@@ -492,6 +492,63 @@ impl crate::Fluree {
         }
     }
 
+    /// Apply the two-way half of [`ConflictStrategy`] to a flake set being
+    /// staged.
+    ///
+    /// "Two-way" means: `flakes` is the **winning** side under `TakeSource`
+    /// and the **losing** side under `TakeBranch`. `opposite_state` is the
+    /// ledger state whose current values get retracted when `flakes` wins.
+    /// This is the polarity used by merge (`flakes` = incoming source branch)
+    /// and revert (`flakes` = inverse flakes from the reverted commits); the
+    /// rebase replay path has the opposite polarity (`flakes` = branch
+    /// commits being replayed onto `source_state`) and uses a separate
+    /// resolver.
+    ///
+    /// Behaviour:
+    /// - empty `conflicting_keys` → return `flakes` unchanged
+    /// - `TakeSource` → keep `flakes` + retract `opposite_state`'s values for
+    ///   each conflict key (via [`Self::build_source_retractions`])
+    /// - `TakeBranch` → drop entries of `flakes` whose `(s, p, g)` is in the
+    ///   conflict set
+    /// - `TakeBoth` → keep `flakes` unchanged so both values coexist (merge
+    ///   only; revert rejects this strategy at the entry point)
+    /// - `Abort` / `Skip` → caller's responsibility to short-circuit before
+    ///   invoking this method
+    pub(crate) async fn apply_two_way_strategy(
+        &self,
+        flakes: Vec<Flake>,
+        conflicting_keys: &[ConflictKey],
+        strategy: &ConflictStrategy,
+        opposite_state: &LedgerState,
+    ) -> Result<Vec<Flake>> {
+        if conflicting_keys.is_empty() {
+            return Ok(flakes);
+        }
+
+        let conflict_set: FxHashSet<&ConflictKey> = conflicting_keys.iter().collect();
+
+        match strategy {
+            ConflictStrategy::TakeSource => {
+                let retractions = self
+                    .build_source_retractions(conflicting_keys, opposite_state)
+                    .await?;
+                let mut result = flakes;
+                result.extend(retractions);
+                Ok(result)
+            }
+            ConflictStrategy::TakeBranch => Ok(flakes
+                .into_iter()
+                .filter(|f| {
+                    let key = ConflictKey::new(f.s.clone(), f.p.clone(), f.g.clone());
+                    !conflict_set.contains(&key)
+                })
+                .collect()),
+            // TakeBoth: keep all flakes (both values coexist).
+            // Abort/Skip: caller handles these before this function is called.
+            _ => Ok(flakes),
+        }
+    }
+
     /// Look up the source state's current flakes for the given conflict keys
     /// and generate retraction flakes (`op: false`) for each.
     pub(crate) async fn build_source_retractions(

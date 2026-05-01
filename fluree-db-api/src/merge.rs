@@ -4,18 +4,18 @@
 //! merges (target HEAD is the common ancestor) and general merges with
 //! conflict resolution strategies.
 
+use crate::commit_data::{collect_from_commits, CollectedCommitData};
 use crate::error::{ApiError, Result};
 use crate::rebase::ConflictStrategy;
 use fluree_db_core::commit::codec::read_commit_envelope;
 use fluree_db_core::content_kind::ContentKind;
 use fluree_db_core::ledger_id::format_ledger_id;
 use fluree_db_core::{collect_dag_cids, load_commit_by_id, CommonAncestor};
-use fluree_db_core::{BranchedContentStore, ConflictKey, ContentId, ContentStore, Flake};
+use fluree_db_core::{BranchedContentStore, ConflictKey, ContentId, ContentStore};
 use fluree_db_ledger::{LedgerState, StagedLedger};
 use fluree_db_nameservice::{NsRecord, NsRecordSnapshot};
 use fluree_db_novelty::compute_delta_keys;
 use fluree_db_transact::{CommitOpts, NamespaceRegistry};
-use rustc_hash::FxHashSet;
 use serde::Serialize;
 use tracing::Instrument;
 
@@ -327,11 +327,15 @@ impl crate::Fluree {
 
         // Collect source flakes and metadata: walk source commits from HEAD
         // to ancestor, gathering flakes, namespace deltas, and graph deltas.
-        let source_data = collect_commit_data(source_store, source_head_id, ancestor.t).await?;
+        let CollectedCommitData {
+            flakes: source_flakes,
+            namespace_delta,
+            graph_delta,
+        } = collect_commit_data(source_store, source_head_id, ancestor.t).await?;
 
-        // Resolve conflicts.
+        // Resolve conflicts via the shared two-way strategy helper.
         let resolved_flakes = self
-            .resolve_merge_flakes(&source_data.flakes, &conflicts, strategy, &target_state)
+            .apply_two_way_strategy(source_flakes, &conflicts, strategy, &target_state)
             .await?;
 
         // Stage resolved flakes onto target state. An empty flake set is valid
@@ -349,11 +353,11 @@ impl crate::Fluree {
         let ns_registry = NamespaceRegistry::from_db(view.db());
         let mut commit_opts =
             CommitOpts::default().with_merge_parents(vec![source_head_id.clone()]);
-        if !source_data.namespace_delta.is_empty() {
-            commit_opts = commit_opts.with_namespace_delta(source_data.namespace_delta);
+        if !namespace_delta.is_empty() {
+            commit_opts = commit_opts.with_namespace_delta(namespace_delta);
         }
-        if !source_data.graph_delta.is_empty() {
-            commit_opts = commit_opts.with_graph_delta(source_data.graph_delta);
+        if !graph_delta.is_empty() {
+            commit_opts = commit_opts.with_graph_delta(graph_delta);
         }
 
         // Copy source commit chain to target namespace so the target is
@@ -399,56 +403,6 @@ impl crate::Fluree {
             conflict_count,
             strategy: Some(strategy.as_str().to_string()),
         })
-    }
-
-    /// Resolve flakes for a merge operation.
-    ///
-    /// In merge context the semantics are:
-    /// - `TakeBoth`: keep all source flakes as-is (both values coexist).
-    /// - `TakeSource` (incoming branch wins): keep source flakes + retract
-    ///   target's conflicting values.
-    /// - `TakeBranch` (target wins): drop source's conflicting flakes.
-    /// - `Abort`/`Skip`: handled before this method is called.
-    async fn resolve_merge_flakes(
-        &self,
-        flakes: &[Flake],
-        conflicting_keys: &[ConflictKey],
-        strategy: &ConflictStrategy,
-        target_state: &LedgerState,
-    ) -> Result<Vec<Flake>> {
-        if conflicting_keys.is_empty() {
-            return Ok(flakes.to_vec());
-        }
-
-        let conflict_set: FxHashSet<&ConflictKey> = conflicting_keys.iter().collect();
-
-        match strategy {
-            ConflictStrategy::TakeSource => {
-                // Incoming branch wins: keep source flakes + retract target's values.
-                // In rebase terms, this is like TakeBranch — we query the target
-                // state (the "other side") for retractions.
-                let retractions = self
-                    .build_source_retractions(conflicting_keys, target_state)
-                    .await?;
-                let mut result = flakes.to_vec();
-                result.extend(retractions);
-                Ok(result)
-            }
-            ConflictStrategy::TakeBranch => {
-                // Target wins: drop source's conflicting flakes.
-                Ok(flakes
-                    .iter()
-                    .filter(|f| {
-                        let key = ConflictKey::new(f.s.clone(), f.p.clone(), f.g.clone());
-                        !conflict_set.contains(&key)
-                    })
-                    .cloned()
-                    .collect())
-            }
-            // TakeBoth: keep all source flakes, both values coexist.
-            // Abort/Skip: handled before this method is called.
-            _ => Ok(flakes.to_vec()),
-        }
     }
 
     /// Copy commit blobs (and their referenced txn blobs) from a source
@@ -519,41 +473,19 @@ impl crate::Fluree {
     }
 }
 
-/// Collected flakes and metadata from a range of commits.
-struct CollectedCommitData {
-    flakes: Vec<Flake>,
-    namespace_delta: std::collections::HashMap<u16, String>,
-    graph_delta: std::collections::HashMap<u16, String>,
-}
-
 /// Collect all flakes, namespace deltas, and graph deltas from commits
-/// between `head_id` and `stop_at_t` (exclusive).
+/// between `head_id` and `stop_at_t` (exclusive). Walks the DAG newest-first
+/// then folds via [`collect_from_commits`] in oldest-first order so that
+/// earlier commits win on namespace and graph delta key collisions.
 async fn collect_commit_data(
     store: &impl ContentStore,
     head_id: &ContentId,
     stop_at_t: i64,
 ) -> Result<CollectedCommitData> {
     let dag = collect_dag_cids(store, head_id, stop_at_t).await?;
-    let mut all_flakes = Vec::new();
-    let mut namespace_delta = std::collections::HashMap::new();
-    let mut graph_delta = std::collections::HashMap::new();
-
-    // dag is in newest-first order; we want oldest-first for correct ordering.
+    let mut commits = Vec::with_capacity(dag.len());
     for (_, cid) in dag.iter().rev() {
-        let commit = load_commit_by_id(store, cid).await?;
-        all_flakes.extend(commit.flakes);
-        // Accumulate deltas: earlier commits take precedence (oldest-first).
-        for (code, prefix) in commit.namespace_delta {
-            namespace_delta.entry(code).or_insert(prefix);
-        }
-        for (g_id, iri) in commit.graph_delta {
-            graph_delta.entry(g_id).or_insert(iri);
-        }
+        commits.push(load_commit_by_id(store, cid).await?);
     }
-
-    Ok(CollectedCommitData {
-        flakes: all_flakes,
-        namespace_delta,
-        graph_delta,
-    })
+    Ok(collect_from_commits(commits, std::convert::identity))
 }

@@ -159,6 +159,19 @@ pub struct RefreshedTokens {
     pub refresh_token: Option<String>,
 }
 
+/// Wire shape for [`RemoteLedgerClient::revert`] and
+/// [`RemoteLedgerClient::revert_preview`]: exactly one of a single commit
+/// reference, a set of references (cherry-pick), or a git-style range.
+///
+/// Lives next to the methods that serialize it. Callers (CLI commands)
+/// construct it from positional args / `--from`/`--to` flags.
+#[derive(Clone, Debug)]
+pub enum RevertPayload {
+    Single(String),
+    Set(Vec<String>),
+    Range { from: String, to: String },
+}
+
 /// HTTP client for ledger data operations against a remote Fluree server.
 ///
 /// Supports query (JSON-LD/SPARQL), insert, upsert, transact, ledger-info, and
@@ -1244,6 +1257,127 @@ impl RemoteLedgerClient {
             Some(RequestBody::Json(&body)),
         )
         .await
+    }
+
+    /// Revert one or more commits on `branch` of `ledger`.
+    ///
+    /// Calls `POST {base_url}/revert`. The body is a [`RevertPayload`]
+    /// describing exactly one of: a single commit, a list of commits, or a
+    /// git-style range. Each commit reference is a string parsed by
+    /// [`fluree_db_api::CommitRef::parse`] on the server.
+    pub async fn revert(
+        &self,
+        ledger: &str,
+        branch: &str,
+        payload: &RevertPayload,
+        strategy: Option<&str>,
+    ) -> Result<serde_json::Value, RemoteLedgerError> {
+        let url = self.op_url_root("revert");
+        let mut body = serde_json::json!({
+            "ledger": ledger,
+            "branch": branch,
+        });
+        match payload {
+            RevertPayload::Single(c) => {
+                body["commit"] = serde_json::Value::String(c.clone());
+            }
+            RevertPayload::Set(items) => {
+                body["commits"] = serde_json::Value::Array(
+                    items
+                        .iter()
+                        .cloned()
+                        .map(serde_json::Value::String)
+                        .collect(),
+                );
+            }
+            RevertPayload::Range { from, to } => {
+                body["range"] = serde_json::json!({ "from": from, "to": to });
+            }
+        }
+        if let Some(s) = strategy {
+            body["strategy"] = serde_json::Value::String(s.to_string());
+        }
+        self.send_json(
+            reqwest::Method::POST,
+            &url,
+            "application/json",
+            Some(RequestBody::Json(&body)),
+        )
+        .await
+    }
+
+    /// Read-only preview of a revert.
+    ///
+    /// Calls `GET {base_url}/revert-preview/{ledger}?branch=&commit=...`. The
+    /// shape of the query string depends on `payload`:
+    /// - `Single` ⇒ `&commit=<ref>`
+    /// - `Set`    ⇒ `&commits=<ref1>,<ref2>,...` (comma-separated)
+    /// - `Range`  ⇒ `&from=<ref>&to=<ref>`
+    pub async fn revert_preview(
+        &self,
+        ledger: &str,
+        branch: &str,
+        payload: &RevertPayload,
+        strategy: Option<&str>,
+    ) -> Result<serde_json::Value, RemoteLedgerError> {
+        let mut url = self.op_url("revert-preview", ledger);
+        let mut sep = '?';
+        let push = |url: &mut String, sep: &mut char, key: &str, val: String| {
+            url.push(*sep);
+            url.push_str(key);
+            url.push('=');
+            url.push_str(&val);
+            *sep = '&';
+        };
+        push(
+            &mut url,
+            &mut sep,
+            "branch",
+            urlencoding::encode(branch).into_owned(),
+        );
+        match payload {
+            RevertPayload::Single(c) => {
+                push(
+                    &mut url,
+                    &mut sep,
+                    "commit",
+                    urlencoding::encode(c).into_owned(),
+                );
+            }
+            RevertPayload::Set(items) => {
+                let csv = items.join(",");
+                push(
+                    &mut url,
+                    &mut sep,
+                    "commits",
+                    urlencoding::encode(&csv).into_owned(),
+                );
+            }
+            RevertPayload::Range { from, to } => {
+                push(
+                    &mut url,
+                    &mut sep,
+                    "from",
+                    urlencoding::encode(from).into_owned(),
+                );
+                push(
+                    &mut url,
+                    &mut sep,
+                    "to",
+                    urlencoding::encode(to).into_owned(),
+                );
+            }
+        }
+        if let Some(s) = strategy {
+            push(
+                &mut url,
+                &mut sep,
+                "strategy",
+                urlencoding::encode(s).into_owned(),
+            );
+        }
+        self.send_json(reqwest::Method::GET, &url, "application/json", None)
+            .await
     }
 
     /// List all branches for a ledger on the remote server.

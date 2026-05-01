@@ -338,6 +338,32 @@ impl Flake {
         }
     }
 
+    /// Create the inverse of this flake by flipping `op` (assertion ⇄
+    /// retraction) and preserving every other component.
+    ///
+    /// Use this when you need true symmetric inversion — e.g. when reverting a
+    /// commit and a flake's `op` may already be `false`. [`Self::retract`]
+    /// only sets `op: false` regardless of the original value, which is the
+    /// correct primitive when you specifically want a retraction but does not
+    /// invert a retraction back into an assertion.
+    pub fn invert(&self) -> Self {
+        Self {
+            op: !self.op,
+            ..self.clone()
+        }
+    }
+
+    /// Like [`Self::invert`] but also overrides the transaction time. Useful
+    /// when staging inverted flakes for a new commit, where the staging layer
+    /// will rewrite `t` anyway.
+    pub fn invert_at(&self, t: i64) -> Self {
+        Self {
+            t,
+            op: !self.op,
+            ..self.clone()
+        }
+    }
+
     /// Approximate size of this flake in bytes
     ///
     /// Used for cache size estimation.
