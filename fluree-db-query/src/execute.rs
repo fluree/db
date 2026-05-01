@@ -361,7 +361,9 @@ mod tests {
             post_values: None,
         };
         let executable = ExecutableQuery::simple(query);
-        let results = execute_with_overlay(db, &vars, &executable).await.unwrap();
+        let results = execute(db, &vars, &executable, ContextConfig::default())
+            .await
+            .unwrap();
 
         // Empty WHERE returns 1 batch with a single empty solution
         assert_eq!(results.len(), 1);

@@ -28,7 +28,7 @@ use fluree_db_query::vector::usearch::{
     IncrementalVectorUpdater, VectorIndex, VectorIndexBuilder, VectorPropertyDeps,
 };
 #[cfg(feature = "vector")]
-use fluree_db_query::{execute_with_overlay, ExecutableQuery, QueryOutput, VarRegistry};
+use fluree_db_query::{execute, ContextConfig, ExecutableQuery, QueryOutput, VarRegistry};
 #[cfg(feature = "vector")]
 use serde_json::Value as JsonValue;
 #[cfg(feature = "vector")]
@@ -252,7 +252,7 @@ impl crate::Fluree {
         let executable = ExecutableQuery::simple(parsed_for_exec);
 
         let db = ledger.as_graph_db_ref(0);
-        let batches = execute_with_overlay(db, &vars, &executable).await?;
+        let batches = execute(db, &vars, &executable, ContextConfig::default()).await?;
 
         // Format using the standard JSON-LD formatter
         let result = crate::query::helpers::build_query_result(
