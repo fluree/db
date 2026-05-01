@@ -72,7 +72,10 @@ use runner::{
     execute_prepared_with_overlay, execute_prepared_with_overlay_tracked,
     execute_prepared_with_policy, execute_prepared_with_r2rml,
 };
-pub use runner::{prepare_execution, prepare_execution_with_binary_store};
+pub use runner::{
+    prepare_execution, prepare_execution_with_binary_store, prepare_execution_with_config,
+    PrepareConfig,
+};
 
 /// Execute a query with an overlay
 ///
@@ -177,7 +180,17 @@ pub async fn execute_with_dataset_tracked<'a>(
     execute_prepared_with_dataset(db, vars, prepared, dataset, Some(tracker)).await
 }
 
-/// Execute a query against a dataset in history mode
+/// Execute a query against a dataset in history mode.
+///
+/// The `_history` suffix is load-bearing: this helper prepares the operator
+/// tree with [`PrepareConfig::history`] so scan operators emit asserts +
+/// retracts and fast paths are gated off at planner-time. Callers that want
+/// current-state semantics should use [`execute_with_dataset`] instead.
+///
+/// The view layer (`view::dataset_query::query_dataset`) has its own
+/// detection logic and goes through `prepare_execution_with_config`
+/// directly; this top-level helper is for callers that already know they
+/// want history-range semantics without going through the view layer.
 pub async fn execute_with_dataset_history<'a>(
     db: GraphDbRef<'a>,
     vars: &VarRegistry,
@@ -185,8 +198,8 @@ pub async fn execute_with_dataset_history<'a>(
     dataset: &'a DataSet<'a>,
     tracker: Option<&'a Tracker>,
 ) -> Result<Vec<Batch>> {
-    let prepared = prepare_execution(db, query).await?;
-    execute_prepared_with_dataset_history(db, vars, prepared, dataset, tracker, true).await
+    let prepared = prepare_execution_with_config(db, query, &PrepareConfig::history(None)).await?;
+    execute_prepared_with_dataset_history(db, vars, prepared, dataset, tracker).await
 }
 
 /// Execute a query against a dataset (multi-graph) with policy enforcement
@@ -388,7 +401,12 @@ mod tests {
             post_values: None,
         };
 
-        let result = build_operator_tree(&query, &QueryOptions::default(), None);
+        let result = build_operator_tree(
+            &query,
+            &QueryOptions::default(),
+            None,
+            &crate::temporal_mode::PlanningContext::current(),
+        );
         match result {
             Err(e) => assert!(e.to_string().contains("not found")),
             Ok(_) => panic!("Expected error for invalid select var"),
@@ -409,7 +427,12 @@ mod tests {
 
         let options = QueryOptions::new().with_order_by(vec![SortSpec::asc(VarId(99))]); // Invalid var
 
-        let result = build_operator_tree(&query, &options, None);
+        let result = build_operator_tree(
+            &query,
+            &options,
+            None,
+            &crate::temporal_mode::PlanningContext::current(),
+        );
         match result {
             Err(e) => assert!(e.to_string().contains("Sort variable")),
             Ok(_) => panic!("Expected error for invalid sort var"),
@@ -420,7 +443,12 @@ mod tests {
     fn test_build_where_operators_single_triple() {
         let patterns = vec![Pattern::Triple(make_pattern(VarId(0), "name", VarId(1)))];
 
-        let result = where_plan::build_where_operators(&patterns, None, None);
+        let result = where_plan::build_where_operators(
+            &patterns,
+            None,
+            None,
+            &crate::temporal_mode::PlanningContext::current(),
+        );
         assert!(result.is_ok());
 
         let op = result.unwrap();
@@ -437,7 +465,12 @@ mod tests {
             )),
         ];
 
-        let result = where_plan::build_where_operators(&patterns, None, None);
+        let result = where_plan::build_where_operators(
+            &patterns,
+            None,
+            None,
+            &crate::temporal_mode::PlanningContext::current(),
+        );
         assert!(result.is_ok());
     }
 

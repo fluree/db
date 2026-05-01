@@ -185,6 +185,16 @@ pub struct BinaryScanOperator {
     /// When a bound subject IRI cannot be translated to a persisted `s_id`,
     /// keep a widened base scan correct by checking the resolved subject IRI row-by-row.
     unresolved_bound_subject_iri: Option<Arc<str>>,
+    /// Temporal mode captured at planner-time. Drives the `op` field on
+    /// emitted bindings, the `t` column projection, and the
+    /// `RangeOptions::history_mode` pass-through to `range_with_overlay` in
+    /// the genesis fallback path.
+    ///
+    /// Single-purpose: when `mode == History`, this operator is constructed
+    /// only as the private inner of `BinaryHistoryScanOperator`. When
+    /// `mode == Current`, it is constructed by `ScanDatasetBuilder` directly
+    /// and emits current-state bindings without the `op` channel.
+    mode: crate::temporal_mode::TemporalMode,
 }
 
 /// A filter that can be evaluated on encoded index columns (no term decoding).
@@ -509,8 +519,10 @@ fn range_contains(ranges: &[(u32, u32)], value: u32) -> bool {
 }
 
 impl BinaryScanOperator {
-    /// Create a new scan operator. The `store` and `g_id` are resolved from
-    /// `ExecutionContext` during `open()`.
+    /// Create a new scan operator for current-state queries.
+    ///
+    /// Equivalent to [`new_with_emit_and_index`](Self::new_with_emit_and_index)
+    /// with default emit/index_hint and [`TemporalMode::Current`](crate::TemporalMode::Current).
     pub fn new(
         pattern: TriplePattern,
         object_bounds: Option<ObjectBounds>,
@@ -519,13 +531,58 @@ impl BinaryScanOperator {
         Self::new_with_emit_and_index(pattern, object_bounds, inline_ops, EmitMask::ALL, None)
     }
 
-    /// Create a scan operator with explicit emit mask and index hint.
+    /// Create a scan operator with explicit emit mask and index hint, for
+    /// current-state queries.
+    ///
+    /// History-range scans go through [`BinaryHistoryScanOperator`](crate::BinaryHistoryScanOperator),
+    /// which constructs its inner `BinaryScanOperator` via
+    /// [`for_history_inner`](Self::for_history_inner).
     pub fn new_with_emit_and_index(
         pattern: TriplePattern,
         object_bounds: Option<ObjectBounds>,
         inline_ops: Vec<InlineOperator>,
         emit: EmitMask,
         index_hint: Option<IndexType>,
+    ) -> Self {
+        Self::with_mode(
+            pattern,
+            object_bounds,
+            inline_ops,
+            emit,
+            index_hint,
+            crate::temporal_mode::TemporalMode::Current,
+        )
+    }
+
+    /// Construct the inner scan that backs a [`BinaryHistoryScanOperator`].
+    ///
+    /// Public-but-restricted: only `BinaryHistoryScanOperator` should call
+    /// this; every other current-state scan goes through the public
+    /// constructors above.
+    pub(crate) fn for_history_inner(
+        pattern: TriplePattern,
+        object_bounds: Option<ObjectBounds>,
+        inline_ops: Vec<InlineOperator>,
+        emit: EmitMask,
+        index_hint: Option<IndexType>,
+    ) -> Self {
+        Self::with_mode(
+            pattern,
+            object_bounds,
+            inline_ops,
+            emit,
+            index_hint,
+            crate::temporal_mode::TemporalMode::History,
+        )
+    }
+
+    fn with_mode(
+        pattern: TriplePattern,
+        object_bounds: Option<ObjectBounds>,
+        inline_ops: Vec<InlineOperator>,
+        emit: EmitMask,
+        index_hint: Option<IndexType>,
+        mode: crate::temporal_mode::TemporalMode,
     ) -> Self {
         let s_bound = pattern.s_bound();
         let p_bound = pattern.p_bound();
@@ -586,6 +643,7 @@ impl BinaryScanOperator {
             check_p_eq_o,
             range_iter: None,
             unresolved_bound_subject_iri: None,
+            mode,
         }
     }
 
@@ -692,7 +750,7 @@ impl BinaryScanOperator {
                     // history mode, where the scan emits both asserts
                     // and retracts; current-state scans only ever see
                     // asserts so the distinction would be misleading.
-                    FlakeValue::Ref(r) if ctx.history_mode => {
+                    FlakeValue::Ref(r) if self.mode.is_history() => {
                         Binding::sid_with_t_op(r.clone(), flake.t, flake.op)
                     }
                     FlakeValue::Ref(r) => Binding::sid_with_t(r.clone(), flake.t),
@@ -710,7 +768,7 @@ impl BinaryScanOperator {
                             val: v.clone(),
                             dtc,
                             t: Some(flake.t),
-                            op: if ctx.history_mode {
+                            op: if self.mode.is_history() {
                                 Some(flake.op)
                             } else {
                                 None
@@ -749,7 +807,7 @@ impl BinaryScanOperator {
             to_t: Some(ctx.to_t),
             from_t: ctx.from_t,
             object_bounds: self.object_bounds.clone(),
-            history_mode: ctx.history_mode,
+            history_mode: self.mode.is_history(),
             ..Default::default()
         };
         let mut flakes = range_with_overlay(
@@ -1649,7 +1707,7 @@ impl Operator for BinaryScanOperator {
         // - `t` is only required for history mode
         let mut output = ColumnSet::CORE;
         output.insert(ColumnId::OI);
-        if ctx.history_mode || inline_ops_need_t(&self.inline_ops) {
+        if self.mode.is_history() || inline_ops_need_t(&self.inline_ops) {
             output.insert(ColumnId::T);
         }
         let projection = ColumnProjection {

@@ -215,10 +215,11 @@ async fn eval_exists_uncorrelated(
     patterns: &[Pattern],
     negated: bool,
     ctx: &ExecutionContext<'_>,
+    planning: &crate::temporal_mode::PlanningContext,
 ) -> Result<bool> {
     #[expect(clippy::box_default)]
     let seed: BoxedOperator = Box::new(EmptyOperator::new());
-    let mut exists_op = build_where_operators_seeded(Some(seed), patterns, None, None)?;
+    let mut exists_op = build_where_operators_seeded(Some(seed), patterns, None, None, planning)?;
 
     exists_op.open(ctx).await?;
 
@@ -244,9 +245,11 @@ async fn eval_exists_for_row(
     batch: &Batch,
     row_idx: usize,
     ctx: &ExecutionContext<'_>,
+    planning: &crate::temporal_mode::PlanningContext,
 ) -> Result<bool> {
     let seed = SeedOperator::from_batch_row(batch, row_idx);
-    let mut exists_op = build_where_operators_seeded(Some(Box::new(seed)), patterns, None, None)?;
+    let mut exists_op =
+        build_where_operators_seeded(Some(Box::new(seed)), patterns, None, None, planning)?;
 
     exists_op.open(ctx).await?;
 
@@ -271,12 +274,14 @@ fn pre_resolve_uncorrelated<'a>(
     expr: &'a Expression,
     batch_schema: &'a [VarId],
     ctx: &'a ExecutionContext<'a>,
+    planning: &'a crate::temporal_mode::PlanningContext,
 ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Expression>> + Send + 'a>> {
     Box::pin(async move {
         match expr {
             Expression::Exists { patterns, negated } => {
                 if is_uncorrelated_exists(patterns, batch_schema) {
-                    let result = eval_exists_uncorrelated(patterns, *negated, ctx).await?;
+                    let result =
+                        eval_exists_uncorrelated(patterns, *negated, ctx, planning).await?;
                     Ok(Expression::Const(FilterValue::Bool(result)))
                 } else {
                     Ok(expr.clone())
@@ -285,7 +290,8 @@ fn pre_resolve_uncorrelated<'a>(
             Expression::Call { func, args } => {
                 let mut resolved_args = Vec::with_capacity(args.len());
                 for arg in args {
-                    resolved_args.push(pre_resolve_uncorrelated(arg, batch_schema, ctx).await?);
+                    resolved_args
+                        .push(pre_resolve_uncorrelated(arg, batch_schema, ctx, planning).await?);
                 }
                 Ok(Expression::Call {
                     func: func.clone(),
@@ -364,6 +370,7 @@ fn resolve_exists_for_row<'a>(
     row_idx: usize,
     ctx: &'a ExecutionContext<'a>,
     cache: Option<&'a ExistsSemijoinCache>,
+    planning: &'a crate::temporal_mode::PlanningContext,
 ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Expression>> + Send + 'a>> {
     Box::pin(async move {
         match expr {
@@ -376,14 +383,16 @@ fn resolve_exists_for_row<'a>(
                     }
                 }
 
-                let result = eval_exists_for_row(patterns, *negated, batch, row_idx, ctx).await?;
+                let result =
+                    eval_exists_for_row(patterns, *negated, batch, row_idx, ctx, planning).await?;
                 Ok(Expression::Const(FilterValue::Bool(result)))
             }
             Expression::Call { func, args } => {
                 let mut resolved_args = Vec::with_capacity(args.len());
                 for arg in args {
-                    resolved_args
-                        .push(resolve_exists_for_row(arg, batch, row_idx, ctx, cache).await?);
+                    resolved_args.push(
+                        resolve_exists_for_row(arg, batch, row_idx, ctx, cache, planning).await?,
+                    );
                 }
                 Ok(Expression::Call {
                     func: func.clone(),
@@ -410,9 +419,10 @@ async fn filter_batch_with_exists(
     schema: &Arc<[VarId]>,
     ctx: &ExecutionContext<'_>,
     cache: Option<&ExistsSemijoinCache>,
+    planning: &crate::temporal_mode::PlanningContext,
 ) -> Result<Option<Batch>> {
     // Phase 1: resolve uncorrelated EXISTS once for the whole batch
-    let partially_resolved = pre_resolve_uncorrelated(expr, batch.schema(), ctx).await?;
+    let partially_resolved = pre_resolve_uncorrelated(expr, batch.schema(), ctx, planning).await?;
 
     // If no EXISTS nodes remain, we can use the fast synchronous path
     if !contains_exists(&partially_resolved) {
@@ -425,7 +435,8 @@ async fn filter_batch_with_exists(
 
     for row_idx in 0..batch.len() {
         let resolved_expr =
-            resolve_exists_for_row(&partially_resolved, batch, row_idx, ctx, cache).await?;
+            resolve_exists_for_row(&partially_resolved, batch, row_idx, ctx, cache, planning)
+                .await?;
         let Some(row) = batch.row_view(row_idx) else {
             continue;
         };
@@ -472,11 +483,31 @@ pub struct FilterOperator {
     has_exists: bool,
     /// Optional semijoin caches for simple correlated EXISTS patterns.
     exists_semijoin: Option<ExistsSemijoinCache>,
+    /// Planning context captured at planner-time for FILTER EXISTS subplans.
+    planning: crate::temporal_mode::PlanningContext,
 }
 
 impl FilterOperator {
-    /// Create a new filter operator
+    /// Create a new filter operator with current-state planning context.
+    ///
+    /// Construction sites that have a captured [`PlanningContext`] should call
+    /// [`FilterOperator::new_with_planning`] instead so that FILTER EXISTS
+    /// subplans inherit the same temporal mode.
     pub fn new(child: BoxedOperator, expr: Expression) -> Self {
+        Self::new_with_planning(
+            child,
+            expr,
+            crate::temporal_mode::PlanningContext::current(),
+        )
+    }
+
+    /// Create a new filter operator that captures a planning context for any
+    /// FILTER EXISTS subplans.
+    pub fn new_with_planning(
+        child: BoxedOperator,
+        expr: Expression,
+        planning: crate::temporal_mode::PlanningContext,
+    ) -> Self {
         let schema = Arc::from(child.schema().to_vec().into_boxed_slice());
         let has_exists = contains_exists(&expr);
         let prepared_expr = PreparedBoolExpression::new(expr.clone());
@@ -488,6 +519,7 @@ impl FilterOperator {
             state: OperatorState::Created,
             has_exists,
             exists_semijoin: None,
+            planning,
         }
     }
 
@@ -537,6 +569,7 @@ impl Operator for FilterOperator {
                     &self.schema,
                     ctx,
                     self.exists_semijoin.as_ref(),
+                    &self.planning,
                 )
                 .await?
             } else {

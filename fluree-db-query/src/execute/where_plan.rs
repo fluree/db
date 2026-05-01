@@ -29,6 +29,7 @@ use crate::property_path::{PropertyPathOperator, DEFAULT_MAX_VISITED};
 use crate::seed::EmptyOperator;
 use crate::semijoin::SemijoinOperator;
 use crate::subquery::SubqueryOperator;
+use crate::temporal_mode::PlanningContext;
 use crate::triple::{Ref, Term, TriplePattern};
 use crate::union::UnionOperator;
 use crate::values::ValuesOperator;
@@ -666,12 +667,14 @@ fn apply_eligible_binds(
 /// Apply BINDs and FILTERs whose required variables are all bound.
 ///
 /// Returns the updated operator and the remaining items.
+#[allow(clippy::too_many_arguments)]
 fn apply_deferred_patterns(
     child: BoxedOperator,
     bound: &mut HashSet<VarId>,
     pending_binds: Vec<BindPattern>,
     pending_filters: Vec<FilterPattern>,
     filter_idxs_consumed: &[usize],
+    planning: &PlanningContext,
 ) -> (BoxedOperator, Vec<BindPattern>, Vec<FilterPattern>) {
     let (mut child, remaining_binds, pending_filters) = apply_eligible_binds(
         child,
@@ -684,7 +687,7 @@ fn apply_deferred_patterns(
     let (ready, remaining_filters) =
         partition_eligible_filters(pending_filters, bound, filter_idxs_consumed);
     for expr in ready {
-        child = Box::new(FilterOperator::new(child, expr));
+        child = Box::new(FilterOperator::new_with_planning(child, expr, *planning));
     }
 
     (child, remaining_binds, remaining_filters)
@@ -700,6 +703,7 @@ fn apply_all_remaining(
     pending_binds: Vec<BindPattern>,
     pending_filters: Vec<FilterPattern>,
     filter_idxs_consumed: &[usize],
+    planning: &PlanningContext,
 ) -> BoxedOperator {
     let mut bound: HashSet<VarId> = child.schema().iter().copied().collect();
 
@@ -712,7 +716,11 @@ fn apply_all_remaining(
     );
     for pending in remaining_filters {
         if !filter_idxs_consumed.contains(&pending.original_idx) {
-            child = Box::new(FilterOperator::new(child, pending.expr));
+            child = Box::new(FilterOperator::new_with_planning(
+                child,
+                pending.expr,
+                *planning,
+            ));
         }
     }
     child
@@ -728,6 +736,7 @@ fn build_single_pattern(
     var_counts: &HashMap<VarId, usize>,
     protected_vars: &HashSet<VarId>,
     group_by: &[VarId],
+    planning: &PlanningContext,
 ) -> Option<BoxedOperator> {
     match pattern {
         Pattern::Bind { var, expr } => {
@@ -755,6 +764,7 @@ fn build_single_pattern(
             None,
             emit_mask_for_triple(tp, var_counts, protected_vars),
             group_by,
+            planning,
         )),
         _ => operator,
     }
@@ -775,6 +785,7 @@ fn build_property_join_block(
     required_where_vars: Option<&[VarId]>,
     var_counts: &HashMap<VarId, usize>,
     protected_vars: &HashSet<VarId>,
+    planning: &PlanningContext,
 ) -> Result<Option<BoxedOperator>> {
     let mut needed: HashSet<VarId> = HashSet::new();
     if let Some(rwv) = required_where_vars {
@@ -818,6 +829,7 @@ fn build_property_join_block(
         pushdown.object_bounds.clone(),
         Some(&needed),
         inline_ops,
+        planning.mode(),
     )?;
     let mut operator: Option<BoxedOperator> = Some(Box::new(property_join));
 
@@ -833,6 +845,7 @@ fn build_property_join_block(
             pending_binds,
             pending_filters,
             &pushdown.consumed_indices,
+            planning,
         );
         operator = Some(child);
     }
@@ -947,6 +960,7 @@ fn build_sequential_join_block(
     protected_vars: &HashSet<VarId>,
     group_by: &[VarId],
     distinct_query: bool,
+    planning: &PlanningContext,
 ) -> Result<Option<BoxedOperator>> {
     let mut operator = operator;
 
@@ -1018,6 +1032,7 @@ fn build_sequential_join_block(
             live_vars.as_deref(),
             emit,
             group_by,
+            planning,
         );
         bound.extend(op.schema().iter().copied());
         operator = Some(op);
@@ -1029,6 +1044,7 @@ fn build_sequential_join_block(
                 pending_binds,
                 pending_filters,
                 &pushdown.consumed_indices,
+                planning,
             );
             pending_binds = new_binds;
             pending_filters = new_filters;
@@ -1047,6 +1063,7 @@ fn build_sequential_join_block(
             pending_binds,
             pending_filters,
             &pushdown.consumed_indices,
+            planning,
         ));
     }
 
@@ -1061,12 +1078,21 @@ pub fn build_where_operators(
     patterns: &[Pattern],
     stats: Option<Arc<StatsView>>,
     required_where_vars: Option<&[VarId]>,
+    planning: &PlanningContext,
 ) -> Result<BoxedOperator> {
     let mut needed: HashSet<VarId> = HashSet::new();
     let mut counts: HashMap<VarId, usize> = HashMap::new();
     collect_var_stats(patterns, &mut counts, &mut needed);
     needed.extend(counts.keys().copied());
-    build_where_operators_with_needed(patterns, stats, &needed, &[], false, required_where_vars)
+    build_where_operators_with_needed(
+        patterns,
+        stats,
+        &needed,
+        &[],
+        false,
+        required_where_vars,
+        planning,
+    )
 }
 
 /// Build WHERE operators with explicit needed-vars and GROUP BY keys.
@@ -1080,6 +1106,7 @@ pub fn build_where_operators_with_needed(
     group_by: &[VarId],
     distinct_query: bool,
     required_where_vars: Option<&[VarId]>,
+    planning: &PlanningContext,
 ) -> Result<BoxedOperator> {
     build_where_operators_seeded_with_needed(
         None,
@@ -1089,6 +1116,7 @@ pub fn build_where_operators_with_needed(
         group_by,
         distinct_query,
         required_where_vars,
+        planning,
     )
 }
 
@@ -1172,6 +1200,7 @@ pub fn build_where_operators_seeded(
     patterns: &[Pattern],
     stats: Option<Arc<StatsView>>,
     required_where_vars: Option<&[VarId]>,
+    planning: &PlanningContext,
 ) -> Result<BoxedOperator> {
     let mut needed: HashSet<VarId> = HashSet::new();
     let mut counts: HashMap<VarId, usize> = HashMap::new();
@@ -1185,6 +1214,7 @@ pub fn build_where_operators_seeded(
         &[],
         false,
         required_where_vars,
+        planning,
     )
 }
 
@@ -1204,6 +1234,7 @@ pub fn build_where_operators_seeded(
 /// - If `seed` is `Some`, it is used as the starting operator for the pattern list.
 /// - If `seed` is `None` and the first pattern is non-triple, an `EmptyOperator` is used.
 /// - `stats` provides property/class statistics for selectivity-based pattern reordering.
+#[allow(clippy::too_many_arguments)]
 pub fn build_where_operators_seeded_with_needed(
     seed: Option<BoxedOperator>,
     patterns: &[Pattern],
@@ -1212,7 +1243,13 @@ pub fn build_where_operators_seeded_with_needed(
     group_by: &[VarId],
     distinct_query: bool,
     required_where_vars: Option<&[VarId]>,
+    planning: &PlanningContext,
 ) -> Result<BoxedOperator> {
+    // `planning` is captured here and threaded into every operator that
+    // builds late subplans (UNION, OPTIONAL, EXISTS, MINUS, GRAPH, SERVICE,
+    // SUBQUERY, FILTER EXISTS, scan/join chain). The invariant: late
+    // builders never call `PlanningContext::current()` themselves —
+    // they capture the value passed here.
     if patterns.is_empty() {
         // Empty patterns = one row with empty schema
         return Ok(seed.unwrap_or_else(|| Box::new(EmptyOperator::new())));
@@ -1286,6 +1323,7 @@ pub fn build_where_operators_seeded_with_needed(
                         &var_counts,
                         &protected_vars,
                         group_by,
+                        planning,
                     );
                     i = start + 1;
                     continue;
@@ -1319,6 +1357,7 @@ pub fn build_where_operators_seeded_with_needed(
                         &protected_vars,
                         group_by,
                         distinct_query,
+                        planning,
                     )?;
                     if values_after_triples {
                         built = apply_values(Some(built), block.values)
@@ -1471,6 +1510,7 @@ pub fn build_where_operators_seeded_with_needed(
                         augmented_ref,
                         &var_counts,
                         &protected_vars,
+                        planning,
                     )?;
                 } else {
                     operator = build_sequential_join_block(
@@ -1485,14 +1525,20 @@ pub fn build_where_operators_seeded_with_needed(
                         &protected_vars,
                         group_by,
                         distinct_query,
+                        planning,
                     )?;
                 }
             }
 
             Pattern::Filter(expr) => {
-                // Wrap current operator with filter
+                // Wrap current operator with filter; FILTER EXISTS subplans
+                // inherit the captured planning context.
                 let child = require_child(operator, "Filter pattern")?;
-                operator = Some(Box::new(FilterOperator::new(child, expr.clone())));
+                operator = Some(Box::new(FilterOperator::new_with_planning(
+                    child,
+                    expr.clone(),
+                    *planning,
+                )));
                 i += 1;
             }
 
@@ -1527,6 +1573,7 @@ pub fn build_where_operators_seeded_with_needed(
                                     inner_patterns.clone(),
                                     true,
                                     stats.clone(),
+                                    *planning,
                                 )));
                                 i += 2;
                                 continue;
@@ -1542,6 +1589,7 @@ pub fn build_where_operators_seeded_with_needed(
                         let builder = GroupedPatternOptionalBuilder::new(
                             required_schema.clone(),
                             grouped_optional_triples,
+                            *planning,
                         )?;
                         operator = Some(Box::new(
                             OptionalOperator::with_builder(
@@ -1559,8 +1607,13 @@ pub fn build_where_operators_seeded_with_needed(
                     if inner_patterns.len() == 1 {
                         if let Some(inner_triple) = inner_patterns[0].as_triple().cloned() {
                             operator = Some(Box::new(
-                                OptionalOperator::new(child, required_schema, inner_triple)
-                                    .with_out_schema(augmented_ref),
+                                OptionalOperator::new(
+                                    child,
+                                    required_schema,
+                                    inner_triple,
+                                    *planning,
+                                )
+                                .with_out_schema(augmented_ref),
                             ));
                             i += 1;
                             continue;
@@ -1573,6 +1626,7 @@ pub fn build_where_operators_seeded_with_needed(
                         required_schema.clone(),
                         inner_patterns.clone(),
                         stats.clone(),
+                        *planning,
                     );
                     operator = Some(Box::new(
                         OptionalOperator::with_builder(child, required_schema, Box::new(builder))
@@ -1598,7 +1652,7 @@ pub fn build_where_operators_seeded_with_needed(
 
                 // Correlated UNION: execute each branch per input row (seeded from child).
                 operator = Some(Box::new(
-                    UnionOperator::new(child, branches.clone(), stats.clone())
+                    UnionOperator::new(child, branches.clone(), stats.clone(), *planning)
                         .with_out_schema(augmented_ref),
                 ));
                 i += 1;
@@ -1611,6 +1665,7 @@ pub fn build_where_operators_seeded_with_needed(
                     child,
                     inner_patterns.clone(),
                     stats.clone(),
+                    *planning,
                 )));
                 i += 1;
             }
@@ -1657,6 +1712,7 @@ pub fn build_where_operators_seeded_with_needed(
                         inner_patterns.clone(),
                         negated,
                         stats.clone(),
+                        *planning,
                     )));
                 } else {
                     // Correlated via produced vars only: SemijoinOperator builds inner
@@ -1667,6 +1723,7 @@ pub fn build_where_operators_seeded_with_needed(
                         key_vars,
                         negated,
                         stats.clone(),
+                        *planning,
                     )));
                 }
                 i += 1;
@@ -1692,7 +1749,7 @@ pub fn build_where_operators_seeded_with_needed(
                 let augmented_ref = augmented_rwv.as_deref();
 
                 operator = Some(Box::new(
-                    SubqueryOperator::new(child, sq.clone(), stats.clone())
+                    SubqueryOperator::new(child, sq.clone(), stats.clone(), *planning)
                         .with_out_schema(augmented_ref),
                 ));
                 i += 1;
@@ -1771,6 +1828,7 @@ pub fn build_where_operators_seeded_with_needed(
                     child,
                     name.clone(),
                     inner_patterns.clone(),
+                    *planning,
                 )));
                 i += 1;
             }
@@ -1781,6 +1839,7 @@ pub fn build_where_operators_seeded_with_needed(
                 operator = Some(Box::new(crate::service::ServiceOperator::new(
                     child,
                     service_pattern.clone(),
+                    *planning,
                 )));
                 i += 1;
             }
@@ -1801,6 +1860,7 @@ fn make_first_scan(
     inline_ops: Vec<InlineOperator>,
     emit: EmitMask,
     group_by: &[VarId],
+    planning: &PlanningContext,
 ) -> BoxedOperator {
     let obj_bounds = tp.o.as_var().and_then(|v| object_bounds.get(&v).cloned());
     let index_hint = scan_index_hint_for_triple(tp, group_by, &inline_ops);
@@ -1810,6 +1870,7 @@ fn make_first_scan(
         inline_ops,
         emit,
         index_hint,
+        planning.mode(),
     ))
 }
 
@@ -1824,6 +1885,7 @@ fn make_first_scan(
 ///
 /// The `inline_ops` are evaluated inline on the operator: baked into the scan
 /// for the first pattern, or evaluated per combined row in `NestedLoopJoinOperator` for joins.
+#[allow(clippy::too_many_arguments)]
 pub fn build_scan_or_join(
     left: Option<BoxedOperator>,
     tp: &TriplePattern,
@@ -1832,9 +1894,10 @@ pub fn build_scan_or_join(
     downstream_vars: Option<&[VarId]>,
     emit: EmitMask,
     group_by: &[VarId],
+    planning: &PlanningContext,
 ) -> BoxedOperator {
     match left {
-        None => make_first_scan(tp, object_bounds, inline_ops, emit, group_by),
+        None => make_first_scan(tp, object_bounds, inline_ops, emit, group_by, planning),
         Some(left) => {
             // Subsequent patterns: use NestedLoopJoinOperator with optional bounds pushdown
             let left_schema: Arc<[VarId]> = Arc::from(left.schema().to_vec().into_boxed_slice());
@@ -1850,6 +1913,7 @@ pub fn build_scan_or_join(
                     bounds,
                     inline_ops,
                     EmitMask::ALL,
+                    planning.mode(),
                 )
                 .with_out_schema(downstream_vars),
             )
@@ -1939,6 +2003,7 @@ pub fn build_triple_operators(
     protected_vars: &HashSet<VarId>,
     group_by: &[VarId],
     distinct_query: bool,
+    planning: &PlanningContext,
 ) -> Result<BoxedOperator> {
     if triples.is_empty() {
         return existing
@@ -1973,6 +2038,7 @@ pub fn build_triple_operators(
             &triples_for_exec,
             object_bounds.clone(),
             Some(&needed),
+            planning.mode(),
         )?;
         return Ok(Box::new(pj));
     }
@@ -2001,6 +2067,7 @@ pub fn build_triple_operators(
             live_vars.as_deref(),
             emit,
             group_by,
+            planning,
         ));
 
         // DISTINCT query optimization: if any variables seen so far are no longer live,
@@ -2046,7 +2113,15 @@ mod tests {
         let mut counts: HashMap<VarId, usize> = HashMap::new();
         collect_var_stats(patterns, &mut counts, &mut needed);
         needed.extend(counts.keys().copied());
-        super::build_where_operators_with_needed(patterns, stats, &needed, &[], false, None)
+        super::build_where_operators_with_needed(
+            patterns,
+            stats,
+            &needed,
+            &[],
+            false,
+            None,
+            &crate::temporal_mode::PlanningContext::current(),
+        )
     }
 
     fn build_triple_operators(
@@ -2076,6 +2151,7 @@ mod tests {
             &protected,
             &[],
             false,
+            &crate::temporal_mode::PlanningContext::current(),
         )
     }
 
@@ -2474,8 +2550,16 @@ mod tests {
         let tp = make_pattern(VarId(0), "name", VarId(1));
         let bounds = HashMap::new();
 
-        let op: BoxedOperator =
-            build_scan_or_join(None, &tp, &bounds, Vec::new(), None, EmitMask::ALL, &[]);
+        let op: BoxedOperator = build_scan_or_join(
+            None,
+            &tp,
+            &bounds,
+            Vec::new(),
+            None,
+            EmitMask::ALL,
+            &[],
+            &crate::temporal_mode::PlanningContext::current(),
+        );
 
         assert_eq!(op.schema(), &[VarId(0), VarId(1)]);
     }
@@ -2486,8 +2570,16 @@ mod tests {
         let tp2 = make_pattern(VarId(0), "age", VarId(2));
         let bounds = HashMap::new();
 
-        let first: BoxedOperator =
-            build_scan_or_join(None, &tp1, &bounds, Vec::new(), None, EmitMask::ALL, &[]);
+        let first: BoxedOperator = build_scan_or_join(
+            None,
+            &tp1,
+            &bounds,
+            Vec::new(),
+            None,
+            EmitMask::ALL,
+            &[],
+            &crate::temporal_mode::PlanningContext::current(),
+        );
         let second = build_scan_or_join(
             Some(first),
             &tp2,
@@ -2496,6 +2588,7 @@ mod tests {
             None,
             EmitMask::ALL,
             &[],
+            &crate::temporal_mode::PlanningContext::current(),
         );
 
         // Schema should include all vars from both patterns

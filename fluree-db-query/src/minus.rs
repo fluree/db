@@ -17,6 +17,7 @@ use crate::execute::build_where_operators_seeded;
 use crate::ir::Pattern;
 use crate::operator::{BoxedOperator, Operator, OperatorState};
 use crate::seed::EmptyOperator;
+use crate::temporal_mode::PlanningContext;
 use crate::var_registry::VarId;
 use async_trait::async_trait;
 use fluree_db_core::StatsView;
@@ -73,6 +74,9 @@ pub struct MinusOperator {
     state: OperatorState,
     /// Optional stats for nested query optimization (Arc for cheap cloning in nested operators)
     stats: Option<Arc<StatsView>>,
+    /// Planning context captured at planner-time. Used when building the
+    /// MINUS subtree so it inherits the same temporal mode.
+    planning: PlanningContext,
     /// Hash set of minus rows where ALL shared vars are matchable (common case)
     minus_hash: HashSet<MinusKey>,
     /// Minus rows with >= 1 unbound shared var (wildcard rows, rare)
@@ -92,6 +96,7 @@ impl MinusOperator {
         child: BoxedOperator,
         minus_patterns: Vec<Pattern>,
         stats: Option<Arc<StatsView>>,
+        planning: PlanningContext,
     ) -> Self {
         let schema: Arc<[VarId]> = Arc::from(child.schema().to_vec().into_boxed_slice());
         let child_vars: HashSet<VarId> = child.schema().iter().copied().collect();
@@ -110,6 +115,7 @@ impl MinusOperator {
             schema,
             state: OperatorState::Created,
             stats,
+            planning,
             minus_hash: HashSet::new(),
             minus_wildcards: Vec::new(),
         }
@@ -312,6 +318,7 @@ impl Operator for MinusOperator {
                 &self.minus_patterns,
                 self.stats.clone(),
                 None,
+                &self.planning,
             )?;
 
             minus_op.open(ctx).await?;
@@ -474,7 +481,12 @@ mod tests {
             Term::Var(VarId(2)), // ?age - not shared
         ))];
 
-        let op = MinusOperator::new(child, minus_patterns, None);
+        let op = MinusOperator::new(
+            child,
+            minus_patterns,
+            None,
+            crate::temporal_mode::PlanningContext::current(),
+        );
 
         // Only ?s should be shared
         assert_eq!(op.shared_vars.len(), 1);
@@ -488,7 +500,12 @@ mod tests {
             schema: child_schema.clone(),
         });
 
-        let op = MinusOperator::new(child, vec![], None);
+        let op = MinusOperator::new(
+            child,
+            vec![],
+            None,
+            crate::temporal_mode::PlanningContext::current(),
+        );
 
         // Output schema should match child schema
         assert_eq!(op.schema(), &*child_schema);
@@ -529,6 +546,7 @@ mod tests {
             schema: child_schema,
             state: OperatorState::Created,
             stats: None,
+            planning: crate::temporal_mode::PlanningContext::current(),
             minus_hash: HashSet::new(),
             minus_wildcards: Vec::new(),
         }

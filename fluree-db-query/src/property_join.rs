@@ -34,6 +34,7 @@ use crate::join::{
 };
 use crate::operator::inline::{apply_inline, extend_schema, InlineOperator};
 use crate::operator::{BoxedOperator, Operator, OperatorState};
+use crate::temporal_mode::TemporalMode;
 use crate::triple::{Ref, Term, TriplePattern};
 use crate::var_registry::VarId;
 use async_trait::async_trait;
@@ -64,6 +65,7 @@ fn make_property_join_scan(
     pattern: TriplePattern,
     bounds: Option<ObjectBounds>,
     emit: EmitMask,
+    mode: TemporalMode,
 ) -> BoxedOperator {
     Box::new(crate::dataset_operator::DatasetOperator::scan(
         pattern,
@@ -71,6 +73,7 @@ fn make_property_join_scan(
         Vec::new(),
         emit,
         None,
+        mode,
     ))
 }
 
@@ -122,6 +125,8 @@ pub struct PropertyJoinOperator {
     emitted_required: Vec<bool>,
     /// Row-local filters/binds applied after star rows are assembled.
     inline_ops: Vec<InlineOperator>,
+    /// Temporal mode captured at planner-time for the late per-predicate scans.
+    mode: TemporalMode,
 }
 
 #[derive(Clone, Debug)]
@@ -322,8 +327,9 @@ impl PropertyJoinOperator {
     pub fn new(
         patterns: &[TriplePattern],
         object_bounds: HashMap<VarId, ObjectBounds>,
+        mode: TemporalMode,
     ) -> Result<Self> {
-        Self::new_with_options(patterns, &[], object_bounds, None, Vec::new())
+        Self::new_with_options(patterns, &[], object_bounds, None, Vec::new(), mode)
     }
 
     /// Create a new property-join operator, optionally treating some predicate patterns
@@ -332,8 +338,9 @@ impl PropertyJoinOperator {
         patterns: &[TriplePattern],
         object_bounds: HashMap<VarId, ObjectBounds>,
         needed_vars: Option<&std::collections::HashSet<VarId>>,
+        mode: TemporalMode,
     ) -> Result<Self> {
-        Self::new_with_options(patterns, &[], object_bounds, needed_vars, Vec::new())
+        Self::new_with_options(patterns, &[], object_bounds, needed_vars, Vec::new(), mode)
     }
 
     pub fn new_with_options(
@@ -342,6 +349,7 @@ impl PropertyJoinOperator {
         object_bounds: HashMap<VarId, ObjectBounds>,
         needed_vars: Option<&std::collections::HashSet<VarId>>,
         inline_ops: Vec<InlineOperator>,
+        mode: TemporalMode,
     ) -> Result<Self> {
         if !crate::planner::is_property_join(required_patterns) {
             return Err(QueryError::Internal(
@@ -442,6 +450,7 @@ impl PropertyJoinOperator {
             emit_positions,
             emitted_required,
             inline_ops,
+            mode,
         })
     }
 
@@ -804,7 +813,8 @@ impl Operator for PropertyJoinOperator {
                         o: false,
                     }
                 };
-                let mut scan: BoxedOperator = make_property_join_scan(pattern, bounds, emit);
+                let mut scan: BoxedOperator =
+                    make_property_join_scan(pattern, bounds, emit, self.mode);
                 scan.open(ctx).await?;
 
                 while let Some(batch) = scan.next_batch(ctx).await? {
@@ -1062,7 +1072,8 @@ mod tests {
     #[test]
     fn test_property_join_creation() {
         let patterns = make_property_join_patterns();
-        let op = PropertyJoinOperator::new(&patterns, HashMap::new()).unwrap();
+        let op =
+            PropertyJoinOperator::new(&patterns, HashMap::new(), TemporalMode::Current).unwrap();
 
         assert_eq!(op.subject_var(), VarId(0));
         assert_eq!(op.predicates.len(), 2);
@@ -1072,7 +1083,8 @@ mod tests {
     #[test]
     fn test_property_join_schema() {
         let patterns = make_property_join_patterns();
-        let op = PropertyJoinOperator::new(&patterns, HashMap::new()).unwrap();
+        let op =
+            PropertyJoinOperator::new(&patterns, HashMap::new(), TemporalMode::Current).unwrap();
 
         let schema = op.output_schema();
         assert_eq!(schema[0], VarId(0)); // subject
@@ -1083,7 +1095,8 @@ mod tests {
     #[test]
     fn test_property_join_schema_with_bound_object_predicate() {
         let patterns = make_property_join_patterns_with_bound_object();
-        let op = PropertyJoinOperator::new(&patterns, HashMap::new()).unwrap();
+        let op =
+            PropertyJoinOperator::new(&patterns, HashMap::new(), TemporalMode::Current).unwrap();
 
         let schema = op.output_schema();
         assert_eq!(&schema[..], &[VarId(0), VarId(1), VarId(2)]);
@@ -1092,7 +1105,8 @@ mod tests {
     #[test]
     fn test_property_join_prefers_bound_object_driver_over_bounds() {
         let patterns = make_property_join_patterns_with_bound_object();
-        let op = PropertyJoinOperator::new(&patterns, HashMap::new()).unwrap();
+        let op =
+            PropertyJoinOperator::new(&patterns, HashMap::new(), TemporalMode::Current).unwrap();
 
         let mut bounds = HashMap::new();
         bounds.insert(VarId(2), ObjectBounds::new());
@@ -1111,7 +1125,8 @@ mod tests {
     #[test]
     fn test_generate_rows_single_values() {
         let patterns = make_property_join_patterns();
-        let op = PropertyJoinOperator::new(&patterns, HashMap::new()).unwrap();
+        let op =
+            PropertyJoinOperator::new(&patterns, HashMap::new(), TemporalMode::Current).unwrap();
 
         let subject_sid = Sid::new(1, "alice");
         let subject_binding = Binding::sid(subject_sid.clone());
@@ -1134,7 +1149,8 @@ mod tests {
     #[test]
     fn test_generate_rows_cartesian_product() {
         let patterns = make_property_join_patterns();
-        let op = PropertyJoinOperator::new(&patterns, HashMap::new()).unwrap();
+        let op =
+            PropertyJoinOperator::new(&patterns, HashMap::new(), TemporalMode::Current).unwrap();
 
         let subject_binding = Binding::sid(Sid::new(1, "alice"));
         let values = vec![
@@ -1162,7 +1178,8 @@ mod tests {
     #[test]
     fn test_generate_rows_empty_pred() {
         let patterns = make_property_join_patterns();
-        let op = PropertyJoinOperator::new(&patterns, HashMap::new()).unwrap();
+        let op =
+            PropertyJoinOperator::new(&patterns, HashMap::new(), TemporalMode::Current).unwrap();
 
         let subject_binding = Binding::sid(Sid::new(1, "alice"));
         let values = vec![
@@ -1216,7 +1233,7 @@ mod tests {
                 Term::Var(VarId(3)),
             ),
         ];
-        let result = PropertyJoinOperator::new(&patterns, HashMap::new());
+        let result = PropertyJoinOperator::new(&patterns, HashMap::new(), TemporalMode::Current);
         assert!(
             result.is_err(),
             "should reject invalid property-join patterns"

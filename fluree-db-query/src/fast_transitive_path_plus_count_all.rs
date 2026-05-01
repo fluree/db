@@ -34,10 +34,11 @@ pub fn transitive_path_plus_count_all_operator(
     FastPathOperator::new(
         out_var,
         move |ctx| {
-            // Cursor-based path is overlay-aware, but still requires single-ledger,
-            // non-history, root-policy execution.
+            // Cursor-based path is overlay-aware, but still requires single-ledger
+            // and root-policy execution. History mode is filtered at the planner —
+            // see `execute::operator_tree::build_operator_tree_inner` — so this
+            // gate doesn't duplicate that check.
             let allow_fast = !ctx.is_multi_ledger()
-                && !ctx.history_mode
                 && ctx.from_t.is_none()
                 && ctx.policy_enforcer.as_ref().is_none_or(|p| p.is_root());
             if !allow_fast {

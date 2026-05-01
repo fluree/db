@@ -15,6 +15,7 @@ use crate::execute::build_where_operators_seeded;
 use crate::ir::Pattern;
 use crate::operator::{compute_trimmed_vars, BoxedOperator, Operator, OperatorState};
 use crate::seed::SeedOperator;
+use crate::temporal_mode::PlanningContext;
 use crate::var_registry::VarId;
 use async_trait::async_trait;
 use fluree_db_core::StatsView;
@@ -44,6 +45,9 @@ pub struct UnionOperator {
     input_exhausted: bool,
     /// Optional stats for selectivity-based pattern reordering in branches
     stats: Option<Arc<StatsView>>,
+    /// Planning context captured at planner-time. Used when building the
+    /// per-row branch operator trees so they inherit the same temporal mode.
+    planning: PlanningContext,
     /// Debug counters for low-noise batch fragmentation summaries.
     input_batches_seen: usize,
     input_rows_seen: usize,
@@ -70,6 +74,7 @@ impl UnionOperator {
         child: BoxedOperator,
         branches: Vec<Vec<Pattern>>,
         stats: Option<Arc<StatsView>>,
+        planning: PlanningContext,
     ) -> Self {
         assert!(!branches.is_empty(), "UNION requires at least one branch");
 
@@ -96,6 +101,7 @@ impl UnionOperator {
             current_input_row: 0,
             input_exhausted: false,
             stats,
+            planning,
             input_batches_seen: 0,
             input_rows_seen: 0,
             branch_execs: 0,
@@ -285,6 +291,7 @@ impl Operator for UnionOperator {
                     branch_patterns,
                     self.stats.clone(),
                     branch_downstream_vars,
+                    &self.planning,
                 )?;
 
                 branch_op.open(ctx).await?;
@@ -466,7 +473,12 @@ mod tests {
             ))],
         ];
 
-        let op = UnionOperator::new(child, branches, None);
+        let op = UnionOperator::new(
+            child,
+            branches,
+            None,
+            crate::temporal_mode::PlanningContext::current(),
+        );
         assert_eq!(op.schema(), &[VarId(0), VarId(1), VarId(2)]);
     }
 
@@ -477,7 +489,12 @@ mod tests {
         let empty = EmptyOperator::new();
         let child: BoxedOperator = Box::new(empty);
         let branches = vec![vec![], vec![]];
-        let op = UnionOperator::new(child, branches, None);
+        let op = UnionOperator::new(
+            child,
+            branches,
+            None,
+            crate::temporal_mode::PlanningContext::current(),
+        );
         assert_eq!(op.schema().len(), 0);
     }
 
@@ -504,8 +521,13 @@ mod tests {
             ))],
         ];
 
-        let op =
-            UnionOperator::new(child, branches, None).with_out_schema(Some(&[VarId(0), VarId(2)]));
+        let op = UnionOperator::new(
+            child,
+            branches,
+            None,
+            crate::temporal_mode::PlanningContext::current(),
+        )
+        .with_out_schema(Some(&[VarId(0), VarId(2)]));
 
         assert_eq!(op.schema(), &[VarId(0), VarId(2)]);
     }
@@ -523,7 +545,13 @@ mod tests {
             crate::triple::Term::Var(VarId(1)),
         ))]];
 
-        let op = UnionOperator::new(child, branches, None).with_out_schema(None);
+        let op = UnionOperator::new(
+            child,
+            branches,
+            None,
+            crate::temporal_mode::PlanningContext::current(),
+        )
+        .with_out_schema(None);
 
         assert_eq!(op.schema(), &[VarId(0), VarId(1)]);
     }
@@ -562,7 +590,12 @@ mod tests {
             }],
         ];
 
-        let mut op = UnionOperator::new(child, branches, None);
+        let mut op = UnionOperator::new(
+            child,
+            branches,
+            None,
+            crate::temporal_mode::PlanningContext::current(),
+        );
         op.open(&ctx).await.unwrap();
 
         let batch1 = op.next_batch(&ctx).await.unwrap().unwrap();

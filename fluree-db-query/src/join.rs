@@ -110,6 +110,7 @@ pub(crate) fn make_dict_overlay(
 ///
 /// Wraps the scan in a [`DatasetOperator`](crate::dataset_operator::DatasetOperator)
 /// so that multi-graph fanout is handled transparently.
+#[allow(clippy::too_many_arguments)]
 fn make_right_scan(
     pattern: TriplePattern,
     object_bounds: Option<ObjectBounds>,
@@ -117,6 +118,7 @@ fn make_right_scan(
     inline_ops: Vec<InlineOperator>,
     index_hint: Option<IndexType>,
     _ctx: &ExecutionContext<'_>,
+    mode: crate::temporal_mode::TemporalMode,
 ) -> Box<dyn Operator> {
     Box::new(crate::dataset_operator::DatasetOperator::scan(
         pattern,
@@ -124,6 +126,7 @@ fn make_right_scan(
         inline_ops,
         emit,
         index_hint,
+        mode,
     ))
 }
 
@@ -355,6 +358,8 @@ pub struct NestedLoopJoinOperator {
     out_schema: Option<Arc<[VarId]>>,
     /// Emit the runtime path decision once per open().
     logged_runtime_mode: bool,
+    /// Temporal mode captured at planner-time for the late per-row right scan.
+    mode: crate::temporal_mode::TemporalMode,
 }
 
 impl NestedLoopJoinOperator {
@@ -414,6 +419,7 @@ impl NestedLoopJoinOperator {
     /// * `right_pattern` - Pattern to execute for each left row
     /// * `object_bounds` - Optional range bounds for object variable (filter pushdown)
     /// * `inline_ops` - Inline operators evaluated on combined rows
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         left: Box<dyn Operator>,
         left_schema: Arc<[VarId]>,
@@ -421,6 +427,7 @@ impl NestedLoopJoinOperator {
         object_bounds: Option<ObjectBounds>,
         inline_ops: Vec<InlineOperator>,
         right_emit: EmitMask,
+        mode: crate::temporal_mode::TemporalMode,
     ) -> Self {
         // Build bind instructions: which left columns bind which right pattern positions
         let mut bind_instructions = Vec::new();
@@ -613,6 +620,7 @@ impl NestedLoopJoinOperator {
             right_index_hint,
             out_schema: None,
             logged_runtime_mode: false,
+            mode,
         }
     }
 
@@ -1176,6 +1184,7 @@ impl Operator for NestedLoopJoinOperator {
                         self.right_scan_inline_ops.clone(),
                         self.right_index_hint,
                         ctx,
+                        self.mode,
                     );
                     right_scan.open(ctx).await?;
                     self.active_right_scan = Some(right_scan);
@@ -1197,6 +1206,7 @@ impl Operator for NestedLoopJoinOperator {
                     self.right_scan_inline_ops.clone(),
                     self.right_index_hint,
                     ctx,
+                    self.mode,
                 );
                 right_scan.open(ctx).await?;
                 self.active_right_scan = Some(right_scan);
@@ -2967,6 +2977,7 @@ mod tests {
             None, // No object bounds
             Vec::new(),
             EmitMask::ALL,
+            crate::temporal_mode::TemporalMode::Current,
         );
 
         // Create a batch with one row that has Poisoned in position 0 (used for binding)
@@ -3056,6 +3067,7 @@ mod tests {
             None, // No object bounds
             Vec::new(),
             EmitMask::ALL,
+            crate::temporal_mode::TemporalMode::Current,
         );
 
         // Verify that ?v is NOT in unify_instructions (it's substituted, not unified)
@@ -3140,6 +3152,7 @@ mod tests {
                 )),
             )],
             EmitMask::ALL,
+            crate::temporal_mode::TemporalMode::Current,
         );
 
         assert_eq!(join.right_index_hint, Some(IndexType::Opst));
@@ -3182,6 +3195,7 @@ mod tests {
                 p: false,
                 o: false,
             },
+            crate::temporal_mode::TemporalMode::Current,
         );
 
         assert!(!join.batched_eligible);
@@ -3228,6 +3242,7 @@ mod tests {
                 )),
             )],
             EmitMask::ALL,
+            crate::temporal_mode::TemporalMode::Current,
         );
 
         assert!(join.right_scan_inline_ops.is_empty());
@@ -3294,6 +3309,7 @@ mod tests {
             None, // No object bounds
             Vec::new(),
             EmitMask::ALL,
+            crate::temporal_mode::TemporalMode::Current,
         );
 
         // No unify_instructions since no shared vars between left [?s] and right [?x, ?y]

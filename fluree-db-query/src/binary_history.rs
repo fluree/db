@@ -1,8 +1,11 @@
 //! Indexed history-range scan operator.
 //!
-//! Wraps `BinaryScanOperator` and, when `ctx.history_mode` is set and a
-//! binary store is attached, replaces its cursor walk with a
-//! three-source merge:
+//! Single-purpose: constructed only when the planner has captured
+//! [`TemporalMode::History`](crate::TemporalMode::History) at scan
+//! construction time. Current-state queries are served by
+//! [`BinaryScanOperator`] directly and never reach this operator.
+//!
+//! Replaces the regular cursor walk with a three-source merge:
 //!
 //! 1. **History sidecar entries** (`HistEntryV2`) for each matching
 //!    leaflet — assert + retract events with explicit op.
@@ -12,9 +15,11 @@
 //!    own `flake.op`.
 //!
 //! The merged flake list is handed to the existing
-//! `flakes_to_bindings` pipeline via `prime_history_flakes`, which is
-//! already history-aware (line ~704 in `binary_scan.rs` copies
-//! `flake.op` onto the emitted `Binding::Lit`).
+//! `flakes_to_bindings` pipeline via `prime_history_flakes`, which
+//! preserves the per-flake `op` on the emitted `Binding::Lit` (the
+//! `op`-emit branch in `binary_scan.rs::flakes_to_bindings` runs
+//! whenever flakes were primed via `prime_history_flakes`, regardless
+//! of any runtime context flag).
 //!
 //! ## Narrowing
 //!
@@ -89,15 +94,14 @@ use crate::operator::Operator;
 use crate::triple::TriplePattern;
 use crate::var_registry::VarId;
 
-/// Scan operator that activates a dedicated history-range walk when
-/// `ctx.history_mode` is true.
+/// Scan operator for history-range queries.
 ///
-/// When history mode is not active, this wrapper transparently delegates
-/// to `BinaryScanOperator::open` — the regular scan path is unchanged.
-/// When history mode is active, the operator runs its own three-source
-/// merge (sidecar + base + novelty) regardless of whether a binary store
-/// is attached: an unindexed ledger just skips the persisted pass and
-/// takes the full event stream from novelty.
+/// Single-purpose: the planner picks this operator only when
+/// [`TemporalMode::History`](crate::TemporalMode::History) is captured at
+/// scan construction. It always runs its own three-source merge — sidecar,
+/// base, and novelty — regardless of whether a binary store is attached.
+/// An unindexed ledger just skips the persisted pass and takes the full
+/// event stream from novelty.
 pub struct BinaryHistoryScanOperator {
     inner: BinaryScanOperator,
     pattern: TriplePattern,
@@ -123,7 +127,7 @@ impl BinaryHistoryScanOperator {
         emit: EmitMask,
         index_hint: Option<IndexType>,
     ) -> Self {
-        let inner = BinaryScanOperator::new_with_emit_and_index(
+        let inner = BinaryScanOperator::for_history_inner(
             pattern.clone(),
             object_bounds.clone(),
             inline_ops,
@@ -422,10 +426,6 @@ impl Operator for BinaryHistoryScanOperator {
     }
 
     async fn open(&mut self, ctx: &ExecutionContext<'_>) -> Result<()> {
-        if !ctx.history_mode {
-            // Non-history queries go through the unchanged scan path.
-            return self.inner.open(ctx).await;
-        }
         // History mode: we always collect flakes ourselves (with explicit op
         // preservation) rather than going through `BinaryScanOperator::open`.
         // The non-history path in the core `range_with_overlay` genesis
@@ -434,6 +434,11 @@ impl Operator for BinaryHistoryScanOperator {
         // collector handles both the indexed and novelty-only cases
         // correctly. Policy enforcement is applied in
         // `collect_history_flakes` via `filter_flakes_by_policy`.
+        //
+        // Single-purpose: this operator is only constructed by
+        // `ScanDatasetBuilder` when its captured mode is `History`. The
+        // current-state path goes through `BinaryScanOperator` directly and
+        // never reaches this function.
         let flakes = self.collect_history_flakes(ctx).await?;
         self.inner.prime_history_flakes(ctx, flakes)
     }

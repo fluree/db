@@ -88,6 +88,7 @@ pub mod sparql_results;
 pub(crate) mod stats_cache;
 pub mod stats_query;
 pub mod subquery;
+pub mod temporal_mode;
 pub mod triple;
 pub mod union;
 pub mod values;
@@ -156,6 +157,7 @@ pub use seed::{EmptyOperator, SeedOperator};
 pub use sort::{compare_bindings, compare_flake_values, SortDirection, SortOperator, SortSpec};
 pub use stats_query::StatsCountByPredicateOperator;
 pub use subquery::SubqueryOperator;
+pub use temporal_mode::{PlanningContext, TemporalMode};
 pub use triple::{Ref, Term, TriplePattern};
 
 // Re-export DatatypeConstraint from fluree-db-core for convenience
@@ -190,7 +192,10 @@ pub async fn execute_pattern(
     pattern: TriplePattern,
 ) -> Result<Vec<Batch>> {
     let ctx = ExecutionContext::from_graph_db_ref(db, vars);
-    let mut scan = BinaryHistoryScanOperator::new(pattern, None, Vec::new());
+    // Current-state helper: BinaryHistoryScanOperator is single-purpose since the
+    // planner-mode refactor (always emits asserts + retracts), so use the
+    // current-state scan directly here.
+    let mut scan = BinaryScanOperator::new(pattern, None, Vec::new());
 
     scan.open(&ctx).await?;
 
@@ -250,7 +255,10 @@ pub async fn execute_pattern_at(
     from_t: Option<i64>,
 ) -> Result<Vec<Batch>> {
     let ctx = ExecutionContext::from_graph_db_ref_with_from_t(db, vars, from_t);
-    let mut scan = BinaryHistoryScanOperator::new(pattern, None, Vec::new());
+    // Current-state helper: BinaryHistoryScanOperator is single-purpose since the
+    // planner-mode refactor (always emits asserts + retracts), so use the
+    // current-state scan directly here.
+    let mut scan = BinaryScanOperator::new(pattern, None, Vec::new());
 
     scan.open(&ctx).await?;
 
@@ -274,7 +282,10 @@ pub async fn execute_pattern_with_overlay(
     pattern: TriplePattern,
 ) -> Result<Vec<Batch>> {
     let ctx = ExecutionContext::from_graph_db_ref(db, vars);
-    let mut scan = BinaryHistoryScanOperator::new(pattern, None, Vec::new());
+    // Current-state helper: BinaryHistoryScanOperator is single-purpose since the
+    // planner-mode refactor (always emits asserts + retracts), so use the
+    // current-state scan directly here.
+    let mut scan = BinaryScanOperator::new(pattern, None, Vec::new());
 
     scan.open(&ctx).await?;
 
@@ -297,7 +308,10 @@ pub async fn execute_pattern_with_overlay_at(
     from_t: Option<i64>,
 ) -> Result<Vec<Batch>> {
     let ctx = ExecutionContext::from_graph_db_ref_with_from_t(db, vars, from_t);
-    let mut scan = BinaryHistoryScanOperator::new(pattern, None, Vec::new());
+    // Current-state helper: BinaryHistoryScanOperator is single-purpose since the
+    // planner-mode refactor (always emits asserts + retracts), so use the
+    // current-state scan directly here.
+    let mut scan = BinaryScanOperator::new(pattern, None, Vec::new());
 
     scan.open(&ctx).await?;
 
@@ -340,7 +354,17 @@ pub async fn execute_where_with_overlay_at(
     }
 
     let ctx = ExecutionContext::from_graph_db_ref_with_from_t(db, vars, from_t);
-    let mut operator = build_where_operators_seeded(None, patterns, None, None)?;
+    // Root: this is a transaction WHERE-clause executor. Even when `from_t` is
+    // set, semantics are "current state at `to_t` with from_t time bound for
+    // novelty visibility" — not a history-range query that emits asserts +
+    // retracts. Always plan as `Current`.
+    let mut operator = build_where_operators_seeded(
+        None,
+        patterns,
+        None,
+        None,
+        &temporal_mode::PlanningContext::current(),
+    )?;
 
     operator.open(&ctx).await?;
     let mut batches = Vec::new();
@@ -366,7 +390,15 @@ pub async fn execute_where_with_overlay_at_strict(
 
     let ctx =
         ExecutionContext::from_graph_db_ref_with_from_t(db, vars, from_t).with_strict_bind_errors();
-    let mut operator = build_where_operators_seeded(None, patterns, None, None)?;
+    // Root: same as `execute_where_with_overlay_at` — transaction WHERE clause,
+    // current-state semantics regardless of `from_t`.
+    let mut operator = build_where_operators_seeded(
+        None,
+        patterns,
+        None,
+        None,
+        &temporal_mode::PlanningContext::current(),
+    )?;
 
     operator.open(&ctx).await?;
     let mut batches = Vec::new();
@@ -402,7 +434,17 @@ pub async fn execute_where_with_overlay_at_strict_in_dataset<'a>(
     if let Some(ds) = dataset {
         ctx = ctx.with_dataset(ds);
     }
-    let mut operator = build_where_operators_seeded(None, patterns, None, None)?;
+    // Root: transaction WHERE clause executor (dataset-aware variant).
+    // History-range planning is detected at the dataset/view layer in
+    // `view::dataset_query` before prepare runs; this transaction-side path
+    // is always current-state.
+    let mut operator = build_where_operators_seeded(
+        None,
+        patterns,
+        None,
+        None,
+        &temporal_mode::PlanningContext::current(),
+    )?;
 
     operator.open(&ctx).await?;
     let mut batches = Vec::new();
@@ -539,7 +581,17 @@ pub async fn execute_where_streaming_in_dataset<'a>(
     if let Some(ds) = dataset {
         ctx = ctx.with_dataset(ds);
     }
-    let mut operator = build_where_operators_seeded(None, patterns, None, None)?;
+    // Root: transaction WHERE clause executor (dataset-aware variant).
+    // History-range planning is detected at the dataset/view layer in
+    // `view::dataset_query` before prepare runs; this transaction-side path
+    // is always current-state.
+    let mut operator = build_where_operators_seeded(
+        None,
+        patterns,
+        None,
+        None,
+        &temporal_mode::PlanningContext::current(),
+    )?;
     operator.open(&ctx).await?;
     Ok(WhereCursor {
         inner: CursorInner::Operator(Box::new(WhereCursorOperator {

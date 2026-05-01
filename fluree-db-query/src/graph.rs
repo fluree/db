@@ -34,6 +34,7 @@ use crate::ir::{GraphName, Pattern};
 use crate::operator::{BoxedOperator, Operator, OperatorState};
 use crate::r2rml::rewrite_patterns_for_r2rml;
 use crate::seed::SeedOperator;
+use crate::temporal_mode::PlanningContext;
 use crate::var_registry::VarId;
 use async_trait::async_trait;
 use fluree_db_core::DatatypeConstraint;
@@ -62,6 +63,8 @@ pub struct GraphOperator {
     result_buffer: Vec<Vec<Binding>>,
     /// Current position in result buffer
     buffer_pos: usize,
+    /// Planning context captured at planner-time for the per-row inner subplan.
+    planning: PlanningContext,
 }
 
 impl GraphOperator {
@@ -72,7 +75,12 @@ impl GraphOperator {
     /// * `child` - Input solutions operator
     /// * `graph_name` - The graph name (concrete IRI or variable)
     /// * `inner_patterns` - Patterns to execute within the graph context
-    pub fn new(child: BoxedOperator, graph_name: GraphName, inner_patterns: Vec<Pattern>) -> Self {
+    pub fn new(
+        child: BoxedOperator,
+        graph_name: GraphName,
+        inner_patterns: Vec<Pattern>,
+        planning: PlanningContext,
+    ) -> Self {
         // Compute output schema: parent schema + new vars from inner patterns
         let parent_schema: std::collections::HashSet<VarId> =
             child.schema().iter().copied().collect();
@@ -108,6 +116,7 @@ impl GraphOperator {
             state: OperatorState::Created,
             result_buffer: Vec::new(),
             buffer_pos: 0,
+            planning,
         }
     }
 
@@ -177,8 +186,13 @@ impl GraphOperator {
 
         // Build seed operator from parent row (like EXISTS/Subquery)
         let seed = SeedOperator::from_batch_row(parent_batch, row_idx);
-        let mut inner =
-            build_where_operators_seeded(Some(Box::new(seed)), &patterns_to_execute, None, None)?;
+        let mut inner = build_where_operators_seeded(
+            Some(Box::new(seed)),
+            &patterns_to_execute,
+            None,
+            None,
+            &self.planning,
+        )?;
 
         inner.open(&graph_ctx).await?;
 
@@ -482,6 +496,7 @@ mod tests {
             child,
             GraphName::Iri(Arc::from("http://example.org/graph1")),
             patterns,
+            crate::temporal_mode::PlanningContext::current(),
         );
 
         // Output schema should include parent vars + new var from pattern
@@ -504,7 +519,12 @@ mod tests {
         ))];
 
         // Graph variable ?g = VarId(2)
-        let op = GraphOperator::new(child, GraphName::Var(VarId(2)), patterns);
+        let op = GraphOperator::new(
+            child,
+            GraphName::Var(VarId(2)),
+            patterns,
+            crate::temporal_mode::PlanningContext::current(),
+        );
 
         // Output schema should include parent var, new var from pattern, and graph var
         assert!(op.schema().contains(&VarId(0)));

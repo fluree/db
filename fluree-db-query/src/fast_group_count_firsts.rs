@@ -40,8 +40,10 @@ fn should_fallback(ctx: &ExecutionContext<'_>) -> bool {
 
 #[inline]
 fn allow_cursor_fast_path(ctx: &ExecutionContext<'_>) -> bool {
+    // History mode is filtered at the planner — see
+    // `execute::operator_tree::build_operator_tree_inner` — so this gate
+    // doesn't duplicate that check.
     !ctx.is_multi_ledger()
-        && !ctx.history_mode
         && ctx.from_t.is_none()
         && ctx.policy_enforcer.as_ref().is_none_or(|p| p.is_root())
 }
@@ -79,6 +81,8 @@ pub struct PredicateGroupCountFirstsOperator {
     results_v6: Option<Vec<(u16, u64, i64)>>,
     /// Next result to emit
     pos: usize,
+    /// Temporal mode captured at planner-time for the fallback per-row scan.
+    mode: crate::temporal_mode::TemporalMode,
 }
 
 impl PredicateGroupCountFirstsOperator {
@@ -88,6 +92,7 @@ impl PredicateGroupCountFirstsOperator {
         count_var: VarId,
         predicate: crate::triple::Ref,
         limit: usize,
+        mode: crate::temporal_mode::TemporalMode,
     ) -> Self {
         Self {
             schema: Arc::from(vec![object_var, count_var].into_boxed_slice()),
@@ -100,6 +105,7 @@ impl PredicateGroupCountFirstsOperator {
             fallback: None,
             results_v6: None,
             pos: 0,
+            mode,
         }
     }
 
@@ -126,6 +132,7 @@ impl PredicateGroupCountFirstsOperator {
             Vec::new(),
             crate::binary_scan::EmitMask::ALL,
             None,
+            self.mode,
         ));
 
         let agg_specs = vec![StreamingAggSpec {
@@ -328,6 +335,8 @@ pub struct PredicateObjectCountFirstsOperator {
     count: i64,
     /// Whether the single row has been emitted
     emitted: bool,
+    /// Temporal mode captured at planner-time for the fallback scan.
+    mode: crate::temporal_mode::TemporalMode,
 }
 
 impl PredicateObjectCountFirstsOperator {
@@ -336,6 +345,7 @@ impl PredicateObjectCountFirstsOperator {
         subject_var: VarId,
         object: Term,
         count_var: VarId,
+        mode: crate::temporal_mode::TemporalMode,
     ) -> Self {
         Self {
             schema: Arc::from(vec![count_var].into_boxed_slice()),
@@ -347,6 +357,7 @@ impl PredicateObjectCountFirstsOperator {
             fallback: None,
             count: 0,
             emitted: false,
+            mode,
         }
     }
 
@@ -371,6 +382,7 @@ impl PredicateObjectCountFirstsOperator {
             Vec::new(),
             crate::binary_scan::EmitMask::ALL,
             None,
+            self.mode,
         ));
 
         let agg_specs = vec![StreamingAggSpec {

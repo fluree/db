@@ -28,6 +28,7 @@ use crate::ir::{ServiceEndpoint, ServicePattern};
 use crate::operator::{BoxedOperator, Operator, OperatorState};
 use crate::remote_service::{is_fluree_remote_endpoint, parse_fluree_remote_ref};
 use crate::seed::SeedOperator;
+use crate::temporal_mode::PlanningContext;
 use crate::var_registry::VarId;
 use async_trait::async_trait;
 use fluree_db_core::DatatypeConstraint;
@@ -56,6 +57,8 @@ pub struct ServiceOperator {
     result_buffer: Vec<Vec<Binding>>,
     /// Current position in result buffer
     buffer_pos: usize,
+    /// Planning context captured at planner-time for the per-row inner subplan.
+    planning: PlanningContext,
 }
 
 impl ServiceOperator {
@@ -65,7 +68,9 @@ impl ServiceOperator {
     ///
     /// * `child` - Input solutions operator
     /// * `service` - The SERVICE pattern (silent, endpoint, patterns)
-    pub fn new(child: BoxedOperator, service: ServicePattern) -> Self {
+    /// * `planning` - Planning context captured at planner-time for the
+    ///   per-row inner subplan
+    pub fn new(child: BoxedOperator, service: ServicePattern, planning: PlanningContext) -> Self {
         // Compute output schema: parent schema + new vars from inner patterns
         let parent_schema: std::collections::HashSet<VarId> =
             child.schema().iter().copied().collect();
@@ -100,6 +105,7 @@ impl ServiceOperator {
             state: OperatorState::Created,
             result_buffer: Vec::new(),
             buffer_pos: 0,
+            planning,
         }
     }
 
@@ -169,8 +175,13 @@ impl ServiceOperator {
 
         // Build seed operator from parent row (like EXISTS/Subquery)
         let seed = SeedOperator::from_batch_row(parent_batch, row_idx);
-        let mut inner =
-            build_where_operators_seeded(Some(Box::new(seed)), &self.service.patterns, None, None)?;
+        let mut inner = build_where_operators_seeded(
+            Some(Box::new(seed)),
+            &self.service.patterns,
+            None,
+            None,
+            &self.planning,
+        )?;
 
         // Create execution context for the target ledger
         // If graph_ref is Some, create a new context; otherwise use the current context (self-reference)

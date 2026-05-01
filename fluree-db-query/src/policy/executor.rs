@@ -184,13 +184,21 @@ impl QueryPolicyExecutor<'_> {
                 .with_graph_id(self.g_id)
         };
 
-        // Build the where clause operators (VALUES is now part of parsed patterns)
-        let mut operator =
-            build_where_operators_seeded(None, &patterns, None, None).map_err(|e| {
-                fluree_db_policy::PolicyError::QueryExecution {
-                    message: e.to_string(),
-                }
-            })?;
+        // Build the where clause operators (VALUES is now part of parsed patterns).
+        //
+        // Root: policy queries always evaluate at `self.to_t` for current state —
+        // they're access-control predicates, not history-range queries. Always
+        // plan as `Current`.
+        let mut operator = build_where_operators_seeded(
+            None,
+            &patterns,
+            None,
+            None,
+            &crate::temporal_mode::PlanningContext::current(),
+        )
+        .map_err(|e| fluree_db_policy::PolicyError::QueryExecution {
+            message: e.to_string(),
+        })?;
 
         // Execute with limit 1 (we only need to know if there are any results)
         operator

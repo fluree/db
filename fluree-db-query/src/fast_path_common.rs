@@ -1696,15 +1696,16 @@ pub fn term_to_ref_s_id(
 
 /// Check whether the execution context allows fast-path operators.
 ///
-/// Fast paths are only valid when not in history mode, no `from_t`, no policy
-/// enforcement (or root policy), and no uncommitted overlay.
+/// Fast paths are only valid when single-ledger, no `from_t`, root (or no)
+/// policy, and no uncommitted overlay. History mode is filtered at the
+/// planner level (in `execute::operator_tree::build_operator_tree_inner`),
+/// so this runtime gate doesn't repeat that check.
 #[inline]
 fn allow_fast_path(ctx: &ExecutionContext<'_>) -> bool {
     // Fast paths rely on a single binary index + single-ledger semantics for encoded IDs.
     // Dataset (multi-ledger) execution can span multiple ledgers/graphs, so disable fast
     // paths for correctness unless/until they are made dataset-aware.
     !ctx.is_multi_ledger()
-        && !ctx.history_mode
         && ctx.from_t.is_none()
         && ctx.policy_enforcer.as_ref().is_none_or(|p| p.is_root())
         && ctx
