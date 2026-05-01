@@ -596,6 +596,73 @@ pub async fn execute_where_streaming_in_dataset<'a>(
     })
 }
 
+/// Open a streaming WHERE cursor over `patterns`.
+///
+/// Strict-by-default: bind evaluation errors become query errors, matching
+/// the strict semantics of [`execute::ContextConfig`]. `dataset = Some(_)`
+/// enables GRAPH pattern resolution against named graphs; `None` is the
+/// single-graph case.
+///
+/// History-range planning is detected at the dataset/view layer
+/// (`view::dataset_query`) before this entry point runs; the WHERE-clause
+/// path is always current-state.
+pub async fn execute_where_streaming<'a>(
+    db: GraphDbRef<'a>,
+    vars: &'a VarRegistry,
+    patterns: &[Pattern],
+    dataset: Option<&'a DataSet<'a>>,
+) -> Result<WhereCursor<'a>> {
+    if patterns.is_empty() {
+        let schema: Arc<[VarId]> = Arc::new([]);
+        return Ok(WhereCursor {
+            inner: CursorInner::SingleEmpty {
+                schema,
+                emitted: false,
+            },
+        });
+    }
+
+    let mut ctx = ExecutionContext::from_graph_db_ref(db, vars).with_strict_bind_errors();
+    if let Some(ds) = dataset {
+        ctx = ctx.with_dataset(ds);
+    }
+    let mut operator = build_where_operators_seeded(
+        None,
+        patterns,
+        None,
+        None,
+        &temporal_mode::PlanningContext::current(),
+    )?;
+    operator.open(&ctx).await?;
+    Ok(WhereCursor {
+        inner: CursorInner::Operator(Box::new(WhereCursorOperator {
+            operator,
+            ctx,
+            closed: false,
+        })),
+    })
+}
+
+/// Eagerly execute `patterns` as a WHERE clause and collect every result
+/// batch. Strict-by-default; `dataset` enables GRAPH pattern resolution.
+///
+/// This is a thin convenience over [`execute_where_streaming`]: it opens a
+/// cursor and drains it. Callers that care about peak memory should use the
+/// streaming primitive directly.
+pub async fn execute_where<'a>(
+    db: GraphDbRef<'a>,
+    vars: &'a VarRegistry,
+    patterns: &[Pattern],
+    dataset: Option<&'a DataSet<'a>>,
+) -> Result<Vec<Batch>> {
+    let mut cursor = execute_where_streaming(db, vars, patterns, dataset).await?;
+    let mut batches = Vec::new();
+    while let Some(batch) = cursor.next_batch().await? {
+        batches.push(batch);
+    }
+    Ok(batches)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
