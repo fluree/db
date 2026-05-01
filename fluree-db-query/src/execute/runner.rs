@@ -794,6 +794,23 @@ pub async fn execute_prepared<'a, 'b>(
     run_operator(prepared.operator, &ctx).await
 }
 
+/// Prepare and execute a query in a single call.
+///
+/// This is the canonical one-call entry point for callers that don't need to
+/// separate preparation from execution. Callers that want to inspect or share
+/// a `PreparedExecution` (for example, the view layer's eager + tracked
+/// variants) should call [`prepare_execution`] / [`prepare_execution_with_config`]
+/// and then [`execute_prepared`] explicitly.
+pub async fn execute<'a, 'b>(
+    db: GraphDbRef<'a>,
+    vars: &VarRegistry,
+    query: &ExecutableQuery,
+    config: ContextConfig<'a, 'b>,
+) -> Result<Vec<Batch>> {
+    let prepared = prepare_execution(db, query).await?;
+    execute_prepared(db, vars, prepared, config).await
+}
+
 // ============================================================================
 // Convenience wrappers for backward compatibility
 // ============================================================================

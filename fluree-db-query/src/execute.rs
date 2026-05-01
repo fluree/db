@@ -39,6 +39,7 @@ mod runner;
 mod where_plan;
 
 // Re-export public types
+pub use runner::execute;
 pub use runner::execute_prepared;
 pub use runner::ContextConfig;
 pub use runner::ExecutableQuery;
