@@ -202,259 +202,10 @@ pub async fn execute_pattern(
     Ok(batches)
 }
 
-/// Execute a pattern and collect all results into a single batch
-///
-/// Convenience function when you want all results at once.
-pub async fn execute_pattern_all(
-    db: GraphDbRef<'_>,
-    vars: &VarRegistry,
-    pattern: TriplePattern,
-) -> Result<Option<Batch>> {
-    let batches = execute_pattern(db, vars, pattern).await?;
-
-    if batches.is_empty() {
-        return Ok(None);
-    }
-
-    if batches.len() == 1 {
-        return Ok(batches.into_iter().next());
-    }
-
-    // Merge multiple batches into one
-    let schema_vec = batches[0].schema().to_vec();
-    let schema: Arc<[VarId]> = Arc::from(schema_vec.into_boxed_slice());
-    let num_cols = schema.len();
-
-    // Merge columns across all batches
-    let columns: Vec<Vec<Binding>> = (0..num_cols)
-        .map(|col_idx| {
-            batches
-                .iter()
-                .filter_map(|batch| batch.column_by_idx(col_idx))
-                .flat_map(|src_col| src_col.iter().cloned())
-                .collect()
-        })
-        .collect();
-
-    Ok(Some(Batch::new(schema, columns)?))
-}
-
-/// Execute a pattern with a `GraphDbRef` and an optional `from_t` for history queries.
-///
-/// `to_t` comes from `db.t`; `from_t` is the lower time bound for history.
-pub async fn execute_pattern_at(
-    db: GraphDbRef<'_>,
-    vars: &VarRegistry,
-    pattern: TriplePattern,
-    from_t: Option<i64>,
-) -> Result<Vec<Batch>> {
-    let ctx = ExecutionContext::from_graph_db_ref_with_from_t(db, vars, from_t);
-    // Current-state helper: BinaryHistoryScanOperator is single-purpose since the
-    // planner-mode refactor (always emits asserts + retracts), so use the
-    // current-state scan directly here.
-    let mut scan = BinaryScanOperator::new(pattern, None, Vec::new());
-
-    scan.open(&ctx).await?;
-
-    let mut batches = Vec::new();
-    while let Some(batch) = scan.next_batch(&ctx).await? {
-        batches.push(batch);
-    }
-
-    scan.close();
-    Ok(batches)
-}
-
-/// Execute a pattern against a `GraphDbRef`.
-///
-/// The `db` bundles snapshot, graph id, overlay (novelty), and as-of time.
-/// This replaces the old `execute_pattern_with_overlay` and
-/// `execute_pattern_with_overlay_at` functions.
-pub async fn execute_pattern_with_overlay(
-    db: GraphDbRef<'_>,
-    vars: &VarRegistry,
-    pattern: TriplePattern,
-) -> Result<Vec<Batch>> {
-    let ctx = ExecutionContext::from_graph_db_ref(db, vars);
-    // Current-state helper: BinaryHistoryScanOperator is single-purpose since the
-    // planner-mode refactor (always emits asserts + retracts), so use the
-    // current-state scan directly here.
-    let mut scan = BinaryScanOperator::new(pattern, None, Vec::new());
-
-    scan.open(&ctx).await?;
-
-    let mut batches = Vec::new();
-    while let Some(batch) = scan.next_batch(&ctx).await? {
-        batches.push(batch);
-    }
-
-    scan.close();
-    Ok(batches)
-}
-
-/// Execute a pattern with a `GraphDbRef` and an optional `from_t` for history queries.
-///
-/// `to_t` comes from `db.t`; `from_t` is the lower time bound for history.
-pub async fn execute_pattern_with_overlay_at(
-    db: GraphDbRef<'_>,
-    vars: &VarRegistry,
-    pattern: TriplePattern,
-    from_t: Option<i64>,
-) -> Result<Vec<Batch>> {
-    let ctx = ExecutionContext::from_graph_db_ref_with_from_t(db, vars, from_t);
-    // Current-state helper: BinaryHistoryScanOperator is single-purpose since the
-    // planner-mode refactor (always emits asserts + retracts), so use the
-    // current-state scan directly here.
-    let mut scan = BinaryScanOperator::new(pattern, None, Vec::new());
-
-    scan.open(&ctx).await?;
-
-    let mut batches = Vec::new();
-    while let Some(batch) = scan.next_batch(&ctx).await? {
-        batches.push(batch);
-    }
-
-    scan.close();
-    Ok(batches)
-}
-
-/// Execute WHERE patterns with overlay and time-travel support
-///
-/// This is the entry point for transaction WHERE clause execution.
-/// Returns all matching bindings as batches.
-///
-/// # Arguments
-///
-/// * `db` - Bundled database reference (snapshot + graph id + overlay + as-of time)
-/// * `vars` - Variable registry for the patterns
-/// * `patterns` - WHERE patterns to execute
-/// * `from_t` - Optional lower time bound for history queries
-///
-/// # Returns
-///
-/// Vector of result batches. If patterns is empty, returns a single batch
-/// with one empty solution (row with no columns).
-///
-pub async fn execute_where_with_overlay_at(
-    db: GraphDbRef<'_>,
-    vars: &VarRegistry,
-    patterns: &[Pattern],
-    from_t: Option<i64>,
-) -> Result<Vec<Batch>> {
-    if patterns.is_empty() {
-        // Empty WHERE = single empty solution (one row, zero columns)
-        let schema: Arc<[VarId]> = Arc::new([]);
-        return Ok(vec![Batch::empty(schema)?]);
-    }
-
-    let ctx = ExecutionContext::from_graph_db_ref_with_from_t(db, vars, from_t);
-    // Root: this is a transaction WHERE-clause executor. Even when `from_t` is
-    // set, semantics are "current state at `to_t` with from_t time bound for
-    // novelty visibility" — not a history-range query that emits asserts +
-    // retracts. Always plan as `Current`.
-    let mut operator = build_where_operators_seeded(
-        None,
-        patterns,
-        None,
-        None,
-        &temporal_mode::PlanningContext::current(),
-    )?;
-
-    operator.open(&ctx).await?;
-    let mut batches = Vec::new();
-    while let Some(batch) = operator.next_batch(&ctx).await? {
-        batches.push(batch);
-    }
-    operator.close();
-
-    Ok(batches)
-}
-
-/// Execute WHERE patterns with strict bind error handling.
-pub async fn execute_where_with_overlay_at_strict(
-    db: GraphDbRef<'_>,
-    vars: &VarRegistry,
-    patterns: &[Pattern],
-    from_t: Option<i64>,
-) -> Result<Vec<Batch>> {
-    if patterns.is_empty() {
-        let schema: Arc<[VarId]> = Arc::new([]);
-        return Ok(vec![Batch::empty(schema)?]);
-    }
-
-    let ctx =
-        ExecutionContext::from_graph_db_ref_with_from_t(db, vars, from_t).with_strict_bind_errors();
-    // Root: same as `execute_where_with_overlay_at` — transaction WHERE clause,
-    // current-state semantics regardless of `from_t`.
-    let mut operator = build_where_operators_seeded(
-        None,
-        patterns,
-        None,
-        None,
-        &temporal_mode::PlanningContext::current(),
-    )?;
-
-    operator.open(&ctx).await?;
-    let mut batches = Vec::new();
-    while let Some(batch) = operator.next_batch(&ctx).await? {
-        batches.push(batch);
-    }
-    operator.close();
-
-    Ok(batches)
-}
-
-/// Execute WHERE patterns with strict bind error handling, optionally providing a runtime dataset.
-///
-/// When `dataset` is provided, GRAPH patterns like `GRAPH <iri> { ... }` can resolve named
-/// graphs by IRI (via `DataSet::named_graph` / `DataSet::has_named_graph`). Without a dataset,
-/// GRAPH patterns only execute for:
-/// - R2RML graph sources (if configured via `ExecutionContext`)
-/// - a graph IRI that matches the db's `ledger_id` alias
-pub async fn execute_where_with_overlay_at_strict_in_dataset<'a>(
-    db: GraphDbRef<'a>,
-    vars: &VarRegistry,
-    patterns: &[Pattern],
-    from_t: Option<i64>,
-    dataset: Option<&'a DataSet<'a>>,
-) -> Result<Vec<Batch>> {
-    if patterns.is_empty() {
-        let schema: Arc<[VarId]> = Arc::new([]);
-        return Ok(vec![Batch::empty(schema)?]);
-    }
-
-    let mut ctx =
-        ExecutionContext::from_graph_db_ref_with_from_t(db, vars, from_t).with_strict_bind_errors();
-    if let Some(ds) = dataset {
-        ctx = ctx.with_dataset(ds);
-    }
-    // Root: transaction WHERE clause executor (dataset-aware variant).
-    // History-range planning is detected at the dataset/view layer in
-    // `view::dataset_query` before prepare runs; this transaction-side path
-    // is always current-state.
-    let mut operator = build_where_operators_seeded(
-        None,
-        patterns,
-        None,
-        None,
-        &temporal_mode::PlanningContext::current(),
-    )?;
-
-    operator.open(&ctx).await?;
-    let mut batches = Vec::new();
-    while let Some(batch) = operator.next_batch(&ctx).await? {
-        batches.push(batch);
-    }
-    operator.close();
-
-    Ok(batches)
-}
-
 /// Cursor handle over a WHERE operator tree that yields result batches
 /// incrementally via [`WhereCursor::next_batch`].
 ///
-/// This is the streaming counterpart to
-/// [`execute_where_with_overlay_at_strict_in_dataset`]. Instead of driving
+/// This is the streaming counterpart to [`execute_where`]. Instead of driving
 /// the operator to completion and collecting a `Vec<Batch>`, the caller
 /// pulls one batch at a time — typically to process (materialize, generate
 /// flakes, push into an accumulator) and drop before pulling the next.
@@ -549,53 +300,6 @@ impl Drop for WhereCursor<'_> {
     }
 }
 
-/// Open a streaming WHERE cursor. Same input shape and execution semantics
-/// as [`execute_where_with_overlay_at_strict_in_dataset`], but returns a
-/// [`WhereCursor`] for per-batch consumption instead of buffering the
-/// entire result into a `Vec<Batch>`.
-pub async fn execute_where_streaming_in_dataset<'a>(
-    db: GraphDbRef<'a>,
-    vars: &'a VarRegistry,
-    patterns: &[Pattern],
-    from_t: Option<i64>,
-    dataset: Option<&'a DataSet<'a>>,
-) -> Result<WhereCursor<'a>> {
-    if patterns.is_empty() {
-        let schema: Arc<[VarId]> = Arc::new([]);
-        return Ok(WhereCursor {
-            inner: CursorInner::SingleEmpty {
-                schema,
-                emitted: false,
-            },
-        });
-    }
-
-    let mut ctx =
-        ExecutionContext::from_graph_db_ref_with_from_t(db, vars, from_t).with_strict_bind_errors();
-    if let Some(ds) = dataset {
-        ctx = ctx.with_dataset(ds);
-    }
-    // Root: transaction WHERE clause executor (dataset-aware variant).
-    // History-range planning is detected at the dataset/view layer in
-    // `view::dataset_query` before prepare runs; this transaction-side path
-    // is always current-state.
-    let mut operator = build_where_operators_seeded(
-        None,
-        patterns,
-        None,
-        None,
-        &temporal_mode::PlanningContext::current(),
-    )?;
-    operator.open(&ctx).await?;
-    Ok(WhereCursor {
-        inner: CursorInner::Operator(Box::new(WhereCursorOperator {
-            operator,
-            ctx,
-            closed: false,
-        })),
-    })
-}
-
 /// Open a streaming WHERE cursor over `patterns`.
 ///
 /// Strict-by-default: bind evaluation errors become query errors, matching
@@ -682,8 +386,8 @@ mod tests {
     }
 
     /// Empty-patterns cursor yields one empty batch then end-of-stream,
-    /// matching the eager `execute_where_with_overlay_at_strict_in_dataset`
-    /// behavior of returning `vec![Batch::empty(schema)?]`.
+    /// matching the eager `execute_where` behavior of returning
+    /// `vec![Batch::empty(schema)?]`.
     #[tokio::test]
     async fn test_streaming_cursor_empty_patterns() {
         use crate::binding::Batch;
@@ -694,7 +398,7 @@ mod tests {
         let overlay = NoOverlay;
         let db = GraphDbRef::new(&snapshot, 0, &overlay, 0);
 
-        let mut cursor = execute_where_streaming_in_dataset(db, &vars, &[], None, None)
+        let mut cursor = execute_where_streaming(db, &vars, &[], None)
             .await
             .expect("cursor");
 
@@ -721,7 +425,7 @@ mod tests {
         let overlay = NoOverlay;
         let db = GraphDbRef::new(&snapshot, 0, &overlay, 0);
 
-        let mut cursor = execute_where_streaming_in_dataset(db, &vars, &[], None, None)
+        let mut cursor = execute_where_streaming(db, &vars, &[], None)
             .await
             .expect("cursor");
 
@@ -745,7 +449,7 @@ mod tests {
         let overlay = NoOverlay;
         let db = GraphDbRef::new(&snapshot, 0, &overlay, 0);
 
-        let mut cursor = execute_where_streaming_in_dataset(db, &vars, &[], None, None)
+        let mut cursor = execute_where_streaming(db, &vars, &[], None)
             .await
             .expect("cursor");
 
