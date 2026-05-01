@@ -219,8 +219,8 @@ pub use fluree_db_nameservice::{
 };
 pub use fluree_db_novelty::Novelty;
 pub use fluree_db_query::{
-    execute, execute_pattern, execute_pattern_with_overlay, execute_pattern_with_overlay_at, Batch,
-    ContextConfig, ExecutableQuery, NoOpR2rmlProvider, Pattern, QueryOptions, VarRegistry,
+    execute, execute_pattern, Batch, ContextConfig, ExecutableQuery, NoOpR2rmlProvider, Pattern,
+    QueryOptions, VarRegistry,
 };
 // Re-export for lower-level pattern-based queries (internal/advanced use)
 pub use fluree_db_query::{Term, TriplePattern};

@@ -29,9 +29,7 @@ use fluree_db_core::ledger_config::{
     RollbackGuard, ShaclDefaults, TransactDefaults, TrustMode, TrustPolicy, ValidationMode,
 };
 use fluree_db_core::{GraphDbRef, LedgerSnapshot, OverlayProvider, Sid, CONFIG_GRAPH_ID};
-use fluree_db_query::{
-    execute_pattern_with_overlay_at, Binding, Ref, Term, TriplePattern, VarRegistry,
-};
+use fluree_db_query::{execute_pattern, Binding, Ref, Term, TriplePattern, VarRegistry};
 use fluree_vocab::config_iris;
 use fluree_vocab::rdf::TYPE as RDF_TYPE_IRI;
 
@@ -633,7 +631,7 @@ async fn find_instances_of_type(
     // Eager materialization: config resolver needs concrete Sid/Lit bindings,
     // not late-materialized EncodedSid/EncodedLit from binary scans.
     let db = GraphDbRef::new(snapshot, CONFIG_GRAPH_ID, overlay, to_t).eager();
-    let batches = execute_pattern_with_overlay_at(db, &vars, pattern, None).await?;
+    let batches = execute_pattern(db, &vars, pattern).await?;
 
     let mut results = Vec::new();
     for batch in &batches {
@@ -670,7 +668,7 @@ async fn query_config_predicate(
     );
 
     let db = GraphDbRef::new(snapshot, CONFIG_GRAPH_ID, overlay, to_t).eager();
-    let batches = execute_pattern_with_overlay_at(db, &vars, pattern, None).await?;
+    let batches = execute_pattern(db, &vars, pattern).await?;
 
     let mut results = Vec::new();
     for batch in &batches {

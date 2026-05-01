@@ -44,7 +44,7 @@ use std::sync::Arc;
 use fluree_db_core::graph_registry::{CONFIG_GRAPH_ID, DEFAULT_GRAPH_ID, TXN_META_GRAPH_ID};
 use fluree_db_core::ledger_config::{GraphSourceRef, ReasoningDefaults};
 use fluree_db_core::{GraphDbRef, GraphId, LedgerSnapshot, OverlayProvider};
-use fluree_db_query::{execute_pattern_with_overlay_at, Ref, Term, TriplePattern, VarRegistry};
+use fluree_db_query::{execute_pattern, Ref, Term, TriplePattern, VarRegistry};
 use fluree_vocab::config_iris;
 
 use crate::error::{ApiError, Result};
@@ -317,7 +317,7 @@ async fn scan_owl_imports_in_graph(
     );
 
     let db = GraphDbRef::new(snapshot, g_id, overlay, to_t).eager();
-    let batches = execute_pattern_with_overlay_at(db, &vars, pattern, None)
+    let batches = execute_pattern(db, &vars, pattern)
         .await
         .map_err(|e| {
             ApiError::OntologyImport(format!("failed to scan owl:imports in graph {g_id}: {e}"))

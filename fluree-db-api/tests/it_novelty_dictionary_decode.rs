@@ -12,7 +12,7 @@ mod support;
 use fluree_db_api::{FlureeBuilder, IndexConfig};
 use fluree_db_core::FlakeValue;
 use fluree_db_query::{
-    execute_where_with_overlay_at, ExecutionContext, Pattern, Ref, Term, TriplePattern, VarRegistry,
+    execute_where, ExecutionContext, Pattern, Ref, Term, TriplePattern, VarRegistry,
 };
 use fluree_db_transact::{CommitOpts, TxnOpts};
 use serde_json::json;
@@ -153,10 +153,9 @@ SELECT ?o WHERE { ex:s ex:label ?o }
                 Ref::Sid(fluree_db_core::Sid::new(0, "http://example.org/label")),
                 Term::Var(o_var),
             ))];
-            let batches =
-                execute_where_with_overlay_at(after.as_graph_db_ref(0), &vars, &patterns, None)
-                    .await
-                    .expect("execute_where_with_overlay_at");
+            let batches = execute_where(after.as_graph_db_ref(0), &vars, &patterns, None)
+                .await
+                .expect("execute_where");
             assert!(!batches.is_empty(), "expected at least one batch");
             let batch = &batches[0];
             let o_col = batch.column_by_idx(0).expect("o column");
