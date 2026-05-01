@@ -162,6 +162,7 @@ pub use storage::{
     MemoryContentStore,
     MemoryStorage,
     ReadHint,
+    RemoteObject,
     Storage,
     StorageBackend,
     StorageCas,
@@ -207,7 +208,8 @@ pub mod prelude {
     pub use crate::storage::FileStorage;
     pub use crate::storage::{
         CasAction, CasOutcome, ContentAddressedWrite, ContentStore, ContentWriteResult, ListResult,
-        MemoryContentStore, MemoryStorage, ReadHint, Storage, StorageCas, StorageContentStore,
-        StorageDelete, StorageExtError, StorageExtResult, StorageList, StorageRead, StorageWrite,
+        MemoryContentStore, MemoryStorage, ReadHint, RemoteObject, Storage, StorageCas,
+        StorageContentStore, StorageDelete, StorageExtError, StorageExtResult, StorageList,
+        StorageRead, StorageWrite,
     };
 }
