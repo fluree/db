@@ -544,8 +544,7 @@ pub async fn run_operator(
 /// Execution context configuration
 ///
 /// Specifies the optional components to add to the execution context.
-/// This eliminates duplication in the execute_prepared_* functions.
-#[derive(Default)]
+/// This is the unified knob for all query execution paths.
 pub struct ContextConfig<'a, 'b> {
     pub tracker: Option<&'a Tracker>,
     /// Policy enforcer for async policy evaluation with full f:query support.
@@ -593,6 +592,33 @@ pub struct ContextConfig<'a, 'b> {
     pub english_lang_id: Option<u16>,
     /// Remote SERVICE executor for `fluree:remote:` endpoints.
     pub remote_service: Option<&'b dyn crate::remote_service::RemoteServiceExecutor>,
+}
+
+impl<'a, 'b> Default for ContextConfig<'a, 'b> {
+    fn default() -> Self {
+        // strict-by-default: query semantics treat bind eval errors as query
+        // errors. Every wrapper in this file set `strict_bind_errors: true`,
+        // and the view layer sets it true; the only lax path was the legacy
+        // `execute_where_with_overlay_at` family in `lib.rs`, which never
+        // went through `ContextConfig`.
+        Self {
+            tracker: None,
+            policy_enforcer: None,
+            dataset: None,
+            r2rml: None,
+            bm25_provider: None,
+            vector_provider: None,
+            from_t: None,
+            strict_bind_errors: true,
+            binary_store: None,
+            binary_g_id: 0,
+            dict_novelty: None,
+            spatial_providers: None,
+            fulltext_providers: None,
+            english_lang_id: None,
+            remote_service: None,
+        }
+    }
 }
 
 /// Parameters for query execution with dataset, policy, and search providers.
