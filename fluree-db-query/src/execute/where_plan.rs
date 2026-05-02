@@ -62,7 +62,7 @@ fn filter_not_bound_var(expr: &Expression) -> Option<VarId> {
 
 #[inline]
 fn pattern_list_contains_var(patterns: &[Pattern], v: VarId) -> bool {
-    patterns.iter().any(|p| p.variables().contains(&v))
+    patterns.iter().any(|p| p.referenced_vars().contains(&v))
 }
 
 fn collect_grouped_single_triple_optionals(
@@ -129,7 +129,7 @@ pub fn collect_var_stats(
         for p in patterns {
             match p {
                 Pattern::Triple(tp) => {
-                    for v in tp.variables() {
+                    for v in tp.referenced_vars() {
                         bump_count(counts, v);
                         vars.insert(v);
                     }
@@ -143,13 +143,13 @@ pub fn collect_var_stats(
                 Pattern::Bind { var, expr } => {
                     bump_count(counts, *var);
                     vars.insert(*var);
-                    for v in expr.variables() {
+                    for v in expr.referenced_vars() {
                         bump_count(counts, v);
                         vars.insert(v);
                     }
                 }
                 Pattern::Filter(expr) => {
-                    for v in expr.variables() {
+                    for v in expr.referenced_vars() {
                         bump_count(counts, v);
                         vars.insert(v);
                     }
@@ -178,7 +178,7 @@ pub fn collect_var_stats(
                     walk(&sq.patterns, counts, vars);
                 }
                 Pattern::PropertyPath(pp) => {
-                    for v in pp.variables() {
+                    for v in pp.referenced_vars() {
                         bump_count(counts, v);
                         vars.insert(v);
                     }
@@ -253,7 +253,7 @@ fn precompute_suffix_vars(patterns: &[Pattern]) -> Vec<HashSet<VarId>> {
     let mut sets = vec![HashSet::new(); n + 1];
     for j in (0..n).rev() {
         sets[j] = sets[j + 1].clone();
-        sets[j].extend(patterns[j].variables());
+        sets[j].extend(patterns[j].referenced_vars());
     }
     sets
 }
@@ -299,7 +299,7 @@ impl BindPattern {
         expr: &Expression,
         bound_vars: &HashSet<VarId>,
     ) -> Option<Self> {
-        let required_vars: HashSet<VarId> = expr.variables().into_iter().collect();
+        let required_vars: HashSet<VarId> = expr.referenced_vars().into_iter().collect();
         required_vars.is_subset(bound_vars).then(|| Self {
             required_vars,
             var,
@@ -327,7 +327,7 @@ pub struct FilterPattern {
 
 impl FilterPattern {
     pub fn new(original_idx: usize, expr: Expression) -> Self {
-        let required_vars = expr.variables().into_iter().collect();
+        let required_vars = expr.referenced_vars().into_iter().collect();
         Self {
             original_idx,
             required_vars,
@@ -437,7 +437,7 @@ pub(crate) fn collect_property_join_tail(
     let mut combined = required_triples.to_vec();
     let mut available_required_vars: HashSet<VarId> = required_triples
         .iter()
-        .flat_map(crate::ir::triple::TriplePattern::variables)
+        .flat_map(crate::ir::triple::TriplePattern::produced_vars)
         .collect();
 
     while let Some(Pattern::Optional(inner_patterns)) = patterns.get(i) {
@@ -463,7 +463,7 @@ pub(crate) fn collect_property_join_tail(
     while i < patterns.len() {
         match &patterns[i] {
             Pattern::Filter(expr) => {
-                let required: HashSet<VarId> = expr.variables().into_iter().collect();
+                let required: HashSet<VarId> = expr.referenced_vars().into_iter().collect();
                 if !required.is_subset(&available_required_vars) {
                     break;
                 }
@@ -545,43 +545,6 @@ fn bound_vars_from_operator(operator: &Option<BoxedOperator>) -> HashSet<VarId> 
         .as_ref()
         .map(|op| op.schema().iter().copied().collect())
         .unwrap_or_default()
-}
-
-/// Collect variables that a pattern **produces** (binds), excluding variables that
-/// are only consumed (e.g., referenced in FILTER expressions but not bound by any
-/// triple/bind/values pattern). Used to determine which correlation vars can serve
-/// as semijoin keys for EXISTS.
-fn produced_variables(pattern: &Pattern) -> Vec<VarId> {
-    match pattern {
-        Pattern::Triple(tp) => tp.variables(),
-        Pattern::Bind { var, .. } => vec![*var],
-        Pattern::Values { vars, .. } => vars.clone(),
-        Pattern::Optional(inner)
-        | Pattern::Minus(inner)
-        | Pattern::Exists(inner)
-        | Pattern::NotExists(inner) => inner.iter().flat_map(produced_variables).collect(),
-        Pattern::Union(branches) => branches
-            .iter()
-            .flat_map(|branch| branch.iter().flat_map(produced_variables))
-            .collect(),
-        Pattern::PropertyPath(pp) => pp.variables(),
-        Pattern::Subquery(sq) => sq.variables(),
-        Pattern::IndexSearch(isp) => isp.variables(),
-        Pattern::VectorSearch(vsp) => vsp.variables(),
-        Pattern::R2rml(r2rml) => r2rml.variables(),
-        Pattern::GeoSearch(gsp) => gsp.variables(),
-        Pattern::S2Search(s2p) => s2p.variables(),
-        Pattern::Graph { name, patterns } => {
-            let mut vars: Vec<VarId> = patterns.iter().flat_map(produced_variables).collect();
-            if let crate::ir::GraphName::Var(v) = name {
-                vars.push(*v);
-            }
-            vars
-        }
-        Pattern::Service(sp) => sp.variables(),
-        // FILTER only consumes variables, never produces them.
-        Pattern::Filter(_) => vec![],
-    }
 }
 
 /// Apply VALUES patterns on top of an existing operator.
@@ -799,12 +762,12 @@ fn build_property_join_block(
 
     let mut available_vars: HashSet<VarId> = triples
         .iter()
-        .flat_map(crate::ir::triple::TriplePattern::variables)
+        .flat_map(crate::ir::triple::TriplePattern::produced_vars)
         .collect();
     available_vars.extend(
         optional_triples
             .iter()
-            .flat_map(crate::ir::triple::TriplePattern::variables),
+            .flat_map(crate::ir::triple::TriplePattern::produced_vars),
     );
 
     let (inline_ops, pending_binds, pending_filters) = build_inline_ops(
@@ -815,10 +778,10 @@ fn build_property_join_block(
     );
     for op in &inline_ops {
         match op {
-            InlineOperator::Filter(expr) => needed.extend(expr.variables()),
+            InlineOperator::Filter(expr) => needed.extend(expr.referenced_vars()),
             InlineOperator::Bind { var, expr } => {
                 needed.insert(*var);
-                needed.extend(expr.variables());
+                needed.extend(expr.referenced_vars());
             }
         }
     }
@@ -979,7 +942,7 @@ fn build_sequential_join_block(
 
     for (k, tp) in triples.iter().enumerate() {
         let mut vars_after: HashSet<VarId> = bound.clone();
-        for v in tp.variables() {
+        for v in tp.produced_vars() {
             vars_after.insert(v);
         }
 
@@ -1003,10 +966,10 @@ fn build_sequential_join_block(
             live.extend(
                 triples[k + 1..]
                     .iter()
-                    .flat_map(crate::ir::triple::TriplePattern::variables),
+                    .flat_map(crate::ir::triple::TriplePattern::referenced_vars),
             );
-            live.extend(pending_filters.iter().flat_map(|f| f.expr.variables()));
-            live.extend(pending_binds.iter().flat_map(|b| b.expr.variables()));
+            live.extend(pending_filters.iter().flat_map(|f| f.expr.referenced_vars()));
+            live.extend(pending_binds.iter().flat_map(|b| b.expr.referenced_vars()));
             live.into_iter().collect::<Vec<VarId>>()
         });
 
@@ -1155,7 +1118,7 @@ pub fn collect_inner_join_block(patterns: &[Pattern], start: usize) -> InnerJoin
             }
             Pattern::Triple(tp) => {
                 // Triples add bindings (subject/object vars) to the local bound set.
-                bound_vars.extend(tp.variables());
+                bound_vars.extend(tp.produced_vars());
                 triples.push(tp.clone());
                 i += 1;
             }
@@ -1680,7 +1643,7 @@ pub fn build_where_operators_seeded_with_needed(
                 // Vars only consumed (e.g., in FILTER expressions) require per-row seeding
                 // and cannot serve as semijoin keys.
                 let inner_produced_vars: std::collections::HashSet<VarId> =
-                    inner_patterns.iter().flat_map(produced_variables).collect();
+                    inner_patterns.iter().flat_map(Pattern::produced_vars).collect();
 
                 // Key vars in child schema order (stable, matches column layout).
                 let key_vars: Vec<VarId> = child
@@ -1695,7 +1658,7 @@ pub fn build_where_operators_seeded_with_needed(
                 // patterns can't be executed standalone — fall back to ExistsOperator.
                 let inner_all_vars: std::collections::HashSet<VarId> = inner_patterns
                     .iter()
-                    .flat_map(super::super::ir::Pattern::variables)
+                    .flat_map(super::super::ir::Pattern::referenced_vars)
                     .collect();
                 let outer_schema: std::collections::HashSet<VarId> =
                     child.schema().iter().copied().collect();
@@ -2048,12 +2011,12 @@ pub fn build_triple_operators(
 
     let mut seen_vars: HashSet<VarId> = HashSet::new();
     for (k, pattern) in triples_for_exec.iter().enumerate() {
-        seen_vars.extend(pattern.variables());
+        seen_vars.extend(pattern.produced_vars());
         // Compute live vars: required_where_vars ∪ vars from subsequent triples
         let live_vars = rwv_set.as_ref().map(|base| {
             let suffix_vars: HashSet<VarId> = triples_for_exec[k + 1..]
                 .iter()
-                .flat_map(crate::ir::triple::TriplePattern::variables)
+                .flat_map(crate::ir::triple::TriplePattern::referenced_vars)
                 .collect();
             base.union(&suffix_vars).copied().collect::<Vec<VarId>>()
         });
@@ -2132,7 +2095,7 @@ mod tests {
         // Preserve historical test behavior: keep all triple vars.
         let needed: HashSet<VarId> = triples
             .iter()
-            .flat_map(crate::ir::triple::TriplePattern::variables)
+            .flat_map(crate::ir::triple::TriplePattern::produced_vars)
             .collect();
         let (counts, protected) = compute_where_var_stats(
             &triples
@@ -3006,7 +2969,7 @@ mod tests {
 
     /// Helper: build a BindPattern from a var and expression.
     fn make_bind(var: VarId, expr: Expression) -> BindPattern {
-        let required_vars = expr.variables().into_iter().collect();
+        let required_vars = expr.referenced_vars().into_iter().collect();
         BindPattern {
             required_vars,
             var,

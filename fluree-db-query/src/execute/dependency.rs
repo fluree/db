@@ -68,7 +68,7 @@ pub fn compute_variable_deps(query: &ParsedQuery, options: &QueryOptions) -> Opt
         required_bind_vars.push(deps.iter().copied().collect());
         // Then trace backward through the bind expression.
         if deps.remove(var) {
-            deps.extend(expr.variables());
+            deps.extend(expr.referenced_vars());
         }
     }
     // Reverse so indices match the forward (execution) order of post_binds.
@@ -80,7 +80,7 @@ pub fn compute_variable_deps(query: &ParsedQuery, options: &QueryOptions) -> Opt
     // HAVING expression variables: needed in HAVING's input but not
     // necessarily in its output (HAVING evaluates before trimming).
     if let Some(ref having_expr) = options.having {
-        deps.extend(having_expr.variables());
+        deps.extend(having_expr.referenced_vars());
     }
 
     // Record what Aggregate's output must contain (before tracing aggregates backward).

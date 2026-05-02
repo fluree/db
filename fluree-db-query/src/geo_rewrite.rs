@@ -244,50 +244,11 @@ fn is_var_used_elsewhere(
     skip_bind: usize,
     skip_filter: usize,
 ) -> bool {
-    for (idx, p) in patterns.iter().enumerate() {
-        if idx == skip_triple || idx == skip_bind || idx == skip_filter {
-            continue;
-        }
-        if pattern_references_var(p, var) {
-            return true;
-        }
-    }
-    false
-}
-
-/// Check if a pattern references a variable
-fn pattern_references_var(pattern: &Pattern, var: VarId) -> bool {
-    match pattern {
-        Pattern::Triple(tp) => {
-            tp.s.as_var() == Some(var) || tp.p.as_var() == Some(var) || term_is_var(&tp.o, var)
-        }
-        Pattern::Filter(expr) => expr.variables().contains(&var),
-        Pattern::Bind { var: v, expr } => *v == var || expr.variables().contains(&var),
-        Pattern::Optional(inner)
-        | Pattern::Minus(inner)
-        | Pattern::Exists(inner)
-        | Pattern::NotExists(inner) => inner.iter().any(|p| pattern_references_var(p, var)),
-        Pattern::Union(branches) => branches
-            .iter()
-            .any(|branch| branch.iter().any(|p| pattern_references_var(p, var))),
-        Pattern::Graph { patterns, name } => {
-            let name_matches = matches!(name, crate::ir::GraphName::Var(v) if *v == var);
-            name_matches || patterns.iter().any(|p| pattern_references_var(p, var))
-        }
-        Pattern::Values { vars, .. } => vars.contains(&var),
-        Pattern::GeoSearch(gsp) => gsp.variables().contains(&var),
-        Pattern::S2Search(s2p) => s2p.variables().contains(&var),
-        Pattern::PropertyPath(pp) => pp.variables().contains(&var),
-        Pattern::Subquery(sq) => sq.variables().contains(&var),
-        Pattern::IndexSearch(isp) => isp.variables().contains(&var),
-        Pattern::VectorSearch(vsp) => vsp.variables().contains(&var),
-        Pattern::Service(sp) => sp.variables().contains(&var),
-        Pattern::R2rml(r2rml) => r2rml.variables().contains(&var),
-    }
-}
-
-fn term_is_var(term: &Term, var: VarId) -> bool {
-    matches!(term, Term::Var(v) if *v == var)
+    patterns
+        .iter()
+        .enumerate()
+        .filter(|(idx, _)| *idx != skip_triple && *idx != skip_bind && *idx != skip_filter)
+        .any(|(_, p)| p.referenced_vars().contains(&var))
 }
 
 /// Apply rewrites to the pattern list

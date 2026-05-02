@@ -226,8 +226,13 @@ impl TriplePattern {
         }
     }
 
-    /// Get the variables in this pattern (in order: s, p, o)
-    pub fn variables(&self) -> Vec<VarId> {
+    /// Variables this pattern mentions, in order: s, p, o.
+    ///
+    /// For a triple pattern, every variable position is both *referenced*
+    /// by the pattern (the planner needs to know about it) and *produced*
+    /// when the pattern matches (the row gains a binding for it). The two
+    /// semantic helpers below therefore both delegate here.
+    fn positional_vars(&self) -> Vec<VarId> {
         let mut vars = Vec::with_capacity(3);
         if let Ref::Var(v) = &self.s {
             vars.push(*v);
@@ -239,6 +244,16 @@ impl TriplePattern {
             vars.push(*v);
         }
         vars
+    }
+
+    /// Variables mentioned anywhere in this pattern.
+    pub fn referenced_vars(&self) -> Vec<VarId> {
+        self.positional_vars()
+    }
+
+    /// Variables this pattern adds to a matching row's binding set.
+    pub fn produced_vars(&self) -> Vec<VarId> {
+        self.positional_vars()
     }
 
     /// Check if subject is bound (not a variable)
@@ -325,7 +340,7 @@ mod tests {
             Term::Var(VarId(1)),
         );
 
-        let vars = pattern.variables();
+        let vars = pattern.produced_vars();
         assert_eq!(vars.len(), 2);
         assert_eq!(vars[0], VarId(0));
         assert_eq!(vars[1], VarId(1));

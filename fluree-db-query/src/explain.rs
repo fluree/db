@@ -219,7 +219,7 @@ fn build_pattern_display(pattern: &TriplePattern, stats: Option<&StatsView>) -> 
         pattern_type,
         selectivity_score,
         inputs,
-        variables: pattern.variables(),
+        variables: pattern.produced_vars(),
     }
 }
 
@@ -383,7 +383,7 @@ fn reorder_for_explain(
                 if !has_bound {
                     true
                 } else {
-                    p.variables().iter().any(|v| bound_vars.contains(v))
+                    p.produced_vars().iter().any(|v| bound_vars.contains(v))
                 }
             })
             .map(|(i, _)| i)
@@ -407,7 +407,7 @@ fn reorder_for_explain(
             .unwrap();
 
         let chosen = remaining.remove(best_idx);
-        for var in chosen.variables() {
+        for var in chosen.produced_vars() {
             bound_vars.insert(var);
         }
         ordered.push(chosen);
@@ -576,7 +576,7 @@ fn build_general_pattern_display(
     stats: Option<&StatsView>,
 ) -> GeneralPatternDisplay {
     let cardinality = estimate_pattern(pattern, &HashSet::new(), stats);
-    let variables = pattern.variables();
+    let variables = pattern.produced_vars();
 
     let triple_detail = if let Pattern::Triple(tp) = pattern {
         Some(build_pattern_display(tp, stats))

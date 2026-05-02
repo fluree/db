@@ -124,7 +124,7 @@ pub fn extract_lookahead_bounds_with_consumption(
 /// Count unique variables referenced in a filter expression
 pub fn count_filter_vars(expr: &Expression) -> usize {
     // Use the existing variables() method on Expression
-    let vars: HashSet<VarId> = expr.variables().into_iter().collect();
+    let vars: HashSet<VarId> = expr.referenced_vars().into_iter().collect();
     vars.len()
 }
 

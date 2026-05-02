@@ -315,7 +315,7 @@ fn collect_bound_variables(patterns: &[Pattern]) -> Vec<VarId> {
                     collect(&sp.patterns, seen, out);
                 }
                 Pattern::PropertyPath(pp) => {
-                    for v in pp.variables() {
+                    for v in pp.produced_vars() {
                         add(v, seen, out);
                     }
                 }

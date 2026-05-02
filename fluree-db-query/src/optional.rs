@@ -168,7 +168,7 @@ impl PatternOptionalBuilder {
     ) -> Self {
         // Determine optional-only vars (in optional but not in required)
         let required_vars: std::collections::HashSet<_> = required_schema.iter().copied().collect();
-        let pattern_vars = pattern.variables();
+        let pattern_vars = pattern.produced_vars();
         let optional_only_vars: Vec<_> = pattern_vars
             .iter()
             .filter(|v| !required_vars.contains(v))
@@ -234,7 +234,7 @@ impl PatternOptionalBuilder {
         pattern: &TriplePattern,
         optional_only_vars: &[VarId],
     ) -> Vec<UnifyInstruction> {
-        let pattern_vars = pattern.variables();
+        let pattern_vars = pattern.produced_vars();
 
         pattern_vars
             .iter()
@@ -980,7 +980,7 @@ impl PlanTreeOptionalBuilder {
         let mut optional_vars: Vec<VarId> = Vec::new();
         let mut seen: HashSet<VarId> = HashSet::new();
         for p in &inner_patterns {
-            for v in p.variables() {
+            for v in p.produced_vars() {
                 if seen.insert(v) {
                     optional_vars.push(v);
                 }

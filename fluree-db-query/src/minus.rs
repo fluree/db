@@ -454,7 +454,7 @@ impl Operator for MinusOperator {
 /// Collect all variables referenced in a list of patterns
 fn collect_vars_from_patterns(patterns: &[Pattern], vars: &mut HashSet<VarId>) {
     for p in patterns {
-        for v in p.variables() {
+        for v in p.referenced_vars() {
             vars.insert(v);
         }
     }

@@ -99,10 +99,25 @@ impl SubqueryPattern {
         self
     }
 
-    /// Get variables from the select list
-    pub fn variables(&self) -> Vec<VarId> {
+    /// Variables the subquery exposes to its enclosing scope (its SELECT list).
+    pub fn produced_vars(&self) -> Vec<VarId> {
         self.select.clone()
     }
+
+    /// Variables mentioned anywhere in the subquery, including inside its
+    /// body. Body-internal variables that aren't in `select` are still
+    /// listed; correlation analysis at the call site can subtract
+    /// [`Self::produced_vars`] if it needs only the free variables.
+    pub fn referenced_vars(&self) -> Vec<VarId> {
+        let mut vars: Vec<VarId> = self
+            .patterns
+            .iter()
+            .flat_map(Pattern::referenced_vars)
+            .collect();
+        vars.extend(self.select.iter().copied());
+        vars
+    }
+
 }
 
 // ============================================================================
@@ -246,14 +261,35 @@ impl ServicePattern {
         }
     }
 
-    /// Get all variables referenced by this pattern
-    pub fn variables(&self) -> Vec<VarId> {
-        let mut vars: Vec<VarId> = self.patterns.iter().flat_map(Pattern::variables).collect();
+    /// Variables this service pattern adds to the row's binding set: the
+    /// produced bindings of the inner patterns (which the remote endpoint
+    /// returns), plus the endpoint variable itself when the endpoint is a
+    /// variable (the row gets bound to the iterating service IRI).
+    pub fn produced_vars(&self) -> Vec<VarId> {
+        let mut vars: Vec<VarId> = self
+            .patterns
+            .iter()
+            .flat_map(Pattern::produced_vars)
+            .collect();
         if let ServiceEndpoint::Var(v) = &self.endpoint {
             vars.push(*v);
         }
         vars
     }
+
+    /// Variables mentioned anywhere in this service pattern.
+    pub fn referenced_vars(&self) -> Vec<VarId> {
+        let mut vars: Vec<VarId> = self
+            .patterns
+            .iter()
+            .flat_map(Pattern::referenced_vars)
+            .collect();
+        if let ServiceEndpoint::Var(v) = &self.endpoint {
+            vars.push(*v);
+        }
+        vars
+    }
+
 }
 
 // ============================================================================
@@ -418,43 +454,86 @@ impl Pattern {
         }
     }
 
-    /// Get all variables referenced by this pattern
-    pub fn variables(&self) -> Vec<VarId> {
+    /// Variables mentioned anywhere in this pattern, recursively. Includes
+    /// vars referenced by filters and bind expressions, vars in subquery
+    /// bodies (not just their SELECT lists), and vars used as inputs by
+    /// search-adapter patterns.
+    pub fn referenced_vars(&self) -> Vec<VarId> {
         match self {
-            Pattern::Triple(tp) => tp.variables(),
-            Pattern::Filter(expr) => expr.variables(),
-            Pattern::Optional(inner) => inner.iter().flat_map(Pattern::variables).collect(),
+            Pattern::Triple(tp) => tp.referenced_vars(),
+            Pattern::Filter(expr) => expr.referenced_vars(),
+            Pattern::Optional(inner) => inner.iter().flat_map(Pattern::referenced_vars).collect(),
             Pattern::Union(branches) => branches
                 .iter()
-                .flat_map(|branch| branch.iter().flat_map(Pattern::variables))
+                .flat_map(|branch| branch.iter().flat_map(Pattern::referenced_vars))
                 .collect(),
             Pattern::Bind { var, expr } => {
-                let mut vars = expr.variables();
+                let mut vars = expr.referenced_vars();
                 vars.push(*var);
                 vars
             }
             Pattern::Values { vars, .. } => vars.clone(),
             Pattern::Minus(inner) | Pattern::Exists(inner) | Pattern::NotExists(inner) => {
-                inner.iter().flat_map(Pattern::variables).collect()
+                inner.iter().flat_map(Pattern::referenced_vars).collect()
             }
-            Pattern::PropertyPath(pp) => pp.variables(),
-            Pattern::Subquery(sq) => sq.variables(),
-            Pattern::IndexSearch(isp) => isp.variables(),
-            Pattern::VectorSearch(vsp) => vsp.variables(),
-            Pattern::R2rml(r2rml) => r2rml.variables(),
-            Pattern::GeoSearch(gsp) => gsp.variables(),
-            Pattern::S2Search(s2p) => s2p.variables(),
+            Pattern::PropertyPath(pp) => pp.referenced_vars(),
+            Pattern::Subquery(sq) => sq.referenced_vars(),
+            Pattern::IndexSearch(isp) => isp.referenced_vars(),
+            Pattern::VectorSearch(vsp) => vsp.referenced_vars(),
+            Pattern::R2rml(r2rml) => r2rml.referenced_vars(),
+            Pattern::GeoSearch(gsp) => gsp.referenced_vars(),
+            Pattern::S2Search(s2p) => s2p.referenced_vars(),
             Pattern::Graph { name, patterns } => {
-                let mut vars = patterns
+                let mut vars: Vec<VarId> = patterns
                     .iter()
-                    .flat_map(Pattern::variables)
-                    .collect::<Vec<_>>();
+                    .flat_map(Pattern::referenced_vars)
+                    .collect();
                 if let GraphName::Var(v) = name {
                     vars.push(*v);
                 }
                 vars
             }
-            Pattern::Service(sp) => sp.variables(),
+            Pattern::Service(sp) => sp.referenced_vars(),
+        }
+    }
+
+    /// Variables this pattern adds to the binding set of matched rows.
+    ///
+    /// Pure filters (`Filter`, `Minus`, `Exists`, `NotExists`) return the
+    /// empty set — they remove rows but don't introduce bindings. `Bind`
+    /// produces only its target variable, not the variables its expression
+    /// reads. `Subquery` exposes only its SELECT list outward, not body
+    /// internals.
+    pub fn produced_vars(&self) -> Vec<VarId> {
+        match self {
+            Pattern::Triple(tp) => tp.produced_vars(),
+            Pattern::Filter(_) => Vec::new(),
+            Pattern::Optional(inner) => inner.iter().flat_map(Pattern::produced_vars).collect(),
+            Pattern::Union(branches) => branches
+                .iter()
+                .flat_map(|branch| branch.iter().flat_map(Pattern::produced_vars))
+                .collect(),
+            Pattern::Bind { var, .. } => vec![*var],
+            Pattern::Values { vars, .. } => vars.clone(),
+            Pattern::Minus(_) | Pattern::Exists(_) | Pattern::NotExists(_) => Vec::new(),
+            Pattern::PropertyPath(pp) => pp.produced_vars(),
+            Pattern::Subquery(sq) => sq.produced_vars(),
+            Pattern::IndexSearch(isp) => isp.produced_vars(),
+            Pattern::VectorSearch(vsp) => vsp.produced_vars(),
+            Pattern::R2rml(r2rml) => r2rml.produced_vars(),
+            Pattern::GeoSearch(gsp) => gsp.produced_vars(),
+            Pattern::S2Search(s2p) => s2p.produced_vars(),
+            Pattern::Graph { name, patterns } => {
+                let mut vars: Vec<VarId> = patterns
+                    .iter()
+                    .flat_map(Pattern::produced_vars)
+                    .collect();
+                if let GraphName::Var(v) = name {
+                    vars.push(*v);
+                }
+                vars
+            }
+            Pattern::Service(sp) => sp.produced_vars(),
         }
     }
 
@@ -499,7 +578,7 @@ mod tests {
     #[test]
     fn test_pattern_variables() {
         let pattern = Pattern::Triple(test_pattern());
-        let vars = pattern.variables();
+        let vars = pattern.referenced_vars();
         assert_eq!(vars.len(), 2);
         assert!(vars.contains(&VarId(0)));
         assert!(vars.contains(&VarId(1)));

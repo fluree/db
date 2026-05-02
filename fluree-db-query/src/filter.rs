@@ -205,7 +205,7 @@ fn is_uncorrelated_exists(patterns: &[Pattern], batch_schema: &[VarId]) -> bool 
     let schema_vars: HashSet<VarId> = batch_schema.iter().copied().collect();
     let pattern_vars: HashSet<VarId> = patterns
         .iter()
-        .flat_map(super::ir::Pattern::variables)
+        .flat_map(super::ir::Pattern::referenced_vars)
         .collect();
     pattern_vars.is_disjoint(&schema_vars)
 }

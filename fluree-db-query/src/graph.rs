@@ -87,7 +87,7 @@ impl GraphOperator {
 
         let mut inner_vars: std::collections::HashSet<VarId> = std::collections::HashSet::new();
         for p in &inner_patterns {
-            inner_vars.extend(p.variables());
+            inner_vars.extend(p.produced_vars());
         }
 
         // If graph_name is a variable, it may be bound by this operator

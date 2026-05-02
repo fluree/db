@@ -106,10 +106,10 @@ impl ConstructTemplate {
     }
 
     /// Collect all variables referenced in the template patterns.
-    pub fn variables(&self) -> HashSet<VarId> {
+    pub fn referenced_vars(&self) -> HashSet<VarId> {
         self.patterns
             .iter()
-            .flat_map(crate::ir::triple::TriplePattern::variables)
+            .flat_map(crate::ir::triple::TriplePattern::referenced_vars)
             .collect()
     }
 }
@@ -244,7 +244,7 @@ impl QueryOutput {
                 Some(vars.iter().copied().collect())
             }
             QueryOutput::Construct(t) if t.patterns.is_empty() => None,
-            QueryOutput::Construct(t) => Some(t.variables()),
+            QueryOutput::Construct(t) => Some(t.referenced_vars()),
         }
     }
 }

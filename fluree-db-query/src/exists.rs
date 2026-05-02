@@ -75,7 +75,7 @@ impl ExistsOperator {
         let input_vars: HashSet<VarId> = schema.iter().copied().collect();
         let pattern_vars: HashSet<VarId> = exists_patterns
             .iter()
-            .flat_map(super::ir::Pattern::variables)
+            .flat_map(super::ir::Pattern::referenced_vars)
             .collect();
         let uncorrelated = pattern_vars.is_disjoint(&input_vars);
 

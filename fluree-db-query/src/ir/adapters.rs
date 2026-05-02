@@ -127,24 +127,35 @@ impl IndexSearchPattern {
         self
     }
 
-    /// Get all variables referenced by this pattern
-    pub fn variables(&self) -> Vec<VarId> {
+    /// Variables this pattern adds to the row's binding set: the document
+    /// IRI, plus optional score and ledger bindings.
+    pub fn produced_vars(&self) -> Vec<VarId> {
         let mut vars = vec![self.id_var];
-
-        if let IndexSearchTarget::Var(v) = &self.target {
-            vars.push(*v);
-        }
-
         if let Some(v) = self.score_var {
             vars.push(v);
         }
-
         if let Some(v) = self.ledger_var {
             vars.push(v);
         }
-
         vars
     }
+
+    /// Variables this pattern reads from outer bindings (the search target,
+    /// when supplied as a variable rather than a constant).
+    pub fn input_vars(&self) -> Vec<VarId> {
+        match &self.target {
+            IndexSearchTarget::Var(v) => vec![*v],
+            IndexSearchTarget::Const(_) => Vec::new(),
+        }
+    }
+
+    /// Variables mentioned anywhere in this pattern (input + produced).
+    pub fn referenced_vars(&self) -> Vec<VarId> {
+        let mut vars = self.produced_vars();
+        vars.extend(self.input_vars());
+        vars
+    }
+
 }
 
 // ============================================================================
@@ -273,24 +284,35 @@ impl VectorSearchPattern {
         self
     }
 
-    /// Get all variables referenced by this pattern
-    pub fn variables(&self) -> Vec<VarId> {
+    /// Variables this pattern adds to the row's binding set: the document
+    /// IRI, plus optional score and ledger bindings.
+    pub fn produced_vars(&self) -> Vec<VarId> {
         let mut vars = vec![self.id_var];
-
-        if let VectorSearchTarget::Var(v) = &self.target {
-            vars.push(*v);
-        }
-
         if let Some(v) = self.score_var {
             vars.push(v);
         }
-
         if let Some(v) = self.ledger_var {
             vars.push(v);
         }
-
         vars
     }
+
+    /// Variables this pattern reads from outer bindings (the query vector,
+    /// when supplied as a variable rather than a constant).
+    pub fn input_vars(&self) -> Vec<VarId> {
+        match &self.target {
+            VectorSearchTarget::Var(v) => vec![*v],
+            VectorSearchTarget::Const(_) => Vec::new(),
+        }
+    }
+
+    /// Variables mentioned anywhere in this pattern (input + produced).
+    pub fn referenced_vars(&self) -> Vec<VarId> {
+        let mut vars = self.produced_vars();
+        vars.extend(self.input_vars());
+        vars
+    }
+
 }
 
 // ============================================================================
@@ -372,20 +394,32 @@ impl GeoSearchPattern {
         self
     }
 
-    /// Get all variables referenced by this pattern
-    pub fn variables(&self) -> Vec<VarId> {
+    /// Variables this pattern adds to the row's binding set: the matching
+    /// subject IRI, plus the optional distance binding.
+    pub fn produced_vars(&self) -> Vec<VarId> {
         let mut vars = vec![self.subject_var];
-
-        if let GeoSearchCenter::Var(v) = &self.center {
-            vars.push(*v);
-        }
-
         if let Some(v) = self.distance_var {
             vars.push(v);
         }
-
         vars
     }
+
+    /// Variables this pattern reads from outer bindings (the center point,
+    /// when supplied as a variable rather than a constant).
+    pub fn input_vars(&self) -> Vec<VarId> {
+        match &self.center {
+            GeoSearchCenter::Var(v) => vec![*v],
+            GeoSearchCenter::Const { .. } => Vec::new(),
+        }
+    }
+
+    /// Variables mentioned anywhere in this pattern (input + produced).
+    pub fn referenced_vars(&self) -> Vec<VarId> {
+        let mut vars = self.produced_vars();
+        vars.extend(self.input_vars());
+        vars
+    }
+
 
     /// Get the center coordinates if constant, or None if variable
     pub fn const_center(&self) -> Option<(f64, f64)> {
@@ -541,20 +575,32 @@ impl S2SearchPattern {
         self
     }
 
-    /// Get all variables in this pattern
-    pub fn variables(&self) -> Vec<VarId> {
+    /// Variables this pattern adds to the row's binding set: the matching
+    /// subject IRI, plus the optional distance binding.
+    pub fn produced_vars(&self) -> Vec<VarId> {
         let mut vars = vec![self.subject_var];
-
-        if let S2QueryGeom::Var(v) = &self.query_geom {
-            vars.push(*v);
-        }
-
         if let Some(v) = self.distance_var {
             vars.push(v);
         }
-
         vars
     }
+
+    /// Variables this pattern reads from outer bindings (the query geometry,
+    /// when supplied as a variable rather than a constant).
+    pub fn input_vars(&self) -> Vec<VarId> {
+        match &self.query_geom {
+            S2QueryGeom::Var(v) => vec![*v],
+            S2QueryGeom::Wkt(_) | S2QueryGeom::Point { .. } => Vec::new(),
+        }
+    }
+
+    /// Variables mentioned anywhere in this pattern (input + produced).
+    pub fn referenced_vars(&self) -> Vec<VarId> {
+        let mut vars = self.produced_vars();
+        vars.extend(self.input_vars());
+        vars
+    }
+
 }
 
 // ============================================================================
@@ -641,12 +687,20 @@ impl R2rmlPattern {
         self
     }
 
-    /// Get all variables referenced by this pattern.
-    pub fn variables(&self) -> Vec<VarId> {
+    /// Variables this pattern produces. R2RML patterns have no input
+    /// variables (only the static graph_source_id and metadata filters), so
+    /// referenced and produced are the same set.
+    pub fn produced_vars(&self) -> Vec<VarId> {
         let mut vars = vec![self.subject_var];
         if let Some(obj_var) = self.object_var {
             vars.push(obj_var);
         }
         vars
     }
+
+    /// Variables mentioned anywhere in this pattern.
+    pub fn referenced_vars(&self) -> Vec<VarId> {
+        self.produced_vars()
+    }
+
 }

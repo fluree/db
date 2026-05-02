@@ -220,23 +220,28 @@ impl Expression {
     // Query methods
     // =========================================================================
 
-    /// Get all variables referenced by this expression
-    pub fn variables(&self) -> Vec<VarId> {
+    /// Variables this expression references when evaluated. Expressions
+    /// produce values, never bindings, so there is no `produced_vars`
+    /// counterpart.
+    pub fn referenced_vars(&self) -> Vec<VarId> {
         match self {
             Expression::Var(v) => vec![*v],
-            Expression::Const(_) => vec![],
-            Expression::Call { args, .. } => args.iter().flat_map(Expression::variables).collect(),
+            Expression::Const(_) => Vec::new(),
+            Expression::Call { args, .. } => {
+                args.iter().flat_map(Expression::referenced_vars).collect()
+            }
             Expression::Exists { patterns, .. } => {
-                patterns.iter().flat_map(Pattern::variables).collect()
+                patterns.iter().flat_map(Pattern::referenced_vars).collect()
             }
         }
     }
+
 
     /// Returns Some(var) if filter references exactly one variable
     ///
     /// Used to determine if a filter can be attached inline to a pattern.
     pub fn single_var(&self) -> Option<VarId> {
-        let vars = self.variables();
+        let vars = self.referenced_vars();
         let unique: std::collections::HashSet<_> = vars.into_iter().collect();
         if unique.len() == 1 {
             unique.into_iter().next()

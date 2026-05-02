@@ -42,8 +42,7 @@ impl PropertyPathPattern {
         }
     }
 
-    /// Get variables from subject and object
-    pub fn variables(&self) -> Vec<VarId> {
+    fn positional_vars(&self) -> Vec<VarId> {
         let mut vars = Vec::with_capacity(2);
         if let Ref::Var(v) = &self.subject {
             vars.push(*v);
@@ -52,5 +51,15 @@ impl PropertyPathPattern {
             vars.push(*v);
         }
         vars
+    }
+
+    /// Variables mentioned in this pattern (subject and object slots).
+    pub fn referenced_vars(&self) -> Vec<VarId> {
+        self.positional_vars()
+    }
+
+    /// Variables this pattern adds to the binding set.
+    pub fn produced_vars(&self) -> Vec<VarId> {
+        self.positional_vars()
     }
 }

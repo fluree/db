@@ -164,7 +164,7 @@ impl<E: IriEncoder> LoweringContext<'_, E> {
                 use std::collections::BTreeSet;
                 let mut vars = BTreeSet::new();
                 for p in where_patterns {
-                    for v in p.variables() {
+                    for v in p.produced_vars() {
                         vars.insert(v);
                     }
                 }

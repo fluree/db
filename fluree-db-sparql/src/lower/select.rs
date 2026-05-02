@@ -344,7 +344,7 @@ impl<E: IriEncoder> LoweringContext<'_, E> {
                 let mut seen: HashSet<VarId> = HashSet::new();
                 let mut select: Vec<VarId> = Vec::new();
                 for p in &patterns {
-                    for v in p.variables() {
+                    for v in p.produced_vars() {
                         if seen.insert(v) {
                             select.push(v);
                         }
