@@ -76,51 +76,22 @@ pub fn rewrite_patterns_for_r2rml(
                     unconverted += 1;
                 }
             }
-            Pattern::Optional(inner) => {
-                let inner_result = rewrite_patterns_for_r2rml(inner, graph_source_id, snapshot);
-                result_patterns.push(Pattern::Optional(inner_result.patterns));
-                converted += inner_result.converted_count;
-                unconverted += inner_result.unconverted_count;
-            }
-            Pattern::Union(branches) => {
-                let mut new_branches = Vec::with_capacity(branches.len());
-                for branch in branches {
-                    let branch_result =
-                        rewrite_patterns_for_r2rml(branch, graph_source_id, snapshot);
-                    new_branches.push(branch_result.patterns);
-                    converted += branch_result.converted_count;
-                    unconverted += branch_result.unconverted_count;
-                }
-                result_patterns.push(Pattern::Union(new_branches));
-            }
-            Pattern::Minus(inner) => {
-                let inner_result = rewrite_patterns_for_r2rml(inner, graph_source_id, snapshot);
-                result_patterns.push(Pattern::Minus(inner_result.patterns));
-                converted += inner_result.converted_count;
-                unconverted += inner_result.unconverted_count;
-            }
-            Pattern::Exists(inner) => {
-                let inner_result = rewrite_patterns_for_r2rml(inner, graph_source_id, snapshot);
-                result_patterns.push(Pattern::Exists(inner_result.patterns));
-                converted += inner_result.converted_count;
-                unconverted += inner_result.unconverted_count;
-            }
-            Pattern::NotExists(inner) => {
-                let inner_result = rewrite_patterns_for_r2rml(inner, graph_source_id, snapshot);
-                result_patterns.push(Pattern::NotExists(inner_result.patterns));
-                converted += inner_result.converted_count;
-                unconverted += inner_result.unconverted_count;
-            }
-            Pattern::Service(sp) => {
-                let inner_result =
-                    rewrite_patterns_for_r2rml(&sp.patterns, graph_source_id, snapshot);
-                result_patterns.push(Pattern::Service(crate::ir::ServicePattern::new(
-                    sp.silent,
-                    sp.endpoint.clone(),
-                    inner_result.patterns,
-                )));
-                converted += inner_result.converted_count;
-                unconverted += inner_result.unconverted_count;
+            // Recurse into structural containers (except Graph, which this
+            // rewriter is graph-source-bounded and treats as a leaf, and
+            // Subquery, which is its own scope).
+            Pattern::Optional(_)
+            | Pattern::Union(_)
+            | Pattern::Minus(_)
+            | Pattern::Exists(_)
+            | Pattern::NotExists(_)
+            | Pattern::Service(_) => {
+                let rewritten = pattern.clone().map_subpatterns(&mut |inner| {
+                    let r = rewrite_patterns_for_r2rml(&inner, graph_source_id, snapshot);
+                    converted += r.converted_count;
+                    unconverted += r.unconverted_count;
+                    r.patterns
+                });
+                result_patterns.push(rewritten);
             }
             // Preserve other patterns as-is
             Pattern::Filter(_)

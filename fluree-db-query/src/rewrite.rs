@@ -484,6 +484,40 @@ impl Diagnostics {
     }
 }
 
+/// Recurse a rewriter into the subpatterns of a container variant and
+/// report whether anything changed.
+///
+/// `recurse` is the rewriter's per-pattern-list entry point — it sees an
+/// owned `Vec<Pattern>` plus the shared `Diagnostics` and returns the
+/// rewritten list. This helper handles the three boilerplate concerns that
+/// every container arm in the rewriters used to inline:
+///
+/// 1. Snapshot `diag.patterns_expanded` before recursion.
+/// 2. Walk every nested `Vec<Pattern>` via [`Pattern::map_subpatterns`].
+/// 3. Wrap the reconstructed pattern in `Expanded(vec![..])` if the
+///    counter advanced, otherwise return `Unchanged`.
+///
+/// Callers control which container variants this function gets called for
+/// by matching on the variants they want to recurse into. Variants the
+/// rewriter wants to treat as a leaf (typically `Subquery`) stay in the
+/// rewriter's leaf arm and never reach this helper.
+pub fn rewrite_subpatterns<F>(
+    pattern: Pattern,
+    diag: &mut Diagnostics,
+    mut recurse: F,
+) -> RewriteResult
+where
+    F: FnMut(Vec<Pattern>, &mut Diagnostics) -> Vec<Pattern>,
+{
+    let before = diag.patterns_expanded;
+    let rewritten = pattern.map_subpatterns(&mut |xs| recurse(xs, diag));
+    if diag.patterns_expanded > before {
+        RewriteResult::Expanded(vec![rewritten])
+    } else {
+        RewriteResult::Unchanged
+    }
+}
+
 /// Rewrite patterns according to the entailment mode
 ///
 /// This function applies pattern expansion based on the entailment mode:
@@ -593,106 +627,18 @@ fn rewrite_single_pattern(
     match pattern {
         Pattern::Triple(tp) => rewrite_triple_pattern(tp, hierarchy, ctx, diag, total_expansions),
 
-        // Recursively process nested patterns - sharing the global budget
-        Pattern::Optional(inner) => {
-            let before = diag.patterns_expanded;
-            let rewritten =
-                rewrite_patterns_internal(inner, hierarchy, ctx, diag, total_expansions);
-            let changed = diag.patterns_expanded > before;
-            if changed {
-                RewriteResult::Expanded(vec![Pattern::Optional(rewritten)])
-            } else {
-                RewriteResult::Unchanged
-            }
-        }
-
-        Pattern::Union(branches) => {
-            let mut rewritten_branches = Vec::with_capacity(branches.len());
-            let before = diag.patterns_expanded;
-
-            for branch in branches {
-                let rewritten =
-                    rewrite_patterns_internal(branch, hierarchy, ctx, diag, total_expansions);
-                rewritten_branches.push(rewritten);
-            }
-
-            let changed = diag.patterns_expanded > before;
-            if changed {
-                RewriteResult::Expanded(vec![Pattern::Union(rewritten_branches)])
-            } else {
-                RewriteResult::Unchanged
-            }
-        }
-
-        Pattern::Minus(inner) => {
-            let before = diag.patterns_expanded;
-            let rewritten =
-                rewrite_patterns_internal(inner, hierarchy, ctx, diag, total_expansions);
-            let changed = diag.patterns_expanded > before;
-            if changed {
-                RewriteResult::Expanded(vec![Pattern::Minus(rewritten)])
-            } else {
-                RewriteResult::Unchanged
-            }
-        }
-
-        Pattern::Exists(inner) => {
-            let before = diag.patterns_expanded;
-            let rewritten =
-                rewrite_patterns_internal(inner, hierarchy, ctx, diag, total_expansions);
-            let changed = diag.patterns_expanded > before;
-            if changed {
-                RewriteResult::Expanded(vec![Pattern::Exists(rewritten)])
-            } else {
-                RewriteResult::Unchanged
-            }
-        }
-
-        Pattern::NotExists(inner) => {
-            let before = diag.patterns_expanded;
-            let rewritten =
-                rewrite_patterns_internal(inner, hierarchy, ctx, diag, total_expansions);
-            let changed = diag.patterns_expanded > before;
-            if changed {
-                RewriteResult::Expanded(vec![Pattern::NotExists(rewritten)])
-            } else {
-                RewriteResult::Unchanged
-            }
-        }
-
-        Pattern::Graph {
-            name,
-            patterns: inner,
-        } => {
-            let before = diag.patterns_expanded;
-            let rewritten =
-                rewrite_patterns_internal(inner, hierarchy, ctx, diag, total_expansions);
-            let changed = diag.patterns_expanded > before;
-            if changed {
-                RewriteResult::Expanded(vec![Pattern::Graph {
-                    name: name.clone(),
-                    patterns: rewritten,
-                }])
-            } else {
-                RewriteResult::Unchanged
-            }
-        }
-
-        Pattern::Service(sp) => {
-            let before = diag.patterns_expanded;
-            let rewritten =
-                rewrite_patterns_internal(&sp.patterns, hierarchy, ctx, diag, total_expansions);
-            let changed = diag.patterns_expanded > before;
-            if changed {
-                RewriteResult::Expanded(vec![Pattern::Service(crate::ir::ServicePattern::new(
-                    sp.silent,
-                    sp.endpoint.clone(),
-                    rewritten,
-                ))])
-            } else {
-                RewriteResult::Unchanged
-            }
-        }
+        // Recursively process nested patterns — sharing the global budget.
+        // Subquery is treated as a leaf below; the rewriter doesn't expand
+        // across subquery scope boundaries.
+        Pattern::Optional(_)
+        | Pattern::Union(_)
+        | Pattern::Minus(_)
+        | Pattern::Exists(_)
+        | Pattern::NotExists(_)
+        | Pattern::Graph { .. }
+        | Pattern::Service(_) => rewrite_subpatterns(pattern.clone(), diag, |xs, diag| {
+            rewrite_patterns_internal(&xs, hierarchy, ctx, diag, total_expansions)
+        }),
 
         // Non-expandable patterns
         Pattern::Filter(_)
