@@ -120,7 +120,7 @@ pub use groupby::GroupByOperator;
 pub use having::HavingOperator;
 pub use ir::{
     CompareOp, Expression, FilterValue, Function, PathModifier, Pattern, PropertyPathPattern,
-    Query, R2rmlPattern, ServiceEndpoint, ServicePattern, SubqueryPattern,
+    R2rmlPattern, ServiceEndpoint, ServicePattern, SubqueryPattern,
 };
 pub use join::{BindInstruction, NestedLoopJoinOperator, PatternPosition, UnifyInstruction};
 pub use limit::LimitOperator;

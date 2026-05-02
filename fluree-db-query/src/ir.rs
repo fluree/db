@@ -39,5 +39,5 @@ pub use path::{PathModifier, PropertyPathPattern};
 pub use pattern::{
     GraphName, Pattern, ServiceEndpoint, ServicePattern, SubqueryPattern,
 };
-pub use projection::{GraphSelectSpec, NestedSelectSpec, Query, Root, SelectionSpec};
+pub use projection::{GraphSelectSpec, NestedSelectSpec, Root, SelectionSpec};
 pub use triple::{Ref, Term, TriplePattern};

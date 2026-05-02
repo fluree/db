@@ -1,37 +1,10 @@
-//! Query output shape: the top-level `Query` plus the selection specs that
-//! describe how results are projected and crawled into nested JSON-LD form.
+//! Selection specs that describe how query results are projected and
+//! crawled into nested JSON-LD form. The canonical resolved-and-lowered
+//! query type is [`crate::parse::ParsedQuery`]; this module covers only
+//! the projection-shape types that flow through it.
 
-use super::pattern::Pattern;
-use super::triple::TriplePattern;
 use crate::var_registry::VarId;
 use fluree_db_core::Sid;
-
-/// Top-level query structure
-///
-/// Represents a parsed and lowered query ready for planning.
-#[derive(Debug, Clone)]
-pub struct Query {
-    /// Selected variables (output columns)
-    pub select: Vec<VarId>,
-    /// Where clause patterns (ordered!)
-    pub where_: Vec<Pattern>,
-}
-
-impl Query {
-    /// Create a new query
-    pub fn new(select: Vec<VarId>, where_: Vec<Pattern>) -> Self {
-        Self { select, where_ }
-    }
-
-    /// Create a query with a single triple pattern
-    pub fn single(select: Vec<VarId>, pattern: TriplePattern) -> Self {
-        Self {
-            select,
-            where_: vec![Pattern::Triple(pattern)],
-        }
-    }
-
-}
 
 // ============================================================================
 // Graph crawl select types (resolved)
@@ -148,35 +121,3 @@ impl GraphSelectSpec {
 
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::ir::triple::{Ref, Term};
-
-    fn test_pattern() -> TriplePattern {
-        TriplePattern::new(
-            Ref::Var(VarId(0)),
-            Ref::Sid(Sid::new(100, "name")),
-            Term::Var(VarId(1)),
-        )
-    }
-
-    #[test]
-    fn test_query_new() {
-        let pattern = test_pattern();
-        let query = Query::new(vec![VarId(0), VarId(1)], vec![Pattern::Triple(pattern)]);
-
-        assert_eq!(query.select.len(), 2);
-        assert_eq!(query.where_.len(), 1);
-    }
-
-    #[test]
-    fn test_query_single() {
-        let pattern = test_pattern();
-        let query = Query::single(vec![VarId(0)], pattern);
-
-        assert_eq!(query.where_.len(), 1);
-        assert!(query.where_[0].is_triple());
-    }
-
-}
