@@ -1121,31 +1121,6 @@ impl<'a> GraphCrawlFormatter<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use fluree_db_query::VarId;
-
-    #[test]
-    fn test_sync_format_returns_error() {
-        // Create a minimal QueryResult with graph_select
-        // The sync format function should always return an error
-        let spec = GraphSelectSpec {
-            root: Root::Var(VarId(0)),
-            selections: vec![SelectionSpec::Wildcard],
-            reverse: HashMap::new(),
-            depth: 0,
-            has_wildcard: true,
-        };
-
-        let _compactor = IriCompactor::from_namespaces(&HashMap::new());
-
-        // We can't easily create a full QueryResult, but we can verify the behavior
-        // by checking that format() returns an error when called
-        // (In practice, format_results() guards this path)
-
-        // Just verify the spec hash is consistent
-        let hash1 = spec.spec_hash();
-        let hash2 = spec.spec_hash();
-        assert_eq!(hash1, hash2);
-    }
 
     #[test]
     fn test_cache_key_different_depths() {

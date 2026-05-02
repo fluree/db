@@ -237,19 +237,6 @@ impl Expression {
     }
 
 
-    /// Returns Some(var) if filter references exactly one variable
-    ///
-    /// Used to determine if a filter can be attached inline to a pattern.
-    pub fn single_var(&self) -> Option<VarId> {
-        let vars = self.referenced_vars();
-        let unique: std::collections::HashSet<_> = vars.into_iter().collect();
-        if unique.len() == 1 {
-            unique.into_iter().next()
-        } else {
-            None
-        }
-    }
-
     /// Returns true if this filter can be pushed down to index scans as range bounds.
     ///
     /// "Range-safe" filters can be converted to contiguous range constraints on the
@@ -315,41 +302,6 @@ impl Expression {
         }
     }
 
-    /// Check if this is a comparison expression
-    pub fn is_comparison(&self) -> bool {
-        matches!(
-            self,
-            Expression::Call {
-                func: Function::Eq
-                    | Function::Ne
-                    | Function::Lt
-                    | Function::Le
-                    | Function::Gt
-                    | Function::Ge,
-                ..
-            }
-        )
-    }
-
-    /// Get the comparison function if this is a comparison expression
-    pub fn as_comparison(&self) -> Option<(&Function, &[Expression])> {
-        match self {
-            Expression::Call { func, args }
-                if matches!(
-                    func,
-                    Function::Eq
-                        | Function::Ne
-                        | Function::Lt
-                        | Function::Le
-                        | Function::Gt
-                        | Function::Ge
-                ) =>
-            {
-                Some((func, args))
-            }
-            _ => None,
-        }
-    }
 }
 
 /// Comparison operators
@@ -634,20 +586,6 @@ pub enum Function {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn test_filter_expr_single_var() {
-        // Single var: ?x > 10
-        let expr = Expression::gt(
-            Expression::Var(VarId(0)),
-            Expression::Const(FilterValue::Long(10)),
-        );
-        assert_eq!(expr.single_var(), Some(VarId(0)));
-
-        // Two vars: ?x > ?y
-        let expr2 = Expression::gt(Expression::Var(VarId(0)), Expression::Var(VarId(1)));
-        assert_eq!(expr2.single_var(), None);
-    }
 
     #[test]
     fn test_filter_expr_is_range_safe() {

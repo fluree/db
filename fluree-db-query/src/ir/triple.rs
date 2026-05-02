@@ -163,14 +163,6 @@ impl Term {
         }
     }
 
-    /// Get the value if this is a Value term
-    pub fn as_value(&self) -> Option<&FlakeValue> {
-        match self {
-            Term::Value(v) => Some(v),
-            _ => None,
-        }
-    }
-
     /// Check if this term represents the rdf:type predicate
     ///
     /// Handles both Term::Sid (checks namespace code) and Term::Iri (compares IRI string).
@@ -213,16 +205,6 @@ impl TriplePattern {
             p,
             o,
             dtc: Some(DatatypeConstraint::Explicit(dt)),
-        }
-    }
-
-    /// Create with a language tag constraint (implies `rdf:langString` datatype)
-    pub fn with_lang(s: Ref, p: Ref, o: Term, lang: impl AsRef<str>) -> Self {
-        Self {
-            s,
-            p,
-            o,
-            dtc: Some(DatatypeConstraint::LangTag(Arc::from(lang.as_ref()))),
         }
     }
 

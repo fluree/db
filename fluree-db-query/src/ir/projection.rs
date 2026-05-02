@@ -31,41 +31,6 @@ impl Query {
         }
     }
 
-    /// Get all triple patterns in the where clause (flattening nested structures)
-    pub fn triple_patterns(&self) -> Vec<&TriplePattern> {
-        fn collect<'a>(patterns: &'a [Pattern], out: &mut Vec<&'a TriplePattern>) {
-            for p in patterns {
-                match p {
-                    Pattern::Triple(tp) => out.push(tp),
-                    Pattern::Optional(inner)
-                    | Pattern::Minus(inner)
-                    | Pattern::Exists(inner)
-                    | Pattern::NotExists(inner) => collect(inner, out),
-                    Pattern::Union(branches) => {
-                        for branch in branches {
-                            collect(branch, out);
-                        }
-                    }
-                    Pattern::Graph { patterns, .. } => collect(patterns, out),
-                    Pattern::Service(sp) => collect(&sp.patterns, out),
-                    Pattern::Filter(_)
-                    | Pattern::Bind { .. }
-                    | Pattern::Values { .. }
-                    | Pattern::PropertyPath(_)
-                    | Pattern::Subquery(_)
-                    | Pattern::IndexSearch(_)
-                    | Pattern::VectorSearch(_)
-                    | Pattern::R2rml(_)
-                    | Pattern::GeoSearch(_)
-                    | Pattern::S2Search(_) => {}
-                }
-            }
-        }
-
-        let mut result = Vec::new();
-        collect(&self.where_, &mut result);
-        result
-    }
 }
 
 // ============================================================================
@@ -181,106 +146,6 @@ impl GraphSelectSpec {
         }
     }
 
-    /// Generate a hash for cache keying purposes
-    ///
-    /// Used to differentiate the same Sid expanded under different specs.
-    /// The cache key is `(Sid, spec_hash, depth_remaining)`.
-    pub fn spec_hash(&self) -> u64 {
-        use std::hash::{Hash, Hasher};
-        let mut hasher = std::collections::hash_map::DefaultHasher::new();
-
-        self.has_wildcard.hash(&mut hasher);
-        self.selections.len().hash(&mut hasher);
-
-        // Hash selection structure
-        fn hash_selection(spec: &SelectionSpec, hasher: &mut impl Hasher) {
-            match spec {
-                SelectionSpec::Id => {
-                    2u8.hash(hasher);
-                }
-                SelectionSpec::Wildcard => {
-                    0u8.hash(hasher);
-                }
-                SelectionSpec::Property {
-                    predicate,
-                    sub_spec,
-                } => {
-                    1u8.hash(hasher);
-                    predicate.hash(hasher);
-                    if let Some(nested) = sub_spec {
-                        // Hash nested spec
-                        nested.has_wildcard.hash(hasher);
-                        nested.forward.len().hash(hasher);
-                        for sub in &nested.forward {
-                            hash_selection(sub, hasher);
-                        }
-                        // Hash nested reverse
-                        nested.reverse.len().hash(hasher);
-                        let mut nested_rev_keys: Vec<_> = nested.reverse.keys().collect();
-                        nested_rev_keys.sort();
-                        for key in nested_rev_keys {
-                            key.hash(hasher);
-                            if let Some(nested_nested) = nested.reverse.get(key) {
-                                if let Some(spec) = nested_nested {
-                                    1u8.hash(hasher);
-                                    hash_nested_spec(spec, hasher);
-                                } else {
-                                    0u8.hash(hasher);
-                                }
-                            }
-                        }
-                    } else {
-                        0usize.hash(hasher);
-                    }
-                }
-            }
-        }
-
-        fn hash_nested_spec(spec: &NestedSelectSpec, hasher: &mut impl Hasher) {
-            spec.has_wildcard.hash(hasher);
-            spec.forward.len().hash(hasher);
-            for sub in &spec.forward {
-                hash_selection(sub, hasher);
-            }
-            spec.reverse.len().hash(hasher);
-            let mut rev_keys: Vec<_> = spec.reverse.keys().collect();
-            rev_keys.sort();
-            for key in rev_keys {
-                key.hash(hasher);
-                if let Some(nested) = spec.reverse.get(key) {
-                    if let Some(inner) = nested {
-                        1u8.hash(hasher);
-                        hash_nested_spec(inner, hasher);
-                    } else {
-                        0u8.hash(hasher);
-                    }
-                }
-            }
-        }
-
-        for sel in &self.selections {
-            hash_selection(sel, &mut hasher);
-        }
-
-        // Hash reverse properties
-        self.reverse.len().hash(&mut hasher);
-        // Sort by Sid for deterministic hashing
-        let mut reverse_keys: Vec<_> = self.reverse.keys().collect();
-        reverse_keys.sort();
-        for key in reverse_keys {
-            key.hash(&mut hasher);
-            if let Some(nested) = self.reverse.get(key) {
-                if let Some(spec) = nested {
-                    1u8.hash(&mut hasher);
-                    hash_nested_spec(spec, &mut hasher);
-                } else {
-                    0u8.hash(&mut hasher);
-                }
-            }
-        }
-
-        hasher.finish()
-    }
 }
 
 #[cfg(test)]
@@ -314,25 +179,4 @@ mod tests {
         assert!(query.where_[0].is_triple());
     }
 
-    #[test]
-    fn test_query_triple_patterns() {
-        let p1 = TriplePattern::new(
-            Ref::Var(VarId(0)),
-            Ref::Sid(Sid::new(100, "name")),
-            Term::Var(VarId(1)),
-        );
-        let p2 = TriplePattern::new(
-            Ref::Var(VarId(0)),
-            Ref::Sid(Sid::new(101, "age")),
-            Term::Var(VarId(2)),
-        );
-
-        let query = Query::new(
-            vec![VarId(0), VarId(1), VarId(2)],
-            vec![Pattern::Triple(p1), Pattern::Triple(p2)],
-        );
-
-        let triples = query.triple_patterns();
-        assert_eq!(triples.len(), 2);
-    }
 }

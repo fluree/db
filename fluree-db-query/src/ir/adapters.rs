@@ -421,13 +421,6 @@ impl GeoSearchPattern {
     }
 
 
-    /// Get the center coordinates if constant, or None if variable
-    pub fn const_center(&self) -> Option<(f64, f64)> {
-        match &self.center {
-            GeoSearchCenter::Const { lat, lng } => Some((*lat, *lng)),
-            GeoSearchCenter::Var(_) => None,
-        }
-    }
 }
 
 // ============================================================================
@@ -569,12 +562,6 @@ impl S2SearchPattern {
         self
     }
 
-    /// Set spatial index alias
-    pub fn with_spatial_index(mut self, alias: impl Into<String>) -> Self {
-        self.spatial_index_alias = Some(alias.into());
-        self
-    }
-
     /// Variables this pattern adds to the row's binding set: the matching
     /// subject IRI, plus the optional distance binding.
     pub fn produced_vars(&self) -> Vec<VarId> {
@@ -667,12 +654,6 @@ impl R2rmlPattern {
             predicate_filter: None,
             class_filter: None,
         }
-    }
-
-    /// Set the specific TriplesMap IRI to use.
-    pub fn with_triples_map(mut self, iri: impl Into<String>) -> Self {
-        self.triples_map_iri = Some(iri.into());
-        self
     }
 
     /// Set the predicate filter.

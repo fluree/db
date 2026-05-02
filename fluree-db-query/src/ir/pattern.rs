@@ -136,29 +136,6 @@ pub enum GraphName {
     Var(VarId),
 }
 
-impl GraphName {
-    /// Check if this is a variable
-    pub fn is_var(&self) -> bool {
-        matches!(self, GraphName::Var(_))
-    }
-
-    /// Get the variable ID if this is a variable
-    pub fn as_var(&self) -> Option<VarId> {
-        match self {
-            GraphName::Var(v) => Some(*v),
-            GraphName::Iri(_) => None,
-        }
-    }
-
-    /// Get the IRI if this is a concrete graph
-    pub fn as_iri(&self) -> Option<&str> {
-        match self {
-            GraphName::Iri(iri) => Some(iri),
-            GraphName::Var(_) => None,
-        }
-    }
-}
-
 // ============================================================================
 // Service Pattern
 // ============================================================================
@@ -177,29 +154,6 @@ pub enum ServiceEndpoint {
     Iri(Arc<str>),
     /// Variable endpoint (iterates all known services if unbound)
     Var(VarId),
-}
-
-impl ServiceEndpoint {
-    /// Check if this is a variable
-    pub fn is_var(&self) -> bool {
-        matches!(self, ServiceEndpoint::Var(_))
-    }
-
-    /// Get the variable ID if this is a variable
-    pub fn as_var(&self) -> Option<VarId> {
-        match self {
-            ServiceEndpoint::Var(v) => Some(*v),
-            ServiceEndpoint::Iri(_) => None,
-        }
-    }
-
-    /// Get the IRI if this is a concrete endpoint
-    pub fn as_iri(&self) -> Option<&str> {
-        match self {
-            ServiceEndpoint::Iri(iri) => Some(iri),
-            ServiceEndpoint::Var(_) => None,
-        }
-    }
 }
 
 /// Service pattern for executing patterns against external or local services.
