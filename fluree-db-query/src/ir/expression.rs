@@ -2,7 +2,7 @@
 //! at FILTER, BIND, and HAVING positions, plus the comparison and
 //! arithmetic operators and the built-in function catalog.
 
-use super::pattern::{pattern_contains_function, Pattern};
+use super::pattern::Pattern;
 use crate::var_registry::VarId;
 
 /// Filter expression AST
@@ -48,9 +48,9 @@ impl Expression {
             Expression::Call { func, args } => {
                 func == target || args.iter().any(|a| a.contains_function(target))
             }
-            Expression::Exists { patterns, .. } => patterns
-                .iter()
-                .any(|p| pattern_contains_function(p, target)),
+            Expression::Exists { patterns, .. } => {
+                patterns.iter().any(|p| p.contains_function(target))
+            }
         }
     }
 }

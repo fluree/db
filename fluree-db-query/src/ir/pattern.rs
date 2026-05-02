@@ -457,29 +457,28 @@ impl Pattern {
             Pattern::Service(sp) => sp.variables(),
         }
     }
-}
 
-/// True if any expression inside `pattern` (recursively) calls `target`.
-pub fn pattern_contains_function(pattern: &Pattern, target: &Function) -> bool {
-    match pattern {
-        Pattern::Filter(expr) => expr.contains_function(target),
-        Pattern::Bind { expr, .. } => expr.contains_function(target),
-        Pattern::Exists(inner) | Pattern::NotExists(inner) | Pattern::Minus(inner) => {
-            inner.iter().any(|p| pattern_contains_function(p, target))
+    /// True if any expression inside this pattern (recursively, through any
+    /// nested patterns) calls `target`. Mirrors [`Expression::contains_function`]
+    /// at the pattern level.
+    pub fn contains_function(&self, target: &Function) -> bool {
+        match self {
+            Pattern::Filter(expr) => expr.contains_function(target),
+            Pattern::Bind { expr, .. } => expr.contains_function(target),
+            Pattern::Exists(inner) | Pattern::NotExists(inner) | Pattern::Minus(inner) => {
+                inner.iter().any(|p| p.contains_function(target))
+            }
+            Pattern::Optional(inner) => inner.iter().any(|p| p.contains_function(target)),
+            Pattern::Union(branches) => branches
+                .iter()
+                .any(|branch| branch.iter().any(|p| p.contains_function(target))),
+            Pattern::Graph { patterns, .. } => {
+                patterns.iter().any(|p| p.contains_function(target))
+            }
+            Pattern::Subquery(sq) => sq.patterns.iter().any(|p| p.contains_function(target)),
+            // Other pattern variants cannot contain general expressions.
+            _ => false,
         }
-        Pattern::Optional(inner) => inner.iter().any(|p| pattern_contains_function(p, target)),
-        Pattern::Union(branches) => branches.iter().any(|branch: &Vec<Pattern>| {
-            branch.iter().any(|p| pattern_contains_function(p, target))
-        }),
-        Pattern::Graph { patterns, .. } => patterns
-            .iter()
-            .any(|p| pattern_contains_function(p, target)),
-        Pattern::Subquery(sq) => sq
-            .patterns
-            .iter()
-            .any(|p| pattern_contains_function(p, target)),
-        // Other pattern variants cannot contain general expressions.
-        _ => false,
     }
 }
 

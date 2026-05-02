@@ -99,7 +99,7 @@ impl ExecutableQuery {
         self.query
             .patterns
             .iter()
-            .any(|p| crate::ir::pattern_contains_function(p, &crate::ir::Function::Fulltext))
+            .any(|p| p.contains_function(&crate::ir::Function::Fulltext))
     }
 }
 
