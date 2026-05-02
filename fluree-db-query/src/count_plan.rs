@@ -17,7 +17,7 @@ use crate::execute::operator_tree::{detect_count_all_aggregate, validate_simple_
 use crate::ir::{Expression, Pattern};
 use crate::options::QueryOptions;
 use crate::parse::ParsedQuery;
-use crate::triple::Ref;
+use crate::ir::triple::Ref;
 use crate::var_registry::VarId;
 
 /// Resolve an EXISTS block from a `Filter(Expression::Exists { .. })` expression.
@@ -947,7 +947,7 @@ mod tests {
     use super::*;
     use crate::aggregate::AggregateFn;
     use crate::parse::QueryOutput;
-    use crate::triple::{Term, TriplePattern};
+    use crate::ir::triple::{Term, TriplePattern};
     use crate::var_registry::VarRegistry;
     use fluree_db_core::Sid;
     use fluree_graph_json_ld::ParsedContext;

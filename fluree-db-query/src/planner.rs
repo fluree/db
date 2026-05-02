@@ -8,7 +8,7 @@
 //! `build_where_operators_seeded` in `execute/where_plan.rs`.
 
 use crate::ir::{CompareOp, Function, Pattern};
-use crate::triple::{Ref, Term, TriplePattern};
+use crate::ir::triple::{Ref, Term, TriplePattern};
 use crate::var_registry::VarId;
 use fluree_db_core::{FlakeValue, PropertyStatData, StatsView};
 use std::collections::{HashMap, HashSet};
@@ -239,7 +239,7 @@ pub fn analyze_property_join(patterns: &[TriplePattern]) -> PropertyJoinAnalysis
                 enough_patterns,
                 subject_is_var: false,
                 same_subject: false,
-                predicates_bound: patterns.iter().all(super::triple::TriplePattern::p_bound),
+                predicates_bound: patterns.iter().all(crate::ir::triple::TriplePattern::p_bound),
                 object_modes_supported: false,
                 object_vars_distinct: false,
                 has_bound_objects: false,
@@ -253,7 +253,7 @@ pub fn analyze_property_join(patterns: &[TriplePattern]) -> PropertyJoinAnalysis
         _ => false,
     });
 
-    let predicates_bound = patterns.iter().all(super::triple::TriplePattern::p_bound);
+    let predicates_bound = patterns.iter().all(crate::ir::triple::TriplePattern::p_bound);
 
     let mut obj_vars: HashSet<VarId> = HashSet::new();
     let mut object_modes_supported = true;
@@ -1314,7 +1314,7 @@ fn deferred_required_vars(pattern: &Pattern) -> Vec<VarId> {
 mod tests {
     use super::*;
     use crate::ir::GraphName;
-    use crate::triple::Term;
+    use crate::ir::triple::Term;
     use fluree_db_core::{PropertyStatData, Sid, StatsView};
     use std::sync::Arc;
 

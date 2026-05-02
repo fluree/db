@@ -15,7 +15,7 @@ use crate::span::SourceSpan;
 
 use fluree_db_query::ir::{PathModifier, Pattern, PropertyPathPattern};
 use fluree_db_query::parse::encode::IriEncoder;
-use fluree_db_query::triple::{Ref, TriplePattern};
+use fluree_db_query::ir::triple::{Ref, TriplePattern};
 use fluree_vocab::rdf::TYPE;
 
 use super::{LowerError, LoweringContext, Result};

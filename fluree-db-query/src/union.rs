@@ -461,15 +461,15 @@ mod tests {
         });
 
         let branches = vec![
-            vec![Pattern::Triple(crate::triple::TriplePattern::new(
-                crate::triple::Ref::Var(VarId(0)),
-                crate::triple::Ref::Sid(Sid::new(100, "name")),
-                crate::triple::Term::Var(VarId(1)),
+            vec![Pattern::Triple(crate::ir::triple::TriplePattern::new(
+                crate::ir::triple::Ref::Var(VarId(0)),
+                crate::ir::triple::Ref::Sid(Sid::new(100, "name")),
+                crate::ir::triple::Term::Var(VarId(1)),
             ))],
-            vec![Pattern::Triple(crate::triple::TriplePattern::new(
-                crate::triple::Ref::Var(VarId(0)),
-                crate::triple::Ref::Sid(Sid::new(100, "email")),
-                crate::triple::Term::Var(VarId(2)),
+            vec![Pattern::Triple(crate::ir::triple::TriplePattern::new(
+                crate::ir::triple::Ref::Var(VarId(0)),
+                crate::ir::triple::Ref::Sid(Sid::new(100, "email")),
+                crate::ir::triple::Term::Var(VarId(2)),
             ))],
         ];
 
@@ -509,15 +509,15 @@ mod tests {
         });
 
         let branches = vec![
-            vec![Pattern::Triple(crate::triple::TriplePattern::new(
-                crate::triple::Ref::Var(VarId(0)),
-                crate::triple::Ref::Sid(Sid::new(100, "name")),
-                crate::triple::Term::Var(VarId(1)),
+            vec![Pattern::Triple(crate::ir::triple::TriplePattern::new(
+                crate::ir::triple::Ref::Var(VarId(0)),
+                crate::ir::triple::Ref::Sid(Sid::new(100, "name")),
+                crate::ir::triple::Term::Var(VarId(1)),
             ))],
-            vec![Pattern::Triple(crate::triple::TriplePattern::new(
-                crate::triple::Ref::Var(VarId(0)),
-                crate::triple::Ref::Sid(Sid::new(100, "email")),
-                crate::triple::Term::Var(VarId(2)),
+            vec![Pattern::Triple(crate::ir::triple::TriplePattern::new(
+                crate::ir::triple::Ref::Var(VarId(0)),
+                crate::ir::triple::Ref::Sid(Sid::new(100, "email")),
+                crate::ir::triple::Term::Var(VarId(2)),
             ))],
         ];
 
@@ -539,10 +539,10 @@ mod tests {
             schema: child_schema,
         });
 
-        let branches = vec![vec![Pattern::Triple(crate::triple::TriplePattern::new(
-            crate::triple::Ref::Var(VarId(0)),
-            crate::triple::Ref::Sid(Sid::new(100, "name")),
-            crate::triple::Term::Var(VarId(1)),
+        let branches = vec![vec![Pattern::Triple(crate::ir::triple::TriplePattern::new(
+            crate::ir::triple::Ref::Var(VarId(0)),
+            crate::ir::triple::Ref::Sid(Sid::new(100, "name")),
+            crate::ir::triple::Term::Var(VarId(1)),
         ))]];
 
         let op = UnionOperator::new(

@@ -19,7 +19,7 @@ use fluree_db_query::parse::encode::IriEncoder;
 use fluree_db_query::parse::{
     ConstructTemplate as QueryConstructTemplate, ParsedQuery, QueryOutput,
 };
-use fluree_db_query::triple::{Ref, Term, TriplePattern};
+use fluree_db_query::ir::triple::{Ref, Term, TriplePattern};
 use fluree_db_query::var_registry::VarId;
 
 use super::{LowerError, LoweringContext, Result};

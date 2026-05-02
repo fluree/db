@@ -4,7 +4,7 @@ use crate::error::{QueryError, Result};
 use crate::fast_path_common::{fast_path_store, normalize_pred_sid};
 use crate::operator::BoxedOperator;
 use crate::operator::{Operator, OperatorState};
-use crate::triple::Term;
+use crate::ir::triple::Term;
 use crate::var_registry::VarId;
 use async_trait::async_trait;
 use fluree_db_binary_index::format::column_block::ColumnId;
@@ -70,7 +70,7 @@ pub struct PredicateGroupCountFirstsOperator {
     object_var: VarId,
     count_var: VarId,
     /// Bound predicate reference (Sid or Iri).
-    predicate: crate::triple::Ref,
+    predicate: crate::ir::triple::Ref,
     /// LIMIT k (top-k by count)
     limit: usize,
     /// Operator state
@@ -90,7 +90,7 @@ impl PredicateGroupCountFirstsOperator {
         subject_var: VarId,
         object_var: VarId,
         count_var: VarId,
-        predicate: crate::triple::Ref,
+        predicate: crate::ir::triple::Ref,
         limit: usize,
         mode: crate::temporal_mode::TemporalMode,
     ) -> Self {
@@ -115,7 +115,7 @@ impl PredicateGroupCountFirstsOperator {
         use crate::group_aggregate::{GroupAggregateOperator, StreamingAggSpec};
         use crate::limit::LimitOperator;
         use crate::sort::{SortDirection, SortOperator, SortSpec};
-        use crate::triple::{Ref, TriplePattern};
+        use crate::ir::triple::{Ref, TriplePattern};
 
         let tp = TriplePattern::new(
             Ref::Var(self.subject_var),
@@ -324,7 +324,7 @@ pub struct PredicateObjectCountFirstsOperator {
     subject_var: VarId,
     count_var: VarId,
     /// Bound predicate reference (Sid or Iri).
-    predicate: crate::triple::Ref,
+    predicate: crate::ir::triple::Ref,
     /// Bound object term (Sid/Iri/Value).
     object: Term,
     /// Operator state
@@ -341,7 +341,7 @@ pub struct PredicateObjectCountFirstsOperator {
 
 impl PredicateObjectCountFirstsOperator {
     pub fn new(
-        predicate: crate::triple::Ref,
+        predicate: crate::ir::triple::Ref,
         subject_var: VarId,
         object: Term,
         count_var: VarId,
@@ -365,7 +365,7 @@ impl PredicateObjectCountFirstsOperator {
         use crate::aggregate::AggregateFn;
         use crate::dataset_operator::DatasetOperator;
         use crate::group_aggregate::{GroupAggregateOperator, StreamingAggSpec};
-        use crate::triple::{Ref, TriplePattern};
+        use crate::ir::triple::{Ref, TriplePattern};
 
         let tp = TriplePattern::new(
             Ref::Var(self.subject_var),
@@ -551,7 +551,7 @@ fn load_v6_batch(
 
 /// Resolve a predicate [`Ref`] to its V6 binary index `p_id`.
 fn resolve_predicate_id_v6(
-    predicate: &crate::triple::Ref,
+    predicate: &crate::ir::triple::Ref,
     store: &BinaryIndexStore,
 ) -> Result<u32> {
     let sid = normalize_pred_sid(store, predicate)?;
@@ -568,7 +568,7 @@ fn resolve_predicate_id_v6(
 fn count_bound_object_v6(
     store: &BinaryIndexStore,
     g_id: GraphId,
-    predicate: &crate::triple::Ref,
+    predicate: &crate::ir::triple::Ref,
     object: &Term,
 ) -> Result<i64> {
     let p_id = resolve_predicate_id_v6(predicate, store)?;
@@ -676,7 +676,7 @@ fn count_bound_object_v6(
 fn group_count_v6(
     store: &BinaryIndexStore,
     g_id: GraphId,
-    predicate: &crate::triple::Ref,
+    predicate: &crate::ir::triple::Ref,
     limit: usize,
 ) -> Result<Vec<(u16, u64, i64)>> {
     let p_id = resolve_predicate_id_v6(predicate, store)?;
@@ -864,8 +864,8 @@ impl AggStateStar {
 ///
 /// Optionally also computes MIN/MAX/SAMPLE on `?s`.
 pub struct GroupByObjectStarTopKOperator {
-    group_pred: crate::triple::Ref,
-    filter_preds: Vec<crate::triple::Ref>,
+    group_pred: crate::ir::triple::Ref,
+    filter_preds: Vec<crate::ir::triple::Ref>,
     group_var: VarId,
     count_var: VarId,
     min_var: Option<VarId>,
@@ -882,8 +882,8 @@ pub struct GroupByObjectStarTopKOperator {
 impl GroupByObjectStarTopKOperator {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
-        group_pred: crate::triple::Ref,
-        filter_preds: Vec<crate::triple::Ref>,
+        group_pred: crate::ir::triple::Ref,
+        filter_preds: Vec<crate::ir::triple::Ref>,
         group_var: VarId,
         count_var: VarId,
         min_var: Option<VarId>,
@@ -1002,11 +1002,11 @@ impl Operator for GroupByObjectStarTopKOperator {
     }
 }
 
-fn ref_to_sid_group(store: &BinaryIndexStore, r: &crate::triple::Ref) -> Result<Sid> {
+fn ref_to_sid_group(store: &BinaryIndexStore, r: &crate::ir::triple::Ref) -> Result<Sid> {
     Ok(match r {
-        crate::triple::Ref::Sid(s) => s.clone(),
-        crate::triple::Ref::Iri(i) => store.encode_iri(i),
-        crate::triple::Ref::Var(_) => {
+        crate::ir::triple::Ref::Sid(s) => s.clone(),
+        crate::ir::triple::Ref::Iri(i) => store.encode_iri(i),
+        crate::ir::triple::Ref::Var(_) => {
             return Err(QueryError::Internal(
                 "group-by-object star fast path requires bound predicates".into(),
             ))
@@ -1134,7 +1134,7 @@ fn collect_subject_set_for_predicate_group(
     store: &Arc<BinaryIndexStore>,
     ctx: &ExecutionContext<'_>,
     g_id: GraphId,
-    pred: &crate::triple::Ref,
+    pred: &crate::ir::triple::Ref,
     restrict_to: Option<&FxHashSet<u64>>,
 ) -> Result<Option<FxHashSet<u64>>> {
     let overlay_has_rows = ctx
@@ -1190,8 +1190,8 @@ fn compute_group_by_object_star_topk(
     store: &Arc<BinaryIndexStore>,
     ctx: &ExecutionContext<'_>,
     g_id: GraphId,
-    group_pred: &crate::triple::Ref,
-    filter_preds: &[crate::triple::Ref],
+    group_pred: &crate::ir::triple::Ref,
+    filter_preds: &[crate::ir::triple::Ref],
     schema: Arc<[VarId]>,
     group_var: VarId,
     count_var: VarId,

@@ -14,7 +14,7 @@ use fluree_db_query::operator::Operator;
 use fluree_db_query::options::QueryOptions;
 use fluree_db_query::parse::{ParsedQuery, QueryOutput};
 use fluree_db_query::seed::EmptyOperator;
-use fluree_db_query::triple::{Ref, Term, TriplePattern};
+use fluree_db_query::ir::triple::{Ref, Term, TriplePattern};
 use fluree_db_query::values::ValuesOperator;
 use fluree_db_query::var_registry::{VarId, VarRegistry};
 use fluree_graph_json_ld::ParsedContext;

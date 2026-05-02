@@ -13,7 +13,7 @@ use crate::QueryResult;
 use fluree_db_core::FlakeValue;
 use fluree_db_query::binding::Binding;
 use fluree_db_query::parse::ConstructTemplate;
-use fluree_db_query::triple::{Ref, Term};
+use fluree_db_query::ir::triple::{Ref, Term};
 use fluree_db_query::Batch;
 use fluree_graph_format::{format_jsonld, JsonLdFormatConfig};
 use fluree_graph_ir::{BlankId, Datatype, Graph, LiteralValue, Term as IrTerm, Triple};

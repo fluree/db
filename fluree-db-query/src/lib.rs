@@ -89,7 +89,6 @@ pub(crate) mod stats_cache;
 pub mod stats_query;
 pub mod subquery;
 pub mod temporal_mode;
-pub mod triple;
 pub mod union;
 pub mod values;
 pub mod var_registry;
@@ -150,7 +149,7 @@ pub use sort::{compare_bindings, compare_flake_values, SortDirection, SortOperat
 pub use stats_query::StatsCountByPredicateOperator;
 pub use subquery::SubqueryOperator;
 pub use temporal_mode::{PlanningContext, TemporalMode};
-pub use triple::{Ref, Term, TriplePattern};
+pub use ir::triple::{Ref, Term, TriplePattern};
 
 // Re-export DatatypeConstraint from fluree-db-core for convenience
 pub use fluree_db_core::DatatypeConstraint;

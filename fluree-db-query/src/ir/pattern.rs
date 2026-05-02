@@ -16,7 +16,7 @@ use super::path::PropertyPathPattern;
 use crate::aggregate::AggregateSpec;
 use crate::binding::Binding;
 use crate::sort::SortSpec;
-use crate::triple::TriplePattern;
+use super::triple::TriplePattern;
 use crate::var_registry::VarId;
 
 /// Resolved subquery pattern
@@ -486,7 +486,7 @@ pub fn pattern_contains_function(pattern: &Pattern, target: &Function) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::triple::{Ref, Term};
+    use crate::ir::triple::{Ref, Term};
     use fluree_db_core::Sid;
 
     fn test_pattern() -> TriplePattern {

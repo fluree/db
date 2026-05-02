@@ -33,7 +33,7 @@ use crate::fast_path_common::{
     cursor_projection_sid_otype_okey, normalize_pred_sid,
 };
 use crate::operator::{BoxedOperator, Operator, OperatorState};
-use crate::triple::Ref;
+use crate::ir::triple::Ref;
 use crate::var_registry::VarId;
 use async_trait::async_trait;
 use fluree_db_binary_index::BinaryCursor;

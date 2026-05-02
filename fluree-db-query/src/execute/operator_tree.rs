@@ -54,7 +54,7 @@ use crate::sort::SortDirection;
 use crate::sort::SortOperator;
 use crate::stats_query::StatsCountByPredicateOperator;
 use crate::temporal_mode::PlanningContext;
-use crate::triple::{Ref, Term, TriplePattern};
+use crate::ir::triple::{Ref, Term, TriplePattern};
 use crate::var_registry::VarId;
 use fluree_db_core::StatsView;
 use std::sync::Arc;
@@ -115,7 +115,7 @@ struct StarConstOrderTopKSpec {
     label_pred: Ref,
     const_constraints: Vec<(Ref, Term)>,
     numeric_pred: Ref,
-    numeric_threshold: crate::triple::Term, // stored as Term::Value for convenience
+    numeric_threshold: crate::ir::triple::Term, // stored as Term::Value for convenience
     limit: usize,
 }
 
@@ -581,7 +581,7 @@ fn detect_partitioned_group_by(query: &ParsedQuery, options: &QueryOptions) -> b
     let gb = options.group_by[0];
 
     // Strict: only a single triple pattern plus order-preserving operators (FILTER/BIND).
-    let mut triple: Option<&crate::triple::TriplePattern> = None;
+    let mut triple: Option<&crate::ir::triple::TriplePattern> = None;
     for p in &query.patterns {
         match p {
             Pattern::Triple(tp) => {
@@ -944,7 +944,7 @@ fn detect_sum_strlen_group_concat_subquery(
 fn detect_predicate_object_count(
     query: &ParsedQuery,
     options: &QueryOptions,
-) -> Option<(Ref, VarId, crate::triple::Term, VarId)> {
+) -> Option<(Ref, VarId, crate::ir::triple::Term, VarId)> {
     let (input_var, out_var) = detect_count_aggregate(query, options)?;
 
     if query.patterns.len() != 1 {
@@ -1171,7 +1171,7 @@ fn detect_count_rows_with_encoded_filters(
     query: &ParsedQuery,
     options: &QueryOptions,
 ) -> Option<(
-    crate::triple::TriplePattern,
+    crate::ir::triple::TriplePattern,
     Vec<crate::ir::Expression>,
     VarId,
 )> {
@@ -1209,7 +1209,7 @@ fn detect_count_rows_with_encoded_filters(
     if query.patterns.len() < 2 {
         return None;
     }
-    let mut triple: Option<&crate::triple::TriplePattern> = None;
+    let mut triple: Option<&crate::ir::triple::TriplePattern> = None;
     let mut filters: Vec<&crate::ir::Expression> = Vec::new();
     for p in &query.patterns {
         match p {
@@ -1949,7 +1949,7 @@ fn detect_optional_chain_head_join_count_all(
         return None;
     }
 
-    let mut req: Option<&crate::triple::TriplePattern> = None;
+    let mut req: Option<&crate::ir::triple::TriplePattern> = None;
     let mut inner: Option<&[Pattern]> = None;
     for p in &query.patterns {
         match p {
@@ -3089,7 +3089,7 @@ mod tests {
     use crate::options::QueryOptions;
     use crate::parse::{ParsedQuery, QueryOutput};
     use crate::sort::SortSpec;
-    use crate::triple::{Ref, Term, TriplePattern};
+    use crate::ir::triple::{Ref, Term, TriplePattern};
     use fluree_db_core::Sid;
     use fluree_graph_json_ld::ParsedContext;
 

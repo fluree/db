@@ -312,7 +312,7 @@ mod tests {
     use fluree_db_query::ir::{PathModifier, Pattern};
     use fluree_db_query::parse::encode::MemoryEncoder;
     use fluree_db_query::sort::SortDirection;
-    use fluree_db_query::triple::{Ref, Term};
+    use fluree_db_query::ir::triple::{Ref, Term};
 
     fn test_encoder() -> MemoryEncoder {
         let mut encoder = MemoryEncoder::with_common_namespaces();

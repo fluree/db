@@ -11,6 +11,9 @@
 //!
 //! # Module layout
 //!
+//! - [`triple`] — `TriplePattern`, `Ref`, `Term`: the s/p/o vocabulary used
+//!   by triple patterns (and reused by other pattern variants for s/p
+//!   positions)
 //! - [`projection`] — top-level `Query` and graph-crawl selection specs
 //! - [`path`] — property-path patterns (transitive predicate traversal)
 //! - [`adapters`] — scan patterns over non-graph data sources (BM25, vector,
@@ -25,6 +28,7 @@ pub mod expression;
 pub mod path;
 pub mod pattern;
 pub mod projection;
+pub mod triple;
 
 pub use adapters::{
     GeoSearchCenter, GeoSearchPattern, IndexSearchPattern, IndexSearchTarget, R2rmlPattern,
@@ -37,3 +41,4 @@ pub use pattern::{
     SubqueryPattern,
 };
 pub use projection::{GraphSelectSpec, NestedSelectSpec, Query, Root, SelectionSpec};
+pub use triple::{Ref, Term, TriplePattern};

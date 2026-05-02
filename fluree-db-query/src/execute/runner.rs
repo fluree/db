@@ -16,7 +16,7 @@ use crate::reasoning::ReasoningOverlay;
 use crate::rewrite_owl_ql::Ontology;
 use crate::schema_bundle::SchemaBundleOverlay;
 use crate::stats_cache::cached_stats_view_for_db;
-use crate::triple::{Ref, Term, TriplePattern};
+use crate::ir::triple::{Ref, Term, TriplePattern};
 use crate::var_registry::VarRegistry;
 use fluree_db_binary_index::BinaryIndexStore;
 use fluree_db_core::dict_novelty::DictNovelty;

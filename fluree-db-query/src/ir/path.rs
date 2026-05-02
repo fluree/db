@@ -2,7 +2,7 @@
 //! standard graph (transitive predicate traversal), independent of where
 //! the data lives.
 
-use crate::triple::Ref;
+use super::triple::Ref;
 use crate::var_registry::VarId;
 use fluree_db_core::Sid;
 

@@ -24,7 +24,7 @@ use crate::vector::DistanceMetric;
 pub use crate::ir::{GraphSelectSpec, NestedSelectSpec, Root, SelectionSpec};
 use crate::options::QueryOptions;
 use crate::sort::{SortDirection, SortSpec};
-use crate::triple::{Ref, Term, TriplePattern};
+use crate::ir::triple::{Ref, Term, TriplePattern};
 use crate::var_registry::{VarId, VarRegistry};
 use fluree_db_core::DatatypeConstraint;
 use fluree_db_core::{FlakeValue, Sid};
@@ -109,7 +109,7 @@ impl ConstructTemplate {
     pub fn variables(&self) -> HashSet<VarId> {
         self.patterns
             .iter()
-            .flat_map(super::super::triple::TriplePattern::variables)
+            .flat_map(crate::ir::triple::TriplePattern::variables)
             .collect()
     }
 }

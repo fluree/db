@@ -19,7 +19,7 @@ use crate::fast_path_common::{
     reach_count_plus_multi, subject_ref_to_s_id, FastPathOperator,
 };
 use crate::operator::BoxedOperator;
-use crate::triple::Ref;
+use crate::ir::triple::Ref;
 use crate::var_registry::VarId;
 use fluree_db_core::o_type::OType;
 use rustc_hash::FxHashMap;

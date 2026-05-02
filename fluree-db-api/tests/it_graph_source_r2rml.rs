@@ -25,7 +25,7 @@ use fluree_db_api::{
 use fluree_db_core::{GraphDbRef, NoOverlay, Tracker};
 use fluree_db_query::ir::GraphName;
 use fluree_db_query::parse::{ParsedQuery, QueryOutput};
-use fluree_db_query::triple::{Ref, Term, TriplePattern};
+use fluree_db_query::ir::triple::{Ref, Term, TriplePattern};
 use support::genesis_ledger;
 
 fn r2rml_test_config<'a, P: R2rmlProvider + R2rmlTableProvider>(

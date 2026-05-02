@@ -91,7 +91,7 @@ use crate::context::ExecutionContext;
 use crate::error::{QueryError, Result};
 use crate::operator::inline::InlineOperator;
 use crate::operator::Operator;
-use crate::triple::TriplePattern;
+use crate::ir::triple::TriplePattern;
 use crate::var_registry::VarId;
 
 /// Scan operator for history-range queries.

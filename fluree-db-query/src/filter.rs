@@ -25,7 +25,7 @@ use crate::expression::PreparedBoolExpression;
 use crate::ir::{Expression, FilterValue, Pattern};
 use crate::operator::{BoxedOperator, Operator, OperatorState};
 use crate::seed::{EmptyOperator, SeedOperator};
-use crate::triple::Ref;
+use crate::ir::triple::Ref;
 use crate::var_registry::VarId;
 use async_trait::async_trait;
 use rustc_hash::{FxHashMap, FxHashSet};
@@ -126,7 +126,7 @@ fn collect_simple_exists_keys(expr: &Expression, out: &mut Vec<(VarId, Ref)>) {
             if !tp.p_bound() {
                 return;
             }
-            if !matches!(tp.o, crate::triple::Term::Var(_)) {
+            if !matches!(tp.o, crate::ir::triple::Term::Var(_)) {
                 return;
             }
             if tp.dtc.is_some() {
@@ -329,7 +329,7 @@ fn try_eval_simple_exists_semijoin(
     if !tp.p_bound() {
         return Ok(None);
     }
-    if !matches!(tp.o, crate::triple::Term::Var(_)) {
+    if !matches!(tp.o, crate::ir::triple::Term::Var(_)) {
         return Ok(None);
     }
     let Some(pred_sid) = try_normalize_pred_sid(store, &tp.p) else {
@@ -597,7 +597,7 @@ impl Operator for FilterOperator {
 mod tests {
     use super::*;
     use crate::ir::FilterValue;
-    use crate::triple::{Ref, Term, TriplePattern};
+    use crate::ir::triple::{Ref, Term, TriplePattern};
     use fluree_db_core::Sid;
 
     #[test]

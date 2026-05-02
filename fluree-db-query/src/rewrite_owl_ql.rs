@@ -37,7 +37,7 @@
 
 use crate::ir::Pattern;
 use crate::rewrite::{rewrite_subpatterns, Diagnostics, PlanContext, RewriteResult};
-use crate::triple::{Ref, Term, TriplePattern};
+use crate::ir::triple::{Ref, Term, TriplePattern};
 use crate::var_registry::VarId;
 use fluree_db_core::{
     is_owl_equivalent_property, is_rdf_type, FlakeValue, GraphDbRef, IndexType, RangeMatch,
@@ -883,7 +883,7 @@ fn expand_type_query_owl_ql(
 mod tests {
     use super::*;
     use crate::rewrite::{EntailmentMode, PlanLimits};
-    use crate::triple::Ref;
+    use crate::ir::triple::Ref;
     use fluree_db_core::SidInterner;
     use fluree_vocab::namespaces::RDF;
 

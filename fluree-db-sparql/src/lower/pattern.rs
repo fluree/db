@@ -255,7 +255,7 @@ impl<E: IriEncoder> LoweringContext<'_, E> {
 /// BIND expressions.  Used to build the SELECT list for anonymous subqueries
 /// that enforce SPARQL scope boundaries.
 fn collect_bound_variables(patterns: &[Pattern]) -> Vec<VarId> {
-    use fluree_db_query::triple::Ref;
+    use fluree_db_query::ir::triple::Ref;
     let mut seen = std::collections::HashSet::new();
     let mut result = Vec::new();
 
@@ -264,7 +264,7 @@ fn collect_bound_variables(patterns: &[Pattern]) -> Vec<VarId> {
         seen: &mut std::collections::HashSet<VarId>,
         out: &mut Vec<VarId>,
     ) {
-        use fluree_db_query::triple::Term;
+        use fluree_db_query::ir::triple::Term;
         fn add(v: VarId, seen: &mut std::collections::HashSet<VarId>, out: &mut Vec<VarId>) {
             if seen.insert(v) {
                 out.push(v);

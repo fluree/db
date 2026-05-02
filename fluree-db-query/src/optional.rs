@@ -37,7 +37,7 @@ use crate::operator::{
 };
 use crate::seed::SeedOperator;
 use crate::temporal_mode::PlanningContext;
-use crate::triple::{Ref, Term, TriplePattern};
+use crate::ir::triple::{Ref, Term, TriplePattern};
 use crate::var_registry::VarId;
 use async_trait::async_trait;
 use fluree_db_core::StatsView;

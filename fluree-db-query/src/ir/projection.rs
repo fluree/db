@@ -2,7 +2,7 @@
 //! describe how results are projected and crawled into nested JSON-LD form.
 
 use super::pattern::Pattern;
-use crate::triple::TriplePattern;
+use super::triple::TriplePattern;
 use crate::var_registry::VarId;
 use fluree_db_core::Sid;
 
@@ -286,7 +286,7 @@ impl GraphSelectSpec {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::triple::{Ref, Term};
+    use crate::ir::triple::{Ref, Term};
 
     fn test_pattern() -> TriplePattern {
         TriplePattern::new(

@@ -28,7 +28,7 @@ use crate::fast_path_common::{
     fast_path_store, leaf_entries_for_predicate, normalize_pred_sid, FastPathOperator,
 };
 use crate::operator::BoxedOperator;
-use crate::triple::Ref;
+use crate::ir::triple::Ref;
 use crate::var_registry::VarId;
 use fluree_db_binary_index::format::column_block::ColumnId;
 use fluree_db_binary_index::format::run_record::RunSortOrder;

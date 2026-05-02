@@ -71,7 +71,7 @@ mod tests {
     use crate::parse::{ParsedQuery, QueryOutput};
     use crate::planner::reorder_patterns;
     use crate::sort::SortSpec;
-    use crate::triple::{Ref, Term, TriplePattern};
+    use crate::ir::triple::{Ref, Term, TriplePattern};
     use crate::var_registry::{VarId, VarRegistry};
     use fluree_db_core::{
         FlakeValue, GraphDbRef, LedgerSnapshot, NoOverlay, PropertyStatData, Sid, StatsView,

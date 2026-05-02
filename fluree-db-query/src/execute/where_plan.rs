@@ -30,7 +30,7 @@ use crate::seed::EmptyOperator;
 use crate::semijoin::SemijoinOperator;
 use crate::subquery::SubqueryOperator;
 use crate::temporal_mode::PlanningContext;
-use crate::triple::{Ref, Term, TriplePattern};
+use crate::ir::triple::{Ref, Term, TriplePattern};
 use crate::union::UnionOperator;
 use crate::values::ValuesOperator;
 use crate::var_registry::VarId;
@@ -437,7 +437,7 @@ pub(crate) fn collect_property_join_tail(
     let mut combined = required_triples.to_vec();
     let mut available_required_vars: HashSet<VarId> = required_triples
         .iter()
-        .flat_map(super::super::triple::TriplePattern::variables)
+        .flat_map(crate::ir::triple::TriplePattern::variables)
         .collect();
 
     while let Some(Pattern::Optional(inner_patterns)) = patterns.get(i) {
@@ -799,12 +799,12 @@ fn build_property_join_block(
 
     let mut available_vars: HashSet<VarId> = triples
         .iter()
-        .flat_map(super::super::triple::TriplePattern::variables)
+        .flat_map(crate::ir::triple::TriplePattern::variables)
         .collect();
     available_vars.extend(
         optional_triples
             .iter()
-            .flat_map(super::super::triple::TriplePattern::variables),
+            .flat_map(crate::ir::triple::TriplePattern::variables),
     );
 
     let (inline_ops, pending_binds, pending_filters) = build_inline_ops(
@@ -1003,7 +1003,7 @@ fn build_sequential_join_block(
             live.extend(
                 triples[k + 1..]
                     .iter()
-                    .flat_map(super::super::triple::TriplePattern::variables),
+                    .flat_map(crate::ir::triple::TriplePattern::variables),
             );
             live.extend(pending_filters.iter().flat_map(|f| f.expr.variables()));
             live.extend(pending_binds.iter().flat_map(|b| b.expr.variables()));
@@ -2053,7 +2053,7 @@ pub fn build_triple_operators(
         let live_vars = rwv_set.as_ref().map(|base| {
             let suffix_vars: HashSet<VarId> = triples_for_exec[k + 1..]
                 .iter()
-                .flat_map(super::super::triple::TriplePattern::variables)
+                .flat_map(crate::ir::triple::TriplePattern::variables)
                 .collect();
             base.union(&suffix_vars).copied().collect::<Vec<VarId>>()
         });
@@ -2096,7 +2096,7 @@ pub fn build_triple_operators(
 mod tests {
     use super::*;
     use crate::ir::{Expression, FilterValue, Pattern};
-    use crate::triple::{Ref, Term};
+    use crate::ir::triple::{Ref, Term};
     use fluree_db_core::{FlakeValue, PropertyStatData, Sid, StatsView};
     use std::collections::HashSet;
     use std::sync::Arc;
@@ -2132,7 +2132,7 @@ mod tests {
         // Preserve historical test behavior: keep all triple vars.
         let needed: HashSet<VarId> = triples
             .iter()
-            .flat_map(crate::triple::TriplePattern::variables)
+            .flat_map(crate::ir::triple::TriplePattern::variables)
             .collect();
         let (counts, protected) = compute_where_var_stats(
             &triples

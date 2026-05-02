@@ -34,7 +34,7 @@ use crate::ir::{PathModifier, PropertyPathPattern};
 use crate::operator::{
     compute_trimmed_vars, effective_schema, trim_batch, BoxedOperator, Operator, OperatorState,
 };
-use crate::triple::Ref;
+use crate::ir::triple::Ref;
 use crate::var_registry::VarId;
 use async_trait::async_trait;
 use fluree_db_core::{
@@ -729,7 +729,7 @@ impl Operator for PropertyPathOperator {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::triple::Ref;
+    use crate::ir::triple::Ref;
     use fluree_db_core::Sid;
 
     fn make_pattern(subj: Ref, pred: Sid, modifier: PathModifier, obj: Ref) -> PropertyPathPattern {

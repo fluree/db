@@ -122,7 +122,7 @@ mod tests {
     use crate::options::QueryOptions;
     use crate::parse::{ConstructTemplate, ParsedQuery, QueryOutput, SelectMode};
     use crate::sort::SortSpec;
-    use crate::triple::{Ref, Term, TriplePattern};
+    use crate::ir::triple::{Ref, Term, TriplePattern};
     use fluree_db_core::Sid;
     use fluree_graph_json_ld::ParsedContext;
 

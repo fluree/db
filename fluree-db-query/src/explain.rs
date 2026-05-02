@@ -6,7 +6,7 @@
 //! Call `explain_patterns` with a set of patterns and optional stats to get an `ExplainPlan`.
 
 use crate::planner::{classify_pattern, estimate_triple_row_count, PatternType};
-use crate::triple::{Ref, Term, TriplePattern};
+use crate::ir::triple::{Ref, Term, TriplePattern};
 use crate::var_registry::VarId;
 use crate::{
     execute::{analyze_property_join_plan, collect_inner_join_block},
