@@ -3248,15 +3248,17 @@ mod tests {
 
     #[test]
     fn test_scan_index_hint_prefers_opst_for_str_wrapper_with_string_dtc() {
-        let tp = TriplePattern::with_dt(
-            Ref::Var(VarId(0)),
-            Ref::Sid(fluree_db_core::Sid::new(100, "name")),
-            Term::Var(VarId(1)),
-            fluree_db_core::Sid::new(
-                fluree_vocab::namespaces::XSD,
-                fluree_vocab::xsd_names::STRING,
-            ),
-        );
+        let tp = TriplePattern {
+            s: Ref::Var(VarId(0)),
+            p: Ref::Sid(fluree_db_core::Sid::new(100, "name")),
+            o: Term::Var(VarId(1)),
+            dtc: Some(fluree_db_core::DatatypeConstraint::Explicit(
+                fluree_db_core::Sid::new(
+                    fluree_vocab::namespaces::XSD,
+                    fluree_vocab::xsd_names::STRING,
+                ),
+            )),
+        };
         let filter = InlineOperator::Filter(PreparedBoolExpression::new(Expression::call(
             crate::ir::Function::Regex,
             vec![

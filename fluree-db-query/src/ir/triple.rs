@@ -198,16 +198,6 @@ impl TriplePattern {
         Self { s, p, o, dtc: None }
     }
 
-    /// Create with an explicit datatype constraint
-    pub fn with_dt(s: Ref, p: Ref, o: Term, dt: Sid) -> Self {
-        Self {
-            s,
-            p,
-            o,
-            dtc: Some(DatatypeConstraint::Explicit(dt)),
-        }
-    }
-
     /// Variables this pattern mentions, in order: s, p, o.
     ///
     /// For a triple pattern, every variable position is both *referenced*
