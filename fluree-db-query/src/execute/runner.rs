@@ -57,18 +57,7 @@ fn dedup_exact_triples(patterns: Vec<Pattern>) -> Vec<Pattern> {
                     seen_triples.push(tp.clone());
                     out.push(Pattern::Triple(tp));
                 }
-                Pattern::Optional(inner) => out.push(Pattern::Optional(dedup_list(inner))),
-                Pattern::Union(branches) => out.push(Pattern::Union(
-                    branches.into_iter().map(dedup_list).collect(),
-                )),
-                Pattern::Minus(inner) => out.push(Pattern::Minus(dedup_list(inner))),
-                Pattern::Exists(inner) => out.push(Pattern::Exists(dedup_list(inner))),
-                Pattern::NotExists(inner) => out.push(Pattern::NotExists(dedup_list(inner))),
-                Pattern::Graph { name, patterns } => out.push(Pattern::Graph {
-                    name,
-                    patterns: dedup_list(patterns),
-                }),
-                other => out.push(other),
+                other => out.push(other.map_subpatterns(&mut dedup_list)),
             }
         }
         out
@@ -343,29 +332,14 @@ pub async fn prepare_execution_with_config(
                         o: encode_term(snapshot, &tp.o),
                         dtc: tp.dtc.clone(),
                     }),
-                    Pattern::Optional(inner) => {
-                        Pattern::Optional(encode_patterns_for_reasoning(snapshot, inner))
-                    }
-                    Pattern::Union(branches) => Pattern::Union(
-                        branches
-                            .iter()
-                            .map(|b| encode_patterns_for_reasoning(snapshot, b))
-                            .collect(),
-                    ),
-                    Pattern::Minus(inner) => {
-                        Pattern::Minus(encode_patterns_for_reasoning(snapshot, inner))
-                    }
-                    Pattern::Exists(inner) => {
-                        Pattern::Exists(encode_patterns_for_reasoning(snapshot, inner))
-                    }
-                    Pattern::NotExists(inner) => {
-                        Pattern::NotExists(encode_patterns_for_reasoning(snapshot, inner))
-                    }
-                    Pattern::Graph { name, patterns } => Pattern::Graph {
-                        name: name.clone(),
-                        patterns: encode_patterns_for_reasoning(snapshot, patterns),
-                    },
-                    _ => p.clone(),
+                    // Don't encode IRIs across remote-endpoint or
+                    // independently-scoped boundaries: a Service block targets
+                    // a different endpoint with potentially different IRI→SID
+                    // mappings, and a Subquery is its own scope.
+                    Pattern::Service(_) | Pattern::Subquery(_) => p.clone(),
+                    other => other
+                        .clone()
+                        .map_subpatterns(&mut |xs| encode_patterns_for_reasoning(snapshot, &xs)),
                 })
                 .collect()
         }
