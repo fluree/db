@@ -849,11 +849,11 @@ impl UnresolvedHydrationSpec {
     }
 }
 
-/// One column of a SELECT/SELECT-ONE projection (unresolved).
+/// One column of a SELECT projection (unresolved).
 ///
 /// Lowered into [`crate::ir::Column`].
 #[derive(Debug, Clone, PartialEq)]
-pub enum UnresolvedSelection {
+pub enum UnresolvedColumn {
     /// Project a single variable's binding (e.g. `"?name"`).
     Var(Arc<str>),
     /// Hydrate a subject (variable or IRI constant) into a nested JSON-LD
@@ -861,12 +861,72 @@ pub enum UnresolvedSelection {
     Hydration(UnresolvedHydrationSpec),
 }
 
-impl UnresolvedSelection {
-    /// Returns the variable name if this is a `Var` selection.
+impl UnresolvedColumn {
+    /// Returns the variable name if this is a `Var` column.
     pub fn var_name(&self) -> Option<&str> {
         match self {
-            UnresolvedSelection::Var(name) => Some(name),
-            UnresolvedSelection::Hydration(_) => None,
+            UnresolvedColumn::Var(name) => Some(name),
+            UnresolvedColumn::Hydration(_) => None,
+        }
+    }
+
+    /// Returns the hydration spec if this is a `Hydration` column.
+    pub fn as_hydration(&self) -> Option<&UnresolvedHydrationSpec> {
+        match self {
+            UnresolvedColumn::Hydration(spec) => Some(spec),
+            UnresolvedColumn::Var(_) => None,
+        }
+    }
+}
+
+/// The columns a SELECT query produces (unresolved). Mirrors
+/// [`crate::ir::Projection`].
+#[derive(Debug, Clone, PartialEq)]
+pub enum UnresolvedProjection {
+    /// SELECT * — all in-scope WHERE-bound variables, rendered raw.
+    Wildcard,
+    /// Array-form rows: each row is `[v1, v2, ...]` of any arity.
+    Tuple(Vec<UnresolvedColumn>),
+    /// Bare-value rows from JSON-LD `select: "?x"` — exactly one column,
+    /// each row is a bare value (not wrapped in an array).
+    Scalar(UnresolvedColumn),
+}
+
+impl Default for UnresolvedProjection {
+    /// An empty `Tuple` projection — the parser populates it as columns
+    /// are encountered.
+    fn default() -> Self {
+        UnresolvedProjection::Tuple(Vec::new())
+    }
+}
+
+impl UnresolvedProjection {
+    /// Columns in render order. Empty for `Wildcard`.
+    pub fn columns(&self) -> &[UnresolvedColumn] {
+        match self {
+            UnresolvedProjection::Wildcard => &[],
+            UnresolvedProjection::Tuple(cs) => cs,
+            UnresolvedProjection::Scalar(c) => std::slice::from_ref(c),
+        }
+    }
+
+    /// The hydration spec embedded in the projection, if any.
+    pub fn hydration(&self) -> Option<&UnresolvedHydrationSpec> {
+        self.columns().iter().find_map(UnresolvedColumn::as_hydration)
+    }
+
+    /// Mutable access to the hydration spec, if any.
+    pub fn hydration_mut(&mut self) -> Option<&mut UnresolvedHydrationSpec> {
+        match self {
+            UnresolvedProjection::Wildcard => None,
+            UnresolvedProjection::Tuple(cs) => cs.iter_mut().find_map(|c| match c {
+                UnresolvedColumn::Hydration(spec) => Some(spec),
+                UnresolvedColumn::Var(_) => None,
+            }),
+            UnresolvedProjection::Scalar(c) => match c {
+                UnresolvedColumn::Hydration(spec) => Some(spec),
+                UnresolvedColumn::Var(_) => None,
+            },
         }
     }
 }
@@ -1014,18 +1074,6 @@ impl UnresolvedPattern {
     }
 }
 
-/// User-declared select shape from the input syntax. Parser-only — lowered
-/// into a `Projection` variant in the IR.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum SelectShape {
-    /// Array-form select: each row is a tuple. Default; SPARQL and JSON-LD
-    /// array-form `select`.
-    #[default]
-    Tuple,
-    /// Bare-string `select: "?x"`: each row is a single bare value.
-    Scalar,
-}
-
 /// Unresolved query - the result of parsing before IRI resolution
 #[derive(Debug, Clone)]
 pub struct UnresolvedQuery {
@@ -1033,15 +1081,8 @@ pub struct UnresolvedQuery {
     pub context: ParsedContext,
     /// Original JSON context from the query (for CONSTRUCT output)
     pub orig_context: Option<serde_json::Value>,
-    /// Selections in column order (variable names and/or one hydration).
-    pub select: Vec<UnresolvedSelection>,
-    /// User-declared select shape from the input syntax.
-    ///
-    /// `Scalar` for bare-string select (`select: "?x"`), `Tuple` otherwise
-    /// (array form, or SPARQL, which has no scalar form). Lowered into
-    /// `Projection::Scalar` vs `Projection::Tuple` so formatters can decide
-    /// rendering without inferring from `selections.len()`.
-    pub select_shape: SelectShape,
+    /// Projection (columns + shape). Lowered into [`crate::ir::Projection`].
+    pub select: UnresolvedProjection,
     /// Ordered patterns in where clause (triples, filters, optionals, etc.)
     pub patterns: Vec<UnresolvedPattern>,
     /// Query options (limit, offset, order by, group by, etc.)
@@ -1056,39 +1097,42 @@ impl UnresolvedQuery {
         Self {
             context,
             orig_context: None,
-            select: Vec::new(),
-            select_shape: SelectShape::default(),
+            select: UnresolvedProjection::default(),
             patterns: Vec::new(),
             options: UnresolvedOptions::default(),
             construct_template: None,
         }
     }
 
-    /// Add a selected variable.
+    /// Append a Var column. The projection must be in `Tuple` mode
+    /// (the default for [`Self::new`]).
     pub fn add_select(&mut self, var: impl AsRef<str>) {
-        self.select
-            .push(UnresolvedSelection::Var(Arc::from(var.as_ref())));
+        self.push_column(UnresolvedColumn::Var(Arc::from(var.as_ref())));
     }
 
-    /// Add a hydrationion.
+    /// Append a Hydration column. The projection must be in `Tuple` mode.
     pub fn add_hydration(&mut self, spec: UnresolvedHydrationSpec) {
-        self.select.push(UnresolvedSelection::Hydration(spec));
+        self.push_column(UnresolvedColumn::Hydration(spec));
     }
 
-    /// Returns the (single) hydrationion, if any.
+    /// Append a column to a `Tuple` projection. Panics if `select` is not
+    /// `Tuple` (which only happens after `select` has been finalized to
+    /// `Wildcard` or `Scalar` — neither supports incremental appends).
+    fn push_column(&mut self, column: UnresolvedColumn) {
+        match &mut self.select {
+            UnresolvedProjection::Tuple(cs) => cs.push(column),
+            _ => panic!("cannot append a column to a non-Tuple projection"),
+        }
+    }
+
+    /// Returns the hydration spec embedded in the projection, if any.
     pub fn hydration(&self) -> Option<&UnresolvedHydrationSpec> {
-        self.select.iter().find_map(|s| match s {
-            UnresolvedSelection::Hydration(spec) => Some(spec),
-            _ => None,
-        })
+        self.select.hydration()
     }
 
-    /// Mutable access to the (single) hydrationion, if any.
+    /// Mutable access to the hydration spec, if any.
     pub fn hydration_mut(&mut self) -> Option<&mut UnresolvedHydrationSpec> {
-        self.select.iter_mut().find_map(|s| match s {
-            UnresolvedSelection::Hydration(spec) => Some(spec),
-            _ => None,
-        })
+        self.select.hydration_mut()
     }
 
     /// Add a triple pattern (convenience method that wraps in UnresolvedPattern)

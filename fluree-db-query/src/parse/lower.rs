@@ -4,10 +4,10 @@
 //! (with Sids and VarIds) using an IriEncoder.
 
 use super::ast::{
-    LiteralValue, SelectShape, UnresolvedAggregateFn, UnresolvedAggregateSpec,
+    LiteralValue, UnresolvedAggregateFn, UnresolvedAggregateSpec, UnresolvedColumn,
     UnresolvedConstructTemplate, UnresolvedDatatypeConstraint, UnresolvedExpression,
     UnresolvedHydrationSpec, UnresolvedNestedSelectSpec, UnresolvedOptions, UnresolvedPathExpr,
-    UnresolvedPattern, UnresolvedQuery, UnresolvedRoot, UnresolvedSelection,
+    UnresolvedPattern, UnresolvedProjection, UnresolvedQuery, UnresolvedRoot,
     UnresolvedSelectionSpec, UnresolvedSortDirection, UnresolvedSortSpec, UnresolvedTerm,
     UnresolvedTriplePattern, UnresolvedValue,
 };
@@ -87,12 +87,8 @@ pub(crate) fn lower_query<E: IriEncoder>(
 ) -> Result<Query> {
     let mut pp_counter: u32 = 0;
 
-    // Lower columns (variables and any hydration)
-    let columns: Vec<Column> = ast
-        .select
-        .iter()
-        .map(|sel| lower_selection(sel, encoder, vars))
-        .collect::<Result<_>>()?;
+    // Lower the projection (columns + shape)
+    let projection = lower_projection(&ast.select, encoder, vars)?;
 
     // Lower patterns
     let mut patterns = Vec::new();
@@ -108,11 +104,11 @@ pub(crate) fn lower_query<E: IriEncoder>(
     // Build QueryOutput from mode + lowered components
     let output = match select_mode {
         SelectMode::Many => QueryOutput::Select {
-            projection: build_projection(columns, ast.select_shape),
+            projection,
             multiplicity: Multiplicity::All,
         },
         SelectMode::One => QueryOutput::Select {
-            projection: build_projection(columns, ast.select_shape),
+            projection,
             multiplicity: Multiplicity::One,
         },
         SelectMode::Wildcard => QueryOutput::Select {
@@ -139,31 +135,36 @@ pub(crate) fn lower_query<E: IriEncoder>(
     })
 }
 
-fn lower_selection<E: IriEncoder>(
-    sel: &UnresolvedSelection,
+fn lower_column<E: IriEncoder>(
+    col: &UnresolvedColumn,
     encoder: &E,
     vars: &mut VarRegistry,
 ) -> Result<Column> {
-    match sel {
-        UnresolvedSelection::Var(name) => Ok(Column::Var(vars.get_or_insert(name))),
-        UnresolvedSelection::Hydration(spec) => {
+    match col {
+        UnresolvedColumn::Var(name) => Ok(Column::Var(vars.get_or_insert(name))),
+        UnresolvedColumn::Hydration(spec) => {
             Ok(Column::Hydration(lower_hydration(spec, encoder, vars)?))
         }
     }
 }
 
-/// Build the appropriate `Projection` variant from lowered columns and the
-/// user-declared shape from the input syntax (`Tuple` for array form,
-/// `Scalar` for bare-string form).
-fn build_projection(columns: Vec<Column>, shape: SelectShape) -> Projection {
-    match shape {
-        SelectShape::Scalar if columns.len() == 1 => {
-            Projection::Scalar(columns.into_iter().next().unwrap())
+fn lower_projection<E: IriEncoder>(
+    projection: &UnresolvedProjection,
+    encoder: &E,
+    vars: &mut VarRegistry,
+) -> Result<Projection> {
+    match projection {
+        UnresolvedProjection::Wildcard => Ok(Projection::Wildcard),
+        UnresolvedProjection::Tuple(cs) => {
+            let lowered = cs
+                .iter()
+                .map(|c| lower_column(c, encoder, vars))
+                .collect::<Result<Vec<_>>>()?;
+            Ok(Projection::Tuple(lowered))
         }
-        // Multi-column scalar is unrepresentable; the parser only sets
-        // Scalar for bare-string `select: "?x"` so this branch is just a
-        // safety net — fall through to Tuple.
-        _ => Projection::Tuple(columns),
+        UnresolvedProjection::Scalar(c) => {
+            Ok(Projection::Scalar(lower_column(c, encoder, vars)?))
+        }
     }
 }
 
@@ -1010,14 +1011,27 @@ fn lower_subquery<E: IriEncoder>(
     vars: &mut VarRegistry,
     pp_counter: &mut u32,
 ) -> Result<SubqueryPattern> {
-    // Lower select list to VarIds (subqueries support variables only, no hydration)
-    let select: Vec<VarId> = subquery
-        .select
+    // Lower select list to VarIds (subqueries support variables only, no
+    // hydration or wildcard)
+    let columns = match &subquery.select {
+        UnresolvedProjection::Tuple(cs) => cs,
+        UnresolvedProjection::Wildcard => {
+            return Err(ParseError::InvalidSelect(
+                "subqueries do not support SELECT *".to_string(),
+            ));
+        }
+        UnresolvedProjection::Scalar(_) => {
+            return Err(ParseError::InvalidSelect(
+                "subqueries do not support scalar select form".to_string(),
+            ));
+        }
+    };
+    let select: Vec<VarId> = columns
         .iter()
-        .map(|sel| match sel {
-            UnresolvedSelection::Var(name) => Ok(vars.get_or_insert(name)),
-            UnresolvedSelection::Hydration(_) => Err(ParseError::InvalidSelect(
-                "hydrationions are not allowed inside subqueries".to_string(),
+        .map(|c| match c {
+            UnresolvedColumn::Var(name) => Ok(vars.get_or_insert(name)),
+            UnresolvedColumn::Hydration(_) => Err(ParseError::InvalidSelect(
+                "hydrations are not allowed inside subqueries".to_string(),
             )),
         })
         .collect::<Result<_>>()?;

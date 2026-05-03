@@ -49,7 +49,7 @@ pub use where_clause::parse_where_with_counters;
 
 use crate::ir::{Expression, Query};
 use crate::var_registry::VarRegistry;
-use ast::{SelectShape, UnresolvedPathExpr};
+use ast::{UnresolvedColumn, UnresolvedPathExpr, UnresolvedProjection};
 use fluree_graph_json_ld::{parse_context, ParsedContext};
 use serde_json::Value as JsonValue;
 use std::collections::HashMap;
@@ -278,11 +278,9 @@ fn parse_query_ast_internal(
             let mut seen: std::collections::HashSet<&str> = std::collections::HashSet::new();
             query.options.order_by = query
                 .select
+                .columns()
                 .iter()
-                .filter_map(|sel| match sel {
-                    crate::parse::ast::UnresolvedSelection::Var(name) => Some(name.as_ref()),
-                    crate::parse::ast::UnresolvedSelection::Hydration(_) => None,
-                })
+                .filter_map(UnresolvedColumn::var_name)
                 .filter(|s| s.starts_with('?'))
                 .filter(|s| seen.insert(*s))
                 .map(crate::parse::ast::UnresolvedSortSpec::asc)
@@ -548,11 +546,10 @@ fn parse_select(
     query: &mut UnresolvedQuery,
 ) -> Result<()> {
     match select {
-        // Case 2, 3, 5: Array form - could be simple vars, mixed, or with aggregates
+        // Case 2, 3, 5: Array form — tuple-shaped rows of any arity.
+        // (`["?x"]` → `[[v]]`, `["?x", "?y"]` → `[[v1, v2]]`, etc.)
         JsonValue::Array(arr) => {
-            // Record shape: array form always yields tuple rows, regardless of
-            // how many items are inside (`["?x"]` → `[[v1],[v2]]`, not `[v1,v2]`).
-            query.select_shape = SelectShape::Tuple;
+            // The default UnresolvedProjection is Tuple(empty); push columns in.
             for item in arr {
                 match item {
                     JsonValue::String(s) => {
@@ -572,6 +569,8 @@ fn parse_select(
         }
 
         // Case 4: Single object form: {"?person": ["*"]}
+        // Stored as a one-column Tuple — formatters can't tell this apart
+        // from `["{"?person": ["*"]}"]`, and SPARQL has no scalar form.
         JsonValue::Object(map) => {
             let spec = parse_hydration_object(map, ctx, query)?;
             query.add_hydration(spec);
@@ -579,8 +578,18 @@ fn parse_select(
 
         // Case 1: Single string form: "?x" — bare variable, scalar shape.
         JsonValue::String(s) => {
-            query.select_shape = SelectShape::Scalar;
+            // Promote the (empty) default projection to Scalar by parsing
+            // the column first and then wrapping.
             parse_select_string(s, query)?;
+            // The string may have been an aggregate that registered a
+            // computed output var as a single Var column; either way,
+            // promote that single column into Scalar form.
+            query.select = match std::mem::take(&mut query.select) {
+                UnresolvedProjection::Tuple(mut cs) if cs.len() == 1 => {
+                    UnresolvedProjection::Scalar(cs.pop().unwrap())
+                }
+                other => other,
+            };
         }
 
         _ => {
@@ -1108,8 +1117,8 @@ mod tests {
 
         let (ast, _) = parse_query_ast(&json, None).unwrap();
 
-        assert_eq!(ast.select.len(), 1);
-        assert_eq!(ast.select[0].var_name().unwrap(), "?name");
+        assert_eq!(ast.select.columns().len(), 1);
+        assert_eq!(ast.select.columns()[0].var_name().unwrap(), "?name");
         assert_eq!(ast.patterns.len(), 2); // @type + name
     }
 
@@ -2095,7 +2104,7 @@ mod tests {
 
         // Empty select should parse (though semantically questionable)
         let (ast, _) = parse_query_ast(&json, None).unwrap();
-        assert!(ast.select.is_empty());
+        assert!(ast.select.columns().is_empty());
     }
 
     #[test]
@@ -2143,7 +2152,7 @@ mod tests {
         });
 
         let (ast, _) = parse_query_ast(&json, None).unwrap();
-        assert_eq!(ast.select.len(), 2);
+        assert_eq!(ast.select.columns().len(), 2);
     }
 
     #[test]
@@ -2999,9 +3008,9 @@ mod tests {
         let (ast, _) = parse_query_ast(&json, None).unwrap();
 
         // Check select has both vars
-        assert_eq!(ast.select.len(), 2);
-        assert_eq!(ast.select[0].var_name().unwrap(), "?name");
-        assert_eq!(ast.select[1].var_name().unwrap(), "?count");
+        assert_eq!(ast.select.columns().len(), 2);
+        assert_eq!(ast.select.columns()[0].var_name().unwrap(), "?name");
+        assert_eq!(ast.select.columns()[1].var_name().unwrap(), "?count");
 
         // Check aggregate was parsed
         assert_eq!(ast.options.aggregates.len(), 1);
@@ -3041,8 +3050,8 @@ mod tests {
 
         let (ast, _) = parse_query_ast(&json, None).unwrap();
 
-        assert_eq!(ast.select.len(), 1);
-        assert_eq!(ast.select[0].var_name().unwrap(), "?sum");
+        assert_eq!(ast.select.columns().len(), 1);
+        assert_eq!(ast.select.columns()[0].var_name().unwrap(), "?sum");
 
         assert_eq!(ast.options.aggregates.len(), 1);
         let agg = &ast.options.aggregates[0];
