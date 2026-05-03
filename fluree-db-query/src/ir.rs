@@ -15,6 +15,8 @@
 //! - [`query`] — top-level `Query`, `QueryOutput`, `ProjectionShape`,
 //!   `ConstructTemplate`: the resolved-and-lowered query that flows through
 //!   parse → plan → execute → format
+//! - [`options`] — `QueryOptions` (LIMIT/OFFSET/ORDER BY/GROUP BY/aggregates/
+//!   HAVING/post-binds/DISTINCT) plus `ReasoningModes` config for the rewriter
 //! - [`triple`] — `TriplePattern`, `Ref`, `Term`: the s/p/o vocabulary used
 //!   by triple patterns (and reused by other pattern variants for s/p
 //!   positions)
@@ -30,6 +32,7 @@
 
 pub mod adapters;
 pub mod expression;
+pub mod options;
 pub mod path;
 pub mod pattern;
 pub mod projection;
@@ -41,6 +44,7 @@ pub use adapters::{
     S2QueryGeom, S2SearchPattern, S2SpatialOp, VectorSearchPattern, VectorSearchTarget,
 };
 pub use expression::{ArithmeticOp, CompareOp, Expression, FilterValue, Function};
+pub use options::{QueryOptions, ReasoningModes};
 pub use path::{PathModifier, PropertyPathPattern};
 pub use pattern::{
     GraphName, Pattern, ServiceEndpoint, ServicePattern, SubqueryPattern,

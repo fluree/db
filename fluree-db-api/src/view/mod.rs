@@ -17,7 +17,7 @@
 //!
 //! ```ignore
 //! use fluree_db_api::{Fluree, GraphDb};
-//! use fluree_db_query::rewrite::ReasoningModes;
+//! use fluree_db_query::ir::ReasoningModes;
 //!
 //! // Load a base view
 //! let view = fluree.db("mydb:main").await?;

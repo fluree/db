@@ -23,7 +23,7 @@ use crate::vector::DistanceMetric;
 use crate::ir::{
     ConstructTemplate, GraphSelectSpec, NestedSelectSpec, Query, QueryOutput, Root, SelectionSpec,
 };
-use crate::options::QueryOptions;
+use crate::ir::QueryOptions;
 use crate::sort::{SortDirection, SortSpec};
 use crate::ir::triple::{Ref, Term, TriplePattern};
 use crate::var_registry::{VarId, VarRegistry};

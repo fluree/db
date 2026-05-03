@@ -5,8 +5,7 @@
 //! and GROUP BY. Variables without downstream dependencies are dead and can
 //! be projected away early.
 
-use crate::options::QueryOptions;
-use crate::ir::Query;
+use crate::ir::{Query, QueryOptions};
 use crate::var_registry::VarId;
 use std::collections::HashSet;
 
@@ -119,7 +118,7 @@ mod tests {
     use super::*;
     use crate::aggregate::{AggregateFn, AggregateSpec};
     use crate::ir::{Expression, FilterValue, Pattern};
-    use crate::options::QueryOptions;
+    use crate::ir::QueryOptions;
     use crate::ir::{ConstructTemplate, Query, QueryOutput};
     use crate::parse::SelectMode;
     use crate::sort::SortSpec;

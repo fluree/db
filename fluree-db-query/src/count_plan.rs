@@ -15,7 +15,7 @@
 
 use crate::execute::operator_tree::{detect_count_all_aggregate, validate_simple_triple};
 use crate::ir::{Expression, Pattern};
-use crate::options::QueryOptions;
+use crate::ir::QueryOptions;
 use crate::ir::Query;
 use crate::ir::triple::Ref;
 use crate::var_registry::VarId;

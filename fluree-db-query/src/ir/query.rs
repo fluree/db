@@ -12,10 +12,10 @@ use std::collections::HashSet;
 
 use fluree_graph_json_ld::ParsedContext;
 
+use super::options::QueryOptions;
 use super::pattern::Pattern;
 use super::projection::GraphSelectSpec;
 use super::triple::TriplePattern;
-use crate::options::QueryOptions;
 use crate::var_registry::VarId;
 
 /// Per-row projection shape for tabular output formatters.

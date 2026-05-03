@@ -13,13 +13,12 @@ use crate::ast::query::{DescribeQuery, DescribeTarget, SolutionModifiers, VarOrI
 use crate::SourceSpan;
 
 use fluree_db_query::binding::Binding;
-use fluree_db_query::ir::{Expression, Pattern, SubqueryPattern};
-use fluree_db_query::options::QueryOptions;
-use fluree_db_query::parse::encode::IriEncoder;
-use fluree_db_query::ir::{
-    ConstructTemplate as QueryConstructTemplate, Query, QueryOutput,
-};
 use fluree_db_query::ir::triple::{Ref, Term, TriplePattern};
+use fluree_db_query::ir::{
+    ConstructTemplate as QueryConstructTemplate, Expression, Pattern, Query, QueryOptions,
+    QueryOutput, SubqueryPattern,
+};
+use fluree_db_query::parse::encode::IriEncoder;
 use fluree_db_query::var_registry::VarId;
 
 use super::{LowerError, LoweringContext, Result};

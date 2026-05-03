@@ -10,7 +10,7 @@ use crate::dataset::DataSet;
 use crate::error::Result;
 use crate::ir::Pattern;
 use crate::operator::BoxedOperator;
-use crate::options::QueryOptions;
+use crate::ir::QueryOptions;
 use crate::ir::Query;
 use crate::reasoning::ReasoningOverlay;
 use crate::rewrite_owl_ql::Ontology;

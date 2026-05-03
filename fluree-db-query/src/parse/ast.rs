@@ -666,7 +666,7 @@ pub struct UnresolvedOptions {
     ///
     /// Parsed from `"reasoning"` key in query JSON. None means use defaults
     /// (auto-enable RDFS when hierarchy exists).
-    pub reasoning: Option<crate::rewrite::ReasoningModes>,
+    pub reasoning: Option<crate::ir::ReasoningModes>,
     /// Whether to treat bare "?var" object strings as variables in WHERE.
     ///
     /// When false, bare "?x" object values are literals unless

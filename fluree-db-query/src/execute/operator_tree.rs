@@ -47,7 +47,7 @@ use crate::limit::LimitOperator;
 use crate::offset::OffsetOperator;
 use crate::operator::inline::InlineOperator;
 use crate::operator::BoxedOperator;
-use crate::options::QueryOptions;
+use crate::ir::QueryOptions;
 use crate::ir::{Query, QueryOutput};
 use crate::project::ProjectOperator;
 use crate::sort::SortDirection;
@@ -3086,7 +3086,7 @@ fn build_operator_tree_inner(
 mod tests {
     use super::*;
     use crate::ir::Pattern;
-    use crate::options::QueryOptions;
+    use crate::ir::QueryOptions;
     use crate::ir::{Query, QueryOutput};
     use crate::sort::SortSpec;
     use crate::ir::triple::{Ref, Term, TriplePattern};

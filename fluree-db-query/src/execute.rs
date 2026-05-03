@@ -67,7 +67,7 @@ pub use runner::{
 mod tests {
     use super::*;
     use crate::ir::{Expression, FilterValue, Pattern};
-    use crate::options::QueryOptions;
+    use crate::ir::QueryOptions;
     use crate::ir::{Query, QueryOutput};
     use crate::planner::reorder_patterns;
     use crate::sort::SortSpec;

@@ -65,7 +65,6 @@ pub(crate) mod object_binding;
 pub mod offset;
 pub mod operator;
 pub mod optional;
-pub mod options;
 pub mod parse;
 pub mod planner;
 pub mod policy;
@@ -129,7 +128,7 @@ pub use minus::MinusOperator;
 pub use offset::OffsetOperator;
 pub use operator::{BoxedOperator, Operator, OperatorState};
 pub use optional::OptionalOperator;
-pub use options::QueryOptions;
+pub use ir::QueryOptions;
 pub use planner::{
     extract_object_bounds_for_var, extract_range_constraints, is_property_join, PatternType,
     RangeConstraint, RangeValue,
@@ -140,8 +139,9 @@ pub use property_join::PropertyJoinOperator;
 pub use property_path::{PropertyPathOperator, DEFAULT_MAX_VISITED};
 pub use r2rml::{NoOpR2rmlProvider, R2rmlProvider, R2rmlScanOperator, R2rmlTableProvider};
 pub use reasoning::{global_reasoning_cache, ReasoningOverlay};
+pub use ir::ReasoningModes;
 pub use rewrite::{
-    rewrite_patterns, Diagnostics as RewriteDiagnostics, PlanContext, PlanLimits, ReasoningModes,
+    rewrite_patterns, Diagnostics as RewriteDiagnostics, PlanContext, PlanLimits,
 };
 pub use rewrite_owl_ql::{rewrite_owl_ql_patterns, Ontology, OwlQlContext};
 pub use seed::{EmptyOperator, SeedOperator};

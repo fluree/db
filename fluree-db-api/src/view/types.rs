@@ -13,7 +13,7 @@ use fluree_db_ledger::{HistoricalLedgerView, LedgerState};
 use fluree_db_novelty::Novelty;
 use fluree_db_policy::PolicyContext;
 use fluree_db_query::policy::QueryPolicyEnforcer;
-use fluree_db_query::rewrite::ReasoningModes;
+use fluree_db_query::ir::ReasoningModes;
 
 /// How wrapper-provided reasoning interacts with query-specified reasoning.
 ///

@@ -4,7 +4,7 @@
 //! and derived facts computation for OWL2-RL and datalog rules.
 
 use crate::reasoning::{global_reasoning_cache, reason_owl2rl, ReasoningOverlay};
-use crate::rewrite::ReasoningModes;
+use crate::ir::ReasoningModes;
 use fluree_db_core::{
     is_rdfs_subclass_of, is_rdfs_subproperty_of, overlay::OverlayProvider, GraphDbRef, GraphId,
     IndexSchema, LedgerSnapshot, SchemaHierarchy, SchemaPredicateInfo,

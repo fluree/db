@@ -6,13 +6,11 @@
 use crate::ast::query::{ConstructQuery, SolutionModifiers};
 use crate::ast::TriplePattern as SparqlTriplePattern;
 
-use fluree_db_query::ir::Pattern;
-use fluree_db_query::options::QueryOptions;
-use fluree_db_query::parse::encode::IriEncoder;
-use fluree_db_query::ir::{
-    ConstructTemplate as QueryConstructTemplate, Query, QueryOutput,
-};
 use fluree_db_query::ir::triple::TriplePattern;
+use fluree_db_query::ir::{
+    ConstructTemplate as QueryConstructTemplate, Pattern, Query, QueryOptions, QueryOutput,
+};
+use fluree_db_query::parse::encode::IriEncoder;
 
 use super::{LoweringContext, Result};
 

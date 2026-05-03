@@ -11,7 +11,7 @@ use fluree_db_query::context::ExecutionContext;
 use fluree_db_query::execute::{execute, ContextConfig, ExecutableQuery};
 use fluree_db_query::ir::{Expression, FilterValue, Pattern};
 use fluree_db_query::operator::Operator;
-use fluree_db_query::options::QueryOptions;
+use fluree_db_query::ir::QueryOptions;
 use fluree_db_query::ir::{Query, QueryOutput};
 use fluree_db_query::seed::EmptyOperator;
 use fluree_db_query::ir::triple::{Ref, Term, TriplePattern};
