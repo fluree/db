@@ -32,20 +32,14 @@ pub fn format(
     let select_one = result.output.is_select_one();
     let mut rows = Vec::new();
 
+    let select_vars = result.output.select_vars_or_empty();
     for batch in &result.batches {
         for row_idx in 0..batch.len() {
             let row = if result.output.is_wildcard() {
                 // Wildcard: use batch schema, return all bound vars as object
                 format_row_wildcard(batch, row_idx, &result.vars, compactor, result)?
             } else {
-                format_row(
-                    batch,
-                    row_idx,
-                    result.output.select_vars_or_empty(),
-                    &result.vars,
-                    compactor,
-                    result,
-                )?
+                format_row(batch, row_idx, &select_vars, &result.vars, compactor, result)?
             };
             rows.push(row);
 
@@ -340,7 +334,6 @@ mod tests {
             output: crate::QueryOutput::select(vec![]),
             batches: vec![],
             binary_graph: None,
-            graph_select: None,
         }
     }
 

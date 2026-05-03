@@ -368,15 +368,15 @@ async fn indexed_then_insert_novelty_custom_pred_returns_results() {
 }
 
 // =============================================================================
-// Bug 2 repro: graph crawl empty for custom NS type after index
+// Bug 2 repro: expansion empty for custom NS type after index
 // =============================================================================
 
-/// After index + insert with a custom namespace rdf:type, graph crawl returns
+/// After index + insert with a custom namespace rdf:type, expansion returns
 /// only `{"@id": "..."}` with no properties. The `decode_batch_to_flakes_filtered`
 /// function in `binary_range.rs` only handled REF_ID values through DictOverlay
 /// fallback, missing DictOverlay-assigned string value IDs.
 #[tokio::test]
-async fn indexed_then_insert_graph_crawl_custom_type_returns_properties() {
+async fn indexed_then_insert_expansion_custom_type_returns_properties() {
     assert_index_defaults();
     let fluree = FlureeBuilder::memory()
         .with_ledger_cache_config(LedgerManagerConfig::default())
@@ -454,7 +454,7 @@ async fn indexed_then_insert_graph_crawl_custom_type_returns_properties() {
                 "select": {"?s": ["*"]},
                 "values": ["?s", [{"@id": "cbc:assoc/coverage-001"}]]
             });
-            let result: QueryResult = fluree.query(&view, &query).await.expect("graph crawl");
+            let result: QueryResult = fluree.query(&view, &query).await.expect("expansion");
             let jsonld = result
                 .to_jsonld_async(view.as_graph_db_ref())
                 .await
@@ -464,7 +464,7 @@ async fn indexed_then_insert_graph_crawl_custom_type_returns_properties() {
             let obj = rows[0].as_object().expect("object");
             assert!(
                 obj.len() > 1,
-                "graph crawl should return properties, not just @id; got: {obj:?}"
+                "expansion should return properties, not just @id; got: {obj:?}"
             );
         })
         .await;

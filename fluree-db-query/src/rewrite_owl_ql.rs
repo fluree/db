@@ -931,7 +931,7 @@ mod tests {
     }
 
     #[test]
-    fn test_empty_ontology_no_expansion() {
+    fn test_empty_ontology_no_hydration() {
         let interner = SidInterner::new();
         let has_friend = interner.intern(100, "hasFriend");
 
@@ -950,7 +950,7 @@ mod tests {
     }
 
     #[test]
-    fn test_inverse_of_expansion() {
+    fn test_inverse_of_hydration() {
         let interner = SidInterner::new();
         let has_friend = interner.intern(100, "hasFriend");
 
@@ -996,7 +996,7 @@ mod tests {
     }
 
     #[test]
-    fn test_domain_type_query_expansion() {
+    fn test_domain_type_query_hydration() {
         let interner = SidInterner::new();
         let person = interner.intern(100, "Person");
 
@@ -1022,7 +1022,7 @@ mod tests {
     }
 
     #[test]
-    fn test_range_type_query_expansion() {
+    fn test_range_type_query_hydration() {
         let interner = SidInterner::new();
         let location = interner.intern(100, "Location");
 
@@ -1098,7 +1098,7 @@ mod tests {
     }
 
     #[test]
-    fn test_nested_pattern_expansion() {
+    fn test_nested_pattern_hydration() {
         let interner = SidInterner::new();
         let has_friend = interner.intern(100, "hasFriend");
 

@@ -4,7 +4,7 @@
 //! `target_t >= index_t` to use the binary index, forcing any query at
 //! `target_t < index_t` to fall back to overlay-only reconstruction
 //! (genesis snapshot + replay of every prior commit). Combined with the
-//! graph-crawl `select {"?s": ["*"]}` path — which issues one `range()`
+//! expansion `select {"?s": ["*"]}` path — which issues one `range()`
 //! call per subject and per reverse property — this turned historical
 //! queries into an O(N × total-overlay) scan that OOMed on real ledgers.
 //!
@@ -13,7 +13,7 @@
 //! replay handles `(index_t, target_t]`.
 //!
 //! This test reproduces the incident: index the ledger, add a commit on
-//! top, then query at `target_t < index_t` with graph-crawl `select *`.
+//! top, then query at `target_t < index_t` with expansion `select *`.
 //! The historical view must use the index (not fall back to genesis),
 //! and results must match what was present at `target_t`.
 
@@ -121,7 +121,7 @@ async fn historical_view_uses_index_when_target_below_index_t() {
         .expect("ledger_view_at t=2");
     assert_eq!(view_at_2.index_t(), 2);
 
-    // ---- Functional assertion: graph-crawl `select *` at t<index_t ----
+    // ---- Functional assertion: expansion `select *` at t<index_t ----
     //
     // This is the exact query shape that OOMed in production. At t=1 we
     // should see all 20 Contacts from tx1 and none from tx2/tx3.
@@ -137,14 +137,14 @@ async fn historical_view_uses_index_when_target_below_index_t() {
         .format(FormatterConfig::typed_json().with_normalize_arrays())
         .execute_tracked()
         .await
-        .expect("graph crawl at t=1");
+        .expect("expansion at t=1");
 
     let value = serde_json::to_value(&result.result).expect("serialize");
     let rows = value.as_array().expect("crawl result is array");
     assert_eq!(
         rows.len(),
         20,
-        "t=1 graph crawl must return exactly the 20 contacts from tx1; got {}",
+        "t=1 expansion must return exactly the 20 contacts from tx1; got {}",
         rows.len()
     );
 
@@ -161,7 +161,7 @@ async fn historical_view_uses_index_when_target_below_index_t() {
         .format(FormatterConfig::typed_json().with_normalize_arrays())
         .execute_tracked()
         .await
-        .expect("graph crawl at t=2");
+        .expect("expansion at t=2");
     let value_t2 = serde_json::to_value(&result_t2.result).expect("serialize");
     assert_eq!(value_t2.as_array().expect("array").len(), 21);
 }

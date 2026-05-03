@@ -33,7 +33,6 @@ impl<E: IriEncoder> LoweringContext<'_, E> {
             output: QueryOutput::Boolean,
             patterns,
             options,
-            graph_select: None,
             post_values: None,
         })
     }

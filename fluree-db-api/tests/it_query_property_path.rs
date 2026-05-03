@@ -100,7 +100,7 @@ async fn property_path_one_or_more_no_vars_matches_transitively() {
     assert!(normalize_rows(&sanity_path_rows).contains(&json!(["ex:f"])));
 
     // Use VALUES to seed a single solution row and treat the (non-)transitive pattern
-    // as a filter, so we can assert reachability without relying on graph crawl output.
+    // as a filter, so we can assert reachability without relying on expansion output.
     let q_non = json!({
         "@context": {"ex":"http://example.org/"},
         "values": [["?dummy"], [[1]]],

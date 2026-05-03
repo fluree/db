@@ -1,12 +1,10 @@
-//! Graph crawl formatter - expands Sid bindings to nested JSON-LD objects
-//!
-//! This module handles the graph crawl select syntax which enables nested object
-//! expansion in query results.
+//! Hydration formatter — materializes a Sid into a nested JSON-LD object by
+//! recursively fetching its properties.
 //!
 //! # Supported Syntax
 //!
 //! ```json
-//! // Variable-bound graph crawl
+//! // Variable-bound hydration
 //! {"select": {"?person": ["*", {"ex:friend": ["*"]}]},
 //!  "where": {"@id": "?person", "type": "ex:User"}}
 //!
@@ -28,7 +26,7 @@ use fluree_db_core::value::FlakeValue;
 use fluree_db_core::{Flake, GraphDbRef, Sid, Tracker};
 use fluree_db_policy::{is_schema_flake, PolicyContext};
 use fluree_db_query::binding::Binding;
-use fluree_db_query::ir::{GraphSelectSpec, NestedSelectSpec, Root, SelectionSpec};
+use fluree_db_query::ir::{HydrationSpec, NestedSelectSpec, Root, SelectionSpec};
 use fluree_vocab::namespaces::JSON_LD;
 use fluree_vocab::rdf::{self, TYPE as RDF_TYPE_IRI};
 use futures::future::BoxFuture;
@@ -38,14 +36,14 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 
 /// Cache key: (Sid, local_spec_hash, depth_remaining)
 /// The local_spec_hash is computed from the current selections/reverse/has_wildcard,
-/// NOT the top-level spec. This ensures different nested expansions of the same Sid
+/// NOT the top-level spec. This ensures different nested hydrations of the same Sid
 /// produce different cache entries.
 type CacheKey = (Sid, u64, usize);
 
 /// Selection specification for formatting a subject.
 ///
 /// Bundles the immutable parameters that define what properties to select
-/// during graph crawl formatting.
+/// during hydration formatting.
 struct FormatSpec<'a> {
     /// Forward property selections
     selections: &'a [SelectionSpec],
@@ -150,27 +148,27 @@ fn compute_local_spec_hash(
     hasher.finish()
 }
 
-/// Format query results with graph crawl expansion (sync entry point - returns error)
+/// Format query results with hydration (sync entry point - returns error)
 ///
 /// The sync entry point always returns an error directing callers to use
-/// `format_results_async()` instead, as graph crawl requires DB access.
+/// `format_results_async()` instead, since hydration requires DB access.
 #[allow(dead_code)]
 pub fn format(result: &QueryResult, _compactor: &IriCompactor) -> Result<JsonValue> {
-    let _spec = result.graph_select.as_ref().ok_or_else(|| {
-        FormatError::InvalidBinding("Graph crawl format called without graph_select spec".into())
+    let _spec = result.output.hydration().ok_or_else(|| {
+        FormatError::InvalidBinding("Hydration format called without spec".into())
     })?;
 
-    // Graph crawl always requires async DB access
+    // Hydration always requires async DB access
     Err(FormatError::InvalidBinding(
-        "Graph crawl formatting requires async database access. \
+        "Hydration formatting requires async database access. \
          Use format_results_async() instead of format_results()."
             .into(),
     ))
 }
 
-/// Async graph crawl formatter entry point.
+/// Async hydration formatter entry point.
 ///
-/// This is the full graph crawl implementation with async database access
+/// This is the full hydration implementation with async database access
 /// for property fetching, depth expansion, and reverse property expansion.
 ///
 /// # Policy Support
@@ -185,8 +183,8 @@ pub async fn format_async(
     policy: Option<&PolicyContext>,
     tracker: Option<&Tracker>,
 ) -> Result<JsonValue> {
-    let spec = result.graph_select.as_ref().ok_or_else(|| {
-        FormatError::InvalidBinding("Graph crawl format called without graph_select spec".into())
+    let spec = result.output.hydration().ok_or_else(|| {
+        FormatError::InvalidBinding("Hydration format called without spec".into())
     })?;
 
     // Attach the tracker to the GraphDbRef so db.range calls inside the
@@ -197,13 +195,13 @@ pub async fn format_async(
         None => db,
     };
 
-    let formatter = GraphCrawlFormatter::new(db, compactor, spec, config, policy, tracker);
+    let formatter = HydrationFormatter::new(db, compactor, spec, config, policy, tracker);
 
     // Shared cache across all rows
     let mut cache: HashMap<CacheKey, JsonValue> = HashMap::new();
     let mut rows = Vec::new();
 
-    // If the underlying query produced no solutions, graph crawl must produce no rows,
+    // If the underlying query produced no solutions, expansion must produce no rows,
     // even when the root is a constant Sid.
     if result.row_count() == 0 {
         return Ok(JsonValue::Array(rows));
@@ -272,7 +270,7 @@ pub async fn format_async(
 
                     if mixed_select {
                         let mut row = Vec::with_capacity(select_vars.len());
-                        for var in select_vars {
+                        for var in &select_vars {
                             if var == var_id {
                                 row.push(obj.clone());
                             } else {
@@ -302,11 +300,11 @@ pub async fn format_async(
     Ok(JsonValue::Array(rows))
 }
 
-/// Graph crawl formatter with async DB access
-struct GraphCrawlFormatter<'a> {
+/// Hydration formatter with async DB access
+struct HydrationFormatter<'a> {
     db: GraphDbRef<'a>,
     compactor: &'a IriCompactor,
-    spec: &'a GraphSelectSpec,
+    spec: &'a HydrationSpec,
     /// Whether to emit typed JSON (`{"@value": ..., "@type": ...}`) for all literals.
     typed: bool,
     /// Whether to always wrap property values in arrays (even single-valued).
@@ -318,11 +316,11 @@ struct GraphCrawlFormatter<'a> {
     tracker: Option<&'a Tracker>,
 }
 
-impl<'a> GraphCrawlFormatter<'a> {
+impl<'a> HydrationFormatter<'a> {
     fn new(
         db: GraphDbRef<'a>,
         compactor: &'a IriCompactor,
-        spec: &'a GraphSelectSpec,
+        spec: &'a HydrationSpec,
         config: &FormatterConfig,
         policy: Option<&'a PolicyContext>,
         tracker: Option<&'a Tracker>,
@@ -359,7 +357,7 @@ impl<'a> GraphCrawlFormatter<'a> {
         async move {
             let depth_remaining = self.spec.depth.saturating_sub(current_depth);
             // Use LOCAL spec hash (selections, reverse, has_wildcard) not top-level spec
-            // This ensures different nested expansions of the same Sid produce different cache entries
+            // This ensures different nested hydrations of the same Sid produce different cache entries
             let spec_hash =
                 compute_local_spec_hash(spec.selections, spec.reverse, spec.has_wildcard);
             let cache_key = (sid.clone(), spec_hash, depth_remaining);
@@ -382,7 +380,7 @@ impl<'a> GraphCrawlFormatter<'a> {
                 .iter()
                 .any(|s| matches!(s, SelectionSpec::Id));
             // @id inclusion:
-            // - Always include for nested expansions (identity of a crawled ref)
+            // - Always include for nested hydrations (identity of an expanded ref)
             // - Otherwise include when wildcard or explicit @id selection
             if current_depth > 0 || spec.has_wildcard || has_explicit_id {
                 obj.insert("@id".to_string(), json!(self.compactor.compact_sid(sid)?));
@@ -554,7 +552,7 @@ impl<'a> GraphCrawlFormatter<'a> {
                         // @type special case: compact IRI string, not {"@id": ...}
                         values.push(json!(self.compactor.compact_sid(ref_sid)?));
                     } else {
-                        // Expansion decision:
+                        // Hydration decision:
                         // 1. If explicit sub-selection exists → expand with that spec
                         // 2. Else if current_depth < max_depth → auto-expand with FULL parent spec
                         // 3. Else → just return {"@id": ...}
@@ -1091,8 +1089,8 @@ impl<'a> GraphCrawlFormatter<'a> {
                 }
 
                 // Get subject classes from cache (empty if not cached)
-                // Note: Graph crawl doesn't pre-populate class cache like BinaryScanOperator.
-                // For graph crawl with class policies, the cache will be empty and
+                // Note: Hydration doesn't pre-populate class cache like BinaryScanOperator.
+                // For hydration with class policies, the cache will be empty and
                 // class policies may not work correctly. This is a known limitation
                 // that can be addressed by pre-populating in format_async if needed.
                 let subject_classes = policy_ctx

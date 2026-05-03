@@ -2,7 +2,7 @@
 //!
 //! Focus:
 //! - identity-based policy loading via `f:policyClass` on the identity subject
-//! - view policy enforcement on direct selects and graph crawl formatting
+//! - view policy enforcement on direct selects and expansion formatting
 
 mod support;
 
@@ -62,7 +62,7 @@ async fn policy_inline_denies_restricted_property_in_direct_select() {
 }
 
 #[tokio::test]
-async fn policy_inline_denies_restricted_property_in_graph_crawl() {
+async fn policy_inline_denies_restricted_property_in_expansion() {
     assert_index_defaults();
     let fluree = FlureeBuilder::memory().build_memory();
 
@@ -121,7 +121,7 @@ async fn policy_inline_denies_restricted_property_in_graph_crawl() {
     );
 
     // Use the tracked connection query entrypoint, which performs **policy-aware**
-    // graph crawl formatting.
+    // expansion formatting.
     let tracked = fluree
         .query_connection_tracked(&query)
         .await

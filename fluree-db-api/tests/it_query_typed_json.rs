@@ -1,7 +1,7 @@
-//! Integration tests for TypedJson graph crawl formatting and normalize_arrays.
+//! Integration tests for TypedJson expansion formatting and normalize_arrays.
 //!
 //! Verifies that `to_typed_json_async()` and `FormatterConfig::typed_json()` produce
-//! explicit `@type` annotations in graph crawl results, and that `normalize_arrays`
+//! explicit `@type` annotations in expansion results, and that `normalize_arrays`
 //! forces array wrapping for single-valued properties.
 
 mod support;
@@ -58,11 +58,11 @@ async fn seed_typed_graph() -> (MemoryFluree, MemoryLedger) {
 }
 
 // ============================================================================
-// TypedJson graph crawl
+// TypedJson expansion
 // ============================================================================
 
 #[tokio::test]
-async fn typed_json_graph_crawl_includes_type_annotations() {
+async fn typed_json_expansion_includes_type_annotations() {
     let (fluree, ledger) = seed_typed_graph().await;
 
     let query = json!({
@@ -74,7 +74,7 @@ async fn typed_json_graph_crawl_includes_type_annotations() {
     let config = FormatterConfig::typed_json();
     let result = query_jsonld_format(&fluree, &ledger, &query, &config)
         .await
-        .expect("typed json graph crawl");
+        .expect("typed json expansion");
 
     let arr = result.as_array().expect("result is array");
     assert_eq!(arr.len(), 1, "single root entity");
@@ -104,7 +104,7 @@ async fn typed_json_graph_crawl_includes_type_annotations() {
 }
 
 #[tokio::test]
-async fn typed_json_graph_crawl_json_datatype_preserved() {
+async fn typed_json_expansion_json_datatype_preserved() {
     let (fluree, ledger) = seed_typed_graph().await;
 
     let query = json!({
@@ -116,7 +116,7 @@ async fn typed_json_graph_crawl_json_datatype_preserved() {
     let config = FormatterConfig::typed_json();
     let result = query_jsonld_format(&fluree, &ledger, &query, &config)
         .await
-        .expect("typed json graph crawl with @json");
+        .expect("typed json expansion with @json");
 
     let arr = result.as_array().expect("result is array");
     let config_obj = &arr[0];
@@ -137,7 +137,7 @@ async fn typed_json_graph_crawl_json_datatype_preserved() {
 
 #[cfg(feature = "native")]
 #[tokio::test]
-async fn typed_json_graph_crawl_novelty_json_value_decodes_via_binary_range_provider() {
+async fn typed_json_expansion_novelty_json_value_decodes_via_binary_range_provider() {
     use fluree_db_api::ReindexOptions;
     use fluree_db_core::comparator::IndexType;
     use fluree_db_core::range::{RangeMatch, RangeTest};
@@ -223,7 +223,7 @@ async fn typed_json_graph_crawl_novelty_json_value_decodes_via_binary_range_prov
         "expected novelty @json value decoded via range provider, got: {flakes:?}"
     );
 
-    // 2) Typed-json graph crawl: should format without failing to resolve novelty string IDs.
+    // 2) Typed-json expansion: should format without failing to resolve novelty string IDs.
     let query = json!({
         "@context": ctx(),
         "select": {"ex:config": ["*"]},
@@ -237,7 +237,7 @@ async fn typed_json_graph_crawl_novelty_json_value_decodes_via_binary_range_prov
         .expect("query")
         .format_async(dbref, &config)
         .await
-        .expect("typed json graph crawl should succeed");
+        .expect("typed json expansion should succeed");
 
     let arr = result.as_array().expect("result array");
     let cfg = &arr[0];
@@ -269,7 +269,7 @@ async fn typed_json_graph_crawl_novelty_json_value_decodes_via_binary_range_prov
 }
 
 #[tokio::test]
-async fn typed_json_graph_crawl_nested_entities_are_typed() {
+async fn typed_json_expansion_nested_entities_are_typed() {
     let (fluree, ledger) = seed_typed_graph().await;
 
     // Graph crawl with nested expansion
@@ -282,7 +282,7 @@ async fn typed_json_graph_crawl_nested_entities_are_typed() {
     let config = FormatterConfig::typed_json();
     let result = query_jsonld_format(&fluree, &ledger, &query, &config)
         .await
-        .expect("typed json nested graph crawl");
+        .expect("typed json nested expansion");
 
     let alice = &result.as_array().unwrap()[0];
     let knows = alice.get("schema:knows").expect("has schema:knows");
@@ -302,11 +302,11 @@ async fn typed_json_graph_crawl_nested_entities_are_typed() {
 }
 
 // ============================================================================
-// JSON-LD graph crawl (default) does NOT include types for inferable datatypes
+// JSON-LD expansion (default) does NOT include types for inferable datatypes
 // ============================================================================
 
 #[tokio::test]
-async fn jsonld_graph_crawl_omits_inferable_types() {
+async fn jsonld_expansion_omits_inferable_types() {
     let (fluree, ledger) = seed_typed_graph().await;
 
     let query = json!({
@@ -317,7 +317,7 @@ async fn jsonld_graph_crawl_omits_inferable_types() {
 
     let result = query_jsonld_formatted(&fluree, &ledger, &query)
         .await
-        .expect("jsonld graph crawl");
+        .expect("jsonld expansion");
 
     let alice = &result.as_array().unwrap()[0];
     let name = alice.get("schema:name").expect("has schema:name");
@@ -345,7 +345,7 @@ async fn normalize_arrays_forces_array_for_single_values() {
     // Without normalize_arrays: single-valued property is a scalar
     let default_result = query_jsonld_formatted(&fluree, &ledger, &query)
         .await
-        .expect("default graph crawl");
+        .expect("default expansion");
     let bob_default = &default_result.as_array().unwrap()[0];
     let single_tag_default = bob_default.get("ex:single_tag").expect("has ex:single_tag");
     assert!(
@@ -357,7 +357,7 @@ async fn normalize_arrays_forces_array_for_single_values() {
     let config = FormatterConfig::jsonld().with_normalize_arrays();
     let norm_result = query_jsonld_format(&fluree, &ledger, &query, &config)
         .await
-        .expect("normalized graph crawl");
+        .expect("normalized expansion");
     let bob_norm = &norm_result.as_array().unwrap()[0];
     let single_tag_norm = bob_norm.get("ex:single_tag").expect("has ex:single_tag");
     assert!(
@@ -380,7 +380,7 @@ async fn normalize_arrays_combined_with_typed_json() {
     let config = FormatterConfig::typed_json().with_normalize_arrays();
     let result = query_jsonld_format(&fluree, &ledger, &query, &config)
         .await
-        .expect("typed + normalized graph crawl");
+        .expect("typed + normalized expansion");
     let bob = &result.as_array().unwrap()[0];
 
     // Single-valued property is an array

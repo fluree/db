@@ -1,5 +1,5 @@
 //! Selection specs that describe how query results are projected and
-//! crawled into nested JSON-LD form. The canonical resolved-and-lowered
+//! expanded into nested JSON-LD form. The canonical resolved-and-lowered
 //! query type is [`crate::ir::Query`]; this module covers only
 //! the projection-shape types that flow through it.
 
@@ -7,10 +7,10 @@ use crate::var_registry::VarId;
 use fluree_db_core::Sid;
 
 // ============================================================================
-// Graph crawl select types (resolved)
+// Hydration types (resolved)
 // ============================================================================
 
-/// Root of a graph crawl select (resolved)
+/// Root of a hydration (resolved)
 ///
 /// Supports both variable and IRI constant roots:
 /// - Variable root: from query results (e.g., `?person`)
@@ -23,7 +23,7 @@ pub enum Root {
     Sid(Sid),
 }
 
-/// Nested selection specification for sub-crawls (resolved)
+/// Nested selection specification for sub-hydrations (resolved)
 ///
 /// This type captures the full selection state for nested property expansion,
 /// including both forward and reverse properties.
@@ -32,7 +32,7 @@ pub struct NestedSelectSpec {
     /// Forward property selections
     pub forward: Vec<SelectionSpec>,
     /// Reverse property selections (predicate Sid → optional nested spec)
-    /// None means no sub-selections (just return @id), Some means nested expansion
+    /// None means no sub-selections (just return @id), Some means nested hydration
     pub reverse: std::collections::HashMap<Sid, Option<Box<NestedSelectSpec>>>,
     /// Whether wildcard was specified at this level
     pub has_wildcard: bool,
@@ -58,7 +58,7 @@ impl NestedSelectSpec {
     }
 }
 
-/// Selection specification for graph crawl (resolved)
+/// Selection specification for expansion (resolved)
 ///
 /// Defines what properties to include at each level of expansion.
 #[derive(Debug, Clone, PartialEq)]
@@ -67,7 +67,7 @@ pub enum SelectionSpec {
     Id,
     /// Wildcard - select all properties at this level
     Wildcard,
-    /// Property selection with optional nested expansion
+    /// Property selection with optional nested hydration
     Property {
         /// Predicate Sid
         predicate: Sid,
@@ -77,18 +77,18 @@ pub enum SelectionSpec {
     },
 }
 
-/// Graph crawl selection specification (resolved, with Sids)
+/// Hydrationion specification (resolved, with Sids)
 ///
-/// This is the resolved form of `UnresolvedGraphSelectSpec`, with all IRIs
+/// This is the resolved form of `UnresolvedHydrationSpec`, with all IRIs
 /// encoded as Sids. Used during result formatting for nested JSON-LD output.
 #[derive(Debug, Clone, PartialEq)]
-pub struct GraphSelectSpec {
-    /// Root of the crawl - variable or IRI constant
+pub struct HydrationSpec {
+    /// Root of the hydration - variable or IRI constant
     pub root: Root,
     /// Forward property selections
     pub selections: Vec<SelectionSpec>,
     /// Reverse property selections (predicate Sid → optional nested spec)
-    /// None means no sub-selections (just return @id), Some means nested expansion
+    /// None means no sub-selections (just return @id), Some means nested hydration
     pub reverse: std::collections::HashMap<Sid, Option<Box<NestedSelectSpec>>>,
     /// Max depth for auto-expansion (0 = no auto-expand)
     pub depth: usize,
@@ -96,7 +96,7 @@ pub struct GraphSelectSpec {
     pub has_wildcard: bool,
 }
 
-impl GraphSelectSpec {
+impl HydrationSpec {
     /// Create a new graph select spec
     pub fn new(root: Root, selections: Vec<SelectionSpec>) -> Self {
         let has_wildcard = selections
@@ -116,6 +116,44 @@ impl GraphSelectSpec {
         match &self.root {
             Root::Var(v) => Some(*v),
             Root::Sid(_) => None,
+        }
+    }
+}
+
+/// One column of a SELECT/SELECT-ONE projection.
+///
+/// Selections are ordered: their position determines column order in tabular
+/// output and JSON-LD array rendering. A single query may mix `Var` columns
+/// (raw bindings) with `Hydrate` columns (the formatter materializes the
+/// root variable into a nested JSON-LD object).
+#[derive(Debug, Clone, PartialEq)]
+pub enum Selection {
+    /// Project a single variable's binding.
+    Var(VarId),
+    /// Hydrate a subject (variable or IRI constant) into a nested JSON-LD
+    /// object. The root variable (when present) is the bound column the
+    /// formatter materializes.
+    Hydration(HydrationSpec),
+}
+
+impl Selection {
+    /// Variable bound for this selection's row column, if any.
+    ///
+    /// `Var` returns its variable. `Hydrate` returns its root variable
+    /// (or `None` when the root is an IRI constant — that case projects no
+    /// bound row column; the formatter fetches the constant directly).
+    pub fn bound_var(&self) -> Option<VarId> {
+        match self {
+            Selection::Var(v) => Some(*v),
+            Selection::Hydration(spec) => spec.root_var(),
+        }
+    }
+
+    /// Returns the `HydrationSpec` if this is a hydrate selection.
+    pub fn as_hydration(&self) -> Option<&HydrationSpec> {
+        match self {
+            Selection::Hydration(spec) => Some(spec),
+            Selection::Var(_) => None,
         }
     }
 }

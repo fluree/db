@@ -14,7 +14,7 @@ async fn compound_two_tuple_select_with_crawl_and_values() {
     let ledger = seed_people_compound_dataset(&fluree, "query/compound:main").await;
 
     // NOTE: Some clients return tuple rows mixing scalars + a crawled object.
-    // Rust currently formats graph crawl selections as **objects only** (graph crawl output),
+    // Rust currently formats expansion selections as **objects only** (expansion output),
     // so we assert the crawled friends and keep a separate ignored parity test below.
     let q = json!({
         "@context": {"schema":"http://schema.org/","ex":"http://example.org/ns/"},
@@ -274,7 +274,7 @@ async fn compound_group_by_multicard_without_aggregate() {
 }
 
 #[tokio::test]
-async fn compound_s_p_o_and_object_subject_joins_with_graph_crawl() {
+async fn compound_s_p_o_and_object_subject_joins_with_expansion() {
     // Scenario: s/p/o check + object-subject joins
     let fluree = FlureeBuilder::memory().build_memory();
     let ledger = seed_people_compound_dataset(&fluree, "query/compound:spo").await;

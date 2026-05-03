@@ -141,7 +141,6 @@ impl<E: IriEncoder> LoweringContext<'_, E> {
             output: QueryOutput::Construct(template),
             patterns,
             options: QueryOptions::default(),
-            graph_select: None, // SPARQL doesn't support graph crawl
             post_values: None,
         })
     }

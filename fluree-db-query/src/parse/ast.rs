@@ -720,10 +720,10 @@ impl UnresolvedConstructTemplate {
 }
 
 // ============================================================================
-// Graph crawl select types
+// Hydration types
 // ============================================================================
 
-/// Root of a graph crawl select - can be variable or IRI constant
+/// Root of a hydration - can be variable or IRI constant
 ///
 /// Supports both syntax forms:
 /// - Variable root: `{"?person": ["*", ...]}`
@@ -736,7 +736,7 @@ pub enum UnresolvedRoot {
     Iri(String),
 }
 
-/// Nested selection specification for sub-crawls
+/// Nested selection specification for sub-hydrations
 ///
 /// This type captures the full selection state for nested property expansion,
 /// including both forward and reverse properties. It's used when a property
@@ -746,7 +746,7 @@ pub struct UnresolvedNestedSelectSpec {
     /// Forward property selections
     pub forward: Vec<UnresolvedSelectionSpec>,
     /// Reverse property selections (expanded IRI → optional nested spec)
-    /// None means no sub-selections (just return @id), Some means nested expansion
+    /// None means no sub-selections (just return @id), Some means nested hydration
     pub reverse: std::collections::HashMap<String, Option<Box<UnresolvedNestedSelectSpec>>>,
     /// Whether wildcard was specified at this level
     pub has_wildcard: bool,
@@ -772,9 +772,9 @@ impl UnresolvedNestedSelectSpec {
     }
 }
 
-/// Selection specification within a graph crawl
+/// Selection specification within a hydration
 ///
-/// Defines what properties to include at each level of the expansion.
+/// Defines what properties to include at each level of the hydration.
 #[derive(Debug, Clone, PartialEq)]
 pub enum UnresolvedSelectionSpec {
     /// Explicit @id selection (include @id even when wildcard is not specified)
@@ -796,18 +796,18 @@ pub enum UnresolvedSelectionSpec {
     },
 }
 
-/// Graph crawl selection specification (formatting-time only)
+/// Hydrationion specification (formatting-time only)
 ///
-/// This captures the graph crawl select syntax for nested JSON-LD object expansion.
+/// This captures the hydration syntax for nested JSON-LD objects.
 /// It is used only during result formatting, not during query execution.
 ///
 /// # Examples
 ///
 /// ```json
-/// // Simple crawl with wildcard
+/// // Simple hydration with wildcard
 /// {"select": {"?person": ["*"]}}
 ///
-/// // Nested crawl
+/// // Nested hydration
 /// {"select": {"?person": ["*", {"ex:friend": ["*"]}]}}
 ///
 /// // With depth parameter
@@ -817,13 +817,13 @@ pub enum UnresolvedSelectionSpec {
 /// {"select": {"ex:alice": ["*"]}}
 /// ```
 #[derive(Debug, Clone, PartialEq)]
-pub struct UnresolvedGraphSelectSpec {
-    /// Root of the crawl - variable or IRI constant
+pub struct UnresolvedHydrationSpec {
+    /// Root of the hydration - variable or IRI constant
     pub root: UnresolvedRoot,
     /// Forward property selections
     pub selections: Vec<UnresolvedSelectionSpec>,
     /// Reverse property selections (expanded IRI → optional nested spec)
-    /// None means no sub-selections (just return @id), Some means nested expansion
+    /// None means no sub-selections (just return @id), Some means nested hydration
     ///
     /// Populated from `@reverse` context entries
     pub reverse: std::collections::HashMap<String, Option<Box<UnresolvedNestedSelectSpec>>>,
@@ -833,7 +833,7 @@ pub struct UnresolvedGraphSelectSpec {
     pub has_wildcard: bool,
 }
 
-impl UnresolvedGraphSelectSpec {
+impl UnresolvedHydrationSpec {
     /// Create a new graph select spec with default values
     pub fn new(root: UnresolvedRoot, selections: Vec<UnresolvedSelectionSpec>) -> Self {
         let has_wildcard = selections
@@ -845,6 +845,28 @@ impl UnresolvedGraphSelectSpec {
             reverse: std::collections::HashMap::new(),
             depth: 0,
             has_wildcard,
+        }
+    }
+}
+
+/// One column of a SELECT/SELECT-ONE projection (unresolved).
+///
+/// Lowered into [`crate::ir::Selection`].
+#[derive(Debug, Clone, PartialEq)]
+pub enum UnresolvedSelection {
+    /// Project a single variable's binding (e.g. `"?name"`).
+    Var(Arc<str>),
+    /// Hydrate a subject (variable or IRI constant) into a nested JSON-LD
+    /// object (e.g. `{"?person": ["*"]}`).
+    Hydration(UnresolvedHydrationSpec),
+}
+
+impl UnresolvedSelection {
+    /// Returns the variable name if this is a `Var` selection.
+    pub fn var_name(&self) -> Option<&str> {
+        match self {
+            UnresolvedSelection::Var(name) => Some(name),
+            UnresolvedSelection::Hydration(_) => None,
         }
     }
 }
@@ -999,11 +1021,8 @@ pub struct UnresolvedQuery {
     pub context: ParsedContext,
     /// Original JSON context from the query (for CONSTRUCT output)
     pub orig_context: Option<serde_json::Value>,
-    /// Selected variables (e.g., ["?name", "?age"])
-    ///
-    /// For graph crawl queries, this still contains the root variable(s)
-    /// needed for execution. The graph_select field controls formatting.
-    pub select: Vec<Arc<str>>,
+    /// Selections in column order (variable names and/or one hydration).
+    pub select: Vec<UnresolvedSelection>,
     /// User-declared projection shape from the input syntax.
     ///
     /// `Scalar` for bare-string select (`select: "?x"`), `Tuple` otherwise
@@ -1017,11 +1036,6 @@ pub struct UnresolvedQuery {
     pub options: UnresolvedOptions,
     /// CONSTRUCT template (None for SELECT queries)
     pub construct_template: Option<UnresolvedConstructTemplate>,
-    /// Graph crawl select specification (None for flat SELECT or CONSTRUCT)
-    ///
-    /// When present, controls nested JSON-LD object expansion during formatting.
-    /// Only one graph-select object is allowed per query.
-    pub graph_select: Option<UnresolvedGraphSelectSpec>,
 }
 
 impl UnresolvedQuery {
@@ -1035,13 +1049,34 @@ impl UnresolvedQuery {
             patterns: Vec::new(),
             options: UnresolvedOptions::default(),
             construct_template: None,
-            graph_select: None,
         }
     }
 
-    /// Add a selected variable
+    /// Add a selected variable.
     pub fn add_select(&mut self, var: impl AsRef<str>) {
-        self.select.push(Arc::from(var.as_ref()));
+        self.select
+            .push(UnresolvedSelection::Var(Arc::from(var.as_ref())));
+    }
+
+    /// Add a hydrationion.
+    pub fn add_hydration(&mut self, spec: UnresolvedHydrationSpec) {
+        self.select.push(UnresolvedSelection::Hydration(spec));
+    }
+
+    /// Returns the (single) hydrationion, if any.
+    pub fn hydration(&self) -> Option<&UnresolvedHydrationSpec> {
+        self.select.iter().find_map(|s| match s {
+            UnresolvedSelection::Hydration(spec) => Some(spec),
+            _ => None,
+        })
+    }
+
+    /// Mutable access to the (single) hydrationion, if any.
+    pub fn hydration_mut(&mut self) -> Option<&mut UnresolvedHydrationSpec> {
+        self.select.iter_mut().find_map(|s| match s {
+            UnresolvedSelection::Hydration(spec) => Some(spec),
+            _ => None,
+        })
     }
 
     /// Add a triple pattern (convenience method that wraps in UnresolvedPattern)

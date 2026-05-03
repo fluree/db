@@ -969,7 +969,6 @@ mod tests {
             output: QueryOutput::select(vec![out_var]),
             patterns,
             options: options.clone(),
-            graph_select: None,
             post_values: None,
         };
         (query, options)

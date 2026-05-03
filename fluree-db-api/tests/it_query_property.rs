@@ -86,7 +86,7 @@ async fn subjects_as_predicates_variable_predicate_scan() {
 async fn subjects_as_predicates_reverse_crawl_without_star() {
     // Scenario: subjects-as-predicates / "via reverse no subgraph"
     //
-    // NOTE: We intentionally avoid `["*"]` (graph crawl) here because select [*] graph crawl
+    // NOTE: We intentionally avoid `["*"]` (expansion) here because select [*] expansion
     // parity is still in progress; this test validates reverse traversal + predicate-as-subject.
     let fluree = FlureeBuilder::memory().build_memory();
     let ledger = seed_subject_as_predicate(&fluree, "property:reverse-crawl").await;
@@ -96,7 +96,7 @@ async fn subjects_as_predicates_reverse_crawl_without_star() {
 
     let q = json!({
         "@context": ctx,
-        // Include "*" so graph crawl formatter includes @id and we can assert the reverse edge
+        // Include "*" so expansion formatter includes @id and we can assert the reverse edge
         // without relying on explicit "id" selection behavior.
         "select": {"ex:nested": ["*","ex:reversed-pred"]},
         // Our parser requires a WHERE clause; this is equivalent to selecting by subject id.
@@ -117,7 +117,7 @@ async fn subjects_as_predicates_reverse_crawl_without_star() {
 }
 
 #[tokio::test]
-async fn equivalent_properties_equivalent_symmetric_transitive_and_graph_crawl() {
+async fn equivalent_properties_equivalent_symmetric_transitive_and_expansion() {
     // Scenario: equivalent-properties-test
     let fluree = FlureeBuilder::memory().build_memory();
     let ledger0 = genesis_ledger(&fluree, "query/equivalent-properties");
@@ -207,7 +207,7 @@ async fn equivalent_properties_equivalent_symmetric_transitive_and_graph_crawl()
         normalize_rows(&json!(["Ben", "Brian", "Francois"]))
     );
 
-    // Querying with graph crawl.
+    // Querying with expansion.
     let q4 = json!({
         "@context": {
             "ex": "http://example.org/ns/",

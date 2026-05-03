@@ -127,7 +127,6 @@ pub(crate) fn build_query_result(
         output: parsed.output,
         batches,
         binary_graph,
-        graph_select: parsed.graph_select,
     }
 }
 

@@ -2,11 +2,11 @@
 //! parsing through planning, execution, and result formatting.
 //!
 //! `Query` is the canonical query representation. Its `output` field
-//! captures the result-shape decision (SELECT vars, SELECT-one, wildcard,
-//! ASK, CONSTRUCT). `patterns` holds the WHERE clause IR. `options`
-//! carries solution modifiers (limit, offset, order by, group by,
-//! aggregates, having, distinct, ...). `graph_select` carries a graph
-//! crawl spec when the result format is nested JSON-LD rather than tabular.
+//! captures the result-shape decision (SELECT selections, SELECT-one,
+//! wildcard, ASK, CONSTRUCT). `patterns` holds the WHERE clause IR.
+//! `options` carries solution modifiers (limit, offset, order by, group
+//! by, aggregates, having, distinct, ...). Hydration formatting lives
+//! inside the `Selection::Hydration` variant on the SELECT outputs.
 
 use std::collections::HashSet;
 
@@ -14,7 +14,7 @@ use fluree_graph_json_ld::ParsedContext;
 
 use super::options::QueryOptions;
 use super::pattern::Pattern;
-use super::projection::GraphSelectSpec;
+use super::projection::{HydrationSpec, Selection};
 use super::triple::TriplePattern;
 use crate::var_registry::VarId;
 
@@ -62,19 +62,19 @@ impl ConstructTemplate {
 
 /// Describes what the query produces.
 ///
-/// Combines the select mode, selected variables, and construct template into a
+/// Combines the select mode, selections, and construct template into a
 /// single enum so that invalid combinations (e.g. `Construct` without a
-/// template, or `Many` with an empty variable list) are unrepresentable.
+/// template) are unrepresentable.
 #[derive(Debug, Clone)]
 pub enum QueryOutput {
-    /// Normal SELECT with explicit variable list and projection shape.
+    /// Normal SELECT with explicit selection list and projection shape.
     Select {
-        vars: Vec<VarId>,
+        selections: Vec<Selection>,
         shape: ProjectionShape,
     },
     /// selectOne — same as Select but formatters return first row or null.
     SelectOne {
-        vars: Vec<VarId>,
+        selections: Vec<Selection>,
         shape: ProjectionShape,
     },
     /// SELECT * — all bound variables from WHERE.
@@ -86,36 +86,59 @@ pub enum QueryOutput {
 }
 
 impl QueryOutput {
-    /// Construct a `Select` with the default (`Tuple`) shape.
+    /// Construct a `Select` from a variable list with the default (`Tuple`) shape.
     ///
     /// Used by SPARQL lowering and internal fixtures. JSON-LD bare-string
     /// `select: "?x"` builds the struct variant directly with `shape: Scalar`.
     pub fn select(vars: Vec<VarId>) -> Self {
         Self::Select {
-            vars,
+            selections: vars.into_iter().map(Selection::Var).collect(),
             shape: ProjectionShape::Tuple,
         }
     }
 
-    /// Construct a `SelectOne` with the default (`Tuple`) shape.
+    /// Construct a `SelectOne` from a variable list with the default (`Tuple`) shape.
     pub fn select_one(vars: Vec<VarId>) -> Self {
         Self::SelectOne {
-            vars,
+            selections: vars.into_iter().map(Selection::Var).collect(),
             shape: ProjectionShape::Tuple,
         }
     }
 
-    /// Get select vars for Select/SelectOne, `None` otherwise.
-    pub fn select_vars(&self) -> Option<&[VarId]> {
+    /// Get the raw selections for Select/SelectOne, `None` otherwise.
+    pub fn selections(&self) -> Option<&[Selection]> {
         match self {
-            QueryOutput::Select { vars, .. } | QueryOutput::SelectOne { vars, .. } => Some(vars),
+            QueryOutput::Select { selections, .. } | QueryOutput::SelectOne { selections, .. } => {
+                Some(selections)
+            }
             _ => None,
         }
     }
 
-    /// Get select vars, or an empty slice for non-select outputs.
-    pub fn select_vars_or_empty(&self) -> &[VarId] {
-        self.select_vars().unwrap_or(&[])
+    /// Iterator over the bound variables of each selection in column order.
+    ///
+    /// `Selection::Var` yields its variable; `Selection::Hydration` yields its
+    /// root variable when the root is a variable (constant-rooted expansions
+    /// bind no row column and are skipped).
+    pub fn select_var_iter(&self) -> impl Iterator<Item = VarId> + '_ {
+        self.selections()
+            .into_iter()
+            .flatten()
+            .filter_map(Selection::bound_var)
+    }
+
+    /// Collect bound select variables in column order, `None` for non-select outputs.
+    pub fn select_vars(&self) -> Option<Vec<VarId>> {
+        self.selections().map(|sels| {
+            sels.iter()
+                .filter_map(Selection::bound_var)
+                .collect::<Vec<_>>()
+        })
+    }
+
+    /// Collect bound select variables, or an empty `Vec` for non-select outputs.
+    pub fn select_vars_or_empty(&self) -> Vec<VarId> {
+        self.select_vars().unwrap_or_default()
     }
 
     /// Get the projection shape for Select/SelectOne, `None` otherwise.
@@ -131,13 +154,14 @@ impl QueryOutput {
     /// Returns `true` iff rows should be flattened from `[v]` to `v` at format
     /// time. True only when the user opted into scalar output via JSON-LD
     /// `select: "?x"` (bare-string form) AND there is exactly one projected
-    /// variable. Wildcard, Construct, Boolean, and `Tuple`-shaped Select all
-    /// return `false`, so tabular output (SPARQL + JSON-LD array-form select)
-    /// is preserved.
+    /// variable selection (hydrationions never flatten).
     pub fn should_flatten_scalar(&self) -> bool {
         match self {
-            QueryOutput::Select { vars, shape } | QueryOutput::SelectOne { vars, shape } => {
-                *shape == ProjectionShape::Scalar && vars.len() == 1
+            QueryOutput::Select { selections, shape }
+            | QueryOutput::SelectOne { selections, shape } => {
+                *shape == ProjectionShape::Scalar
+                    && selections.len() == 1
+                    && matches!(selections[0], Selection::Var(_))
             }
             _ => false,
         }
@@ -149,6 +173,16 @@ impl QueryOutput {
             QueryOutput::Construct(t) => Some(t),
             _ => None,
         }
+    }
+
+    /// Returns the hydration spec embedded in the selections, if any.
+    ///
+    /// A query carries at most one hydration selection (enforced by the
+    /// parser). Non-Select/SelectOne outputs return `None`.
+    pub fn hydration(&self) -> Option<&HydrationSpec> {
+        self.selections()?
+            .iter()
+            .find_map(Selection::as_hydration)
     }
 
     /// Returns `true` for `SelectOne` output.
@@ -181,13 +215,13 @@ impl QueryOutput {
     pub fn variables(&self) -> Option<HashSet<VarId>> {
         match self {
             QueryOutput::Wildcard | QueryOutput::Boolean => None,
-            QueryOutput::Select { vars, .. } | QueryOutput::SelectOne { vars, .. }
-                if vars.is_empty() =>
+            QueryOutput::Select { selections, .. } | QueryOutput::SelectOne { selections, .. }
+                if selections.is_empty() =>
             {
                 None
             }
-            QueryOutput::Select { vars, .. } | QueryOutput::SelectOne { vars, .. } => {
-                Some(vars.iter().copied().collect())
+            QueryOutput::Select { selections, .. } | QueryOutput::SelectOne { selections, .. } => {
+                Some(selections.iter().filter_map(Selection::bound_var).collect())
             }
             QueryOutput::Construct(t) if t.patterns.is_empty() => None,
             QueryOutput::Construct(t) => Some(t.referenced_vars()),
@@ -205,16 +239,12 @@ pub struct Query {
     pub context: ParsedContext,
     /// Original JSON context from the query (for CONSTRUCT output)
     pub orig_context: Option<serde_json::Value>,
-    /// Query output specification (replaces select, select_mode, construct_template)
+    /// Query output specification (selections, construct template, or boolean/wildcard mode)
     pub output: QueryOutput,
     /// Resolved patterns (triples, filters, optionals, etc.)
     pub patterns: Vec<Pattern>,
     /// Query options (limit, offset, order by, group by, etc.)
     pub options: QueryOptions,
-    /// Graph crawl select specification (None for flat SELECT or CONSTRUCT)
-    ///
-    /// When present, controls nested JSON-LD object expansion during formatting.
-    pub graph_select: Option<GraphSelectSpec>,
     /// Post-query VALUES clause (SPARQL `ValuesClause` after `SolutionModifier`).
     ///
     /// Stored separately from `patterns` so the WHERE-clause planner does not
@@ -232,7 +262,6 @@ impl Query {
             output: QueryOutput::Wildcard,
             patterns: Vec::new(),
             options: QueryOptions::default(),
-            graph_select: None,
             post_values: None,
         }
     }
@@ -248,7 +277,6 @@ impl Query {
             output: self.output.clone(),
             patterns,
             options: self.options.clone(),
-            graph_select: self.graph_select.clone(),
             post_values: self.post_values.clone(),
         }
     }

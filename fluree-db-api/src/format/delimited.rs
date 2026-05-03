@@ -227,7 +227,7 @@ fn format_delimited_limited(
 // Internals
 // ---------------------------------------------------------------------------
 
-/// Reject non-tabular results (CONSTRUCT, graph crawl).
+/// Reject non-tabular results (CONSTRUCT, hydration).
 fn reject_non_tabular(result: &QueryResult, delimiter: Delimiter) -> Result<()> {
     let name = delimiter.name();
     if result.output.is_construct() {
@@ -240,9 +240,9 @@ fn reject_non_tabular(result: &QueryResult, delimiter: Delimiter) -> Result<()> 
             "{name} format not supported for ASK queries (boolean result)"
         )));
     }
-    if result.graph_select.is_some() {
+    if result.output.hydration().is_some() {
         return Err(FormatError::InvalidBinding(format!(
-            "{name} format not supported for graph crawl queries (use JSON-LD instead)"
+            "{name} format not supported for hydration queries (use JSON-LD instead)"
         )));
     }
     Ok(())
@@ -637,7 +637,6 @@ mod tests {
             output: crate::QueryOutput::select(var_ids),
             batches: vec![batch],
             binary_graph: None,
-            graph_select: None,
         }
     }
 

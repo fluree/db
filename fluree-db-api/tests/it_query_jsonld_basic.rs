@@ -26,7 +26,7 @@ async fn seed_movie_graph() -> (MemoryFluree, MemoryLedger) {
 
     let ledger0 = genesis_ledger(&fluree, ledger_id);
 
-    // Minimal “movie -> book -> author” shape to exercise graph crawl + depth.
+    // Minimal “movie -> book -> author” shape to exercise expansion + depth.
     let tx = json!({
         "@context": ctx(),
         "@graph": [
@@ -238,7 +238,7 @@ async fn jsonld_basic_single_subject_query_select_one() {
 }
 
 #[tokio::test]
-async fn jsonld_basic_single_subject_query_graph_crawl() {
+async fn jsonld_basic_single_subject_query_expansion() {
     let (fluree, ledger) = seed_movie_graph().await;
 
     let query = json!({
@@ -273,8 +273,8 @@ async fn jsonld_basic_single_subject_query_graph_crawl() {
 }
 
 #[tokio::test]
-async fn jsonld_basic_single_subject_graph_crawl_with_depth() {
-    // Mirrors the “depth graph crawl” behavior:
+async fn jsonld_basic_single_subject_expansion_with_depth() {
+    // Mirrors the “depth expansion” behavior:
     // with depth=3 and wildcard selection, refs should auto-expand transitively.
     let (fluree, ledger) = seed_movie_graph().await;
 
@@ -317,7 +317,7 @@ async fn jsonld_basic_single_subject_graph_crawl_with_depth() {
 }
 
 #[tokio::test]
-async fn jsonld_basic_single_subject_graph_crawl_with_depth_and_subselection() {
+async fn jsonld_basic_single_subject_expansion_with_depth_and_subselection() {
     let (fluree, ledger) = seed_movie_graph().await;
 
     let query = json!({
@@ -744,7 +744,7 @@ async fn jsonld_rdf_type_query_analytical() {
 }
 
 #[tokio::test]
-async fn jsonld_graph_crawl_nested_subselect_includes_id() {
+async fn jsonld_expansion_nested_subselect_includes_id() {
     let (fluree, ledger) = seed_movie_graph().await;
 
     // Regression: nested ref sub-selects should always include @id for identity,

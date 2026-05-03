@@ -133,7 +133,7 @@ async fn class_queries_type_and_all_types() {
 // -----------------------------------------------------------------------------
 
 #[tokio::test]
-async fn result_formatting_graph_crawl_variants() {
+async fn result_formatting_expansion_variants() {
     // Scenario: misc-queries-test/result-formatting (current query section)
     let fluree = FlureeBuilder::memory().build_memory();
     let ledger0 = genesis_ledger(&fluree, "misc/result-formatting:main");
@@ -401,10 +401,10 @@ async fn s_p_o_full_db_queries_parity() {
         ),
     ];
 
-    let rows = r_graph.as_array().expect("graph crawl results array");
+    let rows = r_graph.as_array().expect("expansion results array");
     assert_eq!(rows.len(), 11);
     for row in rows {
-        let obj = row.as_object().expect("graph crawl row object");
+        let obj = row.as_object().expect("expansion row object");
         let canon = canon_person(obj).expect("canonicalize person row");
         assert!(expected.contains(&canon), "unexpected row: {row:?}");
     }

@@ -5,10 +5,11 @@
 
 use super::ast::{
     LiteralValue, UnresolvedAggregateFn, UnresolvedAggregateSpec, UnresolvedConstructTemplate,
-    UnresolvedDatatypeConstraint, UnresolvedExpression, UnresolvedGraphSelectSpec,
+    UnresolvedDatatypeConstraint, UnresolvedExpression, UnresolvedHydrationSpec,
     UnresolvedNestedSelectSpec, UnresolvedOptions, UnresolvedPathExpr, UnresolvedPattern,
-    UnresolvedQuery, UnresolvedRoot, UnresolvedSelectionSpec, UnresolvedSortDirection,
-    UnresolvedSortSpec, UnresolvedTerm, UnresolvedTriplePattern, UnresolvedValue,
+    UnresolvedQuery, UnresolvedRoot, UnresolvedSelection, UnresolvedSelectionSpec,
+    UnresolvedSortDirection, UnresolvedSortSpec, UnresolvedTerm, UnresolvedTriplePattern,
+    UnresolvedValue,
 };
 use super::encode::{IriEncoder, NoEncoder};
 use super::error::{ParseError, Result};
@@ -18,7 +19,8 @@ use crate::context::WellKnownDatatypes;
 use crate::ir::triple::{Ref, Term, TriplePattern};
 use crate::ir::QueryOptions;
 use crate::ir::{
-    ConstructTemplate, GraphSelectSpec, NestedSelectSpec, Query, QueryOutput, Root, SelectionSpec,
+    ConstructTemplate, HydrationSpec, NestedSelectSpec, Query, QueryOutput, Root, Selection,
+    SelectionSpec,
 };
 use crate::ir::{
     Expression, Function, IndexSearchPattern, IndexSearchTarget, PathModifier, Pattern,
@@ -85,12 +87,12 @@ pub(crate) fn lower_query<E: IriEncoder>(
 ) -> Result<Query> {
     let mut pp_counter: u32 = 0;
 
-    // Lower select variables
-    let select_vars: Vec<VarId> = ast
+    // Lower selections (variables and any hydration)
+    let selections: Vec<Selection> = ast
         .select
         .iter()
-        .map(|name| vars.get_or_insert(name))
-        .collect();
+        .map(|sel| lower_selection(sel, encoder, vars))
+        .collect::<Result<_>>()?;
 
     // Lower patterns
     let mut patterns = Vec::new();
@@ -106,14 +108,8 @@ pub(crate) fn lower_query<E: IriEncoder>(
     // Build QueryOutput from mode + lowered components
     let shape = ast.select_shape;
     let output = match select_mode {
-        SelectMode::Many => QueryOutput::Select {
-            vars: select_vars,
-            shape,
-        },
-        SelectMode::One => QueryOutput::SelectOne {
-            vars: select_vars,
-            shape,
-        },
+        SelectMode::Many => QueryOutput::Select { selections, shape },
+        SelectMode::One => QueryOutput::SelectOne { selections, shape },
         SelectMode::Wildcard => QueryOutput::Wildcard,
         SelectMode::Construct => {
             let template = match ast.construct_template {
@@ -125,22 +121,27 @@ pub(crate) fn lower_query<E: IriEncoder>(
         SelectMode::Boolean => QueryOutput::Boolean,
     };
 
-    // Lower graph select if present
-    let graph_select = ast
-        .graph_select
-        .as_ref()
-        .map(|gs| lower_graph_select(gs, encoder, vars))
-        .transpose()?;
-
     Ok(Query {
         context: ast.context,
         orig_context: ast.orig_context,
         output,
         patterns,
         options,
-        graph_select,
         post_values: None,
     })
+}
+
+fn lower_selection<E: IriEncoder>(
+    sel: &UnresolvedSelection,
+    encoder: &E,
+    vars: &mut VarRegistry,
+) -> Result<Selection> {
+    match sel {
+        UnresolvedSelection::Var(name) => Ok(Selection::Var(vars.get_or_insert(name))),
+        UnresolvedSelection::Hydration(spec) => {
+            Ok(Selection::Hydration(lower_hydration(spec, encoder, vars)?))
+        }
+    }
 }
 
 /// Lower an unresolved pattern to resolved Pattern(s).
@@ -986,12 +987,17 @@ fn lower_subquery<E: IriEncoder>(
     vars: &mut VarRegistry,
     pp_counter: &mut u32,
 ) -> Result<SubqueryPattern> {
-    // Lower select list to VarIds
+    // Lower select list to VarIds (subqueries support variables only, no hydration)
     let select: Vec<VarId> = subquery
         .select
         .iter()
-        .map(|var_name| vars.get_or_insert(var_name))
-        .collect();
+        .map(|sel| match sel {
+            UnresolvedSelection::Var(name) => Ok(vars.get_or_insert(name)),
+            UnresolvedSelection::Hydration(_) => Err(ParseError::InvalidSelect(
+                "hydrationions are not allowed inside subqueries".to_string(),
+            )),
+        })
+        .collect::<Result<_>>()?;
 
     // Lower WHERE patterns
     let patterns = lower_unresolved_patterns(&subquery.patterns, encoder, vars, pp_counter)?;
@@ -1063,15 +1069,15 @@ fn lower_construct_template<E: IriEncoder>(
 }
 
 // ============================================================================
-// Graph crawl lowering
+// Hydration lowering
 // ============================================================================
 
-/// Lower an unresolved graph select specification to a resolved GraphSelectSpec
-fn lower_graph_select<E: IriEncoder>(
-    spec: &UnresolvedGraphSelectSpec,
+/// Lower an unresolved graph select specification to a resolved HydrationSpec
+fn lower_hydration<E: IriEncoder>(
+    spec: &UnresolvedHydrationSpec,
     encoder: &E,
     vars: &mut VarRegistry,
-) -> Result<GraphSelectSpec> {
+) -> Result<HydrationSpec> {
     // Handle root - variable or IRI constant
     let root = match &spec.root {
         UnresolvedRoot::Var(name) => {
@@ -1112,7 +1118,7 @@ fn lower_graph_select<E: IriEncoder>(
         reverse.insert(sid, lowered_nested);
     }
 
-    Ok(GraphSelectSpec {
+    Ok(HydrationSpec {
         root,
         selections,
         reverse,

@@ -104,7 +104,6 @@ mod tests {
             output: QueryOutput::Wildcard,
             patterns: vec![],
             options: QueryOptions::default(),
-            graph_select: None,
             post_values: None,
         };
         let executable = ExecutableQuery::simple(query);
@@ -147,7 +146,6 @@ mod tests {
             output: QueryOutput::select(vec![VarId(99)]), // Variable not in pattern
             patterns: vec![Pattern::Triple(make_pattern(VarId(0), "name", VarId(1)))],
             options: QueryOptions::default(),
-            graph_select: None,
             post_values: None,
         };
 
@@ -171,7 +169,6 @@ mod tests {
             output: QueryOutput::select(vec![VarId(0)]),
             patterns: vec![Pattern::Triple(make_pattern(VarId(0), "name", VarId(1)))],
             options: QueryOptions::default(),
-            graph_select: None,
             post_values: None,
         };
 

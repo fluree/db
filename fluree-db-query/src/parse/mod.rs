@@ -35,7 +35,7 @@ pub mod where_clause;
 pub use ast::{
     encode_datatype_constraint, LiteralValue, UnresolvedAggregateFn, UnresolvedAggregateSpec,
     UnresolvedConstructTemplate, UnresolvedDatatypeConstraint, UnresolvedExpression,
-    UnresolvedFilterValue, UnresolvedGraphSelectSpec, UnresolvedNestedSelectSpec,
+    UnresolvedFilterValue, UnresolvedHydrationSpec, UnresolvedNestedSelectSpec,
     UnresolvedOptions, UnresolvedPattern, UnresolvedQuery, UnresolvedRoot, UnresolvedSelectionSpec,
     UnresolvedSortDirection, UnresolvedSortSpec, UnresolvedTerm, UnresolvedTriplePattern,
     UnresolvedValue,
@@ -194,8 +194,8 @@ fn parse_query_ast_internal(
         parse_select(select, &ctx, &mut query)?;
     }
 
-    // Parse depth parameter and apply to graph_select if present
-    if let Some(ref mut gs) = query.graph_select {
+    // Parse depth parameter and apply to hydrationion if present
+    if let Some(gs) = query.hydration_mut() {
         gs.depth = options::parse_depth(obj)?;
     }
 
@@ -210,7 +210,7 @@ fn parse_query_ast_internal(
 
     // Parse where clause.
     //
-    // Graph crawl queries like {"select": {"ex:dan": ["*"]}} are allowed.
+    // Hydration queries like {"select": {"ex:dan": ["*"]}} are allowed.
     // without an explicit WHERE clause (root may be an IRI constant).
     let object_var_parsing = options::parse_object_var_parsing(obj);
     if let Some(where_clause) = obj.get("where") {
@@ -222,9 +222,9 @@ fn parse_query_ast_internal(
             nested_counter,
             object_var_parsing,
         )?;
-    } else if query.graph_select.is_some() {
-        // Allowed: graph crawl-only query with no WHERE.
-        // Execution will produce an empty solution set, and graph crawl formatting will use the root
+    } else if query.hydration().is_some() {
+        // Allowed: hydration-only query with no WHERE.
+        // Execution will produce an empty solution set, and hydration formatting will use the root
         // (constant root emits one row; variable root yields no rows).
     } else if !query
         .patterns
@@ -279,16 +279,13 @@ fn parse_query_ast_internal(
             query.options.order_by = query
                 .select
                 .iter()
-                .filter_map(|v| {
-                    let s = v.as_ref();
-                    if !s.starts_with('?') {
-                        return None;
-                    }
-                    if !seen.insert(s) {
-                        return None;
-                    }
-                    Some(crate::parse::ast::UnresolvedSortSpec::asc(s))
+                .filter_map(|sel| match sel {
+                    crate::parse::ast::UnresolvedSelection::Var(name) => Some(name.as_ref()),
+                    crate::parse::ast::UnresolvedSelection::Hydration(_) => None,
                 })
+                .filter(|s| s.starts_with('?'))
+                .filter(|s| seen.insert(*s))
+                .map(crate::parse::ast::UnresolvedSortSpec::asc)
                 .collect();
         }
     }
@@ -542,8 +539,8 @@ fn parse_construct_template(
 /// Supports five forms:
 /// 1. Single string: `"?x"` - single variable selection (unwrap)
 /// 2. Simple array: `["?x", "?y"]` - flat variable selection
-/// 3. Mixed array: `["?age", {"?person": ["*"]}]` - scalar vars + graph crawl
-/// 4. Single object: `{"?person": ["*"]}` - graph crawl only
+/// 3. Mixed array: `["?age", {"?person": ["*"]}]` - scalar vars + hydration
+/// 4. Single object: `{"?person": ["*"]}` - hydration only
 /// 5. S-expression aggregates: `["?name", "(count ?favNums as ?cnt)"]`
 fn parse_select(
     select: &JsonValue,
@@ -562,8 +559,8 @@ fn parse_select(
                         parse_select_string(s, query)?;
                     }
                     JsonValue::Object(map) => {
-                        let spec = parse_graph_select_object(map, ctx, query)?;
-                        query.graph_select = Some(spec);
+                        let spec = parse_hydration_object(map, ctx, query)?;
+                        query.add_hydration(spec);
                     }
                     _ => {
                         return Err(ParseError::InvalidSelect(
@@ -576,8 +573,8 @@ fn parse_select(
 
         // Case 4: Single object form: {"?person": ["*"]}
         JsonValue::Object(map) => {
-            let spec = parse_graph_select_object(map, ctx, query)?;
-            query.graph_select = Some(spec);
+            let spec = parse_hydration_object(map, ctx, query)?;
+            query.add_hydration(spec);
         }
 
         // Case 1: Single string form: "?x" — bare variable, scalar shape.
@@ -820,16 +817,14 @@ fn parse_aggregate_fn_and_input(
     Ok((function, input.to_string()))
 }
 
-/// Parse a graph crawl select object like `{"?person": ["*", {"ex:friend": ["*"]}]}`
-///
-/// Also adds the root variable to the execution select list.
-fn parse_graph_select_object(
+/// Parse a hydration object like `{"?person": ["*", {"ex:friend": ["*"]}]}`
+fn parse_hydration_object(
     map: &serde_json::Map<String, JsonValue>,
     ctx: &JsonLdParseCtx,
-    query: &mut UnresolvedQuery,
-) -> Result<UnresolvedGraphSelectSpec> {
-    // Error if we already have a graph_select (only one allowed)
-    if query.graph_select.is_some() {
+    query: &UnresolvedQuery,
+) -> Result<UnresolvedHydrationSpec> {
+    // Error if we already have a hydration (only one allowed)
+    if query.hydration().is_some() {
         return Err(ParseError::InvalidSelect(
             "only one graph-select object allowed per query".to_string(),
         ));
@@ -846,8 +841,6 @@ fn parse_graph_select_object(
 
     // Root can be variable OR IRI constant
     let root = if is_variable(root_str) {
-        // Variable root - add to execution select list
-        query.add_select(root_str);
         UnresolvedRoot::Var(Arc::from(root_str.as_str()))
     } else {
         // IRI constant root - expand via @context
@@ -862,7 +855,7 @@ fn parse_graph_select_object(
 
     let specs = parse_selection_specs(specs_arr, ctx)?;
 
-    Ok(UnresolvedGraphSelectSpec {
+    Ok(UnresolvedHydrationSpec {
         root,
         selections: specs.forward,
         reverse: specs.reverse,
@@ -1116,7 +1109,7 @@ mod tests {
         let (ast, _) = parse_query_ast(&json, None).unwrap();
 
         assert_eq!(ast.select.len(), 1);
-        assert_eq!(ast.select[0].as_ref(), "?name");
+        assert_eq!(ast.select[0].var_name().unwrap(), "?name");
         assert_eq!(ast.patterns.len(), 2); // @type + name
     }
 
@@ -1371,7 +1364,7 @@ mod tests {
     }
 
     #[test]
-    fn test_type_expansion() {
+    fn test_type_hydration() {
         let json = json!({
             "@context": { "ex": "http://example.org/" },
             "select": ["?s"],
@@ -1483,7 +1476,7 @@ mod tests {
     }
 
     #[test]
-    fn test_vocab_expansion() {
+    fn test_vocab_hydration() {
         let json = json!({
             "@context": {
                 "@vocab": "http://schema.org/"
@@ -1856,7 +1849,7 @@ mod tests {
     }
 
     #[test]
-    fn test_reference_value_expansion() {
+    fn test_reference_value_hydration() {
         // String values for @id-typed properties should expand to IRIs
         let json = json!({
             "@context": {
@@ -3007,8 +3000,8 @@ mod tests {
 
         // Check select has both vars
         assert_eq!(ast.select.len(), 2);
-        assert_eq!(ast.select[0].as_ref(), "?name");
-        assert_eq!(ast.select[1].as_ref(), "?count");
+        assert_eq!(ast.select[0].var_name().unwrap(), "?name");
+        assert_eq!(ast.select[1].var_name().unwrap(), "?count");
 
         // Check aggregate was parsed
         assert_eq!(ast.options.aggregates.len(), 1);
@@ -3049,7 +3042,7 @@ mod tests {
         let (ast, _) = parse_query_ast(&json, None).unwrap();
 
         assert_eq!(ast.select.len(), 1);
-        assert_eq!(ast.select[0].as_ref(), "?sum");
+        assert_eq!(ast.select[0].var_name().unwrap(), "?sum");
 
         assert_eq!(ast.options.aggregates.len(), 1);
         let agg = &ast.options.aggregates[0];

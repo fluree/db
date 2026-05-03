@@ -221,7 +221,6 @@ impl crate::Fluree {
         // bindings we need for indexing
         let mut parsed_for_exec = parsed.clone();
         parsed_for_exec.output = QueryOutput::Wildcard;
-        parsed_for_exec.graph_select = None;
 
         let executable = ExecutableQuery::simple(parsed_for_exec);
 
@@ -263,7 +262,6 @@ impl crate::Fluree {
 
         let mut parsed_for_exec = parsed.clone();
         parsed_for_exec.output = QueryOutput::Wildcard;
-        parsed_for_exec.graph_select = None;
 
         let executable = ExecutableQuery::simple(parsed_for_exec);
 

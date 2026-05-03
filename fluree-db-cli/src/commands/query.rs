@@ -512,7 +512,7 @@ pub async fn run(
                     format_duration(fmt_elapsed),
                 );
             } else {
-                // JSON-LD queries can produce nested graph crawl results; always render as JSON.
+                // JSON-LD queries can produce nested expansion results; always render as JSON.
                 let display_format = match output_format {
                     OutputFormatKind::TypedJson => OutputFormatKind::TypedJson,
                     _ if query_format == detect::QueryFormat::JsonLd => OutputFormatKind::Json,

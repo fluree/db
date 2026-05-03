@@ -40,17 +40,8 @@ pub fn compute_variable_deps(query: &Query, options: &QueryOptions) -> Option<Va
 
     // Seed deps from the query output requirements.
     // Wildcard/Boolean return None from `variables()`, disabling trimming.
+    // Selection::Hydration contributes its root variable via bound_var.
     let mut deps: HashSet<VarId> = query.output.variables()?;
-
-    // Graph crawl formatter reads the root variable from result batches
-    // in addition to the SELECT variables (for mixed-select mode).
-    if let Some(root_var) = query
-        .graph_select
-        .as_ref()
-        .and_then(super::super::ir::GraphSelectSpec::root_var)
-    {
-        deps.insert(root_var);
-    }
 
     // ORDER BY vars must survive to the sort operator.
     for spec in &options.order_by {
@@ -140,7 +131,6 @@ mod tests {
             output,
             patterns,
             options: QueryOptions::default(),
-            graph_select: None,
             post_values: None,
         }
     }
@@ -261,7 +251,6 @@ mod tests {
             )])),
             patterns: vec![],
             options: QueryOptions::default(),
-            graph_select: None,
             post_values: None,
         };
 
@@ -270,32 +259,49 @@ mod tests {
         assert!(deps.required_where_vars.contains(&VarId(1)));
     }
 
-    // ---- graph_select tests ----
+    // ---- hydrationion tests ----
 
-    #[test]
-    fn graph_select_adds_root_var() {
-        // SELECT ?name WHERE { ... } with graph_select rooted at ?s
-        // The formatter needs both ?name (select var) and ?s (root var).
-        let mut query = make_query(vec![VarId(1)], vec![], SelectMode::Many);
-        query.graph_select = Some(crate::ir::GraphSelectSpec::new(
-            crate::ir::Root::Var(VarId(0)),
-            vec![],
-        ));
-
-        let deps = compute_variable_deps(&query, &QueryOptions::default()).unwrap();
-        assert!(deps.required_where_vars.contains(&VarId(0))); // root var
-        assert!(deps.required_where_vars.contains(&VarId(1))); // select var
+    fn make_query_with_selections(selections: Vec<crate::ir::Selection>) -> Query {
+        Query {
+            context: ParsedContext::default(),
+            orig_context: None,
+            output: QueryOutput::Select {
+                selections,
+                shape: crate::ir::ProjectionShape::Tuple,
+            },
+            patterns: vec![],
+            options: QueryOptions::default(),
+            post_values: None,
+        }
     }
 
     #[test]
-    fn graph_select_root_already_in_select() {
-        // SELECT ?s WHERE { ... } with graph_select rooted at ?s
-        // Root var is the same as the select var — no extra var needed.
-        let mut query = make_query(vec![VarId(0)], vec![], SelectMode::Many);
-        query.graph_select = Some(crate::ir::GraphSelectSpec::new(
-            crate::ir::Root::Var(VarId(0)),
-            vec![],
-        ));
+    fn hydration_adds_root_var() {
+        // SELECT ?name + hydration rooted at ?s
+        // The formatter needs both ?name (var selection) and ?s (root var).
+        let query = make_query_with_selections(vec![
+            crate::ir::Selection::Var(VarId(1)),
+            crate::ir::Selection::Hydration(crate::ir::HydrationSpec::new(
+                crate::ir::Root::Var(VarId(0)),
+                vec![],
+            )),
+        ]);
+
+        let deps = compute_variable_deps(&query, &QueryOptions::default()).unwrap();
+        assert!(deps.required_where_vars.contains(&VarId(0))); // root var
+        assert!(deps.required_where_vars.contains(&VarId(1))); // var selection
+    }
+
+    #[test]
+    fn hydration_root_already_in_select() {
+        // Var selection ?s + hydration rooted at ?s — only ?s needed.
+        let query = make_query_with_selections(vec![
+            crate::ir::Selection::Var(VarId(0)),
+            crate::ir::Selection::Hydration(crate::ir::HydrationSpec::new(
+                crate::ir::Root::Var(VarId(0)),
+                vec![],
+            )),
+        ]);
 
         let deps = compute_variable_deps(&query, &QueryOptions::default()).unwrap();
         assert!(deps.required_where_vars.contains(&VarId(0)));
@@ -303,30 +309,20 @@ mod tests {
     }
 
     #[test]
-    fn graph_select_sid_root_no_extra_vars() {
-        // SELECT ?name WHERE { ... } with graph_select rooted at an IRI constant
-        // Sid root doesn't reference a variable — only select vars needed.
-        let mut query = make_query(vec![VarId(1)], vec![], SelectMode::Many);
-        query.graph_select = Some(crate::ir::GraphSelectSpec::new(
-            crate::ir::Root::Sid(Sid::new(100, "alice")),
-            vec![],
-        ));
+    fn hydration_sid_root_no_extra_vars() {
+        // SELECT ?name + hydration rooted at an IRI constant.
+        // Sid root binds no variable — only ?name needed.
+        let query = make_query_with_selections(vec![
+            crate::ir::Selection::Var(VarId(1)),
+            crate::ir::Selection::Hydration(crate::ir::HydrationSpec::new(
+                crate::ir::Root::Sid(Sid::new(100, "alice")),
+                vec![],
+            )),
+        ]);
 
         let deps = compute_variable_deps(&query, &QueryOptions::default()).unwrap();
         assert!(deps.required_where_vars.contains(&VarId(1)));
         assert_eq!(deps.required_where_vars.len(), 1);
-    }
-
-    #[test]
-    fn graph_select_wildcard_output_disables_trimming() {
-        // SELECT * WHERE { ... } with graph_select — Wildcard disables trimming.
-        let mut query = make_query(vec![], vec![], SelectMode::Wildcard);
-        query.graph_select = Some(crate::ir::GraphSelectSpec::new(
-            crate::ir::Root::Var(VarId(0)),
-            vec![],
-        ));
-
-        assert!(compute_variable_deps(&query, &QueryOptions::default()).is_none());
     }
 
     // ---- per-operator pipeline deps tests ----

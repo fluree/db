@@ -205,7 +205,7 @@ impl DataSetDb {
         ds
     }
 
-    /// Build a composite overlay across all graphs (for graph crawl formatting).
+    /// Build a composite overlay across all graphs (for hydration formatting).
     pub(crate) fn composite_overlay(&self) -> Option<Arc<dyn OverlayProvider>> {
         let mut overlays: Vec<Arc<dyn OverlayProvider>> = Vec::new();
 

@@ -465,7 +465,6 @@ mod tests {
             output: crate::QueryOutput::select(vec![]),
             batches: vec![],
             binary_graph: None,
-            graph_select: None,
         }
     }
 

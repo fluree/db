@@ -1,11 +1,11 @@
-//! Regression tests for novelty retraction handling in JSON-LD graph crawl.
+//! Regression tests for novelty retraction handling in JSON-LD expansion.
 //!
 //! When an entity is created and then updated (upserted) within novelty
-//! (both transactions after the last index), the graph crawl `select *`
+//! (both transactions after the last index), the expansion `select *`
 //! must only return the current (post-upsert) values, not both old and new.
 //!
 //! SPARQL SELECT handles this correctly because the query engine deduplicates
-//! overlay facts. The JSON-LD graph crawl path goes through BinaryRangeProvider
+//! overlay facts. The JSON-LD expansion path goes through BinaryRangeProvider
 //! which uses BinaryCursor overlay merge — and the cursor does not deduplicate
 //! intra-overlay assert/retract pairs for the same fact.
 
@@ -72,7 +72,7 @@ fn assert_single_string_value(value: &Value, expected: &str, field: &str, node: 
 }
 
 // =============================================================================
-// Core regression test: upsert in novelty → graph crawl must show only new value
+// Core regression test: upsert in novelty → expansion must show only new value
 // =============================================================================
 
 /// Reproduces the bug where JSON-LD `select *` returns both old and new values
@@ -85,7 +85,7 @@ fn assert_single_string_value(value: &Value, expected: &str, field: &str, node: 
 /// 3. Upsert task with description "updated" (novelty only)
 /// 4. JSON-LD `select {IRI: ["*"]}` should return ONLY "updated"
 #[tokio::test]
-async fn graph_crawl_applies_novelty_retractions() {
+async fn expansion_applies_novelty_retractions() {
     let tmp = tempfile::tempdir().expect("create temp dir");
     let path = tmp.path().to_str().unwrap();
 
@@ -153,7 +153,7 @@ async fn graph_crawl_applies_novelty_retractions() {
     );
 
     // -------------------------------------------------------------------------
-    // JSON-LD graph crawl: select {IRI: ["*"]}
+    // JSON-LD expansion: select {IRI: ["*"]}
     // -------------------------------------------------------------------------
     let crawl_query = json!({
         "@context": test_context(),
@@ -167,7 +167,7 @@ async fn graph_crawl_applies_novelty_retractions() {
         .format(config)
         .execute_tracked()
         .await
-        .expect("graph crawl query");
+        .expect("expansion query");
 
     let formatted = serde_json::to_value(&crawl_result.result).expect("serialize");
     let node = formatted
@@ -191,7 +191,7 @@ async fn graph_crawl_applies_novelty_retractions() {
 /// and the update happens in novelty. This exercises the cursor merge path
 /// (base rows + overlay retract/assert) rather than the overlay-only path.
 #[tokio::test]
-async fn graph_crawl_applies_novelty_retractions_for_indexed_base_rows() {
+async fn expansion_applies_novelty_retractions_for_indexed_base_rows() {
     let tmp = tempfile::tempdir().expect("create temp dir");
     let path = tmp.path().to_str().unwrap();
 
@@ -253,7 +253,7 @@ async fn graph_crawl_applies_novelty_retractions_for_indexed_base_rows() {
         "SPARQL should return only the updated description"
     );
 
-    // JSON-LD graph crawl: select {IRI: ["*"]} should also return only the updated value.
+    // JSON-LD expansion: select {IRI: ["*"]} should also return only the updated value.
     let crawl_query = json!({
         "@context": test_context(),
         "select": { TASK_IRI: ["*"] },
@@ -266,7 +266,7 @@ async fn graph_crawl_applies_novelty_retractions_for_indexed_base_rows() {
         .format(config)
         .execute_tracked()
         .await
-        .expect("graph crawl query");
+        .expect("expansion query");
 
     let formatted = serde_json::to_value(&crawl_result.result).expect("serialize");
     let node = formatted
@@ -289,7 +289,7 @@ async fn graph_crawl_applies_novelty_retractions_for_indexed_base_rows() {
 /// must match the exact fact identity including list index, otherwise stale
 /// values will leak from the base index.
 #[tokio::test]
-async fn graph_crawl_applies_novelty_retractions_for_list_indexed_values() {
+async fn expansion_applies_novelty_retractions_for_list_indexed_values() {
     let tmp = tempfile::tempdir().expect("create temp dir");
     let path = tmp.path().to_str().unwrap();
 
@@ -344,7 +344,7 @@ async fn graph_crawl_applies_novelty_retractions_for_list_indexed_values() {
         "SPARQL should return only the updated single description"
     );
 
-    // JSON-LD graph crawl should also contain only one description value.
+    // JSON-LD expansion should also contain only one description value.
     let crawl_query = json!({
         "@context": test_context(),
         "select": { TASK_IRI: ["*"] },
@@ -357,7 +357,7 @@ async fn graph_crawl_applies_novelty_retractions_for_list_indexed_values() {
         .format(config)
         .execute_tracked()
         .await
-        .expect("graph crawl query");
+        .expect("expansion query");
     let formatted = serde_json::to_value(&crawl_result.result).expect("serialize");
     let node = formatted
         .as_array()
@@ -367,7 +367,7 @@ async fn graph_crawl_applies_novelty_retractions_for_list_indexed_values() {
     assert_single_string_value(&node["ex:description"], "desc c", "description", node);
 }
 
-/// Regression: graph crawl must not drop novelty assertions when V3 overlay translation
+/// Regression: expansion must not drop novelty assertions when V3 overlay translation
 /// fails due to missing/invalid dictionary state.
 ///
 /// This simulates a production failure mode where the reader has a binary index
@@ -376,7 +376,7 @@ async fn graph_crawl_applies_novelty_retractions_for_list_indexed_values() {
 /// translation of retractions for indexed (old) string values still succeeds.
 /// If we silently drop the failed assertion, the property disappears entirely.
 #[tokio::test]
-async fn graph_crawl_does_not_drop_overlay_assertions_when_dict_novelty_missing() {
+async fn expansion_does_not_drop_overlay_assertions_when_dict_novelty_missing() {
     use std::sync::Arc;
 
     let tmp = tempfile::tempdir().expect("create temp dir");
@@ -453,7 +453,7 @@ async fn graph_crawl_does_not_drop_overlay_assertions_when_dict_novelty_missing(
     let formatted = result
         .format_async(db.as_graph_db_ref(), &config)
         .await
-        .expect("format graph crawl");
+        .expect("format expansion");
 
     let node = formatted
         .as_array()
@@ -471,7 +471,7 @@ async fn graph_crawl_does_not_drop_overlay_assertions_when_dict_novelty_missing(
 /// Same test but with a fresh reader instance (simulates Lambda/separate process).
 /// This is closer to the production scenario where the reader loads state from storage.
 #[tokio::test]
-async fn graph_crawl_novelty_retractions_fresh_reader() {
+async fn expansion_novelty_retractions_fresh_reader() {
     let tmp = tempfile::tempdir().expect("create temp dir");
     let path = tmp.path().to_str().unwrap();
 
@@ -522,7 +522,7 @@ async fn graph_crawl_novelty_retractions_fresh_reader() {
         .format(config)
         .execute_tracked()
         .await
-        .expect("graph crawl");
+        .expect("expansion");
 
     let formatted = serde_json::to_value(&result.result).expect("serialize");
     let node = formatted
@@ -541,7 +541,7 @@ async fn graph_crawl_novelty_retractions_fresh_reader() {
 /// Memory-backed baseline: same scenario without binary index.
 /// This should always pass because the overlay-only path uses `remove_stale_flakes`.
 #[tokio::test]
-async fn memory_graph_crawl_novelty_retractions() {
+async fn memory_expansion_novelty_retractions() {
     let fluree = FlureeBuilder::memory().build_memory();
     let ledger0 = fluree.create_ledger("test:main").await.expect("create");
 
@@ -585,7 +585,7 @@ async fn memory_graph_crawl_novelty_retractions() {
     assert_eq!(
         node["ex:description"],
         json!("updated description"),
-        "Memory-backed graph crawl should return only the updated description.\n\
+        "Memory-backed expansion should return only the updated description.\n\
          Got: {}\nFull: {}",
         node["ex:description"],
         node

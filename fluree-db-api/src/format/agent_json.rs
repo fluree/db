@@ -28,6 +28,7 @@ pub fn format(
     } else {
         Some(result.output.select_vars_or_empty())
     };
+    let select_vars = select_vars.as_deref();
 
     let max_bytes = config.max_bytes;
     let total_row_hint = result
