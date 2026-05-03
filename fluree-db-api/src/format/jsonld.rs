@@ -28,7 +28,7 @@ pub fn format(
     let select_one = result.output.is_select_one();
     let mut rows = Vec::new();
 
-    let select_vars = result.output.select_vars_or_empty();
+    let select_vars = result.output.projected_vars_or_empty();
     for batch in &result.batches {
         for row_idx in 0..batch.len() {
             let row = if result.output.is_wildcard() {

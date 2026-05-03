@@ -119,8 +119,8 @@ mod tests {
 
     fn make_query(select: Vec<VarId>, patterns: Vec<Pattern>, select_mode: SelectMode) -> Query {
         let output = match select_mode {
-            SelectMode::Many => QueryOutput::select(select),
-            SelectMode::One => QueryOutput::select_one(select),
+            SelectMode::Many => QueryOutput::select_vars(select),
+            SelectMode::One => QueryOutput::select_one_var(select),
             SelectMode::Wildcard => QueryOutput::wildcard(),
             SelectMode::Construct => QueryOutput::Construct(ConstructTemplate::new(Vec::new())),
             SelectMode::Boolean => QueryOutput::Boolean,

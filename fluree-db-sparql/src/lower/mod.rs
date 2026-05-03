@@ -239,7 +239,7 @@ impl<'a, E: IriEncoder> LoweringContext<'a, E> {
                 // the `select`/`select_one` helpers).
                 let output = match &select_query.select.variables {
                     SelectVariables::Star => QueryOutput::wildcard(),
-                    _ => QueryOutput::select(select),
+                    _ => QueryOutput::select_vars(select),
                 };
 
                 Ok(Query {
@@ -351,7 +351,7 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(query.output.select_vars().unwrap().len(), 2);
+        assert_eq!(query.output.projected_vars().unwrap().len(), 2);
         assert_eq!(query.patterns.len(), 1);
         assert!(matches!(query.patterns[0], Pattern::Triple(_)));
     }
@@ -379,7 +379,7 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(query.output.select_vars().unwrap().len(), 3);
+        assert_eq!(query.output.projected_vars().unwrap().len(), 3);
         assert_eq!(query.patterns.len(), 2);
     }
 
@@ -1066,7 +1066,7 @@ mod tests {
         .unwrap();
 
         // CONSTRUCT doesn't project variables like SELECT does
-        assert!(query.output.select_vars().is_none());
+        assert!(query.output.projected_vars().is_none());
     }
 
     // =========================================================================
@@ -1222,7 +1222,7 @@ mod tests {
         .unwrap();
 
         // Should parse complex arithmetic without error
-        assert_eq!(query.output.select_vars().unwrap().len(), 1);
+        assert_eq!(query.output.projected_vars().unwrap().len(), 1);
         let has_filter = query
             .patterns
             .iter()

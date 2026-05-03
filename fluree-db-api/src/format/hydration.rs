@@ -223,7 +223,7 @@ pub async fn format_async(
         }
         Root::Var(var_id) => {
             // Variable root - iterate through result batches
-            let select_vars = result.output.select_vars_or_empty();
+            let select_vars = result.output.projected_vars_or_empty();
             let mixed_select = select_vars.len() > 1 || select_vars.first() != Some(var_id);
 
             for batch in &result.batches {

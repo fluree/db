@@ -1430,7 +1430,7 @@ mod tests {
         let mut vars = VarRegistry::new();
         let query = parse_query(&json, &encoder, &mut vars, None).unwrap();
 
-        assert_eq!(query.output.select_vars().unwrap().len(), 2);
+        assert_eq!(query.output.projected_vars().unwrap().len(), 2);
         assert_eq!(query.patterns.len(), 1);
 
         // query.patterns now contains Pattern, not TriplePattern

@@ -82,7 +82,7 @@ pub fn format_sparql_table_from_result(
                     .collect()
             })
     } else {
-        result.output.select_vars_or_empty().to_vec()
+        result.output.projected_vars_or_empty().to_vec()
     };
 
     // Match SPARQL JSON head var behavior: strip '?' and sort lexicographically.

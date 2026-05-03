@@ -128,7 +128,7 @@ fn detect_star_const_numeric_label_order_limit(
     query: &Query,
     options: &QueryOptions,
 ) -> Option<StarConstOrderTopKSpec> {
-    if query.output.select_vars().is_none() {
+    if query.output.projected_vars().is_none() {
         return None;
     }
     if !options.distinct
@@ -154,7 +154,7 @@ fn detect_star_const_numeric_label_order_limit(
     let label_var = ob.var;
 
     // Must select exactly (?s, ?label) in any order.
-    let select_vars = query.output.select_vars()?;
+    let select_vars = query.output.projected_vars()?;
     if select_vars.len() != 2 || !select_vars.contains(&label_var) {
         return None;
     }
@@ -312,7 +312,7 @@ struct LabelRegexTypeSpec {
 /// `?s rdfs:label ?label . ?s rdf:type <Class> . FILTER regex(?label, "pat"[, "flags"])`
 /// with plain SELECT of exactly `(?s, ?label)` (no ORDER BY/LIMIT/DISTINCT).
 fn detect_label_regex_type(query: &Query, options: &QueryOptions) -> Option<LabelRegexTypeSpec> {
-    if query.output.select_vars().is_none() {
+    if query.output.projected_vars().is_none() {
         return None;
     }
     if options.distinct
@@ -327,7 +327,7 @@ fn detect_label_regex_type(query: &Query, options: &QueryOptions) -> Option<Labe
         return None;
     }
 
-    let select = query.output.select_vars()?;
+    let select = query.output.projected_vars()?;
     if select.len() != 2 {
         return None;
     }
@@ -441,7 +441,7 @@ fn extract_regex_const_pattern(
 /// - LIMIT >= 1 (or no limit)
 /// - SELECT vars == `[agg.output_var]`
 pub(crate) fn detect_count_all_aggregate(query: &Query, options: &QueryOptions) -> Option<VarId> {
-    if query.output.select_vars().is_none() {
+    if query.output.projected_vars().is_none() {
         return None;
     }
     if !options.group_by.is_empty()
@@ -461,7 +461,7 @@ pub(crate) fn detect_count_all_aggregate(query: &Query, options: &QueryOptions) 
     if options.limit == Some(0) {
         return None;
     }
-    let select_vars = query.output.select_vars()?;
+    let select_vars = query.output.projected_vars()?;
     if select_vars.len() != 1 || select_vars[0] != agg.output_var {
         return None;
     }
@@ -480,7 +480,7 @@ fn detect_count_distinct_aggregate(
     query: &Query,
     options: &QueryOptions,
 ) -> Option<(VarId, VarId)> {
-    if query.output.select_vars().is_none() {
+    if query.output.projected_vars().is_none() {
         return None;
     }
     if !options.group_by.is_empty()
@@ -501,7 +501,7 @@ fn detect_count_distinct_aggregate(
     if options.limit == Some(0) {
         return None;
     }
-    let select_vars = query.output.select_vars()?;
+    let select_vars = query.output.projected_vars()?;
     if select_vars.len() != 1 || select_vars[0] != agg.output_var {
         return None;
     }
@@ -513,7 +513,7 @@ fn detect_count_distinct_aggregate(
 /// Returns `Some((input_var, output_var))` where `input_var` is `None` for `COUNT(*)`.
 /// Same standard constraints as [`detect_count_all_aggregate`].
 fn detect_count_aggregate(query: &Query, options: &QueryOptions) -> Option<(Option<VarId>, VarId)> {
-    if query.output.select_vars().is_none() {
+    if query.output.projected_vars().is_none() {
         return None;
     }
     if !options.group_by.is_empty()
@@ -543,7 +543,7 @@ fn detect_count_aggregate(query: &Query, options: &QueryOptions) -> Option<(Opti
     if options.limit == Some(0) {
         return None;
     }
-    let select_vars = query.output.select_vars()?;
+    let select_vars = query.output.projected_vars()?;
     if select_vars.len() != 1 || select_vars[0] != agg.output_var {
         return None;
     }
@@ -659,11 +659,11 @@ fn detect_group_by_object_star_topk(
     Option<VarId>,
     usize,
 )> {
-    if query.output.select_vars().is_none() {
+    if query.output.projected_vars().is_none() {
         return None;
     }
     let select_vars: Arc<[VarId]> =
-        Arc::from(query.output.select_vars()?.to_vec().into_boxed_slice());
+        Arc::from(query.output.projected_vars()?.to_vec().into_boxed_slice());
     if options.group_by.len() != 1 {
         return None;
     }
@@ -804,7 +804,7 @@ fn detect_sum_strlen_group_concat_subquery(
 ) -> Option<(Ref, Arc<str>, VarId)> {
     use crate::ir::{Expression, Function, Pattern};
 
-    if query.output.select_vars().is_none() {
+    if query.output.projected_vars().is_none() {
         return None;
     }
     if !options.group_by.is_empty() {
@@ -903,7 +903,7 @@ fn detect_sum_strlen_group_concat_subquery(
     }
 
     // SELECT must be exactly the aggregate output var.
-    let select_vars = query.output.select_vars()?;
+    let select_vars = query.output.projected_vars()?;
     if select_vars.len() != 1 || select_vars[0] != outer_agg.output_var {
         return None;
     }
@@ -1044,7 +1044,7 @@ fn detect_predicate_minmax_string(
     query: &Query,
     options: &QueryOptions,
 ) -> Option<(Ref, MinMaxMode, VarId)> {
-    if query.output.select_vars().is_none() {
+    if query.output.projected_vars().is_none() {
         return None;
     }
     // Must be single aggregate, no grouping/having/binds/etc.
@@ -1085,7 +1085,7 @@ fn detect_predicate_minmax_string(
     }
 
     // SELECT must be exactly the aggregate output var.
-    let select_vars = query.output.select_vars()?;
+    let select_vars = query.output.projected_vars()?;
     if select_vars.len() != 1 || select_vars[0] != agg.output_var {
         return None;
     }
@@ -1094,7 +1094,7 @@ fn detect_predicate_minmax_string(
 }
 
 fn detect_predicate_avg_numeric(query: &Query, options: &QueryOptions) -> Option<(Ref, VarId)> {
-    if query.output.select_vars().is_none() {
+    if query.output.projected_vars().is_none() {
         return None;
     }
     if !options.group_by.is_empty()
@@ -1118,7 +1118,7 @@ fn detect_predicate_avg_numeric(query: &Query, options: &QueryOptions) -> Option
     if agg.distinct || !matches!(agg.function, AggregateFn::Avg) || agg.input_var? != o_var {
         return None;
     }
-    let select_vars = query.output.select_vars()?;
+    let select_vars = query.output.projected_vars()?;
     if select_vars.len() != 1 || select_vars[0] != agg.output_var {
         return None;
     }
@@ -1133,7 +1133,7 @@ fn detect_count_rows_with_encoded_filters(
     Vec<crate::ir::Expression>,
     VarId,
 )> {
-    if query.output.select_vars().is_none() {
+    if query.output.projected_vars().is_none() {
         return None;
     }
 
@@ -1243,7 +1243,7 @@ fn detect_count_rows_with_encoded_filters(
     }
 
     // SELECT must be exactly the count output var.
-    let select_vars = query.output.select_vars()?;
+    let select_vars = query.output.projected_vars()?;
     if select_vars.len() != 1 || select_vars[0] != agg.output_var {
         return None;
     }
@@ -1259,7 +1259,7 @@ fn detect_predicate_count_rows_numeric_compare(
     query: &Query,
     options: &QueryOptions,
 ) -> Option<(Ref, NumericCompareOp, fluree_db_core::FlakeValue, VarId)> {
-    if query.output.select_vars().is_none() {
+    if query.output.projected_vars().is_none() {
         return None;
     }
     if !options.group_by.is_empty()
@@ -1297,7 +1297,7 @@ fn detect_predicate_count_rows_numeric_compare(
         return None;
     }
 
-    let select_vars = query.output.select_vars()?;
+    let select_vars = query.output.projected_vars()?;
     if select_vars.len() != 1 || select_vars[0] != agg.output_var {
         return None;
     }
@@ -1331,7 +1331,7 @@ fn detect_string_prefix_sum_strstarts(
 ) -> Option<(Ref, Arc<str>, VarId)> {
     use crate::ir::{Expression, FilterValue, Function};
 
-    if query.output.select_vars().is_none() {
+    if query.output.projected_vars().is_none() {
         return None;
     }
     if !options.group_by.is_empty()
@@ -1352,7 +1352,7 @@ fn detect_string_prefix_sum_strstarts(
     if agg.distinct || !matches!(agg.function, AggregateFn::Sum) {
         return None;
     }
-    let select_vars = query.output.select_vars()?;
+    let select_vars = query.output.projected_vars()?;
     if select_vars.len() != 1 || select_vars[0] != agg.output_var {
         return None;
     }
@@ -1545,7 +1545,7 @@ fn detect_fused_scan_sum_i64(
     query: &Query,
     options: &QueryOptions,
 ) -> Option<(Ref, SumExprI64, VarId)> {
-    if query.output.select_vars().is_none() {
+    if query.output.projected_vars().is_none() {
         return None;
     }
     // Must be single aggregate, no grouping/having/binds/etc.
@@ -1566,7 +1566,7 @@ fn detect_fused_scan_sum_i64(
     }
 
     // SELECT must be exactly the aggregate output var.
-    let select_vars = query.output.select_vars()?;
+    let select_vars = query.output.projected_vars()?;
     let agg = &options.aggregates[0];
     if select_vars.len() != 1 || select_vars[0] != agg.output_var {
         return None;
@@ -2607,7 +2607,7 @@ fn build_operator_tree_inner(
             }
 
             // PROJECT
-            if let Some(vars) = query.output.select_vars() {
+            if let Some(vars) = query.output.projected_vars() {
                 if !vars.is_empty() {
                     operator = Box::new(ProjectOperator::new(operator, vars.to_vec()));
                 }
@@ -2653,7 +2653,7 @@ fn build_operator_tree_inner(
                 }
 
                 // PROJECT (select specific columns)
-                if let Some(vars) = query.output.select_vars() {
+                if let Some(vars) = query.output.projected_vars() {
                     if !vars.is_empty() {
                         operator = Box::new(ProjectOperator::new(operator, vars.to_vec()));
                     }
@@ -2801,7 +2801,7 @@ fn build_operator_tree_inner(
         // If the SELECT projects any *grouped* variables (non-key, non-aggregate),
         // we must use the traditional GroupByOperator path so those vars become
         // `Binding::Grouped(Vec<Binding>)` and remain selectable.
-        let select_needs_grouped_vars = query.output.select_vars().is_some_and(|vars| {
+        let select_needs_grouped_vars = query.output.projected_vars().is_some_and(|vars| {
             vars.iter().any(|v| {
                 !options.group_by.contains(v)
                     && !options.aggregates.iter().any(|a| a.output_var == *v)
@@ -2897,7 +2897,7 @@ fn build_operator_tree_inner(
     // size (and allow top-k truncation) while preserving semantics:
     // duplicates eliminated by DISTINCT have identical sort keys, so removing
     // them before sorting does not change the ordered set of unique solutions.
-    let select_vars_opt: Option<Vec<VarId>> = query.output.select_vars();
+    let select_vars_opt: Option<Vec<VarId>> = query.output.projected_vars();
     let can_project_distinct_before_sort = options.distinct
         && !options.order_by.is_empty()
         && select_vars_opt.as_ref().is_some_and(|vars| {
@@ -3051,7 +3051,7 @@ mod tests {
         let output = if select.is_empty() {
             QueryOutput::wildcard()
         } else {
-            QueryOutput::select(select)
+            QueryOutput::select_vars(select)
         };
         Query {
             context: ParsedContext::default(),
@@ -3100,7 +3100,7 @@ mod tests {
         let query = Query {
             context: ParsedContext::default(),
             orig_context: None,
-            output: QueryOutput::select(vec![s, label]),
+            output: QueryOutput::select_vars(vec![s, label]),
             patterns,
             options: QueryOptions::default(),
             post_values: None,
@@ -3126,7 +3126,7 @@ mod tests {
         let query = Query {
             context: ParsedContext::default(),
             orig_context: None,
-            output: QueryOutput::select(vec![VarId(99)]), // Variable not in pattern
+            output: QueryOutput::select_vars(vec![VarId(99)]), // Variable not in pattern
             patterns: vec![Pattern::Triple(make_pattern(VarId(0), "name", VarId(1)))],
             options: QueryOptions::default(),
             post_values: None,
@@ -3149,7 +3149,7 @@ mod tests {
         let query = Query {
             context: ParsedContext::default(),
             orig_context: None,
-            output: QueryOutput::select(vec![VarId(0)]),
+            output: QueryOutput::select_vars(vec![VarId(0)]),
             patterns: vec![Pattern::Triple(make_pattern(VarId(0), "name", VarId(1)))],
             options: QueryOptions::default(),
             post_values: None,
@@ -3197,7 +3197,7 @@ mod tests {
         let counted_first = Query {
             context: ParsedContext::default(),
             orig_context: None,
-            output: QueryOutput::select(vec![out]),
+            output: QueryOutput::select_vars(vec![out]),
             patterns: vec![
                 Pattern::Triple(TriplePattern::new(
                     Ref::Var(s),
@@ -3216,7 +3216,7 @@ mod tests {
         let reversed = Query {
             context: ParsedContext::default(),
             orig_context: None,
-            output: QueryOutput::select(vec![out]),
+            output: QueryOutput::select_vars(vec![out]),
             patterns: vec![
                 Pattern::Triple(TriplePattern::new(
                     Ref::Var(s),

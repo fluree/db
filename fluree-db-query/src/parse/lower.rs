@@ -1696,7 +1696,7 @@ mod tests {
 
         let query = lower_query(ast, &encoder, &mut vars, SelectMode::Many).unwrap();
 
-        assert_eq!(query.output.select_vars().unwrap().len(), 2);
+        assert_eq!(query.output.projected_vars().unwrap().len(), 2);
         assert_eq!(query.patterns.len(), 1);
         assert_eq!(vars.len(), 2);
         assert!(matches!(query.output, QueryOutput::Select { .. }));

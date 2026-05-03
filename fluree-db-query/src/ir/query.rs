@@ -77,15 +77,16 @@ pub enum QueryOutput {
 impl QueryOutput {
     /// Construct a `Select` from a variable list (Tuple projection,
     /// `All` multiplicity). Used by SPARQL lowering and fixtures.
-    pub fn select(vars: Vec<VarId>) -> Self {
+    pub fn select_vars(vars: Vec<VarId>) -> Self {
         Self::Select {
             projection: Projection::Tuple(vars.into_iter().map(Column::Var).collect()),
             multiplicity: Multiplicity::All,
         }
     }
 
-    /// Construct a `Select` with `One` multiplicity (`selectOne`).
-    pub fn select_one(vars: Vec<VarId>) -> Self {
+    /// Construct a `Select` from a variable list with `One` multiplicity
+    /// (`selectOne`).
+    pub fn select_one_var(vars: Vec<VarId>) -> Self {
         Self::Select {
             projection: Projection::Tuple(vars.into_iter().map(Column::Var).collect()),
             multiplicity: Multiplicity::One,
@@ -125,13 +126,13 @@ impl QueryOutput {
     /// Bound variables of the projection in column order.
     /// `None` when projection trimming is not applicable (Wildcard,
     /// Construct, Boolean).
-    pub fn select_vars(&self) -> Option<Vec<VarId>> {
+    pub fn projected_vars(&self) -> Option<Vec<VarId>> {
         self.projection()?.bound_vars()
     }
 
     /// Bound select variables, or an empty `Vec` for non-Select outputs.
-    pub fn select_vars_or_empty(&self) -> Vec<VarId> {
-        self.select_vars().unwrap_or_default()
+    pub fn projected_vars_or_empty(&self) -> Vec<VarId> {
+        self.projected_vars().unwrap_or_default()
     }
 
     /// Returns `true` iff rows should be flattened from `[v]` to `v` at

@@ -26,7 +26,7 @@ pub fn format(
     let select_vars = if result.output.is_wildcard() {
         None
     } else {
-        Some(result.output.select_vars_or_empty())
+        Some(result.output.projected_vars_or_empty())
     };
     let select_vars = select_vars.as_deref();
 
