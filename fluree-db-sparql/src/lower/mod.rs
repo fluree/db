@@ -239,7 +239,7 @@ impl<'a, E: IriEncoder> LoweringContext<'a, E> {
                 // the `select`/`select_one` helpers).
                 let output = match &select_query.select.variables {
                     SelectVariables::Star => QueryOutput::wildcard(),
-                    _ => QueryOutput::select_vars(select),
+                    _ => QueryOutput::select_all(select),
                 };
 
                 Ok(Query {

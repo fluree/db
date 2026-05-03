@@ -143,7 +143,7 @@ mod tests {
         let query = Query {
             context: ParsedContext::default(),
             orig_context: None,
-            output: QueryOutput::select_vars(vec![VarId(99)]), // Variable not in pattern
+            output: QueryOutput::select_all(vec![VarId(99)]), // Variable not in pattern
             patterns: vec![Pattern::Triple(make_pattern(VarId(0), "name", VarId(1)))],
             options: QueryOptions::default(),
             post_values: None,
@@ -166,7 +166,7 @@ mod tests {
         let query = Query {
             context: ParsedContext::default(),
             orig_context: None,
-            output: QueryOutput::select_vars(vec![VarId(0)]),
+            output: QueryOutput::select_all(vec![VarId(0)]),
             patterns: vec![Pattern::Triple(make_pattern(VarId(0), "name", VarId(1)))],
             options: QueryOptions::default(),
             post_values: None,

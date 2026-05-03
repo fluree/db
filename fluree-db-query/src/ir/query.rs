@@ -77,7 +77,7 @@ pub enum QueryOutput {
 impl QueryOutput {
     /// Construct a `Select` from a variable list (Tuple projection,
     /// `All` multiplicity). Used by SPARQL lowering and fixtures.
-    pub fn select_vars(vars: Vec<VarId>) -> Self {
+    pub fn select_all(vars: Vec<VarId>) -> Self {
         Self::Select {
             projection: Projection::Tuple(vars.into_iter().map(Column::Var).collect()),
             multiplicity: Multiplicity::All,
@@ -86,7 +86,7 @@ impl QueryOutput {
 
     /// Construct a `Select` from a variable list with `One` multiplicity
     /// (`selectOne`).
-    pub fn select_one_var(vars: Vec<VarId>) -> Self {
+    pub fn select_one(vars: Vec<VarId>) -> Self {
         Self::Select {
             projection: Projection::Tuple(vars.into_iter().map(Column::Var).collect()),
             multiplicity: Multiplicity::One,

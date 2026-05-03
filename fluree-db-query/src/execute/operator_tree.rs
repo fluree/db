@@ -3051,7 +3051,7 @@ mod tests {
         let output = if select.is_empty() {
             QueryOutput::wildcard()
         } else {
-            QueryOutput::select_vars(select)
+            QueryOutput::select_all(select)
         };
         Query {
             context: ParsedContext::default(),
@@ -3100,7 +3100,7 @@ mod tests {
         let query = Query {
             context: ParsedContext::default(),
             orig_context: None,
-            output: QueryOutput::select_vars(vec![s, label]),
+            output: QueryOutput::select_all(vec![s, label]),
             patterns,
             options: QueryOptions::default(),
             post_values: None,
@@ -3126,7 +3126,7 @@ mod tests {
         let query = Query {
             context: ParsedContext::default(),
             orig_context: None,
-            output: QueryOutput::select_vars(vec![VarId(99)]), // Variable not in pattern
+            output: QueryOutput::select_all(vec![VarId(99)]), // Variable not in pattern
             patterns: vec![Pattern::Triple(make_pattern(VarId(0), "name", VarId(1)))],
             options: QueryOptions::default(),
             post_values: None,
@@ -3149,7 +3149,7 @@ mod tests {
         let query = Query {
             context: ParsedContext::default(),
             orig_context: None,
-            output: QueryOutput::select_vars(vec![VarId(0)]),
+            output: QueryOutput::select_all(vec![VarId(0)]),
             patterns: vec![Pattern::Triple(make_pattern(VarId(0), "name", VarId(1)))],
             options: QueryOptions::default(),
             post_values: None,
@@ -3197,7 +3197,7 @@ mod tests {
         let counted_first = Query {
             context: ParsedContext::default(),
             orig_context: None,
-            output: QueryOutput::select_vars(vec![out]),
+            output: QueryOutput::select_all(vec![out]),
             patterns: vec![
                 Pattern::Triple(TriplePattern::new(
                     Ref::Var(s),
@@ -3216,7 +3216,7 @@ mod tests {
         let reversed = Query {
             context: ParsedContext::default(),
             orig_context: None,
-            output: QueryOutput::select_vars(vec![out]),
+            output: QueryOutput::select_all(vec![out]),
             patterns: vec![
                 Pattern::Triple(TriplePattern::new(
                     Ref::Var(s),

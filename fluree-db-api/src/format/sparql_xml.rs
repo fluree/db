@@ -355,7 +355,7 @@ mod tests {
             novelty: None,
             context: fluree_graph_json_ld::ParsedContext::default(),
             orig_context: None,
-            output: fluree_db_query::ir::QueryOutput::select_vars(vec![]),
+            output: fluree_db_query::ir::QueryOutput::select_all(vec![]),
             batches: vec![],
             binary_graph: None,
         }
@@ -379,7 +379,7 @@ mod tests {
         let mut result = make_test_result();
 
         let s_var = result.vars.get_or_insert("?s");
-        result.output = fluree_db_query::ir::QueryOutput::select_vars(vec![s_var]);
+        result.output = fluree_db_query::ir::QueryOutput::select_all(vec![s_var]);
 
         let schema = std::sync::Arc::from(vec![s_var].into_boxed_slice());
         let sid = Sid::new(100, "alice");

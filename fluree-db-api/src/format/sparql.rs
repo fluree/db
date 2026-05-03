@@ -462,7 +462,7 @@ mod tests {
             novelty: None,
             context: crate::ParsedContext::default(),
             orig_context: None,
-            output: crate::QueryOutput::select_vars(vec![]),
+            output: crate::QueryOutput::select_all(vec![]),
             batches: vec![],
             binary_graph: None,
         }

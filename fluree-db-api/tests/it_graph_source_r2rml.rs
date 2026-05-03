@@ -444,7 +444,7 @@ async fn e2e_r2rml_query_iceberg_table() {
 
     let mut parsed = Query::new(ParsedContext::default());
     parsed.patterns = vec![graph_pattern];
-    parsed.output = QueryOutput::select_vars(vec![airline_var, name_var, country_var]);
+    parsed.output = QueryOutput::select_all(vec![airline_var, name_var, country_var]);
 
     let executable = ExecutableQuery::simple(parsed);
     let tracker = Tracker::disabled();
@@ -1092,7 +1092,7 @@ async fn engine_e2e_graph_pattern_r2rml_scan() {
     // Build Query with this pattern
     let mut parsed = Query::new(ParsedContext::default());
     parsed.patterns = vec![graph_pattern];
-    parsed.output = QueryOutput::select_vars(vec![subject_var, name_var]);
+    parsed.output = QueryOutput::select_all(vec![subject_var, name_var]);
 
     let executable = ExecutableQuery::simple(parsed);
     let tracker = Tracker::disabled();
@@ -1208,7 +1208,7 @@ async fn engine_e2e_provider_method_calls() {
 
     let mut parsed = Query::new(ParsedContext::default());
     parsed.patterns = vec![graph_pattern];
-    parsed.output = QueryOutput::select_vars(vec![subject_var]);
+    parsed.output = QueryOutput::select_all(vec![subject_var]);
 
     let executable = ExecutableQuery::simple(parsed);
     let tracker = Tracker::disabled();
@@ -1841,7 +1841,7 @@ async fn engine_e2e_ref_object_map_join_execution() {
 
     let mut parsed = Query::new(ParsedContext::default());
     parsed.patterns = vec![graph_pattern];
-    parsed.output = QueryOutput::select_vars(vec![route_var, airline_var]);
+    parsed.output = QueryOutput::select_all(vec![route_var, airline_var]);
 
     let executable = ExecutableQuery::simple(parsed);
     let tracker = Tracker::disabled();

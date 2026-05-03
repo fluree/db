@@ -36,7 +36,7 @@ fn make_query(select: Vec<VarId>, patterns: Vec<Pattern>) -> Query {
     let output = if select.is_empty() {
         QueryOutput::wildcard()
     } else {
-        QueryOutput::select_vars(select)
+        QueryOutput::select_all(select)
     };
     Query {
         context: ParsedContext::default(),
