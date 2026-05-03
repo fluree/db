@@ -177,20 +177,18 @@ fn parse_query_ast_internal(
             implied_distinct = true;
             (select_distinct, SelectMode::Many)
         } else if let Some(select) = obj.get("select") {
-            // Check for wildcard select
-            if select.as_str() == Some("*") {
-                (select, SelectMode::Wildcard)
-            } else {
-                (select, SelectMode::Many)
-            }
+            (select, SelectMode::Many)
         } else {
             return Err(ParseError::MissingField(
                 "select, selectOne, select-one, selectDistinct, select-distinct, construct, or ask",
             ));
         };
 
-    // Parse select clause (skip for wildcard)
-    if select_mode != SelectMode::Wildcard {
+    // Wildcard `select: "*"` lives entirely in the projection; otherwise
+    // dispatch on JSON shape.
+    if select.as_str() == Some("*") {
+        query.select = UnresolvedProjection::Wildcard;
+    } else {
         parse_select(select, &ctx, &mut query)?;
     }
 
@@ -549,15 +547,15 @@ fn parse_select(
         // Case 2, 3, 5: Array form — tuple-shaped rows of any arity.
         // (`["?x"]` → `[[v]]`, `["?x", "?y"]` → `[[v1, v2]]`, etc.)
         JsonValue::Array(arr) => {
-            // The default UnresolvedProjection is Tuple(empty); push columns in.
+            let mut columns = Vec::with_capacity(arr.len());
             for item in arr {
                 match item {
                     JsonValue::String(s) => {
-                        parse_select_string(s, query)?;
+                        columns.push(parse_select_string(s, &mut query.options.aggregates)?);
                     }
                     JsonValue::Object(map) => {
                         let spec = parse_hydration_object(map, ctx, query)?;
-                        query.add_hydration(spec);
+                        columns.push(UnresolvedColumn::Hydration(spec));
                     }
                     _ => {
                         return Err(ParseError::InvalidSelect(
@@ -566,30 +564,20 @@ fn parse_select(
                     }
                 }
             }
+            query.select = UnresolvedProjection::Tuple(columns);
         }
 
-        // Case 4: Single object form: {"?person": ["*"]}
-        // Stored as a one-column Tuple — formatters can't tell this apart
-        // from `["{"?person": ["*"]}"]`, and SPARQL has no scalar form.
+        // Case 4: Single object form: {"?person": ["*"]} — one hydration
+        // column wrapped as a Tuple (SPARQL has no scalar object form).
         JsonValue::Object(map) => {
             let spec = parse_hydration_object(map, ctx, query)?;
-            query.add_hydration(spec);
+            query.select = UnresolvedProjection::Tuple(vec![UnresolvedColumn::Hydration(spec)]);
         }
 
         // Case 1: Single string form: "?x" — bare variable, scalar shape.
         JsonValue::String(s) => {
-            // Promote the (empty) default projection to Scalar by parsing
-            // the column first and then wrapping.
-            parse_select_string(s, query)?;
-            // The string may have been an aggregate that registered a
-            // computed output var as a single Var column; either way,
-            // promote that single column into Scalar form.
-            query.select = match std::mem::take(&mut query.select) {
-                UnresolvedProjection::Tuple(mut cs) if cs.len() == 1 => {
-                    UnresolvedProjection::Scalar(cs.pop().unwrap())
-                }
-                other => other,
-            };
+            let column = parse_select_string(s, &mut query.options.aggregates)?;
+            query.select = UnresolvedProjection::Scalar(column);
         }
 
         _ => {
@@ -602,17 +590,23 @@ fn parse_select(
     Ok(())
 }
 
-/// Parse a string in the select clause
+/// Parse a string item from the select clause into a column.
 ///
-/// Handles three cases:
-/// - Wildcard: `"*"`
+/// Handles two cases:
 /// - Variable: `"?name"`
-/// - S-expression aggregate: `"(count ?x)"` or `"(as (count ?x) ?cnt)"`
-fn parse_select_string(s: &str, query: &mut UnresolvedQuery) -> Result<()> {
+/// - S-expression aggregate: `"(count ?x)"` or `"(as (count ?x) ?cnt)"` —
+///   the spec is appended to `aggregates` and the output var becomes the
+///   returned column.
+///
+/// Wildcard (`"*"`) is rejected here; it must be the entire `select` value
+/// and is handled at the top-level dispatch in `parse_query_inner`.
+fn parse_select_string(
+    s: &str,
+    aggregates: &mut Vec<ast::UnresolvedAggregateSpec>,
+) -> Result<UnresolvedColumn> {
     let trimmed = s.trim();
 
     if trimmed == "*" {
-        // Wildcard select - handled elsewhere
         return Err(ParseError::InvalidSelect(
             "wildcard '*' must be the only select item".to_string(),
         ));
@@ -621,16 +615,14 @@ fn parse_select_string(s: &str, query: &mut UnresolvedQuery) -> Result<()> {
     if trimmed.starts_with('(') {
         // S-expression: aggregate function call
         let agg_spec = parse_aggregate_sexpr(trimmed)?;
-        // Add output var to select
-        query.add_select(&agg_spec.output_var);
-        query.options.aggregates.push(agg_spec);
+        let column = UnresolvedColumn::Var(Arc::from(agg_spec.output_var.as_ref()));
+        aggregates.push(agg_spec);
+        Ok(column)
     } else {
         // Must be a variable - use validate_var_name for consistent error handling
         validate_var_name(trimmed)?;
-        query.add_select(trimmed);
+        Ok(UnresolvedColumn::Var(Arc::from(trimmed)))
     }
-
-    Ok(())
 }
 
 // SexprToken and tokenization moved to sexpr_tokenize module

@@ -35,10 +35,11 @@ use fluree_db_core::{FlakeValue, Sid};
 use fluree_graph_json_ld::ParsedContext;
 use std::sync::Arc;
 
-/// Select mode determines result shape
+/// Select mode determines result shape.
 ///
-/// This is derived from the parsed query (select vs selectOne vs construct) and controls
-/// whether the formatter returns an array, single value, or JSON-LD graph.
+/// Derived from the parsed query (select / selectOne / construct / ask).
+/// Wildcard (`select: "*"`) is not represented here — it lives entirely in
+/// the projection (`UnresolvedProjection::Wildcard`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub(crate) enum SelectMode {
     /// Normal select: return array of rows
@@ -47,12 +48,6 @@ pub(crate) enum SelectMode {
 
     /// selectOne: return first row or null
     One,
-
-    /// Wildcard (*): return all bound variables as object
-    ///
-    /// Uses `batch.schema()` to get all variables, not just select.
-    /// Omits unbound/poisoned variables from output.
-    Wildcard,
 
     /// CONSTRUCT: return JSON-LD graph `{"@context": ..., "@graph": [...]}`
     ///
@@ -110,10 +105,6 @@ pub(crate) fn lower_query<E: IriEncoder>(
         SelectMode::One => QueryOutput::Select {
             projection,
             multiplicity: Multiplicity::One,
-        },
-        SelectMode::Wildcard => QueryOutput::Select {
-            projection: Projection::Wildcard,
-            multiplicity: Multiplicity::All,
         },
         SelectMode::Construct => {
             let template = match ast.construct_template {

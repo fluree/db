@@ -121,7 +121,6 @@ mod tests {
         let output = match select_mode {
             SelectMode::Many => QueryOutput::select_vars(select),
             SelectMode::One => QueryOutput::select_one_var(select),
-            SelectMode::Wildcard => QueryOutput::wildcard(),
             SelectMode::Construct => QueryOutput::Construct(ConstructTemplate::new(Vec::new())),
             SelectMode::Boolean => QueryOutput::Boolean,
         };
@@ -135,13 +134,24 @@ mod tests {
         }
     }
 
+    fn make_wildcard_query(patterns: Vec<Pattern>) -> Query {
+        Query {
+            context: ParsedContext::default(),
+            orig_context: None,
+            output: QueryOutput::wildcard(),
+            patterns,
+            options: QueryOptions::default(),
+            post_values: None,
+        }
+    }
+
     fn make_tp(s: VarId, p: &str, o: VarId) -> TriplePattern {
         TriplePattern::new(Ref::Var(s), Ref::Sid(Sid::new(100, p)), Term::Var(o))
     }
 
     #[test]
     fn none_for_wildcard() {
-        let query = make_query(vec![], vec![], SelectMode::Wildcard);
+        let query = make_wildcard_query(vec![]);
         assert!(compute_variable_deps(&query, &QueryOptions::default()).is_none());
     }
 
