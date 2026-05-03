@@ -157,7 +157,7 @@ fn parse_query_ast_internal(
         )?;
         // LIMIT 1 for efficiency — only need to know if any solution exists
         query.options.limit = Some(1);
-        return Ok((query, SelectMode::Boolean));
+        return Ok((query, SelectMode::Ask));
     }
 
     // Determine select mode based on which key is present.

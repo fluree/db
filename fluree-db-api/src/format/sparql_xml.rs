@@ -36,7 +36,7 @@ pub fn format(
         ));
     }
 
-    if result.output.is_boolean() {
+    if result.output.is_ask() {
         let has_solution = result.batches.iter().any(|b| !b.is_empty());
         return Ok(format!(
             r#"<?xml version="1.0" encoding="UTF-8"?><sparql xmlns="{ns}"><head></head><boolean>{val}</boolean></sparql>"#,
@@ -365,7 +365,7 @@ mod tests {
     fn format_ask_true() {
         let compactor = make_test_compactor();
         let mut result = make_test_result();
-        result.output = fluree_db_query::ir::QueryOutput::Boolean;
+        result.output = fluree_db_query::ir::QueryOutput::Ask;
         result.batches = vec![Batch::single_empty()];
 
         let xml = format(&result, &compactor, &FormatterConfig::sparql_xml()).unwrap();

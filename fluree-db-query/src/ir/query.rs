@@ -71,7 +71,7 @@ pub enum QueryOutput {
     /// CONSTRUCT — template patterns instantiated with bindings.
     Construct(ConstructTemplate),
     /// ASK — boolean result.
-    Boolean,
+    Ask,
 }
 
 impl QueryOutput {
@@ -125,7 +125,7 @@ impl QueryOutput {
 
     /// Bound variables of the projection in column order.
     /// `None` when projection trimming is not applicable (Wildcard,
-    /// Construct, Boolean).
+    /// Construct, Ask).
     pub fn projected_vars(&self) -> Option<Vec<VarId>> {
         self.projection()?.bound_vars()
     }
@@ -164,9 +164,9 @@ impl QueryOutput {
         self.projection().is_some_and(Projection::is_wildcard)
     }
 
-    /// Returns `true` for `Boolean` (ASK) output.
-    pub fn is_boolean(&self) -> bool {
-        matches!(self, Self::Boolean)
+    /// Returns `true` for `Ask` output.
+    pub fn is_ask(&self) -> bool {
+        matches!(self, Self::Ask)
     }
 
     /// Returns `true` for `Construct` output.
@@ -178,12 +178,12 @@ impl QueryOutput {
     ///
     /// Returns `None` when dependency trimming is not applicable:
     /// - `Select` with `Wildcard` projection: all WHERE vars are needed
-    /// - `Boolean`: all WHERE vars needed for solvability checking
+    /// - `Ask`: all WHERE vars needed for solvability checking
     /// - `Select` with empty projection: no explicit projection
     /// - `Construct` with no template patterns
     pub fn referenced_vars(&self) -> Option<HashSet<VarId>> {
         match self {
-            QueryOutput::Boolean => None,
+            QueryOutput::Ask => None,
             QueryOutput::Select { projection, .. } => {
                 let vars = projection.bound_vars()?;
                 if vars.is_empty() {

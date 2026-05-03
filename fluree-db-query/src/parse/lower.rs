@@ -59,7 +59,7 @@ pub(crate) enum SelectMode {
     ///
     /// No variables are projected. LIMIT 1 is applied internally for efficiency.
     /// Result format: `{"head": {}, "boolean": true|false}`
-    Boolean,
+    Ask,
 }
 
 /// Lower an unresolved query to a resolved [`Query`]
@@ -113,7 +113,7 @@ pub(crate) fn lower_query<E: IriEncoder>(
             };
             QueryOutput::Construct(template)
         }
-        SelectMode::Boolean => QueryOutput::Boolean,
+        SelectMode::Ask => QueryOutput::Ask,
     };
 
     Ok(Query {

@@ -133,7 +133,7 @@ pub fn format_results(
     }
 
     // ASK queries: return boolean based on solution existence
-    if let Some(result) = format_boolean(result, config) {
+    if let Some(result) = format_ask(result, config) {
         return result;
     }
 
@@ -208,8 +208,8 @@ pub fn format_results_string(
 
 /// If this is an ASK/Boolean query, produce the result directly.
 /// Returns `None` for non-Boolean queries (caller continues to normal dispatch).
-fn format_boolean(result: &QueryResult, config: &FormatterConfig) -> Option<Result<JsonValue>> {
-    if !result.output.is_boolean() {
+fn format_ask(result: &QueryResult, config: &FormatterConfig) -> Option<Result<JsonValue>> {
+    if !result.output.is_ask() {
         return None;
     }
     let has_solution = result.batches.iter().any(|b| !b.is_empty());
@@ -276,7 +276,7 @@ pub async fn format_results_async(
     }
 
     // ASK queries: return boolean based on solution existence
-    if let Some(result) = format_boolean(result, config) {
+    if let Some(result) = format_ask(result, config) {
         return result;
     }
 
@@ -399,51 +399,51 @@ mod tests {
     }
 
     #[test]
-    fn format_boolean_returns_none_for_non_boolean() {
+    fn format_ask_returns_none_for_non_boolean() {
         let result = make_test_result();
         let config = FormatterConfig::jsonld();
-        assert!(format_boolean(&result, &config).is_none());
+        assert!(format_ask(&result, &config).is_none());
     }
 
     #[test]
-    fn format_boolean_true_sparql_json() {
+    fn format_ask_true_sparql_json() {
         let mut result = make_test_result();
-        result.output = QueryOutput::Boolean;
+        result.output = QueryOutput::Ask;
         result.batches = vec![fluree_db_query::binding::Batch::single_empty()];
 
         let config = FormatterConfig::sparql_json();
-        let output = format_boolean(&result, &config).unwrap().unwrap();
+        let output = format_ask(&result, &config).unwrap().unwrap();
         assert_eq!(output, json!({"head": {}, "boolean": true}));
     }
 
     #[test]
-    fn format_boolean_false_sparql_json() {
+    fn format_ask_false_sparql_json() {
         let mut result = make_test_result();
-        result.output = QueryOutput::Boolean;
+        result.output = QueryOutput::Ask;
 
         let config = FormatterConfig::sparql_json();
-        let output = format_boolean(&result, &config).unwrap().unwrap();
+        let output = format_ask(&result, &config).unwrap().unwrap();
         assert_eq!(output, json!({"head": {}, "boolean": false}));
     }
 
     #[test]
-    fn format_boolean_true_jsonld() {
+    fn format_ask_true_jsonld() {
         let mut result = make_test_result();
-        result.output = QueryOutput::Boolean;
+        result.output = QueryOutput::Ask;
         result.batches = vec![fluree_db_query::binding::Batch::single_empty()];
 
         let config = FormatterConfig::jsonld();
-        let output = format_boolean(&result, &config).unwrap().unwrap();
+        let output = format_ask(&result, &config).unwrap().unwrap();
         assert_eq!(output, JsonValue::Bool(true));
     }
 
     #[test]
-    fn format_boolean_false_jsonld() {
+    fn format_ask_false_jsonld() {
         let mut result = make_test_result();
-        result.output = QueryOutput::Boolean;
+        result.output = QueryOutput::Ask;
 
         let config = FormatterConfig::jsonld();
-        let output = format_boolean(&result, &config).unwrap().unwrap();
+        let output = format_ask(&result, &config).unwrap().unwrap();
         assert_eq!(output, JsonValue::Bool(false));
     }
 }

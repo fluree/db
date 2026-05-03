@@ -593,7 +593,7 @@ fn detect_predicate_group_by_object_count_topk(
 ) -> Option<(Ref, VarId, VarId, VarId, usize)> {
     if matches!(
         query.output,
-        QueryOutput::Construct(_) | QueryOutput::Boolean
+        QueryOutput::Construct(_) | QueryOutput::Ask
     ) {
         return None;
     }

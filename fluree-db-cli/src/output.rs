@@ -47,7 +47,7 @@ pub fn format_sparql_table_from_result(
     limit: Option<usize>,
 ) -> CliResult<Option<FormatOutput>> {
     // ASK queries: display boolean result directly instead of an empty table.
-    if result.output.is_boolean() {
+    if result.output.is_ask() {
         let has_solution = result.batches.iter().any(|b| !b.is_empty());
         return Ok(Some(FormatOutput {
             text: has_solution.to_string(),

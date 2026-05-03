@@ -1081,7 +1081,7 @@ mod tests {
         )
         .unwrap();
 
-        assert!(matches!(query.output, QueryOutput::Boolean));
+        assert!(matches!(query.output, QueryOutput::Ask));
         assert_eq!(query.options.limit, Some(1), "ASK should inject LIMIT 1");
         assert_eq!(query.patterns.len(), 1);
         assert!(matches!(query.patterns[0], Pattern::Triple(_)));
@@ -1095,7 +1095,7 @@ mod tests {
         )
         .unwrap();
 
-        assert!(matches!(query.output, QueryOutput::Boolean));
+        assert!(matches!(query.output, QueryOutput::Ask));
         assert_eq!(query.patterns.len(), 2);
     }
 
@@ -1107,7 +1107,7 @@ mod tests {
         )
         .unwrap();
 
-        assert!(matches!(query.output, QueryOutput::Boolean));
+        assert!(matches!(query.output, QueryOutput::Ask));
         // Patterns: Triple + Filter
         assert!(query.patterns.len() >= 2);
     }

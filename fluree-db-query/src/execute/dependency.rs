@@ -122,7 +122,7 @@ mod tests {
             SelectMode::Many => QueryOutput::select_vars(select),
             SelectMode::One => QueryOutput::select_one_var(select),
             SelectMode::Construct => QueryOutput::Construct(ConstructTemplate::new(Vec::new())),
-            SelectMode::Boolean => QueryOutput::Boolean,
+            SelectMode::Ask => QueryOutput::Ask,
         };
         Query {
             context: ParsedContext::default(),
@@ -157,7 +157,7 @@ mod tests {
 
     #[test]
     fn none_for_boolean() {
-        let query = make_query(vec![], vec![], SelectMode::Boolean);
+        let query = make_query(vec![], vec![], SelectMode::Ask);
         assert!(compute_variable_deps(&query, &QueryOptions::default()).is_none());
     }
 

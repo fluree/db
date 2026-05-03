@@ -235,7 +235,7 @@ fn reject_non_tabular(result: &QueryResult, delimiter: Delimiter) -> Result<()> 
             "{name} format not supported for CONSTRUCT queries (use JSON-LD instead)"
         )));
     }
-    if result.output.is_boolean() {
+    if result.output.is_ask() {
         return Err(FormatError::InvalidBinding(format!(
             "{name} format not supported for ASK queries (boolean result)"
         )));
