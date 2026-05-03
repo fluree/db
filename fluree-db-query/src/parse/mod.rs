@@ -47,9 +47,9 @@ pub use lower::{lower_unresolved_pattern, lower_unresolved_patterns};
 pub use policy::{JsonLdParseCtx, JsonLdParsePolicy};
 pub use where_clause::parse_where_with_counters;
 
-use crate::ir::{Expression, ProjectionShape, Query};
+use crate::ir::{Expression, Query};
 use crate::var_registry::VarRegistry;
-use ast::UnresolvedPathExpr;
+use ast::{SelectShape, UnresolvedPathExpr};
 use fluree_graph_json_ld::{parse_context, ParsedContext};
 use serde_json::Value as JsonValue;
 use std::collections::HashMap;
@@ -552,7 +552,7 @@ fn parse_select(
         JsonValue::Array(arr) => {
             // Record shape: array form always yields tuple rows, regardless of
             // how many items are inside (`["?x"]` → `[[v1],[v2]]`, not `[v1,v2]`).
-            query.select_shape = ProjectionShape::Tuple;
+            query.select_shape = SelectShape::Tuple;
             for item in arr {
                 match item {
                     JsonValue::String(s) => {
@@ -579,7 +579,7 @@ fn parse_select(
 
         // Case 1: Single string form: "?x" — bare variable, scalar shape.
         JsonValue::String(s) => {
-            query.select_shape = ProjectionShape::Scalar;
+            query.select_shape = SelectShape::Scalar;
             parse_select_string(s, query)?;
         }
 

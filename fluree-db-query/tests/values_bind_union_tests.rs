@@ -34,7 +34,7 @@ fn make_triple_pattern(s_var: VarId, p_name: &str, o_var: VarId) -> TriplePatter
 
 fn make_query(select: Vec<VarId>, patterns: Vec<Pattern>) -> Query {
     let output = if select.is_empty() {
-        QueryOutput::Wildcard
+        QueryOutput::wildcard()
     } else {
         QueryOutput::select(select)
     };

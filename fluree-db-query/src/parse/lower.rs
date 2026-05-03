@@ -4,12 +4,12 @@
 //! (with Sids and VarIds) using an IriEncoder.
 
 use super::ast::{
-    LiteralValue, UnresolvedAggregateFn, UnresolvedAggregateSpec, UnresolvedConstructTemplate,
-    UnresolvedDatatypeConstraint, UnresolvedExpression, UnresolvedHydrationSpec,
-    UnresolvedNestedSelectSpec, UnresolvedOptions, UnresolvedPathExpr, UnresolvedPattern,
-    UnresolvedQuery, UnresolvedRoot, UnresolvedSelection, UnresolvedSelectionSpec,
-    UnresolvedSortDirection, UnresolvedSortSpec, UnresolvedTerm, UnresolvedTriplePattern,
-    UnresolvedValue,
+    LiteralValue, SelectShape, UnresolvedAggregateFn, UnresolvedAggregateSpec,
+    UnresolvedConstructTemplate, UnresolvedDatatypeConstraint, UnresolvedExpression,
+    UnresolvedHydrationSpec, UnresolvedNestedSelectSpec, UnresolvedOptions, UnresolvedPathExpr,
+    UnresolvedPattern, UnresolvedQuery, UnresolvedRoot, UnresolvedSelection,
+    UnresolvedSelectionSpec, UnresolvedSortDirection, UnresolvedSortSpec, UnresolvedTerm,
+    UnresolvedTriplePattern, UnresolvedValue,
 };
 use super::encode::{IriEncoder, NoEncoder};
 use super::error::{ParseError, Result};
@@ -19,8 +19,8 @@ use crate::context::WellKnownDatatypes;
 use crate::ir::triple::{Ref, Term, TriplePattern};
 use crate::ir::QueryOptions;
 use crate::ir::{
-    ConstructTemplate, HydrationSpec, NestedSelectSpec, Query, QueryOutput, Root, Selection,
-    SelectionSpec,
+    Column, ConstructTemplate, HydrationSpec, Multiplicity, NestedSelectSpec, Projection, Query,
+    QueryOutput, Root, SelectionSpec,
 };
 use crate::ir::{
     Expression, Function, IndexSearchPattern, IndexSearchTarget, PathModifier, Pattern,
@@ -87,8 +87,8 @@ pub(crate) fn lower_query<E: IriEncoder>(
 ) -> Result<Query> {
     let mut pp_counter: u32 = 0;
 
-    // Lower selections (variables and any hydration)
-    let selections: Vec<Selection> = ast
+    // Lower columns (variables and any hydration)
+    let columns: Vec<Column> = ast
         .select
         .iter()
         .map(|sel| lower_selection(sel, encoder, vars))
@@ -106,11 +106,19 @@ pub(crate) fn lower_query<E: IriEncoder>(
     let options = lower_options(&ast.options, vars)?;
 
     // Build QueryOutput from mode + lowered components
-    let shape = ast.select_shape;
     let output = match select_mode {
-        SelectMode::Many => QueryOutput::Select { selections, shape },
-        SelectMode::One => QueryOutput::SelectOne { selections, shape },
-        SelectMode::Wildcard => QueryOutput::Wildcard,
+        SelectMode::Many => QueryOutput::Select {
+            projection: build_projection(columns, ast.select_shape),
+            multiplicity: Multiplicity::All,
+        },
+        SelectMode::One => QueryOutput::Select {
+            projection: build_projection(columns, ast.select_shape),
+            multiplicity: Multiplicity::One,
+        },
+        SelectMode::Wildcard => QueryOutput::Select {
+            projection: Projection::Wildcard,
+            multiplicity: Multiplicity::All,
+        },
         SelectMode::Construct => {
             let template = match ast.construct_template {
                 Some(ref t) => lower_construct_template(t, encoder, vars)?,
@@ -135,12 +143,27 @@ fn lower_selection<E: IriEncoder>(
     sel: &UnresolvedSelection,
     encoder: &E,
     vars: &mut VarRegistry,
-) -> Result<Selection> {
+) -> Result<Column> {
     match sel {
-        UnresolvedSelection::Var(name) => Ok(Selection::Var(vars.get_or_insert(name))),
+        UnresolvedSelection::Var(name) => Ok(Column::Var(vars.get_or_insert(name))),
         UnresolvedSelection::Hydration(spec) => {
-            Ok(Selection::Hydration(lower_hydration(spec, encoder, vars)?))
+            Ok(Column::Hydration(lower_hydration(spec, encoder, vars)?))
         }
+    }
+}
+
+/// Build the appropriate `Projection` variant from lowered columns and the
+/// user-declared shape from the input syntax (`Tuple` for array form,
+/// `Scalar` for bare-string form).
+fn build_projection(columns: Vec<Column>, shape: SelectShape) -> Projection {
+    match shape {
+        SelectShape::Scalar if columns.len() == 1 => {
+            Projection::Scalar(columns.into_iter().next().unwrap())
+        }
+        // Multi-column scalar is unrepresentable; the parser only sets
+        // Scalar for bare-string `select: "?x"` so this branch is just a
+        // safety net — fall through to Tuple.
+        _ => Projection::Tuple(columns),
     }
 }
 

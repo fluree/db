@@ -128,10 +128,7 @@ fn detect_star_const_numeric_label_order_limit(
     query: &Query,
     options: &QueryOptions,
 ) -> Option<StarConstOrderTopKSpec> {
-    if matches!(
-        query.output,
-        QueryOutput::Construct(_) | QueryOutput::Boolean | QueryOutput::Wildcard
-    ) {
+    if query.output.select_vars().is_none() {
         return None;
     }
     if !options.distinct
@@ -315,10 +312,7 @@ struct LabelRegexTypeSpec {
 /// `?s rdfs:label ?label . ?s rdf:type <Class> . FILTER regex(?label, "pat"[, "flags"])`
 /// with plain SELECT of exactly `(?s, ?label)` (no ORDER BY/LIMIT/DISTINCT).
 fn detect_label_regex_type(query: &Query, options: &QueryOptions) -> Option<LabelRegexTypeSpec> {
-    if matches!(
-        query.output,
-        QueryOutput::Construct(_) | QueryOutput::Boolean | QueryOutput::Wildcard
-    ) {
+    if query.output.select_vars().is_none() {
         return None;
     }
     if options.distinct
@@ -447,10 +441,7 @@ fn extract_regex_const_pattern(
 /// - LIMIT >= 1 (or no limit)
 /// - SELECT vars == `[agg.output_var]`
 pub(crate) fn detect_count_all_aggregate(query: &Query, options: &QueryOptions) -> Option<VarId> {
-    if matches!(
-        query.output,
-        QueryOutput::Construct(_) | QueryOutput::Boolean | QueryOutput::Wildcard
-    ) {
+    if query.output.select_vars().is_none() {
         return None;
     }
     if !options.group_by.is_empty()
@@ -489,10 +480,7 @@ fn detect_count_distinct_aggregate(
     query: &Query,
     options: &QueryOptions,
 ) -> Option<(VarId, VarId)> {
-    if matches!(
-        query.output,
-        QueryOutput::Construct(_) | QueryOutput::Boolean | QueryOutput::Wildcard
-    ) {
+    if query.output.select_vars().is_none() {
         return None;
     }
     if !options.group_by.is_empty()
@@ -525,10 +513,7 @@ fn detect_count_distinct_aggregate(
 /// Returns `Some((input_var, output_var))` where `input_var` is `None` for `COUNT(*)`.
 /// Same standard constraints as [`detect_count_all_aggregate`].
 fn detect_count_aggregate(query: &Query, options: &QueryOptions) -> Option<(Option<VarId>, VarId)> {
-    if matches!(
-        query.output,
-        QueryOutput::Construct(_) | QueryOutput::Boolean | QueryOutput::Wildcard
-    ) {
+    if query.output.select_vars().is_none() {
         return None;
     }
     if !options.group_by.is_empty()
@@ -674,10 +659,7 @@ fn detect_group_by_object_star_topk(
     Option<VarId>,
     usize,
 )> {
-    if matches!(
-        query.output,
-        QueryOutput::Construct(_) | QueryOutput::Boolean | QueryOutput::Wildcard
-    ) {
+    if query.output.select_vars().is_none() {
         return None;
     }
     let select_vars: Arc<[VarId]> =
@@ -822,10 +804,7 @@ fn detect_sum_strlen_group_concat_subquery(
 ) -> Option<(Ref, Arc<str>, VarId)> {
     use crate::ir::{Expression, Function, Pattern};
 
-    if matches!(
-        query.output,
-        QueryOutput::Construct(_) | QueryOutput::Boolean | QueryOutput::Wildcard
-    ) {
+    if query.output.select_vars().is_none() {
         return None;
     }
     if !options.group_by.is_empty() {
@@ -1065,10 +1044,7 @@ fn detect_predicate_minmax_string(
     query: &Query,
     options: &QueryOptions,
 ) -> Option<(Ref, MinMaxMode, VarId)> {
-    if matches!(
-        query.output,
-        QueryOutput::Construct(_) | QueryOutput::Boolean | QueryOutput::Wildcard
-    ) {
+    if query.output.select_vars().is_none() {
         return None;
     }
     // Must be single aggregate, no grouping/having/binds/etc.
@@ -1118,10 +1094,7 @@ fn detect_predicate_minmax_string(
 }
 
 fn detect_predicate_avg_numeric(query: &Query, options: &QueryOptions) -> Option<(Ref, VarId)> {
-    if matches!(
-        query.output,
-        QueryOutput::Construct(_) | QueryOutput::Boolean | QueryOutput::Wildcard
-    ) {
+    if query.output.select_vars().is_none() {
         return None;
     }
     if !options.group_by.is_empty()
@@ -1160,10 +1133,7 @@ fn detect_count_rows_with_encoded_filters(
     Vec<crate::ir::Expression>,
     VarId,
 )> {
-    if matches!(
-        query.output,
-        QueryOutput::Construct(_) | QueryOutput::Boolean | QueryOutput::Wildcard
-    ) {
+    if query.output.select_vars().is_none() {
         return None;
     }
 
@@ -1289,10 +1259,7 @@ fn detect_predicate_count_rows_numeric_compare(
     query: &Query,
     options: &QueryOptions,
 ) -> Option<(Ref, NumericCompareOp, fluree_db_core::FlakeValue, VarId)> {
-    if matches!(
-        query.output,
-        QueryOutput::Construct(_) | QueryOutput::Boolean | QueryOutput::Wildcard
-    ) {
+    if query.output.select_vars().is_none() {
         return None;
     }
     if !options.group_by.is_empty()
@@ -1364,10 +1331,7 @@ fn detect_string_prefix_sum_strstarts(
 ) -> Option<(Ref, Arc<str>, VarId)> {
     use crate::ir::{Expression, FilterValue, Function};
 
-    if matches!(
-        query.output,
-        QueryOutput::Construct(_) | QueryOutput::Boolean | QueryOutput::Wildcard
-    ) {
+    if query.output.select_vars().is_none() {
         return None;
     }
     if !options.group_by.is_empty()
@@ -1581,10 +1545,7 @@ fn detect_fused_scan_sum_i64(
     query: &Query,
     options: &QueryOptions,
 ) -> Option<(Ref, SumExprI64, VarId)> {
-    if matches!(
-        query.output,
-        QueryOutput::Construct(_) | QueryOutput::Boolean | QueryOutput::Wildcard
-    ) {
+    if query.output.select_vars().is_none() {
         return None;
     }
     // Must be single aggregate, no grouping/having/binds/etc.
@@ -3088,7 +3049,7 @@ mod tests {
 
     fn make_simple_query(select: Vec<VarId>, patterns: Vec<Pattern>) -> Query {
         let output = if select.is_empty() {
-            QueryOutput::Wildcard
+            QueryOutput::wildcard()
         } else {
             QueryOutput::select(select)
         };

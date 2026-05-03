@@ -121,7 +121,7 @@ mod tests {
         let output = match select_mode {
             SelectMode::Many => QueryOutput::select(select),
             SelectMode::One => QueryOutput::select_one(select),
-            SelectMode::Wildcard => QueryOutput::Wildcard,
+            SelectMode::Wildcard => QueryOutput::wildcard(),
             SelectMode::Construct => QueryOutput::Construct(ConstructTemplate::new(Vec::new())),
             SelectMode::Boolean => QueryOutput::Boolean,
         };
@@ -261,13 +261,13 @@ mod tests {
 
     // ---- hydrationion tests ----
 
-    fn make_query_with_selections(selections: Vec<crate::ir::Selection>) -> Query {
+    fn make_query_with_selections(columns: Vec<crate::ir::Column>) -> Query {
         Query {
             context: ParsedContext::default(),
             orig_context: None,
             output: QueryOutput::Select {
-                selections,
-                shape: crate::ir::ProjectionShape::Tuple,
+                projection: crate::ir::Projection::Tuple(columns),
+                multiplicity: crate::ir::Multiplicity::All,
             },
             patterns: vec![],
             options: QueryOptions::default(),
@@ -280,8 +280,8 @@ mod tests {
         // SELECT ?name + hydration rooted at ?s
         // The formatter needs both ?name (var selection) and ?s (root var).
         let query = make_query_with_selections(vec![
-            crate::ir::Selection::Var(VarId(1)),
-            crate::ir::Selection::Hydration(crate::ir::HydrationSpec::new(
+            crate::ir::Column::Var(VarId(1)),
+            crate::ir::Column::Hydration(crate::ir::HydrationSpec::new(
                 crate::ir::Root::Var(VarId(0)),
                 vec![],
             )),
@@ -296,8 +296,8 @@ mod tests {
     fn hydration_root_already_in_select() {
         // Var selection ?s + hydration rooted at ?s — only ?s needed.
         let query = make_query_with_selections(vec![
-            crate::ir::Selection::Var(VarId(0)),
-            crate::ir::Selection::Hydration(crate::ir::HydrationSpec::new(
+            crate::ir::Column::Var(VarId(0)),
+            crate::ir::Column::Hydration(crate::ir::HydrationSpec::new(
                 crate::ir::Root::Var(VarId(0)),
                 vec![],
             )),
@@ -313,8 +313,8 @@ mod tests {
         // SELECT ?name + hydration rooted at an IRI constant.
         // Sid root binds no variable — only ?name needed.
         let query = make_query_with_selections(vec![
-            crate::ir::Selection::Var(VarId(1)),
-            crate::ir::Selection::Hydration(crate::ir::HydrationSpec::new(
+            crate::ir::Column::Var(VarId(1)),
+            crate::ir::Column::Hydration(crate::ir::HydrationSpec::new(
                 crate::ir::Root::Sid(Sid::new(100, "alice")),
                 vec![],
             )),

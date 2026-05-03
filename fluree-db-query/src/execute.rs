@@ -101,7 +101,7 @@ mod tests {
         let query = Query {
             context: ParsedContext::default(),
             orig_context: None,
-            output: QueryOutput::Wildcard,
+            output: QueryOutput::wildcard(),
             patterns: vec![],
             options: QueryOptions::default(),
             post_values: None,

@@ -851,7 +851,7 @@ impl UnresolvedHydrationSpec {
 
 /// One column of a SELECT/SELECT-ONE projection (unresolved).
 ///
-/// Lowered into [`crate::ir::Selection`].
+/// Lowered into [`crate::ir::Column`].
 #[derive(Debug, Clone, PartialEq)]
 pub enum UnresolvedSelection {
     /// Project a single variable's binding (e.g. `"?name"`).
@@ -1014,6 +1014,18 @@ impl UnresolvedPattern {
     }
 }
 
+/// User-declared select shape from the input syntax. Parser-only — lowered
+/// into a `Projection` variant in the IR.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SelectShape {
+    /// Array-form select: each row is a tuple. Default; SPARQL and JSON-LD
+    /// array-form `select`.
+    #[default]
+    Tuple,
+    /// Bare-string `select: "?x"`: each row is a single bare value.
+    Scalar,
+}
+
 /// Unresolved query - the result of parsing before IRI resolution
 #[derive(Debug, Clone)]
 pub struct UnresolvedQuery {
@@ -1023,13 +1035,13 @@ pub struct UnresolvedQuery {
     pub orig_context: Option<serde_json::Value>,
     /// Selections in column order (variable names and/or one hydration).
     pub select: Vec<UnresolvedSelection>,
-    /// User-declared projection shape from the input syntax.
+    /// User-declared select shape from the input syntax.
     ///
     /// `Scalar` for bare-string select (`select: "?x"`), `Tuple` otherwise
-    /// (array form, or SPARQL, which has no scalar form). Propagated into
-    /// `QueryOutput::Select` / `SelectOne` so formatters can decide rendering
-    /// without inferring from `vars.len()`.
-    pub select_shape: crate::ir::ProjectionShape,
+    /// (array form, or SPARQL, which has no scalar form). Lowered into
+    /// `Projection::Scalar` vs `Projection::Tuple` so formatters can decide
+    /// rendering without inferring from `selections.len()`.
+    pub select_shape: SelectShape,
     /// Ordered patterns in where clause (triples, filters, optionals, etc.)
     pub patterns: Vec<UnresolvedPattern>,
     /// Query options (limit, offset, order by, group by, etc.)
@@ -1045,7 +1057,7 @@ impl UnresolvedQuery {
             context,
             orig_context: None,
             select: Vec::new(),
-            select_shape: crate::ir::ProjectionShape::default(),
+            select_shape: SelectShape::default(),
             patterns: Vec::new(),
             options: UnresolvedOptions::default(),
             construct_template: None,

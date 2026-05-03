@@ -120,40 +120,98 @@ impl HydrationSpec {
     }
 }
 
-/// One column of a SELECT/SELECT-ONE projection.
+/// One column of a SELECT projection.
 ///
-/// Selections are ordered: their position determines column order in tabular
+/// Columns are ordered: their position determines column order in tabular
 /// output and JSON-LD array rendering. A single query may mix `Var` columns
-/// (raw bindings) with `Hydrate` columns (the formatter materializes the
+/// (raw bindings) with `Hydration` columns (the formatter materializes the
 /// root variable into a nested JSON-LD object).
 #[derive(Debug, Clone, PartialEq)]
-pub enum Selection {
+pub enum Column {
     /// Project a single variable's binding.
     Var(VarId),
-    /// Hydrate a subject (variable or IRI constant) into a nested JSON-LD
-    /// object. The root variable (when present) is the bound column the
-    /// formatter materializes.
+    /// Materialize a subject (variable or IRI constant) into a nested
+    /// JSON-LD object. When the spec's root is a variable, that variable
+    /// is the projected source; when it's a Sid, no variable is projected
+    /// for this column — the formatter fetches the constant directly.
     Hydration(HydrationSpec),
 }
 
-impl Selection {
-    /// Variable bound for this selection's row column, if any.
+impl Column {
+    /// Variable bound for this column's row position, if any.
     ///
-    /// `Var` returns its variable. `Hydrate` returns its root variable
-    /// (or `None` when the root is an IRI constant — that case projects no
-    /// bound row column; the formatter fetches the constant directly).
+    /// `Var` returns its variable. `Hydration` returns its root variable
+    /// (or `None` when the root is an IRI constant — that case projects
+    /// no bound row column; the formatter fetches the constant directly).
     pub fn bound_var(&self) -> Option<VarId> {
         match self {
-            Selection::Var(v) => Some(*v),
-            Selection::Hydration(spec) => spec.root_var(),
+            Column::Var(v) => Some(*v),
+            Column::Hydration(spec) => spec.root_var(),
         }
     }
 
-    /// Returns the `HydrationSpec` if this is a hydrate selection.
+    /// Returns the `HydrationSpec` if this is a hydration column.
     pub fn as_hydration(&self) -> Option<&HydrationSpec> {
         match self {
-            Selection::Hydration(spec) => Some(spec),
-            Selection::Var(_) => None,
+            Column::Hydration(spec) => Some(spec),
+            Column::Var(_) => None,
         }
+    }
+}
+
+/// The columns a SELECT query produces.
+///
+/// Carries column order for rendering; the SPARQL projection (the bound-var
+/// set) is recoverable via [`Projection::bound_vars`].
+#[derive(Debug, Clone, PartialEq)]
+pub enum Projection {
+    /// SELECT * — all in-scope WHERE-bound variables, rendered raw.
+    Wildcard,
+    /// Array-form rows: each row is `[v1, v2, ...]` of any arity.
+    Tuple(Vec<Column>),
+    /// Bare-value rows from JSON-LD `select: "?x"` — exactly one column,
+    /// each row is just the value (not wrapped in an array).
+    Scalar(Column),
+}
+
+impl Projection {
+    /// Columns in render order. Empty for `Wildcard`.
+    pub fn columns(&self) -> &[Column] {
+        match self {
+            Projection::Wildcard => &[],
+            Projection::Tuple(cs) => cs,
+            Projection::Scalar(c) => std::slice::from_ref(c),
+        }
+    }
+
+    /// Iterator over the bound variables of each column in render order.
+    pub fn var_iter(&self) -> impl Iterator<Item = VarId> + '_ {
+        self.columns().iter().filter_map(Column::bound_var)
+    }
+
+    /// SPARQL projection: variables this projection contributes to the
+    /// row schema. `None` for `Wildcard` (means "all bound WHERE vars").
+    pub fn bound_vars(&self) -> Option<Vec<VarId>> {
+        match self {
+            Projection::Wildcard => None,
+            other => Some(other.var_iter().collect()),
+        }
+    }
+
+    /// The hydration spec embedded in the projection (at most one;
+    /// enforced by the parser).
+    pub fn hydration(&self) -> Option<&HydrationSpec> {
+        self.columns().iter().find_map(Column::as_hydration)
+    }
+
+    /// Returns `true` iff rows should be flattened from `[v]` to `v` at
+    /// format time. Only fires for the bare-string `select: "?x"` form.
+    pub fn is_scalar_var(&self) -> bool {
+        matches!(self, Projection::Scalar(Column::Var(_)))
+    }
+
+    /// Returns `true` for `Wildcard`.
+    pub fn is_wildcard(&self) -> bool {
+        matches!(self, Projection::Wildcard)
     }
 }

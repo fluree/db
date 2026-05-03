@@ -238,7 +238,7 @@ impl<'a, E: IriEncoder> LoweringContext<'a, E> {
                 // of bare values. Projection shape is `Tuple` (the default of
                 // the `select`/`select_one` helpers).
                 let output = match &select_query.select.variables {
-                    SelectVariables::Star => QueryOutput::Wildcard,
+                    SelectVariables::Star => QueryOutput::wildcard(),
                     _ => QueryOutput::select(select),
                 };
 
@@ -364,8 +364,8 @@ mod tests {
         )
         .unwrap();
 
-        // SELECT * should produce Wildcard output
-        assert!(matches!(query.output, QueryOutput::Wildcard));
+        // SELECT * should produce Wildcard projection
+        assert!(query.output.is_wildcard());
     }
 
     #[test]
