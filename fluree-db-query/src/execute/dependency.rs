@@ -41,7 +41,7 @@ pub fn compute_variable_deps(query: &Query, options: &QueryOptions) -> Option<Va
     // Seed deps from the query output requirements.
     // Wildcard/Boolean return None from `variables()`, disabling trimming.
     // Selection::Hydration contributes its root variable via bound_var.
-    let mut deps: HashSet<VarId> = query.output.variables()?;
+    let mut deps: HashSet<VarId> = query.output.referenced_vars()?;
 
     // ORDER BY vars must survive to the sort operator.
     for spec in &options.order_by {

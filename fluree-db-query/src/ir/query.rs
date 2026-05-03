@@ -174,14 +174,14 @@ impl QueryOutput {
         matches!(self, Self::Construct(_))
     }
 
-    /// Variables the output depends on.
+    /// Variables this output references from the upstream solution stream.
     ///
     /// Returns `None` when dependency trimming is not applicable:
     /// - `Select` with `Wildcard` projection: all WHERE vars are needed
     /// - `Boolean`: all WHERE vars needed for solvability checking
     /// - `Select` with empty projection: no explicit projection
     /// - `Construct` with no template patterns
-    pub fn variables(&self) -> Option<HashSet<VarId>> {
+    pub fn referenced_vars(&self) -> Option<HashSet<VarId>> {
         match self {
             QueryOutput::Boolean => None,
             QueryOutput::Select { projection, .. } => {
