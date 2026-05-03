@@ -23,91 +23,122 @@ pub enum Root {
     Sid(Sid),
 }
 
-/// Nested selection specification for sub-hydrations (resolved)
+/// Selection at one level of a hydration (resolved).
 ///
-/// This type captures the full selection state for nested property expansion,
-/// including both forward and reverse properties.
+/// Wildcard-vs-explicit is encoded structurally: the Wildcard variant
+/// includes all forward properties at this level (and `@id` implicitly),
+/// optionally refined per-property; the Explicit variant lists only the
+/// chosen forward items (with `@id` membership tracked by the presence of
+/// `ForwardItem::Id`).
+type ReverseMap = std::collections::HashMap<Sid, Option<Box<NestedSelectSpec>>>;
+
 #[derive(Debug, Clone, PartialEq)]
-pub struct NestedSelectSpec {
-    /// Forward property selections
-    pub forward: Vec<SelectionSpec>,
-    /// Reverse property selections (predicate Sid → optional nested spec)
-    /// None means no sub-selections (just return @id), Some means nested hydration
-    pub reverse: std::collections::HashMap<Sid, Option<Box<NestedSelectSpec>>>,
-    /// Whether wildcard was specified at this level
-    pub has_wildcard: bool,
+pub enum NestedSelectSpec {
+    /// `*` at this level — include all forward properties (and `@id`).
+    /// `refinements` overrides the wildcard default of "include but don't
+    /// recurse" for specific properties.
+    Wildcard {
+        refinements: std::collections::HashMap<Sid, Box<NestedSelectSpec>>,
+        reverse: ReverseMap,
+    },
+    /// Explicit list of forward items. `@id` is included iff `forward`
+    /// contains `ForwardItem::Id`.
+    Explicit { forward: Vec<ForwardItem>, reverse: ReverseMap },
 }
 
 impl NestedSelectSpec {
-    /// Create a new nested select spec
-    pub fn new(
-        forward: Vec<SelectionSpec>,
-        reverse: std::collections::HashMap<Sid, Option<Box<NestedSelectSpec>>>,
-        has_wildcard: bool,
-    ) -> Self {
-        Self {
-            forward,
-            reverse,
-            has_wildcard,
+    /// Returns `true` if this level is a wildcard.
+    pub fn is_wildcard(&self) -> bool {
+        matches!(self, NestedSelectSpec::Wildcard { .. })
+    }
+
+    /// Reverse property selections at this level.
+    pub fn reverse(&self) -> &ReverseMap {
+        match self {
+            NestedSelectSpec::Wildcard { reverse, .. }
+            | NestedSelectSpec::Explicit { reverse, .. } => reverse,
         }
     }
 
-    /// Check if this spec is empty (no selections)
+    /// Returns `true` if the level produces no output (empty Explicit
+    /// selection with no reverse).
     pub fn is_empty(&self) -> bool {
-        self.forward.is_empty() && self.reverse.is_empty()
+        match self {
+            NestedSelectSpec::Wildcard { .. } => false,
+            NestedSelectSpec::Explicit { forward, reverse } => {
+                forward.is_empty() && reverse.is_empty()
+            }
+        }
+    }
+
+    /// Whether this level explicitly includes `@id`.
+    /// Wildcard always does; Explicit does iff `forward` contains `Id`.
+    pub fn includes_id(&self) -> bool {
+        match self {
+            NestedSelectSpec::Wildcard { .. } => true,
+            NestedSelectSpec::Explicit { forward, .. } => {
+                forward.iter().any(|item| matches!(item, ForwardItem::Id))
+            }
+        }
+    }
+
+    /// Resolve a forward predicate against this level.
+    ///
+    /// Returns:
+    /// - `Some(None)`: predicate is selected with no nested expansion.
+    /// - `Some(Some(&nested))`: predicate is selected with explicit nested expansion.
+    /// - `None`: predicate is not selected (only possible for `Explicit`).
+    pub fn select_predicate(&self, pred: &Sid) -> Option<Option<&NestedSelectSpec>> {
+        match self {
+            NestedSelectSpec::Wildcard { refinements, .. } => {
+                Some(refinements.get(pred).map(|b| b.as_ref()))
+            }
+            NestedSelectSpec::Explicit { forward, .. } => forward.iter().find_map(|item| match item {
+                ForwardItem::Property {
+                    predicate,
+                    sub_spec,
+                } if predicate == pred => Some(sub_spec.as_deref()),
+                _ => None,
+            }),
+        }
     }
 }
 
-/// Selection specification for expansion (resolved)
-///
-/// Defines what properties to include at each level of expansion.
+/// One forward item in an explicit (non-wildcard) selection level.
 #[derive(Debug, Clone, PartialEq)]
-pub enum SelectionSpec {
-    /// Explicit @id selection (include @id even when wildcard is not specified)
+pub enum ForwardItem {
+    /// Explicit `@id` selection.
     Id,
-    /// Wildcard - select all properties at this level
-    Wildcard,
-    /// Property selection with optional nested hydration
+    /// A specific property, with optional nested expansion of its values.
     Property {
-        /// Predicate Sid
         predicate: Sid,
-        /// Optional nested selection spec for expanding this property's values
-        /// Uses Box to avoid infinite type recursion
         sub_spec: Option<Box<NestedSelectSpec>>,
     },
 }
 
-/// Hydrationion specification (resolved, with Sids)
+/// Top-level hydration spec (resolved, with Sids).
 ///
-/// This is the resolved form of `UnresolvedHydrationSpec`, with all IRIs
-/// encoded as Sids. Used during result formatting for nested JSON-LD output.
+/// Resolves an [`UnresolvedHydrationSpec`] into IR form: IRIs encoded as
+/// `Sid`s, the root chosen, and the level of selection captured in
+/// `level`.
 #[derive(Debug, Clone, PartialEq)]
 pub struct HydrationSpec {
-    /// Root of the hydration - variable or IRI constant
+    /// Root of the hydration — variable or IRI constant.
     pub root: Root,
-    /// Forward property selections
-    pub selections: Vec<SelectionSpec>,
-    /// Reverse property selections (predicate Sid → optional nested spec)
-    /// None means no sub-selections (just return @id), Some means nested hydration
-    pub reverse: std::collections::HashMap<Sid, Option<Box<NestedSelectSpec>>>,
-    /// Max depth for auto-expansion (0 = no auto-expand)
+    /// Selection at the top level of the hydration.
+    pub level: NestedSelectSpec,
+    /// Max depth for auto-expansion (0 = no auto-expand).
     pub depth: usize,
-    /// Whether wildcard was specified (controls @id inclusion)
-    pub has_wildcard: bool,
 }
 
 impl HydrationSpec {
-    /// Create a new graph select spec
-    pub fn new(root: Root, selections: Vec<SelectionSpec>) -> Self {
-        let has_wildcard = selections
-            .iter()
-            .any(|s| matches!(s, SelectionSpec::Wildcard));
+    /// Create a hydration with the given root and top-level selection,
+    /// `depth: 0`.
+    pub fn new(root: Root, level: NestedSelectSpec) -> Self {
         Self {
             root,
-            selections,
-            reverse: std::collections::HashMap::new(),
+            level,
             depth: 0,
-            has_wildcard,
         }
     }
 

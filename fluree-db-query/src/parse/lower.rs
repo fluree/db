@@ -6,10 +6,10 @@
 use super::ast::{
     LiteralValue, UnresolvedAggregateFn, UnresolvedAggregateSpec, UnresolvedColumn,
     UnresolvedConstructTemplate, UnresolvedDatatypeConstraint, UnresolvedExpression,
-    UnresolvedHydrationSpec, UnresolvedNestedSelectSpec, UnresolvedOptions, UnresolvedPathExpr,
-    UnresolvedPattern, UnresolvedProjection, UnresolvedQuery, UnresolvedRoot,
-    UnresolvedSelectionSpec, UnresolvedSortDirection, UnresolvedSortSpec, UnresolvedTerm,
-    UnresolvedTriplePattern, UnresolvedValue,
+    UnresolvedForwardItem, UnresolvedHydrationSpec, UnresolvedNestedSelectSpec, UnresolvedOptions,
+    UnresolvedPathExpr, UnresolvedPattern, UnresolvedProjection, UnresolvedQuery, UnresolvedRoot,
+    UnresolvedSortDirection, UnresolvedSortSpec, UnresolvedTerm, UnresolvedTriplePattern,
+    UnresolvedValue,
 };
 use super::encode::{IriEncoder, NoEncoder};
 use super::error::{ParseError, Result};
@@ -19,8 +19,8 @@ use crate::context::WellKnownDatatypes;
 use crate::ir::triple::{Ref, Term, TriplePattern};
 use crate::ir::QueryOptions;
 use crate::ir::{
-    Column, ConstructTemplate, HydrationSpec, Multiplicity, NestedSelectSpec, Projection, Query,
-    QueryOutput, Root, SelectionSpec,
+    Column, ConstructTemplate, ForwardItem, HydrationSpec, Multiplicity, NestedSelectSpec,
+    Projection, Query, QueryOutput, Root,
 };
 use crate::ir::{
     Expression, Function, IndexSearchPattern, IndexSearchTarget, PathModifier, Pattern,
@@ -1126,95 +1126,102 @@ fn lower_hydration<E: IriEncoder>(
         }
     };
 
-    // Lower forward selections
-    let selections = spec
-        .selections
-        .iter()
-        .map(|s| lower_selection_spec(s, encoder))
-        .collect::<Result<Vec<_>>>()?;
-
-    // Lower reverse selections
-    let mut reverse = std::collections::HashMap::new();
-    for (iri, nested_opt) in &spec.reverse {
-        let sid = encoder
-            .encode_iri(iri)
-            .ok_or_else(|| ParseError::UnknownNamespace(iri.clone()))?;
-        let lowered_nested = nested_opt
-            .as_ref()
-            .map(|nested| lower_nested_select_spec(nested, encoder))
-            .transpose()?;
-        reverse.insert(sid, lowered_nested);
-    }
+    let level = lower_level(&spec.level, encoder)?;
 
     Ok(HydrationSpec {
         root,
-        selections,
-        reverse,
+        level,
         depth: spec.depth,
-        has_wildcard: spec.has_wildcard,
     })
 }
 
-/// Lower a single selection spec to resolved form
-fn lower_selection_spec<E: IriEncoder>(
-    spec: &UnresolvedSelectionSpec,
+/// Lower one forward item (only meaningful in `Explicit` levels).
+fn lower_forward_item<E: IriEncoder>(
+    item: &UnresolvedForwardItem,
     encoder: &E,
-) -> Result<SelectionSpec> {
-    match spec {
-        UnresolvedSelectionSpec::Id => Ok(SelectionSpec::Id),
-        UnresolvedSelectionSpec::Wildcard => Ok(SelectionSpec::Wildcard),
-        UnresolvedSelectionSpec::Property {
+) -> Result<ForwardItem> {
+    match item {
+        UnresolvedForwardItem::Id => Ok(ForwardItem::Id),
+        UnresolvedForwardItem::Property {
             predicate,
             sub_spec,
         } => {
             let sid = encoder
                 .encode_iri(predicate)
                 .ok_or_else(|| ParseError::UnknownNamespace(predicate.clone()))?;
-
-            // Lower nested spec (includes both forward and reverse)
-            let lowered_sub_spec = sub_spec
+            let lowered_sub = sub_spec
                 .as_ref()
-                .map(|nested| lower_nested_select_spec(nested, encoder))
+                .map(|nested| lower_level_boxed(nested, encoder))
                 .transpose()?;
-
-            Ok(SelectionSpec::Property {
+            Ok(ForwardItem::Property {
                 predicate: sid,
-                sub_spec: lowered_sub_spec,
+                sub_spec: lowered_sub,
             })
         }
     }
 }
 
-/// Lower a nested select spec to resolved form
-fn lower_nested_select_spec<E: IriEncoder>(
-    spec: &UnresolvedNestedSelectSpec,
+/// Lower a reverse map (`predicate IRI -> Option<nested level>`).
+fn lower_reverse_map<E: IriEncoder>(
+    reverse: &std::collections::HashMap<String, Option<Box<UnresolvedNestedSelectSpec>>>,
     encoder: &E,
-) -> Result<Box<NestedSelectSpec>> {
-    // Lower forward selections
-    let forward = spec
-        .forward
-        .iter()
-        .map(|s| lower_selection_spec(s, encoder))
-        .collect::<Result<Vec<_>>>()?;
-
-    // Lower reverse selections (now carries full nested spec, not just forward)
-    let mut reverse = std::collections::HashMap::new();
-    for (iri, nested_opt) in &spec.reverse {
+) -> Result<std::collections::HashMap<Sid, Option<Box<NestedSelectSpec>>>> {
+    let mut out = std::collections::HashMap::new();
+    for (iri, nested_opt) in reverse {
         let sid = encoder
             .encode_iri(iri)
             .ok_or_else(|| ParseError::UnknownNamespace(iri.clone()))?;
-        let lowered_nested = nested_opt
+        let lowered = nested_opt
             .as_ref()
-            .map(|nested| lower_nested_select_spec(nested, encoder))
+            .map(|nested| lower_level_boxed(nested, encoder))
             .transpose()?;
-        reverse.insert(sid, lowered_nested);
+        out.insert(sid, lowered);
     }
+    Ok(out)
+}
 
-    Ok(Box::new(NestedSelectSpec::new(
-        forward,
-        reverse,
-        spec.has_wildcard,
-    )))
+/// Lower one selection level into `NestedSelectSpec`.
+fn lower_level<E: IriEncoder>(
+    spec: &UnresolvedNestedSelectSpec,
+    encoder: &E,
+) -> Result<NestedSelectSpec> {
+    match spec {
+        UnresolvedNestedSelectSpec::Wildcard {
+            refinements,
+            reverse,
+        } => {
+            let mut lowered_refinements = std::collections::HashMap::new();
+            for (iri, nested) in refinements {
+                let sid = encoder
+                    .encode_iri(iri)
+                    .ok_or_else(|| ParseError::UnknownNamespace(iri.clone()))?;
+                lowered_refinements.insert(sid, lower_level_boxed(nested, encoder)?);
+            }
+            Ok(NestedSelectSpec::Wildcard {
+                refinements: lowered_refinements,
+                reverse: lower_reverse_map(reverse, encoder)?,
+            })
+        }
+        UnresolvedNestedSelectSpec::Explicit { forward, reverse } => {
+            let lowered_forward = forward
+                .iter()
+                .map(|item| lower_forward_item(item, encoder))
+                .collect::<Result<Vec<_>>>()?;
+            Ok(NestedSelectSpec::Explicit {
+                forward: lowered_forward,
+                reverse: lower_reverse_map(reverse, encoder)?,
+            })
+        }
+    }
+}
+
+/// Lower a level into a `Box<NestedSelectSpec>` (the form used by sub-specs
+/// inside reverse maps and wildcard refinements).
+fn lower_level_boxed<E: IriEncoder>(
+    spec: &UnresolvedNestedSelectSpec,
+    encoder: &E,
+) -> Result<Box<NestedSelectSpec>> {
+    Ok(Box::new(lower_level(spec, encoder)?))
 }
 
 /// Lower an unresolved filter expression to a resolved Expression

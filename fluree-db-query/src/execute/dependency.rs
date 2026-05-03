@@ -293,7 +293,10 @@ mod tests {
             crate::ir::Column::Var(VarId(1)),
             crate::ir::Column::Hydration(crate::ir::HydrationSpec::new(
                 crate::ir::Root::Var(VarId(0)),
-                vec![],
+                crate::ir::NestedSelectSpec::Explicit {
+                    forward: vec![],
+                    reverse: std::collections::HashMap::new(),
+                },
             )),
         ]);
 
@@ -309,7 +312,10 @@ mod tests {
             crate::ir::Column::Var(VarId(0)),
             crate::ir::Column::Hydration(crate::ir::HydrationSpec::new(
                 crate::ir::Root::Var(VarId(0)),
-                vec![],
+                crate::ir::NestedSelectSpec::Explicit {
+                    forward: vec![],
+                    reverse: std::collections::HashMap::new(),
+                },
             )),
         ]);
 
@@ -326,7 +332,10 @@ mod tests {
             crate::ir::Column::Var(VarId(1)),
             crate::ir::Column::Hydration(crate::ir::HydrationSpec::new(
                 crate::ir::Root::Sid(Sid::new(100, "alice")),
-                vec![],
+                crate::ir::NestedSelectSpec::Explicit {
+                    forward: vec![],
+                    reverse: std::collections::HashMap::new(),
+                },
             )),
         ]);
 

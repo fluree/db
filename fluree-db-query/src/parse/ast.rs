@@ -738,68 +738,76 @@ pub enum UnresolvedRoot {
 
 /// Nested selection specification for sub-hydrations
 ///
-/// This type captures the full selection state for nested property expansion,
-/// including both forward and reverse properties. It's used when a property
-/// has nested selections like `{"ex:friend": ["*", {"friended": ["*"]}]}`.
+/// Selection at one level of a hydration (unresolved). Mirrors
+/// [`crate::ir::NestedSelectSpec`].
+type UnresolvedReverseMap =
+    std::collections::HashMap<String, Option<Box<UnresolvedNestedSelectSpec>>>;
+
 #[derive(Debug, Clone, PartialEq)]
-pub struct UnresolvedNestedSelectSpec {
-    /// Forward property selections
-    pub forward: Vec<UnresolvedSelectionSpec>,
-    /// Reverse property selections (expanded IRI → optional nested spec)
-    /// None means no sub-selections (just return @id), Some means nested hydration
-    pub reverse: std::collections::HashMap<String, Option<Box<UnresolvedNestedSelectSpec>>>,
-    /// Whether wildcard was specified at this level
-    pub has_wildcard: bool,
+pub enum UnresolvedNestedSelectSpec {
+    /// `*` at this level — include all forward properties (and `@id`).
+    /// `refinements` overrides the wildcard default of "include but don't
+    /// recurse" for specific properties.
+    Wildcard {
+        refinements:
+            std::collections::HashMap<String, Box<UnresolvedNestedSelectSpec>>,
+        reverse: UnresolvedReverseMap,
+    },
+    /// Explicit list of forward items.
+    Explicit {
+        forward: Vec<UnresolvedForwardItem>,
+        reverse: UnresolvedReverseMap,
+    },
 }
 
 impl UnresolvedNestedSelectSpec {
-    /// Create a new nested select spec
-    pub fn new(
-        forward: Vec<UnresolvedSelectionSpec>,
-        reverse: std::collections::HashMap<String, Option<Box<UnresolvedNestedSelectSpec>>>,
-        has_wildcard: bool,
-    ) -> Self {
-        Self {
-            forward,
-            reverse,
-            has_wildcard,
+    /// Returns `true` if this level is a wildcard.
+    pub fn is_wildcard(&self) -> bool {
+        matches!(self, UnresolvedNestedSelectSpec::Wildcard { .. })
+    }
+
+    /// Reverse property selections at this level.
+    pub fn reverse(&self) -> &UnresolvedReverseMap {
+        match self {
+            UnresolvedNestedSelectSpec::Wildcard { reverse, .. }
+            | UnresolvedNestedSelectSpec::Explicit { reverse, .. } => reverse,
         }
     }
 
-    /// Check if this spec is empty (no selections)
+    /// Returns `true` if the level produces no output (empty Explicit
+    /// selection with no reverse).
     pub fn is_empty(&self) -> bool {
-        self.forward.is_empty() && self.reverse.is_empty()
+        match self {
+            UnresolvedNestedSelectSpec::Wildcard { .. } => false,
+            UnresolvedNestedSelectSpec::Explicit { forward, reverse } => {
+                forward.is_empty() && reverse.is_empty()
+            }
+        }
     }
 }
 
-/// Selection specification within a hydration
+/// One forward item in an explicit (non-wildcard) selection level.
 ///
-/// Defines what properties to include at each level of the hydration.
+/// Examples:
+/// - `"ex:name"` → `Property { predicate: "ex:name", sub_spec: None }`
+/// - `{"ex:friend": ["*"]}` → `Property { sub_spec: Some(...) }`
+/// - `"@id"` → `Id`
 #[derive(Debug, Clone, PartialEq)]
-pub enum UnresolvedSelectionSpec {
-    /// Explicit @id selection (include @id even when wildcard is not specified)
+pub enum UnresolvedForwardItem {
+    /// Explicit `@id` selection.
     Id,
-    /// Wildcard - select all properties at this level ("*")
-    Wildcard,
-    /// Property selection - optionally with nested sub-selections
-    ///
-    /// Examples:
-    /// - `"ex:name"` → Property with no sub_spec
-    /// - `{"ex:friend": ["*"]}` → Property with sub_spec containing forward selections
-    /// - `{"ex:friend": ["*", {"@reverse:friended": ["*"]}]}` → Property with both forward and reverse
+    /// A specific property with optional nested expansion of its values.
     Property {
         /// Predicate IRI (expanded)
         predicate: String,
-        /// Optional nested selection spec for expanding this property's values
-        /// Uses Box to avoid infinite type recursion
         sub_spec: Option<Box<UnresolvedNestedSelectSpec>>,
     },
 }
 
-/// Hydrationion specification (formatting-time only)
+/// Hydration spec (unresolved).
 ///
-/// This captures the hydration syntax for nested JSON-LD objects.
-/// It is used only during result formatting, not during query execution.
+/// Captures the hydration syntax for nested JSON-LD objects. Lowered into
+/// [`crate::ir::HydrationSpec`].
 ///
 /// # Examples
 ///
@@ -818,33 +826,22 @@ pub enum UnresolvedSelectionSpec {
 /// ```
 #[derive(Debug, Clone, PartialEq)]
 pub struct UnresolvedHydrationSpec {
-    /// Root of the hydration - variable or IRI constant
+    /// Root of the hydration — variable or IRI constant.
     pub root: UnresolvedRoot,
-    /// Forward property selections
-    pub selections: Vec<UnresolvedSelectionSpec>,
-    /// Reverse property selections (expanded IRI → optional nested spec)
-    /// None means no sub-selections (just return @id), Some means nested hydration
-    ///
-    /// Populated from `@reverse` context entries
-    pub reverse: std::collections::HashMap<String, Option<Box<UnresolvedNestedSelectSpec>>>,
-    /// Max depth for auto-expansion (0 = no auto-expand, only explicit)
+    /// Selection at the top level of the hydration.
+    pub level: UnresolvedNestedSelectSpec,
+    /// Max depth for auto-expansion (0 = no auto-expand, only explicit).
     pub depth: usize,
-    /// Whether wildcard was specified (controls @id inclusion)
-    pub has_wildcard: bool,
 }
 
 impl UnresolvedHydrationSpec {
-    /// Create a new graph select spec with default values
-    pub fn new(root: UnresolvedRoot, selections: Vec<UnresolvedSelectionSpec>) -> Self {
-        let has_wildcard = selections
-            .iter()
-            .any(|s| matches!(s, UnresolvedSelectionSpec::Wildcard));
+    /// Create a hydration with the given root and top-level selection,
+    /// `depth: 0`.
+    pub fn new(root: UnresolvedRoot, level: UnresolvedNestedSelectSpec) -> Self {
         Self {
             root,
-            selections,
-            reverse: std::collections::HashMap::new(),
+            level,
             depth: 0,
-            has_wildcard,
         }
     }
 }

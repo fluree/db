@@ -26,7 +26,7 @@ use fluree_db_core::value::FlakeValue;
 use fluree_db_core::{Flake, GraphDbRef, Sid, Tracker};
 use fluree_db_policy::{is_schema_flake, PolicyContext};
 use fluree_db_query::binding::Binding;
-use fluree_db_query::ir::{HydrationSpec, NestedSelectSpec, Root, SelectionSpec};
+use fluree_db_query::ir::{ForwardItem, HydrationSpec, NestedSelectSpec, Root};
 use fluree_vocab::namespaces::JSON_LD;
 use fluree_vocab::rdf::{self, TYPE as RDF_TYPE_IRI};
 use futures::future::BoxFuture;
@@ -35,23 +35,10 @@ use serde_json::{json, Value as JsonValue};
 use std::collections::{BTreeMap, HashMap, HashSet};
 
 /// Cache key: (Sid, local_spec_hash, depth_remaining)
-/// The local_spec_hash is computed from the current selections/reverse/has_wildcard,
-/// NOT the top-level spec. This ensures different nested hydrations of the same Sid
-/// produce different cache entries.
+/// The local_spec_hash is computed from the current `NestedSelectSpec`,
+/// NOT the top-level spec. This ensures different nested hydrations of
+/// the same Sid produce different cache entries.
 type CacheKey = (Sid, u64, usize);
-
-/// Selection specification for formatting a subject.
-///
-/// Bundles the immutable parameters that define what properties to select
-/// during hydration formatting.
-struct FormatSpec<'a> {
-    /// Forward property selections
-    selections: &'a [SelectionSpec],
-    /// Reverse property selections
-    reverse: &'a HashMap<Sid, Option<Box<NestedSelectSpec>>>,
-    /// Whether wildcard was specified at this level
-    has_wildcard: bool,
-}
 
 /// Context for formatting a specific predicate's values.
 struct PredicateContext<'a> {
@@ -63,89 +50,83 @@ struct PredicateContext<'a> {
     explicit_sub_spec: Option<&'a NestedSelectSpec>,
 }
 
-/// Compute hash for a local selection spec (forward, reverse, has_wildcard)
-///
-/// This is used to generate cache keys that correctly distinguish between
-/// different nested selection specs at the same depth.
-fn compute_local_spec_hash(
-    selections: &[SelectionSpec],
-    reverse: &HashMap<Sid, Option<Box<NestedSelectSpec>>>,
-    has_wildcard: bool,
-) -> u64 {
+/// Hash a `NestedSelectSpec` to a u64 cache key. We can't derive `Hash`
+/// because the nested HashMaps don't implement it; iterate keys in sorted
+/// order for determinism.
+fn compute_level_hash(level: &NestedSelectSpec) -> u64 {
     use std::hash::{Hash, Hasher};
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
-
-    has_wildcard.hash(&mut hasher);
-    selections.len().hash(&mut hasher);
-
-    // Hash forward selections
-    fn hash_selection(spec: &SelectionSpec, hasher: &mut impl Hasher) {
-        match spec {
-            SelectionSpec::Id => {
-                2u8.hash(hasher);
-            }
-            SelectionSpec::Wildcard => {
-                0u8.hash(hasher);
-            }
-            SelectionSpec::Property {
-                predicate,
-                sub_spec,
-            } => {
-                1u8.hash(hasher);
-                predicate.hash(hasher);
-                if let Some(nested) = sub_spec {
-                    1u8.hash(hasher);
-                    hash_nested_spec(nested, hasher);
-                } else {
-                    0u8.hash(hasher);
-                }
-            }
-        }
-    }
-
-    fn hash_nested_spec(spec: &NestedSelectSpec, hasher: &mut impl Hasher) {
-        spec.has_wildcard.hash(hasher);
-        spec.forward.len().hash(hasher);
-        for sub in &spec.forward {
-            hash_selection(sub, hasher);
-        }
-        spec.reverse.len().hash(hasher);
-        let mut rev_keys: Vec<_> = spec.reverse.keys().collect();
-        rev_keys.sort();
-        for key in rev_keys {
-            key.hash(hasher);
-            if let Some(nested_opt) = spec.reverse.get(key) {
-                if let Some(inner) = nested_opt {
-                    1u8.hash(hasher);
-                    hash_nested_spec(inner, hasher);
-                } else {
-                    0u8.hash(hasher);
-                }
-            }
-        }
-    }
-
-    for sel in selections {
-        hash_selection(sel, &mut hasher);
-    }
-
-    // Hash reverse properties
-    reverse.len().hash(&mut hasher);
-    let mut reverse_keys: Vec<_> = reverse.keys().collect();
-    reverse_keys.sort();
-    for key in reverse_keys {
-        key.hash(&mut hasher);
-        if let Some(nested_opt) = reverse.get(key) {
-            if let Some(spec) = nested_opt {
-                1u8.hash(&mut hasher);
-                hash_nested_spec(spec, &mut hasher);
-            } else {
-                0u8.hash(&mut hasher);
-            }
-        }
-    }
-
+    hash_level(level, &mut hasher);
     hasher.finish()
+}
+
+fn hash_level<H: std::hash::Hasher>(level: &NestedSelectSpec, hasher: &mut H) {
+    use std::hash::Hash;
+    match level {
+        NestedSelectSpec::Wildcard {
+            refinements,
+            reverse,
+        } => {
+            0u8.hash(hasher);
+            let mut keys: Vec<_> = refinements.keys().collect();
+            keys.sort();
+            keys.len().hash(hasher);
+            for key in keys {
+                key.hash(hasher);
+                hash_level(refinements.get(key).unwrap(), hasher);
+            }
+            hash_reverse(reverse, hasher);
+        }
+        NestedSelectSpec::Explicit { forward, reverse } => {
+            1u8.hash(hasher);
+            forward.len().hash(hasher);
+            for item in forward {
+                hash_forward_item(item, hasher);
+            }
+            hash_reverse(reverse, hasher);
+        }
+    }
+}
+
+fn hash_forward_item<H: std::hash::Hasher>(item: &ForwardItem, hasher: &mut H) {
+    use std::hash::Hash;
+    match item {
+        ForwardItem::Id => 0u8.hash(hasher),
+        ForwardItem::Property {
+            predicate,
+            sub_spec,
+        } => {
+            1u8.hash(hasher);
+            predicate.hash(hasher);
+            match sub_spec {
+                None => 0u8.hash(hasher),
+                Some(boxed) => {
+                    1u8.hash(hasher);
+                    hash_level(boxed, hasher);
+                }
+            }
+        }
+    }
+}
+
+fn hash_reverse<H: std::hash::Hasher>(
+    reverse: &HashMap<Sid, Option<Box<NestedSelectSpec>>>,
+    hasher: &mut H,
+) {
+    use std::hash::Hash;
+    let mut keys: Vec<_> = reverse.keys().collect();
+    keys.sort();
+    keys.len().hash(hasher);
+    for key in keys {
+        key.hash(hasher);
+        match reverse.get(key).unwrap() {
+            None => 0u8.hash(hasher),
+            Some(inner) => {
+                1u8.hash(hasher);
+                hash_level(inner, hasher);
+            }
+        }
+    }
 }
 
 /// Format query results with hydration (sync entry point - returns error)
@@ -211,13 +192,8 @@ pub async fn format_async(
         Root::Sid(sid) => {
             // IRI constant root - single subject fetch (no batches needed)
             let mut visited = HashSet::new();
-            let format_spec = FormatSpec {
-                selections: &spec.selections,
-                reverse: &spec.reverse,
-                has_wildcard: spec.has_wildcard,
-            };
             let obj = formatter
-                .format_subject(sid, format_spec, 0, &mut visited, &mut cache)
+                .format_subject(sid, &spec.level, 0, &mut visited, &mut cache)
                 .await?;
             rows.push(obj);
         }
@@ -259,13 +235,8 @@ pub async fn format_async(
                     };
 
                     let mut visited = HashSet::new();
-                    let format_spec = FormatSpec {
-                        selections: &spec.selections,
-                        reverse: &spec.reverse,
-                        has_wildcard: spec.has_wildcard,
-                    };
                     let obj = formatter
-                        .format_subject(&root_sid, format_spec, 0, &mut visited, &mut cache)
+                        .format_subject(&root_sid, &spec.level, 0, &mut visited, &mut cache)
                         .await?;
 
                     if mixed_select {
@@ -349,18 +320,14 @@ impl<'a> HydrationFormatter<'a> {
     fn format_subject<'b>(
         &'b self,
         sid: &'b Sid,
-        spec: FormatSpec<'b>,
+        level: &'b NestedSelectSpec,
         current_depth: usize,
         visited: &'b mut HashSet<Sid>,
         cache: &'b mut HashMap<CacheKey, JsonValue>,
     ) -> BoxFuture<'b, Result<JsonValue>> {
         async move {
             let depth_remaining = self.spec.depth.saturating_sub(current_depth);
-            // Use LOCAL spec hash (selections, reverse, has_wildcard) not top-level spec
-            // This ensures different nested hydrations of the same Sid produce different cache entries
-            let spec_hash =
-                compute_local_spec_hash(spec.selections, spec.reverse, spec.has_wildcard);
-            let cache_key = (sid.clone(), spec_hash, depth_remaining);
+            let cache_key = (sid.clone(), compute_level_hash(level), depth_remaining);
 
             // Check cache first (same Sid + spec + depth = same result)
             if let Some(cached) = cache.get(&cache_key) {
@@ -375,14 +342,10 @@ impl<'a> HydrationFormatter<'a> {
             // Build object with sorted keys for determinism (BTreeMap)
             let mut obj: BTreeMap<String, JsonValue> = BTreeMap::new();
 
-            let has_explicit_id = spec
-                .selections
-                .iter()
-                .any(|s| matches!(s, SelectionSpec::Id));
             // @id inclusion:
             // - Always include for nested hydrations (identity of an expanded ref)
             // - Otherwise include when wildcard or explicit @id selection
-            if current_depth > 0 || spec.has_wildcard || has_explicit_id {
+            if current_depth > 0 || level.includes_id() {
                 obj.insert("@id".to_string(), json!(self.compactor.compact_sid(sid)?));
             }
 
@@ -397,13 +360,13 @@ impl<'a> HydrationFormatter<'a> {
 
             // Format each predicate
             for (pred, mut pred_flakes) in by_pred {
-                // Determine whether this predicate was explicitly selected.
-                // NOTE: a property selection like "schema:name" is explicit even when it has no sub-spec.
-                let selected_opt = self.find_selection_for_predicate(&pred, spec.selections);
-                let explicit_sub_spec = selected_opt.flatten();
-                if !spec.has_wildcard && selected_opt.is_none() {
+                // `select_predicate` returns `None` when the level is Explicit
+                // and the predicate isn't listed; otherwise it returns
+                // `Some(sub_spec)` (which may itself be `None` for "select but
+                // don't recurse").
+                let Some(explicit_sub_spec) = level.select_predicate(&pred) else {
                     continue;
-                }
+                };
 
                 // If these flakes represent an ordered list (`@list`), preserve transaction order
                 // by sorting by the list index stored in FlakeMeta.i.
@@ -424,7 +387,7 @@ impl<'a> HydrationFormatter<'a> {
                     explicit_sub_spec,
                 };
                 let values = self
-                    .format_predicate_values(pred_ctx, &spec, current_depth, visited, cache)
+                    .format_predicate_values(pred_ctx, level, current_depth, visited, cache)
                     .await?;
 
                 if !values.is_empty() {
@@ -441,14 +404,14 @@ impl<'a> HydrationFormatter<'a> {
             }
 
             // Format reverse properties
-            for (rev_pred, rev_nested_opt) in spec.reverse {
+            for (rev_pred, rev_nested_opt) in level.reverse() {
                 let rev_flakes = self.fetch_reverse_properties(sid, rev_pred).await?;
                 if !rev_flakes.is_empty() {
                     let values = self
                         .format_reverse_values(
                             &rev_flakes,
                             rev_nested_opt.as_deref(),
-                            &spec,
+                            level,
                             current_depth,
                             visited,
                             cache,
@@ -480,26 +443,6 @@ impl<'a> HydrationFormatter<'a> {
             Ok(result)
         }
         .boxed()
-    }
-
-    /// Find explicit sub-spec for a predicate in the selections
-    fn find_selection_for_predicate<'b>(
-        &self,
-        pred: &Sid,
-        selections: &'b [SelectionSpec],
-    ) -> Option<Option<&'b NestedSelectSpec>> {
-        for sel in selections {
-            if let SelectionSpec::Property {
-                predicate,
-                sub_spec,
-            } = sel
-            {
-                if predicate == pred {
-                    return Some(sub_spec.as_deref());
-                }
-            }
-        }
-        None
     }
 
     /// Whether this compact key should always be represented as an array.
@@ -536,7 +479,7 @@ impl<'a> HydrationFormatter<'a> {
     async fn format_predicate_values<'b>(
         &'b self,
         pred_ctx: PredicateContext<'b>,
-        parent_spec: &FormatSpec<'b>,
+        parent_level: &'b NestedSelectSpec,
         current_depth: usize,
         visited: &'b mut HashSet<Sid>,
         cache: &'b mut HashMap<CacheKey, JsonValue>,
@@ -554,19 +497,13 @@ impl<'a> HydrationFormatter<'a> {
                     } else {
                         // Hydration decision:
                         // 1. If explicit sub-selection exists → expand with that spec
-                        // 2. Else if current_depth < max_depth → auto-expand with FULL parent spec
+                        // 2. Else if current_depth < max_depth → auto-expand with FULL parent level
                         // 3. Else → just return {"@id": ...}
                         if let Some(nested) = pred_ctx.explicit_sub_spec {
-                            // Case 1: Explicit sub-selection
-                            let nested_spec = FormatSpec {
-                                selections: &nested.forward,
-                                reverse: &nested.reverse,
-                                has_wildcard: nested.has_wildcard,
-                            };
                             values.push(
                                 self.format_subject(
                                     ref_sid,
-                                    nested_spec,
+                                    nested,
                                     current_depth + 1,
                                     visited,
                                     cache,
@@ -574,16 +511,10 @@ impl<'a> HydrationFormatter<'a> {
                                 .await?,
                             );
                         } else if current_depth < self.spec.depth {
-                            // Case 2: Auto-expand with FULL parent spec (forward + reverse!)
-                            let nested_spec = FormatSpec {
-                                selections: parent_spec.selections,
-                                reverse: parent_spec.reverse,
-                                has_wildcard: parent_spec.has_wildcard,
-                            };
                             values.push(
                                 self.format_subject(
                                     ref_sid,
-                                    nested_spec,
+                                    parent_level,
                                     current_depth + 1,
                                     visited,
                                     cache,
@@ -591,7 +522,7 @@ impl<'a> HydrationFormatter<'a> {
                                 .await?,
                             );
                         } else {
-                            // Case 3: Max depth reached, just @id
+                            // Max depth reached, just @id
                             values.push(json!({ "@id": self.compactor.compact_sid(ref_sid)? }));
                         }
                     }
@@ -616,7 +547,7 @@ impl<'a> HydrationFormatter<'a> {
         &'b self,
         flakes: &[Flake],
         nested_spec: Option<&'b NestedSelectSpec>,
-        parent_spec: &FormatSpec<'b>,
+        parent_level: &'b NestedSelectSpec,
         current_depth: usize,
         visited: &'b mut HashSet<Sid>,
         cache: &'b mut HashMap<CacheKey, JsonValue>,
@@ -626,17 +557,11 @@ impl<'a> HydrationFormatter<'a> {
             // For reverse lookup, subject is the entity that points to our object
             let subject_sid = &flake.s;
 
-            if let Some(spec) = nested_spec {
-                // Explicit sub-selection for reverse - use the full nested spec
-                let nested_spec = FormatSpec {
-                    selections: &spec.forward,
-                    reverse: &spec.reverse,
-                    has_wildcard: spec.has_wildcard,
-                };
+            if let Some(nested) = nested_spec {
                 values.push(
                     self.format_subject(
                         subject_sid,
-                        nested_spec,
+                        nested,
                         current_depth + 1,
                         visited,
                         cache,
@@ -644,16 +569,11 @@ impl<'a> HydrationFormatter<'a> {
                     .await?,
                 );
             } else if current_depth < self.spec.depth {
-                // Auto-expand reverse refs with FULL parent spec
-                let nested_spec = FormatSpec {
-                    selections: parent_spec.selections,
-                    reverse: parent_spec.reverse,
-                    has_wildcard: parent_spec.has_wildcard,
-                };
+                // Auto-expand reverse refs with FULL parent level
                 values.push(
                     self.format_subject(
                         subject_sid,
-                        nested_spec,
+                        parent_level,
                         current_depth + 1,
                         visited,
                         cache,
@@ -904,29 +824,24 @@ impl<'a> HydrationFormatter<'a> {
         let mut want_type = false;
         let mut want_language = false;
 
-        if spec.has_wildcard {
-            want_value = true;
-            want_type = true;
-            want_language = flake.m.as_ref().and_then(|m| m.lang.as_ref()).is_some();
-        } else {
-            for sel in &spec.forward {
-                match sel {
-                    SelectionSpec::Wildcard => {
-                        want_value = true;
-                        want_type = true;
-                        want_language = flake.m.as_ref().and_then(|m| m.lang.as_ref()).is_some();
-                    }
-                    SelectionSpec::Property { predicate, .. }
-                        if predicate.namespace_code == JSON_LD =>
-                    {
-                        match predicate.name.as_ref() {
-                            "value" => want_value = true,
-                            "type" => want_type = true,
-                            "language" => want_language = true,
-                            _ => {}
+        match spec {
+            NestedSelectSpec::Wildcard { .. } => {
+                want_value = true;
+                want_type = true;
+                want_language = flake.m.as_ref().and_then(|m| m.lang.as_ref()).is_some();
+            }
+            NestedSelectSpec::Explicit { forward, .. } => {
+                for item in forward {
+                    if let ForwardItem::Property { predicate, .. } = item {
+                        if predicate.namespace_code == JSON_LD {
+                            match predicate.name.as_ref() {
+                                "value" => want_value = true,
+                                "type" => want_type = true,
+                                "language" => want_language = true,
+                                _ => {}
+                            }
                         }
                     }
-                    _ => {}
                 }
             }
         }
@@ -1135,90 +1050,72 @@ mod tests {
         assert_eq!(key1, key3);
     }
 
-    #[test]
-    fn test_local_spec_hash_different_selections() {
-        // Empty selections
-        let hash_empty = compute_local_spec_hash(&[], &HashMap::new(), false);
+    fn explicit(forward: Vec<ForwardItem>) -> NestedSelectSpec {
+        NestedSelectSpec::Explicit {
+            forward,
+            reverse: HashMap::new(),
+        }
+    }
 
-        // Wildcard only
-        let hash_wildcard =
-            compute_local_spec_hash(&[SelectionSpec::Wildcard], &HashMap::new(), true);
-
-        // Different hashes for different selections
-        assert_ne!(hash_empty, hash_wildcard);
-
-        // Same selections should produce same hash
-        let hash_wildcard2 =
-            compute_local_spec_hash(&[SelectionSpec::Wildcard], &HashMap::new(), true);
-        assert_eq!(hash_wildcard, hash_wildcard2);
-
-        // Different has_wildcard flag should produce different hash
-        let hash_wildcard_false =
-            compute_local_spec_hash(&[SelectionSpec::Wildcard], &HashMap::new(), false);
-        assert_ne!(hash_wildcard, hash_wildcard_false);
+    fn wildcard() -> NestedSelectSpec {
+        NestedSelectSpec::Wildcard {
+            refinements: HashMap::new(),
+            reverse: HashMap::new(),
+        }
     }
 
     #[test]
-    fn test_local_spec_hash_with_property() {
+    fn level_hash_distinguishes_explicit_from_wildcard() {
+        let hash_empty = compute_level_hash(&explicit(vec![]));
+        let hash_wildcard = compute_level_hash(&wildcard());
+        assert_ne!(hash_empty, hash_wildcard);
+        // Same level produces same hash.
+        assert_eq!(compute_level_hash(&wildcard()), hash_wildcard);
+    }
+
+    #[test]
+    fn level_hash_distinguishes_properties() {
         let pred1 = Sid::new(1, "name");
         let pred2 = Sid::new(2, "age");
 
-        // Property without sub-spec
-        let selections1 = vec![SelectionSpec::Property {
+        let hash1 = compute_level_hash(&explicit(vec![ForwardItem::Property {
             predicate: pred1.clone(),
             sub_spec: None,
-        }];
-        let hash1 = compute_local_spec_hash(&selections1, &HashMap::new(), false);
-
-        // Different property
-        let selections2 = vec![SelectionSpec::Property {
+        }]));
+        let hash2 = compute_level_hash(&explicit(vec![ForwardItem::Property {
             predicate: pred2.clone(),
             sub_spec: None,
-        }];
-        let hash2 = compute_local_spec_hash(&selections2, &HashMap::new(), false);
-
+        }]));
         assert_ne!(hash1, hash2);
 
-        // Property with sub-spec should differ from property without
-        let selections3 = vec![SelectionSpec::Property {
+        // Sub-spec presence changes the hash.
+        let hash3 = compute_level_hash(&explicit(vec![ForwardItem::Property {
             predicate: pred1.clone(),
-            sub_spec: Some(Box::new(NestedSelectSpec {
-                forward: vec![SelectionSpec::Wildcard],
-                reverse: HashMap::new(),
-                has_wildcard: true,
-            })),
-        }];
-        let hash3 = compute_local_spec_hash(&selections3, &HashMap::new(), false);
-
+            sub_spec: Some(Box::new(wildcard())),
+        }]));
         assert_ne!(hash1, hash3);
     }
 
     #[test]
-    fn test_local_spec_hash_with_reverse() {
+    fn level_hash_distinguishes_reverse() {
         let rev_pred = Sid::new(10, "friendOf");
 
-        // Empty reverse
-        let hash_no_reverse = compute_local_spec_hash(&[], &HashMap::new(), true);
+        let hash_no_reverse = compute_level_hash(&wildcard());
 
-        // With reverse property (no nested spec)
         let mut reverse1 = HashMap::new();
         reverse1.insert(rev_pred.clone(), None);
-        let hash_with_reverse = compute_local_spec_hash(&[], &reverse1, true);
-
+        let hash_with_reverse = compute_level_hash(&NestedSelectSpec::Wildcard {
+            refinements: HashMap::new(),
+            reverse: reverse1,
+        });
         assert_ne!(hash_no_reverse, hash_with_reverse);
 
-        // With reverse property (with nested spec)
         let mut reverse2 = HashMap::new();
-        reverse2.insert(
-            rev_pred.clone(),
-            Some(Box::new(NestedSelectSpec {
-                forward: vec![SelectionSpec::Wildcard],
-                reverse: HashMap::new(),
-                has_wildcard: true,
-            })),
-        );
-        let hash_with_reverse_nested = compute_local_spec_hash(&[], &reverse2, true);
-
-        assert_ne!(hash_with_reverse, hash_with_reverse_nested);
+        reverse2.insert(rev_pred, Some(Box::new(wildcard())));
+        let hash_nested = compute_level_hash(&NestedSelectSpec::Wildcard {
+            refinements: HashMap::new(),
+            reverse: reverse2,
+        });
+        assert_ne!(hash_with_reverse, hash_nested);
     }
 }

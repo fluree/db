@@ -21,7 +21,7 @@
 //!   by triple patterns (and reused by other pattern variants for s/p
 //!   positions)
 //! - [`projection`] — projection / hydration specs (`Projection`, `Column`,
-//!   `HydrationSpec`, `NestedSelectSpec`, `SelectionSpec`, `Root`)
+//!   `HydrationSpec`, `NestedSelectSpec`, `ForwardItem`, `Root`)
 //! - [`path`] — property-path patterns (transitive predicate traversal)
 //! - [`adapters`] — scan patterns over non-graph data sources (BM25, vector,
 //!   geo, S2, R2RML) adapted to plug into the pattern tree
@@ -47,6 +47,6 @@ pub use expression::{ArithmeticOp, CompareOp, Expression, FilterValue, Function}
 pub use options::{QueryOptions, ReasoningModes};
 pub use path::{PathModifier, PropertyPathPattern};
 pub use pattern::{GraphName, Pattern, ServiceEndpoint, ServicePattern, SubqueryPattern};
-pub use projection::{Column, HydrationSpec, NestedSelectSpec, Projection, Root, SelectionSpec};
+pub use projection::{Column, ForwardItem, HydrationSpec, NestedSelectSpec, Projection, Root};
 pub use query::{ConstructTemplate, Multiplicity, Query, QueryOutput};
 pub use triple::{Ref, Term, TriplePattern};

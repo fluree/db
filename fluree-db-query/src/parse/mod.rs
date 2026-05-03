@@ -35,10 +35,10 @@ pub mod where_clause;
 pub use ast::{
     encode_datatype_constraint, LiteralValue, UnresolvedAggregateFn, UnresolvedAggregateSpec,
     UnresolvedConstructTemplate, UnresolvedDatatypeConstraint, UnresolvedExpression,
-    UnresolvedFilterValue, UnresolvedHydrationSpec, UnresolvedNestedSelectSpec,
-    UnresolvedOptions, UnresolvedPattern, UnresolvedQuery, UnresolvedRoot, UnresolvedSelectionSpec,
-    UnresolvedSortDirection, UnresolvedSortSpec, UnresolvedTerm, UnresolvedTriplePattern,
-    UnresolvedValue,
+    UnresolvedFilterValue, UnresolvedForwardItem, UnresolvedHydrationSpec,
+    UnresolvedNestedSelectSpec, UnresolvedOptions, UnresolvedPattern, UnresolvedQuery,
+    UnresolvedRoot, UnresolvedSortDirection, UnresolvedSortSpec, UnresolvedTerm,
+    UnresolvedTriplePattern, UnresolvedValue,
 };
 pub use encode::{IriEncoder, MemoryEncoder, NoEncoder};
 pub use error::{ParseError, Result};
@@ -854,42 +854,24 @@ fn parse_hydration_object(
         ParseError::InvalidSelect("graph-select value must be an array".to_string())
     })?;
 
-    let specs = parse_selection_specs(specs_arr, ctx)?;
+    let level = parse_selection_level(specs_arr, ctx)?;
 
     Ok(UnresolvedHydrationSpec {
         root,
-        selections: specs.forward,
-        reverse: specs.reverse,
+        level,
         depth: 0, // Will be set later from query-level "depth" parameter
-        has_wildcard: specs.has_wildcard,
     })
 }
 
 /// Build an optional boxed nested select spec, returning `None` when empty.
 fn make_nested_spec(
-    forward: Vec<UnresolvedSelectionSpec>,
-    reverse: std::collections::HashMap<String, Option<Box<UnresolvedNestedSelectSpec>>>,
-    has_wildcard: bool,
+    level: UnresolvedNestedSelectSpec,
 ) -> Option<Box<UnresolvedNestedSelectSpec>> {
-    if forward.is_empty() && reverse.is_empty() {
+    if level.is_empty() {
         None
     } else {
-        Some(Box::new(UnresolvedNestedSelectSpec::new(
-            forward,
-            reverse,
-            has_wildcard,
-        )))
+        Some(Box::new(level))
     }
-}
-
-/// Parsed selection specifications with forward and reverse properties separated.
-struct SelectionSpecs {
-    /// Forward (normal) property selections
-    forward: Vec<UnresolvedSelectionSpec>,
-    /// Reverse property selections mapped by predicate IRI
-    reverse: std::collections::HashMap<String, Option<Box<UnresolvedNestedSelectSpec>>>,
-    /// Whether a wildcard (*) was present
-    has_wildcard: bool,
 }
 
 /// If `key` uses the inline `@reverse:...` form, return the target predicate IRI
@@ -909,23 +891,30 @@ fn parse_inline_reverse_key(key: &str, ctx: &JsonLdParseCtx) -> Result<Option<St
     Ok(Some(expanded))
 }
 
-/// Parse selection specs array, separating forward and reverse properties.
-fn parse_selection_specs(arr: &[JsonValue], ctx: &JsonLdParseCtx) -> Result<SelectionSpecs> {
-    let mut forward = Vec::new();
-    let mut reverse: std::collections::HashMap<String, Option<Box<UnresolvedNestedSelectSpec>>> =
+/// Parse a selection-level array (the value of a hydration `{key: [...]}`)
+/// into either a `Wildcard` or `Explicit` level.
+fn parse_selection_level(
+    arr: &[JsonValue],
+    ctx: &JsonLdParseCtx,
+) -> Result<UnresolvedNestedSelectSpec> {
+    let mut wildcard = false;
+    let mut forward: Vec<UnresolvedForwardItem> = Vec::new();
+    let mut refinements: std::collections::HashMap<String, Box<UnresolvedNestedSelectSpec>> =
         std::collections::HashMap::new();
-    let mut has_wildcard = false;
+    let mut reverse: std::collections::HashMap<
+        String,
+        Option<Box<UnresolvedNestedSelectSpec>>,
+    > = std::collections::HashMap::new();
 
     for item in arr {
         match item {
             // Wildcard: "*"
             JsonValue::String(s) if s == "*" => {
-                forward.push(UnresolvedSelectionSpec::Wildcard);
-                has_wildcard = true;
+                wildcard = true;
             }
             // Explicit @id selection
             JsonValue::String(s) if s == "@id" || s == "id" || s == ctx.context.id_key.as_str() => {
-                forward.push(UnresolvedSelectionSpec::Id);
+                forward.push(UnresolvedForwardItem::Id);
             }
             // Property name: "ex:name" or inline "@reverse:ex:friend"
             JsonValue::String(s) => {
@@ -933,13 +922,10 @@ fn parse_selection_specs(arr: &[JsonValue], ctx: &JsonLdParseCtx) -> Result<Sele
                     reverse.insert(rev_iri, None);
                 } else {
                     let (expanded, entry) = ctx.expand_vocab(s)?;
-                    // Check if this is a reverse property from @context
-                    // (reverse field is Option<String> with the reversed property IRI)
                     if let Some(rev_iri) = entry.and_then(|e| e.reverse) {
-                        // Reverse property - key by the *actual* predicate IRI to reverse on.
                         reverse.insert(rev_iri, None);
                     } else {
-                        forward.push(UnresolvedSelectionSpec::Property {
+                        forward.push(UnresolvedForwardItem::Property {
                             predicate: expanded,
                             sub_spec: None,
                         });
@@ -960,23 +946,28 @@ fn parse_selection_specs(arr: &[JsonValue], ctx: &JsonLdParseCtx) -> Result<Sele
                     ParseError::InvalidSelect("nested selection value must be an array".to_string())
                 })?;
 
-                // Recursively parse sub-selections - preserves both forward AND reverse
-                let sub_specs = parse_selection_specs(sub_arr, ctx)?;
-
-                let nested_spec =
-                    make_nested_spec(sub_specs.forward, sub_specs.reverse, sub_specs.has_wildcard);
+                let sub_level = parse_selection_level(sub_arr, ctx)?;
+                let nested = make_nested_spec(sub_level);
 
                 if let Some(rev_iri) = parse_inline_reverse_key(pred_str, ctx)? {
-                    reverse.insert(rev_iri, nested_spec);
+                    reverse.insert(rev_iri, nested);
                 } else {
                     let (expanded, entry) = ctx.expand_vocab(pred_str)?;
                     let context_reverse = entry.as_ref().and_then(|e| e.reverse.as_ref());
                     if let Some(rev_iri) = context_reverse {
-                        reverse.insert(rev_iri.clone(), nested_spec);
-                    } else {
-                        forward.push(UnresolvedSelectionSpec::Property {
+                        reverse.insert(rev_iri.clone(), nested);
+                    } else if let Some(boxed) = nested {
+                        // Wildcard refinements only matter when the parent is
+                        // a wildcard; otherwise it's a regular Property entry.
+                        // Decide based on `wildcard` after the loop completes.
+                        forward.push(UnresolvedForwardItem::Property {
                             predicate: expanded,
-                            sub_spec: nested_spec,
+                            sub_spec: Some(boxed),
+                        });
+                    } else {
+                        forward.push(UnresolvedForwardItem::Property {
+                            predicate: expanded,
+                            sub_spec: None,
                         });
                     }
                 }
@@ -989,11 +980,24 @@ fn parse_selection_specs(arr: &[JsonValue], ctx: &JsonLdParseCtx) -> Result<Sele
         }
     }
 
-    Ok(SelectionSpecs {
-        forward,
-        reverse,
-        has_wildcard,
-    })
+    if wildcard {
+        // For a wildcard level, fold any explicit Property entries back into
+        // `refinements` (they refine the wildcard's per-property recursion).
+        // Plain `Id` entries are redundant under wildcard and are dropped.
+        for item in forward {
+            if let UnresolvedForwardItem::Property { predicate, sub_spec } = item {
+                if let Some(boxed) = sub_spec {
+                    refinements.insert(predicate, boxed);
+                }
+            }
+        }
+        Ok(UnresolvedNestedSelectSpec::Wildcard {
+            refinements,
+            reverse,
+        })
+    } else {
+        Ok(UnresolvedNestedSelectSpec::Explicit { forward, reverse })
+    }
 }
 
 // parse_depth moved to options module
