@@ -20,8 +20,9 @@ use crate::ir::{
     PropertyPathPattern, SubqueryPattern, VectorSearchPattern, VectorSearchTarget,
 };
 use crate::vector::DistanceMetric;
-// Re-export graph select types for external use
-pub use crate::ir::{GraphSelectSpec, NestedSelectSpec, Root, SelectionSpec};
+use crate::ir::{
+    ConstructTemplate, GraphSelectSpec, NestedSelectSpec, Query, QueryOutput, Root, SelectionSpec,
+};
 use crate::options::QueryOptions;
 use crate::sort::{SortDirection, SortSpec};
 use crate::ir::triple::{Ref, Term, TriplePattern};
@@ -29,31 +30,7 @@ use crate::var_registry::{VarId, VarRegistry};
 use fluree_db_core::DatatypeConstraint;
 use fluree_db_core::{FlakeValue, Sid};
 use fluree_graph_json_ld::ParsedContext;
-use std::collections::HashSet;
 use std::sync::Arc;
-
-/// Projection shape — how each row should be rendered by row-array formatters.
-///
-/// - `Tuple` (default): every row is an array regardless of arity. This is
-///   the spec-correct shape for SPARQL (solution sequences are tabular) and
-///   for JSON-LD `select: ["?x"]` / `["?x","?y"]` (the user's array wrapper
-///   is preserved end-to-end).
-/// - `Scalar`: 1-var rows flatten to the bare value. JSON-LD sets this only
-///   when the user writes `select: "?x"` (bare string) — an explicit opt-in
-///   to scalar shape. Multi-var `Scalar` is unreachable from the parser.
-///
-/// Formatters that emit row arrays (jsonld, delimited, etc.) consult this to
-/// decide scalar-vs-tuple rendering. Object-based formatters (typed, agent_json)
-/// ignore it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum ProjectionShape {
-    /// Every row is an array, regardless of arity. Default; used by SPARQL
-    /// and JSON-LD array-form select.
-    #[default]
-    Tuple,
-    /// 1-var rows flatten to scalars. JSON-LD bare-string `select: "?x"`.
-    Scalar,
-}
 
 /// Select mode determines result shape
 ///
@@ -87,263 +64,7 @@ pub(crate) enum SelectMode {
     Boolean,
 }
 
-/// Resolved CONSTRUCT template patterns
-///
-/// Contains the template patterns that will be instantiated with query bindings
-/// to produce output triples. Uses the same TriplePattern type as WHERE clause
-/// patterns, but variables are resolved against the query result bindings rather
-/// than matched against the database.
-#[derive(Debug, Clone)]
-pub struct ConstructTemplate {
-    /// Template patterns (resolved TriplePatterns with Sids and VarIds)
-    pub patterns: Vec<TriplePattern>,
-}
-
-impl ConstructTemplate {
-    /// Create a new construct template from patterns
-    pub fn new(patterns: Vec<TriplePattern>) -> Self {
-        Self { patterns }
-    }
-
-    /// Collect all variables referenced in the template patterns.
-    pub fn referenced_vars(&self) -> HashSet<VarId> {
-        self.patterns
-            .iter()
-            .flat_map(crate::ir::triple::TriplePattern::referenced_vars)
-            .collect()
-    }
-}
-
-/// Describes what the query produces.
-///
-/// Combines the select mode, selected variables, and construct template into a
-/// single enum so that invalid combinations (e.g. `Construct` without a
-/// template, or `Many` with an empty variable list) are unrepresentable.
-#[derive(Debug, Clone)]
-pub enum QueryOutput {
-    /// Normal SELECT with explicit variable list and projection shape.
-    Select {
-        vars: Vec<VarId>,
-        shape: ProjectionShape,
-    },
-    /// selectOne — same as Select but formatters return first row or null.
-    SelectOne {
-        vars: Vec<VarId>,
-        shape: ProjectionShape,
-    },
-    /// SELECT * — all bound variables from WHERE.
-    Wildcard,
-    /// CONSTRUCT — template patterns instantiated with bindings.
-    Construct(ConstructTemplate),
-    /// ASK — boolean result.
-    Boolean,
-}
-
-impl QueryOutput {
-    /// Construct a `Select` with the default (`Tuple`) shape.
-    ///
-    /// Used by SPARQL lowering and internal fixtures. JSON-LD bare-string
-    /// `select: "?x"` builds the struct variant directly with `shape: Scalar`.
-    pub fn select(vars: Vec<VarId>) -> Self {
-        Self::Select {
-            vars,
-            shape: ProjectionShape::Tuple,
-        }
-    }
-
-    /// Construct a `SelectOne` with the default (`Tuple`) shape.
-    pub fn select_one(vars: Vec<VarId>) -> Self {
-        Self::SelectOne {
-            vars,
-            shape: ProjectionShape::Tuple,
-        }
-    }
-
-    /// Get select vars for Select/SelectOne, `None` otherwise.
-    pub fn select_vars(&self) -> Option<&[VarId]> {
-        match self {
-            QueryOutput::Select { vars, .. } | QueryOutput::SelectOne { vars, .. } => Some(vars),
-            _ => None,
-        }
-    }
-
-    /// Get select vars, or an empty slice for non-select outputs.
-    pub fn select_vars_or_empty(&self) -> &[VarId] {
-        self.select_vars().unwrap_or(&[])
-    }
-
-    /// Get the projection shape for Select/SelectOne, `None` otherwise.
-    pub fn projection_shape(&self) -> Option<ProjectionShape> {
-        match self {
-            QueryOutput::Select { shape, .. } | QueryOutput::SelectOne { shape, .. } => {
-                Some(*shape)
-            }
-            _ => None,
-        }
-    }
-
-    /// Returns `true` iff rows should be flattened from `[v]` to `v` at format
-    /// time. True only when the user opted into scalar output via JSON-LD
-    /// `select: "?x"` (bare-string form) AND there is exactly one projected
-    /// variable. Wildcard, Construct, Boolean, and `Tuple`-shaped Select all
-    /// return `false`, so tabular output (SPARQL + JSON-LD array-form select)
-    /// is preserved.
-    pub fn should_flatten_scalar(&self) -> bool {
-        match self {
-            QueryOutput::Select { vars, shape } | QueryOutput::SelectOne { vars, shape } => {
-                *shape == ProjectionShape::Scalar && vars.len() == 1
-            }
-            _ => false,
-        }
-    }
-
-    /// Get the construct template for Construct, `None` otherwise.
-    pub fn construct_template(&self) -> Option<&ConstructTemplate> {
-        match self {
-            QueryOutput::Construct(t) => Some(t),
-            _ => None,
-        }
-    }
-
-    /// Returns `true` for `SelectOne` output.
-    pub fn is_select_one(&self) -> bool {
-        matches!(self, Self::SelectOne { .. })
-    }
-
-    /// Returns `true` for `Wildcard` output.
-    pub fn is_wildcard(&self) -> bool {
-        matches!(self, Self::Wildcard)
-    }
-
-    /// Returns `true` for `Boolean` (ASK) output.
-    pub fn is_boolean(&self) -> bool {
-        matches!(self, Self::Boolean)
-    }
-
-    /// Returns `true` for `Construct` output.
-    pub fn is_construct(&self) -> bool {
-        matches!(self, Self::Construct(_))
-    }
-
-    /// Variables the output depends on.
-    ///
-    /// Returns `None` when dependency trimming is not applicable:
-    /// - `Wildcard`: all WHERE vars are needed
-    /// - `Boolean`: all WHERE vars needed for solvability checking
-    /// - Empty `Select`/`SelectOne`: no explicit projection
-    /// - `Construct` with no template patterns
-    pub fn variables(&self) -> Option<HashSet<VarId>> {
-        match self {
-            QueryOutput::Wildcard | QueryOutput::Boolean => None,
-            QueryOutput::Select { vars, .. } | QueryOutput::SelectOne { vars, .. }
-                if vars.is_empty() =>
-            {
-                None
-            }
-            QueryOutput::Select { vars, .. } | QueryOutput::SelectOne { vars, .. } => {
-                Some(vars.iter().copied().collect())
-            }
-            QueryOutput::Construct(t) if t.patterns.is_empty() => None,
-            QueryOutput::Construct(t) => Some(t.referenced_vars()),
-        }
-    }
-}
-
-/// Resolved query ready for execution
-#[derive(Debug, Clone)]
-pub struct ParsedQuery {
-    /// Parsed JSON-LD context (for result formatting)
-    pub context: ParsedContext,
-    /// Original JSON context from the query (for CONSTRUCT output)
-    pub orig_context: Option<serde_json::Value>,
-    /// Query output specification (replaces select, select_mode, construct_template)
-    pub output: QueryOutput,
-    /// Resolved patterns (triples, filters, optionals, etc.)
-    pub patterns: Vec<Pattern>,
-    /// Query options (limit, offset, order by, group by, etc.)
-    pub options: QueryOptions,
-    /// Graph crawl select specification (None for flat SELECT or CONSTRUCT)
-    ///
-    /// When present, controls nested JSON-LD object expansion during formatting.
-    pub graph_select: Option<GraphSelectSpec>,
-    /// Post-query VALUES clause (SPARQL `ValuesClause` after `SolutionModifier`).
-    ///
-    /// Stored separately from `patterns` so the WHERE-clause planner does not
-    /// reorder it relative to OPTIONAL/UNION/etc.  Applied as a final inner-join
-    /// constraint after the WHERE operator tree is fully built.
-    pub post_values: Option<Pattern>,
-}
-
-impl ParsedQuery {
-    /// Create a new parsed query with default Wildcard output.
-    pub fn new(context: ParsedContext) -> Self {
-        Self {
-            context,
-            orig_context: None,
-            output: QueryOutput::Wildcard,
-            patterns: Vec::new(),
-            options: QueryOptions::default(),
-            graph_select: None,
-            post_values: None,
-        }
-    }
-
-    /// Get all triple patterns (flattening nested structures)
-    pub fn triple_patterns(&self) -> Vec<&TriplePattern> {
-        fn collect<'a>(patterns: &'a [Pattern], out: &mut Vec<&'a TriplePattern>) {
-            for p in patterns {
-                match p {
-                    Pattern::Triple(tp) => out.push(tp),
-                    Pattern::Optional(inner)
-                    | Pattern::Minus(inner)
-                    | Pattern::Exists(inner)
-                    | Pattern::NotExists(inner) => collect(inner, out),
-                    Pattern::Union(branches) => {
-                        for branch in branches {
-                            collect(branch, out);
-                        }
-                    }
-                    Pattern::Graph {
-                        patterns: inner, ..
-                    } => collect(inner, out),
-                    Pattern::Service(sp) => collect(&sp.patterns, out),
-                    Pattern::Filter(_)
-                    | Pattern::Bind { .. }
-                    | Pattern::Values { .. }
-                    | Pattern::PropertyPath(_)
-                    | Pattern::Subquery(_)
-                    | Pattern::IndexSearch(_)
-                    | Pattern::GeoSearch(_)
-                    | Pattern::S2Search(_)
-                    | Pattern::VectorSearch(_)
-                    | Pattern::R2rml(_) => {}
-                }
-            }
-        }
-
-        let mut result = Vec::new();
-        collect(&self.patterns, &mut result);
-        result
-    }
-
-    /// Create a copy of this query with different patterns
-    ///
-    /// Used by pattern rewriting (RDFS expansion) to create a query with
-    /// expanded patterns while preserving all other query properties.
-    pub fn with_patterns(&self, patterns: Vec<Pattern>) -> Self {
-        Self {
-            context: self.context.clone(),
-            orig_context: self.orig_context.clone(),
-            output: self.output.clone(),
-            patterns,
-            options: self.options.clone(),
-            graph_select: self.graph_select.clone(),
-            post_values: self.post_values.clone(),
-        }
-    }
-}
-
-/// Lower an unresolved query to a resolved ParsedQuery
+/// Lower an unresolved query to a resolved [`Query`]
 ///
 /// # Arguments
 ///
@@ -354,13 +75,13 @@ impl ParsedQuery {
 ///
 /// # Returns
 ///
-/// A resolved `ParsedQuery` with Sids and VarIds
+/// A resolved `Query` with Sids and VarIds
 pub(crate) fn lower_query<E: IriEncoder>(
     ast: UnresolvedQuery,
     encoder: &E,
     vars: &mut VarRegistry,
     select_mode: SelectMode,
-) -> Result<ParsedQuery> {
+) -> Result<Query> {
     let mut pp_counter: u32 = 0;
 
     // Lower select variables
@@ -410,7 +131,7 @@ pub(crate) fn lower_query<E: IriEncoder>(
         .map(|gs| lower_graph_select(gs, encoder, vars))
         .transpose()?;
 
-    Ok(ParsedQuery {
+    Ok(Query {
         context: ast.context,
         orig_context: ast.orig_context,
         output,

@@ -473,7 +473,7 @@ impl Fluree {
     async fn build_executable_for_dataset(
         &self,
         dataset: &DataSetDb,
-        parsed: &fluree_db_query::parse::ParsedQuery,
+        parsed: &fluree_db_query::ir::Query,
     ) -> Result<ExecutableQuery> {
         let mut executable = prepare_for_execution(parsed);
 

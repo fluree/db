@@ -6,7 +6,7 @@
 //! be projected away early.
 
 use crate::options::QueryOptions;
-use crate::parse::ParsedQuery;
+use crate::ir::Query;
 use crate::var_registry::VarId;
 use std::collections::HashSet;
 
@@ -36,7 +36,7 @@ pub struct VariableDeps {
 /// - `Wildcard` / `Boolean` select mode (all WHERE vars are needed)
 /// - Empty select list (no explicit projection)
 /// - `Construct` without a template
-pub fn compute_variable_deps(query: &ParsedQuery, options: &QueryOptions) -> Option<VariableDeps> {
+pub fn compute_variable_deps(query: &Query, options: &QueryOptions) -> Option<VariableDeps> {
     // ---- backward walk ----
 
     // Seed deps from the query output requirements.
@@ -120,7 +120,8 @@ mod tests {
     use crate::aggregate::{AggregateFn, AggregateSpec};
     use crate::ir::{Expression, FilterValue, Pattern};
     use crate::options::QueryOptions;
-    use crate::parse::{ConstructTemplate, ParsedQuery, QueryOutput, SelectMode};
+    use crate::ir::{ConstructTemplate, Query, QueryOutput};
+    use crate::parse::SelectMode;
     use crate::sort::SortSpec;
     use crate::ir::triple::{Ref, Term, TriplePattern};
     use fluree_db_core::Sid;
@@ -130,7 +131,7 @@ mod tests {
         select: Vec<VarId>,
         patterns: Vec<Pattern>,
         select_mode: SelectMode,
-    ) -> ParsedQuery {
+    ) -> Query {
         let output = match select_mode {
             SelectMode::Many => QueryOutput::select(select),
             SelectMode::One => QueryOutput::select_one(select),
@@ -138,7 +139,7 @@ mod tests {
             SelectMode::Construct => QueryOutput::Construct(ConstructTemplate::new(Vec::new())),
             SelectMode::Boolean => QueryOutput::Boolean,
         };
-        ParsedQuery {
+        Query {
             context: ParsedContext::default(),
             orig_context: None,
             output,
@@ -255,7 +256,7 @@ mod tests {
 
     #[test]
     fn construct_uses_template_vars() {
-        let query = ParsedQuery {
+        let query = Query {
             context: ParsedContext::default(),
             orig_context: None,
             output: QueryOutput::Construct(ConstructTemplate::new(vec![make_tp(

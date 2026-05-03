@@ -5,7 +5,7 @@
 //! and high-performance delimited-text formats (TSV, CSV).
 
 // Re-export QueryOutput from fluree-db-query (canonical source)
-pub use fluree_db_query::parse::QueryOutput;
+pub use fluree_db_query::ir::QueryOutput;
 
 /// Output format selection
 ///

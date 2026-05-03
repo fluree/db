@@ -161,7 +161,8 @@ pub use fluree_db_core::ObjectBounds;
 pub use var_registry::{VarId, VarRegistry};
 
 // Re-export parse types for query parsing
-pub use parse::{parse_query, ParsedQuery, QueryOutput};
+pub use ir::{Query, QueryOutput};
+pub use parse::parse_query;
 
 use execute::build_where_operators_seeded;
 use fluree_db_core::GraphDbRef;

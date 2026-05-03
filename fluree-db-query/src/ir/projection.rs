@@ -1,6 +1,6 @@
 //! Selection specs that describe how query results are projected and
 //! crawled into nested JSON-LD form. The canonical resolved-and-lowered
-//! query type is [`crate::parse::ParsedQuery`]; this module covers only
+//! query type is [`crate::parse::Query`]; this module covers only
 //! the projection-shape types that flow through it.
 
 use crate::var_registry::VarId;

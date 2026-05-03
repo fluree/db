@@ -9,14 +9,14 @@
 //!
 //! ## Architecture
 //!
-//! - `try_build_count_plan()` — entry point, analyses `ParsedQuery` → `Option<CountPlan>`
+//! - `try_build_count_plan()` — entry point, analyses `Query` → `Option<CountPlan>`
 //! - `CountPlan` — the plan root, wrapping a `CountPlanRoot` + output var
 //! - `count_plan_exec.rs` — evaluates a `CountPlan` against a `BinaryIndexStore`
 
 use crate::execute::operator_tree::{detect_count_all_aggregate, validate_simple_triple};
 use crate::ir::{Expression, Pattern};
 use crate::options::QueryOptions;
-use crate::parse::ParsedQuery;
+use crate::ir::Query;
 use crate::ir::triple::Ref;
 use crate::var_registry::VarId;
 
@@ -202,7 +202,7 @@ pub(crate) struct CountPlan {
 /// Gate: ungrouped `COUNT(*)`, no DISTINCT, no HAVING, no ORDER BY, no LIMIT/OFFSET.
 /// Runtime gating (binary-index store, HEAD query, root policy) happens in the executor.
 pub(crate) fn try_build_count_plan(
-    query: &ParsedQuery,
+    query: &Query,
     options: &QueryOptions,
 ) -> Option<CountPlan> {
     let out_var = detect_count_all_aggregate(query, options)?;
@@ -946,7 +946,7 @@ fn build_keyset_for_object_chain_block(
 mod tests {
     use super::*;
     use crate::aggregate::AggregateFn;
-    use crate::parse::QueryOutput;
+    use crate::ir::QueryOutput;
     use crate::ir::triple::{Term, TriplePattern};
     use crate::var_registry::VarRegistry;
     use fluree_db_core::Sid;
@@ -956,7 +956,7 @@ mod tests {
         Ref::Sid(Sid::new(id, name))
     }
 
-    fn make_query(patterns: Vec<Pattern>, out_var: VarId) -> (ParsedQuery, QueryOptions) {
+    fn make_query(patterns: Vec<Pattern>, out_var: VarId) -> (Query, QueryOptions) {
         let options = QueryOptions {
             aggregates: vec![crate::aggregate::AggregateSpec {
                 function: AggregateFn::CountAll,
@@ -966,7 +966,7 @@ mod tests {
             }],
             ..Default::default()
         };
-        let query = ParsedQuery {
+        let query = Query {
             context: ParsedContext::default(),
             orig_context: None,
             output: QueryOutput::select(vec![out_var]),

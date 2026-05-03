@@ -1,19 +1,19 @@
 //! ASK query lowering.
 //!
-//! Converts SPARQL ASK queries to `ParsedQuery` with `SelectMode::Boolean`.
+//! Converts SPARQL ASK queries to `Query` with `SelectMode::Boolean`.
 //! ASK tests whether a graph pattern has any solution — no variables are projected.
 
 use crate::ast::query::AskQuery;
 
 use fluree_db_query::options::QueryOptions;
 use fluree_db_query::parse::encode::IriEncoder;
-use fluree_db_query::parse::{ParsedQuery, QueryOutput};
+use fluree_db_query::ir::{Query, QueryOutput};
 
 use super::{LoweringContext, Result};
 
 impl<E: IriEncoder> LoweringContext<'_, E> {
-    /// Lower an ASK query to a ParsedQuery.
-    pub(super) fn lower_ask(&mut self, ask: &AskQuery) -> Result<ParsedQuery> {
+    /// Lower an ASK query to a Query.
+    pub(super) fn lower_ask(&mut self, ask: &AskQuery) -> Result<Query> {
         // Lower WHERE clause patterns
         let patterns = self.lower_graph_pattern(&ask.where_clause.pattern)?;
 
@@ -27,7 +27,7 @@ impl<E: IriEncoder> LoweringContext<'_, E> {
 
         let ctx = self.build_jsonld_context()?;
 
-        Ok(ParsedQuery {
+        Ok(Query {
             context: ctx,
             orig_context: None,
             output: QueryOutput::Boolean,

@@ -1,6 +1,6 @@
 //! CONSTRUCT query lowering.
 //!
-//! Converts SPARQL CONSTRUCT queries to `ParsedQuery` with template patterns,
+//! Converts SPARQL CONSTRUCT queries to `Query` with template patterns,
 //! supporting both explicit templates and the `CONSTRUCT WHERE { ... }` shorthand.
 
 use crate::ast::query::{ConstructQuery, SolutionModifiers};
@@ -9,16 +9,16 @@ use crate::ast::TriplePattern as SparqlTriplePattern;
 use fluree_db_query::ir::Pattern;
 use fluree_db_query::options::QueryOptions;
 use fluree_db_query::parse::encode::IriEncoder;
-use fluree_db_query::parse::{
-    ConstructTemplate as QueryConstructTemplate, ParsedQuery, QueryOutput,
+use fluree_db_query::ir::{
+    ConstructTemplate as QueryConstructTemplate, Query, QueryOutput,
 };
 use fluree_db_query::ir::triple::TriplePattern;
 
 use super::{LoweringContext, Result};
 
 impl<E: IriEncoder> LoweringContext<'_, E> {
-    /// Lower a CONSTRUCT query to a ParsedQuery.
-    pub(super) fn lower_construct(&mut self, construct: &ConstructQuery) -> Result<ParsedQuery> {
+    /// Lower a CONSTRUCT query to a Query.
+    pub(super) fn lower_construct(&mut self, construct: &ConstructQuery) -> Result<Query> {
         // Lower WHERE clause patterns
         let patterns = self.lower_graph_pattern(&construct.where_clause.pattern)?;
 
@@ -44,7 +44,7 @@ impl<E: IriEncoder> LoweringContext<'_, E> {
         let ctx = self.build_jsonld_context()?;
         let ctx_val = self.build_jsonld_context_value();
 
-        Ok(ParsedQuery {
+        Ok(Query {
             context: ctx,
             orig_context: Some(ctx_val),
             output: QueryOutput::Construct(construct_template),

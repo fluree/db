@@ -48,7 +48,7 @@ use crate::offset::OffsetOperator;
 use crate::operator::inline::InlineOperator;
 use crate::operator::BoxedOperator;
 use crate::options::QueryOptions;
-use crate::parse::{ParsedQuery, QueryOutput};
+use crate::ir::{Query, QueryOutput};
 use crate::project::ProjectOperator;
 use crate::sort::SortDirection;
 use crate::sort::SortOperator;
@@ -125,7 +125,7 @@ struct StarConstOrderTopKSpec {
 /// - One label predicate whose object var is ORDER BY key
 /// - SELECT DISTINCT of exactly `(?s, ?label)` plus `ORDER BY ?label LIMIT k`
 fn detect_star_const_numeric_label_order_limit(
-    query: &ParsedQuery,
+    query: &Query,
     options: &QueryOptions,
 ) -> Option<StarConstOrderTopKSpec> {
     if matches!(
@@ -315,7 +315,7 @@ struct LabelRegexTypeSpec {
 /// `?s rdfs:label ?label . ?s rdf:type <Class> . FILTER regex(?label, "pat"[, "flags"])`
 /// with plain SELECT of exactly `(?s, ?label)` (no ORDER BY/LIMIT/DISTINCT).
 fn detect_label_regex_type(
-    query: &ParsedQuery,
+    query: &Query,
     options: &QueryOptions,
 ) -> Option<LabelRegexTypeSpec> {
     if matches!(
@@ -450,7 +450,7 @@ fn extract_regex_const_pattern(
 /// - LIMIT >= 1 (or no limit)
 /// - SELECT vars == `[agg.output_var]`
 pub(crate) fn detect_count_all_aggregate(
-    query: &ParsedQuery,
+    query: &Query,
     options: &QueryOptions,
 ) -> Option<VarId> {
     if matches!(
@@ -492,7 +492,7 @@ pub(crate) fn detect_count_all_aggregate(
 /// - LIMIT >= 1 (or no limit)
 /// - SELECT vars == `[agg.output_var]`
 fn detect_count_distinct_aggregate(
-    query: &ParsedQuery,
+    query: &Query,
     options: &QueryOptions,
 ) -> Option<(VarId, VarId)> {
     if matches!(
@@ -531,7 +531,7 @@ fn detect_count_distinct_aggregate(
 /// Returns `Some((input_var, output_var))` where `input_var` is `None` for `COUNT(*)`.
 /// Same standard constraints as [`detect_count_all_aggregate`].
 fn detect_count_aggregate(
-    query: &ParsedQuery,
+    query: &Query,
     options: &QueryOptions,
 ) -> Option<(Option<VarId>, VarId)> {
     if matches!(
@@ -574,7 +574,7 @@ fn detect_count_aggregate(
     Some((input_var, agg.output_var))
 }
 
-fn detect_partitioned_group_by(query: &ParsedQuery, options: &QueryOptions) -> bool {
+fn detect_partitioned_group_by(query: &Query, options: &QueryOptions) -> bool {
     if options.group_by.len() != 1 {
         return false;
     }
@@ -612,7 +612,7 @@ fn detect_partitioned_group_by(query: &ParsedQuery, options: &QueryOptions) -> b
 }
 
 fn detect_predicate_group_by_object_count_topk(
-    query: &ParsedQuery,
+    query: &Query,
     options: &QueryOptions,
 ) -> Option<(Ref, VarId, VarId, VarId, usize)> {
     if matches!(
@@ -669,7 +669,7 @@ fn detect_predicate_group_by_object_count_topk(
 /// Supports subject aggregates: MIN(?s), MAX(?s), SAMPLE(?s) in addition to COUNT.
 #[allow(clippy::type_complexity)]
 fn detect_group_by_object_star_topk(
-    query: &ParsedQuery,
+    query: &Query,
     options: &QueryOptions,
 ) -> Option<(
     Ref,
@@ -826,7 +826,7 @@ fn detect_group_by_object_star_topk(
 }
 
 fn detect_sum_strlen_group_concat_subquery(
-    query: &ParsedQuery,
+    query: &Query,
     options: &QueryOptions,
 ) -> Option<(Ref, Arc<str>, VarId)> {
     use crate::ir::{Expression, Function, Pattern};
@@ -942,7 +942,7 @@ fn detect_sum_strlen_group_concat_subquery(
 }
 
 fn detect_predicate_object_count(
-    query: &ParsedQuery,
+    query: &Query,
     options: &QueryOptions,
 ) -> Option<(Ref, VarId, crate::ir::triple::Term, VarId)> {
     let (input_var, out_var) = detect_count_aggregate(query, options)?;
@@ -977,7 +977,7 @@ fn detect_predicate_object_count(
 }
 
 fn detect_predicate_count_rows(
-    query: &ParsedQuery,
+    query: &Query,
     options: &QueryOptions,
 ) -> Option<(Ref, VarId)> {
     let (input_var, out_var) = detect_count_aggregate(query, options)?;
@@ -1001,7 +1001,7 @@ fn detect_predicate_count_rows(
 }
 
 fn detect_predicate_count_rows_lang_filter(
-    query: &ParsedQuery,
+    query: &Query,
     options: &QueryOptions,
 ) -> Option<(Ref, String, VarId)> {
     let (input_var, out_var) = detect_count_aggregate(query, options)?;
@@ -1052,7 +1052,7 @@ fn detect_predicate_count_rows_lang_filter(
 }
 
 fn detect_predicate_count_distinct_object(
-    query: &ParsedQuery,
+    query: &Query,
     options: &QueryOptions,
 ) -> Option<(Ref, VarId)> {
     let (in_var, out_var) = detect_count_distinct_aggregate(query, options)?;
@@ -1074,7 +1074,7 @@ fn detect_predicate_count_distinct_object(
 }
 
 fn detect_predicate_minmax_string(
-    query: &ParsedQuery,
+    query: &Query,
     options: &QueryOptions,
 ) -> Option<(Ref, MinMaxMode, VarId)> {
     if matches!(
@@ -1130,7 +1130,7 @@ fn detect_predicate_minmax_string(
 }
 
 fn detect_predicate_avg_numeric(
-    query: &ParsedQuery,
+    query: &Query,
     options: &QueryOptions,
 ) -> Option<(Ref, VarId)> {
     if matches!(
@@ -1168,7 +1168,7 @@ fn detect_predicate_avg_numeric(
 }
 
 fn detect_count_rows_with_encoded_filters(
-    query: &ParsedQuery,
+    query: &Query,
     options: &QueryOptions,
 ) -> Option<(
     crate::ir::triple::TriplePattern,
@@ -1301,7 +1301,7 @@ fn detect_count_rows_with_encoded_filters(
 }
 
 fn detect_predicate_count_rows_numeric_compare(
-    query: &ParsedQuery,
+    query: &Query,
     options: &QueryOptions,
 ) -> Option<(Ref, NumericCompareOp, fluree_db_core::FlakeValue, VarId)> {
     if matches!(
@@ -1354,7 +1354,7 @@ fn detect_predicate_count_rows_numeric_compare(
 }
 
 fn detect_string_prefix_count_all(
-    query: &ParsedQuery,
+    query: &Query,
     options: &QueryOptions,
 ) -> Option<(Ref, Arc<str>, VarId)> {
     let out_var = detect_count_all_aggregate(query, options)?;
@@ -1374,7 +1374,7 @@ fn detect_string_prefix_count_all(
 }
 
 fn detect_string_prefix_sum_strstarts(
-    query: &ParsedQuery,
+    query: &Query,
     options: &QueryOptions,
 ) -> Option<(Ref, Arc<str>, VarId)> {
     use crate::ir::{Expression, FilterValue, Function};
@@ -1530,7 +1530,7 @@ fn anchored_literal_regex_prefix(pattern: &str) -> Option<Arc<str>> {
 ///
 /// Returns `Some((predicate_var, count_output_var))` if the query matches the pattern.
 fn detect_stats_count_by_predicate(
-    query: &ParsedQuery,
+    query: &Query,
     options: &QueryOptions,
 ) -> Option<(VarId, VarId)> {
     // Must have stats available (checked by caller)
@@ -1593,7 +1593,7 @@ fn detect_stats_count_by_predicate(
 }
 
 fn detect_fused_scan_sum_i64(
-    query: &ParsedQuery,
+    query: &Query,
     options: &QueryOptions,
 ) -> Option<(Ref, SumExprI64, VarId)> {
     if matches!(
@@ -1693,7 +1693,7 @@ fn detect_fused_scan_sum_i64(
 }
 
 fn detect_exists_join_count_distinct_object(
-    query: &ParsedQuery,
+    query: &Query,
     options: &QueryOptions,
 ) -> Option<(Ref, Ref, VarId)> {
     let (in_var, out_var) = detect_count_distinct_aggregate(query, options)?;
@@ -1728,7 +1728,7 @@ fn detect_exists_join_count_distinct_object(
 }
 
 fn detect_multicolumn_join_count_all(
-    query: &ParsedQuery,
+    query: &Query,
     options: &QueryOptions,
 ) -> Option<(Ref, Ref, VarId)> {
     let out_var = detect_count_all_aggregate(query, options)?;
@@ -1760,7 +1760,7 @@ fn detect_multicolumn_join_count_all(
     Some((p1, p2, out_var))
 }
 
-fn detect_count_blank_node_subjects(query: &ParsedQuery, options: &QueryOptions) -> Option<VarId> {
+fn detect_count_blank_node_subjects(query: &Query, options: &QueryOptions) -> Option<VarId> {
     let (input_var, out_var) = detect_count_aggregate(query, options)?;
 
     // Pattern shape: one Triple + one Filter(ISBLANK(?s)) in canonical order.
@@ -1798,7 +1798,7 @@ fn detect_count_blank_node_subjects(query: &ParsedQuery, options: &QueryOptions)
     Some(out_var)
 }
 
-fn detect_count_literal_objects(query: &ParsedQuery, options: &QueryOptions) -> Option<VarId> {
+fn detect_count_literal_objects(query: &Query, options: &QueryOptions) -> Option<VarId> {
     let (input_var, out_var) = detect_count_aggregate(query, options)?;
 
     // Pattern shape: one Triple + one Filter(ISLITERAL(?o)) in canonical order.
@@ -1836,7 +1836,7 @@ fn detect_count_literal_objects(query: &ParsedQuery, options: &QueryOptions) -> 
     Some(out_var)
 }
 
-fn detect_count_distinct_objects(query: &ParsedQuery, options: &QueryOptions) -> Option<VarId> {
+fn detect_count_distinct_objects(query: &Query, options: &QueryOptions) -> Option<VarId> {
     let (in_var, out_var) = detect_count_distinct_aggregate(query, options)?;
 
     // Pattern shape: exactly one triple with all vars.
@@ -1861,7 +1861,7 @@ fn detect_count_distinct_objects(query: &ParsedQuery, options: &QueryOptions) ->
     Some(out_var)
 }
 
-fn detect_count_distinct_subjects(query: &ParsedQuery, options: &QueryOptions) -> Option<VarId> {
+fn detect_count_distinct_subjects(query: &Query, options: &QueryOptions) -> Option<VarId> {
     let (in_var, out_var) = detect_count_distinct_aggregate(query, options)?;
 
     // Pattern shape: exactly one triple with all vars.
@@ -1886,7 +1886,7 @@ fn detect_count_distinct_subjects(query: &ParsedQuery, options: &QueryOptions) -
     Some(out_var)
 }
 
-fn detect_count_distinct_predicates(query: &ParsedQuery, options: &QueryOptions) -> Option<VarId> {
+fn detect_count_distinct_predicates(query: &Query, options: &QueryOptions) -> Option<VarId> {
     let (in_var, out_var) = detect_count_distinct_aggregate(query, options)?;
 
     // Pattern shape: exactly one triple with all vars.
@@ -1911,7 +1911,7 @@ fn detect_count_distinct_predicates(query: &ParsedQuery, options: &QueryOptions)
     Some(out_var)
 }
 
-fn detect_count_triples(query: &ParsedQuery, options: &QueryOptions) -> Option<VarId> {
+fn detect_count_triples(query: &Query, options: &QueryOptions) -> Option<VarId> {
     let (input_var, out_var) = detect_count_aggregate(query, options)?;
 
     // Pattern shape: exactly one triple with all vars.
@@ -1939,7 +1939,7 @@ fn detect_count_triples(query: &ParsedQuery, options: &QueryOptions) -> Option<V
 }
 
 fn detect_optional_chain_head_join_count_all(
-    query: &ParsedQuery,
+    query: &Query,
     options: &QueryOptions,
 ) -> Option<(Ref, Ref, Ref, VarId)> {
     let out_var = detect_count_all_aggregate(query, options)?;
@@ -1987,7 +1987,7 @@ fn detect_optional_chain_head_join_count_all(
 }
 
 fn detect_transitive_path_plus_count_all(
-    query: &ParsedQuery,
+    query: &Query,
     options: &QueryOptions,
 ) -> Option<(Ref, Ref, VarId)> {
     let out_var = detect_count_all_aggregate(query, options)?;
@@ -2022,7 +2022,7 @@ fn detect_transitive_path_plus_count_all(
 }
 
 fn detect_property_path_plus_fixed_subject_count_all(
-    query: &ParsedQuery,
+    query: &Query,
     options: &QueryOptions,
 ) -> Option<(fluree_db_core::Sid, Ref, VarId)> {
     let out_var = detect_count_all_aggregate(query, options)?;
@@ -2045,7 +2045,7 @@ fn detect_property_path_plus_fixed_subject_count_all(
 }
 
 fn detect_union_star_count_all(
-    query: &ParsedQuery,
+    query: &Query,
     options: &QueryOptions,
 ) -> Option<(Vec<Ref>, Vec<Ref>, UnionCountMode, VarId)> {
     use crate::ir::{Expression, Function};
@@ -2148,7 +2148,7 @@ fn detect_union_star_count_all(
 /// Constructs operators in the order:
 /// WHERE patterns → GROUP BY → Aggregates → HAVING → ORDER BY → PROJECT → DISTINCT → OFFSET → LIMIT
 pub fn build_operator_tree(
-    query: &ParsedQuery,
+    query: &Query,
     options: &QueryOptions,
     stats: Option<Arc<StatsView>>,
     planning: &PlanningContext,
@@ -2157,7 +2157,7 @@ pub fn build_operator_tree(
 }
 
 fn build_operator_tree_inner(
-    query: &ParsedQuery,
+    query: &Query,
     options: &QueryOptions,
     stats: Option<Arc<StatsView>>,
     enable_fused_fast_paths: bool,
@@ -3087,7 +3087,7 @@ mod tests {
     use super::*;
     use crate::ir::Pattern;
     use crate::options::QueryOptions;
-    use crate::parse::{ParsedQuery, QueryOutput};
+    use crate::ir::{Query, QueryOutput};
     use crate::sort::SortSpec;
     use crate::ir::triple::{Ref, Term, TriplePattern};
     use fluree_db_core::Sid;
@@ -3101,13 +3101,13 @@ mod tests {
         )
     }
 
-    fn make_simple_query(select: Vec<VarId>, patterns: Vec<Pattern>) -> ParsedQuery {
+    fn make_simple_query(select: Vec<VarId>, patterns: Vec<Pattern>) -> Query {
         let output = if select.is_empty() {
             QueryOutput::Wildcard
         } else {
             QueryOutput::select(select)
         };
-        ParsedQuery {
+        Query {
             context: ParsedContext::default(),
             orig_context: None,
             output,
@@ -3152,7 +3152,7 @@ mod tests {
             )),
         ];
 
-        let query = ParsedQuery {
+        let query = Query {
             context: ParsedContext::default(),
             orig_context: None,
             output: QueryOutput::select(vec![s, label]),
@@ -3179,7 +3179,7 @@ mod tests {
 
     #[test]
     fn test_build_operator_tree_validates_select_vars() {
-        let query = ParsedQuery {
+        let query = Query {
             context: ParsedContext::default(),
             orig_context: None,
             output: QueryOutput::select(vec![VarId(99)]), // Variable not in pattern
@@ -3203,7 +3203,7 @@ mod tests {
 
     #[test]
     fn test_build_operator_tree_validates_sort_vars() {
-        let query = ParsedQuery {
+        let query = Query {
             context: ParsedContext::default(),
             orig_context: None,
             output: QueryOutput::select(vec![VarId(0)]),
@@ -3252,7 +3252,7 @@ mod tests {
         let exists_pred = Ref::Sid(Sid::new(100, "rdf:type"));
         let count_pred = Ref::Sid(Sid::new(100, "sourceLink"));
 
-        let counted_first = ParsedQuery {
+        let counted_first = Query {
             context: ParsedContext::default(),
             orig_context: None,
             output: QueryOutput::select(vec![out]),
@@ -3272,7 +3272,7 @@ mod tests {
             graph_select: None,
             post_values: None,
         };
-        let reversed = ParsedQuery {
+        let reversed = Query {
             context: ParsedContext::default(),
             orig_context: None,
             output: QueryOutput::select(vec![out]),

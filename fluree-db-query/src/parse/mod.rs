@@ -43,14 +43,11 @@ pub use ast::{
 pub use encode::{IriEncoder, MemoryEncoder, NoEncoder};
 pub use error::{ParseError, Result};
 pub(crate) use lower::{lower_query, SelectMode};
-pub use lower::{
-    lower_unresolved_pattern, lower_unresolved_patterns, ConstructTemplate, GraphSelectSpec,
-    NestedSelectSpec, ParsedQuery, ProjectionShape, QueryOutput, Root, SelectionSpec,
-};
+pub use lower::{lower_unresolved_pattern, lower_unresolved_patterns};
 pub use policy::{JsonLdParseCtx, JsonLdParsePolicy};
 pub use where_clause::parse_where_with_counters;
 
-use crate::ir::Expression;
+use crate::ir::{Expression, ProjectionShape, Query};
 use crate::var_registry::VarRegistry;
 use ast::UnresolvedPathExpr;
 use fluree_graph_json_ld::{parse_context, ParsedContext};
@@ -1077,13 +1074,13 @@ fn validate_var_name(name: &str) -> Result<()> {
 ///
 /// # Returns
 ///
-/// A fully resolved `ParsedQuery` ready for execution.
+/// A fully resolved `Query` ready for execution.
 pub fn parse_query<E: IriEncoder>(
     json: &JsonValue,
     encoder: &E,
     vars: &mut VarRegistry,
     strict_override: Option<bool>,
-) -> Result<ParsedQuery> {
+) -> Result<Query> {
     let (ast, select_mode) = parse_query_ast(json, strict_override)?;
     lower_query(ast, encoder, vars, select_mode)
 }

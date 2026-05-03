@@ -225,7 +225,8 @@ pub use fluree_db_query::{
 // Re-export for lower-level pattern-based queries (internal/advanced use)
 pub use fluree_db_query::{Term, TriplePattern};
 // Re-export parse types for query results
-pub use fluree_db_query::parse::{ParseError, ParsedQuery};
+pub use fluree_db_query::ir::Query;
+pub use fluree_db_query::parse::ParseError;
 pub use fluree_db_transact::{
     lower_sparql_update, lower_sparql_update_ast, CommitOpts, CommitReceipt,
     LowerError as SparqlUpdateLowerError, NamespaceRegistry, TransactError, TxnOpts, TxnType,

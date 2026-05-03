@@ -1,7 +1,7 @@
 //! Query execution engine
 //!
 //! This module provides the query runner that builds operator trees from
-//! `ParsedQuery` and executes them with optional solution modifiers.
+//! `Query` and executes them with optional solution modifiers.
 //!
 //! # Architecture
 //!
@@ -68,7 +68,7 @@ mod tests {
     use super::*;
     use crate::ir::{Expression, FilterValue, Pattern};
     use crate::options::QueryOptions;
-    use crate::parse::{ParsedQuery, QueryOutput};
+    use crate::ir::{Query, QueryOutput};
     use crate::planner::reorder_patterns;
     use crate::sort::SortSpec;
     use crate::ir::triple::{Ref, Term, TriplePattern};
@@ -98,7 +98,7 @@ mod tests {
         let vars = VarRegistry::new();
         let db = GraphDbRef::new(&snapshot, 0, &NoOverlay, snapshot.t);
 
-        let query = ParsedQuery {
+        let query = Query {
             context: ParsedContext::default(),
             orig_context: None,
             output: QueryOutput::Wildcard,
@@ -141,7 +141,7 @@ mod tests {
 
     #[test]
     fn test_build_operator_tree_validates_select_vars() {
-        let query = ParsedQuery {
+        let query = Query {
             context: ParsedContext::default(),
             orig_context: None,
             output: QueryOutput::select(vec![VarId(99)]), // Variable not in pattern
@@ -165,7 +165,7 @@ mod tests {
 
     #[test]
     fn test_build_operator_tree_validates_sort_vars() {
-        let query = ParsedQuery {
+        let query = Query {
             context: ParsedContext::default(),
             orig_context: None,
             output: QueryOutput::select(vec![VarId(0)]),

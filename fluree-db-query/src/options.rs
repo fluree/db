@@ -15,7 +15,7 @@ use crate::var_registry::VarId;
 /// Options for query execution modifiers
 ///
 /// Controls GROUP BY, HAVING, ORDER BY, DISTINCT, OFFSET, LIMIT, and reasoning behavior.
-/// This type is shared between the parse module (embedded in ParsedQuery) and
+/// This type is shared between the parse module (embedded in Query) and
 /// the execute module (used by ExecutableQuery).
 #[derive(Debug, Clone, Default)]
 pub struct QueryOptions {

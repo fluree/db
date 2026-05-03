@@ -15,7 +15,7 @@ use fluree_db_query::groupby::GroupByOperator;
 use fluree_db_query::ir::{Expression, FilterValue, Pattern};
 use fluree_db_query::operator::Operator;
 use fluree_db_query::options::QueryOptions;
-use fluree_db_query::parse::{ParsedQuery, QueryOutput};
+use fluree_db_query::ir::{Query, QueryOutput};
 use fluree_db_query::var_registry::{VarId, VarRegistry};
 use fluree_graph_json_ld::ParsedContext;
 use std::sync::Arc;
@@ -32,13 +32,13 @@ fn xsd_string() -> Sid {
     Sid::new(2, "string")
 }
 
-fn make_query(select: Vec<VarId>, patterns: Vec<Pattern>) -> ParsedQuery {
+fn make_query(select: Vec<VarId>, patterns: Vec<Pattern>) -> Query {
     let output = if select.is_empty() {
         QueryOutput::Wildcard
     } else {
         QueryOutput::select(select)
     };
-    ParsedQuery {
+    Query {
         context: ParsedContext::default(),
         orig_context: None,
         output,

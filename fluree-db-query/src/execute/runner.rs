@@ -11,7 +11,7 @@ use crate::error::Result;
 use crate::ir::Pattern;
 use crate::operator::BoxedOperator;
 use crate::options::QueryOptions;
-use crate::parse::ParsedQuery;
+use crate::ir::Query;
 use crate::reasoning::ReasoningOverlay;
 use crate::rewrite_owl_ql::Ontology;
 use crate::schema_bundle::SchemaBundleOverlay;
@@ -69,23 +69,23 @@ fn dedup_exact_triples(patterns: Vec<Pattern>) -> Vec<Pattern> {
 /// Query with execution options
 ///
 /// Combines a parsed query with solution modifiers for execution.
-/// The `options` field allows overriding the options embedded in `ParsedQuery`.
+/// The `options` field allows overriding the options embedded in `Query`.
 #[derive(Debug)]
 pub struct ExecutableQuery {
     /// The parsed query (contains embedded options)
-    pub query: ParsedQuery,
+    pub query: Query,
     /// Execution options (may override query.options)
     pub options: QueryOptions,
 }
 
 impl ExecutableQuery {
     /// Create a new executable query with explicit options override
-    pub fn new(query: ParsedQuery, options: QueryOptions) -> Self {
+    pub fn new(query: Query, options: QueryOptions) -> Self {
         Self { query, options }
     }
 
     /// Create an executable query using the query's embedded options
-    pub fn simple(query: ParsedQuery) -> Self {
+    pub fn simple(query: Query) -> Self {
         let options = query.options.clone();
         Self { query, options }
     }

@@ -62,7 +62,7 @@ use crate::ast::query::{QueryBody, SelectVariables, SparqlAst};
 
 use fluree_db_query::ir::Pattern;
 use fluree_db_query::parse::encode::IriEncoder;
-use fluree_db_query::parse::{ParsedQuery, QueryOutput};
+use fluree_db_query::ir::{Query, QueryOutput};
 use fluree_db_query::var_registry::{VarId, VarRegistry};
 
 use fluree_graph_json_ld::{parse_context, ParsedContext};
@@ -70,9 +70,9 @@ use fluree_graph_json_ld::{parse_context, ParsedContext};
 use std::collections::HashMap;
 use std::sync::Arc;
 
-/// Lower a SPARQL AST to a ParsedQuery.
+/// Lower a SPARQL AST to a Query.
 ///
-/// This produces a `ParsedQuery` that can be directly executed by the
+/// This produces a `Query` that can be directly executed by the
 /// fluree-db-query engine via `ExecutableQuery`.
 ///
 /// # Arguments
@@ -83,16 +83,16 @@ use std::sync::Arc;
 ///
 /// # Returns
 ///
-/// A `ParsedQuery` ready for execution, or a `LowerError`.
+/// A `Query` ready for execution, or a `LowerError`.
 pub fn lower_sparql<E: IriEncoder>(
     ast: &SparqlAst,
     encoder: &E,
     vars: &mut VarRegistry,
-) -> Result<ParsedQuery> {
+) -> Result<Query> {
     lower_sparql_with_source(ast, encoder, vars, None)
 }
 
-/// Lower a SPARQL AST to a ParsedQuery, with optional source text for SERVICE body capture.
+/// Lower a SPARQL AST to a Query, with optional source text for SERVICE body capture.
 ///
 /// When `source_text` is provided, SERVICE patterns will capture the original SPARQL
 /// text for their body, enabling remote execution without an IR-to-SPARQL serializer.
@@ -101,7 +101,7 @@ pub fn lower_sparql_with_source<E: IriEncoder>(
     encoder: &E,
     vars: &mut VarRegistry,
     source_text: Option<&str>,
-) -> Result<ParsedQuery> {
+) -> Result<Query> {
     let span = tracing::debug_span!("sparql_lower");
     let _guard = span.enter();
 
@@ -184,7 +184,7 @@ impl<'a, E: IriEncoder> LoweringContext<'a, E> {
     }
 
     /// Main entry point for lowering.
-    fn lower(&mut self) -> Result<ParsedQuery> {
+    fn lower(&mut self) -> Result<Query> {
         match &self.ast.body {
             QueryBody::Select(select_query) => {
                 // Lower WHERE clause patterns
@@ -242,7 +242,7 @@ impl<'a, E: IriEncoder> LoweringContext<'a, E> {
                     _ => QueryOutput::select(select),
                 };
 
-                Ok(ParsedQuery {
+                Ok(Query {
                     context: ctx,
                     orig_context: None, // SPARQL doesn't originate from JSON context
                     output,
@@ -322,11 +322,11 @@ mod tests {
         encoder
     }
 
-    fn lower_query(sparql: &str) -> Result<ParsedQuery> {
+    fn lower_query(sparql: &str) -> Result<Query> {
         lower_query_with_vars(sparql).map(|(q, _)| q)
     }
 
-    fn lower_query_with_vars(sparql: &str) -> Result<(ParsedQuery, VarRegistry)> {
+    fn lower_query_with_vars(sparql: &str) -> Result<(Query, VarRegistry)> {
         let output = parse_sparql(sparql);
         assert!(
             output.ast.is_some(),

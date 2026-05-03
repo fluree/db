@@ -24,7 +24,7 @@ use fluree_db_api::{
 };
 use fluree_db_core::{GraphDbRef, NoOverlay, Tracker};
 use fluree_db_query::ir::GraphName;
-use fluree_db_query::parse::{ParsedQuery, QueryOutput};
+use fluree_db_query::ir::{Query, QueryOutput};
 use fluree_db_query::ir::triple::{Ref, Term, TriplePattern};
 use support::genesis_ledger;
 
@@ -442,7 +442,7 @@ async fn e2e_r2rml_query_iceberg_table() {
         patterns: inner_patterns,
     };
 
-    let mut parsed = ParsedQuery::new(ParsedContext::default());
+    let mut parsed = Query::new(ParsedContext::default());
     parsed.patterns = vec![graph_pattern];
     parsed.output = QueryOutput::select(vec![airline_var, name_var, country_var]);
 
@@ -1089,8 +1089,8 @@ async fn engine_e2e_graph_pattern_r2rml_scan() {
         patterns: inner_patterns,
     };
 
-    // Build ParsedQuery with this pattern
-    let mut parsed = ParsedQuery::new(ParsedContext::default());
+    // Build Query with this pattern
+    let mut parsed = Query::new(ParsedContext::default());
     parsed.patterns = vec![graph_pattern];
     parsed.output = QueryOutput::select(vec![subject_var, name_var]);
 
@@ -1206,7 +1206,7 @@ async fn engine_e2e_provider_method_calls() {
         ))],
     };
 
-    let mut parsed = ParsedQuery::new(ParsedContext::default());
+    let mut parsed = Query::new(ParsedContext::default());
     parsed.patterns = vec![graph_pattern];
     parsed.output = QueryOutput::select(vec![subject_var]);
 
@@ -1839,7 +1839,7 @@ async fn engine_e2e_ref_object_map_join_execution() {
         patterns: inner_patterns,
     };
 
-    let mut parsed = ParsedQuery::new(ParsedContext::default());
+    let mut parsed = Query::new(ParsedContext::default());
     parsed.patterns = vec![graph_pattern];
     parsed.output = QueryOutput::select(vec![route_var, airline_var]);
 
