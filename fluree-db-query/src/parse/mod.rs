@@ -1367,7 +1367,7 @@ mod tests {
     }
 
     #[test]
-    fn test_type_expansion() {
+    fn test_type_hydration() {
         let json = json!({
             "@context": { "ex": "http://example.org/" },
             "select": ["?s"],
@@ -1479,7 +1479,7 @@ mod tests {
     }
 
     #[test]
-    fn test_vocab_expansion() {
+    fn test_vocab_hydration() {
         let json = json!({
             "@context": {
                 "@vocab": "http://schema.org/"
@@ -1852,7 +1852,7 @@ mod tests {
     }
 
     #[test]
-    fn test_reference_value_expansion() {
+    fn test_reference_value_hydration() {
         // String values for @id-typed properties should expand to IRIs
         let json = json!({
             "@context": {

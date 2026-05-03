@@ -603,7 +603,7 @@ mod tests {
     }
 
     #[test]
-    fn test_type_expansion() {
+    fn test_type_hydration() {
         let interner = SidInterner::new();
         let animal = interner.intern(100, "Animal");
 
@@ -740,7 +740,7 @@ mod tests {
     }
 
     #[test]
-    fn test_optional_pattern_expansion() {
+    fn test_optional_pattern_hydration() {
         let interner = SidInterner::new();
         let animal = interner.intern(100, "Animal");
 
@@ -921,7 +921,7 @@ mod tests {
     }
 
     #[test]
-    fn test_predicate_expansion() {
+    fn test_predicate_hydration() {
         let interner = SidInterner::new();
         let has_color = interner.intern(100, "hasColor");
 
@@ -1061,7 +1061,7 @@ mod tests {
     }
 
     #[test]
-    fn test_combined_type_and_predicate_expansion() {
+    fn test_combined_type_and_predicate_hydration() {
         // Test that both type and predicate expansion work together
         let interner = SidInterner::new();
 
