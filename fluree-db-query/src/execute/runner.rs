@@ -570,11 +570,6 @@ pub struct ContextConfig<'a, 'b> {
 
 impl Default for ContextConfig<'_, '_> {
     fn default() -> Self {
-        // strict-by-default: query semantics treat bind eval errors as query
-        // errors. Every wrapper in this file set `strict_bind_errors: true`,
-        // and the view layer sets it true; the only lax path was the legacy
-        // `execute_where_with_overlay_at` family in `lib.rs`, which never
-        // went through `ContextConfig`.
         Self {
             tracker: None,
             policy_enforcer: None,
@@ -595,22 +590,6 @@ impl Default for ContextConfig<'_, '_> {
     }
 }
 
-impl ContextConfig<'_, '_> {
-    /// Attach a policy enforcer built from a `&PolicyContext`.
-    ///
-    /// Wraps the `Arc::new(QueryPolicyEnforcer::new(Arc::new(policy.clone())))`
-    /// boilerplate so callers handing in a raw `&PolicyContext` don't have to
-    /// reconstruct it. Callers that already hold a cached
-    /// `Arc<QueryPolicyEnforcer>` (e.g., the view layer via
-    /// `db.policy_enforcer().cloned()`) should set `policy_enforcer` directly.
-    pub fn with_policy(mut self, policy: &fluree_db_policy::PolicyContext) -> Self {
-        self.policy_enforcer = Some(Arc::new(crate::policy::QueryPolicyEnforcer::new(Arc::new(
-            policy.clone(),
-        ))));
-        self
-    }
-}
-
 /// Execute a prepared query with configurable context options
 ///
 /// This is the unified internal execution path that handles all variants.
@@ -621,19 +600,16 @@ pub async fn execute_prepared<'a, 'b>(
     prepared: PreparedExecution,
     config: ContextConfig<'a, 'b>,
 ) -> Result<Vec<Batch>> {
-    // Create composite overlay if we have derived facts
     let reasoning_overlay: Option<ReasoningOverlay<'a>> = prepared
         .derived_overlay
         .as_ref()
         .map(|derived| ReasoningOverlay::new(db.overlay, derived.clone()));
 
-    // Use composite overlay if available, otherwise base overlay
     let effective_overlay: &dyn fluree_db_core::OverlayProvider = reasoning_overlay
         .as_ref()
         .map(|o| o as &dyn fluree_db_core::OverlayProvider)
         .unwrap_or(db.overlay);
 
-    // Build context with all configured options
     let mut ctx = ExecutionContext::with_time_and_overlay(
         db.snapshot,
         vars,
