@@ -61,8 +61,8 @@ pub use error::{LowerError, Result};
 use crate::ast::query::{QueryBody, SelectVariables, SparqlAst};
 
 use fluree_db_query::ir::Pattern;
-use fluree_db_query::parse::encode::IriEncoder;
 use fluree_db_query::ir::{Query, QueryOutput};
+use fluree_db_query::parse::encode::IriEncoder;
 use fluree_db_query::var_registry::{VarId, VarRegistry};
 
 use fluree_graph_json_ld::{parse_context, ParsedContext};
@@ -309,10 +309,10 @@ mod tests {
     use super::*;
     use crate::parse::parse_sparql;
     use fluree_db_query::aggregate::AggregateFn;
+    use fluree_db_query::ir::triple::{Ref, Term};
     use fluree_db_query::ir::{PathModifier, Pattern};
     use fluree_db_query::parse::encode::MemoryEncoder;
     use fluree_db_query::sort::SortDirection;
-    use fluree_db_query::ir::triple::{Ref, Term};
 
     fn test_encoder() -> MemoryEncoder {
         let mut encoder = MemoryEncoder::with_common_namespaces();

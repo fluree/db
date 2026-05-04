@@ -7,8 +7,8 @@
 use crate::binding::{Batch, Binding};
 use crate::context::ExecutionContext;
 use crate::error::{QueryError, Result};
-use crate::operator::{BoxedOperator, Operator, OperatorState};
 use crate::ir::triple::Ref;
+use crate::operator::{BoxedOperator, Operator, OperatorState};
 use crate::var_registry::VarId;
 use async_trait::async_trait;
 use fluree_db_binary_index::format::branch::LeafEntry;

@@ -19,8 +19,8 @@ use crate::fast_path_common::{
     build_i64_singleton_batch, fast_path_store, leaf_entries_for_predicate, normalize_pred_sid,
     FastPathOperator,
 };
-use crate::operator::BoxedOperator;
 use crate::ir::triple::Ref;
+use crate::operator::BoxedOperator;
 use crate::var_registry::VarId;
 use chrono::Datelike;
 use fluree_db_binary_index::format::column_block::ColumnId;

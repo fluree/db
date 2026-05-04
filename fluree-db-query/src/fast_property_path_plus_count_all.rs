@@ -18,8 +18,8 @@ use crate::fast_path_common::{
     count_to_i64, cursor_projection_sid_otype_okey, fast_path_store, reach_count_plus,
     reach_count_plus_multi, subject_ref_to_s_id, FastPathOperator,
 };
-use crate::operator::BoxedOperator;
 use crate::ir::triple::Ref;
+use crate::operator::BoxedOperator;
 use crate::var_registry::VarId;
 use fluree_db_core::o_type::OType;
 use rustc_hash::FxHashMap;

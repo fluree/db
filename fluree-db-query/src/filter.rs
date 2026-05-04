@@ -22,10 +22,10 @@ use crate::context::ExecutionContext;
 use crate::error::Result;
 use crate::execute::build_where_operators_seeded;
 use crate::expression::PreparedBoolExpression;
+use crate::ir::triple::Ref;
 use crate::ir::{Expression, FilterValue, Pattern};
 use crate::operator::{BoxedOperator, Operator, OperatorState};
 use crate::seed::{EmptyOperator, SeedOperator};
-use crate::ir::triple::Ref;
 use crate::var_registry::VarId;
 use async_trait::async_trait;
 use rustc_hash::{FxHashMap, FxHashSet};
@@ -596,8 +596,8 @@ impl Operator for FilterOperator {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ir::FilterValue;
     use crate::ir::triple::{Ref, Term, TriplePattern};
+    use crate::ir::FilterValue;
     use fluree_db_core::Sid;
 
     #[test]

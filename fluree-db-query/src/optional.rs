@@ -27,6 +27,7 @@ use crate::binding::{Batch, Binding};
 use crate::context::ExecutionContext;
 use crate::error::{QueryError, Result};
 use crate::fast_path_common::try_normalize_pred_sid;
+use crate::ir::triple::{Ref, Term, TriplePattern};
 use crate::ir::Pattern;
 use crate::join::{
     batched_subject_probe_binary, BindInstruction, PatternPosition, SubjectProbeParams,
@@ -37,7 +38,6 @@ use crate::operator::{
 };
 use crate::seed::SeedOperator;
 use crate::temporal_mode::PlanningContext;
-use crate::ir::triple::{Ref, Term, TriplePattern};
 use crate::var_registry::VarId;
 use async_trait::async_trait;
 use fluree_db_core::StatsView;

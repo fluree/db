@@ -119,7 +119,8 @@ pub use groupby::GroupByOperator;
 pub use having::HavingOperator;
 pub use ir::{
     CompareOp, Expression, FilterValue, Function, PathModifier, Pattern, PropertyPathPattern,
-    R2rmlPattern, ServiceEndpoint, ServicePattern, SubqueryPattern,
+    Query, QueryOptions, QueryOutput, R2rmlPattern, ReasoningModes, Ref, ServiceEndpoint,
+    ServicePattern, SubqueryPattern, Term, TriplePattern,
 };
 pub use join::{BindInstruction, NestedLoopJoinOperator, PatternPosition, UnifyInstruction};
 pub use limit::LimitOperator;
@@ -128,7 +129,6 @@ pub use minus::MinusOperator;
 pub use offset::OffsetOperator;
 pub use operator::{BoxedOperator, Operator, OperatorState};
 pub use optional::OptionalOperator;
-pub use ir::QueryOptions;
 pub use planner::{
     extract_object_bounds_for_var, extract_range_constraints, is_property_join, PatternType,
     RangeConstraint, RangeValue,
@@ -139,17 +139,13 @@ pub use property_join::PropertyJoinOperator;
 pub use property_path::{PropertyPathOperator, DEFAULT_MAX_VISITED};
 pub use r2rml::{NoOpR2rmlProvider, R2rmlProvider, R2rmlScanOperator, R2rmlTableProvider};
 pub use reasoning::{global_reasoning_cache, ReasoningOverlay};
-pub use ir::ReasoningModes;
-pub use rewrite::{
-    rewrite_patterns, Diagnostics as RewriteDiagnostics, PlanContext, PlanLimits,
-};
+pub use rewrite::{rewrite_patterns, Diagnostics as RewriteDiagnostics, PlanContext, PlanLimits};
 pub use rewrite_owl_ql::{rewrite_owl_ql_patterns, Ontology, OwlQlContext};
 pub use seed::{EmptyOperator, SeedOperator};
 pub use sort::{compare_bindings, compare_flake_values, SortDirection, SortOperator, SortSpec};
 pub use stats_query::StatsCountByPredicateOperator;
 pub use subquery::SubqueryOperator;
 pub use temporal_mode::{PlanningContext, TemporalMode};
-pub use ir::triple::{Ref, Term, TriplePattern};
 
 // Re-export DatatypeConstraint from fluree-db-core for convenience
 pub use fluree_db_core::DatatypeConstraint;
@@ -158,11 +154,8 @@ pub use values::ValuesOperator;
 
 // Re-export from fluree-db-core for convenience
 pub use fluree_db_core::ObjectBounds;
-pub use var_registry::{VarId, VarRegistry};
-
-// Re-export parse types for query parsing
-pub use ir::{Query, QueryOutput};
 pub use parse::parse_query;
+pub use var_registry::{VarId, VarRegistry};
 
 use execute::build_where_operators_seeded;
 use fluree_db_core::GraphDbRef;

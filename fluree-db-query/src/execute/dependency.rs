@@ -117,20 +117,16 @@ pub fn compute_variable_deps(query: &Query, options: &QueryOptions) -> Option<Va
 mod tests {
     use super::*;
     use crate::aggregate::{AggregateFn, AggregateSpec};
-    use crate::ir::{Expression, FilterValue, Pattern};
+    use crate::ir::triple::{Ref, Term, TriplePattern};
     use crate::ir::QueryOptions;
     use crate::ir::{ConstructTemplate, Query, QueryOutput};
+    use crate::ir::{Expression, FilterValue, Pattern};
     use crate::parse::SelectMode;
     use crate::sort::SortSpec;
-    use crate::ir::triple::{Ref, Term, TriplePattern};
     use fluree_db_core::Sid;
     use fluree_graph_json_ld::ParsedContext;
 
-    fn make_query(
-        select: Vec<VarId>,
-        patterns: Vec<Pattern>,
-        select_mode: SelectMode,
-    ) -> Query {
+    fn make_query(select: Vec<VarId>, patterns: Vec<Pattern>, select_mode: SelectMode) -> Query {
         let output = match select_mode {
             SelectMode::Many => QueryOutput::select(select),
             SelectMode::One => QueryOutput::select_one(select),

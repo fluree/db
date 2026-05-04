@@ -17,8 +17,8 @@ use crate::fast_path_common::{
     cursor_projection_sid_otype_okey, normalize_pred_sid, reach_count_plus, reach_count_plus_multi,
     FastPathOperator,
 };
-use crate::operator::BoxedOperator;
 use crate::ir::triple::Ref;
+use crate::operator::BoxedOperator;
 use crate::var_registry::VarId;
 use fluree_db_core::o_type::OType;
 use rustc_hash::FxHashMap;

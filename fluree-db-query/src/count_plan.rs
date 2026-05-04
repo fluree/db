@@ -14,10 +14,10 @@
 //! - `count_plan_exec.rs` — evaluates a `CountPlan` against a `BinaryIndexStore`
 
 use crate::execute::operator_tree::{detect_count_all_aggregate, validate_simple_triple};
-use crate::ir::{Expression, Pattern};
-use crate::ir::QueryOptions;
-use crate::ir::Query;
 use crate::ir::triple::Ref;
+use crate::ir::Query;
+use crate::ir::QueryOptions;
+use crate::ir::{Expression, Pattern};
 use crate::var_registry::VarId;
 
 /// Resolve an EXISTS block from a `Filter(Expression::Exists { .. })` expression.
@@ -201,10 +201,7 @@ pub(crate) struct CountPlan {
 ///
 /// Gate: ungrouped `COUNT(*)`, no DISTINCT, no HAVING, no ORDER BY, no LIMIT/OFFSET.
 /// Runtime gating (binary-index store, HEAD query, root policy) happens in the executor.
-pub(crate) fn try_build_count_plan(
-    query: &Query,
-    options: &QueryOptions,
-) -> Option<CountPlan> {
+pub(crate) fn try_build_count_plan(query: &Query, options: &QueryOptions) -> Option<CountPlan> {
     let out_var = detect_count_all_aggregate(query, options)?;
 
     // Classify all patterns in the WHERE clause.
@@ -946,8 +943,8 @@ fn build_keyset_for_object_chain_block(
 mod tests {
     use super::*;
     use crate::aggregate::AggregateFn;
-    use crate::ir::QueryOutput;
     use crate::ir::triple::{Term, TriplePattern};
+    use crate::ir::QueryOutput;
     use crate::var_registry::VarRegistry;
     use fluree_db_core::Sid;
     use fluree_graph_json_ld::ParsedContext;

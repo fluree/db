@@ -8,8 +8,8 @@ use crate::format::iri::IriCompactor;
 use crate::query::helpers::{parse_jsonld_query, parse_sparql_to_ir};
 use fluree_db_core::{is_rdf_type, StatsView};
 use fluree_db_query::{
-    explain_execution_hints, parse_query, ExplainPlan, OptimizationStatus, Query, Pattern,
-    Ref, Term, TriplePattern, VarRegistry,
+    explain_execution_hints, parse_query, ExplainPlan, OptimizationStatus, Pattern, Query, Ref,
+    Term, TriplePattern, VarRegistry,
 };
 use serde_json::{json, Map, Value as JsonValue};
 

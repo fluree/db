@@ -16,8 +16,8 @@ use crate::fast_path_common::{
     build_count_batch, build_i64_singleton_batch, contiguous_id_range, fast_path_store,
     ref_to_p_id, FastPathOperator,
 };
-use crate::operator::BoxedOperator;
 use crate::ir::triple::Ref;
+use crate::operator::BoxedOperator;
 use crate::var_registry::VarId;
 use fluree_db_binary_index::format::column_block::ColumnId;
 use fluree_db_binary_index::format::run_record::RunSortOrder;

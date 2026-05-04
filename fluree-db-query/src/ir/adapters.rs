@@ -155,7 +155,6 @@ impl IndexSearchPattern {
         vars.extend(self.input_vars());
         vars
     }
-
 }
 
 // ============================================================================
@@ -312,7 +311,6 @@ impl VectorSearchPattern {
         vars.extend(self.input_vars());
         vars
     }
-
 }
 
 // ============================================================================
@@ -419,8 +417,6 @@ impl GeoSearchPattern {
         vars.extend(self.input_vars());
         vars
     }
-
-
 }
 
 // ============================================================================
@@ -587,7 +583,6 @@ impl S2SearchPattern {
         vars.extend(self.input_vars());
         vars
     }
-
 }
 
 // ============================================================================
@@ -683,5 +678,4 @@ impl R2rmlPattern {
     pub fn referenced_vars(&self) -> Vec<VarId> {
         self.produced_vars()
     }
-
 }

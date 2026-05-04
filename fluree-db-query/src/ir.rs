@@ -46,9 +46,7 @@ pub use adapters::{
 pub use expression::{ArithmeticOp, CompareOp, Expression, FilterValue, Function};
 pub use options::{QueryOptions, ReasoningModes};
 pub use path::{PathModifier, PropertyPathPattern};
-pub use pattern::{
-    GraphName, Pattern, ServiceEndpoint, ServicePattern, SubqueryPattern,
-};
+pub use pattern::{GraphName, Pattern, ServiceEndpoint, ServicePattern, SubqueryPattern};
 pub use projection::{GraphSelectSpec, NestedSelectSpec, Root, SelectionSpec};
 pub use query::{ConstructTemplate, ProjectionShape, Query, QueryOutput};
 pub use triple::{Ref, Term, TriplePattern};

@@ -89,9 +89,9 @@ use crate::binary_scan::{BinaryScanOperator, EmitMask};
 use crate::binding::Batch;
 use crate::context::ExecutionContext;
 use crate::error::{QueryError, Result};
+use crate::ir::triple::TriplePattern;
 use crate::operator::inline::InlineOperator;
 use crate::operator::Operator;
-use crate::ir::triple::TriplePattern;
 use crate::var_registry::VarId;
 
 /// Scan operator for history-range queries.

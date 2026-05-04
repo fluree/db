@@ -42,19 +42,19 @@ use crate::fast_union_star_count_all::{UnionCountMode, UnionStarCountAllOperator
 use crate::group_aggregate::{GroupAggregateOperator, StreamingAggSpec};
 use crate::groupby::GroupByOperator;
 use crate::having::HavingOperator;
+use crate::ir::triple::{Ref, Term, TriplePattern};
+use crate::ir::QueryOptions;
 use crate::ir::{PathModifier, Pattern};
+use crate::ir::{Query, QueryOutput};
 use crate::limit::LimitOperator;
 use crate::offset::OffsetOperator;
 use crate::operator::inline::InlineOperator;
 use crate::operator::BoxedOperator;
-use crate::ir::QueryOptions;
-use crate::ir::{Query, QueryOutput};
 use crate::project::ProjectOperator;
 use crate::sort::SortDirection;
 use crate::sort::SortOperator;
 use crate::stats_query::StatsCountByPredicateOperator;
 use crate::temporal_mode::PlanningContext;
-use crate::ir::triple::{Ref, Term, TriplePattern};
 use crate::var_registry::VarId;
 use fluree_db_core::StatsView;
 use std::sync::Arc;
@@ -314,10 +314,7 @@ struct LabelRegexTypeSpec {
 /// Detect:
 /// `?s rdfs:label ?label . ?s rdf:type <Class> . FILTER regex(?label, "pat"[, "flags"])`
 /// with plain SELECT of exactly `(?s, ?label)` (no ORDER BY/LIMIT/DISTINCT).
-fn detect_label_regex_type(
-    query: &Query,
-    options: &QueryOptions,
-) -> Option<LabelRegexTypeSpec> {
+fn detect_label_regex_type(query: &Query, options: &QueryOptions) -> Option<LabelRegexTypeSpec> {
     if matches!(
         query.output,
         QueryOutput::Construct(_) | QueryOutput::Boolean | QueryOutput::Wildcard
@@ -449,10 +446,7 @@ fn extract_regex_const_pattern(
 /// - No group_by, having, post_binds, order_by, offset, or DISTINCT
 /// - LIMIT >= 1 (or no limit)
 /// - SELECT vars == `[agg.output_var]`
-pub(crate) fn detect_count_all_aggregate(
-    query: &Query,
-    options: &QueryOptions,
-) -> Option<VarId> {
+pub(crate) fn detect_count_all_aggregate(query: &Query, options: &QueryOptions) -> Option<VarId> {
     if matches!(
         query.output,
         QueryOutput::Construct(_) | QueryOutput::Boolean | QueryOutput::Wildcard
@@ -530,10 +524,7 @@ fn detect_count_distinct_aggregate(
 ///
 /// Returns `Some((input_var, output_var))` where `input_var` is `None` for `COUNT(*)`.
 /// Same standard constraints as [`detect_count_all_aggregate`].
-fn detect_count_aggregate(
-    query: &Query,
-    options: &QueryOptions,
-) -> Option<(Option<VarId>, VarId)> {
+fn detect_count_aggregate(query: &Query, options: &QueryOptions) -> Option<(Option<VarId>, VarId)> {
     if matches!(
         query.output,
         QueryOutput::Construct(_) | QueryOutput::Boolean | QueryOutput::Wildcard
@@ -976,10 +967,7 @@ fn detect_predicate_object_count(
     Some((pred, *s_var, tp.o.clone(), out_var))
 }
 
-fn detect_predicate_count_rows(
-    query: &Query,
-    options: &QueryOptions,
-) -> Option<(Ref, VarId)> {
+fn detect_predicate_count_rows(query: &Query, options: &QueryOptions) -> Option<(Ref, VarId)> {
     let (input_var, out_var) = detect_count_aggregate(query, options)?;
 
     if query.patterns.len() != 1 {
@@ -1129,10 +1117,7 @@ fn detect_predicate_minmax_string(
     Some((pred, mode, agg.output_var))
 }
 
-fn detect_predicate_avg_numeric(
-    query: &Query,
-    options: &QueryOptions,
-) -> Option<(Ref, VarId)> {
+fn detect_predicate_avg_numeric(query: &Query, options: &QueryOptions) -> Option<(Ref, VarId)> {
     if matches!(
         query.output,
         QueryOutput::Construct(_) | QueryOutput::Boolean | QueryOutput::Wildcard
@@ -3085,11 +3070,11 @@ fn build_operator_tree_inner(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ir::triple::{Ref, Term, TriplePattern};
     use crate::ir::Pattern;
     use crate::ir::QueryOptions;
     use crate::ir::{Query, QueryOutput};
     use crate::sort::SortSpec;
-    use crate::ir::triple::{Ref, Term, TriplePattern};
     use fluree_db_core::Sid;
     use fluree_graph_json_ld::ParsedContext;
 

@@ -236,7 +236,6 @@ impl Expression {
         }
     }
 
-
     /// Returns true if this filter can be pushed down to index scans as range bounds.
     ///
     /// "Range-safe" filters can be converted to contiguous range constraints on the
@@ -301,7 +300,6 @@ impl Expression {
             Expression::Var(_) | Expression::Const(_) | Expression::Exists { .. } => false,
         }
     }
-
 }
 
 /// Comparison operators

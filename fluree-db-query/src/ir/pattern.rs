@@ -1,10 +1,6 @@
 //! The `Pattern` enum and the variants that wrap nested `Vec<Pattern>` —
 //! `SubqueryPattern`, `ServicePattern`, plus the small `GraphName` /
 //! `ServiceEndpoint` types they depend on.
-//!
-//! Co-located here because they share `Pattern`'s recursive shape and form
-//! a structural cycle with it; splitting them out would require sibling
-//! modules to refer back into this one.
 
 use std::sync::Arc;
 
@@ -13,10 +9,10 @@ use super::adapters::{
 };
 use super::expression::{Expression, Function};
 use super::path::PropertyPathPattern;
+use super::triple::TriplePattern;
 use crate::aggregate::AggregateSpec;
 use crate::binding::Binding;
 use crate::sort::SortSpec;
-use super::triple::TriplePattern;
 use crate::var_registry::VarId;
 
 /// Resolved subquery pattern
@@ -117,7 +113,6 @@ impl SubqueryPattern {
         vars.extend(self.select.iter().copied());
         vars
     }
-
 }
 
 // ============================================================================
@@ -243,7 +238,6 @@ impl ServicePattern {
         }
         vars
     }
-
 }
 
 // ============================================================================
@@ -376,9 +370,7 @@ impl Pattern {
             Pattern::Minus(inner) => Pattern::Minus(f(inner)),
             Pattern::Exists(inner) => Pattern::Exists(f(inner)),
             Pattern::NotExists(inner) => Pattern::NotExists(f(inner)),
-            Pattern::Union(branches) => {
-                Pattern::Union(branches.into_iter().map(&mut *f).collect())
-            }
+            Pattern::Union(branches) => Pattern::Union(branches.into_iter().map(&mut *f).collect()),
             Pattern::Graph { name, patterns } => Pattern::Graph {
                 name,
                 patterns: f(patterns),
@@ -438,10 +430,8 @@ impl Pattern {
             Pattern::GeoSearch(gsp) => gsp.referenced_vars(),
             Pattern::S2Search(s2p) => s2p.referenced_vars(),
             Pattern::Graph { name, patterns } => {
-                let mut vars: Vec<VarId> = patterns
-                    .iter()
-                    .flat_map(Pattern::referenced_vars)
-                    .collect();
+                let mut vars: Vec<VarId> =
+                    patterns.iter().flat_map(Pattern::referenced_vars).collect();
                 if let GraphName::Var(v) = name {
                     vars.push(*v);
                 }
@@ -478,10 +468,8 @@ impl Pattern {
             Pattern::GeoSearch(gsp) => gsp.produced_vars(),
             Pattern::S2Search(s2p) => s2p.produced_vars(),
             Pattern::Graph { name, patterns } => {
-                let mut vars: Vec<VarId> = patterns
-                    .iter()
-                    .flat_map(Pattern::produced_vars)
-                    .collect();
+                let mut vars: Vec<VarId> =
+                    patterns.iter().flat_map(Pattern::produced_vars).collect();
                 if let GraphName::Var(v) = name {
                     vars.push(*v);
                 }
@@ -505,9 +493,7 @@ impl Pattern {
             Pattern::Union(branches) => branches
                 .iter()
                 .any(|branch| branch.iter().any(|p| p.contains_function(target))),
-            Pattern::Graph { patterns, .. } => {
-                patterns.iter().any(|p| p.contains_function(target))
-            }
+            Pattern::Graph { patterns, .. } => patterns.iter().any(|p| p.contains_function(target)),
             Pattern::Subquery(sq) => sq.patterns.iter().any(|p| p.contains_function(target)),
             // Other pattern variants cannot contain general expressions.
             _ => false,

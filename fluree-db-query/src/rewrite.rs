@@ -8,10 +8,9 @@
 //!
 //! Use `rewrite_patterns` with a `PlanContext` to expand query patterns according to the active entailment mode.
 
-use crate::ir::Pattern;
 use crate::ir::triple::{Ref, Term, TriplePattern};
+use crate::ir::Pattern;
 use fluree_db_core::{is_rdf_type, SchemaHierarchy, Sid};
-
 
 /// Entailment mode for query execution.
 ///
@@ -1132,5 +1131,4 @@ mod tests {
         assert_eq!(diag.predicate_expansions, 1);
         assert_eq!(diag.patterns_expanded, 2);
     }
-
 }

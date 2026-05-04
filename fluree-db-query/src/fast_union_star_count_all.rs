@@ -32,8 +32,8 @@ use crate::fast_path_common::{
     build_count_batch, build_psot_cursor_for_predicate, count_to_i64, cursor_projection_sid_only,
     cursor_projection_sid_otype_okey, normalize_pred_sid,
 };
-use crate::operator::{BoxedOperator, Operator, OperatorState};
 use crate::ir::triple::Ref;
+use crate::operator::{BoxedOperator, Operator, OperatorState};
 use crate::var_registry::VarId;
 use async_trait::async_trait;
 use fluree_db_binary_index::BinaryCursor;

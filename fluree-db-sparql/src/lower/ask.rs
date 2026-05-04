@@ -6,8 +6,8 @@
 use crate::ast::query::AskQuery;
 
 use fluree_db_query::ir::QueryOptions;
-use fluree_db_query::parse::encode::IriEncoder;
 use fluree_db_query::ir::{Query, QueryOutput};
+use fluree_db_query::parse::encode::IriEncoder;
 
 use super::{LoweringContext, Result};
 

@@ -3,10 +3,10 @@
 //! Extracts range constraints from FILTER expressions for pushdown
 //! to scan/join operators, enabling index-level filtering.
 
+use crate::ir::triple::TriplePattern;
 use crate::ir::{Expression, Pattern};
 use crate::planner::extract_object_bounds_for_var;
 use crate::sort::compare_flake_values;
-use crate::ir::triple::TriplePattern;
 use crate::var_registry::VarId;
 use fluree_db_core::{FlakeValue, ObjectBounds};
 use std::cmp::Ordering;
@@ -189,8 +189,8 @@ pub fn merge_upper_bound(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ir::FilterValue;
     use crate::ir::triple::{Ref, Term};
+    use crate::ir::FilterValue;
     use fluree_db_core::Sid;
 
     use crate::ir::Function;

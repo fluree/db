@@ -6,8 +6,8 @@
 //! This optimization runs for both SPARQL and JSON-LD queries, enabling `geof:distance`
 //! patterns to use the accelerated GeoPoint binary index path.
 
-use crate::ir::{Expression, FilterValue, Function, GeoSearchCenter, GeoSearchPattern, Pattern};
 use crate::ir::triple::{Ref, Term, TriplePattern};
+use crate::ir::{Expression, FilterValue, Function, GeoSearchCenter, GeoSearchPattern, Pattern};
 use crate::var_registry::VarId;
 use fluree_db_core::geo::try_extract_point;
 use fluree_db_core::Sid;

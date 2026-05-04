@@ -17,6 +17,7 @@ use crate::error::{QueryError, Result};
 use crate::exists::ExistsOperator;
 use crate::expression::PreparedBoolExpression;
 use crate::filter::{contains_exists, FilterOperator};
+use crate::ir::triple::{Ref, Term, TriplePattern};
 use crate::ir::{Expression, Pattern};
 use crate::join::NestedLoopJoinOperator;
 use crate::minus::MinusOperator;
@@ -30,7 +31,6 @@ use crate::seed::EmptyOperator;
 use crate::semijoin::SemijoinOperator;
 use crate::subquery::SubqueryOperator;
 use crate::temporal_mode::PlanningContext;
-use crate::ir::triple::{Ref, Term, TriplePattern};
 use crate::union::UnionOperator;
 use crate::values::ValuesOperator;
 use crate::var_registry::VarId;
@@ -968,7 +968,11 @@ fn build_sequential_join_block(
                     .iter()
                     .flat_map(crate::ir::triple::TriplePattern::referenced_vars),
             );
-            live.extend(pending_filters.iter().flat_map(|f| f.expr.referenced_vars()));
+            live.extend(
+                pending_filters
+                    .iter()
+                    .flat_map(|f| f.expr.referenced_vars()),
+            );
             live.extend(pending_binds.iter().flat_map(|b| b.expr.referenced_vars()));
             live.into_iter().collect::<Vec<VarId>>()
         });
@@ -1642,8 +1646,10 @@ pub fn build_where_operators_seeded_with_needed(
                 // Collect only vars PRODUCED by inner patterns (Triple, Bind, Values, etc.).
                 // Vars only consumed (e.g., in FILTER expressions) require per-row seeding
                 // and cannot serve as semijoin keys.
-                let inner_produced_vars: std::collections::HashSet<VarId> =
-                    inner_patterns.iter().flat_map(Pattern::produced_vars).collect();
+                let inner_produced_vars: std::collections::HashSet<VarId> = inner_patterns
+                    .iter()
+                    .flat_map(Pattern::produced_vars)
+                    .collect();
 
                 // Key vars in child schema order (stable, matches column layout).
                 let key_vars: Vec<VarId> = child
@@ -2058,8 +2064,8 @@ pub fn build_triple_operators(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ir::{Expression, FilterValue, Pattern};
     use crate::ir::triple::{Ref, Term};
+    use crate::ir::{Expression, FilterValue, Pattern};
     use fluree_db_core::{FlakeValue, PropertyStatData, Sid, StatsView};
     use std::collections::HashSet;
     use std::sync::Arc;

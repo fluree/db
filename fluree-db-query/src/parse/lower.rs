@@ -15,20 +15,21 @@ use super::error::{ParseError, Result};
 use crate::aggregate::{AggregateFn, AggregateSpec};
 use crate::binding::Binding;
 use crate::context::WellKnownDatatypes;
+use crate::ir::triple::{Ref, Term, TriplePattern};
+use crate::ir::QueryOptions;
+use crate::ir::{
+    ConstructTemplate, GraphSelectSpec, NestedSelectSpec, Query, QueryOutput, Root, SelectionSpec,
+};
 use crate::ir::{
     Expression, Function, IndexSearchPattern, IndexSearchTarget, PathModifier, Pattern,
     PropertyPathPattern, SubqueryPattern, VectorSearchPattern, VectorSearchTarget,
 };
-use crate::vector::DistanceMetric;
-use crate::ir::{
-    ConstructTemplate, GraphSelectSpec, NestedSelectSpec, Query, QueryOutput, Root, SelectionSpec,
-};
-use crate::ir::QueryOptions;
 use crate::sort::{SortDirection, SortSpec};
-use crate::ir::triple::{Ref, Term, TriplePattern};
 use crate::var_registry::{VarId, VarRegistry};
+use crate::vector::DistanceMetric;
 use fluree_db_core::DatatypeConstraint;
 use fluree_db_core::{FlakeValue, Sid};
+#[cfg(test)]
 use fluree_graph_json_ld::ParsedContext;
 use std::sync::Arc;
 

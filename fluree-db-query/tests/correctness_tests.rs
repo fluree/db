@@ -11,12 +11,12 @@ use fluree_db_query::binary_scan::EmitMask;
 use fluree_db_query::binding::{Batch, Binding};
 use fluree_db_query::context::ExecutionContext;
 use fluree_db_query::expression::PreparedBoolExpression;
+use fluree_db_query::ir::triple::{Ref, Term, TriplePattern};
 use fluree_db_query::ir::{Expression, FilterValue};
 use fluree_db_query::join::NestedLoopJoinOperator;
 use fluree_db_query::operator::inline::InlineOperator;
 use fluree_db_query::operator::Operator;
 use fluree_db_query::optional::{OptionalBuilder, OptionalOperator};
-use fluree_db_query::ir::triple::{Ref, Term, TriplePattern};
 use fluree_db_query::var_registry::{VarId, VarRegistry};
 
 /// A simple operator that yields a single batch then exhausts.

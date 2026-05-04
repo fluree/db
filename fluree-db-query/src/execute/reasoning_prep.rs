@@ -3,8 +3,8 @@
 //! Handles schema hierarchy computation, effective reasoning mode determination,
 //! and derived facts computation for OWL2-RL and datalog rules.
 
-use crate::reasoning::{global_reasoning_cache, reason_owl2rl, ReasoningOverlay};
 use crate::ir::ReasoningModes;
+use crate::reasoning::{global_reasoning_cache, reason_owl2rl, ReasoningOverlay};
 use fluree_db_core::{
     is_rdfs_subclass_of, is_rdfs_subproperty_of, overlay::OverlayProvider, GraphDbRef, GraphId,
     IndexSchema, LedgerSnapshot, SchemaHierarchy, SchemaPredicateInfo,

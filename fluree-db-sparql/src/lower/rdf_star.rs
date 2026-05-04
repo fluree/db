@@ -7,9 +7,9 @@ use crate::ast::term::{ObjectTerm, PredicateTerm, SubjectTerm, Term as SparqlTer
 use crate::ast::TriplePattern as SparqlTriplePattern;
 use crate::span::SourceSpan;
 
+use fluree_db_query::ir::triple::{Term, TriplePattern};
 use fluree_db_query::ir::{Expression, Function, Pattern};
 use fluree_db_query::parse::encode::IriEncoder;
-use fluree_db_query::ir::triple::{Term, TriplePattern};
 use fluree_db_query::var_registry::VarId;
 use fluree_vocab::fluree;
 

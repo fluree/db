@@ -2,9 +2,9 @@ use crate::binding::Binding;
 use crate::context::{ExecutionContext, WellKnownDatatypes};
 use crate::error::{QueryError, Result};
 use crate::fast_path_common::{fast_path_store, normalize_pred_sid};
+use crate::ir::triple::Term;
 use crate::operator::BoxedOperator;
 use crate::operator::{Operator, OperatorState};
-use crate::ir::triple::Term;
 use crate::var_registry::VarId;
 use async_trait::async_trait;
 use fluree_db_binary_index::format::column_block::ColumnId;
@@ -113,9 +113,9 @@ impl PredicateGroupCountFirstsOperator {
         use crate::aggregate::AggregateFn;
         use crate::dataset_operator::DatasetOperator;
         use crate::group_aggregate::{GroupAggregateOperator, StreamingAggSpec};
+        use crate::ir::triple::{Ref, TriplePattern};
         use crate::limit::LimitOperator;
         use crate::sort::{SortDirection, SortOperator, SortSpec};
-        use crate::ir::triple::{Ref, TriplePattern};
 
         let tp = TriplePattern::new(
             Ref::Var(self.subject_var),
