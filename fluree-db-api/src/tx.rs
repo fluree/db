@@ -1219,13 +1219,20 @@ impl crate::Fluree {
         // captures them — otherwise the committed snapshot omits the
         // mapping and post-commit SELECT can't resolve the predicate IRI
         // back to the same Sid the flake was stored under.
+        //
+        // Conflicts here are retry-safe: they happen when two concurrent
+        // SPARQL UPDATEs both lower against the same pre-commit snapshot
+        // and pick the same first-time namespace code for different
+        // prefixes. The second writer should re-lower against the latest
+        // snapshot (which now sees the first writer's namespaces) — surface
+        // as `NamespaceConflict` so callers in the same family as
+        // `CommitConflict` / `PublishLostRace` can treat it uniformly.
         if !txn.namespace_delta.is_empty() {
             ns_registry
                 .adopt_delta_for_persistence(&txn.namespace_delta)
                 .map_err(|e| {
-                    ApiError::Internal(format!(
-                        "namespace allocations from SPARQL lowering conflict \
-                         with the staging registry: {e}"
+                    ApiError::Transact(fluree_db_transact::TransactError::NamespaceConflict(
+                        e.to_string(),
                     ))
                 })?;
         }

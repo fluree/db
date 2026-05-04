@@ -1157,10 +1157,7 @@ mod tests {
         let next_code_after_first = codes.next_code;
         codes.adopt_delta_for_persistence(&delta).unwrap();
         assert_eq!(codes.next_code, next_code_after_first);
-        assert_eq!(
-            codes.get_code("https://idem.example.org/"),
-            Some(150)
-        );
+        assert_eq!(codes.get_code("https://idem.example.org/"), Some(150));
     }
 
     #[test]
