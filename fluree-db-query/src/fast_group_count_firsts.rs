@@ -686,9 +686,16 @@ fn count_bound_object_v6(
             }
 
             // Boundary-equality fast count: only valid when the leaflet is
-            // entirely target rows (it starts at the target value AND the next
-            // leaflet also starts at the target value).
-            if prefix == target_prefix && next_prefix == Some(target_prefix) {
+            // entirely target rows for our predicate (it starts at the target
+            // value, the next leaflet also starts at the target value, AND the
+            // leaflet is homogeneous on `p_id`). A mixed-predicate leaflet can
+            // satisfy the first two conditions while still containing rows for
+            // *other* predicates that must be excluded — fall through to the
+            // per-row scan in that case.
+            if prefix == target_prefix
+                && next_prefix == Some(target_prefix)
+                && entry.p_const == Some(p_id)
+            {
                 total += entry.row_count as i64;
                 continue;
             }
