@@ -28,6 +28,17 @@ use fluree_db_query::parse::{ParsedQuery, QueryOutput};
 use fluree_db_query::triple::{Ref, Term, TriplePattern};
 use support::genesis_ledger;
 
+fn r2rml_test_config<'a, P: R2rmlProvider + R2rmlTableProvider>(
+    tracker: &'a Tracker,
+    provider: &'a P,
+) -> ContextConfig<'a, 'a> {
+    ContextConfig {
+        tracker: Some(tracker),
+        r2rml: Some((provider, provider)),
+        ..Default::default()
+    }
+}
+
 // =============================================================================
 // Mock R2RML Provider for Testing
 // =============================================================================
@@ -445,11 +456,7 @@ async fn e2e_r2rml_query_iceberg_table() {
         GraphDbRef::new(&ledger.snapshot, 0, &NoOverlay, ledger.t()),
         &vars,
         &executable,
-        ContextConfig {
-            tracker: Some(&tracker),
-            r2rml: Some((&provider, &provider)),
-            ..Default::default()
-        },
+        r2rml_test_config(&tracker, &provider),
     )
     .await;
 
@@ -1095,11 +1102,7 @@ async fn engine_e2e_graph_pattern_r2rml_scan() {
         GraphDbRef::new(&ledger.snapshot, 0, &NoOverlay, ledger.t()),
         &vars,
         &executable,
-        ContextConfig {
-            tracker: Some(&tracker),
-            r2rml: Some((&provider, &provider)),
-            ..Default::default()
-        },
+        r2rml_test_config(&tracker, &provider),
     )
     .await
     .expect("Query execution should succeed");
@@ -1215,11 +1218,7 @@ async fn engine_e2e_provider_method_calls() {
         GraphDbRef::new(&ledger.snapshot, 0, &NoOverlay, ledger.t()),
         &vars,
         &executable,
-        ContextConfig {
-            tracker: Some(&tracker),
-            r2rml: Some((&provider, &provider)),
-            ..Default::default()
-        },
+        r2rml_test_config(&tracker, &provider),
     )
     .await;
 
@@ -1852,11 +1851,7 @@ async fn engine_e2e_ref_object_map_join_execution() {
         GraphDbRef::new(&ledger.snapshot, 0, &NoOverlay, ledger.t()),
         &vars,
         &executable,
-        ContextConfig {
-            tracker: Some(&tracker),
-            r2rml: Some((&provider, &provider)),
-            ..Default::default()
-        },
+        r2rml_test_config(&tracker, &provider),
     )
     .await
     .expect("Query execution should succeed");
