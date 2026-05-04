@@ -11,7 +11,7 @@ use fluree_db_query::context::ExecutionContext;
 use fluree_db_query::execute::{execute, ContextConfig, ExecutableQuery};
 use fluree_db_query::ir::triple::{Ref, Term, TriplePattern};
 use fluree_db_query::ir::QueryOptions;
-use fluree_db_query::ir::{Expression, FilterValue, Pattern};
+use fluree_db_query::ir::{Expression, Pattern};
 use fluree_db_query::ir::{Query, QueryOutput};
 use fluree_db_query::operator::Operator;
 use fluree_db_query::seed::EmptyOperator;
@@ -107,7 +107,7 @@ async fn test_bind_first() {
         vec![
             Pattern::Bind {
                 var: VarId(0), // ?x
-                expr: Expression::Const(FilterValue::Long(42)),
+                expr: Expression::Const(FlakeValue::Long(42)),
             },
             Pattern::Triple(make_triple_pattern(VarId(1), "age", VarId(0))),
         ],
@@ -178,8 +178,8 @@ async fn test_filter_first_true() {
         vec![VarId(0), VarId(1)], // SELECT ?s ?n
         vec![
             Pattern::Filter(Expression::eq(
-                Expression::Const(FilterValue::Long(1)),
-                Expression::Const(FilterValue::Long(1)),
+                Expression::Const(FlakeValue::Long(1)),
+                Expression::Const(FlakeValue::Long(1)),
             )),
             Pattern::Triple(make_triple_pattern(VarId(0), "name", VarId(1))),
         ],
@@ -207,8 +207,8 @@ async fn test_filter_first_false() {
         vec![VarId(0), VarId(1)], // SELECT ?s ?n
         vec![
             Pattern::Filter(Expression::eq(
-                Expression::Const(FilterValue::Long(1)),
-                Expression::Const(FilterValue::Long(2)),
+                Expression::Const(FlakeValue::Long(1)),
+                Expression::Const(FlakeValue::Long(2)),
             )),
             Pattern::Triple(make_triple_pattern(VarId(0), "name", VarId(1))),
         ],
@@ -288,7 +288,7 @@ async fn test_bind_clobber_same_value() {
     let seed = Box::new(SeedOperator::from_batch_row(&seed_batch, 0));
 
     // BIND(42 AS ?x) - same value, should pass through
-    let expr = Expression::Const(FilterValue::Long(42));
+    let expr = Expression::Const(FlakeValue::Long(42));
     let mut bind_op = BindOperator::new(seed, VarId(0), expr, vec![]);
 
     bind_op.open(&ctx).await.unwrap();
@@ -322,7 +322,7 @@ async fn test_bind_clobber_different_value() {
     let seed = Box::new(SeedOperator::from_batch_row(&seed_batch, 0));
 
     // BIND(100 AS ?x) - different value, should drop the row
-    let expr = Expression::Const(FilterValue::Long(100));
+    let expr = Expression::Const(FlakeValue::Long(100));
     let mut bind_op = BindOperator::new(seed, VarId(0), expr, vec![]);
 
     bind_op.open(&ctx).await.unwrap();
@@ -414,7 +414,7 @@ async fn test_bind_error_does_not_clobber_existing_binding() {
     // Expression uses an unbound var ?y => evaluation yields Unbound
     let expr = Expression::add(
         Expression::Var(VarId(1)), // ?y (unbound)
-        Expression::Const(FilterValue::Long(1)),
+        Expression::Const(FlakeValue::Long(1)),
     );
 
     let mut bind_op = BindOperator::new(seed, VarId(0), expr, vec![]);
@@ -456,11 +456,11 @@ async fn test_bind_with_inline_filter() {
     // ?x=30 => ?y=40 (passes)
     let bind_expr = Expression::add(
         Expression::Var(VarId(0)),
-        Expression::Const(FilterValue::Long(10)),
+        Expression::Const(FlakeValue::Long(10)),
     );
     let filter_expr = Expression::gt(
         Expression::Var(VarId(1)),
-        Expression::Const(FilterValue::Long(25)),
+        Expression::Const(FlakeValue::Long(25)),
     );
 
     let mut bind_op = BindOperator::new(seed, VarId(1), bind_expr, vec![filter_expr]);
@@ -507,11 +507,11 @@ async fn test_bind_with_inline_filter_rejects_all() {
     // ?x=5 => ?y=15 (fails ?y > 100)
     let bind_expr = Expression::add(
         Expression::Var(VarId(0)),
-        Expression::Const(FilterValue::Long(10)),
+        Expression::Const(FlakeValue::Long(10)),
     );
     let filter_expr = Expression::gt(
         Expression::Var(VarId(1)),
-        Expression::Const(FilterValue::Long(100)),
+        Expression::Const(FlakeValue::Long(100)),
     );
 
     let mut bind_op = BindOperator::new(seed, VarId(1), bind_expr, vec![filter_expr]);
@@ -555,15 +555,15 @@ async fn test_bind_with_multiple_inline_filters() {
     // Combined: only ?y=20,30,40 survive (the middle three input rows)
     let bind_expr = Expression::add(
         Expression::Var(VarId(0)),
-        Expression::Const(FilterValue::Long(10)),
+        Expression::Const(FlakeValue::Long(10)),
     );
     let filter1 = Expression::gt(
         Expression::Var(VarId(1)),
-        Expression::Const(FilterValue::Long(15)),
+        Expression::Const(FlakeValue::Long(15)),
     );
     let filter2 = Expression::lt(
         Expression::Var(VarId(1)),
-        Expression::Const(FilterValue::Long(45)),
+        Expression::Const(FlakeValue::Long(45)),
     );
 
     let mut bind_op = BindOperator::new(seed, VarId(1), bind_expr, vec![filter1, filter2]);

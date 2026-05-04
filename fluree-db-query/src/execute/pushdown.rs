@@ -190,7 +190,7 @@ pub fn merge_upper_bound(
 mod tests {
     use super::*;
     use crate::ir::triple::{Ref, Term};
-    use crate::ir::FilterValue;
+    use crate::ir::FlakeValue;
     use fluree_db_core::Sid;
 
     use crate::ir::Function;
@@ -211,11 +211,11 @@ mod tests {
         let remaining = vec![Pattern::Filter(Expression::and(vec![
             Expression::gt(
                 Expression::Var(VarId(1)),
-                Expression::Const(FilterValue::Long(18)),
+                Expression::Const(FlakeValue::Long(18)),
             ),
             Expression::lt(
                 Expression::Var(VarId(1)),
-                Expression::Const(FilterValue::Long(65)),
+                Expression::Const(FlakeValue::Long(65)),
             ),
         ]))];
 
@@ -324,9 +324,9 @@ mod tests {
         let filter = Expression::Call {
             func: Function::Lt,
             args: vec![
-                Expression::Const(FilterValue::Long(10)),
+                Expression::Const(FlakeValue::Long(10)),
                 Expression::Var(VarId(1)),
-                Expression::Const(FilterValue::Long(20)),
+                Expression::Const(FlakeValue::Long(20)),
             ],
         };
 

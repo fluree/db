@@ -301,7 +301,7 @@ fn analyze_bool_cache_inner(expr: &Expression, state: &mut impl Hasher) -> BoolC
             }
         }
         Expression::Const(value) => {
-            hash_filter_value(value, state);
+            hash_flake_value(value, state);
             BoolCacheAnalysis {
                 expr_hash: state.finish(),
                 vars: VarUsage::None,
@@ -453,17 +453,6 @@ fn hash_function(func: &Function, state: &mut impl Hasher) {
     std::mem::discriminant(func).hash(state);
     if let Function::Custom(name) = func {
         name.hash(state);
-    }
-}
-
-fn hash_filter_value(value: &crate::ir::FilterValue, state: &mut impl Hasher) {
-    std::mem::discriminant(value).hash(state);
-    match value {
-        crate::ir::FilterValue::Long(v) => v.hash(state),
-        crate::ir::FilterValue::Double(v) => v.to_bits().hash(state),
-        crate::ir::FilterValue::String(v) => v.hash(state),
-        crate::ir::FilterValue::Bool(v) => v.hash(state),
-        crate::ir::FilterValue::Temporal(v) => hash_flake_value(v, state),
     }
 }
 
@@ -733,7 +722,7 @@ pub fn format_datatype_sid(dt: &fluree_db_core::Sid) -> ComparableValue {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ir::FilterValue;
+    use fluree_db_core::value::FlakeValue;
 
     #[test]
     fn cacheable_bool_predicate_accepts_regex_over_single_var() {
@@ -741,7 +730,7 @@ mod tests {
             Function::Regex,
             vec![
                 Expression::Var(VarId(0)),
-                Expression::Const(FilterValue::String("^crm:stage/".to_string())),
+                Expression::Const(FlakeValue::String("^crm:stage/".to_string())),
             ],
         );
 
@@ -755,7 +744,7 @@ mod tests {
             Function::StrStarts,
             vec![
                 Expression::call(Function::Str, vec![Expression::Var(VarId(3))]),
-                Expression::Const(FilterValue::String("Closed".to_string())),
+                Expression::Const(FlakeValue::String("Closed".to_string())),
             ],
         ));
 

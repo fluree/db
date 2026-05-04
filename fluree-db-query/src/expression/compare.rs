@@ -389,14 +389,14 @@ mod tests {
     // =========================================================================
 
     use crate::binding::BindingRow;
-    use crate::ir::FilterValue;
+    use fluree_db_core::value::FlakeValue;
 
     fn long(v: i64) -> Expression {
-        Expression::Const(FilterValue::Long(v))
+        Expression::Const(FlakeValue::Long(v))
     }
 
     fn string(s: &str) -> Expression {
-        Expression::Const(FilterValue::String(s.to_string()))
+        Expression::Const(FlakeValue::String(s.to_string()))
     }
 
     fn empty_row() -> BindingRow<'static> {

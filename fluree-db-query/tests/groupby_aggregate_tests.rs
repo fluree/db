@@ -13,7 +13,7 @@ use fluree_db_query::context::ExecutionContext;
 use fluree_db_query::execute::{execute, ContextConfig, ExecutableQuery};
 use fluree_db_query::groupby::GroupByOperator;
 use fluree_db_query::ir::QueryOptions;
-use fluree_db_query::ir::{Expression, FilterValue, Pattern};
+use fluree_db_query::ir::{Expression, Pattern};
 use fluree_db_query::ir::{Query, QueryOutput};
 use fluree_db_query::operator::Operator;
 use fluree_db_query::var_registry::{VarId, VarRegistry};
@@ -262,7 +262,7 @@ async fn test_group_by_with_having() {
         }])
         .with_having(Expression::gt(
             Expression::Var(VarId(1)),
-            Expression::Const(FilterValue::Long(2)),
+            Expression::Const(FlakeValue::Long(2)),
         ));
 
     let db = GraphDbRef::new(&snapshot, 0, &NoOverlay, snapshot.t);

@@ -7,7 +7,7 @@
 //! patterns to use the accelerated GeoPoint binary index path.
 
 use crate::ir::triple::{Ref, Term, TriplePattern};
-use crate::ir::{Expression, FilterValue, Function, GeoSearchCenter, GeoSearchPattern, Pattern};
+use crate::ir::{Expression, FlakeValue, Function, GeoSearchCenter, GeoSearchPattern, Pattern};
 use crate::var_registry::VarId;
 use fluree_db_core::geo::try_extract_point;
 use fluree_db_core::Sid;
@@ -181,7 +181,7 @@ fn extract_distance_call(expr: &Expression) -> Option<(VarId, GeoSearchCenter)> 
 
         // Second arg must be a constant WKT string
         let wkt = match &args[1] {
-            Expression::Const(FilterValue::String(s)) => s.as_str(),
+            Expression::Const(FlakeValue::String(s)) => s.as_str(),
             _ => return None,
         };
 
@@ -228,8 +228,8 @@ fn extract_lt_comparison(expr: &Expression, target_var: VarId) -> Option<f64> {
 /// Extract numeric constant from a Expression
 fn extract_numeric_const(expr: &Expression) -> Option<f64> {
     match expr {
-        Expression::Const(FilterValue::Long(n)) => Some(*n as f64),
-        Expression::Const(FilterValue::Double(n)) => Some(*n),
+        Expression::Const(FlakeValue::Long(n)) => Some(*n as f64),
+        Expression::Const(FlakeValue::Double(n)) => Some(*n),
         _ => None,
     }
 }
@@ -328,7 +328,7 @@ mod tests {
             func: Function::GeofDistance,
             args: vec![
                 Expression::Var(loc_var),
-                Expression::Const(FilterValue::String("POINT(2.35 48.86)".to_string())),
+                Expression::Const(FlakeValue::String("POINT(2.35 48.86)".to_string())),
             ],
         };
 
@@ -354,7 +354,7 @@ mod tests {
         // ?dist < 1000
         let expr = Expression::lt(
             Expression::Var(dist_var),
-            Expression::Const(FilterValue::Long(1000)),
+            Expression::Const(FlakeValue::Long(1000)),
         );
         assert_eq!(extract_lt_comparison(&expr, dist_var), Some(1000.0));
         assert_eq!(extract_lt_comparison(&expr, other_var), None);
@@ -362,13 +362,13 @@ mod tests {
         // ?dist <= 500.5
         let expr2 = Expression::le(
             Expression::Var(dist_var),
-            Expression::Const(FilterValue::Double(500.5)),
+            Expression::Const(FlakeValue::Double(500.5)),
         );
         assert_eq!(extract_lt_comparison(&expr2, dist_var), Some(500.5));
 
         // 2000 > ?dist
         let expr3 = Expression::gt(
-            Expression::Const(FilterValue::Long(2000)),
+            Expression::Const(FlakeValue::Long(2000)),
             Expression::Var(dist_var),
         );
         assert_eq!(extract_lt_comparison(&expr3, dist_var), Some(2000.0));
@@ -376,7 +376,7 @@ mod tests {
         // Negative radius should fail
         let expr4 = Expression::lt(
             Expression::Var(dist_var),
-            Expression::Const(FilterValue::Long(-100)),
+            Expression::Const(FlakeValue::Long(-100)),
         );
         assert_eq!(extract_lt_comparison(&expr4, dist_var), None);
     }
@@ -403,13 +403,13 @@ mod tests {
                     func: Function::GeofDistance,
                     args: vec![
                         Expression::Var(loc_var),
-                        Expression::Const(FilterValue::String("POINT(2.35 48.86)".to_string())),
+                        Expression::Const(FlakeValue::String("POINT(2.35 48.86)".to_string())),
                     ],
                 },
             },
             Pattern::Filter(Expression::lt(
                 Expression::Var(dist_var),
-                Expression::Const(FilterValue::Long(1000)),
+                Expression::Const(FlakeValue::Long(1000)),
             )),
         ];
 
@@ -450,18 +450,18 @@ mod tests {
                     func: Function::GeofDistance,
                     args: vec![
                         Expression::Var(loc_var),
-                        Expression::Const(FilterValue::String("POINT(2.35 48.86)".to_string())),
+                        Expression::Const(FlakeValue::String("POINT(2.35 48.86)".to_string())),
                     ],
                 },
             },
             Pattern::Filter(Expression::lt(
                 Expression::Var(dist_var),
-                Expression::Const(FilterValue::Long(1000)),
+                Expression::Const(FlakeValue::Long(1000)),
             )),
             // ?loc is used here too - Triple should be kept
             Pattern::Filter(Expression::eq(
                 Expression::Var(loc_var),
-                Expression::Const(FilterValue::String("test".to_string())),
+                Expression::Const(FlakeValue::String("test".to_string())),
             )),
         ];
 
@@ -502,7 +502,7 @@ mod tests {
                     func: Function::GeofDistance,
                     args: vec![
                         Expression::Var(loc_var),
-                        Expression::Const(FilterValue::String("POINT(2.35 48.86)".to_string())),
+                        Expression::Const(FlakeValue::String("POINT(2.35 48.86)".to_string())),
                     ],
                 },
             },
@@ -537,13 +537,13 @@ mod tests {
                     func: Function::GeofDistance,
                     args: vec![
                         Expression::Var(loc_var),
-                        Expression::Const(FilterValue::String("POINT(2.35 48.86)".to_string())),
+                        Expression::Const(FlakeValue::String("POINT(2.35 48.86)".to_string())),
                     ],
                 },
             },
             Pattern::Filter(Expression::lt(
                 Expression::Var(dist_var),
-                Expression::Const(FilterValue::Long(1000)),
+                Expression::Const(FlakeValue::Long(1000)),
             )),
         ];
 
@@ -574,13 +574,13 @@ mod tests {
                     func: Function::GeofDistance,
                     args: vec![
                         Expression::Var(loc_var),
-                        Expression::Const(FilterValue::String("POINT(2.35 48.86)".to_string())),
+                        Expression::Const(FlakeValue::String("POINT(2.35 48.86)".to_string())),
                     ],
                 },
             },
             Pattern::Filter(Expression::lt(
                 Expression::Var(dist_var),
-                Expression::Const(FilterValue::Long(1000)),
+                Expression::Const(FlakeValue::Long(1000)),
             )),
         ];
 
@@ -611,13 +611,13 @@ mod tests {
                     func: Function::GeofDistance,
                     args: vec![
                         Expression::Var(loc_var),
-                        Expression::Const(FilterValue::String("POINT(2.35 48.86)".to_string())),
+                        Expression::Const(FlakeValue::String("POINT(2.35 48.86)".to_string())),
                     ],
                 },
             },
             Pattern::Filter(Expression::lt(
                 Expression::Var(dist_var),
-                Expression::Const(FilterValue::Long(1000)),
+                Expression::Const(FlakeValue::Long(1000)),
             )),
         ];
 
@@ -649,13 +649,13 @@ mod tests {
                     func: Function::GeofDistance,
                     args: vec![
                         Expression::Var(loc_var),
-                        Expression::Const(FilterValue::String("POINT(2.35 48.86)".to_string())),
+                        Expression::Const(FlakeValue::String("POINT(2.35 48.86)".to_string())),
                     ],
                 },
             },
             Pattern::Filter(Expression::lt(
                 Expression::Var(dist_var),
-                Expression::Const(FilterValue::Long(1000)),
+                Expression::Const(FlakeValue::Long(1000)),
             )),
         ];
 

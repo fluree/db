@@ -262,16 +262,16 @@ fn extract_simple_gt_threshold(
 fn extract_simple_numeric_compare_threshold(
     expr: &crate::ir::Expression,
 ) -> Option<(VarId, NumericCompareOp, fluree_db_core::FlakeValue)> {
-    use crate::ir::{Expression, FilterValue, Function};
+    use crate::ir::{Expression, FlakeValue, Function};
     let Expression::Call { func, args } = expr else {
         return None;
     };
     if args.len() != 2 {
         return None;
     }
-    let const_to_flake = |c: &FilterValue| match c {
-        FilterValue::Long(n) => Some(fluree_db_core::FlakeValue::Long(*n)),
-        FilterValue::Double(d) => Some(fluree_db_core::FlakeValue::Double(*d)),
+    let const_to_flake = |c: &FlakeValue| match c {
+        FlakeValue::Long(n) => Some(fluree_db_core::FlakeValue::Long(*n)),
+        FlakeValue::Double(d) => Some(fluree_db_core::FlakeValue::Double(*d)),
         _ => None,
     };
     let direct_op = match *func {
@@ -399,7 +399,7 @@ fn extract_regex_const_pattern(
     expr: &crate::ir::Expression,
     label_var: VarId,
 ) -> Option<(Arc<str>, Arc<str>)> {
-    use crate::ir::{Expression, FilterValue, Function};
+    use crate::ir::{Expression, FlakeValue, Function};
     let Expression::Call { func, args } = expr else {
         return None;
     };
@@ -412,11 +412,11 @@ fn extract_regex_const_pattern(
     if !matches!(&args[0], Expression::Var(v) if *v == label_var) {
         return None;
     }
-    let Expression::Const(FilterValue::String(pat)) = &args[1] else {
+    let Expression::Const(FlakeValue::String(pat)) = &args[1] else {
         return None;
     };
     let flags: Arc<str> = if args.len() == 3 {
-        let Expression::Const(FilterValue::String(f)) = &args[2] else {
+        let Expression::Const(FlakeValue::String(f)) = &args[2] else {
             return None;
         };
         Arc::from(f.as_str())
@@ -980,12 +980,12 @@ fn detect_predicate_count_rows_lang_filter(
     }
 
     if is_lang_o(&args[0]) {
-        if let crate::ir::Expression::Const(crate::ir::FilterValue::String(tag)) = &args[1] {
+        if let crate::ir::Expression::Const(crate::ir::FlakeValue::String(tag)) = &args[1] {
             return Some((pred, tag.clone(), out_var));
         }
     }
     if is_lang_o(&args[1]) {
-        if let crate::ir::Expression::Const(crate::ir::FilterValue::String(tag)) = &args[0] {
+        if let crate::ir::Expression::Const(crate::ir::FlakeValue::String(tag)) = &args[0] {
             return Some((pred, tag.clone(), out_var));
         }
     }
@@ -1172,11 +1172,11 @@ fn detect_count_rows_with_encoded_filters(
             let has_const = matches!(
                 (&args[0], &args[1]),
                 (
-                    crate::ir::Expression::Const(crate::ir::FilterValue::String(_)),
+                    crate::ir::Expression::Const(crate::ir::FlakeValue::String(_)),
                     _
                 ) | (
                     _,
-                    crate::ir::Expression::Const(crate::ir::FilterValue::String(_))
+                    crate::ir::Expression::Const(crate::ir::FlakeValue::String(_))
                 )
             );
             has_lang && has_const
@@ -1291,7 +1291,7 @@ fn detect_string_prefix_sum_strstarts(
     query: &Query,
     options: &QueryOptions,
 ) -> Option<(Ref, Arc<str>, VarId)> {
-    use crate::ir::{Expression, FilterValue, Function};
+    use crate::ir::{Expression, FlakeValue, Function};
 
     if !options.group_by.is_empty()
         || options.aggregates.len() != 1
@@ -1351,7 +1351,7 @@ fn detect_string_prefix_sum_strstarts(
     if !matches!(&args[0], Expression::Var(v) if *v == o_var) {
         return None;
     }
-    let Expression::Const(FilterValue::String(prefix)) = &args[1] else {
+    let Expression::Const(FlakeValue::String(prefix)) = &args[1] else {
         return None;
     };
     if prefix.is_empty() {
@@ -1365,7 +1365,7 @@ fn extract_string_prefix_filter(
     expr: &crate::ir::Expression,
     object_var: VarId,
 ) -> Option<Arc<str>> {
-    use crate::ir::{Expression, FilterValue, Function};
+    use crate::ir::{Expression, FlakeValue, Function};
 
     let is_object_var = |expr: &Expression| matches!(expr, Expression::Var(v) if *v == object_var);
 
@@ -1377,11 +1377,11 @@ fn extract_string_prefix_filter(
             if !is_object_var(&args[0]) {
                 return None;
             }
-            let Expression::Const(FilterValue::String(pattern)) = &args[1] else {
+            let Expression::Const(FlakeValue::String(pattern)) = &args[1] else {
                 return None;
             };
             if args.len() == 3 {
-                let Expression::Const(FilterValue::String(flags)) = &args[2] else {
+                let Expression::Const(FlakeValue::String(flags)) = &args[2] else {
                     return None;
                 };
                 if !flags.is_empty() {
@@ -1394,7 +1394,7 @@ fn extract_string_prefix_filter(
             if !is_object_var(&args[0]) {
                 return None;
             }
-            let Expression::Const(FilterValue::String(prefix)) = &args[1] else {
+            let Expression::Const(FlakeValue::String(prefix)) = &args[1] else {
                 return None;
             };
             if prefix.is_empty() {
@@ -3049,7 +3049,7 @@ mod tests {
             Pattern::Triple(TriplePattern::new(Ref::Var(s), p_num.clone(), Term::Var(v))),
             Pattern::Filter(crate::ir::Expression::gt(
                 crate::ir::Expression::Var(v),
-                crate::ir::Expression::Const(crate::ir::FilterValue::Long(50)),
+                crate::ir::Expression::Const(crate::ir::FlakeValue::Long(50)),
             )),
         ];
 

@@ -268,7 +268,7 @@ impl Operator for BindOperator {
 mod tests {
     use super::*;
     use crate::binding::Batch;
-    use crate::ir::FilterValue;
+    use fluree_db_core::value::FlakeValue;
 
     #[test]
     fn test_bind_operator_new_var_schema() {
@@ -278,7 +278,7 @@ mod tests {
             schema: child_schema,
         });
 
-        let expr = Expression::Const(FilterValue::Long(42));
+        let expr = Expression::Const(FlakeValue::Long(42));
         let op = BindOperator::new(child, VarId(1), expr, vec![]);
 
         // Output schema should be [?a, ?b]
@@ -296,7 +296,7 @@ mod tests {
             schema: child_schema,
         });
 
-        let expr = Expression::Const(FilterValue::Long(42));
+        let expr = Expression::Const(FlakeValue::Long(42));
         let op = BindOperator::new(child, VarId(0), expr, vec![]);
 
         // Schema should stay [?a, ?b]

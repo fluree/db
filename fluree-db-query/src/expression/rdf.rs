@@ -294,7 +294,7 @@ pub fn eval_bnode<R: RowAccess>(
 mod tests {
     use super::*;
     use crate::binding::Batch;
-    use crate::ir::FilterValue;
+    use fluree_db_core::value::FlakeValue;
     use crate::var_registry::VarId;
     use fluree_db_core::Sid;
 
@@ -307,7 +307,7 @@ mod tests {
         let row = batch.row_view(0).unwrap();
 
         // Evaluate IRI(?x) where ?x is an IRI string
-        let args = [Expression::Const(FilterValue::String(
+        let args = [Expression::Const(FlakeValue::String(
             "http://unknown.org/ns/Foo".to_string(),
         ))];
         let result = eval_iri(&args, &row, None).unwrap();

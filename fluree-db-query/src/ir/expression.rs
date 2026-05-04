@@ -4,6 +4,7 @@
 
 use super::pattern::Pattern;
 use crate::var_registry::VarId;
+use fluree_db_core::value::FlakeValue;
 
 /// Filter expression AST
 ///
@@ -14,7 +15,7 @@ pub enum Expression {
     /// Variable reference
     Var(VarId),
     /// Constant value
-    Const(FilterValue),
+    Const(FlakeValue),
     /// Function call (includes operators like +, -, =, AND, OR, etc.)
     Call {
         func: Function,
@@ -353,17 +354,6 @@ impl std::fmt::Display for ArithmeticOp {
     }
 }
 
-/// Constant value in filter expressions
-#[derive(Debug, Clone, PartialEq)]
-pub enum FilterValue {
-    Long(i64),
-    Double(f64),
-    String(String),
-    Bool(bool),
-    /// Temporal or duration value (wraps any temporal/duration FlakeValue)
-    Temporal(fluree_db_core::value::FlakeValue),
-}
-
 // =============================================================================
 // From implementations for lowering unresolved AST types
 // =============================================================================
@@ -392,14 +382,14 @@ impl From<ArithmeticOp> for Function {
     }
 }
 
-impl From<&crate::parse::ast::UnresolvedFilterValue> for FilterValue {
+impl From<&crate::parse::ast::UnresolvedFilterValue> for FlakeValue {
     fn from(val: &crate::parse::ast::UnresolvedFilterValue) -> Self {
         use crate::parse::ast::UnresolvedFilterValue;
         match val {
-            UnresolvedFilterValue::Long(l) => FilterValue::Long(*l),
-            UnresolvedFilterValue::Double(d) => FilterValue::Double(*d),
-            UnresolvedFilterValue::String(s) => FilterValue::String(s.to_string()),
-            UnresolvedFilterValue::Bool(b) => FilterValue::Bool(*b),
+            UnresolvedFilterValue::Long(l) => FlakeValue::Long(*l),
+            UnresolvedFilterValue::Double(d) => FlakeValue::Double(*d),
+            UnresolvedFilterValue::String(s) => FlakeValue::String(s.to_string()),
+            UnresolvedFilterValue::Bool(b) => FlakeValue::Boolean(*b),
         }
     }
 }
@@ -590,7 +580,7 @@ mod tests {
         // Range-safe: ?x > 10
         let expr = Expression::gt(
             Expression::Var(VarId(0)),
-            Expression::Const(FilterValue::Long(10)),
+            Expression::Const(FlakeValue::Long(10)),
         );
         assert!(expr.is_range_safe());
 
@@ -598,11 +588,11 @@ mod tests {
         let and_expr = Expression::and(vec![
             Expression::ge(
                 Expression::Var(VarId(0)),
-                Expression::Const(FilterValue::Long(18)),
+                Expression::Const(FlakeValue::Long(18)),
             ),
             Expression::lt(
                 Expression::Var(VarId(0)),
-                Expression::Const(FilterValue::Long(65)),
+                Expression::Const(FlakeValue::Long(65)),
             ),
         ]);
         assert!(and_expr.is_range_safe());
@@ -610,7 +600,7 @@ mod tests {
         // Not range-safe: OR
         let or_expr = Expression::or(vec![Expression::eq(
             Expression::Var(VarId(0)),
-            Expression::Const(FilterValue::Long(1)),
+            Expression::Const(FlakeValue::Long(1)),
         )]);
         assert!(!or_expr.is_range_safe());
     }

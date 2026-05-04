@@ -10,7 +10,7 @@ use super::value::ComparableValue;
 use crate::binding::{Binding, BindingRow, RowAccess};
 use crate::context::ExecutionContext;
 use crate::error::{QueryError, Result};
-use crate::ir::{Expression, FilterValue};
+use crate::ir::{Expression, FlakeValue};
 use crate::var_registry::VarId;
 use std::sync::Arc;
 
@@ -41,7 +41,7 @@ impl Expression {
             Expression::Const(val) => {
                 // Constant as boolean
                 match val {
-                    FilterValue::Bool(b) => Ok(*b),
+                    FlakeValue::Boolean(b) => Ok(*b),
                     _ => Ok(true), // Non-bool constants are truthy
                 }
             }
@@ -159,7 +159,9 @@ impl Expression {
                 }
             },
 
-            Expression::Const(val) => Ok(Some(val.into())),
+            // FlakeValue::Null is the only variant TryFrom rejects (with
+            // NullValueError); a constant Null evaluates to "no value".
+            Expression::Const(val) => Ok(val.try_into().ok()),
 
             Expression::Call { func, args } => func.eval(args, row, ctx),
 
@@ -311,7 +313,7 @@ mod tests {
         // ?age > 20
         let expr = Expression::gt(
             Expression::Var(VarId(0)),
-            Expression::Const(FilterValue::Long(20)),
+            Expression::Const(FlakeValue::Long(20)),
         );
 
         // Row 0: age=25 > 20 → true
@@ -335,11 +337,11 @@ mod tests {
         let expr = Expression::and(vec![
             Expression::gt(
                 Expression::Var(VarId(0)),
-                Expression::Const(FilterValue::Long(20)),
+                Expression::Const(FlakeValue::Long(20)),
             ),
             Expression::lt(
                 Expression::Var(VarId(0)),
-                Expression::Const(FilterValue::Long(28)),
+                Expression::Const(FlakeValue::Long(28)),
             ),
         ]);
 
@@ -360,11 +362,11 @@ mod tests {
         let expr = Expression::or(vec![
             Expression::lt(
                 Expression::Var(VarId(0)),
-                Expression::Const(FilterValue::Long(20)),
+                Expression::Const(FlakeValue::Long(20)),
             ),
             Expression::gt(
                 Expression::Var(VarId(0)),
-                Expression::Const(FilterValue::Long(28)),
+                Expression::Const(FlakeValue::Long(28)),
             ),
         ]);
 
@@ -388,7 +390,7 @@ mod tests {
         // NOT(?age > 25)
         let expr = Expression::not(Expression::gt(
             Expression::Var(VarId(0)),
-            Expression::Const(FilterValue::Long(25)),
+            Expression::Const(FlakeValue::Long(25)),
         ));
 
         // Row 0: age=25 → NOT(25 > 25) = NOT(false) = true

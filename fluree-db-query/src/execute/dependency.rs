@@ -111,7 +111,7 @@ mod tests {
     use crate::ir::triple::{Ref, Term, TriplePattern};
     use crate::ir::QueryOptions;
     use crate::ir::{ConstructTemplate, Query, QueryOutput};
-    use crate::ir::{Expression, FilterValue, Pattern};
+    use crate::ir::{Expression, FlakeValue, Pattern};
     use crate::parse::SelectMode;
     use crate::sort::SortSpec;
     use fluree_db_core::Sid;
@@ -241,7 +241,7 @@ mod tests {
             .with_group_by(vec![VarId(0)])
             .with_having(Expression::gt(
                 Expression::Var(VarId(1)),
-                Expression::Const(FilterValue::Long(10)),
+                Expression::Const(FlakeValue::Long(10)),
             ));
 
         let deps = compute_variable_deps(&query, &options).unwrap();
@@ -441,7 +441,7 @@ mod tests {
             }])
             .with_having(Expression::gt(
                 Expression::Var(VarId(2)),
-                Expression::Const(FilterValue::Long(5)),
+                Expression::Const(FlakeValue::Long(5)),
             ));
 
         let deps = compute_variable_deps(&query, &options).unwrap();

@@ -3145,7 +3145,7 @@ mod tests {
                     crate::ir::Function::StrStarts,
                     vec![
                         crate::ir::Expression::Var(VarId(1)),
-                        crate::ir::Expression::Const(crate::ir::FilterValue::String(
+                        crate::ir::Expression::Const(crate::ir::FlakeValue::String(
                             "Ali".to_string(),
                         )),
                     ],

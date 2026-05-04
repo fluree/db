@@ -68,7 +68,7 @@ mod tests {
     use super::*;
     use crate::ir::triple::{Ref, Term, TriplePattern};
     use crate::ir::QueryOptions;
-    use crate::ir::{Expression, FilterValue, Pattern};
+    use crate::ir::{Expression, Pattern};
     use crate::ir::{Query, QueryOutput};
     use crate::planner::reorder_patterns;
     use crate::sort::SortSpec;
@@ -208,7 +208,7 @@ mod tests {
             Pattern::Triple(make_pattern(VarId(0), "age", VarId(1))),
             Pattern::Filter(Expression::gt(
                 Expression::Var(VarId(1)),
-                Expression::Const(FilterValue::Long(18)),
+                Expression::Const(FlakeValue::Long(18)),
             )),
         ];
 
@@ -231,7 +231,7 @@ mod tests {
             Pattern::Triple(make_pattern(score, "hasScore", score_v)),
             Pattern::Filter(Expression::gt(
                 Expression::Var(score_v),
-                Expression::Const(FilterValue::Double(0.4)),
+                Expression::Const(FlakeValue::Double(0.4)),
             )),
             Pattern::Triple(TriplePattern::new(
                 Ref::Var(score),
@@ -301,11 +301,11 @@ mod tests {
         let remaining = vec![Pattern::Filter(Expression::and(vec![
             Expression::gt(
                 Expression::Var(VarId(1)),
-                Expression::Const(FilterValue::Long(18)),
+                Expression::Const(FlakeValue::Long(18)),
             ),
             Expression::lt(
                 Expression::Var(VarId(1)),
-                Expression::Const(FilterValue::Long(65)),
+                Expression::Const(FlakeValue::Long(65)),
             ),
         ]))];
 

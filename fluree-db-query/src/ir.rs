@@ -43,7 +43,8 @@ pub use adapters::{
     GeoSearchCenter, GeoSearchPattern, IndexSearchPattern, IndexSearchTarget, R2rmlPattern,
     S2QueryGeom, S2SearchPattern, S2SpatialOp, VectorSearchPattern, VectorSearchTarget,
 };
-pub use expression::{ArithmeticOp, CompareOp, Expression, FilterValue, Function};
+pub use expression::{ArithmeticOp, CompareOp, Expression, Function};
+pub use fluree_db_core::value::FlakeValue;
 pub use options::{QueryOptions, ReasoningModes};
 pub use path::{PathModifier, PropertyPathPattern};
 pub use pattern::{GraphName, Pattern, ServiceEndpoint, ServicePattern, SubqueryPattern};

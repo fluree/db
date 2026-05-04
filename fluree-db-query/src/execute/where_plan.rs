@@ -2065,7 +2065,7 @@ pub fn build_triple_operators(
 mod tests {
     use super::*;
     use crate::ir::triple::{Ref, Term};
-    use crate::ir::{Expression, FilterValue, Pattern};
+    use crate::ir::{Expression, Pattern};
     use fluree_db_core::{FlakeValue, PropertyStatData, Sid, StatsView};
     use std::collections::HashSet;
     use std::sync::Arc;
@@ -2149,7 +2149,7 @@ mod tests {
             Pattern::Triple(make_pattern(VarId(0), "age", VarId(1))),
             Pattern::Filter(Expression::gt(
                 Expression::Var(VarId(1)),
-                Expression::Const(FilterValue::Long(18)),
+                Expression::Const(FlakeValue::Long(18)),
             )),
         ];
 
@@ -2222,7 +2222,7 @@ mod tests {
             Pattern::Triple(make_pattern(score, "hasScore", score_v)),
             Pattern::Filter(Expression::gt(
                 Expression::Var(score_v),
-                Expression::Const(FilterValue::Double(0.4)),
+                Expression::Const(FlakeValue::Double(0.4)),
             )),
             Pattern::Triple(TriplePattern::new(
                 Ref::Var(score),
@@ -2298,7 +2298,7 @@ mod tests {
             },
             Pattern::Filter(Expression::eq(
                 Expression::Var(VarId(0)),
-                Expression::Const(FilterValue::Long(1)),
+                Expression::Const(FlakeValue::Long(1)),
             )),
             Pattern::Triple(TriplePattern::new(
                 Ref::Var(VarId(1)),
@@ -2330,12 +2330,12 @@ mod tests {
                 var: VarId(2),
                 expr: Expression::add(
                     Expression::Var(VarId(1)),
-                    Expression::Const(FilterValue::Long(1)),
+                    Expression::Const(FlakeValue::Long(1)),
                 ),
             },
             Pattern::Filter(Expression::gt(
                 Expression::Var(VarId(2)),
-                Expression::Const(FilterValue::Long(0)),
+                Expression::Const(FlakeValue::Long(0)),
             )),
         ];
 
@@ -2356,8 +2356,8 @@ mod tests {
         // FILTER at position 0 is now allowed with empty seed support
         let patterns = vec![
             Pattern::Filter(Expression::eq(
-                Expression::Const(FilterValue::Long(1)),
-                Expression::Const(FilterValue::Long(1)),
+                Expression::Const(FlakeValue::Long(1)),
+                Expression::Const(FlakeValue::Long(1)),
             )),
             Pattern::Triple(make_pattern(VarId(0), "name", VarId(1))),
         ];
@@ -2393,7 +2393,7 @@ mod tests {
         // BIND at position 0 should work
         let patterns = vec![Pattern::Bind {
             var: VarId(0),
-            expr: Expression::Const(FilterValue::Long(42)),
+            expr: Expression::Const(FlakeValue::Long(42)),
         }];
         let result = build_where_operators(&patterns, None);
         assert!(result.is_ok());
@@ -2499,7 +2499,7 @@ mod tests {
             Pattern::Triple(make_pattern(VarId(0), "vec", VarId(2))),
             Pattern::Filter(Expression::ge(
                 Expression::Var(VarId(1)),
-                Expression::Const(FilterValue::String("2026-01-01".to_string())),
+                Expression::Const(FlakeValue::String("2026-01-01".to_string())),
             )),
         ];
 
@@ -2579,7 +2579,7 @@ mod tests {
         let patterns = vec![
             Pattern::Filter(Expression::gt(
                 Expression::Var(VarId(0)),
-                Expression::Const(FilterValue::Long(0)),
+                Expression::Const(FlakeValue::Long(0)),
             )),
             Pattern::Triple(make_pattern(VarId(1), "value", VarId(0))),
         ];
@@ -2604,11 +2604,11 @@ mod tests {
             Pattern::Filter(Expression::and(vec![
                 Expression::gt(
                     Expression::Var(age),
-                    Expression::Const(FilterValue::Long(18)),
+                    Expression::Const(FlakeValue::Long(18)),
                 ),
                 Expression::ne(
                     Expression::Var(name),
-                    Expression::Const(FilterValue::String(String::new())),
+                    Expression::Const(FlakeValue::String(String::new())),
                 ),
             ])),
             Pattern::Triple(make_pattern(s, "name", name)),
@@ -2630,11 +2630,11 @@ mod tests {
         let patterns = vec![
             Pattern::Filter(Expression::gt(
                 Expression::Var(VarId(0)),
-                Expression::Const(FilterValue::Long(0)),
+                Expression::Const(FlakeValue::Long(0)),
             )),
             Pattern::Filter(Expression::lt(
                 Expression::Var(VarId(0)),
-                Expression::Const(FilterValue::Long(100)),
+                Expression::Const(FlakeValue::Long(100)),
             )),
             Pattern::Triple(make_pattern(VarId(1), "value", VarId(0))),
         ];
@@ -2651,7 +2651,7 @@ mod tests {
         let patterns = vec![
             Pattern::Filter(Expression::gt(
                 Expression::Var(VarId(0)),
-                Expression::Const(FilterValue::Long(18)),
+                Expression::Const(FlakeValue::Long(18)),
             )),
             Pattern::Triple(make_pattern(VarId(1), "age", VarId(0))),
         ];
@@ -2810,7 +2810,7 @@ mod tests {
                         func: crate::ir::Function::Str,
                         args: vec![Expression::Var(VarId(3))],
                     },
-                    Expression::Const(FilterValue::String("Closed".to_string())),
+                    Expression::Const(FlakeValue::String("Closed".to_string())),
                 ],
             })),
         ];
@@ -2830,7 +2830,7 @@ mod tests {
             Pattern::Triple(make_pattern(VarId(0), "age", VarId(2))),
             Pattern::Filter(Expression::gt(
                 Expression::Var(VarId(2)),
-                Expression::Const(FilterValue::Long(18)),
+                Expression::Const(FlakeValue::Long(18)),
             )),
         ];
 
@@ -2945,12 +2945,12 @@ mod tests {
                 var: VarId(2),
                 expr: Expression::add(
                     Expression::Var(VarId(1)),
-                    Expression::Const(FilterValue::Long(10)),
+                    Expression::Const(FlakeValue::Long(10)),
                 ),
             },
             Pattern::Filter(Expression::gt(
                 Expression::Var(VarId(2)),
-                Expression::Const(FilterValue::Long(25)),
+                Expression::Const(FlakeValue::Long(25)),
             )),
         ];
 
@@ -2991,7 +2991,7 @@ mod tests {
         let age = VarId(1);
         let filter_expr = Expression::gt(
             Expression::Var(age),
-            Expression::Const(FilterValue::Long(18)),
+            Expression::Const(FlakeValue::Long(18)),
         );
         let available: HashSet<VarId> = [VarId(0), age].into();
 
@@ -3020,7 +3020,7 @@ mod tests {
         let age2 = VarId(2);
         let bind_expr = Expression::add(
             Expression::Var(age),
-            Expression::Const(FilterValue::Long(1)),
+            Expression::Const(FlakeValue::Long(1)),
         );
         let available: HashSet<VarId> = [VarId(0), age].into();
 
@@ -3050,10 +3050,10 @@ mod tests {
         let y = VarId(2);
         let bind_expr = Expression::add(
             Expression::Var(age),
-            Expression::Const(FilterValue::Long(10)),
+            Expression::Const(FlakeValue::Long(10)),
         );
         let filter_expr =
-            Expression::gt(Expression::Var(y), Expression::Const(FilterValue::Long(25)));
+            Expression::gt(Expression::Var(y), Expression::Const(FlakeValue::Long(25)));
         let available: HashSet<VarId> = [VarId(0), age].into();
 
         let (ops, remaining_binds, remaining_filters) = build_inline_ops(
@@ -3088,12 +3088,12 @@ mod tests {
             a,
             Expression::add(
                 Expression::Var(age),
-                Expression::Const(FilterValue::Long(1)),
+                Expression::Const(FlakeValue::Long(1)),
             ),
         );
         let bind_b = make_bind(
             b,
-            Expression::mul(Expression::Var(a), Expression::Const(FilterValue::Long(2))),
+            Expression::mul(Expression::Var(a), Expression::Const(FlakeValue::Long(2))),
         );
         let available: HashSet<VarId> = [VarId(0), age].into();
 
@@ -3148,7 +3148,7 @@ mod tests {
             Pattern::Triple(make_pattern(s, "age", age)),
             Pattern::Filter(Expression::gt(
                 Expression::Var(age),
-                Expression::Const(FilterValue::Long(18)),
+                Expression::Const(FlakeValue::Long(18)),
             )),
         ];
 
@@ -3183,7 +3183,7 @@ mod tests {
                 var: y,
                 expr: Expression::add(
                     Expression::Var(age),
-                    Expression::Const(FilterValue::Long(10)),
+                    Expression::Const(FlakeValue::Long(10)),
                 ),
             },
         ];
@@ -3216,7 +3216,7 @@ mod tests {
                 var: y,
                 expr: Expression::add(
                     Expression::Var(age),
-                    Expression::Const(FilterValue::Long(10)),
+                    Expression::Const(FlakeValue::Long(10)),
                 ),
             },
         ];
@@ -3244,7 +3244,7 @@ mod tests {
             crate::ir::Function::StrStarts,
             vec![
                 Expression::Var(VarId(1)),
-                Expression::Const(FilterValue::String("Ali".to_string())),
+                Expression::Const(FlakeValue::String("Ali".to_string())),
             ],
         )));
 
@@ -3269,7 +3269,7 @@ mod tests {
             crate::ir::Function::Regex,
             vec![
                 Expression::call(crate::ir::Function::Str, vec![Expression::Var(VarId(1))]),
-                Expression::Const(FilterValue::String("^Ali".to_string())),
+                Expression::Const(FlakeValue::String("^Ali".to_string())),
             ],
         )));
 
@@ -3288,7 +3288,7 @@ mod tests {
             crate::ir::Function::Regex,
             vec![
                 Expression::call(crate::ir::Function::Str, vec![Expression::Var(VarId(1))]),
-                Expression::Const(FilterValue::String("^Ali".to_string())),
+                Expression::Const(FlakeValue::String("^Ali".to_string())),
             ],
         )));
 

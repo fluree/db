@@ -589,43 +589,36 @@ fn evaluate_filter(filter: &RuleFilter, bindings: &Bindings) -> bool {
 }
 
 /// Resolve a filter term to a comparable value
-fn resolve_filter_term(term: &RuleTerm, bindings: &Bindings) -> Option<FilterValue> {
+fn resolve_filter_term(term: &RuleTerm, bindings: &Bindings) -> Option<FlakeValue> {
     match term {
         RuleTerm::Var(name) => bindings.get(name.as_ref()).map(|bv| match bv {
-            BindingValue::Long(n) => FilterValue::Long(*n),
-            BindingValue::Double(d) => FilterValue::Double(*d),
-            BindingValue::String(s) => FilterValue::String(s.clone()),
-            BindingValue::Boolean(b) => FilterValue::Boolean(*b),
-            BindingValue::Sid(sid) => FilterValue::String(sid.name.to_string()),
+            BindingValue::Long(n) => FlakeValue::Long(*n),
+            BindingValue::Double(d) => FlakeValue::Double(*d),
+            BindingValue::String(s) => FlakeValue::String(s.clone()),
+            BindingValue::Boolean(b) => FlakeValue::Boolean(*b),
+            BindingValue::Sid(sid) => FlakeValue::String(sid.name.to_string()),
         }),
         RuleTerm::Value(val) => Some(match val {
-            RuleValue::Long(n) => FilterValue::Long(*n),
-            RuleValue::Double(d) => FilterValue::Double(*d),
-            RuleValue::String(s) => FilterValue::String(s.clone()),
-            RuleValue::Boolean(b) => FilterValue::Boolean(*b),
-            RuleValue::Ref(sid) => FilterValue::String(sid.name.to_string()),
+            RuleValue::Long(n) => FlakeValue::Long(*n),
+            RuleValue::Double(d) => FlakeValue::Double(*d),
+            RuleValue::String(s) => FlakeValue::String(s.clone()),
+            RuleValue::Boolean(b) => FlakeValue::Boolean(*b),
+            RuleValue::Ref(sid) => FlakeValue::String(sid.name.to_string()),
         }),
-        RuleTerm::Sid(sid) => Some(FilterValue::String(sid.name.to_string())),
+        RuleTerm::Sid(sid) => Some(FlakeValue::String(sid.name.to_string())),
     }
 }
 
-/// Value type for filter comparisons
-#[derive(Debug, Clone)]
-enum FilterValue {
-    Long(i64),
-    Double(f64),
-    String(String),
-    Boolean(bool),
-}
-
-/// Compare two filter values using the given operator
-fn compare_values(left: &FilterValue, right: &FilterValue, op: CompareOp) -> bool {
+/// Compare two filter values using the given operator. Only the
+/// Long/Double/String/Boolean variants of FlakeValue are inspected; other
+/// variants fall through to "incompatible".
+fn compare_values(left: &FlakeValue, right: &FlakeValue, op: CompareOp) -> bool {
     // Try numeric comparison first
     let numeric_result = match (left, right) {
-        (FilterValue::Long(l), FilterValue::Long(r)) => Some(l.cmp(r)),
-        (FilterValue::Long(l), FilterValue::Double(r)) => (*l as f64).partial_cmp(r),
-        (FilterValue::Double(l), FilterValue::Long(r)) => l.partial_cmp(&(*r as f64)),
-        (FilterValue::Double(l), FilterValue::Double(r)) => l.partial_cmp(r),
+        (FlakeValue::Long(l), FlakeValue::Long(r)) => Some(l.cmp(r)),
+        (FlakeValue::Long(l), FlakeValue::Double(r)) => (*l as f64).partial_cmp(r),
+        (FlakeValue::Double(l), FlakeValue::Long(r)) => l.partial_cmp(&(*r as f64)),
+        (FlakeValue::Double(l), FlakeValue::Double(r)) => l.partial_cmp(r),
         _ => None,
     };
 
@@ -642,8 +635,8 @@ fn compare_values(left: &FilterValue, right: &FilterValue, op: CompareOp) -> boo
 
     // Fall back to string comparison
     let (left_str, right_str) = match (left, right) {
-        (FilterValue::String(l), FilterValue::String(r)) => (l.as_str(), r.as_str()),
-        (FilterValue::Boolean(l), FilterValue::Boolean(r)) => {
+        (FlakeValue::String(l), FlakeValue::String(r)) => (l.as_str(), r.as_str()),
+        (FlakeValue::Boolean(l), FlakeValue::Boolean(r)) => {
             // Boolean comparison
             return match op {
                 CompareOp::Equal => l == r,

@@ -12,7 +12,7 @@ use fluree_db_query::binding::{Batch, Binding};
 use fluree_db_query::context::ExecutionContext;
 use fluree_db_query::expression::PreparedBoolExpression;
 use fluree_db_query::ir::triple::{Ref, Term, TriplePattern};
-use fluree_db_query::ir::{Expression, FilterValue};
+use fluree_db_query::ir::{Expression, FlakeValue};
 use fluree_db_query::join::NestedLoopJoinOperator;
 use fluree_db_query::operator::inline::InlineOperator;
 use fluree_db_query::operator::Operator;
@@ -167,7 +167,7 @@ async fn test_range_scan_empty_schema_respects_inline_filter() {
     let mut bindings: Vec<Binding> = vec![];
 
     let inline_ops = vec![InlineOperator::Filter(PreparedBoolExpression::new(
-        Expression::Const(FilterValue::Bool(false)),
+        Expression::Const(FlakeValue::Boolean(false)),
     ))];
     let keep =
         fluree_db_query::operator::inline::apply_inline(&inline_ops, &schema, &mut bindings, None)

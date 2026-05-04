@@ -69,10 +69,10 @@ pub fn eval_negate<R: RowAccess>(
 mod tests {
     use super::*;
     use crate::binding::BindingRow;
-    use crate::ir::FilterValue;
+    use fluree_db_core::value::FlakeValue;
 
     fn long(v: i64) -> Expression {
-        Expression::Const(FilterValue::Long(v))
+        Expression::Const(FlakeValue::Long(v))
     }
 
     fn empty_row() -> BindingRow<'static> {

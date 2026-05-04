@@ -13,7 +13,7 @@ use crate::span::SourceSpan;
 
 use fluree_db_query::aggregate::AggregateSpec;
 use fluree_db_query::ir::QueryOptions;
-use fluree_db_query::ir::{Expression, FilterValue, Pattern, SubqueryPattern};
+use fluree_db_query::ir::{Expression, FlakeValue, Pattern, SubqueryPattern};
 use fluree_db_query::parse::encode::IriEncoder;
 use fluree_db_query::sort::{SortDirection, SortSpec};
 use fluree_db_query::var_registry::VarId;
@@ -290,7 +290,7 @@ impl<E: IriEncoder> LoweringContext<'_, E> {
     fn lower_having_conditions(&mut self, conditions: &[AstExpression]) -> Result<Expression> {
         if conditions.is_empty() {
             // Should not happen - HAVING requires at least one condition
-            return Ok(Expression::Const(FilterValue::Bool(true)));
+            return Ok(Expression::Const(FlakeValue::Boolean(true)));
         }
 
         let mut exprs: Vec<Expression> = Vec::with_capacity(conditions.len());

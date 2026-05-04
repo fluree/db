@@ -1564,7 +1564,7 @@ mod tests {
             Pattern::Triple(TriplePattern::new(Ref::Var(s), pred.clone(), Term::Var(o))),
             Pattern::Bind {
                 var: o,
-                expr: crate::ir::Expression::Const(crate::ir::FilterValue::Long(42)),
+                expr: crate::ir::Expression::Const(crate::ir::FlakeValue::Long(42)),
             },
         ];
 
