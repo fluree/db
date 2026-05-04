@@ -184,6 +184,11 @@ impl<'a> FlakeGenerator<'a> {
             _ => return Ok(None),
         };
 
+        // Late hard guard for storage invariants: catches (FlakeValue, dt)
+        // mis-pairings (e.g. scalar object key with VECTOR_ID datatype) before
+        // they hit the index. Bails out the whole transaction.
+        validate_value_dt_pair(&o, &dt)?;
+
         // Create metadata if language tag or list_index is present
         let meta_lang = template_lang.or(bound_lang);
         let meta = match (&meta_lang, &template.list_index) {
@@ -389,6 +394,46 @@ impl<'a> FlakeGenerator<'a> {
     }
 }
 
+/// Hard-fail invariants between the resolved datatype Sid and FlakeValue
+/// shape, run before a flake is committed. Catches mis-paired forms like
+/// `(FlakeValue::Double, dt=embeddingVector)` produced by upstream parsing
+/// bugs — without this guard, those go on to generate VECTOR_ID flakes
+/// pointing at scalar arena handles, corrupting the index.
+pub(crate) fn validate_value_dt_pair(val: &FlakeValue, dt: &Sid) -> Result<()> {
+    let is_vector_dt = dt == &*DT_VECTOR;
+    let is_vector_val = matches!(val, FlakeValue::Vector(_));
+    if is_vector_dt != is_vector_val {
+        return Err(TransactError::FlakeGeneration(format!(
+            "f:embeddingVector must pair only with FlakeValue::Vector \
+             (dt_vector={is_vector_dt}, val_vector={is_vector_val}); \
+             a parser produced a mismatched (value, datatype) shape"
+        )));
+    }
+    // Empty vectors must never reach the indexer: `FlakeValue::Vector(Vec::new())`
+    // is reserved as the `FlakeValue::max()` upper-bound sentinel, and the shared
+    // vector arena hard-rejects them. Catch any path that bypassed
+    // `coerce_array_to_vector`'s upstream check (e.g. a future direct
+    // construction of `FlakeValue::Vector(vec![])`).
+    if is_vector_dt {
+        if let FlakeValue::Vector(v) = val {
+            if v.is_empty() {
+                return Err(TransactError::FlakeGeneration(
+                    "f:embeddingVector flake must have at least one element; \
+                     empty vectors collide with the FlakeValue::max() sentinel \
+                     and the vector arena rejects them"
+                        .to_string(),
+                ));
+            }
+        }
+    }
+    if dt == &*DT_JSON && !matches!(val, FlakeValue::Json(_)) {
+        return Err(TransactError::FlakeGeneration(format!(
+            "rdf:JSON must pair only with FlakeValue::Json (got {val:?})"
+        )));
+    }
+    Ok(())
+}
+
 /// Infer datatype from a FlakeValue
 ///
 /// Returns the appropriate XSD/RDF datatype Sid for the given value.
@@ -580,5 +625,37 @@ mod tests {
         let meta = flakes[0].m.as_ref().expect("should have metadata");
         assert_eq!(meta.lang.as_deref(), Some("en"));
         assert_eq!(meta.i, Some(0));
+    }
+
+    #[test]
+    fn test_validate_pair_rejects_vector_dt_with_non_vector_value() {
+        let err = validate_value_dt_pair(
+            &FlakeValue::Double(0.1),
+            &Sid::new(FLUREE_DB, "embeddingVector"),
+        )
+        .expect_err("scalar paired with embeddingVector dt must fail");
+        assert!(format!("{err}").contains("embeddingVector"));
+    }
+
+    #[test]
+    fn test_validate_pair_rejects_empty_vector() {
+        // Empty Vector is reserved as the FlakeValue::max() sentinel and the
+        // vector arena rejects it; the write-path guard must catch it even if
+        // it bypassed coerce_array_to_vector.
+        let err = validate_value_dt_pair(
+            &FlakeValue::Vector(Vec::new()),
+            &Sid::new(FLUREE_DB, "embeddingVector"),
+        )
+        .expect_err("empty vector must be rejected");
+        assert!(format!("{err}").contains("at least one element"), "{err}");
+    }
+
+    #[test]
+    fn test_validate_pair_accepts_non_empty_vector() {
+        validate_value_dt_pair(
+            &FlakeValue::Vector(vec![0.1, 0.2]),
+            &Sid::new(FLUREE_DB, "embeddingVector"),
+        )
+        .expect("non-empty vector with embeddingVector dt is valid");
     }
 }
