@@ -105,6 +105,18 @@ impl ApiFulltextConfigProvider {
                         return Ok(Vec::new());
                     }
                     GraphRegistrationProbe::Found(t) => {
+                        // FUTURE OPTIMIZATION (per PR #1211 review by @bplatz):
+                        // `t` here is the earliest commit at which the config
+                        // graph was registered — every flake we care about lives
+                        // at `t' >= t`. The `LedgerState::load` call below still
+                        // walks the whole chain (`stop_at_t = 0`) because that's
+                        // the only entry point it currently exposes. Threading
+                        // `t` through as a `stop_at_t` hint, OR moving config
+                        // resolution behind a `g_id`-filtered novelty load,
+                        // would eliminate the redundant pass on registered-
+                        // config ledgers. Tracked as a follow-up; the
+                        // `Found(t)` value here is already plumbed through the
+                        // public API to support that work.
                         tracing::debug!(
                             ledger_id,
                             cfg_iri = %cfg_iri,
