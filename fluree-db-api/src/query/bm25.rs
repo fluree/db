@@ -47,7 +47,10 @@ impl Fluree {
         } else {
             None
         };
-        #[allow(unused_mut, reason = "vector_provider is set inside cfg(feature = \"vector\")")]
+        #[allow(
+            unused_mut,
+            reason = "vector_provider is set inside cfg(feature = \"vector\")"
+        )]
         let mut config = ContextConfig {
             tracker: tracker_ref,
             dataset: Some(&runtime_dataset),

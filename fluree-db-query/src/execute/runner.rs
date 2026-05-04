@@ -568,7 +568,7 @@ pub struct ContextConfig<'a, 'b> {
     pub remote_service: Option<&'b dyn crate::remote_service::RemoteServiceExecutor>,
 }
 
-impl<'a, 'b> Default for ContextConfig<'a, 'b> {
+impl Default for ContextConfig<'_, '_> {
     fn default() -> Self {
         // strict-by-default: query semantics treat bind eval errors as query
         // errors. Every wrapper in this file set `strict_bind_errors: true`,
@@ -595,7 +595,7 @@ impl<'a, 'b> Default for ContextConfig<'a, 'b> {
     }
 }
 
-impl<'a, 'b> ContextConfig<'a, 'b> {
+impl ContextConfig<'_, '_> {
     /// Attach a policy enforcer built from a `&PolicyContext`.
     ///
     /// Wraps the `Arc::new(QueryPolicyEnforcer::new(Arc::new(policy.clone())))`
@@ -604,9 +604,9 @@ impl<'a, 'b> ContextConfig<'a, 'b> {
     /// `Arc<QueryPolicyEnforcer>` (e.g., the view layer via
     /// `db.policy_enforcer().cloned()`) should set `policy_enforcer` directly.
     pub fn with_policy(mut self, policy: &fluree_db_policy::PolicyContext) -> Self {
-        self.policy_enforcer = Some(Arc::new(crate::policy::QueryPolicyEnforcer::new(
-            Arc::new(policy.clone()),
-        )));
+        self.policy_enforcer = Some(Arc::new(crate::policy::QueryPolicyEnforcer::new(Arc::new(
+            policy.clone(),
+        ))));
         self
     }
 }
@@ -734,13 +734,12 @@ pub async fn execute_prepared<'a, 'b>(
 /// a `PreparedExecution` (for example, the view layer's eager + tracked
 /// variants) should call [`prepare_execution`] / [`prepare_execution_with_config`]
 /// and then [`execute_prepared`] explicitly.
-pub async fn execute<'a, 'b>(
+pub async fn execute<'a>(
     db: GraphDbRef<'a>,
     vars: &VarRegistry,
     query: &ExecutableQuery,
-    config: ContextConfig<'a, 'b>,
+    config: ContextConfig<'a, '_>,
 ) -> Result<Vec<Batch>> {
     let prepared = prepare_execution(db, query).await?;
     execute_prepared(db, vars, prepared, config).await
 }
-

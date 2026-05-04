@@ -317,11 +317,9 @@ async fn scan_owl_imports_in_graph(
     );
 
     let db = GraphDbRef::new(snapshot, g_id, overlay, to_t).eager();
-    let batches = execute_pattern(db, &vars, pattern)
-        .await
-        .map_err(|e| {
-            ApiError::OntologyImport(format!("failed to scan owl:imports in graph {g_id}: {e}"))
-        })?;
+    let batches = execute_pattern(db, &vars, pattern).await.map_err(|e| {
+        ApiError::OntologyImport(format!("failed to scan owl:imports in graph {g_id}: {e}"))
+    })?;
 
     let mut iris = Vec::new();
     let mut seen: HashSet<String> = HashSet::new();

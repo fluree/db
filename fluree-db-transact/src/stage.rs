@@ -1374,12 +1374,8 @@ async fn generate_upsert_deletions(
             }
         } else {
             // Default graph: use standard query path through range_provider
-            fluree_db_query::execute_pattern(
-                ledger.as_graph_db_ref(0),
-                &query_vars,
-                pattern,
-            )
-            .await?
+            fluree_db_query::execute_pattern(ledger.as_graph_db_ref(0), &query_vars, pattern)
+                .await?
         };
 
         // Convert each result to a retraction flake in the appropriate graph.

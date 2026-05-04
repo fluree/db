@@ -1350,9 +1350,7 @@ impl Pattern {
             Pattern::Minus(inner) => Pattern::Minus(f(inner)),
             Pattern::Exists(inner) => Pattern::Exists(f(inner)),
             Pattern::NotExists(inner) => Pattern::NotExists(f(inner)),
-            Pattern::Union(branches) => {
-                Pattern::Union(branches.into_iter().map(&mut *f).collect())
-            }
+            Pattern::Union(branches) => Pattern::Union(branches.into_iter().map(&mut *f).collect()),
             Pattern::Graph { name, patterns } => Pattern::Graph {
                 name,
                 patterns: f(patterns),
