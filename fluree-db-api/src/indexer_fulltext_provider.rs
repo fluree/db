@@ -17,6 +17,7 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use fluree_db_core::{config_graph_iri, first_t_where_graph_registered, GraphRegistrationProbe};
 use fluree_db_indexer::{ConfiguredFulltextProperty, FulltextConfigProvider};
 use fluree_db_ledger::LedgerState;
 use fluree_db_nameservice::NameService;
@@ -42,6 +43,100 @@ impl std::fmt::Debug for ApiFulltextConfigProvider {
 
 impl ApiFulltextConfigProvider {
     async fn resolve(&self, ledger_id: &str) -> Result<Vec<ConfiguredFulltextProperty>, String> {
+        // 0. Envelope-only short-circuit.
+        //
+        // The config graph (`config_graph_iri(ledger_id)`) must be
+        // registered in some commit's `graph_delta` before any flake can
+        // belong to it. Probe the chain envelope-only (byte-range
+        // ~128 KiB per commit on range-capable backends) — if the IRI
+        // never appears, no `f:LedgerConfig` can exist and we can return
+        // immediately without paying for `LedgerState::load`'s full
+        // chain walk + novelty build.
+        //
+        // This is the common case on a fresh reindex of a ledger that
+        // never set up fulltext config, which is what was driving Lambda
+        // first-reindex past the 900s ceiling — `LedgerState::load`
+        // walked all 787 commits via `load_commit_by_id`
+        // (`read_commit_v4` per commit) just to discover an empty config
+        // graph.
+        //
+        // Only `NotFound` short-circuits. `Found(_)` and `Inconclusive`
+        // fall through to the full-load path:
+        //
+        // - `Found(_)`: the chain definitely registered the config graph,
+        //   so we need to read the actual flakes to extract config.
+        // - `Inconclusive`: at least one v3 envelope on the chain (which
+        //   never encoded `graph_delta`), so we can't tell from envelopes
+        //   alone whether the IRI is registered. Fall through to a full
+        //   `LedgerState::load` so legacy chains don't silently lose
+        //   their fulltext config — the full load is itself fast now
+        //   thanks to `bulk_apply_commits` in `load_novelty`.
+        let record = self
+            .nameservice
+            .lookup(ledger_id)
+            .await
+            .map_err(|e| format!("nameservice lookup: {e}"))?;
+        if let Some(record) = &record {
+            if let Some(head_id) = record.commit_head_id.as_ref() {
+                let cs = if record.source_branch.is_some() {
+                    let branched = fluree_db_nameservice::build_branched_store(
+                        &self.backend,
+                        self.nameservice.as_ref(),
+                        record,
+                    )
+                    .await
+                    .map_err(|e| format!("build_branched_store: {e}"))?;
+                    Arc::new(branched) as Arc<dyn fluree_db_core::ContentStore>
+                } else {
+                    self.backend.content_store(&record.ledger_id)
+                };
+                let cfg_iri = config_graph_iri(ledger_id);
+                let probe = first_t_where_graph_registered(cs.as_ref(), head_id, &cfg_iri)
+                    .await
+                    .map_err(|e| format!("envelope walk for config graph: {e}"))?;
+                match probe {
+                    GraphRegistrationProbe::NotFound => {
+                        tracing::debug!(
+                            ledger_id,
+                            cfg_iri = %cfg_iri,
+                            "fulltext config provider: config graph never registered; \
+                             skipping LedgerState::load + resolve_ledger_config"
+                        );
+                        return Ok(Vec::new());
+                    }
+                    GraphRegistrationProbe::Found(t) => {
+                        // FUTURE OPTIMIZATION (per PR #1211 review by @bplatz):
+                        // `t` here is the earliest commit at which the config
+                        // graph was registered — every flake we care about lives
+                        // at `t' >= t`. The `LedgerState::load` call below still
+                        // walks the whole chain (`stop_at_t = 0`) because that's
+                        // the only entry point it currently exposes. Threading
+                        // `t` through as a `stop_at_t` hint, OR moving config
+                        // resolution behind a `g_id`-filtered novelty load,
+                        // would eliminate the redundant pass on registered-
+                        // config ledgers. Tracked as a follow-up; the
+                        // `Found(t)` value here is already plumbed through the
+                        // public API to support that work.
+                        tracing::debug!(
+                            ledger_id,
+                            cfg_iri = %cfg_iri,
+                            first_t = t,
+                            "fulltext config provider: config graph registered; \
+                             proceeding with full state load + resolve"
+                        );
+                    }
+                    GraphRegistrationProbe::Inconclusive => {
+                        tracing::debug!(
+                            ledger_id,
+                            cfg_iri = %cfg_iri,
+                            "fulltext config provider: envelope-only probe inconclusive \
+                             (v3 envelope on chain); falling through to full state load"
+                        );
+                    }
+                }
+            }
+        }
+
         // 1. Load ledger state (snapshot + novelty).
         let mut state = LedgerState::load(self.nameservice.as_ref(), ledger_id, &self.backend)
             .await

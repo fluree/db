@@ -363,6 +363,221 @@ impl Novelty {
         Ok(())
     }
 
+    /// Bulk-apply many commits' flakes in a single pass.
+    ///
+    /// Designed for first-load / catch-up paths (e.g. `LedgerState::load_novelty`
+    /// walking a long commit chain) where calling [`apply_commit`] per commit
+    /// degrades to O(N²) cumulative cost: each call's
+    /// `merge_batch_into_index` is O(target.len() + batch.len()), so over
+    /// `M` commits with average batch `B` it accrues `O(M·N̄)` work, where
+    /// `N̄` is the running novelty size.
+    ///
+    /// This method instead:
+    /// 1. Routes every flake into a per-graph bucket in one ingest pass.
+    /// 2. Sorts each graph's flakes once (parallel) by an identity-then-t
+    ///    key (`s, p, o, dt, m, t, op`).
+    /// 3. Walks each `(s, p, o, dt, m)` group linearly to apply set
+    ///    semantics — assertion is dropped iff the prior kept flake for the
+    ///    same identity was also an assertion (mirroring
+    ///    [`apply_commit`]'s `fact_currently_asserted_in_graph` skip rule);
+    ///    retractions are always kept.
+    /// 4. Re-sorts the deduped set into the 4 index orders (SPOT, PSOT,
+    ///    POST, OPST) once each.
+    ///
+    /// Total cost is `O(N log N)` over the merged set instead of `O(N²)` —
+    /// for a 787-commit / ~7M-flake chain this drops the catch-up from
+    /// minutes to seconds on Lambda single-CPU.
+    ///
+    /// Existing graph contents (if any) are preserved by merging their
+    /// alive `FlakeId`s into the dedup pass alongside the incoming batches,
+    /// so the post-condition matches what a sequential per-commit
+    /// `apply_commit` chain would have produced — minus retraction-noise
+    /// duplicates that the per-commit path never emits anyway.
+    ///
+    /// `epoch` bumps once per call, regardless of how many commits were
+    /// merged. `t` advances to `max(self.t, max_commit_t)`.
+    ///
+    /// # Memory contract — differs from [`apply_commit`]
+    ///
+    /// Unlike [`apply_commit`] (which checks `fact_currently_asserted_in_graph`
+    /// **before** pushing into the arena, so deduped duplicates never enter
+    /// the [`FlakeStore`]), this method pushes every incoming flake into the
+    /// arena in Phase 1 and only drops `FlakeId`s during the post-sort
+    /// dedup walk. The underlying `Flake` records and their per-flake
+    /// sizes remain in [`FlakeStore::flakes`] / `FlakeStore::sizes` for
+    /// the lifetime of the [`Novelty`], and `self.size` (the
+    /// backpressure-relevant total) accounts for them.
+    ///
+    /// For the design call site (one fresh-load chain walk feeding an
+    /// otherwise-empty arena, after which the [`Novelty`] is consumed and
+    /// dropped), this bloat is bounded and operationally negligible — the
+    /// dedup count is logged at the end of every call so the cost stays
+    /// observable. **Do not wire this into hot-path mutation code without
+    /// either redesigning the dedup to gate `push_with_size` or adding a
+    /// post-walk arena rebuild.**
+    pub fn bulk_apply_commits<I>(
+        &mut self,
+        commit_batches: I,
+        reverse_graph: &HashMap<Sid, GraphId>,
+    ) -> Result<()>
+    where
+        I: IntoIterator<Item = (Vec<Flake>, i64)>,
+    {
+        use rayon::prelude::*;
+
+        let span = tracing::debug_span!(
+            "novelty_bulk_apply_commits",
+            rayon_threads = rayon::current_num_threads()
+        );
+        let _guard = span.enter();
+
+        let started = std::time::Instant::now();
+
+        // ---- Phase 1: ingest into arena, partition by graph ----
+        let mut per_graph: HashMap<GraphId, Vec<FlakeId>> = HashMap::new();
+        let mut max_t = self.t;
+        let mut commit_count: u64 = 0;
+        let mut total_flakes: usize = 0;
+
+        for (flakes, commit_t) in commit_batches {
+            if flakes.is_empty() {
+                commit_count += 1;
+                max_t = max_t.max(commit_t);
+                continue;
+            }
+            let new_count = self.store.len() + flakes.len();
+            if new_count > MAX_FLAKE_ID as usize {
+                return Err(NoveltyError::overflow(
+                    "FlakeId overflow during bulk apply: too many flakes in novelty, trigger reindex",
+                ));
+            }
+            commit_count += 1;
+            total_flakes += flakes.len();
+            max_t = max_t.max(commit_t);
+
+            for flake in flakes {
+                let g_id = Self::resolve_flake_g_id(&flake, reverse_graph)?;
+                let size = flake.size_bytes();
+                self.size += size;
+                let id = self.store.push_with_size(flake, size);
+                per_graph.entry(g_id).or_default().push(id);
+            }
+        }
+
+        if per_graph.is_empty() {
+            self.t = max_t;
+            self.epoch += 1;
+            return Ok(());
+        }
+
+        // Ensure graph slots so we can take existing index vectors.
+        for &g_id in per_graph.keys() {
+            self.ensure_graph(g_id);
+        }
+
+        // ---- Phase 2: per-graph dedup + 4-index sort ----
+        let store = &self.store;
+        let mut total_dedup: u64 = 0;
+
+        for (g_id, mut new_ids) in per_graph {
+            // Pull in the graph's existing alive FlakeIds (any prior
+            // novelty content) so the dedup pass sees the full universe.
+            // SPOT/PSOT/POST/OPST have identical alive sets (apply_commit
+            // pushes the same batch_ids to all four), so taking SPOT is
+            // the canonical choice.
+            let graph_vecs = self.graphs[g_id as usize]
+                .as_mut()
+                .expect("ensure_graph above");
+            let existing_spot = std::mem::take(&mut graph_vecs.spot);
+            // Other indexes get rebuilt below; clear them so we don't
+            // double-count if the dedup walk drops some.
+            graph_vecs.psot.clear();
+            graph_vecs.post.clear();
+            graph_vecs.opst.clear();
+
+            let mut combined = existing_spot;
+            combined.append(&mut new_ids);
+
+            // Sort by (s, p, o, dt, m, t, op) so each (s, p, o, dt, m)
+            // identity forms a contiguous t-ascending run.
+            combined.par_sort_unstable_by(|&a, &b| {
+                let fa = store.get(a);
+                let fb = store.get(b);
+                fa.s.cmp(&fb.s)
+                    .then_with(|| fa.p.cmp(&fb.p))
+                    .then_with(|| cmp_object(fa, fb))
+                    .then_with(|| cmp_meta(fa, fb))
+                    .then_with(|| fa.t.cmp(&fb.t))
+                    .then_with(|| fa.op.cmp(&fb.op))
+            });
+
+            // Linear set-semantics dedup: for each (s, p, o, dt, m)
+            // identity group, walk in ascending t and drop any assertion
+            // whose prior kept flake for the same identity was also an
+            // assertion. Retractions are always kept.
+            let mut kept: Vec<FlakeId> = Vec::with_capacity(combined.len());
+            let mut group_start = 0usize;
+            while group_start < combined.len() {
+                let head = store.get(combined[group_start]);
+                let mut group_end = group_start + 1;
+                while group_end < combined.len() {
+                    let f = store.get(combined[group_end]);
+                    if !same_identity(head, f) {
+                        break;
+                    }
+                    group_end += 1;
+                }
+                let mut currently_asserted = false;
+                for &id in &combined[group_start..group_end] {
+                    let f = store.get(id);
+                    if !f.op {
+                        kept.push(id);
+                        currently_asserted = false;
+                    } else if !currently_asserted {
+                        kept.push(id);
+                        currently_asserted = true;
+                    } else {
+                        total_dedup += 1;
+                    }
+                }
+                group_start = group_end;
+            }
+
+            // Build the 4 sorted index vectors from the deduped set. Each
+            // sort is independently O(N log N); kept.clone() copies only
+            // the small `FlakeId` (u32) array, not the underlying flakes.
+            let mut spot = kept.clone();
+            spot.par_sort_unstable_by(|&a, &b| IndexType::Spot.compare(store.get(a), store.get(b)));
+            let mut psot = kept.clone();
+            psot.par_sort_unstable_by(|&a, &b| IndexType::Psot.compare(store.get(a), store.get(b)));
+            let mut post = kept.clone();
+            post.par_sort_unstable_by(|&a, &b| IndexType::Post.compare(store.get(a), store.get(b)));
+            let mut opst = kept;
+            opst.par_sort_unstable_by(|&a, &b| IndexType::Opst.compare(store.get(a), store.get(b)));
+
+            let graph_vecs = self.graphs[g_id as usize]
+                .as_mut()
+                .expect("ensure_graph above");
+            graph_vecs.spot = spot;
+            graph_vecs.psot = psot;
+            graph_vecs.post = post;
+            graph_vecs.opst = opst;
+        }
+
+        self.t = max_t;
+        self.epoch += 1;
+
+        tracing::debug!(
+            commits = commit_count,
+            total_flakes,
+            deduped = total_dedup,
+            elapsed_ms = started.elapsed().as_millis() as u64,
+            "novelty bulk apply complete"
+        );
+
+        Ok(())
+    }
+
     /// Clear flakes with t <= cutoff_t (after index merge)
     ///
     /// Uses bitmap instead of HashSet for cache-friendly O(n) clear.
@@ -567,6 +782,38 @@ impl OverlayProvider for Novelty {
 // =============================================================================
 // Parallel merge helpers (read-only store + disjoint mutable index vectors)
 // =============================================================================
+
+/// Compare two flakes by their object value (datatype-aware).
+///
+/// Mirrors the hidden `cmp_object` in `fluree_db_core::comparator` so the
+/// bulk-apply identity sort can group flakes by `(s, p, o, dt, m)` without
+/// reaching into core's private comparators.
+fn cmp_object(f1: &Flake, f2: &Flake) -> Ordering {
+    f1.o.cmp(&f2.o).then_with(|| f1.dt.cmp(&f2.dt))
+}
+
+/// Compare two flakes by their metadata (None < Some, then m1 < m2).
+///
+/// Mirrors `fluree_db_core::comparator::cmp_meta` for the same reason as
+/// [`cmp_object`].
+fn cmp_meta(f1: &Flake, f2: &Flake) -> Ordering {
+    match (&f1.m, &f2.m) {
+        (None, None) => Ordering::Equal,
+        (None, Some(_)) => Ordering::Less,
+        (Some(_), None) => Ordering::Greater,
+        (Some(m1), Some(m2)) => m1.cmp(m2),
+    }
+}
+
+/// True iff `a` and `b` have identical `(s, p, o, dt, m)` — the fact
+/// identity used by [`Novelty::apply_commit`]'s `fact_currently_asserted_in_graph`
+/// dedup rule and the [`Novelty::bulk_apply_commits`] dedup walk.
+fn same_identity(a: &Flake, b: &Flake) -> bool {
+    a.s == b.s
+        && a.p == b.p
+        && cmp_object(a, b) == Ordering::Equal
+        && cmp_meta(a, b) == Ordering::Equal
+}
 
 /// LSM-style merge: sort batch by index comparator, then merge with existing target.
 fn merge_batch_into_index(
@@ -1093,5 +1340,116 @@ mod tests {
 
         assert_eq!(store.get(0).s.namespace_code, 1);
         assert_eq!(store.get(1).s.namespace_code, 2);
+    }
+
+    /// Drift guard: the file-local `cmp_object` / `cmp_meta` /
+    /// `same_identity` helpers exist because `fluree_db_core::comparator`'s
+    /// equivalents are private. They MUST stay byte-for-byte consistent
+    /// with the `(s, p, o, dt, t, op, m)` ordering encoded in
+    /// `IndexType::Spot.compare`, since [`Novelty::bulk_apply_commits`]'s
+    /// set-semantics dedup depends on `same_identity` matching the
+    /// identity used by `fact_currently_asserted_in_graph` in
+    /// [`Novelty::apply_commit`].
+    ///
+    /// If either side ever drifts, this test fires loudly. Symptoms of a
+    /// silent drift would be silently dropped or duplicated assertions
+    /// during first-load catch-up — extremely hard to track down at
+    /// runtime — so a deterministic compile-and-run guard is worth it.
+    #[test]
+    fn local_identity_helpers_match_core_spot_comparator_semantics() {
+        use fluree_db_core::IndexType;
+
+        // Two flakes that share `(s, p, o, dt, m)` but differ in `(t, op)`
+        // — `same_identity` must say `true`, and SPOT comparator must
+        // disagree only on the t/op tail.
+        let id_a = make_flake(101, 200, 42, 1, true);
+        let id_b = make_flake(101, 200, 42, 5, false);
+        assert!(
+            same_identity(&id_a, &id_b),
+            "same (s, p, o, dt, m) must be one identity"
+        );
+        let cmp = IndexType::Spot.compare(&id_a, &id_b);
+        assert_eq!(
+            cmp,
+            Ordering::Less,
+            "within an identity group, SPOT must order by ascending t"
+        );
+
+        // Differing on each prefix component must break identity.
+        let other_s = make_flake(102, 200, 42, 1, true);
+        let other_p = make_flake(101, 201, 42, 1, true);
+        let other_o = make_flake(101, 200, 99, 1, true);
+        for (label, b) in [
+            ("subject", other_s),
+            ("predicate", other_p),
+            ("object", other_o),
+        ] {
+            assert!(
+                !same_identity(&id_a, &b),
+                "identity must NOT collapse across differing {label}"
+            );
+            assert_ne!(
+                IndexType::Spot.compare(&id_a, &b),
+                Ordering::Equal,
+                "SPOT comparator must disagree when {label} differs"
+            );
+        }
+
+        // `cmp_meta` ordering: None < Some, and Some<m1> < Some<m2>
+        // when m1 < m2. Construct two flakes with explicit metadata
+        // and verify both `cmp_meta` and the SPOT tail behavior.
+        let m_lo = FlakeMeta::with_lang("aa");
+        let m_hi = FlakeMeta::with_lang("zz");
+        let f_none = make_flake_with_meta(101, 200, 42, 1, true, None);
+        let f_lo = make_flake_with_meta(101, 200, 42, 1, true, Some(m_lo.clone()));
+        let f_hi = make_flake_with_meta(101, 200, 42, 1, true, Some(m_hi.clone()));
+        assert_eq!(cmp_meta(&f_none, &f_lo), Ordering::Less);
+        assert_eq!(cmp_meta(&f_lo, &f_hi), Ordering::Less);
+        assert_eq!(cmp_meta(&f_lo, &f_lo), Ordering::Equal);
+        // `same_identity` must split on metadata: same (s,p,o,dt) but
+        // distinct m means distinct identity, just like `apply_commit`'s
+        // `fact_currently_asserted_in_graph` walks (s,p,o,dt) and then
+        // matches `existing.m == flake.m`.
+        assert!(
+            !same_identity(&f_none, &f_lo),
+            "identity must split on metadata"
+        );
+        assert!(
+            !same_identity(&f_lo, &f_hi),
+            "identity must split on differing metadata values"
+        );
+
+        // `cmp_object` mixes value and datatype: equal value + differing
+        // datatype must order. Use distinct datatype Sids on otherwise
+        // identical flakes.
+        let dt_long = Sid::new(2, "long");
+        let dt_int = Sid::new(2, "integer");
+        let with_long = Flake::new(
+            Sid::new(101, "s101"),
+            Sid::new(200, "p200"),
+            FlakeValue::Long(42),
+            dt_long,
+            1,
+            true,
+            None,
+        );
+        let with_int = Flake::new(
+            Sid::new(101, "s101"),
+            Sid::new(200, "p200"),
+            FlakeValue::Long(42),
+            dt_int,
+            1,
+            true,
+            None,
+        );
+        assert_ne!(
+            cmp_object(&with_long, &with_int),
+            Ordering::Equal,
+            "cmp_object must distinguish equal values across differing datatypes"
+        );
+        assert!(
+            !same_identity(&with_long, &with_int),
+            "datatype is part of identity — must split"
+        );
     }
 }

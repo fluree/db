@@ -806,6 +806,29 @@ impl ContentStore for BranchedContentStore {
             .resolve_local_path(id)
             .or_else(|| self.parents.iter().find_map(|p| p.resolve_local_path(id)))
     }
+
+    async fn get_range(&self, id: &ContentId, range: std::ops::Range<u64>) -> Result<Vec<u8>> {
+        // Mirror `get` semantics: try this branch first, then walk parents on
+        // NotFound. Forward `get_range` natively at every step so range-capable
+        // backends (S3, file) keep their byte-range optimization across the
+        // ancestry chain. Without this, the trait default falls back to a full
+        // `get` + slice — which silently nullifies envelope-only probes
+        // (`load_commit_envelope_by_id`) for branched ledgers.
+        match self.branch_store.get_range(id, range.clone()).await {
+            Ok(bytes) => return Ok(bytes),
+            Err(e) if self.parents.is_empty() => return Err(e),
+            Err(e) if !matches!(e, crate::error::Error::NotFound(_)) => return Err(e),
+            Err(_) => {}
+        }
+        let mut last_err = None;
+        for parent in &self.parents {
+            match parent.get_range(id, range.clone()).await {
+                Ok(bytes) => return Ok(bytes),
+                Err(e) => last_err = Some(e),
+            }
+        }
+        Err(last_err.unwrap_or_else(|| crate::error::Error::not_found(id.to_string())))
+    }
 }
 
 // ============================================================================
