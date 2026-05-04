@@ -589,6 +589,58 @@ impl NamespaceCodes {
         Ok(())
     }
 
+    /// Like [`merge_delta`](Self::merge_delta), but also records the new
+    /// entries in the persistence delta (`self.delta`) so the next
+    /// `take_delta()` includes them in the commit record.
+    ///
+    /// Use this when adopting allocations made by *another* registry that
+    /// must end up persisted in this registry's commit (e.g. SPARQL
+    /// `lower_sparql_update` builds template Sids against a caller-owned
+    /// `NamespaceRegistry`; the staging path adopts those allocations so the
+    /// committed snapshot maps them back to IRIs for query-time lookup).
+    pub fn adopt_delta_for_persistence(
+        &mut self,
+        delta: &HashMap<u16, String>,
+    ) -> Result<(), NsAllocError> {
+        for (&code, prefix) in delta {
+            // Same conflict checks as merge_delta
+            if let Some(existing) = self.code_to_prefix.get(&code) {
+                if existing != prefix {
+                    return Err(NsAllocError::CodeConflict {
+                        code,
+                        new_prefix: prefix.clone(),
+                        existing_prefix: existing.clone(),
+                    });
+                }
+                // Already registered with matching prefix — record in delta only
+                // if this registry hasn't already persisted it.
+                self.delta.entry(code).or_insert_with(|| prefix.clone());
+                continue;
+            }
+
+            if let Some(&existing_code) = self.prefix_to_code.get(prefix.as_str()) {
+                if existing_code != code {
+                    return Err(NsAllocError::PrefixConflict {
+                        prefix: prefix.clone(),
+                        new_code: code,
+                        existing_code,
+                    });
+                }
+                self.delta.entry(code).or_insert_with(|| prefix.clone());
+                continue;
+            }
+
+            // New mapping — insert into both lookup tables AND persistence delta
+            self.prefix_to_code.insert(prefix.clone(), code);
+            self.code_to_prefix.insert(code, prefix.clone());
+            self.delta.insert(code, prefix.clone());
+            if code >= self.next_code && code < OVERFLOW {
+                self.next_code = code + 1;
+            }
+        }
+        Ok(())
+    }
+
     /// Take the accumulated delta (new allocations) and reset it.
     ///
     /// Returns the map of new allocations (`code → prefix`) for inclusion

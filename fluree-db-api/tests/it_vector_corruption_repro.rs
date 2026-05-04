@@ -9,20 +9,16 @@
 //! previous corrupt shape of N scalar flakes each tagged with the
 //! vector datatype.
 //!
-//! Two pre-existing concerns surfaced (but not introduced) by the fix
-//! are pinned here as `#[ignore]`'d tests, each with an inline
-//! `TODO(...)` block above its attribute that documents the root cause
-//! and remediation options:
+//! One pre-existing concern surfaced (but not introduced) by the corruption
+//! fix is pinned here as a `#[ignore]`'d test with an inline `TODO(...)`
+//! block above its attribute that documents the root cause and remediation
+//! options:
 //!
 //! - `jsonld_context_vector_bare_array_retracts_after_indexing` —
 //!   SPARQL DELETE WHERE on an indexed vector flake doesn't cancel the
 //!   assertion because the retraction allocates a fresh vector arena
 //!   handle, so index-merge cancellation (which keys on `o_kind/o_key`)
 //!   never pairs them. See `TODO(vector-retraction)`.
-//! - `sparql_insert_data_embedding_vector_literal_round_trips_after_indexing`
-//!   — SPARQL `INSERT DATA` of a vector typed literal commits, but the
-//!   subsequent post-publish SELECT returns no rows. See
-//!   `TODO(sparql-vector-ingest)`.
 
 mod support;
 
@@ -215,37 +211,8 @@ async fn jsonld_context_vector_bare_array_retracts_after_indexing() {
     assert_eq!(count_rows, json!([[0]]));
 }
 
-// TODO(sparql-vector-ingest): `coerce_typed_flake_value` correctly produces
-// `FlakeValue::Vector` for `"[..]"^^f:embeddingVector` (verified by
-// `test_coerce_typed_flake_value_vector_lexical` in
-// `fluree-db-transact/src/lower_sparql_update.rs`), and FlakeGenerator
-// generates the assertion flake (op=true, dt=embeddingVector, val_len=N).
-// But a post-publish `SELECT ?v WHERE { ex:doc1 ex:embedding ?v }` returns
-// no rows, suggesting the SPARQL ingest path doesn't fully register the
-// vector with the indexer's vector arena (or the predicate Sid the SELECT
-// resolves doesn't match the one INSERT stored under). Not investigated
-// in depth; out of scope for the JSON-LD corruption fix.
 #[tokio::test]
-#[ignore = "SPARQL INSERT DATA → post-index SELECT for vectors has separate \
-            downstream wiring issues unrelated to the JSON-LD corruption fix; \
-            see TODO(sparql-vector-ingest) above."]
 async fn sparql_insert_data_embedding_vector_literal_round_trips_after_indexing() {
-    use fluree_db_api::LedgerState;
-    use fluree_db_transact::{NamespaceRegistry, Txn, TxnOpts};
-
-    fn lower_sparql_update(ledger: &LedgerState, sparql: &str) -> Txn {
-        let parsed = fluree_db_sparql::parse_sparql(sparql);
-        assert!(
-            !parsed.has_errors(),
-            "SPARQL parse failed: {:?}",
-            parsed.diagnostics
-        );
-        let ast = parsed.ast.expect("SPARQL AST");
-        let mut ns = NamespaceRegistry::from_db(&ledger.snapshot);
-        fluree_db_transact::lower_sparql_update_ast(&ast, &mut ns, TxnOpts::default())
-            .expect("lower SPARQL update")
-    }
-
     let fluree = FlureeBuilder::memory().build_memory();
     let ledger_id = "it/vector-corruption/sparql-insert:main";
     let ledger0 = support::genesis_ledger(&fluree, ledger_id);
@@ -267,6 +234,13 @@ async fn sparql_insert_data_embedding_vector_literal_round_trips_after_indexing(
     support::rebuild_and_publish_index(&fluree, ledger_id).await;
     let loaded = fluree.ledger(ledger_id).await.expect("load indexed ledger");
 
+    // Pre-fix this returned [] because the lowering step's namespace
+    // allocations (e.g. `ex/` → 13) lived only in the caller-owned
+    // NamespaceRegistry — `stage_transaction_from_txn` built its own
+    // registry from the (pre-commit, empty-namespace) snapshot, never saw
+    // the lowering's allocations, and committed flakes whose namespace
+    // codes the post-commit snapshot couldn't resolve back to IRIs. Fixed
+    // by `Txn.namespace_delta` + `adopt_delta_for_persistence`.
     let select = r"
         PREFIX ex: <http://example.org/>
         SELECT ?v WHERE { ex:doc1 ex:embedding ?v }
@@ -285,4 +259,11 @@ async fn sparql_insert_data_embedding_vector_literal_round_trips_after_indexing(
         .and_then(|value| value.as_array())
         .expect("single vector result row");
     assert_eq!(vector.len(), 4);
+    for (actual, expected) in vector.iter().zip([0.1_f64, 0.2, 0.3, 0.4]) {
+        let actual = actual.as_f64().expect("vector element");
+        assert!(
+            (actual - expected).abs() < 0.000_001,
+            "expected {expected}, got {actual}"
+        );
+    }
 }

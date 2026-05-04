@@ -227,6 +227,22 @@ impl NamespaceRegistry {
         self.codes.merge_delta(&delta)
     }
 
+    /// Adopt namespace allocations made elsewhere AND record them in the
+    /// persistence delta so the next commit includes the mappings.
+    ///
+    /// Distinct from [`ensure_code`](Self::ensure_code), which only updates
+    /// the in-memory lookup tables. Use this when staging a `Txn` whose
+    /// templates reference namespace codes allocated by an upstream registry
+    /// (e.g. `lower_sparql_update`'s caller-owned registry) — without
+    /// persisting those mappings, post-commit reads can't resolve the
+    /// committed flakes' namespace_codes back to IRIs.
+    pub fn adopt_delta_for_persistence(
+        &mut self,
+        delta: &HashMap<u16, String>,
+    ) -> Result<(), NsAllocError> {
+        self.codes.adopt_delta_for_persistence(delta)
+    }
+
     /// Create a Sid for a blank node.
     ///
     /// Blank nodes use the predefined `BLANK_NODE` namespace code and generate

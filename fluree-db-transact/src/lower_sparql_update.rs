@@ -234,20 +234,28 @@ pub fn lower_sparql_update(
     let mut vars = VarRegistry::new();
     let mut bnodes = BlankNodeCounter::new();
 
-    match op {
+    let mut txn = match op {
         UpdateOperation::InsertData(insert) => {
-            lower_insert_data(&insert.data, prologue, ns, &mut vars, &mut bnodes, opts)
+            lower_insert_data(&insert.data, prologue, ns, &mut vars, &mut bnodes, opts)?
         }
         UpdateOperation::DeleteData(delete) => {
-            lower_delete_data(&delete.data, prologue, ns, &mut vars, &mut bnodes, opts)
+            lower_delete_data(&delete.data, prologue, ns, &mut vars, &mut bnodes, opts)?
         }
         UpdateOperation::DeleteWhere(delete_where) => {
-            lower_delete_where(&delete_where.pattern, prologue, ns, &mut vars, opts)
+            lower_delete_where(&delete_where.pattern, prologue, ns, &mut vars, opts)?
         }
         UpdateOperation::Modify(modify) => {
-            lower_modify(modify, prologue, ns, &mut vars, &mut bnodes, opts)
+            lower_modify(modify, prologue, ns, &mut vars, &mut bnodes, opts)?
         }
-    }
+    };
+    // Hand off the lowering registry's allocations so `stage_transaction_from_txn`
+    // can merge them into its own snapshot-derived registry. Without this, the
+    // first SPARQL `INSERT DATA` on a fresh ledger commits flakes referencing
+    // namespace codes the staging registry never learned about — the commit's
+    // persisted namespace map omits them, and post-commit SELECT can't resolve
+    // the predicate IRI back to the same Sid.
+    txn.namespace_delta = ns.delta().clone();
+    Ok(txn)
 }
 
 /// Lower INSERT DATA operation.
@@ -276,6 +284,7 @@ fn lower_insert_data(
         vars: mem::take(vars),
         txn_meta: Vec::new(),
         graph_delta: FxHashMap::default(),
+        namespace_delta: std::collections::HashMap::new(),
     })
 }
 
@@ -306,6 +315,7 @@ fn lower_delete_data(
         vars: mem::take(vars),
         txn_meta: Vec::new(),
         graph_delta: FxHashMap::default(),
+        namespace_delta: std::collections::HashMap::new(),
     })
 }
 
@@ -385,6 +395,7 @@ fn lower_delete_where(
         vars: mem::take(vars),
         txn_meta: Vec::new(),
         graph_delta: FxHashMap::default(),
+        namespace_delta: std::collections::HashMap::new(),
     })
 }
 
@@ -485,6 +496,7 @@ fn lower_modify(
         vars: mem::take(vars),
         txn_meta: Vec::new(),
         graph_delta: graph_ids.delta(),
+        namespace_delta: std::collections::HashMap::new(),
     })
 }
 
