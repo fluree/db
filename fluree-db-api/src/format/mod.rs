@@ -203,11 +203,11 @@ pub fn format_results_string(
 }
 
 // ============================================================================
-// Boolean (ASK) formatting
+// ASK formatting
 // ============================================================================
 
-/// If this is an ASK/Boolean query, produce the result directly.
-/// Returns `None` for non-Boolean queries (caller continues to normal dispatch).
+/// If this is an ASK query, produce the result directly.
+/// Returns `None` for non-ASK queries (caller continues to normal dispatch).
 fn format_ask(result: &QueryResult, config: &FormatterConfig) -> Option<Result<JsonValue>> {
     if !result.output.is_ask() {
         return None;
@@ -303,9 +303,8 @@ pub async fn format_results_async(
             (Some(novelty), None) => GraphDbRef::new(db.snapshot, db.g_id, novelty.as_ref(), db.t),
             (None, _) => db,
         };
-        let v =
-            hydration::format_async(result, hydration_db, &compactor, config, policy, tracker)
-                .await?;
+        let v = hydration::format_async(result, hydration_db, &compactor, config, policy, tracker)
+            .await?;
         // Hydration formatter returns an array of rows; honor selectOne by
         // returning the first row (or null if empty).
         return if result.output.is_select_one() {

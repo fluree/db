@@ -749,8 +749,7 @@ pub enum UnresolvedNestedSelectSpec {
     /// `refinements` overrides the wildcard default of "include but don't
     /// recurse" for specific properties.
     Wildcard {
-        refinements:
-            std::collections::HashMap<String, Box<UnresolvedNestedSelectSpec>>,
+        refinements: std::collections::HashMap<String, Box<UnresolvedNestedSelectSpec>>,
         reverse: UnresolvedReverseMap,
     },
     /// Explicit list of forward items.
@@ -909,7 +908,9 @@ impl UnresolvedProjection {
 
     /// The hydration spec embedded in the projection, if any.
     pub fn hydration(&self) -> Option<&UnresolvedHydrationSpec> {
-        self.columns().iter().find_map(UnresolvedColumn::as_hydration)
+        self.columns()
+            .iter()
+            .find_map(UnresolvedColumn::as_hydration)
     }
 
     /// Mutable access to the hydration spec, if any.

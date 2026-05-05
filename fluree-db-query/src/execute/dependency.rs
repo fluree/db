@@ -269,7 +269,7 @@ mod tests {
         assert!(deps.required_where_vars.contains(&VarId(1)));
     }
 
-    // ---- hydrationion tests ----
+    // ---- hydration tests ----
 
     fn make_query_with_selections(columns: Vec<crate::ir::Column>) -> Query {
         Query {

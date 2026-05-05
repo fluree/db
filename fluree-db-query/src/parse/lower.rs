@@ -153,9 +153,7 @@ fn lower_projection<E: IriEncoder>(
                 .collect::<Result<Vec<_>>>()?;
             Ok(Projection::Tuple(lowered))
         }
-        UnresolvedProjection::Scalar(c) => {
-            Ok(Projection::Scalar(lower_column(c, encoder, vars)?))
-        }
+        UnresolvedProjection::Scalar(c) => Ok(Projection::Scalar(lower_column(c, encoder, vars)?)),
     }
 }
 

@@ -285,7 +285,7 @@ fn resolve_select_vars(result: &QueryResult) -> Vec<VarId> {
         pairs.sort_by(|(a, _), (b, _)| a.cmp(b));
         pairs.into_iter().map(|(_, vid)| vid).collect()
     } else {
-        result.output.projected_vars_or_empty().to_vec()
+        result.output.projected_vars_or_empty()
     }
 }
 

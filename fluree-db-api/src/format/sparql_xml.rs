@@ -68,7 +68,7 @@ pub fn format(
                     .collect()
             })
     } else {
-        result.output.projected_vars_or_empty().to_vec()
+        result.output.projected_vars_or_empty()
     };
 
     // Order head vars lexicographically by variable name (without '?') for stability.

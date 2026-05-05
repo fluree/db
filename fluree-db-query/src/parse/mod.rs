@@ -192,7 +192,7 @@ fn parse_query_ast_internal(
         parse_select(select, &ctx, &mut query)?;
     }
 
-    // Parse depth parameter and apply to hydrationion if present
+    // Parse depth parameter and apply to hydration if present
     if let Some(gs) = query.hydration_mut() {
         gs.depth = options::parse_depth(obj)?;
     }
@@ -864,9 +864,7 @@ fn parse_hydration_object(
 }
 
 /// Build an optional boxed nested select spec, returning `None` when empty.
-fn make_nested_spec(
-    level: UnresolvedNestedSelectSpec,
-) -> Option<Box<UnresolvedNestedSelectSpec>> {
+fn make_nested_spec(level: UnresolvedNestedSelectSpec) -> Option<Box<UnresolvedNestedSelectSpec>> {
     if level.is_empty() {
         None
     } else {
@@ -901,10 +899,8 @@ fn parse_selection_level(
     let mut forward: Vec<UnresolvedForwardItem> = Vec::new();
     let mut refinements: std::collections::HashMap<String, Box<UnresolvedNestedSelectSpec>> =
         std::collections::HashMap::new();
-    let mut reverse: std::collections::HashMap<
-        String,
-        Option<Box<UnresolvedNestedSelectSpec>>,
-    > = std::collections::HashMap::new();
+    let mut reverse: std::collections::HashMap<String, Option<Box<UnresolvedNestedSelectSpec>>> =
+        std::collections::HashMap::new();
 
     for item in arr {
         match item {
@@ -985,10 +981,12 @@ fn parse_selection_level(
         // `refinements` (they refine the wildcard's per-property recursion).
         // Plain `Id` entries are redundant under wildcard and are dropped.
         for item in forward {
-            if let UnresolvedForwardItem::Property { predicate, sub_spec } = item {
-                if let Some(boxed) = sub_spec {
-                    refinements.insert(predicate, boxed);
-                }
+            if let UnresolvedForwardItem::Property {
+                predicate,
+                sub_spec: Some(boxed),
+            } = item
+            {
+                refinements.insert(predicate, boxed);
             }
         }
         Ok(UnresolvedNestedSelectSpec::Wildcard {
@@ -1369,7 +1367,7 @@ mod tests {
     }
 
     #[test]
-    fn test_type_hydration() {
+    fn test_type_expansion() {
         let json = json!({
             "@context": { "ex": "http://example.org/" },
             "select": ["?s"],
@@ -1481,7 +1479,7 @@ mod tests {
     }
 
     #[test]
-    fn test_vocab_hydration() {
+    fn test_vocab_expansion() {
         let json = json!({
             "@context": {
                 "@vocab": "http://schema.org/"
@@ -1854,7 +1852,7 @@ mod tests {
     }
 
     #[test]
-    fn test_reference_value_hydration() {
+    fn test_reference_value_expansion() {
         // String values for @id-typed properties should expand to IRIs
         let json = json!({
             "@context": {

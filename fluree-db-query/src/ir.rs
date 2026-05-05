@@ -6,7 +6,7 @@
 //! # Design
 //!
 //! - `Query` is the top-level structure: output spec, WHERE patterns, options,
-//!   optional expansion spec, optional post-VALUES
+//!   optional post-VALUES
 //! - `Pattern` enum mirrors the where clause structure, preserving order for filter inlining
 //! - The planner chooses physical join operators based on pattern analysis
 //!

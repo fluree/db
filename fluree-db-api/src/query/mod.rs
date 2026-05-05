@@ -38,7 +38,7 @@ pub struct QueryResult {
     pub context: crate::ParsedContext,
     /// Original JSON context from the query (for CONSTRUCT output)
     pub orig_context: Option<JsonValue>,
-    /// Query output specification (select vars, construct template, or boolean/wildcard mode)
+    /// Query output specification (projection, construct template, ASK, or wildcard).
     pub output: QueryOutput,
     /// Result batches
     pub batches: Vec<Batch>,

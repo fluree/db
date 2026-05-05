@@ -54,7 +54,7 @@ struct PredicateContext<'a> {
 /// because the nested HashMaps don't implement it; iterate keys in sorted
 /// order for determinism.
 fn compute_level_hash(level: &NestedSelectSpec) -> u64 {
-    use std::hash::{Hash, Hasher};
+    use std::hash::Hasher;
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     hash_level(level, &mut hasher);
     hasher.finish()
@@ -559,14 +559,8 @@ impl<'a> HydrationFormatter<'a> {
 
             if let Some(nested) = nested_spec {
                 values.push(
-                    self.format_subject(
-                        subject_sid,
-                        nested,
-                        current_depth + 1,
-                        visited,
-                        cache,
-                    )
-                    .await?,
+                    self.format_subject(subject_sid, nested, current_depth + 1, visited, cache)
+                        .await?,
                 );
             } else if current_depth < self.spec.depth {
                 // Auto-expand reverse refs with FULL parent level

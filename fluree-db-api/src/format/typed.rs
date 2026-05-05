@@ -39,7 +39,14 @@ pub fn format(
                 // Wildcard: use batch schema, return all bound vars as object
                 format_row_wildcard(batch, row_idx, &result.vars, compactor, result)?
             } else {
-                format_row(batch, row_idx, &select_vars, &result.vars, compactor, result)?
+                format_row(
+                    batch,
+                    row_idx,
+                    &select_vars,
+                    &result.vars,
+                    compactor,
+                    result,
+                )?
             };
             rows.push(row);
 

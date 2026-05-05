@@ -208,7 +208,7 @@ pub struct Query {
     pub context: ParsedContext,
     /// Original JSON context from the query (for CONSTRUCT output)
     pub orig_context: Option<serde_json::Value>,
-    /// Query output specification (selections, construct template, or boolean/wildcard mode)
+    /// Query output specification (projection, construct template, ASK, or wildcard).
     pub output: QueryOutput,
     /// Resolved patterns (triples, filters, optionals, etc.)
     pub patterns: Vec<Pattern>,

@@ -43,7 +43,10 @@ pub enum NestedSelectSpec {
     },
     /// Explicit list of forward items. `@id` is included iff `forward`
     /// contains `ForwardItem::Id`.
-    Explicit { forward: Vec<ForwardItem>, reverse: ReverseMap },
+    Explicit {
+        forward: Vec<ForwardItem>,
+        reverse: ReverseMap,
+    },
 }
 
 impl NestedSelectSpec {
@@ -91,15 +94,17 @@ impl NestedSelectSpec {
     pub fn select_predicate(&self, pred: &Sid) -> Option<Option<&NestedSelectSpec>> {
         match self {
             NestedSelectSpec::Wildcard { refinements, .. } => {
-                Some(refinements.get(pred).map(|b| b.as_ref()))
+                Some(refinements.get(pred).map(|b| &**b))
             }
-            NestedSelectSpec::Explicit { forward, .. } => forward.iter().find_map(|item| match item {
-                ForwardItem::Property {
-                    predicate,
-                    sub_spec,
-                } if predicate == pred => Some(sub_spec.as_deref()),
-                _ => None,
-            }),
+            NestedSelectSpec::Explicit { forward, .. } => {
+                forward.iter().find_map(|item| match item {
+                    ForwardItem::Property {
+                        predicate,
+                        sub_spec,
+                    } if predicate == pred => Some(sub_spec.as_deref()),
+                    _ => None,
+                })
+            }
         }
     }
 }
