@@ -31,7 +31,7 @@ use crate::var_registry::VarId;
 /// - Enhanced someValuesFrom/allValuesFrom reasoning in equivalences
 ///
 /// This mode is opt-in and separate from standard `owl2rl`.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ReasoningModes {
     /// RDFS reasoning - subclass/subproperty expansion
     pub rdfs: bool,
@@ -60,20 +60,6 @@ pub struct ReasoningModes {
     /// Each rule should have `where` and `insert` clauses.
     pub rules: Vec<serde_json::Value>,
 }
-
-impl PartialEq for ReasoningModes {
-    fn eq(&self, other: &Self) -> bool {
-        self.rdfs == other.rdfs
-            && self.owl2ql == other.owl2ql
-            && self.datalog == other.datalog
-            && self.owl2rl == other.owl2rl
-            && self.owl_datalog == other.owl_datalog
-            && self.explicit_none == other.explicit_none
-            && self.rules == other.rules
-    }
-}
-
-impl Eq for ReasoningModes {}
 
 impl ReasoningModes {
     /// Create with no reasoning modes enabled
