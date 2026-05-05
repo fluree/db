@@ -9,7 +9,7 @@ use crate::binary_scan::EmitMask;
 use crate::count_rows::CountRowsOperator;
 use crate::distinct::DistinctOperator;
 use crate::error::{QueryError, Result};
-use crate::expression::PreparedBoolExpression;
+use crate::eval::PreparedBoolExpression;
 use crate::fast_count::{
     count_blank_node_subjects_operator, count_distinct_object_operator,
     count_distinct_objects_operator, count_distinct_predicates_operator,

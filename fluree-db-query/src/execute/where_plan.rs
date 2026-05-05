@@ -15,7 +15,7 @@ use crate::bm25::Bm25SearchOperator;
 use crate::distinct::DistinctOperator;
 use crate::error::{QueryError, Result};
 use crate::exists::ExistsOperator;
-use crate::expression::PreparedBoolExpression;
+use crate::eval::PreparedBoolExpression;
 use crate::filter::{contains_exists, FilterOperator};
 use crate::ir::triple::{Ref, Term, TriplePattern};
 use crate::ir::{Expression, Pattern};

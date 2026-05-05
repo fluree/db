@@ -21,7 +21,7 @@
 use crate::binding::Batch;
 use crate::context::ExecutionContext;
 use crate::error::Result;
-use crate::expression::PreparedBoolExpression;
+use crate::eval::PreparedBoolExpression;
 use crate::filter::filter_batch;
 use crate::ir::Expression;
 use crate::operator::{

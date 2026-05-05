@@ -15,7 +15,7 @@
 use crate::binding::{Batch, Binding, RowAccess};
 use crate::context::ExecutionContext;
 use crate::error::Result;
-use crate::expression::{passes_filters, PreparedBoolExpression};
+use crate::eval::{passes_filters, PreparedBoolExpression};
 use crate::ir::Expression;
 use crate::operator::{
     compute_trimmed_vars, effective_schema, trim_batch, BoxedOperator, Operator, OperatorState,

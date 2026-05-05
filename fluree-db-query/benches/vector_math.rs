@@ -9,7 +9,7 @@
 use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
 
 // Import the NEW SIMD vector math functions from the crate
-use fluree_db_query::expression::vector_math::{cosine_f64, dot_f64, l2_f64};
+use fluree_db_query::eval::vector_math::{cosine_f64, dot_f64, l2_f64};
 
 // =============================================================================
 // OLD scalar implementations (copied from prior commit for baseline comparison)

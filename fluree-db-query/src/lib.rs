@@ -33,7 +33,7 @@ pub mod error;
 pub mod execute;
 pub mod exists;
 pub mod explain;
-pub mod expression;
+pub mod eval;
 pub(crate) mod fast_count;
 pub(crate) mod fast_exists_join_count_distinct_object;
 pub(crate) mod fast_fused_scan_sum;

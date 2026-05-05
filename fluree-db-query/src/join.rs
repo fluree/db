@@ -3141,7 +3141,7 @@ mod tests {
             right_pattern,
             None,
             vec![InlineOperator::Filter(
-                crate::expression::PreparedBoolExpression::new(crate::ir::Expression::call(
+                crate::eval::PreparedBoolExpression::new(crate::ir::Expression::call(
                     crate::ir::Function::StrStarts,
                     vec![
                         crate::ir::Expression::Var(VarId(1)),
@@ -3236,7 +3236,7 @@ mod tests {
             right_pattern,
             None,
             vec![InlineOperator::Filter(
-                crate::expression::PreparedBoolExpression::new(crate::ir::Expression::eq(
+                crate::eval::PreparedBoolExpression::new(crate::ir::Expression::eq(
                     crate::ir::Expression::Var(VarId(0)),
                     crate::ir::Expression::Var(VarId(1)),
                 )),
