@@ -57,6 +57,7 @@ use crate::stats_query::StatsCountByPredicateOperator;
 use crate::temporal_mode::PlanningContext;
 use crate::var_registry::VarId;
 use fluree_db_core::StatsView;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use super::dependency::compute_variable_deps;
@@ -2647,12 +2648,12 @@ fn build_operator_tree_inner(
         .map(|d| d.required_where_vars.as_slice());
     // needed-vars for WHERE planning: derived from variable_deps when available,
     // otherwise treat all WHERE-bound vars as needed (wildcard/boolean/construct cases).
-    let mut needed_where_vars: std::collections::HashSet<VarId> = std::collections::HashSet::new();
+    let mut needed_where_vars: HashSet<VarId> = HashSet::new();
     if let Some(req) = required_where_vars {
         needed_where_vars.extend(req.iter().copied());
     } else {
-        let mut counts: std::collections::HashMap<VarId, usize> = std::collections::HashMap::new();
-        let mut vars: std::collections::HashSet<VarId> = std::collections::HashSet::new();
+        let mut counts: HashMap<VarId, usize> = HashMap::new();
+        let mut vars: HashSet<VarId> = HashSet::new();
         collect_var_stats(&query.patterns, &mut counts, &mut vars);
         vars.extend(counts.keys().copied());
         needed_where_vars = vars;
@@ -2698,10 +2699,10 @@ fn build_operator_tree_inner(
 
         // Validate aggregates
         let current_schema = operator.schema();
-        let group_by_set: std::collections::HashSet<VarId> =
+        let group_by_set: HashSet<VarId> =
             options.group_by.iter().copied().collect();
-        let mut seen_output_vars: std::collections::HashSet<VarId> =
-            std::collections::HashSet::new();
+        let mut seen_output_vars: HashSet<VarId> =
+            HashSet::new();
 
         for spec in &options.aggregates {
             if let Some(input_var) = spec.input_var {
@@ -2876,9 +2877,9 @@ fn build_operator_tree_inner(
     // Validate ORDER BY vars exist in the post-group schema and are allowed under grouping.
     if !options.order_by.is_empty() {
         // Disallow sorting on Grouped variables (non-key, non-aggregated) because comparison is undefined.
-        let mut allowed_sort_vars: Option<std::collections::HashSet<VarId>> = None;
+        let mut allowed_sort_vars: Option<HashSet<VarId>> = None;
         if needs_grouping {
-            let mut allowed = std::collections::HashSet::new();
+            let mut allowed = HashSet::new();
             for v in &options.group_by {
                 allowed.insert(*v);
             }

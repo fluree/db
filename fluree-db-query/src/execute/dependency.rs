@@ -7,7 +7,7 @@
 
 use crate::ir::{Query, QueryOptions};
 use crate::var_registry::VarId;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 /// Per-operator required variable sets.
 ///
@@ -295,7 +295,7 @@ mod tests {
                 crate::ir::Root::Var(VarId(0)),
                 crate::ir::NestedSelectSpec::Explicit {
                     forward: vec![],
-                    reverse: std::collections::HashMap::new(),
+                    reverse: HashMap::new(),
                 },
             )),
         ]);
@@ -314,7 +314,7 @@ mod tests {
                 crate::ir::Root::Var(VarId(0)),
                 crate::ir::NestedSelectSpec::Explicit {
                     forward: vec![],
-                    reverse: std::collections::HashMap::new(),
+                    reverse: HashMap::new(),
                 },
             )),
         ]);
@@ -334,7 +334,7 @@ mod tests {
                 crate::ir::Root::Sid(Sid::new(100, "alice")),
                 crate::ir::NestedSelectSpec::Explicit {
                     forward: vec![],
-                    reverse: std::collections::HashMap::new(),
+                    reverse: HashMap::new(),
                 },
             )),
         ]);
