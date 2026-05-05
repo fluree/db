@@ -71,10 +71,7 @@ use super::where_plan::collect_var_stats;
 /// Extract a bound predicate (IRI or SID) from a triple pattern's predicate position.
 /// Returns `None` if the predicate is a variable or other non-bound form.
 pub(crate) fn extract_bound_predicate(p: &Ref) -> Option<Ref> {
-    match p {
-        Ref::Sid(_) | Ref::Iri(_) => Some(p.clone()),
-        _ => None,
-    }
+    p.is_bound().then(|| p.clone())
 }
 
 /// Validate a triple pattern as `?s <bound_pred> ?o` with no datatype constraint.

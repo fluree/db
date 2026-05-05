@@ -126,7 +126,7 @@ fn collect_simple_exists_keys(expr: &Expression, out: &mut Vec<(VarId, Ref)>) {
             if !tp.p_bound() {
                 return;
             }
-            if !matches!(tp.o, crate::ir::triple::Term::Var(_)) {
+            if tp.o.is_bound() {
                 return;
             }
             if tp.dtc.is_some() {
@@ -329,7 +329,7 @@ fn try_eval_simple_exists_semijoin(
     if !tp.p_bound() {
         return Ok(None);
     }
-    if !matches!(tp.o, crate::ir::triple::Term::Var(_)) {
+    if tp.o.is_bound() {
         return Ok(None);
     }
     let Some(pred_sid) = try_normalize_pred_sid(store, &tp.p) else {
