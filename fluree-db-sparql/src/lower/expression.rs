@@ -159,7 +159,7 @@ impl<E: IriEncoder> LoweringContext<'_, E> {
     ) -> Result<Expression> {
         let l = self.lower_expression(left)?;
         let r = self.lower_expression(right)?;
-        Ok(Expression::compare(func, l, r))
+        Ok(Expression::binary(func, l, r))
     }
 
     fn lower_arithmetic(
@@ -170,7 +170,7 @@ impl<E: IriEncoder> LoweringContext<'_, E> {
     ) -> Result<Expression> {
         let l = self.lower_expression(left)?;
         let r = self.lower_expression(right)?;
-        Ok(Expression::arithmetic(func, l, r))
+        Ok(Expression::binary(func, l, r))
     }
 
     fn lower_filter_value(&self, lit: &Literal) -> Result<FlakeValue> {
