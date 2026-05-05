@@ -1092,6 +1092,7 @@ fn build_psot_cursor_for_predicate_group(
                     ctx.runtime_small_dicts,
                     &mut ephemeral_preds,
                     &mut next_ep,
+                    g_id,
                 ) {
                     Ok(op) => ops.push(op),
                     Err(e) => {

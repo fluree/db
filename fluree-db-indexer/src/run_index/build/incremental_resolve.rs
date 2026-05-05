@@ -480,6 +480,33 @@ pub async fn resolve_incremental_commits_v6(
     let t_remap_records_ms = t0.elapsed().as_millis() as u64;
 
     // Offset vector handles.
+    //
+    // TODO(incremental-vector-retraction): chunk-local handle space lives
+    // 0..chunk_count; this pass shifts to base_count..base_count+chunk_count
+    // so handles are globally unique post-merge.
+    //
+    // KNOWN GAP: a retraction whose ASSERTION lives in the base index (not
+    // in the new chunk) cannot currently resolve to the base handle —
+    // `SharedResolverState::vector_fact_handles` is populated only from
+    // chunk assertions, so `resolve_object_chunk` returns Ok(None) (no-op
+    // skip) and the user's DELETE silently has no effect on incremental
+    // republish.
+    //
+    // Two fix shapes (pick one in a follow-up):
+    //   (a) Pre-load base vector arenas into `shared.vectors` AND
+    //       SPOT-scan the base for VECTOR_ID rows to pre-populate
+    //       `shared.vector_fact_handles`. Chunk inserts then append to
+    //       the unified arena returning globally-unique handles directly
+    //       (offset becomes a no-op for vectors). Heavy I/O but cleanest.
+    //   (b) Per-retraction fallback: when chunk fact-handle lookup misses,
+    //       query the base index via `BinaryIndexStore::find_vector_handle_by_fact`,
+    //       store the result with a high-bit sentinel on o_key, and have
+    //       this offset pass strip the sentinel (skipping the offset for
+    //       sentinel-tagged records).
+    //
+    // Until then, the rebuild path (which the test suite exercises) is
+    // correct, and incremental retraction of base vectors is a safe
+    // no-op rather than data corruption.
     if !base_vector_counts.is_empty() {
         for record in &mut v1_records {
             if ObjKind::from_u8(record.o_kind) == ObjKind::VECTOR_ID {

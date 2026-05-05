@@ -9,16 +9,19 @@
 //! previous corrupt shape of N scalar flakes each tagged with the
 //! vector datatype.
 //!
-//! One pre-existing concern surfaced (but not introduced) by the corruption
-//! fix is pinned here as a `#[ignore]`'d test with an inline `TODO(...)`
-//! block above its attribute that documents the root cause and remediation
-//! options:
+//! Vector retraction is also pinned here at two layers:
 //!
-//! - `jsonld_context_vector_bare_array_retracts_after_indexing` —
-//!   SPARQL DELETE WHERE on an indexed vector flake doesn't cancel the
-//!   assertion because the retraction allocates a fresh vector arena
-//!   handle, so index-merge cancellation (which keys on `o_kind/o_key`)
-//!   never pairs them. See `TODO(vector-retraction)`.
+//! - `jsonld_context_vector_bare_array_retracts_after_indexing` — the
+//!   post-rebuild path. The indexer's `resolve_object` re-resolves a
+//!   vector retraction to the existing assertion's arena handle so the
+//!   merge cancellation by `(s, p, dt, o_kind, o_key)` matches.
+//! - `jsonld_context_vector_bare_array_retracts_via_novelty_overlay` —
+//!   the pre-rebuild novelty-overlay path. The query layer's
+//!   `binary_scan::translate_one_flake_v3_pub` short-circuits
+//!   `FlakeValue::Vector` retractions through
+//!   `BinaryIndexStore::find_vector_handle` to look up the assertion's
+//!   handle in the base index so the overlay subtracts it correctly
+//!   without requiring a republish.
 
 mod support;
 
@@ -135,33 +138,13 @@ async fn jsonld_context_vector_empty_array_is_rejected() {
     );
 }
 
-// TODO(vector-retraction): when SPARQL DELETE WHERE matches an indexed
-// vector flake, materialize_template generates a correct retraction
-// (op=false, dt=embeddingVector, FlakeValue::Vector with the matched values)
-// and the transaction commits. But the index-merge cancellation pairs
-// assertions and retractions by `(s, p, dt, o_kind, o_key)`, and the
-// retraction's vector goes through `VectorArena::insert_f32` which
-// allocates a fresh arena slot — so the retraction's `o_key` (handle) is
-// different from the original assertion's, the pair never matches, and
-// COUNT after delete still returns 1.
-//
-// Two viable remediations (both deferred — out of scope for the JSON-LD
-// corruption fix that landed alongside this test):
-//   1. At retraction time, look up the existing arena handle for the
-//      matched (s, p, value) and reuse it on the retraction flake. Tighter
-//      blast radius; needs an arena→handle reverse-lookup index.
-//   2. For `ObjKind::VECTOR_ID` (and any future arena-handle kind), do
-//      cancellation by decoded value rather than by `o_key`. More general
-//      but slower at merge time.
-//
-// The fix that this test pins (single well-formed FlakeValue::Vector flake
-// with `dt = embeddingVector`) is the prerequisite for either remediation —
-// before it, the corrupt scalar-as-vector flakes couldn't even be matched
-// for retraction.
+/// Vector retraction round-trip. Pre-fix the index-merge cancellation
+/// missed because the retraction's vector went through
+/// `VectorArena::insert_f32` and was assigned a fresh arena handle that
+/// never matched the assertion's `(s, p, dt, o_kind, o_key)`. Post-fix,
+/// the indexer's `resolve_object` re-resolves vector retractions to the
+/// existing assertion handle via `VectorArena::find_handle_by_value`.
 #[tokio::test]
-#[ignore = "vector retraction is a separate latent issue surfaced by the \
-            JSON-LD corruption fix; see TODO(vector-retraction) above for \
-            the root cause and remediation options."]
 async fn jsonld_context_vector_bare_array_retracts_after_indexing() {
     let fluree = FlureeBuilder::memory().build_memory();
     let ledger_id = "it/vector-corruption/jsonld-retract:main";
@@ -209,6 +192,492 @@ async fn jsonld_context_vector_bare_array_retracts_after_indexing() {
         .await
         .expect("format");
     assert_eq!(count_rows, json!([[0]]));
+}
+
+/// Vector retraction via the *novelty-overlay* path: insert + publish
+/// index, then DELETE WHERE, then COUNT *without* republishing. The
+/// retraction sits in novelty and must overlay-suppress the indexed
+/// assertion at query time. Pre-fix this returned 1 because the overlay
+/// translation in `binary_scan` couldn't translate `FlakeValue::Vector`
+/// retractions back into base-index `o_key` space; post-fix it goes
+/// through `BinaryIndexStore::find_vector_handle` to re-resolve the
+/// assertion's handle so the overlay subtracts it.
+#[tokio::test]
+async fn jsonld_context_vector_bare_array_retracts_via_novelty_overlay() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger_id = "it/vector-corruption/jsonld-novelty-retract:main";
+    let ledger0 = support::genesis_ledger(&fluree, ledger_id);
+
+    let insert = json!({
+        "@context": {
+            "ex": "http://example.org/",
+            "ex:embedding": { "@type": "@vector" }
+        },
+        "@graph": [{
+            "@id": "ex:doc1",
+            "ex:embedding": [0.1, 0.2, 0.3, 0.4]
+        }]
+    });
+    fluree
+        .insert(ledger0, &insert)
+        .await
+        .expect("insert vector");
+    support::rebuild_and_publish_index(&fluree, ledger_id).await;
+    let loaded = fluree.ledger(ledger_id).await.expect("load");
+
+    let delete = r"
+        PREFIX ex: <http://example.org/>
+        DELETE WHERE { ex:doc1 ex:embedding ?v }
+    ";
+    let txn = lower_sparql_update(&loaded, delete);
+    let deleted = fluree
+        .stage_owned(loaded)
+        .txn(txn)
+        .execute()
+        .await
+        .expect("DELETE WHERE executes");
+
+    // Note: NO second rebuild_and_publish_index — this exercises the
+    // novelty-overlay path against the still-base index.
+    let count = r"
+        PREFIX ex: <http://example.org/>
+        SELECT (COUNT(*) AS ?count) WHERE { ex:doc1 ex:embedding ?v }
+    ";
+    let count_rows = support::query_sparql(&fluree, &deleted.ledger, count)
+        .await
+        .expect("count after delete (novelty-overlay path)")
+        .to_jsonld_async(deleted.ledger.as_graph_db_ref(0))
+        .await
+        .expect("format");
+    assert_eq!(
+        count_rows,
+        json!([[0]]),
+        "novelty overlay must suppress indexed vector flake"
+    );
+}
+
+/// Two subjects storing the *same* vector value under the same predicate.
+/// Each gets its own arena handle. Retracting one must cancel ONLY that
+/// row — not the other subject's. The pre-fix value-only handle lookup
+/// (`find_handle_by_value`) returned the FIRST matching handle, so
+/// retracting `doc2` aliased to `doc1`'s handle and corrupted both rows.
+/// Full fact-identity lookup `(g_id, s_id, p_id, o_i, f32_bits)` is
+/// required (the value bits are needed because the same `(s, p, o_i)`
+/// can also hold multiple distinct values — see the multi-valued test).
+#[tokio::test]
+async fn jsonld_context_vector_duplicate_values_retract_one_keeps_other() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger_id = "it/vector-corruption/duplicate-values:main";
+    let ledger0 = support::genesis_ledger(&fluree, ledger_id);
+
+    let insert = json!({
+        "@context": {
+            "ex": "http://example.org/",
+            "ex:embedding": { "@type": "@vector" }
+        },
+        "@graph": [
+            {"@id": "ex:doc1", "ex:embedding": [0.1, 0.2, 0.3]},
+            {"@id": "ex:doc2", "ex:embedding": [0.1, 0.2, 0.3]}
+        ]
+    });
+    fluree.insert(ledger0, &insert).await.expect("insert");
+    support::rebuild_and_publish_index(&fluree, ledger_id).await;
+    let loaded = fluree.ledger(ledger_id).await.expect("load");
+
+    // Retract only doc2.
+    let delete = r"
+        PREFIX ex: <http://example.org/>
+        DELETE WHERE { ex:doc2 ex:embedding ?v }
+    ";
+    let txn = lower_sparql_update(&loaded, delete);
+    fluree
+        .stage_owned(loaded)
+        .txn(txn)
+        .execute()
+        .await
+        .expect("delete doc2");
+    support::rebuild_and_publish_index(&fluree, ledger_id).await;
+    let reloaded = fluree.ledger(ledger_id).await.expect("reload");
+
+    // doc1 must still have its vector.
+    let select_doc1 = r"
+        PREFIX ex: <http://example.org/>
+        SELECT ?v WHERE { ex:doc1 ex:embedding ?v }
+    ";
+    let rows = support::query_sparql(&fluree, &reloaded, select_doc1)
+        .await
+        .expect("query doc1")
+        .to_jsonld_async(reloaded.as_graph_db_ref(0))
+        .await
+        .expect("format");
+    assert_ne!(
+        rows,
+        json!([]),
+        "doc1's vector must survive a same-value retraction of doc2"
+    );
+
+    // doc2 must be empty.
+    let select_doc2 = r"
+        PREFIX ex: <http://example.org/>
+        SELECT ?v WHERE { ex:doc2 ex:embedding ?v }
+    ";
+    let rows = support::query_sparql(&fluree, &reloaded, select_doc2)
+        .await
+        .expect("query doc2")
+        .to_jsonld_async(reloaded.as_graph_db_ref(0))
+        .await
+        .expect("format");
+    assert_eq!(rows, json!([]), "doc2's vector must be retracted");
+}
+
+/// One subject holding TWO different vector values under the same
+/// predicate (multi-cardinality, no list indices). Both flakes have
+/// `o_i = LIST_INDEX_NONE`, so a fact-identity key of just
+/// `(s_id, p_id, o_i)` collides between them. Retracting one must
+/// cancel ONLY the matching value, not the other.
+#[tokio::test]
+async fn jsonld_multi_valued_vectors_retract_one_keeps_other() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger_id = "it/vector-corruption/multi-valued-rebuild:main";
+    let ledger0 = support::genesis_ledger(&fluree, ledger_id);
+
+    let insert = json!({
+        "@context": { "ex": "http://example.org/" },
+        "@graph": [{
+            "@id": "ex:doc1",
+            "ex:embedding": [
+                {"@value": [0.1, 0.2, 0.3], "@type": "@vector"},
+                {"@value": [0.7, 0.8, 0.9], "@type": "@vector"}
+            ]
+        }]
+    });
+    fluree.insert(ledger0, &insert).await.expect("insert");
+    support::rebuild_and_publish_index(&fluree, ledger_id).await;
+    let loaded = fluree.ledger(ledger_id).await.expect("load");
+
+    // Retract only [0.1, 0.2, 0.3].
+    let delete = r#"
+        PREFIX ex: <http://example.org/>
+        PREFIX f: <https://ns.flur.ee/db#>
+        DELETE DATA {
+            ex:doc1 ex:embedding "[0.1, 0.2, 0.3]"^^f:embeddingVector .
+        }
+    "#;
+    let txn = lower_sparql_update(&loaded, delete);
+    fluree
+        .stage_owned(loaded)
+        .txn(txn)
+        .execute()
+        .await
+        .expect("delete one of two");
+    support::rebuild_and_publish_index(&fluree, ledger_id).await;
+    let reloaded = fluree.ledger(ledger_id).await.expect("reload");
+
+    let count = r"
+        PREFIX ex: <http://example.org/>
+        SELECT (COUNT(*) AS ?n) WHERE { ex:doc1 ex:embedding ?v }
+    ";
+    let count_rows = support::query_sparql(&fluree, &reloaded, count)
+        .await
+        .expect("count")
+        .to_jsonld_async(reloaded.as_graph_db_ref(0))
+        .await
+        .expect("format");
+    assert_eq!(
+        count_rows,
+        json!([[1]]),
+        "exactly one of two same-(s,p) vector values must remain"
+    );
+
+    // The surviving row must be [0.7, 0.8, 0.9], not [0.1, 0.2, 0.3].
+    let select = r"
+        PREFIX ex: <http://example.org/>
+        SELECT ?v WHERE { ex:doc1 ex:embedding ?v }
+    ";
+    let rows = support::query_sparql(&fluree, &reloaded, select)
+        .await
+        .expect("select")
+        .to_jsonld_async(reloaded.as_graph_db_ref(0))
+        .await
+        .expect("format");
+    let surviving = rows
+        .as_array()
+        .and_then(|rs| rs.first())
+        .and_then(|r| r.as_array())
+        .and_then(|r| r.first())
+        .and_then(|v| v.as_array())
+        .expect("one surviving vector");
+    let first = surviving[0].as_f64().expect("element");
+    assert!(
+        (first - 0.7).abs() < 0.000_001,
+        "surviving vector must be the one we did NOT retract; got first element {first}"
+    );
+}
+
+/// Re-asserting the same logical vector fact across commits must not
+/// produce a second arena handle. Pre-fix the resolver always called
+/// `insert_f64` on assert, so two assertions of `(s, p, o_i, value)`
+/// got two distinct `o_key`s — the rebuild ended up with two encoded
+/// facts and a subsequent retraction couldn't cancel both. The fix
+/// dedups: if `fact_map` already has the key, reuse the existing
+/// handle. Stable encoded identity means assert/retract/assert cycles
+/// work naturally under latest-op semantics.
+#[tokio::test]
+async fn jsonld_re_asserting_same_vector_dedups() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger_id = "it/vector-corruption/dedup-reassert:main";
+    let ledger0 = support::genesis_ledger(&fluree, ledger_id);
+
+    let same_value = json!({
+        "@context": {
+            "ex": "http://example.org/",
+            "ex:embedding": { "@type": "@vector" }
+        },
+        "@graph": [{ "@id": "ex:doc1", "ex:embedding": [0.1, 0.2, 0.3] }]
+    });
+
+    // Commit 1: insert.
+    let after1 = fluree
+        .insert(ledger0, &same_value)
+        .await
+        .expect("first insert");
+    support::rebuild_and_publish_index(&fluree, ledger_id).await;
+    let loaded1 = fluree.ledger(ledger_id).await.expect("load after first");
+
+    // Commit 2: insert the EXACT same fact again.
+    fluree
+        .insert(after1.ledger, &same_value)
+        .await
+        .expect("re-assert same vector");
+    let _ = loaded1; // sanity drop
+    support::rebuild_and_publish_index(&fluree, ledger_id).await;
+    let reloaded = fluree.ledger(ledger_id).await.expect("load after re-assert");
+
+    let count_q = r"
+        PREFIX ex: <http://example.org/>
+        SELECT (COUNT(*) AS ?n) WHERE { ex:doc1 ex:embedding ?v }
+    ";
+    let count_rows = support::query_sparql(&fluree, &reloaded, count_q)
+        .await
+        .expect("count after re-assert")
+        .to_jsonld_async(reloaded.as_graph_db_ref(0))
+        .await
+        .expect("format");
+    assert_eq!(
+        count_rows,
+        json!([[1]]),
+        "re-asserting same vector fact must dedup to one encoded row"
+    );
+
+    // Now delete it; count must be 0.
+    let delete = r"
+        PREFIX ex: <http://example.org/>
+        DELETE WHERE { ex:doc1 ex:embedding ?v }
+    ";
+    let txn = lower_sparql_update(&reloaded, delete);
+    fluree
+        .stage_owned(reloaded)
+        .txn(txn)
+        .execute()
+        .await
+        .expect("delete after re-assert");
+    support::rebuild_and_publish_index(&fluree, ledger_id).await;
+    let final_ledger = fluree.ledger(ledger_id).await.expect("final reload");
+    let count_rows = support::query_sparql(&fluree, &final_ledger, count_q)
+        .await
+        .expect("count after delete")
+        .to_jsonld_async(final_ledger.as_graph_db_ref(0))
+        .await
+        .expect("format");
+    assert_eq!(
+        count_rows,
+        json!([[0]]),
+        "single retraction must cancel the deduped assertion"
+    );
+}
+
+/// Multi-valued vector retraction via the *novelty-overlay* path.
+/// The SPOT-prefix scan in `find_vector_handle_by_fact` returns multiple
+/// candidate rows (same s/p/o_i, different vectors); the value-bit
+/// comparison must pick the right one.
+#[tokio::test]
+async fn jsonld_multi_valued_vectors_overlay_retract_one_keeps_other() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger_id = "it/vector-corruption/multi-valued-overlay:main";
+    let ledger0 = support::genesis_ledger(&fluree, ledger_id);
+
+    let insert = json!({
+        "@context": { "ex": "http://example.org/" },
+        "@graph": [{
+            "@id": "ex:doc1",
+            "ex:embedding": [
+                {"@value": [0.1, 0.2, 0.3], "@type": "@vector"},
+                {"@value": [0.7, 0.8, 0.9], "@type": "@vector"}
+            ]
+        }]
+    });
+    fluree.insert(ledger0, &insert).await.expect("insert");
+    support::rebuild_and_publish_index(&fluree, ledger_id).await;
+    let loaded = fluree.ledger(ledger_id).await.expect("load");
+
+    let delete = r#"
+        PREFIX ex: <http://example.org/>
+        PREFIX f: <https://ns.flur.ee/db#>
+        DELETE DATA {
+            ex:doc1 ex:embedding "[0.1, 0.2, 0.3]"^^f:embeddingVector .
+        }
+    "#;
+    let txn = lower_sparql_update(&loaded, delete);
+    let deleted = fluree
+        .stage_owned(loaded)
+        .txn(txn)
+        .execute()
+        .await
+        .expect("delete one of two via overlay");
+
+    // No second rebuild — overlay path.
+    let count = r"
+        PREFIX ex: <http://example.org/>
+        SELECT (COUNT(*) AS ?n) WHERE { ex:doc1 ex:embedding ?v }
+    ";
+    let count_rows = support::query_sparql(&fluree, &deleted.ledger, count)
+        .await
+        .expect("count")
+        .to_jsonld_async(deleted.ledger.as_graph_db_ref(0))
+        .await
+        .expect("format");
+    assert_eq!(
+        count_rows,
+        json!([[1]]),
+        "overlay must cancel exactly one of two same-(s,p) vector values"
+    );
+
+    let select = r"
+        PREFIX ex: <http://example.org/>
+        SELECT ?v WHERE { ex:doc1 ex:embedding ?v }
+    ";
+    let rows = support::query_sparql(&fluree, &deleted.ledger, select)
+        .await
+        .expect("select")
+        .to_jsonld_async(deleted.ledger.as_graph_db_ref(0))
+        .await
+        .expect("format");
+    let surviving = rows
+        .as_array()
+        .and_then(|rs| rs.first())
+        .and_then(|r| r.as_array())
+        .and_then(|r| r.first())
+        .and_then(|v| v.as_array())
+        .expect("one surviving vector");
+    let first = surviving[0].as_f64().expect("element");
+    assert!(
+        (first - 0.7).abs() < 0.000_001,
+        "overlay surviving vector must be the one we did NOT retract; got first element {first}"
+    );
+}
+
+/// Same as `jsonld_context_vector_duplicate_values_retract_one_keeps_other`
+/// but exercises the *novelty-overlay* path (no rebuild between the two
+/// commits). The overlay translation in `binary_scan` must also use fact
+/// identity, not value-only lookup, otherwise it can resolve the
+/// retraction to the wrong base-arena handle and cancel the wrong row.
+#[tokio::test]
+async fn jsonld_context_vector_duplicate_values_overlay_retract_one_keeps_other() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger_id = "it/vector-corruption/duplicate-overlay:main";
+    let ledger0 = support::genesis_ledger(&fluree, ledger_id);
+
+    let insert = json!({
+        "@context": {
+            "ex": "http://example.org/",
+            "ex:embedding": { "@type": "@vector" }
+        },
+        "@graph": [
+            {"@id": "ex:doc1", "ex:embedding": [0.1, 0.2, 0.3]},
+            {"@id": "ex:doc2", "ex:embedding": [0.1, 0.2, 0.3]}
+        ]
+    });
+    fluree.insert(ledger0, &insert).await.expect("insert");
+    support::rebuild_and_publish_index(&fluree, ledger_id).await;
+    let loaded = fluree.ledger(ledger_id).await.expect("load");
+
+    let delete = r"
+        PREFIX ex: <http://example.org/>
+        DELETE WHERE { ex:doc2 ex:embedding ?v }
+    ";
+    let txn = lower_sparql_update(&loaded, delete);
+    let deleted = fluree
+        .stage_owned(loaded)
+        .txn(txn)
+        .execute()
+        .await
+        .expect("delete doc2");
+
+    // No second rebuild — overlay path.
+    let select_doc1 = r"
+        PREFIX ex: <http://example.org/>
+        SELECT ?v WHERE { ex:doc1 ex:embedding ?v }
+    ";
+    let rows = support::query_sparql(&fluree, &deleted.ledger, select_doc1)
+        .await
+        .expect("query doc1 via overlay")
+        .to_jsonld_async(deleted.ledger.as_graph_db_ref(0))
+        .await
+        .expect("format");
+    assert_ne!(
+        rows,
+        json!([]),
+        "overlay must not cancel doc1 when retracting doc2 with same value"
+    );
+
+    let select_doc2 = r"
+        PREFIX ex: <http://example.org/>
+        SELECT ?v WHERE { ex:doc2 ex:embedding ?v }
+    ";
+    let rows = support::query_sparql(&fluree, &deleted.ledger, select_doc2)
+        .await
+        .expect("query doc2 via overlay")
+        .to_jsonld_async(deleted.ledger.as_graph_db_ref(0))
+        .await
+        .expect("format");
+    assert_eq!(rows, json!([]), "overlay must retract doc2");
+}
+
+/// SPARQL `DELETE DATA` for a vector that was never inserted must NOT
+/// fail the transaction. Other datatypes encode unmatched retractions
+/// harmlessly; vectors must do the same. Pre-fix this returned an
+/// `InvalidOp` because `find_handle_by_value` returned None and the
+/// resolver propagated it as an error.
+#[tokio::test]
+async fn sparql_delete_data_unmatched_vector_is_no_op() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger_id = "it/vector-corruption/unmatched-retract:main";
+    let ledger0 = support::genesis_ledger(&fluree, ledger_id);
+
+    // First commit: insert SOMETHING so the ledger has at least one
+    // namespace allocation; this is a generic warm-up, not a vector.
+    let warm = json!({
+        "@context": {"ex": "http://example.org/"},
+        "@graph": [{"@id": "ex:doc1", "ex:name": "Alice"}]
+    });
+    let inserted = fluree.insert(ledger0, &warm).await.expect("warm insert");
+
+    // Now DELETE DATA a vector that doesn't exist anywhere.
+    let delete = r#"
+        PREFIX ex: <http://example.org/>
+        PREFIX f: <https://ns.flur.ee/db#>
+        DELETE DATA {
+            ex:ghost ex:embedding "[0.1, 0.2, 0.3]"^^f:embeddingVector .
+        }
+    "#;
+    let txn = lower_sparql_update(&inserted.ledger, delete);
+    let _ = fluree
+        .stage_owned(inserted.ledger)
+        .txn(txn)
+        .execute()
+        .await
+        .expect("unmatched vector retraction must not error");
+    support::rebuild_and_publish_index(&fluree, ledger_id).await;
 }
 
 #[tokio::test]

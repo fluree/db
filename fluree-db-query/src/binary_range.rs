@@ -41,7 +41,7 @@ fn translate_overlay_ops_v3_with_raw(
     g_id: GraphId,
     index: IndexType,
     to_t: i64,
-    store: &BinaryIndexStore,
+    store: &Arc<BinaryIndexStore>,
     dict_novelty: &Arc<DictNovelty>,
     runtime_small_dicts: &Arc<RuntimeSmallDicts>,
     mut include: impl FnMut(&Flake) -> bool,
@@ -69,6 +69,7 @@ fn translate_overlay_ops_v3_with_raw(
             Some(runtime_small_dicts),
             &mut ephemeral_preds,
             &mut next_ep,
+            g_id,
         ) {
             Ok(op) => ops.push(op),
             Err(e) => {
