@@ -929,28 +929,6 @@ impl UnresolvedProjection {
     }
 }
 
-/// One column of a SELECT/SELECT-ONE projection (unresolved).
-///
-/// Lowered into [`crate::ir::Column`].
-#[derive(Debug, Clone, PartialEq)]
-pub enum UnresolvedSelection {
-    /// Project a single variable's binding (e.g. `"?name"`).
-    Var(Arc<str>),
-    /// Hydrate a subject (variable or IRI constant) into a nested JSON-LD
-    /// object (e.g. `{"?person": ["*"]}`).
-    Hydration(UnresolvedHydrationSpec),
-}
-
-impl UnresolvedSelection {
-    /// Returns the variable name if this is a `Var` selection.
-    pub fn var_name(&self) -> Option<&str> {
-        match self {
-            UnresolvedSelection::Var(name) => Some(name),
-            UnresolvedSelection::Hydration(_) => None,
-        }
-    }
-}
-
 /// Ordered pattern in where clause
 ///
 /// Each variant represents a different pattern type. The order in the
