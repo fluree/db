@@ -1,8 +1,6 @@
-//! Unified query execution runner
-//!
-//! This module provides the core execution pipeline that all `execute_with_*`
-//! functions share. By extracting the common logic here, we eliminate duplication
-//! and ensure consistent behavior (including tracing) across all execution paths.
+//! Unified query execution runner: shared pipeline behind every `execute*`
+//! entry point. Tracing and error handling go through here so all paths
+//! behave the same.
 
 use crate::binding::Batch;
 use crate::context::{ExecutionContext, FulltextProviders};
@@ -110,15 +108,9 @@ impl ExecutableQuery {
 /// - Rewritten patterns
 /// - Operator tree
 ///
-/// This struct captures the result of the "preparation" phase, which is
-/// common to all execution paths. The actual execution just needs to
-/// run the operator tree with an appropriate ExecutionContext.
-///
-/// # Future Enhancements
-///
-/// Additional fields may be added to support:
-/// - Schema hierarchy for context building
-/// - Reasoning modes for diagnostics/debugging
+/// Output of the prepare phase: the operator tree plus any state that has
+/// to outlive `prepare_execution` and accompany the operator into runtime
+/// (e.g. the derived-facts overlay backing reasoning).
 pub struct PreparedExecution {
     /// The operator tree to execute
     pub operator: BoxedOperator,
