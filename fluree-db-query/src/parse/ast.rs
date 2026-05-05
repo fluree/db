@@ -931,7 +931,7 @@ impl UnresolvedProjection {
 
 /// One column of a SELECT/SELECT-ONE projection (unresolved).
 ///
-/// Lowered into [`crate::ir::Selection`].
+/// Lowered into [`crate::ir::Column`].
 #[derive(Debug, Clone, PartialEq)]
 pub enum UnresolvedSelection {
     /// Project a single variable's binding (e.g. `"?name"`).
@@ -1092,6 +1092,18 @@ impl UnresolvedPattern {
             _ => None,
         }
     }
+}
+
+/// User-declared select shape from the input syntax. Parser-only — lowered
+/// into a `Projection` variant in the IR.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SelectShape {
+    /// Array-form select: each row is a tuple. Default; SPARQL and JSON-LD
+    /// array-form `select`.
+    #[default]
+    Tuple,
+    /// Bare-string `select: "?x"`: each row is a single bare value.
+    Scalar,
 }
 
 /// Unresolved query - the result of parsing before IRI resolution
