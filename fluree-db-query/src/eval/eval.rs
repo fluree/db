@@ -14,22 +14,22 @@ use crate::ir::{Expression, FlakeValue};
 use crate::var_registry::VarId;
 use std::sync::Arc;
 
-impl Expression {
-    fn decode_lookup_error(
-        kind: &'static str,
-        details: impl Into<String>,
-        err: impl std::fmt::Display,
-    ) -> QueryError {
-        let details = details.into();
-        tracing::debug!(
-            kind,
-            details = %details,
-            error = %err,
-            "dictionary lookup failure during expression evaluation"
-        );
-        QueryError::dictionary_lookup(format!("{kind}: {details}: {err}"))
-    }
+fn decode_lookup_error(
+    kind: &'static str,
+    details: impl Into<String>,
+    err: impl std::fmt::Display,
+) -> QueryError {
+    let details = details.into();
+    tracing::debug!(
+        kind,
+        details = %details,
+        error = %err,
+        "dictionary lookup failure during expression evaluation"
+    );
+    QueryError::dictionary_lookup(format!("{kind}: {details}: {err}"))
+}
 
+impl Expression {
     pub(crate) fn eval_to_bool_uncached<R: RowAccess>(
         &self,
         row: &R,
@@ -113,7 +113,7 @@ impl Expression {
                         return Ok(None);
                     };
                     let val = decoded.map_err(|e| {
-                        Self::decode_lookup_error(
+                        decode_lookup_error(
                             "decode encoded literal",
                             format!(
                                 "o_kind={o_kind}, o_key={o_key}, p_id={p_id}, dt_id={dt_id}, lang_id={lang_id}"
@@ -134,7 +134,7 @@ impl Expression {
                     };
                     match resolved {
                         Ok(iri) => Ok(Some(ComparableValue::Iri(Arc::from(iri)))),
-                        Err(e) => Err(Self::decode_lookup_error(
+                        Err(e) => Err(decode_lookup_error(
                             "resolve subject IRI",
                             format!("s_id={s_id}"),
                             e,
