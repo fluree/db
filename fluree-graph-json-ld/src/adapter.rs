@@ -433,6 +433,25 @@ fn process_literal<S: GraphSink>(
                     LiteralValue::Json(Arc::from(json_str.as_str())),
                     Datatype::rdf_json(),
                 )))
+            } else if matches!(val, Value::Array(_))
+                && datatype.as_iri() == fluree_vocab::fluree::EMBEDDING_VECTOR
+            {
+                // Vector arrays come through here once JSON-LD expansion produces
+                // {"@value": [...], "@type": f:embeddingVector}. Stringify and
+                // route through the typed-string-literal path so that
+                // value_convert::convert_string_literal (and its core::coerce
+                // delegate) does the f32-quantized parse — keeping JSON-LD,
+                // Turtle, and SPARQL on a single shared parser.
+                let lexical = serde_json::to_string(val).map_err(|e| {
+                    AdapterError::InvalidStructure(format!(
+                        "failed to serialize vector @value: {e}"
+                    ))
+                })?;
+                Ok(ProcessedValue::Single(sink.term_literal(
+                    &lexical,
+                    Datatype::from_iri(fluree_vocab::fluree::EMBEDDING_VECTOR),
+                    None,
+                )))
             } else {
                 // Non-JSON object/array in @value - shouldn't happen
                 Ok(ProcessedValue::None)

@@ -56,7 +56,7 @@ use thiserror::Error;
 
 use crate::ir::{SparqlWhereClause, TemplateTerm, TripleTemplate, Txn, TxnOpts, TxnType};
 use crate::namespace::NamespaceRegistry;
-use fluree_vocab::xsd;
+use fluree_vocab::{fluree, xsd};
 
 /// Result of converting a SPARQL term to an unresolved term with metadata.
 struct UnresolvedTermWithMeta {
@@ -937,6 +937,17 @@ fn coerce_typed_value(lexical: &str, datatype_iri: &str) -> UnresolvedTerm {
                 return UnresolvedTerm::Literal(LiteralValue::Boolean(false));
             }
         }
+        // f:embeddingVector — share the core lexical parser with JSON-LD/Turtle
+        // so f32 quantization is uniform across ingest paths. The query
+        // layer's `LiteralValue::Vector` is lowered to `FlakeValue::Vector`
+        // with the correct datatype Sid in `parse/lower.rs`.
+        fluree::EMBEDDING_VECTOR => {
+            if let Ok(FlakeValue::Vector(v)) =
+                fluree_db_core::coerce::coerce_string_value(lexical, datatype_iri)
+            {
+                return UnresolvedTerm::Literal(LiteralValue::Vector(v));
+            }
+        }
         _ => {}
     }
     // Fall back to string
@@ -962,6 +973,14 @@ fn coerce_typed_flake_value(lexical: &str, datatype_iri: &str) -> FlakeValue {
                 return FlakeValue::Boolean(true);
             } else if lexical == "false" || lexical == "0" {
                 return FlakeValue::Boolean(false);
+            }
+        }
+        // See `coerce_typed_value` — share core's parser for f:embeddingVector.
+        fluree::EMBEDDING_VECTOR => {
+            if let Ok(fv @ FlakeValue::Vector(_)) =
+                fluree_db_core::coerce::coerce_string_value(lexical, datatype_iri)
+            {
+                return fv;
             }
         }
         _ => {}
@@ -1075,5 +1094,29 @@ mod tests {
         assert_eq!(counter.next(), "_:b0");
         assert_eq!(counter.next(), "_:b1");
         assert_eq!(counter.next(), "_:b2");
+    }
+
+    #[test]
+    fn test_coerce_typed_flake_value_vector_lexical() {
+        // Regression for the vector-corruption bug: a SPARQL typed literal
+        // `"[..]"^^f:embeddingVector` must produce FlakeValue::Vector, not
+        // FlakeValue::String — otherwise downstream flake gen pairs a String
+        // value with the embeddingVector datatype and the index decodes
+        // garbage.
+        let result = coerce_typed_flake_value("[0.1, 0.2, 0.3, 0.4]", fluree::EMBEDDING_VECTOR);
+        match result {
+            FlakeValue::Vector(v) => assert_eq!(v.len(), 4),
+            other => panic!("expected FlakeValue::Vector, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_coerce_typed_value_vector_lexical_unresolved() {
+        // Same coverage on the UnresolvedTerm path used by literal_to_unresolved.
+        let result = coerce_typed_value("[0.1, 0.2]", fluree::EMBEDDING_VECTOR);
+        match result {
+            UnresolvedTerm::Literal(LiteralValue::Vector(v)) => assert_eq!(v.len(), 2),
+            other => panic!("expected LiteralValue::Vector, got {other:?}"),
+        }
     }
 }

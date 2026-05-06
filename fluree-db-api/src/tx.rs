@@ -1858,7 +1858,7 @@ impl crate::Fluree {
             let _g = parse_span.enter();
             let mut sink = FlakeSink::new(&mut ns_registry, new_t, txn_id);
             fluree_graph_turtle::parse(turtle, &mut sink)?;
-            sink.finish()
+            sink.finish().map_err(ApiError::from)?
         };
         tracing::info!(flake_count = flakes.len(), "turtle parsed to flakes");
 

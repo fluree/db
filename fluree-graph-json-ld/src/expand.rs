@@ -171,6 +171,15 @@ fn details_dispatch(
     }
 }
 
+/// Detect a context-coerced `@vector` declaration (long or shorthand form).
+fn is_vector_type(type_val: Option<&TypeValue>) -> bool {
+    matches!(
+        type_val,
+        Some(TypeValue::Iri(t))
+            if t == "@vector" || t == fluree_vocab::fluree::EMBEDDING_VECTOR
+    )
+}
+
 /// Check if map is a @list container
 fn is_list_item(map: &Map<String, JsonValue>) -> bool {
     (map.contains_key("@list") || map.contains_key("list"))
@@ -255,6 +264,22 @@ fn parse_node_value(
         }
 
         JsonValue::Array(arr) => {
+            // Context-coerced `@vector` (or `f:embeddingVector`) array values
+            // expand to ONE value-object whose `@value` is the array — matching
+            // the explicit `{"@value": [...], "@type": "@vector"}` form. Without
+            // this, the array would be split into N scalar @value objects, each
+            // tagged with the vector datatype, which downstream commits as
+            // VECTOR_ID flakes pointing at scalar arena handles (storage corruption).
+            if is_vector_type(type_val) {
+                let mut obj = Map::new();
+                obj.insert("@value".to_string(), JsonValue::Array(arr.clone()));
+                obj.insert(
+                    "@type".to_string(),
+                    json!(fluree_vocab::fluree::EMBEDDING_VECTOR),
+                );
+                return Ok(vec![JsonValue::Object(obj)]);
+            }
+
             let mut results = Vec::new();
             for (i, item) in arr.iter().enumerate() {
                 let mut new_idx = idx.to_vec();
@@ -861,6 +886,105 @@ mod tests {
         let obj = result.as_object().unwrap();
 
         assert_eq!(obj["bar"][0]["@value"], false);
+    }
+
+    #[test]
+    fn test_expand_vector_short_form_array_to_single_value_object() {
+        // Context coerces "ex:embedding" to @vector. A bare JSON array must
+        // expand to ONE value-object whose @value is the whole array, with
+        // @type normalized to the full f:embeddingVector IRI.
+        let doc = json!({
+            "@context": {
+                "ex": "http://example.org/",
+                "ex:embedding": {"@type": "@vector"}
+            },
+            "@id": "ex:doc1",
+            "ex:embedding": [0.1, 0.2, 0.3, 0.4]
+        });
+        let result = node(&doc, &ParsedContext::new()).unwrap();
+        let obj = result.as_object().unwrap();
+        let values = obj["http://example.org/embedding"].as_array().unwrap();
+        assert_eq!(values.len(), 1, "vector array must expand as one value");
+        assert_eq!(
+            values[0]["@type"], "https://ns.flur.ee/db#embeddingVector",
+            "@type must be normalized to the full IRI"
+        );
+        assert_eq!(values[0]["@value"], json!([0.1, 0.2, 0.3, 0.4]));
+    }
+
+    #[test]
+    fn test_expand_vector_full_iri_form_array_to_single_value_object() {
+        let doc = json!({
+            "@context": {
+                "ex": "http://example.org/",
+                "ex:embedding": {"@type": "https://ns.flur.ee/db#embeddingVector"}
+            },
+            "@id": "ex:doc1",
+            "ex:embedding": [0.5, 0.6]
+        });
+        let result = node(&doc, &ParsedContext::new()).unwrap();
+        let obj = result.as_object().unwrap();
+        let values = obj["http://example.org/embedding"].as_array().unwrap();
+        assert_eq!(values.len(), 1);
+        assert_eq!(values[0]["@value"], json!([0.5, 0.6]));
+        assert_eq!(values[0]["@type"], "https://ns.flur.ee/db#embeddingVector");
+    }
+
+    #[test]
+    fn test_expand_vector_prefixed_iri_form_array_to_single_value_object() {
+        let doc = json!({
+            "@context": {
+                "ex": "http://example.org/",
+                "f": "https://ns.flur.ee/db#",
+                "ex:embedding": {"@type": "f:embeddingVector"}
+            },
+            "@id": "ex:doc1",
+            "ex:embedding": [0.7]
+        });
+        let result = node(&doc, &ParsedContext::new()).unwrap();
+        let obj = result.as_object().unwrap();
+        let values = obj["http://example.org/embedding"].as_array().unwrap();
+        assert_eq!(values.len(), 1);
+        assert_eq!(values[0]["@value"], json!([0.7]));
+        assert_eq!(values[0]["@type"], "https://ns.flur.ee/db#embeddingVector");
+    }
+
+    #[test]
+    fn test_expand_non_vector_array_still_produces_n_values() {
+        // Sanity: a normal datatype on an array still expands to N value objects.
+        let doc = json!({
+            "@context": {
+                "ex": "http://example.org/",
+                "xsd": "http://www.w3.org/2001/XMLSchema#",
+                "ex:age": {"@type": "xsd:integer"}
+            },
+            "@id": "ex:doc1",
+            "ex:age": [10, 20, 30]
+        });
+        let result = node(&doc, &ParsedContext::new()).unwrap();
+        let obj = result.as_object().unwrap();
+        let values = obj["http://example.org/age"].as_array().unwrap();
+        assert_eq!(
+            values.len(),
+            3,
+            "non-vector arrays must expand element-wise"
+        );
+    }
+
+    #[test]
+    fn test_expand_vector_explicit_value_wrapper_unchanged() {
+        // The explicit {"@value": [...], "@type": "@vector"} form must continue
+        // to round-trip through expansion as a single value object.
+        let doc = json!({
+            "@context": {"ex": "http://example.org/"},
+            "@id": "ex:doc1",
+            "ex:embedding": {"@value": [0.1, 0.2], "@type": "@vector"}
+        });
+        let result = node(&doc, &ParsedContext::new()).unwrap();
+        let obj = result.as_object().unwrap();
+        let values = obj["http://example.org/embedding"].as_array().unwrap();
+        assert_eq!(values.len(), 1);
+        assert_eq!(values[0]["@value"], json!([0.1, 0.2]));
     }
 
     #[test]
