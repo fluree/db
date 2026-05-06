@@ -13,9 +13,11 @@
 //! 3. Derive exclude/include sets and three-way merge into output `ColumnBatch`
 
 use std::collections::HashMap;
+use std::io;
 use std::sync::Arc;
 
-use crate::format::history_sidecar::HistEntryV2;
+use crate::format::history_sidecar::{decode_history_segment, HistEntryV2, HistorySegmentRef};
+use crate::format::leaf::LeafletDirEntryV3;
 use crate::format::run_record::RunSortOrder;
 use crate::format::run_record_v2::{cmp_v2_for_order, RunRecordV2};
 use crate::read::column_types::{ColumnBatch, ColumnData};
@@ -86,6 +88,72 @@ struct FactState {
 // ============================================================================
 // Public API
 // ============================================================================
+
+/// Check if any row in the batch has `t > t_target`.
+///
+/// Used as a quick gate: a leaflet whose history sidecar doesn't extend
+/// past `t_target` AND whose base rows are all `<= t_target` needs no
+/// replay.
+#[inline]
+pub fn batch_has_rows_above_t(batch: &ColumnBatch, t_target: u32) -> bool {
+    match &batch.t {
+        ColumnData::Block(ts) => ts.iter().any(|&t| t > t_target),
+        ColumnData::Const(t) => *t > t_target,
+        ColumnData::AbsentDefault => false,
+    }
+}
+
+/// Apply time-travel replay to a freshly-loaded leaflet `batch`.
+///
+/// This is the helper used by callers that walk leaflet base columns
+/// directly (e.g. batched join probes) and need correct historical
+/// semantics. It mirrors what [`crate::read::binary_cursor::BinaryCursor`]
+/// does internally:
+///
+/// 1. Quick-skip: if the leaflet's history doesn't extend past `to_t` and
+///    no base rows have `t > to_t`, return `Ok(None)` (no replay needed).
+/// 2. If `entry.history_len > 0`, decode the sidecar segment from
+///    `sidecar_bytes` and call [`replay_leaflet`].
+/// 3. If no sidecar but base rows have `t > to_t`, call
+///    [`replay_leaflet`] with an empty history slice (filters those rows).
+///
+/// Returns `Ok(Some(replayed))` when replay produced a different batch,
+/// `Ok(None)` when the input batch is correct as-is.
+///
+/// `sidecar_bytes` may be `None` when the caller knows the leaf has no
+/// sidecar; in that case the helper degrades to the empty-history filter
+/// path described above.
+pub fn replay_leaflet_at_t(
+    batch: &ColumnBatch,
+    entry: &LeafletDirEntryV3,
+    sidecar_bytes: Option<&[u8]>,
+    to_t: i64,
+    order: RunSortOrder,
+) -> io::Result<Option<ColumnBatch>> {
+    let to_t_u32 = u32::try_from(to_t).unwrap_or(u32::MAX);
+    let needs_replay = entry.history_max_t > to_t_u32 || batch_has_rows_above_t(batch, to_t_u32);
+    if !needs_replay {
+        return Ok(None);
+    }
+    if entry.history_len > 0 {
+        let sc_bytes = sidecar_bytes.ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::NotFound,
+                "history replay requires sidecar bytes but none were provided",
+            )
+        })?;
+        let seg = HistorySegmentRef {
+            offset: entry.history_offset,
+            len: entry.history_len,
+            min_t: entry.history_min_t,
+            max_t: entry.history_max_t,
+        };
+        let history = decode_history_segment(sc_bytes, &seg)?;
+        return Ok(replay_leaflet(batch, &history, to_t, order));
+    }
+    // No sidecar, but base rows have t > to_t — filter them out.
+    Ok(replay_leaflet(batch, &[], to_t, order))
+}
 
 /// Replay a V3 leaflet to reconstruct its state at `t_target`.
 ///
@@ -204,8 +272,18 @@ pub fn replay_leaflet(
             let (_, row_idx) = base_entry.unwrap();
             exclude_indices.push(*row_idx);
         } else if !in_base && state.present {
-            // Was NOT in base, should be present → include from source.
-            if let Some(src) = &state.include_src {
+            // Was NOT in base, should be present → restore from history.
+            // Prefer the most recent assert with `t ≤ t_target` so the
+            // reconstructed row carries the original assert transaction
+            // rather than the retract event's `t`. Downstream consumers
+            // (`T(?val)`, history-range bindings) observe this `t`, and
+            // a retract `t` here would place the row outside the queried
+            // snapshot's `to_t`. Fall back to `state.include_src` only
+            // when no prior assert is recorded in this leaflet's sidecar
+            // — for example when the assert lives in a different segment.
+            if let Some(src) = find_base_assert_at_target(key, history, t_target_u32) {
+                includes.push(hist_entry_to_record(&src));
+            } else if let Some(src) = &state.include_src {
                 includes.push(hist_entry_to_record(src));
             }
         } else if in_base && state.present {
@@ -516,11 +594,15 @@ mod tests {
         let replayed = result.unwrap();
         assert_eq!(replayed.row_count, 2);
         // Should have both s=1 and s=2 (restored).
-        let s_ids: Vec<u64> = (0..replayed.row_count)
-            .map(|i| replayed.s_id.get(i))
+        let rows: Vec<(u64, u32)> = (0..replayed.row_count)
+            .map(|i| (replayed.s_id.get(i), replayed.t.get_or(i, 0)))
             .collect();
-        assert!(s_ids.contains(&1));
-        assert!(s_ids.contains(&2));
+        assert!(rows.contains(&(1, 3)), "s=1 retains base t=3");
+        // The restored fact must carry its assert t (=2), not the retract t (=5).
+        assert!(
+            rows.contains(&(2, 2)),
+            "s=2 must be restored with the assert t=2, got rows {rows:?}"
+        );
     }
 
     #[test]
@@ -565,6 +647,94 @@ mod tests {
         assert!(
             result.is_none(),
             "t_target > u32::MAX means no replay needed"
+        );
+    }
+
+    /// Empty-after-retract leaflet: base columns are empty (`row_count == 0`)
+    /// because every fact in the leaflet was retracted. The history sidecar
+    /// still carries the original asserts, so time-travel to a `t` before
+    /// the retract must reconstruct the leaflet from history alone.
+    ///
+    /// This locks in the contract that `replay_leaflet_at_t` callers
+    /// (e.g. batched join probes) must NOT pre-skip leaflets with
+    /// `row_count == 0` when their sidecar carries events past `to_t`.
+    #[test]
+    fn replay_at_t_reconstructs_empty_after_retract_leaflet() {
+        use crate::format::history_sidecar::HistSidecarBuilder;
+        use crate::format::leaf::LeafletDirEntryV3;
+
+        // Build a sidecar segment containing one assert at t=2 and the
+        // matching retract at t=5, mirroring what the indexer writes when
+        // an entire leaflet is retracted.
+        let mut builder = HistSidecarBuilder::new();
+        builder.start_leaflet();
+        builder.push_entry(make_hist(1, 10, 2, 1)); // assert at t=2
+        builder.push_entry(make_hist(1, 10, 5, 0)); // retract at t=5
+        let (sidecar_bytes, segs) = builder.build();
+        assert_eq!(segs.len(), 1);
+        let seg = &segs[0];
+
+        // Synthesize the directory entry the indexer would write for the
+        // empty-after-retract leaflet (`row_count == 0` but `history_*`
+        // populated; key range and `p_const` preserved for routing).
+        let entry = LeafletDirEntryV3 {
+            row_count: 0,
+            lead_group_count: 0,
+            first_key: [0u8; 26],
+            last_key: [0u8; 26],
+            p_const: Some(1),
+            o_type_const: None,
+            flags: 0,
+            payload_offset: 0,
+            payload_len: 0,
+            column_refs: Vec::new(),
+            history_offset: seg.offset,
+            history_len: seg.len,
+            history_min_t: seg.min_t,
+            history_max_t: seg.max_t,
+        };
+
+        // At t_target=3 the retract has not yet happened: the assert from
+        // t=2 must be restored.
+        let result = replay_leaflet_at_t(
+            &ColumnBatch::empty(),
+            &entry,
+            Some(&sidecar_bytes),
+            3,
+            RunSortOrder::Spot,
+        )
+        .expect("replay should succeed");
+        let replayed = result.expect("history past to_t must produce replay");
+        assert_eq!(replayed.row_count, 1, "the retracted assert is restored");
+        assert_eq!(replayed.s_id.get(0), 1);
+        assert_eq!(replayed.o_key.get(0), ObjKey::encode_i64(10).as_u64());
+        // The reconstructed row's `t` must be the original assert
+        // transaction (t=2), not the retract transaction (t=5).
+        // Downstream consumers — `T(?val)` in queries, history-range
+        // bindings, etc. — observe this `t`, and a value of 5 would
+        // place the row outside the queried snapshot's `to_t == 3`.
+        assert_eq!(
+            replayed.t.get(0),
+            2,
+            "restored row must carry the assert transaction t, not the retract t"
+        );
+
+        // At t_target=5 the retract is in effect: nothing to restore.
+        let result = replay_leaflet_at_t(
+            &ColumnBatch::empty(),
+            &entry,
+            Some(&sidecar_bytes),
+            5,
+            RunSortOrder::Spot,
+        )
+        .expect("replay should succeed");
+        // Either Ok(None) (history.max_t == to_t, quick-skip) or an empty
+        // batch — both reflect "nothing live at t=5". The quick-skip path
+        // returns None because `entry.history_max_t == to_t_u32` is not
+        // strictly greater.
+        assert!(
+            result.as_ref().is_none_or(|b| b.row_count == 0),
+            "at to_t == retract_t no rows should be restored"
         );
     }
 }

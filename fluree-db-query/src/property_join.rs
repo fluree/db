@@ -697,6 +697,8 @@ impl Operator for PropertyJoinOperator {
                 // If we have a driver subject set and we're in the right execution mode,
                 // try a batched subject probe for this predicate.
                 // Batched probe requires binary store with batched_lookup support.
+                // Historical snapshots (`to_t < max_t`) are handled inside the
+                // probe helpers via `replay_leaflet_at_t`.
                 let can_batched_probe = order_pos > 0
                     && driver_subject_ids.is_some()
                     && !ctx.is_multi_ledger()

@@ -21,7 +21,7 @@ pub use read::binary_cursor::BinaryCursor;
 pub use read::binary_index_store::{BinaryGraphView, BinaryIndexStore};
 pub use read::column_types::{BinaryFilter, ColumnBatch, ColumnData, ColumnProjection, ColumnSet};
 pub use read::leaflet_cache::{LeafletCache, LeafletCacheKey, V3BatchCacheKey};
-pub use read::replay::replay_leaflet;
+pub use read::replay::{batch_has_rows_above_t, replay_leaflet, replay_leaflet_at_t};
 
 // ── Format types ────────────────────────────────────────────────────────────
 pub use format::branch::{BranchManifest, LeafEntry};
