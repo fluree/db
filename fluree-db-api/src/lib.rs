@@ -115,6 +115,7 @@ pub use dataset::{
 };
 pub use error::{ApiError, BuilderError, BuilderErrors, Result};
 pub use fluree_db_core::ContentId;
+pub use fluree_db_core::RemoteObject;
 pub use fluree_db_core::{
     commit_to_summary, find_common_ancestor, walk_commit_summaries, CommitSummary, CommonAncestor,
     ConflictKey,
@@ -131,7 +132,7 @@ pub use graph_source::{
 pub use graph_transact_builder::{GraphTransactBuilder, StagedGraph};
 pub use import::{
     scan_directory_format, CreateBuilder, DirectoryFormat, EffectiveImportSettings, ImportBuilder,
-    ImportConfig, ImportError, ImportPhase, ImportResult, ImportSummary,
+    ImportConfig, ImportError, ImportPhase, ImportResult, ImportSummary, RemoteSource,
 };
 pub use ledger_info::LedgerInfoBuilder;
 pub use ledger_manager::{

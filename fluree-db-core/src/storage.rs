@@ -57,6 +57,18 @@ pub enum ReadHint {
 // Core Traits
 // ============================================================================
 
+/// An object in remote storage with its size, returned by
+/// [`StorageRead::list_prefix_with_metadata`].
+///
+/// `address` is a storage address accepted by [`StorageRead::read_bytes`] /
+/// [`StorageRead::read_byte_range`] — it is opaque to callers and remains
+/// backend-encapsulated.
+#[derive(Debug, Clone)]
+pub struct RemoteObject {
+    pub address: String,
+    pub size_bytes: u64,
+}
+
 /// Read-only storage operations
 ///
 /// This trait provides all non-mutating storage operations: reading bytes,
@@ -130,6 +142,21 @@ pub trait StorageRead: Debug + Send + Sync {
             return Ok(Vec::new());
         }
         Ok(full[start..end].to_vec())
+    }
+
+    /// List objects under a prefix together with their byte sizes.
+    ///
+    /// Used by callers (e.g. the bulk-import remote source) that need to
+    /// know object sizes up front without issuing a separate HEAD per object.
+    ///
+    /// Backends that support cheap metadata listing (S3, GCS, etc.) should
+    /// override this. The default returns `Other("not supported")` so callers
+    /// can fail fast and fall back to a caller-supplied object list.
+    async fn list_prefix_with_metadata(&self, prefix: &str) -> Result<Vec<RemoteObject>> {
+        let _ = prefix;
+        Err(crate::error::Error::other(
+            "list_prefix_with_metadata is not supported by this storage backend",
+        ))
     }
 }
 
@@ -262,6 +289,10 @@ impl StorageRead for Arc<dyn Storage> {
 
     async fn list_prefix(&self, prefix: &str) -> Result<Vec<String>> {
         self.as_ref().list_prefix(prefix).await
+    }
+
+    async fn list_prefix_with_metadata(&self, prefix: &str) -> Result<Vec<RemoteObject>> {
+        self.as_ref().list_prefix_with_metadata(prefix).await
     }
 
     fn resolve_local_path(&self, address: &str) -> Option<PathBuf> {
