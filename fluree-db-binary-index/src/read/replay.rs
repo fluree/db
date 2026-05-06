@@ -272,8 +272,18 @@ pub fn replay_leaflet(
             let (_, row_idx) = base_entry.unwrap();
             exclude_indices.push(*row_idx);
         } else if !in_base && state.present {
-            // Was NOT in base, should be present → include from source.
-            if let Some(src) = &state.include_src {
+            // Was NOT in base, should be present → restore from history.
+            // Prefer the most recent assert with `t ≤ t_target` so the
+            // reconstructed row carries the original assert transaction
+            // rather than the retract event's `t`. Downstream consumers
+            // (`T(?val)`, history-range bindings) observe this `t`, and
+            // a retract `t` here would place the row outside the queried
+            // snapshot's `to_t`. Fall back to `state.include_src` only
+            // when no prior assert is recorded in this leaflet's sidecar
+            // — for example when the assert lives in a different segment.
+            if let Some(src) = find_base_assert_at_target(key, history, t_target_u32) {
+                includes.push(hist_entry_to_record(&src));
+            } else if let Some(src) = &state.include_src {
                 includes.push(hist_entry_to_record(src));
             }
         } else if in_base && state.present {
@@ -584,11 +594,15 @@ mod tests {
         let replayed = result.unwrap();
         assert_eq!(replayed.row_count, 2);
         // Should have both s=1 and s=2 (restored).
-        let s_ids: Vec<u64> = (0..replayed.row_count)
-            .map(|i| replayed.s_id.get(i))
+        let rows: Vec<(u64, u32)> = (0..replayed.row_count)
+            .map(|i| (replayed.s_id.get(i), replayed.t.get_or(i, 0)))
             .collect();
-        assert!(s_ids.contains(&1));
-        assert!(s_ids.contains(&2));
+        assert!(rows.contains(&(1, 3)), "s=1 retains base t=3");
+        // The restored fact must carry its assert t (=2), not the retract t (=5).
+        assert!(
+            rows.contains(&(2, 2)),
+            "s=2 must be restored with the assert t=2, got rows {rows:?}"
+        );
     }
 
     #[test]
@@ -694,6 +708,16 @@ mod tests {
         assert_eq!(replayed.row_count, 1, "the retracted assert is restored");
         assert_eq!(replayed.s_id.get(0), 1);
         assert_eq!(replayed.o_key.get(0), ObjKey::encode_i64(10).as_u64());
+        // The reconstructed row's `t` must be the original assert
+        // transaction (t=2), not the retract transaction (t=5).
+        // Downstream consumers — `T(?val)` in queries, history-range
+        // bindings, etc. — observe this `t`, and a value of 5 would
+        // place the row outside the queried snapshot's `to_t == 3`.
+        assert_eq!(
+            replayed.t.get(0),
+            2,
+            "restored row must carry the assert transaction t, not the retract t"
+        );
 
         // At t_target=5 the retract is in effect: nothing to restore.
         let result = replay_leaflet_at_t(
