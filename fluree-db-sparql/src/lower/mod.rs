@@ -226,6 +226,7 @@ impl<'a, E: IriEncoder> LoweringContext<'a, E> {
                 patterns.extend(lowered_modifiers.pre_group_binds);
                 let mut options = lowered_modifiers.options;
                 options.post_binds = select_binds.post;
+                let distinct = lowered_modifiers.distinct;
 
                 // Build a JSON-LD-like context from SPARQL prologue prefixes so formatters can compact IRIs.
                 let ctx = self.build_jsonld_context()?;
@@ -237,9 +238,10 @@ impl<'a, E: IriEncoder> LoweringContext<'a, E> {
                 // `SELECT ?x` is a sequence of single-column rows, not a list
                 // of bare values. Projection shape is `Tuple` (the default of
                 // the `select`/`select_one` helpers).
-                let output = match &select_query.select.variables {
-                    SelectVariables::Star => QueryOutput::wildcard(),
-                    _ => QueryOutput::select_all(select),
+                let output = match (&select_query.select.variables, distinct) {
+                    (SelectVariables::Star, _) => QueryOutput::wildcard(),
+                    (_, true) => QueryOutput::select_distinct(select),
+                    (_, false) => QueryOutput::select_all(select),
                 };
 
                 Ok(Query {
@@ -1278,7 +1280,7 @@ mod tests {
         )
         .unwrap();
 
-        assert!(query.options.distinct);
+        assert!(query.output.is_distinct());
     }
 
     #[test]
@@ -1459,7 +1461,7 @@ mod tests {
         )
         .unwrap();
 
-        assert!(query.options.distinct);
+        assert!(query.output.is_distinct());
         assert_eq!(query.options.group_by.len(), 1);
         assert!(query.options.having.is_some());
         assert_eq!(query.options.order_by.len(), 1);

@@ -126,7 +126,7 @@ fn detect_star_const_numeric_label_order_limit(
     query: &Query,
     options: &QueryOptions,
 ) -> Option<StarConstOrderTopKSpec> {
-    if !options.distinct
+    if !query.output.is_distinct()
         || options.offset.is_some()
         || !options.group_by.is_empty()
         || !options.aggregates.is_empty()
@@ -307,7 +307,7 @@ struct LabelRegexTypeSpec {
 /// `?s rdfs:label ?label . ?s rdf:type <Class> . FILTER regex(?label, "pat"[, "flags"])`
 /// with plain SELECT of exactly `(?s, ?label)` (no ORDER BY/LIMIT/DISTINCT).
 fn detect_label_regex_type(query: &Query, options: &QueryOptions) -> Option<LabelRegexTypeSpec> {
-    if options.distinct
+    if query.output.is_distinct()
         || options.limit.is_some()
         || options.offset.is_some()
         || !options.order_by.is_empty()
@@ -439,7 +439,7 @@ pub(crate) fn detect_count_all_aggregate(query: &Query, options: &QueryOptions) 
         || !options.post_binds.is_empty()
         || !options.order_by.is_empty()
         || options.offset.is_some()
-        || options.distinct
+        || query.output.is_distinct()
     {
         return None;
     }
@@ -475,7 +475,7 @@ fn detect_count_distinct_aggregate(
         || !options.post_binds.is_empty()
         || !options.order_by.is_empty()
         || options.offset.is_some()
-        || options.distinct
+        || query.output.is_distinct()
     {
         return None;
     }
@@ -505,7 +505,7 @@ fn detect_count_aggregate(query: &Query, options: &QueryOptions) -> Option<(Opti
         || !options.post_binds.is_empty()
         || !options.order_by.is_empty()
         || options.offset.is_some()
-        || options.distinct
+        || query.output.is_distinct()
     {
         return None;
     }
@@ -644,7 +644,7 @@ fn detect_group_by_object_star_topk(
         return None;
     }
     let group_var = options.group_by[0];
-    if options.distinct || options.having.is_some() || !options.post_binds.is_empty() {
+    if query.output.is_distinct() || options.having.is_some() || !options.post_binds.is_empty() {
         return None;
     }
     if options.offset.is_some() {
@@ -786,7 +786,7 @@ fn detect_sum_strlen_group_concat_subquery(
     if options.aggregates.len() != 1 {
         return None;
     }
-    if options.distinct || options.having.is_some() || !options.post_binds.is_empty() {
+    if query.output.is_distinct() || options.having.is_some() || !options.post_binds.is_empty() {
         return None;
     }
     if !options.order_by.is_empty() || options.offset.is_some() {
@@ -1024,7 +1024,7 @@ fn detect_predicate_minmax_string(
         || !options.post_binds.is_empty()
         || !options.order_by.is_empty()
         || options.offset.is_some()
-        || options.distinct
+        || query.output.is_distinct()
     {
         return None;
     }
@@ -1070,7 +1070,7 @@ fn detect_predicate_avg_numeric(query: &Query, options: &QueryOptions) -> Option
         || !options.post_binds.is_empty()
         || !options.order_by.is_empty()
         || options.offset.is_some()
-        || options.distinct
+        || query.output.is_distinct()
     {
         return None;
     }
@@ -1107,7 +1107,7 @@ fn detect_count_rows_with_encoded_filters(
         || !options.post_binds.is_empty()
         || !options.order_by.is_empty()
         || options.offset.is_some()
-        || options.distinct
+        || query.output.is_distinct()
     {
         return None;
     }
@@ -1228,7 +1228,7 @@ fn detect_predicate_count_rows_numeric_compare(
         || !options.post_binds.is_empty()
         || !options.order_by.is_empty()
         || options.offset.is_some()
-        || options.distinct
+        || query.output.is_distinct()
     {
         return None;
     }
@@ -1297,7 +1297,7 @@ fn detect_string_prefix_sum_strstarts(
         || !options.post_binds.is_empty()
         || !options.order_by.is_empty()
         || options.offset.is_some()
-        || options.distinct
+        || query.output.is_distinct()
     {
         return None;
     }
@@ -2568,7 +2568,7 @@ fn build_operator_tree_inner(
             }
 
             // DISTINCT
-            if options.distinct {
+            if query.output.is_distinct() {
                 operator = Box::new(DistinctOperator::new(operator));
             }
 
@@ -2614,7 +2614,7 @@ fn build_operator_tree_inner(
                 }
 
                 // DISTINCT
-                if options.distinct {
+                if query.output.is_distinct() {
                     operator = Box::new(crate::distinct::DistinctOperator::new(operator));
                 }
 
@@ -2661,7 +2661,7 @@ fn build_operator_tree_inner(
         stats,
         &needed_where_vars,
         &options.group_by,
-        options.distinct,
+        query.output.is_distinct(),
         required_where_vars,
         planning,
     )?;
@@ -2852,7 +2852,7 @@ fn build_operator_tree_inner(
     // duplicates eliminated by DISTINCT have identical sort keys, so removing
     // them before sorting does not change the ordered set of unique solutions.
     let select_vars_opt: Option<Vec<VarId>> = query.output.projected_vars();
-    let can_project_distinct_before_sort = options.distinct
+    let can_project_distinct_before_sort = query.output.is_distinct()
         && !options.order_by.is_empty()
         && select_vars_opt.as_ref().is_some_and(|vars| {
             !vars.is_empty() && options.order_by.iter().all(|s| vars.contains(&s.var))
@@ -2935,7 +2935,7 @@ fn build_operator_tree_inner(
             // Safe top-k: ORDER BY + (OFFSET o) + LIMIT l can keep only (o + l) rows.
             //
             // This is safe when DISTINCT is not in play because slicing happens after sorting.
-            let can_topk = options.limit.is_some() && !options.distinct;
+            let can_topk = options.limit.is_some() && !query.output.is_distinct();
             let k = match (options.limit, options.offset) {
                 (Some(limit), Some(offset)) => limit.saturating_add(offset),
                 (Some(limit), None) => limit,
@@ -2962,7 +2962,7 @@ fn build_operator_tree_inner(
         }
 
         // DISTINCT (after projection)
-        if options.distinct {
+        if query.output.is_distinct() {
             operator = Box::new(DistinctOperator::new(operator));
         }
     }
@@ -3054,14 +3054,13 @@ mod tests {
         let query = Query {
             context: ParsedContext::default(),
             orig_context: None,
-            output: QueryOutput::select_all(vec![s, label]),
+            output: QueryOutput::select_distinct(vec![s, label]),
             patterns,
             options: QueryOptions::default(),
             post_values: None,
         };
 
         let opts = QueryOptions::new()
-            .with_distinct()
             .with_limit(10)
             .with_order_by(vec![SortSpec::asc(label)]);
 

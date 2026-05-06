@@ -19,8 +19,8 @@ use crate::context::WellKnownDatatypes;
 use crate::ir::triple::{Ref, Term, TriplePattern};
 use crate::ir::QueryOptions;
 use crate::ir::{
-    Column, ConstructTemplate, ForwardItem, HydrationSpec, Multiplicity, NestedSelectSpec,
-    Projection, Query, QueryOutput, Root,
+    Column, ConstructTemplate, ForwardItem, HydrationSpec, NestedSelectSpec, Projection, Query,
+    QueryOutput, Restriction, Root,
 };
 use crate::ir::{
     Expression, Function, IndexSearchPattern, IndexSearchTarget, PathModifier, Pattern,
@@ -96,15 +96,18 @@ pub(crate) fn lower_query<E: IriEncoder>(
     // Lower options
     let options = lower_options(&ast.options, vars)?;
 
-    // Build QueryOutput from mode + lowered components
+    // Build QueryOutput from mode + lowered components. The parser guarantees
+    // `selectOne` and `selectDistinct` are mutually exclusive (if-else dispatch
+    // on the syntactic key); the IR enforces it structurally via Option<Restriction>.
+    let restriction = match select_mode {
+        SelectMode::One => Some(Restriction::One),
+        SelectMode::Many if ast.options.distinct => Some(Restriction::Distinct),
+        _ => None,
+    };
     let output = match select_mode {
-        SelectMode::Many => QueryOutput::Select {
+        SelectMode::Many | SelectMode::One => QueryOutput::Select {
             projection,
-            multiplicity: Multiplicity::All,
-        },
-        SelectMode::One => QueryOutput::Select {
-            projection,
-            multiplicity: Multiplicity::One,
+            restriction,
         },
         SelectMode::Construct => {
             let template = match ast.construct_template {
@@ -1538,7 +1541,6 @@ fn lower_options(opts: &UnresolvedOptions, vars: &mut VarRegistry) -> Result<Que
     Ok(QueryOptions {
         limit: opts.limit,
         offset: opts.offset,
-        distinct: opts.distinct,
         order_by: opts
             .order_by
             .iter()

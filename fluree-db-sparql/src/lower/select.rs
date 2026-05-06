@@ -33,8 +33,11 @@ pub(super) struct SelectBinds {
 
 /// Result of lowering solution modifiers.
 pub(super) struct LoweredModifiers {
-    /// Query options (GROUP BY vars, aggregates, HAVING, ORDER BY, LIMIT, OFFSET, DISTINCT)
+    /// Query options (GROUP BY vars, aggregates, HAVING, ORDER BY, LIMIT, OFFSET)
     pub options: QueryOptions,
+    /// Whether the SELECT carried `DISTINCT`. Lifted into the resulting
+    /// [`QueryOutput::Select::restriction`] by the caller.
+    pub distinct: bool,
     /// Pre-GROUP-BY BIND patterns for expression-based GROUP BY conditions.
     /// These must be injected into the WHERE pattern list before query building.
     pub pre_group_binds: Vec<Pattern>,
@@ -123,10 +126,8 @@ impl<E: IriEncoder> LoweringContext<'_, E> {
         modifiers: &SolutionModifiers,
         select: &SelectClause,
     ) -> Result<LoweredModifiers> {
-        let mut options = QueryOptions {
-            distinct: select.modifier == Some(SelectModifier::Distinct),
-            ..Default::default()
-        };
+        let mut options = QueryOptions::default();
+        let distinct = select.modifier == Some(SelectModifier::Distinct);
         let mut pre_group_binds = Vec::new();
 
         // LIMIT, OFFSET, ORDER BY
@@ -184,6 +185,7 @@ impl<E: IriEncoder> LoweringContext<'_, E> {
 
         Ok(LoweredModifiers {
             options,
+            distinct,
             pre_group_binds,
         })
     }

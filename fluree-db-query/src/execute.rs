@@ -122,12 +122,10 @@ mod tests {
         let opts = QueryOptions::new()
             .with_limit(10)
             .with_offset(5)
-            .with_distinct()
             .with_order_by(vec![SortSpec::asc(VarId(0))]);
 
         assert_eq!(opts.limit, Some(10));
         assert_eq!(opts.offset, Some(5));
-        assert!(opts.distinct);
         assert_eq!(opts.order_by.len(), 1);
         assert!(opts.has_modifiers());
     }

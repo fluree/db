@@ -4,9 +4,8 @@
 //! `Query` is the canonical query representation. Its `output` field
 //! captures the result-shape decision (SELECT, ASK, CONSTRUCT). `patterns`
 //! holds the WHERE clause IR. `options` carries solution modifiers (limit,
-//! offset, order by, group by, aggregates, having, distinct, ...).
-//! Hydration formatting lives inside the `Column::Hydration` variant on
-//! the SELECT projection.
+//! offset, order by, group by, aggregates, having, ...). Hydration formatting
+//! lives inside the `Column::Hydration` variant on the SELECT projection.
 
 use std::collections::HashSet;
 
@@ -45,16 +44,21 @@ impl ConstructTemplate {
     }
 }
 
-/// Whether a SELECT returns all solutions or just the first row.
+/// A restriction applied to a SELECT query's result stream.
 ///
-/// Distinct from `LIMIT 1`: `One` also changes output shape (formatters
-/// return the bare row or null instead of an array of rows).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum Multiplicity {
-    /// Return all matching solutions (`select`).
-    #[default]
-    All,
-    /// Return only the first solution (`selectOne`).
+/// The variants are mutually exclusive: a SELECT query is either plain (no
+/// restriction), `selectDistinct`, or `selectOne` — never a combination. The
+/// parser already enforces this; encoding it as `Option<Restriction>` makes
+/// the invariant structural.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Restriction {
+    /// Filter duplicates from the result stream (`selectDistinct ...`).
+    Distinct,
+    /// Return only the first row (`selectOne ...`).
+    ///
+    /// Distinct from `options.limit = Some(1)`: `One` also changes the output
+    /// shape — formatters render a bare row (or null) rather than a one-element
+    /// array. `LIMIT 1` caps the result set but keeps the array shape.
     One,
 }
 
@@ -62,11 +66,11 @@ pub enum Multiplicity {
 #[derive(Debug, Clone)]
 pub enum QueryOutput {
     /// SELECT — projects rows from the algebra. The `projection` carries
-    /// column structure (and per-column hydration); the `multiplicity`
-    /// carries the all-vs-first-row distinction.
+    /// column structure (and per-column hydration); `restriction` carries the
+    /// optional `selectDistinct` / `selectOne` modifier.
     Select {
         projection: Projection,
-        multiplicity: Multiplicity,
+        restriction: Option<Restriction>,
     },
     /// CONSTRUCT — template patterns instantiated with bindings.
     Construct(ConstructTemplate),
@@ -75,29 +79,35 @@ pub enum QueryOutput {
 }
 
 impl QueryOutput {
-    /// Construct a `Select` from a variable list (Tuple projection,
-    /// `All` multiplicity). Used by SPARQL lowering and fixtures.
+    /// Construct a plain `Select` from a variable list (`select ?x ?y ...`).
     pub fn select_all(vars: Vec<VarId>) -> Self {
         Self::Select {
             projection: Projection::Tuple(vars.into_iter().map(Column::Var).collect()),
-            multiplicity: Multiplicity::All,
+            restriction: None,
         }
     }
 
-    /// Construct a `Select` from a variable list with `One` multiplicity
-    /// (`selectOne`).
+    /// Construct a `Select` with `Distinct` restriction (`selectDistinct ?x ...`).
+    pub fn select_distinct(vars: Vec<VarId>) -> Self {
+        Self::Select {
+            projection: Projection::Tuple(vars.into_iter().map(Column::Var).collect()),
+            restriction: Some(Restriction::Distinct),
+        }
+    }
+
+    /// Construct a `Select` with `One` restriction (`selectOne ?x ...`).
     pub fn select_one(vars: Vec<VarId>) -> Self {
         Self::Select {
             projection: Projection::Tuple(vars.into_iter().map(Column::Var).collect()),
-            multiplicity: Multiplicity::One,
+            restriction: Some(Restriction::One),
         }
     }
 
-    /// Construct a `Select` with a Wildcard projection (`SELECT *`).
+    /// Construct a `Select` with a Wildcard projection (`select *`).
     pub fn wildcard() -> Self {
         Self::Select {
             projection: Projection::Wildcard,
-            multiplicity: Multiplicity::All,
+            restriction: None,
         }
     }
 
@@ -109,10 +119,11 @@ impl QueryOutput {
         }
     }
 
-    /// The multiplicity of a SELECT output, if any.
-    pub fn multiplicity(&self) -> Option<Multiplicity> {
+    /// The restriction on a SELECT output. `None` for non-SELECT outputs and
+    /// for plain SELECT (no modifier).
+    fn restriction(&self) -> Option<Restriction> {
         match self {
-            QueryOutput::Select { multiplicity, .. } => Some(*multiplicity),
+            QueryOutput::Select { restriction, .. } => *restriction,
             _ => None,
         }
     }
@@ -154,9 +165,14 @@ impl QueryOutput {
         self.projection()?.hydration()
     }
 
+    /// Returns `true` for `selectDistinct`.
+    pub fn is_distinct(&self) -> bool {
+        self.restriction() == Some(Restriction::Distinct)
+    }
+
     /// Returns `true` for `selectOne`.
     pub fn is_select_one(&self) -> bool {
-        self.multiplicity() == Some(Multiplicity::One)
+        self.restriction() == Some(Restriction::One)
     }
 
     /// Returns `true` for `SELECT *`.
@@ -228,10 +244,7 @@ impl Query {
         Self {
             context,
             orig_context: None,
-            output: QueryOutput::Select {
-                projection: Projection::Wildcard,
-                multiplicity: Multiplicity::All,
-            },
+            output: QueryOutput::wildcard(),
             patterns: Vec::new(),
             options: QueryOptions::default(),
             post_values: None,

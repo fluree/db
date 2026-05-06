@@ -341,7 +341,7 @@ impl ReasoningModes {
 
 /// Options for query execution modifiers
 ///
-/// Controls GROUP BY, HAVING, ORDER BY, DISTINCT, OFFSET, LIMIT, and reasoning behavior.
+/// Controls GROUP BY, HAVING, ORDER BY, OFFSET, LIMIT, and reasoning behavior.
 /// Embedded in [`Query`](super::Query) and consumed by the planner / executor.
 #[derive(Debug, Clone, Default)]
 pub struct QueryOptions {
@@ -349,8 +349,6 @@ pub struct QueryOptions {
     pub limit: Option<usize>,
     /// Rows to skip before returning results
     pub offset: Option<usize>,
-    /// Whether to deduplicate results
-    pub distinct: bool,
     /// Sort specifications (applied before projection)
     pub order_by: Vec<SortSpec>,
     /// GROUP BY variables (applied after WHERE, before aggregates)
@@ -396,12 +394,6 @@ impl QueryOptions {
     /// Set the offset
     pub fn with_offset(mut self, offset: usize) -> Self {
         self.offset = Some(offset);
-        self
-    }
-
-    /// Enable distinct
-    pub fn with_distinct(mut self) -> Self {
-        self.distinct = true;
         self
     }
 
@@ -459,7 +451,6 @@ impl QueryOptions {
     pub fn has_modifiers(&self) -> bool {
         self.limit.is_some()
             || self.offset.is_some()
-            || self.distinct
             || !self.order_by.is_empty()
             || !self.group_by.is_empty()
             || !self.aggregates.is_empty()
@@ -491,7 +482,6 @@ mod tests {
         let opts = QueryOptions::default();
         assert!(opts.limit.is_none());
         assert!(opts.offset.is_none());
-        assert!(!opts.distinct);
         assert!(opts.order_by.is_empty());
         assert!(opts.group_by.is_empty());
         assert!(opts.aggregates.is_empty());
@@ -504,14 +494,10 @@ mod tests {
 
     #[test]
     fn test_builder_pattern() {
-        let opts = QueryOptions::new()
-            .with_limit(10)
-            .with_offset(5)
-            .with_distinct();
+        let opts = QueryOptions::new().with_limit(10).with_offset(5);
 
         assert_eq!(opts.limit, Some(10));
         assert_eq!(opts.offset, Some(5));
-        assert!(opts.distinct);
         assert!(opts.has_modifiers());
     }
 
@@ -520,7 +506,6 @@ mod tests {
         assert!(!QueryOptions::new().has_modifiers());
         assert!(QueryOptions::new().with_limit(1).has_modifiers());
         assert!(QueryOptions::new().with_offset(1).has_modifiers());
-        assert!(QueryOptions::new().with_distinct().has_modifiers());
     }
 
     #[test]

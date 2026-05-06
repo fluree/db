@@ -277,7 +277,7 @@ mod tests {
             orig_context: None,
             output: QueryOutput::Select {
                 projection: crate::ir::Projection::Tuple(columns),
-                multiplicity: crate::ir::Multiplicity::All,
+                restriction: None,
             },
             patterns: vec![],
             options: QueryOptions::default(),
