@@ -9,12 +9,12 @@ use crate::binding::{Batch, Binding};
 use crate::context::ExecutionContext;
 use crate::dataset::ActiveGraphs;
 use crate::error::{QueryError, Result};
+use crate::ir::triple::{Ref, Term, TriplePattern};
 use crate::object_binding::{late_materialized_object_binding, materialized_object_binding};
 use crate::operator::inline::{apply_inline, extend_schema, InlineOperator};
 use crate::operator::{
     compute_trimmed_vars, effective_schema, trim_batch, BoxedOperator, Operator, OperatorState,
 };
-use crate::triple::{Ref, Term, TriplePattern};
 use crate::var_registry::VarId;
 use async_trait::async_trait;
 use fluree_db_binary_index::{BinaryGraphView, BinaryIndexStore};
@@ -381,7 +381,7 @@ impl NestedLoopJoinOperator {
             match &op {
                 InlineOperator::Filter(expr)
                     if expr
-                        .variables()
+                        .referenced_vars()
                         .into_iter()
                         .all(|v| right_only_vars.contains(&v)) =>
                 {
@@ -533,7 +533,7 @@ impl NestedLoopJoinOperator {
             .collect();
 
         let mut unify_instructions = Vec::new();
-        for var in right_pattern.variables() {
+        for var in right_pattern.produced_vars() {
             // Skip vars that have bind_instructions - they will be substituted
             // (or if not substituted due to binding type, the row is handled
             // by the scan returning no results or the substitution leaving the var)
@@ -2865,7 +2865,7 @@ mod tests {
             .collect();
 
         // Right pattern vars
-        let right_vars = right_pattern.variables();
+        let right_vars = right_pattern.produced_vars();
         assert_eq!(right_vars, vec![VarId(0), VarId(1)]);
 
         // New vars (not in left)
@@ -2924,9 +2924,9 @@ mod tests {
 
         // Build unify instructions
         let mut unify_instructions = Vec::new();
-        for var in right_pattern.variables() {
+        for var in right_pattern.produced_vars() {
             if let Some(&left_col) = left_var_positions.get(&var) {
-                let right_vars = right_pattern.variables();
+                let right_vars = right_pattern.produced_vars();
                 if let Some(right_idx) = right_vars.iter().position(|v| *v == var) {
                     unify_instructions.push(UnifyInstruction {
                         left_col,

@@ -13,20 +13,19 @@ use crate::ast::query::{DescribeQuery, DescribeTarget, SolutionModifiers, VarOrI
 use crate::SourceSpan;
 
 use fluree_db_query::binding::Binding;
-use fluree_db_query::ir::{Expression, Pattern, SubqueryPattern};
-use fluree_db_query::options::QueryOptions;
-use fluree_db_query::parse::encode::IriEncoder;
-use fluree_db_query::parse::{
-    ConstructTemplate as QueryConstructTemplate, ParsedQuery, QueryOutput,
+use fluree_db_query::ir::triple::{Ref, Term, TriplePattern};
+use fluree_db_query::ir::{
+    ConstructTemplate as QueryConstructTemplate, Expression, Pattern, Query, QueryOptions,
+    QueryOutput, SubqueryPattern,
 };
-use fluree_db_query::triple::{Ref, Term, TriplePattern};
+use fluree_db_query::parse::encode::IriEncoder;
 use fluree_db_query::var_registry::VarId;
 
 use super::{LowerError, LoweringContext, Result};
 
 impl<E: IriEncoder> LoweringContext<'_, E> {
-    /// Lower a DESCRIBE query to a ParsedQuery.
-    pub(super) fn lower_describe(&mut self, describe: &DescribeQuery) -> Result<ParsedQuery> {
+    /// Lower a DESCRIBE query to a Query.
+    pub(super) fn lower_describe(&mut self, describe: &DescribeQuery) -> Result<Query> {
         let ctx = self.build_jsonld_context()?;
         let ctx_val = self.build_jsonld_context_value();
 
@@ -136,7 +135,7 @@ impl<E: IriEncoder> LoweringContext<'_, E> {
             Term::Var(o_var),
         )));
 
-        Ok(ParsedQuery {
+        Ok(Query {
             context: ctx,
             orig_context: Some(ctx_val),
             output: QueryOutput::Construct(template),
@@ -164,7 +163,7 @@ impl<E: IriEncoder> LoweringContext<'_, E> {
                 use std::collections::BTreeSet;
                 let mut vars = BTreeSet::new();
                 for p in where_patterns {
-                    for v in p.variables() {
+                    for v in p.produced_vars() {
                         vars.insert(v);
                     }
                 }

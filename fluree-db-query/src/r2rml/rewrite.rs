@@ -24,8 +24,8 @@
 //! - Subject-bound patterns (`ex:subject ex:name ?o`) are not optimized
 //! - Filter patterns are preserved and applied post-R2RML scan
 
+use crate::ir::triple::{Ref, Term, TriplePattern};
 use crate::ir::{Pattern, R2rmlPattern};
-use crate::triple::{Ref, Term, TriplePattern};
 use fluree_db_core::LedgerSnapshot;
 
 /// Result of rewriting patterns for R2RML.
@@ -194,7 +194,7 @@ pub fn convert_triple_to_r2rml(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::triple::Ref;
+    use crate::ir::triple::Ref;
     use crate::var_registry::VarId;
     use fluree_db_core::{is_rdf_type, Sid};
     use fluree_vocab::namespaces::RDF;

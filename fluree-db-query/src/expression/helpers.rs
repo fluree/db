@@ -150,8 +150,8 @@ impl PreparedBoolExpression {
         &self.expr
     }
 
-    pub fn variables(&self) -> Vec<VarId> {
-        self.expr.variables()
+    pub fn referenced_vars(&self) -> Vec<VarId> {
+        self.expr.referenced_vars()
     }
 
     pub fn eval_to_bool<R: RowAccess>(

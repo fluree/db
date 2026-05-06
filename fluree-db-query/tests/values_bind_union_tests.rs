@@ -9,12 +9,12 @@ use fluree_db_core::{FlakeValue, GraphDbRef, LedgerSnapshot, NoOverlay, Sid};
 use fluree_db_query::binding::Binding;
 use fluree_db_query::context::ExecutionContext;
 use fluree_db_query::execute::{execute, ContextConfig, ExecutableQuery};
+use fluree_db_query::ir::triple::{Ref, Term, TriplePattern};
+use fluree_db_query::ir::QueryOptions;
 use fluree_db_query::ir::{Expression, FilterValue, Pattern};
+use fluree_db_query::ir::{Query, QueryOutput};
 use fluree_db_query::operator::Operator;
-use fluree_db_query::options::QueryOptions;
-use fluree_db_query::parse::{ParsedQuery, QueryOutput};
 use fluree_db_query::seed::EmptyOperator;
-use fluree_db_query::triple::{Ref, Term, TriplePattern};
 use fluree_db_query::values::ValuesOperator;
 use fluree_db_query::var_registry::{VarId, VarRegistry};
 use fluree_graph_json_ld::ParsedContext;
@@ -32,13 +32,13 @@ fn make_triple_pattern(s_var: VarId, p_name: &str, o_var: VarId) -> TriplePatter
     )
 }
 
-fn make_query(select: Vec<VarId>, patterns: Vec<Pattern>) -> ParsedQuery {
+fn make_query(select: Vec<VarId>, patterns: Vec<Pattern>) -> Query {
     let output = if select.is_empty() {
         QueryOutput::Wildcard
     } else {
         QueryOutput::select(select)
     };
-    ParsedQuery {
+    Query {
         context: ParsedContext::default(),
         orig_context: None,
         output,

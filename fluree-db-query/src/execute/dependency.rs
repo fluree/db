@@ -5,8 +5,7 @@
 //! and GROUP BY. Variables without downstream dependencies are dead and can
 //! be projected away early.
 
-use crate::options::QueryOptions;
-use crate::parse::ParsedQuery;
+use crate::ir::{Query, QueryOptions};
 use crate::var_registry::VarId;
 use std::collections::HashSet;
 
@@ -36,7 +35,7 @@ pub struct VariableDeps {
 /// - `Wildcard` / `Boolean` select mode (all WHERE vars are needed)
 /// - Empty select list (no explicit projection)
 /// - `Construct` without a template
-pub fn compute_variable_deps(query: &ParsedQuery, options: &QueryOptions) -> Option<VariableDeps> {
+pub fn compute_variable_deps(query: &Query, options: &QueryOptions) -> Option<VariableDeps> {
     // ---- backward walk ----
 
     // Seed deps from the query output requirements.
@@ -68,7 +67,7 @@ pub fn compute_variable_deps(query: &ParsedQuery, options: &QueryOptions) -> Opt
         required_bind_vars.push(deps.iter().copied().collect());
         // Then trace backward through the bind expression.
         if deps.remove(var) {
-            deps.extend(expr.variables());
+            deps.extend(expr.referenced_vars());
         }
     }
     // Reverse so indices match the forward (execution) order of post_binds.
@@ -80,7 +79,7 @@ pub fn compute_variable_deps(query: &ParsedQuery, options: &QueryOptions) -> Opt
     // HAVING expression variables: needed in HAVING's input but not
     // necessarily in its output (HAVING evaluates before trimming).
     if let Some(ref having_expr) = options.having {
-        deps.extend(having_expr.variables());
+        deps.extend(having_expr.referenced_vars());
     }
 
     // Record what Aggregate's output must contain (before tracing aggregates backward).
@@ -118,19 +117,16 @@ pub fn compute_variable_deps(query: &ParsedQuery, options: &QueryOptions) -> Opt
 mod tests {
     use super::*;
     use crate::aggregate::{AggregateFn, AggregateSpec};
+    use crate::ir::triple::{Ref, Term, TriplePattern};
+    use crate::ir::QueryOptions;
+    use crate::ir::{ConstructTemplate, Query, QueryOutput};
     use crate::ir::{Expression, FilterValue, Pattern};
-    use crate::options::QueryOptions;
-    use crate::parse::{ConstructTemplate, ParsedQuery, QueryOutput, SelectMode};
+    use crate::parse::SelectMode;
     use crate::sort::SortSpec;
-    use crate::triple::{Ref, Term, TriplePattern};
     use fluree_db_core::Sid;
     use fluree_graph_json_ld::ParsedContext;
 
-    fn make_query(
-        select: Vec<VarId>,
-        patterns: Vec<Pattern>,
-        select_mode: SelectMode,
-    ) -> ParsedQuery {
+    fn make_query(select: Vec<VarId>, patterns: Vec<Pattern>, select_mode: SelectMode) -> Query {
         let output = match select_mode {
             SelectMode::Many => QueryOutput::select(select),
             SelectMode::One => QueryOutput::select_one(select),
@@ -138,7 +134,7 @@ mod tests {
             SelectMode::Construct => QueryOutput::Construct(ConstructTemplate::new(Vec::new())),
             SelectMode::Boolean => QueryOutput::Boolean,
         };
-        ParsedQuery {
+        Query {
             context: ParsedContext::default(),
             orig_context: None,
             output,
@@ -255,7 +251,7 @@ mod tests {
 
     #[test]
     fn construct_uses_template_vars() {
-        let query = ParsedQuery {
+        let query = Query {
             context: ParsedContext::default(),
             orig_context: None,
             output: QueryOutput::Construct(ConstructTemplate::new(vec![make_tp(

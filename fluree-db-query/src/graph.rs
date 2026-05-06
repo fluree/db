@@ -87,7 +87,7 @@ impl GraphOperator {
 
         let mut inner_vars: std::collections::HashSet<VarId> = std::collections::HashSet::new();
         for p in &inner_patterns {
-            inner_vars.extend(p.variables());
+            inner_vars.extend(p.produced_vars());
         }
 
         // If graph_name is a variable, it may be bound by this operator
@@ -454,7 +454,7 @@ impl Operator for GraphOperator {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::triple::{Ref, Term, TriplePattern};
+    use crate::ir::triple::{Ref, Term, TriplePattern};
     use fluree_db_core::Sid;
 
     // Helper test struct for creating operators with specific schemas

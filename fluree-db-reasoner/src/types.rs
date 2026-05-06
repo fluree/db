@@ -6,7 +6,7 @@ use fluree_db_core::Sid;
 
 /// Reasoning modes that may affect derived-facts materialization and caching.
 ///
-/// This mirrors `fluree-db-query::rewrite::ReasoningModes` structurally, but is defined
+/// This mirrors `fluree-db-query::ir::ReasoningModes` structurally, but is defined
 /// locally to keep `fluree-db-reasoner` dependency-free of the query crate.
 ///
 /// # Reasoning Methods

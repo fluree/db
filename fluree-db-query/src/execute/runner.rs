@@ -8,15 +8,15 @@ use crate::binding::Batch;
 use crate::context::{ExecutionContext, FulltextProviders};
 use crate::dataset::DataSet;
 use crate::error::Result;
+use crate::ir::triple::{Ref, Term, TriplePattern};
 use crate::ir::Pattern;
+use crate::ir::Query;
+use crate::ir::QueryOptions;
 use crate::operator::BoxedOperator;
-use crate::options::QueryOptions;
-use crate::parse::ParsedQuery;
 use crate::reasoning::ReasoningOverlay;
 use crate::rewrite_owl_ql::Ontology;
 use crate::schema_bundle::SchemaBundleOverlay;
 use crate::stats_cache::cached_stats_view_for_db;
-use crate::triple::{Ref, Term, TriplePattern};
 use crate::var_registry::VarRegistry;
 use fluree_db_binary_index::BinaryIndexStore;
 use fluree_db_core::dict_novelty::DictNovelty;
@@ -69,23 +69,23 @@ fn dedup_exact_triples(patterns: Vec<Pattern>) -> Vec<Pattern> {
 /// Query with execution options
 ///
 /// Combines a parsed query with solution modifiers for execution.
-/// The `options` field allows overriding the options embedded in `ParsedQuery`.
+/// The `options` field allows overriding the options embedded in `Query`.
 #[derive(Debug)]
 pub struct ExecutableQuery {
     /// The parsed query (contains embedded options)
-    pub query: ParsedQuery,
+    pub query: Query,
     /// Execution options (may override query.options)
     pub options: QueryOptions,
 }
 
 impl ExecutableQuery {
     /// Create a new executable query with explicit options override
-    pub fn new(query: ParsedQuery, options: QueryOptions) -> Self {
+    pub fn new(query: Query, options: QueryOptions) -> Self {
         Self { query, options }
     }
 
     /// Create an executable query using the query's embedded options
-    pub fn simple(query: ParsedQuery) -> Self {
+    pub fn simple(query: Query) -> Self {
         let options = query.options.clone();
         Self { query, options }
     }
@@ -99,7 +99,7 @@ impl ExecutableQuery {
         self.query
             .patterns
             .iter()
-            .any(|p| crate::ir::pattern_contains_function(p, &crate::ir::Function::Fulltext))
+            .any(|p| p.contains_function(&crate::ir::Function::Fulltext))
     }
 }
 

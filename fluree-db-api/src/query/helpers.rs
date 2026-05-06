@@ -9,7 +9,8 @@ use crate::{
 
 use fluree_db_binary_index::BinaryGraphView;
 use fluree_db_core::LedgerSnapshot;
-use fluree_db_query::parse::{parse_query, ParsedQuery};
+use fluree_db_query::ir::Query;
+use fluree_db_query::parse::parse_query;
 
 use super::QueryResult;
 
@@ -29,7 +30,7 @@ pub(crate) fn parse_jsonld_query(
     snapshot: &LedgerSnapshot,
     default_context: Option<&JsonValue>,
     strict_compact_iri: Option<bool>,
-) -> Result<(VarRegistry, ParsedQuery)> {
+) -> Result<(VarRegistry, Query)> {
     let has_context = query_json.get("@context").is_some() || query_json.get("context").is_some();
 
     let effective_query;
@@ -67,7 +68,7 @@ pub(crate) fn parse_sparql_to_ir(
     sparql: &str,
     snapshot: &LedgerSnapshot,
     default_context: Option<&JsonValue>,
-) -> Result<(VarRegistry, ParsedQuery)> {
+) -> Result<(VarRegistry, Query)> {
     let mut ast = parse_and_validate_sparql(sparql)?;
 
     // Inject default prefixes from the ledger's stored @context, but only
@@ -97,7 +98,7 @@ pub(crate) fn parse_sparql_to_ir(
 }
 
 /// Prepare a parsed query for execution.
-pub(crate) fn prepare_for_execution(parsed: &ParsedQuery) -> ExecutableQuery {
+pub(crate) fn prepare_for_execution(parsed: &Query) -> ExecutableQuery {
     ExecutableQuery::simple(parsed.clone())
 }
 
@@ -111,7 +112,7 @@ pub(crate) fn prepare_for_execution(parsed: &ParsedQuery) -> ExecutableQuery {
 /// in every query method.
 pub(crate) fn build_query_result(
     vars: VarRegistry,
-    parsed: ParsedQuery,
+    parsed: Query,
     batches: Vec<Batch>,
     t: Option<i64>,
     novelty: Option<Arc<dyn OverlayProvider>>,

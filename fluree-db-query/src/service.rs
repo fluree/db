@@ -77,7 +77,7 @@ impl ServiceOperator {
 
         let mut inner_vars: std::collections::HashSet<VarId> = std::collections::HashSet::new();
         for p in &service.patterns {
-            inner_vars.extend(p.variables());
+            inner_vars.extend(p.produced_vars());
         }
 
         // If endpoint is a variable, it may be bound by this operator

@@ -7,8 +7,8 @@
 //! The main entry point is `reorder_patterns`, called from
 //! `build_where_operators_seeded` in `execute/where_plan.rs`.
 
+use crate::ir::triple::{Ref, Term, TriplePattern};
 use crate::ir::{CompareOp, Function, Pattern};
-use crate::triple::{Ref, Term, TriplePattern};
 use crate::var_registry::VarId;
 use fluree_db_core::{FlakeValue, PropertyStatData, StatsView};
 use std::collections::{HashMap, HashSet};
@@ -239,7 +239,9 @@ pub fn analyze_property_join(patterns: &[TriplePattern]) -> PropertyJoinAnalysis
                 enough_patterns,
                 subject_is_var: false,
                 same_subject: false,
-                predicates_bound: patterns.iter().all(super::triple::TriplePattern::p_bound),
+                predicates_bound: patterns
+                    .iter()
+                    .all(crate::ir::triple::TriplePattern::p_bound),
                 object_modes_supported: false,
                 object_vars_distinct: false,
                 has_bound_objects: false,
@@ -253,7 +255,9 @@ pub fn analyze_property_join(patterns: &[TriplePattern]) -> PropertyJoinAnalysis
         _ => false,
     });
 
-    let predicates_bound = patterns.iter().all(super::triple::TriplePattern::p_bound);
+    let predicates_bound = patterns
+        .iter()
+        .all(crate::ir::triple::TriplePattern::p_bound);
 
     let mut obj_vars: HashSet<VarId> = HashSet::new();
     let mut object_modes_supported = true;
@@ -856,7 +860,7 @@ pub fn estimate_branch_cardinality(patterns: &[Pattern], stats: Option<&StatsVie
                     }
                     _ => {}
                 }
-                for v in other.variables() {
+                for v in other.produced_vars() {
                     bound_vars.insert(v);
                 }
             }
@@ -879,7 +883,7 @@ pub fn estimate_branch_cardinality(patterns: &[Pattern], stats: Option<&StatsVie
     // Start with most selective triple (standalone estimate — nothing bound yet)
     let first = sorted_triples[0];
     let mut running = estimate_triple_row_count(first, &bound_vars, stats);
-    for v in first.variables() {
+    for v in first.produced_vars() {
         bound_vars.insert(v);
     }
 
@@ -888,7 +892,7 @@ pub fn estimate_branch_cardinality(patterns: &[Pattern], stats: Option<&StatsVie
     for tp in sorted_triples.iter().skip(1) {
         let expansion = estimate_triple_row_count(tp, &bound_vars, stats);
         running *= expansion;
-        for v in tp.variables() {
+        for v in tp.produced_vars() {
             bound_vars.insert(v);
         }
     }
@@ -897,17 +901,18 @@ pub fn estimate_branch_cardinality(patterns: &[Pattern], stats: Option<&StatsVie
 }
 
 /// Check if a general pattern shares any variables with the bound set.
-///
-/// Uses `Pattern::variables()` which works for all pattern variants.
 pub fn pattern_shares_variables(pattern: &Pattern, bound_vars: &HashSet<VarId>) -> bool {
-    pattern.variables().iter().any(|v| bound_vars.contains(v))
+    pattern
+        .referenced_vars()
+        .iter()
+        .any(|v| bound_vars.contains(v))
 }
 
 /// Collect the variables that a slice of patterns guarantees to bind.
 fn collect_guaranteed_vars(patterns: &[Pattern]) -> HashSet<VarId> {
     patterns
         .iter()
-        .flat_map(super::ir::Pattern::variables)
+        .flat_map(super::ir::Pattern::produced_vars)
         .collect()
 }
 
@@ -1020,15 +1025,15 @@ pub fn reorder_patterns(
             pattern,
             Pattern::Minus(_) | Pattern::Exists(_) | Pattern::NotExists(_)
         ) {
-            // Require all variables from preceding patterns (order preservation)
+            // Require all variables produced by preceding patterns (order preservation)
             let mut required: HashSet<VarId> = patterns[..i]
                 .iter()
-                .flat_map(super::ir::Pattern::variables)
+                .flat_map(super::ir::Pattern::produced_vars)
                 .collect();
-            // If no preceding patterns, require the pattern's own variables
-            // so it cannot execute before any sources provide bindings.
+            // If no preceding patterns, require the pattern's own referenced
+            // variables so it cannot execute before any sources provide bindings.
             if required.is_empty() {
-                required = pattern.variables().into_iter().collect();
+                required = pattern.referenced_vars().into_iter().collect();
             }
             deferred.push(DeferredPattern {
                 orig_index: i,
@@ -1083,7 +1088,7 @@ pub fn reorder_patterns(
             } else {
                 break;
             };
-            for v in rp.pattern.variables() {
+            for v in rp.pattern.produced_vars() {
                 bound_vars.insert(v);
             }
             result.push(rp.pattern);
@@ -1129,7 +1134,7 @@ fn try_place_reducer(
 
     if let Some(idx) = eligible_idx {
         let rp = remaining.remove(idx);
-        for v in rp.pattern.variables() {
+        for v in rp.pattern.produced_vars() {
             bound_vars.insert(v);
         }
         result.push(rp.pattern);
@@ -1194,7 +1199,7 @@ fn try_place_source(
 
     if let Some(idx) = best_idx {
         let rp = remaining.remove(idx);
-        for v in rp.pattern.variables() {
+        for v in rp.pattern.produced_vars() {
             bound_vars.insert(v);
         }
         result.push(rp.pattern);
@@ -1227,7 +1232,7 @@ fn try_place_expander(
 
     if let Some(idx) = eligible_idx {
         let rp = remaining.remove(idx);
-        for v in rp.pattern.variables() {
+        for v in rp.pattern.produced_vars() {
             bound_vars.insert(v);
         }
         result.push(rp.pattern);
@@ -1302,19 +1307,19 @@ fn drain_ready_deferred(
 /// - BIND: the expression's variables (not the target variable)
 fn deferred_required_vars(pattern: &Pattern) -> Vec<VarId> {
     match pattern {
-        Pattern::Filter(expr) => expr.variables(),
-        Pattern::Bind { expr, .. } => expr.variables(),
+        Pattern::Filter(expr) => expr.referenced_vars(),
+        Pattern::Bind { expr, .. } => expr.referenced_vars(),
         // Other patterns should not be classified as Deferred, but handle
-        // gracefully by returning all variables.
-        other => other.variables(),
+        // gracefully by returning all referenced variables.
+        other => other.referenced_vars(),
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ir::triple::Term;
     use crate::ir::GraphName;
-    use crate::triple::Term;
     use fluree_db_core::{PropertyStatData, Sid, StatsView};
     use std::sync::Arc;
 
@@ -1367,24 +1372,24 @@ mod tests {
             Pattern::Triple(tp) => tp,
             _ => panic!("expected Triple pattern"),
         };
-        assert!(first.variables().contains(&VarId(0)));
-        assert!(first.variables().contains(&VarId(1)));
+        assert!(first.produced_vars().contains(&VarId(0)));
+        assert!(first.produced_vars().contains(&VarId(1)));
 
         // p3 placed second (shares ?s=VarId(0) with p1, preferred over disjoint p2)
         let second = match &ordered[1] {
             Pattern::Triple(tp) => tp,
             _ => panic!("expected Triple pattern"),
         };
-        assert!(second.variables().contains(&VarId(0)));
-        assert!(second.variables().contains(&VarId(4)));
+        assert!(second.produced_vars().contains(&VarId(0)));
+        assert!(second.produced_vars().contains(&VarId(4)));
 
         // p2 placed last (disjoint, no joinable preference)
         let last = match &ordered[2] {
             Pattern::Triple(tp) => tp,
             _ => panic!("expected Triple pattern"),
         };
-        assert!(last.variables().contains(&VarId(2)));
-        assert!(last.variables().contains(&VarId(3)));
+        assert!(last.produced_vars().contains(&VarId(2)));
+        assert!(last.produced_vars().contains(&VarId(3)));
     }
 
     #[test]
@@ -1437,7 +1442,7 @@ mod tests {
             _ => panic!("expected Triple pattern"),
         };
         assert!(
-            first.variables().contains(&s),
+            first.produced_vars().contains(&s),
             "expected first pattern to join with seeded bound vars"
         );
     }

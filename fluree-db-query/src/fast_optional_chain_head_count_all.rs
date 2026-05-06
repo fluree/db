@@ -11,8 +11,8 @@ use crate::fast_path_common::{
     build_count_batch, count_to_i64, fast_path_store, normalize_pred_sid, FastPathOperator,
     PostObjectGroupCountIter, PsotSubjectCountIter, PsotSubjectWeightedSumIter,
 };
+use crate::ir::triple::Ref;
 use crate::operator::BoxedOperator;
-use crate::triple::Ref;
 use crate::var_registry::VarId;
 use fluree_db_binary_index::BinaryIndexStore;
 use fluree_db_core::GraphId;

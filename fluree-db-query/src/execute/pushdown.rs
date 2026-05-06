@@ -3,10 +3,10 @@
 //! Extracts range constraints from FILTER expressions for pushdown
 //! to scan/join operators, enabling index-level filtering.
 
+use crate::ir::triple::TriplePattern;
 use crate::ir::{Expression, Pattern};
 use crate::planner::extract_object_bounds_for_var;
 use crate::sort::compare_flake_values;
-use crate::triple::TriplePattern;
 use crate::var_registry::VarId;
 use fluree_db_core::{FlakeValue, ObjectBounds};
 use std::cmp::Ordering;
@@ -124,7 +124,7 @@ pub fn extract_lookahead_bounds_with_consumption(
 /// Count unique variables referenced in a filter expression
 pub fn count_filter_vars(expr: &Expression) -> usize {
     // Use the existing variables() method on Expression
-    let vars: HashSet<VarId> = expr.variables().into_iter().collect();
+    let vars: HashSet<VarId> = expr.referenced_vars().into_iter().collect();
     vars.len()
 }
 
@@ -189,8 +189,8 @@ pub fn merge_upper_bound(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ir::triple::{Ref, Term};
     use crate::ir::FilterValue;
-    use crate::triple::{Ref, Term};
     use fluree_db_core::Sid;
 
     use crate::ir::Function;

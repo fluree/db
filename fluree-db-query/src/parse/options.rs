@@ -476,7 +476,7 @@ fn rewrite_having_aggregates(
 /// ```
 pub fn parse_reasoning(
     obj: &serde_json::Map<String, JsonValue>,
-) -> Result<Option<crate::rewrite::ReasoningModes>> {
+) -> Result<Option<crate::ir::ReasoningModes>> {
     // Check if either reasoning or rules is present
     let has_reasoning = obj.contains_key("reasoning");
     let has_rules = obj.contains_key("rules");
@@ -487,7 +487,7 @@ pub fn parse_reasoning(
 
     // Reconstruct the query object for from_query_json
     let query_obj = JsonValue::Object(obj.clone());
-    crate::rewrite::ReasoningModes::from_query_json(&query_obj)
+    crate::ir::ReasoningModes::from_query_json(&query_obj)
         .map(Some)
         .map_err(|e| ParseError::InvalidOption(format!("reasoning: {e}")))
 }

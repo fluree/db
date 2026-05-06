@@ -12,8 +12,8 @@ use crate::ast::query::{
 use crate::span::SourceSpan;
 
 use fluree_db_query::aggregate::AggregateSpec;
+use fluree_db_query::ir::QueryOptions;
 use fluree_db_query::ir::{Expression, FilterValue, Pattern, SubqueryPattern};
-use fluree_db_query::options::QueryOptions;
 use fluree_db_query::parse::encode::IriEncoder;
 use fluree_db_query::sort::{SortDirection, SortSpec};
 use fluree_db_query::var_registry::VarId;
@@ -344,7 +344,7 @@ impl<E: IriEncoder> LoweringContext<'_, E> {
                 let mut seen: HashSet<VarId> = HashSet::new();
                 let mut select: Vec<VarId> = Vec::new();
                 for p in &patterns {
-                    for v in p.variables() {
+                    for v in p.produced_vars() {
                         if seen.insert(v) {
                             select.push(v);
                         }

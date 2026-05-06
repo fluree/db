@@ -31,10 +31,10 @@ use crate::binding::{Batch, Binding};
 use crate::context::ExecutionContext;
 use crate::dataset::ActiveGraphs;
 use crate::error::{QueryError, Result};
+use crate::ir::triple::TriplePattern;
 use crate::operator::inline::{extend_schema, InlineOperator};
 use crate::operator::{BoxedOperator, Operator, OperatorState};
 use crate::temporal_mode::TemporalMode;
-use crate::triple::TriplePattern;
 use crate::var_registry::VarId;
 
 // =============================================================================
@@ -436,7 +436,7 @@ mod tests {
     /// Verify ScanDatasetBuilder produces operators with consistent schema.
     #[test]
     fn scan_dataset_builder_consistent_schema() {
-        use crate::triple::{Ref, Term};
+        use crate::ir::triple::{Ref, Term};
         use fluree_db_core::Sid;
 
         let s = VarId(0);
