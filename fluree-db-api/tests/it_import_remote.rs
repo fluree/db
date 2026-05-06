@@ -332,8 +332,8 @@ async fn import_from_storage_jsonld_then_query() {
 // ============================================================================
 //
 // The underlying TriG-via-import path has a documented upstream limitation
-// (see fluree-db-transact/src/import.rs:452). Until that is fixed,
-// import_from_storage rejects .trig with an actionable error message.
+// (see `import_trig_commit` in fluree-db-transact/src/import.rs). Until that
+// is fixed, import_from_storage rejects .trig with an actionable error message.
 
 #[tokio::test]
 async fn import_from_storage_rejects_trig_with_upstream_explanation() {
@@ -364,8 +364,8 @@ async fn import_from_storage_rejects_trig_with_upstream_explanation() {
 
     let msg = err.to_string();
     assert!(
-        msg.contains(".trig") && msg.contains("upstream limitation"),
-        "expected explicit upstream-limitation message, got: {msg}"
+        msg.contains(".trig") && msg.contains("not currently supported"),
+        "expected explicit not-supported message, got: {msg}"
     );
 }
 

@@ -809,18 +809,18 @@ async fn resolve_remote_objects(
     }
 
     // `.trig` import is wired through the same serial path the local
-    // `.import(dir)` uses, but that path has a documented upstream limitation:
-    // the Tier 2 spool/index pipeline does not fully capture TriG content —
-    // see fluree-db-transact/src/import.rs (`import_trig_commit` comment).
-    // Imported TriG data may not become queryable. Fail loud rather than
-    // silently producing a half-imported ledger.
+    // `.import(dir)` uses, but that path has a documented upstream limitation
+    // in `import_trig_commit` (fluree-db-transact/src/import.rs): the Tier 2
+    // spool/index pipeline does not fully capture TriG content. Imported TriG
+    // data may not become queryable. Fail loud rather than silently producing
+    // a half-imported ledger.
     if has_trig {
         return Err(ImportError::NoChunks(
-            "remote .trig import is wired but blocked by an upstream limitation in \
-             the Tier 2 import pipeline (named-graph flakes are not spooled, \
-             default-graph TriG content is not surfaced to queries). Until that \
-             is fixed, convert TriG to .ttl or .jsonld before import. \
-             See fluree-db-transact/src/import.rs:452 for context."
+            "remote .trig import is not currently supported: the Tier 2 import \
+             pipeline does not fully capture named-graph or default-graph TriG \
+             content, so imported data may not become queryable. Convert TriG \
+             to .ttl or .jsonld before import. See `import_trig_commit` in \
+             fluree-db-transact/src/import.rs for context."
                 .into(),
         ));
     }
