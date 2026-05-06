@@ -23,9 +23,7 @@ use fluree_db_policy::{
     build_policy_set, PolicyAction, PolicyContext, PolicyQuery, PolicyRestriction, PolicyValue,
     PolicyWrapper, TargetMode,
 };
-use fluree_db_query::{
-    execute_pattern_with_overlay_at, Binding, Ref, Term, TriplePattern, VarRegistry,
-};
+use fluree_db_query::{execute_pattern, Binding, Ref, Term, TriplePattern, VarRegistry};
 use fluree_vocab::rdf::TYPE as RDF_TYPE_IRI;
 use serde_json::Value as JsonValue;
 use std::collections::{HashMap, HashSet};
@@ -373,7 +371,7 @@ async fn load_policies_by_identity(
     let mut class_sids: Vec<Sid> = Vec::new();
     for &g_id in policy_graphs {
         let db = GraphDbRef::new(snapshot, g_id, overlay, to_t).eager();
-        let batches = execute_pattern_with_overlay_at(db, &vars, pattern.clone(), None).await?;
+        let batches = execute_pattern(db, &vars, pattern.clone()).await?;
         for batch in &batches {
             for row in 0..batch.len() {
                 if let Some(binding) = batch.get(row, class_var) {

@@ -57,18 +57,7 @@ fn dedup_exact_triples(patterns: Vec<Pattern>) -> Vec<Pattern> {
                     seen_triples.push(tp.clone());
                     out.push(Pattern::Triple(tp));
                 }
-                Pattern::Optional(inner) => out.push(Pattern::Optional(dedup_list(inner))),
-                Pattern::Union(branches) => out.push(Pattern::Union(
-                    branches.into_iter().map(dedup_list).collect(),
-                )),
-                Pattern::Minus(inner) => out.push(Pattern::Minus(dedup_list(inner))),
-                Pattern::Exists(inner) => out.push(Pattern::Exists(dedup_list(inner))),
-                Pattern::NotExists(inner) => out.push(Pattern::NotExists(dedup_list(inner))),
-                Pattern::Graph { name, patterns } => out.push(Pattern::Graph {
-                    name,
-                    patterns: dedup_list(patterns),
-                }),
-                other => out.push(other),
+                other => out.push(other.map_subpatterns(&mut dedup_list)),
             }
         }
         out
@@ -343,29 +332,14 @@ pub async fn prepare_execution_with_config(
                         o: encode_term(snapshot, &tp.o),
                         dtc: tp.dtc.clone(),
                     }),
-                    Pattern::Optional(inner) => {
-                        Pattern::Optional(encode_patterns_for_reasoning(snapshot, inner))
-                    }
-                    Pattern::Union(branches) => Pattern::Union(
-                        branches
-                            .iter()
-                            .map(|b| encode_patterns_for_reasoning(snapshot, b))
-                            .collect(),
-                    ),
-                    Pattern::Minus(inner) => {
-                        Pattern::Minus(encode_patterns_for_reasoning(snapshot, inner))
-                    }
-                    Pattern::Exists(inner) => {
-                        Pattern::Exists(encode_patterns_for_reasoning(snapshot, inner))
-                    }
-                    Pattern::NotExists(inner) => {
-                        Pattern::NotExists(encode_patterns_for_reasoning(snapshot, inner))
-                    }
-                    Pattern::Graph { name, patterns } => Pattern::Graph {
-                        name: name.clone(),
-                        patterns: encode_patterns_for_reasoning(snapshot, patterns),
-                    },
-                    _ => p.clone(),
+                    // Don't encode IRIs across remote-endpoint or
+                    // independently-scoped boundaries: a Service block targets
+                    // a different endpoint with potentially different IRI→SID
+                    // mappings, and a Subquery is its own scope.
+                    Pattern::Service(_) | Pattern::Subquery(_) => p.clone(),
+                    other => other
+                        .clone()
+                        .map_subpatterns(&mut |xs| encode_patterns_for_reasoning(snapshot, &xs)),
                 })
                 .collect()
         }
@@ -544,8 +518,7 @@ pub async fn run_operator(
 /// Execution context configuration
 ///
 /// Specifies the optional components to add to the execution context.
-/// This eliminates duplication in the execute_prepared_* functions.
-#[derive(Default)]
+/// This is the unified knob for all query execution paths.
 pub struct ContextConfig<'a, 'b> {
     pub tracker: Option<&'a Tracker>,
     /// Policy enforcer for async policy evaluation with full f:query support.
@@ -595,44 +568,25 @@ pub struct ContextConfig<'a, 'b> {
     pub remote_service: Option<&'b dyn crate::remote_service::RemoteServiceExecutor>,
 }
 
-/// Parameters for query execution with dataset, policy, and search providers.
-///
-/// Bundles the common parameters needed for full-featured query execution
-/// to reduce argument count in execution functions.
-pub struct QueryContextParams<'a, 'b> {
-    /// Dataset for multi-ledger queries
-    pub dataset: &'a DataSet<'a>,
-    /// Policy context for access control
-    pub policy: &'a fluree_db_policy::PolicyContext,
-    /// BM25 index provider for full-text search
-    pub bm25_provider: &'b dyn crate::bm25::Bm25IndexProvider,
-    /// Vector index provider for similarity search
-    pub vector_provider: &'b dyn crate::vector::VectorIndexProvider,
-    /// Optional execution tracker
-    pub tracker: Option<&'a Tracker>,
-}
-
-impl<'a, 'b> QueryContextParams<'a, 'b> {
-    /// Create new query context parameters.
-    pub fn new(
-        dataset: &'a DataSet<'a>,
-        policy: &'a fluree_db_policy::PolicyContext,
-        bm25_provider: &'b dyn crate::bm25::Bm25IndexProvider,
-        vector_provider: &'b dyn crate::vector::VectorIndexProvider,
-    ) -> Self {
+impl Default for ContextConfig<'_, '_> {
+    fn default() -> Self {
         Self {
-            dataset,
-            policy,
-            bm25_provider,
-            vector_provider,
             tracker: None,
+            policy_enforcer: None,
+            dataset: None,
+            r2rml: None,
+            bm25_provider: None,
+            vector_provider: None,
+            from_t: None,
+            strict_bind_errors: true,
+            binary_store: None,
+            binary_g_id: 0,
+            dict_novelty: None,
+            spatial_providers: None,
+            fulltext_providers: None,
+            english_lang_id: None,
+            remote_service: None,
         }
-    }
-
-    /// Set the execution tracker.
-    pub fn with_tracker(mut self, tracker: Option<&'a Tracker>) -> Self {
-        self.tracker = tracker;
-        self
     }
 }
 
@@ -646,19 +600,16 @@ pub async fn execute_prepared<'a, 'b>(
     prepared: PreparedExecution,
     config: ContextConfig<'a, 'b>,
 ) -> Result<Vec<Batch>> {
-    // Create composite overlay if we have derived facts
     let reasoning_overlay: Option<ReasoningOverlay<'a>> = prepared
         .derived_overlay
         .as_ref()
         .map(|derived| ReasoningOverlay::new(db.overlay, derived.clone()));
 
-    // Use composite overlay if available, otherwise base overlay
     let effective_overlay: &dyn fluree_db_core::OverlayProvider = reasoning_overlay
         .as_ref()
         .map(|o| o as &dyn fluree_db_core::OverlayProvider)
         .unwrap_or(db.overlay);
 
-    // Build context with all configured options
     let mut ctx = ExecutionContext::with_time_and_overlay(
         db.snapshot,
         vars,
@@ -752,291 +703,19 @@ pub async fn execute_prepared<'a, 'b>(
     run_operator(prepared.operator, &ctx).await
 }
 
-// ============================================================================
-// Convenience wrappers for backward compatibility
-// ============================================================================
-
-/// Execute a prepared query with an overlay
-pub async fn execute_prepared_with_overlay(
-    db: GraphDbRef<'_>,
-    vars: &VarRegistry,
-    prepared: PreparedExecution,
-) -> Result<Vec<Batch>> {
-    execute_prepared(
-        db,
-        vars,
-        prepared,
-        ContextConfig {
-            strict_bind_errors: true,
-            ..Default::default()
-        },
-    )
-    .await
-}
-
-/// Execute with overlay, time bounds, and optional tracker
-pub async fn execute_prepared_with_overlay_tracked<'a>(
-    db: GraphDbRef<'a>,
-    vars: &VarRegistry,
-    prepared: PreparedExecution,
-    tracker: Option<&'a Tracker>,
-) -> Result<Vec<Batch>> {
-    execute_prepared(
-        db,
-        vars,
-        prepared,
-        ContextConfig {
-            tracker,
-            strict_bind_errors: true,
-            ..Default::default()
-        },
-    )
-    .await
-}
-
-/// Execute with overlay, time bounds, and policy (with async f:query support)
-pub async fn execute_prepared_with_policy<'a>(
-    db: GraphDbRef<'a>,
-    vars: &VarRegistry,
-    prepared: PreparedExecution,
-    policy: &'a fluree_db_policy::PolicyContext,
-    tracker: Option<&'a Tracker>,
-) -> Result<Vec<Batch>> {
-    // Create policy enforcer for async f:query support
-    let enforcer = Arc::new(crate::policy::QueryPolicyEnforcer::new(Arc::new(
-        policy.clone(),
-    )));
-
-    execute_prepared(
-        db,
-        vars,
-        prepared,
-        ContextConfig {
-            tracker,
-            policy_enforcer: Some(enforcer),
-            strict_bind_errors: true,
-            ..Default::default()
-        },
-    )
-    .await
-}
-
-/// Execute with overlay, time bounds, tracker, and R2RML providers
-pub async fn execute_prepared_with_r2rml<'a, 'b>(
-    db: GraphDbRef<'a>,
-    vars: &VarRegistry,
-    prepared: PreparedExecution,
-    tracker: &'a Tracker,
-    r2rml_provider: &'b dyn crate::r2rml::R2rmlProvider,
-    r2rml_table_provider: &'b dyn crate::r2rml::R2rmlTableProvider,
-) -> Result<Vec<Batch>> {
-    execute_prepared(
-        db,
-        vars,
-        prepared,
-        ContextConfig {
-            tracker: Some(tracker),
-            r2rml: Some((r2rml_provider, r2rml_table_provider)),
-            strict_bind_errors: true,
-            ..Default::default()
-        },
-    )
-    .await
-}
-
-/// Execute with dataset (multi-graph query)
-pub async fn execute_prepared_with_dataset<'a>(
-    db: GraphDbRef<'a>,
-    vars: &VarRegistry,
-    prepared: PreparedExecution,
-    dataset: &'a DataSet<'a>,
-    tracker: Option<&'a Tracker>,
-) -> Result<Vec<Batch>> {
-    execute_prepared_with_dataset_history(db, vars, prepared, dataset, tracker).await
-}
-
-/// Execute against a prepared dataset query.
+/// Prepare and execute a query in a single call.
 ///
-/// History mode is captured at planner-time inside `prepared` (see
-/// `prepare_execution_with_config` and `PrepareConfig::history`) — there is
-/// no execution-time history toggle. The function name is preserved for
-/// API stability; behavior is identical to `execute_prepared_with_dataset`.
-pub async fn execute_prepared_with_dataset_history<'a>(
+/// This is the canonical one-call entry point for callers that don't need to
+/// separate preparation from execution. Callers that want to inspect or share
+/// a `PreparedExecution` (for example, the view layer's eager + tracked
+/// variants) should call [`prepare_execution`] / [`prepare_execution_with_config`]
+/// and then [`execute_prepared`] explicitly.
+pub async fn execute<'a>(
     db: GraphDbRef<'a>,
     vars: &VarRegistry,
-    prepared: PreparedExecution,
-    dataset: &'a DataSet<'a>,
-    tracker: Option<&'a Tracker>,
+    query: &ExecutableQuery,
+    config: ContextConfig<'a, '_>,
 ) -> Result<Vec<Batch>> {
-    execute_prepared(
-        db,
-        vars,
-        prepared,
-        ContextConfig {
-            tracker,
-            dataset: Some(dataset),
-            strict_bind_errors: true,
-            ..Default::default()
-        },
-    )
-    .await
-}
-
-/// Execute with dataset and policy
-pub async fn execute_prepared_with_dataset_and_policy<'a>(
-    db: GraphDbRef<'a>,
-    vars: &VarRegistry,
-    prepared: PreparedExecution,
-    dataset: &'a DataSet<'a>,
-    policy: &'a fluree_db_policy::PolicyContext,
-    tracker: Option<&'a Tracker>,
-) -> Result<Vec<Batch>> {
-    execute_prepared_with_dataset_and_policy_history(db, vars, prepared, dataset, policy, tracker)
-        .await
-}
-
-/// Execute with dataset and policy.
-///
-/// History mode is captured at planner-time inside `prepared` — see
-/// `execute_prepared_with_dataset_history` for the analogous note.
-pub async fn execute_prepared_with_dataset_and_policy_history<'a>(
-    db: GraphDbRef<'a>,
-    vars: &VarRegistry,
-    prepared: PreparedExecution,
-    dataset: &'a DataSet<'a>,
-    policy: &'a fluree_db_policy::PolicyContext,
-    tracker: Option<&'a Tracker>,
-) -> Result<Vec<Batch>> {
-    // Create policy enforcer for async f:query support
-    let enforcer = Arc::new(crate::policy::QueryPolicyEnforcer::new(Arc::new(
-        policy.clone(),
-    )));
-
-    execute_prepared(
-        db,
-        vars,
-        prepared,
-        ContextConfig {
-            tracker,
-            policy_enforcer: Some(enforcer),
-            dataset: Some(dataset),
-            strict_bind_errors: true,
-            ..Default::default()
-        },
-    )
-    .await
-}
-
-/// Execute with dataset and BM25 provider (for graph source BM25 queries)
-pub async fn execute_prepared_with_dataset_and_bm25<'a>(
-    db: GraphDbRef<'a>,
-    vars: &VarRegistry,
-    prepared: PreparedExecution,
-    dataset: &'a DataSet<'a>,
-    bm25_provider: &dyn crate::bm25::Bm25IndexProvider,
-    tracker: Option<&'a Tracker>,
-) -> Result<Vec<Batch>> {
-    execute_prepared(
-        db,
-        vars,
-        prepared,
-        ContextConfig {
-            tracker,
-            dataset: Some(dataset),
-            bm25_provider: Some(bm25_provider),
-            strict_bind_errors: true,
-            ..Default::default()
-        },
-    )
-    .await
-}
-
-/// Execute with dataset, policy, and BM25 provider (for graph source BM25 queries with policy)
-pub async fn execute_prepared_with_dataset_and_policy_and_bm25<'a>(
-    db: GraphDbRef<'a>,
-    vars: &VarRegistry,
-    prepared: PreparedExecution,
-    dataset: &'a DataSet<'a>,
-    policy: &'a fluree_db_policy::PolicyContext,
-    bm25_provider: &dyn crate::bm25::Bm25IndexProvider,
-    tracker: Option<&'a Tracker>,
-) -> Result<Vec<Batch>> {
-    // Create policy enforcer for async f:query support
-    let enforcer = Arc::new(crate::policy::QueryPolicyEnforcer::new(Arc::new(
-        policy.clone(),
-    )));
-
-    execute_prepared(
-        db,
-        vars,
-        prepared,
-        ContextConfig {
-            tracker,
-            policy_enforcer: Some(enforcer),
-            dataset: Some(dataset),
-            bm25_provider: Some(bm25_provider),
-            strict_bind_errors: true,
-            ..Default::default()
-        },
-    )
-    .await
-}
-
-/// Execute with dataset and both BM25 and vector providers (for graph source queries)
-pub async fn execute_prepared_with_dataset_and_providers<'a, 'b>(
-    db: GraphDbRef<'a>,
-    vars: &VarRegistry,
-    prepared: PreparedExecution,
-    dataset: &'a DataSet<'a>,
-    bm25_provider: &'b dyn crate::bm25::Bm25IndexProvider,
-    vector_provider: &'b dyn crate::vector::VectorIndexProvider,
-    tracker: Option<&'a Tracker>,
-) -> Result<Vec<Batch>> {
-    execute_prepared(
-        db,
-        vars,
-        prepared,
-        ContextConfig {
-            tracker,
-            dataset: Some(dataset),
-            bm25_provider: Some(bm25_provider),
-            vector_provider: Some(vector_provider),
-            strict_bind_errors: true,
-            ..Default::default()
-        },
-    )
-    .await
-}
-
-/// Execute with dataset, policy, and both BM25 and vector providers
-#[allow(
-    clippy::elidable_lifetime_names,
-    reason = "named lifetimes document the 'a/'b relationship between the db ref and context params"
-)]
-pub async fn execute_prepared_with_dataset_and_policy_and_providers<'a, 'b>(
-    db: GraphDbRef<'a>,
-    vars: &VarRegistry,
-    prepared: PreparedExecution,
-    params: QueryContextParams<'a, 'b>,
-) -> Result<Vec<Batch>> {
-    // Create policy enforcer for async f:query support
-    let enforcer = Arc::new(crate::policy::QueryPolicyEnforcer::new(Arc::new(
-        params.policy.clone(),
-    )));
-
-    execute_prepared(
-        db,
-        vars,
-        prepared,
-        ContextConfig {
-            tracker: params.tracker,
-            policy_enforcer: Some(enforcer),
-            dataset: Some(params.dataset),
-            bm25_provider: Some(params.bm25_provider),
-            vector_provider: Some(params.vector_provider),
-            strict_bind_errors: true,
-            ..Default::default()
-        },
-    )
-    .await
+    let prepared = prepare_execution(db, query).await?;
+    execute_prepared(db, vars, prepared, config).await
 }

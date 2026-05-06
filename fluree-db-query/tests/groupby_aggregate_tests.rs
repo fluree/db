@@ -10,7 +10,7 @@ use fluree_db_core::{FlakeValue, GraphDbRef, LedgerSnapshot, NoOverlay, Sid};
 use fluree_db_query::aggregate::{AggregateFn, AggregateSpec};
 use fluree_db_query::binding::Binding;
 use fluree_db_query::context::ExecutionContext;
-use fluree_db_query::execute::{execute_with_overlay, ExecutableQuery};
+use fluree_db_query::execute::{execute, ContextConfig, ExecutableQuery};
 use fluree_db_query::groupby::GroupByOperator;
 use fluree_db_query::ir::{Expression, FilterValue, Pattern};
 use fluree_db_query::operator::Operator;
@@ -106,7 +106,9 @@ async fn test_group_by_with_count() {
 
     let db = GraphDbRef::new(&snapshot, 0, &NoOverlay, snapshot.t);
     let executable = ExecutableQuery::new(query, options);
-    let results = execute_with_overlay(db, &vars, &executable).await.unwrap();
+    let results = execute(db, &vars, &executable, ContextConfig::default())
+        .await
+        .unwrap();
 
     // Expect 2 groups: NYC (count=2), LA (count=3)
     let total_rows: usize = results.iter().map(fluree_db_query::Batch::len).sum();
@@ -180,7 +182,9 @@ async fn test_group_by_with_sum() {
 
     let db = GraphDbRef::new(&snapshot, 0, &NoOverlay, snapshot.t);
     let executable = ExecutableQuery::new(query, options);
-    let results = execute_with_overlay(db, &vars, &executable).await.unwrap();
+    let results = execute(db, &vars, &executable, ContextConfig::default())
+        .await
+        .unwrap();
 
     // Collect results
     let mut sums: Vec<(String, i64)> = Vec::new();
@@ -264,7 +268,9 @@ async fn test_group_by_with_having() {
 
     let db = GraphDbRef::new(&snapshot, 0, &NoOverlay, snapshot.t);
     let executable = ExecutableQuery::new(query, options);
-    let results = execute_with_overlay(db, &vars, &executable).await.unwrap();
+    let results = execute(db, &vars, &executable, ContextConfig::default())
+        .await
+        .unwrap();
 
     // Only LA should remain (count=3 > 2)
     let total_rows: usize = results.iter().map(fluree_db_query::Batch::len).sum();
@@ -312,7 +318,9 @@ async fn test_aggregates_without_group_by() {
 
     let db = GraphDbRef::new(&snapshot, 0, &NoOverlay, snapshot.t);
     let executable = ExecutableQuery::new(query, options);
-    let results = execute_with_overlay(db, &vars, &executable).await.unwrap();
+    let results = execute(db, &vars, &executable, ContextConfig::default())
+        .await
+        .unwrap();
 
     // Should have 1 row with sum=60
     let total_rows: usize = results.iter().map(fluree_db_query::Batch::len).sum();
@@ -454,7 +462,9 @@ async fn test_aggregate_avg() {
 
     let db = GraphDbRef::new(&snapshot, 0, &NoOverlay, snapshot.t);
     let executable = ExecutableQuery::new(query, options);
-    let results = execute_with_overlay(db, &vars, &executable).await.unwrap();
+    let results = execute(db, &vars, &executable, ContextConfig::default())
+        .await
+        .unwrap();
 
     // Should have 1 row with avg=20.0
     let avg = results[0].get_by_col(0, 1);
@@ -514,7 +524,9 @@ async fn test_aggregate_min_max() {
 
     let db = GraphDbRef::new(&snapshot, 0, &NoOverlay, snapshot.t);
     let executable = ExecutableQuery::new(query, options);
-    let results = execute_with_overlay(db, &vars, &executable).await.unwrap();
+    let results = execute(db, &vars, &executable, ContextConfig::default())
+        .await
+        .unwrap();
 
     // Should have 1 row with min=10, max=50
     let min = results[0].get_by_col(0, 1);
@@ -565,7 +577,7 @@ async fn test_order_by_on_grouped_var_errors() {
 
     let db = GraphDbRef::new(&snapshot, 0, &NoOverlay, snapshot.t);
     let executable = ExecutableQuery::new(query, options);
-    let err = execute_with_overlay(db, &vars, &executable)
+    let err = execute(db, &vars, &executable, ContextConfig::default())
         .await
         .unwrap_err();
     assert!(
@@ -609,7 +621,7 @@ async fn test_aggregate_on_group_by_key_errors() {
 
     let db = GraphDbRef::new(&snapshot, 0, &NoOverlay, snapshot.t);
     let executable = ExecutableQuery::new(query, options);
-    let err = execute_with_overlay(db, &vars, &executable)
+    let err = execute(db, &vars, &executable, ContextConfig::default())
         .await
         .unwrap_err();
     assert!(

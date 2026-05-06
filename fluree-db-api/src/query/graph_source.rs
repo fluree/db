@@ -1,3 +1,4 @@
+use fluree_db_query::{execute, ContextConfig};
 use serde_json::Value as JsonValue;
 
 use crate::query::helpers::{build_query_result, parse_jsonld_query, parse_sparql_to_ir};
@@ -76,13 +77,15 @@ impl Fluree {
         let r2rml_provider = crate::r2rml_provider!(self);
         let tracker = crate::Tracker::disabled();
         let db = ledger.as_graph_db_ref(0);
-        let batches = crate::execute_with_r2rml(
+        let batches = execute(
             db,
             &vars,
             &executable,
-            &tracker,
-            &r2rml_provider,
-            &r2rml_provider,
+            ContextConfig {
+                tracker: Some(&tracker),
+                r2rml: Some((&r2rml_provider, &r2rml_provider)),
+                ..Default::default()
+            },
         )
         .await?;
 
@@ -109,13 +112,15 @@ impl Fluree {
         let r2rml_provider = crate::r2rml_provider!(self);
         let tracker = crate::Tracker::disabled();
         let db = ledger.as_graph_db_ref(0);
-        let batches = crate::execute_with_r2rml(
+        let batches = execute(
             db,
             &vars,
             &executable,
-            &tracker,
-            &r2rml_provider,
-            &r2rml_provider,
+            ContextConfig {
+                tracker: Some(&tracker),
+                r2rml: Some((&r2rml_provider, &r2rml_provider)),
+                ..Default::default()
+            },
         )
         .await?;
 

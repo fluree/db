@@ -1327,6 +1327,46 @@ pub enum Pattern {
 }
 
 impl Pattern {
+    /// Apply `f` once to every immediate nested pattern list inside this
+    /// pattern, reconstructing the surrounding container around the result.
+    ///
+    /// This walks every variant that is structurally a container of
+    /// `Vec<Pattern>` — Optional, Minus, Exists, NotExists, Graph, Service,
+    /// Subquery — plus each branch of Union (`f` is called per branch). Leaf
+    /// variants (Triple, Filter, Bind, Values, PropertyPath, IndexSearch,
+    /// VectorSearch, R2rml, GeoSearch, S2Search) pass through unchanged.
+    ///
+    /// The IR is honest about what's a container; callers decide which
+    /// containers their semantics permit recursing into. A site that does
+    /// not want to descend into, say, `Pattern::Service` (because the inner
+    /// patterns target a remote endpoint) intercepts that variant in its
+    /// own match arms before falling through to `map_subpatterns`.
+    pub fn map_subpatterns<F>(self, f: &mut F) -> Self
+    where
+        F: FnMut(Vec<Pattern>) -> Vec<Pattern>,
+    {
+        match self {
+            Pattern::Optional(inner) => Pattern::Optional(f(inner)),
+            Pattern::Minus(inner) => Pattern::Minus(f(inner)),
+            Pattern::Exists(inner) => Pattern::Exists(f(inner)),
+            Pattern::NotExists(inner) => Pattern::NotExists(f(inner)),
+            Pattern::Union(branches) => Pattern::Union(branches.into_iter().map(&mut *f).collect()),
+            Pattern::Graph { name, patterns } => Pattern::Graph {
+                name,
+                patterns: f(patterns),
+            },
+            Pattern::Service(sp) => Pattern::Service(ServicePattern {
+                patterns: f(sp.patterns),
+                ..sp
+            }),
+            Pattern::Subquery(sp) => Pattern::Subquery(SubqueryPattern {
+                patterns: f(sp.patterns),
+                ..sp
+            }),
+            other => other,
+        }
+    }
+
     /// Check if this is a triple pattern
     pub fn is_triple(&self) -> bool {
         matches!(self, Pattern::Triple(_))

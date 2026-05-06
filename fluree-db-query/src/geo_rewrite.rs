@@ -37,25 +37,18 @@ fn rewrite_recursive<F>(patterns: Vec<Pattern>, encode_iri: &F) -> Vec<Pattern>
 where
     F: Fn(&str) -> Option<Sid>,
 {
-    // 1. Recurse into nested scopes first
+    // 1. Recurse into nested scopes first.
+    //
+    // Service and Subquery are intentionally not rewritten: the geo rewrite
+    // produces `Pattern::GeoSearch`, which depends on the local binary
+    // GeoPoint index. A Service block targets a remote endpoint (no such
+    // index), and a Subquery is its own scope that the parent should not
+    // mutate in place.
     let patterns: Vec<Pattern> = patterns
         .into_iter()
         .map(|p| match p {
-            Pattern::Optional(inner) => Pattern::Optional(rewrite_recursive(inner, encode_iri)),
-            Pattern::Union(branches) => Pattern::Union(
-                branches
-                    .into_iter()
-                    .map(|b| rewrite_recursive(b, encode_iri))
-                    .collect(),
-            ),
-            Pattern::Graph { name, patterns } => Pattern::Graph {
-                name,
-                patterns: rewrite_recursive(patterns, encode_iri),
-            },
-            Pattern::Minus(inner) => Pattern::Minus(rewrite_recursive(inner, encode_iri)),
-            Pattern::Exists(inner) => Pattern::Exists(rewrite_recursive(inner, encode_iri)),
-            Pattern::NotExists(inner) => Pattern::NotExists(rewrite_recursive(inner, encode_iri)),
-            other => other,
+            Pattern::Service(_) | Pattern::Subquery(_) => p,
+            other => other.map_subpatterns(&mut |xs| rewrite_recursive(xs, encode_iri)),
         })
         .collect();
 

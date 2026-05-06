@@ -20,13 +20,24 @@ use std::sync::Arc;
 
 // Additional imports for engine-level E2E tests
 use fluree_db_api::{
-    execute_with_r2rml, ExecutableQuery, FlureeBuilder, ParsedContext, Pattern, VarRegistry,
+    execute, ContextConfig, ExecutableQuery, FlureeBuilder, ParsedContext, Pattern, VarRegistry,
 };
 use fluree_db_core::{GraphDbRef, NoOverlay, Tracker};
 use fluree_db_query::ir::GraphName;
 use fluree_db_query::parse::{ParsedQuery, QueryOutput};
 use fluree_db_query::triple::{Ref, Term, TriplePattern};
 use support::genesis_ledger;
+
+fn r2rml_test_config<'a, P: R2rmlProvider + R2rmlTableProvider>(
+    tracker: &'a Tracker,
+    provider: &'a P,
+) -> ContextConfig<'a, 'a> {
+    ContextConfig {
+        tracker: Some(tracker),
+        r2rml: Some((provider, provider)),
+        ..Default::default()
+    }
+}
 
 // =============================================================================
 // Mock R2RML Provider for Testing
@@ -441,13 +452,11 @@ async fn e2e_r2rml_query_iceberg_table() {
     eprintln!("Executing query against Iceberg...");
 
     // Execute query
-    let result = execute_with_r2rml(
+    let result = execute(
         GraphDbRef::new(&ledger.snapshot, 0, &NoOverlay, ledger.t()),
         &vars,
         &executable,
-        &tracker,
-        &provider,
-        &provider,
+        r2rml_test_config(&tracker, &provider),
     )
     .await;
 
@@ -1089,13 +1098,11 @@ async fn engine_e2e_graph_pattern_r2rml_scan() {
     let tracker = Tracker::disabled();
 
     // Execute with our mock R2RML provider
-    let batches = execute_with_r2rml(
+    let batches = execute(
         GraphDbRef::new(&ledger.snapshot, 0, &NoOverlay, ledger.t()),
         &vars,
         &executable,
-        &tracker,
-        &provider,
-        &provider,
+        r2rml_test_config(&tracker, &provider),
     )
     .await
     .expect("Query execution should succeed");
@@ -1207,13 +1214,11 @@ async fn engine_e2e_provider_method_calls() {
     let tracker = Tracker::disabled();
 
     // Execute query - should succeed
-    let result = execute_with_r2rml(
+    let result = execute(
         GraphDbRef::new(&ledger.snapshot, 0, &NoOverlay, ledger.t()),
         &vars,
         &executable,
-        &tracker,
-        &provider,
-        &provider,
+        r2rml_test_config(&tracker, &provider),
     )
     .await;
 
@@ -1842,13 +1847,11 @@ async fn engine_e2e_ref_object_map_join_execution() {
     let tracker = Tracker::disabled();
 
     // Execute query
-    let batches = execute_with_r2rml(
+    let batches = execute(
         GraphDbRef::new(&ledger.snapshot, 0, &NoOverlay, ledger.t()),
         &vars,
         &executable,
-        &tracker,
-        &provider,
-        &provider,
+        r2rml_test_config(&tracker, &provider),
     )
     .await
     .expect("Query execution should succeed");
