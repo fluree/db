@@ -8,10 +8,6 @@ data based on ontology declarations (RDFS and OWL) or user-defined rules
 [OWL & RDFS reference](../reference/owl-rdfs-support.md) for a full list of
 supported constructs.
 
-> **Status:** Reasoning is an **experimental** feature. See
-> [Standards and feature flags](../reference/compatibility.md) for how to
-> enable it.
-
 ## Why reasoning?
 
 In a plain triple store every fact must be stated explicitly. If you assert that

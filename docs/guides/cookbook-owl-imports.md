@@ -19,9 +19,8 @@ A runnable end-to-end script lives at
 [`cookbook-owl-imports.sh`](cookbook-owl-imports.sh) — it executes every
 command in this tutorial and asserts the expected rows.
 
-> Reasoning is currently **experimental**. See
-> [Reasoning and inference](../concepts/reasoning.md) for background and
-> [Setting groups → reasoningDefaults](../ledger-config/setting-groups.md)
+> See [Reasoning and inference](../concepts/reasoning.md) for background
+> and [Setting groups → reasoningDefaults](../ledger-config/setting-groups.md)
 > for the full config schema.
 
 ---

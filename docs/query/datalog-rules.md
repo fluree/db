@@ -9,10 +9,6 @@ For background concepts see [Reasoning and inference](../concepts/reasoning.md);
 for enabling reasoning in queries see
 [Query-time reasoning](reasoning.md).
 
-> **Status:** Reasoning is an **experimental** feature. See
-> [Standards and feature flags](../reference/compatibility.md) for how to
-> enable it.
-
 ## Quick example
 
 Infer a `grandparent` relationship from two `parent` hops:
