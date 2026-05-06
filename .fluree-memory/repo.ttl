@@ -1303,21 +1303,31 @@ mem:fact-01kqfy6txdrjppaf6756xzdz25 a mem:Fact ;
     mem:rationale "Captures the design contract and arena-bloat semantics from PR #1211 so future callers of bulk_apply_commits don't accidentally wire it into a hot-path mutation site." .
 
 mem:constraint-01kjte29y3cp8mae56xy6yfv2n a mem:Constraint ;
-    mem:content "SPARQL↔JSON-LD Parity: both compile to the same IR (fluree-db-query/src/ir.rs) and share the entire execution engine. When adding SPARQL features: (1) shared IR changes already affect JSON-LD — verify JSON-LD tests pass, (2) if expressible in JSON-LD, add parallel tests, (3) execution path missing in JSON-LD lower → track follow-up.\n\nSPARQL tests: it_query_sparql.rs | JSON-LD tests: it_query.rs, it_query_analytical.rs, it_query_grouping.rs\nValidate: `cd testsuite-sparql && make test-eval-cat CAT=<cat>` then `cargo test -p fluree-db-api --test it_query`" ;
+    mem:content "SPARQL↔JSON-LD parity workflow — for each failing W3C test, classify before fixing:\n\nTier A (SPARQL surface only): equivalent JSON-LD query already works → fix only fluree-db-sparql/src/lower/ or parser. No JSON-LD parity test needed.\n\nTier B (shared IR/engine): equivalent JSON-LD query also fails → fix shared engine + both lowering paths. Add parallel JSON-LD test in it_query*.rs.\n\nTier C (SPARQL-only): effectively empty. Default assumption: any SPARQL characteristic IS expressible in JSON-LD. Before claiming Tier C, audit fluree-db-query/src/parse/ thoroughly and DISCUSS with user. \"Missing JSON-LD lowering\" is a parity gap to fix, not skip.\n\nWorkflow: read .rq + expected → write JSON-LD probe → run → A if passes, B if fails, C only after audit + user signoff." ;
     mem:tag "compliance" ;
     mem:tag "constraint" ;
     mem:tag "jsonld" ;
-    mem:tag "must-check" ;
     mem:tag "parity" ;
     mem:tag "sparql" ;
     mem:tag "testing" ;
+    mem:tag "tier" ;
+    mem:tag "workflow" ;
     mem:scope mem:repo ;
     mem:severity "must" ;
-    mem:artifactRef "fluree-db-api/tests/it_query.rs" ;
+    mem:artifactRef "docs/contributing/sparql-compliance.md" ;
+    mem:artifactRef "fluree-db-api/tests/it_query_aggregates.rs" ;
+    mem:artifactRef "fluree-db-api/tests/it_query_ask.rs" ;
+    mem:artifactRef "fluree-db-api/tests/it_query_construct.rs" ;
+    mem:artifactRef "fluree-db-api/tests/it_query_negation.rs" ;
+    mem:artifactRef "fluree-db-api/tests/it_query_property_path.rs" ;
     mem:artifactRef "fluree-db-api/tests/it_query_sparql.rs" ;
+    mem:artifactRef "fluree-db-api/tests/it_query_subquery.rs" ;
+    mem:artifactRef "fluree-db-api/tests/it_query_values.rs" ;
     mem:artifactRef "fluree-db-query/src/ir.rs" ;
+    mem:artifactRef "fluree-db-sparql/src/lower/" ;
     mem:branch "main" ;
-    mem:createdAt "2026-03-03T18:06:20.611062+00:00"^^xsd:dateTime .
+    mem:createdAt "2026-03-03T18:06:20.611062+00:00"^^xsd:dateTime ;
+    mem:rationale "User principle (2026-05-06): nearly all SPARQL characteristics should be expressible in JSON-LD. Treating things as SPARQL-only when they're really JSON-LD lowering gaps silently rots parity and produces single-surface test coverage." .
 
 mem:fact-01kjte0r70p5ppv4cjkfyyedpe a mem:Fact ;
     mem:content "SPARQL Testsuite critical gotchas:\n- MUST `cd testsuite-sparql/` first — excluded from workspace, `cargo test -p testsuite-sparql` from root FAILS\n- Syntax tests run by default; eval tests need `--include-ignored`\n- Each test runs in subprocess with 5s/10s timeouts — panics show as \"Subprocess error\"\n- W3C data in git submodule `rdf-tests/`; URL→local: strip `https://w3c.github.io/rdf-tests/`, prepend `testsuite-sparql/rdf-tests/`\n- `make investigate` only searches syntax report — use `make investigate-eval` for eval failures\n- Key commands: `make count-eval`, `make test-eval-cat CAT=functions`, `make summary`, `make classify`" ;
@@ -1682,3 +1692,18 @@ mem:fact-01kpm3sz8pxzakzcj4r8xx687v a mem:Fact ;
     mem:branch "misc/fixes" ;
     mem:createdAt "2026-04-20T00:14:22.486023+00:00"^^xsd:dateTime ;
     mem:rationale "This is a subtle semi-naive reasoning invariant; future restriction or chain work could easily reintroduce the bug by splitting lookups across delta and derived." .
+
+mem:fact-01kqzf90xxh2nx4fxvs4mdnczy a mem:Fact ;
+    mem:content "testsuite-sparql/rdf-tests is a git submodule. After fresh clone or worktree creation, must run `git submodule update --init --recursive testsuite-sparql/rdf-tests` before any eval/syntax tests work — otherwise tests fail reading manifests, and the Makefile silently swallows the cargo error via `> /dev/null 2>&1` so report-eval-json appears to succeed but writes no JSON. Submodule sha: efccbc6b8d15fb519f6532f541d62418f2a8eee6." ;
+    mem:tag "gotcha" ;
+    mem:tag "setup" ;
+    mem:tag "submodule" ;
+    mem:tag "testsuite-sparql" ;
+    mem:tag "w3c" ;
+    mem:tag "worktree" ;
+    mem:scope mem:repo ;
+    mem:artifactRef ".gitmodules" ;
+    mem:artifactRef "testsuite-sparql/Makefile" ;
+    mem:artifactRef "testsuite-sparql/rdf-tests" ;
+    mem:branch "sparql-tests" ;
+    mem:createdAt "2026-05-06T20:22:10.621406+00:00"^^xsd:dateTime .

@@ -196,10 +196,15 @@ impl<'a, E: IriEncoder> LoweringContext<'a, E> {
                 // Aggregate aliases referenced by SELECT expressions (for post-aggregation binds)
                 let aggregate_aliases = self.collect_aggregate_alias_names(&select_query.select);
 
-                // Lower SELECT expression bindings (e.g., SELECT (SHA512(?x) AS ?hash))
+                // Lower SELECT expression bindings (e.g., SELECT (SHA512(?x) AS ?hash)).
+                // For inline aggregates inside non-aggregate SELECT expressions like
+                // `((MIN(?p) + MAX(?p)) / 2 AS ?c)`, this also returns hoisted
+                // aggregate specs (with synthetic ?__select_agg_N aliases) and any
+                // pre-aggregation BINDs needed for their computed inputs.
                 let select_binds =
                     self.lower_select_expression_binds(&select_query.select, &aggregate_aliases)?;
                 patterns.extend(select_binds.pre);
+                patterns.extend(select_binds.hoisted_agg_binds);
 
                 // Lower post-query VALUES clause.  Stored in `post_values` (not
                 // in `patterns`) so the WHERE-clause planner cannot reorder it
@@ -226,6 +231,10 @@ impl<'a, E: IriEncoder> LoweringContext<'a, E> {
                 patterns.extend(lowered_modifiers.pre_group_binds);
                 let mut options = lowered_modifiers.options;
                 options.post_binds = select_binds.post;
+                // Aggregates hoisted from non-aggregate SELECT expressions
+                // (e.g. `((MIN(?p) + MAX(?p)) / 2 AS ?c)`) must run alongside
+                // explicit SELECT aggregates and any HAVING-hoisted aggregates.
+                options.aggregates.extend(select_binds.hoisted_aggregates);
 
                 // Build a JSON-LD-like context from SPARQL prologue prefixes so formatters can compact IRIs.
                 let ctx = self.build_jsonld_context()?;

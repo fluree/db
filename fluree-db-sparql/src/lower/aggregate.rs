@@ -246,12 +246,23 @@ impl<E: IriEncoder> LoweringContext<'_, E> {
         })
     }
 
-    pub(super) fn collect_having_aggregates(
+    /// Walk an expression and hoist every inline `Expression::Aggregate` node
+    /// into `aggregates` with a synthetic alias variable, recording the alias
+    /// in `aliases` keyed by `aggregate_key` for dedup. The aggregate's input
+    /// (if any) is materialized as a pre-aggregation BIND in `pre_binds` when
+    /// it is not already a bare variable.
+    ///
+    /// `synthetic_prefix` controls the synthetic alias name (e.g. `"?__having_agg_"`
+    /// for HAVING, `"?__select_agg_"` for inline aggregates inside non-aggregate
+    /// SELECT expressions). Recursing into nested aggregates is intentionally
+    /// blocked — SPARQL forbids `AGG(AGG(...))`.
+    pub(super) fn collect_inline_aggregates(
         &mut self,
         expr: &Expression,
         aliases: &mut HashMap<String, VarId>,
         aggregates: &mut Vec<AggregateSpec>,
         pre_binds: &mut Vec<Pattern>,
+        synthetic_prefix: &str,
     ) -> Result<()> {
         match expr.unwrap_bracketed() {
             agg @ Expression::Aggregate { .. } => {
@@ -259,7 +270,7 @@ impl<E: IriEncoder> LoweringContext<'_, E> {
                 if !aliases.contains_key(&key) {
                     let output_var = self
                         .vars
-                        .get_or_insert(&format!("?__having_agg_{}", aliases.len()));
+                        .get_or_insert(&format!("{synthetic_prefix}{}", aliases.len()));
                     let spec = self.aggregate_spec_from_expr(agg, output_var, pre_binds)?;
                     aliases.insert(key, output_var);
                     aggregates.push(spec);
@@ -267,16 +278,38 @@ impl<E: IriEncoder> LoweringContext<'_, E> {
                 Ok(())
             }
             Expression::Binary { left, right, .. } => {
-                self.collect_having_aggregates(left, aliases, aggregates, pre_binds)?;
-                self.collect_having_aggregates(right, aliases, aggregates, pre_binds)?;
+                self.collect_inline_aggregates(
+                    left,
+                    aliases,
+                    aggregates,
+                    pre_binds,
+                    synthetic_prefix,
+                )?;
+                self.collect_inline_aggregates(
+                    right,
+                    aliases,
+                    aggregates,
+                    pre_binds,
+                    synthetic_prefix,
+                )?;
                 Ok(())
             }
-            Expression::Unary { operand, .. } => {
-                self.collect_having_aggregates(operand, aliases, aggregates, pre_binds)
-            }
+            Expression::Unary { operand, .. } => self.collect_inline_aggregates(
+                operand,
+                aliases,
+                aggregates,
+                pre_binds,
+                synthetic_prefix,
+            ),
             Expression::FunctionCall { args, .. } => {
                 for arg in args {
-                    self.collect_having_aggregates(arg, aliases, aggregates, pre_binds)?;
+                    self.collect_inline_aggregates(
+                        arg,
+                        aliases,
+                        aggregates,
+                        pre_binds,
+                        synthetic_prefix,
+                    )?;
                 }
                 Ok(())
             }
@@ -286,20 +319,56 @@ impl<E: IriEncoder> LoweringContext<'_, E> {
                 else_expr,
                 ..
             } => {
-                self.collect_having_aggregates(condition, aliases, aggregates, pre_binds)?;
-                self.collect_having_aggregates(then_expr, aliases, aggregates, pre_binds)?;
-                self.collect_having_aggregates(else_expr, aliases, aggregates, pre_binds)
+                self.collect_inline_aggregates(
+                    condition,
+                    aliases,
+                    aggregates,
+                    pre_binds,
+                    synthetic_prefix,
+                )?;
+                self.collect_inline_aggregates(
+                    then_expr,
+                    aliases,
+                    aggregates,
+                    pre_binds,
+                    synthetic_prefix,
+                )?;
+                self.collect_inline_aggregates(
+                    else_expr,
+                    aliases,
+                    aggregates,
+                    pre_binds,
+                    synthetic_prefix,
+                )
             }
             Expression::Coalesce { args, .. } => {
                 for arg in args {
-                    self.collect_having_aggregates(arg, aliases, aggregates, pre_binds)?;
+                    self.collect_inline_aggregates(
+                        arg,
+                        aliases,
+                        aggregates,
+                        pre_binds,
+                        synthetic_prefix,
+                    )?;
                 }
                 Ok(())
             }
             Expression::In { expr, list, .. } => {
-                self.collect_having_aggregates(expr, aliases, aggregates, pre_binds)?;
+                self.collect_inline_aggregates(
+                    expr,
+                    aliases,
+                    aggregates,
+                    pre_binds,
+                    synthetic_prefix,
+                )?;
                 for arg in list {
-                    self.collect_having_aggregates(arg, aliases, aggregates, pre_binds)?;
+                    self.collect_inline_aggregates(
+                        arg,
+                        aliases,
+                        aggregates,
+                        pre_binds,
+                        synthetic_prefix,
+                    )?;
                 }
                 Ok(())
             }

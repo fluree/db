@@ -29,6 +29,14 @@ pub(super) struct SelectBinds {
     pub pre: Vec<Pattern>,
     /// Post-aggregation binds (var, expr) to apply after GROUP BY
     pub post: Vec<(VarId, Expression)>,
+    /// Aggregate specs hoisted out of non-aggregate SELECT expressions like
+    /// `((MIN(?p) + MAX(?p)) / 2 AS ?c)` — must be merged into
+    /// `QueryOptions.aggregates` so the engine actually computes them.
+    pub hoisted_aggregates: Vec<AggregateSpec>,
+    /// Pre-aggregation BIND patterns produced when a hoisted aggregate's input
+    /// is a computed expression (e.g. `SUM(YEAR(?d))` → BIND `?__agg_expr_N` first).
+    /// These must be injected into the WHERE pattern list before grouping.
+    pub hoisted_agg_binds: Vec<Pattern>,
 }
 
 /// Result of lowering solution modifiers.
@@ -83,6 +91,18 @@ impl<E: IriEncoder> LoweringContext<'_, E> {
     }
 
     /// Lower non-aggregate SELECT expressions to BIND patterns (pre or post aggregation).
+    ///
+    /// Three cases per SELECT expression `(expr AS ?alias)` (with `expr` not
+    /// itself an aggregate — those are handled by `extract_aggregates`):
+    ///
+    /// 1. `expr` references an aggregate alias name (e.g. `?avg + 1` where
+    ///    `?avg` is `(AVG(?x) AS ?avg)`) → post-aggregation BIND.
+    /// 2. `expr` contains *inline* `Expression::Aggregate` nodes
+    ///    (e.g. `(MIN(?p) + MAX(?p)) / 2`) → hoist each inline aggregate as a
+    ///    synthetic spec, lower with the alias map populated so the engine's
+    ///    expression layer substitutes synthetic vars for inline aggregates,
+    ///    then route as post-aggregation BIND.
+    /// 3. `expr` references neither → ordinary pre-aggregation BIND.
     pub(super) fn lower_select_expression_binds(
         &mut self,
         clause: &SelectClause,
@@ -90,6 +110,14 @@ impl<E: IriEncoder> LoweringContext<'_, E> {
     ) -> Result<SelectBinds> {
         let mut pre_binds = Vec::new();
         let mut post_binds = Vec::new();
+        let mut hoisted_aggregates: Vec<AggregateSpec> = Vec::new();
+        let mut hoisted_agg_binds: Vec<Pattern> = Vec::new();
+
+        // Seed the alias-by-key map with explicit SELECT aggregates so that
+        // inline-aggregate hoisting reuses them rather than producing duplicate
+        // specs (e.g. `(AVG(?p) AS ?avg)` plus `((MIN(?p) + AVG(?p))/2 AS ?c)`
+        // shares the AVG(?p) spec under both `?avg` and the inline reference).
+        let mut aliases_by_key = self.build_aggregate_aliases(clause)?;
 
         if let SelectVariables::Explicit(vars) = &clause.variables {
             for var in vars {
@@ -97,9 +125,34 @@ impl<E: IriEncoder> LoweringContext<'_, E> {
                     if matches!(expr, AstExpression::Aggregate { .. }) {
                         continue;
                     }
-                    let filter_expr = self.lower_expression(expr)?;
+
+                    let had_inline_aggregates = self.expr_contains_inline_aggregate(expr);
+
+                    // Hoist any inline aggregates not yet in the alias map.
+                    // No-op if `expr` contains none.
+                    self.collect_inline_aggregates(
+                        expr,
+                        &mut aliases_by_key,
+                        &mut hoisted_aggregates,
+                        &mut hoisted_agg_binds,
+                        "?__select_agg_",
+                    )?;
+
+                    // Lower the expression. With `aggregate_aliases` set, any
+                    // inline `Expression::Aggregate` node is rewritten to a
+                    // reference to its synthetic alias variable by
+                    // `lower/expression.rs::lower_expression`.
+                    let filter_expr = if had_inline_aggregates {
+                        self.aggregate_aliases = Some(aliases_by_key.clone());
+                        let result = self.lower_expression(expr);
+                        self.aggregate_aliases = None;
+                        result?
+                    } else {
+                        self.lower_expression(expr)?
+                    };
+
                     let var_id = self.register_var(alias);
-                    if self.expr_references_vars(expr, aggregate_aliases) {
+                    if had_inline_aggregates || self.expr_references_vars(expr, aggregate_aliases) {
                         post_binds.push((var_id, filter_expr));
                     } else {
                         pre_binds.push(Pattern::Bind {
@@ -114,7 +167,46 @@ impl<E: IriEncoder> LoweringContext<'_, E> {
         Ok(SelectBinds {
             pre: pre_binds,
             post: post_binds,
+            hoisted_aggregates,
+            hoisted_agg_binds,
         })
+    }
+
+    /// Quick predicate: does `expr` contain any `Expression::Aggregate` node?
+    /// Used to decide whether a SELECT expression must route to post-binds
+    /// even when no NEW aggregates were hoisted (e.g. all of its inline
+    /// aggregates were de-duplicated against existing alias entries).
+    fn expr_contains_inline_aggregate(&self, expr: &AstExpression) -> bool {
+        match expr.unwrap_bracketed() {
+            AstExpression::Aggregate { .. } => true,
+            AstExpression::Binary { left, right, .. } => {
+                self.expr_contains_inline_aggregate(left)
+                    || self.expr_contains_inline_aggregate(right)
+            }
+            AstExpression::Unary { operand, .. } => self.expr_contains_inline_aggregate(operand),
+            AstExpression::FunctionCall { args, .. } => {
+                args.iter().any(|a| self.expr_contains_inline_aggregate(a))
+            }
+            AstExpression::If {
+                condition,
+                then_expr,
+                else_expr,
+                ..
+            } => {
+                self.expr_contains_inline_aggregate(condition)
+                    || self.expr_contains_inline_aggregate(then_expr)
+                    || self.expr_contains_inline_aggregate(else_expr)
+            }
+            AstExpression::Coalesce { args, .. } => {
+                args.iter().any(|a| self.expr_contains_inline_aggregate(a))
+            }
+            AstExpression::In { expr, list, .. } => {
+                self.expr_contains_inline_aggregate(expr)
+                    || list.iter().any(|a| self.expr_contains_inline_aggregate(a))
+            }
+            AstExpression::Bracketed { inner, .. } => self.expr_contains_inline_aggregate(inner),
+            _ => false,
+        }
     }
 
     /// Lower solution modifiers (DISTINCT, LIMIT, OFFSET, ORDER BY, GROUP BY, HAVING)
@@ -153,11 +245,12 @@ impl<E: IriEncoder> LoweringContext<'_, E> {
             let mut aggregate_aliases = self.build_aggregate_aliases(select)?;
             let mut having_pre_binds: Vec<Pattern> = Vec::new();
             for cond in &having.conditions {
-                self.collect_having_aggregates(
+                self.collect_inline_aggregates(
                     cond,
                     &mut aggregate_aliases,
                     &mut having_aggregates,
                     &mut having_pre_binds,
+                    "?__having_agg_",
                 )?;
             }
             self.aggregate_aliases = Some(aggregate_aliases);
