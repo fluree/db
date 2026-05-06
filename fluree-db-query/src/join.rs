@@ -1000,9 +1000,21 @@ impl Operator for NestedLoopJoinOperator {
         // - Binary store must be available (batched path reads leaf files directly)
         // - Single-db mode (ActiveGraphs::Single), subjects are Binding::Sid
         // - Dataset mode with exactly one graph (ActiveGraphs::Many len==1), subjects are Binding::IriMatch
+        // - `to_t == store.max_t()` (latest snapshot only). The batched probes
+        //   (`scan_leaves_into_scatter`, `batched_subject_probe_binary`) read
+        //   base leaflet rows directly without applying the `to_t` filter or
+        //   replaying the history sidecar, so they would silently return
+        //   latest-state results for historical snapshots. Fall back to the
+        //   per-row scan path which uses `BinaryCursor::set_to_t` and proper
+        //   sidecar replay.
+        let at_latest_t = ctx
+            .binary_store
+            .as_ref()
+            .is_some_and(|s| s.max_t() == ctx.to_t);
         let use_batched =
             (self.batched_eligible || self.batched_object_eligible || self.batched_exists_eligible)
                 && ctx.binary_store.is_some()
+                && at_latest_t
                 && match ctx.active_graphs() {
                     // Object-batched path currently emits `Binding::EncodedSid` for the new
                     // subject var. Keep it single-ledger only to avoid dataset-mode IriMatch

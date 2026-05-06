@@ -308,10 +308,25 @@ impl PropertyJoinOperator {
         driver_subject_ids.is_some()
             && !ctx.is_multi_ledger()
             && ctx.binary_store.is_some()
+            && Self::at_latest_t(ctx)
             && !remaining_predicates.is_empty()
             && remaining_predicates
                 .iter()
                 .all(|&idx| self.predicates[idx].dtc.is_none())
+    }
+
+    /// Whether the query is targeting the latest snapshot.
+    ///
+    /// `batched_subject_probe_binary` and `batched_subject_star_spot` read
+    /// base leaflet rows directly without applying the `to_t` filter or
+    /// replaying the history sidecar. Disable those paths for historical
+    /// snapshots and let the planned per-predicate scans (which use
+    /// `BinaryCursor::set_to_t` + sidecar replay) handle correctness.
+    #[inline]
+    fn at_latest_t(ctx: &ExecutionContext<'_>) -> bool {
+        ctx.binary_store
+            .as_ref()
+            .is_some_and(|s| s.max_t() == ctx.to_t)
     }
 
     /// Create a new property-join operator from patterns
@@ -697,10 +712,13 @@ impl Operator for PropertyJoinOperator {
                 // If we have a driver subject set and we're in the right execution mode,
                 // try a batched subject probe for this predicate.
                 // Batched probe requires binary store with batched_lookup support.
+                // Time-travel queries fall back to the planned per-predicate scan
+                // path (`BinaryCursor::set_to_t` + sidecar replay); see `at_latest_t`.
                 let can_batched_probe = order_pos > 0
                     && driver_subject_ids.is_some()
                     && !ctx.is_multi_ledger()
                     && ctx.binary_store.is_some()
+                    && Self::at_latest_t(ctx)
                     && predicate.dtc.is_none();
 
                 if can_batched_probe {
