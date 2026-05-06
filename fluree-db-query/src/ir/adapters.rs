@@ -140,19 +140,13 @@ impl IndexSearchPattern {
         vars
     }
 
-    /// Variables this pattern reads from outer bindings (the search target,
-    /// when supplied as a variable rather than a constant).
-    pub fn input_vars(&self) -> Vec<VarId> {
-        match &self.target {
-            IndexSearchTarget::Var(v) => vec![*v],
-            IndexSearchTarget::Const(_) => Vec::new(),
-        }
-    }
-
-    /// Variables mentioned anywhere in this pattern (input + produced).
+    /// Variables mentioned anywhere in this pattern: produced bindings plus
+    /// the search target when it's a variable rather than a constant.
     pub fn referenced_vars(&self) -> Vec<VarId> {
         let mut vars = self.produced_vars();
-        vars.extend(self.input_vars());
+        if let IndexSearchTarget::Var(v) = &self.target {
+            vars.push(*v);
+        }
         vars
     }
 }
@@ -296,19 +290,13 @@ impl VectorSearchPattern {
         vars
     }
 
-    /// Variables this pattern reads from outer bindings (the query vector,
-    /// when supplied as a variable rather than a constant).
-    pub fn input_vars(&self) -> Vec<VarId> {
-        match &self.target {
-            VectorSearchTarget::Var(v) => vec![*v],
-            VectorSearchTarget::Const(_) => Vec::new(),
-        }
-    }
-
-    /// Variables mentioned anywhere in this pattern (input + produced).
+    /// Variables mentioned anywhere in this pattern: produced bindings plus
+    /// the query vector when it's a variable rather than a constant.
     pub fn referenced_vars(&self) -> Vec<VarId> {
         let mut vars = self.produced_vars();
-        vars.extend(self.input_vars());
+        if let VectorSearchTarget::Var(v) = &self.target {
+            vars.push(*v);
+        }
         vars
     }
 }
@@ -402,19 +390,13 @@ impl GeoSearchPattern {
         vars
     }
 
-    /// Variables this pattern reads from outer bindings (the center point,
-    /// when supplied as a variable rather than a constant).
-    pub fn input_vars(&self) -> Vec<VarId> {
-        match &self.center {
-            GeoSearchCenter::Var(v) => vec![*v],
-            GeoSearchCenter::Const { .. } => Vec::new(),
-        }
-    }
-
-    /// Variables mentioned anywhere in this pattern (input + produced).
+    /// Variables mentioned anywhere in this pattern: produced bindings plus
+    /// the center point when it's a variable rather than a constant.
     pub fn referenced_vars(&self) -> Vec<VarId> {
         let mut vars = self.produced_vars();
-        vars.extend(self.input_vars());
+        if let GeoSearchCenter::Var(v) = &self.center {
+            vars.push(*v);
+        }
         vars
     }
 }
@@ -568,19 +550,13 @@ impl S2SearchPattern {
         vars
     }
 
-    /// Variables this pattern reads from outer bindings (the query geometry,
-    /// when supplied as a variable rather than a constant).
-    pub fn input_vars(&self) -> Vec<VarId> {
-        match &self.query_geom {
-            S2QueryGeom::Var(v) => vec![*v],
-            S2QueryGeom::Wkt(_) | S2QueryGeom::Point { .. } => Vec::new(),
-        }
-    }
-
-    /// Variables mentioned anywhere in this pattern (input + produced).
+    /// Variables mentioned anywhere in this pattern: produced bindings plus
+    /// the query geometry when it's a variable rather than a constant.
     pub fn referenced_vars(&self) -> Vec<VarId> {
         let mut vars = self.produced_vars();
-        vars.extend(self.input_vars());
+        if let S2QueryGeom::Var(v) = &self.query_geom {
+            vars.push(*v);
+        }
         vars
     }
 }
