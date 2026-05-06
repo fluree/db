@@ -1505,6 +1505,7 @@ impl NestedLoopJoinOperator {
         let mut leaflets_scanned: u64 = 0;
         let mut matched_rows: u64 = 0;
         let need_replay = ctx.to_t < store.max_t();
+        let to_t_u32 = u32::try_from(ctx.to_t).unwrap_or(u32::MAX);
 
         for leaf_idx in leaf_range {
             let leaf_entry = &branch.leaves[leaf_idx];
@@ -1533,7 +1534,6 @@ impl NestedLoopJoinOperator {
                 // An empty-after-retract leaflet (`row_count == 0`) is preserved
                 // by the indexer for time-travel replay. Skip only when there is
                 // also no history past `to_t` to reconstruct.
-                let to_t_u32 = u32::try_from(ctx.to_t).unwrap_or(u32::MAX);
                 let needs_history_replay =
                     need_replay && entry.history_len > 0 && entry.history_max_t > to_t_u32;
                 if entry.row_count == 0 && !needs_history_replay {
@@ -2096,6 +2096,7 @@ impl NestedLoopJoinOperator {
 
         let cache = store.leaflet_cache();
         let need_replay = ctx.to_t < store.max_t();
+        let to_t_u32 = u32::try_from(ctx.to_t).unwrap_or(u32::MAX);
         for leaf_idx in leaf_indices {
             let leaf_entry = &branch.leaves[leaf_idx];
             let leaf_bytes = store
@@ -2118,7 +2119,6 @@ impl NestedLoopJoinOperator {
             };
 
             for (leaflet_idx, entry) in dir.entries.iter().enumerate() {
-                let to_t_u32 = u32::try_from(ctx.to_t).unwrap_or(u32::MAX);
                 let needs_history_replay =
                     need_replay && entry.history_len > 0 && entry.history_max_t > to_t_u32;
                 if entry.row_count == 0 && !needs_history_replay {
@@ -2588,6 +2588,7 @@ pub(crate) fn batched_subject_probe_binary(
     let leaf_range = branch.find_leaves_in_range(&min_key, &max_key, cmp);
     let cache = store.leaflet_cache();
     let need_replay = ctx.to_t < store.max_t();
+    let to_t_u32 = u32::try_from(ctx.to_t).unwrap_or(u32::MAX);
     let mut out = Vec::new();
 
     for leaf_idx in leaf_range {
@@ -2609,7 +2610,6 @@ pub(crate) fn batched_subject_probe_binary(
         let leaf_id = xxhash_rust::xxh3::xxh3_128(leaf_entry.leaf_cid.to_bytes().as_ref());
 
         for (leaflet_idx, entry) in dir.entries.iter().enumerate() {
-            let to_t_u32 = u32::try_from(ctx.to_t).unwrap_or(u32::MAX);
             let needs_history_replay =
                 need_replay && entry.history_len > 0 && entry.history_max_t > to_t_u32;
             if entry.row_count == 0 && !needs_history_replay {
@@ -2805,6 +2805,7 @@ pub(crate) fn batched_subject_star_spot(
     let leaf_range = branch.find_leaves_in_range(&min_key, &max_key, cmp);
     let cache = store.leaflet_cache();
     let need_replay = ctx.to_t < store.max_t();
+    let to_t_u32 = u32::try_from(ctx.to_t).unwrap_or(u32::MAX);
     let mut out = Vec::new();
 
     for leaf_idx in leaf_range {
@@ -2826,7 +2827,6 @@ pub(crate) fn batched_subject_star_spot(
         let leaf_id = xxhash_rust::xxh3::xxh3_128(leaf_entry.leaf_cid.to_bytes().as_ref());
 
         for (leaflet_idx, entry) in dir.entries.iter().enumerate() {
-            let to_t_u32 = u32::try_from(ctx.to_t).unwrap_or(u32::MAX);
             let needs_history_replay =
                 need_replay && entry.history_len > 0 && entry.history_max_t > to_t_u32;
             if entry.row_count == 0 && !needs_history_replay {

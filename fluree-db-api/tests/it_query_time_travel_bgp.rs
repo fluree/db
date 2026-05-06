@@ -471,3 +471,142 @@ async fn time_travel_bench_replay_overhead() {
         to_avg(t_grp_hist) / to_avg(t_grp_latest)
     );
 }
+
+/// Pattern B (control — already worked pre-fix): `?inv a ns:Invoice ;
+/// ns:status ?s . BIND(?s AS ?aliased)` GROUP BY `?aliased`. The BIND
+/// indirection forces this through a different operator shape than
+/// pattern A; the bug report showed it returned the correct historical
+/// counts even before the fix. Lock that in so the fix to A/E doesn't
+/// regress B.
+#[tokio::test]
+async fn time_travel_type_plus_bind_alias_respects_t() {
+    assert_index_defaults();
+    let fluree = FlureeBuilder::memory().build_memory();
+    let _ledger = seed_invoice_ledger(&fluree).await;
+
+    let sparql_t1 = format!(
+        r"PREFIX ns: <http://example.org/ns#>
+          SELECT ?aliased (COUNT(?inv) AS ?n)
+          FROM <{LEDGER_ID}@t:1>
+          WHERE {{ ?inv a ns:Invoice ; ns:status ?s . BIND(?s AS ?aliased) }}
+          GROUP BY ?aliased"
+    );
+    let jsonld = fluree
+        .query_from()
+        .sparql(&sparql_t1)
+        .format(fluree_db_api::FormatterConfig::jsonld())
+        .execute_formatted()
+        .await
+        .expect("group-by sparql should succeed");
+
+    let rows = jsonld.as_array().expect("array").clone();
+    let mut paid: Option<i64> = None;
+    let mut approved: Option<i64> = None;
+    for row in &rows {
+        let arr = row.as_array().expect("row");
+        let status = arr[0].as_str().unwrap_or_default();
+        let count = arr[1].as_i64().expect("count");
+        match status {
+            "paid" => paid = Some(count),
+            "approved" => approved = Some(count),
+            _ => {}
+        }
+    }
+    assert_eq!(
+        paid,
+        Some(18),
+        "BIND-alias variant must match pattern A at t=1; full result: {jsonld}"
+    );
+    assert_eq!(
+        approved,
+        Some(2),
+        "BIND-alias variant must match pattern A at t=1; full result: {jsonld}"
+    );
+}
+
+/// `PropertyJoinOperator` SPOT-walk path at a historical `t`.
+///
+/// A 3+ predicate same-subject star with unbound objects and no datatype
+/// constraints meets `can_spot_walk_remaining`, routing the trailing
+/// predicates through `batched_subject_star_spot` rather than the
+/// scatter-side `scan_leaves_into_scatter`. The fix gates the SPOT walk
+/// on `at_latest_t(ctx)`; this test pins that historical queries through
+/// that path return the t=1 state, not the latest state.
+#[tokio::test]
+async fn time_travel_property_join_spot_walk_respects_t() {
+    assert_index_defaults();
+    let fluree = FlureeBuilder::memory().build_memory();
+    let _ledger = seed_invoice_ledger(&fluree).await;
+
+    // Three same-subject predicates after the type-class triple. With ?status
+    // and ?amount unbound and no FILTER/datatype constraint, this is the
+    // shape `can_spot_walk_remaining` accepts.
+    let sparql_t1 = format!(
+        r"PREFIX ns: <http://example.org/ns#>
+          SELECT ?inv ?status ?amount
+          FROM <{LEDGER_ID}@t:1>
+          WHERE {{
+            ?inv a ns:Invoice .
+            ?inv ns:status ?status .
+            ?inv ns:totalAmount ?amount .
+          }}"
+    );
+    let jsonld = fluree
+        .query_from()
+        .sparql(&sparql_t1)
+        .format(fluree_db_api::FormatterConfig::jsonld())
+        .execute_formatted()
+        .await
+        .expect("star sparql should succeed");
+    let rows = jsonld.as_array().expect("array");
+    assert_eq!(
+        rows.len(),
+        20,
+        "expected 20 invoice rows at t=1; got {jsonld}"
+    );
+    let approved_at_t1 = rows
+        .iter()
+        .filter(|row| {
+            row.as_array()
+                .and_then(|a| a.get(1))
+                .and_then(|s| s.as_str())
+                == Some("approved")
+        })
+        .count();
+    assert_eq!(
+        approved_at_t1, 2,
+        "at t=1 the star walk must see the 2 'approved' invoices; got {jsonld}"
+    );
+
+    let sparql_t2 = format!(
+        r"PREFIX ns: <http://example.org/ns#>
+          SELECT ?inv ?status ?amount
+          FROM <{LEDGER_ID}@t:2>
+          WHERE {{
+            ?inv a ns:Invoice .
+            ?inv ns:status ?status .
+            ?inv ns:totalAmount ?amount .
+          }}"
+    );
+    let jsonld_t2 = fluree
+        .query_from()
+        .sparql(&sparql_t2)
+        .format(fluree_db_api::FormatterConfig::jsonld())
+        .execute_formatted()
+        .await
+        .expect("star sparql at t=2 should succeed");
+    let rows_t2 = jsonld_t2.as_array().expect("array");
+    let approved_at_t2 = rows_t2
+        .iter()
+        .filter(|row| {
+            row.as_array()
+                .and_then(|a| a.get(1))
+                .and_then(|s| s.as_str())
+                == Some("approved")
+        })
+        .count();
+    assert_eq!(
+        approved_at_t2, 0,
+        "at t=2 no invoice is 'approved' anymore; got {jsonld_t2}"
+    );
+}
