@@ -57,6 +57,18 @@ pub enum ReadHint {
 // Core Traits
 // ============================================================================
 
+/// An object in remote storage with its size, returned by
+/// [`StorageRead::list_prefix_with_metadata`].
+///
+/// `address` is a storage address accepted by [`StorageRead::read_bytes`] /
+/// [`StorageRead::read_byte_range`] — it is opaque to callers and remains
+/// backend-encapsulated.
+#[derive(Debug, Clone)]
+pub struct RemoteObject {
+    pub address: String,
+    pub size_bytes: u64,
+}
+
 /// Read-only storage operations
 ///
 /// This trait provides all non-mutating storage operations: reading bytes,
@@ -130,6 +142,21 @@ pub trait StorageRead: Debug + Send + Sync {
             return Ok(Vec::new());
         }
         Ok(full[start..end].to_vec())
+    }
+
+    /// List objects under a prefix together with their byte sizes.
+    ///
+    /// Used by callers (e.g. the bulk-import remote source) that need to
+    /// know object sizes up front without issuing a separate HEAD per object.
+    ///
+    /// Backends that support cheap metadata listing (S3, GCS, etc.) should
+    /// override this. The default returns `Other("not supported")` so callers
+    /// can fail fast and fall back to a caller-supplied object list.
+    async fn list_prefix_with_metadata(&self, prefix: &str) -> Result<Vec<RemoteObject>> {
+        let _ = prefix;
+        Err(crate::error::Error::other(
+            "list_prefix_with_metadata is not supported by this storage backend",
+        ))
     }
 }
 
@@ -262,6 +289,10 @@ impl StorageRead for Arc<dyn Storage> {
 
     async fn list_prefix(&self, prefix: &str) -> Result<Vec<String>> {
         self.as_ref().list_prefix(prefix).await
+    }
+
+    async fn list_prefix_with_metadata(&self, prefix: &str) -> Result<Vec<RemoteObject>> {
+        self.as_ref().list_prefix_with_metadata(prefix).await
     }
 
     fn resolve_local_path(&self, address: &str) -> Option<PathBuf> {
@@ -805,6 +836,29 @@ impl ContentStore for BranchedContentStore {
         self.branch_store
             .resolve_local_path(id)
             .or_else(|| self.parents.iter().find_map(|p| p.resolve_local_path(id)))
+    }
+
+    async fn get_range(&self, id: &ContentId, range: std::ops::Range<u64>) -> Result<Vec<u8>> {
+        // Mirror `get` semantics: try this branch first, then walk parents on
+        // NotFound. Forward `get_range` natively at every step so range-capable
+        // backends (S3, file) keep their byte-range optimization across the
+        // ancestry chain. Without this, the trait default falls back to a full
+        // `get` + slice — which silently nullifies envelope-only probes
+        // (`load_commit_envelope_by_id`) for branched ledgers.
+        match self.branch_store.get_range(id, range.clone()).await {
+            Ok(bytes) => return Ok(bytes),
+            Err(e) if self.parents.is_empty() => return Err(e),
+            Err(e) if !matches!(e, crate::error::Error::NotFound(_)) => return Err(e),
+            Err(_) => {}
+        }
+        let mut last_err = None;
+        for parent in &self.parents {
+            match parent.get_range(id, range.clone()).await {
+                Ok(bytes) => return Ok(bytes),
+                Err(e) => last_err = Some(e),
+            }
+        }
+        Err(last_err.unwrap_or_else(|| crate::error::Error::not_found(id.to_string())))
     }
 }
 

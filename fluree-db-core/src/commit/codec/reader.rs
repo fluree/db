@@ -205,6 +205,7 @@ pub(crate) fn read_commit_envelope_v4(bytes: &[u8]) -> Result<CommitEnvelope, Co
         txn: env.txn,
         namespace_delta: env.namespace_delta,
         txn_meta: env.txn_meta,
+        graph_delta: env.graph_delta,
         ns_split_mode: env.ns_split_mode,
     })
 }
