@@ -216,3 +216,135 @@ async fn time_travel_type_plus_group_by_property_respects_t() {
         "at t=1, approved count must be 2; full result: {jsonld}"
     );
 }
+
+/// Microbench: compare latest vs historical batched-probe timing.
+///
+/// Run with: `cargo test -p fluree-db-api --features native --test
+/// it_query_time_travel_bgp -- --ignored --nocapture
+/// time_travel_bench_replay_overhead`.
+///
+/// Builds a 10k-invoice ledger with ~10% status mutations between t=1 and
+/// t=2. Each query path goes through `flush_batched_exists_accumulator_binary`
+/// (pattern E) and `flush_batched_accumulator_binary` (pattern A). The
+/// historical path additionally runs `replay_leaflet_at_t` per leaflet.
+#[tokio::test]
+#[ignore]
+async fn time_travel_bench_replay_overhead() {
+    use std::time::Instant;
+
+    assert_index_defaults();
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger_id = "tt-bgp-bench:main";
+    let ledger0 = genesis_ledger(&fluree, ledger_id);
+
+    const N: usize = 10_000;
+    const MUTATED: usize = 1_000; // ~10%
+
+    // t=1: N invoices, last MUTATED status="approved", rest "paid".
+    let mut invoices = Vec::with_capacity(N);
+    for i in 0..N {
+        let status = if i < N - MUTATED { "paid" } else { "approved" };
+        invoices.push(json!({
+            "@id": format!("ns:Invoice/inv-{:06}", i),
+            "@type": "ns:Invoice",
+            "ns:status": status,
+            "ns:totalAmount": 100 + i,
+        }));
+    }
+    let tx1 = json!({"@context": ctx(), "@graph": invoices});
+    let _ = fluree.insert(ledger0, &tx1).await.expect("tx1");
+    support::rebuild_and_publish_index(&fluree, ledger_id).await;
+    let l1 = fluree.ledger(ledger_id).await.unwrap();
+
+    // t=2: flip MUTATED rows from "approved" to "paid".
+    let tx2 = json!({
+        "@context": ctx(),
+        "where": {"@id": "?inv", "ns:status": "approved"},
+        "delete": {"@id": "?inv", "ns:status": "approved"},
+        "insert": {"@id": "?inv", "ns:status": "paid"}
+    });
+    fluree.update(l1, &tx2).await.expect("tx2");
+    support::rebuild_and_publish_index(&fluree, ledger_id).await;
+
+    // Pattern E (literal-object exists). At latest expect N paid; at t=1
+    // expect N-MUTATED paid.
+    let q_lit = |t: i64| {
+        format!(
+            r#"PREFIX ns: <http://example.org/ns#>
+              SELECT (COUNT(?inv) AS ?n)
+              FROM <{ledger_id}@t:{t}>
+              WHERE {{ ?inv a ns:Invoice ; ns:status "paid" }}"#
+        )
+    };
+    // Pattern A (group by status). Same shape, different join helper.
+    let q_grp = |t: i64| {
+        format!(
+            r"PREFIX ns: <http://example.org/ns#>
+              SELECT ?status (COUNT(?inv) AS ?n)
+              FROM <{ledger_id}@t:{t}>
+              WHERE {{ ?inv a ns:Invoice ; ns:status ?status }}
+              GROUP BY ?status"
+        )
+    };
+
+    // Warm up caches/dicts.
+    for _ in 0..2 {
+        let _ = run_count_sparql(&fluree, &q_lit(2)).await;
+        let _ = run_count_sparql(&fluree, &q_lit(1)).await;
+    }
+
+    const ITERS: u32 = 30;
+    let mut t_lit_latest = std::time::Duration::ZERO;
+    let mut t_lit_hist = std::time::Duration::ZERO;
+    let mut t_grp_latest = std::time::Duration::ZERO;
+    let mut t_grp_hist = std::time::Duration::ZERO;
+    for _ in 0..ITERS {
+        let q = q_lit(2);
+        let s = Instant::now();
+        let _ = run_count_sparql(&fluree, &q).await;
+        t_lit_latest += s.elapsed();
+
+        let q = q_lit(1);
+        let s = Instant::now();
+        let _ = run_count_sparql(&fluree, &q).await;
+        t_lit_hist += s.elapsed();
+
+        let q = q_grp(2);
+        let s = Instant::now();
+        let _ = fluree
+            .query_from()
+            .sparql(&q)
+            .format(fluree_db_api::FormatterConfig::jsonld())
+            .execute_formatted()
+            .await
+            .unwrap();
+        t_grp_latest += s.elapsed();
+
+        let q = q_grp(1);
+        let s = Instant::now();
+        let _ = fluree
+            .query_from()
+            .sparql(&q)
+            .format(fluree_db_api::FormatterConfig::jsonld())
+            .execute_formatted()
+            .await
+            .unwrap();
+        t_grp_hist += s.elapsed();
+    }
+    let to_avg = |d: std::time::Duration| (d.as_secs_f64() * 1000.0) / f64::from(ITERS);
+    println!(
+        "\n--- batched join probe: latest vs historical ({N} invoices, ~{MUTATED} mutated, {ITERS} iters) ---"
+    );
+    println!(
+        "pattern E (literal-object exists): latest = {:.2} ms/iter, t=1 = {:.2} ms/iter, ratio = {:.2}x",
+        to_avg(t_lit_latest),
+        to_avg(t_lit_hist),
+        to_avg(t_lit_hist) / to_avg(t_lit_latest)
+    );
+    println!(
+        "pattern A (group-by status):       latest = {:.2} ms/iter, t=1 = {:.2} ms/iter, ratio = {:.2}x",
+        to_avg(t_grp_latest),
+        to_avg(t_grp_hist),
+        to_avg(t_grp_hist) / to_avg(t_grp_latest)
+    );
+}

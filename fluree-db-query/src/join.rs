@@ -1000,21 +1000,13 @@ impl Operator for NestedLoopJoinOperator {
         // - Binary store must be available (batched path reads leaf files directly)
         // - Single-db mode (ActiveGraphs::Single), subjects are Binding::Sid
         // - Dataset mode with exactly one graph (ActiveGraphs::Many len==1), subjects are Binding::IriMatch
-        // - `to_t == store.max_t()` (latest snapshot only). The batched probes
-        //   (`scan_leaves_into_scatter`, `batched_subject_probe_binary`) read
-        //   base leaflet rows directly without applying the `to_t` filter or
-        //   replaying the history sidecar, so they would silently return
-        //   latest-state results for historical snapshots. Fall back to the
-        //   per-row scan path which uses `BinaryCursor::set_to_t` and proper
-        //   sidecar replay.
-        let at_latest_t = ctx
-            .binary_store
-            .as_ref()
-            .is_some_and(|s| s.max_t() == ctx.to_t);
+        //
+        // Historical snapshots (`to_t < store.max_t()`) are handled inside each
+        // batched flush helper via `replay_leaflet_at_t`, which reconstructs
+        // leaflet state at `to_t` from the history sidecar.
         let use_batched =
             (self.batched_eligible || self.batched_object_eligible || self.batched_exists_eligible)
                 && ctx.binary_store.is_some()
-                && at_latest_t
                 && match ctx.active_graphs() {
                     // Object-batched path currently emits `Binding::EncodedSid` for the new
                     // subject var. Keep it single-ledger only to avoid dataset-mode IriMatch
@@ -1512,6 +1504,7 @@ impl NestedLoopJoinOperator {
 
         let mut leaflets_scanned: u64 = 0;
         let mut matched_rows: u64 = 0;
+        let need_replay = ctx.to_t < store.max_t();
 
         for leaf_idx in leaf_range {
             let leaf_entry = &branch.leaves[leaf_idx];
@@ -1524,6 +1517,16 @@ impl NestedLoopJoinOperator {
             let dir = decode_leaf_dir_v3_with_base(&leaf_bytes, &header)
                 .map_err(|e| QueryError::Internal(format!("decode leaf dir: {e}")))?;
             let leaf_id = xxhash_rust::xxh3::xxh3_128(leaf_entry.leaf_cid.to_bytes().as_ref());
+            // Fetch sidecar bytes once per leaf when we need historical replay.
+            // The leaflet base columns are content-addressed (immutable); the
+            // sidecar is what carries retracts, so we only need it for `to_t < max_t`.
+            let sidecar_bytes: Option<Vec<u8>> = if need_replay {
+                store
+                    .fetch_sidecar_bytes_sync(leaf_entry.sidecar_cid.as_ref())
+                    .map_err(|e| QueryError::Internal(format!("fetch sidecar: {e}")))?
+            } else {
+                None
+            };
 
             for (leaflet_idx, entry) in dir.entries.iter().enumerate() {
                 leaflets_scanned += 1;
@@ -1559,6 +1562,26 @@ impl NestedLoopJoinOperator {
                         header.order,
                     )
                     .map_err(|e| QueryError::Internal(format!("load columns: {e}")))?
+                };
+
+                // Apply time-travel replay when querying a historical snapshot.
+                // The cached `batch` reflects latest base state; `replay_leaflet_at_t`
+                // reconstructs the state at `ctx.to_t` using the history sidecar.
+                let batch = if need_replay {
+                    match fluree_db_binary_index::replay_leaflet_at_t(
+                        &batch,
+                        entry,
+                        sidecar_bytes.as_deref(),
+                        ctx.to_t,
+                        header.order,
+                    )
+                    .map_err(|e| QueryError::Internal(format!("replay leaflet: {e}")))?
+                    {
+                        Some(replayed) => replayed,
+                        None => batch,
+                    }
+                } else {
+                    batch
                 };
 
                 let row_count = batch.row_count;
@@ -2060,6 +2083,7 @@ impl NestedLoopJoinOperator {
         leaf_indices.dedup();
 
         let cache = store.leaflet_cache();
+        let need_replay = ctx.to_t < store.max_t();
         for leaf_idx in leaf_indices {
             let leaf_entry = &branch.leaves[leaf_idx];
             let leaf_bytes = store
@@ -2071,6 +2095,15 @@ impl NestedLoopJoinOperator {
             let dir = decode_leaf_dir_v3_with_base(&leaf_bytes, &header)
                 .map_err(|e| QueryError::Internal(format!("decode leaf dir: {e}")))?;
             let leaf_id = xxhash_rust::xxh3::xxh3_128(leaf_entry.leaf_cid.to_bytes().as_ref());
+            // Fetch sidecar bytes once per leaf for historical replay (see
+            // `scan_leaves_into_scatter` for the rationale).
+            let sidecar_bytes: Option<Vec<u8>> = if need_replay {
+                store
+                    .fetch_sidecar_bytes_sync(leaf_entry.sidecar_cid.as_ref())
+                    .map_err(|e| QueryError::Internal(format!("fetch sidecar: {e}")))?
+            } else {
+                None
+            };
 
             for (leaflet_idx, entry) in dir.entries.iter().enumerate() {
                 if entry.row_count == 0 {
@@ -2098,11 +2131,16 @@ impl NestedLoopJoinOperator {
                     continue;
                 }
 
-                // We only need core identity columns for this join. Avoid decoding all
-                // columns on cache miss (the cache stores full batches).
-                let core_proj = fluree_db_binary_index::read::column_types::ColumnProjection {
-                    output: fluree_db_binary_index::read::column_types::ColumnSet::CORE,
-                    internal: fluree_db_binary_index::read::column_types::ColumnSet::EMPTY,
+                // We only need core identity columns for this join, but for
+                // historical snapshots we also need `T` so `replay_leaflet_at_t`
+                // can detect base rows that postdate `to_t`.
+                let proj = if need_replay {
+                    fluree_db_binary_index::read::column_types::ColumnProjection::all()
+                } else {
+                    fluree_db_binary_index::read::column_types::ColumnProjection {
+                        output: fluree_db_binary_index::read::column_types::ColumnSet::CORE,
+                        internal: fluree_db_binary_index::read::column_types::ColumnSet::EMPTY,
+                    }
                 };
                 let batch = if let Some(c) = &cache {
                     let key = fluree_db_binary_index::read::leaflet_cache::V3BatchCacheKey {
@@ -2118,20 +2156,32 @@ impl NestedLoopJoinOperator {
                             &leaf_bytes,
                             entry,
                             dir.payload_base,
-                            &core_proj,
+                            &proj,
                             header.order,
                         )
                         .map_err(|e| QueryError::Internal(format!("load columns: {e}")))?
                     }
                 } else {
-                    load_leaflet_columns(
-                        &leaf_bytes,
+                    load_leaflet_columns(&leaf_bytes, entry, dir.payload_base, &proj, header.order)
+                        .map_err(|e| QueryError::Internal(format!("load columns: {e}")))?
+                };
+
+                // Apply time-travel replay when querying a historical snapshot.
+                let batch = if need_replay {
+                    match fluree_db_binary_index::replay_leaflet_at_t(
+                        &batch,
                         entry,
-                        dir.payload_base,
-                        &core_proj,
+                        sidecar_bytes.as_deref(),
+                        ctx.to_t,
                         header.order,
                     )
-                    .map_err(|e| QueryError::Internal(format!("load columns: {e}")))?
+                    .map_err(|e| QueryError::Internal(format!("replay leaflet: {e}")))?
+                    {
+                        Some(replayed) => replayed,
+                        None => batch,
+                    }
+                } else {
+                    batch
                 };
 
                 // OPST leaflets are ordered by (o_type, o_key, p_id, s_id, t...).
@@ -2520,6 +2570,7 @@ pub(crate) fn batched_subject_probe_binary(
     };
     let leaf_range = branch.find_leaves_in_range(&min_key, &max_key, cmp);
     let cache = store.leaflet_cache();
+    let need_replay = ctx.to_t < store.max_t();
     let mut out = Vec::new();
 
     for leaf_idx in leaf_range {
@@ -2527,6 +2578,13 @@ pub(crate) fn batched_subject_probe_binary(
         let leaf_bytes = store
             .get_leaf_bytes_sync(&leaf_entry.leaf_cid)
             .map_err(|e| QueryError::Internal(format!("fetch leaf: {e}")))?;
+        let sidecar_bytes: Option<Vec<u8>> = if need_replay {
+            store
+                .fetch_sidecar_bytes_sync(leaf_entry.sidecar_cid.as_ref())
+                .map_err(|e| QueryError::Internal(format!("fetch sidecar: {e}")))?
+        } else {
+            None
+        };
         let header = decode_leaf_header_v3(&leaf_bytes)
             .map_err(|e| QueryError::Internal(format!("read leaf header: {e}")))?;
         let dir = decode_leaf_dir_v3_with_base(&leaf_bytes, &header)
@@ -2563,6 +2621,24 @@ pub(crate) fn batched_subject_probe_binary(
                     header.order,
                 )
                 .map_err(|e| QueryError::Internal(format!("load columns: {e}")))?
+            };
+
+            // Apply time-travel replay when querying a historical snapshot.
+            let batch = if need_replay {
+                match fluree_db_binary_index::replay_leaflet_at_t(
+                    &batch,
+                    entry,
+                    sidecar_bytes.as_deref(),
+                    ctx.to_t,
+                    header.order,
+                )
+                .map_err(|e| QueryError::Internal(format!("replay leaflet: {e}")))?
+                {
+                    Some(replayed) => replayed,
+                    None => batch,
+                }
+            } else {
+                batch
             };
 
             let row_count = batch.row_count;
@@ -2706,6 +2782,7 @@ pub(crate) fn batched_subject_star_spot(
     };
     let leaf_range = branch.find_leaves_in_range(&min_key, &max_key, cmp);
     let cache = store.leaflet_cache();
+    let need_replay = ctx.to_t < store.max_t();
     let mut out = Vec::new();
 
     for leaf_idx in leaf_range {
@@ -2713,6 +2790,13 @@ pub(crate) fn batched_subject_star_spot(
         let leaf_bytes = store
             .get_leaf_bytes_sync(&leaf_entry.leaf_cid)
             .map_err(|e| QueryError::Internal(format!("fetch leaf: {e}")))?;
+        let sidecar_bytes: Option<Vec<u8>> = if need_replay {
+            store
+                .fetch_sidecar_bytes_sync(leaf_entry.sidecar_cid.as_ref())
+                .map_err(|e| QueryError::Internal(format!("fetch sidecar: {e}")))?
+        } else {
+            None
+        };
         let header = decode_leaf_header_v3(&leaf_bytes)
             .map_err(|e| QueryError::Internal(format!("read leaf header: {e}")))?;
         let dir = decode_leaf_dir_v3_with_base(&leaf_bytes, &header)
@@ -2746,6 +2830,24 @@ pub(crate) fn batched_subject_star_spot(
                     header.order,
                 )
                 .map_err(|e| QueryError::Internal(format!("load columns: {e}")))?
+            };
+
+            // Apply time-travel replay when querying a historical snapshot.
+            let batch = if need_replay {
+                match fluree_db_binary_index::replay_leaflet_at_t(
+                    &batch,
+                    entry,
+                    sidecar_bytes.as_deref(),
+                    ctx.to_t,
+                    header.order,
+                )
+                .map_err(|e| QueryError::Internal(format!("replay leaflet: {e}")))?
+                {
+                    Some(replayed) => replayed,
+                    None => batch,
+                }
+            } else {
+                batch
             };
 
             let row_count = batch.row_count;

@@ -13,9 +13,11 @@
 //! 3. Derive exclude/include sets and three-way merge into output `ColumnBatch`
 
 use std::collections::HashMap;
+use std::io;
 use std::sync::Arc;
 
-use crate::format::history_sidecar::HistEntryV2;
+use crate::format::history_sidecar::{decode_history_segment, HistEntryV2, HistorySegmentRef};
+use crate::format::leaf::LeafletDirEntryV3;
 use crate::format::run_record::RunSortOrder;
 use crate::format::run_record_v2::{cmp_v2_for_order, RunRecordV2};
 use crate::read::column_types::{ColumnBatch, ColumnData};
@@ -86,6 +88,72 @@ struct FactState {
 // ============================================================================
 // Public API
 // ============================================================================
+
+/// Check if any row in the batch has `t > t_target`.
+///
+/// Used as a quick gate: a leaflet whose history sidecar doesn't extend
+/// past `t_target` AND whose base rows are all `<= t_target` needs no
+/// replay.
+#[inline]
+pub fn batch_has_rows_above_t(batch: &ColumnBatch, t_target: u32) -> bool {
+    match &batch.t {
+        ColumnData::Block(ts) => ts.iter().any(|&t| t > t_target),
+        ColumnData::Const(t) => *t > t_target,
+        ColumnData::AbsentDefault => false,
+    }
+}
+
+/// Apply time-travel replay to a freshly-loaded leaflet `batch`.
+///
+/// This is the helper used by callers that walk leaflet base columns
+/// directly (e.g. batched join probes) and need correct historical
+/// semantics. It mirrors what [`crate::read::binary_cursor::BinaryCursor`]
+/// does internally:
+///
+/// 1. Quick-skip: if the leaflet's history doesn't extend past `to_t` and
+///    no base rows have `t > to_t`, return `Ok(None)` (no replay needed).
+/// 2. If `entry.history_len > 0`, decode the sidecar segment from
+///    `sidecar_bytes` and call [`replay_leaflet`].
+/// 3. If no sidecar but base rows have `t > to_t`, call
+///    [`replay_leaflet`] with an empty history slice (filters those rows).
+///
+/// Returns `Ok(Some(replayed))` when replay produced a different batch,
+/// `Ok(None)` when the input batch is correct as-is.
+///
+/// `sidecar_bytes` may be `None` when the caller knows the leaf has no
+/// sidecar; in that case the helper degrades to the empty-history filter
+/// path described above.
+pub fn replay_leaflet_at_t(
+    batch: &ColumnBatch,
+    entry: &LeafletDirEntryV3,
+    sidecar_bytes: Option<&[u8]>,
+    to_t: i64,
+    order: RunSortOrder,
+) -> io::Result<Option<ColumnBatch>> {
+    let to_t_u32 = u32::try_from(to_t).unwrap_or(u32::MAX);
+    let needs_replay = entry.history_max_t > to_t_u32 || batch_has_rows_above_t(batch, to_t_u32);
+    if !needs_replay {
+        return Ok(None);
+    }
+    if entry.history_len > 0 {
+        let sc_bytes = sidecar_bytes.ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::NotFound,
+                "history replay requires sidecar bytes but none were provided",
+            )
+        })?;
+        let seg = HistorySegmentRef {
+            offset: entry.history_offset,
+            len: entry.history_len,
+            min_t: entry.history_min_t,
+            max_t: entry.history_max_t,
+        };
+        let history = decode_history_segment(sc_bytes, &seg)?;
+        return Ok(replay_leaflet(batch, &history, to_t, order));
+    }
+    // No sidecar, but base rows have t > to_t — filter them out.
+    Ok(replay_leaflet(batch, &[], to_t, order))
+}
 
 /// Replay a V3 leaflet to reconstruct its state at `t_target`.
 ///

@@ -23,7 +23,7 @@ use crate::read::types::{cmp_row_vs_overlay, OverlayOp};
 use super::binary_index_store::BinaryIndexStore;
 use super::column_loader::load_columns_cached_via_handle;
 use super::column_types::{BinaryFilter, ColumnBatch, ColumnData, ColumnProjection};
-use super::replay::replay_leaflet;
+use super::replay::{batch_has_rows_above_t, replay_leaflet};
 
 // ============================================================================
 // BinaryCursor
@@ -627,15 +627,6 @@ fn push_overlay_row(
 
 /// Apply the filter to a batch, returning only matching rows.
 /// Returns the batch unchanged if all rows match (avoids copy).
-/// Check if any row in the batch has `t > t_target`.
-fn batch_has_rows_above_t(batch: &ColumnBatch, t_target: u32) -> bool {
-    match &batch.t {
-        ColumnData::Block(ts) => ts.iter().any(|&t| t > t_target),
-        ColumnData::Const(t) => *t > t_target,
-        ColumnData::AbsentDefault => false,
-    }
-}
-
 fn filter_batch(filter: &BinaryFilter, batch: &ColumnBatch) -> ColumnBatch {
     let mut matching: Vec<usize> = Vec::new();
     for i in 0..batch.row_count {
