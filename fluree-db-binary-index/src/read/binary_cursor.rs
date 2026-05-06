@@ -228,7 +228,15 @@ impl BinaryCursor {
                     if !has_ov && self.filter.skip_leaflet(entry.p_const, entry.o_type_const) {
                         continue;
                     }
-                    if entry.row_count == 0 && !has_ov {
+                    // An empty-after-retract leaflet (`row_count == 0`) is preserved
+                    // by the indexer with its history sidecar segment so time-travel
+                    // can recover fully-retracted facts. Don't pre-skip it when we
+                    // need replay and the sidecar carries events past `to_t`.
+                    let to_t_u32 = u32::try_from(self.to_t).unwrap_or(u32::MAX);
+                    let needs_history_replay = self.need_replay()
+                        && entry.history_len > 0
+                        && entry.history_max_t > to_t_u32;
+                    if entry.row_count == 0 && !has_ov && !needs_history_replay {
                         continue;
                     }
 

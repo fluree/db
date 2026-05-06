@@ -1530,16 +1530,28 @@ impl NestedLoopJoinOperator {
 
             for (leaflet_idx, entry) in dir.entries.iter().enumerate() {
                 leaflets_scanned += 1;
-                if entry.row_count == 0 {
+                // An empty-after-retract leaflet (`row_count == 0`) is preserved
+                // by the indexer for time-travel replay. Skip only when there is
+                // also no history past `to_t` to reconstruct.
+                let to_t_u32 = u32::try_from(ctx.to_t).unwrap_or(u32::MAX);
+                let needs_history_replay =
+                    need_replay && entry.history_len > 0 && entry.history_max_t > to_t_u32;
+                if entry.row_count == 0 && !needs_history_replay {
                     continue;
                 }
-                // Skip leaflets that don't contain our predicate.
+                // Skip leaflets that don't contain our predicate. The indexer
+                // preserves `p_const` on empty-after-retract leaflets so this
+                // filter is still safe.
                 if entry.p_const.is_some() && entry.p_const != Some(p_id) {
                     continue;
                 }
 
                 // Load all columns via V3 column loader (cached when available).
-                let batch = if let Some(c) = &cache {
+                // For empty-after-retract leaflets we start from an empty batch
+                // and let `replay_leaflet_at_t` reconstruct rows from the sidecar.
+                let batch = if entry.row_count == 0 {
+                    fluree_db_binary_index::ColumnBatch::empty()
+                } else if let Some(c) = &cache {
                     load_leaflet_columns_cached(
                         &leaf_bytes,
                         entry,
@@ -2106,7 +2118,10 @@ impl NestedLoopJoinOperator {
             };
 
             for (leaflet_idx, entry) in dir.entries.iter().enumerate() {
-                if entry.row_count == 0 {
+                let to_t_u32 = u32::try_from(ctx.to_t).unwrap_or(u32::MAX);
+                let needs_history_replay =
+                    need_replay && entry.history_len > 0 && entry.history_max_t > to_t_u32;
+                if entry.row_count == 0 && !needs_history_replay {
                     continue;
                 }
                 if entry.p_const.is_some() && entry.p_const != Some(p_id) {
@@ -2142,7 +2157,9 @@ impl NestedLoopJoinOperator {
                         internal: fluree_db_binary_index::read::column_types::ColumnSet::EMPTY,
                     }
                 };
-                let batch = if let Some(c) = &cache {
+                let batch = if entry.row_count == 0 {
+                    fluree_db_binary_index::ColumnBatch::empty()
+                } else if let Some(c) = &cache {
                     let key = fluree_db_binary_index::read::leaflet_cache::V3BatchCacheKey {
                         leaf_id,
                         leaflet_idx: u32::try_from(leaflet_idx).map_err(|_| {
@@ -2592,14 +2609,19 @@ pub(crate) fn batched_subject_probe_binary(
         let leaf_id = xxhash_rust::xxh3::xxh3_128(leaf_entry.leaf_cid.to_bytes().as_ref());
 
         for (leaflet_idx, entry) in dir.entries.iter().enumerate() {
-            if entry.row_count == 0 {
+            let to_t_u32 = u32::try_from(ctx.to_t).unwrap_or(u32::MAX);
+            let needs_history_replay =
+                need_replay && entry.history_len > 0 && entry.history_max_t > to_t_u32;
+            if entry.row_count == 0 && !needs_history_replay {
                 continue;
             }
             if entry.p_const.is_some() && entry.p_const != Some(p_id) {
                 continue;
             }
 
-            let batch = if let Some(c) = &cache {
+            let batch = if entry.row_count == 0 {
+                fluree_db_binary_index::ColumnBatch::empty()
+            } else if let Some(c) = &cache {
                 load_leaflet_columns_cached(
                     &leaf_bytes,
                     entry,
@@ -2804,11 +2826,16 @@ pub(crate) fn batched_subject_star_spot(
         let leaf_id = xxhash_rust::xxh3::xxh3_128(leaf_entry.leaf_cid.to_bytes().as_ref());
 
         for (leaflet_idx, entry) in dir.entries.iter().enumerate() {
-            if entry.row_count == 0 {
+            let to_t_u32 = u32::try_from(ctx.to_t).unwrap_or(u32::MAX);
+            let needs_history_replay =
+                need_replay && entry.history_len > 0 && entry.history_max_t > to_t_u32;
+            if entry.row_count == 0 && !needs_history_replay {
                 continue;
             }
 
-            let batch = if let Some(c) = &cache {
+            let batch = if entry.row_count == 0 {
+                fluree_db_binary_index::ColumnBatch::empty()
+            } else if let Some(c) = &cache {
                 load_leaflet_columns_cached(
                     &leaf_bytes,
                     entry,

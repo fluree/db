@@ -635,4 +635,82 @@ mod tests {
             "t_target > u32::MAX means no replay needed"
         );
     }
+
+    /// Empty-after-retract leaflet: base columns are empty (`row_count == 0`)
+    /// because every fact in the leaflet was retracted. The history sidecar
+    /// still carries the original asserts, so time-travel to a `t` before
+    /// the retract must reconstruct the leaflet from history alone.
+    ///
+    /// This locks in the contract that `replay_leaflet_at_t` callers
+    /// (e.g. batched join probes) must NOT pre-skip leaflets with
+    /// `row_count == 0` when their sidecar carries events past `to_t`.
+    #[test]
+    fn replay_at_t_reconstructs_empty_after_retract_leaflet() {
+        use crate::format::history_sidecar::HistSidecarBuilder;
+        use crate::format::leaf::LeafletDirEntryV3;
+
+        // Build a sidecar segment containing one assert at t=2 and the
+        // matching retract at t=5, mirroring what the indexer writes when
+        // an entire leaflet is retracted.
+        let mut builder = HistSidecarBuilder::new();
+        builder.start_leaflet();
+        builder.push_entry(make_hist(1, 10, 2, 1)); // assert at t=2
+        builder.push_entry(make_hist(1, 10, 5, 0)); // retract at t=5
+        let (sidecar_bytes, segs) = builder.build();
+        assert_eq!(segs.len(), 1);
+        let seg = &segs[0];
+
+        // Synthesize the directory entry the indexer would write for the
+        // empty-after-retract leaflet (`row_count == 0` but `history_*`
+        // populated; key range and `p_const` preserved for routing).
+        let entry = LeafletDirEntryV3 {
+            row_count: 0,
+            lead_group_count: 0,
+            first_key: [0u8; 26],
+            last_key: [0u8; 26],
+            p_const: Some(1),
+            o_type_const: None,
+            flags: 0,
+            payload_offset: 0,
+            payload_len: 0,
+            column_refs: Vec::new(),
+            history_offset: seg.offset,
+            history_len: seg.len,
+            history_min_t: seg.min_t,
+            history_max_t: seg.max_t,
+        };
+
+        // At t_target=3 the retract has not yet happened: the assert from
+        // t=2 must be restored.
+        let result = replay_leaflet_at_t(
+            &ColumnBatch::empty(),
+            &entry,
+            Some(&sidecar_bytes),
+            3,
+            RunSortOrder::Spot,
+        )
+        .expect("replay should succeed");
+        let replayed = result.expect("history past to_t must produce replay");
+        assert_eq!(replayed.row_count, 1, "the retracted assert is restored");
+        assert_eq!(replayed.s_id.get(0), 1);
+        assert_eq!(replayed.o_key.get(0), ObjKey::encode_i64(10).as_u64());
+
+        // At t_target=5 the retract is in effect: nothing to restore.
+        let result = replay_leaflet_at_t(
+            &ColumnBatch::empty(),
+            &entry,
+            Some(&sidecar_bytes),
+            5,
+            RunSortOrder::Spot,
+        )
+        .expect("replay should succeed");
+        // Either Ok(None) (history.max_t == to_t, quick-skip) or an empty
+        // batch — both reflect "nothing live at t=5". The quick-skip path
+        // returns None because `entry.history_max_t == to_t_u32` is not
+        // strictly greater.
+        assert!(
+            result.as_ref().is_none_or(|b| b.row_count == 0),
+            "at to_t == retract_t no rows should be restored"
+        );
+    }
 }

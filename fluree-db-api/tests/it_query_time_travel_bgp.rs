@@ -83,6 +83,47 @@ async fn seed_invoice_ledger(fluree: &fluree_db_api::Fluree) -> fluree_db_api::L
     ledger2
 }
 
+/// Seed a ledger that exercises the empty-after-retract leaflet case.
+///
+/// At t=1 every invoice has a `ns:legacyFlag "true"` triple. At t=2 the
+/// legacy flag is fully retracted from every invoice (no replacement). The
+/// indexer preserves the now-empty leaflet's metadata (`row_count == 0`
+/// but `history_*` populated) so time-travel can still recover the
+/// retracted state. Historical queries at t=1 must see the legacy flag;
+/// queries at t=2 must not.
+async fn seed_fully_retracted_ledger(
+    fluree: &fluree_db_api::Fluree,
+    ledger_id: &str,
+) -> fluree_db_api::LedgerState {
+    let ledger0 = genesis_ledger(fluree, ledger_id);
+
+    // t=1: 5 invoices, all carrying ns:legacyFlag "true" and a status.
+    let mut invoices = Vec::with_capacity(5);
+    for i in 0..5 {
+        invoices.push(json!({
+            "@id": format!("ns:Invoice/inv-{:02}", i),
+            "@type": "ns:Invoice",
+            "ns:status": "paid",
+            "ns:legacyFlag": "true",
+        }));
+    }
+    let tx1 = json!({"@context": ctx(), "@graph": invoices});
+    let _ = fluree.insert(ledger0, &tx1).await.expect("tx1");
+    support::rebuild_and_publish_index(fluree, ledger_id).await;
+    let l1 = fluree.ledger(ledger_id).await.expect("reload after t=1");
+
+    // t=2: retract every ns:legacyFlag triple — no replacement value.
+    let tx2 = json!({
+        "@context": ctx(),
+        "where": {"@id": "?inv", "ns:legacyFlag": "?flag"},
+        "delete": {"@id": "?inv", "ns:legacyFlag": "?flag"}
+    });
+    let l2 = fluree.update(l1, &tx2).await.expect("tx2").ledger;
+    support::rebuild_and_publish_index(fluree, ledger_id).await;
+    fluree.ledger(ledger_id).await.expect("reload after t=2");
+    l2
+}
+
 async fn run_count_sparql(fluree: &fluree_db_api::Fluree, sparql: &str) -> i64 {
     let jsonld = fluree
         .query_from()
@@ -214,6 +255,88 @@ async fn time_travel_type_plus_group_by_property_respects_t() {
         approved,
         Some(2),
         "at t=1, approved count must be 2; full result: {jsonld}"
+    );
+}
+
+/// SPARQL surface regression for time-travel after a full retract.
+///
+/// At t=1 every invoice carries `ns:legacyFlag "true"`; at t=2 the flag
+/// is fully retracted with no replacement. Historical queries at t=1
+/// must still see the flag, queries at t=2 must not.
+///
+/// Note: a *full* `rebuild_index_from_commits` of this small ledger does
+/// not actually produce a `row_count == 0` (empty-after-retract) leaflet
+/// — the rebuild path just omits the predicate from the t=2 index. The
+/// specific empty-leaflet+sidecar shape is covered by
+/// `replay_at_t_reconstructs_empty_after_retract_leaflet` in
+/// `fluree-db-binary-index/src/read/replay.rs`, and the four batched
+/// probe sites + the cursor were updated to not pre-skip those leaflets.
+/// Even so, this end-to-end test locks in the post-retract time-travel
+/// behavior at the SPARQL surface.
+#[tokio::test]
+async fn time_travel_fully_retracted_leaflet_respects_t() {
+    assert_index_defaults();
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger_id = "tt-bgp-empty:main";
+    let _ledger = seed_fully_retracted_ledger(&fluree, ledger_id).await;
+
+    // Pattern E shape: type-class triple + same-subject literal-object
+    // triple. Goes through `flush_batched_exists_accumulator_binary` →
+    // `batched_subject_probe_binary`.
+    let q_t1 = format!(
+        r#"PREFIX ns: <http://example.org/ns#>
+          SELECT (COUNT(?inv) AS ?n)
+          FROM <{ledger_id}@t:1>
+          WHERE {{ ?inv a ns:Invoice ; ns:legacyFlag "true" }}"#
+    );
+    assert_eq!(
+        run_count_sparql(&fluree, &q_t1).await,
+        5,
+        "at t=1 all 5 invoices carry ns:legacyFlag; the leaflet that was \
+         emptied at t=2 must replay from its sidecar"
+    );
+
+    let q_t2 = format!(
+        r#"PREFIX ns: <http://example.org/ns#>
+          SELECT (COUNT(?inv) AS ?n)
+          FROM <{ledger_id}@t:2>
+          WHERE {{ ?inv a ns:Invoice ; ns:legacyFlag "true" }}"#
+    );
+    assert_eq!(
+        run_count_sparql(&fluree, &q_t2).await,
+        0,
+        "at t=2 the legacy flag was fully retracted; count must be 0"
+    );
+
+    // Pattern A shape: type + same-subject ?o triple, GROUP BY ?o. Goes
+    // through `flush_batched_accumulator_binary` → `scan_leaves_into_scatter`.
+    let q_grp_t1 = format!(
+        r"PREFIX ns: <http://example.org/ns#>
+          SELECT ?flag (COUNT(?inv) AS ?n)
+          FROM <{ledger_id}@t:1>
+          WHERE {{ ?inv a ns:Invoice ; ns:legacyFlag ?flag }}
+          GROUP BY ?flag"
+    );
+    let jsonld = fluree
+        .query_from()
+        .sparql(&q_grp_t1)
+        .format(fluree_db_api::FormatterConfig::jsonld())
+        .execute_formatted()
+        .await
+        .expect("group-by sparql should succeed");
+    let rows = jsonld.as_array().expect("array");
+    let true_count = rows.iter().find_map(|row| {
+        let arr = row.as_array()?;
+        if arr[0].as_str()? == "true" {
+            arr[1].as_i64()
+        } else {
+            None
+        }
+    });
+    assert_eq!(
+        true_count,
+        Some(5),
+        "at t=1 group-by must see all 5 retracted-since flags; got {jsonld}"
     );
 }
 
