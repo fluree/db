@@ -30,6 +30,57 @@ use tracing::Instrument;
 const BATCHED_EXISTS_DEBUG_MIN_ACCUM: usize = 8;
 const BATCHED_EXISTS_DEBUG_MIN_MS: u64 = 10;
 
+/// Prepared per-leaf inputs shared by every batched-probe path
+/// (`scan_leaves_into_scatter`, `flush_batched_object_accumulator_binary`,
+/// `batched_subject_probe_binary`, `batched_subject_star_spot`). Owns the
+/// leaf blob, decoded header/dir, the leaf-id hash, and the optional
+/// sidecar bytes — the leaflet loop body destructures this and proceeds
+/// without repeating the fetch+decode dance at each site.
+struct LeafScan {
+    leaf_bytes: Vec<u8>,
+    header: fluree_db_binary_index::format::leaf::LeafHeaderV3,
+    dir: fluree_db_binary_index::format::leaf::DecodedLeafDirV3,
+    leaf_id: u128,
+    /// Sidecar bytes for time-travel replay. `None` at `max_t` (the base
+    /// leaflet alone is authoritative); always fetched when `need_replay`
+    /// is true so `replay_leaflet_at_t` can reconstruct historical state.
+    sidecar_bytes: Option<Vec<u8>>,
+}
+
+fn prepare_leaf_for_scan(
+    store: &BinaryIndexStore,
+    leaf_entry: &fluree_db_binary_index::format::branch::LeafEntry,
+    need_replay: bool,
+) -> Result<LeafScan> {
+    use fluree_db_binary_index::format::leaf::{
+        decode_leaf_dir_v3_with_base, decode_leaf_header_v3,
+    };
+
+    let leaf_bytes = store
+        .get_leaf_bytes_sync(&leaf_entry.leaf_cid)
+        .map_err(|e| QueryError::Internal(format!("fetch leaf: {e}")))?;
+    let sidecar_bytes: Option<Vec<u8>> = if need_replay {
+        store
+            .fetch_sidecar_bytes_sync(leaf_entry.sidecar_cid.as_ref())
+            .map_err(|e| QueryError::Internal(format!("fetch sidecar: {e}")))?
+    } else {
+        None
+    };
+    let header = decode_leaf_header_v3(&leaf_bytes)
+        .map_err(|e| QueryError::Internal(format!("read leaf header: {e}")))?;
+    let dir = decode_leaf_dir_v3_with_base(&leaf_bytes, &header)
+        .map_err(|e| QueryError::Internal(format!("decode leaf dir: {e}")))?;
+    let leaf_id = xxhash_rust::xxh3::xxh3_128(leaf_entry.leaf_cid.to_bytes().as_ref());
+
+    Ok(LeafScan {
+        leaf_bytes,
+        header,
+        dir,
+        leaf_id,
+        sidecar_bytes,
+    })
+}
+
 /// Binary search for the first row in `batch.s_id[start..end]` where `s_id >= target`.
 #[inline]
 fn lower_bound_s_id(
@@ -1493,9 +1544,6 @@ impl NestedLoopJoinOperator {
         scatter: &mut [Vec<Vec<Binding>>],
         dict_overlay: &Option<crate::dict_overlay::DictOverlay>,
     ) -> Result<()> {
-        use fluree_db_binary_index::format::leaf::{
-            decode_leaf_dir_v3_with_base, decode_leaf_header_v3,
-        };
         use fluree_db_binary_index::read::column_loader::load_leaflet_columns_cached;
         use fluree_db_core::o_type::OType;
 
@@ -1509,25 +1557,13 @@ impl NestedLoopJoinOperator {
 
         for leaf_idx in leaf_range {
             let leaf_entry = &branch.leaves[leaf_idx];
-            let leaf_bytes = store
-                .get_leaf_bytes_sync(&leaf_entry.leaf_cid)
-                .map_err(|e| QueryError::Internal(format!("fetch leaf: {e}")))?;
-
-            let header = decode_leaf_header_v3(&leaf_bytes)
-                .map_err(|e| QueryError::Internal(format!("read leaf header: {e}")))?;
-            let dir = decode_leaf_dir_v3_with_base(&leaf_bytes, &header)
-                .map_err(|e| QueryError::Internal(format!("decode leaf dir: {e}")))?;
-            let leaf_id = xxhash_rust::xxh3::xxh3_128(leaf_entry.leaf_cid.to_bytes().as_ref());
-            // Fetch sidecar bytes once per leaf when we need historical replay.
-            // The leaflet base columns are content-addressed (immutable); the
-            // sidecar is what carries retracts, so we only need it for `to_t < max_t`.
-            let sidecar_bytes: Option<Vec<u8>> = if need_replay {
-                store
-                    .fetch_sidecar_bytes_sync(leaf_entry.sidecar_cid.as_ref())
-                    .map_err(|e| QueryError::Internal(format!("fetch sidecar: {e}")))?
-            } else {
-                None
-            };
+            let LeafScan {
+                leaf_bytes,
+                header,
+                dir,
+                leaf_id,
+                sidecar_bytes,
+            } = prepare_leaf_for_scan(store, leaf_entry, need_replay)?;
 
             for (leaflet_idx, entry) in dir.entries.iter().enumerate() {
                 leaflets_scanned += 1;
@@ -2009,9 +2045,6 @@ impl NestedLoopJoinOperator {
         &mut self,
         ctx: &ExecutionContext<'_>,
     ) -> Result<()> {
-        use fluree_db_binary_index::format::leaf::{
-            decode_leaf_dir_v3_with_base, decode_leaf_header_v3,
-        };
         use fluree_db_binary_index::format::run_record_v2::{
             cmp_v2_for_order, read_ordered_key_v2, RunRecordV2,
         };
@@ -2099,24 +2132,13 @@ impl NestedLoopJoinOperator {
         let to_t_u32 = u32::try_from(ctx.to_t).unwrap_or(u32::MAX);
         for leaf_idx in leaf_indices {
             let leaf_entry = &branch.leaves[leaf_idx];
-            let leaf_bytes = store
-                .get_leaf_bytes_sync(&leaf_entry.leaf_cid)
-                .map_err(|e| QueryError::Internal(format!("fetch leaf: {e}")))?;
-
-            let header = decode_leaf_header_v3(&leaf_bytes)
-                .map_err(|e| QueryError::Internal(format!("read leaf header: {e}")))?;
-            let dir = decode_leaf_dir_v3_with_base(&leaf_bytes, &header)
-                .map_err(|e| QueryError::Internal(format!("decode leaf dir: {e}")))?;
-            let leaf_id = xxhash_rust::xxh3::xxh3_128(leaf_entry.leaf_cid.to_bytes().as_ref());
-            // Fetch sidecar bytes once per leaf for historical replay (see
-            // `scan_leaves_into_scatter` for the rationale).
-            let sidecar_bytes: Option<Vec<u8>> = if need_replay {
-                store
-                    .fetch_sidecar_bytes_sync(leaf_entry.sidecar_cid.as_ref())
-                    .map_err(|e| QueryError::Internal(format!("fetch sidecar: {e}")))?
-            } else {
-                None
-            };
+            let LeafScan {
+                leaf_bytes,
+                header,
+                dir,
+                leaf_id,
+                sidecar_bytes,
+            } = prepare_leaf_for_scan(&store, leaf_entry, need_replay)?;
 
             for (leaflet_idx, entry) in dir.entries.iter().enumerate() {
                 let needs_history_replay =
@@ -2541,9 +2563,6 @@ pub(crate) fn batched_subject_probe_binary(
     store: &Arc<BinaryIndexStore>,
     params: &SubjectProbeParams<'_>,
 ) -> Result<Vec<BatchedSubjectProbeMatch>> {
-    use fluree_db_binary_index::format::leaf::{
-        decode_leaf_dir_v3_with_base, decode_leaf_header_v3,
-    };
     use fluree_db_binary_index::format::run_record_v2::{cmp_v2_for_order, RunRecordV2};
     use fluree_db_binary_index::read::column_loader::load_leaflet_columns_cached;
     use fluree_db_binary_index::{ColumnProjection, RunSortOrder};
@@ -2593,21 +2612,13 @@ pub(crate) fn batched_subject_probe_binary(
 
     for leaf_idx in leaf_range {
         let leaf_entry = &branch.leaves[leaf_idx];
-        let leaf_bytes = store
-            .get_leaf_bytes_sync(&leaf_entry.leaf_cid)
-            .map_err(|e| QueryError::Internal(format!("fetch leaf: {e}")))?;
-        let sidecar_bytes: Option<Vec<u8>> = if need_replay {
-            store
-                .fetch_sidecar_bytes_sync(leaf_entry.sidecar_cid.as_ref())
-                .map_err(|e| QueryError::Internal(format!("fetch sidecar: {e}")))?
-        } else {
-            None
-        };
-        let header = decode_leaf_header_v3(&leaf_bytes)
-            .map_err(|e| QueryError::Internal(format!("read leaf header: {e}")))?;
-        let dir = decode_leaf_dir_v3_with_base(&leaf_bytes, &header)
-            .map_err(|e| QueryError::Internal(format!("decode leaf dir: {e}")))?;
-        let leaf_id = xxhash_rust::xxh3::xxh3_128(leaf_entry.leaf_cid.to_bytes().as_ref());
+        let LeafScan {
+            leaf_bytes,
+            header,
+            dir,
+            leaf_id,
+            sidecar_bytes,
+        } = prepare_leaf_for_scan(store, leaf_entry, need_replay)?;
 
         for (leaflet_idx, entry) in dir.entries.iter().enumerate() {
             let needs_history_replay =
@@ -2750,9 +2761,6 @@ pub(crate) fn batched_subject_star_spot(
     predicates: &[SpotStarPredicateParams<'_>],
     dict_overlay: Option<&crate::dict_overlay::DictOverlay>,
 ) -> Result<Vec<BatchedSpotStarMatch>> {
-    use fluree_db_binary_index::format::leaf::{
-        decode_leaf_dir_v3_with_base, decode_leaf_header_v3,
-    };
     use fluree_db_binary_index::format::run_record_v2::{cmp_v2_for_order, RunRecordV2};
     use fluree_db_binary_index::read::column_loader::load_leaflet_columns_cached;
     use fluree_db_binary_index::{ColumnProjection, RunSortOrder};
@@ -2810,21 +2818,13 @@ pub(crate) fn batched_subject_star_spot(
 
     for leaf_idx in leaf_range {
         let leaf_entry = &branch.leaves[leaf_idx];
-        let leaf_bytes = store
-            .get_leaf_bytes_sync(&leaf_entry.leaf_cid)
-            .map_err(|e| QueryError::Internal(format!("fetch leaf: {e}")))?;
-        let sidecar_bytes: Option<Vec<u8>> = if need_replay {
-            store
-                .fetch_sidecar_bytes_sync(leaf_entry.sidecar_cid.as_ref())
-                .map_err(|e| QueryError::Internal(format!("fetch sidecar: {e}")))?
-        } else {
-            None
-        };
-        let header = decode_leaf_header_v3(&leaf_bytes)
-            .map_err(|e| QueryError::Internal(format!("read leaf header: {e}")))?;
-        let dir = decode_leaf_dir_v3_with_base(&leaf_bytes, &header)
-            .map_err(|e| QueryError::Internal(format!("decode leaf dir: {e}")))?;
-        let leaf_id = xxhash_rust::xxh3::xxh3_128(leaf_entry.leaf_cid.to_bytes().as_ref());
+        let LeafScan {
+            leaf_bytes,
+            header,
+            dir,
+            leaf_id,
+            sidecar_bytes,
+        } = prepare_leaf_for_scan(store, leaf_entry, need_replay)?;
 
         for (leaflet_idx, entry) in dir.entries.iter().enumerate() {
             let needs_history_replay =
