@@ -1054,10 +1054,12 @@ pub struct GlobalDicts {
         FxHashMap<GraphId, FxHashMap<u32, fluree_db_binary_index::arena::vector::VectorArena>>,
     /// Fact-identity → vector arena handle mapping for retraction lookup.
     ///
-    /// Keyed by `(g_id, s_id, p_id, o_i, f32_bits)` — the full RDF fact
-    /// identity. `f32_bits` is the per-element bit pattern of the
-    /// quantized f32 vector; this is required (not just `(s, p, o_i)`)
-    /// because:
+    /// Keyed by `(g_id, s_ns_code, s_name, p_id, o_i, f32_bits)` — the
+    /// full RDF fact identity in **subject-name** space (not s_id) so the
+    /// key is stable across the chunk-local-vs-global s_id boundary
+    /// inherent in the incremental-resolve pipeline. `f32_bits` is the
+    /// per-element bit pattern of the quantized f32 vector; this is
+    /// required (not just `(s, p, o_i)`) because:
     /// - Two distinct subjects can hold the same value under the same
     ///   predicate, each with its own arena handle.
     /// - One subject can hold MULTIPLE different vector values under
@@ -1068,7 +1070,8 @@ pub struct GlobalDicts {
     /// `o_i = u32::MAX` is the sentinel for "no list index" (matches
     /// `LIST_INDEX_NONE` in run records).
     #[allow(clippy::type_complexity)]
-    pub vector_fact_handles: FxHashMap<GraphId, FxHashMap<(u64, u32, u32, Vec<u32>), u32>>,
+    pub vector_fact_handles:
+        FxHashMap<GraphId, FxHashMap<(u16, std::sync::Arc<str>, u32, u32, Vec<u32>), u32>>,
 }
 
 impl GlobalDicts {

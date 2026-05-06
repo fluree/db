@@ -674,16 +674,27 @@ impl CommitResolver {
         };
 
         // 6. Encode object -> Option<(ObjKind, ObjKey)>.
-        // Pass `op.op` + `(s_id, i)` so vector retractions resolve to the
-        // assertion's arena handle by fact identity (see `resolve_object`).
-        // `None` means a no-op retraction; skip emitting a record.
+        // Pass `op.op` + `(s_ns_code, s_name, i)` so vector retractions
+        // resolve to the assertion's arena handle by fact identity (see
+        // `resolve_object`). `None` means a no-op retraction; skip emitting.
         let (o_kind, o_key) = match self
-            .resolve_object(&op.o, g_id, s_id, p_id, i, dt_id, dicts, op.op)
+            .resolve_object(
+                &op.o,
+                g_id,
+                op.s_ns_code,
+                op.s_name,
+                p_id,
+                i,
+                dt_id,
+                dicts,
+                op.op,
+            )
             .map_err(|e| CommitCodecError::InvalidOp(format!("object resolve: {e}")))?
         {
             Some(pair) => pair,
             None => return Ok(None),
         };
+        let _ = s_id; // s_id used by the RunRecord constructor below.
 
         // 7. Language tag
         let lang_id = dicts.languages.get_or_insert(op.lang);
@@ -785,7 +796,8 @@ impl CommitResolver {
         &mut self,
         obj: &RawObject<'_>,
         g_id: GraphId,
-        s_id: u64,
+        s_ns_code: u16,
+        s_name: &str,
         p_id: u32,
         o_i: u32,
         _dt_id: u16,
@@ -804,12 +816,19 @@ impl CommitResolver {
                 .entry(p_id)
                 .or_default();
             let fact_map = dicts.vector_fact_handles.entry(g_id).or_default();
-            // Quantize to f32 and use the per-element bit pattern as part of
-            // the key. Required so multi-valued vectors on one (s, p, o_i)
-            // don't collide. Bit-equality matches the arena's storage so
-            // insert+lookup land on the same key.
+            // Key by (subject ns_code, subject name, p_id, o_i, f32_bits).
+            // Subject-name space (not s_id) so the key matches across the
+            // chunk-local-vs-global s_id boundary in the incremental
+            // resolve pipeline; f32 bits disambiguate multi-valued vectors
+            // per (s, p, o_i) without list indices.
             let f32_bits: Vec<u32> = v.iter().map(|&x| (x as f32).to_bits()).collect();
-            let key = (s_id, p_id, o_i, f32_bits);
+            let key = (
+                s_ns_code,
+                std::sync::Arc::<str>::from(s_name),
+                p_id,
+                o_i,
+                f32_bits,
+            );
             if is_assert {
                 // Re-assertion of the same logical fact reuses the
                 // existing arena handle so encoded identity stays stable
@@ -832,7 +851,8 @@ impl CommitResolver {
                 None => {
                     tracing::debug!(
                         g_id,
-                        s_id,
+                        s_ns_code,
+                        s_name,
                         p_id,
                         o_i,
                         "vector retraction has no matching assertion; skipping (no-op)"
@@ -1068,11 +1088,14 @@ pub struct SharedResolverState {
     pub vectors:
         FxHashMap<GraphId, FxHashMap<u32, fluree_db_binary_index::arena::vector::VectorArena>>,
     /// Fact-identity → vector arena handle mapping for retraction lookup.
-    /// Keyed by `(g_id, s_id, p_id, o_i, f32_bits)` — full fact identity.
-    /// See `GlobalDicts::vector_fact_handles` for why the value bits are
-    /// part of the key (multi-valued vectors per s/p without list index).
+    /// Keyed by `(g_id, s_ns_code, s_name, p_id, o_i, f32_bits)` — full
+    /// fact identity in subject-name space. See
+    /// `GlobalDicts::vector_fact_handles` for the rationale (key must be
+    /// stable across chunk-local/global s_id, and `f32_bits` distinguishes
+    /// multi-valued vectors per s/p without list index).
     #[allow(clippy::type_complexity)]
-    pub vector_fact_handles: FxHashMap<GraphId, FxHashMap<(u64, u32, u32, Vec<u32>), u32>>,
+    pub vector_fact_handles:
+        FxHashMap<GraphId, FxHashMap<(u16, std::sync::Arc<str>, u32, u32, Vec<u32>), u32>>,
     /// Datatype dict ID → ValueTypeTag mapping, populated at insertion time.
     /// Indexed by dt_id (u32). Pre-seeded with reserved entries in `new()`.
     pub dt_tags: Vec<fluree_db_core::value_id::ValueTypeTag>,
@@ -1511,12 +1534,23 @@ impl SharedResolverState {
         // 6. Encode object → Option<(ObjKind, ObjKey)>.
         // `None` = vector retraction with no matching assertion: skip emit.
         let (o_kind, o_key) = match self
-            .resolve_object_chunk(&op.o, g_id, s_id, p_id, i, dt_id, chunk, op.op)
+            .resolve_object_chunk(
+                &op.o,
+                g_id,
+                op.s_ns_code,
+                op.s_name,
+                p_id,
+                i,
+                dt_id,
+                chunk,
+                op.op,
+            )
             .map_err(|e| CommitCodecError::InvalidOp(format!("object resolve: {e}")))?
         {
             Some(pair) => pair,
             None => return Ok(None),
         };
+        let _ = s_id; // used by the RunRecord constructor below.
 
         // 7. Language tag (global)
         let lang_id = self.languages.get_or_insert(op.lang);
@@ -1578,7 +1612,8 @@ impl SharedResolverState {
         &mut self,
         obj: &RawObject<'_>,
         g_id: GraphId,
-        s_id: u64,
+        s_ns_code: u16,
+        s_name: &str,
         p_id: u32,
         o_i: u32,
         _dt_id: u16,
@@ -1599,7 +1634,13 @@ impl SharedResolverState {
                 .or_default();
             let fact_map = self.vector_fact_handles.entry(g_id).or_default();
             let f32_bits: Vec<u32> = v.iter().map(|&x| (x as f32).to_bits()).collect();
-            let key = (s_id, p_id, o_i, f32_bits);
+            let key = (
+                s_ns_code,
+                std::sync::Arc::<str>::from(s_name),
+                p_id,
+                o_i,
+                f32_bits,
+            );
             if is_assert {
                 // Re-assertion of the same logical fact reuses the
                 // existing arena handle so encoded identity stays stable
@@ -1622,7 +1663,8 @@ impl SharedResolverState {
                 None => {
                     tracing::debug!(
                         g_id,
-                        s_id,
+                        s_ns_code,
+                        s_name,
                         p_id,
                         o_i,
                         "vector retraction has no matching assertion; skipping (no-op)"

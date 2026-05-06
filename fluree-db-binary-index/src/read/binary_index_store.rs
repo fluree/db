@@ -850,6 +850,34 @@ impl BinaryIndexStore {
         Ok(None)
     }
 
+    /// Decode an `s_id` into its `(ns_code, suffix)` parts via the subject
+    /// forward pack — the inverse of `sid_for_iri`'s split. Returns
+    /// `Err(NotFound)` if the namespace code or local ID isn't registered.
+    /// Useful for incremental indexing where we need the canonical
+    /// subject-name pair (not the joined IRI) as a HashMap key.
+    pub fn resolve_subject_parts(&self, s_id: u64) -> io::Result<(u16, String)> {
+        let sid = fluree_db_core::subject_id::SubjectId::from_u64(s_id);
+        let ns_code = sid.ns_code();
+        let local_id = sid.local_id();
+        let reader = self
+            .dicts
+            .subject_forward_packs
+            .get(&ns_code)
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::NotFound,
+                    format!("no subject forward pack for ns_code={ns_code}"),
+                )
+            })?;
+        let suffix = reader.forward_lookup_str(local_id)?.ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("subject local_id {local_id} not found in ns {ns_code}"),
+            )
+        })?;
+        Ok((ns_code, suffix))
+    }
+
     /// Resolve a subject ID (u64) to its full IRI string.
     pub fn resolve_subject_iri(&self, s_id: u64) -> io::Result<String> {
         let sid = fluree_db_core::subject_id::SubjectId::from_u64(s_id);

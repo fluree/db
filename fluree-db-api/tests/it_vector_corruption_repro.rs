@@ -9,19 +9,27 @@
 //! previous corrupt shape of N scalar flakes each tagged with the
 //! vector datatype.
 //!
-//! Vector retraction is also pinned here at two layers:
+//! Vector retraction is pinned here at three layers:
 //!
 //! - `jsonld_context_vector_bare_array_retracts_after_indexing` — the
-//!   post-rebuild path. The indexer's `resolve_object` re-resolves a
-//!   vector retraction to the existing assertion's arena handle so the
-//!   merge cancellation by `(s, p, dt, o_kind, o_key)` matches.
+//!   post-rebuild path (full rebuild from commit chain). The indexer's
+//!   `resolve_object` resolves a vector retraction to the existing
+//!   assertion's arena handle so merge cancellation by
+//!   `(s, p, dt, o_kind, o_key)` matches.
 //! - `jsonld_context_vector_bare_array_retracts_via_novelty_overlay` —
-//!   the pre-rebuild novelty-overlay path. The query layer's
-//!   `binary_scan::translate_one_flake_v3_pub` short-circuits
-//!   `FlakeValue::Vector` retractions through
-//!   `BinaryIndexStore::find_vector_handle` to look up the assertion's
-//!   handle in the base index so the overlay subtracts it correctly
-//!   without requiring a republish.
+//!   the pre-rebuild novelty-overlay path. `binary_scan::translate_one_flake_v3_pub`
+//!   short-circuits `FlakeValue::Vector` retractions through
+//!   `BinaryIndexStore::find_vector_handle_by_fact` (SPOT scan + value
+//!   compare) so the overlay subtracts the right indexed row without a
+//!   republish.
+//! - `jsonld_vector_retracts_via_incremental_publish` — the
+//!   incremental-publish path (most common in production once a base
+//!   index exists). `incremental_resolve` pre-loads base vector arenas
+//!   into `shared.vectors` and SPOT-scans the base for VECTOR_ID rows to
+//!   pre-populate `vector_fact_handles`. Chunk inserts then append to
+//!   the unified arena (handles already global), and chunk retractions
+//!   of base-asserted vectors find their handle via the pre-populated
+//!   fact map.
 
 mod support;
 
@@ -451,7 +459,10 @@ async fn jsonld_re_asserting_same_vector_dedups() {
         .expect("re-assert same vector");
     let _ = loaded1; // sanity drop
     support::rebuild_and_publish_index(&fluree, ledger_id).await;
-    let reloaded = fluree.ledger(ledger_id).await.expect("load after re-assert");
+    let reloaded = fluree
+        .ledger(ledger_id)
+        .await
+        .expect("load after re-assert");
 
     let count_q = r"
         PREFIX ex: <http://example.org/>
@@ -641,6 +652,74 @@ async fn jsonld_context_vector_duplicate_values_overlay_retract_one_keeps_other(
         .await
         .expect("format");
     assert_eq!(rows, json!([]), "overlay must retract doc2");
+}
+
+/// Incremental publish path: vector asserted in commit 1 (publish triggers
+/// full rebuild), then retracted in commit 2 (publish triggers
+/// *incremental* indexing because a base index exists). The retraction
+/// must apply on the incremental publish — not silently drop with the
+/// base assertion left in place.
+///
+/// Pre-fix the chunk-local `vector_fact_handles` only knew assertions
+/// from THIS chunk; retractions of base-asserted vectors returned
+/// `Ok(None)` and the merge dropped them. After incremental publish the
+/// base assertion was still queryable, the user's DELETE silently
+/// reverted.
+#[tokio::test]
+async fn jsonld_vector_retracts_via_incremental_publish() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger_id = "it/vector-corruption/incremental-retract:main";
+    let ledger0 = support::genesis_ledger(&fluree, ledger_id);
+
+    // Commit 1: insert vector. Publish (full rebuild — no prior index).
+    let insert = json!({
+        "@context": {
+            "ex": "http://example.org/",
+            "ex:embedding": { "@type": "@vector" }
+        },
+        "@graph": [{ "@id": "ex:doc1", "ex:embedding": [0.1, 0.2, 0.3, 0.4] }]
+    });
+    fluree.insert(ledger0, &insert).await.expect("insert");
+    support::rebuild_and_publish_index(&fluree, ledger_id).await;
+    let after_publish_1 = fluree
+        .ledger(ledger_id)
+        .await
+        .expect("load after publish 1");
+
+    // Commit 2: delete the vector. Publish via `build_and_publish_index`
+    // which dispatches to incremental indexing when a base exists.
+    let delete = r"
+        PREFIX ex: <http://example.org/>
+        DELETE WHERE { ex:doc1 ex:embedding ?v }
+    ";
+    let txn = lower_sparql_update(&after_publish_1, delete);
+    fluree
+        .stage_owned(after_publish_1)
+        .txn(txn)
+        .execute()
+        .await
+        .expect("DELETE WHERE");
+    support::build_and_publish_index(&fluree, ledger_id).await;
+    let final_ledger = fluree
+        .ledger(ledger_id)
+        .await
+        .expect("load after publish 2");
+
+    let count = r"
+        PREFIX ex: <http://example.org/>
+        SELECT (COUNT(*) AS ?n) WHERE { ex:doc1 ex:embedding ?v }
+    ";
+    let count_rows = support::query_sparql(&fluree, &final_ledger, count)
+        .await
+        .expect("count after incremental")
+        .to_jsonld_async(final_ledger.as_graph_db_ref(0))
+        .await
+        .expect("format");
+    assert_eq!(
+        count_rows,
+        json!([[0]]),
+        "incremental publish must apply the retraction of a base-asserted vector"
+    );
 }
 
 /// SPARQL `DELETE DATA` for a vector that was never inserted must NOT

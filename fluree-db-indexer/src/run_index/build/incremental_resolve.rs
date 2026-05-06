@@ -266,7 +266,14 @@ pub async fn resolve_incremental_commits_v6(
             }
         }
 
-        // 4b. Collect base vector counts.
+        // 4b. Pre-load base vector arenas into `shared.vectors`.
+        //
+        // Loading the actual shard bytes (rather than just the count) makes
+        // chunk inserts append to the unified base+chunk arena, so handles
+        // returned by `arena.insert_f64` are already global. This in turn
+        // makes the offset pass a no-op for VECTOR_ID and lets re-asserted
+        // logical vector facts (same `(s, p, value)` across commits) dedup
+        // against the base entry instead of producing duplicate rows.
         let mut base_vector_counts: HashMap<(u16, u32), u32> = HashMap::new();
         for ga in &root.graph_arenas {
             for vref in &ga.vectors {
@@ -284,6 +291,48 @@ pub async fn resolve_incremental_commits_v6(
                             ))
                         })?;
                 base_vector_counts.insert((ga.g_id, vref.p_id), manifest.total_count);
+
+                // Fetch each shard and reassemble a fully-populated
+                // VectorArena. Inserts during chunk processing will append
+                // to this — handles already global.
+                let mut shards = Vec::with_capacity(manifest.shards.len());
+                for shard_info in &manifest.shards {
+                    let cid: ContentId = shard_info.cas.parse().map_err(|e| {
+                        IncrementalResolveError::RootLoad(format!(
+                            "vector shard CID parse for g_id={}, p_id={}: {e}",
+                            ga.g_id, vref.p_id
+                        ))
+                    })?;
+                    let bytes = cs.get(&cid).await.map_err(|e| {
+                        IncrementalResolveError::RootLoad(format!(
+                            "vector shard load for g_id={}, p_id={}, cid={}: {e}",
+                            ga.g_id, vref.p_id, shard_info.cas
+                        ))
+                    })?;
+                    let shard =
+                        fluree_db_binary_index::arena::vector::read_vector_shard_from_bytes(&bytes)
+                            .map_err(|e| {
+                                IncrementalResolveError::RootLoad(format!(
+                                    "vector shard decode for g_id={}, p_id={}: {e}",
+                                    ga.g_id, vref.p_id
+                                ))
+                            })?;
+                    shards.push(shard);
+                }
+                let arena = fluree_db_binary_index::arena::vector::load_arena_from_shards(
+                    &manifest, shards,
+                )
+                .map_err(|e| {
+                    IncrementalResolveError::RootLoad(format!(
+                        "vector arena reassembly for g_id={}, p_id={}: {e}",
+                        ga.g_id, vref.p_id
+                    ))
+                })?;
+                shared
+                    .vectors
+                    .entry(ga.g_id)
+                    .or_default()
+                    .insert(vref.p_id, arena);
             }
         }
 
@@ -293,6 +342,26 @@ pub async fn resolve_incremental_commits_v6(
             t0.elapsed().as_millis() as u64,
         )
     };
+
+    // 4c. Pre-populate `vector_fact_handles` from base SPOT.
+    //
+    // For every base VECTOR_ID row, decode `(s_ns_code, s_name, p_id, o_i, value, handle)`
+    // and insert into the shared fact map. This makes:
+    //  - Vector RETRACTIONS in this chunk find the assertion's existing handle
+    //    (correctness — without this, the chunk would emit Ok(None) and the
+    //    user's DELETE silently no-ops at incremental publish).
+    //  - Vector RE-ASSERTIONS dedup against the base entry (same handle reused),
+    //    so we don't end up with two encoded rows for the same logical fact.
+    if !shared.vectors.is_empty() {
+        seed_vector_fact_handles(
+            Arc::clone(&cs),
+            &root,
+            &mut shared,
+            config.artifact_cache_dir.as_deref(),
+        )
+        .await
+        .map_err(|e| IncrementalResolveError::RootLoad(format!("vector fact-handle seed: {e}")))?;
+    }
 
     // 5. Walk commit chain (commit format is version-independent).
     let (walked_commits, t_walk_chain_ms) = {
@@ -479,44 +548,35 @@ pub async fn resolve_incremental_commits_v6(
     }
     let t_remap_records_ms = t0.elapsed().as_millis() as u64;
 
-    // Offset vector handles.
+    // VECTOR_ID handles are already globally-correct: chunk inserts
+    // appended to the pre-loaded base arena (step 4b) so they return
+    // `base_count..base_count+chunk_count` directly, and retractions /
+    // re-assertions resolve to base handles via the pre-populated
+    // `vector_fact_handles` (step 4c). No offset pass needed.
     //
-    // TODO(incremental-vector-retraction): chunk-local handle space lives
-    // 0..chunk_count; this pass shifts to base_count..base_count+chunk_count
-    // so handles are globally unique post-merge.
-    //
-    // KNOWN GAP: a retraction whose ASSERTION lives in the base index (not
-    // in the new chunk) cannot currently resolve to the base handle —
-    // `SharedResolverState::vector_fact_handles` is populated only from
-    // chunk assertions, so `resolve_object_chunk` returns Ok(None) (no-op
-    // skip) and the user's DELETE silently has no effect on incremental
-    // republish.
-    //
-    // Two fix shapes (pick one in a follow-up):
-    //   (a) Pre-load base vector arenas into `shared.vectors` AND
-    //       SPOT-scan the base for VECTOR_ID rows to pre-populate
-    //       `shared.vector_fact_handles`. Chunk inserts then append to
-    //       the unified arena returning globally-unique handles directly
-    //       (offset becomes a no-op for vectors). Heavy I/O but cleanest.
-    //   (b) Per-retraction fallback: when chunk fact-handle lookup misses,
-    //       query the base index via `BinaryIndexStore::find_vector_handle_by_fact`,
-    //       store the result with a high-bit sentinel on o_key, and have
-    //       this offset pass strip the sentinel (skipping the offset for
-    //       sentinel-tagged records).
-    //
-    // Until then, the rebuild path (which the test suite exercises) is
-    // correct, and incremental retraction of base vectors is a safe
-    // no-op rather than data corruption.
-    if !base_vector_counts.is_empty() {
-        for record in &mut v1_records {
-            if ObjKind::from_u8(record.o_kind) == ObjKind::VECTOR_ID {
-                let key = (record.g_id, record.p_id);
-                if let Some(&base_count) = base_vector_counts.get(&key) {
-                    record.o_key += base_count as u64;
-                }
+    // Sanity guard: every VECTOR_ID record's o_key must be < total arena
+    // count (base + chunk). A regression here would mean a chunk emitted
+    // a handle that doesn't exist in the unified arena.
+    debug_assert!(
+        v1_records.iter().all(|record| {
+            if ObjKind::from_u8(record.o_kind) != ObjKind::VECTOR_ID {
+                return true;
             }
-        }
-    }
+            let base_count = base_vector_counts
+                .get(&(record.g_id, record.p_id))
+                .copied()
+                .unwrap_or(0) as u64;
+            let chunk_count = shared
+                .vectors
+                .get(&record.g_id)
+                .and_then(|m| m.get(&record.p_id))
+                .map(|a| a.len() as u64)
+                .unwrap_or(0);
+            // `chunk_count` is base + new (since base was pre-loaded).
+            record.o_key < chunk_count.max(base_count)
+        }),
+        "VECTOR_ID record has out-of-range o_key after pre-loaded incremental resolve"
+    );
 
     // 10. Sort V1 records by (g_id, SPOT) — needed for the conversion step
     //     which preserves sort order.
@@ -582,6 +642,114 @@ struct WalkedCommit {
     cid: ContentId,
     t: i64,
     bytes: Vec<u8>,
+}
+
+/// SPOT-scan the base index for every `o_kind = VECTOR_ID` row and
+/// pre-populate `shared.vector_fact_handles` with
+/// `(g_id, s_ns_code, s_name, p_id, o_i, f32_bits) → handle` so chunk
+/// retractions of base-asserted vectors find their handle (and chunk
+/// re-assertions dedup against the base entry).
+///
+/// Reuses the public `BinaryIndexStore::load_from_root_v6` for the SPOT
+/// cursor + dict decoding. The duplicate arena loading is bounded; if it
+/// becomes a hot path we can add a slimmer "scan-only" loader.
+async fn seed_vector_fact_handles(
+    cs: Arc<dyn ContentStore>,
+    root: &fluree_db_binary_index::format::index_root::IndexRoot,
+    shared: &mut SharedResolverState,
+    cache_dir: Option<&std::path::Path>,
+) -> io::Result<()> {
+    use fluree_db_binary_index::format::run_record::RunSortOrder;
+    use fluree_db_binary_index::read::binary_cursor::BinaryCursor;
+    use fluree_db_binary_index::read::binary_index_store::BinaryIndexStore;
+    use fluree_db_binary_index::read::column_types::{BinaryFilter, ColumnProjection, ColumnSet};
+    use fluree_db_core::o_type::OType;
+
+    let cache_dir = cache_dir
+        .map(std::path::Path::to_path_buf)
+        .unwrap_or_else(std::env::temp_dir);
+
+    let store = Arc::new(
+        BinaryIndexStore::load_from_root_v6(Arc::clone(&cs), root, &cache_dir, None).await?,
+    );
+
+    // Walk every graph that has vector arenas; for each, scan SPOT for
+    // VECTOR_ID rows and decode (s_ns_code, s_name, p_id, o_i, value) →
+    // handle into the shared fact map.
+    let graphs_with_vectors: Vec<u16> = shared.vectors.keys().copied().collect();
+    for g_id in graphs_with_vectors {
+        let branch = match store.branch_for_order(g_id, RunSortOrder::Spot) {
+            Some(b) => Arc::clone(b),
+            None => continue,
+        };
+        let arena_map = match shared.vectors.get(&g_id) {
+            Some(m) => m,
+            None => continue,
+        };
+        let filter = BinaryFilter {
+            o_type: Some(OType::VECTOR.as_u16()),
+            ..Default::default()
+        };
+        let projection = ColumnProjection::for_scan(ColumnSet::EMPTY, false, RunSortOrder::Spot);
+        let mut cursor = BinaryCursor::scan_all(
+            Arc::clone(&store),
+            RunSortOrder::Spot,
+            branch,
+            filter,
+            projection,
+        );
+        let fact_map = shared.vector_fact_handles.entry(g_id).or_default();
+        while let Some(batch) = cursor.next_batch()? {
+            for i in 0..batch.row_count {
+                if batch.o_type.get_or(i, 0) != OType::VECTOR.as_u16() {
+                    continue;
+                }
+                let s_id = batch.s_id.get(i);
+                let p_id = batch.p_id.get(i);
+                let handle = batch.o_key.get(i) as u32;
+                let o_i = batch.o_i.get_or(i, u32::MAX);
+                let (ns_code, name) = match store.resolve_subject_parts(s_id) {
+                    Ok(parts) => parts,
+                    Err(e) => {
+                        tracing::warn!(
+                            g_id,
+                            s_id,
+                            error = %e,
+                            "vector fact-handle seed: subject decode failed; skipping row"
+                        );
+                        continue;
+                    }
+                };
+                let arena = match arena_map.get(&p_id) {
+                    Some(a) => a,
+                    None => continue,
+                };
+                let f32_bits: Vec<u32> = match arena.get_f32(handle) {
+                    Some(slice) => slice.iter().map(|&x| x.to_bits()).collect(),
+                    None => {
+                        tracing::warn!(
+                            g_id,
+                            p_id,
+                            handle,
+                            "vector fact-handle seed: arena handle out of range; skipping"
+                        );
+                        continue;
+                    }
+                };
+                fact_map.insert(
+                    (
+                        ns_code,
+                        std::sync::Arc::<str>::from(name.as_str()),
+                        p_id,
+                        o_i,
+                        f32_bits,
+                    ),
+                    handle,
+                );
+            }
+        }
+    }
+    Ok(())
 }
 
 async fn walk_commit_chain_since(
