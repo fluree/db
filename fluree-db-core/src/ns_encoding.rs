@@ -589,6 +589,58 @@ impl NamespaceCodes {
         Ok(())
     }
 
+    /// Like [`merge_delta`](Self::merge_delta), but also records the new
+    /// entries in the persistence delta (`self.delta`) so the next
+    /// `take_delta()` includes them in the commit record.
+    ///
+    /// Use this when adopting allocations made by *another* registry that
+    /// must end up persisted in this registry's commit (e.g. SPARQL
+    /// `lower_sparql_update` builds template Sids against a caller-owned
+    /// `NamespaceRegistry`; the staging path adopts those allocations so the
+    /// committed snapshot maps them back to IRIs for query-time lookup).
+    pub fn adopt_delta_for_persistence(
+        &mut self,
+        delta: &HashMap<u16, String>,
+    ) -> Result<(), NsAllocError> {
+        for (&code, prefix) in delta {
+            // Same conflict checks as merge_delta
+            if let Some(existing) = self.code_to_prefix.get(&code) {
+                if existing != prefix {
+                    return Err(NsAllocError::CodeConflict {
+                        code,
+                        new_prefix: prefix.clone(),
+                        existing_prefix: existing.clone(),
+                    });
+                }
+                // Already registered with matching prefix — record in delta only
+                // if this registry hasn't already persisted it.
+                self.delta.entry(code).or_insert_with(|| prefix.clone());
+                continue;
+            }
+
+            if let Some(&existing_code) = self.prefix_to_code.get(prefix.as_str()) {
+                if existing_code != code {
+                    return Err(NsAllocError::PrefixConflict {
+                        prefix: prefix.clone(),
+                        new_code: code,
+                        existing_code,
+                    });
+                }
+                self.delta.entry(code).or_insert_with(|| prefix.clone());
+                continue;
+            }
+
+            // New mapping — insert into both lookup tables AND persistence delta
+            self.prefix_to_code.insert(prefix.clone(), code);
+            self.code_to_prefix.insert(code, prefix.clone());
+            self.delta.insert(code, prefix.clone());
+            if code >= self.next_code && code < OVERFLOW {
+                self.next_code = code + 1;
+            }
+        }
+        Ok(())
+    }
+
     /// Take the accumulated delta (new allocations) and reset it.
     ///
     /// Returns the map of new allocations (`code → prefix`) for inclusion
@@ -1039,6 +1091,149 @@ mod tests {
         let delta = codes.take_delta();
         assert!(!delta.is_empty());
         assert!(!codes.has_delta());
+    }
+
+    // ---- adopt_delta_for_persistence ----
+    //
+    // Distinct from merge_delta: also records adopted entries in
+    // `self.delta` so the next take_delta()/commit captures them.
+    // Used by `stage_transaction_from_txn` to persist namespace
+    // allocations made by an upstream registry (e.g. SPARQL lowering).
+
+    #[test]
+    fn test_adopt_delta_records_new_mapping_in_delta() {
+        let mut codes = NamespaceCodes::new();
+        let next_code_before = codes.next_code;
+
+        let mut delta = HashMap::new();
+        delta.insert(next_code_before, "https://new.example.org/".to_string());
+        codes.adopt_delta_for_persistence(&delta).unwrap();
+
+        // Lookup tables updated
+        assert_eq!(
+            codes.get_code("https://new.example.org/"),
+            Some(next_code_before)
+        );
+        assert_eq!(
+            codes.get_prefix(next_code_before),
+            Some("https://new.example.org/")
+        );
+
+        // Persistence delta captured the new entry — this is the contract
+        // that distinguishes adopt_delta_for_persistence from merge_delta.
+        assert!(codes.has_delta());
+        let taken = codes.take_delta();
+        assert_eq!(
+            taken.get(&next_code_before).map(String::as_str),
+            Some("https://new.example.org/")
+        );
+    }
+
+    #[test]
+    fn test_adopt_delta_advances_next_code() {
+        let mut codes = NamespaceCodes::new();
+        let mut delta = HashMap::new();
+        // Adopt a code well above next_code; next_code must jump past it
+        // so subsequent allocations don't collide.
+        delta.insert(200u16, "https://gap.example.org/".to_string());
+        codes.adopt_delta_for_persistence(&delta).unwrap();
+
+        assert_eq!(codes.next_code, 201);
+
+        // The next allocate_prefix should land at 201.
+        let new_code = codes.allocate_prefix("https://after.example.org/").unwrap();
+        assert_eq!(new_code, 201);
+    }
+
+    #[test]
+    fn test_adopt_delta_idempotent_for_same_mapping() {
+        let mut codes = NamespaceCodes::new();
+        let mut delta = HashMap::new();
+        delta.insert(150u16, "https://idem.example.org/".to_string());
+
+        codes.adopt_delta_for_persistence(&delta).unwrap();
+        // Second adopt of the same mapping must succeed and not duplicate
+        // entries or change next_code.
+        let next_code_after_first = codes.next_code;
+        codes.adopt_delta_for_persistence(&delta).unwrap();
+        assert_eq!(codes.next_code, next_code_after_first);
+        assert_eq!(codes.get_code("https://idem.example.org/"), Some(150));
+    }
+
+    #[test]
+    fn test_adopt_delta_rejects_code_conflict() {
+        let mut codes = NamespaceCodes::new();
+        let mut first = HashMap::new();
+        first.insert(170u16, "https://first.example.org/".to_string());
+        codes.adopt_delta_for_persistence(&first).unwrap();
+
+        // Same code, different prefix → CodeConflict.
+        let mut conflicting = HashMap::new();
+        conflicting.insert(170u16, "https://second.example.org/".to_string());
+        let err = codes
+            .adopt_delta_for_persistence(&conflicting)
+            .expect_err("must reject");
+        match err {
+            NsAllocError::CodeConflict {
+                code,
+                new_prefix,
+                existing_prefix,
+            } => {
+                assert_eq!(code, 170);
+                assert_eq!(new_prefix, "https://second.example.org/");
+                assert_eq!(existing_prefix, "https://first.example.org/");
+            }
+            other => panic!("expected CodeConflict, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_adopt_delta_rejects_prefix_conflict() {
+        let mut codes = NamespaceCodes::new();
+        let mut first = HashMap::new();
+        first.insert(180u16, "https://shared.example.org/".to_string());
+        codes.adopt_delta_for_persistence(&first).unwrap();
+
+        // Same prefix, different code → PrefixConflict.
+        let mut conflicting = HashMap::new();
+        conflicting.insert(181u16, "https://shared.example.org/".to_string());
+        let err = codes
+            .adopt_delta_for_persistence(&conflicting)
+            .expect_err("must reject");
+        match err {
+            NsAllocError::PrefixConflict {
+                prefix,
+                new_code,
+                existing_code,
+            } => {
+                assert_eq!(prefix, "https://shared.example.org/");
+                assert_eq!(new_code, 181);
+                assert_eq!(existing_code, 180);
+            }
+            other => panic!("expected PrefixConflict, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_adopt_delta_records_existing_mapping_in_delta_when_absent() {
+        // Pre-existing mapping (e.g. a default that won't otherwise be in
+        // delta): adopt_delta_for_persistence should still record it so the
+        // commit captures the use site. Avoids losing the binding when the
+        // staging registry inherits from a snapshot but the lowering
+        // registry independently learned of the same mapping.
+        let mut codes = NamespaceCodes::new();
+        let prefix = "https://shared.example.org/";
+        let code = codes.allocate_prefix(prefix).unwrap();
+        // Drain the delta so we can observe whether adopt re-records it.
+        codes.take_delta();
+        assert!(!codes.has_delta());
+
+        let mut delta = HashMap::new();
+        delta.insert(code, prefix.to_string());
+        codes.adopt_delta_for_persistence(&delta).unwrap();
+
+        let taken = codes.take_delta();
+        assert_eq!(taken.get(&code).map(String::as_str), Some(prefix));
     }
 
     // ---- NsLookup trait ----

@@ -1209,7 +1209,33 @@ impl crate::Fluree {
         policy: Option<&crate::PolicyContext>,
         tracker: Option<&Tracker>,
     ) -> Result<StageResult> {
-        let ns_registry = NamespaceRegistry::from_db(&ledger.snapshot);
+        let mut ns_registry = NamespaceRegistry::from_db(&ledger.snapshot);
+
+        // Adopt any namespace allocations the lowering step already made
+        // (e.g. `lower_sparql_update` allocates IRIs against a caller-owned
+        // registry to build the templates' Sids). The staging registry must
+        // both (a) know about the codes for in-session lookups and (b)
+        // record them in its persistence delta so the commit envelope
+        // captures them — otherwise the committed snapshot omits the
+        // mapping and post-commit SELECT can't resolve the predicate IRI
+        // back to the same Sid the flake was stored under.
+        //
+        // Conflicts here are retry-safe: they happen when two concurrent
+        // SPARQL UPDATEs both lower against the same pre-commit snapshot
+        // and pick the same first-time namespace code for different
+        // prefixes. The second writer should re-lower against the latest
+        // snapshot (which now sees the first writer's namespaces) — surface
+        // as `NamespaceConflict` so callers in the same family as
+        // `CommitConflict` / `PublishLostRace` can treat it uniformly.
+        if !txn.namespace_delta.is_empty() {
+            ns_registry
+                .adopt_delta_for_persistence(&txn.namespace_delta)
+                .map_err(|e| {
+                    ApiError::Transact(fluree_db_transact::TransactError::NamespaceConflict(
+                        e.to_string(),
+                    ))
+                })?;
+        }
 
         // Extract txn_meta and graph_delta before staging consumes the Txn
         let txn_meta = txn.txn_meta.clone();

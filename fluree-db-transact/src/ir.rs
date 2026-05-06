@@ -174,6 +174,22 @@ pub struct Txn {
     /// - `1`: txn-meta graph (`#txn-meta`)
     /// - `2+`: user-defined named graphs
     pub graph_delta: FxHashMap<u16, String>,
+
+    /// Namespace allocations made during lowering that the staging path must
+    /// merge into its own registry before flake generation.
+    ///
+    /// Required when the producer of this `Txn` (e.g. `lower_sparql_update`)
+    /// uses a `NamespaceRegistry` that is independent of the one
+    /// `stage_transaction_from_txn` creates from the ledger snapshot. Without
+    /// this hand-off, IRIs allocated during lowering (e.g. `ex:doc1` →
+    /// `Sid{13, "doc1"}`) get baked into the templates but the staging
+    /// registry never learns about them, so the commit's persisted
+    /// namespace map omits the mapping and post-commit SELECT can't resolve
+    /// the predicate IRI back to the same Sid.
+    ///
+    /// JSON-LD producers (`parse_transaction`) share the staging registry and
+    /// leave this empty.
+    pub namespace_delta: std::collections::HashMap<u16, String>,
 }
 
 impl Txn {
@@ -192,6 +208,7 @@ impl Txn {
             vars: VarRegistry::new(),
             txn_meta: Vec::new(),
             graph_delta: FxHashMap::default(),
+            namespace_delta: std::collections::HashMap::new(),
         }
     }
 
