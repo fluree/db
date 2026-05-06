@@ -17,6 +17,7 @@
 //! See [`parse_query_ast`] for the pure parsing phase (no DB required),
 //! and `lower_query` for the lowering phase (requires `IriEncoder`).
 
+pub mod aggregate_fn;
 pub mod ast;
 pub mod encode;
 pub mod error;
@@ -238,12 +239,21 @@ fn parse_query_ast_internal(
     }
 
     // Parse query options (limit, offset, orderBy, groupBy, having, etc.)
-    // Preserve aggregates collected from S-expression syntax in parse_select
-    let aggregates_from_select = std::mem::take(&mut query.options.aggregates);
+    // Preserve aggregates and post_binds already collected on query.options:
+    // - aggregates: from S-expression SELECT syntax (`parse_select`) and from
+    //   inline aggregates hoisted out of WHERE BIND patterns
+    //   (`where_clause::"bind"`).
+    // - post_binds: from WHERE BIND patterns whose expression referenced
+    //   inline aggregates — these run after grouping/aggregation and must
+    //   survive the upcoming wholesale `query.options = opts` replacement.
+    let aggregates_so_far = std::mem::take(&mut query.options.aggregates);
+    let post_binds_so_far = std::mem::take(&mut query.options.post_binds);
     let mut opts = options::parse_options(obj, filter_data::parse_filter_expr)?;
-    // Merge aggregates from HAVING parsing with aggregates collected from select clause.
-    // (HAVING may introduce synthetic aggregates like (count ?x) used only for filtering.)
-    opts.aggregates.extend(aggregates_from_select);
+    // Merge aggregates from HAVING parsing with aggregates collected earlier.
+    // HAVING may introduce its own synthetic aggregates (e.g. (count ?x) used
+    // only for filtering) which compose alongside SELECT and BIND aggregates.
+    opts.aggregates.extend(aggregates_so_far);
+    opts.post_binds.extend(post_binds_so_far);
     query.options = opts;
 
     // GROUP BY without explicit ORDER BY defaults to ordering by the group key(s).
@@ -744,9 +754,13 @@ fn parse_direct_aggregate(
     })
 }
 
-/// Parse aggregate function and input variable from args
+/// Parse aggregate function and input variable from s-expression-tokenized args.
 ///
-/// Returns (function, input_var)
+/// Thin wrapper that adapts the legacy `&[SexprToken]` shape to the shared
+/// `aggregate_fn::try_parse_aggregate_call` helper. The s-expr select-clause
+/// path requires the function name to be known (it has already committed to
+/// parsing this as an aggregate), so an unknown name is escalated to
+/// `ParseError::UnknownAggregate` rather than the helper's `Ok(None)`.
 fn parse_aggregate_fn_and_input(
     fn_name: &str,
     args: &[sexpr_tokenize::SexprToken],
@@ -757,70 +771,16 @@ fn parse_aggregate_fn_and_input(
         )));
     }
 
-    // First arg is the input variable (or "*" for count)
     let input = args[0].expect_atom("aggregate input")?;
+    let extra: Vec<&str> = args[1..]
+        .iter()
+        .map(|t| t.expect_atom("aggregate extra arg"))
+        .collect::<Result<Vec<_>>>()?;
 
-    // Validate input is a variable or "*"
-    if input != "*" && !is_variable(input) {
-        return Err(ParseError::InvalidSelect(format!(
-            "aggregate input must be a variable or '*', got: {input}"
-        )));
+    match aggregate_fn::try_parse_aggregate_call(fn_name, input, &extra)? {
+        Some((function, input_arc)) => Ok((function, input_arc.to_string())),
+        None => Err(ParseError::UnknownAggregate(fn_name.to_string())),
     }
-
-    // Parse function + validate arity.
-    //
-    // IMPORTANT: don't silently ignore extra args (user feedback).
-    //
-    // Most aggregates take exactly 1 argument; special cases handled separately.
-    let function = match fn_name {
-        // group-concat accepts an optional separator: (groupconcat ?x ", ")
-        "group-concat" | "groupconcat" => {
-            if args.len() > 2 {
-                return Err(ParseError::InvalidSelect(format!(
-                    "aggregate '{fn_name}' accepts at most 2 arguments, got {} (expected: (groupconcat ?x) or (groupconcat ?x \", \"))",
-                    args.len(),
-                )));
-            }
-            let separator = if args.len() > 1 {
-                args[1].expect_atom("groupconcat separator")?.to_string()
-            } else {
-                " ".to_string() // default separator
-            };
-            ast::UnresolvedAggregateFn::GroupConcat { separator }
-        }
-        // All other aggregates require exactly 1 argument.
-        _ => {
-            let variant = match fn_name {
-                "count" => ast::UnresolvedAggregateFn::Count,
-                "count-distinct" | "countdistinct" => ast::UnresolvedAggregateFn::CountDistinct,
-                "sum" => ast::UnresolvedAggregateFn::Sum,
-                "avg" => ast::UnresolvedAggregateFn::Avg,
-                "min" => ast::UnresolvedAggregateFn::Min,
-                "max" => ast::UnresolvedAggregateFn::Max,
-                "median" => ast::UnresolvedAggregateFn::Median,
-                "variance" => ast::UnresolvedAggregateFn::Variance,
-                "stddev" => ast::UnresolvedAggregateFn::Stddev,
-                "sample" => ast::UnresolvedAggregateFn::Sample,
-                other => return Err(ParseError::UnknownAggregate(other.to_string())),
-            };
-            if args.len() != 1 {
-                return Err(ParseError::InvalidSelect(format!(
-                    "aggregate '{fn_name}' requires exactly 1 argument, got {} (expected: ({fn_name} ?x))",
-                    args.len(),
-                )));
-            }
-            variant
-        }
-    };
-
-    // Validate COUNT(*) is only used with count
-    if input == "*" && !matches!(function, ast::UnresolvedAggregateFn::Count) {
-        return Err(ParseError::InvalidSelect(format!(
-            "'*' can only be used with count, not {fn_name}"
-        )));
-    }
-
-    Ok((function, input.to_string()))
 }
 
 /// Parse a graph crawl select object like `{"?person": ["*", {"ex:friend": ["*"]}]}`

@@ -171,16 +171,33 @@ pub fn parse_where_array_element(
             // ["bind", "?var", expr, "?var2", expr2, ...]
             //
             // `expr` supports:
-            // - string S-expression: "(+ ?x 1)"
-            // - data expr: ["+", "?x", 1]
+            // - string S-expression: "(+ ?x 1)"               // B2 form
+            // - data expr: ["+", "?x", 1]                     // B1 form
             // - wrapped expr: ["expr", [...]]
+            //
+            // Inline aggregates (e.g. `["min", "?p"]` in B1, `"(min ?p)"`
+            // in B2) appearing inside the BIND expression are recognized as
+            // aggregate function calls (`Call` nodes whose head matches
+            // `aggregate_fn::is_aggregate_name`). They are hoisted out of
+            // the expression, allocated a synthetic `?__bind_agg{N}` alias
+            // appended to `query.options.aggregates`, and the rewritten
+            // BIND `(var, expr)` is recorded in `query.options.post_binds`
+            // so the engine evaluates it AFTER aggregation. Aggregate-free
+            // BINDs continue to flow through `Pattern::Bind` in the WHERE
+            // pattern list (pre-aggregation).
+            //
+            // This is JSON-LD's analogue of SPARQL's
+            // `SELECT ((MIN(?p) + MAX(?p)) / 2 AS ?c)` projection
+            // expression. The SPARQL spec confines aggregates to SELECT,
+            // HAVING, and ORDER BY; JSON-LD has no separate select-expression
+            // syntax, so BIND-in-WHERE is the natural surface — we route
+            // post-aggregation when an aggregate appears, matching the
+            // SPARQL semantics.
             if arr.len() < 3 || !(arr.len() - 1).is_multiple_of(2) {
                 return Err(ParseError::InvalidWhere(
                     "bind requires pairs of arguments: variable and expression".to_string(),
                 ));
             }
-            // Reuse filter parsing so BIND has the same expression language as FILTER.
-            // Allow multiple bindings in a single bind form.
             let mut i = 1;
             while i < arr.len() {
                 let var = arr[i].as_str().ok_or_else(|| {
@@ -188,11 +205,36 @@ pub fn parse_where_array_element(
                 })?;
                 validate_var_name(var)?;
 
-                let expr = parse_filter_value(&arr[i + 1])?;
-                query.patterns.push(UnresolvedPattern::Bind {
-                    var: Arc::from(var),
-                    expr,
-                });
+                let raw_expr = parse_filter_value(&arr[i + 1])?;
+
+                // Hoist any inline aggregate function calls out of the BIND
+                // expression. Local dedup map is per-BIND; cross-BIND dedup
+                // is a future perf optimization. Counter is seeded from the
+                // current aggregates length to avoid synthetic-alias
+                // collisions across BINDs and HAVING in the same query.
+                let aggregates_before = query.options.aggregates.len();
+                let mut local_dedup: std::collections::HashMap<String, Arc<str>> =
+                    std::collections::HashMap::new();
+                let mut counter = aggregates_before;
+                let rewritten = super::aggregate_fn::rewrite_aggregates_in_expr(
+                    raw_expr,
+                    &mut query.options.aggregates,
+                    &mut local_dedup,
+                    &mut counter,
+                    "?__bind_agg",
+                    "BIND",
+                )?;
+
+                if query.options.aggregates.len() > aggregates_before {
+                    // BIND referenced one or more aggregates: route post-aggregation.
+                    query.options.post_binds.push((Arc::from(var), rewritten));
+                } else {
+                    // Aggregate-free BIND: ordinary pre-aggregation pattern.
+                    query.patterns.push(UnresolvedPattern::Bind {
+                        var: Arc::from(var),
+                        expr: rewritten,
+                    });
+                }
                 i += 2;
             }
             Ok(())

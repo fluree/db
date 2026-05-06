@@ -1798,7 +1798,21 @@ fn lower_options(opts: &UnresolvedOptions, vars: &mut VarRegistry) -> Result<Que
             .as_ref()
             .map(|e| lower_filter_expr(e, vars))
             .transpose()?,
-        post_binds: Vec::new(),
+        // Post-aggregation BINDs are populated when a JSON-LD WHERE BIND
+        // contains inline aggregates (see where_clause.rs::"bind"). VarId
+        // allocation happens here so synthetic alias names like
+        // ?__bind_agg_0 share the same VarRegistry as the aggregate output
+        // vars they reference (also allocated from this registry via
+        // `lower_aggregate_spec`).
+        post_binds: opts
+            .post_binds
+            .iter()
+            .map(|(var_name, expr)| {
+                let var_id = vars.get_or_insert(var_name);
+                let lowered = lower_filter_expr(expr, vars)?;
+                Ok((var_id, lowered))
+            })
+            .collect::<Result<Vec<_>>>()?,
         reasoning,
         schema_bundle: None,
     })

@@ -483,3 +483,194 @@ async fn aggregates_count_star_direct() {
         ]))
     );
 }
+
+// =============================================================================
+// Inline aggregates inside BIND expressions
+//
+// JSON-LD parity for SPARQL's `SELECT (expr_with_aggregates AS ?alias)`. When
+// a JSON-LD WHERE BIND references an aggregate function like `["min", "?p"]`
+// (B1 data form) or `"(min ?p)"` (B2 string form), the aggregate is hoisted
+// into `QueryOptions.aggregates` with a synthetic `?__bind_agg{N}` alias and
+// the BIND is routed to post-aggregation execution via
+// `QueryOptions.post_binds`. See where_clause.rs::"bind" for the wiring.
+//
+// Test data is uniform-integer typed so these tests do not depend on the
+// arithmetic type-promotion fixes tracked separately (db-r#50,
+// W3C type-promotion-01..22).
+// =============================================================================
+
+async fn seed_uniform_ints(fluree: &MemoryFluree, ledger_id: &str) -> MemoryLedger {
+    let ledger0 = genesis_ledger(fluree, ledger_id);
+    let ctx = context_ex_schema();
+    let insert = json!({
+        "@context": ctx,
+        "@graph": [
+            {"@id": "ex:gx", "ex:p": [1, 2, 3, 4]},
+            {"@id": "ex:gy", "ex:p": [10, 20, 30, 40]}
+        ]
+    });
+    fluree
+        .insert(ledger0, &insert)
+        .await
+        .expect("seed insert should succeed")
+        .ledger
+}
+
+#[tokio::test]
+async fn aggregates_inline_control_explicit_select_agg() {
+    // Control: same data shape as aggregates_inline_*, but uses select-clause
+    // aggregate (existing path) instead of BIND inline. Confirms `?p` is
+    // bound by the array-form WHERE node-map and reachable to AggregateOperator.
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger = seed_uniform_ints(&fluree, "query/agg-inline-control:main").await;
+    let ctx = context_ex_schema();
+    let query = json!({
+        "@context": ctx,
+        "select": ["?g", "(as (min ?p) ?min)"],
+        "where": [{"@id": "?g", "ex:p": "?p"}],
+        "groupBy": ["?g"]
+    });
+    let result = support::query_jsonld(&fluree, &ledger, &query)
+        .await
+        .expect("control query should succeed");
+    let json_rows = result.to_jsonld(&ledger.snapshot).expect("jsonld");
+    let mut rows = json_rows.as_array().expect("rows array").clone();
+    rows.sort_by(|a, b| a[0].to_string().cmp(&b[0].to_string()));
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[0][1], json!(1));
+    assert_eq!(rows[1][1], json!(10));
+}
+
+#[tokio::test]
+async fn aggregates_inline_in_bind_data_form() {
+    // B1 form — JSON-array nested expression. Equivalent SPARQL:
+    //   SELECT ?g ((MIN(?p) + MAX(?p)) / 2 AS ?c) WHERE { ?g :p ?p } GROUP BY ?g
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger = seed_uniform_ints(&fluree, "query/agg-inline-b1:main").await;
+    let ctx = context_ex_schema();
+
+    let query = json!({
+        "@context": ctx,
+        "select": ["?g", "?c"],
+        "where": [
+            {"@id": "?g", "ex:p": "?p"},
+            ["bind", "?c", ["/", ["+", ["min", "?p"], ["max", "?p"]], 2]]
+        ],
+        "groupBy": ["?g"]
+    });
+
+    let result = support::query_jsonld(&fluree, &ledger, &query)
+        .await
+        .expect("query");
+    let json_rows = result.to_jsonld(&ledger.snapshot).expect("jsonld");
+
+    // ex:gx values [1,2,3,4]: (1+4)/2 = 2; ex:gy values [10,20,30,40]: (10+40)/2 = 25.
+    let mut rows = json_rows.as_array().expect("rows array").clone();
+    rows.sort_by(|a, b| a[0].to_string().cmp(&b[0].to_string()));
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[0][1], json!(2));
+    assert_eq!(rows[1][1], json!(25));
+}
+
+#[tokio::test]
+async fn aggregates_inline_in_bind_sexpr_form() {
+    // B2 form — string s-expression. Same shape as B1, different surface.
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger = seed_uniform_ints(&fluree, "query/agg-inline-b2:main").await;
+    let ctx = context_ex_schema();
+
+    let query = json!({
+        "@context": ctx,
+        "select": ["?g", "?c"],
+        "where": [
+            {"@id": "?g", "ex:p": "?p"},
+            ["bind", "?c", "(/ (+ (min ?p) (max ?p)) 2)"]
+        ],
+        "groupBy": ["?g"]
+    });
+
+    let result = support::query_jsonld(&fluree, &ledger, &query)
+        .await
+        .expect("query");
+    let json_rows = result.to_jsonld(&ledger.snapshot).expect("jsonld");
+
+    let mut rows = json_rows.as_array().expect("rows array").clone();
+    rows.sort_by(|a, b| a[0].to_string().cmp(&b[0].to_string()));
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[0][1], json!(2));
+    assert_eq!(rows[1][1], json!(25));
+}
+
+#[tokio::test]
+async fn aggregates_inline_groupconcat_b1() {
+    // B1 form — GROUP_CONCAT with explicit separator. Each group gets a
+    // single comma-separated string of its ?p values.
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger = seed_uniform_ints(&fluree, "query/agg-inline-gc-b1:main").await;
+    let ctx = context_ex_schema();
+
+    let query = json!({
+        "@context": ctx,
+        "select": ["?g", "?cs"],
+        "where": [
+            {"@id": "?g", "ex:p": "?p"},
+            ["bind", "?cs", ["group-concat", "?p", ", "]]
+        ],
+        "groupBy": ["?g"]
+    });
+
+    let result = support::query_jsonld(&fluree, &ledger, &query)
+        .await
+        .expect("query");
+    let json_rows = result.to_jsonld(&ledger.snapshot).expect("jsonld");
+
+    let mut rows = json_rows.as_array().expect("rows array").clone();
+    rows.sort_by(|a, b| a[0].to_string().cmp(&b[0].to_string()));
+    assert_eq!(rows.len(), 2);
+    // GROUP_CONCAT does not guarantee ordering within a group; verify each
+    // result string contains all expected values separated by ", ".
+    for (row, expected_values) in rows
+        .iter()
+        .zip([vec!["1", "2", "3", "4"], vec!["10", "20", "30", "40"]])
+    {
+        let s = row[1].as_str().expect("group-concat result is a string");
+        for v in &expected_values {
+            assert!(s.contains(v), "expected {v} in group-concat result {s:?}");
+        }
+        let actual_count = s.matches(", ").count() + 1;
+        assert_eq!(
+            actual_count,
+            expected_values.len(),
+            "group-concat string {s:?} should have {} comma-separated parts",
+            expected_values.len()
+        );
+    }
+}
+
+#[tokio::test]
+async fn aggregates_inline_rejects_nested_aggregate_b1() {
+    // ["min", ["max", "?p"]] is rejected because the outer MIN's input
+    // arg is a Call (the inner aggregate), not a variable. SPARQL §18.5
+    // forbids nested aggregates.
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger = seed_uniform_ints(&fluree, "query/agg-inline-nested:main").await;
+
+    let query = json!({
+        "@context": context_ex_schema(),
+        "select": ["?g", "?c"],
+        "where": [
+            {"@id": "?g", "ex:p": "?p"},
+            ["bind", "?c", ["min", ["max", "?p"]]]
+        ],
+        "groupBy": ["?g"]
+    });
+
+    let err = support::query_jsonld(&fluree, &ledger, &query)
+        .await
+        .unwrap_err();
+    let msg = err.to_string();
+    assert!(
+        msg.to_lowercase().contains("variable") || msg.to_lowercase().contains("nested aggregate"),
+        "expected error mentioning variable/nested-aggregate input, got: {msg}"
+    );
+}

@@ -662,6 +662,21 @@ pub struct UnresolvedOptions {
     pub aggregates: Vec<UnresolvedAggregateSpec>,
     /// HAVING filter expression
     pub having: Option<UnresolvedExpression>,
+    /// Post-aggregation BIND expressions, in encounter order.
+    ///
+    /// Populated when a JSON-LD BIND in WHERE references inline aggregate
+    /// functions (e.g. `["bind", "?c", ["/", ["+", ["min", "?p"], ["max", "?p"]], 2]]`):
+    /// the inline aggregates are hoisted into `aggregates` with synthetic
+    /// alias variables, the BIND expression is rewritten to reference those
+    /// aliases, and the rewritten `(var, expr)` pair is recorded here so
+    /// the engine evaluates it AFTER `AggregateOperator` runs (matching
+    /// SPARQL's `(expr AS ?var)` projection semantics).
+    ///
+    /// JSON-LD BINDs without aggregate references continue to lower as
+    /// ordinary `Pattern::Bind` patterns in the WHERE clause and do NOT
+    /// appear here. Order is preserved so dependent post-binds resolve
+    /// in the user's written sequence.
+    pub post_binds: Vec<(Arc<str>, UnresolvedExpression)>,
     /// Reasoning modes (RDFS, OWL2-QL, etc.)
     ///
     /// Parsed from `"reasoning"` key in query JSON. None means use defaults
@@ -691,6 +706,7 @@ impl Default for UnresolvedOptions {
             group_by: Vec::new(),
             aggregates: Vec::new(),
             having: None,
+            post_binds: Vec::new(),
             reasoning: None,
             object_var_parsing: true,
         }

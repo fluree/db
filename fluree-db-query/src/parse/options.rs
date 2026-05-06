@@ -24,8 +24,8 @@
 //! ```
 
 use super::ast::{
-    UnresolvedAggregateFn, UnresolvedAggregateSpec, UnresolvedExpression, UnresolvedFilterValue,
-    UnresolvedOptions, UnresolvedSortDirection, UnresolvedSortSpec,
+    UnresolvedAggregateSpec, UnresolvedExpression, UnresolvedOptions, UnresolvedSortDirection,
+    UnresolvedSortSpec,
 };
 use super::error::{ParseError, Result};
 use super::filter_sexpr;
@@ -334,123 +334,17 @@ fn parse_having_with_aggregates(
 
     let mut aggregates: Vec<UnresolvedAggregateSpec> = Vec::new();
     let mut counter: usize = 0;
-    let rewritten = rewrite_having_aggregates(raw_expr, &mut aggregates, &mut counter)?;
+    let mut alias_dedup: std::collections::HashMap<String, Arc<str>> =
+        std::collections::HashMap::new();
+    let rewritten = super::aggregate_fn::rewrite_aggregates_in_expr(
+        raw_expr,
+        &mut aggregates,
+        &mut alias_dedup,
+        &mut counter,
+        "?__having_agg",
+        "HAVING",
+    )?;
     Ok((Some(rewritten), aggregates))
-}
-
-fn rewrite_having_aggregates(
-    expr: UnresolvedExpression,
-    aggregates: &mut Vec<UnresolvedAggregateSpec>,
-    counter: &mut usize,
-) -> Result<UnresolvedExpression> {
-    use super::ast::UnresolvedExpression as E;
-
-    let rewrite_child = |e: UnresolvedExpression,
-                         aggregates: &mut Vec<UnresolvedAggregateSpec>,
-                         counter: &mut usize|
-     -> Result<UnresolvedExpression> {
-        rewrite_having_aggregates(e, aggregates, counter)
-    };
-
-    match expr {
-        E::Var(_) | E::Const(_) => Ok(expr),
-
-        E::And(exprs) => Ok(E::And(
-            exprs
-                .into_iter()
-                .map(|e| rewrite_child(e, aggregates, counter))
-                .collect::<Result<Vec<_>>>()?,
-        )),
-
-        E::Or(exprs) => Ok(E::Or(
-            exprs
-                .into_iter()
-                .map(|e| rewrite_child(e, aggregates, counter))
-                .collect::<Result<Vec<_>>>()?,
-        )),
-
-        E::Not(inner) => Ok(E::Not(Box::new(rewrite_child(
-            *inner, aggregates, counter,
-        )?))),
-
-        E::In {
-            expr,
-            values,
-            negated,
-        } => Ok(E::In {
-            expr: Box::new(rewrite_child(*expr, aggregates, counter)?),
-            values: values
-                .into_iter()
-                .map(|e| rewrite_child(e, aggregates, counter))
-                .collect::<Result<Vec<_>>>()?,
-            negated,
-        }),
-
-        E::Call { func, args } => {
-            let name_lc = func.as_ref().to_ascii_lowercase();
-            let agg_fn = match name_lc.as_str() {
-                "count" => Some(UnresolvedAggregateFn::Count),
-                "avg" => Some(UnresolvedAggregateFn::Avg),
-                "sum" => Some(UnresolvedAggregateFn::Sum),
-                "min" => Some(UnresolvedAggregateFn::Min),
-                "max" => Some(UnresolvedAggregateFn::Max),
-                _ => None,
-            };
-
-            if let Some(function) = agg_fn {
-                if args.len() != 1 {
-                    return Err(ParseError::InvalidFilter(format!(
-                        "HAVING aggregate {func} requires exactly 1 argument"
-                    )));
-                }
-
-                match &args[0] {
-                    E::Var(v) => {
-                        let out = Arc::from(format!("?__having_agg{}", *counter));
-                        *counter += 1;
-                        aggregates.push(UnresolvedAggregateSpec {
-                            function,
-                            input_var: Arc::clone(v),
-                            output_var: Arc::clone(&out),
-                        });
-                        Ok(E::Var(out))
-                    }
-                    // Allow COUNT(*) in s-expression form: (count "*")
-                    E::Const(UnresolvedFilterValue::String(s))
-                        if s.as_ref() == "*"
-                            && matches!(function, UnresolvedAggregateFn::Count) =>
-                    {
-                        let out = Arc::from(format!("?__having_agg{}", *counter));
-                        *counter += 1;
-                        aggregates.push(UnresolvedAggregateSpec {
-                            function,
-                            input_var: Arc::from("*"),
-                            output_var: Arc::clone(&out),
-                        });
-                        Ok(E::Var(out))
-                    }
-                    _ => Err(ParseError::InvalidFilter(
-                        "HAVING aggregate argument must be a variable".to_string(),
-                    )),
-                }
-            } else {
-                // Non-aggregate function: just rewrite its arguments.
-                let rewritten_args = args
-                    .into_iter()
-                    .map(|e| rewrite_child(e, aggregates, counter))
-                    .collect::<Result<Vec<_>>>()?;
-                Ok(E::Call {
-                    func,
-                    args: rewritten_args,
-                })
-            }
-        }
-
-        // EXISTS/NOT EXISTS makes no sense in HAVING expressions
-        E::Exists { .. } => Err(ParseError::InvalidFilter(
-            "EXISTS/NOT EXISTS not supported in HAVING expressions".to_string(),
-        )),
-    }
 }
 
 /// Parse reasoning mode(s) from query options
@@ -521,6 +415,7 @@ pub fn parse_options(
         group_by: parse_group_by(obj)?,
         aggregates: having_aggs, // will be merged with aggregates from select clause
         having,
+        post_binds: Vec::new(), // populated when WHERE BIND patterns reference inline aggregates
         reasoning: parse_reasoning(obj)?,
         object_var_parsing: parse_object_var_parsing(obj),
     })
