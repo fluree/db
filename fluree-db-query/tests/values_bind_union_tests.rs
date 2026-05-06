@@ -8,13 +8,13 @@
 use fluree_db_core::{FlakeValue, GraphDbRef, LedgerSnapshot, NoOverlay, Sid};
 use fluree_db_query::binding::Binding;
 use fluree_db_query::context::ExecutionContext;
-use fluree_db_query::execute::{execute_with_overlay, ExecutableQuery};
+use fluree_db_query::execute::{execute, ContextConfig, ExecutableQuery};
+use fluree_db_query::ir::triple::{Ref, Term, TriplePattern};
+use fluree_db_query::ir::QueryOptions;
 use fluree_db_query::ir::{Expression, FilterValue, Pattern};
+use fluree_db_query::ir::{Query, QueryOutput};
 use fluree_db_query::operator::Operator;
-use fluree_db_query::options::QueryOptions;
-use fluree_db_query::parse::{ParsedQuery, QueryOutput};
 use fluree_db_query::seed::EmptyOperator;
-use fluree_db_query::triple::{Ref, Term, TriplePattern};
 use fluree_db_query::values::ValuesOperator;
 use fluree_db_query::var_registry::{VarId, VarRegistry};
 use fluree_graph_json_ld::ParsedContext;
@@ -32,13 +32,13 @@ fn make_triple_pattern(s_var: VarId, p_name: &str, o_var: VarId) -> TriplePatter
     )
 }
 
-fn make_query(select: Vec<VarId>, patterns: Vec<Pattern>) -> ParsedQuery {
+fn make_query(select: Vec<VarId>, patterns: Vec<Pattern>) -> Query {
     let output = if select.is_empty() {
         QueryOutput::Wildcard
     } else {
         QueryOutput::select(select)
     };
-    ParsedQuery {
+    Query {
         context: ParsedContext::default(),
         orig_context: None,
         output,
@@ -82,7 +82,9 @@ async fn test_values_first_then_join() {
     // This should succeed even though VALUES is at position 0
     let db = GraphDbRef::new(&snapshot, 0, &NoOverlay, snapshot.t);
     let executable = ExecutableQuery::simple(query);
-    let results = execute_with_overlay(db, &vars, &executable).await.unwrap();
+    let results = execute(db, &vars, &executable, ContextConfig::default())
+        .await
+        .unwrap();
 
     // With an empty database, we'll get no results from the join
     // but the query structure is valid
@@ -115,7 +117,9 @@ async fn test_bind_first() {
     // Should succeed even though BIND is at position 0
     let db = GraphDbRef::new(&snapshot, 0, &NoOverlay, snapshot.t);
     let executable = ExecutableQuery::simple(query);
-    let results = execute_with_overlay(db, &vars, &executable).await.unwrap();
+    let results = execute(db, &vars, &executable, ContextConfig::default())
+        .await
+        .unwrap();
 
     // With an empty database, we'll get no results from the join
     // but the query structure is valid
@@ -153,7 +157,9 @@ async fn test_union_first() {
     // Should succeed even though UNION is at position 0
     let db = GraphDbRef::new(&snapshot, 0, &NoOverlay, snapshot.t);
     let executable = ExecutableQuery::simple(query);
-    let results = execute_with_overlay(db, &vars, &executable).await.unwrap();
+    let results = execute(db, &vars, &executable, ContextConfig::default())
+        .await
+        .unwrap();
 
     // With an empty database, we'll get no results
     // but the query structure is valid
@@ -183,7 +189,9 @@ async fn test_filter_first_true() {
     // Should succeed - FILTER is on constants, passes for the empty seed row
     let db = GraphDbRef::new(&snapshot, 0, &NoOverlay, snapshot.t);
     let executable = ExecutableQuery::simple(query);
-    let results = execute_with_overlay(db, &vars, &executable).await.unwrap();
+    let results = execute(db, &vars, &executable, ContextConfig::default())
+        .await
+        .unwrap();
 
     // Empty database, so no triple matches
     assert!(results.is_empty() || results.iter().all(fluree_db_query::Batch::is_empty));
@@ -210,7 +218,9 @@ async fn test_filter_first_false() {
     // The false filter should eliminate all rows
     let db = GraphDbRef::new(&snapshot, 0, &NoOverlay, snapshot.t);
     let executable = ExecutableQuery::simple(query);
-    let results = execute_with_overlay(db, &vars, &executable).await.unwrap();
+    let results = execute(db, &vars, &executable, ContextConfig::default())
+        .await
+        .unwrap();
 
     // No results because the filter eliminates the empty seed row
     assert!(results.is_empty() || results.iter().all(fluree_db_query::Batch::is_empty));
@@ -364,7 +374,9 @@ async fn test_union_is_correlated_via_values_overlap() {
 
     let db = GraphDbRef::new(&snapshot, 0, &NoOverlay, snapshot.t);
     let executable = ExecutableQuery::simple(query);
-    let results = execute_with_overlay(db, &vars, &executable).await.unwrap();
+    let results = execute(db, &vars, &executable, ContextConfig::default())
+        .await
+        .unwrap();
     let rows: Vec<Binding> = results
         .iter()
         .flat_map(|b| b.column_by_idx(0).unwrap_or(&[]).iter().cloned())

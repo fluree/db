@@ -22,10 +22,7 @@ use serde_json::Value as JsonValue;
 ///
 /// Skips wrapping if the query already contains a top-level GRAPH pattern
 /// (the user explicitly scoped it).
-pub(crate) fn maybe_wrap_for_graph_source(
-    db: &GraphDb,
-    parsed: &mut fluree_db_query::parse::ParsedQuery,
-) {
+pub(crate) fn maybe_wrap_for_graph_source(db: &GraphDb, parsed: &mut fluree_db_query::ir::Query) {
     if let Some(ref gs_id) = db.graph_source_id {
         let has_graph_pattern = parsed
             .patterns
@@ -483,7 +480,7 @@ impl Fluree {
     async fn build_executable_for_view(
         &self,
         db: &GraphDb,
-        parsed: &fluree_db_query::parse::ParsedQuery,
+        parsed: &fluree_db_query::ir::Query,
     ) -> Result<ExecutableQuery> {
         // Start with the standard executable
         let mut executable = prepare_for_execution(parsed);

@@ -6,8 +6,8 @@
 //! This optimization runs for both SPARQL and JSON-LD queries, enabling `geof:distance`
 //! patterns to use the accelerated GeoPoint binary index path.
 
+use crate::ir::triple::{Ref, Term, TriplePattern};
 use crate::ir::{Expression, FilterValue, Function, GeoSearchCenter, GeoSearchPattern, Pattern};
-use crate::triple::{Ref, Term, TriplePattern};
 use crate::var_registry::VarId;
 use fluree_db_core::geo::try_extract_point;
 use fluree_db_core::Sid;
@@ -37,25 +37,18 @@ fn rewrite_recursive<F>(patterns: Vec<Pattern>, encode_iri: &F) -> Vec<Pattern>
 where
     F: Fn(&str) -> Option<Sid>,
 {
-    // 1. Recurse into nested scopes first
+    // 1. Recurse into nested scopes first.
+    //
+    // Service and Subquery are intentionally not rewritten: the geo rewrite
+    // produces `Pattern::GeoSearch`, which depends on the local binary
+    // GeoPoint index. A Service block targets a remote endpoint (no such
+    // index), and a Subquery is its own scope that the parent should not
+    // mutate in place.
     let patterns: Vec<Pattern> = patterns
         .into_iter()
         .map(|p| match p {
-            Pattern::Optional(inner) => Pattern::Optional(rewrite_recursive(inner, encode_iri)),
-            Pattern::Union(branches) => Pattern::Union(
-                branches
-                    .into_iter()
-                    .map(|b| rewrite_recursive(b, encode_iri))
-                    .collect(),
-            ),
-            Pattern::Graph { name, patterns } => Pattern::Graph {
-                name,
-                patterns: rewrite_recursive(patterns, encode_iri),
-            },
-            Pattern::Minus(inner) => Pattern::Minus(rewrite_recursive(inner, encode_iri)),
-            Pattern::Exists(inner) => Pattern::Exists(rewrite_recursive(inner, encode_iri)),
-            Pattern::NotExists(inner) => Pattern::NotExists(rewrite_recursive(inner, encode_iri)),
-            other => other,
+            Pattern::Service(_) | Pattern::Subquery(_) => p,
+            other => other.map_subpatterns(&mut |xs| rewrite_recursive(xs, encode_iri)),
         })
         .collect();
 
@@ -251,50 +244,11 @@ fn is_var_used_elsewhere(
     skip_bind: usize,
     skip_filter: usize,
 ) -> bool {
-    for (idx, p) in patterns.iter().enumerate() {
-        if idx == skip_triple || idx == skip_bind || idx == skip_filter {
-            continue;
-        }
-        if pattern_references_var(p, var) {
-            return true;
-        }
-    }
-    false
-}
-
-/// Check if a pattern references a variable
-fn pattern_references_var(pattern: &Pattern, var: VarId) -> bool {
-    match pattern {
-        Pattern::Triple(tp) => {
-            tp.s.as_var() == Some(var) || tp.p.as_var() == Some(var) || term_is_var(&tp.o, var)
-        }
-        Pattern::Filter(expr) => expr.variables().contains(&var),
-        Pattern::Bind { var: v, expr } => *v == var || expr.variables().contains(&var),
-        Pattern::Optional(inner)
-        | Pattern::Minus(inner)
-        | Pattern::Exists(inner)
-        | Pattern::NotExists(inner) => inner.iter().any(|p| pattern_references_var(p, var)),
-        Pattern::Union(branches) => branches
-            .iter()
-            .any(|branch| branch.iter().any(|p| pattern_references_var(p, var))),
-        Pattern::Graph { patterns, name } => {
-            let name_matches = matches!(name, crate::ir::GraphName::Var(v) if *v == var);
-            name_matches || patterns.iter().any(|p| pattern_references_var(p, var))
-        }
-        Pattern::Values { vars, .. } => vars.contains(&var),
-        Pattern::GeoSearch(gsp) => gsp.variables().contains(&var),
-        Pattern::S2Search(s2p) => s2p.variables().contains(&var),
-        Pattern::PropertyPath(pp) => pp.variables().contains(&var),
-        Pattern::Subquery(sq) => sq.variables().contains(&var),
-        Pattern::IndexSearch(isp) => isp.variables().contains(&var),
-        Pattern::VectorSearch(vsp) => vsp.variables().contains(&var),
-        Pattern::Service(sp) => sp.variables().contains(&var),
-        Pattern::R2rml(r2rml) => r2rml.variables().contains(&var),
-    }
-}
-
-fn term_is_var(term: &Term, var: VarId) -> bool {
-    matches!(term, Term::Var(v) if *v == var)
+    patterns
+        .iter()
+        .enumerate()
+        .filter(|(idx, _)| *idx != skip_triple && *idx != skip_bind && *idx != skip_filter)
+        .any(|(_, p)| p.referenced_vars().contains(&var))
 }
 
 /// Apply rewrites to the pattern list

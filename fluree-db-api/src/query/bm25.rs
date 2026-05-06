@@ -7,6 +7,7 @@ use crate::{
 };
 
 use fluree_db_query::parse::parse_query;
+use fluree_db_query::{execute, ContextConfig};
 
 impl Fluree {
     /// Execute a query against a loaded dataset with BM25 and vector index provider support.
@@ -46,33 +47,21 @@ impl Fluree {
         } else {
             None
         };
-        let batches = {
-            #[cfg(feature = "vector")]
-            {
-                crate::execute_with_dataset_and_providers(
-                    db,
-                    &vars,
-                    &executable,
-                    &runtime_dataset,
-                    &provider,
-                    &provider,
-                    tracker_ref,
-                )
-                .await?
-            }
-            #[cfg(not(feature = "vector"))]
-            {
-                crate::execute_with_dataset_and_bm25(
-                    db,
-                    &vars,
-                    &executable,
-                    &runtime_dataset,
-                    &provider,
-                    tracker_ref,
-                )
-                .await?
-            }
+        #[allow(
+            unused_mut,
+            reason = "vector_provider is set inside cfg(feature = \"vector\")"
+        )]
+        let mut config = ContextConfig {
+            tracker: tracker_ref,
+            dataset: Some(&runtime_dataset),
+            bm25_provider: Some(&provider),
+            ..Default::default()
         };
+        #[cfg(feature = "vector")]
+        {
+            config.vector_provider = Some(&provider);
+        }
+        let batches = execute(db, &vars, &executable, config).await?;
 
         // Dataset graph crawl formatting may need to see flakes from multiple ledgers (union),
         // and each ledger may have a different `t`. We therefore:

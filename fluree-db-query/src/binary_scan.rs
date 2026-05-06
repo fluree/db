@@ -31,13 +31,13 @@ use crate::binding::{Batch, Binding};
 use crate::context::ExecutionContext;
 use crate::error::{QueryError, Result};
 use crate::fast_path_common::contiguous_id_range;
+use crate::ir::triple::{Ref, Term, TriplePattern};
 use crate::ir::{Expression, Function};
 use crate::object_binding::{late_materialized_object_binding, materialized_object_binding};
 use crate::operator::inline::{apply_inline, extend_schema, InlineOperator};
 use crate::operator::{Operator, OperatorState};
 use crate::sid_iri;
 use crate::stats_cache::cached_stats_view_for_db;
-use crate::triple::{Ref, Term, TriplePattern};
 use crate::var_registry::VarId;
 use fluree_vocab::{namespaces, rdf_names, xsd_names};
 

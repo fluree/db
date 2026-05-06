@@ -106,6 +106,18 @@ impl StorageRead for MemoryStorage {
         }
         Ok(full[start..end].to_vec())
     }
+
+    async fn list_prefix_with_metadata(&self, prefix: &str) -> Result<Vec<crate::RemoteObject>> {
+        let data = self.data.read();
+        Ok(data
+            .iter()
+            .filter(|(k, _)| k.starts_with(prefix))
+            .map(|(k, v)| crate::RemoteObject {
+                address: k.clone(),
+                size_bytes: v.len() as u64,
+            })
+            .collect())
+    }
 }
 
 #[async_trait]

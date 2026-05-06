@@ -332,109 +332,9 @@ fn extend_schema_from_patterns(
     patterns: &[Pattern],
 ) {
     for p in patterns {
-        match p {
-            Pattern::Triple(tp) => {
-                for v in tp.variables() {
-                    if seen.insert(v) {
-                        schema.push(v);
-                    }
-                }
-            }
-            Pattern::Filter(_) => {}
-            Pattern::Optional(inner)
-            | Pattern::Minus(inner)
-            | Pattern::Exists(inner)
-            | Pattern::NotExists(inner) => extend_schema_from_patterns(schema, seen, inner),
-            Pattern::Union(branches) => {
-                for b in branches {
-                    extend_schema_from_patterns(schema, seen, b);
-                }
-            }
-            Pattern::Bind { var, .. } => {
-                if seen.insert(*var) {
-                    schema.push(*var);
-                }
-            }
-            Pattern::Values { vars, .. } => {
-                for v in vars {
-                    if seen.insert(*v) {
-                        schema.push(*v);
-                    }
-                }
-            }
-            Pattern::PropertyPath(pp) => {
-                for v in pp.variables() {
-                    if seen.insert(v) {
-                        schema.push(v);
-                    }
-                }
-            }
-            Pattern::Subquery(sq) => {
-                // Subquery contributes its select variables to the schema
-                for v in &sq.select {
-                    if seen.insert(*v) {
-                        schema.push(*v);
-                    }
-                }
-            }
-            Pattern::IndexSearch(isp) => {
-                // Index search contributes id, score, and ledger variables to the schema
-                for v in isp.variables() {
-                    if seen.insert(v) {
-                        schema.push(v);
-                    }
-                }
-            }
-            Pattern::VectorSearch(vsp) => {
-                // Vector search contributes id, score, and ledger variables to the schema
-                for v in vsp.variables() {
-                    if seen.insert(v) {
-                        schema.push(v);
-                    }
-                }
-            }
-            Pattern::R2rml(r2rml) => {
-                // R2RML pattern contributes subject and object variables to the schema
-                for v in r2rml.variables() {
-                    if seen.insert(v) {
-                        schema.push(v);
-                    }
-                }
-            }
-            Pattern::GeoSearch(gsp) => {
-                for v in gsp.variables() {
-                    if seen.insert(v) {
-                        schema.push(v);
-                    }
-                }
-            }
-            Pattern::S2Search(s2p) => {
-                for v in s2p.variables() {
-                    if seen.insert(v) {
-                        schema.push(v);
-                    }
-                }
-            }
-            Pattern::Graph {
-                name,
-                patterns: inner,
-            } => {
-                // Graph pattern contributes variables from inner patterns and the graph variable (if any)
-                if let crate::ir::GraphName::Var(v) = name {
-                    if seen.insert(*v) {
-                        schema.push(*v);
-                    }
-                }
-                extend_schema_from_patterns(schema, seen, inner);
-            }
-            Pattern::Service(sp) => {
-                // Service pattern contributes variables from inner patterns and the endpoint variable (if any)
-                if let crate::ir::ServiceEndpoint::Var(v) = &sp.endpoint {
-                    if seen.insert(*v) {
-                        schema.push(*v);
-                    }
-                }
-                extend_schema_from_patterns(schema, seen, &sp.patterns);
+        for v in p.produced_vars() {
+            if seen.insert(v) {
+                schema.push(v);
             }
         }
     }
@@ -461,15 +361,15 @@ mod tests {
         });
 
         let branches = vec![
-            vec![Pattern::Triple(crate::triple::TriplePattern::new(
-                crate::triple::Ref::Var(VarId(0)),
-                crate::triple::Ref::Sid(Sid::new(100, "name")),
-                crate::triple::Term::Var(VarId(1)),
+            vec![Pattern::Triple(crate::ir::triple::TriplePattern::new(
+                crate::ir::triple::Ref::Var(VarId(0)),
+                crate::ir::triple::Ref::Sid(Sid::new(100, "name")),
+                crate::ir::triple::Term::Var(VarId(1)),
             ))],
-            vec![Pattern::Triple(crate::triple::TriplePattern::new(
-                crate::triple::Ref::Var(VarId(0)),
-                crate::triple::Ref::Sid(Sid::new(100, "email")),
-                crate::triple::Term::Var(VarId(2)),
+            vec![Pattern::Triple(crate::ir::triple::TriplePattern::new(
+                crate::ir::triple::Ref::Var(VarId(0)),
+                crate::ir::triple::Ref::Sid(Sid::new(100, "email")),
+                crate::ir::triple::Term::Var(VarId(2)),
             ))],
         ];
 
@@ -509,15 +409,15 @@ mod tests {
         });
 
         let branches = vec![
-            vec![Pattern::Triple(crate::triple::TriplePattern::new(
-                crate::triple::Ref::Var(VarId(0)),
-                crate::triple::Ref::Sid(Sid::new(100, "name")),
-                crate::triple::Term::Var(VarId(1)),
+            vec![Pattern::Triple(crate::ir::triple::TriplePattern::new(
+                crate::ir::triple::Ref::Var(VarId(0)),
+                crate::ir::triple::Ref::Sid(Sid::new(100, "name")),
+                crate::ir::triple::Term::Var(VarId(1)),
             ))],
-            vec![Pattern::Triple(crate::triple::TriplePattern::new(
-                crate::triple::Ref::Var(VarId(0)),
-                crate::triple::Ref::Sid(Sid::new(100, "email")),
-                crate::triple::Term::Var(VarId(2)),
+            vec![Pattern::Triple(crate::ir::triple::TriplePattern::new(
+                crate::ir::triple::Ref::Var(VarId(0)),
+                crate::ir::triple::Ref::Sid(Sid::new(100, "email")),
+                crate::ir::triple::Term::Var(VarId(2)),
             ))],
         ];
 
@@ -539,11 +439,13 @@ mod tests {
             schema: child_schema,
         });
 
-        let branches = vec![vec![Pattern::Triple(crate::triple::TriplePattern::new(
-            crate::triple::Ref::Var(VarId(0)),
-            crate::triple::Ref::Sid(Sid::new(100, "name")),
-            crate::triple::Term::Var(VarId(1)),
-        ))]];
+        let branches = vec![vec![Pattern::Triple(
+            crate::ir::triple::TriplePattern::new(
+                crate::ir::triple::Ref::Var(VarId(0)),
+                crate::ir::triple::Ref::Sid(Sid::new(100, "name")),
+                crate::ir::triple::Term::Var(VarId(1)),
+            ),
+        )]];
 
         let op = UnionOperator::new(
             child,

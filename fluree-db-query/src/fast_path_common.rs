@@ -7,8 +7,8 @@
 use crate::binding::{Batch, Binding};
 use crate::context::ExecutionContext;
 use crate::error::{QueryError, Result};
+use crate::ir::triple::Ref;
 use crate::operator::{BoxedOperator, Operator, OperatorState};
-use crate::triple::Ref;
 use crate::var_registry::VarId;
 use async_trait::async_trait;
 use fluree_db_binary_index::format::branch::LeafEntry;
@@ -1679,14 +1679,14 @@ pub fn ref_to_p_id(ctx: &ExecutionContext<'_>, store: &BinaryIndexStore, r: &Ref
 pub fn term_to_ref_s_id(
     ctx: &ExecutionContext<'_>,
     store: &BinaryIndexStore,
-    t: &crate::triple::Term,
+    t: &crate::ir::triple::Term,
 ) -> Result<Option<u64>> {
     let iri: Arc<str> = match t {
-        crate::triple::Term::Sid(sid) => match ctx.decode_sid(sid) {
+        crate::ir::triple::Term::Sid(sid) => match ctx.decode_sid(sid) {
             Some(i) => Arc::from(i),
             None => return Ok(None),
         },
-        crate::triple::Term::Iri(i) => Arc::clone(i),
+        crate::ir::triple::Term::Iri(i) => Arc::clone(i),
         _ => return Ok(None),
     };
     let sid = store.encode_iri(iri.as_ref());

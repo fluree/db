@@ -2,10 +2,8 @@
 //!
 //! Applies RDFS/OWL expansion to query patterns based on reasoning modes.
 
-use crate::ir::Pattern;
-use crate::rewrite::{
-    rewrite_patterns, Diagnostics, EntailmentMode, PlanContext, PlanLimits, ReasoningModes,
-};
+use crate::ir::{Pattern, ReasoningModes};
+use crate::rewrite::{rewrite_patterns, Diagnostics, EntailmentMode, PlanContext, PlanLimits};
 use crate::rewrite_owl_ql::{rewrite_owl_ql_patterns, Ontology, OwlQlContext};
 use fluree_db_core::SchemaHierarchy;
 

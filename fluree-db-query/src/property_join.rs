@@ -28,6 +28,7 @@ use crate::binding::{Batch, Binding};
 use crate::context::ExecutionContext;
 use crate::error::{QueryError, Result};
 use crate::fast_path_common::try_normalize_pred_sid;
+use crate::ir::triple::{Ref, Term, TriplePattern};
 use crate::join::{
     batched_subject_probe_binary, batched_subject_star_spot, make_dict_overlay,
     BatchedSpotStarMatch, BatchedSubjectProbeMatch, SpotStarPredicateParams, SubjectProbeParams,
@@ -35,7 +36,6 @@ use crate::join::{
 use crate::operator::inline::{apply_inline, extend_schema, InlineOperator};
 use crate::operator::{BoxedOperator, Operator, OperatorState};
 use crate::temporal_mode::TemporalMode;
-use crate::triple::{Ref, Term, TriplePattern};
 use crate::var_registry::VarId;
 use async_trait::async_trait;
 use fluree_db_core::DatatypeConstraint;
@@ -697,6 +697,8 @@ impl Operator for PropertyJoinOperator {
                 // If we have a driver subject set and we're in the right execution mode,
                 // try a batched subject probe for this predicate.
                 // Batched probe requires binary store with batched_lookup support.
+                // Historical snapshots (`to_t < max_t`) are handled inside the
+                // probe helpers via `replay_leaflet_at_t`.
                 let can_batched_probe = order_pos > 0
                     && driver_subject_ids.is_some()
                     && !ctx.is_multi_ledger()

@@ -8,8 +8,8 @@ use crate::format::iri::IriCompactor;
 use crate::query::helpers::{parse_jsonld_query, parse_sparql_to_ir};
 use fluree_db_core::{is_rdf_type, StatsView};
 use fluree_db_query::{
-    explain_execution_hints, parse_query, ExplainPlan, OptimizationStatus, ParsedQuery, Pattern,
-    Ref, Term, TriplePattern, VarRegistry,
+    explain_execution_hints, parse_query, ExplainPlan, OptimizationStatus, Pattern, Query, Ref,
+    Term, TriplePattern, VarRegistry,
 };
 use serde_json::{json, Map, Value as JsonValue};
 
@@ -173,7 +173,7 @@ fn plan_patterns_to_json(
 
 /// Shared explain logic operating on an already-parsed query.
 ///
-/// Both JSON-LD and SPARQL entry points parse into `(VarRegistry, ParsedQuery)`
+/// Both JSON-LD and SPARQL entry points parse into `(VarRegistry, Query)`
 /// and then delegate here.  The `query_echo` value is placed in the `"query"`
 /// field of the response (JSON-LD echoes the original JSON object; SPARQL echoes
 /// the raw SPARQL string).  `where_clause` is optionally included in the
@@ -181,7 +181,7 @@ fn plan_patterns_to_json(
 fn explain_from_parsed(
     snapshot: &fluree_db_core::LedgerSnapshot,
     vars: &VarRegistry,
-    parsed: &ParsedQuery,
+    parsed: &Query,
     query_echo: JsonValue,
     where_clause: Option<JsonValue>,
 ) -> Result<JsonValue> {

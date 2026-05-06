@@ -35,9 +35,9 @@
 //! ?s rdf:type R  →  UNION(?s rdf:type R, ?_x P ?s)
 //! ```
 
+use crate::ir::triple::{Ref, Term, TriplePattern};
 use crate::ir::Pattern;
-use crate::rewrite::{Diagnostics, PlanContext, RewriteResult};
-use crate::triple::{Ref, Term, TriplePattern};
+use crate::rewrite::{rewrite_subpatterns, Diagnostics, PlanContext, RewriteResult};
 use crate::var_registry::VarId;
 use fluree_db_core::{
     is_owl_equivalent_property, is_rdf_type, FlakeValue, GraphDbRef, IndexType, RangeMatch,
@@ -541,111 +541,18 @@ fn rewrite_owl_ql_single_pattern(
     match pattern {
         Pattern::Triple(tp) => rewrite_owl_ql_triple(tp, ontology, ctx, diag, total_expansions),
 
-        // Recursively process nested patterns
-        Pattern::Optional(inner) => {
-            let before = diag.patterns_expanded;
-            let rewritten =
-                rewrite_owl_ql_patterns_internal(inner, ontology, ctx, diag, total_expansions);
-            let changed = diag.patterns_expanded > before;
-            if changed {
-                RewriteResult::Expanded(vec![Pattern::Optional(rewritten)])
-            } else {
-                RewriteResult::Unchanged
-            }
-        }
-
-        Pattern::Union(branches) => {
-            let mut rewritten_branches = Vec::with_capacity(branches.len());
-            let before = diag.patterns_expanded;
-
-            for branch in branches {
-                let rewritten =
-                    rewrite_owl_ql_patterns_internal(branch, ontology, ctx, diag, total_expansions);
-                rewritten_branches.push(rewritten);
-            }
-
-            let changed = diag.patterns_expanded > before;
-            if changed {
-                RewriteResult::Expanded(vec![Pattern::Union(rewritten_branches)])
-            } else {
-                RewriteResult::Unchanged
-            }
-        }
-
-        Pattern::Minus(inner) => {
-            let before = diag.patterns_expanded;
-            let rewritten =
-                rewrite_owl_ql_patterns_internal(inner, ontology, ctx, diag, total_expansions);
-            let changed = diag.patterns_expanded > before;
-            if changed {
-                RewriteResult::Expanded(vec![Pattern::Minus(rewritten)])
-            } else {
-                RewriteResult::Unchanged
-            }
-        }
-
-        Pattern::Exists(inner) => {
-            let before = diag.patterns_expanded;
-            let rewritten =
-                rewrite_owl_ql_patterns_internal(inner, ontology, ctx, diag, total_expansions);
-            let changed = diag.patterns_expanded > before;
-            if changed {
-                RewriteResult::Expanded(vec![Pattern::Exists(rewritten)])
-            } else {
-                RewriteResult::Unchanged
-            }
-        }
-
-        Pattern::NotExists(inner) => {
-            let before = diag.patterns_expanded;
-            let rewritten =
-                rewrite_owl_ql_patterns_internal(inner, ontology, ctx, diag, total_expansions);
-            let changed = diag.patterns_expanded > before;
-            if changed {
-                RewriteResult::Expanded(vec![Pattern::NotExists(rewritten)])
-            } else {
-                RewriteResult::Unchanged
-            }
-        }
-
-        Pattern::Graph {
-            name,
-            patterns: inner,
-        } => {
-            let before = diag.patterns_expanded;
-            let rewritten =
-                rewrite_owl_ql_patterns_internal(inner, ontology, ctx, diag, total_expansions);
-            let changed = diag.patterns_expanded > before;
-            if changed {
-                RewriteResult::Expanded(vec![Pattern::Graph {
-                    name: name.clone(),
-                    patterns: rewritten,
-                }])
-            } else {
-                RewriteResult::Unchanged
-            }
-        }
-
-        Pattern::Service(sp) => {
-            let before = diag.patterns_expanded;
-            let rewritten = rewrite_owl_ql_patterns_internal(
-                &sp.patterns,
-                ontology,
-                ctx,
-                diag,
-                total_expansions,
-            );
-            let changed = diag.patterns_expanded > before;
-            if changed {
-                RewriteResult::Expanded(vec![Pattern::Service(crate::ir::ServicePattern::new(
-                    sp.silent,
-                    sp.endpoint.clone(),
-                    rewritten,
-                ))])
-            } else {
-                RewriteResult::Unchanged
-            }
-        }
+        // Recursively process nested patterns. Subquery is treated as a
+        // leaf below; OWL2-QL expansion doesn't cross subquery scope
+        // boundaries.
+        Pattern::Optional(_)
+        | Pattern::Union(_)
+        | Pattern::Minus(_)
+        | Pattern::Exists(_)
+        | Pattern::NotExists(_)
+        | Pattern::Graph { .. }
+        | Pattern::Service(_) => rewrite_subpatterns(pattern.clone(), diag, |xs, diag| {
+            rewrite_owl_ql_patterns_internal(&xs, ontology, ctx, diag, total_expansions)
+        }),
 
         // Non-expandable patterns
         Pattern::Filter(_)
@@ -975,8 +882,8 @@ fn expand_type_query_owl_ql(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ir::triple::Ref;
     use crate::rewrite::{EntailmentMode, PlanLimits};
-    use crate::triple::Ref;
     use fluree_db_core::SidInterner;
     use fluree_vocab::namespaces::RDF;
 

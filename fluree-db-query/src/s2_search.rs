@@ -569,7 +569,7 @@ mod tests {
         )
         .with_distance_var(distance);
 
-        let vars = pattern.variables();
+        let vars = pattern.produced_vars();
         assert!(vars.contains(&subject));
         assert!(vars.contains(&distance));
     }

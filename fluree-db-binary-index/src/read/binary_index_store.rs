@@ -543,7 +543,11 @@ impl BinaryIndexStore {
     }
 
     /// Fetch sidecar bytes by CID (full object, sync).
-    fn fetch_sidecar_bytes_sync(
+    ///
+    /// Used by both the cursor (`open_leaf_handle`) and external callers
+    /// that walk leaflet base columns directly (batched join probes) and
+    /// need to reconstruct historical state via `replay_leaflet_at_t`.
+    pub fn fetch_sidecar_bytes_sync(
         &self,
         sidecar_cid: Option<&ContentId>,
     ) -> io::Result<Option<Vec<u8>>> {

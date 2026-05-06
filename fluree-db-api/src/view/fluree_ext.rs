@@ -13,7 +13,7 @@ use crate::{
 use fluree_db_binary_index::BinaryIndexStore;
 use fluree_db_core::ids::GraphId;
 use fluree_db_core::{ContentStore, DictNovelty, IndexType, DEFAULT_GRAPH_ID, TXN_META_GRAPH_ID};
-use fluree_db_query::rewrite::ReasoningModes;
+use fluree_db_query::ir::ReasoningModes;
 use fluree_db_query::BinaryRangeProvider;
 
 // ============================================================================

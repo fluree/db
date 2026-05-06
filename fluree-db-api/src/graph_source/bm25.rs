@@ -16,7 +16,7 @@ use fluree_db_ledger::LedgerState;
 use fluree_db_nameservice::GraphSourceType;
 use fluree_db_query::bm25::{Bm25IndexBuilder, Bm25Manifest, Bm25SnapshotEntry, PropertyDeps};
 use fluree_db_query::parse::parse_query;
-use fluree_db_query::{execute_with_overlay, ExecutableQuery, QueryOutput, VarRegistry};
+use fluree_db_query::{execute, ContextConfig, ExecutableQuery, QueryOutput, VarRegistry};
 use serde_json::Value as JsonValue;
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -226,7 +226,7 @@ impl crate::Fluree {
         let executable = ExecutableQuery::simple(parsed_for_exec);
 
         let db = ledger.as_graph_db_ref(0);
-        let batches = execute_with_overlay(db, &vars, &executable).await?;
+        let batches = execute(db, &vars, &executable, ContextConfig::default()).await?;
 
         // Format using the standard JSON-LD formatter
         let result = crate::query::helpers::build_query_result(
@@ -268,7 +268,7 @@ impl crate::Fluree {
         let executable = ExecutableQuery::simple(parsed_for_exec);
 
         let db = view.as_graph_db_ref();
-        let batches = execute_with_overlay(db, &vars, &executable).await?;
+        let batches = execute(db, &vars, &executable, ContextConfig::default()).await?;
 
         let novelty = view
             .novelty()

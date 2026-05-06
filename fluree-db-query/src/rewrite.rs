@@ -8,381 +8,9 @@
 //!
 //! Use `rewrite_patterns` with a `PlanContext` to expand query patterns according to the active entailment mode.
 
+use crate::ir::triple::{Ref, Term, TriplePattern};
 use crate::ir::Pattern;
-use crate::triple::{Ref, Term, TriplePattern};
 use fluree_db_core::{is_rdf_type, SchemaHierarchy, Sid};
-
-/// Reasoning modes that can be enabled for query execution
-///
-/// Multiple modes can be enabled simultaneously. For example, both RDFS and OWL2-QL
-/// can be active to get subclass/subproperty expansion plus inverseOf handling.
-///
-/// # JSON-LD Query Syntax
-///
-/// ```json
-/// { "reasoning": ["rdfs", "owl2ql"] }  // multiple modes
-/// { "reasoning": "rdfs" }               // single mode
-/// { "reasoning": "none" }               // disable all (including auto-RDFS)
-/// { "reasoning": "datalog", "rules": [...] }  // datalog with query-time rules
-/// { "reasoning": "owl-datalog" }        // extended OWL with complex expressions
-/// ```
-///
-/// # Default Behavior
-///
-/// When no `reasoning` key is present:
-/// - RDFS is auto-enabled if a schema hierarchy exists
-/// - OWL2-QL, OWL2-RL, OWL-Datalog, Datalog are disabled
-///
-/// When `reasoning: "none"` is specified, auto-RDFS is disabled.
-///
-/// # Query-Time Rules
-///
-/// Rules can be provided at query time via the `rules` field. These are merged
-/// with any rules stored in the database when `datalog` reasoning is enabled.
-/// Rules should be in the same JSON-LD format as stored rules:
-///
-/// ```json
-/// {
-///   "reasoning": "datalog",
-///   "rules": [{
-///     "@context": {"ex": "http://example.org/"},
-///     "where": {"@id": "?person", "ex:parent": {"ex:parent": "?grandparent"}},
-///     "insert": {"@id": "?person", "ex:grandparent": "?grandparent"}
-///   }]
-/// }
-/// ```
-///
-/// # OWL-Datalog Mode
-///
-/// The `owl-datalog` mode enables extended OWL reasoning with complex class expressions
-/// that can be expressed in Datalog. This is a SUPERSET of `owl2rl` that supports:
-/// - Complex `owl:equivalentClass` with intersections containing restrictions
-/// - Property chains with inverse elements and arbitrary length (≥2)
-/// - Nested restrictions and complex class expressions
-/// - Enhanced someValuesFrom/allValuesFrom reasoning in equivalences
-///
-/// This mode is opt-in and separate from standard `owl2rl`.
-#[derive(Debug, Clone, Default)]
-pub struct ReasoningModes {
-    /// RDFS reasoning - subclass/subproperty expansion
-    pub rdfs: bool,
-    /// OWL2-QL reasoning - owl:inverseOf, domain/range type queries
-    pub owl2ql: bool,
-    /// Datalog rules (tx-time rules) - Phase 3
-    pub datalog: bool,
-    /// OWL2-RL materialization - Phase 5
-    pub owl2rl: bool,
-    /// OWL-Datalog: Extended OWL with complex class expressions
-    ///
-    /// This is a superset of owl2rl that supports additional constructs
-    /// expressible in Datalog: complex intersections, property chains with
-    /// inverses, nested restrictions, etc.
-    ///
-    /// Opt-in mode, not enabled by default.
-    pub owl_datalog: bool,
-    /// Explicitly disable all reasoning (overrides auto-RDFS)
-    ///
-    /// When true, no reasoning is applied even if hierarchy exists.
-    /// This is set by `"reasoning": "none"` in JSON.
-    pub explicit_none: bool,
-    /// Query-time datalog rules (JSON-LD format)
-    ///
-    /// These rules are merged with database rules when datalog reasoning is enabled.
-    /// Each rule should have `where` and `insert` clauses.
-    pub rules: Vec<serde_json::Value>,
-}
-
-impl PartialEq for ReasoningModes {
-    fn eq(&self, other: &Self) -> bool {
-        self.rdfs == other.rdfs
-            && self.owl2ql == other.owl2ql
-            && self.datalog == other.datalog
-            && self.owl2rl == other.owl2rl
-            && self.owl_datalog == other.owl_datalog
-            && self.explicit_none == other.explicit_none
-            && self.rules == other.rules
-    }
-}
-
-impl Eq for ReasoningModes {}
-
-impl ReasoningModes {
-    /// Create with no reasoning modes enabled
-    pub fn none() -> Self {
-        Self {
-            explicit_none: true,
-            ..Default::default()
-        }
-    }
-
-    /// Create with RDFS enabled
-    pub fn rdfs() -> Self {
-        Self {
-            rdfs: true,
-            ..Default::default()
-        }
-    }
-
-    /// Create with OWL2-QL enabled (includes RDFS for subclass expansion)
-    pub fn owl2ql() -> Self {
-        Self {
-            rdfs: true,
-            owl2ql: true,
-            ..Default::default()
-        }
-    }
-
-    /// Create with datalog enabled and query-time rules
-    pub fn datalog_with_rules(rules: Vec<serde_json::Value>) -> Self {
-        Self {
-            datalog: true,
-            rules,
-            ..Default::default()
-        }
-    }
-
-    /// Builder: enable RDFS
-    pub fn with_rdfs(mut self) -> Self {
-        self.rdfs = true;
-        self
-    }
-
-    /// Builder: enable OWL2-QL
-    pub fn with_owl2ql(mut self) -> Self {
-        self.owl2ql = true;
-        self
-    }
-
-    /// Builder: enable Datalog rules
-    pub fn with_datalog(mut self) -> Self {
-        self.datalog = true;
-        self
-    }
-
-    /// Builder: enable OWL2-RL materialization
-    pub fn with_owl2rl(mut self) -> Self {
-        self.owl2rl = true;
-        self
-    }
-
-    /// Builder: enable OWL-Datalog extended reasoning
-    ///
-    /// This enables complex OWL class expressions that can be expressed in Datalog:
-    /// - Complex intersectionOf/unionOf with restrictions
-    /// - Property chains with inverse elements and arbitrary length
-    /// - Enhanced someValuesFrom/allValuesFrom in equivalences
-    pub fn with_owl_datalog(mut self) -> Self {
-        self.owl_datalog = true;
-        self
-    }
-
-    /// Builder: add query-time rules
-    ///
-    /// Note: This also enables datalog reasoning mode if not already enabled.
-    pub fn with_rules(mut self, rules: Vec<serde_json::Value>) -> Self {
-        if !rules.is_empty() {
-            self.datalog = true;
-        }
-        self.rules = rules;
-        self
-    }
-
-    /// Check if any mode is explicitly enabled
-    pub fn has_any_enabled(&self) -> bool {
-        self.rdfs || self.owl2ql || self.datalog || self.owl2rl || self.owl_datalog
-    }
-
-    /// Check if reasoning is explicitly disabled
-    pub fn is_disabled(&self) -> bool {
-        self.explicit_none
-    }
-
-    /// Parse from a JSON value (string or array of strings)
-    ///
-    /// Valid values:
-    /// - `"none"` - disable all reasoning
-    /// - `"rdfs"` - RDFS only
-    /// - `"owl2ql"` - OWL2-QL (implies RDFS)
-    /// - `"datalog"` - Datalog rules
-    /// - `"owl2rl"` - OWL2-RL materialization
-    /// - `["rdfs", "owl2ql", ...]` - multiple modes
-    pub fn from_json(value: &serde_json::Value) -> Result<Self, String> {
-        match value {
-            serde_json::Value::Null => Ok(Self::default()),
-            serde_json::Value::String(s) => Self::parse_single(s),
-            serde_json::Value::Array(arr) => {
-                let mut modes = Self::default();
-                for item in arr {
-                    let s = item
-                        .as_str()
-                        .ok_or_else(|| "reasoning array must contain strings".to_string())?;
-                    modes = modes.merge(&Self::parse_single(s)?);
-                }
-                Ok(modes)
-            }
-            _ => Err("reasoning must be a string or array of strings".to_string()),
-        }
-    }
-
-    /// Parse reasoning modes from a query JSON object
-    ///
-    /// This extracts both the `reasoning` key (mode selection) and the `rules` key
-    /// (query-time datalog rules) from a query object.
-    ///
-    /// # Example
-    ///
-    /// ```
-    /// use fluree_db_query::rewrite::ReasoningModes;
-    /// use serde_json::json;
-    ///
-    /// let query = json!({
-    ///     "reasoning": "datalog",
-    ///     "rules": [{
-    ///         "@context": {"ex": "http://example.org/"},
-    ///         "where": {"@id": "?person", "ex:parent": {"ex:parent": "?grandparent"}},
-    ///         "insert": {"@id": "?person", "ex:grandparent": "?grandparent"}
-    ///     }]
-    /// });
-    /// let modes = ReasoningModes::from_query_json(&query).unwrap();
-    /// assert!(modes.datalog);
-    /// assert!(modes.has_rules());
-    /// ```
-    pub fn from_query_json(query: &serde_json::Value) -> Result<Self, String> {
-        // Parse reasoning modes
-        let mut modes = if let Some(reasoning) = query.get("reasoning") {
-            Self::from_json(reasoning)?
-        } else {
-            Self::default()
-        };
-
-        // Parse query-time rules
-        if let Some(rules) = query.get("rules") {
-            match rules {
-                serde_json::Value::Array(arr) => {
-                    modes.rules = arr.clone();
-                    // Enable datalog if rules are provided
-                    if !modes.rules.is_empty() {
-                        modes.datalog = true;
-                    }
-                }
-                serde_json::Value::Null => {}
-                _ => {
-                    return Err("rules must be an array".to_string());
-                }
-            }
-        }
-
-        Ok(modes)
-    }
-
-    /// Parse a single mode string
-    fn parse_single(s: &str) -> Result<Self, String> {
-        match s.to_lowercase().as_str() {
-            "none" => Ok(Self::none()),
-            "rdfs" => Ok(Self {
-                rdfs: true,
-                ..Default::default()
-            }),
-            "owl2ql" | "owl-ql" | "owlql" => Ok(Self {
-                rdfs: true, // OWL2-QL implies RDFS for subclass expansion
-                owl2ql: true,
-                ..Default::default()
-            }),
-            "datalog" => Ok(Self {
-                datalog: true,
-                ..Default::default()
-            }),
-            "owl2rl" | "owl-rl" | "owlrl" => Ok(Self {
-                owl2rl: true,
-                ..Default::default()
-            }),
-            "owl-datalog" | "owldatalog" | "owl_datalog" => Ok(Self {
-                owl_datalog: true,
-                // owl-datalog is a superset of owl2rl - enable both
-                owl2rl: true,
-                ..Default::default()
-            }),
-            other => Err(format!(
-                "unknown reasoning mode '{other}', expected: none, rdfs, owl2ql, datalog, owl2rl, owl-datalog"
-            )),
-        }
-    }
-
-    /// Merge another ReasoningModes into this one (OR of flags)
-    fn merge(mut self, other: &Self) -> Self {
-        self.rdfs |= other.rdfs;
-        self.owl2ql |= other.owl2ql;
-        self.datalog |= other.datalog;
-        self.owl2rl |= other.owl2rl;
-        self.owl_datalog |= other.owl_datalog;
-        // explicit_none is only set by "none" alone, not merged
-        // rules are combined
-        self.rules.extend(other.rules.iter().cloned());
-        self
-    }
-
-    /// Build from a list of mode name strings (e.g., from config graph).
-    ///
-    /// Accepts the same names as `parse_single`: "rdfs", "owl2ql",
-    /// "owl2rl", "datalog", "owl-datalog", "none".
-    /// Unknown names are logged as warnings and skipped.
-    pub fn from_mode_strings(names: &[String]) -> Self {
-        let mut modes = Self::default();
-        for name in names {
-            // Config reader returns full IRIs (e.g., "https://ns.flur.ee/db#rdfs").
-            // Strip known namespace prefix before parsing.
-            let short = name.strip_prefix(fluree_vocab::fluree::DB).unwrap_or(name);
-            match Self::parse_single(short) {
-                Ok(single) => {
-                    if single.explicit_none {
-                        // "none" force-disables reasoning; return immediately.
-                        // merge() deliberately does not propagate explicit_none,
-                        // so we must handle it here.
-                        if names.len() > 1 {
-                            tracing::warn!(
-                                "Config reasoning modes contain 'none' alongside other modes; \
-                                 'none' takes precedence"
-                            );
-                        }
-                        return Self::none();
-                    }
-                    modes = modes.merge(&single);
-                }
-                Err(e) => {
-                    tracing::warn!(mode = %name, "Unknown reasoning mode in config: {e}");
-                }
-            }
-        }
-        modes
-    }
-
-    /// Check if query-time rules are provided
-    pub fn has_rules(&self) -> bool {
-        !self.rules.is_empty()
-    }
-
-    /// Compute effective reasoning given available hierarchy
-    ///
-    /// Auto-enables RDFS if:
-    /// - RDFS is not already enabled
-    /// - User didn't explicitly disable reasoning with "none"
-    /// - A schema hierarchy is available
-    ///
-    /// This means other modes (datalog, owl2rl) can be enabled independently
-    /// and RDFS will still be auto-enabled unless explicitly disabled.
-    pub fn effective_with_hierarchy(self, hierarchy_available: bool) -> Self {
-        if self.explicit_none {
-            // User explicitly disabled - no auto-enable
-            return self;
-        }
-        // Auto-enable RDFS if not already enabled and hierarchy exists
-        if !self.rdfs && hierarchy_available {
-            Self { rdfs: true, ..self }
-        } else {
-            self
-        }
-    }
-}
 
 /// Entailment mode for query execution.
 ///
@@ -481,6 +109,40 @@ impl Diagnostics {
     /// Add a warning message
     pub fn warn(&mut self, msg: impl Into<String>) {
         self.warnings.push(msg.into());
+    }
+}
+
+/// Recurse a rewriter into the subpatterns of a container variant and
+/// report whether anything changed.
+///
+/// `recurse` is the rewriter's per-pattern-list entry point — it sees an
+/// owned `Vec<Pattern>` plus the shared `Diagnostics` and returns the
+/// rewritten list. This helper handles the three boilerplate concerns that
+/// every container arm in the rewriters used to inline:
+///
+/// 1. Snapshot `diag.patterns_expanded` before recursion.
+/// 2. Walk every nested `Vec<Pattern>` via [`Pattern::map_subpatterns`].
+/// 3. Wrap the reconstructed pattern in `Expanded(vec![..])` if the
+///    counter advanced, otherwise return `Unchanged`.
+///
+/// Callers control which container variants this function gets called for
+/// by matching on the variants they want to recurse into. Variants the
+/// rewriter wants to treat as a leaf (typically `Subquery`) stay in the
+/// rewriter's leaf arm and never reach this helper.
+pub fn rewrite_subpatterns<F>(
+    pattern: Pattern,
+    diag: &mut Diagnostics,
+    mut recurse: F,
+) -> RewriteResult
+where
+    F: FnMut(Vec<Pattern>, &mut Diagnostics) -> Vec<Pattern>,
+{
+    let before = diag.patterns_expanded;
+    let rewritten = pattern.map_subpatterns(&mut |xs| recurse(xs, diag));
+    if diag.patterns_expanded > before {
+        RewriteResult::Expanded(vec![rewritten])
+    } else {
+        RewriteResult::Unchanged
     }
 }
 
@@ -593,106 +255,18 @@ fn rewrite_single_pattern(
     match pattern {
         Pattern::Triple(tp) => rewrite_triple_pattern(tp, hierarchy, ctx, diag, total_expansions),
 
-        // Recursively process nested patterns - sharing the global budget
-        Pattern::Optional(inner) => {
-            let before = diag.patterns_expanded;
-            let rewritten =
-                rewrite_patterns_internal(inner, hierarchy, ctx, diag, total_expansions);
-            let changed = diag.patterns_expanded > before;
-            if changed {
-                RewriteResult::Expanded(vec![Pattern::Optional(rewritten)])
-            } else {
-                RewriteResult::Unchanged
-            }
-        }
-
-        Pattern::Union(branches) => {
-            let mut rewritten_branches = Vec::with_capacity(branches.len());
-            let before = diag.patterns_expanded;
-
-            for branch in branches {
-                let rewritten =
-                    rewrite_patterns_internal(branch, hierarchy, ctx, diag, total_expansions);
-                rewritten_branches.push(rewritten);
-            }
-
-            let changed = diag.patterns_expanded > before;
-            if changed {
-                RewriteResult::Expanded(vec![Pattern::Union(rewritten_branches)])
-            } else {
-                RewriteResult::Unchanged
-            }
-        }
-
-        Pattern::Minus(inner) => {
-            let before = diag.patterns_expanded;
-            let rewritten =
-                rewrite_patterns_internal(inner, hierarchy, ctx, diag, total_expansions);
-            let changed = diag.patterns_expanded > before;
-            if changed {
-                RewriteResult::Expanded(vec![Pattern::Minus(rewritten)])
-            } else {
-                RewriteResult::Unchanged
-            }
-        }
-
-        Pattern::Exists(inner) => {
-            let before = diag.patterns_expanded;
-            let rewritten =
-                rewrite_patterns_internal(inner, hierarchy, ctx, diag, total_expansions);
-            let changed = diag.patterns_expanded > before;
-            if changed {
-                RewriteResult::Expanded(vec![Pattern::Exists(rewritten)])
-            } else {
-                RewriteResult::Unchanged
-            }
-        }
-
-        Pattern::NotExists(inner) => {
-            let before = diag.patterns_expanded;
-            let rewritten =
-                rewrite_patterns_internal(inner, hierarchy, ctx, diag, total_expansions);
-            let changed = diag.patterns_expanded > before;
-            if changed {
-                RewriteResult::Expanded(vec![Pattern::NotExists(rewritten)])
-            } else {
-                RewriteResult::Unchanged
-            }
-        }
-
-        Pattern::Graph {
-            name,
-            patterns: inner,
-        } => {
-            let before = diag.patterns_expanded;
-            let rewritten =
-                rewrite_patterns_internal(inner, hierarchy, ctx, diag, total_expansions);
-            let changed = diag.patterns_expanded > before;
-            if changed {
-                RewriteResult::Expanded(vec![Pattern::Graph {
-                    name: name.clone(),
-                    patterns: rewritten,
-                }])
-            } else {
-                RewriteResult::Unchanged
-            }
-        }
-
-        Pattern::Service(sp) => {
-            let before = diag.patterns_expanded;
-            let rewritten =
-                rewrite_patterns_internal(&sp.patterns, hierarchy, ctx, diag, total_expansions);
-            let changed = diag.patterns_expanded > before;
-            if changed {
-                RewriteResult::Expanded(vec![Pattern::Service(crate::ir::ServicePattern::new(
-                    sp.silent,
-                    sp.endpoint.clone(),
-                    rewritten,
-                ))])
-            } else {
-                RewriteResult::Unchanged
-            }
-        }
+        // Recursively process nested patterns — sharing the global budget.
+        // Subquery is treated as a leaf below; the rewriter doesn't expand
+        // across subquery scope boundaries.
+        Pattern::Optional(_)
+        | Pattern::Union(_)
+        | Pattern::Minus(_)
+        | Pattern::Exists(_)
+        | Pattern::NotExists(_)
+        | Pattern::Graph { .. }
+        | Pattern::Service(_) => rewrite_subpatterns(pattern.clone(), diag, |xs, diag| {
+            rewrite_patterns_internal(&xs, hierarchy, ctx, diag, total_expansions)
+        }),
 
         // Non-expandable patterns
         Pattern::Filter(_)
@@ -937,7 +511,7 @@ fn expand_predicate_pattern(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::triple::Ref;
+    use crate::ir::triple::Ref;
     use crate::var_registry::VarId;
     use fluree_db_core::{IndexSchema, SchemaPredicateInfo, SchemaPredicates};
     use fluree_db_core::{Sid, SidInterner};
@@ -1556,188 +1130,5 @@ mod tests {
         assert_eq!(diag.type_expansions, 1);
         assert_eq!(diag.predicate_expansions, 1);
         assert_eq!(diag.patterns_expanded, 2);
-    }
-
-    // ========================
-    // ReasoningModes tests
-    // ========================
-
-    #[test]
-    fn test_reasoning_modes_default() {
-        let modes = ReasoningModes::default();
-        assert!(!modes.rdfs);
-        assert!(!modes.owl2ql);
-        assert!(!modes.datalog);
-        assert!(!modes.owl2rl);
-        assert!(!modes.explicit_none);
-        assert!(!modes.has_any_enabled());
-        assert!(!modes.is_disabled());
-    }
-
-    #[test]
-    fn test_reasoning_modes_none() {
-        let modes = ReasoningModes::none();
-        assert!(!modes.rdfs);
-        assert!(!modes.owl2ql);
-        assert!(modes.explicit_none);
-        assert!(modes.is_disabled());
-    }
-
-    #[test]
-    fn test_reasoning_modes_rdfs() {
-        let modes = ReasoningModes::rdfs();
-        assert!(modes.rdfs);
-        assert!(!modes.owl2ql);
-        assert!(!modes.explicit_none);
-        assert!(modes.has_any_enabled());
-    }
-
-    #[test]
-    fn test_reasoning_modes_owl2ql() {
-        let modes = ReasoningModes::owl2ql();
-        assert!(modes.rdfs); // owl2ql implies rdfs
-        assert!(modes.owl2ql);
-        assert!(modes.has_any_enabled());
-    }
-
-    #[test]
-    fn test_reasoning_modes_builders() {
-        let modes = ReasoningModes::default()
-            .with_rdfs()
-            .with_owl2ql()
-            .with_datalog();
-        assert!(modes.rdfs);
-        assert!(modes.owl2ql);
-        assert!(modes.datalog);
-        assert!(!modes.owl2rl);
-    }
-
-    #[test]
-    fn test_reasoning_modes_from_json_string_none() {
-        let value = serde_json::json!("none");
-        let modes = ReasoningModes::from_json(&value).unwrap();
-        assert!(modes.explicit_none);
-        assert!(!modes.rdfs);
-    }
-
-    #[test]
-    fn test_reasoning_modes_from_json_string_rdfs() {
-        let value = serde_json::json!("rdfs");
-        let modes = ReasoningModes::from_json(&value).unwrap();
-        assert!(modes.rdfs);
-        assert!(!modes.owl2ql);
-        assert!(!modes.explicit_none);
-    }
-
-    #[test]
-    fn test_reasoning_modes_from_json_string_owl2ql() {
-        // Test various spellings
-        for spelling in &["owl2ql", "owl-ql", "owlql", "OWL2QL", "Owl-Ql"] {
-            let value = serde_json::json!(spelling);
-            let modes = ReasoningModes::from_json(&value).unwrap();
-            assert!(modes.owl2ql, "Failed for spelling: {spelling}");
-            assert!(modes.rdfs, "OWL2QL should imply RDFS for: {spelling}");
-        }
-    }
-
-    #[test]
-    fn test_reasoning_modes_from_json_string_owl2rl() {
-        for spelling in &["owl2rl", "owl-rl", "owlrl"] {
-            let value = serde_json::json!(spelling);
-            let modes = ReasoningModes::from_json(&value).unwrap();
-            assert!(modes.owl2rl, "Failed for spelling: {spelling}");
-        }
-    }
-
-    #[test]
-    fn test_reasoning_modes_from_json_array() {
-        let value = serde_json::json!(["rdfs", "owl2ql"]);
-        let modes = ReasoningModes::from_json(&value).unwrap();
-        assert!(modes.rdfs);
-        assert!(modes.owl2ql);
-        assert!(!modes.datalog);
-    }
-
-    #[test]
-    fn test_reasoning_modes_from_json_array_multiple() {
-        let value = serde_json::json!(["rdfs", "datalog", "owl2rl"]);
-        let modes = ReasoningModes::from_json(&value).unwrap();
-        assert!(modes.rdfs);
-        assert!(modes.datalog);
-        assert!(modes.owl2rl);
-        assert!(!modes.owl2ql);
-    }
-
-    #[test]
-    fn test_reasoning_modes_from_json_null() {
-        let value = serde_json::json!(null);
-        let modes = ReasoningModes::from_json(&value).unwrap();
-        assert!(!modes.rdfs);
-        assert!(!modes.explicit_none);
-    }
-
-    #[test]
-    fn test_reasoning_modes_from_json_invalid_string() {
-        let value = serde_json::json!("invalid_mode");
-        let result = ReasoningModes::from_json(&value);
-        assert!(result.is_err());
-        assert!(result.unwrap_err().contains("unknown reasoning mode"));
-    }
-
-    #[test]
-    fn test_reasoning_modes_from_json_invalid_type() {
-        let value = serde_json::json!(123);
-        let result = ReasoningModes::from_json(&value);
-        assert!(result.is_err());
-        assert!(result.unwrap_err().contains("must be a string or array"));
-    }
-
-    #[test]
-    fn test_reasoning_modes_from_json_invalid_array_element() {
-        let value = serde_json::json!(["rdfs", 123]);
-        let result = ReasoningModes::from_json(&value);
-        assert!(result.is_err());
-        assert!(result.unwrap_err().contains("must contain strings"));
-    }
-
-    #[test]
-    fn test_reasoning_modes_effective_with_hierarchy_auto_rdfs() {
-        // Default modes (no explicit setting) + hierarchy available = RDFS enabled
-        let modes = ReasoningModes::default();
-        let effective = modes.effective_with_hierarchy(true);
-        assert!(effective.rdfs);
-    }
-
-    #[test]
-    fn test_reasoning_modes_effective_with_hierarchy_no_auto_without_hierarchy() {
-        // Default modes + no hierarchy = RDFS not enabled
-        let modes = ReasoningModes::default();
-        let effective = modes.effective_with_hierarchy(false);
-        assert!(!effective.rdfs);
-    }
-
-    #[test]
-    fn test_reasoning_modes_effective_explicit_none_overrides_auto() {
-        // Explicit "none" + hierarchy available = RDFS NOT enabled
-        let modes = ReasoningModes::none();
-        let effective = modes.effective_with_hierarchy(true);
-        assert!(!effective.rdfs);
-    }
-
-    #[test]
-    fn test_reasoning_modes_effective_explicit_rdfs_without_hierarchy() {
-        // Explicit RDFS + no hierarchy = RDFS still requested (may warn at runtime)
-        let modes = ReasoningModes::rdfs();
-        let effective = modes.effective_with_hierarchy(false);
-        assert!(effective.rdfs);
-    }
-
-    #[test]
-    fn test_reasoning_modes_effective_preserves_other_modes() {
-        // Auto-RDFS shouldn't affect other modes
-        let modes = ReasoningModes::default().with_datalog();
-        let effective = modes.effective_with_hierarchy(true);
-        assert!(effective.rdfs);
-        assert!(effective.datalog);
     }
 }

@@ -12,8 +12,8 @@ use fluree_db_core::{GraphDbRef, LedgerSnapshot, NoOverlay, OverlayProvider, Run
 use fluree_db_ledger::{HistoricalLedgerView, LedgerState};
 use fluree_db_novelty::Novelty;
 use fluree_db_policy::PolicyContext;
+use fluree_db_query::ir::ReasoningModes;
 use fluree_db_query::policy::QueryPolicyEnforcer;
-use fluree_db_query::rewrite::ReasoningModes;
 
 /// How wrapper-provided reasoning interacts with query-specified reasoning.
 ///

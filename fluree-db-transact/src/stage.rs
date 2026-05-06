@@ -923,11 +923,10 @@ async fn stream_where_into_accumulator(
     // Open the streaming WHERE cursor. For empty patterns it emits one
     // empty-schema/empty-len batch then EOF, mirroring the eager API's
     // `vec![Batch::empty(...)]` behavior.
-    let mut cursor = fluree_db_query::execute_where_streaming_in_dataset(
+    let mut cursor = fluree_db_query::execute_where_streaming(
         base_db,
         &txn.vars,
         &query_patterns,
-        None,
         Some(&runtime_dataset),
     )
     .await
@@ -1361,11 +1360,10 @@ async fn generate_upsert_deletions(
                 }
                 Some(g_id) => {
                     if ledger.snapshot.range_provider.is_some() {
-                        fluree_db_query::execute_pattern_with_overlay_at(
+                        fluree_db_query::execute_pattern(
                             ledger.as_graph_db_ref(g_id),
                             &query_vars,
                             pattern,
-                            None,
                         )
                         .await?
                     } else {
@@ -1376,13 +1374,8 @@ async fn generate_upsert_deletions(
             }
         } else {
             // Default graph: use standard query path through range_provider
-            fluree_db_query::execute_pattern_with_overlay_at(
-                ledger.as_graph_db_ref(0),
-                &query_vars,
-                pattern,
-                None,
-            )
-            .await?
+            fluree_db_query::execute_pattern(ledger.as_graph_db_ref(0), &query_vars, pattern)
+                .await?
         };
 
         // Convert each result to a retraction flake in the appropriate graph.

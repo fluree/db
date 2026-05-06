@@ -115,6 +115,7 @@ pub use dataset::{
 };
 pub use error::{ApiError, BuilderError, BuilderErrors, Result};
 pub use fluree_db_core::ContentId;
+pub use fluree_db_core::RemoteObject;
 pub use fluree_db_core::{
     commit_to_summary, find_common_ancestor, walk_commit_summaries, CommitSummary, CommonAncestor,
     ConflictKey,
@@ -131,7 +132,7 @@ pub use graph_source::{
 pub use graph_transact_builder::{GraphTransactBuilder, StagedGraph};
 pub use import::{
     scan_directory_format, CreateBuilder, DirectoryFormat, EffectiveImportSettings, ImportBuilder,
-    ImportConfig, ImportError, ImportPhase, ImportResult, ImportSummary,
+    ImportConfig, ImportError, ImportPhase, ImportResult, ImportSummary, RemoteSource,
 };
 pub use ledger_info::LedgerInfoBuilder;
 pub use ledger_manager::{
@@ -219,16 +220,14 @@ pub use fluree_db_nameservice::{
 };
 pub use fluree_db_novelty::Novelty;
 pub use fluree_db_query::{
-    execute_pattern, execute_pattern_with_overlay, execute_pattern_with_overlay_at,
-    execute_with_dataset_and_bm25, execute_with_dataset_and_policy_and_bm25,
-    execute_with_dataset_and_policy_and_providers, execute_with_dataset_and_providers,
-    execute_with_overlay, execute_with_overlay_tracked, execute_with_r2rml, Batch, ExecutableQuery,
-    NoOpR2rmlProvider, Pattern, QueryContextParams, QueryOptions, VarRegistry,
+    execute, execute_pattern, Batch, ContextConfig, ExecutableQuery, NoOpR2rmlProvider, Pattern,
+    QueryOptions, VarRegistry,
 };
 // Re-export for lower-level pattern-based queries (internal/advanced use)
 pub use fluree_db_query::{Term, TriplePattern};
 // Re-export parse types for query results
-pub use fluree_db_query::parse::{ParseError, ParsedQuery};
+pub use fluree_db_query::ir::Query;
+pub use fluree_db_query::parse::ParseError;
 pub use fluree_db_transact::{
     lower_sparql_update, lower_sparql_update_ast, CommitOpts, CommitReceipt,
     LowerError as SparqlUpdateLowerError, NamespaceRegistry, TransactError, TxnOpts, TxnType,

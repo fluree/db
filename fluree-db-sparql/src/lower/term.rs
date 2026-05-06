@@ -15,8 +15,8 @@ use fluree_db_core::temporal::{
 };
 use fluree_db_core::{FlakeValue, Sid};
 use fluree_db_query::binding::Binding;
+use fluree_db_query::ir::triple::{Ref, Term, TriplePattern};
 use fluree_db_query::parse::encode::IriEncoder;
-use fluree_db_query::triple::{Ref, Term, TriplePattern};
 use fluree_db_query::var_registry::VarId;
 use fluree_vocab::namespaces::{FLUREE_DB, XSD};
 use fluree_vocab::{fluree, xsd, xsd_names};
