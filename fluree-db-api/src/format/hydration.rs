@@ -295,7 +295,18 @@ pub async fn format_async(
     // object per row; multi-column projections emit array rows.
     let single_column = columns.len() == 1;
 
-    for batch in &result.batches {
+    // A projection is "row-independent" when no column reads any solution
+    // binding — every column is a `Root::Sid` hydration. Such a projection
+    // produces the same output for every solution row, so we emit a single
+    // row regardless of how many solutions the WHERE clause yielded (the
+    // WHERE still gates *whether* a row is emitted via row_count == 0
+    // above).
+    let row_dependent = columns.iter().any(|c| match c {
+        Column::Var(_) => true,
+        Column::Hydration(spec) => matches!(spec.root, Root::Var(_)),
+    });
+
+    'rows: for batch in &result.batches {
         for row_idx in 0..batch.len() {
             let mut row_values: Vec<JsonValue> = Vec::with_capacity(columns.len());
 
@@ -324,6 +335,10 @@ pub async fn format_async(
                 rows.push(row_values.into_iter().next().unwrap());
             } else {
                 rows.push(JsonValue::Array(row_values));
+            }
+
+            if !row_dependent {
+                break 'rows;
             }
         }
     }
