@@ -540,8 +540,12 @@ fn parse_construct_template(
 /// Supports five forms:
 /// 1. Single string: `"?x"` - single variable selection (unwrap)
 /// 2. Simple array: `["?x", "?y"]` - flat variable selection
-/// 3. Mixed array: `["?age", {"?person": ["*"]}]` - scalar vars + hydration
-/// 4. Single object: `{"?person": ["*"]}` - hydration only
+/// 3. Mixed array: `["?age", {"?person": ["*"]}, {"?org": ["*"]}]` - any
+///    combination of variable and hydration columns, in any order; each
+///    object is an independent hydration with its own root, level, and
+///    depth.
+/// 4. Single object: `{"?person": ["*"]}` - one hydration column (rendered
+///    as a bare object per row rather than a single-element array).
 /// 5. S-expression aggregates: `["?name", "(count ?favNums as ?cnt)"]`
 fn parse_select(
     select: &JsonValue,

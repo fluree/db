@@ -1,6 +1,12 @@
 //! Hydration formatter — materializes a Sid into a nested JSON-LD object by
 //! recursively fetching its properties.
 //!
+//! Each hydration column carries its own root, level, and depth budget. The
+//! formatter dispatches per column: a variable root reads the row's binding
+//! and expands that subject; an IRI-constant root expands the named subject
+//! directly; non-hydration (`Var`) columns are formatted by the regular
+//! flat-binding formatters.
+//!
 //! # Supported Syntax
 //!
 //! ```json
@@ -13,7 +19,26 @@
 //!
 //! // IRI constant root (no WHERE needed)
 //! {"select": {"ex:alice": ["*"]}}
+//!
+//! // Multiple hydration columns: each row is [expanded_a, expanded_b].
+//! {"select": [{"?person": ["*"]}, {"?org": ["*"]}],
+//!  "where": {"@id": "?person", "ex:worksFor": "?org"}}
+//!
+//! // Hydration columns mixed with flat variables.
+//! {"select": ["?age", {"?person": ["*"]}],
+//!  "where": {"@id": "?person", "ex:age": "?age"}}
 //! ```
+//!
+//! # Output cardinality
+//!
+//! Solution rows generally map 1:1 to output rows, except when no column
+//! depends on any solution binding (every column is an IRI-constant
+//! hydration). In that case the output is independent of the row, so the
+//! formatter emits a single row regardless of how many solutions the WHERE
+//! produced. An empty solution set still produces no rows.
+//!
+//! A variable root that's unbound for a given solution renders as `null` in
+//! that cell rather than dropping the entire row.
 
 use super::config::{FormatterConfig, OutputFormat};
 use super::datatype::is_inferable_datatype;
