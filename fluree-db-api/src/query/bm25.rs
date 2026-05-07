@@ -63,7 +63,7 @@ impl Fluree {
         }
         let batches = execute(db, &vars, &executable, config).await?;
 
-        // Dataset graph crawl formatting may need to see flakes from multiple ledgers (union),
+        // Dataset hydration formatting may need to see flakes from multiple ledgers (union),
         // and each ledger may have a different `t`. We therefore:
         // - use a composite overlay (union of novelty overlays)
         // - omit result `t` unless the dataset resolves to one meaningful ledger/time

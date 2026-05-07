@@ -28,19 +28,14 @@ pub fn format(
     let select_one = result.output.is_select_one();
     let mut rows = Vec::new();
 
+    let select_vars = result.output.projected_vars_or_empty();
     for batch in &result.batches {
         for row_idx in 0..batch.len() {
             let row = if result.output.is_wildcard() {
                 // Wildcard: use batch schema, return all bound vars as object
                 format_row_wildcard(result, batch, row_idx, &result.vars, compactor)?
             } else {
-                format_row_array(
-                    result,
-                    batch,
-                    row_idx,
-                    result.output.select_vars_or_empty(),
-                    compactor,
-                )?
+                format_row_array(result, batch, row_idx, &select_vars, compactor)?
             };
             rows.push(row);
 

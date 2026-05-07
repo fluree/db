@@ -227,7 +227,7 @@ fn format_delimited_limited(
 // Internals
 // ---------------------------------------------------------------------------
 
-/// Reject non-tabular results (CONSTRUCT, graph crawl).
+/// Reject non-tabular results (CONSTRUCT, hydration).
 fn reject_non_tabular(result: &QueryResult, delimiter: Delimiter) -> Result<()> {
     let name = delimiter.name();
     if result.output.is_construct() {
@@ -235,14 +235,14 @@ fn reject_non_tabular(result: &QueryResult, delimiter: Delimiter) -> Result<()> 
             "{name} format not supported for CONSTRUCT queries (use JSON-LD instead)"
         )));
     }
-    if result.output.is_boolean() {
+    if result.output.is_ask() {
         return Err(FormatError::InvalidBinding(format!(
             "{name} format not supported for ASK queries (boolean result)"
         )));
     }
-    if result.graph_select.is_some() {
+    if result.output.has_hydration() {
         return Err(FormatError::InvalidBinding(format!(
-            "{name} format not supported for graph crawl queries (use JSON-LD instead)"
+            "{name} format not supported for hydration queries (use JSON-LD instead)"
         )));
     }
     Ok(())
@@ -285,7 +285,7 @@ fn resolve_select_vars(result: &QueryResult) -> Vec<VarId> {
         pairs.sort_by(|(a, _), (b, _)| a.cmp(b));
         pairs.into_iter().map(|(_, vid)| vid).collect()
     } else {
-        result.output.select_vars_or_empty().to_vec()
+        result.output.projected_vars_or_empty()
     }
 }
 
@@ -634,10 +634,9 @@ mod tests {
             novelty: None,
             context,
             orig_context: None,
-            output: crate::QueryOutput::select(var_ids),
+            output: crate::QueryOutput::select_all(var_ids),
             batches: vec![batch],
             binary_graph: None,
-            graph_select: None,
         }
     }
 

@@ -63,7 +63,7 @@ async fn seed_reverse_family(fluree: &MemoryFluree, ledger_id: &str) -> MemoryLe
 
 #[tokio::test]
 async fn reverse_predicate_in_where_selects_inverse_edges() {
-    // Scenario: context-reverse-test (adapted: WHERE-based assertion, avoids reverse graph crawl formatting)
+    // Scenario: context-reverse-test (adapted: WHERE-based assertion, avoids reverse expansion formatting)
     let fluree = FlureeBuilder::memory().build_memory();
     let ledger = seed_reverse_friends(&fluree, "reverse:friends").await;
 
@@ -97,7 +97,7 @@ async fn reverse_predicate_in_where_selects_inverse_edges() {
 
 #[tokio::test]
 async fn reverse_predicate_in_where_finds_kid() {
-    // Scenario: reverse-preds-in-where-and-select / "where clause" (adapted: avoid graph crawl selector)
+    // Scenario: reverse-preds-in-where-and-select / "where clause" (adapted: avoid expansion selector)
     let fluree = FlureeBuilder::memory().build_memory();
     let ledger = seed_reverse_family(&fluree, "reverse:family").await;
 
@@ -171,10 +171,10 @@ async fn forward_at_type_in_where_finds_classes() {
 }
 
 #[tokio::test]
-async fn context_reverse_select_one_graph_crawl() {
+async fn context_reverse_select_one_expansion() {
     // Scenario: context-reverse-test
     let fluree = FlureeBuilder::memory().build_memory();
-    let ledger = seed_reverse_friends(&fluree, "reverse-friends-graph-crawl:main").await;
+    let ledger = seed_reverse_friends(&fluree, "reverse-friends-expansion:main").await;
 
     // 1) single reverse edge, no container
     let q1 = json!({
@@ -319,7 +319,7 @@ async fn type_reverse_and_forward_agree_on_classes() {
 }
 
 #[tokio::test]
-async fn inline_reverse_key_in_graph_crawl_top_level() {
+async fn inline_reverse_key_in_expansion_top_level() {
     // The AST documents {"@reverse:friended": ["*"]} as inline reverse-in-select
     // syntax. Verify it works without needing a context alias.
     let fluree = FlureeBuilder::memory().build_memory();

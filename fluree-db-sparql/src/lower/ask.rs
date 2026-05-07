@@ -1,6 +1,6 @@
 //! ASK query lowering.
 //!
-//! Converts SPARQL ASK queries to `Query` with `SelectMode::Boolean`.
+//! Converts SPARQL ASK queries to `Query` with `SelectMode::Ask`.
 //! ASK tests whether a graph pattern has any solution — no variables are projected.
 
 use crate::ast::query::AskQuery;
@@ -30,10 +30,9 @@ impl<E: IriEncoder> LoweringContext<'_, E> {
         Ok(Query {
             context: ctx,
             orig_context: None,
-            output: QueryOutput::Boolean,
+            output: QueryOutput::Ask,
             patterns,
             options,
-            graph_select: None,
             post_values: None,
         })
     }

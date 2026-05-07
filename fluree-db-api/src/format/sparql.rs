@@ -58,7 +58,7 @@ pub fn format(
                     .collect()
             })
     } else {
-        result.output.select_vars_or_empty().to_vec()
+        result.output.projected_vars_or_empty()
     };
 
     // Order head vars lexicographically by variable name (without '?').
@@ -462,10 +462,9 @@ mod tests {
             novelty: None,
             context: crate::ParsedContext::default(),
             orig_context: None,
-            output: crate::QueryOutput::select(vec![]),
+            output: crate::QueryOutput::select_all(vec![]),
             batches: vec![],
             binary_graph: None,
-            graph_select: None,
         }
     }
 

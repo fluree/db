@@ -2,11 +2,11 @@
 //! parsing through planning, execution, and result formatting.
 //!
 //! `Query` is the canonical query representation. Its `output` field
-//! captures the result-shape decision (SELECT vars, SELECT-one, wildcard,
-//! ASK, CONSTRUCT). `patterns` holds the WHERE clause IR. `options`
-//! carries solution modifiers (limit, offset, order by, group by,
-//! aggregates, having, distinct, ...). `graph_select` carries a graph
-//! crawl spec when the result format is nested JSON-LD rather than tabular.
+//! captures the result-shape decision (SELECT, ASK, CONSTRUCT). `patterns`
+//! holds the WHERE clause IR. `options` carries solution modifiers (limit,
+//! offset, order by, group by, aggregates, having, distinct, ...).
+//! Hydration formatting lives inside the `Column::Hydration` variant on
+//! the SELECT projection.
 
 use std::collections::HashSet;
 
@@ -14,24 +14,9 @@ use fluree_graph_json_ld::ParsedContext;
 
 use super::options::QueryOptions;
 use super::pattern::Pattern;
-use super::projection::GraphSelectSpec;
+use super::projection::{Column, Projection};
 use super::triple::TriplePattern;
 use crate::var_registry::VarId;
-
-/// Per-row projection shape for tabular output formatters.
-///
-/// Formatters that emit row arrays (jsonld, delimited, etc.) consult this to
-/// decide scalar-vs-tuple rendering. Object-based formatters (typed, agent_json)
-/// ignore it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum ProjectionShape {
-    /// Every row is an array, regardless of arity. Default; used by SPARQL
-    /// and JSON-LD array-form select.
-    #[default]
-    Tuple,
-    /// 1-var rows flatten to scalars. JSON-LD bare-string `select: "?x"`.
-    Scalar,
-}
 
 /// Resolved CONSTRUCT template patterns
 ///
@@ -60,90 +45,103 @@ impl ConstructTemplate {
     }
 }
 
-/// Describes what the query produces.
+/// Whether a SELECT returns all solutions or just the first row.
 ///
-/// Combines the select mode, selected variables, and construct template into a
-/// single enum so that invalid combinations (e.g. `Construct` without a
-/// template, or `Many` with an empty variable list) are unrepresentable.
+/// Distinct from `LIMIT 1`: `One` also changes output shape (formatters
+/// return the bare row or null instead of an array of rows).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Multiplicity {
+    /// Return all matching solutions (`select`).
+    #[default]
+    All,
+    /// Return only the first solution (`selectOne`).
+    One,
+}
+
+/// Describes what the query produces.
 #[derive(Debug, Clone)]
 pub enum QueryOutput {
-    /// Normal SELECT with explicit variable list and projection shape.
+    /// SELECT — projects rows from the algebra. The `projection` carries
+    /// column structure (and per-column hydration); the `multiplicity`
+    /// carries the all-vs-first-row distinction.
     Select {
-        vars: Vec<VarId>,
-        shape: ProjectionShape,
+        projection: Projection,
+        multiplicity: Multiplicity,
     },
-    /// selectOne — same as Select but formatters return first row or null.
-    SelectOne {
-        vars: Vec<VarId>,
-        shape: ProjectionShape,
-    },
-    /// SELECT * — all bound variables from WHERE.
-    Wildcard,
     /// CONSTRUCT — template patterns instantiated with bindings.
     Construct(ConstructTemplate),
     /// ASK — boolean result.
-    Boolean,
+    Ask,
 }
 
 impl QueryOutput {
-    /// Construct a `Select` with the default (`Tuple`) shape.
-    ///
-    /// Used by SPARQL lowering and internal fixtures. JSON-LD bare-string
-    /// `select: "?x"` builds the struct variant directly with `shape: Scalar`.
-    pub fn select(vars: Vec<VarId>) -> Self {
+    /// Construct a `Select` from a variable list (Tuple projection,
+    /// `All` multiplicity). Used by SPARQL lowering and fixtures.
+    pub fn select_all(vars: Vec<VarId>) -> Self {
         Self::Select {
-            vars,
-            shape: ProjectionShape::Tuple,
+            projection: Projection::Tuple(vars.into_iter().map(Column::Var).collect()),
+            multiplicity: Multiplicity::All,
         }
     }
 
-    /// Construct a `SelectOne` with the default (`Tuple`) shape.
+    /// Construct a `Select` from a variable list with `One` multiplicity
+    /// (`selectOne`).
     pub fn select_one(vars: Vec<VarId>) -> Self {
-        Self::SelectOne {
-            vars,
-            shape: ProjectionShape::Tuple,
+        Self::Select {
+            projection: Projection::Tuple(vars.into_iter().map(Column::Var).collect()),
+            multiplicity: Multiplicity::One,
         }
     }
 
-    /// Get select vars for Select/SelectOne, `None` otherwise.
-    pub fn select_vars(&self) -> Option<&[VarId]> {
+    /// Construct a `Select` with a Wildcard projection (`SELECT *`).
+    pub fn wildcard() -> Self {
+        Self::Select {
+            projection: Projection::Wildcard,
+            multiplicity: Multiplicity::All,
+        }
+    }
+
+    /// The projection of a SELECT output, if any.
+    pub fn projection(&self) -> Option<&Projection> {
         match self {
-            QueryOutput::Select { vars, .. } | QueryOutput::SelectOne { vars, .. } => Some(vars),
+            QueryOutput::Select { projection, .. } => Some(projection),
             _ => None,
         }
     }
 
-    /// Get select vars, or an empty slice for non-select outputs.
-    pub fn select_vars_or_empty(&self) -> &[VarId] {
-        self.select_vars().unwrap_or(&[])
-    }
-
-    /// Get the projection shape for Select/SelectOne, `None` otherwise.
-    pub fn projection_shape(&self) -> Option<ProjectionShape> {
+    /// The multiplicity of a SELECT output, if any.
+    pub fn multiplicity(&self) -> Option<Multiplicity> {
         match self {
-            QueryOutput::Select { shape, .. } | QueryOutput::SelectOne { shape, .. } => {
-                Some(*shape)
-            }
+            QueryOutput::Select { multiplicity, .. } => Some(*multiplicity),
             _ => None,
         }
     }
 
-    /// Returns `true` iff rows should be flattened from `[v]` to `v` at format
-    /// time. True only when the user opted into scalar output via JSON-LD
-    /// `select: "?x"` (bare-string form) AND there is exactly one projected
-    /// variable. Wildcard, Construct, Boolean, and `Tuple`-shaped Select all
-    /// return `false`, so tabular output (SPARQL + JSON-LD array-form select)
-    /// is preserved.
+    /// Columns of a SELECT projection. `None` for non-Select outputs;
+    /// empty slice for Wildcard.
+    pub fn columns(&self) -> Option<&[Column]> {
+        self.projection().map(Projection::columns)
+    }
+
+    /// Bound variables of the projection in column order.
+    /// `None` when projection trimming is not applicable (Wildcard,
+    /// Construct, Ask).
+    pub fn projected_vars(&self) -> Option<Vec<VarId>> {
+        self.projection()?.bound_vars()
+    }
+
+    /// Bound select variables, or an empty `Vec` for non-Select outputs.
+    pub fn projected_vars_or_empty(&self) -> Vec<VarId> {
+        self.projected_vars().unwrap_or_default()
+    }
+
+    /// Returns `true` iff rows should be flattened from `[v]` to `v` at
+    /// format time. Only fires for the bare-string `select: "?x"` form.
     pub fn should_flatten_scalar(&self) -> bool {
-        match self {
-            QueryOutput::Select { vars, shape } | QueryOutput::SelectOne { vars, shape } => {
-                *shape == ProjectionShape::Scalar && vars.len() == 1
-            }
-            _ => false,
-        }
+        self.projection().is_some_and(Projection::is_scalar_var)
     }
 
-    /// Get the construct template for Construct, `None` otherwise.
+    /// The construct template, if any.
     pub fn construct_template(&self) -> Option<&ConstructTemplate> {
         match self {
             QueryOutput::Construct(t) => Some(t),
@@ -151,19 +149,25 @@ impl QueryOutput {
         }
     }
 
-    /// Returns `true` for `SelectOne` output.
+    /// Returns `true` if the output is a SELECT whose projection contains
+    /// any hydration column.
+    pub fn has_hydration(&self) -> bool {
+        self.projection().is_some_and(Projection::has_hydration)
+    }
+
+    /// Returns `true` for `selectOne`.
     pub fn is_select_one(&self) -> bool {
-        matches!(self, Self::SelectOne { .. })
+        self.multiplicity() == Some(Multiplicity::One)
     }
 
-    /// Returns `true` for `Wildcard` output.
+    /// Returns `true` for `SELECT *`.
     pub fn is_wildcard(&self) -> bool {
-        matches!(self, Self::Wildcard)
+        self.projection().is_some_and(Projection::is_wildcard)
     }
 
-    /// Returns `true` for `Boolean` (ASK) output.
-    pub fn is_boolean(&self) -> bool {
-        matches!(self, Self::Boolean)
+    /// Returns `true` for `Ask` output.
+    pub fn is_ask(&self) -> bool {
+        matches!(self, Self::Ask)
     }
 
     /// Returns `true` for `Construct` output.
@@ -171,23 +175,23 @@ impl QueryOutput {
         matches!(self, Self::Construct(_))
     }
 
-    /// Variables the output depends on.
+    /// Variables this output references from the upstream solution stream.
     ///
     /// Returns `None` when dependency trimming is not applicable:
-    /// - `Wildcard`: all WHERE vars are needed
-    /// - `Boolean`: all WHERE vars needed for solvability checking
-    /// - Empty `Select`/`SelectOne`: no explicit projection
+    /// - `Select` with `Wildcard` projection: all WHERE vars are needed
+    /// - `Ask`: all WHERE vars needed for solvability checking
+    /// - `Select` with empty projection: no explicit projection
     /// - `Construct` with no template patterns
-    pub fn variables(&self) -> Option<HashSet<VarId>> {
+    pub fn referenced_vars(&self) -> Option<HashSet<VarId>> {
         match self {
-            QueryOutput::Wildcard | QueryOutput::Boolean => None,
-            QueryOutput::Select { vars, .. } | QueryOutput::SelectOne { vars, .. }
-                if vars.is_empty() =>
-            {
-                None
-            }
-            QueryOutput::Select { vars, .. } | QueryOutput::SelectOne { vars, .. } => {
-                Some(vars.iter().copied().collect())
+            QueryOutput::Ask => None,
+            QueryOutput::Select { projection, .. } => {
+                let vars = projection.bound_vars()?;
+                if vars.is_empty() {
+                    None
+                } else {
+                    Some(vars.into_iter().collect())
+                }
             }
             QueryOutput::Construct(t) if t.patterns.is_empty() => None,
             QueryOutput::Construct(t) => Some(t.referenced_vars()),
@@ -205,16 +209,12 @@ pub struct Query {
     pub context: ParsedContext,
     /// Original JSON context from the query (for CONSTRUCT output)
     pub orig_context: Option<serde_json::Value>,
-    /// Query output specification (replaces select, select_mode, construct_template)
+    /// Query output specification (projection, construct template, ASK, or wildcard).
     pub output: QueryOutput,
     /// Resolved patterns (triples, filters, optionals, etc.)
     pub patterns: Vec<Pattern>,
     /// Query options (limit, offset, order by, group by, etc.)
     pub options: QueryOptions,
-    /// Graph crawl select specification (None for flat SELECT or CONSTRUCT)
-    ///
-    /// When present, controls nested JSON-LD object expansion during formatting.
-    pub graph_select: Option<GraphSelectSpec>,
     /// Post-query VALUES clause (SPARQL `ValuesClause` after `SolutionModifier`).
     ///
     /// Stored separately from `patterns` so the WHERE-clause planner does not
@@ -229,10 +229,12 @@ impl Query {
         Self {
             context,
             orig_context: None,
-            output: QueryOutput::Wildcard,
+            output: QueryOutput::Select {
+                projection: Projection::Wildcard,
+                multiplicity: Multiplicity::All,
+            },
             patterns: Vec::new(),
             options: QueryOptions::default(),
-            graph_select: None,
             post_values: None,
         }
     }
@@ -248,7 +250,6 @@ impl Query {
             output: self.output.clone(),
             patterns,
             options: self.options.clone(),
-            graph_select: self.graph_select.clone(),
             post_values: self.post_values.clone(),
         }
     }

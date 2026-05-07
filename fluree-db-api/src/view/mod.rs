@@ -42,7 +42,7 @@
 //! ## Policy (`with_policy`)
 //!
 //! Attaches a `PolicyContext` and `QueryPolicyEnforcer` for access control.
-//! Policy applies to both query execution and result formatting (graph crawl).
+//! Policy applies to both query execution and result formatting (expansion).
 //!
 //! ## Reasoning (`with_reasoning`)
 //!

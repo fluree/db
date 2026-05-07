@@ -17,7 +17,7 @@ use crate::{
 use fluree_db_binary_index::BinaryGraphView;
 use fluree_db_core::{GraphDbRef, LedgerSnapshot};
 
-use fluree_db_query::ir::{GraphSelectSpec, QueryOutput};
+use fluree_db_query::ir::QueryOutput;
 
 /// Result of a query execution
 pub struct QueryResult {
@@ -29,16 +29,16 @@ pub struct QueryResult {
     /// queries leave it as `None` because there is no shared ledger-local transaction
     /// number that can be reported or reused safely across ledgers.
     pub t: Option<i64>,
-    /// Novelty overlay used during execution (for graph crawl formatting).
+    /// Novelty overlay used during execution (for hydration formatting).
     ///
-    /// Most query execution runs against `LedgerSnapshot + Novelty` (range_with_overlay). Graph crawl formatting
+    /// Most query execution runs against `LedgerSnapshot + Novelty` (range_with_overlay). Hydration formatting
     /// must use the same overlay to see unindexed flakes in memory-backed tests.
     pub novelty: Option<std::sync::Arc<dyn OverlayProvider>>,
     /// Parsed JSON-LD context from the query (for IRI compaction in formatters)
     pub context: crate::ParsedContext,
     /// Original JSON context from the query (for CONSTRUCT output)
     pub orig_context: Option<JsonValue>,
-    /// Query output specification (select vars, construct template, or boolean/wildcard mode)
+    /// Query output specification (projection, construct template, ASK, or wildcard).
     pub output: QueryOutput,
     /// Result batches
     pub batches: Vec<Batch>,
@@ -49,10 +49,6 @@ pub struct QueryResult {
     /// VECTOR_ID) through the correct arenas.  When absent, all bindings must
     /// already be fully materialized.
     pub binary_graph: Option<BinaryGraphView>,
-    /// Graph crawl select specification (None for flat SELECT or CONSTRUCT)
-    ///
-    /// When present, controls nested JSON-LD object expansion during formatting.
-    pub graph_select: Option<GraphSelectSpec>,
 }
 
 impl std::fmt::Debug for QueryResult {
@@ -60,11 +56,11 @@ impl std::fmt::Debug for QueryResult {
         f.debug_struct("QueryResult")
             .field("t", &self.t)
             .field("output", &self.output)
-            .field("select_len", &self.output.select_vars_or_empty().len())
+            .field("select_len", &self.output.projected_vars_or_empty().len())
             .field("batches_len", &self.batches.len())
             .field("has_binary_graph", &self.binary_graph.is_some())
             .field("has_novelty", &self.novelty.is_some())
-            .field("has_graph_select", &self.graph_select.is_some())
+            .field("has_hydration", &self.output.has_hydration())
             .finish()
     }
 }
@@ -323,12 +319,12 @@ impl QueryResult {
     }
 
     // ========================================================================
-    // Async formatting methods (required for graph crawl queries)
+    // Async formatting methods (required for hydration queries)
     // ========================================================================
 
     /// Format as JSON-LD Query JSON with async DB access
     ///
-    /// This is the async version of `to_jsonld()`. Required for graph crawl
+    /// This is the async version of `to_jsonld()`. Required for hydration
     /// queries which need to fetch additional data from the database during
     /// formatting. For regular SELECT queries, the sync version works fine.
     ///
@@ -340,7 +336,7 @@ impl QueryResult {
     ///     "where": {"@id": "?person", "@type": "ex:User"}
     /// })).await?;
     ///
-    /// // Graph crawl requires async formatting
+    /// // Hydration requires async formatting
     /// let json = result.to_jsonld_async(ledger.as_graph_db_ref(0)).await?;
     /// ```
     pub async fn to_jsonld_async(&self, db: GraphDbRef<'_>) -> format::Result<JsonValue> {
@@ -350,7 +346,7 @@ impl QueryResult {
 
     /// Format as TypedJson with async DB access
     ///
-    /// Async version of `to_typed_json()`. Required for graph crawl queries
+    /// Async version of `to_typed_json()`. Required for hydration queries
     /// which need to fetch additional data from the database during formatting.
     /// Every literal value includes explicit `@type` annotation.
     pub async fn to_typed_json_async(&self, db: GraphDbRef<'_>) -> format::Result<JsonValue> {
@@ -360,7 +356,7 @@ impl QueryResult {
 
     /// Format with custom configuration (async version)
     ///
-    /// Async version of `format()`. Required for graph crawl queries.
+    /// Async version of `format()`. Required for hydration queries.
     pub async fn format_async(
         &self,
         db: GraphDbRef<'_>,
@@ -375,9 +371,9 @@ impl QueryResult {
 
     /// Format as JSON-LD Query JSON with policy filtering (async version)
     ///
-    /// When `policy` is provided, graph crawl queries filter flakes according to
+    /// When `policy` is provided, hydration queries filter flakes according to
     /// view policies during formatting. This ensures that nested objects fetched
-    /// during graph crawl also respect policy restrictions.
+    /// during hydration also respect policy restrictions.
     ///
     /// # Example
     ///
@@ -385,7 +381,7 @@ impl QueryResult {
     /// // Compose a policy-wrapped view, then query it.
     /// let db = fluree_db_api::GraphDb::from_ledger_state(&ledger).with_policy(Arc::new(policy_ctx.clone()));
     /// let result = fluree.query(&db, &query).await?;
-    /// // Graph crawl formatting also applies policy
+    /// // Hydration formatting also applies policy
     /// let json = result.to_jsonld_async_with_policy(db.as_graph_db_ref(), &policy_ctx).await?;
     /// ```
     pub async fn to_jsonld_async_with_policy(
@@ -399,7 +395,7 @@ impl QueryResult {
 
     /// Format with custom configuration and policy filtering (async version)
     ///
-    /// Combines custom formatting options with policy-aware graph crawl.
+    /// Combines custom formatting options with policy-aware hydration.
     pub async fn format_async_with_policy(
         &self,
         db: GraphDbRef<'_>,
@@ -409,7 +405,7 @@ impl QueryResult {
         format::format_results_async(self, &self.context, db, config, Some(policy), None).await
     }
 
-    /// Tracked async JSON-LD formatting (graph crawl counts fuel/policy).
+    /// Tracked async JSON-LD formatting (hydration counts fuel/policy).
     pub async fn to_jsonld_async_tracked(
         &self,
         db: GraphDbRef<'_>,
@@ -419,7 +415,7 @@ impl QueryResult {
         format::format_results_async(self, &self.context, db, &config, None, Some(tracker)).await
     }
 
-    /// Tracked async JSON-LD formatting with policy (graph crawl counts fuel/policy).
+    /// Tracked async JSON-LD formatting with policy (hydration counts fuel/policy).
     pub async fn to_jsonld_async_with_policy_tracked(
         &self,
         db: GraphDbRef<'_>,
@@ -438,7 +434,7 @@ impl QueryResult {
         .await
     }
 
-    /// Tracked async formatting with custom config (graph crawl counts fuel).
+    /// Tracked async formatting with custom config (hydration counts fuel).
     pub async fn format_async_tracked(
         &self,
         db: GraphDbRef<'_>,

@@ -2134,9 +2134,9 @@ async fn sparql_exact_repro_custom_pred_without_type() {
     );
 }
 
-/// Bug 2 repro: JSON-LD graph crawl returns empty for custom namespace type.
+/// Bug 2 repro: JSON-LD expansion returns empty for custom namespace type.
 #[tokio::test]
-async fn jsonld_exact_repro_graph_crawl_custom_type() {
+async fn jsonld_exact_repro_expansion_custom_type() {
     let fluree = FlureeBuilder::memory().build_memory();
     let ledger = seed_exact_repro(&fluree, "repro/bug2:main").await;
 
@@ -2152,7 +2152,7 @@ async fn jsonld_exact_repro_graph_crawl_custom_type() {
 
     let result = support::query_jsonld(&fluree, &ledger, &query)
         .await
-        .expect("graph crawl should not error");
+        .expect("expansion should not error");
     let jsonld = result
         .to_jsonld_async(ledger.as_graph_db_ref(0))
         .await
@@ -2162,7 +2162,7 @@ async fn jsonld_exact_repro_graph_crawl_custom_type() {
     let obj = rows[0].as_object().expect("should be object");
     assert!(
         obj.len() > 1,
-        "graph crawl should return properties, not just @id; got: {obj:?}"
+        "expansion should return properties, not just @id; got: {obj:?}"
     );
 }
 

@@ -35,10 +35,10 @@ pub mod where_clause;
 pub use ast::{
     encode_datatype_constraint, LiteralValue, UnresolvedAggregateFn, UnresolvedAggregateSpec,
     UnresolvedConstructTemplate, UnresolvedDatatypeConstraint, UnresolvedExpression,
-    UnresolvedFilterValue, UnresolvedGraphSelectSpec, UnresolvedNestedSelectSpec,
-    UnresolvedOptions, UnresolvedPattern, UnresolvedQuery, UnresolvedRoot, UnresolvedSelectionSpec,
-    UnresolvedSortDirection, UnresolvedSortSpec, UnresolvedTerm, UnresolvedTriplePattern,
-    UnresolvedValue,
+    UnresolvedFilterValue, UnresolvedForwardItem, UnresolvedHydrationSpec,
+    UnresolvedNestedSelectSpec, UnresolvedOptions, UnresolvedPattern, UnresolvedQuery,
+    UnresolvedRoot, UnresolvedSortDirection, UnresolvedSortSpec, UnresolvedTerm,
+    UnresolvedTriplePattern, UnresolvedValue,
 };
 pub use encode::{IriEncoder, MemoryEncoder, NoEncoder};
 pub use error::{ParseError, Result};
@@ -47,9 +47,9 @@ pub use lower::{lower_unresolved_pattern, lower_unresolved_patterns};
 pub use policy::{JsonLdParseCtx, JsonLdParsePolicy};
 pub use where_clause::parse_where_with_counters;
 
-use crate::ir::{Expression, ProjectionShape, Query};
+use crate::ir::{Expression, Query};
 use crate::var_registry::VarRegistry;
-use ast::UnresolvedPathExpr;
+use ast::{UnresolvedColumn, UnresolvedPathExpr, UnresolvedProjection};
 use fluree_graph_json_ld::{parse_context, ParsedContext};
 use serde_json::Value as JsonValue;
 use std::collections::HashMap;
@@ -157,7 +157,7 @@ fn parse_query_ast_internal(
         )?;
         // LIMIT 1 for efficiency — only need to know if any solution exists
         query.options.limit = Some(1);
-        return Ok((query, SelectMode::Boolean));
+        return Ok((query, SelectMode::Ask));
     }
 
     // Determine select mode based on which key is present.
@@ -177,26 +177,29 @@ fn parse_query_ast_internal(
             implied_distinct = true;
             (select_distinct, SelectMode::Many)
         } else if let Some(select) = obj.get("select") {
-            // Check for wildcard select
-            if select.as_str() == Some("*") {
-                (select, SelectMode::Wildcard)
-            } else {
-                (select, SelectMode::Many)
-            }
+            (select, SelectMode::Many)
         } else {
             return Err(ParseError::MissingField(
                 "select, selectOne, select-one, selectDistinct, select-distinct, construct, or ask",
             ));
         };
 
-    // Parse select clause (skip for wildcard)
-    if select_mode != SelectMode::Wildcard {
+    // Wildcard `select: "*"` lives entirely in the projection; otherwise
+    // dispatch on JSON shape.
+    if select.as_str() == Some("*") {
+        query.select = UnresolvedProjection::Wildcard;
+    } else {
         parse_select(select, &ctx, &mut query)?;
     }
 
-    // Parse depth parameter and apply to graph_select if present
-    if let Some(ref mut gs) = query.graph_select {
-        gs.depth = options::parse_depth(obj)?;
+    // Parse depth parameter and apply to every hydration column.
+    if query.has_hydration() {
+        let depth = options::parse_depth(obj)?;
+        for column in query.select.columns_mut() {
+            if let UnresolvedColumn::Hydration(spec) = column {
+                spec.depth = depth;
+            }
+        }
     }
 
     // Parse top-level VALUES (optional) - mirrors the `:values` initial solution seed.
@@ -210,7 +213,7 @@ fn parse_query_ast_internal(
 
     // Parse where clause.
     //
-    // Graph crawl queries like {"select": {"ex:dan": ["*"]}} are allowed.
+    // Hydration queries like {"select": {"ex:dan": ["*"]}} are allowed.
     // without an explicit WHERE clause (root may be an IRI constant).
     let object_var_parsing = options::parse_object_var_parsing(obj);
     if let Some(where_clause) = obj.get("where") {
@@ -222,9 +225,9 @@ fn parse_query_ast_internal(
             nested_counter,
             object_var_parsing,
         )?;
-    } else if query.graph_select.is_some() {
-        // Allowed: graph crawl-only query with no WHERE.
-        // Execution will produce an empty solution set, and graph crawl formatting will use the root
+    } else if query.has_hydration() {
+        // Allowed: hydration-only query with no WHERE.
+        // Execution will produce an empty solution set, and hydration formatting will use the root
         // (constant root emits one row; variable root yields no rows).
     } else if !query
         .patterns
@@ -278,17 +281,12 @@ fn parse_query_ast_internal(
             let mut seen: std::collections::HashSet<&str> = std::collections::HashSet::new();
             query.options.order_by = query
                 .select
+                .columns()
                 .iter()
-                .filter_map(|v| {
-                    let s = v.as_ref();
-                    if !s.starts_with('?') {
-                        return None;
-                    }
-                    if !seen.insert(s) {
-                        return None;
-                    }
-                    Some(crate::parse::ast::UnresolvedSortSpec::asc(s))
-                })
+                .filter_map(UnresolvedColumn::var_name)
+                .filter(|s| s.starts_with('?'))
+                .filter(|s| seen.insert(*s))
+                .map(crate::parse::ast::UnresolvedSortSpec::asc)
                 .collect();
         }
     }
@@ -542,8 +540,12 @@ fn parse_construct_template(
 /// Supports five forms:
 /// 1. Single string: `"?x"` - single variable selection (unwrap)
 /// 2. Simple array: `["?x", "?y"]` - flat variable selection
-/// 3. Mixed array: `["?age", {"?person": ["*"]}]` - scalar vars + graph crawl
-/// 4. Single object: `{"?person": ["*"]}` - graph crawl only
+/// 3. Mixed array: `["?age", {"?person": ["*"]}, {"?org": ["*"]}]` - any
+///    combination of variable and hydration columns, in any order; each
+///    object is an independent hydration with its own root, level, and
+///    depth.
+/// 4. Single object: `{"?person": ["*"]}` - one hydration column (rendered
+///    as a bare object per row rather than a single-element array).
 /// 5. S-expression aggregates: `["?name", "(count ?favNums as ?cnt)"]`
 fn parse_select(
     select: &JsonValue,
@@ -551,19 +553,18 @@ fn parse_select(
     query: &mut UnresolvedQuery,
 ) -> Result<()> {
     match select {
-        // Case 2, 3, 5: Array form - could be simple vars, mixed, or with aggregates
+        // Case 2, 3, 5: Array form — tuple-shaped rows of any arity.
+        // (`["?x"]` → `[[v]]`, `["?x", "?y"]` → `[[v1, v2]]`, etc.)
         JsonValue::Array(arr) => {
-            // Record shape: array form always yields tuple rows, regardless of
-            // how many items are inside (`["?x"]` → `[[v1],[v2]]`, not `[v1,v2]`).
-            query.select_shape = ProjectionShape::Tuple;
+            let mut columns = Vec::with_capacity(arr.len());
             for item in arr {
                 match item {
                     JsonValue::String(s) => {
-                        parse_select_string(s, query)?;
+                        columns.push(parse_select_string(s, &mut query.options.aggregates)?);
                     }
                     JsonValue::Object(map) => {
-                        let spec = parse_graph_select_object(map, ctx, query)?;
-                        query.graph_select = Some(spec);
+                        let spec = parse_hydration_object(map, ctx)?;
+                        columns.push(UnresolvedColumn::Hydration(spec));
                     }
                     _ => {
                         return Err(ParseError::InvalidSelect(
@@ -572,18 +573,20 @@ fn parse_select(
                     }
                 }
             }
+            query.select = UnresolvedProjection::Tuple(columns);
         }
 
-        // Case 4: Single object form: {"?person": ["*"]}
+        // Case 4: Single object form: {"?person": ["*"]} — one hydration
+        // column wrapped as a Tuple (SPARQL has no scalar object form).
         JsonValue::Object(map) => {
-            let spec = parse_graph_select_object(map, ctx, query)?;
-            query.graph_select = Some(spec);
+            let spec = parse_hydration_object(map, ctx)?;
+            query.select = UnresolvedProjection::Tuple(vec![UnresolvedColumn::Hydration(spec)]);
         }
 
         // Case 1: Single string form: "?x" — bare variable, scalar shape.
         JsonValue::String(s) => {
-            query.select_shape = ProjectionShape::Scalar;
-            parse_select_string(s, query)?;
+            let column = parse_select_string(s, &mut query.options.aggregates)?;
+            query.select = UnresolvedProjection::Scalar(column);
         }
 
         _ => {
@@ -596,17 +599,23 @@ fn parse_select(
     Ok(())
 }
 
-/// Parse a string in the select clause
+/// Parse a string item from the select clause into a column.
 ///
-/// Handles three cases:
-/// - Wildcard: `"*"`
+/// Handles two cases:
 /// - Variable: `"?name"`
-/// - S-expression aggregate: `"(count ?x)"` or `"(as (count ?x) ?cnt)"`
-fn parse_select_string(s: &str, query: &mut UnresolvedQuery) -> Result<()> {
+/// - S-expression aggregate: `"(count ?x)"` or `"(as (count ?x) ?cnt)"` —
+///   the spec is appended to `aggregates` and the output var becomes the
+///   returned column.
+///
+/// Wildcard (`"*"`) is rejected here; it must be the entire `select` value
+/// and is handled at the top-level dispatch in `parse_query_inner`.
+fn parse_select_string(
+    s: &str,
+    aggregates: &mut Vec<ast::UnresolvedAggregateSpec>,
+) -> Result<UnresolvedColumn> {
     let trimmed = s.trim();
 
     if trimmed == "*" {
-        // Wildcard select - handled elsewhere
         return Err(ParseError::InvalidSelect(
             "wildcard '*' must be the only select item".to_string(),
         ));
@@ -615,16 +624,14 @@ fn parse_select_string(s: &str, query: &mut UnresolvedQuery) -> Result<()> {
     if trimmed.starts_with('(') {
         // S-expression: aggregate function call
         let agg_spec = parse_aggregate_sexpr(trimmed)?;
-        // Add output var to select
-        query.add_select(&agg_spec.output_var);
-        query.options.aggregates.push(agg_spec);
+        let column = UnresolvedColumn::Var(Arc::from(agg_spec.output_var.as_ref()));
+        aggregates.push(agg_spec);
+        Ok(column)
     } else {
         // Must be a variable - use validate_var_name for consistent error handling
         validate_var_name(trimmed)?;
-        query.add_select(trimmed);
+        Ok(UnresolvedColumn::Var(Arc::from(trimmed)))
     }
-
-    Ok(())
 }
 
 // SexprToken and tokenization moved to sexpr_tokenize module
@@ -820,21 +827,15 @@ fn parse_aggregate_fn_and_input(
     Ok((function, input.to_string()))
 }
 
-/// Parse a graph crawl select object like `{"?person": ["*", {"ex:friend": ["*"]}]}`
+/// Parse a hydration object like `{"?person": ["*", {"ex:friend": ["*"]}]}`.
 ///
-/// Also adds the root variable to the execution select list.
-fn parse_graph_select_object(
+/// Multiple hydration objects in one select clause are permitted; each
+/// becomes its own `Column::Hydration` and the formatter dispatches per
+/// column.
+fn parse_hydration_object(
     map: &serde_json::Map<String, JsonValue>,
     ctx: &JsonLdParseCtx,
-    query: &mut UnresolvedQuery,
-) -> Result<UnresolvedGraphSelectSpec> {
-    // Error if we already have a graph_select (only one allowed)
-    if query.graph_select.is_some() {
-        return Err(ParseError::InvalidSelect(
-            "only one graph-select object allowed per query".to_string(),
-        ));
-    }
-
+) -> Result<UnresolvedHydrationSpec> {
     // Must have exactly one key
     if map.len() != 1 {
         return Err(ParseError::InvalidSelect(
@@ -846,8 +847,6 @@ fn parse_graph_select_object(
 
     // Root can be variable OR IRI constant
     let root = if is_variable(root_str) {
-        // Variable root - add to execution select list
-        query.add_select(root_str);
         UnresolvedRoot::Var(Arc::from(root_str.as_str()))
     } else {
         // IRI constant root - expand via @context
@@ -860,42 +859,22 @@ fn parse_graph_select_object(
         ParseError::InvalidSelect("graph-select value must be an array".to_string())
     })?;
 
-    let specs = parse_selection_specs(specs_arr, ctx)?;
+    let level = parse_selection_level(specs_arr, ctx)?;
 
-    Ok(UnresolvedGraphSelectSpec {
+    Ok(UnresolvedHydrationSpec {
         root,
-        selections: specs.forward,
-        reverse: specs.reverse,
+        level,
         depth: 0, // Will be set later from query-level "depth" parameter
-        has_wildcard: specs.has_wildcard,
     })
 }
 
 /// Build an optional boxed nested select spec, returning `None` when empty.
-fn make_nested_spec(
-    forward: Vec<UnresolvedSelectionSpec>,
-    reverse: std::collections::HashMap<String, Option<Box<UnresolvedNestedSelectSpec>>>,
-    has_wildcard: bool,
-) -> Option<Box<UnresolvedNestedSelectSpec>> {
-    if forward.is_empty() && reverse.is_empty() {
+fn make_nested_spec(level: UnresolvedNestedSelectSpec) -> Option<Box<UnresolvedNestedSelectSpec>> {
+    if level.is_empty() {
         None
     } else {
-        Some(Box::new(UnresolvedNestedSelectSpec::new(
-            forward,
-            reverse,
-            has_wildcard,
-        )))
+        Some(Box::new(level))
     }
-}
-
-/// Parsed selection specifications with forward and reverse properties separated.
-struct SelectionSpecs {
-    /// Forward (normal) property selections
-    forward: Vec<UnresolvedSelectionSpec>,
-    /// Reverse property selections mapped by predicate IRI
-    reverse: std::collections::HashMap<String, Option<Box<UnresolvedNestedSelectSpec>>>,
-    /// Whether a wildcard (*) was present
-    has_wildcard: bool,
 }
 
 /// If `key` uses the inline `@reverse:...` form, return the target predicate IRI
@@ -915,23 +894,28 @@ fn parse_inline_reverse_key(key: &str, ctx: &JsonLdParseCtx) -> Result<Option<St
     Ok(Some(expanded))
 }
 
-/// Parse selection specs array, separating forward and reverse properties.
-fn parse_selection_specs(arr: &[JsonValue], ctx: &JsonLdParseCtx) -> Result<SelectionSpecs> {
-    let mut forward = Vec::new();
+/// Parse a selection-level array (the value of a hydration `{key: [...]}`)
+/// into either a `Wildcard` or `Explicit` level.
+fn parse_selection_level(
+    arr: &[JsonValue],
+    ctx: &JsonLdParseCtx,
+) -> Result<UnresolvedNestedSelectSpec> {
+    let mut wildcard = false;
+    let mut forward: Vec<UnresolvedForwardItem> = Vec::new();
+    let mut refinements: std::collections::HashMap<String, Box<UnresolvedNestedSelectSpec>> =
+        std::collections::HashMap::new();
     let mut reverse: std::collections::HashMap<String, Option<Box<UnresolvedNestedSelectSpec>>> =
         std::collections::HashMap::new();
-    let mut has_wildcard = false;
 
     for item in arr {
         match item {
             // Wildcard: "*"
             JsonValue::String(s) if s == "*" => {
-                forward.push(UnresolvedSelectionSpec::Wildcard);
-                has_wildcard = true;
+                wildcard = true;
             }
             // Explicit @id selection
             JsonValue::String(s) if s == "@id" || s == "id" || s == ctx.context.id_key.as_str() => {
-                forward.push(UnresolvedSelectionSpec::Id);
+                forward.push(UnresolvedForwardItem::Id);
             }
             // Property name: "ex:name" or inline "@reverse:ex:friend"
             JsonValue::String(s) => {
@@ -939,13 +923,10 @@ fn parse_selection_specs(arr: &[JsonValue], ctx: &JsonLdParseCtx) -> Result<Sele
                     reverse.insert(rev_iri, None);
                 } else {
                     let (expanded, entry) = ctx.expand_vocab(s)?;
-                    // Check if this is a reverse property from @context
-                    // (reverse field is Option<String> with the reversed property IRI)
                     if let Some(rev_iri) = entry.and_then(|e| e.reverse) {
-                        // Reverse property - key by the *actual* predicate IRI to reverse on.
                         reverse.insert(rev_iri, None);
                     } else {
-                        forward.push(UnresolvedSelectionSpec::Property {
+                        forward.push(UnresolvedForwardItem::Property {
                             predicate: expanded,
                             sub_spec: None,
                         });
@@ -966,23 +947,28 @@ fn parse_selection_specs(arr: &[JsonValue], ctx: &JsonLdParseCtx) -> Result<Sele
                     ParseError::InvalidSelect("nested selection value must be an array".to_string())
                 })?;
 
-                // Recursively parse sub-selections - preserves both forward AND reverse
-                let sub_specs = parse_selection_specs(sub_arr, ctx)?;
-
-                let nested_spec =
-                    make_nested_spec(sub_specs.forward, sub_specs.reverse, sub_specs.has_wildcard);
+                let sub_level = parse_selection_level(sub_arr, ctx)?;
+                let nested = make_nested_spec(sub_level);
 
                 if let Some(rev_iri) = parse_inline_reverse_key(pred_str, ctx)? {
-                    reverse.insert(rev_iri, nested_spec);
+                    reverse.insert(rev_iri, nested);
                 } else {
                     let (expanded, entry) = ctx.expand_vocab(pred_str)?;
                     let context_reverse = entry.as_ref().and_then(|e| e.reverse.as_ref());
                     if let Some(rev_iri) = context_reverse {
-                        reverse.insert(rev_iri.clone(), nested_spec);
-                    } else {
-                        forward.push(UnresolvedSelectionSpec::Property {
+                        reverse.insert(rev_iri.clone(), nested);
+                    } else if let Some(boxed) = nested {
+                        // Wildcard refinements only matter when the parent is
+                        // a wildcard; otherwise it's a regular Property entry.
+                        // Decide based on `wildcard` after the loop completes.
+                        forward.push(UnresolvedForwardItem::Property {
                             predicate: expanded,
-                            sub_spec: nested_spec,
+                            sub_spec: Some(boxed),
+                        });
+                    } else {
+                        forward.push(UnresolvedForwardItem::Property {
+                            predicate: expanded,
+                            sub_spec: None,
                         });
                     }
                 }
@@ -995,11 +981,26 @@ fn parse_selection_specs(arr: &[JsonValue], ctx: &JsonLdParseCtx) -> Result<Sele
         }
     }
 
-    Ok(SelectionSpecs {
-        forward,
-        reverse,
-        has_wildcard,
-    })
+    if wildcard {
+        // For a wildcard level, fold any explicit Property entries back into
+        // `refinements` (they refine the wildcard's per-property recursion).
+        // Plain `Id` entries are redundant under wildcard and are dropped.
+        for item in forward {
+            if let UnresolvedForwardItem::Property {
+                predicate,
+                sub_spec: Some(boxed),
+            } = item
+            {
+                refinements.insert(predicate, boxed);
+            }
+        }
+        Ok(UnresolvedNestedSelectSpec::Wildcard {
+            refinements,
+            reverse,
+        })
+    } else {
+        Ok(UnresolvedNestedSelectSpec::Explicit { forward, reverse })
+    }
 }
 
 // parse_depth moved to options module
@@ -1115,8 +1116,8 @@ mod tests {
 
         let (ast, _) = parse_query_ast(&json, None).unwrap();
 
-        assert_eq!(ast.select.len(), 1);
-        assert_eq!(ast.select[0].as_ref(), "?name");
+        assert_eq!(ast.select.columns().len(), 1);
+        assert_eq!(ast.select.columns()[0].var_name().unwrap(), "?name");
         assert_eq!(ast.patterns.len(), 2); // @type + name
     }
 
@@ -1428,7 +1429,7 @@ mod tests {
         let mut vars = VarRegistry::new();
         let query = parse_query(&json, &encoder, &mut vars, None).unwrap();
 
-        assert_eq!(query.output.select_vars().unwrap().len(), 2);
+        assert_eq!(query.output.projected_vars().unwrap().len(), 2);
         assert_eq!(query.patterns.len(), 1);
 
         // query.patterns now contains Pattern, not TriplePattern
@@ -2102,7 +2103,7 @@ mod tests {
 
         // Empty select should parse (though semantically questionable)
         let (ast, _) = parse_query_ast(&json, None).unwrap();
-        assert!(ast.select.is_empty());
+        assert!(ast.select.columns().is_empty());
     }
 
     #[test]
@@ -2150,7 +2151,7 @@ mod tests {
         });
 
         let (ast, _) = parse_query_ast(&json, None).unwrap();
-        assert_eq!(ast.select.len(), 2);
+        assert_eq!(ast.select.columns().len(), 2);
     }
 
     #[test]
@@ -3006,9 +3007,9 @@ mod tests {
         let (ast, _) = parse_query_ast(&json, None).unwrap();
 
         // Check select has both vars
-        assert_eq!(ast.select.len(), 2);
-        assert_eq!(ast.select[0].as_ref(), "?name");
-        assert_eq!(ast.select[1].as_ref(), "?count");
+        assert_eq!(ast.select.columns().len(), 2);
+        assert_eq!(ast.select.columns()[0].var_name().unwrap(), "?name");
+        assert_eq!(ast.select.columns()[1].var_name().unwrap(), "?count");
 
         // Check aggregate was parsed
         assert_eq!(ast.options.aggregates.len(), 1);
@@ -3048,8 +3049,8 @@ mod tests {
 
         let (ast, _) = parse_query_ast(&json, None).unwrap();
 
-        assert_eq!(ast.select.len(), 1);
-        assert_eq!(ast.select[0].as_ref(), "?sum");
+        assert_eq!(ast.select.columns().len(), 1);
+        assert_eq!(ast.select.columns()[0].var_name().unwrap(), "?sum");
 
         assert_eq!(ast.options.aggregates.len(), 1);
         let agg = &ast.options.aggregates[0];
@@ -3354,6 +3355,118 @@ mod tests {
                 assert_eq!(vsp.metric.as_ref(), "cosine");
             }
             _ => panic!("Expected VectorSearch pattern"),
+        }
+    }
+
+    // ---- multi-hydration parsing ----
+
+    #[test]
+    fn test_parse_two_hydration_columns() {
+        // Two var-rooted hydrations in one select clause.
+        let json = json!({
+            "@context": { "ex": "http://example.org/" },
+            "select": [
+                {"?person": ["*"]},
+                {"?org": ["*", {"ex:member": ["*"]}]}
+            ],
+            "where": {
+                "@id": "?person",
+                "ex:worksFor": "?org"
+            }
+        });
+
+        let (ast, _) = parse_query_ast(&json, None).unwrap();
+        let columns = ast.select.columns();
+        assert_eq!(columns.len(), 2);
+
+        let spec0 = columns[0]
+            .as_hydration()
+            .expect("first column should be a hydration");
+        assert!(matches!(&spec0.root, UnresolvedRoot::Var(v) if v.as_ref() == "?person"));
+
+        let spec1 = columns[1]
+            .as_hydration()
+            .expect("second column should be a hydration");
+        assert!(matches!(&spec1.root, UnresolvedRoot::Var(v) if v.as_ref() == "?org"));
+    }
+
+    #[test]
+    fn test_parse_mixed_var_and_constant_root_hydrations() {
+        // One var-rooted hydration plus one IRI-constant-rooted hydration.
+        let json = json!({
+            "@context": { "ex": "http://example.org/" },
+            "select": [
+                {"?person": ["*"]},
+                {"ex:alice": ["ex:name"]}
+            ],
+            "where": { "@id": "?person", "ex:active": true }
+        });
+
+        let (ast, _) = parse_query_ast(&json, None).unwrap();
+        let columns = ast.select.columns();
+        assert_eq!(columns.len(), 2);
+        assert!(matches!(
+            &columns[0].as_hydration().unwrap().root,
+            UnresolvedRoot::Var(_)
+        ));
+        assert!(matches!(
+            &columns[1].as_hydration().unwrap().root,
+            UnresolvedRoot::Iri(_)
+        ));
+    }
+
+    #[test]
+    fn test_parse_mixes_hydration_with_var_columns() {
+        // Hydration columns interleaved with plain variable columns.
+        let json = json!({
+            "@context": { "ex": "http://example.org/" },
+            "select": [
+                "?age",
+                {"?person": ["*"]},
+                "?title",
+                {"?org": ["*"]}
+            ],
+            "where": {
+                "@id": "?person",
+                "ex:age": "?age",
+                "ex:title": "?title",
+                "ex:worksFor": "?org"
+            }
+        });
+
+        let (ast, _) = parse_query_ast(&json, None).unwrap();
+        let columns = ast.select.columns();
+        assert_eq!(columns.len(), 4);
+        assert_eq!(columns[0].var_name().unwrap(), "?age");
+        assert!(columns[1].as_hydration().is_some());
+        assert_eq!(columns[2].var_name().unwrap(), "?title");
+        assert!(columns[3].as_hydration().is_some());
+    }
+
+    #[test]
+    fn test_depth_option_applies_to_every_hydration_column() {
+        // The query-level `depth` option must reach every hydration spec.
+        let json = json!({
+            "@context": { "ex": "http://example.org/" },
+            "select": [
+                {"?person": ["*"]},
+                {"?org": ["*"]}
+            ],
+            "depth": 2,
+            "where": {
+                "@id": "?person",
+                "ex:worksFor": "?org"
+            }
+        });
+
+        let (ast, _) = parse_query_ast(&json, None).unwrap();
+        let columns = ast.select.columns();
+        assert_eq!(columns.len(), 2);
+        for column in columns {
+            let spec = column
+                .as_hydration()
+                .expect("every column should be a hydration");
+            assert_eq!(spec.depth, 2);
         }
     }
 }

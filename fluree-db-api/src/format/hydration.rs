@@ -1,12 +1,16 @@
-//! Graph crawl formatter - expands Sid bindings to nested JSON-LD objects
+//! Hydration formatter — materializes a Sid into a nested JSON-LD object by
+//! recursively fetching its properties.
 //!
-//! This module handles the graph crawl select syntax which enables nested object
-//! expansion in query results.
+//! Each hydration column carries its own root, level, and depth budget. The
+//! formatter dispatches per column: a variable root reads the row's binding
+//! and expands that subject; an IRI-constant root expands the named subject
+//! directly; non-hydration (`Var`) columns are formatted by the regular
+//! flat-binding formatters.
 //!
 //! # Supported Syntax
 //!
 //! ```json
-//! // Variable-bound graph crawl
+//! // Variable-bound hydration
 //! {"select": {"?person": ["*", {"ex:friend": ["*"]}]},
 //!  "where": {"@id": "?person", "type": "ex:User"}}
 //!
@@ -15,7 +19,26 @@
 //!
 //! // IRI constant root (no WHERE needed)
 //! {"select": {"ex:alice": ["*"]}}
+//!
+//! // Multiple hydration columns: each row is [expanded_a, expanded_b].
+//! {"select": [{"?person": ["*"]}, {"?org": ["*"]}],
+//!  "where": {"@id": "?person", "ex:worksFor": "?org"}}
+//!
+//! // Hydration columns mixed with flat variables.
+//! {"select": ["?age", {"?person": ["*"]}],
+//!  "where": {"@id": "?person", "ex:age": "?age"}}
 //! ```
+//!
+//! # Output cardinality
+//!
+//! Solution rows generally map 1:1 to output rows, except when no column
+//! depends on any solution binding (every column is an IRI-constant
+//! hydration). In that case the output is independent of the row, so the
+//! formatter emits a single row regardless of how many solutions the WHERE
+//! produced. An empty solution set still produces no rows.
+//!
+//! A variable root that's unbound for a given solution renders as `null` in
+//! that cell rather than dropping the entire row.
 
 use super::config::{FormatterConfig, OutputFormat};
 use super::datatype::is_inferable_datatype;
@@ -28,7 +51,7 @@ use fluree_db_core::value::FlakeValue;
 use fluree_db_core::{Flake, GraphDbRef, Sid, Tracker};
 use fluree_db_policy::{is_schema_flake, PolicyContext};
 use fluree_db_query::binding::Binding;
-use fluree_db_query::ir::{GraphSelectSpec, NestedSelectSpec, Root, SelectionSpec};
+use fluree_db_query::ir::{Column, ForwardItem, HydrationSpec, NestedSelectSpec, Root};
 use fluree_vocab::namespaces::JSON_LD;
 use fluree_vocab::rdf::{self, TYPE as RDF_TYPE_IRI};
 use futures::future::BoxFuture;
@@ -37,22 +60,53 @@ use serde_json::{json, Value as JsonValue};
 use std::collections::{BTreeMap, HashMap, HashSet};
 
 /// Cache key: (Sid, local_spec_hash, depth_remaining)
-/// The local_spec_hash is computed from the current selections/reverse/has_wildcard,
-/// NOT the top-level spec. This ensures different nested expansions of the same Sid
-/// produce different cache entries.
+///
+/// The local_spec_hash is computed from the current `NestedSelectSpec`,
+/// NOT any top-level spec. This serves two purposes:
+/// - Different nested hydrations of the same Sid produce different entries.
+/// - Multiple top-level hydration columns share entries when they land on
+///   the same Sid with structurally identical levels, and stay separated
+///   when their levels differ.
 type CacheKey = (Sid, u64, usize);
 
-/// Selection specification for formatting a subject.
+/// Depth bookkeeping for one hydration call.
 ///
-/// Bundles the immutable parameters that define what properties to select
-/// during graph crawl formatting.
-struct FormatSpec<'a> {
-    /// Forward property selections
-    selections: &'a [SelectionSpec],
-    /// Reverse property selections
-    reverse: &'a HashMap<Sid, Option<Box<NestedSelectSpec>>>,
-    /// Whether wildcard was specified at this level
-    has_wildcard: bool,
+/// Each hydration column carries its own budget; threading the pair as a
+/// single value (instead of two parallel `usize` parameters) keeps the
+/// recursive signatures small and puts the descent / expansion-gate logic
+/// on the type itself.
+#[derive(Copy, Clone)]
+struct DepthBudget {
+    /// Current recursion depth (0 at a column's root).
+    current: usize,
+    /// Auto-expansion budget for this column.
+    max: usize,
+}
+
+impl DepthBudget {
+    /// Budget at a column's root: depth 0, with the column's `max`.
+    fn root(max: usize) -> Self {
+        Self { current: 0, max }
+    }
+
+    /// Budget for one level of recursive descent.
+    fn descend(self) -> Self {
+        Self {
+            current: self.current + 1,
+            max: self.max,
+        }
+    }
+
+    /// Levels of auto-expansion still permitted (for cache keying).
+    fn remaining(self) -> usize {
+        self.max.saturating_sub(self.current)
+    }
+
+    /// Whether auto-expansion (no explicit sub-spec) is still permitted at
+    /// this level — i.e. there's at least one descent left in the budget.
+    fn can_expand(self) -> bool {
+        self.current < self.max
+    }
 }
 
 /// Context for formatting a specific predicate's values.
@@ -65,112 +119,157 @@ struct PredicateContext<'a> {
     explicit_sub_spec: Option<&'a NestedSelectSpec>,
 }
 
-/// Compute hash for a local selection spec (forward, reverse, has_wildcard)
-///
-/// This is used to generate cache keys that correctly distinguish between
-/// different nested selection specs at the same depth.
-fn compute_local_spec_hash(
-    selections: &[SelectionSpec],
-    reverse: &HashMap<Sid, Option<Box<NestedSelectSpec>>>,
-    has_wildcard: bool,
-) -> u64 {
-    use std::hash::{Hash, Hasher};
+/// Hash a `NestedSelectSpec` to a u64 cache key. We can't derive `Hash`
+/// because the nested HashMaps don't implement it; iterate keys in sorted
+/// order for determinism.
+fn compute_level_hash(level: &NestedSelectSpec) -> u64 {
+    use std::hash::Hasher;
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
-
-    has_wildcard.hash(&mut hasher);
-    selections.len().hash(&mut hasher);
-
-    // Hash forward selections
-    fn hash_selection(spec: &SelectionSpec, hasher: &mut impl Hasher) {
-        match spec {
-            SelectionSpec::Id => {
-                2u8.hash(hasher);
-            }
-            SelectionSpec::Wildcard => {
-                0u8.hash(hasher);
-            }
-            SelectionSpec::Property {
-                predicate,
-                sub_spec,
-            } => {
-                1u8.hash(hasher);
-                predicate.hash(hasher);
-                if let Some(nested) = sub_spec {
-                    1u8.hash(hasher);
-                    hash_nested_spec(nested, hasher);
-                } else {
-                    0u8.hash(hasher);
-                }
-            }
-        }
-    }
-
-    fn hash_nested_spec(spec: &NestedSelectSpec, hasher: &mut impl Hasher) {
-        spec.has_wildcard.hash(hasher);
-        spec.forward.len().hash(hasher);
-        for sub in &spec.forward {
-            hash_selection(sub, hasher);
-        }
-        spec.reverse.len().hash(hasher);
-        let mut rev_keys: Vec<_> = spec.reverse.keys().collect();
-        rev_keys.sort();
-        for key in rev_keys {
-            key.hash(hasher);
-            if let Some(nested_opt) = spec.reverse.get(key) {
-                if let Some(inner) = nested_opt {
-                    1u8.hash(hasher);
-                    hash_nested_spec(inner, hasher);
-                } else {
-                    0u8.hash(hasher);
-                }
-            }
-        }
-    }
-
-    for sel in selections {
-        hash_selection(sel, &mut hasher);
-    }
-
-    // Hash reverse properties
-    reverse.len().hash(&mut hasher);
-    let mut reverse_keys: Vec<_> = reverse.keys().collect();
-    reverse_keys.sort();
-    for key in reverse_keys {
-        key.hash(&mut hasher);
-        if let Some(nested_opt) = reverse.get(key) {
-            if let Some(spec) = nested_opt {
-                1u8.hash(&mut hasher);
-                hash_nested_spec(spec, &mut hasher);
-            } else {
-                0u8.hash(&mut hasher);
-            }
-        }
-    }
-
+    hash_level(level, &mut hasher);
     hasher.finish()
 }
 
-/// Format query results with graph crawl expansion (sync entry point - returns error)
-///
-/// The sync entry point always returns an error directing callers to use
-/// `format_results_async()` instead, as graph crawl requires DB access.
-#[allow(dead_code)]
-pub fn format(result: &QueryResult, _compactor: &IriCompactor) -> Result<JsonValue> {
-    let _spec = result.graph_select.as_ref().ok_or_else(|| {
-        FormatError::InvalidBinding("Graph crawl format called without graph_select spec".into())
-    })?;
-
-    // Graph crawl always requires async DB access
-    Err(FormatError::InvalidBinding(
-        "Graph crawl formatting requires async database access. \
-         Use format_results_async() instead of format_results()."
-            .into(),
-    ))
+fn hash_level<H: std::hash::Hasher>(level: &NestedSelectSpec, hasher: &mut H) {
+    use std::hash::Hash;
+    match level {
+        NestedSelectSpec::Wildcard {
+            refinements,
+            reverse,
+        } => {
+            0u8.hash(hasher);
+            let mut keys: Vec<_> = refinements.keys().collect();
+            keys.sort();
+            keys.len().hash(hasher);
+            for key in keys {
+                key.hash(hasher);
+                hash_level(refinements.get(key).unwrap(), hasher);
+            }
+            hash_reverse(reverse, hasher);
+        }
+        NestedSelectSpec::Explicit { forward, reverse } => {
+            1u8.hash(hasher);
+            forward.len().hash(hasher);
+            for item in forward {
+                hash_forward_item(item, hasher);
+            }
+            hash_reverse(reverse, hasher);
+        }
+    }
 }
 
-/// Async graph crawl formatter entry point.
+fn hash_forward_item<H: std::hash::Hasher>(item: &ForwardItem, hasher: &mut H) {
+    use std::hash::Hash;
+    match item {
+        ForwardItem::Id => 0u8.hash(hasher),
+        ForwardItem::Property {
+            predicate,
+            sub_spec,
+        } => {
+            1u8.hash(hasher);
+            predicate.hash(hasher);
+            match sub_spec {
+                None => 0u8.hash(hasher),
+                Some(boxed) => {
+                    1u8.hash(hasher);
+                    hash_level(boxed, hasher);
+                }
+            }
+        }
+    }
+}
+
+fn hash_reverse<H: std::hash::Hasher>(
+    reverse: &HashMap<Sid, Option<Box<NestedSelectSpec>>>,
+    hasher: &mut H,
+) {
+    use std::hash::Hash;
+    let mut keys: Vec<_> = reverse.keys().collect();
+    keys.sort();
+    keys.len().hash(hasher);
+    for key in keys {
+        key.hash(hasher);
+        match reverse.get(key).unwrap() {
+            None => 0u8.hash(hasher),
+            Some(inner) => {
+                1u8.hash(hasher);
+                hash_level(inner, hasher);
+            }
+        }
+    }
+}
+
+/// Resolve a hydration root variable's binding into a `Sid` for a single row.
 ///
-/// This is the full graph crawl implementation with async database access
+/// Returns `Ok(None)` when the binding is unbound, poisoned, missing, or not
+/// subject-shaped (literals, IRIs that didn't match a known subject, etc.).
+/// Such columns render as `null` rather than skipping the row entirely.
+fn resolve_root_sid_from_binding(
+    result: &QueryResult,
+    binding: Option<&Binding>,
+) -> Result<Option<Sid>> {
+    match binding {
+        Some(b) if b.is_encoded() => {
+            let materialized = super::materialize::materialize_binding(result, b)?;
+            Ok(match materialized {
+                Binding::Sid { sid, .. } => Some(sid),
+                Binding::IriMatch { primary_sid, .. } => Some(primary_sid),
+                _ => None,
+            })
+        }
+        Some(Binding::Sid { sid, .. }) => Ok(Some(sid.clone())),
+        Some(Binding::IriMatch { primary_sid, .. }) => Ok(Some(primary_sid.clone())),
+        Some(Binding::Unbound | Binding::Poisoned) | None => Ok(None),
+        Some(
+            Binding::Lit { .. }
+            | Binding::Grouped(_)
+            | Binding::Iri(_)
+            | Binding::EncodedLit { .. }
+            | Binding::EncodedSid { .. }
+            | Binding::EncodedPid { .. },
+        ) => Ok(None),
+    }
+}
+
+/// Format one hydration column for one solution row.
+///
+/// Resolves the column's root (variable or IRI constant) into a `Sid` and
+/// expands it via [`HydrationFormatter::format_subject`] using the column's
+/// own level and depth budget. A variable root that's unbound for this row
+/// renders as `null` rather than skipping the row entirely.
+async fn format_hydration_column(
+    formatter: &HydrationFormatter<'_>,
+    spec: &HydrationSpec,
+    result: &QueryResult,
+    batch: &fluree_db_query::Batch,
+    row_idx: usize,
+    cache: &mut HashMap<CacheKey, JsonValue>,
+) -> Result<JsonValue> {
+    let root_sid: Sid = match &spec.root {
+        Root::Sid(sid) => sid.clone(),
+        Root::Var(var_id) => {
+            let Some(sid) = resolve_root_sid_from_binding(result, batch.get(row_idx, *var_id))?
+            else {
+                return Ok(JsonValue::Null);
+            };
+            sid
+        }
+    };
+
+    let mut visited = HashSet::new();
+    formatter
+        .format_subject(
+            &root_sid,
+            &spec.level,
+            DepthBudget::root(spec.depth),
+            &mut visited,
+            cache,
+        )
+        .await
+}
+
+/// Async hydration formatter entry point.
+///
+/// This is the full hydration implementation with async database access
 /// for property fetching, depth expansion, and reverse property expansion.
 ///
 /// # Policy Support
@@ -185,8 +284,13 @@ pub async fn format_async(
     policy: Option<&PolicyContext>,
     tracker: Option<&Tracker>,
 ) -> Result<JsonValue> {
-    let spec = result.graph_select.as_ref().ok_or_else(|| {
-        FormatError::InvalidBinding("Graph crawl format called without graph_select spec".into())
+    if !result.output.has_hydration() {
+        return Err(FormatError::InvalidBinding(
+            "Hydration format called without any hydration columns".into(),
+        ));
+    }
+    let columns = result.output.columns().ok_or_else(|| {
+        FormatError::InvalidBinding("Hydration format called on non-Select output".into())
     })?;
 
     // Attach the tracker to the GraphDbRef so db.range calls inside the
@@ -197,104 +301,69 @@ pub async fn format_async(
         None => db,
     };
 
-    let formatter = GraphCrawlFormatter::new(db, compactor, spec, config, policy, tracker);
+    let formatter = HydrationFormatter::new(db, compactor, config, policy, tracker);
 
-    // Shared cache across all rows
+    // Shared cache across all rows and all hydration columns. The cache key
+    // includes a hash of the current `NestedSelectSpec`, so columns with
+    // structurally identical levels share entries; columns with different
+    // levels do not collide.
     let mut cache: HashMap<CacheKey, JsonValue> = HashMap::new();
-    let mut rows = Vec::new();
+    let mut rows: Vec<JsonValue> = Vec::new();
 
-    // If the underlying query produced no solutions, graph crawl must produce no rows,
-    // even when the root is a constant Sid.
+    // If the underlying query produced no solutions, expansion produces no
+    // rows — even when a column root is a constant Sid.
     if result.row_count() == 0 {
         return Ok(JsonValue::Array(rows));
     }
 
-    match &spec.root {
-        Root::Sid(sid) => {
-            // IRI constant root - single subject fetch (no batches needed)
-            let mut visited = HashSet::new();
-            let format_spec = FormatSpec {
-                selections: &spec.selections,
-                reverse: &spec.reverse,
-                has_wildcard: spec.has_wildcard,
-            };
-            let obj = formatter
-                .format_subject(sid, format_spec, 0, &mut visited, &mut cache)
-                .await?;
-            rows.push(obj);
-        }
-        Root::Var(var_id) => {
-            // Variable root - iterate through result batches
-            let select_vars = result.output.select_vars_or_empty();
-            let mixed_select = select_vars.len() > 1 || select_vars.first() != Some(var_id);
+    // Single-column projections (e.g. `select: {"?x": ["*"]}`) emit a bare
+    // object per row; multi-column projections emit array rows.
+    let single_column = columns.len() == 1;
 
-            for batch in &result.batches {
-                for row_idx in 0..batch.len() {
-                    let root_binding = batch.get(row_idx, *var_id);
+    // A projection is "row-independent" when no column reads any solution
+    // binding — every column is a `Root::Sid` hydration. Such a projection
+    // produces the same output for every solution row, so we emit a single
+    // row regardless of how many solutions the WHERE clause yielded (the
+    // WHERE still gates *whether* a row is emitted via row_count == 0
+    // above).
+    let row_dependent = columns.iter().any(|c| match c {
+        Column::Var(_) => true,
+        Column::Hydration(spec) => matches!(spec.root, Root::Var(_)),
+    });
 
-                    let root_sid: Option<Sid> = match root_binding {
-                        Some(binding) if binding.is_encoded() => {
-                            let materialized =
-                                super::materialize::materialize_binding(result, binding)?;
-                            match materialized {
-                                Binding::Sid { sid, .. } => Some(sid),
-                                Binding::IriMatch { primary_sid, .. } => Some(primary_sid),
-                                _ => None,
-                            }
+    'rows: for batch in &result.batches {
+        for row_idx in 0..batch.len() {
+            let mut row_values: Vec<JsonValue> = Vec::with_capacity(columns.len());
+
+            for column in columns {
+                let value = match column {
+                    Column::Var(v) => match batch.get(row_idx, *v) {
+                        Some(binding) if formatter.typed => {
+                            super::typed::format_binding_with_result(result, binding, compactor)?
                         }
-                        Some(Binding::Sid { sid, .. }) => Some(sid.clone()),
-                        Some(Binding::IriMatch { primary_sid, .. }) => Some(primary_sid.clone()),
-                        Some(Binding::Unbound | Binding::Poisoned) | None => None,
-                        Some(
-                            Binding::Lit { .. }
-                            | Binding::Grouped(_)
-                            | Binding::Iri(_)
-                            | Binding::EncodedLit { .. }
-                            | Binding::EncodedSid { .. }
-                            | Binding::EncodedPid { .. },
-                        ) => None,
-                    };
-
-                    let Some(root_sid) = root_sid else {
-                        // Unbound/poisoned root var - skip this row
-                        continue;
-                    };
-
-                    let mut visited = HashSet::new();
-                    let format_spec = FormatSpec {
-                        selections: &spec.selections,
-                        reverse: &spec.reverse,
-                        has_wildcard: spec.has_wildcard,
-                    };
-                    let obj = formatter
-                        .format_subject(&root_sid, format_spec, 0, &mut visited, &mut cache)
-                        .await?;
-
-                    if mixed_select {
-                        let mut row = Vec::with_capacity(select_vars.len());
-                        for var in select_vars {
-                            if var == var_id {
-                                row.push(obj.clone());
-                            } else {
-                                let value = match batch.get(row_idx, *var) {
-                                    Some(binding) if formatter.typed => {
-                                        super::typed::format_binding_with_result(
-                                            result, binding, compactor,
-                                        )?
-                                    }
-                                    Some(binding) => super::jsonld::format_binding_with_result(
-                                        result, binding, compactor,
-                                    )?,
-                                    None => JsonValue::Null,
-                                };
-                                row.push(value);
-                            }
+                        Some(binding) => {
+                            super::jsonld::format_binding_with_result(result, binding, compactor)?
                         }
-                        rows.push(JsonValue::Array(row));
-                    } else {
-                        rows.push(obj);
+                        None => JsonValue::Null,
+                    },
+                    Column::Hydration(spec) => {
+                        format_hydration_column(
+                            &formatter, spec, result, batch, row_idx, &mut cache,
+                        )
+                        .await?
                     }
-                }
+                };
+                row_values.push(value);
+            }
+
+            if single_column {
+                rows.push(row_values.into_iter().next().unwrap());
+            } else {
+                rows.push(JsonValue::Array(row_values));
+            }
+
+            if !row_dependent {
+                break 'rows;
             }
         }
     }
@@ -302,11 +371,14 @@ pub async fn format_async(
     Ok(JsonValue::Array(rows))
 }
 
-/// Graph crawl formatter with async DB access
-struct GraphCrawlFormatter<'a> {
+/// Hydration formatter with async DB access.
+///
+/// The formatter is spec-agnostic: per-call the caller passes the
+/// `NestedSelectSpec` level and `max_depth` budget. This lets a single
+/// formatter serve multiple hydration columns in the same query.
+struct HydrationFormatter<'a> {
     db: GraphDbRef<'a>,
     compactor: &'a IriCompactor,
-    spec: &'a GraphSelectSpec,
     /// Whether to emit typed JSON (`{"@value": ..., "@type": ...}`) for all literals.
     typed: bool,
     /// Whether to always wrap property values in arrays (even single-valued).
@@ -318,11 +390,10 @@ struct GraphCrawlFormatter<'a> {
     tracker: Option<&'a Tracker>,
 }
 
-impl<'a> GraphCrawlFormatter<'a> {
+impl<'a> HydrationFormatter<'a> {
     fn new(
         db: GraphDbRef<'a>,
         compactor: &'a IriCompactor,
-        spec: &'a GraphSelectSpec,
         config: &FormatterConfig,
         policy: Option<&'a PolicyContext>,
         tracker: Option<&'a Tracker>,
@@ -330,7 +401,6 @@ impl<'a> GraphCrawlFormatter<'a> {
         Self {
             db,
             compactor,
-            spec,
             typed: config.format == OutputFormat::TypedJson,
             normalize_arrays: config.normalize_arrays,
             policy,
@@ -342,8 +412,8 @@ impl<'a> GraphCrawlFormatter<'a> {
     ///
     /// # Arguments
     /// - `sid`: Subject to expand
-    /// - `spec`: Selection specification (what properties to include)
-    /// - `current_depth`: Current recursion depth
+    /// - `level`: Selection specification (what properties to include)
+    /// - `depth`: Current depth and per-column max — see [`DepthBudget`].
     /// - `visited`: Cycle detection set (per-path)
     /// - `cache`: Result cache (shared across all subjects)
     ///
@@ -351,18 +421,13 @@ impl<'a> GraphCrawlFormatter<'a> {
     fn format_subject<'b>(
         &'b self,
         sid: &'b Sid,
-        spec: FormatSpec<'b>,
-        current_depth: usize,
+        level: &'b NestedSelectSpec,
+        depth: DepthBudget,
         visited: &'b mut HashSet<Sid>,
         cache: &'b mut HashMap<CacheKey, JsonValue>,
     ) -> BoxFuture<'b, Result<JsonValue>> {
         async move {
-            let depth_remaining = self.spec.depth.saturating_sub(current_depth);
-            // Use LOCAL spec hash (selections, reverse, has_wildcard) not top-level spec
-            // This ensures different nested expansions of the same Sid produce different cache entries
-            let spec_hash =
-                compute_local_spec_hash(spec.selections, spec.reverse, spec.has_wildcard);
-            let cache_key = (sid.clone(), spec_hash, depth_remaining);
+            let cache_key = (sid.clone(), compute_level_hash(level), depth.remaining());
 
             // Check cache first (same Sid + spec + depth = same result)
             if let Some(cached) = cache.get(&cache_key) {
@@ -377,14 +442,10 @@ impl<'a> GraphCrawlFormatter<'a> {
             // Build object with sorted keys for determinism (BTreeMap)
             let mut obj: BTreeMap<String, JsonValue> = BTreeMap::new();
 
-            let has_explicit_id = spec
-                .selections
-                .iter()
-                .any(|s| matches!(s, SelectionSpec::Id));
             // @id inclusion:
-            // - Always include for nested expansions (identity of a crawled ref)
+            // - Always include for nested hydrations (identity of an expanded ref)
             // - Otherwise include when wildcard or explicit @id selection
-            if current_depth > 0 || spec.has_wildcard || has_explicit_id {
+            if depth.current > 0 || level.includes_id() {
                 obj.insert("@id".to_string(), json!(self.compactor.compact_sid(sid)?));
             }
 
@@ -399,13 +460,13 @@ impl<'a> GraphCrawlFormatter<'a> {
 
             // Format each predicate
             for (pred, mut pred_flakes) in by_pred {
-                // Determine whether this predicate was explicitly selected.
-                // NOTE: a property selection like "schema:name" is explicit even when it has no sub-spec.
-                let selected_opt = self.find_selection_for_predicate(&pred, spec.selections);
-                let explicit_sub_spec = selected_opt.flatten();
-                if !spec.has_wildcard && selected_opt.is_none() {
+                // `select_predicate` returns `None` when the level is Explicit
+                // and the predicate isn't listed; otherwise it returns
+                // `Some(sub_spec)` (which may itself be `None` for "select but
+                // don't recurse").
+                let Some(explicit_sub_spec) = level.select_predicate(&pred) else {
                     continue;
-                }
+                };
 
                 // If these flakes represent an ordered list (`@list`), preserve transaction order
                 // by sorting by the list index stored in FlakeMeta.i.
@@ -426,7 +487,7 @@ impl<'a> GraphCrawlFormatter<'a> {
                     explicit_sub_spec,
                 };
                 let values = self
-                    .format_predicate_values(pred_ctx, &spec, current_depth, visited, cache)
+                    .format_predicate_values(pred_ctx, level, depth, visited, cache)
                     .await?;
 
                 if !values.is_empty() {
@@ -443,15 +504,15 @@ impl<'a> GraphCrawlFormatter<'a> {
             }
 
             // Format reverse properties
-            for (rev_pred, rev_nested_opt) in spec.reverse {
+            for (rev_pred, rev_nested_opt) in level.reverse() {
                 let rev_flakes = self.fetch_reverse_properties(sid, rev_pred).await?;
                 if !rev_flakes.is_empty() {
                     let values = self
                         .format_reverse_values(
                             &rev_flakes,
                             rev_nested_opt.as_deref(),
-                            &spec,
-                            current_depth,
+                            level,
+                            depth,
                             visited,
                             cache,
                         )
@@ -482,26 +543,6 @@ impl<'a> GraphCrawlFormatter<'a> {
             Ok(result)
         }
         .boxed()
-    }
-
-    /// Find explicit sub-spec for a predicate in the selections
-    fn find_selection_for_predicate<'b>(
-        &self,
-        pred: &Sid,
-        selections: &'b [SelectionSpec],
-    ) -> Option<Option<&'b NestedSelectSpec>> {
-        for sel in selections {
-            if let SelectionSpec::Property {
-                predicate,
-                sub_spec,
-            } = sel
-            {
-                if predicate == pred {
-                    return Some(sub_spec.as_deref());
-                }
-            }
-        }
-        None
     }
 
     /// Whether this compact key should always be represented as an array.
@@ -538,8 +579,8 @@ impl<'a> GraphCrawlFormatter<'a> {
     async fn format_predicate_values<'b>(
         &'b self,
         pred_ctx: PredicateContext<'b>,
-        parent_spec: &FormatSpec<'b>,
-        current_depth: usize,
+        parent_level: &'b NestedSelectSpec,
+        depth: DepthBudget,
         visited: &'b mut HashSet<Sid>,
         cache: &'b mut HashMap<CacheKey, JsonValue>,
     ) -> Result<Vec<JsonValue>> {
@@ -554,46 +595,34 @@ impl<'a> GraphCrawlFormatter<'a> {
                         // @type special case: compact IRI string, not {"@id": ...}
                         values.push(json!(self.compactor.compact_sid(ref_sid)?));
                     } else {
-                        // Expansion decision:
+                        // Hydration decision:
                         // 1. If explicit sub-selection exists → expand with that spec
-                        // 2. Else if current_depth < max_depth → auto-expand with FULL parent spec
+                        // 2. Else if budget permits → auto-expand with FULL parent level
                         // 3. Else → just return {"@id": ...}
                         if let Some(nested) = pred_ctx.explicit_sub_spec {
-                            // Case 1: Explicit sub-selection
-                            let nested_spec = FormatSpec {
-                                selections: &nested.forward,
-                                reverse: &nested.reverse,
-                                has_wildcard: nested.has_wildcard,
-                            };
                             values.push(
                                 self.format_subject(
                                     ref_sid,
-                                    nested_spec,
-                                    current_depth + 1,
+                                    nested,
+                                    depth.descend(),
                                     visited,
                                     cache,
                                 )
                                 .await?,
                             );
-                        } else if current_depth < self.spec.depth {
-                            // Case 2: Auto-expand with FULL parent spec (forward + reverse!)
-                            let nested_spec = FormatSpec {
-                                selections: parent_spec.selections,
-                                reverse: parent_spec.reverse,
-                                has_wildcard: parent_spec.has_wildcard,
-                            };
+                        } else if depth.can_expand() {
                             values.push(
                                 self.format_subject(
                                     ref_sid,
-                                    nested_spec,
-                                    current_depth + 1,
+                                    parent_level,
+                                    depth.descend(),
                                     visited,
                                     cache,
                                 )
                                 .await?,
                             );
                         } else {
-                            // Case 3: Max depth reached, just @id
+                            // Max depth reached, just @id
                             values.push(json!({ "@id": self.compactor.compact_sid(ref_sid)? }));
                         }
                     }
@@ -618,8 +647,8 @@ impl<'a> GraphCrawlFormatter<'a> {
         &'b self,
         flakes: &[Flake],
         nested_spec: Option<&'b NestedSelectSpec>,
-        parent_spec: &FormatSpec<'b>,
-        current_depth: usize,
+        parent_level: &'b NestedSelectSpec,
+        depth: DepthBudget,
         visited: &'b mut HashSet<Sid>,
         cache: &'b mut HashMap<CacheKey, JsonValue>,
     ) -> Result<Vec<JsonValue>> {
@@ -628,39 +657,16 @@ impl<'a> GraphCrawlFormatter<'a> {
             // For reverse lookup, subject is the entity that points to our object
             let subject_sid = &flake.s;
 
-            if let Some(spec) = nested_spec {
-                // Explicit sub-selection for reverse - use the full nested spec
-                let nested_spec = FormatSpec {
-                    selections: &spec.forward,
-                    reverse: &spec.reverse,
-                    has_wildcard: spec.has_wildcard,
-                };
+            if let Some(nested) = nested_spec {
                 values.push(
-                    self.format_subject(
-                        subject_sid,
-                        nested_spec,
-                        current_depth + 1,
-                        visited,
-                        cache,
-                    )
-                    .await?,
+                    self.format_subject(subject_sid, nested, depth.descend(), visited, cache)
+                        .await?,
                 );
-            } else if current_depth < self.spec.depth {
-                // Auto-expand reverse refs with FULL parent spec
-                let nested_spec = FormatSpec {
-                    selections: parent_spec.selections,
-                    reverse: parent_spec.reverse,
-                    has_wildcard: parent_spec.has_wildcard,
-                };
+            } else if depth.can_expand() {
+                // Auto-expand reverse refs with FULL parent level
                 values.push(
-                    self.format_subject(
-                        subject_sid,
-                        nested_spec,
-                        current_depth + 1,
-                        visited,
-                        cache,
-                    )
-                    .await?,
+                    self.format_subject(subject_sid, parent_level, depth.descend(), visited, cache)
+                        .await?,
                 );
             } else {
                 // No expansion - just @id
@@ -906,29 +912,24 @@ impl<'a> GraphCrawlFormatter<'a> {
         let mut want_type = false;
         let mut want_language = false;
 
-        if spec.has_wildcard {
-            want_value = true;
-            want_type = true;
-            want_language = flake.m.as_ref().and_then(|m| m.lang.as_ref()).is_some();
-        } else {
-            for sel in &spec.forward {
-                match sel {
-                    SelectionSpec::Wildcard => {
-                        want_value = true;
-                        want_type = true;
-                        want_language = flake.m.as_ref().and_then(|m| m.lang.as_ref()).is_some();
-                    }
-                    SelectionSpec::Property { predicate, .. }
-                        if predicate.namespace_code == JSON_LD =>
-                    {
-                        match predicate.name.as_ref() {
-                            "value" => want_value = true,
-                            "type" => want_type = true,
-                            "language" => want_language = true,
-                            _ => {}
+        match spec {
+            NestedSelectSpec::Wildcard { .. } => {
+                want_value = true;
+                want_type = true;
+                want_language = flake.m.as_ref().and_then(|m| m.lang.as_ref()).is_some();
+            }
+            NestedSelectSpec::Explicit { forward, .. } => {
+                for item in forward {
+                    if let ForwardItem::Property { predicate, .. } = item {
+                        if predicate.namespace_code == JSON_LD {
+                            match predicate.name.as_ref() {
+                                "value" => want_value = true,
+                                "type" => want_type = true,
+                                "language" => want_language = true,
+                                _ => {}
+                            }
                         }
                     }
-                    _ => {}
                 }
             }
         }
@@ -1091,8 +1092,8 @@ impl<'a> GraphCrawlFormatter<'a> {
                 }
 
                 // Get subject classes from cache (empty if not cached)
-                // Note: Graph crawl doesn't pre-populate class cache like BinaryScanOperator.
-                // For graph crawl with class policies, the cache will be empty and
+                // Note: Hydration doesn't pre-populate class cache like BinaryScanOperator.
+                // For hydration with class policies, the cache will be empty and
                 // class policies may not work correctly. This is a known limitation
                 // that can be addressed by pre-populating in format_async if needed.
                 let subject_classes = policy_ctx
@@ -1137,90 +1138,72 @@ mod tests {
         assert_eq!(key1, key3);
     }
 
-    #[test]
-    fn test_local_spec_hash_different_selections() {
-        // Empty selections
-        let hash_empty = compute_local_spec_hash(&[], &HashMap::new(), false);
+    fn explicit(forward: Vec<ForwardItem>) -> NestedSelectSpec {
+        NestedSelectSpec::Explicit {
+            forward,
+            reverse: HashMap::new(),
+        }
+    }
 
-        // Wildcard only
-        let hash_wildcard =
-            compute_local_spec_hash(&[SelectionSpec::Wildcard], &HashMap::new(), true);
-
-        // Different hashes for different selections
-        assert_ne!(hash_empty, hash_wildcard);
-
-        // Same selections should produce same hash
-        let hash_wildcard2 =
-            compute_local_spec_hash(&[SelectionSpec::Wildcard], &HashMap::new(), true);
-        assert_eq!(hash_wildcard, hash_wildcard2);
-
-        // Different has_wildcard flag should produce different hash
-        let hash_wildcard_false =
-            compute_local_spec_hash(&[SelectionSpec::Wildcard], &HashMap::new(), false);
-        assert_ne!(hash_wildcard, hash_wildcard_false);
+    fn wildcard() -> NestedSelectSpec {
+        NestedSelectSpec::Wildcard {
+            refinements: HashMap::new(),
+            reverse: HashMap::new(),
+        }
     }
 
     #[test]
-    fn test_local_spec_hash_with_property() {
+    fn level_hash_distinguishes_explicit_from_wildcard() {
+        let hash_empty = compute_level_hash(&explicit(vec![]));
+        let hash_wildcard = compute_level_hash(&wildcard());
+        assert_ne!(hash_empty, hash_wildcard);
+        // Same level produces same hash.
+        assert_eq!(compute_level_hash(&wildcard()), hash_wildcard);
+    }
+
+    #[test]
+    fn level_hash_distinguishes_properties() {
         let pred1 = Sid::new(1, "name");
         let pred2 = Sid::new(2, "age");
 
-        // Property without sub-spec
-        let selections1 = vec![SelectionSpec::Property {
+        let hash1 = compute_level_hash(&explicit(vec![ForwardItem::Property {
             predicate: pred1.clone(),
             sub_spec: None,
-        }];
-        let hash1 = compute_local_spec_hash(&selections1, &HashMap::new(), false);
-
-        // Different property
-        let selections2 = vec![SelectionSpec::Property {
+        }]));
+        let hash2 = compute_level_hash(&explicit(vec![ForwardItem::Property {
             predicate: pred2.clone(),
             sub_spec: None,
-        }];
-        let hash2 = compute_local_spec_hash(&selections2, &HashMap::new(), false);
-
+        }]));
         assert_ne!(hash1, hash2);
 
-        // Property with sub-spec should differ from property without
-        let selections3 = vec![SelectionSpec::Property {
+        // Sub-spec presence changes the hash.
+        let hash3 = compute_level_hash(&explicit(vec![ForwardItem::Property {
             predicate: pred1.clone(),
-            sub_spec: Some(Box::new(NestedSelectSpec {
-                forward: vec![SelectionSpec::Wildcard],
-                reverse: HashMap::new(),
-                has_wildcard: true,
-            })),
-        }];
-        let hash3 = compute_local_spec_hash(&selections3, &HashMap::new(), false);
-
+            sub_spec: Some(Box::new(wildcard())),
+        }]));
         assert_ne!(hash1, hash3);
     }
 
     #[test]
-    fn test_local_spec_hash_with_reverse() {
+    fn level_hash_distinguishes_reverse() {
         let rev_pred = Sid::new(10, "friendOf");
 
-        // Empty reverse
-        let hash_no_reverse = compute_local_spec_hash(&[], &HashMap::new(), true);
+        let hash_no_reverse = compute_level_hash(&wildcard());
 
-        // With reverse property (no nested spec)
         let mut reverse1 = HashMap::new();
         reverse1.insert(rev_pred.clone(), None);
-        let hash_with_reverse = compute_local_spec_hash(&[], &reverse1, true);
-
+        let hash_with_reverse = compute_level_hash(&NestedSelectSpec::Wildcard {
+            refinements: HashMap::new(),
+            reverse: reverse1,
+        });
         assert_ne!(hash_no_reverse, hash_with_reverse);
 
-        // With reverse property (with nested spec)
         let mut reverse2 = HashMap::new();
-        reverse2.insert(
-            rev_pred.clone(),
-            Some(Box::new(NestedSelectSpec {
-                forward: vec![SelectionSpec::Wildcard],
-                reverse: HashMap::new(),
-                has_wildcard: true,
-            })),
-        );
-        let hash_with_reverse_nested = compute_local_spec_hash(&[], &reverse2, true);
-
-        assert_ne!(hash_with_reverse, hash_with_reverse_nested);
+        reverse2.insert(rev_pred, Some(Box::new(wildcard())));
+        let hash_nested = compute_level_hash(&NestedSelectSpec::Wildcard {
+            refinements: HashMap::new(),
+            reverse: reverse2,
+        });
+        assert_ne!(hash_with_reverse, hash_nested);
     }
 }

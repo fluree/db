@@ -966,10 +966,9 @@ mod tests {
         let query = Query {
             context: ParsedContext::default(),
             orig_context: None,
-            output: QueryOutput::select(vec![out_var]),
+            output: QueryOutput::select_all(vec![out_var]),
             patterns,
             options: options.clone(),
-            graph_select: None,
             post_values: None,
         };
         (query, options)

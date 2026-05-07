@@ -1032,13 +1032,13 @@ async fn reindex_default_from_t_includes_all_data() {
 /// Graph crawl select (`{"?s": ["*"]}`) must work against an indexed ledger.
 ///
 /// Binary scan operators produce `EncodedSid` bindings for late materialization.
-/// The graph crawl formatter must materialize these before subject property
+/// The expansion formatter must materialize these before subject property
 /// lookup, otherwise every row is silently skipped and the result is `[]`.
 #[tokio::test]
-async fn graph_crawl_select_works_after_indexing() {
+async fn expansion_select_works_after_indexing() {
     assert_index_defaults();
     let fluree = FlureeBuilder::memory().build_memory();
-    let ledger_id = "it/graph-crawl-indexed:main";
+    let ledger_id = "it/expansion-indexed:main";
 
     let (local, handle) = start_background_indexer_local(
         fluree.backend().clone(),
@@ -1118,7 +1118,7 @@ async fn graph_crawl_select_works_after_indexing() {
             assert_eq!(
                 rows.len(),
                 3,
-                "graph crawl should return 3 persons, got: {json_rows}"
+                "expansion should return 3 persons, got: {json_rows}"
             );
 
             // Each row should be a JSON object with @id and properties

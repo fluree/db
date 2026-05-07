@@ -187,7 +187,7 @@ async fn credential_transact_then_credential_query_enforces_policy() {
         .expect("credential_transact")
         .ledger;
 
-    // Signed credentialed query selecting the root user (graph crawl).
+    // Signed credentialed query selecting the root user (expansion).
     let query = json!({
         "@context": ctx_ct(ns_prefix),
         "from": ledger_id,

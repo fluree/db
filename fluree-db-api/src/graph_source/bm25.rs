@@ -220,8 +220,7 @@ impl crate::Fluree {
         // Execute with a wildcard select so the operator pipeline does not project away
         // bindings we need for indexing
         let mut parsed_for_exec = parsed.clone();
-        parsed_for_exec.output = QueryOutput::Wildcard;
-        parsed_for_exec.graph_select = None;
+        parsed_for_exec.output = QueryOutput::wildcard();
 
         let executable = ExecutableQuery::simple(parsed_for_exec);
 
@@ -262,8 +261,7 @@ impl crate::Fluree {
         let parsed = parse_query(query_json, view.snapshot.as_ref(), &mut vars, None)?;
 
         let mut parsed_for_exec = parsed.clone();
-        parsed_for_exec.output = QueryOutput::Wildcard;
-        parsed_for_exec.graph_select = None;
+        parsed_for_exec.output = QueryOutput::wildcard();
 
         let executable = ExecutableQuery::simple(parsed_for_exec);
 

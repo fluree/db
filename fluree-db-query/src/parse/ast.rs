@@ -720,10 +720,10 @@ impl UnresolvedConstructTemplate {
 }
 
 // ============================================================================
-// Graph crawl select types
+// Hydration types
 // ============================================================================
 
-/// Root of a graph crawl select - can be variable or IRI constant
+/// Root of a hydration - can be variable or IRI constant
 ///
 /// Supports both syntax forms:
 /// - Variable root: `{"?person": ["*", ...]}`
@@ -736,78 +736,85 @@ pub enum UnresolvedRoot {
     Iri(String),
 }
 
-/// Nested selection specification for sub-crawls
+/// Nested selection specification for sub-hydrations
 ///
-/// This type captures the full selection state for nested property expansion,
-/// including both forward and reverse properties. It's used when a property
-/// has nested selections like `{"ex:friend": ["*", {"friended": ["*"]}]}`.
+/// Selection at one level of a hydration (unresolved). Mirrors
+/// [`crate::ir::NestedSelectSpec`].
+type UnresolvedReverseMap =
+    std::collections::HashMap<String, Option<Box<UnresolvedNestedSelectSpec>>>;
+
 #[derive(Debug, Clone, PartialEq)]
-pub struct UnresolvedNestedSelectSpec {
-    /// Forward property selections
-    pub forward: Vec<UnresolvedSelectionSpec>,
-    /// Reverse property selections (expanded IRI → optional nested spec)
-    /// None means no sub-selections (just return @id), Some means nested expansion
-    pub reverse: std::collections::HashMap<String, Option<Box<UnresolvedNestedSelectSpec>>>,
-    /// Whether wildcard was specified at this level
-    pub has_wildcard: bool,
+pub enum UnresolvedNestedSelectSpec {
+    /// `*` at this level — include all forward properties (and `@id`).
+    /// `refinements` overrides the wildcard default of "include but don't
+    /// recurse" for specific properties.
+    Wildcard {
+        refinements: std::collections::HashMap<String, Box<UnresolvedNestedSelectSpec>>,
+        reverse: UnresolvedReverseMap,
+    },
+    /// Explicit list of forward items.
+    Explicit {
+        forward: Vec<UnresolvedForwardItem>,
+        reverse: UnresolvedReverseMap,
+    },
 }
 
 impl UnresolvedNestedSelectSpec {
-    /// Create a new nested select spec
-    pub fn new(
-        forward: Vec<UnresolvedSelectionSpec>,
-        reverse: std::collections::HashMap<String, Option<Box<UnresolvedNestedSelectSpec>>>,
-        has_wildcard: bool,
-    ) -> Self {
-        Self {
-            forward,
-            reverse,
-            has_wildcard,
+    /// Returns `true` if this level is a wildcard.
+    pub fn is_wildcard(&self) -> bool {
+        matches!(self, UnresolvedNestedSelectSpec::Wildcard { .. })
+    }
+
+    /// Reverse property selections at this level.
+    pub fn reverse(&self) -> &UnresolvedReverseMap {
+        match self {
+            UnresolvedNestedSelectSpec::Wildcard { reverse, .. }
+            | UnresolvedNestedSelectSpec::Explicit { reverse, .. } => reverse,
         }
     }
 
-    /// Check if this spec is empty (no selections)
+    /// Returns `true` if the level produces no output (empty Explicit
+    /// selection with no reverse).
     pub fn is_empty(&self) -> bool {
-        self.forward.is_empty() && self.reverse.is_empty()
+        match self {
+            UnresolvedNestedSelectSpec::Wildcard { .. } => false,
+            UnresolvedNestedSelectSpec::Explicit { forward, reverse } => {
+                forward.is_empty() && reverse.is_empty()
+            }
+        }
     }
 }
 
-/// Selection specification within a graph crawl
+/// One forward item in an explicit (non-wildcard) selection level.
 ///
-/// Defines what properties to include at each level of the expansion.
+/// Examples:
+/// - `"ex:name"` → `Property { predicate: "ex:name", sub_spec: None }`
+/// - `{"ex:friend": ["*"]}` → `Property { sub_spec: Some(...) }`
+/// - `"@id"` → `Id`
 #[derive(Debug, Clone, PartialEq)]
-pub enum UnresolvedSelectionSpec {
-    /// Explicit @id selection (include @id even when wildcard is not specified)
+pub enum UnresolvedForwardItem {
+    /// Explicit `@id` selection.
     Id,
-    /// Wildcard - select all properties at this level ("*")
-    Wildcard,
-    /// Property selection - optionally with nested sub-selections
-    ///
-    /// Examples:
-    /// - `"ex:name"` → Property with no sub_spec
-    /// - `{"ex:friend": ["*"]}` → Property with sub_spec containing forward selections
-    /// - `{"ex:friend": ["*", {"@reverse:friended": ["*"]}]}` → Property with both forward and reverse
+    /// A specific property with optional nested expansion of its values.
     Property {
         /// Predicate IRI (expanded)
         predicate: String,
-        /// Optional nested selection spec for expanding this property's values
-        /// Uses Box to avoid infinite type recursion
         sub_spec: Option<Box<UnresolvedNestedSelectSpec>>,
     },
 }
 
-/// Graph crawl selection specification (formatting-time only)
+/// Hydration spec (unresolved).
 ///
-/// This captures the graph crawl select syntax for nested JSON-LD object expansion.
-/// It is used only during result formatting, not during query execution.
+/// Captures the hydration syntax for nested JSON-LD objects. Lowered into
+/// [`crate::ir::HydrationSpec`].
 ///
 /// # Examples
 ///
 /// ```json
-/// // Simple crawl with wildcard
+/// // Simple hydration with wildcard
 /// {"select": {"?person": ["*"]}}
 ///
-/// // Nested crawl
+/// // Nested hydration
 /// {"select": {"?person": ["*", {"ex:friend": ["*"]}]}}
 ///
 /// // With depth parameter
@@ -817,35 +824,102 @@ pub enum UnresolvedSelectionSpec {
 /// {"select": {"ex:alice": ["*"]}}
 /// ```
 #[derive(Debug, Clone, PartialEq)]
-pub struct UnresolvedGraphSelectSpec {
-    /// Root of the crawl - variable or IRI constant
+pub struct UnresolvedHydrationSpec {
+    /// Root of the hydration — variable or IRI constant.
     pub root: UnresolvedRoot,
-    /// Forward property selections
-    pub selections: Vec<UnresolvedSelectionSpec>,
-    /// Reverse property selections (expanded IRI → optional nested spec)
-    /// None means no sub-selections (just return @id), Some means nested expansion
-    ///
-    /// Populated from `@reverse` context entries
-    pub reverse: std::collections::HashMap<String, Option<Box<UnresolvedNestedSelectSpec>>>,
-    /// Max depth for auto-expansion (0 = no auto-expand, only explicit)
+    /// Selection at the top level of the hydration.
+    pub level: UnresolvedNestedSelectSpec,
+    /// Max depth for auto-expansion (0 = no auto-expand, only explicit).
     pub depth: usize,
-    /// Whether wildcard was specified (controls @id inclusion)
-    pub has_wildcard: bool,
 }
 
-impl UnresolvedGraphSelectSpec {
-    /// Create a new graph select spec with default values
-    pub fn new(root: UnresolvedRoot, selections: Vec<UnresolvedSelectionSpec>) -> Self {
-        let has_wildcard = selections
-            .iter()
-            .any(|s| matches!(s, UnresolvedSelectionSpec::Wildcard));
+impl UnresolvedHydrationSpec {
+    /// Create a hydration with the given root and top-level selection,
+    /// `depth: 0`.
+    pub fn new(root: UnresolvedRoot, level: UnresolvedNestedSelectSpec) -> Self {
         Self {
             root,
-            selections,
-            reverse: std::collections::HashMap::new(),
+            level,
             depth: 0,
-            has_wildcard,
         }
+    }
+}
+
+/// One column of a SELECT projection (unresolved).
+///
+/// Lowered into [`crate::ir::Column`].
+#[derive(Debug, Clone, PartialEq)]
+pub enum UnresolvedColumn {
+    /// Project a single variable's binding (e.g. `"?name"`).
+    Var(Arc<str>),
+    /// Hydrate a subject (variable or IRI constant) into a nested JSON-LD
+    /// object (e.g. `{"?person": ["*"]}`).
+    Hydration(UnresolvedHydrationSpec),
+}
+
+impl UnresolvedColumn {
+    /// Returns the variable name if this is a `Var` column.
+    pub fn var_name(&self) -> Option<&str> {
+        match self {
+            UnresolvedColumn::Var(name) => Some(name),
+            UnresolvedColumn::Hydration(_) => None,
+        }
+    }
+
+    /// Returns the hydration spec if this is a `Hydration` column.
+    pub fn as_hydration(&self) -> Option<&UnresolvedHydrationSpec> {
+        match self {
+            UnresolvedColumn::Hydration(spec) => Some(spec),
+            UnresolvedColumn::Var(_) => None,
+        }
+    }
+}
+
+/// The columns a SELECT query produces (unresolved). Mirrors
+/// [`crate::ir::Projection`].
+#[derive(Debug, Clone, PartialEq)]
+pub enum UnresolvedProjection {
+    /// SELECT * — all in-scope WHERE-bound variables, rendered raw.
+    Wildcard,
+    /// Array-form rows: each row is `[v1, v2, ...]` of any arity.
+    Tuple(Vec<UnresolvedColumn>),
+    /// Bare-value rows from JSON-LD `select: "?x"` — exactly one column,
+    /// each row is a bare value (not wrapped in an array).
+    Scalar(UnresolvedColumn),
+}
+
+impl Default for UnresolvedProjection {
+    /// An empty `Tuple` projection — the parser populates it as columns
+    /// are encountered.
+    fn default() -> Self {
+        UnresolvedProjection::Tuple(Vec::new())
+    }
+}
+
+impl UnresolvedProjection {
+    /// Columns in render order. Empty for `Wildcard`.
+    pub fn columns(&self) -> &[UnresolvedColumn] {
+        match self {
+            UnresolvedProjection::Wildcard => &[],
+            UnresolvedProjection::Tuple(cs) => cs,
+            UnresolvedProjection::Scalar(c) => std::slice::from_ref(c),
+        }
+    }
+
+    /// Mutable access to columns in render order. Empty for `Wildcard`.
+    pub fn columns_mut(&mut self) -> &mut [UnresolvedColumn] {
+        match self {
+            UnresolvedProjection::Wildcard => &mut [],
+            UnresolvedProjection::Tuple(cs) => cs.as_mut_slice(),
+            UnresolvedProjection::Scalar(c) => std::slice::from_mut(c),
+        }
+    }
+
+    /// Returns `true` if any column in the projection is a hydration column.
+    pub fn has_hydration(&self) -> bool {
+        self.columns()
+            .iter()
+            .any(|c| matches!(c, UnresolvedColumn::Hydration(_)))
     }
 }
 
@@ -999,29 +1073,14 @@ pub struct UnresolvedQuery {
     pub context: ParsedContext,
     /// Original JSON context from the query (for CONSTRUCT output)
     pub orig_context: Option<serde_json::Value>,
-    /// Selected variables (e.g., ["?name", "?age"])
-    ///
-    /// For graph crawl queries, this still contains the root variable(s)
-    /// needed for execution. The graph_select field controls formatting.
-    pub select: Vec<Arc<str>>,
-    /// User-declared projection shape from the input syntax.
-    ///
-    /// `Scalar` for bare-string select (`select: "?x"`), `Tuple` otherwise
-    /// (array form, or SPARQL, which has no scalar form). Propagated into
-    /// `QueryOutput::Select` / `SelectOne` so formatters can decide rendering
-    /// without inferring from `vars.len()`.
-    pub select_shape: crate::ir::ProjectionShape,
+    /// Projection (columns + shape). Lowered into [`crate::ir::Projection`].
+    pub select: UnresolvedProjection,
     /// Ordered patterns in where clause (triples, filters, optionals, etc.)
     pub patterns: Vec<UnresolvedPattern>,
     /// Query options (limit, offset, order by, group by, etc.)
     pub options: UnresolvedOptions,
     /// CONSTRUCT template (None for SELECT queries)
     pub construct_template: Option<UnresolvedConstructTemplate>,
-    /// Graph crawl select specification (None for flat SELECT or CONSTRUCT)
-    ///
-    /// When present, controls nested JSON-LD object expansion during formatting.
-    /// Only one graph-select object is allowed per query.
-    pub graph_select: Option<UnresolvedGraphSelectSpec>,
 }
 
 impl UnresolvedQuery {
@@ -1030,18 +1089,37 @@ impl UnresolvedQuery {
         Self {
             context,
             orig_context: None,
-            select: Vec::new(),
-            select_shape: crate::ir::ProjectionShape::default(),
+            select: UnresolvedProjection::default(),
             patterns: Vec::new(),
             options: UnresolvedOptions::default(),
             construct_template: None,
-            graph_select: None,
         }
     }
 
-    /// Add a selected variable
+    /// Append a Var column. The projection must be in `Tuple` mode
+    /// (the default for [`Self::new`]).
     pub fn add_select(&mut self, var: impl AsRef<str>) {
-        self.select.push(Arc::from(var.as_ref()));
+        self.push_column(UnresolvedColumn::Var(Arc::from(var.as_ref())));
+    }
+
+    /// Append a Hydration column. The projection must be in `Tuple` mode.
+    pub fn add_hydration(&mut self, spec: UnresolvedHydrationSpec) {
+        self.push_column(UnresolvedColumn::Hydration(spec));
+    }
+
+    /// Append a column to a `Tuple` projection. Panics if `select` is not
+    /// `Tuple` (which only happens after `select` has been finalized to
+    /// `Wildcard` or `Scalar` — neither supports incremental appends).
+    fn push_column(&mut self, column: UnresolvedColumn) {
+        match &mut self.select {
+            UnresolvedProjection::Tuple(cs) => cs.push(column),
+            _ => panic!("cannot append a column to a non-Tuple projection"),
+        }
+    }
+
+    /// Returns `true` if the projection contains any hydration column.
+    pub fn has_hydration(&self) -> bool {
+        self.select.has_hydration()
     }
 
     /// Add a triple pattern (convenience method that wraps in UnresolvedPattern)

@@ -34,9 +34,9 @@ fn xsd_string() -> Sid {
 
 fn make_query(select: Vec<VarId>, patterns: Vec<Pattern>) -> Query {
     let output = if select.is_empty() {
-        QueryOutput::Wildcard
+        QueryOutput::wildcard()
     } else {
-        QueryOutput::select(select)
+        QueryOutput::select_all(select)
     };
     Query {
         context: ParsedContext::default(),
@@ -44,7 +44,6 @@ fn make_query(select: Vec<VarId>, patterns: Vec<Pattern>) -> Query {
         output,
         patterns,
         options: QueryOptions::default(),
-        graph_select: None,
         post_values: None,
     }
 }

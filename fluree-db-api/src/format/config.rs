@@ -138,7 +138,7 @@ pub struct FormatterConfig {
 
     /// Normalize multi-value properties to always use arrays
     ///
-    /// When true, graph crawl results always wrap property values in arrays,
+    /// When true, hydration results always wrap property values in arrays,
     /// even when there is only a single value. This ensures predictable shapes
     /// for programmatic consumers (e.g., deserializing into `Vec<T>` fields).
     ///
@@ -146,7 +146,7 @@ pub struct FormatterConfig {
     /// multi-valued properties return arrays (existing behavior). The
     /// `@container: @set` context annotation still forces arrays per-property.
     ///
-    /// Only affects graph crawl formatting; tabular SELECT results are unaffected.
+    /// Only affects hydration formatting; tabular SELECT results are unaffected.
     pub normalize_arrays: bool,
 
     /// Maximum byte budget for AgentJson output
@@ -227,7 +227,7 @@ impl FormatterConfig {
         self
     }
 
-    /// Enable array normalization for graph crawl results
+    /// Enable array normalization for hydration results
     ///
     /// When enabled, all multi-value properties are wrapped in arrays even
     /// when only a single value exists. This produces predictable shapes for

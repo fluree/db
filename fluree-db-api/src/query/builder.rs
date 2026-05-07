@@ -328,7 +328,7 @@ impl<'a> ViewQueryBuilder<'a> {
     ///
     /// For TSV format: produces TSV directly (fast path, no JSON intermediate).
     /// For JSON formats: produces serialized JSON string via async formatting
-    /// (supports graph crawl and policy-aware queries).
+    /// (supports expansion-aware policies-aware queries).
     pub async fn execute_formatted_string(mut self) -> Result<String> {
         let errs = self.core.validate();
         if !errs.is_empty() {
@@ -577,7 +577,7 @@ impl<'a> DatasetQueryBuilder<'a> {
     ///
     /// For TSV format: produces TSV directly (fast path, no JSON intermediate).
     /// For JSON formats: produces serialized JSON string via async formatting
-    /// (supports graph crawl and policy-aware queries).
+    /// (supports expansion-aware policies-aware queries).
     pub async fn execute_formatted_string(mut self) -> Result<String> {
         let errs = self.core.validate();
         if !errs.is_empty() {
@@ -942,7 +942,7 @@ impl<'a> FromQueryBuilder<'a> {
     ///
     /// For TSV format: produces TSV directly (fast path, no JSON intermediate).
     /// For JSON formats: produces serialized JSON string via async formatting
-    /// (supports graph crawl queries).
+    /// (supports hydration queries).
     pub async fn execute_formatted_string(mut self) -> Result<String> {
         let errs = self.core.validate();
         if !errs.is_empty() {

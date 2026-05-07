@@ -1,13 +1,13 @@
 //! Overlay utilities for formatting/query results.
 //!
-//! Currently used to support dataset (multi-ledger) graph crawl formatting by
+//! Currently used to support dataset (multi-ledger) hydration formatting by
 //! composing multiple novelty overlays into a single `OverlayProvider`.
 
 use fluree_db_core::{Flake, GraphId, IndexType, OverlayProvider};
 
 /// Composite overlay that merges multiple overlay providers.
 ///
-/// Used when graph crawl formatting needs to "see" unindexed flakes from multiple ledgers
+/// Used when hydration formatting needs to "see" unindexed flakes from multiple ledgers
 /// (dataset mode). This is a correctness-first implementation intended for tests and
 /// low-volume usage: it collects flakes from each overlay, sorts them, then streams them
 /// to the callback.

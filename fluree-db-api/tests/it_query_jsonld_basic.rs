@@ -26,7 +26,7 @@ async fn seed_movie_graph() -> (MemoryFluree, MemoryLedger) {
 
     let ledger0 = genesis_ledger(&fluree, ledger_id);
 
-    // Minimal “movie -> book -> author” shape to exercise graph crawl + depth.
+    // Minimal “movie -> book -> author” shape to exercise expansion + depth.
     let tx = json!({
         "@context": ctx(),
         "@graph": [
@@ -58,6 +58,21 @@ async fn seed_movie_graph() -> (MemoryFluree, MemoryLedger) {
         .await
         .expect("insert movie graph");
     (fluree, committed.ledger)
+}
+
+/// Extract `(@id of column 0, @id of column 1)` from an array-shaped row,
+/// for use as a stable sort key when asserting on multi-column hydration
+/// outputs.
+fn row_id_pair(row: &JsonValue) -> (String, String) {
+    let cols = row.as_array();
+    let id_at = |idx: usize| -> String {
+        cols.and_then(|cs| cs.get(idx))
+            .and_then(|c| c.get("@id"))
+            .and_then(|v| v.as_str())
+            .unwrap_or_default()
+            .to_string()
+    };
+    (id_at(0), id_at(1))
 }
 
 fn normalize_object_arrays(value: &mut JsonValue) {
@@ -238,7 +253,7 @@ async fn jsonld_basic_single_subject_query_select_one() {
 }
 
 #[tokio::test]
-async fn jsonld_basic_single_subject_query_graph_crawl() {
+async fn jsonld_basic_single_subject_query_expansion() {
     let (fluree, ledger) = seed_movie_graph().await;
 
     let query = json!({
@@ -273,8 +288,8 @@ async fn jsonld_basic_single_subject_query_graph_crawl() {
 }
 
 #[tokio::test]
-async fn jsonld_basic_single_subject_graph_crawl_with_depth() {
-    // Mirrors the “depth graph crawl” behavior:
+async fn jsonld_basic_single_subject_expansion_with_depth() {
+    // Mirrors the “depth expansion” behavior:
     // with depth=3 and wildcard selection, refs should auto-expand transitively.
     let (fluree, ledger) = seed_movie_graph().await;
 
@@ -317,7 +332,7 @@ async fn jsonld_basic_single_subject_graph_crawl_with_depth() {
 }
 
 #[tokio::test]
-async fn jsonld_basic_single_subject_graph_crawl_with_depth_and_subselection() {
+async fn jsonld_basic_single_subject_expansion_with_depth_and_subselection() {
     let (fluree, ledger) = seed_movie_graph().await;
 
     let query = json!({
@@ -744,7 +759,7 @@ async fn jsonld_rdf_type_query_analytical() {
 }
 
 #[tokio::test]
-async fn jsonld_graph_crawl_nested_subselect_includes_id() {
+async fn jsonld_expansion_nested_subselect_includes_id() {
     let (fluree, ledger) = seed_movie_graph().await;
 
     // Regression: nested ref sub-selects should always include @id for identity,
@@ -964,6 +979,91 @@ async fn jsonld_simple_subject_crawl_where_type() {
         }
     ]);
     normalize_object_arrays(&mut expected);
+
+    assert_eq!(json_result, expected);
+}
+
+#[tokio::test]
+async fn jsonld_two_hydration_columns_var_roots() {
+    // Two var-rooted hydration columns in a single select: each row should be
+    // a 2-element array of independently expanded subjects.
+    let (fluree, ledger) = seed_simple_subject_crawl().await;
+
+    let query = json!({
+        "@context": ctx(),
+        "select": [
+            {"?friender": ["@id", "schema:name"]},
+            {"?friend":   ["@id", "schema:name"]}
+        ],
+        "where": {
+            "@id": "?friender",
+            "ex:friend": "?friend"
+        }
+    });
+
+    let result = support::query_jsonld(&fluree, &ledger, &query)
+        .await
+        .expect("query");
+    let mut json_result = result
+        .to_jsonld_async(ledger.as_graph_db_ref(0))
+        .await
+        .expect("to_jsonld_async");
+
+    // Sort top-level rows by (friender @id, friend @id) so the assertion is
+    // independent of solution iteration order.
+    if let JsonValue::Array(rows) = &mut json_result {
+        rows.sort_by_key(row_id_pair);
+    }
+
+    let expected = json!([
+        [
+            {"@id": "ex:cam", "schema:name": "Cam"},
+            {"@id": "ex:alice", "schema:name": "Alice"}
+        ],
+        [
+            {"@id": "ex:cam", "schema:name": "Cam"},
+            {"@id": "ex:brian", "schema:name": "Brian"}
+        ],
+        [
+            {"@id": "ex:david", "schema:name": "David"},
+            {"@id": "ex:cam", "schema:name": "Cam"}
+        ]
+    ]);
+
+    assert_eq!(json_result, expected);
+}
+
+#[tokio::test]
+async fn jsonld_two_hydration_columns_different_subspecs() {
+    // Each hydration column may carry its own NestedSelectSpec — different
+    // sub-selections should be honored independently per column.
+    let (fluree, ledger) = seed_simple_subject_crawl().await;
+
+    let query = json!({
+        "@context": ctx(),
+        "select": [
+            {"?friender": ["@id", "schema:name", "schema:age"]},
+            {"?friend":   ["@id"]}
+        ],
+        "where": {
+            "@id": "?friender",
+            "ex:friend": "?friend",
+            "schema:name": "David"
+        }
+    });
+
+    let result = support::query_jsonld(&fluree, &ledger, &query)
+        .await
+        .expect("query");
+    let json_result = result
+        .to_jsonld_async(ledger.as_graph_db_ref(0))
+        .await
+        .expect("to_jsonld_async");
+
+    let expected = json!([[
+        {"@id": "ex:david", "schema:name": "David", "schema:age": 46},
+        {"@id": "ex:cam"}
+    ]]);
 
     assert_eq!(json_result, expected);
 }

@@ -4,11 +4,12 @@
 //! (with Sids and VarIds) using an IriEncoder.
 
 use super::ast::{
-    LiteralValue, UnresolvedAggregateFn, UnresolvedAggregateSpec, UnresolvedConstructTemplate,
-    UnresolvedDatatypeConstraint, UnresolvedExpression, UnresolvedGraphSelectSpec,
-    UnresolvedNestedSelectSpec, UnresolvedOptions, UnresolvedPathExpr, UnresolvedPattern,
-    UnresolvedQuery, UnresolvedRoot, UnresolvedSelectionSpec, UnresolvedSortDirection,
-    UnresolvedSortSpec, UnresolvedTerm, UnresolvedTriplePattern, UnresolvedValue,
+    LiteralValue, UnresolvedAggregateFn, UnresolvedAggregateSpec, UnresolvedColumn,
+    UnresolvedConstructTemplate, UnresolvedDatatypeConstraint, UnresolvedExpression,
+    UnresolvedForwardItem, UnresolvedHydrationSpec, UnresolvedNestedSelectSpec, UnresolvedOptions,
+    UnresolvedPathExpr, UnresolvedPattern, UnresolvedProjection, UnresolvedQuery, UnresolvedRoot,
+    UnresolvedSortDirection, UnresolvedSortSpec, UnresolvedTerm, UnresolvedTriplePattern,
+    UnresolvedValue,
 };
 use super::encode::{IriEncoder, NoEncoder};
 use super::error::{ParseError, Result};
@@ -18,7 +19,8 @@ use crate::context::WellKnownDatatypes;
 use crate::ir::triple::{Ref, Term, TriplePattern};
 use crate::ir::QueryOptions;
 use crate::ir::{
-    ConstructTemplate, GraphSelectSpec, NestedSelectSpec, Query, QueryOutput, Root, SelectionSpec,
+    Column, ConstructTemplate, ForwardItem, HydrationSpec, Multiplicity, NestedSelectSpec,
+    Projection, Query, QueryOutput, Root,
 };
 use crate::ir::{
     Expression, Function, IndexSearchPattern, IndexSearchTarget, PathModifier, Pattern,
@@ -33,10 +35,11 @@ use fluree_db_core::{FlakeValue, Sid};
 use fluree_graph_json_ld::ParsedContext;
 use std::sync::Arc;
 
-/// Select mode determines result shape
+/// Select mode determines result shape.
 ///
-/// This is derived from the parsed query (select vs selectOne vs construct) and controls
-/// whether the formatter returns an array, single value, or JSON-LD graph.
+/// Derived from the parsed query (select / selectOne / construct / ask).
+/// Wildcard (`select: "*"`) is not represented here — it lives entirely in
+/// the projection (`UnresolvedProjection::Wildcard`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub(crate) enum SelectMode {
     /// Normal select: return array of rows
@@ -45,12 +48,6 @@ pub(crate) enum SelectMode {
 
     /// selectOne: return first row or null
     One,
-
-    /// Wildcard (*): return all bound variables as object
-    ///
-    /// Uses `batch.schema()` to get all variables, not just select.
-    /// Omits unbound/poisoned variables from output.
-    Wildcard,
 
     /// CONSTRUCT: return JSON-LD graph `{"@context": ..., "@graph": [...]}`
     ///
@@ -62,7 +59,7 @@ pub(crate) enum SelectMode {
     ///
     /// No variables are projected. LIMIT 1 is applied internally for efficiency.
     /// Result format: `{"head": {}, "boolean": true|false}`
-    Boolean,
+    Ask,
 }
 
 /// Lower an unresolved query to a resolved [`Query`]
@@ -85,12 +82,8 @@ pub(crate) fn lower_query<E: IriEncoder>(
 ) -> Result<Query> {
     let mut pp_counter: u32 = 0;
 
-    // Lower select variables
-    let select_vars: Vec<VarId> = ast
-        .select
-        .iter()
-        .map(|name| vars.get_or_insert(name))
-        .collect();
+    // Lower the projection (columns + shape)
+    let projection = lower_projection(&ast.select, encoder, vars)?;
 
     // Lower patterns
     let mut patterns = Vec::new();
@@ -104,17 +97,15 @@ pub(crate) fn lower_query<E: IriEncoder>(
     let options = lower_options(&ast.options, vars)?;
 
     // Build QueryOutput from mode + lowered components
-    let shape = ast.select_shape;
     let output = match select_mode {
         SelectMode::Many => QueryOutput::Select {
-            vars: select_vars,
-            shape,
+            projection,
+            multiplicity: Multiplicity::All,
         },
-        SelectMode::One => QueryOutput::SelectOne {
-            vars: select_vars,
-            shape,
+        SelectMode::One => QueryOutput::Select {
+            projection,
+            multiplicity: Multiplicity::One,
         },
-        SelectMode::Wildcard => QueryOutput::Wildcard,
         SelectMode::Construct => {
             let template = match ast.construct_template {
                 Some(ref t) => lower_construct_template(t, encoder, vars)?,
@@ -122,15 +113,8 @@ pub(crate) fn lower_query<E: IriEncoder>(
             };
             QueryOutput::Construct(template)
         }
-        SelectMode::Boolean => QueryOutput::Boolean,
+        SelectMode::Ask => QueryOutput::Ask,
     };
-
-    // Lower graph select if present
-    let graph_select = ast
-        .graph_select
-        .as_ref()
-        .map(|gs| lower_graph_select(gs, encoder, vars))
-        .transpose()?;
 
     Ok(Query {
         context: ast.context,
@@ -138,9 +122,39 @@ pub(crate) fn lower_query<E: IriEncoder>(
         output,
         patterns,
         options,
-        graph_select,
         post_values: None,
     })
+}
+
+fn lower_column<E: IriEncoder>(
+    col: &UnresolvedColumn,
+    encoder: &E,
+    vars: &mut VarRegistry,
+) -> Result<Column> {
+    match col {
+        UnresolvedColumn::Var(name) => Ok(Column::Var(vars.get_or_insert(name))),
+        UnresolvedColumn::Hydration(spec) => {
+            Ok(Column::Hydration(lower_hydration(spec, encoder, vars)?))
+        }
+    }
+}
+
+fn lower_projection<E: IriEncoder>(
+    projection: &UnresolvedProjection,
+    encoder: &E,
+    vars: &mut VarRegistry,
+) -> Result<Projection> {
+    match projection {
+        UnresolvedProjection::Wildcard => Ok(Projection::Wildcard),
+        UnresolvedProjection::Tuple(cs) => {
+            let lowered = cs
+                .iter()
+                .map(|c| lower_column(c, encoder, vars))
+                .collect::<Result<Vec<_>>>()?;
+            Ok(Projection::Tuple(lowered))
+        }
+        UnresolvedProjection::Scalar(c) => Ok(Projection::Scalar(lower_column(c, encoder, vars)?)),
+    }
 }
 
 /// Lower an unresolved pattern to resolved Pattern(s).
@@ -986,12 +1000,30 @@ fn lower_subquery<E: IriEncoder>(
     vars: &mut VarRegistry,
     pp_counter: &mut u32,
 ) -> Result<SubqueryPattern> {
-    // Lower select list to VarIds
-    let select: Vec<VarId> = subquery
-        .select
+    // Lower select list to VarIds (subqueries support variables only, no
+    // hydration or wildcard)
+    let columns = match &subquery.select {
+        UnresolvedProjection::Tuple(cs) => cs,
+        UnresolvedProjection::Wildcard => {
+            return Err(ParseError::InvalidSelect(
+                "subqueries do not support SELECT *".to_string(),
+            ));
+        }
+        UnresolvedProjection::Scalar(_) => {
+            return Err(ParseError::InvalidSelect(
+                "subqueries do not support scalar select form".to_string(),
+            ));
+        }
+    };
+    let select: Vec<VarId> = columns
         .iter()
-        .map(|var_name| vars.get_or_insert(var_name))
-        .collect();
+        .map(|c| match c {
+            UnresolvedColumn::Var(name) => Ok(vars.get_or_insert(name)),
+            UnresolvedColumn::Hydration(_) => Err(ParseError::InvalidSelect(
+                "hydrations are not allowed inside subqueries".to_string(),
+            )),
+        })
+        .collect::<Result<_>>()?;
 
     // Lower WHERE patterns
     let patterns = lower_unresolved_patterns(&subquery.patterns, encoder, vars, pp_counter)?;
@@ -1063,15 +1095,15 @@ fn lower_construct_template<E: IriEncoder>(
 }
 
 // ============================================================================
-// Graph crawl lowering
+// Hydration lowering
 // ============================================================================
 
-/// Lower an unresolved graph select specification to a resolved GraphSelectSpec
-fn lower_graph_select<E: IriEncoder>(
-    spec: &UnresolvedGraphSelectSpec,
+/// Lower an unresolved graph select specification to a resolved HydrationSpec
+fn lower_hydration<E: IriEncoder>(
+    spec: &UnresolvedHydrationSpec,
     encoder: &E,
     vars: &mut VarRegistry,
-) -> Result<GraphSelectSpec> {
+) -> Result<HydrationSpec> {
     // Handle root - variable or IRI constant
     let root = match &spec.root {
         UnresolvedRoot::Var(name) => {
@@ -1092,95 +1124,102 @@ fn lower_graph_select<E: IriEncoder>(
         }
     };
 
-    // Lower forward selections
-    let selections = spec
-        .selections
-        .iter()
-        .map(|s| lower_selection_spec(s, encoder))
-        .collect::<Result<Vec<_>>>()?;
+    let level = lower_level(&spec.level, encoder)?;
 
-    // Lower reverse selections
-    let mut reverse = std::collections::HashMap::new();
-    for (iri, nested_opt) in &spec.reverse {
-        let sid = encoder
-            .encode_iri(iri)
-            .ok_or_else(|| ParseError::UnknownNamespace(iri.clone()))?;
-        let lowered_nested = nested_opt
-            .as_ref()
-            .map(|nested| lower_nested_select_spec(nested, encoder))
-            .transpose()?;
-        reverse.insert(sid, lowered_nested);
-    }
-
-    Ok(GraphSelectSpec {
+    Ok(HydrationSpec {
         root,
-        selections,
-        reverse,
+        level,
         depth: spec.depth,
-        has_wildcard: spec.has_wildcard,
     })
 }
 
-/// Lower a single selection spec to resolved form
-fn lower_selection_spec<E: IriEncoder>(
-    spec: &UnresolvedSelectionSpec,
+/// Lower one forward item (only meaningful in `Explicit` levels).
+fn lower_forward_item<E: IriEncoder>(
+    item: &UnresolvedForwardItem,
     encoder: &E,
-) -> Result<SelectionSpec> {
-    match spec {
-        UnresolvedSelectionSpec::Id => Ok(SelectionSpec::Id),
-        UnresolvedSelectionSpec::Wildcard => Ok(SelectionSpec::Wildcard),
-        UnresolvedSelectionSpec::Property {
+) -> Result<ForwardItem> {
+    match item {
+        UnresolvedForwardItem::Id => Ok(ForwardItem::Id),
+        UnresolvedForwardItem::Property {
             predicate,
             sub_spec,
         } => {
             let sid = encoder
                 .encode_iri(predicate)
                 .ok_or_else(|| ParseError::UnknownNamespace(predicate.clone()))?;
-
-            // Lower nested spec (includes both forward and reverse)
-            let lowered_sub_spec = sub_spec
+            let lowered_sub = sub_spec
                 .as_ref()
-                .map(|nested| lower_nested_select_spec(nested, encoder))
+                .map(|nested| lower_level_boxed(nested, encoder))
                 .transpose()?;
-
-            Ok(SelectionSpec::Property {
+            Ok(ForwardItem::Property {
                 predicate: sid,
-                sub_spec: lowered_sub_spec,
+                sub_spec: lowered_sub,
             })
         }
     }
 }
 
-/// Lower a nested select spec to resolved form
-fn lower_nested_select_spec<E: IriEncoder>(
-    spec: &UnresolvedNestedSelectSpec,
+/// Lower a reverse map (`predicate IRI -> Option<nested level>`).
+fn lower_reverse_map<E: IriEncoder>(
+    reverse: &std::collections::HashMap<String, Option<Box<UnresolvedNestedSelectSpec>>>,
     encoder: &E,
-) -> Result<Box<NestedSelectSpec>> {
-    // Lower forward selections
-    let forward = spec
-        .forward
-        .iter()
-        .map(|s| lower_selection_spec(s, encoder))
-        .collect::<Result<Vec<_>>>()?;
-
-    // Lower reverse selections (now carries full nested spec, not just forward)
-    let mut reverse = std::collections::HashMap::new();
-    for (iri, nested_opt) in &spec.reverse {
+) -> Result<std::collections::HashMap<Sid, Option<Box<NestedSelectSpec>>>> {
+    let mut out = std::collections::HashMap::new();
+    for (iri, nested_opt) in reverse {
         let sid = encoder
             .encode_iri(iri)
             .ok_or_else(|| ParseError::UnknownNamespace(iri.clone()))?;
-        let lowered_nested = nested_opt
+        let lowered = nested_opt
             .as_ref()
-            .map(|nested| lower_nested_select_spec(nested, encoder))
+            .map(|nested| lower_level_boxed(nested, encoder))
             .transpose()?;
-        reverse.insert(sid, lowered_nested);
+        out.insert(sid, lowered);
     }
+    Ok(out)
+}
 
-    Ok(Box::new(NestedSelectSpec::new(
-        forward,
-        reverse,
-        spec.has_wildcard,
-    )))
+/// Lower one selection level into `NestedSelectSpec`.
+fn lower_level<E: IriEncoder>(
+    spec: &UnresolvedNestedSelectSpec,
+    encoder: &E,
+) -> Result<NestedSelectSpec> {
+    match spec {
+        UnresolvedNestedSelectSpec::Wildcard {
+            refinements,
+            reverse,
+        } => {
+            let mut lowered_refinements = std::collections::HashMap::new();
+            for (iri, nested) in refinements {
+                let sid = encoder
+                    .encode_iri(iri)
+                    .ok_or_else(|| ParseError::UnknownNamespace(iri.clone()))?;
+                lowered_refinements.insert(sid, lower_level_boxed(nested, encoder)?);
+            }
+            Ok(NestedSelectSpec::Wildcard {
+                refinements: lowered_refinements,
+                reverse: lower_reverse_map(reverse, encoder)?,
+            })
+        }
+        UnresolvedNestedSelectSpec::Explicit { forward, reverse } => {
+            let lowered_forward = forward
+                .iter()
+                .map(|item| lower_forward_item(item, encoder))
+                .collect::<Result<Vec<_>>>()?;
+            Ok(NestedSelectSpec::Explicit {
+                forward: lowered_forward,
+                reverse: lower_reverse_map(reverse, encoder)?,
+            })
+        }
+    }
+}
+
+/// Lower a level into a `Box<NestedSelectSpec>` (the form used by sub-specs
+/// inside reverse maps and wildcard refinements).
+fn lower_level_boxed<E: IriEncoder>(
+    spec: &UnresolvedNestedSelectSpec,
+    encoder: &E,
+) -> Result<Box<NestedSelectSpec>> {
+    Ok(Box::new(lower_level(spec, encoder)?))
 }
 
 /// Lower an unresolved filter expression to a resolved Expression
@@ -1653,7 +1692,7 @@ mod tests {
 
         let query = lower_query(ast, &encoder, &mut vars, SelectMode::Many).unwrap();
 
-        assert_eq!(query.output.select_vars().unwrap().len(), 2);
+        assert_eq!(query.output.projected_vars().unwrap().len(), 2);
         assert_eq!(query.patterns.len(), 1);
         assert_eq!(vars.len(), 2);
         assert!(matches!(query.output, QueryOutput::Select { .. }));

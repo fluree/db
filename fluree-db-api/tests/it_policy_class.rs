@@ -135,7 +135,7 @@ async fn policy_class_restricts_ssn_to_own_user() {
 
 /// Test: Policy class allows viewing non-restricted properties
 ///
-/// class-policy-query (in a graph crawl restricts)
+/// class-policy-query (in a expansion restricts)
 #[tokio::test]
 async fn policy_class_allows_non_restricted_properties() {
     assert_index_defaults();

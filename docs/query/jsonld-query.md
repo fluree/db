@@ -42,7 +42,17 @@ When querying via the **CLI**, omitting `@context` causes the ledger's [default 
 
 ### select
 
-Specifies which variables to return in results:
+Specifies what to return in results. The shape of `select` determines the shape of each output row.
+
+**Bare variable** — one column, each row is the bound value (not wrapped in an array):
+
+```json
+{
+  "select": "?name"
+}
+```
+
+**Variable list** — each row is `[v1, v2, ...]`:
 
 ```json
 {
@@ -50,7 +60,7 @@ Specifies which variables to return in results:
 }
 ```
 
-**Wildcard Selection:**
+**Wildcard** — every variable bound in the WHERE clause:
 
 ```json
 {
@@ -58,7 +68,41 @@ Specifies which variables to return in results:
 }
 ```
 
-Returns all variables bound in the query.
+**Subject expansion** — return a nested JSON-LD object instead of a flat row. The key is either a variable (the WHERE clause binds it to subjects) or an IRI constant (the named subject is expanded directly, no WHERE needed):
+
+```json
+{
+  "select": { "?person": ["*", { "schema:knows": ["@id", "schema:name"] }] },
+  "where": { "@id": "?person", "@type": "schema:Person" }
+}
+```
+
+```json
+{
+  "select": { "ex:alice": ["*"] }
+}
+```
+
+The array value is the selection spec — `"*"` for all forward properties, individual property names (`"schema:name"`), or nested object forms for sub-selections. Add `"depth": N` at the query top level to bound auto-expansion of unselected references.
+
+**Mixed array** — combine flat variables and subject expansions in one row, in any order. Each object is an independent expansion with its own root and selection spec:
+
+```json
+{
+  "select": [
+    "?age",
+    { "?person": ["@id", "schema:name"] },
+    { "?org": ["@id", "schema:name"] }
+  ],
+  "where": {
+    "@id": "?person",
+    "ex:age": "?age",
+    "ex:worksFor": "?org"
+  }
+}
+```
+
+Each row is `[age, expanded_person, expanded_org]`. When every column is an IRI-constant expansion (no variable dependency anywhere in `select`), the output is independent of the WHERE solution count: the formatter emits one row regardless of how many solutions the WHERE produced.
 
 ### ask
 

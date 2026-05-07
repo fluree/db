@@ -438,7 +438,7 @@ pub enum Commands {
         #[arg(long, default_value = "table")]
         format: String,
 
-        /// Normalize arrays: always wrap multi-value properties in arrays (graph crawl only)
+        /// Normalize arrays: always wrap multi-value properties in arrays (expansion only)
         #[arg(long)]
         normalize_arrays: bool,
 
