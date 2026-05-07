@@ -29,7 +29,6 @@ Standards and feature-flag reference:
 - JSON-LD specifications
 - W3C standards support
 - Feature flags
-- Experimental features
 - Deprecated features
 
 ### [Graph Identities and Naming](graph-identities.md)

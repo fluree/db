@@ -5,9 +5,6 @@ supports. For conceptual background see
 [Reasoning and inference](../concepts/reasoning.md); for query syntax see
 [Query-time reasoning](../query/reasoning.md).
 
-> **Status:** Reasoning is an **experimental** feature. See
-> [Standards and feature flags](compatibility.md) for how to enable it.
-
 ## Quick orientation
 
 Fluree implements reasoning via two techniques:
