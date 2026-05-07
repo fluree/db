@@ -38,6 +38,11 @@ impl<T> NonEmpty<T> {
     pub fn len(&self) -> usize {
         1 + self.tail.len()
     }
+
+    /// First element. Always present by construction.
+    pub fn first(&self) -> &T {
+        &self.head
+    }
 }
 
 impl<T> From<T> for NonEmpty<T> {
