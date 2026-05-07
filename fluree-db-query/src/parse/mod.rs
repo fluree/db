@@ -192,9 +192,14 @@ fn parse_query_ast_internal(
         parse_select(select, &ctx, &mut query)?;
     }
 
-    // Parse depth parameter and apply to hydration if present
-    if let Some(gs) = query.hydration_mut() {
-        gs.depth = options::parse_depth(obj)?;
+    // Parse depth parameter and apply to every hydration column.
+    if query.has_hydration() {
+        let depth = options::parse_depth(obj)?;
+        for column in query.select.columns_mut() {
+            if let UnresolvedColumn::Hydration(spec) = column {
+                spec.depth = depth;
+            }
+        }
     }
 
     // Parse top-level VALUES (optional) - mirrors the `:values` initial solution seed.
@@ -220,7 +225,7 @@ fn parse_query_ast_internal(
             nested_counter,
             object_var_parsing,
         )?;
-    } else if query.hydration().is_some() {
+    } else if query.has_hydration() {
         // Allowed: hydration-only query with no WHERE.
         // Execution will produce an empty solution set, and hydration formatting will use the root
         // (constant root emits one row; variable root yields no rows).
@@ -535,8 +540,12 @@ fn parse_construct_template(
 /// Supports five forms:
 /// 1. Single string: `"?x"` - single variable selection (unwrap)
 /// 2. Simple array: `["?x", "?y"]` - flat variable selection
-/// 3. Mixed array: `["?age", {"?person": ["*"]}]` - scalar vars + hydration
-/// 4. Single object: `{"?person": ["*"]}` - hydration only
+/// 3. Mixed array: `["?age", {"?person": ["*"]}, {"?org": ["*"]}]` - any
+///    combination of variable and hydration columns, in any order; each
+///    object is an independent hydration with its own root, level, and
+///    depth.
+/// 4. Single object: `{"?person": ["*"]}` - one hydration column (rendered
+///    as a bare object per row rather than a single-element array).
 /// 5. S-expression aggregates: `["?name", "(count ?favNums as ?cnt)"]`
 fn parse_select(
     select: &JsonValue,
@@ -554,7 +563,7 @@ fn parse_select(
                         columns.push(parse_select_string(s, &mut query.options.aggregates)?);
                     }
                     JsonValue::Object(map) => {
-                        let spec = parse_hydration_object(map, ctx, query)?;
+                        let spec = parse_hydration_object(map, ctx)?;
                         columns.push(UnresolvedColumn::Hydration(spec));
                     }
                     _ => {
@@ -570,7 +579,7 @@ fn parse_select(
         // Case 4: Single object form: {"?person": ["*"]} — one hydration
         // column wrapped as a Tuple (SPARQL has no scalar object form).
         JsonValue::Object(map) => {
-            let spec = parse_hydration_object(map, ctx, query)?;
+            let spec = parse_hydration_object(map, ctx)?;
             query.select = UnresolvedProjection::Tuple(vec![UnresolvedColumn::Hydration(spec)]);
         }
 
@@ -818,19 +827,15 @@ fn parse_aggregate_fn_and_input(
     Ok((function, input.to_string()))
 }
 
-/// Parse a hydration object like `{"?person": ["*", {"ex:friend": ["*"]}]}`
+/// Parse a hydration object like `{"?person": ["*", {"ex:friend": ["*"]}]}`.
+///
+/// Multiple hydration objects in one select clause are permitted; each
+/// becomes its own `Column::Hydration` and the formatter dispatches per
+/// column.
 fn parse_hydration_object(
     map: &serde_json::Map<String, JsonValue>,
     ctx: &JsonLdParseCtx,
-    query: &UnresolvedQuery,
 ) -> Result<UnresolvedHydrationSpec> {
-    // Error if we already have a hydration (only one allowed)
-    if query.hydration().is_some() {
-        return Err(ParseError::InvalidSelect(
-            "only one graph-select object allowed per query".to_string(),
-        ));
-    }
-
     // Must have exactly one key
     if map.len() != 1 {
         return Err(ParseError::InvalidSelect(
@@ -3350,6 +3355,118 @@ mod tests {
                 assert_eq!(vsp.metric.as_ref(), "cosine");
             }
             _ => panic!("Expected VectorSearch pattern"),
+        }
+    }
+
+    // ---- multi-hydration parsing ----
+
+    #[test]
+    fn test_parse_two_hydration_columns() {
+        // Two var-rooted hydrations in one select clause.
+        let json = json!({
+            "@context": { "ex": "http://example.org/" },
+            "select": [
+                {"?person": ["*"]},
+                {"?org": ["*", {"ex:member": ["*"]}]}
+            ],
+            "where": {
+                "@id": "?person",
+                "ex:worksFor": "?org"
+            }
+        });
+
+        let (ast, _) = parse_query_ast(&json, None).unwrap();
+        let columns = ast.select.columns();
+        assert_eq!(columns.len(), 2);
+
+        let spec0 = columns[0]
+            .as_hydration()
+            .expect("first column should be a hydration");
+        assert!(matches!(&spec0.root, UnresolvedRoot::Var(v) if v.as_ref() == "?person"));
+
+        let spec1 = columns[1]
+            .as_hydration()
+            .expect("second column should be a hydration");
+        assert!(matches!(&spec1.root, UnresolvedRoot::Var(v) if v.as_ref() == "?org"));
+    }
+
+    #[test]
+    fn test_parse_mixed_var_and_constant_root_hydrations() {
+        // One var-rooted hydration plus one IRI-constant-rooted hydration.
+        let json = json!({
+            "@context": { "ex": "http://example.org/" },
+            "select": [
+                {"?person": ["*"]},
+                {"ex:alice": ["ex:name"]}
+            ],
+            "where": { "@id": "?person", "ex:active": true }
+        });
+
+        let (ast, _) = parse_query_ast(&json, None).unwrap();
+        let columns = ast.select.columns();
+        assert_eq!(columns.len(), 2);
+        assert!(matches!(
+            &columns[0].as_hydration().unwrap().root,
+            UnresolvedRoot::Var(_)
+        ));
+        assert!(matches!(
+            &columns[1].as_hydration().unwrap().root,
+            UnresolvedRoot::Iri(_)
+        ));
+    }
+
+    #[test]
+    fn test_parse_mixes_hydration_with_var_columns() {
+        // Hydration columns interleaved with plain variable columns.
+        let json = json!({
+            "@context": { "ex": "http://example.org/" },
+            "select": [
+                "?age",
+                {"?person": ["*"]},
+                "?title",
+                {"?org": ["*"]}
+            ],
+            "where": {
+                "@id": "?person",
+                "ex:age": "?age",
+                "ex:title": "?title",
+                "ex:worksFor": "?org"
+            }
+        });
+
+        let (ast, _) = parse_query_ast(&json, None).unwrap();
+        let columns = ast.select.columns();
+        assert_eq!(columns.len(), 4);
+        assert_eq!(columns[0].var_name().unwrap(), "?age");
+        assert!(columns[1].as_hydration().is_some());
+        assert_eq!(columns[2].var_name().unwrap(), "?title");
+        assert!(columns[3].as_hydration().is_some());
+    }
+
+    #[test]
+    fn test_depth_option_applies_to_every_hydration_column() {
+        // The query-level `depth` option must reach every hydration spec.
+        let json = json!({
+            "@context": { "ex": "http://example.org/" },
+            "select": [
+                {"?person": ["*"]},
+                {"?org": ["*"]}
+            ],
+            "depth": 2,
+            "where": {
+                "@id": "?person",
+                "ex:worksFor": "?org"
+            }
+        });
+
+        let (ast, _) = parse_query_ast(&json, None).unwrap();
+        let columns = ast.select.columns();
+        assert_eq!(columns.len(), 2);
+        for column in columns {
+            let spec = column
+                .as_hydration()
+                .expect("every column should be a hydration");
+            assert_eq!(spec.depth, 2);
         }
     }
 }

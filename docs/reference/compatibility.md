@@ -179,44 +179,18 @@ To build the server without credential support (faster compile):
 cargo build -p fluree-db-server --no-default-features --features native
 ```
 
-## Runtime Feature Flags
+## Runtime Behavior
 
-### Experimental Features
+Reasoning, SPARQL property paths, and GeoSPARQL functions are always
+available in any build that links the corresponding crate features (see
+the build-time feature tables above). They are not gated behind a runtime
+flag.
 
-Enable experimental features:
-
-```bash
-./fluree-db-server --features experimental
-```
-
-Or in config:
-```toml
-[features]
-experimental = true
-```
-
-**Current Experimental Features:**
-- SPARQL property paths
-- GeoSPARQL support
-- Reasoning and inference
-- Additional DID methods
-
-### Feature-Specific Flags
-
-Enable specific features:
-
-```bash
-./fluree-db-server \
-  --enable-property-paths \
-  --enable-reasoning
-```
-
-```toml
-[features]
-property_paths = true
-reasoning = false
-geosparql = false
-```
+Reasoning is opted into per query (via the `reasoning` parameter or the
+SPARQL `PRAGMA reasoning` directive) or per ledger (via
+`f:reasoningDefaults` in the ledger configuration graph). See
+[Query-time reasoning](../query/reasoning.md) and
+[Setting groups](../ledger-config/setting-groups.md).
 
 ## Parsing Modes
 
@@ -393,11 +367,11 @@ Export Fluree data to:
 - Snowflake integration
 - Elasticsearch integration
 
-### Experimental Status
+### Feature Discovery
 
-Feature availability is currently documented in this compatibility matrix and by
-crate feature flags; the standalone server does not expose a `/features` HTTP
-endpoint.
+Feature availability is documented in this compatibility matrix and by
+crate feature flags; the standalone server does not expose a `/features`
+HTTP endpoint.
 
 ## Browser Support
 

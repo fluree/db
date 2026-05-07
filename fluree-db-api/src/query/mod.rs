@@ -60,7 +60,7 @@ impl std::fmt::Debug for QueryResult {
             .field("batches_len", &self.batches.len())
             .field("has_binary_graph", &self.binary_graph.is_some())
             .field("has_novelty", &self.novelty.is_some())
-            .field("has_hydration", &self.output.hydration().is_some())
+            .field("has_hydration", &self.output.has_hydration())
             .finish()
     }
 }

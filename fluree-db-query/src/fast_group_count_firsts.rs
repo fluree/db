@@ -507,10 +507,23 @@ impl Operator for PredicateObjectCountFirstsOperator {
 
 /// Extract the object prefix `(o_type, o_key)` from a V3 leaflet directory entry's
 /// `first_key` field, interpreted in POST order.
+///
+/// Strips `p_id`. Only meaningful as a bound for rows known to be within the
+/// same predicate range — see [`predicate_qualified_prefix`] for cross-predicate
+/// comparisons.
 #[inline]
 fn prefix_v6_from_entry(entry: &LeafletDirEntryV3) -> (u16, u64) {
     let rec = read_ordered_key_v2(RunSortOrder::Post, &entry.first_key);
     (rec.o_type, rec.o_key)
+}
+
+/// Read the `(p_id, o_type, o_key)` tuple from a V3 leaflet directory entry's
+/// `first_key`, interpreted in POST order. Includes `p_id` so callers can
+/// detect predicate boundaries.
+#[inline]
+fn pid_prefix_v6_from_entry(entry: &LeafletDirEntryV3) -> (u32, u16, u64) {
+    let rec = read_ordered_key_v2(RunSortOrder::Post, &entry.first_key);
+    (rec.p_id, rec.o_type, rec.o_key)
 }
 
 /// Load a V3 leaflet's columns, using the `LeafletCache` when available.
@@ -539,6 +552,12 @@ fn load_v6_batch(
         needed.insert(ColumnId::OKey);
         if entry.o_type_const.is_none() {
             needed.insert(ColumnId::OType);
+        }
+        // Mixed-predicate leaflets need the per-row `p_id` column to verify
+        // each row belongs to the queried predicate; the cached path always
+        // loads all columns, so this is only a concern for the no-cache path.
+        if entry.p_const.is_none() {
+            needed.insert(ColumnId::PId);
         }
         let projection = ColumnProjection {
             output: ColumnSet::EMPTY,
@@ -617,34 +636,82 @@ fn count_bound_object_v6(
         let leaf_id = xxhash_rust::xxh3::xxh3_128(leaf_entry.leaf_cid.to_bytes().as_ref());
 
         for (i, entry) in dir.entries.iter().enumerate() {
-            if entry.row_count == 0 || entry.p_const != Some(p_id) {
+            if entry.row_count == 0 {
                 continue;
+            }
+            // For mixed-predicate leaflets (`p_const = None`) we cannot skip on
+            // p_const alone — the leaflet may still contain rows for our p_id.
+            if let Some(leaflet_p) = entry.p_const {
+                if leaflet_p != p_id {
+                    continue;
+                }
             }
 
             let prefix = prefix_v6_from_entry(entry);
-            if prefix < target_prefix {
-                continue;
-            }
-            if prefix > target_prefix {
-                break;
-            }
-
-            // Boundary-equality: check the next leaflet's first prefix.
-            let next_prefix = if i + 1 < dir.entries.len() {
-                Some(prefix_v6_from_entry(&dir.entries[i + 1]))
+            // The leaflet's rows span `[prefix, next_prefix)` half-open: the
+            // next leaflet's first key is the first row *not* in this leaflet.
+            // (A single key value can spill across leaflet boundaries — both
+            // leaflets then have rows for that value, and the gating below
+            // handles it correctly.)
+            //
+            // POST sorts by `(p_id, o_type, o_key, ...)`. The `(o_type, o_key)`
+            // pair is only a meaningful range bound *within* a single predicate;
+            // when the next leaflet starts a different predicate, its
+            // `(o_type, o_key)` tuple is unrelated to our range and cannot be
+            // used to skip this leaflet. Detect that case and treat next_prefix
+            // as `None` (unknown upper bound) — fall through to row-level scan.
+            let next_full = if i + 1 < dir.entries.len() {
+                Some(pid_prefix_v6_from_entry(&dir.entries[i + 1]))
             } else if leaf_idx + 1 < leaf_range.end {
-                let next_entry = &branch.leaves[leaf_idx + 1].first_key;
-                Some((next_entry.o_type, next_entry.o_key))
+                let next = &branch.leaves[leaf_idx + 1].first_key;
+                Some((next.p_id, next.o_type, next.o_key))
             } else {
                 None
             };
+            let next_prefix = next_full.and_then(|(np_p, np_ot, np_ok)| {
+                if np_p == p_id {
+                    Some((np_ot, np_ok))
+                } else {
+                    None
+                }
+            });
 
-            if next_prefix == Some(target_prefix) {
+            // `prefix` is computed from the leaflet's first row stripped of
+            // `p_id`. For a homogeneous-predicate leaflet (`p_const = Some(p_id)`)
+            // it's a sound sort key for early break, but in a mixed-predicate
+            // leaflet the first row may belong to a *different* predicate — its
+            // `(o_type, o_key)` could exceed `target_prefix` even when later
+            // rows in the leaflet (or in subsequent leaflets) belong to our
+            // predicate and are still on or before `target_prefix`. Restrict
+            // the break to homogeneous leaflets.
+            if prefix > target_prefix && entry.p_const == Some(p_id) {
+                break;
+            }
+            // Skip a leaflet only when it ends strictly before the target —
+            // i.e. the next leaflet's first row (within our predicate) also
+            // sorts before the target. Equality is not enough: this leaflet's
+            // last row can equal target if a key spills across the boundary.
+            if let Some(np) = next_prefix {
+                if np < target_prefix {
+                    continue;
+                }
+            }
+
+            // Boundary-equality fast count: only valid when the leaflet is
+            // entirely target rows for our predicate (it starts at the target
+            // value, the next leaflet also starts at the target value, AND the
+            // leaflet is homogeneous on `p_id`). A mixed-predicate leaflet can
+            // satisfy the first two conditions while still containing rows for
+            // *other* predicates that must be excluded — fall through to the
+            // per-row scan in that case.
+            if prefix == target_prefix
+                && next_prefix == Some(target_prefix)
+                && entry.p_const == Some(p_id)
+            {
                 total += entry.row_count as i64;
                 continue;
             }
 
-            // Decode columns (cached when available).
             let batch = load_v6_batch(
                 &bytes,
                 entry,
@@ -657,6 +724,14 @@ fn count_bound_object_v6(
             )?;
 
             for row in 0..batch.row_count {
+                // For mixed-predicate leaflets we must verify p_id per row —
+                // a `p_const = Some(p_id)` leaflet lets us skip the column read.
+                if entry.p_const.is_none() {
+                    let row_p_id = batch.p_id.get_or(row, 0);
+                    if row_p_id != p_id {
+                        continue;
+                    }
+                }
                 let ot = entry
                     .o_type_const
                     .unwrap_or_else(|| batch.o_type.get_or(row, 0));
@@ -721,24 +796,44 @@ fn group_count_v6(
         let leaf_id = xxhash_rust::xxh3::xxh3_128(leaf_entry.leaf_cid.to_bytes().as_ref());
 
         for (i, entry) in dir.entries.iter().enumerate() {
-            if entry.row_count == 0 || entry.p_const != Some(p_id) {
+            if entry.row_count == 0 {
                 continue;
+            }
+            // Mixed-predicate leaflets (`p_const = None`) may still hold rows
+            // for our predicate; only skip when the leaflet is constant on a
+            // *different* predicate.
+            if let Some(leaflet_p) = entry.p_const {
+                if leaflet_p != p_id {
+                    continue;
+                }
             }
 
             let prefix = prefix_v6_from_entry(entry);
 
-            // Boundary-equality: check if this leaflet is entirely one object value.
-            let next_prefix = if i + 1 < dir.entries.len() {
-                Some(prefix_v6_from_entry(&dir.entries[i + 1]))
+            // Boundary-equality: check the next leaflet's first object key,
+            // but only when it's within the same predicate range — see
+            // `count_bound_object_v6` for the rationale.
+            let next_full = if i + 1 < dir.entries.len() {
+                Some(pid_prefix_v6_from_entry(&dir.entries[i + 1]))
             } else if leaf_idx + 1 < leaf_range.end {
-                let next_entry = &branch.leaves[leaf_idx + 1].first_key;
-                Some((next_entry.o_type, next_entry.o_key))
+                let next = &branch.leaves[leaf_idx + 1].first_key;
+                Some((next.p_id, next.o_type, next.o_key))
             } else {
                 None
             };
+            let next_prefix = next_full.and_then(|(np_p, np_ot, np_ok)| {
+                if np_p == p_id {
+                    Some((np_ot, np_ok))
+                } else {
+                    None
+                }
+            });
 
-            if next_prefix == Some(prefix) {
-                // Entire leaflet is one object value.
+            // Boundary-equality fast count is only sound for homogeneous-
+            // predicate leaflets — a mixed-predicate leaflet may have the
+            // same `(o_type, o_key)` first row as the next leaflet but still
+            // contain rows for *other* predicates that must be excluded.
+            if next_prefix == Some(prefix) && entry.p_const == Some(p_id) {
                 *counts.entry(prefix).or_insert(0) += entry.row_count as i64;
                 continue;
             }
@@ -756,6 +851,16 @@ fn group_count_v6(
             )?;
 
             for row in 0..batch.row_count {
+                // Per-row `p_id` check needed for mixed-predicate leaflets;
+                // the cached path always loads `p_id`, the no-cache path is
+                // configured to load it via `load_v6_batch` when `p_const` is
+                // `None`.
+                if entry.p_const.is_none() {
+                    let row_p_id = batch.p_id.get_or(row, 0);
+                    if row_p_id != p_id {
+                        continue;
+                    }
+                }
                 let ot = entry
                     .o_type_const
                     .unwrap_or_else(|| batch.o_type.get_or(row, 0));
@@ -1080,6 +1185,7 @@ fn build_psot_cursor_for_predicate_group(
                     ctx.runtime_small_dicts,
                     &mut ephemeral_preds,
                     &mut next_ep,
+                    g_id,
                 ) {
                     Ok(op) => ops.push(op),
                     Err(e) => {

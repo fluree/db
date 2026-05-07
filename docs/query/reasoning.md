@@ -5,10 +5,6 @@ background concepts see [Reasoning and inference](../concepts/reasoning.md); for
 the full list of supported OWL/RDFS constructs see the
 [OWL & RDFS reference](../reference/owl-rdfs-support.md).
 
-> **Status:** Reasoning is an **experimental** feature. See
-> [Standards and feature flags](../reference/compatibility.md) for how to
-> enable it.
-
 ## The `reasoning` parameter
 
 Add a `"reasoning"` key to any JSON-LD query to control which inference modes
@@ -210,10 +206,9 @@ combined base + OWL data, and finally RDFS query rewriting is applied.
 ## SPARQL
 
 In SPARQL queries, reasoning is controlled via the Fluree-specific
-`PRAGMA reasoning` directive (syntax may change while the feature is
-experimental). Property paths (`+`, `*`, `^`) provide a complementary
-mechanism for navigating transitive and inverse relationships directly in
-the query pattern — see [SPARQL](sparql.md) for details.
+`PRAGMA reasoning` directive. Property paths (`+`, `*`, `^`) provide a
+complementary mechanism for navigating transitive and inverse relationships
+directly in the query pattern — see [SPARQL](sparql.md) for details.
 
 ## Interaction with ledger configuration
 

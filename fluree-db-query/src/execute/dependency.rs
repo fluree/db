@@ -344,6 +344,34 @@ mod tests {
         assert_eq!(deps.required_where_vars.len(), 1);
     }
 
+    #[test]
+    fn hydration_two_roots_both_added() {
+        // Two hydration columns with distinct variable roots: both root vars
+        // must contribute to required_where_vars so the executor produces
+        // bindings for each.
+        let query = make_query_with_selections(vec![
+            crate::ir::Column::Hydration(crate::ir::HydrationSpec::new(
+                crate::ir::Root::Var(VarId(0)),
+                crate::ir::NestedSelectSpec::Explicit {
+                    forward: vec![],
+                    reverse: std::collections::HashMap::new(),
+                },
+            )),
+            crate::ir::Column::Hydration(crate::ir::HydrationSpec::new(
+                crate::ir::Root::Var(VarId(1)),
+                crate::ir::NestedSelectSpec::Explicit {
+                    forward: vec![],
+                    reverse: std::collections::HashMap::new(),
+                },
+            )),
+        ]);
+
+        let deps = compute_variable_deps(&query, &QueryOptions::default()).unwrap();
+        assert!(deps.required_where_vars.contains(&VarId(0)));
+        assert!(deps.required_where_vars.contains(&VarId(1)));
+        assert_eq!(deps.required_where_vars.len(), 2);
+    }
+
     // ---- per-operator pipeline deps tests ----
 
     #[test]

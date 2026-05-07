@@ -31,7 +31,7 @@
 //! even though chunk parsing is parallel.
 
 use crate::error::ApiError;
-use fluree_db_core::{ContentId, ContentKind, ContentStore, Storage};
+use fluree_db_core::{ContentId, ContentKind, ContentStore, RemoteObject, Storage, StorageRead};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -445,29 +445,113 @@ impl From<fluree_db_core::Error> for ImportError {
 }
 
 // ============================================================================
+// Remote source types
+// ============================================================================
+
+/// How to enumerate objects in a remote `StorageRead` source.
+///
+/// `OrderedObjects` is recommended for production because the caller controls
+/// commit ordering exactly. `Prefix` lists addresses lexicographically and
+/// is convenient for ad-hoc imports.
+#[derive(Debug, Clone)]
+pub enum RemoteSource {
+    /// Caller-supplied ordered list of objects to import. Production-recommended.
+    OrderedObjects(Vec<RemoteObject>),
+    /// Lex-sorted prefix listing via `StorageRead::list_prefix_with_metadata`.
+    Prefix { prefix: String },
+}
+
+/// Where the import driver pulls bytes from.
+pub(crate) enum ImportSource {
+    Local(PathBuf),
+    Remote {
+        storage: Arc<dyn StorageRead>,
+        source: RemoteSource,
+    },
+}
+
+/// Format of an individual remote object, derived from its extension.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RemoteFormat {
+    Ttl,
+    Trig,
+    JsonLd,
+}
+
+/// `(chunk_index, raw_bytes)` payload sent from the remote producer to parser workers.
+type RemoteChunk = (usize, Vec<u8>);
+
+type RemoteChunkRx = Arc<std::sync::Mutex<std::sync::mpsc::Receiver<RemoteChunk>>>;
+
+/// Bridge handle for the remote-fetch pipeline: workers receive whole-object
+/// payloads from `rx`, the producer task is owned by `_producer_task`, and
+/// final completion (or producer error) is signaled via `error_rx`.
+///
+/// **EOF semantics:** `rx` closing alone does NOT mean "import finished
+/// successfully" — the import driver must await `error_rx` after parsers
+/// exit to distinguish clean completion from producer failure.
+pub struct RemoteChunkProducer {
+    pub(crate) rx: RemoteChunkRx,
+    /// Take-once handles, accessible through `&self` via Mutex<Option<_>>.
+    /// `error_rx` carries `Some(err)` on producer failure, `None` on success.
+    pub(crate) error_rx:
+        std::sync::Mutex<Option<tokio::sync::oneshot::Receiver<Option<ImportError>>>>,
+    pub(crate) bridge_handle: std::sync::Mutex<Option<std::thread::JoinHandle<()>>>,
+    pub(crate) estimated_count: usize,
+    /// Per-object format, indexed by chunk_idx. Chunks arrive in the producer's
+    /// input order, so chunk_idx == position in this vec.
+    pub(crate) per_chunk_format: Vec<RemoteFormat>,
+}
+
+impl RemoteChunkProducer {
+    fn format_at(&self, idx: usize) -> Option<RemoteFormat> {
+        self.per_chunk_format.get(idx).copied()
+    }
+
+    /// True iff every chunk in this producer is `.ttl` (the parallel hot path).
+    fn all_ttl(&self) -> bool {
+        self.per_chunk_format
+            .iter()
+            .all(|f| matches!(f, RemoteFormat::Ttl))
+    }
+
+    fn has_jsonld(&self) -> bool {
+        self.per_chunk_format
+            .iter()
+            .any(|f| matches!(f, RemoteFormat::JsonLd))
+    }
+}
+
+// ============================================================================
 // ChunkSource
 // ============================================================================
 
 /// Abstraction over the source of import chunks.
 ///
-/// Either a set of pre-split files (index-based access), or a streaming reader
-/// for a single large Turtle file (channel-based, no pre-scan).
+/// Three shapes:
+/// - `Files`: pre-split local files, index-based access.
+/// - `Streaming`: a single large local Turtle file, channel-fed by a background reader.
+/// - `Remote`: a directory of remote objects, channel-fed by an async producer task.
 pub enum ChunkSource {
     /// Pre-split Turtle/TriG/JSON-LD files from a directory (sorted lexicographically).
     Files(Vec<PathBuf>),
     /// Streaming reader for a single large Turtle file. Chunks are emitted
     /// through a channel as the file is read — no full pre-scan needed.
     Streaming(fluree_graph_turtle::splitter::StreamingTurtleReader),
+    /// Remote-fetched whole objects (one chunk per object). Each object's
+    /// prelude is auto-extracted at parse time, mirroring the local `Files` path.
+    Remote(RemoteChunkProducer),
 }
 
 impl ChunkSource {
     /// Estimated number of chunks.
     ///
-    /// Exact for `Files`, estimated for `Streaming` (file_size / chunk_size).
+    /// Exact for `Files` and `Remote`, estimated for `Streaming` (file_size / chunk_size).
     pub fn estimated_len(&self) -> usize {
         match self {
             Self::Files(files) => files.len(),
             Self::Streaming(reader) => reader.estimated_chunk_count(),
+            Self::Remote(producer) => producer.estimated_count,
         }
     }
 
@@ -476,14 +560,19 @@ impl ChunkSource {
         matches!(self, Self::Streaming(_))
     }
 
+    /// Whether this is a remote channel-fed source.
+    pub fn is_remote(&self) -> bool {
+        matches!(self, Self::Remote(_))
+    }
+
     /// Read chunk at `index` as a String (only for `Files` variant).
     ///
-    /// Panics if called on `Streaming` — use `recv_next` instead.
+    /// Panics if called on `Streaming`/`Remote` — use `recv_next` instead.
     pub fn read_chunk(&self, index: usize) -> std::io::Result<String> {
         match self {
             Self::Files(files) => std::fs::read_to_string(&files[index]),
-            Self::Streaming(_) => {
-                panic!("read_chunk not supported for streaming source; use recv_next")
+            Self::Streaming(_) | Self::Remote(_) => {
+                panic!("read_chunk not supported for channel-fed source; use recv_next")
             }
         }
     }
@@ -513,8 +602,8 @@ impl ChunkSource {
                     None => Ok(None),
                 }
             }
-            Self::Files(_) => {
-                panic!("recv_next not supported for file-based source; use read_chunk")
+            Self::Files(_) | Self::Remote(_) => {
+                panic!("recv_next not supported for this source variant")
             }
         }
     }
@@ -528,6 +617,7 @@ impl ChunkSource {
                 .and_then(|ext| ext.to_str())
                 .is_some_and(|ext| ext.eq_ignore_ascii_case("trig")),
             Self::Streaming(_) => false, // Streaming is Turtle only.
+            Self::Remote(producer) => matches!(producer.format_at(index), Some(RemoteFormat::Trig)),
         }
     }
 
@@ -540,6 +630,9 @@ impl ChunkSource {
                 .and_then(|ext| ext.to_str())
                 .is_some_and(|ext| ext.eq_ignore_ascii_case("jsonld")),
             Self::Streaming(_) => false,
+            Self::Remote(producer) => {
+                matches!(producer.format_at(index), Some(RemoteFormat::JsonLd))
+            }
         }
     }
 
@@ -554,6 +647,7 @@ impl ChunkSource {
                     .is_some_and(|ext| ext.eq_ignore_ascii_case("jsonld"))
             }),
             Self::Streaming(_) => false,
+            Self::Remote(producer) => producer.has_jsonld(),
         }
     }
 }
@@ -631,6 +725,189 @@ fn resolve_chunk_source(
     }
 }
 
+/// Resolve a remote source (`OrderedObjects` or `Prefix`) into a list of
+/// `RemoteObject`s, sorted lex by address for `Prefix` mode.
+///
+/// Returns the accepted objects and their per-chunk formats (parallel to
+/// the objects vec). Rejects mixing Turtle (`.ttl`/`.trig`) with JSON-LD
+/// (`.jsonld`), mirroring the local `scan_directory_format` rule.
+async fn resolve_remote_objects(
+    storage: &Arc<dyn StorageRead>,
+    source: &RemoteSource,
+) -> std::result::Result<(Vec<RemoteObject>, Vec<RemoteFormat>), ImportError> {
+    let all_objects = match source {
+        RemoteSource::OrderedObjects(objs) => objs.clone(),
+        RemoteSource::Prefix { prefix } => {
+            let mut listed = storage
+                .list_prefix_with_metadata(prefix)
+                .await
+                .map_err(|e| {
+                    ImportError::Storage(format!(
+                        "list_prefix_with_metadata({prefix:?}) failed: {e}; \
+                     backend may not support metadata listing — \
+                     use RemoteSource::OrderedObjects to supply addresses+sizes directly"
+                    ))
+                })?;
+            listed.sort_by(|a, b| a.address.cmp(&b.address));
+            listed
+        }
+    };
+
+    if all_objects.is_empty() {
+        return Err(ImportError::NoChunks(
+            "remote source contains no objects".to_string(),
+        ));
+    }
+
+    // Detect format by extension (mirrors local discover_chunks rules).
+    // Turtle-family (.ttl/.trig) and JSON-LD must not be mixed in a single import.
+    let mut has_ttl = false;
+    let mut has_trig = false;
+    let mut has_jsonld = false;
+    let mut accepted: Vec<RemoteObject> = Vec::with_capacity(all_objects.len());
+    let mut extensions: Vec<RemoteFormat> = Vec::with_capacity(all_objects.len());
+    for obj in all_objects {
+        let ext = std::path::Path::new(&obj.address)
+            .extension()
+            .and_then(|e| e.to_str())
+            .map(str::to_ascii_lowercase);
+        match ext.as_deref() {
+            Some("ttl") => {
+                has_ttl = true;
+                accepted.push(obj);
+                extensions.push(RemoteFormat::Ttl);
+            }
+            Some("trig") => {
+                has_trig = true;
+                accepted.push(obj);
+                extensions.push(RemoteFormat::Trig);
+            }
+            Some("jsonld") => {
+                has_jsonld = true;
+                accepted.push(obj);
+                extensions.push(RemoteFormat::JsonLd);
+            }
+            _ => {
+                // Skip non-data files silently (mirrors local behavior).
+            }
+        }
+    }
+
+    let has_turtle_family = has_ttl || has_trig;
+    if has_turtle_family && has_jsonld {
+        return Err(ImportError::MixedFormats(
+            "remote source contains both Turtle (.ttl/.trig) and JSON-LD (.jsonld) objects; \
+             use a single format family per import"
+                .into(),
+        ));
+    }
+
+    if accepted.is_empty() {
+        return Err(ImportError::NoChunks(
+            "remote source contains no .ttl/.trig/.jsonld objects".into(),
+        ));
+    }
+
+    // `.trig` import is wired through the same serial path the local
+    // `.import(dir)` uses, but that path has a documented upstream limitation
+    // in `import_trig_commit` (fluree-db-transact/src/import.rs): the Tier 2
+    // spool/index pipeline does not fully capture TriG content. Imported TriG
+    // data may not become queryable. Fail loud rather than silently producing
+    // a half-imported ledger.
+    if has_trig {
+        return Err(ImportError::NoChunks(
+            "remote .trig import is not currently supported: the Tier 2 import \
+             pipeline does not fully capture named-graph or default-graph TriG \
+             content, so imported data may not become queryable. Convert TriG \
+             to .ttl or .jsonld before import. See `import_trig_commit` in \
+             fluree-db-transact/src/import.rs for context."
+                .into(),
+        ));
+    }
+
+    Ok((accepted, extensions))
+}
+
+/// Spawn the async producer task + bridge thread for a remote source.
+///
+/// Producer task: runs on the current tokio runtime, fetches each object
+/// via `StorageRead::read_bytes` in order, sends `(idx, bytes)` into a
+/// bounded tokio channel. On error, sends the error to `error_tx` and
+/// drops the channel.
+///
+/// Bridge thread: blocking_recv from tokio channel, forwards to a
+/// `std::sync::mpsc::SyncSender` that parser workers drain. This keeps
+/// parser workers entirely off the tokio runtime (no `block_on`).
+fn spawn_remote_producer(
+    storage: Arc<dyn StorageRead>,
+    objects: Vec<RemoteObject>,
+    per_chunk_format: Vec<RemoteFormat>,
+    in_flight: usize,
+) -> RemoteChunkProducer {
+    let estimated_count = objects.len();
+    debug_assert_eq!(estimated_count, per_chunk_format.len());
+    let in_flight = in_flight.max(1);
+
+    // tokio mpsc — async producer side.
+    let (tokio_tx, mut tokio_rx) = tokio::sync::mpsc::channel::<(usize, Vec<u8>)>(in_flight);
+    // std mpsc — sync worker side. Capacity 2 (small handoff buffer; tokio
+    // channel is the real backpressure knob).
+    let (std_tx, std_rx) = std::sync::mpsc::sync_channel::<(usize, Vec<u8>)>(2);
+    let (error_tx, error_rx) = tokio::sync::oneshot::channel::<Option<ImportError>>();
+
+    // Producer task — async on tokio.
+    tokio::spawn(async move {
+        for (idx, obj) in objects.into_iter().enumerate() {
+            let bytes = match storage.read_bytes(&obj.address).await {
+                Ok(b) => b,
+                Err(e) => {
+                    let _ = error_tx.send(Some(ImportError::Storage(format!(
+                        "remote read failed for {} ({} bytes expected): {e}",
+                        obj.address, obj.size_bytes
+                    ))));
+                    return;
+                }
+            };
+            // Sanity check vs reported size — log on mismatch but continue.
+            if obj.size_bytes != 0 && bytes.len() as u64 != obj.size_bytes {
+                tracing::warn!(
+                    address = %obj.address,
+                    expected = obj.size_bytes,
+                    actual = bytes.len(),
+                    "remote object size differs from listing metadata"
+                );
+            }
+            if tokio_tx.send((idx, bytes)).await.is_err() {
+                // Bridge dropped — pipeline aborted upstream. Exit cleanly.
+                let _ = error_tx.send(None);
+                return;
+            }
+        }
+        // Normal EOF: signal success.
+        let _ = error_tx.send(None);
+    });
+
+    // Bridge thread — blocking_recv → sync channel.
+    let bridge_handle = std::thread::Builder::new()
+        .name("ttl-remote-bridge".into())
+        .spawn(move || {
+            while let Some(payload) = tokio_rx.blocking_recv() {
+                if std_tx.send(payload).is_err() {
+                    break;
+                }
+            }
+        })
+        .expect("spawn remote bridge thread");
+
+    RemoteChunkProducer {
+        rx: Arc::new(std::sync::Mutex::new(std_rx)),
+        error_rx: std::sync::Mutex::new(Some(error_rx)),
+        bridge_handle: std::sync::Mutex::new(Some(bridge_handle)),
+        estimated_count,
+        per_chunk_format,
+    }
+}
+
 // ============================================================================
 // Builder
 // ============================================================================
@@ -651,7 +928,7 @@ fn resolve_chunk_source(
 pub struct ImportBuilder<'a> {
     fluree: &'a super::Fluree,
     ledger_id: String,
-    import_path: PathBuf,
+    source: ImportSource,
     config: ImportConfig,
 }
 
@@ -660,7 +937,21 @@ impl<'a> ImportBuilder<'a> {
         Self {
             fluree,
             ledger_id,
-            import_path,
+            source: ImportSource::Local(import_path),
+            config: ImportConfig::default(),
+        }
+    }
+
+    pub(crate) fn new_remote(
+        fluree: &'a super::Fluree,
+        ledger_id: String,
+        storage: Arc<dyn StorageRead>,
+        source: RemoteSource,
+    ) -> Self {
+        Self {
+            fluree,
+            ledger_id,
+            source: ImportSource::Remote { storage, source },
             config: ImportConfig::default(),
         }
     }
@@ -776,7 +1067,7 @@ impl<'a> ImportBuilder<'a> {
             &storage,
             self.fluree.publisher()?,
             &self.ledger_id,
-            &self.import_path,
+            self.source,
             &self.config,
         )
         .await
@@ -806,6 +1097,35 @@ impl<'a> CreateBuilder<'a> {
     /// (sorted lexicographically), or a single `.ttl`/`.jsonld` file.
     pub fn import(self, path: impl AsRef<Path>) -> ImportBuilder<'a> {
         ImportBuilder::new(self.fluree, self.ledger_id, path.as_ref().to_path_buf())
+    }
+
+    /// Attach a bulk import that streams source bytes from a remote
+    /// `StorageRead` backend (e.g. S3) instead of local disk.
+    ///
+    /// Each remote object is fetched whole into memory by an async producer
+    /// task and parsed by the existing pipeline — no input is staged to
+    /// local disk. **Scratch (spool/runs/index) still uses local disk** under
+    /// `FLUREE_IMPORT_DIR`; size your runtime accordingly.
+    ///
+    /// Supports either all-`.ttl` or all-`.jsonld` per import. Pure `.ttl`
+    /// imports take a parallel parser pool; `.jsonld` takes a serial path —
+    /// same as the local fallback — because the JSON-LD parser does not
+    /// parallelize across chunks. Mixing `.ttl` with `.jsonld` in a single
+    /// import is rejected, matching the local `.import` rule.
+    ///
+    /// `.trig` is currently rejected with an explicit error: the underlying
+    /// TriG-via-import path has a known upstream limitation (named-graph
+    /// flakes are not captured by the Tier 2 spool pipeline, and even
+    /// default-graph TriG content does not become queryable). When that
+    /// upstream issue is resolved, `.trig` will be enabled here without
+    /// further API changes — the serial remote arm already dispatches it
+    /// correctly.
+    pub fn import_from_storage(
+        self,
+        storage: Arc<dyn StorageRead>,
+        source: RemoteSource,
+    ) -> ImportBuilder<'a> {
+        ImportBuilder::new_remote(self.fluree, self.ledger_id, storage, source)
     }
 }
 
@@ -915,7 +1235,7 @@ async fn run_import_pipeline<S>(
     storage: &S,
     nameservice: &dyn crate::NameServicePublisher,
     alias: &str,
-    import_path: &Path,
+    import_source: ImportSource,
     config: &ImportConfig,
 ) -> std::result::Result<ImportResult, ImportError>
 where
@@ -927,14 +1247,59 @@ where
     async {
         // ---- Log effective settings and resolve chunk source ----
         config.log_effective_settings();
-        let chunk_source = resolve_chunk_source(import_path, config)?;
-        let estimated_total = chunk_source.estimated_len();
-        tracing::info!(
-            estimated_chunks = estimated_total,
-            streaming = chunk_source.is_streaming(),
-            path = %import_path.display(),
-            "resolved import chunks"
-        );
+        let chunk_source = match &import_source {
+            ImportSource::Local(path) => {
+                let cs = resolve_chunk_source(path, config)?;
+                tracing::info!(
+                    estimated_chunks = cs.estimated_len(),
+                    streaming = cs.is_streaming(),
+                    path = %path.display(),
+                    "resolved import chunks"
+                );
+                cs
+            }
+            ImportSource::Remote { storage, source } => {
+                let (objects, per_chunk_format) = resolve_remote_objects(storage, source).await?;
+                let count = objects.len();
+                let total_bytes: u64 = objects.iter().map(|o| o.size_bytes).sum();
+                let in_flight = config.effective_max_inflight();
+
+                // Each remote object is fetched whole into memory by the
+                // producer (MVP does not split single objects via byte-range).
+                // Warn if any object exceeds the configured chunk size — peak
+                // memory will be `largest_object × in_flight`.
+                let chunk_size_bytes = config.effective_chunk_size_mb() as u64 * 1024 * 1024;
+                if let Some(largest) = objects.iter().max_by_key(|o| o.size_bytes) {
+                    if largest.size_bytes > chunk_size_bytes {
+                        tracing::warn!(
+                            address = %largest.address,
+                            size_mb = largest.size_bytes / (1024 * 1024),
+                            chunk_size_mb = config.effective_chunk_size_mb(),
+                            in_flight,
+                            "remote object exceeds configured chunk size; \
+                             single-object byte-range splitting is not yet \
+                             supported — object will be materialized whole. \
+                             Pre-split large objects or raise chunk_size_mb \
+                             to silence this warning."
+                        );
+                    }
+                }
+
+                let producer = spawn_remote_producer(
+                    Arc::clone(storage),
+                    objects,
+                    per_chunk_format,
+                    in_flight,
+                );
+                tracing::info!(
+                    estimated_chunks = count,
+                    total_bytes,
+                    in_flight,
+                    "resolved remote import chunks"
+                );
+                ChunkSource::Remote(producer)
+            }
+        };
 
         // ---- Phase 1: Create ledger (init nameservice) ----
         let normalized_alias = fluree_db_core::ledger_id::normalize_ledger_id(alias)
@@ -1484,6 +1849,17 @@ where
     }
 
     let is_streaming = chunk_source.is_streaming();
+    let is_remote = chunk_source.is_remote();
+    // Remote takes the parallel TTL hot path only when every object is `.ttl`.
+    // Otherwise it falls into a serial remote arm that handles `.trig` /
+    // `.jsonld` per-chunk, mirroring the local serial fallback.
+    let remote_all_ttl = match &**chunk_source {
+        ChunkSource::Remote(producer) => producer.all_ttl(),
+        _ => false,
+    };
+    let is_remote_parallel = is_remote && remote_all_ttl;
+    let is_remote_serial = is_remote && !remote_all_ttl;
+    let is_channel_fed = is_streaming || is_remote_parallel;
     let estimated_total = chunk_source.estimated_len();
     let compress = config.compress_commits;
     let num_threads = config.parse_threads;
@@ -1492,9 +1868,9 @@ where
 
     // ---- Inflight permit channel (memory budget enforcement) ----
     // For Files mode: limits the number of chunk texts materialized in memory.
-    // For Streaming mode: backpressure is handled by the bounded channel in
-    // StreamingTurtleReader, so permits are not needed.
-    let (permit_tx, permit_rx) = if !is_streaming {
+    // For Streaming/Remote modes: backpressure is handled by the bounded channel
+    // in the producer (StreamingTurtleReader / remote bridge), so permits are not needed.
+    let (permit_tx, permit_rx) = if !is_channel_fed {
         let max_inflight = config.effective_max_inflight();
         let (tx, rx) = std::sync::mpsc::sync_channel::<()>(max_inflight);
         for _ in 0..max_inflight {
@@ -1873,6 +2249,279 @@ where
         tracing::info!(
             committed_chunks = next_expected,
             "streaming import phase complete"
+        );
+    } else if is_remote_parallel {
+        // Remote parallel path (all-`.ttl` remote): workers receive whole-object
+        // payloads from a producer task (async tokio fetch) bridged into a sync
+        // channel by a small forwarder thread. Workers parse with auto-extracted
+        // per-chunk prelude (each remote object is a self-contained file with
+        // its own header) — same parser semantics as the local `Files` path,
+        // but bytes arrive via channel instead of disk read.
+        //
+        // The remote arm always uses at least one parser worker — zero workers
+        // would mean the bridge thread blocks forever sending into an unread
+        // channel.
+        let num_threads = num_threads.max(1);
+        let ledger = alias.to_string();
+
+        let (remote_rx, error_rx, bridge_handle) = match &**chunk_source {
+            ChunkSource::Remote(producer) => {
+                let error_rx = producer.error_rx.lock().unwrap().take().ok_or_else(|| {
+                    ImportError::Transact(
+                        "remote producer error_rx already taken (import re-entered?)".into(),
+                    )
+                })?;
+                let bridge = producer.bridge_handle.lock().unwrap().take();
+                (Arc::clone(&producer.rx), error_rx, bridge)
+            }
+            _ => unreachable!("is_remote guard"),
+        };
+
+        // One slot per worker is sufficient (same logic as streaming arm).
+        let (result_tx, result_rx) = std::sync::mpsc::sync_channel::<
+            std::result::Result<(usize, ParsedChunk), String>,
+        >(num_threads);
+
+        let mut parse_handles = Vec::with_capacity(num_threads);
+        for thread_idx in 0..num_threads {
+            let work_rx = Arc::clone(&remote_rx);
+            let result_tx = result_tx.clone();
+            let shared_alloc = Arc::clone(&shared_alloc);
+            let ledger = ledger.clone();
+            let spool_dir = spool_dir.clone();
+            let spool_config = Arc::clone(&spool_config);
+
+            let handle = std::thread::Builder::new()
+                .name(format!("ttl-remote-parser-{thread_idx}"))
+                .spawn(move || {
+                    let ctx = ParseChunkContext {
+                        shared_alloc: &shared_alloc,
+                        // Remote objects are whole files with embedded preludes —
+                        // parse_chunk extracts prelude per-chunk.
+                        prelude: None,
+                        ledger: &ledger,
+                        compress,
+                        spool_dir: &spool_dir,
+                        spool_config: &spool_config,
+                    };
+                    loop {
+                        let (idx, raw_bytes) = match work_rx.lock().unwrap().recv() {
+                            Ok(payload) => payload,
+                            Err(_) => break, // Bridge dropped — channel closed.
+                        };
+
+                        let ttl = match String::from_utf8(raw_bytes) {
+                            Ok(s) => s,
+                            Err(e) => {
+                                let _ =
+                                    result_tx.send(Err(format!("chunk {idx} invalid UTF-8: {e}")));
+                                break;
+                            }
+                        };
+
+                        let t = (idx + 1) as i64;
+                        match parse_ttl_chunk(&ttl, &ctx, t, idx) {
+                            Ok(parsed) => {
+                                if result_tx.send(Ok((idx, parsed))).is_err() {
+                                    break;
+                                }
+                            }
+                            Err(e) => {
+                                let _ =
+                                    result_tx.send(Err(format!("parse chunk {idx} failed: {e}")));
+                                break;
+                            }
+                        }
+                    }
+                })
+                .map_err(|e| ImportError::Transact(format!("spawn parser: {e}")))?;
+
+            parse_handles.push(handle);
+        }
+        drop(result_tx); // main thread's copy
+
+        let next_expected = commit_parsed_chunks_in_order(
+            result_rx,
+            &commit_env,
+            &mut state,
+            &mut published_codes,
+            compute_ns_delta,
+            &mut sort_write_handles,
+            &mut total_commit_size,
+            &mut commit_metas,
+        )
+        .await?;
+
+        for handle in parse_handles {
+            handle.join().expect("parse thread panicked");
+        }
+        if let Some(bridge) = bridge_handle {
+            bridge.join().expect("remote bridge thread panicked");
+        }
+
+        // CRITICAL: distinguish clean EOF from producer failure.
+        // Channel closing alone is not sufficient — a producer crash also
+        // closes the channel, but means partial import.
+        match error_rx.await {
+            Ok(None) => {
+                // Producer reported success.
+            }
+            Ok(Some(err)) => return Err(err),
+            Err(_) => {
+                return Err(ImportError::Storage(
+                    "remote producer task dropped without signaling completion".into(),
+                ));
+            }
+        }
+
+        tracing::info!(
+            committed_chunks = next_expected,
+            "remote import phase complete"
+        );
+    } else if is_remote_serial {
+        // Remote serial path: producer fetches each object whole; we drain
+        // the channel one chunk at a time and dispatch to the format-specific
+        // parser (`import_trig_commit` for `.trig`, `parse_jsonld_chunk` for
+        // `.jsonld`, `parse_chunk` otherwise). Mirrors the local serial
+        // fallback below — the only difference is `recv()` vs `read_chunk(i)`.
+        //
+        // This path is used whenever the remote source contains any `.trig`
+        // or `.jsonld` objects. Performance is single-threaded by design
+        // (TriG/JSON-LD parsers do not parallelize across chunks today).
+        let (remote_rx, error_rx, bridge_handle) = match &**chunk_source {
+            ChunkSource::Remote(producer) => {
+                let error_rx = producer.error_rx.lock().unwrap().take().ok_or_else(|| {
+                    ImportError::Transact(
+                        "remote producer error_rx already taken (import re-entered?)".into(),
+                    )
+                })?;
+                let bridge = producer.bridge_handle.lock().unwrap().take();
+                (Arc::clone(&producer.rx), error_rx, bridge)
+            }
+            _ => unreachable!("is_remote_serial guard"),
+        };
+
+        let mut next_expected: i64 = 0;
+        loop {
+            let (idx, raw_bytes) = match remote_rx.lock().unwrap().recv() {
+                Ok(payload) => payload,
+                Err(_) => break, // Channel closed — bridge thread exited.
+            };
+
+            let content = String::from_utf8(raw_bytes)
+                .map_err(|e| ImportError::Transact(format!("chunk {idx} invalid UTF-8: {e}")))?;
+            let t = (idx + 1) as i64;
+
+            let result = if chunk_source.is_trig(idx) {
+                let r = import_trig_commit(
+                    &mut state,
+                    &content,
+                    storage,
+                    alias,
+                    compress,
+                    Some(&spool_dir),
+                    Some(&spool_config),
+                    idx,
+                )
+                .await
+                .map_err(|e| ImportError::Transact(e.to_string()))?;
+                shared_alloc
+                    .sync_from_registry(&state.ns_registry)
+                    .map_err(|e| ImportError::Transact(format!("namespace sync conflict: {e}")))?;
+                published_codes.extend(state.ns_registry.all_codes());
+                r
+            } else {
+                let parsed = if chunk_source.is_jsonld(idx) {
+                    parse_jsonld_chunk(
+                        &content,
+                        &shared_alloc,
+                        t,
+                        alias,
+                        compress,
+                        Some(&spool_dir),
+                        Some(&spool_config),
+                        idx,
+                    )
+                } else {
+                    parse_chunk(
+                        &content,
+                        &shared_alloc,
+                        t,
+                        alias,
+                        compress,
+                        Some(&spool_dir),
+                        Some(&spool_config),
+                        idx,
+                    )
+                }
+                .map_err(|e| ImportError::Transact(e.to_string()))?;
+
+                let ns_delta = compute_ns_delta(&parsed.new_codes, &mut published_codes);
+                finalize_parsed_chunk(&mut state, parsed, ns_delta, storage, alias)
+                    .await
+                    .map_err(|e| ImportError::Transact(e.to_string()))?
+            };
+
+            // Collect txn-meta for this commit.
+            {
+                let previous_commit_hex = commit_metas.last().map(|m| m.commit_hash_hex.clone());
+                commit_metas.push(CommitMeta {
+                    commit_hash_hex: result.commit_id.digest_hex(),
+                    t: result.t,
+                    blob_bytes: result.blob_bytes,
+                    flake_count: result.flake_count,
+                    time_epoch_ms: import_time_epoch_ms,
+                    previous_commit_hex,
+                });
+            }
+
+            if let Some(sr) = result.spool_result {
+                spawn_sorted_commit_write(
+                    &mut sort_write_handles,
+                    &sort_write_semaphore,
+                    &vocab_dir,
+                    &spool_dir,
+                    rdf_type_p_id,
+                    &spool_config.datatype_alloc,
+                    sr,
+                )
+                .await;
+            }
+            total_commit_size += result.blob_bytes as u64;
+            next_expected = result.t;
+
+            config.emit_progress(ImportPhase::Committing {
+                chunk: idx + 1,
+                total: estimated_total,
+                cumulative_flakes: state.cumulative_flakes,
+                elapsed_secs: run_start.elapsed().as_secs_f64(),
+            });
+            if config.publish_every > 0 && (idx + 1).is_multiple_of(config.publish_every) {
+                nameservice
+                    .publish_commit(alias, result.t, &result.commit_id)
+                    .await
+                    .map_err(|e| ImportError::Storage(e.to_string()))?;
+            }
+        }
+
+        if let Some(bridge) = bridge_handle {
+            bridge.join().expect("remote bridge thread panicked");
+        }
+
+        // Producer error vs clean EOF — same protocol as the parallel arm.
+        match error_rx.await {
+            Ok(None) => {}
+            Ok(Some(err)) => return Err(err),
+            Err(_) => {
+                return Err(ImportError::Storage(
+                    "remote producer task dropped without signaling completion".into(),
+                ));
+            }
+        }
+
+        tracing::info!(
+            committed_chunks = next_expected,
+            "remote serial import phase complete"
         );
     } else {
         // File-based path: index-based access to chunk files.

@@ -1611,10 +1611,6 @@ async fn execute_sparql_update_request(
         }
     };
 
-    // Get namespace registry from the ledger's snapshot
-    let cached_state = handle.snapshot().await;
-    let mut ns = NamespaceRegistry::from_db(&cached_state.snapshot);
-
     // Resolve the effective identity honoring the root-impersonation semantic.
     // For SPARQL UPDATE, impersonation is driven by the `fluree-identity` header
     // (there is no body-level opts block). Policy-class / policy / policy-values
@@ -1628,14 +1624,6 @@ async fn execute_sparql_update_request(
     )
     .await;
 
-    // TxnOpts no longer carries identity — provenance flows via CommitOpts.
-    let txn_opts = TxnOpts::default();
-
-    // Build PolicyContext from the resolved identity plus all header-supplied
-    // policy fields. SPARQL UPDATE has no body opts block, so headers are the
-    // only transport for `policy-class`, `policy`, `policy-values`, and
-    // `default-allow`. The impersonation gate above already constrained the
-    // identity; the additional fields here apply on top.
     let policy_values_map = match headers.policy_values_map() {
         Ok(v) => v,
         Err(e) => {
@@ -1656,88 +1644,135 @@ async fn execute_sparql_update_request(
         default_allow: headers.default_allow,
         ..Default::default()
     };
-    let policy_ctx = if qc_opts.has_any_policy_inputs() {
-        match fluree_db_api::build_policy_context(
-            &cached_state.snapshot,
-            cached_state.novelty.as_ref(),
-            Some(cached_state.novelty.as_ref()),
-            cached_state.t,
-            &qc_opts,
-        )
-        .await
-        {
-            Ok(ctx) => Some(ctx),
-            Err(e) => {
-                let server_error = ServerError::Api(e);
-                set_span_error_code(parent_span, "error:PolicyBuildFailed");
-                tracing::error!(error = %server_error, "failed to build policy context for SPARQL UPDATE");
-                return Err(server_error);
-            }
-        }
-    } else {
-        None
-    };
 
-    // Lower SPARQL UPDATE to Txn IR
-    let txn = match lower_sparql_update(update_op, &ast.prologue, &mut ns, txn_opts) {
-        Ok(txn) => txn,
-        Err(e) => {
-            set_span_error_code(parent_span, "error:SparqlLower");
-            tracing::warn!(error = %e, "SPARQL UPDATE lowering failed");
-            return Err(ServerError::SparqlUpdateLower(e));
-        }
-    };
-
-    tracing::debug!(
-        tx_id = %tx_id,
-        txn_type = ?txn.txn_type,
-        where_patterns = txn.where_patterns.len(),
-        delete_templates = txn.delete_templates.len(),
-        insert_templates = txn.insert_templates.len(),
-        "SPARQL UPDATE lowered to Txn IR"
-    );
-
-    // Execute the transaction using the Txn IR directly
     let fluree = &state.fluree;
-    let mut builder = fluree.stage(&handle).txn(txn);
-    let mut commit_opts = CommitOpts::default();
-    if let Some(d) = &effective_identity {
-        commit_opts = commit_opts.identity(d.clone());
-    }
-    // If the request was signed, ALWAYS store the original signed envelope for provenance.
-    // Spawn the upload in parallel with the rest of the pipeline.
-    if let Some(raw_txn) = raw_txn_from_credential(credential) {
-        let content_store = fluree.content_store(handle.ledger_id());
-        commit_opts = commit_opts.with_raw_txn_spawned(content_store, raw_txn);
-    }
-    builder = builder.commit_opts(commit_opts);
-    if let Some(config) = &state.index_config {
-        builder = builder.index_config(config.clone());
-    }
-    if let Some(ctx) = policy_ctx {
-        builder = builder.policy(ctx);
-    }
-
     let correlation = index_request_correlation(
         &credential.headers,
         extract_request_id(&credential.headers, &state.telemetry_config),
         "sparql-update",
     );
-    let result = match with_index_request_correlation(correlation, builder.execute()).await {
-        Ok(result) => {
-            tracing::info!(
-                status = "success",
-                commit_t = result.receipt.t,
-                commit_id = %result.receipt.commit_id,
-                "SPARQL UPDATE committed"
-            );
-            result
+
+    // Bounded retry around snapshot fetch + lowering + execute.
+    //
+    // `lower_sparql_update` allocates IRIs against a `NamespaceRegistry` built
+    // from the *current* snapshot to assign Sids to template terms. Two
+    // concurrent SPARQL UPDATEs racing on a fresh namespace can both pick the
+    // same first-time code for *different* prefixes, then the second writer
+    // hits `TransactError::NamespaceConflict` at staging because the staging
+    // registry sees the first writer's commit. The fix: re-fetch the snapshot
+    // and re-lower against the latest namespace allocations. Bounded to 3
+    // attempts to avoid livelock; the conflict is rare (requires concurrent
+    // writers AND first-time-namespace contention), so 1 retry is usually
+    // enough.
+    const MAX_NS_RETRIES: usize = 3;
+    let mut last_error: Option<ServerError> = None;
+    let mut result = None;
+    for attempt in 1..=MAX_NS_RETRIES {
+        let cached_state = handle.snapshot().await;
+        let mut ns = NamespaceRegistry::from_db(&cached_state.snapshot);
+
+        // Build PolicyContext from the resolved identity plus all header-supplied
+        // policy fields. Rebuilt each attempt because it depends on the snapshot.
+        let policy_ctx = if qc_opts.has_any_policy_inputs() {
+            match fluree_db_api::build_policy_context(
+                &cached_state.snapshot,
+                cached_state.novelty.as_ref(),
+                Some(cached_state.novelty.as_ref()),
+                cached_state.t,
+                &qc_opts,
+            )
+            .await
+            {
+                Ok(ctx) => Some(ctx),
+                Err(e) => {
+                    let server_error = ServerError::Api(e);
+                    set_span_error_code(parent_span, "error:PolicyBuildFailed");
+                    tracing::error!(error = %server_error, "failed to build policy context for SPARQL UPDATE");
+                    return Err(server_error);
+                }
+            }
+        } else {
+            None
+        };
+
+        let txn = match lower_sparql_update(update_op, &ast.prologue, &mut ns, TxnOpts::default()) {
+            Ok(txn) => txn,
+            Err(e) => {
+                set_span_error_code(parent_span, "error:SparqlLower");
+                tracing::warn!(error = %e, "SPARQL UPDATE lowering failed");
+                return Err(ServerError::SparqlUpdateLower(e));
+            }
+        };
+
+        tracing::debug!(
+            tx_id = %tx_id,
+            attempt,
+            txn_type = ?txn.txn_type,
+            where_patterns = txn.where_patterns.len(),
+            delete_templates = txn.delete_templates.len(),
+            insert_templates = txn.insert_templates.len(),
+            "SPARQL UPDATE lowered to Txn IR"
+        );
+
+        let mut builder = fluree.stage(&handle).txn(txn);
+        let mut commit_opts = CommitOpts::default();
+        if let Some(d) = &effective_identity {
+            commit_opts = commit_opts.identity(d.clone());
         }
-        Err(e) => {
-            let server_error = ServerError::Api(e);
-            set_span_error_code(parent_span, "error:InvalidTransaction");
-            tracing::error!(error = %server_error, "SPARQL UPDATE failed");
-            return Err(server_error);
+        // If the request was signed, ALWAYS store the original signed envelope
+        // for provenance. Spawn the upload in parallel with the rest of the
+        // pipeline. Re-spawning across retries is harmless: the content store
+        // is content-addressed so duplicate puts are idempotent.
+        if let Some(raw_txn) = raw_txn_from_credential(credential) {
+            let content_store = fluree.content_store(handle.ledger_id());
+            commit_opts = commit_opts.with_raw_txn_spawned(content_store, raw_txn);
+        }
+        builder = builder.commit_opts(commit_opts);
+        if let Some(config) = &state.index_config {
+            builder = builder.index_config(config.clone());
+        }
+        if let Some(ctx) = policy_ctx {
+            builder = builder.policy(ctx);
+        }
+
+        match with_index_request_correlation(correlation.clone(), builder.execute()).await {
+            Ok(r) => {
+                tracing::info!(
+                    status = "success",
+                    attempt,
+                    commit_t = r.receipt.t,
+                    commit_id = %r.receipt.commit_id,
+                    "SPARQL UPDATE committed"
+                );
+                result = Some(r);
+                break;
+            }
+            Err(fluree_db_api::ApiError::Transact(
+                fluree_db_api::TransactError::NamespaceConflict(msg),
+            )) if attempt < MAX_NS_RETRIES => {
+                tracing::warn!(
+                    attempt,
+                    max_attempts = MAX_NS_RETRIES,
+                    %msg,
+                    "SPARQL UPDATE namespace conflict; re-lowering against latest snapshot"
+                );
+                continue;
+            }
+            Err(e) => {
+                let server_error = ServerError::Api(e);
+                set_span_error_code(parent_span, "error:InvalidTransaction");
+                tracing::error!(error = %server_error, attempt, "SPARQL UPDATE failed");
+                last_error = Some(server_error);
+                break;
+            }
+        }
+    }
+    let result = match result {
+        Some(r) => r,
+        None => {
+            return Err(last_error.unwrap_or_else(|| {
+                ServerError::internal("SPARQL UPDATE failed after retries with no captured error")
+            }));
         }
     };
 

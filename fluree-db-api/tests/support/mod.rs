@@ -209,6 +209,32 @@ pub async fn rebuild_and_publish_index(fluree: &fluree_db_api::Fluree, ledger_id
         .expect("publish index");
 }
 
+/// Like `rebuild_and_publish_index`, but uses `build_index_for_record` which
+/// chooses **incremental** indexing when a base index exists and the commit
+/// gap is small. The plain rebuild helper always does a full rebuild;
+/// callers exercising the incremental code path should use this instead.
+pub async fn build_and_publish_index(fluree: &fluree_db_api::Fluree, ledger_id: &str) {
+    let record = fluree
+        .nameservice()
+        .lookup(ledger_id)
+        .await
+        .expect("nameservice lookup")
+        .expect("ledger record should exist");
+    let result = fluree_db_indexer::build_index_for_record(
+        fluree.content_store(ledger_id),
+        &record,
+        fluree_db_indexer::IndexerConfig::default(),
+    )
+    .await
+    .expect("index build should succeed");
+    fluree
+        .publisher()
+        .expect("read-write nameservice")
+        .publish_index(ledger_id, result.index_t, &result.root_id)
+        .await
+        .expect("publish index");
+}
+
 // =============================================================================
 // Indexing helpers (native tests)
 // =============================================================================

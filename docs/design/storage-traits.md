@@ -111,14 +111,43 @@ pub trait StorageRead: Debug + Send + Sync {
     /// Check if an address exists
     async fn exists(&self, address: &str) -> Result<bool>;
 
+    /// Read a `[start, end)` byte range from an address.
+    /// Default implementation fetches the full object and slices; backends
+    /// that support native range reads (S3, HTTP) should override.
+    async fn read_byte_range(&self, address: &str, range: std::ops::Range<u64>)
+        -> Result<Vec<u8>>;
+
     /// List all addresses with a given prefix
     async fn list_prefix(&self, prefix: &str) -> Result<Vec<String>>;
+
+    /// List addresses under a prefix together with byte sizes.
+    /// Default implementation returns an error indicating the backend does
+    /// not support cheap metadata listing. Backends with native list+size
+    /// (S3 `list_objects_v2`, GCS, etc.) should override.
+    async fn list_prefix_with_metadata(&self, prefix: &str)
+        -> Result<Vec<RemoteObject>>;
+
+    /// Resolve a CAS address to a local filesystem path, if available.
+    fn resolve_local_path(&self, address: &str) -> Option<PathBuf> { None }
+}
+
+/// `(address, size)` pair returned by `list_prefix_with_metadata`.
+pub struct RemoteObject {
+    pub address: String,
+    pub size_bytes: u64,
 }
 ```
 
 **Design notes:**
 - `read_bytes_hint` enables optimizations like returning pre-encoded flakes for leaf nodes
+- `read_byte_range` allows partial reads against backends with native HTTP/S3 range support;
+  the default impl is correct but does N full-object fetches for N range reads
 - `list_prefix` is essential for garbage collection and administrative operations
+- `list_prefix_with_metadata` is used by the bulk-import remote-source path so the
+  importer can size each chunk before fetching. Backends without cheap size metadata
+  return an error; callers can fall back to caller-supplied object lists
+- `resolve_local_path` lets callers (e.g., import scratch staging) skip a copy when
+  the storage already exposes data on the local filesystem (`FileStorage`)
 - All methods return `fluree_db_core::Result<T>` (alias for `std::result::Result<T, Error>`)
 
 ### StorageWrite

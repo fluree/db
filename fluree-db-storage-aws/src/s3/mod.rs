@@ -375,6 +375,53 @@ impl StorageRead for S3Storage {
             .await
             .map_err(ext_error_to_core)
     }
+
+    async fn list_prefix_with_metadata(
+        &self,
+        prefix: &str,
+    ) -> std::result::Result<Vec<fluree_db_core::RemoteObject>, CoreError> {
+        let mut objects = Vec::new();
+        let mut continuation_token = None;
+
+        let full_prefix = match &self.prefix {
+            Some(p) => format!("{}/{}", p.trim_end_matches('/'), prefix),
+            None => prefix.to_string(),
+        };
+
+        loop {
+            let mut request = self
+                .client
+                .list_objects_v2()
+                .bucket(&self.bucket)
+                .prefix(&full_prefix);
+
+            if let Some(token) = continuation_token.take() {
+                request = request.continuation_token(token);
+            }
+
+            let response = request
+                .send()
+                .await
+                .map_err(|e| map_s3_error_core(e, &full_prefix))?;
+
+            for object in response.contents() {
+                if let Some(key) = object.key() {
+                    let size = object.size().unwrap_or(0).max(0) as u64;
+                    objects.push(fluree_db_core::RemoteObject {
+                        address: self.to_address(key),
+                        size_bytes: size,
+                    });
+                }
+            }
+
+            match response.next_continuation_token() {
+                Some(token) => continuation_token = Some(token.to_string()),
+                None => break,
+            }
+        }
+
+        Ok(objects)
+    }
 }
 
 #[async_trait]

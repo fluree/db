@@ -13,7 +13,7 @@ use fluree_graph_json_ld::ParsedContext;
 
 use super::options::QueryOptions;
 use super::pattern::Pattern;
-use super::projection::{Column, HydrationSpec, Projection};
+use super::projection::{Column, Projection};
 use super::triple::TriplePattern;
 use crate::var_registry::VarId;
 
@@ -160,9 +160,10 @@ impl QueryOutput {
         }
     }
 
-    /// The hydration spec embedded in the projection, if any.
-    pub fn hydration(&self) -> Option<&HydrationSpec> {
-        self.projection()?.hydration()
+    /// Returns `true` if the output is a SELECT whose projection contains
+    /// any hydration column.
+    pub fn has_hydration(&self) -> bool {
+        self.projection().is_some_and(Projection::has_hydration)
     }
 
     /// Returns `true` for `selectDistinct`.

@@ -331,14 +331,25 @@ impl LedgerState {
             }
         }
 
-        // Replay oldest→newest (walk was HEAD→oldest, so reverse)
+        // Replay oldest→newest (walk was HEAD→oldest, so reverse).
         commit_batches.reverse();
-        for (flakes, commit_t) in commit_batches {
-            // Populate dict_novelty with subjects/strings from replayed commits so
-            // overlay translation can resolve IDs for unindexed commits.
-            dict_novelty.populate_from_flakes(&flakes);
-            novelty.apply_commit(flakes, commit_t, &reverse_graph)?;
+
+        // Populate dict_novelty in commit order so overlay translation can
+        // resolve IDs for unindexed commits. Doing this before bulk-apply
+        // matches the ordering invariants the per-commit `apply_commit`
+        // path used to provide.
+        for (flakes, _t) in &commit_batches {
+            dict_novelty.populate_from_flakes(flakes);
         }
+
+        // Bulk-load mode: previously this loop called `Novelty::apply_commit`
+        // per commit, whose `merge_batch_into_index` is `O(target+batch)`
+        // per call, accumulating to `O(M·N̄)` over the chain. For a fresh
+        // reindex with thousands of commits that grew to many minutes on
+        // single-CPU lambdas. `bulk_apply_commits` instead does one
+        // identity-key sort + linear set-semantics dedup + four index
+        // sorts, totaling `O(N log N)` regardless of M.
+        novelty.bulk_apply_commits(commit_batches, &reverse_graph)?;
 
         Ok((novelty, Some(head_cid.clone())))
     }

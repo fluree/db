@@ -1052,6 +1052,26 @@ pub struct GlobalDicts {
     /// Outer key = g_id, inner key = p_id.
     pub vectors:
         FxHashMap<GraphId, FxHashMap<u32, fluree_db_binary_index::arena::vector::VectorArena>>,
+    /// Fact-identity → vector arena handle mapping for retraction lookup.
+    ///
+    /// Keyed by `(g_id, s_ns_code, s_name, p_id, o_i, f32_bits)` — the
+    /// full RDF fact identity in **subject-name** space (not s_id) so the
+    /// key is stable across the chunk-local-vs-global s_id boundary
+    /// inherent in the incremental-resolve pipeline. `f32_bits` is the
+    /// per-element bit pattern of the quantized f32 vector; this is
+    /// required (not just `(s, p, o_i)`) because:
+    /// - Two distinct subjects can hold the same value under the same
+    ///   predicate, each with its own arena handle.
+    /// - One subject can hold MULTIPLE different vector values under
+    ///   the same predicate without a list index — both share
+    ///   `(s, p, o_i=LIST_INDEX_NONE)` so a value-free key would have
+    ///   the second insertion overwrite the first.
+    ///
+    /// `o_i = u32::MAX` is the sentinel for "no list index" (matches
+    /// `LIST_INDEX_NONE` in run records).
+    #[allow(clippy::type_complexity)]
+    pub vector_fact_handles:
+        FxHashMap<GraphId, FxHashMap<(u16, std::sync::Arc<str>, u32, u32, Vec<u32>), u32>>,
 }
 
 impl GlobalDicts {
@@ -1077,6 +1097,7 @@ impl GlobalDicts {
             datatypes: new_datatype_dict(),
             numbigs: FxHashMap::default(),
             vectors: FxHashMap::default(),
+            vector_fact_handles: FxHashMap::default(),
         };
         // Reserve g_id=1 for txn-meta, g_id=2 for config.
         dicts.graphs.get_or_insert(&txn_meta_iri);
@@ -1102,6 +1123,7 @@ impl GlobalDicts {
             datatypes: new_datatype_dict(),
             numbigs: FxHashMap::default(),
             vectors: FxHashMap::default(),
+            vector_fact_handles: FxHashMap::default(),
         };
         // Reserve g_id=1 for txn-meta, g_id=2 for config.
         dicts.graphs.get_or_insert(&txn_meta_iri);

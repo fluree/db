@@ -138,7 +138,7 @@ pub fn format_results(
     }
 
     // Hydration queries require async formatting for database access
-    if result.output.hydration().is_some() {
+    if result.output.has_hydration() {
         return Err(FormatError::InvalidBinding(
             "Hydration queries require async database access for property expansion. \
              Use format_results_async() instead of format_results()."
@@ -281,7 +281,7 @@ pub async fn format_results_async(
     }
 
     // Hydration queries use async formatter with DB access
-    if result.output.hydration().is_some() {
+    if result.output.has_hydration() {
         if !matches!(
             config.format,
             OutputFormat::JsonLd | OutputFormat::TypedJson

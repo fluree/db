@@ -391,7 +391,8 @@ impl ApiError {
             ApiError::Transact(
                 fluree_db_transact::TransactError::CommitConflict { .. }
                 | fluree_db_transact::TransactError::CommitIdMismatch { .. }
-                | fluree_db_transact::TransactError::PublishLostRace { .. },
+                | fluree_db_transact::TransactError::PublishLostRace { .. }
+                | fluree_db_transact::TransactError::NamespaceConflict(_),
             ) => 409,
             // Other transaction errors are usually validation failures
             ApiError::Transact(_) => 400,

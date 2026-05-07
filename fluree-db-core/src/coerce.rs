@@ -54,7 +54,7 @@ use crate::temporal::{
 };
 use crate::{Date, DateTime, FlakeValue, GeoPointBits, Time};
 use bigdecimal::BigDecimal;
-use fluree_vocab::{errors, geo, rdf, xsd};
+use fluree_vocab::{errors, fluree, geo, rdf, xsd};
 use num_bigint::BigInt;
 use std::str::FromStr;
 
@@ -419,8 +419,12 @@ pub fn coerce_json_value(
 // Internal Coercion Helpers
 // =============================================================================
 
-/// Coerce a string value to the target datatype
-fn coerce_string_value(s: &str, datatype_iri: &str) -> CoercionResult<FlakeValue> {
+/// Coerce a lexical string value to the target datatype.
+///
+/// Public so other crates (e.g. `fluree-db-transact`'s value-convert) can share
+/// the same parsing rules — notably the f32-quantized vector lexical parse for
+/// `f:embeddingVector`.
+pub fn coerce_string_value(s: &str, datatype_iri: &str) -> CoercionResult<FlakeValue> {
     match datatype_iri {
         // String-like types: pass through
         dt if xsd::is_string_like(dt) => Ok(FlakeValue::String(s.to_string())),
@@ -507,6 +511,15 @@ fn coerce_string_value(s: &str, datatype_iri: &str) -> CoercionResult<FlakeValue
             .map(|_| FlakeValue::Json(s.to_string()))
             .map_err(|e| CoercionError::parse_failed(s, "rdf:JSON", Some(&e.to_string()))),
 
+        // f:embeddingVector — parse JSON array lexical form (e.g. "[0.1, 0.2]")
+        // through the same f32-quantization path used for native arrays.
+        dt if dt == fluree::EMBEDDING_VECTOR => {
+            let arr: Vec<serde_json::Value> = serde_json::from_str(s).map_err(|e| {
+                CoercionError::parse_failed(s, "f:embeddingVector", Some(&e.to_string()))
+            })?;
+            coerce_array_to_vector(&arr)
+        }
+
         // geo:wktLiteral - detect POINT and store as GeoPoint, others as string
         geo::WKT_LITERAL => {
             if let Some((lat, lng)) = try_extract_point(s) {
@@ -533,6 +546,17 @@ fn coerce_number_value(n: &serde_json::Number, datatype_iri: &str) -> CoercionRe
             &format!("number {n}"),
             datatype_iri,
             Some(&format!("Use {{\"@value\": \"{n}\"}} instead.")),
+        ));
+    }
+
+    // Number → Vector is invalid: a scalar can never be a vector. This was
+    // previously a silent fall-through to FlakeValue::Long/Double, producing
+    // VECTOR_ID flakes paired with scalar object keys (storage corruption).
+    if datatype_iri == fluree::EMBEDDING_VECTOR {
+        return Err(CoercionError::incompatible(
+            &format!("number {n}"),
+            "f:embeddingVector",
+            Some("Vector values must be a JSON array of numbers."),
         ));
     }
 
@@ -639,6 +663,15 @@ fn coerce_bool_value(b: bool, datatype_iri: &str) -> CoercionResult<FlakeValue> 
         ));
     }
 
+    // Boolean → Vector is invalid
+    if datatype_iri == fluree::EMBEDDING_VECTOR {
+        return Err(CoercionError::incompatible(
+            &format!("boolean {b}"),
+            "f:embeddingVector",
+            Some("Vector values must be a JSON array of numbers."),
+        ));
+    }
+
     // Boolean → Boolean
     if datatype_iri == xsd::BOOLEAN {
         return Ok(FlakeValue::Boolean(b));
@@ -660,6 +693,17 @@ fn coerce_bool_value(b: bool, datatype_iri: &str) -> CoercionResult<FlakeValue> 
 /// rejected. Users needing higher-precision numeric arrays can use a custom
 /// datatype (stored as a string literal).
 fn coerce_array_to_vector(arr: &[serde_json::Value]) -> CoercionResult<FlakeValue> {
+    // Reject empty arrays. `FlakeValue::Vector(Vec::new())` is reserved as the
+    // upper-bound sentinel by `FlakeValue::max()` (see core/value.rs), and the
+    // shared vector arena (`VectorArena::insert_f32`) hard-rejects empty
+    // vectors anyway. Storing one would either alias the sentinel (corrupting
+    // range scans) or fail at index time (silent partial commit).
+    if arr.is_empty() {
+        return Err(CoercionError::new(
+            "f:embeddingVector requires at least one element; empty vectors \
+             are reserved as a max-bound sentinel and rejected by the vector arena",
+        ));
+    }
     let mut vector = Vec::with_capacity(arr.len());
     for (i, item) in arr.iter().enumerate() {
         match item {
@@ -766,6 +810,14 @@ fn validate_bigint_range(value: &BigInt, datatype_iri: &str) -> CoercionResult<(
     }
     Ok(())
 }
+
+// NOTE: `(datatype, value)` pair invariants for storage (e.g. `f:embeddingVector
+// ⇔ FlakeValue::Vector`) are enforced at the write-path bottleneck via
+// `fluree_db_transact::generate::flakes::validate_value_dt_pair`. That single
+// validator covers all three sinks (FlakeGenerator, ImportSink, FlakeSink) and
+// avoids the drift risk of duplicating the rules at the core/IRI level. If a
+// query-side IRI-based check is needed in the future, factor it back into core
+// here and have the transact validator delegate.
 
 #[cfg(test)]
 mod tests {
@@ -896,5 +948,77 @@ mod tests {
         let result = coerce_value(FlakeValue::BigInt(Box::new(big)), xsd::DOUBLE);
         assert!(result.is_ok());
         assert!(matches!(result.unwrap(), FlakeValue::Double(_)));
+    }
+
+    // -------------------------------------------------------------------
+    // f:embeddingVector coercion (regression: see fluree/db-r vector
+    // corruption repro). Scalar Number/Bool with a vector datatype must
+    // be hard-rejected; lexical "[..]" must parse via the shared array
+    // path so JSON-LD/Turtle/SPARQL all share f32 quantization.
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn test_coerce_json_array_to_vector() {
+        let json = serde_json::json!([0.1, 0.2, 0.3, 0.4]);
+        let result = coerce_json_value(&json, fluree::EMBEDDING_VECTOR).unwrap();
+        match result {
+            FlakeValue::Vector(v) => assert_eq!(v.len(), 4),
+            other => panic!("expected Vector, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_coerce_json_number_to_vector_rejects() {
+        let json = serde_json::json!(0.1);
+        let err = coerce_json_value(&json, fluree::EMBEDDING_VECTOR).unwrap_err();
+        assert!(err.message.contains("f:embeddingVector"), "{}", err.message);
+    }
+
+    #[test]
+    fn test_coerce_json_bool_to_vector_rejects() {
+        let json = serde_json::json!(true);
+        let err = coerce_json_value(&json, fluree::EMBEDDING_VECTOR).unwrap_err();
+        assert!(err.message.contains("f:embeddingVector"), "{}", err.message);
+    }
+
+    #[test]
+    fn test_coerce_string_lexical_to_vector() {
+        let json = serde_json::json!("[0.1, 0.2, 0.3]");
+        let result = coerce_json_value(&json, fluree::EMBEDDING_VECTOR).unwrap();
+        match result {
+            FlakeValue::Vector(v) => assert_eq!(v.len(), 3),
+            other => panic!("expected Vector, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_coerce_string_lexical_to_vector_invalid_rejects() {
+        let json = serde_json::json!("not-an-array");
+        let err = coerce_json_value(&json, fluree::EMBEDDING_VECTOR).unwrap_err();
+        assert!(err.message.contains("f:embeddingVector"), "{}", err.message);
+    }
+
+    #[test]
+    fn test_coerce_empty_array_to_vector_rejects() {
+        // Empty `Vector(Vec::new())` is reserved as the FlakeValue::max() sentinel
+        // and the vector arena rejects it. Coercion must fail upstream.
+        let json = serde_json::json!([]);
+        let err = coerce_json_value(&json, fluree::EMBEDDING_VECTOR).unwrap_err();
+        assert!(
+            err.message.contains("at least one element"),
+            "{}",
+            err.message
+        );
+    }
+
+    #[test]
+    fn test_coerce_empty_string_lexical_to_vector_rejects() {
+        let json = serde_json::json!("[]");
+        let err = coerce_json_value(&json, fluree::EMBEDDING_VECTOR).unwrap_err();
+        assert!(
+            err.message.contains("at least one element"),
+            "{}",
+            err.message
+        );
     }
 }

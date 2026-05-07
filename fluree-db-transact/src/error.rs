@@ -65,6 +65,20 @@ pub enum TransactError {
         published_commit_id: String,
     },
 
+    /// Namespace allocations from a pre-built `Txn` (e.g. SPARQL UPDATE
+    /// lowered against a stale snapshot) conflict with the staging
+    /// registry. Retry-safe: re-lower against the latest snapshot.
+    ///
+    /// Triggered when two concurrent SPARQL UPDATEs lower against the same
+    /// pre-commit snapshot, both pick the same first-time namespace code
+    /// for *different* prefixes, and the second writer reaches staging
+    /// after the first has committed.
+    #[error(
+        "Namespace allocation from pre-built Txn conflicts with the staging \
+         registry (likely stale lowering against an out-of-date snapshot): {0}"
+    )]
+    NamespaceConflict(String),
+
     /// Ledger or branch has been retracted (soft-deleted)
     #[error("Ledger has been retracted: {0}")]
     Retracted(String),

@@ -56,7 +56,7 @@ use thiserror::Error;
 
 use crate::ir::{SparqlWhereClause, TemplateTerm, TripleTemplate, Txn, TxnOpts, TxnType};
 use crate::namespace::NamespaceRegistry;
-use fluree_vocab::xsd;
+use fluree_vocab::{fluree, xsd};
 
 /// Result of converting a SPARQL term to an unresolved term with metadata.
 struct UnresolvedTermWithMeta {
@@ -234,20 +234,28 @@ pub fn lower_sparql_update(
     let mut vars = VarRegistry::new();
     let mut bnodes = BlankNodeCounter::new();
 
-    match op {
+    let mut txn = match op {
         UpdateOperation::InsertData(insert) => {
-            lower_insert_data(&insert.data, prologue, ns, &mut vars, &mut bnodes, opts)
+            lower_insert_data(&insert.data, prologue, ns, &mut vars, &mut bnodes, opts)?
         }
         UpdateOperation::DeleteData(delete) => {
-            lower_delete_data(&delete.data, prologue, ns, &mut vars, &mut bnodes, opts)
+            lower_delete_data(&delete.data, prologue, ns, &mut vars, &mut bnodes, opts)?
         }
         UpdateOperation::DeleteWhere(delete_where) => {
-            lower_delete_where(&delete_where.pattern, prologue, ns, &mut vars, opts)
+            lower_delete_where(&delete_where.pattern, prologue, ns, &mut vars, opts)?
         }
         UpdateOperation::Modify(modify) => {
-            lower_modify(modify, prologue, ns, &mut vars, &mut bnodes, opts)
+            lower_modify(modify, prologue, ns, &mut vars, &mut bnodes, opts)?
         }
-    }
+    };
+    // Hand off the lowering registry's allocations so `stage_transaction_from_txn`
+    // can merge them into its own snapshot-derived registry. Without this, the
+    // first SPARQL `INSERT DATA` on a fresh ledger commits flakes referencing
+    // namespace codes the staging registry never learned about — the commit's
+    // persisted namespace map omits them, and post-commit SELECT can't resolve
+    // the predicate IRI back to the same Sid.
+    txn.namespace_delta = ns.delta().clone();
+    Ok(txn)
 }
 
 /// Lower INSERT DATA operation.
@@ -276,6 +284,7 @@ fn lower_insert_data(
         vars: mem::take(vars),
         txn_meta: Vec::new(),
         graph_delta: FxHashMap::default(),
+        namespace_delta: std::collections::HashMap::new(),
     })
 }
 
@@ -306,6 +315,7 @@ fn lower_delete_data(
         vars: mem::take(vars),
         txn_meta: Vec::new(),
         graph_delta: FxHashMap::default(),
+        namespace_delta: std::collections::HashMap::new(),
     })
 }
 
@@ -385,6 +395,7 @@ fn lower_delete_where(
         vars: mem::take(vars),
         txn_meta: Vec::new(),
         graph_delta: FxHashMap::default(),
+        namespace_delta: std::collections::HashMap::new(),
     })
 }
 
@@ -485,6 +496,7 @@ fn lower_modify(
         vars: mem::take(vars),
         txn_meta: Vec::new(),
         graph_delta: graph_ids.delta(),
+        namespace_delta: std::collections::HashMap::new(),
     })
 }
 
@@ -937,6 +949,17 @@ fn coerce_typed_value(lexical: &str, datatype_iri: &str) -> UnresolvedTerm {
                 return UnresolvedTerm::Literal(LiteralValue::Boolean(false));
             }
         }
+        // f:embeddingVector — share the core lexical parser with JSON-LD/Turtle
+        // so f32 quantization is uniform across ingest paths. The query
+        // layer's `LiteralValue::Vector` is lowered to `FlakeValue::Vector`
+        // with the correct datatype Sid in `parse/lower.rs`.
+        fluree::EMBEDDING_VECTOR => {
+            if let Ok(FlakeValue::Vector(v)) =
+                fluree_db_core::coerce::coerce_string_value(lexical, datatype_iri)
+            {
+                return UnresolvedTerm::Literal(LiteralValue::Vector(v));
+            }
+        }
         _ => {}
     }
     // Fall back to string
@@ -962,6 +985,14 @@ fn coerce_typed_flake_value(lexical: &str, datatype_iri: &str) -> FlakeValue {
                 return FlakeValue::Boolean(true);
             } else if lexical == "false" || lexical == "0" {
                 return FlakeValue::Boolean(false);
+            }
+        }
+        // See `coerce_typed_value` — share core's parser for f:embeddingVector.
+        fluree::EMBEDDING_VECTOR => {
+            if let Ok(fv @ FlakeValue::Vector(_)) =
+                fluree_db_core::coerce::coerce_string_value(lexical, datatype_iri)
+            {
+                return fv;
             }
         }
         _ => {}
@@ -1075,5 +1106,29 @@ mod tests {
         assert_eq!(counter.next(), "_:b0");
         assert_eq!(counter.next(), "_:b1");
         assert_eq!(counter.next(), "_:b2");
+    }
+
+    #[test]
+    fn test_coerce_typed_flake_value_vector_lexical() {
+        // Regression for the vector-corruption bug: a SPARQL typed literal
+        // `"[..]"^^f:embeddingVector` must produce FlakeValue::Vector, not
+        // FlakeValue::String — otherwise downstream flake gen pairs a String
+        // value with the embeddingVector datatype and the index decodes
+        // garbage.
+        let result = coerce_typed_flake_value("[0.1, 0.2, 0.3, 0.4]", fluree::EMBEDDING_VECTOR);
+        match result {
+            FlakeValue::Vector(v) => assert_eq!(v.len(), 4),
+            other => panic!("expected FlakeValue::Vector, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_coerce_typed_value_vector_lexical_unresolved() {
+        // Same coverage on the UnresolvedTerm path used by literal_to_unresolved.
+        let result = coerce_typed_value("[0.1, 0.2]", fluree::EMBEDDING_VECTOR);
+        match result {
+            UnresolvedTerm::Literal(LiteralValue::Vector(v)) => assert_eq!(v.len(), 2),
+            other => panic!("expected LiteralValue::Vector, got {other:?}"),
+        }
     }
 }

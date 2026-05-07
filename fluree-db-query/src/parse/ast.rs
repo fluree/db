@@ -906,26 +906,20 @@ impl UnresolvedProjection {
         }
     }
 
-    /// The hydration spec embedded in the projection, if any.
-    pub fn hydration(&self) -> Option<&UnresolvedHydrationSpec> {
-        self.columns()
-            .iter()
-            .find_map(UnresolvedColumn::as_hydration)
+    /// Mutable access to columns in render order. Empty for `Wildcard`.
+    pub fn columns_mut(&mut self) -> &mut [UnresolvedColumn] {
+        match self {
+            UnresolvedProjection::Wildcard => &mut [],
+            UnresolvedProjection::Tuple(cs) => cs.as_mut_slice(),
+            UnresolvedProjection::Scalar(c) => std::slice::from_mut(c),
+        }
     }
 
-    /// Mutable access to the hydration spec, if any.
-    pub fn hydration_mut(&mut self) -> Option<&mut UnresolvedHydrationSpec> {
-        match self {
-            UnresolvedProjection::Wildcard => None,
-            UnresolvedProjection::Tuple(cs) => cs.iter_mut().find_map(|c| match c {
-                UnresolvedColumn::Hydration(spec) => Some(spec),
-                UnresolvedColumn::Var(_) => None,
-            }),
-            UnresolvedProjection::Scalar(c) => match c {
-                UnresolvedColumn::Hydration(spec) => Some(spec),
-                UnresolvedColumn::Var(_) => None,
-            },
-        }
+    /// Returns `true` if any column in the projection is a hydration column.
+    pub fn has_hydration(&self) -> bool {
+        self.columns()
+            .iter()
+            .any(|c| matches!(c, UnresolvedColumn::Hydration(_)))
     }
 }
 
@@ -1135,14 +1129,9 @@ impl UnresolvedQuery {
         }
     }
 
-    /// Returns the hydration spec embedded in the projection, if any.
-    pub fn hydration(&self) -> Option<&UnresolvedHydrationSpec> {
-        self.select.hydration()
-    }
-
-    /// Mutable access to the hydration spec, if any.
-    pub fn hydration_mut(&mut self) -> Option<&mut UnresolvedHydrationSpec> {
-        self.select.hydration_mut()
+    /// Returns `true` if the projection contains any hydration column.
+    pub fn has_hydration(&self) -> bool {
+        self.select.has_hydration()
     }
 
     /// Add a triple pattern (convenience method that wraps in UnresolvedPattern)
