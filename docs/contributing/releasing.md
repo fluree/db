@@ -7,17 +7,17 @@ Cutting a release is two phases: a release PR that bumps the version, then a tag
 ```bash
 # 1. Branch off main and bump the workspace version.
 git checkout main && git pull
-git checkout -b release/v4.0.2
+git checkout -b release/v4.0.3
 $EDITOR Cargo.toml                      # update [workspace.package].version
 cargo update --workspace                # refresh Cargo.lock
-git commit -am "release v4.0.2"
-git push -u origin release/v4.0.2
-gh pr create --title "release v4.0.2"
+git commit -am "release v4.0.3"
+git push -u origin release/v4.0.3
+gh pr create --title "release v4.0.3"
 
 # 2. After the PR is reviewed and merged to main, tag the merge commit.
 git checkout main && git pull
-git tag v4.0.2
-git push origin v4.0.2                  # ← triggers .github/workflows/release.yml
+git tag v4.0.3
+git push origin v4.0.3                  # ← triggers .github/workflows/release.yml
 ```
 
 Watch the Actions tab. cargo-dist builds platform binaries, creates the GitHub Release with auto-generated notes, publishes the Homebrew formula, and pushes the multi-arch Docker image.
