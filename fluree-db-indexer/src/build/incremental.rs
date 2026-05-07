@@ -783,9 +783,15 @@ pub async fn incremental_index(
                         .get(&(g_id, p_id))
                         .copied()
                         .unwrap_or(0);
-                    if (base_count as u64) + (arena.len() as u64) > u32::MAX as u64 {
+                    // `arena` here is the unified base+chunk arena (see
+                    // `incremental_resolve` step 4b). `arena.len()` is the
+                    // total count after this round; it inherently fits in
+                    // u32 because the arena's append API caps at u32::MAX.
+                    if arena.len() < base_count {
                         return Err(IndexerError::IncrementalAbort(format!(
-                            "vector handle overflow for g_id={g_id}, p_id={p_id}"
+                            "vector arena shrunk for g_id={g_id}, p_id={p_id}: \
+                             base_count={base_count}, arena.len()={}",
+                            arena.len()
                         )));
                     }
 
@@ -838,6 +844,26 @@ pub async fn incremental_index(
 
                         let shard_cap = old_manifest.shard_capacity;
                         let dims_usize = arena.dims() as usize;
+                        // `arena.raw_values()` holds base + chunk-new values
+                        // because step 4b pre-loaded the base arena before
+                        // the resolver appended chunk inserts. Everything
+                        // below operates on the chunk-new portion only;
+                        // base entries are already persisted in existing
+                        // shards and must not be re-read or re-written.
+                        let new_count = arena.len() - base_count;
+                        // Retraction-only chunk for this predicate: the base
+                        // arena is unchanged. Re-uploading the manifest (a)
+                        // re-CASes identical bytes, and (b) queues the still-
+                        // live `existing.manifest` for GC release — which
+                        // would delete the manifest the current root still
+                        // references, since `release` deletes by CID with no
+                        // live-reference check. Leave `ga.vectors[pos]`
+                        // pointing at the existing manifest and shards.
+                        if new_count == 0 {
+                            continue;
+                        }
+                        let new_raw_offset = base_count as usize * dims_usize;
+                        let new_raw = &arena.raw_values()[new_raw_offset..];
                         let mut combined_shards = existing.shards.clone();
                         let mut combined_shard_infos = old_manifest.shards.clone();
 
@@ -845,7 +871,7 @@ pub async fn incremental_index(
                         if let Some(last_info) = combined_shard_infos.last().cloned() {
                             if last_info.count < shard_cap {
                                 let remaining = shard_cap - last_info.count;
-                                let take = remaining.min(arena.len());
+                                let take = remaining.min(new_count);
                                 if take > 0 {
                                     let last_idx = combined_shard_infos.len() - 1;
                                     let old_last_cid = combined_shards[last_idx].clone();
@@ -869,7 +895,7 @@ pub async fn incremental_index(
                                     let mut merged: Vec<f32> =
                                         Vec::with_capacity(old_last_shard.values.len() + take_f32);
                                     merged.extend_from_slice(&old_last_shard.values);
-                                    merged.extend_from_slice(&arena.raw_values()[0..take_f32]);
+                                    merged.extend_from_slice(&new_raw[0..take_f32]);
 
                                     let shard_bytes =
                                         fluree_db_binary_index::arena::vector::write_vector_shard_to_bytes(
@@ -901,7 +927,7 @@ pub async fn incremental_index(
                         }
 
                         let start_f32 = consumed_new as usize * dims_usize;
-                        let remaining_raw = &arena.raw_values()[start_f32..];
+                        let remaining_raw = &new_raw[start_f32..];
                         let shard_results =
                             fluree_db_binary_index::arena::vector::write_vector_shards_from_raw(
                                 arena.dims(),
@@ -932,7 +958,10 @@ pub async fn incremental_index(
                                 dtype: "f32".to_string(),
                                 normalized: old_manifest.normalized,
                                 shard_capacity: old_manifest.shard_capacity,
-                                total_count: base_count + arena.len(),
+                                // `arena.len()` already includes base + new
+                                // (step 4b pre-loaded base into the arena);
+                                // adding base_count here would double-count.
+                                total_count: arena.len(),
                                 shards: combined_shard_infos,
                             };
 

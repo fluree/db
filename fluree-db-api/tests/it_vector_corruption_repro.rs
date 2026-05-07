@@ -815,3 +815,130 @@ async fn sparql_insert_data_embedding_vector_literal_round_trips_after_indexing(
         );
     }
 }
+
+/// Round-trip a vector inserted via the **incremental publish** path.
+///
+/// After the vector-retraction PR, `incremental_resolve` pre-loads the base
+/// vector arena into `shared.vectors` so chunk inserts return globally
+/// correct handles by appending. The downstream upload code in
+/// `fluree-db-indexer/src/build/incremental.rs` (the "Extending an
+/// existing vector arena" arm), however, still treats `arena.raw_values()`
+/// as if it held only chunk-new entries. With the pre-load it actually
+/// holds base + chunk, so:
+///
+///   - the partial-shard merge copies base entries into the new last
+///     shard tail (corrupts shard contents at the chunk-new positions),
+///   - the manifest's `total_count` is written as `base_count + arena.len()`,
+///     which equals `2*base + new`.
+///
+/// The corruption surfaces here: after an incremental publish that inserts
+/// a brand-new vector for a brand-new subject, `SELECT ?v` for that subject
+/// must decode the vector value the user wrote — not the duplicated base
+/// vector that the bug planted at the new subject's arena handle. Existing
+/// tests use COUNT (operates on SPOT rows, not arena bytes) and so don't
+/// catch this.
+#[tokio::test]
+async fn jsonld_vector_round_trips_through_incremental_publish() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger_id = "it/vector-corruption/incremental-roundtrip:main";
+    let ledger0 = support::genesis_ledger(&fluree, ledger_id);
+
+    // Commit 1: subject S1 with V1. Full rebuild — establishes the base
+    // arena (`base_count == 1` for the next round).
+    let v1 = [1.0_f64, 1.0, 1.0, 1.0];
+    let insert1 = json!({
+        "@context": {
+            "ex": "http://example.org/",
+            "ex:embedding": { "@type": "@vector" }
+        },
+        "@graph": [{ "@id": "ex:doc1", "ex:embedding": v1 }]
+    });
+    fluree.insert(ledger0, &insert1).await.expect("insert S1");
+    support::rebuild_and_publish_index(&fluree, ledger_id).await;
+    let after_publish_1 = fluree
+        .ledger(ledger_id)
+        .await
+        .expect("load after full publish");
+
+    // Commit 2: subject S2 with a DIFFERENT vector V2. Incremental publish.
+    // S2 should be assigned arena handle 1 (base_count + 0).
+    let v2 = [9.0_f64, 9.0, 9.0, 9.0];
+    let insert2 = json!({
+        "@context": {
+            "ex": "http://example.org/",
+            "ex:embedding": { "@type": "@vector" }
+        },
+        "@graph": [{ "@id": "ex:doc2", "ex:embedding": v2 }]
+    });
+    fluree
+        .insert(after_publish_1, &insert2)
+        .await
+        .expect("insert S2");
+    support::build_and_publish_index(&fluree, ledger_id).await;
+    let after_publish_2 = fluree
+        .ledger(ledger_id)
+        .await
+        .expect("load after incremental publish");
+
+    // S1's vector must still decode to V1.
+    let select_doc1 = r"
+        PREFIX ex: <http://example.org/>
+        SELECT ?v WHERE { ex:doc1 ex:embedding ?v }
+    ";
+    let rows1 = support::query_sparql(&fluree, &after_publish_2, select_doc1)
+        .await
+        .expect("query S1")
+        .to_jsonld_async(after_publish_2.as_graph_db_ref(0))
+        .await
+        .expect("format S1 result");
+    let s1_vec = rows1
+        .as_array()
+        .and_then(|rs| rs.first())
+        .and_then(|r| r.as_array())
+        .and_then(|r| r.first())
+        .and_then(|v| v.as_array())
+        .expect("S1 vector row");
+    assert_vector_eq(s1_vec, &v1, "S1 (base) vector after incremental publish");
+
+    // S2's vector must decode to V2 — the bug plants V1 at handle 1, so the
+    // pre-fix path returns V1's values here instead of V2's.
+    let select_doc2 = r"
+        PREFIX ex: <http://example.org/>
+        SELECT ?v WHERE { ex:doc2 ex:embedding ?v }
+    ";
+    let rows2 = support::query_sparql(&fluree, &after_publish_2, select_doc2)
+        .await
+        .expect("query S2")
+        .to_jsonld_async(after_publish_2.as_graph_db_ref(0))
+        .await
+        .expect("format S2 result");
+    let s2_vec = rows2
+        .as_array()
+        .and_then(|rs| rs.first())
+        .and_then(|r| r.as_array())
+        .and_then(|r| r.first())
+        .and_then(|v| v.as_array())
+        .expect("S2 vector row");
+    assert_vector_eq(
+        s2_vec,
+        &v2,
+        "S2 (chunk-new) vector after incremental publish",
+    );
+}
+
+fn assert_vector_eq(actual: &[serde_json::Value], expected: &[f64], context: &str) {
+    assert_eq!(
+        actual.len(),
+        expected.len(),
+        "{context}: expected {} elements, got {}",
+        expected.len(),
+        actual.len()
+    );
+    for (i, (a, e)) in actual.iter().zip(expected.iter()).enumerate() {
+        let a = a.as_f64().expect("element is number");
+        assert!(
+            (a - e).abs() < 0.000_001,
+            "{context}: element {i} mismatch — expected {e}, got {a}"
+        );
+    }
+}
