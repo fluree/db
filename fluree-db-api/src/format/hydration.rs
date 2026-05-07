@@ -44,6 +44,46 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 ///   when their levels differ.
 type CacheKey = (Sid, u64, usize);
 
+/// Depth bookkeeping for one hydration call.
+///
+/// Each hydration column carries its own budget; threading the pair as a
+/// single value (instead of two parallel `usize` parameters) keeps the
+/// recursive signatures small and puts the descent / expansion-gate logic
+/// on the type itself.
+#[derive(Copy, Clone)]
+struct DepthBudget {
+    /// Current recursion depth (0 at a column's root).
+    current: usize,
+    /// Auto-expansion budget for this column.
+    max: usize,
+}
+
+impl DepthBudget {
+    /// Budget at a column's root: depth 0, with the column's `max`.
+    fn root(max: usize) -> Self {
+        Self { current: 0, max }
+    }
+
+    /// Budget for one level of recursive descent.
+    fn descend(self) -> Self {
+        Self {
+            current: self.current + 1,
+            max: self.max,
+        }
+    }
+
+    /// Levels of auto-expansion still permitted (for cache keying).
+    fn remaining(self) -> usize {
+        self.max.saturating_sub(self.current)
+    }
+
+    /// Whether auto-expansion (no explicit sub-spec) is still permitted at
+    /// this level — i.e. there's at least one descent left in the budget.
+    fn can_expand(self) -> bool {
+        self.current < self.max
+    }
+}
+
 /// Context for formatting a specific predicate's values.
 struct PredicateContext<'a> {
     /// The predicate SID being formatted.
@@ -171,8 +211,8 @@ fn resolve_root_sid_from_binding(
 /// expands it via [`HydrationFormatter::format_subject`] using the column's
 /// own level and depth budget. A variable root that's unbound for this row
 /// renders as `null` rather than skipping the row entirely.
-async fn format_hydration_column<'a>(
-    formatter: &HydrationFormatter<'a>,
+async fn format_hydration_column(
+    formatter: &HydrationFormatter<'_>,
     spec: &HydrationSpec,
     result: &QueryResult,
     batch: &fluree_db_query::Batch,
@@ -192,7 +232,13 @@ async fn format_hydration_column<'a>(
 
     let mut visited = HashSet::new();
     formatter
-        .format_subject(&root_sid, &spec.level, 0, spec.depth, &mut visited, cache)
+        .format_subject(
+            &root_sid,
+            &spec.level,
+            DepthBudget::root(spec.depth),
+            &mut visited,
+            cache,
+        )
         .await
 }
 
@@ -327,11 +373,7 @@ impl<'a> HydrationFormatter<'a> {
     /// # Arguments
     /// - `sid`: Subject to expand
     /// - `level`: Selection specification (what properties to include)
-    /// - `current_depth`: Current recursion depth
-    /// - `max_depth`: Auto-expansion budget for *this* hydration column. Each
-    ///   column carries its own budget; threading it as a parameter (rather
-    ///   than holding it on the formatter) lets multiple columns with
-    ///   different depths share one formatter.
+    /// - `depth`: Current depth and per-column max — see [`DepthBudget`].
     /// - `visited`: Cycle detection set (per-path)
     /// - `cache`: Result cache (shared across all subjects)
     ///
@@ -340,14 +382,12 @@ impl<'a> HydrationFormatter<'a> {
         &'b self,
         sid: &'b Sid,
         level: &'b NestedSelectSpec,
-        current_depth: usize,
-        max_depth: usize,
+        depth: DepthBudget,
         visited: &'b mut HashSet<Sid>,
         cache: &'b mut HashMap<CacheKey, JsonValue>,
     ) -> BoxFuture<'b, Result<JsonValue>> {
         async move {
-            let depth_remaining = max_depth.saturating_sub(current_depth);
-            let cache_key = (sid.clone(), compute_level_hash(level), depth_remaining);
+            let cache_key = (sid.clone(), compute_level_hash(level), depth.remaining());
 
             // Check cache first (same Sid + spec + depth = same result)
             if let Some(cached) = cache.get(&cache_key) {
@@ -365,7 +405,7 @@ impl<'a> HydrationFormatter<'a> {
             // @id inclusion:
             // - Always include for nested hydrations (identity of an expanded ref)
             // - Otherwise include when wildcard or explicit @id selection
-            if current_depth > 0 || level.includes_id() {
+            if depth.current > 0 || level.includes_id() {
                 obj.insert("@id".to_string(), json!(self.compactor.compact_sid(sid)?));
             }
 
@@ -407,14 +447,7 @@ impl<'a> HydrationFormatter<'a> {
                     explicit_sub_spec,
                 };
                 let values = self
-                    .format_predicate_values(
-                        pred_ctx,
-                        level,
-                        current_depth,
-                        max_depth,
-                        visited,
-                        cache,
-                    )
+                    .format_predicate_values(pred_ctx, level, depth, visited, cache)
                     .await?;
 
                 if !values.is_empty() {
@@ -439,8 +472,7 @@ impl<'a> HydrationFormatter<'a> {
                             &rev_flakes,
                             rev_nested_opt.as_deref(),
                             level,
-                            current_depth,
-                            max_depth,
+                            depth,
                             visited,
                             cache,
                         )
@@ -508,8 +540,7 @@ impl<'a> HydrationFormatter<'a> {
         &'b self,
         pred_ctx: PredicateContext<'b>,
         parent_level: &'b NestedSelectSpec,
-        current_depth: usize,
-        max_depth: usize,
+        depth: DepthBudget,
         visited: &'b mut HashSet<Sid>,
         cache: &'b mut HashMap<CacheKey, JsonValue>,
     ) -> Result<Vec<JsonValue>> {
@@ -526,27 +557,25 @@ impl<'a> HydrationFormatter<'a> {
                     } else {
                         // Hydration decision:
                         // 1. If explicit sub-selection exists → expand with that spec
-                        // 2. Else if current_depth < max_depth → auto-expand with FULL parent level
+                        // 2. Else if budget permits → auto-expand with FULL parent level
                         // 3. Else → just return {"@id": ...}
                         if let Some(nested) = pred_ctx.explicit_sub_spec {
                             values.push(
                                 self.format_subject(
                                     ref_sid,
                                     nested,
-                                    current_depth + 1,
-                                    max_depth,
+                                    depth.descend(),
                                     visited,
                                     cache,
                                 )
                                 .await?,
                             );
-                        } else if current_depth < max_depth {
+                        } else if depth.can_expand() {
                             values.push(
                                 self.format_subject(
                                     ref_sid,
                                     parent_level,
-                                    current_depth + 1,
-                                    max_depth,
+                                    depth.descend(),
                                     visited,
                                     cache,
                                 )
@@ -579,8 +608,7 @@ impl<'a> HydrationFormatter<'a> {
         flakes: &[Flake],
         nested_spec: Option<&'b NestedSelectSpec>,
         parent_level: &'b NestedSelectSpec,
-        current_depth: usize,
-        max_depth: usize,
+        depth: DepthBudget,
         visited: &'b mut HashSet<Sid>,
         cache: &'b mut HashMap<CacheKey, JsonValue>,
     ) -> Result<Vec<JsonValue>> {
@@ -591,28 +619,14 @@ impl<'a> HydrationFormatter<'a> {
 
             if let Some(nested) = nested_spec {
                 values.push(
-                    self.format_subject(
-                        subject_sid,
-                        nested,
-                        current_depth + 1,
-                        max_depth,
-                        visited,
-                        cache,
-                    )
-                    .await?,
+                    self.format_subject(subject_sid, nested, depth.descend(), visited, cache)
+                        .await?,
                 );
-            } else if current_depth < max_depth {
+            } else if depth.can_expand() {
                 // Auto-expand reverse refs with FULL parent level
                 values.push(
-                    self.format_subject(
-                        subject_sid,
-                        parent_level,
-                        current_depth + 1,
-                        max_depth,
-                        visited,
-                        cache,
-                    )
-                    .await?,
+                    self.format_subject(subject_sid, parent_level, depth.descend(), visited, cache)
+                        .await?,
                 );
             } else {
                 // No expansion - just @id
