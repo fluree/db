@@ -197,26 +197,6 @@ async fn format_hydration_column<'a>(
         .await
 }
 
-/// Format query results with hydration (sync entry point - returns error)
-///
-/// The sync entry point always returns an error directing callers to use
-/// `format_results_async()` instead, since hydration requires DB access.
-#[allow(dead_code)]
-pub fn format(result: &QueryResult, _compactor: &IriCompactor) -> Result<JsonValue> {
-    if !result.output.has_hydration() {
-        return Err(FormatError::InvalidBinding(
-            "Hydration format called without any hydration columns".into(),
-        ));
-    }
-
-    // Hydration always requires async DB access
-    Err(FormatError::InvalidBinding(
-        "Hydration formatting requires async database access. \
-         Use format_results_async() instead of format_results()."
-            .into(),
-    ))
-}
-
 /// Async hydration formatter entry point.
 ///
 /// This is the full hydration implementation with async database access
