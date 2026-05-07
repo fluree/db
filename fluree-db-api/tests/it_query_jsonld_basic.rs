@@ -1012,7 +1012,7 @@ async fn jsonld_two_hydration_columns_var_roots() {
     // Sort top-level rows by (friender @id, friend @id) so the assertion is
     // independent of solution iteration order.
     if let JsonValue::Array(rows) = &mut json_result {
-        rows.sort_by_key(|row| row_id_pair(row));
+        rows.sort_by_key(row_id_pair);
     }
 
     let expected = json!([
