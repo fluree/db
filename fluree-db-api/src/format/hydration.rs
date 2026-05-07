@@ -182,8 +182,7 @@ async fn format_hydration_column<'a>(
     let root_sid: Sid = match &spec.root {
         Root::Sid(sid) => sid.clone(),
         Root::Var(var_id) => {
-            let Some(sid) =
-                resolve_root_sid_from_binding(result, batch.get(row_idx, *var_id))?
+            let Some(sid) = resolve_root_sid_from_binding(result, batch.get(row_idx, *var_id))?
             else {
                 return Ok(JsonValue::Null);
             };
@@ -266,8 +265,10 @@ pub async fn format_async(
                         None => JsonValue::Null,
                     },
                     Column::Hydration(spec) => {
-                        format_hydration_column(&formatter, spec, result, batch, row_idx, &mut cache)
-                            .await?
+                        format_hydration_column(
+                            &formatter, spec, result, batch, row_idx, &mut cache,
+                        )
+                        .await?
                     }
                 };
                 row_values.push(value);
