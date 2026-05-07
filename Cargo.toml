@@ -41,7 +41,7 @@ members = [
 exclude = ["testsuite-sparql"]
 
 [workspace.package]
-version = "4.0.2"
+version = "4.0.3"
 edition = "2021"
 license = "BUSL-1.1"
 repository = "https://github.com/fluree/db"

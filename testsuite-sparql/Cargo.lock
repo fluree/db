@@ -278,11 +278,10 @@ dependencies = [
 
 [[package]]
 name = "cid"
-version = "0.11.1"
+version = "0.11.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3147d8272e8fa0ccd29ce51194dd98f79ddfb8191ba9e3409884e751798acf3a"
+checksum = "21a304f95f84d169a6f31c4d0a30d784643aaa0bbc9c1e449a2c23e963ec4971"
 dependencies = [
- "core2",
  "multibase",
  "multihash",
  "unsigned-varint",
@@ -324,15 +323,6 @@ name = "core-foundation-sys"
 version = "0.8.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "773648b94d0e5d620f64f280777445740e61fe701025087ec8b57f45c791888b"
-
-[[package]]
-name = "core2"
-version = "0.4.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b49ba7ef1ad6107f8824dbe97de947cbaac53c44e7f9756a1fba0d37c1eec505"
-dependencies = [
- "memchr",
-]
 
 [[package]]
 name = "cpufeatures"
@@ -629,7 +619,7 @@ checksum = "8bf7cc16383c4b8d58b9905a8509f02926ce3058053c056376248d958c9df1e8"
 
 [[package]]
 name = "fluree-db-api"
-version = "4.0.0"
+version = "4.0.3"
 dependencies = [
  "async-trait",
  "base64",
@@ -672,7 +662,7 @@ dependencies = [
 
 [[package]]
 name = "fluree-db-binary-index"
-version = "4.0.0"
+version = "4.0.3"
 dependencies = [
  "bigdecimal 0.4.10",
  "chrono",
@@ -702,7 +692,7 @@ dependencies = [
 
 [[package]]
 name = "fluree-db-connection"
-version = "4.0.0"
+version = "4.0.3"
 dependencies = [
  "async-trait",
  "fluree-db-core",
@@ -716,7 +706,7 @@ dependencies = [
 
 [[package]]
 name = "fluree-db-core"
-version = "4.0.0"
+version = "4.0.3"
 dependencies = [
  "async-trait",
  "bigdecimal 0.4.10",
@@ -750,7 +740,7 @@ dependencies = [
 
 [[package]]
 name = "fluree-db-credential"
-version = "4.0.0"
+version = "4.0.3"
 dependencies = [
  "base64",
  "bs58",
@@ -763,7 +753,7 @@ dependencies = [
 
 [[package]]
 name = "fluree-db-crypto"
-version = "4.0.0"
+version = "4.0.3"
 dependencies = [
  "aes-gcm",
  "async-trait",
@@ -779,7 +769,7 @@ dependencies = [
 
 [[package]]
 name = "fluree-db-indexer"
-version = "4.0.0"
+version = "4.0.3"
 dependencies = [
  "async-trait",
  "bigdecimal 0.4.10",
@@ -814,7 +804,7 @@ dependencies = [
 
 [[package]]
 name = "fluree-db-ledger"
-version = "4.0.0"
+version = "4.0.3"
 dependencies = [
  "async-trait",
  "fluree-db-core",
@@ -829,7 +819,7 @@ dependencies = [
 
 [[package]]
 name = "fluree-db-nameservice"
-version = "4.0.0"
+version = "4.0.3"
 dependencies = [
  "async-trait",
  "fluree-db-core",
@@ -845,7 +835,7 @@ dependencies = [
 
 [[package]]
 name = "fluree-db-novelty"
-version = "4.0.0"
+version = "4.0.3"
 dependencies = [
  "async-trait",
  "chrono",
@@ -862,7 +852,7 @@ dependencies = [
 
 [[package]]
 name = "fluree-db-policy"
-version = "4.0.0"
+version = "4.0.3"
 dependencies = [
  "fluree-db-core",
  "fluree-vocab",
@@ -873,7 +863,7 @@ dependencies = [
 
 [[package]]
 name = "fluree-db-query"
-version = "4.0.0"
+version = "4.0.3"
 dependencies = [
  "async-trait",
  "bigdecimal 0.4.10",
@@ -920,7 +910,7 @@ dependencies = [
 
 [[package]]
 name = "fluree-db-r2rml"
-version = "4.0.0"
+version = "4.0.3"
 dependencies = [
  "async-trait",
  "fluree-db-tabular",
@@ -936,7 +926,7 @@ dependencies = [
 
 [[package]]
 name = "fluree-db-reasoner"
-version = "4.0.0"
+version = "4.0.3"
 dependencies = [
  "async-trait",
  "fluree-db-core",
@@ -950,7 +940,7 @@ dependencies = [
 
 [[package]]
 name = "fluree-db-sparql"
-version = "4.0.0"
+version = "4.0.3"
 dependencies = [
  "fluree-db-core",
  "fluree-db-query",
@@ -965,7 +955,7 @@ dependencies = [
 
 [[package]]
 name = "fluree-db-spatial"
-version = "4.0.0"
+version = "4.0.3"
 dependencies = [
  "async-trait",
  "crc32fast",
@@ -993,14 +983,14 @@ dependencies = [
 
 [[package]]
 name = "fluree-db-tabular"
-version = "4.0.0"
+version = "4.0.3"
 dependencies = [
  "thiserror 1.0.69",
 ]
 
 [[package]]
 name = "fluree-db-transact"
-version = "4.0.0"
+version = "4.0.3"
 dependencies = [
  "async-trait",
  "bigdecimal 0.4.10",
@@ -1030,6 +1020,7 @@ dependencies = [
  "sha2",
  "tempfile",
  "thiserror 1.0.69",
+ "tokio",
  "tracing",
  "ulid",
  "zstd",
@@ -1037,7 +1028,7 @@ dependencies = [
 
 [[package]]
 name = "fluree-graph-format"
-version = "4.0.0"
+version = "4.0.3"
 dependencies = [
  "fluree-graph-ir",
  "serde",
@@ -1047,7 +1038,7 @@ dependencies = [
 
 [[package]]
 name = "fluree-graph-ir"
-version = "4.0.0"
+version = "4.0.3"
 dependencies = [
  "fluree-vocab",
  "serde",
@@ -1057,7 +1048,7 @@ dependencies = [
 
 [[package]]
 name = "fluree-graph-json-ld"
-version = "4.0.0"
+version = "4.0.3"
 dependencies = [
  "fluree-graph-ir",
  "fluree-vocab",
@@ -1068,7 +1059,7 @@ dependencies = [
 
 [[package]]
 name = "fluree-graph-turtle"
-version = "4.0.0"
+version = "4.0.3"
 dependencies = [
  "fluree-graph-ir",
  "fluree-vocab",
@@ -1081,7 +1072,7 @@ dependencies = [
 
 [[package]]
 name = "fluree-search-protocol"
-version = "4.0.0"
+version = "4.0.3"
 dependencies = [
  "serde",
  "serde_json",
@@ -1090,7 +1081,7 @@ dependencies = [
 
 [[package]]
 name = "fluree-vocab"
-version = "4.0.0"
+version = "4.0.3"
 
 [[package]]
 name = "foldhash"
@@ -1663,11 +1654,10 @@ dependencies = [
 
 [[package]]
 name = "multihash"
-version = "0.19.3"
+version = "0.19.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6b430e7953c29dd6a09afc29ff0bb69c6e306329ee6794700aee27b76a1aea8d"
+checksum = "577c63b00ad74d57e8c9aa870b5fccebf2fd64a308a5aee9f1bb88e4aea19447"
 dependencies = [
- "core2",
  "unsigned-varint",
 ]
 
@@ -2285,7 +2275,7 @@ dependencies = [
 
 [[package]]
 name = "testsuite-sparql"
-version = "4.0.0"
+version = "4.0.3"
 dependencies = [
  "anyhow",
  "fluree-db-api",
