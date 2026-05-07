@@ -177,6 +177,33 @@ impl VectorArena {
     pub fn raw_values(&self) -> &[f32] {
         &self.values
     }
+
+    /// Find an existing handle for `needle` by scanning stored vectors.
+    /// Bit-equality match. Returns `None` if no stored vector matches.
+    ///
+    /// Companion to `LazyVectorArena::find_handle_by_value` for the in-memory
+    /// arena used during fresh index builds. Same purpose: re-resolve a
+    /// retraction's vector value to the assertion's handle so cancellation by
+    /// `(s, p, dt, o_kind, o_key)` works without allocating a new slot.
+    pub fn find_handle_by_value(&self, needle: &[f32]) -> Option<u32> {
+        if self.count == 0 || needle.len() != self.dims as usize {
+            return None;
+        }
+        let d = self.dims as usize;
+        for handle in 0..self.count {
+            let start = handle as usize * d;
+            let end = start + d;
+            let stored = &self.values[start..end];
+            if stored
+                .iter()
+                .zip(needle.iter())
+                .all(|(a, b)| a.to_bits() == b.to_bits())
+            {
+                return Some(handle);
+            }
+        }
+        None
+    }
 }
 
 impl Default for VectorArena {
@@ -792,6 +819,43 @@ impl LazyVectorArena {
     // ========================================================================
     // Access mode 2: Streaming scan (transient — no cache pollution)
     // ========================================================================
+
+    /// Find the handle of a stored vector matching `needle` exactly (per-element
+    /// f32 bit equality). Returns `None` if no match exists.
+    ///
+    /// Used to re-resolve a vector value back to its existing arena handle for
+    /// retraction-vs-assertion cancellation: a `DELETE WHERE` produces a
+    /// retraction flake whose `FlakeValue::Vector(v)` value matches the
+    /// assertion's, but allocating a fresh handle would make the merge
+    /// cancellation (which keys on `(s, p, dt, o_kind, o_key)`) miss. The
+    /// retraction must reuse the assertion's handle.
+    ///
+    /// Linear scan across shards (loaded transiently, no cache pollution).
+    /// Per-predicate vector arenas are typically small in practice; if this
+    /// becomes a hot path, the manifest could grow a content-keyed lookup
+    /// index.
+    pub fn find_handle_by_value(&self, needle: &[f32]) -> io::Result<Option<u32>> {
+        if self.is_empty() || needle.len() != self.dims() as usize {
+            return Ok(None);
+        }
+        let mut found: Option<u32> = None;
+        self.scan_all(|handle, slice| {
+            // Bit-equality compare so f32::NaN (already rejected at coerce) and
+            // ±0 round-trip identically.
+            if slice.len() == needle.len()
+                && slice
+                    .iter()
+                    .zip(needle.iter())
+                    .all(|(a, b)| a.to_bits() == b.to_bits())
+            {
+                found = Some(handle);
+                ControlFlow::Break(())
+            } else {
+                ControlFlow::Continue(())
+            }
+        })?;
+        Ok(found)
+    }
 
     /// Scan all vectors sequentially. Each shard is loaded transiently
     /// (not inserted into the cache) to avoid evicting other entries.

@@ -158,7 +158,12 @@ impl CommitResolver {
         let mut retracts = 0u32;
 
         commit_ops.for_each_op(|raw_op: RawOp<'_>| {
-            let record = self.resolve_single_op(&raw_op, t, dicts)?;
+            // resolve_single_op returns Ok(None) for vector retractions with
+            // no matching assertion (a no-op). Skip emitting anything for
+            // those — neither a record nor a stats/spatial/fulltext side-effect.
+            let Some(record) = self.resolve_single_op(&raw_op, t, dicts)? else {
+                return Ok(());
+            };
 
             // Feed resolved record to ID-based stats hook (user-data ops only)
             if let Some(ref mut hook) = self.stats_hook {
@@ -617,13 +622,15 @@ impl CommitResolver {
         }
     }
 
-    /// Resolve a single RawOp into a RunRecord.
+    /// Resolve a single RawOp into a RunRecord, or `Ok(None)` for a no-op
+    /// that should not be emitted (currently: vector retraction with no
+    /// matching assertion).
     fn resolve_single_op(
         &mut self,
         op: &RawOp<'_>,
         t: u32,
         dicts: &mut GlobalDicts,
-    ) -> Result<RunRecord, CommitCodecError> {
+    ) -> Result<Option<RunRecord>, CommitCodecError> {
         // 1. Resolve graph
         let g_id = self
             .resolve_graph(op.g_ns_code, op.g_name, dicts)
@@ -654,15 +661,8 @@ impl CommitResolver {
         }
         let dt_id = dt_id as u16;
 
-        // 5. Encode object -> (ObjKind, ObjKey)
-        let (o_kind, o_key) = self
-            .resolve_object(&op.o, g_id, p_id, dt_id, dicts)
-            .map_err(|e| CommitCodecError::InvalidOp(format!("object resolve: {e}")))?;
-
-        // 6. Language tag
-        let lang_id = dicts.languages.get_or_insert(op.lang);
-
-        // 7. List index (convert Option<i32> to u32 with sentinel)
+        // 5. List index (convert Option<i32> to u32 with sentinel) — needed
+        // by vector fact-identity lookup before object encode.
         let i = match op.i {
             Some(idx) if idx >= 0 => idx as u32,
             Some(idx) => {
@@ -673,7 +673,33 @@ impl CommitResolver {
             None => LIST_INDEX_NONE,
         };
 
-        Ok(RunRecord {
+        // 6. Encode object -> Option<(ObjKind, ObjKey)>.
+        // Pass `op.op` + `(s_ns_code, s_name, i)` so vector retractions
+        // resolve to the assertion's arena handle by fact identity (see
+        // `resolve_object`). `None` means a no-op retraction; skip emitting.
+        let (o_kind, o_key) = match self
+            .resolve_object(
+                &op.o,
+                g_id,
+                op.s_ns_code,
+                op.s_name,
+                p_id,
+                i,
+                dt_id,
+                dicts,
+                op.op,
+            )
+            .map_err(|e| CommitCodecError::InvalidOp(format!("object resolve: {e}")))?
+        {
+            Some(pair) => pair,
+            None => return Ok(None),
+        };
+        let _ = s_id; // s_id used by the RunRecord constructor below.
+
+        // 7. Language tag
+        let lang_id = dicts.languages.get_or_insert(op.lang);
+
+        Ok(Some(RunRecord {
             g_id,
             s_id: SubjectId::from_u64(s_id),
             p_id,
@@ -684,7 +710,7 @@ impl CommitResolver {
             t,
             lang_id,
             i,
-        })
+        }))
     }
 
     // ---- Field resolvers ----
@@ -754,15 +780,88 @@ impl CommitResolver {
     /// - Finite floats -> NumF64 (inline); see fluree/db-r#142
     /// - NaN / Inf -> REJECT (error)
     /// - Overflow BigInt / BigDecimal -> NumBig (per-predicate equality-only arena)
+    ///
+    /// `is_assert` + `(s_id, o_i)` control vector arena handling: assertions
+    /// allocate a new arena slot AND record the fact-identity → handle map;
+    /// retractions look up the assertion's handle by fact identity (NOT by
+    /// value, since two distinct subjects can share the same vector value
+    /// and would alias). Returns `Ok(None)` for vector retractions with no
+    /// matching assertion (e.g. `DELETE DATA` for a never-asserted vector,
+    /// or a historical no-op) so the caller can skip emitting a record
+    /// rather than aborting the rebuild.
+    ///
+    /// `o_i = u32::MAX` is the "no list index" sentinel.
+    #[allow(clippy::too_many_arguments)]
     fn resolve_object(
         &mut self,
         obj: &RawObject<'_>,
         g_id: GraphId,
+        s_ns_code: u16,
+        s_name: &str,
         p_id: u32,
+        o_i: u32,
         _dt_id: u16,
         dicts: &mut GlobalDicts,
-    ) -> Result<(ObjKind, ObjKey), String> {
-        match obj {
+        is_assert: bool,
+    ) -> Result<Option<(ObjKind, ObjKey)>, String> {
+        // Vector handling is unique: assertions allocate + record fact identity;
+        // retractions look up by fact identity (NOT by value, to avoid aliasing
+        // between distinct subjects with the same vector value); unmatched
+        // retractions return Ok(None) so the caller skips them.
+        if let RawObject::Vector(v) = obj {
+            let arena = dicts
+                .vectors
+                .entry(g_id)
+                .or_default()
+                .entry(p_id)
+                .or_default();
+            let fact_map = dicts.vector_fact_handles.entry(g_id).or_default();
+            // Key by (subject ns_code, subject name, p_id, o_i, f32_bits).
+            // Subject-name space (not s_id) so the key matches across the
+            // chunk-local-vs-global s_id boundary in the incremental
+            // resolve pipeline; f32 bits disambiguate multi-valued vectors
+            // per (s, p, o_i) without list indices.
+            let f32_bits: Vec<u32> = v.iter().map(|&x| (x as f32).to_bits()).collect();
+            let key = (
+                s_ns_code,
+                std::sync::Arc::<str>::from(s_name),
+                p_id,
+                o_i,
+                f32_bits,
+            );
+            if is_assert {
+                // Re-assertion of the same logical fact reuses the
+                // existing arena handle so encoded identity stays stable
+                // across commits. Without this, a second `INSERT` of the
+                // same `(s, p, o_i, value)` would get a fresh `o_key` and
+                // the two rows could not cancel under a single retraction.
+                let handle = if let Some(&existing) = fact_map.get(&key) {
+                    existing
+                } else {
+                    let h = arena
+                        .insert_f64(v)
+                        .map_err(|e| format!("vector arena insert: {e}"))?;
+                    fact_map.insert(key, h);
+                    h
+                };
+                return Ok(Some((ObjKind::VECTOR_ID, ObjKey::encode_u32_id(handle))));
+            }
+            return match fact_map.get(&key).copied() {
+                Some(handle) => Ok(Some((ObjKind::VECTOR_ID, ObjKey::encode_u32_id(handle)))),
+                None => {
+                    tracing::debug!(
+                        g_id,
+                        s_ns_code,
+                        s_name,
+                        p_id,
+                        o_i,
+                        "vector retraction has no matching assertion; skipping (no-op)"
+                    );
+                    Ok(None)
+                }
+            };
+        }
+        let result = match obj {
             RawObject::Long(v) => Ok((ObjKind::NUM_INT, ObjKey::encode_i64(*v))),
             RawObject::Double(v) => {
                 // NOTE: Do not optimize integral doubles to NUM_INT here.
@@ -823,13 +922,13 @@ impl CommitResolver {
             RawObject::BigIntStr(s) => {
                 // Try to parse as i64 first for NumInt fast path
                 if let Ok(v) = s.parse::<i64>() {
-                    return Ok((ObjKind::NUM_INT, ObjKey::encode_i64(v)));
+                    return Ok(Some((ObjKind::NUM_INT, ObjKey::encode_i64(v))));
                 }
                 // Parse as BigInt
                 match s.parse::<BigInt>() {
                     Ok(bi) => {
                         if let Some(v) = num_traits::ToPrimitive::to_i64(&bi) {
-                            return Ok((ObjKind::NUM_INT, ObjKey::encode_i64(v)));
+                            return Ok(Some((ObjKind::NUM_INT, ObjKey::encode_i64(v))));
                         }
                         // Overflow BigInt -> NumBig
                         let handle = dicts
@@ -938,18 +1037,10 @@ impl CommitResolver {
                     .map_err(|e| format!("geo point encode: {e}"))?;
                 Ok((ObjKind::GEO_POINT, key))
             }
-            RawObject::Vector(v) => {
-                let handle = dicts
-                    .vectors
-                    .entry(g_id)
-                    .or_default()
-                    .entry(p_id)
-                    .or_default()
-                    .insert_f64(v)
-                    .map_err(|e| format!("vector arena insert: {e}"))?;
-                Ok((ObjKind::VECTOR_ID, ObjKey::encode_u32_id(handle)))
-            }
-        }
+            // Vector handled at the top of this function — unreachable here.
+            RawObject::Vector(_) => unreachable!("vector handled before match"),
+        };
+        result.map(Some)
     }
 
     /// Look up the prefix IRI for a namespace code.
@@ -996,6 +1087,15 @@ pub struct SharedResolverState {
     /// Outer key = g_id, inner key = p_id.
     pub vectors:
         FxHashMap<GraphId, FxHashMap<u32, fluree_db_binary_index::arena::vector::VectorArena>>,
+    /// Fact-identity → vector arena handle mapping for retraction lookup.
+    /// Keyed by `(g_id, s_ns_code, s_name, p_id, o_i, f32_bits)` — full
+    /// fact identity in subject-name space. See
+    /// `GlobalDicts::vector_fact_handles` for the rationale (key must be
+    /// stable across chunk-local/global s_id, and `f32_bits` distinguishes
+    /// multi-valued vectors per s/p without list index).
+    #[allow(clippy::type_complexity)]
+    pub vector_fact_handles:
+        FxHashMap<GraphId, FxHashMap<(u16, std::sync::Arc<str>, u32, u32, Vec<u32>), u32>>,
     /// Datatype dict ID → ValueTypeTag mapping, populated at insertion time.
     /// Indexed by dt_id (u32). Pre-seeded with reserved entries in `new()`.
     pub dt_tags: Vec<fluree_db_core::value_id::ValueTypeTag>,
@@ -1055,6 +1155,7 @@ impl SharedResolverState {
             languages: super::global_dict::LanguageTagDict::new(),
             numbigs: FxHashMap::default(),
             vectors: FxHashMap::default(),
+            vector_fact_handles: FxHashMap::default(),
             dt_tags,
             spatial_hook: None,
             fulltext_hook: None,
@@ -1181,6 +1282,7 @@ impl SharedResolverState {
             languages,
             numbigs: FxHashMap::default(),
             vectors: FxHashMap::default(),
+            vector_fact_handles: FxHashMap::default(),
             dt_tags,
             spatial_hook: None,
             fulltext_hook: None,
@@ -1324,7 +1426,11 @@ impl SharedResolverState {
                 }
             }
 
-            let record = self.resolve_op_chunk(&raw_op, t, chunk)?;
+            // Skip vector retractions with no matching assertion: a no-op
+            // shouldn't drive any side-effect (stats / spatial / fulltext).
+            let Some(record) = self.resolve_op_chunk(&raw_op, t, chunk)? else {
+                return Ok(());
+            };
 
             // Feed raw op to spatial hook (needs raw WKT string + resolved IDs).
             // Note: record.s_id is chunk-local here; subject IDs in spatial entries
@@ -1393,7 +1499,7 @@ impl SharedResolverState {
         op: &RawOp<'_>,
         t: u32,
         chunk: &mut RebuildChunk,
-    ) -> Result<RunRecord, CommitCodecError> {
+    ) -> Result<Option<RunRecord>, CommitCodecError> {
         // 1. Resolve graph (global)
         let g_id = self
             .resolve_graph(op.g_ns_code, op.g_name)
@@ -1414,15 +1520,7 @@ impl SharedResolverState {
         }
         let dt_id = dt_id as u16;
 
-        // 5. Encode object (subjects/strings → chunk-local)
-        let (o_kind, o_key) = self
-            .resolve_object_chunk(&op.o, g_id, p_id, dt_id, chunk)
-            .map_err(|e| CommitCodecError::InvalidOp(format!("object resolve: {e}")))?;
-
-        // 6. Language tag (global)
-        let lang_id = self.languages.get_or_insert(op.lang);
-
-        // 7. List index
+        // 5. List index — needed by vector fact-identity lookup before object encode.
         let i = match op.i {
             Some(idx) if idx >= 0 => idx as u32,
             Some(idx) => {
@@ -1433,7 +1531,31 @@ impl SharedResolverState {
             None => LIST_INDEX_NONE,
         };
 
-        Ok(RunRecord {
+        // 6. Encode object → Option<(ObjKind, ObjKey)>.
+        // `None` = vector retraction with no matching assertion: skip emit.
+        let (o_kind, o_key) = match self
+            .resolve_object_chunk(
+                &op.o,
+                g_id,
+                op.s_ns_code,
+                op.s_name,
+                p_id,
+                i,
+                dt_id,
+                chunk,
+                op.op,
+            )
+            .map_err(|e| CommitCodecError::InvalidOp(format!("object resolve: {e}")))?
+        {
+            Some(pair) => pair,
+            None => return Ok(None),
+        };
+        let _ = s_id; // used by the RunRecord constructor below.
+
+        // 7. Language tag (global)
+        let lang_id = self.languages.get_or_insert(op.lang);
+
+        Ok(Some(RunRecord {
             g_id,
             s_id: SubjectId::from_u64(s_id),
             p_id,
@@ -1444,7 +1566,7 @@ impl SharedResolverState {
             t,
             lang_id,
             i,
-        })
+        }))
     }
 
     /// Resolve subject to a chunk-local sequential u64 ID.
@@ -1483,15 +1605,75 @@ impl SharedResolverState {
     }
 
     /// Encode object value using chunk-local dicts for subjects/strings.
+    ///
+    /// `is_assert` controls vector arena handling — see [`CommitResolver::resolve_object`].
+    #[allow(clippy::too_many_arguments)]
     fn resolve_object_chunk(
         &mut self,
         obj: &RawObject<'_>,
         g_id: GraphId,
+        s_ns_code: u16,
+        s_name: &str,
         p_id: u32,
+        o_i: u32,
         _dt_id: u16,
         chunk: &mut RebuildChunk,
-    ) -> Result<(ObjKind, ObjKey), String> {
-        match obj {
+        is_assert: bool,
+    ) -> Result<Option<(ObjKind, ObjKey)>, String> {
+        // Vector handling — see `CommitResolver::resolve_object` for details.
+        // Fact-identity `(s_id, p_id, o_i, f32_bits)` → handle is required so:
+        // (a) two distinct subjects with the same vector value don't alias,
+        // (b) one subject with multiple values under the same predicate
+        //     (no list index, both have o_i=MAX) don't overwrite each other.
+        if let RawObject::Vector(v) = obj {
+            let arena = self
+                .vectors
+                .entry(g_id)
+                .or_default()
+                .entry(p_id)
+                .or_default();
+            let fact_map = self.vector_fact_handles.entry(g_id).or_default();
+            let f32_bits: Vec<u32> = v.iter().map(|&x| (x as f32).to_bits()).collect();
+            let key = (
+                s_ns_code,
+                std::sync::Arc::<str>::from(s_name),
+                p_id,
+                o_i,
+                f32_bits,
+            );
+            if is_assert {
+                // Re-assertion of the same logical fact reuses the
+                // existing arena handle so encoded identity stays stable
+                // across commits. Without this, a second `INSERT` of the
+                // same `(s, p, o_i, value)` would get a fresh `o_key` and
+                // the two rows could not cancel under a single retraction.
+                let handle = if let Some(&existing) = fact_map.get(&key) {
+                    existing
+                } else {
+                    let h = arena
+                        .insert_f64(v)
+                        .map_err(|e| format!("vector arena insert: {e}"))?;
+                    fact_map.insert(key, h);
+                    h
+                };
+                return Ok(Some((ObjKind::VECTOR_ID, ObjKey::encode_u32_id(handle))));
+            }
+            return match fact_map.get(&key).copied() {
+                Some(handle) => Ok(Some((ObjKind::VECTOR_ID, ObjKey::encode_u32_id(handle)))),
+                None => {
+                    tracing::debug!(
+                        g_id,
+                        s_ns_code,
+                        s_name,
+                        p_id,
+                        o_i,
+                        "vector retraction has no matching assertion; skipping (no-op)"
+                    );
+                    Ok(None)
+                }
+            };
+        }
+        let result = match obj {
             RawObject::Long(v) => Ok((ObjKind::NUM_INT, ObjKey::encode_i64(*v))),
             RawObject::Double(v) => {
                 // NOTE: Do not optimize integral doubles to NUM_INT here.
@@ -1530,12 +1712,12 @@ impl SharedResolverState {
                 .map_err(|e| format!("time parse: {e}")),
             RawObject::BigIntStr(s) => {
                 if let Ok(v) = s.parse::<i64>() {
-                    return Ok((ObjKind::NUM_INT, ObjKey::encode_i64(v)));
+                    return Ok(Some((ObjKind::NUM_INT, ObjKey::encode_i64(v))));
                 }
                 match s.parse::<BigInt>() {
                     Ok(bi) => {
                         if let Some(v) = num_traits::ToPrimitive::to_i64(&bi) {
-                            return Ok((ObjKind::NUM_INT, ObjKey::encode_i64(v)));
+                            return Ok(Some((ObjKind::NUM_INT, ObjKey::encode_i64(v))));
                         }
                         let handle = self
                             .numbigs
@@ -1625,18 +1807,10 @@ impl SharedResolverState {
                     .map_err(|e| format!("geo point encode: {e}"))?;
                 Ok((ObjKind::GEO_POINT, key))
             }
-            RawObject::Vector(v) => {
-                let handle = self
-                    .vectors
-                    .entry(g_id)
-                    .or_default()
-                    .entry(p_id)
-                    .or_default()
-                    .insert_f64(v)
-                    .map_err(|e| format!("vector arena insert: {e}"))?;
-                Ok((ObjKind::VECTOR_ID, ObjKey::encode_u32_id(handle)))
-            }
-        }
+            // Vector handled at the top of this function.
+            RawObject::Vector(_) => unreachable!("vector handled before match"),
+        };
+        result.map(Some)
     }
 
     /// Emit txn-meta RunRecords into the chunk using chunk-local subject/string dicts.

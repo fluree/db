@@ -72,7 +72,7 @@ pub fn is_system_graph(g_id: GraphId) -> bool {
 fn apply_time_travel(
     cursor: &mut BinaryCursor,
     config: &ExportConfig,
-    store: &BinaryIndexStore,
+    store: &Arc<BinaryIndexStore>,
 ) -> EphemeralPredicateMap {
     cursor.set_to_t(config.to_t);
     if let Some(overlay) = config.overlay {

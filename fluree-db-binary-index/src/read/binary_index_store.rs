@@ -745,6 +745,143 @@ impl BinaryIndexStore {
         }
     }
 
+    /// Find the existing vector arena handle for the given quantized f32
+    /// `value` under `(g_id, p_id)`. Returns `None` if no arena exists for
+    /// the predicate, or if the value isn't stored.
+    ///
+    /// **Value-only lookup.** When two distinct subjects hold the same
+    /// vector value under the same predicate, both have separate handles
+    /// and this returns whichever was inserted first — caller must
+    /// handle the ambiguity (or use [`find_vector_handle_by_fact`] for
+    /// the retraction-cancellation case).
+    pub fn find_vector_handle(
+        &self,
+        g_id: GraphId,
+        p_id: u32,
+        value: &[f32],
+    ) -> io::Result<Option<u32>> {
+        let arena = match self
+            .graph_indexes
+            .get(&g_id)
+            .and_then(|gi| gi.vectors.get(&p_id))
+        {
+            Some(a) => a,
+            None => return Ok(None),
+        };
+        arena.find_handle_by_value(value)
+    }
+
+    /// Find the vector arena handle for a specific *fact* identified by
+    /// `(g_id, s_id, p_id, o_i, value)`. Returns `None` if no row matches.
+    ///
+    /// This is the correct primitive for vector-retraction overlay
+    /// translation: scans the SPOT prefix `(s_id, p_id, o_type=VECTOR, o_i)`,
+    /// then for each candidate row decodes the arena value and bit-compares
+    /// to `value` before returning its `o_key`.
+    ///
+    /// `value` must be the f32-quantized vector (same form the arena stores).
+    /// The value-comparison step is required because:
+    /// - Two distinct subjects can hold the same value under the same
+    ///   predicate (each with its own handle), AND
+    /// - One subject can hold MULTIPLE different values under the same
+    ///   predicate without a list index (all share `o_i = LIST_INDEX_NONE`),
+    ///   so `(s, p, o_i)` alone is not unique.
+    ///
+    /// `o_i` should be `u32::MAX` (`LIST_INDEX_NONE`) for non-list
+    /// vector facts.
+    pub fn find_vector_handle_by_fact(
+        self: &Arc<Self>,
+        g_id: GraphId,
+        s_id: u64,
+        p_id: u32,
+        o_i: u32,
+        value: &[f32],
+    ) -> io::Result<Option<u32>> {
+        use crate::format::run_record::RunSortOrder;
+        use crate::read::binary_cursor::BinaryCursor;
+        use crate::read::column_types::{BinaryFilter, ColumnProjection, ColumnSet};
+        use fluree_db_core::o_type::OType;
+
+        let branch = match self.branch_for_order(g_id, RunSortOrder::Spot) {
+            Some(b) => Arc::clone(b),
+            None => return Ok(None),
+        };
+        let arena = self
+            .graph_indexes
+            .get(&g_id)
+            .and_then(|gi| gi.vectors.get(&p_id));
+
+        let filter = BinaryFilter {
+            s_id: Some(s_id),
+            p_id: Some(p_id),
+            o_type: Some(OType::VECTOR.as_u16()),
+            o_i: Some(o_i),
+            ..Default::default()
+        };
+        let projection = ColumnProjection::for_scan(ColumnSet::EMPTY, false, RunSortOrder::Spot);
+        let mut cursor = BinaryCursor::scan_all(
+            Arc::clone(self),
+            RunSortOrder::Spot,
+            branch,
+            filter,
+            projection,
+        );
+
+        while let Some(batch) = cursor.next_batch()? {
+            for i in 0..batch.row_count {
+                if batch.s_id.get(i) == s_id
+                    && batch.p_id.get(i) == p_id
+                    && batch.o_type.get_or(i, 0) == OType::VECTOR.as_u16()
+                    && batch.o_i.get_or(i, u32::MAX) == o_i
+                {
+                    let candidate_handle = batch.o_key.get(i) as u32;
+                    if let Some(arena) = arena {
+                        if let Some(slice) = arena.lookup_vector(candidate_handle)? {
+                            let stored = slice.as_f32();
+                            if stored.len() == value.len()
+                                && stored
+                                    .iter()
+                                    .zip(value.iter())
+                                    .all(|(a, b)| a.to_bits() == b.to_bits())
+                            {
+                                return Ok(Some(candidate_handle));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        Ok(None)
+    }
+
+    /// Decode an `s_id` into its `(ns_code, suffix)` parts via the subject
+    /// forward pack — the inverse of `sid_for_iri`'s split. Returns
+    /// `Err(NotFound)` if the namespace code or local ID isn't registered.
+    /// Useful for incremental indexing where we need the canonical
+    /// subject-name pair (not the joined IRI) as a HashMap key.
+    pub fn resolve_subject_parts(&self, s_id: u64) -> io::Result<(u16, String)> {
+        let sid = fluree_db_core::subject_id::SubjectId::from_u64(s_id);
+        let ns_code = sid.ns_code();
+        let local_id = sid.local_id();
+        let reader = self
+            .dicts
+            .subject_forward_packs
+            .get(&ns_code)
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::NotFound,
+                    format!("no subject forward pack for ns_code={ns_code}"),
+                )
+            })?;
+        let suffix = reader.forward_lookup_str(local_id)?.ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("subject local_id {local_id} not found in ns {ns_code}"),
+            )
+        })?;
+        Ok((ns_code, suffix))
+    }
+
     /// Resolve a subject ID (u64) to its full IRI string.
     pub fn resolve_subject_iri(&self, s_id: u64) -> io::Result<String> {
         let sid = fluree_db_core::subject_id::SubjectId::from_u64(s_id);

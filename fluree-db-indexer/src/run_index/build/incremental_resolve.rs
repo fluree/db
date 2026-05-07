@@ -239,8 +239,17 @@ pub async fn resolve_incremental_commits_v6(
         );
     }
 
-    // 4a. Pre-seed numbig arenas.
-    let (base_numbig_counts, base_vector_counts, t_seed_arenas_ms) = {
+    // 4a. Pre-seed numbig arenas + read vector manifests.
+    //
+    // Numbig arenas are loaded fully (cheap; needed regardless of chunk
+    // content). Vector manifests are read for `base_vector_counts` (also
+    // cheap; consumed by the result envelope and the chunk-vs-base sanity
+    // guard further down). Vector arena SHARDS — the expensive part — are
+    // deferred to the conditional load below: they're only worth fetching
+    // when the chunk actually touches vectors. Without this split, ledgers
+    // accumulating vector data pay the full shard-reload cost on every
+    // incremental publish even for non-vector-touching commits.
+    let (base_numbig_counts, base_vector_counts, vector_manifests, t_seed_arenas_ms) = {
         let t0 = Instant::now();
 
         let mut base_numbig_counts: HashMap<(u16, u32), usize> = HashMap::new();
@@ -266,8 +275,12 @@ pub async fn resolve_incremental_commits_v6(
             }
         }
 
-        // 4b. Collect base vector counts.
         let mut base_vector_counts: HashMap<(u16, u32), u32> = HashMap::new();
+        let mut vector_manifests: Vec<(
+            u16,
+            u32,
+            fluree_db_binary_index::arena::vector::VectorManifest,
+        )> = Vec::new();
         for ga in &root.graph_arenas {
             for vref in &ga.vectors {
                 let manifest_bytes = cs.get(&vref.manifest).await.map_err(|e| {
@@ -284,17 +297,21 @@ pub async fn resolve_incremental_commits_v6(
                             ))
                         })?;
                 base_vector_counts.insert((ga.g_id, vref.p_id), manifest.total_count);
+                vector_manifests.push((ga.g_id, vref.p_id, manifest));
             }
         }
 
         (
             base_numbig_counts,
             base_vector_counts,
+            vector_manifests,
             t0.elapsed().as_millis() as u64,
         )
     };
 
-    // 5. Walk commit chain (commit format is version-independent).
+    // 5. Walk commit chain (commit format is version-independent). Moved
+    // ahead of the vector-shard load so we can detect whether the chunk
+    // contains any vector op before deciding to pay that cost.
     let (walked_commits, t_walk_chain_ms) = {
         let t0 = Instant::now();
         let commits = walk_commit_chain_since(
@@ -307,6 +324,86 @@ pub async fn resolve_incremental_commits_v6(
         (commits, t0.elapsed().as_millis() as u64)
     };
 
+    // 4b/4c. Vector arena shard load + fact-handle seeding — gated on the
+    // chunk actually containing a vector op (assert or retract).
+    //
+    // 4b's purpose is to make chunk-side `arena.insert_f64` return globally
+    // correct handles by appending to the pre-loaded base arena. 4c's
+    // purpose is to let chunk-side retractions / re-assertions of base
+    // vectors find the matching base handle. Both are pure waste when the
+    // chunk doesn't touch vectors at all — and on a vector-heavy ledger the
+    // unnecessary cost is proportional to the entire base vector dataset
+    // (every shard reloaded, every base SPOT VECTOR row scanned), not the
+    // size of the new chunk.
+    // Tracking three distinct concepts here:
+    //   - `base_has_vectors`: any vector arenas in the base index.
+    //   - `chunk_has_vectors`: any commit in the chunk asserts/retracts a
+    //     vector. Pre-scan is skipped when base has none, since preload
+    //     wouldn't run regardless and the answer is irrelevant.
+    //   - `base_vector_preload_needed`: the actual gate for the expensive
+    //     work — true only when both flags are true.
+    let base_has_vectors = !vector_manifests.is_empty();
+    let chunk_has_vectors = if base_has_vectors {
+        chunk_has_vector_ops(&walked_commits)?
+    } else {
+        false
+    };
+    let base_vector_preload_needed = base_has_vectors && chunk_has_vectors;
+    let t_vector_load_ms = if base_vector_preload_needed {
+        let t0 = Instant::now();
+        for (g_id, p_id, manifest) in &vector_manifests {
+            let mut shards = Vec::with_capacity(manifest.shards.len());
+            for shard_info in &manifest.shards {
+                let cid: ContentId = shard_info.cas.parse().map_err(|e| {
+                    IncrementalResolveError::RootLoad(format!(
+                        "vector shard CID parse for g_id={g_id}, p_id={p_id}: {e}"
+                    ))
+                })?;
+                let bytes = cs.get(&cid).await.map_err(|e| {
+                    IncrementalResolveError::RootLoad(format!(
+                        "vector shard load for g_id={g_id}, p_id={p_id}, cid={}: {e}",
+                        shard_info.cas
+                    ))
+                })?;
+                let shard =
+                    fluree_db_binary_index::arena::vector::read_vector_shard_from_bytes(&bytes)
+                        .map_err(|e| {
+                            IncrementalResolveError::RootLoad(format!(
+                                "vector shard decode for g_id={g_id}, p_id={p_id}: {e}"
+                            ))
+                        })?;
+                shards.push(shard);
+            }
+            let arena =
+                fluree_db_binary_index::arena::vector::load_arena_from_shards(manifest, shards)
+                    .map_err(|e| {
+                        IncrementalResolveError::RootLoad(format!(
+                            "vector arena reassembly for g_id={g_id}, p_id={p_id}: {e}"
+                        ))
+                    })?;
+            shared
+                .vectors
+                .entry(*g_id)
+                .or_default()
+                .insert(*p_id, arena);
+        }
+        if !shared.vectors.is_empty() {
+            seed_vector_fact_handles(
+                Arc::clone(&cs),
+                &root,
+                &mut shared,
+                config.artifact_cache_dir.as_deref(),
+            )
+            .await
+            .map_err(|e| {
+                IncrementalResolveError::RootLoad(format!("vector fact-handle seed: {e}"))
+            })?;
+        }
+        t0.elapsed().as_millis() as u64
+    } else {
+        0
+    };
+
     tracing::debug!(
         commit_count = walked_commits.len(),
         root_load_ms = t_root_load_ms,
@@ -314,6 +411,15 @@ pub async fn resolve_incremental_commits_v6(
         dict_load_ms = t_dict_load_ms,
         seed_arenas_ms = t_seed_arenas_ms,
         walk_chain_ms = t_walk_chain_ms,
+        base_has_vectors,
+        chunk_has_vectors,
+        // The pre-scan is skipped when `base_has_vectors == false` (preload
+        // wouldn't run regardless), so `chunk_has_vectors` is hard-coded
+        // false in that branch. This flag disambiguates "chunk has no
+        // vector ops" from "we didn't check."
+        chunk_vector_prescan_skipped = !base_has_vectors,
+        base_vector_preload_needed,
+        vector_load_ms = t_vector_load_ms,
         avg_walk_ms_per_commit = if walked_commits.is_empty() {
             0.0
         } else {
@@ -422,6 +528,7 @@ pub async fn resolve_incremental_commits_v6(
     }
 
     // 7. Reconcile chunk-local IDs to global IDs (same algorithm as V5).
+    let t_reconcile_start = Instant::now();
     let reconcile = reconcile_chunk_to_global(
         &chunk,
         &subject_tree,
@@ -429,16 +536,7 @@ pub async fn resolve_incremental_commits_v6(
         &base_subject_watermarks,
         base_string_watermark,
     )?;
-    let t_reconcile_ms = t_start.elapsed().as_millis().saturating_sub(
-        (t_root_load_ms
-            + t_root_decode_ms
-            + t_dict_load_ms
-            + t_seed_arenas_ms
-            + t_walk_chain_ms
-            + t_commit_resolve_ms) as u128,
-    ) as u64;
-    // Note: the above gives a conservative aggregate since start; we also measure precise
-    // step timings below where possible.
+    let t_reconcile_ms = t_reconcile_start.elapsed().as_millis() as u64;
 
     // 8. Remap fulltext hook entries.
     let t0 = Instant::now();
@@ -479,17 +577,35 @@ pub async fn resolve_incremental_commits_v6(
     }
     let t_remap_records_ms = t0.elapsed().as_millis() as u64;
 
-    // Offset vector handles.
-    if !base_vector_counts.is_empty() {
-        for record in &mut v1_records {
-            if ObjKind::from_u8(record.o_kind) == ObjKind::VECTOR_ID {
-                let key = (record.g_id, record.p_id);
-                if let Some(&base_count) = base_vector_counts.get(&key) {
-                    record.o_key += base_count as u64;
-                }
+    // VECTOR_ID handles are already globally-correct: chunk inserts
+    // appended to the pre-loaded base arena (step 4b) so they return
+    // `base_count..base_count+chunk_count` directly, and retractions /
+    // re-assertions resolve to base handles via the pre-populated
+    // `vector_fact_handles` (step 4c). No offset pass needed.
+    //
+    // Sanity guard: every VECTOR_ID record's o_key must be < total arena
+    // count (base + chunk). A regression here would mean a chunk emitted
+    // a handle that doesn't exist in the unified arena.
+    debug_assert!(
+        v1_records.iter().all(|record| {
+            if ObjKind::from_u8(record.o_kind) != ObjKind::VECTOR_ID {
+                return true;
             }
-        }
-    }
+            let base_count = base_vector_counts
+                .get(&(record.g_id, record.p_id))
+                .copied()
+                .unwrap_or(0) as u64;
+            let chunk_count = shared
+                .vectors
+                .get(&record.g_id)
+                .and_then(|m| m.get(&record.p_id))
+                .map(|a| a.len() as u64)
+                .unwrap_or(0);
+            // `chunk_count` is base + new (since base was pre-loaded).
+            record.o_key < chunk_count.max(base_count)
+        }),
+        "VECTOR_ID record has out-of-range o_key after pre-loaded incremental resolve"
+    );
 
     // 10. Sort V1 records by (g_id, SPOT) — needed for the conversion step
     //     which preserves sort order.
@@ -548,6 +664,54 @@ pub async fn resolve_incremental_commits_v6(
 }
 
 // ============================================================================
+// Internal: Vector-op pre-scan
+// ============================================================================
+
+/// Detect whether any commit in the new chunk asserts or retracts a vector
+/// flake. Used to gate the expensive vector arena pre-load and SPOT-scan
+/// fact-handle seeding on incremental publish — when the chunk doesn't
+/// touch vectors, both are wasted work, scaling with base size rather
+/// than chunk size.
+///
+/// Stops scanning at the first commit that contains a vector op. Within a
+/// commit, `for_each_op` is a single linear pass over the ops buffer, so
+/// finishing one commit's iteration after the flag is set is essentially
+/// free relative to the work we save.
+fn chunk_has_vector_ops(walked_commits: &[WalkedCommit]) -> Result<bool, IncrementalResolveError> {
+    use fluree_db_core::commit::codec::load_commit_ops;
+    use fluree_db_core::commit::codec::raw_reader::RawObject;
+
+    for walked in walked_commits {
+        let commit_ops = load_commit_ops(&walked.bytes).map_err(|e| {
+            IncrementalResolveError::RootLoad(format!(
+                "vector-op pre-scan: load_commit_ops for {}: {e}",
+                walked.cid
+            ))
+        })?;
+
+        let mut found = false;
+        commit_ops
+            .for_each_op(|raw_op| {
+                if matches!(raw_op.o, RawObject::Vector(_)) {
+                    found = true;
+                }
+                Ok(())
+            })
+            .map_err(|e| {
+                IncrementalResolveError::RootLoad(format!(
+                    "vector-op pre-scan: for_each_op for {}: {e}",
+                    walked.cid
+                ))
+            })?;
+
+        if found {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+// ============================================================================
 // Internal: Commit Chain Walking
 // ============================================================================
 
@@ -555,6 +719,114 @@ struct WalkedCommit {
     cid: ContentId,
     t: i64,
     bytes: Vec<u8>,
+}
+
+/// SPOT-scan the base index for every `o_kind = VECTOR_ID` row and
+/// pre-populate `shared.vector_fact_handles` with
+/// `(g_id, s_ns_code, s_name, p_id, o_i, f32_bits) → handle` so chunk
+/// retractions of base-asserted vectors find their handle (and chunk
+/// re-assertions dedup against the base entry).
+///
+/// Reuses the public `BinaryIndexStore::load_from_root_v6` for the SPOT
+/// cursor + dict decoding. The duplicate arena loading is bounded; if it
+/// becomes a hot path we can add a slimmer "scan-only" loader.
+async fn seed_vector_fact_handles(
+    cs: Arc<dyn ContentStore>,
+    root: &fluree_db_binary_index::format::index_root::IndexRoot,
+    shared: &mut SharedResolverState,
+    cache_dir: Option<&std::path::Path>,
+) -> io::Result<()> {
+    use fluree_db_binary_index::format::run_record::RunSortOrder;
+    use fluree_db_binary_index::read::binary_cursor::BinaryCursor;
+    use fluree_db_binary_index::read::binary_index_store::BinaryIndexStore;
+    use fluree_db_binary_index::read::column_types::{BinaryFilter, ColumnProjection, ColumnSet};
+    use fluree_db_core::o_type::OType;
+
+    let cache_dir = cache_dir
+        .map(std::path::Path::to_path_buf)
+        .unwrap_or_else(std::env::temp_dir);
+
+    let store = Arc::new(
+        BinaryIndexStore::load_from_root_v6(Arc::clone(&cs), root, &cache_dir, None).await?,
+    );
+
+    // Walk every graph that has vector arenas; for each, scan SPOT for
+    // VECTOR_ID rows and decode (s_ns_code, s_name, p_id, o_i, value) →
+    // handle into the shared fact map.
+    let graphs_with_vectors: Vec<u16> = shared.vectors.keys().copied().collect();
+    for g_id in graphs_with_vectors {
+        let branch = match store.branch_for_order(g_id, RunSortOrder::Spot) {
+            Some(b) => Arc::clone(b),
+            None => continue,
+        };
+        let arena_map = match shared.vectors.get(&g_id) {
+            Some(m) => m,
+            None => continue,
+        };
+        let filter = BinaryFilter {
+            o_type: Some(OType::VECTOR.as_u16()),
+            ..Default::default()
+        };
+        let projection = ColumnProjection::for_scan(ColumnSet::EMPTY, false, RunSortOrder::Spot);
+        let mut cursor = BinaryCursor::scan_all(
+            Arc::clone(&store),
+            RunSortOrder::Spot,
+            branch,
+            filter,
+            projection,
+        );
+        let fact_map = shared.vector_fact_handles.entry(g_id).or_default();
+        while let Some(batch) = cursor.next_batch()? {
+            for i in 0..batch.row_count {
+                if batch.o_type.get_or(i, 0) != OType::VECTOR.as_u16() {
+                    continue;
+                }
+                let s_id = batch.s_id.get(i);
+                let p_id = batch.p_id.get(i);
+                let handle = batch.o_key.get(i) as u32;
+                let o_i = batch.o_i.get_or(i, u32::MAX);
+                let (ns_code, name) = match store.resolve_subject_parts(s_id) {
+                    Ok(parts) => parts,
+                    Err(e) => {
+                        tracing::warn!(
+                            g_id,
+                            s_id,
+                            error = %e,
+                            "vector fact-handle seed: subject decode failed; skipping row"
+                        );
+                        continue;
+                    }
+                };
+                let arena = match arena_map.get(&p_id) {
+                    Some(a) => a,
+                    None => continue,
+                };
+                let f32_bits: Vec<u32> = match arena.get_f32(handle) {
+                    Some(slice) => slice.iter().map(|&x| x.to_bits()).collect(),
+                    None => {
+                        tracing::warn!(
+                            g_id,
+                            p_id,
+                            handle,
+                            "vector fact-handle seed: arena handle out of range; skipping"
+                        );
+                        continue;
+                    }
+                };
+                fact_map.insert(
+                    (
+                        ns_code,
+                        std::sync::Arc::<str>::from(name.as_str()),
+                        p_id,
+                        o_i,
+                        f32_bits,
+                    ),
+                    handle,
+                );
+            }
+        }
+    }
+    Ok(())
 }
 
 async fn walk_commit_chain_since(

@@ -1836,7 +1836,7 @@ impl Operator for BinaryScanOperator {
             let (mut ops, mut untranslated, ephemeral_preds) =
                 translate_overlay_flakes_with_untranslated(
                     ctx.overlay(),
-                    store_ref,
+                    &store_arc,
                     ctx.dict_novelty.as_ref(),
                     ctx.runtime_small_dicts,
                     ctx.to_t,
@@ -2014,7 +2014,7 @@ pub type EphemeralPredicateMap = HashMap<Sid, u32>;
 
 pub fn translate_overlay_flakes(
     overlay: &dyn OverlayProvider,
-    store: &BinaryIndexStore,
+    store: &Arc<BinaryIndexStore>,
     dict_novelty: Option<&Arc<fluree_db_core::dict_novelty::DictNovelty>>,
     runtime_small_dicts: Option<&RuntimeSmallDicts>,
     to_t: i64,
@@ -2040,6 +2040,7 @@ pub fn translate_overlay_flakes(
             runtime_small_dicts,
             &mut ephemeral_preds,
             &mut next_ephemeral_p_id,
+            g_id,
         ) {
             Ok(op) => ops.push(op),
             Err(e) => {
@@ -2063,7 +2064,7 @@ pub fn translate_overlay_flakes(
 /// p_id → Sid lookup tables so that novelty-only predicates can be resolved during decode.
 fn translate_overlay_flakes_with_untranslated(
     overlay: &dyn OverlayProvider,
-    store: &BinaryIndexStore,
+    store: &Arc<BinaryIndexStore>,
     dict_novelty: Option<&Arc<fluree_db_core::dict_novelty::DictNovelty>>,
     runtime_small_dicts: Option<&RuntimeSmallDicts>,
     to_t: i64,
@@ -2090,6 +2091,7 @@ fn translate_overlay_flakes_with_untranslated(
             runtime_small_dicts,
             &mut ephemeral_preds,
             &mut next_ephemeral_p_id,
+            g_id,
         ) {
             Ok(op) => ops.push(op),
             Err(e) => {
@@ -2108,13 +2110,28 @@ fn translate_overlay_flakes_with_untranslated(
 /// Translate a single Flake to an OverlayOp.
 ///
 /// `pub(crate)` so `binary_range` can reuse it for overlay translation.
+///
+/// `g_id` is required for `FlakeValue::Vector` translation: vector retractions
+/// re-resolve to the assertion's existing arena handle by FULL FACT IDENTITY
+/// `(s_id, p_id, o_i, value)` via `BinaryIndexStore::find_vector_handle_by_fact`
+/// so the overlay's `(s_id, p_id, o_type, o_key, o_i)` tuple matches the
+/// indexed assertion. The value comparison is required because:
+/// - Two distinct subjects can hold the same value under the same
+///   predicate (each with its own handle), AND
+/// - One subject can hold MULTIPLE different values under the same
+///   predicate without a list index — so `(s, p, o_i)` alone is not unique.
+///
+/// `store` is `&Arc<BinaryIndexStore>` (not `&BinaryIndexStore`) because
+/// the SPOT cursor scan inside `find_vector_handle_by_fact` requires an
+/// owned `Arc`.
 pub(crate) fn translate_one_flake_v3_pub(
     flake: &fluree_db_core::Flake,
-    store: &BinaryIndexStore,
+    store: &Arc<BinaryIndexStore>,
     dict_novelty: Option<&Arc<fluree_db_core::dict_novelty::DictNovelty>>,
     runtime_small_dicts: Option<&RuntimeSmallDicts>,
     ephemeral_preds: &mut HashMap<Sid, u32>,
     next_ephemeral_p_id: &mut u32,
+    g_id: GraphId,
 ) -> std::io::Result<OverlayOp> {
     // Subject: persisted → DictNovelty → error
     let s_id = resolve_subject_v3(&flake.s, store, dict_novelty)?;
@@ -2142,8 +2159,44 @@ pub(crate) fn translate_one_flake_v3_pub(
             }),
     };
 
-    // Object value → (o_type, o_key), using flake.dt + lang for proper OType.
+    // Vector short-circuit: re-resolve to the *exact* base assertion's
+    // arena handle by FULL FACT IDENTITY `(s_id, p_id, o_i, value)`. The
+    // value-bit comparison inside `find_vector_handle_by_fact` is what
+    // disambiguates two distinct subjects sharing the same value AND a
+    // single subject holding multiple values under the same predicate
+    // without a list index — neither case is unique on `(s, p, o_i)` alone.
     let lang = flake.m.as_ref().and_then(|m| m.lang.as_deref());
+    if let fluree_db_core::FlakeValue::Vector(v) = &flake.o {
+        let o_i = flake
+            .m
+            .as_ref()
+            .and_then(|m| m.i)
+            .map(|i| i as u32)
+            .unwrap_or(u32::MAX);
+        let f32_vec: Vec<f32> = v.iter().map(|&x| x as f32).collect();
+        if let Some(handle) = store
+            .find_vector_handle_by_fact(g_id, s_id, p_id, o_i, &f32_vec)
+            .map_err(|e| std::io::Error::other(format!("vector fact-handle lookup: {e}")))?
+        {
+            return Ok(OverlayOp {
+                s_id,
+                p_id,
+                o_type: fluree_db_core::o_type::OType::VECTOR.as_u16(),
+                o_key: handle as u64,
+                o_i,
+                t: flake.t,
+                op: flake.op,
+            });
+        }
+        // No matching base row. For a retraction this means the assertion
+        // is in novelty (not yet indexed) — fall through and the value_to_otype_okey
+        // path will return Unsupported, materializing as an overlay-only
+        // row that the merge layer can still pair with novelty. For an
+        // assertion (vector inserted but never indexed yet) the same path
+        // applies and produces a materialized row.
+    }
+
+    // Object value → (o_type, o_key), using flake.dt + lang for proper OType.
     let (o_type, o_key) = value_to_otype_okey(&flake.o, &flake.dt, lang, store, dict_novelty)?;
 
     // List index
