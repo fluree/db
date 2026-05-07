@@ -240,6 +240,13 @@ impl Projection {
         self.columns().iter().find_map(Column::as_hydration)
     }
 
+    /// Returns `true` if any column in the projection is a hydration column.
+    pub fn has_hydration(&self) -> bool {
+        self.columns()
+            .iter()
+            .any(|c| matches!(c, Column::Hydration(_)))
+    }
+
     /// Returns `true` iff rows should be flattened from `[v]` to `v` at
     /// format time. Only fires for the bare-string `select: "?x"` form.
     pub fn is_scalar_var(&self) -> bool {

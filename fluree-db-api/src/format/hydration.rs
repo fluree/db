@@ -26,7 +26,7 @@ use fluree_db_core::value::FlakeValue;
 use fluree_db_core::{Flake, GraphDbRef, Sid, Tracker};
 use fluree_db_policy::{is_schema_flake, PolicyContext};
 use fluree_db_query::binding::Binding;
-use fluree_db_query::ir::{ForwardItem, HydrationSpec, NestedSelectSpec, Root};
+use fluree_db_query::ir::{Column, ForwardItem, NestedSelectSpec, Root};
 use fluree_vocab::namespaces::JSON_LD;
 use fluree_vocab::rdf::{self, TYPE as RDF_TYPE_IRI};
 use futures::future::BoxFuture;
@@ -35,9 +35,13 @@ use serde_json::{json, Value as JsonValue};
 use std::collections::{BTreeMap, HashMap, HashSet};
 
 /// Cache key: (Sid, local_spec_hash, depth_remaining)
+///
 /// The local_spec_hash is computed from the current `NestedSelectSpec`,
-/// NOT the top-level spec. This ensures different nested hydrations of
-/// the same Sid produce different cache entries.
+/// NOT any top-level spec. This serves two purposes:
+/// - Different nested hydrations of the same Sid produce different entries.
+/// - Multiple top-level hydration columns share entries when they land on
+///   the same Sid with structurally identical levels, and stay separated
+///   when their levels differ.
 type CacheKey = (Sid, u64, usize);
 
 /// Context for formatting a specific predicate's values.
@@ -129,6 +133,38 @@ fn hash_reverse<H: std::hash::Hasher>(
     }
 }
 
+/// Resolve a hydration root variable's binding into a `Sid` for a single row.
+///
+/// Returns `Ok(None)` when the binding is unbound, poisoned, missing, or not
+/// subject-shaped (literals, IRIs that didn't match a known subject, etc.).
+/// Such columns render as `null` rather than skipping the row entirely.
+fn resolve_root_sid_from_binding(
+    result: &QueryResult,
+    binding: Option<&Binding>,
+) -> Result<Option<Sid>> {
+    match binding {
+        Some(b) if b.is_encoded() => {
+            let materialized = super::materialize::materialize_binding(result, b)?;
+            Ok(match materialized {
+                Binding::Sid { sid, .. } => Some(sid),
+                Binding::IriMatch { primary_sid, .. } => Some(primary_sid),
+                _ => None,
+            })
+        }
+        Some(Binding::Sid { sid, .. }) => Ok(Some(sid.clone())),
+        Some(Binding::IriMatch { primary_sid, .. }) => Ok(Some(primary_sid.clone())),
+        Some(Binding::Unbound | Binding::Poisoned) | None => Ok(None),
+        Some(
+            Binding::Lit { .. }
+            | Binding::Grouped(_)
+            | Binding::Iri(_)
+            | Binding::EncodedLit { .. }
+            | Binding::EncodedSid { .. }
+            | Binding::EncodedPid { .. },
+        ) => Ok(None),
+    }
+}
+
 /// Format query results with hydration (sync entry point - returns error)
 ///
 /// The sync entry point always returns an error directing callers to use
@@ -164,8 +200,13 @@ pub async fn format_async(
     policy: Option<&PolicyContext>,
     tracker: Option<&Tracker>,
 ) -> Result<JsonValue> {
-    let spec = result.output.hydration().ok_or_else(|| {
-        FormatError::InvalidBinding("Hydration format called without spec".into())
+    if !result.output.has_hydration() {
+        return Err(FormatError::InvalidBinding(
+            "Hydration format called without any hydration columns".into(),
+        ));
+    }
+    let columns = result.output.columns().ok_or_else(|| {
+        FormatError::InvalidBinding("Hydration format called on non-Select output".into())
     })?;
 
     // Attach the tracker to the GraphDbRef so db.range calls inside the
@@ -176,94 +217,85 @@ pub async fn format_async(
         None => db,
     };
 
-    let formatter = HydrationFormatter::new(db, compactor, spec, config, policy, tracker);
+    let formatter = HydrationFormatter::new(db, compactor, config, policy, tracker);
 
-    // Shared cache across all rows
+    // Shared cache across all rows and all hydration columns. The cache key
+    // includes a hash of the current `NestedSelectSpec`, so columns with
+    // structurally identical levels share entries; columns with different
+    // levels do not collide.
     let mut cache: HashMap<CacheKey, JsonValue> = HashMap::new();
-    let mut rows = Vec::new();
+    let mut rows: Vec<JsonValue> = Vec::new();
 
-    // If the underlying query produced no solutions, expansion must produce no rows,
-    // even when the root is a constant Sid.
+    // If the underlying query produced no solutions, expansion produces no
+    // rows — even when a column root is a constant Sid.
     if result.row_count() == 0 {
         return Ok(JsonValue::Array(rows));
     }
 
-    match &spec.root {
-        Root::Sid(sid) => {
-            // IRI constant root - single subject fetch (no batches needed)
-            let mut visited = HashSet::new();
-            let obj = formatter
-                .format_subject(sid, &spec.level, 0, &mut visited, &mut cache)
-                .await?;
-            rows.push(obj);
-        }
-        Root::Var(var_id) => {
-            // Variable root - iterate through result batches
-            let select_vars = result.output.projected_vars_or_empty();
-            let mixed_select = select_vars.len() > 1 || select_vars.first() != Some(var_id);
+    // Single-column projections (e.g. `select: {"?x": ["*"]}`) emit a bare
+    // object per row; multi-column projections emit array rows.
+    let single_column = columns.len() == 1;
 
-            for batch in &result.batches {
-                for row_idx in 0..batch.len() {
-                    let root_binding = batch.get(row_idx, *var_id);
+    for batch in &result.batches {
+        for row_idx in 0..batch.len() {
+            let mut row_values: Vec<JsonValue> = Vec::with_capacity(columns.len());
 
-                    let root_sid: Option<Sid> = match root_binding {
-                        Some(binding) if binding.is_encoded() => {
-                            let materialized =
-                                super::materialize::materialize_binding(result, binding)?;
-                            match materialized {
-                                Binding::Sid { sid, .. } => Some(sid),
-                                Binding::IriMatch { primary_sid, .. } => Some(primary_sid),
-                                _ => None,
+            for column in columns {
+                let value = match column {
+                    Column::Var(v) => match batch.get(row_idx, *v) {
+                        Some(binding) if formatter.typed => {
+                            super::typed::format_binding_with_result(result, binding, compactor)?
+                        }
+                        Some(binding) => {
+                            super::jsonld::format_binding_with_result(result, binding, compactor)?
+                        }
+                        None => JsonValue::Null,
+                    },
+                    Column::Hydration(spec) => match &spec.root {
+                        Root::Sid(sid) => {
+                            let mut visited = HashSet::new();
+                            formatter
+                                .format_subject(
+                                    sid,
+                                    &spec.level,
+                                    0,
+                                    spec.depth,
+                                    &mut visited,
+                                    &mut cache,
+                                )
+                                .await?
+                        }
+                        Root::Var(var_id) => {
+                            let root_sid = resolve_root_sid_from_binding(
+                                result,
+                                batch.get(row_idx, *var_id),
+                            )?;
+                            match root_sid {
+                                Some(sid) => {
+                                    let mut visited = HashSet::new();
+                                    formatter
+                                        .format_subject(
+                                            &sid,
+                                            &spec.level,
+                                            0,
+                                            spec.depth,
+                                            &mut visited,
+                                            &mut cache,
+                                        )
+                                        .await?
+                                }
+                                None => JsonValue::Null,
                             }
                         }
-                        Some(Binding::Sid { sid, .. }) => Some(sid.clone()),
-                        Some(Binding::IriMatch { primary_sid, .. }) => Some(primary_sid.clone()),
-                        Some(Binding::Unbound | Binding::Poisoned) | None => None,
-                        Some(
-                            Binding::Lit { .. }
-                            | Binding::Grouped(_)
-                            | Binding::Iri(_)
-                            | Binding::EncodedLit { .. }
-                            | Binding::EncodedSid { .. }
-                            | Binding::EncodedPid { .. },
-                        ) => None,
-                    };
+                    },
+                };
+                row_values.push(value);
+            }
 
-                    let Some(root_sid) = root_sid else {
-                        // Unbound/poisoned root var - skip this row
-                        continue;
-                    };
-
-                    let mut visited = HashSet::new();
-                    let obj = formatter
-                        .format_subject(&root_sid, &spec.level, 0, &mut visited, &mut cache)
-                        .await?;
-
-                    if mixed_select {
-                        let mut row = Vec::with_capacity(select_vars.len());
-                        for var in &select_vars {
-                            if var == var_id {
-                                row.push(obj.clone());
-                            } else {
-                                let value = match batch.get(row_idx, *var) {
-                                    Some(binding) if formatter.typed => {
-                                        super::typed::format_binding_with_result(
-                                            result, binding, compactor,
-                                        )?
-                                    }
-                                    Some(binding) => super::jsonld::format_binding_with_result(
-                                        result, binding, compactor,
-                                    )?,
-                                    None => JsonValue::Null,
-                                };
-                                row.push(value);
-                            }
-                        }
-                        rows.push(JsonValue::Array(row));
-                    } else {
-                        rows.push(obj);
-                    }
-                }
+            if single_column {
+                rows.push(row_values.into_iter().next().unwrap());
+            } else {
+                rows.push(JsonValue::Array(row_values));
             }
         }
     }
@@ -271,11 +303,14 @@ pub async fn format_async(
     Ok(JsonValue::Array(rows))
 }
 
-/// Hydration formatter with async DB access
+/// Hydration formatter with async DB access.
+///
+/// The formatter is spec-agnostic: per-call the caller passes the
+/// `NestedSelectSpec` level and `max_depth` budget. This lets a single
+/// formatter serve multiple hydration columns in the same query.
 struct HydrationFormatter<'a> {
     db: GraphDbRef<'a>,
     compactor: &'a IriCompactor,
-    spec: &'a HydrationSpec,
     /// Whether to emit typed JSON (`{"@value": ..., "@type": ...}`) for all literals.
     typed: bool,
     /// Whether to always wrap property values in arrays (even single-valued).
@@ -291,7 +326,6 @@ impl<'a> HydrationFormatter<'a> {
     fn new(
         db: GraphDbRef<'a>,
         compactor: &'a IriCompactor,
-        spec: &'a HydrationSpec,
         config: &FormatterConfig,
         policy: Option<&'a PolicyContext>,
         tracker: Option<&'a Tracker>,
@@ -299,7 +333,6 @@ impl<'a> HydrationFormatter<'a> {
         Self {
             db,
             compactor,
-            spec,
             typed: config.format == OutputFormat::TypedJson,
             normalize_arrays: config.normalize_arrays,
             policy,
@@ -311,8 +344,12 @@ impl<'a> HydrationFormatter<'a> {
     ///
     /// # Arguments
     /// - `sid`: Subject to expand
-    /// - `spec`: Selection specification (what properties to include)
+    /// - `level`: Selection specification (what properties to include)
     /// - `current_depth`: Current recursion depth
+    /// - `max_depth`: Auto-expansion budget for *this* hydration column. Each
+    ///   column carries its own budget; threading it as a parameter (rather
+    ///   than holding it on the formatter) lets multiple columns with
+    ///   different depths share one formatter.
     /// - `visited`: Cycle detection set (per-path)
     /// - `cache`: Result cache (shared across all subjects)
     ///
@@ -322,11 +359,12 @@ impl<'a> HydrationFormatter<'a> {
         sid: &'b Sid,
         level: &'b NestedSelectSpec,
         current_depth: usize,
+        max_depth: usize,
         visited: &'b mut HashSet<Sid>,
         cache: &'b mut HashMap<CacheKey, JsonValue>,
     ) -> BoxFuture<'b, Result<JsonValue>> {
         async move {
-            let depth_remaining = self.spec.depth.saturating_sub(current_depth);
+            let depth_remaining = max_depth.saturating_sub(current_depth);
             let cache_key = (sid.clone(), compute_level_hash(level), depth_remaining);
 
             // Check cache first (same Sid + spec + depth = same result)
@@ -387,7 +425,14 @@ impl<'a> HydrationFormatter<'a> {
                     explicit_sub_spec,
                 };
                 let values = self
-                    .format_predicate_values(pred_ctx, level, current_depth, visited, cache)
+                    .format_predicate_values(
+                        pred_ctx,
+                        level,
+                        current_depth,
+                        max_depth,
+                        visited,
+                        cache,
+                    )
                     .await?;
 
                 if !values.is_empty() {
@@ -413,6 +458,7 @@ impl<'a> HydrationFormatter<'a> {
                             rev_nested_opt.as_deref(),
                             level,
                             current_depth,
+                            max_depth,
                             visited,
                             cache,
                         )
@@ -481,6 +527,7 @@ impl<'a> HydrationFormatter<'a> {
         pred_ctx: PredicateContext<'b>,
         parent_level: &'b NestedSelectSpec,
         current_depth: usize,
+        max_depth: usize,
         visited: &'b mut HashSet<Sid>,
         cache: &'b mut HashMap<CacheKey, JsonValue>,
     ) -> Result<Vec<JsonValue>> {
@@ -505,17 +552,19 @@ impl<'a> HydrationFormatter<'a> {
                                     ref_sid,
                                     nested,
                                     current_depth + 1,
+                                    max_depth,
                                     visited,
                                     cache,
                                 )
                                 .await?,
                             );
-                        } else if current_depth < self.spec.depth {
+                        } else if current_depth < max_depth {
                             values.push(
                                 self.format_subject(
                                     ref_sid,
                                     parent_level,
                                     current_depth + 1,
+                                    max_depth,
                                     visited,
                                     cache,
                                 )
@@ -549,6 +598,7 @@ impl<'a> HydrationFormatter<'a> {
         nested_spec: Option<&'b NestedSelectSpec>,
         parent_level: &'b NestedSelectSpec,
         current_depth: usize,
+        max_depth: usize,
         visited: &'b mut HashSet<Sid>,
         cache: &'b mut HashMap<CacheKey, JsonValue>,
     ) -> Result<Vec<JsonValue>> {
@@ -559,16 +609,24 @@ impl<'a> HydrationFormatter<'a> {
 
             if let Some(nested) = nested_spec {
                 values.push(
-                    self.format_subject(subject_sid, nested, current_depth + 1, visited, cache)
-                        .await?,
+                    self.format_subject(
+                        subject_sid,
+                        nested,
+                        current_depth + 1,
+                        max_depth,
+                        visited,
+                        cache,
+                    )
+                    .await?,
                 );
-            } else if current_depth < self.spec.depth {
+            } else if current_depth < max_depth {
                 // Auto-expand reverse refs with FULL parent level
                 values.push(
                     self.format_subject(
                         subject_sid,
                         parent_level,
                         current_depth + 1,
+                        max_depth,
                         visited,
                         cache,
                     )

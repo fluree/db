@@ -154,6 +154,12 @@ impl QueryOutput {
         self.projection()?.hydration()
     }
 
+    /// Returns `true` if the output is a SELECT whose projection contains
+    /// any hydration column.
+    pub fn has_hydration(&self) -> bool {
+        self.projection().is_some_and(Projection::has_hydration)
+    }
+
     /// Returns `true` for `selectOne`.
     pub fn is_select_one(&self) -> bool {
         self.multiplicity() == Some(Multiplicity::One)
