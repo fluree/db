@@ -15,10 +15,6 @@ imports are not supported. This tutorial uses three named graphs in one ledger:
 | `<http://example.org/onto/behaviors>`      | Imported ontology — property characteristics |
 | `<urn:fluree:demo:main#config>`            | Ledger config — wires up reasoning  |
 
-A runnable end-to-end script lives at
-[`cookbook-owl-imports.sh`](cookbook-owl-imports.sh) — it executes every
-command in this tutorial and asserts the expected rows.
-
 > See [Reasoning and inference](../concepts/reasoning.md) for background
 > and [Setting groups → reasoningDefaults](../ledger-config/setting-groups.md)
 > for the full config schema.
@@ -72,9 +68,10 @@ fluree upsert -f 01-data.ttl
 ```
 
 > Use `upsert` (not `insert`) for any TriG document that contains `GRAPH`
-> blocks. `fluree insert` takes a fast path that only understands plain
-> Turtle. `upsert` routes Turtle/TriG through the parser that recognises
-> `GRAPH` blocks. Plain Turtle works through either command.
+> blocks. The CLI's `insert` path parses Turtle straight to flakes and does
+> not extract `GRAPH` blocks; over HTTP, `/v1/fluree/insert` rejects
+> `Content-Type: application/trig` outright. `upsert` handles both Turtle
+> and TriG.
 
 ---
 
@@ -317,12 +314,12 @@ application/trig` (or `text/turtle`):
 
 ```bash
 # Connection-scoped (specify ledger via query string)
-curl -X POST 'http://localhost:8090/fluree/upsert?ledger=demo:main' \
+curl -X POST 'http://localhost:8090/v1/fluree/upsert?ledger=demo:main' \
      -H 'Content-Type: application/trig' \
      --data-binary @02-ontology.trig
 
 # Ledger-scoped path form
-curl -X POST 'http://localhost:8090/fluree/upsert/demo:main' \
+curl -X POST 'http://localhost:8090/v1/fluree/upsert/demo:main' \
      -H 'Content-Type: application/trig' \
      --data-binary @02-ontology.trig
 ```
