@@ -26,7 +26,7 @@ use fluree_db_core::value::FlakeValue;
 use fluree_db_core::{Flake, GraphDbRef, Sid, Tracker};
 use fluree_db_policy::{is_schema_flake, PolicyContext};
 use fluree_db_query::binding::Binding;
-use fluree_db_query::ir::{Column, ForwardItem, NestedSelectSpec, Root};
+use fluree_db_query::ir::{Column, ForwardItem, HydrationSpec, NestedSelectSpec, Root};
 use fluree_vocab::namespaces::JSON_LD;
 use fluree_vocab::rdf::{self, TYPE as RDF_TYPE_IRI};
 use futures::future::BoxFuture;
@@ -165,6 +165,38 @@ fn resolve_root_sid_from_binding(
     }
 }
 
+/// Format one hydration column for one solution row.
+///
+/// Resolves the column's root (variable or IRI constant) into a `Sid` and
+/// expands it via [`HydrationFormatter::format_subject`] using the column's
+/// own level and depth budget. A variable root that's unbound for this row
+/// renders as `null` rather than skipping the row entirely.
+async fn format_hydration_column<'a>(
+    formatter: &HydrationFormatter<'a>,
+    spec: &HydrationSpec,
+    result: &QueryResult,
+    batch: &fluree_db_query::Batch,
+    row_idx: usize,
+    cache: &mut HashMap<CacheKey, JsonValue>,
+) -> Result<JsonValue> {
+    let root_sid: Sid = match &spec.root {
+        Root::Sid(sid) => sid.clone(),
+        Root::Var(var_id) => {
+            let Some(sid) =
+                resolve_root_sid_from_binding(result, batch.get(row_idx, *var_id))?
+            else {
+                return Ok(JsonValue::Null);
+            };
+            sid
+        }
+    };
+
+    let mut visited = HashSet::new();
+    formatter
+        .format_subject(&root_sid, &spec.level, 0, spec.depth, &mut visited, cache)
+        .await
+}
+
 /// Format query results with hydration (sync entry point - returns error)
 ///
 /// The sync entry point always returns an error directing callers to use
@@ -253,43 +285,10 @@ pub async fn format_async(
                         }
                         None => JsonValue::Null,
                     },
-                    Column::Hydration(spec) => match &spec.root {
-                        Root::Sid(sid) => {
-                            let mut visited = HashSet::new();
-                            formatter
-                                .format_subject(
-                                    sid,
-                                    &spec.level,
-                                    0,
-                                    spec.depth,
-                                    &mut visited,
-                                    &mut cache,
-                                )
-                                .await?
-                        }
-                        Root::Var(var_id) => {
-                            let root_sid = resolve_root_sid_from_binding(
-                                result,
-                                batch.get(row_idx, *var_id),
-                            )?;
-                            match root_sid {
-                                Some(sid) => {
-                                    let mut visited = HashSet::new();
-                                    formatter
-                                        .format_subject(
-                                            &sid,
-                                            &spec.level,
-                                            0,
-                                            spec.depth,
-                                            &mut visited,
-                                            &mut cache,
-                                        )
-                                        .await?
-                                }
-                                None => JsonValue::Null,
-                            }
-                        }
-                    },
+                    Column::Hydration(spec) => {
+                        format_hydration_column(&formatter, spec, result, batch, row_idx, &mut cache)
+                            .await?
+                    }
                 };
                 row_values.push(value);
             }
