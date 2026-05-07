@@ -102,6 +102,30 @@ Or with the `@vector` shorthand:
 }
 ```
 
+A property declared with `@type: "@vector"` (or `@type: "f:embeddingVector"`) in the `@context` may also use a bare JSON array as its value — equivalent to the explicit `@value` form above:
+
+```json
+{
+  "@context": {
+    "ex": "http://example.org/",
+    "ex:embedding": { "@type": "@vector" }
+  },
+  "insert": {
+    "@id": "ex:doc1",
+    "ex:embedding": [0.1, 0.2, 0.3]
+  }
+}
+```
+
+### Validation rules
+
+- **Element type:** every element must be a JSON number; non-numeric elements are rejected.
+- **Element range:** values are quantized to `f32` at ingest. Non-finite values (`NaN`, `±Infinity`) and values outside the representable `f32` range are rejected.
+- **Non-empty:** vectors must have at least one element. The empty vector (`[]`) is reserved as an internal max-bound sentinel and is rejected by both the coercion layer and the write-path guard.
+- **Scalar values are rejected:** a single number paired with the `f:embeddingVector` datatype (e.g. `{"@value": 0.1, "@type": "@vector"}`) is rejected; the value must be an array.
+
+The same rules apply to the SPARQL typed-literal form `"[0.1, 0.2, 0.3]"^^f:embeddingVector` and to Turtle.
+
 ---
 
 ## Fulltext datatype

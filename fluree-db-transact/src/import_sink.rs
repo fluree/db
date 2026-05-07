@@ -608,6 +608,19 @@ mod inner {
                 (None, None) => None,
             };
 
+            // Late hard guard: reject (FlakeValue, datatype) shapes that would
+            // produce corrupt flakes (e.g. scalar object key with VECTOR_ID
+            // datatype). Surface as a CommitCodecError so the import fails
+            // loudly rather than silently dropping/storing bad records.
+            if let Err(e) = crate::generate::flakes::validate_value_dt_pair(&o, &dt) {
+                if self.encode_error.is_none() {
+                    let msg = format!("invariant violation: {e}");
+                    tracing::error!("ImportSink: {msg}");
+                    self.encode_error = Some(CommitCodecError::InvalidOp(msg));
+                }
+                return;
+            }
+
             let flake = Flake::new(
                 s.clone(),
                 p.clone(),

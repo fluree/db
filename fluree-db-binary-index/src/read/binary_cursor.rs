@@ -23,7 +23,7 @@ use crate::read::types::{cmp_row_vs_overlay, OverlayOp};
 use super::binary_index_store::BinaryIndexStore;
 use super::column_loader::load_columns_cached_via_handle;
 use super::column_types::{BinaryFilter, ColumnBatch, ColumnData, ColumnProjection};
-use super::replay::replay_leaflet;
+use super::replay::{batch_has_rows_above_t, replay_leaflet};
 
 // ============================================================================
 // BinaryCursor
@@ -228,7 +228,15 @@ impl BinaryCursor {
                     if !has_ov && self.filter.skip_leaflet(entry.p_const, entry.o_type_const) {
                         continue;
                     }
-                    if entry.row_count == 0 && !has_ov {
+                    // An empty-after-retract leaflet (`row_count == 0`) is preserved
+                    // by the indexer with its history sidecar segment so time-travel
+                    // can recover fully-retracted facts. Don't pre-skip it when we
+                    // need replay and the sidecar carries events past `to_t`.
+                    let to_t_u32 = u32::try_from(self.to_t).unwrap_or(u32::MAX);
+                    let needs_history_replay = self.need_replay()
+                        && entry.history_len > 0
+                        && entry.history_max_t > to_t_u32;
+                    if entry.row_count == 0 && !has_ov && !needs_history_replay {
                         continue;
                     }
 
@@ -627,15 +635,6 @@ fn push_overlay_row(
 
 /// Apply the filter to a batch, returning only matching rows.
 /// Returns the batch unchanged if all rows match (avoids copy).
-/// Check if any row in the batch has `t > t_target`.
-fn batch_has_rows_above_t(batch: &ColumnBatch, t_target: u32) -> bool {
-    match &batch.t {
-        ColumnData::Block(ts) => ts.iter().any(|&t| t > t_target),
-        ColumnData::Const(t) => *t > t_target,
-        ColumnData::AbsentDefault => false,
-    }
-}
-
 fn filter_batch(filter: &BinaryFilter, batch: &ColumnBatch) -> ColumnBatch {
     let mut matching: Vec<usize> = Vec::new();
     for i in 0..batch.row_count {

@@ -17,7 +17,7 @@ use fluree_db_core::temporal::{
 };
 use fluree_db_core::{FlakeValue, GeoPointBits, Sid};
 use fluree_graph_ir::LiteralValue;
-use fluree_vocab::{geo, rdf, xsd};
+use fluree_vocab::{fluree, geo, rdf, xsd};
 
 /// Fast-path: return cached Sid for the most common datatype IRIs.
 /// Avoids trie lookup + Sid::new() allocation for high-frequency types.
@@ -121,6 +121,16 @@ pub(crate) fn convert_string_literal(
             .map(|v| FlakeValue::YearMonthDuration(Box::new(v)))
             .unwrap_or_else(|_| FlakeValue::String(value.to_string())),
         rdf::JSON => FlakeValue::Json(value.to_string()),
+        fluree::EMBEDDING_VECTOR => {
+            // Delegate to core's shared lexical parser so JSON-LD bulk import,
+            // Turtle, and SPARQL `"[..]"^^f:embeddingVector` all share f32
+            // quantization. On parse failure, fall through to a string literal
+            // — the late `validate_value_dt_pair` guard at the write path
+            // (FlakeGenerator / ImportSink / FlakeSink) rejects the corrupt
+            // (String, embeddingVector) pair as a hard transaction error.
+            fluree_db_core::coerce::coerce_string_value(value, fluree::EMBEDDING_VECTOR)
+                .unwrap_or_else(|_| FlakeValue::String(value.to_string()))
+        }
         rdf::LANG_STRING => {
             // Language goes in FlakeMeta, value is a plain string
             FlakeValue::String(value.to_string())
