@@ -60,6 +60,21 @@ async fn seed_movie_graph() -> (MemoryFluree, MemoryLedger) {
     (fluree, committed.ledger)
 }
 
+/// Extract `(@id of column 0, @id of column 1)` from an array-shaped row,
+/// for use as a stable sort key when asserting on multi-column hydration
+/// outputs.
+fn row_id_pair(row: &JsonValue) -> (String, String) {
+    let cols = row.as_array();
+    let id_at = |idx: usize| -> String {
+        cols.and_then(|cs| cs.get(idx))
+            .and_then(|c| c.get("@id"))
+            .and_then(|v| v.as_str())
+            .unwrap_or_default()
+            .to_string()
+    };
+    (id_at(0), id_at(1))
+}
+
 fn normalize_object_arrays(value: &mut JsonValue) {
     match value {
         JsonValue::Array(arr) => {
@@ -964,6 +979,91 @@ async fn jsonld_simple_subject_crawl_where_type() {
         }
     ]);
     normalize_object_arrays(&mut expected);
+
+    assert_eq!(json_result, expected);
+}
+
+#[tokio::test]
+async fn jsonld_two_hydration_columns_var_roots() {
+    // Two var-rooted hydration columns in a single select: each row should be
+    // a 2-element array of independently expanded subjects.
+    let (fluree, ledger) = seed_simple_subject_crawl().await;
+
+    let query = json!({
+        "@context": ctx(),
+        "select": [
+            {"?friender": ["@id", "schema:name"]},
+            {"?friend":   ["@id", "schema:name"]}
+        ],
+        "where": {
+            "@id": "?friender",
+            "ex:friend": "?friend"
+        }
+    });
+
+    let result = support::query_jsonld(&fluree, &ledger, &query)
+        .await
+        .expect("query");
+    let mut json_result = result
+        .to_jsonld_async(ledger.as_graph_db_ref(0))
+        .await
+        .expect("to_jsonld_async");
+
+    // Sort top-level rows by (friender @id, friend @id) so the assertion is
+    // independent of solution iteration order.
+    if let JsonValue::Array(rows) = &mut json_result {
+        rows.sort_by_key(|row| row_id_pair(row));
+    }
+
+    let expected = json!([
+        [
+            {"@id": "ex:cam", "schema:name": "Cam"},
+            {"@id": "ex:alice", "schema:name": "Alice"}
+        ],
+        [
+            {"@id": "ex:cam", "schema:name": "Cam"},
+            {"@id": "ex:brian", "schema:name": "Brian"}
+        ],
+        [
+            {"@id": "ex:david", "schema:name": "David"},
+            {"@id": "ex:cam", "schema:name": "Cam"}
+        ]
+    ]);
+
+    assert_eq!(json_result, expected);
+}
+
+#[tokio::test]
+async fn jsonld_two_hydration_columns_different_subspecs() {
+    // Each hydration column may carry its own NestedSelectSpec — different
+    // sub-selections should be honored independently per column.
+    let (fluree, ledger) = seed_simple_subject_crawl().await;
+
+    let query = json!({
+        "@context": ctx(),
+        "select": [
+            {"?friender": ["@id", "schema:name", "schema:age"]},
+            {"?friend":   ["@id"]}
+        ],
+        "where": {
+            "@id": "?friender",
+            "ex:friend": "?friend",
+            "schema:name": "David"
+        }
+    });
+
+    let result = support::query_jsonld(&fluree, &ledger, &query)
+        .await
+        .expect("query");
+    let json_result = result
+        .to_jsonld_async(ledger.as_graph_db_ref(0))
+        .await
+        .expect("to_jsonld_async");
+
+    let expected = json!([[
+        {"@id": "ex:david", "schema:name": "David", "schema:age": 46},
+        {"@id": "ex:cam"}
+    ]]);
 
     assert_eq!(json_result, expected);
 }
