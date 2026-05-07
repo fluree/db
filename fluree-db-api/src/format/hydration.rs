@@ -171,9 +171,11 @@ fn resolve_root_sid_from_binding(
 /// `format_results_async()` instead, since hydration requires DB access.
 #[allow(dead_code)]
 pub fn format(result: &QueryResult, _compactor: &IriCompactor) -> Result<JsonValue> {
-    let _spec = result.output.hydration().ok_or_else(|| {
-        FormatError::InvalidBinding("Hydration format called without spec".into())
-    })?;
+    if !result.output.has_hydration() {
+        return Err(FormatError::InvalidBinding(
+            "Hydration format called without any hydration columns".into(),
+        ));
+    }
 
     // Hydration always requires async DB access
     Err(FormatError::InvalidBinding(

@@ -192,9 +192,14 @@ fn parse_query_ast_internal(
         parse_select(select, &ctx, &mut query)?;
     }
 
-    // Parse depth parameter and apply to hydration if present
-    if let Some(gs) = query.hydration_mut() {
-        gs.depth = options::parse_depth(obj)?;
+    // Parse depth parameter and apply to every hydration column.
+    if query.has_hydration() {
+        let depth = options::parse_depth(obj)?;
+        for column in query.select.columns_mut() {
+            if let UnresolvedColumn::Hydration(spec) = column {
+                spec.depth = depth;
+            }
+        }
     }
 
     // Parse top-level VALUES (optional) - mirrors the `:values` initial solution seed.
@@ -220,7 +225,7 @@ fn parse_query_ast_internal(
             nested_counter,
             object_var_parsing,
         )?;
-    } else if query.hydration().is_some() {
+    } else if query.has_hydration() {
         // Allowed: hydration-only query with no WHERE.
         // Execution will produce an empty solution set, and hydration formatting will use the root
         // (constant root emits one row; variable root yields no rows).
@@ -825,7 +830,7 @@ fn parse_hydration_object(
     query: &UnresolvedQuery,
 ) -> Result<UnresolvedHydrationSpec> {
     // Error if we already have a hydration (only one allowed)
-    if query.hydration().is_some() {
+    if query.has_hydration() {
         return Err(ParseError::InvalidSelect(
             "only one graph-select object allowed per query".to_string(),
         ));

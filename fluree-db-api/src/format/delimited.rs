@@ -240,7 +240,7 @@ fn reject_non_tabular(result: &QueryResult, delimiter: Delimiter) -> Result<()> 
             "{name} format not supported for ASK queries (boolean result)"
         )));
     }
-    if result.output.hydration().is_some() {
+    if result.output.has_hydration() {
         return Err(FormatError::InvalidBinding(format!(
             "{name} format not supported for hydration queries (use JSON-LD instead)"
         )));

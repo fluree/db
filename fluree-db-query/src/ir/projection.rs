@@ -234,12 +234,6 @@ impl Projection {
         }
     }
 
-    /// The hydration spec embedded in the projection (at most one;
-    /// enforced by the parser).
-    pub fn hydration(&self) -> Option<&HydrationSpec> {
-        self.columns().iter().find_map(Column::as_hydration)
-    }
-
     /// Returns `true` if any column in the projection is a hydration column.
     pub fn has_hydration(&self) -> bool {
         self.columns()
