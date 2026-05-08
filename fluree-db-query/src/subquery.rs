@@ -311,18 +311,13 @@ impl SubqueryOperator {
 
         // Apply GROUP BY / aggregates / HAVING for subqueries that use them.
         if let Some(grouping) = &self.subquery.grouping {
-            let (group_by, aggregates, having) = match grouping {
-                crate::ir::Grouping::Implicit { aggregates, having } => (
-                    Vec::new(),
-                    aggregates.iter().cloned().collect::<Vec<_>>(),
-                    having.clone(),
-                ),
-                crate::ir::Grouping::Explicit {
-                    group_by,
-                    aggregates,
-                    having,
-                } => (group_by.iter().copied().collect(), aggregates.clone(), having.clone()),
+            let group_by: Vec<crate::var_registry::VarId> = match grouping {
+                crate::ir::Grouping::Implicit { .. } => Vec::new(),
+                crate::ir::Grouping::Explicit { group_by, .. } => group_by.iter().copied().collect(),
             };
+            let aggregates: Vec<crate::aggregate::AggregateSpec> =
+                grouping.aggregates().cloned().collect();
+            let having = grouping.having().cloned();
             operator = Box::new(GroupByOperator::new(operator, group_by));
             if !aggregates.is_empty() {
                 operator = Box::new(AggregateOperator::new(operator, aggregates));

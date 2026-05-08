@@ -956,15 +956,18 @@ mod tests {
     fn make_query(patterns: Vec<Pattern>, out_var: VarId) -> (Query, QueryOptions) {
         let options = QueryOptions::default();
         let grouping = Some(crate::ir::Grouping::Implicit {
-            aggregates: fluree_db_core::NonEmpty::try_from_vec(vec![
-                crate::aggregate::AggregateSpec {
-                    function: AggregateFn::CountAll,
-                    input_var: None,
-                    output_var: out_var,
-                    distinct: false,
-                },
-            ])
-            .expect("non-empty"),
+            aggregation: crate::ir::Aggregation {
+                aggregates: fluree_db_core::NonEmpty::try_from_vec(vec![
+                    crate::aggregate::AggregateSpec {
+                        function: AggregateFn::CountAll,
+                        input_var: None,
+                        output_var: out_var,
+                        distinct: false,
+                    },
+                ])
+                .expect("non-empty"),
+                binds: Vec::new(),
+            },
             having: None,
         });
         let query = Query {

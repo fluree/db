@@ -19,8 +19,8 @@ use crate::context::WellKnownDatatypes;
 use crate::ir::triple::{Ref, Term, TriplePattern};
 use crate::ir::QueryOptions;
 use crate::ir::{
-    Column, ConstructTemplate, ForwardItem, Grouping, HydrationSpec, NestedSelectSpec, Projection,
-    Query, QueryOutput, Restriction, Root,
+    Aggregation, Column, ConstructTemplate, ForwardItem, Grouping, HydrationSpec, NestedSelectSpec,
+    Projection, Query, QueryOutput, Restriction, Root,
 };
 use crate::ir::{
     Expression, Function, IndexSearchPattern, IndexSearchTarget, PathModifier, Pattern,
@@ -1530,7 +1530,6 @@ fn lower_options(opts: &UnresolvedOptions, vars: &mut VarRegistry) -> Result<Que
             .iter()
             .map(|s| lower_sort_spec(s, vars))
             .collect(),
-        post_binds: Vec::new(),
         reasoning,
         schema_bundle: None,
     })
@@ -1559,14 +1558,19 @@ fn lower_grouping(
         .map(|e| lower_filter_expr(e, vars))
         .transpose()?;
 
+    let aggregation = NonEmpty::try_from_vec(aggregates).map(|aggregates| Aggregation {
+        aggregates,
+        binds: Vec::new(),
+    });
+
     if let Some(group_by) = NonEmpty::try_from_vec(group_by) {
         Ok(Some(Grouping::Explicit {
             group_by,
-            aggregates,
+            aggregation,
             having,
         }))
-    } else if let Some(aggregates) = NonEmpty::try_from_vec(aggregates) {
-        Ok(Some(Grouping::Implicit { aggregates, having }))
+    } else if let Some(aggregation) = aggregation {
+        Ok(Some(Grouping::Implicit { aggregation, having }))
     } else {
         // No GROUP BY, no aggregates: the parser should reject HAVING in this
         // shape, so any leftover `having` here is dropped — the validator's

@@ -7,6 +7,21 @@ use super::expression::Expression;
 use crate::aggregate::AggregateSpec;
 use crate::var_registry::VarId;
 
+/// The aggregation stage of a grouping phase: aggregate functions computed
+/// per group, plus any derived bindings that depend on the aggregate outputs.
+///
+/// `binds` may reference aggregate output variables; they fire after every
+/// aggregate has been computed and before HAVING is evaluated. Empty `binds`
+/// means no derived bindings; `aggregates` is `NonEmpty` because an
+/// aggregation stage with nothing to compute would be meaningless.
+#[derive(Debug, Clone)]
+pub struct Aggregation {
+    /// Aggregate specs computed per group.
+    pub aggregates: NonEmpty<AggregateSpec>,
+    /// Derived bindings computed from aggregate outputs.
+    pub binds: Vec<(VarId, Expression)>,
+}
+
 /// The grouping phase of a query: how solutions partition into groups, what
 /// aggregates compute over each group, and whether to filter the resulting
 /// groups.
@@ -17,33 +32,36 @@ use crate::var_registry::VarId;
 ///
 /// # Invariants
 ///
-/// - `Implicit` requires aggregates (a single-group grouping with no
-///   aggregates would be a no-op pass-through).
+/// - `Implicit` always carries an `Aggregation` (a single-group grouping
+///   with nothing to compute would be a no-op pass-through).
 /// - `Explicit::group_by` is `NonEmpty<VarId>` (an empty key list would
 ///   semantically be `Implicit`).
-/// - `Explicit::aggregates` may be empty (a deduplicating GROUP BY:
-///   `SELECT ?g WHERE { ... } GROUP BY ?g` produces distinct values of `?g`
-///   with no per-group computations).
-/// - `having` contains no aggregate-function calls. Aggregates that appeared
-///   inside the surface HAVING expression have been lifted into `aggregates`
-///   with synthetic output variables, and the `having` expression has been
-///   rewritten to reference those output variables. The post-lift expression
-///   evaluates as a regular boolean against rows produced by upstream
-///   aggregate operators.
+/// - `Explicit::aggregation` is `Option<Aggregation>` — `None` represents
+///   a deduplicating GROUP BY (`SELECT ?g WHERE { ... } GROUP BY ?g`
+///   produces distinct values of `?g` with no per-group computations).
+/// - `Aggregation::binds` only exist when an aggregation stage is present,
+///   so they cannot accidentally accompany a dedup-only Explicit grouping.
+/// - `having` contains no aggregate-function calls. Aggregates that
+///   appeared inside the surface HAVING expression have been lifted into
+///   `aggregation.aggregates` with synthetic output variables, and the
+///   `having` expression has been rewritten to reference those output
+///   variables. The post-lift expression evaluates as a regular boolean
+///   against rows produced by upstream aggregate operators.
 #[derive(Debug, Clone)]
 pub enum Grouping {
     /// All solutions form one implicit group; aggregates produce a single
     /// result row. Surface form: aggregates without a `GROUP BY` clause
     /// (e.g. `SELECT (count(*) AS ?n) WHERE { ... }`).
     Implicit {
-        aggregates: NonEmpty<AggregateSpec>,
+        aggregation: Aggregation,
         having: Option<Expression>,
     },
-    /// Solutions partitioned by the values of `group_by`; aggregates produce
-    /// one row per partition.
+    /// Solutions partitioned by the values of `group_by`. Carries an
+    /// optional `aggregation` stage; with no aggregation, partitioning
+    /// alone deduplicates by group keys.
     Explicit {
         group_by: NonEmpty<VarId>,
-        aggregates: Vec<AggregateSpec>,
+        aggregation: Option<Aggregation>,
         having: Option<Expression>,
     },
 }
@@ -56,11 +74,30 @@ impl Grouping {
         }
     }
 
-    /// Number of aggregates computed by this grouping phase.
-    pub fn aggregate_count(&self) -> usize {
+    /// Borrow the aggregation stage, if any. Always present for `Implicit`;
+    /// optional for `Explicit` (absent in dedup-only `GROUP BY`).
+    pub fn aggregation(&self) -> Option<&Aggregation> {
         match self {
-            Self::Implicit { aggregates, .. } => aggregates.len(),
-            Self::Explicit { aggregates, .. } => aggregates.len(),
+            Self::Implicit { aggregation, .. } => Some(aggregation),
+            Self::Explicit { aggregation, .. } => aggregation.as_ref(),
         }
+    }
+
+    /// Iterate over every aggregate spec computed by this grouping phase,
+    /// regardless of variant.
+    pub fn aggregates(&self) -> Box<dyn Iterator<Item = &AggregateSpec> + '_> {
+        match self.aggregation() {
+            Some(agg) => Box::new(agg.aggregates.iter()),
+            None => Box::new(std::iter::empty()),
+        }
+    }
+
+    /// Iterate over the post-aggregation bind expressions for this grouping
+    /// phase (`(VarId, Expression)` pairs). Empty when there's no
+    /// aggregation stage.
+    pub fn binds(&self) -> impl Iterator<Item = &(VarId, Expression)> {
+        self.aggregation()
+            .into_iter()
+            .flat_map(|agg| agg.binds.iter())
     }
 }

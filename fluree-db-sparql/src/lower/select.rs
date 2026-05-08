@@ -417,15 +417,21 @@ impl<E: IriEncoder> LoweringContext<'_, E> {
         // Lift GROUP BY / aggregates / HAVING into the SubqueryPattern's
         // grouping phase. Subselect HAVING isn't lowered here (its surface
         // syntax is captured upstream and would require its own lowering).
+        let aggregation = fluree_db_core::NonEmpty::try_from_vec(aggregates).map(|aggregates| {
+            fluree_db_query::ir::Aggregation {
+                aggregates,
+                binds: Vec::new(),
+            }
+        });
         if let Some(group_by) = fluree_db_core::NonEmpty::try_from_vec(group_vars) {
             sq = sq.with_grouping(fluree_db_query::ir::Grouping::Explicit {
                 group_by,
-                aggregates,
+                aggregation,
                 having: None,
             });
-        } else if let Some(aggregates) = fluree_db_core::NonEmpty::try_from_vec(aggregates) {
+        } else if let Some(aggregation) = aggregation {
             sq = sq.with_grouping(fluree_db_query::ir::Grouping::Implicit {
-                aggregates,
+                aggregation,
                 having: None,
             });
         }

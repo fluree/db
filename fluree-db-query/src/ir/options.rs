@@ -10,10 +10,8 @@
 
 use std::sync::Arc;
 
-use super::expression::Expression;
 use crate::schema_bundle::SchemaBundleFlakes;
 use crate::sort::SortSpec;
-use crate::var_registry::VarId;
 
 /// Reasoning modes for RDFS / OWL / datalog query rewriting.
 ///
@@ -351,8 +349,6 @@ pub struct QueryOptions {
     pub offset: Option<usize>,
     /// Sort specifications (applied before projection)
     pub order_by: Vec<SortSpec>,
-    /// Post-aggregation BIND expressions (applied after HAVING)
-    pub post_binds: Vec<(VarId, Expression)>,
     /// Reasoning modes for RDFS/OWL reasoning
     ///
     /// Controls pattern expansion based on class/property hierarchies.
@@ -425,10 +421,7 @@ impl QueryOptions {
 
     /// Check if any modifiers are set
     pub fn has_modifiers(&self) -> bool {
-        self.limit.is_some()
-            || self.offset.is_some()
-            || !self.order_by.is_empty()
-            || !self.post_binds.is_empty()
+        self.limit.is_some() || self.offset.is_some() || !self.order_by.is_empty()
     }
 
     /// Check if any reasoning mode is explicitly enabled
@@ -456,7 +449,6 @@ mod tests {
         assert!(opts.limit.is_none());
         assert!(opts.offset.is_none());
         assert!(opts.order_by.is_empty());
-        assert!(opts.post_binds.is_empty());
         // Default reasoning: nothing explicitly enabled
         assert!(!opts.has_reasoning());
         assert!(!opts.is_reasoning_disabled());

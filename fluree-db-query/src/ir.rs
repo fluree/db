@@ -46,7 +46,7 @@ pub use adapters::{
 };
 pub use expression::{ArithmeticOp, CompareOp, Expression, Function};
 pub use fluree_db_core::value::FlakeValue;
-pub use grouping::Grouping;
+pub use grouping::{Aggregation, Grouping};
 pub use options::{QueryOptions, ReasoningModes};
 pub use path::{PathModifier, PropertyPathPattern};
 pub use pattern::{GraphName, Pattern, ServiceEndpoint, ServicePattern, SubqueryPattern};

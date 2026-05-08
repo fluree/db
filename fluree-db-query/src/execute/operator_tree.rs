@@ -44,6 +44,7 @@ use crate::group_aggregate::{GroupAggregateOperator, StreamingAggSpec};
 use crate::groupby::GroupByOperator;
 use crate::having::HavingOperator;
 use crate::ir::triple::{Ref, Term, TriplePattern};
+use crate::ir::Aggregation;
 use crate::ir::Expression;
 use crate::ir::Grouping;
 use crate::ir::QueryOptions;
@@ -132,7 +133,6 @@ fn detect_star_const_numeric_label_order_limit(
     if !query.output.is_distinct()
         || options.offset.is_some()
         || query.grouping.is_some()
-        || !options.post_binds.is_empty()
     {
         return None;
     }
@@ -313,7 +313,6 @@ fn detect_label_regex_type(query: &Query, options: &QueryOptions) -> Option<Labe
         || options.offset.is_some()
         || !options.order_by.is_empty()
         || query.grouping.is_some()
-        || !options.post_binds.is_empty()
     {
         return None;
     }
@@ -432,10 +431,10 @@ fn extract_regex_const_pattern(
 /// - LIMIT >= 1 (or no limit)
 /// - SELECT vars == `[agg.output_var]`
 pub(crate) fn detect_count_all_aggregate(query: &Query, options: &QueryOptions) -> Option<VarId> {
-    let Some(Grouping::Implicit { aggregates, having: None }) = &query.grouping
+    let Some(Grouping::Implicit { aggregation: Aggregation { aggregates, binds }, having: None }) = &query.grouping
     else { return None };
     if aggregates.len() != 1
-        || !options.post_binds.is_empty()
+        || !binds.is_empty()
         || !options.order_by.is_empty()
         || options.offset.is_some()
         || query.output.is_distinct()
@@ -468,10 +467,10 @@ fn detect_count_distinct_aggregate(
     query: &Query,
     options: &QueryOptions,
 ) -> Option<(VarId, VarId)> {
-    let Some(Grouping::Implicit { aggregates, having: None }) = &query.grouping
+    let Some(Grouping::Implicit { aggregation: Aggregation { aggregates, binds }, having: None }) = &query.grouping
     else { return None };
     if aggregates.len() != 1
-        || !options.post_binds.is_empty()
+        || !binds.is_empty()
         || !options.order_by.is_empty()
         || options.offset.is_some()
         || query.output.is_distinct()
@@ -498,10 +497,10 @@ fn detect_count_distinct_aggregate(
 /// Returns `Some((input_var, output_var))` where `input_var` is `None` for `COUNT(*)`.
 /// Same standard constraints as [`detect_count_all_aggregate`].
 fn detect_count_aggregate(query: &Query, options: &QueryOptions) -> Option<(Option<VarId>, VarId)> {
-    let Some(Grouping::Implicit { aggregates, having: None }) = &query.grouping
+    let Some(Grouping::Implicit { aggregation: Aggregation { aggregates, binds }, having: None }) = &query.grouping
     else { return None };
     if aggregates.len() != 1
-        || !options.post_binds.is_empty()
+        || !binds.is_empty()
         || !options.order_by.is_empty()
         || options.offset.is_some()
         || query.output.is_distinct()
@@ -590,7 +589,7 @@ fn detect_predicate_group_by_object_count_topk(
     // GROUP BY ?object with exactly one aggregate, no HAVING.
     let Some(Grouping::Explicit {
         group_by,
-        aggregates,
+        aggregation: Some(Aggregation { aggregates, binds }),
         having: None,
     }) = &query.grouping
     else {
@@ -602,7 +601,7 @@ fn detect_predicate_group_by_object_count_topk(
     if aggregates.len() != 1 {
         return None;
     }
-    let agg = &aggregates[0];
+    let agg = aggregates.first();
     if agg.distinct {
         return None;
     }
@@ -613,7 +612,7 @@ fn detect_predicate_group_by_object_count_topk(
     if matches!(agg.function, AggregateFn::Count) && agg.input_var != Some(s_var) {
         return None;
     }
-    if !options.post_binds.is_empty() {
+    if !binds.is_empty() {
         return None;
     }
     // ORDER BY DESC(?count) and LIMIT k required so we can do top-k directly.
@@ -651,7 +650,7 @@ fn detect_group_by_object_star_topk(
     let select_vars: Arc<[VarId]> = Arc::from(query.output.projected_vars()?.into_boxed_slice());
     let Some(Grouping::Explicit {
         group_by,
-        aggregates,
+        aggregation: Some(Aggregation { aggregates, binds }),
         having: None,
     }) = &query.grouping
     else {
@@ -661,7 +660,7 @@ fn detect_group_by_object_star_topk(
         return None;
     }
     let group_var = *group_by.first();
-    if query.output.is_distinct() || !options.post_binds.is_empty() {
+    if query.output.is_distinct() || !binds.is_empty() {
         return None;
     }
     if options.offset.is_some() {
@@ -797,12 +796,12 @@ fn detect_sum_strlen_group_concat_subquery(
 ) -> Option<(Ref, Arc<str>, VarId)> {
     use crate::ir::{Expression, Function, Pattern};
 
-    let Some(Grouping::Implicit { aggregates, having: None }) = &query.grouping
+    let Some(Grouping::Implicit { aggregation: Aggregation { aggregates, binds }, having: None }) = &query.grouping
     else { return None };
     if aggregates.len() != 1 {
         return None;
     }
-    if query.output.is_distinct() || !options.post_binds.is_empty() {
+    if query.output.is_distinct() || !binds.is_empty() {
         return None;
     }
     if !options.order_by.is_empty() || options.offset.is_some() {
@@ -851,7 +850,7 @@ fn detect_sum_strlen_group_concat_subquery(
     // Inner subquery must be GROUP BY ?s with GROUP_CONCAT(?o; sep) AS ?cat.
     let Some(Grouping::Explicit {
         group_by: sq_group_by,
-        aggregates: sq_aggregates,
+        aggregation: Some(Aggregation { aggregates: sq_aggregates, binds: _ }),
         having: None,
     }) = &sq.grouping
     else {
@@ -863,7 +862,7 @@ fn detect_sum_strlen_group_concat_subquery(
     if sq_aggregates.len() != 1 {
         return None;
     }
-    let inner_agg = &sq_aggregates[0];
+    let inner_agg = sq_aggregates.first();
     let (sep, input_var) = match &inner_agg.function {
         AggregateFn::GroupConcat { separator } => (separator.as_str(), inner_agg.input_var?),
         _ => return None,
@@ -1042,10 +1041,10 @@ fn detect_predicate_minmax_string(
     options: &QueryOptions,
 ) -> Option<(Ref, MinMaxMode, VarId)> {
     // Must be single aggregate, no grouping/having/binds/etc.
-    let Some(Grouping::Implicit { aggregates, having: None }) = &query.grouping
+    let Some(Grouping::Implicit { aggregation: Aggregation { aggregates, binds }, having: None }) = &query.grouping
     else { return None };
     if aggregates.len() != 1
-        || !options.post_binds.is_empty()
+        || !binds.is_empty()
         || !options.order_by.is_empty()
         || options.offset.is_some()
         || query.output.is_distinct()
@@ -1088,10 +1087,10 @@ fn detect_predicate_minmax_string(
 }
 
 fn detect_predicate_avg_numeric(query: &Query, options: &QueryOptions) -> Option<(Ref, VarId)> {
-    let Some(Grouping::Implicit { aggregates, having: None }) = &query.grouping
+    let Some(Grouping::Implicit { aggregation: Aggregation { aggregates, binds }, having: None }) = &query.grouping
     else { return None };
     if aggregates.len() != 1
-        || !options.post_binds.is_empty()
+        || !binds.is_empty()
         || !options.order_by.is_empty()
         || options.offset.is_some()
         || query.output.is_distinct()
@@ -1125,10 +1124,10 @@ fn detect_count_rows_with_encoded_filters(
     VarId,
 )> {
     // Must be single COUNT aggregate, no grouping/having/binds/etc.
-    let Some(Grouping::Implicit { aggregates, having: None }) = &query.grouping
+    let Some(Grouping::Implicit { aggregation: Aggregation { aggregates, binds }, having: None }) = &query.grouping
     else { return None };
     if aggregates.len() != 1
-        || !options.post_binds.is_empty()
+        || !binds.is_empty()
         || !options.order_by.is_empty()
         || options.offset.is_some()
         || query.output.is_distinct()
@@ -1246,10 +1245,10 @@ fn detect_predicate_count_rows_numeric_compare(
     query: &Query,
     options: &QueryOptions,
 ) -> Option<(Ref, NumericCompareOp, fluree_db_core::FlakeValue, VarId)> {
-    let Some(Grouping::Implicit { aggregates, having: None }) = &query.grouping
+    let Some(Grouping::Implicit { aggregation: Aggregation { aggregates, binds }, having: None }) = &query.grouping
     else { return None };
     if aggregates.len() != 1
-        || !options.post_binds.is_empty()
+        || !binds.is_empty()
         || !options.order_by.is_empty()
         || options.offset.is_some()
         || query.output.is_distinct()
@@ -1315,10 +1314,10 @@ fn detect_string_prefix_sum_strstarts(
 ) -> Option<(Ref, Arc<str>, VarId)> {
     use crate::ir::{Expression, FlakeValue, Function};
 
-    let Some(Grouping::Implicit { aggregates, having: None }) = &query.grouping
+    let Some(Grouping::Implicit { aggregation: Aggregation { aggregates, binds }, having: None }) = &query.grouping
     else { return None };
     if aggregates.len() != 1
-        || !options.post_binds.is_empty()
+        || !binds.is_empty()
         || !options.order_by.is_empty()
         || options.offset.is_some()
         || query.output.is_distinct()
@@ -1487,7 +1486,7 @@ fn detect_stats_count_by_predicate(
     // aggregate, no HAVING.
     let Some(Grouping::Explicit {
         group_by,
-        aggregates,
+        aggregation: Some(Aggregation { aggregates, binds }),
         having: None,
     }) = &query.grouping
     else {
@@ -1499,7 +1498,7 @@ fn detect_stats_count_by_predicate(
     if aggregates.len() != 1 {
         return None;
     }
-    let agg = &aggregates[0];
+    let agg = aggregates.first();
     if !matches!(agg.function, AggregateFn::Count) {
         return None;
     }
@@ -1511,7 +1510,7 @@ fn detect_stats_count_by_predicate(
     }
 
     // No post_binds (for simplicity)
-    if !options.post_binds.is_empty() {
+    if !binds.is_empty() {
         return None;
     }
 
@@ -1529,10 +1528,10 @@ fn detect_fused_scan_sum_i64(
     options: &QueryOptions,
 ) -> Option<(Ref, SumExprI64, VarId)> {
     // Must be single aggregate, no grouping/having/binds/etc.
-    let Some(Grouping::Implicit { aggregates, having: None }) = &query.grouping
+    let Some(Grouping::Implicit { aggregation: Aggregation { aggregates, binds }, having: None }) = &query.grouping
     else { return None };
     if aggregates.len() != 1
-        || !options.post_binds.is_empty()
+        || !binds.is_empty()
         || !options.order_by.is_empty()
         || options.offset.is_some()
     {
@@ -2690,13 +2689,16 @@ fn build_operator_tree_inner(
         Some(Grouping::Explicit { group_by, .. }) => group_by.iter().copied().collect(),
         _ => Vec::new(),
     };
-    let aggregates_vec: Vec<AggregateSpec> = match &query.grouping {
-        Some(Grouping::Implicit { aggregates, .. }) => {
-            aggregates.iter().cloned().collect()
-        }
-        Some(Grouping::Explicit { aggregates, .. }) => aggregates.clone(),
-        None => Vec::new(),
-    };
+    let aggregates_vec: Vec<AggregateSpec> = query
+        .grouping
+        .as_ref()
+        .map(|g| g.aggregates().cloned().collect())
+        .unwrap_or_default();
+    let post_binds_vec: Vec<(VarId, Expression)> = query
+        .grouping
+        .as_ref()
+        .map(|g| g.binds().cloned().collect())
+        .unwrap_or_default();
     let having_expr: Option<&Expression> = query.grouping.as_ref().and_then(Grouping::having);
 
     let mut operator = build_where_operators_with_needed(
@@ -2866,8 +2868,8 @@ fn build_operator_tree_inner(
     }
 
     // Post-aggregation BINDs (e.g., SELECT (CEIL(?avg) AS ?ceil))
-    if !options.post_binds.is_empty() {
-        for (i, (var, expr)) in options.post_binds.iter().enumerate() {
+    if !post_binds_vec.is_empty() {
+        for (i, (var, expr)) in post_binds_vec.iter().enumerate() {
             operator = Box::new(
                 crate::bind::BindOperator::new(operator, *var, expr.clone(), vec![])
                     .with_out_schema(
@@ -3195,15 +3197,18 @@ mod tests {
 
         let make_grouping = || {
             Some(Grouping::Implicit {
-                aggregates: fluree_db_core::NonEmpty::try_from_vec(vec![
-                    crate::aggregate::AggregateSpec {
-                        function: crate::aggregate::AggregateFn::CountDistinct,
-                        input_var: Some(counted_o),
-                        output_var: out,
-                        distinct: false,
-                    },
-                ])
-                .unwrap(),
+                aggregation: Aggregation {
+                    aggregates: fluree_db_core::NonEmpty::try_from_vec(vec![
+                        crate::aggregate::AggregateSpec {
+                            function: crate::aggregate::AggregateFn::CountDistinct,
+                            input_var: Some(counted_o),
+                            output_var: out,
+                            distinct: false,
+                        },
+                    ])
+                    .unwrap(),
+                    binds: Vec::new(),
+                },
                 having: None,
             })
         };

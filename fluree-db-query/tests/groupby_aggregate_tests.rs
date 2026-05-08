@@ -13,17 +13,27 @@ use fluree_db_query::context::ExecutionContext;
 use fluree_db_query::execute::{execute, ContextConfig, ExecutableQuery};
 use fluree_db_query::groupby::GroupByOperator;
 use fluree_db_query::ir::QueryOptions;
-use fluree_db_query::ir::{Expression, Grouping, Pattern};
+use fluree_db_query::ir::{Aggregation, Expression, Grouping, Pattern};
 use fluree_db_query::ir::{Query, QueryOutput};
 use fluree_db_query::operator::Operator;
 use fluree_db_query::var_registry::{VarId, VarRegistry};
 use fluree_graph_json_ld::ParsedContext;
 use std::sync::Arc;
 
+fn aggregation(aggregates: Vec<AggregateSpec>) -> Aggregation {
+    Aggregation {
+        aggregates: NonEmpty::try_from_vec(aggregates).expect("non-empty aggregates"),
+        binds: Vec::new(),
+    }
+}
+
 fn explicit_grouping(by: Vec<VarId>, aggregates: Vec<AggregateSpec>) -> Grouping {
     Grouping::Explicit {
         group_by: NonEmpty::try_from_vec(by).expect("non-empty group_by"),
-        aggregates,
+        aggregation: NonEmpty::try_from_vec(aggregates).map(|aggregates| Aggregation {
+            aggregates,
+            binds: Vec::new(),
+        }),
         having: None,
     }
 }
@@ -35,14 +45,17 @@ fn explicit_grouping_having(
 ) -> Grouping {
     Grouping::Explicit {
         group_by: NonEmpty::try_from_vec(by).expect("non-empty group_by"),
-        aggregates,
+        aggregation: NonEmpty::try_from_vec(aggregates).map(|aggregates| Aggregation {
+            aggregates,
+            binds: Vec::new(),
+        }),
         having: Some(having),
     }
 }
 
 fn implicit_grouping(aggregates: Vec<AggregateSpec>) -> Grouping {
     Grouping::Implicit {
-        aggregates: NonEmpty::try_from_vec(aggregates).expect("non-empty aggregates"),
+        aggregation: aggregation(aggregates),
         having: None,
     }
 }

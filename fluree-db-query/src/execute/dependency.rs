@@ -5,8 +5,7 @@
 //! and GROUP BY. Variables without downstream dependencies are dead and can
 //! be projected away early.
 
-use crate::aggregate::AggregateSpec;
-use crate::ir::{Grouping, Query, QueryOptions};
+use crate::ir::{Expression, Grouping, Query, QueryOptions};
 use crate::var_registry::VarId;
 use std::collections::{HashMap, HashSet};
 
@@ -50,11 +49,16 @@ pub fn compute_variable_deps(query: &Query, options: &QueryOptions) -> Option<Va
     }
     let required_sort_vars: Vec<VarId> = deps.iter().copied().collect();
 
-    // Post-binds (reverse order): trace expression inputs.
+    // Post-aggregation binds (reverse order): trace expression inputs.
     // Record deps BEFORE processing each bind backward, since that
     // represents what the bind's output must contain for downstream.
-    let mut required_bind_vars: Vec<Vec<VarId>> = Vec::with_capacity(options.post_binds.len());
-    for (var, expr) in options.post_binds.iter().rev() {
+    let binds: Vec<&(VarId, Expression)> = query
+        .grouping
+        .iter()
+        .flat_map(Grouping::binds)
+        .collect();
+    let mut required_bind_vars: Vec<Vec<VarId>> = Vec::with_capacity(binds.len());
+    for (var, expr) in binds.iter().rev() {
         // Record what this bind's output must contain.
         required_bind_vars.push(deps.iter().copied().collect());
         // Then trace backward through the bind expression.
@@ -62,7 +66,7 @@ pub fn compute_variable_deps(query: &Query, options: &QueryOptions) -> Option<Va
             deps.extend(expr.referenced_vars());
         }
     }
-    // Reverse so indices match the forward (execution) order of post_binds.
+    // Reverse so indices match the forward (execution) order of binds.
     required_bind_vars.reverse();
 
     // Record what HAVING's output must contain (before tracing HAVING backward).
@@ -77,14 +81,8 @@ pub fn compute_variable_deps(query: &Query, options: &QueryOptions) -> Option<Va
     // Record what Aggregate's output must contain (before tracing aggregates backward).
     let required_aggregate_vars: Vec<VarId> = deps.iter().copied().collect();
 
-    // Aggregates: replace output vars with input vars. Iterate over either
-    // grouping variant's aggregate list via a unified iterator.
-    let agg_iter: Box<dyn Iterator<Item = &AggregateSpec>> = match &query.grouping {
-        Some(Grouping::Implicit { aggregates, .. }) => Box::new(aggregates.iter()),
-        Some(Grouping::Explicit { aggregates, .. }) => Box::new(aggregates.iter()),
-        None => Box::new(std::iter::empty()),
-    };
-    for spec in agg_iter {
+    // Aggregates: replace output vars with input vars.
+    for spec in query.grouping.iter().flat_map(Grouping::aggregates) {
         if deps.remove(&spec.output_var) {
             if let Some(input_var) = spec.input_var {
                 deps.insert(input_var);
@@ -119,8 +117,8 @@ mod tests {
     use crate::aggregate::{AggregateFn, AggregateSpec};
     use crate::ir::triple::{Ref, Term, TriplePattern};
     use crate::ir::QueryOptions;
-    use crate::ir::{ConstructTemplate, Query, QueryOutput};
-    use crate::ir::{Expression, FlakeValue, Pattern};
+    use crate::ir::{Aggregation, ConstructTemplate, Query, QueryOutput};
+    use crate::ir::{FlakeValue, Pattern};
     use crate::parse::SelectMode;
     use crate::sort::SortSpec;
     use fluree_db_core::Sid;
@@ -207,12 +205,16 @@ mod tests {
         let mut query = make_query(vec![VarId(2), VarId(3)], vec![], SelectMode::Many);
         query.grouping = Some(Grouping::Explicit {
             group_by: fluree_db_core::NonEmpty::try_from_vec(vec![VarId(2)]).unwrap(),
-            aggregates: vec![AggregateSpec {
-                function: AggregateFn::Avg,
-                input_var: Some(VarId(1)),
-                output_var: VarId(3),
-                distinct: false,
-            }],
+            aggregation: Some(Aggregation {
+                aggregates: fluree_db_core::NonEmpty::try_from_vec(vec![AggregateSpec {
+                    function: AggregateFn::Avg,
+                    input_var: Some(VarId(1)),
+                    output_var: VarId(3),
+                    distinct: false,
+                }])
+                .unwrap(),
+                binds: Vec::new(),
+            }),
             having: None,
         });
         let options = QueryOptions::default();
@@ -227,25 +229,38 @@ mod tests {
 
     #[test]
     fn post_bind_traces_where_vars() {
-        // SELECT ?x (CEIL(?avg) AS ?ceil)
-        // post_bind: ?ceil = CEIL(?avg)
-        let query = make_query(vec![VarId(0), VarId(2)], vec![], SelectMode::Many);
-        let options = QueryOptions {
-            post_binds: vec![(
-                VarId(2),
-                Expression::Call {
-                    func: crate::ir::Function::Ceil,
-                    args: vec![Expression::Var(VarId(1))],
-                },
-            )],
-            ..Default::default()
-        };
+        // SELECT ?x (AVG(?n) AS ?avg) (CEIL(?avg) AS ?ceil)
+        // GROUP BY ?x — the post-bind ?ceil = CEIL(?avg) references the
+        // aggregate output ?avg, which traces back to the WHERE var ?n.
+        let mut query = make_query(vec![VarId(0), VarId(3)], vec![], SelectMode::Many);
+        query.grouping = Some(Grouping::Explicit {
+            group_by: fluree_db_core::NonEmpty::try_from_vec(vec![VarId(0)]).unwrap(),
+            aggregation: Some(Aggregation {
+                aggregates: fluree_db_core::NonEmpty::try_from_vec(vec![AggregateSpec {
+                    function: AggregateFn::Avg,
+                    input_var: Some(VarId(1)),
+                    output_var: VarId(2),
+                    distinct: false,
+                }])
+                .unwrap(),
+                binds: vec![(
+                    VarId(3),
+                    Expression::Call {
+                        func: crate::ir::Function::Ceil,
+                        args: vec![Expression::Var(VarId(2))],
+                    },
+                )],
+            }),
+            having: None,
+        });
+        let options = QueryOptions::default();
 
         let deps = compute_variable_deps(&query, &options).unwrap();
+        // ?x (group key) and ?n (aggregate input traced from ?avg) are WHERE deps.
         assert!(deps.required_where_vars.contains(&VarId(0)));
-        // ?avg (input to post-bind) is a WHERE dependency, ?ceil is not (it's computed)
         assert!(deps.required_where_vars.contains(&VarId(1)));
-        assert!(!deps.required_where_vars.contains(&VarId(2)));
+        // ?ceil (post-bind output) is not a WHERE dep — it's computed.
+        assert!(!deps.required_where_vars.contains(&VarId(3)));
     }
 
     #[test]
@@ -253,7 +268,7 @@ mod tests {
         let mut query = make_query(vec![VarId(0)], vec![], SelectMode::Many);
         query.grouping = Some(Grouping::Explicit {
             group_by: fluree_db_core::NonEmpty::try_from_vec(vec![VarId(0)]).unwrap(),
-            aggregates: vec![],
+            aggregation: None,
             having: Some(Expression::gt(
                 Expression::Var(VarId(1)),
                 Expression::Const(FlakeValue::Long(10)),
@@ -414,12 +429,16 @@ mod tests {
         let mut query = make_query(vec![VarId(0), VarId(2)], vec![], SelectMode::Many);
         query.grouping = Some(Grouping::Explicit {
             group_by: fluree_db_core::NonEmpty::try_from_vec(vec![VarId(0)]).unwrap(),
-            aggregates: vec![AggregateSpec {
-                function: AggregateFn::Avg,
-                input_var: Some(VarId(1)),
-                output_var: VarId(2),
-                distinct: false,
-            }],
+            aggregation: Some(Aggregation {
+                aggregates: fluree_db_core::NonEmpty::try_from_vec(vec![AggregateSpec {
+                    function: AggregateFn::Avg,
+                    input_var: Some(VarId(1)),
+                    output_var: VarId(2),
+                    distinct: false,
+                }])
+                .unwrap(),
+                binds: Vec::new(),
+            }),
             having: None,
         });
         let options = QueryOptions::default();
@@ -444,17 +463,31 @@ mod tests {
 
     #[test]
     fn variable_deps_with_post_bind() {
-        // SELECT ?x ?ceil WHERE { ... } BIND(CEIL(?avg) AS ?ceil) ORDER BY ?ceil
-        let query = make_query(vec![VarId(0), VarId(2)], vec![], SelectMode::Many);
+        // SELECT ?x (AVG(?n) AS ?avg) (CEIL(?avg) AS ?ceil)
+        // GROUP BY ?x ORDER BY ?ceil — bind on aggregate output, sorted on bind output.
+        let mut query = make_query(vec![VarId(0), VarId(3)], vec![], SelectMode::Many);
+        query.grouping = Some(Grouping::Explicit {
+            group_by: fluree_db_core::NonEmpty::try_from_vec(vec![VarId(0)]).unwrap(),
+            aggregation: Some(Aggregation {
+                aggregates: fluree_db_core::NonEmpty::try_from_vec(vec![AggregateSpec {
+                    function: AggregateFn::Avg,
+                    input_var: Some(VarId(1)),
+                    output_var: VarId(2),
+                    distinct: false,
+                }])
+                .unwrap(),
+                binds: vec![(
+                    VarId(3),
+                    Expression::Call {
+                        func: crate::ir::Function::Ceil,
+                        args: vec![Expression::Var(VarId(2))],
+                    },
+                )],
+            }),
+            having: None,
+        });
         let options = QueryOptions {
-            post_binds: vec![(
-                VarId(2),
-                Expression::Call {
-                    func: crate::ir::Function::Ceil,
-                    args: vec![Expression::Var(VarId(1))],
-                },
-            )],
-            order_by: vec![SortSpec::asc(VarId(2))],
+            order_by: vec![SortSpec::asc(VarId(3))],
             ..Default::default()
         };
 
@@ -462,18 +495,19 @@ mod tests {
 
         // required_sort_vars needs ?x and ?ceil
         assert!(deps.required_sort_vars.contains(&VarId(0)));
-        assert!(deps.required_sort_vars.contains(&VarId(2)));
+        assert!(deps.required_sort_vars.contains(&VarId(3)));
 
-        // required_bind_vars[0] represents what bind 0's OUTPUT must contain.
-        // That's the same as required_sort_vars since bind 0 is the only bind.
+        // required_bind_vars[0] is what bind 0's output must contain.
+        // Same as required_sort_vars since there's only one bind.
         assert_eq!(deps.required_bind_vars.len(), 1);
         assert!(deps.required_bind_vars[0].contains(&VarId(0)));
-        assert!(deps.required_bind_vars[0].contains(&VarId(2)));
+        assert!(deps.required_bind_vars[0].contains(&VarId(3)));
 
-        // required_where_vars: bind traces ?ceil→?avg, so {?x, ?avg}
+        // required_where_vars: bind ?ceil→?avg, aggregate ?avg→?n, so {?x, ?n}.
         assert!(deps.required_where_vars.contains(&VarId(0)));
         assert!(deps.required_where_vars.contains(&VarId(1)));
         assert!(!deps.required_where_vars.contains(&VarId(2)));
+        assert!(!deps.required_where_vars.contains(&VarId(3)));
     }
 
     #[test]
@@ -483,12 +517,16 @@ mod tests {
         let mut query = make_query(vec![VarId(0), VarId(2)], vec![], SelectMode::Many);
         query.grouping = Some(Grouping::Explicit {
             group_by: fluree_db_core::NonEmpty::try_from_vec(vec![VarId(0)]).unwrap(),
-            aggregates: vec![AggregateSpec {
-                function: AggregateFn::Count,
-                input_var: Some(VarId(1)),
-                output_var: VarId(2),
-                distinct: false,
-            }],
+            aggregation: Some(Aggregation {
+                aggregates: fluree_db_core::NonEmpty::try_from_vec(vec![AggregateSpec {
+                    function: AggregateFn::Count,
+                    input_var: Some(VarId(1)),
+                    output_var: VarId(2),
+                    distinct: false,
+                }])
+                .unwrap(),
+                binds: Vec::new(),
+            }),
             having: Some(Expression::gt(
                 Expression::Var(VarId(2)),
                 Expression::Const(FlakeValue::Long(5)),

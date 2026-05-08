@@ -224,24 +224,30 @@ impl<'a, E: IriEncoder> LoweringContext<'a, E> {
                 let lowered_modifiers =
                     self.lower_solution_modifiers(&select_query.modifiers, &select_query.select)?;
                 patterns.extend(lowered_modifiers.pre_group_binds);
-                let mut options = lowered_modifiers.options;
-                options.post_binds = select_binds.post;
+                let options = lowered_modifiers.options;
                 let distinct = lowered_modifiers.distinct;
 
                 // Assemble the grouping phase from the lowered components.
+                // Aggregation only exists when there are aggregates; post-aggregation
+                // binds (`select_binds.post`) live inside it.
+                let aggregation = fluree_db_core::NonEmpty::try_from_vec(
+                    lowered_modifiers.aggregates,
+                )
+                .map(|aggregates| fluree_db_query::ir::Aggregation {
+                    aggregates,
+                    binds: select_binds.post,
+                });
                 let grouping = if let Some(group_by) =
                     fluree_db_core::NonEmpty::try_from_vec(lowered_modifiers.group_by)
                 {
                     Some(fluree_db_query::ir::Grouping::Explicit {
                         group_by,
-                        aggregates: lowered_modifiers.aggregates,
+                        aggregation,
                         having: lowered_modifiers.having,
                     })
-                } else if let Some(aggregates) =
-                    fluree_db_core::NonEmpty::try_from_vec(lowered_modifiers.aggregates)
-                {
+                } else if let Some(aggregation) = aggregation {
                     Some(fluree_db_query::ir::Grouping::Implicit {
-                        aggregates,
+                        aggregation,
                         having: lowered_modifiers.having,
                     })
                 } else {
@@ -339,11 +345,11 @@ mod tests {
 
     /// View aggregates of a lowered Query as a flat Vec of references.
     fn aggregates_of(query: &Query) -> Vec<&AggregateSpec> {
-        match &query.grouping {
-            Some(Grouping::Implicit { aggregates, .. }) => aggregates.iter().collect(),
-            Some(Grouping::Explicit { aggregates, .. }) => aggregates.iter().collect(),
-            None => Vec::new(),
-        }
+        query
+            .grouping
+            .iter()
+            .flat_map(Grouping::aggregates)
+            .collect()
     }
 
     /// View GROUP BY keys of a lowered Query.
