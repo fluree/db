@@ -119,10 +119,7 @@ fn workspace_reconciles_with_regression_budget() {
             continue;
         };
         if !benches.is_empty() {
-            declared
-                .entry(crate_name)
-                .or_default()
-                .extend(benches);
+            declared.entry(crate_name).or_default().extend(benches);
         }
     }
 
