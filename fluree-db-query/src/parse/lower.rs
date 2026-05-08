@@ -19,8 +19,8 @@ use crate::context::WellKnownDatatypes;
 use crate::ir::triple::{Ref, Term, TriplePattern};
 use crate::ir::QueryOptions;
 use crate::ir::{
-    Aggregation, Column, ConstructTemplate, ForwardItem, Grouping, HydrationSpec, NestedSelectSpec,
-    Projection, Query, QueryOutput, Restriction, Root,
+    Column, ConstructTemplate, ForwardItem, Grouping, HydrationSpec, NestedSelectSpec, Projection,
+    Query, QueryOutput, Restriction, Root,
 };
 use crate::ir::{
     Expression, Function, IndexSearchPattern, IndexSearchTarget, PathModifier, Pattern,
@@ -30,7 +30,7 @@ use crate::sort::{SortDirection, SortSpec};
 use crate::var_registry::{VarId, VarRegistry};
 use crate::vector::DistanceMetric;
 use fluree_db_core::DatatypeConstraint;
-use fluree_db_core::{FlakeValue, NonEmpty, Sid};
+use fluree_db_core::{FlakeValue, Sid};
 #[cfg(test)]
 use fluree_graph_json_ld::ParsedContext;
 use std::sync::Arc;
@@ -1558,25 +1558,7 @@ fn lower_grouping(
         .map(|e| lower_filter_expr(e, vars))
         .transpose()?;
 
-    let aggregation = NonEmpty::try_from_vec(aggregates).map(|aggregates| Aggregation {
-        aggregates,
-        binds: Vec::new(),
-    });
-
-    if let Some(group_by) = NonEmpty::try_from_vec(group_by) {
-        Ok(Some(Grouping::Explicit {
-            group_by,
-            aggregation,
-            having,
-        }))
-    } else if let Some(aggregation) = aggregation {
-        Ok(Some(Grouping::Implicit { aggregation, having }))
-    } else {
-        // No GROUP BY, no aggregates: the parser should reject HAVING in this
-        // shape, so any leftover `having` here is dropped — the validator's
-        // job, not ours.
-        Ok(None)
-    }
+    Ok(Grouping::assemble(group_by, aggregates, Vec::new(), having))
 }
 
 #[cfg(test)]

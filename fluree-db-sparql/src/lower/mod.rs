@@ -61,7 +61,7 @@ pub use error::{LowerError, Result};
 use crate::ast::query::{QueryBody, SelectVariables, SparqlAst};
 
 use fluree_db_query::ir::Pattern;
-use fluree_db_query::ir::{Query, QueryOutput};
+use fluree_db_query::ir::{Grouping, Query, QueryOutput};
 use fluree_db_query::parse::encode::IriEncoder;
 use fluree_db_query::var_registry::{VarId, VarRegistry};
 
@@ -228,31 +228,14 @@ impl<'a, E: IriEncoder> LoweringContext<'a, E> {
                 let distinct = lowered_modifiers.distinct;
 
                 // Assemble the grouping phase from the lowered components.
-                // Aggregation only exists when there are aggregates; post-aggregation
-                // binds (`select_binds.post`) live inside it.
-                let aggregation = fluree_db_core::NonEmpty::try_from_vec(
+                // Post-aggregation binds (`select_binds.post`) ride inside the
+                // aggregation stage when one exists.
+                let grouping = Grouping::assemble(
+                    lowered_modifiers.group_by,
                     lowered_modifiers.aggregates,
-                )
-                .map(|aggregates| fluree_db_query::ir::Aggregation {
-                    aggregates,
-                    binds: select_binds.post,
-                });
-                let grouping = if let Some(group_by) =
-                    fluree_db_core::NonEmpty::try_from_vec(lowered_modifiers.group_by)
-                {
-                    Some(fluree_db_query::ir::Grouping::Explicit {
-                        group_by,
-                        aggregation,
-                        having: lowered_modifiers.having,
-                    })
-                } else if let Some(aggregation) = aggregation {
-                    Some(fluree_db_query::ir::Grouping::Implicit {
-                        aggregation,
-                        having: lowered_modifiers.having,
-                    })
-                } else {
-                    None
-                };
+                    select_binds.post,
+                    lowered_modifiers.having,
+                );
 
                 // Build a JSON-LD-like context from SPARQL prologue prefixes so formatters can compact IRIs.
                 let ctx = self.build_jsonld_context()?;

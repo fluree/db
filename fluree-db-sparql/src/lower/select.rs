@@ -13,7 +13,7 @@ use crate::span::SourceSpan;
 
 use fluree_db_query::ir::AggregateSpec;
 use fluree_db_query::ir::QueryOptions;
-use fluree_db_query::ir::{Expression, FlakeValue, Pattern, SubqueryPattern};
+use fluree_db_query::ir::{Expression, FlakeValue, Grouping, Pattern, SubqueryPattern};
 use fluree_db_query::parse::encode::IriEncoder;
 use fluree_db_query::sort::{SortDirection, SortSpec};
 use fluree_db_query::var_registry::VarId;
@@ -414,26 +414,12 @@ impl<E: IriEncoder> LoweringContext<'_, E> {
             group_vars = self.collect_non_aggregate_select_vars(&select_clause);
         }
 
-        // Lift GROUP BY / aggregates / HAVING into the SubqueryPattern's
-        // grouping phase. Subselect HAVING isn't lowered here (its surface
-        // syntax is captured upstream and would require its own lowering).
-        let aggregation = fluree_db_core::NonEmpty::try_from_vec(aggregates).map(|aggregates| {
-            fluree_db_query::ir::Aggregation {
-                aggregates,
-                binds: Vec::new(),
-            }
-        });
-        if let Some(group_by) = fluree_db_core::NonEmpty::try_from_vec(group_vars) {
-            sq = sq.with_grouping(fluree_db_query::ir::Grouping::Explicit {
-                group_by,
-                aggregation,
-                having: None,
-            });
-        } else if let Some(aggregation) = aggregation {
-            sq = sq.with_grouping(fluree_db_query::ir::Grouping::Implicit {
-                aggregation,
-                having: None,
-            });
+        // Lift GROUP BY / aggregates into the SubqueryPattern's grouping
+        // phase. Subselect HAVING isn't lowered here (its surface syntax is
+        // captured upstream and would require its own lowering); same for
+        // post-aggregation binds.
+        if let Some(grouping) = Grouping::assemble(group_vars, aggregates, Vec::new(), None) {
+            sq = sq.with_grouping(grouping);
         }
 
         // Apply LIMIT

@@ -116,6 +116,36 @@ pub enum Grouping {
 }
 
 impl Grouping {
+    /// Assemble a grouping phase from the loose pieces produced by lowering.
+    ///
+    /// Returns `None` when there is no grouping phase to build (no `GROUP BY`,
+    /// no aggregates, no post-aggregation binds). Otherwise selects the variant
+    /// that satisfies the type-level invariants:
+    ///   - `Explicit` when `group_by` is non-empty (regardless of whether an
+    ///     aggregation stage is present — `GROUP BY` alone deduplicates by key).
+    ///   - `Implicit` when there's no `GROUP BY` but at least one aggregate.
+    ///
+    /// Any leftover `having` or `binds` when no grouping exists is dropped on
+    /// the floor — the parser/validator owns rejecting that surface form.
+    pub fn assemble(
+        group_by: Vec<VarId>,
+        aggregates: Vec<AggregateSpec>,
+        binds: Vec<(VarId, Expression)>,
+        having: Option<Expression>,
+    ) -> Option<Self> {
+        let aggregation = NonEmpty::try_from_vec(aggregates)
+            .map(|aggregates| Aggregation { aggregates, binds });
+        if let Some(group_by) = NonEmpty::try_from_vec(group_by) {
+            Some(Self::Explicit {
+                group_by,
+                aggregation,
+                having,
+            })
+        } else {
+            aggregation.map(|aggregation| Self::Implicit { aggregation, having })
+        }
+    }
+
     /// Borrow the `having` filter, if any, from either variant.
     pub fn having(&self) -> Option<&Expression> {
         match self {
