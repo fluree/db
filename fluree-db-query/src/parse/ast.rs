@@ -862,7 +862,7 @@ pub enum UnresolvedColumn {
     /// `Column::Var(alias)` projection plus a `Pattern::Bind { var: alias, expr }`
     /// injected into the patterns list — or into `options.post_binds` when
     /// the expression references an aggregate output variable.
-    Expr {
+    Computation {
         expr: UnresolvedExpression,
         alias: Arc<str>,
     },
@@ -871,12 +871,12 @@ pub enum UnresolvedColumn {
 impl UnresolvedColumn {
     /// Returns the variable name if this column projects a single variable.
     ///
-    /// `Expr` columns return their alias variable, since after lowering the
-    /// projection is just the alias VarId.
+    /// `Computation` columns return their alias variable, since after
+    /// lowering the projection is just the alias VarId.
     pub fn var_name(&self) -> Option<&str> {
         match self {
             UnresolvedColumn::Var(name) => Some(name),
-            UnresolvedColumn::Expr { alias, .. } => Some(alias),
+            UnresolvedColumn::Computation { alias, .. } => Some(alias),
             UnresolvedColumn::Hydration(_) => None,
         }
     }
@@ -885,7 +885,7 @@ impl UnresolvedColumn {
     pub fn as_hydration(&self) -> Option<&UnresolvedHydrationSpec> {
         match self {
             UnresolvedColumn::Hydration(spec) => Some(spec),
-            UnresolvedColumn::Var(_) | UnresolvedColumn::Expr { .. } => None,
+            UnresolvedColumn::Var(_) | UnresolvedColumn::Computation { .. } => None,
         }
     }
 }

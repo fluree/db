@@ -631,7 +631,7 @@ fn is_aggregate_name(name: &str) -> bool {
 ///   the spec is appended to `aggregates` and the output var becomes the
 ///   returned column.
 /// - S-expression scalar with alias: `"(as (coalesce ?a ?b) ?title)"` — the
-///   inner expression is captured as an `UnresolvedColumn::Expr` so lowering
+///   inner expression is captured as an `UnresolvedColumn::Computation` so lowering
 ///   can desugar it to a `Pattern::Bind` with the alias as the projected var.
 ///
 /// Wildcard (`"*"`) is rejected here; it must be the entire `select` value
@@ -713,7 +713,7 @@ fn parse_select_string(
 
         // Scalar expression with explicit alias — desugars to a BIND.
         let expr = filter_sexpr::expr_from_sexpr_token(&list[1])?;
-        return Ok(UnresolvedColumn::Expr {
+        return Ok(UnresolvedColumn::Computation {
             expr,
             alias: Arc::from(alias),
         });
@@ -3168,7 +3168,7 @@ mod tests {
         assert_eq!(cols.len(), 2);
         assert!(matches!(&cols[0], UnresolvedColumn::Var(n) if n.as_ref() == "?scheme"));
         match &cols[1] {
-            UnresolvedColumn::Expr { expr, alias } => {
+            UnresolvedColumn::Computation { expr, alias } => {
                 assert_eq!(alias.as_ref(), "?title");
                 match expr {
                     UnresolvedExpression::Call { func, args } => {
@@ -3286,7 +3286,7 @@ mod tests {
 
         let (ast, _) = parse_query_ast(&json, None).unwrap();
         match &ast.select.columns()[1] {
-            UnresolvedColumn::Expr { alias, expr } => {
+            UnresolvedColumn::Computation { alias, expr } => {
                 assert_eq!(alias.as_ref(), "?label");
                 assert!(
                     matches!(expr, UnresolvedExpression::Call { func, .. } if func.as_ref() == "if")
@@ -3317,7 +3317,7 @@ mod tests {
         // For each Expr column, the second arg of coalesce must be a string Const.
         for (idx, expected) in [(1, "false"), (2, "42"), (3, "?notavar")] {
             let col = &ast.select.columns()[idx];
-            let UnresolvedColumn::Expr { expr, .. } = col else {
+            let UnresolvedColumn::Computation { expr, .. } = col else {
                 panic!("col {idx}: expected Expr, got {col:?}");
             };
             let UnresolvedExpression::Call { func, args } = expr else {
@@ -3359,21 +3359,29 @@ mod tests {
         let mut found_int = false;
         let mut found_str = false;
         for p in &query.patterns {
-            if let crate::ir::Pattern::Bind { var, expr } = p {
-                if let crate::ir::Expression::Call { func, .. } = expr {
-                    if *var == int_var {
-                        assert!(matches!(func, crate::ir::Function::XsdInteger));
-                        found_int = true;
-                    }
-                    if *var == str_var {
-                        assert!(matches!(func, crate::ir::Function::XsdString));
-                        found_str = true;
-                    }
+            if let crate::ir::Pattern::Bind {
+                var,
+                expr: crate::ir::Expression::Call { func, .. },
+            } = p
+            {
+                if *var == int_var {
+                    assert!(matches!(func, crate::ir::Function::XsdInteger));
+                    found_int = true;
+                }
+                if *var == str_var {
+                    assert!(matches!(func, crate::ir::Function::XsdString));
+                    found_str = true;
                 }
             }
         }
-        assert!(found_int, "xsd:integer cast did not lower to Function::XsdInteger");
-        assert!(found_str, "xsd:string cast did not lower to Function::XsdString");
+        assert!(
+            found_int,
+            "xsd:integer cast did not lower to Function::XsdInteger"
+        );
+        assert!(
+            found_str,
+            "xsd:string cast did not lower to Function::XsdString"
+        );
     }
 
     #[test]
