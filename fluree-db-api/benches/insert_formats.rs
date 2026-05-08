@@ -25,9 +25,11 @@
 //   cargo bench -p fluree-db-api --bench insert_formats -- --test
 
 use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
-use fluree_db_api::{CommitOpts, FlureeBuilder, IndexConfig, TxnOpts};
-use fluree_bench_support::gen::people::{generate_txn_data, txn_data_to_jsonld, txn_data_to_turtle};
+use fluree_bench_support::gen::people::{
+    generate_txn_data, txn_data_to_jsonld, txn_data_to_turtle,
+};
 use fluree_bench_support::{init_tracing_for_bench, next_ledger_alias};
+use fluree_db_api::{CommitOpts, FlureeBuilder, IndexConfig, TxnOpts};
 use serde_json::Value as JsonValue;
 use tokio::runtime::Runtime;
 

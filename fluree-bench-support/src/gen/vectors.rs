@@ -54,7 +54,9 @@ fn hashed_value(i: usize) -> f64 {
 /// (not `Vec<f32>`) to match the existing bench's intermediate type; the
 /// `@vector` ingest path quantizes to `f32` separately.
 pub fn rng_one(rng: &mut impl Rng, dim: usize) -> Vec<f64> {
-    (0..dim).map(|_| rng.gen_range(-1.0f32..1.0f32) as f64).collect()
+    (0..dim)
+        .map(|_| rng.gen_range(-1.0f32..1.0f32) as f64)
+        .collect()
 }
 
 #[cfg(test)]

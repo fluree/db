@@ -162,62 +162,68 @@ fn bench_query_hot_bsbm(c: &mut Criterion) {
     // `snapshot` (which borrows from `fluree`) stays valid for the
     // duration of the bench group.
     let (_db_dir, fluree) = rt.block_on(setup_indexed(n_products));
-    let snapshot = rt.block_on(async {
-        fluree
-            .graph(LEDGER_ID)
-            .load()
-            .await
-            .expect("graph load")
-    });
+    let snapshot = rt.block_on(async { fluree.graph(LEDGER_ID).load().await.expect("graph load") });
 
     let mut group = c.benchmark_group("query_hot_bsbm");
     group.sample_size(profile.sample_size());
     group.sampling_mode(criterion::SamplingMode::Flat);
 
     // --- Q3-shape ---
-    group.bench_with_input(BenchmarkId::new("q3", scale.as_str()), &n_products, |b, _| {
-        b.iter(|| {
-            rt.block_on(async {
-                let result = snapshot
-                    .query()
-                    .sparql(Q3)
-                    .execute()
-                    .await
-                    .expect("Q3 execute");
-                black_box(result);
+    group.bench_with_input(
+        BenchmarkId::new("q3", scale.as_str()),
+        &n_products,
+        |b, _| {
+            b.iter(|| {
+                rt.block_on(async {
+                    let result = snapshot
+                        .query()
+                        .sparql(Q3)
+                        .execute()
+                        .await
+                        .expect("Q3 execute");
+                    black_box(result);
+                });
             });
-        });
-    });
+        },
+    );
 
     // --- Q5-shape ---
-    group.bench_with_input(BenchmarkId::new("q5", scale.as_str()), &n_products, |b, _| {
-        b.iter(|| {
-            rt.block_on(async {
-                let result = snapshot
-                    .query()
-                    .sparql(Q5)
-                    .execute()
-                    .await
-                    .expect("Q5 execute");
-                black_box(result);
+    group.bench_with_input(
+        BenchmarkId::new("q5", scale.as_str()),
+        &n_products,
+        |b, _| {
+            b.iter(|| {
+                rt.block_on(async {
+                    let result = snapshot
+                        .query()
+                        .sparql(Q5)
+                        .execute()
+                        .await
+                        .expect("Q5 execute");
+                    black_box(result);
+                });
             });
-        });
-    });
+        },
+    );
 
     // --- Q9-shape ---
-    group.bench_with_input(BenchmarkId::new("q9", scale.as_str()), &n_products, |b, _| {
-        b.iter(|| {
-            rt.block_on(async {
-                let result = snapshot
-                    .query()
-                    .sparql(Q9)
-                    .execute()
-                    .await
-                    .expect("Q9 execute");
-                black_box(result);
+    group.bench_with_input(
+        BenchmarkId::new("q9", scale.as_str()),
+        &n_products,
+        |b, _| {
+            b.iter(|| {
+                rt.block_on(async {
+                    let result = snapshot
+                        .query()
+                        .sparql(Q9)
+                        .execute()
+                        .await
+                        .expect("Q9 execute");
+                    black_box(result);
+                });
             });
-        });
-    });
+        },
+    );
 
     group.finish();
     // snapshot's borrow of fluree ends here; explicit drops below keep

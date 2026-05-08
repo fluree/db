@@ -150,7 +150,10 @@ mod tests {
     #[test]
     fn paragraph_has_keywords_section() {
         let p = random_paragraph(&mut StdRng::seed_from_u64(42));
-        assert!(p.contains("Keywords:"), "missing Keywords: section in {p:?}");
+        assert!(
+            p.contains("Keywords:"),
+            "missing Keywords: section in {p:?}"
+        );
     }
 
     #[test]

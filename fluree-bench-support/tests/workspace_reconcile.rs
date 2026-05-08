@@ -93,8 +93,8 @@ struct BudgetFile {
 
 fn load_budget(root: &Path) -> BudgetFile {
     let path = root.join("regression-budget.json");
-    let raw = std::fs::read_to_string(&path)
-        .unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
+    let raw =
+        std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
     serde_json::from_str(&raw).unwrap_or_else(|e| panic!("parse {}: {e}", path.display()))
 }
 
@@ -122,7 +122,7 @@ fn workspace_reconciles_with_regression_budget() {
             declared
                 .entry(crate_name)
                 .or_default()
-                .extend(benches.into_iter());
+                .extend(benches);
         }
     }
 

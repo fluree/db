@@ -33,7 +33,11 @@ use crate::runtime::BenchScale;
 pub fn fixtures_dir() -> Option<PathBuf> {
     let root = crate::budget::workspace_root()?;
     let dir = root.join("fluree-bench-support").join("fixtures");
-    if dir.exists() { Some(dir) } else { None }
+    if dir.exists() {
+        Some(dir)
+    } else {
+        None
+    }
 }
 
 /// Path to a per-fixture directory for the given name.
@@ -90,6 +94,9 @@ mod tests {
     #[test]
     fn vendored_check_is_conservative() {
         // Without any vendored data, every name/scale should return false.
-        assert!(!has_vendored("definitely_not_present_xyz", BenchScale::Tiny));
+        assert!(!has_vendored(
+            "definitely_not_present_xyz",
+            BenchScale::Tiny
+        ));
     }
 }

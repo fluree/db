@@ -189,9 +189,13 @@ impl std::fmt::Display for BudgetViolation {
         write!(
             f,
             "{}/{} [{}]: observed {:.1} ns > allowed {:.1} ns (baseline {:.1} ns + {:.1}% budget)",
-            self.crate_name, self.bench, self.scale,
-            self.observed_ns, self.allowed_ns,
-            self.baseline_ns, self.budget_pct,
+            self.crate_name,
+            self.bench,
+            self.scale,
+            self.observed_ns,
+            self.allowed_ns,
+            self.baseline_ns,
+            self.budget_pct,
         )
     }
 }
@@ -212,8 +216,10 @@ mod tests {
     fn explicit_budget_overrides_default() {
         let mut b = RegressionBudget::empty(5.0);
         b.crates
-            .entry("foo".into()).or_default()
-            .entry("bar".into()).or_default()
+            .entry("foo".into())
+            .or_default()
+            .entry("bar".into())
+            .or_default()
             .insert("small".into(), 1.0);
         assert_eq!(b.budget_pct("foo", "bar", BenchScale::Small), 1.0);
         // Non-listed scale falls back to default.
@@ -241,8 +247,10 @@ mod tests {
     fn round_trip_serde() {
         let mut b = RegressionBudget::empty(5.0);
         b.crates
-            .entry("foo".into()).or_default()
-            .entry("bar".into()).or_default()
+            .entry("foo".into())
+            .or_default()
+            .entry("bar".into())
+            .or_default()
             .insert("small".into(), 3.0);
         let s = serde_json::to_string(&b).unwrap();
         let d: RegressionBudget = serde_json::from_str(&s).unwrap();

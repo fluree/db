@@ -72,7 +72,11 @@ pub fn generate_txn_data(txn_idx: usize, nodes_per_txn: usize) -> TxnData {
             let gid = global_base + i;
 
             // Distribute persons across companies for refs.
-            let chunk = if n_persons == 0 { 0 } else { n_persons / n_companies };
+            let chunk = if n_persons == 0 {
+                0
+            } else {
+                n_persons / n_companies
+            };
             let start = i * chunk;
             let end = if i == n_companies - 1 {
                 n_persons
@@ -236,12 +240,23 @@ mod tests {
         // Different txn_idx → no overlap in IDs (the global_base shift guarantees it).
         let a = generate_txn_data(0, 10);
         let b = generate_txn_data(1, 10);
-        let a_ids: Vec<_> = a.persons.iter().map(|p| p.id.clone())
-            .chain(a.companies.iter().map(|c| c.id.clone())).collect();
-        let b_ids: Vec<_> = b.persons.iter().map(|p| p.id.clone())
-            .chain(b.companies.iter().map(|c| c.id.clone())).collect();
+        let a_ids: Vec<_> = a
+            .persons
+            .iter()
+            .map(|p| p.id.clone())
+            .chain(a.companies.iter().map(|c| c.id.clone()))
+            .collect();
+        let b_ids: Vec<_> = b
+            .persons
+            .iter()
+            .map(|p| p.id.clone())
+            .chain(b.companies.iter().map(|c| c.id.clone()))
+            .collect();
         for id in &a_ids {
-            assert!(!b_ids.contains(id), "id {id} appears in both txn 0 and txn 1");
+            assert!(
+                !b_ids.contains(id),
+                "id {id} appears in both txn 0 and txn 1"
+            );
         }
     }
 }

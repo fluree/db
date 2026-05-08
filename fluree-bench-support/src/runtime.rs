@@ -192,10 +192,16 @@ mod tests {
 
     #[test]
     fn profile_parses_aliases() {
-        assert_eq!(BenchProfile::from_env_str("quick"), Some(BenchProfile::Quick));
+        assert_eq!(
+            BenchProfile::from_env_str("quick"),
+            Some(BenchProfile::Quick)
+        );
         assert_eq!(BenchProfile::from_env_str("Q"), Some(BenchProfile::Quick));
         assert_eq!(BenchProfile::from_env_str("FULL"), Some(BenchProfile::Full));
-        assert_eq!(BenchProfile::from_env_str("nightly"), Some(BenchProfile::Full));
+        assert_eq!(
+            BenchProfile::from_env_str("nightly"),
+            Some(BenchProfile::Full)
+        );
         assert_eq!(BenchProfile::from_env_str("garbage"), None);
     }
 
@@ -211,7 +217,12 @@ mod tests {
 
     #[test]
     fn scale_str_round_trip() {
-        for s in [BenchScale::Tiny, BenchScale::Small, BenchScale::Medium, BenchScale::Large] {
+        for s in [
+            BenchScale::Tiny,
+            BenchScale::Small,
+            BenchScale::Medium,
+            BenchScale::Large,
+        ] {
             assert_eq!(BenchScale::from_env_str(s.as_str()), Some(s));
         }
     }

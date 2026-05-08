@@ -46,13 +46,7 @@
 //! - `n_types    = 5`                  (fixed; products cycle through them)
 
 const BSBM_NS: &str = "http://example.org/bsbm/";
-const PRODUCT_TYPES: &[&str] = &[
-    "Electronics",
-    "Books",
-    "Clothing",
-    "Sports",
-    "HomeGoods",
-];
+const PRODUCT_TYPES: &[&str] = &["Electronics", "Books", "Clothing", "Sports", "HomeGoods"];
 const COUNTRIES: &[&str] = &["US", "DE", "GB", "JP", "BR"];
 
 #[derive(Debug, Clone)]
@@ -178,8 +172,8 @@ pub fn generate_dataset(n_products: usize) -> BsbmData {
 /// `ex:` and `bsbm:` prefixes plus `xsd:`.
 pub fn bsbm_data_to_turtle(data: &BsbmData) -> String {
     // Conservative cap: ~120 bytes per entity on average.
-    let cap = (data.vendors.len() + data.products.len() + data.persons.len() + data.reviews.len())
-        * 150;
+    let cap =
+        (data.vendors.len() + data.products.len() + data.persons.len() + data.reviews.len()) * 150;
     let mut buf = String::with_capacity(cap);
 
     buf.push_str("@prefix ex: <http://example.org/ns/> .\n");
