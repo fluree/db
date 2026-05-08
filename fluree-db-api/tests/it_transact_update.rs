@@ -920,7 +920,12 @@ async fn update_where_bind_rdf_term_functions() {
     assert_eq!(result.get("ex:isIRI"), Some(&json!(true)));
     assert_eq!(result.get("ex:isLiteral"), Some(&json!(true)));
     assert_eq!(result.get("ex:lang"), Some(&json!("es")));
-    assert_eq!(result.get("ex:datatype"), Some(&json!("rdf:langString")));
+    // DATATYPE returns the datatype IRI (W3C SPARQL §17.4.2.6) which the
+    // JSON-LD formatter renders as `{"@id": "rdf:langString"}`.
+    assert_eq!(
+        result.get("ex:datatype"),
+        Some(&json!({"@id": "rdf:langString"}))
+    );
     assert_eq!(
         result.get("ex:strdt"),
         Some(&json!({"@value": "Abcdefg", "@type": "ex:mystring"}))

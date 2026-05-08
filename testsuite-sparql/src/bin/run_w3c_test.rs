@@ -83,10 +83,13 @@ fn run_syntax_test(query_url: &str, test_id: &str) -> SubprocessResult {
     let output = parse_sparql(&query_string);
     let mut has_errors = output.has_errors();
 
-    // Run validation if parsing produced an AST
+    // Run validation if parsing produced an AST. Use the strict W3C
+    // capability profile so spec-defined rules (e.g. §18.5 aggregate scope,
+    // exercised by negative-syntax tests agg08-agg12) flag errors here —
+    // the default Capabilities are deliberately Fluree-extension-permissive.
     if !has_errors {
         if let Some(ast) = &output.ast {
-            let val_diags = validate(ast, &Capabilities::default());
+            let val_diags = validate(ast, &Capabilities::w3c_strict());
             if val_diags.iter().any(|d| d.is_error()) {
                 has_errors = true;
             }

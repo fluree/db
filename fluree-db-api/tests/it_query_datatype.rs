@@ -246,7 +246,13 @@ async fn datatype_bind_datatype_function_includes_dt_in_results() {
 
 #[tokio::test]
 async fn datatype_filter_with_datatype_function() {
-    // Scenario: datatype-test / filtered with the datatype function
+    // Scenario: datatype-test / filtered with the datatype function.
+    //
+    // After the W3C SPARQL §17.4.2.6 fix (db-r#50 / type-promotion),
+    // `DATATYPE(?x)` returns a `Sid` matching the form produced when an
+    // IRI literal like `xsd:integer` flows through SPARQL lowering. The
+    // filter must therefore compare against the IRI form of `xsd:integer`,
+    // not the legacy compact-string form `"xsd:integer"`.
     let fluree = FlureeBuilder::memory().build_memory();
     let ledger = seed_people_for_datatype(&fluree, "people:datatype").await;
     let ctx = ctx_datatype();
@@ -257,7 +263,7 @@ async fn datatype_filter_with_datatype_function() {
         "where": [
             {"ex:name":"?name","ex:age":"?age"},
             ["bind","?dt",["expr",["datatype","?age"]]],
-            ["filter", "(= \"xsd:integer\" ?dt)"]
+            ["filter", ["=", "?dt", ["iri", "http://www.w3.org/2001/XMLSchema#integer"]]]
         ]
     });
 

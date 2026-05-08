@@ -57,6 +57,15 @@ pub struct Capabilities {
     pub minus_operator: bool,
     /// Allow USING clause in updates
     pub using_clause: bool,
+    /// Strict W3C SPARQL §18.5 aggregate-scope validation.
+    ///
+    /// When `true`, rejects queries that project an ungrouped non-aggregated
+    /// variable in a grouped query — this matches W3C negative-syntax tests
+    /// `agg08`–`agg12`. When `false` (the default), Fluree's extension that
+    /// auto-collects ungrouped projected variables into per-group lists
+    /// remains available to existing customer queries that depend on it.
+    /// The W3C compliance harness in `testsuite-sparql` flips this to `true`.
+    pub strict_aggregate_scope: bool,
 }
 
 impl Default for Capabilities {
@@ -65,6 +74,20 @@ impl Default for Capabilities {
             property_paths: true,
             minus_operator: true,
             using_clause: true,
+            strict_aggregate_scope: false,
+        }
+    }
+}
+
+impl Capabilities {
+    /// Strict W3C SPARQL conformance: every spec-defined validation rule
+    /// is enforced. Enables `strict_aggregate_scope`; everything else
+    /// matches the default. Use this in the W3C testsuite harness and any
+    /// other context that demands rejection of spec-noncompliant queries.
+    pub fn w3c_strict() -> Self {
+        Self {
+            strict_aggregate_scope: true,
+            ..Self::default()
         }
     }
 }
@@ -105,7 +128,9 @@ impl<'a> Validator<'a> {
 
     fn validate_select(&mut self, query: &SelectQuery) {
         self.validate_graph_pattern(&query.where_clause.pattern);
-        self.validate_aggregate_scope(query);
+        if self.caps.strict_aggregate_scope {
+            self.validate_aggregate_scope(query);
+        }
     }
 
     /// W3C SPARQL §18.5 aggregate scope rules.
@@ -608,6 +633,16 @@ mod tests {
     use super::*;
     use crate::parse::parse_sparql;
 
+    fn validate_query_strict(sparql: &str) -> Vec<Diagnostic> {
+        let output = parse_sparql(sparql);
+        assert!(
+            output.ast.is_some(),
+            "Parse failed: {:?}",
+            output.diagnostics
+        );
+        validate(output.ast.as_ref().unwrap(), &Capabilities::w3c_strict())
+    }
+
     fn validate_query(sparql: &str) -> Vec<Diagnostic> {
         let output = parse_sparql(sparql);
         assert!(
@@ -865,7 +900,7 @@ mod tests {
     fn test_ungrouped_var_with_aggregate_no_groupby_rejected() {
         // agg10: SELECT ?P (COUNT(?O) AS ?C) WHERE { ?S ?P ?O } — no GROUP BY,
         // ?P is ungrouped while an aggregate is present.
-        let diags = validate_query(
+        let diags = validate_query_strict(
             "PREFIX : <http://example.org/>
              SELECT ?P (COUNT(?O) AS ?C) WHERE { ?S ?P ?O }",
         );
@@ -878,7 +913,7 @@ mod tests {
     #[test]
     fn test_ungrouped_var_with_explicit_groupby_rejected() {
         // agg09: GROUP BY ?S but SELECT projects ?P which isn't grouped.
-        let diags = validate_query(
+        let diags = validate_query_strict(
             "PREFIX : <http://example.org/>
              SELECT ?P (COUNT(?O) AS ?C) WHERE { ?S ?P ?O } GROUP BY ?S",
         );
@@ -892,7 +927,7 @@ mod tests {
     fn test_groupby_expression_without_alias_does_not_expose_inner_vars() {
         // agg08: GROUP BY (?O1 + ?O2) without alias — ?O1 and ?O2 are not
         // grouped (only the synthesized expression alias is implementation-only).
-        let diags = validate_query(
+        let diags = validate_query_strict(
             "PREFIX : <http://example.org/>
              SELECT ((?O1 + ?O2) AS ?O12) (COUNT(?O1) AS ?C)
              WHERE { ?S :p ?O1; :q ?O2 } GROUP BY (?O1 + ?O2)
@@ -907,7 +942,7 @@ mod tests {
     #[test]
     fn test_ungrouped_var_in_projection_expression_rejected() {
         // agg11: GROUP BY (?S) but projection expression uses ?O1 + ?O2.
-        let diags = validate_query(
+        let diags = validate_query_strict(
             "PREFIX : <http://example.org/>
              SELECT ((?O1 + ?O2) AS ?O12) (COUNT(?O1) AS ?C)
              WHERE { ?S :p ?O1; :q ?O2 } GROUP BY (?S)",
@@ -921,7 +956,7 @@ mod tests {
     #[test]
     fn test_var_inside_groupby_expr_is_not_grouped() {
         // agg12: GROUP BY (?O1 + ?O2) but SELECT projects ?O1.
-        let diags = validate_query(
+        let diags = validate_query_strict(
             "PREFIX : <http://example.org/>
              SELECT ?O1 (COUNT(?O2) AS ?C)
              WHERE { ?S :p ?O1; :q ?O2 } GROUP BY (?O1 + ?O2)",
@@ -935,7 +970,7 @@ mod tests {
     #[test]
     fn test_grouped_var_in_projection_accepted() {
         // SELECT ?S projects a grouped variable — should pass.
-        let diags = validate_query(
+        let diags = validate_query_strict(
             "PREFIX : <http://example.org/>
              SELECT ?S (COUNT(?O) AS ?C) WHERE { ?S ?P ?O } GROUP BY ?S",
         );
@@ -949,7 +984,7 @@ mod tests {
     fn test_aggregate_alias_in_post_aggregation_projection_accepted() {
         // SELECT ?S (COUNT(?O) AS ?C) (?C + 1 AS ?D) — ?C is an aggregate
         // alias and is allowed in subsequent projection expressions.
-        let diags = validate_query(
+        let diags = validate_query_strict(
             "PREFIX : <http://example.org/>
              SELECT ?S (COUNT(?O) AS ?C) ((?C + 1) AS ?D)
              WHERE { ?S ?P ?O } GROUP BY ?S",
@@ -963,7 +998,7 @@ mod tests {
     #[test]
     fn test_groupby_expression_with_alias_grouped_var_accepted() {
         // GROUP BY (UCASE(?S) AS ?up) — ?up is grouped.
-        let diags = validate_query(
+        let diags = validate_query_strict(
             "PREFIX : <http://example.org/>
              SELECT ?up (COUNT(?O) AS ?C)
              WHERE { ?S ?P ?O } GROUP BY (UCASE(STR(?S)) AS ?up)",
@@ -977,7 +1012,7 @@ mod tests {
     #[test]
     fn test_simple_select_without_aggregates_or_groupby_unaffected() {
         // No aggregates, no GROUP BY: scope check is skipped entirely.
-        let diags = validate_query(
+        let diags = validate_query_strict(
             "PREFIX : <http://example.org/>
              SELECT ?S ?P ?O WHERE { ?S ?P ?O }",
         );

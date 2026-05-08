@@ -714,18 +714,29 @@ fn flake_value_to_datetime(
 
 /// Format a datatype Sid as a ComparableValue
 ///
-/// Returns compact string representations for well-known datatypes.
+/// W3C SPARQL §17.4.2.6: `DATATYPE` returns the datatype IRI of the
+/// argument. Returning a full IRI (rather than the compact `"xsd:integer"`
+/// form) is necessary for `FILTER(DATATYPE(?x) = xsd:integer)` to compare
+/// equal — the SPARQL lowering pass expands `xsd:integer` to the full IRI
+/// before evaluation, so the LHS must match.
+///
+/// The Fluree-internal pseudo-types `@json` and `@id` keep their compact
+/// string rendering — they have no IRI form and are only ever compared via
+/// the engine's own special-case paths.
 pub fn format_datatype_sid(dt: &fluree_db_core::Sid) -> ComparableValue {
     let datatypes = &*WELL_KNOWN_DATATYPES;
+    // Fluree-internal pseudo-types `@id` and `@json` have no IRI form;
+    // surface as compact strings (matches result-formatter rendering).
     if *dt == datatypes.rdf_json {
         ComparableValue::String(Arc::from("@json"))
     } else if *dt == datatypes.id_type {
         ComparableValue::String(Arc::from("@id"))
-    } else if dt.namespace_code == datatypes.xsd_string.namespace_code {
-        ComparableValue::String(Arc::from(format!("xsd:{}", dt.name_str())))
-    } else if dt.namespace_code == datatypes.rdf_json.namespace_code {
-        ComparableValue::String(Arc::from(format!("rdf:{}", dt.name_str())))
     } else {
+        // Real datatype IRIs return as `Sid`. The SPARQL lowering expands
+        // an IRI literal like `xsd:integer` to `IRI(<full IRI>)`, and
+        // `eval_iri` resolves that to `ComparableValue::Sid` when the
+        // dictionary recognizes the IRI. For `FILTER(DATATYPE(?x) = xsd:integer)`
+        // to compare equal, the LHS must be the same Sid form.
         ComparableValue::Sid(dt.clone())
     }
 }
