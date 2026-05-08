@@ -1,8 +1,8 @@
 //! Query execution options and reasoning modes.
 //!
-//! `QueryOptions` carries solution modifiers (LIMIT, OFFSET, ORDER BY, GROUP BY,
-//! aggregates, HAVING, post-binds, DISTINCT) plus a `ReasoningModes` config
-//! describing which RDFS/OWL/datalog reasoning should be applied.
+//! `QueryOptions` carries the post-WHERE solution modifiers (LIMIT, OFFSET,
+//! ORDER BY) plus the reasoning configuration the rewriter consumes
+//! (`ReasoningModes` and an optional pre-resolved `SchemaBundleFlakes`).
 //!
 //! `ReasoningModes` is pure config — no behavior, just bit flags and a JSON
 //! rule list. The rewriter consumes it as input. Both types live here in `ir`
