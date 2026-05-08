@@ -254,7 +254,8 @@ impl<'a, E: IriEncoder> LoweringContext<'a, E> {
                 // of bare values. Projection shape is `Tuple` (the default of
                 // the `select`/`select_one` helpers).
                 let output = match (&select_query.select.variables, distinct) {
-                    (SelectVariables::Star, _) => QueryOutput::wildcard(),
+                    (SelectVariables::Star, true) => QueryOutput::wildcard_distinct(),
+                    (SelectVariables::Star, false) => QueryOutput::wildcard(),
                     (_, true) => QueryOutput::select_distinct(select),
                     (_, false) => QueryOutput::select_all(select),
                 };
@@ -346,10 +347,11 @@ mod tests {
 
     /// View GROUP BY keys of a lowered Query.
     fn group_by_of(query: &Query) -> Vec<VarId> {
-        match &query.grouping {
-            Some(Grouping::Explicit { group_by, .. }) => group_by.iter().copied().collect(),
-            _ => Vec::new(),
-        }
+        query
+            .grouping
+            .iter()
+            .flat_map(Grouping::group_by_vars)
+            .collect()
     }
 
     /// View HAVING expression of a lowered Query.

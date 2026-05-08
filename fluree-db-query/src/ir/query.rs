@@ -116,6 +116,15 @@ impl QueryOutput {
         }
     }
 
+    /// Construct a `Select` with a Wildcard projection and `Distinct`
+    /// restriction (`select distinct *`).
+    pub fn wildcard_distinct() -> Self {
+        Self::Select {
+            projection: Projection::Wildcard,
+            restriction: Some(Restriction::Distinct),
+        }
+    }
+
     /// The projection of a SELECT output, if any.
     pub fn projection(&self) -> Option<&Projection> {
         match self {

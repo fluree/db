@@ -162,6 +162,17 @@ impl Grouping {
         }
     }
 
+    /// Iterate over the `GROUP BY` key variables. Empty for `Implicit`
+    /// grouping (single implicit group); the `Explicit` keys for
+    /// `Explicit` grouping.
+    pub fn group_by_vars(&self) -> impl Iterator<Item = VarId> + '_ {
+        let explicit = match self {
+            Self::Explicit { group_by, .. } => Some(group_by.iter().copied()),
+            Self::Implicit { .. } => None,
+        };
+        explicit.into_iter().flatten()
+    }
+
     /// Iterate over every aggregate spec computed by this grouping phase,
     /// regardless of variant.
     pub fn aggregates(&self) -> impl Iterator<Item = &AggregateSpec> {

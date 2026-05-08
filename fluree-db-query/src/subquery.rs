@@ -311,10 +311,7 @@ impl SubqueryOperator {
 
         // Apply GROUP BY / aggregates / HAVING for subqueries that use them.
         if let Some(grouping) = &self.subquery.grouping {
-            let group_by = match grouping {
-                Grouping::Implicit { .. } => Vec::new(),
-                Grouping::Explicit { group_by, .. } => group_by.iter().copied().collect(),
-            };
+            let group_by: Vec<_> = grouping.group_by_vars().collect();
             let aggregates: Vec<_> = grouping.aggregates().cloned().collect();
             operator = Box::new(GroupByOperator::new(operator, group_by));
             if !aggregates.is_empty() {

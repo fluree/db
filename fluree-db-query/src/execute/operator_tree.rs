@@ -808,9 +808,11 @@ fn detect_sum_strlen_group_concat_subquery(
     };
 
     // Inner subquery must be GROUP BY ?s with GROUP_CONCAT(?o; sep) AS ?cat.
+    // No post-aggregation binds and no HAVING — those would change the
+    // shape that the outer SUM(STRLEN(?cat)) fast-path is keyed against.
     let Some(Grouping::Explicit {
         group_by: sq_group_by,
-        aggregation: Some(Aggregation { aggregates: sq_aggregates, binds: _ }),
+        aggregation: Some(Aggregation { aggregates: sq_aggregates, binds: sq_binds }),
         having: None,
     }) = &sq.grouping
     else {
@@ -2542,10 +2544,11 @@ fn build_operator_tree_inner(
     // the operator-tree builder treats both variants uniformly. Cloning is
     // cheap here — both vectors are short (typically a handful of items)
     // and this is one-shot setup, not per-row work.
-    let group_by_vec: Vec<VarId> = match &query.grouping {
-        Some(Grouping::Explicit { group_by, .. }) => group_by.iter().copied().collect(),
-        _ => Vec::new(),
-    };
+    let group_by_vec: Vec<VarId> = query
+        .grouping
+        .iter()
+        .flat_map(Grouping::group_by_vars)
+        .collect();
     let aggregates_vec: Vec<AggregateSpec> = query
         .grouping
         .as_ref()
