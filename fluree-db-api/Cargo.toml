@@ -112,6 +112,7 @@ num-bigdecimal = { package = "bigdecimal", version = "0.4" }
 # and its full dep tree when the feature is off.
 ed25519-dalek = "2.1"
 criterion = "0.5"
+fluree-bench-support = { path = "../fluree-bench-support" }
 rand = { workspace = true }
 fluree-db-nameservice-sync = { path = "../fluree-db-nameservice-sync" }
 

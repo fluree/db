@@ -4,8 +4,19 @@
 //! - Build time (geometry → S2 covering → index construction)
 //! - Query latency (within/intersects/radius operations)
 //! - Covering quality (false positive rate)
+//!
+//! ## Chassis usage
+//!
+//! Spatial benches don't yet use [`fluree_bench_support::init_tracing_for_bench`]
+//! because they don't go through the Fluree query/transact paths and the
+//! per-bench tracing surface is empty. The chassis dev-dep is wired so future
+//! spatial benches that *do* want tracing or env-driven scale can opt in
+//! without re-establishing the import. The geometry generators below are
+//! domain-specific to spatial and intentionally stay co-located with the
+//! bench.
 
 use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
+use fluree_bench_support as _; // chassis intentionally wired but not yet used; see comment above
 use fluree_db_spatial::config::SpatialCreateConfig;
 use fluree_db_spatial::{SpatialIndexBuilder, SpatialIndexSnapshot};
 use std::collections::HashMap;

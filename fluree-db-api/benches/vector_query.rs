@@ -25,36 +25,13 @@
 //   cargo bench -p fluree-db-api --bench vector_query -- --test
 
 use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
+use fluree_bench_support::gen::vectors::rng_one as random_vector;
+use fluree_bench_support::init_tracing_for_bench;
+use fluree_db_api::admin::ReindexOptions;
 use fluree_db_api::{CommitOpts, FlureeBuilder, IndexConfig, TxnOpts};
 use rand::prelude::*;
 use serde_json::{json, Value as JsonValue};
 use tokio::runtime::Runtime;
-
-use fluree_db_api::admin::ReindexOptions;
-
-fn init_tracing_for_bench() {
-    use std::sync::OnceLock;
-    static INIT: OnceLock<()> = OnceLock::new();
-    INIT.get_or_init(|| {
-        // Opt-in only: enable by setting FLUREE_BENCH_TRACING=1.
-        if std::env::var("FLUREE_BENCH_TRACING").ok().as_deref() != Some("1") {
-            return;
-        }
-
-        // Default to info if RUST_LOG not provided.
-        if std::env::var("RUST_LOG").is_err() {
-            std::env::set_var("RUST_LOG", "info");
-        }
-
-        let filter = tracing_subscriber::EnvFilter::from_default_env();
-        tracing_subscriber::fmt()
-            .with_env_filter(filter)
-            .with_target(true)
-            .with_level(true)
-            .try_init()
-            .ok();
-    });
-}
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -79,13 +56,10 @@ type BenchLedger = fluree_db_api::LedgerState;
 // ---------------------------------------------------------------------------
 // Data generation
 // ---------------------------------------------------------------------------
-
-/// Generate a random f32-quantized vector (mirrors the @vector ingest path).
-fn random_vector(rng: &mut impl Rng, dim: usize) -> Vec<f64> {
-    (0..dim)
-        .map(|_| rng.gen_range(-1.0f32..1.0f32) as f64)
-        .collect()
-}
+//
+// `random_vector` is `fluree_bench_support::gen::vectors::rng_one` (re-imported
+// at module top). Same `(rng, dim) -> Vec<f64>` signature, byte-identical
+// output for the same RNG seed chain.
 
 /// Create Fluree instance, insert `n_articles` articles with vectors + dates,
 /// and return everything needed to run the two benchmark queries.

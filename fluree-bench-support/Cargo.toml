@@ -1,0 +1,34 @@
+[package]
+name = "fluree-bench-support"
+description = "Shared chassis for Fluree DB benchmarks: helpers, deterministic generators, fixture loading, regression-budget validation, and bench-mode tracing"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+# Library only. No bins, no benches in this crate — see <workspace>/BENCHMARKING.md
+# for the chassis design and per-crate `benches/` for the actual benches.
+
+[features]
+default = []
+
+[dependencies]
+# Runtime + tracing primitives — match what existing benches already use.
+tokio = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+
+# Deterministic data generation — uses workspace versions where available.
+chrono = { workspace = true }
+rand = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+
+# Lockfile-driven hashing for deterministic fixtures.
+sha2 = { workspace = true }
+
+[dev-dependencies]
+# Bench helpers are themselves trivially testable; small criterion dep is OK
+# but we keep the surface tiny so this crate doesn't pull criterion into
+# anyone who depends on it.

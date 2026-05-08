@@ -1,0 +1,29 @@
+{
+  "version": 1,
+  "default_budget_pct": 5.0,
+  "_comment": "Per-bench, per-scale percentage regression CI accepts. 5.0 means observed time may exceed the committed baseline by up to 5%. Omitted scales fall back to default_budget_pct. Numbers below are placeholders until the first nightly run lands a baseline; tighten them in a follow-up PR once baselines exist. See BENCHMARKING.md and docs/contributing/benches.md.",
+  "crates": {
+    "fluree-db-api": {
+      "insert_formats": {
+        "tiny": 10.0,
+        "small": 5.0
+      },
+      "vector_query": {
+        "small": 5.0
+      },
+      "fulltext_query": {
+        "small": 5.0
+      }
+    },
+    "fluree-db-query": {
+      "vector_math": {
+        "small": 3.0
+      }
+    },
+    "fluree-db-spatial": {
+      "spatial_bench": {
+        "small": 5.0
+      }
+    }
+  }
+}

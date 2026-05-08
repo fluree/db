@@ -11,6 +11,10 @@ use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criteri
 // Import the NEW SIMD vector math functions from the crate
 use fluree_db_query::expression::vector_math::{cosine_f64, dot_f64, l2_f64};
 
+// Deterministic vector generator from the shared bench chassis. Replaces a
+// previous in-file `random_vectors(dim)` helper; output is byte-identical.
+use fluree_bench_support::gen::vectors::hashed_pair as random_vectors;
+
 // =============================================================================
 // OLD scalar implementations (copied from prior commit for baseline comparison)
 // =============================================================================
@@ -43,32 +47,6 @@ fn cosine_scalar(a: &[f64], b: &[f64]) -> Option<f64> {
     } else {
         Some(dot / (mag_a * mag_b))
     }
-}
-
-// =============================================================================
-// Helpers
-// =============================================================================
-
-/// Generate random f64 vectors of given dimension (deterministic for reproducibility).
-fn random_vectors(dim: usize) -> (Vec<f64>, Vec<f64>) {
-    use std::collections::hash_map::DefaultHasher;
-    use std::hash::{Hash, Hasher};
-
-    let mut hasher = DefaultHasher::new();
-    let mut a = Vec::with_capacity(dim);
-    let mut b = Vec::with_capacity(dim);
-
-    for i in 0..dim {
-        i.hash(&mut hasher);
-        let h1 = hasher.finish();
-        a.push((h1 as f64) / (u64::MAX as f64) * 2.0 - 1.0);
-
-        (i + 1000).hash(&mut hasher);
-        let h2 = hasher.finish();
-        b.push((h2 as f64) / (u64::MAX as f64) * 2.0 - 1.0);
-    }
-
-    (a, b)
 }
 
 // =============================================================================

@@ -76,6 +76,7 @@ vector = ["dep:usearch"]
 fluree-db-indexer = { path = "../fluree-db-indexer" }
 # tokio is now a regular dependency
 criterion = "0.5"
+fluree-bench-support = { path = "../fluree-bench-support" }
 
 [[bench]]
 name = "vector_math"
