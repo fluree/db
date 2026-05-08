@@ -3,9 +3,7 @@
 //! Builds the complete operator tree for a query including:
 //! WHERE patterns → GROUP BY → Aggregates → HAVING → ORDER BY → PROJECT → DISTINCT → OFFSET → LIMIT
 
-use crate::ir::AggregateFn;
 use crate::aggregate::AggregateOperator;
-use crate::ir::AggregateSpec;
 use crate::binary_scan::EmitMask;
 use crate::count_rows::CountRowsOperator;
 use crate::distinct::DistinctOperator;
@@ -44,11 +42,10 @@ use crate::group_aggregate::{GroupAggregateOperator, StreamingAggSpec};
 use crate::groupby::GroupByOperator;
 use crate::having::HavingOperator;
 use crate::ir::triple::{Ref, Term, TriplePattern};
-use crate::ir::Aggregation;
-use crate::ir::Expression;
-use crate::ir::Grouping;
-use crate::ir::{PathModifier, Pattern};
-use crate::ir::{Query, QueryOutput};
+use crate::ir::{
+    AggregateFn, AggregateSpec, Aggregation, Expression, Grouping, PathModifier, Pattern, Query,
+    QueryOutput,
+};
 use crate::limit::LimitOperator;
 use crate::offset::OffsetOperator;
 use crate::operator::inline::InlineOperator;

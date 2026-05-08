@@ -28,7 +28,7 @@ use crate::error::{QueryError, Result};
 use crate::execute::build_where_operators_seeded;
 use crate::groupby::GroupByOperator;
 use crate::having::HavingOperator;
-use crate::ir::{Grouping, SubqueryPattern};
+use crate::ir::SubqueryPattern;
 use crate::limit::LimitOperator;
 use crate::offset::OffsetOperator;
 use crate::operator::{
