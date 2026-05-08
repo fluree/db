@@ -943,7 +943,7 @@ mod tests {
     use super::*;
     use crate::ir::AggregateFn;
     use crate::ir::triple::{Term, TriplePattern};
-    use crate::ir::{QueryOptions, QueryOutput};
+    use crate::ir::{ReasoningConfig, QueryOutput};
     use crate::var_registry::VarRegistry;
     use fluree_db_core::Sid;
     use fluree_graph_json_ld::ParsedContext;
@@ -977,7 +977,7 @@ mod tests {
             ordering: Vec::new(),
             limit: None,
             offset: None,
-            options: QueryOptions::default(),
+            reasoning: ReasoningConfig::default(),
             post_values: None,
         };
         query

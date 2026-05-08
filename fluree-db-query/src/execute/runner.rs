@@ -9,7 +9,7 @@ use crate::error::Result;
 use crate::ir::triple::{Ref, Term, TriplePattern};
 use crate::ir::Pattern;
 use crate::ir::Query;
-use crate::ir::QueryOptions;
+use crate::ir::ReasoningConfig;
 use crate::operator::BoxedOperator;
 use crate::reasoning::ReasoningOverlay;
 use crate::rewrite_owl_ql::Ontology;
@@ -64,28 +64,32 @@ fn dedup_exact_triples(patterns: Vec<Pattern>) -> Vec<Pattern> {
     dedup_list(patterns)
 }
 
-/// Query with execution options
+/// A parsed query bundled with the reasoning configuration that should
+/// govern its execution.
 ///
-/// Combines a parsed query with solution modifiers for execution.
-/// The `options` field allows overriding the options embedded in `Query`.
+/// `reasoning` defaults to whatever `Query.reasoning` carried after lowering,
+/// but the API surface (e.g. `view::query::execute`) may override it before
+/// dispatch — for example to force-disable datalog or to attach a
+/// pre-resolved schema bundle.
 #[derive(Debug)]
 pub struct ExecutableQuery {
-    /// The parsed query (contains embedded options)
+    /// The parsed query (carries its own embedded reasoning config).
     pub query: Query,
-    /// Execution options (may override query.options)
-    pub options: QueryOptions,
+    /// Reasoning configuration applied at execution time.
+    /// May override `query.reasoning`.
+    pub reasoning: ReasoningConfig,
 }
 
 impl ExecutableQuery {
-    /// Create a new executable query with explicit options override
-    pub fn new(query: Query, options: QueryOptions) -> Self {
-        Self { query, options }
+    /// Create a new executable query with an explicit reasoning override.
+    pub fn new(query: Query, reasoning: ReasoningConfig) -> Self {
+        Self { query, reasoning }
     }
 
-    /// Create an executable query using the query's embedded options
+    /// Create an executable query using the reasoning config embedded in `Query`.
     pub fn simple(query: Query) -> Self {
-        let options = query.options.clone();
-        Self { query, options }
+        let reasoning = query.reasoning.clone();
+        Self { query, reasoning }
     }
 
     /// True if any pattern in this query calls `fulltext(...)`.
@@ -215,11 +219,11 @@ pub async fn prepare_execution_with_config(
         // ---- reasoning_prep: schema hierarchy, reasoning modes, derived facts, ontology ----
         let reasoning_span = tracing::debug_span!("reasoning_prep");
         // If the upstream API layer pre-resolved an `f:schemaSource` + `owl:imports`
-        // closure into `query.options.schema_bundle`, project it as an overlay now.
+        // closure into `query.reasoning.schema_bundle`, project it as an overlay now.
         // This makes schema-whitelisted flakes from every source graph visible at
         // `g_id=0`, which is what RDFS/OWL extraction code scans.
         let schema_overlay_binding: Option<SchemaBundleOverlay<'_>> = query
-            .options
+            .reasoning
             .schema_bundle
             .as_ref()
             .filter(|b| !b.is_empty())
@@ -234,7 +238,7 @@ pub async fn prepare_execution_with_config(
 
             // Step 2: Determine effective reasoning modes
             let reasoning =
-                effective_reasoning_modes(&query.options.reasoning, hierarchy.is_some());
+                effective_reasoning_modes(&query.reasoning.modes, hierarchy.is_some());
 
             if reasoning.rdfs || reasoning.owl2ql || reasoning.owl2rl || reasoning.datalog {
                 tracing::debug!(

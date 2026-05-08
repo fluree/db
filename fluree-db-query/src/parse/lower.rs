@@ -17,7 +17,7 @@ use crate::ir::{AggregateFn, AggregateSpec};
 use crate::binding::Binding;
 use crate::context::WellKnownDatatypes;
 use crate::ir::triple::{Ref, Term, TriplePattern};
-use crate::ir::QueryOptions;
+use crate::ir::ReasoningConfig;
 use crate::ir::{
     Column, ConstructTemplate, ForwardItem, Grouping, HydrationSpec, NestedSelectSpec, Projection,
     Query, QueryOutput, Restriction, Root,
@@ -93,8 +93,8 @@ pub(crate) fn lower_query<E: IriEncoder>(
         patterns.extend(lowered);
     }
 
-    // Lower options, ordering, and grouping (each is its own axis).
-    let options = lower_options(&ast.options);
+    // Lower the reasoning config, ordering, and grouping (each is its own axis).
+    let reasoning = lower_options(&ast.options);
     let ordering = lower_ordering(&ast.options, vars);
     let grouping = lower_grouping(&ast.options, vars)?;
     let limit = ast.options.limit;
@@ -132,7 +132,7 @@ pub(crate) fn lower_query<E: IriEncoder>(
         ordering,
         limit,
         offset,
-        options,
+        reasoning,
         post_values: None,
     })
 }
@@ -1523,10 +1523,10 @@ fn lower_aggregate_spec(spec: &UnresolvedAggregateSpec, vars: &mut VarRegistry) 
     }
 }
 
-/// Lower the unresolved reasoning configuration to resolved `QueryOptions`.
-fn lower_options(opts: &UnresolvedOptions) -> QueryOptions {
-    QueryOptions {
-        reasoning: opts.reasoning.clone().unwrap_or_default(),
+/// Lower the unresolved reasoning configuration to resolved `ReasoningConfig`.
+fn lower_options(opts: &UnresolvedOptions) -> ReasoningConfig {
+    ReasoningConfig {
+        modes: opts.reasoning.clone().unwrap_or_default(),
         schema_bundle: None,
     }
 }

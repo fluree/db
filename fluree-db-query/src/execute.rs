@@ -28,7 +28,7 @@
 //! - `operator_tree`: Complete operator tree construction
 //! - `runner`: Unified execution runner (eliminates duplication)
 //!
-//! Use `execute_query` for simple execution or build an `ExecutableQuery` with custom `QueryOptions` for full control.
+//! Use `execute_query` for simple execution or build an `ExecutableQuery` with custom `ReasoningConfig` for full control.
 
 mod dependency;
 pub(crate) mod operator_tree;
@@ -67,7 +67,7 @@ pub use runner::{
 mod tests {
     use super::*;
     use crate::ir::triple::{Ref, Term, TriplePattern};
-    use crate::ir::QueryOptions;
+    use crate::ir::ReasoningConfig;
     use crate::ir::{Expression, Pattern};
     use crate::ir::{Query, QueryOutput};
     use crate::planner::reorder_patterns;
@@ -103,7 +103,7 @@ mod tests {
             orig_context: None,
             output: QueryOutput::wildcard(),
             patterns: vec![],
-            options: QueryOptions::default(),
+            reasoning: ReasoningConfig::default(),
             grouping: None,
             ordering: Vec::new(),
             limit: None,
@@ -128,7 +128,7 @@ mod tests {
             orig_context: None,
             output: QueryOutput::select_all(vec![VarId(99)]), // Variable not in pattern
             patterns: vec![Pattern::Triple(make_pattern(VarId(0), "name", VarId(1)))],
-            options: QueryOptions::default(),
+            reasoning: ReasoningConfig::default(),
             grouping: None,
             ordering: Vec::new(),
             limit: None,
@@ -154,7 +154,7 @@ mod tests {
             orig_context: None,
             output: QueryOutput::select_all(vec![VarId(0)]),
             patterns: vec![Pattern::Triple(make_pattern(VarId(0), "name", VarId(1)))],
-            options: QueryOptions::default(),
+            reasoning: ReasoningConfig::default(),
             grouping: None,
             ordering: vec![SortSpec::asc(VarId(99))], // Invalid var
             limit: None,

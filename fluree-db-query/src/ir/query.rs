@@ -15,7 +15,7 @@ use std::collections::HashSet;
 use fluree_graph_json_ld::ParsedContext;
 
 use super::grouping::Grouping;
-use super::options::QueryOptions;
+use super::reasoning::ReasoningConfig;
 use super::pattern::Pattern;
 use super::projection::{Column, Projection};
 use super::triple::TriplePattern;
@@ -245,7 +245,7 @@ pub struct Query {
     /// Rows to skip before returning results. `None` is no skip.
     pub offset: Option<usize>,
     /// Reasoning configuration (RDFS/OWL/datalog modes, schema bundle).
-    pub options: QueryOptions,
+    pub reasoning: ReasoningConfig,
     /// Post-query VALUES clause (SPARQL `ValuesClause` after `SolutionModifier`).
     ///
     /// Stored separately from `patterns` so the WHERE-clause planner does not
@@ -266,7 +266,7 @@ impl Query {
             ordering: Vec::new(),
             limit: None,
             offset: None,
-            options: QueryOptions::default(),
+            reasoning: ReasoningConfig::default(),
             post_values: None,
         }
     }
@@ -285,7 +285,7 @@ impl Query {
             ordering: self.ordering.clone(),
             limit: self.limit,
             offset: self.offset,
-            options: self.options.clone(),
+            reasoning: self.reasoning.clone(),
             post_values: self.post_values.clone(),
         }
     }

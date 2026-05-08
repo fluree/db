@@ -2894,7 +2894,7 @@ mod tests {
     use super::*;
     use crate::ir::triple::{Ref, Term, TriplePattern};
     use crate::ir::Pattern;
-    use crate::ir::QueryOptions;
+    use crate::ir::ReasoningConfig;
     use crate::ir::{Query, QueryOutput};
     use crate::sort::SortSpec;
     use fluree_db_core::Sid;
@@ -2919,7 +2919,7 @@ mod tests {
             orig_context: None,
             output,
             patterns,
-            options: QueryOptions::default(),
+            reasoning: ReasoningConfig::default(),
             grouping: None,
             ordering: Vec::new(),
             limit: None,
@@ -2967,7 +2967,7 @@ mod tests {
             orig_context: None,
             output: QueryOutput::select_distinct(vec![s, label]),
             patterns,
-            options: QueryOptions::default(),
+            reasoning: ReasoningConfig::default(),
             grouping: None,
             ordering: vec![SortSpec::asc(label)],
             limit: Some(10),
@@ -2992,7 +2992,7 @@ mod tests {
             orig_context: None,
             output: QueryOutput::select_all(vec![VarId(99)]), // Variable not in pattern
             patterns: vec![Pattern::Triple(make_pattern(VarId(0), "name", VarId(1)))],
-            options: QueryOptions::default(),
+            reasoning: ReasoningConfig::default(),
             grouping: None,
             ordering: Vec::new(),
             limit: None,
@@ -3018,7 +3018,7 @@ mod tests {
             orig_context: None,
             output: QueryOutput::select_all(vec![VarId(0)]),
             patterns: vec![Pattern::Triple(make_pattern(VarId(0), "name", VarId(1)))],
-            options: QueryOptions::default(),
+            reasoning: ReasoningConfig::default(),
             grouping: None,
             ordering: vec![SortSpec::asc(VarId(99))], // Invalid var
             limit: None,
@@ -3094,7 +3094,7 @@ mod tests {
                     Term::Var(exists_o),
                 )),
             ],
-            options: QueryOptions::default(),
+            reasoning: ReasoningConfig::default(),
             grouping: make_grouping(),
             ordering: Vec::new(),
             limit: None,
@@ -3117,7 +3117,7 @@ mod tests {
                     Term::Var(counted_o),
                 )),
             ],
-            options: QueryOptions::default(),
+            reasoning: ReasoningConfig::default(),
             grouping: make_grouping(),
             ordering: Vec::new(),
             limit: None,

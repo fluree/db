@@ -120,7 +120,7 @@ pub use groupby::GroupByOperator;
 pub use having::HavingOperator;
 pub use ir::{
     CompareOp, Expression, FlakeValue, Function, PathModifier, Pattern, PropertyPathPattern,
-    Query, QueryOptions, QueryOutput, R2rmlPattern, ReasoningModes, Ref, ServiceEndpoint,
+    Query, ReasoningConfig, QueryOutput, R2rmlPattern, ReasoningModes, Ref, ServiceEndpoint,
     ServicePattern, SubqueryPattern, Term, TriplePattern,
 };
 pub use join::{BindInstruction, NestedLoopJoinOperator, PatternPosition, UnifyInstruction};

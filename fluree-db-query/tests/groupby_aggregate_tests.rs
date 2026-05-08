@@ -12,7 +12,7 @@ use fluree_db_query::binding::Binding;
 use fluree_db_query::context::ExecutionContext;
 use fluree_db_query::execute::{execute, ContextConfig, ExecutableQuery};
 use fluree_db_query::groupby::GroupByOperator;
-use fluree_db_query::ir::QueryOptions;
+use fluree_db_query::ir::ReasoningConfig;
 use fluree_db_query::ir::{Aggregation, Expression, Grouping, Pattern};
 use fluree_db_query::ir::{Query, QueryOutput};
 use fluree_db_query::operator::Operator;
@@ -87,7 +87,7 @@ fn make_query(select: Vec<VarId>, patterns: Vec<Pattern>) -> Query {
         ordering: Vec::new(),
         limit: None,
         offset: None,
-        options: QueryOptions::default(),
+        reasoning: ReasoningConfig::default(),
         post_values: None,
     }
 }
@@ -149,7 +149,7 @@ async fn test_group_by_with_count() {
     ));
 
     let db = GraphDbRef::new(&snapshot, 0, &NoOverlay, snapshot.t);
-    let executable = ExecutableQuery::new(query, QueryOptions::default());
+    let executable = ExecutableQuery::new(query, ReasoningConfig::default());
     let results = execute(db, &vars, &executable, ContextConfig::default())
         .await
         .unwrap();
@@ -226,7 +226,7 @@ async fn test_group_by_with_sum() {
     ));
 
     let db = GraphDbRef::new(&snapshot, 0, &NoOverlay, snapshot.t);
-    let executable = ExecutableQuery::new(query, QueryOptions::default());
+    let executable = ExecutableQuery::new(query, ReasoningConfig::default());
     let results = execute(db, &vars, &executable, ContextConfig::default())
         .await
         .unwrap();
@@ -313,7 +313,7 @@ async fn test_group_by_with_having() {
     ));
 
     let db = GraphDbRef::new(&snapshot, 0, &NoOverlay, snapshot.t);
-    let executable = ExecutableQuery::new(query, QueryOptions::default());
+    let executable = ExecutableQuery::new(query, ReasoningConfig::default());
     let results = execute(db, &vars, &executable, ContextConfig::default())
         .await
         .unwrap();
@@ -359,7 +359,7 @@ async fn test_aggregates_without_group_by() {
     }]));
 
     let db = GraphDbRef::new(&snapshot, 0, &NoOverlay, snapshot.t);
-    let executable = ExecutableQuery::new(query, QueryOptions::default());
+    let executable = ExecutableQuery::new(query, ReasoningConfig::default());
     let results = execute(db, &vars, &executable, ContextConfig::default())
         .await
         .unwrap();
@@ -504,7 +504,7 @@ async fn test_aggregate_avg() {
     ));
 
     let db = GraphDbRef::new(&snapshot, 0, &NoOverlay, snapshot.t);
-    let executable = ExecutableQuery::new(query, QueryOptions::default());
+    let executable = ExecutableQuery::new(query, ReasoningConfig::default());
     let results = execute(db, &vars, &executable, ContextConfig::default())
         .await
         .unwrap();
@@ -567,7 +567,7 @@ async fn test_aggregate_min_max() {
     ));
 
     let db = GraphDbRef::new(&snapshot, 0, &NoOverlay, snapshot.t);
-    let executable = ExecutableQuery::new(query, QueryOptions::default());
+    let executable = ExecutableQuery::new(query, ReasoningConfig::default());
     let results = execute(db, &vars, &executable, ContextConfig::default())
         .await
         .unwrap();
@@ -619,7 +619,7 @@ async fn test_order_by_on_grouped_var_errors() {
     query.ordering = vec![fluree_db_query::sort::SortSpec::asc(VarId(1))];
 
     let db = GraphDbRef::new(&snapshot, 0, &NoOverlay, snapshot.t);
-    let executable = ExecutableQuery::new(query, QueryOptions::default());
+    let executable = ExecutableQuery::new(query, ReasoningConfig::default());
     let err = execute(db, &vars, &executable, ContextConfig::default())
         .await
         .unwrap_err();
@@ -662,7 +662,7 @@ async fn test_aggregate_on_group_by_key_errors() {
             distinct: false,
         }],
     ));
-    let options = QueryOptions::default();
+    let options = ReasoningConfig::default();
 
     let db = GraphDbRef::new(&snapshot, 0, &NoOverlay, snapshot.t);
     let executable = ExecutableQuery::new(query, options);

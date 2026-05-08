@@ -117,7 +117,7 @@ mod tests {
     use super::*;
     use crate::ir::{AggregateFn, AggregateSpec, Expression};
     use crate::ir::triple::{Ref, Term, TriplePattern};
-    use crate::ir::QueryOptions;
+    use crate::ir::ReasoningConfig;
     use crate::ir::{Aggregation, ConstructTemplate, Query, QueryOutput};
     use std::collections::HashMap;
     use crate::ir::{FlakeValue, Pattern};
@@ -138,7 +138,7 @@ mod tests {
             orig_context: None,
             output,
             patterns,
-            options: QueryOptions::default(),
+            reasoning: ReasoningConfig::default(),
             grouping: None,
             ordering: Vec::new(),
             limit: None,
@@ -153,7 +153,7 @@ mod tests {
             orig_context: None,
             output: QueryOutput::wildcard(),
             patterns,
-            options: QueryOptions::default(),
+            reasoning: ReasoningConfig::default(),
             grouping: None,
             ordering: Vec::new(),
             limit: None,
@@ -297,7 +297,7 @@ mod tests {
                 VarId(1),
             )])),
             patterns: vec![],
-            options: QueryOptions::default(),
+            reasoning: ReasoningConfig::default(),
             grouping: None,
             ordering: Vec::new(),
             limit: None,
@@ -321,7 +321,7 @@ mod tests {
                 restriction: None,
             },
             patterns: vec![],
-            options: QueryOptions::default(),
+            reasoning: ReasoningConfig::default(),
             grouping: None,
             ordering: Vec::new(),
             limit: None,

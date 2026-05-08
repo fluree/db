@@ -1,13 +1,14 @@
-//! Query execution options and reasoning modes.
+//! Reasoning configuration for the rewrite phase.
 //!
-//! `QueryOptions` carries the reasoning configuration the rewriter consumes
-//! (`ReasoningModes` plus an optional pre-resolved `SchemaBundleFlakes`).
-//! Solution modifiers (LIMIT, OFFSET, ORDER BY, GROUP BY, HAVING) ride on
-//! [`Query`](super::Query) directly.
+//! `ReasoningConfig` bundles the inputs the rewriter consults: a
+//! `ReasoningModes` selector plus an optional pre-resolved
+//! `SchemaBundleFlakes` for ontology imports. Solution modifiers (LIMIT,
+//! OFFSET, ORDER BY, GROUP BY, HAVING) ride on [`Query`](super::Query)
+//! directly.
 //!
 //! `ReasoningModes` is pure config — no behavior, just bit flags and a JSON
-//! rule list. The rewriter consumes it as input. Both types live here in `ir`
-//! because they're embedded in [`Query`](super::Query).
+//! rule list. Both types live here in `ir` because they're embedded in
+//! [`Query`](super::Query).
 
 use std::sync::Arc;
 
@@ -340,15 +341,15 @@ impl ReasoningModes {
 /// (LIMIT, OFFSET, ORDER BY, GROUP BY, HAVING) ride on [`Query`](super::Query)
 /// directly.
 #[derive(Debug, Clone, Default)]
-pub struct QueryOptions {
+pub struct ReasoningConfig {
     /// Reasoning modes for RDFS/OWL reasoning
     ///
     /// Controls pattern expansion based on class/property hierarchies.
     /// Default is to auto-enable RDFS when hierarchy exists.
     ///
-    /// Use `reasoning.effective_with_hierarchy(has_hierarchy)` at execution
+    /// Use `modes.effective_with_hierarchy(has_hierarchy)` at execution
     /// time to compute the actual modes to apply.
-    pub reasoning: ReasoningModes,
+    pub modes: ReasoningModes,
     /// Pre-resolved schema bundle flakes projected to `g_id=0`.
     ///
     /// Populated upstream (in `fluree-db-api`) from the ledger's
@@ -361,7 +362,7 @@ pub struct QueryOptions {
     pub schema_bundle: Option<Arc<SchemaBundleFlakes>>,
 }
 
-impl QueryOptions {
+impl ReasoningConfig {
     /// Create new execution options with defaults
     pub fn new() -> Self {
         Self::default()
@@ -372,15 +373,15 @@ impl QueryOptions {
     /// # Example
     ///
     /// ```
-    /// use fluree_db_query::ir::{QueryOptions, ReasoningModes};
+    /// use fluree_db_query::ir::{ReasoningConfig, ReasoningModes};
     ///
-    /// let opts = QueryOptions::new()
-    ///     .with_reasoning(ReasoningModes::rdfs().with_owl2ql());
-    /// assert!(opts.reasoning.rdfs);
-    /// assert!(opts.reasoning.owl2ql);
+    /// let cfg = ReasoningConfig::new()
+    ///     .with_modes(ReasoningModes::rdfs().with_owl2ql());
+    /// assert!(cfg.modes.rdfs);
+    /// assert!(cfg.modes.owl2ql);
     /// ```
-    pub fn with_reasoning(mut self, modes: ReasoningModes) -> Self {
-        self.reasoning = modes;
+    pub fn with_modes(mut self, modes: ReasoningModes) -> Self {
+        self.modes = modes;
         self
     }
 
@@ -395,12 +396,12 @@ impl QueryOptions {
 
     /// Check if any reasoning mode is explicitly enabled
     pub fn has_reasoning(&self) -> bool {
-        self.reasoning.has_any_enabled()
+        self.modes.has_any_enabled()
     }
 
     /// Check if reasoning is explicitly disabled
     pub fn is_reasoning_disabled(&self) -> bool {
-        self.reasoning.is_disabled()
+        self.modes.is_disabled()
     }
 }
 
@@ -409,12 +410,12 @@ mod tests {
     use super::*;
 
     // ========================
-    // QueryOptions tests
+    // ReasoningConfig tests
     // ========================
 
     #[test]
     fn test_default_options() {
-        let opts = QueryOptions::default();
+        let opts = ReasoningConfig::default();
         // Default reasoning: nothing explicitly enabled
         assert!(!opts.has_reasoning());
         assert!(!opts.is_reasoning_disabled());
@@ -423,24 +424,24 @@ mod tests {
     #[test]
     fn test_reasoning_modes() {
         // Default: no explicit reasoning
-        let opts = QueryOptions::new();
+        let opts = ReasoningConfig::new();
         assert!(!opts.has_reasoning());
         assert!(!opts.is_reasoning_disabled());
 
         // With RDFS
-        let opts = QueryOptions::new().with_reasoning(ReasoningModes::rdfs());
+        let opts = ReasoningConfig::new().with_modes(ReasoningModes::rdfs());
         assert!(opts.has_reasoning());
-        assert!(opts.reasoning.rdfs);
-        assert!(!opts.reasoning.owl2ql);
+        assert!(opts.modes.rdfs);
+        assert!(!opts.modes.owl2ql);
 
         // With OWL2-QL (includes RDFS)
-        let opts = QueryOptions::new().with_reasoning(ReasoningModes::owl2ql());
+        let opts = ReasoningConfig::new().with_modes(ReasoningModes::owl2ql());
         assert!(opts.has_reasoning());
-        assert!(opts.reasoning.rdfs);
-        assert!(opts.reasoning.owl2ql);
+        assert!(opts.modes.rdfs);
+        assert!(opts.modes.owl2ql);
 
         // Explicit none
-        let opts = QueryOptions::new().with_reasoning(ReasoningModes::none());
+        let opts = ReasoningConfig::new().with_modes(ReasoningModes::none());
         assert!(!opts.has_reasoning());
         assert!(opts.is_reasoning_disabled());
     }

@@ -61,7 +61,7 @@ pub use error::{LowerError, Result};
 use crate::ast::query::{QueryBody, SelectVariables, SparqlAst};
 
 use fluree_db_query::ir::Pattern;
-use fluree_db_query::ir::{Grouping, Query, QueryOptions, QueryOutput};
+use fluree_db_query::ir::{Grouping, Query, ReasoningConfig, QueryOutput};
 
 use self::select::BaseModifiers;
 use fluree_db_query::parse::encode::IriEncoder;
@@ -268,7 +268,7 @@ impl<'a, E: IriEncoder> LoweringContext<'a, E> {
                     ordering,
                     limit,
                     offset,
-                    options: QueryOptions::default(),
+                    reasoning: ReasoningConfig::default(),
                     post_values,
                 })
             }

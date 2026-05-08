@@ -10,7 +10,7 @@ use fluree_db_query::binding::Binding;
 use fluree_db_query::context::ExecutionContext;
 use fluree_db_query::execute::{execute, ContextConfig, ExecutableQuery};
 use fluree_db_query::ir::triple::{Ref, Term, TriplePattern};
-use fluree_db_query::ir::QueryOptions;
+use fluree_db_query::ir::ReasoningConfig;
 use fluree_db_query::ir::{Expression, Pattern};
 use fluree_db_query::ir::{Query, QueryOutput};
 use fluree_db_query::operator::Operator;
@@ -43,7 +43,7 @@ fn make_query(select: Vec<VarId>, patterns: Vec<Pattern>) -> Query {
         orig_context: None,
         output,
         patterns,
-        options: QueryOptions::default(),
+        reasoning: ReasoningConfig::default(),
         grouping: None,
         ordering: Vec::new(),
         limit: None,

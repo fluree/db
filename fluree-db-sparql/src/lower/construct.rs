@@ -8,7 +8,7 @@ use crate::ast::TriplePattern as SparqlTriplePattern;
 
 use fluree_db_query::ir::triple::TriplePattern;
 use fluree_db_query::ir::{
-    ConstructTemplate as QueryConstructTemplate, Pattern, Query, QueryOptions, QueryOutput,
+    ConstructTemplate as QueryConstructTemplate, Pattern, Query, ReasoningConfig, QueryOutput,
 };
 use fluree_db_query::parse::encode::IriEncoder;
 
@@ -52,7 +52,7 @@ impl<E: IriEncoder> LoweringContext<'_, E> {
             orig_context: Some(ctx_val),
             output: QueryOutput::Construct(construct_template),
             patterns,
-            options: QueryOptions::default(),
+            reasoning: ReasoningConfig::default(),
             grouping: None,
             ordering,
             limit,

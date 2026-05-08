@@ -15,7 +15,7 @@ use crate::SourceSpan;
 use fluree_db_query::binding::Binding;
 use fluree_db_query::ir::triple::{Ref, Term, TriplePattern};
 use fluree_db_query::ir::{
-    ConstructTemplate as QueryConstructTemplate, Expression, Pattern, Query, QueryOptions,
+    ConstructTemplate as QueryConstructTemplate, Expression, Pattern, Query, ReasoningConfig,
     QueryOutput, SubqueryPattern,
 };
 use fluree_db_query::parse::encode::IriEncoder;
@@ -141,7 +141,7 @@ impl<E: IriEncoder> LoweringContext<'_, E> {
             orig_context: Some(ctx_val),
             output: QueryOutput::Construct(template),
             patterns,
-            options: QueryOptions::default(),
+            reasoning: ReasoningConfig::default(),
             grouping: None,
             ordering: Vec::new(),
             limit: None,
