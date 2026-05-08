@@ -141,6 +141,7 @@ impl<E: IriEncoder> LoweringContext<'_, E> {
             output: QueryOutput::Construct(template),
             patterns,
             options: QueryOptions::default(),
+            grouping: None,
             post_values: None,
         })
     }

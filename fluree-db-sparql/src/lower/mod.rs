@@ -228,6 +228,26 @@ impl<'a, E: IriEncoder> LoweringContext<'a, E> {
                 options.post_binds = select_binds.post;
                 let distinct = lowered_modifiers.distinct;
 
+                // Assemble the grouping phase from the lowered components.
+                let grouping = if let Some(group_by) =
+                    fluree_db_core::NonEmpty::try_from_vec(lowered_modifiers.group_by)
+                {
+                    Some(fluree_db_query::ir::Grouping::Explicit {
+                        group_by,
+                        aggregates: lowered_modifiers.aggregates,
+                        having: lowered_modifiers.having,
+                    })
+                } else if let Some(aggregates) =
+                    fluree_db_core::NonEmpty::try_from_vec(lowered_modifiers.aggregates)
+                {
+                    Some(fluree_db_query::ir::Grouping::Implicit {
+                        aggregates,
+                        having: lowered_modifiers.having,
+                    })
+                } else {
+                    None
+                };
+
                 // Build a JSON-LD-like context from SPARQL prologue prefixes so formatters can compact IRIs.
                 let ctx = self.build_jsonld_context()?;
 
@@ -249,6 +269,7 @@ impl<'a, E: IriEncoder> LoweringContext<'a, E> {
                     orig_context: None, // SPARQL doesn't originate from JSON context
                     output,
                     patterns,
+                    grouping,
                     options,
                     post_values,
                 })
@@ -309,11 +330,34 @@ impl<'a, E: IriEncoder> LoweringContext<'a, E> {
 mod tests {
     use super::*;
     use crate::parse::parse_sparql;
-    use fluree_db_query::aggregate::AggregateFn;
+    use fluree_db_query::aggregate::{AggregateFn, AggregateSpec};
     use fluree_db_query::ir::triple::{Ref, Term};
-    use fluree_db_query::ir::{PathModifier, Pattern};
+    use fluree_db_query::ir::{Expression, Grouping, PathModifier, Pattern};
     use fluree_db_query::parse::encode::MemoryEncoder;
     use fluree_db_query::sort::SortDirection;
+    use fluree_db_query::var_registry::VarId;
+
+    /// View aggregates of a lowered Query as a flat Vec of references.
+    fn aggregates_of(query: &Query) -> Vec<&AggregateSpec> {
+        match &query.grouping {
+            Some(Grouping::Implicit { aggregates, .. }) => aggregates.iter().collect(),
+            Some(Grouping::Explicit { aggregates, .. }) => aggregates.iter().collect(),
+            None => Vec::new(),
+        }
+    }
+
+    /// View GROUP BY keys of a lowered Query.
+    fn group_by_of(query: &Query) -> Vec<VarId> {
+        match &query.grouping {
+            Some(Grouping::Explicit { group_by, .. }) => group_by.iter().copied().collect(),
+            _ => Vec::new(),
+        }
+    }
+
+    /// View HAVING expression of a lowered Query.
+    fn having_of(query: &Query) -> Option<&Expression> {
+        query.grouping.as_ref().and_then(Grouping::having)
+    }
 
     fn test_encoder() -> MemoryEncoder {
         let mut encoder = MemoryEncoder::with_common_namespaces();
@@ -1350,7 +1394,7 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(query.options.group_by.len(), 1);
+        assert_eq!(group_by_of(&query).len(), 1);
     }
 
     #[test]
@@ -1362,7 +1406,7 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(query.options.group_by.len(), 1);
+        assert_eq!(group_by_of(&query).len(), 1);
     }
 
     #[test]
@@ -1376,8 +1420,8 @@ mod tests {
         .unwrap();
 
         // GROUP BY should contain one variable (the alias ?y)
-        assert_eq!(query.options.group_by.len(), 1);
-        let group_var = query.options.group_by[0];
+        assert_eq!(group_by_of(&query).len(), 1);
+        let group_var = group_by_of(&query)[0];
 
         // Patterns should contain a Bind for the expression, targeting the same variable
         let has_bind = query
@@ -1396,8 +1440,8 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(query.options.group_by.len(), 1);
-        let group_var = query.options.group_by[0];
+        assert_eq!(group_by_of(&query).len(), 1);
+        let group_var = group_by_of(&query)[0];
 
         // The synthetic variable name starts with ?__group_expr_
         let var_name = vars.name(group_var);
@@ -1426,7 +1470,7 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(query.options.group_by.len(), 1);
+        assert_eq!(group_by_of(&query).len(), 1);
         let has_bind = query
             .patterns
             .iter()
@@ -1445,7 +1489,7 @@ mod tests {
         )
         .unwrap();
 
-        assert!(query.options.having.is_some());
+        assert!(having_of(&query).is_some());
     }
 
     #[test]
@@ -1462,8 +1506,8 @@ mod tests {
         .unwrap();
 
         assert!(query.output.is_distinct());
-        assert_eq!(query.options.group_by.len(), 1);
-        assert!(query.options.having.is_some());
+        assert_eq!(group_by_of(&query).len(), 1);
+        assert!(having_of(&query).is_some());
         assert_eq!(query.options.order_by.len(), 1);
         assert_eq!(query.options.limit, Some(10));
         assert_eq!(query.options.offset, Some(5));
@@ -1481,8 +1525,8 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(query.options.aggregates.len(), 1);
-        let agg = &query.options.aggregates[0];
+        assert_eq!(aggregates_of(&query).len(), 1);
+        let agg = aggregates_of(&query)[0];
         assert!(matches!(agg.function, AggregateFn::Count));
     }
 
@@ -1494,8 +1538,8 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(query.options.aggregates.len(), 1);
-        let agg = &query.options.aggregates[0];
+        assert_eq!(aggregates_of(&query).len(), 1);
+        let agg = aggregates_of(&query)[0];
         assert!(matches!(agg.function, AggregateFn::CountDistinct));
     }
 
@@ -1509,8 +1553,8 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(query.options.aggregates.len(), 1);
-        let agg = &query.options.aggregates[0];
+        assert_eq!(aggregates_of(&query).len(), 1);
+        let agg = aggregates_of(&query)[0];
         assert!(matches!(agg.function, AggregateFn::CountDistinct));
         assert!(agg.input_var.is_some()); // Should have resolved the variable
     }
@@ -1525,8 +1569,8 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(query.options.aggregates.len(), 1);
-        let agg = &query.options.aggregates[0];
+        assert_eq!(aggregates_of(&query).len(), 1);
+        let agg = aggregates_of(&query)[0];
         assert!(matches!(agg.function, AggregateFn::CountDistinct));
         assert!(agg.input_var.is_some());
     }
@@ -1544,16 +1588,16 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(query.options.aggregates.len(), 2);
+        assert_eq!(aggregates_of(&query).len(), 2);
 
-        let count_agg = &query.options.aggregates[0];
+        let count_agg = aggregates_of(&query)[0];
         assert!(matches!(count_agg.function, AggregateFn::CountDistinct));
         assert!(
             !count_agg.distinct,
             "CountDistinct variant should clear the distinct flag"
         );
 
-        let sum_agg = &query.options.aggregates[1];
+        let sum_agg = aggregates_of(&query)[1];
         assert!(matches!(sum_agg.function, AggregateFn::Sum));
         assert!(sum_agg.distinct, "SUM(DISTINCT) should set distinct=true");
     }
@@ -1567,12 +1611,12 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(query.options.aggregates.len(), 1);
+        assert_eq!(aggregates_of(&query).len(), 1);
         assert!(matches!(
-            query.options.aggregates[0].function,
+            aggregates_of(&query)[0].function,
             AggregateFn::Sum
         ));
-        assert!(query.options.aggregates[0].input_var.is_some());
+        assert!(aggregates_of(&query)[0].input_var.is_some());
     }
 
     #[test]
@@ -1583,9 +1627,9 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(query.options.aggregates.len(), 1);
+        assert_eq!(aggregates_of(&query).len(), 1);
         assert!(matches!(
-            query.options.aggregates[0].function,
+            aggregates_of(&query)[0].function,
             AggregateFn::Sum
         ));
     }
@@ -1598,8 +1642,8 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(query.options.aggregates.len(), 1);
-        let agg = &query.options.aggregates[0];
+        assert_eq!(aggregates_of(&query).len(), 1);
+        let agg = aggregates_of(&query)[0];
         assert!(matches!(agg.function, AggregateFn::Sum));
 
         let input_var = agg.input_var.expect("expected aggregate input var");
@@ -1627,9 +1671,9 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(query.options.aggregates.len(), 1);
+        assert_eq!(aggregates_of(&query).len(), 1);
         assert!(matches!(
-            query.options.aggregates[0].function,
+            aggregates_of(&query)[0].function,
             AggregateFn::Avg
         ));
     }
@@ -1642,13 +1686,13 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(query.options.aggregates.len(), 2);
+        assert_eq!(aggregates_of(&query).len(), 2);
         assert!(matches!(
-            query.options.aggregates[0].function,
+            aggregates_of(&query)[0].function,
             AggregateFn::Min
         ));
         assert!(matches!(
-            query.options.aggregates[1].function,
+            aggregates_of(&query)[1].function,
             AggregateFn::Max
         ));
     }
@@ -1661,8 +1705,9 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(query.options.aggregates.len(), 1);
-        match &query.options.aggregates[0].function {
+        let aggs = aggregates_of(&query);
+        assert_eq!(aggs.len(), 1);
+        match &aggs[0].function {
             AggregateFn::GroupConcat { separator } => {
                 assert_eq!(separator, ", ");
             }
@@ -1678,9 +1723,9 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(query.options.aggregates.len(), 1);
+        assert_eq!(aggregates_of(&query).len(), 1);
         assert!(matches!(
-            query.options.aggregates[0].function,
+            aggregates_of(&query)[0].function,
             AggregateFn::Sample
         ));
     }
@@ -1694,8 +1739,8 @@ mod tests {
         .unwrap();
 
         // Verify COUNT(*) aggregate was created
-        assert_eq!(query.options.aggregates.len(), 1);
-        let agg = &query.options.aggregates[0];
+        assert_eq!(aggregates_of(&query).len(), 1);
+        let agg = aggregates_of(&query)[0];
         assert!(matches!(agg.function, AggregateFn::CountAll));
         assert!(agg.input_var.is_none(), "COUNT(*) should have no input var");
     }
@@ -1710,9 +1755,9 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(query.options.aggregates.len(), 1);
+        assert_eq!(aggregates_of(&query).len(), 1);
         // ?type should be auto-added to GROUP BY
-        assert_eq!(query.options.group_by.len(), 1);
+        assert_eq!(group_by_of(&query).len(), 1);
     }
 
     #[test]
@@ -1724,9 +1769,9 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(query.options.aggregates.len(), 1);
+        assert_eq!(aggregates_of(&query).len(), 1);
         // Only the explicit GROUP BY var, not duplicated
-        assert_eq!(query.options.group_by.len(), 1);
+        assert_eq!(group_by_of(&query).len(), 1);
     }
 
     #[test]
@@ -1740,9 +1785,9 @@ mod tests {
         .unwrap();
 
         // 2 aggregates: COUNT and AVG
-        assert_eq!(query.options.aggregates.len(), 2);
+        assert_eq!(aggregates_of(&query).len(), 2);
         // 2 non-aggregate vars auto-added to GROUP BY: ?cat, ?brand
-        assert_eq!(query.options.group_by.len(), 2);
+        assert_eq!(group_by_of(&query).len(), 2);
     }
 
     // =========================================================================

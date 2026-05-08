@@ -3,14 +3,17 @@
 //!
 //! `Query` is the canonical query representation. Its `output` field
 //! captures the result-shape decision (SELECT, ASK, CONSTRUCT). `patterns`
-//! holds the WHERE clause IR. `options` carries solution modifiers (limit,
-//! offset, order by, group by, aggregates, having, ...). Hydration formatting
-//! lives inside the `Column::Hydration` variant on the SELECT projection.
+//! holds the WHERE clause IR. `grouping` carries the optional aggregation
+//! phase (GROUP BY / aggregates / HAVING). `options` carries the remaining
+//! solution modifiers (limit, offset, order by, post-binds). Hydration
+//! formatting lives inside the `Column::Hydration` variant on the SELECT
+//! projection.
 
 use std::collections::HashSet;
 
 use fluree_graph_json_ld::ParsedContext;
 
+use super::grouping::Grouping;
 use super::options::QueryOptions;
 use super::pattern::Pattern;
 use super::projection::{Column, Projection};
@@ -229,7 +232,9 @@ pub struct Query {
     pub output: QueryOutput,
     /// Resolved patterns (triples, filters, optionals, etc.)
     pub patterns: Vec<Pattern>,
-    /// Query options (limit, offset, order by, group by, etc.)
+    /// Optional aggregation phase: GROUP BY + aggregates + HAVING.
+    pub grouping: Option<Grouping>,
+    /// Solution modifiers applied after grouping (limit, offset, order by, ...).
     pub options: QueryOptions,
     /// Post-query VALUES clause (SPARQL `ValuesClause` after `SolutionModifier`).
     ///
@@ -247,6 +252,7 @@ impl Query {
             orig_context: None,
             output: QueryOutput::wildcard(),
             patterns: Vec::new(),
+            grouping: None,
             options: QueryOptions::default(),
             post_values: None,
         }
@@ -262,6 +268,7 @@ impl Query {
             orig_context: self.orig_context.clone(),
             output: self.output.clone(),
             patterns,
+            grouping: self.grouping.clone(),
             options: self.options.clone(),
             post_values: self.post_values.clone(),
         }

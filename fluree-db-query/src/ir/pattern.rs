@@ -8,9 +8,9 @@ use super::adapters::{
     GeoSearchPattern, IndexSearchPattern, R2rmlPattern, S2SearchPattern, VectorSearchPattern,
 };
 use super::expression::{Expression, Function};
+use super::grouping::Grouping;
 use super::path::PropertyPathPattern;
 use super::triple::TriplePattern;
-use crate::aggregate::AggregateSpec;
 use crate::binding::Binding;
 use crate::sort::SortSpec;
 use crate::var_registry::VarId;
@@ -35,12 +35,8 @@ pub struct SubqueryPattern {
     pub distinct: bool,
     /// ORDER BY specifications
     pub order_by: Vec<SortSpec>,
-    /// GROUP BY variables (for aggregates)
-    pub group_by: Vec<VarId>,
-    /// Aggregate specifications
-    pub aggregates: Vec<AggregateSpec>,
-    /// HAVING filter (post-aggregate)
-    pub having: Option<Expression>,
+    /// Optional aggregation phase (GROUP BY / aggregates / HAVING).
+    pub grouping: Option<Grouping>,
 }
 
 impl SubqueryPattern {
@@ -53,9 +49,7 @@ impl SubqueryPattern {
             offset: None,
             distinct: false,
             order_by: Vec::new(),
-            group_by: Vec::new(),
-            aggregates: Vec::new(),
-            having: None,
+            grouping: None,
         }
     }
 
@@ -83,15 +77,9 @@ impl SubqueryPattern {
         self
     }
 
-    /// Set GROUP BY variables
-    pub fn with_group_by(mut self, vars: Vec<VarId>) -> Self {
-        self.group_by = vars;
-        self
-    }
-
-    /// Set aggregate specifications
-    pub fn with_aggregates(mut self, specs: Vec<AggregateSpec>) -> Self {
-        self.aggregates = specs;
+    /// Set the aggregation phase (GROUP BY / aggregates / HAVING).
+    pub fn with_grouping(mut self, grouping: Grouping) -> Self {
+        self.grouping = Some(grouping);
         self
     }
 

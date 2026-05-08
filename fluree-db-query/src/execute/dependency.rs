@@ -5,7 +5,8 @@
 //! and GROUP BY. Variables without downstream dependencies are dead and can
 //! be projected away early.
 
-use crate::ir::{Query, QueryOptions};
+use crate::aggregate::AggregateSpec;
+use crate::ir::{Grouping, Query, QueryOptions};
 use crate::var_registry::VarId;
 use std::collections::{HashMap, HashSet};
 
@@ -69,15 +70,21 @@ pub fn compute_variable_deps(query: &Query, options: &QueryOptions) -> Option<Va
 
     // HAVING expression variables: needed in HAVING's input but not
     // necessarily in its output (HAVING evaluates before trimming).
-    if let Some(ref having_expr) = options.having {
+    if let Some(having_expr) = query.grouping.as_ref().and_then(Grouping::having) {
         deps.extend(having_expr.referenced_vars());
     }
 
     // Record what Aggregate's output must contain (before tracing aggregates backward).
     let required_aggregate_vars: Vec<VarId> = deps.iter().copied().collect();
 
-    // Aggregates: replace output vars with input vars.
-    for spec in &options.aggregates {
+    // Aggregates: replace output vars with input vars. Iterate over either
+    // grouping variant's aggregate list via a unified iterator.
+    let agg_iter: Box<dyn Iterator<Item = &AggregateSpec>> = match &query.grouping {
+        Some(Grouping::Implicit { aggregates, .. }) => Box::new(aggregates.iter()),
+        Some(Grouping::Explicit { aggregates, .. }) => Box::new(aggregates.iter()),
+        None => Box::new(std::iter::empty()),
+    };
+    for spec in agg_iter {
         if deps.remove(&spec.output_var) {
             if let Some(input_var) = spec.input_var {
                 deps.insert(input_var);
@@ -89,7 +96,9 @@ pub fn compute_variable_deps(query: &Query, options: &QueryOptions) -> Option<Va
     let required_groupby_vars: Vec<VarId> = deps.iter().copied().collect();
 
     // GROUP BY keys must survive.
-    deps.extend(options.group_by.iter().copied());
+    if let Some(Grouping::Explicit { group_by, .. }) = &query.grouping {
+        deps.extend(group_by.iter().copied());
+    }
 
     // deps now contains the full set of WHERE-produced variables needed downstream.
     let required_where_vars: Vec<VarId> = deps.iter().copied().collect();
@@ -130,6 +139,7 @@ mod tests {
             output,
             patterns,
             options: QueryOptions::default(),
+            grouping: None,
             post_values: None,
         }
     }
@@ -141,6 +151,7 @@ mod tests {
             output: QueryOutput::wildcard(),
             patterns,
             options: QueryOptions::default(),
+            grouping: None,
             post_values: None,
         }
     }
@@ -193,15 +204,18 @@ mod tests {
     #[test]
     fn aggregate_replaces_output_with_input_in_where_vars() {
         // SELECT ?city (AVG(?age) AS ?avg) ... GROUP BY ?city
-        let query = make_query(vec![VarId(2), VarId(3)], vec![], SelectMode::Many);
-        let options = QueryOptions::new()
-            .with_group_by(vec![VarId(2)])
-            .with_aggregates(vec![AggregateSpec {
+        let mut query = make_query(vec![VarId(2), VarId(3)], vec![], SelectMode::Many);
+        query.grouping = Some(Grouping::Explicit {
+            group_by: fluree_db_core::NonEmpty::try_from_vec(vec![VarId(2)]).unwrap(),
+            aggregates: vec![AggregateSpec {
                 function: AggregateFn::Avg,
                 input_var: Some(VarId(1)),
                 output_var: VarId(3),
                 distinct: false,
-            }]);
+            }],
+            having: None,
+        });
+        let options = QueryOptions::default();
 
         let deps = compute_variable_deps(&query, &options).unwrap();
         // ?city (group key) and ?age (aggregate input) are WHERE dependencies
@@ -236,13 +250,16 @@ mod tests {
 
     #[test]
     fn having_adds_where_vars() {
-        let query = make_query(vec![VarId(0)], vec![], SelectMode::Many);
-        let options = QueryOptions::new()
-            .with_group_by(vec![VarId(0)])
-            .with_having(Expression::gt(
+        let mut query = make_query(vec![VarId(0)], vec![], SelectMode::Many);
+        query.grouping = Some(Grouping::Explicit {
+            group_by: fluree_db_core::NonEmpty::try_from_vec(vec![VarId(0)]).unwrap(),
+            aggregates: vec![],
+            having: Some(Expression::gt(
                 Expression::Var(VarId(1)),
                 Expression::Const(FlakeValue::Long(10)),
-            ));
+            )),
+        });
+        let options = QueryOptions::default();
 
         let deps = compute_variable_deps(&query, &options).unwrap();
         assert!(deps.required_where_vars.contains(&VarId(0)));
@@ -261,6 +278,7 @@ mod tests {
             )])),
             patterns: vec![],
             options: QueryOptions::default(),
+            grouping: None,
             post_values: None,
         };
 
@@ -281,6 +299,7 @@ mod tests {
             },
             patterns: vec![],
             options: QueryOptions::default(),
+            grouping: None,
             post_values: None,
         }
     }
@@ -392,15 +411,18 @@ mod tests {
     #[test]
     fn variable_deps_with_group_by_and_aggregate() {
         // SELECT ?city (AVG(?age) AS ?avg) WHERE { ... } GROUP BY ?city
-        let query = make_query(vec![VarId(0), VarId(2)], vec![], SelectMode::Many);
-        let options = QueryOptions::new()
-            .with_group_by(vec![VarId(0)])
-            .with_aggregates(vec![AggregateSpec {
+        let mut query = make_query(vec![VarId(0), VarId(2)], vec![], SelectMode::Many);
+        query.grouping = Some(Grouping::Explicit {
+            group_by: fluree_db_core::NonEmpty::try_from_vec(vec![VarId(0)]).unwrap(),
+            aggregates: vec![AggregateSpec {
                 function: AggregateFn::Avg,
                 input_var: Some(VarId(1)),
                 output_var: VarId(2),
                 distinct: false,
-            }]);
+            }],
+            having: None,
+        });
+        let options = QueryOptions::default();
 
         let deps = compute_variable_deps(&query, &options).unwrap();
 
@@ -458,19 +480,21 @@ mod tests {
     fn variable_deps_with_having() {
         // SELECT ?city (COUNT(?p) AS ?cnt) WHERE { ... }
         // GROUP BY ?city HAVING (?cnt > 5)
-        let query = make_query(vec![VarId(0), VarId(2)], vec![], SelectMode::Many);
-        let options = QueryOptions::new()
-            .with_group_by(vec![VarId(0)])
-            .with_aggregates(vec![AggregateSpec {
+        let mut query = make_query(vec![VarId(0), VarId(2)], vec![], SelectMode::Many);
+        query.grouping = Some(Grouping::Explicit {
+            group_by: fluree_db_core::NonEmpty::try_from_vec(vec![VarId(0)]).unwrap(),
+            aggregates: vec![AggregateSpec {
                 function: AggregateFn::Count,
                 input_var: Some(VarId(1)),
                 output_var: VarId(2),
                 distinct: false,
-            }])
-            .with_having(Expression::gt(
+            }],
+            having: Some(Expression::gt(
                 Expression::Var(VarId(2)),
                 Expression::Const(FlakeValue::Long(5)),
-            ));
+            )),
+        });
+        let options = QueryOptions::default();
 
         let deps = compute_variable_deps(&query, &options).unwrap();
 

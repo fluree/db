@@ -33,6 +33,7 @@ impl<E: IriEncoder> LoweringContext<'_, E> {
             output: QueryOutput::Ask,
             patterns,
             options,
+            grouping: None,
             post_values: None,
         })
     }

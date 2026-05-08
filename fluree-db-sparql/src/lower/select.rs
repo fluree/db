@@ -33,11 +33,21 @@ pub(super) struct SelectBinds {
 
 /// Result of lowering solution modifiers.
 pub(super) struct LoweredModifiers {
-    /// Query options (GROUP BY vars, aggregates, HAVING, ORDER BY, LIMIT, OFFSET)
+    /// Query options (ORDER BY, LIMIT, OFFSET, post-binds).
     pub options: QueryOptions,
     /// Whether the SELECT carried `DISTINCT`. Lifted into the resulting
     /// [`QueryOutput::Select::restriction`] by the caller.
     pub distinct: bool,
+    /// GROUP BY variables. Empty when the surface SELECT had no `GROUP BY`
+    /// and no implied grouping was derived. Lifted into `Query.grouping`
+    /// by the caller.
+    pub group_by: Vec<VarId>,
+    /// Aggregate specs computed per group (or once if `group_by` is empty
+    /// and `aggregates` is non-empty — implicit single-group aggregation).
+    pub aggregates: Vec<AggregateSpec>,
+    /// HAVING expression (post-lift — aggregate calls have been hoisted into
+    /// `aggregates` with synthetic output variables, and this references them).
+    pub having: Option<Expression>,
     /// Pre-GROUP-BY BIND patterns for expression-based GROUP BY conditions.
     /// These must be injected into the WHERE pattern list before query building.
     pub pre_group_binds: Vec<Pattern>,
@@ -128,6 +138,9 @@ impl<E: IriEncoder> LoweringContext<'_, E> {
     ) -> Result<LoweredModifiers> {
         let mut options = QueryOptions::default();
         let distinct = select.modifier == Some(SelectModifier::Distinct);
+        let mut group_by: Vec<VarId> = Vec::new();
+        let mut aggregates: Vec<AggregateSpec> = Vec::new();
+        let mut having: Option<Expression> = None;
         let mut pre_group_binds = Vec::new();
 
         // LIMIT, OFFSET, ORDER BY
@@ -136,24 +149,24 @@ impl<E: IriEncoder> LoweringContext<'_, E> {
         // GROUP BY — supports both variables and expressions.
         // Expression GROUP BY like `GROUP BY (expr AS ?alias)` desugars to
         // a pre-group BIND pattern + GROUP BY on the alias variable.
-        if let Some(ref group_by) = modifiers.group_by {
-            let mut group_vars = Vec::with_capacity(group_by.conditions.len());
-            for cond in &group_by.conditions {
+        if let Some(ref group_by_clause) = modifiers.group_by {
+            let mut group_vars = Vec::with_capacity(group_by_clause.conditions.len());
+            for cond in &group_by_clause.conditions {
                 let (var_id, bind_pattern) = self.lower_group_condition(cond)?;
                 group_vars.push(var_id);
                 if let Some(pattern) = bind_pattern {
                     pre_group_binds.push(pattern);
                 }
             }
-            options.group_by = group_vars;
+            group_by = group_vars;
         }
 
         // HAVING (may reference aggregate expressions)
         let mut having_aggregates: Vec<AggregateSpec> = Vec::new();
-        if let Some(ref having) = modifiers.having {
+        if let Some(ref having_clause) = modifiers.having {
             let mut aggregate_aliases = self.build_aggregate_aliases(select)?;
             let mut having_pre_binds: Vec<Pattern> = Vec::new();
-            for cond in &having.conditions {
+            for cond in &having_clause.conditions {
                 self.collect_having_aggregates(
                     cond,
                     &mut aggregate_aliases,
@@ -163,29 +176,32 @@ impl<E: IriEncoder> LoweringContext<'_, E> {
             }
             self.aggregate_aliases = Some(aggregate_aliases);
             // Combine all HAVING conditions with AND
-            let filter = self.lower_having_conditions(&having.conditions)?;
-            options.having = Some(filter);
+            let filter = self.lower_having_conditions(&having_clause.conditions)?;
+            having = Some(filter);
             self.aggregate_aliases = None;
             pre_group_binds.extend(having_pre_binds);
         }
 
         // Extract aggregates from SELECT clause
         let (select_aggregates, select_agg_binds) = self.extract_aggregates(select)?;
-        options.aggregates = select_aggregates;
+        aggregates = select_aggregates;
         pre_group_binds.extend(select_agg_binds);
         if !having_aggregates.is_empty() {
-            options.aggregates.extend(having_aggregates);
+            aggregates.extend(having_aggregates);
         }
 
         // Auto-populate GROUP BY when aggregates present but no explicit GROUP BY
         // Per SPARQL semantics, all non-aggregated SELECT variables must be in GROUP BY
-        if !options.aggregates.is_empty() && options.group_by.is_empty() {
-            options.group_by = self.collect_non_aggregate_select_vars(select);
+        if !aggregates.is_empty() && group_by.is_empty() {
+            group_by = self.collect_non_aggregate_select_vars(select);
         }
 
         Ok(LoweredModifiers {
             options,
             distinct,
+            group_by,
+            aggregates,
+            having,
             pre_group_binds,
         })
     }
@@ -398,11 +414,20 @@ impl<E: IriEncoder> LoweringContext<'_, E> {
             group_vars = self.collect_non_aggregate_select_vars(&select_clause);
         }
 
-        if !group_vars.is_empty() {
-            sq = sq.with_group_by(group_vars);
-        }
-        if !aggregates.is_empty() {
-            sq = sq.with_aggregates(aggregates);
+        // Lift GROUP BY / aggregates / HAVING into the SubqueryPattern's
+        // grouping phase. Subselect HAVING isn't lowered here (its surface
+        // syntax is captured upstream and would require its own lowering).
+        if let Some(group_by) = fluree_db_core::NonEmpty::try_from_vec(group_vars) {
+            sq = sq.with_grouping(fluree_db_query::ir::Grouping::Explicit {
+                group_by,
+                aggregates,
+                having: None,
+            });
+        } else if let Some(aggregates) = fluree_db_core::NonEmpty::try_from_vec(aggregates) {
+            sq = sq.with_grouping(fluree_db_query::ir::Grouping::Implicit {
+                aggregates,
+                having: None,
+            });
         }
 
         // Apply LIMIT

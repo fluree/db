@@ -19,8 +19,8 @@ use crate::context::WellKnownDatatypes;
 use crate::ir::triple::{Ref, Term, TriplePattern};
 use crate::ir::QueryOptions;
 use crate::ir::{
-    Column, ConstructTemplate, ForwardItem, HydrationSpec, NestedSelectSpec, Projection, Query,
-    QueryOutput, Restriction, Root,
+    Column, ConstructTemplate, ForwardItem, Grouping, HydrationSpec, NestedSelectSpec, Projection,
+    Query, QueryOutput, Restriction, Root,
 };
 use crate::ir::{
     Expression, Function, IndexSearchPattern, IndexSearchTarget, PathModifier, Pattern,
@@ -30,7 +30,7 @@ use crate::sort::{SortDirection, SortSpec};
 use crate::var_registry::{VarId, VarRegistry};
 use crate::vector::DistanceMetric;
 use fluree_db_core::DatatypeConstraint;
-use fluree_db_core::{FlakeValue, Sid};
+use fluree_db_core::{FlakeValue, NonEmpty, Sid};
 #[cfg(test)]
 use fluree_graph_json_ld::ParsedContext;
 use std::sync::Arc;
@@ -93,8 +93,9 @@ pub(crate) fn lower_query<E: IriEncoder>(
         patterns.extend(lowered);
     }
 
-    // Lower options
+    // Lower options and grouping (the aggregation phase is its own axis)
     let options = lower_options(&ast.options, vars)?;
+    let grouping = lower_grouping(&ast.options, vars)?;
 
     // Build QueryOutput from mode + lowered components. The parser guarantees
     // `selectOne` and `selectDistinct` are mutually exclusive (if-else dispatch
@@ -124,6 +125,7 @@ pub(crate) fn lower_query<E: IriEncoder>(
         orig_context: ast.orig_context,
         output,
         patterns,
+        grouping,
         options,
         post_values: None,
     })
@@ -1054,25 +1056,7 @@ fn lower_subquery<E: IriEncoder>(
     }
 
     // GROUP BY / aggregates / HAVING (needed for subqueries used in filters/unions)
-    if !subquery.options.group_by.is_empty() {
-        sq.group_by = subquery
-            .options
-            .group_by
-            .iter()
-            .map(|v| vars.get_or_insert(v))
-            .collect();
-    }
-    if !subquery.options.aggregates.is_empty() {
-        sq.aggregates = subquery
-            .options
-            .aggregates
-            .iter()
-            .map(|a| lower_aggregate_spec(a, vars))
-            .collect();
-    }
-    if let Some(ref having) = subquery.options.having {
-        sq.having = Some(lower_filter_expr(having, vars)?);
-    }
+    sq.grouping = lower_grouping(&subquery.options, vars)?;
 
     Ok(sq)
 }
@@ -1546,25 +1530,49 @@ fn lower_options(opts: &UnresolvedOptions, vars: &mut VarRegistry) -> Result<Que
             .iter()
             .map(|s| lower_sort_spec(s, vars))
             .collect(),
-        group_by: opts
-            .group_by
-            .iter()
-            .map(|v| vars.get_or_insert(v))
-            .collect(),
-        aggregates: opts
-            .aggregates
-            .iter()
-            .map(|a| lower_aggregate_spec(a, vars))
-            .collect(),
-        having: opts
-            .having
-            .as_ref()
-            .map(|e| lower_filter_expr(e, vars))
-            .transpose()?,
         post_binds: Vec::new(),
         reasoning,
         schema_bundle: None,
     })
+}
+
+/// Lower the unresolved aggregation surface (GROUP BY / aggregates / HAVING)
+/// into the structural `Grouping` IR. Returns `None` when there is no
+/// aggregation phase at all (no GROUP BY, no aggregates, no HAVING).
+fn lower_grouping(
+    opts: &UnresolvedOptions,
+    vars: &mut VarRegistry,
+) -> Result<Option<Grouping>> {
+    let group_by: Vec<VarId> = opts
+        .group_by
+        .iter()
+        .map(|v| vars.get_or_insert(v))
+        .collect();
+    let aggregates: Vec<AggregateSpec> = opts
+        .aggregates
+        .iter()
+        .map(|a| lower_aggregate_spec(a, vars))
+        .collect();
+    let having = opts
+        .having
+        .as_ref()
+        .map(|e| lower_filter_expr(e, vars))
+        .transpose()?;
+
+    if let Some(group_by) = NonEmpty::try_from_vec(group_by) {
+        Ok(Some(Grouping::Explicit {
+            group_by,
+            aggregates,
+            having,
+        }))
+    } else if let Some(aggregates) = NonEmpty::try_from_vec(aggregates) {
+        Ok(Some(Grouping::Implicit { aggregates, having }))
+    } else {
+        // No GROUP BY, no aggregates: the parser should reject HAVING in this
+        // shape, so any leftover `having` here is dropped — the validator's
+        // job, not ours.
+        Ok(None)
+    }
 }
 
 #[cfg(test)]

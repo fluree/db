@@ -310,22 +310,26 @@ impl SubqueryOperator {
         )?;
 
         // Apply GROUP BY / aggregates / HAVING for subqueries that use them.
-        let needs_grouping =
-            !self.subquery.group_by.is_empty() || !self.subquery.aggregates.is_empty();
-        if needs_grouping {
-            operator = Box::new(GroupByOperator::new(
-                operator,
-                self.subquery.group_by.clone(),
-            ));
-        }
-        if !self.subquery.aggregates.is_empty() {
-            operator = Box::new(AggregateOperator::new(
-                operator,
-                self.subquery.aggregates.clone(),
-            ));
-        }
-        if let Some(ref having) = self.subquery.having {
-            operator = Box::new(HavingOperator::new(operator, having.clone()));
+        if let Some(grouping) = &self.subquery.grouping {
+            let (group_by, aggregates, having) = match grouping {
+                crate::ir::Grouping::Implicit { aggregates, having } => (
+                    Vec::new(),
+                    aggregates.iter().cloned().collect::<Vec<_>>(),
+                    having.clone(),
+                ),
+                crate::ir::Grouping::Explicit {
+                    group_by,
+                    aggregates,
+                    having,
+                } => (group_by.iter().copied().collect(), aggregates.clone(), having.clone()),
+            };
+            operator = Box::new(GroupByOperator::new(operator, group_by));
+            if !aggregates.is_empty() {
+                operator = Box::new(AggregateOperator::new(operator, aggregates));
+            }
+            if let Some(having) = having {
+                operator = Box::new(HavingOperator::new(operator, having));
+            }
         }
 
         // Project to subquery select list before DISTINCT/ORDER BY/OFFSET/LIMIT so those modifiers

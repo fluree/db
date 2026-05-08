@@ -11,7 +11,6 @@
 use std::sync::Arc;
 
 use super::expression::Expression;
-use crate::aggregate::AggregateSpec;
 use crate::schema_bundle::SchemaBundleFlakes;
 use crate::sort::SortSpec;
 use crate::var_registry::VarId;
@@ -339,10 +338,11 @@ impl ReasoningModes {
     }
 }
 
-/// Options for query execution modifiers
+/// Solution-modifier options applied after the WHERE and grouping phases.
 ///
-/// Controls GROUP BY, HAVING, ORDER BY, OFFSET, LIMIT, and reasoning behavior.
-/// Embedded in [`Query`](super::Query) and consumed by the planner / executor.
+/// Controls ORDER BY, OFFSET, LIMIT, post-aggregation binds, and reasoning
+/// configuration. Embedded in [`Query`](super::Query) and consumed by the
+/// planner and executor.
 #[derive(Debug, Clone, Default)]
 pub struct QueryOptions {
     /// Maximum rows to return (applied last)
@@ -351,12 +351,6 @@ pub struct QueryOptions {
     pub offset: Option<usize>,
     /// Sort specifications (applied before projection)
     pub order_by: Vec<SortSpec>,
-    /// GROUP BY variables (applied after WHERE, before aggregates)
-    pub group_by: Vec<VarId>,
-    /// Aggregate specifications (applied after GROUP BY)
-    pub aggregates: Vec<AggregateSpec>,
-    /// HAVING filter expression (applied after aggregates)
-    pub having: Option<Expression>,
     /// Post-aggregation BIND expressions (applied after HAVING)
     pub post_binds: Vec<(VarId, Expression)>,
     /// Reasoning modes for RDFS/OWL reasoning
@@ -403,24 +397,6 @@ impl QueryOptions {
         self
     }
 
-    /// Set GROUP BY variables
-    pub fn with_group_by(mut self, vars: Vec<VarId>) -> Self {
-        self.group_by = vars;
-        self
-    }
-
-    /// Set aggregate specifications
-    pub fn with_aggregates(mut self, specs: Vec<AggregateSpec>) -> Self {
-        self.aggregates = specs;
-        self
-    }
-
-    /// Set HAVING filter expression
-    pub fn with_having(mut self, expr: Expression) -> Self {
-        self.having = Some(expr);
-        self
-    }
-
     /// Set reasoning modes
     ///
     /// # Example
@@ -452,9 +428,6 @@ impl QueryOptions {
         self.limit.is_some()
             || self.offset.is_some()
             || !self.order_by.is_empty()
-            || !self.group_by.is_empty()
-            || !self.aggregates.is_empty()
-            || self.having.is_some()
             || !self.post_binds.is_empty()
     }
 
@@ -483,9 +456,7 @@ mod tests {
         assert!(opts.limit.is_none());
         assert!(opts.offset.is_none());
         assert!(opts.order_by.is_empty());
-        assert!(opts.group_by.is_empty());
-        assert!(opts.aggregates.is_empty());
-        assert!(opts.having.is_none());
+        assert!(opts.post_binds.is_empty());
         // Default reasoning: nothing explicitly enabled
         assert!(!opts.has_reasoning());
         assert!(!opts.is_reasoning_disabled());
