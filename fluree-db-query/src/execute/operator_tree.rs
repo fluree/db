@@ -816,10 +816,7 @@ fn detect_sum_strlen_group_concat_subquery(
     else {
         return None;
     };
-    if sq_group_by.len() != 1 {
-        return None;
-    }
-    if sq_aggregates.len() != 1 {
+    if !sq_binds.is_empty() || sq_group_by.len() != 1 || sq_aggregates.len() != 1 {
         return None;
     }
     let inner_agg = sq_aggregates.first();

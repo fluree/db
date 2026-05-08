@@ -335,8 +335,8 @@ impl SubqueryOperator {
         if self.subquery.distinct {
             operator = Box::new(DistinctOperator::new(operator));
         }
-        if !self.subquery.order_by.is_empty() {
-            operator = Box::new(SortOperator::new(operator, self.subquery.order_by.clone()));
+        if !self.subquery.ordering.is_empty() {
+            operator = Box::new(SortOperator::new(operator, self.subquery.ordering.clone()));
         }
         if let Some(offset) = self.subquery.offset {
             operator = Box::new(OffsetOperator::new(operator, offset));

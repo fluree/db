@@ -463,7 +463,7 @@ impl<E: IriEncoder> LoweringContext<'_, E> {
                     direction,
                 });
             }
-            sq = sq.with_order_by(sort_specs);
+            sq = sq.with_ordering(sort_specs);
         }
 
         Ok(vec![Pattern::Subquery(sq)])

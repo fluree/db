@@ -209,7 +209,7 @@ impl<E: IriEncoder> LoweringContext<'_, E> {
 
         subq.limit = limit;
         subq.offset = offset;
-        subq.order_by = ordering;
+        subq.ordering = ordering;
         Ok(())
     }
 }

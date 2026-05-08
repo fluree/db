@@ -1058,7 +1058,7 @@ fn lower_subquery<E: IriEncoder>(
             .iter()
             .map(|s| lower_sort_spec(s, vars))
             .collect();
-        sq = sq.with_order_by(sort_specs);
+        sq = sq.with_ordering(sort_specs);
     }
 
     // GROUP BY / aggregates / HAVING (needed for subqueries used in filters/unions)

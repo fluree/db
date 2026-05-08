@@ -2236,9 +2236,9 @@ mod tests {
 
         // Check the subquery has order_by
         if let Pattern::Subquery(sq) = &query.patterns[1] {
-            assert_eq!(sq.order_by.len(), 1, "Expected 1 ORDER BY spec");
+            assert_eq!(sq.ordering.len(), 1, "Expected 1 ORDER BY spec");
             assert_eq!(
-                sq.order_by[0].direction,
+                sq.ordering[0].direction,
                 SortDirection::Ascending,
                 "Expected ascending order"
             );
@@ -2260,9 +2260,9 @@ mod tests {
 
         // Check the subquery has order_by with descending direction
         if let Pattern::Subquery(sq) = &query.patterns[1] {
-            assert_eq!(sq.order_by.len(), 1, "Expected 1 ORDER BY spec");
+            assert_eq!(sq.ordering.len(), 1, "Expected 1 ORDER BY spec");
             assert_eq!(
-                sq.order_by[0].direction,
+                sq.ordering[0].direction,
                 SortDirection::Descending,
                 "Expected descending order"
             );
@@ -2284,14 +2284,14 @@ mod tests {
 
         // Check the subquery has multiple order_by specs
         if let Pattern::Subquery(sq) = &query.patterns[1] {
-            assert_eq!(sq.order_by.len(), 2, "Expected 2 ORDER BY specs");
+            assert_eq!(sq.ordering.len(), 2, "Expected 2 ORDER BY specs");
             assert_eq!(
-                sq.order_by[0].direction,
+                sq.ordering[0].direction,
                 SortDirection::Ascending,
                 "First should be ascending"
             );
             assert_eq!(
-                sq.order_by[1].direction,
+                sq.ordering[1].direction,
                 SortDirection::Descending,
                 "Second should be descending"
             );

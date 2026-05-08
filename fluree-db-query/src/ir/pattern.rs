@@ -33,8 +33,8 @@ pub struct SubqueryPattern {
     pub offset: Option<usize>,
     /// Whether to apply DISTINCT to results
     pub distinct: bool,
-    /// ORDER BY specifications
-    pub order_by: Vec<SortSpec>,
+    /// ORDER BY specs. Empty when the subquery is unordered.
+    pub ordering: Vec<SortSpec>,
     /// Optional aggregation phase (GROUP BY / aggregates / HAVING).
     pub grouping: Option<Grouping>,
 }
@@ -48,7 +48,7 @@ impl SubqueryPattern {
             limit: None,
             offset: None,
             distinct: false,
-            order_by: Vec::new(),
+            ordering: Vec::new(),
             grouping: None,
         }
     }
@@ -71,9 +71,9 @@ impl SubqueryPattern {
         self
     }
 
-    /// Set ORDER BY specifications
-    pub fn with_order_by(mut self, specs: Vec<SortSpec>) -> Self {
-        self.order_by = specs;
+    /// Set ORDER BY specs.
+    pub fn with_ordering(mut self, specs: Vec<SortSpec>) -> Self {
+        self.ordering = specs;
         self
     }
 
