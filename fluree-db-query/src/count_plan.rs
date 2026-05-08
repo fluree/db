@@ -16,7 +16,6 @@
 use crate::execute::operator_tree::{detect_count_all_aggregate, validate_simple_triple};
 use crate::ir::triple::Ref;
 use crate::ir::Query;
-use crate::ir::QueryOptions;
 use crate::ir::{Expression, Pattern};
 use crate::var_registry::VarId;
 
@@ -201,8 +200,8 @@ pub(crate) struct CountPlan {
 ///
 /// Gate: ungrouped `COUNT(*)`, no DISTINCT, no HAVING, no ORDER BY, no LIMIT/OFFSET.
 /// Runtime gating (binary-index store, HEAD query, root policy) happens in the executor.
-pub(crate) fn try_build_count_plan(query: &Query, options: &QueryOptions) -> Option<CountPlan> {
-    let out_var = detect_count_all_aggregate(query, options)?;
+pub(crate) fn try_build_count_plan(query: &Query) -> Option<CountPlan> {
+    let out_var = detect_count_all_aggregate(query)?;
 
     // Classify all patterns in the WHERE clause.
     let classified = classify_patterns(&query.patterns)?;
@@ -944,7 +943,7 @@ mod tests {
     use super::*;
     use crate::ir::AggregateFn;
     use crate::ir::triple::{Term, TriplePattern};
-    use crate::ir::QueryOutput;
+    use crate::ir::{QueryOptions, QueryOutput};
     use crate::var_registry::VarRegistry;
     use fluree_db_core::Sid;
     use fluree_graph_json_ld::ParsedContext;
@@ -953,8 +952,7 @@ mod tests {
         Ref::Sid(Sid::new(id, name))
     }
 
-    fn make_query(patterns: Vec<Pattern>, out_var: VarId) -> (Query, QueryOptions) {
-        let options = QueryOptions::default();
+    fn make_query(patterns: Vec<Pattern>, out_var: VarId) -> Query {
         let grouping = Some(crate::ir::Grouping::Implicit {
             aggregation: crate::ir::Aggregation {
                 aggregates: fluree_db_core::NonEmpty::try_from_vec(vec![
@@ -977,10 +975,12 @@ mod tests {
             patterns,
             grouping,
             ordering: Vec::new(),
-            options: options.clone(),
+            limit: None,
+            offset: None,
+            options: QueryOptions::default(),
             post_values: None,
         };
-        (query, options)
+        query
     }
 
     #[test]
@@ -999,8 +999,8 @@ mod tests {
             Pattern::Triple(TriplePattern::new(Ref::Var(s), p2.clone(), Term::Var(o2))),
         ];
 
-        let (query, options) = make_query(patterns, count);
-        let plan = try_build_count_plan(&query, &options);
+        let query = make_query(patterns, count);
+        let plan = try_build_count_plan(&query);
         assert!(plan.is_some(), "Should detect star join");
 
         let plan = plan.unwrap();
@@ -1029,8 +1029,8 @@ mod tests {
             Term::Var(o),
         ))];
 
-        let (query, options) = make_query(patterns, count);
-        let plan = try_build_count_plan(&query, &options);
+        let query = make_query(patterns, count);
+        let plan = try_build_count_plan(&query);
         assert!(plan.is_some());
 
         match &plan.unwrap().root {
@@ -1055,8 +1055,8 @@ mod tests {
             Pattern::Triple(TriplePattern::new(Ref::Var(b), p2.clone(), Term::Var(c))),
         ];
 
-        let (query, options) = make_query(patterns, count);
-        let plan = try_build_count_plan(&query, &options);
+        let query = make_query(patterns, count);
+        let plan = try_build_count_plan(&query);
         assert!(plan.is_some(), "Should detect chain");
 
         match &plan.unwrap().root {
@@ -1088,8 +1088,8 @@ mod tests {
             ))]),
         ];
 
-        let (query, options) = make_query(patterns, count);
-        let plan = try_build_count_plan(&query, &options);
+        let query = make_query(patterns, count);
+        let plan = try_build_count_plan(&query);
         assert!(plan.is_some(), "Should detect star + OPTIONAL");
 
         match &plan.unwrap().root {
@@ -1127,8 +1127,8 @@ mod tests {
             ))]),
         ];
 
-        let (query, options) = make_query(patterns, count);
-        let plan = try_build_count_plan(&query, &options);
+        let query = make_query(patterns, count);
+        let plan = try_build_count_plan(&query);
         assert!(plan.is_some(), "Should detect star + MINUS");
 
         match &plan.unwrap().root {
@@ -1166,8 +1166,8 @@ mod tests {
             }),
         ];
 
-        let (query, options) = make_query(patterns, count);
-        let plan = try_build_count_plan(&query, &options);
+        let query = make_query(patterns, count);
+        let plan = try_build_count_plan(&query);
         assert!(plan.is_some(), "Should detect star + EXISTS");
 
         match &plan.unwrap().root {
@@ -1207,8 +1207,8 @@ mod tests {
             }),
         ];
 
-        let (query, options) = make_query(patterns, count);
-        let plan = try_build_count_plan(&query, &options);
+        let query = make_query(patterns, count);
+        let plan = try_build_count_plan(&query);
         assert!(plan.is_some(), "Should detect single + NOT EXISTS");
 
         match &plan.unwrap().root {
@@ -1250,8 +1250,8 @@ mod tests {
             }),
         ];
 
-        let (query, options) = make_query(patterns, count);
-        let plan = try_build_count_plan(&query, &options);
+        let query = make_query(patterns, count);
+        let plan = try_build_count_plan(&query);
         assert!(plan.is_some(), "Should detect single + EXISTS-star");
 
         match &plan.unwrap().root {
@@ -1298,8 +1298,8 @@ mod tests {
             ))]),
         ];
 
-        let (query, options) = make_query(patterns, count);
-        let plan = try_build_count_plan(&query, &options);
+        let query = make_query(patterns, count);
+        let plan = try_build_count_plan(&query);
         assert!(plan.is_some(), "Should detect single + OPTIONAL + MINUS");
 
         // Expected: Sum(AntiJoin(OptionalJoin(Scan, [Scan]), SubjectSet))
@@ -1338,8 +1338,8 @@ mod tests {
             ))]),
         ];
 
-        let (query, options) = make_query(patterns, count);
-        let plan = try_build_count_plan(&query, &options);
+        let query = make_query(patterns, count);
+        let plan = try_build_count_plan(&query);
         assert!(plan.is_some(), "Should detect chain + OPTIONAL tail");
 
         match &plan.unwrap().root {
@@ -1375,8 +1375,8 @@ mod tests {
             ))]),
         ];
 
-        let (query, options) = make_query(patterns, count);
-        let plan = try_build_count_plan(&query, &options);
+        let query = make_query(patterns, count);
+        let plan = try_build_count_plan(&query);
         assert!(plan.is_some(), "Should detect chain + MINUS tail");
 
         match &plan.unwrap().root {
@@ -1415,8 +1415,8 @@ mod tests {
             }),
         ];
 
-        let (query, options) = make_query(patterns, count);
-        let plan = try_build_count_plan(&query, &options);
+        let query = make_query(patterns, count);
+        let plan = try_build_count_plan(&query);
         assert!(plan.is_some(), "Should detect chain + EXISTS tail");
 
         match &plan.unwrap().root {
@@ -1455,8 +1455,8 @@ mod tests {
             }),
         ];
 
-        let (query, options) = make_query(patterns, count);
-        let plan = try_build_count_plan(&query, &options);
+        let query = make_query(patterns, count);
+        let plan = try_build_count_plan(&query);
         assert!(plan.is_some(), "Should detect chain + NOT EXISTS tail");
 
         match &plan.unwrap().root {
@@ -1494,9 +1494,9 @@ mod tests {
             ))]),
         ];
 
-        let (query, options) = make_query(patterns, count);
+        let query = make_query(patterns, count);
         assert!(
-            try_build_count_plan(&query, &options).is_none(),
+            try_build_count_plan(&query).is_none(),
             "Chain + modifier on non-tail var should be rejected"
         );
     }
@@ -1523,8 +1523,8 @@ mod tests {
             ]),
         ];
 
-        let (query, options) = make_query(patterns, count);
-        let plan = try_build_count_plan(&query, &options);
+        let query = make_query(patterns, count);
+        let plan = try_build_count_plan(&query);
         assert!(plan.is_some(), "Should detect single + MINUS(star)");
 
         match &plan.unwrap().root {
@@ -1557,8 +1557,8 @@ mod tests {
             Term::Var(s), // self-loop
         ))];
 
-        let (query, options) = make_query(patterns, count);
-        assert!(try_build_count_plan(&query, &options).is_none());
+        let query = make_query(patterns, count);
+        assert!(try_build_count_plan(&query).is_none());
     }
 
     #[test]
@@ -1577,8 +1577,8 @@ mod tests {
             },
         ];
 
-        let (query, options) = make_query(patterns, count);
-        assert!(try_build_count_plan(&query, &options).is_none());
+        let query = make_query(patterns, count);
+        assert!(try_build_count_plan(&query).is_none());
     }
 
     // =======================================================================
@@ -1606,8 +1606,8 @@ mod tests {
             ))]),
         ];
 
-        let (query, options) = make_query(patterns, count);
-        let plan = try_build_count_plan(&query, &options);
+        let query = make_query(patterns, count);
+        let plan = try_build_count_plan(&query);
         assert!(plan.is_some(), "Should detect object-chain EXISTS");
         match &plan.unwrap().root {
             CountPlanRoot::Scalar(ScalarNode::PostObjectFilteredSum {
@@ -1639,8 +1639,8 @@ mod tests {
             ))]),
         ];
 
-        let (query, options) = make_query(patterns, count);
-        let plan = try_build_count_plan(&query, &options);
+        let query = make_query(patterns, count);
+        let plan = try_build_count_plan(&query);
         assert!(plan.is_some(), "Should detect object-chain MINUS");
         match &plan.unwrap().root {
             CountPlanRoot::Scalar(ScalarNode::TotalMinusPostObjectFilteredSum {
@@ -1675,8 +1675,8 @@ mod tests {
             ]),
         ];
 
-        let (query, options) = make_query(patterns, count);
-        let plan = try_build_count_plan(&query, &options);
+        let query = make_query(patterns, count);
+        let plan = try_build_count_plan(&query);
         assert!(plan.is_some(), "Should detect 2-hop object-chain EXISTS");
         match &plan.unwrap().root {
             CountPlanRoot::Scalar(ScalarNode::PostObjectFilteredSum {
@@ -1713,8 +1713,8 @@ mod tests {
             ]),
         ];
 
-        let (query, options) = make_query(patterns, count);
-        let plan = try_build_count_plan(&query, &options);
+        let query = make_query(patterns, count);
+        let plan = try_build_count_plan(&query);
         assert!(plan.is_some(), "Should detect 2-hop object-chain MINUS");
         match &plan.unwrap().root {
             CountPlanRoot::Scalar(ScalarNode::TotalMinusPostObjectFilteredSum { .. }) => {}
@@ -1743,8 +1743,8 @@ mod tests {
             ))]),
         ];
 
-        let (query, options) = make_query(patterns, count);
-        let plan = try_build_count_plan(&query, &options);
+        let query = make_query(patterns, count);
+        let plan = try_build_count_plan(&query);
         assert!(plan.is_some(), "Should detect object-chain NOT EXISTS");
         match &plan.unwrap().root {
             CountPlanRoot::Scalar(ScalarNode::TotalMinusPostObjectFilteredSum { .. }) => {}
@@ -1774,8 +1774,8 @@ mod tests {
             ]),
         ];
 
-        let (query, options) = make_query(patterns, count);
-        let plan = try_build_count_plan(&query, &options);
+        let query = make_query(patterns, count);
+        let plan = try_build_count_plan(&query);
         assert!(plan.is_some(), "Should detect star-on-object EXISTS");
         match &plan.unwrap().root {
             CountPlanRoot::Scalar(ScalarNode::PostObjectFilteredSum {

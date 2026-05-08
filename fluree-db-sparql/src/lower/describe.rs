@@ -21,6 +21,7 @@ use fluree_db_query::ir::{
 use fluree_db_query::parse::encode::IriEncoder;
 use fluree_db_query::var_registry::VarId;
 
+use super::select::BaseModifiers;
 use super::{LowerError, LoweringContext, Result};
 
 impl<E: IriEncoder> LoweringContext<'_, E> {
@@ -143,6 +144,8 @@ impl<E: IriEncoder> LoweringContext<'_, E> {
             options: QueryOptions::default(),
             grouping: None,
             ordering: Vec::new(),
+            limit: None,
+            offset: None,
             post_values: None,
         })
     }
@@ -188,8 +191,11 @@ impl<E: IriEncoder> LoweringContext<'_, E> {
             ));
         }
 
-        let mut opts = QueryOptions::default();
-        let ordering = self.lower_base_modifiers(modifiers, &mut opts)?;
+        let BaseModifiers {
+            limit,
+            offset,
+            ordering,
+        } = self.lower_base_modifiers(modifiers)?;
 
         // For simplicity and predictable performance, require ORDER BY vars to be part of the subquery select list.
         for spec in &ordering {
@@ -201,8 +207,8 @@ impl<E: IriEncoder> LoweringContext<'_, E> {
             }
         }
 
-        subq.limit = opts.limit;
-        subq.offset = opts.offset;
+        subq.limit = limit;
+        subq.offset = offset;
         subq.order_by = ordering;
         Ok(())
     }

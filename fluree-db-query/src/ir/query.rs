@@ -5,9 +5,10 @@
 //! captures the result-shape decision (SELECT, ASK, CONSTRUCT). `patterns`
 //! holds the WHERE clause IR. `grouping` carries the optional aggregation
 //! phase (GROUP BY / aggregates / HAVING). `ordering` carries the ORDER BY
-//! sort specs. `options` carries the remaining solution modifiers (limit,
-//! offset, reasoning configuration). Hydration formatting lives inside the
-//! `Column::Hydration` variant on the SELECT projection.
+//! sort specs. `limit` and `offset` are the slicing modifiers applied last.
+//! `options` carries the reasoning configuration the rewriter consumes.
+//! Hydration formatting lives inside the `Column::Hydration` variant on the
+//! SELECT projection.
 
 use std::collections::HashSet;
 
@@ -238,8 +239,12 @@ pub struct Query {
     /// ORDER BY specs applied after grouping. Empty when the query is
     /// unordered.
     pub ordering: Vec<SortSpec>,
-    /// Remaining solution modifiers and reasoning configuration (limit,
-    /// offset, reasoning modes, schema bundle).
+    /// Maximum rows to return (applied last). `None` is unbounded;
+    /// `Some(0)` is a legitimate "return nothing" some fast-paths bail on.
+    pub limit: Option<usize>,
+    /// Rows to skip before returning results. `None` is no skip.
+    pub offset: Option<usize>,
+    /// Reasoning configuration (RDFS/OWL/datalog modes, schema bundle).
     pub options: QueryOptions,
     /// Post-query VALUES clause (SPARQL `ValuesClause` after `SolutionModifier`).
     ///
@@ -259,6 +264,8 @@ impl Query {
             patterns: Vec::new(),
             grouping: None,
             ordering: Vec::new(),
+            limit: None,
+            offset: None,
             options: QueryOptions::default(),
             post_values: None,
         }
@@ -276,6 +283,8 @@ impl Query {
             patterns,
             grouping: self.grouping.clone(),
             ordering: self.ordering.clone(),
+            limit: self.limit,
+            offset: self.offset,
             options: self.options.clone(),
             post_values: self.post_values.clone(),
         }

@@ -47,7 +47,6 @@ use crate::ir::triple::{Ref, Term, TriplePattern};
 use crate::ir::Aggregation;
 use crate::ir::Expression;
 use crate::ir::Grouping;
-use crate::ir::QueryOptions;
 use crate::ir::{PathModifier, Pattern};
 use crate::ir::{Query, QueryOutput};
 use crate::limit::LimitOperator;
@@ -128,15 +127,14 @@ struct StarConstOrderTopKSpec {
 /// - SELECT DISTINCT of exactly `(?s, ?label)` plus `ORDER BY ?label LIMIT k`
 fn detect_star_const_numeric_label_order_limit(
     query: &Query,
-    options: &QueryOptions,
 ) -> Option<StarConstOrderTopKSpec> {
     if !query.output.is_distinct()
-        || options.offset.is_some()
+        || query.offset.is_some()
         || query.grouping.is_some()
     {
         return None;
     }
-    let limit = options.limit?;
+    let limit = query.limit?;
     if limit == 0 {
         return None;
     }
@@ -307,10 +305,10 @@ struct LabelRegexTypeSpec {
 /// Detect:
 /// `?s rdfs:label ?label . ?s rdf:type <Class> . FILTER regex(?label, "pat"[, "flags"])`
 /// with plain SELECT of exactly `(?s, ?label)` (no ORDER BY/LIMIT/DISTINCT).
-fn detect_label_regex_type(query: &Query, options: &QueryOptions) -> Option<LabelRegexTypeSpec> {
+fn detect_label_regex_type(query: &Query) -> Option<LabelRegexTypeSpec> {
     if query.output.is_distinct()
-        || options.limit.is_some()
-        || options.offset.is_some()
+        || query.limit.is_some()
+        || query.offset.is_some()
         || !query.ordering.is_empty()
         || query.grouping.is_some()
     {
@@ -430,10 +428,7 @@ fn extract_regex_const_pattern(
 ///
 /// Detectors that look for a specific aggregate function start here, then
 /// inspect the spec's function/distinct/input_var fields.
-fn implicit_single_aggregate<'a>(
-    query: &'a Query,
-    options: &QueryOptions,
-) -> Option<&'a AggregateSpec> {
+fn implicit_single_aggregate(query: &Query) -> Option<&AggregateSpec> {
     let Some(Grouping::Implicit {
         aggregation: Aggregation { aggregates, binds },
         having: None,
@@ -444,9 +439,9 @@ fn implicit_single_aggregate<'a>(
     if aggregates.len() != 1
         || !binds.is_empty()
         || !query.ordering.is_empty()
-        || options.offset.is_some()
+        || query.offset.is_some()
         || query.output.is_distinct()
-        || options.limit == Some(0)
+        || query.limit == Some(0)
     {
         return None;
     }
@@ -461,8 +456,8 @@ fn implicit_single_aggregate<'a>(
 /// - No group_by, having, post-aggregation binds, order_by, offset, or DISTINCT
 /// - LIMIT >= 1 (or no limit)
 /// - SELECT vars == `[agg.output_var]`
-pub(crate) fn detect_count_all_aggregate(query: &Query, options: &QueryOptions) -> Option<VarId> {
-    let agg = implicit_single_aggregate(query, options)?;
+pub(crate) fn detect_count_all_aggregate(query: &Query) -> Option<VarId> {
+    let agg = implicit_single_aggregate(query)?;
     if agg.distinct || !matches!(agg.function, AggregateFn::CountAll) || agg.input_var.is_some() {
         return None;
     }
@@ -483,9 +478,8 @@ pub(crate) fn detect_count_all_aggregate(query: &Query, options: &QueryOptions) 
 /// - SELECT vars == `[agg.output_var]`
 fn detect_count_distinct_aggregate(
     query: &Query,
-    options: &QueryOptions,
 ) -> Option<(VarId, VarId)> {
-    let agg = implicit_single_aggregate(query, options)?;
+    let agg = implicit_single_aggregate(query)?;
     if agg.distinct || !matches!(agg.function, AggregateFn::CountDistinct) {
         return None;
     }
@@ -501,8 +495,8 @@ fn detect_count_distinct_aggregate(
 ///
 /// Returns `Some((input_var, output_var))` where `input_var` is `None` for `COUNT(*)`.
 /// Same standard constraints as [`detect_count_all_aggregate`].
-fn detect_count_aggregate(query: &Query, options: &QueryOptions) -> Option<(Option<VarId>, VarId)> {
-    let agg = implicit_single_aggregate(query, options)?;
+fn detect_count_aggregate(query: &Query) -> Option<(Option<VarId>, VarId)> {
+    let agg = implicit_single_aggregate(query)?;
     if agg.distinct {
         return None;
     }
@@ -518,7 +512,7 @@ fn detect_count_aggregate(query: &Query, options: &QueryOptions) -> Option<(Opti
     Some((input_var, agg.output_var))
 }
 
-fn detect_partitioned_group_by(query: &Query, _options: &QueryOptions) -> bool {
+fn detect_partitioned_group_by(query: &Query) -> bool {
     let Some(Grouping::Explicit { group_by, .. }) = &query.grouping else {
         return false;
     };
@@ -560,7 +554,6 @@ fn detect_partitioned_group_by(query: &Query, _options: &QueryOptions) -> bool {
 
 fn detect_predicate_group_by_object_count_topk(
     query: &Query,
-    options: &QueryOptions,
 ) -> Option<(Ref, VarId, VarId, VarId, usize)> {
     if matches!(query.output, QueryOutput::Construct(_) | QueryOutput::Ask) {
         return None;
@@ -603,7 +596,7 @@ fn detect_predicate_group_by_object_count_topk(
         return None;
     }
     // ORDER BY DESC(?count) and LIMIT k required so we can do top-k directly.
-    let limit = options.limit?;
+    let limit = query.limit?;
     if query.ordering.len() != 1 {
         return None;
     }
@@ -621,7 +614,6 @@ fn detect_predicate_group_by_object_count_topk(
 #[allow(clippy::type_complexity)]
 fn detect_group_by_object_star_topk(
     query: &Query,
-    options: &QueryOptions,
 ) -> Option<(
     Ref,
     Vec<Ref>,
@@ -650,10 +642,10 @@ fn detect_group_by_object_star_topk(
     if query.output.is_distinct() || !binds.is_empty() {
         return None;
     }
-    if options.offset.is_some() {
+    if query.offset.is_some() {
         return None;
     }
-    let limit = options.limit?;
+    let limit = query.limit?;
     if query.ordering.len() != 1 {
         return None;
     }
@@ -779,12 +771,11 @@ fn detect_group_by_object_star_topk(
 
 fn detect_sum_strlen_group_concat_subquery(
     query: &Query,
-    options: &QueryOptions,
 ) -> Option<(Ref, Arc<str>, VarId)> {
     use crate::ir::{Expression, Function, Pattern};
 
     // Outer aggregate must be SUM(?v) (where ?v is the STRLEN bind var).
-    let outer_agg = implicit_single_aggregate(query, options)?;
+    let outer_agg = implicit_single_aggregate(query)?;
     if outer_agg.distinct || outer_agg.function != AggregateFn::Sum {
         return None;
     }
@@ -881,9 +872,8 @@ fn detect_sum_strlen_group_concat_subquery(
 
 fn detect_predicate_object_count(
     query: &Query,
-    options: &QueryOptions,
 ) -> Option<(Ref, VarId, crate::ir::triple::Term, VarId)> {
-    let (input_var, out_var) = detect_count_aggregate(query, options)?;
+    let (input_var, out_var) = detect_count_aggregate(query)?;
 
     if query.patterns.len() != 1 {
         return None;
@@ -914,8 +904,8 @@ fn detect_predicate_object_count(
     Some((pred, *s_var, tp.o.clone(), out_var))
 }
 
-fn detect_predicate_count_rows(query: &Query, options: &QueryOptions) -> Option<(Ref, VarId)> {
-    let (input_var, out_var) = detect_count_aggregate(query, options)?;
+fn detect_predicate_count_rows(query: &Query) -> Option<(Ref, VarId)> {
+    let (input_var, out_var) = detect_count_aggregate(query)?;
 
     if query.patterns.len() != 1 {
         return None;
@@ -937,9 +927,8 @@ fn detect_predicate_count_rows(query: &Query, options: &QueryOptions) -> Option<
 
 fn detect_predicate_count_rows_lang_filter(
     query: &Query,
-    options: &QueryOptions,
 ) -> Option<(Ref, String, VarId)> {
-    let (input_var, out_var) = detect_count_aggregate(query, options)?;
+    let (input_var, out_var) = detect_count_aggregate(query)?;
 
     if query.patterns.len() != 2 {
         return None;
@@ -988,9 +977,8 @@ fn detect_predicate_count_rows_lang_filter(
 
 fn detect_predicate_count_distinct_object(
     query: &Query,
-    options: &QueryOptions,
 ) -> Option<(Ref, VarId)> {
-    let (in_var, out_var) = detect_count_distinct_aggregate(query, options)?;
+    let (in_var, out_var) = detect_count_distinct_aggregate(query)?;
 
     if query.patterns.len() != 1 {
         return None;
@@ -1010,10 +998,9 @@ fn detect_predicate_count_distinct_object(
 
 fn detect_predicate_minmax_string(
     query: &Query,
-    options: &QueryOptions,
 ) -> Option<(Ref, MinMaxMode, VarId)> {
     // Must be a single implicit aggregate with no grouping/having/binds/etc.
-    let agg = implicit_single_aggregate(query, options)?;
+    let agg = implicit_single_aggregate(query)?;
     // WHERE must be a single triple.
     if query.patterns.len() != 1 {
         return None;
@@ -1045,8 +1032,8 @@ fn detect_predicate_minmax_string(
     Some((pred, mode, agg.output_var))
 }
 
-fn detect_predicate_avg_numeric(query: &Query, options: &QueryOptions) -> Option<(Ref, VarId)> {
-    let agg = implicit_single_aggregate(query, options)?;
+fn detect_predicate_avg_numeric(query: &Query) -> Option<(Ref, VarId)> {
+    let agg = implicit_single_aggregate(query)?;
     if query.patterns.len() != 1 {
         return None;
     }
@@ -1066,14 +1053,13 @@ fn detect_predicate_avg_numeric(query: &Query, options: &QueryOptions) -> Option
 
 fn detect_count_rows_with_encoded_filters(
     query: &Query,
-    options: &QueryOptions,
 ) -> Option<(
     crate::ir::triple::TriplePattern,
     Vec<crate::ir::Expression>,
     VarId,
 )> {
     // Must be single COUNT aggregate, no grouping/having/binds/etc.
-    let agg = implicit_single_aggregate(query, options)?;
+    let agg = implicit_single_aggregate(query)?;
     if agg.distinct || !matches!(agg.function, AggregateFn::Count | AggregateFn::CountAll) {
         return None;
     }
@@ -1175,9 +1161,8 @@ fn detect_count_rows_with_encoded_filters(
 
 fn detect_predicate_count_rows_numeric_compare(
     query: &Query,
-    options: &QueryOptions,
 ) -> Option<(Ref, NumericCompareOp, fluree_db_core::FlakeValue, VarId)> {
-    let agg = implicit_single_aggregate(query, options)?;
+    let agg = implicit_single_aggregate(query)?;
     if query.patterns.len() != 2 {
         return None;
     }
@@ -1211,9 +1196,8 @@ fn detect_predicate_count_rows_numeric_compare(
 
 fn detect_string_prefix_count_all(
     query: &Query,
-    options: &QueryOptions,
 ) -> Option<(Ref, Arc<str>, VarId)> {
-    let out_var = detect_count_all_aggregate(query, options)?;
+    let out_var = detect_count_all_aggregate(query)?;
     if query.patterns.len() != 2 {
         return None;
     }
@@ -1231,11 +1215,10 @@ fn detect_string_prefix_count_all(
 
 fn detect_string_prefix_sum_strstarts(
     query: &Query,
-    options: &QueryOptions,
 ) -> Option<(Ref, Arc<str>, VarId)> {
     use crate::ir::{Expression, FlakeValue, Function};
 
-    let agg = implicit_single_aggregate(query, options)?;
+    let agg = implicit_single_aggregate(query)?;
     if agg.distinct || !matches!(agg.function, AggregateFn::Sum) {
         return None;
     }
@@ -1365,10 +1348,7 @@ fn anchored_literal_regex_prefix(pattern: &str) -> Option<Arc<str>> {
 /// Detect if this is a stats fast-path query: `SELECT ?p (COUNT(?x) as ?c) WHERE { ?s ?p ?o } GROUP BY ?p`
 ///
 /// Returns `Some((predicate_var, count_output_var))` if the query matches the pattern.
-fn detect_stats_count_by_predicate(
-    query: &Query,
-    _options: &QueryOptions,
-) -> Option<(VarId, VarId)> {
+fn detect_stats_count_by_predicate(query: &Query) -> Option<(VarId, VarId)> {
     // Must have stats available (checked by caller)
     // Must have exactly one triple pattern with all variables
     if query.patterns.len() != 1 {
@@ -1432,10 +1412,9 @@ fn detect_stats_count_by_predicate(
 
 fn detect_fused_scan_sum_i64(
     query: &Query,
-    options: &QueryOptions,
 ) -> Option<(Ref, SumExprI64, VarId)> {
     // Must be single aggregate, no grouping/having/binds/etc.
-    let agg = implicit_single_aggregate(query, options)?;
+    let agg = implicit_single_aggregate(query)?;
 
     // SELECT must be exactly the aggregate output var.
     let select_vars = query.output.projected_vars()?;
@@ -1511,9 +1490,8 @@ fn detect_fused_scan_sum_i64(
 
 fn detect_exists_join_count_distinct_object(
     query: &Query,
-    options: &QueryOptions,
 ) -> Option<(Ref, Ref, VarId)> {
-    let (in_var, out_var) = detect_count_distinct_aggregate(query, options)?;
+    let (in_var, out_var) = detect_count_distinct_aggregate(query)?;
 
     // WHERE must be exactly two triples: ?s <p1> ?o1 . ?s <p2> ?o2 .
     if query.patterns.len() != 2 {
@@ -1546,9 +1524,8 @@ fn detect_exists_join_count_distinct_object(
 
 fn detect_multicolumn_join_count_all(
     query: &Query,
-    options: &QueryOptions,
 ) -> Option<(Ref, Ref, VarId)> {
-    let out_var = detect_count_all_aggregate(query, options)?;
+    let out_var = detect_count_all_aggregate(query)?;
 
     // WHERE must be exactly two triple patterns and nothing else.
     if query.patterns.len() != 2 {
@@ -1577,8 +1554,8 @@ fn detect_multicolumn_join_count_all(
     Some((p1, p2, out_var))
 }
 
-fn detect_count_blank_node_subjects(query: &Query, options: &QueryOptions) -> Option<VarId> {
-    let (input_var, out_var) = detect_count_aggregate(query, options)?;
+fn detect_count_blank_node_subjects(query: &Query) -> Option<VarId> {
+    let (input_var, out_var) = detect_count_aggregate(query)?;
 
     // Pattern shape: one Triple + one Filter(ISBLANK(?s)) in canonical order.
     if query.patterns.len() != 2 {
@@ -1615,8 +1592,8 @@ fn detect_count_blank_node_subjects(query: &Query, options: &QueryOptions) -> Op
     Some(out_var)
 }
 
-fn detect_count_literal_objects(query: &Query, options: &QueryOptions) -> Option<VarId> {
-    let (input_var, out_var) = detect_count_aggregate(query, options)?;
+fn detect_count_literal_objects(query: &Query) -> Option<VarId> {
+    let (input_var, out_var) = detect_count_aggregate(query)?;
 
     // Pattern shape: one Triple + one Filter(ISLITERAL(?o)) in canonical order.
     if query.patterns.len() != 2 {
@@ -1653,8 +1630,8 @@ fn detect_count_literal_objects(query: &Query, options: &QueryOptions) -> Option
     Some(out_var)
 }
 
-fn detect_count_distinct_objects(query: &Query, options: &QueryOptions) -> Option<VarId> {
-    let (in_var, out_var) = detect_count_distinct_aggregate(query, options)?;
+fn detect_count_distinct_objects(query: &Query) -> Option<VarId> {
+    let (in_var, out_var) = detect_count_distinct_aggregate(query)?;
 
     // Pattern shape: exactly one triple with all vars.
     if query.patterns.len() != 1 {
@@ -1678,8 +1655,8 @@ fn detect_count_distinct_objects(query: &Query, options: &QueryOptions) -> Optio
     Some(out_var)
 }
 
-fn detect_count_distinct_subjects(query: &Query, options: &QueryOptions) -> Option<VarId> {
-    let (in_var, out_var) = detect_count_distinct_aggregate(query, options)?;
+fn detect_count_distinct_subjects(query: &Query) -> Option<VarId> {
+    let (in_var, out_var) = detect_count_distinct_aggregate(query)?;
 
     // Pattern shape: exactly one triple with all vars.
     if query.patterns.len() != 1 {
@@ -1703,8 +1680,8 @@ fn detect_count_distinct_subjects(query: &Query, options: &QueryOptions) -> Opti
     Some(out_var)
 }
 
-fn detect_count_distinct_predicates(query: &Query, options: &QueryOptions) -> Option<VarId> {
-    let (in_var, out_var) = detect_count_distinct_aggregate(query, options)?;
+fn detect_count_distinct_predicates(query: &Query) -> Option<VarId> {
+    let (in_var, out_var) = detect_count_distinct_aggregate(query)?;
 
     // Pattern shape: exactly one triple with all vars.
     if query.patterns.len() != 1 {
@@ -1728,8 +1705,8 @@ fn detect_count_distinct_predicates(query: &Query, options: &QueryOptions) -> Op
     Some(out_var)
 }
 
-fn detect_count_triples(query: &Query, options: &QueryOptions) -> Option<VarId> {
-    let (input_var, out_var) = detect_count_aggregate(query, options)?;
+fn detect_count_triples(query: &Query) -> Option<VarId> {
+    let (input_var, out_var) = detect_count_aggregate(query)?;
 
     // Pattern shape: exactly one triple with all vars.
     if query.patterns.len() != 1 {
@@ -1757,9 +1734,8 @@ fn detect_count_triples(query: &Query, options: &QueryOptions) -> Option<VarId> 
 
 fn detect_optional_chain_head_join_count_all(
     query: &Query,
-    options: &QueryOptions,
 ) -> Option<(Ref, Ref, Ref, VarId)> {
-    let out_var = detect_count_all_aggregate(query, options)?;
+    let out_var = detect_count_all_aggregate(query)?;
 
     // Pattern shape: one required triple + OPTIONAL with two triples (order-independent).
     if query.patterns.len() != 2 {
@@ -1805,9 +1781,8 @@ fn detect_optional_chain_head_join_count_all(
 
 fn detect_transitive_path_plus_count_all(
     query: &Query,
-    options: &QueryOptions,
 ) -> Option<(Ref, Ref, VarId)> {
-    let out_var = detect_count_all_aggregate(query, options)?;
+    let out_var = detect_count_all_aggregate(query)?;
     if query.patterns.len() != 2 {
         return None;
     }
@@ -1840,9 +1815,8 @@ fn detect_transitive_path_plus_count_all(
 
 fn detect_property_path_plus_fixed_subject_count_all(
     query: &Query,
-    options: &QueryOptions,
 ) -> Option<(fluree_db_core::Sid, Ref, VarId)> {
-    let out_var = detect_count_all_aggregate(query, options)?;
+    let out_var = detect_count_all_aggregate(query)?;
     if query.patterns.len() != 1 {
         return None;
     }
@@ -1863,10 +1837,9 @@ fn detect_property_path_plus_fixed_subject_count_all(
 
 fn detect_union_star_count_all(
     query: &Query,
-    options: &QueryOptions,
 ) -> Option<(Vec<Ref>, Vec<Ref>, UnionCountMode, VarId)> {
     use crate::ir::{Expression, Function};
-    let out_var = detect_count_all_aggregate(query, options)?;
+    let out_var = detect_count_all_aggregate(query)?;
 
     // Find exactly one UNION pattern.
     let mut union: Option<&Vec<Vec<Pattern>>> = None;
@@ -1966,16 +1939,14 @@ fn detect_union_star_count_all(
 /// WHERE patterns → GROUP BY → Aggregates → HAVING → ORDER BY → PROJECT → DISTINCT → OFFSET → LIMIT
 pub fn build_operator_tree(
     query: &Query,
-    options: &QueryOptions,
     stats: Option<Arc<StatsView>>,
     planning: &PlanningContext,
 ) -> Result<BoxedOperator> {
-    build_operator_tree_inner(query, options, stats, true, planning)
+    build_operator_tree_inner(query, stats, true, planning)
 }
 
 fn build_operator_tree_inner(
     query: &Query,
-    options: &QueryOptions,
     stats: Option<Arc<StatsView>>,
     enable_fused_fast_paths: bool,
     planning: &PlanningContext,
@@ -2001,11 +1972,11 @@ fn build_operator_tree_inner(
     // These are lowered as: Triple + Bind(expr) + SUM(synthetic_var).
     // This operator scans the predicate's POST range and aggregates directly from encoded values.
     if enable_fused_fast_paths {
-        if let Some((pred, scalar, out_var)) = detect_fused_scan_sum_i64(query, options) {
+        if let Some((pred, scalar, out_var)) = detect_fused_scan_sum_i64(query) {
             // Build fallback operator tree without this fast path to preserve correctness in
             // pre-index / history / policy contexts.
             let fallback =
-                build_operator_tree_inner(query, options, stats.clone(), false, planning)?;
+                build_operator_tree_inner(query, stats.clone(), false, planning)?;
             return Ok(Box::new(fused_scan_sum_i64_operator(
                 pred,
                 scalar,
@@ -2018,9 +1989,9 @@ fn build_operator_tree_inner(
     // Fast-path: `SELECT (AVG(?o) AS ?avg) WHERE { ?s <p> ?o }`
     // for homogeneous numeric predicates, scanning only POST `o_key` values.
     if enable_fused_fast_paths {
-        if let Some((pred, out_var)) = detect_predicate_avg_numeric(query, options) {
+        if let Some((pred, out_var)) = detect_predicate_avg_numeric(query) {
             let fallback =
-                build_operator_tree_inner(query, options, stats.clone(), false, planning)?;
+                build_operator_tree_inner(query, stats.clone(), false, planning)?;
             return Ok(Box::new(predicate_avg_numeric_operator(
                 pred,
                 out_var,
@@ -2032,9 +2003,9 @@ fn build_operator_tree_inner(
     // Fast-path: `SELECT (COUNT(DISTINCT ?o) AS ?c) WHERE { ?s <p> ?o }`
     // by scanning POST and counting distinct encoded object IDs.
     if enable_fused_fast_paths {
-        if let Some((pred, out_var)) = detect_predicate_count_distinct_object(query, options) {
+        if let Some((pred, out_var)) = detect_predicate_count_distinct_object(query) {
             let fallback =
-                build_operator_tree_inner(query, options, stats.clone(), false, planning)?;
+                build_operator_tree_inner(query, stats.clone(), false, planning)?;
             return Ok(Box::new(count_distinct_object_operator(
                 pred,
                 out_var,
@@ -2046,9 +2017,9 @@ fn build_operator_tree_inner(
     // Fast-path: `SELECT (MIN(?o) AS ?min) WHERE { ?s <p> ?o }` and MAX(...)
     // when the object is string-dict-backed. This inspects only POST leaflet directory keys.
     if enable_fused_fast_paths {
-        if let Some((pred, mode, out_var)) = detect_predicate_minmax_string(query, options) {
+        if let Some((pred, mode, out_var)) = detect_predicate_minmax_string(query) {
             let fallback =
-                build_operator_tree_inner(query, options, stats.clone(), false, planning)?;
+                build_operator_tree_inner(query, stats.clone(), false, planning)?;
             return Ok(Box::new(predicate_min_max_string_operator(
                 pred,
                 mode,
@@ -2060,9 +2031,9 @@ fn build_operator_tree_inner(
 
     // Fast-path: `COUNT(*)` over one triple with an anchored string-prefix filter.
     if enable_fused_fast_paths {
-        if let Some((pred, prefix, out_var)) = detect_string_prefix_count_all(query, options) {
+        if let Some((pred, prefix, out_var)) = detect_string_prefix_count_all(query) {
             let fallback =
-                build_operator_tree_inner(query, options, stats.clone(), false, planning)?;
+                build_operator_tree_inner(query, stats.clone(), false, planning)?;
             return Ok(Box::new(string_prefix_count_all_operator(
                 pred,
                 prefix,
@@ -2074,9 +2045,9 @@ fn build_operator_tree_inner(
 
     // Fast-path: `SUM(xsd:integer(STRSTARTS(?o, "...")))` over one triple.
     if enable_fused_fast_paths {
-        if let Some((pred, prefix, out_var)) = detect_string_prefix_sum_strstarts(query, options) {
+        if let Some((pred, prefix, out_var)) = detect_string_prefix_sum_strstarts(query) {
             let fallback =
-                build_operator_tree_inner(query, options, stats.clone(), false, planning)?;
+                build_operator_tree_inner(query, stats.clone(), false, planning)?;
             return Ok(Box::new(string_prefix_sum_strstarts_operator(
                 pred,
                 prefix,
@@ -2095,10 +2066,10 @@ fn build_operator_tree_inner(
     // We build a scan that emits no bindings (empty schema) and counts rows.
     if enable_fused_fast_paths {
         if let Some((pred, lang_tag, out_var)) =
-            detect_predicate_count_rows_lang_filter(query, options)
+            detect_predicate_count_rows_lang_filter(query)
         {
             let fallback =
-                build_operator_tree_inner(query, options, stats.clone(), false, planning)?;
+                build_operator_tree_inner(query, stats.clone(), false, planning)?;
             return Ok(Box::new(count_rows_lang_filter_operator(
                 pred,
                 lang_tag,
@@ -2110,10 +2081,10 @@ fn build_operator_tree_inner(
 
     if enable_fused_fast_paths {
         if let Some((pred, compare, threshold, out_var)) =
-            detect_predicate_count_rows_numeric_compare(query, options)
+            detect_predicate_count_rows_numeric_compare(query)
         {
             let fallback =
-                build_operator_tree_inner(query, options, stats.clone(), false, planning)?;
+                build_operator_tree_inner(query, stats.clone(), false, planning)?;
             return Ok(Box::new(count_rows_numeric_compare_operator(
                 pred,
                 compare,
@@ -2125,10 +2096,10 @@ fn build_operator_tree_inner(
     }
 
     if enable_fused_fast_paths {
-        if let Some((tp, filters, out_var)) = detect_count_rows_with_encoded_filters(query, options)
+        if let Some((tp, filters, out_var)) = detect_count_rows_with_encoded_filters(query)
         {
             let fallback =
-                build_operator_tree_inner(query, options, stats.clone(), false, planning)?;
+                build_operator_tree_inner(query, stats.clone(), false, planning)?;
             let inline_ops: Vec<InlineOperator> = filters
                 .into_iter()
                 .map(|expr| InlineOperator::Filter(PreparedBoolExpression::new(expr)))
@@ -2157,9 +2128,9 @@ fn build_operator_tree_inner(
     // Fast-path: `SELECT (COUNT(?x) AS ?c) WHERE { ?s <p> ?o }` (and COUNT(*))
     // answered from PSOT leaflet directory row counts (no scan / no decoding).
     if enable_fused_fast_paths {
-        if let Some((pred, out_var)) = detect_predicate_count_rows(query, options) {
+        if let Some((pred, out_var)) = detect_predicate_count_rows(query) {
             let fallback =
-                build_operator_tree_inner(query, options, stats.clone(), false, planning)?;
+                build_operator_tree_inner(query, stats.clone(), false, planning)?;
             return Ok(Box::new(count_rows_operator(pred, out_var, Some(fallback))));
         }
     }
@@ -2168,9 +2139,9 @@ fn build_operator_tree_inner(
     // and modifier combinations (OPTIONAL, MINUS, EXISTS, object-chain patterns).
     // Fires after trivial metadata-only counts but before the remaining specialized fast paths.
     if enable_fused_fast_paths {
-        if let Some(plan) = crate::count_plan::try_build_count_plan(query, options) {
+        if let Some(plan) = crate::count_plan::try_build_count_plan(query) {
             let fallback =
-                build_operator_tree_inner(query, options, stats.clone(), false, planning)?;
+                build_operator_tree_inner(query, stats.clone(), false, planning)?;
             return Ok(crate::count_plan_exec::count_plan_operator(
                 plan,
                 Some(fallback),
@@ -2180,9 +2151,9 @@ fn build_operator_tree_inner(
 
     // Fast-path: `COUNT(*)` for a 2-pattern multicolumn join `?s p1 ?o . ?s p2 ?o`.
     if enable_fused_fast_paths {
-        if let Some((p1, p2, out_var)) = detect_multicolumn_join_count_all(query, options) {
+        if let Some((p1, p2, out_var)) = detect_multicolumn_join_count_all(query) {
             let fallback =
-                build_operator_tree_inner(query, options, stats.clone(), false, planning)?;
+                build_operator_tree_inner(query, stats.clone(), false, planning)?;
             return Ok(Box::new(multicolumn_join_count_all_operator(
                 p1,
                 p2,
@@ -2195,10 +2166,10 @@ fn build_operator_tree_inner(
     // Fast-path: `COUNT(DISTINCT ?o1)` with an existence-only same-subject join.
     if enable_fused_fast_paths {
         if let Some((count_pred, exists_pred, out_var)) =
-            detect_exists_join_count_distinct_object(query, options)
+            detect_exists_join_count_distinct_object(query)
         {
             let fallback =
-                build_operator_tree_inner(query, options, stats.clone(), false, planning)?;
+                build_operator_tree_inner(query, stats.clone(), false, planning)?;
             return Ok(Box::new(exists_join_count_distinct_object_operator(
                 count_pred,
                 exists_pred,
@@ -2211,9 +2182,9 @@ fn build_operator_tree_inner(
     // Fast-path: `SELECT (COUNT(?s) AS ?c) WHERE { ?s ?p ?o FILTER ISBLANK(?s) }`
     // answered from SPOT leaflet metadata by scanning the blank-node SubjectId range.
     if enable_fused_fast_paths {
-        if let Some(out_var) = detect_count_blank_node_subjects(query, options) {
+        if let Some(out_var) = detect_count_blank_node_subjects(query) {
             let fallback =
-                build_operator_tree_inner(query, options, stats.clone(), false, planning)?;
+                build_operator_tree_inner(query, stats.clone(), false, planning)?;
             return Ok(Box::new(count_blank_node_subjects_operator(
                 out_var,
                 Some(fallback),
@@ -2224,9 +2195,9 @@ fn build_operator_tree_inner(
     // Fast-path: `SELECT (COUNT(?o) AS ?c) WHERE { ?s ?p ?o FILTER ISLITERAL(?o) }`
     // answered from PSOT leaflet metadata by counting non-node-ref `o_type` rows.
     if enable_fused_fast_paths {
-        if let Some(out_var) = detect_count_literal_objects(query, options) {
+        if let Some(out_var) = detect_count_literal_objects(query) {
             let fallback =
-                build_operator_tree_inner(query, options, stats.clone(), false, planning)?;
+                build_operator_tree_inner(query, stats.clone(), false, planning)?;
             return Ok(Box::new(count_literal_objects_operator(
                 out_var,
                 Some(fallback),
@@ -2237,9 +2208,9 @@ fn build_operator_tree_inner(
     // Fast-path: `SELECT (COUNT(DISTINCT ?s) AS ?c) WHERE { ?s ?p ?o }`
     // answered metadata-only from SPOT leaflet `lead_group_count` + boundary correction.
     if enable_fused_fast_paths {
-        if let Some(out_var) = detect_count_distinct_subjects(query, options) {
+        if let Some(out_var) = detect_count_distinct_subjects(query) {
             let fallback =
-                build_operator_tree_inner(query, options, stats.clone(), false, planning)?;
+                build_operator_tree_inner(query, stats.clone(), false, planning)?;
             return Ok(Box::new(count_distinct_subjects_operator(
                 out_var,
                 Some(fallback),
@@ -2250,9 +2221,9 @@ fn build_operator_tree_inner(
     // Fast-path: `SELECT (COUNT(DISTINCT ?p) AS ?c) WHERE { ?s ?p ?o }`
     // answered metadata-only from PSOT leaflet `p_const` transitions.
     if enable_fused_fast_paths {
-        if let Some(out_var) = detect_count_distinct_predicates(query, options) {
+        if let Some(out_var) = detect_count_distinct_predicates(query) {
             let fallback =
-                build_operator_tree_inner(query, options, stats.clone(), false, planning)?;
+                build_operator_tree_inner(query, stats.clone(), false, planning)?;
             return Ok(Box::new(count_distinct_predicates_operator(
                 out_var,
                 Some(fallback),
@@ -2263,9 +2234,9 @@ fn build_operator_tree_inner(
     // Fast-path: `SELECT (COUNT(?s) AS ?c) WHERE { ?s ?p ?o }`
     // answered metadata-only by summing leaf row_count across a branch manifest.
     if enable_fused_fast_paths {
-        if let Some(out_var) = detect_count_triples(query, options) {
+        if let Some(out_var) = detect_count_triples(query) {
             let fallback =
-                build_operator_tree_inner(query, options, stats.clone(), false, planning)?;
+                build_operator_tree_inner(query, stats.clone(), false, planning)?;
             return Ok(Box::new(count_triples_operator(out_var, Some(fallback))));
         }
     }
@@ -2274,10 +2245,10 @@ fn build_operator_tree_inner(
     // answered by streaming group counts and an `n3(c)` map.
     if enable_fused_fast_paths {
         if let Some((p1, p2, p3, out_var)) =
-            detect_optional_chain_head_join_count_all(query, options)
+            detect_optional_chain_head_join_count_all(query)
         {
             let fallback =
-                build_operator_tree_inner(query, options, stats.clone(), false, planning)?;
+                build_operator_tree_inner(query, stats.clone(), false, planning)?;
             return Ok(Box::new(predicate_optional_chain_head_count_all(
                 p1,
                 p2,
@@ -2292,10 +2263,10 @@ fn build_operator_tree_inner(
     // Avoids repeated range scans by building adjacency once and traversing.
     if enable_fused_fast_paths {
         if let Some((pred_sid, subject, out_var)) =
-            detect_property_path_plus_fixed_subject_count_all(query, options)
+            detect_property_path_plus_fixed_subject_count_all(query)
         {
             let fallback =
-                build_operator_tree_inner(query, options, stats.clone(), false, planning)?;
+                build_operator_tree_inner(query, stats.clone(), false, planning)?;
             return Ok(Box::new(property_path_plus_count_all_operator(
                 pred_sid,
                 subject,
@@ -2308,10 +2279,10 @@ fn build_operator_tree_inner(
     // Fast-path: UNION-of-triples optionally constrained by same-subject star joins and/or FILTER(?s = ?o).
     if enable_fused_fast_paths {
         if let Some((union_preds, extra_preds, mode, out_var)) =
-            detect_union_star_count_all(query, options)
+            detect_union_star_count_all(query)
         {
             let fallback =
-                build_operator_tree_inner(query, options, stats.clone(), false, planning)?;
+                build_operator_tree_inner(query, stats.clone(), false, planning)?;
             return Ok(Box::new(UnionStarCountAllOperator::new(
                 union_preds,
                 extra_preds,
@@ -2325,9 +2296,9 @@ fn build_operator_tree_inner(
     // Fast-path: `SELECT (COUNT(*) AS ?c) WHERE { ?s <p1> ?x . ?x <p2>+ ?o }`
     // Avoids closure materialization by counting reachability.
     if enable_fused_fast_paths {
-        if let Some((p1, p2, out_var)) = detect_transitive_path_plus_count_all(query, options) {
+        if let Some((p1, p2, out_var)) = detect_transitive_path_plus_count_all(query) {
             let fallback =
-                build_operator_tree_inner(query, options, stats.clone(), false, planning)?;
+                build_operator_tree_inner(query, stats.clone(), false, planning)?;
             return Ok(Box::new(transitive_path_plus_count_all_operator(
                 p1,
                 p2,
@@ -2340,9 +2311,9 @@ fn build_operator_tree_inner(
     // Fast-path: `SELECT (COUNT(DISTINCT ?o) AS ?c) WHERE { ?s ?p ?o }`
     // answered metadata-only from OPST leaflet `lead_group_count` + boundary correction.
     if enable_fused_fast_paths {
-        if let Some(out_var) = detect_count_distinct_objects(query, options) {
+        if let Some(out_var) = detect_count_distinct_objects(query) {
             let fallback =
-                build_operator_tree_inner(query, options, stats.clone(), false, planning)?;
+                build_operator_tree_inner(query, stats.clone(), false, planning)?;
             return Ok(Box::new(count_distinct_objects_operator(
                 out_var,
                 Some(fallback),
@@ -2352,9 +2323,9 @@ fn build_operator_tree_inner(
 
     // Fast-path: constant-object star constraints + numeric existence filter + label ORDER BY + LIMIT.
     if enable_fused_fast_paths {
-        if let Some(spec) = detect_star_const_numeric_label_order_limit(query, options) {
+        if let Some(spec) = detect_star_const_numeric_label_order_limit(query) {
             let fallback =
-                build_operator_tree_inner(query, options, stats.clone(), false, planning)?;
+                build_operator_tree_inner(query, stats.clone(), false, planning)?;
             let threshold = match spec.numeric_threshold {
                 Term::Value(v) => v,
                 _ => return Ok(fallback),
@@ -2374,9 +2345,9 @@ fn build_operator_tree_inner(
 
     // Fast-path: label scan + regex filter + rdf:type membership check.
     if enable_fused_fast_paths {
-        if let Some(spec) = detect_label_regex_type(query, options) {
+        if let Some(spec) = detect_label_regex_type(query) {
             let fallback =
-                build_operator_tree_inner(query, options, stats.clone(), false, planning)?;
+                build_operator_tree_inner(query, stats.clone(), false, planning)?;
             return Ok(label_regex_type_operator(
                 spec.subject_var,
                 spec.label_var,
@@ -2405,10 +2376,10 @@ fn build_operator_tree_inner(
             max_var,
             sample_var,
             limit,
-        )) = detect_group_by_object_star_topk(query, options)
+        )) = detect_group_by_object_star_topk(query)
         {
             let fallback =
-                build_operator_tree_inner(query, options, stats.clone(), false, planning)?;
+                build_operator_tree_inner(query, stats.clone(), false, planning)?;
             return Ok(Box::new(GroupByObjectStarTopKOperator::new(
                 group_pred,
                 filter_preds,
@@ -2431,7 +2402,7 @@ fn build_operator_tree_inner(
     // the path emits current-state counts and ignores retracts.
     if !planning.is_history() {
         if let Some((pred, s_var, o_var, count_var, limit)) =
-            detect_predicate_group_by_object_count_topk(query, options)
+            detect_predicate_group_by_object_count_topk(query)
         {
             return Ok(Box::new(PredicateGroupCountFirstsOperator::new(
                 s_var,
@@ -2446,10 +2417,10 @@ fn build_operator_tree_inner(
 
     // Fast-path: SUM(STRLEN(GROUP_CONCAT(...))) over a single predicate.
     if enable_fused_fast_paths {
-        if let Some((pred, sep, out_var)) = detect_sum_strlen_group_concat_subquery(query, options)
+        if let Some((pred, sep, out_var)) = detect_sum_strlen_group_concat_subquery(query)
         {
             let fallback =
-                build_operator_tree_inner(query, options, stats.clone(), false, planning)?;
+                build_operator_tree_inner(query, stats.clone(), false, planning)?;
             return Ok(Box::new(sum_strlen_group_concat_operator(
                 pred,
                 sep,
@@ -2462,7 +2433,7 @@ fn build_operator_tree_inner(
     // Fast-path: `SELECT (COUNT(?s) AS ?c) WHERE { ?s <p> <o> }` using leaflet FIRST headers.
     // Skipped in `History` mode (current-state count semantics).
     if !planning.is_history() {
-        if let Some((pred, s_var, obj, count_var)) = detect_predicate_object_count(query, options) {
+        if let Some((pred, s_var, obj, count_var)) = detect_predicate_object_count(query) {
             let mut operator: BoxedOperator = Box::new(PredicateObjectCountFirstsOperator::new(
                 pred,
                 s_var,
@@ -2489,14 +2460,14 @@ fn build_operator_tree_inner(
             }
 
             // OFFSET
-            if let Some(offset) = options.offset {
+            if let Some(offset) = query.offset {
                 if offset > 0 {
                     operator = Box::new(OffsetOperator::new(operator, offset));
                 }
             }
 
             // LIMIT
-            if let Some(limit) = options.limit {
+            if let Some(limit) = query.limit {
                 operator = Box::new(LimitOperator::new(operator, limit));
             }
 
@@ -2510,7 +2481,7 @@ fn build_operator_tree_inner(
     // not the asserts + retracts a history-range query needs.
     if !planning.is_history() {
         if let Some(ref stats_view) = stats {
-            if let Some((pred_var, count_var)) = detect_stats_count_by_predicate(query, options) {
+            if let Some((pred_var, count_var)) = detect_stats_count_by_predicate(query) {
                 let mut operator: BoxedOperator = Box::new(StatsCountByPredicateOperator::new(
                     Arc::clone(stats_view),
                     pred_var,
@@ -2535,14 +2506,14 @@ fn build_operator_tree_inner(
                 }
 
                 // OFFSET
-                if let Some(offset) = options.offset {
+                if let Some(offset) = query.offset {
                     if offset > 0 {
                         operator = Box::new(OffsetOperator::new(operator, offset));
                     }
                 }
 
                 // LIMIT
-                if let Some(limit) = options.limit {
+                if let Some(limit) = query.limit {
                     operator = Box::new(LimitOperator::new(operator, limit));
                 }
 
@@ -2704,7 +2675,7 @@ fn build_operator_tree_inner(
 
         if use_streaming {
             // Streaming path: O(groups) memory
-            let partitioned = detect_partitioned_group_by(query, options);
+            let partitioned = detect_partitioned_group_by(query);
             tracing::debug!(
                 group_by_count = group_by_vec.len(),
                 agg_count = streaming_specs.len(),
@@ -2848,12 +2819,12 @@ fn build_operator_tree_inner(
         operator = Box::new(DistinctOperator::new(operator));
 
         // ORDER BY (post-distinct, projected vars only)
-        let k = match (options.limit, options.offset) {
+        let k = match (query.limit, query.offset) {
             (Some(limit), Some(offset)) => limit.saturating_add(offset),
             (Some(limit), None) => limit,
             _ => 0,
         };
-        let can_topk = options.limit.is_some();
+        let can_topk = query.limit.is_some();
         let mut sort_op = if can_topk {
             SortOperator::new_topk(operator, query.ordering.clone(), k)
         } else {
@@ -2871,8 +2842,8 @@ fn build_operator_tree_inner(
             // Safe top-k: ORDER BY + (OFFSET o) + LIMIT l can keep only (o + l) rows.
             //
             // This is safe when DISTINCT is not in play because slicing happens after sorting.
-            let can_topk = options.limit.is_some() && !query.output.is_distinct();
-            let k = match (options.limit, options.offset) {
+            let can_topk = query.limit.is_some() && !query.output.is_distinct();
+            let k = match (query.limit, query.offset) {
                 (Some(limit), Some(offset)) => limit.saturating_add(offset),
                 (Some(limit), None) => limit,
                 _ => 0,
@@ -2904,14 +2875,14 @@ fn build_operator_tree_inner(
     }
 
     // OFFSET
-    if let Some(offset) = options.offset {
+    if let Some(offset) = query.offset {
         if offset > 0 {
             operator = Box::new(OffsetOperator::new(operator, offset));
         }
     }
 
     // LIMIT
-    if let Some(limit) = options.limit {
+    if let Some(limit) = query.limit {
         operator = Box::new(LimitOperator::new(operator, limit));
     }
 
@@ -2951,6 +2922,8 @@ mod tests {
             options: QueryOptions::default(),
             grouping: None,
             ordering: Vec::new(),
+            limit: None,
+            offset: None,
             post_values: None,
         }
     }
@@ -2997,12 +2970,12 @@ mod tests {
             options: QueryOptions::default(),
             grouping: None,
             ordering: vec![SortSpec::asc(label)],
+            limit: Some(10),
+            offset: None,
             post_values: None,
         };
 
-        let opts = QueryOptions::new().with_limit(10);
-
-        let spec = detect_star_const_numeric_label_order_limit(&query, &opts)
+        let spec = detect_star_const_numeric_label_order_limit(&query)
             .expect("should detect shape");
         assert_eq!(spec.subject_var, s);
         assert_eq!(spec.label_var, label);
@@ -3022,12 +2995,13 @@ mod tests {
             options: QueryOptions::default(),
             grouping: None,
             ordering: Vec::new(),
+            limit: None,
+            offset: None,
             post_values: None,
         };
 
         let result = build_operator_tree(
             &query,
-            &QueryOptions::default(),
             None,
             &crate::temporal_mode::PlanningContext::current(),
         );
@@ -3047,12 +3021,13 @@ mod tests {
             options: QueryOptions::default(),
             grouping: None,
             ordering: vec![SortSpec::asc(VarId(99))], // Invalid var
+            limit: None,
+            offset: None,
             post_values: None,
         };
 
         let result = build_operator_tree(
             &query,
-            &QueryOptions::default(),
             None,
             &crate::temporal_mode::PlanningContext::current(),
         );
@@ -3067,7 +3042,6 @@ mod tests {
         let query = make_simple_query(vec![], vec![]);
         let result = build_operator_tree(
             &query,
-            &QueryOptions::default(),
             None,
             &crate::temporal_mode::PlanningContext::current(),
         );
@@ -3123,6 +3097,8 @@ mod tests {
             options: QueryOptions::default(),
             grouping: make_grouping(),
             ordering: Vec::new(),
+            limit: None,
+            offset: None,
             post_values: None,
         };
         let reversed = Query {
@@ -3144,16 +3120,16 @@ mod tests {
             options: QueryOptions::default(),
             grouping: make_grouping(),
             ordering: Vec::new(),
+            limit: None,
+            offset: None,
             post_values: None,
         };
-        let options = QueryOptions::default();
-
         assert_eq!(
-            detect_exists_join_count_distinct_object(&counted_first, &options),
+            detect_exists_join_count_distinct_object(&counted_first),
             Some((count_pred.clone(), exists_pred.clone(), out))
         );
         assert_eq!(
-            detect_exists_join_count_distinct_object(&reversed, &options),
+            detect_exists_join_count_distinct_object(&reversed),
             Some((count_pred, exists_pred, out))
         );
     }

@@ -402,7 +402,7 @@ pub async fn prepare_execution_with_config(
             .entered();
 
             let stats_view = cached_stats_view_for_db(db, binary_store);
-            build_operator_tree(&rewritten_query, &query.options, stats_view, &planning)?
+            build_operator_tree(&rewritten_query, stats_view, &planning)?
         };
 
         Ok(PreparedExecution {

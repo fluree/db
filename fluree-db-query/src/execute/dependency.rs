@@ -141,6 +141,8 @@ mod tests {
             options: QueryOptions::default(),
             grouping: None,
             ordering: Vec::new(),
+            limit: None,
+            offset: None,
             post_values: None,
         }
     }
@@ -154,6 +156,8 @@ mod tests {
             options: QueryOptions::default(),
             grouping: None,
             ordering: Vec::new(),
+            limit: None,
+            offset: None,
             post_values: None,
         }
     }
@@ -296,6 +300,8 @@ mod tests {
             options: QueryOptions::default(),
             grouping: None,
             ordering: Vec::new(),
+            limit: None,
+            offset: None,
             post_values: None,
         };
 
@@ -318,6 +324,8 @@ mod tests {
             options: QueryOptions::default(),
             grouping: None,
             ordering: Vec::new(),
+            limit: None,
+            offset: None,
             post_values: None,
         }
     }

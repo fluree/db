@@ -106,6 +106,8 @@ mod tests {
             options: QueryOptions::default(),
             grouping: None,
             ordering: Vec::new(),
+            limit: None,
+            offset: None,
             post_values: None,
         };
         let executable = ExecutableQuery::simple(query);
@@ -119,21 +121,6 @@ mod tests {
         assert_eq!(results[0].len(), 1);
     }
 
-    #[tokio::test]
-    async fn test_query_options_builder() {
-        let opts = QueryOptions::new().with_limit(10).with_offset(5);
-
-        assert_eq!(opts.limit, Some(10));
-        assert_eq!(opts.offset, Some(5));
-        assert!(opts.has_modifiers());
-    }
-
-    #[tokio::test]
-    async fn test_query_options_default_no_modifiers() {
-        let opts = QueryOptions::default();
-        assert!(!opts.has_modifiers());
-    }
-
     #[test]
     fn test_build_operator_tree_validates_select_vars() {
         let query = Query {
@@ -144,12 +131,13 @@ mod tests {
             options: QueryOptions::default(),
             grouping: None,
             ordering: Vec::new(),
+            limit: None,
+            offset: None,
             post_values: None,
         };
 
         let result = build_operator_tree(
             &query,
-            &QueryOptions::default(),
             None,
             &crate::temporal_mode::PlanningContext::current(),
         );
@@ -169,12 +157,13 @@ mod tests {
             options: QueryOptions::default(),
             grouping: None,
             ordering: vec![SortSpec::asc(VarId(99))], // Invalid var
+            limit: None,
+            offset: None,
             post_values: None,
         };
 
         let result = build_operator_tree(
             &query,
-            &QueryOptions::default(),
             None,
             &crate::temporal_mode::PlanningContext::current(),
         );

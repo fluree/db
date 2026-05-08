@@ -1,9 +1,9 @@
 //! Query execution options and reasoning modes.
 //!
-//! `QueryOptions` carries the post-WHERE solution modifiers (LIMIT, OFFSET)
-//! plus the reasoning configuration the rewriter consumes (`ReasoningModes`
-//! and an optional pre-resolved `SchemaBundleFlakes`). ORDER BY rides on
-//! [`Query::ordering`](super::Query) directly.
+//! `QueryOptions` carries the reasoning configuration the rewriter consumes
+//! (`ReasoningModes` plus an optional pre-resolved `SchemaBundleFlakes`).
+//! Solution modifiers (LIMIT, OFFSET, ORDER BY, GROUP BY, HAVING) ride on
+//! [`Query`](super::Query) directly.
 //!
 //! `ReasoningModes` is pure config — no behavior, just bit flags and a JSON
 //! rule list. The rewriter consumes it as input. Both types live here in `ir`
@@ -336,17 +336,11 @@ impl ReasoningModes {
     }
 }
 
-/// Solution-modifier options applied after the WHERE and grouping phases.
-///
-/// Controls OFFSET, LIMIT, and reasoning configuration. Embedded in
-/// [`Query`](super::Query) and consumed by the planner and executor. ORDER
-/// BY rides separately on [`Query::ordering`](super::Query).
+/// Reasoning configuration consumed by the rewriter. Solution modifiers
+/// (LIMIT, OFFSET, ORDER BY, GROUP BY, HAVING) ride on [`Query`](super::Query)
+/// directly.
 #[derive(Debug, Clone, Default)]
 pub struct QueryOptions {
-    /// Maximum rows to return (applied last)
-    pub limit: Option<usize>,
-    /// Rows to skip before returning results
-    pub offset: Option<usize>,
     /// Reasoning modes for RDFS/OWL reasoning
     ///
     /// Controls pattern expansion based on class/property hierarchies.
@@ -371,18 +365,6 @@ impl QueryOptions {
     /// Create new execution options with defaults
     pub fn new() -> Self {
         Self::default()
-    }
-
-    /// Set the limit
-    pub fn with_limit(mut self, limit: usize) -> Self {
-        self.limit = Some(limit);
-        self
-    }
-
-    /// Set the offset
-    pub fn with_offset(mut self, offset: usize) -> Self {
-        self.offset = Some(offset);
-        self
     }
 
     /// Set reasoning modes
@@ -411,11 +393,6 @@ impl QueryOptions {
         self
     }
 
-    /// Check if any modifiers are set
-    pub fn has_modifiers(&self) -> bool {
-        self.limit.is_some() || self.offset.is_some()
-    }
-
     /// Check if any reasoning mode is explicitly enabled
     pub fn has_reasoning(&self) -> bool {
         self.reasoning.has_any_enabled()
@@ -438,28 +415,9 @@ mod tests {
     #[test]
     fn test_default_options() {
         let opts = QueryOptions::default();
-        assert!(opts.limit.is_none());
-        assert!(opts.offset.is_none());
         // Default reasoning: nothing explicitly enabled
         assert!(!opts.has_reasoning());
         assert!(!opts.is_reasoning_disabled());
-        assert!(!opts.has_modifiers());
-    }
-
-    #[test]
-    fn test_builder_pattern() {
-        let opts = QueryOptions::new().with_limit(10).with_offset(5);
-
-        assert_eq!(opts.limit, Some(10));
-        assert_eq!(opts.offset, Some(5));
-        assert!(opts.has_modifiers());
-    }
-
-    #[test]
-    fn test_has_modifiers() {
-        assert!(!QueryOptions::new().has_modifiers());
-        assert!(QueryOptions::new().with_limit(1).has_modifiers());
-        assert!(QueryOptions::new().with_offset(1).has_modifiers());
     }
 
     #[test]

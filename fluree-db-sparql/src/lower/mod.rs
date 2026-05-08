@@ -61,7 +61,9 @@ pub use error::{LowerError, Result};
 use crate::ast::query::{QueryBody, SelectVariables, SparqlAst};
 
 use fluree_db_query::ir::Pattern;
-use fluree_db_query::ir::{Grouping, Query, QueryOutput};
+use fluree_db_query::ir::{Grouping, Query, QueryOptions, QueryOutput};
+
+use self::select::BaseModifiers;
 use fluree_db_query::parse::encode::IriEncoder;
 use fluree_db_query::var_registry::{VarId, VarRegistry};
 
@@ -218,14 +220,17 @@ impl<'a, E: IriEncoder> LoweringContext<'a, E> {
                     None
                 };
 
-                // Lower solution modifiers to QueryOptions.
+                // Lower solution modifiers (LIMIT/OFFSET/ORDER BY/DISTINCT/GROUP BY/HAVING/aggregates).
                 // Expression-based GROUP BY produces pre-group BINDs that must be
                 // injected into the WHERE pattern list before query building.
                 let lowered_modifiers =
                     self.lower_solution_modifiers(&select_query.modifiers, &select_query.select)?;
                 patterns.extend(lowered_modifiers.pre_group_binds);
-                let options = lowered_modifiers.options;
-                let ordering = lowered_modifiers.ordering;
+                let BaseModifiers {
+                    limit,
+                    offset,
+                    ordering,
+                } = lowered_modifiers.base;
                 let distinct = lowered_modifiers.distinct;
 
                 // Assemble the grouping phase from the lowered components.
@@ -261,7 +266,9 @@ impl<'a, E: IriEncoder> LoweringContext<'a, E> {
                     patterns,
                     grouping,
                     ordering,
-                    options,
+                    limit,
+                    offset,
+                    options: QueryOptions::default(),
                     post_values,
                 })
             }
@@ -1076,8 +1083,8 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(query.options.limit, Some(10));
-        assert_eq!(query.options.offset, Some(5));
+        assert_eq!(query.limit, Some(10));
+        assert_eq!(query.offset, Some(5));
     }
 
     #[test]
@@ -1119,7 +1126,7 @@ mod tests {
         .unwrap();
 
         assert!(matches!(query.output, QueryOutput::Ask));
-        assert_eq!(query.options.limit, Some(1), "ASK should inject LIMIT 1");
+        assert_eq!(query.limit, Some(1), "ASK should inject LIMIT 1");
         assert_eq!(query.patterns.len(), 1);
         assert!(matches!(query.patterns[0], Pattern::Triple(_)));
     }
@@ -1279,8 +1286,8 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(query.options.limit, Some(10));
-        assert_eq!(query.options.offset, None);
+        assert_eq!(query.limit, Some(10));
+        assert_eq!(query.offset, None);
     }
 
     #[test]
@@ -1291,8 +1298,8 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(query.options.offset, Some(5));
-        assert_eq!(query.options.limit, None);
+        assert_eq!(query.offset, Some(5));
+        assert_eq!(query.limit, None);
     }
 
     #[test]
@@ -1303,8 +1310,8 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(query.options.limit, Some(10));
-        assert_eq!(query.options.offset, Some(5));
+        assert_eq!(query.limit, Some(10));
+        assert_eq!(query.offset, Some(5));
     }
 
     #[test]
@@ -1500,8 +1507,8 @@ mod tests {
         assert_eq!(group_by_of(&query).len(), 1);
         assert!(having_of(&query).is_some());
         assert_eq!(query.ordering.len(), 1);
-        assert_eq!(query.options.limit, Some(10));
-        assert_eq!(query.options.offset, Some(5));
+        assert_eq!(query.limit, Some(10));
+        assert_eq!(query.offset, Some(5));
     }
 
     // =========================================================================

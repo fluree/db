@@ -12,7 +12,6 @@ use crate::ast::query::{
 use crate::span::SourceSpan;
 
 use fluree_db_query::ir::AggregateSpec;
-use fluree_db_query::ir::QueryOptions;
 use fluree_db_query::ir::{Expression, FlakeValue, Grouping, Pattern, SubqueryPattern};
 use fluree_db_query::parse::encode::IriEncoder;
 use fluree_db_query::sort::{SortDirection, SortSpec};
@@ -31,12 +30,19 @@ pub(super) struct SelectBinds {
     pub post: Vec<(VarId, Expression)>,
 }
 
+/// LIMIT / OFFSET / ORDER BY values produced by `lower_base_modifiers`.
+/// Each lives on `Query` directly, so the lowering helper just hands them
+/// back as a bundle for the caller to attach.
+pub(super) struct BaseModifiers {
+    pub limit: Option<usize>,
+    pub offset: Option<usize>,
+    pub ordering: Vec<SortSpec>,
+}
+
 /// Result of lowering solution modifiers.
 pub(super) struct LoweredModifiers {
-    /// Query options (LIMIT, OFFSET).
-    pub options: QueryOptions,
-    /// ORDER BY specs. Lifted onto `Query.ordering` by the caller.
-    pub ordering: Vec<SortSpec>,
+    /// LIMIT, OFFSET, ORDER BY — lifted onto `Query` by the caller.
+    pub base: BaseModifiers,
     /// Whether the SELECT carried `DISTINCT`. Lifted into the resulting
     /// [`QueryOutput::Select::restriction`] by the caller.
     pub distinct: bool,
@@ -138,14 +144,13 @@ impl<E: IriEncoder> LoweringContext<'_, E> {
         modifiers: &SolutionModifiers,
         select: &SelectClause,
     ) -> Result<LoweredModifiers> {
-        let mut options = QueryOptions::default();
         let distinct = select.modifier == Some(SelectModifier::Distinct);
         let mut group_by: Vec<VarId> = Vec::new();
         let mut having: Option<Expression> = None;
         let mut pre_group_binds = Vec::new();
 
         // LIMIT, OFFSET, ORDER BY
-        let ordering = self.lower_base_modifiers(modifiers, &mut options)?;
+        let base = self.lower_base_modifiers(modifiers)?;
 
         // GROUP BY — supports both variables and expressions.
         // Expression GROUP BY like `GROUP BY (expr AS ?alias)` desugars to
@@ -196,8 +201,7 @@ impl<E: IriEncoder> LoweringContext<'_, E> {
         }
 
         Ok(LoweredModifiers {
-            options,
-            ordering,
+            base,
             distinct,
             group_by,
             aggregates,
@@ -207,24 +211,19 @@ impl<E: IriEncoder> LoweringContext<'_, E> {
     }
 
     /// Lower LIMIT, OFFSET, and ORDER BY modifiers (shared by SELECT and
-    /// CONSTRUCT). Returns the ORDER BY specs; LIMIT and OFFSET are written
-    /// into the supplied `options`.
+    /// CONSTRUCT). Each rides on `Query` directly; the caller attaches them.
     pub(super) fn lower_base_modifiers(
         &mut self,
         modifiers: &SolutionModifiers,
-        options: &mut QueryOptions,
-    ) -> Result<Vec<SortSpec>> {
-        // LIMIT
-        if let Some(ref limit_clause) = modifiers.limit {
-            options.limit = Some(limit_clause.value as usize);
-        }
-
-        // OFFSET
-        if let Some(ref offset_clause) = modifiers.offset {
-            options.offset = Some(offset_clause.value as usize);
-        }
-
-        // ORDER BY (vars-only MVP)
+    ) -> Result<BaseModifiers> {
+        let limit = modifiers
+            .limit
+            .as_ref()
+            .map(|clause| clause.value as usize);
+        let offset = modifiers
+            .offset
+            .as_ref()
+            .map(|clause| clause.value as usize);
         let ordering = match &modifiers.order_by {
             Some(order_by) => order_by
                 .conditions
@@ -234,7 +233,11 @@ impl<E: IriEncoder> LoweringContext<'_, E> {
             None => Vec::new(),
         };
 
-        Ok(ordering)
+        Ok(BaseModifiers {
+            limit,
+            offset,
+            ordering,
+        })
     }
 
     /// Lower an ORDER BY condition (vars-only MVP)
