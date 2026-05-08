@@ -2613,10 +2613,7 @@ mod tests {
                 var: double,
                 expr: Expression::Call {
                     func: Function::Mul,
-                    args: vec![
-                        Expression::Var(age),
-                        Expression::Const(FlakeValue::Long(2)),
-                    ],
+                    args: vec![Expression::Var(age), Expression::Const(FlakeValue::Long(2))],
                 },
             },
             Pattern::Filter(Expression::gt(

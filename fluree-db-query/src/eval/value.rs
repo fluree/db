@@ -665,7 +665,6 @@ mod tests {
         assert_eq!(cv_null, Err(NullValueError));
     }
 
-
     #[test]
     fn test_into_flake_value() {
         // Reference conversion

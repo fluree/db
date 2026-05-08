@@ -7,12 +7,12 @@
 //! - Full pipeline execution
 
 use fluree_db_core::{FlakeValue, GraphDbRef, LedgerSnapshot, NoOverlay, NonEmpty, Sid};
-use fluree_db_query::ir::{AggregateFn, AggregateSpec};
 use fluree_db_query::binding::Binding;
 use fluree_db_query::context::ExecutionContext;
 use fluree_db_query::execute::{execute, ContextConfig, ExecutableQuery};
 use fluree_db_query::groupby::GroupByOperator;
 use fluree_db_query::ir::ReasoningConfig;
+use fluree_db_query::ir::{AggregateFn, AggregateSpec};
 use fluree_db_query::ir::{Aggregation, Expression, Grouping, Pattern};
 use fluree_db_query::ir::{Query, QueryOutput};
 use fluree_db_query::operator::Operator;

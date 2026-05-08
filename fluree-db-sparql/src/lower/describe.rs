@@ -15,8 +15,8 @@ use crate::SourceSpan;
 use fluree_db_query::binding::Binding;
 use fluree_db_query::ir::triple::{Ref, Term, TriplePattern};
 use fluree_db_query::ir::{
-    ConstructTemplate as QueryConstructTemplate, Expression, Pattern, Query, ReasoningConfig,
-    QueryOutput, SubqueryPattern,
+    ConstructTemplate as QueryConstructTemplate, Expression, Pattern, Query, QueryOutput,
+    ReasoningConfig, SubqueryPattern,
 };
 use fluree_db_query::parse::encode::IriEncoder;
 use fluree_db_query::var_registry::VarId;

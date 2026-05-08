@@ -37,10 +37,10 @@ pub mod adapters;
 pub mod expression;
 pub mod grouping;
 pub mod path;
-pub mod reasoning;
 pub mod pattern;
 pub mod projection;
 pub mod query;
+pub mod reasoning;
 pub mod triple;
 
 pub use adapters::{

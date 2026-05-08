@@ -35,10 +35,10 @@
 //! When any non-streamable aggregate is present, we fall back to the standard
 //! GROUP BY behavior for that column only.
 
-use crate::ir::AggregateFn;
 use crate::binding::{Batch, Binding};
 use crate::context::ExecutionContext;
 use crate::error::{QueryError, Result};
+use crate::ir::AggregateFn;
 // Note: JoinKey and Materializer would be used for multi-ledger/dataset mode
 // but for now we use GroupKeyOwned for single-ledger simplicity
 use crate::operator::{

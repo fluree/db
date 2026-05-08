@@ -941,9 +941,9 @@ fn build_keyset_for_object_chain_block(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ir::AggregateFn;
     use crate::ir::triple::{Term, TriplePattern};
-    use crate::ir::{ReasoningConfig, QueryOutput};
+    use crate::ir::AggregateFn;
+    use crate::ir::{QueryOutput, ReasoningConfig};
     use crate::var_registry::VarRegistry;
     use fluree_db_core::Sid;
     use fluree_graph_json_ld::ParsedContext;

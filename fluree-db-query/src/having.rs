@@ -140,8 +140,8 @@ mod tests {
     #[tokio::test]
     async fn test_having_filters_rows() {
         use crate::context::ExecutionContext;
-        use fluree_db_core::value::FlakeValue;
         use crate::var_registry::VarRegistry;
+        use fluree_db_core::value::FlakeValue;
 
         let snapshot = make_test_snapshot();
         let vars = VarRegistry::new();
@@ -225,8 +225,8 @@ mod tests {
     #[tokio::test]
     async fn test_having_no_matches() {
         use crate::context::ExecutionContext;
-        use fluree_db_core::value::FlakeValue;
         use crate::var_registry::VarRegistry;
+        use fluree_db_core::value::FlakeValue;
 
         let snapshot = make_test_snapshot();
         let vars = VarRegistry::new();
@@ -288,8 +288,8 @@ mod tests {
     #[tokio::test]
     async fn test_having_schema_preserved() {
         use crate::context::ExecutionContext;
-        use fluree_db_core::value::FlakeValue;
         use crate::var_registry::VarRegistry;
+        use fluree_db_core::value::FlakeValue;
 
         let snapshot = make_test_snapshot();
         let vars = VarRegistry::new();
@@ -322,8 +322,8 @@ mod tests {
     #[tokio::test]
     async fn test_having_type_mismatch_filters_out_row() {
         use crate::context::ExecutionContext;
-        use fluree_db_core::value::FlakeValue;
         use crate::var_registry::VarRegistry;
+        use fluree_db_core::value::FlakeValue;
 
         let snapshot = make_test_snapshot();
         let vars = VarRegistry::new();

@@ -61,7 +61,7 @@ pub use error::{LowerError, Result};
 use crate::ast::query::{QueryBody, SelectVariables, SparqlAst};
 
 use fluree_db_query::ir::Pattern;
-use fluree_db_query::ir::{Grouping, Query, ReasoningConfig, QueryOutput};
+use fluree_db_query::ir::{Grouping, Query, QueryOutput, ReasoningConfig};
 
 use self::select::BaseModifiers;
 use fluree_db_query::parse::encode::IriEncoder;
@@ -329,8 +329,8 @@ impl<'a, E: IriEncoder> LoweringContext<'a, E> {
 mod tests {
     use super::*;
     use crate::parse::parse_sparql;
-    use fluree_db_query::ir::{AggregateFn, AggregateSpec};
     use fluree_db_query::ir::triple::{Ref, Term};
+    use fluree_db_query::ir::{AggregateFn, AggregateSpec};
     use fluree_db_query::ir::{Expression, Grouping, PathModifier, Pattern};
     use fluree_db_query::parse::encode::MemoryEncoder;
     use fluree_db_query::sort::SortDirection;
@@ -1336,10 +1336,7 @@ mod tests {
         .unwrap();
 
         assert_eq!(query.ordering.len(), 1);
-        assert_eq!(
-            query.ordering[0].direction,
-            SortDirection::Ascending
-        );
+        assert_eq!(query.ordering[0].direction, SortDirection::Ascending);
     }
 
     #[test]
@@ -1351,10 +1348,7 @@ mod tests {
         .unwrap();
 
         assert_eq!(query.ordering.len(), 1);
-        assert_eq!(
-            query.ordering[0].direction,
-            SortDirection::Descending
-        );
+        assert_eq!(query.ordering[0].direction, SortDirection::Descending);
     }
 
     #[test]
@@ -1367,10 +1361,7 @@ mod tests {
         .unwrap();
 
         assert_eq!(query.ordering.len(), 1);
-        assert_eq!(
-            query.ordering[0].direction,
-            SortDirection::Ascending
-        );
+        assert_eq!(query.ordering[0].direction, SortDirection::Ascending);
     }
 
     #[test]

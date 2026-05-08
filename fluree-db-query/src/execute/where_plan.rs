@@ -14,8 +14,8 @@ use crate::bind::BindOperator;
 use crate::bm25::Bm25SearchOperator;
 use crate::distinct::DistinctOperator;
 use crate::error::{QueryError, Result};
-use crate::exists::ExistsOperator;
 use crate::eval::PreparedBoolExpression;
+use crate::exists::ExistsOperator;
 use crate::filter::{contains_exists, FilterOperator};
 use crate::ir::triple::{Ref, Term, TriplePattern};
 use crate::ir::{Expression, Pattern};
@@ -3018,10 +3018,8 @@ mod tests {
         // so it should be inlined.
         let age = VarId(1);
         let age2 = VarId(2);
-        let bind_expr = Expression::add(
-            Expression::Var(age),
-            Expression::Const(FlakeValue::Long(1)),
-        );
+        let bind_expr =
+            Expression::add(Expression::Var(age), Expression::Const(FlakeValue::Long(1)));
         let available: HashSet<VarId> = [VarId(0), age].into();
 
         let (ops, remaining_binds, remaining_filters) = build_inline_ops(
@@ -3086,10 +3084,7 @@ mod tests {
         let b = VarId(3);
         let bind_a = make_bind(
             a,
-            Expression::add(
-                Expression::Var(age),
-                Expression::Const(FlakeValue::Long(1)),
-            ),
+            Expression::add(Expression::Var(age), Expression::Const(FlakeValue::Long(1))),
         );
         let bind_b = make_bind(
             b,

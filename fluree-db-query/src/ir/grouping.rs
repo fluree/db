@@ -133,8 +133,8 @@ impl Grouping {
         binds: Vec<(VarId, Expression)>,
         having: Option<Expression>,
     ) -> Option<Self> {
-        let aggregation = NonEmpty::try_from_vec(aggregates)
-            .map(|aggregates| Aggregation { aggregates, binds });
+        let aggregation =
+            NonEmpty::try_from_vec(aggregates).map(|aggregates| Aggregation { aggregates, binds });
         if let Some(group_by) = NonEmpty::try_from_vec(group_by) {
             Some(Self::Explicit {
                 group_by,
@@ -142,7 +142,10 @@ impl Grouping {
                 having,
             })
         } else {
-            aggregation.map(|aggregation| Self::Implicit { aggregation, having })
+            aggregation.map(|aggregation| Self::Implicit {
+                aggregation,
+                having,
+            })
         }
     }
 

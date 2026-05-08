@@ -30,10 +30,10 @@ pub mod dataset_operator;
 pub mod dict_overlay;
 pub mod distinct;
 pub mod error;
+pub mod eval;
 pub mod execute;
 pub mod exists;
 pub mod explain;
-pub mod eval;
 pub(crate) mod fast_count;
 pub(crate) mod fast_exists_join_count_distinct_object;
 pub(crate) mod fast_fused_scan_sum;
@@ -95,7 +95,6 @@ pub mod vector;
 
 // Re-exports
 pub use aggregate::{apply_aggregate, AggregateOperator};
-pub use ir::{AggregateFn, AggregateSpec};
 pub use binary_history::BinaryHistoryScanOperator;
 pub use binary_range::BinaryRangeProvider;
 pub use binary_scan::BinaryScanOperator;
@@ -118,9 +117,10 @@ pub use graph::GraphOperator;
 pub use group_aggregate::{GroupAggregateOperator, StreamingAggSpec};
 pub use groupby::GroupByOperator;
 pub use having::HavingOperator;
+pub use ir::{AggregateFn, AggregateSpec};
 pub use ir::{
-    CompareOp, Expression, FlakeValue, Function, PathModifier, Pattern, PropertyPathPattern,
-    Query, ReasoningConfig, QueryOutput, R2rmlPattern, ReasoningModes, Ref, ServiceEndpoint,
+    CompareOp, Expression, FlakeValue, Function, PathModifier, Pattern, PropertyPathPattern, Query,
+    QueryOutput, R2rmlPattern, ReasoningConfig, ReasoningModes, Ref, ServiceEndpoint,
     ServicePattern, SubqueryPattern, Term, TriplePattern,
 };
 pub use join::{BindInstruction, NestedLoopJoinOperator, PatternPosition, UnifyInstruction};

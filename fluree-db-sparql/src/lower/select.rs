@@ -216,10 +216,7 @@ impl<E: IriEncoder> LoweringContext<'_, E> {
         &mut self,
         modifiers: &SolutionModifiers,
     ) -> Result<BaseModifiers> {
-        let limit = modifiers
-            .limit
-            .as_ref()
-            .map(|clause| clause.value as usize);
+        let limit = modifiers.limit.as_ref().map(|clause| clause.value as usize);
         let offset = modifiers
             .offset
             .as_ref()

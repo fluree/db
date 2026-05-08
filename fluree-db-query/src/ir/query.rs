@@ -15,9 +15,9 @@ use std::collections::HashSet;
 use fluree_graph_json_ld::ParsedContext;
 
 use super::grouping::Grouping;
-use super::reasoning::ReasoningConfig;
 use super::pattern::Pattern;
 use super::projection::{Column, Projection};
+use super::reasoning::ReasoningConfig;
 use super::triple::TriplePattern;
 use crate::sort::SortSpec;
 use crate::var_registry::VarId;

@@ -13,11 +13,11 @@ use super::ast::{
 };
 use super::encode::{IriEncoder, NoEncoder};
 use super::error::{ParseError, Result};
-use crate::ir::{AggregateFn, AggregateSpec};
 use crate::binding::Binding;
 use crate::context::WellKnownDatatypes;
 use crate::ir::triple::{Ref, Term, TriplePattern};
 use crate::ir::ReasoningConfig;
+use crate::ir::{AggregateFn, AggregateSpec};
 use crate::ir::{
     Column, ConstructTemplate, ForwardItem, Grouping, HydrationSpec, NestedSelectSpec, Projection,
     Query, QueryOutput, Restriction, Root,
@@ -1543,10 +1543,7 @@ fn lower_ordering(opts: &UnresolvedOptions, vars: &mut VarRegistry) -> Vec<SortS
 /// Lower the unresolved aggregation surface (GROUP BY / aggregates / HAVING)
 /// into the structural `Grouping` IR. Returns `None` when there is no
 /// aggregation phase at all (no GROUP BY, no aggregates, no HAVING).
-fn lower_grouping(
-    opts: &UnresolvedOptions,
-    vars: &mut VarRegistry,
-) -> Result<Option<Grouping>> {
+fn lower_grouping(opts: &UnresolvedOptions, vars: &mut VarRegistry) -> Result<Option<Grouping>> {
     let group_by: Vec<VarId> = opts
         .group_by
         .iter()

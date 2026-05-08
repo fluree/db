@@ -20,8 +20,8 @@
 use crate::binding::{Batch, Binding};
 use crate::context::ExecutionContext;
 use crate::error::Result;
-use crate::execute::build_where_operators_seeded;
 use crate::eval::PreparedBoolExpression;
+use crate::execute::build_where_operators_seeded;
 use crate::ir::triple::Ref;
 use crate::ir::{Expression, FlakeValue, Pattern};
 use crate::operator::{BoxedOperator, Operator, OperatorState};

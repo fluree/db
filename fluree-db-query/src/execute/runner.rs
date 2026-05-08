@@ -237,8 +237,7 @@ pub async fn prepare_execution_with_config(
             let hierarchy = schema_hierarchy_with_overlay(db.snapshot, effective_overlay, db.t);
 
             // Step 2: Determine effective reasoning modes
-            let reasoning =
-                effective_reasoning_modes(&query.reasoning.modes, hierarchy.is_some());
+            let reasoning = effective_reasoning_modes(&query.reasoning.modes, hierarchy.is_some());
 
             if reasoning.rdfs || reasoning.owl2ql || reasoning.owl2rl || reasoning.datalog {
                 tracing::debug!(

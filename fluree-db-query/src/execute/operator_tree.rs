@@ -122,13 +122,8 @@ struct StarConstOrderTopKSpec {
 /// - One numeric predicate with `FILTER(?v > K)` used only as an existence constraint
 /// - One label predicate whose object var is ORDER BY key
 /// - SELECT DISTINCT of exactly `(?s, ?label)` plus `ORDER BY ?label LIMIT k`
-fn detect_star_const_numeric_label_order_limit(
-    query: &Query,
-) -> Option<StarConstOrderTopKSpec> {
-    if !query.output.is_distinct()
-        || query.offset.is_some()
-        || query.grouping.is_some()
-    {
+fn detect_star_const_numeric_label_order_limit(query: &Query) -> Option<StarConstOrderTopKSpec> {
+    if !query.output.is_distinct() || query.offset.is_some() || query.grouping.is_some() {
         return None;
     }
     let limit = query.limit?;
@@ -473,9 +468,7 @@ pub(crate) fn detect_count_all_aggregate(query: &Query) -> Option<VarId> {
 /// - No group_by, having, post-aggregation binds, order_by, offset, or DISTINCT
 /// - LIMIT >= 1 (or no limit)
 /// - SELECT vars == `[agg.output_var]`
-fn detect_count_distinct_aggregate(
-    query: &Query,
-) -> Option<(VarId, VarId)> {
+fn detect_count_distinct_aggregate(query: &Query) -> Option<(VarId, VarId)> {
     let agg = implicit_single_aggregate(query)?;
     if agg.distinct || !matches!(agg.function, AggregateFn::CountDistinct) {
         return None;
@@ -766,9 +759,7 @@ fn detect_group_by_object_star_topk(
     ))
 }
 
-fn detect_sum_strlen_group_concat_subquery(
-    query: &Query,
-) -> Option<(Ref, Arc<str>, VarId)> {
+fn detect_sum_strlen_group_concat_subquery(query: &Query) -> Option<(Ref, Arc<str>, VarId)> {
     use crate::ir::{Expression, Function, Pattern};
 
     // Outer aggregate must be SUM(?v) (where ?v is the STRLEN bind var).
@@ -812,7 +803,11 @@ fn detect_sum_strlen_group_concat_subquery(
     // shape that the outer SUM(STRLEN(?cat)) fast-path is keyed against.
     let Some(Grouping::Explicit {
         group_by: sq_group_by,
-        aggregation: Some(Aggregation { aggregates: sq_aggregates, binds: sq_binds }),
+        aggregation:
+            Some(Aggregation {
+                aggregates: sq_aggregates,
+                binds: sq_binds,
+            }),
         having: None,
     }) = &sq.grouping
     else {
@@ -921,9 +916,7 @@ fn detect_predicate_count_rows(query: &Query) -> Option<(Ref, VarId)> {
     Some((pred, out_var))
 }
 
-fn detect_predicate_count_rows_lang_filter(
-    query: &Query,
-) -> Option<(Ref, String, VarId)> {
+fn detect_predicate_count_rows_lang_filter(query: &Query) -> Option<(Ref, String, VarId)> {
     let (input_var, out_var) = detect_count_aggregate(query)?;
 
     if query.patterns.len() != 2 {
@@ -971,9 +964,7 @@ fn detect_predicate_count_rows_lang_filter(
     None
 }
 
-fn detect_predicate_count_distinct_object(
-    query: &Query,
-) -> Option<(Ref, VarId)> {
+fn detect_predicate_count_distinct_object(query: &Query) -> Option<(Ref, VarId)> {
     let (in_var, out_var) = detect_count_distinct_aggregate(query)?;
 
     if query.patterns.len() != 1 {
@@ -992,9 +983,7 @@ fn detect_predicate_count_distinct_object(
     Some((pred, out_var))
 }
 
-fn detect_predicate_minmax_string(
-    query: &Query,
-) -> Option<(Ref, MinMaxMode, VarId)> {
+fn detect_predicate_minmax_string(query: &Query) -> Option<(Ref, MinMaxMode, VarId)> {
     // Must be a single implicit aggregate with no grouping/having/binds/etc.
     let agg = implicit_single_aggregate(query)?;
     // WHERE must be a single triple.
@@ -1190,9 +1179,7 @@ fn detect_predicate_count_rows_numeric_compare(
     Some((pred, compare, threshold, agg.output_var))
 }
 
-fn detect_string_prefix_count_all(
-    query: &Query,
-) -> Option<(Ref, Arc<str>, VarId)> {
+fn detect_string_prefix_count_all(query: &Query) -> Option<(Ref, Arc<str>, VarId)> {
     let out_var = detect_count_all_aggregate(query)?;
     if query.patterns.len() != 2 {
         return None;
@@ -1209,9 +1196,7 @@ fn detect_string_prefix_count_all(
     Some((pred, prefix, out_var))
 }
 
-fn detect_string_prefix_sum_strstarts(
-    query: &Query,
-) -> Option<(Ref, Arc<str>, VarId)> {
+fn detect_string_prefix_sum_strstarts(query: &Query) -> Option<(Ref, Arc<str>, VarId)> {
     use crate::ir::{Expression, FlakeValue, Function};
 
     let agg = implicit_single_aggregate(query)?;
@@ -1406,9 +1391,7 @@ fn detect_stats_count_by_predicate(query: &Query) -> Option<(VarId, VarId)> {
     Some((*p_var, agg.output_var))
 }
 
-fn detect_fused_scan_sum_i64(
-    query: &Query,
-) -> Option<(Ref, SumExprI64, VarId)> {
+fn detect_fused_scan_sum_i64(query: &Query) -> Option<(Ref, SumExprI64, VarId)> {
     // Must be single aggregate, no grouping/having/binds/etc.
     let agg = implicit_single_aggregate(query)?;
 
@@ -1484,9 +1467,7 @@ fn detect_fused_scan_sum_i64(
     }
 }
 
-fn detect_exists_join_count_distinct_object(
-    query: &Query,
-) -> Option<(Ref, Ref, VarId)> {
+fn detect_exists_join_count_distinct_object(query: &Query) -> Option<(Ref, Ref, VarId)> {
     let (in_var, out_var) = detect_count_distinct_aggregate(query)?;
 
     // WHERE must be exactly two triples: ?s <p1> ?o1 . ?s <p2> ?o2 .
@@ -1518,9 +1499,7 @@ fn detect_exists_join_count_distinct_object(
     }
 }
 
-fn detect_multicolumn_join_count_all(
-    query: &Query,
-) -> Option<(Ref, Ref, VarId)> {
+fn detect_multicolumn_join_count_all(query: &Query) -> Option<(Ref, Ref, VarId)> {
     let out_var = detect_count_all_aggregate(query)?;
 
     // WHERE must be exactly two triple patterns and nothing else.
@@ -1728,9 +1707,7 @@ fn detect_count_triples(query: &Query) -> Option<VarId> {
     Some(out_var)
 }
 
-fn detect_optional_chain_head_join_count_all(
-    query: &Query,
-) -> Option<(Ref, Ref, Ref, VarId)> {
+fn detect_optional_chain_head_join_count_all(query: &Query) -> Option<(Ref, Ref, Ref, VarId)> {
     let out_var = detect_count_all_aggregate(query)?;
 
     // Pattern shape: one required triple + OPTIONAL with two triples (order-independent).
@@ -1775,9 +1752,7 @@ fn detect_optional_chain_head_join_count_all(
     Some((p1, p2, p3, out_var))
 }
 
-fn detect_transitive_path_plus_count_all(
-    query: &Query,
-) -> Option<(Ref, Ref, VarId)> {
+fn detect_transitive_path_plus_count_all(query: &Query) -> Option<(Ref, Ref, VarId)> {
     let out_var = detect_count_all_aggregate(query)?;
     if query.patterns.len() != 2 {
         return None;
@@ -1971,8 +1946,7 @@ fn build_operator_tree_inner(
         if let Some((pred, scalar, out_var)) = detect_fused_scan_sum_i64(query) {
             // Build fallback operator tree without this fast path to preserve correctness in
             // pre-index / history / policy contexts.
-            let fallback =
-                build_operator_tree_inner(query, stats.clone(), false, planning)?;
+            let fallback = build_operator_tree_inner(query, stats.clone(), false, planning)?;
             return Ok(Box::new(fused_scan_sum_i64_operator(
                 pred,
                 scalar,
@@ -1986,8 +1960,7 @@ fn build_operator_tree_inner(
     // for homogeneous numeric predicates, scanning only POST `o_key` values.
     if enable_fused_fast_paths {
         if let Some((pred, out_var)) = detect_predicate_avg_numeric(query) {
-            let fallback =
-                build_operator_tree_inner(query, stats.clone(), false, planning)?;
+            let fallback = build_operator_tree_inner(query, stats.clone(), false, planning)?;
             return Ok(Box::new(predicate_avg_numeric_operator(
                 pred,
                 out_var,
@@ -2000,8 +1973,7 @@ fn build_operator_tree_inner(
     // by scanning POST and counting distinct encoded object IDs.
     if enable_fused_fast_paths {
         if let Some((pred, out_var)) = detect_predicate_count_distinct_object(query) {
-            let fallback =
-                build_operator_tree_inner(query, stats.clone(), false, planning)?;
+            let fallback = build_operator_tree_inner(query, stats.clone(), false, planning)?;
             return Ok(Box::new(count_distinct_object_operator(
                 pred,
                 out_var,
@@ -2014,8 +1986,7 @@ fn build_operator_tree_inner(
     // when the object is string-dict-backed. This inspects only POST leaflet directory keys.
     if enable_fused_fast_paths {
         if let Some((pred, mode, out_var)) = detect_predicate_minmax_string(query) {
-            let fallback =
-                build_operator_tree_inner(query, stats.clone(), false, planning)?;
+            let fallback = build_operator_tree_inner(query, stats.clone(), false, planning)?;
             return Ok(Box::new(predicate_min_max_string_operator(
                 pred,
                 mode,
@@ -2028,8 +1999,7 @@ fn build_operator_tree_inner(
     // Fast-path: `COUNT(*)` over one triple with an anchored string-prefix filter.
     if enable_fused_fast_paths {
         if let Some((pred, prefix, out_var)) = detect_string_prefix_count_all(query) {
-            let fallback =
-                build_operator_tree_inner(query, stats.clone(), false, planning)?;
+            let fallback = build_operator_tree_inner(query, stats.clone(), false, planning)?;
             return Ok(Box::new(string_prefix_count_all_operator(
                 pred,
                 prefix,
@@ -2042,8 +2012,7 @@ fn build_operator_tree_inner(
     // Fast-path: `SUM(xsd:integer(STRSTARTS(?o, "...")))` over one triple.
     if enable_fused_fast_paths {
         if let Some((pred, prefix, out_var)) = detect_string_prefix_sum_strstarts(query) {
-            let fallback =
-                build_operator_tree_inner(query, stats.clone(), false, planning)?;
+            let fallback = build_operator_tree_inner(query, stats.clone(), false, planning)?;
             return Ok(Box::new(string_prefix_sum_strstarts_operator(
                 pred,
                 prefix,
@@ -2061,11 +2030,8 @@ fn build_operator_tree_inner(
     //
     // We build a scan that emits no bindings (empty schema) and counts rows.
     if enable_fused_fast_paths {
-        if let Some((pred, lang_tag, out_var)) =
-            detect_predicate_count_rows_lang_filter(query)
-        {
-            let fallback =
-                build_operator_tree_inner(query, stats.clone(), false, planning)?;
+        if let Some((pred, lang_tag, out_var)) = detect_predicate_count_rows_lang_filter(query) {
+            let fallback = build_operator_tree_inner(query, stats.clone(), false, planning)?;
             return Ok(Box::new(count_rows_lang_filter_operator(
                 pred,
                 lang_tag,
@@ -2079,8 +2045,7 @@ fn build_operator_tree_inner(
         if let Some((pred, compare, threshold, out_var)) =
             detect_predicate_count_rows_numeric_compare(query)
         {
-            let fallback =
-                build_operator_tree_inner(query, stats.clone(), false, planning)?;
+            let fallback = build_operator_tree_inner(query, stats.clone(), false, planning)?;
             return Ok(Box::new(count_rows_numeric_compare_operator(
                 pred,
                 compare,
@@ -2092,10 +2057,8 @@ fn build_operator_tree_inner(
     }
 
     if enable_fused_fast_paths {
-        if let Some((tp, filters, out_var)) = detect_count_rows_with_encoded_filters(query)
-        {
-            let fallback =
-                build_operator_tree_inner(query, stats.clone(), false, planning)?;
+        if let Some((tp, filters, out_var)) = detect_count_rows_with_encoded_filters(query) {
+            let fallback = build_operator_tree_inner(query, stats.clone(), false, planning)?;
             let inline_ops: Vec<InlineOperator> = filters
                 .into_iter()
                 .map(|expr| InlineOperator::Filter(PreparedBoolExpression::new(expr)))
@@ -2125,8 +2088,7 @@ fn build_operator_tree_inner(
     // answered from PSOT leaflet directory row counts (no scan / no decoding).
     if enable_fused_fast_paths {
         if let Some((pred, out_var)) = detect_predicate_count_rows(query) {
-            let fallback =
-                build_operator_tree_inner(query, stats.clone(), false, planning)?;
+            let fallback = build_operator_tree_inner(query, stats.clone(), false, planning)?;
             return Ok(Box::new(count_rows_operator(pred, out_var, Some(fallback))));
         }
     }
@@ -2136,8 +2098,7 @@ fn build_operator_tree_inner(
     // Fires after trivial metadata-only counts but before the remaining specialized fast paths.
     if enable_fused_fast_paths {
         if let Some(plan) = crate::count_plan::try_build_count_plan(query) {
-            let fallback =
-                build_operator_tree_inner(query, stats.clone(), false, planning)?;
+            let fallback = build_operator_tree_inner(query, stats.clone(), false, planning)?;
             return Ok(crate::count_plan_exec::count_plan_operator(
                 plan,
                 Some(fallback),
@@ -2148,8 +2109,7 @@ fn build_operator_tree_inner(
     // Fast-path: `COUNT(*)` for a 2-pattern multicolumn join `?s p1 ?o . ?s p2 ?o`.
     if enable_fused_fast_paths {
         if let Some((p1, p2, out_var)) = detect_multicolumn_join_count_all(query) {
-            let fallback =
-                build_operator_tree_inner(query, stats.clone(), false, planning)?;
+            let fallback = build_operator_tree_inner(query, stats.clone(), false, planning)?;
             return Ok(Box::new(multicolumn_join_count_all_operator(
                 p1,
                 p2,
@@ -2164,8 +2124,7 @@ fn build_operator_tree_inner(
         if let Some((count_pred, exists_pred, out_var)) =
             detect_exists_join_count_distinct_object(query)
         {
-            let fallback =
-                build_operator_tree_inner(query, stats.clone(), false, planning)?;
+            let fallback = build_operator_tree_inner(query, stats.clone(), false, planning)?;
             return Ok(Box::new(exists_join_count_distinct_object_operator(
                 count_pred,
                 exists_pred,
@@ -2179,8 +2138,7 @@ fn build_operator_tree_inner(
     // answered from SPOT leaflet metadata by scanning the blank-node SubjectId range.
     if enable_fused_fast_paths {
         if let Some(out_var) = detect_count_blank_node_subjects(query) {
-            let fallback =
-                build_operator_tree_inner(query, stats.clone(), false, planning)?;
+            let fallback = build_operator_tree_inner(query, stats.clone(), false, planning)?;
             return Ok(Box::new(count_blank_node_subjects_operator(
                 out_var,
                 Some(fallback),
@@ -2192,8 +2150,7 @@ fn build_operator_tree_inner(
     // answered from PSOT leaflet metadata by counting non-node-ref `o_type` rows.
     if enable_fused_fast_paths {
         if let Some(out_var) = detect_count_literal_objects(query) {
-            let fallback =
-                build_operator_tree_inner(query, stats.clone(), false, planning)?;
+            let fallback = build_operator_tree_inner(query, stats.clone(), false, planning)?;
             return Ok(Box::new(count_literal_objects_operator(
                 out_var,
                 Some(fallback),
@@ -2205,8 +2162,7 @@ fn build_operator_tree_inner(
     // answered metadata-only from SPOT leaflet `lead_group_count` + boundary correction.
     if enable_fused_fast_paths {
         if let Some(out_var) = detect_count_distinct_subjects(query) {
-            let fallback =
-                build_operator_tree_inner(query, stats.clone(), false, planning)?;
+            let fallback = build_operator_tree_inner(query, stats.clone(), false, planning)?;
             return Ok(Box::new(count_distinct_subjects_operator(
                 out_var,
                 Some(fallback),
@@ -2218,8 +2174,7 @@ fn build_operator_tree_inner(
     // answered metadata-only from PSOT leaflet `p_const` transitions.
     if enable_fused_fast_paths {
         if let Some(out_var) = detect_count_distinct_predicates(query) {
-            let fallback =
-                build_operator_tree_inner(query, stats.clone(), false, planning)?;
+            let fallback = build_operator_tree_inner(query, stats.clone(), false, planning)?;
             return Ok(Box::new(count_distinct_predicates_operator(
                 out_var,
                 Some(fallback),
@@ -2231,8 +2186,7 @@ fn build_operator_tree_inner(
     // answered metadata-only by summing leaf row_count across a branch manifest.
     if enable_fused_fast_paths {
         if let Some(out_var) = detect_count_triples(query) {
-            let fallback =
-                build_operator_tree_inner(query, stats.clone(), false, planning)?;
+            let fallback = build_operator_tree_inner(query, stats.clone(), false, planning)?;
             return Ok(Box::new(count_triples_operator(out_var, Some(fallback))));
         }
     }
@@ -2240,11 +2194,8 @@ fn build_operator_tree_inner(
     // Fast-path: `SELECT (COUNT(*) AS ?c) WHERE { ?a <p1> ?b . OPTIONAL { ?b <p2> ?c . ?c <p3> ?d } }`
     // answered by streaming group counts and an `n3(c)` map.
     if enable_fused_fast_paths {
-        if let Some((p1, p2, p3, out_var)) =
-            detect_optional_chain_head_join_count_all(query)
-        {
-            let fallback =
-                build_operator_tree_inner(query, stats.clone(), false, planning)?;
+        if let Some((p1, p2, p3, out_var)) = detect_optional_chain_head_join_count_all(query) {
+            let fallback = build_operator_tree_inner(query, stats.clone(), false, planning)?;
             return Ok(Box::new(predicate_optional_chain_head_count_all(
                 p1,
                 p2,
@@ -2261,8 +2212,7 @@ fn build_operator_tree_inner(
         if let Some((pred_sid, subject, out_var)) =
             detect_property_path_plus_fixed_subject_count_all(query)
         {
-            let fallback =
-                build_operator_tree_inner(query, stats.clone(), false, planning)?;
+            let fallback = build_operator_tree_inner(query, stats.clone(), false, planning)?;
             return Ok(Box::new(property_path_plus_count_all_operator(
                 pred_sid,
                 subject,
@@ -2274,11 +2224,9 @@ fn build_operator_tree_inner(
 
     // Fast-path: UNION-of-triples optionally constrained by same-subject star joins and/or FILTER(?s = ?o).
     if enable_fused_fast_paths {
-        if let Some((union_preds, extra_preds, mode, out_var)) =
-            detect_union_star_count_all(query)
+        if let Some((union_preds, extra_preds, mode, out_var)) = detect_union_star_count_all(query)
         {
-            let fallback =
-                build_operator_tree_inner(query, stats.clone(), false, planning)?;
+            let fallback = build_operator_tree_inner(query, stats.clone(), false, planning)?;
             return Ok(Box::new(UnionStarCountAllOperator::new(
                 union_preds,
                 extra_preds,
@@ -2293,8 +2241,7 @@ fn build_operator_tree_inner(
     // Avoids closure materialization by counting reachability.
     if enable_fused_fast_paths {
         if let Some((p1, p2, out_var)) = detect_transitive_path_plus_count_all(query) {
-            let fallback =
-                build_operator_tree_inner(query, stats.clone(), false, planning)?;
+            let fallback = build_operator_tree_inner(query, stats.clone(), false, planning)?;
             return Ok(Box::new(transitive_path_plus_count_all_operator(
                 p1,
                 p2,
@@ -2308,8 +2255,7 @@ fn build_operator_tree_inner(
     // answered metadata-only from OPST leaflet `lead_group_count` + boundary correction.
     if enable_fused_fast_paths {
         if let Some(out_var) = detect_count_distinct_objects(query) {
-            let fallback =
-                build_operator_tree_inner(query, stats.clone(), false, planning)?;
+            let fallback = build_operator_tree_inner(query, stats.clone(), false, planning)?;
             return Ok(Box::new(count_distinct_objects_operator(
                 out_var,
                 Some(fallback),
@@ -2320,8 +2266,7 @@ fn build_operator_tree_inner(
     // Fast-path: constant-object star constraints + numeric existence filter + label ORDER BY + LIMIT.
     if enable_fused_fast_paths {
         if let Some(spec) = detect_star_const_numeric_label_order_limit(query) {
-            let fallback =
-                build_operator_tree_inner(query, stats.clone(), false, planning)?;
+            let fallback = build_operator_tree_inner(query, stats.clone(), false, planning)?;
             let threshold = match spec.numeric_threshold {
                 Term::Value(v) => v,
                 _ => return Ok(fallback),
@@ -2342,8 +2287,7 @@ fn build_operator_tree_inner(
     // Fast-path: label scan + regex filter + rdf:type membership check.
     if enable_fused_fast_paths {
         if let Some(spec) = detect_label_regex_type(query) {
-            let fallback =
-                build_operator_tree_inner(query, stats.clone(), false, planning)?;
+            let fallback = build_operator_tree_inner(query, stats.clone(), false, planning)?;
             return Ok(label_regex_type_operator(
                 spec.subject_var,
                 spec.label_var,
@@ -2374,8 +2318,7 @@ fn build_operator_tree_inner(
             limit,
         )) = detect_group_by_object_star_topk(query)
         {
-            let fallback =
-                build_operator_tree_inner(query, stats.clone(), false, planning)?;
+            let fallback = build_operator_tree_inner(query, stats.clone(), false, planning)?;
             return Ok(Box::new(GroupByObjectStarTopKOperator::new(
                 group_pred,
                 filter_preds,
@@ -2413,10 +2356,8 @@ fn build_operator_tree_inner(
 
     // Fast-path: SUM(STRLEN(GROUP_CONCAT(...))) over a single predicate.
     if enable_fused_fast_paths {
-        if let Some((pred, sep, out_var)) = detect_sum_strlen_group_concat_subquery(query)
-        {
-            let fallback =
-                build_operator_tree_inner(query, stats.clone(), false, planning)?;
+        if let Some((pred, sep, out_var)) = detect_sum_strlen_group_concat_subquery(query) {
+            let fallback = build_operator_tree_inner(query, stats.clone(), false, planning)?;
             return Ok(Box::new(sum_strlen_group_concat_operator(
                 pred,
                 sep,
@@ -2601,10 +2542,8 @@ fn build_operator_tree_inner(
 
         // Validate aggregates
         let current_schema = operator.schema();
-        let group_by_set: HashSet<VarId> =
-            group_by_vec.iter().copied().collect();
-        let mut seen_output_vars: HashSet<VarId> =
-            HashSet::new();
+        let group_by_set: HashSet<VarId> = group_by_vec.iter().copied().collect();
+        let mut seen_output_vars: HashSet<VarId> = HashSet::new();
 
         for spec in &aggregates_vec {
             if let Some(input_var) = spec.input_var {
@@ -2661,8 +2600,7 @@ fn build_operator_tree_inner(
         // `Binding::Grouped(Vec<Binding>)` and remain selectable.
         let select_needs_grouped_vars = query.output.projected_vars().is_some_and(|vars| {
             vars.iter().any(|v| {
-                !group_by_vec.contains(v)
-                    && !aggregates_vec.iter().any(|a| a.output_var == *v)
+                !group_by_vec.contains(v) && !aggregates_vec.iter().any(|a| a.output_var == *v)
             })
         });
 
@@ -2972,8 +2910,8 @@ mod tests {
             post_values: None,
         };
 
-        let spec = detect_star_const_numeric_label_order_limit(&query)
-            .expect("should detect shape");
+        let spec =
+            detect_star_const_numeric_label_order_limit(&query).expect("should detect shape");
         assert_eq!(spec.subject_var, s);
         assert_eq!(spec.label_var, label);
         assert_eq!(spec.limit, 10);

@@ -294,8 +294,8 @@ pub fn eval_bnode<R: RowAccess>(
 mod tests {
     use super::*;
     use crate::binding::Batch;
-    use fluree_db_core::value::FlakeValue;
     use crate::var_registry::VarId;
+    use fluree_db_core::value::FlakeValue;
     use fluree_db_core::Sid;
 
     #[test]
