@@ -130,6 +130,13 @@ pub enum DiagCode {
     #[serde(rename = "F009")]
     VariableInGroundData,
 
+    /// Aggregate scope violation: a variable is referenced in a SELECT
+    /// projection (or ORDER BY / HAVING) outside of an aggregate function
+    /// without appearing in GROUP BY. W3C SPARQL §18.5 forbids this — see
+    /// negative-syntax tests `agg08`–`agg12`.
+    #[serde(rename = "F010")]
+    UngroupedVariableInProjection,
+
     // =========================================================================
     // Rust port status (R001-R099) - "Rust engine not finished"
     // =========================================================================
@@ -177,6 +184,7 @@ impl DiagCode {
             Self::UnsupportedSelectReduced => "F007",
             Self::UnsupportedDistinctAggregate => "F008",
             Self::VariableInGroundData => "F009",
+            Self::UngroupedVariableInProjection => "F010",
             // Rust port
             Self::LoweringNotImplemented => "R001",
             // Warnings

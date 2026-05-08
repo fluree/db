@@ -28,18 +28,22 @@
 //! }
 //! ```
 
+use crate::ast::expr::Expression;
 use crate::ast::path::PropertyPath;
 use crate::ast::pattern::{GraphPattern, TriplePattern};
 use crate::ast::query::{
-    AskQuery, ConstructQuery, DescribeQuery, QueryBody, SelectQuery, SparqlAst,
+    AskQuery, ConstructQuery, DescribeQuery, GroupCondition, QueryBody, SelectQuery,
+    SelectVariable, SelectVariables, SparqlAst,
 };
-use crate::ast::term::{PredicateTerm, SubjectTerm, Term};
+use crate::ast::term::{PredicateTerm, SubjectTerm, Term, Var};
 use crate::ast::update::{
     DeleteData, DeleteWhere, InsertData, Modify, QuadData, QuadPattern, QuadPatternElement,
     UpdateOperation,
 };
 use crate::diag::{DiagCode, Diagnostic, Label};
 use crate::span::SourceSpan;
+use std::collections::HashSet;
+use std::sync::Arc;
 
 /// Fluree capability configuration.
 ///
@@ -101,6 +105,183 @@ impl<'a> Validator<'a> {
 
     fn validate_select(&mut self, query: &SelectQuery) {
         self.validate_graph_pattern(&query.where_clause.pattern);
+        self.validate_aggregate_scope(query);
+    }
+
+    /// W3C SPARQL §18.5 aggregate scope rules.
+    ///
+    /// When a query is "grouped" — has an explicit `GROUP BY` clause OR has
+    /// any aggregate in the SELECT — every variable referenced in a
+    /// non-aggregate SELECT projection (or its alias-bearing expression)
+    /// must be either:
+    ///
+    /// 1. A grouped variable (named directly in GROUP BY, or the alias of a
+    ///    `GROUP BY (expr AS ?alias)` clause, or the bare variable in
+    ///    `GROUP BY (?x)`).
+    /// 2. An aggregate alias from a `SELECT (AGG(...) AS ?alias)` element.
+    ///
+    /// Variables that appear only inside an aggregate function (e.g. the
+    /// `?x` in `COUNT(?x)`) are aggregate inputs — allowed regardless.
+    ///
+    /// W3C negative-syntax tests `agg08`–`agg12` exercise this rule.
+    fn validate_aggregate_scope(&mut self, query: &SelectQuery) {
+        let has_group_by = query.modifiers.group_by.is_some();
+        let has_aggregates = match &query.select.variables {
+            SelectVariables::Star => false,
+            SelectVariables::Explicit(vars) => vars.iter().any(|v| {
+                matches!(v, SelectVariable::Expr { expr, .. }
+                    if expr_contains_aggregate(expr))
+            }),
+        };
+        if !has_group_by && !has_aggregates {
+            return;
+        }
+
+        // Build the set of in-scope (grouped or aggregate-alias) variable names.
+        let mut in_scope: HashSet<Arc<str>> = HashSet::new();
+
+        if let Some(ref gb) = query.modifiers.group_by {
+            for cond in &gb.conditions {
+                match cond {
+                    GroupCondition::Var(v) => {
+                        in_scope.insert(v.name.clone());
+                    }
+                    GroupCondition::Expr {
+                        expr,
+                        alias: Some(a),
+                        ..
+                    } => {
+                        // GROUP BY (expr AS ?alias) — alias is grouped.
+                        in_scope.insert(a.name.clone());
+                        // The vars *inside* expr are NOT grouped (only the alias is).
+                        let _ = expr; // suppress unused-binding warning if any
+                    }
+                    GroupCondition::Expr {
+                        expr, alias: None, ..
+                    } => {
+                        // GROUP BY (?x) without alias unwraps to a plain
+                        // grouped variable. GROUP BY (?x + ?y) without alias
+                        // contributes no user-visible grouped name (the
+                        // synthesized alias is implementation-only and
+                        // cannot be referenced from SELECT).
+                        if let Expression::Var(v) = expr.unwrap_bracketed() {
+                            in_scope.insert(v.name.clone());
+                        }
+                    }
+                }
+            }
+        }
+
+        if let SelectVariables::Explicit(vars) = &query.select.variables {
+            for sv in vars {
+                if let SelectVariable::Expr {
+                    expr: Expression::Aggregate { .. },
+                    alias,
+                    ..
+                } = sv
+                {
+                    in_scope.insert(alias.name.clone());
+                }
+            }
+        }
+
+        // Walk each non-aggregate SELECT element and validate its variable
+        // references. Aggregate elements are skipped — their inputs are
+        // always allowed regardless of grouping.
+        if let SelectVariables::Explicit(vars) = &query.select.variables {
+            for sv in vars {
+                match sv {
+                    SelectVariable::Var(v) => {
+                        if !in_scope.contains(&v.name) {
+                            self.report_ungrouped_var(v);
+                        }
+                    }
+                    SelectVariable::Expr { expr, .. } => {
+                        if matches!(expr, Expression::Aggregate { .. }) {
+                            continue;
+                        }
+                        self.check_expr_vars_in_scope(expr, &in_scope);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Walk an expression tree and report any ungrouped variable reference.
+    /// Recursion stops at `Expression::Aggregate` boundaries — aggregate
+    /// inputs are always allowed.
+    fn check_expr_vars_in_scope(&mut self, expr: &Expression, in_scope: &HashSet<Arc<str>>) {
+        match expr {
+            Expression::Var(v) => {
+                if !in_scope.contains(&v.name) {
+                    self.report_ungrouped_var(v);
+                }
+            }
+            Expression::Aggregate { .. } => {
+                // Inside an aggregate: input vars are aggregate operands, allowed.
+            }
+            Expression::Binary { left, right, .. } => {
+                self.check_expr_vars_in_scope(left, in_scope);
+                self.check_expr_vars_in_scope(right, in_scope);
+            }
+            Expression::Unary { operand, .. } => {
+                self.check_expr_vars_in_scope(operand, in_scope);
+            }
+            Expression::FunctionCall { args, .. } => {
+                for arg in args {
+                    self.check_expr_vars_in_scope(arg, in_scope);
+                }
+            }
+            Expression::If {
+                condition,
+                then_expr,
+                else_expr,
+                ..
+            } => {
+                self.check_expr_vars_in_scope(condition, in_scope);
+                self.check_expr_vars_in_scope(then_expr, in_scope);
+                self.check_expr_vars_in_scope(else_expr, in_scope);
+            }
+            Expression::Coalesce { args, .. } => {
+                for arg in args {
+                    self.check_expr_vars_in_scope(arg, in_scope);
+                }
+            }
+            Expression::In { expr, list, .. } => {
+                self.check_expr_vars_in_scope(expr, in_scope);
+                for arg in list {
+                    self.check_expr_vars_in_scope(arg, in_scope);
+                }
+            }
+            Expression::Bracketed { inner, .. } => {
+                self.check_expr_vars_in_scope(inner, in_scope);
+            }
+            // EXISTS/NOT EXISTS introduce their own scope; their pattern's
+            // bound variables are local. Don't propagate the outer scope check.
+            Expression::Exists { .. } | Expression::NotExists { .. } => {}
+            Expression::Literal(_) | Expression::Iri(_) => {}
+        }
+    }
+
+    fn report_ungrouped_var(&mut self, v: &Var) {
+        self.diagnostics.push(Diagnostic {
+            code: DiagCode::UngroupedVariableInProjection,
+            severity: DiagCode::UngroupedVariableInProjection.default_severity(),
+            message: format!(
+                "Variable '?{}' is referenced in a SELECT projection but is not in the GROUP BY scope and not an aggregate alias (W3C SPARQL §18.5)",
+                v.name
+            ),
+            span: v.span,
+            labels: vec![Label {
+                span: v.span,
+                message: format!(
+                    "'?{}' must appear in GROUP BY, or be wrapped in an aggregate function",
+                    v.name
+                ),
+            }],
+            help: None,
+            note: None,
+        });
     }
 
     fn validate_construct(&mut self, query: &ConstructQuery) {
@@ -387,6 +568,41 @@ impl<'a> Validator<'a> {
     }
 }
 
+/// Recursively detect any `Expression::Aggregate` in an expression tree.
+/// Used to flag a SELECT clause as "grouped" when it contains aggregates,
+/// even when there is no explicit GROUP BY clause (W3C SPARQL §18.5
+/// implicit single-group case).
+fn expr_contains_aggregate(expr: &Expression) -> bool {
+    match expr {
+        Expression::Aggregate { .. } => true,
+        Expression::Binary { left, right, .. } => {
+            expr_contains_aggregate(left) || expr_contains_aggregate(right)
+        }
+        Expression::Unary { operand, .. } => expr_contains_aggregate(operand),
+        Expression::FunctionCall { args, .. } => args.iter().any(expr_contains_aggregate),
+        Expression::If {
+            condition,
+            then_expr,
+            else_expr,
+            ..
+        } => {
+            expr_contains_aggregate(condition)
+                || expr_contains_aggregate(then_expr)
+                || expr_contains_aggregate(else_expr)
+        }
+        Expression::Coalesce { args, .. } => args.iter().any(expr_contains_aggregate),
+        Expression::In { expr, list, .. } => {
+            expr_contains_aggregate(expr) || list.iter().any(expr_contains_aggregate)
+        }
+        Expression::Bracketed { inner, .. } => expr_contains_aggregate(inner),
+        Expression::Var(_)
+        | Expression::Literal(_)
+        | Expression::Iri(_)
+        | Expression::Exists { .. }
+        | Expression::NotExists { .. } => false,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -632,5 +848,142 @@ mod tests {
             .expect("Expected path error");
         assert!(path_error.help.is_some(), "Error should have help text");
         assert!(path_error.note.is_some(), "Error should have a note");
+    }
+
+    // =========================================================================
+    // Aggregate scope rules — W3C SPARQL §18.5
+    // (negative-syntax tests agg08–agg12)
+    // =========================================================================
+
+    fn has_ungrouped_var_error(diags: &[Diagnostic]) -> bool {
+        diags
+            .iter()
+            .any(|d| d.code == DiagCode::UngroupedVariableInProjection)
+    }
+
+    #[test]
+    fn test_ungrouped_var_with_aggregate_no_groupby_rejected() {
+        // agg10: SELECT ?P (COUNT(?O) AS ?C) WHERE { ?S ?P ?O } — no GROUP BY,
+        // ?P is ungrouped while an aggregate is present.
+        let diags = validate_query(
+            "PREFIX : <http://example.org/>
+             SELECT ?P (COUNT(?O) AS ?C) WHERE { ?S ?P ?O }",
+        );
+        assert!(
+            has_ungrouped_var_error(&diags),
+            "expected ungrouped-var error; got: {diags:?}"
+        );
+    }
+
+    #[test]
+    fn test_ungrouped_var_with_explicit_groupby_rejected() {
+        // agg09: GROUP BY ?S but SELECT projects ?P which isn't grouped.
+        let diags = validate_query(
+            "PREFIX : <http://example.org/>
+             SELECT ?P (COUNT(?O) AS ?C) WHERE { ?S ?P ?O } GROUP BY ?S",
+        );
+        assert!(
+            has_ungrouped_var_error(&diags),
+            "expected ungrouped-var error; got: {diags:?}"
+        );
+    }
+
+    #[test]
+    fn test_groupby_expression_without_alias_does_not_expose_inner_vars() {
+        // agg08: GROUP BY (?O1 + ?O2) without alias — ?O1 and ?O2 are not
+        // grouped (only the synthesized expression alias is implementation-only).
+        let diags = validate_query(
+            "PREFIX : <http://example.org/>
+             SELECT ((?O1 + ?O2) AS ?O12) (COUNT(?O1) AS ?C)
+             WHERE { ?S :p ?O1; :q ?O2 } GROUP BY (?O1 + ?O2)
+             ORDER BY ?O12",
+        );
+        assert!(
+            has_ungrouped_var_error(&diags),
+            "expected ungrouped-var error; got: {diags:?}"
+        );
+    }
+
+    #[test]
+    fn test_ungrouped_var_in_projection_expression_rejected() {
+        // agg11: GROUP BY (?S) but projection expression uses ?O1 + ?O2.
+        let diags = validate_query(
+            "PREFIX : <http://example.org/>
+             SELECT ((?O1 + ?O2) AS ?O12) (COUNT(?O1) AS ?C)
+             WHERE { ?S :p ?O1; :q ?O2 } GROUP BY (?S)",
+        );
+        assert!(
+            has_ungrouped_var_error(&diags),
+            "expected ungrouped-var error; got: {diags:?}"
+        );
+    }
+
+    #[test]
+    fn test_var_inside_groupby_expr_is_not_grouped() {
+        // agg12: GROUP BY (?O1 + ?O2) but SELECT projects ?O1.
+        let diags = validate_query(
+            "PREFIX : <http://example.org/>
+             SELECT ?O1 (COUNT(?O2) AS ?C)
+             WHERE { ?S :p ?O1; :q ?O2 } GROUP BY (?O1 + ?O2)",
+        );
+        assert!(
+            has_ungrouped_var_error(&diags),
+            "expected ungrouped-var error; got: {diags:?}"
+        );
+    }
+
+    #[test]
+    fn test_grouped_var_in_projection_accepted() {
+        // SELECT ?S projects a grouped variable — should pass.
+        let diags = validate_query(
+            "PREFIX : <http://example.org/>
+             SELECT ?S (COUNT(?O) AS ?C) WHERE { ?S ?P ?O } GROUP BY ?S",
+        );
+        assert!(
+            !has_ungrouped_var_error(&diags),
+            "should not flag grouped variable; got: {diags:?}"
+        );
+    }
+
+    #[test]
+    fn test_aggregate_alias_in_post_aggregation_projection_accepted() {
+        // SELECT ?S (COUNT(?O) AS ?C) (?C + 1 AS ?D) — ?C is an aggregate
+        // alias and is allowed in subsequent projection expressions.
+        let diags = validate_query(
+            "PREFIX : <http://example.org/>
+             SELECT ?S (COUNT(?O) AS ?C) ((?C + 1) AS ?D)
+             WHERE { ?S ?P ?O } GROUP BY ?S",
+        );
+        assert!(
+            !has_ungrouped_var_error(&diags),
+            "should accept aggregate alias in projection; got: {diags:?}"
+        );
+    }
+
+    #[test]
+    fn test_groupby_expression_with_alias_grouped_var_accepted() {
+        // GROUP BY (UCASE(?S) AS ?up) — ?up is grouped.
+        let diags = validate_query(
+            "PREFIX : <http://example.org/>
+             SELECT ?up (COUNT(?O) AS ?C)
+             WHERE { ?S ?P ?O } GROUP BY (UCASE(STR(?S)) AS ?up)",
+        );
+        assert!(
+            !has_ungrouped_var_error(&diags),
+            "should accept GROUP BY alias; got: {diags:?}"
+        );
+    }
+
+    #[test]
+    fn test_simple_select_without_aggregates_or_groupby_unaffected() {
+        // No aggregates, no GROUP BY: scope check is skipped entirely.
+        let diags = validate_query(
+            "PREFIX : <http://example.org/>
+             SELECT ?S ?P ?O WHERE { ?S ?P ?O }",
+        );
+        assert!(
+            !has_ungrouped_var_error(&diags),
+            "non-aggregate query should not trigger scope check; got: {diags:?}"
+        );
     }
 }

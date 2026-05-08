@@ -148,10 +148,7 @@ impl NumericAccum {
 
         // Promote accumulator state if we're crossing into the f64 band.
         if matches!(new_tier, NumericTier::Float | NumericTier::Double)
-            && !matches!(
-                self.tier,
-                Some(NumericTier::Float | NumericTier::Double)
-            )
+            && !matches!(self.tier, Some(NumericTier::Float | NumericTier::Double))
         {
             // Fold the exact decimal sum into f64 (one-time conversion).
             self.f_sum += self.d_sum.to_f64().unwrap_or(0.0);
