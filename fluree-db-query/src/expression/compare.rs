@@ -284,6 +284,18 @@ fn cmp_values(left: &ComparableValue, right: &ComparableValue) -> Option<Orderin
         (ComparableValue::Bool(a), ComparableValue::Bool(b)) => Some(a.cmp(b)),
         (ComparableValue::Sid(a), ComparableValue::Sid(b)) => Some(a.cmp(b)),
         (ComparableValue::Iri(a), ComparableValue::Iri(b)) => Some(a.cmp(b)),
+        // Custom-datatype string literals: compare lexically only if both
+        // sides share the same datatype constraint, per W3C SPARQL §17.4.1.2.
+        // Different datatypes (or one TypedLiteral and one plain String)
+        // yield `None` (type error / FILTER false) — exercised by W3C
+        // `eq-4`, `eq-2-1`, `eq-2-2`.
+        (
+            ComparableValue::TypedLiteral { val: lv, dtc: ld },
+            ComparableValue::TypedLiteral { val: rv, dtc: rd },
+        ) if ld == rd => match (lv, rv) {
+            (FlakeValue::String(a), FlakeValue::String(b)) => Some(a.cmp(b)),
+            _ => None,
+        },
         // Type mismatch
         _ => None,
     }

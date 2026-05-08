@@ -11,8 +11,49 @@ use crate::binding::{Binding, BindingRow, RowAccess};
 use crate::context::ExecutionContext;
 use crate::error::{QueryError, Result};
 use crate::ir::{Expression, FilterValue};
+use crate::parse::UnresolvedDatatypeConstraint;
 use crate::var_registry::VarId;
+use fluree_db_core::{FlakeValue, Sid};
 use std::sync::Arc;
+
+/// Convert a `Binding::Lit { val, dtc }` to a `ComparableValue`, preserving
+/// custom-datatype information so cross-type equality comparisons can be
+/// detected per W3C SPARQL §17.4.1.2 (RDFterm-equal).
+///
+/// The default `String → ComparableValue::String` conversion drops datatype
+/// info — fine for `xsd:string` (the canonical plain literal) but wrong for
+/// `"zzz"^^:myType`, which would then compare equal to a plain `"zzz"`. The
+/// W3C `expr-equals` tests `eq-4`, `eq-2-1`, and `eq-2-2` exercise this.
+///
+/// When the value is a string with a non-`xsd:string` datatype, wrap as
+/// `ComparableValue::TypedLiteral` carrying a structural-key dtc derived
+/// from the resolved Sid (`[<ns_code>:<name>]`). The compare engine then
+/// emits `None` for cross-type comparisons (→ FILTER false / type error)
+/// and matches lexically when both sides share the same datatype key.
+fn comparable_from_lit(val: &FlakeValue, dt_sid: &Sid) -> Option<ComparableValue> {
+    let xsd_string = Sid::xsd_string();
+    // String literals only wrap as TypedLiteral when their datatype is a
+    // genuine *custom* type (e.g. `:myType`). Both `xsd:string` (the plain-
+    // literal default) and `rdf:langString` (lang-tagged strings) flow as
+    // `ComparableValue::String` so the SPARQL string functions
+    // (CONTAINS, SUBSTR, REGEX, REPLACE, STRSTARTS, ...) can operate on
+    // them. The wrap exists to enable the W3C `eq-2-1`/`eq-2-2` value
+    // -equality semantics that distinguish a typed literal from a plain
+    // literal of the same lexical form.
+    let is_default_string_class = *dt_sid == xsd_string
+        || (dt_sid.namespace_code == fluree_vocab::namespaces::RDF
+            && dt_sid.name.as_ref() == fluree_vocab::rdf_names::LANG_STRING);
+    match val {
+        FlakeValue::String(s) if !is_default_string_class => {
+            let dt_key = format!("[{}:{}]", dt_sid.namespace_code, dt_sid.name);
+            Some(ComparableValue::TypedLiteral {
+                val: FlakeValue::String(s.clone()),
+                dtc: Some(UnresolvedDatatypeConstraint::Explicit(Arc::from(dt_key))),
+            })
+        }
+        _ => ComparableValue::try_from(val).ok(),
+    }
+}
 
 impl Expression {
     fn decode_lookup_error(
@@ -98,7 +139,9 @@ impl Expression {
     ) -> Result<Option<ComparableValue>> {
         match self {
             Expression::Var(var) => match row.get(*var) {
-                Some(Binding::Lit { val, .. }) => Ok(ComparableValue::try_from(val).ok()),
+                Some(Binding::Lit { val, dtc, .. }) => {
+                    Ok(comparable_from_lit(val, dtc.datatype()))
+                }
                 Some(Binding::EncodedLit {
                     o_kind,
                     o_key,
@@ -121,6 +164,19 @@ impl Expression {
                             e,
                         )
                     })?;
+                    // For string-valued literals with a custom (non-xsd:string)
+                    // datatype, look up the Sid and route through the same
+                    // TypedLiteral wrapper used for `Binding::Lit`. Without
+                    // this, `"zzz"^^:myType` would decode to `String("zzz")`
+                    // and compare equal to a plain `"zzz"` (W3C eq-4 violation).
+                    if let FlakeValue::String(_) = &val {
+                        if let Some(dt_sid) = ctx
+                            .and_then(|c| c.binary_store.as_deref())
+                            .and_then(|store| store.dt_sids().get(*dt_id as usize).cloned())
+                        {
+                            return Ok(comparable_from_lit(&val, &dt_sid));
+                        }
+                    }
                     Ok(ComparableValue::try_from(&val).ok())
                 }
                 Some(Binding::Sid { sid, .. }) => Ok(Some(ComparableValue::Sid(sid.clone()))),
