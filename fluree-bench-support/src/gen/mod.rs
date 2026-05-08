@@ -15,6 +15,9 @@
 //!   RNG-driven (used by end-to-end vector benches).
 //! - [`corpora`] — paragraph-length text + vocabulary. Used by full-text
 //!   benchmarks.
+//! - [`bsbm`] — Berlin SPARQL Benchmark-shape graph (Vendor, Product,
+//!   Person, Review). Used by `query_hot_bsbm` and any future bench
+//!   that wants multi-hop join + filter + aggregate query patterns.
 //!
 //! ## Determinism contract
 //!
@@ -23,6 +26,7 @@
 //! reproducibility and regression-budget validity both depend on it. Tests
 //! in each submodule pin the contract.
 
+pub mod bsbm;
 pub mod corpora;
 pub mod people;
 pub mod vectors;

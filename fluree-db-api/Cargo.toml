@@ -172,5 +172,9 @@ harness = false
 name = "novelty_replay"
 harness = false
 
+[[bench]]
+name = "query_hot_bsbm"
+harness = false
+
 [lints]
 workspace = true
