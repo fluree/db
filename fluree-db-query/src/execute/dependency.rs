@@ -114,7 +114,7 @@ pub fn compute_variable_deps(query: &Query, options: &QueryOptions) -> Option<Va
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::aggregate::{AggregateFn, AggregateSpec};
+    use crate::ir::{AggregateFn, AggregateSpec};
     use crate::ir::triple::{Ref, Term, TriplePattern};
     use crate::ir::QueryOptions;
     use crate::ir::{Aggregation, ConstructTemplate, Query, QueryOutput};

@@ -942,7 +942,7 @@ fn build_keyset_for_object_chain_block(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::aggregate::AggregateFn;
+    use crate::ir::AggregateFn;
     use crate::ir::triple::{Term, TriplePattern};
     use crate::ir::QueryOutput;
     use crate::var_registry::VarRegistry;
@@ -958,7 +958,7 @@ mod tests {
         let grouping = Some(crate::ir::Grouping::Implicit {
             aggregation: crate::ir::Aggregation {
                 aggregates: fluree_db_core::NonEmpty::try_from_vec(vec![
-                    crate::aggregate::AggregateSpec {
+                    crate::ir::AggregateSpec {
                         function: AggregateFn::CountAll,
                         input_var: None,
                         output_var: out_var,

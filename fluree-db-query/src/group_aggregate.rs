@@ -35,7 +35,7 @@
 //! When any non-streamable aggregate is present, we fall back to the standard
 //! GROUP BY behavior for that column only.
 
-use crate::aggregate::AggregateFn;
+use crate::ir::AggregateFn;
 use crate::binding::{Batch, Binding};
 use crate::context::ExecutionContext;
 use crate::error::{QueryError, Result};

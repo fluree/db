@@ -110,7 +110,7 @@ impl PredicateGroupCountFirstsOperator {
     }
 
     async fn open_fallback(&mut self, ctx: &ExecutionContext<'_>) -> Result<()> {
-        use crate::aggregate::AggregateFn;
+        use crate::ir::AggregateFn;
         use crate::dataset_operator::DatasetOperator;
         use crate::group_aggregate::{GroupAggregateOperator, StreamingAggSpec};
         use crate::ir::triple::{Ref, TriplePattern};
@@ -362,7 +362,7 @@ impl PredicateObjectCountFirstsOperator {
     }
 
     async fn open_fallback(&mut self, ctx: &ExecutionContext<'_>) -> Result<()> {
-        use crate::aggregate::AggregateFn;
+        use crate::ir::AggregateFn;
         use crate::dataset_operator::DatasetOperator;
         use crate::group_aggregate::{GroupAggregateOperator, StreamingAggSpec};
         use crate::ir::triple::{Ref, TriplePattern};

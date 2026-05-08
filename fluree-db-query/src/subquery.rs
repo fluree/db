@@ -315,7 +315,7 @@ impl SubqueryOperator {
                 crate::ir::Grouping::Implicit { .. } => Vec::new(),
                 crate::ir::Grouping::Explicit { group_by, .. } => group_by.iter().copied().collect(),
             };
-            let aggregates: Vec<crate::aggregate::AggregateSpec> =
+            let aggregates: Vec<crate::ir::AggregateSpec> =
                 grouping.aggregates().cloned().collect();
             let having = grouping.having().cloned();
             operator = Box::new(GroupByOperator::new(operator, group_by));

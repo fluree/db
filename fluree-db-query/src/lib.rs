@@ -94,7 +94,8 @@ pub mod var_registry;
 pub mod vector;
 
 // Re-exports
-pub use aggregate::{apply_aggregate, AggregateFn, AggregateOperator, AggregateSpec};
+pub use aggregate::{apply_aggregate, AggregateOperator};
+pub use ir::{AggregateFn, AggregateSpec};
 pub use binary_history::BinaryHistoryScanOperator;
 pub use binary_range::BinaryRangeProvider;
 pub use binary_scan::BinaryScanOperator;

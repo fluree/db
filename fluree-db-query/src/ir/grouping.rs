@@ -4,8 +4,57 @@
 use fluree_db_core::NonEmpty;
 
 use super::expression::Expression;
-use crate::aggregate::AggregateSpec;
 use crate::var_registry::VarId;
+
+/// Aggregate function kinds.
+///
+/// `DISTINCT` handling is split: `COUNT(DISTINCT)` has a dedicated variant
+/// (`CountDistinct`) because its streaming state uses a `HashSet` rather
+/// than a simple counter. All other DISTINCT aggregates (SUM, AVG, …) use
+/// their normal variant with `AggregateSpec::distinct = true`, and dedup
+/// is applied at execution time.
+#[derive(Debug, Clone, PartialEq)]
+pub enum AggregateFn {
+    /// COUNT — count non-Unbound values of a variable
+    Count,
+    /// COUNT(*) — count all rows in a group regardless of variable values
+    CountAll,
+    /// COUNT(DISTINCT) — count distinct non-Unbound values (dedicated variant
+    /// for streaming HashSet state; `AggregateSpec::distinct` is false here)
+    CountDistinct,
+    /// SUM — numeric sum
+    Sum,
+    /// AVG — numeric average
+    Avg,
+    /// MIN — minimum value by comparison
+    Min,
+    /// MAX — maximum value by comparison
+    Max,
+    /// MEDIAN — median value
+    Median,
+    /// VARIANCE — population variance
+    Variance,
+    /// STDDEV — population standard deviation
+    Stddev,
+    /// GROUP_CONCAT — concatenate strings with separator
+    GroupConcat { separator: String },
+    /// SAMPLE — return an arbitrary value
+    Sample,
+}
+
+/// Specification for a single aggregate operation.
+#[derive(Debug, Clone)]
+pub struct AggregateSpec {
+    /// The aggregate function to apply.
+    pub function: AggregateFn,
+    /// Input variable (contains `Grouped` values after GROUP BY). `None`
+    /// for `COUNT(*)`, which counts all rows regardless of values.
+    pub input_var: Option<VarId>,
+    /// Output variable for the aggregate result.
+    pub output_var: VarId,
+    /// Whether `DISTINCT` was specified (e.g., `SUM(DISTINCT ?x)`).
+    pub distinct: bool,
+}
 
 /// The aggregation stage of a grouping phase: aggregate functions computed
 /// per group, plus any derived bindings that depend on the aggregate outputs.

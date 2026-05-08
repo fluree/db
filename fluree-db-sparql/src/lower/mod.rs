@@ -336,7 +336,7 @@ impl<'a, E: IriEncoder> LoweringContext<'a, E> {
 mod tests {
     use super::*;
     use crate::parse::parse_sparql;
-    use fluree_db_query::aggregate::{AggregateFn, AggregateSpec};
+    use fluree_db_query::ir::{AggregateFn, AggregateSpec};
     use fluree_db_query::ir::triple::{Ref, Term};
     use fluree_db_query::ir::{Expression, Grouping, PathModifier, Pattern};
     use fluree_db_query::parse::encode::MemoryEncoder;

@@ -18,6 +18,7 @@
 use crate::binding::{Batch, Binding};
 use crate::context::ExecutionContext;
 use crate::error::Result;
+use crate::ir::{AggregateFn, AggregateSpec};
 use crate::operator::{
     compute_trimmed_vars, effective_schema, trim_batch, BoxedOperator, Operator, OperatorState,
 };
@@ -28,56 +29,6 @@ use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Instant;
 use tracing::Instrument;
-
-/// Aggregate function types.
-///
-/// DISTINCT handling is split: `COUNT(DISTINCT)` has a dedicated variant
-/// (`CountDistinct`) because its streaming state uses a HashSet rather than
-/// a simple counter. All other DISTINCT aggregates (SUM, AVG, etc.) use
-/// their normal variant with `AggregateSpec::distinct = true`, and dedup
-/// is applied at execution time by `apply_aggregate()`.
-#[derive(Debug, Clone, PartialEq)]
-pub enum AggregateFn {
-    /// COUNT - count non-Unbound values of a variable
-    Count,
-    /// COUNT(*) - count all rows in a group (regardless of variable values)
-    CountAll,
-    /// COUNT(DISTINCT) - count distinct non-Unbound values (dedicated variant
-    /// for streaming HashSet state; `AggregateSpec::distinct` is false for this)
-    CountDistinct,
-    /// SUM - numeric sum
-    Sum,
-    /// AVG - numeric average
-    Avg,
-    /// MIN - minimum value by comparison
-    Min,
-    /// MAX - maximum value by comparison
-    Max,
-    /// MEDIAN - median value
-    Median,
-    /// VARIANCE - population variance
-    Variance,
-    /// STDDEV - population standard deviation
-    Stddev,
-    /// GROUP_CONCAT - concatenate strings with separator
-    GroupConcat { separator: String },
-    /// SAMPLE - return an arbitrary value
-    Sample,
-}
-
-/// Specification for a single aggregate operation
-#[derive(Debug, Clone)]
-pub struct AggregateSpec {
-    /// The aggregate function to apply
-    pub function: AggregateFn,
-    /// Input variable (should contain Grouped values after GROUP BY)
-    /// None for COUNT(*) which counts all rows regardless of variable values
-    pub input_var: Option<VarId>,
-    /// Output variable for the aggregate result
-    pub output_var: VarId,
-    /// Whether DISTINCT was specified (e.g., SUM(DISTINCT ?x))
-    pub distinct: bool,
-}
 
 /// Aggregate operator - applies aggregate functions to grouped values
 ///

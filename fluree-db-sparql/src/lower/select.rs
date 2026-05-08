@@ -11,7 +11,7 @@ use crate::ast::query::{
 };
 use crate::span::SourceSpan;
 
-use fluree_db_query::aggregate::AggregateSpec;
+use fluree_db_query::ir::AggregateSpec;
 use fluree_db_query::ir::QueryOptions;
 use fluree_db_query::ir::{Expression, FlakeValue, Pattern, SubqueryPattern};
 use fluree_db_query::parse::encode::IriEncoder;

@@ -13,7 +13,7 @@ use super::ast::{
 };
 use super::encode::{IriEncoder, NoEncoder};
 use super::error::{ParseError, Result};
-use crate::aggregate::{AggregateFn, AggregateSpec};
+use crate::ir::{AggregateFn, AggregateSpec};
 use crate::binding::Binding;
 use crate::context::WellKnownDatatypes;
 use crate::ir::triple::{Ref, Term, TriplePattern};

@@ -3,9 +3,9 @@
 //! Builds the complete operator tree for a query including:
 //! WHERE patterns → GROUP BY → Aggregates → HAVING → ORDER BY → PROJECT → DISTINCT → OFFSET → LIMIT
 
-use crate::aggregate::AggregateFn;
+use crate::ir::AggregateFn;
 use crate::aggregate::AggregateOperator;
-use crate::aggregate::AggregateSpec;
+use crate::ir::AggregateSpec;
 use crate::binary_scan::EmitMask;
 use crate::count_rows::CountRowsOperator;
 use crate::distinct::DistinctOperator;
@@ -3199,8 +3199,8 @@ mod tests {
             Some(Grouping::Implicit {
                 aggregation: Aggregation {
                     aggregates: fluree_db_core::NonEmpty::try_from_vec(vec![
-                        crate::aggregate::AggregateSpec {
-                            function: crate::aggregate::AggregateFn::CountDistinct,
+                        crate::ir::AggregateSpec {
+                            function: crate::ir::AggregateFn::CountDistinct,
                             input_var: Some(counted_o),
                             output_var: out,
                             distinct: false,
