@@ -65,6 +65,7 @@
   - [Branching and merging](guides/cookbook-branching.md)
   - [Access control policies](guides/cookbook-policies.md)
   - [SHACL validation](guides/cookbook-shacl.md)
+  - [`owl:imports` across named graphs](guides/cookbook-owl-imports.md)
 
 - [Design](design/README.md)
   - [Query execution and overlay merge](design/query-execution.md)
