@@ -44,7 +44,20 @@ use tokio::runtime::Runtime;
 const BATCH_SIZE: usize = 200;
 
 /// Dataset sizes to benchmark.
-const DATASET_SIZES: &[usize] = &[1_000, 5_000, 10_000, 50_000];
+const DATASET_SIZES_FULL: &[usize] = &[1_000, 5_000, 10_000, 50_000];
+
+/// Scale-driven slice of `DATASET_SIZES_FULL`. Tiny only runs the
+/// smallest size so the CI bench-gate stays under its wall-clock
+/// budget; nightly (`Full` profile, scale=Large) runs the whole curve.
+fn dataset_sizes() -> &'static [usize] {
+    use fluree_bench_support::BenchScale;
+    match fluree_bench_support::current_scale() {
+        BenchScale::Tiny => &DATASET_SIZES_FULL[..1],
+        BenchScale::Small => &DATASET_SIZES_FULL[..2],
+        BenchScale::Medium => &DATASET_SIZES_FULL[..3],
+        BenchScale::Large => DATASET_SIZES_FULL,
+    }
+}
 
 /// Categories for filtered queries — ~25% pass rate per category.
 const CATEGORIES: &[&str] = &["science", "technology", "history", "culture"];
@@ -198,7 +211,7 @@ fn bench_fulltext_scan_all(c: &mut Criterion) {
     let mut group = c.benchmark_group("fulltext_scan_all");
     group.sample_size(10);
 
-    for &n in DATASET_SIZES {
+    for &n in dataset_sizes() {
         eprintln!("  [setup] Inserting {n} @fulltext docs...");
         let (fluree, ledger, query, _, _) = rt.block_on(setup_dataset(n));
         let db = fluree_db_api::GraphDb::from_ledger_state(&ledger);
@@ -222,7 +235,7 @@ fn bench_fulltext_scan_all_indexed(c: &mut Criterion) {
     let mut group = c.benchmark_group("fulltext_scan_all_indexed");
     group.sample_size(10);
 
-    for &n in DATASET_SIZES {
+    for &n in dataset_sizes() {
         eprintln!("  [setup] Inserting {n} @fulltext docs + building index...");
         let (_fluree, snapshot, query, _, _) = rt.block_on(setup_dataset_indexed(n));
 
@@ -247,7 +260,7 @@ fn bench_fulltext_scan_filtered(c: &mut Criterion) {
     let mut group = c.benchmark_group("fulltext_scan_filtered");
     group.sample_size(10);
 
-    for &n in DATASET_SIZES {
+    for &n in dataset_sizes() {
         eprintln!("  [setup] Inserting {n} @fulltext docs...");
         let (fluree, ledger, _, query, n_science) = rt.block_on(setup_dataset(n));
         let db = fluree_db_api::GraphDb::from_ledger_state(&ledger);
@@ -283,7 +296,7 @@ fn bench_fulltext_scan_filtered_indexed(c: &mut Criterion) {
     let mut group = c.benchmark_group("fulltext_scan_filtered_indexed");
     group.sample_size(10);
 
-    for &n in DATASET_SIZES {
+    for &n in dataset_sizes() {
         eprintln!("  [setup] Inserting {n} @fulltext docs + building index...");
         let (_fluree, snapshot, _, query, n_science) = rt.block_on(setup_dataset_indexed(n));
         eprintln!(

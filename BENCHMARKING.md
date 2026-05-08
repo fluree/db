@@ -77,13 +77,47 @@ plots and prior-run comparisons.
 ## Regression budgets
 
 `regression-budget.json` at the workspace root sets the per-bench, per-scale
-percentage regression that CI's gated job will accept. The default is 5%
-for any (crate, bench, scale) tuple not explicitly listed.
+percentage regression that CI's gated job will accept once the gate is in
+its final shape. The default is 5% for any (crate, bench, scale) tuple
+not explicitly listed.
 
-CI's gated bench job (lands in `bench-5`) reads this file, runs the `Quick`
-profile of every bench, and fails if a measured regression exceeds the
-budget. To intentionally accept a regression (or tighten a budget), edit
-the JSON in the same PR and explain in the PR body.
+### CI gate — two phases
+
+The gate runs in two phases, defined separately in CI:
+
+1. **`bench-gate` (this PR's contribution)** — runs on every PR and push to
+   `main`. Two checks:
+   - **Reconcile.** `cargo test -p fluree-bench-support --test workspace_reconcile`
+     asserts every `[[bench]]` declared in a workspace member's `Cargo.toml`
+     has a matching entry in `regression-budget.json`, and vice versa. A
+     missing or stale entry fails the gate with a message naming the
+     `crate/bench` pair to fix.
+   - **Smoke.** `cargo bench --workspace -- --test` runs each bench's
+     scenarios once at `tiny` scale. Catches benches that compile but
+     panic at runtime (bad SPARQL, broken setup, missing API surface).
+
+   This phase **does not** compare against runner-stable baselines, so a
+   2× regression that still completes successfully won't fail the gate.
+   That comparison is phase 2.
+
+2. **`bench-nightly` (separate PR — `bench-nightly`)** — runs on a cron
+   schedule with `FLUREE_BENCH_PROFILE=full` against the canonical
+   `bench-baselines.json` committed in the repo. Compares observed
+   nanoseconds to `baseline × (1 + budget_pct/100)` for each
+   `(crate, bench, scale)` tuple and fails the job if any bench exceeds
+   its budget.
+
+To intentionally accept a regression (or tighten a budget), edit
+`regression-budget.json` in the same PR and explain in the PR body.
+
+### Why two phases
+
+`ubuntu-latest` shared runners flap; a 5% threshold on a single PR run
+would produce false positives every few PRs. Phase 2 amortizes noise
+across the nightly's larger sample (`Full` profile = ~30 samples per
+bench) and uses dedicated 4-core runners for stability. Phase 1 catches
+the regressions that don't depend on baseline comparison: API breakage,
+panics, missing budgets.
 
 ## Architecture
 

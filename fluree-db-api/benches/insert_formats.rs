@@ -36,10 +36,23 @@ use tokio::runtime::Runtime;
 // ---------------------------------------------------------------------------
 
 /// Transaction counts to benchmark.
-const TXN_COUNTS: &[usize] = &[10, 100];
+const TXN_COUNTS_FULL: &[usize] = &[10, 100];
 
 /// Nodes per transaction to benchmark.
-const NODES_PER_TXN: &[usize] = &[10, 100, 1_000];
+const NODES_PER_TXN_FULL: &[usize] = &[10, 100, 1_000];
+
+/// Scale-driven slices. Tiny runs only the smallest matrix cell so the
+/// CI bench-gate stays under its wall-clock budget; nightly runs the
+/// full matrix (6 scenarios at the largest dimensions).
+fn matrix() -> (&'static [usize], &'static [usize]) {
+    use fluree_bench_support::BenchScale;
+    match fluree_bench_support::current_scale() {
+        BenchScale::Tiny => (&TXN_COUNTS_FULL[..1], &NODES_PER_TXN_FULL[..1]),
+        BenchScale::Small => (&TXN_COUNTS_FULL[..1], &NODES_PER_TXN_FULL[..2]),
+        BenchScale::Medium => (TXN_COUNTS_FULL, &NODES_PER_TXN_FULL[..2]),
+        BenchScale::Large => (TXN_COUNTS_FULL, NODES_PER_TXN_FULL),
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Type aliases
@@ -270,8 +283,9 @@ fn bench_insert_formats(c: &mut Criterion) {
 
     let mut summary: Vec<ScenarioResult> = Vec::new();
 
-    for &txn_count in TXN_COUNTS {
-        for &nodes_per_txn in NODES_PER_TXN {
+    let (txn_counts, nodes_per_txn_arr) = matrix();
+    for &txn_count in txn_counts {
+        for &nodes_per_txn in nodes_per_txn_arr {
             let total_nodes = txn_count * nodes_per_txn;
 
             eprintln!(

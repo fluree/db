@@ -100,3 +100,55 @@ jobs:
       - name: Check compiles (test targets)
         working-directory: testsuite-sparql
         run: cargo test --no-run
+
+  bench-gate:
+    # Two-phase bench gate (matches `BENCHMARKING.md`):
+    #   Phase 1 (this job)        — smoke + reconcile, run per-PR.
+    #   Phase 2 (bench-nightly)   — regression comparison against
+    #                               runner-stable baselines, runs on cron.
+    #
+    # Phase 1's failure modes:
+    #   - A bench no longer compiles (real API regression).
+    #   - A bench's `--test` mode panics or never returns.
+    #   - A `[[bench]]` is declared in Cargo.toml without a matching
+    #     entry in `regression-budget.json` (or vice versa).
+    #
+    # Wall-clock budget: ~5–8 min on `ubuntu-latest` after rust-cache
+    # warms up, ~12–15 min cold. The smoke run uses the `tiny` scale
+    # (smallest input curve per bench) so the gate stays affordable.
+    runs-on: ubuntu-latest
+    env:
+      FLUREE_BENCH_PROFILE: quick
+      FLUREE_BENCH_SCALE: tiny
+    steps:
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet
+          sudo rm -rf /usr/local/lib/android
+          sudo rm -rf /opt/ghc
+          sudo rm -rf /opt/hostedtoolcache/CodeQL
+          sudo docker image prune --all --force
+
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
+
+      # Reconcile first — failure here is fast (no compile needed) and
+      # tells the contributor exactly which bench / budget entry is
+      # out of sync.
+      - name: Reconcile workspace [[bench]] entries with regression-budget.json
+        run: cargo test -p fluree-bench-support --test workspace_reconcile
+
+      # Build all benches in release. Heavy on cold cache; rust-cache
+      # makes subsequent runs cheap.
+      - name: Build benches
+        run: cargo bench --workspace --no-run
+
+      # Smoke-run every bench's scenarios at `tiny` scale via
+      # criterion's `--test` mode (one iteration per scenario, no
+      # statistics collected). Catches benches that compile but panic
+      # at runtime (bad SPARQL, broken setup, missing API surface).
+      - name: Smoke-run benches at tiny scale
+        run: cargo bench --workspace -- --test

@@ -32,3 +32,8 @@ sha2 = { workspace = true }
 # Bench helpers are themselves trivially testable; small criterion dep is OK
 # but we keep the surface tiny so this crate doesn't pull criterion into
 # anyone who depends on it.
+
+# `toml` is dev-only — used by the workspace_reconcile integration test
+# (walks every member crate's Cargo.toml to reconcile `[[bench]]` entries
+# with regression-budget.json).
+toml = "0.8"

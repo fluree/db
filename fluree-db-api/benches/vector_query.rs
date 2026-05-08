@@ -44,7 +44,18 @@ const VECTOR_DIM: usize = 768;
 const BATCH_SIZE: usize = 100;
 
 /// Dataset sizes to benchmark (keep small for sub-1s query target).
-const DATASET_SIZES: &[usize] = &[1_000, 5_000];
+const DATASET_SIZES_FULL: &[usize] = &[1_000, 5_000];
+
+/// Scale-driven slice of `DATASET_SIZES_FULL`. Tiny only runs the
+/// smallest size so the CI bench-gate stays under its wall-clock
+/// budget; nightly runs the whole curve.
+fn dataset_sizes() -> &'static [usize] {
+    use fluree_bench_support::BenchScale;
+    match fluree_bench_support::current_scale() {
+        BenchScale::Tiny => &DATASET_SIZES_FULL[..1],
+        _ => DATASET_SIZES_FULL,
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Type aliases (matches test support pattern)
@@ -139,9 +150,12 @@ async fn setup_dataset(
     let query_all = json!({
         "@context": ctx,
         "select": ["?article", "?score"],
+        // Query VALUES clauses require the full IRI for embedding vector
+        // typed literals; the `@vector` alias is INSERT-only. See
+        // it_vector_flatrank.rs for the canonical pattern.
         "values": [
             ["?queryVec"],
-            [{"@value": query_vec.clone(), "@type": "@vector"}]
+            [{"@value": query_vec.clone(), "@type": "https://ns.flur.ee/db#embeddingVector"}]
         ],
         "where": [
             {"@id": "?article", "ex:articleSummaryVec": "?vec"},
@@ -159,7 +173,7 @@ async fn setup_dataset(
         "select": ["?article", "?score"],
         "values": [
             ["?queryVec"],
-            [{"@value": query_vec, "@type": "@vector"}]
+            [{"@value": query_vec, "@type": "https://ns.flur.ee/db#embeddingVector"}]
         ],
         "where": [
             {"@id": "?article", "ex:publishedDate": "?date", "ex:articleSummaryVec": "?vec"},
@@ -214,7 +228,7 @@ fn bench_vector_scan_all(c: &mut Criterion) {
     let mut group = c.benchmark_group("vector_scan_all");
     group.sample_size(10);
 
-    for &n in DATASET_SIZES {
+    for &n in dataset_sizes() {
         eprintln!("  [setup] Inserting {n} articles with {VECTOR_DIM}-dim vectors...");
         let (fluree, ledger, query, _, _) = rt.block_on(setup_dataset(n));
         let db = fluree_db_api::GraphDb::from_ledger_state(&ledger);
@@ -238,7 +252,7 @@ fn bench_vector_scan_all_indexed(c: &mut Criterion) {
     let mut group = c.benchmark_group("vector_scan_all_indexed");
     group.sample_size(10);
 
-    for &n in DATASET_SIZES {
+    for &n in dataset_sizes() {
         eprintln!(
             "  [setup] Inserting {n} articles with {VECTOR_DIM}-dim vectors + building index..."
         );
@@ -265,7 +279,7 @@ fn bench_vector_scan_filtered(c: &mut Criterion) {
     let mut group = c.benchmark_group("vector_scan_filtered");
     group.sample_size(10);
 
-    for &n in DATASET_SIZES {
+    for &n in dataset_sizes() {
         eprintln!("  [setup] Inserting {n} articles with {VECTOR_DIM}-dim vectors...");
         let (fluree, ledger, _, query, n_recent) = rt.block_on(setup_dataset(n));
         let db = fluree_db_api::GraphDb::from_ledger_state(&ledger);
@@ -302,7 +316,7 @@ fn bench_vector_scan_filtered_indexed(c: &mut Criterion) {
     let mut group = c.benchmark_group("vector_scan_filtered_indexed");
     group.sample_size(10);
 
-    for &n in DATASET_SIZES {
+    for &n in dataset_sizes() {
         eprintln!(
             "  [setup] Inserting {n} articles with {VECTOR_DIM}-dim vectors + building index..."
         );
