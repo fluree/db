@@ -115,6 +115,30 @@ impl Sid {
         SID.clone()
     }
 
+    /// XSD `xsd:decimal` SID.
+    ///
+    /// Cached via `LazyLock` — the `Arc<str>` is allocated once and reused.
+    /// Used by aggregate output typing: `SUM` of integers stays `xsd:integer`,
+    /// but `SUM` involving any decimal value promotes to `xsd:decimal`, and
+    /// `AVG` of integers/decimals returns `xsd:decimal` per W3C SPARQL §17.4.1.7.
+    pub fn xsd_decimal() -> Sid {
+        use std::sync::LazyLock;
+        static SID: LazyLock<Sid> = LazyLock::new(|| Sid::new(namespaces::XSD, xsd_names::DECIMAL));
+        SID.clone()
+    }
+
+    /// XSD `xsd:float` SID.
+    ///
+    /// Cached via `LazyLock` — the `Arc<str>` is allocated once and reused.
+    /// `xsd:float` and `xsd:double` are stored alike (`FlakeValue::Double(f64)`),
+    /// but the SPARQL numeric promotion lattice distinguishes them: `xsd:float`
+    /// promotes to `xsd:double` when mixed with one.
+    pub fn xsd_float() -> Sid {
+        use std::sync::LazyLock;
+        static SID: LazyLock<Sid> = LazyLock::new(|| Sid::new(namespaces::XSD, xsd_names::FLOAT));
+        SID.clone()
+    }
+
     /// XSD `xsd:string` SID.
     ///
     /// Cached via `LazyLock` — the `Arc<str>` is allocated once and reused.

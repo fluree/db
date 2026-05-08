@@ -76,10 +76,14 @@ enum AggState {
     Count { n: u64 },
     /// COUNT(DISTINCT) - HashSet of seen values
     CountDistinct { seen: HashSet<GroupKeyOwned> },
-    /// SUM - running total (as f64 for mixed types)
-    Sum { total: f64, has_int_only: bool },
-    /// AVG - sum and count
-    Avg { sum: f64, count: u64 },
+    /// SUM - type-aware accumulator (W3C SPARQL §17.4.1.7 promotion).
+    /// Tracks the widest numeric tier seen and preserves precision in
+    /// BigDecimal while in the integer/decimal band, folding to f64 when a
+    /// float/double value is observed.
+    Sum(crate::numeric_tier::NumericAccum),
+    /// AVG - same tier-aware accumulator. Emits `0 xsd:integer` for empty
+    /// groups per W3C test `agg-avg-03`.
+    Avg(crate::numeric_tier::NumericAccum),
     /// MIN - current minimum (stores materialized binding for correct comparison)
     Min { min: Option<Binding> },
     /// MAX - current maximum (stores materialized binding for correct comparison)
@@ -214,11 +218,8 @@ impl AggState {
             AggregateFn::CountDistinct => AggState::CountDistinct {
                 seen: HashSet::new(),
             },
-            AggregateFn::Sum => AggState::Sum {
-                total: 0.0,
-                has_int_only: true,
-            },
-            AggregateFn::Avg => AggState::Avg { sum: 0.0, count: 0 },
+            AggregateFn::Sum => AggState::Sum(crate::numeric_tier::NumericAccum::new()),
+            AggregateFn::Avg => AggState::Avg(crate::numeric_tier::NumericAccum::new()),
             AggregateFn::Min => AggState::Min { min: None },
             AggregateFn::Max => AggState::Max { max: None },
             // Non-streamable: collect all values
@@ -253,23 +254,8 @@ impl AggState {
                     seen.insert(key);
                 }
             }
-            AggState::Sum {
-                total,
-                has_int_only,
-            } => {
-                if let Some(num) = extract_number(binding) {
-                    *total += num;
-                    if !is_int_binding(binding) {
-                        *has_int_only = false;
-                    }
-                }
-            }
-            AggState::Avg { sum, count } => {
-                if let Some(num) = extract_number(binding) {
-                    *sum += num;
-                    *count += 1;
-                }
-            }
+            AggState::Sum(accum) => accum.add(binding),
+            AggState::Avg(accum) => accum.add(binding),
             AggState::Min { min } => {
                 if !matches!(
                     binding,
@@ -333,23 +319,8 @@ impl AggState {
             AggState::CountDistinct { seen } => {
                 Binding::lit(FlakeValue::Long(seen.len() as i64), Sid::xsd_integer())
             }
-            AggState::Sum {
-                total,
-                has_int_only,
-            } => {
-                if has_int_only && total.fract() == 0.0 {
-                    Binding::lit(FlakeValue::Long(total as i64), Sid::xsd_integer())
-                } else {
-                    Binding::lit(FlakeValue::Double(total), Sid::xsd_double())
-                }
-            }
-            AggState::Avg { sum, count } => {
-                if count == 0 {
-                    Binding::Unbound
-                } else {
-                    Binding::lit(FlakeValue::Double(sum / count as f64), Sid::xsd_double())
-                }
-            }
+            AggState::Sum(accum) => accum.finalize_sum(),
+            AggState::Avg(accum) => accum.finalize_avg(),
             AggState::Min { min } => min.unwrap_or(Binding::Unbound),
             AggState::Max { max } => max.unwrap_or(Binding::Unbound),
             AggState::Sample { sample } => sample.unwrap_or(Binding::Unbound),
@@ -947,52 +918,6 @@ impl Operator for GroupAggregateOperator {
     }
 }
 
-/// Extract numeric value from binding
-fn extract_number(binding: &Binding) -> Option<f64> {
-    use fluree_db_core::value_id::{ObjKey, ObjKind};
-
-    match binding {
-        Binding::Lit { val, .. } => match val {
-            FlakeValue::Long(n) => Some(*n as f64),
-            FlakeValue::Boolean(b) => Some(i64::from(*b) as f64),
-            FlakeValue::Double(d) if !d.is_nan() => Some(*d),
-            _ => None,
-        },
-        Binding::EncodedLit { o_kind, o_key, .. } => {
-            // Decode numeric value from o_key based on o_kind
-            // i_val is list index metadata, NOT the numeric value!
-            if *o_kind == ObjKind::NUM_INT.as_u8() {
-                // i64 encoded in o_key via order-preserving XOR transform
-                Some(ObjKey::from_u64(*o_key).decode_i64() as f64)
-            } else if *o_kind == ObjKind::NUM_F64.as_u8() {
-                // f64 encoded in o_key via order-preserving bit transform
-                let decoded = ObjKey::from_u64(*o_key).decode_f64();
-                if decoded.is_nan() {
-                    None
-                } else {
-                    Some(decoded)
-                }
-            } else {
-                None
-            }
-        }
-        _ => None,
-    }
-}
-
-/// Check if binding is an integer type
-fn is_int_binding(binding: &Binding) -> bool {
-    match binding {
-        Binding::Lit { val, .. } => matches!(val, FlakeValue::Long(_) | FlakeValue::Boolean(_)),
-        Binding::EncodedLit { o_kind, .. } => {
-            // ObjKind for Long is typically stored as a specific value
-            // This needs to match the actual encoding
-            *o_kind == fluree_db_core::ObjKind::NUM_INT.as_u8()
-        }
-        _ => false,
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1208,12 +1133,18 @@ mod tests {
                         } => *n,
                         _ => panic!("Expected Long"),
                     };
+                    // AVG of integer inputs returns xsd:decimal per
+                    // W3C SPARQL §17.4.1.7 (integer ÷ integer is decimal).
                     let avg = match avg_val {
+                        Binding::Lit {
+                            val: FlakeValue::Decimal(d),
+                            ..
+                        } => bigdecimal::ToPrimitive::to_f64(d.as_ref()).unwrap_or(0.0),
                         Binding::Lit {
                             val: FlakeValue::Double(d),
                             ..
                         } => *d,
-                        _ => panic!("Expected Double"),
+                        _ => panic!("Expected Decimal or Double, got {avg_val:?}"),
                     };
                     results.insert(sid.name.to_string(), (sum, avg));
                 }

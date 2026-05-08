@@ -395,81 +395,36 @@ fn agg_count_distinct(values: &[Binding]) -> Binding {
     Binding::lit(FlakeValue::Long(distinct.len() as i64), xsd_integer())
 }
 
-/// SUM - numeric sum
+/// SUM - numeric sum with W3C SPARQL §17.4.1.7 type promotion.
 ///
-/// Uses separate `i128` and `f64` accumulators to avoid precision loss when all
-/// values are integers. The `i128` accumulator prevents overflow that would occur
-/// with `i64`, and the final `i64::try_from` safely detects if the result exceeds
-/// `i64` range (falling back to `f64` in that case).
+/// Result type is the widest tier observed across the group:
+/// - all `xsd:integer` → `xsd:integer` (BigInt-backed when overflowing i64)
+/// - any `xsd:decimal` mixed with integers → `xsd:decimal`
+/// - any `xsd:float` (no double) → `xsd:float`
+/// - any `xsd:double` → `xsd:double`
+///
+/// Empty input returns `Binding::Unbound`. Non-numeric inputs are skipped
+/// silently (matching SPARQL's permissive aggregate semantics).
 fn agg_sum(values: &[Binding]) -> Binding {
-    let typed = extract_typed_numbers(values);
-    if typed.is_empty() {
-        return Binding::Unbound;
+    let mut accum = crate::numeric_tier::NumericAccum::new();
+    for v in values {
+        accum.add(v);
     }
-
-    let mut all_int = true;
-    let mut int_sum: i128 = 0;
-    let mut float_sum: f64 = 0.0;
-
-    for num in &typed {
-        match num {
-            TypedNumber::Int(v) => {
-                int_sum += *v as i128;
-                float_sum += *v as f64;
-            }
-            TypedNumber::Float(v) => {
-                all_int = false;
-                float_sum += *v;
-            }
-        }
-    }
-
-    if all_int {
-        // Return as Long if the result fits in i64, otherwise fall back to f64.
-        match i64::try_from(int_sum) {
-            Ok(v) => Binding::lit(FlakeValue::Long(v), xsd_integer()),
-            Err(_) => Binding::lit(FlakeValue::Double(int_sum as f64), xsd_double()),
-        }
-    } else {
-        Binding::lit(FlakeValue::Double(float_sum), xsd_double())
-    }
+    accum.finalize_sum()
 }
 
-/// AVG - numeric average
+/// AVG - numeric average with W3C SPARQL §17.4.1.7 type promotion.
 ///
-/// Uses an `i128` accumulator for integer-only groups to preserve precision
-/// when summing large `i64` values. Falls back to `f64` for mixed types.
+/// Result tier mirrors SUM with one twist: an all-integer group widens to
+/// `xsd:decimal` because SPARQL's `integer ÷ integer` is decimal-typed.
+/// An empty group returns `0` `xsd:integer` per W3C test `agg-avg-03`
+/// ("AVG with empty group (value defined to be 0)").
 fn agg_avg(values: &[Binding]) -> Binding {
-    let typed = extract_typed_numbers(values);
-    if typed.is_empty() {
-        return Binding::Unbound;
+    let mut accum = crate::numeric_tier::NumericAccum::new();
+    for v in values {
+        accum.add(v);
     }
-
-    let count = typed.len() as f64;
-    let mut all_int = true;
-    let mut int_sum: i128 = 0;
-    let mut float_sum: f64 = 0.0;
-
-    for num in &typed {
-        match num {
-            TypedNumber::Int(v) => {
-                int_sum += *v as i128;
-                float_sum += *v as f64;
-            }
-            TypedNumber::Float(v) => {
-                all_int = false;
-                float_sum += *v;
-            }
-        }
-    }
-
-    let avg = if all_int {
-        // Compute from i128 to avoid f64 precision loss on large integer sums.
-        (int_sum as f64) / count
-    } else {
-        float_sum / count
-    };
-    Binding::lit(FlakeValue::Double(avg), xsd_double())
+    accum.finalize_avg()
 }
 
 /// MIN - minimum value
@@ -582,37 +537,6 @@ fn agg_sample(values: &[Binding]) -> Binding {
         .find(|b| !matches!(b, Binding::Unbound | Binding::Poisoned))
         .cloned()
         .unwrap_or(Binding::Unbound)
-}
-
-/// A numeric value preserving its original type (integer vs float).
-enum TypedNumber {
-    Int(i64),
-    Float(f64),
-}
-
-/// Extract numeric values preserving their original type.
-///
-/// This allows callers to use an `i128` accumulator for integer-only groups,
-/// avoiding precision loss that occurs when large `i64` values are cast to `f64`.
-fn extract_typed_numbers(values: &[Binding]) -> Vec<TypedNumber> {
-    values
-        .iter()
-        .filter_map(|b| match b {
-            Binding::Lit { val, .. } => match val {
-                FlakeValue::Long(n) => Some(TypedNumber::Int(*n)),
-                FlakeValue::Boolean(b) => Some(TypedNumber::Int(i64::from(*b))),
-                FlakeValue::Double(n) => {
-                    if n.is_nan() {
-                        None
-                    } else {
-                        Some(TypedNumber::Float(*n))
-                    }
-                }
-                _ => None,
-            },
-            _ => None,
-        })
-        .collect()
 }
 
 /// Extract numeric values as f64 from bindings

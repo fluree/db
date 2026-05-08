@@ -388,13 +388,30 @@ async fn subquery_inside_union() {
         .unwrap()
         .to_jsonld(&ledger.snapshot)
         .unwrap();
-    assert_eq!(
-        normalize_rows(&rows),
-        normalize_rows(&json!([
-            ["Alice", 42.333_333_333_333_336_f64],
-            ["Cam", 7.5_f64]
-        ]))
-    );
+    // AVG of integer inputs is xsd:decimal per W3C SPARQL §17.4.1.7
+    // (integer ÷ integer is decimal-typed). The to_jsonld formatter
+    // renders xsd:decimal as a decimal string. Compare numerically with
+    // a small tolerance for non-terminating quotients.
+    let arr = rows.as_array().expect("rows array").clone();
+    let mut values: Vec<(String, f64)> = arr
+        .iter()
+        .map(|row| {
+            let row = row.as_array().expect("row array");
+            let name = row[0].as_str().expect("name").to_string();
+            let avg = row[1]
+                .as_str()
+                .and_then(|s| s.parse::<f64>().ok())
+                .or_else(|| row[1].as_f64())
+                .expect("avg value");
+            (name, avg)
+        })
+        .collect();
+    values.sort_by(|a, b| a.0.cmp(&b.0));
+    assert_eq!(values.len(), 2);
+    assert_eq!(values[0].0, "Alice");
+    assert!((values[0].1 - 42.333_333_333_333_336).abs() < 1e-12);
+    assert_eq!(values[1].0, "Cam");
+    assert!((values[1].1 - 7.5).abs() < 1e-12);
 }
 
 #[tokio::test]
@@ -418,7 +435,16 @@ async fn subquery_union_branch_query_alone_has_results() {
         .unwrap()
         .to_jsonld(&ledger.snapshot)
         .unwrap();
-    assert_eq!(rows, json!([["Alice", 42.333_333_333_333_336_f64]]));
+    let arr = rows.as_array().expect("rows array");
+    assert_eq!(arr.len(), 1);
+    let row = arr[0].as_array().expect("row array");
+    assert_eq!(row[0].as_str(), Some("Alice"));
+    let avg = row[1]
+        .as_str()
+        .and_then(|s| s.parse::<f64>().ok())
+        .or_else(|| row[1].as_f64())
+        .expect("avg value");
+    assert!((avg - 42.333_333_333_333_336).abs() < 1e-12);
 }
 
 #[tokio::test]

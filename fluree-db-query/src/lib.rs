@@ -61,6 +61,7 @@ pub mod join;
 pub mod limit;
 pub mod materializer;
 pub mod minus;
+pub mod numeric_tier;
 pub(crate) mod object_binding;
 pub mod offset;
 pub mod operator;

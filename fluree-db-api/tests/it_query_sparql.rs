@@ -12,6 +12,32 @@ use support::{
     MemoryLedger,
 };
 
+/// Extract a numeric value from a JSON-LD output cell regardless of how the
+/// formatter rendered it. After db-r#62, `AVG` of integer/decimal inputs
+/// returns `xsd:decimal`, which the formatter emits as a typed-value object
+/// `{"@value": "<decimal-string>", "@type": "xsd:decimal"}`. Bare-number cells
+/// (used for `xsd:integer`/`xsd:double`) and string-decimal cells (the wrapped
+/// form) both flow through this helper.
+fn extract_numeric(value: &JsonValue) -> Option<f64> {
+    if let Some(n) = value.as_f64() {
+        return Some(n);
+    }
+    if let Some(obj) = value.as_object() {
+        if let Some(v) = obj.get("@value") {
+            if let Some(n) = v.as_f64() {
+                return Some(n);
+            }
+            if let Some(s) = v.as_str() {
+                return s.parse::<f64>().ok();
+            }
+        }
+    }
+    if let Some(s) = value.as_str() {
+        return s.parse::<f64>().ok();
+    }
+    None
+}
+
 fn normalize_object_rows(value: &JsonValue) -> Vec<String> {
     let Some(array) = value.as_array() else {
         return Vec::new();
@@ -810,12 +836,15 @@ async fn sparql_aggregate_avg_over_values() {
         .unwrap();
     let jsonld = result.to_jsonld(&ledger.snapshot).expect("to_jsonld");
 
+    // AVG of integer inputs is xsd:decimal per W3C SPARQL §17.4.1.7
+    // (integer ÷ integer is decimal-typed). The to_jsonld formatter
+    // renders xsd:decimal as a typed-value object; extract via helper.
     let avg = jsonld
         .as_array()
         .and_then(|arr| arr.first())
         .and_then(|row| row.as_array())
         .and_then(|row| row.first())
-        .and_then(serde_json::Value::as_f64)
+        .and_then(extract_numeric)
         .expect("avg result");
     assert!((avg - 17.666_666_666_666_67).abs() < 1e-12);
 }
@@ -840,12 +869,13 @@ async fn sparql_group_by_having_filters_groups() {
         .unwrap();
     let jsonld = result.to_jsonld(&ledger.snapshot).expect("to_jsonld");
 
+    // AVG renders as xsd:decimal — extract numerics regardless of shape.
     let mut values: Vec<f64> = jsonld
         .as_array()
         .expect("avg rows array")
         .iter()
         .flat_map(|row| row.as_array().expect("row array").iter())
-        .filter_map(serde_json::Value::as_f64)
+        .filter_map(extract_numeric)
         .collect();
     values.sort_by(|a, b| a.partial_cmp(b).unwrap());
 
@@ -923,8 +953,8 @@ async fn sparql_multiple_select_expressions_with_aggregate_alias() {
 
     let rows = normalize_rows(&jsonld);
     assert_eq!(rows.len(), 1);
-    let avg = rows[0][0].as_f64().expect("avg");
-    let ceil = rows[0][1].as_f64().expect("ceil");
+    let avg = extract_numeric(&rows[0][0]).expect("avg");
+    let ceil = extract_numeric(&rows[0][1]).expect("ceil");
     assert!((avg - 17.666_666_666_666_67).abs() < 1e-12);
     assert!((ceil - 18.0).abs() < 1e-12);
 }
@@ -1018,7 +1048,7 @@ async fn sparql_mix_of_grouped_values_and_aggregates() {
                 .iter()
                 .map(|v| v.as_i64().expect("favNum"))
                 .collect::<Vec<_>>();
-            let avg = row[1].as_f64().expect("avg");
+            let avg = extract_numeric(&row[1]).expect("avg");
             let person = row[2].as_str().expect("person").to_string();
             let handle = row[3].as_str().expect("handle").to_string();
             let max = row[4].as_i64().expect("max");

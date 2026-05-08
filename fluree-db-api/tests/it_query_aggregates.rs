@@ -674,3 +674,228 @@ async fn aggregates_inline_rejects_nested_aggregate_b1() {
         "expected error mentioning variable/nested-aggregate input, got: {msg}"
     );
 }
+
+// =============================================================================
+// SUM / AVG numeric type promotion (W3C SPARQL §17.4.1.7)
+//
+// Parity for db-r#62: aggregate output type tracks the widest tier observed
+// across the group: integer → decimal → float → double. AVG is one twist —
+// an all-integer group widens to xsd:decimal because SPARQL's integer ÷
+// integer is decimal-typed. Empty AVG returns 0 xsd:integer per W3C
+// agg-avg-03.
+// =============================================================================
+
+async fn seed_typed_numerics(fluree: &MemoryFluree, ledger_id: &str) -> MemoryLedger {
+    let ledger0 = genesis_ledger(fluree, ledger_id);
+    let ctx = context_ex_schema();
+    // Three subjects each carrying values of a uniform numeric type:
+    //  ex:ints      → xsd:integer values 1, 2, 3
+    //  ex:decs      → xsd:decimal values 1.0, 2.2, 3.5
+    //  ex:doubles   → xsd:double  values 100, 2000, 30000 (scientific)
+    let insert = json!({
+        "@context": ctx,
+        "@graph": [
+            {"@id": "ex:ints", "ex:n": [1, 2, 3]},
+            {"@id": "ex:decs", "ex:n": [
+                {"@value": "1.0", "@type": "xsd:decimal"},
+                {"@value": "2.2", "@type": "xsd:decimal"},
+                {"@value": "3.5", "@type": "xsd:decimal"}
+            ]},
+            {"@id": "ex:doubles", "ex:n": [
+                {"@value": "1.0E2", "@type": "xsd:double"},
+                {"@value": "2.0E3", "@type": "xsd:double"},
+                {"@value": "3.0E4", "@type": "xsd:double"}
+            ]}
+        ]
+    });
+    fluree
+        .insert(ledger0, &insert)
+        .await
+        .expect("seed insert should succeed")
+        .ledger
+}
+
+#[tokio::test]
+async fn aggregates_sum_preserves_xsd_integer() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger = seed_typed_numerics(&fluree, "query/agg-tiers-sum-int:main").await;
+    let ctx = context_ex_schema();
+    let query = json!({
+        "@context": ctx,
+        "select": ["?s", "(as (sum ?n) ?total)"],
+        "where": {"@id": "?s", "ex:n": "?n"},
+        "groupBy": ["?s"]
+    });
+    let result = support::query_jsonld(&fluree, &ledger, &query)
+        .await
+        .expect("query");
+    let typed = result.to_typed_json(&ledger.snapshot).expect("typed json");
+    let arr = typed.as_array().expect("rows");
+    // Find the row for ex:ints; assert its ?total is xsd:integer 6.
+    let ints_row = arr
+        .iter()
+        .find(|r| {
+            r.as_object()
+                .and_then(|o| o.get("?s"))
+                .and_then(|v| v.get("@id"))
+                .and_then(|s| s.as_str())
+                .map(|s| s.ends_with(":ints") || s.ends_with("/ints"))
+                .unwrap_or(false)
+        })
+        .expect("ex:ints row");
+    let total = ints_row
+        .as_object()
+        .and_then(|o| o.get("?total"))
+        .expect("?total binding");
+    let total_obj = total
+        .as_object()
+        .expect("integer rendered as @value object");
+    assert_eq!(
+        total_obj.get("@type").and_then(|v| v.as_str()),
+        Some("xsd:integer"),
+        "SUM of integers should retain xsd:integer datatype, got {total:?}"
+    );
+    assert_eq!(total_obj.get("@value"), Some(&json!(6)));
+}
+
+#[tokio::test]
+async fn aggregates_sum_decimal_returns_xsd_decimal() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger = seed_typed_numerics(&fluree, "query/agg-tiers-sum-dec:main").await;
+    let ctx = context_ex_schema();
+    let query = json!({
+        "@context": ctx,
+        "select": ["?s", "(as (sum ?n) ?total)"],
+        "where": {"@id": "?s", "ex:n": "?n"},
+        "groupBy": ["?s"]
+    });
+    let result = support::query_jsonld(&fluree, &ledger, &query)
+        .await
+        .expect("query");
+    let typed = result.to_typed_json(&ledger.snapshot).expect("typed json");
+    let arr = typed.as_array().expect("rows");
+    let dec_row = arr
+        .iter()
+        .find(|r| {
+            r.as_object()
+                .and_then(|o| o.get("?s"))
+                .and_then(|v| v.get("@id"))
+                .and_then(|s| s.as_str())
+                .map(|s| s.ends_with(":decs") || s.ends_with("/decs"))
+                .unwrap_or(false)
+        })
+        .expect("ex:decs row");
+    let total = dec_row
+        .as_object()
+        .and_then(|o| o.get("?total"))
+        .expect("?total binding");
+    let total_obj = total.as_object().expect("decimal rendered as object");
+    assert_eq!(
+        total_obj.get("@type").and_then(|v| v.as_str()),
+        Some("xsd:decimal"),
+        "SUM of decimals should be xsd:decimal, got {total:?}"
+    );
+}
+
+#[tokio::test]
+async fn aggregates_avg_of_integers_returns_xsd_decimal() {
+    // SPARQL §17.4.1.7: AVG of integers widens to xsd:decimal because
+    // integer ÷ integer is decimal-typed in the spec's division semantics.
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger = seed_typed_numerics(&fluree, "query/agg-tiers-avg-int:main").await;
+    let ctx = context_ex_schema();
+    let query = json!({
+        "@context": ctx,
+        "select": ["?s", "(as (avg ?n) ?avg)"],
+        "where": {"@id": "?s", "ex:n": "?n"},
+        "groupBy": ["?s"]
+    });
+    let result = support::query_jsonld(&fluree, &ledger, &query)
+        .await
+        .expect("query");
+    let typed = result.to_typed_json(&ledger.snapshot).expect("typed json");
+    let arr = typed.as_array().expect("rows");
+    let ints_row = arr
+        .iter()
+        .find(|r| {
+            r.as_object()
+                .and_then(|o| o.get("?s"))
+                .and_then(|v| v.get("@id"))
+                .and_then(|s| s.as_str())
+                .map(|s| s.ends_with(":ints") || s.ends_with("/ints"))
+                .unwrap_or(false)
+        })
+        .expect("ex:ints row");
+    let avg = ints_row
+        .as_object()
+        .and_then(|o| o.get("?avg"))
+        .expect("?avg binding");
+    let avg_obj = avg.as_object().expect("decimal rendered as object");
+    assert_eq!(
+        avg_obj.get("@type").and_then(|v| v.as_str()),
+        Some("xsd:decimal"),
+        "AVG of integers should be xsd:decimal, got {avg:?}"
+    );
+}
+
+#[tokio::test]
+async fn aggregates_sum_double_returns_xsd_double() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger = seed_typed_numerics(&fluree, "query/agg-tiers-sum-dbl:main").await;
+    let ctx = context_ex_schema();
+    let query = json!({
+        "@context": ctx,
+        "select": ["?s", "(as (sum ?n) ?total)"],
+        "where": {"@id": "?s", "ex:n": "?n"},
+        "groupBy": ["?s"]
+    });
+    let result = support::query_jsonld(&fluree, &ledger, &query)
+        .await
+        .expect("query");
+    let typed = result.to_typed_json(&ledger.snapshot).expect("typed json");
+    let arr = typed.as_array().expect("rows");
+    let dbl_row = arr
+        .iter()
+        .find(|r| {
+            r.as_object()
+                .and_then(|o| o.get("?s"))
+                .and_then(|v| v.get("@id"))
+                .and_then(|s| s.as_str())
+                .map(|s| s.ends_with(":doubles") || s.ends_with("/doubles"))
+                .unwrap_or(false)
+        })
+        .expect("ex:doubles row");
+    let total = dbl_row
+        .as_object()
+        .and_then(|o| o.get("?total"))
+        .expect("?total binding");
+    let total_obj = total.as_object().expect("double rendered as object");
+    assert_eq!(
+        total_obj.get("@type").and_then(|v| v.as_str()),
+        Some("xsd:double"),
+        "SUM of doubles should be xsd:double, got {total:?}"
+    );
+}
+
+#[tokio::test]
+async fn aggregates_avg_empty_group_returns_zero_xsd_integer() {
+    // W3C SPARQL agg-avg-03: AVG of empty input → 0 xsd:integer.
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger = seed_uniform_ints(&fluree, "query/agg-tiers-avg-empty:main").await;
+    let ctx = context_ex_schema();
+    // ex:nope predicate is not present in any data → empty input to AVG.
+    let query = json!({
+        "@context": ctx,
+        "select": "(avg ?n)",
+        "where": {"ex:nope": "?n"}
+    });
+    let result = support::query_jsonld(&fluree, &ledger, &query)
+        .await
+        .expect("query");
+    let json_rows = result.to_jsonld(&ledger.snapshot).expect("jsonld");
+    assert_eq!(
+        json_rows,
+        json!([0]),
+        "AVG of empty input should be 0 xsd:integer"
+    );
+}
