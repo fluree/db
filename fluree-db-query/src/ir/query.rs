@@ -6,9 +6,9 @@
 //! holds the WHERE clause IR. `grouping` carries the optional aggregation
 //! phase (GROUP BY / aggregates / HAVING). `ordering` carries the ORDER BY
 //! sort specs. `limit` and `offset` are the slicing modifiers applied last.
-//! `options` carries the reasoning configuration the rewriter consumes.
-//! Hydration formatting lives inside the `Column::Hydration` variant on the
-//! SELECT projection.
+//! `reasoning` carries the configuration the rewriter consumes (modes plus
+//! an optional pre-resolved schema bundle). Hydration formatting lives
+//! inside the `Column::Hydration` variant on the SELECT projection.
 
 use std::collections::HashSet;
 
@@ -61,7 +61,7 @@ pub enum Restriction {
     Distinct,
     /// Return only the first row (`selectOne ...`).
     ///
-    /// Distinct from `options.limit = Some(1)`: `One` also changes the output
+    /// Distinct from `query.limit = Some(1)`: `One` also changes the output
     /// shape — formatters render a bare row (or null) rather than a one-element
     /// array. `LIMIT 1` caps the result set but keeps the array shape.
     One,
