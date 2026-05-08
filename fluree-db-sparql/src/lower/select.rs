@@ -139,7 +139,6 @@ impl<E: IriEncoder> LoweringContext<'_, E> {
         let mut options = QueryOptions::default();
         let distinct = select.modifier == Some(SelectModifier::Distinct);
         let mut group_by: Vec<VarId> = Vec::new();
-        let mut aggregates: Vec<AggregateSpec> = Vec::new();
         let mut having: Option<Expression> = None;
         let mut pre_group_binds = Vec::new();
 
@@ -182,13 +181,11 @@ impl<E: IriEncoder> LoweringContext<'_, E> {
             pre_group_binds.extend(having_pre_binds);
         }
 
-        // Extract aggregates from SELECT clause
-        let (select_aggregates, select_agg_binds) = self.extract_aggregates(select)?;
-        aggregates = select_aggregates;
+        // Extract aggregates from SELECT clause, then append any aggregates
+        // lifted out of HAVING.
+        let (mut aggregates, select_agg_binds) = self.extract_aggregates(select)?;
         pre_group_binds.extend(select_agg_binds);
-        if !having_aggregates.is_empty() {
-            aggregates.extend(having_aggregates);
-        }
+        aggregates.extend(having_aggregates);
 
         // Auto-populate GROUP BY when aggregates present but no explicit GROUP BY
         // Per SPARQL semantics, all non-aggregated SELECT variables must be in GROUP BY

@@ -5,9 +5,9 @@
 //! and GROUP BY. Variables without downstream dependencies are dead and can
 //! be projected away early.
 
-use crate::ir::{Expression, Grouping, Query, QueryOptions};
+use crate::ir::{Grouping, Query, QueryOptions};
 use crate::var_registry::VarId;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 
 /// Per-operator required variable sets.
 ///
@@ -52,11 +52,12 @@ pub fn compute_variable_deps(query: &Query, options: &QueryOptions) -> Option<Va
     // Post-aggregation binds (reverse order): trace expression inputs.
     // Record deps BEFORE processing each bind backward, since that
     // represents what the bind's output must contain for downstream.
-    let binds: Vec<&(VarId, Expression)> = query
+    let binds = query
         .grouping
-        .iter()
-        .flat_map(Grouping::binds)
-        .collect();
+        .as_ref()
+        .and_then(Grouping::aggregation)
+        .map(|agg| agg.binds.as_slice())
+        .unwrap_or(&[]);
     let mut required_bind_vars: Vec<Vec<VarId>> = Vec::with_capacity(binds.len());
     for (var, expr) in binds.iter().rev() {
         // Record what this bind's output must contain.
@@ -114,10 +115,11 @@ pub fn compute_variable_deps(query: &Query, options: &QueryOptions) -> Option<Va
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ir::{AggregateFn, AggregateSpec};
+    use crate::ir::{AggregateFn, AggregateSpec, Expression};
     use crate::ir::triple::{Ref, Term, TriplePattern};
     use crate::ir::QueryOptions;
     use crate::ir::{Aggregation, ConstructTemplate, Query, QueryOutput};
+    use std::collections::HashMap;
     use crate::ir::{FlakeValue, Pattern};
     use crate::parse::SelectMode;
     use crate::sort::SortSpec;
@@ -388,14 +390,14 @@ mod tests {
                 crate::ir::Root::Var(VarId(0)),
                 crate::ir::NestedSelectSpec::Explicit {
                     forward: vec![],
-                    reverse: std::collections::HashMap::new(),
+                    reverse: HashMap::new(),
                 },
             )),
             crate::ir::Column::Hydration(crate::ir::HydrationSpec::new(
                 crate::ir::Root::Var(VarId(1)),
                 crate::ir::NestedSelectSpec::Explicit {
                     forward: vec![],
-                    reverse: std::collections::HashMap::new(),
+                    reverse: HashMap::new(),
                 },
             )),
         ]);

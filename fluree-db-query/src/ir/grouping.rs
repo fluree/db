@@ -164,11 +164,10 @@ impl Grouping {
 
     /// Iterate over every aggregate spec computed by this grouping phase,
     /// regardless of variant.
-    pub fn aggregates(&self) -> Box<dyn Iterator<Item = &AggregateSpec> + '_> {
-        match self.aggregation() {
-            Some(agg) => Box::new(agg.aggregates.iter()),
-            None => Box::new(std::iter::empty()),
-        }
+    pub fn aggregates(&self) -> impl Iterator<Item = &AggregateSpec> {
+        self.aggregation()
+            .into_iter()
+            .flat_map(|agg| agg.aggregates.iter())
     }
 
     /// Iterate over the post-aggregation bind expressions for this grouping

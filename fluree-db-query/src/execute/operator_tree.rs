@@ -422,30 +422,48 @@ fn extract_regex_const_pattern(
     Some((Arc::from(pat.as_str()), flags))
 }
 
-/// Validate that a query has a single `COUNT(*)` aggregate with standard constraints.
+/// Returns the sole aggregate when the query is in the canonical implicit
+/// single-aggregate fast-path shape:
+/// - `Grouping::Implicit` with exactly one aggregate, no `having`, no
+///   post-aggregation binds.
+/// - No `order_by`, no `offset`, no `DISTINCT`, and `limit != Some(0)`.
 ///
-/// Returns `Some(output_var)` if the query has:
-/// - SELECT output (not CONSTRUCT/BOOLEAN/WILDCARD)
-/// - Exactly one aggregate: `COUNT(*)` (not distinct, no input var)
-/// - No group_by, having, post_binds, order_by, offset, or DISTINCT
-/// - LIMIT >= 1 (or no limit)
-/// - SELECT vars == `[agg.output_var]`
-pub(crate) fn detect_count_all_aggregate(query: &Query, options: &QueryOptions) -> Option<VarId> {
-    let Some(Grouping::Implicit { aggregation: Aggregation { aggregates, binds }, having: None }) = &query.grouping
-    else { return None };
+/// Detectors that look for a specific aggregate function start here, then
+/// inspect the spec's function/distinct/input_var fields.
+fn implicit_single_aggregate<'a>(
+    query: &'a Query,
+    options: &QueryOptions,
+) -> Option<&'a AggregateSpec> {
+    let Some(Grouping::Implicit {
+        aggregation: Aggregation { aggregates, binds },
+        having: None,
+    }) = &query.grouping
+    else {
+        return None;
+    };
     if aggregates.len() != 1
         || !binds.is_empty()
         || !options.order_by.is_empty()
         || options.offset.is_some()
         || query.output.is_distinct()
+        || options.limit == Some(0)
     {
         return None;
     }
-    let agg = aggregates.first();
+    Some(aggregates.first())
+}
+
+/// Validate that a query has a single `COUNT(*)` aggregate with standard constraints.
+///
+/// Returns `Some(output_var)` if the query has:
+/// - SELECT output (not CONSTRUCT/BOOLEAN/WILDCARD)
+/// - Exactly one aggregate: `COUNT(*)` (not distinct, no input var)
+/// - No group_by, having, post-aggregation binds, order_by, offset, or DISTINCT
+/// - LIMIT >= 1 (or no limit)
+/// - SELECT vars == `[agg.output_var]`
+pub(crate) fn detect_count_all_aggregate(query: &Query, options: &QueryOptions) -> Option<VarId> {
+    let agg = implicit_single_aggregate(query, options)?;
     if agg.distinct || !matches!(agg.function, AggregateFn::CountAll) || agg.input_var.is_some() {
-        return None;
-    }
-    if options.limit == Some(0) {
         return None;
     }
     let select_vars = query.output.projected_vars()?;
@@ -460,31 +478,18 @@ pub(crate) fn detect_count_all_aggregate(query: &Query, options: &QueryOptions) 
 /// Returns `Some((input_var, output_var))` if the query has:
 /// - SELECT output (not CONSTRUCT/BOOLEAN/WILDCARD)
 /// - Exactly one aggregate: `COUNT(DISTINCT ?var)`
-/// - No group_by, having, post_binds, order_by, offset, or DISTINCT
+/// - No group_by, having, post-aggregation binds, order_by, offset, or DISTINCT
 /// - LIMIT >= 1 (or no limit)
 /// - SELECT vars == `[agg.output_var]`
 fn detect_count_distinct_aggregate(
     query: &Query,
     options: &QueryOptions,
 ) -> Option<(VarId, VarId)> {
-    let Some(Grouping::Implicit { aggregation: Aggregation { aggregates, binds }, having: None }) = &query.grouping
-    else { return None };
-    if aggregates.len() != 1
-        || !binds.is_empty()
-        || !options.order_by.is_empty()
-        || options.offset.is_some()
-        || query.output.is_distinct()
-    {
-        return None;
-    }
-    let agg = aggregates.first();
+    let agg = implicit_single_aggregate(query, options)?;
     if agg.distinct || !matches!(agg.function, AggregateFn::CountDistinct) {
         return None;
     }
     let in_var = agg.input_var?;
-    if options.limit == Some(0) {
-        return None;
-    }
     let select_vars = query.output.projected_vars()?;
     if select_vars.len() != 1 || select_vars[0] != agg.output_var {
         return None;
@@ -497,33 +502,15 @@ fn detect_count_distinct_aggregate(
 /// Returns `Some((input_var, output_var))` where `input_var` is `None` for `COUNT(*)`.
 /// Same standard constraints as [`detect_count_all_aggregate`].
 fn detect_count_aggregate(query: &Query, options: &QueryOptions) -> Option<(Option<VarId>, VarId)> {
-    let Some(Grouping::Implicit { aggregation: Aggregation { aggregates, binds }, having: None }) = &query.grouping
-    else { return None };
-    if aggregates.len() != 1
-        || !binds.is_empty()
-        || !options.order_by.is_empty()
-        || options.offset.is_some()
-        || query.output.is_distinct()
-    {
-        return None;
-    }
-    let agg = aggregates.first();
+    let agg = implicit_single_aggregate(query, options)?;
     if agg.distinct {
         return None;
     }
     let input_var = match agg.function {
-        AggregateFn::CountAll => {
-            if agg.input_var.is_some() {
-                return None;
-            }
-            None
-        }
+        AggregateFn::CountAll if agg.input_var.is_none() => None,
         AggregateFn::Count => Some(agg.input_var?),
         _ => return None,
     };
-    if options.limit == Some(0) {
-        return None;
-    }
     let select_vars = query.output.projected_vars()?;
     if select_vars.len() != 1 || select_vars[0] != agg.output_var {
         return None;
@@ -796,23 +783,8 @@ fn detect_sum_strlen_group_concat_subquery(
 ) -> Option<(Ref, Arc<str>, VarId)> {
     use crate::ir::{Expression, Function, Pattern};
 
-    let Some(Grouping::Implicit { aggregation: Aggregation { aggregates, binds }, having: None }) = &query.grouping
-    else { return None };
-    if aggregates.len() != 1 {
-        return None;
-    }
-    if query.output.is_distinct() || !binds.is_empty() {
-        return None;
-    }
-    if !options.order_by.is_empty() || options.offset.is_some() {
-        return None;
-    }
-    if options.limit == Some(0) {
-        return None;
-    }
-
     // Outer aggregate must be SUM(?v) (where ?v is the STRLEN bind var).
-    let outer_agg = aggregates.first();
+    let outer_agg = implicit_single_aggregate(query, options)?;
     if outer_agg.distinct || outer_agg.function != AggregateFn::Sum {
         return None;
     }
@@ -1040,20 +1012,8 @@ fn detect_predicate_minmax_string(
     query: &Query,
     options: &QueryOptions,
 ) -> Option<(Ref, MinMaxMode, VarId)> {
-    // Must be single aggregate, no grouping/having/binds/etc.
-    let Some(Grouping::Implicit { aggregation: Aggregation { aggregates, binds }, having: None }) = &query.grouping
-    else { return None };
-    if aggregates.len() != 1
-        || !binds.is_empty()
-        || !options.order_by.is_empty()
-        || options.offset.is_some()
-        || query.output.is_distinct()
-    {
-        return None;
-    }
-    if options.limit == Some(0) {
-        return None;
-    }
+    // Must be a single implicit aggregate with no grouping/having/binds/etc.
+    let agg = implicit_single_aggregate(query, options)?;
     // WHERE must be a single triple.
     if query.patterns.len() != 1 {
         return None;
@@ -1064,7 +1024,6 @@ fn detect_predicate_minmax_string(
     let (_s_var, pred, o_var) = validate_simple_triple(tp)?;
 
     // Aggregate must be MIN(?o) or MAX(?o) (not distinct).
-    let agg = aggregates.first();
     if agg.distinct {
         return None;
     }
@@ -1087,24 +1046,14 @@ fn detect_predicate_minmax_string(
 }
 
 fn detect_predicate_avg_numeric(query: &Query, options: &QueryOptions) -> Option<(Ref, VarId)> {
-    let Some(Grouping::Implicit { aggregation: Aggregation { aggregates, binds }, having: None }) = &query.grouping
-    else { return None };
-    if aggregates.len() != 1
-        || !binds.is_empty()
-        || !options.order_by.is_empty()
-        || options.offset.is_some()
-        || query.output.is_distinct()
-    {
-        return None;
-    }
-    if options.limit == Some(0) || query.patterns.len() != 1 {
+    let agg = implicit_single_aggregate(query, options)?;
+    if query.patterns.len() != 1 {
         return None;
     }
     let Pattern::Triple(tp) = &query.patterns[0] else {
         return None;
     };
     let (_s_var, pred, o_var) = validate_simple_triple(tp)?;
-    let agg = aggregates.first();
     if agg.distinct || !matches!(agg.function, AggregateFn::Avg) || agg.input_var? != o_var {
         return None;
     }
@@ -1124,25 +1073,8 @@ fn detect_count_rows_with_encoded_filters(
     VarId,
 )> {
     // Must be single COUNT aggregate, no grouping/having/binds/etc.
-    let Some(Grouping::Implicit { aggregation: Aggregation { aggregates, binds }, having: None }) = &query.grouping
-    else { return None };
-    if aggregates.len() != 1
-        || !binds.is_empty()
-        || !options.order_by.is_empty()
-        || options.offset.is_some()
-        || query.output.is_distinct()
-    {
-        return None;
-    }
-    if options.limit == Some(0) {
-        return None;
-    }
-    let agg = aggregates.first();
-    if agg.distinct {
-        return None;
-    }
-    let is_count = matches!(agg.function, AggregateFn::Count | AggregateFn::CountAll);
-    if !is_count {
+    let agg = implicit_single_aggregate(query, options)?;
+    if agg.distinct || !matches!(agg.function, AggregateFn::Count | AggregateFn::CountAll) {
         return None;
     }
 
@@ -1245,21 +1177,10 @@ fn detect_predicate_count_rows_numeric_compare(
     query: &Query,
     options: &QueryOptions,
 ) -> Option<(Ref, NumericCompareOp, fluree_db_core::FlakeValue, VarId)> {
-    let Some(Grouping::Implicit { aggregation: Aggregation { aggregates, binds }, having: None }) = &query.grouping
-    else { return None };
-    if aggregates.len() != 1
-        || !binds.is_empty()
-        || !options.order_by.is_empty()
-        || options.offset.is_some()
-        || query.output.is_distinct()
-    {
+    let agg = implicit_single_aggregate(query, options)?;
+    if query.patterns.len() != 2 {
         return None;
     }
-    if options.limit == Some(0) || query.patterns.len() != 2 {
-        return None;
-    }
-
-    let agg = aggregates.first();
     if agg.distinct || !matches!(agg.function, AggregateFn::Count | AggregateFn::CountAll) {
         return None;
     }
@@ -1314,21 +1235,7 @@ fn detect_string_prefix_sum_strstarts(
 ) -> Option<(Ref, Arc<str>, VarId)> {
     use crate::ir::{Expression, FlakeValue, Function};
 
-    let Some(Grouping::Implicit { aggregation: Aggregation { aggregates, binds }, having: None }) = &query.grouping
-    else { return None };
-    if aggregates.len() != 1
-        || !binds.is_empty()
-        || !options.order_by.is_empty()
-        || options.offset.is_some()
-        || query.output.is_distinct()
-    {
-        return None;
-    }
-    if options.limit == Some(0) {
-        return None;
-    }
-
-    let agg = aggregates.first();
+    let agg = implicit_single_aggregate(query, options)?;
     if agg.distinct || !matches!(agg.function, AggregateFn::Sum) {
         return None;
     }
@@ -1460,7 +1367,7 @@ fn anchored_literal_regex_prefix(pattern: &str) -> Option<Arc<str>> {
 /// Returns `Some((predicate_var, count_output_var))` if the query matches the pattern.
 fn detect_stats_count_by_predicate(
     query: &Query,
-    options: &QueryOptions,
+    _options: &QueryOptions,
 ) -> Option<(VarId, VarId)> {
     // Must have stats available (checked by caller)
     // Must have exactly one triple pattern with all variables
@@ -1509,7 +1416,7 @@ fn detect_stats_count_by_predicate(
         return None;
     }
 
-    // No post_binds (for simplicity)
+    // No post-aggregation binds (for simplicity)
     if !binds.is_empty() {
         return None;
     }
@@ -1528,25 +1435,10 @@ fn detect_fused_scan_sum_i64(
     options: &QueryOptions,
 ) -> Option<(Ref, SumExprI64, VarId)> {
     // Must be single aggregate, no grouping/having/binds/etc.
-    let Some(Grouping::Implicit { aggregation: Aggregation { aggregates, binds }, having: None }) = &query.grouping
-    else { return None };
-    if aggregates.len() != 1
-        || !binds.is_empty()
-        || !options.order_by.is_empty()
-        || options.offset.is_some()
-    {
-        return None;
-    }
-    // LIMIT is fine as long as it's >= 1 (single row output). OFFSET is disallowed above.
-    if let Some(lim) = options.limit {
-        if lim == 0 {
-            return None;
-        }
-    }
+    let agg = implicit_single_aggregate(query, options)?;
 
     // SELECT must be exactly the aggregate output var.
     let select_vars = query.output.projected_vars()?;
-    let agg = aggregates.first();
     if select_vars.len() != 1 || select_vars[0] != agg.output_var {
         return None;
     }
