@@ -18,42 +18,61 @@ use super::error::{ParseError, Result};
 
 /// Token in an S-expression
 ///
-/// S-expressions are tokenized into nested atoms and lists:
+/// S-expressions are tokenized into nested atoms, quoted strings, and lists:
 /// - `?x` → `Atom("?x")`
+/// - `42` → `Atom("42")`
+/// - `"hello world"` → `String("hello world")`
 /// - `(count ?x)` → `List([Atom("count"), Atom("?x")])`
+///
+/// `Atom` and `String` are kept distinct so callers parsing scalar
+/// expressions can preserve literal type — e.g. `"false"` stays a string,
+/// while bare `false` is a boolean. `as_str` collapses both back to the
+/// underlying text for callers that don't care (e.g. the groupconcat
+/// separator).
 #[derive(Debug, Clone, PartialEq)]
 pub enum SexprToken {
-    /// Atom: variable, symbol, string literal, or number
+    /// Atom: variable, symbol, number, or boolean (unquoted in source).
     Atom(String),
+    /// Quoted string literal. Surrounding `"..."` is stripped; the contents
+    /// are preserved verbatim.
+    String(String),
     /// Nested list (sub-expression)
     List(Vec<SexprToken>),
 }
 
 impl SexprToken {
-    /// Extract atom value, returning error if this is a list
+    /// Extract atom value (unquoted), returning error if this is a list or
+    /// quoted string. Use this when the value must syntactically be an
+    /// identifier — variable, function name, alias, `*`, `as`.
     pub fn as_atom(&self) -> Result<&str> {
         match self {
             SexprToken::Atom(s) => Ok(s),
+            SexprToken::String(s) => Err(ParseError::InvalidSelect(format!(
+                "expected unquoted atom, got string literal: \"{s}\""
+            ))),
             SexprToken::List(_) => Err(ParseError::InvalidSelect(
                 "expected atom, got list".to_string(),
             )),
         }
     }
 
-    /// Extract list contents, returning error if this is an atom
+    /// Extract list contents, returning error if this is an atom or string
     pub fn as_list(&self) -> Result<&[SexprToken]> {
         match self {
             SexprToken::List(tokens) => Ok(tokens),
-            SexprToken::Atom(_) => Err(ParseError::InvalidSelect(
+            SexprToken::Atom(_) | SexprToken::String(_) => Err(ParseError::InvalidSelect(
                 "expected list, got atom".to_string(),
             )),
         }
     }
 
-    /// Extract atom value with custom error context
+    /// Extract atom value with custom error context (rejects strings and lists).
     pub fn expect_atom(&self, context: &str) -> Result<&str> {
         match self {
             SexprToken::Atom(s) => Ok(s),
+            SexprToken::String(s) => Err(ParseError::InvalidSelect(format!(
+                "{context} must be an unquoted atom, got string literal: \"{s}\""
+            ))),
             SexprToken::List(_) => Err(ParseError::InvalidSelect(format!(
                 "{context} must be an atom, not a list"
             ))),
@@ -67,6 +86,22 @@ impl SexprToken {
             SexprToken::Atom(a) => Err(ParseError::InvalidSelect(format!(
                 "{context} must be a list, got atom: {a}"
             ))),
+            SexprToken::String(s) => Err(ParseError::InvalidSelect(format!(
+                "{context} must be a list, got string literal: \"{s}\""
+            ))),
+        }
+    }
+
+    /// Inner text regardless of quoting (atom or string literal). Use for
+    /// values where the syntactic form doesn't change semantics — e.g. the
+    /// groupconcat separator: `(groupconcat ?x ", ")` and
+    /// `(groupconcat ?x ,)` both extract `,`.
+    pub fn as_str(&self) -> Result<&str> {
+        match self {
+            SexprToken::Atom(s) | SexprToken::String(s) => Ok(s),
+            SexprToken::List(_) => Err(ParseError::InvalidSelect(
+                "expected atom or string, got list".to_string(),
+            )),
         }
     }
 }
@@ -75,7 +110,7 @@ impl SexprToken {
 ///
 /// Handles:
 /// - Nested parentheses: `(as (count ?x) ?y)` → `List[Atom("as"), List[Atom("count"), Atom("?x")], Atom("?y")]`
-/// - Quoted strings: `"hello world"` → `Atom("hello world")`
+/// - Quoted strings: `"hello world"` → `String("hello world")` (distinct from `Atom`)
 /// - Symbols and variables: `count`, `?x`, `*`
 ///
 /// # Example
@@ -150,7 +185,7 @@ fn tokenize_sexpr_inner(
                         "unclosed string literal in S-expression (missing closing '\")".to_string(),
                     ));
                 }
-                tokens.push(SexprToken::Atom(string_val));
+                tokens.push(SexprToken::String(string_val));
             }
             c if c.is_whitespace() => {
                 // Push any pending atom
@@ -305,14 +340,31 @@ mod tests {
     }
 
     #[test]
-    fn test_tokenize_quoted_string() {
+    fn test_tokenize_quoted_string_distinct_from_atom() {
         let tokens = tokenize_sexpr(r#"(groupconcat ?x ", ")"#).unwrap();
         assert_eq!(tokens.len(), 1);
         let list = tokens[0].as_list().unwrap();
         assert_eq!(list.len(), 3);
         assert_eq!(list[0].as_atom().unwrap(), "groupconcat");
         assert_eq!(list[1].as_atom().unwrap(), "?x");
-        assert_eq!(list[2].as_atom().unwrap(), ", ");
+        // Quoted string is a `String` variant, not an `Atom`. Strict
+        // accessors reject it; `as_str` normalizes both back to text.
+        assert!(matches!(&list[2], SexprToken::String(s) if s == ", "));
+        assert!(list[2].as_atom().is_err());
+        assert_eq!(list[2].as_str().unwrap(), ", ");
+    }
+
+    #[test]
+    fn test_tokenize_quoted_keyword_not_a_keyword() {
+        // A quoted "false" must remain a string token — it should NOT collapse
+        // into the same shape as the bare boolean atom `false`.
+        let quoted = tokenize_sexpr(r#"(coalesce ?v "false")"#).unwrap();
+        let q_list = quoted[0].as_list().unwrap();
+        assert!(matches!(&q_list[2], SexprToken::String(s) if s == "false"));
+
+        let bare = tokenize_sexpr("(coalesce ?v false)").unwrap();
+        let b_list = bare[0].as_list().unwrap();
+        assert!(matches!(&b_list[2], SexprToken::Atom(s) if s == "false"));
     }
 
     #[test]

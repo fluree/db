@@ -483,3 +483,110 @@ async fn aggregates_count_star_direct() {
         ]))
     );
 }
+
+// ============================================================================
+// SELECT-clause scalar expressions
+//
+// Mirrors SPARQL's `SELECT (expr AS ?alias)` form so JSON-LD queries can
+// project computed values (COALESCE, IF, arithmetic, hash functions, …)
+// without resorting to a separate `bind` clause in the WHERE.
+// ============================================================================
+
+#[tokio::test]
+async fn select_expr_coalesce_falls_back_to_constant() {
+    // brian and cam have no schema:birthDate; should fall back to "unknown".
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger = seed_people(&fluree, "query/select-expr-coalesce:main").await;
+    let ctx = context_ex_schema();
+
+    let query = json!({
+        "@context": ctx,
+        "select": ["?name", "(as (coalesce ?birthDate \"unknown\") ?dob)"],
+        "where": [
+            {"@id": "?p", "schema:name": "?name"},
+            ["optional", {"@id": "?p", "schema:birthDate": "?birthDate"}]
+        ]
+    });
+
+    let result = support::query_jsonld(&fluree, &ledger, &query)
+        .await
+        .expect("query");
+    let json_rows = result.to_jsonld(&ledger.snapshot).expect("jsonld");
+
+    assert_eq!(
+        normalize_rows(&json_rows),
+        normalize_rows(&json!([
+            ["Alice", {"@value": "1974-09-26", "@type": "xsd:date"}],
+            ["Brian", "unknown"],
+            ["Cam", "unknown"],
+            ["Liam", {"@value": "2011-09-26", "@type": "xsd:date"}]
+        ]))
+    );
+}
+
+#[tokio::test]
+async fn select_expr_coalesce_with_count_aggregate() {
+    // Reproduces the user-reported pattern: COALESCE alongside an aggregate
+    // (COUNT) in the same SELECT, with explicit GROUP BY.
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger = seed_people(&fluree, "query/select-expr-coalesce-count:main").await;
+    let ctx = context_ex_schema();
+
+    let query = json!({
+        "@context": ctx,
+        "select": [
+            "?name",
+            "(as (coalesce ?email \"no-email\") ?contact)",
+            "(as (count ?favNums) ?count)"
+        ],
+        "where": [
+            {"@id": "?p", "schema:name": "?name", "ex:favNums": "?favNums"},
+            ["optional", {"@id": "?p", "schema:email": "?email"}]
+        ],
+        "groupBy": ["?name", "?contact"]
+    });
+
+    let result = support::query_jsonld(&fluree, &ledger, &query)
+        .await
+        .expect("query");
+    let json_rows = result.to_jsonld(&ledger.snapshot).expect("jsonld");
+
+    assert_eq!(
+        normalize_rows(&json_rows),
+        normalize_rows(&json!([
+            ["Alice", "alice@example.org", 3],
+            ["Brian", "brian@example.org", 1],
+            ["Cam", "cam@example.org", 2],
+            ["Liam", "liam@example.org", 2]
+        ]))
+    );
+}
+
+#[tokio::test]
+async fn select_expr_if_branches_on_age() {
+    // IF in SELECT (no aggregate) — desugars to a pre-aggregation BIND.
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger = seed_people(&fluree, "query/select-expr-if:main").await;
+    let ctx = context_ex_schema();
+
+    let query = json!({
+        "@context": ctx,
+        "select": ["?name", "(as (if (>= ?age 18) \"adult\" \"minor\") ?label)"],
+        "where": {"schema:name": "?name", "schema:age": "?age"}
+    });
+
+    let result = support::query_jsonld(&fluree, &ledger, &query)
+        .await
+        .expect("query");
+    let json_rows = result.to_jsonld(&ledger.snapshot).expect("jsonld");
+
+    assert_eq!(
+        normalize_rows(&json_rows),
+        normalize_rows(&json!([
+            ["Alice", "adult"],
+            ["Brian", "adult"],
+            ["Cam", "adult"],
+            ["Liam", "minor"]
+        ]))
+    );
+}
