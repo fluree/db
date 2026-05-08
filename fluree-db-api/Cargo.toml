@@ -148,5 +148,17 @@ harness = false
 name = "insert_formats"
 harness = false
 
+[[bench]]
+name = "import_bulk"
+harness = false
+
+[[bench]]
+name = "transact_commit"
+harness = false
+
+[[bench]]
+name = "query_cold_reload"
+harness = false
+
 [lints]
 workspace = true
