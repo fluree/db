@@ -976,6 +976,7 @@ mod tests {
             output: QueryOutput::select_all(vec![out_var]),
             patterns,
             grouping,
+            ordering: Vec::new(),
             options: options.clone(),
             post_values: None,
         };

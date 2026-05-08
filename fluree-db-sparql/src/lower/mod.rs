@@ -225,6 +225,7 @@ impl<'a, E: IriEncoder> LoweringContext<'a, E> {
                     self.lower_solution_modifiers(&select_query.modifiers, &select_query.select)?;
                 patterns.extend(lowered_modifiers.pre_group_binds);
                 let options = lowered_modifiers.options;
+                let ordering = lowered_modifiers.ordering;
                 let distinct = lowered_modifiers.distinct;
 
                 // Assemble the grouping phase from the lowered components.
@@ -259,6 +260,7 @@ impl<'a, E: IriEncoder> LoweringContext<'a, E> {
                     output,
                     patterns,
                     grouping,
+                    ordering,
                     options,
                     post_values,
                 })
@@ -1088,7 +1090,7 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(query.options.order_by.len(), 1);
+        assert_eq!(query.ordering.len(), 1);
     }
 
     #[test]
@@ -1324,9 +1326,9 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(query.options.order_by.len(), 1);
+        assert_eq!(query.ordering.len(), 1);
         assert_eq!(
-            query.options.order_by[0].direction,
+            query.ordering[0].direction,
             SortDirection::Ascending
         );
     }
@@ -1339,9 +1341,9 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(query.options.order_by.len(), 1);
+        assert_eq!(query.ordering.len(), 1);
         assert_eq!(
-            query.options.order_by[0].direction,
+            query.ordering[0].direction,
             SortDirection::Descending
         );
     }
@@ -1355,9 +1357,9 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(query.options.order_by.len(), 1);
+        assert_eq!(query.ordering.len(), 1);
         assert_eq!(
-            query.options.order_by[0].direction,
+            query.ordering[0].direction,
             SortDirection::Ascending
         );
     }
@@ -1497,7 +1499,7 @@ mod tests {
         assert!(query.output.is_distinct());
         assert_eq!(group_by_of(&query).len(), 1);
         assert!(having_of(&query).is_some());
-        assert_eq!(query.options.order_by.len(), 1);
+        assert_eq!(query.ordering.len(), 1);
         assert_eq!(query.options.limit, Some(10));
         assert_eq!(query.options.offset, Some(5));
     }

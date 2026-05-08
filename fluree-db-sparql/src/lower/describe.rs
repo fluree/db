@@ -142,6 +142,7 @@ impl<E: IriEncoder> LoweringContext<'_, E> {
             patterns,
             options: QueryOptions::default(),
             grouping: None,
+            ordering: Vec::new(),
             post_values: None,
         })
     }
@@ -188,10 +189,10 @@ impl<E: IriEncoder> LoweringContext<'_, E> {
         }
 
         let mut opts = QueryOptions::default();
-        self.lower_base_modifiers(modifiers, &mut opts)?;
+        let ordering = self.lower_base_modifiers(modifiers, &mut opts)?;
 
         // For simplicity and predictable performance, require ORDER BY vars to be part of the subquery select list.
-        for spec in &opts.order_by {
+        for spec in &ordering {
             if !select_vars.contains(&spec.var) {
                 return Err(LowerError::unsupported_form(
                     "DESCRIBE ORDER BY on non-target variables",
@@ -202,7 +203,7 @@ impl<E: IriEncoder> LoweringContext<'_, E> {
 
         subq.limit = opts.limit;
         subq.offset = opts.offset;
-        subq.order_by = opts.order_by;
+        subq.order_by = ordering;
         Ok(())
     }
 }

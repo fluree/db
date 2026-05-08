@@ -84,6 +84,7 @@ fn make_query(select: Vec<VarId>, patterns: Vec<Pattern>) -> Query {
         output,
         patterns,
         grouping: None,
+        ordering: Vec::new(),
         options: QueryOptions::default(),
         post_values: None,
     }
@@ -613,11 +614,10 @@ async fn test_order_by_on_grouped_var_errors() {
     // GROUP BY ?city, no aggregates: ?person becomes Grouped(...)
     // ORDER BY ?person is undefined -> should error.
     query.grouping = Some(explicit_grouping(vec![VarId(0)], vec![]));
-    let options = QueryOptions::new()
-        .with_order_by(vec![fluree_db_query::sort::SortSpec::asc(VarId(1))]);
+    query.ordering = vec![fluree_db_query::sort::SortSpec::asc(VarId(1))];
 
     let db = GraphDbRef::new(&snapshot, 0, &NoOverlay, snapshot.t);
-    let executable = ExecutableQuery::new(query, options);
+    let executable = ExecutableQuery::new(query, QueryOptions::default());
     let err = execute(db, &vars, &executable, ContextConfig::default())
         .await
         .unwrap_err();

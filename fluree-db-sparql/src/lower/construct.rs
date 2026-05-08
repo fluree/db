@@ -11,6 +11,7 @@ use fluree_db_query::ir::{
     ConstructTemplate as QueryConstructTemplate, Pattern, Query, QueryOptions, QueryOutput,
 };
 use fluree_db_query::parse::encode::IriEncoder;
+use fluree_db_query::sort::SortSpec;
 
 use super::{LoweringContext, Result};
 
@@ -37,7 +38,7 @@ impl<E: IriEncoder> LoweringContext<'_, E> {
         let construct_template = QueryConstructTemplate::new(template_patterns);
 
         // Lower solution modifiers (CONSTRUCT supports ORDER BY, LIMIT, OFFSET but not GROUP BY/HAVING)
-        let options = self.lower_construct_modifiers(&construct.modifiers)?;
+        let (options, ordering) = self.lower_construct_modifiers(&construct.modifiers)?;
 
         let ctx = self.build_jsonld_context()?;
         let ctx_val = self.build_jsonld_context_value();
@@ -49,6 +50,7 @@ impl<E: IriEncoder> LoweringContext<'_, E> {
             patterns,
             options,
             grouping: None,
+            ordering,
             post_values: None,
         })
     }
@@ -106,9 +108,12 @@ impl<E: IriEncoder> LoweringContext<'_, E> {
     }
 
     /// Lower solution modifiers for CONSTRUCT (no GROUP BY/HAVING/aggregates).
-    fn lower_construct_modifiers(&mut self, modifiers: &SolutionModifiers) -> Result<QueryOptions> {
+    fn lower_construct_modifiers(
+        &mut self,
+        modifiers: &SolutionModifiers,
+    ) -> Result<(QueryOptions, Vec<SortSpec>)> {
         let mut options = QueryOptions::default();
-        self.lower_base_modifiers(modifiers, &mut options)?;
-        Ok(options)
+        let ordering = self.lower_base_modifiers(modifiers, &mut options)?;
+        Ok((options, ordering))
     }
 }

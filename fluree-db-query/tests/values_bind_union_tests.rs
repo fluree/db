@@ -45,6 +45,7 @@ fn make_query(select: Vec<VarId>, patterns: Vec<Pattern>) -> Query {
         patterns,
         options: QueryOptions::default(),
         grouping: None,
+        ordering: Vec::new(),
         post_values: None,
     }
 }

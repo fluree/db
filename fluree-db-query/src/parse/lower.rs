@@ -93,8 +93,9 @@ pub(crate) fn lower_query<E: IriEncoder>(
         patterns.extend(lowered);
     }
 
-    // Lower options and grouping (the aggregation phase is its own axis)
-    let options = lower_options(&ast.options, vars)?;
+    // Lower options, ordering, and grouping (each is its own axis).
+    let options = lower_options(&ast.options)?;
+    let ordering = lower_ordering(&ast.options, vars);
     let grouping = lower_grouping(&ast.options, vars)?;
 
     // Build QueryOutput from mode + lowered components. The parser guarantees
@@ -126,6 +127,7 @@ pub(crate) fn lower_query<E: IriEncoder>(
         output,
         patterns,
         grouping,
+        ordering,
         options,
         post_values: None,
     })
@@ -1518,21 +1520,25 @@ fn lower_aggregate_spec(spec: &UnresolvedAggregateSpec, vars: &mut VarRegistry) 
 }
 
 /// Lower unresolved options to resolved QueryOptions
-fn lower_options(opts: &UnresolvedOptions, vars: &mut VarRegistry) -> Result<QueryOptions> {
+fn lower_options(opts: &UnresolvedOptions) -> Result<QueryOptions> {
     // Transfer reasoning modes, or use default if not specified
     let reasoning = opts.reasoning.clone().unwrap_or_default();
 
     Ok(QueryOptions {
         limit: opts.limit,
         offset: opts.offset,
-        order_by: opts
-            .order_by
-            .iter()
-            .map(|s| lower_sort_spec(s, vars))
-            .collect(),
         reasoning,
         schema_bundle: None,
     })
+}
+
+/// Lower the unresolved ORDER BY specs into the resolved `Vec<SortSpec>`
+/// that rides on `Query.ordering`.
+fn lower_ordering(opts: &UnresolvedOptions, vars: &mut VarRegistry) -> Vec<SortSpec> {
+    opts.order_by
+        .iter()
+        .map(|s| lower_sort_spec(s, vars))
+        .collect()
 }
 
 /// Lower the unresolved aggregation surface (GROUP BY / aggregates / HAVING)

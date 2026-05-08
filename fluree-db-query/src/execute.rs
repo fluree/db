@@ -105,6 +105,7 @@ mod tests {
             patterns: vec![],
             options: QueryOptions::default(),
             grouping: None,
+            ordering: Vec::new(),
             post_values: None,
         };
         let executable = ExecutableQuery::simple(query);
@@ -120,14 +121,10 @@ mod tests {
 
     #[tokio::test]
     async fn test_query_options_builder() {
-        let opts = QueryOptions::new()
-            .with_limit(10)
-            .with_offset(5)
-            .with_order_by(vec![SortSpec::asc(VarId(0))]);
+        let opts = QueryOptions::new().with_limit(10).with_offset(5);
 
         assert_eq!(opts.limit, Some(10));
         assert_eq!(opts.offset, Some(5));
-        assert_eq!(opts.order_by.len(), 1);
         assert!(opts.has_modifiers());
     }
 
@@ -146,6 +143,7 @@ mod tests {
             patterns: vec![Pattern::Triple(make_pattern(VarId(0), "name", VarId(1)))],
             options: QueryOptions::default(),
             grouping: None,
+            ordering: Vec::new(),
             post_values: None,
         };
 
@@ -170,14 +168,13 @@ mod tests {
             patterns: vec![Pattern::Triple(make_pattern(VarId(0), "name", VarId(1)))],
             options: QueryOptions::default(),
             grouping: None,
+            ordering: vec![SortSpec::asc(VarId(99))], // Invalid var
             post_values: None,
         };
 
-        let options = QueryOptions::new().with_order_by(vec![SortSpec::asc(VarId(99))]); // Invalid var
-
         let result = build_operator_tree(
             &query,
-            &options,
+            &QueryOptions::default(),
             None,
             &crate::temporal_mode::PlanningContext::current(),
         );

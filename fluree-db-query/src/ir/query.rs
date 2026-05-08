@@ -4,10 +4,10 @@
 //! `Query` is the canonical query representation. Its `output` field
 //! captures the result-shape decision (SELECT, ASK, CONSTRUCT). `patterns`
 //! holds the WHERE clause IR. `grouping` carries the optional aggregation
-//! phase (GROUP BY / aggregates / HAVING). `options` carries the remaining
-//! solution modifiers (limit, offset, order by, post-binds). Hydration
-//! formatting lives inside the `Column::Hydration` variant on the SELECT
-//! projection.
+//! phase (GROUP BY / aggregates / HAVING). `ordering` carries the ORDER BY
+//! sort specs. `options` carries the remaining solution modifiers (limit,
+//! offset, reasoning configuration). Hydration formatting lives inside the
+//! `Column::Hydration` variant on the SELECT projection.
 
 use std::collections::HashSet;
 
@@ -18,6 +18,7 @@ use super::options::QueryOptions;
 use super::pattern::Pattern;
 use super::projection::{Column, Projection};
 use super::triple::TriplePattern;
+use crate::sort::SortSpec;
 use crate::var_registry::VarId;
 
 /// Resolved CONSTRUCT template patterns
@@ -234,7 +235,11 @@ pub struct Query {
     pub patterns: Vec<Pattern>,
     /// Optional aggregation phase: GROUP BY + aggregates + HAVING.
     pub grouping: Option<Grouping>,
-    /// Solution modifiers applied after grouping (limit, offset, order by, ...).
+    /// ORDER BY specs applied after grouping. Empty when the query is
+    /// unordered.
+    pub ordering: Vec<SortSpec>,
+    /// Remaining solution modifiers and reasoning configuration (limit,
+    /// offset, reasoning modes, schema bundle).
     pub options: QueryOptions,
     /// Post-query VALUES clause (SPARQL `ValuesClause` after `SolutionModifier`).
     ///
@@ -253,6 +258,7 @@ impl Query {
             output: QueryOutput::wildcard(),
             patterns: Vec::new(),
             grouping: None,
+            ordering: Vec::new(),
             options: QueryOptions::default(),
             post_values: None,
         }
@@ -269,6 +275,7 @@ impl Query {
             output: self.output.clone(),
             patterns,
             grouping: self.grouping.clone(),
+            ordering: self.ordering.clone(),
             options: self.options.clone(),
             post_values: self.post_values.clone(),
         }

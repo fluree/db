@@ -33,8 +33,10 @@ pub(super) struct SelectBinds {
 
 /// Result of lowering solution modifiers.
 pub(super) struct LoweredModifiers {
-    /// Query options (ORDER BY, LIMIT, OFFSET, post-binds).
+    /// Query options (LIMIT, OFFSET).
     pub options: QueryOptions,
+    /// ORDER BY specs. Lifted onto `Query.ordering` by the caller.
+    pub ordering: Vec<SortSpec>,
     /// Whether the SELECT carried `DISTINCT`. Lifted into the resulting
     /// [`QueryOutput::Select::restriction`] by the caller.
     pub distinct: bool,
@@ -143,7 +145,7 @@ impl<E: IriEncoder> LoweringContext<'_, E> {
         let mut pre_group_binds = Vec::new();
 
         // LIMIT, OFFSET, ORDER BY
-        self.lower_base_modifiers(modifiers, &mut options)?;
+        let ordering = self.lower_base_modifiers(modifiers, &mut options)?;
 
         // GROUP BY — supports both variables and expressions.
         // Expression GROUP BY like `GROUP BY (expr AS ?alias)` desugars to
@@ -195,6 +197,7 @@ impl<E: IriEncoder> LoweringContext<'_, E> {
 
         Ok(LoweredModifiers {
             options,
+            ordering,
             distinct,
             group_by,
             aggregates,
@@ -203,12 +206,14 @@ impl<E: IriEncoder> LoweringContext<'_, E> {
         })
     }
 
-    /// Lower LIMIT, OFFSET, and ORDER BY modifiers (shared by SELECT and CONSTRUCT).
+    /// Lower LIMIT, OFFSET, and ORDER BY modifiers (shared by SELECT and
+    /// CONSTRUCT). Returns the ORDER BY specs; LIMIT and OFFSET are written
+    /// into the supplied `options`.
     pub(super) fn lower_base_modifiers(
         &mut self,
         modifiers: &SolutionModifiers,
         options: &mut QueryOptions,
-    ) -> Result<()> {
+    ) -> Result<Vec<SortSpec>> {
         // LIMIT
         if let Some(ref limit_clause) = modifiers.limit {
             options.limit = Some(limit_clause.value as usize);
@@ -220,15 +225,16 @@ impl<E: IriEncoder> LoweringContext<'_, E> {
         }
 
         // ORDER BY (vars-only MVP)
-        if let Some(ref order_by) = modifiers.order_by {
-            let mut sort_specs = Vec::with_capacity(order_by.conditions.len());
-            for cond in &order_by.conditions {
-                sort_specs.push(self.lower_order_condition(cond)?);
-            }
-            options.order_by = sort_specs;
-        }
+        let ordering = match &modifiers.order_by {
+            Some(order_by) => order_by
+                .conditions
+                .iter()
+                .map(|cond| self.lower_order_condition(cond))
+                .collect::<Result<Vec<_>>>()?,
+            None => Vec::new(),
+        };
 
-        Ok(())
+        Ok(ordering)
     }
 
     /// Lower an ORDER BY condition (vars-only MVP)

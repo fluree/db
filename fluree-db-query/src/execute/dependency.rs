@@ -5,7 +5,7 @@
 //! and GROUP BY. Variables without downstream dependencies are dead and can
 //! be projected away early.
 
-use crate::ir::{Grouping, Query, QueryOptions};
+use crate::ir::{Grouping, Query};
 use crate::var_registry::VarId;
 use std::collections::HashSet;
 
@@ -35,7 +35,7 @@ pub struct VariableDeps {
 /// - `Wildcard` / `Boolean` select mode (all WHERE vars are needed)
 /// - Empty select list (no explicit projection)
 /// - `Construct` without a template
-pub fn compute_variable_deps(query: &Query, options: &QueryOptions) -> Option<VariableDeps> {
+pub fn compute_variable_deps(query: &Query) -> Option<VariableDeps> {
     // ---- backward walk ----
 
     // Seed deps from the query output requirements.
@@ -44,7 +44,7 @@ pub fn compute_variable_deps(query: &Query, options: &QueryOptions) -> Option<Va
     let mut deps: HashSet<VarId> = query.output.referenced_vars()?;
 
     // ORDER BY vars must survive to the sort operator.
-    for spec in &options.order_by {
+    for spec in &query.ordering {
         deps.insert(spec.var);
     }
     let required_sort_vars: Vec<VarId> = deps.iter().copied().collect();
@@ -140,6 +140,7 @@ mod tests {
             patterns,
             options: QueryOptions::default(),
             grouping: None,
+            ordering: Vec::new(),
             post_values: None,
         }
     }
@@ -152,6 +153,7 @@ mod tests {
             patterns,
             options: QueryOptions::default(),
             grouping: None,
+            ordering: Vec::new(),
             post_values: None,
         }
     }
@@ -163,40 +165,40 @@ mod tests {
     #[test]
     fn none_for_wildcard() {
         let query = make_wildcard_query(vec![]);
-        assert!(compute_variable_deps(&query, &QueryOptions::default()).is_none());
+        assert!(compute_variable_deps(&query).is_none());
     }
 
     #[test]
     fn none_for_boolean() {
         let query = make_query(vec![], vec![], SelectMode::Ask);
-        assert!(compute_variable_deps(&query, &QueryOptions::default()).is_none());
+        assert!(compute_variable_deps(&query).is_none());
     }
 
     #[test]
     fn none_for_construct_without_template() {
         let query = make_query(vec![], vec![], SelectMode::Construct);
-        assert!(compute_variable_deps(&query, &QueryOptions::default()).is_none());
+        assert!(compute_variable_deps(&query).is_none());
     }
 
     #[test]
     fn none_for_empty_select() {
         let query = make_query(vec![], vec![], SelectMode::Many);
-        assert!(compute_variable_deps(&query, &QueryOptions::default()).is_none());
+        assert!(compute_variable_deps(&query).is_none());
     }
 
     #[test]
     fn simple_select_where_vars() {
         let query = make_query(vec![VarId(1), VarId(2)], vec![], SelectMode::Many);
-        let deps = compute_variable_deps(&query, &QueryOptions::default()).unwrap();
+        let deps = compute_variable_deps(&query).unwrap();
         let where_set: HashSet<VarId> = deps.required_where_vars.into_iter().collect();
         assert_eq!(where_set, HashSet::from([VarId(1), VarId(2)]));
     }
 
     #[test]
     fn order_by_adds_where_vars() {
-        let query = make_query(vec![VarId(1)], vec![], SelectMode::Many);
-        let options = QueryOptions::new().with_order_by(vec![SortSpec::asc(VarId(3))]);
-        let deps = compute_variable_deps(&query, &options).unwrap();
+        let mut query = make_query(vec![VarId(1)], vec![], SelectMode::Many);
+        query.ordering = vec![SortSpec::asc(VarId(3))];
+        let deps = compute_variable_deps(&query).unwrap();
         assert!(deps.required_where_vars.contains(&VarId(1)));
         assert!(deps.required_where_vars.contains(&VarId(3)));
     }
@@ -219,9 +221,8 @@ mod tests {
             }),
             having: None,
         });
-        let options = QueryOptions::default();
 
-        let deps = compute_variable_deps(&query, &options).unwrap();
+        let deps = compute_variable_deps(&query).unwrap();
         // ?city (group key) and ?age (aggregate input) are WHERE dependencies
         assert!(deps.required_where_vars.contains(&VarId(2)));
         assert!(deps.required_where_vars.contains(&VarId(1)));
@@ -255,9 +256,8 @@ mod tests {
             }),
             having: None,
         });
-        let options = QueryOptions::default();
 
-        let deps = compute_variable_deps(&query, &options).unwrap();
+        let deps = compute_variable_deps(&query).unwrap();
         // ?x (group key) and ?n (aggregate input traced from ?avg) are WHERE deps.
         assert!(deps.required_where_vars.contains(&VarId(0)));
         assert!(deps.required_where_vars.contains(&VarId(1)));
@@ -276,9 +276,8 @@ mod tests {
                 Expression::Const(FlakeValue::Long(10)),
             )),
         });
-        let options = QueryOptions::default();
 
-        let deps = compute_variable_deps(&query, &options).unwrap();
+        let deps = compute_variable_deps(&query).unwrap();
         assert!(deps.required_where_vars.contains(&VarId(0)));
         assert!(deps.required_where_vars.contains(&VarId(1)));
     }
@@ -296,10 +295,11 @@ mod tests {
             patterns: vec![],
             options: QueryOptions::default(),
             grouping: None,
+            ordering: Vec::new(),
             post_values: None,
         };
 
-        let deps = compute_variable_deps(&query, &QueryOptions::default()).unwrap();
+        let deps = compute_variable_deps(&query).unwrap();
         assert!(deps.required_where_vars.contains(&VarId(0)));
         assert!(deps.required_where_vars.contains(&VarId(1)));
     }
@@ -317,6 +317,7 @@ mod tests {
             patterns: vec![],
             options: QueryOptions::default(),
             grouping: None,
+            ordering: Vec::new(),
             post_values: None,
         }
     }
@@ -336,7 +337,7 @@ mod tests {
             )),
         ]);
 
-        let deps = compute_variable_deps(&query, &QueryOptions::default()).unwrap();
+        let deps = compute_variable_deps(&query).unwrap();
         assert!(deps.required_where_vars.contains(&VarId(0))); // root var
         assert!(deps.required_where_vars.contains(&VarId(1))); // var selection
     }
@@ -355,7 +356,7 @@ mod tests {
             )),
         ]);
 
-        let deps = compute_variable_deps(&query, &QueryOptions::default()).unwrap();
+        let deps = compute_variable_deps(&query).unwrap();
         assert!(deps.required_where_vars.contains(&VarId(0)));
         assert_eq!(deps.required_where_vars.len(), 1);
     }
@@ -375,7 +376,7 @@ mod tests {
             )),
         ]);
 
-        let deps = compute_variable_deps(&query, &QueryOptions::default()).unwrap();
+        let deps = compute_variable_deps(&query).unwrap();
         assert!(deps.required_where_vars.contains(&VarId(1)));
         assert_eq!(deps.required_where_vars.len(), 1);
     }
@@ -402,7 +403,7 @@ mod tests {
             )),
         ]);
 
-        let deps = compute_variable_deps(&query, &QueryOptions::default()).unwrap();
+        let deps = compute_variable_deps(&query).unwrap();
         assert!(deps.required_where_vars.contains(&VarId(0)));
         assert!(deps.required_where_vars.contains(&VarId(1)));
         assert_eq!(deps.required_where_vars.len(), 2);
@@ -413,10 +414,10 @@ mod tests {
     #[test]
     fn variable_deps_with_order_by() {
         // SELECT ?name WHERE { ... } ORDER BY ?age
-        let query = make_query(vec![VarId(0)], vec![], SelectMode::Many);
-        let options = QueryOptions::new().with_order_by(vec![SortSpec::asc(VarId(1))]);
+        let mut query = make_query(vec![VarId(0)], vec![], SelectMode::Many);
+        query.ordering = vec![SortSpec::asc(VarId(1))];
 
-        let deps = compute_variable_deps(&query, &options).unwrap();
+        let deps = compute_variable_deps(&query).unwrap();
         // required_sort_vars needs both ?name and ?age
         assert!(deps.required_sort_vars.contains(&VarId(0)));
         assert!(deps.required_sort_vars.contains(&VarId(1)));
@@ -443,9 +444,8 @@ mod tests {
             }),
             having: None,
         });
-        let options = QueryOptions::default();
 
-        let deps = compute_variable_deps(&query, &options).unwrap();
+        let deps = compute_variable_deps(&query).unwrap();
 
         // required_aggregate_vars = what Aggregate's OUTPUT must contain = SELECT vars
         assert!(deps.required_aggregate_vars.contains(&VarId(0)));
@@ -488,12 +488,9 @@ mod tests {
             }),
             having: None,
         });
-        let options = QueryOptions {
-            order_by: vec![SortSpec::asc(VarId(3))],
-            ..Default::default()
-        };
+        query.ordering = vec![SortSpec::asc(VarId(3))];
 
-        let deps = compute_variable_deps(&query, &options).unwrap();
+        let deps = compute_variable_deps(&query).unwrap();
 
         // required_sort_vars needs ?x and ?ceil
         assert!(deps.required_sort_vars.contains(&VarId(0)));
@@ -534,9 +531,8 @@ mod tests {
                 Expression::Const(FlakeValue::Long(5)),
             )),
         });
-        let options = QueryOptions::default();
 
-        let deps = compute_variable_deps(&query, &options).unwrap();
+        let deps = compute_variable_deps(&query).unwrap();
 
         // required_having_vars = what HAVING's OUTPUT must contain = SELECT vars
         // HAVING expression vars are NOT needed in output (only in input)

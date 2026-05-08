@@ -1,8 +1,9 @@
 //! Query execution options and reasoning modes.
 //!
-//! `QueryOptions` carries the post-WHERE solution modifiers (LIMIT, OFFSET,
-//! ORDER BY) plus the reasoning configuration the rewriter consumes
-//! (`ReasoningModes` and an optional pre-resolved `SchemaBundleFlakes`).
+//! `QueryOptions` carries the post-WHERE solution modifiers (LIMIT, OFFSET)
+//! plus the reasoning configuration the rewriter consumes (`ReasoningModes`
+//! and an optional pre-resolved `SchemaBundleFlakes`). ORDER BY rides on
+//! [`Query::ordering`](super::Query) directly.
 //!
 //! `ReasoningModes` is pure config — no behavior, just bit flags and a JSON
 //! rule list. The rewriter consumes it as input. Both types live here in `ir`
@@ -11,7 +12,6 @@
 use std::sync::Arc;
 
 use crate::schema_bundle::SchemaBundleFlakes;
-use crate::sort::SortSpec;
 
 /// Reasoning modes for RDFS / OWL / datalog query rewriting.
 ///
@@ -338,17 +338,15 @@ impl ReasoningModes {
 
 /// Solution-modifier options applied after the WHERE and grouping phases.
 ///
-/// Controls ORDER BY, OFFSET, LIMIT, post-aggregation binds, and reasoning
-/// configuration. Embedded in [`Query`](super::Query) and consumed by the
-/// planner and executor.
+/// Controls OFFSET, LIMIT, and reasoning configuration. Embedded in
+/// [`Query`](super::Query) and consumed by the planner and executor. ORDER
+/// BY rides separately on [`Query::ordering`](super::Query).
 #[derive(Debug, Clone, Default)]
 pub struct QueryOptions {
     /// Maximum rows to return (applied last)
     pub limit: Option<usize>,
     /// Rows to skip before returning results
     pub offset: Option<usize>,
-    /// Sort specifications (applied before projection)
-    pub order_by: Vec<SortSpec>,
     /// Reasoning modes for RDFS/OWL reasoning
     ///
     /// Controls pattern expansion based on class/property hierarchies.
@@ -387,12 +385,6 @@ impl QueryOptions {
         self
     }
 
-    /// Set order by specifications
-    pub fn with_order_by(mut self, specs: Vec<SortSpec>) -> Self {
-        self.order_by = specs;
-        self
-    }
-
     /// Set reasoning modes
     ///
     /// # Example
@@ -421,7 +413,7 @@ impl QueryOptions {
 
     /// Check if any modifiers are set
     pub fn has_modifiers(&self) -> bool {
-        self.limit.is_some() || self.offset.is_some() || !self.order_by.is_empty()
+        self.limit.is_some() || self.offset.is_some()
     }
 
     /// Check if any reasoning mode is explicitly enabled
@@ -448,7 +440,6 @@ mod tests {
         let opts = QueryOptions::default();
         assert!(opts.limit.is_none());
         assert!(opts.offset.is_none());
-        assert!(opts.order_by.is_empty());
         // Default reasoning: nothing explicitly enabled
         assert!(!opts.has_reasoning());
         assert!(!opts.is_reasoning_disabled());

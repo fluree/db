@@ -18,9 +18,10 @@ impl<E: IriEncoder> LoweringContext<'_, E> {
         let patterns = self.lower_graph_pattern(&ask.where_clause.pattern)?;
 
         // Lower any solution modifiers the parser accepted (ORDER BY, LIMIT, OFFSET).
-        // Per SPARQL spec, these are meaningless for ASK — we override LIMIT below.
+        // Per SPARQL spec, these are meaningless for ASK — we override LIMIT below
+        // and discard the parsed ORDER BY since ASK returns a single boolean.
         let mut options = QueryOptions::default();
-        self.lower_base_modifiers(&ask.modifiers, &mut options)?;
+        let _ordering = self.lower_base_modifiers(&ask.modifiers, &mut options)?;
 
         // Override to LIMIT 1 — ASK only needs to know if any solution exists
         options.limit = Some(1);
@@ -34,6 +35,7 @@ impl<E: IriEncoder> LoweringContext<'_, E> {
             patterns,
             options,
             grouping: None,
+            ordering: Vec::new(),
             post_values: None,
         })
     }

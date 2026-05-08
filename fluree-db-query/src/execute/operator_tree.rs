@@ -140,10 +140,10 @@ fn detect_star_const_numeric_label_order_limit(
     if limit == 0 {
         return None;
     }
-    if options.order_by.len() != 1 {
+    if query.ordering.len() != 1 {
         return None;
     }
-    let ob = &options.order_by[0];
+    let ob = &query.ordering[0];
     if ob.direction != SortDirection::Ascending {
         return None;
     }
@@ -311,7 +311,7 @@ fn detect_label_regex_type(query: &Query, options: &QueryOptions) -> Option<Labe
     if query.output.is_distinct()
         || options.limit.is_some()
         || options.offset.is_some()
-        || !options.order_by.is_empty()
+        || !query.ordering.is_empty()
         || query.grouping.is_some()
     {
         return None;
@@ -443,7 +443,7 @@ fn implicit_single_aggregate<'a>(
     };
     if aggregates.len() != 1
         || !binds.is_empty()
-        || !options.order_by.is_empty()
+        || !query.ordering.is_empty()
         || options.offset.is_some()
         || query.output.is_distinct()
         || options.limit == Some(0)
@@ -604,10 +604,10 @@ fn detect_predicate_group_by_object_count_topk(
     }
     // ORDER BY DESC(?count) and LIMIT k required so we can do top-k directly.
     let limit = options.limit?;
-    if options.order_by.len() != 1 {
+    if query.ordering.len() != 1 {
         return None;
     }
-    let ob = &options.order_by[0];
+    let ob = &query.ordering[0];
     if ob.var != agg.output_var || ob.direction != crate::sort::SortDirection::Descending {
         return None;
     }
@@ -654,7 +654,7 @@ fn detect_group_by_object_star_topk(
         return None;
     }
     let limit = options.limit?;
-    if options.order_by.len() != 1 {
+    if query.ordering.len() != 1 {
         return None;
     }
     if query.patterns.len() < 2 {
@@ -740,7 +740,7 @@ fn detect_group_by_object_star_topk(
     let count_out = count_out?;
 
     // ORDER BY DESC(?count).
-    let ob = &options.order_by[0];
+    let ob = &query.ordering[0];
     if ob.var != count_out || ob.direction != crate::sort::SortDirection::Descending {
         return None;
     }
@@ -2472,8 +2472,8 @@ fn build_operator_tree_inner(
             ));
 
             // ORDER BY
-            if !options.order_by.is_empty() {
-                operator = Box::new(SortOperator::new(operator, options.order_by.clone()));
+            if !query.ordering.is_empty() {
+                operator = Box::new(SortOperator::new(operator, query.ordering.clone()));
             }
 
             // PROJECT
@@ -2518,8 +2518,8 @@ fn build_operator_tree_inner(
                 ));
 
                 // ORDER BY (on predicate or count)
-                if !options.order_by.is_empty() {
-                    operator = Box::new(SortOperator::new(operator, options.order_by.clone()));
+                if !query.ordering.is_empty() {
+                    operator = Box::new(SortOperator::new(operator, query.ordering.clone()));
                 }
 
                 // PROJECT (select specific columns)
@@ -2553,7 +2553,7 @@ fn build_operator_tree_inner(
 
     // Compute per-operator downstream dependency sets for trimming.
     // Done before building WHERE operators so we can push projection into the WHERE clause.
-    let variable_deps = compute_variable_deps(query, options);
+    let variable_deps = compute_variable_deps(query);
 
     // Build WHERE clause operators with projection pushdown
     let required_where_vars = variable_deps
@@ -2789,9 +2789,9 @@ fn build_operator_tree_inner(
     // them before sorting does not change the ordered set of unique solutions.
     let select_vars_opt: Option<Vec<VarId>> = query.output.projected_vars();
     let can_project_distinct_before_sort = query.output.is_distinct()
-        && !options.order_by.is_empty()
+        && !query.ordering.is_empty()
         && select_vars_opt.as_ref().is_some_and(|vars| {
-            !vars.is_empty() && options.order_by.iter().all(|s| vars.contains(&s.var))
+            !vars.is_empty() && query.ordering.iter().all(|s| vars.contains(&s.var))
         });
 
     // Validate SELECT vars (when present) exist in the post-group schema.
@@ -2808,7 +2808,7 @@ fn build_operator_tree_inner(
     }
 
     // Validate ORDER BY vars exist in the post-group schema and are allowed under grouping.
-    if !options.order_by.is_empty() {
+    if !query.ordering.is_empty() {
         // Disallow sorting on Grouped variables (non-key, non-aggregated) because comparison is undefined.
         let mut allowed_sort_vars: Option<HashSet<VarId>> = None;
         if needs_grouping {
@@ -2821,7 +2821,7 @@ fn build_operator_tree_inner(
             }
             allowed_sort_vars = Some(allowed);
         }
-        for spec in &options.order_by {
+        for spec in &query.ordering {
             if !post_group_schema.contains(&spec.var) {
                 return Err(QueryError::VariableNotFound(format!(
                     "Sort variable {:?} not found in query schema",
@@ -2855,9 +2855,9 @@ fn build_operator_tree_inner(
         };
         let can_topk = options.limit.is_some();
         let mut sort_op = if can_topk {
-            SortOperator::new_topk(operator, options.order_by.clone(), k)
+            SortOperator::new_topk(operator, query.ordering.clone(), k)
         } else {
-            SortOperator::new(operator, options.order_by.clone())
+            SortOperator::new(operator, query.ordering.clone())
         };
         sort_op = sort_op.with_out_schema(
             variable_deps
@@ -2867,7 +2867,7 @@ fn build_operator_tree_inner(
         operator = Box::new(sort_op);
     } else {
         // ORDER BY (before projection - may reference vars not in SELECT)
-        if !options.order_by.is_empty() {
+        if !query.ordering.is_empty() {
             // Safe top-k: ORDER BY + (OFFSET o) + LIMIT l can keep only (o + l) rows.
             //
             // This is safe when DISTINCT is not in play because slicing happens after sorting.
@@ -2878,9 +2878,9 @@ fn build_operator_tree_inner(
                 _ => 0,
             };
             let mut sort_op = if can_topk {
-                SortOperator::new_topk(operator, options.order_by.clone(), k)
+                SortOperator::new_topk(operator, query.ordering.clone(), k)
             } else {
-                SortOperator::new(operator, options.order_by.clone())
+                SortOperator::new(operator, query.ordering.clone())
             };
             sort_op = sort_op.with_out_schema(
                 variable_deps
@@ -2950,6 +2950,7 @@ mod tests {
             patterns,
             options: QueryOptions::default(),
             grouping: None,
+            ordering: Vec::new(),
             post_values: None,
         }
     }
@@ -2995,12 +2996,11 @@ mod tests {
             patterns,
             options: QueryOptions::default(),
             grouping: None,
+            ordering: vec![SortSpec::asc(label)],
             post_values: None,
         };
 
-        let opts = QueryOptions::new()
-            .with_limit(10)
-            .with_order_by(vec![SortSpec::asc(label)]);
+        let opts = QueryOptions::new().with_limit(10);
 
         let spec = detect_star_const_numeric_label_order_limit(&query, &opts)
             .expect("should detect shape");
@@ -3021,6 +3021,7 @@ mod tests {
             patterns: vec![Pattern::Triple(make_pattern(VarId(0), "name", VarId(1)))],
             options: QueryOptions::default(),
             grouping: None,
+            ordering: Vec::new(),
             post_values: None,
         };
 
@@ -3045,14 +3046,13 @@ mod tests {
             patterns: vec![Pattern::Triple(make_pattern(VarId(0), "name", VarId(1)))],
             options: QueryOptions::default(),
             grouping: None,
+            ordering: vec![SortSpec::asc(VarId(99))], // Invalid var
             post_values: None,
         };
 
-        let options = QueryOptions::new().with_order_by(vec![SortSpec::asc(VarId(99))]); // Invalid var
-
         let result = build_operator_tree(
             &query,
-            &options,
+            &QueryOptions::default(),
             None,
             &crate::temporal_mode::PlanningContext::current(),
         );
@@ -3122,6 +3122,7 @@ mod tests {
             ],
             options: QueryOptions::default(),
             grouping: make_grouping(),
+            ordering: Vec::new(),
             post_values: None,
         };
         let reversed = Query {
@@ -3142,6 +3143,7 @@ mod tests {
             ],
             options: QueryOptions::default(),
             grouping: make_grouping(),
+            ordering: Vec::new(),
             post_values: None,
         };
         let options = QueryOptions::default();
