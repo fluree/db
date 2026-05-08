@@ -160,5 +160,17 @@ harness = false
 name = "query_cold_reload"
 harness = false
 
+[[bench]]
+name = "reindex_full"
+harness = false
+
+[[bench]]
+name = "reindex_incremental"
+harness = false
+
+[[bench]]
+name = "novelty_replay"
+harness = false
+
 [lints]
 workspace = true

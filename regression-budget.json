@@ -28,6 +28,21 @@
         "tiny": 10.0,
         "small": 5.0,
         "medium": 5.0
+      },
+      "reindex_full": {
+        "tiny": 10.0,
+        "small": 5.0,
+        "medium": 5.0
+      },
+      "reindex_incremental": {
+        "tiny": 10.0,
+        "small": 5.0,
+        "medium": 5.0
+      },
+      "novelty_replay": {
+        "tiny": 10.0,
+        "small": 5.0,
+        "medium": 5.0
       }
     },
     "fluree-db-query": {

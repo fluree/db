@@ -317,6 +317,58 @@ Don't read `FLUREE_BENCH_*` env vars in your bench's hot loop —
 hand-rolled `std::env::var` call inside `b.iter` is a system call per
 iteration. Read once, reuse.
 
+### `iter_batched` setup needs a tokio reactor for file-backed Fluree
+
+`criterion::iter_batched`'s `setup` closure runs **synchronously**, outside
+any `block_on`. If `setup` calls anything that requires a running tokio
+reactor — most notably `FlureeBuilder::file(...).build()` and any path
+that touches the file storage backend during construction — you'll get:
+
+```
+thread 'main' panicked: there is no reactor running, must be called from
+the context of a Tokio 1.x runtime
+```
+
+The fix is to wrap setup work that touches the runtime in `rt.block_on`:
+
+```rust
+let rt = bench_runtime();
+
+b.iter_batched(
+    // setup — wrap in block_on so the reactor is alive while
+    // FlureeBuilder::file(...).build() runs.
+    || rt.block_on(async {
+        let dir = tempfile::tempdir().unwrap();
+        let fluree = FlureeBuilder::file(dir.path().to_string_lossy().to_string())
+            .build()
+            .unwrap();
+        (dir, fluree)
+    }),
+    |(_dir, fluree)| rt.block_on(async {
+        // measured op
+    }),
+    criterion::BatchSize::PerIteration,
+);
+```
+
+`FlureeBuilder::memory().build_memory()` does **not** have this constraint
+— it constructs synchronously without a reactor. Use the memory builder
+when the bench's hot path doesn't actually need disk I/O; reach for the
+file builder only when you need to exercise persistence/load paths.
+
+### Workspace clippy lints apply to bench code
+
+The workspace `Cargo.toml` denies several clippy lints
+(see `[workspace.lints.clippy]`). Two that matter for benches:
+
+- **`needless_raw_string_hashes = "deny"`**: write `r"..."` not `r#"..."#`
+  unless the string actually contains `"`. This usually surfaces in
+  embedded SPARQL/Turtle string literals.
+- **`uninlined_format_args = "deny"`**: write `format!("{x}")` not
+  `format!("{}", x)` whenever the variable name is in scope.
+
+Running `cargo clippy --benches` locally before pushing catches these.
+
 ## Debugging a flaky bench
 
 A bench is "flaky" when CI runs sometimes pass and sometimes fail with no
