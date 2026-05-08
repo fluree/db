@@ -5,8 +5,9 @@
 //!
 //! # Design
 //!
-//! - `Query` is the top-level structure: output spec, WHERE patterns, options,
-//!   optional post-VALUES
+//! - `Query` is the top-level structure: output spec, WHERE patterns,
+//!   grouping, ordering, slicing modifiers, reasoning config, and an
+//!   optional post-VALUES clause
 //! - `Pattern` enum mirrors the where clause structure, preserving order for filter inlining
 //! - The planner chooses physical join operators based on pattern analysis
 //!
@@ -15,8 +16,10 @@
 //! - [`query`] — top-level `Query`, `QueryOutput`, `Restriction`,
 //!   `ConstructTemplate`: the resolved-and-lowered query that flows through
 //!   parse → plan → execute → format
-//! - [`options`] — `ReasoningConfig` (LIMIT/OFFSET/ORDER BY/GROUP BY/aggregates/
-//!   HAVING/post-binds) plus `ReasoningModes` config for the rewriter
+//! - [`grouping`] — `Grouping` (Implicit / Explicit), `Aggregation`, and the
+//!   aggregate-spec primitives (`AggregateFn`, `AggregateSpec`)
+//! - [`reasoning`] — `ReasoningConfig` and `ReasoningModes`: the rewriter's
+//!   inputs (mode flags plus an optional pre-resolved schema bundle)
 //! - [`triple`] — `TriplePattern`, `Ref`, `Term`: the s/p/o vocabulary used
 //!   by triple patterns (and reused by other pattern variants for s/p
 //!   positions)
