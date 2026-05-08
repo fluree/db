@@ -82,19 +82,59 @@ pub(crate) fn lower_query<E: IriEncoder>(
 ) -> Result<Query> {
     let mut pp_counter: u32 = 0;
 
-    // Lower the projection (columns + shape)
+    // Lower the projection (columns + shape). For `Expr` columns this only
+    // registers the alias VarId; the expression itself is desugared below.
     let projection = lower_projection(&ast.select, encoder, vars)?;
 
     // Lower patterns
     let mut patterns = Vec::new();
-    for unresolved_pattern in ast.patterns {
-        let lowered =
-            lower_unresolved_pattern(&unresolved_pattern, encoder, vars, &mut pp_counter)?;
+    for unresolved_pattern in &ast.patterns {
+        let lowered = lower_unresolved_pattern(unresolved_pattern, encoder, vars, &mut pp_counter)?;
         patterns.extend(lowered);
     }
 
     // Lower options
-    let options = lower_options(&ast.options, vars)?;
+    let mut options = lower_options(&ast.options, vars)?;
+
+    // Desugar SELECT-clause scalar expressions to BIND patterns. Pre/Post
+    // placement is decided per-column by `lower_select_expr_bind`; we
+    // accumulate post-bind aliases as we go so chained derivations
+    // (`(as (+ ?cnt 1) ?adj) (as (+ ?adj 1) ?again)`) correctly land in
+    // `options.post_binds` in source order.
+    //
+    // Mirrors `fluree_db_sparql::lower::select::lower_select_expression_binds`
+    // so SPARQL and JSON-LD queries produce the same IR shape.
+    let aggregate_output_vars: std::collections::HashSet<VarId> = options
+        .aggregates
+        .iter()
+        .map(|spec| spec.output_var)
+        .collect();
+    let mut post_bind_aliases: std::collections::HashSet<VarId> = std::collections::HashSet::new();
+    for column in ast.select.columns() {
+        if let UnresolvedColumn::Computation { expr, alias } = column {
+            let (placement, alias_var, lowered_expr) = lower_select_expr_bind(
+                expr,
+                alias,
+                encoder,
+                vars,
+                &mut pp_counter,
+                &aggregate_output_vars,
+                &post_bind_aliases,
+            )?;
+            match placement {
+                SelectExprPlacement::Post => {
+                    post_bind_aliases.insert(alias_var);
+                    options.post_binds.push((alias_var, lowered_expr));
+                }
+                SelectExprPlacement::Pre => {
+                    patterns.push(Pattern::Bind {
+                        var: alias_var,
+                        expr: lowered_expr,
+                    });
+                }
+            }
+        }
+    }
 
     // Build QueryOutput from mode + lowered components
     let output = match select_mode {
@@ -135,6 +175,12 @@ fn lower_column<E: IriEncoder>(
         UnresolvedColumn::Var(name) => Ok(Column::Var(vars.get_or_insert(name))),
         UnresolvedColumn::Hydration(spec) => {
             Ok(Column::Hydration(lower_hydration(spec, encoder, vars)?))
+        }
+        UnresolvedColumn::Computation { alias, .. } => {
+            // The inner expression desugars to a `Pattern::Bind` (or to
+            // `options.post_binds`) inside `lower_query`. The projection
+            // itself is just the alias variable.
+            Ok(Column::Var(vars.get_or_insert(alias)))
         }
     }
 }
@@ -981,6 +1027,51 @@ fn path_expr_name(expr: &UnresolvedPathExpr) -> &'static str {
     }
 }
 
+/// Where a SELECT-clause scalar expression must run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SelectExprPlacement {
+    /// Pre-aggregation: append to the WHERE pattern list as `Pattern::Bind`.
+    Pre,
+    /// Post-aggregation: append to `options.post_binds`.
+    Post,
+}
+
+/// Lower a single `UnresolvedColumn::Computation` to its placement plus
+/// resolved (alias VarId, Expression).
+///
+/// The decision is purely about which pipeline stage the BIND belongs to:
+///
+///   - `Post` if the lowered expression references any aggregate output
+///     variable, **or** any earlier-in-this-SELECT post-bind alias (passed
+///     in via `post_bind_aliases` so the caller can chain dependencies).
+///   - `Pre` otherwise.
+///
+/// Both `lower_query` and `lower_subquery` call this. `lower_query` routes
+/// the result by placement; `lower_subquery` errors on `Post` because
+/// [`SubqueryPattern`] has no `post_binds` field.
+fn lower_select_expr_bind<E: IriEncoder>(
+    expr: &UnresolvedExpression,
+    alias: &Arc<str>,
+    encoder: &E,
+    vars: &mut VarRegistry,
+    pp_counter: &mut u32,
+    aggregate_output_vars: &std::collections::HashSet<VarId>,
+    post_bind_aliases: &std::collections::HashSet<VarId>,
+) -> Result<(SelectExprPlacement, VarId, Expression)> {
+    let alias_var = vars.get_or_insert(alias);
+    let lowered = lower_filter_expr_with_encoder(expr, vars, encoder, pp_counter)?;
+    let placement = if lowered
+        .referenced_vars()
+        .iter()
+        .any(|v| aggregate_output_vars.contains(v) || post_bind_aliases.contains(v))
+    {
+        SelectExprPlacement::Post
+    } else {
+        SelectExprPlacement::Pre
+    };
+    Ok((placement, alias_var, lowered))
+}
+
 /// Expect a path expression to be a simple IRI. Returns the Arc'd IRI string.
 fn expect_simple_iri(path: &UnresolvedPathExpr) -> Result<&Arc<str>> {
     match path {
@@ -1015,18 +1106,61 @@ fn lower_subquery<E: IriEncoder>(
             ));
         }
     };
+    // Pre-register alias VarIds for any `Expr` columns so the projection has
+    // them, then lower their expressions to a `Pattern::Bind` appended to the
+    // subquery's WHERE patterns below.
     let select: Vec<VarId> = columns
         .iter()
         .map(|c| match c {
             UnresolvedColumn::Var(name) => Ok(vars.get_or_insert(name)),
+            UnresolvedColumn::Computation { alias, .. } => Ok(vars.get_or_insert(alias)),
             UnresolvedColumn::Hydration(_) => Err(ParseError::InvalidSelect(
                 "hydrations are not allowed inside subqueries".to_string(),
             )),
         })
         .collect::<Result<_>>()?;
 
-    // Lower WHERE patterns
-    let patterns = lower_unresolved_patterns(&subquery.patterns, encoder, vars, pp_counter)?;
+    // Lower WHERE patterns, then append select-expression BINDs.
+    let mut patterns = lower_unresolved_patterns(&subquery.patterns, encoder, vars, pp_counter)?;
+
+    // Subqueries do not currently expose post-aggregation binds, so we use
+    // the shared `lower_select_expr_bind` helper but reject any column it
+    // classifies as `Post`. This mirrors the limitation of `SubqueryPattern`
+    // (no `post_binds` field).
+    let aggregate_output_vars: std::collections::HashSet<VarId> = subquery
+        .options
+        .aggregates
+        .iter()
+        .map(|spec| vars.get_or_insert(&spec.output_var))
+        .collect();
+    let empty_post_binds: std::collections::HashSet<VarId> = std::collections::HashSet::new();
+    for column in columns {
+        if let UnresolvedColumn::Computation { expr, alias } = column {
+            let (placement, alias_var, lowered_expr) = lower_select_expr_bind(
+                expr,
+                alias,
+                encoder,
+                vars,
+                pp_counter,
+                &aggregate_output_vars,
+                &empty_post_binds,
+            )?;
+            match placement {
+                SelectExprPlacement::Post => {
+                    return Err(ParseError::InvalidSelect(format!(
+                        "select expression '{alias}' references an aggregate output; \
+                         post-aggregation BINDs are not supported inside subqueries"
+                    )));
+                }
+                SelectExprPlacement::Pre => {
+                    patterns.push(Pattern::Bind {
+                        var: alias_var,
+                        expr: lowered_expr,
+                    });
+                }
+            }
+        }
+    }
 
     // Build SubqueryPattern with options
     let mut sq = SubqueryPattern::new(select, patterns);
@@ -1409,6 +1543,16 @@ fn lower_function_name(name: &str) -> Function {
         "bound" => Function::Bound,
         "if" => Function::If,
         "coalesce" => Function::Coalesce,
+        // XSD datatype constructor (cast) functions — W3C SPARQL 1.1 §17.5.
+        // SPARQL routes these through `FunctionName::Extension(iri)`. JSON-LD
+        // queries arrive as a raw operator string, so accept both the compact
+        // prefix form (`xsd:integer`) and the fully-expanded IRI.
+        "xsd:boolean" | "http://www.w3.org/2001/xmlschema#boolean" => Function::XsdBoolean,
+        "xsd:integer" | "http://www.w3.org/2001/xmlschema#integer" => Function::XsdInteger,
+        "xsd:float" | "http://www.w3.org/2001/xmlschema#float" => Function::XsdFloat,
+        "xsd:double" | "http://www.w3.org/2001/xmlschema#double" => Function::XsdDouble,
+        "xsd:decimal" | "http://www.w3.org/2001/xmlschema#decimal" => Function::XsdDecimal,
+        "xsd:string" | "http://www.w3.org/2001/xmlschema#string" => Function::XsdString,
         other => Function::Custom(other.to_string()),
     }
 }
