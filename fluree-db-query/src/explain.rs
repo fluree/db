@@ -650,6 +650,20 @@ pub fn format_general_pattern(pattern: &Pattern) -> String {
                 sp.patterns.len()
             )
         }
+        Pattern::EdgeAnnotation { edge, body, .. } => {
+            format!(
+                "EDGE-ANNOTATION {{ {} | {} body patterns }}",
+                format_pattern(edge),
+                body.len()
+            )
+        }
+        Pattern::AnnotationTarget { edge, body, .. } => {
+            format!(
+                "ANNOTATION-TARGET {{ {} | {} body patterns }}",
+                format_pattern(edge),
+                body.len()
+            )
+        }
     }
 }
 

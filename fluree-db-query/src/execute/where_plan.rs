@@ -1812,6 +1812,17 @@ pub fn build_where_operators_seeded_with_needed(
                 )));
                 i += 1;
             }
+
+            // Edge-annotation patterns: M0 stub. Storage support arrives in
+            // M1; the operator-tree assembly entry point (operator_tree.rs)
+            // is the single failure surface, so this dispatch should never
+            // be reached at runtime in M0. Treat as unsupported here as a
+            // belt-and-braces guard if a caller bypasses operator_tree.
+            Pattern::EdgeAnnotation { .. } | Pattern::AnnotationTarget { .. } => {
+                return Err(QueryError::UnsupportedFeature(
+                    "edge annotations: storage not yet implemented".to_string(),
+                ));
+            }
         }
     }
 

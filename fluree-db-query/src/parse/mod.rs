@@ -3769,4 +3769,270 @@ mod tests {
             assert_eq!(spec.depth, 2);
         }
     }
+
+    // ---- Edge annotations (M0 parser surface) ----
+
+    #[test]
+    fn test_parse_edge_annotation_inline() {
+        // Canonical inline form: @annotation block on the object node-map.
+        let json = json!({
+            "@context": { "ex": "http://example.org/" },
+            "select": ["?person", "?org", "?role"],
+            "where": {
+                "@id": "?person",
+                "ex:worksFor": {
+                    "@id": "?org",
+                    "@annotation": { "ex:role": "?role" }
+                }
+            }
+        });
+
+        let (ast, _) = parse_query_ast(&json, None).unwrap();
+        assert_eq!(ast.patterns.len(), 1, "expected one EdgeAnnotation pattern");
+
+        match &ast.patterns[0] {
+            UnresolvedPattern::EdgeAnnotation { edge, body, .. } => {
+                // Base edge: ?person ex:worksFor ?org
+                assert!(
+                    matches!(&edge.s, UnresolvedTerm::Var(v) if v.as_ref() == "?person"),
+                    "subject should be ?person"
+                );
+                assert!(
+                    matches!(&edge.p, UnresolvedTerm::Iri(p) if p.as_ref() == "http://example.org/worksFor"),
+                    "predicate should be ex:worksFor"
+                );
+                assert!(
+                    matches!(&edge.o, UnresolvedTerm::Var(v) if v.as_ref() == "?org"),
+                    "object should be ?org"
+                );
+                assert_eq!(body.len(), 1, "body should have one triple for ex:role");
+            }
+            other => panic!("expected EdgeAnnotation, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_parse_edge_alias_normalizes_to_annotation() {
+        // `@edge` is an alias for `@annotation` and should produce the same IR.
+        let json = json!({
+            "@context": { "ex": "http://example.org/" },
+            "select": ["?person", "?org", "?role"],
+            "where": {
+                "@id": "?person",
+                "ex:worksFor": {
+                    "@id": "?org",
+                    "@edge": { "ex:role": "?role" }
+                }
+            }
+        });
+
+        let (ast, _) = parse_query_ast(&json, None).unwrap();
+        assert!(matches!(
+            &ast.patterns[0],
+            UnresolvedPattern::EdgeAnnotation { .. }
+        ));
+    }
+
+    #[test]
+    fn test_parse_annotation_target_via_reifies() {
+        // Annotation-rooted form: @reifies names the base triple, the
+        // surrounding map describes the annotation.
+        let json = json!({
+            "@context": { "ex": "http://example.org/" },
+            "select": ["?person", "?org", "?since"],
+            "where": {
+                "ex:role": "Engineer",
+                "ex:since": "?since",
+                "@reifies": {
+                    "@id": "?person",
+                    "ex:worksFor": { "@id": "?org" }
+                }
+            }
+        });
+
+        let (ast, _) = parse_query_ast(&json, None).unwrap();
+        assert_eq!(ast.patterns.len(), 1);
+        match &ast.patterns[0] {
+            UnresolvedPattern::AnnotationTarget {
+                annotation,
+                edge,
+                body,
+            } => {
+                // Anonymous annotation → synthetic var.
+                assert!(
+                    matches!(annotation, UnresolvedTerm::Var(v) if v.as_ref().starts_with("?__ann")),
+                    "anonymous annotation should mint a synthetic var"
+                );
+                // Base edge: ?person ex:worksFor ?org
+                assert!(matches!(&edge.s, UnresolvedTerm::Var(v) if v.as_ref() == "?person"));
+                assert!(
+                    matches!(&edge.p, UnresolvedTerm::Iri(p) if p.as_ref() == "http://example.org/worksFor")
+                );
+                assert!(matches!(&edge.o, UnresolvedTerm::Var(v) if v.as_ref() == "?org"));
+                // Body: 2 facts about the annotation (ex:role, ex:since).
+                assert_eq!(body.len(), 2, "body should have ex:role + ex:since");
+            }
+            other => panic!("expected AnnotationTarget, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_parse_annotation_target_named_subject() {
+        // Explicit @id on the annotation surrounding map names the
+        // annotation subject.
+        let json = json!({
+            "@context": { "ex": "http://example.org/" },
+            "select": ["?ann"],
+            "where": {
+                "@id": "?ann",
+                "ex:role": "Engineer",
+                "@reifies": {
+                    "@id": "?person",
+                    "ex:worksFor": { "@id": "?org" }
+                }
+            }
+        });
+
+        let (ast, _) = parse_query_ast(&json, None).unwrap();
+        assert_eq!(ast.patterns.len(), 1);
+        match &ast.patterns[0] {
+            UnresolvedPattern::AnnotationTarget { annotation, .. } => {
+                assert!(matches!(annotation, UnresolvedTerm::Var(v) if v.as_ref() == "?ann"));
+            }
+            other => panic!("expected AnnotationTarget, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_parse_edge_annotation_explicit_id() {
+        // Explicit @id on the @annotation block should be carried through
+        // as the annotation subject.
+        let json = json!({
+            "@context": { "ex": "http://example.org/" },
+            "select": ["?ann", "?role"],
+            "where": {
+                "@id": "?person",
+                "ex:worksFor": {
+                    "@id": "?org",
+                    "@annotation": {
+                        "@id": "?ann",
+                        "ex:role": "?role"
+                    }
+                }
+            }
+        });
+
+        let (ast, _) = parse_query_ast(&json, None).unwrap();
+        match &ast.patterns[0] {
+            UnresolvedPattern::EdgeAnnotation { annotation, .. } => {
+                assert!(matches!(annotation, UnresolvedTerm::Var(v) if v.as_ref() == "?ann"));
+            }
+            other => panic!("expected EdgeAnnotation, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_parse_rejects_both_annotation_and_edge() {
+        // Cannot use both keys on the same object node.
+        let json = json!({
+            "@context": { "ex": "http://example.org/" },
+            "select": ["?role"],
+            "where": {
+                "@id": "?person",
+                "ex:worksFor": {
+                    "@id": "?org",
+                    "@annotation": { "ex:role": "?role" },
+                    "@edge":       { "ex:role": "?role" }
+                }
+            }
+        });
+
+        let err = parse_query_ast(&json, None).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("@annotation") && msg.contains("@edge"),
+            "error should name both keywords: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_parse_rejects_extra_property_alongside_annotation() {
+        // Object node may carry only @id + @annotation/@edge. A free-form
+        // predicate alongside `@annotation` is the deferred shape.
+        let json = json!({
+            "@context": { "ex": "http://example.org/" },
+            "select": ["?role"],
+            "where": {
+                "@id": "?person",
+                "ex:worksFor": {
+                    "@id": "?org",
+                    "ex:other": "?other",
+                    "@annotation": { "ex:role": "?role" }
+                }
+            }
+        });
+
+        let err = parse_query_ast(&json, None).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("ex:other") || msg.contains("extra property"),
+            "error should name the offending property: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_parse_rejects_multi_triple_reifies() {
+        // Multi-triple reifiers are deferred to v2: @reifies must lower
+        // to exactly one triple.
+        let json = json!({
+            "@context": { "ex": "http://example.org/" },
+            "select": ["?role"],
+            "where": {
+                "ex:role": "?role",
+                "@reifies": {
+                    "@id": "?s",
+                    "ex:worksFor": { "@id": "?o" },
+                    "ex:since": "?since"
+                }
+            }
+        });
+
+        let err = parse_query_ast(&json, None).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("exactly one") || msg.contains("multi-triple") || msg.contains("deferred"),
+            "error should explain the multi-triple reifier deferral: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_parse_rejects_nested_annotation_in_body() {
+        // Annotation-of-annotation is deferred. The body of an
+        // `@annotation` block cannot itself carry `@annotation`.
+        let json = json!({
+            "@context": { "ex": "http://example.org/" },
+            "select": ["?role"],
+            "where": {
+                "@id": "?person",
+                "ex:worksFor": {
+                    "@id": "?org",
+                    "@annotation": {
+                        "ex:role": {
+                            "@id": "?role",
+                            "@annotation": { "ex:nested": "?n" }
+                        }
+                    }
+                }
+            }
+        });
+
+        let err = parse_query_ast(&json, None).unwrap_err();
+        let msg = err.to_string();
+        // Any of these substrings is acceptable as long as something
+        // identifies this as the annotation-of-annotation case.
+        assert!(
+            msg.contains("annotation") && msg.contains("deferred"),
+            "error should explain the annotation-of-annotation deferral: {msg}"
+        );
+    }
 }

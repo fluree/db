@@ -43,6 +43,26 @@ struct PropertyParseContext<'a> {
 pub(crate) use fluree_vocab::rdf::TYPE as RDF_TYPE;
 use fluree_vocab::xsd;
 
+/// JSON-LD-star annotation keyword. Names the annotation block attached
+/// to an object position. Treated as a literal key (not subject to
+/// `@context` expansion), matching how `@id` / `@type` / `@graph` are
+/// handled.
+const ANNOTATION_KEY: &str = "@annotation";
+
+/// Alias for [`ANNOTATION_KEY`], oriented at LPG / Cypher imports. Both
+/// keys are accepted at parse time and normalize to the same IR variant.
+const EDGE_KEY: &str = "@edge";
+
+/// Annotation-rooted query keyword: names the base triple that the
+/// enclosing node-map reifies. Used to drive the reverse-direction
+/// scan (annotation → edge).
+const REIFIES_KEY: &str = "@reifies";
+
+/// True when `key` is one of the recognized annotation block keys.
+fn is_annotation_key(key: &str) -> bool {
+    key == ANNOTATION_KEY || key == EDGE_KEY
+}
+
 /// Check if a string is a variable (starts with '?')
 pub(super) fn is_variable(s: &str) -> bool {
     s.starts_with('?')
@@ -517,6 +537,20 @@ pub fn parse_node_map(
         return parse_index_search_pattern(map, context, query);
     }
 
+    // Annotation-rooted query: the enclosing node-map describes the
+    // annotation subject, and `@reifies` names the base triple. Lower to
+    // `UnresolvedPattern::AnnotationTarget`.
+    if map.contains_key(REIFIES_KEY) {
+        return parse_annotation_target(
+            map,
+            ctx,
+            query,
+            subject_counter,
+            nested_counter,
+            object_var_parsing,
+        );
+    }
+
     // Bare subject variable: {"@id": "?s"} with no other properties.
     // Emit a full-scan triple (?s ?p ?o) so the subject variable is bound.
     // This handles the "select all subjects" query: {"where": {"@id": "?s"}}.
@@ -830,6 +864,18 @@ fn parse_property(
     if let JsonValue::Object(nested_map) = value {
         if nested_map.contains_key("@variable") {
             // Explicit variable wrapper should be treated as a value.
+        } else if nested_map.contains_key(ANNOTATION_KEY) || nested_map.contains_key(EDGE_KEY) {
+            // Edge annotation attached to the object position. Lower to
+            // `UnresolvedPattern::EdgeAnnotation`.
+            return parse_edge_annotation(
+                subject,
+                predicate,
+                is_reverse,
+                dt_iri.as_deref(),
+                nested_map,
+                query,
+                ctx,
+            );
         } else {
             // Determine the nested subject:
             // - If nested object has an explicit @id, use it (var or IRI).
@@ -877,6 +923,323 @@ fn parse_property(
     let pattern = build_triple_pattern(subject, predicate, object, is_reverse, dt_iri.as_deref());
     query.add_pattern(pattern);
 
+    Ok(())
+}
+
+// ============================================================================
+// Edge annotation parsing (M0 surface)
+// ============================================================================
+//
+// Lowers JSON-LD-star-style annotation syntax into the AST variants
+// `UnresolvedPattern::EdgeAnnotation` (forward / inline form, triggered by
+// `@annotation` or `@edge`) and `UnresolvedPattern::AnnotationTarget`
+// (reverse / annotation-rooted form, triggered by `@reifies`).
+//
+// At M0 these patterns parse cleanly but the operator layer returns
+// `QueryError::UnsupportedFeature`. Storage support and execution
+// arrive in M1.
+
+/// Parse an annotation-rooted node-map (the surrounding map contains
+/// `@reifies`).
+///
+/// Contract:
+/// 1. The enclosing node's `@id` (if present) names the annotation
+///    subject. Absent → mint a synthetic variable.
+/// 2. The `@reifies` value is itself a node-map describing exactly
+///    *one* base triple `(s, p, o)`. Multi-triple reifiers are deferred.
+/// 3. Every other (non-`@`-keyword) property on the enclosing node is
+///    parsed as a fact about the annotation subject, captured as the
+///    `body`.
+/// 4. Exactly one `@reifies` per enclosing node-map.
+fn parse_annotation_target(
+    map: &serde_json::Map<String, JsonValue>,
+    ctx: &JsonLdParseCtx,
+    query: &mut UnresolvedQuery,
+    subject_counter: &mut u32,
+    nested_counter: &mut u32,
+    object_var_parsing: bool,
+) -> Result<()> {
+    let context = &ctx.context;
+
+    // Annotation subject — explicit @id or synthetic variable.
+    let annotation =
+        if let Some(id_val) = map.get("@id").or_else(|| map.get(context.id_key.as_str())) {
+            parse_subject(id_val, ctx)?
+        } else {
+            let var_name = format!("?__ann{}", *subject_counter);
+            *subject_counter += 1;
+            UnresolvedTerm::var(&var_name)
+        };
+
+    // Extract the @reifies value and lower it to a triple pattern.
+    let reifies_val = map.get(REIFIES_KEY).expect("caller checked @reifies");
+    let edge = parse_reifies_edge(
+        reifies_val,
+        ctx,
+        subject_counter,
+        nested_counter,
+        object_var_parsing,
+    )?;
+
+    // Body patterns: the rest of the surrounding node, minus the
+    // structural keys (`@id`, `@context`, `@reifies`). Annotation
+    // subjects cannot themselves be re-annotated in v1, so reject
+    // `@annotation`/`@edge` at this layer.
+    let body = parse_annotation_body(
+        map,
+        &annotation,
+        ctx,
+        nested_counter,
+        object_var_parsing,
+        /* skip_keys */ &[REIFIES_KEY],
+    )?;
+
+    query.patterns.push(UnresolvedPattern::AnnotationTarget {
+        annotation,
+        edge,
+        body,
+    });
+    Ok(())
+}
+
+/// Parse an edge-rooted annotation: the nested object on `predicate`'s
+/// object position carries `@annotation` (or its `@edge` alias).
+///
+/// The base edge is `(subject, predicate, nested_subject)`; the
+/// annotation block is the value of `@annotation`/`@edge`.
+fn parse_edge_annotation(
+    subject: &UnresolvedTerm,
+    predicate: UnresolvedTerm,
+    is_reverse: bool,
+    dt_iri: Option<&str>,
+    nested_map: &serde_json::Map<String, JsonValue>,
+    query: &mut UnresolvedQuery,
+    ctx: &mut PropertyParseContext<'_>,
+) -> Result<()> {
+    // The nested object's @id (or synthetic) is the base triple's object.
+    let nested_subject = if let Some(id_val) = nested_map.get("@id") {
+        parse_subject(id_val, ctx.ctx)?
+    } else {
+        let nested_subject_name = format!("?__n{}", *ctx.nested_counter);
+        *ctx.nested_counter += 1;
+        UnresolvedTerm::var(&nested_subject_name)
+    };
+
+    let edge = build_triple_pattern(
+        subject,
+        predicate,
+        nested_subject.clone(),
+        is_reverse,
+        dt_iri,
+    );
+
+    // Reject the deferred shape: annotations on an object that also
+    // carries free-form predicate properties alongside `@annotation`.
+    // The clean form is "@id + @annotation only" on the object node.
+    // (User can express extra object-side facts as ordinary nested
+    // node-maps without `@annotation` — the M0 surface keeps the
+    // annotation block isolated to avoid ambiguity about which
+    // properties belong to the base object vs. the annotation.)
+    for (k, _) in nested_map {
+        if k == "@id" || is_annotation_key(k) || k == "@context" {
+            continue;
+        }
+        return Err(ParseError::InvalidWhere(format!(
+            "edge annotation: extra property '{k}' alongside @annotation on the object node \
+             is deferred (v1); express object-side facts in a separate triple"
+        )));
+    }
+
+    // Find the annotation block. Both keys are accepted; only one is
+    // permitted.
+    let ann_block = match (nested_map.get(ANNOTATION_KEY), nested_map.get(EDGE_KEY)) {
+        (Some(_), Some(_)) => {
+            return Err(ParseError::InvalidWhere(
+                "edge annotation: cannot specify both @annotation and @edge on the same object"
+                    .to_string(),
+            ));
+        }
+        (Some(v), None) | (None, Some(v)) => v,
+        (None, None) => {
+            unreachable!("caller ensured an annotation key is present");
+        }
+    };
+
+    let JsonValue::Object(ann_map) = ann_block else {
+        return Err(ParseError::InvalidWhere(format!(
+            "{ANNOTATION_KEY} value must be a JSON object (annotation node-map)"
+        )));
+    };
+
+    // Annotation subject: explicit @id or synthetic variable. We mint
+    // the synthetic name from `nested_counter` so it shares the same
+    // namespace and doesn't collide.
+    let annotation = if let Some(id_val) = ann_map.get("@id") {
+        parse_subject(id_val, ctx.ctx)?
+    } else {
+        let var_name = format!("?__ann_n{}", *ctx.nested_counter);
+        *ctx.nested_counter += 1;
+        UnresolvedTerm::var(&var_name)
+    };
+
+    // Body patterns: the annotation block's properties (other than
+    // @id / @context). Annotation-of-annotation is deferred.
+    let body = parse_annotation_body(
+        ann_map,
+        &annotation,
+        ctx.ctx,
+        ctx.nested_counter,
+        ctx.object_var_parsing,
+        /* skip_keys */ &[],
+    )?;
+
+    query.patterns.push(UnresolvedPattern::EdgeAnnotation {
+        edge,
+        annotation,
+        body,
+    });
+    Ok(())
+}
+
+/// Lower the @reifies value (a node-map describing the base triple) to
+/// a single `UnresolvedTriplePattern`.
+///
+/// Reuses the regular `parse_node_map` machinery via a buffer, then
+/// asserts the result is exactly one triple. Multi-triple shapes and
+/// non-triple patterns (paths, value objects) are deferred to v2 with
+/// explicit error messages.
+fn parse_reifies_edge(
+    value: &JsonValue,
+    ctx: &JsonLdParseCtx,
+    subject_counter: &mut u32,
+    nested_counter: &mut u32,
+    object_var_parsing: bool,
+) -> Result<UnresolvedTriplePattern> {
+    let JsonValue::Object(rmap) = value else {
+        return Err(ParseError::InvalidWhere(
+            "@reifies must be a node-map describing the base triple".to_string(),
+        ));
+    };
+
+    // Re-using a fresh UnresolvedQuery as a parsing buffer avoids
+    // duplicating node-map traversal. The result must lower to exactly
+    // one Triple; anything else is the deferred multi-triple-reifier
+    // shape.
+    let mut buffer = UnresolvedQuery::new(ctx.context.clone());
+    parse_node_map(
+        rmap,
+        ctx,
+        &mut buffer,
+        subject_counter,
+        nested_counter,
+        object_var_parsing,
+    )?;
+
+    if buffer.patterns.len() != 1 {
+        return Err(ParseError::InvalidWhere(format!(
+            "@reifies must describe exactly one base triple (got {} patterns); \
+             multi-triple reifiers are deferred to v2",
+            buffer.patterns.len()
+        )));
+    }
+
+    match buffer.patterns.into_iter().next().unwrap() {
+        UnresolvedPattern::Triple(tp) => Ok(tp),
+        _ => Err(ParseError::InvalidWhere(
+            "@reifies must describe a basic triple pattern; \
+             property paths, lists, and other shapes are deferred to v2"
+                .to_string(),
+        )),
+    }
+}
+
+/// Parse the body of an annotation node-map (the properties other than
+/// the structural `@`-keywords) into a flat `Vec<UnresolvedPattern>`.
+///
+/// Skips `@id`, `@context`, and any keys in `skip_keys`. Rejects
+/// re-annotation (`@annotation`/`@edge` on the body subject) and
+/// nested `@reifies` for v1.
+fn parse_annotation_body(
+    map: &serde_json::Map<String, JsonValue>,
+    body_subject: &UnresolvedTerm,
+    ctx: &JsonLdParseCtx,
+    nested_counter: &mut u32,
+    object_var_parsing: bool,
+    skip_keys: &[&str],
+) -> Result<Vec<UnresolvedPattern>> {
+    let mut buffer = UnresolvedQuery::new(ctx.context.clone());
+
+    for (key, value) in map {
+        if key == "@id" || key == "@context" || skip_keys.iter().any(|k| k == key) {
+            continue;
+        }
+        if is_annotation_key(key) {
+            return Err(ParseError::InvalidWhere(format!(
+                "{key} on an annotation body is deferred (v1); \
+                 annotation-of-annotation is not supported yet"
+            )));
+        }
+        if key == REIFIES_KEY {
+            return Err(ParseError::InvalidWhere(
+                "@reifies inside an annotation body is not supported (v1); \
+                 nested triple-term values are deferred to v2"
+                    .to_string(),
+            ));
+        }
+        // Reject annotation keywords nested anywhere inside a property's
+        // value as well — annotation-of-annotation and triple-term values
+        // are both deferred. Surface a clear error before lowering tries
+        // to recurse.
+        scan_for_deferred_annotation_keywords(value)?;
+        if key == "@type"
+            || key == "type"
+            || Some(key.as_str()) == ctx.context.type_key.as_str().into()
+        {
+            parse_type_property(value, body_subject, ctx, &mut buffer, object_var_parsing)?;
+            continue;
+        }
+
+        let mut prop_ctx = PropertyParseContext {
+            ctx,
+            nested_counter,
+            object_var_parsing,
+        };
+        parse_property(key, value, body_subject, &mut buffer, &mut prop_ctx)?;
+    }
+
+    Ok(buffer.patterns)
+}
+
+/// Recursively scan `value` for `@annotation` / `@edge` / `@reifies`
+/// keys. Used inside annotation-body parsing to reject deferred shapes
+/// (annotation-of-annotation, nested triple-term values).
+fn scan_for_deferred_annotation_keywords(value: &JsonValue) -> Result<()> {
+    match value {
+        JsonValue::Object(map) => {
+            for (k, v) in map {
+                if is_annotation_key(k) {
+                    return Err(ParseError::InvalidWhere(format!(
+                        "{k} nested inside an annotation body is deferred (v1); \
+                         annotation-of-annotation is not supported yet"
+                    )));
+                }
+                if k == REIFIES_KEY {
+                    return Err(ParseError::InvalidWhere(
+                        "@reifies nested inside an annotation body is not supported (v1); \
+                         nested triple-term values are deferred to v2"
+                            .to_string(),
+                    ));
+                }
+                scan_for_deferred_annotation_keywords(v)?;
+            }
+        }
+        JsonValue::Array(items) => {
+            for item in items {
+                scan_for_deferred_annotation_keywords(item)?;
+            }
+        }
+        _ => {}
+    }
     Ok(())
 }
 

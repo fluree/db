@@ -104,7 +104,9 @@ pub fn rewrite_patterns_for_r2rml(
             | Pattern::R2rml(_)
             | Pattern::GeoSearch(_)
             | Pattern::S2Search(_)
-            | Pattern::Graph { .. } => {
+            | Pattern::Graph { .. }
+            | Pattern::EdgeAnnotation { .. }
+            | Pattern::AnnotationTarget { .. } => {
                 result_patterns.push(pattern.clone());
             }
         }

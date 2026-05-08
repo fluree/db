@@ -825,6 +825,16 @@ pub fn estimate_pattern(
         Pattern::Service(_) => PatternEstimate::Source {
             row_count: DEFAULT_SERVICE_ROW_COUNT,
         },
+
+        // Edge-annotation patterns (M0): treated as a `Source` with the
+        // wrapped edge's cardinality as a first approximation. Real
+        // cost-based selection between edge-first and annotation-first
+        // scans arrives in M3 alongside `AnnotationStats`.
+        Pattern::EdgeAnnotation { edge, .. } | Pattern::AnnotationTarget { edge, .. } => {
+            PatternEstimate::Source {
+                row_count: estimate_triple_row_count(edge, bound_vars, stats),
+            }
+        }
     }
 }
 

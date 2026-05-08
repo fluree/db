@@ -96,6 +96,11 @@ impl<E: IriEncoder> LoweringContext<'_, E> {
                         self.collect_triples(branch, out);
                     }
                 }
+                Pattern::EdgeAnnotation { edge, body, .. }
+                | Pattern::AnnotationTarget { edge, body, .. } => {
+                    out.push(edge.clone());
+                    self.collect_triples(body, out);
+                }
                 // Filters, Binds, Values, PropertyPaths, Subqueries, IndexSearch, Service, and R2rml don't contribute template triples
                 Pattern::Filter(_)
                 | Pattern::Bind { .. }

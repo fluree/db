@@ -10,7 +10,7 @@ use super::adapters::{
 use super::expression::{Expression, Function};
 use super::grouping::Grouping;
 use super::path::PropertyPathPattern;
-use super::triple::TriplePattern;
+use super::triple::{Ref, TriplePattern};
 use crate::binding::Binding;
 use crate::sort::SortSpec;
 use crate::var_registry::VarId;
@@ -332,6 +332,57 @@ pub enum Pattern {
     /// - Results are joined with the outer query on shared variables
     /// - If `silent` is true, service errors produce empty results
     Service(ServicePattern),
+
+    /// Edge-rooted annotation pattern.
+    ///
+    /// Lowered from JSON-LD `@annotation` (or its `@edge` alias) blocks
+    /// attached to an object position. The annotation is the subject of
+    /// the body patterns; the edge `(s, p, o)` is the reified base
+    /// triple.
+    ///
+    /// # Semantics
+    ///
+    /// One row per `(matched_edge, attached_annotation)` pair: a base
+    /// edge with two parallel annotations produces two rows. This is
+    /// the multiplicity contract that supports Cypher fidelity.
+    ///
+    /// # Status
+    ///
+    /// M0 / parser surface only — operator-tree assembly returns
+    /// `QueryError::UnsupportedFeature`. Storage support arrives in M1.
+    EdgeAnnotation {
+        /// The annotated edge (base triple).
+        edge: TriplePattern,
+        /// The annotation subject — variable or constant ref.
+        annotation: Ref,
+        /// Patterns about the annotation subject.
+        body: Vec<Pattern>,
+    },
+
+    /// Annotation-rooted pattern — reverse direction of [`Pattern::EdgeAnnotation`].
+    ///
+    /// Lowered from JSON-LD `@reifies`. The enclosing node-map is the
+    /// annotation subject; `@reifies` names the base triple it reifies.
+    ///
+    /// # Semantics
+    ///
+    /// One row per `(annotation, base_edge)` pair. The base edge must be
+    /// **currently asserted and policy-visible** before a row is emitted
+    /// (M1 enforcement) — otherwise this operator would leak hidden
+    /// edges via annotation existence.
+    ///
+    /// # Status
+    ///
+    /// M0 / parser surface only — operator-tree assembly returns
+    /// `QueryError::UnsupportedFeature`. Storage support arrives in M1.
+    AnnotationTarget {
+        /// The annotation subject — variable or constant ref.
+        annotation: Ref,
+        /// The base edge being reified.
+        edge: TriplePattern,
+        /// Patterns about the annotation subject.
+        body: Vec<Pattern>,
+    },
 }
 
 impl Pattern {
@@ -371,6 +422,24 @@ impl Pattern {
                 patterns: f(sp.patterns),
                 ..sp
             }),
+            Pattern::EdgeAnnotation {
+                edge,
+                annotation,
+                body,
+            } => Pattern::EdgeAnnotation {
+                edge,
+                annotation,
+                body: f(body),
+            },
+            Pattern::AnnotationTarget {
+                annotation,
+                edge,
+                body,
+            } => Pattern::AnnotationTarget {
+                annotation,
+                edge,
+                body: f(body),
+            },
             other => other,
         }
     }
@@ -426,6 +495,23 @@ impl Pattern {
                 vars
             }
             Pattern::Service(sp) => sp.referenced_vars(),
+            Pattern::EdgeAnnotation {
+                edge,
+                annotation,
+                body,
+            }
+            | Pattern::AnnotationTarget {
+                annotation,
+                edge,
+                body,
+            } => {
+                let mut vars = edge.referenced_vars();
+                if let Ref::Var(v) = annotation {
+                    vars.push(*v);
+                }
+                vars.extend(body.iter().flat_map(Pattern::referenced_vars));
+                vars
+            }
         }
     }
 
@@ -464,6 +550,23 @@ impl Pattern {
                 vars
             }
             Pattern::Service(sp) => sp.produced_vars(),
+            Pattern::EdgeAnnotation {
+                edge,
+                annotation,
+                body,
+            }
+            | Pattern::AnnotationTarget {
+                annotation,
+                edge,
+                body,
+            } => {
+                let mut vars = edge.produced_vars();
+                if let Ref::Var(v) = annotation {
+                    vars.push(*v);
+                }
+                vars.extend(body.iter().flat_map(Pattern::produced_vars));
+                vars
+            }
         }
     }
 
@@ -483,6 +586,9 @@ impl Pattern {
                 .any(|branch| branch.iter().any(|p| p.contains_function(target))),
             Pattern::Graph { patterns, .. } => patterns.iter().any(|p| p.contains_function(target)),
             Pattern::Subquery(sq) => sq.patterns.iter().any(|p| p.contains_function(target)),
+            Pattern::EdgeAnnotation { body, .. } | Pattern::AnnotationTarget { body, .. } => {
+                body.iter().any(|p| p.contains_function(target))
+            }
             // Other pattern variants cannot contain general expressions.
             _ => false,
         }

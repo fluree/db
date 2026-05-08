@@ -382,6 +382,34 @@ pub fn lower_unresolved_pattern<E: IriEncoder>(
                 patterns: lowered_patterns,
             }])
         }
+        UnresolvedPattern::EdgeAnnotation {
+            edge,
+            annotation,
+            body,
+        } => {
+            let lowered_edge = lower_triple_pattern(edge, encoder, vars)?;
+            let lowered_annotation = lower_ref_term(annotation, encoder, vars)?;
+            let lowered_body = lower_unresolved_patterns(body, encoder, vars, pp_counter)?;
+            Ok(vec![Pattern::EdgeAnnotation {
+                edge: lowered_edge,
+                annotation: lowered_annotation,
+                body: lowered_body,
+            }])
+        }
+        UnresolvedPattern::AnnotationTarget {
+            annotation,
+            edge,
+            body,
+        } => {
+            let lowered_annotation = lower_ref_term(annotation, encoder, vars)?;
+            let lowered_edge = lower_triple_pattern(edge, encoder, vars)?;
+            let lowered_body = lower_unresolved_patterns(body, encoder, vars, pp_counter)?;
+            Ok(vec![Pattern::AnnotationTarget {
+                annotation: lowered_annotation,
+                edge: lowered_edge,
+                body: lowered_body,
+            }])
+        }
     }
 }
 

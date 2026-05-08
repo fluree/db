@@ -264,9 +264,13 @@ fn rewrite_single_pattern(
         | Pattern::Exists(_)
         | Pattern::NotExists(_)
         | Pattern::Graph { .. }
-        | Pattern::Service(_) => rewrite_subpatterns(pattern.clone(), diag, |xs, diag| {
-            rewrite_patterns_internal(&xs, hierarchy, ctx, diag, total_expansions)
-        }),
+        | Pattern::Service(_)
+        | Pattern::EdgeAnnotation { .. }
+        | Pattern::AnnotationTarget { .. } => {
+            rewrite_subpatterns(pattern.clone(), diag, |xs, diag| {
+                rewrite_patterns_internal(&xs, hierarchy, ctx, diag, total_expansions)
+            })
+        }
 
         // Non-expandable patterns
         Pattern::Filter(_)
