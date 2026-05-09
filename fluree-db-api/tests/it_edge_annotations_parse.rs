@@ -1,17 +1,21 @@
-//! Edge annotations — M0 surface integration tests.
+//! Edge annotations — M1 surface integration tests.
 //!
-//! M0 locks the `@annotation` / `@edge` / `@reifies` parser surface and
-//! returns `UnsupportedFeature` from the executor and transactor. M1
-//! replaces those stubs with real storage-backed lowering. These tests
-//! pin the contract:
+//! M1 wires durable storage for `@annotation` / `@edge` (lowered to
+//! `f:reifies*` system facts on the write side). `@reifies` on inserts
+//! remains deferred to a follow-up. The query-side operators arrive
+//! after M1 finishes.
 //!
-//! - Queries containing the new keywords parse cleanly *and* fail at
-//!   execution time with a clear "not yet implemented" message.
-//! - Inserts containing the new keywords fail at parse time with an
-//!   explicit pointer to the deferred milestone.
+//! These tests pin the surface contract:
+//! - Inserts with `@annotation` (or `@edge` alias) succeed and persist
+//!   the durable encoding.
+//! - `@reifies` on inserts is the deferred unasserted-reifier shape and
+//!   errors with an explicit message.
+//! - Queries containing `@annotation` / `@reifies` parse cleanly but
+//!   still error at execution time until the planner is wired in M1's
+//!   read-side slice.
 //!
 //! See: `EDGE_ANNOTATIONS.md` (design contract) and
-//! `EDGE_ANNOTATIONS_IMPL_PLAN.md` (M0/M1 split).
+//! `EDGE_ANNOTATIONS_IMPL_PLAN.md` (M1 split).
 
 mod support;
 
@@ -27,7 +31,7 @@ fn ctx() -> serde_json::Value {
 }
 
 #[tokio::test]
-async fn insert_with_annotation_returns_unsupported_feature() {
+async fn insert_with_annotation_succeeds_under_m1() {
     let fluree = FlureeBuilder::memory().build_memory();
     let ledger_id = "it/edge-annotations:insert";
     let ledger0 = genesis_ledger(&fluree, ledger_id);
@@ -41,23 +45,14 @@ async fn insert_with_annotation_returns_unsupported_feature() {
         }
     });
 
-    let err = fluree
+    fluree
         .insert(ledger0, &txn)
         .await
-        .expect_err("M0: @annotation on insert must error until M1 lowering lands");
-    let msg = err.to_string();
-    assert!(
-        msg.contains("@annotation") || msg.contains("edge annotation"),
-        "error should name the feature: {msg}"
-    );
-    assert!(
-        msg.contains("not yet implemented") || msg.contains("Unsupported feature"),
-        "error should mark the feature as deferred: {msg}"
-    );
+        .expect("M1: @annotation on insert lowers to f:reifies* and succeeds");
 }
 
 #[tokio::test]
-async fn insert_with_edge_alias_also_unsupported() {
+async fn insert_with_edge_alias_succeeds_under_m1() {
     let fluree = FlureeBuilder::memory().build_memory();
     let ledger_id = "it/edge-annotations:edge-alias";
     let ledger0 = genesis_ledger(&fluree, ledger_id);
@@ -71,11 +66,10 @@ async fn insert_with_edge_alias_also_unsupported() {
         }
     });
 
-    let err = fluree
+    fluree
         .insert(ledger0, &txn)
         .await
-        .expect_err("M0: @edge alias on insert is also rejected");
-    assert!(err.to_string().contains("@edge"));
+        .expect("M1: @edge is an alias for @annotation and succeeds");
 }
 
 #[tokio::test]

@@ -98,47 +98,20 @@ pub fn parse_transaction(
     opts: TxnOpts,
     ns_registry: &mut NamespaceRegistry,
 ) -> Result<Txn> {
-    // M0: edge-annotation surface (`@annotation` / `@edge` / `@reifies`)
-    // parses on the query side but storage support arrives in M1. Reject
-    // mentions on the write surface with a clear message so users get a
-    // real error rather than silently dropped metadata.
-    reject_edge_annotation_keywords(json)?;
+    // M1: lower `@annotation` / `@edge` / `@reifies` into the seven-fact
+    // `f:reifies*` system encoding before JSON-LD expansion. Rejects
+    // user-authored `f:reifies*` IRIs and every deferred shape (literal-
+    // valued annotations, multi-triple reifiers, annotation-of-
+    // annotation) with explicit errors. After this pass the rest of the
+    // parser sees only ordinary IRIs.
+    let mut lowered = json.clone();
+    super::edge_annotations::lower_edge_annotations(&mut lowered)?;
 
     match txn_type {
-        TxnType::Insert => parse_insert(json, opts, ns_registry),
-        TxnType::Upsert => parse_upsert(json, opts, ns_registry),
-        TxnType::Update => parse_update(json, opts, ns_registry),
+        TxnType::Insert => parse_insert(&lowered, opts, ns_registry),
+        TxnType::Upsert => parse_upsert(&lowered, opts, ns_registry),
+        TxnType::Update => parse_update(&lowered, opts, ns_registry),
     }
-}
-
-/// Recursively scan `value` for edge-annotation keywords and return an
-/// `UnsupportedFeature` error if any are present.
-///
-/// The check runs *before* JSON-LD expansion so the user-visible error
-/// names the keyword they actually wrote. This is the M0 firewall on the
-/// write surface — M1 lowers `@annotation` / `@reifies` into the durable
-/// system facts described in `EDGE_ANNOTATIONS_IMPL_PLAN.md`.
-fn reject_edge_annotation_keywords(value: &Value) -> Result<()> {
-    match value {
-        Value::Object(map) => {
-            for (key, child) in map {
-                if key == "@annotation" || key == "@edge" || key == "@reifies" {
-                    return Err(TransactError::UnsupportedFeature(format!(
-                        "edge annotations: '{key}' on write surface is not yet \
-                         implemented (M0 parser stub; storage support arrives in M1)"
-                    )));
-                }
-                reject_edge_annotation_keywords(child)?;
-            }
-        }
-        Value::Array(items) => {
-            for item in items {
-                reject_edge_annotation_keywords(item)?;
-            }
-        }
-        _ => {}
-    }
-    Ok(())
 }
 
 /// Parse an insert transaction

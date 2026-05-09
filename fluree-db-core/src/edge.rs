@@ -289,13 +289,22 @@ impl EdgeKey {
         let s = s_pos.ok_or(EdgeKeyDecodeError::Missing("f:reifiesSubject"))?;
         let p = p_pos.ok_or(EdgeKeyDecodeError::Missing("f:reifiesPredicate"))?;
         let (o, o_dt_from_flake) = o_pos.ok_or(EdgeKeyDecodeError::Missing("f:reifiesObject"))?;
-        let dt = dt_pos.ok_or(EdgeKeyDecodeError::Missing("f:reifiesDatatype"))?;
 
-        // Cross-check: f:reifiesObject's flake-level dt must match the
-        // f:reifiesDatatype value (both encode the original object dt).
-        if o_dt_from_flake != dt {
-            return Err(EdgeKeyDecodeError::DatatypeMismatch);
-        }
+        // `f:reifiesDatatype` is optional: when present it must agree
+        // with the flake-level `dt` of the `f:reifiesObject` row (both
+        // encode the same value). When absent, the flake-level dt is
+        // canonical — the bundle is still complete because object
+        // datatype round-trips via the flake's own `dt` field. The
+        // pre-expansion JSON-LD lowering path emits the optional
+        // form; the in-Rust `to_reifies_facts` builder emits both for
+        // diagnostic clarity.
+        let dt = match dt_pos {
+            Some(separate) if separate != o_dt_from_flake => {
+                return Err(EdgeKeyDecodeError::DatatypeMismatch);
+            }
+            Some(separate) => separate,
+            None => o_dt_from_flake,
+        };
 
         Ok(Self {
             g,
