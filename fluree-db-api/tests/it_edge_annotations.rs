@@ -298,9 +298,25 @@ async fn retracting_base_edge_cascades_f_reifies_bundle() {
     // M1b cascade: when a base edge is retracted, the `f:reifies*`
     // bundle pointing at it must be retracted in the same
     // transaction so the durable encoding doesn't keep orphaned
-    // attachment pointers. After the cascade, an `@reifies` query
-    // for the metadata must return zero rows because the base edge
-    // is gone *and* the attachment is no longer asserted.
+    // attachment pointers.
+    //
+    // The naïve "post-delete @reifies returns zero rows" check is
+    // ambiguous: the base-edge triple emitted by the M1b expansion
+    // *also* drops the row when the edge isn't currently asserted,
+    // so zero rows after delete tells us nothing about whether the
+    // f:reifies* bundle was retracted or merely orphaned.
+    //
+    // The discriminating test: after the cascade-eligible delete,
+    // re-insert *just* the base edge (no `@annotation` block). This
+    // re-asserts the visibility-check edge but does not re-emit any
+    // f:reifies* facts. So:
+    //   - if cascade fired, the f:reifies* facts are retracted,
+    //     re-inserting the edge doesn't bring them back, and
+    //     `@reifies` returns zero rows.
+    //   - if cascade didn't fire, the f:reifies* facts are still
+    //     asserted from the original insert, the visibility check
+    //     now passes, and `@reifies` returns the original
+    //     annotation — proving the bundle was orphaned, not cleaned.
     let fluree = FlureeBuilder::memory().build_memory();
     let ledger_id = "it/edge-annotations:cascade-base-retract";
     let ledger0 = genesis_ledger(&fluree, ledger_id);
@@ -322,7 +338,6 @@ async fn retracting_base_edge_cascades_f_reifies_bundle() {
         .await
         .expect("annotated insert");
 
-    // Sanity: the annotation is reachable via @reifies.
     let q = json!({
         "@context": ctx(),
         "select": ["?person", "?org"],
@@ -331,6 +346,8 @@ async fn retracting_base_edge_cascades_f_reifies_bundle() {
             "@reifies": { "@id": "?person", "ex:worksFor": { "@id": "?org" } }
         }
     });
+
+    // Sanity: the annotation is reachable via @reifies before delete.
     let pre = support::query_jsonld_formatted(&fluree, &after_insert.ledger, &q)
         .await
         .expect("pre-cascade query");
@@ -353,20 +370,47 @@ async fn retracting_base_edge_cascades_f_reifies_bundle() {
         .await
         .expect("base-edge delete");
 
-    // 3. The `@reifies` query must now return zero rows. If the
-    //    cascade didn't fire, the f:reifies* facts would still
-    //    point at the now-retracted edge — and the join through the
-    //    expansion would still match the annotation but lose the
-    //    base-edge visibility check (which would correctly filter
-    //    it out, but only the visibility check, not the cascade,
-    //    would explain the zero rows).
-    let post = support::query_jsonld_formatted(&fluree, &after_delete.ledger, &q)
+    // 3. Re-insert *only* the base edge. No `@annotation` block,
+    //    so no f:reifies* assertions are emitted by the lowering.
+    let reinsert = json!({
+        "@context": ctx(),
+        "@id": "ex:alice",
+        "ex:worksFor": { "@id": "ex:acme" }
+    });
+    let after_reinsert = fluree
+        .insert(after_delete.ledger, &reinsert)
         .await
-        .expect("post-cascade query");
+        .expect("plain re-insert");
+
+    // 4. The base edge is now currently asserted again (visibility
+    //    check passes), so any zero-row result must come from the
+    //    f:reifies* facts being retracted — the cascade contract.
+    let post = support::query_jsonld_formatted(&fluree, &after_reinsert.ledger, &q)
+        .await
+        .expect("post-cascade-and-reinsert query");
     let arr = post.as_array().expect("array");
     assert!(
         arr.is_empty(),
-        "after cascade, @reifies must return zero rows: {arr:#?}"
+        "after cascade + plain re-insert, @reifies must return zero rows \
+         (proving the f:reifies* bundle was retracted, not just orphaned). got: {arr:#?}"
+    );
+
+    // Cross-check: a bare-triple query for the re-inserted edge
+    // must return one row, confirming the visibility-check side of
+    // the proof — the edge IS currently asserted, so zero rows
+    // above isn't a visibility miss.
+    let bare = json!({
+        "@context": ctx(),
+        "select": ["?person", "?org"],
+        "where": { "@id": "?person", "ex:worksFor": { "@id": "?org" } }
+    });
+    let bare_rows = support::query_jsonld_formatted(&fluree, &after_reinsert.ledger, &bare)
+        .await
+        .expect("bare triple query after re-insert");
+    assert_eq!(
+        bare_rows.as_array().expect("array").len(),
+        1,
+        "the re-inserted base edge must be currently asserted (cross-check)"
     );
 }
 

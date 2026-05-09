@@ -114,13 +114,19 @@ impl EdgeKey {
     /// for annotation subject `ann` at transaction time `t`, with the
     /// given assertion `op` (`true` = assert, `false` = retract).
     ///
-    /// All bundle facts share the same `t`/`op` and graph context as the
-    /// caller's transaction. The bundle is **complete by construction**:
-    /// every `EdgeKey` shape produces exactly one `f:reifiesSubject`,
-    /// `f:reifiesPredicate`, `f:reifiesObject`, and `f:reifiesDatatype`
-    /// flake, plus optional `f:reifiesGraph` (when the edge lives in a
-    /// named graph) and `f:reifiesLang` (when applicable). v1 never
-    /// emits `f:reifiesListIndex` (list-occurrence annotations deferred).
+    /// **Full bundle shape** including the optional `f:reifiesDatatype`
+    /// flake. Used by in-Rust producers that have direct knowledge of
+    /// the datatype and want the redundant-but-explicit encoding for
+    /// diagnostic clarity (e.g., direct flake construction in tests).
+    ///
+    /// Most write paths in v1 — including the JSON-LD pre-expansion
+    /// lowering and the cascade pass — must use
+    /// [`Self::to_reifies_facts_jsonld_compatible`] instead, which
+    /// omits `f:reifiesDatatype` so the inverse retract bundle is
+    /// byte-symmetric with what was originally asserted. Asserting
+    /// the full form and retracting the JSON-LD-compatible form (or
+    /// vice versa) leaves a phantom retract / orphan in the durable
+    /// log.
     ///
     /// Callers must not split or reorder the bundle — partial bundles
     /// are rejected by the replay validator (see
@@ -206,6 +212,39 @@ impl EdgeKey {
 
         // f:reifiesListIndex — deferred (v1 always omitted).
 
+        facts
+    }
+
+    /// Encode this edge as the **JSON-LD-compatible** `f:reifies*`
+    /// bundle: the same shape that
+    /// `fluree-db-transact::parse::edge_annotations` emits when
+    /// lowering an `@annotation` block before JSON-LD expansion.
+    ///
+    /// Differs from [`Self::to_reifies_facts`] by **omitting the
+    /// optional `f:reifiesDatatype` flake**. The decoder treats it as
+    /// optional and reconstructs the canonical datatype from the
+    /// flake-level `dt` of `f:reifiesObject`, so the bundle is
+    /// information-equivalent — but a *retraction* must match the
+    /// shape the original assertion produced or it leaves a phantom
+    /// retract in the flake log (a retract for a flake that was
+    /// never asserted).
+    ///
+    /// Use this variant in any path whose paired assertion shape is
+    /// the JSON-LD lowering: today that's the cascade pass in
+    /// `fluree-db-transact::stage::cascade_attachment_retracts` and
+    /// any future cleanup paths driven by `AttachmentNovelty`.
+    pub fn to_reifies_facts_jsonld_compatible(
+        &self,
+        ann: &Sid,
+        t: i64,
+        op: bool,
+    ) -> Vec<Flake> {
+        // Emit the full bundle, then drop the `f:reifiesDatatype`
+        // flake. Cheaper than reimplementing the seven-flake
+        // construction inline, and avoids drift between the two
+        // builders.
+        let mut facts = self.to_reifies_facts(ann, t, op);
+        facts.retain(|f| !is_reifies_datatype(&f.p));
         facts
     }
 
@@ -547,6 +586,67 @@ mod tests {
         ));
         let decoded = EdgeKey::from_reifies_facts(&bundle).expect("metadata is ignored");
         assert_eq!(decoded, key);
+    }
+
+    #[test]
+    fn jsonld_compatible_bundle_omits_datatype_but_round_trips() {
+        // The JSON-LD-compatible encoding drops the redundant
+        // `f:reifiesDatatype` flake. The decoder treats it as
+        // optional and reconstructs the canonical datatype from the
+        // flake-level `dt` of `f:reifiesObject`, so round-trip is
+        // lossless.
+        let f = sample_flake();
+        let key = EdgeKey::from_flake(&f);
+        let ann = Sid::new(13, "ann1");
+
+        let full = key.to_reifies_facts(&ann, 42, true);
+        let compact = key.to_reifies_facts_jsonld_compatible(&ann, 42, true);
+
+        assert_eq!(full.len(), 4, "full default-graph bundle has 4 facts");
+        assert_eq!(
+            compact.len(),
+            3,
+            "JSON-LD-compatible bundle drops f:reifiesDatatype"
+        );
+        assert!(
+            !compact.iter().any(|f| is_reifies_datatype(&f.p)),
+            "JSON-LD-compatible bundle must not contain f:reifiesDatatype: {compact:?}"
+        );
+
+        let decoded = EdgeKey::from_reifies_facts(&compact)
+            .expect("decoder treats f:reifiesDatatype as optional");
+        assert_eq!(decoded, key);
+    }
+
+    #[test]
+    fn jsonld_compatible_bundle_retract_matches_assertion_shape() {
+        // The cascade contract: a retract bundle must be the
+        // structural inverse of what the write path asserted, with
+        // only `t` and `op` differing. This test pins that for the
+        // JSON-LD encoding: an assertion at t=5 + a retract at t=7
+        // produces flake pairs that share `(s, p, o, dt, m)` and
+        // differ only in `(t, op)`.
+        let f = sample_flake();
+        let key = EdgeKey::from_flake(&f);
+        let ann = Sid::new(13, "ann1");
+
+        let assertion = key.to_reifies_facts_jsonld_compatible(&ann, 5, true);
+        let retract = key.to_reifies_facts_jsonld_compatible(&ann, 7, false);
+
+        assert_eq!(
+            assertion.len(),
+            retract.len(),
+            "assertion and retract bundles must have the same size"
+        );
+        for (a, r) in assertion.iter().zip(retract.iter()) {
+            assert_eq!(a.s, r.s, "subject must match");
+            assert_eq!(a.p, r.p, "predicate must match");
+            assert_eq!(a.o, r.o, "object value must match");
+            assert_eq!(a.dt, r.dt, "datatype must match");
+            assert_eq!(a.m, r.m, "metadata must match");
+            assert!(a.op && !r.op, "ops must invert");
+            assert_ne!(a.t, r.t, "t must differ");
+        }
     }
 
     #[test]

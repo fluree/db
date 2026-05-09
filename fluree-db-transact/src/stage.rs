@@ -76,11 +76,17 @@ fn cascade_attachment_retracts(
         }
         let edge_key = EdgeKey::from_flake(flake);
         for ann_sid in attachments.current_annotations_for(&edge_key) {
-            // Build the f:reifies* retraction bundle. The bundle's
-            // `t` matches the rest of the new transaction's flakes,
-            // and `op = false` produces the inverse of the original
-            // assertion bundle.
-            cascade.extend(edge_key.to_reifies_facts(&ann_sid, new_t, false));
+            // Build the f:reifies* retraction bundle. We use the
+            // *JSON-LD-compatible* shape (no f:reifiesDatatype) so
+            // the inverse retract is byte-symmetric with the
+            // original assertion that the JSON-LD pre-expansion
+            // lowering emitted. Using the full-bundle builder here
+            // would emit a retract for `f:reifiesDatatype` that
+            // was never asserted — a phantom retract that pollutes
+            // history and history-range queries.
+            cascade.extend(edge_key.to_reifies_facts_jsonld_compatible(
+                &ann_sid, new_t, false,
+            ));
         }
     }
     cascade
