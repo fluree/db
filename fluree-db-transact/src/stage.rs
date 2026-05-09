@@ -133,9 +133,11 @@ async fn cascade_attachment_retracts(
                 continue;
             }
 
-            // SPOT scan for the candidate's f:reifies* bundle and
-            // verify it matches our base edge.
-            let bundle_flakes = fluree_db_core::range_with_overlay(
+            // SPOT scan for ALL of the candidate's flakes (system
+            // bundle + body metadata). Splitting after the scan
+            // lets us reuse the same flake set for bundle-validation
+            // and (for anonymous annotations) metadata cleanup.
+            let all_ann_flakes = fluree_db_core::range_with_overlay(
                 &ledger.snapshot,
                 g_id,
                 ledger.novelty.as_ref(),
@@ -145,10 +147,9 @@ async fn cascade_attachment_retracts(
                 RangeOptions::new().with_to_t(to_t),
             )
             .await?;
-            let bundle: Vec<Flake> = bundle_flakes
+            let (bundle, metadata): (Vec<Flake>, Vec<Flake>) = all_ann_flakes
                 .into_iter()
-                .filter(|f| is_reserved_reifies_predicate(&f.p))
-                .collect();
+                .partition(|f| is_reserved_reifies_predicate(&f.p));
             if bundle.is_empty() {
                 continue;
             }
@@ -167,6 +168,34 @@ async fn cascade_attachment_retracts(
             cascade.extend(edge_key.to_reifies_facts_jsonld_compatible(
                 &ann_sid, new_t, false,
             ));
+
+            // Anonymous-annotation metadata cleanup (RDF mode
+            // default). Anonymous annotation subjects are minted
+            // by the JSON-LD lowering as blank-node SIDs that the
+            // user can't address directly. Once the f:reifies*
+            // bundle is gone, the body metadata (`ann ex:role
+            // "Engineer"`, etc.) becomes orphaned RDF — visible
+            // only via raw subject lookup on the synthetic SID.
+            // Retract it to keep the durable encoding clean.
+            //
+            // Explicit-IRI annotations are user-named and stay
+            // queryable as ordinary subjects after the bundle is
+            // retracted (RDF mode). The opt-in
+            // `lpgEdgeLifecycle: true` flag would extend this
+            // cleanup to explicit-IRI annotations too; that flag
+            // isn't implemented yet.
+            if ann_sid.namespace_code == fluree_vocab::namespaces::BLANK_NODE {
+                for asserted in metadata {
+                    // Mirror the asserted shape with `op = false`
+                    // and the new transaction's `t`. Preserves
+                    // graph (`g`), datatype, and metadata so the
+                    // retract matches the assertion's identity.
+                    let mut retract = asserted.clone();
+                    retract.t = new_t;
+                    retract.op = false;
+                    cascade.push(retract);
+                }
+            }
         }
     }
     Ok(cascade)

@@ -735,6 +735,127 @@ async fn subject_expansion_emits_no_annotation_when_edge_has_none() {
 }
 
 #[tokio::test]
+async fn cascade_cleans_up_anonymous_annotation_metadata() {
+    // RDF-mode cleanup contract: when the cascade retracts the
+    // `f:reifies*` bundle for an anonymous (blank-node) annotation,
+    // it must also retract the annotation's body metadata. Without
+    // this, the body flakes (`_:fluree_ann_0 ex:role "Engineer"`)
+    // remain in the graph as orphaned RDF — unreachable through
+    // `@reifies` (the bundle is gone) but still discoverable via
+    // a `?s ex:role "Engineer"` scan.
+    //
+    // Explicit-IRI annotations are deliberately NOT cleaned up in
+    // RDF mode — they're user-addressable subjects that may have
+    // independent meaning. The opt-in `lpgEdgeLifecycle` flag
+    // would extend cleanup to those; not in scope here.
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger_id = "it/edge-annotations:cascade-anonymous-metadata";
+    let ledger0 = genesis_ledger(&fluree, ledger_id);
+
+    // Insert with an *anonymous* annotation (no @id on the
+    // annotation block — the lowering mints a blank-node SID).
+    let txn = json!({
+        "@context": ctx(),
+        "@id": "ex:alice",
+        "ex:worksFor": {
+            "@id": "ex:acme",
+            "@annotation": { "ex:role": "Engineer" }
+        }
+    });
+    let after_insert = fluree.insert(ledger0, &txn).await.expect("insert");
+
+    // Sanity: the role is queryable before the cascade.
+    let q_role = json!({
+        "@context": ctx(),
+        "select": ["?role"],
+        "where": { "ex:role": "?role" }
+    });
+    let pre = support::query_jsonld_formatted(&fluree, &after_insert.ledger, &q_role)
+        .await
+        .expect("pre-cascade role query");
+    assert_eq!(
+        pre.as_array().expect("array").len(),
+        1,
+        "ex:role should be present before cascade: {pre:#?}"
+    );
+
+    // Retract the base edge — cascade fires.
+    let delete = json!({
+        "@context": ctx(),
+        "where": { "@id": "?s", "ex:worksFor": { "@id": "?o" } },
+        "delete": { "@id": "?s", "ex:worksFor": { "@id": "?o" } }
+    });
+    let after_delete = fluree.update(after_insert.ledger, &delete).await.expect("delete");
+
+    // After the cascade, no row should match `?s ex:role ?role` —
+    // the anonymous annotation's body metadata is gone too.
+    let post = support::query_jsonld_formatted(&fluree, &after_delete.ledger, &q_role)
+        .await
+        .expect("post-cascade role query");
+    let arr = post.as_array().expect("array");
+    assert!(
+        arr.is_empty(),
+        "anonymous annotation's metadata must be cleaned up by RDF-mode cascade; \
+         got: {arr:#?}"
+    );
+}
+
+#[tokio::test]
+async fn cascade_keeps_explicit_iri_annotation_metadata() {
+    // Counterpart: explicit-IRI annotation subjects are NOT
+    // cleaned up by the default RDF-mode cascade. The bundle
+    // disappears (so `@reifies` returns nothing) but the body
+    // metadata stays queryable as ordinary RDF on the named
+    // subject.
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger_id = "it/edge-annotations:cascade-explicit-keeps-metadata";
+    let ledger0 = genesis_ledger(&fluree, ledger_id);
+
+    let txn = json!({
+        "@context": ctx(),
+        "@id": "ex:alice",
+        "ex:worksFor": {
+            "@id": "ex:acme",
+            "@annotation": {
+                "@id": "ex:emp/alice-acme",
+                "ex:role": "Engineer"
+            }
+        }
+    });
+    let after_insert = fluree.insert(ledger0, &txn).await.expect("insert");
+
+    let delete = json!({
+        "@context": ctx(),
+        "where": { "@id": "?s", "ex:worksFor": { "@id": "?o" } },
+        "delete": { "@id": "?s", "ex:worksFor": { "@id": "?o" } }
+    });
+    let after_delete = fluree.update(after_insert.ledger, &delete).await.expect("delete");
+
+    // The explicit-IRI annotation's role is still queryable.
+    let q = json!({
+        "@context": ctx(),
+        "select": ["?ann", "?role"],
+        "where": { "@id": "?ann", "ex:role": "?role" }
+    });
+    let rows = support::query_jsonld_formatted(&fluree, &after_delete.ledger, &q)
+        .await
+        .expect("post-cascade explicit-IRI role query");
+    let arr = rows.as_array().expect("array");
+    assert_eq!(
+        arr.len(),
+        1,
+        "explicit-IRI annotation's metadata must survive RDF-mode cascade: {arr:#?}"
+    );
+    let row = arr[0].as_array().expect("row");
+    assert!(iri_matches(
+        &row[0],
+        "ex:emp/alice-acme",
+        "http://example.org/emp/alice-acme",
+    ));
+    assert_eq!(row[1].as_str(), Some("Engineer"));
+}
+
+#[tokio::test]
 async fn variable_predicate_scan_hides_f_reifies() {
     // A triple pattern with a variable predicate (`?s ?p ?o`) used
     // to surface `f:reifies*` system flakes from the annotation
