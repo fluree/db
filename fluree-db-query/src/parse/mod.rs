@@ -81,6 +81,15 @@ pub(crate) fn parse_query_ast(
     json: &JsonValue,
     strict_override: Option<bool>,
 ) -> Result<(UnresolvedQuery, SelectMode)> {
+    // M1b: read-side firewall on user-authored `f:reifies*` IRIs.
+    // The IR-level expansion in `where_plan.rs::expand_edge_annotation_patterns`
+    // is the *only* legitimate way f:reifies* predicates enter the
+    // pattern stream — direct user mention of these IRIs in a query
+    // would expose system facts as ordinary RDF. We reject before
+    // even building the AST so the error message points at the
+    // user's input verbatim.
+    reject_user_authored_reifies_in_query(json)?;
+
     // Use shared counters so nested subqueries can generate unique implicit vars
     // across the full query tree (prevents collisions like ?__s0 between parent/subquery).
     let mut subject_counter: u32 = 0;
@@ -91,6 +100,77 @@ pub(crate) fn parse_query_ast(
         &mut nested_counter,
         strict_override,
     )
+}
+
+/// Reject user-authored `f:reifies*` IRIs anywhere in the query
+/// document. Resolves compact-IRI forms through the document's
+/// `@context` (and any nested per-node `@context`s) before checking,
+/// matching the write-side firewall in
+/// `fluree-db-transact::parse::edge_annotations`.
+fn reject_user_authored_reifies_in_query(json: &JsonValue) -> Result<()> {
+    let top_ctx = json
+        .as_object()
+        .and_then(|m| m.get("@context").or_else(|| m.get("context")))
+        .map(|v| fluree_graph_json_ld::parse_context(&normalize_context_value(v)))
+        .transpose()
+        .map_err(|e| ParseError::InvalidWhere(format!("failed to parse @context: {e}")))?
+        .unwrap_or_else(fluree_graph_json_ld::ParsedContext::new);
+    scan_query_for_reifies_iris(json, &top_ctx)
+}
+
+fn scan_query_for_reifies_iris(
+    value: &JsonValue,
+    context: &fluree_graph_json_ld::ParsedContext,
+) -> Result<()> {
+    use fluree_vocab::reifies_iris;
+    match value {
+        JsonValue::Object(map) => {
+            // Honor per-node `@context` overrides for compact-IRI
+            // resolution.
+            let merged: Option<fluree_graph_json_ld::ParsedContext> =
+                if let Some(local) = map.get("@context").or_else(|| map.get("context")) {
+                    Some(
+                        fluree_graph_json_ld::parse_context_with_base(
+                            context,
+                            &normalize_context_value(local),
+                        )
+                        .map_err(|e| {
+                            ParseError::InvalidWhere(format!(
+                                "failed to parse nested @context during firewall scan: {e}"
+                            ))
+                        })?,
+                    )
+                } else {
+                    None
+                };
+            let effective = merged.as_ref().unwrap_or(context);
+
+            for (k, v) in map {
+                if k == "@context" || k == "context" {
+                    continue;
+                }
+                let expanded_key = if k.starts_with('@') {
+                    k.clone()
+                } else {
+                    fluree_graph_json_ld::expand_iri(k, effective)
+                };
+                if reifies_iris::ALL.iter().any(|iri| *iri == expanded_key) {
+                    return Err(ParseError::InvalidWhere(format!(
+                        "'{k}' resolves to a system-controlled predicate '{expanded_key}'; \
+                         use @annotation or @reifies in queries instead"
+                    )));
+                }
+                scan_query_for_reifies_iris(v, effective)?;
+            }
+        }
+        JsonValue::Array(items) => {
+            for item in items {
+                scan_query_for_reifies_iris(item, context)?;
+            }
+        }
+        _ => {}
+    }
+    Ok(())
 }
 
 fn parse_query_ast_internal(
@@ -4002,6 +4082,45 @@ mod tests {
         assert!(
             msg.contains("exactly one") || msg.contains("multi-triple") || msg.contains("deferred"),
             "error should explain the multi-triple reifier deferral: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_parse_rejects_user_authored_full_reifies_iri() {
+        // The read-side firewall mirrors the write side: user-authored
+        // `f:reifies*` IRIs (full or compact) are system-controlled and
+        // cannot be queried directly.
+        let json = json!({
+            "select": ["?s"],
+            "where": {
+                "@id": "?ann",
+                "https://ns.flur.ee/db#reifiesSubject": "?s"
+            }
+        });
+        let err = parse_query_ast(&json, None).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("system-controlled") && msg.contains("reifiesSubject"),
+            "expected system-controlled rejection: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_parse_rejects_user_authored_compact_reifies_iri() {
+        // Compact form via `@context` is also blocked.
+        let json = json!({
+            "@context": { "f": "https://ns.flur.ee/db#" },
+            "select": ["?s"],
+            "where": {
+                "@id": "?ann",
+                "f:reifiesPredicate": "?p"
+            }
+        });
+        let err = parse_query_ast(&json, None).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("system-controlled") && msg.contains("reifiesPredicate"),
+            "expected system-controlled rejection: {msg}"
         );
     }
 
