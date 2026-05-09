@@ -1,0 +1,374 @@
+//! Reconstruct edge-annotation rows from a slab of `f:reifies*` flakes.
+//!
+//! The indexer collects every `f:reifies*` fact reachable from the
+//! snapshot's commit chain and hands them to [`build_arenas_from_flakes`].
+//! This module:
+//!
+//! 1. Groups the flakes by `(ann_subject, t, op)` so each group is a
+//!    single attachment-event bundle.
+//! 2. Calls [`EdgeKey::from_reifies_facts`] to validate the bundle and
+//!    materialize an [`EdgeKey`].
+//! 3. Emits one forward and one reverse row per validated bundle.
+//! 4. Sorts each list, runs the pure builder
+//!    ([`super::builder`]), and returns blobs ready for CAS writes
+//!    plus the [`AnnotationStats`] / `max_t` to seal into
+//!    [`AnnotationIndexRoot`].
+//!
+//! Malformed bundles (missing `f:reifiesSubject`, datatype mismatch,
+//! list-index facts in v1, …) are skipped with a `tracing::warn` and
+//! counted; the rest of the snapshot indexes normally. This mirrors
+//! the replay-validator behavior described in
+//! `EDGE_ANNOTATIONS_IMPL_PLAN.md` M2 ("the on-disk arena never
+//! contains rows from malformed bundles").
+//!
+//! ## Inputs
+//!
+//! Callers pass `&[Flake]` containing **only** `f:reifies*` flakes —
+//! the filter is the caller's responsibility because they have direct
+//! access to predicate-SID information (the global predicate dict in
+//! the indexer, or `is_reserved_reifies_predicate` for ad-hoc cases).
+//! Passing non-`f:reifies*` flakes is a no-op (they're ignored by the
+//! per-bundle decoder), but increases bundle-grouping cost.
+//!
+//! ## What this module is not
+//!
+//! - It does not write to CAS. The caller takes the leaf blobs from
+//!   the [`ArenaBuildOutput`], writes each one, then calls
+//!   [`super::build_forward_branch`] / [`super::build_reverse_branch`]
+//!   with `(summary, cid)` pairs.
+//! - It does not build [`AnnotationIndexRoot`]. The caller fills in
+//!   `forward_branch_cid` / `reverse_branch_cid` after writing the
+//!   branches.
+
+use super::builder::{
+    build_forward_leaves, build_reverse_leaves, ForwardLeafSummary, ReverseLeafSummary,
+    DEFAULT_TARGET_ROWS_PER_LEAF,
+};
+use super::format::{AnnotationForwardRow, AnnotationReverseRow};
+use fluree_db_core::{AnnotationStats, EdgeKey, Flake, Sid};
+use std::collections::HashMap;
+
+/// Output of [`build_arenas_from_flakes`].
+///
+/// `forward_leaves` and `reverse_leaves` carry encoded blobs ready
+/// for CAS writes. The caller writes each blob, collects the resulting
+/// `ContentId`, then calls
+/// [`super::build_forward_branch`] / [`super::build_reverse_branch`]
+/// with the `(summary, cid)` pairs to encode the branch manifest.
+#[derive(Debug)]
+pub struct ArenaBuildOutput {
+    pub forward_leaves: Vec<(ForwardLeafSummary, Vec<u8>)>,
+    pub reverse_leaves: Vec<(ReverseLeafSummary, Vec<u8>)>,
+    /// Highest `t` observed across all valid bundles. `0` when zero
+    /// valid bundles were produced.
+    pub max_t: i64,
+    /// Aggregate stats over the validated rows. Independent counters
+    /// for forward / reverse (always equal in the current builder, but
+    /// kept distinct so future filters can diverge).
+    pub stats: AnnotationStats,
+    /// Number of malformed bundles skipped. Surfaced so callers can
+    /// emit a single rolled-up telemetry counter rather than one
+    /// per-bundle.
+    pub skipped_bundles: u64,
+}
+
+/// Reconstruct + sort + chunk forward / reverse arena rows from a slab
+/// of `f:reifies*` flakes.
+///
+/// `target_rows_per_leaf` controls leaf chunking; pass
+/// [`DEFAULT_TARGET_ROWS_PER_LEAF`] when in doubt.
+pub fn build_arenas_from_flakes(flakes: &[Flake], target_rows_per_leaf: usize) -> ArenaBuildOutput {
+    // Group by (ann_sid, t, op) — each group is one bundle.
+    // `ann_sid` is the *subject* of every `f:reifies*` flake (the
+    // annotation's id; not the reified edge's subject).
+    let mut groups: HashMap<(Sid, i64, bool), Vec<Flake>> = HashMap::new();
+    for f in flakes {
+        groups
+            .entry((f.s.clone(), f.t, f.op))
+            .or_default()
+            .push(f.clone());
+    }
+
+    let mut forward_rows: Vec<AnnotationForwardRow> = Vec::with_capacity(groups.len());
+    let mut reverse_rows: Vec<AnnotationReverseRow> = Vec::with_capacity(groups.len());
+    let mut skipped: u64 = 0;
+    let mut max_t: i64 = 0;
+
+    for ((ann_sid, t, op), bundle) in groups {
+        match EdgeKey::from_reifies_facts(&bundle) {
+            Ok(edge) => {
+                if t > max_t {
+                    max_t = t;
+                }
+                forward_rows.push(AnnotationForwardRow {
+                    edge: edge.clone(),
+                    ann: ann_sid.clone(),
+                    t,
+                    op,
+                });
+                reverse_rows.push(AnnotationReverseRow {
+                    ann: ann_sid,
+                    edge,
+                    t,
+                    op,
+                });
+            }
+            Err(err) => {
+                skipped += 1;
+                // The replay validator pattern: log + count, never fail
+                // the index build over a single malformed bundle.
+                // Surrounding non-`f:reifies` metadata stays visible as
+                // ordinary RDF (just without the attachment binding).
+                tracing::warn!(
+                    ?err,
+                    ?ann_sid,
+                    t,
+                    op,
+                    "skipping malformed f:reifies* bundle during arena build"
+                );
+            }
+        }
+    }
+
+    forward_rows.sort_unstable_by(|a, b| {
+        a.edge
+            .cmp(&b.edge)
+            .then_with(|| a.ann.cmp(&b.ann))
+            .then_with(|| a.t.cmp(&b.t))
+            .then_with(|| a.op.cmp(&b.op))
+    });
+    reverse_rows.sort_unstable_by(|a, b| {
+        a.ann
+            .cmp(&b.ann)
+            .then_with(|| a.edge.cmp(&b.edge))
+            .then_with(|| a.t.cmp(&b.t))
+            .then_with(|| a.op.cmp(&b.op))
+    });
+
+    let stats = compute_stats(&forward_rows, &reverse_rows);
+
+    let forward_leaves = build_forward_leaves(&forward_rows, target_rows_per_leaf);
+    let reverse_leaves = build_reverse_leaves(&reverse_rows, target_rows_per_leaf);
+
+    ArenaBuildOutput {
+        forward_leaves,
+        reverse_leaves,
+        max_t,
+        stats,
+        skipped_bundles: skipped,
+    }
+}
+
+fn compute_stats(
+    forward: &[AnnotationForwardRow],
+    reverse: &[AnnotationReverseRow],
+) -> AnnotationStats {
+    use std::collections::HashSet;
+    let mut distinct_edges: HashSet<&EdgeKey> = HashSet::with_capacity(forward.len());
+    let mut distinct_anns: HashSet<&Sid> = HashSet::with_capacity(reverse.len());
+    for row in forward {
+        distinct_edges.insert(&row.edge);
+        distinct_anns.insert(&row.ann);
+    }
+    AnnotationStats {
+        forward_rows: forward.len() as u64,
+        reverse_rows: reverse.len() as u64,
+        distinct_edges: distinct_edges.len() as u64,
+        distinct_annotations: distinct_anns.len() as u64,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use fluree_db_core::{FlakeValue, Sid};
+    use fluree_vocab::db as db_predicates;
+
+    fn ns_fluree_db() -> u16 {
+        fluree_vocab::namespaces::FLUREE_DB
+    }
+
+    fn ann_sid(name: &str) -> Sid {
+        Sid::new(20, name)
+    }
+
+    fn ref_sid(name: &str) -> Sid {
+        Sid::new(11, name)
+    }
+
+    fn p_reifies(suffix: &str) -> Sid {
+        Sid::new(ns_fluree_db(), suffix)
+    }
+
+    fn id_dt() -> Sid {
+        fluree_db_core::id_datatype_sid()
+    }
+
+    /// Build a JSON-LD-compatible 3-flake bundle (subject, predicate,
+    /// object) for ann `ann_name` reifying edge `(ref_sid("alice"),
+    /// ref_sid("worksFor"), ref_sid("acme"))` at `(t, op)`.
+    fn make_bundle(ann_name: &str, t: i64, op: bool) -> Vec<Flake> {
+        let ann = ann_sid(ann_name);
+        vec![
+            Flake::new(
+                ann.clone(),
+                p_reifies(db_predicates::REIFIES_SUBJECT),
+                FlakeValue::Ref(ref_sid("alice")),
+                id_dt(),
+                t,
+                op,
+                None,
+            ),
+            Flake::new(
+                ann.clone(),
+                p_reifies(db_predicates::REIFIES_PREDICATE),
+                FlakeValue::Ref(ref_sid("worksFor")),
+                id_dt(),
+                t,
+                op,
+                None,
+            ),
+            Flake::new(
+                ann,
+                p_reifies(db_predicates::REIFIES_OBJECT),
+                FlakeValue::Ref(ref_sid("acme")),
+                id_dt(),
+                t,
+                op,
+                None,
+            ),
+        ]
+    }
+
+    #[test]
+    fn empty_input_produces_zero_rows() {
+        let out = build_arenas_from_flakes(&[], DEFAULT_TARGET_ROWS_PER_LEAF);
+        assert!(out.forward_leaves.is_empty());
+        assert!(out.reverse_leaves.is_empty());
+        assert_eq!(out.max_t, 0);
+        assert_eq!(out.stats, AnnotationStats::default());
+        assert_eq!(out.skipped_bundles, 0);
+    }
+
+    #[test]
+    fn single_assert_bundle_produces_one_forward_and_one_reverse_row() {
+        let flakes = make_bundle("ann_1", 5, true);
+        let out = build_arenas_from_flakes(&flakes, DEFAULT_TARGET_ROWS_PER_LEAF);
+        assert_eq!(out.forward_leaves.len(), 1);
+        assert_eq!(out.reverse_leaves.len(), 1);
+        assert_eq!(out.forward_leaves[0].0.row_count, 1);
+        assert_eq!(out.reverse_leaves[0].0.row_count, 1);
+        assert_eq!(out.max_t, 5);
+        assert_eq!(out.stats.forward_rows, 1);
+        assert_eq!(out.stats.distinct_edges, 1);
+        assert_eq!(out.stats.distinct_annotations, 1);
+        assert_eq!(out.skipped_bundles, 0);
+    }
+
+    #[test]
+    fn assert_then_retract_same_ann_emits_two_rows() {
+        // Same annotation re-bundled at different (t, op) — two
+        // events, two rows in each direction.
+        let mut flakes = make_bundle("ann_1", 5, true);
+        flakes.extend(make_bundle("ann_1", 7, false));
+        let out = build_arenas_from_flakes(&flakes, DEFAULT_TARGET_ROWS_PER_LEAF);
+        assert_eq!(out.stats.forward_rows, 2);
+        assert_eq!(out.stats.reverse_rows, 2);
+        assert_eq!(
+            out.stats.distinct_edges, 1,
+            "same edge across the two events"
+        );
+        assert_eq!(out.stats.distinct_annotations, 1);
+        assert_eq!(out.max_t, 7);
+    }
+
+    #[test]
+    fn malformed_bundle_skipped_with_counter() {
+        // Bundle missing f:reifiesSubject. Surrounding good bundle
+        // must still produce a row.
+        let good = make_bundle("ann_good", 1, true);
+        let bad = vec![Flake::new(
+            ann_sid("ann_bad"),
+            p_reifies(db_predicates::REIFIES_PREDICATE),
+            FlakeValue::Ref(ref_sid("worksFor")),
+            id_dt(),
+            1,
+            true,
+            None,
+        )];
+        let mut all = good;
+        all.extend(bad);
+        let out = build_arenas_from_flakes(&all, DEFAULT_TARGET_ROWS_PER_LEAF);
+        assert_eq!(out.skipped_bundles, 1);
+        assert_eq!(out.stats.forward_rows, 1, "good bundle still emitted");
+    }
+
+    #[test]
+    fn multiple_bundles_sort_into_arena_order() {
+        // Three bundles, distinct edges. The forward arena sort key is
+        // (edge, ann, t, op); reverse is (ann, edge, t, op). We assert
+        // the sort by inspecting the first/last keys of the produced
+        // single leaf each.
+        let mut flakes = Vec::new();
+        flakes.extend(make_bundle("ann_3", 1, true));
+        flakes.extend(make_bundle("ann_1", 2, true));
+        flakes.extend(make_bundle("ann_2", 3, true));
+        // make_bundle reuses the same edge for every annotation, so
+        // forward arena rows differ only in the annotation Sid.
+        let out = build_arenas_from_flakes(&flakes, DEFAULT_TARGET_ROWS_PER_LEAF);
+        assert_eq!(out.forward_leaves.len(), 1);
+        let summary = &out.forward_leaves[0].0;
+        // Sorted ascending by ann_sid: ann_1 < ann_2 < ann_3.
+        assert_eq!(summary.first_ann, ann_sid("ann_1"));
+        assert_eq!(summary.last_ann, ann_sid("ann_3"));
+
+        let rev = &out.reverse_leaves[0].0;
+        assert_eq!(rev.first_ann, ann_sid("ann_1"));
+        assert_eq!(rev.last_ann, ann_sid("ann_3"));
+    }
+
+    #[test]
+    fn rows_chunk_into_multiple_leaves_when_exceeding_target() {
+        // 5 distinct annotations against the same edge → 5 forward
+        // rows; with target=2 → 3 leaves.
+        let mut flakes = Vec::new();
+        for i in 0..5 {
+            flakes.extend(make_bundle(&format!("ann_{i}"), i64::from(i) + 1, true));
+        }
+        let out = build_arenas_from_flakes(&flakes, 2);
+        assert_eq!(out.forward_leaves.len(), 3);
+        let total: u64 = out.forward_leaves.iter().map(|(s, _)| s.row_count).sum();
+        assert_eq!(total, 5);
+    }
+
+    #[test]
+    fn forward_and_reverse_blobs_decode_back_to_original_rows() {
+        use crate::annotation_arena::format::{AnnotationForwardLeaf, AnnotationReverseLeaf};
+
+        let mut flakes = Vec::new();
+        flakes.extend(make_bundle("ann_a", 1, true));
+        flakes.extend(make_bundle("ann_b", 2, true));
+        flakes.extend(make_bundle("ann_a", 3, false));
+        let out = build_arenas_from_flakes(&flakes, DEFAULT_TARGET_ROWS_PER_LEAF);
+
+        let mut decoded_forward = Vec::new();
+        for (_, blob) in &out.forward_leaves {
+            decoded_forward.extend(AnnotationForwardLeaf::decode(blob).unwrap().rows);
+        }
+        let mut decoded_reverse = Vec::new();
+        for (_, blob) in &out.reverse_leaves {
+            decoded_reverse.extend(AnnotationReverseLeaf::decode(blob).unwrap().rows);
+        }
+        assert_eq!(decoded_forward.len(), 3);
+        assert_eq!(decoded_reverse.len(), 3);
+
+        // Cross-check: every forward (edge, ann, t, op) appears in
+        // reverse with the same fields.
+        for fwd in &decoded_forward {
+            let found = decoded_reverse.iter().any(|rev| {
+                rev.edge == fwd.edge && rev.ann == fwd.ann && rev.t == fwd.t && rev.op == fwd.op
+            });
+            assert!(found, "forward row missing from reverse: {fwd:?}");
+        }
+    }
+}
