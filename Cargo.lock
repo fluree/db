@@ -2357,6 +2357,7 @@ dependencies = [
  "chrono",
  "ciborium",
  "fluree-db-core",
+ "fluree-db-novelty",
  "fluree-db-spatial",
  "fluree-vocab",
  "fs2",

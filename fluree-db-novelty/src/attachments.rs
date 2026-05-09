@@ -183,6 +183,29 @@ impl AttachmentNovelty {
             .flat_map(|rows| rows.iter())
     }
 
+    /// Collect every overlay event for `edge` as `(ann, t, op)` triples.
+    ///
+    /// Shaped to match the input format of
+    /// `fluree_db_binary_index::annotation_arena::AnnotationArenaReader::current_annotations_merged`
+    /// so callers in higher-layer crates can pass the slice directly.
+    /// Empty when the overlay has no rows for the given edge.
+    pub fn collect_forward_events(&self, edge: &EdgeKey) -> Vec<(Sid, i64, bool)> {
+        self.forward
+            .get(edge)
+            .map(|rows| rows.iter().map(|r| (r.ann.clone(), r.t, r.op)).collect())
+            .unwrap_or_default()
+    }
+
+    /// Collect every overlay event for `ann` as `(edge, t, op)` triples.
+    /// Counterpart of [`Self::collect_forward_events`] for the reverse
+    /// arena.
+    pub fn collect_reverse_events(&self, ann: &Sid) -> Vec<(EdgeKey, i64, bool)> {
+        self.reverse
+            .get(ann)
+            .map(|rows| rows.iter().map(|r| (r.edge.clone(), r.t, r.op)).collect())
+            .unwrap_or_default()
+    }
+
     /// Observe a slice of accepted flakes and update the overlay.
     ///
     /// Filters down to `f:reifies*` flakes, groups them by
@@ -523,6 +546,53 @@ mod tests {
         );
         // Overlay should remain untouched after the error.
         assert!(!overlay.has_annotations());
+    }
+
+    #[test]
+    fn collect_forward_events_returns_arena_reader_input_shape() {
+        // Two events on the same edge: ann_a attached at t=5, retracted
+        // at t=7. `collect_forward_events` returns both as
+        // (ann, t, op) triples in row-stored order — ready to hand
+        // straight to AnnotationArenaReader::current_annotations_merged.
+        let edge = sample_edge();
+        let ann = ann_sid("ann_a");
+        let mut overlay = AttachmentNovelty::new();
+        overlay
+            .observe_flakes(&edge.to_reifies_facts(&ann, 5, true))
+            .unwrap();
+        overlay
+            .observe_flakes(&edge.to_reifies_facts(&ann, 7, false))
+            .unwrap();
+
+        let events = overlay.collect_forward_events(&edge);
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0], (ann.clone(), 5, true));
+        assert_eq!(events[1], (ann, 7, false));
+    }
+
+    #[test]
+    fn collect_reverse_events_mirrors_forward_collector() {
+        let edge = sample_edge();
+        let ann = ann_sid("ann_a");
+        let mut overlay = AttachmentNovelty::new();
+        overlay
+            .observe_flakes(&edge.to_reifies_facts(&ann, 5, true))
+            .unwrap();
+
+        let events = overlay.collect_reverse_events(&ann);
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].0, edge);
+        assert_eq!(events[0].1, 5);
+        assert!(events[0].2);
+    }
+
+    #[test]
+    fn collect_events_empty_for_unknown_keys() {
+        let overlay = AttachmentNovelty::new();
+        assert!(overlay.collect_forward_events(&sample_edge()).is_empty());
+        assert!(overlay
+            .collect_reverse_events(&ann_sid("never_seen"))
+            .is_empty());
     }
 
     #[test]
