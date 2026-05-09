@@ -694,22 +694,17 @@ impl BinaryScanOperator {
                 break;
             };
 
-            // Mirror the binary-cursor path's `is_internal_predicate`
-            // filter on the overlay/novelty side: when the
-            // predicate is a variable in the user's pattern, hide
-            // every Fluree system predicate (the
-            // `https://ns.flur.ee/db#` namespace, which includes
-            // the `f:reifies*` set). Without this, a scan like
-            // `?s ?p ?o` against an annotated subject leaks
-            // `f:reifiesSubject` / `f:reifiesPredicate` /
-            // `f:reifiesObject` flakes from the novelty overlay.
-            // The binary-cursor path already filtered these for
-            // indexed data; extending the filter here closes the
-            // novelty leak.
-            if self.p_is_var
-                && self.g_id == 0
-                && flake.p.namespace_code == fluree_vocab::namespaces::FLUREE_DB
-            {
+            // Hide `f:reifies*` system predicates from
+            // variable-predicate scans on the overlay/novelty
+            // side. Without this, a scan like `?s ?p ?o` against
+            // an annotated subject leaks `f:reifiesSubject` /
+            // `f:reifiesPredicate` / `f:reifiesObject` from the
+            // overlay. Applied in every graph context (default
+            // and named) — annotation bundles are emitted in
+            // their reified edge's graph, so a `GRAPH ?g` /
+            // per-graph variable-predicate scan would otherwise
+            // leak the bundle in that graph.
+            if self.p_is_var && fluree_db_core::is_reserved_reifies_predicate(&flake.p) {
                 continue;
             }
 
@@ -1031,15 +1026,37 @@ impl BinaryScanOperator {
             .unwrap_or_else(|| Sid::new(0, ""))
     }
 
-    /// Filter: skip internal db: predicates when predicate is a variable.
+    /// Filter: skip Fluree-system predicates when predicate is a
+    /// variable.
+    ///
+    /// Two predicate sets are filtered:
+    ///
+    /// 1. **`f:reifies*`** (the seven edge-annotation bundle
+    ///    predicates) are hidden in **every** graph context. The
+    ///    annotation bundle is emitted in the reified edge's
+    ///    graph, so a per-graph `?p` scan would otherwise leak the
+    ///    bundle into the user's results.
+    /// 2. Other Fluree-namespace predicates (commit metadata,
+    ///    nameservice, etc.) are hidden only in the **default
+    ///    graph**, matching the prior behavior of this filter.
+    ///    Those predicates live in their own system graphs (e.g.
+    ///    txn-meta at `g_id == 1`) and the legacy default-graph
+    ///    filter is preserved to avoid behavior drift for queries
+    ///    that have grown to depend on it.
     #[inline]
     fn is_internal_predicate(&self, p_id: u32) -> bool {
-        if !self.p_is_var || self.g_id != 0 {
+        if !self.p_is_var {
             return false;
         }
-        self.p_sids
-            .get(p_id as usize)
-            .is_some_and(|s| s.namespace_code == fluree_vocab::namespaces::FLUREE_DB)
+        let Some(sid) = self.p_sids.get(p_id as usize) else {
+            return false;
+        };
+        // Always hide `f:reifies*` regardless of graph.
+        if fluree_db_core::is_reserved_reifies_predicate(sid) {
+            return true;
+        }
+        // Default-graph: also hide the broader Fluree-namespace set.
+        self.g_id == 0 && sid.namespace_code == fluree_vocab::namespaces::FLUREE_DB
     }
 
     /// Enforce within-pattern repeated-variable constraints.

@@ -856,6 +856,84 @@ async fn cascade_keeps_explicit_iri_annotation_metadata() {
 }
 
 #[tokio::test]
+async fn variable_predicate_scan_hides_f_reifies_in_named_graph() {
+    // Annotation bundles are emitted in the reified edge's graph,
+    // so a variable-predicate scan scoped to a named graph would
+    // expose `f:reifies*` flakes there too. The filter must apply
+    // to every graph, not only the default graph.
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger_id = "it/edge-annotations:variable-predicate-named-graph";
+    let ledger0 = genesis_ledger(&fluree, ledger_id);
+
+    let txn = json!({
+        "@context": ctx(),
+        "@id": "ex:alice",
+        "@graph": "ex:hr-graph",
+        "ex:worksFor": {
+            "@id": "ex:acme",
+            "@annotation": {
+                "@id": "ex:emp/alice-acme",
+                "ex:role": "Engineer"
+            }
+        }
+    });
+    let committed = fluree
+        .insert(ledger0, &txn)
+        .await
+        .expect("named-graph annotated insert");
+
+    // Scope the variable-predicate scan to the named graph via the
+    // dataset alias.
+    let named_graph_alias = format!("{ledger_id}#http://example.org/hr-graph");
+    let query = json!({
+        "@context": ctx(),
+        "from": &named_graph_alias,
+        "select": ["?p"],
+        "where": { "@id": "ex:emp/alice-acme", "?p": "?o" }
+    });
+
+    // `query_connection` is the dataset-aware path; pair with a
+    // formatter against the post-insert snapshot.
+    let result = fluree
+        .query_connection(&query)
+        .await
+        .expect("named-graph variable-predicate query");
+    let ledger = fluree.ledger(ledger_id).await.expect("reload ledger");
+    let json = result
+        .to_jsonld(&ledger.snapshot)
+        .expect("to_jsonld");
+    let arr = json.as_array().expect("array");
+
+    // Collect predicate bindings and assert no `f:reifies*` leaks.
+    let predicates: Vec<String> = arr
+        .iter()
+        .filter_map(|row| row.as_array())
+        .filter_map(|cols| cols.first())
+        .filter_map(|v| {
+            v.as_str()
+                .map(String::from)
+                .or_else(|| v.get("@id").and_then(|i| i.as_str()).map(String::from))
+        })
+        .collect();
+    for p in &predicates {
+        assert!(
+            !p.starts_with("https://ns.flur.ee/db#reifies"),
+            "f:reifies* must not leak from named-graph variable-predicate scan: {p} \
+             (full bindings: {predicates:?})"
+        );
+    }
+    // The user-authored predicate should still be visible.
+    assert!(
+        predicates.iter().any(|p| p == "http://example.org/role"
+            || p == "ex:role"),
+        "user-authored ex:role must be visible in named-graph scan: {predicates:?}"
+    );
+
+    // Drop unused suppression: the test is the assertion.
+    drop(committed);
+}
+
+#[tokio::test]
 async fn variable_predicate_scan_hides_f_reifies() {
     // A triple pattern with a variable predicate (`?s ?p ?o`) used
     // to surface `f:reifies*` system flakes from the annotation
