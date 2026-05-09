@@ -241,30 +241,53 @@ to the combined M1.
 - ✅ Test counts: 657 core + 35 novelty + 186 transact + 5 api
   integration + 12 query parser tests pass.
 
-**M1b — TODO** (next session):
-- ⏳ `EdgeAnnotationOp` operator (forward / inline form). Reads
-  `AttachmentNovelty.forward` for the matched base edge and emits
-  one row per `(edge_key, ann_sid)` currently asserted.
-- ⏳ `AnnotationTargetOp` operator (reverse / `@reifies` form). Adds
-  the **base-edge visibility check** (probe regular fact indexes,
-  confirm currently asserted + policy-visible) before emitting a row.
-- ⏳ Replace `where_plan.rs` and `operator_tree.rs` stubs (currently
-  return `UnsupportedFeature`) with real planner dispatch to the
-  new operators.
-- ⏳ Cascade rules in `flake_sink.rs` for the three retract shapes
-  (plain edge, occurrence-by-selector, by-annotation-id) plus the
+**M1b — partially landed (read-side dispatch + firewall in;
+correctness items remaining):**
+
+- ✅ **Planner expansion** (`feat(M1b): planner expansion`): IR-level
+  flattening of `Pattern::EdgeAnnotation` /
+  `Pattern::AnnotationTarget` into base edge + three `f:reifies*`
+  lookup triples + body. Replaces the M0 `UnsupportedFeature` stub
+  in `where_plan.rs`. The standard scan/join/dedup machinery handles
+  the rest. The base-edge triple gives the reverse-direction
+  visibility check for free.
+- ✅ **Read-side firewall** (`feat(M1b): read-side firewall`):
+  user queries naming `f:reifies*` IRIs directly (full or compact)
+  are rejected at parse time with a system-controlled message.
+- ✅ **Round-trip integration tests:**
+  `query_inline_annotation_returns_matching_role` and
+  `query_reifies_form_runs_with_visibility_check` — both demonstrate
+  insert-then-query end-to-end on memory storage.
+
+- ⏳ **System-fact filter at the scan layer.** Variable-predicate
+  scans (`?p` matching all predicates) currently expose `f:reifies*`
+  in their results. Wildcard `select: "*"` projects them as ordinary
+  properties on annotation subjects. Both need filters with an
+  `opts.includeSystemFacts: true` escape and a history-range
+  carve-out. The parser-level firewall blocks *direct named
+  mention*; this is the broader leakage path.
+- ⏳ **Wildcard hide of anonymous annotation SIDs.** Explicit-IRI
+  annotation subjects stay visible; anonymous (blank-node) ones are
+  filtered out of `select: "*"` per the design decisions.
+- ⏳ **Cascade rules** for the three retract shapes
+  (plain-edge / occurrence-by-selector / by-annotation-id) plus the
   RDF-mode default vs. `lpgEdgeLifecycle: true` opt-in.
-- ⏳ System-fact filter for `f:reifies*` predicates at variable-
-  predicate, named-predicate, wildcard-projection, and JSON-LD
-  expansion paths. `opts.includeSystemFacts: true` and
-  history-range escapes.
-- ⏳ JSON-LD subject-expansion output: emit `@annotation` blocks
-  when materializing an annotated edge.
-- ⏳ Wildcard-projection hide of anonymous annotation SIDs
-  (explicit-IRI annotations stay visible).
-- ⏳ `it_edge_annotations.rs` integration tests: round-trip,
-  parallel annotations, multiplicity, cascade, lifecycle, restart,
-  policy visibility.
+- ⏳ **JSON-LD subject-expansion output:** emit `@annotation` blocks
+  when materializing an annotated edge through subject expansion.
+- ⏳ **Broader `it_edge_annotations.rs` integration tests:** parallel
+  annotations on one edge, multiplicity contract, cascade behavior,
+  lifecycle (RDF default vs. LPG opt-in), restart-from-commits,
+  policy visibility independence.
+
+- ❌ **Custom `EdgeAnnotationOp` / `AnnotationTargetOp` operators —
+  not pursued.** The IR-level expansion approach achieves the same
+  result through the existing scan / join machinery, including the
+  visibility check (base edge triple is policy-filtered by the
+  standard scan). The custom-operator approach was the original
+  M1b plan; we kept the IR variants and added a flattening pass
+  instead, which avoids duplicating planner / dedup / policy logic.
+  Custom operators may still arrive in M3 if cost-based direction
+  selection (edge-first vs. annotation-first) requires them.
 
 ### Original goal (still applies to combined M1)
 
