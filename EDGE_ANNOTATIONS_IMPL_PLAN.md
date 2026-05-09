@@ -10,12 +10,19 @@ frozen contract this plan implements.
 Each milestone ships as one PR (or a small chain) and is independently
 useful — a reviewer can merge without waiting for the next.
 
-| ID | Scope | Persistence | Approx |
-|----|-------|-------------|--------|
-| M0 | Parser surface + IR stub | none — execution errors | ~3 days |
-| M1 | Novelty-only end-to-end | in-memory only | 2–3 wk |
-| M2 | Binary arena + `IndexRoot` extension | survives indexing | 3–4 wk |
-| M3 | Planner / costing | — | 1–2 wk |
+| ID  | Scope | Persistence | Approx |
+|-----|-------|-------------|--------|
+| M0  | Parser surface + IR stub | none — execution errors | ~3 days |
+| M1a | Foundation + write side | durable via `f:reifies*` | ~1 wk |
+| M1b | Read side + cascade + integration | (M1a + arena lookups) | ~1–2 wk |
+| M2  | Binary arena + `IndexRoot` extension | survives indexing | 3–4 wk |
+| M3  | Planner / costing | — | 1–2 wk |
+
+**M1 was split into two slices during implementation.** M1a and M1b
+are each independently mergeable. M1a is a complete write-side
+feature (annotations persist, but queries don't yet read them); M1b
+adds the read-side dispatch and visibility wiring that turns it into
+a queryable feature.
 
 The deferred list at the bottom of the source doc is **not** in v1.
 
@@ -200,6 +207,66 @@ no `unimplemented!` reachable from any user-input path.
 ---
 
 ## M1 — Novelty-only end-to-end (with durable encoding)
+
+**Implementation status:** split into M1a (write side, **DONE**) and
+M1b (read side, **TODO**) during execution. The two slices share the
+same goal and contracts — they just shipped as separate PR-sized
+units. The original goal statement and design contracts below apply
+to the combined M1.
+
+### Status snapshot (as of latest commit)
+
+**M1a — DONE** (`feat(M1)` commits):
+- ✅ `f:reifies*` predicates added to `fluree-vocab`
+  (`db::REIFIES_*`, `reifies_iris::*`).
+- ✅ `is_reserved_reifies_predicate(sid)` and per-predicate test
+  helpers in `fluree-db-core::namespaces`.
+- ✅ `EdgeKey` value type in `fluree-db-core::edge` with
+  `to_reifies_facts` / `from_reifies_facts` round-trip.
+- ✅ `AttachmentNovelty` overlay in `fluree-db-novelty` with
+  forward / reverse maps, `(t, op)` rows, and `has_annotations`
+  gate.
+- ✅ Observer hook in `Novelty::apply_commit` and
+  `Novelty::bulk_apply_commits` populating the overlay from
+  post-dedup `f:reifies*` flakes.
+- ✅ Pre-expansion JSON-LD lowering for `@annotation` / `@edge` in
+  `fluree-db-transact::parse::edge_annotations`.
+- ✅ Strict deferred-shape rejection: literal-valued annotations,
+  multi-triple reifiers, annotation-of-annotation, user-authored
+  `f:reifies*` IRIs, `@reifies` on inserts.
+- ✅ M0 keyword scan replaced by the M1 lowering at
+  `parse_transaction` entry.
+- ✅ M0 integration tests updated to M1 semantics: inserts succeed,
+  queries still error at the operator layer.
+- ✅ Test counts: 657 core + 35 novelty + 186 transact + 5 api
+  integration + 12 query parser tests pass.
+
+**M1b — TODO** (next session):
+- ⏳ `EdgeAnnotationOp` operator (forward / inline form). Reads
+  `AttachmentNovelty.forward` for the matched base edge and emits
+  one row per `(edge_key, ann_sid)` currently asserted.
+- ⏳ `AnnotationTargetOp` operator (reverse / `@reifies` form). Adds
+  the **base-edge visibility check** (probe regular fact indexes,
+  confirm currently asserted + policy-visible) before emitting a row.
+- ⏳ Replace `where_plan.rs` and `operator_tree.rs` stubs (currently
+  return `UnsupportedFeature`) with real planner dispatch to the
+  new operators.
+- ⏳ Cascade rules in `flake_sink.rs` for the three retract shapes
+  (plain edge, occurrence-by-selector, by-annotation-id) plus the
+  RDF-mode default vs. `lpgEdgeLifecycle: true` opt-in.
+- ⏳ System-fact filter for `f:reifies*` predicates at variable-
+  predicate, named-predicate, wildcard-projection, and JSON-LD
+  expansion paths. `opts.includeSystemFacts: true` and
+  history-range escapes.
+- ⏳ JSON-LD subject-expansion output: emit `@annotation` blocks
+  when materializing an annotated edge.
+- ⏳ Wildcard-projection hide of anonymous annotation SIDs
+  (explicit-IRI annotations stay visible).
+- ⏳ `it_edge_annotations.rs` integration tests: round-trip,
+  parallel annotations, multiplicity, cascade, lifecycle, restart,
+  policy visibility.
+
+### Original goal (still applies to combined M1)
 
 **Goal:** ledgers fully support edge annotations. Inserts, queries
 (both directions), and the three retract shapes work. Attachments
