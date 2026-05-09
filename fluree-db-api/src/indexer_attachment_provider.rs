@@ -36,7 +36,7 @@ use std::sync::{Arc, OnceLock};
 use async_trait::async_trait;
 use fluree_db_indexer::{AttachmentEventCoverage, AttachmentEventsProvider};
 
-use crate::ledger_manager::LedgerManager;
+use crate::ledger_manager::{LedgerManager, RunningCoverage};
 
 /// Shared late-binding cell for the api's running `LedgerManager`.
 pub(crate) type LedgerManagerCell = Arc<OnceLock<Arc<LedgerManager>>>;
@@ -59,15 +59,18 @@ impl std::fmt::Debug for ApiAttachmentEventsProvider {
 impl AttachmentEventsProvider for ApiAttachmentEventsProvider {
     async fn attachment_events(&self, ledger_id: &str) -> Option<AttachmentEventCoverage> {
         let manager = self.manager.get()?;
-        // Return `Augment`: the running `AttachmentNovelty` may carry
-        // the full history (continuously-running ledger) or only the
-        // post-index tail (after a reload — `LedgerState::load` only
-        // walks commits with `t > snapshot.t` to rebuild novelty).
-        // The indexer's Augment path merges with the base arena's
-        // events and dedupes, which is correct under both shapes.
-        // Asserting Authoritative here would silently drop history
-        // after any reload that precedes a non-annotation commit.
-        let events = manager.try_running_attachment_events(ledger_id).await?;
-        Some(AttachmentEventCoverage::Augment(events))
+        // Coverage from LedgerManager: when snapshot.t==0 (no index
+        // has ever run on this ledger), the AttachmentNovelty was
+        // built by walking every commit since genesis — provably
+        // complete. Once snapshot.t > 0, we can't distinguish a
+        // continuously-running ledger (full history preserved) from
+        // a reloaded one (post-index tail only), so we fall back to
+        // Augment so the indexer merges with the base arena's
+        // events.
+        let result = manager.try_running_attachment_events(ledger_id).await?;
+        Some(match result.coverage {
+            RunningCoverage::Authoritative => AttachmentEventCoverage::Authoritative(result.events),
+            RunningCoverage::Augment => AttachmentEventCoverage::Augment(result.events),
+        })
     }
 }

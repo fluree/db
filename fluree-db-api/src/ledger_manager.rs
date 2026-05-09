@@ -558,6 +558,13 @@ pub(crate) async fn load_and_attach_binary_store(
     // Always rebuild the provider here so it is coherent with the freshly
     // loaded BinaryIndexStore, DictNovelty, and runtime dictionary state.
     state.snapshot.range_provider = Some(Arc::new(provider));
+    // Plumb the CAS handle so arena-backed annotation reads can resolve
+    // `AnnotationIndexRoot.{forward,reverse}_branch_cid`. Mirror of the
+    // identical line in `apply_index_v2` — fresh-load path needs the
+    // same wiring as the cache-update path or `has_arena_reader()`
+    // would always be false on snapshots loaded outside the
+    // LedgerManager handle path.
+    state.snapshot.content_store = Some(Arc::clone(&cs));
     // Also attach the type-erased store to the state so transaction staging
     // (which clones LedgerState under the write lock) can construct
     // graph-scoped BinaryRangeProviders (needed for named-graph upsert deletions).
@@ -575,6 +582,33 @@ pub(crate) async fn load_and_attach_binary_store(
 ///
 /// Provides single-flight loading (concurrent requests share one I/O operation)
 /// and idle eviction.
+/// Coverage envelope returned alongside the running ledger's
+/// attachment events.
+///
+/// Distinguishes "we walked every commit since genesis" (safe to
+/// publish as `Authoritative`) from "we only have the post-index
+/// tail" (must be merged with a base arena via `Augment`).
+#[derive(Debug, Clone, Copy)]
+pub enum RunningCoverage {
+    /// Snapshot.t == 0: no index has ever run, so the running
+    /// `AttachmentNovelty` was built by walking every commit since
+    /// genesis. Provider can return `Authoritative`.
+    Authoritative,
+    /// Snapshot.t > 0: an index has run. The running
+    /// `AttachmentNovelty` may be the full history (continuously-
+    /// running ledger) or only the post-index tail (after a
+    /// reload). We can't distinguish, so the provider must return
+    /// `Augment`.
+    Augment,
+}
+
+/// Result of `LedgerManager::try_running_attachment_events`.
+#[derive(Debug, Clone)]
+pub struct RunningAttachmentEvents {
+    pub coverage: RunningCoverage,
+    pub events: Vec<(fluree_db_core::EdgeKey, fluree_db_core::Sid, i64, bool)>,
+}
+
 pub struct LedgerManager {
     /// Cached ledger handles + loading state
     entries: RwLock<HashMap<String, LoadState>>,
@@ -616,7 +650,8 @@ impl LedgerManager {
     }
 
     /// Snapshot the running ledger's attachment-event delta in the
-    /// shape the indexer's arena builder expects.
+    /// shape the indexer's arena builder expects, plus the coverage
+    /// envelope describing what the events span.
     ///
     /// Returns `None` when:
     /// - the ledger isn't currently loaded into this manager (no
@@ -633,15 +668,30 @@ impl LedgerManager {
     pub async fn try_running_attachment_events(
         &self,
         ledger_id: &str,
-    ) -> Option<Vec<(fluree_db_core::EdgeKey, fluree_db_core::Sid, i64, bool)>> {
+    ) -> Option<RunningAttachmentEvents> {
         let canonical_alias =
             normalize_ledger_id(ledger_id).unwrap_or_else(|_| ledger_id.to_string());
         let entries = self.entries.read().await;
-        let LoadState::Ready(handle) = entries.get(&canonical_alias)? else {
+        let entry = entries.get(&canonical_alias)?;
+        let LoadState::Ready(handle) = entry else {
             return None;
         };
         let view = handle.snapshot().await;
-        Some(view.novelty.attachments.iter_event_pairs().collect())
+        // Coverage heuristic: when the snapshot's `t` is zero, no
+        // index has ever run on this ledger, so the running
+        // `AttachmentNovelty` was built by walking every commit
+        // since genesis — it carries the complete event history.
+        // Once `snapshot.t > 0`, we can't distinguish a continuously-
+        // running ledger (full history preserved across reindexes)
+        // from a reloaded one (only post-index tail in the overlay),
+        // so the safe call is `Augment`.
+        let coverage = if view.snapshot.t == 0 {
+            RunningCoverage::Authoritative
+        } else {
+            RunningCoverage::Augment
+        };
+        let events: Vec<_> = view.novelty.attachments.iter_event_pairs().collect();
+        Some(RunningAttachmentEvents { coverage, events })
     }
 
     /// Get cached handle or load from nameservice
