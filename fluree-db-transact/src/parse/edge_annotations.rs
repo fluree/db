@@ -251,9 +251,26 @@ fn scan_nested_annotation_keywords(value: &Value) -> Result<()> {
 /// to the same identifier. When the node has no `@id`, we add
 /// `"@id": "_:fluree_ann_N"` so the subsequent annotation lowering and
 /// the standard parser see the same blank node.
-fn ensure_subject_id(map: &mut Map<String, Value>, ctx: &mut LowerCtx) -> String {
+///
+/// Honors `walk.json_ld.id_key` so context-aliased ids (e.g.
+/// `"@context": {"id": "@id"}` with node `{"id": "foo", ...}`) are
+/// recognized and the synthetic blank is not minted on top of them.
+/// Inserting a literal `@id` alongside an aliased one would leave the
+/// JSON-LD expander with two `@id` candidates and silently drop the
+/// surrounding predicates.
+fn ensure_subject_id(
+    map: &mut Map<String, Value>,
+    walk: &WalkCtx<'_>,
+    ctx: &mut LowerCtx,
+) -> String {
     if let Some(Value::String(s)) = map.get("@id") {
         return s.clone();
+    }
+    let id_alias = walk.json_ld.id_key.as_str();
+    if id_alias != "@id" {
+        if let Some(Value::String(s)) = map.get(id_alias) {
+            return s.clone();
+        }
     }
     let new_id = ctx.mint_blank();
     map.insert("@id".to_string(), json!(new_id.clone()));
@@ -512,6 +529,12 @@ pub(crate) fn lower_value_with_subject(
 /// or just `{"@graph": [...]}` — the wrapper holds no predicates of
 /// its own and must not be treated as a node (e.g. by minting an @id
 /// for it, which would then become a stray subject).
+///
+/// `opts` is a known top-level transactor key (stripped before
+/// JSON-LD expansion by `strip_opts_for_expansion`); allowing it here
+/// keeps documents like `{"@context": ..., "opts": ..., "@graph": [...]}`
+/// classified as envelopes so we don't mint a synthetic subject for the
+/// outer wrapper.
 fn is_envelope(map: &Map<String, Value>) -> bool {
     if !map.contains_key("@graph") {
         return false;
@@ -521,7 +544,7 @@ fn is_envelope(map: &Map<String, Value>) -> bool {
         return false;
     }
     map.keys()
-        .all(|k| matches!(k.as_str(), "@context" | "@graph"))
+        .all(|k| matches!(k.as_str(), "@context" | "@graph" | "opts"))
 }
 
 /// True when `map` is a JSON-LD value/list/variable wrapper rather
@@ -603,12 +626,19 @@ fn lower_object_with_subject(
     }
 
     // 2. Mint or read the @id so children can reference us.
-    let my_id = ensure_subject_id(map, ctx);
+    let my_id = ensure_subject_id(map, walk, ctx);
 
-    // 3. Walk predicate-value pairs.
+    // 3. Walk predicate-value pairs. Skip JSON-LD keywords plus their
+    //    context aliases (e.g. `"id": "@id"`) so we don't treat the
+    //    aliased subject reference as a regular predicate.
+    let id_alias = walk.json_ld.id_key.as_str();
+    let type_alias = walk.json_ld.type_key.as_str();
     let keys: Vec<String> = map.keys().cloned().collect();
     for key in keys {
         if key == "@id" || key == "@context" || key == "@graph" || key == "@type" {
+            continue;
+        }
+        if key == id_alias || key == type_alias {
             continue;
         }
         if is_annotation_key(&key) {
@@ -679,7 +709,7 @@ fn intercept_annotations_for_predicate(
                 ));
             }
 
-            let object_id = ensure_subject_id(map, ctx);
+            let object_id = ensure_subject_id(map, walk, ctx);
             if reifies_iris::ALL.contains(&predicate) {
                 return Err(TransactError::UnsupportedFeature(format!(
                     "'{predicate}' is a system-controlled predicate; use @annotation instead"
