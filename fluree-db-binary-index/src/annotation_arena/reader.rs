@@ -233,6 +233,27 @@ impl<'a, S: ContentStore + ?Sized> AnnotationArenaReader<'a, S> {
         Ok(out)
     }
 
+    /// Walk every forward-arena row in sort order and yield it as a
+    /// `(EdgeKey, ann, t, op)` event tuple. Used by the indexer's
+    /// arena-rebuild path when merging the previous arena with a
+    /// novelty bundle delta — the union of both event sets is
+    /// re-sorted and re-built.
+    ///
+    /// Loads every leaf (no skipping); on a healthy ledger this is
+    /// only called at index-build time, not on hot read paths.
+    pub async fn collect_all_forward_events(&self) -> CoreResult<Vec<(EdgeKey, Sid, i64, bool)>> {
+        let branch = self.load_forward_branch().await?;
+        let total: usize = branch.leaves.iter().map(|e| e.row_count as usize).sum();
+        let mut out: Vec<(EdgeKey, Sid, i64, bool)> = Vec::with_capacity(total);
+        for entry in &branch.leaves {
+            let leaf = self.load_forward_leaf(&entry.leaf_cid).await?;
+            for row in &leaf.rows {
+                out.push((row.edge.clone(), row.ann.clone(), row.t, row.op));
+            }
+        }
+        Ok(out)
+    }
+
     /// Every `(edge, t, op)` event for the given annotation, in arena
     /// sort order — `(edge, t, op)` ascending. Used by history queries
     /// to surface attach/detach timelines without applying a

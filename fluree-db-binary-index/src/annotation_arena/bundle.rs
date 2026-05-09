@@ -192,6 +192,67 @@ pub fn build_arenas_from_flakes(flakes: &[Flake], target_rows_per_leaf: usize) -
 /// the latest event for that pair. Counting "any row" would
 /// overstate live state after retractions; see the field docs on
 /// [`AnnotationStats`].
+/// Build forward + reverse arenas from a stream of pre-decoded
+/// attachment events.
+///
+/// Bypasses the bundle-reconstruction step that
+/// [`build_arenas_from_flakes`] performs — callers that already
+/// hold `(EdgeKey, ann_sid, t, op)` tuples (e.g.
+/// `AttachmentNovelty.iter_*`, or any source that has already
+/// validated `f:reifiesGraph` agreement) hand them in directly. Each
+/// input event maps to one forward row + one reverse row.
+///
+/// Sort, chunk, and stats handling match the [`build_arenas_from_flakes`]
+/// path. The output is ready for the same CAS-write + branch-encode
+/// flow.
+pub fn build_arenas_from_event_pairs(
+    events: impl IntoIterator<Item = (EdgeKey, Sid, i64, bool)>,
+    target_rows_per_leaf: usize,
+) -> ArenaBuildOutput {
+    let mut forward_rows: Vec<AnnotationForwardRow> = Vec::new();
+    let mut reverse_rows: Vec<AnnotationReverseRow> = Vec::new();
+    let mut max_t: i64 = 0;
+    for (edge, ann, t, op) in events {
+        if t > max_t {
+            max_t = t;
+        }
+        forward_rows.push(AnnotationForwardRow {
+            edge: edge.clone(),
+            ann: ann.clone(),
+            t,
+            op,
+        });
+        reverse_rows.push(AnnotationReverseRow { ann, edge, t, op });
+    }
+
+    forward_rows.sort_unstable_by(|a, b| {
+        a.edge
+            .cmp(&b.edge)
+            .then_with(|| a.ann.cmp(&b.ann))
+            .then_with(|| a.t.cmp(&b.t))
+            .then_with(|| a.op.cmp(&b.op))
+    });
+    reverse_rows.sort_unstable_by(|a, b| {
+        a.ann
+            .cmp(&b.ann)
+            .then_with(|| a.edge.cmp(&b.edge))
+            .then_with(|| a.t.cmp(&b.t))
+            .then_with(|| a.op.cmp(&b.op))
+    });
+
+    let stats = compute_stats(&forward_rows, &reverse_rows);
+    let forward_leaves = build_forward_leaves(&forward_rows, target_rows_per_leaf);
+    let reverse_leaves = build_reverse_leaves(&reverse_rows, target_rows_per_leaf);
+
+    ArenaBuildOutput {
+        forward_leaves,
+        reverse_leaves,
+        max_t,
+        stats,
+        skipped_bundles: 0,
+    }
+}
+
 fn compute_stats(
     forward: &[AnnotationForwardRow],
     reverse: &[AnnotationReverseRow],
@@ -522,5 +583,42 @@ mod tests {
             });
             assert!(found, "forward row missing from reverse: {fwd:?}");
         }
+    }
+
+    #[test]
+    fn event_pairs_path_matches_flakes_path() {
+        // Building from pre-decoded events must produce the same
+        // arena rows as the bundle-driven path. Same input data, two
+        // forms.
+        let mut flakes = Vec::new();
+        flakes.extend(make_bundle("ann_a", 1, true));
+        flakes.extend(make_bundle("ann_b", 2, true));
+        let from_flakes = build_arenas_from_flakes(&flakes, DEFAULT_TARGET_ROWS_PER_LEAF);
+
+        // Equivalent pre-decoded events. `make_bundle` reuses the
+        // same edge for each annotation, so we reconstruct it from
+        // the bundle once.
+        let edge = EdgeKey::from_reifies_facts(&make_bundle("ann_a", 1, true)).unwrap();
+        let events = vec![
+            (edge.clone(), ann_sid("ann_a"), 1, true),
+            (edge, ann_sid("ann_b"), 2, true),
+        ];
+        let from_events = build_arenas_from_event_pairs(events, DEFAULT_TARGET_ROWS_PER_LEAF);
+
+        assert_eq!(from_flakes.stats, from_events.stats);
+        assert_eq!(from_flakes.max_t, from_events.max_t);
+        assert_eq!(
+            from_flakes.forward_leaves.len(),
+            from_events.forward_leaves.len()
+        );
+    }
+
+    #[test]
+    fn event_pairs_empty_input_produces_empty_arena() {
+        let out = build_arenas_from_event_pairs(std::iter::empty(), DEFAULT_TARGET_ROWS_PER_LEAF);
+        assert!(out.forward_leaves.is_empty());
+        assert!(out.reverse_leaves.is_empty());
+        assert_eq!(out.max_t, 0);
+        assert_eq!(out.skipped_bundles, 0);
     }
 }

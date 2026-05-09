@@ -200,6 +200,26 @@ impl IncrementalRootBuilder {
         self.root.sketch_ref = cid;
     }
 
+    /// Replace the on-disk annotation arena pointer.
+    ///
+    /// Pass `Some(_)` after building the new arena and writing its
+    /// branch + leaf blobs to CAS. The encoder enforces the truth-
+    /// table invariant that any populated `annotation_index` implies
+    /// `has_annotations = true` on the wire (see
+    /// `fluree_db_core::annotation_index`), so callers don't need to
+    /// flip the sticky bit separately.
+    ///
+    /// The previous arena's branch CIDs (if any) are tracked as
+    /// replaced so GC can reclaim the old leaf blobs once a new root
+    /// supersedes the chain.
+    pub fn set_annotation_index(&mut self, new_index: Option<fluree_db_core::AnnotationIndexRoot>) {
+        if let Some(prev) = self.root.annotation_index.as_ref() {
+            self.replaced_cids.push(prev.forward_branch_cid.clone());
+            self.replaced_cids.push(prev.reverse_branch_cid.clone());
+        }
+        self.root.annotation_index = new_index;
+    }
+
     /// Add to cumulative commit stats.
     pub fn add_commit_stats(&mut self, size: u64, asserts: u64, retracts: u64) {
         self.root.total_commit_size += size;

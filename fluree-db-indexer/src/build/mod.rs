@@ -11,6 +11,7 @@
 //! - [`spatial`]: Spatial index building (S2 complex geometries)
 //! - [`types`]: Shared types (`UploadedIndexes`, `UploadedDicts`, etc.)
 
+pub(crate) mod annotation_arena;
 pub(crate) mod commit_chain;
 pub(crate) mod dicts;
 pub(crate) mod fulltext;

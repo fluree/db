@@ -42,7 +42,7 @@ pub use builder::{
     build_forward_branch, build_forward_leaves, build_reverse_branch, build_reverse_leaves,
     forward_arena_stats, ForwardLeafSummary, ReverseLeafSummary, DEFAULT_TARGET_ROWS_PER_LEAF,
 };
-pub use bundle::{build_arenas_from_flakes, ArenaBuildOutput};
+pub use bundle::{build_arenas_from_event_pairs, build_arenas_from_flakes, ArenaBuildOutput};
 pub use format::{
     AnnotationForwardBranch, AnnotationForwardBranchEntry, AnnotationForwardLeaf,
     AnnotationForwardRow, AnnotationIndexRoot, AnnotationReverseBranch,

@@ -206,6 +206,22 @@ impl AttachmentNovelty {
             .unwrap_or_default()
     }
 
+    /// Iterator over every overlay event as `(EdgeKey, ann, t, op)`
+    /// tuples — the input shape of
+    /// `fluree_db_binary_index::annotation_arena::build_arenas_from_event_pairs`.
+    ///
+    /// Used by the indexer when sealing a new arena: collect the full
+    /// overlay state (or merge with the previous arena's events first)
+    /// and feed straight into the arena builder. Walks `forward` so
+    /// each `(edge, ann)` pair is yielded together with all its
+    /// history rows in row-stored order.
+    pub fn iter_event_pairs(&self) -> impl Iterator<Item = (EdgeKey, Sid, i64, bool)> + '_ {
+        self.forward.iter().flat_map(|(edge, rows)| {
+            rows.iter()
+                .map(move |r| (edge.clone(), r.ann.clone(), r.t, r.op))
+        })
+    }
+
     /// Observe a slice of accepted flakes and update the overlay.
     ///
     /// Filters down to `f:reifies*` flakes, groups them by
