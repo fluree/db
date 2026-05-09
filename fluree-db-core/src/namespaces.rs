@@ -323,13 +323,14 @@ mod tests {
         }
         // Non-Fluree-DB SIDs and unrelated FLUREE_DB names are not reserved.
         assert!(!is_reserved_reifies_predicate(&Sid::new(RDF, "type")));
-        assert!(!is_reserved_reifies_predicate(&Sid::new(FLUREE_DB, "alias")));
+        assert!(!is_reserved_reifies_predicate(&Sid::new(
+            FLUREE_DB, "alias"
+        )));
         assert!(!is_reserved_reifies_predicate(&Sid::new(FLUREE_DB, "t")));
         // Defensive: a name that *prefix-matches* "reifies" but is not one
         // of the seven must not slip through.
         assert!(!is_reserved_reifies_predicate(&Sid::new(
-            FLUREE_DB,
-            "reifies"
+            FLUREE_DB, "reifies"
         )));
         assert!(!is_reserved_reifies_predicate(&Sid::new(
             FLUREE_DB,

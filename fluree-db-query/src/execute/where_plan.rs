@@ -168,9 +168,8 @@ fn expand_one_into(pattern: Pattern, out: &mut Vec<Pattern>) {
         | Pattern::Graph { .. }
         | Pattern::Service(_)
         | Pattern::Subquery(_) => {
-            let expanded = pattern.map_subpatterns(&mut |inner| {
-                expand_edge_annotation_patterns(&inner)
-            });
+            let expanded =
+                pattern.map_subpatterns(&mut |inner| expand_edge_annotation_patterns(&inner));
             out.push(expanded);
         }
 

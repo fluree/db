@@ -101,7 +101,10 @@ async fn parallel_annotations_on_one_edge_return_one_row_per_occurrence() {
             }
         ]
     });
-    let committed = fluree.insert(ledger0, &txn).await.expect("annotated insert");
+    let committed = fluree
+        .insert(ledger0, &txn)
+        .await
+        .expect("annotated insert");
 
     let query = json!({
         "@context": ctx(),
@@ -137,7 +140,7 @@ async fn parallel_annotations_on_one_edge_return_one_row_per_occurrence() {
         roles,
         ["Engineer", "Manager"]
             .iter()
-            .map(|s| s.to_string())
+            .map(std::string::ToString::to_string)
             .collect()
     );
 }
@@ -166,7 +169,10 @@ async fn bare_triple_pattern_returns_one_row_per_edge_regardless_of_annotations(
             }}
         ]
     });
-    let committed = fluree.insert(ledger0, &txn).await.expect("annotated insert");
+    let committed = fluree
+        .insert(ledger0, &txn)
+        .await
+        .expect("annotated insert");
 
     // Bare triple pattern — no @annotation block, no `@reifies`.
     let query = json!({
@@ -211,7 +217,10 @@ async fn select_distinct_collapses_parallel_annotations_when_projecting_edge_onl
             }}
         ]
     });
-    let committed = fluree.insert(ledger0, &txn).await.expect("annotated insert");
+    let committed = fluree
+        .insert(ledger0, &txn)
+        .await
+        .expect("annotated insert");
 
     let query = json!({
         "@context": ctx(),
@@ -438,7 +447,10 @@ async fn subject_expansion_emits_annotation_block_for_annotated_edge() {
             }
         }
     });
-    let committed = fluree.insert(ledger0, &txn).await.expect("annotated insert");
+    let committed = fluree
+        .insert(ledger0, &txn)
+        .await
+        .expect("annotated insert");
 
     // Wildcard hydrate the base subject. The `ex:worksFor` value
     // should expand to a node-map carrying both `@id` (the org) and
@@ -464,7 +476,11 @@ async fn subject_expansion_emits_annotation_block_for_annotated_edge() {
     // it out regardless of single-vs-array shape.
     let edge_obj = works_for
         .as_object()
-        .or_else(|| works_for.as_array().and_then(|a| a.first().and_then(|v| v.as_object())))
+        .or_else(|| {
+            works_for
+                .as_array()
+                .and_then(|a| a.first().and_then(|v| v.as_object()))
+        })
         .expect("worksFor value must be a node object: {works_for:#?}");
 
     assert!(
@@ -481,7 +497,10 @@ async fn subject_expansion_emits_annotation_block_for_annotated_edge() {
         .expect("@annotation key must be injected for annotated edge");
     let ann_obj = ann
         .as_object()
-        .or_else(|| ann.as_array().and_then(|a| a.first().and_then(|v| v.as_object())))
+        .or_else(|| {
+            ann.as_array()
+                .and_then(|a| a.first().and_then(|v| v.as_object()))
+        })
         .expect("@annotation value must be an object or single-element array");
 
     assert_eq!(
@@ -669,8 +688,7 @@ async fn cascade_fires_for_indexed_annotation_when_edge_is_retracted() {
             let after_insert = fluree.insert(ledger0, &txn).await.expect("insert");
 
             // Drain novelty into base via reindex.
-            support::trigger_index_and_wait(&handle, ledger_id, after_insert.receipt.t)
-                .await;
+            support::trigger_index_and_wait(&handle, ledger_id, after_insert.receipt.t).await;
             let reloaded = fluree.ledger(ledger_id).await.expect("reload");
 
             // Retract the base edge. With the M1b novelty-only
@@ -766,8 +784,7 @@ async fn subject_expansion_finds_annotation_after_reindex() {
 
             // Force a full reindex so the f:reifies* flakes roll
             // from novelty into base storage.
-            support::trigger_index_and_wait(&handle, ledger_id, after_insert.receipt.t)
-                .await;
+            support::trigger_index_and_wait(&handle, ledger_id, after_insert.receipt.t).await;
 
             // Reload the ledger to pick up the post-index snapshot.
             let reloaded = fluree
@@ -856,7 +873,11 @@ async fn subject_expansion_emits_no_annotation_when_edge_has_none() {
         .unwrap();
     let edge_obj = works_for
         .as_object()
-        .or_else(|| works_for.as_array().and_then(|a| a.first().and_then(|v| v.as_object())))
+        .or_else(|| {
+            works_for
+                .as_array()
+                .and_then(|a| a.first().and_then(|v| v.as_object()))
+        })
         .unwrap();
     assert!(
         edge_obj.get("@annotation").is_none(),
@@ -915,7 +936,10 @@ async fn cascade_cleans_up_anonymous_annotation_metadata() {
         "where": { "@id": "?s", "ex:worksFor": { "@id": "?o" } },
         "delete": { "@id": "?s", "ex:worksFor": { "@id": "?o" } }
     });
-    let after_delete = fluree.update(after_insert.ledger, &delete).await.expect("delete");
+    let after_delete = fluree
+        .update(after_insert.ledger, &delete)
+        .await
+        .expect("delete");
 
     // After the cascade, no row should match `?s ex:role ?role` —
     // the anonymous annotation's body metadata is gone too.
@@ -1125,7 +1149,10 @@ async fn retracting_partial_annotation_metadata_keeps_bundle() {
             "ex:role": "Engineer"
         }
     });
-    let after_delete = fluree.update(after_insert.ledger, &delete).await.expect("delete");
+    let after_delete = fluree
+        .update(after_insert.ledger, &delete)
+        .await
+        .expect("delete");
 
     // The annotation should still be findable via @reifies, since
     // `ex:since` (and the bundle) are still asserted.
@@ -1182,7 +1209,10 @@ async fn cascade_lpg_mode_cleans_explicit_iri_metadata_too() {
         "delete": { "@id": "?s", "ex:worksFor": { "@id": "?o" } },
         "opts": { "lpgEdgeLifecycle": true }
     });
-    let after_delete = fluree.update(after_insert.ledger, &delete).await.expect("delete");
+    let after_delete = fluree
+        .update(after_insert.ledger, &delete)
+        .await
+        .expect("delete");
 
     // The explicit-IRI annotation's role must be GONE (LPG semantics).
     let q = json!({
@@ -1229,7 +1259,10 @@ async fn cascade_keeps_explicit_iri_annotation_metadata() {
         "where": { "@id": "?s", "ex:worksFor": { "@id": "?o" } },
         "delete": { "@id": "?s", "ex:worksFor": { "@id": "?o" } }
     });
-    let after_delete = fluree.update(after_insert.ledger, &delete).await.expect("delete");
+    let after_delete = fluree
+        .update(after_insert.ledger, &delete)
+        .await
+        .expect("delete");
 
     // The explicit-IRI annotation's role is still queryable.
     let q = json!({
@@ -1299,9 +1332,7 @@ async fn variable_predicate_scan_hides_f_reifies_in_named_graph() {
         .await
         .expect("named-graph variable-predicate query");
     let ledger = fluree.ledger(ledger_id).await.expect("reload ledger");
-    let json = result
-        .to_jsonld(&ledger.snapshot)
-        .expect("to_jsonld");
+    let json = result.to_jsonld(&ledger.snapshot).expect("to_jsonld");
     let arr = json.as_array().expect("array");
 
     // Collect predicate bindings and assert no `f:reifies*` leaks.
@@ -1324,8 +1355,9 @@ async fn variable_predicate_scan_hides_f_reifies_in_named_graph() {
     }
     // The user-authored predicate should still be visible.
     assert!(
-        predicates.iter().any(|p| p == "http://example.org/role"
-            || p == "ex:role"),
+        predicates
+            .iter()
+            .any(|p| p == "http://example.org/role" || p == "ex:role"),
         "user-authored ex:role must be visible in named-graph scan: {predicates:?}"
     );
 
@@ -1356,7 +1388,10 @@ async fn variable_predicate_scan_hides_f_reifies() {
             }
         }
     });
-    let committed = fluree.insert(ledger0, &txn).await.expect("annotated insert");
+    let committed = fluree
+        .insert(ledger0, &txn)
+        .await
+        .expect("annotated insert");
 
     // Bind ?p to every predicate the annotation subject carries.
     let query = json!({
@@ -1395,8 +1430,9 @@ async fn variable_predicate_scan_hides_f_reifies() {
     }
     // The user-authored `ex:role` must still be visible.
     assert!(
-        predicates.iter().any(|p| p == "http://example.org/role"
-            || p == "ex:role"),
+        predicates
+            .iter()
+            .any(|p| p == "http://example.org/role" || p == "ex:role"),
         "user-authored ex:role must be visible: {predicates:?}"
     );
 }
@@ -1428,7 +1464,10 @@ async fn wildcard_subject_hydration_hides_f_reifies_predicates() {
             }
         }
     });
-    let committed = fluree.insert(ledger0, &txn).await.expect("annotated insert");
+    let committed = fluree
+        .insert(ledger0, &txn)
+        .await
+        .expect("annotated insert");
 
     let query = json!({
         "@context": ctx(),
@@ -1570,8 +1609,7 @@ async fn cascade_retracts_named_graph_annotations_in_their_own_graph() {
             .current_annotations_for_at(edge_key, as_of)
             .collect();
         if !live.is_empty() {
-            leaked_named_graph_attachments
-                .push(format!("{edge_key:?} -> {live:?}"));
+            leaked_named_graph_attachments.push(format!("{edge_key:?} -> {live:?}"));
         }
     }
     assert!(

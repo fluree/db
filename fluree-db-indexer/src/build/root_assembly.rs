@@ -269,10 +269,7 @@ pub(crate) async fn encode_and_write_root_v6(
     // Once a predicate enters the dict it stays there across
     // reindexes, so this naturally inherits sticky-bit semantics.
     let has_annotations = inputs.predicate_sids.iter().any(|(ns, name)| {
-        fluree_db_core::is_reserved_reifies_predicate(&fluree_db_core::Sid::new(
-            *ns,
-            name.as_str(),
-        ))
+        fluree_db_core::is_reserved_reifies_predicate(&fluree_db_core::Sid::new(*ns, name.as_str()))
     });
 
     let mut root = IndexRoot {

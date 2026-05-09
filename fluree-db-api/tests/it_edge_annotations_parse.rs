@@ -113,7 +113,10 @@ async fn query_inline_annotation_returns_matching_role() {
             "@annotation": { "ex:role": "Engineer" }
         }
     });
-    let committed = fluree.insert(ledger0, &txn).await.expect("annotated insert");
+    let committed = fluree
+        .insert(ledger0, &txn)
+        .await
+        .expect("annotated insert");
 
     let query = json!({
         "@context": ctx(),
@@ -191,7 +194,10 @@ async fn query_reifies_form_runs_with_visibility_check() {
             "@annotation": { "ex:role": "Engineer" }
         }
     });
-    let committed = fluree.insert(ledger0, &txn).await.expect("annotated insert");
+    let committed = fluree
+        .insert(ledger0, &txn)
+        .await
+        .expect("annotated insert");
 
     let query = json!({
         "@context": ctx(),
@@ -210,7 +216,9 @@ async fn query_reifies_form_runs_with_visibility_check() {
         .expect("M1b: @reifies query executes via expansion into f:reifies* + base edge");
     let arr = rows.as_array().expect("Select result is an array");
     assert_eq!(arr.len(), 1, "expected one row, got: {arr:#?}");
-    let row = arr[0].as_array().expect("each row is a tuple [?person, ?org]");
+    let row = arr[0]
+        .as_array()
+        .expect("each row is a tuple [?person, ?org]");
     assert_eq!(row.len(), 2);
     assert!(row_iri_matches(
         &row[0],

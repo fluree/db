@@ -617,14 +617,8 @@ impl<'a> HydrationFormatter<'a> {
                         // 2. Else if budget permits → auto-expand with FULL parent level
                         // 3. Else → just return {"@id": ...}
                         let mut value = if let Some(nested) = pred_ctx.explicit_sub_spec {
-                            self.format_subject(
-                                ref_sid,
-                                nested,
-                                depth.descend(),
-                                visited,
-                                cache,
-                            )
-                            .await?
+                            self.format_subject(ref_sid, nested, depth.descend(), visited, cache)
+                                .await?
                         } else if depth.can_expand() {
                             self.format_subject(
                                 ref_sid,
@@ -705,8 +699,7 @@ impl<'a> HydrationFormatter<'a> {
         // POST(f:reifiesSubject, FlakeValue::Ref(edge.s)) gives all
         // annotations whose `f:reifiesSubject` points at this
         // subject. The flake's `s` is the candidate annotation Sid.
-        let f_reifies_subject =
-            Sid::new(FLUREE_DB, fluree_vocab::db::REIFIES_SUBJECT);
+        let f_reifies_subject = Sid::new(FLUREE_DB, fluree_vocab::db::REIFIES_SUBJECT);
         let candidate_flakes = self
             .db
             .range(
@@ -753,9 +746,7 @@ impl<'a> HydrationFormatter<'a> {
                 .fetch_subject_properties(ann_sid)
                 .await?
                 .into_iter()
-                .filter(|f| {
-                    fluree_db_core::is_reserved_reifies_predicate(&f.p)
-                })
+                .filter(|f| fluree_db_core::is_reserved_reifies_predicate(&f.p))
                 .collect();
             if bundle.is_empty() {
                 continue;
@@ -765,11 +756,10 @@ impl<'a> HydrationFormatter<'a> {
             // predicate, different object, different graph, etc.)
             // means this candidate reifies a different edge that
             // happens to share the subject.
-            let cand_edge =
-                match fluree_db_core::edge::EdgeKey::from_reifies_facts(&bundle) {
-                    Ok(k) => k,
-                    Err(_) => continue, // malformed; skip
-                };
+            let cand_edge = match fluree_db_core::edge::EdgeKey::from_reifies_facts(&bundle) {
+                Ok(k) => k,
+                Err(_) => continue, // malformed; skip
+            };
             if cand_edge != edge_key {
                 continue;
             }

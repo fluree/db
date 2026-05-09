@@ -99,6 +99,7 @@ pub use datatype_constraint::DatatypeConstraint;
 pub use datatypes::dt_compatible;
 pub use db::{load_ledger_snapshot, LedgerSnapshot, LedgerSnapshotMetadata};
 pub use dict_novelty::DictNovelty;
+pub use edge::{id_datatype_sid, xsd_string_datatype_sid, EdgeKey, EdgeKeyDecodeError};
 pub use error::{Error, Result};
 pub use flake::{Flake, FlakeMeta};
 pub use graph_db_ref::GraphDbRef;
@@ -130,9 +131,6 @@ pub use namespaces::{
     is_reifies_datatype, is_reifies_graph, is_reifies_lang, is_reifies_list_index,
     is_reifies_object, is_reifies_predicate, is_reifies_subject, is_reserved_reifies_predicate,
     is_schema_class, is_schema_predicate, reifies_predicate_sids,
-};
-pub use edge::{
-    id_datatype_sid, xsd_string_datatype_sid, EdgeKey, EdgeKeyDecodeError,
 };
 pub use nonempty::NonEmpty;
 pub use ns_encoding::{

@@ -319,10 +319,7 @@ fn build_annotation_sibling(
         reifies_iris::PREDICATE.to_string(),
         json!({"@id": predicate}),
     );
-    ann_map.insert(
-        reifies_iris::OBJECT.to_string(),
-        json!({"@id": object_id}),
-    );
+    ann_map.insert(reifies_iris::OBJECT.to_string(), json!({"@id": object_id}));
 
     // f:reifiesGraph — emitted iff the reified edge lives in a named
     // graph. Default-graph edges omit it (absence = default), which
@@ -335,10 +332,7 @@ fn build_annotation_sibling(
     // would land in the default graph while the edge is in a named
     // graph — a partition that breaks both visibility and cascade.
     if let Some(graph_iri) = base_graph {
-        ann_map.insert(
-            reifies_iris::GRAPH.to_string(),
-            json!({"@id": graph_iri}),
-        );
+        ann_map.insert(reifies_iris::GRAPH.to_string(), json!({"@id": graph_iri}));
         ann_map.insert("@graph".to_string(), json!(graph_iri));
     }
 
@@ -425,10 +419,7 @@ fn lower_reifies_block(
         reifies_iris::PREDICATE.to_string(),
         json!({"@id": predicate}),
     );
-    map.insert(
-        reifies_iris::OBJECT.to_string(),
-        json!({"@id": object_id}),
-    );
+    map.insert(reifies_iris::OBJECT.to_string(), json!({"@id": object_id}));
 
     // The base edge is asserted by the user including @reifies, so
     // we don't synthesize a sibling for it: presence of f:reifiesSubject /
@@ -529,7 +520,8 @@ fn is_envelope(map: &Map<String, Value>) -> bool {
     if !graph_is_array {
         return false;
     }
-    map.keys().all(|k| matches!(k.as_str(), "@context" | "@graph"))
+    map.keys()
+        .all(|k| matches!(k.as_str(), "@context" | "@graph"))
 }
 
 /// True when `map` is a JSON-LD value/list/variable wrapper rather
@@ -671,9 +663,7 @@ fn intercept_annotations_for_predicate(
                         .to_string(),
                 ));
             }
-            let ann_block = map
-                .remove(ANNOTATION_KEY)
-                .or_else(|| map.remove(EDGE_KEY));
+            let ann_block = map.remove(ANNOTATION_KEY).or_else(|| map.remove(EDGE_KEY));
             let Some(ann_block) = ann_block else {
                 return Ok(());
             };
@@ -894,8 +884,7 @@ mod tests {
         let err = lower(doc).unwrap_err();
         assert!(
             err.to_string().contains("@reifies on inserts"),
-            "expected @reifies-on-insert deferral message, got: {}",
-            err
+            "expected @reifies-on-insert deferral message, got: {err}"
         );
     }
 
@@ -931,7 +920,10 @@ mod tests {
         });
         let original = doc.clone();
         let result = lower(doc).unwrap();
-        assert_eq!(result, original, "value object must not be lowered as a node");
+        assert_eq!(
+            result, original,
+            "value object must not be lowered as a node"
+        );
     }
 
     #[test]

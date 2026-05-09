@@ -109,9 +109,7 @@ async fn cascade_attachment_retracts(
     // annotation in novelty (no reindex yet) has
     // `snapshot.has_annotations == false` but
     // `novelty.attachments.has_annotations() == true`.
-    if !ledger.snapshot.has_annotations
-        && !ledger.novelty.attachments.has_annotations()
-    {
+    if !ledger.snapshot.has_annotations && !ledger.novelty.attachments.has_annotations() {
         return Ok(cascade);
     }
 
@@ -191,9 +189,7 @@ async fn cascade_attachment_retracts(
             // compatible shape (no f:reifiesDatatype) so the
             // inverse retract is byte-symmetric with the original
             // assertion.
-            cascade.extend(edge_key.to_reifies_facts_jsonld_compatible(
-                &ann_sid, new_t, false,
-            ));
+            cascade.extend(edge_key.to_reifies_facts_jsonld_compatible(&ann_sid, new_t, false));
 
             // Annotation-body metadata cleanup. Two modes:
             //
@@ -256,10 +252,8 @@ async fn cascade_attachment_retracts(
     // replacement (delete old role, insert new role on the same
     // annotation subject) would cascade the bundle and orphan the
     // freshly-asserted metadata.
-    let mut grouped_metadata_retracts: BTreeMap<(GraphId, Sid), Vec<&Flake>> =
-        BTreeMap::new();
-    let mut grouped_metadata_asserts: BTreeMap<(GraphId, Sid), Vec<&Flake>> =
-        BTreeMap::new();
+    let mut grouped_metadata_retracts: BTreeMap<(GraphId, Sid), Vec<&Flake>> = BTreeMap::new();
+    let mut grouped_metadata_asserts: BTreeMap<(GraphId, Sid), Vec<&Flake>> = BTreeMap::new();
     for flake in flakes {
         if is_reserved_reifies_predicate(&flake.p) {
             continue;
@@ -269,7 +263,10 @@ async fn cascade_attachment_retracts(
         if flake.op {
             grouped_metadata_asserts.entry(key).or_default().push(flake);
         } else {
-            grouped_metadata_retracts.entry(key).or_default().push(flake);
+            grouped_metadata_retracts
+                .entry(key)
+                .or_default()
+                .push(flake);
         }
     }
 
@@ -290,10 +287,9 @@ async fn cascade_attachment_retracts(
             RangeOptions::new().with_to_t(to_t),
         )
         .await?;
-        let (bundle, current_metadata): (Vec<Flake>, Vec<Flake>) =
-            all_flakes.into_iter().partition(|f| {
-                is_reserved_reifies_predicate(&f.p)
-            });
+        let (bundle, current_metadata): (Vec<Flake>, Vec<Flake>) = all_flakes
+            .into_iter()
+            .partition(|f| is_reserved_reifies_predicate(&f.p));
         if bundle.is_empty() {
             continue; // not an annotation subject
         }
@@ -314,8 +310,7 @@ async fn cascade_attachment_retracts(
         // Fluree uses for assertion/retraction matching, so an
         // assertion with a different object value than the
         // retracted flake counts as a distinct fact and survives.
-        type FlakeIdentity =
-            (Sid, Sid, FlakeValue, Sid, Option<fluree_db_core::FlakeMeta>);
+        type FlakeIdentity = (Sid, Sid, FlakeValue, Sid, Option<fluree_db_core::FlakeMeta>);
         let identity = |f: &Flake| -> FlakeIdentity {
             (
                 f.s.clone(),
@@ -350,9 +345,7 @@ async fn cascade_attachment_retracts(
         // user is disposing of it. Retract the bundle in the
         // JSON-LD-compatible shape so it cancels the original
         // assertion.
-        cascade.extend(edge_key.to_reifies_facts_jsonld_compatible(
-            &ann_sid, new_t, false,
-        ));
+        cascade.extend(edge_key.to_reifies_facts_jsonld_compatible(&ann_sid, new_t, false));
     }
 
     Ok(cascade)

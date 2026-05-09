@@ -229,12 +229,7 @@ impl EdgeKey {
     /// the JSON-LD lowering: today that's the cascade pass in
     /// `fluree-db-transact::stage::cascade_attachment_retracts` and
     /// any future cleanup paths driven by `AttachmentNovelty`.
-    pub fn to_reifies_facts_jsonld_compatible(
-        &self,
-        ann: &Sid,
-        t: i64,
-        op: bool,
-    ) -> Vec<Flake> {
+    pub fn to_reifies_facts_jsonld_compatible(&self, ann: &Sid, t: i64, op: bool) -> Vec<Flake> {
         // Emit the full bundle, then drop the `f:reifiesDatatype`
         // flake. Cheaper than reimplementing the seven-flake
         // construction inline, and avoids drift between the two
@@ -664,7 +659,10 @@ mod tests {
         let ann = Sid::new(13, "ann1");
         let bundle = key.to_reifies_facts_jsonld_compatible(&ann, 42, true);
         for flake in &bundle {
-            assert!(flake.g.is_none(), "default-graph bundle must keep g=None: {flake:?}");
+            assert!(
+                flake.g.is_none(),
+                "default-graph bundle must keep g=None: {flake:?}"
+            );
         }
     }
 

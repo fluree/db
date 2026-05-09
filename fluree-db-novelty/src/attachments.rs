@@ -110,9 +110,7 @@ impl AttachmentNovelty {
     ) -> impl Iterator<Item = Sid> + 'a {
         self.forward
             .get(edge)
-            .map(|rows| {
-                latest_assertions_at::<_, _>(rows.iter(), |r| (&r.ann, r.t, r.op), as_of_t)
-            })
+            .map(|rows| latest_assertions_at::<_, _>(rows.iter(), |r| (&r.ann, r.t, r.op), as_of_t))
             .into_iter()
             .flatten()
             .cloned()
@@ -158,10 +156,7 @@ impl AttachmentNovelty {
     /// annotation `ann` against the live overlay state. See
     /// [`Self::current_annotations_for`] for the time-travel-vs-
     /// live distinction.
-    pub fn current_targets_for<'a>(
-        &'a self,
-        ann: &'a Sid,
-    ) -> impl Iterator<Item = EdgeKey> + 'a {
+    pub fn current_targets_for<'a>(&'a self, ann: &'a Sid) -> impl Iterator<Item = EdgeKey> + 'a {
         self.current_targets_for_at(ann, i64::MAX)
     }
 
@@ -169,11 +164,11 @@ impl AttachmentNovelty {
     /// every `(EdgeKey, t, op)` event, in row-stored order. Used by
     /// history-range queries that explicitly want to see attachment
     /// lifecycle alongside flake history.
-    pub fn target_history<'a>(
-        &'a self,
-        ann: &'a Sid,
-    ) -> impl Iterator<Item = &'a ReverseRow> + 'a {
-        self.reverse.get(ann).into_iter().flat_map(|rows| rows.iter())
+    pub fn target_history<'a>(&'a self, ann: &'a Sid) -> impl Iterator<Item = &'a ReverseRow> + 'a {
+        self.reverse
+            .get(ann)
+            .into_iter()
+            .flat_map(|rows| rows.iter())
     }
 
     /// Iterator over the full attachment history of `edge` — every
@@ -241,11 +236,10 @@ impl AttachmentNovelty {
                     t,
                     op,
                 });
-            self.reverse.entry(ann).or_default().push(ReverseRow {
-                edge,
-                t,
-                op,
-            });
+            self.reverse
+                .entry(ann)
+                .or_default()
+                .push(ReverseRow { edge, t, op });
             self.has_annotations = true;
         }
 
@@ -382,8 +376,12 @@ mod tests {
         let ann = ann_sid("ann1");
 
         let mut overlay = AttachmentNovelty::new();
-        overlay.observe_flakes(&edge.to_reifies_facts(&ann, 5, true)).unwrap();
-        overlay.observe_flakes(&edge.to_reifies_facts(&ann, 7, false)).unwrap();
+        overlay
+            .observe_flakes(&edge.to_reifies_facts(&ann, 5, true))
+            .unwrap();
+        overlay
+            .observe_flakes(&edge.to_reifies_facts(&ann, 7, false))
+            .unwrap();
 
         assert!(
             overlay.current_annotations_for(&edge).next().is_none(),
@@ -408,29 +406,25 @@ mod tests {
         let ann = ann_sid("ann_a");
 
         let mut overlay = AttachmentNovelty::new();
-        overlay.observe_flakes(&edge.to_reifies_facts(&ann, 5, true)).unwrap();
-        overlay.observe_flakes(&edge.to_reifies_facts(&ann, 7, false)).unwrap();
+        overlay
+            .observe_flakes(&edge.to_reifies_facts(&ann, 5, true))
+            .unwrap();
+        overlay
+            .observe_flakes(&edge.to_reifies_facts(&ann, 7, false))
+            .unwrap();
 
         // Before any event: no rows visible.
-        let before: Vec<Sid> = overlay
-            .current_annotations_for_at(&edge, 4)
-            .collect();
+        let before: Vec<Sid> = overlay.current_annotations_for_at(&edge, 4).collect();
         assert!(before.is_empty(), "view at t=4 must not see t=5 assertion");
 
         // At t=5 and t=6: assertion visible.
-        let at5: Vec<Sid> = overlay
-            .current_annotations_for_at(&edge, 5)
-            .collect();
+        let at5: Vec<Sid> = overlay.current_annotations_for_at(&edge, 5).collect();
         assert_eq!(at5, vec![ann.clone()], "view at t=5 must see the assertion");
-        let at6: Vec<Sid> = overlay
-            .current_annotations_for_at(&edge, 6)
-            .collect();
+        let at6: Vec<Sid> = overlay.current_annotations_for_at(&edge, 6).collect();
         assert_eq!(at6, vec![ann.clone()], "view at t=6 must still see it");
 
         // At t=7+: retract takes effect.
-        let at7: Vec<Sid> = overlay
-            .current_annotations_for_at(&edge, 7)
-            .collect();
+        let at7: Vec<Sid> = overlay.current_annotations_for_at(&edge, 7).collect();
         assert!(at7.is_empty(), "view at t=7 must see retraction");
         let at_max: Vec<Sid> = overlay
             .current_annotations_for_at(&edge, i64::MAX)
@@ -449,7 +443,9 @@ mod tests {
         let ann = ann_sid("ann_a");
 
         let mut overlay = AttachmentNovelty::new();
-        overlay.observe_flakes(&edge.to_reifies_facts(&ann, 5, true)).unwrap();
+        overlay
+            .observe_flakes(&edge.to_reifies_facts(&ann, 5, true))
+            .unwrap();
 
         let at_4: Vec<EdgeKey> = overlay.current_targets_for_at(&ann, 4).collect();
         assert!(at_4.is_empty());
@@ -465,8 +461,12 @@ mod tests {
         let ann_b = ann_sid("ann_B");
 
         let mut overlay = AttachmentNovelty::new();
-        overlay.observe_flakes(&edge.to_reifies_facts(&ann_a, 5, true)).unwrap();
-        overlay.observe_flakes(&edge.to_reifies_facts(&ann_b, 6, true)).unwrap();
+        overlay
+            .observe_flakes(&edge.to_reifies_facts(&ann_a, 5, true))
+            .unwrap();
+        overlay
+            .observe_flakes(&edge.to_reifies_facts(&ann_b, 6, true))
+            .unwrap();
 
         let mut attached: Vec<Sid> = overlay.current_annotations_for(&edge).collect();
         attached.sort();
@@ -512,9 +512,7 @@ mod tests {
         let edge = sample_edge();
         let ann = ann_sid("ann1");
         let mut bundle = edge.to_reifies_facts(&ann, 5, true);
-        bundle.retain(|f| {
-            !fluree_db_core::namespaces::is_reifies_subject(&f.p)
-        });
+        bundle.retain(|f| !fluree_db_core::namespaces::is_reifies_subject(&f.p));
 
         let mut overlay = AttachmentNovelty::new();
         let err = overlay.observe_flakes(&bundle).unwrap_err();
@@ -547,7 +545,9 @@ mod tests {
         let ann = ann_sid("ann_named");
 
         let mut overlay = AttachmentNovelty::new();
-        overlay.observe_flakes(&edge.to_reifies_facts(&ann, 5, true)).unwrap();
+        overlay
+            .observe_flakes(&edge.to_reifies_facts(&ann, 5, true))
+            .unwrap();
 
         let attached: Vec<Sid> = overlay.current_annotations_for(&edge).collect();
         assert_eq!(attached, vec![ann]);
