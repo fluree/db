@@ -52,7 +52,7 @@ use fluree_db_core::{Flake, GraphDbRef, Sid, Tracker};
 use fluree_db_policy::{is_schema_flake, PolicyContext};
 use fluree_db_query::binding::Binding;
 use fluree_db_query::ir::{Column, ForwardItem, HydrationSpec, NestedSelectSpec, Root};
-use fluree_vocab::namespaces::JSON_LD;
+use fluree_vocab::namespaces::{BLANK_NODE, JSON_LD};
 use fluree_vocab::rdf::{self, TYPE as RDF_TYPE_IRI};
 use futures::future::BoxFuture;
 use futures::FutureExt;
@@ -616,32 +616,38 @@ impl<'a> HydrationFormatter<'a> {
                         // 1. If explicit sub-selection exists → expand with that spec
                         // 2. Else if budget permits → auto-expand with FULL parent level
                         // 3. Else → just return {"@id": ...}
-                        if let Some(nested) = pred_ctx.explicit_sub_spec {
-                            values.push(
-                                self.format_subject(
-                                    ref_sid,
-                                    nested,
-                                    depth.descend(),
-                                    visited,
-                                    cache,
-                                )
-                                .await?,
-                            );
+                        let mut value = if let Some(nested) = pred_ctx.explicit_sub_spec {
+                            self.format_subject(
+                                ref_sid,
+                                nested,
+                                depth.descend(),
+                                visited,
+                                cache,
+                            )
+                            .await?
                         } else if depth.can_expand() {
-                            values.push(
-                                self.format_subject(
-                                    ref_sid,
-                                    parent_level,
-                                    depth.descend(),
-                                    visited,
-                                    cache,
-                                )
-                                .await?,
-                            );
+                            self.format_subject(
+                                ref_sid,
+                                parent_level,
+                                depth.descend(),
+                                visited,
+                                cache,
+                            )
+                            .await?
                         } else {
                             // Max depth reached, just @id
-                            values.push(json!({ "@id": self.compactor.compact_sid(ref_sid)? }));
-                        }
+                            json!({ "@id": self.compactor.compact_sid(ref_sid)? })
+                        };
+
+                        // Inject `@annotation` blocks (M1b round-trip):
+                        // when the edge `(flake.s, flake.p, flake.o)`
+                        // carries any currently-asserted annotations,
+                        // surface their bodies under the value's
+                        // `@annotation` key.
+                        self.inject_annotations(flake, &mut value, depth, visited, cache)
+                            .await?;
+
+                        values.push(value);
                     }
                 }
                 _ => {
@@ -657,6 +663,94 @@ impl<'a> HydrationFormatter<'a> {
             }
         }
         Ok(values)
+    }
+
+    /// If the edge `(flake.s, flake.p, flake.o)` has any currently-
+    /// asserted annotations in the novelty overlay, format each one
+    /// and inject the result as the `@annotation` key on `value`.
+    ///
+    /// `value` must already be a JSON object (the rendered Ref form).
+    /// When `value` is a primitive (shouldn't happen in the Ref arm
+    /// today, but guarded for safety), the injection is a no-op.
+    ///
+    /// Anonymous annotation subjects (blank-node SIDs minted by the
+    /// M1a transactor lowering) render their body without `@id`,
+    /// since the synthetic blank-node IRI isn't meaningful to the
+    /// user. Explicit-IRI annotations keep their `@id`.
+    ///
+    /// Multiple parallel annotations on the same edge produce an
+    /// array under `@annotation`; a single annotation produces a
+    /// bare object.
+    async fn inject_annotations<'b>(
+        &'b self,
+        flake: &'b Flake,
+        value: &mut JsonValue,
+        depth: DepthBudget,
+        visited: &'b mut HashSet<Sid>,
+        cache: &'b mut HashMap<CacheKey, JsonValue>,
+    ) -> Result<()> {
+        // Source the overlay's attachment index. M1b runtime: this
+        // is `Novelty::attachments`. M2 will combine indexed + novelty
+        // sources behind a snapshot-level helper.
+        let Some(novelty) = self
+            .db
+            .overlay
+            .as_any()
+            .downcast_ref::<fluree_db_novelty::Novelty>()
+        else {
+            return Ok(());
+        };
+        if !novelty.attachments.has_annotations() {
+            return Ok(());
+        }
+
+        // Build the EdgeKey for this base-edge flake.
+        let edge_key = fluree_db_core::edge::EdgeKey::from_flake(flake);
+
+        // Collect annotation Sids first so we can release the borrow
+        // before recursive `format_subject` calls.
+        let ann_sids: Vec<Sid> = novelty
+            .attachments
+            .current_annotations_for(&edge_key)
+            .collect();
+        if ann_sids.is_empty() {
+            return Ok(());
+        }
+
+        // The injection target must be a JSON object.
+        let Some(obj) = value.as_object_mut() else {
+            return Ok(());
+        };
+
+        // Recursively format each annotation. The wildcard hydration
+        // filter we added earlier already strips `f:reifies*` from
+        // the annotation body, so this just produces a clean
+        // user-property view of each annotation.
+        let mut bodies: Vec<JsonValue> = Vec::with_capacity(ann_sids.len());
+        let ann_level = NestedSelectSpec::Wildcard {
+            refinements: HashMap::new(),
+            reverse: HashMap::new(),
+        };
+        for ann_sid in &ann_sids {
+            let mut body = self
+                .format_subject(ann_sid, &ann_level, depth.descend(), visited, cache)
+                .await?;
+            if ann_sid.namespace_code == BLANK_NODE {
+                if let Some(map) = body.as_object_mut() {
+                    map.remove("@id");
+                }
+            }
+            bodies.push(body);
+        }
+
+        // One annotation → bare object; many → array.
+        let ann_json = if bodies.len() == 1 {
+            bodies.into_iter().next().unwrap()
+        } else {
+            JsonValue::Array(bodies)
+        };
+        obj.insert("@annotation".to_string(), ann_json);
+        Ok(())
     }
 
     /// Format reverse property values

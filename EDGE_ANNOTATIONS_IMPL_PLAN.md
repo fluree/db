@@ -309,16 +309,18 @@ correctness items remaining):**
   more targeted retract shapes that select a specific occurrence
   among parallel annotations need IR support (matching by metadata)
   and aren't covered by the plain-edge cascade.
-- ⏳ **JSON-LD subject-expansion output:** emit `@annotation` blocks
-  when materializing an annotated edge through subject expansion.
-  Implementation sketch: thread `AttachmentNovelty` into the
-  `Hydrator` struct, and in `format_predicate_values`'s `Ref` arm
-  build an `EdgeKey` from `(flake.s, flake.p, flake.o)`, look up
-  `current_annotations_for(edge)`, and when present recursively
-  hydrate the annotation subject with the system-fact filter (now
-  in place) and inject the result as an `@annotation` key on the
-  expanded value. Multiple parallel annotations produce an array.
-  Anonymous annotation SIDs render without `@id` in the output.
+- ✅ **JSON-LD subject-expansion `@annotation` output**
+  (`feat(M1b): @annotation in subject expansion`):
+  `format_predicate_values`'s `Ref` arm now downcasts the overlay to
+  `Novelty`, builds an `EdgeKey` from `(flake.s, flake.p, flake.o)`,
+  and when `current_annotations_for(edge)` returns any Sids,
+  recursively hydrates each annotation subject and injects the
+  result as an `@annotation` key on the expanded value. Single
+  annotation renders as a bare object; multiple parallel
+  annotations render as an array. Anonymous (blank-node) annotation
+  SIDs have their `@id` stripped from the body since the synthetic
+  IRI isn't user-meaningful. The wildcard-hydration filter already
+  in place keeps `f:reifies*` out of the rendered annotation body.
 - ⏳ **Broader `it_edge_annotations.rs` integration tests:** parallel
   annotations on one edge, multiplicity contract, cascade behavior,
   lifecycle (RDF default vs. LPG opt-in), restart-from-commits,

@@ -415,6 +415,131 @@ async fn retracting_base_edge_cascades_f_reifies_bundle() {
 }
 
 #[tokio::test]
+async fn subject_expansion_emits_annotation_block_for_annotated_edge() {
+    // M1b round-trip: when subject expansion materializes a base edge
+    // that has an annotation attached, the rendered value must carry
+    // an `@annotation` key whose body is the annotation's
+    // user-property view (with `f:reifies*` filtered out, which the
+    // wildcard-hydration filter already handles).
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger_id = "it/edge-annotations:expand-annotation";
+    let ledger0 = genesis_ledger(&fluree, ledger_id);
+
+    let txn = json!({
+        "@context": ctx(),
+        "@id": "ex:alice",
+        "ex:worksFor": {
+            "@id": "ex:acme",
+            "@annotation": {
+                "@id": "ex:emp/alice-acme",
+                "ex:role": "Engineer"
+            }
+        }
+    });
+    let committed = fluree.insert(ledger0, &txn).await.expect("annotated insert");
+
+    // Wildcard hydrate the base subject. The `ex:worksFor` value
+    // should expand to a node-map carrying both `@id` (the org) and
+    // an `@annotation` key with the annotation's body.
+    let query = json!({
+        "@context": ctx(),
+        "select": {"?person": ["*", {"ex:worksFor": ["*"]}]},
+        "where": {"@id": "?person", "ex:worksFor": {"@id": "?org"}}
+    });
+    let rows = support::query_jsonld_formatted(&fluree, &committed.ledger, &query)
+        .await
+        .expect("annotated subject expansion");
+    let arr = rows.as_array().expect("array");
+    assert_eq!(arr.len(), 1, "single subject row, got: {arr:#?}");
+
+    let person = arr[0].as_object().expect("hydrated person object");
+    let works_for = person
+        .get("ex:worksFor")
+        .or_else(|| person.get("http://example.org/worksFor"))
+        .expect("ex:worksFor must be present");
+
+    // The value is a single object (one annotation, one edge) — pull
+    // it out regardless of single-vs-array shape.
+    let edge_obj = works_for
+        .as_object()
+        .or_else(|| works_for.as_array().and_then(|a| a.first().and_then(|v| v.as_object())))
+        .expect("worksFor value must be a node object: {works_for:#?}");
+
+    assert!(
+        iri_matches(
+            edge_obj.get("@id").unwrap_or(&JsonValue::Null),
+            "ex:acme",
+            "http://example.org/acme",
+        ),
+        "edge object @id should be ex:acme, got: {edge_obj:#?}"
+    );
+
+    let ann = edge_obj
+        .get("@annotation")
+        .expect("@annotation key must be injected for annotated edge");
+    let ann_obj = ann
+        .as_object()
+        .or_else(|| ann.as_array().and_then(|a| a.first().and_then(|v| v.as_object())))
+        .expect("@annotation value must be an object or single-element array");
+
+    assert_eq!(
+        ann_obj
+            .get("ex:role")
+            .or_else(|| ann_obj.get("http://example.org/role"))
+            .and_then(|v| v.as_str()),
+        Some("Engineer"),
+        "annotation body must surface ex:role: {ann_obj:#?}"
+    );
+    // System facts must still be filtered.
+    for k in ann_obj.keys() {
+        assert!(
+            !k.starts_with("https://ns.flur.ee/db#reifies"),
+            "f:reifies* must not leak into @annotation body: {k}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn subject_expansion_emits_no_annotation_when_edge_has_none() {
+    // Negative case: a plain (un-annotated) edge must not carry an
+    // `@annotation` key in its expanded form. Pins the
+    // has_annotations gate / empty-iter path.
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger_id = "it/edge-annotations:expand-no-annotation";
+    let ledger0 = genesis_ledger(&fluree, ledger_id);
+
+    let txn = json!({
+        "@context": ctx(),
+        "@id": "ex:bob",
+        "ex:worksFor": {"@id": "ex:acme"}
+    });
+    let committed = fluree.insert(ledger0, &txn).await.expect("plain insert");
+
+    let query = json!({
+        "@context": ctx(),
+        "select": {"?person": ["*", {"ex:worksFor": ["*"]}]},
+        "where": {"@id": "?person", "ex:worksFor": {"@id": "?org"}}
+    });
+    let rows = support::query_jsonld_formatted(&fluree, &committed.ledger, &query)
+        .await
+        .expect("plain subject expansion");
+    let arr = rows.as_array().expect("array");
+    let person = arr[0].as_object().unwrap();
+    let works_for = person
+        .get("ex:worksFor")
+        .or_else(|| person.get("http://example.org/worksFor"))
+        .unwrap();
+    let edge_obj = works_for
+        .as_object()
+        .or_else(|| works_for.as_array().and_then(|a| a.first().and_then(|v| v.as_object())))
+        .unwrap();
+    assert!(
+        edge_obj.get("@annotation").is_none(),
+        "plain edge must not carry @annotation: {edge_obj:#?}"
+    );
+}
+
+#[tokio::test]
 async fn wildcard_subject_hydration_hides_f_reifies_predicates() {
     // Annotation subjects minted by the M1a transactor lowering carry
     // `f:reifies*` system facts in addition to the user-authored body
