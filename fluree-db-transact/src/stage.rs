@@ -87,6 +87,7 @@ async fn cascade_attachment_retracts(
     ledger: &LedgerState,
     reverse_graph: &HashMap<Sid, GraphId>,
     new_t: i64,
+    lpg_edge_lifecycle: bool,
 ) -> Result<Vec<Flake>> {
     use fluree_db_core::comparator::IndexType;
     use fluree_db_core::edge::EdgeKey;
@@ -169,22 +170,21 @@ async fn cascade_attachment_retracts(
                 &ann_sid, new_t, false,
             ));
 
-            // Anonymous-annotation metadata cleanup (RDF mode
-            // default). Anonymous annotation subjects are minted
-            // by the JSON-LD lowering as blank-node SIDs that the
-            // user can't address directly. Once the f:reifies*
-            // bundle is gone, the body metadata (`ann ex:role
-            // "Engineer"`, etc.) becomes orphaned RDF — visible
-            // only via raw subject lookup on the synthetic SID.
-            // Retract it to keep the durable encoding clean.
+            // Annotation-body metadata cleanup. Two modes:
             //
-            // Explicit-IRI annotations are user-named and stay
-            // queryable as ordinary subjects after the bundle is
-            // retracted (RDF mode). The opt-in
-            // `lpgEdgeLifecycle: true` flag would extend this
-            // cleanup to explicit-IRI annotations too; that flag
-            // isn't implemented yet.
-            if ann_sid.namespace_code == fluree_vocab::namespaces::BLANK_NODE {
+            // - **RDF mode** (default, `lpg_edge_lifecycle = false`):
+            //   only anonymous (blank-node) annotation subjects
+            //   are cleaned. Explicit-IRI annotations are
+            //   user-named and remain queryable as ordinary RDF
+            //   on the named subject.
+            // - **LPG mode** (`lpg_edge_lifecycle = true`, set via
+            //   `opts.lpgEdgeLifecycle: true` on the transaction):
+            //   *every* annotation's body is cleaned, matching
+            //   Cypher's relationship lifecycle where deleting an
+            //   edge deletes its property metadata.
+            let cleanup_metadata = lpg_edge_lifecycle
+                || ann_sid.namespace_code == fluree_vocab::namespaces::BLANK_NODE;
+            if cleanup_metadata {
                 for asserted in metadata {
                     // Mirror the asserted shape with `op = false`
                     // and the new transaction's `t`. Preserves
@@ -544,8 +544,15 @@ pub async fn stage(
         // anonymous-annotation metadata cascade (RDF default) and the
         // explicit-IRI metadata cascade (LPG mode opt-in) are tracked
         // as follow-ups in the plan.
-        let cascade =
-            cascade_attachment_retracts(&flakes, &ledger, &reverse_graph, new_t).await?;
+        let lpg_edge_lifecycle = txn.opts.lpg_edge_lifecycle.unwrap_or(false);
+        let cascade = cascade_attachment_retracts(
+            &flakes,
+            &ledger,
+            &reverse_graph,
+            new_t,
+            lpg_edge_lifecycle,
+        )
+        .await?;
         if !cascade.is_empty() {
             tracing::debug!(
                 cascade_count = cascade.len(),

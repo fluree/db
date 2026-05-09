@@ -460,6 +460,23 @@ pub struct TxnOpts {
     /// the transaction JSON, defaulting to `true`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub strict_compact_iri: Option<bool>,
+
+    /// LPG-style edge-annotation lifecycle: when `Some(true)`, the
+    /// cascade that fires on a base-edge retract also retracts the
+    /// body metadata of **every** annotation pointing at that edge,
+    /// including ones with explicit user-supplied `@id`s. Matches
+    /// Cypher / LPG semantics where deleting a relationship deletes
+    /// its property metadata.
+    ///
+    /// Default (`None` or `Some(false)`): RDF mode — only anonymous
+    /// (blank-node) annotation metadata is cleaned up, since the
+    /// synthetic SID is unaddressable. Explicit-IRI annotations are
+    /// preserved as ordinary RDF on the named subject.
+    ///
+    /// Read from the transaction JSON's `opts.lpgEdgeLifecycle` field
+    /// (camelCase) when `None` here.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub lpg_edge_lifecycle: Option<bool>,
 }
 
 impl TxnOpts {

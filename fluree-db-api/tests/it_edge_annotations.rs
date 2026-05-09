@@ -801,6 +801,55 @@ async fn cascade_cleans_up_anonymous_annotation_metadata() {
 }
 
 #[tokio::test]
+async fn cascade_lpg_mode_cleans_explicit_iri_metadata_too() {
+    // LPG mode (`opts.lpgEdgeLifecycle: true`) extends cascade
+    // cleanup to explicit-IRI annotations, matching Cypher's
+    // relationship lifecycle. Compare against
+    // `cascade_keeps_explicit_iri_annotation_metadata` (default
+    // RDF mode), which preserves the metadata.
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger_id = "it/edge-annotations:cascade-lpg-cleans-explicit";
+    let ledger0 = genesis_ledger(&fluree, ledger_id);
+
+    let txn = json!({
+        "@context": ctx(),
+        "@id": "ex:alice",
+        "ex:worksFor": {
+            "@id": "ex:acme",
+            "@annotation": {
+                "@id": "ex:emp/alice-acme",
+                "ex:role": "Engineer"
+            }
+        }
+    });
+    let after_insert = fluree.insert(ledger0, &txn).await.expect("insert");
+
+    // Retract the base edge with `lpgEdgeLifecycle: true`.
+    let delete = json!({
+        "@context": ctx(),
+        "where": { "@id": "?s", "ex:worksFor": { "@id": "?o" } },
+        "delete": { "@id": "?s", "ex:worksFor": { "@id": "?o" } },
+        "opts": { "lpgEdgeLifecycle": true }
+    });
+    let after_delete = fluree.update(after_insert.ledger, &delete).await.expect("delete");
+
+    // The explicit-IRI annotation's role must be GONE (LPG semantics).
+    let q = json!({
+        "@context": ctx(),
+        "select": ["?ann", "?role"],
+        "where": { "@id": "?ann", "ex:role": "?role" }
+    });
+    let rows = support::query_jsonld_formatted(&fluree, &after_delete.ledger, &q)
+        .await
+        .expect("post-cascade explicit-IRI role query");
+    let arr = rows.as_array().expect("array");
+    assert!(
+        arr.is_empty(),
+        "LPG mode must clean explicit-IRI annotation metadata too: got {arr:#?}"
+    );
+}
+
+#[tokio::test]
 async fn cascade_keeps_explicit_iri_annotation_metadata() {
     // Counterpart: explicit-IRI annotation subjects are NOT
     // cleaned up by the default RDF-mode cascade. The bundle

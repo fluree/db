@@ -95,7 +95,7 @@ impl GraphIdAssigner {
 pub fn parse_transaction(
     json: &Value,
     txn_type: TxnType,
-    opts: TxnOpts,
+    mut opts: TxnOpts,
     ns_registry: &mut NamespaceRegistry,
 ) -> Result<Txn> {
     // M1: lower `@annotation` / `@edge` / `@reifies` into the seven-fact
@@ -106,6 +106,19 @@ pub fn parse_transaction(
     // parser sees only ordinary IRIs.
     let mut lowered = json.clone();
     super::edge_annotations::lower_edge_annotations(&mut lowered)?;
+
+    // Pull `lpgEdgeLifecycle` from the transaction's `opts` block when
+    // the programmatic `TxnOpts::lpg_edge_lifecycle` is unset. This
+    // mirrors how `strictCompactIri` is read from the JSON when the
+    // builder doesn't override it.
+    if opts.lpg_edge_lifecycle.is_none() {
+        opts.lpg_edge_lifecycle = json
+            .as_object()
+            .and_then(|m| m.get("opts"))
+            .and_then(|v| v.as_object())
+            .and_then(|o| o.get("lpgEdgeLifecycle"))
+            .and_then(Value::as_bool);
+    }
 
     match txn_type {
         TxnType::Insert => parse_insert(&lowered, opts, ns_registry),
