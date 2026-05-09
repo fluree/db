@@ -506,17 +506,29 @@ pub enum Commands {
         action: ContextAction,
     },
 
-    /// Export ledger data as Turtle, N-Triples, N-Quads, TriG, or JSON-LD
+    /// Export ledger data as RDF (Turtle, N-Triples, N-Quads, TriG, JSON-LD) or as a `.flpack` archive
     Export {
         /// Ledger name (defaults to active ledger)
         ledger: Option<String>,
 
-        /// Output format: turtle (ttl), ntriples (nt), jsonld, trig, or nquads (default: turtle)
+        /// Output format: turtle (ttl), ntriples (nt), jsonld, trig, nquads,
+        /// or ledger (`.flpack` archive — full ledger including commits and
+        /// indexes, importable via `fluree create --from <file>.flpack`).
         ///
         /// Note: exporting all graphs requires a dataset-capable format
         /// (`trig` or `nquads`).
         #[arg(long, default_value = "turtle")]
         format: String,
+
+        /// Write output to FILE instead of stdout. Required for --format ledger
+        /// when stdout is a TTY (the archive is binary).
+        #[arg(long, short = 'o', value_name = "FILE")]
+        output: Option<std::path::PathBuf>,
+
+        /// For --format ledger only: skip binary index artifacts (smaller archive,
+        /// the importer will need to reindex before queries are efficient).
+        #[arg(long)]
+        no_indexes: bool,
 
         /// Export all named graphs (dataset export), including system graphs.
         ///

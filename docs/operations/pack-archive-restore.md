@@ -29,9 +29,18 @@ A pack can include just commits + txn blobs (compact, sufficient for full restor
 
 ### Archive (export to `.flpack`)
 
-The CLI does not yet have a dedicated `fluree export --format flpack` command. To produce a `.flpack` file today, use the pack HTTP endpoint directly or the Rust API (see below).
+```bash
+fluree export mydb --format ledger -o mydb.flpack
 
-From the CLI, the closest equivalent is `fluree clone` which uses the pack protocol internally for transfer, then writes objects to local CAS.
+# Smaller archive without binary index artifacts (importer will reindex):
+fluree export mydb --format ledger --no-indexes -o mydb.flpack
+```
+
+`--format ledger` (alias `--format flpack`) writes the full `fluree-pack-v1` archive — commits, txn blobs, and (unless `--no-indexes`) index artifacts — plus a `phase: "nameservice"` manifest frame that lets the importer reconstruct commit/index head pointers.
+
+`-o FILE` is required when stdout is a TTY (the archive is binary). Pipe-friendly forms work too: `fluree export mydb --format ledger > mydb.flpack`. Local-only today; `--remote` is not yet supported for `--format ledger`.
+
+Under the hood this calls `Fluree::archive_ledger` (see [Rust API usage](#rust-api-usage) below), which is also what consumers should use for non-CLI archive flows like S3 upload.
 
 ### Restore (import from `.flpack`)
 

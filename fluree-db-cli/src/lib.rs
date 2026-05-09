@@ -279,6 +279,8 @@ pub async fn run(cli: Cli) -> error::CliResult<()> {
         Commands::Export {
             ledger,
             format,
+            output,
+            no_indexes,
             all_graphs,
             graph,
             context,
@@ -290,6 +292,8 @@ pub async fn run(cli: Cli) -> error::CliResult<()> {
             commands::export::run(
                 ledger.as_deref(),
                 &format,
+                output.as_deref(),
+                no_indexes,
                 all_graphs,
                 graph.as_deref(),
                 context.as_deref(),

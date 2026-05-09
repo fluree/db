@@ -3244,6 +3244,109 @@ impl Fluree {
         export_builder::ExportBuilder::new(self, ledger_id.to_string())
     }
 
+    /// Stream a self-contained ledger archive (`.flpack`) for `ledger_id`.
+    ///
+    /// This is the export side of the `fluree create --from <file>.flpack`
+    /// pipeline. Frame bytes (header → commits → optional indexes →
+    /// nameservice manifest → end) are written to `writer` in order, so the
+    /// caller can target a file, stdout, or any `AsyncWrite` sink without
+    /// buffering the full archive in memory.
+    ///
+    /// `include_indexes` controls whether binary index artifacts ride along
+    /// (`true` → instantly queryable on import; `false` → smaller archive,
+    /// import will need to reindex). When the ledger has no index root, the
+    /// flag is silently downgraded to commits-only.
+    pub async fn archive_ledger<W: tokio::io::AsyncWrite + Unpin + Send>(
+        &self,
+        ledger_id: &str,
+        include_indexes: bool,
+        writer: &mut W,
+    ) -> Result<pack::PackStreamResult> {
+        use tokio::io::AsyncWriteExt as _;
+
+        let record = self
+            .nameservice()
+            .lookup(ledger_id)
+            .await?
+            .ok_or_else(|| ApiError::NotFound(ledger_id.to_string()))?;
+
+        let canonical_id = record.ledger_id.clone();
+        let handle = self.ledger_cached(&canonical_id).await?;
+
+        // Source the manifest *and* the pack request from the same view, so
+        // the archive bytes and the manifest pointers always agree. Reading
+        // the heads from the nameservice record while reading the pack
+        // contents from the cached handle could disagree if the cache is
+        // behind a freshly committed head.
+        let view = handle.snapshot().await;
+
+        let head_commit_id = view.head_commit_id.clone().ok_or_else(|| {
+            ApiError::internal(format!("ledger {canonical_id} has no head commit to pack"))
+        })?;
+
+        // `full_ledger_pack_request` silently drops the index when the
+        // ledger has none. Mirror that decision here so we never advertise
+        // an `index_head_id` we did not archive.
+        let archived_index = if include_indexes {
+            view.head_index_id.clone()
+        } else {
+            None
+        };
+        let request = match archived_index.clone() {
+            Some(index_root) => pack::PackRequest::with_indexes(
+                vec![head_commit_id.clone()],
+                vec![],
+                index_root,
+                None,
+            ),
+            None => pack::PackRequest::commits(vec![head_commit_id.clone()], vec![]),
+        };
+
+        let mut manifest = serde_json::json!({
+            "phase": "nameservice",
+            "ledger_id": canonical_id,
+            "name": record.name,
+            "branch": record.branch,
+            "commit_head_id": head_commit_id.to_string(),
+            "commit_t": view.t,
+        });
+        if let Some(cid) = archived_index.as_ref() {
+            manifest["index_head_id"] = serde_json::Value::String(cid.to_string());
+            manifest["index_t"] = serde_json::Value::from(view.index_t());
+        }
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<pack::PackChunk>(64);
+
+        // Run producer and consumer concurrently in the same task: the
+        // producer is borrowing `&self`, so we cannot `tokio::spawn` it
+        // without an owning handle. The bounded channel still gives us
+        // backpressure as long as the consumer keeps draining.
+        let producer = pack::stream_archive(self, &handle, &request, manifest, tx);
+        let consumer = async {
+            while let Some(chunk) = rx.recv().await {
+                let bytes = chunk.map_err(|e| ApiError::internal(format!("pack stream: {e}")))?;
+                writer
+                    .write_all(&bytes)
+                    .await
+                    .map_err(|e| ApiError::internal(format!("archive write: {e}")))?;
+            }
+            writer
+                .flush()
+                .await
+                .map_err(|e| ApiError::internal(format!("archive flush: {e}")))?;
+            Ok::<_, ApiError>(())
+        };
+
+        let (producer_result, consumer_result) = tokio::join!(producer, consumer);
+        // Surface a producer-side failure even if the consumer drained
+        // cleanly. Without this, a corrupt or empty archive would land on
+        // disk and `archive_ledger` would still report success.
+        let stats = producer_result
+            .map_err(|e| ApiError::internal(format!("archive generation failed: {e}")))?;
+        consumer_result?;
+        Ok(stats)
+    }
+
     /// Walk the commit chain for a ledger and return per-commit summaries.
     ///
     /// `limit` caps the number of returned summaries (newest-first by `t`).

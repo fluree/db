@@ -128,9 +128,9 @@ Imports a `.flpack` file (native ledger pack) into a new local ledger. The `.flp
 
 ### `fluree export --format ledger` (native ledger export)
 
-- No server endpoint required (local-only operation)
+- No server endpoint required (local-only operation today)
 
-Exports a full local ledger (all commits, indexes, dictionaries) as a `.flpack` file. See [Ledger portability](#ledger-portability-flpack-files) below.
+Exports a full local ledger (all commits, txn blobs, and — unless `--no-indexes` — binary index artifacts) as a `.flpack` archive. The archive contains a `phase: "nameservice"` manifest frame so the importer can reconstruct the head pointers. Pass `-o <FILE>` to write to disk (required when stdout is a TTY). `--remote` is not yet supported for `--format ledger`. See [Ledger portability](#ledger-portability-flpack-files) below.
 
 ### `fluree query`, `fluree insert`, `fluree upsert`, `fluree update`, `fluree track`, `fluree info`, `fluree exists`
 
