@@ -26,6 +26,31 @@ pub trait FulltextConfigProvider: std::fmt::Debug + Send + Sync {
     ) -> Vec<ConfiguredFulltextProperty>;
 }
 
+/// Per-ledger attachment-events resolver for arena sealing on the
+/// background-indexer path.
+///
+/// Implementations (typically in the api layer) resolve a ledger ID
+/// to the running `AttachmentNovelty.iter_event_pairs()` snapshot at
+/// job-dispatch time. The indexer takes the returned vec and stamps
+/// it into a per-job `IndexerConfig.attachment_events`.
+///
+/// **Return semantics — same as `attachment_events`:**
+/// - `Some(events)`: caller produced the delta; arena gets sealed.
+/// - `None`: delta unknown; the indexer drops any base-root arena to
+///   force the scan-fallback hydration path until the next seal.
+///
+/// Implementations should be cheap on the happy path (one privileged
+/// read of the running ledger state) and return `None` rather than
+/// panic when the ledger isn't loaded — a missing ledger shouldn't
+/// block the indexing run; the defensive drop covers correctness.
+#[async_trait]
+pub trait AttachmentEventsProvider: std::fmt::Debug + Send + Sync {
+    async fn attachment_events(
+        &self,
+        ledger_id: &str,
+    ) -> Option<Vec<(fluree_db_core::EdgeKey, fluree_db_core::Sid, i64, bool)>>;
+}
+
 /// Scope of a configured full-text property entry.
 ///
 /// Mirrors the `f:targetGraph` sentinels used in config graph writes:
@@ -188,17 +213,36 @@ pub struct IndexerConfig {
     ///   determined the exact attachment delta since the base root.
     ///   The indexer seals an authoritative arena. Readers downstream
     ///   prefer this arena over the scan path.
-    /// - `None`: the caller could not produce the delta this pass
-    ///   (typically because the orchestrator hasn't yet routed
-    ///   per-ledger `AttachmentNovelty` into the indexer — see slice
-    ///   3e). The indexer treats this as **delta unknown**: when the
+    /// - `None`: the caller could not produce the delta this pass.
+    ///   The indexer treats this as **delta unknown**: when the
     ///   base root carries an `annotation_index`, the new root drops
     ///   it (recording the old branch + leaf CIDs as replaced for GC)
     ///   so hydration falls back to the scan path. Publishing a
     ///   carried-forward arena would risk hiding newly-indexed
     ///   annotations whose `f:reifies*` events landed in novelty
     ///   between this pass and the previous arena seal.
+    ///
+    /// Direct callers (CLI tools, tests, custom orchestrators with a
+    /// snapshot in hand) populate this field directly. The
+    /// `BackgroundIndexerWorker` path uses
+    /// [`Self::attachment_events_provider`] to resolve events
+    /// per-ledger at job-dispatch time.
     pub attachment_events: Option<Vec<(fluree_db_core::EdgeKey, fluree_db_core::Sid, i64, bool)>>,
+
+    /// Per-ledger attachment-events resolver for orchestrator paths.
+    ///
+    /// `BackgroundIndexerWorker` holds a single `IndexerConfig` for
+    /// its lifetime, so `attachment_events` (a per-job value) can't
+    /// be set on the static config. The worker calls this provider
+    /// at job dispatch time to fetch the running ledger's
+    /// `AttachmentNovelty.iter_event_pairs()` and stamps the result
+    /// into a per-job clone of the config before invoking the
+    /// indexer. `None` (the default) yields the M2a behavior:
+    /// arenas are not sealed via the background path.
+    ///
+    /// See `attachment_events` for the delta-unknown semantics that
+    /// apply when this provider returns `None` for a given ledger.
+    pub attachment_events_provider: Option<Arc<dyn AttachmentEventsProvider>>,
 
     /// Configured full-text properties for this indexing run.
     ///
@@ -254,6 +298,7 @@ impl Default for IndexerConfig {
             fulltext_configured_properties: Vec::new(),
             fulltext_config_provider: None,
             attachment_events: None,
+            attachment_events_provider: None,
         }
     }
 }
@@ -284,6 +329,7 @@ impl IndexerConfig {
             fulltext_configured_properties: Vec::new(),
             fulltext_config_provider: None,
             attachment_events: None,
+            attachment_events_provider: None,
         }
     }
 
@@ -307,6 +353,7 @@ impl IndexerConfig {
             fulltext_configured_properties: Vec::new(),
             fulltext_config_provider: None,
             attachment_events: None,
+            attachment_events_provider: None,
         }
     }
 
@@ -330,6 +377,7 @@ impl IndexerConfig {
             fulltext_configured_properties: Vec::new(),
             fulltext_config_provider: None,
             attachment_events: None,
+            attachment_events_provider: None,
         }
     }
 
@@ -345,6 +393,18 @@ impl IndexerConfig {
         provider: Arc<dyn FulltextConfigProvider>,
     ) -> Self {
         self.fulltext_config_provider = Some(provider);
+        self
+    }
+
+    /// Attach a per-ledger attachment-events resolver. The
+    /// `BackgroundIndexerWorker` calls the provider at job dispatch
+    /// time; direct callers (CLI, tests) typically populate
+    /// `attachment_events` instead.
+    pub fn with_attachment_events_provider(
+        mut self,
+        provider: Arc<dyn AttachmentEventsProvider>,
+    ) -> Self {
+        self.attachment_events_provider = Some(provider);
         self
     }
 

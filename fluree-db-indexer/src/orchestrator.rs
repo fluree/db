@@ -1019,8 +1019,16 @@ impl BackgroundIndexerWorker {
                 return;
             }
         };
-        let result =
-            crate::build_index_for_record(content_store, &record, self.config.clone()).await;
+        // Per-job config: clone the worker's static config and stamp
+        // in the running ledger's attachment events when a provider
+        // is attached. The provider returning `None` (e.g. ledger not
+        // loaded into the running registry) becomes "delta unknown"
+        // in the indexer — see `IndexerConfig.attachment_events`.
+        let mut job_config = self.config.clone();
+        if let Some(provider) = self.config.attachment_events_provider.as_ref() {
+            job_config.attachment_events = provider.attachment_events(ledger_id).await;
+        }
+        let result = crate::build_index_for_record(content_store, &record, job_config).await;
 
         match result {
             Ok(index_result) => {
