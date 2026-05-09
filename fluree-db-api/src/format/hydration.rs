@@ -695,6 +695,24 @@ impl<'a> HydrationFormatter<'a> {
         // Find the EdgeKey from the base flake.
         let edge_key = fluree_db_core::edge::EdgeKey::from_flake(flake);
 
+        // Arena-backed fast path: when the snapshot has both an
+        // on-disk arena and a CAS handle, look up live annotation
+        // SIDs directly via the merged reader. The novelty events
+        // come from the overlay (downcast from the OverlayProvider
+        // since AttachmentNovelty is the concrete novelty type's
+        // sidecar). On any precondition mismatch we fall through
+        // to the M2a scan path below.
+        if self.db.snapshot.has_arena_reader() {
+            if let Some(ann_sids) = self.arena_lookup_annotations(&edge_key).await? {
+                if ann_sids.is_empty() {
+                    return Ok(());
+                }
+                return self
+                    .inject_annotation_bodies(value, &ann_sids, depth, visited, cache)
+                    .await;
+            }
+        }
+
         // Scan candidate annotations via the base-edge subject:
         // POST(f:reifiesSubject, FlakeValue::Ref(edge.s)) gives all
         // annotations whose `f:reifiesSubject` points at this
@@ -788,6 +806,89 @@ impl<'a> HydrationFormatter<'a> {
         };
 
         // One annotation → bare object; many → array.
+        let ann_json = if bodies.len() == 1 {
+            bodies.into_iter().next().unwrap()
+        } else {
+            JsonValue::Array(bodies)
+        };
+        obj.insert("@annotation".to_string(), ann_json);
+        Ok(())
+    }
+
+    /// Arena-backed annotation lookup. Returns `Some(sids)` when the
+    /// arena reader resolved the query, `None` when a precondition
+    /// failed (no annotation index, no content store, or the overlay
+    /// is not the expected concrete novelty type) — caller falls back
+    /// to the M2a scan path.
+    async fn arena_lookup_annotations(
+        &self,
+        edge_key: &fluree_db_core::edge::EdgeKey,
+    ) -> Result<Option<Vec<Sid>>> {
+        let Some(ann_root) = self.db.snapshot.annotation_index.as_ref() else {
+            return Ok(None);
+        };
+        let Some(store) = self.db.snapshot.content_store.as_ref() else {
+            return Ok(None);
+        };
+        // Downcast the overlay to the concrete `Novelty` so we can
+        // reach `AttachmentNovelty`. If the overlay isn't `Novelty`
+        // (test fakes, future overlay types), fall through to the
+        // scan path rather than error.
+        let novelty = self
+            .db
+            .overlay
+            .as_any()
+            .downcast_ref::<fluree_db_novelty::Novelty>();
+        let novelty_events: Vec<(Sid, i64, bool)> = match novelty {
+            Some(n) => n.attachments.collect_forward_events(edge_key),
+            None => Vec::new(),
+        };
+        let reader = fluree_db_binary_index::annotation_arena::AnnotationArenaReader::new(
+            ann_root,
+            store.as_ref(),
+        );
+        let live = reader
+            .current_annotations_merged(edge_key, &novelty_events, self.db.t)
+            .await
+            .map_err(|e| {
+                FormatError::InvalidBinding(format!("annotation arena lookup failed: {e}"))
+            })?;
+        Ok(Some(live))
+    }
+
+    /// Format the bodies for a list of annotation SIDs and inject
+    /// them as `@annotation` on `value`. Shared between the arena and
+    /// scan paths.
+    async fn inject_annotation_bodies<'b>(
+        &'b self,
+        value: &mut JsonValue,
+        ann_sids: &[Sid],
+        depth: DepthBudget,
+        visited: &'b mut HashSet<Sid>,
+        cache: &'b mut HashMap<CacheKey, JsonValue>,
+    ) -> Result<()> {
+        let ann_level = NestedSelectSpec::Wildcard {
+            refinements: HashMap::new(),
+            reverse: HashMap::new(),
+        };
+        let mut bodies: Vec<JsonValue> = Vec::with_capacity(ann_sids.len());
+        for ann_sid in ann_sids {
+            let mut body = self
+                .format_subject(ann_sid, &ann_level, depth.descend(), visited, cache)
+                .await?;
+            if ann_sid.namespace_code == BLANK_NODE {
+                if let Some(map) = body.as_object_mut() {
+                    map.remove("@id");
+                }
+            }
+            bodies.push(body);
+        }
+        if bodies.is_empty() {
+            return Ok(());
+        }
+        let Some(obj) = value.as_object_mut() else {
+            return Ok(());
+        };
         let ann_json = if bodies.len() == 1 {
             bodies.into_iter().next().unwrap()
         } else {
