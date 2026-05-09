@@ -615,6 +615,35 @@ impl LedgerManager {
         &self.config
     }
 
+    /// Snapshot the running ledger's attachment-event delta in the
+    /// shape the indexer's arena builder expects.
+    ///
+    /// Returns `None` when:
+    /// - the ledger isn't currently loaded into this manager (no
+    ///   running overlay to snapshot — the indexer treats this as
+    ///   "delta unknown" and defensively drops any base arena),
+    /// - the ledger is loading (we don't block the indexer's job
+    ///   dispatch on a load).
+    ///
+    /// Returns `Some(vec)` (possibly empty) when the snapshot was
+    /// observed cleanly — the empty case explicitly asserts "no
+    /// events since the base arena," which the indexer treats as
+    /// "delta is empty" and seals an authoritative (unchanged)
+    /// arena.
+    pub async fn try_running_attachment_events(
+        &self,
+        ledger_id: &str,
+    ) -> Option<Vec<(fluree_db_core::EdgeKey, fluree_db_core::Sid, i64, bool)>> {
+        let canonical_alias =
+            normalize_ledger_id(ledger_id).unwrap_or_else(|_| ledger_id.to_string());
+        let entries = self.entries.read().await;
+        let LoadState::Ready(handle) = entries.get(&canonical_alias)? else {
+            return None;
+        };
+        let view = handle.snapshot().await;
+        Some(view.novelty.attachments.iter_event_pairs().collect())
+    }
+
     /// Get cached handle or load from nameservice
     ///
     /// Uses single-flight pattern: concurrent requests for same ledger ID
