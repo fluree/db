@@ -243,6 +243,30 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn truncates_events_above_job_t() {
+        // The indexer clips `attachment_events` to `t <= job_t` before
+        // calling the orchestrator helper. We verify the helper itself
+        // does not over-shoot when it gets pre-clipped input: max_t
+        // matches the highest event in the input, never higher.
+        let store: Arc<dyn ContentStore> = Arc::new(MemoryContentStore::new());
+        let result = build_and_persist_annotation_arena(
+            &store,
+            None,
+            vec![
+                (edge("alice", "worksFor", "acme"), ann("ann_1"), 5, true),
+                (edge("alice", "worksFor", "acme"), ann("ann_2"), 7, true),
+            ],
+        )
+        .await
+        .unwrap();
+        let new_index = result.new_index.unwrap();
+        assert_eq!(
+            new_index.max_t, 7,
+            "max_t must reflect input, not exceed it"
+        );
+    }
+
+    #[tokio::test]
     async fn merging_with_previous_arena_yields_replaced_leaf_cids() {
         let store: Arc<dyn ContentStore> = Arc::new(MemoryContentStore::new());
 

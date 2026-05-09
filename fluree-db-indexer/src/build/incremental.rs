@@ -2322,36 +2322,116 @@ pub async fn incremental_index(
     }
 
     // ---- Phase 3d: Annotation arena seal ----
-    // `attachment_events` is the caller's attachment delta since the
-    // base root. Three cases:
     //
-    // 1. `Some(events)` — caller determined the exact delta; seal an
-    //    authoritative arena (merging with the base arena if any).
-    // 2. `None` AND base has no arena — nothing to do.
-    // 3. `None` AND base has an arena — delta is **unknown**.
-    //    Carrying the old arena pointer forward would publish a
-    //    stale-but-authoritative arena: any new `f:reifies*` events
-    //    that landed in novelty since the previous seal would be
-    //    invisible to hydration once it prefers the arena over the
-    //    scan path. Defensive choice: drop `annotation_index` to
-    //    `None` on the new root and record the old branch + leaf
-    //    CIDs as replaced for GC. Hydration falls back to the scan
-    //    path until the next pass with `Some(events)` re-seals the
-    //    arena. Readers stay correct at the cost of arena-fast-path
-    //    performance during the transition.
-    match (
-        config.attachment_events.as_ref(),
-        base_root.annotation_index.as_ref(),
-    ) {
-        (Some(_), _) => {
-            let novelty_events = config.attachment_events.clone().unwrap_or_default();
+    // The matrix below covers every (delta, base_arena, base_sticky)
+    // combination. Two invariants drive it:
+    //
+    // - Authoritative arenas must be **complete**. We can only seal
+    //   `Some(_)` when the union (base arena ∪ delta) covers every
+    //   `f:reifies*` event the snapshot has ever seen.
+    // - The truth-table cell `(has_annotations=true, annotation_index=None)`
+    //   tells readers to fall back to scan, which is always safe.
+    //
+    // Cases:
+    //
+    //   delta=Some, base_arena=Some
+    //     → seal from (base ∪ delta). Authoritative.
+    //
+    //   delta=Some, base_arena=None, base_sticky=false
+    //     → seal from delta alone. The base has zero indexed
+    //       f:reifies* facts, so there's no missing history.
+    //
+    //   delta=Some, base_arena=None, base_sticky=true
+    //     → KEEP annotation_index=None. The base has indexed
+    //       `f:reifies*` facts (sticky bit) but no arena to merge
+    //       from. Sealing only from the delta would publish an
+    //       arena that's missing every pre-base-root attachment,
+    //       and hydration would prefer it over the scan. Until
+    //       slice 3f can reconstruct an arena from the indexed
+    //       facts, scan-fallback is the correct authoritative
+    //       state. (This case happens after a defensive drop on a
+    //       prior pass, or on an upgraded ledger that pre-dates
+    //       arenas.)
+    //
+    //   delta=None, base_arena=Some
+    //     → defensive drop. Carrying the old arena would publish a
+    //       stale-but-authoritative pointer; readers must fall
+    //       back to scan until the next pass supplies events.
+    //
+    //   delta=None, base_arena=None
+    //     → nothing to do. Non-annotation ledger fast path (or the
+    //       scan-fallback state already in place).
+    //
+    // Filtering: `attachment_events` is also clipped to
+    // `t <= record.commit_t` so a concurrent commit's events can't
+    // leak into a root whose `index_t` is still `commit_t`. Keeps
+    // the invariant `AnnotationIndexRoot.max_t <= IndexRoot.index_t`
+    // per snapshot.
+    let job_t = record.commit_t;
+    let clipped_events = config.attachment_events.as_ref().map(|events| {
+        let mut e = events.clone();
+        e.retain(|(_, _, t, _)| *t <= job_t);
+        e
+    });
+    match (clipped_events.as_ref(), base_root.annotation_index.as_ref()) {
+        (Some(_), Some(_)) => {
+            let novelty_events = clipped_events.unwrap_or_default();
             let result = crate::build::annotation_arena::build_and_persist_annotation_arena(
                 &content_store,
                 base_root.annotation_index.as_ref(),
                 novelty_events,
             )
             .await?;
+            if let Some(ref ann) = result.new_index {
+                debug_assert!(
+                    ann.max_t <= job_t,
+                    "AnnotationIndexRoot.max_t ({}) must not exceed IndexRoot.index_t ({})",
+                    ann.max_t,
+                    job_t
+                );
+            }
             root_builder.set_annotation_index(result.new_index, result.replaced_leaf_cids);
+        }
+        (Some(_), None) if !base_root.has_annotations => {
+            // Base has no f:reifies* facts at all — delta alone is
+            // the complete picture.
+            let novelty_events = clipped_events.unwrap_or_default();
+            let result = crate::build::annotation_arena::build_and_persist_annotation_arena(
+                &content_store,
+                None,
+                novelty_events,
+            )
+            .await?;
+            if let Some(ref ann) = result.new_index {
+                debug_assert!(
+                    ann.max_t <= job_t,
+                    "AnnotationIndexRoot.max_t ({}) must not exceed IndexRoot.index_t ({})",
+                    ann.max_t,
+                    job_t
+                );
+            }
+            root_builder.set_annotation_index(result.new_index, result.replaced_leaf_cids);
+        }
+        (Some(_), None) => {
+            // Base has indexed f:reifies* facts but no arena to
+            // merge against (`has_annotations=true,
+            // annotation_index=None` — typically after a prior
+            // defensive drop, or an upgraded ledger that pre-dates
+            // arenas). Sealing from the delta alone would publish
+            // an incomplete-but-authoritative arena that hides
+            // historical attachments. Stay in scan-fallback until
+            // slice 3f rebuilds from indexed facts.
+            tracing::warn!(
+                ledger_id = %ledger_id,
+                "incremental indexer received attachment_events but base \
+                 root has indexed f:reifies* facts without an arena \
+                 (has_annotations=true, annotation_index=None). Sealing \
+                 from delta alone would publish an incomplete arena; \
+                 leaving annotation_index=None so hydration uses scan. \
+                 The next full rebuild (or slice 3f) reconstructs the \
+                 arena from the indexed facts."
+            );
+            root_builder.set_annotation_index(None, Vec::new());
         }
         (None, Some(prev)) => {
             // Delta unknown but base has an arena — defensively drop
@@ -2377,7 +2457,8 @@ pub async fn incremental_index(
             root_builder.set_annotation_index(None, prev_leaf_cids);
         }
         (None, None) => {
-            // Nothing to do — non-annotation ledger fast path.
+            // Nothing to do — non-annotation ledger fast path, or
+            // already in scan-fallback state.
         }
     }
 
