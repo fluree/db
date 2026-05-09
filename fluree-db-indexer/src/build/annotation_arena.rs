@@ -83,7 +83,7 @@ pub struct PersistedArenaResult {
 /// the new root advertises an empty arena (still authoritative —
 /// empty events explicitly assert "no attachments live anywhere").
 pub async fn build_and_persist_annotation_arena(
-    content_store: &Arc<dyn ContentStore>,
+    content_store: &dyn ContentStore,
     previous_index: Option<&AnnotationIndexRoot>,
     events: Vec<(EdgeKey, Sid, i64, bool)>,
 ) -> Result<PersistedArenaResult> {
@@ -96,7 +96,7 @@ pub async fn build_and_persist_annotation_arena(
     // complete history per the contract above.
     let replaced_leaf_cids: Vec<fluree_db_core::ContentId> = match previous_index {
         Some(prev) => {
-            let reader = AnnotationArenaReader::new(prev, content_store.as_ref());
+            let reader = AnnotationArenaReader::new(prev, content_store);
             reader.all_leaf_cids().await.map_err(IndexerError::Core)?
         }
         None => Vec::new(),

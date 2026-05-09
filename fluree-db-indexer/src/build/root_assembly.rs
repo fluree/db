@@ -217,6 +217,21 @@ pub(crate) struct Fir6Inputs {
     pub db_schema: Option<fluree_db_core::IndexSchema>,
     /// CAS reference for the serialized HLL sketch blob.
     pub sketch_ref: Option<ContentId>,
+    /// Edge-annotation event coverage envelope (M2b slice 3g).
+    ///
+    /// Routed from `IndexerConfig.attachment_events` through
+    /// `rebuild.rs`. Same coverage semantics as the incremental
+    /// path, but without a base arena to merge against:
+    ///
+    /// - `Authoritative(events)` — caller guarantees full history;
+    ///   seal the arena from this set.
+    /// - `Augment(events)` / `Unknown` / `None` — we can't prove
+    ///   completeness without a base arena (the rebuild path
+    ///   doesn't yet collect events from the resolver). Stay in
+    ///   scan-fallback (`annotation_index = None`); the next
+    ///   incremental pass with a populated overlay can seal an
+    ///   authoritative arena.
+    pub attachment_events: Option<crate::config::AttachmentEventCoverage>,
 }
 
 /// Encode an `IndexRoot` (FIR6), write to CAS, and return an `IndexResult`.
@@ -331,6 +346,70 @@ pub(crate) async fn encode_and_write_root_v6(
                     }
                 }
             }
+        }
+    }
+
+    // ---- Annotation arena seal (M2b slice 3g, full-rebuild path) ----
+    //
+    // Same coverage envelope as the incremental Phase 3d, but
+    // without a previous arena to merge against (full rebuild
+    // starts from scratch). Decision matrix:
+    //
+    //   Authoritative(events) → caller asserts complete history;
+    //                            seal authoritative arena.
+    //   Augment(events)       → caller has events but can't prove
+    //                            completeness; without a base arena
+    //                            to merge with, we have no way to
+    //                            recover historical attachments
+    //                            beyond the supplied events. Stay
+    //                            in scan-fallback (annotation_index
+    //                            = None). The next incremental pass
+    //                            with running overlay coverage can
+    //                            seal an arena. (A future slice can
+    //                            collect events from the resolver
+    //                            and turn this into Authoritative
+    //                            here.)
+    //   Unknown / None        → no caller events; no-op.
+    //
+    // Events clipped to t <= inputs.index_t for the same reason as
+    // incremental: keeps `AnnotationIndexRoot.max_t <=
+    // IndexRoot.index_t`.
+    use crate::config::AttachmentEventCoverage;
+    let job_t = inputs.index_t;
+    match inputs.attachment_events {
+        Some(AttachmentEventCoverage::Authoritative(mut events)) => {
+            events.retain(|(_, _, t, _)| *t <= job_t);
+            let result = crate::build::annotation_arena::build_and_persist_annotation_arena(
+                content_store,
+                None,
+                events,
+            )
+            .await?;
+            if let Some(ref ann) = result.new_index {
+                debug_assert!(
+                    ann.max_t <= job_t,
+                    "AnnotationIndexRoot.max_t ({}) must not exceed IndexRoot.index_t ({})",
+                    ann.max_t,
+                    job_t
+                );
+            }
+            root.annotation_index = result.new_index;
+            // No previous arena → no leaves to GC; replaced_leaf_cids
+            // is empty by construction.
+            debug_assert!(result.replaced_leaf_cids.is_empty());
+        }
+        Some(AttachmentEventCoverage::Augment(_)) => {
+            tracing::warn!(
+                ledger_id = %inputs.ledger_id,
+                "full-rebuild path received Augment coverage but has no \
+                 base arena to merge with; cannot prove history \
+                 completeness. Leaving annotation_index=None — the next \
+                 incremental pass with running overlay coverage will \
+                 seal an authoritative arena."
+            );
+        }
+        Some(AttachmentEventCoverage::Unknown) | None => {
+            // Non-annotation ledger fast path or scan-fallback state.
         }
     }
 

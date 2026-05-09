@@ -2350,7 +2350,7 @@ pub async fn incremental_index(
         Some(AttachmentEventCoverage::Authoritative(mut events)) => {
             events.retain(|(_, _, t, _)| *t <= job_t);
             let result = crate::build::annotation_arena::build_and_persist_annotation_arena(
-                &content_store,
+                content_store.as_ref(),
                 prev_arena,
                 events,
             )
@@ -2395,7 +2395,7 @@ pub async fn incremental_index(
             combined.dedup();
 
             let result = crate::build::annotation_arena::build_and_persist_annotation_arena(
-                &content_store,
+                content_store.as_ref(),
                 prev_arena,
                 combined,
             )
