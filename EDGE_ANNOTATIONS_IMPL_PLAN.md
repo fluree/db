@@ -291,9 +291,24 @@ correctness items remaining):**
 - ⏳ **Wildcard hide of anonymous annotation SIDs.** Explicit-IRI
   annotation subjects stay visible; anonymous (blank-node) ones are
   filtered out of `select: "*"` per the design decisions.
-- ⏳ **Cascade rules** for the three retract shapes
-  (plain-edge / occurrence-by-selector / by-annotation-id) plus the
-  RDF-mode default vs. `lpgEdgeLifecycle: true` opt-in.
+- ✅ **Plain-edge retract cascade** (`feat(M1b): cascade f:reifies*`):
+  retracting a base edge via DELETE / SPARQL UPDATE auto-retracts
+  the `f:reifies*` bundle pointing at it via a stage-time pass that
+  walks the retract flake set, looks up annotations in the
+  `AttachmentNovelty` overlay, and emits the inverse bundle. After
+  cascade, `@reifies` queries correctly return zero rows for the
+  retracted edge.
+- ⏳ **Annotation-metadata cascade** (RDF-mode anonymous + LPG-mode
+  explicit). The bundle retract above prevents orphaned attachment
+  pointers, but the annotation subject's own metadata flakes
+  (e.g. `ann ex:role "Engineer"`) remain in the graph as ordinary
+  RDF. Anonymous annotations have unreachable SIDs so this is
+  observably benign; explicit-IRI annotations stay queryable as
+  ordinary nodes (which the design doc allows in RDF mode).
+- ⏳ **Occurrence-by-selector and by-annotation-id retracts.** The
+  more targeted retract shapes that select a specific occurrence
+  among parallel annotations need IR support (matching by metadata)
+  and aren't covered by the plain-edge cascade.
 - ⏳ **JSON-LD subject-expansion output:** emit `@annotation` blocks
   when materializing an annotated edge through subject expansion.
 - ⏳ **Broader `it_edge_annotations.rs` integration tests:** parallel

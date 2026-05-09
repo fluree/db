@@ -294,6 +294,83 @@ async fn annotation_rooted_query_returns_no_rows_when_metadata_doesnt_match() {
 }
 
 #[tokio::test]
+async fn retracting_base_edge_cascades_f_reifies_bundle() {
+    // M1b cascade: when a base edge is retracted, the `f:reifies*`
+    // bundle pointing at it must be retracted in the same
+    // transaction so the durable encoding doesn't keep orphaned
+    // attachment pointers. After the cascade, an `@reifies` query
+    // for the metadata must return zero rows because the base edge
+    // is gone *and* the attachment is no longer asserted.
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger_id = "it/edge-annotations:cascade-base-retract";
+    let ledger0 = genesis_ledger(&fluree, ledger_id);
+
+    // 1. Insert an annotated edge.
+    let insert = json!({
+        "@context": ctx(),
+        "@id": "ex:alice",
+        "ex:worksFor": {
+            "@id": "ex:acme",
+            "@annotation": {
+                "@id": "ex:emp/alice-acme",
+                "ex:role": "Engineer"
+            }
+        }
+    });
+    let after_insert = fluree
+        .insert(ledger0, &insert)
+        .await
+        .expect("annotated insert");
+
+    // Sanity: the annotation is reachable via @reifies.
+    let q = json!({
+        "@context": ctx(),
+        "select": ["?person", "?org"],
+        "where": {
+            "ex:role": "Engineer",
+            "@reifies": { "@id": "?person", "ex:worksFor": { "@id": "?org" } }
+        }
+    });
+    let pre = support::query_jsonld_formatted(&fluree, &after_insert.ledger, &q)
+        .await
+        .expect("pre-cascade query");
+    assert_eq!(
+        pre.as_array().expect("array").len(),
+        1,
+        "@reifies should find the annotation before cascade: {pre:#?}"
+    );
+
+    // 2. Retract the base edge via SPARQL-style update. The
+    //    transactor's cascade pass should retract the corresponding
+    //    `f:reifies*` bundle automatically.
+    let delete = json!({
+        "@context": ctx(),
+        "where": { "@id": "?s", "ex:worksFor": { "@id": "?o" } },
+        "delete": { "@id": "?s", "ex:worksFor": { "@id": "?o" } }
+    });
+    let after_delete = fluree
+        .update(after_insert.ledger, &delete)
+        .await
+        .expect("base-edge delete");
+
+    // 3. The `@reifies` query must now return zero rows. If the
+    //    cascade didn't fire, the f:reifies* facts would still
+    //    point at the now-retracted edge — and the join through the
+    //    expansion would still match the annotation but lose the
+    //    base-edge visibility check (which would correctly filter
+    //    it out, but only the visibility check, not the cascade,
+    //    would explain the zero rows).
+    let post = support::query_jsonld_formatted(&fluree, &after_delete.ledger, &q)
+        .await
+        .expect("post-cascade query");
+    let arr = post.as_array().expect("array");
+    assert!(
+        arr.is_empty(),
+        "after cascade, @reifies must return zero rows: {arr:#?}"
+    );
+}
+
+#[tokio::test]
 async fn wildcard_subject_hydration_hides_f_reifies_predicates() {
     // Annotation subjects minted by the M1a transactor lowering carry
     // `f:reifies*` system facts in addition to the user-authored body

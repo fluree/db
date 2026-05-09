@@ -42,6 +42,50 @@ use fluree_db_shacl::{ShaclCache, ShaclEngine, ValidationReport};
 /// Given `graph_sids` (GraphId → Sid from `txn.graph_delta`), returns the
 /// inverse mapping. Used by SHACL/policy to determine which graph a flake
 /// belongs to based on its `Flake.g` field.
+/// Generate cascade `f:reifies*` retraction flakes for any base edges
+/// being retracted in `flakes`.
+///
+/// For each retract flake whose predicate is *not* a system-controlled
+/// `f:reifies*` predicate, build the corresponding `EdgeKey` and look
+/// up its currently-asserted annotations in `attachments`. For each
+/// annotation, emit the inverse `f:reifies*` bundle so the durable
+/// encoding doesn't keep pointing at a retracted edge.
+///
+/// M1b minimum: only retracts the `f:reifies*` bundle. Anonymous-
+/// annotation metadata cleanup (RDF mode default) and explicit-IRI
+/// metadata cleanup (LPG mode `opts.lpgEdgeLifecycle: true`) are
+/// tracked as follow-ups — leaving them in place is observably safe
+/// (the annotation subject becomes unreachable through `@reifies`
+/// once the bundle is gone, and anonymous SIDs can't be addressed
+/// directly).
+fn cascade_attachment_retracts(
+    flakes: &[Flake],
+    attachments: &fluree_db_novelty::AttachmentNovelty,
+    new_t: i64,
+) -> Vec<Flake> {
+    use fluree_db_core::edge::EdgeKey;
+    use fluree_db_core::is_reserved_reifies_predicate;
+
+    let mut cascade = Vec::new();
+    for flake in flakes {
+        if flake.op {
+            continue; // assertion, not a retract — nothing to cascade
+        }
+        if is_reserved_reifies_predicate(&flake.p) {
+            continue; // already a system retract (cascade or upstream); skip
+        }
+        let edge_key = EdgeKey::from_flake(flake);
+        for ann_sid in attachments.current_annotations_for(&edge_key) {
+            // Build the f:reifies* retraction bundle. The bundle's
+            // `t` matches the rest of the new transaction's flakes,
+            // and `op = false` produces the inverse of the original
+            // assertion bundle.
+            cascade.extend(edge_key.to_reifies_facts(&ann_sid, new_t, false));
+        }
+    }
+    cascade
+}
+
 fn build_reverse_graph_lookup(graph_sids: &HashMap<GraphId, Sid>) -> HashMap<Sid, GraphId> {
     graph_sids
         .iter()
@@ -336,7 +380,7 @@ pub async fn stage(
         let retraction_count = stream_stats.retraction_count;
         let assertion_count = stream_stats.assertion_count;
         let total_inputs = acc.input_count();
-        let flakes = if pure_delete {
+        let mut flakes = if pure_delete {
             let _span =
                 tracing::debug_span!("dedup_retractions", retraction_count = retraction_count)
                     .entered();
@@ -368,6 +412,31 @@ pub async fn stage(
             }
             f
         };
+
+        // Cascade-retract `f:reifies*` bundles for any base edge that
+        // is being retracted in this transaction. Without this, a
+        // DELETE of the base edge would leave the attachment pointers
+        // orphaned in the durable encoding, and `@reifies` queries
+        // would still surface annotations for retracted edges.
+        //
+        // M1b minimum: retracts the `f:reifies*` bundle only. The
+        // anonymous-annotation metadata cascade (RDF default) and the
+        // explicit-IRI metadata cascade (LPG mode opt-in) are tracked
+        // as follow-ups in the plan.
+        if ledger.novelty.attachments.has_annotations() {
+            let cascade = cascade_attachment_retracts(
+                &flakes,
+                &ledger.novelty.attachments,
+                new_t,
+            );
+            if !cascade.is_empty() {
+                tracing::debug!(
+                    cascade_count = cascade.len(),
+                    "cascading f:reifies* retracts for retracted base edges"
+                );
+                flakes.extend(cascade);
+            }
+        }
 
         // Count fuel per staged non-schema flake (mirrors query-side fuel counting).
         // NOTE: fuel exhaustion now returns an error (previously silently ignored).
