@@ -94,6 +94,16 @@ Required endpoints:
 
 The `--remote-name` flag allows publishing under a different name on the remote (e.g., `fluree publish origin mydb --remote-name production-db`).
 
+### `fluree drop <name> --remote <name>` (admin-protected)
+
+- `POST {api_base_url}/drop` with `{"ledger": "<name>", "hard": true}`
+
+Drops a ledger or graph source on the remote server. The CLI sends `hard: true` (no soft-drop surface today). The server resolves `name` as a ledger first, then as a graph source — see the [`fluree drop` graph source fallback](#fluree-drop-name-graph-source-fallback) section below for the resolution order and response shape.
+
+When `--remote` is omitted, the CLI auto-routes through a locally running `fluree server start` if `server.meta.json` is present and the PID is alive, falling back to direct local execution otherwise. Pass `--direct` to skip auto-routing. The `--force` flag is required in all modes to confirm deletion.
+
+`--remote` does not affect local state: dropping a ledger remotely never touches the local active-ledger pointer or local storage.
+
 ### `fluree create <name> --from <file>.flpack` (native ledger import)
 
 - No server endpoint required (local-only operation)
@@ -1283,5 +1293,6 @@ fluree iceberg map my-gs \
 fluree list                    # should show mydb (Ledger) + my-gs (Iceberg)
 fluree info my-gs              # should show Iceberg config + R2RML mapping
 fluree show t:1 --remote origin  # should show decoded commit with resolved IRIs
-fluree drop my-gs --force      # should drop the graph source
+fluree drop my-gs --force      # should drop the graph source locally
+fluree drop local-db --remote origin --force  # should drop the published ledger on the remote
 ```

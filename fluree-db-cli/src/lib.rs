@@ -128,9 +128,13 @@ pub async fn run(cli: Cli) -> error::CliResult<()> {
             commands::branch::run(action, &fluree_dir, direct).await
         }
 
-        Commands::Drop { name, force } => {
+        Commands::Drop {
+            name,
+            force,
+            remote,
+        } => {
             let fluree_dir = config::require_fluree_dir(config_path)?;
-            commands::drop::run(&name, force, &fluree_dir).await
+            commands::drop::run(&name, force, &fluree_dir, remote.as_deref(), direct).await
         }
 
         Commands::Insert {
