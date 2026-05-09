@@ -4006,6 +4006,107 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_rejects_literal_value_object_with_annotation() {
+        // Literal-valued annotations are deferred. A value object with
+        // @value alongside @annotation must error explicitly rather
+        // than silently dropping the annotation.
+        let json = json!({
+            "@context": {
+                "ex": "http://example.org/",
+                "xsd": "http://www.w3.org/2001/XMLSchema#"
+            },
+            "select": ["?since"],
+            "where": {
+                "@id": "?person",
+                "ex:joinedAt": {
+                    "@value": "?since",
+                    "@type": "xsd:date",
+                    "@annotation": { "ex:source": "?source" }
+                }
+            }
+        });
+
+        let err = parse_query_ast(&json, None).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("@annotation") && msg.contains("deferred"),
+            "error should explain literal-value annotation deferral: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_parse_rejects_literal_value_object_with_edge_alias() {
+        // Same coverage for the @edge alias.
+        let json = json!({
+            "@context": { "ex": "http://example.org/" },
+            "select": ["?val"],
+            "where": {
+                "@id": "?s",
+                "ex:label": {
+                    "@value": "?val",
+                    "@edge": { "ex:lang": "en" }
+                }
+            }
+        });
+
+        let err = parse_query_ast(&json, None).unwrap_err();
+        assert!(err.to_string().contains("@edge"));
+    }
+
+    #[test]
+    fn test_parse_edge_annotation_honors_id_alias() {
+        // `"id": "@id"` in @context should make `"id"` a valid alias
+        // for `@id` everywhere — including inside annotation node-maps.
+        let json = json!({
+            "@context": { "ex": "http://example.org/", "id": "@id" },
+            "select": ["?ann", "?role"],
+            "where": {
+                "id": "?person",
+                "ex:worksFor": {
+                    "id": "?org",
+                    "@annotation": {
+                        "id": "?ann",
+                        "ex:role": "?role"
+                    }
+                }
+            }
+        });
+
+        let (ast, _) = parse_query_ast(&json, None).unwrap();
+        match &ast.patterns[0] {
+            UnresolvedPattern::EdgeAnnotation {
+                edge,
+                annotation,
+                body,
+            } => {
+                // Aliased @id on the surrounding subject + nested object
+                // both resolve to user-named variables (not synthetic).
+                assert!(
+                    matches!(&edge.s, UnresolvedTerm::Var(v) if v.as_ref() == "?person"),
+                    "aliased @id on the surrounding subject should resolve to ?person"
+                );
+                assert!(
+                    matches!(&edge.o, UnresolvedTerm::Var(v) if v.as_ref() == "?org"),
+                    "aliased @id on the nested object should resolve to ?org"
+                );
+                // Aliased @id on the annotation block resolves to ?ann.
+                assert!(
+                    matches!(annotation, UnresolvedTerm::Var(v) if v.as_ref() == "?ann"),
+                    "aliased @id on the annotation block should resolve to ?ann"
+                );
+                // The aliased @id on the annotation block must NOT be
+                // re-emitted as a body triple ("id" → ?ann).
+                assert_eq!(
+                    body.len(),
+                    1,
+                    "aliased @id on annotation must be skipped, not re-emitted as a body triple"
+                );
+            }
+            other => panic!("expected EdgeAnnotation, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn test_parse_rejects_nested_annotation_in_body() {
         // Annotation-of-annotation is deferred. The body of an
         // `@annotation` block cannot itself carry `@annotation`.

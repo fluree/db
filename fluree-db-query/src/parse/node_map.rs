@@ -756,6 +756,20 @@ fn parse_property(
     // Handle value objects like {"@value": ..., "@type": ..., "@language": ..., "@t": ...} (typed literals in WHERE)
     if let JsonValue::Object(obj) = value {
         if obj.contains_key("@value") || obj.contains_key("@language") {
+            // Literal-valued annotations are deferred (v1). A value
+            // object that also carries `@annotation` / `@edge` would
+            // otherwise drop the annotation silently, since
+            // `parse_value_object` does not recognize those keys.
+            // Reject explicitly so users get a clear deferred-feature
+            // error instead.
+            for k in [ANNOTATION_KEY, EDGE_KEY] {
+                if obj.contains_key(k) {
+                    return Err(ParseError::InvalidWhere(format!(
+                        "{k} on a literal value object is deferred (v1); \
+                         annotations on literal-valued edges are not supported yet"
+                    )));
+                }
+            }
             let parsed = parse_value_object(obj, ctx.ctx, ctx.object_var_parsing)?;
             let object = parsed.term;
 
@@ -1016,14 +1030,18 @@ fn parse_edge_annotation(
     query: &mut UnresolvedQuery,
     ctx: &mut PropertyParseContext<'_>,
 ) -> Result<()> {
-    // The nested object's @id (or synthetic) is the base triple's object.
-    let nested_subject = if let Some(id_val) = nested_map.get("@id") {
-        parse_subject(id_val, ctx.ctx)?
-    } else {
-        let nested_subject_name = format!("?__n{}", *ctx.nested_counter);
-        *ctx.nested_counter += 1;
-        UnresolvedTerm::var(&nested_subject_name)
-    };
+    // The nested object's @id (or synthetic) is the base triple's
+    // object. Honor `@id` aliases declared in `@context` (e.g.
+    // `"id": "@id"`), matching the regular node-map parser.
+    let id_key = ctx.ctx.context.id_key.as_str();
+    let nested_subject =
+        if let Some(id_val) = nested_map.get("@id").or_else(|| nested_map.get(id_key)) {
+            parse_subject(id_val, ctx.ctx)?
+        } else {
+            let nested_subject_name = format!("?__n{}", *ctx.nested_counter);
+            *ctx.nested_counter += 1;
+            UnresolvedTerm::var(&nested_subject_name)
+        };
 
     let edge = build_triple_pattern(
         subject,
@@ -1041,7 +1059,7 @@ fn parse_edge_annotation(
     // annotation block isolated to avoid ambiguity about which
     // properties belong to the base object vs. the annotation.)
     for (k, _) in nested_map {
-        if k == "@id" || is_annotation_key(k) || k == "@context" {
+        if k == "@id" || k == id_key || is_annotation_key(k) || k == "@context" {
             continue;
         }
         return Err(ParseError::InvalidWhere(format!(
@@ -1071,10 +1089,10 @@ fn parse_edge_annotation(
         )));
     };
 
-    // Annotation subject: explicit @id or synthetic variable. We mint
-    // the synthetic name from `nested_counter` so it shares the same
-    // namespace and doesn't collide.
-    let annotation = if let Some(id_val) = ann_map.get("@id") {
+    // Annotation subject: explicit @id (or aliased @id) or synthetic
+    // variable. We mint the synthetic name from `nested_counter` so
+    // it shares the same namespace and doesn't collide.
+    let annotation = if let Some(id_val) = ann_map.get("@id").or_else(|| ann_map.get(id_key)) {
         parse_subject(id_val, ctx.ctx)?
     } else {
         let var_name = format!("?__ann_n{}", *ctx.nested_counter);
@@ -1168,9 +1186,11 @@ fn parse_annotation_body(
     skip_keys: &[&str],
 ) -> Result<Vec<UnresolvedPattern>> {
     let mut buffer = UnresolvedQuery::new(ctx.context.clone());
+    let id_key = ctx.context.id_key.as_str();
 
     for (key, value) in map {
-        if key == "@id" || key == "@context" || skip_keys.iter().any(|k| k == key) {
+        if key == "@id" || key == id_key || key == "@context" || skip_keys.iter().any(|k| k == key)
+        {
             continue;
         }
         if is_annotation_key(key) {
