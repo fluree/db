@@ -266,6 +266,24 @@ correctness items remaining):**
   `opts.includeSystemFacts: true` escape and a history-range
   carve-out. The parser-level firewall blocks *direct named
   mention*; this is the broader leakage path.
+- ⏳ **Graph-bound expansion in multi-graph queries.** The IR-level
+  expansion in `expand_edge_annotation_patterns` correctly handles
+  single-graph queries and `Pattern::Graph`-wrapped patterns (the
+  base edge and `f:reifies*` lookups all scope to the same graph
+  via the standard scan filter). It does **not** explicitly bind
+  the graph variable across the lookup, so a multi-graph dataset
+  with the same `(s,p,o)` in multiple graphs and SPARQL
+  `FROM` / `FROM NAMED` semantics can join an annotation from
+  graph X with a base edge from graph Y. The proper fix needs
+  either a custom operator that carries graph identity through the
+  lookup or an `(?ann, f:reifiesGraph, ?graph)` triple bound to
+  the base-edge match. Tracked alongside the M2 binary-arena work
+  since the custom operator becomes the right vehicle then.
+- ⏳ **Per-language disambiguation.** Same architectural shape:
+  `f:reifiesLang` is emitted by the write side but not constrained
+  in the read-side expansion, so cross-language misjoin is possible
+  when the same string is asserted with multiple language tags.
+  Same fix path as the graph-bound expansion.
 - ⏳ **Wildcard hide of anonymous annotation SIDs.** Explicit-IRI
   annotation subjects stay visible; anonymous (blank-node) ones are
   filtered out of `select: "*"` per the design decisions.

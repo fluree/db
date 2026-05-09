@@ -567,12 +567,18 @@ fn lower_object_with_subject(
     walk: &WalkCtx<'_>,
     ctx: &mut LowerCtx,
 ) -> Result<()> {
-    // Value/list/variable objects must not be lowered as nodes.
-    // (The annotation-keyword rejection for these shapes happens at
-    // the predicate-value-pair level via
-    // `intercept_annotations_for_predicate`, so we don't need to
-    // re-scan here.)
+    // Value/list/variable objects must not be lowered as nodes —
+    // they describe a literal, an ordered collection, or a variable
+    // reference, none of which are subjects in their own right.
+    //
+    // The early-return must NOT skip the annotation-keyword scan
+    // inside the wrapper's contents: e.g. `@list` items are full
+    // node-maps and could carry `@annotation` (the deferred list-
+    // occurrence shape), and `@variable` wrappers could be misused
+    // to embed a deferred shape. We scan the wrapper once and
+    // reject any deferred mention before returning.
     if is_jsonld_value_object(map) {
+        scan_nested_annotation_keywords(&Value::Object(map.clone()))?;
         return Ok(());
     }
 
@@ -926,6 +932,62 @@ mod tests {
         let original = doc.clone();
         let result = lower(doc).unwrap();
         assert_eq!(result, original, "value object must not be lowered as a node");
+    }
+
+    #[test]
+    fn rejects_annotation_nested_inside_list_item() {
+        // List-occurrence annotations are deferred (v1). A `@list`
+        // wrapper containing an `@annotation` inside one of its items
+        // must error rather than silently slip past the early-return
+        // for value-class objects.
+        let doc = json!({
+            "@context": { "ex": "http://example.org/" },
+            "@id": "ex:alice",
+            "ex:colleagues": {
+                "@list": [
+                    { "@id": "ex:bob",
+                      "@annotation": { "ex:role": "buddy" } }
+                ]
+            }
+        });
+        let err = lower(doc).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("annotation") && msg.contains("deferred"),
+            "list-nested @annotation must be rejected with a deferred message: {msg}"
+        );
+    }
+
+    #[test]
+    fn rejects_reifies_nested_inside_list_item() {
+        let doc = json!({
+            "@context": { "ex": "http://example.org/" },
+            "@id": "ex:ann1",
+            "ex:colleagues": {
+                "@list": [
+                    { "@id": "ex:bob",
+                      "@reifies": { "@id": "ex:alice", "ex:knows": { "@id": "ex:bob" } } }
+                ]
+            }
+        });
+        let err = lower(doc).unwrap_err();
+        assert!(err.to_string().contains("@reifies"));
+    }
+
+    #[test]
+    fn rejects_annotation_nested_inside_variable_wrapper() {
+        // @variable should be a leaf reference — embedding a deferred
+        // shape inside it must error.
+        let doc = json!({
+            "@context": { "ex": "http://example.org/" },
+            "@id": "ex:alice",
+            "ex:status": {
+                "@variable": "?status",
+                "@annotation": { "ex:meta": "x" }
+            }
+        });
+        let err = lower(doc).unwrap_err();
+        assert!(err.to_string().contains("annotation"));
     }
 
     #[test]

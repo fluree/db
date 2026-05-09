@@ -113,12 +113,41 @@ fn expand_one_into(pattern: Pattern, out: &mut Vec<Pattern>) {
                 dtc: edge.dtc.clone(),
             }));
 
-            // f:reifiesGraph and f:reifiesLang are intentionally
-            // omitted from the lookup chain in v1 — the base edge
-            // triple already constrains graph and language matching
-            // through its own scan, so adding them as separate
-            // triples would over-constrain. Cross-graph or per-lang
-            // disambiguation arrives in M2 with the binary arena.
+            // f:reifiesGraph and f:reifiesLang are NOT emitted as
+            // separate constraint triples in this M1b expansion.
+            //
+            // **Graph correctness** holds in two cases:
+            //
+            // 1. **Single-graph queries** (no `Pattern::Graph` wrapper,
+            //    or one wrapping every annotation pattern). Both the
+            //    base edge triple and the f:reifies* lookups scope to
+            //    the same graph as a side effect of the scan layer's
+            //    default graph filtering, so they can only join an
+            //    annotation that lives in the same graph as the edge.
+            //
+            // 2. **`Pattern::Graph` wrapped patterns**. The whole
+            //    expansion (base edge + f:reifies* lookups) is
+            //    wrapped together by `map_subpatterns` further up,
+            //    which preserves the surrounding container, so the
+            //    graph scope applies uniformly to every emitted
+            //    triple.
+            //
+            // **Known gap (M2):** in a multi-graph dataset where a
+            // single query stream can match flakes from more than
+            // one graph (e.g. a SPARQL `FROM` / `FROM NAMED` union),
+            // these expanded triples do not pin `f:reifiesGraph`
+            // across the join. A correctly graph-bound result
+            // requires either a custom operator that carries graph
+            // identity through the lookup, or a pattern that emits
+            // `(?ann, f:reifiesGraph, ?graph)` and binds `?graph`
+            // to the base-edge match. The custom-operator path is
+            // tracked alongside the M2 binary-arena work.
+            //
+            // **Per-language disambiguation** is similarly deferred:
+            // the f:reifiesObject triple's `dtc` constraint matches
+            // datatype but not language; cross-lang misjoin is
+            // possible if the same string is asserted with multiple
+            // language tags.
 
             // 3. Body patterns (recursively expanded so nested
             //    annotations — though M0 rejects them — flatten too).
