@@ -94,43 +94,75 @@ impl AttachmentNovelty {
         self.has_annotations
     }
 
-    /// Iterator over annotation SIDs **currently attached** to `edge`.
+    /// Iterator over annotation SIDs **currently attached** to `edge`,
+    /// where "current" is evaluated against `as_of_t`: only events
+    /// with `t <= as_of_t` are considered, and the latest such event
+    /// for each annotation must be `op == true`.
     ///
-    /// Walks the row history and returns one Sid per annotation whose
-    /// most-recent event for this edge has `op == true`. Annotations
-    /// that were asserted then retracted produce no row.
+    /// This is the time-travel-correct read used by query and
+    /// hydration paths — the formatter passes `self.db.t` so a
+    /// historical view sees the attachment state as of that
+    /// transaction, not the live latest.
+    pub fn current_annotations_for_at<'a>(
+        &'a self,
+        edge: &'a EdgeKey,
+        as_of_t: i64,
+    ) -> impl Iterator<Item = Sid> + 'a {
+        self.forward
+            .get(edge)
+            .map(|rows| {
+                latest_assertions_at::<_, _>(rows.iter(), |r| (&r.ann, r.t, r.op), as_of_t)
+            })
+            .into_iter()
+            .flatten()
+            .cloned()
+    }
+
+    /// Iterator over annotation SIDs currently attached to `edge`
+    /// against the **live** overlay state (i.e., the latest event
+    /// over all `t`).
+    ///
+    /// Used by transactor staging where the relevant state is
+    /// always "everything committed before this transaction" — the
+    /// novelty's attachment rows only carry post-commit events with
+    /// `t <= ledger.t()` by construction, so the live and as-of
+    /// reads coincide.
+    ///
+    /// **Read paths must use [`Self::current_annotations_for_at`]
+    /// with an explicit `as_of_t`** — this method is for write-side
+    /// callers only.
     pub fn current_annotations_for<'a>(
         &'a self,
         edge: &'a EdgeKey,
     ) -> impl Iterator<Item = Sid> + 'a {
-        self.forward
-            .get(edge)
-            .map(|rows| latest_assertions::<_, _>(rows.iter(), |r| (&r.ann, r.t, r.op)))
-            .into_iter()
-            .flatten()
-            .map(|sid| sid.clone())
+        self.current_annotations_for_at(edge, i64::MAX)
     }
 
-    /// Iterator over base [`EdgeKey`]s **currently reified** by
-    /// annotation `ann`. Same `(t, op)` filter as
-    /// [`Self::current_annotations_for`].
-    ///
-    /// Note: at v1 stage time we enforce "exactly one current target
-    /// per annotation SID" — so this iterator usually produces zero or
-    /// one element. We still return an iterator because (a) M2 indexed
-    /// arenas may surface legacy multi-target rows, and (b)
-    /// policy-filtered visibility checks downstream may drop the only
-    /// candidate.
+    /// Time-travel-correct counterpart of [`Self::current_targets_for`].
+    pub fn current_targets_for_at<'a>(
+        &'a self,
+        ann: &'a Sid,
+        as_of_t: i64,
+    ) -> impl Iterator<Item = EdgeKey> + 'a {
+        self.reverse
+            .get(ann)
+            .map(|rows| {
+                latest_assertions_at::<_, _>(rows.iter(), |r| (&r.edge, r.t, r.op), as_of_t)
+            })
+            .into_iter()
+            .flatten()
+            .cloned()
+    }
+
+    /// Iterator over base [`EdgeKey`]s currently reified by
+    /// annotation `ann` against the live overlay state. See
+    /// [`Self::current_annotations_for`] for the time-travel-vs-
+    /// live distinction.
     pub fn current_targets_for<'a>(
         &'a self,
         ann: &'a Sid,
     ) -> impl Iterator<Item = EdgeKey> + 'a {
-        self.reverse
-            .get(ann)
-            .map(|rows| latest_assertions::<_, _>(rows.iter(), |r| (&r.edge, r.t, r.op)))
-            .into_iter()
-            .flatten()
-            .cloned()
+        self.current_targets_for_at(ann, i64::MAX)
     }
 
     /// Iterator over the *full* attachment history of `ann` —
@@ -244,26 +276,32 @@ impl AttachmentNovelty {
 }
 
 /// Walk a row sequence and yield each "other" position whose latest
-/// `(t, op)` event is currently asserted.
+/// `(t, op)` event with `t <= as_of_t` is currently asserted.
 ///
-/// Generic over both row types so both `current_annotations_for` and
-/// `current_targets_for` share the same implementation. Stable: when
-/// the same `(other, t)` appears twice (impossible in practice but
-/// not enforced by the type), the *last-encountered* `op` wins.
-fn latest_assertions<'a, R, T>(
+/// Generic over both row types so both `current_annotations_for_at`
+/// and `current_targets_for_at` share the same implementation. Rows
+/// with `t > as_of_t` are ignored entirely (so a future retract is
+/// invisible to a past view, and vice-versa). Stable: when the same
+/// `(other, t)` appears twice (impossible in practice but not
+/// enforced by the type), the *last-encountered* `op` wins.
+fn latest_assertions_at<'a, R, T>(
     rows: impl Iterator<Item = &'a R>,
     extract: impl Fn(&'a R) -> (&'a T, i64, bool),
+    as_of_t: i64,
 ) -> impl Iterator<Item = &'a T>
 where
     R: 'a,
     T: 'a + Ord + Clone,
 {
-    // Build a small map of "latest (t, op)" per `other`. A BTreeMap
-    // keyed on the `other` side gives a deterministic iteration order
-    // (good for tests and replay determinism).
+    // Build a small map of "latest visible (t, op)" per `other`. A
+    // BTreeMap keyed on the `other` side gives a deterministic
+    // iteration order (good for tests and replay determinism).
     let mut latest: BTreeMap<&'a T, (i64, bool)> = BTreeMap::new();
     for row in rows {
         let (other, t, op) = extract(row);
+        if t > as_of_t {
+            continue;
+        }
         latest
             .entry(other)
             .and_modify(|cur| {
@@ -346,6 +384,64 @@ mod tests {
         assert_eq!(history, vec![(5, true), (7, false)]);
         // has_annotations remains sticky — the index has been touched.
         assert!(overlay.has_annotations());
+    }
+
+    #[test]
+    fn current_annotations_for_at_respects_as_of_t() {
+        // Time-travel correctness: an annotation asserted at t=5 and
+        // retracted at t=7 must be visible to a view at t=5 or t=6,
+        // hidden at t=7+, and not yet visible at t=4.
+        let edge = sample_edge();
+        let ann = ann_sid("ann_a");
+
+        let mut overlay = AttachmentNovelty::new();
+        overlay.observe_flakes(&edge.to_reifies_facts(&ann, 5, true)).unwrap();
+        overlay.observe_flakes(&edge.to_reifies_facts(&ann, 7, false)).unwrap();
+
+        // Before any event: no rows visible.
+        let before: Vec<Sid> = overlay
+            .current_annotations_for_at(&edge, 4)
+            .collect();
+        assert!(before.is_empty(), "view at t=4 must not see t=5 assertion");
+
+        // At t=5 and t=6: assertion visible.
+        let at5: Vec<Sid> = overlay
+            .current_annotations_for_at(&edge, 5)
+            .collect();
+        assert_eq!(at5, vec![ann.clone()], "view at t=5 must see the assertion");
+        let at6: Vec<Sid> = overlay
+            .current_annotations_for_at(&edge, 6)
+            .collect();
+        assert_eq!(at6, vec![ann.clone()], "view at t=6 must still see it");
+
+        // At t=7+: retract takes effect.
+        let at7: Vec<Sid> = overlay
+            .current_annotations_for_at(&edge, 7)
+            .collect();
+        assert!(at7.is_empty(), "view at t=7 must see retraction");
+        let at_max: Vec<Sid> = overlay
+            .current_annotations_for_at(&edge, i64::MAX)
+            .collect();
+        assert!(at_max.is_empty(), "live view sees retraction too");
+
+        // Live `current_annotations_for` agrees with as-of MAX.
+        let live: Vec<Sid> = overlay.current_annotations_for(&edge).collect();
+        assert!(live.is_empty());
+    }
+
+    #[test]
+    fn current_targets_for_at_respects_as_of_t() {
+        // Counterpart for the reverse map.
+        let edge = sample_edge();
+        let ann = ann_sid("ann_a");
+
+        let mut overlay = AttachmentNovelty::new();
+        overlay.observe_flakes(&edge.to_reifies_facts(&ann, 5, true)).unwrap();
+
+        let at_4: Vec<EdgeKey> = overlay.current_targets_for_at(&ann, 4).collect();
+        assert!(at_4.is_empty());
+        let at_5: Vec<EdgeKey> = overlay.current_targets_for_at(&ann, 5).collect();
+        assert_eq!(at_5, vec![edge]);
     }
 
     #[test]

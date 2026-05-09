@@ -689,9 +689,13 @@ impl<'a> HydrationFormatter<'a> {
         visited: &'b mut HashSet<Sid>,
         cache: &'b mut HashMap<CacheKey, JsonValue>,
     ) -> Result<()> {
-        // Source the overlay's attachment index. M1b runtime: this
-        // is `Novelty::attachments`. M2 will combine indexed + novelty
-        // sources behind a snapshot-level helper.
+        // Source the overlay's attachment index. M1b limitation: only
+        // the novelty overlay is consulted — durable `f:reifies*`
+        // facts indexed into base storage produce no overlay rows
+        // until M2 introduces the indexed/arena-backed lookup.
+        // For ledgers whose annotations are still in novelty (the
+        // common case during M1) this gives the correct round-trip;
+        // a fully-indexed ledger would require the M2 path.
         let Some(novelty) = self
             .db
             .overlay
@@ -708,10 +712,14 @@ impl<'a> HydrationFormatter<'a> {
         let edge_key = fluree_db_core::edge::EdgeKey::from_flake(flake);
 
         // Collect annotation Sids first so we can release the borrow
-        // before recursive `format_subject` calls.
+        // before recursive `format_subject` calls. **Use the
+        // formatter's as-of `t`** — a historical view must see only
+        // attachment events with `t <= self.db.t`, so future
+        // retracts don't hide a past assertion and future asserts
+        // don't leak into a past view.
         let ann_sids: Vec<Sid> = novelty
             .attachments
-            .current_annotations_for(&edge_key)
+            .current_annotations_for_at(&edge_key, self.db.t)
             .collect();
         if ann_sids.is_empty() {
             return Ok(());

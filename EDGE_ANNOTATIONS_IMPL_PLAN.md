@@ -310,17 +310,31 @@ correctness items remaining):**
   among parallel annotations need IR support (matching by metadata)
   and aren't covered by the plain-edge cascade.
 - ✅ **JSON-LD subject-expansion `@annotation` output**
-  (`feat(M1b): @annotation in subject expansion`):
-  `format_predicate_values`'s `Ref` arm now downcasts the overlay to
+  (`feat(M1b): @annotation in subject expansion` +
+  `fix(M1b): @annotation output respects as-of t`):
+  `format_predicate_values`'s `Ref` arm downcasts the overlay to
   `Novelty`, builds an `EdgeKey` from `(flake.s, flake.p, flake.o)`,
-  and when `current_annotations_for(edge)` returns any Sids,
-  recursively hydrates each annotation subject and injects the
-  result as an `@annotation` key on the expanded value. Single
-  annotation renders as a bare object; multiple parallel
-  annotations render as an array. Anonymous (blank-node) annotation
-  SIDs have their `@id` stripped from the body since the synthetic
-  IRI isn't user-meaningful. The wildcard-hydration filter already
-  in place keeps `f:reifies*` out of the rendered annotation body.
+  and when `current_annotations_for_at(edge, self.db.t)` returns
+  any Sids, recursively hydrates each annotation subject and
+  injects the result as an `@annotation` key on the expanded
+  value. Time-travel-correct: a historical view at `t=N` only sees
+  attachment events with `t <= N`. Single annotation renders as a
+  bare object; multiple parallel annotations render as an array.
+  Anonymous (blank-node) annotation SIDs have their `@id` stripped
+  from the body. The wildcard-hydration filter keeps `f:reifies*`
+  out of the rendered body.
+
+  **M1b limitation: novelty-only.** The output path is
+  novelty-backed — it downcasts the overlay to
+  `fluree_db_novelty::Novelty` and reads `attachments`. Once a
+  ledger's annotation rows roll into base storage / a binary
+  arena (M2), this lookup returns nothing and the `@annotation`
+  output disappears, even though the durable `f:reifies*` facts
+  themselves remain queryable via normal scans. The M2 work
+  introduces an indexed/arena-backed lookup that the hydrator
+  consults alongside (or unified with) the novelty overlay. For
+  the M1 milestone — which is explicitly novelty-only end-to-end
+  — this is the documented behavior.
 - ⏳ **Broader `it_edge_annotations.rs` integration tests:** parallel
   annotations on one edge, multiplicity contract, cascade behavior,
   lifecycle (RDF default vs. LPG opt-in), restart-from-commits,
