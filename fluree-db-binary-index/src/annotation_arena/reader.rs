@@ -30,11 +30,21 @@
 //!
 //! Same model for reverse, swapping the routing key.
 //!
+//! ## Merging with novelty
+//!
+//! The arena holds events committed up to its `max_t`; an in-memory
+//! attachment overlay (e.g. `fluree_db_novelty::AttachmentNovelty`)
+//! holds events from after that point. The merged variants
+//! ([`AnnotationArenaReader::current_annotations_merged`] /
+//! [`AnnotationArenaReader::current_targets_merged`]) accept
+//! pre-collected `(other, t, op)` slices from the overlay and apply
+//! the same visibility filter across the union of events. This keeps
+//! `fluree-db-binary-index` decoupled from `fluree-db-novelty`:
+//! callers in higher-layer crates do the per-key event collection
+//! and hand it down.
+//!
 //! ## What this module is not
 //!
-//! - It does not merge with [`fluree_db_novelty::AttachmentNovelty`].
-//!   Slice 4b adds the merged-iterator API that combines indexed +
-//!   novelty state under a single `as_of_t` rule.
 //! - It does not validate the on-disk arena. Slice 5 adds the
 //!   storage-inspector path.
 
@@ -127,6 +137,98 @@ impl<'a, S: ContentStore + ?Sized> AnnotationArenaReader<'a, S> {
             }
             let leaf = self.load_reverse_leaf(&entry.leaf_cid).await?;
             collect_live_edges_from_reverse_leaf(&leaf, ann, as_of_t, &mut out);
+        }
+        Ok(out)
+    }
+
+    /// Merged forward lookup combining indexed arena events with
+    /// caller-provided novelty events. Returns annotations whose
+    /// latest event over the union (`t <= as_of_t`) is `op = true`.
+    ///
+    /// `novelty_events` should contain every overlay event for this
+    /// edge — typically collected via
+    /// `AttachmentNovelty::forward_history(edge)` in the caller's
+    /// crate. The merge applies one visibility pass over the union,
+    /// so an arena `op = true` followed by a novelty `op = false`
+    /// (or vice versa) resolves correctly without the caller doing
+    /// any pre-merging.
+    pub async fn current_annotations_merged(
+        &self,
+        edge: &EdgeKey,
+        novelty_events: &[(Sid, i64, bool)],
+        as_of_t: i64,
+    ) -> CoreResult<Vec<Sid>> {
+        let arena_events = self.collect_forward_events(edge, as_of_t).await?;
+        Ok(merge_live_annotations(
+            &arena_events,
+            novelty_events,
+            as_of_t,
+        ))
+    }
+
+    /// Merged reverse lookup combining indexed arena events with
+    /// caller-provided novelty events. See
+    /// [`Self::current_annotations_merged`] for the merge semantics.
+    pub async fn current_targets_merged(
+        &self,
+        ann: &Sid,
+        novelty_events: &[(EdgeKey, i64, bool)],
+        as_of_t: i64,
+    ) -> CoreResult<Vec<EdgeKey>> {
+        let arena_events = self.collect_reverse_events(ann, as_of_t).await?;
+        Ok(merge_live_edges(&arena_events, novelty_events, as_of_t))
+    }
+
+    /// Collect every forward event `(ann, t, op)` for the given edge
+    /// from the indexed arena, with `t <= as_of_t`. Used internally by
+    /// the merged path; exposed in case callers want to build their
+    /// own merge logic.
+    pub async fn collect_forward_events(
+        &self,
+        edge: &EdgeKey,
+        as_of_t: i64,
+    ) -> CoreResult<Vec<(Sid, i64, bool)>> {
+        let branch = self.load_forward_branch().await?;
+        let mut out: Vec<(Sid, i64, bool)> = Vec::new();
+        for entry in &branch.leaves {
+            if entry.last_edge < *edge {
+                continue;
+            }
+            if entry.first_edge > *edge {
+                break;
+            }
+            let leaf = self.load_forward_leaf(&entry.leaf_cid).await?;
+            for row in &leaf.rows {
+                if row.edge == *edge && row.t <= as_of_t {
+                    out.push((row.ann.clone(), row.t, row.op));
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    /// Collect every reverse event `(edge, t, op)` for the given
+    /// annotation from the indexed arena, with `t <= as_of_t`.
+    pub async fn collect_reverse_events(
+        &self,
+        ann: &Sid,
+        as_of_t: i64,
+    ) -> CoreResult<Vec<(EdgeKey, i64, bool)>> {
+        let branch = self.load_reverse_branch().await?;
+        let mut out: Vec<(EdgeKey, i64, bool)> = Vec::new();
+        for entry in &branch.leaves {
+            if entry.last_ann < *ann {
+                continue;
+            }
+            if entry.first_ann > *ann {
+                break;
+            }
+            let leaf = self.load_reverse_leaf(&entry.leaf_cid).await?;
+            for row in &leaf.rows {
+                if row.ann == *ann && row.t <= as_of_t {
+                    out.push((row.edge.clone(), row.t, row.op));
+                }
+            }
         }
         Ok(out)
     }
@@ -243,6 +345,78 @@ fn collect_live_anns_from_forward_leaf(
             out.push(group_ann);
         }
     }
+}
+
+/// Merge indexed + novelty events for one edge under one visibility
+/// pass. Per-`(edge, ann)` pair, the latest event with `t <= as_of_t`
+/// determines liveness. The arena and novelty event lists are not
+/// required to be sorted or deduplicated — duplicate `(ann, t)`
+/// entries are tolerated; later occurrences with the same `t` win on
+/// the `op` axis (`false < true` so an assert at the same `t` as a
+/// retract wins, matching the on-disk sort tie-break).
+fn merge_live_annotations(
+    arena: &[(Sid, i64, bool)],
+    novelty: &[(Sid, i64, bool)],
+    as_of_t: i64,
+) -> Vec<Sid> {
+    use std::collections::BTreeMap;
+    let mut latest: BTreeMap<Sid, (i64, bool)> = BTreeMap::new();
+    let consider = |latest: &mut BTreeMap<Sid, (i64, bool)>, ann: &Sid, t: i64, op: bool| {
+        if t > as_of_t {
+            return;
+        }
+        latest
+            .entry(ann.clone())
+            .and_modify(|cur| {
+                if (t, op) >= (cur.0, cur.1) {
+                    *cur = (t, op);
+                }
+            })
+            .or_insert((t, op));
+    };
+    for (ann, t, op) in arena {
+        consider(&mut latest, ann, *t, *op);
+    }
+    for (ann, t, op) in novelty {
+        consider(&mut latest, ann, *t, *op);
+    }
+    latest
+        .into_iter()
+        .filter_map(|(ann, (_, op))| if op { Some(ann) } else { None })
+        .collect()
+}
+
+fn merge_live_edges(
+    arena: &[(EdgeKey, i64, bool)],
+    novelty: &[(EdgeKey, i64, bool)],
+    as_of_t: i64,
+) -> Vec<EdgeKey> {
+    use std::collections::BTreeMap;
+    let mut latest: BTreeMap<EdgeKey, (i64, bool)> = BTreeMap::new();
+    let consider =
+        |latest: &mut BTreeMap<EdgeKey, (i64, bool)>, edge: &EdgeKey, t: i64, op: bool| {
+            if t > as_of_t {
+                return;
+            }
+            latest
+                .entry(edge.clone())
+                .and_modify(|cur| {
+                    if (t, op) >= (cur.0, cur.1) {
+                        *cur = (t, op);
+                    }
+                })
+                .or_insert((t, op));
+        };
+    for (edge, t, op) in arena {
+        consider(&mut latest, edge, *t, *op);
+    }
+    for (edge, t, op) in novelty {
+        consider(&mut latest, edge, *t, *op);
+    }
+    latest
+        .into_iter()
+        .filter_map(|(edge, (_, op))| if op { Some(edge) } else { None })
+        .collect()
 }
 
 fn collect_live_edges_from_reverse_leaf(
@@ -528,6 +702,133 @@ mod tests {
         // Cache should hold one branch + at least one leaf.
         assert!(reader.forward_branch.lock().is_some());
         assert!(!reader.forward_leaves.lock().is_empty());
+    }
+
+    #[tokio::test]
+    async fn merge_arena_assert_with_novelty_retract_resolves_to_not_live() {
+        // Arena holds (edge, ann_a) attached at t=1.
+        // Novelty holds (edge, ann_a) retracted at t=5.
+        // Merged view: ann_a is not live.
+        let flakes = make_bundle("ann_a", "alice", "worksFor", "acme", 1, true);
+        let store = MemoryContentStore::new();
+        let root = build_and_store(&flakes, DEFAULT_TARGET_ROWS_PER_LEAF, &store).await;
+        let reader = AnnotationArenaReader::new(&root, &store);
+
+        let edge = EdgeKey {
+            g: None,
+            s: ref_sid("alice"),
+            p: ref_sid("worksFor"),
+            o: FlakeValue::Ref(ref_sid("acme")),
+            dt: id_dt(),
+            lang: None,
+            list_i: None,
+        };
+
+        // Indexed-only path still sees ann_a as live.
+        let indexed = reader.current_annotations_for(&edge, 100).await.unwrap();
+        assert_eq!(indexed, vec![ann_sid("ann_a")]);
+
+        // Merged with novelty retract: not live.
+        let novelty = vec![(ann_sid("ann_a"), 5, false)];
+        let merged = reader
+            .current_annotations_merged(&edge, &novelty, 100)
+            .await
+            .unwrap();
+        assert!(merged.is_empty(), "novelty retract overrides arena assert");
+
+        // As-of t=4 — novelty retract not yet visible — ann_a still live.
+        let merged_t4 = reader
+            .current_annotations_merged(&edge, &novelty, 4)
+            .await
+            .unwrap();
+        assert_eq!(merged_t4, vec![ann_sid("ann_a")]);
+    }
+
+    #[tokio::test]
+    async fn merge_novelty_only_attachment_visible() {
+        // Empty arena, novelty has the only event. Merged view sees it.
+        let store = MemoryContentStore::new();
+        let root = build_and_store(&[], DEFAULT_TARGET_ROWS_PER_LEAF, &store).await;
+        let reader = AnnotationArenaReader::new(&root, &store);
+
+        let edge = EdgeKey {
+            g: None,
+            s: ref_sid("alice"),
+            p: ref_sid("worksFor"),
+            o: FlakeValue::Ref(ref_sid("acme")),
+            dt: id_dt(),
+            lang: None,
+            list_i: None,
+        };
+        let novelty = vec![(ann_sid("ann_new"), 10, true)];
+        let merged = reader
+            .current_annotations_merged(&edge, &novelty, 100)
+            .await
+            .unwrap();
+        assert_eq!(merged, vec![ann_sid("ann_new")]);
+    }
+
+    #[tokio::test]
+    async fn merge_reverse_arena_assert_then_novelty_retarget() {
+        // Arena: ann_x reifies edge_a (t=1, asserted).
+        // Novelty: ann_x retracts edge_a at t=5, asserts edge_b at t=6.
+        // Merged: ann_x currently reifies edge_b only.
+        let flakes = make_bundle("ann_x", "alice", "worksFor", "acme", 1, true);
+        let store = MemoryContentStore::new();
+        let root = build_and_store(&flakes, DEFAULT_TARGET_ROWS_PER_LEAF, &store).await;
+        let reader = AnnotationArenaReader::new(&root, &store);
+
+        let edge_a = EdgeKey {
+            g: None,
+            s: ref_sid("alice"),
+            p: ref_sid("worksFor"),
+            o: FlakeValue::Ref(ref_sid("acme")),
+            dt: id_dt(),
+            lang: None,
+            list_i: None,
+        };
+        let edge_b = EdgeKey {
+            g: None,
+            s: ref_sid("bob"),
+            p: ref_sid("worksFor"),
+            o: FlakeValue::Ref(ref_sid("acme")),
+            dt: id_dt(),
+            lang: None,
+            list_i: None,
+        };
+        let novelty = vec![(edge_a.clone(), 5, false), (edge_b.clone(), 6, true)];
+        let merged = reader
+            .current_targets_merged(&ann_sid("ann_x"), &novelty, 100)
+            .await
+            .unwrap();
+        assert_eq!(merged, vec![edge_b]);
+    }
+
+    #[tokio::test]
+    async fn merge_collect_events_returns_only_below_as_of_t() {
+        // collect_forward_events / collect_reverse_events filter by
+        // as_of_t before returning. Future events must not leak.
+        let mut flakes = Vec::new();
+        flakes.extend(make_bundle("ann_a", "alice", "worksFor", "acme", 5, true));
+        flakes.extend(make_bundle("ann_b", "alice", "worksFor", "acme", 10, true));
+        let store = MemoryContentStore::new();
+        let root = build_and_store(&flakes, DEFAULT_TARGET_ROWS_PER_LEAF, &store).await;
+        let reader = AnnotationArenaReader::new(&root, &store);
+
+        let edge = EdgeKey {
+            g: None,
+            s: ref_sid("alice"),
+            p: ref_sid("worksFor"),
+            o: FlakeValue::Ref(ref_sid("acme")),
+            dt: id_dt(),
+            lang: None,
+            list_i: None,
+        };
+        let at_t7 = reader.collect_forward_events(&edge, 7).await.unwrap();
+        assert_eq!(at_t7.len(), 1);
+        assert_eq!(at_t7[0].0, ann_sid("ann_a"));
+        let at_t100 = reader.collect_forward_events(&edge, 100).await.unwrap();
+        assert_eq!(at_t100.len(), 2);
     }
 
     #[tokio::test]
