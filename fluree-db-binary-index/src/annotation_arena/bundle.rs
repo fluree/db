@@ -42,7 +42,6 @@
 
 use super::builder::{
     build_forward_leaves, build_reverse_leaves, ForwardLeafSummary, ReverseLeafSummary,
-    DEFAULT_TARGET_ROWS_PER_LEAF,
 };
 use super::format::{AnnotationForwardRow, AnnotationReverseRow};
 use fluree_db_core::{AnnotationStats, EdgeKey, Flake, Sid};
@@ -219,6 +218,7 @@ fn compute_stats(
 
 #[cfg(test)]
 mod tests {
+    use super::super::builder::DEFAULT_TARGET_ROWS_PER_LEAF;
     use super::*;
     use fluree_db_core::{FlakeValue, Sid};
     use fluree_vocab::db as db_predicates;
