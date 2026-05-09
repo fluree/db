@@ -518,7 +518,8 @@ async fn first_annotation_through_incremental_index_flips_has_annotations() {
     //   3. Reindex (incremental path clones the old root) →
     //      indexed root MUST flip `has_annotations` to `true`.
     //   4. Retract the base edge → the cascade gate must NOT
-    //      short-circuit (would skip if either bit were false).
+    //      short-circuit (it skips only when both snapshot and
+    //      novelty annotation flags are false).
     //   5. Re-insert the base edge alone, query @reifies → zero
     //      rows (cascade actually fired and retracted the bundle).
     let fluree = FlureeBuilder::memory()
