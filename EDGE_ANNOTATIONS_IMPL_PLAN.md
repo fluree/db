@@ -311,6 +311,14 @@ correctness items remaining):**
   and aren't covered by the plain-edge cascade.
 - ⏳ **JSON-LD subject-expansion output:** emit `@annotation` blocks
   when materializing an annotated edge through subject expansion.
+  Implementation sketch: thread `AttachmentNovelty` into the
+  `Hydrator` struct, and in `format_predicate_values`'s `Ref` arm
+  build an `EdgeKey` from `(flake.s, flake.p, flake.o)`, look up
+  `current_annotations_for(edge)`, and when present recursively
+  hydrate the annotation subject with the system-fact filter (now
+  in place) and inject the result as an `@annotation` key on the
+  expanded value. Multiple parallel annotations produce an array.
+  Anonymous annotation SIDs render without `@id` in the output.
 - ⏳ **Broader `it_edge_annotations.rs` integration tests:** parallel
   annotations on one edge, multiplicity contract, cascade behavior,
   lifecycle (RDF default vs. LPG opt-in), restart-from-commits,
