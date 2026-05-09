@@ -27,6 +27,11 @@ use fluree_db_binary_index::annotation_arena::{
     build_arenas_from_event_pairs, build_forward_branch, build_reverse_branch,
     AnnotationArenaReader, DEFAULT_TARGET_ROWS_PER_LEAF,
 };
+// Note: collect_all_forward_events was used when this module merged
+// the previous arena's events into a delta. The current contract is
+// that callers pass the complete event history (typically from
+// AttachmentNovelty.iter_event_pairs()), so the previous arena
+// participates only for GC reachability via all_leaf_cids.
 use fluree_db_core::storage::ContentStore;
 use fluree_db_core::{AnnotationIndexRoot, ContentKind, EdgeKey, Sid};
 use std::sync::Arc;
@@ -49,55 +54,55 @@ pub struct PersistedArenaResult {
     pub replaced_leaf_cids: Vec<fluree_db_core::ContentId>,
 }
 
-/// Build a new annotation arena from the union of the previous arena
-/// (when `previous_index` is `Some`) and the in-memory overlay events.
+/// Build and persist an annotation arena from a complete event set.
 ///
-/// Writes the resulting forward + reverse leaf and branch blobs to
-/// CAS and returns the populated [`AnnotationIndexRoot`] plus the
-/// previous arena's leaf CIDs (for GC bookkeeping) in
-/// [`PersistedArenaResult`].
+/// Writes forward + reverse leaf and branch blobs to CAS and returns
+/// the populated [`AnnotationIndexRoot`] plus the previous arena's
+/// leaf CIDs (for GC bookkeeping) in [`PersistedArenaResult`].
+///
+/// ## Contract: `events` is the complete history, not a delta
+///
+/// `events` must contain every `f:reifies*` attachment event the new
+/// snapshot should publish — typically the running ledger's full
+/// `AttachmentNovelty.iter_event_pairs()` (which preserves events
+/// across reindexes), clipped to `t <= IndexRoot.index_t`. The arena
+/// is rebuilt from scratch from this set; the previous arena
+/// participates **only** for GC reachability — its leaf CIDs are
+/// returned in `replaced_leaf_cids` so callers can record them as
+/// reclaimable.
+///
+/// This rebuild-from-scratch contract is safer than a delta merge:
+/// the api-side `AttachmentNovelty` accumulates events across
+/// reindexes (no `clear_up_to` on attachments), so a "delta" + "base
+/// arena" merge would double-count any event indexed in a prior pass.
 ///
 /// Returns `Ok(PersistedArenaResult { new_index: None, .. })` only
-/// when **both** sources are empty AND there is no previous arena —
+/// when **both** `events` is empty AND there is no previous arena —
 /// preserving the "zero attachments" guarantee for non-annotation
-/// ledgers. If `previous_index` is `Some`, the new index will always
-/// be `Some` too (possibly with empty arenas), so readers don't see a
-/// regression in the truth-table state.
-///
-/// `novelty_events` is the post-base-root attachment delta as
-/// `(edge, ann, t, op)` tuples — typically collected from the running
-/// ledger's `AttachmentNovelty.iter_event_pairs()` and threaded into
-/// the indexer through `IndexerConfig.attachment_events`. Decoupling
-/// the function from the concrete `AttachmentNovelty` type keeps the
-/// indexer free of a `fluree-db-novelty` runtime dep on this code
-/// path.
+/// ledgers. When the previous arena is `Some` and `events` is empty,
+/// the new root advertises an empty arena (still authoritative —
+/// empty events explicitly assert "no attachments live anywhere").
 pub async fn build_and_persist_annotation_arena(
     content_store: &Arc<dyn ContentStore>,
     previous_index: Option<&AnnotationIndexRoot>,
-    novelty_events: Vec<(EdgeKey, Sid, i64, bool)>,
+    events: Vec<(EdgeKey, Sid, i64, bool)>,
 ) -> Result<PersistedArenaResult> {
-    if previous_index.is_none() && novelty_events.is_empty() {
+    if previous_index.is_none() && events.is_empty() {
         return Ok(PersistedArenaResult::default());
     }
 
-    let mut combined = novelty_events;
-    let mut replaced_leaf_cids: Vec<fluree_db_core::ContentId> = Vec::new();
-    if let Some(prev) = previous_index {
-        let reader = AnnotationArenaReader::new(prev, content_store.as_ref());
-        // Collect both the events (for the merge) and every leaf CID
-        // referenced by the previous arena (for GC reachability).
-        // Two branches × N leaves each — same set of CAS reads either
-        // way; we just record the CIDs from the loaded branches.
-        let prev_events = reader
-            .collect_all_forward_events()
-            .await
-            .map_err(IndexerError::Core)?;
-        combined.reserve(prev_events.len());
-        combined.extend(prev_events);
-        replaced_leaf_cids = reader.all_leaf_cids().await.map_err(IndexerError::Core)?;
-    }
+    // Collect previous-arena leaf CIDs for GC. We do NOT merge the
+    // previous arena's events with `events` — `events` is the
+    // complete history per the contract above.
+    let replaced_leaf_cids: Vec<fluree_db_core::ContentId> = match previous_index {
+        Some(prev) => {
+            let reader = AnnotationArenaReader::new(prev, content_store.as_ref());
+            reader.all_leaf_cids().await.map_err(IndexerError::Core)?
+        }
+        None => Vec::new(),
+    };
 
-    let out = build_arenas_from_event_pairs(combined, DEFAULT_TARGET_ROWS_PER_LEAF);
+    let out = build_arenas_from_event_pairs(events, DEFAULT_TARGET_ROWS_PER_LEAF);
 
     // Forward leaves first.
     let mut fwd_pairs = Vec::with_capacity(out.forward_leaves.len());
@@ -210,11 +215,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn empty_event_vec_seals_authoritative_arena_with_no_changes() {
-        // `Some(vec![])` ≠ `None`. The caller has explicitly
-        // confirmed there are no new events since the base arena.
-        // The merge produces the same row set as the base, but a
-        // fresh arena gets written so readers can prefer it.
+    async fn empty_events_with_previous_arena_seals_empty_arena() {
+        // Under the complete-history contract, `Some(vec![])`
+        // explicitly asserts "no attachments live anywhere." The
+        // new arena is empty — the previous arena's content is
+        // NOT merged in. This is the correct shape for a ledger
+        // whose attachments were all retracted between passes.
         let store: Arc<dyn ContentStore> = Arc::new(MemoryContentStore::new());
         let first = build_and_persist_annotation_arena(
             &store,
@@ -228,18 +234,15 @@ mod tests {
         let second = build_and_persist_annotation_arena(&store, Some(&prev), Vec::new())
             .await
             .unwrap();
-        let new_index = second.new_index.expect("empty-delta still seals an arena");
-        assert_eq!(new_index.stats.forward_rows, 1);
-        assert_eq!(new_index.stats.distinct_edges, 1);
+        let new_index = second.new_index.expect("empty-events still seals an arena");
+        assert_eq!(
+            new_index.stats.forward_rows, 0,
+            "empty events → empty arena under complete-history contract"
+        );
+        assert_eq!(new_index.stats.distinct_edges, 0);
 
-        // Live read confirms the merged arena reflects the same state
-        // as the base.
-        let reader = AnnotationArenaReader::new(&new_index, store.as_ref());
-        let live = reader
-            .current_annotations_for(&edge("alice", "worksFor", "acme"), 100)
-            .await
-            .unwrap();
-        assert_eq!(live, vec![ann("ann_1")]);
+        // Previous arena's leaves are still recorded for GC.
+        assert_eq!(second.replaced_leaf_cids.len(), 2);
     }
 
     #[tokio::test]
@@ -267,7 +270,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn merging_with_previous_arena_yields_replaced_leaf_cids() {
+    async fn rebuilds_from_complete_history_with_previous_arena_only_for_gc() {
+        // Contract: `events` is the COMPLETE history. The previous
+        // arena participates only for GC reachability — its events
+        // are NOT merged in.
         let store: Arc<dyn ContentStore> = Arc::new(MemoryContentStore::new());
 
         // First seal: ann_1 attached at t=5.
@@ -280,43 +286,77 @@ mod tests {
         .unwrap();
         let prev = first.new_index.expect("first seal produces an arena");
 
-        // Snapshot the previous leaf CIDs so we can compare.
         let reader = AnnotationArenaReader::new(&prev, store.as_ref());
         let prev_leaves: std::collections::HashSet<_> =
             reader.all_leaf_cids().await.unwrap().into_iter().collect();
         assert_eq!(prev_leaves.len(), 2, "one forward + one reverse leaf");
 
-        // Second seal: novelty retracts ann_1 at t=8. The merge
-        // should yield a 2-row arena (assert + retract) and report
-        // every CID from the previous arena as replaced.
+        // Second seal: complete history is the original assert PLUS
+        // a retract at t=8. Caller passes BOTH events, not just the
+        // delta.
         let second = build_and_persist_annotation_arena(
             &store,
             Some(&prev),
-            vec![(edge("alice", "worksFor", "acme"), ann("ann_1"), 8, false)],
+            vec![
+                (edge("alice", "worksFor", "acme"), ann("ann_1"), 5, true),
+                (edge("alice", "worksFor", "acme"), ann("ann_1"), 8, false),
+            ],
         )
         .await
         .unwrap();
         let new_index = second.new_index.expect("second seal");
         assert_eq!(new_index.max_t, 8);
-        assert_eq!(new_index.stats.forward_rows, 2);
+        assert_eq!(
+            new_index.stats.forward_rows, 2,
+            "rebuild reflects the complete history, no double-count"
+        );
         assert_eq!(
             new_index.stats.distinct_edges, 0,
             "ann_1 retracted → not live"
         );
 
+        // Previous arena's leaves recorded for GC.
         let replaced: std::collections::HashSet<_> =
             second.replaced_leaf_cids.iter().cloned().collect();
-        assert_eq!(
-            replaced, prev_leaves,
-            "replaced_leaf_cids must enumerate every leaf from the previous arena"
-        );
+        assert_eq!(replaced, prev_leaves);
 
-        // Live read of the merged arena: ann_1 not visible at t=100.
+        // Live read: ann_1 not visible at t=100.
         let reader = AnnotationArenaReader::new(&new_index, store.as_ref());
         let live = reader
             .current_annotations_for(&edge("alice", "worksFor", "acme"), 100)
             .await
             .unwrap();
-        assert!(live.is_empty(), "retract overrides assert in merged arena");
+        assert!(live.is_empty());
+    }
+
+    #[tokio::test]
+    async fn rebuild_does_not_double_count_when_caller_supplies_complete_history() {
+        // If a caller mistakenly passed only a delta, the previous
+        // arena's events would be missed but the rebuild stays
+        // self-consistent. Here we verify the no-merge contract
+        // explicitly: identical input → identical row count.
+        let store: Arc<dyn ContentStore> = Arc::new(MemoryContentStore::new());
+
+        let events = vec![
+            (edge("alice", "worksFor", "acme"), ann("ann_1"), 5, true),
+            (edge("alice", "worksFor", "acme"), ann("ann_2"), 6, true),
+        ];
+
+        let first = build_and_persist_annotation_arena(&store, None, events.clone())
+            .await
+            .unwrap();
+        let prev = first.new_index.unwrap();
+        assert_eq!(prev.stats.forward_rows, 2);
+
+        // Re-seal with the same complete history. The prev arena is
+        // present but its events are NOT merged — total stays at 2.
+        let second = build_and_persist_annotation_arena(&store, Some(&prev), events)
+            .await
+            .unwrap();
+        let new_index = second.new_index.unwrap();
+        assert_eq!(
+            new_index.stats.forward_rows, 2,
+            "previous arena must not be merged into the rebuild"
+        );
     }
 }

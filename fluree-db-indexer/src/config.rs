@@ -201,19 +201,25 @@ pub struct IndexerConfig {
 
     /// Edge-annotation attachment events to seal into the new arena.
     ///
-    /// `(edge, ann_sid, t, op)` tuples covering every `f:reifies*`
-    /// event observed since the base index — sourced from the running
+    /// `(edge, ann_sid, t, op)` tuples — the **complete event history**
+    /// the new snapshot should publish, sourced from the running
     /// ledger's `AttachmentNovelty.iter_event_pairs()`. The indexer
-    /// merges these with the base root's arena (when present) and
-    /// writes the resulting forward + reverse arena blobs to CAS.
+    /// rebuilds the arena from scratch from this set; the previous
+    /// arena (when present) participates only for GC reachability.
+    ///
+    /// The complete-history contract is correct because the api-side
+    /// `AttachmentNovelty` preserves attachment events across
+    /// reindexes (`clear_up_to` does not trim attachments), so the
+    /// running overlay always carries the full history.
     ///
     /// **Semantics — `None` means delta is unknown, not empty.**
     ///
     /// - `Some(events)` (including `Some(vec![])`): the caller has
-    ///   determined the exact attachment delta since the base root.
-    ///   The indexer seals an authoritative arena. Readers downstream
-    ///   prefer this arena over the scan path.
-    /// - `None`: the caller could not produce the delta this pass.
+    ///   determined the exact event set. The indexer seals an
+    ///   authoritative arena (possibly empty) with `max_t` clipped
+    ///   to `IndexRoot.index_t`. Readers prefer this arena over the
+    ///   scan path.
+    /// - `None`: the caller could not produce the history this pass.
     ///   The indexer treats this as **delta unknown**: when the
     ///   base root carries an `annotation_index`, the new root drops
     ///   it (recording the old branch + leaf CIDs as replaced for GC)
