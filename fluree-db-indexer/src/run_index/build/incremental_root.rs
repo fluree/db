@@ -209,14 +209,24 @@ impl IncrementalRootBuilder {
     /// `fluree_db_core::annotation_index`), so callers don't need to
     /// flip the sticky bit separately.
     ///
-    /// The previous arena's branch CIDs (if any) are tracked as
-    /// replaced so GC can reclaim the old leaf blobs once a new root
-    /// supersedes the chain.
-    pub fn set_annotation_index(&mut self, new_index: Option<fluree_db_core::AnnotationIndexRoot>) {
+    /// `previous_leaf_cids` must enumerate **every** leaf CID
+    /// referenced by the arena currently in `root.annotation_index`.
+    /// `ContentStore::release` deletes exact CIDs (not child graphs),
+    /// so without this list the old leaves leak when the new root
+    /// supersedes the chain. The orchestrator computes this set by
+    /// loading the previous forward + reverse branches and walking
+    /// their entries; pass an empty `Vec` when there's no previous
+    /// arena. Old branch CIDs are recorded automatically.
+    pub fn set_annotation_index(
+        &mut self,
+        new_index: Option<fluree_db_core::AnnotationIndexRoot>,
+        previous_leaf_cids: Vec<ContentId>,
+    ) {
         if let Some(prev) = self.root.annotation_index.as_ref() {
             self.replaced_cids.push(prev.forward_branch_cid.clone());
             self.replaced_cids.push(prev.reverse_branch_cid.clone());
         }
+        self.replaced_cids.extend(previous_leaf_cids);
         self.root.annotation_index = new_index;
     }
 

@@ -233,6 +233,20 @@ impl<'a, S: ContentStore + ?Sized> AnnotationArenaReader<'a, S> {
         Ok(out)
     }
 
+    /// Collect every leaf CID referenced by the arena's forward and
+    /// reverse branches. Used by the indexer's GC bookkeeping when
+    /// replacing an arena: the new root supersedes the old, and
+    /// `ContentStore::release` needs exact CIDs (not child graphs)
+    /// to reclaim each old leaf.
+    pub async fn all_leaf_cids(&self) -> CoreResult<Vec<ContentId>> {
+        let fwd = self.load_forward_branch().await?;
+        let rev = self.load_reverse_branch().await?;
+        let mut out: Vec<ContentId> = Vec::with_capacity(fwd.leaves.len() + rev.leaves.len());
+        out.extend(fwd.leaves.iter().map(|e| e.leaf_cid.clone()));
+        out.extend(rev.leaves.iter().map(|e| e.leaf_cid.clone()));
+        Ok(out)
+    }
+
     /// Walk every forward-arena row in sort order and yield it as a
     /// `(EdgeKey, ann, t, op)` event tuple. Used by the indexer's
     /// arena-rebuild path when merging the previous arena with a

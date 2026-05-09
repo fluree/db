@@ -388,6 +388,18 @@ struct HydrationFormatter<'a> {
     policy: Option<&'a PolicyContext>,
     /// Optional execution tracker for fuel/policy tracking.
     tracker: Option<&'a Tracker>,
+    /// Single arena reader reused across every annotation lookup in
+    /// this response. Constructed once on `new()` when the snapshot
+    /// satisfies `has_arena_reader()`. Holds the loaded forward /
+    /// reverse branches plus a per-CID leaf cache, so successive
+    /// edge lookups amortize the CAS reads. `None` falls back to the
+    /// scan path in `inject_annotations`.
+    arena_reader: Option<
+        fluree_db_binary_index::annotation_arena::AnnotationArenaReader<
+            'a,
+            dyn fluree_db_core::storage::ContentStore,
+        >,
+    >,
 }
 
 impl<'a> HydrationFormatter<'a> {
@@ -398,6 +410,22 @@ impl<'a> HydrationFormatter<'a> {
         policy: Option<&'a PolicyContext>,
         tracker: Option<&'a Tracker>,
     ) -> Self {
+        // Cache one arena reader for the whole response so successive
+        // edge lookups share branch + leaf caches. Constructed only
+        // when both `annotation_index` and `content_store` are set on
+        // the snapshot — otherwise the scan path runs.
+        let arena_reader = match (
+            db.snapshot.annotation_index.as_ref(),
+            db.snapshot.content_store.as_ref(),
+        ) {
+            (Some(root), Some(store)) => Some(
+                fluree_db_binary_index::annotation_arena::AnnotationArenaReader::new(
+                    root,
+                    store.as_ref(),
+                ),
+            ),
+            _ => None,
+        };
         Self {
             db,
             compactor,
@@ -405,6 +433,7 @@ impl<'a> HydrationFormatter<'a> {
             normalize_arrays: config.normalize_arrays,
             policy,
             tracker,
+            arena_reader,
         }
     }
 
@@ -695,14 +724,15 @@ impl<'a> HydrationFormatter<'a> {
         // Find the EdgeKey from the base flake.
         let edge_key = fluree_db_core::edge::EdgeKey::from_flake(flake);
 
-        // Arena-backed fast path: when the snapshot has both an
-        // on-disk arena and a CAS handle, look up live annotation
+        // Arena-backed fast path: when the formatter holds a cached
+        // arena reader (constructed in `new()` from the snapshot's
+        // annotation_index + content_store), look up live annotation
         // SIDs directly via the merged reader. The novelty events
-        // come from the overlay (downcast from the OverlayProvider
-        // since AttachmentNovelty is the concrete novelty type's
-        // sidecar). On any precondition mismatch we fall through
-        // to the M2a scan path below.
-        if self.db.snapshot.has_arena_reader() {
+        // come from the overlay (downcast to the concrete `Novelty`
+        // type since `AttachmentNovelty` is its sidecar). On any
+        // precondition mismatch we fall through to the M2a scan path
+        // below.
+        if self.arena_reader.is_some() {
             if let Some(ann_sids) = self.arena_lookup_annotations(&edge_key).await? {
                 if ann_sids.is_empty() {
                     return Ok(());
@@ -817,36 +847,35 @@ impl<'a> HydrationFormatter<'a> {
 
     /// Arena-backed annotation lookup. Returns `Some(sids)` when the
     /// arena reader resolved the query, `None` when a precondition
-    /// failed (no annotation index, no content store, or the overlay
-    /// is not the expected concrete novelty type) — caller falls back
-    /// to the M2a scan path.
+    /// failed (no cached reader, or the overlay is not the expected
+    /// concrete novelty type) — caller falls back to the M2a scan
+    /// path.
+    ///
+    /// Reuses the formatter's cached `arena_reader` so successive
+    /// edge lookups in the same response amortize branch + leaf
+    /// loads.
     async fn arena_lookup_annotations(
         &self,
         edge_key: &fluree_db_core::edge::EdgeKey,
     ) -> Result<Option<Vec<Sid>>> {
-        let Some(ann_root) = self.db.snapshot.annotation_index.as_ref() else {
-            return Ok(None);
-        };
-        let Some(store) = self.db.snapshot.content_store.as_ref() else {
+        let Some(reader) = self.arena_reader.as_ref() else {
             return Ok(None);
         };
         // Downcast the overlay to the concrete `Novelty` so we can
         // reach `AttachmentNovelty`. If the overlay isn't `Novelty`
-        // (test fakes, future overlay types), fall through to the
-        // scan path rather than error.
-        let novelty = self
+        // (test fakes, future overlay types), bail to the scan path
+        // — proceeding with an empty novelty event slice would let
+        // the arena report stale indexed attachments while the
+        // overlay still holds unobserved retracts.
+        let Some(novelty) = self
             .db
             .overlay
             .as_any()
-            .downcast_ref::<fluree_db_novelty::Novelty>();
-        let novelty_events: Vec<(Sid, i64, bool)> = match novelty {
-            Some(n) => n.attachments.collect_forward_events(edge_key),
-            None => Vec::new(),
+            .downcast_ref::<fluree_db_novelty::Novelty>()
+        else {
+            return Ok(None);
         };
-        let reader = fluree_db_binary_index::annotation_arena::AnnotationArenaReader::new(
-            ann_root,
-            store.as_ref(),
-        );
+        let novelty_events = novelty.attachments.collect_forward_events(edge_key);
         let live = reader
             .current_annotations_merged(edge_key, &novelty_events, self.db.t)
             .await
