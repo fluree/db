@@ -36,6 +36,7 @@ pub mod datatype_constraint;
 pub mod datatypes;
 pub mod db;
 pub mod dict_novelty;
+pub mod edge;
 pub mod error;
 pub mod flake;
 pub mod geo;
@@ -126,7 +127,12 @@ pub use namespaces::{
     is_owl_object_property_class, is_owl_ontology_class, is_owl_same_as, is_owl_symmetric_property,
     is_owl_transitive_property, is_rdf_first, is_rdf_nil, is_rdf_property_class, is_rdf_rest,
     is_rdf_type, is_rdfs_domain, is_rdfs_range, is_rdfs_subclass_of, is_rdfs_subproperty_of,
-    is_schema_class, is_schema_predicate,
+    is_reifies_datatype, is_reifies_graph, is_reifies_lang, is_reifies_list_index,
+    is_reifies_object, is_reifies_predicate, is_reifies_subject, is_reserved_reifies_predicate,
+    is_schema_class, is_schema_predicate, reifies_predicate_sids,
+};
+pub use edge::{
+    id_datatype_sid, xsd_string_datatype_sid, EdgeKey, EdgeKeyDecodeError,
 };
 pub use nonempty::NonEmpty;
 pub use ns_encoding::{

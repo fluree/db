@@ -1598,6 +1598,78 @@ pub mod db {
 
     /// db:ledgerIndex - nameservice field: pointer to latest ledger index root
     pub const LEDGER_INDEX: &str = "ledgerIndex";
+
+    // ========================================================================
+    // Edge-annotation system predicates (durable attachment encoding)
+    // ========================================================================
+    //
+    // System-controlled predicates that record the (graph, subject,
+    // predicate, object, datatype, lang, list-index) of the base triple
+    // an annotation reifies. **User transactions cannot assert or
+    // retract these directly** — they are emitted only by the internal
+    // `@annotation` / `@reifies` lowering path. See
+    // `EDGE_ANNOTATIONS.md` and the `EDGE_ANNOTATIONS_IMPL_PLAN.md` M1
+    // section for the full contract.
+
+    /// db:reifiesGraph - the named graph the reified edge lives in.
+    /// Omitted entirely for default-graph edges (absence = default).
+    pub const REIFIES_GRAPH: &str = "reifiesGraph";
+
+    /// db:reifiesSubject - subject SID of the reified edge.
+    pub const REIFIES_SUBJECT: &str = "reifiesSubject";
+
+    /// db:reifiesPredicate - predicate SID of the reified edge.
+    pub const REIFIES_PREDICATE: &str = "reifiesPredicate";
+
+    /// db:reifiesObject - object value of the reified edge (any FlakeValue:
+    /// refs, literals, etc.).
+    pub const REIFIES_OBJECT: &str = "reifiesObject";
+
+    /// db:reifiesDatatype - datatype SID of the reified edge's object.
+    pub const REIFIES_DATATYPE: &str = "reifiesDatatype";
+
+    /// db:reifiesLang - language tag of the reified edge's object,
+    /// when applicable. Omitted otherwise.
+    pub const REIFIES_LANG: &str = "reifiesLang";
+
+    /// db:reifiesListIndex - list-occurrence index, when the reified
+    /// edge is a list element. Always omitted in v1 (list-occurrence
+    /// annotations are deferred).
+    pub const REIFIES_LIST_INDEX: &str = "reifiesListIndex";
+}
+
+/// Edge-annotation system predicate IRIs (`https://ns.flur.ee/db#reifies*`).
+///
+/// Convenience full IRIs for query/parser code that needs to compare against
+/// expanded IRIs rather than `(namespace_code, name)` pairs. The local
+/// names live under [`db`].
+pub mod reifies_iris {
+    /// `https://ns.flur.ee/db#reifiesGraph`
+    pub const GRAPH: &str = "https://ns.flur.ee/db#reifiesGraph";
+
+    /// `https://ns.flur.ee/db#reifiesSubject`
+    pub const SUBJECT: &str = "https://ns.flur.ee/db#reifiesSubject";
+
+    /// `https://ns.flur.ee/db#reifiesPredicate`
+    pub const PREDICATE: &str = "https://ns.flur.ee/db#reifiesPredicate";
+
+    /// `https://ns.flur.ee/db#reifiesObject`
+    pub const OBJECT: &str = "https://ns.flur.ee/db#reifiesObject";
+
+    /// `https://ns.flur.ee/db#reifiesDatatype`
+    pub const DATATYPE: &str = "https://ns.flur.ee/db#reifiesDatatype";
+
+    /// `https://ns.flur.ee/db#reifiesLang`
+    pub const LANG: &str = "https://ns.flur.ee/db#reifiesLang";
+
+    /// `https://ns.flur.ee/db#reifiesListIndex`
+    pub const LIST_INDEX: &str = "https://ns.flur.ee/db#reifiesListIndex";
+
+    /// All seven `f:reifies*` IRIs as a slice. Useful for system-fact
+    /// filters that need to enumerate the full reserved set.
+    pub const ALL: [&str; 7] = [
+        GRAPH, SUBJECT, PREDICATE, OBJECT, DATATYPE, LANG, LIST_INDEX,
+    ];
 }
 
 /// Fluree DB search query key local names (under `https://ns.flur.ee/db#`)
