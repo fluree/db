@@ -252,6 +252,19 @@ impl AttachmentNovelty {
         Ok(())
     }
 
+    /// Iterator over every `(edge, rows)` pair in the forward map.
+    /// Diagnostic / test use — walks the entire overlay so callers
+    /// must keep the cost in mind (linear in distinct edges).
+    pub fn iter_forward(&self) -> impl Iterator<Item = (&EdgeKey, &Vec<ForwardRow>)> {
+        self.forward.iter()
+    }
+
+    /// Iterator over every `(ann_sid, rows)` pair in the reverse map.
+    /// Diagnostic / test counterpart of [`Self::iter_forward`].
+    pub fn iter_reverse(&self) -> impl Iterator<Item = (&fluree_db_core::Sid, &Vec<ReverseRow>)> {
+        self.reverse.iter()
+    }
+
     /// Total number of forward rows across all edges. Diagnostic /
     /// telemetry-only — not a hot-path metric.
     pub fn forward_row_count(&self) -> usize {

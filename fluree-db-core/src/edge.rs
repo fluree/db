@@ -136,77 +136,73 @@ impl EdgeKey {
         let id_dt = id_datatype_sid();
         let str_dt = xsd_string_datatype_sid();
 
+        // Helper: emit each f:reifies* flake **into the same graph**
+        // as the reified edge. The JSON-LD lowering places annotation
+        // siblings under `@graph: <iri>`, so the asserted flakes have
+        // `g = Some(g_sid)` for named graphs. A retract bundle that
+        // hardcoded `g = None` would not match the original assertion
+        // (different `g` = different fact identity in Fluree's flake
+        // model), leaving named-graph annotations orphaned.
+        let make = |s: Sid, p: Sid, o: FlakeValue, dt: Sid| -> Flake {
+            match &self.g {
+                Some(g) => Flake::new_in_graph(g.clone(), s, p, o, dt, t, op, None),
+                None => Flake::new(s, p, o, dt, t, op, None),
+            }
+        };
+
         // f:reifiesGraph — present iff edge is in a named graph.
         if let Some(g) = &self.g {
-            facts.push(Flake::new(
+            facts.push(make(
                 ann.clone(),
                 Sid::new(FLUREE_DB, fluree_db_predicates::REIFIES_GRAPH),
                 FlakeValue::Ref(g.clone()),
                 id_dt.clone(),
-                t,
-                op,
-                None,
             ));
         }
 
         // f:reifiesSubject — required.
-        facts.push(Flake::new(
+        facts.push(make(
             ann.clone(),
             Sid::new(FLUREE_DB, fluree_db_predicates::REIFIES_SUBJECT),
             FlakeValue::Ref(self.s.clone()),
             id_dt.clone(),
-            t,
-            op,
-            None,
         ));
 
         // f:reifiesPredicate — required.
-        facts.push(Flake::new(
+        facts.push(make(
             ann.clone(),
             Sid::new(FLUREE_DB, fluree_db_predicates::REIFIES_PREDICATE),
             FlakeValue::Ref(self.p.clone()),
             id_dt.clone(),
-            t,
-            op,
-            None,
         ));
 
         // f:reifiesObject — required. Preserves the original object's
         // datatype on the flake so typed-equality lookups round-trip.
-        facts.push(Flake::new(
+        facts.push(make(
             ann.clone(),
             Sid::new(FLUREE_DB, fluree_db_predicates::REIFIES_OBJECT),
             self.o.clone(),
             self.dt.clone(),
-            t,
-            op,
-            None,
         ));
 
         // f:reifiesDatatype — required. Names the dt SID itself so
         // queries can filter on the original object's datatype without
         // inspecting the object value.
-        facts.push(Flake::new(
+        facts.push(make(
             ann.clone(),
             Sid::new(FLUREE_DB, fluree_db_predicates::REIFIES_DATATYPE),
             FlakeValue::Ref(self.dt.clone()),
             id_dt,
-            t,
-            op,
-            None,
         ));
 
         // f:reifiesLang — optional, only when the original object
         // carried a language tag.
         if let Some(lang) = &self.lang {
-            facts.push(Flake::new(
+            facts.push(make(
                 ann.clone(),
                 Sid::new(FLUREE_DB, fluree_db_predicates::REIFIES_LANG),
                 FlakeValue::String(lang.clone()),
                 str_dt,
-                t,
-                op,
-                None,
             ));
         }
 
@@ -616,6 +612,60 @@ mod tests {
         let decoded = EdgeKey::from_reifies_facts(&compact)
             .expect("decoder treats f:reifiesDatatype as optional");
         assert_eq!(decoded, key);
+    }
+
+    #[test]
+    fn named_graph_bundle_emits_flakes_in_the_named_graph() {
+        // Regression: every flake in a named-graph bundle (assertion
+        // or retract) must have `g = Some(graph_sid)` matching the
+        // reified edge's graph. A `g = None` retract would not
+        // match a `g = Some(...)` assertion in Fluree's flake
+        // identity model, leaving named-graph annotations orphaned.
+        let mut f = sample_flake();
+        f.g = Some(Sid::new(13, "graph_a"));
+        f.o = FlakeValue::String("Engineer".into());
+        f.dt = Sid::new(2, "string");
+        f.m = Some(FlakeMeta {
+            lang: Some("fr".into()),
+            i: None,
+        });
+        let key = EdgeKey::from_flake(&f);
+        let ann = Sid::new(13, "ann1");
+
+        // Full bundle.
+        let full = key.to_reifies_facts(&ann, 42, true);
+        for flake in &full {
+            assert_eq!(
+                flake.g.as_ref(),
+                Some(&Sid::new(13, "graph_a")),
+                "named-graph bundle flake must carry the edge's graph: {flake:?}"
+            );
+        }
+
+        // JSON-LD-compatible (cascade) bundle.
+        let compact = key.to_reifies_facts_jsonld_compatible(&ann, 42, true);
+        for flake in &compact {
+            assert_eq!(
+                flake.g.as_ref(),
+                Some(&Sid::new(13, "graph_a")),
+                "JSON-LD-compat named-graph bundle must carry the edge's graph: {flake:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn default_graph_bundle_keeps_g_none() {
+        // Symmetric counterpart: default-graph edges produce
+        // `g = None` flakes (the absence-encodes-default convention
+        // matches the assertion side).
+        let f = sample_flake();
+        assert!(f.g.is_none(), "sample is default-graph");
+        let key = EdgeKey::from_flake(&f);
+        let ann = Sid::new(13, "ann1");
+        let bundle = key.to_reifies_facts_jsonld_compatible(&ann, 42, true);
+        for flake in &bundle {
+            assert!(flake.g.is_none(), "default-graph bundle must keep g=None: {flake:?}");
+        }
     }
 
     #[test]

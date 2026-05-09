@@ -809,6 +809,112 @@ async fn wildcard_subject_hydration_hides_f_reifies_predicates() {
 }
 
 #[tokio::test]
+async fn cascade_retracts_named_graph_annotations_in_their_own_graph() {
+    // Regression: cascade retract bundles must carry the same
+    // `g = Some(graph_sid)` as the original named-graph assertion.
+    // A default-graph retract would not match named-graph
+    // assertions in Fluree's flake identity model, leaving the
+    // annotation orphaned in the named graph.
+    //
+    // We can't directly inspect the flake graph from the public
+    // API, but we *can* observe the retract via the
+    // `AttachmentNovelty` overlay: if the cascade emitted retracts
+    // in the named graph, the overlay's observer would record
+    // them, and `current_annotations_for_at` would return zero
+    // for the edge after the retract. If the retracts went to the
+    // default graph, the named-graph assertion would still be
+    // active in the overlay.
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger_id = "it/edge-annotations:cascade-named-graph";
+    let ledger0 = genesis_ledger(&fluree, ledger_id);
+
+    let txn = json!({
+        "@context": ctx(),
+        "@id": "ex:alice",
+        "@graph": "ex:hr-graph",
+        "ex:worksFor": {
+            "@id": "ex:acme",
+            "@annotation": {
+                "@id": "ex:emp/alice-acme",
+                "ex:role": "Engineer"
+            }
+        }
+    });
+    let after_insert = fluree
+        .insert(ledger0, &txn)
+        .await
+        .expect("named-graph annotated insert");
+
+    // Direct retract — no WHERE binding needed since the IRIs are
+    // explicit. The named-graph selector tells the transactor to
+    // emit the retract flake in the named graph.
+    let insert_t = after_insert.ledger.t();
+    let delete = json!({
+        "@context": ctx(),
+        "delete": {
+            "@id": "ex:alice",
+            "@graph": "ex:hr-graph",
+            "ex:worksFor": { "@id": "ex:acme" }
+        }
+    });
+    let after_delete = fluree
+        .update(after_insert.ledger, &delete)
+        .await
+        .expect("named-graph base delete");
+    assert!(
+        after_delete.ledger.t() > insert_t,
+        "delete must produce a new t (precondition for cascade test)"
+    );
+
+    // Re-insert just the base edge in the same named graph.
+    let reinsert = json!({
+        "@context": ctx(),
+        "@id": "ex:alice",
+        "@graph": "ex:hr-graph",
+        "ex:worksFor": { "@id": "ex:acme" }
+    });
+    let after_reinsert = fluree
+        .insert(after_delete.ledger, &reinsert)
+        .await
+        .expect("named-graph base re-insert");
+
+    // After the cascade, the AttachmentNovelty observer should
+    // have recorded both the named-graph assertion AND a matching
+    // named-graph retract. With the named-graph fix, both events
+    // share the same `EdgeKey { g: Some(graph_a), ... }` so the
+    // forward map's latest event for that key is a retract (op=false).
+    //
+    // Without the fix, the assertion is keyed by `g=Some(graph_a)`
+    // but the retract would be keyed by `g=None` (different
+    // EdgeKey), so the named-graph forward rows would still show
+    // the annotation as currently asserted.
+    //
+    // We don't reconstruct the EdgeKey directly — we walk the
+    // forward map and assert that *no* named-graph edge has any
+    // currently-attached annotation.
+    let attachments = &after_reinsert.ledger.novelty.attachments;
+    let as_of = after_reinsert.ledger.t();
+    let mut leaked_named_graph_attachments: Vec<String> = Vec::new();
+    for (edge_key, _rows) in attachments.iter_forward() {
+        if edge_key.g.is_none() {
+            continue; // default-graph edge — not what this test guards
+        }
+        let live: Vec<fluree_db_core::Sid> = attachments
+            .current_annotations_for_at(edge_key, as_of)
+            .collect();
+        if !live.is_empty() {
+            leaked_named_graph_attachments
+                .push(format!("{edge_key:?} -> {live:?}"));
+        }
+    }
+    assert!(
+        leaked_named_graph_attachments.is_empty(),
+        "after named-graph cascade, no named-graph edge should have currently-attached \
+         annotations; got: {leaked_named_graph_attachments:#?}"
+    );
+}
+
+#[tokio::test]
 async fn annotation_in_named_graph_insert_succeeds() {
     // Regression coverage for the M1a `f:reifiesGraph` fix on the
     // *write* path. An annotated edge in a named graph must be

@@ -52,18 +52,36 @@ use fluree_db_shacl::{ShaclCache, ShaclEngine, ValidationReport};
 /// `f:reifies*` bundle so the durable encoding doesn't keep pointing
 /// at a retracted edge.
 ///
-/// **M2 read path:** uses scan-based lookup through
-/// `range_with_overlay`, which reads novelty + base storage. Closes
-/// the M1b "novelty-only" gap — annotations that have rolled into
-/// indexed base storage are still found and cascaded.
+/// **Read path:** uses scan-based lookup through
+/// `range_with_overlay`, which reads novelty + indexed base storage,
+/// so annotations that have rolled into base storage post-reindex
+/// are still found and cascaded.
 ///
-/// M1b minimum: only retracts the `f:reifies*` bundle. Anonymous-
-/// annotation metadata cleanup (RDF mode default) and explicit-IRI
-/// metadata cleanup (LPG mode `opts.lpgEdgeLifecycle: true`) are
-/// tracked as follow-ups — leaving them in place is observably safe
-/// (the annotation subject becomes unreachable through `@reifies`
-/// once the bundle is gone, and anonymous SIDs can't be addressed
-/// directly).
+/// **Graph context:** the inverse bundle is emitted via
+/// `EdgeKey::to_reifies_facts_jsonld_compatible`, which carries the
+/// edge's `g` through to each retract flake. Named-graph assertions
+/// are retracted in the same named graph; default-graph assertions
+/// stay in the default graph. Without this graph-aware emission,
+/// named-graph annotations would be orphaned by mismatched-graph
+/// retracts.
+///
+/// **Performance:** every retract flake pays one POST point lookup
+/// against the binary index. The lookup returns empty quickly when
+/// nothing matches, so per-retract cost is bounded by the binary
+/// index's empty-range cost — but it's no longer zero. The prior
+/// `has_annotations()` fast-path on the novelty overlay was
+/// incorrect post-reindex (the overlay drains when novelty rolls
+/// into base) and was removed; restoring a correct fast-path needs
+/// a "ledger has any annotations ever" flag at the `IndexRoot`
+/// level, which belongs with the binary-arena work.
+///
+/// **Cleanup scope:** retracts the `f:reifies*` bundle only.
+/// Anonymous-annotation metadata cleanup (RDF mode default) and
+/// explicit-IRI metadata cleanup (LPG mode `opts.lpgEdgeLifecycle:
+/// true`) are separate cleanup passes — the bundle-only cascade is
+/// observably safe (anonymous SIDs become unreachable through
+/// `@reifies` once the bundle is gone, and explicit-IRI annotation
+/// metadata stays queryable as ordinary RDF).
 async fn cascade_attachment_retracts(
     flakes: &[Flake],
     ledger: &LedgerState,
