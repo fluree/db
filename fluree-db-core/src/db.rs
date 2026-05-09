@@ -140,6 +140,19 @@ pub struct LedgerSnapshot {
     /// automatically.
     pub range_provider: Option<Arc<dyn RangeProvider>>,
 
+    /// Optional CAS handle for arena-backed reads.
+    ///
+    /// Set by ledger-load paths that have a content store available
+    /// (the same one backing `range_provider`). Formatter / cascade
+    /// callers consult [`Self::annotation_index`] alongside this field
+    /// to decide whether to use the on-disk arena or fall back to the
+    /// scan-based hydration path.
+    ///
+    /// `Arc<dyn ContentStore>` (rather than a borrowed reference)
+    /// because the snapshot is `Clone` and outlives any individual
+    /// query / cascade scope.
+    pub content_store: Option<Arc<dyn crate::storage::ContentStore>>,
+
     /// Ledger-wide graph IRI → GraphId registry.
     ///
     /// Populated from index root (via `seed_from_root_iris`) or ledger creation
@@ -181,6 +194,7 @@ impl Clone for LedgerSnapshot {
             graph_registry: self.graph_registry.clone(),
             has_annotations: self.has_annotations,
             annotation_index: self.annotation_index.clone(),
+            content_store: self.content_store.clone(),
         }
     }
 }
@@ -233,6 +247,7 @@ impl LedgerSnapshot {
             graph_registry: GraphRegistry::new_for_ledger(ledger_id),
             has_annotations: false,
             annotation_index: None,
+            content_store: None,
         }
     }
 
@@ -270,6 +285,7 @@ impl LedgerSnapshot {
             graph_registry,
             has_annotations: meta.has_annotations,
             annotation_index: meta.annotation_index,
+            content_store: None,
         })
     }
 
@@ -292,6 +308,24 @@ impl LedgerSnapshot {
     pub fn with_range_provider(mut self, provider: Arc<dyn RangeProvider>) -> Self {
         self.range_provider = Some(provider);
         self
+    }
+
+    /// Attach a content store handle. Required (alongside
+    /// [`Self::annotation_index`]) for arena-backed annotation reads;
+    /// callers that only need range queries can leave this `None`.
+    pub fn with_content_store(mut self, store: Arc<dyn crate::storage::ContentStore>) -> Self {
+        self.content_store = Some(store);
+        self
+    }
+
+    /// True iff this snapshot has both the index root section
+    /// pointing at on-disk arenas AND a CAS handle to read them. The
+    /// hot path for arena-backed lookups gates on this — when `false`,
+    /// callers fall back to the M2a scan-based hydration / cascade
+    /// paths.
+    #[inline]
+    pub fn has_arena_reader(&self) -> bool {
+        self.annotation_index.is_some() && self.content_store.is_some()
     }
 
     /// Encode an IRI to a SID using this db's namespace codes.
@@ -959,6 +993,43 @@ mod tests {
     fn test_from_root_bytes_rejects_truncated() {
         let err = LedgerSnapshot::from_root_bytes(b"FI").unwrap_err();
         assert!(err.to_string().contains("too short"));
+    }
+
+    #[test]
+    fn has_arena_reader_requires_both_index_and_store() {
+        // Genesis snapshot: neither annotation_index nor content_store
+        // — has_arena_reader returns false.
+        let snap = LedgerSnapshot::genesis("test:main");
+        assert!(!snap.has_arena_reader(), "genesis has no arena");
+
+        // Adding only the content store still doesn't enable arena
+        // reads — the snapshot must also point at on-disk arenas.
+        let store = Arc::new(crate::storage::MemoryContentStore::new())
+            as Arc<dyn crate::storage::ContentStore>;
+        let snap = snap.with_content_store(store);
+        assert!(
+            !snap.has_arena_reader(),
+            "store without annotation_index does not enable arena reads"
+        );
+
+        // Adding annotation_index with no store still doesn't suffice.
+        let mut snap = snap;
+        snap.content_store = None;
+        snap.annotation_index = Some(crate::AnnotationIndexRoot {
+            version: 1,
+            max_t: 0,
+            forward_branch_cid: ContentId::new(ContentKind::AnnotationForwardBranch, b"empty-fwd"),
+            reverse_branch_cid: ContentId::new(ContentKind::AnnotationReverseBranch, b"empty-rev"),
+            stats: crate::AnnotationStats::default(),
+        });
+        assert!(
+            !snap.has_arena_reader(),
+            "annotation_index without store does not enable arena reads"
+        );
+
+        // Both present — arena reader is available.
+        snap.content_store = Some(Arc::new(crate::storage::MemoryContentStore::new()));
+        assert!(snap.has_arena_reader());
     }
 
     #[test]
