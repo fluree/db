@@ -208,6 +208,18 @@ pub struct IndexRoot {
     /// `@annotation` / `@reifies` write) skip the per-retract POST
     /// lookup entirely.
     pub has_annotations: bool,
+
+    /// Inline pointer to the on-disk forward/reverse annotation
+    /// arenas (M2b). `None` is a hard guarantee that this snapshot
+    /// has zero annotation attachments. `Some(_)` indicates the
+    /// indexer emitted EAFB1/EAFL1 + EARB1/EARL1 artifacts (possibly
+    /// empty) that the read path can lazy-load.
+    ///
+    /// Pre-builder: always `None`; the cascade fast-path consults
+    /// `has_annotations` instead. Once the M2b builder lands,
+    /// downstream readers migrate to this field for arena-backed
+    /// lookups.
+    pub annotation_index: Option<fluree_db_core::AnnotationIndexRoot>,
 }
 
 impl IndexRoot {
@@ -501,6 +513,12 @@ impl IndexRoot {
     /// `fluree-db-transact::stage` — non-annotation ledgers skip
     /// the per-retract POST lookup entirely.
     const FLAG_HAS_ANNOTATIONS: u8 = 1 << 6;
+    /// Optional on-disk arena pointer (`AnnotationIndexRoot`) is present
+    /// in the inline tail. Independent of `FLAG_HAS_ANNOTATIONS`: the
+    /// sticky bit may be set without the arena (pre-builder roots);
+    /// once the builder runs the bit is set whenever the section is
+    /// present.
+    const FLAG_HAS_ANNOTATION_INDEX: u8 = 1 << 7;
 
     /// Encode to the binary FIR6 wire format.
     ///
@@ -538,6 +556,10 @@ impl IndexRoot {
             0
         }) | (if self.has_annotations {
             Self::FLAG_HAS_ANNOTATIONS
+        } else {
+            0
+        }) | (if self.annotation_index.is_some() {
+            Self::FLAG_HAS_ANNOTATION_INDEX
         } else {
             0
         });
@@ -691,6 +713,18 @@ impl IndexRoot {
         // ---- Optional: sketch_ref ----
         if let Some(ref sketch) = self.sketch_ref {
             write_cid(&mut buf, sketch);
+        }
+
+        // ---- Optional: annotation_index (M2b) ----
+        // CBOR-encoded inline so the index format can grow new fields
+        // (e.g. histograms in M3) without bumping FIR6 itself. Length
+        // prefix lets old readers skip the section.
+        if let Some(ref ann) = self.annotation_index {
+            let mut body = Vec::new();
+            ciborium::ser::into_writer(ann, &mut body)
+                .expect("ciborium serialization to Vec<u8> is infallible");
+            buf.extend_from_slice(&(body.len() as u32).to_le_bytes());
+            buf.extend_from_slice(&body);
         }
 
         buf
@@ -909,6 +943,19 @@ impl IndexRoot {
             None
         };
 
+        let annotation_index = if flags & Self::FLAG_HAS_ANNOTATION_INDEX != 0 {
+            let len = read_u32_at(data, &mut pos)? as usize;
+            ensure_bytes(data, pos, len, "annotation_index section")?;
+            let ann = ciborium::de::from_reader::<fluree_db_core::AnnotationIndexRoot, _>(
+                &data[pos..pos + len],
+            )
+            .map_err(|e| io_err(&format!("annotation_index decode: {e}")))?;
+            pos += len;
+            Some(ann)
+        } else {
+            None
+        };
+
         Ok(IndexRoot {
             ledger_id,
             index_t,
@@ -937,6 +984,7 @@ impl IndexRoot {
             garbage,
             sketch_ref,
             has_annotations,
+            annotation_index,
         })
     }
     /// Collect all CAS content-artifact CIDs referenced by this root.
@@ -1213,6 +1261,7 @@ mod tests {
             garbage: None,
             sketch_ref: None,
             has_annotations: false,
+            annotation_index: None,
             ns_split_mode: fluree_db_core::ns_encoding::NsSplitMode::default(),
         }
     }
@@ -1237,6 +1286,57 @@ mod tests {
         assert_eq!(decoded.default_graph_orders.len(), 0);
         assert_eq!(decoded.named_graphs.len(), 0);
         assert!(decoded.stats.is_none());
+        assert!(decoded.annotation_index.is_none());
+    }
+
+    #[test]
+    fn fir6_round_trip_with_annotation_index() {
+        let mut root = minimal_root_v6();
+        let dummy_cid = fluree_db_core::ContentId::from_hex_digest(
+            fluree_db_core::CODEC_FLUREE_ANNOTATION_FORWARD_BRANCH,
+            &fluree_db_core::sha256_hex(b"fwd"),
+        )
+        .unwrap();
+        let dummy_rev = fluree_db_core::ContentId::from_hex_digest(
+            fluree_db_core::CODEC_FLUREE_ANNOTATION_REVERSE_BRANCH,
+            &fluree_db_core::sha256_hex(b"rev"),
+        )
+        .unwrap();
+        root.annotation_index = Some(fluree_db_core::AnnotationIndexRoot {
+            version: 1,
+            max_t: 99,
+            forward_branch_cid: dummy_cid.clone(),
+            reverse_branch_cid: dummy_rev.clone(),
+            stats: fluree_db_core::AnnotationStats {
+                forward_rows: 100,
+                reverse_rows: 100,
+                distinct_edges: 25,
+                distinct_annotations: 75,
+            },
+        });
+
+        let bytes = root.encode();
+        // Section flag must be set.
+        assert_ne!(bytes[5] & IndexRoot::FLAG_HAS_ANNOTATION_INDEX, 0);
+
+        let decoded = IndexRoot::decode(&bytes).unwrap();
+        let ann = decoded
+            .annotation_index
+            .expect("annotation_index roundtrip");
+        assert_eq!(ann.version, 1);
+        assert_eq!(ann.max_t, 99);
+        assert_eq!(ann.forward_branch_cid, dummy_cid);
+        assert_eq!(ann.reverse_branch_cid, dummy_rev);
+        assert_eq!(ann.stats.forward_rows, 100);
+        assert_eq!(ann.stats.distinct_edges, 25);
+        assert_eq!(ann.stats.distinct_annotations, 75);
+
+        // Metadata-only path (`LedgerSnapshot::from_root_bytes`) must
+        // surface the same pointer — callers that only load metadata
+        // still see the section.
+        let snap = fluree_db_core::LedgerSnapshot::from_root_bytes(&bytes).unwrap();
+        let snap_ann = snap.annotation_index.expect("metadata path roundtrip");
+        assert_eq!(snap_ann, ann);
     }
 
     #[test]

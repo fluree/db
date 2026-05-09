@@ -26,6 +26,7 @@
 
 pub mod address;
 pub mod address_path;
+pub mod annotation_index;
 pub mod coerce;
 pub mod commit;
 pub mod comparator;
@@ -78,6 +79,7 @@ pub use address::{
     extract_identifier, extract_ledger_prefix, extract_path, parse_fluree_address,
     ParsedFlureeAddress,
 };
+pub use annotation_index::{AnnotationIndexRoot, AnnotationStats};
 pub use coerce::{coerce_json_value, coerce_value, CoercionError, CoercionResult};
 pub use commit::{
     collect_dag_cids, collect_dag_cids_with_split_mode, commit_to_summary, find_common_ancestor,

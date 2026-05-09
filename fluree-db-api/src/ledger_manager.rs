@@ -310,6 +310,7 @@ impl LedgerHandle {
             string_watermark: root.string_watermark,
             graph_iris: root.graph_iris,
             has_annotations: root.has_annotations,
+            annotation_index: root.annotation_index.clone(),
         };
         let db = LedgerSnapshot::new_meta(meta)
             .map_err(|e| ApiError::internal(format!("graph registry from root: {e}")))?;

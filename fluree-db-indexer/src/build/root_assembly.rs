@@ -300,6 +300,7 @@ pub(crate) async fn encode_and_write_root_v6(
         garbage: None,
         sketch_ref: inputs.sketch_ref,
         has_annotations,
+        annotation_index: None,
     };
 
     // `IndexStats.size` is defined as total commit data size (bytes) for the ledger.

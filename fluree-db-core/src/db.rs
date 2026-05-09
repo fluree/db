@@ -61,6 +61,17 @@ pub struct LedgerSnapshotMetadata {
     /// `fluree-db-transact::stage` so non-annotation ledgers skip
     /// the per-retract POST scan entirely.
     pub has_annotations: bool,
+    /// Optional inline pointer to the on-disk annotation arenas.
+    ///
+    /// `None` is a hard guarantee that the indexed snapshot has zero
+    /// annotation attachments. `Some(_)` indicates the indexer has
+    /// emitted forward/reverse arena artifacts (possibly empty) that
+    /// the read path can lazy-load.
+    ///
+    /// Pre-builder: always `None`; the cascade fast-path uses
+    /// `has_annotations` instead. Builder slice (M2b/3) populates
+    /// this field; downstream slices migrate readers off the boolean.
+    pub annotation_index: Option<crate::AnnotationIndexRoot>,
 }
 
 /// Database value at a specific point in time.
@@ -139,6 +150,10 @@ pub struct LedgerSnapshot {
     /// fast-path so non-annotation ledgers pay zero per-retract
     /// cost.
     pub has_annotations: bool,
+    /// On-disk annotation-arena pointer (forward/reverse branch CIDs +
+    /// stats). `None` until the M2b builder populates it; cascade
+    /// fast-path consults `has_annotations` in the meantime.
+    pub annotation_index: Option<crate::AnnotationIndexRoot>,
 }
 
 impl Clone for LedgerSnapshot {
@@ -159,6 +174,7 @@ impl Clone for LedgerSnapshot {
             range_provider: self.range_provider.clone(),
             graph_registry: self.graph_registry.clone(),
             has_annotations: self.has_annotations,
+            annotation_index: self.annotation_index.clone(),
         }
     }
 }
@@ -210,6 +226,7 @@ impl LedgerSnapshot {
             range_provider: None,
             graph_registry: GraphRegistry::new_for_ledger(ledger_id),
             has_annotations: false,
+            annotation_index: None,
         }
     }
 
@@ -246,6 +263,7 @@ impl LedgerSnapshot {
             range_provider: None,
             graph_registry,
             has_annotations: meta.has_annotations,
+            annotation_index: meta.annotation_index,
         })
     }
 
@@ -546,7 +564,11 @@ fn decode_fir6_metadata(bytes: &[u8]) -> std::io::Result<LedgerSnapshotMetadata>
     /// by the cascade fast-path in `fluree-db-transact::stage` to
     /// skip the per-retract POST scan on non-annotation ledgers.
     const FLAG_HAS_ANNOTATIONS: u8 = 1 << 6;
+    /// Optional `AnnotationIndexRoot` section is present in the inline
+    /// tail. Decoder uses ciborium; metadata-only callers skip it.
+    const FLAG_HAS_ANNOTATION_INDEX: u8 = 1 << 7;
     let has_annotations = flags & FLAG_HAS_ANNOTATIONS != 0;
+    let has_annotation_index_section = flags & FLAG_HAS_ANNOTATION_INDEX != 0;
 
     #[inline]
     fn ensure(bytes: &[u8], pos: usize, need: usize, ctx: &str) -> std::io::Result<()> {
@@ -841,6 +863,29 @@ fn decode_fir6_metadata(bytes: &[u8]) -> std::io::Result<LedgerSnapshotMetadata>
         skip_cid(bytes, &mut pos)?;
     }
 
+    // Optional `AnnotationIndexRoot` section. Decoded eagerly via
+    // ciborium so the metadata-only fast path surfaces the same
+    // pointer that `IndexRoot::decode` would produce. The section
+    // is small (a couple of CIDs and counters), so eager decode
+    // costs ~tens of bytes — comparable to `stats`/`schema` already
+    // parsed above.
+    let annotation_index = if has_annotation_index_section {
+        let len = read_u32(bytes, &mut pos)? as usize;
+        ensure(bytes, pos, len, "annotation_index section")?;
+        let ann =
+            ciborium::de::from_reader::<crate::AnnotationIndexRoot, _>(&bytes[pos..pos + len])
+                .map_err(|e| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        format!("FIR6: annotation_index decode: {e}"),
+                    )
+                })?;
+        pos += len;
+        Some(ann)
+    } else {
+        None
+    };
+
     Ok(LedgerSnapshotMetadata {
         ledger_id,
         t: index_t,
@@ -853,6 +898,7 @@ fn decode_fir6_metadata(bytes: &[u8]) -> std::io::Result<LedgerSnapshotMetadata>
         string_watermark,
         graph_iris,
         has_annotations,
+        annotation_index,
     })
 }
 
@@ -913,6 +959,7 @@ mod tests {
             string_watermark: 0,
             graph_iris: vec![],
             has_annotations: false,
+            annotation_index: None,
         })
         .unwrap();
 

@@ -38,6 +38,11 @@ use fluree_db_core::{ContentId, EdgeKey, Sid};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+// Re-exported from `fluree-db-core` so callers continue to import from
+// this module. The structs themselves live in core because
+// `LedgerSnapshot` holds `Option<AnnotationIndexRoot>`.
+pub use fluree_db_core::{AnnotationIndexRoot, AnnotationStats};
+
 /// Magic bytes for an edge-annotation forward branch (`EAFB1`).
 pub const FORWARD_BRANCH_MAGIC: [u8; 4] = *b"EAFB";
 
@@ -55,49 +60,6 @@ pub const ARENA_VERSION: u8 = 1;
 
 /// Header length (magic + version + flags + reserved + body_len).
 pub const ARENA_HEADER_LEN: usize = 12;
-
-/// Aggregate counters populated at build time, surfaced for cost-based
-/// planning (M3) and storage inspection.
-///
-/// Counts are `u64` everywhere — the arena is content-addressed and can
-/// in principle hold history-scale row counts, so 32-bit fields would be
-/// risky on long-lived ledgers.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub struct AnnotationStats {
-    /// Total forward-arena rows (one per asserted/retracted attachment event).
-    pub forward_rows: u64,
-    /// Total reverse-arena rows (mirror of `forward_rows` after compaction).
-    pub reverse_rows: u64,
-    /// Distinct edges with at least one current (live) attachment.
-    pub distinct_edges: u64,
-    /// Distinct annotation subjects.
-    pub distinct_annotations: u64,
-}
-
-/// Inline section in [`crate::format::index_root::IndexRoot`].
-///
-/// Absent (`None`) means the indexed snapshot has zero `f:reifies*`
-/// flakes — a positive correctness guarantee, not a "don't know yet"
-/// signal. Builders that are uncertain emit `Some(empty)` and let
-/// reads no-op cheaply.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct AnnotationIndexRoot {
-    /// Format version of the on-disk arena artifacts. Independent of
-    /// `IndexRoot`'s own version so the arena format can roll forward
-    /// without a full FIR6 bump.
-    pub version: u8,
-    /// Highest commit `t` reflected in either arena. Reads with `as_of_t`
-    /// above this fall back to novelty for any newer attachments.
-    pub max_t: i64,
-    /// Forward-arena branch CID (`EAFB1`). Always present, even for an
-    /// empty arena, so absence-of-section in the parent root keeps its
-    /// "zero attachments" meaning.
-    pub forward_branch_cid: ContentId,
-    /// Reverse-arena branch CID (`EARB1`).
-    pub reverse_branch_cid: ContentId,
-    /// Build-time stats. Always present (zero-valued for empty arenas).
-    pub stats: AnnotationStats,
-}
 
 // ── Forward arena ───────────────────────────────────────────────────────────
 

@@ -4008,6 +4008,7 @@ where
             // ledger has annotations. Computed above before the
             // dict moves into this struct literal.
             has_annotations: import_has_annotations,
+            annotation_index: None,
             ns_split_mode: fluree_db_core::ns_encoding::NsSplitMode::default(),
         };
 
