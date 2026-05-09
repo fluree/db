@@ -3,9 +3,10 @@
 //! Glues the pure builder in
 //! `fluree_db_binary_index::annotation_arena` to the CAS write seam
 //! the indexer already drives for branches/leaves. The function takes
-//! a fully decoded set of attachment events (from
-//! [`fluree_db_novelty::AttachmentNovelty`] and/or the previous root's
-//! arena), builds forward + reverse blobs, writes them, and returns
+//! a pre-decoded set of attachment events (sourced from the running
+//! ledger's `AttachmentNovelty.iter_event_pairs()` and threaded in
+//! via `IndexerConfig.attachment_events`) plus the previous root's
+//! arena, builds forward + reverse blobs, writes them, and returns
 //! the populated [`AnnotationIndexRoot`] that the root encoder will
 //! seal.
 //!
@@ -13,14 +14,14 @@
 //!
 //! - Merging events from two sources (previous arena + novelty).
 //! - Driving the CAS writes for arena leaves and branches.
-//! - Returning a structurally-correct `AnnotationIndexRoot`.
+//! - Returning a structurally-correct `AnnotationIndexRoot` plus the
+//!   replaced leaf CIDs the GC pass needs.
 //!
 //! ## What this module does NOT own
 //!
-//! - **Where the events come from on the indexer's collection side.**
-//!   For incremental indexing the caller passes the running ledger's
-//!   `AttachmentNovelty`; for full rebuild the caller will materialize
-//!   one from the resolved commit stream (see slice 3d).
+//! - **Decoding events from the commit stream.** The orchestrator
+//!   layer collects the pre-decoded events from the running
+//!   `AttachmentNovelty` and threads them through `IndexerConfig`.
 
 use fluree_db_binary_index::annotation_arena::{
     build_arenas_from_event_pairs, build_forward_branch, build_reverse_branch,
@@ -28,7 +29,6 @@ use fluree_db_binary_index::annotation_arena::{
 };
 use fluree_db_core::storage::ContentStore;
 use fluree_db_core::{AnnotationIndexRoot, ContentKind, EdgeKey, Sid};
-use fluree_db_novelty::AttachmentNovelty;
 use std::sync::Arc;
 
 use crate::error::{IndexerError, Result};
@@ -43,11 +43,6 @@ use crate::error::{IndexerError, Result};
 /// `set_annotation_index` from `root.annotation_index`, so this list
 /// covers only the leaves.
 ///
-/// Kept for: M2b slice 3d (the call site that consumes both fields).
-/// Use when: incremental indexer wires `build_and_persist_annotation_arena`
-/// → `IncrementalRootBuilder::set_annotation_index` and needs both
-/// the new index pointer and the old leaf CIDs.
-#[expect(dead_code)]
 #[derive(Debug, Default)]
 pub struct PersistedArenaResult {
     pub new_index: Option<AnnotationIndexRoot>,
@@ -69,22 +64,18 @@ pub struct PersistedArenaResult {
 /// be `Some` too (possibly with empty arenas), so readers don't see a
 /// regression in the truth-table state.
 ///
-/// Kept for: M2b slice 3d (call site in `build/incremental.rs` after
-/// resolving novelty). The orchestrator passes the running ledger's
-/// `AttachmentNovelty` plus the base root's `annotation_index`, then
-/// wires the result into `IncrementalRootBuilder::set_annotation_index`
-/// (passing both `result.new_index` and `result.replaced_leaf_cids`).
-/// Use when: incremental indexer has access to the running
-/// AttachmentNovelty (today the indexer takes only commits + content
-/// store; 3d adds the novelty as a public-API parameter).
-#[expect(dead_code)]
+/// `novelty_events` is the post-base-root attachment delta as
+/// `(edge, ann, t, op)` tuples — typically collected from the running
+/// ledger's `AttachmentNovelty.iter_event_pairs()` and threaded into
+/// the indexer through `IndexerConfig.attachment_events`. Decoupling
+/// the function from the concrete `AttachmentNovelty` type keeps the
+/// indexer free of a `fluree-db-novelty` runtime dep on this code
+/// path.
 pub async fn build_and_persist_annotation_arena(
     content_store: &Arc<dyn ContentStore>,
     previous_index: Option<&AnnotationIndexRoot>,
-    attachments: &AttachmentNovelty,
+    novelty_events: Vec<(EdgeKey, Sid, i64, bool)>,
 ) -> Result<PersistedArenaResult> {
-    let novelty_events: Vec<(EdgeKey, Sid, i64, bool)> = attachments.iter_event_pairs().collect();
-
     if previous_index.is_none() && novelty_events.is_empty() {
         return Ok(PersistedArenaResult::default());
     }

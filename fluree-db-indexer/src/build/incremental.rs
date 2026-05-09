@@ -2321,6 +2321,24 @@ pub async fn incremental_index(
         }
     }
 
+    // ---- Phase 3d: Annotation arena seal ----
+    // Build / merge / persist forward+reverse arenas from the
+    // attachment events the orchestrator handed us via
+    // `IndexerConfig.attachment_events`. Skip when the caller didn't
+    // provide events AND there's no previous arena — the new root
+    // carries `annotation_index = None` in that case, preserving the
+    // pre-M2b behavior.
+    if config.attachment_events.is_some() || base_root.annotation_index.is_some() {
+        let novelty_events = config.attachment_events.clone().unwrap_or_default();
+        let result = crate::build::annotation_arena::build_and_persist_annotation_arena(
+            &content_store,
+            base_root.annotation_index.as_ref(),
+            novelty_events,
+        )
+        .await?;
+        root_builder.set_annotation_index(result.new_index, result.replaced_leaf_cids);
+    }
+
     // ---- Phase 4: Root assembly ----
     root_builder.set_prev_index(Some(BinaryPrevIndexRef {
         t: base_root.index_t,

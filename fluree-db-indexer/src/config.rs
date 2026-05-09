@@ -174,6 +174,20 @@ pub struct IndexerConfig {
     /// `None` means no limit (backwards-compatible default).
     pub incremental_max_commit_bytes: Option<usize>,
 
+    /// Edge-annotation attachment events to seal into the new arena.
+    ///
+    /// `(edge, ann_sid, t, op)` tuples covering every `f:reifies*`
+    /// event observed since the base index — sourced from the running
+    /// ledger's `AttachmentNovelty.iter_event_pairs()`. The indexer
+    /// merges these with the base root's arena (when present) and
+    /// writes the resulting forward + reverse arena blobs to CAS.
+    ///
+    /// `None` (the default) skips arena sealing — the new root carries
+    /// the same `annotation_index` value as the base, preserving the
+    /// pre-M2b behavior. Callers that have an `AttachmentNovelty`
+    /// available should populate this.
+    pub attachment_events: Option<Vec<(fluree_db_core::EdgeKey, fluree_db_core::Sid, i64, bool)>>,
+
     /// Configured full-text properties for this indexing run.
     ///
     /// Caller-computed (typically by `fluree-db-api` resolving the ledger's
@@ -227,6 +241,7 @@ impl Default for IndexerConfig {
             incremental_max_commit_bytes: None,
             fulltext_configured_properties: Vec::new(),
             fulltext_config_provider: None,
+            attachment_events: None,
         }
     }
 }
@@ -256,6 +271,7 @@ impl IndexerConfig {
             incremental_max_commit_bytes: None,
             fulltext_configured_properties: Vec::new(),
             fulltext_config_provider: None,
+            attachment_events: None,
         }
     }
 
@@ -278,6 +294,7 @@ impl IndexerConfig {
             incremental_max_commit_bytes: None,
             fulltext_configured_properties: Vec::new(),
             fulltext_config_provider: None,
+            attachment_events: None,
         }
     }
 
@@ -300,6 +317,7 @@ impl IndexerConfig {
             incremental_max_commit_bytes: None,
             fulltext_configured_properties: Vec::new(),
             fulltext_config_provider: None,
+            attachment_events: None,
         }
     }
 
