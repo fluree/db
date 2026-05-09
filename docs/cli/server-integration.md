@@ -73,6 +73,22 @@ The `commit` query parameter accepts the same identifiers as the local `fluree s
 - `404 Not Found` — ledger or commit not found
 - `501 Not Implemented` — proxy storage mode (no local index available for decoding)
 
+### `fluree log --remote`
+
+- `GET {api_base_url}/log/*ledger?limit=<N>`
+
+Returns lightweight per-commit summaries newest-first by `t`. Read-auth (same bracket as `/show`) — does **not** require storage-replication permissions, unlike `/commits`. See [Commit Log Contract](#commit-log-contract) for the response shape and required server semantics.
+
+When `--remote` is omitted, the CLI auto-routes through a locally running `fluree server start` if one is detected; pass `--direct` to skip auto-routing and use the local commit-chain walker.
+
+### `fluree export --remote` (admin-protected)
+
+- `POST {api_base_url}/export/*ledger`
+
+Returns ledger data as RDF in the requested format (Turtle, N-Triples, N-Quads, TriG, or JSON-LD). **Admin-protected** — same bracket as `/create`, `/drop`, `/reindex`. RDF export today reads from the binary index without per-flake policy filtering, which is why it does not live in the data-read bracket alongside `/query` and `/show`. See [RDF Export Contract](#rdf-export-contract) for the request body fields and content-type mapping.
+
+When `--remote` is omitted, the CLI auto-routes through a locally running server when one is detected; pass `--direct` to bypass routing and use the local binary index. Tracked ledgers (no local data) require `--remote`.
+
 ### `fluree publish <remote> [ledger]` (create + push)
 
 Creates a ledger on the remote and pushes all local commits in a single operation.
@@ -893,6 +909,189 @@ These endpoints exist so a client can fetch bytes by CID without knowing storage
 
 `/storage/block` is only required for query peers that need server-mediated index-leaf access.
 
+## Commit Log Contract
+
+`fluree log --remote` issues a single read-only request:
+
+```
+GET {api_base_url}/log/{ledger}?limit={n}
+```
+
+| Parameter | Type | Required | Server default | Description |
+|-----------|------|----------|----------------|-------------|
+| `ledger` (path) | string | Yes | — | Ledger ID, including branch suffix (`org/mydb` and `org/mydb:main` both work via the greedy `*ledger` capture) |
+| `limit` | integer | No | `100` | Number of summaries to return (newest-first by `t`). Server clamps to a hard maximum (reference: `5000`). |
+
+### Auth
+
+Read-only. Requires a Bearer token when `data_auth.mode == required`; gates on
+`can_read(ledger)`; returns `404` (not `403`) when the bearer cannot read the
+ledger so it doesn't leak existence. Admin tokens are NOT required.
+
+### Response (`200 OK`)
+
+```jsonc
+{
+  "ledger_id": "mydb:main",
+  "commits": [
+    {
+      "t": 12,
+      "commit_id": "bafy...",
+      "time": "2026-04-25T12:00:00Z",
+      "asserts": 3,
+      "retracts": 0,
+      "flake_count": 3,
+      "message": null
+    }
+    // ... newest-first by t
+  ],
+  "count": 12,
+  "truncated": false
+}
+```
+
+| Field | Type | Notes |
+|-------|------|-------|
+| `ledger_id` | string | Ledger ID echoed from the request path. |
+| `commits` | array | Per-commit summaries, **strictly newest-first by `t`**, capped at the resolved limit. |
+| `count` | integer | Total commits in the chain (uncapped). `truncated == count > commits.len()`. |
+| `truncated` | bool | `true` when the chain is longer than the returned page. |
+
+Each `commits[i]` mirrors `fluree_db_core::CommitSummary`:
+
+| Field | Type | Notes |
+|-------|------|-------|
+| `t` | integer | Transaction number. |
+| `commit_id` | string | Content ID (CID) of the commit blob. |
+| `time` | string \| null | ISO-8601 commit time, or `null` for legacy commits without a timestamp. |
+| `asserts` | integer | Asserted flakes in this commit. |
+| `retracts` | integer | Retracted flakes. |
+| `flake_count` | integer | Total flakes (`asserts + retracts`). |
+| `message` | string \| null | Extracted from `txn_meta` when an `f:message` entry with a string value is present. Returns `null` otherwise. |
+
+### Required semantics
+
+1. **Branch-aware walk.** The walk **must** load commit envelopes via a
+   branch-aware content store (the reference server uses
+   `branched_content_store_for_record`). Pre-fork commits live under the
+   source branch's namespace, so a flat per-branch store cannot reach them
+   and the response would be incomplete.
+2. **Newest-first ordering.** `commits` is sorted strictly descending by
+   `t`. The CLI prints in this order without re-sorting.
+3. **Empty ledger.** When the ledger exists but has no commits, return
+   `200 OK` with `commits: []` and `count: 0`.
+4. **Hard cap.** Servers MUST enforce a hard maximum independent of the
+   client's `limit` (reference: `5000`). The CLI assumes the server caps
+   the response, and unbounded responses must not be reachable.
+
+### Error responses
+
+| Status | When |
+|--------|------|
+| `401` | Bearer required and absent/invalid. |
+| `404` | Ledger does not exist; or the bearer cannot `can_read`. |
+| `5xx` | Storage / nameservice errors during walk. |
+
+### Reference implementation
+
+| Concern | Canonical location |
+|---------|-------------------|
+| HTTP route + auth | `fluree-db-server/src/routes/log.rs::log_ledger_tail` |
+| Underlying API | `fluree_db_api::Fluree::commit_log` |
+| Walk + summary | `fluree_db_core::commit::walk_commit_summaries` |
+
+## RDF Export Contract
+
+`fluree export --remote` issues:
+
+```
+POST {api_base_url}/export/{ledger}
+Content-Type: application/json
+
+{
+  "format": "turtle",
+  "all_graphs": false,
+  "graph": "http://example.org/people",
+  "context": { "ex": "http://example.org/" },
+  "at": "t:42"
+}
+```
+
+| Field | Type | Required | Server default | Description |
+|-------|------|----------|----------------|-------------|
+| `format` | string | No | `"turtle"` | One of: `turtle`/`ttl`, `ntriples`/`nt`, `nquads`/`n-quads`, `trig`, `jsonld`/`json-ld`/`json`. Case-insensitive. |
+| `all_graphs` | bool | No | `false` | Export every named graph as a dataset. Requires `format` ∈ `trig` / `nquads`. Mutually exclusive with `graph`. |
+| `graph` | string | No | — | IRI of a single named graph to export. Mutually exclusive with `all_graphs`. |
+| `context` | object | No | ledger default | Prefix map for Turtle/TriG/JSON-LD output. Either a bare object (`{ "ex": "..." }`) or `{ "@context": {...} }`. Falls back to the ledger's stored default context when absent. |
+| `at` | string | No | latest | Time spec — integer (`"42"`), ISO-8601 datetime (`"2026-01-15T10:30:00Z"`), or commit CID prefix (`"bafy…"`). Identical to the local `--at` flag. |
+
+An empty body is accepted and treated as all-default (Turtle export at HEAD).
+
+### Auth
+
+**Admin-protected.** Same middleware as `/create`, `/drop`, `/reindex`,
+and the branch admin endpoints — registered through
+`v1_admin_protected_routes` in `fluree-db-server/src/routes/mod.rs`.
+
+Export today does **not** apply per-flake policy filtering: it reads
+straight from the binary index. Putting it in the data-read bracket
+alongside `/query` and `/show` would be a bulk policy bypass for any
+bearer with `can_read(ledger)`. Adding policy-filtered streaming export
+would let it move to read-auth in the future.
+
+### Response (`200 OK`)
+
+The body is the raw RDF for the requested format. `Content-Type` reflects
+the chosen format:
+
+| Format | Content-Type |
+|--------|--------------|
+| Turtle | `text/turtle; charset=utf-8` |
+| N-Triples | `application/n-triples; charset=utf-8` |
+| N-Quads | `application/n-quads; charset=utf-8` |
+| TriG | `application/trig; charset=utf-8` |
+| JSON-LD | `application/ld+json; charset=utf-8` |
+
+The reference server today buffers the full export in memory before responding
+(simple, sufficient for moderate-size ledgers). Implementations are free to
+stream chunked bodies; clients MUST be prepared to read until EOF.
+
+### Required semantics
+
+1. **Format validation.** Reject unknown format strings with `400`.
+2. **Dataset/format coupling.** When `all_graphs == true`, `format` must be
+   `trig` or `nquads`; otherwise return `400` with a message that mentions
+   the dataset format requirement (the local CLI surfaces the same error).
+3. **Time spec parsing.** Same rules as the merge-preview / show
+   contracts: parse as integer first (`t`), then as ISO-8601 if it
+   contains both `-` and `:`, else as a commit CID prefix.
+4. **Graph IRI resolution.** When `graph` is set, resolve via the ledger's
+   graph registry; an unknown IRI is a `400` (or `5xx` if you treat it as
+   a config error — the reference returns `400` via `ApiError::Config`).
+5. **Index requirement.** Export reads from the binary index. If the
+   ledger has no index, the reference server surfaces `ApiError::Config`
+   ("no binary index available for export (is the ledger indexed?)"),
+   which the error mapper returns as `400 Bad Request`. Document that
+   shape if you implement equivalently — the CLI surfaces the message
+   verbatim.
+
+### Error responses
+
+| Status | When |
+|--------|------|
+| `400` | Unknown format; conflicting `all_graphs` + `graph`; `all_graphs` with non-dataset format; unknown graph IRI; malformed JSON; ledger not indexed. |
+| `401` / `403` | Admin token required and absent/invalid. |
+| `404` | Ledger does not exist. |
+| `5xx` | Storage / nameservice / encoding errors during walk. |
+
+### Reference implementation
+
+| Concern | Canonical location |
+|---------|-------------------|
+| HTTP route + auth | `fluree-db-server/src/routes/export.rs::export_ledger_tail` |
+| Builder | `fluree_db_api::export_builder::ExportBuilder` |
+| Format encoders | `fluree_db_api::export` |
+
 ## `/create` Contract
 
 - Endpoint: `POST {api_base_url}/create`
@@ -1293,6 +1492,8 @@ fluree iceberg map my-gs \
 fluree list                    # should show mydb (Ledger) + my-gs (Iceberg)
 fluree info my-gs              # should show Iceberg config + R2RML mapping
 fluree show t:1 --remote origin  # should show decoded commit with resolved IRIs
+fluree log mydb --remote origin --oneline  # should print the remote's commit chain newest-first
+fluree export mydb --remote origin --format turtle > mydb-remote.ttl  # should write Turtle to disk
 fluree drop my-gs --force      # should drop the graph source locally
 fluree drop local-db --remote origin --force  # should drop the published ledger on the remote
 ```

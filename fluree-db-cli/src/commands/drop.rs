@@ -29,6 +29,15 @@ pub async fn run(
         if let Some(client) = context::try_server_route_client(dirs) {
             let result = run_remote(name, &client).await;
             context::persist_refreshed_tokens(&client, context::LOCAL_SERVER_REMOTE, dirs).await;
+            // Auto-route operates against the same on-disk storage as `--direct`,
+            // so a successful drop must also clear the local active-ledger pointer
+            // to avoid leaving CLI state pointing at a deleted ledger.
+            if result.is_ok() {
+                let active = config::read_active_ledger(dirs.data_dir());
+                if active.as_deref() == Some(name) {
+                    config::clear_active_ledger(dirs.data_dir())?;
+                }
+            }
             return result;
         }
     }

@@ -382,6 +382,60 @@ Each flake is a tuple: `[subject, predicate, object, datatype, operation]`. Oper
 
 **Peer mode:** Forwards to the transactor.
 
+### GET /log/*ledger
+
+Return a paginated list of lightweight commit summaries (newest-first by `t`). Server-side equivalent of `fluree log`. Read-auth — does **not** require storage-replication permissions, unlike `/commits`.
+
+**URL:**
+
+```
+GET /log/<ledger...>?limit=<N>
+```
+
+**Query Parameters:**
+
+- `limit` (optional, default `100`): Number of summaries to return. Server clamps to a hard maximum (reference: `5000`).
+
+**Request Headers:**
+
+```http
+Authorization: Bearer <token>   (when data auth is enabled)
+```
+
+**Response Body (200 OK):**
+
+```json
+{
+  "ledger_id": "mydb:main",
+  "commits": [
+    {
+      "t": 12,
+      "commit_id": "bafy...",
+      "time": "2026-04-25T12:00:00Z",
+      "asserts": 3,
+      "retracts": 0,
+      "flake_count": 3,
+      "message": null
+    }
+  ],
+  "count": 12,
+  "truncated": false
+}
+```
+
+`commits` is strictly newest-first by `t` and capped by `limit`. `count` is the full chain length; `truncated == count > commits.len()`. `message` is extracted from `txn_meta` when an `f:message` entry with a string value is present, otherwise `null`. Each summary mirrors `fluree_db_core::CommitSummary`.
+
+**Branch-aware walk:** The walk loads commit envelopes via a branch-aware content store so it can cross fork points — pre-fork commits live under the source branch's namespace.
+
+**Responses:**
+
+- `200 OK`: Summaries returned (possibly empty array when the ledger has no commits)
+- `401 Unauthorized`: Bearer token required but missing
+- `404 Not Found`: Ledger does not exist; or the bearer cannot `can_read`
+- `5xx`: Storage / nameservice errors during walk
+
+**Peer mode:** Forwards to the transactor.
+
 ### GET /commits/*ledger
 
 Export commit blobs from a ledger using stable cursors. Pages walk backward via each commit's `parents` — O(limit) per page regardless of ledger size. Used by `fluree pull` and `fluree clone`.
@@ -2232,6 +2286,64 @@ curl -X POST http://localhost:8090/v1/fluree/reindex \
 - `500 Internal Server Error` — reindex failed
 
 When triggering indexing through the Rust API instead, see `Fluree::reindex` and `ReindexOptions`. For background incremental indexing (which runs automatically as commits are made), see [Background indexing](../indexing-and-search/background-indexing.md).
+
+### POST /export/*ledger
+
+Return ledger data as RDF in the requested format (Turtle, N-Triples, N-Quads, TriG, or JSON-LD). Server-side equivalent of `fluree export`.
+
+**Auth bracket: admin-protected** — same middleware as `/create`, `/drop`, `/reindex`, and the branch admin endpoints. Today's implementation reads from the binary index without per-flake policy filtering, so it does not live in the data-read bracket alongside `/query` and `/show`. Adding policy-filtered streaming export would let it move to read-auth in the future.
+
+**URL:**
+
+```
+POST /export/<ledger...>
+```
+
+**Request Body:**
+
+```json
+{
+  "format": "turtle",
+  "all_graphs": false,
+  "graph": "http://example.org/people",
+  "context": { "ex": "http://example.org/" },
+  "at": "t:42"
+}
+```
+
+| Field | Type | Required | Default | Description |
+|-------|------|----------|---------|-------------|
+| `format` | string | No | `"turtle"` | One of `turtle`/`ttl`, `ntriples`/`nt`, `nquads`/`n-quads`, `trig`, `jsonld`/`json-ld`/`json`. Case-insensitive. |
+| `all_graphs` | bool | No | `false` | Export every named graph as a dataset. Requires `format` ∈ `trig` / `nquads`. Mutually exclusive with `graph`. |
+| `graph` | string | No | — | IRI of a single named graph to export. Mutually exclusive with `all_graphs`. |
+| `context` | object | No | ledger default | Prefix map for Turtle/TriG/JSON-LD output. Either a bare object or `{"@context": {…}}`. |
+| `at` | string | No | latest | Time spec — integer (`"42"`), ISO-8601 datetime, or commit CID prefix. |
+
+An empty body is treated as all-default (Turtle export at HEAD).
+
+**Response Headers:**
+
+| Format | Content-Type |
+|--------|--------------|
+| Turtle | `text/turtle; charset=utf-8` |
+| N-Triples | `application/n-triples; charset=utf-8` |
+| N-Quads | `application/n-quads; charset=utf-8` |
+| TriG | `application/trig; charset=utf-8` |
+| JSON-LD | `application/ld+json; charset=utf-8` |
+
+**Response Body (200 OK):**
+
+The raw RDF for the requested format. The reference server today buffers the full export in memory before responding; implementations are free to stream chunked bodies, and clients MUST be prepared to read until EOF.
+
+**Status Codes:**
+
+- `200 OK` — export complete
+- `400 Bad Request` — unknown format; conflicting `all_graphs` + `graph`; `all_graphs` with non-dataset format; unknown graph IRI; malformed JSON; ledger not indexed (`ApiError::Config`)
+- `401` / `403` — admin token required and absent/invalid
+- `404 Not Found` — ledger does not exist
+- `5xx` — storage / nameservice / encoding errors
+
+**Peer mode:** Forwards to the transactor.
 
 ## Admin Authentication
 

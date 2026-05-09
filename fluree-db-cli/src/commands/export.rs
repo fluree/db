@@ -2,9 +2,10 @@
 
 use crate::context;
 use crate::error::{CliError, CliResult};
+use crate::remote_client::RemoteLedgerClient;
 use fluree_db_api::export::ExportFormat;
 use fluree_db_api::server_defaults::FlureeDir;
-use std::io::{self, BufWriter};
+use std::io::{self, BufWriter, Write};
 use std::path::Path;
 
 #[allow(clippy::too_many_arguments)]
@@ -17,40 +18,140 @@ pub async fn run(
     context_file: Option<&Path>,
     at: Option<&str>,
     dirs: &FlureeDir,
+    remote_flag: Option<&str>,
+    direct: bool,
 ) -> CliResult<()> {
-    // Check for tracked ledger — export requires local data
-    let store = crate::config::TomlSyncConfigStore::new(dirs.config_dir().to_path_buf());
     let alias = context::resolve_ledger(explicit_ledger, dirs)?;
 
-    // Reject ledger#fragment syntax — use --graph instead
     if alias.contains('#') {
         return Err(CliError::Usage(
             "export does not support 'ledger#fragment' syntax; use --graph <IRI> to export a specific named graph"
                 .to_string(),
         ));
     }
-
     if all_graphs && graph.is_some() {
         return Err(CliError::Usage(
             "cannot use both --all-graphs and --graph; choose one".to_string(),
         ));
     }
 
-    if store.get_tracked(&alias).is_some()
-        || store.get_tracked(&context::to_ledger_id(&alias)).is_some()
+    if let Some(remote_name) = remote_flag {
+        let client = context::build_remote_client(remote_name, dirs).await?;
+        let result = run_remote(
+            &alias,
+            format_str,
+            all_graphs,
+            graph,
+            context_expr,
+            context_file,
+            at,
+            &client,
+        )
+        .await;
+        context::persist_refreshed_tokens(&client, remote_name, dirs).await;
+        return result;
+    }
+
+    if !direct {
+        if let Some(client) = context::try_server_route_client(dirs) {
+            let result = run_remote(
+                &alias,
+                format_str,
+                all_graphs,
+                graph,
+                context_expr,
+                context_file,
+                at,
+                &client,
+            )
+            .await;
+            context::persist_refreshed_tokens(&client, context::LOCAL_SERVER_REMOTE, dirs).await;
+            return result;
+        }
+    }
+
+    run_local(
+        &alias,
+        format_str,
+        all_graphs,
+        graph,
+        context_expr,
+        context_file,
+        at,
+        dirs,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_remote(
+    alias: &str,
+    format_str: &str,
+    all_graphs: bool,
+    graph: Option<&str>,
+    context_expr: Option<&str>,
+    context_file: Option<&Path>,
+    at: Option<&str>,
+    client: &RemoteLedgerClient,
+) -> CliResult<()> {
+    let context_override = resolve_context_override(context_expr, context_file)?;
+
+    let mut body = serde_json::json!({ "format": format_str });
+    if all_graphs {
+        body["all_graphs"] = serde_json::Value::Bool(true);
+    }
+    if let Some(iri) = graph {
+        body["graph"] = serde_json::Value::String(iri.to_string());
+    }
+    if let Some(at_str) = at {
+        body["at"] = serde_json::Value::String(at_str.to_string());
+    }
+    if let Some(ctx) = context_override {
+        body["context"] = ctx;
+    }
+
+    let bytes = client
+        .export_rdf(alias, &body)
+        .await
+        .map_err(|e| CliError::Remote(format!("failed to export '{alias}': {e}")))?;
+
+    let stdout = io::stdout().lock();
+    let mut writer = BufWriter::new(stdout);
+    writer
+        .write_all(&bytes)
+        .map_err(|e| CliError::Config(format!("failed to write export to stdout: {e}")))?;
+    writer
+        .flush()
+        .map_err(|e| CliError::Config(format!("failed to flush stdout: {e}")))?;
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_local(
+    alias: &str,
+    format_str: &str,
+    all_graphs: bool,
+    graph: Option<&str>,
+    context_expr: Option<&str>,
+    context_file: Option<&Path>,
+    at: Option<&str>,
+    dirs: &FlureeDir,
+) -> CliResult<()> {
+    let store = crate::config::TomlSyncConfigStore::new(dirs.config_dir().to_path_buf());
+    if store.get_tracked(alias).is_some()
+        || store.get_tracked(&context::to_ledger_id(alias)).is_some()
     {
         return Err(CliError::Usage(
-            "export is not available for tracked ledgers (no local data).".to_string(),
+            "export is not available for tracked ledgers (no local data); pass --remote <name> to export from the upstream."
+                .to_string(),
         ));
     }
 
     let fluree = context::build_fluree(dirs)?;
 
-    // Parse format string → ExportFormat
     let format = parse_format(format_str)?;
 
-    // Build the export
-    let mut builder = fluree.export(&alias).format(format);
+    let mut builder = fluree.export(alias).format(format);
 
     if all_graphs {
         builder = builder.all_graphs();
@@ -64,7 +165,6 @@ pub async fn run(
         builder = builder.as_of(crate::commands::query::parse_time_spec(at_str));
     }
 
-    // Resolve context override (--context or --context-file)
     if let Some(ctx) = resolve_context_override(context_expr, context_file)? {
         builder = builder.context(&ctx);
     }

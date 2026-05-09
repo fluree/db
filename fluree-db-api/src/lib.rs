@@ -3244,6 +3244,43 @@ impl Fluree {
         export_builder::ExportBuilder::new(self, ledger_id.to_string())
     }
 
+    /// Walk the commit chain for a ledger and return per-commit summaries.
+    ///
+    /// `limit` caps the number of returned summaries (newest-first by `t`).
+    /// The returned `total` reflects the full chain length regardless of cap;
+    /// truncation is implied by `summaries.len() < total`.
+    ///
+    /// Uses a branch-aware content store so the walk crosses fork points —
+    /// pre-fork commits live under the source branch's namespace, not the
+    /// current branch's.
+    pub async fn commit_log(
+        &self,
+        ledger_id: &str,
+        limit: Option<usize>,
+    ) -> Result<(Vec<CommitSummary>, usize)> {
+        let record = self
+            .nameservice()
+            .lookup(ledger_id)
+            .await?
+            .ok_or_else(|| ApiError::NotFound(ledger_id.to_string()))?;
+
+        let head = match record.commit_head_id.as_ref() {
+            Some(id) => id.clone(),
+            None => return Ok((Vec::new(), 0)),
+        };
+
+        let store = fluree_db_nameservice::branched_content_store_for_record(
+            self.backend(),
+            self.nameservice(),
+            &record,
+        )
+        .await?;
+
+        let (summaries, total) =
+            fluree_db_core::walk_commit_summaries(&store, &head, 0, limit).await?;
+        Ok((summaries, total))
+    }
+
     /// Get the default JSON-LD context for a ledger.
     ///
     /// Reads the context CID from nameservice config and fetches the blob

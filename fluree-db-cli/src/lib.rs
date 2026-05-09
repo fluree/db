@@ -284,6 +284,7 @@ pub async fn run(cli: Cli) -> error::CliResult<()> {
             context,
             context_file,
             at,
+            remote,
         } => {
             let fluree_dir = config::require_fluree_dir_or_global(config_path)?;
             commands::export::run(
@@ -295,6 +296,8 @@ pub async fn run(cli: Cli) -> error::CliResult<()> {
                 context_file.as_deref(),
                 at.as_deref(),
                 &fluree_dir,
+                remote.as_deref(),
+                direct,
             )
             .await
         }
@@ -303,9 +306,18 @@ pub async fn run(cli: Cli) -> error::CliResult<()> {
             ledger,
             oneline,
             count,
+            remote,
         } => {
             let fluree_dir = config::require_fluree_dir_or_global(config_path)?;
-            commands::log::run(ledger.as_deref(), oneline, count, &fluree_dir).await
+            commands::log::run(
+                ledger.as_deref(),
+                oneline,
+                count,
+                &fluree_dir,
+                remote.as_deref(),
+                direct,
+            )
+            .await
         }
 
         Commands::Show {

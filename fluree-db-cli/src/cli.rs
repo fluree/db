@@ -543,6 +543,10 @@ pub enum Commands {
         /// Query at a specific point in time
         #[arg(long)]
         at: Option<String>,
+
+        /// Execute against a remote server (by remote name, e.g., "origin")
+        #[arg(long)]
+        remote: Option<String>,
     },
 
     /// Show commit log for a ledger
@@ -557,6 +561,10 @@ pub enum Commands {
         /// Maximum number of commits to show
         #[arg(short = 'n', long)]
         count: Option<usize>,
+
+        /// Execute against a remote server (by remote name, e.g., "origin")
+        #[arg(long)]
+        remote: Option<String>,
     },
 
     /// Show the contents of a commit (decoded flakes with resolved IRIs)

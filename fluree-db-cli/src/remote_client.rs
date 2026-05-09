@@ -1099,6 +1099,69 @@ impl RemoteLedgerClient {
     }
 
     // =========================================================================
+    // RDF export
+    // =========================================================================
+
+    /// Fetch an RDF export of a ledger from the remote.
+    ///
+    /// Calls `POST {base_url}/export/<ledger>` with the JSON body documented
+    /// in the `/export` Contract. Returns the raw response bytes (the
+    /// requested RDF format) — the caller is responsible for writing them
+    /// to the desired sink.
+    pub async fn export_rdf(
+        &self,
+        ledger: &str,
+        body: &serde_json::Value,
+    ) -> Result<bytes::Bytes, RemoteLedgerError> {
+        let url = self.op_url("export", ledger);
+        let req_body = Some(RequestBody::Json(body));
+
+        let resp = self
+            .build_request(reqwest::Method::POST, &url, "application/json", &req_body)
+            .send()
+            .await
+            .map_err(Self::map_network_error)?;
+
+        let resp = if resp.status() == StatusCode::UNAUTHORIZED && self.try_refresh().await {
+            self.build_request(reqwest::Method::POST, &url, "application/json", &req_body)
+                .send()
+                .await
+                .map_err(Self::map_network_error)?
+        } else {
+            resp
+        };
+
+        if !resp.status().is_success() {
+            return Err(Self::map_error(resp).await);
+        }
+
+        resp.bytes()
+            .await
+            .map_err(|e| RemoteLedgerError::InvalidResponse(format!("read body: {e}")))
+    }
+
+    // =========================================================================
+    // Commit log
+    // =========================================================================
+
+    /// Fetch lightweight commit summaries from the remote.
+    ///
+    /// Calls `GET {base_url}/log/<ledger>?limit=<N>`. The server returns
+    /// summaries newest-first by `t`, capped at the server's hard maximum.
+    pub async fn commit_log(
+        &self,
+        ledger: &str,
+        limit: Option<usize>,
+    ) -> Result<serde_json::Value, RemoteLedgerError> {
+        let mut url = self.op_url("log", ledger);
+        if let Some(n) = limit {
+            url.push_str(&format!("?limit={n}"));
+        }
+        self.send_json(reqwest::Method::GET, &url, "application/json", None)
+            .await
+    }
+
+    // =========================================================================
     // Reindex
     // =========================================================================
 
