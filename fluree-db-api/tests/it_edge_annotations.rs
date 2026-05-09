@@ -503,6 +503,135 @@ async fn subject_expansion_emits_annotation_block_for_annotated_edge() {
 
 #[tokio::test]
 #[cfg(feature = "native")]
+async fn first_annotation_through_incremental_index_flips_has_annotations() {
+    // Regression: when a ledger is first reindexed via the
+    // incremental path AFTER receiving its first annotation,
+    // `IndexRoot.has_annotations` must flip to `true`. Otherwise
+    // post-reindex (when the novelty bit drains) the cascade
+    // fast-path would skip the scan and leave dangling
+    // `f:reifies*` flakes for any later retract.
+    //
+    // Test path:
+    //   1. Insert plain (non-annotated) data, reindex → indexed
+    //      root has `has_annotations = false`.
+    //   2. Insert annotated edge → novelty bit fires.
+    //   3. Reindex (incremental path clones the old root) →
+    //      indexed root MUST flip `has_annotations` to `true`.
+    //   4. Retract the base edge → the cascade gate must NOT
+    //      short-circuit (would skip if either bit were false).
+    //   5. Re-insert the base edge alone, query @reifies → zero
+    //      rows (cascade actually fired and retracted the bundle).
+    let fluree = FlureeBuilder::memory()
+        .with_ledger_cache_config(fluree_db_api::LedgerManagerConfig::default())
+        .build_memory();
+    let ledger_id = "it/edge-annotations:incremental-flips-flag";
+
+    let (local, handle) = support::start_background_indexer_local(
+        fluree.backend().clone(),
+        Arc::new(fluree.nameservice_mode().clone()),
+        fluree_db_indexer::IndexerConfig::small(),
+    );
+
+    local
+        .run_until(async move {
+            let ledger0 = genesis_ledger(&fluree, ledger_id);
+
+            // Step 1: plain insert → indexed root with no annotations.
+            let plain = json!({
+                "@context": ctx(),
+                "@id": "ex:bob",
+                "ex:name": "Bob"
+            });
+            let after_plain = fluree.insert(ledger0, &plain).await.expect("plain insert");
+            support::trigger_index_and_wait(&handle, ledger_id, after_plain.receipt.t).await;
+
+            // Step 2: insert an annotated edge.
+            let after_plain_reload = fluree
+                .ledger(ledger_id)
+                .await
+                .expect("reload after plain reindex");
+            let annotated = json!({
+                "@context": ctx(),
+                "@id": "ex:alice",
+                "ex:worksFor": {
+                    "@id": "ex:acme",
+                    "@annotation": {
+                        "@id": "ex:emp/alice-acme",
+                        "ex:role": "Engineer"
+                    }
+                }
+            });
+            let after_annotated = fluree
+                .insert(after_plain_reload, &annotated)
+                .await
+                .expect("annotated insert");
+
+            // Step 3: reindex → incremental path clones the old
+            // root and must OR-update `has_annotations` from the
+            // newly-added `f:reifies*` predicates.
+            support::trigger_index_and_wait(&handle, ledger_id, after_annotated.receipt.t).await;
+            let post_reindex = fluree
+                .ledger(ledger_id)
+                .await
+                .expect("reload after annotated reindex");
+            assert!(
+                post_reindex.snapshot.has_annotations,
+                "incremental indexing of the first annotation must flip \
+                 IndexRoot.has_annotations to true (otherwise the cascade \
+                 fast-path would skip post-reindex retracts)"
+            );
+
+            // Step 4: retract the base edge. The cascade gate sees
+            // `snapshot.has_annotations = true` so the scan runs.
+            let delete = json!({
+                "@context": ctx(),
+                "where": { "@id": "?s", "ex:worksFor": { "@id": "?o" } },
+                "delete": { "@id": "?s", "ex:worksFor": { "@id": "?o" } }
+            });
+            let after_delete = fluree
+                .update(post_reindex, &delete)
+                .await
+                .expect("base-edge delete");
+
+            // Step 5: re-insert just the base edge, query @reifies
+            // — must return zero rows (proving cascade actually ran
+            // post-reindex).
+            let reinsert = json!({
+                "@context": ctx(),
+                "@id": "ex:alice",
+                "ex:worksFor": { "@id": "ex:acme" }
+            });
+            let after_reinsert = fluree
+                .insert(after_delete.ledger, &reinsert)
+                .await
+                .expect("plain re-insert");
+
+            let q = json!({
+                "@context": ctx(),
+                "select": ["?person", "?org"],
+                "where": {
+                    "ex:role": "Engineer",
+                    "@reifies": {
+                        "@id": "?person",
+                        "ex:worksFor": { "@id": "?org" }
+                    }
+                }
+            });
+            let post = support::query_jsonld_formatted(&fluree, &after_reinsert.ledger, &q)
+                .await
+                .expect("post-cascade @reifies query");
+            let arr = post.as_array().expect("array");
+            assert!(
+                arr.is_empty(),
+                "post-incremental-reindex retract must cascade (proving the \
+                 sticky bit flipped on incremental rebuild): {arr:#?}"
+            );
+        })
+        .await;
+}
+
+#[tokio::test]
+#[cfg(feature = "native")]
 async fn cascade_fires_for_indexed_annotation_when_edge_is_retracted() {
     // M2 indexed-readpath proof for the cascade path: insert an
     // annotated edge, force a reindex (drains novelty into base),
