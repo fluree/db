@@ -111,7 +111,7 @@ num-bigdecimal = { package = "bigdecimal", version = "0.4" }
 # may still compile. The main compile-time win is avoiding fluree-db-credential
 # and its full dep tree when the feature is off.
 ed25519-dalek = "2.1"
-criterion = "0.5"
+criterion = { version = "0.5", features = ["async_tokio"] }
 rand = { workspace = true }
 fluree-db-nameservice-sync = { path = "../fluree-db-nameservice-sync" }
 
@@ -149,3 +149,7 @@ harness = false
 
 [lints]
 workspace = true
+
+[[bench]]
+name = "annotation_hydration"
+harness = false
