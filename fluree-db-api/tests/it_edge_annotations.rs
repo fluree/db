@@ -735,6 +735,74 @@ async fn subject_expansion_emits_no_annotation_when_edge_has_none() {
 }
 
 #[tokio::test]
+async fn variable_predicate_scan_hides_f_reifies() {
+    // A triple pattern with a variable predicate (`?s ?p ?o`) used
+    // to surface `f:reifies*` system flakes from the annotation
+    // subject's overlay rows. The scan-layer filter in
+    // `flakes_to_bindings` skips Fluree-system-namespace predicates
+    // when the user's predicate slot is a variable, mirroring the
+    // existing filter on the binary-cursor path.
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger_id = "it/edge-annotations:variable-predicate-no-leak";
+    let ledger0 = genesis_ledger(&fluree, ledger_id);
+
+    let txn = json!({
+        "@context": ctx(),
+        "@id": "ex:alice",
+        "ex:worksFor": {
+            "@id": "ex:acme",
+            "@annotation": {
+                "@id": "ex:emp/alice-acme",
+                "ex:role": "Engineer"
+            }
+        }
+    });
+    let committed = fluree.insert(ledger0, &txn).await.expect("annotated insert");
+
+    // Bind ?p to every predicate the annotation subject carries.
+    let query = json!({
+        "@context": ctx(),
+        "select": ["?p"],
+        "where": { "@id": "ex:emp/alice-acme", "?p": "?o" }
+    });
+    let rows = support::query_jsonld_formatted(&fluree, &committed.ledger, &query)
+        .await
+        .expect("variable-predicate query");
+    let arr = rows.as_array().expect("array");
+
+    // Collect the predicate bindings as strings.
+    let predicates: Vec<String> = arr
+        .iter()
+        .filter_map(|row| row.as_array())
+        .filter_map(|cols| cols.first())
+        .filter_map(|v| {
+            v.as_str()
+                .map(String::from)
+                .or_else(|| v.get("@id").and_then(|i| i.as_str()).map(String::from))
+        })
+        .collect();
+
+    // No `f:reifies*` predicate may leak.
+    for p in &predicates {
+        assert!(
+            !p.starts_with("https://ns.flur.ee/db#reifies"),
+            "f:reifies* must not leak through variable-predicate scan: {p} \
+             (full bindings: {predicates:?})"
+        );
+        assert!(
+            !p.starts_with("f:reifies"),
+            "compact f:reifies* form must not leak: {p}"
+        );
+    }
+    // The user-authored `ex:role` must still be visible.
+    assert!(
+        predicates.iter().any(|p| p == "http://example.org/role"
+            || p == "ex:role"),
+        "user-authored ex:role must be visible: {predicates:?}"
+    );
+}
+
+#[tokio::test]
 async fn wildcard_subject_hydration_hides_f_reifies_predicates() {
     // Annotation subjects minted by the M1a transactor lowering carry
     // `f:reifies*` system facts in addition to the user-authored body

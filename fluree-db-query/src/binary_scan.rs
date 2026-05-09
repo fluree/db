@@ -694,6 +694,25 @@ impl BinaryScanOperator {
                 break;
             };
 
+            // Mirror the binary-cursor path's `is_internal_predicate`
+            // filter on the overlay/novelty side: when the
+            // predicate is a variable in the user's pattern, hide
+            // every Fluree system predicate (the
+            // `https://ns.flur.ee/db#` namespace, which includes
+            // the `f:reifies*` set). Without this, a scan like
+            // `?s ?p ?o` against an annotated subject leaks
+            // `f:reifiesSubject` / `f:reifiesPredicate` /
+            // `f:reifiesObject` flakes from the novelty overlay.
+            // The binary-cursor path already filtered these for
+            // indexed data; extending the filter here closes the
+            // novelty leak.
+            if self.p_is_var
+                && self.g_id == 0
+                && flake.p.namespace_code == fluree_vocab::namespaces::FLUREE_DB
+            {
+                continue;
+            }
+
             if let Some(target_iri) = self.unresolved_bound_subject_iri.as_ref() {
                 let subject_iri = ctx
                     .active_snapshot
