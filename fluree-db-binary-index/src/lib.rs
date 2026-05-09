@@ -9,6 +9,7 @@ pub mod analyzer;
 pub mod error;
 pub mod types;
 
+pub mod annotation_arena;
 pub mod arena;
 pub mod dict;
 pub mod dict_novelty_safe;
