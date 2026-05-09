@@ -26,29 +26,74 @@ pub trait FulltextConfigProvider: std::fmt::Debug + Send + Sync {
     ) -> Vec<ConfiguredFulltextProperty>;
 }
 
+/// Coverage envelope for caller-supplied attachment events.
+///
+/// Tells the indexer how to combine the supplied events with the base
+/// root's existing arena (when present). The wrong coverage label
+/// will either drop history (if `Authoritative` is asserted on a
+/// post-reload tail) or double-count rows (if `Augment` is supplied
+/// with already-indexed events that don't deduplicate cleanly), so
+/// providers must be precise.
+#[derive(Debug, Clone)]
+pub enum AttachmentEventCoverage {
+    /// Caller asserts `events` is the **complete** history of every
+    /// `f:reifies*` event the snapshot has ever observed. The indexer
+    /// rebuilds the arena from scratch from this set; the previous
+    /// arena is enumerated only for GC reachability.
+    ///
+    /// Safe only when the caller has seen every commit since
+    /// genesis (or at least since the predicate dictionary first
+    /// observed an `f:reifies*` SID). A long-running ledger with a
+    /// continuously populated `AttachmentNovelty` qualifies; an
+    /// `AttachmentNovelty` reconstructed by `LedgerState::load` from
+    /// post-index commits **does not** — `load_novelty` only walks
+    /// commits with `t > snapshot.t`.
+    Authoritative(Vec<(fluree_db_core::EdgeKey, fluree_db_core::Sid, i64, bool)>),
+
+    /// Caller has events but can't guarantee full-history coverage.
+    /// The indexer concatenates `events` with the previous arena's
+    /// events, deduplicates by `(edge, ann, t, op)` tuple, and
+    /// rebuilds. The dedup step makes this correct regardless of
+    /// whether the caller's events overlap the previous arena.
+    ///
+    /// Safe default for orchestrator-driven providers that read the
+    /// running `AttachmentNovelty.iter_event_pairs()` — that
+    /// overlay's coverage shifts between "full history" (for a
+    /// continuously running ledger) and "post-index tail" (after a
+    /// reload or eviction), and the merge-and-dedupe path stays
+    /// correct in both shapes.
+    Augment(Vec<(fluree_db_core::EdgeKey, fluree_db_core::Sid, i64, bool)>),
+
+    /// Caller couldn't produce events this pass. Indexer treats as
+    /// delta-unknown — when the base root carries an arena, the new
+    /// root drops it (recording old leaves as replaced for GC) and
+    /// hydration falls back to scan until the next pass.
+    Unknown,
+}
+
 /// Per-ledger attachment-events resolver for arena sealing on the
 /// background-indexer path.
 ///
 /// Implementations (typically in the api layer) resolve a ledger ID
-/// to the running `AttachmentNovelty.iter_event_pairs()` snapshot at
-/// job-dispatch time. The indexer takes the returned vec and stamps
-/// it into a per-job `IndexerConfig.attachment_events`.
+/// to a coverage envelope at job-dispatch time. The indexer takes
+/// the resulting [`AttachmentEventCoverage`] and stamps it into a
+/// per-job `IndexerConfig.attachment_events`.
 ///
-/// **Return semantics — same as `attachment_events`:**
-/// - `Some(events)`: caller produced the delta; arena gets sealed.
-/// - `None`: delta unknown; the indexer drops any base-root arena to
-///   force the scan-fallback hydration path until the next seal.
+/// **Return semantics:**
+/// - `Some(Authoritative(events))`: full history; indexer rebuilds
+///   from scratch.
+/// - `Some(Augment(events))`: partial coverage; indexer merges with
+///   previous arena's events and dedupes.
+/// - `Some(Unknown)` or `None`: defensive drop (treated identically).
 ///
 /// Implementations should be cheap on the happy path (one privileged
-/// read of the running ledger state) and return `None` rather than
-/// panic when the ledger isn't loaded — a missing ledger shouldn't
-/// block the indexing run; the defensive drop covers correctness.
+/// read of the running ledger state) and return
+/// `Some(Unknown)` / `None` rather than panic when the ledger isn't
+/// loaded — a missing ledger shouldn't block the indexing run; the
+/// defensive drop covers correctness.
 #[async_trait]
 pub trait AttachmentEventsProvider: std::fmt::Debug + Send + Sync {
-    async fn attachment_events(
-        &self,
-        ledger_id: &str,
-    ) -> Option<Vec<(fluree_db_core::EdgeKey, fluree_db_core::Sid, i64, bool)>>;
+    async fn attachment_events(&self, ledger_id: &str) -> Option<AttachmentEventCoverage>;
 }
 
 /// Scope of a configured full-text property entry.
@@ -201,39 +246,25 @@ pub struct IndexerConfig {
 
     /// Edge-annotation attachment events to seal into the new arena.
     ///
-    /// `(edge, ann_sid, t, op)` tuples — the **complete event history**
-    /// the new snapshot should publish, sourced from the running
-    /// ledger's `AttachmentNovelty.iter_event_pairs()`. The indexer
-    /// rebuilds the arena from scratch from this set; the previous
-    /// arena (when present) participates only for GC reachability.
+    /// `Some(coverage)` carries an [`AttachmentEventCoverage`]
+    /// envelope that tells the indexer how to combine the events
+    /// with the base root's existing arena:
     ///
-    /// The complete-history contract is correct because the api-side
-    /// `AttachmentNovelty` preserves attachment events across
-    /// reindexes (`clear_up_to` does not trim attachments), so the
-    /// running overlay always carries the full history.
+    /// - `Authoritative(events)`: caller has the complete history;
+    ///   the indexer rebuilds the arena from scratch from this set.
+    /// - `Augment(events)`: caller has partial events; the indexer
+    ///   merges with the previous arena's events, dedupes by
+    ///   `(edge, ann, t, op)`, and rebuilds.
+    /// - `Unknown`: caller couldn't produce events; defensive drop.
     ///
-    /// **Semantics — `None` means delta is unknown, not empty.**
-    ///
-    /// - `Some(events)` (including `Some(vec![])`): the caller has
-    ///   determined the exact event set. The indexer seals an
-    ///   authoritative arena (possibly empty) with `max_t` clipped
-    ///   to `IndexRoot.index_t`. Readers prefer this arena over the
-    ///   scan path.
-    /// - `None`: the caller could not produce the history this pass.
-    ///   The indexer treats this as **delta unknown**: when the
-    ///   base root carries an `annotation_index`, the new root drops
-    ///   it (recording the old branch + leaf CIDs as replaced for GC)
-    ///   so hydration falls back to the scan path. Publishing a
-    ///   carried-forward arena would risk hiding newly-indexed
-    ///   annotations whose `f:reifies*` events landed in novelty
-    ///   between this pass and the previous arena seal.
+    /// `None` is treated identically to `Some(Unknown)`.
     ///
     /// Direct callers (CLI tools, tests, custom orchestrators with a
     /// snapshot in hand) populate this field directly. The
     /// `BackgroundIndexerWorker` path uses
-    /// [`Self::attachment_events_provider`] to resolve events
+    /// [`Self::attachment_events_provider`] to resolve coverage
     /// per-ledger at job-dispatch time.
-    pub attachment_events: Option<Vec<(fluree_db_core::EdgeKey, fluree_db_core::Sid, i64, bool)>>,
+    pub attachment_events: Option<AttachmentEventCoverage>,
 
     /// Per-ledger attachment-events resolver for orchestrator paths.
     ///

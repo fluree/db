@@ -34,8 +34,7 @@
 use std::sync::{Arc, OnceLock};
 
 use async_trait::async_trait;
-use fluree_db_core::{EdgeKey, Sid};
-use fluree_db_indexer::AttachmentEventsProvider;
+use fluree_db_indexer::{AttachmentEventCoverage, AttachmentEventsProvider};
 
 use crate::ledger_manager::LedgerManager;
 
@@ -58,8 +57,17 @@ impl std::fmt::Debug for ApiAttachmentEventsProvider {
 
 #[async_trait]
 impl AttachmentEventsProvider for ApiAttachmentEventsProvider {
-    async fn attachment_events(&self, ledger_id: &str) -> Option<Vec<(EdgeKey, Sid, i64, bool)>> {
+    async fn attachment_events(&self, ledger_id: &str) -> Option<AttachmentEventCoverage> {
         let manager = self.manager.get()?;
-        manager.try_running_attachment_events(ledger_id).await
+        // Return `Augment`: the running `AttachmentNovelty` may carry
+        // the full history (continuously-running ledger) or only the
+        // post-index tail (after a reload — `LedgerState::load` only
+        // walks commits with `t > snapshot.t` to rebuild novelty).
+        // The indexer's Augment path merges with the base arena's
+        // events and dedupes, which is correct under both shapes.
+        // Asserting Authoritative here would silently drop history
+        // after any reload that precedes a non-annotation commit.
+        let events = manager.try_running_attachment_events(ledger_id).await?;
+        Some(AttachmentEventCoverage::Augment(events))
     }
 }

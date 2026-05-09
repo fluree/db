@@ -2323,52 +2323,35 @@ pub async fn incremental_index(
 
     // ---- Phase 3d: Annotation arena seal ----
     //
-    // Contract (post slice 3f): `attachment_events` is the **complete
-    // event history** the new snapshot should publish, not a delta.
-    // The api-side `AttachmentNovelty` preserves attachment events
-    // across reindexes (`clear_up_to` doesn't trim attachments), so
-    // a provider returns the full history. The indexer rebuilds the
-    // arena from scratch from this set; the previous arena
-    // participates only for GC reachability.
+    // Coverage envelope from the caller:
     //
-    // Filtering: events are clipped to `t <= record.commit_t` so a
-    // concurrent commit's events can't leak into a root whose
-    // `index_t` is still `commit_t`. Keeps the invariant
-    // `AnnotationIndexRoot.max_t <= IndexRoot.index_t`.
+    //   Authoritative(events) → events are the complete history;
+    //                            rebuild from scratch. Previous arena
+    //                            participates only for GC.
+    //   Augment(events)       → partial coverage; merge with the
+    //                            previous arena's events, dedupe by
+    //                            (edge, ann, t, op), rebuild. Stays
+    //                            correct under reload/eviction
+    //                            scenarios where the running
+    //                            AttachmentNovelty doesn't cover
+    //                            pre-index history.
+    //   Unknown / None        → defensive drop when base has arena;
+    //                            no-op when base has none.
     //
-    // Cases:
-    //
-    //   events=Some(_)   → seal authoritative arena from the
-    //                       complete history (clipped to job_t). The
-    //                       previous arena (if any) is enumerated
-    //                       only for GC. Correct regardless of
-    //                       whether the base root carried an arena
-    //                       or stayed in scan-fallback — the
-    //                       complete-history contract guarantees
-    //                       no historical attachments are missed.
-    //
-    //   events=None, base_arena=Some
-    //                    → defensive drop. Caller couldn't produce
-    //                       the history this pass; carrying the old
-    //                       arena would publish a stale-but-
-    //                       authoritative pointer. Drop it; readers
-    //                       fall back to scan until the next pass.
-    //
-    //   events=None, base_arena=None
-    //                    → no-op. Non-annotation ledger fast path or
-    //                       already in scan-fallback state.
+    // Events are clipped to `t <= record.commit_t` so a concurrent
+    // commit's events can't leak into a root whose `index_t` is still
+    // `commit_t`. Keeps `AnnotationIndexRoot.max_t <= IndexRoot.index_t`.
     let job_t = record.commit_t;
-    let clipped_events = config.attachment_events.as_ref().map(|events| {
-        let mut e = events.clone();
-        e.retain(|(_, _, t, _)| *t <= job_t);
-        e
-    });
-    match (clipped_events.as_ref(), base_root.annotation_index.as_ref()) {
-        (Some(_), _) => {
-            let events = clipped_events.unwrap_or_default();
+    use crate::config::AttachmentEventCoverage;
+    let coverage = config.attachment_events.clone();
+    let prev_arena = base_root.annotation_index.as_ref();
+
+    match coverage {
+        Some(AttachmentEventCoverage::Authoritative(mut events)) => {
+            events.retain(|(_, _, t, _)| *t <= job_t);
             let result = crate::build::annotation_arena::build_and_persist_annotation_arena(
                 &content_store,
-                base_root.annotation_index.as_ref(),
+                prev_arena,
                 events,
             )
             .await?;
@@ -2382,32 +2365,76 @@ pub async fn incremental_index(
             }
             root_builder.set_annotation_index(result.new_index, result.replaced_leaf_cids);
         }
-        (None, Some(prev)) => {
-            // Delta unknown but base has an arena — defensively drop
-            // it. Collect the previous leaf CIDs so GC can reclaim
-            // them; the previous branch CIDs are recorded by
-            // `set_annotation_index` automatically.
-            let reader = fluree_db_binary_index::annotation_arena::AnnotationArenaReader::new(
-                prev,
-                content_store.as_ref(),
-            );
-            let prev_leaf_cids = reader
-                .all_leaf_cids()
-                .await
-                .map_err(crate::error::IndexerError::Core)?;
-            tracing::warn!(
-                ledger_id = %ledger_id,
-                "incremental indexer received attachment_events=None but base \
-                 root carries an arena; dropping arena on new root to avoid \
-                 publishing stale-but-authoritative attachment state. \
-                 Hydration falls back to scan path until the next reindex \
-                 pass supplies events."
-            );
-            root_builder.set_annotation_index(None, prev_leaf_cids);
+        Some(AttachmentEventCoverage::Augment(mut events)) => {
+            events.retain(|(_, _, t, _)| *t <= job_t);
+            // Pull the previous arena's events (if any) and merge
+            // with the caller's. Dedupe by full tuple so overlap is
+            // safe — e.g. a continuously-running ledger whose
+            // overlay still holds pre-index events that match the
+            // base arena.
+            let prev_events: Vec<_> = if let Some(prev) = prev_arena {
+                let reader = fluree_db_binary_index::annotation_arena::AnnotationArenaReader::new(
+                    prev,
+                    content_store.as_ref(),
+                );
+                reader
+                    .collect_all_forward_events()
+                    .await
+                    .map_err(crate::error::IndexerError::Core)?
+            } else {
+                Vec::new()
+            };
+            let mut combined: Vec<(fluree_db_core::EdgeKey, fluree_db_core::Sid, i64, bool)> =
+                Vec::with_capacity(prev_events.len() + events.len());
+            combined.extend(prev_events);
+            combined.extend(events);
+            // Sort + dedup_by_key — `(edge, ann, t, op)` tuples
+            // already implement Ord. After this `combined` carries
+            // every distinct event observed across both sources.
+            combined.sort();
+            combined.dedup();
+
+            let result = crate::build::annotation_arena::build_and_persist_annotation_arena(
+                &content_store,
+                prev_arena,
+                combined,
+            )
+            .await?;
+            if let Some(ref ann) = result.new_index {
+                debug_assert!(
+                    ann.max_t <= job_t,
+                    "AnnotationIndexRoot.max_t ({}) must not exceed IndexRoot.index_t ({})",
+                    ann.max_t,
+                    job_t
+                );
+            }
+            root_builder.set_annotation_index(result.new_index, result.replaced_leaf_cids);
         }
-        (None, None) => {
-            // Nothing to do — non-annotation ledger fast path, or
-            // already in scan-fallback state.
+        Some(AttachmentEventCoverage::Unknown) | None => {
+            if let Some(prev) = prev_arena {
+                // Delta unknown but base has an arena — defensively
+                // drop it. Collect the previous leaf CIDs so GC can
+                // reclaim them.
+                let reader = fluree_db_binary_index::annotation_arena::AnnotationArenaReader::new(
+                    prev,
+                    content_store.as_ref(),
+                );
+                let prev_leaf_cids = reader
+                    .all_leaf_cids()
+                    .await
+                    .map_err(crate::error::IndexerError::Core)?;
+                tracing::warn!(
+                    ledger_id = %ledger_id,
+                    "incremental indexer received Unknown / None coverage but \
+                     base root carries an arena; dropping arena on new root \
+                     to avoid publishing stale-but-authoritative attachment \
+                     state. Hydration falls back to scan path until the next \
+                     reindex pass supplies events."
+                );
+                root_builder.set_annotation_index(None, prev_leaf_cids);
+            }
+            // Else: non-annotation ledger fast path, or already in
+            // scan-fallback state. Nothing to do.
         }
     }
 

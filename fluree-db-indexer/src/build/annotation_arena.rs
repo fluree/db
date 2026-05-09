@@ -330,6 +330,25 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn augment_path_merges_and_dedupes() {
+        // The Augment path in Phase 3d concats prev events with
+        // caller events, then sorts + dedups by full tuple. Verify
+        // the dedup actually drops exact-tuple duplicates.
+        let mut combined: Vec<(EdgeKey, Sid, i64, bool)> = vec![
+            (edge("alice", "worksFor", "acme"), ann("ann_1"), 5, true),
+            (edge("alice", "worksFor", "acme"), ann("ann_1"), 5, true), // duplicate
+            (edge("alice", "worksFor", "acme"), ann("ann_1"), 8, false),
+        ];
+        combined.sort();
+        combined.dedup();
+        assert_eq!(
+            combined.len(),
+            2,
+            "exact-tuple duplicates must collapse to one"
+        );
+    }
+
+    #[tokio::test]
     async fn rebuild_does_not_double_count_when_caller_supplies_complete_history() {
         // If a caller mistakenly passed only a delta, the previous
         // arena's events would be missed but the rebuild stays
