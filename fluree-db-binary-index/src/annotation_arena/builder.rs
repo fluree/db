@@ -66,28 +66,36 @@ pub struct ReverseLeafSummary {
 /// snapshot's `index_t` if it wants the arena root to advertise the
 /// snapshot's `t` even with zero rows.
 ///
-/// `distinct_annotations` and `distinct_edges` are counted by walking
-/// the rows once. Forward-arena rows are sorted by `(edge, ann, t, op)`,
-/// so distinct edges can be counted by tracking adjacent runs without
-/// allocation; distinct annotations must use a `HashSet` because the
-/// same annotation can re-appear after an unrelated edge.
+/// `distinct_edges` and `distinct_annotations` count **live**
+/// attachments only: a `(edge, ann)` pair contributes to the totals
+/// iff the final row in its history group has `op = true`. This
+/// matches the field documentation on [`AnnotationStats`] and gives
+/// the cost-based planner a true "currently attached" snapshot
+/// rather than an over-count of historical churn. Implementation
+/// relies on the `(edge, ann, t, op)` sort: the last row of each
+/// `(edge, ann)` run is the latest event for that pair.
 pub fn forward_arena_stats(rows: &[AnnotationForwardRow]) -> (i64, AnnotationStats) {
     if rows.is_empty() {
         return (0, AnnotationStats::default());
     }
     let mut max_t: i64 = i64::MIN;
-    let mut distinct_edges: u64 = 0;
-    let mut prev_edge: Option<&EdgeKey> = None;
-    let mut anns: HashSet<Sid> = HashSet::with_capacity(rows.len() / 4 + 1);
-    for row in rows {
-        if row.t > max_t {
-            max_t = row.t;
+    let mut live_edges: HashSet<EdgeKey> = HashSet::new();
+    let mut live_anns: HashSet<Sid> = HashSet::new();
+    for i in 0..rows.len() {
+        if rows[i].t > max_t {
+            max_t = rows[i].t;
         }
-        if prev_edge.is_none_or(|e| e != &row.edge) {
-            distinct_edges += 1;
-            prev_edge = Some(&row.edge);
+        let last_in_group = i + 1 == rows.len()
+            || rows[i].edge != rows[i + 1].edge
+            || rows[i].ann != rows[i + 1].ann;
+        // The final event in each (edge, ann) run determines whether
+        // the pair is currently live. Sort tie-breaker on `op` is
+        // `false < true`, so an assert at the same `t` as a retract
+        // correctly wins.
+        if last_in_group && rows[i].op {
+            live_edges.insert(rows[i].edge.clone());
+            live_anns.insert(rows[i].ann.clone());
         }
-        anns.insert(row.ann.clone());
     }
     let stats = AnnotationStats {
         forward_rows: rows.len() as u64,
@@ -95,8 +103,8 @@ pub fn forward_arena_stats(rows: &[AnnotationForwardRow]) -> (i64, AnnotationSta
         // arenas from the same source set. The caller fills in its own
         // count if the two are not symmetric.
         reverse_rows: rows.len() as u64,
-        distinct_edges,
-        distinct_annotations: anns.len() as u64,
+        distinct_edges: live_edges.len() as u64,
+        distinct_annotations: live_anns.len() as u64,
     };
     (max_t, stats)
 }
@@ -111,6 +119,16 @@ pub fn forward_arena_stats(rows: &[AnnotationForwardRow]) -> (i64, AnnotationSta
 /// emit a zero-leaf branch or omit the section entirely (per
 /// `EDGE_ANNOTATIONS.md` Sidecar Artifacts, omission is only legal when
 /// the snapshot has zero `f:reifies*` bundles).
+///
+/// **Routing-key cohesion.** Chunks are extended past
+/// `target_rows_per_leaf` whenever splitting would cut a `(edge, ann)`
+/// group across two leaves. The branch holds inclusive `[first, last]`
+/// `(edge, ann)` bounds per leaf; if a single hot routing key spilled
+/// into two leaves, both leaves would advertise the same `(edge, ann)`
+/// in their bounds and a `partition_point` lookup would only see the
+/// first one — silently dropping the rest of the history. The
+/// post-`target` overshoot keeps every history row for one
+/// `(edge, ann)` co-located.
 pub fn build_forward_leaves(
     rows: &[AnnotationForwardRow],
     target_rows_per_leaf: usize,
@@ -123,8 +141,23 @@ pub fn build_forward_leaves(
         "build_forward_leaves: rows must be sorted by (edge, ann, t, op)"
     );
 
-    let mut out = Vec::with_capacity(rows.len().div_ceil(target));
-    for chunk in rows.chunks(target) {
+    let mut out: Vec<(ForwardLeafSummary, Vec<u8>)> = Vec::new();
+    let mut start = 0usize;
+    while start < rows.len() {
+        let mut end = (start + target).min(rows.len());
+        // Extend `end` so we never split a `(edge, ann)` group across
+        // two leaves. The routing key for forward leaves is
+        // `(edge, ann)`; identical values must live in one leaf.
+        while end < rows.len() {
+            let prev = &rows[end - 1];
+            let next = &rows[end];
+            if prev.edge == next.edge && prev.ann == next.ann {
+                end += 1;
+            } else {
+                break;
+            }
+        }
+        let chunk = &rows[start..end];
         let first = chunk.first().expect("non-empty chunk");
         let last = chunk.last().expect("non-empty chunk");
         let summary = ForwardLeafSummary {
@@ -138,6 +171,7 @@ pub fn build_forward_leaves(
             rows: chunk.to_vec(),
         };
         out.push((summary, leaf.encode()));
+        start = end;
     }
     out
 }
@@ -161,6 +195,10 @@ pub fn build_forward_branch(leaves: &[(ForwardLeafSummary, ContentId)]) -> Vec<u
 }
 
 /// Encode the reverse-arena leaves from a sorted row slice.
+///
+/// Same routing-key cohesion guarantee as
+/// [`build_forward_leaves`]: a single `(ann, edge)` group never
+/// straddles two leaves.
 pub fn build_reverse_leaves(
     rows: &[AnnotationReverseRow],
     target_rows_per_leaf: usize,
@@ -173,8 +211,20 @@ pub fn build_reverse_leaves(
         "build_reverse_leaves: rows must be sorted by (ann, edge, t, op)"
     );
 
-    let mut out = Vec::with_capacity(rows.len().div_ceil(target));
-    for chunk in rows.chunks(target) {
+    let mut out: Vec<(ReverseLeafSummary, Vec<u8>)> = Vec::new();
+    let mut start = 0usize;
+    while start < rows.len() {
+        let mut end = (start + target).min(rows.len());
+        while end < rows.len() {
+            let prev = &rows[end - 1];
+            let next = &rows[end];
+            if prev.ann == next.ann && prev.edge == next.edge {
+                end += 1;
+            } else {
+                break;
+            }
+        }
+        let chunk = &rows[start..end];
         let first = chunk.first().expect("non-empty chunk");
         let last = chunk.last().expect("non-empty chunk");
         let summary = ReverseLeafSummary {
@@ -188,6 +238,7 @@ pub fn build_reverse_leaves(
             rows: chunk.to_vec(),
         };
         out.push((summary, leaf.encode()));
+        start = end;
     }
     out
 }
@@ -260,6 +311,37 @@ mod tests {
     }
 
     #[test]
+    fn forward_stats_distinct_excludes_retracted_pairs() {
+        // (edge_0, ann_a) attached then retracted → not live;
+        // (edge_1, ann_b) attached → live. Stats should reflect only
+        // currently-attached pairs, not historical churn.
+        let rows = vec![
+            fwd_row(0, "ann_a", 1, true),
+            fwd_row(0, "ann_a", 2, false),
+            fwd_row(1, "ann_b", 3, true),
+        ];
+        let (max_t, stats) = forward_arena_stats(&rows);
+        assert_eq!(max_t, 3);
+        assert_eq!(stats.forward_rows, 3, "all events still counted");
+        assert_eq!(
+            stats.distinct_edges, 1,
+            "edge_0 was retracted; only edge_1 is live"
+        );
+        assert_eq!(stats.distinct_annotations, 1, "only ann_b is live");
+    }
+
+    #[test]
+    fn forward_stats_assert_at_same_t_as_retract_wins() {
+        // Same `t`, both ops on the same pair. Sort tie-break on
+        // `op` puts `false` before `true`, so the assert is the
+        // final row → pair is live.
+        let rows = vec![fwd_row(0, "ann_a", 5, false), fwd_row(0, "ann_a", 5, true)];
+        let (_, stats) = forward_arena_stats(&rows);
+        assert_eq!(stats.distinct_edges, 1);
+        assert_eq!(stats.distinct_annotations, 1);
+    }
+
+    #[test]
     fn forward_stats_counts_distinct_edges_and_annotations() {
         // Two edges; first has two annotations and a retract event;
         // second shares one annotation with the first.
@@ -301,6 +383,59 @@ mod tests {
         assert_eq!(branch.leaves[0].first_edge, edge(0));
         assert_eq!(branch.leaves[0].last_edge, edge(1));
         assert_eq!(branch.leaves[0].row_count, 3);
+    }
+
+    #[test]
+    fn forward_chunking_keeps_routing_key_groups_together() {
+        // 5 events for the same `(edge_0, ann_a)` history followed by
+        // a singleton `(edge_1, ann_b)`. With `target = 2`, naive
+        // row-count chunking would split `(edge_0, ann_a)` across two
+        // leaves, leaving overlapping inclusive bounds in the branch.
+        // Routing-key cohesion must extend the first chunk past the
+        // target so the hot key stays in one leaf — otherwise a
+        // `partition_point` lookup in the branch would only find the
+        // first leaf and silently drop the rest of the history.
+        let rows: Vec<AnnotationForwardRow> = (1..=5)
+            .map(|t| fwd_row(0, "ann_a", t, true))
+            .chain(std::iter::once(fwd_row(1, "ann_b", 6, true)))
+            .collect();
+        let leaves = build_forward_leaves(&rows, 2);
+        assert_eq!(leaves.len(), 2);
+        assert_eq!(
+            leaves[0].0.row_count, 5,
+            "all 5 (edge_0, ann_a) rows colocated"
+        );
+        assert_eq!(leaves[0].0.first_ann, sid(20, "ann_a"));
+        assert_eq!(leaves[0].0.last_ann, sid(20, "ann_a"));
+        assert_eq!(leaves[1].0.row_count, 1);
+        // Branch entries must have non-overlapping `(edge, ann)` bounds.
+        let entries: Vec<_> = leaves
+            .iter()
+            .map(|(s, b)| (s.clone(), cid_for(b, ContentKind::AnnotationForwardLeaf)))
+            .collect();
+        let branch_bytes = build_forward_branch(&entries);
+        let branch = AnnotationForwardBranch::decode(&branch_bytes).unwrap();
+        for w in branch.leaves.windows(2) {
+            assert!(
+                (&w[0].last_edge, &w[0].last_ann) < (&w[1].first_edge, &w[1].first_ann),
+                "leaf bounds must not overlap on routing key"
+            );
+        }
+    }
+
+    #[test]
+    fn reverse_chunking_keeps_routing_key_groups_together() {
+        // Same scenario for the reverse arena: 5 events for the same
+        // `(ann_a, edge_0)` then a singleton.
+        let rows: Vec<AnnotationReverseRow> = (1..=5)
+            .map(|t| rev_row("ann_a", 0, t, true))
+            .chain(std::iter::once(rev_row("ann_b", 1, 6, true)))
+            .collect();
+        let leaves = build_reverse_leaves(&rows, 2);
+        assert_eq!(leaves.len(), 2);
+        assert_eq!(leaves[0].0.row_count, 5);
+        assert_eq!(leaves[0].0.first_ann, sid(20, "ann_a"));
+        assert_eq!(leaves[0].0.last_ann, sid(20, "ann_a"));
     }
 
     #[test]

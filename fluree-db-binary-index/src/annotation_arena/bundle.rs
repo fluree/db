@@ -78,13 +78,18 @@ pub struct ArenaBuildOutput {
 /// `target_rows_per_leaf` controls leaf chunking; pass
 /// [`DEFAULT_TARGET_ROWS_PER_LEAF`] when in doubt.
 pub fn build_arenas_from_flakes(flakes: &[Flake], target_rows_per_leaf: usize) -> ArenaBuildOutput {
-    // Group by (ann_sid, t, op) — each group is one bundle.
-    // `ann_sid` is the *subject* of every `f:reifies*` flake (the
-    // annotation's id; not the reified edge's subject).
-    let mut groups: HashMap<(Sid, i64, bool), Vec<Flake>> = HashMap::new();
+    // Group by (flake_graph, ann_sid, t, op) — each group is one
+    // bundle. The flake-level graph is part of the key because the
+    // writer convention is that `f:reifies*` flakes for an edge in
+    // graph G are themselves asserted in graph G; folding two graphs
+    // together at this stage would let a pathological cross-graph
+    // collision merge into a single (wrong-graph) bundle. `ann_sid`
+    // is the *subject* of every `f:reifies*` flake — the annotation's
+    // id, not the reified edge's subject.
+    let mut groups: HashMap<(Option<Sid>, Sid, i64, bool), Vec<Flake>> = HashMap::new();
     for f in flakes {
         groups
-            .entry((f.s.clone(), f.t, f.op))
+            .entry((f.g.clone(), f.s.clone(), f.t, f.op))
             .or_default()
             .push(f.clone());
     }
@@ -94,9 +99,30 @@ pub fn build_arenas_from_flakes(flakes: &[Flake], target_rows_per_leaf: usize) -
     let mut skipped: u64 = 0;
     let mut max_t: i64 = 0;
 
-    for ((ann_sid, t, op), bundle) in groups {
+    for ((bundle_g, ann_sid, t, op), bundle) in groups {
         match EdgeKey::from_reifies_facts(&bundle) {
             Ok(edge) => {
+                // Cross-check: the graph the bundle was *asserted in*
+                // (flake-level `g`) must match the graph the bundle
+                // *reifies* (`EdgeKey.g`, derived from the optional
+                // `f:reifiesGraph` flake). Mismatches indicate either
+                // a malformed bundle (e.g. `f:reifiesGraph` missing on
+                // a named-graph edge) or tampered history. Either way,
+                // the safe move is the replay-validator pattern: skip
+                // + count, never silently file the bundle under the
+                // wrong graph in the arena.
+                if edge.g != bundle_g {
+                    skipped += 1;
+                    tracing::warn!(
+                        ann_sid = ?ann_sid,
+                        t,
+                        op,
+                        bundle_graph = ?bundle_g,
+                        edge_graph = ?edge.g,
+                        "skipping bundle: f:reifiesGraph disagrees with flake-level graph"
+                    );
+                    continue;
+                }
                 if t > max_t {
                     max_t = t;
                 }
@@ -159,22 +185,35 @@ pub fn build_arenas_from_flakes(flakes: &[Flake], target_rows_per_leaf: usize) -
     }
 }
 
+/// `distinct_edges` and `distinct_annotations` count **live**
+/// attachments only — `(edge, ann)` pairs whose latest event is
+/// `op = true`. The forward slice is already sorted by
+/// `(edge, ann, t, op)` (caller of [`build_arenas_from_flakes`]
+/// guarantees this), so the last row in each `(edge, ann)` run is
+/// the latest event for that pair. Counting "any row" would
+/// overstate live state after retractions; see the field docs on
+/// [`AnnotationStats`].
 fn compute_stats(
     forward: &[AnnotationForwardRow],
     reverse: &[AnnotationReverseRow],
 ) -> AnnotationStats {
     use std::collections::HashSet;
-    let mut distinct_edges: HashSet<&EdgeKey> = HashSet::with_capacity(forward.len());
-    let mut distinct_anns: HashSet<&Sid> = HashSet::with_capacity(reverse.len());
-    for row in forward {
-        distinct_edges.insert(&row.edge);
-        distinct_anns.insert(&row.ann);
+    let mut live_edges: HashSet<&EdgeKey> = HashSet::new();
+    let mut live_anns: HashSet<&Sid> = HashSet::new();
+    for i in 0..forward.len() {
+        let last_in_group = i + 1 == forward.len()
+            || forward[i].edge != forward[i + 1].edge
+            || forward[i].ann != forward[i + 1].ann;
+        if last_in_group && forward[i].op {
+            live_edges.insert(&forward[i].edge);
+            live_anns.insert(&forward[i].ann);
+        }
     }
     AnnotationStats {
         forward_rows: forward.len() as u64,
         reverse_rows: reverse.len() as u64,
-        distinct_edges: distinct_edges.len() as u64,
-        distinct_annotations: distinct_anns.len() as u64,
+        distinct_edges: live_edges.len() as u64,
+        distinct_annotations: live_anns.len() as u64,
     }
 }
 
@@ -266,20 +305,133 @@ mod tests {
     }
 
     #[test]
-    fn assert_then_retract_same_ann_emits_two_rows() {
-        // Same annotation re-bundled at different (t, op) — two
-        // events, two rows in each direction.
+    fn assert_then_retract_same_ann_emits_two_rows_but_zero_live() {
+        // Two events on the same (edge, ann): attached then retracted.
+        // Both rows survive (history queries need them), but the pair
+        // is no longer live and must not contribute to live-state
+        // stats.
         let mut flakes = make_bundle("ann_1", 5, true);
         flakes.extend(make_bundle("ann_1", 7, false));
         let out = build_arenas_from_flakes(&flakes, DEFAULT_TARGET_ROWS_PER_LEAF);
         assert_eq!(out.stats.forward_rows, 2);
         assert_eq!(out.stats.reverse_rows, 2);
         assert_eq!(
-            out.stats.distinct_edges, 1,
-            "same edge across the two events"
+            out.stats.distinct_edges, 0,
+            "edge attached then retracted is no longer live"
         );
-        assert_eq!(out.stats.distinct_annotations, 1);
+        assert_eq!(
+            out.stats.distinct_annotations, 0,
+            "ann_1 attached then retracted is no longer live"
+        );
         assert_eq!(out.max_t, 7);
+    }
+
+    #[test]
+    fn distinct_stats_count_only_currently_live_pairs() {
+        // ann_a attached then retracted → not live;
+        // ann_b attached → live. Stats reflect live state, not history.
+        let mut flakes = Vec::new();
+        flakes.extend(make_bundle("ann_a", 1, true));
+        flakes.extend(make_bundle("ann_a", 2, false));
+        flakes.extend(make_bundle("ann_b", 3, true));
+        let out = build_arenas_from_flakes(&flakes, DEFAULT_TARGET_ROWS_PER_LEAF);
+        assert_eq!(out.stats.forward_rows, 3, "all events kept for history");
+        assert_eq!(out.stats.distinct_edges, 1, "edge with ann_b is live");
+        assert_eq!(out.stats.distinct_annotations, 1, "only ann_b is live");
+    }
+
+    #[test]
+    fn bundle_with_mismatched_flake_graph_is_skipped() {
+        // Manually build a bundle whose flakes are asserted in a
+        // named graph but whose `f:reifiesGraph` is omitted (so
+        // `EdgeKey::from_reifies_facts` infers default-graph). This
+        // is the malformed shape the cross-check guards against —
+        // accepting it would file the annotation under the wrong
+        // graph in the arena.
+        let ann = ann_sid("ann_x");
+        let bundle_graph = Some(ref_sid("graph_a"));
+        let mk = |p: &str, o: FlakeValue, dt: Sid| {
+            // `Flake::new_in_graph` to mark these as living in
+            // graph_a.
+            Flake::new_in_graph(
+                bundle_graph.clone().unwrap(),
+                ann.clone(),
+                p_reifies(p),
+                o,
+                dt,
+                1,
+                true,
+                None,
+            )
+        };
+        let flakes = vec![
+            mk(
+                db_predicates::REIFIES_SUBJECT,
+                FlakeValue::Ref(ref_sid("alice")),
+                id_dt(),
+            ),
+            mk(
+                db_predicates::REIFIES_PREDICATE,
+                FlakeValue::Ref(ref_sid("worksFor")),
+                id_dt(),
+            ),
+            mk(
+                db_predicates::REIFIES_OBJECT,
+                FlakeValue::Ref(ref_sid("acme")),
+                id_dt(),
+            ),
+            // Note: NO `f:reifiesGraph` flake. EdgeKey.g will decode
+            // as None (default graph), but the bundle was asserted in
+            // graph_a. Cross-check must reject.
+        ];
+        let out = build_arenas_from_flakes(&flakes, DEFAULT_TARGET_ROWS_PER_LEAF);
+        assert_eq!(out.skipped_bundles, 1);
+        assert_eq!(out.stats.forward_rows, 0);
+        assert!(out.forward_leaves.is_empty());
+        assert!(out.reverse_leaves.is_empty());
+    }
+
+    #[test]
+    fn bundle_with_matching_named_graph_is_accepted() {
+        // Same as above, but with the `f:reifiesGraph` flake present
+        // and pointing to graph_a. Cross-check passes; the row lands
+        // in the arena with `EdgeKey.g = Some(graph_a)`.
+        let ann = ann_sid("ann_y");
+        let g = ref_sid("graph_a");
+        let mk = |p: &str, o: FlakeValue, dt: Sid| {
+            Flake::new_in_graph(g.clone(), ann.clone(), p_reifies(p), o, dt, 1, true, None)
+        };
+        let flakes = vec![
+            mk(
+                db_predicates::REIFIES_GRAPH,
+                FlakeValue::Ref(g.clone()),
+                id_dt(),
+            ),
+            mk(
+                db_predicates::REIFIES_SUBJECT,
+                FlakeValue::Ref(ref_sid("alice")),
+                id_dt(),
+            ),
+            mk(
+                db_predicates::REIFIES_PREDICATE,
+                FlakeValue::Ref(ref_sid("worksFor")),
+                id_dt(),
+            ),
+            mk(
+                db_predicates::REIFIES_OBJECT,
+                FlakeValue::Ref(ref_sid("acme")),
+                id_dt(),
+            ),
+        ];
+        let out = build_arenas_from_flakes(&flakes, DEFAULT_TARGET_ROWS_PER_LEAF);
+        assert_eq!(out.skipped_bundles, 0);
+        assert_eq!(out.stats.forward_rows, 1);
+        assert_eq!(out.stats.distinct_edges, 1);
+        // Recovered EdgeKey carries the named graph.
+        let leaf_blob = &out.forward_leaves[0].1;
+        let leaf =
+            crate::annotation_arena::format::AnnotationForwardLeaf::decode(leaf_blob).unwrap();
+        assert_eq!(leaf.rows[0].edge.g, Some(g));
     }
 
     #[test]
