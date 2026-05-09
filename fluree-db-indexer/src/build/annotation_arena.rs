@@ -139,3 +139,127 @@ pub async fn build_and_persist_annotation_arena(
         replaced_leaf_cids,
     })
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use fluree_db_core::storage::MemoryContentStore;
+    use fluree_db_core::FlakeValue;
+
+    fn ann(name: &str) -> Sid {
+        Sid::new(20, name)
+    }
+    fn refs(name: &str) -> Sid {
+        Sid::new(11, name)
+    }
+    fn id_dt() -> Sid {
+        fluree_db_core::id_datatype_sid()
+    }
+    fn edge(s: &str, p: &str, o: &str) -> EdgeKey {
+        EdgeKey {
+            g: None,
+            s: refs(s),
+            p: refs(p),
+            o: FlakeValue::Ref(refs(o)),
+            dt: id_dt(),
+            lang: None,
+            list_i: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn empty_inputs_skip_arena_seal() {
+        let store: Arc<dyn ContentStore> = Arc::new(MemoryContentStore::new());
+        let result = build_and_persist_annotation_arena(&store, None, Vec::new())
+            .await
+            .unwrap();
+        assert!(result.new_index.is_none());
+        assert!(result.replaced_leaf_cids.is_empty());
+    }
+
+    #[tokio::test]
+    async fn novelty_only_seals_new_arena() {
+        let store: Arc<dyn ContentStore> = Arc::new(MemoryContentStore::new());
+        let events = vec![
+            (edge("alice", "worksFor", "acme"), ann("ann_1"), 5, true),
+            (edge("alice", "worksFor", "acme"), ann("ann_2"), 6, true),
+        ];
+        let result = build_and_persist_annotation_arena(&store, None, events)
+            .await
+            .unwrap();
+        let new_index = result.new_index.expect("arena sealed");
+        assert_eq!(new_index.max_t, 6);
+        assert_eq!(new_index.stats.forward_rows, 2);
+        assert_eq!(new_index.stats.distinct_edges, 1);
+        assert_eq!(new_index.stats.distinct_annotations, 2);
+        assert!(
+            result.replaced_leaf_cids.is_empty(),
+            "no previous arena → no replaced leaves"
+        );
+
+        // Roundtrip the new arena via a reader to confirm CAS writes
+        // landed correctly.
+        let reader = AnnotationArenaReader::new(&new_index, store.as_ref());
+        let live = reader
+            .current_annotations_for(&edge("alice", "worksFor", "acme"), 100)
+            .await
+            .unwrap();
+        let mut sids: Vec<Sid> = live.into_iter().collect();
+        sids.sort();
+        assert_eq!(sids, vec![ann("ann_1"), ann("ann_2")]);
+    }
+
+    #[tokio::test]
+    async fn merging_with_previous_arena_yields_replaced_leaf_cids() {
+        let store: Arc<dyn ContentStore> = Arc::new(MemoryContentStore::new());
+
+        // First seal: ann_1 attached at t=5.
+        let first = build_and_persist_annotation_arena(
+            &store,
+            None,
+            vec![(edge("alice", "worksFor", "acme"), ann("ann_1"), 5, true)],
+        )
+        .await
+        .unwrap();
+        let prev = first.new_index.expect("first seal produces an arena");
+
+        // Snapshot the previous leaf CIDs so we can compare.
+        let reader = AnnotationArenaReader::new(&prev, store.as_ref());
+        let prev_leaves: std::collections::HashSet<_> =
+            reader.all_leaf_cids().await.unwrap().into_iter().collect();
+        assert_eq!(prev_leaves.len(), 2, "one forward + one reverse leaf");
+
+        // Second seal: novelty retracts ann_1 at t=8. The merge
+        // should yield a 2-row arena (assert + retract) and report
+        // every CID from the previous arena as replaced.
+        let second = build_and_persist_annotation_arena(
+            &store,
+            Some(&prev),
+            vec![(edge("alice", "worksFor", "acme"), ann("ann_1"), 8, false)],
+        )
+        .await
+        .unwrap();
+        let new_index = second.new_index.expect("second seal");
+        assert_eq!(new_index.max_t, 8);
+        assert_eq!(new_index.stats.forward_rows, 2);
+        assert_eq!(
+            new_index.stats.distinct_edges, 0,
+            "ann_1 retracted → not live"
+        );
+
+        let replaced: std::collections::HashSet<_> =
+            second.replaced_leaf_cids.iter().cloned().collect();
+        assert_eq!(
+            replaced, prev_leaves,
+            "replaced_leaf_cids must enumerate every leaf from the previous arena"
+        );
+
+        // Live read of the merged arena: ann_1 not visible at t=100.
+        let reader = AnnotationArenaReader::new(&new_index, store.as_ref());
+        let live = reader
+            .current_annotations_for(&edge("alice", "worksFor", "acme"), 100)
+            .await
+            .unwrap();
+        assert!(live.is_empty(), "retract overrides assert in merged arena");
+    }
+}
