@@ -36,6 +36,7 @@
 pub mod builder;
 pub mod bundle;
 pub mod format;
+pub mod reader;
 
 pub use builder::{
     build_forward_branch, build_forward_leaves, build_reverse_branch, build_reverse_leaves,
@@ -49,3 +50,4 @@ pub use format::{
     DecodeError, FORWARD_BRANCH_MAGIC, FORWARD_LEAF_MAGIC, REVERSE_BRANCH_MAGIC,
     REVERSE_LEAF_MAGIC,
 };
+pub use reader::AnnotationArenaReader;
