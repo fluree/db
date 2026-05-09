@@ -294,6 +294,80 @@ async fn annotation_rooted_query_returns_no_rows_when_metadata_doesnt_match() {
 }
 
 #[tokio::test]
+async fn wildcard_subject_hydration_hides_f_reifies_predicates() {
+    // Annotation subjects minted by the M1a transactor lowering carry
+    // `f:reifies*` system facts in addition to the user-authored body
+    // properties. Wildcard subject hydration (`select: {"?s": ["*"]}`)
+    // expands all properties of a subject, which would otherwise leak
+    // these system facts to the user.
+    //
+    // The hydration-layer filter in `format/hydration.rs` skips any
+    // predicate where `is_reserved_reifies_predicate(&p)` returns
+    // true. This test pins that contract: the wildcard projection
+    // sees the user's `ex:role` but not any `f:reifies*` predicate.
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger_id = "it/edge-annotations:wildcard-hides-reifies";
+    let ledger0 = genesis_ledger(&fluree, ledger_id);
+
+    let txn = json!({
+        "@context": ctx(),
+        "@id": "ex:alice",
+        "ex:worksFor": {
+            "@id": "ex:acme",
+            "@annotation": {
+                "@id": "ex:emp/alice-acme",
+                "ex:role": "Engineer"
+            }
+        }
+    });
+    let committed = fluree.insert(ledger0, &txn).await.expect("annotated insert");
+
+    let query = json!({
+        "@context": ctx(),
+        "select": {"?ann": ["*"]},
+        "where": { "@id": "?ann", "ex:role": "Engineer" }
+    });
+
+    let rows = support::query_jsonld_formatted(&fluree, &committed.ledger, &query)
+        .await
+        .expect("wildcard hydration over annotation subject");
+    let arr = rows.as_array().expect("array");
+    assert!(
+        !arr.is_empty(),
+        "wildcard hydration should find the annotation subject"
+    );
+
+    // The user's `ex:role` is visible.
+    let node = arr[0]
+        .as_object()
+        .expect("hydrated node should be an object");
+    let role_visible = node
+        .get("ex:role")
+        .or_else(|| node.get("http://example.org/role"))
+        .is_some();
+    assert!(
+        role_visible,
+        "user-authored ex:role must remain visible under wildcard hydration: {node:#?}"
+    );
+
+    // No `f:reifies*` predicate may appear under any namespace form
+    // (full IRI or compact alias). The hydration formatter compacts
+    // through the query's `@context`, but we don't declare an `f:`
+    // alias in our test ctx, so any leak would surface as the
+    // expanded IRI.
+    for key in node.keys() {
+        assert!(
+            !key.starts_with("https://ns.flur.ee/db#reifies"),
+            "f:reifies* predicate '{key}' must not leak through wildcard hydration"
+        );
+        assert!(
+            !key.starts_with("f:reifies"),
+            "compact f:reifies* form '{key}' must not leak"
+        );
+    }
+}
+
+#[tokio::test]
 async fn annotation_in_named_graph_insert_succeeds() {
     // Regression coverage for the M1a `f:reifiesGraph` fix on the
     // *write* path. An annotated edge in a named graph must be

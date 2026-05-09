@@ -259,13 +259,17 @@ correctness items remaining):**
   `query_reifies_form_runs_with_visibility_check` — both demonstrate
   insert-then-query end-to-end on memory storage.
 
-- ⏳ **System-fact filter at the scan layer.** Variable-predicate
-  scans (`?p` matching all predicates) currently expose `f:reifies*`
-  in their results. Wildcard `select: "*"` projects them as ordinary
-  properties on annotation subjects. Both need filters with an
-  `opts.includeSystemFacts: true` escape and a history-range
-  carve-out. The parser-level firewall blocks *direct named
-  mention*; this is the broader leakage path.
+- ✅ **Wildcard subject-hydration filter** (`fluree-db-api/src/format/hydration.rs`):
+  the projection layer skips any predicate where
+  `is_reserved_reifies_predicate(&p)` returns true. Closes the
+  `select: {"?s": ["*"]}` leak path that the parser firewall
+  doesn't catch.
+- ⏳ **Variable-predicate scan filter.** Triple patterns with a
+  variable predicate (`{"@id": "?ann", "?p": "?o"}`) match all
+  predicates including `f:reifies*` directly at the scan layer.
+  This filter belongs in the binary / novelty scan operators, not
+  in hydration. Needs an `opts.includeSystemFacts: true` escape and
+  a history-range carve-out.
 - ⏳ **Graph-bound expansion in multi-graph queries.** The IR-level
   expansion in `expand_edge_annotation_patterns` correctly handles
   single-graph queries and `Pattern::Graph`-wrapped patterns (the

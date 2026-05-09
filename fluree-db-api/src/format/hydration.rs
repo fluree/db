@@ -460,6 +460,23 @@ impl<'a> HydrationFormatter<'a> {
 
             // Format each predicate
             for (pred, mut pred_flakes) in by_pred {
+                // System-fact filter (M1b): the seven `f:reifies*`
+                // predicates encode an annotation's reified edge. They
+                // are system-controlled — never user-data — and must
+                // not leak through wildcard subject hydration. Direct
+                // user mention in queries is already blocked by the
+                // parser firewall in `fluree-db-query::parse`; this
+                // filter closes the wildcard-projection path.
+                //
+                // Explicitly-listed levels can still reach these via
+                // a `Pattern::Triple` lookup at the planner layer
+                // (which is what the `Pattern::EdgeAnnotation` /
+                // `AnnotationTarget` IR expansion does), but those
+                // patterns don't go through hydration.
+                if fluree_db_core::is_reserved_reifies_predicate(&pred) {
+                    continue;
+                }
+
                 // `select_predicate` returns `None` when the level is Explicit
                 // and the predicate isn't listed; otherwise it returns
                 // `Some(sub_spec)` (which may itself be `None` for "select but
