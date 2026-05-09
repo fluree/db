@@ -333,7 +333,7 @@ async fn cascade_attachment_retracts(
         // dedupe for free).
         let post_metadata: HashSet<FlakeIdentity> = current_metadata
             .iter()
-            .map(|f| identity(f))
+            .map(identity)
             .filter(|id| !retracted_ids.contains(id))
             .chain(asserted_ids.into_iter())
             .collect();

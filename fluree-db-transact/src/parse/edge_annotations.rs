@@ -72,7 +72,7 @@ fn is_annotation_key(key: &str) -> bool {
 /// Mutable counter used to mint unique blank-node IDs for anonymous
 /// annotation subjects. Threaded through the recursion so siblings
 /// don't collide.
-struct LowerCtx {
+pub(crate) struct LowerCtx {
     /// Counter for `_:fluree_ann_N` blank-node IDs.
     next_anon_id: usize,
     /// Sibling top-level nodes synthesized during lowering. Each entry
@@ -209,7 +209,7 @@ pub fn lower_edge_annotations(doc: &mut Value) -> Result<()> {
 /// keys, so synthetic annotation siblings can carry `f:reifiesGraph`
 /// when the reified edge lives in a named graph.
 #[derive(Clone, Copy)]
-struct WalkCtx<'a> {
+pub(crate) struct WalkCtx<'a> {
     json_ld: &'a ParsedContext,
     graph: Option<&'a str>,
 }
@@ -680,7 +680,7 @@ fn intercept_annotations_for_predicate(
             }
 
             let object_id = ensure_subject_id(map, ctx);
-            if reifies_iris::ALL.iter().any(|iri| *iri == predicate) {
+            if reifies_iris::ALL.contains(&predicate) {
                 return Err(TransactError::UnsupportedFeature(format!(
                     "'{predicate}' is a system-controlled predicate; use @annotation instead"
                 )));
