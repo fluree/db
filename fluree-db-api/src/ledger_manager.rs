@@ -341,6 +341,12 @@ impl LedgerHandle {
                 ns_fallback,
             );
             state.snapshot.range_provider = Some(Arc::new(provider));
+            // Plumb the CAS handle so arena-backed annotation reads can
+            // resolve `AnnotationIndexRoot.{forward,reverse}_branch_cid`.
+            // Without this, `LedgerSnapshot::has_arena_reader()` always
+            // returns false and the formatter / cascade falls back to
+            // the M2a scan path even on snapshots with on-disk arenas.
+            state.snapshot.content_store = Some(Arc::clone(&cs));
 
             let te_store: Arc<dyn std::any::Any + Send + Sync> = arc_store.clone();
             state.binary_store = Some(TypeErasedStore(te_store));
