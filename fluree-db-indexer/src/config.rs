@@ -182,10 +182,22 @@ pub struct IndexerConfig {
     /// merges these with the base root's arena (when present) and
     /// writes the resulting forward + reverse arena blobs to CAS.
     ///
-    /// `None` (the default) skips arena sealing — the new root carries
-    /// the same `annotation_index` value as the base, preserving the
-    /// pre-M2b behavior. Callers that have an `AttachmentNovelty`
-    /// available should populate this.
+    /// **Semantics — `None` means delta is unknown, not empty.**
+    ///
+    /// - `Some(events)` (including `Some(vec![])`): the caller has
+    ///   determined the exact attachment delta since the base root.
+    ///   The indexer seals an authoritative arena. Readers downstream
+    ///   prefer this arena over the scan path.
+    /// - `None`: the caller could not produce the delta this pass
+    ///   (typically because the orchestrator hasn't yet routed
+    ///   per-ledger `AttachmentNovelty` into the indexer — see slice
+    ///   3e). The indexer treats this as **delta unknown**: when the
+    ///   base root carries an `annotation_index`, the new root drops
+    ///   it (recording the old branch + leaf CIDs as replaced for GC)
+    ///   so hydration falls back to the scan path. Publishing a
+    ///   carried-forward arena would risk hiding newly-indexed
+    ///   annotations whose `f:reifies*` events landed in novelty
+    ///   between this pass and the previous arena seal.
     pub attachment_events: Option<Vec<(fluree_db_core::EdgeKey, fluree_db_core::Sid, i64, bool)>>,
 
     /// Configured full-text properties for this indexing run.

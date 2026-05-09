@@ -2322,21 +2322,63 @@ pub async fn incremental_index(
     }
 
     // ---- Phase 3d: Annotation arena seal ----
-    // Build / merge / persist forward+reverse arenas from the
-    // attachment events the orchestrator handed us via
-    // `IndexerConfig.attachment_events`. Skip when the caller didn't
-    // provide events AND there's no previous arena — the new root
-    // carries `annotation_index = None` in that case, preserving the
-    // pre-M2b behavior.
-    if config.attachment_events.is_some() || base_root.annotation_index.is_some() {
-        let novelty_events = config.attachment_events.clone().unwrap_or_default();
-        let result = crate::build::annotation_arena::build_and_persist_annotation_arena(
-            &content_store,
-            base_root.annotation_index.as_ref(),
-            novelty_events,
-        )
-        .await?;
-        root_builder.set_annotation_index(result.new_index, result.replaced_leaf_cids);
+    // `attachment_events` is the caller's attachment delta since the
+    // base root. Three cases:
+    //
+    // 1. `Some(events)` — caller determined the exact delta; seal an
+    //    authoritative arena (merging with the base arena if any).
+    // 2. `None` AND base has no arena — nothing to do.
+    // 3. `None` AND base has an arena — delta is **unknown**.
+    //    Carrying the old arena pointer forward would publish a
+    //    stale-but-authoritative arena: any new `f:reifies*` events
+    //    that landed in novelty since the previous seal would be
+    //    invisible to hydration once it prefers the arena over the
+    //    scan path. Defensive choice: drop `annotation_index` to
+    //    `None` on the new root and record the old branch + leaf
+    //    CIDs as replaced for GC. Hydration falls back to the scan
+    //    path until the next pass with `Some(events)` re-seals the
+    //    arena. Readers stay correct at the cost of arena-fast-path
+    //    performance during the transition.
+    match (
+        config.attachment_events.as_ref(),
+        base_root.annotation_index.as_ref(),
+    ) {
+        (Some(_), _) => {
+            let novelty_events = config.attachment_events.clone().unwrap_or_default();
+            let result = crate::build::annotation_arena::build_and_persist_annotation_arena(
+                &content_store,
+                base_root.annotation_index.as_ref(),
+                novelty_events,
+            )
+            .await?;
+            root_builder.set_annotation_index(result.new_index, result.replaced_leaf_cids);
+        }
+        (None, Some(prev)) => {
+            // Delta unknown but base has an arena — defensively drop
+            // it. Collect the previous leaf CIDs so GC can reclaim
+            // them; the previous branch CIDs are recorded by
+            // `set_annotation_index` automatically.
+            let reader = fluree_db_binary_index::annotation_arena::AnnotationArenaReader::new(
+                prev,
+                content_store.as_ref(),
+            );
+            let prev_leaf_cids = reader
+                .all_leaf_cids()
+                .await
+                .map_err(crate::error::IndexerError::Core)?;
+            tracing::warn!(
+                ledger_id = %ledger_id,
+                "incremental indexer received attachment_events=None but base \
+                 root carries an arena; dropping arena on new root to avoid \
+                 publishing stale-but-authoritative attachment state. \
+                 Hydration falls back to scan path until the next reindex \
+                 pass supplies events."
+            );
+            root_builder.set_annotation_index(None, prev_leaf_cids);
+        }
+        (None, None) => {
+            // Nothing to do — non-annotation ledger fast path.
+        }
     }
 
     // ---- Phase 4: Root assembly ----

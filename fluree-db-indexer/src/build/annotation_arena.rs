@@ -210,6 +210,39 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn empty_event_vec_seals_authoritative_arena_with_no_changes() {
+        // `Some(vec![])` ≠ `None`. The caller has explicitly
+        // confirmed there are no new events since the base arena.
+        // The merge produces the same row set as the base, but a
+        // fresh arena gets written so readers can prefer it.
+        let store: Arc<dyn ContentStore> = Arc::new(MemoryContentStore::new());
+        let first = build_and_persist_annotation_arena(
+            &store,
+            None,
+            vec![(edge("alice", "worksFor", "acme"), ann("ann_1"), 5, true)],
+        )
+        .await
+        .unwrap();
+        let prev = first.new_index.unwrap();
+
+        let second = build_and_persist_annotation_arena(&store, Some(&prev), Vec::new())
+            .await
+            .unwrap();
+        let new_index = second.new_index.expect("empty-delta still seals an arena");
+        assert_eq!(new_index.stats.forward_rows, 1);
+        assert_eq!(new_index.stats.distinct_edges, 1);
+
+        // Live read confirms the merged arena reflects the same state
+        // as the base.
+        let reader = AnnotationArenaReader::new(&new_index, store.as_ref());
+        let live = reader
+            .current_annotations_for(&edge("alice", "worksFor", "acme"), 100)
+            .await
+            .unwrap();
+        assert_eq!(live, vec![ann("ann_1")]);
+    }
+
+    #[tokio::test]
     async fn merging_with_previous_arena_yields_replaced_leaf_cids() {
         let store: Arc<dyn ContentStore> = Arc::new(MemoryContentStore::new());
 
