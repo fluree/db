@@ -8,11 +8,19 @@
 //!
 //! ## Empty-vs-absent semantics
 //!
-//! - `LedgerSnapshot.annotation_index = None` is a hard guarantee that
-//!   the indexed snapshot has zero annotation attachments. Builders
-//!   write `Some(empty)` whenever uncertain.
-//! - `Some(AnnotationIndexRoot { stats: zeros, ... })` is a valid
-//!   "indexed but empty" state that still costs a CAS read on cascade.
+//! The indexed-arena guarantee depends on **both** signals on
+//! [`crate::db::LedgerSnapshot`]:
+//!
+//! | `has_annotations` | `annotation_index` | Meaning                                |
+//! |-------------------|--------------------|----------------------------------------|
+//! | `false`           | `None`             | Hard guarantee: zero attachments. Cascade and reads short-circuit. |
+//! | `true`            | `Some(_)`          | Builder ran. Forward/reverse arenas are authoritative for `t ≤ max_t`; novelty supplies the tail. |
+//! | `true`            | `None`             | Pre-builder transitional state: snapshot may carry `f:reifies*` flakes but no arena yet — readers fall back to scan, cascade still runs. |
+//! | `false`           | `Some(_)`          | Invariant violation. The FIR6 encoder coerces `FLAG_HAS_ANNOTATIONS` whenever an arena is present, so this state never reaches the wire. |
+//!
+//! Builders that produce arenas must set both signals; the encoder
+//! defends against forgetting the sticky bit but cannot fix the
+//! inverse (arena present, bool false in memory).
 //!
 //! See `EDGE_ANNOTATIONS.md` (Sidecar Artifacts) for the design contract.
 

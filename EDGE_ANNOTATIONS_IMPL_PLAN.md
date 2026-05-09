@@ -756,11 +756,14 @@ annotation artifacts.
     "Reserved-predicate invariants" so the on-disk arena never
     contains rows from malformed bundles.
   - Omit the annotation section entirely (and leave
-    `IndexRoot.annotation_index = None`) only when the resulting
-    snapshot has **zero** valid `f:reifies*` bundles — independent of
-    whether novelty contributed any. This preserves the "no cost for
-    non-annotation ledgers" property without leaking restart-state
-    into the absence flag.
+    `IndexRoot.annotation_index = None`, `IndexRoot.has_annotations =
+    false`) only when the resulting snapshot has **zero** valid
+    `f:reifies*` bundles — independent of whether novelty contributed
+    any. This preserves the "no cost for non-annotation ledgers"
+    property without leaking restart-state into the absence flag. The
+    encoder enforces the converse invariant: any populated
+    `annotation_index` forces `FLAG_HAS_ANNOTATIONS` on the wire so
+    the cascade fast-path never desynchronizes from a built arena.
   - Treat the arenas like the existing dictionary trees: derived
     artifacts that can be rebuilt from facts whenever needed;
     corruption or omission is recoverable, never destructive.

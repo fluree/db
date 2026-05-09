@@ -63,10 +63,14 @@ pub struct LedgerSnapshotMetadata {
     pub has_annotations: bool,
     /// Optional inline pointer to the on-disk annotation arenas.
     ///
-    /// `None` is a hard guarantee that the indexed snapshot has zero
-    /// annotation attachments. `Some(_)` indicates the indexer has
-    /// emitted forward/reverse arena artifacts (possibly empty) that
-    /// the read path can lazy-load.
+    /// Combined with `has_annotations`:
+    /// - `(false, None)` — hard guarantee: zero attachments.
+    /// - `(true, Some(_))` — builder ran; arenas authoritative
+    ///   through `max_t`, novelty covers the tail.
+    /// - `(true, None)` — pre-builder transitional state; readers
+    ///   fall back to scan, cascade still runs.
+    /// - `(false, Some(_))` is an invariant violation; the FIR6
+    ///   encoder coerces the sticky bit when an arena is present.
     ///
     /// Pre-builder: always `None`; the cascade fast-path uses
     /// `has_annotations` instead. Builder slice (M2b/3) populates
@@ -151,8 +155,10 @@ pub struct LedgerSnapshot {
     /// cost.
     pub has_annotations: bool,
     /// On-disk annotation-arena pointer (forward/reverse branch CIDs +
-    /// stats). `None` until the M2b builder populates it; cascade
-    /// fast-path consults `has_annotations` in the meantime.
+    /// stats). See `crate::annotation_index` for the truth table that
+    /// pairs this field with `has_annotations`. `None` until the M2b
+    /// builder populates it; cascade fast-path consults
+    /// `has_annotations` in the meantime.
     pub annotation_index: Option<crate::AnnotationIndexRoot>,
 }
 
@@ -885,6 +891,19 @@ fn decode_fir6_metadata(bytes: &[u8]) -> std::io::Result<LedgerSnapshotMetadata>
     } else {
         None
     };
+
+    // Trailing-byte sentinel: any unread bytes after the annotation
+    // section indicate a future format extension or a writer bug.
+    // Surface that explicitly rather than silently drop the bytes.
+    if pos != bytes.len() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!(
+                "FIR6: trailing bytes after annotation_index ({} unread)",
+                bytes.len() - pos
+            ),
+        ));
+    }
 
     Ok(LedgerSnapshotMetadata {
         ledger_id,

@@ -210,15 +210,19 @@ pub struct IndexRoot {
     pub has_annotations: bool,
 
     /// Inline pointer to the on-disk forward/reverse annotation
-    /// arenas (M2b). `None` is a hard guarantee that this snapshot
-    /// has zero annotation attachments. `Some(_)` indicates the
-    /// indexer emitted EAFB1/EAFL1 + EARB1/EARL1 artifacts (possibly
-    /// empty) that the read path can lazy-load.
+    /// arenas (M2b). See `fluree_db_core::annotation_index` for the
+    /// truth table that pairs this field with `has_annotations`. The
+    /// hard "zero attachments" guarantee requires both
+    /// `has_annotations == false` AND `annotation_index.is_none()`.
     ///
     /// Pre-builder: always `None`; the cascade fast-path consults
     /// `has_annotations` instead. Once the M2b builder lands,
     /// downstream readers migrate to this field for arena-backed
     /// lookups.
+    ///
+    /// Encoder invariant: `annotation_index.is_some()` implies
+    /// `FLAG_HAS_ANNOTATIONS` on the wire, so the cascade fast-path
+    /// can never desynchronize from a populated arena.
     pub annotation_index: Option<fluree_db_core::AnnotationIndexRoot>,
 }
 
@@ -554,7 +558,13 @@ impl IndexRoot {
             Self::FLAG_LEX_SORTED_STRING_IDS
         } else {
             0
-        }) | (if self.has_annotations {
+        }) | (if self.has_annotations || self.annotation_index.is_some() {
+            // The cascade fast-path in `fluree-db-transact::stage` gates
+            // on `LedgerSnapshot.has_annotations`. A populated
+            // `annotation_index` without the sticky bit set would let
+            // post-reindex retracts skip cascade — so the encoder
+            // forces the two signals to agree on the wire regardless
+            // of caller bookkeeping.
             Self::FLAG_HAS_ANNOTATIONS
         } else {
             0
@@ -956,6 +966,19 @@ impl IndexRoot {
             None
         };
 
+        // All optional sections consumed. `pos` should now equal the
+        // input length — anything else means a future format added
+        // bytes after the annotation section, or the writer emitted
+        // garbage. Surfacing this here keeps decode strict and makes
+        // appending a new section a deliberate change rather than a
+        // silent compatibility break.
+        if pos != data.len() {
+            return Err(io_err(&format!(
+                "root v6: trailing bytes after annotation_index ({} unread)",
+                data.len() - pos
+            )));
+        }
+
         Ok(IndexRoot {
             ledger_id,
             index_t,
@@ -1315,11 +1338,24 @@ mod tests {
             },
         });
 
+        // `minimal_root_v6` leaves `has_annotations = false`. The
+        // encoder must coerce the sticky bit on whenever an arena is
+        // present, so the cascade fast-path can never desynchronize
+        // from a populated arena.
+        assert!(!root.has_annotations);
         let bytes = root.encode();
-        // Section flag must be set.
         assert_ne!(bytes[5] & IndexRoot::FLAG_HAS_ANNOTATION_INDEX, 0);
+        assert_ne!(
+            bytes[5] & IndexRoot::FLAG_HAS_ANNOTATIONS,
+            0,
+            "arena present must imply sticky bit on the wire"
+        );
 
         let decoded = IndexRoot::decode(&bytes).unwrap();
+        assert!(
+            decoded.has_annotations,
+            "decoded sticky bit follows the encoded flag"
+        );
         let ann = decoded
             .annotation_index
             .expect("annotation_index roundtrip");
@@ -1335,8 +1371,24 @@ mod tests {
         // surface the same pointer — callers that only load metadata
         // still see the section.
         let snap = fluree_db_core::LedgerSnapshot::from_root_bytes(&bytes).unwrap();
+        assert!(snap.has_annotations, "snapshot path also sees sticky bit");
         let snap_ann = snap.annotation_index.expect("metadata path roundtrip");
         assert_eq!(snap_ann, ann);
+    }
+
+    #[test]
+    fn fir6_rejects_trailing_bytes() {
+        // A future format extension that appended bytes after the
+        // annotation section must not silently load on this build.
+        // Both decode paths reject the stray byte explicitly.
+        let bytes = minimal_root_v6().encode();
+        let mut tampered = bytes.clone();
+        tampered.push(0xff);
+        let err = IndexRoot::decode(&tampered).expect_err("trailing byte must be rejected");
+        assert!(err.to_string().contains("trailing bytes"), "got: {err}");
+        let err = fluree_db_core::LedgerSnapshot::from_root_bytes(&tampered)
+            .expect_err("metadata path must reject trailing bytes too");
+        assert!(err.to_string().contains("trailing bytes"), "got: {err}");
     }
 
     #[test]

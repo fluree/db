@@ -414,9 +414,9 @@ AnnotationIndexRoot {
 }
 ```
 
-If `annotation_index` is absent, the indexed snapshot has no annotation attachments.
+The hard "zero attachments" guarantee for the indexed portion requires both `IndexRoot.annotation_index = None` **and** `IndexRoot.has_annotations = false`. Once the M2b builder ships, those signals always agree on the wire (the encoder coerces `has_annotations = true` whenever an arena is present). Pre-builder roots may legitimately have `has_annotations = true` with `annotation_index = None` — readers fall back to scan, cascade still runs.
 
-The absence must be a correctness guarantee for the indexed portion. If any uncertainty exists, set it present with empty artifacts or force the transaction layer to check novelty.
+If any uncertainty exists, set it present with empty artifacts or force the transaction layer to check novelty.
 
 ### Forward Attachment Index
 
