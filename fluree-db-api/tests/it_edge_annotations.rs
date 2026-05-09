@@ -890,6 +890,79 @@ async fn retracting_all_annotation_metadata_cleans_bundle_too() {
 }
 
 #[tokio::test]
+async fn replacing_annotation_metadata_in_one_txn_keeps_bundle() {
+    // Same-transaction metadata replacement: delete the only
+    // existing user-property fact AND insert a new one in a single
+    // SPARQL UPDATE. The user's intent is "update the metadata,"
+    // not "remove the annotation." The orphan-cleanup pass must
+    // see the surviving same-txn assertion and NOT cascade the
+    // bundle. Otherwise the new metadata lands as ordinary RDF
+    // but loses its edge attachment.
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger_id = "it/edge-annotations:metadata-replacement";
+    let ledger0 = genesis_ledger(&fluree, ledger_id);
+
+    let txn = json!({
+        "@context": ctx(),
+        "@id": "ex:alice",
+        "ex:worksFor": {
+            "@id": "ex:acme",
+            "@annotation": {
+                "@id": "ex:emp/alice-acme",
+                "ex:role": "Engineer"
+            }
+        }
+    });
+    let after_insert = fluree.insert(ledger0, &txn).await.expect("insert");
+
+    // Replace `ex:role "Engineer"` with `ex:role "Manager"` in
+    // a single update — the only existing metadata is being
+    // retracted, but a new metadata fact is being asserted in
+    // the same txn.
+    let update = json!({
+        "@context": ctx(),
+        "delete": {
+            "@id": "ex:emp/alice-acme",
+            "ex:role": "Engineer"
+        },
+        "insert": {
+            "@id": "ex:emp/alice-acme",
+            "ex:role": "Manager"
+        }
+    });
+    let after_update = fluree
+        .update(after_insert.ledger, &update)
+        .await
+        .expect("metadata replacement");
+
+    // The annotation must still be findable via @reifies — the
+    // bundle is preserved because the post-transaction metadata
+    // set is non-empty (`ex:role "Manager"` survives).
+    let q_reifies = json!({
+        "@context": ctx(),
+        "select": ["?person", "?org", "?role"],
+        "where": {
+            "ex:role": "?role",
+            "@reifies": {
+                "@id": "?person",
+                "ex:worksFor": { "@id": "?org" }
+            }
+        }
+    });
+    let rows = support::query_jsonld_formatted(&fluree, &after_update.ledger, &q_reifies)
+        .await
+        .expect("@reifies query post-replacement");
+    let arr = rows.as_array().expect("array");
+    assert_eq!(
+        arr.len(),
+        1,
+        "metadata replacement must preserve the bundle so the new role is reachable: {arr:#?}"
+    );
+    let row = arr[0].as_array().expect("row");
+    assert_eq!(row[2].as_str(), Some("Manager"));
+}
+
+#[tokio::test]
 async fn retracting_partial_annotation_metadata_keeps_bundle() {
     // Counterpart: if the user retracts ONLY SOME metadata flakes
     // (leaving others asserted), the annotation is still meaningful

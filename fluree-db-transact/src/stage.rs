@@ -230,20 +230,29 @@ async fn cascade_attachment_retracts(
     // signal (retract every metadata flake) is the same either way.
     // The mode flag only controls whether explicit-IRI metadata
     // gets retracted from a base-edge cascade.
+    // Group both retract and assert flakes by `(g_id, subject)`,
+    // skipping `f:reifies*` predicates. Pass 2 keys off the retract
+    // groups (only retracts can trigger orphan cleanup) but
+    // consults the assert groups when computing the post-transaction
+    // metadata set — otherwise an in-transaction metadata
+    // replacement (delete old role, insert new role on the same
+    // annotation subject) would cascade the bundle and orphan the
+    // freshly-asserted metadata.
     let mut grouped_metadata_retracts: BTreeMap<(GraphId, Sid), Vec<&Flake>> =
         BTreeMap::new();
+    let mut grouped_metadata_asserts: BTreeMap<(GraphId, Sid), Vec<&Flake>> =
+        BTreeMap::new();
     for flake in flakes {
-        if flake.op {
-            continue;
-        }
         if is_reserved_reifies_predicate(&flake.p) {
             continue;
         }
         let g_id = resolve_flake_graph_id(flake, reverse_graph)?;
-        grouped_metadata_retracts
-            .entry((g_id, flake.s.clone()))
-            .or_default()
-            .push(flake);
+        let key = (g_id, flake.s.clone());
+        if flake.op {
+            grouped_metadata_asserts.entry(key).or_default().push(flake);
+        } else {
+            grouped_metadata_retracts.entry(key).or_default().push(flake);
+        }
     }
 
     for ((g_id, ann_sid), retract_set) in grouped_metadata_retracts {
@@ -275,11 +284,20 @@ async fn cascade_attachment_retracts(
             Err(_) => continue, // malformed; skip
         };
 
-        // Check that every currently-asserted metadata flake on the
-        // annotation subject is being retracted in this transaction.
-        // Identity = (s, p, o, dt, m) — the same dimensions Fluree
-        // uses for assertion/retraction matching.
-        type FlakeIdentity = (Sid, Sid, FlakeValue, Sid, Option<fluree_db_core::FlakeMeta>);
+        // Compute the post-transaction metadata set:
+        // (current metadata - retracts in this txn) ∪ asserts in this
+        // txn. Cascade only when post == ∅. This handles the
+        // metadata-replacement case (delete old fact + insert new
+        // fact on the same annotation in one transaction): the new
+        // assertion keeps the post-set non-empty, so the bundle
+        // stays asserted and the new metadata stays attached.
+        //
+        // Identity = `(s, p, o, dt, m)` — the same dimensions
+        // Fluree uses for assertion/retraction matching, so an
+        // assertion with a different object value than the
+        // retracted flake counts as a distinct fact and survives.
+        type FlakeIdentity =
+            (Sid, Sid, FlakeValue, Sid, Option<fluree_db_core::FlakeMeta>);
         let identity = |f: &Flake| -> FlakeIdentity {
             (
                 f.s.clone(),
@@ -291,16 +309,29 @@ async fn cascade_attachment_retracts(
         };
         let retracted_ids: HashSet<FlakeIdentity> =
             retract_set.iter().map(|f| identity(f)).collect();
-        let all_metadata_being_retracted = current_metadata
+        let asserted_ids: HashSet<FlakeIdentity> = grouped_metadata_asserts
+            .get(&(g_id, ann_sid.clone()))
+            .map(|v| v.iter().map(|f| identity(f)).collect::<HashSet<_>>())
+            .unwrap_or_default();
+
+        // Surviving current metadata: present today AND not being
+        // retracted. Plus any new same-txn assertions (which may
+        // overlap with surviving current; HashSet handles the
+        // dedupe for free).
+        let post_metadata: HashSet<FlakeIdentity> = current_metadata
             .iter()
-            .all(|f| retracted_ids.contains(&identity(f)));
-        if !all_metadata_being_retracted {
+            .map(|f| identity(f))
+            .filter(|id| !retracted_ids.contains(id))
+            .chain(asserted_ids.into_iter())
+            .collect();
+        if !post_metadata.is_empty() {
             continue;
         }
 
-        // All metadata being removed → the annotation is being
-        // disposed of. Retract the bundle in the same JSON-LD-
-        // compatible shape so it cancels the original assertion.
+        // Annotation has no surviving metadata after the txn → the
+        // user is disposing of it. Retract the bundle in the
+        // JSON-LD-compatible shape so it cancels the original
+        // assertion.
         cascade.extend(edge_key.to_reifies_facts_jsonld_compatible(
             &ann_sid, new_t, false,
         ));
