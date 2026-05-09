@@ -2372,43 +2372,70 @@ pub async fn incremental_index(
             // safe — e.g. a continuously-running ledger whose
             // overlay still holds pre-index events that match the
             // base arena.
-            let prev_events: Vec<_> = if let Some(prev) = prev_arena {
-                let reader = fluree_db_binary_index::annotation_arena::AnnotationArenaReader::new(
-                    prev,
-                    content_store.as_ref(),
+            //
+            // Coverage gate: `Augment` is only safe to seal when we
+            // can recover historical events from somewhere. With a
+            // base arena, that's the merge source. Without one, the
+            // base might still carry indexed `f:reifies*` facts (the
+            // sticky bit) — sealing from the partial events alone
+            // would publish an incomplete arena and hide history.
+            // Stay in scan-fallback in that case until either:
+            //   - a future pass supplies `Authoritative(events)`, or
+            //   - resolver-side event collection lets the indexer
+            //     produce its own complete history.
+            if prev_arena.is_none() && base_root.has_annotations {
+                tracing::warn!(
+                    ledger_id = %ledger_id,
+                    "incremental indexer received Augment coverage but base \
+                     root has indexed f:reifies* facts without an arena \
+                     (has_annotations=true, annotation_index=None). Augment \
+                     events alone can't recover historical attachments; \
+                     leaving annotation_index=None so hydration uses scan. \
+                     A later pass with Authoritative coverage (or slice \
+                     3h's resolver-side collection) will seal an \
+                     authoritative arena."
                 );
-                reader
-                    .collect_all_forward_events()
-                    .await
-                    .map_err(crate::error::IndexerError::Core)?
+                root_builder.set_annotation_index(None, Vec::new());
             } else {
-                Vec::new()
-            };
-            let mut combined: Vec<(fluree_db_core::EdgeKey, fluree_db_core::Sid, i64, bool)> =
-                Vec::with_capacity(prev_events.len() + events.len());
-            combined.extend(prev_events);
-            combined.extend(events);
-            // Sort + dedup_by_key — `(edge, ann, t, op)` tuples
-            // already implement Ord. After this `combined` carries
-            // every distinct event observed across both sources.
-            combined.sort();
-            combined.dedup();
+                let prev_events: Vec<_> = if let Some(prev) = prev_arena {
+                    let reader =
+                        fluree_db_binary_index::annotation_arena::AnnotationArenaReader::new(
+                            prev,
+                            content_store.as_ref(),
+                        );
+                    reader
+                        .collect_all_forward_events()
+                        .await
+                        .map_err(crate::error::IndexerError::Core)?
+                } else {
+                    Vec::new()
+                };
+                let mut combined: Vec<(fluree_db_core::EdgeKey, fluree_db_core::Sid, i64, bool)> =
+                    Vec::with_capacity(prev_events.len() + events.len());
+                combined.extend(prev_events);
+                combined.extend(events);
+                // Sort + dedup — `(edge, ann, t, op)` tuples already
+                // implement Ord. After this `combined` carries every
+                // distinct event observed across both sources.
+                combined.sort();
+                combined.dedup();
 
-            let result = crate::build::annotation_arena::build_and_persist_annotation_arena(
-                content_store.as_ref(),
-                prev_arena,
-                combined,
-            )
-            .await?;
-            if let Some(ref ann) = result.new_index {
-                debug_assert!(
-                    ann.max_t <= job_t,
-                    "AnnotationIndexRoot.max_t ({}) must not exceed IndexRoot.index_t ({})",
-                    ann.max_t,
-                    job_t
-                );
+                let result = crate::build::annotation_arena::build_and_persist_annotation_arena(
+                    content_store.as_ref(),
+                    prev_arena,
+                    combined,
+                )
+                .await?;
+                if let Some(ref ann) = result.new_index {
+                    debug_assert!(
+                        ann.max_t <= job_t,
+                        "AnnotationIndexRoot.max_t ({}) must not exceed IndexRoot.index_t ({})",
+                        ann.max_t,
+                        job_t
+                    );
+                }
+                root_builder.set_annotation_index(result.new_index, result.replaced_leaf_cids);
             }
-            root_builder.set_annotation_index(result.new_index, result.replaced_leaf_cids);
         }
         Some(AttachmentEventCoverage::Unknown) | None => {
             if let Some(prev) = prev_arena {

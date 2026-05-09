@@ -34,7 +34,6 @@ use fluree_db_binary_index::annotation_arena::{
 // participates only for GC reachability via all_leaf_cids.
 use fluree_db_core::storage::ContentStore;
 use fluree_db_core::{AnnotationIndexRoot, ContentKind, EdgeKey, Sid};
-use std::sync::Arc;
 
 use crate::error::{IndexerError, Result};
 
@@ -150,6 +149,7 @@ mod tests {
     use super::*;
     use fluree_db_core::storage::MemoryContentStore;
     use fluree_db_core::FlakeValue;
+    use std::sync::Arc;
 
     fn ann(name: &str) -> Sid {
         Sid::new(20, name)
@@ -376,6 +376,31 @@ mod tests {
         assert_eq!(
             new_index.stats.forward_rows, 2,
             "previous arena must not be merged into the rebuild"
+        );
+    }
+
+    /// Sanity-only: this orchestrator helper trusts what it's given.
+    /// The `Augment`-without-prev-arena-but-sticky=true gate lives in
+    /// `build/incremental.rs` (where `has_annotations` is in scope).
+    /// Verify that here we'd happily seal an incomplete arena from
+    /// partial events, which is precisely why the upper-layer gate
+    /// is needed.
+    #[tokio::test]
+    async fn function_itself_does_not_gate_partial_events() {
+        let store: Arc<dyn ContentStore> = Arc::new(MemoryContentStore::new());
+        let result = build_and_persist_annotation_arena(
+            &store,
+            None,
+            vec![(edge("alice", "worksFor", "acme"), ann("ann_1"), 5, true)],
+        )
+        .await
+        .unwrap();
+        let new_index = result.new_index.unwrap();
+        assert_eq!(
+            new_index.stats.forward_rows, 1,
+            "function happily seals partial input — caller is responsible \
+             for ensuring `events` is complete or that the result is OK \
+             to publish"
         );
     }
 }
