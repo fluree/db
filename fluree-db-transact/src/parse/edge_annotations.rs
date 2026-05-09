@@ -56,6 +56,7 @@
 //! module emits.
 
 use crate::error::{Result, TransactError};
+use fluree_graph_json_ld::{expand_iri, parse_context, ParsedContext};
 use fluree_vocab::reifies_iris;
 use serde_json::{json, Map, Value};
 
@@ -94,31 +95,62 @@ impl LowerCtx {
     }
 }
 
-/// Reject any user-authored `f:reifies*` IRI (full or compact) before
-/// lowering runs, so the firewall doesn't fire on the IRIs that this
-/// module synthesizes.
+/// Reject any user-authored `f:reifies*` IRI before lowering runs, so
+/// the firewall doesn't fire on the IRIs that this module
+/// synthesizes.
 ///
-/// Compact form (e.g. `f:reifiesSubject`) requires knowledge of the
-/// document's `@context`, which we don't traverse here. We rely on the
-/// pre-expansion full IRI being the most common attack vector and on
-/// post-expansion firewall checks at the staging layer for compact
-/// forms; expansion will produce full IRIs that the staging firewall
-/// inspects via the SID-based `is_reserved_reifies_predicate` helper.
-fn scan_user_authored_reifies_iris(value: &Value) -> Result<()> {
+/// Resolves compact-IRI forms (e.g. `f:reifiesSubject` with
+/// `"f": "https://ns.flur.ee/db#"` in `@context`) through the
+/// document's `@context` before checking. Without this, a user could
+/// bypass the firewall by writing the compact form and having
+/// expansion silently introduce system facts.
+///
+/// The walker maintains a stack of merged contexts so per-node
+/// `@context` overrides are honored. When a key has no `@context`
+/// resolution and isn't already a full IRI, it's left untouched —
+/// downstream JSON-LD expansion will fail or treat it as a plain
+/// string, neither of which can produce a reserved-predicate flake.
+fn scan_user_authored_reifies_iris(value: &Value, context: &ParsedContext) -> Result<()> {
     match value {
         Value::Object(map) => {
+            // Merge any per-node `@context` into the inherited one.
+            let merged: Option<ParsedContext> = if let Some(local_ctx) = map.get("@context") {
+                Some(
+                    fluree_graph_json_ld::parse_context_with_base(context, local_ctx).map_err(
+                        |e| {
+                            TransactError::Parse(format!(
+                                "failed to parse nested @context during firewall scan: {e}"
+                            ))
+                        },
+                    )?,
+                )
+            } else {
+                None
+            };
+            let effective = merged.as_ref().unwrap_or(context);
+
             for (k, v) in map {
-                if reifies_iris::ALL.iter().any(|iri| iri == k) {
+                // `@context` is structural, not a predicate.
+                if k == "@context" {
+                    continue;
+                }
+                let expanded_key = if k.starts_with('@') {
+                    k.clone()
+                } else {
+                    expand_iri(k, effective)
+                };
+                if reifies_iris::ALL.iter().any(|iri| *iri == expanded_key) {
                     return Err(TransactError::UnsupportedFeature(format!(
-                        "'{k}' is a system-controlled predicate; use @annotation or @reifies instead"
+                        "'{k}' resolves to a system-controlled predicate '{expanded_key}'; \
+                         use @annotation or @reifies instead"
                     )));
                 }
-                scan_user_authored_reifies_iris(v)?;
+                scan_user_authored_reifies_iris(v, effective)?;
             }
         }
         Value::Array(items) => {
             for item in items {
-                scan_user_authored_reifies_iris(item)?;
+                scan_user_authored_reifies_iris(item, context)?;
             }
         }
         _ => {}
@@ -140,15 +172,46 @@ fn scan_user_authored_reifies_iris(value: &Value) -> Result<()> {
 /// - Envelope form `{"@graph": [...]}` → siblings appended to the
 ///   existing `@graph` array.
 pub fn lower_edge_annotations(doc: &mut Value) -> Result<()> {
-    scan_user_authored_reifies_iris(doc)?;
+    // Parse the document's top-level @context once so the firewall and
+    // the lowering walker can resolve compact IRIs to full ones. We
+    // accept missing or malformed contexts silently — the rest of the
+    // parse pipeline (`expand_with_context_policy`) will surface those
+    // errors with better messages.
+    let top_ctx = doc
+        .as_object()
+        .and_then(|m| m.get("@context"))
+        .map(parse_context)
+        .transpose()
+        .map_err(|e| TransactError::Parse(format!("failed to parse @context: {e}")))?
+        .unwrap_or_else(ParsedContext::new);
+
+    scan_user_authored_reifies_iris(doc, &top_ctx)?;
 
     let mut ctx = LowerCtx::new();
-    lower_value_with_subject(doc, None, &mut ctx)?;
+    let walk_ctx = WalkCtx {
+        json_ld: &top_ctx,
+        graph: None,
+    };
+    lower_value_with_subject(doc, None, &walk_ctx, &mut ctx)?;
 
     if !ctx.siblings.is_empty() {
         attach_siblings(doc, ctx.siblings);
     }
     Ok(())
+}
+
+/// Inherited context for the lowering walker.
+///
+/// `json_ld` is used for compact-IRI resolution checks (the same
+/// context the firewall scan resolves against). `graph` is the
+/// in-effect named-graph IRI for the current node — propagated from
+/// envelope-level `@graph` selectors and per-node `@graph: "<iri>"`
+/// keys, so synthetic annotation siblings can carry `f:reifiesGraph`
+/// when the reified edge lives in a named graph.
+#[derive(Clone, Copy)]
+struct WalkCtx<'a> {
+    json_ld: &'a ParsedContext,
+    graph: Option<&'a str>,
 }
 
 /// Recursively reject `@annotation` / `@edge` / `@reifies` anywhere
@@ -218,6 +281,7 @@ fn build_annotation_sibling(
     predicate: &str,
     object_id: &str,
     ann_block: Value,
+    base_graph: Option<&str>,
     ctx: &mut LowerCtx,
 ) -> Result<Value> {
     let base_subject_id = base_subject_id.ok_or_else(|| {
@@ -259,10 +323,31 @@ fn build_annotation_sibling(
         reifies_iris::OBJECT.to_string(),
         json!({"@id": object_id}),
     );
-    // f:reifiesDatatype is added at staging time when the actual datatype
-    // is known (after parse_literal_value_with_meta resolves it). For
-    // pre-expansion lowering we don't have it; the staging path injects
-    // it from the corresponding base flake.
+
+    // f:reifiesGraph — emitted iff the reified edge lives in a named
+    // graph. Default-graph edges omit it (absence = default), which
+    // matches the encoding in `EdgeKey::to_reifies_facts` and the
+    // bundle validator's "at most one" rule for `f:reifiesGraph`.
+    //
+    // The synthetic annotation node *also* lives in the same named
+    // graph as the edge it reifies, so we set its own `@graph`
+    // selector to the same IRI. Otherwise the annotation flakes
+    // would land in the default graph while the edge is in a named
+    // graph — a partition that breaks both visibility and cascade.
+    if let Some(graph_iri) = base_graph {
+        ann_map.insert(
+            reifies_iris::GRAPH.to_string(),
+            json!({"@id": graph_iri}),
+        );
+        ann_map.insert("@graph".to_string(), json!(graph_iri));
+    }
+
+    // f:reifiesDatatype is intentionally omitted at lowering time —
+    // we don't know the object's datatype before JSON-LD expansion.
+    // The decoder treats it as optional and derives the canonical
+    // datatype from the flake-level `dt` of `f:reifiesObject`. The
+    // in-Rust `EdgeKey::to_reifies_facts` builder still emits both
+    // for diagnostic clarity.
 
     Ok(Value::Object(ann_map))
 }
@@ -407,24 +492,26 @@ fn attach_siblings(doc: &mut Value, siblings: Vec<Value>) {
 // explicit two-pass approach implemented by `lower_with_subject`.
 // ---------------------------------------------------------------------------
 
-/// Recursive variant that knows the subject of the enclosing node.
+/// Recursive variant that knows the subject and graph context of the
+/// enclosing node.
 ///
 /// Used internally to thread the parent's `@id` (resolved via
-/// `ensure_subject_id`) into the inline-annotation lowering, so
-/// `f:reifiesSubject` can be filled in.
+/// `ensure_subject_id`) and the inherited graph selector into the
+/// inline-annotation lowering.
 pub(crate) fn lower_value_with_subject(
     value: &mut Value,
     parent_subject: Option<&str>,
+    walk: &WalkCtx<'_>,
     ctx: &mut LowerCtx,
 ) -> Result<()> {
     match value {
         Value::Array(items) => {
             for item in items {
-                lower_value_with_subject(item, parent_subject, ctx)?;
+                lower_value_with_subject(item, parent_subject, walk, ctx)?;
             }
             Ok(())
         }
-        Value::Object(map) => lower_object_with_subject(map, parent_subject, ctx),
+        Value::Object(map) => lower_object_with_subject(map, parent_subject, walk, ctx),
         _ => Ok(()),
     }
 }
@@ -438,22 +525,78 @@ fn is_envelope(map: &Map<String, Value>) -> bool {
     if !map.contains_key("@graph") {
         return false;
     }
+    let graph_is_array = matches!(map.get("@graph"), Some(Value::Array(_)));
+    if !graph_is_array {
+        return false;
+    }
     map.keys().all(|k| matches!(k.as_str(), "@context" | "@graph"))
+}
+
+/// True when `map` is a JSON-LD value/list/variable wrapper rather
+/// than a node-map. These objects describe a literal value, a list,
+/// or a variable reference — they must not be treated as nodes (we
+/// must not mint `@id` for them or walk their structural keys as
+/// predicates).
+///
+/// Detection mirrors the transactor's expanded-value parser: presence
+/// of `@value`, `@language`, `@list`, or `@variable` makes this a
+/// value-class object.
+fn is_jsonld_value_object(map: &Map<String, Value>) -> bool {
+    map.contains_key("@value")
+        || map.contains_key("@language")
+        || map.contains_key("@list")
+        || map.contains_key("@variable")
+}
+
+/// Extract a per-node graph selector. Returns the raw IRI / variable
+/// string when present, `None` otherwise. Per-node `@graph` differs
+/// from envelope `@graph` (which is an array of nodes) — this only
+/// fires on the per-node form.
+fn extract_node_graph_selector(map: &Map<String, Value>) -> Option<String> {
+    let val = map.get("@graph")?;
+    match val {
+        Value::String(s) => Some(s.clone()),
+        Value::Object(g) => g.get("@id").and_then(|x| x.as_str()).map(String::from),
+        _ => None,
+    }
 }
 
 fn lower_object_with_subject(
     map: &mut Map<String, Value>,
     _parent_subject: Option<&str>,
+    walk: &WalkCtx<'_>,
     ctx: &mut LowerCtx,
 ) -> Result<()> {
+    // Value/list/variable objects must not be lowered as nodes.
+    // (The annotation-keyword rejection for these shapes happens at
+    // the predicate-value-pair level via
+    // `intercept_annotations_for_predicate`, so we don't need to
+    // re-scan here.)
+    if is_jsonld_value_object(map) {
+        return Ok(());
+    }
+
     // Envelope form: recurse into `@graph` only. Don't mint an @id
-    // for the wrapper (it isn't a node).
+    // for the wrapper (it isn't a node). The envelope's `@graph`
+    // is the default-graph wrapper, so child nodes inherit the same
+    // graph context as the envelope.
     if is_envelope(map) {
         if let Some(graph_val) = map.get_mut("@graph") {
-            lower_value_with_subject(graph_val, None, ctx)?;
+            lower_value_with_subject(graph_val, None, walk, ctx)?;
         }
         return Ok(());
     }
+
+    // Compute the in-effect graph selector for this node and its
+    // children. Per-node `@graph: "<iri>"` overrides; otherwise we
+    // inherit from the walker.
+    let node_graph = extract_node_graph_selector(map);
+    let node_graph_ref = node_graph.as_deref();
+    let effective_graph = node_graph_ref.or(walk.graph);
+    let child_walk = WalkCtx {
+        json_ld: walk.json_ld,
+        graph: effective_graph,
+    };
 
     // 1. Honor `@reifies` on this node (rejected in v1 — see above).
     if map.contains_key(REIFIES_KEY) {
@@ -479,11 +622,11 @@ fn lower_object_with_subject(
 
         let predicate = key.clone();
         let value = map.get_mut(&key).expect("key collected from this map");
-        intercept_annotations_for_predicate(&my_id, &predicate, value, ctx)?;
+        intercept_annotations_for_predicate(&my_id, &predicate, value, &child_walk, ctx)?;
 
         // Recurse into the rewritten value to catch nested forms.
         if let Some(v) = map.get_mut(&key) {
-            lower_value_with_subject(v, Some(&my_id), ctx)?;
+            lower_value_with_subject(v, Some(&my_id), &child_walk, ctx)?;
         }
     }
     Ok(())
@@ -495,12 +638,13 @@ fn intercept_annotations_for_predicate(
     parent_subject: &str,
     predicate: &str,
     value: &mut Value,
+    walk: &WalkCtx<'_>,
     ctx: &mut LowerCtx,
 ) -> Result<()> {
     match value {
         Value::Array(items) => {
             for item in items {
-                intercept_annotations_for_predicate(parent_subject, predicate, item, ctx)?;
+                intercept_annotations_for_predicate(parent_subject, predicate, item, walk, ctx)?;
             }
             Ok(())
         }
@@ -528,6 +672,17 @@ fn intercept_annotations_for_predicate(
                 return Ok(());
             };
 
+            // Skip lowering for value/list/variable objects. (The
+            // literal-value rejection above already caught the
+            // `@annotation` + `@value` combination; this is a
+            // belt-and-braces guard.)
+            if is_jsonld_value_object(map) {
+                return Err(TransactError::UnsupportedFeature(
+                    "edge annotations are not supported on @list / @variable wrappers in v1"
+                        .to_string(),
+                ));
+            }
+
             let object_id = ensure_subject_id(map, ctx);
             if reifies_iris::ALL.iter().any(|iri| *iri == predicate) {
                 return Err(TransactError::UnsupportedFeature(format!(
@@ -539,6 +694,7 @@ fn intercept_annotations_for_predicate(
                 predicate,
                 &object_id,
                 ann_block,
+                walk.graph,
                 ctx,
             )?;
             ctx.siblings.push(synth);
@@ -556,12 +712,7 @@ mod tests {
     /// Run the full pipeline (scan + two-pass lowering) on `doc` and
     /// return the rewritten document plus any minted blank-node count.
     fn lower(mut doc: Value) -> Result<Value> {
-        scan_user_authored_reifies_iris(&doc)?;
-        let mut ctx = LowerCtx::new();
-        lower_value_with_subject(&mut doc, None, &mut ctx)?;
-        if !ctx.siblings.is_empty() {
-            attach_siblings(&mut doc, ctx.siblings);
-        }
+        lower_edge_annotations(&mut doc)?;
         Ok(doc)
     }
 
@@ -739,6 +890,125 @@ mod tests {
             err.to_string().contains("@reifies on inserts"),
             "expected @reifies-on-insert deferral message, got: {}",
             err
+        );
+    }
+
+    #[test]
+    fn rejects_compact_reifies_iri_via_context() {
+        // Compact form via `@context` must be rejected with the same
+        // firewall message as the full IRI form. Without context-aware
+        // resolution this would slip through and produce user-authored
+        // system facts.
+        let doc = json!({
+            "@context": { "f": "https://ns.flur.ee/db#" },
+            "@id": "ex:alice",
+            "f:reifiesSubject": { "@id": "ex:bob" }
+        });
+        let err = lower(doc).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("system-controlled") && msg.contains("reifiesSubject"),
+            "expected reserved-predicate firewall error, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn typed_literal_value_object_passes_through_untouched() {
+        // Regression: previously the lowering walker minted an @id for
+        // `{"@value": "...", "@type": "..."}` and treated `@value` as a
+        // predicate. Verify a typed-literal value-object is preserved
+        // exactly, with no @id minted and no annotation siblings.
+        let doc = json!({
+            "@context": { "ex": "http://example.org/", "xsd": "http://www.w3.org/2001/XMLSchema#" },
+            "@id": "ex:alice",
+            "ex:joinedAt": { "@value": "2024-01-01", "@type": "xsd:date" }
+        });
+        let original = doc.clone();
+        let result = lower(doc).unwrap();
+        assert_eq!(result, original, "value object must not be lowered as a node");
+    }
+
+    #[test]
+    fn list_object_passes_through_untouched() {
+        let doc = json!({
+            "@context": { "ex": "http://example.org/" },
+            "@id": "ex:alice",
+            "ex:nicknames": { "@list": ["A", "B", "C"] }
+        });
+        let original = doc.clone();
+        let result = lower(doc).unwrap();
+        assert_eq!(result, original);
+    }
+
+    #[test]
+    fn variable_object_passes_through_untouched() {
+        let doc = json!({
+            "@context": { "ex": "http://example.org/" },
+            "@id": "ex:alice",
+            "ex:status": { "@variable": "?status" }
+        });
+        let original = doc.clone();
+        let result = lower(doc).unwrap();
+        assert_eq!(result, original);
+    }
+
+    #[test]
+    fn annotation_in_named_graph_emits_reifies_graph() {
+        // When the parent node is in a named graph (per-node @graph
+        // selector), the synthetic annotation sibling must carry both
+        // `f:reifiesGraph` (so the decoder pins the right graph) and
+        // its own `@graph` (so the annotation flakes land in the same
+        // named graph as the reified edge).
+        let doc = json!({
+            "@context": { "ex": "http://example.org/" },
+            "@id": "ex:alice",
+            "@graph": "ex:hr-graph",
+            "ex:worksFor": {
+                "@id": "ex:acme",
+                "@annotation": { "ex:role": "Engineer" }
+            }
+        });
+        let result = lower(doc).unwrap();
+        let graph = result
+            .get("@graph")
+            .and_then(|g| g.as_array())
+            .expect("envelope @graph form");
+        let sibling = &graph[1];
+
+        assert_eq!(
+            sibling.get(reifies_iris::GRAPH).unwrap(),
+            &json!({"@id": "ex:hr-graph"}),
+            "f:reifiesGraph should pin the reified edge's named graph"
+        );
+        assert_eq!(
+            sibling.get("@graph").unwrap(),
+            &json!("ex:hr-graph"),
+            "annotation sibling should land in the same named graph as its edge"
+        );
+    }
+
+    #[test]
+    fn annotation_in_default_graph_omits_reifies_graph() {
+        // Default-graph edges encode "default" as the *absence* of
+        // `f:reifiesGraph` — matching the bundle validator's
+        // "at most one" rule and `EdgeKey::from_reifies_facts`'s
+        // None-means-default semantics.
+        let doc = json!({
+            "@id": "ex:alice",
+            "ex:worksFor": {
+                "@id": "ex:acme",
+                "@annotation": { "ex:role": "Engineer" }
+            }
+        });
+        let result = lower(doc).unwrap();
+        let sibling = &result.get("@graph").unwrap().as_array().unwrap()[1];
+        assert!(
+            sibling.get(reifies_iris::GRAPH).is_none(),
+            "f:reifiesGraph must be absent for default-graph edges"
+        );
+        assert!(
+            sibling.get("@graph").is_none(),
+            "annotation sibling must not pin a named graph for default-graph edges"
         );
     }
 
