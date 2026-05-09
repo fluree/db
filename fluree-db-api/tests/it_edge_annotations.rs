@@ -801,6 +801,154 @@ async fn cascade_cleans_up_anonymous_annotation_metadata() {
 }
 
 #[tokio::test]
+async fn retracting_all_annotation_metadata_cleans_bundle_too() {
+    // When a user retracts every asserted user-property flake of
+    // an annotation subject in a single transaction, the cascade
+    // should also retract the `f:reifies*` bundle pointing at the
+    // (still-asserted) base edge. Without this auto-cleanup, the
+    // bundle stays asserted as an orphan: an inline `@annotation`
+    // query would still surface the annotation subject (because
+    // `f:reifiesSubject/Predicate/Object` still pin it to the
+    // base edge), even though the user clearly intended to delete
+    // the whole annotation.
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger_id = "it/edge-annotations:metadata-retract-cleans-bundle";
+    let ledger0 = genesis_ledger(&fluree, ledger_id);
+
+    let txn = json!({
+        "@context": ctx(),
+        "@id": "ex:alice",
+        "ex:worksFor": {
+            "@id": "ex:acme",
+            "@annotation": {
+                "@id": "ex:emp/alice-acme",
+                "ex:role": "Engineer"
+            }
+        }
+    });
+    let after_insert = fluree.insert(ledger0, &txn).await.expect("insert");
+
+    // Sanity: inline `@annotation` finds the annotation subject before
+    // we do anything else.
+    let q_ann = json!({
+        "@context": ctx(),
+        "select": ["?ann"],
+        "where": {
+            "@id": "?person",
+            "ex:worksFor": {
+                "@id": "?org",
+                "@annotation": { "@id": "?ann" }
+            }
+        }
+    });
+    let pre = support::query_jsonld_formatted(&fluree, &after_insert.ledger, &q_ann)
+        .await
+        .expect("pre-cleanup ?ann query");
+    assert_eq!(pre.as_array().expect("array").len(), 1);
+
+    // Retract all of the annotation subject's user metadata
+    // (here: just the single `ex:role` flake) without touching the
+    // base edge.
+    let delete = json!({
+        "@context": ctx(),
+        "delete": {
+            "@id": "ex:emp/alice-acme",
+            "ex:role": "Engineer"
+        }
+    });
+    let after_delete = fluree
+        .update(after_insert.ledger, &delete)
+        .await
+        .expect("metadata-only retract");
+
+    // The bundle should also be gone — inline `@annotation` no
+    // longer finds the orphaned annotation.
+    let post = support::query_jsonld_formatted(&fluree, &after_delete.ledger, &q_ann)
+        .await
+        .expect("post-cleanup ?ann query");
+    let arr = post.as_array().expect("array");
+    assert!(
+        arr.is_empty(),
+        "after metadata retract, the bundle must be cleaned too; got: {arr:#?}"
+    );
+
+    // The base edge itself should still be queryable — the cleanup
+    // is annotation-scoped, not edge-scoped.
+    let q_bare = json!({
+        "@context": ctx(),
+        "select": ["?o"],
+        "where": { "@id": "ex:alice", "ex:worksFor": { "@id": "?o" } }
+    });
+    let bare = support::query_jsonld_formatted(&fluree, &after_delete.ledger, &q_bare)
+        .await
+        .expect("base-edge query post-cleanup");
+    assert_eq!(
+        bare.as_array().expect("array").len(),
+        1,
+        "the base edge must survive metadata-only retract: {bare:#?}"
+    );
+}
+
+#[tokio::test]
+async fn retracting_partial_annotation_metadata_keeps_bundle() {
+    // Counterpart: if the user retracts ONLY SOME metadata flakes
+    // (leaving others asserted), the annotation is still meaningful
+    // and the bundle must NOT be cascaded. The auto-cleanup only
+    // fires when the annotation subject is left with zero asserted
+    // body metadata.
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger_id = "it/edge-annotations:metadata-retract-partial";
+    let ledger0 = genesis_ledger(&fluree, ledger_id);
+
+    let txn = json!({
+        "@context": ctx(),
+        "@id": "ex:alice",
+        "ex:worksFor": {
+            "@id": "ex:acme",
+            "@annotation": {
+                "@id": "ex:emp/alice-acme",
+                "ex:role": "Engineer",
+                "ex:since": "2020"
+            }
+        }
+    });
+    let after_insert = fluree.insert(ledger0, &txn).await.expect("insert");
+
+    // Retract only `ex:role`; leave `ex:since` asserted.
+    let delete = json!({
+        "@context": ctx(),
+        "delete": {
+            "@id": "ex:emp/alice-acme",
+            "ex:role": "Engineer"
+        }
+    });
+    let after_delete = fluree.update(after_insert.ledger, &delete).await.expect("delete");
+
+    // The annotation should still be findable via @reifies, since
+    // `ex:since` (and the bundle) are still asserted.
+    let q = json!({
+        "@context": ctx(),
+        "select": ["?ann"],
+        "where": {
+            "@id": "?person",
+            "ex:worksFor": {
+                "@id": "?org",
+                "@annotation": { "@id": "?ann" }
+            }
+        }
+    });
+    let post = support::query_jsonld_formatted(&fluree, &after_delete.ledger, &q)
+        .await
+        .expect("post-partial-retract ?ann query");
+    let arr = post.as_array().expect("array");
+    assert_eq!(
+        arr.len(),
+        1,
+        "partial metadata retract must NOT cascade the bundle: {arr:#?}"
+    );
+}
+
+#[tokio::test]
 async fn cascade_lpg_mode_cleans_explicit_iri_metadata_too() {
     // LPG mode (`opts.lpgEdgeLifecycle: true`) extends cascade
     // cleanup to explicit-IRI annotations, matching Cypher's

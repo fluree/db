@@ -299,13 +299,14 @@ correctness items remaining):**
   `AttachmentNovelty` overlay, and emits the inverse bundle. After
   cascade, `@reifies` queries correctly return zero rows for the
   retracted edge.
-- ⏳ **Annotation-metadata cascade** (RDF-mode anonymous + LPG-mode
-  explicit). The bundle retract above prevents orphaned attachment
-  pointers, but the annotation subject's own metadata flakes
-  (e.g. `ann ex:role "Engineer"`) remain in the graph as ordinary
-  RDF. Anonymous annotations have unreachable SIDs so this is
-  observably benign; explicit-IRI annotations stay queryable as
-  ordinary nodes (which the design doc allows in RDF mode).
+- ✅ **Annotation-metadata cascade** (RDF-mode anonymous + LPG-mode
+  explicit opt-in): when a plain base-edge retract cascades the
+  `f:reifies*` bundle, the cascade also retracts anonymous annotation
+  body metadata by default. If the transaction sets
+  `opts.lpgEdgeLifecycle: true`, explicit-IRI annotation body metadata
+  is retracted too, matching Cypher relationship lifecycle. Default
+  RDF mode still preserves explicit-IRI annotations as ordinary
+  user-named RDF subjects.
 - ⏳ **Occurrence-by-selector and by-annotation-id retracts.** The
   more targeted retract shapes that select a specific occurrence
   among parallel annotations need IR support (matching by metadata)
@@ -555,19 +556,21 @@ Other properties of the encoding:
     4. Emit annotation flakes for the metadata properties.
     5. Update `AttachmentNovelty` from the same observer hook so
        reads see the attachment immediately.
-  - `flake_sink.rs`: extend so retraction emit paths cascade per the
+  - `stage.rs`: extend so retraction emit paths cascade per the
     rules in the decisions section.
-    - Plain edge retract: enumerate current attachments via
-      `AttachmentNovelty.forward.get(&edge_key)`, retract `f:reifies*`
-      flakes + owned annotation flakes (anonymous always; explicit
-      only in LPG mode). Then retract base.
+    - Plain edge retract: enumerate current attachments via the
+      merged snapshot+novelty scan path, retract `f:reifies*` flakes
+      + owned annotation flakes (anonymous always; explicit only in
+      LPG mode). The base-edge retract is the user-authored operation
+      that triggered the cascade.
     - Occurrence retract by selector: filter attachments, retract
       matching ones; if last and LPG mode, retract base.
     - Delete-by-annotation-id: single attachment's `f:reifies*` +
       owned facts.
-  - Transaction option `lpgEdgeLifecycle: bool` parsed in
-    `fluree-db-transact/src/parse/options.rs` (or wherever opts live)
-    and threaded into `flake_sink`.
+  - Transaction option `opts.lpgEdgeLifecycle: bool` parsed into
+    `TxnOpts::lpg_edge_lifecycle` in
+    `fluree-db-transact/src/parse/jsonld.rs` and threaded into the
+    `stage.rs` cascade pass.
 
 - `fluree-db-query/src/execute/`
   - New operator `EdgeAnnotationOp` reading `AttachmentNovelty.forward`
@@ -649,12 +652,15 @@ Other properties of the encoding:
     over (s, p, o) ignores parallel occurrences.
   - `annotation_rooted_query_via_reifies` — `@reifies` finds the edge
     from metadata.
-  - `delete_base_edge_cascades_anonymous_annotations` — anonymous
-    metadata is gone; explicit-IRI metadata is preserved (RDF mode).
-  - `delete_base_edge_lpg_mode_cascades_explicit_metadata` — opt-in
-    flag flips behavior.
+  - `cascade_cleans_up_anonymous_annotation_metadata` — anonymous
+    metadata is gone on base-edge retract.
+  - `cascade_keeps_explicit_iri_annotation_metadata` — explicit-IRI
+    metadata is preserved in default RDF mode.
+  - `cascade_lpg_mode_cleans_explicit_iri_metadata_too` —
+    `opts.lpgEdgeLifecycle: true` cleans explicit-IRI metadata on
+    base-edge retract.
   - `delete_by_annotation_id_targets_one_occurrence` — leaves siblings
-    intact.
+    intact (pending targeted-retract IR work).
   - `delete_by_selector_filters_matching_occurrences` — partial
     metadata match.
   - `empty_annotation_block_is_noop_in_rdf_mode` — no attachment row
@@ -681,8 +687,10 @@ Other properties of the encoding:
       the same results. Locks in the durable encoding.
 - [ ] Multiplicity contract verified: bare-triple cardinality
       unchanged.
-- [ ] Lifecycle rules verified: RDF default preserves base fact;
-      `lpgEdgeLifecycle` opt-in retracts it.
+- [ ] Lifecycle rules verified: RDF default preserves explicit-IRI
+      annotation metadata on base-edge retract; `lpgEdgeLifecycle`
+      opt-in cleans it. Occurrence-level base-fact lifecycle remains
+      deferred to targeted retract work.
 - [ ] Cascade rules verified for all three retract shapes.
 - [ ] **Reverse-direction visibility check** verified:
       `AnnotationTargetOp` cannot leak base edges that policy hides

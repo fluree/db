@@ -94,12 +94,19 @@ async fn cascade_attachment_retracts(
     use fluree_db_core::range::{RangeMatch, RangeOptions, RangeTest};
     use fluree_db_core::{is_reserved_reifies_predicate, FlakeValue};
 
+    use std::collections::BTreeMap;
+
     let mut cascade = Vec::new();
     let f_reifies_subject = Sid::new(
         fluree_vocab::namespaces::FLUREE_DB,
         fluree_vocab::db::REIFIES_SUBJECT,
     );
     let to_t = ledger.t();
+
+    // Annotation subjects already cascaded in pass 1 (base-edge
+    // retract). Pass 2 (orphan-cleanup) skips these so the
+    // `f:reifies*` bundle isn't double-retracted.
+    let mut cascaded_anns: HashSet<(GraphId, Sid)> = HashSet::new();
 
     for flake in flakes {
         if flake.op {
@@ -196,8 +203,109 @@ async fn cascade_attachment_retracts(
                     cascade.push(retract);
                 }
             }
+            // Track this annotation as already-cascaded so the
+            // orphan-cleanup pass below doesn't double-retract.
+            cascaded_anns.insert((g_id, ann_sid));
         }
     }
+
+    // ---------------------------------------------------------------
+    // Pass 2: orphan-cleanup for annotation-metadata-only retracts.
+    //
+    // When a transaction retracts all the user-property metadata of
+    // an annotation subject WITHOUT retracting the base edge, the
+    // base-edge pass above doesn't fire — but the f:reifies* bundle
+    // is now an orphan in the durable encoding, since the
+    // annotation has no body left. An inline `@annotation` query
+    // would still surface the empty annotation subject, which is
+    // not what the user intended.
+    //
+    // Detection: for every retract flake whose subject is an
+    // annotation subject (has currently-asserted f:reifies*
+    // facts), check if the user's retract set covers ALL of that
+    // subject's currently-asserted user-property metadata. If so,
+    // also retract the bundle.
+    //
+    // Both RDF and LPG modes apply this cleanup — the user-intent
+    // signal (retract every metadata flake) is the same either way.
+    // The mode flag only controls whether explicit-IRI metadata
+    // gets retracted from a base-edge cascade.
+    let mut grouped_metadata_retracts: BTreeMap<(GraphId, Sid), Vec<&Flake>> =
+        BTreeMap::new();
+    for flake in flakes {
+        if flake.op {
+            continue;
+        }
+        if is_reserved_reifies_predicate(&flake.p) {
+            continue;
+        }
+        let g_id = resolve_flake_graph_id(flake, reverse_graph)?;
+        grouped_metadata_retracts
+            .entry((g_id, flake.s.clone()))
+            .or_default()
+            .push(flake);
+    }
+
+    for ((g_id, ann_sid), retract_set) in grouped_metadata_retracts {
+        if cascaded_anns.contains(&(g_id, ann_sid.clone())) {
+            // Already cascaded via the base-edge pass; skip.
+            continue;
+        }
+
+        // Scan all currently-asserted flakes for this subject.
+        let all_flakes = fluree_db_core::range_with_overlay(
+            &ledger.snapshot,
+            g_id,
+            ledger.novelty.as_ref(),
+            IndexType::Spot,
+            RangeTest::Eq,
+            RangeMatch::new().with_subject(ann_sid.clone()),
+            RangeOptions::new().with_to_t(to_t),
+        )
+        .await?;
+        let (bundle, current_metadata): (Vec<Flake>, Vec<Flake>) =
+            all_flakes.into_iter().partition(|f| {
+                is_reserved_reifies_predicate(&f.p)
+            });
+        if bundle.is_empty() {
+            continue; // not an annotation subject
+        }
+        let edge_key = match EdgeKey::from_reifies_facts(&bundle) {
+            Ok(k) => k,
+            Err(_) => continue, // malformed; skip
+        };
+
+        // Check that every currently-asserted metadata flake on the
+        // annotation subject is being retracted in this transaction.
+        // Identity = (s, p, o, dt, m) — the same dimensions Fluree
+        // uses for assertion/retraction matching.
+        type FlakeIdentity = (Sid, Sid, FlakeValue, Sid, Option<fluree_db_core::FlakeMeta>);
+        let identity = |f: &Flake| -> FlakeIdentity {
+            (
+                f.s.clone(),
+                f.p.clone(),
+                f.o.clone(),
+                f.dt.clone(),
+                f.m.clone(),
+            )
+        };
+        let retracted_ids: HashSet<FlakeIdentity> =
+            retract_set.iter().map(|f| identity(f)).collect();
+        let all_metadata_being_retracted = current_metadata
+            .iter()
+            .all(|f| retracted_ids.contains(&identity(f)));
+        if !all_metadata_being_retracted {
+            continue;
+        }
+
+        // All metadata being removed → the annotation is being
+        // disposed of. Retract the bundle in the same JSON-LD-
+        // compatible shape so it cancels the original assertion.
+        cascade.extend(edge_key.to_reifies_facts_jsonld_compatible(
+            &ann_sid, new_t, false,
+        ));
+    }
+
     Ok(cascade)
 }
 

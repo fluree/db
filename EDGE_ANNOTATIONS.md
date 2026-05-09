@@ -1264,13 +1264,20 @@ this section as its frozen contract.
 
 ### Mode default
 
-- **RDF default.** When the last annotation occurrence on an edge is
-  removed, the base fact remains asserted. Triple-store users keep their
-  existing semantics.
+- **RDF default.** Retracting a base edge removes the attachment bundle
+  and anonymous annotation body metadata, but preserves explicit-IRI
+  annotation subjects as ordinary RDF. Triple-store users keep their
+  existing semantics and user-named resources are not deleted
+  surprisingly.
 - **LPG mode is opt-in per transaction.** A transaction option (e.g.
-  `opts.lpgEdgeLifecycle: true`) flips the lifecycle so that retracting
-  the last annotation occurrence also retracts the base fact, and Cypher
-  imports use this mode by default.
+  `opts.lpgEdgeLifecycle: true`) extends base-edge retract cascade to
+  explicit-IRI annotation body metadata, matching Cypher's relationship
+  lifecycle where deleting a relationship deletes its properties.
+- **Occurrence-level lifecycle is deferred.** Targeted retracts such as
+  "delete the annotation with `ex:role` = `Engineer` but keep the
+  `Manager` annotation" still require occurrence-by-selector / by-id IR
+  work. When that lands, LPG mode can also define the "last occurrence
+  removed may retract the base fact" behavior for those targeted shapes.
 - Cypher / LPG imports default to LPG mode without requiring the user to
   pass the option.
 
