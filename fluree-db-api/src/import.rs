@@ -3963,6 +3963,14 @@ where
             .cloned()
             .collect();
 
+        // Sticky bit (computed before move into the struct literal).
+        let import_has_annotations = predicate_sids_v6.iter().any(|(ns, name)| {
+            fluree_db_core::is_reserved_reifies_predicate(&fluree_db_core::Sid::new(
+                *ns,
+                name.as_str(),
+            ))
+        });
+
         let root_v6 = IndexRoot {
             ledger_id: alias.to_string(),
             index_t: input.final_t,
@@ -3994,6 +4002,12 @@ where
             prev_index: None,
             garbage: None,
             sketch_ref: None,
+            // Bulk import path: detect annotations the same way the
+            // incremental indexer does — any of the seven reserved
+            // `f:reifies*` SIDs in the predicate dict means the
+            // ledger has annotations. Computed above before the
+            // dict moves into this struct literal.
+            has_annotations: import_has_annotations,
             ns_split_mode: fluree_db_core::ns_encoding::NsSplitMode::default(),
         };
 

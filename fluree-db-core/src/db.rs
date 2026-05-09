@@ -55,6 +55,12 @@ pub struct LedgerSnapshotMetadata {
     /// index 2 = g_id 3 (first user graph), etc.
     /// Matches `IndexRoot.graph_iris` encoding.
     pub graph_iris: Vec<String>,
+    /// Sticky bit: `true` once any `f:reifies*` flake has ever been
+    /// observed in this ledger's history. Carried in `IndexRoot`
+    /// and consulted by the cascade fast-path in
+    /// `fluree-db-transact::stage` so non-annotation ledgers skip
+    /// the per-retract POST scan entirely.
+    pub has_annotations: bool,
 }
 
 /// Database value at a specific point in time.
@@ -126,6 +132,13 @@ pub struct LedgerSnapshot {
     /// (via `apply_envelope_deltas`). Provides IRI→GraphId resolution
     /// without requiring a binary index.
     pub graph_registry: GraphRegistry,
+
+    /// Sticky bit: `true` once any `f:reifies*` flake has ever been
+    /// observed in this ledger's history. Carried in `IndexRoot`'s
+    /// flag bits, plumbed here, and consulted by the cascade
+    /// fast-path so non-annotation ledgers pay zero per-retract
+    /// cost.
+    pub has_annotations: bool,
 }
 
 impl Clone for LedgerSnapshot {
@@ -145,6 +158,7 @@ impl Clone for LedgerSnapshot {
             string_watermark: self.string_watermark,
             range_provider: self.range_provider.clone(),
             graph_registry: self.graph_registry.clone(),
+            has_annotations: self.has_annotations,
         }
     }
 }
@@ -195,6 +209,7 @@ impl LedgerSnapshot {
             string_watermark: 0,
             range_provider: None,
             graph_registry: GraphRegistry::new_for_ledger(ledger_id),
+            has_annotations: false,
         }
     }
 
@@ -230,6 +245,7 @@ impl LedgerSnapshot {
             string_watermark: meta.string_watermark,
             range_provider: None,
             graph_registry,
+            has_annotations: meta.has_annotations,
         })
     }
 
@@ -525,6 +541,12 @@ fn decode_fir6_metadata(bytes: &[u8]) -> std::io::Result<LedgerSnapshotMetadata>
     const FLAG_HAS_PREV_INDEX: u8 = 1 << 2;
     const FLAG_HAS_GARBAGE: u8 = 1 << 3;
     const FLAG_HAS_SKETCH: u8 = 1 << 4;
+    /// Sticky bit: this snapshot has at least one currently- or
+    /// previously-asserted edge-annotation `f:reifies*` flake. Used
+    /// by the cascade fast-path in `fluree-db-transact::stage` to
+    /// skip the per-retract POST scan on non-annotation ledgers.
+    const FLAG_HAS_ANNOTATIONS: u8 = 1 << 6;
+    let has_annotations = flags & FLAG_HAS_ANNOTATIONS != 0;
 
     #[inline]
     fn ensure(bytes: &[u8], pos: usize, need: usize, ctx: &str) -> std::io::Result<()> {
@@ -830,6 +852,7 @@ fn decode_fir6_metadata(bytes: &[u8]) -> std::io::Result<LedgerSnapshotMetadata>
         subject_watermarks,
         string_watermark,
         graph_iris,
+        has_annotations,
     })
 }
 
@@ -889,6 +912,7 @@ mod tests {
             subject_watermarks: vec![],
             string_watermark: 0,
             graph_iris: vec![],
+            has_annotations: false,
         })
         .unwrap();
 

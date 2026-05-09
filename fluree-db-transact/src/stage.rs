@@ -97,6 +97,24 @@ async fn cascade_attachment_retracts(
     use std::collections::BTreeMap;
 
     let mut cascade = Vec::new();
+
+    // Fast-path gate: if the ledger has *never* observed a
+    // `f:reifies*` flake (sticky bit on `IndexRoot`, plumbed through
+    // `LedgerSnapshot.has_annotations`) AND the in-memory novelty
+    // hasn't observed one in this run either, skip the cascade
+    // entirely. Non-annotation ledgers pay zero per-retract cost.
+    //
+    // Both gates are required because the indexed bit only updates at
+    // index-build time — a ledger that just received its first
+    // annotation in novelty (no reindex yet) has
+    // `snapshot.has_annotations == false` but
+    // `novelty.attachments.has_annotations() == true`.
+    if !ledger.snapshot.has_annotations
+        && !ledger.novelty.attachments.has_annotations()
+    {
+        return Ok(cascade);
+    }
+
     let f_reifies_subject = Sid::new(
         fluree_vocab::namespaces::FLUREE_DB,
         fluree_vocab::db::REIFIES_SUBJECT,

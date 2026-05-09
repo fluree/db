@@ -193,6 +193,21 @@ pub struct IndexRoot {
     pub prev_index: Option<BinaryPrevIndexRef>,
     pub garbage: Option<BinaryGarbageRef>,
     pub sketch_ref: Option<ContentId>,
+
+    // ── Edge-annotation gate ──────────────────────────────────────
+    /// Sticky bit: `true` once any `f:reifies*` flake (assertion or
+    /// retract) has been observed in this ledger's history. Once
+    /// set, stays set across reindexes — annotations may have been
+    /// fully retracted, but the cascade pass should still scan to
+    /// catch the (now-rare) case where an in-flight retract uncovers
+    /// a previously-orphaned bundle.
+    ///
+    /// Used as a fast-path gate in
+    /// `fluree-db-transact::stage::cascade_attachment_retracts`:
+    /// non-annotation ledgers (those that have never seen an
+    /// `@annotation` / `@reifies` write) skip the per-retract POST
+    /// lookup entirely.
+    pub has_annotations: bool,
 }
 
 impl IndexRoot {
@@ -480,6 +495,12 @@ impl IndexRoot {
     const FLAG_HAS_GARBAGE: u8 = 1 << 3;
     const FLAG_HAS_SKETCH: u8 = 1 << 4;
     const FLAG_LEX_SORTED_STRING_IDS: u8 = 1 << 5;
+    /// Sticky bit: this snapshot has at least one currently- or
+    /// previously-asserted edge-annotation `f:reifies*` flake.
+    /// Acts as a fast-path gate for the cascade scan in
+    /// `fluree-db-transact::stage` — non-annotation ledgers skip
+    /// the per-retract POST lookup entirely.
+    const FLAG_HAS_ANNOTATIONS: u8 = 1 << 6;
 
     /// Encode to the binary FIR6 wire format.
     ///
@@ -513,6 +534,10 @@ impl IndexRoot {
             0
         }) | (if self.lex_sorted_string_ids {
             Self::FLAG_LEX_SORTED_STRING_IDS
+        } else {
+            0
+        }) | (if self.has_annotations {
+            Self::FLAG_HAS_ANNOTATIONS
         } else {
             0
         });
@@ -692,6 +717,7 @@ impl IndexRoot {
         let index_t = read_i64_at(data, &mut pos)?;
         let base_t = read_i64_at(data, &mut pos)?;
         let lex_sorted_string_ids = (flags & Self::FLAG_LEX_SORTED_STRING_IDS) != 0;
+        let has_annotations = (flags & Self::FLAG_HAS_ANNOTATIONS) != 0;
 
         // Ledger ID
         let ledger_id = read_string(data, &mut pos)?;
@@ -910,6 +936,7 @@ impl IndexRoot {
             prev_index,
             garbage,
             sketch_ref,
+            has_annotations,
         })
     }
     /// Collect all CAS content-artifact CIDs referenced by this root.
@@ -1185,6 +1212,7 @@ mod tests {
             prev_index: None,
             garbage: None,
             sketch_ref: None,
+            has_annotations: false,
             ns_split_mode: fluree_db_core::ns_encoding::NsSplitMode::default(),
         }
     }

@@ -262,6 +262,19 @@ pub(crate) async fn encode_and_write_root_v6(
         .cloned()
         .collect();
 
+    // Sticky bit: `true` once any `f:reifies*` predicate has been
+    // observed in the ledger's history. Detection is cheap — if any
+    // of the seven reserved reifies SIDs appears in the indexer's
+    // accumulated predicate dictionary, annotations exist (or did).
+    // Once a predicate enters the dict it stays there across
+    // reindexes, so this naturally inherits sticky-bit semantics.
+    let has_annotations = inputs.predicate_sids.iter().any(|(ns, name)| {
+        fluree_db_core::is_reserved_reifies_predicate(&fluree_db_core::Sid::new(
+            *ns,
+            name.as_str(),
+        ))
+    });
+
     let mut root = IndexRoot {
         ledger_id: inputs.ledger_id.clone(),
         index_t: inputs.index_t,
@@ -289,6 +302,7 @@ pub(crate) async fn encode_and_write_root_v6(
         prev_index: None,
         garbage: None,
         sketch_ref: inputs.sketch_ref,
+        has_annotations,
     };
 
     // `IndexStats.size` is defined as total commit data size (bytes) for the ledger.
