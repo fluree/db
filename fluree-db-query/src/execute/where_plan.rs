@@ -40,6 +40,136 @@ use std::sync::Arc;
 
 use super::pushdown::extract_bounds_from_filters;
 
+// ============================================================================
+// Edge-annotation IR expansion (M1b)
+// ============================================================================
+//
+// `Pattern::EdgeAnnotation { edge, annotation, body }` and
+// `Pattern::AnnotationTarget { annotation, edge, body }` are flattened
+// at planner time into the equivalent triple chain over the
+// `f:reifies*` system predicates. The standard scan / join machinery
+// handles the rest. This avoids a custom operator and exercises the
+// existing visibility / policy / dedup paths automatically — the
+// base edge triple's standard scan provides the visibility check for
+// the reverse direction "for free".
+
+/// Expand every `Pattern::EdgeAnnotation` / `Pattern::AnnotationTarget`
+/// in `patterns` into its triple-chain equivalent, recursing through
+/// every container pattern (`Optional`, `Union`, `Minus`, `Exists`,
+/// `NotExists`, `Graph`, `Service`, `Subquery`).
+fn expand_edge_annotation_patterns(patterns: &[Pattern]) -> Vec<Pattern> {
+    let mut out = Vec::with_capacity(patterns.len());
+    for p in patterns {
+        expand_one_into(p.clone(), &mut out);
+    }
+    out
+}
+
+fn expand_one_into(pattern: Pattern, out: &mut Vec<Pattern>) {
+    match pattern {
+        Pattern::EdgeAnnotation {
+            edge,
+            annotation,
+            body,
+        }
+        | Pattern::AnnotationTarget {
+            annotation,
+            edge,
+            body,
+        } => {
+            // 1. Base edge triple: provides visibility for both
+            //    directions. The standard scan applies snapshot rules
+            //    + policy filters here, so an `AnnotationTarget`
+            //    operator-style visibility check is redundant.
+            out.push(Pattern::Triple(edge.clone()));
+
+            // 2. Three required `f:reifies*` lookup triples that bind
+            //    the annotation to the edge.
+            let ann_ref = annotation.clone();
+            let id_dt = fluree_db_core::edge::id_datatype_sid();
+            // f:reifiesSubject — links annotation to the edge's
+            // subject.
+            out.push(Pattern::Triple(TriplePattern {
+                s: ann_ref.clone(),
+                p: reifies_subject_ref(),
+                o: edge.s.clone().into(),
+                dtc: Some(fluree_db_core::DatatypeConstraint::Explicit(id_dt.clone())),
+            }));
+            // f:reifiesPredicate — links annotation to the edge's
+            // predicate.
+            out.push(Pattern::Triple(TriplePattern {
+                s: ann_ref.clone(),
+                p: reifies_predicate_ref(),
+                o: edge.p.clone().into(),
+                dtc: Some(fluree_db_core::DatatypeConstraint::Explicit(id_dt)),
+            }));
+            // f:reifiesObject — preserves the original object's
+            // datatype constraint via dtc so typed-equality matches
+            // round-trip.
+            out.push(Pattern::Triple(TriplePattern {
+                s: ann_ref,
+                p: reifies_object_ref(),
+                o: edge.o.clone(),
+                dtc: edge.dtc.clone(),
+            }));
+
+            // f:reifiesGraph and f:reifiesLang are intentionally
+            // omitted from the lookup chain in v1 — the base edge
+            // triple already constrains graph and language matching
+            // through its own scan, so adding them as separate
+            // triples would over-constrain. Cross-graph or per-lang
+            // disambiguation arrives in M2 with the binary arena.
+
+            // 3. Body patterns (recursively expanded so nested
+            //    annotations — though M0 rejects them — flatten too).
+            for inner in body {
+                expand_one_into(inner, out);
+            }
+        }
+
+        // Recurse into compound containers so nested EdgeAnnotation
+        // patterns inside Optional/Union/Minus/Exists/NotExists/
+        // Graph/Service/Subquery get expanded too. The `map_subpatterns`
+        // helper rebuilds the surrounding container around the result.
+        Pattern::Optional(_)
+        | Pattern::Minus(_)
+        | Pattern::Exists(_)
+        | Pattern::NotExists(_)
+        | Pattern::Union(_)
+        | Pattern::Graph { .. }
+        | Pattern::Service(_)
+        | Pattern::Subquery(_) => {
+            let expanded = pattern.map_subpatterns(&mut |inner| {
+                expand_edge_annotation_patterns(&inner)
+            });
+            out.push(expanded);
+        }
+
+        other => out.push(other),
+    }
+}
+
+fn reifies_subject_ref() -> Ref {
+    Ref::Sid(fluree_db_core::Sid::new(
+        fluree_vocab::namespaces::FLUREE_DB,
+        fluree_vocab::db::REIFIES_SUBJECT,
+    ))
+}
+
+fn reifies_predicate_ref() -> Ref {
+    Ref::Sid(fluree_db_core::Sid::new(
+        fluree_vocab::namespaces::FLUREE_DB,
+        fluree_vocab::db::REIFIES_PREDICATE,
+    ))
+}
+
+fn reifies_object_ref() -> Ref {
+    Ref::Sid(fluree_db_core::Sid::new(
+        fluree_vocab::namespaces::FLUREE_DB,
+        fluree_vocab::db::REIFIES_OBJECT,
+    ))
+}
+
 #[inline]
 fn filter_not_bound_var(expr: &Expression) -> Option<VarId> {
     match expr {
@@ -1222,6 +1352,18 @@ pub fn build_where_operators_seeded_with_needed(
         return Ok(seed.unwrap_or_else(|| Box::new(EmptyOperator::new())));
     }
 
+    // Edge-annotation expansion (M1b): Pattern::EdgeAnnotation /
+    // Pattern::AnnotationTarget are flattened into the equivalent base
+    // edge plus four `f:reifies*` triple lookups plus the body. The
+    // standard scan/join machinery handles the rest. The base-edge
+    // triple is always emitted, which gives the
+    // `Pattern::AnnotationTarget` reverse direction its required
+    // visibility check for free: the base edge must be currently
+    // asserted under the snapshot's normal policy/visibility rules,
+    // or no row survives the join.
+    let expanded_storage = expand_edge_annotation_patterns(patterns);
+    let patterns: &[Pattern] = &expanded_storage;
+
     // Apply generalized pattern reordering upfront for all pattern lists.
     //
     // reorder_patterns determines optimal placement of all patterns
@@ -1813,14 +1955,17 @@ pub fn build_where_operators_seeded_with_needed(
                 i += 1;
             }
 
-            // Edge-annotation patterns: M0 stub. Storage support arrives in
-            // M1; the operator-tree assembly entry point (operator_tree.rs)
-            // is the single failure surface, so this dispatch should never
-            // be reached at runtime in M0. Treat as unsupported here as a
-            // belt-and-braces guard if a caller bypasses operator_tree.
+            // Edge-annotation patterns are flattened by
+            // `expand_edge_annotation_patterns` at the top of
+            // `build_where_operators_seeded_with_needed`, so this
+            // dispatch arm is unreachable from any standard entry
+            // point. Keep the guard for safety in case a future
+            // caller bypasses the expansion pass.
             Pattern::EdgeAnnotation { .. } | Pattern::AnnotationTarget { .. } => {
-                return Err(QueryError::UnsupportedFeature(
-                    "edge annotations: storage not yet implemented".to_string(),
+                return Err(QueryError::Internal(
+                    "edge-annotation pattern reached the operator dispatch \
+                     without being flattened by expand_edge_annotation_patterns"
+                        .to_string(),
                 ));
             }
         }
