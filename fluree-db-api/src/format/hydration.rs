@@ -52,7 +52,7 @@ use fluree_db_core::{Flake, GraphDbRef, Sid, Tracker};
 use fluree_db_policy::{is_schema_flake, PolicyContext};
 use fluree_db_query::binding::Binding;
 use fluree_db_query::ir::{Column, ForwardItem, HydrationSpec, NestedSelectSpec, Root};
-use fluree_vocab::namespaces::{BLANK_NODE, JSON_LD};
+use fluree_vocab::namespaces::{BLANK_NODE, FLUREE_DB, JSON_LD};
 use fluree_vocab::rdf::{self, TYPE as RDF_TYPE_IRI};
 use futures::future::BoxFuture;
 use futures::FutureExt;
@@ -666,8 +666,8 @@ impl<'a> HydrationFormatter<'a> {
     }
 
     /// If the edge `(flake.s, flake.p, flake.o)` has any currently-
-    /// asserted annotations in the novelty overlay, format each one
-    /// and inject the result as the `@annotation` key on `value`.
+    /// asserted annotations, format each one and inject the result
+    /// as the `@annotation` key on `value`.
     ///
     /// `value` must already be a JSON object (the rendered Ref form).
     /// When `value` is a primitive (shouldn't happen in the Ref arm
@@ -681,6 +681,15 @@ impl<'a> HydrationFormatter<'a> {
     /// Multiple parallel annotations on the same edge produce an
     /// array under `@annotation`; a single annotation produces a
     /// bare object.
+    ///
+    /// **M2 read path:** uses scan-based lookups through
+    /// `self.db.range`, which goes through the merged base+novelty
+    /// view. This catches annotations whether they're in the
+    /// novelty overlay (fresh inserts) or in indexed base storage
+    /// (post-reindex), closing the M1b "novelty-only" limitation.
+    /// Time-travel correctness: `db.range` respects `self.db.t`, so
+    /// a historical view sees only `f:reifies*` flakes asserted at
+    /// `t <= self.db.t`.
     async fn inject_annotations<'b>(
         &'b self,
         flake: &'b Flake,
@@ -689,57 +698,85 @@ impl<'a> HydrationFormatter<'a> {
         visited: &'b mut HashSet<Sid>,
         cache: &'b mut HashMap<CacheKey, JsonValue>,
     ) -> Result<()> {
-        // Source the overlay's attachment index. M1b limitation: only
-        // the novelty overlay is consulted — durable `f:reifies*`
-        // facts indexed into base storage produce no overlay rows
-        // until M2 introduces the indexed/arena-backed lookup.
-        // For ledgers whose annotations are still in novelty (the
-        // common case during M1) this gives the correct round-trip;
-        // a fully-indexed ledger would require the M2 path.
-        let Some(novelty) = self
-            .db
-            .overlay
-            .as_any()
-            .downcast_ref::<fluree_db_novelty::Novelty>()
-        else {
-            return Ok(());
-        };
-        if !novelty.attachments.has_annotations() {
-            return Ok(());
-        }
-
-        // Build the EdgeKey for this base-edge flake.
+        // Find the EdgeKey from the base flake.
         let edge_key = fluree_db_core::edge::EdgeKey::from_flake(flake);
 
-        // Collect annotation Sids first so we can release the borrow
-        // before recursive `format_subject` calls. **Use the
-        // formatter's as-of `t`** — a historical view must see only
-        // attachment events with `t <= self.db.t`, so future
-        // retracts don't hide a past assertion and future asserts
-        // don't leak into a past view.
-        let ann_sids: Vec<Sid> = novelty
-            .attachments
-            .current_annotations_for_at(&edge_key, self.db.t)
-            .collect();
-        if ann_sids.is_empty() {
+        // Scan candidate annotations via the base-edge subject:
+        // POST(f:reifiesSubject, FlakeValue::Ref(edge.s)) gives all
+        // annotations whose `f:reifiesSubject` points at this
+        // subject. The flake's `s` is the candidate annotation Sid.
+        let f_reifies_subject =
+            Sid::new(FLUREE_DB, fluree_vocab::db::REIFIES_SUBJECT);
+        let candidate_flakes = self
+            .db
+            .range(
+                IndexType::Post,
+                RangeTest::Eq,
+                RangeMatch::predicate_object(
+                    f_reifies_subject,
+                    FlakeValue::Ref(edge_key.s.clone()),
+                ),
+            )
+            .await
+            .map_err(|e| {
+                FormatError::InvalidBinding(format!(
+                    "annotation lookup (f:reifiesSubject scan) failed: {e}"
+                ))
+            })?;
+
+        if candidate_flakes.is_empty() {
             return Ok(());
         }
 
-        // The injection target must be a JSON object.
-        let Some(obj) = value.as_object_mut() else {
-            return Ok(());
-        };
-
-        // Recursively format each annotation. The wildcard hydration
-        // filter we added earlier already strips `f:reifies*` from
-        // the annotation body, so this just produces a clean
-        // user-property view of each annotation.
-        let mut bodies: Vec<JsonValue> = Vec::with_capacity(ann_sids.len());
+        // Verify each candidate's full bundle matches the base
+        // edge. A candidate `ann_sid` is valid iff the bundle of
+        // its `f:reifies*` flakes decodes to an `EdgeKey` equal to
+        // ours. The verification is per-candidate but the candidate
+        // set is bounded by "annotations on this subject" which is
+        // typically small.
+        let mut bodies: Vec<JsonValue> = Vec::new();
         let ann_level = NestedSelectSpec::Wildcard {
             refinements: HashMap::new(),
             reverse: HashMap::new(),
         };
-        for ann_sid in &ann_sids {
+        let mut seen: HashSet<Sid> = HashSet::new();
+
+        for cand in &candidate_flakes {
+            let ann_sid = &cand.s;
+            // Each candidate appears once per matching `f:reifiesSubject`
+            // flake — dedupe in case of replay anomalies.
+            if !seen.insert(ann_sid.clone()) {
+                continue;
+            }
+
+            let bundle: Vec<Flake> = self
+                .fetch_subject_properties(ann_sid)
+                .await?
+                .into_iter()
+                .filter(|f| {
+                    fluree_db_core::is_reserved_reifies_predicate(&f.p)
+                })
+                .collect();
+            if bundle.is_empty() {
+                continue;
+            }
+
+            // Decode to an EdgeKey and compare. A mismatch (different
+            // predicate, different object, different graph, etc.)
+            // means this candidate reifies a different edge that
+            // happens to share the subject.
+            let cand_edge =
+                match fluree_db_core::edge::EdgeKey::from_reifies_facts(&bundle) {
+                    Ok(k) => k,
+                    Err(_) => continue, // malformed; skip
+                };
+            if cand_edge != edge_key {
+                continue;
+            }
+
+            // Recursively format the annotation body. The wildcard
+            // hydration filter strips `f:reifies*` so this produces
+            // a clean user-property view.
             let mut body = self
                 .format_subject(ann_sid, &ann_level, depth.descend(), visited, cache)
                 .await?;
@@ -750,6 +787,15 @@ impl<'a> HydrationFormatter<'a> {
             }
             bodies.push(body);
         }
+
+        if bodies.is_empty() {
+            return Ok(());
+        }
+
+        // The injection target must be a JSON object.
+        let Some(obj) = value.as_object_mut() else {
+            return Ok(());
+        };
 
         // One annotation → bare object; many → array.
         let ann_json = if bodies.len() == 1 {

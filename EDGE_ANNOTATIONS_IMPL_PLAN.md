@@ -14,8 +14,9 @@ useful — a reviewer can merge without waiting for the next.
 |-----|-------|-------------|--------|
 | M0  | Parser surface + IR stub | none — execution errors | ~3 days |
 | M1a | Foundation + write side | durable via `f:reifies*` | ~1 wk |
-| M1b | Read side + cascade + integration | (M1a + arena lookups) | ~1–2 wk |
-| M2  | Binary arena + `IndexRoot` extension | survives indexing | 3–4 wk |
+| M1b | Read side + cascade + integration | (M1a + scan-based lookups) | ~1–2 wk |
+| M2a | Scan-based indexed read path | works pre + post-index | (this session) |
+| M2b | Binary annotation-arena format | O(log N) lookups, lazy load | follow-up |
 | M3  | Planner / costing | — | 1–2 wk |
 
 **M1 was split into two slices during implementation.** M1a and M1b

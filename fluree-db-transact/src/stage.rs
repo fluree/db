@@ -47,9 +47,15 @@ use fluree_db_shacl::{ShaclCache, ShaclEngine, ValidationReport};
 ///
 /// For each retract flake whose predicate is *not* a system-controlled
 /// `f:reifies*` predicate, build the corresponding `EdgeKey` and look
-/// up its currently-asserted annotations in `attachments`. For each
-/// annotation, emit the inverse `f:reifies*` bundle so the durable
-/// encoding doesn't keep pointing at a retracted edge.
+/// up its currently-asserted annotations against the merged
+/// snapshot+novelty view. For each annotation, emit the inverse
+/// `f:reifies*` bundle so the durable encoding doesn't keep pointing
+/// at a retracted edge.
+///
+/// **M2 read path:** uses scan-based lookup through
+/// `range_with_overlay`, which reads novelty + base storage. Closes
+/// the M1b "novelty-only" gap — annotations that have rolled into
+/// indexed base storage are still found and cascaded.
 ///
 /// M1b minimum: only retracts the `f:reifies*` bundle. Anonymous-
 /// annotation metadata cleanup (RDF mode default) and explicit-IRI
@@ -58,15 +64,24 @@ use fluree_db_shacl::{ShaclCache, ShaclEngine, ValidationReport};
 /// (the annotation subject becomes unreachable through `@reifies`
 /// once the bundle is gone, and anonymous SIDs can't be addressed
 /// directly).
-fn cascade_attachment_retracts(
+async fn cascade_attachment_retracts(
     flakes: &[Flake],
-    attachments: &fluree_db_novelty::AttachmentNovelty,
+    ledger: &LedgerState,
+    reverse_graph: &HashMap<Sid, GraphId>,
     new_t: i64,
-) -> Vec<Flake> {
+) -> Result<Vec<Flake>> {
+    use fluree_db_core::comparator::IndexType;
     use fluree_db_core::edge::EdgeKey;
-    use fluree_db_core::is_reserved_reifies_predicate;
+    use fluree_db_core::range::{RangeMatch, RangeOptions, RangeTest};
+    use fluree_db_core::{is_reserved_reifies_predicate, FlakeValue};
 
     let mut cascade = Vec::new();
+    let f_reifies_subject = Sid::new(
+        fluree_vocab::namespaces::FLUREE_DB,
+        fluree_vocab::db::REIFIES_SUBJECT,
+    );
+    let to_t = ledger.t();
+
     for flake in flakes {
         if flake.op {
             continue; // assertion, not a retract — nothing to cascade
@@ -75,21 +90,68 @@ fn cascade_attachment_retracts(
             continue; // already a system retract (cascade or upstream); skip
         }
         let edge_key = EdgeKey::from_flake(flake);
-        for ann_sid in attachments.current_annotations_for(&edge_key) {
-            // Build the f:reifies* retraction bundle. We use the
-            // *JSON-LD-compatible* shape (no f:reifiesDatatype) so
-            // the inverse retract is byte-symmetric with the
-            // original assertion that the JSON-LD pre-expansion
-            // lowering emitted. Using the full-bundle builder here
-            // would emit a retract for `f:reifiesDatatype` that
-            // was never asserted — a phantom retract that pollutes
-            // history and history-range queries.
+        let g_id = resolve_flake_graph_id(flake, reverse_graph)?;
+
+        // POST scan: find every annotation whose `f:reifiesSubject`
+        // points at this edge's subject. The flake's `s` is the
+        // candidate annotation Sid.
+        let candidates = fluree_db_core::range_with_overlay(
+            &ledger.snapshot,
+            g_id,
+            ledger.novelty.as_ref(),
+            IndexType::Post,
+            RangeTest::Eq,
+            RangeMatch::new()
+                .with_predicate(f_reifies_subject.clone())
+                .with_object(FlakeValue::Ref(edge_key.s.clone())),
+            RangeOptions::new().with_to_t(to_t),
+        )
+        .await?;
+
+        let mut seen: HashSet<Sid> = HashSet::new();
+        for cand in &candidates {
+            let ann_sid = cand.s.clone();
+            if !seen.insert(ann_sid.clone()) {
+                continue;
+            }
+
+            // SPOT scan for the candidate's f:reifies* bundle and
+            // verify it matches our base edge.
+            let bundle_flakes = fluree_db_core::range_with_overlay(
+                &ledger.snapshot,
+                g_id,
+                ledger.novelty.as_ref(),
+                IndexType::Spot,
+                RangeTest::Eq,
+                RangeMatch::new().with_subject(ann_sid.clone()),
+                RangeOptions::new().with_to_t(to_t),
+            )
+            .await?;
+            let bundle: Vec<Flake> = bundle_flakes
+                .into_iter()
+                .filter(|f| is_reserved_reifies_predicate(&f.p))
+                .collect();
+            if bundle.is_empty() {
+                continue;
+            }
+            let cand_edge = match EdgeKey::from_reifies_facts(&bundle) {
+                Ok(k) => k,
+                Err(_) => continue,
+            };
+            if cand_edge != edge_key {
+                continue;
+            }
+
+            // Build the f:reifies* retraction bundle. JSON-LD-
+            // compatible shape (no f:reifiesDatatype) so the
+            // inverse retract is byte-symmetric with the original
+            // assertion.
             cascade.extend(edge_key.to_reifies_facts_jsonld_compatible(
                 &ann_sid, new_t, false,
             ));
         }
     }
-    cascade
+    Ok(cascade)
 }
 
 fn build_reverse_graph_lookup(graph_sids: &HashMap<GraphId, Sid>) -> HashMap<Sid, GraphId> {
@@ -425,23 +487,24 @@ pub async fn stage(
         // orphaned in the durable encoding, and `@reifies` queries
         // would still surface annotations for retracted edges.
         //
+        // **M2 scan-based path:** the cascade looks up annotations
+        // via `range_with_overlay` over the merged snapshot+novelty
+        // view. This catches annotations whether they're still in
+        // the novelty overlay or have rolled into indexed base
+        // storage post-reindex.
+        //
         // M1b minimum: retracts the `f:reifies*` bundle only. The
         // anonymous-annotation metadata cascade (RDF default) and the
         // explicit-IRI metadata cascade (LPG mode opt-in) are tracked
         // as follow-ups in the plan.
-        if ledger.novelty.attachments.has_annotations() {
-            let cascade = cascade_attachment_retracts(
-                &flakes,
-                &ledger.novelty.attachments,
-                new_t,
+        let cascade =
+            cascade_attachment_retracts(&flakes, &ledger, &reverse_graph, new_t).await?;
+        if !cascade.is_empty() {
+            tracing::debug!(
+                cascade_count = cascade.len(),
+                "cascading f:reifies* retracts for retracted base edges"
             );
-            if !cascade.is_empty() {
-                tracing::debug!(
-                    cascade_count = cascade.len(),
-                    "cascading f:reifies* retracts for retracted base edges"
-                );
-                flakes.extend(cascade);
-            }
+            flakes.extend(cascade);
         }
 
         // Count fuel per staged non-schema flake (mirrors query-side fuel counting).

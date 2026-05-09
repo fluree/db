@@ -24,6 +24,8 @@
 
 mod support;
 
+use std::sync::Arc;
+
 use fluree_db_api::FlureeBuilder;
 use serde_json::{json, Value as JsonValue};
 use support::{genesis_ledger, MemoryFluree, MemoryLedger};
@@ -497,6 +499,199 @@ async fn subject_expansion_emits_annotation_block_for_annotated_edge() {
             "f:reifies* must not leak into @annotation body: {k}"
         );
     }
+}
+
+#[tokio::test]
+#[cfg(feature = "native")]
+async fn cascade_fires_for_indexed_annotation_when_edge_is_retracted() {
+    // M2 indexed-readpath proof for the cascade path: insert an
+    // annotated edge, force a reindex (drains novelty into base),
+    // retract the base edge, and verify the f:reifies* bundle is
+    // also retracted. With the M1b novelty-only cascade this would
+    // fail post-index (the overlay's `attachments` map is empty
+    // after novelty drains).
+    let fluree = FlureeBuilder::memory()
+        .with_ledger_cache_config(fluree_db_api::LedgerManagerConfig::default())
+        .build_memory();
+    let ledger_id = "it/edge-annotations:cascade-after-reindex";
+
+    let (local, handle) = support::start_background_indexer_local(
+        fluree.backend().clone(),
+        Arc::new(fluree.nameservice_mode().clone()),
+        fluree_db_indexer::IndexerConfig::small(),
+    );
+
+    local
+        .run_until(async move {
+            let ledger0 = genesis_ledger(&fluree, ledger_id);
+
+            let txn = json!({
+                "@context": ctx(),
+                "@id": "ex:alice",
+                "ex:worksFor": {
+                    "@id": "ex:acme",
+                    "@annotation": {
+                        "@id": "ex:emp/alice-acme",
+                        "ex:role": "Engineer"
+                    }
+                }
+            });
+            let after_insert = fluree.insert(ledger0, &txn).await.expect("insert");
+
+            // Drain novelty into base via reindex.
+            support::trigger_index_and_wait(&handle, ledger_id, after_insert.receipt.t)
+                .await;
+            let reloaded = fluree.ledger(ledger_id).await.expect("reload");
+
+            // Retract the base edge. With the M1b novelty-only
+            // cascade this would not fire because
+            // `ledger.novelty.attachments` is empty post-index.
+            let delete = json!({
+                "@context": ctx(),
+                "where": { "@id": "?s", "ex:worksFor": { "@id": "?o" } },
+                "delete": { "@id": "?s", "ex:worksFor": { "@id": "?o" } }
+            });
+            let after_delete = fluree.update(reloaded, &delete).await.expect("delete");
+
+            // Re-insert just the base edge (no @annotation block)
+            // and verify the discriminating cascade test:
+            //   - if cascade fired, @reifies returns 0 rows.
+            //   - if it didn't, the still-indexed f:reifies* facts
+            //     would join with the re-inserted base edge and
+            //     surface the original annotation.
+            let reinsert = json!({
+                "@context": ctx(),
+                "@id": "ex:alice",
+                "ex:worksFor": { "@id": "ex:acme" }
+            });
+            let after_reinsert = fluree
+                .insert(after_delete.ledger, &reinsert)
+                .await
+                .expect("plain re-insert");
+
+            let q = json!({
+                "@context": ctx(),
+                "select": ["?person", "?org"],
+                "where": {
+                    "ex:role": "Engineer",
+                    "@reifies": { "@id": "?person", "ex:worksFor": { "@id": "?org" } }
+                }
+            });
+            let post = support::query_jsonld_formatted(&fluree, &after_reinsert.ledger, &q)
+                .await
+                .expect("post-cascade-and-reinsert query");
+            let arr = post.as_array().expect("array");
+            assert!(
+                arr.is_empty(),
+                "cascade must fire for indexed annotations on base-edge retract; \
+                 got rows: {arr:#?}"
+            );
+        })
+        .await;
+}
+
+#[tokio::test]
+#[cfg(feature = "native")]
+async fn subject_expansion_finds_annotation_after_reindex() {
+    // M2 indexed-readpath proof: insert an annotated edge, force a
+    // full reindex (which drains novelty into base storage), reload
+    // the ledger so the snapshot is fresh, and verify the hydrator
+    // still emits `@annotation` blocks. With the M1b novelty-only
+    // approach this test would have failed (downcast finds an empty
+    // overlay post-index); the M2 scan-based lookup goes through
+    // `db.range` which reads novelty + base, so it finds the
+    // f:reifies* facts in their indexed location.
+    let fluree = FlureeBuilder::memory()
+        .with_ledger_cache_config(fluree_db_api::LedgerManagerConfig::default())
+        .build_memory();
+    let ledger_id = "it/edge-annotations:indexed-readpath";
+
+    let (local, handle) = support::start_background_indexer_local(
+        fluree.backend().clone(),
+        Arc::new(fluree.nameservice_mode().clone()),
+        fluree_db_indexer::IndexerConfig::small(),
+    );
+
+    local
+        .run_until(async move {
+            let ledger0 = genesis_ledger(&fluree, ledger_id);
+
+            // Insert an annotated edge. The lowering produces
+            // f:reifies* flakes that land in the novelty overlay.
+            let txn = json!({
+                "@context": ctx(),
+                "@id": "ex:alice",
+                "ex:worksFor": {
+                    "@id": "ex:acme",
+                    "@annotation": {
+                        "@id": "ex:emp/alice-acme",
+                        "ex:role": "Engineer"
+                    }
+                }
+            });
+            let after_insert = fluree
+                .insert(ledger0, &txn)
+                .await
+                .expect("annotated insert");
+
+            // Force a full reindex so the f:reifies* flakes roll
+            // from novelty into base storage.
+            support::trigger_index_and_wait(&handle, ledger_id, after_insert.receipt.t)
+                .await;
+
+            // Reload the ledger to pick up the post-index snapshot.
+            let reloaded = fluree
+                .ledger(ledger_id)
+                .await
+                .expect("reload ledger after index");
+
+            // Wildcard-hydrate the base subject. The expansion
+            // should reach the indexed f:reifies* facts via
+            // `db.range` and surface them under `@annotation`.
+            let query = json!({
+                "@context": ctx(),
+                "select": {"?person": ["*", {"ex:worksFor": ["*"]}]},
+                "where": {"@id": "?person", "ex:worksFor": {"@id": "?org"}}
+            });
+            let rows = support::query_jsonld_formatted(&fluree, &reloaded, &query)
+                .await
+                .expect("post-reindex annotated subject expansion");
+            let arr = rows.as_array().expect("array");
+            assert_eq!(arr.len(), 1, "single subject row, got: {arr:#?}");
+
+            let person = arr[0].as_object().expect("person object");
+            let works_for = person
+                .get("ex:worksFor")
+                .or_else(|| person.get("http://example.org/worksFor"))
+                .expect("ex:worksFor must be present after reindex");
+            let edge_obj = works_for
+                .as_object()
+                .or_else(|| {
+                    works_for
+                        .as_array()
+                        .and_then(|a| a.first().and_then(|v| v.as_object()))
+                })
+                .expect("worksFor value must be a node object");
+            let ann = edge_obj
+                .get("@annotation")
+                .expect("@annotation must survive reindex (M2 scan-based lookup)");
+            let ann_obj = ann
+                .as_object()
+                .or_else(|| {
+                    ann.as_array()
+                        .and_then(|a| a.first().and_then(|v| v.as_object()))
+                })
+                .expect("@annotation body must be an object");
+            assert_eq!(
+                ann_obj
+                    .get("ex:role")
+                    .or_else(|| ann_obj.get("http://example.org/role"))
+                    .and_then(|v| v.as_str()),
+                Some("Engineer"),
+                "annotation body must surface ex:role after reindex: {ann_obj:#?}"
+            );
+        })
+        .await;
 }
 
 #[tokio::test]
