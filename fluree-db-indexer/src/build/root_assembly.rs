@@ -172,10 +172,17 @@ pub(crate) async fn compute_garbage_from_prev_root(
     let prev_root = IndexRoot::decode(&prev_bytes).ok()?;
 
     let prev_t = prev_root.index_t;
-    let old_ids =
-        fluree_db_binary_index::collect_root_cas_ids_expanded(content_store, &prev_root).await;
-    let new_ids =
-        fluree_db_binary_index::collect_root_cas_ids_expanded(content_store, new_root).await;
+    // Strict expansion: a partial new-root set would misclassify
+    // still-reachable leaves as garbage; a partial prev-root set would
+    // leave replaced blobs unreleased. Either way silently — propagate
+    // the error so the caller can decide whether to skip publishing
+    // garbage rather than write a corrupt manifest.
+    let old_ids = fluree_db_binary_index::collect_root_cas_ids_expanded(content_store, &prev_root)
+        .await
+        .ok()?;
+    let new_ids = fluree_db_binary_index::collect_root_cas_ids_expanded(content_store, new_root)
+        .await
+        .ok()?;
     let garbage_cids: Vec<ContentId> = old_ids.difference(&new_ids).cloned().collect();
 
     Some(GarbageContext {

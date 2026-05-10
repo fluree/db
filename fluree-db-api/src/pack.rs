@@ -151,8 +151,16 @@ pub async fn compute_missing_index_artifacts<C: ContentStore>(
         ApiError::internal(format!("failed to parse index root {want_root_id}: {e}"))
     })?;
 
-    let mut want_set =
-        fluree_db_binary_index::collect_root_cas_ids_expanded(store, &want_root).await;
+    // Strict expansion: pack must transfer a self-contained snapshot,
+    // so a missing branch manifest has to surface as an error rather
+    // than silently shipping a partial set.
+    let mut want_set = fluree_db_binary_index::collect_root_cas_ids_expanded(store, &want_root)
+        .await
+        .map_err(|e| {
+            ApiError::internal(format!(
+                "failed to expand index root {want_root_id} CAS set: {e}"
+            ))
+        })?;
     // Include the root blob itself.
     want_set.insert(want_root_id.clone());
 
@@ -160,8 +168,16 @@ pub async fn compute_missing_index_artifacts<C: ContentStore>(
     if let Some(have_id) = have_root_id {
         if let Ok(have_bytes) = store.get(have_id).await {
             if let Ok(have_root) = IndexRoot::decode(&have_bytes) {
+                // Strict here too: under-counting the have-set would
+                // leave the client missing leaves it actually needs.
                 let have_set =
-                    fluree_db_binary_index::collect_root_cas_ids_expanded(store, &have_root).await;
+                    fluree_db_binary_index::collect_root_cas_ids_expanded(store, &have_root)
+                        .await
+                        .map_err(|e| {
+                            ApiError::internal(format!(
+                                "failed to expand have-side index root {have_id} CAS set: {e}"
+                            ))
+                        })?;
                 for cid in &have_set {
                     want_set.remove(cid);
                 }

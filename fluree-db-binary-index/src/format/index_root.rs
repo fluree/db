@@ -1025,10 +1025,10 @@ impl IndexRoot {
     /// Does NOT include the root's own CID or the garbage manifest CID.
     ///
     /// Callers that need leaf CIDs sitting behind named-graph or annotation
-    /// branches must fetch + decode those branch manifests from storage. For
-    /// drop / pack / GC-diff use cases see
-    /// `fluree-db-indexer::expanded_cas::collect_root_cas_ids_expanded`,
-    /// which performs that expansion using a `ContentStore`.
+    /// branches must fetch + decode those branch manifests from storage. See
+    /// [`crate::collect_root_cas_ids_expanded`] (strict) and
+    /// [`crate::collect_root_cas_ids_expanded_tolerant`] (best-effort) for
+    /// the shared expansion helpers.
     pub fn all_cas_ids(&self) -> Vec<ContentId> {
         let mut ids = Vec::new();
 

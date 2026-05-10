@@ -294,10 +294,17 @@ impl Fluree {
         })?;
 
         // Collect every CAS CID reachable from the root, including leaves
-        // behind named-graph and annotation branch manifests.
+        // behind named-graph and annotation branch manifests. Strict:
+        // an undecodable branch must abort the copy rather than yield a
+        // branch namespace missing leaves the new branch will need.
         let mut all_cids: Vec<fluree_db_core::ContentId> =
             collect_root_cas_ids_expanded(&source_store, &root)
                 .await
+                .map_err(|e| {
+                    ApiError::internal(format!(
+                        "failed to expand index root {index_cid} CAS set for branch copy: {e}"
+                    ))
+                })?
                 .into_iter()
                 .collect();
 
@@ -314,7 +321,10 @@ impl Fluree {
         all_cids.sort();
         all_cids.dedup();
 
-        // Copy artifacts concurrently from source to target namespace
+        // Copy artifacts concurrently from source to target namespace.
+        // Reads go through the branch-aware `source_store` so artifacts
+        // inherited from an ancestor branch are resolved correctly;
+        // writes go straight to the target's per-CID address.
         use futures::stream::{self, StreamExt, TryStreamExt};
 
         const COPY_CONCURRENCY: usize = 32;
@@ -322,16 +332,18 @@ impl Fluree {
         let source_label = source_id.to_string();
         let artifact_count = all_cids.len();
 
+        let source_store = std::sync::Arc::new(source_store);
+
         stream::iter(all_cids.into_iter().map(|cid| {
             let kind = cid.content_kind().expect("filtered above");
             let hex = cid.digest_hex();
-            let src_addr = content_address(method, kind, source_id, &hex);
             let dst_addr = content_address(method, kind, target_id, &hex);
             let storage = storage.clone();
+            let source_store = source_store.clone();
             let cid_display = cid.to_string();
             let source_label = source_label.clone();
             async move {
-                let bytes = storage.read_bytes(&src_addr).await.map_err(|e| {
+                let bytes = source_store.get(&cid).await.map_err(|e| {
                     ApiError::internal(format!(
                         "failed to read index artifact {cid_display} from {source_label}: {e}"
                     ))

@@ -11,7 +11,7 @@
 
 use std::collections::HashSet;
 
-use fluree_db_binary_index::collect_root_cas_ids_expanded;
+use fluree_db_binary_index::collect_root_cas_ids_expanded_tolerant;
 use fluree_db_core::commit::codec::read_commit_envelope;
 use fluree_db_core::content_id::ContentId;
 use fluree_db_core::storage::ContentStore;
@@ -124,9 +124,10 @@ async fn collect_index_chain_cids(
         cids.insert(entry.root_id.clone());
 
         // Use the already-decoded IndexRoot from the chain walk.
-        // `collect_root_cas_ids_expanded` covers direct CAS refs plus
-        // named-graph and annotation branch → leaf expansion.
-        let expanded = collect_root_cas_ids_expanded(store, &entry.root).await;
+        // Tolerant expansion: drop is best-effort cleanup, so a stray
+        // unreadable branch should not abort the walk and leak the
+        // rest of the ledger's artifacts.
+        let expanded = collect_root_cas_ids_expanded_tolerant(store, &entry.root).await;
         cids.extend(expanded);
 
         // Garbage record + garbage items

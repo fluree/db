@@ -10,36 +10,54 @@
 //!   routing to annotation leaf CIDs.
 //!
 //! This module owns the single async expansion path so callers stay in
-//! lockstep when new branch-shaped artifacts are added to the root. Per-
-//! branch decode failures are logged at `warn` and skipped — the helper
-//! returns whatever it could collect, on the same conservative footing
-//! as the GC chain walker.
+//! lockstep when new branch-shaped artifacts are added to the root.
+//!
+//! ## Strict vs tolerant
+//!
+//! Two entry points with different correctness contracts:
+//!
+//! - [`collect_root_cas_ids_expanded`] — **strict.** Returns
+//!   `Err` on the first branch read or decode failure. Use when an
+//!   incomplete reachability set would corrupt the caller's invariant
+//!   (pack / branch-copy: missing leaves yield a non-self-contained
+//!   index snapshot; garbage-record diff: missing leaves on the *new*
+//!   root would misclassify still-reachable blobs as garbage).
+//!
+//! - [`collect_root_cas_ids_expanded_tolerant`] — **best-effort.**
+//!   Logs and skips per-branch failures, returning whatever it could
+//!   collect. Use only when partial coverage is strictly safer than
+//!   bailing out — e.g. `drop_ledger`'s CID-walk fallback, where
+//!   skipping a leaf only means a stray pin survives, never data
+//!   corruption.
 //!
 //! ## Use sites (must all stay in sync)
 //!
-//! - `fluree-db-indexer::drop::collect_index_chain_cids` — drop / unpin.
+//! - `fluree-db-indexer::drop::collect_index_chain_cids` — drop / unpin
+//!   (tolerant).
 //! - `fluree-db-indexer::build::root_assembly::compute_garbage_from_prev_root`
-//!   — garbage-record diff (`prev.expanded - new.expanded`).
+//!   — garbage-record diff (strict).
 //! - `fluree-db-api::pack::compute_missing_index_artifacts` — pack
-//!   transfer.
-//! - `fluree-db-api::ledger::loading` — branch fork / index copy.
+//!   transfer (strict).
+//! - `fluree-db-api::ledger::loading::copy_index_to_branch` — branch
+//!   fork (strict).
 
 use std::collections::HashSet;
 
 use fluree_db_core::content_id::ContentId;
 use fluree_db_core::storage::ContentStore;
+use fluree_db_core::{Error, Result};
 
 use crate::annotation_arena::format::{AnnotationForwardBranch, AnnotationReverseBranch};
 use crate::format::branch::read_branch_from_bytes;
 use crate::format::index_root::IndexRoot;
 
-/// Expand an `IndexRoot` to the full set of CAS CIDs reachable from it.
+/// Strict expansion: returns the complete reachable CAS set or an error.
 ///
 /// Starts from `root.all_cas_ids()` and additionally fetches every
 /// named-graph branch + annotation arena branch from `store`, decoding
 /// each manifest to discover the leaf (and named-graph sidecar) CIDs
-/// they route to. Unreadable / undecodable branches are warn-logged and
-/// skipped; the helper never errors on a partial expansion.
+/// they route to. The first read or decode failure short-circuits and
+/// returns `Err` — partial sets are never returned.
 ///
 /// Does NOT include the root's own CID, the garbage manifest CID, the
 /// `prev_index` link, or anything older in the chain — callers
@@ -48,10 +66,86 @@ use crate::format::index_root::IndexRoot;
 pub async fn collect_root_cas_ids_expanded(
     store: &dyn ContentStore,
     root: &IndexRoot,
-) -> HashSet<ContentId> {
+) -> Result<HashSet<ContentId>> {
     let mut ids: HashSet<ContentId> = root.all_cas_ids().into_iter().collect();
 
     // Named-graph branches → leaf (+ sidecar) CIDs.
+    for ng in &root.named_graphs {
+        for (_, branch_cid) in &ng.orders {
+            let bytes = store.get(branch_cid).await.map_err(|e| {
+                Error::invalid_index(format!(
+                    "failed to read named-graph branch {branch_cid} during CID expansion: {e}"
+                ))
+            })?;
+            let manifest = read_branch_from_bytes(&bytes).map_err(|e| {
+                Error::invalid_index(format!(
+                    "failed to decode named-graph branch {branch_cid} during CID expansion: {e}"
+                ))
+            })?;
+            for leaf in &manifest.leaves {
+                ids.insert(leaf.leaf_cid.clone());
+                if let Some(ref sc) = leaf.sidecar_cid {
+                    ids.insert(sc.clone());
+                }
+            }
+        }
+    }
+
+    // Annotation arena: forward + reverse branches → leaf CIDs.
+    if let Some(ref ann) = root.annotation_index {
+        let fwd_bytes = store.get(&ann.forward_branch_cid).await.map_err(|e| {
+            Error::invalid_index(format!(
+                "failed to read annotation forward branch {} during CID expansion: {e}",
+                ann.forward_branch_cid
+            ))
+        })?;
+        let fwd_branch = AnnotationForwardBranch::decode(&fwd_bytes).map_err(|e| {
+            Error::invalid_index(format!(
+                "failed to decode annotation forward branch {} during CID expansion: {e}",
+                ann.forward_branch_cid
+            ))
+        })?;
+        for entry in &fwd_branch.leaves {
+            ids.insert(entry.leaf_cid.clone());
+        }
+
+        let rev_bytes = store.get(&ann.reverse_branch_cid).await.map_err(|e| {
+            Error::invalid_index(format!(
+                "failed to read annotation reverse branch {} during CID expansion: {e}",
+                ann.reverse_branch_cid
+            ))
+        })?;
+        let rev_branch = AnnotationReverseBranch::decode(&rev_bytes).map_err(|e| {
+            Error::invalid_index(format!(
+                "failed to decode annotation reverse branch {} during CID expansion: {e}",
+                ann.reverse_branch_cid
+            ))
+        })?;
+        for entry in &rev_branch.leaves {
+            ids.insert(entry.leaf_cid.clone());
+        }
+    }
+
+    Ok(ids)
+}
+
+/// Tolerant expansion: logs and skips per-branch failures.
+///
+/// Returns whatever could be collected, including the root's direct
+/// CAS refs even if every branch fails to expand. Suitable only for
+/// best-effort cleanup paths (drop / unpin) where leaving an extra
+/// blob behind is strictly safer than bailing out.
+///
+/// Pack / branch-copy / garbage-diff callers must use the strict
+/// [`collect_root_cas_ids_expanded`] instead — silently dropping
+/// reachable leaves there yields incomplete snapshots or misclassified
+/// garbage.
+pub async fn collect_root_cas_ids_expanded_tolerant(
+    store: &dyn ContentStore,
+    root: &IndexRoot,
+) -> HashSet<ContentId> {
+    let mut ids: HashSet<ContentId> = root.all_cas_ids().into_iter().collect();
+
     for ng in &root.named_graphs {
         for (_, branch_cid) in &ng.orders {
             match store.get(branch_cid).await {
@@ -64,26 +158,21 @@ pub async fn collect_root_cas_ids_expanded(
                             }
                         }
                     }
-                    Err(e) => {
-                        tracing::warn!(
-                            branch_cid = %branch_cid,
-                            error = %e,
-                            "failed to decode named-graph branch during CID expansion, skipping"
-                        );
-                    }
-                },
-                Err(e) => {
-                    tracing::warn!(
+                    Err(e) => tracing::warn!(
                         branch_cid = %branch_cid,
                         error = %e,
-                        "failed to read named-graph branch during CID expansion, skipping"
-                    );
-                }
+                        "failed to decode named-graph branch during CID expansion, skipping"
+                    ),
+                },
+                Err(e) => tracing::warn!(
+                    branch_cid = %branch_cid,
+                    error = %e,
+                    "failed to read named-graph branch during CID expansion, skipping"
+                ),
             }
         }
     }
 
-    // Annotation arena: forward branch → forward leaf CIDs.
     if let Some(ref ann) = root.annotation_index {
         match store.get(&ann.forward_branch_cid).await {
             Ok(bytes) => match AnnotationForwardBranch::decode(&bytes) {
@@ -92,21 +181,17 @@ pub async fn collect_root_cas_ids_expanded(
                         ids.insert(entry.leaf_cid.clone());
                     }
                 }
-                Err(e) => {
-                    tracing::warn!(
-                        branch_cid = %ann.forward_branch_cid,
-                        error = %e,
-                        "failed to decode annotation forward branch during CID expansion, skipping"
-                    );
-                }
-            },
-            Err(e) => {
-                tracing::warn!(
+                Err(e) => tracing::warn!(
                     branch_cid = %ann.forward_branch_cid,
                     error = %e,
-                    "failed to read annotation forward branch during CID expansion, skipping"
-                );
-            }
+                    "failed to decode annotation forward branch during CID expansion, skipping"
+                ),
+            },
+            Err(e) => tracing::warn!(
+                branch_cid = %ann.forward_branch_cid,
+                error = %e,
+                "failed to read annotation forward branch during CID expansion, skipping"
+            ),
         }
 
         match store.get(&ann.reverse_branch_cid).await {
@@ -116,21 +201,17 @@ pub async fn collect_root_cas_ids_expanded(
                         ids.insert(entry.leaf_cid.clone());
                     }
                 }
-                Err(e) => {
-                    tracing::warn!(
-                        branch_cid = %ann.reverse_branch_cid,
-                        error = %e,
-                        "failed to decode annotation reverse branch during CID expansion, skipping"
-                    );
-                }
-            },
-            Err(e) => {
-                tracing::warn!(
+                Err(e) => tracing::warn!(
                     branch_cid = %ann.reverse_branch_cid,
                     error = %e,
-                    "failed to read annotation reverse branch during CID expansion, skipping"
-                );
-            }
+                    "failed to decode annotation reverse branch during CID expansion, skipping"
+                ),
+            },
+            Err(e) => tracing::warn!(
+                branch_cid = %ann.reverse_branch_cid,
+                error = %e,
+                "failed to read annotation reverse branch during CID expansion, skipping"
+            ),
         }
     }
 
@@ -280,7 +361,7 @@ mod tests {
         let store = MemoryContentStore::new();
         let (root, fwd_leaf_cid, rev_leaf_cid) = build_root_with_arena(&store).await;
 
-        let ids = collect_root_cas_ids_expanded(&store, &root).await;
+        let ids = collect_root_cas_ids_expanded(&store, &root).await.unwrap();
 
         // Annotation branch CIDs appear via all_cas_ids().
         let ann = root.annotation_index.as_ref().unwrap();
@@ -304,11 +385,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn expansion_tolerates_missing_annotation_branch() {
+    async fn strict_errors_on_missing_annotation_branch() {
         let store = MemoryContentStore::new();
         let mut root = minimal_root();
         root.has_annotations = true;
-        // Branch CIDs that don't exist in storage — helper must not error.
         root.annotation_index = Some(AnnotationIndexRoot {
             version: 1,
             max_t: 0,
@@ -317,7 +397,31 @@ mod tests {
             stats: AnnotationStats::default(),
         });
 
-        let ids = collect_root_cas_ids_expanded(&store, &root).await;
+        // Strict: must surface the read failure rather than return a
+        // partial set that pack / GC-diff would treat as authoritative.
+        let err = collect_root_cas_ids_expanded(&store, &root)
+            .await
+            .expect_err("strict mode should error on missing branch");
+        assert!(
+            err.to_string().contains("annotation forward branch"),
+            "error should identify the missing branch: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn tolerant_expansion_swallows_missing_annotation_branch() {
+        let store = MemoryContentStore::new();
+        let mut root = minimal_root();
+        root.has_annotations = true;
+        root.annotation_index = Some(AnnotationIndexRoot {
+            version: 1,
+            max_t: 0,
+            forward_branch_cid: cid(ContentKind::AnnotationForwardBranch, b"missing-fwd"),
+            reverse_branch_cid: cid(ContentKind::AnnotationReverseBranch, b"missing-rev"),
+            stats: AnnotationStats::default(),
+        });
+
+        let ids = collect_root_cas_ids_expanded_tolerant(&store, &root).await;
         // Still contains the direct branch CIDs from all_cas_ids().
         let ann = root.annotation_index.as_ref().unwrap();
         assert!(ids.contains(&ann.forward_branch_cid));
@@ -401,8 +505,12 @@ mod tests {
             stats: AnnotationStats::default(),
         });
 
-        let prev_ids = collect_root_cas_ids_expanded(&store, &prev_root).await;
-        let new_ids = collect_root_cas_ids_expanded(&store, &new_root).await;
+        let prev_ids = collect_root_cas_ids_expanded(&store, &prev_root)
+            .await
+            .unwrap();
+        let new_ids = collect_root_cas_ids_expanded(&store, &new_root)
+            .await
+            .unwrap();
 
         let replaced: HashSet<_> = prev_ids.difference(&new_ids).cloned().collect();
 
