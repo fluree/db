@@ -391,10 +391,35 @@ correctness items remaining):**
   is retracted too, matching Cypher relationship lifecycle. Default
   RDF mode still preserves explicit-IRI annotations as ordinary
   user-named RDF subjects.
-- ⏳ **Occurrence-by-selector and by-annotation-id retracts.** The
-  more targeted retract shapes that select a specific occurrence
-  among parallel annotations need IR support (matching by metadata)
-  and aren't covered by the plain-edge cascade.
+- 🟡 **Occurrence retracts — by-id shipped, selector deferred.**
+  - **By annotation id** (✅ shipped):
+    `delete: { @id alice ex:worksFor: { @id acme @annotation: { @id ex:emp/A } } }`
+    retracts only A's `f:reifies*` bundle. Parallel annotations and
+    the base edge survive. Implemented via a new
+    `lower_delete_annotation_blocks` pre-pass in
+    `fluree-db-transact::parse::edge_annotations` that runs before
+    the standard assertion-shaped lowering on UPDATE transactions.
+    The pre-pass strips the `@annotation` block from the parent's
+    predicate-value (preventing a base-edge retract) and synthesizes
+    delete templates with the explicit `f:reifies*` retract triples.
+    The user-authored firewall scan was lifted above both passes so
+    the synthesized templates aren't re-rejected. RDF-mode body
+    preservation for explicit-IRI annotations falls out naturally —
+    only the bundle is retracted; user-named body resources stay
+    queryable. Tests:
+    `delete_by_annotation_id_retracts_only_targeted_occurrence`,
+    `delete_by_annotation_id_explicit_iri_preserves_body_in_rdf_mode`.
+  - **By selector** (⏳ deferred, with a clear error):
+    `@annotation: { ex:role: "Engineer" }` (no `@id`) needs runtime
+    resolution against live data — minting a fresh variable,
+    synthesizing WHERE patterns binding it to matching annotations,
+    emitting delete templates against the variable. Out-of-scope
+    for this slice. The pre-pass surfaces a documented error
+    pointing users at the by-id workaround. Test:
+    `delete_by_annotation_selector_returns_deferred_error`.
+  - **By blank-node id** (⏳ deferred): anonymous SIDs are minted
+    server-side at insert time and not user-addressable. Pre-pass
+    rejects with a clear error.
 - ✅ **JSON-LD subject-expansion `@annotation` output**
   (`feat(M1b): @annotation in subject expansion` +
   `fix(M1b): @annotation output respects as-of t`):

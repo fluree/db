@@ -172,24 +172,25 @@ fn scan_user_authored_reifies_iris(value: &Value, context: &ParsedContext) -> Re
 /// - Envelope form `{"@graph": [...]}` → siblings appended to the
 ///   existing `@graph` array.
 pub fn lower_edge_annotations(doc: &mut Value) -> Result<()> {
-    // Parse the document's top-level @context once so the firewall and
-    // the lowering walker can resolve compact IRIs to full ones. We
-    // accept missing or malformed contexts silently — the rest of the
-    // parse pipeline (`expand_with_context_policy`) will surface those
-    // errors with better messages.
-    let top_ctx = doc
-        .as_object()
-        .and_then(|m| m.get("@context"))
-        .map(parse_context)
-        .transpose()
-        .map_err(|e| TransactError::Parse(format!("failed to parse @context: {e}")))?
-        .unwrap_or_else(ParsedContext::new);
-
+    let top_ctx = top_level_context(doc)?;
     scan_user_authored_reifies_iris(doc, &top_ctx)?;
+    lower_edge_annotations_after_firewall(doc, &top_ctx)
+}
 
+/// Same as [`lower_edge_annotations`] minus the firewall scan.
+///
+/// Use this when the caller has already run the firewall on the
+/// original (pre-rewritten) document — e.g. when chaining the
+/// `delete`-clause pre-pass before the standard lowering. Both
+/// passes synthesize `f:reifies*` IRIs internally; running the
+/// firewall a second time would falsely flag those.
+pub fn lower_edge_annotations_after_firewall(
+    doc: &mut Value,
+    top_ctx: &ParsedContext,
+) -> Result<()> {
     let mut ctx = LowerCtx::new();
     let walk_ctx = WalkCtx {
-        json_ld: &top_ctx,
+        json_ld: top_ctx,
         graph: None,
     };
     lower_value_with_subject(doc, None, &walk_ctx, &mut ctx)?;
@@ -198,6 +199,358 @@ pub fn lower_edge_annotations(doc: &mut Value) -> Result<()> {
         attach_siblings(doc, ctx.siblings);
     }
     Ok(())
+}
+
+/// Parse the document's top-level `@context` once. Used by both the
+/// firewall scan and the lowering walker so they share IRI
+/// resolution for compact forms.
+pub fn top_level_context(doc: &Value) -> Result<ParsedContext> {
+    Ok(doc
+        .as_object()
+        .and_then(|m| m.get("@context"))
+        .map(parse_context)
+        .transpose()
+        .map_err(|e| TransactError::Parse(format!("failed to parse @context: {e}")))?
+        .unwrap_or_else(ParsedContext::new))
+}
+
+/// Run the user-authored `f:reifies*` firewall against the ORIGINAL
+/// document, before any lowering pass runs. Exposed for the
+/// transactor's two-pass dispatch (delete-clause pre-pass + standard
+/// lowering) so the firewall fires once on the user's input.
+pub fn run_user_authored_reifies_firewall(doc: &Value, top_ctx: &ParsedContext) -> Result<()> {
+    scan_user_authored_reifies_iris(doc, top_ctx)
+}
+
+/// Pre-pass for UPDATE transactions: rewrite `@annotation` blocks
+/// inside the `delete` clause into explicit `f:reifies*` retract
+/// templates **before** the main `lower_edge_annotations` walker runs.
+///
+/// The default lowering treats `@annotation` as an assertion — it
+/// synthesizes a sibling node with `f:reifiesSubject` etc. and a
+/// freshly-minted blank-node SID. That works for inserts but is
+/// wrong for deletes: the synthesized SID never matches existing
+/// data, so the delete becomes a silent no-op. This pre-pass
+/// rewrites delete-clause `@annotation` blocks into delete-template
+/// shape directly.
+///
+/// **Supported shape — by annotation id:**
+///
+/// ```json
+/// {"delete": {
+///     "@id": "ex:alice",
+///     "ex:worksFor": {
+///         "@id": "ex:acme",
+///         "@annotation": { "@id": "ex:emp/A" }
+///     }
+/// }}
+/// ```
+///
+/// becomes (after this pass):
+///
+/// ```json
+/// {"delete": [
+///     {"@id": "ex:emp/A",
+///      "f:reifiesSubject":   {"@id": "ex:alice"},
+///      "f:reifiesPredicate": {"@id": "ex:worksFor"},
+///      "f:reifiesObject":    {"@id": "ex:acme"}}
+/// ]}
+/// ```
+///
+/// The base-edge selector (the surrounding `{@id alice ex:worksFor:
+/// {@id acme}}`) is *not* lowered into a base-edge retract — per the
+/// design contract, this shape retracts exactly the targeted
+/// annotation occurrence, not the edge it reifies. Users who want
+/// both the annotation and the edge gone should issue two delete
+/// statements.
+///
+/// **Selector shape (deferred):** an `@annotation` block without an
+/// explicit `@id` (e.g. `{ ex:role: "Engineer" }`) requires runtime
+/// resolution against live data — the parser would need to mint a
+/// variable, synthesize `WHERE` patterns binding it to matching
+/// annotations, and emit delete templates against the variable.
+/// That's a separate slice. We surface a clear error here so users
+/// don't silently get the broken-no-op behavior.
+pub fn lower_delete_annotation_blocks(doc: &mut Value) -> Result<()> {
+    // Read the @context BEFORE we borrow the doc mutably for the
+    // delete-clause walk — both views are needed and serde_json's
+    // immutable / mutable accessors don't compose otherwise.
+    let top_ctx = top_level_context(doc)?;
+    let Some(obj) = doc.as_object_mut() else {
+        return Ok(());
+    };
+    let Some(delete_val) = obj.get_mut("delete") else {
+        return Ok(());
+    };
+
+    let mut new_templates: Vec<Value> = Vec::new();
+    walk_delete_for_annotations(delete_val, &top_ctx, &mut new_templates)?;
+    if new_templates.is_empty() {
+        return Ok(());
+    }
+
+    // Splice the new templates into the delete clause. Convert
+    // single-object form to an array, then append.
+    let original = std::mem::replace(delete_val, Value::Null);
+    let mut items: Vec<Value> = match original {
+        Value::Array(arr) => arr.into_iter().filter(|v| !is_empty_node(v)).collect(),
+        Value::Null => Vec::new(),
+        other => {
+            if is_empty_node(&other) {
+                Vec::new()
+            } else {
+                vec![other]
+            }
+        }
+    };
+    items.extend(new_templates);
+    *delete_val = Value::Array(items);
+    Ok(())
+}
+
+/// True iff `v` is `{"@id": ...}` or `{}` with no other keys — a
+/// node-map that contributes no triples and would error out as a
+/// "structurally empty" delete template. We strip these after
+/// removing an `@annotation` block.
+fn is_empty_node(v: &Value) -> bool {
+    let Some(obj) = v.as_object() else {
+        return false;
+    };
+    if obj.is_empty() {
+        return true;
+    }
+    obj.iter().all(|(k, _)| k == "@id" || k == "@context")
+}
+
+/// Walk the delete clause looking for `@annotation` blocks. For each
+/// one with an explicit `@id`, build a retract template, then strip
+/// the `<predicate>: { ... @annotation: ... }` pair from its parent
+/// so the base edge isn't accidentally retracted alongside.
+fn walk_delete_for_annotations(
+    val: &mut Value,
+    ctx: &ParsedContext,
+    out: &mut Vec<Value>,
+) -> Result<()> {
+    match val {
+        Value::Array(items) => {
+            for item in items {
+                walk_delete_for_annotations(item, ctx, out)?;
+            }
+            Ok(())
+        }
+        Value::Object(map) => {
+            // Capture the parent's @id for `f:reifiesSubject`. Honor
+            // context-aliased `@id` keys (e.g. `id: ...` when context
+            // says `"id": "@id"`).
+            let parent_id = map
+                .get("@id")
+                .and_then(Value::as_str)
+                .or_else(|| {
+                    let alias = ctx.id_key.as_str();
+                    if alias != "@id" {
+                        map.get(alias).and_then(Value::as_str)
+                    } else {
+                        None
+                    }
+                })
+                .map(String::from);
+
+            // First pass: find predicate keys whose value carries an
+            // `@annotation`, lift them into retract templates, and
+            // remove from the parent. We collect mutations first to
+            // avoid borrowing twice.
+            let predicate_keys: Vec<String> = map
+                .keys()
+                .filter(|k| !k.starts_with('@') && *k != ctx.id_key.as_str())
+                .cloned()
+                .collect();
+
+            let mut keys_to_remove: Vec<String> = Vec::new();
+            for key in predicate_keys {
+                let value = map.get_mut(&key).expect("collected key");
+                lift_annotations_under_predicate(
+                    parent_id.as_deref(),
+                    &key,
+                    value,
+                    ctx,
+                    out,
+                    &mut |strip_predicate| {
+                        if strip_predicate {
+                            keys_to_remove.push(key.clone());
+                        }
+                    },
+                )?;
+            }
+            for k in keys_to_remove {
+                map.remove(&k);
+            }
+
+            // Second pass: recurse into remaining (non-stripped)
+            // child values to handle nested delete shapes.
+            let remaining: Vec<String> = map.keys().cloned().collect();
+            for key in remaining {
+                if let Some(v) = map.get_mut(&key) {
+                    walk_delete_for_annotations(v, ctx, out)?;
+                }
+            }
+            Ok(())
+        }
+        _ => Ok(()),
+    }
+}
+
+/// Process the value of a single predicate inside a delete clause.
+/// When the value is an object containing an `@annotation` block,
+/// lift it into a retract template (appended to `out`) and signal
+/// the caller to strip the predicate from the parent.
+fn lift_annotations_under_predicate(
+    parent_subject: Option<&str>,
+    predicate: &str,
+    value: &mut Value,
+    ctx: &ParsedContext,
+    out: &mut Vec<Value>,
+    strip_callback: &mut dyn FnMut(bool),
+) -> Result<()> {
+    match value {
+        Value::Array(items) => {
+            // Each array item gets the same parent context. We
+            // process and remove the items that carry annotations,
+            // leaving the rest in place. If every item is stripped,
+            // the parent's predicate becomes redundant.
+            let mut survivors: Vec<Value> = Vec::with_capacity(items.len());
+            for mut item in std::mem::take(items) {
+                let mut item_stripped = false;
+                lift_annotations_under_predicate(
+                    parent_subject,
+                    predicate,
+                    &mut item,
+                    ctx,
+                    out,
+                    &mut |s| item_stripped = s,
+                )?;
+                if !item_stripped {
+                    survivors.push(item);
+                }
+            }
+            if survivors.is_empty() {
+                strip_callback(true);
+            } else {
+                *items = survivors;
+            }
+            Ok(())
+        }
+        Value::Object(map) => {
+            if !map.contains_key(ANNOTATION_KEY) && !map.contains_key(EDGE_KEY) {
+                return Ok(());
+            }
+            let parent_subject = parent_subject.ok_or_else(|| {
+                TransactError::Parse(
+                    "delete-clause @annotation requires the enclosing predicate to have a \
+                     parent @id (the subject of the reified edge)"
+                        .to_string(),
+                )
+            })?;
+            let object_id = map
+                .get("@id")
+                .and_then(Value::as_str)
+                .map(String::from)
+                .ok_or_else(|| {
+                    TransactError::Parse(
+                        "delete-clause @annotation requires the parent object node to carry \
+                         an explicit @id (the object of the reified edge)"
+                            .to_string(),
+                    )
+                })?;
+            let ann_block = map.remove(ANNOTATION_KEY).or_else(|| map.remove(EDGE_KEY));
+            let Some(ann_block) = ann_block else {
+                return Ok(());
+            };
+
+            let template = build_delete_template_for_annotation(
+                parent_subject,
+                predicate,
+                &object_id,
+                ann_block,
+                ctx,
+            )?;
+            out.push(template);
+
+            // After lifting, the parent's predicate-value is just
+            // `{@id: <object>}`. That alone is a structurally empty
+            // node — but stripping the *entire* predicate from the
+            // parent matches the design contract: by-id retracts
+            // do not delete the base edge.
+            strip_callback(true);
+            Ok(())
+        }
+        _ => Ok(()),
+    }
+}
+
+/// Build the retract delete template for a single by-id annotation
+/// block. Verifies the block carries an explicit `@id` (selector
+/// shapes without one are rejected with a clear error), then emits a
+/// node-map shaped like the existing assertion form so the standard
+/// `parse_update_templates_with_ctx` path produces the right
+/// `f:reifies*` retracts.
+fn build_delete_template_for_annotation(
+    parent_subject: &str,
+    predicate: &str,
+    object_id: &str,
+    ann_block: Value,
+    ctx: &ParsedContext,
+) -> Result<Value> {
+    let Value::Object(ann_map) = ann_block else {
+        return Err(TransactError::Parse(
+            "@annotation value must be a JSON object".to_string(),
+        ));
+    };
+    let id_alias = ctx.id_key.as_str();
+    let ann_id = ann_map
+        .get("@id")
+        .and_then(Value::as_str)
+        .or_else(|| {
+            if id_alias != "@id" {
+                ann_map.get(id_alias).and_then(Value::as_str)
+            } else {
+                None
+            }
+        })
+        .ok_or_else(|| {
+            TransactError::UnsupportedFeature(
+                "delete by annotation selector (no @id) is deferred — give the annotation \
+                 an explicit @id and delete that. Selector deletes need a WHERE-style \
+                 resolution that v1's parser doesn't synthesize yet."
+                    .to_string(),
+            )
+        })?;
+
+    // Reject blank-node @ids: a user can't legitimately pin a
+    // specific anonymous annotation by its blank-node id (those are
+    // minted server-side at insert time). If the user really wants
+    // to retract an anonymous annotation, they should supply a
+    // selector once the selector path lands.
+    if ann_id.starts_with("_:") {
+        return Err(TransactError::UnsupportedFeature(
+            "delete by anonymous annotation @id is not supported — anonymous SIDs \
+             are minted at insert time and not user-addressable. Use a selector \
+             form (deferred) or attach an explicit @id at insert."
+                .to_string(),
+        ));
+    }
+
+    let mut template = Map::new();
+    template.insert("@id".to_string(), Value::String(ann_id.to_string()));
+    template.insert(
+        reifies_iris::SUBJECT.to_string(),
+        json!({"@id": parent_subject}),
+    );
+    template.insert(
+        reifies_iris::PREDICATE.to_string(),
+        json!({"@id": predicate}),
+    );
+    template.insert(reifies_iris::OBJECT.to_string(), json!({"@id": object_id}));
+    Ok(Value::Object(template))
 }
 
 /// Inherited context for the lowering walker.

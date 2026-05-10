@@ -2066,6 +2066,228 @@ async fn annotation_in_named_graph_insert_succeeds() {
 }
 
 #[tokio::test]
+async fn delete_by_annotation_id_retracts_only_targeted_occurrence() {
+    // Two parallel annotations on the same edge:
+    //   ex:emp/A → role=Engineer
+    //   ex:emp/B → role=Manager
+    // A delete with `@annotation: { @id: ex:emp/A }` must retract
+    // only A's f:reifies* bundle. B and the base edge survive
+    // unchanged. This is the design's "Delete by Annotation Id"
+    // shape — exactly that occurrence, not the base edge.
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger_id = "it/edge-annotations:delete-by-id";
+    let ledger0 = genesis_ledger(&fluree, ledger_id);
+
+    let r1 = fluree
+        .insert(
+            ledger0,
+            &json!({
+                "@context": ctx(),
+                "@graph": [
+                    {
+                        "@id": "ex:alice",
+                        "ex:worksFor": {
+                            "@id": "ex:acme",
+                            "@annotation": { "@id": "ex:emp/A", "ex:role": "Engineer" }
+                        }
+                    },
+                    {
+                        "@id": "ex:alice",
+                        "ex:worksFor": {
+                            "@id": "ex:acme",
+                            "@annotation": { "@id": "ex:emp/B", "ex:role": "Manager" }
+                        }
+                    }
+                ]
+            }),
+        )
+        .await
+        .expect("insert two parallel annotations");
+
+    let r2 = fluree
+        .update(
+            r1.ledger,
+            &json!({
+                "@context": ctx(),
+                "delete": {
+                    "@id": "ex:alice",
+                    "ex:worksFor": {
+                        "@id": "ex:acme",
+                        "@annotation": { "@id": "ex:emp/A" }
+                    }
+                }
+            }),
+        )
+        .await
+        .expect("delete by annotation id");
+    assert_eq!(
+        r2.receipt.flake_count, 3,
+        "exactly three f:reifies* retracts (subject/predicate/object)"
+    );
+
+    // Surviving annotations: only B should appear in `@reifies`
+    // queries because A's bundle is gone.
+    let surviving = json!({
+        "@context": ctx(),
+        "select": ["?ann", "?role"],
+        "where": {
+            "@id": "?ann",
+            "ex:role": "?role",
+            "@reifies": {
+                "@id": "ex:alice",
+                "ex:worksFor": { "@id": "ex:acme" }
+            }
+        }
+    });
+    let rows = support::query_jsonld_formatted(&fluree, &r2.ledger, &surviving)
+        .await
+        .expect("query survivors");
+    let arr = rows.as_array().expect("rows");
+    assert_eq!(
+        arr.len(),
+        1,
+        "only ex:emp/B should survive @reifies probe: {arr:#?}"
+    );
+    let row = arr[0].as_array().expect("row");
+    assert!(iri_matches(&row[0], "ex:emp/B", "http://example.org/emp/B"));
+    assert_eq!(row[1].as_str(), Some("Manager"));
+
+    // Base edge survives — a bare triple query still finds it.
+    let base = json!({
+        "@context": ctx(),
+        "select": ["?org"],
+        "where": { "@id": "ex:alice", "ex:worksFor": { "@id": "?org" } }
+    });
+    let base_rows = support::query_jsonld_formatted(&fluree, &r2.ledger, &base)
+        .await
+        .expect("base edge query");
+    assert_eq!(
+        base_rows.as_array().map(Vec::len),
+        Some(1),
+        "base edge must still be asserted after annotation-only delete"
+    );
+}
+
+#[tokio::test]
+async fn delete_by_annotation_id_explicit_iri_preserves_body_in_rdf_mode() {
+    // Per the design contract, deleting an explicit-IRI annotation
+    // by @id retracts only the f:reifies* bundle in default RDF
+    // mode — the user-named body metadata stays as ordinary RDF.
+    // (LPG mode `opts.lpgEdgeLifecycle: true` would clean the body
+    // too; that's a separate test.)
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger_id = "it/edge-annotations:delete-by-id-rdf-body";
+    let ledger0 = genesis_ledger(&fluree, ledger_id);
+
+    let r1 = fluree
+        .insert(
+            ledger0,
+            &json!({
+                "@context": ctx(),
+                "@id": "ex:alice",
+                "ex:worksFor": {
+                    "@id": "ex:acme",
+                    "@annotation": {
+                        "@id": "ex:emp/alice-acme",
+                        "ex:role": "Engineer",
+                        "ex:since": "2024-01-01"
+                    }
+                }
+            }),
+        )
+        .await
+        .expect("annotated insert");
+
+    fluree
+        .update(
+            r1.ledger.clone(),
+            &json!({
+                "@context": ctx(),
+                "delete": {
+                    "@id": "ex:alice",
+                    "ex:worksFor": {
+                        "@id": "ex:acme",
+                        "@annotation": { "@id": "ex:emp/alice-acme" }
+                    }
+                }
+            }),
+        )
+        .await
+        .expect("delete by id (RDF mode)");
+
+    // The body should still be queryable as ordinary RDF — the
+    // user-named `ex:emp/alice-acme` resource has its `ex:role`
+    // and `ex:since` predicates preserved.
+    let body = json!({
+        "@context": ctx(),
+        "select": ["?role", "?since"],
+        "where": {
+            "@id": "ex:emp/alice-acme",
+            "ex:role": "?role",
+            "ex:since": "?since"
+        }
+    });
+    let ledger = fluree.ledger(ledger_id).await.expect("reload");
+    let rows = support::query_jsonld_formatted(&fluree, &ledger, &body)
+        .await
+        .expect("body query");
+    assert_eq!(
+        rows.as_array().map(Vec::len),
+        Some(1),
+        "explicit-IRI annotation body must remain queryable after by-id retract in RDF mode"
+    );
+}
+
+#[tokio::test]
+async fn delete_by_annotation_selector_returns_deferred_error() {
+    // The selector form (`@annotation` block with no `@id`,
+    // identifying the occurrence by metadata match) needs a
+    // WHERE-style runtime resolution that v1's parser doesn't
+    // synthesize. We surface a clear error so users don't get the
+    // pre-fix silent-no-op behavior.
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger_id = "it/edge-annotations:delete-selector-deferred";
+    let ledger0 = genesis_ledger(&fluree, ledger_id);
+
+    let r1 = fluree
+        .insert(
+            ledger0,
+            &json!({
+                "@context": ctx(),
+                "@id": "ex:alice",
+                "ex:worksFor": {
+                    "@id": "ex:acme",
+                    "@annotation": { "@id": "ex:emp/A", "ex:role": "Engineer" }
+                }
+            }),
+        )
+        .await
+        .expect("insert");
+
+    let err = fluree
+        .update(
+            r1.ledger,
+            &json!({
+                "@context": ctx(),
+                "delete": {
+                    "@id": "ex:alice",
+                    "ex:worksFor": {
+                        "@id": "ex:acme",
+                        "@annotation": { "ex:role": "Engineer" }
+                    }
+                }
+            }),
+        )
+        .await
+        .expect_err("selector form must error explicitly");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("selector"),
+        "error must point users at the by-id workaround; got: {msg}"
+    );
+}
+
+#[tokio::test]
 async fn cross_graph_misjoin_in_multi_source_default_known_limitation() {
     // Pinning test for the documented cross-graph misjoin in
     // `expand_edge_annotation_patterns` (see comment in
