@@ -414,7 +414,7 @@ AnnotationIndexRoot {
 }
 ```
 
-The hard "zero attachments" guarantee for the indexed portion requires both `IndexRoot.annotation_index = None` **and** `IndexRoot.has_annotations = false`. Once the M2b builder ships, those signals always agree on the wire (the encoder coerces `has_annotations = true` whenever an arena is present). Pre-builder roots may legitimately have `has_annotations = true` with `annotation_index = None` — readers fall back to scan, cascade still runs.
+The hard "zero attachments" guarantee for the indexed portion requires both `IndexRoot.annotation_index = None` **and** `IndexRoot.has_annotations = false`. The M2b builder ships, and the encoder coerces `has_annotations = true` whenever an arena is present so the two signals always agree on the wire. The `(true, None)` cell remains valid for two transitional cases: (a) ledgers indexed before slice 3 (no arena ever sealed), and (b) snapshots that hit the indexer's defensive-drop path (caller couldn't supply an `Authoritative` event set this pass). Both fall back to the M2a scan path; the next reindex with provider coverage re-seals an arena.
 
 If any uncertainty exists, set it present with empty artifacts or force the transaction layer to check novelty.
 

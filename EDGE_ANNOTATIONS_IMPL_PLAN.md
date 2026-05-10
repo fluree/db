@@ -10,20 +10,28 @@ frozen contract this plan implements.
 Each milestone ships as one PR (or a small chain) and is independently
 useful — a reviewer can merge without waiting for the next.
 
-| ID  | Scope | Persistence | Approx |
+| ID  | Scope | Persistence | Status |
 |-----|-------|-------------|--------|
-| M0  | Parser surface + IR stub | none — execution errors | ~3 days |
-| M1a | Foundation + write side | durable via `f:reifies*` | ~1 wk |
-| M1b | Read side + cascade + integration | (M1a + scan-based lookups) | ~1–2 wk |
-| M2a | Scan-based indexed read path | works pre + post-index | (this session) |
-| M2b | Binary annotation-arena format | O(log N) lookups, lazy load | follow-up |
-| M3  | Planner / costing | — | 1–2 wk |
+| M0  | Parser surface + IR stub | none — execution errors | ✅ shipped |
+| M1a | Foundation + write side | durable via `f:reifies*` | ✅ shipped |
+| M1b | Read side + cascade + integration | (M1a + scan-based lookups) | ✅ shipped |
+| M2a | Scan-based indexed read path | works pre + post-index | ✅ shipped |
+| M2b | Binary annotation-arena format | O(log N) lookups, lazy load | ✅ shipped (slices 1–5) |
+| M3  | Planner / costing | — | not started |
 
 **M1 was split into two slices during implementation.** M1a and M1b
 are each independently mergeable. M1a is a complete write-side
 feature (annotations persist, but queries don't yet read them); M1b
 adds the read-side dispatch and visibility wiring that turns it into
 a queryable feature.
+
+**M2b was implemented as seven slices** (1: format, 2: IndexRoot
+field, 3a–c: pure builder + bundle reconstruction + indexer-side
+orchestration, 3d: incremental wire-up, 3e: orchestrator provider
+trait, 3f: complete-history contract, 3g: full-rebuild seal). Slice
+4 (lazy reader + merged hydration path) and slice 5 (validation +
+benchmarks) close the read path. The arena-vs-scan benchmark table
+is at the end of this document.
 
 The deferred list at the bottom of the source doc is **not** in v1.
 
@@ -817,22 +825,70 @@ annotation artifacts.
 
 ### Definition of done
 
-- [ ] M1 test suite passes against a file-backed ledger that goes
+- [x] M1 test suite passes against a file-backed ledger that goes
       through reindexing.
+      *(`it_edge_annotations_indexed::incremental_arena_seal_then_arena_backed_query`
+      and the existing `it_edge_annotations` suite.)*
+- [x] Storage inspector confirms zero annotation artifacts on
+      ledgers that never used `@annotation`.
+      *(`non_annotation_ledger_skips_inject_annotations` —
+      `snapshot.has_annotations=false`, novelty empty, no
+      `@annotation` keys in hydrated output. The hydration
+      zero-cost gate guarantees no POST scan either.)*
+- [x] Bench: non-annotation query throughput unchanged within noise.
+      *(`non_annotation_hydration/baseline` — see table below.)*
+- [x] Bundle-validator rejects malformed bundles at index time;
+      surrounding non-`f:reifies*` facts are unaffected.
+      *(`bundle.rs::tests::malformed_bundle_skipped_with_counter`
+      and `bundle_with_mismatched_flake_graph_is_skipped`.)*
 - [ ] **Full rebuild from commit history** produces the same arenas
-      as incremental indexing for the same end state. Test by:
-      (a) ingest a corpus, index, snapshot arenas;
-      (b) drop indexes, rebuild from commits, snapshot arenas;
-      (c) compare byte-exact.
+      as incremental indexing for the same end state.
+      *Open: byte-exact equivalence still TBD — see "Remaining V1
+      validation gaps" below.*
 - [ ] **Bulk import** of a Turtle/JSON-LD corpus containing
       `@annotation` round-trips through the importer → indexer with
       arenas derived from the resulting `f:reifies*` facts.
-- [ ] Bundle-validator rejects malformed bundles at index time and
-      emits a telemetry counter; surrounding non-`f:reifies*` facts
-      are unaffected.
-- [ ] Storage inspector confirms zero annotation artifacts on
-      ledgers that never used `@annotation`.
-- [ ] Bench: non-annotation query throughput unchanged within noise.
+      *Open: bulk-import validation deferred — see "Remaining V1
+      validation gaps" below.*
+- [ ] Telemetry counter for malformed-bundle skips at index time.
+      *Open: validator emits `tracing::warn!` per skip but no
+      Prometheus counter yet — see "Remaining V1 validation gaps".*
+
+### Remaining V1 validation gaps
+
+Slices 1–5 ship the read + write paths and the validation matrix.
+Three items from the original DoD are deliberately deferred:
+
+1. **Rebuild equivalence (byte-exact).** Today's tests prove
+   correctness (`incremental_arena_seal_then_arena_backed_query`
+   plus `full_rebuild_without_authoritative_falls_back_to_scan`
+   together establish that the read path returns identical results
+   regardless of which indexer path produced the new root). They do
+   not prove that the **CIDs** match across two independent index
+   builds of the same end state. Tracking this would need either
+   a deterministic CID scheme for arena leaves (currently sha256 of
+   the encoded blob, which is sensitive to row ordering and chunk
+   boundaries) or a structural-equivalence helper that loads both
+   arenas and compares the row sets.
+
+2. **Bulk import path.** The Turtle/JSON-LD importer emits
+   `f:reifies*` flakes through the normal write path, so the
+   resolved RunRecords carry the same shape an incremental commit
+   would produce. The arena seal hook (slice 3g) attaches in the
+   full-rebuild path, but only when the caller supplies
+   `Authoritative` events. The api's `BackgroundIndexerWorker`
+   provider doesn't exercise this — bulk imports usually run via
+   the CLI, which today doesn't populate
+   `IndexerConfig.attachment_events`. End-to-end import ➜ arena
+   coverage is a follow-up.
+
+3. **Malformed-bundle telemetry counter.** Both
+   `bundle::build_arenas_from_flakes` and
+   `AttachmentNovelty::observe_flakes` `tracing::warn!` on each
+   malformed bundle, and `ArenaBuildOutput.skipped_bundles`
+   surfaces a per-build count. A long-lived per-ledger counter
+   that operators can scrape from a metrics endpoint hasn't been
+   wired through the telemetry layer yet.
 
 ---
 
@@ -911,3 +967,56 @@ live in `EDGE_ANNOTATIONS.md`. This plan tracks the *implementation*
 schedule; the design contract is the source doc's Decisions section.
 Conflicts between the two documents are bugs in this plan — file
 against `EDGE_ANNOTATIONS_IMPL_PLAN.md`, not the design doc.
+
+---
+
+## Slice 5 benchmarks
+
+Captured on the M2b branch, criterion `--bench` runs (median
+sample, 20 samples per cell). Run yourself with:
+
+```
+cargo bench -p fluree-db-api --bench annotation_hydration
+```
+
+### `annotation_hydration` — scan vs arena on annotated subjects
+
+One base edge with `N` attachments; hydration query is
+`select: {"?person": ["*", {"ex:worksFor": ["*"]}]}`. The "scan"
+ledger reindexes without an `AttachmentEventsProvider` so it lands
+in the M2a indexed-scan-fallback state (`has_annotations=true,
+annotation_index=None`). The "arena" ledger reindexes with the
+provider attached. Both paths flow through
+`HydrationFormatter::inject_annotations`.
+
+| N | scan | arena | arena speedup |
+|---|---|---|---|
+| 1       | 249 µs | 226 µs | 1.10× |
+| 100     | 3.64 ms | 2.10 ms | 1.74× |
+| 10 000  | 2.10 s  | 1.06 s  | 1.98× |
+
+**Reading the data.** Lookup-only the arena is ~5000× cheaper at
+N=10 000 (2 CAS reads vs ~10 001), but per-annotation body
+formatting (`format_subject`) dominates total time and is identical
+between paths — that ceiling caps the wall-clock win at ~2×.
+
+### `non_annotation_hydration/baseline` — non-annotation regression guard
+
+Hydration on a ledger that has never observed an `f:reifies*`
+flake. Same query shape; no annotated edges anywhere. Exercises
+the zero-cost gate added to `inject_annotations` (mirrors the
+cascade fast-path in `fluree_db_transact::stage`).
+
+| Ref edges | time |
+|---|---|
+| 1   | 56 µs |
+| 100 | 3.15 ms (~31 µs/edge) |
+
+The ~31 µs/edge is the pure hydration cost (formatting the ref +
+nested expansion). The gate adds essentially zero overhead — when
+both `snapshot.has_annotations` and `novelty.attachments.has_annotations()`
+are false, `inject_annotations` returns immediately without
+constructing an `EdgeKey` or issuing a POST scan. Run this bench
+on every annotation-related code change to catch a regression
+that would re-introduce per-ref scan cost on non-annotation
+ledgers.
