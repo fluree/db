@@ -428,14 +428,24 @@ correctness items remaining):**
     `delete_by_annotation_id_named_graph_retracts_in_correct_graph`,
     `delete_by_annotation_id_explicit_iri_preserves_body_in_rdf_mode`,
     `delete_by_annotation_id_lpg_mode_cleans_explicit_iri_body`.
-  - **By selector** (⏳ deferred, with a clear error):
-    `@annotation: { ex:role: "Engineer" }` (no `@id`) needs runtime
-    resolution against live data — minting a fresh variable,
-    synthesizing WHERE patterns binding it to matching annotations,
-    emitting delete templates against the variable. Out-of-scope
-    for this slice. The pre-pass surfaces a documented error
-    pointing users at the by-id workaround. Test:
-    `delete_by_annotation_selector_returns_deferred_error`.
+  - **By selector** (✅ `feat: by-selector annotation retracts`):
+    `@annotation: { ex:role: "Engineer" }` (no `@id`) is lowered into
+    a WHERE-bound retract. The pre-pass mints a fresh
+    `?_fluree_del_ann_N` (seeded past any user-visible occurrence of
+    the same prefix to avoid variable collision), synthesizes a flat
+    `f:reifies*` WHERE pattern that constrains the variable to live
+    annotations matching the body selector and reifying the named
+    edge, and emits a by-variable delete template for the bundle.
+    For named-graph annotations the WHERE pattern is wrapped in the
+    JLDQ `["graph", "<iri>", ...]` form with the IRI expanded
+    against the document's `@context`. The standard UPDATE
+    machinery instantiates the template per binding; the LPG body
+    cleanup pass at stage time fires for the resulting bundle
+    retracts. Tests:
+    `delete_by_annotation_selector_retracts_matching_occurrence`,
+    `delete_by_annotation_selector_lpg_mode_cleans_explicit_iri_body`,
+    `delete_by_annotation_selector_named_graph_retracts_in_correct_graph`,
+    `delete_by_annotation_selector_avoids_user_var_collision`.
   - **By blank-node id** (⏳ deferred): anonymous SIDs are minted
     server-side at insert time and not user-addressable. Pre-pass
     rejects with a clear error.

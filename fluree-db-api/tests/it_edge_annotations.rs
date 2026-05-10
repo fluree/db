@@ -2665,6 +2665,86 @@ async fn delete_by_annotation_selector_named_graph_retracts_in_correct_graph() {
 }
 
 #[tokio::test]
+async fn delete_by_annotation_selector_avoids_user_var_collision() {
+    // Regression: the pre-pass mints `?_fluree_del_ann_<N>` for
+    // selector retracts. If the user happens to reference the same
+    // internal variable in their own `where` clause, naive minting
+    // would collide and the selector retract would over-constrain
+    // against the user's bindings instead of binding fresh. The
+    // mint counter is seeded past any user-visible occurrence so
+    // the synthesized variable is always fresh.
+    //
+    // Setup: annotate one edge with role=Engineer. Issue an UPDATE
+    // whose user-provided `where` and `delete` use the colliding
+    // name `?_fluree_del_ann_0` to bind something *unrelated*
+    // (alice's plain `ex:name` triple) so the user's variable maps
+    // to a literal. The selector retract must still find the
+    // annotation and retract it; if the counter collided, the
+    // synthesized WHERE would unify the annotation SID against the
+    // literal "Alice" and bind nothing.
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger_id = "it/edge-annotations:delete-selector-var-collision";
+    let ledger0 = genesis_ledger(&fluree, ledger_id);
+
+    let r1 = fluree
+        .insert(
+            ledger0,
+            &json!({
+                "@context": ctx(),
+                "@id": "ex:alice",
+                "ex:name": "Alice",
+                "ex:worksFor": {
+                    "@id": "ex:acme",
+                    "@annotation": { "@id": "ex:emp/A", "ex:role": "Engineer" }
+                }
+            }),
+        )
+        .await
+        .expect("insert");
+
+    fluree
+        .update(
+            r1.ledger,
+            &json!({
+                "@context": ctx(),
+                "where": { "@id": "ex:alice", "ex:name": "?_fluree_del_ann_0" },
+                "delete": {
+                    "@id": "ex:alice",
+                    "ex:worksFor": {
+                        "@id": "ex:acme",
+                        "@annotation": { "ex:role": "Engineer" }
+                    }
+                }
+            }),
+        )
+        .await
+        .expect("selector retract with colliding user var");
+
+    let ledger = fluree.ledger(ledger_id).await.expect("reload");
+    let surviving = json!({
+        "@context": ctx(),
+        "select": ["?ann", "?role"],
+        "where": {
+            "@id": "?ann",
+            "ex:role": "?role",
+            "@reifies": {
+                "@id": "ex:alice",
+                "ex:worksFor": { "@id": "ex:acme" }
+            }
+        }
+    });
+    let rows = support::query_jsonld_formatted(&fluree, &ledger, &surviving)
+        .await
+        .expect("query survivors");
+    let arr = rows.as_array().expect("rows");
+    assert!(
+        arr.is_empty(),
+        "selector retract must run even when user already uses our \
+         internal variable prefix: {arr:#?}"
+    );
+}
+
+#[tokio::test]
 async fn cross_graph_misjoin_in_multi_source_default_known_limitation() {
     // Pinning test for the documented cross-graph misjoin in
     // `expand_edge_annotation_patterns` (see comment in

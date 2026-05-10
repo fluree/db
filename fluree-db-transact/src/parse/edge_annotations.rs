@@ -285,6 +285,16 @@ pub fn lower_delete_annotation_blocks(doc: &mut Value) -> Result<()> {
     if !obj.contains_key("delete") {
         return Ok(());
     }
+    // Seed the variable counter past any user-authored
+    // `?_fluree_del_ann_N` occurrences in the original `where`,
+    // `delete`, `insert`, `upsert`, and `values` clauses. A naive
+    // `next_var = 0` would collide with a user-provided variable of
+    // the same name and silently mis-join the selector retract
+    // against the wrong bindings. This scan MUST run before the
+    // `obj.remove` calls below — otherwise it sees an empty doc and
+    // returns 0 regardless of user state.
+    let mut next_var: u32 = next_synth_var_index(obj);
+
     // Take ownership of `delete` (and the `where` clause if any) so
     // we can splice both. Re-insert at the end. `obj.get_mut`
     // borrows can't compose with subsequent inserts, so the
@@ -294,7 +304,6 @@ pub fn lower_delete_annotation_blocks(doc: &mut Value) -> Result<()> {
 
     let mut new_templates: Vec<Value> = Vec::new();
     let mut new_where_patterns: Vec<Value> = Vec::new();
-    let mut next_var: u32 = 0;
     // Top-level graph context: the transactor's UPDATE doc has no
     // envelope `@graph` (that's the insert/upsert envelope form),
     // so we start from `None` and let per-node `@graph: "<iri>"`
@@ -355,6 +364,49 @@ pub fn lower_delete_annotation_blocks(doc: &mut Value) -> Result<()> {
     }
 
     Ok(())
+}
+
+/// Internal variable name prefix used by the selector-form retract
+/// rewrite. Kept in one place so the scanner and the minter agree.
+const SYNTH_VAR_PREFIX: &str = "?_fluree_del_ann_";
+
+/// Walk the UPDATE document's user-visible clauses (`where`, `delete`,
+/// `insert`, `upsert`, `values`) and return the smallest counter
+/// value that will produce a fresh `?_fluree_del_ann_N` name. A
+/// user-authored pattern that happens to reference our internal
+/// prefix would otherwise collide with the minter and mis-bind the
+/// selector retract against the user's variable.
+fn next_synth_var_index(obj: &Map<String, Value>) -> u32 {
+    let mut max_seen: Option<u32> = None;
+    for clause in ["where", "delete", "insert", "upsert", "values"] {
+        if let Some(v) = obj.get(clause) {
+            scan_synth_var_usage(v, &mut max_seen);
+        }
+    }
+    max_seen.map(|n| n + 1).unwrap_or(0)
+}
+
+fn scan_synth_var_usage(value: &Value, max_seen: &mut Option<u32>) {
+    match value {
+        Value::String(s) => {
+            if let Some(tail) = s.strip_prefix(SYNTH_VAR_PREFIX) {
+                if let Ok(n) = tail.parse::<u32>() {
+                    *max_seen = Some(max_seen.map_or(n, |cur| cur.max(n)));
+                }
+            }
+        }
+        Value::Array(items) => {
+            for item in items {
+                scan_synth_var_usage(item, max_seen);
+            }
+        }
+        Value::Object(map) => {
+            for v in map.values() {
+                scan_synth_var_usage(v, max_seen);
+            }
+        }
+        _ => {}
+    }
 }
 
 /// True iff `v` is `{"@id": ...}` or `{}` with no other keys — a
@@ -664,7 +716,7 @@ fn build_annotation_delete(
         // pattern that constrains it to live annotations matching
         // the selector body and reifying the named edge, and use
         // the variable as the delete-template @id.
-        let var = format!("?_fluree_del_ann_{}", *next_var);
+        let var = format!("{SYNTH_VAR_PREFIX}{}", *next_var);
         *next_var += 1;
 
         // Strip the alias so we don't carry duplicate @id keys into
