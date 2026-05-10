@@ -1534,9 +1534,7 @@ async fn opts_include_system_facts_surfaces_f_reifies() {
     // visible from the annotation subject.
     let leaked_reifies: Vec<&String> = predicates
         .iter()
-        .filter(|p| {
-            p.starts_with("https://ns.flur.ee/db#reifies") || p.starts_with("f:reifies")
-        })
+        .filter(|p| p.starts_with("https://ns.flur.ee/db#reifies") || p.starts_with("f:reifies"))
         .collect();
     assert!(
         leaked_reifies.len() >= 3,
@@ -1600,9 +1598,7 @@ async fn opts_include_system_facts_propagates_through_dataset_path() {
         .collect();
     let leaked: Vec<&String> = predicates
         .iter()
-        .filter(|p| {
-            p.starts_with("https://ns.flur.ee/db#reifies") || p.starts_with("f:reifies")
-        })
+        .filter(|p| p.starts_with("https://ns.flur.ee/db#reifies") || p.starts_with("f:reifies"))
         .collect();
     assert!(
         leaked.len() >= 3,
@@ -1680,9 +1676,7 @@ async fn opts_include_system_facts_works_for_ask_queries() {
         .query(&support::graphdb_from_ledger(&ledger), &q_opt)
         .await
         .expect("ask opt");
-    let json_opt: JsonValue = resp_opt
-        .to_jsonld(&ledger.snapshot)
-        .expect("to_jsonld opt");
+    let json_opt: JsonValue = resp_opt.to_jsonld(&ledger.snapshot).expect("to_jsonld opt");
     assert_eq!(
         json_opt,
         JsonValue::Bool(true),
@@ -2418,14 +2412,20 @@ async fn delete_by_annotation_id_named_graph_retracts_in_correct_graph() {
 }
 
 #[tokio::test]
-async fn delete_by_annotation_selector_returns_deferred_error() {
-    // The selector form (`@annotation` block with no `@id`,
-    // identifying the occurrence by metadata match) needs a
-    // WHERE-style runtime resolution that v1's parser doesn't
-    // synthesize. We surface a clear error so users don't get the
-    // pre-fix silent-no-op behavior.
+async fn delete_by_annotation_selector_retracts_matching_occurrence() {
+    // Selector form: `@annotation: { ex:role: "Engineer" }` (no @id)
+    // names the *kind* of annotation to retract. The pre-pass mints a
+    // fresh variable, synthesizes a WHERE pattern that constrains it
+    // to every live annotation matching the body and reifying the
+    // named edge, and emits a by-variable delete template. The
+    // standard UPDATE machinery binds and retracts.
+    //
+    // Setup: two parallel annotations on the same edge — Engineer
+    // (with two body fields) and Manager. The selector retract must
+    // cancel exactly the Engineer occurrence, leaving Manager and
+    // the base edge intact.
     let fluree = FlureeBuilder::memory().build_memory();
-    let ledger_id = "it/edge-annotations:delete-selector-deferred";
+    let ledger_id = "it/edge-annotations:delete-selector-basic";
     let ledger0 = genesis_ledger(&fluree, ledger_id);
 
     let r1 = fluree
@@ -2433,17 +2433,24 @@ async fn delete_by_annotation_selector_returns_deferred_error() {
             ledger0,
             &json!({
                 "@context": ctx(),
-                "@id": "ex:alice",
-                "ex:worksFor": {
-                    "@id": "ex:acme",
-                    "@annotation": { "@id": "ex:emp/A", "ex:role": "Engineer" }
-                }
+                "@graph": [
+                    { "@id": "ex:alice",
+                      "ex:worksFor": {
+                          "@id": "ex:acme",
+                          "@annotation": { "@id": "ex:emp/A", "ex:role": "Engineer" }
+                      }},
+                    { "@id": "ex:alice",
+                      "ex:worksFor": {
+                          "@id": "ex:acme",
+                          "@annotation": { "@id": "ex:emp/B", "ex:role": "Manager" }
+                      }}
+                ]
             }),
         )
         .await
-        .expect("insert");
+        .expect("insert two parallel annotations");
 
-    let err = fluree
+    fluree
         .update(
             r1.ledger,
             &json!({
@@ -2458,11 +2465,202 @@ async fn delete_by_annotation_selector_returns_deferred_error() {
             }),
         )
         .await
-        .expect_err("selector form must error explicitly");
-    let msg = err.to_string();
+        .expect("selector-form retract");
+
+    let ledger = fluree.ledger(ledger_id).await.expect("reload");
+    let surviving = json!({
+        "@context": ctx(),
+        "select": ["?ann", "?role"],
+        "where": {
+            "@id": "?ann",
+            "ex:role": "?role",
+            "@reifies": {
+                "@id": "ex:alice",
+                "ex:worksFor": { "@id": "ex:acme" }
+            }
+        }
+    });
+    let rows = support::query_jsonld_formatted(&fluree, &ledger, &surviving)
+        .await
+        .expect("query survivors");
+    let arr = rows.as_array().expect("rows");
+    assert_eq!(
+        arr.len(),
+        1,
+        "only the Manager annotation should survive: {arr:#?}"
+    );
+    let row = arr[0].as_array().expect("row");
+    assert!(iri_matches(&row[0], "ex:emp/B", "http://example.org/emp/B"));
+    assert_eq!(row[1].as_str(), Some("Manager"));
+
+    // Base edge survives — selector retract targets the annotation
+    // occurrence, not the edge it reifies.
+    let base = json!({
+        "@context": ctx(),
+        "select": ["?org"],
+        "where": { "@id": "ex:alice", "ex:worksFor": { "@id": "?org" } }
+    });
+    let base_rows = support::query_jsonld_formatted(&fluree, &ledger, &base)
+        .await
+        .expect("base edge query");
+    assert_eq!(
+        base_rows.as_array().map(Vec::len),
+        Some(1),
+        "base edge must survive a selector annotation retract"
+    );
+}
+
+#[tokio::test]
+async fn delete_by_annotation_selector_lpg_mode_cleans_explicit_iri_body() {
+    // Cypher-style relationship delete by metadata match. In LPG
+    // mode the selector retract also cleans the explicit-IRI
+    // annotation's body, not just the f:reifies* bundle.
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger_id = "it/edge-annotations:delete-selector-lpg";
+    let ledger0 = genesis_ledger(&fluree, ledger_id);
+
+    let r1 = fluree
+        .insert(
+            ledger0,
+            &json!({
+                "@context": ctx(),
+                "@id": "ex:alice",
+                "ex:worksFor": {
+                    "@id": "ex:acme",
+                    "@annotation": {
+                        "@id": "ex:emp/alice-acme",
+                        "ex:role": "Engineer",
+                        "ex:since": "2024-01-01"
+                    }
+                }
+            }),
+        )
+        .await
+        .expect("annotated insert");
+
+    fluree
+        .update(
+            r1.ledger,
+            &json!({
+                "@context": ctx(),
+                "delete": {
+                    "@id": "ex:alice",
+                    "ex:worksFor": {
+                        "@id": "ex:acme",
+                        "@annotation": { "ex:role": "Engineer" }
+                    }
+                },
+                "opts": { "lpgEdgeLifecycle": true }
+            }),
+        )
+        .await
+        .expect("selector retract with lpgEdgeLifecycle");
+
+    let ledger = fluree.ledger(ledger_id).await.expect("reload");
+    let body = json!({
+        "@context": ctx(),
+        "select": ["?role", "?since"],
+        "where": {
+            "@id": "ex:emp/alice-acme",
+            "ex:role": "?role",
+            "ex:since": "?since"
+        }
+    });
+    let rows = support::query_jsonld_formatted(&fluree, &ledger, &body)
+        .await
+        .expect("post-delete body query");
+    let arr = rows.as_array().expect("array");
     assert!(
-        msg.contains("selector"),
-        "error must point users at the by-id workaround; got: {msg}"
+        arr.is_empty(),
+        "LPG-mode selector retract must clean the explicit-IRI annotation body: {arr:#?}"
+    );
+
+    let base = json!({
+        "@context": ctx(),
+        "select": ["?org"],
+        "where": { "@id": "ex:alice", "ex:worksFor": { "@id": "?org" } }
+    });
+    let base_rows = support::query_jsonld_formatted(&fluree, &ledger, &base)
+        .await
+        .expect("base edge query");
+    assert_eq!(
+        base_rows.as_array().map(Vec::len),
+        Some(1),
+        "base edge must survive a selector annotation retract even in LPG mode"
+    );
+}
+
+#[tokio::test]
+async fn delete_by_annotation_selector_named_graph_retracts_in_correct_graph() {
+    // Regression: the synthesized WHERE pattern and delete template
+    // must thread the named graph through `f:reifiesGraph` (plus
+    // their own `@graph` selectors), or the selector retract binds
+    // nothing / fires in the wrong graph and the named-graph
+    // assertion survives.
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger_id = "it/edge-annotations:delete-selector-named-graph";
+    let ledger0 = genesis_ledger(&fluree, ledger_id);
+
+    let r1 = fluree
+        .insert(
+            ledger0,
+            &json!({
+                "@context": ctx(),
+                "@id": "ex:alice",
+                "@graph": "ex:hr-graph",
+                "ex:worksFor": {
+                    "@id": "ex:acme",
+                    "@annotation": {
+                        "@id": "ex:emp/A",
+                        "ex:role": "Engineer"
+                    }
+                }
+            }),
+        )
+        .await
+        .expect("named-graph annotated insert");
+
+    fluree
+        .update(
+            r1.ledger,
+            &json!({
+                "@context": ctx(),
+                "delete": {
+                    "@id": "ex:alice",
+                    "@graph": "ex:hr-graph",
+                    "ex:worksFor": {
+                        "@id": "ex:acme",
+                        "@annotation": { "ex:role": "Engineer" }
+                    }
+                }
+            }),
+        )
+        .await
+        .expect("named-graph selector retract");
+
+    let q = json!({
+        "@context": ctx(),
+        "from": format!("{ledger_id}#http://example.org/hr-graph"),
+        "select": ["?ann", "?role"],
+        "where": {
+            "@id": "?ann",
+            "ex:role": "?role",
+            "@reifies": {
+                "@id": "ex:alice",
+                "ex:worksFor": { "@id": "ex:acme" }
+            }
+        }
+    });
+    let result = fluree
+        .query_connection(&q)
+        .await
+        .expect("named-graph @reifies query");
+    let ledger = fluree.ledger(ledger_id).await.expect("reload");
+    let json = result.to_jsonld(&ledger.snapshot).expect("jsonld");
+    let arr = json.as_array().expect("array");
+    assert!(
+        arr.is_empty(),
+        "named-graph annotation must be retracted by selector; found survivors: {arr:#?}"
     );
 }
 
@@ -2650,7 +2848,10 @@ async fn graph_wrapped_query_correctly_pairs_annotations_per_graph() {
             iri_matches(
                 &row[1],
                 expected_ann,
-                &format!("http://example.org/{}", expected_ann.strip_prefix("ex:").unwrap()),
+                &format!(
+                    "http://example.org/{}",
+                    expected_ann.strip_prefix("ex:").unwrap()
+                ),
             ),
             "annotation IRI for {graph_alias}: {row:#?}"
         );

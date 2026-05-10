@@ -264,13 +264,16 @@ pub fn run_user_authored_reifies_firewall(doc: &Value, top_ctx: &ParsedContext) 
 /// both the annotation and the edge gone should issue two delete
 /// statements.
 ///
-/// **Selector shape (deferred):** an `@annotation` block without an
-/// explicit `@id` (e.g. `{ ex:role: "Engineer" }`) requires runtime
-/// resolution against live data — the parser would need to mint a
-/// variable, synthesize `WHERE` patterns binding it to matching
-/// annotations, and emit delete templates against the variable.
-/// That's a separate slice. We surface a clear error here so users
-/// don't silently get the broken-no-op behavior.
+/// **Selector shape:** an `@annotation` block without an explicit
+/// `@id` (e.g. `{ ex:role: "Engineer" }`) requires runtime
+/// resolution against live data. The pre-pass mints a fresh
+/// variable `?_fluree_del_ann_<n>`, synthesizes a `@reifies`-rooted
+/// WHERE pattern that binds the variable to every live annotation
+/// matching the selector body and reifying the named edge, and
+/// emits a by-variable delete template for the bundle. The standard
+/// SPARQL UPDATE machinery then runs the WHERE, instantiates the
+/// template per binding, and the resulting bundle retracts trigger
+/// the LPG body cleanup pass at stage time.
 pub fn lower_delete_annotation_blocks(doc: &mut Value) -> Result<()> {
     // Read the @context BEFORE we borrow the doc mutably for the
     // delete-clause walk — both views are needed and serde_json's
@@ -279,11 +282,19 @@ pub fn lower_delete_annotation_blocks(doc: &mut Value) -> Result<()> {
     let Some(obj) = doc.as_object_mut() else {
         return Ok(());
     };
-    let Some(delete_val) = obj.get_mut("delete") else {
+    if !obj.contains_key("delete") {
         return Ok(());
-    };
+    }
+    // Take ownership of `delete` (and the `where` clause if any) so
+    // we can splice both. Re-insert at the end. `obj.get_mut`
+    // borrows can't compose with subsequent inserts, so the
+    // remove/walk/insert dance keeps the borrow checker happy.
+    let mut delete_val = obj.remove("delete").expect("checked above");
+    let where_val = obj.remove("where");
 
     let mut new_templates: Vec<Value> = Vec::new();
+    let mut new_where_patterns: Vec<Value> = Vec::new();
+    let mut next_var: u32 = 0;
     // Top-level graph context: the transactor's UPDATE doc has no
     // envelope `@graph` (that's the insert/upsert envelope form),
     // so we start from `None` and let per-node `@graph: "<iri>"`
@@ -292,27 +303,57 @@ pub fn lower_delete_annotation_blocks(doc: &mut Value) -> Result<()> {
     // synthesized retract template so the retract flake's
     // `g = Some(graph_sid)` matches the original assertion's flake
     // identity.
-    walk_delete_for_annotations(delete_val, &top_ctx, None, &mut new_templates)?;
-    if new_templates.is_empty() {
-        return Ok(());
-    }
+    walk_delete_for_annotations(
+        &mut delete_val,
+        &top_ctx,
+        None,
+        &mut new_templates,
+        &mut new_where_patterns,
+        &mut next_var,
+    )?;
 
     // Splice the new templates into the delete clause. Convert
     // single-object form to an array, then append.
-    let original = std::mem::replace(delete_val, Value::Null);
-    let mut items: Vec<Value> = match original {
-        Value::Array(arr) => arr.into_iter().filter(|v| !is_empty_node(v)).collect(),
-        Value::Null => Vec::new(),
-        other => {
-            if is_empty_node(&other) {
-                Vec::new()
-            } else {
-                vec![other]
+    if !new_templates.is_empty() {
+        let mut items: Vec<Value> = match delete_val {
+            Value::Array(arr) => arr.into_iter().filter(|v| !is_empty_node(v)).collect(),
+            Value::Null => Vec::new(),
+            other => {
+                if is_empty_node(&other) {
+                    Vec::new()
+                } else {
+                    vec![other]
+                }
             }
-        }
-    };
-    items.extend(new_templates);
-    *delete_val = Value::Array(items);
+        };
+        items.extend(new_templates);
+        delete_val = Value::Array(items);
+    }
+    obj.insert("delete".to_string(), delete_val);
+
+    // Splice the new WHERE patterns into the existing where clause
+    // (or create one). Selector-form retracts depend on these
+    // patterns to bind their variables to live annotations. The
+    // parser accepts an array or a single object — normalize to
+    // array when we need to merge.
+    if !new_where_patterns.is_empty() {
+        let merged = match where_val {
+            None => Value::Array(new_where_patterns),
+            Some(Value::Array(mut arr)) => {
+                arr.extend(new_where_patterns);
+                Value::Array(arr)
+            }
+            Some(other) => {
+                let mut items = vec![other];
+                items.extend(new_where_patterns);
+                Value::Array(items)
+            }
+        };
+        obj.insert("where".to_string(), merged);
+    } else if let Some(w) = where_val {
+        obj.insert("where".to_string(), w);
+    }
+
     Ok(())
 }
 
@@ -345,12 +386,21 @@ fn walk_delete_for_annotations(
     val: &mut Value,
     ctx: &ParsedContext,
     inherited_graph: Option<&str>,
-    out: &mut Vec<Value>,
+    out_templates: &mut Vec<Value>,
+    out_where: &mut Vec<Value>,
+    next_var: &mut u32,
 ) -> Result<()> {
     match val {
         Value::Array(items) => {
             for item in items {
-                walk_delete_for_annotations(item, ctx, inherited_graph, out)?;
+                walk_delete_for_annotations(
+                    item,
+                    ctx,
+                    inherited_graph,
+                    out_templates,
+                    out_where,
+                    next_var,
+                )?;
             }
             Ok(())
         }
@@ -377,9 +427,7 @@ fn walk_delete_for_annotations(
             // walker so the two paths agree on graph scoping.
             let node_graph: Option<String> = match map.get("@graph") {
                 Some(Value::String(s)) => Some(s.clone()),
-                Some(Value::Object(g)) => {
-                    g.get("@id").and_then(Value::as_str).map(String::from)
-                }
+                Some(Value::Object(g)) => g.get("@id").and_then(Value::as_str).map(String::from),
                 _ => None,
             };
             let node_graph_ref = node_graph.as_deref();
@@ -404,7 +452,9 @@ fn walk_delete_for_annotations(
                     value,
                     ctx,
                     effective_graph,
-                    out,
+                    out_templates,
+                    out_where,
+                    next_var,
                     &mut |strip_predicate| {
                         if strip_predicate {
                             keys_to_remove.push(key.clone());
@@ -421,7 +471,14 @@ fn walk_delete_for_annotations(
             let remaining: Vec<String> = map.keys().cloned().collect();
             for key in remaining {
                 if let Some(v) = map.get_mut(&key) {
-                    walk_delete_for_annotations(v, ctx, effective_graph, out)?;
+                    walk_delete_for_annotations(
+                        v,
+                        ctx,
+                        effective_graph,
+                        out_templates,
+                        out_where,
+                        next_var,
+                    )?;
                 }
             }
             Ok(())
@@ -444,7 +501,9 @@ fn lift_annotations_under_predicate(
     value: &mut Value,
     ctx: &ParsedContext,
     inherited_graph: Option<&str>,
-    out: &mut Vec<Value>,
+    out_templates: &mut Vec<Value>,
+    out_where: &mut Vec<Value>,
+    next_var: &mut u32,
     strip_callback: &mut dyn FnMut(bool),
 ) -> Result<()> {
     match value {
@@ -462,7 +521,9 @@ fn lift_annotations_under_predicate(
                     &mut item,
                     ctx,
                     inherited_graph,
-                    out,
+                    out_templates,
+                    out_where,
+                    next_var,
                     &mut |s| item_stripped = s,
                 )?;
                 if !item_stripped {
@@ -503,28 +564,27 @@ fn lift_annotations_under_predicate(
             // assertion-side walker's per-node graph extraction.
             let object_graph: Option<String> = match map.get("@graph") {
                 Some(Value::String(s)) => Some(s.clone()),
-                Some(Value::Object(g)) => {
-                    g.get("@id").and_then(Value::as_str).map(String::from)
-                }
+                Some(Value::Object(g)) => g.get("@id").and_then(Value::as_str).map(String::from),
                 _ => None,
             };
-            let effective_graph: Option<&str> =
-                object_graph.as_deref().or(inherited_graph);
+            let effective_graph: Option<&str> = object_graph.as_deref().or(inherited_graph);
 
             let ann_block = map.remove(ANNOTATION_KEY).or_else(|| map.remove(EDGE_KEY));
             let Some(ann_block) = ann_block else {
                 return Ok(());
             };
 
-            let template = build_delete_template_for_annotation(
+            build_annotation_delete(
                 parent_subject,
                 predicate,
                 &object_id,
                 ann_block,
                 ctx,
                 effective_graph,
+                out_templates,
+                out_where,
+                next_var,
             )?;
-            out.push(template);
 
             // After lifting, the parent's predicate-value is just
             // `{@id: <object>}`. That alone is a structurally empty
@@ -538,27 +598,40 @@ fn lift_annotations_under_predicate(
     }
 }
 
-/// Build the retract delete template for a single by-id annotation
-/// block. Verifies the block carries an explicit `@id` (selector
-/// shapes without one are rejected with a clear error), then emits a
-/// node-map shaped like the existing assertion form so the standard
-/// `parse_update_templates_with_ctx` path produces the right
-/// `f:reifies*` retracts.
-fn build_delete_template_for_annotation(
+/// Build the retract delete template(s) for one `@annotation` block,
+/// dispatching on shape:
+///
+/// - **By-id** (block has explicit `@id`): emit a single delete
+///   template with the same seven-fact `f:reifies*` shape used by the
+///   assertion-side lowering. The standard
+///   `parse_update_templates_with_ctx` path turns it into per-flake
+///   retracts. Pushed to `out_templates` only — no WHERE pattern
+///   needed.
+///
+/// - **By-selector** (no `@id`, body holds selector properties): mint
+///   a fresh variable `?_fluree_del_ann_<n>`, push a `@reifies`-rooted
+///   WHERE pattern that binds the variable to every live annotation
+///   matching the selector body and reifying the named edge, and push
+///   a delete template keyed by the variable. The SPARQL UPDATE
+///   machinery instantiates the template per WHERE binding.
+fn build_annotation_delete(
     parent_subject: &str,
     predicate: &str,
     object_id: &str,
     ann_block: Value,
     ctx: &ParsedContext,
     graph_iri: Option<&str>,
-) -> Result<Value> {
-    let Value::Object(ann_map) = ann_block else {
+    out_templates: &mut Vec<Value>,
+    out_where: &mut Vec<Value>,
+    next_var: &mut u32,
+) -> Result<()> {
+    let Value::Object(mut ann_map) = ann_block else {
         return Err(TransactError::Parse(
             "@annotation value must be a JSON object".to_string(),
         ));
     };
     let id_alias = ctx.id_key.as_str();
-    let ann_id = ann_map
+    let explicit_id: Option<String> = ann_map
         .get("@id")
         .and_then(Value::as_str)
         .or_else(|| {
@@ -568,31 +641,92 @@ fn build_delete_template_for_annotation(
                 None
             }
         })
-        .ok_or_else(|| {
-            TransactError::UnsupportedFeature(
-                "delete by annotation selector (no @id) is deferred — give the annotation \
-                 an explicit @id and delete that. Selector deletes need a WHERE-style \
-                 resolution that v1's parser doesn't synthesize yet."
-                    .to_string(),
-            )
-        })?;
+        .map(String::from);
 
-    // Reject blank-node @ids: a user can't legitimately pin a
-    // specific anonymous annotation by its blank-node id (those are
-    // minted server-side at insert time). If the user really wants
-    // to retract an anonymous annotation, they should supply a
-    // selector once the selector path lands.
-    if ann_id.starts_with("_:") {
-        return Err(TransactError::UnsupportedFeature(
-            "delete by anonymous annotation @id is not supported — anonymous SIDs \
-             are minted at insert time and not user-addressable. Use a selector \
-             form (deferred) or attach an explicit @id at insert."
-                .to_string(),
-        ));
-    }
+    let template_id: String = if let Some(ann_id) = explicit_id {
+        // Reject blank-node @ids: a user can't legitimately pin a
+        // specific anonymous annotation by its blank-node id (those
+        // are minted server-side at insert time). If they really
+        // want to retract an anonymous annotation, they should use
+        // the selector form (no @id) and let the WHERE clause
+        // resolve it.
+        if ann_id.starts_with("_:") {
+            return Err(TransactError::UnsupportedFeature(
+                "delete by anonymous annotation @id is not supported — anonymous SIDs \
+                 are minted at insert time and not user-addressable. Use a selector \
+                 form (no @id, body properties only) or attach an explicit @id at insert."
+                    .to_string(),
+            ));
+        }
+        ann_id
+    } else {
+        // Selector form. Mint a unique variable, build a WHERE
+        // pattern that constrains it to live annotations matching
+        // the selector body and reifying the named edge, and use
+        // the variable as the delete-template @id.
+        let var = format!("?_fluree_del_ann_{}", *next_var);
+        *next_var += 1;
+
+        // Strip the alias so we don't carry duplicate @id keys into
+        // the WHERE pattern (we'll insert our own).
+        ann_map.remove("@id");
+        if id_alias != "@id" {
+            ann_map.remove(id_alias);
+        }
+
+        // Reject nested annotations / @reifies inside the selector
+        // body — same deferral rule as inserts.
+        scan_nested_annotation_keywords(&Value::Object(ann_map.clone()))?;
+
+        // Build the WHERE pattern as a flat triple-pattern node. The
+        // body properties (remaining in `ann_map`) act as selector
+        // predicates; the `f:reifies*` triples pin the annotation to
+        // the (parent_subject, predicate, object_id) edge. We emit
+        // the system predicates directly rather than the higher-level
+        // `@reifies` shape because the standard lowering walker
+        // rejects `@reifies` outside its query-side context, while
+        // `f:reifies*` IRIs are accepted as ordinary IRIs (the
+        // user-authored-reifies firewall has already run against the
+        // original doc, so our synthesized ones aren't re-scanned).
+        // The JSON-LD-Q query parser still resolves `f:reifies*`
+        // triple patterns into the same indexed lookups as
+        // `@reifies` would.
+        let mut where_node = ann_map.clone();
+        where_node.insert("@id".to_string(), Value::String(var.clone()));
+        where_node.insert(
+            reifies_iris::SUBJECT.to_string(),
+            json!({"@id": parent_subject}),
+        );
+        where_node.insert(
+            reifies_iris::PREDICATE.to_string(),
+            json!({"@id": predicate}),
+        );
+        where_node.insert(reifies_iris::OBJECT.to_string(), json!({"@id": object_id}));
+        if let Some(graph) = graph_iri {
+            where_node.insert(reifies_iris::GRAPH.to_string(), json!({"@id": graph}));
+            // Named-graph case: wrap the node in the JLDQ s-expression
+            // graph form `["graph", "<iri>", { ...patterns... }]` so
+            // the WHERE evaluation scopes its triple matches to the
+            // named graph. Without the wrapper a default-graph WHERE
+            // would not see flakes that live only inside the named
+            // graph, and the variable would never bind.
+            //
+            // The graph name is stored unchanged through to execution
+            // (`GraphName::Iri(Arc::from(name))` in `parse/lower.rs`),
+            // so we expand compact IRIs here against the document's
+            // top-level `@context` rather than leaving them for a
+            // resolution pass that doesn't run for this position.
+            let expanded_graph = expand_iri(graph, ctx);
+            out_where.push(json!(["graph", expanded_graph, Value::Object(where_node),]));
+        } else {
+            out_where.push(Value::Object(where_node));
+        }
+
+        var
+    };
 
     let mut template = Map::new();
-    template.insert("@id".to_string(), Value::String(ann_id.to_string()));
+    template.insert("@id".to_string(), Value::String(template_id));
     template.insert(
         reifies_iris::SUBJECT.to_string(),
         json!({"@id": parent_subject}),
@@ -610,13 +744,11 @@ fn build_delete_template_for_annotation(
     // assertion-side `build_annotation_sibling` graph emission so
     // assert and retract round-trip exactly.
     if let Some(graph) = graph_iri {
-        template.insert(
-            reifies_iris::GRAPH.to_string(),
-            json!({"@id": graph}),
-        );
+        template.insert(reifies_iris::GRAPH.to_string(), json!({"@id": graph}));
         template.insert("@graph".to_string(), Value::String(graph.to_string()));
     }
-    Ok(Value::Object(template))
+    out_templates.push(Value::Object(template));
+    Ok(())
 }
 
 /// Inherited context for the lowering walker.
