@@ -1,8 +1,6 @@
-//! Unified query execution runner
-//!
-//! This module provides the core execution pipeline that all `execute_with_*`
-//! functions share. By extracting the common logic here, we eliminate duplication
-//! and ensure consistent behavior (including tracing) across all execution paths.
+//! Unified query execution runner: shared pipeline behind every `execute*`
+//! entry point. Tracing and error handling go through here so all paths
+//! behave the same.
 
 use crate::binding::Batch;
 use crate::context::{ExecutionContext, FulltextProviders};
@@ -11,7 +9,7 @@ use crate::error::Result;
 use crate::ir::triple::{Ref, Term, TriplePattern};
 use crate::ir::Pattern;
 use crate::ir::Query;
-use crate::ir::QueryOptions;
+use crate::ir::ReasoningConfig;
 use crate::operator::BoxedOperator;
 use crate::reasoning::ReasoningOverlay;
 use crate::rewrite_owl_ql::Ontology;
@@ -66,28 +64,32 @@ fn dedup_exact_triples(patterns: Vec<Pattern>) -> Vec<Pattern> {
     dedup_list(patterns)
 }
 
-/// Query with execution options
+/// A parsed query bundled with the reasoning configuration that should
+/// govern its execution.
 ///
-/// Combines a parsed query with solution modifiers for execution.
-/// The `options` field allows overriding the options embedded in `Query`.
+/// `reasoning` defaults to whatever `Query.reasoning` carried after lowering,
+/// but the API surface (e.g. `view::query::execute`) may override it before
+/// dispatch — for example to force-disable datalog or to attach a
+/// pre-resolved schema bundle.
 #[derive(Debug)]
 pub struct ExecutableQuery {
-    /// The parsed query (contains embedded options)
+    /// The parsed query (carries its own embedded reasoning config).
     pub query: Query,
-    /// Execution options (may override query.options)
-    pub options: QueryOptions,
+    /// Reasoning configuration applied at execution time.
+    /// May override `query.reasoning`.
+    pub reasoning: ReasoningConfig,
 }
 
 impl ExecutableQuery {
-    /// Create a new executable query with explicit options override
-    pub fn new(query: Query, options: QueryOptions) -> Self {
-        Self { query, options }
+    /// Create a new executable query with an explicit reasoning override.
+    pub fn new(query: Query, reasoning: ReasoningConfig) -> Self {
+        Self { query, reasoning }
     }
 
-    /// Create an executable query using the query's embedded options
+    /// Create an executable query using the reasoning config embedded in `Query`.
     pub fn simple(query: Query) -> Self {
-        let options = query.options.clone();
-        Self { query, options }
+        let reasoning = query.reasoning.clone();
+        Self { query, reasoning }
     }
 
     /// True if any pattern in this query calls `fulltext(...)`.
@@ -110,15 +112,9 @@ impl ExecutableQuery {
 /// - Rewritten patterns
 /// - Operator tree
 ///
-/// This struct captures the result of the "preparation" phase, which is
-/// common to all execution paths. The actual execution just needs to
-/// run the operator tree with an appropriate ExecutionContext.
-///
-/// # Future Enhancements
-///
-/// Additional fields may be added to support:
-/// - Schema hierarchy for context building
-/// - Reasoning modes for diagnostics/debugging
+/// Output of the prepare phase: the operator tree plus any state that has
+/// to outlive `prepare_execution` and accompany the operator into runtime
+/// (e.g. the derived-facts overlay backing reasoning).
 pub struct PreparedExecution {
     /// The operator tree to execute
     pub operator: BoxedOperator,
@@ -223,11 +219,11 @@ pub async fn prepare_execution_with_config(
         // ---- reasoning_prep: schema hierarchy, reasoning modes, derived facts, ontology ----
         let reasoning_span = tracing::debug_span!("reasoning_prep");
         // If the upstream API layer pre-resolved an `f:schemaSource` + `owl:imports`
-        // closure into `query.options.schema_bundle`, project it as an overlay now.
+        // closure into `query.reasoning.schema_bundle`, project it as an overlay now.
         // This makes schema-whitelisted flakes from every source graph visible at
         // `g_id=0`, which is what RDFS/OWL extraction code scans.
         let schema_overlay_binding: Option<SchemaBundleOverlay<'_>> = query
-            .options
+            .reasoning
             .schema_bundle
             .as_ref()
             .filter(|b| !b.is_empty())
@@ -241,8 +237,7 @@ pub async fn prepare_execution_with_config(
             let hierarchy = schema_hierarchy_with_overlay(db.snapshot, effective_overlay, db.t);
 
             // Step 2: Determine effective reasoning modes
-            let reasoning =
-                effective_reasoning_modes(&query.options.reasoning, hierarchy.is_some());
+            let reasoning = effective_reasoning_modes(&query.reasoning.modes, hierarchy.is_some());
 
             if reasoning.rdfs || reasoning.owl2ql || reasoning.owl2rl || reasoning.datalog {
                 tracing::debug!(
@@ -410,7 +405,7 @@ pub async fn prepare_execution_with_config(
             .entered();
 
             let stats_view = cached_stats_view_for_db(db, binary_store);
-            build_operator_tree(&rewritten_query, &query.options, stats_view, &planning)?
+            build_operator_tree(&rewritten_query, stats_view, &planning)?
         };
 
         Ok(PreparedExecution {

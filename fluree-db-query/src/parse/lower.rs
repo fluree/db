@@ -13,14 +13,14 @@ use super::ast::{
 };
 use super::encode::{IriEncoder, NoEncoder};
 use super::error::{ParseError, Result};
-use crate::aggregate::{AggregateFn, AggregateSpec};
 use crate::binding::Binding;
 use crate::context::WellKnownDatatypes;
 use crate::ir::triple::{Ref, Term, TriplePattern};
-use crate::ir::QueryOptions;
+use crate::ir::ReasoningConfig;
+use crate::ir::{AggregateFn, AggregateSpec};
 use crate::ir::{
-    Column, ConstructTemplate, ForwardItem, HydrationSpec, Multiplicity, NestedSelectSpec,
-    Projection, Query, QueryOutput, Root,
+    Column, ConstructTemplate, ForwardItem, Grouping, HydrationSpec, NestedSelectSpec, Projection,
+    Query, QueryOutput, Restriction, Root,
 };
 use crate::ir::{
     Expression, Function, IndexSearchPattern, IndexSearchTarget, PathModifier, Pattern,
@@ -93,22 +93,23 @@ pub(crate) fn lower_query<E: IriEncoder>(
         patterns.extend(lowered);
     }
 
-    // Lower options
-    let mut options = lower_options(&ast.options, vars)?;
+    // Resolve aggregate output VarIds up front so we can classify each
+    // SELECT-clause computation as pre- or post-aggregation. Mirrors
+    // `fluree_db_sparql::lower::select::lower_select_expression_binds` so
+    // SPARQL and JSON-LD queries produce the same IR shape.
+    let aggregate_output_vars: std::collections::HashSet<VarId> = ast
+        .options
+        .aggregates
+        .iter()
+        .map(|spec| vars.get_or_insert(&spec.output_var))
+        .collect();
 
     // Desugar SELECT-clause scalar expressions to BIND patterns. Pre/Post
     // placement is decided per-column by `lower_select_expr_bind`; we
     // accumulate post-bind aliases as we go so chained derivations
-    // (`(as (+ ?cnt 1) ?adj) (as (+ ?adj 1) ?again)`) correctly land in
-    // `options.post_binds` in source order.
-    //
-    // Mirrors `fluree_db_sparql::lower::select::lower_select_expression_binds`
-    // so SPARQL and JSON-LD queries produce the same IR shape.
-    let aggregate_output_vars: std::collections::HashSet<VarId> = options
-        .aggregates
-        .iter()
-        .map(|spec| spec.output_var)
-        .collect();
+    // (`(as (+ ?cnt 1) ?adj) (as (+ ?adj 1) ?again)`) land in `post_binds`
+    // in source order.
+    let mut post_binds: Vec<(VarId, Expression)> = Vec::new();
     let mut post_bind_aliases: std::collections::HashSet<VarId> = std::collections::HashSet::new();
     for column in ast.select.columns() {
         if let UnresolvedColumn::Computation { expr, alias } = column {
@@ -124,7 +125,7 @@ pub(crate) fn lower_query<E: IriEncoder>(
             match placement {
                 SelectExprPlacement::Post => {
                     post_bind_aliases.insert(alias_var);
-                    options.post_binds.push((alias_var, lowered_expr));
+                    post_binds.push((alias_var, lowered_expr));
                 }
                 SelectExprPlacement::Pre => {
                     patterns.push(Pattern::Bind {
@@ -136,15 +137,26 @@ pub(crate) fn lower_query<E: IriEncoder>(
         }
     }
 
-    // Build QueryOutput from mode + lowered components
+    // Lower the reasoning config, ordering, and grouping (each is its own axis).
+    // Post-aggregation binds collected above ride inside the grouping phase.
+    let reasoning = lower_options(&ast.options);
+    let ordering = lower_ordering(&ast.options, vars);
+    let grouping = lower_grouping(&ast.options, vars, post_binds)?;
+    let limit = ast.options.limit;
+    let offset = ast.options.offset;
+
+    // Build QueryOutput from mode + lowered components. The parser guarantees
+    // `selectOne` and `selectDistinct` are mutually exclusive (if-else dispatch
+    // on the syntactic key); the IR enforces it structurally via Option<Restriction>.
+    let restriction = match select_mode {
+        SelectMode::One => Some(Restriction::One),
+        SelectMode::Many if ast.options.distinct => Some(Restriction::Distinct),
+        _ => None,
+    };
     let output = match select_mode {
-        SelectMode::Many => QueryOutput::Select {
+        SelectMode::Many | SelectMode::One => QueryOutput::Select {
             projection,
-            multiplicity: Multiplicity::All,
-        },
-        SelectMode::One => QueryOutput::Select {
-            projection,
-            multiplicity: Multiplicity::One,
+            restriction,
         },
         SelectMode::Construct => {
             let template = match ast.construct_template {
@@ -161,7 +173,11 @@ pub(crate) fn lower_query<E: IriEncoder>(
         orig_context: ast.orig_context,
         output,
         patterns,
-        options,
+        grouping,
+        ordering,
+        limit,
+        offset,
+        reasoning,
         post_values: None,
     })
 }
@@ -1181,29 +1197,13 @@ fn lower_subquery<E: IriEncoder>(
             .iter()
             .map(|s| lower_sort_spec(s, vars))
             .collect();
-        sq = sq.with_order_by(sort_specs);
+        sq = sq.with_ordering(sort_specs);
     }
 
-    // GROUP BY / aggregates / HAVING (needed for subqueries used in filters/unions)
-    if !subquery.options.group_by.is_empty() {
-        sq.group_by = subquery
-            .options
-            .group_by
-            .iter()
-            .map(|v| vars.get_or_insert(v))
-            .collect();
-    }
-    if !subquery.options.aggregates.is_empty() {
-        sq.aggregates = subquery
-            .options
-            .aggregates
-            .iter()
-            .map(|a| lower_aggregate_spec(a, vars))
-            .collect();
-    }
-    if let Some(ref having) = subquery.options.having {
-        sq.having = Some(lower_filter_expr(having, vars)?);
-    }
+    // GROUP BY / aggregates / HAVING (needed for subqueries used in filters/unions).
+    // Subqueries have no post-aggregation bind channel; the loop above
+    // already rejects any SELECT computation classified as `Post`.
+    sq.grouping = lower_grouping(&subquery.options, vars, Vec::new())?;
 
     Ok(sq)
 }
@@ -1674,39 +1674,54 @@ fn lower_aggregate_spec(spec: &UnresolvedAggregateSpec, vars: &mut VarRegistry) 
     }
 }
 
-/// Lower unresolved options to resolved QueryOptions
-fn lower_options(opts: &UnresolvedOptions, vars: &mut VarRegistry) -> Result<QueryOptions> {
-    // Transfer reasoning modes, or use default if not specified
-    let reasoning = opts.reasoning.clone().unwrap_or_default();
-
-    Ok(QueryOptions {
-        limit: opts.limit,
-        offset: opts.offset,
-        distinct: opts.distinct,
-        order_by: opts
-            .order_by
-            .iter()
-            .map(|s| lower_sort_spec(s, vars))
-            .collect(),
-        group_by: opts
-            .group_by
-            .iter()
-            .map(|v| vars.get_or_insert(v))
-            .collect(),
-        aggregates: opts
-            .aggregates
-            .iter()
-            .map(|a| lower_aggregate_spec(a, vars))
-            .collect(),
-        having: opts
-            .having
-            .as_ref()
-            .map(|e| lower_filter_expr(e, vars))
-            .transpose()?,
-        post_binds: Vec::new(),
-        reasoning,
+/// Lower the unresolved reasoning configuration to resolved `ReasoningConfig`.
+fn lower_options(opts: &UnresolvedOptions) -> ReasoningConfig {
+    ReasoningConfig {
+        modes: opts.reasoning.clone().unwrap_or_default(),
         schema_bundle: None,
-    })
+    }
+}
+
+/// Lower the unresolved ORDER BY specs into the resolved `Vec<SortSpec>`
+/// that rides on `Query.ordering`.
+fn lower_ordering(opts: &UnresolvedOptions, vars: &mut VarRegistry) -> Vec<SortSpec> {
+    opts.order_by
+        .iter()
+        .map(|s| lower_sort_spec(s, vars))
+        .collect()
+}
+
+/// Lower the unresolved aggregation surface (GROUP BY / aggregates / HAVING)
+/// into the structural `Grouping` IR. Returns `None` when there is no
+/// aggregation phase at all (no GROUP BY, no aggregates, no HAVING, no
+/// post-aggregation binds).
+///
+/// `post_binds` are derived bindings that fire after every aggregate has
+/// been computed; they ride inside the resulting `Aggregation`. Subquery
+/// callers pass `Vec::new()` because [`SubqueryPattern`] has no post-bind
+/// channel.
+fn lower_grouping(
+    opts: &UnresolvedOptions,
+    vars: &mut VarRegistry,
+    post_binds: Vec<(VarId, Expression)>,
+) -> Result<Option<Grouping>> {
+    let group_by: Vec<VarId> = opts
+        .group_by
+        .iter()
+        .map(|v| vars.get_or_insert(v))
+        .collect();
+    let aggregates: Vec<AggregateSpec> = opts
+        .aggregates
+        .iter()
+        .map(|a| lower_aggregate_spec(a, vars))
+        .collect();
+    let having = opts
+        .having
+        .as_ref()
+        .map(|e| lower_filter_expr(e, vars))
+        .transpose()?;
+
+    Ok(Grouping::assemble(group_by, aggregates, post_binds, having))
 }
 
 #[cfg(test)]

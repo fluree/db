@@ -6,19 +6,59 @@
 //! - HAVING filter on aggregated results
 //! - Full pipeline execution
 
-use fluree_db_core::{FlakeValue, GraphDbRef, LedgerSnapshot, NoOverlay, Sid};
-use fluree_db_query::aggregate::{AggregateFn, AggregateSpec};
+use fluree_db_core::{FlakeValue, GraphDbRef, LedgerSnapshot, NoOverlay, NonEmpty, Sid};
 use fluree_db_query::binding::Binding;
 use fluree_db_query::context::ExecutionContext;
 use fluree_db_query::execute::{execute, ContextConfig, ExecutableQuery};
 use fluree_db_query::groupby::GroupByOperator;
-use fluree_db_query::ir::QueryOptions;
-use fluree_db_query::ir::{Expression, FilterValue, Pattern};
+use fluree_db_query::ir::ReasoningConfig;
+use fluree_db_query::ir::{AggregateFn, AggregateSpec};
+use fluree_db_query::ir::{Aggregation, Expression, Grouping, Pattern};
 use fluree_db_query::ir::{Query, QueryOutput};
 use fluree_db_query::operator::Operator;
 use fluree_db_query::var_registry::{VarId, VarRegistry};
 use fluree_graph_json_ld::ParsedContext;
 use std::sync::Arc;
+
+fn aggregation(aggregates: Vec<AggregateSpec>) -> Aggregation {
+    Aggregation {
+        aggregates: NonEmpty::try_from_vec(aggregates).expect("non-empty aggregates"),
+        binds: Vec::new(),
+    }
+}
+
+fn explicit_grouping(by: Vec<VarId>, aggregates: Vec<AggregateSpec>) -> Grouping {
+    Grouping::Explicit {
+        group_by: NonEmpty::try_from_vec(by).expect("non-empty group_by"),
+        aggregation: NonEmpty::try_from_vec(aggregates).map(|aggregates| Aggregation {
+            aggregates,
+            binds: Vec::new(),
+        }),
+        having: None,
+    }
+}
+
+fn explicit_grouping_having(
+    by: Vec<VarId>,
+    aggregates: Vec<AggregateSpec>,
+    having: Expression,
+) -> Grouping {
+    Grouping::Explicit {
+        group_by: NonEmpty::try_from_vec(by).expect("non-empty group_by"),
+        aggregation: NonEmpty::try_from_vec(aggregates).map(|aggregates| Aggregation {
+            aggregates,
+            binds: Vec::new(),
+        }),
+        having: Some(having),
+    }
+}
+
+fn implicit_grouping(aggregates: Vec<AggregateSpec>) -> Grouping {
+    Grouping::Implicit {
+        aggregation: aggregation(aggregates),
+        having: None,
+    }
+}
 
 fn make_test_snapshot() -> LedgerSnapshot {
     LedgerSnapshot::genesis("test/main")
@@ -43,7 +83,11 @@ fn make_query(select: Vec<VarId>, patterns: Vec<Pattern>) -> Query {
         orig_context: None,
         output,
         patterns,
-        options: QueryOptions::default(),
+        grouping: None,
+        ordering: Vec::new(),
+        limit: None,
+        offset: None,
+        reasoning: ReasoningConfig::default(),
         post_values: None,
     }
 }
@@ -65,7 +109,7 @@ async fn test_group_by_with_count() {
     // LA, carol
     // LA, dan
     // LA, eve
-    let query = make_query(
+    let mut query = make_query(
         vec![VarId(0), VarId(1)], // SELECT ?city, ?count (where ?count will replace ?person)
         vec![Pattern::Values {
             vars: vec![VarId(0), VarId(1)], // ?city, ?person
@@ -94,17 +138,18 @@ async fn test_group_by_with_count() {
         }],
     );
 
-    let options = QueryOptions::new()
-        .with_group_by(vec![VarId(0)]) // GROUP BY ?city
-        .with_aggregates(vec![AggregateSpec {
+    query.grouping = Some(explicit_grouping(
+        vec![VarId(0)], // GROUP BY ?city
+        vec![AggregateSpec {
             function: AggregateFn::Count,
             input_var: Some(VarId(1)), // COUNT(?person)
             output_var: VarId(1),      // AS ?count (replaces ?person col)
             distinct: false,
-        }]);
+        }],
+    ));
 
     let db = GraphDbRef::new(&snapshot, 0, &NoOverlay, snapshot.t);
-    let executable = ExecutableQuery::new(query, options);
+    let executable = ExecutableQuery::new(query, ReasoningConfig::default());
     let results = execute(db, &vars, &executable, ContextConfig::default())
         .await
         .unwrap();
@@ -149,7 +194,7 @@ async fn test_group_by_with_sum() {
     // NYC, 100
     // NYC, 200
     // LA, 50
-    let query = make_query(
+    let mut query = make_query(
         vec![VarId(0), VarId(1)],
         vec![Pattern::Values {
             vars: vec![VarId(0), VarId(1)],
@@ -170,17 +215,18 @@ async fn test_group_by_with_sum() {
         }],
     );
 
-    let options = QueryOptions::new()
-        .with_group_by(vec![VarId(0)])
-        .with_aggregates(vec![AggregateSpec {
+    query.grouping = Some(explicit_grouping(
+        vec![VarId(0)],
+        vec![AggregateSpec {
             function: AggregateFn::Sum,
             input_var: Some(VarId(1)),
             output_var: VarId(1),
             distinct: false,
-        }]);
+        }],
+    ));
 
     let db = GraphDbRef::new(&snapshot, 0, &NoOverlay, snapshot.t);
-    let executable = ExecutableQuery::new(query, options);
+    let executable = ExecutableQuery::new(query, ReasoningConfig::default());
     let results = execute(db, &vars, &executable, ContextConfig::default())
         .await
         .unwrap();
@@ -222,7 +268,7 @@ async fn test_group_by_with_having() {
     let vars = VarRegistry::new();
 
     // Same data as test_group_by_with_count
-    let query = make_query(
+    let mut query = make_query(
         vec![VarId(0), VarId(1)],
         vec![Pattern::Values {
             vars: vec![VarId(0), VarId(1)],
@@ -252,21 +298,22 @@ async fn test_group_by_with_having() {
     );
 
     // HAVING ?count > 2 (only LA with count=3 passes)
-    let options = QueryOptions::new()
-        .with_group_by(vec![VarId(0)])
-        .with_aggregates(vec![AggregateSpec {
+    query.grouping = Some(explicit_grouping_having(
+        vec![VarId(0)],
+        vec![AggregateSpec {
             function: AggregateFn::Count,
             input_var: Some(VarId(1)),
             output_var: VarId(1),
             distinct: false,
-        }])
-        .with_having(Expression::gt(
+        }],
+        Expression::gt(
             Expression::Var(VarId(1)),
-            Expression::Const(FilterValue::Long(2)),
-        ));
+            Expression::Const(FlakeValue::Long(2)),
+        ),
+    ));
 
     let db = GraphDbRef::new(&snapshot, 0, &NoOverlay, snapshot.t);
-    let executable = ExecutableQuery::new(query, options);
+    let executable = ExecutableQuery::new(query, ReasoningConfig::default());
     let results = execute(db, &vars, &executable, ContextConfig::default())
         .await
         .unwrap();
@@ -291,7 +338,7 @@ async fn test_aggregates_without_group_by() {
     let vars = VarRegistry::new();
 
     // Input: 3 values
-    let query = make_query(
+    let mut query = make_query(
         vec![VarId(0)],
         vec![Pattern::Values {
             vars: vec![VarId(0)],
@@ -303,20 +350,16 @@ async fn test_aggregates_without_group_by() {
         }],
     );
 
-    // No GROUP BY, just COUNT
-    // This requires implicit single group behavior (all rows become one group)
-    // Note: This test would require GroupByOperator with empty group_vars
-    let options = QueryOptions::new()
-        .with_group_by(vec![]) // No group vars = implicit single group
-        .with_aggregates(vec![AggregateSpec {
-            function: AggregateFn::Sum,
-            input_var: Some(VarId(0)),
-            output_var: VarId(0),
-            distinct: false,
-        }]);
+    // No GROUP BY, just SUM — implicit single-group aggregation.
+    query.grouping = Some(implicit_grouping(vec![AggregateSpec {
+        function: AggregateFn::Sum,
+        input_var: Some(VarId(0)),
+        output_var: VarId(0),
+        distinct: false,
+    }]));
 
     let db = GraphDbRef::new(&snapshot, 0, &NoOverlay, snapshot.t);
-    let executable = ExecutableQuery::new(query, options);
+    let executable = ExecutableQuery::new(query, ReasoningConfig::default());
     let results = execute(db, &vars, &executable, ContextConfig::default())
         .await
         .unwrap();
@@ -429,7 +472,7 @@ async fn test_aggregate_avg() {
     let snapshot = make_test_snapshot();
     let vars = VarRegistry::new();
 
-    let query = make_query(
+    let mut query = make_query(
         vec![VarId(0), VarId(1)],
         vec![Pattern::Values {
             vars: vec![VarId(0), VarId(1)],
@@ -450,17 +493,18 @@ async fn test_aggregate_avg() {
         }],
     );
 
-    let options = QueryOptions::new()
-        .with_group_by(vec![VarId(0)])
-        .with_aggregates(vec![AggregateSpec {
+    query.grouping = Some(explicit_grouping(
+        vec![VarId(0)],
+        vec![AggregateSpec {
             function: AggregateFn::Avg,
             input_var: Some(VarId(1)),
             output_var: VarId(1),
             distinct: false,
-        }]);
+        }],
+    ));
 
     let db = GraphDbRef::new(&snapshot, 0, &NoOverlay, snapshot.t);
-    let executable = ExecutableQuery::new(query, options);
+    let executable = ExecutableQuery::new(query, ReasoningConfig::default());
     let results = execute(db, &vars, &executable, ContextConfig::default())
         .await
         .unwrap();
@@ -480,7 +524,7 @@ async fn test_aggregate_min_max() {
     let snapshot = make_test_snapshot();
     let vars = VarRegistry::new();
 
-    let query = make_query(
+    let mut query = make_query(
         vec![VarId(0), VarId(1), VarId(2)], // ?city, ?min, ?max
         vec![Pattern::Values {
             vars: vec![VarId(0), VarId(1), VarId(2)], // ?city, ?val1, ?val2 (we'll aggregate both)
@@ -504,9 +548,9 @@ async fn test_aggregate_min_max() {
         }],
     );
 
-    let options = QueryOptions::new()
-        .with_group_by(vec![VarId(0)])
-        .with_aggregates(vec![
+    query.grouping = Some(explicit_grouping(
+        vec![VarId(0)],
+        vec![
             AggregateSpec {
                 function: AggregateFn::Min,
                 input_var: Some(VarId(1)),
@@ -519,10 +563,11 @@ async fn test_aggregate_min_max() {
                 output_var: VarId(2),
                 distinct: false,
             },
-        ]);
+        ],
+    ));
 
     let db = GraphDbRef::new(&snapshot, 0, &NoOverlay, snapshot.t);
-    let executable = ExecutableQuery::new(query, options);
+    let executable = ExecutableQuery::new(query, ReasoningConfig::default());
     let results = execute(db, &vars, &executable, ContextConfig::default())
         .await
         .unwrap();
@@ -551,7 +596,7 @@ async fn test_order_by_on_grouped_var_errors() {
     let vars = VarRegistry::new();
 
     // VALUES ?city ?person ...
-    let query = make_query(
+    let mut query = make_query(
         vec![VarId(0), VarId(1)],
         vec![Pattern::Values {
             vars: vec![VarId(0), VarId(1)],
@@ -570,12 +615,11 @@ async fn test_order_by_on_grouped_var_errors() {
 
     // GROUP BY ?city, no aggregates: ?person becomes Grouped(...)
     // ORDER BY ?person is undefined -> should error.
-    let options = QueryOptions::new()
-        .with_group_by(vec![VarId(0)])
-        .with_order_by(vec![fluree_db_query::sort::SortSpec::asc(VarId(1))]);
+    query.grouping = Some(explicit_grouping(vec![VarId(0)], vec![]));
+    query.ordering = vec![fluree_db_query::sort::SortSpec::asc(VarId(1))];
 
     let db = GraphDbRef::new(&snapshot, 0, &NoOverlay, snapshot.t);
-    let executable = ExecutableQuery::new(query, options);
+    let executable = ExecutableQuery::new(query, ReasoningConfig::default());
     let err = execute(db, &vars, &executable, ContextConfig::default())
         .await
         .unwrap_err();
@@ -591,7 +635,7 @@ async fn test_aggregate_on_group_by_key_errors() {
     let snapshot = make_test_snapshot();
     let vars = VarRegistry::new();
 
-    let query = make_query(
+    let mut query = make_query(
         vec![VarId(0), VarId(1)],
         vec![Pattern::Values {
             vars: vec![VarId(0), VarId(1)],
@@ -609,14 +653,16 @@ async fn test_aggregate_on_group_by_key_errors() {
     );
 
     // Attempt to COUNT(?city) while also GROUP BY ?city.
-    let options = QueryOptions::new()
-        .with_group_by(vec![VarId(0)])
-        .with_aggregates(vec![AggregateSpec {
+    query.grouping = Some(explicit_grouping(
+        vec![VarId(0)],
+        vec![AggregateSpec {
             function: AggregateFn::Count,
             input_var: Some(VarId(0)), // key var
             output_var: VarId(0),
             distinct: false,
-        }]);
+        }],
+    ));
+    let options = ReasoningConfig::default();
 
     let db = GraphDbRef::new(&snapshot, 0, &NoOverlay, snapshot.t);
     let executable = ExecutableQuery::new(query, options);

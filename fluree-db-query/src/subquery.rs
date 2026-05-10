@@ -310,22 +310,16 @@ impl SubqueryOperator {
         )?;
 
         // Apply GROUP BY / aggregates / HAVING for subqueries that use them.
-        let needs_grouping =
-            !self.subquery.group_by.is_empty() || !self.subquery.aggregates.is_empty();
-        if needs_grouping {
-            operator = Box::new(GroupByOperator::new(
-                operator,
-                self.subquery.group_by.clone(),
-            ));
-        }
-        if !self.subquery.aggregates.is_empty() {
-            operator = Box::new(AggregateOperator::new(
-                operator,
-                self.subquery.aggregates.clone(),
-            ));
-        }
-        if let Some(ref having) = self.subquery.having {
-            operator = Box::new(HavingOperator::new(operator, having.clone()));
+        if let Some(grouping) = &self.subquery.grouping {
+            let group_by: Vec<_> = grouping.group_by_vars().collect();
+            let aggregates: Vec<_> = grouping.aggregates().cloned().collect();
+            operator = Box::new(GroupByOperator::new(operator, group_by));
+            if !aggregates.is_empty() {
+                operator = Box::new(AggregateOperator::new(operator, aggregates));
+            }
+            if let Some(having) = grouping.having().cloned() {
+                operator = Box::new(HavingOperator::new(operator, having));
+            }
         }
 
         // Project to subquery select list before DISTINCT/ORDER BY/OFFSET/LIMIT so those modifiers
@@ -338,8 +332,8 @@ impl SubqueryOperator {
         if self.subquery.distinct {
             operator = Box::new(DistinctOperator::new(operator));
         }
-        if !self.subquery.order_by.is_empty() {
-            operator = Box::new(SortOperator::new(operator, self.subquery.order_by.clone()));
+        if !self.subquery.ordering.is_empty() {
+            operator = Box::new(SortOperator::new(operator, self.subquery.ordering.clone()));
         }
         if let Some(offset) = self.subquery.offset {
             operator = Box::new(OffsetOperator::new(operator, offset));

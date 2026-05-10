@@ -15,7 +15,7 @@ use fluree_db_core::value::FlakeValue;
 use fluree_db_core::{GraphDbRef, LedgerSnapshot, Sid};
 use fluree_db_query::binding::{Binding, RowAccess};
 use fluree_db_query::execute::{execute, ContextConfig, ExecutableQuery};
-use fluree_db_query::ir::QueryOptions;
+use fluree_db_query::ir::ReasoningConfig;
 use fluree_db_query::ir::ReasoningModes;
 use fluree_db_query::parse::{parse_query, MemoryEncoder};
 use fluree_db_query::var_registry::VarRegistry;
@@ -302,7 +302,7 @@ async fn owl2rl_domain_range_and_chain_visible_via_execute_with_overlay() {
     // Run without owl2rl: should be empty (no explicit rdf:type triples).
     let exec_no = ExecutableQuery::new(
         parsed_a.clone(),
-        QueryOptions::new().with_reasoning(ReasoningModes::default()),
+        ReasoningConfig::new().with_modes(ReasoningModes::default()),
     );
     let source = GraphDbRef::new(&snapshot, 0, &overlay, 10);
     let res_no = execute(source, &vars_a, &exec_no, ContextConfig::default())
@@ -317,7 +317,7 @@ async fn owl2rl_domain_range_and_chain_visible_via_execute_with_overlay() {
     // Run with owl2rl: domain/range should materialize rdf:type(x, Person).
     let exec_yes = ExecutableQuery::new(
         parsed_a,
-        QueryOptions::new().with_reasoning(ReasoningModes::default().with_owl2rl()),
+        ReasoningConfig::new().with_modes(ReasoningModes::default().with_owl2rl()),
     );
     let source = GraphDbRef::new(&snapshot, 0, &overlay, 10);
     let res_yes = execute(source, &vars_a, &exec_yes, ContextConfig::default())
@@ -366,7 +366,7 @@ async fn owl2rl_domain_range_and_chain_visible_via_execute_with_overlay() {
 
     let exec_chain = ExecutableQuery::new(
         parsed_b,
-        QueryOptions::new().with_reasoning(ReasoningModes::default().with_owl2rl()),
+        ReasoningConfig::new().with_modes(ReasoningModes::default().with_owl2rl()),
     );
     let source = GraphDbRef::new(&snapshot, 0, &overlay, 10);
     let res_chain = execute(source, &vars_b, &exec_chain, ContextConfig::default())

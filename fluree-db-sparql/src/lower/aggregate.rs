@@ -7,8 +7,8 @@
 use crate::ast::expr::{AggregateFunction, Expression};
 use crate::ast::query::{SelectClause, SelectVariable, SelectVariables};
 
-use fluree_db_query::aggregate::{AggregateFn, AggregateSpec};
 use fluree_db_query::ir::Pattern;
+use fluree_db_query::ir::{AggregateFn, AggregateSpec};
 use fluree_db_query::parse::encode::IriEncoder;
 use fluree_db_query::var_registry::VarId;
 

@@ -48,7 +48,7 @@ pub fn eval_coalesce<R: RowAccess>(
 mod tests {
     use super::*;
     use crate::binding::BindingRow;
-    use crate::ir::{FilterValue, Function};
+    use crate::ir::{FlakeValue, Function};
     use crate::var_registry::VarId;
 
     #[test]
@@ -59,12 +59,12 @@ mod tests {
                 Expression::call(
                     Function::StrStarts,
                     vec![
-                        Expression::Const(FilterValue::Long(1)),
-                        Expression::Const(FilterValue::String("x".to_string())),
+                        Expression::Const(FlakeValue::Long(1)),
+                        Expression::Const(FlakeValue::String("x".to_string())),
                     ],
                 ),
-                Expression::Const(FilterValue::String("then".to_string())),
-                Expression::Const(FilterValue::String("else".to_string())),
+                Expression::Const(FlakeValue::String("then".to_string())),
+                Expression::Const(FlakeValue::String("else".to_string())),
             ],
         );
 

@@ -47,6 +47,7 @@ pub mod index_stats;
 pub mod ledger_config;
 pub mod ledger_id;
 pub mod namespaces;
+pub mod nonempty;
 pub mod ns_encoding;
 pub mod ns_vec_bi_dict;
 pub mod o_type;
@@ -127,6 +128,7 @@ pub use namespaces::{
     is_rdf_type, is_rdfs_domain, is_rdfs_range, is_rdfs_subclass_of, is_rdfs_subproperty_of,
     is_schema_class, is_schema_predicate,
 };
+pub use nonempty::NonEmpty;
 pub use ns_encoding::{
     builtin_prefix_trie, canonical_split, NamespaceCodes, NsAllocError, NsLookup, NsSplitMode,
     HOST_PLUS_N_MAX,

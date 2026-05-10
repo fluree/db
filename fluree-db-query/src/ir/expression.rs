@@ -4,6 +4,7 @@
 
 use super::pattern::Pattern;
 use crate::var_registry::VarId;
+use fluree_db_core::value::FlakeValue;
 
 /// Filter expression AST
 ///
@@ -14,7 +15,7 @@ pub enum Expression {
     /// Variable reference
     Var(VarId),
     /// Constant value
-    Const(FilterValue),
+    Const(FlakeValue),
     /// Function call (includes operators like +, -, =, AND, OR, etc.)
     Call {
         func: Function,
@@ -76,74 +77,63 @@ impl Expression {
     // Constructors for common expression types
     // =========================================================================
 
-    /// Create a comparison expression
-    pub fn compare(op: impl Into<Function>, left: Expression, right: Expression) -> Self {
-        Expression::Call {
-            func: op.into(),
-            args: vec![left, right],
-        }
+    /// Create a binary call expression: `func(left, right)`.
+    pub fn binary(func: impl Into<Function>, left: Expression, right: Expression) -> Self {
+        Self::call(func.into(), vec![left, right])
     }
 
     /// Create an equality comparison
     pub fn eq(left: Expression, right: Expression) -> Self {
-        Self::compare(Function::Eq, left, right)
+        Self::binary(Function::Eq, left, right)
     }
 
     /// Create a not-equal comparison
     pub fn ne(left: Expression, right: Expression) -> Self {
-        Self::compare(Function::Ne, left, right)
+        Self::binary(Function::Ne, left, right)
     }
 
     /// Create a less-than comparison
     pub fn lt(left: Expression, right: Expression) -> Self {
-        Self::compare(Function::Lt, left, right)
+        Self::binary(Function::Lt, left, right)
     }
 
     /// Create a less-than-or-equal comparison
     pub fn le(left: Expression, right: Expression) -> Self {
-        Self::compare(Function::Le, left, right)
+        Self::binary(Function::Le, left, right)
     }
 
     /// Create a greater-than comparison
     pub fn gt(left: Expression, right: Expression) -> Self {
-        Self::compare(Function::Gt, left, right)
+        Self::binary(Function::Gt, left, right)
     }
 
     /// Create a greater-than-or-equal comparison
     pub fn ge(left: Expression, right: Expression) -> Self {
-        Self::compare(Function::Ge, left, right)
-    }
-
-    /// Create an arithmetic expression
-    pub fn arithmetic(op: impl Into<Function>, left: Expression, right: Expression) -> Self {
-        Expression::Call {
-            func: op.into(),
-            args: vec![left, right],
-        }
+        Self::binary(Function::Ge, left, right)
     }
 
     /// Create an addition expression
     #[allow(clippy::should_implement_trait)]
     pub fn add(left: Expression, right: Expression) -> Self {
-        Self::arithmetic(Function::Add, left, right)
+        Self::binary(Function::Add, left, right)
     }
 
     /// Create a subtraction expression
     #[allow(clippy::should_implement_trait)]
     pub fn sub(left: Expression, right: Expression) -> Self {
-        Self::arithmetic(Function::Sub, left, right)
+        Self::binary(Function::Sub, left, right)
     }
 
     /// Create a multiplication expression
     #[allow(clippy::should_implement_trait)]
     pub fn mul(left: Expression, right: Expression) -> Self {
-        Self::arithmetic(Function::Mul, left, right)
+        Self::binary(Function::Mul, left, right)
     }
 
     /// Create a division expression
     #[allow(clippy::should_implement_trait)]
     pub fn div(left: Expression, right: Expression) -> Self {
-        Self::arithmetic(Function::Div, left, right)
+        Self::binary(Function::Div, left, right)
     }
 
     /// Create a unary negation expression
@@ -353,17 +343,6 @@ impl std::fmt::Display for ArithmeticOp {
     }
 }
 
-/// Constant value in filter expressions
-#[derive(Debug, Clone, PartialEq)]
-pub enum FilterValue {
-    Long(i64),
-    Double(f64),
-    String(String),
-    Bool(bool),
-    /// Temporal or duration value (wraps any temporal/duration FlakeValue)
-    Temporal(fluree_db_core::value::FlakeValue),
-}
-
 // =============================================================================
 // From implementations for lowering unresolved AST types
 // =============================================================================
@@ -392,14 +371,14 @@ impl From<ArithmeticOp> for Function {
     }
 }
 
-impl From<&crate::parse::ast::UnresolvedFilterValue> for FilterValue {
+impl From<&crate::parse::ast::UnresolvedFilterValue> for FlakeValue {
     fn from(val: &crate::parse::ast::UnresolvedFilterValue) -> Self {
         use crate::parse::ast::UnresolvedFilterValue;
         match val {
-            UnresolvedFilterValue::Long(l) => FilterValue::Long(*l),
-            UnresolvedFilterValue::Double(d) => FilterValue::Double(*d),
-            UnresolvedFilterValue::String(s) => FilterValue::String(s.to_string()),
-            UnresolvedFilterValue::Bool(b) => FilterValue::Bool(*b),
+            UnresolvedFilterValue::Long(l) => FlakeValue::Long(*l),
+            UnresolvedFilterValue::Double(d) => FlakeValue::Double(*d),
+            UnresolvedFilterValue::String(s) => FlakeValue::String(s.to_string()),
+            UnresolvedFilterValue::Bool(b) => FlakeValue::Boolean(*b),
         }
     }
 }
@@ -590,7 +569,7 @@ mod tests {
         // Range-safe: ?x > 10
         let expr = Expression::gt(
             Expression::Var(VarId(0)),
-            Expression::Const(FilterValue::Long(10)),
+            Expression::Const(FlakeValue::Long(10)),
         );
         assert!(expr.is_range_safe());
 
@@ -598,11 +577,11 @@ mod tests {
         let and_expr = Expression::and(vec![
             Expression::ge(
                 Expression::Var(VarId(0)),
-                Expression::Const(FilterValue::Long(18)),
+                Expression::Const(FlakeValue::Long(18)),
             ),
             Expression::lt(
                 Expression::Var(VarId(0)),
-                Expression::Const(FilterValue::Long(65)),
+                Expression::Const(FlakeValue::Long(65)),
             ),
         ]);
         assert!(and_expr.is_range_safe());
@@ -610,7 +589,7 @@ mod tests {
         // Not range-safe: OR
         let or_expr = Expression::or(vec![Expression::eq(
             Expression::Var(VarId(0)),
-            Expression::Const(FilterValue::Long(1)),
+            Expression::Const(FlakeValue::Long(1)),
         )]);
         assert!(!or_expr.is_range_safe());
     }

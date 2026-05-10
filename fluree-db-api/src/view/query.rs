@@ -488,12 +488,12 @@ impl Fluree {
         // Apply wrapper reasoning if applicable
         if db.reasoning().is_some() {
             // Check query's reasoning state
-            let query_has_reasoning = executable.options.reasoning.has_any_enabled();
-            let query_disabled = executable.options.reasoning.is_disabled();
+            let query_has_reasoning = executable.reasoning.modes.has_any_enabled();
+            let query_disabled = executable.reasoning.modes.is_disabled();
 
             // Apply precedence rules
             if let Some(effective) = db.effective_reasoning(query_has_reasoning, query_disabled) {
-                executable.options.reasoning = effective.clone();
+                executable.reasoning.modes = effective.clone();
             }
         }
 
@@ -501,10 +501,10 @@ impl Fluree {
         if !db.datalog_override_allowed() {
             // Config override denied — force config settings
             if !db.datalog_enabled() {
-                executable.options.reasoning.datalog = false;
+                executable.reasoning.modes.datalog = false;
             }
             if !db.query_time_rules_allowed() {
-                executable.options.reasoning.rules.clear();
+                executable.reasoning.modes.rules.clear();
             }
         }
 
@@ -515,7 +515,7 @@ impl Fluree {
     }
 
     /// Resolve the schema bundle from the ledger's reasoning config and attach
-    /// the projected schema flakes to `executable.options.schema_bundle`.
+    /// the projected schema flakes to `executable.reasoning.schema_bundle`.
     ///
     /// Short-circuits in three cases (no bundle is built, no error is
     /// raised):
@@ -533,7 +533,7 @@ impl Fluree {
         db: &GraphDb,
         executable: &mut ExecutableQuery,
     ) -> Result<()> {
-        if executable.options.reasoning.is_disabled() {
+        if executable.reasoning.modes.is_disabled() {
             return Ok(());
         }
         let Some(resolved) = db.resolved_config() else {
@@ -565,7 +565,7 @@ impl Fluree {
         )
         .await?;
 
-        executable.options.schema_bundle = Some(flakes);
+        executable.reasoning.schema_bundle = Some(flakes);
         Ok(())
     }
 

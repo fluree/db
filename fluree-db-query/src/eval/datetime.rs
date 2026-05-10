@@ -309,7 +309,7 @@ fn fast_datetime_component_from_binding(
             }
             // Numeric gYear encoding fallback (see helpers.rs::flake_value_to_datetime()).
             FlakeValue::Long(year) => {
-                let dts = &*crate::expression::helpers::WELL_KNOWN_DATATYPES;
+                let dts = &*crate::eval::helpers::WELL_KNOWN_DATATYPES;
                 if *dtc.datatype() == dts.xsd_g_year {
                     extract_from_parts(*year, 1, 1, 0, 0)
                 } else {

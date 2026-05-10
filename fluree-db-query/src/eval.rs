@@ -1,35 +1,52 @@
-//! Core filter expression evaluation
+//! Function evaluation module
 //!
-//! This module provides the main evaluation methods on Expression:
-//! - `eval_to_bool()` - evaluate to boolean
-//! - `eval_to_binding*()` - evaluate to Binding for BIND operator
-//! - `eval_to_comparable()` - evaluate to ComparableValue
+//! This module provides unified evaluation of SPARQL expressions and functions.
+//! It contains all function implementations organized by category, as well as
+//! the core expression evaluation logic on `Expression` (`eval_to_bool`,
+//! `eval_to_binding*`, `eval_to_comparable`).
+//!
+//! # Module Structure
+//!
+//! - `value`: ComparableValue type and conversions
+//! - `compare`: Value comparison logic
+//! - `helpers`: Shared utilities (regex caching, arity checks, etc.)
+//! - `dispatch`: Main function dispatcher
+//! - Category submodules: `string`, `numeric`, `datetime`, `hash`, `uuid`,
+//!   `vector`, `geo`, `types`, `rdf`, `conditional`, `fluree`, `arithmetic`, `logical`
 
-use super::helpers::{eval_cached_bool_predicate, PreparedBoolExpression};
-use super::value::ComparableValue;
+mod arithmetic;
+mod cast;
+mod compare;
+mod conditional;
+mod datetime;
+mod dispatch;
+mod fluree;
+mod fulltext;
+mod geo;
+mod hash;
+mod helpers;
+mod logical;
+mod numeric;
+mod rdf;
+mod string;
+mod types;
+mod uuid;
+mod value;
+mod vector;
+pub mod vector_math;
+
+pub use helpers::PreparedBoolExpression;
+pub use value::{ArithmeticError, ComparableValue, ComparisonError, NullValueError};
+
 use crate::binding::{Binding, BindingRow, RowAccess};
 use crate::context::ExecutionContext;
 use crate::error::{QueryError, Result};
-use crate::ir::{Expression, FilterValue};
+use crate::ir::{Expression, FlakeValue};
 use crate::var_registry::VarId;
+use helpers::eval_cached_bool_predicate;
 use std::sync::Arc;
 
 impl Expression {
-    fn decode_lookup_error(
-        kind: &'static str,
-        details: impl Into<String>,
-        err: impl std::fmt::Display,
-    ) -> QueryError {
-        let details = details.into();
-        tracing::debug!(
-            kind,
-            details = %details,
-            error = %err,
-            "dictionary lookup failure during expression evaluation"
-        );
-        QueryError::dictionary_lookup(format!("{kind}: {details}: {err}"))
-    }
-
     pub(crate) fn eval_to_bool_uncached<R: RowAccess>(
         &self,
         row: &R,
@@ -41,7 +58,7 @@ impl Expression {
             Expression::Const(val) => {
                 // Constant as boolean
                 match val {
-                    FilterValue::Bool(b) => Ok(*b),
+                    FlakeValue::Boolean(b) => Ok(*b),
                     _ => Ok(true), // Non-bool constants are truthy
                 }
             }
@@ -113,7 +130,7 @@ impl Expression {
                         return Ok(None);
                     };
                     let val = decoded.map_err(|e| {
-                        Self::decode_lookup_error(
+                        decode_lookup_error(
                             "decode encoded literal",
                             format!(
                                 "o_kind={o_kind}, o_key={o_key}, p_id={p_id}, dt_id={dt_id}, lang_id={lang_id}"
@@ -134,7 +151,7 @@ impl Expression {
                     };
                     match resolved {
                         Ok(iri) => Ok(Some(ComparableValue::Iri(Arc::from(iri)))),
-                        Err(e) => Err(Self::decode_lookup_error(
+                        Err(e) => Err(decode_lookup_error(
                             "resolve subject IRI",
                             format!("s_id={s_id}"),
                             e,
@@ -159,7 +176,9 @@ impl Expression {
                 }
             },
 
-            Expression::Const(val) => Ok(Some(val.into())),
+            // FlakeValue::Null is the only variant TryFrom rejects (with
+            // NullValueError); a constant Null evaluates to "no value".
+            Expression::Const(val) => Ok(val.try_into().ok()),
 
             Expression::Call { func, args } => func.eval(args, row, ctx),
 
@@ -267,6 +286,21 @@ pub fn passes_filters(
     Ok(true)
 }
 
+fn decode_lookup_error(
+    kind: &'static str,
+    details: impl Into<String>,
+    err: impl std::fmt::Display,
+) -> QueryError {
+    let details = details.into();
+    tracing::debug!(
+        kind,
+        details = %details,
+        error = %err,
+        "dictionary lookup failure during expression evaluation"
+    );
+    QueryError::dictionary_lookup(format!("{kind}: {details}: {err}"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -311,7 +345,7 @@ mod tests {
         // ?age > 20
         let expr = Expression::gt(
             Expression::Var(VarId(0)),
-            Expression::Const(FilterValue::Long(20)),
+            Expression::Const(FlakeValue::Long(20)),
         );
 
         // Row 0: age=25 > 20 → true
@@ -335,11 +369,11 @@ mod tests {
         let expr = Expression::and(vec![
             Expression::gt(
                 Expression::Var(VarId(0)),
-                Expression::Const(FilterValue::Long(20)),
+                Expression::Const(FlakeValue::Long(20)),
             ),
             Expression::lt(
                 Expression::Var(VarId(0)),
-                Expression::Const(FilterValue::Long(28)),
+                Expression::Const(FlakeValue::Long(28)),
             ),
         ]);
 
@@ -360,11 +394,11 @@ mod tests {
         let expr = Expression::or(vec![
             Expression::lt(
                 Expression::Var(VarId(0)),
-                Expression::Const(FilterValue::Long(20)),
+                Expression::Const(FlakeValue::Long(20)),
             ),
             Expression::gt(
                 Expression::Var(VarId(0)),
-                Expression::Const(FilterValue::Long(28)),
+                Expression::Const(FlakeValue::Long(28)),
             ),
         ]);
 
@@ -388,7 +422,7 @@ mod tests {
         // NOT(?age > 25)
         let expr = Expression::not(Expression::gt(
             Expression::Var(VarId(0)),
-            Expression::Const(FilterValue::Long(25)),
+            Expression::Const(FlakeValue::Long(25)),
         ));
 
         // Row 0: age=25 → NOT(25 > 25) = NOT(false) = true

@@ -110,10 +110,10 @@ impl PredicateGroupCountFirstsOperator {
     }
 
     async fn open_fallback(&mut self, ctx: &ExecutionContext<'_>) -> Result<()> {
-        use crate::aggregate::AggregateFn;
         use crate::dataset_operator::DatasetOperator;
         use crate::group_aggregate::{GroupAggregateOperator, StreamingAggSpec};
         use crate::ir::triple::{Ref, TriplePattern};
+        use crate::ir::AggregateFn;
         use crate::limit::LimitOperator;
         use crate::sort::{SortDirection, SortOperator, SortSpec};
 
@@ -362,10 +362,10 @@ impl PredicateObjectCountFirstsOperator {
     }
 
     async fn open_fallback(&mut self, ctx: &ExecutionContext<'_>) -> Result<()> {
-        use crate::aggregate::AggregateFn;
         use crate::dataset_operator::DatasetOperator;
         use crate::group_aggregate::{GroupAggregateOperator, StreamingAggSpec};
         use crate::ir::triple::{Ref, TriplePattern};
+        use crate::ir::AggregateFn;
 
         let tp = TriplePattern::new(
             Ref::Var(self.subject_var),
@@ -1107,18 +1107,6 @@ impl Operator for GroupByObjectStarTopKOperator {
     }
 }
 
-fn ref_to_sid_group(store: &BinaryIndexStore, r: &crate::ir::triple::Ref) -> Result<Sid> {
-    Ok(match r {
-        crate::ir::triple::Ref::Sid(s) => s.clone(),
-        crate::ir::triple::Ref::Iri(i) => store.encode_iri(i),
-        crate::ir::triple::Ref::Var(_) => {
-            return Err(QueryError::Internal(
-                "group-by-object star fast path requires bound predicates".into(),
-            ))
-        }
-    })
-}
-
 fn build_psot_cursor_for_predicate_group(
     ctx: &ExecutionContext<'_>,
     store: &Arc<BinaryIndexStore>,
@@ -1248,7 +1236,7 @@ fn collect_subject_set_for_predicate_group(
         .map(fluree_db_core::OverlayProvider::epoch)
         .unwrap_or(0)
         != 0;
-    let sid = ref_to_sid_group(store, pred)?;
+    let sid = normalize_pred_sid(store, pred)?;
     let Some(p_id) = store.sid_to_p_id(&sid) else {
         return if overlay_has_rows {
             Ok(None)
@@ -1312,7 +1300,7 @@ fn compute_group_by_object_star_topk(
         .unwrap_or(0)
         != 0;
     // Scan group predicate PSOT for (s_id, o_type, o_key).
-    let sid = ref_to_sid_group(store, group_pred)?;
+    let sid = normalize_pred_sid(store, group_pred)?;
     let Some(p_id) = store.sid_to_p_id(&sid) else {
         return if overlay_has_rows {
             Ok(None)
@@ -1343,7 +1331,7 @@ fn compute_group_by_object_star_topk(
     // Preferred path (fast + low-memory): merge-join on subject IDs when there is exactly one filter predicate.
     if filter_preds.len() == 1 {
         let fp = &filter_preds[0];
-        let fp_sid = ref_to_sid_group(store, fp)?;
+        let fp_sid = normalize_pred_sid(store, fp)?;
         let Some(fp_id) = store.sid_to_p_id(&fp_sid) else {
             return if overlay_has_rows {
                 Ok(None)

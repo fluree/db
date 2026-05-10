@@ -20,10 +20,10 @@
 use crate::binding::{Batch, Binding};
 use crate::context::ExecutionContext;
 use crate::error::Result;
+use crate::eval::PreparedBoolExpression;
 use crate::execute::build_where_operators_seeded;
-use crate::expression::PreparedBoolExpression;
 use crate::ir::triple::Ref;
-use crate::ir::{Expression, FilterValue, Pattern};
+use crate::ir::{Expression, FlakeValue, Pattern};
 use crate::operator::{BoxedOperator, Operator, OperatorState};
 use crate::seed::{EmptyOperator, SeedOperator};
 use crate::var_registry::VarId;
@@ -126,7 +126,7 @@ fn collect_simple_exists_keys(expr: &Expression, out: &mut Vec<(VarId, Ref)>) {
             if !tp.p_bound() {
                 return;
             }
-            if !matches!(tp.o, crate::ir::triple::Term::Var(_)) {
+            if tp.o.is_bound() {
                 return;
             }
             if tp.dtc.is_some() {
@@ -282,7 +282,7 @@ fn pre_resolve_uncorrelated<'a>(
                 if is_uncorrelated_exists(patterns, batch_schema) {
                     let result =
                         eval_exists_uncorrelated(patterns, *negated, ctx, planning).await?;
-                    Ok(Expression::Const(FilterValue::Bool(result)))
+                    Ok(Expression::Const(FlakeValue::Boolean(result)))
                 } else {
                     Ok(expr.clone())
                 }
@@ -329,7 +329,7 @@ fn try_eval_simple_exists_semijoin(
     if !tp.p_bound() {
         return Ok(None);
     }
-    if !matches!(tp.o, crate::ir::triple::Term::Var(_)) {
+    if tp.o.is_bound() {
         return Ok(None);
     }
     let Some(pred_sid) = try_normalize_pred_sid(store, &tp.p) else {
@@ -379,13 +379,13 @@ fn resolve_exists_for_row<'a>(
                     if let Some(result) =
                         try_eval_simple_exists_semijoin(patterns, *negated, batch, row_idx, ctx, c)?
                     {
-                        return Ok(Expression::Const(FilterValue::Bool(result)));
+                        return Ok(Expression::Const(FlakeValue::Boolean(result)));
                     }
                 }
 
                 let result =
                     eval_exists_for_row(patterns, *negated, batch, row_idx, ctx, planning).await?;
-                Ok(Expression::Const(FilterValue::Bool(result)))
+                Ok(Expression::Const(FlakeValue::Boolean(result)))
             }
             Expression::Call { func, args } => {
                 let mut resolved_args = Vec::with_capacity(args.len());
@@ -597,7 +597,7 @@ impl Operator for FilterOperator {
 mod tests {
     use super::*;
     use crate::ir::triple::{Ref, Term, TriplePattern};
-    use crate::ir::FilterValue;
+    use crate::ir::FlakeValue;
     use fluree_db_core::Sid;
 
     #[test]
@@ -607,7 +607,7 @@ mod tests {
 
     #[test]
     fn contains_exists_false_for_const() {
-        assert!(!contains_exists(&Expression::Const(FilterValue::Bool(
+        assert!(!contains_exists(&Expression::Const(FlakeValue::Boolean(
             true
         ))));
     }
@@ -646,7 +646,7 @@ mod tests {
     fn contains_exists_false_for_plain_call() {
         let eq = Expression::eq(
             Expression::Var(VarId(0)),
-            Expression::Const(FilterValue::Long(42)),
+            Expression::Const(FlakeValue::Long(42)),
         );
         assert!(!contains_exists(&eq));
     }
@@ -658,10 +658,10 @@ mod tests {
             patterns: vec![],
             negated: false,
         };
-        let inner_or = Expression::or(vec![Expression::Const(FilterValue::Bool(true)), exists]);
+        let inner_or = Expression::or(vec![Expression::Const(FlakeValue::Boolean(true)), exists]);
         let gt = Expression::gt(
             Expression::Var(VarId(0)),
-            Expression::Const(FilterValue::Long(5)),
+            Expression::Const(FlakeValue::Long(5)),
         );
         let and = Expression::and(vec![inner_or, gt]);
         assert!(contains_exists(&and));

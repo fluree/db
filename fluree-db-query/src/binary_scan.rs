@@ -258,7 +258,7 @@ fn compile_encoded_pre_filters_and_prune_inline_ops(
     store: &BinaryIndexStore,
     allow_string_prefix_pushdown: bool,
 ) -> (Vec<EncodedPreFilter>, Vec<InlineOperator>) {
-    use crate::ir::{Expression, FilterValue, Function};
+    use crate::ir::{Expression, FlakeValue, Function};
 
     let obj_var = match &pattern.o {
         Term::Var(v) => Some(*v),
@@ -324,7 +324,7 @@ fn compile_encoded_pre_filters_and_prune_inline_ops(
             _ => false,
         };
         if is_lang_o(&args[0]) {
-            if let Expression::Const(FilterValue::String(tag)) = &args[1] {
+            if let Expression::Const(FlakeValue::String(tag)) = &args[1] {
                 if let Some(lang_id) = store.resolve_lang_id(tag) {
                     let required_otype =
                         fluree_db_core::o_type::OType::lang_string(lang_id).as_u16();
@@ -336,7 +336,7 @@ fn compile_encoded_pre_filters_and_prune_inline_ops(
             continue;
         }
         if is_lang_o(&args[1]) {
-            if let Expression::Const(FilterValue::String(tag)) = &args[0] {
+            if let Expression::Const(FlakeValue::String(tag)) = &args[0] {
                 if let Some(lang_id) = store.resolve_lang_id(tag) {
                     let required_otype =
                         fluree_db_core::o_type::OType::lang_string(lang_id).as_u16();
@@ -401,7 +401,7 @@ fn extract_object_string_prefix(
     obj_var: Option<VarId>,
     pattern_dtc: Option<&DatatypeConstraint>,
 ) -> Option<Arc<str>> {
-    use crate::ir::{FilterValue, Function};
+    use crate::ir::{FlakeValue, Function};
 
     let ov = obj_var?;
     let allow_str_wrapper = string_literal_str_wrapper_safe(pattern_dtc);
@@ -412,7 +412,7 @@ fn extract_object_string_prefix(
             if !is_object_input(&args[0]) {
                 return None;
             }
-            let Expression::Const(FilterValue::String(prefix)) = &args[1] else {
+            let Expression::Const(FlakeValue::String(prefix)) = &args[1] else {
                 return None;
             };
             (!prefix.is_empty()).then(|| Arc::from(prefix.as_str()))
@@ -424,11 +424,11 @@ fn extract_object_string_prefix(
             if !is_object_input(&args[0]) {
                 return None;
             }
-            let Expression::Const(FilterValue::String(pattern)) = &args[1] else {
+            let Expression::Const(FlakeValue::String(pattern)) = &args[1] else {
                 return None;
             };
             if args.len() == 3 {
-                let Expression::Const(FilterValue::String(flags)) = &args[2] else {
+                let Expression::Const(FlakeValue::String(flags)) = &args[2] else {
                     return None;
                 };
                 if !flags.is_empty() {

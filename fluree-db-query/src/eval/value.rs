@@ -1,12 +1,12 @@
 //! ComparableValue type and conversions
 //!
-//! This module contains the intermediate value type used during filter evaluation,
-//! along with conversions to/from FlakeValue and FilterValue.
+//! This module contains the intermediate value type used during filter
+//! evaluation, along with conversions to/from FlakeValue.
 
 use crate::binding::Binding;
 use crate::context::ExecutionContext;
 use crate::error::QueryError;
-use crate::ir::{ArithmeticOp, FilterValue};
+use crate::ir::ArithmeticOp;
 use bigdecimal::BigDecimal;
 use fluree_db_core::temporal::{
     Date as FlureeDate, DateTime as FlureeDateTime, Time as FlureeTime,
@@ -480,37 +480,6 @@ impl From<Arc<str>> for ComparableValue {
 }
 
 // =============================================================================
-// Conversions from FilterValue
-// =============================================================================
-
-impl From<FilterValue> for ComparableValue {
-    fn from(val: FilterValue) -> Self {
-        match val {
-            FilterValue::Long(n) => ComparableValue::Long(n),
-            FilterValue::Double(d) => ComparableValue::Double(d),
-            FilterValue::String(s) => ComparableValue::String(Arc::from(s)),
-            FilterValue::Bool(b) => ComparableValue::Bool(b),
-            FilterValue::Temporal(fv) => ComparableValue::TypedLiteral { val: fv, dtc: None },
-        }
-    }
-}
-
-impl From<&FilterValue> for ComparableValue {
-    fn from(val: &FilterValue) -> Self {
-        match val {
-            FilterValue::Long(n) => ComparableValue::Long(*n),
-            FilterValue::Double(d) => ComparableValue::Double(*d),
-            FilterValue::String(s) => ComparableValue::String(Arc::from(s.as_str())),
-            FilterValue::Bool(b) => ComparableValue::Bool(*b),
-            FilterValue::Temporal(fv) => ComparableValue::TypedLiteral {
-                val: fv.clone(),
-                dtc: None,
-            },
-        }
-    }
-}
-
-// =============================================================================
 // Conversions from FlakeValue
 // =============================================================================
 
@@ -694,19 +663,6 @@ mod tests {
         let fv_null = FlakeValue::Null;
         let cv_null = ComparableValue::try_from(&fv_null);
         assert_eq!(cv_null, Err(NullValueError));
-    }
-
-    #[test]
-    fn test_from_filter_value() {
-        // Reference conversion
-        let fv = FilterValue::String("hello".to_string());
-        let cv: ComparableValue = (&fv).into();
-        assert_eq!(cv, ComparableValue::String(Arc::from("hello")));
-
-        // Owned conversion
-        let fv_owned = FilterValue::String("world".to_string());
-        let cv_owned: ComparableValue = fv_owned.into();
-        assert_eq!(cv_owned, ComparableValue::String(Arc::from("world")));
     }
 
     #[test]

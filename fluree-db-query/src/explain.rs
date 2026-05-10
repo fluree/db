@@ -941,7 +941,7 @@ mod tests {
 
     #[test]
     fn test_explain_execution_hints_reports_fused_property_join() {
-        use crate::ir::{Expression, FilterValue, Function, Pattern};
+        use crate::ir::{Expression, FlakeValue, Function, Pattern};
 
         let s = VarId(0);
         let patterns = vec![
@@ -966,7 +966,7 @@ mod tests {
                         func: Function::Str,
                         args: vec![Expression::Var(VarId(3))],
                     },
-                    Expression::Const(FilterValue::String("Closed".to_string())),
+                    Expression::Const(FlakeValue::String("Closed".to_string())),
                 ],
             })),
         ];

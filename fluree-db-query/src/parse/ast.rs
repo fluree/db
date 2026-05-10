@@ -1081,6 +1081,18 @@ impl UnresolvedPattern {
     }
 }
 
+/// User-declared select shape from the input syntax. Parser-only — lowered
+/// into a `Projection` variant in the IR.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SelectShape {
+    /// Array-form select: each row is a tuple. Default; SPARQL and JSON-LD
+    /// array-form `select`.
+    #[default]
+    Tuple,
+    /// Bare-string `select: "?x"`: each row is a single bare value.
+    Scalar,
+}
+
 /// Unresolved query - the result of parsing before IRI resolution
 #[derive(Debug, Clone)]
 pub struct UnresolvedQuery {

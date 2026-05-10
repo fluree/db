@@ -1381,7 +1381,7 @@ mod tests {
     }
 
     #[test]
-    fn test_type_expansion() {
+    fn test_type_hydration() {
         let json = json!({
             "@context": { "ex": "http://example.org/" },
             "select": ["?s"],
@@ -1493,7 +1493,7 @@ mod tests {
     }
 
     #[test]
-    fn test_vocab_expansion() {
+    fn test_vocab_hydration() {
         let json = json!({
             "@context": {
                 "@vocab": "http://schema.org/"
@@ -1866,7 +1866,7 @@ mod tests {
     }
 
     #[test]
-    fn test_reference_value_expansion() {
+    fn test_reference_value_hydration() {
         // String values for @id-typed properties should expand to IRIs
         let json = json!({
             "@context": {
@@ -3230,14 +3230,14 @@ mod tests {
             }
             other => panic!("expected Call(Coalesce), got {other:?}"),
         }
-        // No post-aggregation binds (no aggregates here).
-        assert!(query.options.post_binds.is_empty());
+        // No grouping phase (no aggregates here, so no post-bind channel).
+        assert!(query.grouping.is_none());
     }
 
     #[test]
     fn test_select_scalar_expr_post_aggregate_bind() {
         // (as (+ ?cnt 1) ?adjusted) where ?cnt is an aggregate output should
-        // land in options.post_binds, not in patterns.
+        // land in the grouping's post-aggregation binds, not in patterns.
         let json = json!({
             "@context": { "ex": "http://example.org/" },
             "select": [
@@ -3253,12 +3253,22 @@ mod tests {
         let encoder = encode::MemoryEncoder::with_common_namespaces();
         let query = parse_query(&json, &encoder, &mut vars, None).unwrap();
 
-        // Aggregate created.
-        assert_eq!(query.options.aggregates.len(), 1);
-        // The (+ ?cnt 1) bind must be post-aggregation.
-        assert_eq!(query.options.post_binds.len(), 1);
+        // One aggregate, one post-aggregation BIND.
+        let aggregates: Vec<_> = query
+            .grouping
+            .as_ref()
+            .map(|g| g.aggregates().collect())
+            .unwrap_or_default();
+        assert_eq!(aggregates.len(), 1);
+        let post_binds = query
+            .grouping
+            .as_ref()
+            .and_then(crate::ir::Grouping::aggregation)
+            .map(|agg| agg.binds.as_slice())
+            .unwrap_or(&[]);
+        assert_eq!(post_binds.len(), 1);
         let adjusted_var = vars.get("?adjusted").expect("?adjusted registered");
-        assert_eq!(query.options.post_binds[0].0, adjusted_var);
+        assert_eq!(post_binds[0].0, adjusted_var);
     }
 
     #[test]
@@ -3406,13 +3416,24 @@ mod tests {
         let query = parse_query(&json, &encoder, &mut vars, None).unwrap();
 
         // One aggregate, two post-aggregation BINDs (in select order).
-        assert_eq!(query.options.aggregates.len(), 1);
-        assert_eq!(query.options.post_binds.len(), 2);
+        let aggregates: Vec<_> = query
+            .grouping
+            .as_ref()
+            .map(|g| g.aggregates().collect())
+            .unwrap_or_default();
+        assert_eq!(aggregates.len(), 1);
+        let post_binds = query
+            .grouping
+            .as_ref()
+            .and_then(crate::ir::Grouping::aggregation)
+            .map(|agg| agg.binds.as_slice())
+            .unwrap_or(&[]);
+        assert_eq!(post_binds.len(), 2);
 
         let adjusted_var = vars.get("?adjusted").expect("?adjusted registered");
         let again_var = vars.get("?again").expect("?again registered");
-        assert_eq!(query.options.post_binds[0].0, adjusted_var);
-        assert_eq!(query.options.post_binds[1].0, again_var);
+        assert_eq!(post_binds[0].0, adjusted_var);
+        assert_eq!(post_binds[1].0, again_var);
 
         // No leaked Pattern::Bind for these — they must NOT have been
         // pre-aggregation.

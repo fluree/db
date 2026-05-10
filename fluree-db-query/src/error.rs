@@ -1,7 +1,7 @@
 //! Error types for query execution
 
 use crate::binding::BatchError;
-use crate::expression::{ArithmeticError, ComparisonError};
+use crate::eval::{ArithmeticError, ComparisonError};
 use thiserror::Error;
 
 /// Query execution errors

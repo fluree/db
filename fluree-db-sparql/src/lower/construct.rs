@@ -3,15 +3,16 @@
 //! Converts SPARQL CONSTRUCT queries to `Query` with template patterns,
 //! supporting both explicit templates and the `CONSTRUCT WHERE { ... }` shorthand.
 
-use crate::ast::query::{ConstructQuery, SolutionModifiers};
+use crate::ast::query::ConstructQuery;
 use crate::ast::TriplePattern as SparqlTriplePattern;
 
 use fluree_db_query::ir::triple::TriplePattern;
 use fluree_db_query::ir::{
-    ConstructTemplate as QueryConstructTemplate, Pattern, Query, QueryOptions, QueryOutput,
+    ConstructTemplate as QueryConstructTemplate, Pattern, Query, QueryOutput, ReasoningConfig,
 };
 use fluree_db_query::parse::encode::IriEncoder;
 
+use super::select::BaseModifiers;
 use super::{LoweringContext, Result};
 
 impl<E: IriEncoder> LoweringContext<'_, E> {
@@ -37,7 +38,11 @@ impl<E: IriEncoder> LoweringContext<'_, E> {
         let construct_template = QueryConstructTemplate::new(template_patterns);
 
         // Lower solution modifiers (CONSTRUCT supports ORDER BY, LIMIT, OFFSET but not GROUP BY/HAVING)
-        let options = self.lower_construct_modifiers(&construct.modifiers)?;
+        let BaseModifiers {
+            limit,
+            offset,
+            ordering,
+        } = self.lower_base_modifiers(&construct.modifiers)?;
 
         let ctx = self.build_jsonld_context()?;
         let ctx_val = self.build_jsonld_context_value();
@@ -47,7 +52,11 @@ impl<E: IriEncoder> LoweringContext<'_, E> {
             orig_context: Some(ctx_val),
             output: QueryOutput::Construct(construct_template),
             patterns,
-            options,
+            reasoning: ReasoningConfig::default(),
+            grouping: None,
+            ordering,
+            limit,
+            offset,
             post_values: None,
         })
     }
@@ -102,12 +111,5 @@ impl<E: IriEncoder> LoweringContext<'_, E> {
                 | Pattern::S2Search(_) => {}
             }
         }
-    }
-
-    /// Lower solution modifiers for CONSTRUCT (no GROUP BY/HAVING/aggregates).
-    fn lower_construct_modifiers(&mut self, modifiers: &SolutionModifiers) -> Result<QueryOptions> {
-        let mut options = QueryOptions::default();
-        self.lower_base_modifiers(modifiers, &mut options)?;
-        Ok(options)
     }
 }
