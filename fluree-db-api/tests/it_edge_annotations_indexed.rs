@@ -521,6 +521,7 @@ async fn storage_inspection_finds_arena_artifacts() {
             assert_eq!(ann_root.stats.reverse_rows, 1);
             assert_eq!(ann_root.stats.distinct_edges, 1);
             assert_eq!(ann_root.stats.distinct_annotations, 1);
+            assert_eq!(ann_root.stats.live_attachment_pairs, 1);
 
             // Per-slot NDVs (M3.1 follow-up): the single edge has one
             // subject (alice), one predicate (worksFor), one object

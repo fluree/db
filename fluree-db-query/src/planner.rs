@@ -1563,6 +1563,7 @@ mod tests {
             reverse_rows: 1_000,
             distinct_edges: 200,
             distinct_annotations: 800,
+            live_attachment_pairs: 800,
             distinct_reified_subjects: 50,
             distinct_reified_predicates: 4,
             distinct_reified_objects: 200,

@@ -45,6 +45,25 @@ pub struct AnnotationStats {
     pub distinct_edges: u64,
     /// Distinct annotation subjects.
     pub distinct_annotations: u64,
+    /// Number of live `(edge, ann)` attachment pairs.
+    ///
+    /// Equal to `distinct_annotations` under the v1 single-target-
+    /// per-ann invariant (enforced at stage time in
+    /// `fluree-db-transact::stage` — re-attaching an SID to a
+    /// different edge is a transaction error). When the invariant
+    /// holds, this field is redundant; we store it explicitly so the
+    /// planner stays accurate when reading older / replayed-from-
+    /// corrupt-history ledgers where the same ann SID may have
+    /// multiple live targets. The `f:reifies*` row count for the
+    /// required slots is `live_attachment_pairs`, not
+    /// `distinct_annotations`.
+    ///
+    /// `#[serde(default)]` so older arena roots written before this
+    /// field landed deserialize cleanly with `0`. The merge layer
+    /// treats `0` as "use distinct_annotations" — the safe equality
+    /// for healthy v1 ledgers.
+    #[serde(default)]
+    pub live_attachment_pairs: u64,
 
     // -----------------------------------------------------------------
     // Per-slot NDV counters across the live (currently-asserted) rows.

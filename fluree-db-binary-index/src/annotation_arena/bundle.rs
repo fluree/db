@@ -276,6 +276,7 @@ fn compute_stats(
     let mut graph_rows: u64 = 0;
     let mut lang_rows: u64 = 0;
     let mut list_index_rows: u64 = 0;
+    let mut live_pairs: u64 = 0;
 
     for i in 0..forward.len() {
         let last_in_group = i + 1 == forward.len()
@@ -287,6 +288,7 @@ fn compute_stats(
         let edge = &forward[i].edge;
         live_edges.insert(edge);
         live_anns.insert(&forward[i].ann);
+        live_pairs += 1;
 
         // Distinct values are per-edge (HashSet dedupes natural
         // duplicates from parallel annotations).
@@ -334,6 +336,7 @@ fn compute_stats(
         reverse_rows: reverse.len() as u64,
         distinct_edges: live_edges.len() as u64,
         distinct_annotations: live_anns.len() as u64,
+        live_attachment_pairs: live_pairs,
         distinct_reified_subjects: subjects.len() as u64,
         distinct_reified_predicates: predicates.len() as u64,
         distinct_reified_objects: objects.len() as u64,

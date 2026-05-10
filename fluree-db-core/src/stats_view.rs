@@ -266,15 +266,22 @@ impl StatsView {
     ///   or absent, but the arena counters are always current.
     ///
     /// **Required slots** (`f:reifiesSubject`, `f:reifiesPredicate`,
-    /// `f:reifiesObject`): every annotation carries exactly one row,
-    /// so `count = ndv_subjects = distinct_annotations`. `ndv_values`
-    /// uses the per-slot NDV (`distinct_reified_subjects`,
-    /// `_predicates`, `_objects`) when available. Older arena roots
-    /// were written before per-slot NDVs were tracked and report `0`
-    /// for those fields; in that case we fall back to
-    /// `ndv_values = 1` (the safe upper bound — the planner sees
-    /// every `BoundObject` probe as a scan, which is conservative
-    /// but not wrong).
+    /// `f:reifiesObject`): every live `(edge, ann)` pair contributes
+    /// exactly one row, so `count = live_attachment_pairs`. Under
+    /// the v1 single-target-per-ann invariant
+    /// `live_attachment_pairs == distinct_annotations`, but a legacy
+    /// or replayed-from-corrupt-history ledger can have one ann SID
+    /// attached to multiple edges, in which case the pair count is
+    /// the right denominator. `ndv_subjects = distinct_annotations`
+    /// (the row's subject is the ann SID; even with multi-target
+    /// the distinct subject set is still the ann SIDs).
+    /// `ndv_values` uses the per-slot NDV
+    /// (`distinct_reified_subjects`, `_predicates`, `_objects`)
+    /// when available. Older arena roots were written before
+    /// per-slot NDVs were tracked and report `0` for those fields;
+    /// in that case we fall back to `ndv_values = 1` (the safe
+    /// upper bound — the planner sees every `BoundObject` probe as
+    /// a scan, which is conservative but not wrong).
     ///
     /// **Optional slots** (`f:reifiesGraph`, `f:reifiesLang`,
     /// `f:reifiesListIndex`): synthesized **only when their per-slot
@@ -318,11 +325,22 @@ impl StatsView {
             return;
         }
 
-        // Required slots: count = distinct_annotations, ndv_values
-        // from the per-slot NDV when present, else 1 (safe upper
-        // bound for older arenas without per-slot tracking).
+        // Required slots: `count` is the number of live `(edge, ann)`
+        // pairs (one row per pair per required slot). Older arena
+        // roots predate `live_attachment_pairs` and report it as 0;
+        // the v1 stage-time invariant says one ann SID has one live
+        // target, so falling back to `distinct_annotations` is safe
+        // for those. A multi-target anomaly on a current-format
+        // arena will report a `live_attachment_pairs` strictly
+        // greater than `distinct_annotations`, and the planner sees
+        // the larger row count.
+        let row_count = if ann.live_attachment_pairs > 0 {
+            ann.live_attachment_pairs
+        } else {
+            ann.distinct_annotations
+        };
         let req = |ndv: u64| PropertyStatData {
-            count: ann.distinct_annotations,
+            count: row_count,
             ndv_values: ndv.max(1),
             ndv_subjects: ann.distinct_annotations,
         };
@@ -427,9 +445,11 @@ mod tests {
         use fluree_vocab::db as p;
         use fluree_vocab::namespaces::FLUREE_DB;
 
-        // 800 annotations across 200 edges: 50 distinct subjects,
-        // 4 distinct predicates, 200 distinct objects. The planner's
-        // BoundObject formula `count / ndv_values` should give:
+        // 800 annotations across 200 edges (one target per ann
+        // under the v1 invariant, so live_attachment_pairs == 800):
+        // 50 distinct subjects, 4 distinct predicates, 200 distinct
+        // objects. The planner's BoundObject formula
+        // `count / ndv_values` should give:
         //   reifiesSubject:   800 /  50 = 16 annotations per subject
         //   reifiesPredicate: 800 /   4 = 200 annotations per predicate
         //   reifiesObject:    800 / 200 = 4 annotations per object
@@ -439,6 +459,7 @@ mod tests {
             reverse_rows: 1_000,
             distinct_edges: 200,
             distinct_annotations: 800,
+            live_attachment_pairs: 800,
             distinct_reified_subjects: 50,
             distinct_reified_predicates: 4,
             distinct_reified_objects: 200,
@@ -479,6 +500,69 @@ mod tests {
                 "optional slot {name} must not be synth'd when row count is zero"
             );
         }
+    }
+
+    #[test]
+    fn merge_annotation_stats_uses_pair_count_when_multi_target_anomaly() {
+        // Anomalous shape: 100 distinct annotation SIDs, but one of
+        // them is attached to 3 different edges (legacy / replayed-
+        // from-corrupt-history — the v1 stage-time invariant should
+        // prevent this on healthy ledgers). live_attachment_pairs
+        // is 102, which is the correct row count for the required
+        // slots. The planner should see count = 102, not 100, so
+        // BoundObject estimates don't undercount.
+        use fluree_vocab::db as p;
+        use fluree_vocab::namespaces::FLUREE_DB;
+
+        let mut view = StatsView::default();
+        let ann = AnnotationStats {
+            distinct_edges: 100,
+            distinct_annotations: 100,
+            live_attachment_pairs: 102,
+            distinct_reified_subjects: 100,
+            distinct_reified_predicates: 5,
+            distinct_reified_objects: 100,
+            ..Default::default()
+        };
+        view.merge_annotation_stats(&ann, &HashMap::new());
+
+        let subj = view
+            .get_property(&Sid::new(FLUREE_DB, p::REIFIES_SUBJECT))
+            .expect("reifiesSubject synth missing");
+        assert_eq!(
+            subj.count, 102,
+            "row count must follow live_attachment_pairs, not distinct_annotations"
+        );
+        assert_eq!(
+            subj.ndv_subjects, 100,
+            "ndv_subjects = distinct ann SIDs (subject of each row)"
+        );
+    }
+
+    #[test]
+    fn merge_annotation_stats_falls_back_to_distinct_annotations_for_old_arenas() {
+        // Older arena roots predate `live_attachment_pairs` and
+        // deserialize as 0. Under the v1 invariant the pair count
+        // equals distinct_annotations, so the merge falls back to
+        // distinct_annotations as the row count.
+        use fluree_vocab::db as p;
+        use fluree_vocab::namespaces::FLUREE_DB;
+
+        let mut view = StatsView::default();
+        let ann = AnnotationStats {
+            distinct_annotations: 50,
+            // live_attachment_pairs missing (== 0)
+            distinct_reified_subjects: 10,
+            ..Default::default()
+        };
+        view.merge_annotation_stats(&ann, &HashMap::new());
+        let subj = view
+            .get_property(&Sid::new(FLUREE_DB, p::REIFIES_SUBJECT))
+            .expect("reifiesSubject synth missing");
+        assert_eq!(
+            subj.count, 50,
+            "older arena: count falls back to distinct_annotations"
+        );
     }
 
     #[test]

@@ -1005,14 +1005,22 @@ so the planner gets sharp `BoundObject` selectivity for any
 Synthesis rules:
 
 - **Required slots** (`f:reifiesSubject` / `f:reifiesPredicate` /
-  `f:reifiesObject`): `count = ndv_subjects = distinct_annotations`,
+  `f:reifiesObject`): `count = live_attachment_pairs`,
+  `ndv_subjects = distinct_annotations`,
   `ndv_values = distinct_reified_<slot>` (or `1` for older arenas).
   `BoundObject` selectivity becomes
-  `distinct_annotations / distinct_reified_<slot>` — annotations per
-  pinned subject / predicate / object. For 10k annotations across
-  200 distinct subjects, a `?ann f:reifiesSubject :alice` probe
-  estimates 50 rows instead of the previous 10k (the safe upper
-  bound).
+  `live_attachment_pairs / distinct_reified_<slot>` — pairs per
+  pinned subject / predicate / object. The pair count, not
+  `distinct_annotations`, is the row count for these slots so the
+  estimate stays accurate even on legacy ledgers where one ann SID
+  is attached to multiple edges (the v1 stage-time invariant in
+  `fluree-db-transact::stage` rejects this on healthy writes;
+  `live_attachment_pairs` defends against replay-from-corrupt-history
+  cases). Older arena roots predate the field and report `0`; the
+  merge falls back to `distinct_annotations` (safe under the
+  invariant). For 10k annotations across 200 distinct subjects,
+  a `?ann f:reifiesSubject :alice` probe estimates 50 rows
+  instead of the previous 10k (the safe upper bound).
 - **Optional slots** (`f:reifiesGraph` / `f:reifiesLang` /
   `f:reifiesListIndex`): synthesized **only** when the per-slot row
   count is non-zero. Row counts are per live `(edge, ann)` pair —

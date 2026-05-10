@@ -97,6 +97,7 @@ pub fn forward_arena_stats(rows: &[AnnotationForwardRow]) -> (i64, AnnotationSta
     let mut graph_rows: u64 = 0;
     let mut lang_rows: u64 = 0;
     let mut list_index_rows: u64 = 0;
+    let mut live_pairs: u64 = 0;
 
     for i in 0..rows.len() {
         if rows[i].t > max_t {
@@ -115,6 +116,7 @@ pub fn forward_arena_stats(rows: &[AnnotationForwardRow]) -> (i64, AnnotationSta
         let edge = &rows[i].edge;
         live_edges.insert(edge.clone());
         live_anns.insert(rows[i].ann.clone());
+        live_pairs += 1;
 
         subjects.insert(edge.s.clone());
         predicates.insert(edge.p.clone());
@@ -145,6 +147,7 @@ pub fn forward_arena_stats(rows: &[AnnotationForwardRow]) -> (i64, AnnotationSta
         reverse_rows: rows.len() as u64,
         distinct_edges: live_edges.len() as u64,
         distinct_annotations: live_anns.len() as u64,
+        live_attachment_pairs: live_pairs,
         distinct_reified_subjects: subjects.len() as u64,
         distinct_reified_predicates: predicates.len() as u64,
         distinct_reified_objects: objects.len() as u64,
@@ -407,6 +410,37 @@ mod tests {
         assert_eq!(stats.forward_rows, 4);
         assert_eq!(stats.distinct_edges, 2);
         assert_eq!(stats.distinct_annotations, 2, "ann_a + ann_b across edges");
+    }
+
+    #[test]
+    fn forward_stats_live_attachment_pairs_counts_actual_rows() {
+        // Healthy v1 shape: each (edge, ann) pair is unique → the
+        // pair count equals distinct_annotations.
+        let healthy = vec![
+            fwd_row(0, "ann_a", 1, true),
+            fwd_row(1, "ann_b", 2, true),
+            fwd_row(2, "ann_c", 3, true),
+        ];
+        let (_, stats) = forward_arena_stats(&healthy);
+        assert_eq!(stats.distinct_annotations, 3);
+        assert_eq!(stats.live_attachment_pairs, 3, "v1 invariant: pairs == anns");
+
+        // Multi-target anomaly: ann_a is attached to two edges. The
+        // v1 stage-time invariant should prevent this on healthy
+        // ledgers, but legacy / replayed-from-corrupt-history data
+        // can produce it. live_attachment_pairs surfaces the actual
+        // row count so the planner stays accurate.
+        let anomaly = vec![
+            fwd_row(0, "ann_a", 1, true),
+            fwd_row(1, "ann_a", 2, true), // same ann SID, different edge
+            fwd_row(2, "ann_b", 3, true),
+        ];
+        let (_, stats) = forward_arena_stats(&anomaly);
+        assert_eq!(stats.distinct_annotations, 2, "two distinct ann SIDs");
+        assert_eq!(
+            stats.live_attachment_pairs, 3,
+            "three live (edge, ann) pairs even though only two distinct anns"
+        );
     }
 
     #[test]
