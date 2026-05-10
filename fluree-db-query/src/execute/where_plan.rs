@@ -57,7 +57,11 @@ use super::pushdown::extract_bounds_from_filters;
 /// in `patterns` into its triple-chain equivalent, recursing through
 /// every container pattern (`Optional`, `Union`, `Minus`, `Exists`,
 /// `NotExists`, `Graph`, `Service`, `Subquery`).
-fn expand_edge_annotation_patterns(patterns: &[Pattern]) -> Vec<Pattern> {
+///
+/// Exposed at crate scope so `/explain` can run the same expansion the
+/// executor does — otherwise edge-annotation queries would surface as
+/// empty in the explain output.
+pub fn expand_edge_annotation_patterns(patterns: &[Pattern]) -> Vec<Pattern> {
     let mut out = Vec::with_capacity(patterns.len());
     for p in patterns {
         expand_one_into(p.clone(), &mut out);

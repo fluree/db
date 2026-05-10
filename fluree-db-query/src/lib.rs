@@ -105,7 +105,10 @@ pub use dataset::{ActiveGraph, ActiveGraphs, DataSet, GraphRef};
 pub use dataset_operator::{DatasetBuilder, DatasetOperator, ScanDatasetBuilder};
 pub use distinct::DistinctOperator;
 pub use error::{QueryError, Result};
-pub use execute::{build_operator_tree, execute, run_operator, ContextConfig, ExecutableQuery};
+pub use execute::{
+    build_operator_tree, execute, expand_edge_annotation_patterns, run_operator, ContextConfig,
+    ExecutableQuery,
+};
 pub use exists::ExistsOperator;
 pub use explain::{
     explain_execution_hints, explain_patterns, ExecutionStrategyHint, ExplainPlan, FallbackReason,

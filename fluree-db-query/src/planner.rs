@@ -1547,6 +1547,81 @@ mod tests {
     }
 
     #[test]
+    fn estimate_uses_merged_annotation_stats_for_reifies_predicates() {
+        // After `StatsView::merge_annotation_stats` runs, the planner's
+        // classifier should look up the synthesized entries for
+        // `f:reifies*` predicates and produce arena-aligned estimates
+        // instead of falling back to `DEFAULT_PROPERTY_SCAN_SELECTIVITY`.
+        //
+        // `AnnotationStats` does not yet carry per-slot NDV counters, so
+        // every slot uses `ndv_values = 1` — `BoundObject` probes get
+        // the safe upper-bound of `distinct_annotations` rows.
+
+        use fluree_db_core::AnnotationStats;
+        use fluree_vocab::db as p;
+        use fluree_vocab::namespaces::FLUREE_DB;
+
+        let mut stats = StatsView::default();
+        let ann = AnnotationStats {
+            forward_rows: 1_000,
+            reverse_rows: 1_000,
+            distinct_edges: 200,
+            distinct_annotations: 800,
+        };
+        let mut ns = std::collections::HashMap::new();
+        ns.insert(FLUREE_DB, "https://ns.flur.ee/db#".to_string());
+        stats.merge_annotation_stats(&ann, &ns);
+
+        // PropertyScan: `?ann f:reifiesObject ?o` — total annotations.
+        let scan = TriplePattern::new(
+            Ref::Var(VarId(0)),
+            Ref::Sid(Sid::new(FLUREE_DB, p::REIFIES_OBJECT)),
+            Term::Var(VarId(1)),
+        );
+        let scan_est = estimate_triple_row_count(&scan, &HashSet::new(), Some(&stats));
+        assert_eq!(scan_est, 800.0, "PropertyScan should equal annotation count");
+
+        // BoundObject: `?ann f:reifiesObject <some_object>` — conservative,
+        // since per-slot NDV is unknown.
+        let bound_o = TriplePattern::new(
+            Ref::Var(VarId(0)),
+            Ref::Sid(Sid::new(FLUREE_DB, p::REIFIES_OBJECT)),
+            Term::Sid(Sid::new(7, "obj1")),
+        );
+        let bound_o_est = estimate_triple_row_count(&bound_o, &HashSet::new(), Some(&stats));
+        assert_eq!(
+            bound_o_est, 800.0,
+            "BoundObject on reifiesObject should fall back to total annotations (conservative)"
+        );
+
+        // BoundSubject: a known annotation subject probing its slot.
+        let mut bound_subj_ctx = HashSet::new();
+        bound_subj_ctx.insert(VarId(0));
+        let bound_s = TriplePattern::new(
+            Ref::Var(VarId(0)),
+            Ref::Sid(Sid::new(FLUREE_DB, p::REIFIES_SUBJECT)),
+            Term::Var(VarId(2)),
+        );
+        let bound_s_est = estimate_triple_row_count(&bound_s, &bound_subj_ctx, Some(&stats));
+        assert_eq!(
+            bound_s_est, 1.0,
+            "BoundSubject on reifiesSubject should be ~1 row per known annotation"
+        );
+
+        // BoundObject on reifiesPredicate also conservative.
+        let bound_p = TriplePattern::new(
+            Ref::Var(VarId(0)),
+            Ref::Sid(Sid::new(FLUREE_DB, p::REIFIES_PREDICATE)),
+            Term::Sid(Sid::new(7, "worksFor")),
+        );
+        let bound_p_est = estimate_triple_row_count(&bound_p, &HashSet::new(), Some(&stats));
+        assert_eq!(
+            bound_p_est, 800.0,
+            "BoundObject on reifiesPredicate should fall back to total annotations (conservative)"
+        );
+    }
+
+    #[test]
     fn test_is_property_join() {
         // Valid property join: ?s :name ?n, ?s :age ?a
         let p1 = make_pattern(VarId(0), "name", VarId(1));

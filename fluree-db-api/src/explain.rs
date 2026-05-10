@@ -8,8 +8,8 @@ use crate::format::iri::IriCompactor;
 use crate::query::helpers::{parse_jsonld_query, parse_sparql_to_ir};
 use fluree_db_core::{is_rdf_type, StatsView};
 use fluree_db_query::{
-    explain_execution_hints, parse_query, ExplainPlan, OptimizationStatus, Pattern, Query, Ref,
-    Term, TriplePattern, VarRegistry,
+    expand_edge_annotation_patterns, explain_execution_hints, parse_query, ExplainPlan,
+    OptimizationStatus, Pattern, Query, Ref, Term, TriplePattern, VarRegistry,
 };
 use serde_json::{json, Map, Value as JsonValue};
 
@@ -68,6 +68,58 @@ fn triple_pattern_to_user_object(
         "property": property,
         "object": term_to_user_string(&tp.o, vars, compactor),
     })
+}
+
+/// If the triple's predicate is one of the seven `f:reifies*` system
+/// predicates, return a short slot name. Used by `/explain` to tag
+/// triples that came from edge-annotation expansion so the planner's
+/// chosen ordering (annotation-first vs edge-first probe) is
+/// observable.
+fn annotation_role_for(tp: &TriplePattern) -> Option<&'static str> {
+    use fluree_db_core::namespaces::{
+        is_reifies_datatype, is_reifies_graph, is_reifies_lang, is_reifies_list_index,
+        is_reifies_object, is_reifies_predicate, is_reifies_subject,
+    };
+    use fluree_vocab::reifies_iris;
+
+    let by_sid = match &tp.p {
+        Ref::Sid(sid) => {
+            if is_reifies_subject(sid) {
+                Some("subject")
+            } else if is_reifies_predicate(sid) {
+                Some("predicate")
+            } else if is_reifies_object(sid) {
+                Some("object")
+            } else if is_reifies_graph(sid) {
+                Some("graph")
+            } else if is_reifies_datatype(sid) {
+                Some("datatype")
+            } else if is_reifies_lang(sid) {
+                Some("lang")
+            } else if is_reifies_list_index(sid) {
+                Some("listIndex")
+            } else {
+                None
+            }
+        }
+        _ => None,
+    };
+    if by_sid.is_some() {
+        return by_sid;
+    }
+    if let Ref::Iri(iri) = &tp.p {
+        return match iri.as_ref() {
+            reifies_iris::SUBJECT => Some("subject"),
+            reifies_iris::PREDICATE => Some("predicate"),
+            reifies_iris::OBJECT => Some("object"),
+            reifies_iris::GRAPH => Some("graph"),
+            reifies_iris::DATATYPE => Some("datatype"),
+            reifies_iris::LANG => Some("lang"),
+            reifies_iris::LIST_INDEX => Some("listIndex"),
+            _ => None,
+        };
+    }
+    None
 }
 
 fn plan_patterns_to_json(
@@ -141,12 +193,19 @@ fn plan_patterns_to_json(
             inputs.insert("fallback".to_string(), json!(inp.fallback));
         }
 
-        json!({
+        let mut entry = json!({
             "type": typ,
             "pattern": triple_pattern_to_user_object(tp, vars, compactor),
             "selectivity": selectivity,
             "inputs": JsonValue::Object(inputs),
-        })
+        });
+        if let Some(role) = annotation_role_for(tp) {
+            entry
+                .as_object_mut()
+                .expect("entry is object")
+                .insert("annotation-role".to_string(), json!(role));
+        }
+        entry
     };
 
     // Original order is the query's triple pattern order.
@@ -250,23 +309,43 @@ fn explain_from_parsed(
         }
     }
 
+    // Expand edge-annotation IR into the same triple chain the
+    // executor uses (`Pattern::EdgeAnnotation` /
+    // `Pattern::AnnotationTarget` → base edge + 3 `f:reifies*` lookups
+    // + body). Without this, edge-annotation queries appear as empty
+    // in `/explain` output because `collect_triples_in_order` doesn't
+    // descend into those container patterns.
+    let expanded_patterns = expand_edge_annotation_patterns(&parsed.patterns);
+
     let mut triples_in_order = Vec::new();
     collect_triples_in_order(
         &mut triples_in_order,
-        &parsed.patterns,
+        &expanded_patterns,
         &normalize_ref,
         &normalize_term,
     );
 
-    let stats_view = snapshot
-        .stats
-        .as_ref()
-        .map(|s| StatsView::from_db_stats_with_namespaces(s, snapshot.namespaces()));
+    // Build a stats view from whatever is available on the snapshot.
+    // Mirrors `stats_cache::cached_stats_view_for_db`: when only the
+    // annotation index is present (e.g. on a freshly-arena-built ledger
+    // before regular stats land), the merged `f:reifies*` entries are
+    // still useful for planning. Without this, `/explain` would report
+    // "no stats" while the planner happily uses arena-derived stats.
+    let stats_view = if snapshot.stats.is_some() || snapshot.annotation_index.is_some() {
+        let base = snapshot.stats.clone().unwrap_or_default();
+        let mut view = StatsView::from_db_stats_with_namespaces(&base, snapshot.namespaces());
+        if let Some(ann) = snapshot.annotation_index.as_ref() {
+            view.merge_annotation_stats(&ann.stats, snapshot.namespaces());
+        }
+        Some(view)
+    } else {
+        None
+    };
     let stats_available = stats_view
         .as_ref()
         .map(fluree_db_core::StatsView::has_property_stats)
         .unwrap_or(false);
-    let execution_hints = explain_execution_hints(&parsed.patterns, stats_view.as_ref());
+    let execution_hints = explain_execution_hints(&expanded_patterns, stats_view.as_ref());
 
     if !stats_available {
         let mut plan = serde_json::Map::new();
@@ -286,10 +365,11 @@ fn explain_from_parsed(
     let (original, optimized) =
         plan_patterns_to_json(&explain, &triples_in_order, vars, &compactor);
 
-    // Minimal statistics summary (stable + useful).
-    let stats = snapshot.stats.as_ref().unwrap();
+    // Minimal statistics summary (stable + useful). `total-flakes` is
+    // zero when only annotation-derived stats are available.
+    let total_flakes = snapshot.stats.as_ref().map(|s| s.flakes).unwrap_or(0);
     let statistics = json!({
-        "total-flakes": stats.flakes,
+        "total-flakes": total_flakes,
     });
 
     Ok(json!({

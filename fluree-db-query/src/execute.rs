@@ -46,6 +46,7 @@ pub use runner::ExecutableQuery;
 
 // Re-export internal helpers for use in lib.rs
 pub use where_plan::build_where_operators_seeded;
+pub use where_plan::expand_edge_annotation_patterns;
 pub(crate) use where_plan::{analyze_property_join_plan, collect_inner_join_block};
 
 // Re-export operator tree builder and runner for custom execution pipelines

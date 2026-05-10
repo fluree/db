@@ -17,7 +17,7 @@ useful — a reviewer can merge without waiting for the next.
 | M1b | Read side + cascade + integration | (M1a + scan-based lookups) | ✅ shipped |
 | M2a | Scan-based indexed read path | works pre + post-index | ✅ shipped |
 | M2b | Binary annotation-arena format | O(log N) lookups, lazy load | ✅ shipped (slices 1–5) |
-| M3  | Planner / costing | — | not started |
+| M3  | Planner / costing | — | ✅ shipped (M3.1 + M3.2 + M3.3) |
 
 **M1 was split into two slices during implementation.** M1a and M1b
 are each independently mergeable. M1a is a complete write-side
@@ -898,25 +898,146 @@ Three items from the original DoD are deliberately deferred:
 direction based on selectivity. Annotation-rooted queries that filter
 metadata constants don't pay the full edge scan.
 
-### Files / changes
+`Pattern::EdgeAnnotation` / `Pattern::AnnotationTarget` are flattened
+into a chain of triple patterns by `expand_edge_annotation_patterns`
+*before* the join planner runs (`fluree-db-query/src/execute/where_plan.rs`).
+That means the standard `reorder_patterns` machinery picks the
+direction — there's no separate "EdgeAnnotation strategy" enum to
+plumb through. The planner just needs accurate selectivity for the
+expanded `f:reifies*` triples.
 
-- `fluree-db-query/src/execute/operator_tree.rs`
-  - Cost-driven choice between edge-first scan + forward-arena lookup
-    vs annotation-first scan + reverse-arena lookup.
-- `fluree-db-query/src/ir/`
-  - `AnnotationStats` consumed by costing. Histogram of annotation
-    predicates if cheap.
-- Possibly: an `EdgeAnnotationStrategy` enum on the operator so the
-  planner's choice is observable in `/explain`.
+### Slices
 
-### Tests / benchmarks
+| Slice | Goal | Status |
+|-------|------|--------|
+| M3.1 | Wire `AnnotationStats` into the cardinality estimator so `f:reifies*` triples on snapshots with `annotation_index = Some(_)` get tight selectivity instead of generic property-stats fallbacks. | ✅ shipped |
+| M3.2 | Surface the chosen ordering in `/explain` output so the planner's decisions for edge-annotation queries are observable. | ✅ shipped |
+| M3.3 | Throughput benchmark measuring current planner choices for edge-rooted vs annotation-rooted shapes on a non-trivial dataset. | ✅ shipped |
 
-- Throughput benchmarks on a 10M-edge / 100k-annotated synthetic
-  dataset:
-  - Edge-rooted query with low-selectivity edge: should choose
-    annotation-first when metadata is selective.
-  - Annotation-rooted query: stays annotation-first.
-- `it_query_explain.rs` extension verifying chosen strategy.
+### M3.1 — what landed
+
+`StatsView::merge_annotation_stats` overlays per-predicate stats for
+the **three required** `f:reifies*` slots
+(`f:reifiesSubject` / `f:reifiesPredicate` / `f:reifiesObject`) from
+`AnnotationIndexRoot.stats` whenever the snapshot has an arena built.
+
+Slot coverage:
+
+- **Required, synthesized**: every annotation carries exactly one row
+  of each of the three required slots, so
+  `count = distinct_annotations` is exact for live state.
+- **Optional, NOT synthesized**: `f:reifiesGraph`,
+  `f:reifiesDatatype`, `f:reifiesLang`, `f:reifiesListIndex`. These
+  are emitted only for named-graph edges, typed literals,
+  language-tagged literals, and list members — `AnnotationStats`
+  doesn't track how many annotations carry each, and synthesizing
+  `count = distinct_annotations` would overstate row counts on
+  workloads where these slots are sparse. Falls through to the
+  regular `IndexStats.properties` HLL.
+
+Synthesis values for the required slots:
+
+- `count = distinct_annotations`,
+  `ndv_subjects = distinct_annotations`.
+- `ndv_values = 1`.
+
+The conservative `ndv_values = 1` is intentional. `AnnotationStats`
+does not yet carry per-slot NDV counters (e.g. distinct objects across
+reified edges). Using `distinct_edges` as a proxy badly underestimates
+common "many annotations sharing one endpoint" cases — e.g. 10k people
+who all `worksFor` `ex:acme` produce
+`distinct_annotations = distinct_edges = 10k`, but
+`?ann f:reifiesObject ex:acme` actually returns 10k rows, not
+`10k / 10k = 1`. With `ndv_values = 1`, `BoundObject` probes get the
+safe upper-bound of `distinct_annotations` rows.
+
+The win over having no stats at all is the accurate `count` (replaces
+`DEFAULT_PROPERTY_SCAN_SELECTIVITY`) and the `BoundSubject`
+selectivity (1 row per known annotation). When `AnnotationStats`
+grows per-slot NDV counters (`distinct_reified_subjects`,
+`distinct_reified_objects`, etc.), sharper `BoundObject` estimates can
+land in the same code path, and the optional slots can be synthesized
+once their per-slot row counts are tracked.
+
+The merge is called from both `stats_cache::cached_stats_view_for_db`
+(query path) and `explain::explain_query` (so `/explain` output sees
+the same numbers the planner will). The stats-view cache key folds in
+`annotation_index.{forward,reverse}_branch_cid` so a reindex/rebuild
+that swaps the arena at the same `snapshot.t` produces a fresh slot.
+`/explain` builds the view whenever either ordinary stats or the
+arena is available, mirroring the query path.
+
+### M3.2 — what landed
+
+`/explain` (in `fluree-db-api/src/explain.rs`) now runs
+`expand_edge_annotation_patterns` on the parsed query before
+extracting triples — without it, `Pattern::EdgeAnnotation` /
+`Pattern::AnnotationTarget` were silently dropped from
+`triples_in_order`, so edge-annotation queries surfaced as empty in
+the optimizer output.
+
+Each emitted triple whose predicate is one of the seven `f:reifies*`
+system predicates carries a new `annotation-role` field in the JSON
+output (`subject` / `predicate` / `object` / `graph` / `datatype` /
+`lang` / `listIndex`). The chosen ordering is observable: the slot
+that the planner probes first (e.g. `subject` for an edge-first
+direction, the body's external filter for annotation-first) is
+visible to clients without re-running the planner.
+
+`expand_edge_annotation_patterns` was promoted to `pub` at the
+`fluree-db-query` crate root so `/explain` can run the same expansion
+the executor does. Acceptance test:
+`it_edge_annotations_indexed::explain_tags_annotation_role_and_uses_arena_stats`.
+
+### M3.3 — what landed
+
+`fluree-db-api/benches/annotation_planner.rs` runs four shapes per
+size:
+
+- `edge-rooted-{arena,scan}`: `select ?ann ?org where { ex:person-0
+  ex:worksFor ?org { @annotation { @id ?ann } } }` — bound subject,
+  one annotation result.
+- `annotation-rooted-{arena,scan}`: `select ?person ?org where {
+  ex:role "Director" ; @reifies { ?person ex:worksFor ?org } }` —
+  filter annotations by metadata, return reified edges.
+
+Workload: N people, each with one `ex:worksFor ex:acme` edge carrying
+one annotation cycling through five roles. Sizes: 100, 1000. The bench
+captures end-to-end timings, **not** the planner's chosen ordering —
+inspecting the chosen ordering is M3.2's `/explain` output. A
+follow-up could add an explain-plan assertion per shape to pin the
+direction picked at each size.
+
+| Bench | N=100 | N=1000 |
+|-------|------:|-------:|
+| edge-rooted-arena       | 1.71 ms | 25.87 ms |
+| edge-rooted-scan        | 1.65 ms | 25.25 ms |
+| annotation-rooted-arena | 1.52 ms | 23.23 ms |
+| annotation-rooted-scan  | 1.50 ms | 22.99 ms |
+
+Run with `cargo bench -p fluree-db-api --bench annotation_planner`.
+
+The arena/scan delta sits inside measurement noise (≤ 3%) on this
+workload — both ledgers carry the regular `IndexStats.properties`
+HLL for the `f:reifies*` predicates after their normal index build,
+so the planner picks essentially the same ordering with or without
+the arena merge. M3.1's win shows up in two cases the bench doesn't
+exercise:
+
+1. **Stats-empty / freshly-arena-sealed snapshots** where
+   `IndexStats.properties` hasn't been computed yet. Pre-M3.1, the
+   planner fell back to `DEFAULT_PROPERTY_SCAN_SELECTIVITY` for every
+   `f:reifies*` triple; post-M3.1 it uses the arena's
+   `distinct_annotations` count.
+2. **Heavy-retract workloads** where `IndexStats.count` is inflated by
+   asserts+retracts. Arena counters are live-only, so the merged
+   estimate matches the actual row count instead of an upper bound.
+
+Bigger throughput wins are gated on `AnnotationStats` growing per-slot
+NDV counters (`distinct_reified_subjects`, `distinct_reified_objects`,
+distinct_reified_predicates`) so `BoundObject` selectivity for
+`?ann f:reifiesObject ex:acme`-style probes can be sharpened beyond
+the safe `count / 1` upper bound.
 
 ---
 

@@ -630,3 +630,158 @@ async fn non_annotation_ledger_skips_inject_annotations() {
         })
         .await;
 }
+
+#[tokio::test]
+async fn explain_tags_annotation_role_and_uses_arena_stats() {
+    // M3.2: `/explain` must (a) expand `@annotation` / `@reifies`
+    // patterns the same way the executor does, (b) tag the resulting
+    // `f:reifies*` triples with their slot name so the chosen ordering
+    // is observable, and (c) report stats as available when the
+    // annotation arena is sealed even if no other property stats
+    // exist yet.
+    use support::graphdb_from_ledger;
+
+    let fluree = FlureeBuilder::memory()
+        .with_ledger_cache_config(fluree_db_api::LedgerManagerConfig::default())
+        .build_memory();
+    let ledger_id = "it/edge-annotations-indexed:explain-tags";
+
+    let (local, handle) =
+        support::start_background_indexer_with_attachments(&fluree, IndexerConfig::small());
+
+    local
+        .run_until(async move {
+            let ledger0 = genesis_ledger(&fluree, ledger_id);
+            let after = fluree
+                .insert(ledger0, &annotated_insert())
+                .await
+                .expect("annotated insert");
+            let _pre = fluree
+                .ledger_cached(ledger_id)
+                .await
+                .expect("pre-reindex cached load");
+            support::trigger_index_and_wait(&handle, ledger_id, after.receipt.t).await;
+            support::wait_for_index_application(&fluree, ledger_id, after.receipt.t).await;
+
+            let post = fluree.ledger(ledger_id).await.expect("reload");
+            assert!(
+                post.snapshot.annotation_index.is_some(),
+                "arena must be sealed for the explain test to exercise M3.1 stats"
+            );
+
+            // `@reifies`-rooted query: filter by annotation metadata,
+            // ask for the edge it reifies. Lowering produces a
+            // `Pattern::AnnotationTarget` which `/explain` should now
+            // expand into a base edge triple + 3 `f:reifies*` lookups.
+            let query = json!({
+                "@context": ctx(),
+                "select": ["?person", "?org"],
+                "where": {
+                    "ex:role": "Engineer",
+                    "@reifies": {
+                        "@id": "?person",
+                        "ex:worksFor": { "@id": "?org" }
+                    }
+                }
+            });
+
+            // Pin the annotation-role tags on the normally-indexed
+            // snapshot first.
+            let db = graphdb_from_ledger(&post);
+            let resp = fluree.explain(&db, &query).await.expect("explain");
+
+            assert_ne!(
+                resp["plan"]["optimization"], "none",
+                "with annotation arena present, explain must report stats availability \
+                 (got plan: {})",
+                resp["plan"]
+            );
+
+            let optimized = resp["plan"]["optimized"]
+                .as_array()
+                .expect("optimized order is an array");
+
+            // Collect the annotation-role tags we saw, in optimized
+            // order, so the test pins both presence and ordering.
+            let roles: Vec<String> = optimized
+                .iter()
+                .filter_map(|entry| {
+                    entry
+                        .get("annotation-role")
+                        .and_then(|v| v.as_str())
+                        .map(String::from)
+                })
+                .collect();
+
+            // The expansion emits exactly three `f:reifies*` triples
+            // per edge-annotation pattern (subject + predicate +
+            // object). The optimizer may reorder them but their
+            // count and slot identities are fixed.
+            let mut sorted = roles.clone();
+            sorted.sort();
+            assert_eq!(
+                sorted,
+                vec!["object", "predicate", "subject"],
+                "optimized order must contain exactly the three required \
+                 f:reifies* slots (got: {roles:?})"
+            );
+
+            // Sanity: every entry in the optimized order has a
+            // selectivity score field — we're not silently dropping
+            // patterns the planner doesn't have inputs for.
+            for entry in optimized {
+                assert!(
+                    entry.get("selectivity").is_some(),
+                    "optimized entry missing selectivity: {entry}"
+                );
+            }
+
+            // M3.1 review fix: prove the arena-only stats path. Clone
+            // the LedgerState and strip `snapshot.stats` so the
+            // ordinary `IndexStats` is unavailable. With the M3.1
+            // wiring, `/explain` should still report optimization
+            // (not "none") because `merge_annotation_stats` populates
+            // the view from `annotation_index` alone.
+            let mut arena_only = post.clone();
+            assert!(
+                arena_only.snapshot.stats.is_some(),
+                "preconditions: post-reindex snapshot has IndexStats"
+            );
+            arena_only.snapshot.stats = None;
+            let db_arena_only = graphdb_from_ledger(&arena_only);
+            let resp_arena_only = fluree
+                .explain(&db_arena_only, &query)
+                .await
+                .expect("explain (arena-only stats)");
+            assert_ne!(
+                resp_arena_only["plan"]["optimization"], "none",
+                "with snapshot.stats=None but annotation_index=Some, explain must \
+                 still report optimization via merged arena stats (got plan: {})",
+                resp_arena_only["plan"]
+            );
+            assert_eq!(
+                resp_arena_only["plan"]["statistics"]["total-flakes"], 0,
+                "no IndexStats → total-flakes reports zero, but stats are still available"
+            );
+            // Roles still present in the arena-only path.
+            let arena_only_roles: Vec<String> = resp_arena_only["plan"]["optimized"]
+                .as_array()
+                .expect("optimized array")
+                .iter()
+                .filter_map(|entry| {
+                    entry
+                        .get("annotation-role")
+                        .and_then(|v| v.as_str())
+                        .map(String::from)
+                })
+                .collect();
+            let mut arena_only_sorted = arena_only_roles.clone();
+            arena_only_sorted.sort();
+            assert_eq!(
+                arena_only_sorted,
+                vec!["object", "predicate", "subject"],
+                "arena-only path must still tag the three required slots (got: {arena_only_roles:?})"
+            );
+        })
+        .await;
+}

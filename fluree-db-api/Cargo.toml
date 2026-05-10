@@ -153,3 +153,7 @@ workspace = true
 [[bench]]
 name = "annotation_hydration"
 harness = false
+
+[[bench]]
+name = "annotation_planner"
+harness = false

@@ -3,6 +3,7 @@
 //! `StatsView` provides O(1) lookups of property and class statistics,
 //! built from `IndexStats` at query time.
 
+use crate::annotation_index::AnnotationStats;
 use crate::ids::{GraphId, RuntimePredicateId};
 use crate::index_stats::IndexStats;
 use crate::sid::Sid;
@@ -249,6 +250,99 @@ impl StatsView {
     pub fn has_graph_stats(&self) -> bool {
         !self.graph_properties.is_empty()
     }
+
+    /// Overlay arena-derived statistics for the **three required**
+    /// `f:reifies*` system predicates onto this view.
+    ///
+    /// When a snapshot's `annotation_index` is present, the arena's live
+    /// counters (`distinct_annotations`, `distinct_edges`) are a more
+    /// accurate source for `f:reifies*` predicate cardinality than the
+    /// generic `IndexStats.properties` HLL, because:
+    ///
+    /// - `IndexStats.count` mixes asserts and retracts; `distinct_*` is
+    ///   live-only.
+    /// - On freshly-indexed ledgers the property stats may be stale or
+    ///   absent, but the arena counters are always current.
+    ///
+    /// Slot coverage:
+    ///
+    /// - **Required, synthesized**: `f:reifiesSubject`,
+    ///   `f:reifiesPredicate`, `f:reifiesObject`. Every annotation
+    ///   carries exactly one row of each (`EdgeKey::to_reifies_facts`),
+    ///   so `count = distinct_annotations` is exact for live state.
+    /// - **Optional, NOT synthesized**: `f:reifiesGraph`,
+    ///   `f:reifiesDatatype`, `f:reifiesLang`, `f:reifiesListIndex`.
+    ///   These are emitted only for named-graph edges, typed literals,
+    ///   language-tagged literals, and list members — `AnnotationStats`
+    ///   doesn't track how many annotations carry each. Falling through
+    ///   to the regular `IndexStats.properties` HLL avoids overstating
+    ///   row counts on workloads where these slots are sparse.
+    ///
+    /// Synthesis values for the required slots:
+    ///
+    /// - `count = distinct_annotations` (one row per annotation, live)
+    /// - `ndv_subjects = distinct_annotations` — gives the planner an
+    ///   accurate `count / ndv_subjects = 1`-row estimate when probing
+    ///   `<known_ann> f:reifies* ?x`.
+    /// - `ndv_values = 1` — conservative.
+    ///
+    /// **Why conservative `ndv_values`?** `AnnotationStats` does not
+    /// currently track per-slot NDV (e.g. distinct subjects across
+    /// reified edges, distinct objects, distinct predicates). Using
+    /// `distinct_edges` as a proxy badly underestimates common
+    /// "many annotations sharing one endpoint" cases — e.g. 10k people
+    /// who all `worksFor` `ex:acme` produce
+    /// `distinct_annotations = distinct_edges = 10k`, but
+    /// `?ann f:reifiesObject ex:acme` actually returns 10k rows, not
+    /// `10k / 10k = 1`. With `ndv_values = 1` the planner sees the
+    /// scan-equivalent estimate (`count / 1 = distinct_annotations`),
+    /// which is a safe upper bound.
+    ///
+    /// The win over having no stats at all is the accurate `count`
+    /// (replaces `DEFAULT_PROPERTY_SCAN_SELECTIVITY`) and the
+    /// `BoundSubject` selectivity (1 row per known annotation). When
+    /// `AnnotationStats` grows per-slot NDV counters, sharper
+    /// `BoundObject` estimates can be added here, and the optional
+    /// slots can be synthesized once their counts are tracked.
+    ///
+    /// Existing entries for the three required predicates are
+    /// overwritten — the arena is authoritative for live attachment
+    /// counts.
+    pub fn merge_annotation_stats(
+        &mut self,
+        ann: &AnnotationStats,
+        namespace_codes: &HashMap<u16, String>,
+    ) {
+        use fluree_vocab::db as p;
+        use fluree_vocab::namespaces::FLUREE_DB;
+
+        if ann.distinct_annotations == 0 {
+            return;
+        }
+
+        let synth = PropertyStatData {
+            count: ann.distinct_annotations,
+            ndv_values: 1,
+            ndv_subjects: ann.distinct_annotations,
+        };
+
+        // Only the three required slots — see method docs for why
+        // optional slots fall through to the regular HLL.
+        let names: [&str; 3] = [
+            p::REIFIES_SUBJECT,
+            p::REIFIES_PREDICATE,
+            p::REIFIES_OBJECT,
+        ];
+
+        let prefix = namespace_codes.get(&FLUREE_DB);
+        for name in names {
+            self.properties.insert(Sid::new(FLUREE_DB, name), synth);
+            if let Some(prefix) = prefix {
+                let iri: Arc<str> = Arc::from(format!("{prefix}{name}"));
+                self.properties_by_iri.insert(iri, synth);
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -294,6 +388,72 @@ mod tests {
         assert_eq!(prop.count, 50);
         assert_eq!(prop.ndv_values, 40);
         assert_eq!(prop.ndv_subjects, 45);
+    }
+
+    #[test]
+    fn merge_annotation_stats_synthesizes_required_reifies_entries_only() {
+        use fluree_vocab::db as p;
+        use fluree_vocab::namespaces::FLUREE_DB;
+
+        let mut view = StatsView::default();
+        let ann = AnnotationStats {
+            forward_rows: 1_000,
+            reverse_rows: 1_000,
+            distinct_edges: 200,
+            distinct_annotations: 800,
+        };
+        let mut ns = HashMap::new();
+        ns.insert(FLUREE_DB, "https://ns.flur.ee/db#".to_string());
+
+        view.merge_annotation_stats(&ann, &ns);
+
+        // Required slots: synthesized with count = distinct_annotations,
+        // ndv_subjects = distinct_annotations, ndv_values = 1.
+        for name in [p::REIFIES_SUBJECT, p::REIFIES_PREDICATE, p::REIFIES_OBJECT] {
+            let entry = view
+                .get_property(&Sid::new(FLUREE_DB, name))
+                .unwrap_or_else(|| panic!("{name} synth missing"));
+            assert_eq!(entry.count, 800, "{name}.count");
+            assert_eq!(entry.ndv_subjects, 800, "{name}.ndv_subjects");
+            assert_eq!(entry.ndv_values, 1, "{name}.ndv_values");
+        }
+
+        // Optional slots: NOT synthesized — `AnnotationStats` doesn't
+        // track per-slot row counts, so synthesizing
+        // `count = distinct_annotations` would overstate sparsely-used
+        // slots like `f:reifiesGraph` or `f:reifiesDatatype`.
+        for name in [
+            p::REIFIES_GRAPH,
+            p::REIFIES_DATATYPE,
+            p::REIFIES_LANG,
+            p::REIFIES_LIST_INDEX,
+        ] {
+            assert!(
+                view.get_property(&Sid::new(FLUREE_DB, name)).is_none(),
+                "optional slot {name} must NOT be synthesized from AnnotationStats"
+            );
+        }
+
+        // IRI map populated for required slots when namespace prefix
+        // is known.
+        let by_iri = view
+            .get_property_by_iri("https://ns.flur.ee/db#reifiesObject")
+            .expect("reifiesObject IRI synth missing");
+        assert_eq!(by_iri.count, 800);
+        assert_eq!(by_iri.ndv_values, 1);
+        assert!(view
+            .get_property_by_iri("https://ns.flur.ee/db#reifiesGraph")
+            .is_none());
+    }
+
+    #[test]
+    fn merge_annotation_stats_zero_annotations_is_noop() {
+        let mut view = StatsView::default();
+        let ann = AnnotationStats::default();
+        let ns = HashMap::new();
+        view.merge_annotation_stats(&ann, &ns);
+        assert!(view.properties.is_empty());
+        assert!(view.properties_by_iri.is_empty());
     }
 
     #[test]
