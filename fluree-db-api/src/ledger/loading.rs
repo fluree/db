@@ -266,9 +266,8 @@ impl Fluree {
         target_id: &str,
         index_cid: &fluree_db_core::ContentId,
     ) -> Result<()> {
-        use fluree_db_binary_index::format::branch::read_branch_from_bytes;
+        use fluree_db_binary_index::collect_root_cas_ids_expanded;
         use fluree_db_binary_index::format::index_root::IndexRoot;
-        use fluree_db_core::content_kind::ContentKind;
         use fluree_db_core::storage::content_address;
         use fluree_db_core::CODEC_FLUREE_DICT_BLOB;
 
@@ -294,28 +293,13 @@ impl Fluree {
             ApiError::internal(format!("failed to decode index root {index_cid}: {e}"))
         })?;
 
-        // Collect all CIDs referenced by the index root
-        let mut all_cids = root.all_cas_ids();
-
-        // Expand named graph branch manifests → leaf CIDs
-        // (all_cas_ids includes branch CIDs but not the leaves within)
-        for ng in &root.named_graphs {
-            for (_, branch_cid) in &ng.orders {
-                let branch_addr = content_address(
-                    method,
-                    ContentKind::IndexBranch,
-                    source_id,
-                    &branch_cid.digest_hex(),
-                );
-                if let Ok(branch_bytes) = storage.read_bytes(&branch_addr).await {
-                    if let Ok(manifest) = read_branch_from_bytes(&branch_bytes) {
-                        for leaf in &manifest.leaves {
-                            all_cids.push(leaf.leaf_cid.clone());
-                        }
-                    }
-                }
-            }
-        }
+        // Collect every CAS CID reachable from the root, including leaves
+        // behind named-graph and annotation branch manifests.
+        let mut all_cids: Vec<fluree_db_core::ContentId> =
+            collect_root_cas_ids_expanded(&source_store, &root)
+                .await
+                .into_iter()
+                .collect();
 
         // Add the root CID itself
         all_cids.push(index_cid.clone());

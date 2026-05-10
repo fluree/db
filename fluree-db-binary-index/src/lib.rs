@@ -26,6 +26,7 @@ pub use read::replay::{batch_has_rows_above_t, replay_leaflet, replay_leaflet_at
 
 // ── Format types ────────────────────────────────────────────────────────────
 pub use format::branch::{BranchManifest, LeafEntry};
+pub use format::expanded_cas::collect_root_cas_ids_expanded;
 pub use format::index_root::IndexRoot;
 pub use format::run_record::{cmp_for_order, cmp_psot, cmp_spot, RunRecord, RunSortOrder};
 pub use format::wire_helpers::{

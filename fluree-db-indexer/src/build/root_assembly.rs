@@ -153,9 +153,13 @@ pub(crate) async fn encode_and_write_root(
     })
 }
 
-/// Compute garbage CIDs by comparing old root's CAS IDs with new root's CAS IDs.
+/// Compute garbage CIDs by diffing the previous root's reachable CAS set
+/// against the new root's reachable CAS set.
 ///
-/// Used by the full-rebuild pipeline which has access to the previous root via CAS.
+/// "Reachable" includes leaves behind named-graph and annotation branch
+/// manifests via `collect_root_cas_ids_expanded`. Diffing only the direct
+/// CAS refs (`all_cas_ids()`) would silently leak those leaves on every
+/// reindex.
 // Kept for: shared GC chain computation for both rebuild and incremental pipelines.
 // Use when: rebuild.rs Phase F.7 is refactored to use this shared helper.
 #[expect(dead_code)]
@@ -168,10 +172,10 @@ pub(crate) async fn compute_garbage_from_prev_root(
     let prev_root = IndexRoot::decode(&prev_bytes).ok()?;
 
     let prev_t = prev_root.index_t;
-    let old_ids: std::collections::HashSet<ContentId> =
-        prev_root.all_cas_ids().into_iter().collect();
-    let new_ids: std::collections::HashSet<ContentId> =
-        new_root.all_cas_ids().into_iter().collect();
+    let old_ids =
+        fluree_db_binary_index::collect_root_cas_ids_expanded(content_store, &prev_root).await;
+    let new_ids =
+        fluree_db_binary_index::collect_root_cas_ids_expanded(content_store, new_root).await;
     let garbage_cids: Vec<ContentId> = old_ids.difference(&new_ids).cloned().collect();
 
     Some(GarbageContext {

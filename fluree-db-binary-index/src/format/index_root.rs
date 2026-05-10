@@ -1010,11 +1010,25 @@ impl IndexRoot {
             annotation_index,
         })
     }
-    /// Collect all CAS content-artifact CIDs referenced by this root.
+    /// Collect all CAS content-artifact CIDs referenced **directly** by this root.
     ///
-    /// Includes: dict artifacts, leaf CIDs + sidecar CIDs (default graph inline),
-    /// branch CIDs (named graphs), numbig, vectors, spatial, fulltext, sketch.
+    /// Returns CIDs that the root references inline — without reading any
+    /// branch manifests from storage. Specifically:
+    /// - Dict pack + dict tree CIDs (forward + reverse).
+    /// - Per-graph arena CIDs (numbig, vectors, spatial, fulltext).
+    /// - Default-graph inline leaf CIDs and their sidecar CIDs.
+    /// - Named-graph **branch** CIDs (the leaves they route to are NOT included).
+    /// - Annotation forward + reverse **branch** CIDs (the leaves behind those
+    ///   branches are NOT included).
+    /// - Sketch CID.
+    ///
     /// Does NOT include the root's own CID or the garbage manifest CID.
+    ///
+    /// Callers that need leaf CIDs sitting behind named-graph or annotation
+    /// branches must fetch + decode those branch manifests from storage. For
+    /// drop / pack / GC-diff use cases see
+    /// `fluree-db-indexer::expanded_cas::collect_root_cas_ids_expanded`,
+    /// which performs that expansion using a `ContentStore`.
     pub fn all_cas_ids(&self) -> Vec<ContentId> {
         let mut ids = Vec::new();
 
@@ -1077,6 +1091,14 @@ impl IndexRoot {
         // Sketch
         if let Some(ref sketch) = self.sketch_ref {
             ids.push(sketch.clone());
+        }
+
+        // Annotation arena: forward + reverse branch CIDs.
+        // Leaves behind these branches are NOT included here — see the
+        // doc comment above and the expanded helper.
+        if let Some(ref ann) = self.annotation_index {
+            ids.push(ann.forward_branch_cid.clone());
+            ids.push(ann.reverse_branch_cid.clone());
         }
 
         ids.sort();
@@ -1580,6 +1602,10 @@ mod tests {
         let leaf_no_sc = ContentId::new(fluree_db_core::ContentKind::IndexLeaf, b"leaf2");
         let branch_cid = ContentId::new(fluree_db_core::ContentKind::IndexBranch, b"br1");
         let sketch_cid = ContentId::new(fluree_db_core::ContentKind::Commit, b"sketch1");
+        let ann_fwd_cid =
+            ContentId::new(fluree_db_core::ContentKind::AnnotationForwardBranch, b"af1");
+        let ann_rev_cid =
+            ContentId::new(fluree_db_core::ContentKind::AnnotationReverseBranch, b"ar1");
 
         let zero_key = RunRecordV2 {
             s_id: SubjectId::from(0u64),
@@ -1616,6 +1642,13 @@ mod tests {
             orders: vec![(RunSortOrder::Spot, branch_cid.clone())],
         }];
         root.sketch_ref = Some(sketch_cid.clone());
+        root.annotation_index = Some(fluree_db_core::AnnotationIndexRoot {
+            version: 1,
+            max_t: 0,
+            forward_branch_cid: ann_fwd_cid.clone(),
+            reverse_branch_cid: ann_rev_cid.clone(),
+            stats: fluree_db_core::AnnotationStats::default(),
+        });
 
         let ids = root.all_cas_ids();
 
@@ -1628,10 +1661,19 @@ mod tests {
         assert!(ids.contains(&branch_cid), "missing branch_cid");
         // Sketch present
         assert!(ids.contains(&sketch_cid), "missing sketch_cid");
+        // Annotation arena branch CIDs present (leaves behind them are not).
+        assert!(
+            ids.contains(&ann_fwd_cid),
+            "missing annotation forward branch CID"
+        );
+        assert!(
+            ids.contains(&ann_rev_cid),
+            "missing annotation reverse branch CID"
+        );
         // Dict CIDs present (from minimal_root_v6)
         assert!(
-            ids.len() >= 5,
-            "expected at least 5 CIDs, got {}",
+            ids.len() >= 7,
+            "expected at least 7 CIDs, got {}",
             ids.len()
         );
         // No duplicates (sorted + deduped)

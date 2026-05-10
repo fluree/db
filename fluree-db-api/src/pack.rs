@@ -129,113 +129,41 @@ pub async fn compute_missing_commits<C: ContentStore>(
 // Missing index artifact computation
 // ============================================================================
 
-/// Decode an index root blob (FIR6) and return all CAS artifact CIDs.
-fn decode_root_cas_ids(bytes: &[u8]) -> std::result::Result<Vec<ContentId>, String> {
-    let root = IndexRoot::decode(bytes).map_err(|e| e.to_string())?;
-    Ok(root.all_cas_ids())
-}
-
-/// Extract named-graph branch CIDs from a decoded root.
-///
-/// These branch manifests must be loaded from CAS to discover the
-/// leaf/sidecar CIDs they contain.
-fn extract_branch_cids(bytes: &[u8]) -> Vec<ContentId> {
-    if let Ok(root) = IndexRoot::decode(bytes) {
-        return root
-            .named_graphs
-            .iter()
-            .flat_map(|ng| ng.orders.iter().map(|(_, cid)| cid.clone()))
-            .collect();
-    }
-    Vec::new()
-}
-
-/// Load branch manifests and collect their leaf + sidecar CIDs.
-///
-/// Named-graph branches (FBR3) are separate CAS objects whose leaf/sidecar
-/// CIDs are not inline in the root. This function expands them so that
-/// pack/sync transfers a self-contained index snapshot.
-async fn expand_branch_leaf_cids<C: ContentStore>(
-    store: &C,
-    branch_cids: &[ContentId],
-) -> Vec<ContentId> {
-    let mut ids = Vec::new();
-    for branch_cid in branch_cids {
-        let bytes = match store.get(branch_cid).await {
-            Ok(b) => b,
-            Err(e) => {
-                tracing::debug!(
-                    %branch_cid,
-                    error = %e,
-                    "skipping branch manifest (not loadable)"
-                );
-                continue;
-            }
-        };
-        let manifest = match fluree_db_binary_index::format::branch::read_branch_from_bytes(&bytes)
-        {
-            Ok(m) => m,
-            Err(e) => {
-                tracing::debug!(
-                    %branch_cid,
-                    error = %e,
-                    "skipping branch manifest (decode failed)"
-                );
-                continue;
-            }
-        };
-        for leaf in &manifest.leaves {
-            ids.push(leaf.leaf_cid.clone());
-            if let Some(ref sc) = leaf.sidecar_cid {
-                ids.push(sc.clone());
-            }
-        }
-    }
-    ids
-}
-
 /// Compute the set of index artifact CIDs that the client is missing.
 ///
-/// Loads the `want` index root, collects all its CAS artifact CIDs via
-/// `all_cas_ids()`, then subtracts the `have` root's artifact set (if provided).
-/// The root blob itself is included in the result so the client gets a complete
-/// index snapshot.
+/// Loads the `want` index root, collects all CAS artifact CIDs reachable
+/// from it (including leaves behind named-graph and annotation branch
+/// manifests), then subtracts the `have` root's reachable set if provided.
+/// The root blob itself is included in the result so the client gets a
+/// complete, self-contained index snapshot.
 ///
-/// Returns artifact CIDs in sorted order (dict/branch/leaf CIDs), deduplicated.
+/// Returns artifact CIDs in sorted order (dict / branch / leaf CIDs),
+/// deduplicated.
 pub async fn compute_missing_index_artifacts<C: ContentStore>(
     store: &C,
     want_root_id: &ContentId,
     have_root_id: Option<&ContentId>,
 ) -> Result<Vec<ContentId>> {
-    // Load and parse the want root (FIR6).
     let want_bytes = store.get(want_root_id).await.map_err(|e| {
         ApiError::internal(format!("failed to read index root {want_root_id}: {e}"))
     })?;
-    let want_cas_ids = decode_root_cas_ids(&want_bytes).map_err(|e| {
+    let want_root = IndexRoot::decode(&want_bytes).map_err(|e| {
         ApiError::internal(format!("failed to parse index root {want_root_id}: {e}"))
     })?;
 
-    // Expand named-graph branch manifests to include their leaf/sidecar CIDs.
-    let want_branch_cids = extract_branch_cids(&want_bytes);
-    let want_branch_leaf_ids = expand_branch_leaf_cids(store, &want_branch_cids).await;
-
-    let mut want_set: HashSet<ContentId> = want_cas_ids.into_iter().collect();
-    want_set.extend(want_branch_leaf_ids);
+    let mut want_set =
+        fluree_db_binary_index::collect_root_cas_ids_expanded(store, &want_root).await;
     // Include the root blob itself.
     want_set.insert(want_root_id.clone());
 
     // If the client has an existing index root, subtract its artifacts.
     if let Some(have_id) = have_root_id {
         if let Ok(have_bytes) = store.get(have_id).await {
-            if let Ok(have_ids) = decode_root_cas_ids(&have_bytes) {
-                for cid in have_ids {
-                    want_set.remove(&cid);
-                }
-                // Expand the have root's branches too, so shared leaves are subtracted.
-                let have_branch_cids = extract_branch_cids(&have_bytes);
-                let have_branch_leaf_ids = expand_branch_leaf_cids(store, &have_branch_cids).await;
-                for cid in have_branch_leaf_ids {
-                    want_set.remove(&cid);
+            if let Ok(have_root) = IndexRoot::decode(&have_bytes) {
+                let have_set =
+                    fluree_db_binary_index::collect_root_cas_ids_expanded(store, &have_root).await;
+                for cid in &have_set {
+                    want_set.remove(cid);
                 }
                 // Don't remove have_root_id itself — client already has it.
             }
