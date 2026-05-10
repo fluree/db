@@ -260,67 +260,74 @@ fn compute_stats(
     use fluree_db_core::FlakeValue;
     use std::collections::HashSet;
 
-    // Collect the live edges (last-in-group rows where op is assert)
-    // and the live annotation subjects.
+    // Walk the rows once. For each live `(edge, ann)` pair (the
+    // last-in-group row where `op == true`), count one row per
+    // optional-slot the edge carries — multiple annotations on the
+    // same named-graph edge contribute separate `f:reifiesGraph`
+    // rows. Distinct-value counters dedupe via `HashSet`.
     let mut live_edges: HashSet<&EdgeKey> = HashSet::new();
     let mut live_anns: HashSet<&Sid> = HashSet::new();
-    for i in 0..forward.len() {
-        let last_in_group = i + 1 == forward.len()
-            || forward[i].edge != forward[i + 1].edge
-            || forward[i].ann != forward[i + 1].ann;
-        if last_in_group && forward[i].op {
-            live_edges.insert(&forward[i].edge);
-            live_anns.insert(&forward[i].ann);
-        }
-    }
-
-    // Per-slot NDV counters across the live edges. Used by the
-    // planner via `StatsView::merge_annotation_stats` to give
-    // `?ann f:reifies* <const>` probes accurate `BoundObject`
-    // selectivity instead of a safe upper bound.
-    //
-    // Required slots (subject, predicate, object, datatype) are
-    // present on every live row contributing one annotation, so the
-    // row count for those is `distinct_annotations` (or 0 in the
-    // JSON-LD-compatible cascade case for datatype). The optional
-    // slots (graph, lang, listIndex) are only present on a subset.
     let mut subjects: HashSet<&Sid> = HashSet::new();
     let mut predicates: HashSet<&Sid> = HashSet::new();
     let mut objects: HashSet<&FlakeValue> = HashSet::new();
     let mut graphs: HashSet<&Sid> = HashSet::new();
-    let mut datatypes: HashSet<&Sid> = HashSet::new();
     let mut langs: HashSet<&str> = HashSet::new();
     let mut list_indices: HashSet<i32> = HashSet::new();
     let mut graph_rows: u64 = 0;
     let mut lang_rows: u64 = 0;
     let mut list_index_rows: u64 = 0;
 
-    for edge in &live_edges {
+    for i in 0..forward.len() {
+        let last_in_group = i + 1 == forward.len()
+            || forward[i].edge != forward[i + 1].edge
+            || forward[i].ann != forward[i + 1].ann;
+        if !(last_in_group && forward[i].op) {
+            continue;
+        }
+        let edge = &forward[i].edge;
+        live_edges.insert(edge);
+        live_anns.insert(&forward[i].ann);
+
+        // Distinct values are per-edge (HashSet dedupes natural
+        // duplicates from parallel annotations).
         subjects.insert(&edge.s);
         predicates.insert(&edge.p);
         objects.insert(&edge.o);
-        datatypes.insert(&edge.dt);
         if let Some(g) = &edge.g {
             graphs.insert(g);
-            graph_rows += 1;
         }
         if let Some(lang) = &edge.lang {
             langs.insert(lang.as_str());
-            lang_rows += 1;
         }
         if let Some(i) = edge.list_i {
             list_indices.insert(i);
+        }
+
+        // Row counts for optional slots are per `(edge, ann)` pair
+        // — each annotation on a named-graph edge contributes its
+        // own `f:reifiesGraph` row. Counting per distinct edge would
+        // under-report when parallel annotations share an endpoint.
+        if edge.g.is_some() {
+            graph_rows += 1;
+        }
+        if edge.lang.is_some() {
+            lang_rows += 1;
+        }
+        if edge.list_i.is_some() {
             list_index_rows += 1;
         }
     }
 
-    // Datatype is emitted as one row per annotation in the full
-    // bundle, omitted entirely in the JSON-LD-compatible cascade.
-    // We can't tell which path produced any specific live row from
-    // the arena alone, so we report `distinct_annotations` as the
-    // upper bound. Planners that want exact counts must ask
-    // `IndexStats.properties` for the f:reifiesDatatype HLL.
-    let datatype_rows = live_anns.len() as u64;
+    // `f:reifiesDatatype` is *not* synthesized from the arena. The
+    // arena reconstructs `EdgeKey.dt` from the flake-level dt of
+    // the `f:reifiesObject` row, so the on-wire `f:reifiesDatatype`
+    // predicate may have zero rows (JSON-LD-compatible cascade) or
+    // one-per-annotation (full bundle path) and we cannot tell
+    // which from the arena state alone. Reporting a synthesized
+    // count would let `merge_annotation_stats` overwrite the real
+    // `IndexStats.properties` HLL with a phantom value. Leave the
+    // datatype counters at zero so the planner falls back to the
+    // HLL.
 
     AnnotationStats {
         forward_rows: forward.len() as u64,
@@ -332,8 +339,8 @@ fn compute_stats(
         distinct_reified_objects: objects.len() as u64,
         reifies_graph_rows: graph_rows,
         distinct_reified_graphs: graphs.len() as u64,
-        reifies_datatype_rows: datatype_rows,
-        distinct_reified_datatypes: datatypes.len() as u64,
+        reifies_datatype_rows: 0,
+        distinct_reified_datatypes: 0,
         reifies_lang_rows: lang_rows,
         distinct_reified_langs: langs.len() as u64,
         reifies_list_index_rows: list_index_rows,

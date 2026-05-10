@@ -80,9 +80,24 @@ pub fn forward_arena_stats(rows: &[AnnotationForwardRow]) -> (i64, AnnotationSta
     if rows.is_empty() {
         return (0, AnnotationStats::default());
     }
+
+    // Single pass: identify each live `(edge, ann)` pair (last-in-
+    // group + `op == true`) and accumulate distinct-value counters
+    // and per-pair row counts in lockstep. Mirrors
+    // `bundle::compute_stats` — keep both paths in sync.
     let mut max_t: i64 = i64::MIN;
     let mut live_edges: HashSet<EdgeKey> = HashSet::new();
     let mut live_anns: HashSet<Sid> = HashSet::new();
+    let mut subjects: HashSet<Sid> = HashSet::new();
+    let mut predicates: HashSet<Sid> = HashSet::new();
+    let mut objects: HashSet<FlakeValue> = HashSet::new();
+    let mut graphs: HashSet<Sid> = HashSet::new();
+    let mut langs: HashSet<String> = HashSet::new();
+    let mut list_indices: HashSet<i32> = HashSet::new();
+    let mut graph_rows: u64 = 0;
+    let mut lang_rows: u64 = 0;
+    let mut list_index_rows: u64 = 0;
+
     for i in 0..rows.len() {
         if rows[i].t > max_t {
             max_t = rows[i].t;
@@ -94,45 +109,34 @@ pub fn forward_arena_stats(rows: &[AnnotationForwardRow]) -> (i64, AnnotationSta
         // the pair is currently live. Sort tie-breaker on `op` is
         // `false < true`, so an assert at the same `t` as a retract
         // correctly wins.
-        if last_in_group && rows[i].op {
-            live_edges.insert(rows[i].edge.clone());
-            live_anns.insert(rows[i].ann.clone());
+        if !(last_in_group && rows[i].op) {
+            continue;
         }
-    }
+        let edge = &rows[i].edge;
+        live_edges.insert(edge.clone());
+        live_anns.insert(rows[i].ann.clone());
 
-    // Per-slot NDV counters across the live edges. Mirrors the logic
-    // in `bundle::compute_stats` — see that function's comment for
-    // the planner-side rationale.
-    let mut subjects: HashSet<&Sid> = HashSet::new();
-    let mut predicates: HashSet<&Sid> = HashSet::new();
-    let mut objects: HashSet<&FlakeValue> = HashSet::new();
-    let mut graphs: HashSet<&Sid> = HashSet::new();
-    let mut datatypes: HashSet<&Sid> = HashSet::new();
-    let mut langs: HashSet<&str> = HashSet::new();
-    let mut list_indices: HashSet<i32> = HashSet::new();
-    let mut graph_rows: u64 = 0;
-    let mut lang_rows: u64 = 0;
-    let mut list_index_rows: u64 = 0;
-    for edge in &live_edges {
-        subjects.insert(&edge.s);
-        predicates.insert(&edge.p);
-        objects.insert(&edge.o);
-        datatypes.insert(&edge.dt);
+        subjects.insert(edge.s.clone());
+        predicates.insert(edge.p.clone());
+        objects.insert(edge.o.clone());
         if let Some(g) = &edge.g {
-            graphs.insert(g);
+            graphs.insert(g.clone());
             graph_rows += 1;
         }
         if let Some(lang) = &edge.lang {
-            langs.insert(lang.as_str());
+            langs.insert(lang.clone());
             lang_rows += 1;
         }
-        if let Some(i) = edge.list_i {
-            list_indices.insert(i);
+        if let Some(idx) = edge.list_i {
+            list_indices.insert(idx);
             list_index_rows += 1;
         }
     }
-    let datatype_rows = live_anns.len() as u64;
 
+    // `f:reifiesDatatype` rows are not synthesized from the arena —
+    // the on-wire predicate may be absent (JSON-LD-compatible
+    // cascade) and we cannot tell from the reconstructed
+    // `EdgeKey.dt`. See `bundle::compute_stats` for the rationale.
     let stats = AnnotationStats {
         forward_rows: rows.len() as u64,
         // Reverse rows mirror forward rows when the indexer emits both
@@ -146,8 +150,8 @@ pub fn forward_arena_stats(rows: &[AnnotationForwardRow]) -> (i64, AnnotationSta
         distinct_reified_objects: objects.len() as u64,
         reifies_graph_rows: graph_rows,
         distinct_reified_graphs: graphs.len() as u64,
-        reifies_datatype_rows: datatype_rows,
-        distinct_reified_datatypes: datatypes.len() as u64,
+        reifies_datatype_rows: 0,
+        distinct_reified_datatypes: 0,
         reifies_lang_rows: lang_rows,
         distinct_reified_langs: langs.len() as u64,
         reifies_list_index_rows: list_index_rows,
@@ -403,6 +407,49 @@ mod tests {
         assert_eq!(stats.forward_rows, 4);
         assert_eq!(stats.distinct_edges, 2);
         assert_eq!(stats.distinct_annotations, 2, "ann_a + ann_b across edges");
+    }
+
+    #[test]
+    fn forward_stats_counts_optional_slot_rows_per_attachment() {
+        // Two annotations on the same named-graph edge must produce
+        // two `f:reifiesGraph` rows in the live state — counting
+        // per distinct edge would under-report. Same shape for
+        // `f:reifiesLang` and `f:reifiesListIndex`.
+        let g_sid = sid(99, "g1");
+        let mk = |s: u8, ann: &str, t: i64, op: bool| AnnotationForwardRow {
+            edge: EdgeKey {
+                g: Some(g_sid.clone()),
+                s: sid(11, &format!("s{s}")),
+                p: sid(12, "worksFor"),
+                o: FlakeValue::Ref(sid(11, "acme")),
+                dt: Sid::new(0, xsd::ANY_URI),
+                lang: None,
+                list_i: None,
+            },
+            ann: sid(20, ann),
+            t,
+            op,
+        };
+        let rows = vec![
+            mk(0, "ann_a", 1, true),
+            mk(0, "ann_b", 2, true),
+            mk(1, "ann_c", 3, true),
+        ];
+        let (_, stats) = forward_arena_stats(&rows);
+        assert_eq!(stats.distinct_edges, 2);
+        assert_eq!(stats.distinct_annotations, 3);
+        assert_eq!(stats.distinct_reified_graphs, 1, "single distinct graph");
+        assert_eq!(
+            stats.reifies_graph_rows, 3,
+            "three live (edge, ann) pairs each contribute one f:reifiesGraph row"
+        );
+
+        // datatype rows always 0 from the arena (see compute_stats
+        // comment): the arena reconstructs `EdgeKey.dt` from the
+        // f:reifiesObject flake-level dt, so it can't observe the
+        // separate f:reifiesDatatype predicate's actual presence.
+        assert_eq!(stats.reifies_datatype_rows, 0);
+        assert_eq!(stats.distinct_reified_datatypes, 0);
     }
 
     #[test]

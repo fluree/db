@@ -79,13 +79,19 @@ pub struct AnnotationStats {
     #[serde(default)]
     pub distinct_reified_graphs: u64,
 
-    /// Live `f:reifiesDatatype` rows. The full-bundle write path
-    /// (`EdgeKey::to_reifies_facts`) emits one per annotation; the
-    /// JSON-LD-compatible cascade omits it. So this is either ≈
-    /// `distinct_annotations` or 0 depending on the insert path.
+    /// **Always 0 from the arena builder.** The arena reconstructs
+    /// `EdgeKey.dt` from the flake-level dt of `f:reifiesObject`, so
+    /// it cannot tell whether the on-wire bundle actually emitted a
+    /// separate `f:reifiesDatatype` flake (full bundle path) or
+    /// omitted it (JSON-LD-compatible cascade). Reporting a synth
+    /// here would let `merge_annotation_stats` overwrite the real
+    /// `IndexStats.properties` HLL with a phantom row count. The
+    /// HLL is the source of truth for this slot. Field kept on the
+    /// struct for forward-compat in case a future builder tracks
+    /// the actual flake presence.
     #[serde(default)]
     pub reifies_datatype_rows: u64,
-    /// Distinct datatype SIDs across live reified edges.
+    /// Always 0 from the arena builder; see `reifies_datatype_rows`.
     #[serde(default)]
     pub distinct_reified_datatypes: u64,
 

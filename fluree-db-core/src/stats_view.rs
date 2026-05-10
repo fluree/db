@@ -276,15 +276,23 @@ impl StatsView {
     /// every `BoundObject` probe as a scan, which is conservative
     /// but not wrong).
     ///
-    /// **Optional slots** (`f:reifiesGraph`, `f:reifiesDatatype`,
-    /// `f:reifiesLang`, `f:reifiesListIndex`): synthesized **only
-    /// when their per-slot row count is non-zero**. The row count
-    /// (e.g. `reifies_graph_rows`) is the number of live annotations
-    /// whose reified edge carries that slot — strictly `≤
-    /// distinct_annotations` for graph/lang/listIndex. When the row
-    /// count is zero (older arenas with default-zeroed fields, or
-    /// workloads that never use that slot), we leave the entry to
-    /// the regular `IndexStats.properties` HLL.
+    /// **Optional slots** (`f:reifiesGraph`, `f:reifiesLang`,
+    /// `f:reifiesListIndex`): synthesized **only when their per-slot
+    /// row count is non-zero**. The row count (e.g.
+    /// `reifies_graph_rows`) is the number of live `(edge, ann)`
+    /// pairs whose edge carries that slot — strictly `≤
+    /// distinct_annotations`. When the row count is zero (older
+    /// arenas with default-zeroed fields, or workloads that never
+    /// use that slot), we leave the entry to the regular
+    /// `IndexStats.properties` HLL.
+    ///
+    /// **`f:reifiesDatatype` is intentionally not synthesized.** The
+    /// arena reconstructs `EdgeKey.dt` from the flake-level dt of
+    /// `f:reifiesObject` and cannot tell whether the on-wire bundle
+    /// actually emitted a separate `f:reifiesDatatype` flake. The
+    /// arena builder reports zero for the datatype row count;
+    /// `merge_annotation_stats` ignores datatype entirely and lets
+    /// the regular HLL handle it.
     ///
     /// **Why per-slot NDV matters.** Without it (the original M3.1
     /// shipped state), `BoundObject` selectivity for
@@ -354,11 +362,8 @@ impl StatsView {
             ann.reifies_graph_rows,
             ann.distinct_reified_graphs,
         );
-        opt(
-            p::REIFIES_DATATYPE,
-            ann.reifies_datatype_rows,
-            ann.distinct_reified_datatypes,
-        );
+        // `f:reifiesDatatype` is intentionally skipped — arena
+        // builder reports zeros (see `AnnotationStats::reifies_datatype_rows`).
         opt(
             p::REIFIES_LANG,
             ann.reifies_lang_rows,
@@ -525,11 +530,9 @@ mod tests {
             distinct_reified_objects: 100,
             reifies_graph_rows: 20,
             distinct_reified_graphs: 3,
-            reifies_datatype_rows: 100,
-            distinct_reified_datatypes: 4,
             reifies_lang_rows: 10,
             distinct_reified_langs: 2,
-            // listIndex omitted → stays 0
+            // datatype + listIndex omitted → stays 0
             ..Default::default()
         };
         view.merge_annotation_stats(&ann, &HashMap::new());
@@ -541,12 +544,6 @@ mod tests {
         assert_eq!(graph.ndv_subjects, 20);
         assert_eq!(graph.ndv_values, 3);
 
-        let dt = view
-            .get_property(&Sid::new(FLUREE_DB, p::REIFIES_DATATYPE))
-            .expect("reifiesDatatype synth missing");
-        assert_eq!(dt.count, 100);
-        assert_eq!(dt.ndv_values, 4);
-
         let lang = view
             .get_property(&Sid::new(FLUREE_DB, p::REIFIES_LANG))
             .expect("reifiesLang synth missing");
@@ -557,6 +554,26 @@ mod tests {
         assert!(view
             .get_property(&Sid::new(FLUREE_DB, p::REIFIES_LIST_INDEX))
             .is_none());
+
+        // f:reifiesDatatype is never synthesized from the arena even
+        // when the caller hands non-zero counts — the arena builder
+        // emits zero by contract because it cannot reliably observe
+        // the on-wire flake count. Pin that the synth path skips it
+        // unconditionally.
+        let mut view2 = StatsView::default();
+        let ann_with_dt = AnnotationStats {
+            distinct_annotations: 100,
+            reifies_datatype_rows: 100, // hypothetical — builder never sets this
+            distinct_reified_datatypes: 4,
+            ..Default::default()
+        };
+        view2.merge_annotation_stats(&ann_with_dt, &HashMap::new());
+        assert!(
+            view2
+                .get_property(&Sid::new(FLUREE_DB, p::REIFIES_DATATYPE))
+                .is_none(),
+            "reifiesDatatype must never be synthesized from arena stats"
+        );
     }
 
     #[test]

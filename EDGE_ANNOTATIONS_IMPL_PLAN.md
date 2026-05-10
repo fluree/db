@@ -1013,12 +1013,23 @@ Synthesis rules:
   200 distinct subjects, a `?ann f:reifiesSubject :alice` probe
   estimates 50 rows instead of the previous 10k (the safe upper
   bound).
-- **Optional slots** (`f:reifiesGraph` / `f:reifiesDatatype` /
-  `f:reifiesLang` / `f:reifiesListIndex`): synthesized **only** when
-  the per-slot row count is non-zero. `count = ndv_subjects = rows`,
-  `ndv_values = distinct_<slot>`. A workload that never uses named
-  graphs leaves the `f:reifiesGraph` HLL untouched and the planner
-  falls back to it.
+- **Optional slots** (`f:reifiesGraph` / `f:reifiesLang` /
+  `f:reifiesListIndex`): synthesized **only** when the per-slot row
+  count is non-zero. Row counts are per live `(edge, ann)` pair —
+  parallel annotations on the same named-graph edge each contribute
+  one `f:reifiesGraph` row, matching the on-wire flake count.
+  `count = ndv_subjects = rows`, `ndv_values = distinct_<slot>`. A
+  workload that never uses named graphs leaves the
+  `f:reifiesGraph` HLL untouched and the planner falls back to it.
+
+- **`f:reifiesDatatype` is not synthesized from the arena.** The
+  arena reconstructs `EdgeKey.dt` from the flake-level dt of
+  `f:reifiesObject`, so it cannot tell whether the on-wire bundle
+  emitted a separate `f:reifiesDatatype` flake (full bundle path)
+  or omitted it (JSON-LD-compatible cascade — today's user-facing
+  insert form). The arena builder reports zero for the datatype
+  row count and `merge_annotation_stats` skips datatype entirely;
+  the regular `IndexStats.properties` HLL is the source of truth.
 
 The arena-side computation lives in two parallel places (kept in
 sync): `bundle::compute_stats` (full-rebuild path, walks live edges

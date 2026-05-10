@@ -524,10 +524,7 @@ async fn storage_inspection_finds_arena_artifacts() {
 
             // Per-slot NDVs (M3.1 follow-up): the single edge has one
             // subject (alice), one predicate (worksFor), one object
-            // (acme), no named graph, and no language tag. The
-            // JSON-LD lowering omits f:reifiesDatatype on the wire,
-            // but the arena stats report the count as the upper
-            // bound = distinct_annotations.
+            // (acme), no named graph, and no language tag.
             assert_eq!(ann_root.stats.distinct_reified_subjects, 1);
             assert_eq!(ann_root.stats.distinct_reified_predicates, 1);
             assert_eq!(ann_root.stats.distinct_reified_objects, 1);
@@ -536,6 +533,10 @@ async fn storage_inspection_finds_arena_artifacts() {
             assert_eq!(ann_root.stats.reifies_lang_rows, 0);
             assert_eq!(ann_root.stats.distinct_reified_langs, 0);
             assert_eq!(ann_root.stats.reifies_list_index_rows, 0);
+            // f:reifiesDatatype is intentionally NOT synthesized
+            // from the arena — see `AnnotationStats::reifies_datatype_rows`.
+            assert_eq!(ann_root.stats.reifies_datatype_rows, 0);
+            assert_eq!(ann_root.stats.distinct_reified_datatypes, 0);
         })
         .await;
 }
