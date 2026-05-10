@@ -359,9 +359,17 @@ impl StatsView {
         insert(p::REIFIES_OBJECT, req(ann.distinct_reified_objects));
 
         // Optional slots: synth only when the arena observed non-zero
-        // rows. count = rows in live state, ndv_values = distinct
-        // values across those rows, ndv_subjects = rows (each row
-        // belongs to a distinct annotation subject).
+        // rows. `count = rows` (one row per live `(edge, ann)` pair
+        // that carries the slot). `ndv_values = distinct values`
+        // observed in that slot. `ndv_subjects` is bounded by
+        // `min(rows, distinct_annotations)` — equal under the v1
+        // single-target invariant, but if a multi-target anomaly
+        // attaches one ann SID to multiple named-graph edges the
+        // distinct subject count is capped by the total number of
+        // ann SIDs (the row's subject is the ann SID). Without the
+        // cap, `BoundSubject` selectivity for `<known_ann>
+        // f:reifiesGraph ?g` would undercount.
+        let cap_subjects = ann.distinct_annotations;
         let mut opt = |name: &str, rows: u64, ndv: u64| {
             if rows == 0 {
                 return;
@@ -371,7 +379,7 @@ impl StatsView {
                 PropertyStatData {
                     count: rows,
                     ndv_values: ndv.max(1),
-                    ndv_subjects: rows,
+                    ndv_subjects: rows.min(cap_subjects).max(1),
                 },
             );
         };
@@ -562,6 +570,48 @@ mod tests {
         assert_eq!(
             subj.count, 50,
             "older arena: count falls back to distinct_annotations"
+        );
+    }
+
+    #[test]
+    fn merge_annotation_stats_caps_optional_slot_subjects_under_multi_target() {
+        // Multi-target anomaly: 50 distinct annotation SIDs but
+        // 70 live `(edge, ann)` pairs (one ann is attached to 21
+        // distinct named-graph edges = 21 rows from a single
+        // subject). All 70 pairs are in named graphs across 3
+        // distinct graph SIDs, so reifies_graph_rows = 70.
+        // Under the old `ndv_subjects = rows` rule, the planner
+        // would compute `BoundSubject` selectivity as
+        // `70 / 70 = 1` row per known annotation, when the actual
+        // number of rows per known annotation can be 21. With the
+        // cap, ndv_subjects = min(70, 50) = 50, giving
+        // `70 / 50 ≈ 2` per known annotation — closer to the
+        // truth, never an undercount.
+        use fluree_vocab::db as p;
+        use fluree_vocab::namespaces::FLUREE_DB;
+
+        let mut view = StatsView::default();
+        let ann = AnnotationStats {
+            distinct_edges: 70,
+            distinct_annotations: 50,
+            live_attachment_pairs: 70,
+            distinct_reified_subjects: 50,
+            distinct_reified_predicates: 5,
+            distinct_reified_objects: 70,
+            reifies_graph_rows: 70,
+            distinct_reified_graphs: 3,
+            ..Default::default()
+        };
+        view.merge_annotation_stats(&ann, &HashMap::new());
+
+        let graph = view
+            .get_property(&Sid::new(FLUREE_DB, p::REIFIES_GRAPH))
+            .expect("reifiesGraph synth missing");
+        assert_eq!(graph.count, 70);
+        assert_eq!(graph.ndv_values, 3);
+        assert_eq!(
+            graph.ndv_subjects, 50,
+            "ndv_subjects must be capped by distinct_annotations under multi-target"
         );
     }
 

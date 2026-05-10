@@ -69,14 +69,17 @@ pub struct AnnotationStats {
     // Per-slot NDV counters across the live (currently-asserted) rows.
     //
     // For the three **required** slots (subject, predicate, object),
-    // every live annotation contributes exactly one row, so the row
-    // count equals `distinct_annotations`. We track only the NDV.
+    // each live `(edge, ann)` pair contributes exactly one row, so
+    // the row count equals `live_attachment_pairs` (which equals
+    // `distinct_annotations` under the v1 single-target invariant).
+    // We track only the NDV here.
     //
-    // For the **optional** slots (graph, datatype, lang, listIndex),
-    // both the row count and the NDV vary: the row count is the
-    // number of live annotations whose reified edge carries that
-    // slot, the NDV is the number of distinct values observed in
-    // that slot across those rows.
+    // For the **optional** slots (graph, lang, listIndex), both the
+    // row count and the NDV vary: the row count is the number of
+    // live `(edge, ann)` pairs whose reified edge carries that slot,
+    // the NDV is the number of distinct values observed in that
+    // slot across those pairs. (`datatype` is a special case — see
+    // its field comment below.)
     // -----------------------------------------------------------------
     /// Distinct subject SIDs across live reified edges.
     /// Used as `ndv_values` for `?ann f:reifiesSubject ?s` probes.

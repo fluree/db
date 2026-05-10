@@ -992,15 +992,26 @@ so the planner gets sharp `BoundObject` selectivity for any
 
 `AnnotationStats` carries (added in M3.1 follow-up):
 
-- Required slots — `distinct_reified_{subjects,predicates,objects}`
-  (the row count for these is always `distinct_annotations`).
-- Optional slots — both row count and distinct-value count for
-  `graph`, `datatype`, `lang`, `listIndex`. Older arena roots
-  written before these fields existed deserialize cleanly with `0`
-  via `#[serde(default)]`; the merge treats `0` as "no information"
+- `live_attachment_pairs` — number of live `(edge, ann)` pairs.
+  Equals `distinct_annotations` under the v1 single-target
+  invariant; tracked separately so the planner stays accurate on
+  legacy / replayed-from-corrupt-history ledgers where one ann SID
+  may be attached to multiple edges.
+- Required slots — `distinct_reified_{subjects,predicates,objects}`.
+  The row count for these is `live_attachment_pairs` (one row per
+  live pair per required slot).
+- Optional slots — row count + distinct-value count for `graph`,
+  `lang`, `listIndex`. Row counts are per live `(edge, ann)` pair
+  (parallel annotations on one named-graph edge each contribute
+  their own `f:reifiesGraph` row). Older arena roots written
+  before these fields existed deserialize cleanly with `0` via
+  `#[serde(default)]`; the merge treats `0` as "no information"
   and falls back to `ndv_values = 1` (safe upper bound) for the
-  required slots, or skips synthesis entirely for the optional ones
-  (regular `IndexStats.properties` HLL fills in).
+  required slots, or skips synthesis entirely for the optional
+  ones (regular `IndexStats.properties` HLL fills in).
+- `f:reifiesDatatype` is intentionally not synthesized from the
+  arena — see the field comment on
+  `AnnotationStats::reifies_datatype_rows` for why.
 
 Synthesis rules:
 
@@ -1026,8 +1037,12 @@ Synthesis rules:
   count is non-zero. Row counts are per live `(edge, ann)` pair —
   parallel annotations on the same named-graph edge each contribute
   one `f:reifiesGraph` row, matching the on-wire flake count.
-  `count = ndv_subjects = rows`, `ndv_values = distinct_<slot>`. A
-  workload that never uses named graphs leaves the
+  `count = rows`, `ndv_values = distinct_<slot>`,
+  `ndv_subjects = min(rows, distinct_annotations)` — the floor
+  defends against the multi-target anomaly where one ann SID
+  contributes multiple rows; without the cap, `BoundSubject`
+  selectivity for `<known_ann> f:reifiesGraph ?g` would
+  undercount. A workload that never uses named graphs leaves the
   `f:reifiesGraph` HLL untouched and the planner falls back to it.
 
 - **`f:reifiesDatatype` is not synthesized from the arena.** The
@@ -1115,16 +1130,14 @@ exercise:
    `IndexStats.properties` hasn't been computed yet. Pre-M3.1, the
    planner fell back to `DEFAULT_PROPERTY_SCAN_SELECTIVITY` for every
    `f:reifies*` triple; post-M3.1 it uses the arena's
-   `distinct_annotations` count.
+   `live_attachment_pairs` count and per-slot NDVs.
 2. **Heavy-retract workloads** where `IndexStats.count` is inflated by
    asserts+retracts. Arena counters are live-only, so the merged
    estimate matches the actual row count instead of an upper bound.
-
-Bigger throughput wins are gated on `AnnotationStats` growing per-slot
-NDV counters (`distinct_reified_subjects`, `distinct_reified_objects`,
-distinct_reified_predicates`) so `BoundObject` selectivity for
-`?ann f:reifiesObject ex:acme`-style probes can be sharpened beyond
-the safe `count / 1` upper bound.
+3. **Workloads with diverse reified subjects/objects** where
+   `BoundObject` selectivity for `?ann f:reifiesObject ex:acme` is
+   `live_attachment_pairs / distinct_reified_objects` — orders of
+   magnitude smaller than the scan-equivalent estimate.
 
 ---
 
