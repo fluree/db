@@ -288,7 +288,15 @@ query_execute (debug)
 │   ├── sort_blocking (debug, cross-thread via spawn_blocking)
 │   └── ...
 └── format (debug)
+    └── inject_annotations (debug, edge_in_named_graph, path, annotation_count)
+        └── annotation_arena_lookup (debug, live_count)  ← path = "arena" only
 ```
+
+`inject_annotations` and `annotation_arena_lookup` fire only on
+hydration responses that surface annotation bodies; both are skipped
+on non-annotation ledgers via the formatter's zero-cost gate.
+`path` is `"arena"` when the cached `AnnotationArenaReader` resolved
+the lookup, `"scan"` when the M2a POST-scan fallback ran.
 
 #### Span Tree (Transaction)
 
@@ -298,6 +306,9 @@ transact_execute (debug)
 │   ├── where_exec (debug, pattern_count, binding_rows, retraction_count, assertion_count)
 │   │   ├── delete_gen (debug, template_count, retraction_count)  ← per streaming-WHERE batch
 │   │   └── insert_gen (debug, template_count, assertion_count)   ← per batch (mixed DELETE+INSERT only)
+│   ├── cascade_reifies_bundle (debug, retract_input_count, lpg_edge_lifecycle, cascade_count)
+│   │     ← only on annotation ledgers (gated by snapshot.has_annotations
+│   │       || novelty.attachments.has_annotations())
 │   ├── cancellation (debug)        ← mixed DELETE+INSERT path
 │   ├── dedup_retractions (debug)   ← pure-DELETE path (no INSERT templates, not Upsert)
 │   └── policy_enforce (debug)

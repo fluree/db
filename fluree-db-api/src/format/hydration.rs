@@ -784,6 +784,19 @@ impl<'a> HydrationFormatter<'a> {
         // Find the EdgeKey from the base flake.
         let edge_key = fluree_db_core::edge::EdgeKey::from_flake(flake);
 
+        // Span the annotation injection work — skipped on the
+        // zero-cost gate path above so non-annotation ledgers don't
+        // pay any tracing cost. `path` field captures which
+        // resolution route fired (arena vs scan) for query-debug
+        // forensics.
+        use tracing::Instrument;
+        let span = tracing::debug_span!(
+            "inject_annotations",
+            edge_in_named_graph = edge_key.g.is_some(),
+            path = tracing::field::Empty,
+            annotation_count = tracing::field::Empty,
+        );
+        async {
         // Arena-backed fast path: when the formatter holds a cached
         // arena reader (constructed in `new()` from the snapshot's
         // annotation_index + content_store), look up live annotation
@@ -794,6 +807,8 @@ impl<'a> HydrationFormatter<'a> {
         // below.
         if self.arena_reader.is_some() {
             if let Some(ann_sids) = self.arena_lookup_annotations(&edge_key).await? {
+                tracing::Span::current().record("path", "arena");
+                tracing::Span::current().record("annotation_count", ann_sids.len());
                 if ann_sids.is_empty() {
                     return Ok(());
                 }
@@ -802,6 +817,7 @@ impl<'a> HydrationFormatter<'a> {
                     .await;
             }
         }
+        tracing::Span::current().record("path", "scan");
 
         // Scan candidate annotations via the base-edge subject:
         // POST(f:reifiesSubject, FlakeValue::Ref(edge.s)) gives all
@@ -886,6 +902,7 @@ impl<'a> HydrationFormatter<'a> {
             bodies.push(body);
         }
 
+        tracing::Span::current().record("annotation_count", bodies.len());
         if bodies.is_empty() {
             return Ok(());
         }
@@ -903,6 +920,9 @@ impl<'a> HydrationFormatter<'a> {
         };
         obj.insert("@annotation".to_string(), ann_json);
         Ok(())
+        }
+        .instrument(span)
+        .await
     }
 
     /// Arena-backed annotation lookup. Returns `Some(sids)` when the
@@ -918,6 +938,12 @@ impl<'a> HydrationFormatter<'a> {
         &self,
         edge_key: &fluree_db_core::edge::EdgeKey,
     ) -> Result<Option<Vec<Sid>>> {
+        use tracing::Instrument;
+        let span = tracing::debug_span!(
+            "annotation_arena_lookup",
+            live_count = tracing::field::Empty,
+        );
+        async {
         let Some(reader) = self.arena_reader.as_ref() else {
             return Ok(None);
         };
@@ -942,7 +968,11 @@ impl<'a> HydrationFormatter<'a> {
             .map_err(|e| {
                 FormatError::InvalidBinding(format!("annotation arena lookup failed: {e}"))
             })?;
+        tracing::Span::current().record("live_count", live.len());
         Ok(Some(live))
+        }
+        .instrument(span)
+        .await
     }
 
     /// Format the bodies for a list of annotation SIDs and inject

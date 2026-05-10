@@ -1173,10 +1173,31 @@ AST/IR for M1 to fill in.
 
 These touch every milestone; calling them out so they don't get lost.
 
-- **Tracing.** Add `debug_span!("edge_annotation_lookup")` and
-  `debug_span!("annotation_target_lookup")` once M1 lands. Update
-  `.claude/skills/trace-{inspect,overview}/references/span-hierarchy.md`
-  per `CLAUDE.md`.
+- **Tracing.** ✅ Three `debug_span!` instrumentation points added
+  on the read + cascade paths (M1b expansion shipped without
+  dedicated `EdgeAnnotationOp` / `AnnotationTargetOp` operators, so
+  the originally planned span names map to the actual code shape):
+  - `inject_annotations` (in `fluree-db-api/src/format/hydration.rs`)
+    — fires once per edge whose hydration injects annotation
+    bodies. Tags: `edge_in_named_graph`, `path` (`"arena"` or
+    `"scan"`), `annotation_count`. Skipped on the zero-cost gate
+    path so non-annotation ledgers pay no tracing cost.
+  - `annotation_arena_lookup` (same file) — narrower span around
+    the cached `AnnotationArenaReader` probe. Fires only on the
+    arena path. Tag: `live_count`.
+  - `cascade_reifies_bundle` (in `fluree-db-transact/src/stage.rs`)
+    — fires when an annotated base-edge retract cascades the
+    `f:reifies*` bundle. Tags: `retract_input_count`,
+    `lpg_edge_lifecycle`, `cascade_count`. Skipped via the
+    has-annotations gate on non-annotation ledgers.
+
+  All four span-hierarchy artifacts updated per `CLAUDE.md`
+  (trace-inspect + trace-overview reference docs,
+  `docs/operations/telemetry.md` span tree section). Acceptance
+  tests in
+  `fluree-db-api/tests/it_tracing_spans.rs::annotation_hydration_emits_inject_annotations_span`
+  and `..._cascade_emits_cascade_reifies_bundle_span` pin the
+  shape, levels, and tag presence.
 - **Policy.** Annotation facts are ordinary RDF and pass through the
   existing policy filter unchanged. No new policy primitive in v1.
   Confirm with an integration test in M1

@@ -95,6 +95,7 @@ async fn cascade_attachment_retracts(
     use fluree_db_core::{is_reserved_reifies_predicate, FlakeValue};
 
     use std::collections::BTreeMap;
+    use tracing::Instrument;
 
     let mut cascade = Vec::new();
 
@@ -112,6 +113,18 @@ async fn cascade_attachment_retracts(
     if !ledger.snapshot.has_annotations && !ledger.novelty.attachments.has_annotations() {
         return Ok(cascade);
     }
+
+    // Wrap the cascade work in a span — skipped for non-annotation
+    // ledgers via the gate above so we don't pay tracing cost on
+    // common-case retracts. `cascade_count` records how many
+    // f:reifies* retract flakes the cascade emitted.
+    let span = tracing::debug_span!(
+        "cascade_reifies_bundle",
+        retract_input_count = flakes.iter().filter(|f| !f.op).count(),
+        lpg_edge_lifecycle,
+        cascade_count = tracing::field::Empty,
+    );
+    async {
 
     let f_reifies_subject = Sid::new(
         fluree_vocab::namespaces::FLUREE_DB,
@@ -348,7 +361,11 @@ async fn cascade_attachment_retracts(
         cascade.extend(edge_key.to_reifies_facts_jsonld_compatible(&ann_sid, new_t, false));
     }
 
+    tracing::Span::current().record("cascade_count", cascade.len());
     Ok(cascade)
+    }
+    .instrument(span)
+    .await
 }
 
 fn build_reverse_graph_lookup(graph_sids: &HashMap<GraphId, Sid>) -> HashMap<Sid, GraphId> {
