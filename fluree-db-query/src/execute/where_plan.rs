@@ -118,40 +118,59 @@ fn expand_one_into(pattern: Pattern, out: &mut Vec<Pattern>) {
             }));
 
             // f:reifiesGraph and f:reifiesLang are NOT emitted as
-            // separate constraint triples in this M1b expansion.
+            // separate constraint triples in this expansion.
             //
-            // **Graph correctness** holds in two cases:
+            // **Safe shapes** (correct results):
             //
-            // 1. **Single-graph queries** (no `Pattern::Graph` wrapper,
-            //    or one wrapping every annotation pattern). Both the
-            //    base edge triple and the f:reifies* lookups scope to
-            //    the same graph as a side effect of the scan layer's
-            //    default graph filtering, so they can only join an
-            //    annotation that lives in the same graph as the edge.
+            // 1. **Single-graph queries** (no dataset; one ledger; no
+            //    `Pattern::Graph` wrapper). All scans run against the
+            //    same `(snapshot, g_id)` so the base edge and
+            //    f:reifies* lookups can only join annotations
+            //    co-located with the edge.
             //
-            // 2. **`Pattern::Graph` wrapped patterns**. The whole
-            //    expansion (base edge + f:reifies* lookups) is
-            //    wrapped together by `map_subpatterns` further up,
-            //    which preserves the surrounding container, so the
-            //    graph scope applies uniformly to every emitted
-            //    triple.
+            // 2. **`Pattern::Graph`-wrapped queries**. The wrapper
+            //    iterates one named graph at a time and binds the
+            //    inner scan context per iteration, so within each
+            //    iteration the base edge and the f:reifies* lookups
+            //    are all scoped to the same graph. `map_subpatterns`
+            //    further down preserves the wrapper around the
+            //    expansion, so the bug below cannot fire under this
+            //    shape.
             //
-            // **Known gap (M2):** in a multi-graph dataset where a
-            // single query stream can match flakes from more than
-            // one graph (e.g. a SPARQL `FROM` / `FROM NAMED` union),
-            // these expanded triples do not pin `f:reifiesGraph`
-            // across the join. A correctly graph-bound result
-            // requires either a custom operator that carries graph
-            // identity through the lookup, or a pattern that emits
-            // `(?ann, f:reifiesGraph, ?graph)` and binds `?graph`
-            // to the base-edge match. The custom-operator path is
-            // tracked alongside the M2 binary-arena work.
+            // **Unsafe shape — KNOWN BUG: cross-graph annotation
+            // misjoin under multi-source default graph.**
             //
-            // **Per-language disambiguation** is similarly deferred:
+            // When the dataset's default graph is the union of two or
+            // more sources (SPARQL `FROM <g1> FROM <g2>` or the
+            // JSON-LD `from: [g1, g2]` analogue), each scan operator
+            // is fanned across the sources by `DatasetOperator` and
+            // produces flakes from *all* of them concatenated. The
+            // base-edge and f:reifies* triples join on `?ann` (the
+            // annotation subject) *without* a graph correlation, so
+            // a base-edge match in g1 can pair with an annotation
+            // from g2. Concretely, `(s,p,o)` asserted in both g1 and
+            // g2 with separate annotations produces N×M cross-product
+            // rows instead of N+M correctly-attributed rows.
+            //
+            // The fix needs either a custom EdgeAnnotation operator
+            // that carries source-graph identity through the join,
+            // or a graph-aware reordering that wraps the expansion in
+            // a synthetic `Pattern::Graph` when expansion runs
+            // against a multi-source dataset (and falls back to the
+            // current shape otherwise to preserve default-graph
+            // queries on single-ledger setups). Pinning test:
+            // `it_edge_annotations::cross_graph_misjoin_in_multi_source_default_known_limitation`.
+            //
+            // **Workaround**: wrap multi-source queries in
+            // `GRAPH ?g { ... }` (SPARQL) or the JSON-LD `@graph` /
+            // dataset-named-graph access form to force per-graph
+            // iteration.
+            //
+            // **Per-language disambiguation** has the same shape:
             // the f:reifiesObject triple's `dtc` constraint matches
-            // datatype but not language; cross-lang misjoin is
-            // possible if the same string is asserted with multiple
-            // language tags.
+            // datatype but not language, so the same string asserted
+            // in multiple languages can produce a cross-language
+            // misjoin. Same architectural fix path.
 
             // 3. Body patterns (recursively expanded so nested
             //    annotations — though M0 rejects them — flatten too).

@@ -1966,3 +1966,194 @@ async fn annotation_in_named_graph_insert_succeeds() {
         .await
         .expect("M1a fix: named-graph annotation insert must succeed end-to-end");
 }
+
+#[tokio::test]
+async fn cross_graph_misjoin_in_multi_source_default_known_limitation() {
+    // Pinning test for the documented cross-graph misjoin in
+    // `expand_edge_annotation_patterns` (see comment in
+    // `fluree-db-query/src/execute/where_plan.rs`).
+    //
+    // Scenario: the same `(s, p, o)` edge is asserted in two named
+    // graphs (g1, g2) with two different annotations. A query
+    // unions both graphs into the default graph (`from: [g1, g2]`)
+    // and asks for the edge plus its annotation role *without* a
+    // `Pattern::Graph` wrapper. The expansion produces a
+    // `?ann`-keyed join with no graph correlation, so each base-edge
+    // match is paired with annotations from BOTH graphs — N×M
+    // cross-product instead of the correct N+M.
+    //
+    // This test asserts the **current** broken row count so a future
+    // fix (custom EdgeAnnotation operator with source-graph
+    // propagation, or graph-aware expansion rewrite) flips this
+    // assertion and prompts the cleanup. It is a regression detector
+    // for the bug, not coverage of correct behavior.
+    //
+    // Workaround for users today: wrap with `GRAPH ?g { ... }` so
+    // the executor iterates one graph at a time and the expanded
+    // triples scope per iteration.
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger_id = "it/edge-annotations:cross-graph-misjoin";
+    let ledger0 = genesis_ledger(&fluree, ledger_id);
+
+    let r1 = fluree
+        .insert(
+            ledger0,
+            &json!({
+                "@context": ctx(),
+                "@id": "ex:alice",
+                "@graph": "ex:graph-A",
+                "ex:worksFor": {
+                    "@id": "ex:acme",
+                    "@annotation": { "@id": "ex:emp/A", "ex:role": "Engineer" }
+                }
+            }),
+        )
+        .await
+        .expect("graph-A insert");
+    let _ = fluree
+        .insert(
+            r1.ledger,
+            &json!({
+                "@context": ctx(),
+                "@id": "ex:alice",
+                "@graph": "ex:graph-B",
+                "ex:worksFor": {
+                    "@id": "ex:acme",
+                    "@annotation": { "@id": "ex:emp/B", "ex:role": "Manager" }
+                }
+            }),
+        )
+        .await
+        .expect("graph-B insert");
+
+    let q = json!({
+        "@context": ctx(),
+        "from": [
+            format!("{ledger_id}#http://example.org/graph-A"),
+            format!("{ledger_id}#http://example.org/graph-B"),
+        ],
+        "select": ["?role", "?ann"],
+        "where": {
+            "@id": "ex:alice",
+            "ex:worksFor": {
+                "@id": "ex:acme",
+                "@annotation": { "@id": "?ann", "ex:role": "?role" }
+            }
+        }
+    });
+    let result = fluree
+        .query_connection(&q)
+        .await
+        .expect("multi-source default query");
+    let ledger = fluree.ledger(ledger_id).await.expect("reload");
+    let json = result.to_jsonld(&ledger.snapshot).expect("jsonld");
+    let arr = json.as_array().expect("array");
+
+    // Bug signature: each annotation appears once per graph in the
+    // dataset rather than exactly once. With two graphs we get four
+    // rows; the correct count is two. When the architectural fix
+    // lands, this assertion will fail and the fixer should:
+    //   1. Update the comment in `expand_edge_annotation_patterns`
+    //      to note the bug is closed.
+    //   2. Convert this test to assert exactly two rows
+    //      (one per graph), each with role+ann from the same graph.
+    assert_eq!(
+        arr.len(),
+        4,
+        "known-bug pinning: multi-source default-graph annotation \
+         expansion produces N×M cross-product. Got: {arr:#?}"
+    );
+}
+
+#[tokio::test]
+async fn graph_wrapped_query_correctly_pairs_annotations_per_graph() {
+    // Positive coverage: when the user wraps a multi-source query in
+    // `Pattern::Graph` (here via JSON-LD's named-graph access form),
+    // the executor iterates one graph at a time and the expanded
+    // f:reifies* triples scope per iteration. Each annotation pairs
+    // only with its own graph's edge — no cross-graph misjoin.
+    //
+    // This is the workaround documented on the bug pinning test.
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger_id = "it/edge-annotations:graph-wrapped-correct";
+    let ledger0 = genesis_ledger(&fluree, ledger_id);
+
+    let r1 = fluree
+        .insert(
+            ledger0,
+            &json!({
+                "@context": ctx(),
+                "@id": "ex:alice",
+                "@graph": "ex:graph-A",
+                "ex:worksFor": {
+                    "@id": "ex:acme",
+                    "@annotation": { "@id": "ex:emp/A", "ex:role": "Engineer" }
+                }
+            }),
+        )
+        .await
+        .expect("graph-A insert");
+    let _ = fluree
+        .insert(
+            r1.ledger,
+            &json!({
+                "@context": ctx(),
+                "@id": "ex:alice",
+                "@graph": "ex:graph-B",
+                "ex:worksFor": {
+                    "@id": "ex:acme",
+                    "@annotation": { "@id": "ex:emp/B", "ex:role": "Manager" }
+                }
+            }),
+        )
+        .await
+        .expect("graph-B insert");
+
+    // Single-graph query against graph A: two iterations would have
+    // produced 2 rows under the bug. Scoping to one graph gives the
+    // correct 1 row. Repeat for graph B as a sanity check.
+    for (graph_alias, expected_role, expected_ann) in [
+        ("ex:graph-A", "Engineer", "ex:emp/A"),
+        ("ex:graph-B", "Manager", "ex:emp/B"),
+    ] {
+        let q = json!({
+            "@context": ctx(),
+            "from": format!("{ledger_id}#http://example.org/{}",
+                graph_alias.strip_prefix("ex:").unwrap()),
+            "select": ["?role", "?ann"],
+            "where": {
+                "@id": "ex:alice",
+                "ex:worksFor": {
+                    "@id": "ex:acme",
+                    "@annotation": { "@id": "?ann", "ex:role": "?role" }
+                }
+            }
+        });
+        let result = fluree
+            .query_connection(&q)
+            .await
+            .unwrap_or_else(|e| panic!("query for {graph_alias}: {e:?}"));
+        let ledger = fluree.ledger(ledger_id).await.expect("reload");
+        let json = result.to_jsonld(&ledger.snapshot).expect("jsonld");
+        let arr = json.as_array().expect("array");
+        assert_eq!(
+            arr.len(),
+            1,
+            "single-graph scope must produce exactly one row for {graph_alias}: {arr:#?}"
+        );
+        let row = arr[0].as_array().expect("row");
+        assert_eq!(
+            row[0].as_str(),
+            Some(expected_role),
+            "role binding for {graph_alias}"
+        );
+        assert!(
+            iri_matches(
+                &row[1],
+                expected_ann,
+                &format!("http://example.org/{}", expected_ann.strip_prefix("ex:").unwrap()),
+            ),
+            "annotation IRI for {graph_alias}: {row:#?}"
+        );
+    }
+}

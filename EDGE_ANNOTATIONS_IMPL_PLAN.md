@@ -313,24 +313,57 @@ correctness items remaining):**
     so attachment lifecycle stays inspectable. Applied in both
     `open()` and `prime_history_flakes()`. Test:
     `history_query_surfaces_f_reifies_events`.
-- ⏳ **Graph-bound expansion in multi-graph queries.** The IR-level
-  expansion in `expand_edge_annotation_patterns` correctly handles
-  single-graph queries and `Pattern::Graph`-wrapped patterns (the
-  base edge and `f:reifies*` lookups all scope to the same graph
-  via the standard scan filter). It does **not** explicitly bind
-  the graph variable across the lookup, so a multi-graph dataset
-  with the same `(s,p,o)` in multiple graphs and SPARQL
-  `FROM` / `FROM NAMED` semantics can join an annotation from
-  graph X with a base edge from graph Y. The proper fix needs
-  either a custom operator that carries graph identity through the
-  lookup or an `(?ann, f:reifiesGraph, ?graph)` triple bound to
-  the base-edge match. Tracked alongside the M2 binary-arena work
-  since the custom operator becomes the right vehicle then.
-- ⏳ **Per-language disambiguation.** Same architectural shape:
-  `f:reifiesLang` is emitted by the write side but not constrained
-  in the read-side expansion, so cross-language misjoin is possible
-  when the same string is asserted with multiple language tags.
-  Same fix path as the graph-bound expansion.
+- ⏳ **Graph-bound expansion in multi-graph queries — bug confirmed,
+  workaround documented, architectural fix scoped.**
+
+  The IR-level expansion in `expand_edge_annotation_patterns`
+  correctly handles two shapes (each scan iteration is per-graph in
+  these cases, so the join cannot cross graphs):
+  - **Single-graph queries** (one ledger, no dataset).
+  - **`Pattern::Graph`-wrapped patterns** (the wrapper carries
+    through `map_subpatterns` and the executor iterates one named
+    graph at a time, scoping every expanded triple per iteration).
+
+  The bug fires when the dataset's default graph is the union of two
+  or more sources (`from: [g1, g2]` / SPARQL `FROM <g1> FROM <g2>`)
+  and the EdgeAnnotation/AnnotationTarget is **not** wrapped in
+  `Pattern::Graph`. `DatasetOperator` fans every scan independently
+  across the sources, so each base-edge match gets cross-joined with
+  annotations from every source — N×M rows instead of N+M. The
+  base-edge graph and the annotation graph aren't correlated through
+  the `?ann` join key.
+
+  Pinning test:
+  `it_edge_annotations::cross_graph_misjoin_in_multi_source_default_known_limitation`
+  (asserts the current 4-row output for a 2-graph + 1-edge-each
+  scenario). When the architectural fix lands, this test flips to
+  asserting 2 rows. Workaround coverage:
+  `graph_wrapped_query_correctly_pairs_annotations_per_graph` shows
+  the GRAPH-scoped form returns the correct 1 row per graph.
+
+  **Fix path** (own slice, not in this changeset):
+  - **Preferred — custom operator**. An `EdgeAnnotation` /
+    `AnnotationTarget` operator that carries source-graph identity
+    through the join. Same vehicle handles per-language
+    disambiguation. Touches the planner + scan dispatch + dataset
+    fanout.
+  - **Alternative — graph-aware expansion rewrite**. At expansion
+    time, when context indicates a multi-source dataset, wrap the
+    expansion in a synthetic `Pattern::Graph { graph: ?fresh }` so
+    each iteration scopes per-graph. Pure IR rewrite but needs
+    dataset-shape plumbing into `build_where_plan` and only handles
+    named-graph cases (default-graph wrap excludes default data).
+
+  See the comment block on `expand_edge_annotation_patterns` in
+  `fluree-db-query/src/execute/where_plan.rs` for the in-code
+  contract.
+- ⏳ **Per-language disambiguation.** Same architectural shape as the
+  graph-bound bug above: `f:reifiesLang` is emitted by the write side
+  but not constrained in the read-side expansion, so cross-language
+  misjoin is possible when the same string is asserted with multiple
+  language tags. Same custom-operator fix path; lands in the same
+  slice. No pinning test today — needs setup that exercises
+  multi-language flakes through the inline annotation form.
 - ⏳ **Wildcard hide of anonymous annotation SIDs.** Explicit-IRI
   annotation subjects stay visible; anonymous (blank-node) ones are
   filtered out of `select: "*"` per the design decisions.
