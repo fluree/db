@@ -1038,12 +1038,15 @@ Synthesis rules:
   parallel annotations on the same named-graph edge each contribute
   one `f:reifiesGraph` row, matching the on-wire flake count.
   `count = rows`, `ndv_values = distinct_<slot>`,
-  `ndv_subjects = min(rows, distinct_annotations)` — the floor
-  defends against the multi-target anomaly where one ann SID
-  contributes multiple rows; without the cap, `BoundSubject`
-  selectivity for `<known_ann> f:reifiesGraph ?g` would
-  undercount. A workload that never uses named graphs leaves the
-  `f:reifiesGraph` HLL untouched and the planner falls back to it.
+  `ndv_subjects = distinct_<slot>_anns` (the per-slot distinct
+  annotation SID count tracked by the arena builder). For older
+  arena roots that predate the per-slot ann counters, `ndv_subjects`
+  falls back to `min(rows, distinct_annotations)` — exact under the
+  v1 single-target invariant but heuristic under the multi-target
+  anomaly, where it can undercount when a sparse slot has one ann
+  SID dominating many edges. A workload that never uses named
+  graphs leaves the `f:reifiesGraph` HLL untouched and the planner
+  falls back to it.
 
 - **`f:reifiesDatatype` is not synthesized from the arena.** The
   arena reconstructs `EdgeKey.dt` from the flake-level dt of

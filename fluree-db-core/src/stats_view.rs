@@ -287,10 +287,17 @@ impl StatsView {
     /// `f:reifiesListIndex`): synthesized **only when their per-slot
     /// row count is non-zero**. The row count (e.g.
     /// `reifies_graph_rows`) is the number of live `(edge, ann)`
-    /// pairs whose edge carries that slot — strictly `≤
-    /// distinct_annotations`. When the row count is zero (older
-    /// arenas with default-zeroed fields, or workloads that never
-    /// use that slot), we leave the entry to the regular
+    /// pairs whose edge carries that slot — usually strictly less
+    /// than `live_attachment_pairs`, and equal to the per-slot
+    /// distinct ann SID count under the v1 single-target
+    /// invariant. The multi-target anomaly can push it above
+    /// `distinct_annotations` (one ann SID with many graph edges).
+    /// `ndv_subjects` uses the per-slot ann-SID count
+    /// (`distinct_<slot>_anns`) when available, falling back to
+    /// `min(rows, distinct_annotations)` for older arena roots that
+    /// predate the per-slot counters. When the row count is zero
+    /// (older arenas with default-zeroed fields, or workloads that
+    /// never use that slot), we leave the entry to the regular
     /// `IndexStats.properties` HLL.
     ///
     /// **`f:reifiesDatatype` is intentionally not synthesized.** The
@@ -359,27 +366,36 @@ impl StatsView {
         insert(p::REIFIES_OBJECT, req(ann.distinct_reified_objects));
 
         // Optional slots: synth only when the arena observed non-zero
-        // rows. `count = rows` (one row per live `(edge, ann)` pair
-        // that carries the slot). `ndv_values = distinct values`
-        // observed in that slot. `ndv_subjects` is bounded by
-        // `min(rows, distinct_annotations)` — equal under the v1
-        // single-target invariant, but if a multi-target anomaly
-        // attaches one ann SID to multiple named-graph edges the
-        // distinct subject count is capped by the total number of
-        // ann SIDs (the row's subject is the ann SID). Without the
-        // cap, `BoundSubject` selectivity for `<known_ann>
-        // f:reifiesGraph ?g` would undercount.
+        // rows. `count = rows`, `ndv_values = distinct values`,
+        // `ndv_subjects = per-slot ann-SID count` when available.
+        //
+        // Older arena roots predate the per-slot ann-SID counters
+        // and report `0` for them. In that case we fall back to
+        // `min(rows, distinct_annotations).max(1)` — a heuristic
+        // that's exact under the v1 single-target invariant (rows
+        // == distinct slot anns) but is wrong in either direction
+        // when one ann SID has many slot rows: a sparse slot where
+        // one anomaly ann holds most rows ends up with
+        // `ndv_subjects == rows` (the cap doesn't bind) and
+        // `BoundSubject` undercounts. The principled fix when this
+        // matters is to reindex with the per-slot counters
+        // populated — current builders always emit them.
         let cap_subjects = ann.distinct_annotations;
-        let mut opt = |name: &str, rows: u64, ndv: u64| {
+        let mut opt = |name: &str, rows: u64, ndv: u64, slot_anns: u64| {
             if rows == 0 {
                 return;
             }
+            let subjects = if slot_anns > 0 {
+                slot_anns
+            } else {
+                rows.min(cap_subjects).max(1)
+            };
             insert(
                 name,
                 PropertyStatData {
                     count: rows,
                     ndv_values: ndv.max(1),
-                    ndv_subjects: rows.min(cap_subjects).max(1),
+                    ndv_subjects: subjects.max(1),
                 },
             );
         };
@@ -387,6 +403,7 @@ impl StatsView {
             p::REIFIES_GRAPH,
             ann.reifies_graph_rows,
             ann.distinct_reified_graphs,
+            ann.distinct_graph_anns,
         );
         // `f:reifiesDatatype` is intentionally skipped — arena
         // builder reports zeros (see `AnnotationStats::reifies_datatype_rows`).
@@ -394,11 +411,13 @@ impl StatsView {
             p::REIFIES_LANG,
             ann.reifies_lang_rows,
             ann.distinct_reified_langs,
+            ann.distinct_lang_anns,
         );
         opt(
             p::REIFIES_LIST_INDEX,
             ann.reifies_list_index_rows,
             ann.distinct_reified_list_indices,
+            ann.distinct_list_index_anns,
         );
     }
 }
@@ -570,6 +589,46 @@ mod tests {
         assert_eq!(
             subj.count, 50,
             "older arena: count falls back to distinct_annotations"
+        );
+    }
+
+    #[test]
+    fn merge_annotation_stats_uses_per_slot_ann_count_for_sparse_anomaly() {
+        // Reviewer's case: 1000 annotations total, but only one of
+        // them carries a graph slot — and that one is attached to
+        // 21 distinct named-graph edges (the multi-target anomaly).
+        // So `reifies_graph_rows = 21`, `distinct_graph_anns = 1`.
+        // Without the per-slot ann counter, the cap fallback
+        // `min(rows, distinct_annotations) = min(21, 1000) = 21`
+        // would set ndv_subjects = 21, making BoundSubject estimate
+        // `21 / 21 = 1` row when the true answer for the anomalous
+        // ann is 21 rows. With the per-slot counter, ndv_subjects
+        // = 1 → BoundSubject = 21 / 1 = 21. Exact.
+        use fluree_vocab::db as p;
+        use fluree_vocab::namespaces::FLUREE_DB;
+
+        let mut view = StatsView::default();
+        let ann = AnnotationStats {
+            distinct_edges: 1020,
+            distinct_annotations: 1000,
+            live_attachment_pairs: 1020,
+            distinct_reified_subjects: 1000,
+            distinct_reified_predicates: 5,
+            distinct_reified_objects: 1020,
+            reifies_graph_rows: 21,
+            distinct_reified_graphs: 1,
+            distinct_graph_anns: 1,
+            ..Default::default()
+        };
+        view.merge_annotation_stats(&ann, &HashMap::new());
+
+        let graph = view
+            .get_property(&Sid::new(FLUREE_DB, p::REIFIES_GRAPH))
+            .expect("reifiesGraph synth missing");
+        assert_eq!(graph.count, 21);
+        assert_eq!(
+            graph.ndv_subjects, 1,
+            "ndv_subjects must use distinct_graph_anns, not the row count"
         );
     }
 

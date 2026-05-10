@@ -277,6 +277,13 @@ fn compute_stats(
     let mut lang_rows: u64 = 0;
     let mut list_index_rows: u64 = 0;
     let mut live_pairs: u64 = 0;
+    // Per-optional-slot ann-SID sets — the right denominator for
+    // `<known_ann> f:reifies<slot> ?v` BoundSubject estimates.
+    // Under the v1 invariant each set's size equals the slot's row
+    // count; under multi-target it can be smaller.
+    let mut graph_anns: HashSet<&Sid> = HashSet::new();
+    let mut lang_anns: HashSet<&Sid> = HashSet::new();
+    let mut list_index_anns: HashSet<&Sid> = HashSet::new();
 
     for i in 0..forward.len() {
         let last_in_group = i + 1 == forward.len()
@@ -286,8 +293,9 @@ fn compute_stats(
             continue;
         }
         let edge = &forward[i].edge;
+        let ann = &forward[i].ann;
         live_edges.insert(edge);
-        live_anns.insert(&forward[i].ann);
+        live_anns.insert(ann);
         live_pairs += 1;
 
         // Distinct values are per-edge (HashSet dedupes natural
@@ -309,14 +317,19 @@ fn compute_stats(
         // — each annotation on a named-graph edge contributes its
         // own `f:reifiesGraph` row. Counting per distinct edge would
         // under-report when parallel annotations share an endpoint.
+        // The per-slot ann-SID sets dedupe naturally for the
+        // multi-target anomaly case.
         if edge.g.is_some() {
             graph_rows += 1;
+            graph_anns.insert(ann);
         }
         if edge.lang.is_some() {
             lang_rows += 1;
+            lang_anns.insert(ann);
         }
         if edge.list_i.is_some() {
             list_index_rows += 1;
+            list_index_anns.insert(ann);
         }
     }
 
@@ -342,12 +355,15 @@ fn compute_stats(
         distinct_reified_objects: objects.len() as u64,
         reifies_graph_rows: graph_rows,
         distinct_reified_graphs: graphs.len() as u64,
+        distinct_graph_anns: graph_anns.len() as u64,
         reifies_datatype_rows: 0,
         distinct_reified_datatypes: 0,
         reifies_lang_rows: lang_rows,
         distinct_reified_langs: langs.len() as u64,
+        distinct_lang_anns: lang_anns.len() as u64,
         reifies_list_index_rows: list_index_rows,
         distinct_reified_list_indices: list_indices.len() as u64,
+        distinct_list_index_anns: list_index_anns.len() as u64,
     }
 }
 

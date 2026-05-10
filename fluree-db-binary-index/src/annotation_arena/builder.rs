@@ -98,6 +98,9 @@ pub fn forward_arena_stats(rows: &[AnnotationForwardRow]) -> (i64, AnnotationSta
     let mut lang_rows: u64 = 0;
     let mut list_index_rows: u64 = 0;
     let mut live_pairs: u64 = 0;
+    let mut graph_anns: HashSet<Sid> = HashSet::new();
+    let mut lang_anns: HashSet<Sid> = HashSet::new();
+    let mut list_index_anns: HashSet<Sid> = HashSet::new();
 
     for i in 0..rows.len() {
         if rows[i].t > max_t {
@@ -114,8 +117,9 @@ pub fn forward_arena_stats(rows: &[AnnotationForwardRow]) -> (i64, AnnotationSta
             continue;
         }
         let edge = &rows[i].edge;
+        let ann = &rows[i].ann;
         live_edges.insert(edge.clone());
-        live_anns.insert(rows[i].ann.clone());
+        live_anns.insert(ann.clone());
         live_pairs += 1;
 
         subjects.insert(edge.s.clone());
@@ -124,14 +128,17 @@ pub fn forward_arena_stats(rows: &[AnnotationForwardRow]) -> (i64, AnnotationSta
         if let Some(g) = &edge.g {
             graphs.insert(g.clone());
             graph_rows += 1;
+            graph_anns.insert(ann.clone());
         }
         if let Some(lang) = &edge.lang {
             langs.insert(lang.clone());
             lang_rows += 1;
+            lang_anns.insert(ann.clone());
         }
         if let Some(idx) = edge.list_i {
             list_indices.insert(idx);
             list_index_rows += 1;
+            list_index_anns.insert(ann.clone());
         }
     }
 
@@ -153,12 +160,15 @@ pub fn forward_arena_stats(rows: &[AnnotationForwardRow]) -> (i64, AnnotationSta
         distinct_reified_objects: objects.len() as u64,
         reifies_graph_rows: graph_rows,
         distinct_reified_graphs: graphs.len() as u64,
+        distinct_graph_anns: graph_anns.len() as u64,
         reifies_datatype_rows: 0,
         distinct_reified_datatypes: 0,
         reifies_lang_rows: lang_rows,
         distinct_reified_langs: langs.len() as u64,
+        distinct_lang_anns: lang_anns.len() as u64,
         reifies_list_index_rows: list_index_rows,
         distinct_reified_list_indices: list_indices.len() as u64,
+        distinct_list_index_anns: list_index_anns.len() as u64,
     };
     (max_t, stats)
 }
@@ -477,6 +487,10 @@ mod tests {
             stats.reifies_graph_rows, 3,
             "three live (edge, ann) pairs each contribute one f:reifiesGraph row"
         );
+        assert_eq!(
+            stats.distinct_graph_anns, 3,
+            "three distinct ann SIDs hold f:reifiesGraph rows under v1 invariant"
+        );
 
         // datatype rows always 0 from the arena (see compute_stats
         // comment): the arena reconstructs `EdgeKey.dt` from the
@@ -484,6 +498,60 @@ mod tests {
         // separate f:reifiesDatatype predicate's actual presence.
         assert_eq!(stats.reifies_datatype_rows, 0);
         assert_eq!(stats.distinct_reified_datatypes, 0);
+    }
+
+    #[test]
+    fn forward_stats_distinct_slot_anns_dedupes_under_multi_target() {
+        // Multi-target anomaly: ann_a has graph slots on three
+        // different edges. The arena reports `reifies_graph_rows = 3`
+        // but `distinct_graph_anns = 1` — only one ann SID actually
+        // holds graph slots. ann_b has one graph row; ann_c has no
+        // graph (default-graph edge) so doesn't appear in the
+        // graph-anns set.
+        let g = sid(99, "g1");
+        let mk_with_g = |s: u8, ann: &str, t: i64| AnnotationForwardRow {
+            edge: EdgeKey {
+                g: Some(g.clone()),
+                s: sid(11, &format!("s{s}")),
+                p: sid(12, "worksFor"),
+                o: FlakeValue::Ref(sid(11, "acme")),
+                dt: Sid::new(0, xsd::ANY_URI),
+                lang: None,
+                list_i: None,
+            },
+            ann: sid(20, ann),
+            t,
+            op: true,
+        };
+        let mk_default = |s: u8, ann: &str, t: i64| AnnotationForwardRow {
+            edge: EdgeKey {
+                g: None,
+                s: sid(11, &format!("s{s}")),
+                p: sid(12, "worksFor"),
+                o: FlakeValue::Ref(sid(11, "acme")),
+                dt: Sid::new(0, xsd::ANY_URI),
+                lang: None,
+                list_i: None,
+            },
+            ann: sid(20, ann),
+            t,
+            op: true,
+        };
+        let rows = vec![
+            mk_with_g(0, "ann_a", 1),
+            mk_with_g(1, "ann_a", 2),
+            mk_with_g(2, "ann_a", 3),
+            mk_with_g(3, "ann_b", 4),
+            mk_default(4, "ann_c", 5),
+        ];
+        let (_, stats) = forward_arena_stats(&rows);
+        assert_eq!(stats.distinct_annotations, 3);
+        assert_eq!(stats.live_attachment_pairs, 5);
+        assert_eq!(stats.reifies_graph_rows, 4);
+        assert_eq!(
+            stats.distinct_graph_anns, 2,
+            "ann_a + ann_b carry graph rows; ann_c does not"
+        );
     }
 
     #[test]

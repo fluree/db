@@ -531,9 +531,12 @@ async fn storage_inspection_finds_arena_artifacts() {
             assert_eq!(ann_root.stats.distinct_reified_objects, 1);
             assert_eq!(ann_root.stats.reifies_graph_rows, 0);
             assert_eq!(ann_root.stats.distinct_reified_graphs, 0);
+            assert_eq!(ann_root.stats.distinct_graph_anns, 0);
             assert_eq!(ann_root.stats.reifies_lang_rows, 0);
             assert_eq!(ann_root.stats.distinct_reified_langs, 0);
+            assert_eq!(ann_root.stats.distinct_lang_anns, 0);
             assert_eq!(ann_root.stats.reifies_list_index_rows, 0);
+            assert_eq!(ann_root.stats.distinct_list_index_anns, 0);
             // f:reifiesDatatype is intentionally NOT synthesized
             // from the arena — see `AnnotationStats::reifies_datatype_rows`.
             assert_eq!(ann_root.stats.reifies_datatype_rows, 0);

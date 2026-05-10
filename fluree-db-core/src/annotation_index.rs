@@ -92,14 +92,28 @@ pub struct AnnotationStats {
     #[serde(default)]
     pub distinct_reified_objects: u64,
 
-    /// Live `f:reifiesGraph` rows = number of live annotations whose
-    /// reified edge is in a named graph (the slot is omitted for
-    /// default-graph edges, so this is generally `< distinct_annotations`).
+    /// Live `f:reifiesGraph` rows = number of live `(edge, ann)`
+    /// pairs whose reified edge is in a named graph. Per pair, not
+    /// per distinct edge — parallel annotations on the same named-
+    /// graph edge each contribute one row. Generally `<
+    /// live_attachment_pairs` (the slot is omitted for default-graph
+    /// edges) but can exceed `distinct_annotations` when a single
+    /// ann SID is attached to multiple named-graph edges (the
+    /// multi-target anomaly the v1 stage-time invariant rejects).
     #[serde(default)]
     pub reifies_graph_rows: u64,
     /// Distinct named-graph SIDs across live reified edges.
     #[serde(default)]
     pub distinct_reified_graphs: u64,
+    /// Distinct **annotation** SIDs that appear in `f:reifiesGraph`
+    /// rows. Used as `ndv_subjects` for `<known_ann> f:reifiesGraph
+    /// ?g` probes — the right denominator for BoundSubject
+    /// selectivity (each row's subject is the ann SID, and not every
+    /// ann SID has a graph row when the slot is sparse). Under the
+    /// v1 single-target invariant this equals `reifies_graph_rows`;
+    /// under the multi-target anomaly it can be smaller.
+    #[serde(default)]
+    pub distinct_graph_anns: u64,
 
     /// **Always 0 from the arena builder.** The arena reconstructs
     /// `EdgeKey.dt` from the flake-level dt of `f:reifiesObject`, so
@@ -117,13 +131,17 @@ pub struct AnnotationStats {
     #[serde(default)]
     pub distinct_reified_datatypes: u64,
 
-    /// Live `f:reifiesLang` rows = number of live annotations whose
-    /// reified edge has a language-tagged literal object.
+    /// Live `f:reifiesLang` rows. Per `(edge, ann)` pair; same
+    /// invariant story as `reifies_graph_rows`.
     #[serde(default)]
     pub reifies_lang_rows: u64,
     /// Distinct language-tag values across live reified edges.
     #[serde(default)]
     pub distinct_reified_langs: u64,
+    /// Distinct annotation SIDs that appear in `f:reifiesLang`
+    /// rows. See `distinct_graph_anns` for rationale.
+    #[serde(default)]
+    pub distinct_lang_anns: u64,
 
     /// Live `f:reifiesListIndex` rows. v1 always 0 — list-element
     /// annotations are deferred (see `EDGE_ANNOTATIONS.md` decisions).
@@ -132,6 +150,10 @@ pub struct AnnotationStats {
     /// Distinct list-index values across live reified edges.
     #[serde(default)]
     pub distinct_reified_list_indices: u64,
+    /// Distinct annotation SIDs that appear in `f:reifiesListIndex`
+    /// rows. See `distinct_graph_anns` for rationale.
+    #[serde(default)]
+    pub distinct_list_index_anns: u64,
 }
 
 /// Inline section in the binary index root.
