@@ -1831,6 +1831,99 @@ async fn wildcard_subject_hydration_hides_f_reifies_predicates() {
 }
 
 #[tokio::test]
+async fn wildcard_subject_hydration_hides_anonymous_annotation_sids() {
+    // Anonymous (blank-node) annotation subjects are LPG-style
+    // internal occurrence ids per the design contract. When a
+    // wildcard subject hydration query happens to bind a row's
+    // subject variable to such an anonymous SID — typically because
+    // the user matched on a body property like `ex:role` —
+    // expanding it would leak the bnode identifier as a top-level
+    // result. The hydration filter at the top of `format_subject`
+    // returns Null for anonymous annotation subjects so the row
+    // surfaces as `null` rather than `{"@id": "_:bnode_x", ...}`.
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger_id = "it/edge-annotations:wildcard-hides-anon-anns";
+    let ledger0 = genesis_ledger(&fluree, ledger_id);
+
+    // Anonymous annotation: no `@id` → blank-node SID minted by
+    // the transactor.
+    let txn = json!({
+        "@context": ctx(),
+        "@id": "ex:alice",
+        "ex:worksFor": {
+            "@id": "ex:acme",
+            "@annotation": { "ex:role": "Engineer" }
+        }
+    });
+    let committed = fluree
+        .insert(ledger0, &txn)
+        .await
+        .expect("anonymous annotation insert");
+
+    let query = json!({
+        "@context": ctx(),
+        "select": {"?ann": ["*"]},
+        "where": { "@id": "?ann", "ex:role": "Engineer" }
+    });
+    let rows = support::query_jsonld_formatted(&fluree, &committed.ledger, &query)
+        .await
+        .expect("wildcard hydration over anonymous annotation");
+    rows.as_array().expect("array");
+
+    // Either the row is omitted entirely, or it surfaces as JSON
+    // null. The exact shape depends on whether the formatter
+    // upstream filters nulls; both are acceptable. The contract
+    // is: no blank-node `@id` leaks through the result.
+    let serialized = serde_json::to_string(&rows).expect("serialize");
+    assert!(
+        !serialized.contains("_:") && !serialized.contains("\"@id\""),
+        "anonymous annotation subject must not leak its blank-node @id: {serialized}"
+    );
+}
+
+#[tokio::test]
+async fn wildcard_subject_hydration_keeps_explicit_iri_annotations_visible() {
+    // Counterpart to the anonymous-hide test. Explicit-IRI
+    // annotation subjects are ordinary user-named resources — the
+    // user wrote the `@id` so they want to see it. The hydration
+    // filter only triggers on blank-node SIDs, so explicit IRIs
+    // pass through unchanged.
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger_id = "it/edge-annotations:wildcard-keeps-explicit-anns";
+    let ledger0 = genesis_ledger(&fluree, ledger_id);
+
+    let txn = json!({
+        "@context": ctx(),
+        "@id": "ex:alice",
+        "ex:worksFor": {
+            "@id": "ex:acme",
+            "@annotation": { "@id": "ex:emp/A", "ex:role": "Engineer" }
+        }
+    });
+    let committed = fluree
+        .insert(ledger0, &txn)
+        .await
+        .expect("explicit annotation insert");
+
+    let query = json!({
+        "@context": ctx(),
+        "select": {"?ann": ["*"]},
+        "where": { "@id": "?ann", "ex:role": "Engineer" }
+    });
+    let rows = support::query_jsonld_formatted(&fluree, &committed.ledger, &query)
+        .await
+        .expect("wildcard hydration over explicit annotation");
+    let arr = rows.as_array().expect("array");
+    assert_eq!(arr.len(), 1);
+    let node = arr[0].as_object().expect("hydrated node");
+    let id = node.get("@id").and_then(|v| v.as_str()).unwrap_or("");
+    assert!(
+        id == "ex:emp/A" || id == "http://example.org/emp/A",
+        "explicit-IRI annotation @id must remain visible: {node:#?}"
+    );
+}
+
+#[tokio::test]
 async fn cascade_retracts_named_graph_annotations_in_their_own_graph() {
     // Regression: cascade retract bundles must carry the same
     // `g = Some(graph_sid)` as the original named-graph assertion.

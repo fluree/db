@@ -364,9 +364,18 @@ correctness items remaining):**
   language tags. Same custom-operator fix path; lands in the same
   slice. No pinning test today — needs setup that exercises
   multi-language flakes through the inline annotation form.
-- ⏳ **Wildcard hide of anonymous annotation SIDs.** Explicit-IRI
-  annotation subjects stay visible; anonymous (blank-node) ones are
-  filtered out of `select: "*"` per the design decisions.
+- ✅ **Wildcard hide of anonymous annotation SIDs.** The hydration
+  formatter (`fluree-db-api/src/format/hydration.rs::format_subject`)
+  returns `Null` for top-level subject expansions whose root SID is
+  a blank node carrying any `f:reifiesSubject` flake — the
+  discriminator that every annotation has. Anonymous annotation
+  subjects no longer leak as top-level results when a wildcard
+  query incidentally binds the row variable to one (e.g. via a body
+  property like `?ann ex:role "Engineer"`). Explicit-IRI annotation
+  subjects stay visible. The filter only fires at `depth.current
+  == 0` so recursive ref expansion behaves unchanged. Test pair:
+  `wildcard_subject_hydration_hides_anonymous_annotation_sids` and
+  `wildcard_subject_hydration_keeps_explicit_iri_annotations_visible`.
 - ✅ **Plain-edge retract cascade** (`feat(M1b): cascade f:reifies*`):
   retracting a base edge via DELETE / SPARQL UPDATE auto-retracts
   the `f:reifies*` bundle pointing at it via a stage-time pass that

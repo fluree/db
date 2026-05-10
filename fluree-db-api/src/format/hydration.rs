@@ -481,6 +481,34 @@ impl<'a> HydrationFormatter<'a> {
             // Fetch forward properties
             let flakes = self.fetch_subject_properties(sid).await?;
 
+            // Hide anonymous (blank-node) annotation subjects from
+            // top-level subject expansion. Per the design contract,
+            // generated annotation SIDs are LPG-style internal
+            // occurrence ids — the user surface for reading
+            // annotations is `@annotation` / `@reifies`, which goes
+            // through the dedicated `inject_annotations` path that
+            // strips the bnode `@id`. A wildcard subject expansion
+            // landing on an annotation SID via the body's user
+            // properties (e.g. `?s ex:role "Engineer"` happens to
+            // bind `?s` to a blank-node annotation) would otherwise
+            // leak the bnode identifier as a top-level subject.
+            //
+            // Only fires at the top of the expansion (`depth.current
+            // == 0`) — recursive ref expansion keeps the existing
+            // behavior so explicit-IRI annotation subjects nested
+            // under a ref-valued property still render. The
+            // `f:reifiesSubject` flake is the discriminator: every
+            // annotation carries one.
+            if depth.current == 0
+                && sid.namespace_code == BLANK_NODE
+                && flakes
+                    .iter()
+                    .any(|f| fluree_db_core::namespaces::is_reifies_subject(&f.p))
+            {
+                visited.remove(sid);
+                return Ok(JsonValue::Null);
+            }
+
             // Group flakes by predicate
             let mut by_pred: HashMap<Sid, Vec<&Flake>> = HashMap::new();
             for flake in &flakes {
