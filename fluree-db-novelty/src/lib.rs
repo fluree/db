@@ -602,9 +602,11 @@ impl Novelty {
             graph_vecs.opst = opst;
 
             // Update attachment overlay after the per-graph batch is
-            // committed. Errors here are observed-bundle malformations
-            // and should fail the bulk apply rather than silently
-            // skipping rows.
+            // committed. Malformed bundles are skipped + warned +
+            // counted on `attachments.observed_malformed_bundle_count`
+            // (see `AttachmentNovelty::observe_flakes`); the
+            // `Result` only fails on infrastructure-level errors,
+            // which `?` propagates here.
             if !accepted_reifies.is_empty() {
                 self.attachments.observe_flakes(&accepted_reifies)?;
             }

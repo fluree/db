@@ -268,16 +268,23 @@ impl AttachmentNovelty {
         }
 
         // Group `f:reifies*` flakes into bundles keyed by
-        // `(ann_sid, t, op)`. Within a single transaction, a complete
-        // attach- or detach-bundle for an annotation subject shares t
-        // and op by construction.
-        let mut bundles: BTreeMap<(Sid, i64, bool), Vec<Flake>> = BTreeMap::new();
+        // `(flake_graph, ann_sid, t, op)`. The flake-level graph is
+        // part of the key because the writer convention is that
+        // `f:reifies*` flakes for an edge in graph G are themselves
+        // asserted in graph G; folding two graphs together at this
+        // stage would let a pathological cross-graph collision merge
+        // into a single (wrong-graph) bundle. Mirrors the arena
+        // builder's grouping in
+        // `fluree_db_binary_index::annotation_arena::bundle::build_arenas_from_flakes`
+        // so the two paths agree on what counts as a malformed
+        // bundle.
+        let mut bundles: BTreeMap<(Option<Sid>, Sid, i64, bool), Vec<Flake>> = BTreeMap::new();
         for f in flakes {
             if !is_reserved_reifies_predicate(&f.p) {
                 continue;
             }
             bundles
-                .entry((f.s.clone(), f.t, f.op))
+                .entry((f.g.clone(), f.s.clone(), f.t, f.op))
                 .or_default()
                 .push(f.clone());
         }
@@ -286,7 +293,7 @@ impl AttachmentNovelty {
             return Ok(());
         }
 
-        for ((ann, t, op), bundle) in bundles {
+        for ((bundle_g, ann, t, op), bundle) in bundles {
             let edge = match EdgeKey::from_reifies_facts(&bundle) {
                 Ok(edge) => edge,
                 Err(e) => {
@@ -303,6 +310,30 @@ impl AttachmentNovelty {
                     continue;
                 }
             };
+
+            // Cross-check: the graph the bundle was *asserted in*
+            // (flake-level `g`) must match the graph the bundle
+            // *reifies* (`EdgeKey.g`, derived from the optional
+            // `f:reifiesGraph` flake). Mismatches indicate a
+            // malformed bundle (e.g. `f:reifiesGraph` missing on a
+            // named-graph edge, or a tampered commit) — file under
+            // the wrong graph and the cascade fast-path can't find
+            // the bundle on a base-edge retract. Mirrors the arena
+            // builder's check.
+            if edge.g != bundle_g {
+                self.observed_malformed_bundles =
+                    self.observed_malformed_bundles.saturating_add(1);
+                tracing::warn!(
+                    ?ann,
+                    t,
+                    op,
+                    bundle_graph = ?bundle_g,
+                    edge_graph = ?edge.g,
+                    cumulative_skipped = self.observed_malformed_bundles,
+                    "skipping bundle: f:reifiesGraph disagrees with flake-level graph"
+                );
+                continue;
+            }
 
             self.forward
                 .entry(edge.clone())
@@ -580,6 +611,53 @@ mod tests {
         let mut overlay = AttachmentNovelty::new();
         overlay.observe_flakes(&[]).unwrap();
         assert!(!overlay.has_annotations());
+    }
+
+    #[test]
+    fn observe_skips_and_counts_graph_mismatch_bundle() {
+        // A bundle whose *flake-level* graph (the graph the
+        // f:reifies* flakes were asserted in) doesn't match the
+        // bundle's *decoded* graph (from the optional f:reifiesGraph
+        // flake) is malformed. Without this cross-check, a cross-
+        // graph collision could merge into a single (wrong-graph)
+        // bundle and file the attachment under the wrong edge —
+        // breaking the cascade fast-path on base-edge retract.
+        // Mirrors the arena builder's guard in
+        // `fluree_db_binary_index::annotation_arena::bundle::build_arenas_from_flakes`.
+        let edge = sample_edge(); // default-graph edge
+        let ann = ann_sid("ann_x");
+        // Build a default-graph bundle (correct shape: edge.g ==
+        // None, no f:reifiesGraph flake), then re-graph every flake
+        // to graph G_a — so flake-level g = Some(G_a) but decoded
+        // EdgeKey.g = None. Mismatch.
+        let g_a = Sid::new(13, "graph_a");
+        let bundle_default: Vec<Flake> = edge.to_reifies_facts(&ann, 5, true);
+        let bundle_mismatch: Vec<Flake> = bundle_default
+            .into_iter()
+            .map(|f| {
+                Flake::new_in_graph(
+                    g_a.clone(),
+                    f.s,
+                    f.p,
+                    f.o,
+                    f.dt,
+                    f.t,
+                    f.op,
+                    f.m,
+                )
+            })
+            .collect();
+
+        let mut overlay = AttachmentNovelty::new();
+        overlay
+            .observe_flakes(&bundle_mismatch)
+            .expect("graph-mismatch bundle skipped, not an error");
+        assert!(!overlay.has_annotations(), "no rows landed");
+        assert_eq!(
+            overlay.observed_malformed_bundle_count(),
+            1,
+            "graph-mismatch bundle counts as malformed"
+        );
     }
 
     #[test]
