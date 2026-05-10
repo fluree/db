@@ -524,3 +524,69 @@ async fn storage_inspection_finds_arena_artifacts() {
         })
         .await;
 }
+
+#[tokio::test]
+async fn non_annotation_ledger_skips_inject_annotations() {
+    // Hydration on a ledger that has never seen an `f:reifies*`
+    // flake must NOT pay the per-ref-value POST scan that
+    // `inject_annotations` does on the M2a fallback path. The gate
+    // (mirror of the cascade fast-path) checks both
+    // `snapshot.has_annotations` and the overlay's
+    // `attachments.has_annotations()`. We can't directly observe
+    // "the scan didn't run," but we can verify three positive
+    // signals:
+    //
+    // 1. `snapshot.has_annotations == false` — sticky bit never
+    //    flipped on an annotation-free ledger.
+    // 2. The overlay's `attachments.has_annotations()` is also
+    //    false — no novelty-side `f:reifies*` events.
+    // 3. The hydration query returns the right shape with no
+    //    `@annotation` keys anywhere — the only output the gate
+    //    short-circuits on (the keys would still be absent on the
+    //    scan path, but we'd pay the POST scan to find that out).
+    let fluree = FlureeBuilder::memory()
+        .with_ledger_cache_config(fluree_db_api::LedgerManagerConfig::default())
+        .build_memory();
+    let ledger_id = "it/edge-annotations-indexed:non-annotation-skip";
+
+    let ledger0 = genesis_ledger(&fluree, ledger_id);
+    let plain_insert = json!({
+        "@context": ctx(),
+        "@graph": [
+            {"@id": "ex:alice", "ex:worksFor": {"@id": "ex:acme"}},
+            {"@id": "ex:acme", "ex:name": "Acme"}
+        ]
+    });
+    let after = fluree
+        .insert(ledger0, &plain_insert)
+        .await
+        .expect("plain insert");
+
+    assert!(
+        !after.ledger.snapshot.has_annotations,
+        "non-annotation ledger must not have sticky bit set"
+    );
+    assert!(
+        !after.ledger.novelty.attachments.has_annotations(),
+        "novelty overlay must report zero annotations"
+    );
+
+    // Subject hydration that would otherwise call `inject_annotations`
+    // on the worksFor ref value. Confirm output is correct AND has
+    // no `@annotation` artifacts.
+    let query = json!({
+        "@context": ctx(),
+        "select": {"?person": ["*", {"ex:worksFor": ["*"]}]},
+        "where": {"@id": "?person", "ex:worksFor": {"@id": "?org"}}
+    });
+    let rows = support::query_jsonld_formatted(&fluree, &after.ledger, &query)
+        .await
+        .expect("hydration on non-annotation ledger");
+    let arr = rows.as_array().expect("rows array");
+    assert_eq!(arr.len(), 1, "single subject row");
+    let json_str = serde_json::to_string(&arr[0]).expect("serialize row");
+    assert!(
+        !json_str.contains("@annotation"),
+        "non-annotation ledger must not produce any @annotation keys: {json_str}"
+    );
+}

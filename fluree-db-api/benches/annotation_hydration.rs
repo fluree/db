@@ -210,6 +210,67 @@ fn bench_annotation_hydration(c: &mut Criterion) {
     }
 
     group.finish();
+    bench_non_annotation_baseline(c);
+}
+
+/// Regression benchmark: hydration on a ledger that has **never**
+/// seen an `f:reifies*` flake must not pay the per-ref-value POST
+/// scan that pre-gate `inject_annotations` did. Compares two N
+/// values (1 ref edge, 100 ref edges) so any per-ref overhead would
+/// scale visibly.
+fn bench_non_annotation_baseline(c: &mut Criterion) {
+    let runtime = Runtime::new().expect("tokio runtime");
+    let mut group = c.benchmark_group("non_annotation_hydration");
+    group.sample_size(20);
+
+    for n in &[1usize, 100] {
+        group.throughput(Throughput::Elements(*n as u64));
+        let (fluree, ledger_id) = runtime.block_on(seed_non_annotation_ledger(*n));
+        let state = runtime.block_on(fluree.ledger(&ledger_id)).unwrap();
+        assert!(
+            !state.snapshot.has_annotations,
+            "non-annotation ledger must not have sticky bit set"
+        );
+        assert!(
+            !state.novelty.attachments.has_annotations(),
+            "novelty attachments must be empty"
+        );
+        let query = json!({
+            "@context": { "ex": "http://example.org/" },
+            "select": {"?person": ["*", {"ex:worksFor": ["*"]}]},
+            "where": {"@id": "?person", "ex:worksFor": {"@id": "?org"}}
+        });
+        group.bench_with_input(BenchmarkId::new("baseline", n), n, |b, _| {
+            b.to_async(&runtime).iter(|| async {
+                let state = fluree.ledger(&ledger_id).await.unwrap();
+                let db = fluree_db_api::GraphDb::from_ledger_state(&state);
+                let result = fluree.query(&db, &query).await.unwrap();
+                let _ = result.to_jsonld_async(db.as_graph_db_ref()).await.unwrap();
+            });
+        });
+    }
+    group.finish();
+}
+
+/// Seed a ledger with N `(person, worksFor, org)` edges. No
+/// annotations anywhere — exercises the
+/// `inject_annotations` zero-cost gate in hydration.
+async fn seed_non_annotation_ledger(n: usize) -> (fluree_db_api::Fluree, String) {
+    let fluree = FlureeBuilder::memory()
+        .with_ledger_cache_config(fluree_db_api::LedgerManagerConfig::default())
+        .build_memory();
+    let ledger_id = format!("bench/non-annotation-hydration:{n}");
+    let mut state = make_genesis(&fluree, &ledger_id);
+    for i in 0..n {
+        let txn = json!({
+            "@context": { "ex": "http://example.org/" },
+            "@id": format!("ex:person-{i}"),
+            "ex:worksFor": { "@id": format!("ex:org-{i}") }
+        });
+        state = fluree.insert(state, &txn).await.unwrap().ledger;
+    }
+    let _ = state;
+    (fluree, ledger_id)
 }
 
 /// Build a ledger with N annotations on one edge, then reindex.

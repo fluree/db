@@ -721,6 +721,38 @@ impl<'a> HydrationFormatter<'a> {
         visited: &'b mut HashSet<Sid>,
         cache: &'b mut HashMap<CacheKey, JsonValue>,
     ) -> Result<()> {
+        // Zero-cost gate for non-annotation ledgers — mirrors the
+        // cascade fast-path in `fluree_db_transact::stage` so a
+        // hydration query like `select: {"?s": ["*"]}` doesn't pay
+        // a POST scan per ref value when the ledger has never seen
+        // an `f:reifies*` flake. Two signals:
+        //
+        // - `snapshot.has_annotations`: sticky bit on `IndexRoot`,
+        //   set at indexer time when any of the seven reserved
+        //   `f:reifies*` predicate SIDs first appears in the
+        //   predicate dictionary. Zero historical exposure on
+        //   ledgers that never used annotations.
+        // - `novelty.attachments.has_annotations()`: in-memory
+        //   overlay sticky bit, flipped on the first observed
+        //   `f:reifies*` bundle.
+        //
+        // Both must be false to skip safely. We only consult the
+        // overlay when it downcasts cleanly to the concrete
+        // `Novelty` type — for unknown overlay implementations
+        // (test fakes, future variants), keep the scan fallback so
+        // we don't silently miss attachments.
+        if !self.db.snapshot.has_annotations {
+            let novelty_clean = self
+                .db
+                .overlay
+                .as_any()
+                .downcast_ref::<fluree_db_novelty::Novelty>()
+                .map(|n| !n.attachments.has_annotations());
+            if matches!(novelty_clean, Some(true)) {
+                return Ok(());
+            }
+        }
+
         // Find the EdgeKey from the base flake.
         let edge_key = fluree_db_core::edge::EdgeKey::from_flake(flake);
 
