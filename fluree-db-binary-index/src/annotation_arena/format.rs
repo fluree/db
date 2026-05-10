@@ -441,6 +441,7 @@ mod tests {
                 reverse_rows: 10,
                 distinct_edges: 4,
                 distinct_annotations: 6,
+                ..Default::default()
             },
         };
         let cloned = root.clone();

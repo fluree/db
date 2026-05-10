@@ -1335,6 +1335,7 @@ mod tests {
                 reverse_rows: 100,
                 distinct_edges: 25,
                 distinct_annotations: 75,
+                ..Default::default()
             },
         });
 

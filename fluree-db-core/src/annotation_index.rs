@@ -29,6 +29,12 @@ use serde::{Deserialize, Serialize};
 
 /// Aggregate counters populated at arena build time. Surfaced for
 /// cost-based planning (M3) and storage inspection.
+///
+/// Per-slot NDV counters (added in M3.1 follow-up) are
+/// `#[serde(default)]` so older arena roots — written before this
+/// struct grew — deserialize cleanly with zeros. The planner treats
+/// a zero NDV for a slot as "no information" and falls back to the
+/// regular `IndexStats.properties` HLL for that predicate.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AnnotationStats {
     /// Total forward-arena rows (one per asserted/retracted attachment event).
@@ -39,6 +45,65 @@ pub struct AnnotationStats {
     pub distinct_edges: u64,
     /// Distinct annotation subjects.
     pub distinct_annotations: u64,
+
+    // -----------------------------------------------------------------
+    // Per-slot NDV counters across the live (currently-asserted) rows.
+    //
+    // For the three **required** slots (subject, predicate, object),
+    // every live annotation contributes exactly one row, so the row
+    // count equals `distinct_annotations`. We track only the NDV.
+    //
+    // For the **optional** slots (graph, datatype, lang, listIndex),
+    // both the row count and the NDV vary: the row count is the
+    // number of live annotations whose reified edge carries that
+    // slot, the NDV is the number of distinct values observed in
+    // that slot across those rows.
+    // -----------------------------------------------------------------
+    /// Distinct subject SIDs across live reified edges.
+    /// Used as `ndv_values` for `?ann f:reifiesSubject ?s` probes.
+    #[serde(default)]
+    pub distinct_reified_subjects: u64,
+    /// Distinct predicate SIDs across live reified edges.
+    #[serde(default)]
+    pub distinct_reified_predicates: u64,
+    /// Distinct object values across live reified edges.
+    #[serde(default)]
+    pub distinct_reified_objects: u64,
+
+    /// Live `f:reifiesGraph` rows = number of live annotations whose
+    /// reified edge is in a named graph (the slot is omitted for
+    /// default-graph edges, so this is generally `< distinct_annotations`).
+    #[serde(default)]
+    pub reifies_graph_rows: u64,
+    /// Distinct named-graph SIDs across live reified edges.
+    #[serde(default)]
+    pub distinct_reified_graphs: u64,
+
+    /// Live `f:reifiesDatatype` rows. The full-bundle write path
+    /// (`EdgeKey::to_reifies_facts`) emits one per annotation; the
+    /// JSON-LD-compatible cascade omits it. So this is either ≈
+    /// `distinct_annotations` or 0 depending on the insert path.
+    #[serde(default)]
+    pub reifies_datatype_rows: u64,
+    /// Distinct datatype SIDs across live reified edges.
+    #[serde(default)]
+    pub distinct_reified_datatypes: u64,
+
+    /// Live `f:reifiesLang` rows = number of live annotations whose
+    /// reified edge has a language-tagged literal object.
+    #[serde(default)]
+    pub reifies_lang_rows: u64,
+    /// Distinct language-tag values across live reified edges.
+    #[serde(default)]
+    pub distinct_reified_langs: u64,
+
+    /// Live `f:reifiesListIndex` rows. v1 always 0 — list-element
+    /// annotations are deferred (see `EDGE_ANNOTATIONS.md` decisions).
+    #[serde(default)]
+    pub reifies_list_index_rows: u64,
+    /// Distinct list-index values across live reified edges.
+    #[serde(default)]
+    pub distinct_reified_list_indices: u64,
 }
 
 /// Inline section in the binary index root.

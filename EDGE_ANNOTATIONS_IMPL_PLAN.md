@@ -984,47 +984,48 @@ expanded `f:reifies*` triples.
 ### M3.1 — what landed
 
 `StatsView::merge_annotation_stats` overlays per-predicate stats for
-the **three required** `f:reifies*` slots
-(`f:reifiesSubject` / `f:reifiesPredicate` / `f:reifiesObject`) from
-`AnnotationIndexRoot.stats` whenever the snapshot has an arena built.
+the seven `f:reifies*` slots from `AnnotationIndexRoot.stats`
+whenever the snapshot has an arena built. The arena builder tracks
+per-slot NDV counters across the live (currently-asserted) edges,
+so the planner gets sharp `BoundObject` selectivity for any
+`?ann f:reifies* <const>`-shape probe.
 
-Slot coverage:
+`AnnotationStats` carries (added in M3.1 follow-up):
 
-- **Required, synthesized**: every annotation carries exactly one row
-  of each of the three required slots, so
-  `count = distinct_annotations` is exact for live state.
-- **Optional, NOT synthesized**: `f:reifiesGraph`,
-  `f:reifiesDatatype`, `f:reifiesLang`, `f:reifiesListIndex`. These
-  are emitted only for named-graph edges, typed literals,
-  language-tagged literals, and list members — `AnnotationStats`
-  doesn't track how many annotations carry each, and synthesizing
-  `count = distinct_annotations` would overstate row counts on
-  workloads where these slots are sparse. Falls through to the
-  regular `IndexStats.properties` HLL.
+- Required slots — `distinct_reified_{subjects,predicates,objects}`
+  (the row count for these is always `distinct_annotations`).
+- Optional slots — both row count and distinct-value count for
+  `graph`, `datatype`, `lang`, `listIndex`. Older arena roots
+  written before these fields existed deserialize cleanly with `0`
+  via `#[serde(default)]`; the merge treats `0` as "no information"
+  and falls back to `ndv_values = 1` (safe upper bound) for the
+  required slots, or skips synthesis entirely for the optional ones
+  (regular `IndexStats.properties` HLL fills in).
 
-Synthesis values for the required slots:
+Synthesis rules:
 
-- `count = distinct_annotations`,
-  `ndv_subjects = distinct_annotations`.
-- `ndv_values = 1`.
+- **Required slots** (`f:reifiesSubject` / `f:reifiesPredicate` /
+  `f:reifiesObject`): `count = ndv_subjects = distinct_annotations`,
+  `ndv_values = distinct_reified_<slot>` (or `1` for older arenas).
+  `BoundObject` selectivity becomes
+  `distinct_annotations / distinct_reified_<slot>` — annotations per
+  pinned subject / predicate / object. For 10k annotations across
+  200 distinct subjects, a `?ann f:reifiesSubject :alice` probe
+  estimates 50 rows instead of the previous 10k (the safe upper
+  bound).
+- **Optional slots** (`f:reifiesGraph` / `f:reifiesDatatype` /
+  `f:reifiesLang` / `f:reifiesListIndex`): synthesized **only** when
+  the per-slot row count is non-zero. `count = ndv_subjects = rows`,
+  `ndv_values = distinct_<slot>`. A workload that never uses named
+  graphs leaves the `f:reifiesGraph` HLL untouched and the planner
+  falls back to it.
 
-The conservative `ndv_values = 1` is intentional. `AnnotationStats`
-does not yet carry per-slot NDV counters (e.g. distinct objects across
-reified edges). Using `distinct_edges` as a proxy badly underestimates
-common "many annotations sharing one endpoint" cases — e.g. 10k people
-who all `worksFor` `ex:acme` produce
-`distinct_annotations = distinct_edges = 10k`, but
-`?ann f:reifiesObject ex:acme` actually returns 10k rows, not
-`10k / 10k = 1`. With `ndv_values = 1`, `BoundObject` probes get the
-safe upper-bound of `distinct_annotations` rows.
-
-The win over having no stats at all is the accurate `count` (replaces
-`DEFAULT_PROPERTY_SCAN_SELECTIVITY`) and the `BoundSubject`
-selectivity (1 row per known annotation). When `AnnotationStats`
-grows per-slot NDV counters (`distinct_reified_subjects`,
-`distinct_reified_objects`, etc.), sharper `BoundObject` estimates can
-land in the same code path, and the optional slots can be synthesized
-once their per-slot row counts are tracked.
+The arena-side computation lives in two parallel places (kept in
+sync): `bundle::compute_stats` (full-rebuild path, walks live edges
+from the bundle decoder) and `builder::forward_arena_stats`
+(incremental path, walks pre-built rows). End-to-end coverage:
+`it_edge_annotations_indexed::storage_inspection_finds_arena_artifacts`
+asserts the wire format carries the per-slot fields.
 
 The merge is called from both `stats_cache::cached_stats_view_for_db`
 (query path) and `explain::explain_query` (so `/explain` output sees

@@ -75,6 +75,8 @@ pub struct ReverseLeafSummary {
 /// relies on the `(edge, ann, t, op)` sort: the last row of each
 /// `(edge, ann)` run is the latest event for that pair.
 pub fn forward_arena_stats(rows: &[AnnotationForwardRow]) -> (i64, AnnotationStats) {
+    use fluree_db_core::FlakeValue;
+
     if rows.is_empty() {
         return (0, AnnotationStats::default());
     }
@@ -97,6 +99,40 @@ pub fn forward_arena_stats(rows: &[AnnotationForwardRow]) -> (i64, AnnotationSta
             live_anns.insert(rows[i].ann.clone());
         }
     }
+
+    // Per-slot NDV counters across the live edges. Mirrors the logic
+    // in `bundle::compute_stats` — see that function's comment for
+    // the planner-side rationale.
+    let mut subjects: HashSet<&Sid> = HashSet::new();
+    let mut predicates: HashSet<&Sid> = HashSet::new();
+    let mut objects: HashSet<&FlakeValue> = HashSet::new();
+    let mut graphs: HashSet<&Sid> = HashSet::new();
+    let mut datatypes: HashSet<&Sid> = HashSet::new();
+    let mut langs: HashSet<&str> = HashSet::new();
+    let mut list_indices: HashSet<i32> = HashSet::new();
+    let mut graph_rows: u64 = 0;
+    let mut lang_rows: u64 = 0;
+    let mut list_index_rows: u64 = 0;
+    for edge in &live_edges {
+        subjects.insert(&edge.s);
+        predicates.insert(&edge.p);
+        objects.insert(&edge.o);
+        datatypes.insert(&edge.dt);
+        if let Some(g) = &edge.g {
+            graphs.insert(g);
+            graph_rows += 1;
+        }
+        if let Some(lang) = &edge.lang {
+            langs.insert(lang.as_str());
+            lang_rows += 1;
+        }
+        if let Some(i) = edge.list_i {
+            list_indices.insert(i);
+            list_index_rows += 1;
+        }
+    }
+    let datatype_rows = live_anns.len() as u64;
+
     let stats = AnnotationStats {
         forward_rows: rows.len() as u64,
         // Reverse rows mirror forward rows when the indexer emits both
@@ -105,6 +141,17 @@ pub fn forward_arena_stats(rows: &[AnnotationForwardRow]) -> (i64, AnnotationSta
         reverse_rows: rows.len() as u64,
         distinct_edges: live_edges.len() as u64,
         distinct_annotations: live_anns.len() as u64,
+        distinct_reified_subjects: subjects.len() as u64,
+        distinct_reified_predicates: predicates.len() as u64,
+        distinct_reified_objects: objects.len() as u64,
+        reifies_graph_rows: graph_rows,
+        distinct_reified_graphs: graphs.len() as u64,
+        reifies_datatype_rows: datatype_rows,
+        distinct_reified_datatypes: datatypes.len() as u64,
+        reifies_lang_rows: lang_rows,
+        distinct_reified_langs: langs.len() as u64,
+        reifies_list_index_rows: list_index_rows,
+        distinct_reified_list_indices: list_indices.len() as u64,
     };
     (max_t, stats)
 }

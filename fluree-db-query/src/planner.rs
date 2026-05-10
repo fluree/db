@@ -1548,14 +1548,10 @@ mod tests {
 
     #[test]
     fn estimate_uses_merged_annotation_stats_for_reifies_predicates() {
-        // After `StatsView::merge_annotation_stats` runs, the planner's
-        // classifier should look up the synthesized entries for
-        // `f:reifies*` predicates and produce arena-aligned estimates
-        // instead of falling back to `DEFAULT_PROPERTY_SCAN_SELECTIVITY`.
-        //
-        // `AnnotationStats` does not yet carry per-slot NDV counters, so
-        // every slot uses `ndv_values = 1` — `BoundObject` probes get
-        // the safe upper-bound of `distinct_annotations` rows.
+        // After `StatsView::merge_annotation_stats` runs with per-slot
+        // NDVs, the planner's classifier should produce arena-aligned
+        // BoundObject estimates: `count / ndv_values` for the matching
+        // slot's NDV, not the conservative fallback.
 
         use fluree_db_core::AnnotationStats;
         use fluree_vocab::db as p;
@@ -1567,6 +1563,10 @@ mod tests {
             reverse_rows: 1_000,
             distinct_edges: 200,
             distinct_annotations: 800,
+            distinct_reified_subjects: 50,
+            distinct_reified_predicates: 4,
+            distinct_reified_objects: 200,
+            ..Default::default()
         };
         let mut ns = std::collections::HashMap::new();
         ns.insert(FLUREE_DB, "https://ns.flur.ee/db#".to_string());
@@ -1581,8 +1581,9 @@ mod tests {
         let scan_est = estimate_triple_row_count(&scan, &HashSet::new(), Some(&stats));
         assert_eq!(scan_est, 800.0, "PropertyScan should equal annotation count");
 
-        // BoundObject: `?ann f:reifiesObject <some_object>` — conservative,
-        // since per-slot NDV is unknown.
+        // BoundObject: `?ann f:reifiesObject <some_object>`. With per-
+        // slot NDV the estimate is `800 / 200 = 4` — annotations per
+        // pinned object.
         let bound_o = TriplePattern::new(
             Ref::Var(VarId(0)),
             Ref::Sid(Sid::new(FLUREE_DB, p::REIFIES_OBJECT)),
@@ -1590,8 +1591,8 @@ mod tests {
         );
         let bound_o_est = estimate_triple_row_count(&bound_o, &HashSet::new(), Some(&stats));
         assert_eq!(
-            bound_o_est, 800.0,
-            "BoundObject on reifiesObject should fall back to total annotations (conservative)"
+            bound_o_est, 4.0,
+            "BoundObject on reifiesObject should be distinct_annotations / distinct_reified_objects"
         );
 
         // BoundSubject: a known annotation subject probing its slot.
@@ -1608,7 +1609,10 @@ mod tests {
             "BoundSubject on reifiesSubject should be ~1 row per known annotation"
         );
 
-        // BoundObject on reifiesPredicate also conservative.
+        // BoundObject on reifiesPredicate: 800 / 4 = 200 annotations
+        // per pinned predicate. Larger than reifiesObject's
+        // selectivity here, which is realistic — predicates are
+        // typically a small set even at scale.
         let bound_p = TriplePattern::new(
             Ref::Var(VarId(0)),
             Ref::Sid(Sid::new(FLUREE_DB, p::REIFIES_PREDICATE)),
@@ -1616,8 +1620,8 @@ mod tests {
         );
         let bound_p_est = estimate_triple_row_count(&bound_p, &HashSet::new(), Some(&stats));
         assert_eq!(
-            bound_p_est, 800.0,
-            "BoundObject on reifiesPredicate should fall back to total annotations (conservative)"
+            bound_p_est, 200.0,
+            "BoundObject on reifiesPredicate should be distinct_annotations / distinct_reified_predicates"
         );
     }
 
