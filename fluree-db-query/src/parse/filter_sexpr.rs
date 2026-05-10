@@ -27,6 +27,7 @@ use super::ast::UnresolvedExpression;
 use super::error::{ParseError, Result};
 use super::filter_common;
 use super::sexpr_tokenize;
+use super::sexpr_tokenize::SexprToken;
 use std::sync::Arc;
 
 /// Parse an S-expression string like "(> ?age 45)" into a filter expression
@@ -238,6 +239,98 @@ fn parse_s_expression_arg(s: &str) -> Result<(UnresolvedExpression, &str)> {
     let atom = &s[..end];
     let expr = parse_s_expression_atom(atom)?;
     Ok((expr, &s[end..]))
+}
+
+/// Convert an already-tokenized S-expression into an [`UnresolvedExpression`].
+///
+/// Used by the SELECT-clause parser, which tokenizes once to dispatch between
+/// aggregate and scalar-expression forms and then needs the scalar form as an
+/// expression tree.
+///
+/// Mirrors the operator handling in [`parse_s_expression`], with one caveat:
+/// `in` / `not-in` are rejected because their bracketed-list form (`[...]`)
+/// is not represented in [`SexprToken`]. Use the string S-expression form
+/// inside BIND/FILTER if `IN` is needed.
+pub fn expr_from_sexpr_token(tok: &SexprToken) -> Result<UnresolvedExpression> {
+    match tok {
+        // Quoted strings are *always* string literals — never reparsed as
+        // booleans, numbers, or variables. This is the only way to write
+        // a literal whose source spelling collides with a keyword
+        // (e.g. `"false"`, `"42"`, `"?notavar"`).
+        SexprToken::String(s) => Ok(UnresolvedExpression::string(s)),
+        SexprToken::Atom(s) => atom_token_to_expr(s),
+        SexprToken::List(items) => list_tokens_to_expr(items),
+    }
+}
+
+fn atom_token_to_expr(s: &str) -> Result<UnresolvedExpression> {
+    if s.starts_with('?') {
+        return Ok(UnresolvedExpression::var(s));
+    }
+    if s == "true" {
+        return Ok(UnresolvedExpression::boolean(true));
+    }
+    if s == "false" {
+        return Ok(UnresolvedExpression::boolean(false));
+    }
+    if let Ok(i) = s.parse::<i64>() {
+        return Ok(UnresolvedExpression::long(i));
+    }
+    if let Ok(f) = s.parse::<f64>() {
+        return Ok(UnresolvedExpression::double(f));
+    }
+    // Unquoted atom that didn't match any other shape — treat as a bare
+    // string. Quoted strings take the explicit `String` path above.
+    Ok(UnresolvedExpression::string(s))
+}
+
+fn list_tokens_to_expr(items: &[SexprToken]) -> Result<UnresolvedExpression> {
+    if items.is_empty() {
+        return Err(ParseError::InvalidSelect(
+            "empty expression in select clause".to_string(),
+        ));
+    }
+
+    let op = items[0].expect_atom("operator")?;
+    let op_lower = op.to_lowercase();
+
+    if matches!(op_lower.as_str(), "in" | "not-in" | "notin") {
+        return Err(ParseError::InvalidSelect(format!(
+            "'{op}' is not supported in select expressions; rewrite using or/and equality (e.g. (or (= ?x 1) (= ?x 2)))"
+        )));
+    }
+
+    let arg_tokens = &items[1..];
+    let clone_expr = |e: &UnresolvedExpression| -> Result<UnresolvedExpression> { Ok(e.clone()) };
+    let parsed: Result<Vec<UnresolvedExpression>> =
+        arg_tokens.iter().map(expr_from_sexpr_token).collect();
+    let args = parsed?;
+
+    match op_lower.as_str() {
+        op @ ("=" | "eq" | "!=" | "<>" | "ne" | "<" | "lt" | "<=" | "le" | ">" | "gt" | ">="
+        | "ge") => {
+            let canonical = filter_common::normalize_op(op);
+            filter_common::build_call(&args, canonical, clone_expr, 1, "comparison operator")
+        }
+        "and" => filter_common::build_and(&args, clone_expr),
+        "or" => filter_common::build_or(&args, clone_expr),
+        "not" => filter_common::build_not(&args, clone_expr),
+        op @ ("+" | "add" | "*" | "mul" | "/" | "div") => {
+            let canonical = filter_common::normalize_op(op);
+            filter_common::build_call(&args, canonical, clone_expr, 1, "arithmetic operator")
+        }
+        "-" | "sub" => {
+            if args.len() == 1 {
+                filter_common::build_call(&args, "negate", clone_expr, 1, "unary negation")
+            } else {
+                filter_common::build_call(&args, "-", clone_expr, 1, "arithmetic operator")
+            }
+        }
+        _ => Ok(UnresolvedExpression::Call {
+            func: Arc::from(op),
+            args,
+        }),
+    }
 }
 
 /// Parse a bracketed list `[...]` as a function call with name "list"

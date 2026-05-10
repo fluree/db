@@ -104,6 +104,47 @@ The array value is the selection spec — `"*"` for all forward properties, indi
 
 Each row is `[age, expanded_person, expanded_org]`. When every column is an IRI-constant expansion (no variable dependency anywhere in `select`), the output is independent of the WHERE solution count: the formatter emits one row regardless of how many solutions the WHERE produced.
 
+**S-expression columns** — a select item that is a string starting with `(` is an S-expression, in two flavors:
+
+*Aggregates*. Auto-aliased (`?count`, `?sum`, etc.) or with an explicit alias via `(as ...)`:
+
+```json
+{
+  "select": ["?category", "(count ?product)"],
+  "groupBy": ["?category"]
+}
+```
+
+```json
+{
+  "select": ["?category", "(as (count ?product) ?total)"],
+  "groupBy": ["?category"]
+}
+```
+
+*Scalar expressions* (COALESCE, IF, arithmetic, string/hash/date functions, …). Always require an explicit alias via `(as <expr> ?alias)`. Mirrors SPARQL `SELECT (expr AS ?alias)`:
+
+```json
+{
+  "select": ["?p", "(as (coalesce ?titleFr ?titleEn \"untitled\") ?title)"]
+}
+```
+
+```json
+{
+  "select": [
+    "?name",
+    "(as (coalesce ?email \"no-email\") ?contact)",
+    "(as (count ?favNums) ?count)"
+  ],
+  "groupBy": ["?name", "?contact"]
+}
+```
+
+Scalar select expressions desugar to a `bind` in the WHERE pattern list. If the expression references an aggregate's output variable (e.g. `(as (+ ?count 1) ?adjusted)`) the bind runs after aggregation; otherwise it runs before, so the alias is also a valid `groupBy` key.
+
+The same expression language is shared with `bind` and `filter`. The one exception is `in` / `not-in`, which require the bracketed-list form and are not accepted in select expressions — rewrite as `(or (= ?x 1) (= ?x 2) …)` instead.
+
 ### ask
 
 Tests whether a set of patterns has any solution, returning `true` or `false`. No variables are projected. Equivalent to SPARQL `ASK`. The value of `ask` is the where clause itself — an array or object of the same patterns accepted by `where`:
@@ -792,7 +833,7 @@ Group results:
 
 ```json
 {
-  "select": ["?category", ["count", "?product"]],
+  "select": ["?category", "(count ?product)"],
   "groupBy": ["?category"],
   "where": [
     { "@id": "?product", "ex:category": "?category" }
@@ -806,7 +847,7 @@ Filter grouped results:
 
 ```json
 {
-  "select": ["?category", ["count", "?product"]],
+  "select": ["?category", "(count ?product)"],
   "groupBy": ["?category"],
   "having": [["filter", "(> (count ?product) 10)"]],
   "where": [
@@ -817,12 +858,17 @@ Filter grouped results:
 
 ## Aggregation Functions
 
-- `(count ?var)` - Count non-null values
-- `(sum ?var)` - Sum numeric values
-- `(avg ?var)` - Average numeric values
-- `(min ?var)` - Minimum value
-- `(max ?var)` - Maximum value
-- `(sample ?var)` - Sample value
+- `(count ?var)` / `(count *)` — count non-null values; `*` counts solution rows
+- `(count-distinct ?var)` — count distinct non-null values
+- `(sum ?var)` — sum numeric values
+- `(avg ?var)` — average numeric values
+- `(min ?var)` / `(max ?var)` — extremum
+- `(median ?var)` — median
+- `(variance ?var)` / `(stddev ?var)` — population variance / standard deviation
+- `(sample ?var)` — implementation-defined sample value
+- `(groupconcat ?var)` / `(groupconcat ?var ", ")` — concatenate string values, optional separator (defaults to a single space)
+
+Each aggregate auto-aliases to `?<fn-name>` (`?count`, `?sum`, …). Use `(as (<fn> ?var) ?alias)` to choose an explicit alias.
 
 ## Time Travel Queries
 
@@ -1083,13 +1129,17 @@ Note: `f:*` keys used for graph source queries should be defined in your `@conte
   "@context": {
     "ex": "http://example.org/ns/"
   },
-  "select": ["?category", ["count", "?product"], ["avg", "?price"]],
+  "select": [
+    "?category",
+    "(as (count ?product) ?count)",
+    "(as (avg ?price) ?avgPrice)"
+  ],
   "groupBy": ["?category"],
   "having": [["filter", "(> (count ?product) 5)"]],
   "where": [
     { "@id": "?product", "ex:category": "?category", "ex:price": "?price" }
   ],
-  "orderBy": [["desc", ["count", "?product"]]]
+  "orderBy": [["desc", "?count"]]
 }
 ```
 
