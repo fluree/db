@@ -106,7 +106,7 @@ async fn incremental_arena_seal_then_arena_backed_query() {
     // 2. Trigger background indexer with attachment-events provider
     //    attached → arena gets sealed.
     // 3. After reindex: snapshot.annotation_index is Some, and the
-    //    inline-annotation query returns the same row it did
+    //    subject-hydration query returns the same row it did
     //    pre-reindex (when the M2a scan path was active).
     let fluree = FlureeBuilder::memory()
         .with_ledger_cache_config(fluree_db_api::LedgerManagerConfig::default())
@@ -210,8 +210,9 @@ async fn incremental_arena_seal_then_arena_backed_query() {
 #[tokio::test]
 async fn full_rebuild_without_authoritative_falls_back_to_scan() {
     // No attachment-events provider → reindex lands the new root
-    // with `annotation_index = None`. The inline-annotation query
-    // must still return the right row via the M2a scan path.
+    // with `annotation_index = None`. The subject-hydration query
+    // must still surface the annotation body via the M2a indexed-
+    // scan-fallback path inside `inject_annotations`.
     let fluree = FlureeBuilder::memory()
         .with_ledger_cache_config(fluree_db_api::LedgerManagerConfig::default())
         .build_memory();

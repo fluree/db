@@ -364,7 +364,6 @@ pub async fn wait_for_index_application(
     target_index_t: i64,
 ) {
     use fluree_db_api::NsNotify;
-    use fluree_db_nameservice::NameService;
     use std::time::{Duration, Instant};
 
     let ns_record = fluree
