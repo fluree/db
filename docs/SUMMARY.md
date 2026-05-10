@@ -54,6 +54,7 @@
   - [IRIs, namespaces, and JSON-LD @context](concepts/iri-and-context.md)
   - [Datatypes and typed values](concepts/datatypes.md)
   - [Datasets and named graphs](concepts/datasets-and-named-graphs.md)
+  - [Edge annotations](concepts/edge-annotations.md)
   - [Time travel](concepts/time-travel.md)
   - [Policy enforcement](concepts/policy-enforcement.md)
   - [Verifiable data](concepts/verifiable-data.md)
