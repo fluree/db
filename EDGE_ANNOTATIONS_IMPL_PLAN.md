@@ -412,13 +412,22 @@ correctness items remaining):**
     assertions). RDF-mode body preservation for explicit-IRI
     annotations falls out naturally — only the bundle is retracted;
     user-named body resources stay queryable. **LPG-mode body
-    cleanup for by-id retracts is deferred** — the pre-pass only
-    emits bundle retracts and the base-edge cascade (which honors
-    `lpg_edge_lifecycle`) doesn't fire on a pure bundle-retract;
-    that asymmetry is its own follow-up. Tests:
+    cleanup is wired** via a new Pass 3 in
+    `cascade_attachment_retracts`: when the user-input retract
+    set contains a complete `f:reifies*` bundle retract for an
+    annotation that Pass 1 (base-edge cascade) didn't already
+    handle, Pass 3 scans the annotation's currently-asserted body
+    and emits matching retract flakes when the SID is anonymous
+    (always — though anonymous by-id retracts are rejected at parse
+    time, the path stays correct for any future selector-form
+    work) or `opts.lpgEdgeLifecycle` is true (explicit IRIs in LPG
+    mode). Default RDF mode for explicit-IRI annotations still
+    preserves the body — Pass 3 skips when neither condition holds.
+    Tests:
     `delete_by_annotation_id_retracts_only_targeted_occurrence`,
     `delete_by_annotation_id_named_graph_retracts_in_correct_graph`,
-    `delete_by_annotation_id_explicit_iri_preserves_body_in_rdf_mode`.
+    `delete_by_annotation_id_explicit_iri_preserves_body_in_rdf_mode`,
+    `delete_by_annotation_id_lpg_mode_cleans_explicit_iri_body`.
   - **By selector** (⏳ deferred, with a clear error):
     `@annotation: { ex:role: "Engineer" }` (no `@id`) needs runtime
     resolution against live data — minting a fresh variable,

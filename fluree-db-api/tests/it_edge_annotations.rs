@@ -2169,19 +2169,99 @@ async fn delete_by_annotation_id_retracts_only_targeted_occurrence() {
 }
 
 #[tokio::test]
+async fn delete_by_annotation_id_lpg_mode_cleans_explicit_iri_body() {
+    // Cypher relationship-delete semantics: in LPG mode
+    // (`opts.lpgEdgeLifecycle: true`), a by-id retract of an
+    // explicit-IRI annotation should also retract the body, not
+    // just the f:reifies* bundle. Default RDF mode preserves the
+    // body — covered by
+    // `delete_by_annotation_id_explicit_iri_preserves_body_in_rdf_mode`.
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger_id = "it/edge-annotations:delete-by-id-lpg-cleans-body";
+    let ledger0 = genesis_ledger(&fluree, ledger_id);
+
+    let r1 = fluree
+        .insert(
+            ledger0,
+            &json!({
+                "@context": ctx(),
+                "@id": "ex:alice",
+                "ex:worksFor": {
+                    "@id": "ex:acme",
+                    "@annotation": {
+                        "@id": "ex:emp/alice-acme",
+                        "ex:role": "Engineer",
+                        "ex:since": "2024-01-01"
+                    }
+                }
+            }),
+        )
+        .await
+        .expect("annotated insert");
+
+    fluree
+        .update(
+            r1.ledger,
+            &json!({
+                "@context": ctx(),
+                "delete": {
+                    "@id": "ex:alice",
+                    "ex:worksFor": {
+                        "@id": "ex:acme",
+                        "@annotation": { "@id": "ex:emp/alice-acme" }
+                    }
+                },
+                "opts": { "lpgEdgeLifecycle": true }
+            }),
+        )
+        .await
+        .expect("by-id delete with lpgEdgeLifecycle");
+
+    // Body must be GONE — both ex:role and ex:since.
+    let body = json!({
+        "@context": ctx(),
+        "select": ["?role", "?since"],
+        "where": {
+            "@id": "ex:emp/alice-acme",
+            "ex:role": "?role",
+            "ex:since": "?since"
+        }
+    });
+    let ledger = fluree.ledger(ledger_id).await.expect("reload");
+    let rows = support::query_jsonld_formatted(&fluree, &ledger, &body)
+        .await
+        .expect("post-delete body query");
+    let arr = rows.as_array().expect("array");
+    assert!(
+        arr.is_empty(),
+        "LPG mode by-id retract must clean explicit-IRI annotation body: got {arr:#?}"
+    );
+
+    // Base edge still survives — by-id retract targets the
+    // annotation occurrence, not the edge it reifies.
+    let base = json!({
+        "@context": ctx(),
+        "select": ["?org"],
+        "where": { "@id": "ex:alice", "ex:worksFor": { "@id": "?org" } }
+    });
+    let base_rows = support::query_jsonld_formatted(&fluree, &ledger, &base)
+        .await
+        .expect("base edge query");
+    assert_eq!(
+        base_rows.as_array().map(Vec::len),
+        Some(1),
+        "base edge must survive a by-id annotation retract even in LPG mode"
+    );
+}
+
+#[tokio::test]
 async fn delete_by_annotation_id_explicit_iri_preserves_body_in_rdf_mode() {
     // Per the design contract, deleting an explicit-IRI annotation
     // by @id retracts only the f:reifies* bundle in default RDF
     // mode — the user-named body metadata stays as ordinary RDF.
-    //
-    // **Deferred:** LPG-mode body cleanup
-    // (`opts.lpgEdgeLifecycle: true`) for by-id retracts is not
-    // yet wired. The pre-pass synthesizes only bundle retracts; the
-    // base-edge cascade (which honors `lpg_edge_lifecycle` for body
-    // cleanup) doesn't fire on a pure bundle-retract since the
-    // user isn't retracting any base-edge flake. That asymmetry
-    // with base-edge-cascade is its own follow-up — for now,
-    // by-id deletes leave the body intact regardless of mode.
+    // The LPG-mode counterpart
+    // (`delete_by_annotation_id_lpg_mode_cleans_explicit_iri_body`)
+    // pins the opt-in cleanup path.
     let fluree = FlureeBuilder::memory().build_memory();
     let ledger_id = "it/edge-annotations:delete-by-id-rdf-body";
     let ledger0 = genesis_ledger(&fluree, ledger_id);

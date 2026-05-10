@@ -361,6 +361,105 @@ async fn cascade_attachment_retracts(
         cascade.extend(edge_key.to_reifies_facts_jsonld_compatible(&ann_sid, new_t, false));
     }
 
+    // ---------------------------------------------------------------
+    // Pass 3: body cleanup for user-explicit bundle retracts.
+    //
+    // The by-id retract pre-pass
+    // (`fluree_db_transact::parse::edge_annotations::lower_delete_annotation_blocks`)
+    // synthesizes only `f:reifies*` retracts — the bundle, no body.
+    // Without this pass, the annotation's body metadata persists
+    // after the bundle is gone. That matches the design contract
+    // for explicit-IRI annotations in default RDF mode
+    // (user-named resources stay queryable as ordinary RDF) but
+    // breaks two cases:
+    //
+    // 1. **Anonymous (BLANK_NODE) annotations:** body becomes
+    //    orphaned bnode-keyed flakes that the wildcard-hide filter
+    //    no longer catches (the `f:reifiesSubject` discriminator
+    //    is gone with the bundle). Always cleanup.
+    // 2. **Explicit-IRI annotations in LPG mode**
+    //    (`opts.lpgEdgeLifecycle: true`): Cypher relationship-delete
+    //    semantics demand that retracting the relationship deletes
+    //    its property metadata too. Cleanup only when the flag is
+    //    set.
+    //
+    // Detection: group the user-input retracts by `(g, ann_sid)`,
+    // keeping only `f:reifies*` flakes. A "complete bundle retract"
+    // has at least the three required slots (subject + predicate +
+    // object) present. Partial retracts are user errors we don't
+    // try to correct.
+    let mut grouped_bundle_retracts: BTreeMap<(GraphId, Sid), Vec<&Flake>> = BTreeMap::new();
+    for flake in flakes {
+        if flake.op {
+            continue; // assertion, not a retract
+        }
+        if !is_reserved_reifies_predicate(&flake.p) {
+            continue; // not a bundle flake
+        }
+        let g_id = resolve_flake_graph_id(flake, reverse_graph)?;
+        grouped_bundle_retracts
+            .entry((g_id, flake.s.clone()))
+            .or_default()
+            .push(flake);
+    }
+
+    for ((g_id, ann_sid), bundle_retracts) in grouped_bundle_retracts {
+        if cascaded_anns.contains(&(g_id, ann_sid.clone())) {
+            // Already handled by Pass 1's base-edge cascade.
+            continue;
+        }
+
+        // Verify all three required slots are retracted at the same
+        // t. The pre-pass emits exactly those three (plus
+        // `f:reifiesGraph` for named-graph annotations); a partial
+        // user-issued retract isn't a "complete bundle retract"
+        // signal.
+        let has_required = [
+            fluree_vocab::db::REIFIES_SUBJECT,
+            fluree_vocab::db::REIFIES_PREDICATE,
+            fluree_vocab::db::REIFIES_OBJECT,
+        ]
+        .iter()
+        .all(|name| {
+            bundle_retracts.iter().any(|f| {
+                f.p.namespace_code == fluree_vocab::namespaces::FLUREE_DB
+                    && f.p.name.as_ref() == *name
+            })
+        });
+        if !has_required {
+            continue;
+        }
+
+        let is_anonymous = ann_sid.namespace_code == fluree_vocab::namespaces::BLANK_NODE;
+        let cleanup_body = is_anonymous || lpg_edge_lifecycle;
+        if !cleanup_body {
+            continue;
+        }
+
+        // Scan currently-asserted flakes for this annotation
+        // subject. Filter out the bundle (Pass 1's domain) and
+        // emit retracts mirroring each body assertion.
+        let all_flakes = fluree_db_core::range_with_overlay(
+            &ledger.snapshot,
+            g_id,
+            ledger.novelty.as_ref(),
+            IndexType::Spot,
+            RangeTest::Eq,
+            RangeMatch::new().with_subject(ann_sid.clone()),
+            RangeOptions::new().with_to_t(to_t),
+        )
+        .await?;
+        for asserted in all_flakes {
+            if is_reserved_reifies_predicate(&asserted.p) {
+                continue;
+            }
+            let mut retract = asserted.clone();
+            retract.t = new_t;
+            retract.op = false;
+            cascade.push(retract);
+        }
+    }
+
     tracing::Span::current().record("cascade_count", cascade.len());
     Ok(cascade)
     }
