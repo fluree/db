@@ -989,6 +989,32 @@ impl crate::Fluree {
         let gc_max_old_indexes = indexer_config.gc_max_old_indexes;
         let gc_min_time_mins = indexer_config.gc_min_time_mins;
 
+        // Resolve the api's attachment-events provider into a
+        // concrete coverage envelope so the rebuild path
+        // (`rebuild_index_from_commits`) can seal an authoritative
+        // annotation arena. The provider trait is consumed by the
+        // orchestrator's per-job dispatch loop; direct rebuild
+        // entry points read `IndexerConfig.attachment_events`
+        // instead, so we have to do the resolution here.
+        //
+        // Skipped when the caller already supplied either field
+        // (respect explicit overrides) or when ledger caching is
+        // disabled (no `LedgerManager` to read the live overlay
+        // from). For non-annotation ledgers the provider returns
+        // `Some(Authoritative([]))` cheaply; the indexer's arena
+        // builder early-returns for empty events with no prev arena.
+        if indexer_config.attachment_events.is_none()
+            && indexer_config.attachment_events_provider.is_none()
+        {
+            if let Some(provider) = self.attachment_events_provider() {
+                // Pre-load so `try_running_attachment_events` finds
+                // the running ledger handle.
+                let _ = self.ledger_cached(&ledger_id).await;
+                indexer_config.attachment_events =
+                    provider.attachment_events(&ledger_id).await;
+            }
+        }
+
         // Read the current ledger's `f:fullTextDefaults` so the reindex routes
         // configured plain-string values into BM25 arena building. Best-effort:
         // if the existing index can't be loaded (e.g. first-ever reindex of a

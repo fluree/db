@@ -805,3 +805,55 @@ async fn explain_tags_annotation_role_and_uses_arena_stats() {
         })
         .await;
 }
+
+#[tokio::test]
+async fn reindex_seals_arena_when_caching_enabled_no_provider_in_opts() {
+    // Closes the bulk-import → arena seal gap: a `fluree.reindex(...)`
+    // call with default options should seal an authoritative arena
+    // when ledger caching is enabled, even though the caller didn't
+    // attach an `AttachmentEventsProvider` explicitly. The api's
+    // admin path attaches its own provider (backed by the running
+    // `LedgerManager`) and pre-loads the ledger so the provider can
+    // read its overlay.
+    //
+    // Without this wiring, a CLI-driven import + reindex flow would
+    // silently land in scan-fallback and require a *second* reindex
+    // through the api to seal the arena.
+    use fluree_db_api::ReindexOptions;
+
+    let fluree = FlureeBuilder::memory()
+        .with_ledger_cache_config(fluree_db_api::LedgerManagerConfig::default())
+        .build_memory();
+    let ledger_id = "it/edge-annotations-indexed:reindex-seals-arena";
+    let ledger0 = genesis_ledger(&fluree, ledger_id);
+
+    fluree
+        .insert(ledger0, &annotated_insert())
+        .await
+        .expect("annotated insert");
+
+    fluree
+        .reindex(ledger_id, ReindexOptions::default())
+        .await
+        .expect("reindex must succeed");
+
+    let post = fluree.ledger(ledger_id).await.expect("reload");
+    assert!(
+        post.snapshot.has_annotations,
+        "sticky bit set after annotated insert + reindex"
+    );
+    assert!(
+        post.snapshot.annotation_index.is_some(),
+        "reindex must seal an annotation arena via the api-attached \
+         AttachmentEventsProvider — got annotation_index=None which \
+         means the bulk-import → arena gap is still open"
+    );
+    let stats = &post
+        .snapshot
+        .annotation_index
+        .as_ref()
+        .expect("arena root")
+        .stats;
+    assert_eq!(stats.distinct_annotations, 1);
+    assert_eq!(stats.live_attachment_pairs, 1);
+}

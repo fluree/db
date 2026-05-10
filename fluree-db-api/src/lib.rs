@@ -2822,6 +2822,40 @@ impl Fluree {
         )
     }
 
+    /// Build a [`fluree_db_indexer::AttachmentEventsProvider`] backed by
+    /// this connection's running `LedgerManager`. Attach it to the
+    /// indexer's `IndexerConfig` (via
+    /// `with_attachment_events_provider`) so every index build —
+    /// including CLI-driven incremental runs and direct `reindex`
+    /// calls — picks up the live attachment overlay and seals an
+    /// authoritative annotation arena.
+    ///
+    /// Returns `None` when ledger caching is disabled — without a
+    /// `LedgerManager`, the provider has nowhere to read the running
+    /// attachment overlay from. The indexer routes that case through
+    /// the defensive arena drop, which is correct.
+    ///
+    /// The background indexer constructed at `FlureeBuilder::build()`
+    /// time already attaches one of these automatically. External
+    /// callers invoking `fluree_db_indexer::build_index_for_ledger`
+    /// directly (e.g. the CLI's `index` command) need to attach
+    /// theirs by calling this method.
+    pub fn attachment_events_provider(
+        &self,
+    ) -> Option<Arc<dyn fluree_db_indexer::AttachmentEventsProvider>> {
+        use std::sync::OnceLock;
+        let manager = Arc::clone(self.ledger_manager.as_ref()?);
+        // The provider's late-binding cell is overkill here (manager
+        // already exists), but reusing the same provider type keeps
+        // one source of truth for `RunningCoverage` →
+        // `AttachmentEventCoverage` translation.
+        let cell = Arc::new(OnceLock::new());
+        let _ = cell.set(manager);
+        Some(Arc::new(
+            crate::indexer_attachment_provider::ApiAttachmentEventsProvider { manager: cell },
+        ))
+    }
+
     /// Get the raw address-based storage for admin/GC operations.
     ///
     /// Returns `None` for `Permanent` (IPFS) backends, which do not

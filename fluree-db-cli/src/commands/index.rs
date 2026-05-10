@@ -26,8 +26,24 @@ pub async fn run_index(ledger: Option<&str>, dirs: &FlureeDir) -> CliResult<()> 
     // build picks up `f:fullTextDefaults` changes — otherwise configured
     // plain-string values written since the last reindex wouldn't flow
     // into BM25 arenas.
-    let config = fluree_db_indexer::IndexerConfig::default()
+    let mut config = fluree_db_indexer::IndexerConfig::default()
         .with_fulltext_config_provider(fluree.fulltext_config_provider());
+
+    // Resolve the attachment-events provider into a concrete
+    // coverage envelope so an annotated ledger seals an
+    // authoritative `f:reifies*` arena on this indexing run.
+    // `build_index_for_ledger` reads `IndexerConfig.attachment_events`
+    // directly — only the orchestrator's job dispatcher consults
+    // the provider trait, so we have to resolve here. Without this,
+    // the indexer takes the defensive-drop path (`annotation_index
+    // = None`) and queries fall back to the M2a scan path —
+    // correct but slower. The provider reads from the running
+    // `LedgerManager`, so we cache the ledger first to make sure
+    // its attachment overlay is loaded.
+    if let Some(provider) = fluree.attachment_events_provider() {
+        let _ = fluree.ledger_cached(&ledger_id).await;
+        config.attachment_events = provider.attachment_events(&ledger_id).await;
+    }
 
     let cs = fluree
         .branched_content_store(&ledger_id)

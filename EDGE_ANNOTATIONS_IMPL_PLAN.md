@@ -947,16 +947,28 @@ Three items from the original DoD are deliberately deferred:
    boundaries) or a structural-equivalence helper that loads both
    arenas and compares the row sets.
 
-2. **Bulk import path.** The Turtle/JSON-LD importer emits
-   `f:reifies*` flakes through the normal write path, so the
-   resolved RunRecords carry the same shape an incremental commit
-   would produce. The arena seal hook (slice 3g) attaches in the
-   full-rebuild path, but only when the caller supplies
-   `Authoritative` events. The api's `BackgroundIndexerWorker`
-   provider doesn't exercise this — bulk imports usually run via
-   the CLI, which today doesn't populate
-   `IndexerConfig.attachment_events`. End-to-end import ➜ arena
-   coverage is a follow-up.
+2. ~~**Bulk import path.**~~ ✅ Closed: `Fluree::reindex(...)` and the
+   CLI's `fluree index` command now resolve the api's
+   `AttachmentEventsProvider` into a concrete coverage envelope and
+   stamp it into `IndexerConfig.attachment_events` before calling
+   the rebuild path. Annotation-bearing ledgers seal an authoritative
+   arena on the first reindex after a bulk import, no second pass
+   needed. The bulk-import code path itself (which uses
+   `build_indexes_from_commits` for fresh-ledger ingestion, not the
+   incremental rebuild path) is unaffected — it still produces a
+   ledger without an arena, and the user runs `fluree index` (or
+   `fluree.reindex(...)`) to seal it. A future enhancement could
+   wire the importer to seal directly during `build_indexes_from_commits`.
+
+   New public api accessor: `Fluree::attachment_events_provider() ->
+   Option<Arc<dyn AttachmentEventsProvider>>` — returns `Some` when
+   ledger caching is enabled. External callers who invoke
+   `fluree_db_indexer::build_index_for_ledger` directly should
+   resolve it via `provider.attachment_events(ledger_id).await`
+   before calling, mirroring the api's own pattern.
+
+   Pinning test:
+   `it_edge_annotations_indexed::reindex_seals_arena_when_caching_enabled_no_provider_in_opts`.
 
 3. **Malformed-bundle telemetry counter.** Both
    `bundle::build_arenas_from_flakes` and
