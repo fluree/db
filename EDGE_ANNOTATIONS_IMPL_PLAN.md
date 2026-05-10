@@ -403,11 +403,21 @@ correctness items remaining):**
     predicate-value (preventing a base-edge retract) and synthesizes
     delete templates with the explicit `f:reifies*` retract triples.
     The user-authored firewall scan was lifted above both passes so
-    the synthesized templates aren't re-rejected. RDF-mode body
-    preservation for explicit-IRI annotations falls out naturally —
-    only the bundle is retracted; user-named body resources stay
-    queryable. Tests:
+    the synthesized templates aren't re-rejected. The walker
+    threads named-graph context through to the synthesized
+    template — including `f:reifiesGraph` and the per-template
+    `@graph` selector — so retracts of named-graph annotations
+    cancel the original assertions (Fluree's flake identity
+    includes `g`; default-graph retracts can't cancel named-graph
+    assertions). RDF-mode body preservation for explicit-IRI
+    annotations falls out naturally — only the bundle is retracted;
+    user-named body resources stay queryable. **LPG-mode body
+    cleanup for by-id retracts is deferred** — the pre-pass only
+    emits bundle retracts and the base-edge cascade (which honors
+    `lpg_edge_lifecycle`) doesn't fire on a pure bundle-retract;
+    that asymmetry is its own follow-up. Tests:
     `delete_by_annotation_id_retracts_only_targeted_occurrence`,
+    `delete_by_annotation_id_named_graph_retracts_in_correct_graph`,
     `delete_by_annotation_id_explicit_iri_preserves_body_in_rdf_mode`.
   - **By selector** (⏳ deferred, with a clear error):
     `@annotation: { ex:role: "Engineer" }` (no `@id`) needs runtime

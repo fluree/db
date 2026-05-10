@@ -284,7 +284,15 @@ pub fn lower_delete_annotation_blocks(doc: &mut Value) -> Result<()> {
     };
 
     let mut new_templates: Vec<Value> = Vec::new();
-    walk_delete_for_annotations(delete_val, &top_ctx, &mut new_templates)?;
+    // Top-level graph context: the transactor's UPDATE doc has no
+    // envelope `@graph` (that's the insert/upsert envelope form),
+    // so we start from `None` and let per-node `@graph: "<iri>"`
+    // selectors inside the delete clause set the inherited graph as
+    // we recurse. The `@graph` value gets threaded into the
+    // synthesized retract template so the retract flake's
+    // `g = Some(graph_sid)` matches the original assertion's flake
+    // identity.
+    walk_delete_for_annotations(delete_val, &top_ctx, None, &mut new_templates)?;
     if new_templates.is_empty() {
         return Ok(());
     }
@@ -326,15 +334,23 @@ fn is_empty_node(v: &Value) -> bool {
 /// one with an explicit `@id`, build a retract template, then strip
 /// the `<predicate>: { ... @annotation: ... }` pair from its parent
 /// so the base edge isn't accidentally retracted alongside.
+///
+/// `inherited_graph` is the named-graph IRI in scope for this
+/// subtree. Per-node `@graph: "<iri>"` selectors override it for
+/// their subtree. The graph IRI is threaded into the synthesized
+/// retract template so the retract flake matches the original
+/// assertion's flake identity (which carries `g = Some(graph_sid)`
+/// for named-graph annotations).
 fn walk_delete_for_annotations(
     val: &mut Value,
     ctx: &ParsedContext,
+    inherited_graph: Option<&str>,
     out: &mut Vec<Value>,
 ) -> Result<()> {
     match val {
         Value::Array(items) => {
             for item in items {
-                walk_delete_for_annotations(item, ctx, out)?;
+                walk_delete_for_annotations(item, ctx, inherited_graph, out)?;
             }
             Ok(())
         }
@@ -355,6 +371,20 @@ fn walk_delete_for_annotations(
                 })
                 .map(String::from);
 
+            // Per-node `@graph: "<iri>"` overrides the inherited
+            // graph for this subtree. Mirrors
+            // `extract_node_graph_selector` from the assertion-side
+            // walker so the two paths agree on graph scoping.
+            let node_graph: Option<String> = match map.get("@graph") {
+                Some(Value::String(s)) => Some(s.clone()),
+                Some(Value::Object(g)) => {
+                    g.get("@id").and_then(Value::as_str).map(String::from)
+                }
+                _ => None,
+            };
+            let node_graph_ref = node_graph.as_deref();
+            let effective_graph: Option<&str> = node_graph_ref.or(inherited_graph);
+
             // First pass: find predicate keys whose value carries an
             // `@annotation`, lift them into retract templates, and
             // remove from the parent. We collect mutations first to
@@ -373,6 +403,7 @@ fn walk_delete_for_annotations(
                     &key,
                     value,
                     ctx,
+                    effective_graph,
                     out,
                     &mut |strip_predicate| {
                         if strip_predicate {
@@ -390,7 +421,7 @@ fn walk_delete_for_annotations(
             let remaining: Vec<String> = map.keys().cloned().collect();
             for key in remaining {
                 if let Some(v) = map.get_mut(&key) {
-                    walk_delete_for_annotations(v, ctx, out)?;
+                    walk_delete_for_annotations(v, ctx, effective_graph, out)?;
                 }
             }
             Ok(())
@@ -403,11 +434,16 @@ fn walk_delete_for_annotations(
 /// When the value is an object containing an `@annotation` block,
 /// lift it into a retract template (appended to `out`) and signal
 /// the caller to strip the predicate from the parent.
+///
+/// `inherited_graph` is the named-graph in scope at the predicate-
+/// value's parent; per-object `@graph` overrides apply on the inner
+/// node and propagate via the recursion in `walk_delete_for_annotations`.
 fn lift_annotations_under_predicate(
     parent_subject: Option<&str>,
     predicate: &str,
     value: &mut Value,
     ctx: &ParsedContext,
+    inherited_graph: Option<&str>,
     out: &mut Vec<Value>,
     strip_callback: &mut dyn FnMut(bool),
 ) -> Result<()> {
@@ -425,6 +461,7 @@ fn lift_annotations_under_predicate(
                     predicate,
                     &mut item,
                     ctx,
+                    inherited_graph,
                     out,
                     &mut |s| item_stripped = s,
                 )?;
@@ -461,6 +498,19 @@ fn lift_annotations_under_predicate(
                             .to_string(),
                     )
                 })?;
+            // Per-object `@graph` selector on the *base edge object*
+            // overrides the inherited graph. Mirrors the
+            // assertion-side walker's per-node graph extraction.
+            let object_graph: Option<String> = match map.get("@graph") {
+                Some(Value::String(s)) => Some(s.clone()),
+                Some(Value::Object(g)) => {
+                    g.get("@id").and_then(Value::as_str).map(String::from)
+                }
+                _ => None,
+            };
+            let effective_graph: Option<&str> =
+                object_graph.as_deref().or(inherited_graph);
+
             let ann_block = map.remove(ANNOTATION_KEY).or_else(|| map.remove(EDGE_KEY));
             let Some(ann_block) = ann_block else {
                 return Ok(());
@@ -472,6 +522,7 @@ fn lift_annotations_under_predicate(
                 &object_id,
                 ann_block,
                 ctx,
+                effective_graph,
             )?;
             out.push(template);
 
@@ -499,6 +550,7 @@ fn build_delete_template_for_annotation(
     object_id: &str,
     ann_block: Value,
     ctx: &ParsedContext,
+    graph_iri: Option<&str>,
 ) -> Result<Value> {
     let Value::Object(ann_map) = ann_block else {
         return Err(TransactError::Parse(
@@ -550,6 +602,20 @@ fn build_delete_template_for_annotation(
         json!({"@id": predicate}),
     );
     template.insert(reifies_iris::OBJECT.to_string(), json!({"@id": object_id}));
+    // For named-graph annotations, both the f:reifies* flakes and
+    // the synthetic annotation node live in the reified edge's
+    // graph. Without this, the parser would emit default-graph
+    // retract flakes (`g = None`) which can't cancel named-graph
+    // assertions — flake identity includes `g`. Mirrors the
+    // assertion-side `build_annotation_sibling` graph emission so
+    // assert and retract round-trip exactly.
+    if let Some(graph) = graph_iri {
+        template.insert(
+            reifies_iris::GRAPH.to_string(),
+            json!({"@id": graph}),
+        );
+        template.insert("@graph".to_string(), Value::String(graph.to_string()));
+    }
     Ok(Value::Object(template))
 }
 

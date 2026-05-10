@@ -2173,8 +2173,15 @@ async fn delete_by_annotation_id_explicit_iri_preserves_body_in_rdf_mode() {
     // Per the design contract, deleting an explicit-IRI annotation
     // by @id retracts only the f:reifies* bundle in default RDF
     // mode — the user-named body metadata stays as ordinary RDF.
-    // (LPG mode `opts.lpgEdgeLifecycle: true` would clean the body
-    // too; that's a separate test.)
+    //
+    // **Deferred:** LPG-mode body cleanup
+    // (`opts.lpgEdgeLifecycle: true`) for by-id retracts is not
+    // yet wired. The pre-pass synthesizes only bundle retracts; the
+    // base-edge cascade (which honors `lpg_edge_lifecycle` for body
+    // cleanup) doesn't fire on a pure bundle-retract since the
+    // user isn't retracting any base-edge flake. That asymmetry
+    // with base-edge-cascade is its own follow-up — for now,
+    // by-id deletes leave the body intact regardless of mode.
     let fluree = FlureeBuilder::memory().build_memory();
     let ledger_id = "it/edge-annotations:delete-by-id-rdf-body";
     let ledger0 = genesis_ledger(&fluree, ledger_id);
@@ -2235,6 +2242,98 @@ async fn delete_by_annotation_id_explicit_iri_preserves_body_in_rdf_mode() {
         rows.as_array().map(Vec::len),
         Some(1),
         "explicit-IRI annotation body must remain queryable after by-id retract in RDF mode"
+    );
+}
+
+#[tokio::test]
+async fn delete_by_annotation_id_named_graph_retracts_in_correct_graph() {
+    // Regression: when an annotated edge lives in a named graph, the
+    // f:reifies* assertion flakes carry `g = Some(graph_sid)` and
+    // the synthetic annotation node also lives in that named graph.
+    // The by-id retract pre-pass must thread the @graph through to
+    // the synthesized retract template — otherwise the retract
+    // flakes land in the default graph (`g = None`), Fluree's
+    // flake identity includes `g`, and the retract fails to cancel
+    // the named-graph assertion (annotation stays asserted, query
+    // continues to surface it).
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger_id = "it/edge-annotations:delete-by-id-named-graph";
+    let ledger0 = genesis_ledger(&fluree, ledger_id);
+
+    let r1 = fluree
+        .insert(
+            ledger0,
+            &json!({
+                "@context": ctx(),
+                "@id": "ex:alice",
+                "@graph": "ex:hr-graph",
+                "ex:worksFor": {
+                    "@id": "ex:acme",
+                    "@annotation": {
+                        "@id": "ex:emp/A",
+                        "ex:role": "Engineer"
+                    }
+                }
+            }),
+        )
+        .await
+        .expect("named-graph annotated insert");
+
+    let r2 = fluree
+        .update(
+            r1.ledger,
+            &json!({
+                "@context": ctx(),
+                "delete": {
+                    "@id": "ex:alice",
+                    "@graph": "ex:hr-graph",
+                    "ex:worksFor": {
+                        "@id": "ex:acme",
+                        "@annotation": { "@id": "ex:emp/A" }
+                    }
+                }
+            }),
+        )
+        .await
+        .expect("named-graph by-id delete");
+    // Three retract flakes for the bundle (subject/predicate/object).
+    // f:reifiesGraph is also retracted because the synthesized
+    // template carries it explicitly to match the original
+    // assertion's identity. So flake_count = 4: subject + predicate
+    // + object + reifiesGraph.
+    assert_eq!(
+        r2.receipt.flake_count, 4,
+        "named-graph by-id retract must cancel all four reifies* flakes \
+         emitted at insert time (subject/predicate/object + reifiesGraph)"
+    );
+
+    // The annotation should no longer surface via @reifies. If the
+    // graph wasn't threaded, the retract flakes would have landed
+    // in the default graph and the named-graph assertion would
+    // still exist — this query would still find ex:emp/A.
+    let q = json!({
+        "@context": ctx(),
+        "from": format!("{ledger_id}#http://example.org/hr-graph"),
+        "select": ["?ann", "?role"],
+        "where": {
+            "@id": "?ann",
+            "ex:role": "?role",
+            "@reifies": {
+                "@id": "ex:alice",
+                "ex:worksFor": { "@id": "ex:acme" }
+            }
+        }
+    });
+    let result = fluree
+        .query_connection(&q)
+        .await
+        .expect("named-graph @reifies query");
+    let ledger = fluree.ledger(ledger_id).await.expect("reload");
+    let json = result.to_jsonld(&ledger.snapshot).expect("jsonld");
+    let arr = json.as_array().expect("array");
+    assert!(
+        arr.is_empty(),
+        "named-graph annotation must be retracted; found survivors: {arr:#?}"
     );
 }
 
