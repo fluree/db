@@ -151,11 +151,26 @@ When `--remote` is omitted, the CLI auto-routes through a locally running `flure
 
 Imports a `.flpack` file (native ledger pack) into a new local ledger. The `.flpack` format uses the same `fluree-pack-v1` wire format as `POST /pack`. See [Ledger portability](#ledger-portability-flpack-files) below.
 
-### `fluree export --format ledger` (native ledger export)
+### `fluree export --format ledger`
 
-- No server endpoint required (local-only operation today)
+Exports a full ledger (all commits, txn blobs, and — unless `--no-indexes` — binary index artifacts) as a `.flpack` archive. The archive contains a `phase: "nameservice"` manifest frame so the importer can reconstruct the head pointers. Pass `-o <FILE>` to write to disk (required when stdout is a TTY).
 
-Exports a full local ledger (all commits, txn blobs, and — unless `--no-indexes` — binary index artifacts) as a `.flpack` archive. The archive contains a `phase: "nameservice"` manifest frame so the importer can reconstruct the head pointers. Pass `-o <FILE>` to write to disk (required when stdout is a TTY). `--remote` is not yet supported for `--format ledger`. See [Ledger portability](#ledger-portability-flpack-files) below.
+**Local mode (default):**
+
+- No server endpoint required.
+
+Streams from the local ledger via the `Fluree::archive_ledger` API.
+
+**Remote mode (`--remote <name>`):**
+
+- `GET {api_base_url}/storage/ns/:ledger-id` (NsRecord lookup)
+- `POST {api_base_url}/pack/*ledger` (binary `fluree-pack-v1` stream)
+
+The CLI fetches the remote `NsRecord` to learn the head CIDs and `t` values, then streams the pack response into the user's writer, swapping the terminal End frame for a synthesized `phase: "nameservice"` manifest + End. The resulting `.flpack` is byte-compatible with a locally-generated archive — `fluree create --from <file>.flpack` doesn't care which side produced it.
+
+**Auth:** Both endpoints sit in the replication-grade bracket and require a Bearer token with `fluree.storage.*` permissions (same auth as `fluree clone`/`pull`). Without those permissions the server returns `404 Not Found` for `/storage/ns/:ledger-id` to avoid existence leaks; the CLI surfaces this as `not found: ledger '...' not found on remote '...'`.
+
+See [Ledger portability](#ledger-portability-flpack-files) below for the on-disk format and [Replication Auth Contract](#replication-auth-contract) for the auth semantics.
 
 ### `fluree query`, `fluree insert`, `fluree upsert`, `fluree update`, `fluree track`, `fluree info`, `fluree exists`
 
@@ -1539,6 +1554,7 @@ fluree context set mydb --remote origin -e '{"ex": "http://example.org/"}'  # ad
 fluree history http://example.org/alice --ledger mydb --remote origin --format json  # remote history
 fluree query mydb 'SELECT * WHERE { ?s ?p ?o }' --remote origin --at 1  # time-travel via /query/{ledger}
 fluree create empty-db --remote origin  # should create an empty ledger on the remote
+fluree export mydb --remote origin --format ledger -o mydb-remote.flpack  # archive remote ledger
 fluree drop my-gs --force      # should drop the graph source locally
 fluree drop local-db --remote origin --force  # should drop the published ledger on the remote
 ```

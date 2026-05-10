@@ -128,14 +128,6 @@ async fn run_ledger_archive(
     dirs: &FlureeDir,
     remote_flag: Option<&str>,
 ) -> CliResult<()> {
-    if remote_flag.is_some() {
-        return Err(CliError::Usage(
-            "fluree export --format ledger does not yet support --remote; \
-             run it against a local ledger or use the Rust API. \
-             See docs/operations/pack-archive-restore.md."
-                .to_string(),
-        ));
-    }
     if at.is_some() {
         return Err(CliError::Usage(
             "fluree export --format ledger does not support --at — archives capture the current head; \
@@ -156,18 +148,23 @@ async fn run_ledger_archive(
         ));
     }
 
+    let ledger_id = context::to_ledger_id(alias);
+
+    if let Some(remote_name) = remote_flag {
+        return run_ledger_archive_remote(alias, &ledger_id, output, no_indexes, dirs, remote_name)
+            .await;
+    }
+
     let store = crate::config::TomlSyncConfigStore::new(dirs.config_dir().to_path_buf());
-    if store.get_tracked(alias).is_some()
-        || store.get_tracked(&context::to_ledger_id(alias)).is_some()
-    {
+    if store.get_tracked(alias).is_some() || store.get_tracked(&ledger_id).is_some() {
         return Err(CliError::Usage(
-            "fluree export --format ledger requires local data and is not available for tracked ledgers"
+            "this alias points at a tracked ledger (no local data); \
+             pass `--remote <name>` to archive the upstream copy."
                 .to_string(),
         ));
     }
 
     let fluree = context::build_fluree(dirs)?;
-    let ledger_id = context::to_ledger_id(alias);
 
     match output {
         Some(path) => {
@@ -222,6 +219,120 @@ async fn run_ledger_archive(
                 stats.commits_sent,
                 stats.txn_blobs_sent,
                 stats.index_artifacts_sent,
+            );
+        }
+    }
+    Ok(())
+}
+
+/// Remote variant of `run_ledger_archive`.
+///
+/// Fetches the remote `NsRecord` (so we can synthesize the trailing
+/// nameservice manifest), then issues `POST /pack/{ledger}` and copies the
+/// pack stream through the user's writer. The remote client swaps the
+/// terminal End frame for `manifest + End` on the fly, producing a byte
+/// stream that's identical in shape to a local archive.
+async fn run_ledger_archive_remote(
+    alias: &str,
+    ledger_id: &str,
+    output: Option<&Path>,
+    no_indexes: bool,
+    dirs: &FlureeDir,
+    remote_name: &str,
+) -> CliResult<()> {
+    use fluree_db_core::pack::PackRequest;
+
+    let client = context::build_remote_client(remote_name, dirs).await?;
+
+    // Pull the NsRecord first; we need its head CIDs and t values both to
+    // build the pack request and to construct the trailing manifest.
+    let record = client
+        .fetch_ns_record(ledger_id)
+        .await
+        .map_err(|e| {
+            CliError::Remote(format!(
+                "failed to fetch NsRecord for '{ledger_id}' on '{remote_name}': {e}"
+            ))
+        })?
+        .ok_or_else(|| {
+            CliError::NotFound(format!(
+                "ledger '{ledger_id}' not found on remote '{remote_name}'"
+            ))
+        })?;
+
+    let head_commit_id = record.commit_head_id.clone().ok_or_else(|| {
+        CliError::Remote(format!(
+            "remote ledger '{ledger_id}' has no head commit to archive"
+        ))
+    })?;
+
+    // Mirror `Fluree::archive_ledger`: only request indexes when the user
+    // wants them AND the remote actually has an index root. Otherwise the
+    // archive degrades to commits-only and the manifest will omit
+    // `index_head_id` accordingly.
+    let include_indexes = !no_indexes;
+    let request = match (include_indexes, record.index_head_id.clone()) {
+        (true, Some(index_root)) => {
+            PackRequest::with_indexes(vec![head_commit_id], vec![], index_root, None)
+        }
+        _ => PackRequest::commits(vec![head_commit_id], vec![]),
+    };
+
+    match output {
+        Some(path) => {
+            let path: PathBuf = path.to_path_buf();
+            let file = tokio::fs::File::create(&path).await.map_err(|e| {
+                CliError::Config(format!("failed to create '{}': {e}", path.display()))
+            })?;
+            let mut writer = tokio::io::BufWriter::new(file);
+            let result = client
+                .archive_ledger_to_writer(ledger_id, &request, &record, &mut writer)
+                .await;
+            drop(writer);
+            context::persist_refreshed_tokens(&client, remote_name, dirs).await;
+
+            let frames = match result {
+                Ok(frames) => frames,
+                Err(e) => {
+                    let _ = std::fs::remove_file(&path);
+                    return Err(CliError::Remote(format!(
+                        "failed to archive '{alias}' from '{remote_name}': {e}"
+                    )));
+                }
+            };
+            eprintln!(
+                "{} Archived '{}' from '{}' → {} ({} pack frames forwarded)",
+                "✓".green(),
+                alias,
+                remote_name,
+                path.display(),
+                frames,
+            );
+        }
+        None => {
+            if io::stdout().is_terminal() {
+                return Err(CliError::Usage(
+                    "refusing to write a binary .flpack archive to a TTY; pass -o <FILE> or redirect stdout"
+                        .to_string(),
+                ));
+            }
+            let stdout = tokio::io::stdout();
+            let mut writer = tokio::io::BufWriter::new(stdout);
+            let frames = client
+                .archive_ledger_to_writer(ledger_id, &request, &record, &mut writer)
+                .await
+                .map_err(|e| {
+                    CliError::Remote(format!(
+                        "failed to archive '{alias}' from '{remote_name}': {e}"
+                    ))
+                })?;
+            context::persist_refreshed_tokens(&client, remote_name, dirs).await;
+            eprintln!(
+                "{} Archived '{}' from '{}' to stdout ({} pack frames forwarded)",
+                "✓".green(),
+                alias,
+                remote_name,
+                frames,
             );
         }
     }

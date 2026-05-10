@@ -53,7 +53,10 @@ fn encode_ledger_segment(s: &str) -> Cow<'_, str> {
 
 use crate::cli::PolicyArgs;
 use fluree_db_api::{ExportCommitsResponse, PushCommitsResponse};
-use fluree_db_core::pack::PackRequest;
+use fluree_db_core::pack::{
+    decode_frame, encode_end_frame, encode_manifest_frame, read_stream_preamble, PackFrame,
+    PackRequest, DEFAULT_MAX_PAYLOAD,
+};
 use fluree_db_nameservice::NsRecord;
 
 /// Build the set of HTTP headers that carry policy enforcement options to a
@@ -1633,6 +1636,143 @@ impl RemoteLedgerClient {
         } else {
             Err(Self::map_error(resp).await)
         }
+    }
+
+    /// Stream a `.flpack` archive of a remote ledger to `writer`.
+    ///
+    /// Builds a `PackRequest` for the ledger's current head and POSTs to
+    /// `/pack/{ledger}`. As frames arrive, they are written through to
+    /// `writer` unchanged **except** for the terminating End frame: we
+    /// swap that for a synthesized `phase: "nameservice"` manifest frame
+    /// (constructed from the supplied `ns_record`) followed by End. The
+    /// resulting byte stream is byte-compatible with `Fluree::archive_ledger`
+    /// and importable via `fluree create --from <file>.flpack`.
+    ///
+    /// Surfaces a server `Error` frame as a `RemoteLedgerError` and stops
+    /// without writing the End — callers should clean up partial output.
+    /// Returns the count of pack frames forwarded (header / data / inner
+    /// manifest), excluding the synthesized nameservice manifest and End.
+    pub async fn archive_ledger_to_writer<W: tokio::io::AsyncWrite + Unpin + Send>(
+        &self,
+        ledger: &str,
+        request: &PackRequest,
+        ns_record: &NsRecord,
+        writer: &mut W,
+    ) -> Result<usize, RemoteLedgerError> {
+        use futures::StreamExt as _;
+        use tokio::io::AsyncWriteExt as _;
+
+        let resp = self.fetch_pack_response(ledger, request).await?;
+        let resp = resp.ok_or_else(|| {
+            RemoteLedgerError::ServerError(format!(
+                "remote does not support /pack for '{ledger}' (404/405/406/501)"
+            ))
+        })?;
+
+        // Frame-by-frame stream copy. We accumulate response bytes into a
+        // sliding buffer and decode frames as they become complete; that
+        // lets us recognize the terminal End frame and substitute the
+        // nameservice manifest in its place without buffering the whole
+        // archive in memory.
+        let mut stream = resp.bytes_stream();
+        let mut buf: Vec<u8> = Vec::with_capacity(64 * 1024);
+        let mut preamble_consumed = false;
+        let mut frames_forwarded: usize = 0;
+        let mut end_seen = false;
+
+        while let Some(chunk) = stream.next().await {
+            let bytes =
+                chunk.map_err(|e| RemoteLedgerError::Network(format!("pack stream: {e}")))?;
+            buf.extend_from_slice(&bytes);
+
+            // Drain any complete preamble + frames out of the buffer.
+            loop {
+                if !preamble_consumed {
+                    match read_stream_preamble(&buf) {
+                        Ok(consumed) => {
+                            // Forward the preamble bytes verbatim.
+                            writer.write_all(&buf[..consumed]).await.map_err(|e| {
+                                RemoteLedgerError::Network(format!("archive write: {e}"))
+                            })?;
+                            buf.drain(..consumed);
+                            preamble_consumed = true;
+                        }
+                        Err(_) => break, // need more bytes
+                    }
+                }
+
+                if end_seen {
+                    // Defensive: nothing should arrive after End.
+                    break;
+                }
+
+                match decode_frame(&buf, DEFAULT_MAX_PAYLOAD) {
+                    Ok((frame, consumed)) => match frame {
+                        PackFrame::End => {
+                            // Don't forward End; we'll write manifest + End below.
+                            buf.drain(..consumed);
+                            end_seen = true;
+                        }
+                        PackFrame::Error(msg) => {
+                            return Err(RemoteLedgerError::ServerError(format!(
+                                "remote pack error: {msg}"
+                            )));
+                        }
+                        PackFrame::Header(_) | PackFrame::Data { .. } | PackFrame::Manifest(_) => {
+                            // Forward verbatim.
+                            writer.write_all(&buf[..consumed]).await.map_err(|e| {
+                                RemoteLedgerError::Network(format!("archive write: {e}"))
+                            })?;
+                            buf.drain(..consumed);
+                            frames_forwarded += 1;
+                        }
+                    },
+                    Err(_) => break, // need more bytes
+                }
+            }
+        }
+
+        if !end_seen {
+            return Err(RemoteLedgerError::InvalidResponse(
+                "pack stream ended before End frame".to_string(),
+            ));
+        }
+
+        // Synthesize the nameservice manifest from the NsRecord, mirroring
+        // `Fluree::archive_ledger`. Index fields ride along only when the
+        // pack request actually includes index artifacts — otherwise the
+        // restored ledger would point at index data we never archived.
+        let mut manifest = serde_json::json!({
+            "phase": "nameservice",
+            "ledger_id": ns_record.ledger_id,
+            "name": ns_record.name,
+            "branch": ns_record.branch,
+            "commit_t": ns_record.commit_t,
+        });
+        if let Some(cid) = ns_record.commit_head_id.as_ref() {
+            manifest["commit_head_id"] = serde_json::Value::String(cid.to_string());
+        }
+        let archived_index = request.want_index_root_id.is_some();
+        if archived_index {
+            if let Some(cid) = ns_record.index_head_id.as_ref() {
+                manifest["index_head_id"] = serde_json::Value::String(cid.to_string());
+                manifest["index_t"] = serde_json::Value::from(ns_record.index_t);
+            }
+        }
+
+        let mut tail = Vec::with_capacity(512);
+        encode_manifest_frame(&manifest, &mut tail);
+        encode_end_frame(&mut tail);
+        writer
+            .write_all(&tail)
+            .await
+            .map_err(|e| RemoteLedgerError::Network(format!("archive write: {e}")))?;
+        writer
+            .flush()
+            .await
+            .map_err(|e| RemoteLedgerError::Network(format!("archive flush: {e}")))?;
+
+        Ok(frames_forwarded)
     }
 
     /// Fetch the NsRecord via the storage proxy.
