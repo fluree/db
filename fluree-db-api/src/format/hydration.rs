@@ -357,7 +357,20 @@ pub async fn format_async(
             }
 
             if single_column {
-                rows.push(row_values.into_iter().next().unwrap());
+                let v = row_values.into_iter().next().unwrap();
+                // Skip rows where the single hydration column produced
+                // `Null` — covers (a) anonymous annotation hides
+                // (`format_subject` returns `Null` when the row's
+                // subject is a known live annotation in the
+                // BLANK_NODE namespace), and (b) unbound hydration
+                // roots. In either case there's no body to emit and
+                // a `null` row is more confusing than informative.
+                // Multi-column projections still emit the row with
+                // a `null` slot — there may be sibling columns with
+                // useful bindings.
+                if !v.is_null() {
+                    rows.push(v);
+                }
             } else {
                 rows.push(JsonValue::Array(row_values));
             }
@@ -478,9 +491,6 @@ impl<'a> HydrationFormatter<'a> {
                 obj.insert("@id".to_string(), json!(self.compactor.compact_sid(sid)?));
             }
 
-            // Fetch forward properties
-            let flakes = self.fetch_subject_properties(sid).await?;
-
             // Hide anonymous (blank-node) annotation subjects from
             // top-level subject expansion. Per the design contract,
             // generated annotation SIDs are LPG-style internal
@@ -493,21 +503,29 @@ impl<'a> HydrationFormatter<'a> {
             // bind `?s` to a blank-node annotation) would otherwise
             // leak the bnode identifier as a top-level subject.
             //
+            // The check runs **before** `fetch_subject_properties`
+            // so it sees the unfiltered annotation membership — a
+            // policy that allows `ex:role` but denies `f:reifies*`
+            // would strip the discriminator from the rendered flake
+            // set, and we'd lose the signal. Going through the
+            // overlay (and arena, when present) sidesteps the
+            // policy filter entirely; annotation membership is a
+            // structural property of the snapshot, not user data.
+            //
             // Only fires at the top of the expansion (`depth.current
             // == 0`) — recursive ref expansion keeps the existing
             // behavior so explicit-IRI annotation subjects nested
-            // under a ref-valued property still render. The
-            // `f:reifiesSubject` flake is the discriminator: every
-            // annotation carries one.
+            // under a ref-valued property still render.
             if depth.current == 0
                 && sid.namespace_code == BLANK_NODE
-                && flakes
-                    .iter()
-                    .any(|f| fluree_db_core::namespaces::is_reifies_subject(&f.p))
+                && self.is_live_annotation_subject(sid).await?
             {
                 visited.remove(sid);
                 return Ok(JsonValue::Null);
             }
+
+            // Fetch forward properties
+            let flakes = self.fetch_subject_properties(sid).await?;
 
             // Group flakes by predicate
             let mut by_pred: HashMap<Sid, Vec<&Flake>> = HashMap::new();
@@ -923,6 +941,54 @@ impl<'a> HydrationFormatter<'a> {
         }
         .instrument(span)
         .await
+    }
+
+    /// Returns `true` iff `sid` is a currently-asserted annotation
+    /// subject. Consults the arena reader (when present) and the
+    /// novelty overlay's `AttachmentNovelty` reverse map. Bypasses
+    /// view policy by design — annotation membership is a structural
+    /// snapshot property, and the wildcard-hide rule must hold even
+    /// when policy denies the discriminating `f:reifies*` flakes.
+    ///
+    /// Returns `false` for non-blank-node SIDs without a lookup
+    /// (every caller already gates on `BLANK_NODE`, but the check
+    /// is cheap and keeps the helper safe to use elsewhere).
+    async fn is_live_annotation_subject(&self, sid: &Sid) -> Result<bool> {
+        if sid.namespace_code != BLANK_NODE {
+            return Ok(false);
+        }
+        // Overlay-side: AttachmentNovelty's reverse map answers
+        // "does this ann SID have any live target?" without policy.
+        let novelty_events: Vec<(fluree_db_core::edge::EdgeKey, i64, bool)> = self
+            .db
+            .overlay
+            .as_any()
+            .downcast_ref::<fluree_db_novelty::Novelty>()
+            .map(|n| n.attachments.collect_reverse_events(sid))
+            .unwrap_or_default();
+        if let Some(reader) = self.arena_reader.as_ref() {
+            let live = reader
+                .current_targets_merged(sid, &novelty_events, self.db.t)
+                .await
+                .map_err(|e| {
+                    FormatError::InvalidBinding(format!(
+                        "annotation membership lookup failed: {e}"
+                    ))
+                })?;
+            return Ok(!live.is_empty());
+        }
+        // No arena: rely on the overlay's own current_targets_for
+        // (the merge helper's edge-cancellation logic over the live
+        // events).
+        if let Some(novelty) = self
+            .db
+            .overlay
+            .as_any()
+            .downcast_ref::<fluree_db_novelty::Novelty>()
+        {
+            return Ok(novelty.attachments.current_targets_for(sid).next().is_some());
+        }
+        Ok(false)
     }
 
     /// Arena-backed annotation lookup. Returns `Some(sids)` when the

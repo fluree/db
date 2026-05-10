@@ -1868,16 +1868,21 @@ async fn wildcard_subject_hydration_hides_anonymous_annotation_sids() {
     let rows = support::query_jsonld_formatted(&fluree, &committed.ledger, &query)
         .await
         .expect("wildcard hydration over anonymous annotation");
-    rows.as_array().expect("array");
+    let arr = rows.as_array().expect("array");
 
-    // Either the row is omitted entirely, or it surfaces as JSON
-    // null. The exact shape depends on whether the formatter
-    // upstream filters nulls; both are acceptable. The contract
-    // is: no blank-node `@id` leaks through the result.
+    // Single-column hydration drops `null` rows entirely, so a
+    // hidden anonymous annotation surfaces as an empty array
+    // rather than `[null]`. The contract is: no blank-node `@id`
+    // leaks through the result, regardless of array length.
     let serialized = serde_json::to_string(&rows).expect("serialize");
     assert!(
         !serialized.contains("_:") && !serialized.contains("\"@id\""),
         "anonymous annotation subject must not leak its blank-node @id: {serialized}"
+    );
+    assert_eq!(
+        arr.len(),
+        0,
+        "hidden anonymous annotation should drop the row entirely (got {arr:#?})"
     );
 }
 
