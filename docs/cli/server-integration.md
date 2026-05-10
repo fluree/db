@@ -73,6 +73,31 @@ The `commit` query parameter accepts the same identifiers as the local `fluree s
 - `404 Not Found` — ledger or commit not found
 - `501 Not Implemented` — proxy storage mode (no local index available for decoding)
 
+### `fluree create <ledger> --remote <name>` (admin-protected, empty ledger only)
+
+- `POST {api_base_url}/create` with `{"ledger": "<ledger>"}`
+
+Creates an **empty** ledger on the remote server. The CLI rejects `--remote` together with `--from` / `--memory` (those import paths require local data ingestion); the suggested workflow is to create + populate locally, then run `fluree publish <remote> <ledger>` which calls `/exists`, `/create`, and `/push` in sequence.
+
+`--remote` does not touch local state — neither the active-ledger pointer nor the local storage tree. The CLI does not require a project-local `.fluree/` for `create --remote`; it falls back to global config (`$FLUREE_HOME` or the platform default) for remote registration lookups. Auto-routing through a local server is **not** done for `create`; you must pass `--remote <name>` explicitly. Without `--remote`, `fluree create` is local-only and does require a project `.fluree/`.
+
+### `fluree context get|set --remote`
+
+- `GET {api_base_url}/context/*ledger` (read)
+- `PUT {api_base_url}/context/*ledger` (write)
+
+Read or replace the default JSON-LD context for a ledger. `get` returns the context as JSON; the unwrapped object is what the CLI prints. `set` accepts either a bare object (`{"ex": "http://example.org/"}`) or a `{"@context": {...}}` wrapper, and replies with `{"status": "updated"}` (or `409 Conflict` after CAS retries).
+
+`get` uses normal data-read auth (Bearer required when `data_auth.mode == required`, gates on `can_read(ledger)`). `set` uses normal write auth (`can_write(ledger)`). Auto-routing behaves the same way as other read/write commands — pass `--direct` to skip.
+
+### `fluree history --remote`
+
+- `POST {api_base_url}/query/*ledger`
+
+Server-side history queries via JSON-LD: the CLI builds the same `from`/`to`/`select`/`where` body it would send locally and POSTs it to the **ledger-scoped** query endpoint (`/query/{ledger}`). The path carries the bare ledger ID (e.g. `mydb:main`) so the server's `can_read` check matches normal scoped read tokens; the body's `from` carries the time-travel suffix (`mydb:main@t:N`) which the query engine uses to resolve the snapshot. Posting to the connection-level `/query` instead would force auth to read `from` for the ledger ID and reject any token not scoped to the time-travel form.
+
+Entity and predicate compact IRIs (`ex:alice` → `http://example.org/alice`) are expanded **client-side** using the project's stored prefix map before the request leaves the CLI, so the server never has to consult the local prefix table. The query body still ships its `@context` (also derived from local prefixes) so the server can compact response IRIs back into the user's preferred form for display.
+
 ### `fluree log --remote`
 
 - `GET {api_base_url}/log/*ledger?limit=<N>`
@@ -147,6 +172,21 @@ When the CLI is invoked with policy flags (`--as`, `--policy-class`,
 listed below and, for JSON-LD bodies, also injects them into `opts`. To be
 CLI-compatible, your server must implement the contract in
 [Policy Enforcement Contract](#policy-enforcement-contract).
+
+**Remote time travel (`--at`)** routes through the **ledger-scoped** endpoints
+(`POST /query/{ledger}`, etc.): the URL path drives the bearer's
+`can_read` check (so a token scoped to `mydb:main` matches), and the
+time-travel suffix rides in the body's `from` (`mydb:main@t:N` for JSON-LD)
+or in an injected `FROM <mydb:main@t:N>` clause (for SPARQL). Posting to
+the connection-level endpoint instead would force auth to derive the
+ledger ID from `from` and reject scoped tokens.
+
+**Known limitation: `--at` + `--explain` over `--remote` is refused.** The
+server's explain handler (both connection- and ledger-scoped) loads the
+ledger at HEAD regardless of any time-travel `from`, so a remote
+`--at --explain` would silently return the HEAD plan. The CLI rejects the
+combination outright; pass `--direct` for a local time-travel explain, or
+drop `--at` to explain the HEAD plan against the remote.
 
 ### `fluree branch list` (read-only)
 
@@ -1101,7 +1141,7 @@ stream chunked bodies; clients MUST be prepared to read until EOF.
 
 If no branch suffix is provided (e.g., `"mydb"`), the server MUST normalize to `"mydb:main"`.
 
-Used by `fluree publish` (and potentially future `fluree create --remote`) to create a ledger on a remote server before pushing commits.
+Used by `fluree publish` (which calls `/create` after `/exists` returns false) and by `fluree create --remote <name>` (empty-ledger creation on a remote server).
 
 ## `/reindex` Contract
 
@@ -1494,6 +1534,11 @@ fluree info my-gs              # should show Iceberg config + R2RML mapping
 fluree show t:1 --remote origin  # should show decoded commit with resolved IRIs
 fluree log mydb --remote origin --oneline  # should print the remote's commit chain newest-first
 fluree export mydb --remote origin --format turtle > mydb-remote.ttl  # should write Turtle to disk
+fluree context get mydb --remote origin  # should print the remote ledger's default context
+fluree context set mydb --remote origin -e '{"ex": "http://example.org/"}'  # admin: replace context
+fluree history http://example.org/alice --ledger mydb --remote origin --format json  # remote history
+fluree query mydb 'SELECT * WHERE { ?s ?p ?o }' --remote origin --at 1  # time-travel via /query/{ledger}
+fluree create empty-db --remote origin  # should create an empty ledger on the remote
 fluree drop my-gs --force      # should drop the graph source locally
 fluree drop local-db --remote origin --force  # should drop the published ledger on the remote
 ```

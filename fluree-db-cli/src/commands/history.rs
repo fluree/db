@@ -2,9 +2,11 @@ use crate::config;
 use crate::context;
 use crate::error::{CliError, CliResult};
 use crate::output::OutputFormatKind;
+use crate::remote_client::RemoteLedgerClient;
 use fluree_db_api::server_defaults::FlureeDir;
 use std::path::Path;
 
+#[allow(clippy::too_many_arguments)]
 pub async fn run(
     entity: &str,
     ledger: Option<&str>,
@@ -13,37 +15,12 @@ pub async fn run(
     predicate: Option<&str>,
     format_str: &str,
     dirs: &FlureeDir,
+    remote_flag: Option<&str>,
+    direct: bool,
 ) -> CliResult<()> {
-    // Check for tracked ledger — history requires local query execution
-    let store = crate::config::TomlSyncConfigStore::new(dirs.config_dir().to_path_buf());
     let alias = context::resolve_ledger(ledger, dirs)?;
-    if store.get_tracked(&alias).is_some()
-        || store.get_tracked(&context::to_ledger_id(&alias)).is_some()
-    {
-        return Err(CliError::Usage(
-            "history is not available for tracked ledgers (no server endpoint).\n  \
-             Use `fluree track status` to check remote state instead."
-                .to_string(),
-        ));
-    }
 
-    let fluree = context::build_fluree(dirs)?;
-
-    // Expand compact IRIs using stored prefixes
-    let entity_iri = config::expand_iri(dirs.data_dir(), entity);
-    let predicate_iri = predicate.map(|p| config::expand_iri(dirs.data_dir(), p));
-
-    // Build the history query
-    let query = build_history_query(
-        &alias,
-        &entity_iri,
-        from,
-        to,
-        predicate_iri.as_deref(),
-        dirs.data_dir(),
-    );
-
-    // Parse output format
+    // Parse output format up-front so all paths share the validation.
     let output_format = match format_str.to_lowercase().as_str() {
         "json" => OutputFormatKind::Json,
         "table" => OutputFormatKind::Table,
@@ -55,15 +32,82 @@ pub async fn run(
         }
     };
 
-    // Execute the query via connection (required for from/to history support)
+    // Expand compact IRIs using stored prefixes — done locally since prefixes
+    // are stored in the project's config and aren't available on the remote.
+    let entity_iri = config::expand_iri(dirs.data_dir(), entity);
+    let predicate_iri = predicate.map(|p| config::expand_iri(dirs.data_dir(), p));
+
+    let query = build_history_query(
+        &alias,
+        &entity_iri,
+        from,
+        to,
+        predicate_iri.as_deref(),
+        dirs.data_dir(),
+    );
+
+    // Bare ledger ID (e.g. "mydb:main") for the auth-driving path segment.
+    // The body's `from` carries the time-travel suffix ("mydb:main@t:N");
+    // the server's auth check uses the path, the query engine uses the body.
+    let ledger_id = context::to_ledger_id(&alias);
+
+    if let Some(remote_name) = remote_flag {
+        let client = context::build_remote_client(remote_name, dirs).await?;
+        let result = run_remote(&alias, &ledger_id, &query, output_format, &client).await;
+        context::persist_refreshed_tokens(&client, remote_name, dirs).await;
+        return result;
+    }
+
+    if !direct {
+        if let Some(client) = context::try_server_route_client(dirs) {
+            let result = run_remote(&alias, &ledger_id, &query, output_format, &client).await;
+            context::persist_refreshed_tokens(&client, context::LOCAL_SERVER_REMOTE, dirs).await;
+            return result;
+        }
+    }
+
+    // Local path: tracked ledgers have no commit chain, so history can't run.
+    let store = crate::config::TomlSyncConfigStore::new(dirs.config_dir().to_path_buf());
+    if store.get_tracked(&alias).is_some()
+        || store.get_tracked(&context::to_ledger_id(&alias)).is_some()
+    {
+        return Err(CliError::Usage(
+            "history is not available locally for tracked ledgers (no commit chain).\n  \
+             Use `fluree track status`, or pass `--remote <name>` to query the upstream."
+                .to_string(),
+        ));
+    }
+
+    let fluree = context::build_fluree(dirs)?;
     let ledger_view = fluree.ledger(&alias).await?;
     let result = fluree.query_connection(&query).await?;
     let json = result.to_jsonld(&ledger_view.snapshot)?;
 
-    // Format output
     let output = format_history_result(&json, output_format)?;
     println!("{output}");
 
+    Ok(())
+}
+
+async fn run_remote(
+    alias: &str,
+    ledger_id: &str,
+    query: &serde_json::Value,
+    output_format: OutputFormatKind,
+    client: &RemoteLedgerClient,
+) -> CliResult<()> {
+    // Use the ledger-scoped query path (`POST /query/{ledger}`) rather than
+    // connection-level. The server's auth check derives the ledger ID from
+    // the path when present, so a token scoped to `mydb:main` matches; if we
+    // posted to `/query` instead, auth would see body.from = `mydb:main@t:N`
+    // and reject scoped tokens.
+    let json = client
+        .query_jsonld(ledger_id, query)
+        .await
+        .map_err(|e| CliError::Remote(format!("failed to query history for '{alias}': {e}")))?;
+
+    let output = format_history_result(&json, output_format)?;
+    println!("{output}");
     Ok(())
 }
 

@@ -176,7 +176,9 @@ async fn run_ledger_archive(
                 CliError::Config(format!("failed to create '{}': {e}", path.display()))
             })?;
             let mut writer = tokio::io::BufWriter::new(file);
-            let archive_result = fluree.archive_ledger(&ledger_id, !no_indexes, &mut writer).await;
+            let archive_result = fluree
+                .archive_ledger(&ledger_id, !no_indexes, &mut writer)
+                .await;
             // Drop writer before we touch the file again on the error path,
             // so the underlying file handle is closed.
             drop(writer);

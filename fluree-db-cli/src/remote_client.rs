@@ -1141,6 +1141,46 @@ impl RemoteLedgerClient {
     }
 
     // =========================================================================
+    // Default context
+    // =========================================================================
+
+    /// Fetch the default JSON-LD context for a ledger.
+    ///
+    /// Calls `GET {base_url}/context/<ledger>`. Server returns
+    /// `{ "@context": <object|null> }`. Returns the unwrapped context value
+    /// (object or `Null`).
+    pub async fn get_context(&self, ledger: &str) -> Result<serde_json::Value, RemoteLedgerError> {
+        let url = self.op_url("context", ledger);
+        let resp = self
+            .send_json(reqwest::Method::GET, &url, "application/json", None)
+            .await?;
+        Ok(resp
+            .get("@context")
+            .cloned()
+            .unwrap_or(serde_json::Value::Null))
+    }
+
+    /// Replace the default JSON-LD context for a ledger.
+    ///
+    /// Calls `PUT {base_url}/context/<ledger>` with `context` as the body.
+    /// `context` should be the bare prefix→IRI object; the server also
+    /// accepts a `{ "@context": {...} }` wrapper.
+    pub async fn set_context(
+        &self,
+        ledger: &str,
+        context: &serde_json::Value,
+    ) -> Result<serde_json::Value, RemoteLedgerError> {
+        let url = self.op_url("context", ledger);
+        self.send_json(
+            reqwest::Method::PUT,
+            &url,
+            "application/json",
+            Some(RequestBody::Json(context)),
+        )
+        .await
+    }
+
+    // =========================================================================
     // Commit log
     // =========================================================================
 

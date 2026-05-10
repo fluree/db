@@ -248,6 +248,12 @@ pub enum Commands {
         /// Larger values produce fewer leaf files (shallower tree, bigger reads).
         #[arg(long, default_value_t = 10)]
         leaflets_per_leaf: usize,
+
+        /// Create the ledger on a remote server (by remote name, e.g., "origin").
+        /// Only valid with empty creates — incompatible with --from/--memory.
+        /// Use `fluree publish` if you also need to push local commits.
+        #[arg(long)]
+        remote: Option<String>,
     },
 
     /// Set the active ledger
@@ -498,6 +504,10 @@ pub enum Commands {
         /// Output format (json, table, csv, or tsv)
         #[arg(long, default_value = "table")]
         format: String,
+
+        /// Execute against a remote server (by remote name, e.g., "origin")
+        #[arg(long)]
+        remote: Option<String>,
     },
 
     /// Manage the default JSON-LD context for a ledger
@@ -1295,6 +1305,10 @@ pub enum ContextAction {
     Get {
         /// Ledger name (defaults to active ledger)
         ledger: Option<String>,
+
+        /// Read from a remote server (by remote name, e.g., "origin")
+        #[arg(long)]
+        remote: Option<String>,
     },
 
     /// Set (replace) the default JSON-LD context for a ledger
@@ -1314,6 +1328,10 @@ pub enum ContextAction {
         /// Read context from a JSON file
         #[arg(long, short = 'f')]
         file: Option<std::path::PathBuf>,
+
+        /// Write to a remote server (by remote name, e.g., "origin")
+        #[arg(long)]
+        remote: Option<String>,
     },
 }
 
