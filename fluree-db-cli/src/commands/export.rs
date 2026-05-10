@@ -148,12 +148,35 @@ async fn run_ledger_archive(
         ));
     }
 
-    let ledger_id = context::to_ledger_id(alias);
+    let local_ledger_id = context::to_ledger_id(alias);
 
     if let Some(remote_name) = remote_flag {
-        return run_ledger_archive_remote(alias, &ledger_id, output, no_indexes, dirs, remote_name)
-            .await;
+        // When the alias is tracked AND points at this same remote, archive
+        // the upstream copy under its tracked `remote_alias`. This mirrors
+        // how every other --remote command resolves tracked aliases via
+        // `resolve_ledger_mode` -> `build_tracked_mode`. If --remote points
+        // at a different remote (or the alias isn't tracked), fall back to
+        // using the alias literally on that remote.
+        let store = crate::config::TomlSyncConfigStore::new(dirs.config_dir().to_path_buf());
+        let tracked = store
+            .get_tracked(alias)
+            .or_else(|| store.get_tracked(&local_ledger_id));
+        let remote_ledger_id = match tracked.as_ref() {
+            Some(t) if t.remote == remote_name => t.remote_alias.clone(),
+            _ => local_ledger_id.clone(),
+        };
+        return run_ledger_archive_remote(
+            alias,
+            &remote_ledger_id,
+            output,
+            no_indexes,
+            dirs,
+            remote_name,
+        )
+        .await;
     }
+
+    let ledger_id = local_ledger_id;
 
     let store = crate::config::TomlSyncConfigStore::new(dirs.config_dir().to_path_buf());
     if store.get_tracked(alias).is_some() || store.get_tracked(&ledger_id).is_some() {
