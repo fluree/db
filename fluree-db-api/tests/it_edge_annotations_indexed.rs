@@ -57,20 +57,47 @@ fn annotated_insert() -> JsonValue {
     })
 }
 
-/// Inline-annotation query that both M2a (scan) and M2b (arena) paths
-/// must return identical results for.
-fn inline_annotation_query() -> JsonValue {
+/// Subject-hydration query that exercises
+/// `HydrationFormatter::inject_annotations` — the only call site
+/// that takes the M2b arena path. A flat `select` with
+/// `@annotation` in the `where` clause goes through query
+/// expansion and the **sync** JSON-LD formatter, which never
+/// touches `inject_annotations`. The hydration path fires only
+/// when a subject's `@annotation` block is materialized while
+/// formatting a ref value during subject expansion.
+fn annotated_hydration_query() -> JsonValue {
     json!({
         "@context": ctx(),
-        "select": ["?person", "?org", "?role"],
-        "where": {
-            "@id": "?person",
-            "ex:worksFor": {
-                "@id": "?org",
-                "@annotation": { "ex:role": "?role" }
-            }
-        }
+        "select": {"?person": ["*", {"ex:worksFor": ["*"]}]},
+        "where": {"@id": "?person", "ex:worksFor": {"@id": "?org"}}
     })
+}
+
+/// Pull the annotation body's `ex:role` out of a hydration result
+/// row, returning `None` when the row's shape doesn't carry one.
+/// Tolerates compact-IRI vs expanded-IRI keys and bare-object vs
+/// single-element-array shapes (both forms are formatter-legal).
+fn extract_role_from_hydration(rows: &JsonValue) -> Option<String> {
+    let arr = rows.as_array()?;
+    let first = arr.first()?.as_object()?;
+    let works_for = first
+        .get("ex:worksFor")
+        .or_else(|| first.get("http://example.org/worksFor"))?;
+    let edge_obj = works_for.as_object().or_else(|| {
+        works_for
+            .as_array()
+            .and_then(|a| a.first().and_then(|v| v.as_object()))
+    })?;
+    let ann = edge_obj.get("@annotation")?;
+    let ann_obj = ann.as_object().or_else(|| {
+        ann.as_array()
+            .and_then(|a| a.first().and_then(|v| v.as_object()))
+    })?;
+    ann_obj
+        .get("ex:role")
+        .or_else(|| ann_obj.get("http://example.org/role"))?
+        .as_str()
+        .map(String::from)
 }
 
 #[tokio::test]
@@ -119,15 +146,20 @@ async fn incremental_arena_seal_then_arena_backed_query() {
                 "running ledger must have attachments before reindex \
                  (provider reads from this overlay)"
             );
+            // Pre-reindex hydration query — exercises the M2a scan
+            // path inside `HydrationFormatter::inject_annotations`.
             let pre_rows = support::query_jsonld_formatted(
                 &fluree,
                 &pre_reindex_loaded,
-                &inline_annotation_query(),
+                &annotated_hydration_query(),
             )
             .await
-            .expect("pre-reindex query");
-            let pre_arr = pre_rows.as_array().expect("rows array");
-            assert_eq!(pre_arr.len(), 1, "pre-reindex inline-annotation row count");
+            .expect("pre-reindex hydration query");
+            assert_eq!(
+                extract_role_from_hydration(&pre_rows).as_deref(),
+                Some("Engineer"),
+                "pre-reindex hydration must surface the annotation body via scan path"
+            );
 
             // Trigger reindex.
             support::trigger_index_and_wait(&handle, ledger_id, after_insert.receipt.t).await;
@@ -153,15 +185,23 @@ async fn incremental_arena_seal_then_arena_backed_query() {
                  content_store after a successful reindex"
             );
 
-            // Same query post-reindex must return the same row,
-            // now via the arena-backed hydration path.
+            // Post-reindex: same hydration query, now via the arena
+            // path. `inject_annotations` constructs an
+            // `AnnotationArenaReader` once per response (see
+            // `HydrationFormatter::new`) and resolves the worksFor
+            // edge through it instead of issuing a POST scan.
             let post_rows =
-                support::query_jsonld_formatted(&fluree, &post, &inline_annotation_query())
+                support::query_jsonld_formatted(&fluree, &post, &annotated_hydration_query())
                     .await
-                    .expect("post-reindex query");
+                    .expect("post-reindex hydration query");
+            assert_eq!(
+                extract_role_from_hydration(&post_rows).as_deref(),
+                Some("Engineer"),
+                "post-reindex hydration must surface the annotation body via arena path"
+            );
             assert_eq!(
                 pre_rows, post_rows,
-                "arena-backed result must match scan-based result"
+                "arena-backed hydration must produce identical output to scan-based"
             );
         })
         .await;
@@ -214,15 +254,21 @@ async fn full_rebuild_without_authoritative_falls_back_to_scan() {
                 "scan-fallback: hydration goes through the M2a POST scan"
             );
 
-            // Query still works — exercises the M2a scan path.
-            let rows = support::query_jsonld_formatted(&fluree, &post, &inline_annotation_query())
-                .await
-                .expect("query against scan-fallback snapshot");
-            let arr = rows.as_array().expect("rows array");
+            // Hydration query against the indexed scan-fallback
+            // snapshot. `inject_annotations` falls through to the
+            // M2a POST scan because the arena reader can't be
+            // constructed without `annotation_index`. The data
+            // lives in the indexed POST (the test reindexed
+            // above), so this exercises the indexed-scan-fallback
+            // path — not the novelty-only path.
+            let rows =
+                support::query_jsonld_formatted(&fluree, &post, &annotated_hydration_query())
+                    .await
+                    .expect("hydration against scan-fallback snapshot");
             assert_eq!(
-                arr.len(),
-                1,
-                "scan path returns the same row count as the arena path"
+                extract_role_from_hydration(&rows).as_deref(),
+                Some("Engineer"),
+                "indexed-scan-fallback hydration must surface the annotation body"
             );
         })
         .await;
@@ -362,18 +408,20 @@ async fn post_defensive_drop_stays_in_scan_fallback() {
                                  must stay scan-fallback (gate from prior commit)"
                             );
 
-                            // Hydration still returns the correct row via scan.
+                            // Hydration still surfaces the annotation
+                            // body via the M2a indexed-scan path.
                             let rows = support::query_jsonld_formatted(
                                 &fluree,
                                 &after_step_c,
-                                &inline_annotation_query(),
+                                &annotated_hydration_query(),
                             )
                             .await
-                            .expect("query against post-drop snapshot");
+                            .expect("hydration against post-drop snapshot");
                             assert_eq!(
-                                rows.as_array().unwrap().len(),
-                                1,
-                                "scan path still returns the annotated row"
+                                extract_role_from_hydration(&rows).as_deref(),
+                                Some("Engineer"),
+                                "indexed-scan-fallback hydration must still \
+                                 surface the annotation body after defensive drop"
                             );
                         })
                         .await;

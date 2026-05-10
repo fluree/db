@@ -1,22 +1,31 @@
 //! Annotation hydration: M2a scan vs M2b arena.
 //!
-//! Compares the wall-clock cost of resolving `@annotation` on a query
-//! result row across two read paths:
+//! Compares the wall-clock cost of `HydrationFormatter::inject_annotations`
+//! across two read paths. The bench uses a **subject-hydration** query
+//! (`select: {"?person": ["*", {"ex:worksFor": ["*"]}]}`) so the
+//! `@annotation` body is materialized via the formatter's
+//! `inject_annotations` call site — a flat select with `@annotation`
+//! in the where clause goes through the sync JSON-LD formatter and
+//! never reaches the arena reader.
 //!
-//! - **scan**: `inject_annotations` issues a POST range query for
-//!   `f:reifiesSubject` and verifies each candidate's bundle. This is
-//!   what runs when the snapshot has no `annotation_index` (the
-//!   pre-builder / scan-fallback state).
-//! - **arena**: `inject_annotations` constructs an
-//!   `AnnotationArenaReader` once (per-response cache) and resolves
-//!   each edge via the merged forward arena. This is what runs once
-//!   the indexer seals an arena via the slice 3d/3g path.
+//! Both ledgers are reindexed before the bench runs:
+//!
+//! - **scan**: reindex without an `AttachmentEventsProvider` →
+//!   indexed root carries `has_annotations=true,
+//!   annotation_index=None`. `inject_annotations` falls through to a
+//!   POST range query for `f:reifiesSubject` against the indexed
+//!   base. This is the M2a indexed-scan-fallback path, not the
+//!   novelty-only path.
+//! - **arena**: reindex with the api `AttachmentEventsProvider` →
+//!   `annotation_index` is sealed. `inject_annotations` constructs
+//!   an `AnnotationArenaReader` once per response and resolves each
+//!   edge via the merged forward arena.
 //!
 //! ## Workload
 //!
-//! One edge with N attachments. The query asks for the inline-
-//! annotation row and gets back N hits — each one resolved
-//! through the formatter's hydration loop.
+//! One edge with N attachments. The query hydrates `ex:alice` →
+//! the worksFor ref expansion triggers `inject_annotations`, which
+//! must surface every live annotation.
 //!
 //! Counts: 1, 100, 10_000.
 //!
@@ -170,16 +179,16 @@ fn bench_annotation_hydration(c: &mut Criterion) {
             "scan ledger must not have arena reader"
         );
 
+        // Subject-hydration query — `inject_annotations` fires
+        // when the worksFor ref value is materialized during
+        // expansion of `ex:alice`. A flat `select` with
+        // `@annotation` in the `where` clause would route through
+        // the sync JSON-LD formatter and never hit the arena
+        // reader.
         let query = json!({
             "@context": { "ex": "http://example.org/" },
-            "select": ["?org", "?role"],
-            "where": {
-                "@id": "ex:alice",
-                "ex:worksFor": {
-                    "@id": "?org",
-                    "@annotation": { "ex:role": "?role" }
-                }
-            }
+            "select": {"?person": ["*", {"ex:worksFor": ["*"]}]},
+            "where": {"@id": "?person", "ex:worksFor": {"@id": "?org"}}
         });
 
         group.bench_with_input(BenchmarkId::new("scan", n), n, |b, _| {
@@ -204,9 +213,15 @@ fn bench_annotation_hydration(c: &mut Criterion) {
     group.finish();
 }
 
-/// Build a ledger with N annotations on one edge. When `seal=true`,
-/// trigger a reindex with attachment-events provider attached so the
-/// arena gets sealed; otherwise leave in scan-fallback.
+/// Build a ledger with N annotations on one edge, then reindex.
+///
+/// - `seal=true`: reindex with the api `AttachmentEventsProvider`
+///   attached → `annotation_index` is populated, hydration takes
+///   the arena path.
+/// - `seal=false`: reindex with a bare worker (no provider) →
+///   indexed root has `has_annotations=true, annotation_index=None`,
+///   hydration takes the M2a indexed-scan-fallback path. The data
+///   lives in the indexed POST, not in novelty.
 async fn seed_ledger_and_optionally_seal(n: usize, seal: bool) -> (fluree_db_api::Fluree, String) {
     let fluree = FlureeBuilder::memory()
         .with_ledger_cache_config(fluree_db_api::LedgerManagerConfig::default())
@@ -265,22 +280,29 @@ async fn seed_ledger_and_optionally_seal(n: usize, seal: bool) -> (fluree_db_api
         emitted += count;
     }
 
-    if seal {
-        let receipt_t = state.t();
-        let (local, handle) =
-            support::start_background_indexer_with_attachments(&fluree, IndexerConfig::small());
-        local
-            .run_until(async {
-                // Cache the ledger pre-trigger so the provider sees
-                // its overlay events.
-                let _ = fluree.ledger_cached(&ledger_id).await.unwrap();
-                support::wait_for_index_application(&fluree, &ledger_id, 0).await;
-                let completion = handle.trigger(&ledger_id, receipt_t).await;
-                let _ = completion.wait().await;
-                support::wait_for_index_application(&fluree, &ledger_id, receipt_t).await;
-            })
-            .await;
-    }
+    let receipt_t = state.t();
+    let (local, handle) = if seal {
+        support::start_background_indexer_with_attachments(&fluree, IndexerConfig::small())
+    } else {
+        let (worker, handle) = fluree_db_api::BackgroundIndexerWorker::new(
+            fluree.backend().clone(),
+            Arc::new(fluree.nameservice_mode().clone()),
+            IndexerConfig::small(),
+        );
+        let local = tokio::task::LocalSet::new();
+        local.spawn_local(worker.run());
+        (local, handle)
+    };
+    local
+        .run_until(async {
+            // Cache the ledger pre-trigger so the provider (when
+            // attached) sees its overlay events.
+            let _ = fluree.ledger_cached(&ledger_id).await.unwrap();
+            let completion = handle.trigger(&ledger_id, receipt_t).await;
+            let _ = completion.wait().await;
+            support::wait_for_index_application(&fluree, &ledger_id, receipt_t).await;
+        })
+        .await;
 
     (fluree, ledger_id)
 }
