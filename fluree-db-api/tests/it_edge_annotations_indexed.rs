@@ -570,6 +570,15 @@ async fn non_annotation_ledger_skips_inject_annotations() {
         !after.ledger.novelty.attachments.has_annotations(),
         "novelty overlay must report zero annotations"
     );
+    assert!(
+        after.ledger.snapshot.annotation_index.is_none(),
+        "non-annotation ledger must not have an annotation_index"
+    );
+    assert!(
+        !after.ledger.snapshot.has_arena_reader(),
+        "non-annotation ledger must not advertise an arena reader \
+         (gate guarantees no CAS reads on hydration either)"
+    );
 
     // Subject hydration that would otherwise call `inject_annotations`
     // on the worksFor ref value. Confirm output is correct AND has
@@ -589,4 +598,35 @@ async fn non_annotation_ledger_skips_inject_annotations() {
         !json_str.contains("@annotation"),
         "non-annotation ledger must not produce any @annotation keys: {json_str}"
     );
+
+    // Reindex with provider attached. Even with the provider asking
+    // for events, an annotation-free ledger must produce a fresh
+    // root with `annotation_index = None` (no arena artifacts in
+    // CAS at all). Verifies the indexer's "non-annotation fast
+    // path" — no CAS writes for branch/leaf blobs that would just
+    // be empty placeholders.
+    let (local, handle) =
+        support::start_background_indexer_with_attachments(&fluree, IndexerConfig::small());
+    local
+        .run_until(async {
+            let _ = fluree.ledger_cached(ledger_id).await.unwrap();
+            let completion = handle.trigger(ledger_id, after.receipt.t).await;
+            let _ = completion.wait().await;
+            support::wait_for_index_application(&fluree, ledger_id, after.receipt.t).await;
+
+            let post = fluree.ledger(ledger_id).await.expect("post-reindex");
+            assert!(
+                !post.snapshot.has_annotations,
+                "indexed root must not flip sticky bit on non-annotation ledger"
+            );
+            assert!(
+                post.snapshot.annotation_index.is_none(),
+                "indexed root must not carry an annotation_index"
+            );
+            assert!(
+                !post.snapshot.has_arena_reader(),
+                "post-reindex snapshot must still skip arena reader"
+            );
+        })
+        .await;
 }
