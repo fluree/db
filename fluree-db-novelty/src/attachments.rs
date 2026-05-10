@@ -30,7 +30,7 @@ use fluree_db_core::namespaces::is_reserved_reifies_predicate;
 use fluree_db_core::{Flake, Sid};
 use std::collections::BTreeMap;
 
-use crate::error::{NoveltyError, Result};
+use crate::error::Result;
 
 /// One forward-direction row: an annotation attached to an edge.
 ///
@@ -76,6 +76,15 @@ pub struct AttachmentNovelty {
     /// or retracted, doesn't matter — the cascade gate cares about
     /// "could this snapshot ever have annotations").
     has_annotations: bool,
+    /// Cumulative count of malformed `f:reifies*` bundles observed by
+    /// [`Self::observe_flakes`] over the lifetime of this overlay.
+    /// Per the design contract, malformed bundles are skipped + warned
+    /// rather than erroring out so a single corrupt event in replay
+    /// can't block the rest of the ledger from loading. Operators
+    /// scrape this to detect data-corruption / replay-anomaly
+    /// signals; a non-zero value indicates either a software bug in
+    /// the writer or an externally-tampered commit history.
+    observed_malformed_bundles: u64,
 }
 
 impl AttachmentNovelty {
@@ -92,6 +101,15 @@ impl AttachmentNovelty {
     #[inline]
     pub fn has_annotations(&self) -> bool {
         self.has_annotations
+    }
+
+    /// Cumulative count of malformed `f:reifies*` bundles observed
+    /// over this overlay's lifetime. See the field docs on
+    /// `observed_malformed_bundles` for the operational signal.
+    /// Always `0` on a healthy ledger.
+    #[inline]
+    pub fn observed_malformed_bundle_count(&self) -> u64 {
+        self.observed_malformed_bundles
     }
 
     /// Iterator over annotation SIDs **currently attached** to `edge`,
@@ -227,11 +245,19 @@ impl AttachmentNovelty {
     /// Filters down to `f:reifies*` flakes, groups them by
     /// `(ann_sid, t, op)`, and decodes each group via
     /// [`EdgeKey::from_reifies_facts`]. A malformed bundle (missing
-    /// required predicate, duplicate, or deferred shape) is skipped
-    /// with the structured decode error returned to the caller — the
-    /// caller may log + telemetry-count and continue, since the
-    /// non-`f:reifies*` flakes for the same annotation subject remain
-    /// visible as ordinary RDF.
+    /// required predicate, duplicate, or deferred shape) is **skipped
+    /// with a `tracing::warn!` and counted** in
+    /// `observed_malformed_bundles`. The non-`f:reifies*` flakes for
+    /// the same annotation subject remain visible as ordinary RDF —
+    /// only the attachment binding is dropped.
+    ///
+    /// **Why skip rather than error:** the contract in
+    /// `EDGE_ANNOTATIONS_IMPL_PLAN.md` says replay validation should
+    /// "Reject (skip + telemetry counter) any ann_sid that has a
+    /// partial bundle." A single malformed bundle in commit replay
+    /// (e.g. legacy data or a tampered commit) would otherwise block
+    /// the ledger from loading. Operators detect data corruption
+    /// post-hoc via [`Self::observed_malformed_bundle_count`].
     ///
     /// Caller contract: pass the **post-dedup** flake set that
     /// `Novelty::apply_commit` ultimately stored in the arena.
@@ -261,11 +287,22 @@ impl AttachmentNovelty {
         }
 
         for ((ann, t, op), bundle) in bundles {
-            let edge = EdgeKey::from_reifies_facts(&bundle).map_err(|e| {
-                NoveltyError::InvalidGraph(format!(
-                    "malformed f:reifies* bundle for annotation {ann:?} at t={t}: {e}"
-                ))
-            })?;
+            let edge = match EdgeKey::from_reifies_facts(&bundle) {
+                Ok(edge) => edge,
+                Err(e) => {
+                    self.observed_malformed_bundles =
+                        self.observed_malformed_bundles.saturating_add(1);
+                    tracing::warn!(
+                        ?ann,
+                        t,
+                        op,
+                        error = %e,
+                        cumulative_skipped = self.observed_malformed_bundles,
+                        "skipping malformed f:reifies* bundle in novelty observer"
+                    );
+                    continue;
+                }
+            };
 
             self.forward
                 .entry(edge.clone())
@@ -546,22 +583,26 @@ mod tests {
     }
 
     #[test]
-    fn observe_returns_error_on_malformed_bundle() {
+    fn observe_skips_and_counts_malformed_bundle() {
         // Strip a required predicate from the bundle — decoder rejects.
+        // Per the design contract, observe_flakes now SKIPS + warns +
+        // counts rather than erroring out, so a single corrupt event
+        // in replay can't block the rest of the ledger from loading.
         let edge = sample_edge();
         let ann = ann_sid("ann1");
         let mut bundle = edge.to_reifies_facts(&ann, 5, true);
         bundle.retain(|f| !fluree_db_core::namespaces::is_reifies_subject(&f.p));
 
         let mut overlay = AttachmentNovelty::new();
-        let err = overlay.observe_flakes(&bundle).unwrap_err();
-        let msg = err.to_string();
-        assert!(
-            msg.contains("malformed") && msg.contains("reifies"),
-            "error should describe the malformed bundle: {msg}"
-        );
-        // Overlay should remain untouched after the error.
+        overlay
+            .observe_flakes(&bundle)
+            .expect("observe_flakes skips malformed bundles instead of erroring");
+        // Overlay's attachment maps stay empty — only the malformed
+        // bundle was in the input.
         assert!(!overlay.has_annotations());
+        // The cumulative counter ticks so operators can detect the
+        // signal post-hoc.
+        assert_eq!(overlay.observed_malformed_bundle_count(), 1);
     }
 
     #[test]
@@ -637,5 +678,83 @@ mod tests {
 
         let attached: Vec<Sid> = overlay.current_annotations_for(&edge).collect();
         assert_eq!(attached, vec![ann]);
+    }
+
+    #[test]
+    fn malformed_bundle_skipped_with_warn_and_counter_bump() {
+        // A bundle missing the required `f:reifiesSubject` flake
+        // (decoder rejects with `EdgeKeyDecodeError::Missing`) used
+        // to error out the caller's commit. Per the design contract
+        // it now skips + warns + bumps the cumulative counter so a
+        // single corrupt event in replay can't block the rest of
+        // the ledger from loading.
+        use fluree_db_core::edge::id_datatype_sid;
+        use fluree_vocab::db as p;
+        use fluree_vocab::namespaces::FLUREE_DB;
+
+        let ann = ann_sid("ann_bad");
+        let id_dt = id_datatype_sid();
+
+        // Bundle with f:reifiesPredicate + f:reifiesObject only —
+        // missing f:reifiesSubject. `EdgeKey::from_reifies_facts`
+        // returns `Missing("f:reifiesSubject")`.
+        let malformed: Vec<Flake> = vec![
+            Flake::new(
+                ann.clone(),
+                Sid::new(FLUREE_DB, p::REIFIES_PREDICATE),
+                FlakeValue::Ref(Sid::new(13, "worksFor")),
+                id_dt.clone(),
+                7,
+                true,
+                None,
+            ),
+            Flake::new(
+                ann.clone(),
+                Sid::new(FLUREE_DB, p::REIFIES_OBJECT),
+                FlakeValue::Ref(Sid::new(13, "acme")),
+                id_dt,
+                7,
+                true,
+                None,
+            ),
+        ];
+
+        // A second, well-formed bundle for a different annotation in
+        // the same call so we can assert "the malformed one is
+        // skipped, the well-formed one still applies."
+        let edge = sample_edge();
+        let good_ann = ann_sid("ann_good");
+        let mut all = malformed;
+        all.extend(edge.to_reifies_facts(&good_ann, 7, true));
+
+        let mut overlay = AttachmentNovelty::new();
+        overlay
+            .observe_flakes(&all)
+            .expect("observe_flakes must NOT error on malformed bundle — skip + count");
+
+        assert_eq!(
+            overlay.observed_malformed_bundle_count(),
+            1,
+            "exactly one malformed bundle was observed"
+        );
+        // The well-formed bundle still landed.
+        let attached: Vec<Sid> = overlay.current_annotations_for(&edge).collect();
+        assert_eq!(attached, vec![good_ann]);
+        // The malformed bundle's annotation has no live target.
+        assert!(overlay.current_targets_for(&ann).next().is_none());
+
+        // A second observe with a fresh malformed bundle bumps the
+        // counter again; it's cumulative across calls.
+        let another_bad: Vec<Flake> = vec![Flake::new(
+            ann_sid("ann_bad2"),
+            Sid::new(FLUREE_DB, p::REIFIES_OBJECT),
+            FlakeValue::Ref(Sid::new(13, "acme")),
+            fluree_db_core::edge::id_datatype_sid(),
+            8,
+            true,
+            None,
+        )];
+        overlay.observe_flakes(&another_bad).unwrap();
+        assert_eq!(overlay.observed_malformed_bundle_count(), 2);
     }
 }

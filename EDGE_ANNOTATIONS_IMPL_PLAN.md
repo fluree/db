@@ -1005,13 +1005,31 @@ Three items from the original DoD are deliberately deferred:
    Pinning test:
    `it_edge_annotations_indexed::reindex_seals_arena_when_caching_enabled_no_provider_in_opts`.
 
-3. **Malformed-bundle telemetry counter.** Both
-   `bundle::build_arenas_from_flakes` and
-   `AttachmentNovelty::observe_flakes` `tracing::warn!` on each
-   malformed bundle, and `ArenaBuildOutput.skipped_bundles`
-   surfaces a per-build count. A long-lived per-ledger counter
-   that operators can scrape from a metrics endpoint hasn't been
-   wired through the telemetry layer yet.
+3. ~~**Malformed-bundle telemetry counter.**~~ ✅ Closed:
+   `AttachmentNovelty::observe_flakes` now skips malformed
+   `f:reifies*` bundles with a `tracing::warn!` (carrying
+   `cumulative_skipped`) instead of returning an `Err`. The
+   per-overlay running total is exposed via
+   `AttachmentNovelty::observed_malformed_bundle_count() -> u64`,
+   and the wider `Novelty` type already exposes
+   `attachments` publicly so callers can read it without extra
+   plumbing. The behavior change matches the design contract in
+   `EDGE_ANNOTATIONS_IMPL_PLAN.md` "Replay validation": "Reject
+   (skip + telemetry counter) any ann_sid that has a partial
+   bundle." Without this, a single corrupt event in commit replay
+   could prevent the entire ledger from loading. Indexer's
+   `bundle::build_arenas_from_flakes` already skipped + warned +
+   counted via `ArenaBuildOutput.skipped_bundles`; that path is
+   currently exercised by tests only (the live indexer uses
+   `build_arenas_from_event_pairs` with pre-validated tuples), but
+   the contract is consistent across both. A future enhancement
+   could plumb both counts into a periodic
+   `tracing::info!` summary or HTTP `/metrics` endpoint, mirroring
+   `LeafletCache stats`. Test:
+   `attachments::tests::observe_skips_and_counts_malformed_bundle`
+   plus
+   `attachments::tests::malformed_bundle_skipped_with_warn_and_counter_bump`
+   for the multi-bundle / multi-call case.
 
 ---
 
