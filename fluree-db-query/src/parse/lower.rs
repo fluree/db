@@ -183,6 +183,7 @@ pub(crate) fn lower_query<E: IriEncoder>(
         offset,
         reasoning,
         post_values: None,
+        include_system_facts: ast.options.include_system_facts,
     })
 }
 

@@ -237,6 +237,10 @@ fn parse_query_ast_internal(
         )?;
         // LIMIT 1 for efficiency — only need to know if any solution exists
         query.options.limit = Some(1);
+        // ASK returns before `parse_options` runs, so opts that the
+        // executor cares about have to be parsed inline. Currently
+        // just `includeSystemFacts`; extend here as more land.
+        query.options.include_system_facts = options::parse_include_system_facts(obj);
         return Ok((query, SelectMode::Ask));
     }
 

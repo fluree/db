@@ -125,7 +125,85 @@ pub fn lower_sparql_with_source<E: IriEncoder>(
         }
     }
 
+    // Mirror the JSON-LD read-side firewall
+    // (`fluree_db_query::parse::reject_user_authored_reifies_in_query`):
+    // user queries naming `f:reifies*` IRIs directly are rejected
+    // so system facts can't be enumerated through the user surface.
+    // The opt-in `opts.includeSystemFacts: true` only relaxes the
+    // variable-predicate scan filter — direct mention is the
+    // contract-level boundary, identical for SPARQL and JSON-LD.
+    if let Ok(query) = &result {
+        reject_direct_reifies_in_patterns(&query.patterns)?;
+    }
+
     result
+}
+
+/// Walk every triple pattern reachable from `patterns` (recursing
+/// through container patterns) and reject any whose predicate slot is
+/// a system-controlled `f:reifies*` IRI/SID. Called by
+/// `lower_sparql_with_source` after lowering succeeds.
+///
+/// Patterns built via the IR-level `expand_edge_annotation_patterns`
+/// pass also produce `f:reifies*` triples, but that pass runs at
+/// execution time on top of `Pattern::EdgeAnnotation` /
+/// `Pattern::AnnotationTarget`, *after* this firewall. SPARQL has no
+/// surface that produces those container variants today, so any
+/// `f:reifies*` triple visible here came from user input.
+fn reject_direct_reifies_in_patterns(patterns: &[Pattern]) -> Result<()> {
+    use fluree_db_query::ir::triple::Ref;
+    use fluree_vocab::reifies_iris;
+
+    fn is_reifies_ref(p: &Ref) -> bool {
+        match p {
+            Ref::Sid(sid) => fluree_db_core::is_reserved_reifies_predicate(sid),
+            Ref::Iri(iri) => reifies_iris::ALL.iter().any(|known| *known == iri.as_ref()),
+            _ => false,
+        }
+    }
+
+    fn walk(patterns: &[Pattern]) -> Result<()> {
+        for pattern in patterns {
+            match pattern {
+                Pattern::Triple(tp) => {
+                    if is_reifies_ref(&tp.p) {
+                        let predicate = match &tp.p {
+                            Ref::Iri(iri) => iri.as_ref().to_string(),
+                            Ref::Sid(sid) => format!("{sid}"),
+                            _ => "<f:reifies*>".to_string(),
+                        };
+                        return Err(LowerError::not_implemented(
+                            format!(
+                                "predicate '{predicate}' is system-controlled; \
+                                 read edge annotations through SPARQL-star \
+                                 quoted-triple annotation syntax rather than \
+                                 naming f:reifies* directly"
+                            ),
+                            (0..0).into(),
+                        ));
+                    }
+                }
+                Pattern::Optional(inner)
+                | Pattern::Minus(inner)
+                | Pattern::Exists(inner)
+                | Pattern::NotExists(inner) => walk(inner)?,
+                Pattern::Union(branches) => {
+                    for branch in branches {
+                        walk(branch)?;
+                    }
+                }
+                Pattern::Graph { patterns, .. } => walk(patterns)?,
+                Pattern::Service(sp) => walk(&sp.patterns)?,
+                Pattern::Subquery(sq) => walk(&sq.patterns)?,
+                Pattern::EdgeAnnotation { body, .. }
+                | Pattern::AnnotationTarget { body, .. } => walk(body)?,
+                _ => {}
+            }
+        }
+        Ok(())
+    }
+
+    walk(patterns)
 }
 
 /// Context for lowering operations.
@@ -271,6 +349,7 @@ impl<'a, E: IriEncoder> LoweringContext<'a, E> {
                     offset,
                     reasoning: ReasoningConfig::default(),
                     post_values,
+                    include_system_facts: false,
                 })
             }
             QueryBody::Construct(construct_query) => self.lower_construct(construct_query),
@@ -388,6 +467,41 @@ mod tests {
     // =========================================================================
     // Basic SELECT tests
     // =========================================================================
+
+    #[test]
+    fn test_rejects_user_authored_reifies_iri() {
+        // Mirrors the JSON-LD read-side firewall: SPARQL queries that
+        // mention `f:reifies*` IRIs directly are rejected at lower
+        // time so users can't enumerate system facts through the
+        // query surface. The opt-in `opts.includeSystemFacts: true`
+        // (JSON-LD only) does not relax this — it only relaxes the
+        // variable-predicate scan filter.
+        let err = lower_query(
+            "PREFIX f: <https://ns.flur.ee/db#>\n\
+             SELECT ?ann ?s WHERE { ?ann f:reifiesSubject ?s }",
+        )
+        .expect_err("direct f:reifiesSubject mention must be rejected");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("system-controlled") && msg.contains("reifies"),
+            "expected system-controlled rejection; got: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_rejects_user_authored_reifies_iri_inside_optional() {
+        // Recurse-into-container check: nested mentions inside
+        // OPTIONAL (and by extension UNION/MINUS/etc.) must also be
+        // caught by the post-lower walk.
+        let err = lower_query(
+            "PREFIX ex: <http://example.org/>\n\
+             PREFIX f: <https://ns.flur.ee/db#>\n\
+             SELECT ?ann WHERE { ?ann ex:role \"Engineer\" \
+              OPTIONAL { ?ann f:reifiesObject ?o } }",
+        )
+        .expect_err("nested f:reifies* mention must be rejected");
+        assert!(err.to_string().contains("system-controlled"));
+    }
 
     #[test]
     fn test_simple_select() {

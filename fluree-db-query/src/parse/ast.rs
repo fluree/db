@@ -672,6 +672,11 @@ pub struct UnresolvedOptions {
     /// When false, bare "?x" object values are literals unless
     /// explicitly wrapped as {"@variable": "?x"}.
     pub object_var_parsing: bool,
+    /// When true, scan operators bypass the variable-predicate filter
+    /// for Fluree-system predicates. Parsed from
+    /// `opts.includeSystemFacts: true`. See
+    /// [`crate::ir::Query::include_system_facts`].
+    pub include_system_facts: bool,
 }
 
 impl UnresolvedOptions {
@@ -693,6 +698,7 @@ impl Default for UnresolvedOptions {
             having: None,
             reasoning: None,
             object_var_parsing: true,
+            include_system_facts: false,
         }
     }
 }

@@ -638,6 +638,7 @@ impl Fluree {
             english_lang_id,
             remote_service: self.remote_service_executor(),
             strict_bind_errors: true,
+            include_system_facts: executable.query.include_system_facts,
             ..Default::default()
         };
 
@@ -707,6 +708,7 @@ impl Fluree {
             english_lang_id,
             remote_service: self.remote_service_executor(),
             strict_bind_errors: true,
+            include_system_facts: executable.query.include_system_facts,
             ..Default::default()
         };
 

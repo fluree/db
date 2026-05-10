@@ -58,6 +58,7 @@ impl<E: IriEncoder> LoweringContext<'_, E> {
             limit,
             offset,
             post_values: None,
+            include_system_facts: false,
         })
     }
 

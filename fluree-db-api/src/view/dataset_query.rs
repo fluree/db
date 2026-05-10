@@ -661,6 +661,7 @@ impl Fluree {
             remote_service: self.remote_service_executor(),
             from_t,
             strict_bind_errors: true,
+            include_system_facts: executable.query.include_system_facts,
             ..Default::default()
         };
 
@@ -777,6 +778,7 @@ impl Fluree {
             remote_service: self.remote_service_executor(),
             from_t,
             strict_bind_errors: true,
+            include_system_facts: executable.query.include_system_facts,
             ..Default::default()
         };
 

@@ -273,12 +273,46 @@ correctness items remaining):**
   `is_reserved_reifies_predicate(&p)` returns true. Closes the
   `select: {"?s": ["*"]}` leak path that the parser firewall
   doesn't catch.
-- ⏳ **Variable-predicate scan filter.** Triple patterns with a
-  variable predicate (`{"@id": "?ann", "?p": "?o"}`) match all
-  predicates including `f:reifies*` directly at the scan layer.
-  This filter belongs in the binary / novelty scan operators, not
-  in hydration. Needs an `opts.includeSystemFacts: true` escape and
-  a history-range carve-out.
+- ✅ **Variable-predicate scan filter.** `BinaryScanOperator` filters
+  `f:reifies*` (and the broader `f:` namespace in the default graph)
+  out of variable-predicate scans on both the indexed-cursor path
+  (`is_internal_predicate`, `binary_scan.rs:1047`) and the
+  range/overlay fallback (`flakes_to_bindings`, `binary_scan.rs:707`).
+  Coverage at `tests/it_edge_annotations.rs::variable_predicate_scan_hides_f_reifies{,_in_named_graph}`.
+
+  **Contract** (uniform for JSON-LD and SPARQL):
+
+  - **Direct mention of an `f:reifies*` IRI is parse-rejected**, full stop.
+    JSON-LD: `parse::reject_user_authored_reifies_in_query` runs at the
+    top of `parse_query_ast`. SPARQL: `lower::reject_direct_reifies_in_patterns`
+    walks the post-lower pattern tree (recursing through OPTIONAL /
+    UNION / MINUS / GRAPH / SERVICE / SUBQUERY / EdgeAnnotation
+    bodies). The parser rejection is the contract-level boundary —
+    even with the opt-in (below), a query naming `f:reifies*` directly
+    is rejected.
+  - **`opts.includeSystemFacts: true`** (JSON-LD only; SPARQL has no
+    equivalent option today) only relaxes the **variable-predicate**
+    scan filter — the `?p`-shape probe. Parsed in
+    `parse::options::parse_include_system_facts`, accepts camel /
+    snake / kebab variants. Threaded `UnresolvedOptions` →
+    `Query::include_system_facts` → `ContextConfig::include_system_facts`
+    → `ExecutionContext::include_system_facts` → snapshotted onto
+    the scan operator at `open()`/`prime_history_flakes()`. Wired
+    through both the single-graph view path (`view::query.rs`) and
+    the dataset / connection path (`view::dataset_query.rs`). Also
+    parsed inline on the JSON-LD ASK branch since ASK returns from
+    the parser before the standard `parse_options` call. Tests:
+    `opts_include_system_facts_surfaces_f_reifies`,
+    `opts_include_system_facts_does_not_relax_direct_mention_firewall`,
+    `opts_include_system_facts_propagates_through_dataset_path`,
+    `opts_include_system_facts_works_for_ask_queries`,
+    `lower::tests::test_rejects_user_authored_reifies_iri{,_inside_optional}`.
+  - **History-range carve-out**: `BinaryScanOperator` with
+    `mode == TemporalMode::History` (the inner of
+    `BinaryHistoryScanOperator`) unconditionally bypasses the filter
+    so attachment lifecycle stays inspectable. Applied in both
+    `open()` and `prime_history_flakes()`. Test:
+    `history_query_surfaces_f_reifies_events`.
 - ⏳ **Graph-bound expansion in multi-graph queries.** The IR-level
   expansion in `expand_edge_annotation_patterns` correctly handles
   single-graph queries and `Pattern::Graph`-wrapped patterns (the

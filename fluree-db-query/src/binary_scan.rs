@@ -162,6 +162,12 @@ pub struct BinaryScanOperator {
     sid_cache: HashMap<u64, Sid>,
     /// Whether predicate is a variable (for internal predicate filtering).
     p_is_var: bool,
+    /// Snapshot of `ExecutionContext::include_system_facts` taken at
+    /// `open()` time. When `true`, both filter sites
+    /// (`is_internal_predicate` on the binary cursor path and the
+    /// `f:reifies*` skip in `flakes_to_bindings`) become no-ops so
+    /// debug/inspection callers can see Fluree-system facts directly.
+    include_system_facts: bool,
     inline_ops: Vec<InlineOperator>,
     /// Encoded pre-filters compiled from inline filter expressions.
     ///
@@ -632,6 +638,7 @@ impl BinaryScanOperator {
             p_sids: Vec::new(),
             sid_cache: HashMap::new(),
             p_is_var,
+            include_system_facts: false,
             inline_ops,
             encoded_pre_filters: Vec::new(),
             emit,
@@ -704,7 +711,14 @@ impl BinaryScanOperator {
             // their reified edge's graph, so a `GRAPH ?g` /
             // per-graph variable-predicate scan would otherwise
             // leak the bundle in that graph.
-            if self.p_is_var && fluree_db_core::is_reserved_reifies_predicate(&flake.p) {
+            //
+            // `include_system_facts` (set from
+            // `opts.includeSystemFacts: true`) bypasses the filter
+            // for debug / inspection workflows.
+            if self.p_is_var
+                && !self.include_system_facts
+                && fluree_db_core::is_reserved_reifies_predicate(&flake.p)
+            {
                 continue;
             }
 
@@ -875,6 +889,12 @@ impl BinaryScanOperator {
         }
         self.store = ctx.binary_store.clone();
         self.g_id = ctx.binary_g_id;
+        // History-range queries unconditionally surface `f:reifies*`
+        // events; mirrors the rule applied in `open()`. Without this,
+        // a variable-predicate history scan would still drop `f:reifies*`
+        // rows in `flakes_to_bindings` because `prime_history_flakes`
+        // bypasses `open()`.
+        self.include_system_facts = ctx.include_system_facts || self.mode.is_history();
         self.range_iter = Some(flakes.into_iter());
         self.cursor = None;
         self.state = OperatorState::Open;
@@ -1046,6 +1066,10 @@ impl BinaryScanOperator {
     #[inline]
     fn is_internal_predicate(&self, p_id: u32) -> bool {
         if !self.p_is_var {
+            return false;
+        }
+        // Opt-in escape for debug / inspection workflows.
+        if self.include_system_facts {
             return false;
         }
         let Some(sid) = self.p_sids.get(p_id as usize) else {
@@ -1580,6 +1604,11 @@ impl Operator for BinaryScanOperator {
         // Resolve store and g_id from context.
         self.store = ctx.binary_store.clone();
         self.g_id = ctx.binary_g_id;
+        // History-range queries unconditionally surface `f:reifies*`
+        // events: attachment lifecycle is part of ledger history and
+        // hiding it would defeat the point of inspecting a history
+        // window. Otherwise honor the per-query opt-in.
+        self.include_system_facts = ctx.include_system_facts || self.mode.is_history();
 
         // Multi-graph fanout is handled by DatasetOperator, which wraps
         // BinaryScanOperator at the scan construction sites (where_plan.rs,

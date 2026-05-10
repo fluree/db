@@ -110,6 +110,7 @@ mod tests {
             limit: None,
             offset: None,
             post_values: None,
+            include_system_facts: false,
         };
         let executable = ExecutableQuery::simple(query);
         let results = execute(db, &vars, &executable, ContextConfig::default())
@@ -135,6 +136,7 @@ mod tests {
             limit: None,
             offset: None,
             post_values: None,
+            include_system_facts: false,
         };
 
         let result = build_operator_tree(
@@ -161,6 +163,7 @@ mod tests {
             limit: None,
             offset: None,
             post_values: None,
+            include_system_facts: false,
         };
 
         let result = build_operator_tree(

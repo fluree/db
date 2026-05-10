@@ -144,6 +144,7 @@ mod tests {
             limit: None,
             offset: None,
             post_values: None,
+            include_system_facts: false,
         }
     }
 
@@ -159,6 +160,7 @@ mod tests {
             limit: None,
             offset: None,
             post_values: None,
+            include_system_facts: false,
         }
     }
 
@@ -303,6 +305,7 @@ mod tests {
             limit: None,
             offset: None,
             post_values: None,
+            include_system_facts: false,
         };
 
         let deps = compute_variable_deps(&query).unwrap();
@@ -327,6 +330,7 @@ mod tests {
             limit: None,
             offset: None,
             post_values: None,
+            include_system_facts: false,
         }
     }
 

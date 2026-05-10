@@ -2860,6 +2860,7 @@ mod tests {
             limit: None,
             offset: None,
             post_values: None,
+            include_system_facts: false,
         }
     }
 
@@ -2908,6 +2909,7 @@ mod tests {
             limit: Some(10),
             offset: None,
             post_values: None,
+            include_system_facts: false,
         };
 
         let spec =
@@ -2933,6 +2935,7 @@ mod tests {
             limit: None,
             offset: None,
             post_values: None,
+            include_system_facts: false,
         };
 
         let result = build_operator_tree(
@@ -2959,6 +2962,7 @@ mod tests {
             limit: None,
             offset: None,
             post_values: None,
+            include_system_facts: false,
         };
 
         let result = build_operator_tree(
@@ -3035,6 +3039,7 @@ mod tests {
             limit: None,
             offset: None,
             post_values: None,
+            include_system_facts: false,
         };
         let reversed = Query {
             context: ParsedContext::default(),
@@ -3058,6 +3063,7 @@ mod tests {
             limit: None,
             offset: None,
             post_values: None,
+            include_system_facts: false,
         };
         assert_eq!(
             detect_exists_join_count_distinct_object(&counted_first),

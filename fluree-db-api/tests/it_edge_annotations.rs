@@ -1438,6 +1438,322 @@ async fn variable_predicate_scan_hides_f_reifies() {
 }
 
 #[tokio::test]
+async fn opts_include_system_facts_does_not_relax_direct_mention_firewall() {
+    // Contract: `opts.includeSystemFacts: true` only relaxes the
+    // variable-predicate scan filter. Direct mention of an
+    // `f:reifies*` IRI in a query is rejected at parse time
+    // regardless of the flag. The parser firewall is the
+    // contract-level boundary.
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger_id = "it/edge-annotations:opts-include-direct-still-rejected";
+    let ledger0 = genesis_ledger(&fluree, ledger_id);
+    let _ = fluree
+        .insert(
+            ledger0,
+            &json!({
+                "@context": ctx(),
+                "@id": "ex:alice",
+                "ex:worksFor": {
+                    "@id": "ex:acme",
+                    "@annotation": { "ex:role": "Engineer" }
+                }
+            }),
+        )
+        .await
+        .expect("annotated insert");
+
+    let ledger = fluree.ledger(ledger_id).await.expect("reload");
+    let direct_query = json!({
+        "@context": {
+            "ex": "http://example.org/",
+            "f": "https://ns.flur.ee/db#"
+        },
+        "select": ["?ann"],
+        "where": { "@id": "?ann", "f:reifiesPredicate": "?p" },
+        "opts": { "includeSystemFacts": true }
+    });
+
+    let result = support::query_jsonld_formatted(&fluree, &ledger, &direct_query).await;
+    let err = result.expect_err("direct f:reifies* mention must be rejected even with opt-in");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("system-controlled") && msg.contains("reifiesPredicate"),
+        "expected system-controlled rejection regardless of includeSystemFacts; got: {msg}"
+    );
+}
+
+#[tokio::test]
+async fn opts_include_system_facts_surfaces_f_reifies() {
+    // The `opts.includeSystemFacts: true` escape disables the
+    // variable-predicate filter so debug / inspection callers can see
+    // the underlying `f:reifies*` system facts. Without the flag, the
+    // filter hides them (covered by `variable_predicate_scan_hides_f_reifies`).
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger_id = "it/edge-annotations:opts-include-system-facts";
+    let ledger0 = genesis_ledger(&fluree, ledger_id);
+
+    let txn = json!({
+        "@context": ctx(),
+        "@id": "ex:alice",
+        "ex:worksFor": {
+            "@id": "ex:acme",
+            "@annotation": {
+                "@id": "ex:emp/alice-acme",
+                "ex:role": "Engineer"
+            }
+        }
+    });
+    let committed = fluree
+        .insert(ledger0, &txn)
+        .await
+        .expect("annotated insert");
+
+    let query = json!({
+        "@context": ctx(),
+        "select": ["?p"],
+        "where": { "@id": "ex:emp/alice-acme", "?p": "?o" },
+        "opts": { "includeSystemFacts": true }
+    });
+    let rows = support::query_jsonld_formatted(&fluree, &committed.ledger, &query)
+        .await
+        .expect("opts.includeSystemFacts query");
+    let arr = rows.as_array().expect("array");
+
+    let predicates: Vec<String> = arr
+        .iter()
+        .filter_map(|row| row.as_array())
+        .filter_map(|cols| cols.first())
+        .filter_map(|v| {
+            v.as_str()
+                .map(String::from)
+                .or_else(|| v.get("@id").and_then(|i| i.as_str()).map(String::from))
+        })
+        .collect();
+
+    // With the escape, all three required `f:reifies*` predicates are
+    // visible from the annotation subject.
+    let leaked_reifies: Vec<&String> = predicates
+        .iter()
+        .filter(|p| {
+            p.starts_with("https://ns.flur.ee/db#reifies") || p.starts_with("f:reifies")
+        })
+        .collect();
+    assert!(
+        leaked_reifies.len() >= 3,
+        "opts.includeSystemFacts: true must surface the f:reifies* bundle \
+         (got predicates: {predicates:?})"
+    );
+}
+
+#[tokio::test]
+async fn opts_include_system_facts_propagates_through_dataset_path() {
+    // The dataset/connection query path
+    // (`view::dataset_query::execute_dataset_with_r2rml`) builds its
+    // own `ContextConfig` separate from the single-graph view path.
+    // Both must thread `executable.query.include_system_facts` so the
+    // opt-in works whichever path the api dispatcher picks.
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger_id = "it/edge-annotations:opts-dataset-path";
+    let ledger0 = genesis_ledger(&fluree, ledger_id);
+    let _ = fluree
+        .insert(
+            ledger0,
+            &json!({
+                "@context": ctx(),
+                "@id": "ex:alice",
+                "ex:worksFor": {
+                    "@id": "ex:acme",
+                    "@annotation": {
+                        "@id": "ex:emp/alice-acme",
+                        "ex:role": "Engineer"
+                    }
+                }
+            }),
+        )
+        .await
+        .expect("annotated insert");
+
+    let query = json!({
+        "@context": ctx(),
+        "from": ledger_id,
+        "select": ["?p"],
+        "where": { "@id": "ex:emp/alice-acme", "?p": "?o" },
+        "opts": { "includeSystemFacts": true }
+    });
+    let result = fluree
+        .query_connection(&query)
+        .await
+        .expect("dataset-path query");
+    let ledger = fluree.ledger(ledger_id).await.expect("reload");
+    let json = result.to_jsonld(&ledger.snapshot).expect("to_jsonld");
+    let arr = json.as_array().expect("array");
+
+    let predicates: Vec<String> = arr
+        .iter()
+        .filter_map(|row| row.as_array())
+        .filter_map(|cols| cols.first())
+        .filter_map(|v| {
+            v.as_str()
+                .map(String::from)
+                .or_else(|| v.get("@id").and_then(|i| i.as_str()).map(String::from))
+        })
+        .collect();
+    let leaked: Vec<&String> = predicates
+        .iter()
+        .filter(|p| {
+            p.starts_with("https://ns.flur.ee/db#reifies") || p.starts_with("f:reifies")
+        })
+        .collect();
+    assert!(
+        leaked.len() >= 3,
+        "dataset-path query must propagate opts.includeSystemFacts to the scan operator \
+         (got predicates: {predicates:?})"
+    );
+}
+
+#[tokio::test]
+async fn opts_include_system_facts_works_for_ask_queries() {
+    // ASK queries return from the parser before `parse_options()`
+    // runs, so `opts.includeSystemFacts` has to be parsed inline on
+    // that branch. Without that, an ASK against an annotation
+    // subject's `?p`-shape would always answer false even with the
+    // opt-in set.
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger_id = "it/edge-annotations:opts-ask";
+    let ledger0 = genesis_ledger(&fluree, ledger_id);
+    let _ = fluree
+        .insert(
+            ledger0,
+            &json!({
+                "@context": ctx(),
+                "@id": "ex:alice",
+                "ex:worksFor": {
+                    "@id": "ex:acme",
+                    "@annotation": {
+                        "@id": "ex:emp/alice-acme",
+                        "ex:role": "Engineer"
+                    }
+                }
+            }),
+        )
+        .await
+        .expect("annotated insert");
+
+    let ledger = fluree.ledger(ledger_id).await.expect("reload");
+
+    // Ask whether the annotation subject has *any* predicate. With
+    // the filter on (default) this still answers true via the
+    // ex:role flake. Pin the discriminating shape: ask via a SID-
+    // bound predicate of `f:reifiesSubject`-via-variable that only
+    // matches when the f:reifies* row passes the scan filter.
+    let q_default = json!({
+        "@context": ctx(),
+        "ask": [{
+            "@id": "ex:emp/alice-acme",
+            "?p": { "@id": "ex:alice" }
+        }]
+    });
+    let resp_default = fluree
+        .query(&support::graphdb_from_ledger(&ledger), &q_default)
+        .await
+        .expect("ask default");
+    let json_default: JsonValue = resp_default
+        .to_jsonld(&ledger.snapshot)
+        .expect("to_jsonld default");
+    assert_eq!(
+        json_default,
+        JsonValue::Bool(false),
+        "without includeSystemFacts, ASK over a hidden f:reifies* row must answer false: {json_default}"
+    );
+
+    // With the opt-in, the ASK now returns true because the scan
+    // filter is bypassed and the f:reifiesSubject row binds.
+    let q_opt = json!({
+        "@context": ctx(),
+        "ask": [{
+            "@id": "ex:emp/alice-acme",
+            "?p": { "@id": "ex:alice" }
+        }],
+        "opts": { "includeSystemFacts": true }
+    });
+    let resp_opt = fluree
+        .query(&support::graphdb_from_ledger(&ledger), &q_opt)
+        .await
+        .expect("ask opt");
+    let json_opt: JsonValue = resp_opt
+        .to_jsonld(&ledger.snapshot)
+        .expect("to_jsonld opt");
+    assert_eq!(
+        json_opt,
+        JsonValue::Bool(true),
+        "ASK + opts.includeSystemFacts must surface f:reifies* rows: {json_opt}"
+    );
+}
+
+#[tokio::test]
+async fn history_query_surfaces_f_reifies_events() {
+    // History-range queries dispatch through `BinaryHistoryScanOperator`,
+    // not `BinaryScanOperator`. The history operator has no
+    // variable-predicate filter for `f:reifies*` because attachment
+    // lifecycle events are part of the ledger's history and the
+    // history-range surface is the documented inspection path for
+    // them. This test pins the carve-out: a history scan over the
+    // annotation subject sees its `f:reifies*` events without any
+    // opt-in.
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger_id = "it/edge-annotations:history-surfaces-reifies";
+    let ledger0 = genesis_ledger(&fluree, ledger_id);
+
+    let txn = json!({
+        "@context": ctx(),
+        "@id": "ex:alice",
+        "ex:worksFor": {
+            "@id": "ex:acme",
+            "@annotation": {
+                "@id": "ex:emp/alice-acme",
+                "ex:role": "Engineer"
+            }
+        }
+    });
+    let committed = fluree
+        .insert(ledger0, &txn)
+        .await
+        .expect("annotated insert");
+
+    // History-range query over the annotation subject. `from`/`to`
+    // dispatches through `view::dataset_query` which selects
+    // `BinaryHistoryScanOperator` instead of the normal
+    // `BinaryScanOperator`.
+    let query = json!({
+        "@context": ctx(),
+        "from": format!("{ledger_id}@t:1"),
+        "to":   format!("{ledger_id}@t:latest"),
+        "select": ["?p", "?o"],
+        "where": [{
+            "@id": "ex:emp/alice-acme",
+            "?p": {"@value": "?o"}
+        }]
+    });
+    let result = fluree
+        .query_connection(&query)
+        .await
+        .expect("history range query");
+    let json = result
+        .to_jsonld(&committed.ledger.snapshot)
+        .expect("to_jsonld");
+
+    // At least one `f:reifies*` predicate IRI must appear in the
+    // bound-?p column — the history operator does not apply the
+    // variable-predicate filter.
+    let json_str = serde_json::to_string(&json).expect("serialize history rows");
+    assert!(
+        json_str.contains("reifies"),
+        "history-range query must surface f:reifies* events for inspection \
+         (payload: {json_str})"
+    );
+}
+
+#[tokio::test]
 async fn wildcard_subject_hydration_hides_f_reifies_predicates() {
     // Annotation subjects minted by the M1a transactor lowering carry
     // `f:reifies*` system facts in addition to the user-authored body
