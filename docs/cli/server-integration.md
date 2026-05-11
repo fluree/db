@@ -4,8 +4,8 @@ This document is for implementers building a custom server (for example in `../s
 
 The CLI supports two broad categories of remote operations:
 
-- **Data API**: query/update/insert/upsert/info/exists/show (normal ledger operations).
-- **Replication / sync**: clone/pull/fetch (content-addressed replication by CID, via pack + storage proxy).
+- **Data API**: query / update / insert / upsert / info / exists / show / log / history / context / explain, plus admin operations like create / drop / reindex / branch (create / drop / rebase / merge) / publish / export.
+- **Replication / sync**: clone / pull / fetch (content-addressed replication by CID, via pack + storage proxy) and ledger-archive (`export --format ledger`).
 
 ## Base URL And Discovery
 
@@ -94,7 +94,7 @@ Read or replace the default JSON-LD context for a ledger. `get` returns the cont
 
 - `POST {api_base_url}/query/*ledger`
 
-Server-side history queries via JSON-LD: the CLI builds the same `from`/`to`/`select`/`where` body it would send locally and POSTs it to the **ledger-scoped** query endpoint (`/query/{ledger}`). The path carries the bare ledger ID (e.g. `mydb:main`) so the server's `can_read` check matches normal scoped read tokens; the body's `from` carries the time-travel suffix (`mydb:main@t:N`) which the query engine uses to resolve the snapshot. Posting to the connection-level `/query` instead would force auth to read `from` for the ledger ID and reject any token not scoped to the time-travel form.
+Server-side history queries via JSON-LD: the CLI builds the same `from`/`to`/`select`/`where` body it would send locally and POSTs it to the **ledger-scoped** query endpoint (`/query/{ledger}`). The path carries the bare ledger ID (e.g. `mydb:main`) so the server's `can_read` check matches normal scoped read tokens; the body's `from` carries the time-travel suffix (`mydb:main@t:N`) which the query engine uses to build a historical view at that `t`. Posting to the connection-level `/query` instead would force auth to read `from` for the ledger ID and reject any token not scoped to the time-travel form.
 
 Entity and predicate compact IRIs (`ex:alice` → `http://example.org/alice`) are expanded **client-side** using the project's stored prefix map before the request leaves the CLI, so the server never has to consult the local prefix table. The query body still ships its `@context` (also derived from local prefixes) so the server can compact response IRIs back into the user's preferred form for display.
 
@@ -143,7 +143,11 @@ Drops a ledger or graph source on the remote server. The CLI sends `hard: true` 
 
 When `--remote` is omitted, the CLI auto-routes through a locally running `fluree server start` if `server.meta.json` is present and the PID is alive, falling back to direct local execution otherwise. Pass `--direct` to skip auto-routing. The `--force` flag is required in all modes to confirm deletion.
 
-`--remote` does not affect local state: dropping a ledger remotely never touches the local active-ledger pointer or local storage.
+Active-ledger handling:
+
+- **`--remote <name>`** (explicit): never touches local state. Remote storage is separate; the local active-ledger pointer and local storage are unaffected.
+- **Auto-route** (no `--remote`, server running): same on-disk storage as `--direct`, so a successful drop also clears the local active-ledger pointer if it matched the dropped name.
+- **`--direct`** (no `--remote`, no server): clears the active-ledger pointer if it matched.
 
 ### `fluree create <name> --from <file>.flpack` (native ledger import)
 
@@ -1557,6 +1561,7 @@ fluree context get mydb --remote origin  # should print the remote ledger's defa
 fluree context set mydb --remote origin -e '{"ex": "http://example.org/"}'  # admin: replace context
 fluree history http://example.org/alice --ledger mydb --remote origin --format json  # remote history
 fluree query mydb 'SELECT * WHERE { ?s ?p ?o }' --remote origin --at 1  # time-travel via /query/{ledger}
+fluree query mydb 'SELECT * WHERE { ?s ?p ?o }' --remote origin --at 1 --explain --format json  # time-travel explain via /explain/{ledger}
 fluree create empty-db --remote origin  # should create an empty ledger on the remote
 fluree export mydb --remote origin --format ledger -o mydb-remote.flpack  # archive remote ledger
 fluree drop my-gs --force      # should drop the graph source locally
