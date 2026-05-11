@@ -2855,6 +2855,83 @@ async fn multi_source_default_pairs_annotations_per_source_graph() {
 }
 
 #[tokio::test]
+async fn multi_source_default_wildcard_does_not_panic_on_synthetic_var() {
+    // Regression: an earlier shape of the per-source-correlation fix
+    // exposed a planner-minted graph variable in the operator schema
+    // without registering it with `VarRegistry`. Wildcard formatters
+    // call `vars.name(var_id)`, which would panic for an unregistered
+    // VarId. The fix removed the synthetic var entirely — per-source
+    // correlation comes from the context switch, not a join key.
+    //
+    // This test exercises the wildcard path against the same
+    // multi-source default-graph annotated dataset to pin the
+    // contract: wildcard select must not panic and must surface only
+    // user-visible bindings.
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger_id = "it/edge-annotations:multi-source-wildcard";
+    let ledger0 = genesis_ledger(&fluree, ledger_id);
+
+    let r1 = fluree
+        .insert(
+            ledger0,
+            &json!({
+                "@context": ctx(),
+                "@id": "ex:alice",
+                "@graph": "ex:graph-A",
+                "ex:worksFor": {
+                    "@id": "ex:acme",
+                    "@annotation": { "@id": "ex:emp/A", "ex:role": "Engineer" }
+                }
+            }),
+        )
+        .await
+        .expect("graph-A insert");
+    let _ = fluree
+        .insert(
+            r1.ledger,
+            &json!({
+                "@context": ctx(),
+                "@id": "ex:alice",
+                "@graph": "ex:graph-B",
+                "ex:worksFor": {
+                    "@id": "ex:acme",
+                    "@annotation": { "@id": "ex:emp/B", "ex:role": "Manager" }
+                }
+            }),
+        )
+        .await
+        .expect("graph-B insert");
+
+    let q = json!({
+        "@context": ctx(),
+        "from": [
+            format!("{ledger_id}#http://example.org/graph-A"),
+            format!("{ledger_id}#http://example.org/graph-B"),
+        ],
+        "select": "*",
+        "where": {
+            "@id": "ex:alice",
+            "ex:worksFor": {
+                "@id": "ex:acme",
+                "@annotation": { "@id": "?ann", "ex:role": "?role" }
+            }
+        }
+    });
+    let result = fluree
+        .query_connection(&q)
+        .await
+        .expect("wildcard select must not panic on synthetic var name lookup");
+    let ledger = fluree.ledger(ledger_id).await.expect("reload");
+    let json = result.to_jsonld(&ledger.snapshot).expect("jsonld");
+    let arr = json.as_array().expect("array");
+    assert_eq!(
+        arr.len(),
+        2,
+        "wildcard must still produce one row per source's annotation: {arr:#?}"
+    );
+}
+
+#[tokio::test]
 async fn graph_wrapped_query_correctly_pairs_annotations_per_graph() {
     // Positive coverage: when the user wraps a multi-source query in
     // `Pattern::Graph` (here via JSON-LD's named-graph access form),

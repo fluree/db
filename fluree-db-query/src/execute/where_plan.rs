@@ -70,37 +70,14 @@ use super::pushdown::extract_bounds_from_filters;
 /// the executor does — otherwise edge-annotation queries would
 /// surface as empty in the explain output.
 pub fn expand_edge_annotation_patterns(patterns: &[Pattern]) -> Vec<Pattern> {
-    let mut next_var = next_synth_var_index(patterns);
     let mut out = Vec::with_capacity(patterns.len());
     for p in patterns {
-        expand_one_into(p.clone(), &mut out, &mut next_var, false);
+        expand_one_into(p.clone(), &mut out, false);
     }
     out
 }
 
-/// Returns the smallest `VarId` index that is unused across `patterns`
-/// (recursively). Used to mint the internal graph variable for the
-/// `DefaultGraphSource` wrapper without colliding with user-visible
-/// VarIds. The synthesized variable never appears in projection — see
-/// `DefaultGraphSourceOperator` — so a name in the registry isn't
-/// strictly required for execution, but the index must be unique to
-/// avoid corrupting unrelated bindings.
-fn next_synth_var_index(patterns: &[Pattern]) -> u16 {
-    let mut max_seen: Option<u16> = None;
-    for p in patterns {
-        for v in p.referenced_vars() {
-            max_seen = Some(max_seen.map_or(v.0, |cur| cur.max(v.0)));
-        }
-    }
-    max_seen.map_or(0, |v| v.saturating_add(1))
-}
-
-fn expand_one_into(
-    pattern: Pattern,
-    out: &mut Vec<Pattern>,
-    next_var: &mut u16,
-    inside_graph: bool,
-) {
+fn expand_one_into(pattern: Pattern, out: &mut Vec<Pattern>, inside_graph: bool) {
     match pattern {
         Pattern::EdgeAnnotation {
             edge,
@@ -158,7 +135,7 @@ fn expand_one_into(
             //    The body inherits this expansion's wrapper context
             //    (already inside the chain we'll wrap below).
             for inner in body {
-                expand_one_into(inner, &mut chain, next_var, true);
+                expand_one_into(inner, &mut chain, true);
             }
 
             // f:reifiesGraph and f:reifiesLang are NOT emitted as
@@ -185,12 +162,7 @@ fn expand_one_into(
                 // layer is needed.
                 out.extend(chain);
             } else {
-                let graph_var = VarId(*next_var);
-                *next_var = next_var.saturating_add(1);
-                out.push(Pattern::DefaultGraphSource {
-                    graph: graph_var,
-                    patterns: chain,
-                });
+                out.push(Pattern::DefaultGraphSource { patterns: chain });
             }
         }
 
@@ -203,7 +175,7 @@ fn expand_one_into(
             // suppress the DefaultGraphSource wrapper — propagate
             // `inside_graph = true`.
             let expanded = pattern.map_subpatterns(&mut |inner| {
-                expand_edge_annotation_patterns_inside_graph(&inner, next_var)
+                expand_edge_annotation_patterns_inside_graph(&inner)
             });
             out.push(expanded);
         }
@@ -216,13 +188,12 @@ fn expand_one_into(
         | Pattern::Subquery(_)
         | Pattern::DefaultGraphSource { .. } => {
             // Container patterns inherit the current `inside_graph`
-            // context. Threading the mutable `next_var` through the
-            // closure keeps minted indices unique across recursion.
+            // context.
             let was_inside = inside_graph;
             let expanded = pattern.map_subpatterns(&mut |inner| {
                 let mut out = Vec::with_capacity(inner.len());
                 for p in inner {
-                    expand_one_into(p, &mut out, next_var, was_inside);
+                    expand_one_into(p, &mut out, was_inside);
                 }
                 out
             });
@@ -236,13 +207,10 @@ fn expand_one_into(
 /// Recursive entry that propagates `inside_graph = true`. Used by the
 /// `Pattern::Graph` arm above so its inner subtree doesn't synthesize
 /// a redundant `DefaultGraphSource`.
-fn expand_edge_annotation_patterns_inside_graph(
-    patterns: &[Pattern],
-    next_var: &mut u16,
-) -> Vec<Pattern> {
+fn expand_edge_annotation_patterns_inside_graph(patterns: &[Pattern]) -> Vec<Pattern> {
     let mut out = Vec::with_capacity(patterns.len());
     for p in patterns {
-        expand_one_into(p.clone(), &mut out, next_var, true);
+        expand_one_into(p.clone(), &mut out, true);
     }
     out
 }
@@ -2043,7 +2011,6 @@ pub fn build_where_operators_seeded_with_needed(
             }
 
             Pattern::DefaultGraphSource {
-                graph,
                 patterns: inner_patterns,
             } => {
                 // Internal — synthesized by `expand_edge_annotation_patterns`
@@ -2053,7 +2020,6 @@ pub fn build_where_operators_seeded_with_needed(
                 operator = Some(Box::new(
                     crate::default_graph_source::DefaultGraphSourceOperator::new(
                         child,
-                        *graph,
                         inner_patterns.clone(),
                         *planning,
                     ),

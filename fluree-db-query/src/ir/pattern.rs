@@ -333,9 +333,8 @@ pub enum Pattern {
     /// - If `silent` is true, service errors produce empty results
     Service(ServicePattern),
 
-    /// Internal — iterate the dataset's *default* graph sources and run
-    /// `patterns` once per source, binding `graph` to the source's IRI
-    /// for each iteration.
+    /// Internal — iterate the dataset's *default* graph sources and
+    /// run `patterns` once per source.
     ///
     /// Distinct from [`Pattern::Graph`], which iterates **named**
     /// graphs (SPARQL `GRAPH ?g { ... }`). This variant exists to let
@@ -345,13 +344,12 @@ pub enum Pattern {
     /// across all sources and produce an N×M cross-product against
     /// each base-edge match.
     ///
-    /// `graph` is a planner-minted internal variable that is not
-    /// projected to user output. Synthesis happens in
+    /// Per-source correlation comes from `with_graph_ref` switching
+    /// the execution context per iteration — no synthetic variable is
+    /// bound or exposed in the operator schema. Synthesis happens in
     /// `expand_edge_annotation_patterns`; users cannot author this
     /// variant directly.
     DefaultGraphSource {
-        /// Internal variable bound to each source IRI per iteration.
-        graph: VarId,
         /// Patterns to execute once per default graph source.
         patterns: Vec<Pattern>,
     },
@@ -463,8 +461,7 @@ impl Pattern {
                 edge,
                 body: f(body),
             },
-            Pattern::DefaultGraphSource { graph, patterns } => Pattern::DefaultGraphSource {
-                graph,
+            Pattern::DefaultGraphSource { patterns } => Pattern::DefaultGraphSource {
                 patterns: f(patterns),
             },
             other => other,
@@ -539,11 +536,8 @@ impl Pattern {
                 vars.extend(body.iter().flat_map(Pattern::referenced_vars));
                 vars
             }
-            Pattern::DefaultGraphSource { graph, patterns } => {
-                let mut vars: Vec<VarId> =
-                    patterns.iter().flat_map(Pattern::referenced_vars).collect();
-                vars.push(*graph);
-                vars
+            Pattern::DefaultGraphSource { patterns } => {
+                patterns.iter().flat_map(Pattern::referenced_vars).collect()
             }
         }
     }
@@ -600,14 +594,13 @@ impl Pattern {
                 vars.extend(body.iter().flat_map(Pattern::produced_vars));
                 vars
             }
-            // The graph var is bound *by* the operator, not produced
-            // by the inner subplan. Inner produced vars surface to
-            // the outer schema so downstream joins still see them.
-            Pattern::DefaultGraphSource { graph, patterns } => {
-                let mut vars: Vec<VarId> =
-                    patterns.iter().flat_map(Pattern::produced_vars).collect();
-                vars.push(*graph);
-                vars
+            // The wrapper itself binds no new variables — only the
+            // inner subplan produces vars, which surface unchanged
+            // to the outer schema. Per-source correlation is purely
+            // an execution-context switch (`with_graph_ref`), not a
+            // join-key binding.
+            Pattern::DefaultGraphSource { patterns } => {
+                patterns.iter().flat_map(Pattern::produced_vars).collect()
             }
         }
     }

@@ -313,8 +313,8 @@ correctness items remaining):**
     so attachment lifecycle stays inspectable. Applied in both
     `open()` and `prime_history_flakes()`. Test:
     `history_query_surfaces_f_reifies_events`.
-- ⏳ **Graph-bound expansion in multi-graph queries — bug confirmed,
-  workaround documented, architectural fix scoped.**
+- ✅ **Graph-bound expansion in multi-graph queries — fixed via
+  per-source correlation wrapper.**
 
   The IR-level expansion in `expand_edge_annotation_patterns`
   correctly handles two shapes (each scan iteration is per-graph in
