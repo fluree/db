@@ -162,18 +162,23 @@ pub(crate) fn reject_context_coercion_on_annotated_literal(
         }
     }
 
-    // Language coercion: a default `@language` (or per-term language)
-    // applies to string `@value` payloads when no explicit `@language`
-    // is set, producing a `lang`-tagged base flake while the reified
-    // bundle would not carry `f:reifiesLang`.
+    // Language coercion: the JSON-LD value-object expander in
+    // `parse_value_object` reads `context.language` (the document
+    // default) regardless of any per-term `@language` setting, then
+    // applies it whenever no `@type` is present on the value object.
+    // So the guard mirrors that behavior — checking only the document
+    // default — even if a per-term entry technically declares (or
+    // clears) a language. Without this, a value-object expander that
+    // tags the base flake with the default language would diverge
+    // from a reified bundle that thinks the per-term clear suppressed
+    // the tag.
+    //
+    // (Bare-scalar strings under a per-term language entry DO get
+    // term-language tags at expansion time, but the value-object
+    // form is the only shape edge annotations accept.)
     let value_is_string = matches!(map.get("@value"), Some(Value::String(_)));
     if value_is_string && !map.contains_key("@language") {
-        // Per-term @language overrides context default; explicit
-        // `Some(None)` clears the default for this term.
-        let effective_lang: Option<&str> = entry
-            .and_then(|e| e.language.as_ref().map(|inner| inner.as_deref()))
-            .unwrap_or(context.language.as_deref());
-        if let Some(lang) = effective_lang {
+        if let Some(lang) = context.language.as_deref() {
             return Err(TransactError::Parse(format!(
                 "annotated string literal on '{predicate}' relies on @context language coercion \
                  (@language='{lang}'); annotated literals must carry an explicit @language so \
@@ -1654,18 +1659,23 @@ fn lower_object_with_subject(
     };
 
     // 1. Honor `@reifies` on this node (rejected in v1 — see above).
+    //    Subject minting must use the merged context so a node-local
+    //    `@id` alias is recognized.
     if map.contains_key(REIFIES_KEY) {
         let val = map.remove(REIFIES_KEY).unwrap();
         // `@reifies` is one of the cases that requires a subject id; the
         // lower function reads `map`'s `@id` directly, but the mint must
         // run first so the value is present.
-        let _ = ensure_subject_id(map, walk, ctx);
+        let _ = ensure_subject_id(map, &child_walk, ctx);
         lower_reifies_block(map, val, ctx)?;
     }
 
     // 2. Walk predicate-value pairs. Skip JSON-LD keywords plus their
     //    context aliases (e.g. `"id": "@id"`) so we don't treat the
-    //    aliased subject reference as a regular predicate.
+    //    aliased subject reference as a regular predicate. Use the
+    //    merged context for alias resolution — a node-local `"id":
+    //    "@id"` override must be honored or the surrounding mints /
+    //    intercepts would treat the aliased id as a regular predicate.
     //
     // **Lazy @id minting.** Only mint `@id` for this node when an
     // annotation is actually being intercepted on one of its
@@ -1682,10 +1692,10 @@ fn lower_object_with_subject(
     // `it_transact::object_var_test`, and the `it_txn_meta::*`
     // negative-validation tests when the lowering pass ran on
     // ordinary (non-annotation) transactions.
-    let id_alias = walk.json_ld.id_key.as_str();
-    let type_alias = walk.json_ld.type_key.as_str();
+    let id_alias = effective_json_ld.id_key.as_str();
+    let type_alias = effective_json_ld.type_key.as_str();
     let keys: Vec<String> = map.keys().cloned().collect();
-    let mut minted_id: Option<String> = read_existing_subject_id(map, walk);
+    let mut minted_id: Option<String> = read_existing_subject_id(map, &child_walk);
     for key in keys {
         if key == "@id" || key == "@context" || key == "@graph" || key == "@type" {
             continue;
@@ -1712,7 +1722,7 @@ fn lower_object_with_subject(
                 .map(value_subtree_carries_annotation)
                 .unwrap_or(false);
             if needs_mint {
-                minted_id = Some(ensure_subject_id(map, walk, ctx));
+                minted_id = Some(ensure_subject_id(map, &child_walk, ctx));
             }
         }
 
@@ -2094,32 +2104,15 @@ mod tests {
     }
 
     #[test]
-    fn rejects_term_level_language_on_annotated_string() {
-        // Per-term @language overrides context default.
-        let doc = json!({
-            "@context": {
-                "ex": "http://example.org/",
-                "label": { "@id": "ex:label", "@language": "de" }
-            },
-            "@id": "ex:alice",
-            "label": {
-                "@value": "Buch",
-                "@annotation": { "ex:source": "lex" }
-            }
-        });
-        let err = lower(doc).unwrap_err();
-        assert!(
-            err.to_string()
-                .contains("@context language coercion (@language='de')"),
-            "got: {err}"
-        );
-    }
-
-    #[test]
-    fn term_cleared_language_overrides_default_no_rejection() {
-        // Per-term `@language: null` clears the default. A bare
-        // `@value` under that term is NOT language-coerced, so the
-        // annotation is accepted without an explicit @language.
+    fn per_term_language_does_not_suppress_default_language_rejection() {
+        // The value-object expander in fluree-graph-json-ld reads
+        // `context.language` directly and ignores per-term language
+        // overrides (including `Some(None)` clears). The guard mirrors
+        // that behavior: a default `@language` triggers rejection
+        // even when the predicate's term entry would conceptually
+        // override it. Otherwise the guard would pass but the
+        // expander would still tag the base flake with `fr`, breaking
+        // the EdgeKey round-trip.
         let doc = json!({
             "@context": {
                 "@language": "fr",
@@ -2132,27 +2125,38 @@ mod tests {
                 "@annotation": { "ex:source": "internal" }
             }
         });
-        lower(doc).expect("cleared per-term language must allow bare @value annotation");
+        let err = lower(doc).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("@context language coercion (@language='fr')"),
+            "got: {err}"
+        );
     }
 
     #[test]
     fn rejects_node_local_context_term_coercion_on_annotated_literal() {
-        // Per-node `@context` defines `joinedAt` with `@type: xsd:date`.
-        // The lowering walker must merge the local context into the
-        // parent's so the coercion guard fires.
+        // Envelope @context holds prefixes; the inner @graph node
+        // introduces its own @context defining `joinedAt` with
+        // `@type: xsd:date`. The lowering walker must merge the inner
+        // context into the parent's so the coercion guard fires.
+        // (Two separate `@context` keys on the same JSON object would
+        // collapse via JSON parsing, so the envelope form is the only
+        // way to express true per-node context merging in input JSON.)
         let doc = json!({
             "@context": {
                 "ex": "http://example.org/",
                 "xsd": "http://www.w3.org/2001/XMLSchema#"
             },
-            "@id": "ex:alice",
-            "@context": {
-                "joinedAt": { "@id": "ex:joinedAt", "@type": "xsd:date" }
-            },
-            "joinedAt": {
-                "@value": "2024-01-01",
-                "@annotation": { "ex:source": "hr" }
-            }
+            "@graph": [{
+                "@context": {
+                    "joinedAt": { "@id": "ex:joinedAt", "@type": "xsd:date" }
+                },
+                "@id": "ex:alice",
+                "joinedAt": {
+                    "@value": "2024-01-01",
+                    "@annotation": { "ex:source": "hr" }
+                }
+            }]
         });
         let err = lower(doc).unwrap_err();
         let msg = err.to_string();
@@ -2165,17 +2169,16 @@ mod tests {
 
     #[test]
     fn rejects_node_local_default_language_on_annotated_string() {
-        // Per-node `@context` introduces a default `@language`. The
-        // base flake would be language-tagged, but the synthesized
-        // bundle would not carry `f:reifiesLang` → EdgeKey mismatch.
         let doc = json!({
             "@context": { "ex": "http://example.org/" },
-            "@id": "ex:alice",
-            "@context": { "@language": "de" },
-            "ex:label": {
-                "@value": "Buch",
-                "@annotation": { "ex:source": "lex" }
-            }
+            "@graph": [{
+                "@context": { "@language": "de" },
+                "@id": "ex:alice",
+                "ex:label": {
+                    "@value": "Buch",
+                    "@annotation": { "ex:source": "lex" }
+                }
+            }]
         });
         let err = lower(doc).unwrap_err();
         let msg = err.to_string();
@@ -2188,14 +2191,14 @@ mod tests {
     #[test]
     fn rejects_node_local_context_term_coercion_on_delete_clause() {
         // Symmetric coverage on the delete pre-pass: a per-node
-        // `@context` inside the delete clause must merge into the
+        // `@context` inside a delete-clause node must merge into the
         // effective context before the coercion guard runs.
         let mut doc = json!({
             "@context": {
                 "ex": "http://example.org/",
                 "xsd": "http://www.w3.org/2001/XMLSchema#"
             },
-            "delete": {
+            "delete": [{
                 "@context": {
                     "joinedAt": { "@id": "ex:joinedAt", "@type": "xsd:date" }
                 },
@@ -2204,7 +2207,7 @@ mod tests {
                     "@value": "2024-01-01",
                     "@annotation": { "@id": "ex:ann-stale" }
                 }
-            }
+            }]
         });
         let err = lower_delete_annotation_blocks(&mut doc).unwrap_err();
         let msg = err.to_string();
@@ -2212,6 +2215,54 @@ mod tests {
             msg.contains("@context term coercion")
                 && (msg.contains("XMLSchema#date") || msg.contains("xsd:date")),
             "got: {msg}"
+        );
+    }
+
+    #[test]
+    fn node_local_context_provides_id_alias_for_subject_resolution() {
+        // Regression: alias lookups inside the insert walker used to
+        // read the *parent* walker's id_key, so a node-local
+        // `"id": "@id"` alias would be invisible. The subject's id
+        // would fall through to blank-node minting and the
+        // synthesized f:reifiesSubject would point at the minted
+        // blank rather than the user's IRI.
+        let doc = json!({
+            "@context": { "ex": "http://example.org/" },
+            "@graph": [{
+                "@context": { "id": "@id" },
+                "id": "ex:alice",
+                "ex:worksFor": {
+                    "id": "ex:acme",
+                    "@annotation": { "ex:role": "Engineer" }
+                }
+            }]
+        });
+        let result = lower(doc).expect("node-local id alias must lower cleanly");
+        // The lowered doc wraps the original + sibling in @graph (the
+        // top-level @graph envelope already exists, so the sibling is
+        // appended in-place).
+        let graph = result
+            .get("@graph")
+            .and_then(|g| g.as_array())
+            .expect("envelope @graph form");
+        let sibling = graph
+            .iter()
+            .find(|v| {
+                v.as_object()
+                    .map(|m| m.contains_key(reifies_iris::SUBJECT))
+                    .unwrap_or(false)
+            })
+            .expect("annotation sibling must be appended");
+        // f:reifiesSubject must point at the user's IRI, not a minted
+        // blank — confirming the alias was resolved from the merged
+        // (node-local) context.
+        assert_eq!(
+            sibling.get(reifies_iris::SUBJECT).unwrap(),
+            &json!({"@id": "ex:alice"})
+        );
+        assert_eq!(
+            sibling.get(reifies_iris::OBJECT).unwrap(),
+            &json!({"@id": "ex:acme"})
         );
     }
 

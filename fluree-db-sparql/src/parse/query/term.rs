@@ -575,8 +575,10 @@ impl super::Parser<'_> {
 
             // RDF 1.2 annotation tail: zero or more (reifier | annotationBlock).
             // Per v1 contract, accept at most one reifier and one block in any
-            // order. Annotations on literal-valued objects are deferred.
-            let annotation = self.parse_annotation_tail(&object)?;
+            // order. Literal-valued objects are accepted — the lowering path
+            // pins their datatype/language constraint onto the synthesized
+            // `TriplePattern.dtc`.
+            let annotation = self.parse_annotation_tail()?;
 
             // Create triple pattern (span covers subject, predicate, object,
             // and annotation tail if present).
@@ -692,22 +694,18 @@ impl super::Parser<'_> {
     /// Grammar: `annotation ::= ( reifier | annotationBlock )*`
     /// v1 narrowing: at most one reifier and one block, any order.
     /// Returns `Ok(None)` when no tail is present.
-    fn parse_annotation_tail(&mut self, object: &ObjectTerm) -> Option<Option<Annotation>> {
+    ///
+    /// Literal-valued objects are accepted: the constraint-preserving
+    /// lowering path (`lower_object_with_constraint`) pins the literal's
+    /// datatype / language tag onto the synthesized `TriplePattern.dtc`
+    /// so reified base-edge object positions match exactly. Without
+    /// `dtc`, same-lexical literals with different datatypes (or
+    /// languages) would cross-match annotations on each other.
+    fn parse_annotation_tail(&mut self) -> Option<Option<Annotation>> {
         let starts_tail = self.stream.check(&TokenKind::Tilde)
             || self.stream.check(&TokenKind::AnnotationOpen);
         if !starts_tail {
             return Some(None);
-        }
-
-        // v1: annotations on literal-valued objects are deferred per the
-        // design doc. Reject before consuming the tail so the diagnostic
-        // points at the first tail token.
-        if matches!(object, Term::Literal(_)) {
-            self.stream.error_at_current(
-                "annotations on literal-valued triples are deferred in v1; only \
-                 IRI/blank/variable-valued objects may carry an annotation tail",
-            );
-            return None;
         }
 
         let start = self.stream.current_span();
@@ -985,7 +983,7 @@ impl super::Parser<'_> {
                 }
 
                 let object = self.parse_object()?;
-                let annotation = self.parse_annotation_tail(&object)?;
+                let annotation = self.parse_annotation_tail()?;
                 let mut span = subject.span().union(predicate.span()).union(object.span());
                 if let Some(ann) = &annotation {
                     span = span.union(ann.span);

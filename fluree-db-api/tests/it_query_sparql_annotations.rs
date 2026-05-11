@@ -549,3 +549,131 @@ async fn sparql_annotation_query_returns_zero_for_unmatched_metadata() {
         "no matching annotation → zero rows: {bindings:#?}"
     );
 }
+
+// =====================================================================
+// Literal-object annotation parity (RDF 1.2)
+// =====================================================================
+
+/// SPARQL parity for a plain-string annotated literal. The SPARQL
+/// surface uses Turtle-star-style `{| ... |}` after the literal; the
+/// lowering attaches `Explicit(xsd:string)` to the base edge's dtc.
+#[tokio::test]
+async fn sparql_annotation_on_plain_string_literal_returns_source() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger_id = "it/sparql-ann-lit/plain";
+    let ledger0 = genesis_ledger(&fluree, ledger_id);
+    let txn = json!({
+        "@context": ctx(),
+        "@id": "ex:alice",
+        "ex:name": {
+            "@value": "Alice",
+            "@annotation": { "ex:source": "hr" }
+        }
+    });
+    let r1 = fluree.insert(ledger0, &txn).await.expect("seed");
+
+    let sparql = r#"
+        PREFIX ex: <http://example.org/>
+        SELECT ?source WHERE {
+          ex:alice ex:name "Alice" {| ex:source ?source |} .
+        }
+    "#;
+    let result = support::query_sparql(&fluree, &r1.ledger, sparql)
+        .await
+        .expect("sparql annotated plain-literal query");
+    let bindings = result
+        .to_sparql_json(&r1.ledger.snapshot)
+        .expect("sparql json")["results"]["bindings"]
+        .as_array()
+        .cloned()
+        .expect("bindings");
+    assert_eq!(bindings.len(), 1, "one annotation → one row: {bindings:#?}");
+    assert_eq!(bindings[0]["source"]["value"].as_str(), Some("hr"));
+}
+
+/// SPARQL parity for a language-tagged annotated literal. The lowering
+/// attaches `LangTag("fr")` to the base edge's dtc so the f:reifiesObject
+/// lookup constrains on language.
+#[tokio::test]
+async fn sparql_annotation_on_lang_tagged_literal_returns_source() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger_id = "it/sparql-ann-lit/lang";
+    let ledger0 = genesis_ledger(&fluree, ledger_id);
+    let txn = json!({
+        "@context": ctx(),
+        "@id": "ex:alice",
+        "ex:label": {
+            "@value": "chat",
+            "@language": "fr",
+            "@annotation": { "ex:source": "lexicon" }
+        }
+    });
+    let r1 = fluree.insert(ledger0, &txn).await.expect("seed");
+
+    let sparql = r#"
+        PREFIX ex: <http://example.org/>
+        SELECT ?source WHERE {
+          ex:alice ex:label "chat"@fr {| ex:source ?source |} .
+        }
+    "#;
+    let result = support::query_sparql(&fluree, &r1.ledger, sparql)
+        .await
+        .expect("sparql annotated lang-literal query");
+    let bindings = result
+        .to_sparql_json(&r1.ledger.snapshot)
+        .expect("sparql json")["results"]["bindings"]
+        .as_array()
+        .cloned()
+        .expect("bindings");
+    assert_eq!(bindings.len(), 1);
+    assert_eq!(bindings[0]["source"]["value"].as_str(), Some("lexicon"));
+}
+
+/// Wrong-language SPARQL queries miss the annotation. With an `@fr`
+/// annotation in place, querying for `"chat"@en` must return zero
+/// rows — the synthesized `f:reifiesObject` lookup's `LangTag` dtc
+/// blocks the cross-language match.
+///
+/// (A two-language-coexistence regression would also be valuable but
+/// is out of scope here: Fluree's insert path for same-lexical literals
+/// across language tags has separate behavior tracked elsewhere.
+/// Lower-layer coverage for the dtc propagation lives in
+/// `fluree-db-sparql` `m43_annotated_lang_tagged_literal_object_carries_lang_dtc`
+/// and `fluree-db-query`
+/// `expand_edge_annotation_propagates_lang_tag_dtc_to_reifies_object`.)
+#[tokio::test]
+async fn sparql_annotation_lang_tag_blocks_wrong_language_match() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger_id = "it/sparql-ann-lit/lang-no-cross";
+    let ledger0 = genesis_ledger(&fluree, ledger_id);
+    let txn = json!({
+        "@context": ctx(),
+        "@id": "ex:alice",
+        "ex:label": {
+            "@value": "chat",
+            "@language": "fr",
+            "@annotation": { "ex:source": "fr-lexicon" }
+        }
+    });
+    let r1 = fluree.insert(ledger0, &txn).await.expect("seed fr");
+
+    let sparql_en = r#"
+        PREFIX ex: <http://example.org/>
+        SELECT ?source WHERE {
+          ex:alice ex:label "chat"@en {| ex:source ?source |} .
+        }
+    "#;
+    let result = support::query_sparql(&fluree, &r1.ledger, sparql_en)
+        .await
+        .expect("sparql wrong-lang query");
+    let bindings = result
+        .to_sparql_json(&r1.ledger.snapshot)
+        .expect("sparql json")["results"]["bindings"]
+        .as_array()
+        .cloned()
+        .expect("bindings");
+    assert!(
+        bindings.is_empty(),
+        "@en query against an @fr-only ledger must return zero rows: {bindings:#?}"
+    );
+}

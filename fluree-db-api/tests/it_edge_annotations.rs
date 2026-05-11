@@ -3289,6 +3289,180 @@ async fn delete_by_id_retracts_literal_annotation_bundle() {
     );
 }
 
+/// Hydration: wildcard subject expansion on a subject whose literal
+/// edge carries an annotation must surface the annotation under
+/// `@annotation`, with the literal promoted to JSON-LD value-object
+/// form so it can carry the sibling key.
+#[tokio::test]
+async fn subject_expansion_promotes_annotated_literal_to_value_object() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger_id = "it-edge-annotations-literal-hydrate-plain";
+    let ledger0 = genesis_ledger(&fluree, ledger_id);
+
+    let insert = json!({
+        "@context": ctx(),
+        "@id": "ex:alice",
+        "ex:name": {
+            "@value": "Alice",
+            "@annotation": { "@id": "ex:ann-hr", "ex:source": "hr" }
+        }
+    });
+    let r1 = fluree.insert(ledger0, &insert).await.expect("insert");
+
+    let q = json!({
+        "@context": ctx(),
+        "select": { "?s": ["*"] },
+        "where": { "@id": "?s", "ex:name": "?n" }
+    });
+    let result = support::query_jsonld_formatted(&fluree, &r1.ledger, &q)
+        .await
+        .expect("subject expansion");
+
+    // Locate the alice node in the formatted result.
+    let arr = result.as_array().expect("result is array");
+    let alice = arr
+        .iter()
+        .find(|v| {
+            v.get("@id")
+                .and_then(|x| x.as_str())
+                .map(|s| s == "ex:alice" || s == "http://example.org/alice")
+                .unwrap_or(false)
+        })
+        .expect("alice node");
+    let name_val = alice
+        .get("ex:name")
+        .or_else(|| alice.get("http://example.org/name"))
+        .expect("ex:name present");
+
+    // ex:name must be in value-object form (since it carries an annotation).
+    let obj = name_val.as_object().unwrap_or_else(|| {
+        panic!("annotated literal must hydrate as a value-object, got {name_val:#?}")
+    });
+    assert_eq!(obj.get("@value"), Some(&json!("Alice")));
+    let ann = obj
+        .get("@annotation")
+        .expect("@annotation key must be present");
+    let ann_obj = ann.as_object().expect("single annotation → bare object");
+    assert_eq!(
+        ann_obj
+            .get("ex:source")
+            .or_else(|| ann_obj.get("http://example.org/source")),
+        Some(&json!("hr"))
+    );
+}
+
+/// Regression: a virtual literal projection that selects only `@type`
+/// on an annotated literal must produce a well-formed value-object —
+/// the renderer forces `@value` inclusion when annotations are present
+/// so promotion doesn't wrap the projection skeleton as if it were a
+/// JSON payload.
+#[tokio::test]
+async fn subject_expansion_virtual_projection_on_annotated_literal_includes_value() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger_id = "it-edge-annotations-virtual-projection";
+    let ledger0 = genesis_ledger(&fluree, ledger_id);
+
+    let insert = json!({
+        "@context": ctx(),
+        "@id": "ex:alice",
+        "ex:joinedAt": {
+            "@value": "2024-01-01",
+            "@type": "xsd:date",
+            "@annotation": { "ex:source": "hr" }
+        }
+    });
+    let r1 = fluree.insert(ledger0, &insert).await.expect("insert");
+
+    // Subject expansion with a virtual literal projection on
+    // `ex:joinedAt` that picks ONLY `@type` (no `@value`).
+    let q = json!({
+        "@context": ctx(),
+        "select": { "?s": ["@id", { "ex:joinedAt": ["@type"] }] },
+        "where": { "@id": "?s", "ex:joinedAt": "?j" }
+    });
+    let result = support::query_jsonld_formatted(&fluree, &r1.ledger, &q)
+        .await
+        .expect("subject expansion with virtual projection");
+
+    let arr = result.as_array().expect("result array");
+    let alice = arr
+        .iter()
+        .find(|v| {
+            v.get("@id")
+                .and_then(|x| x.as_str())
+                .map(|s| s == "ex:alice" || s == "http://example.org/alice")
+                .unwrap_or(false)
+        })
+        .expect("alice node");
+    let joined = alice
+        .get("ex:joinedAt")
+        .or_else(|| alice.get("http://example.org/joinedAt"))
+        .expect("ex:joinedAt present");
+    let obj = joined.as_object().expect("value-object form");
+
+    // The base contract: `@type` is present (the projection asked for
+    // it), `@value` is present (forced because of the annotation),
+    // and `@annotation` is attached. Crucially, `@value` must be the
+    // actual literal value — NOT a wrapped projection skeleton like
+    // `{"@value": {"@type": "..."}}` which would be the bug.
+    assert_eq!(obj.get("@value"), Some(&json!("2024-01-01")));
+    assert_eq!(obj.get("@type"), Some(&json!("xsd:date")));
+    assert!(obj.contains_key("@annotation"));
+}
+
+/// Same as above for a language-tagged literal. The promoted value-
+/// object must preserve `@language` (the typed-literal renderer
+/// already produces value-object form for language-tagged strings, so
+/// the promotion helper's "already value-object, no rewrap" branch
+/// fires).
+#[tokio::test]
+async fn subject_expansion_promotes_annotated_lang_tagged_literal() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger_id = "it-edge-annotations-literal-hydrate-lang";
+    let ledger0 = genesis_ledger(&fluree, ledger_id);
+
+    let insert = json!({
+        "@context": ctx(),
+        "@id": "ex:alice",
+        "ex:label": {
+            "@value": "chat",
+            "@language": "fr",
+            "@annotation": { "@id": "ex:ann-fr", "ex:source": "lexicon" }
+        }
+    });
+    let r1 = fluree.insert(ledger0, &insert).await.expect("insert");
+
+    let q = json!({
+        "@context": ctx(),
+        "select": { "?s": ["*"] },
+        "where": { "@id": "?s", "ex:label": "?l" }
+    });
+    let result = support::query_jsonld_formatted(&fluree, &r1.ledger, &q)
+        .await
+        .expect("subject expansion");
+
+    let arr = result.as_array().expect("result is array");
+    let alice = arr
+        .iter()
+        .find(|v| {
+            v.get("@id")
+                .and_then(|x| x.as_str())
+                .map(|s| s == "ex:alice" || s == "http://example.org/alice")
+                .unwrap_or(false)
+        })
+        .expect("alice node");
+    let label_val = alice
+        .get("ex:label")
+        .or_else(|| alice.get("http://example.org/label"))
+        .expect("ex:label present");
+    let obj = label_val.as_object().unwrap_or_else(|| {
+        panic!("annotated lang literal must hydrate as a value-object, got {label_val:#?}")
+    });
+    assert_eq!(obj.get("@value"), Some(&json!("chat")));
+    assert_eq!(obj.get("@language"), Some(&json!("fr")));
+    assert!(obj.contains_key("@annotation"));
+}
+
 /// Selector-form delete: retract the annotation matching a selector
 /// body without specifying its @id. Exercises the new shape-aware
 /// WHERE template generation that emits `f:reifiesObject` as a literal

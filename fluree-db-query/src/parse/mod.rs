@@ -4129,10 +4129,11 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_rejects_literal_value_object_with_annotation() {
-        // Literal-valued annotations are deferred. A value object with
-        // @value alongside @annotation must error explicitly rather
-        // than silently dropping the annotation.
+    fn test_parse_lowers_literal_value_object_with_annotation_to_edge_annotation() {
+        // RDF 1.2: literal-valued objects may carry `@annotation`. The
+        // parser routes through `parse_literal_edge_annotation` and
+        // emits a `Pattern::EdgeAnnotation` with the base edge's
+        // `dtc` set so the scan matches the literal by exact datatype.
         let json = json!({
             "@context": {
                 "ex": "http://example.org/",
@@ -4149,17 +4150,78 @@ mod tests {
             }
         });
 
+        let (ast, _) = parse_query_ast(&json, None).unwrap();
+        match &ast.patterns[0] {
+            UnresolvedPattern::EdgeAnnotation { edge, body, .. } => {
+                assert!(
+                    edge.dtc.is_some(),
+                    "literal base edge must carry a dtc; got {:?}",
+                    edge.dtc
+                );
+                assert_eq!(body.len(), 1, "one annotation body entry");
+            }
+            other => panic!("expected UnresolvedPattern::EdgeAnnotation, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_parse_rejects_stray_property_on_annotated_literal_value_object() {
+        // Mirror of the ref-object path's "extra property alongside
+        // @annotation is deferred" rejection. Without this, the stray
+        // `ex:other` would be silently dropped by parse_value_object.
+        let json = json!({
+            "@context": { "ex": "http://example.org/" },
+            "select": ["?x"],
+            "where": {
+                "@id": "?s",
+                "ex:name": {
+                    "@value": "Alice",
+                    "ex:other": "?x",
+                    "@annotation": { "ex:source": "hr" }
+                }
+            }
+        });
         let err = parse_query_ast(&json, None).unwrap_err();
         let msg = err.to_string();
         assert!(
-            msg.contains("@annotation") && msg.contains("deferred"),
-            "error should explain literal-value annotation deferral: {msg}"
+            msg.contains("extra property 'ex:other'") && msg.contains("literal value object"),
+            "expected literal stray-key deferral, got: {msg}"
         );
     }
 
     #[test]
-    fn test_parse_rejects_literal_value_object_with_edge_alias() {
-        // Same coverage for the @edge alias.
+    fn test_parse_rejects_metadata_bindings_combined_with_literal_annotation() {
+        // `@type: "?dt"` and `@annotation` in the same value object is
+        // an unsupported combination — the BIND for ?dt would need to
+        // sit inside the EdgeAnnotation's base-edge slot, which has
+        // no shape for it. Reject explicitly so the user splits the
+        // metadata binding into a separate triple.
+        let json = json!({
+            "@context": {
+                "ex": "http://example.org/",
+                "xsd": "http://www.w3.org/2001/XMLSchema#"
+            },
+            "select": ["?since", "?dt"],
+            "where": {
+                "@id": "?person",
+                "ex:joinedAt": {
+                    "@value": "?since",
+                    "@type": "?dt",
+                    "@annotation": { "ex:source": "?source" }
+                }
+            }
+        });
+        let err = parse_query_ast(&json, None).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("metadata-binding extensions"),
+            "expected metadata-binding deferral, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_parse_lowers_literal_value_object_with_edge_alias_to_edge_annotation() {
+        // Same path via the `@edge` alias keyword.
         let json = json!({
             "@context": { "ex": "http://example.org/" },
             "select": ["?val"],
@@ -4172,8 +4234,11 @@ mod tests {
             }
         });
 
-        let err = parse_query_ast(&json, None).unwrap_err();
-        assert!(err.to_string().contains("@edge"));
+        let (ast, _) = parse_query_ast(&json, None).unwrap();
+        assert!(matches!(
+            ast.patterns[0],
+            UnresolvedPattern::EdgeAnnotation { .. }
+        ));
     }
 
     #[test]

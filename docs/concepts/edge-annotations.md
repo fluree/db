@@ -76,6 +76,46 @@ You can give the annotation an IRI when you need stable identity — for updates
 
 Two inserts that target the same explicit `@id` reattach to the same annotation subject — idempotent. Two inserts with no explicit `@id` mint two distinct annotations on the same edge (see *Parallel annotations* below).
 
+### Annotating literal-valued edges
+
+RDF 1.2 permits annotations on triples whose object is a literal — `:alice :name "Alice" {| :source :hr |}` in Turtle-star, equivalently:
+
+```json
+{
+  "@id": "ex:alice",
+  "ex:name": {
+    "@value": "Alice",
+    "@annotation": { "ex:source": "ex:hr-system" }
+  }
+}
+```
+
+Because JSON scalars can't carry sibling metadata, an annotated literal **must** be written as a JSON-LD value object — the expanded form with `@value`. The same applies to typed and language-tagged literals:
+
+```json
+{
+  "@id": "ex:alice",
+  "ex:joinedAt": {
+    "@value": "2024-01-01",
+    "@type": "xsd:date",
+    "@annotation": { "ex:source": "ex:hr-system" }
+  },
+  "ex:label": {
+    "@value": "chat",
+    "@language": "fr",
+    "@annotation": { "ex:source": "ex:lexicon" }
+  }
+}
+```
+
+A few rules that keep the annotation's identity in sync with the base flake:
+
+- **The value object must carry its `@type` / `@language` explicitly when the predicate's `@context` would otherwise coerce them.** When `@annotation` is present, the lowering pass rejects two coercion paths that the JSON-LD value-object expander applies: a term-level `@type` on the predicate's context entry, and a default `@language` on the active context. (Per-term `@language` overrides are intentionally ignored, mirroring the value-object expander's own behavior — it reads `context.language` directly, not the per-term entry.) The non-annotated form continues to use context coercion normally; this stricter rule applies only to annotated literals so the reified `f:reifies*` bundle's `EdgeKey` cannot silently diverge from the base flake's.
+- **Language-tagged literals are language-pinned.** Two annotations on `"chat"@fr` and `"chat"@en` are independent; selector-form retracts and hydration both match on language.
+- **Hydration promotes annotated literals to value-object form.** A subject expansion (`select: {"?s": ["*"]}`) renders unannotated `ex:name "Alice"` as the scalar `"Alice"`, but renders the annotated form as `{"@value": "Alice", "@annotation": {...}}` so the annotation has somewhere to attach.
+
+The deferred shapes from "Current limits" below (list occurrences, multi-triple reifiers, triple terms as object values) still apply on the literal path.
+
 ### Querying inline: edge first, metadata second
 
 The query shape mirrors the insert shape. Match the base edge, then constrain or project annotation metadata.
@@ -403,7 +443,6 @@ This binds `?t` to the transaction time and `?op` to the assert/retract flag of 
 
 Today's surface covers the common LPG / RDF-star use cases. The following are not yet supported and produce a clear validation error rather than silent partial behavior:
 
-- **Annotations on literal-valued objects.** `@annotation` is only valid on `@id`-valued objects (asserted relationship triples). Annotating a string or number is rare in practice and has tricky datatype/language semantics that are still being worked out.
 - **Annotations on list-occurrence triples.** `@list` membership is in scope as a future extension; the on-disk format already reserves space for it. Today, annotating a list element is rejected at parse time.
 - **Reifiers for unasserted triples.** `@reifies` must point at an asserted edge. Pure-proposition reification (claims about triples that are not in the graph) is deferred.
 - **Reifiers for multiple triples.** One annotation subject corresponds to one edge. Reifying several unrelated triples from a single annotation isn't allowed.

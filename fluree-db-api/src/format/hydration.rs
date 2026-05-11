@@ -720,13 +720,43 @@ impl<'a> HydrationFormatter<'a> {
                     }
                 }
                 _ => {
-                    // Literal value
-                    if let Some(nested) = pred_ctx.explicit_sub_spec {
-                        values.push(self.format_literal_virtual(flake, nested)?);
+                    // Literal value. Probe annotations first so the
+                    // virtual literal renderer can force `@value`
+                    // inclusion when an annotation must attach — a
+                    // virtual projection like `{"ex:p": ["@type"]}`
+                    // would otherwise return `{"@type": "..."}` with
+                    // no `@value`, which would be structurally
+                    // indistinguishable from an `@json` payload at
+                    // promotion time. Probing first lets the renderer
+                    // produce a fully-shaped value-object that
+                    // promotion can accept without rewrapping.
+                    let bodies = self
+                        .lookup_annotation_bodies(flake, depth, visited, cache)
+                        .await?;
+                    let has_annotations = !bodies.is_empty();
+
+                    let rendered = if let Some(nested) = pred_ctx.explicit_sub_spec {
+                        self.format_literal_virtual(flake, nested, has_annotations)?
                     } else if self.typed {
-                        values.push(self.format_typed_literal_value(flake)?);
+                        self.format_typed_literal_value(flake)?
                     } else {
-                        values.push(self.format_literal_value(flake)?);
+                        self.format_literal_value(flake)?
+                    };
+
+                    if !has_annotations {
+                        values.push(rendered);
+                    } else {
+                        let mut promoted = self
+                            .promote_literal_to_value_object_for_annotation(flake, rendered)?;
+                        if let Some(obj) = promoted.as_object_mut() {
+                            let ann_json = if bodies.len() == 1 {
+                                bodies.into_iter().next().unwrap()
+                            } else {
+                                JsonValue::Array(bodies)
+                            };
+                            obj.insert("@annotation".to_string(), ann_json);
+                        }
+                        values.push(promoted);
                     }
                 }
             }
@@ -767,6 +797,41 @@ impl<'a> HydrationFormatter<'a> {
         visited: &'b mut HashSet<Sid>,
         cache: &'b mut HashMap<CacheKey, JsonValue>,
     ) -> Result<()> {
+        let bodies = self
+            .lookup_annotation_bodies(flake, depth, visited, cache)
+            .await?;
+        if bodies.is_empty() {
+            return Ok(());
+        }
+        // The injection target must be a JSON object — caller (Ref
+        // arm or post-promotion literal arm) guarantees that.
+        let Some(obj) = value.as_object_mut() else {
+            return Ok(());
+        };
+        let ann_json = if bodies.len() == 1 {
+            bodies.into_iter().next().unwrap()
+        } else {
+            JsonValue::Array(bodies)
+        };
+        obj.insert("@annotation".to_string(), ann_json);
+        Ok(())
+    }
+
+    /// Look up the rendered annotation bodies attached to `flake`'s
+    /// base edge. Returns an empty vec when the ledger has no
+    /// annotations or when the edge has none.
+    ///
+    /// Used as the probe step by both the Ref arm (via
+    /// `inject_annotations`) and the literal arm (which needs to
+    /// decide whether to promote a scalar render to a value-object
+    /// shape before injecting).
+    async fn lookup_annotation_bodies<'b>(
+        &'b self,
+        flake: &'b Flake,
+        depth: DepthBudget,
+        visited: &'b mut HashSet<Sid>,
+        cache: &'b mut HashMap<CacheKey, JsonValue>,
+    ) -> Result<Vec<JsonValue>> {
         // Zero-cost gate for non-annotation ledgers — mirrors the
         // cascade fast-path in `fluree_db_transact::stage` so a
         // hydration query like `select: {"?s": ["*"]}` doesn't pay
@@ -795,18 +860,17 @@ impl<'a> HydrationFormatter<'a> {
                 .downcast_ref::<fluree_db_novelty::Novelty>()
                 .map(|n| !n.attachments.has_annotations());
             if matches!(novelty_clean, Some(true)) {
-                return Ok(());
+                return Ok(Vec::new());
             }
         }
 
-        // Find the EdgeKey from the base flake.
         let edge_key = fluree_db_core::edge::EdgeKey::from_flake(flake);
 
-        // Span the annotation injection work — skipped on the
-        // zero-cost gate path above so non-annotation ledgers don't
-        // pay any tracing cost. `path` field captures which
-        // resolution route fired (arena vs scan) for query-debug
-        // forensics.
+        // Span name preserved across the refactor (was emitted by the
+        // pre-refactor `inject_annotations`). External tooling
+        // (`.claude/skills/trace-*`, `docs/operations/telemetry.md`)
+        // tracks this span — see CLAUDE.md "When adding or renaming
+        // spans".
         use tracing::Instrument;
         let span = tracing::debug_span!(
             "inject_annotations",
@@ -815,100 +879,114 @@ impl<'a> HydrationFormatter<'a> {
             annotation_count = tracing::field::Empty,
         );
         async {
-        // Arena-backed fast path: when the formatter holds a cached
-        // arena reader (constructed in `new()` from the snapshot's
-        // annotation_index + content_store), look up live annotation
-        // SIDs directly via the merged reader. The novelty events
-        // come from the overlay (downcast to the concrete `Novelty`
-        // type since `AttachmentNovelty` is its sidecar). On any
-        // precondition mismatch we fall through to the M2a scan path
-        // below.
-        if self.arena_reader.is_some() {
-            if let Some(ann_sids) = self.arena_lookup_annotations(&edge_key).await? {
-                tracing::Span::current().record("path", "arena");
-                tracing::Span::current().record("annotation_count", ann_sids.len());
-                if ann_sids.is_empty() {
-                    return Ok(());
+            // Arena-backed fast path.
+            if self.arena_reader.is_some() {
+                if let Some(ann_sids) = self.arena_lookup_annotations(&edge_key).await? {
+                    tracing::Span::current().record("path", "arena");
+                    tracing::Span::current().record("annotation_count", ann_sids.len());
+                    if ann_sids.is_empty() {
+                        return Ok(Vec::new());
+                    }
+                    return self
+                        .render_annotation_bodies(&ann_sids, depth, visited, cache)
+                        .await;
                 }
-                return self
-                    .inject_annotation_bodies(value, &ann_sids, depth, visited, cache)
-                    .await;
             }
+            tracing::Span::current().record("path", "scan");
+
+            // Scan fallback: POST(f:reifiesSubject, edge.s) → candidate
+            // annotations whose subject points at our base subject. Each
+            // candidate's bundle is decoded and compared against the
+            // base flake's EdgeKey (full structural equality including
+            // `lang` and `dt`) before its body is formatted.
+            let f_reifies_subject = Sid::new(FLUREE_DB, fluree_vocab::db::REIFIES_SUBJECT);
+            let candidate_flakes = self
+                .db
+                .range(
+                    IndexType::Post,
+                    RangeTest::Eq,
+                    RangeMatch::predicate_object(
+                        f_reifies_subject,
+                        FlakeValue::Ref(edge_key.s.clone()),
+                    ),
+                )
+                .await
+                .map_err(|e| {
+                    FormatError::InvalidBinding(format!(
+                        "annotation lookup (f:reifiesSubject scan) failed: {e}"
+                    ))
+                })?;
+
+            if candidate_flakes.is_empty() {
+                return Ok(Vec::new());
+            }
+
+            let mut bodies: Vec<JsonValue> = Vec::new();
+            let ann_level = NestedSelectSpec::Wildcard {
+                refinements: HashMap::new(),
+                reverse: HashMap::new(),
+            };
+            let mut seen: HashSet<Sid> = HashSet::new();
+
+            for cand in &candidate_flakes {
+                let ann_sid = &cand.s;
+                if !seen.insert(ann_sid.clone()) {
+                    continue;
+                }
+
+                let bundle: Vec<Flake> = self
+                    .fetch_subject_properties(ann_sid)
+                    .await?
+                    .into_iter()
+                    .filter(|f| fluree_db_core::is_reserved_reifies_predicate(&f.p))
+                    .collect();
+                if bundle.is_empty() {
+                    continue;
+                }
+
+                let cand_edge = match fluree_db_core::edge::EdgeKey::from_reifies_facts(&bundle) {
+                    Ok(k) => k,
+                    Err(_) => continue,
+                };
+                if cand_edge != edge_key {
+                    continue;
+                }
+
+                let mut body = self
+                    .format_subject(ann_sid, &ann_level, depth.descend(), visited, cache)
+                    .await?;
+                if ann_sid.namespace_code == BLANK_NODE {
+                    if let Some(map) = body.as_object_mut() {
+                        map.remove("@id");
+                    }
+                }
+                bodies.push(body);
+            }
+
+            tracing::Span::current().record("annotation_count", bodies.len());
+            Ok(bodies)
         }
-        tracing::Span::current().record("path", "scan");
+        .instrument(span)
+        .await
+    }
 
-        // Scan candidate annotations via the base-edge subject:
-        // POST(f:reifiesSubject, FlakeValue::Ref(edge.s)) gives all
-        // annotations whose `f:reifiesSubject` points at this
-        // subject. The flake's `s` is the candidate annotation Sid.
-        let f_reifies_subject = Sid::new(FLUREE_DB, fluree_vocab::db::REIFIES_SUBJECT);
-        let candidate_flakes = self
-            .db
-            .range(
-                IndexType::Post,
-                RangeTest::Eq,
-                RangeMatch::predicate_object(
-                    f_reifies_subject,
-                    FlakeValue::Ref(edge_key.s.clone()),
-                ),
-            )
-            .await
-            .map_err(|e| {
-                FormatError::InvalidBinding(format!(
-                    "annotation lookup (f:reifiesSubject scan) failed: {e}"
-                ))
-            })?;
-
-        if candidate_flakes.is_empty() {
-            return Ok(());
-        }
-
-        // Verify each candidate's full bundle matches the base
-        // edge. A candidate `ann_sid` is valid iff the bundle of
-        // its `f:reifies*` flakes decodes to an `EdgeKey` equal to
-        // ours. The verification is per-candidate but the candidate
-        // set is bounded by "annotations on this subject" which is
-        // typically small.
-        let mut bodies: Vec<JsonValue> = Vec::new();
+    /// Render the annotation bodies for a list of resolved annotation
+    /// SIDs (arena-fast-path output). Shared with the scan fallback's
+    /// body-rendering loop above through the same wildcard select
+    /// spec.
+    async fn render_annotation_bodies<'b>(
+        &'b self,
+        ann_sids: &[Sid],
+        depth: DepthBudget,
+        visited: &'b mut HashSet<Sid>,
+        cache: &'b mut HashMap<CacheKey, JsonValue>,
+    ) -> Result<Vec<JsonValue>> {
         let ann_level = NestedSelectSpec::Wildcard {
             refinements: HashMap::new(),
             reverse: HashMap::new(),
         };
-        let mut seen: HashSet<Sid> = HashSet::new();
-
-        for cand in &candidate_flakes {
-            let ann_sid = &cand.s;
-            // Each candidate appears once per matching `f:reifiesSubject`
-            // flake — dedupe in case of replay anomalies.
-            if !seen.insert(ann_sid.clone()) {
-                continue;
-            }
-
-            let bundle: Vec<Flake> = self
-                .fetch_subject_properties(ann_sid)
-                .await?
-                .into_iter()
-                .filter(|f| fluree_db_core::is_reserved_reifies_predicate(&f.p))
-                .collect();
-            if bundle.is_empty() {
-                continue;
-            }
-
-            // Decode to an EdgeKey and compare. A mismatch (different
-            // predicate, different object, different graph, etc.)
-            // means this candidate reifies a different edge that
-            // happens to share the subject.
-            let cand_edge = match fluree_db_core::edge::EdgeKey::from_reifies_facts(&bundle) {
-                Ok(k) => k,
-                Err(_) => continue, // malformed; skip
-            };
-            if cand_edge != edge_key {
-                continue;
-            }
-
-            // Recursively format the annotation body. The wildcard
-            // hydration filter strips `f:reifies*` so this produces
-            // a clean user-property view.
+        let mut bodies: Vec<JsonValue> = Vec::with_capacity(ann_sids.len());
+        for ann_sid in ann_sids {
             let mut body = self
                 .format_subject(ann_sid, &ann_level, depth.descend(), visited, cache)
                 .await?;
@@ -919,28 +997,48 @@ impl<'a> HydrationFormatter<'a> {
             }
             bodies.push(body);
         }
+        Ok(bodies)
+    }
 
-        tracing::Span::current().record("annotation_count", bodies.len());
-        if bodies.is_empty() {
-            return Ok(());
+    /// Promote a rendered literal into JSON-LD value-object form so
+    /// it can carry `@annotation` as a sibling key.
+    ///
+    /// Rules:
+    /// - If `current` is already a JSON object that contains `@value`,
+    ///   it's already a value-object — return as is. (Includes the
+    ///   typed-literal renderer's `{"@value": ..., "@type": ...}`
+    ///   output and the language-tagged form.)
+    /// - Otherwise wrap: `{"@value": <current>}` plus `@language` (when
+    ///   the flake carries `flake.m.lang`) or `@type` (when the
+    ///   datatype is not inferable from the JSON scalar type).
+    ///
+    /// Critically, `@json` literals rendered as plain JSON objects
+    /// (no `@value` key) take the wrap branch — we never inject
+    /// `@annotation` into the payload of an `@json` literal.
+    fn promote_literal_to_value_object_for_annotation(
+        &self,
+        flake: &Flake,
+        current: JsonValue,
+    ) -> Result<JsonValue> {
+        if let JsonValue::Object(obj) = &current {
+            if obj.contains_key("@value") {
+                return Ok(current);
+            }
         }
-
-        // The injection target must be a JSON object.
-        let Some(obj) = value.as_object_mut() else {
-            return Ok(());
-        };
-
-        // One annotation → bare object; many → array.
-        let ann_json = if bodies.len() == 1 {
-            bodies.into_iter().next().unwrap()
-        } else {
-            JsonValue::Array(bodies)
-        };
-        obj.insert("@annotation".to_string(), ann_json);
-        Ok(())
+        let mut wrapper = serde_json::Map::new();
+        wrapper.insert("@value".to_string(), current);
+        if let Some(ref meta) = flake.m {
+            if let Some(ref lang) = meta.lang {
+                wrapper.insert("@language".to_string(), json!(lang));
+                return Ok(JsonValue::Object(wrapper));
+            }
         }
-        .instrument(span)
-        .await
+        let dt_full = self.compactor.decode_sid(&flake.dt)?;
+        let dt_compact = self.compactor.compact_sid(&flake.dt)?;
+        if !is_inferable_datatype(&dt_full) {
+            wrapper.insert("@type".to_string(), json!(dt_compact));
+        }
+        Ok(JsonValue::Object(wrapper))
     }
 
     /// Returns `true` iff `sid` is a currently-asserted annotation
@@ -1039,48 +1137,6 @@ impl<'a> HydrationFormatter<'a> {
         }
         .instrument(span)
         .await
-    }
-
-    /// Format the bodies for a list of annotation SIDs and inject
-    /// them as `@annotation` on `value`. Shared between the arena and
-    /// scan paths.
-    async fn inject_annotation_bodies<'b>(
-        &'b self,
-        value: &mut JsonValue,
-        ann_sids: &[Sid],
-        depth: DepthBudget,
-        visited: &'b mut HashSet<Sid>,
-        cache: &'b mut HashMap<CacheKey, JsonValue>,
-    ) -> Result<()> {
-        let ann_level = NestedSelectSpec::Wildcard {
-            refinements: HashMap::new(),
-            reverse: HashMap::new(),
-        };
-        let mut bodies: Vec<JsonValue> = Vec::with_capacity(ann_sids.len());
-        for ann_sid in ann_sids {
-            let mut body = self
-                .format_subject(ann_sid, &ann_level, depth.descend(), visited, cache)
-                .await?;
-            if ann_sid.namespace_code == BLANK_NODE {
-                if let Some(map) = body.as_object_mut() {
-                    map.remove("@id");
-                }
-            }
-            bodies.push(body);
-        }
-        if bodies.is_empty() {
-            return Ok(());
-        }
-        let Some(obj) = value.as_object_mut() else {
-            return Ok(());
-        };
-        let ann_json = if bodies.len() == 1 {
-            bodies.into_iter().next().unwrap()
-        } else {
-            JsonValue::Array(bodies)
-        };
-        obj.insert("@annotation".to_string(), ann_json);
-        Ok(())
     }
 
     /// Format reverse property values
@@ -1348,8 +1404,13 @@ impl<'a> HydrationFormatter<'a> {
     /// Format a literal as a virtual node when explicitly selected.
     ///
     /// Supports `@value`, `@type`, and `@language` selection semantics.
-    fn format_literal_virtual(&self, flake: &Flake, spec: &NestedSelectSpec) -> Result<JsonValue> {
-        let mut want_value = false;
+    fn format_literal_virtual(
+        &self,
+        flake: &Flake,
+        spec: &NestedSelectSpec,
+        force_value: bool,
+    ) -> Result<JsonValue> {
+        let mut want_value = force_value;
         let mut want_type = false;
         let mut want_language = false;
 

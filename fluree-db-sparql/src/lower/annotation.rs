@@ -38,7 +38,16 @@ impl<E: IriEncoder> LoweringContext<'_, E> {
         tp: &SparqlTriplePattern,
         ann: &Annotation,
     ) -> Result<Pattern> {
-        let edge = self.lower_triple_pattern(tp)?;
+        // Use the constraint-preserving object lowering for the base
+        // edge so a literal object pins datatype / language onto
+        // `edge.dtc`. The where-plan expansion (`f:reifiesObject`
+        // synthesis) clones `edge.dtc` onto the synthesized lookup
+        // triple — without it, same-lexical literals with different
+        // datatypes (or languages) would cross-match annotations.
+        let s = self.lower_subject(&tp.subject)?;
+        let p = self.lower_predicate(&tp.predicate)?;
+        let (o, dtc) = self.lower_object_with_constraint(&tp.object)?;
+        let edge = IrTriplePattern { s, p, o, dtc };
         let annotation_ref = self.lower_reifier_id(ann.reifier.as_ref())?;
         let body = self.lower_annotation_block_body(&annotation_ref, ann.block.as_ref())?;
         Ok(Pattern::EdgeAnnotation {
@@ -104,6 +113,11 @@ impl<E: IriEncoder> LoweringContext<'_, E> {
 
     /// Lower the `{| pred obj ; pred obj |}` body to a flat list of
     /// `Pattern::Triple` patterns whose subject is the reifier.
+    ///
+    /// Each entry's object is lowered through
+    /// `lower_object_with_constraint` so literal objects pin the scan
+    /// to their exact datatype / language tag — same-lexical literals
+    /// with different datatypes (or languages) must not cross-match.
     fn lower_annotation_block_body(
         &mut self,
         annotation: &Ref,
@@ -115,12 +129,13 @@ impl<E: IriEncoder> LoweringContext<'_, E> {
         let mut out = Vec::with_capacity(block.entries.len());
         for entry in &block.entries {
             let p = self.lower_predicate(&entry.predicate)?;
-            let o = self.lower_object(&entry.object)?;
-            out.push(Pattern::Triple(IrTriplePattern::new(
-                annotation.clone(),
+            let (o, dtc) = self.lower_object_with_constraint(&entry.object)?;
+            out.push(Pattern::Triple(IrTriplePattern {
+                s: annotation.clone(),
                 p,
                 o,
-            )));
+                dtc,
+            }));
         }
         Ok(out)
     }
@@ -128,11 +143,15 @@ impl<E: IriEncoder> LoweringContext<'_, E> {
     /// Lower the inner `<<( s p o )>>` triple-term to an IR
     /// `TriplePattern`. The triple-term has no annotation tail and no
     /// nested triple terms (the parser already enforced both).
+    ///
+    /// Carries the same constraint-preserving object lowering as the
+    /// annotation-block body so reified base-edge object positions
+    /// match precisely.
     fn lower_triple_term(&mut self, term: &TripleTerm) -> Result<IrTriplePattern> {
         let s = self.lower_subject(&term.subject)?;
         let p = self.lower_predicate(&term.predicate)?;
-        let o = self.lower_object(&term.object)?;
-        Ok(IrTriplePattern::new(s, p, o))
+        let (o, dtc) = self.lower_object_with_constraint(&term.object)?;
+        Ok(IrTriplePattern { s, p, o, dtc })
     }
 }
 

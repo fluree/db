@@ -756,19 +756,29 @@ fn parse_property(
     // Handle value objects like {"@value": ..., "@type": ..., "@language": ..., "@t": ...} (typed literals in WHERE)
     if let JsonValue::Object(obj) = value {
         if obj.contains_key("@value") || obj.contains_key("@language") {
-            // Literal-valued annotations are deferred (v1). A value
-            // object that also carries `@annotation` / `@edge` would
-            // otherwise drop the annotation silently, since
-            // `parse_value_object` does not recognize those keys.
-            // Reject explicitly so users get a clear deferred-feature
-            // error instead.
-            for k in [ANNOTATION_KEY, EDGE_KEY] {
-                if obj.contains_key(k) {
-                    return Err(ParseError::InvalidWhere(format!(
-                        "{k} on a literal value object is deferred (v1); \
-                         annotations on literal-valued edges are not supported yet"
-                    )));
+            // Literal value-objects may now carry `@annotation` / `@edge`.
+            // Route those into the literal-edge-annotation lowering so
+            // the base edge's `dtc` is preserved and a
+            // `Pattern::EdgeAnnotation` is emitted instead of a plain
+            // triple. Reverse-direction literal annotations are still
+            // deferred (would place a literal in the subject slot).
+            let has_ann = obj.contains_key(ANNOTATION_KEY) || obj.contains_key(EDGE_KEY);
+            if has_ann {
+                if is_reverse {
+                    return Err(ParseError::InvalidWhere(
+                        "reverse-direction edge annotations on literal-valued objects are \
+                         deferred (v1); use the forward form"
+                            .to_string(),
+                    ));
                 }
+                return parse_literal_edge_annotation(
+                    subject,
+                    predicate,
+                    dt_iri.as_deref(),
+                    obj,
+                    query,
+                    ctx,
+                );
             }
             let parsed = parse_value_object(obj, ctx.ctx, ctx.object_var_parsing)?;
             let object = parsed.term;
@@ -1102,6 +1112,145 @@ fn parse_edge_annotation(
 
     // Body patterns: the annotation block's properties (other than
     // @id / @context). Annotation-of-annotation is deferred.
+    let body = parse_annotation_body(
+        ann_map,
+        &annotation,
+        ctx.ctx,
+        ctx.nested_counter,
+        ctx.object_var_parsing,
+        /* skip_keys */ &[],
+    )?;
+
+    query.patterns.push(UnresolvedPattern::EdgeAnnotation {
+        edge,
+        annotation,
+        body,
+    });
+    Ok(())
+}
+
+/// Lower a JSON-LD-star edge annotation attached to a literal value-
+/// object: `{"@value": ..., ?"@type": ..., ?"@language": ...,
+/// "@annotation": {...}}`.
+///
+/// Mirrors [`parse_edge_annotation`] but threads the literal through
+/// `parse_value_object` so the base edge carries an
+/// `UnresolvedDatatypeConstraint` derived from `@type` (explicit or
+/// context-coerced) or `@language`. Without that constraint,
+/// same-lexical literals of different datatypes (or languages) would
+/// cross-match annotations through the `f:reifiesObject` lookup.
+///
+/// The forward direction is the only shape accepted — a reverse-
+/// direction literal would put a literal in the subject slot of the
+/// reverse triple, which has no meaning in RDF.
+fn parse_literal_edge_annotation(
+    subject: &UnresolvedTerm,
+    predicate: UnresolvedTerm,
+    dt_iri: Option<&str>,
+    value_obj: &serde_json::Map<String, JsonValue>,
+    query: &mut UnresolvedQuery,
+    ctx: &mut PropertyParseContext<'_>,
+) -> Result<()> {
+    if value_obj.contains_key(ANNOTATION_KEY) && value_obj.contains_key(EDGE_KEY) {
+        return Err(ParseError::InvalidWhere(
+            "edge annotation: cannot specify both @annotation and @edge on the same object"
+                .to_string(),
+        ));
+    }
+
+    // Pull the annotation block out of a clone of the value object so
+    // `parse_value_object` doesn't see (and ignore) the annotation
+    // key. The remaining keys must be the canonical literal-shape set
+    // (`@value`, `@type`, `@language`, plus the existing metadata-bind
+    // extensions handled below the annotation path).
+    let mut stripped: serde_json::Map<String, JsonValue> = value_obj.clone();
+    let ann_block = stripped
+        .remove(ANNOTATION_KEY)
+        .or_else(|| stripped.remove(EDGE_KEY))
+        .ok_or_else(|| {
+            ParseError::InvalidWhere(
+                "literal edge annotation: caller guaranteed annotation key presence".to_string(),
+            )
+        })?;
+
+    // Whitelist the remaining keys to the canonical JSON-LD literal
+    // shape. `parse_value_object` is permissive — it recognizes
+    // known keys (`@value`, `@type`, `@language`, plus aliases) and
+    // silently ignores stray keys. The ref-object annotation path
+    // rejects extra properties alongside `@annotation` as a deferred
+    // shape; mirror that strictness here so a query like
+    // `{"@value": "Alice", "ex:other": "?x", "@annotation": ...}`
+    // doesn't appear to parse while dropping `ex:other`.
+    //
+    // The metadata-binding extensions (`@t`, `@op`, plus variable-
+    // valued `@type`/`@language`) are rejected separately after
+    // `parse_value_object` runs — they live outside the literal
+    // shape and need a different downstream rejection because they
+    // affect query semantics, not just structure.
+    for k in stripped.keys() {
+        let allowed = matches!(
+            k.as_str(),
+            "@value" | "value" | "@type" | "type" | "@language" | "language" | "@t" | "@op"
+        );
+        if !allowed {
+            return Err(ParseError::InvalidWhere(format!(
+                "edge annotation: extra property '{k}' alongside @annotation on a literal \
+                 value object is deferred (v1); express object-side facts in a separate triple"
+            )));
+        }
+    }
+
+    let parsed = parse_value_object(&stripped, ctx.ctx, ctx.object_var_parsing)?;
+
+    // The metadata-binding extensions (`@type: "?var"`, `@language:
+    // "?var"`, `@t`, `@op`) attach BIND / FILTER patterns alongside
+    // the literal in the non-annotation path. Combining them with
+    // `@annotation` would require routing both into a single
+    // `Pattern::EdgeAnnotation` while keeping the BIND/FILTER scoped
+    // to the base edge — a shape that hasn't been designed yet.
+    // Reject explicitly so users get a clear error rather than
+    // silently unbound metadata vars.
+    if parsed.dt_var.is_some()
+        || parsed.lang_var.is_some()
+        || parsed.t_var.is_some()
+        || parsed.op_var.is_some()
+    {
+        return Err(ParseError::InvalidWhere(
+            "edge annotation on a literal value object cannot also use metadata-binding \
+             extensions (@type / @language variables, @t, @op) in the same value object; \
+             split these into a separate triple"
+                .to_string(),
+        ));
+    }
+
+    let object = parsed.term;
+
+    // dtc precedence: the value object's parsed `@type`/`@language`
+    // wins; the predicate's context-level dt_iri is the fallback.
+    let pattern_dtc = parsed.dtc.or_else(|| {
+        dt_iri
+            .as_deref()
+            .map(|iri| UnresolvedDatatypeConstraint::Explicit(Arc::from(iri)))
+    });
+
+    let mut edge = UnresolvedTriplePattern::new(subject.clone(), predicate, object);
+    edge.dtc = pattern_dtc;
+
+    let JsonValue::Object(ann_map) = &ann_block else {
+        return Err(ParseError::InvalidWhere(format!(
+            "{ANNOTATION_KEY} value must be a JSON object (annotation node-map)"
+        )));
+    };
+
+    let id_key = ctx.ctx.context.id_key.as_str();
+    let annotation = if let Some(id_val) = ann_map.get("@id").or_else(|| ann_map.get(id_key)) {
+        parse_subject(id_val, ctx.ctx)?
+    } else {
+        let var_name = format!("?__ann_n{}", *ctx.nested_counter);
+        *ctx.nested_counter += 1;
+        UnresolvedTerm::var(&var_name)
+    };
+
     let body = parse_annotation_body(
         ann_map,
         &annotation,

@@ -3289,6 +3289,77 @@ mod tests {
     }
 
     #[test]
+    fn m43_annotated_plain_string_literal_object_carries_xsd_string_dtc() {
+        // Plain string literal on the base edge of an annotated triple.
+        // `edge.dtc` must be Some(Explicit(xsd:string)) so the scan
+        // matches only xsd:string flakes — not, say, a custom-typed
+        // string with the same lexical value.
+        let query = lower_query(
+            "PREFIX ex: <http://example.org/>
+             SELECT * WHERE { ex:alice ex:name \"Alice\" {| ex:source \"hr\" |} . }",
+        )
+        .unwrap();
+        match &query.patterns[0] {
+            Pattern::EdgeAnnotation { edge, body, .. } => {
+                match &edge.dtc {
+                    Some(fluree_db_core::DatatypeConstraint::Explicit(_)) => {}
+                    other => panic!("plain string base edge must have Explicit dtc, got {other:?}"),
+                }
+                // Annotation body entry should also carry dtc for its
+                // string literal value.
+                match &body[0] {
+                    Pattern::Triple(tp) => match &tp.dtc {
+                        Some(fluree_db_core::DatatypeConstraint::Explicit(_)) => {}
+                        other => panic!("body string literal must have Explicit dtc, got {other:?}"),
+                    },
+                    other => panic!("body[0] should be Pattern::Triple, got {other:?}"),
+                }
+            }
+            other => panic!("expected Pattern::EdgeAnnotation, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn m43_annotated_lang_tagged_literal_object_carries_lang_dtc() {
+        // Language-tagged literal on the base edge. `edge.dtc` must be
+        // Some(LangTag("fr")) so same-lexical literals in different
+        // languages do not cross-match.
+        let query = lower_query(
+            "PREFIX ex: <http://example.org/>
+             SELECT * WHERE { ex:alice ex:label \"chat\"@fr {| ex:source \"lex\" |} . }",
+        )
+        .unwrap();
+        match &query.patterns[0] {
+            Pattern::EdgeAnnotation { edge, .. } => match &edge.dtc {
+                Some(fluree_db_core::DatatypeConstraint::LangTag(tag)) => {
+                    assert_eq!(tag.as_ref(), "fr");
+                }
+                other => panic!("lang-tagged base edge must have LangTag dtc, got {other:?}"),
+            },
+            other => panic!("expected EdgeAnnotation, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn m43_annotated_typed_literal_object_carries_typed_dtc() {
+        // Typed literal — integer in this case. The constraint must be
+        // Some(Explicit(<xsd:integer sid>)) so scans don't cross
+        // datatypes.
+        let query = lower_query(
+            "PREFIX ex: <http://example.org/>
+             SELECT * WHERE { ex:alice ex:age 30 {| ex:source \"hr\" |} . }",
+        )
+        .unwrap();
+        match &query.patterns[0] {
+            Pattern::EdgeAnnotation { edge, .. } => match &edge.dtc {
+                Some(fluree_db_core::DatatypeConstraint::Explicit(_)) => {}
+                other => panic!("typed literal base edge must have Explicit dtc, got {other:?}"),
+            },
+            other => panic!("expected EdgeAnnotation, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn m43_named_iri_reifier_resolves_to_iri_ref() {
         let query = lower_query(
             "PREFIX ex: <http://example.org/>

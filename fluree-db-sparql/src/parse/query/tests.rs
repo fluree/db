@@ -2071,11 +2071,20 @@ fn assert_parse_error(input: &str, needle: &str) {
 }
 
 #[test]
-fn annotation_on_literal_object_is_rejected() {
-    assert_parse_error(
-        &format!("{EX_PREFIX}SELECT * WHERE {{ ex:alice ex:age 30 {{| ex:source \"x\" |}} . }}"),
-        "literal-valued",
-    );
+fn annotation_on_literal_object_parses_cleanly() {
+    // RDF 1.2 allows annotations on literal-valued triples. The
+    // lowering path attaches a `DatatypeConstraint` to the synthesized
+    // `TriplePattern.dtc` so the scan matches literal objects by exact
+    // datatype / language tag.
+    assert_parses(&format!(
+        "{EX_PREFIX}SELECT * WHERE {{ ex:alice ex:age 30 {{| ex:source \"x\" |}} . }}"
+    ));
+    assert_parses(&format!(
+        "{EX_PREFIX}SELECT * WHERE {{ ex:alice ex:name \"Alice\" {{| ex:source \"hr\" |}} . }}"
+    ));
+    assert_parses(&format!(
+        "{EX_PREFIX}SELECT * WHERE {{ ex:alice ex:label \"chat\"@fr {{| ex:source \"lex\" |}} . }}"
+    ));
 }
 
 #[test]
