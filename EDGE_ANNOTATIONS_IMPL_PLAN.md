@@ -1041,28 +1041,49 @@ Three items from the original DoD are deliberately deferred:
    boundaries) or a structural-equivalence helper that loads both
    arenas and compares the row sets.
 
-2. ~~**Bulk import path.**~~ ✅ Closed: `Fluree::reindex(...)` and the
-   CLI's `fluree index` command now resolve the api's
-   `AttachmentEventsProvider` into a concrete coverage envelope and
-   stamp it into `IndexerConfig.attachment_events` before calling
-   the rebuild path. Annotation-bearing ledgers seal an authoritative
-   arena on the first reindex after a bulk import, no second pass
-   needed. The bulk-import code path itself (which uses
-   `build_indexes_from_commits` for fresh-ledger ingestion, not the
-   incremental rebuild path) is unaffected — it still produces a
-   ledger without an arena, and the user runs `fluree index` (or
-   `fluree.reindex(...)`) to seal it. A future enhancement could
-   wire the importer to seal directly during `build_indexes_from_commits`.
+2. 🟡 **Bulk import path — signal plumbed, seal path needs deeper work.**
 
-   New public api accessor: `Fluree::attachment_events_provider() ->
+   What landed:
+   - `ImportResult.has_annotations: bool` surfaces from
+     `IndexUploadResult` (set in
+     `fluree-db-api/src/import.rs` from the same predicate-dict
+     sticky-bit logic that powers `IndexRoot.has_annotations`).
+   - The CLI's `fluree create --import` (`commands/create.rs`)
+     reads `result.has_annotations` after a successful import and
+     auto-invokes `Fluree::reindex(...)` when true. Non-annotation
+     imports skip the extra pass.
+   - `Fluree::reindex(...)` and CLI `fluree index` already wire the
+     api's `AttachmentEventsProvider` into the rebuild path (closed
+     earlier, pinned by
+     `it_edge_annotations_indexed::reindex_seals_arena_when_caching_enabled_no_provider_in_opts`),
+     so the auto-seal works for ledgers whose attachment events
+     live in `AttachmentNovelty`.
+
+   What still doesn't seal:
+   - `Fluree::reindex` resolves attachment events via
+     `ApiAttachmentEventsProvider`, which reads from
+     `AttachmentNovelty.iter_event_pairs()`. After a fresh bulk
+     import, the overlay is empty — the f:reifies* flakes live in
+     the **base index**, not novelty. The provider therefore
+     returns `Augment([])`, and the indexer's arena builder
+     early-returns (no events, no previous arena → no work).
+   - The full fix needs one of: (a) bulk import populates
+     `AttachmentNovelty` from imported f:reifies* flakes before
+     exiting; (b) the indexer's arena builder walks the base index
+     for f:reifies* when sticky bit is true but events are empty;
+     (c) the provider walks the base index itself when overlay is
+     empty. Each is meaningful work; deferred as a follow-up.
+
+   New public api accessor:
+   `Fluree::attachment_events_provider() ->
    Option<Arc<dyn AttachmentEventsProvider>>` — returns `Some` when
-   ledger caching is enabled. External callers who invoke
-   `fluree_db_indexer::build_index_for_ledger` directly should
-   resolve it via `provider.attachment_events(ledger_id).await`
-   before calling, mirroring the api's own pattern.
+   ledger caching is enabled.
 
-   Pinning test:
-   `it_edge_annotations_indexed::reindex_seals_arena_when_caching_enabled_no_provider_in_opts`.
+   Pinning tests:
+   - `it_import::import_with_f_reifies_predicates_sets_has_annotations` (active)
+   - `it_import::import_without_f_reifies_predicates_leaves_has_annotations_false` (active)
+   - `it_import::import_then_reindex_seals_annotation_arena` (`#[ignore]`d
+     — flips to active when the seal-from-base-index path lands).
 
 3. ~~**Malformed-bundle telemetry counter.**~~ ✅ Closed:
    `AttachmentNovelty::observe_flakes` now skips malformed

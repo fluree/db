@@ -368,6 +368,14 @@ pub struct ImportResult {
     pub index_t: i64,
     /// Optional summary of top classes, properties, and connections.
     pub summary: Option<ImportSummary>,
+    /// Whether the imported dataset contains at least one
+    /// `f:reifies*` flake (an edge-annotation bundle). The bulk-import
+    /// root currently writes `annotation_index: None` even when this
+    /// is `true`, so callers that want a sealed annotation arena
+    /// available immediately should follow up with
+    /// `Fluree::reindex(...)` (the CLI's `fluree create --import`
+    /// does this automatically). `false` when `build_index == false`.
+    pub has_annotations: bool,
 }
 
 /// Lightweight summary of the imported dataset for CLI display.
@@ -1506,6 +1514,7 @@ where
     let root_id;
     let index_t;
     let summary;
+    let mut has_annotations = false;
 
     if config.build_index {
         let build_input = IndexBuildInput {
@@ -1551,6 +1560,7 @@ where
         root_id = Some(index_result.root_id);
         index_t = index_result.index_t;
         summary = index_result.summary;
+        has_annotations = index_result.has_annotations;
     } else {
         root_id = None;
         index_t = 0;
@@ -1574,6 +1584,7 @@ where
         root_id,
         index_t,
         summary,
+        has_annotations,
     })
 }
 
@@ -3323,6 +3334,12 @@ struct IndexUploadResult {
     root_id: fluree_db_core::ContentId,
     index_t: i64,
     summary: Option<ImportSummary>,
+    /// Sticky bit: at least one `f:reifies*` predicate landed in the
+    /// imported dataset. Surfaced to `ImportResult.has_annotations`
+    /// so the CLI can auto-seal the annotation arena via a follow-up
+    /// `reindex` pass (the bulk-import root currently writes
+    /// `annotation_index: None` even when annotations are present).
+    has_annotations: bool,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -4045,6 +4062,7 @@ where
             root_id: root_cid,
             index_t: input.final_t,
             summary,
+            has_annotations: import_has_annotations,
         })
     }
 }

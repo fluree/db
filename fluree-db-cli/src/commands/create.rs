@@ -465,6 +465,50 @@ async fn run_bulk_import(
         println!();
     }
 
+    // Annotation arena auto-seal pass.
+    //
+    // The bulk-import path writes `IndexRoot.annotation_index = None`
+    // even when the imported dataset contains `f:reifies*` flakes —
+    // `build_indexes_from_commits` doesn't drive the annotation
+    // arena builder, so a freshly-imported ledger always lands in
+    // arena-less / scan-fallback state until a reindex.
+    //
+    // To close the workflow gap, we follow a successful annotation-
+    // bearing import with `Fluree::reindex(...)`, which DOES seal the
+    // arena via the api's `AttachmentEventsProvider`. The cost is one
+    // extra index pass on annotation-bearing imports — the same work
+    // a user would otherwise run manually via `fluree index` as a
+    // second step. Non-annotation imports skip this entirely (the
+    // sticky bit gate on `Fluree::reindex` and the early-return in
+    // the indexer's arena builder both make it cheap to be wrong).
+    if result.has_annotations {
+        if !quiet {
+            eprintln!(
+                "{} Sealing annotation arena (one-shot reindex pass) — ledger contains `f:reifies*` flakes…",
+                "info:".cyan().bold()
+            );
+        }
+        match fluree
+            .reindex(ledger, fluree_db_api::ReindexOptions::default())
+            .await
+        {
+            Ok(_) => {
+                if !quiet {
+                    eprintln!(
+                        "{} Annotation arena sealed.",
+                        "info:".cyan().bold()
+                    );
+                }
+            }
+            Err(e) => {
+                eprintln!(
+                    "{} Annotation arena seal failed (import succeeded; arena will land on the next `fluree index`): {e}",
+                    "warning:".yellow().bold()
+                );
+            }
+        }
+    }
+
     // Success: remove the crash breadcrumb so the presence of files in
     // `<data_dir>/crash/` continues to be a strong signal of *failed/crashed*
     // runs that need investigation.
