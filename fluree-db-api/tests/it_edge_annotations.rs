@@ -3664,19 +3664,23 @@ async fn delete_by_id_retracts_lang_tagged_literal_annotation_bundle() {
 /// language tags** must not cross-match when an annotation-rooted
 /// query constrains the base edge's object by language.
 ///
-/// `expand_edge_annotation_patterns` emits a
-/// `(?ann f:reifiesLang "<tag>")` constraint triple at the IR
-/// level (unit-tested in
-/// `where_plan::tests::expand_edge_annotation_emits_reifies_lang_triple_for_lang_tagged_edge`)
-/// — but at execution time the triple does not actually filter, so
-/// both annotations still cross-match. The IR shape is in place;
-/// the diagnosis at the join/scan layer is not yet complete.
+/// The IR is structurally correct: `expand_edge_annotation_patterns`
+/// clones `edge.dtc` (= `LangTag("fr")` for `"chat"@fr`) onto the
+/// synthesized `f:reifiesObject` lookup, and the writer DOES store
+/// the language tag on the f:reifiesObject flake's `m.lang` (the
+/// sanity-check assertions below scan the actual flakes and confirm
+/// `dt=rdf:langString, m.lang=Some("fr"|"en")`). So the `LangTag`
+/// dtc filter in `binary_scan` ought to pick exactly one annotation
+/// per language.
 ///
-/// Today this test fails — both annotations cross-match — so it is
-/// `#[ignore]`d. When the executor-side fix lands, flip the
-/// `#[ignore]` to make it an active regression guard.
+/// The bug is somewhere downstream of the IR — candidates: the OPST
+/// exact-match path skipping the lang-tag filter applied in the
+/// range fallback (`binary_scan.rs:753-763`), the planner selecting
+/// a scan path that doesn't honor `dtc`, or
+/// `DefaultGraphSourceOperator`'s inner-subplan re-plan dropping the
+/// constraint. Test stays `#[ignore]`d until that's resolved.
 #[tokio::test]
-#[ignore = "pins the per-language cross-match gap; IR-level constraint emits but does not filter at scan time"]
+#[ignore = "pins the per-language cross-match gap; IR is correct but executor doesn't honor LangTag dtc on f:reifiesObject"]
 async fn cross_language_annotation_does_not_cross_match() {
     let fluree = FlureeBuilder::memory().build_memory();
     let ledger_id = "it-edge-annotations-cross-language";
@@ -3756,6 +3760,40 @@ async fn cross_language_annotation_does_not_cross_match() {
         .await
         .expect("scan f:reifiesLang");
         assert_eq!(lang_flakes.len(), 2, "expected two f:reifiesLang flakes");
+
+        // ALSO scan the f:reifiesObject flakes to verify whether the
+        // language tag IS stored on the per-flake `m.lang` (in which
+        // case the existing `edge.dtc` clone IS the right
+        // disambiguator and the bug is elsewhere) or NOT stored there
+        // (in which case the new `f:reifiesLang` constraint triple is
+        // necessary). This tells us which IR shape is internally
+        // consistent.
+        let reifies_obj_pid = ledger
+            .snapshot
+            .encode_iri(reifies_iris::OBJECT)
+            .expect("encode f:reifiesObject");
+        let obj_flakes = range_with_overlay(
+            &ledger.snapshot,
+            0,
+            ledger.novelty.as_ref(),
+            IndexType::Spot,
+            RangeTest::Eq,
+            RangeMatch::new().with_predicate(reifies_obj_pid),
+            RangeOptions::new().with_to_t(ledger.t()),
+        )
+        .await
+        .expect("scan f:reifiesObject");
+        eprintln!("--- f:reifiesObject flakes ---");
+        for f in &obj_flakes {
+            eprintln!(
+                "  s={:?} o={:?} dt={:?} m.lang={:?}",
+                f.s,
+                f.o,
+                f.dt,
+                f.m.as_ref().and_then(|m| m.lang.as_ref())
+            );
+        }
+        assert_eq!(obj_flakes.len(), 2, "expected two f:reifiesObject flakes");
     }
 
     // SPARQL gives an unambiguous syntax for language-tagged literal

@@ -360,37 +360,41 @@ correctness items remaining):**
   language tags. Same custom-operator fix path; lands in the same
   slice.
 
-  **Status note.** `expand_edge_annotation_patterns` clones
-  `edge.dtc` onto the synthesized `f:reifiesObject` lookup with the
-  intent of disambiguating, but that clone alone does not exclude
-  cross-language matches at execution time — the JSON-LD writer
-  stores the `f:reifiesObject` flake without the language tag in
-  the scan-filterable position (the language lives on the sibling
-  `f:reifiesLang` predicate, not on the `f:reifiesObject` flake's
-  `m.lang`).
+  **Status note — IR is correct, executor doesn't honor it.**
+  `expand_edge_annotation_patterns` clones `edge.dtc` onto the
+  synthesized `f:reifiesObject` lookup, which IS the architecturally
+  right disambiguator: the writer stores the language tag on the
+  f:reifiesObject flake's `m.lang` (verified by direct flake
+  inspection inside the integration repro — both flakes carry
+  `dt=rdf:langString, m.lang=Some(<tag>)`). With `dtc =
+  Some(LangTag("fr"))` on the lookup triple, `binary_scan`'s lang-tag
+  filter at `binary_scan.rs:753-763` should match exactly one
+  annotation. An earlier write-up here speculated the bug was the
+  writer dropping the lang tag and proposed a separate
+  `f:reifiesLang` constraint triple — that was wrong, the
+  speculation never verified the flake state, and the redundant
+  triple has since been removed.
 
-  **IR-level constraint emitted (shipped):** the expansion now
-  additionally emits a `(?ann f:reifiesLang "<tag>")` triple
-  whenever the base edge's object carries a
-  `DatatypeConstraint::LangTag`. Unit-tested in
-  `where_plan::tests::expand_edge_annotation_emits_reifies_lang_triple_for_lang_tagged_edge`
-  and `…_omits_reifies_lang_triple_when_no_lang`. This pins the IR
-  shape; future debugging of the executor gap has a stable
-  constraint to attach to.
+  **Executor gap remains.** The integration repro
+  `cross_language_annotation_does_not_cross_match` still returns
+  both annotations. Candidates to investigate, in order of
+  likelihood:
+  - OPST exact-match path: for a triple with `dtc=Some(...)` and a
+    `Term::Value(FlakeValue::String(_))` object, `binary_scan.rs`
+    selects `IndexType::Opst`. The OPST scan loop may skip the
+    lang-tag filter applied in the range-fallback path
+    (`binary_scan.rs:753-763`).
+  - Planner reorder: the lang-tagged f:reifiesObject lookup gets
+    placed after `f:reifiesSubject`/`f:reifiesPredicate` bind
+    `?ann`, which means it runs as a constraint rather than a
+    source — the constraint path may have its own scan loop that
+    doesn't apply `dtc`.
+  - `DefaultGraphSourceOperator`: the inner-subplan re-plan via
+    `build_where_operators_seeded` may drop or transform the
+    constraint.
 
-  **Executor still doesn't filter (open):** with the IR-level
-  constraint in place, the integration repro
-  `cross_language_annotation_does_not_cross_match` *still* returns
-  both annotations — diagnosis at the join/scan layer is
-  incomplete. The triple appears in the expansion chain (confirmed
-  via `eprintln!` during development), the writer emits both
-  `f:reifiesLang` flakes with distinct values (`"fr"` and `"en"`,
-  both `dt=xsd:string`), and the per-flake constraint shape is
-  what other passing tests use. Something downstream — either
-  the scan filter, the planner's reorder, or
-  `DefaultGraphSourceOperator`'s inner-subplan join — is not
-  honoring this particular constraint. The test stays `#[ignore]`d
-  until this is resolved.
+  Test stays `#[ignore]`d as a stable repro until the executor-side
+  fix lands.
 - ✅ **Wildcard hide of anonymous annotation SIDs.** The hydration
   formatter (`fluree-db-api/src/format/hydration.rs::format_subject`)
   returns `Null` for top-level subject expansions whose root SID is
