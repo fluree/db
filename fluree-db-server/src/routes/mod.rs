@@ -5,9 +5,11 @@ mod admin_auth;
 mod commits;
 mod context;
 mod events;
+mod export;
 #[cfg(feature = "iceberg")]
 mod iceberg;
 mod ledger;
+mod log;
 mod nameservice_refs;
 mod pack;
 mod policy_auth;
@@ -43,7 +45,10 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .route("/drop-branch", post(ledger::drop_branch))
         .route("/rebase", post(ledger::rebase))
         .route("/merge", post(ledger::merge))
-        .route("/revert", post(ledger::revert));
+        .route("/revert", post(ledger::revert))
+        // RDF export bypasses per-flake policy filtering today, so it lives in
+        // the admin-protected bracket alongside other root-level operations.
+        .route("/export/*ledger", post(export::export_ledger_tail));
 
     #[cfg(feature = "iceberg")]
     let v1_admin_protected_routes =
@@ -96,6 +101,8 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .route("/push/*ledger", post(push::push_ledger_tail))
         // Commit show endpoint (decoded commit with resolved IRIs)
         .route("/show/*ledger", get(show::show_ledger_tail))
+        // Commit log endpoint (lightweight per-commit summaries)
+        .route("/log/*ledger", get(log::log_ledger_tail))
         // Commit export endpoint (paginated, replication-grade auth)
         .route("/commits/*ledger", get(commits::commits_ledger_tail))
         // Binary pack stream endpoint (efficient clone/pull)

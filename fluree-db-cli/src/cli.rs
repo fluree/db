@@ -248,6 +248,12 @@ pub enum Commands {
         /// Larger values produce fewer leaf files (shallower tree, bigger reads).
         #[arg(long, default_value_t = 10)]
         leaflets_per_leaf: usize,
+
+        /// Create the ledger on a remote server (by remote name, e.g., "origin").
+        /// Only valid with empty creates — incompatible with --from/--memory.
+        /// Use `fluree publish` if you also need to push local commits.
+        #[arg(long)]
+        remote: Option<String>,
     },
 
     /// Set the active ledger
@@ -285,14 +291,20 @@ pub enum Commands {
         action: BranchAction,
     },
 
-    /// Drop (delete) a ledger
+    /// Drop (delete) a ledger or graph source
     Drop {
-        /// Ledger name to drop
+        /// Ledger or graph source name to drop. The server resolves as a ledger
+        /// first, then as a graph source — `fluree iceberg drop` is the
+        /// explicit graph-source variant.
         name: String,
 
         /// Required flag to confirm deletion
         #[arg(long)]
         force: bool,
+
+        /// Execute against a remote server (by remote name, e.g., "origin")
+        #[arg(long)]
+        remote: Option<String>,
     },
 
     /// Insert data into a ledger
@@ -494,6 +506,10 @@ pub enum Commands {
         /// Output format (json, table, csv, or tsv)
         #[arg(long, default_value = "table")]
         format: String,
+
+        /// Execute against a remote server (by remote name, e.g., "origin")
+        #[arg(long)]
+        remote: Option<String>,
     },
 
     /// Manage the default JSON-LD context for a ledger
@@ -502,17 +518,29 @@ pub enum Commands {
         action: ContextAction,
     },
 
-    /// Export ledger data as Turtle, N-Triples, N-Quads, TriG, or JSON-LD
+    /// Export ledger data as RDF (Turtle, N-Triples, N-Quads, TriG, JSON-LD) or as a `.flpack` archive
     Export {
         /// Ledger name (defaults to active ledger)
         ledger: Option<String>,
 
-        /// Output format: turtle (ttl), ntriples (nt), jsonld, trig, or nquads (default: turtle)
+        /// Output format: turtle (ttl), ntriples (nt), jsonld, trig, nquads,
+        /// or ledger (`.flpack` archive — full ledger including commits and
+        /// indexes, importable via `fluree create --from <file>.flpack`).
         ///
         /// Note: exporting all graphs requires a dataset-capable format
         /// (`trig` or `nquads`).
         #[arg(long, default_value = "turtle")]
         format: String,
+
+        /// Write output to FILE instead of stdout. Required for --format ledger
+        /// when stdout is a TTY (the archive is binary).
+        #[arg(long, short = 'o', value_name = "FILE")]
+        output: Option<std::path::PathBuf>,
+
+        /// For --format ledger only: skip binary index artifacts (smaller archive,
+        /// the importer will need to reindex before queries are efficient).
+        #[arg(long)]
+        no_indexes: bool,
 
         /// Export all named graphs (dataset export), including system graphs.
         ///
@@ -539,6 +567,10 @@ pub enum Commands {
         /// Query at a specific point in time
         #[arg(long)]
         at: Option<String>,
+
+        /// Execute against a remote server (by remote name, e.g., "origin")
+        #[arg(long)]
+        remote: Option<String>,
     },
 
     /// Show commit log for a ledger
@@ -553,6 +585,10 @@ pub enum Commands {
         /// Maximum number of commits to show
         #[arg(short = 'n', long)]
         count: Option<usize>,
+
+        /// Execute against a remote server (by remote name, e.g., "origin")
+        #[arg(long)]
+        remote: Option<String>,
     },
 
     /// Show the contents of a commit (decoded flakes with resolved IRIs)
@@ -1271,6 +1307,10 @@ pub enum ContextAction {
     Get {
         /// Ledger name (defaults to active ledger)
         ledger: Option<String>,
+
+        /// Read from a remote server (by remote name, e.g., "origin")
+        #[arg(long)]
+        remote: Option<String>,
     },
 
     /// Set (replace) the default JSON-LD context for a ledger
@@ -1290,6 +1330,10 @@ pub enum ContextAction {
         /// Read context from a JSON file
         #[arg(long, short = 'f')]
         file: Option<std::path::PathBuf>,
+
+        /// Write to a remote server (by remote name, e.g., "origin")
+        #[arg(long)]
+        remote: Option<String>,
     },
 }
 

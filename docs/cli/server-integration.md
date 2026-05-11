@@ -4,8 +4,8 @@ This document is for implementers building a custom server (for example in `../s
 
 The CLI supports two broad categories of remote operations:
 
-- **Data API**: query/update/insert/upsert/info/exists/show (normal ledger operations).
-- **Replication / sync**: clone/pull/fetch (content-addressed replication by CID, via pack + storage proxy).
+- **Data API**: query / update / insert / upsert / info / exists / show / log / history / context / explain, plus admin operations like create / drop / reindex / branch (create / drop / rebase / merge) / publish / export.
+- **Replication / sync**: clone / pull / fetch (content-addressed replication by CID, via pack + storage proxy) and ledger-archive (`export --format ledger`).
 
 ## Base URL And Discovery
 
@@ -73,6 +73,47 @@ The `commit` query parameter accepts the same identifiers as the local `fluree s
 - `404 Not Found` — ledger or commit not found
 - `501 Not Implemented` — proxy storage mode (no local index available for decoding)
 
+### `fluree create <ledger> --remote <name>` (admin-protected, empty ledger only)
+
+- `POST {api_base_url}/create` with `{"ledger": "<ledger>"}`
+
+Creates an **empty** ledger on the remote server. The CLI rejects `--remote` together with `--from` / `--memory` (those import paths require local data ingestion); the suggested workflow is to create + populate locally, then run `fluree publish <remote> <ledger>` which calls `/exists`, `/create`, and `/push` in sequence.
+
+`--remote` does not touch local state — neither the active-ledger pointer nor the local storage tree. The CLI does not require a project-local `.fluree/` for `create --remote`; it falls back to global config (`$FLUREE_HOME` or the platform default) for remote registration lookups. Auto-routing through a local server is **not** done for `create`; you must pass `--remote <name>` explicitly. Without `--remote`, `fluree create` is local-only and does require a project `.fluree/`.
+
+### `fluree context get|set --remote`
+
+- `GET {api_base_url}/context/*ledger` (read)
+- `PUT {api_base_url}/context/*ledger` (write)
+
+Read or replace the default JSON-LD context for a ledger. `get` returns the context as JSON; the unwrapped object is what the CLI prints. `set` accepts either a bare object (`{"ex": "http://example.org/"}`) or a `{"@context": {...}}` wrapper, and replies with `{"status": "updated"}` (or `409 Conflict` after CAS retries).
+
+`get` uses normal data-read auth (Bearer required when `data_auth.mode == required`, gates on `can_read(ledger)`). `set` uses normal write auth (`can_write(ledger)`). Auto-routing behaves the same way as other read/write commands — pass `--direct` to skip.
+
+### `fluree history --remote`
+
+- `POST {api_base_url}/query/*ledger`
+
+Server-side history queries via JSON-LD: the CLI builds the same `from`/`to`/`select`/`where` body it would send locally and POSTs it to the **ledger-scoped** query endpoint (`/query/{ledger}`). The path carries the bare ledger ID (e.g. `mydb:main`) so the server's `can_read` check matches normal scoped read tokens; the body's `from` carries the time-travel suffix (`mydb:main@t:N`) which the query engine uses to build a historical view at that `t`. Posting to the connection-level `/query` instead would force auth to read `from` for the ledger ID and reject any token not scoped to the time-travel form.
+
+Entity and predicate compact IRIs (`ex:alice` → `http://example.org/alice`) are expanded **client-side** using the project's stored prefix map before the request leaves the CLI, so the server never has to consult the local prefix table. The query body still ships its `@context` (also derived from local prefixes) so the server can compact response IRIs back into the user's preferred form for display.
+
+### `fluree log --remote`
+
+- `GET {api_base_url}/log/*ledger?limit=<N>`
+
+Returns lightweight per-commit summaries newest-first by `t`. Read-auth (same bracket as `/show`) — does **not** require storage-replication permissions, unlike `/commits`. See [Commit Log Contract](#commit-log-contract) for the response shape and required server semantics.
+
+When `--remote` is omitted, the CLI auto-routes through a locally running `fluree server start` if one is detected; pass `--direct` to skip auto-routing and use the local commit-chain walker.
+
+### `fluree export --remote` (admin-protected)
+
+- `POST {api_base_url}/export/*ledger`
+
+Returns ledger data as RDF in the requested format (Turtle, N-Triples, N-Quads, TriG, or JSON-LD). **Admin-protected** — same bracket as `/create`, `/drop`, `/reindex`. RDF export today reads from the binary index without per-flake policy filtering, which is why it does not live in the data-read bracket alongside `/query` and `/show`. See [RDF Export Contract](#rdf-export-contract) for the request body fields and content-type mapping.
+
+When `--remote` is omitted, the CLI auto-routes through a locally running server when one is detected; pass `--direct` to bypass routing and use the local binary index. Tracked ledgers (no local data) require `--remote`.
+
 ### `fluree publish <remote> [ledger]` (create + push)
 
 Creates a ledger on the remote and pushes all local commits in a single operation.
@@ -94,17 +135,46 @@ Required endpoints:
 
 The `--remote-name` flag allows publishing under a different name on the remote (e.g., `fluree publish origin mydb --remote-name production-db`).
 
+### `fluree drop <name> --remote <name>` (admin-protected)
+
+- `POST {api_base_url}/drop` with `{"ledger": "<name>", "hard": true}`
+
+Drops a ledger or graph source on the remote server. The CLI sends `hard: true` (no soft-drop surface today). The server resolves `name` as a ledger first, then as a graph source — see the [`fluree drop` graph source fallback](#fluree-drop-name-graph-source-fallback) section below for the resolution order and response shape.
+
+When `--remote` is omitted, the CLI auto-routes through a locally running `fluree server start` if `server.meta.json` is present and the PID is alive, falling back to direct local execution otherwise. Pass `--direct` to skip auto-routing. The `--force` flag is required in all modes to confirm deletion.
+
+Active-ledger handling:
+
+- **`--remote <name>`** (explicit): never touches local state. Remote storage is separate; the local active-ledger pointer and local storage are unaffected.
+- **Auto-route** (no `--remote`, server running): same on-disk storage as `--direct`, so a successful drop also clears the local active-ledger pointer if it matched the dropped name.
+- **`--direct`** (no `--remote`, no server): clears the active-ledger pointer if it matched.
+
 ### `fluree create <name> --from <file>.flpack` (native ledger import)
 
 - No server endpoint required (local-only operation)
 
 Imports a `.flpack` file (native ledger pack) into a new local ledger. The `.flpack` format uses the same `fluree-pack-v1` wire format as `POST /pack`. See [Ledger portability](#ledger-portability-flpack-files) below.
 
-### `fluree export --format ledger` (native ledger export)
+### `fluree export --format ledger`
 
-- No server endpoint required (local-only operation)
+Exports a full ledger (all commits, txn blobs, and — unless `--no-indexes` — binary index artifacts) as a `.flpack` archive. The archive contains a `phase: "nameservice"` manifest frame so the importer can reconstruct the head pointers. Pass `-o <FILE>` to write to disk (required when stdout is a TTY).
 
-Exports a full local ledger (all commits, indexes, dictionaries) as a `.flpack` file. See [Ledger portability](#ledger-portability-flpack-files) below.
+**Local mode (default):**
+
+- No server endpoint required.
+
+Streams from the local ledger via the `Fluree::archive_ledger` API.
+
+**Remote mode (`--remote <name>`):**
+
+- `GET {api_base_url}/storage/ns/:ledger-id` (NsRecord lookup)
+- `POST {api_base_url}/pack/*ledger` (binary `fluree-pack-v1` stream)
+
+The CLI fetches the remote `NsRecord` to learn the head CIDs and `t` values, then streams the pack response into the user's writer, swapping the terminal End frame for a synthesized `phase: "nameservice"` manifest + End. The resulting `.flpack` is byte-compatible with a locally-generated archive — `fluree create --from <file>.flpack` doesn't care which side produced it.
+
+**Auth:** Both endpoints sit in the replication-grade bracket and require a Bearer token with `fluree.storage.*` permissions (same auth as `fluree clone`/`pull`). Without those permissions the server returns `404 Not Found` for `/storage/ns/:ledger-id` to avoid existence leaks; the CLI surfaces this as `not found: ledger '...' not found on remote '...'`.
+
+See [Ledger portability](#ledger-portability-flpack-files) below for the on-disk format and [Replication Auth Contract](#replication-auth-contract) for the auth semantics.
 
 ### `fluree query`, `fluree insert`, `fluree upsert`, `fluree update`, `fluree track`, `fluree info`, `fluree exists`
 
@@ -121,6 +191,25 @@ When the CLI is invoked with policy flags (`--as`, `--policy-class`,
 listed below and, for JSON-LD bodies, also injects them into `opts`. To be
 CLI-compatible, your server must implement the contract in
 [Policy Enforcement Contract](#policy-enforcement-contract).
+
+**Remote time travel (`--at`)** routes through the **ledger-scoped** endpoints
+(`POST /query/{ledger}`, etc.): the URL path drives the bearer's
+`can_read` check (so a token scoped to `mydb:main` matches), and the
+time-travel suffix rides in the body's `from` (`mydb:main@t:N` for JSON-LD)
+or in an injected `FROM <mydb:main@t:N>` clause (for SPARQL). Posting to
+the connection-level endpoint instead would force auth to derive the
+ledger ID from `from` and reject scoped tokens.
+
+**Remote `--at --explain` flows through the same ledger-scoped path.** The
+CLI injects the time-travel suffix into `from` (JSON-LD) or as a `FROM
+<ledger@t:N>` clause (SPARQL), then POSTs to `POST /explain/{ledger}`.
+The server's explain handlers route those requests through a
+dataset-aware path so the request is processed against a view at the
+requested `t`. Note that Fluree maintains one set of index stats
+(latest), so explain plans for a given query text are largely
+independent of `t` — the value of `--at --explain` is in honoring the
+contract and consistency with the query path, not in producing
+materially different plans.
 
 ### `fluree branch list` (read-only)
 
@@ -883,6 +972,189 @@ These endpoints exist so a client can fetch bytes by CID without knowing storage
 
 `/storage/block` is only required for query peers that need server-mediated index-leaf access.
 
+## Commit Log Contract
+
+`fluree log --remote` issues a single read-only request:
+
+```
+GET {api_base_url}/log/{ledger}?limit={n}
+```
+
+| Parameter | Type | Required | Server default | Description |
+|-----------|------|----------|----------------|-------------|
+| `ledger` (path) | string | Yes | — | Ledger ID, including branch suffix (`org/mydb` and `org/mydb:main` both work via the greedy `*ledger` capture) |
+| `limit` | integer | No | `100` | Number of summaries to return (newest-first by `t`). Server clamps to a hard maximum (reference: `5000`). |
+
+### Auth
+
+Read-only. Requires a Bearer token when `data_auth.mode == required`; gates on
+`can_read(ledger)`; returns `404` (not `403`) when the bearer cannot read the
+ledger so it doesn't leak existence. Admin tokens are NOT required.
+
+### Response (`200 OK`)
+
+```jsonc
+{
+  "ledger_id": "mydb:main",
+  "commits": [
+    {
+      "t": 12,
+      "commit_id": "bafy...",
+      "time": "2026-04-25T12:00:00Z",
+      "asserts": 3,
+      "retracts": 0,
+      "flake_count": 3,
+      "message": null
+    }
+    // ... newest-first by t
+  ],
+  "count": 12,
+  "truncated": false
+}
+```
+
+| Field | Type | Notes |
+|-------|------|-------|
+| `ledger_id` | string | Ledger ID echoed from the request path. |
+| `commits` | array | Per-commit summaries, **strictly newest-first by `t`**, capped at the resolved limit. |
+| `count` | integer | Total commits in the chain (uncapped). `truncated == count > commits.len()`. |
+| `truncated` | bool | `true` when the chain is longer than the returned page. |
+
+Each `commits[i]` mirrors `fluree_db_core::CommitSummary`:
+
+| Field | Type | Notes |
+|-------|------|-------|
+| `t` | integer | Transaction number. |
+| `commit_id` | string | Content ID (CID) of the commit blob. |
+| `time` | string \| null | ISO-8601 commit time, or `null` for legacy commits without a timestamp. |
+| `asserts` | integer | Asserted flakes in this commit. |
+| `retracts` | integer | Retracted flakes. |
+| `flake_count` | integer | Total flakes (`asserts + retracts`). |
+| `message` | string \| null | Extracted from `txn_meta` when an `f:message` entry with a string value is present. Returns `null` otherwise. |
+
+### Required semantics
+
+1. **Branch-aware walk.** The walk **must** load commit envelopes via a
+   branch-aware content store (the reference server uses
+   `branched_content_store_for_record`). Pre-fork commits live under the
+   source branch's namespace, so a flat per-branch store cannot reach them
+   and the response would be incomplete.
+2. **Newest-first ordering.** `commits` is sorted strictly descending by
+   `t`. The CLI prints in this order without re-sorting.
+3. **Empty ledger.** When the ledger exists but has no commits, return
+   `200 OK` with `commits: []` and `count: 0`.
+4. **Hard cap.** Servers MUST enforce a hard maximum independent of the
+   client's `limit` (reference: `5000`). The CLI assumes the server caps
+   the response, and unbounded responses must not be reachable.
+
+### Error responses
+
+| Status | When |
+|--------|------|
+| `401` | Bearer required and absent/invalid. |
+| `404` | Ledger does not exist; or the bearer cannot `can_read`. |
+| `5xx` | Storage / nameservice errors during walk. |
+
+### Reference implementation
+
+| Concern | Canonical location |
+|---------|-------------------|
+| HTTP route + auth | `fluree-db-server/src/routes/log.rs::log_ledger_tail` |
+| Underlying API | `fluree_db_api::Fluree::commit_log` |
+| Walk + summary | `fluree_db_core::commit::walk_commit_summaries` |
+
+## RDF Export Contract
+
+`fluree export --remote` issues:
+
+```
+POST {api_base_url}/export/{ledger}
+Content-Type: application/json
+
+{
+  "format": "turtle",
+  "all_graphs": false,
+  "graph": "http://example.org/people",
+  "context": { "ex": "http://example.org/" },
+  "at": "t:42"
+}
+```
+
+| Field | Type | Required | Server default | Description |
+|-------|------|----------|----------------|-------------|
+| `format` | string | No | `"turtle"` | One of: `turtle`/`ttl`, `ntriples`/`nt`, `nquads`/`n-quads`, `trig`, `jsonld`/`json-ld`/`json`. Case-insensitive. |
+| `all_graphs` | bool | No | `false` | Export every named graph as a dataset. Requires `format` ∈ `trig` / `nquads`. Mutually exclusive with `graph`. |
+| `graph` | string | No | — | IRI of a single named graph to export. Mutually exclusive with `all_graphs`. |
+| `context` | object | No | ledger default | Prefix map for Turtle/TriG/JSON-LD output. Either a bare object (`{ "ex": "..." }`) or `{ "@context": {...} }`. Falls back to the ledger's stored default context when absent. |
+| `at` | string | No | latest | Time spec — integer (`"42"`), ISO-8601 datetime (`"2026-01-15T10:30:00Z"`), or commit CID prefix (`"bafy…"`). Identical to the local `--at` flag. |
+
+An empty body is accepted and treated as all-default (Turtle export at HEAD).
+
+### Auth
+
+**Admin-protected.** Same middleware as `/create`, `/drop`, `/reindex`,
+and the branch admin endpoints — registered through
+`v1_admin_protected_routes` in `fluree-db-server/src/routes/mod.rs`.
+
+Export today does **not** apply per-flake policy filtering: it reads
+straight from the binary index. Putting it in the data-read bracket
+alongside `/query` and `/show` would be a bulk policy bypass for any
+bearer with `can_read(ledger)`. Adding policy-filtered streaming export
+would let it move to read-auth in the future.
+
+### Response (`200 OK`)
+
+The body is the raw RDF for the requested format. `Content-Type` reflects
+the chosen format:
+
+| Format | Content-Type |
+|--------|--------------|
+| Turtle | `text/turtle; charset=utf-8` |
+| N-Triples | `application/n-triples; charset=utf-8` |
+| N-Quads | `application/n-quads; charset=utf-8` |
+| TriG | `application/trig; charset=utf-8` |
+| JSON-LD | `application/ld+json; charset=utf-8` |
+
+The reference server today buffers the full export in memory before responding
+(simple, sufficient for moderate-size ledgers). Implementations are free to
+stream chunked bodies; clients MUST be prepared to read until EOF.
+
+### Required semantics
+
+1. **Format validation.** Reject unknown format strings with `400`.
+2. **Dataset/format coupling.** When `all_graphs == true`, `format` must be
+   `trig` or `nquads`; otherwise return `400` with a message that mentions
+   the dataset format requirement (the local CLI surfaces the same error).
+3. **Time spec parsing.** Same rules as the merge-preview / show
+   contracts: parse as integer first (`t`), then as ISO-8601 if it
+   contains both `-` and `:`, else as a commit CID prefix.
+4. **Graph IRI resolution.** When `graph` is set, resolve via the ledger's
+   graph registry; an unknown IRI is a `400` (or `5xx` if you treat it as
+   a config error — the reference returns `400` via `ApiError::Config`).
+5. **Index requirement.** Export reads from the binary index. If the
+   ledger has no index, the reference server surfaces `ApiError::Config`
+   ("no binary index available for export (is the ledger indexed?)"),
+   which the error mapper returns as `400 Bad Request`. Document that
+   shape if you implement equivalently — the CLI surfaces the message
+   verbatim.
+
+### Error responses
+
+| Status | When |
+|--------|------|
+| `400` | Unknown format; conflicting `all_graphs` + `graph`; `all_graphs` with non-dataset format; unknown graph IRI; malformed JSON; ledger not indexed. |
+| `401` / `403` | Admin token required and absent/invalid. |
+| `404` | Ledger does not exist. |
+| `5xx` | Storage / nameservice / encoding errors during walk. |
+
+### Reference implementation
+
+| Concern | Canonical location |
+|---------|-------------------|
+| HTTP route + auth | `fluree-db-server/src/routes/export.rs::export_ledger_tail` |
+| Builder | `fluree_db_api::export_builder::ExportBuilder` |
+| Format encoders | `fluree_db_api::export` |
+
 ## `/create` Contract
 
 - Endpoint: `POST {api_base_url}/create`
@@ -892,7 +1164,7 @@ These endpoints exist so a client can fetch bytes by CID without knowing storage
 
 If no branch suffix is provided (e.g., `"mydb"`), the server MUST normalize to `"mydb:main"`.
 
-Used by `fluree publish` (and potentially future `fluree create --remote`) to create a ledger on a remote server before pushing commits.
+Used by `fluree publish` (which calls `/create` after `/exists` returns false) and by `fluree create --remote <name>` (empty-ledger creation on a remote server).
 
 ## `/reindex` Contract
 
@@ -1283,5 +1555,15 @@ fluree iceberg map my-gs \
 fluree list                    # should show mydb (Ledger) + my-gs (Iceberg)
 fluree info my-gs              # should show Iceberg config + R2RML mapping
 fluree show t:1 --remote origin  # should show decoded commit with resolved IRIs
-fluree drop my-gs --force      # should drop the graph source
+fluree log mydb --remote origin --oneline  # should print the remote's commit chain newest-first
+fluree export mydb --remote origin --format turtle > mydb-remote.ttl  # should write Turtle to disk
+fluree context get mydb --remote origin  # should print the remote ledger's default context
+fluree context set mydb --remote origin -e '{"ex": "http://example.org/"}'  # admin: replace context
+fluree history http://example.org/alice --ledger mydb --remote origin --format json  # remote history
+fluree query mydb 'SELECT * WHERE { ?s ?p ?o }' --remote origin --at 1  # time-travel via /query/{ledger}
+fluree query mydb 'SELECT * WHERE { ?s ?p ?o }' --remote origin --at 1 --explain --format json  # time-travel explain via /explain/{ledger}
+fluree create empty-db --remote origin  # should create an empty ledger on the remote
+fluree export mydb --remote origin --format ledger -o mydb-remote.flpack  # archive remote ledger
+fluree drop my-gs --force      # should drop the graph source locally
+fluree drop local-db --remote origin --force  # should drop the published ledger on the remote
 ```
