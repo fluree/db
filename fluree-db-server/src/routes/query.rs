@@ -714,41 +714,15 @@ pub async fn explain_ledger(
                 }
             }
 
-            // If the SPARQL carries FROM clauses, allow them only when they
-            // target the path ledger (same base) — with an optional
-            // time-travel suffix. That gives `--at` callers a working plan
-            // at the requested `t` while still rejecting attempts to point
-            // explain at a different ledger via FROM. Multi-FROM and FROM
-            // NAMED are still routed through the connection-explain path,
-            // which itself enforces single-ledger.
-            let from_ids = fluree_db_api::sparql_dataset_ledger_ids(&sparql)
-                .unwrap_or_default();
-            let has_dataset_clauses = !from_ids.is_empty();
-            if has_dataset_clauses {
-                let base_path = base_ledger_id(&ledger)?;
-                for from in &from_ids {
-                    let base = base_ledger_id(from)?;
-                    if base != base_path {
-                        set_span_error_code(&span, "error:BadRequest");
-                        return Err(ServerError::bad_request(format!(
-                            "Ledger mismatch: endpoint ledger is '{ledger}' but SPARQL FROM targets '{from}'"
-                        )));
-                    }
-                }
-
-                // Route through the connection-explain path so the time-travel
-                // suffix on FROM <ledger@t:N> drives snapshot selection.
-                let result = state
-                    .fluree
-                    .explain_connection_sparql(&sparql)
-                    .await
-                    .map_err(ServerError::Api)?;
-                tracing::info!(
-                    status = "success",
-                    query_kind = "sparql",
-                    "explain completed (dataset path)"
-                );
-                return Ok(Json(result));
+            // For now, explain is ledger-scoped and does not support dataset clauses.
+            if fluree_db_api::sparql_dataset_ledger_ids(&sparql)
+                .map(|v| !v.is_empty())
+                .unwrap_or(false)
+            {
+                return Err(ServerError::bad_request(
+                    "SPARQL FROM/FROM NAMED is not supported for explain on the ledger-scoped endpoint; remove dataset clauses to explain the core plan"
+                        .to_string(),
+                ));
             }
 
             let ledger_id = ledger.clone();
@@ -815,37 +789,6 @@ pub async fn explain_ledger(
             policy_class,
         )
         .await;
-
-        // When the body carries a time-travel `from` (or any other dataset
-        // feature `normalize_ledger_scoped_from` accepted), delegate to the
-        // connection-explain path so the snapshot is resolved at the
-        // requested `t`. The default fast path below loads the ledger at
-        // HEAD, which would silently drop time-travel — exactly the
-        // explain bug the CLI was working around with a hard refusal.
-        if requires_dataset_features(&query_json) {
-            // Ensure the dataset has a default-graph entry pointing at this
-            // ledger if the body omitted `from`. Mirrors execute_query's
-            // dataset routing.
-            if query_json.get("from").is_none() {
-                if let Some(obj) = query_json.as_object_mut() {
-                    obj.insert(
-                        "from".to_string(),
-                        JsonValue::String(ledger_id.to_string()),
-                    );
-                }
-            }
-            let result = state
-                .fluree
-                .explain_connection(&query_json)
-                .await
-                .map_err(ServerError::Api)?;
-            tracing::info!(
-                status = "success",
-                query_kind = "jsonld",
-                "explain completed (dataset path)"
-            );
-            return Ok(Json(result));
-        }
 
         let loaded = if state.config.is_proxy_storage_mode() {
             state.fluree.ledger(&ledger_id).await.map_err(ServerError::Api)?
@@ -2044,51 +1987,33 @@ pub async fn explain(
             log_query_text(&sparql, &state.telemetry_config, &span);
 
             // Determine target ledger: header wins, otherwise require a single FROM ledger id.
-            // FROM may carry a time-travel suffix (`@t:N` / `@iso:` / `@commit:`);
-            // strip it for the auth check so a scoped read token still authorizes.
-            let from_ids_raw = fluree_db_api::sparql_dataset_ledger_ids(&sparql)
-                .unwrap_or_default();
-            let ledger_id_raw = if let Some(ref l) = headers.ledger {
+            let ledger_id = if let Some(ref l) = headers.ledger {
                 l.clone()
-            } else if from_ids_raw.len() == 1 {
-                from_ids_raw[0].clone()
-            } else if from_ids_raw.is_empty() {
-                return Err(ServerError::bad_request(format!(
-                    "Unable to determine ledger for SPARQL explain; include a FROM clause (e.g., FROM <myledger:main>) or send '{}' header.",
-                    FlureeHeaders::LEDGER,
-                )));
             } else {
-                return Err(ServerError::bad_request(
-                    "SPARQL explain requires exactly one target ledger (single FROM <ledger>); multi-ledger explain is not supported"
-                        .to_string(),
-                ));
+                let ledger_ids = fluree_db_api::sparql_dataset_ledger_ids(&sparql).map_err(|e| {
+                    ServerError::bad_request(format!(
+                        "Unable to determine ledger for SPARQL explain; include a FROM clause (e.g., FROM <myledger:main>) or send '{}' header. Details: {}",
+                        FlureeHeaders::LEDGER,
+                        e
+                    ))
+                })?;
+                if ledger_ids.len() != 1 {
+                    return Err(ServerError::bad_request(
+                        "SPARQL explain requires exactly one target ledger (single FROM <ledger>); multi-ledger explain is not supported"
+                            .to_string(),
+                    ));
+                }
+                ledger_ids[0].clone()
             };
-            let ledger_id = base_ledger_id(&ledger_id_raw)?;
             span.record("ledger_id", ledger_id.as_str());
 
-            // Enforce bearer ledger scope for unsigned requests. We compare
-            // against the *base* ledger id (sans `@t:` suffix) so scoped
-            // tokens authorize time-travel explains.
+            // Enforce bearer ledger scope for unsigned requests
             if let Some(p) = bearer.0.as_ref() {
                 if !credential.is_signed() && !p.can_read(&ledger_id) {
                     set_span_error_code(&span, "error:Forbidden");
                     // Avoid existence leak
                     return Err(ServerError::not_found("Ledger not found"));
                 }
-            }
-
-            // If FROM carries a time-travel suffix, route through the
-            // dataset-aware connection-explain path so snapshot selection
-            // honors `@t:N` / ISO / commit-prefix. Otherwise keep the
-            // simple HEAD-load fast path.
-            if ledger_id_raw != ledger_id {
-                let result = state
-                    .fluree
-                    .explain_connection_sparql(&sparql)
-                    .await
-                    .map_err(ServerError::Api)?;
-                tracing::info!(status = "success", "explain completed (dataset path)");
-                return Ok(Json(result));
             }
 
             let loaded = if state.config.is_proxy_storage_mode() {
@@ -2131,10 +2056,8 @@ pub async fn explain(
             }
         }
 
-        // Get ledger id (may include `@t:N` suffix when body's `from` is
-        // time-travelled). Use the base for the bearer scope check so
-        // scoped read tokens still authorize.
-        let ledger_id_raw = match get_ledger_id(None, &headers, &query_json) {
+        // Get ledger id
+        let ledger_id = match get_ledger_id(None, &headers, &query_json) {
             Ok(ledger_id) => {
                 span.record("ledger_id", ledger_id.as_str());
                 ledger_id
@@ -2145,12 +2068,11 @@ pub async fn explain(
                 return Err(e);
             }
         };
-        let ledger_id = base_ledger_id(&ledger_id_raw)?;
 
         // Inject header values into query opts
         inject_headers_into_query(&mut query_json, &headers);
 
-        // Enforce bearer ledger scope for unsigned requests (base id only).
+        // Enforce bearer ledger scope for unsigned requests
         if let Some(p) = bearer.0.as_ref() {
             if !credential.is_signed() && !p.can_read(&ledger_id) {
                 set_span_error_code(&span, "error:Forbidden");
@@ -2171,27 +2093,7 @@ pub async fn explain(
         )
         .await;
 
-        // When the body carries time-travel `from` (or any other dataset
-        // feature parse_dataset_spec recognizes), route through the
-        // dataset-aware connection-explain path so snapshot selection
-        // honors `@t:N` rather than silently loading HEAD.
-        if requires_dataset_features(&query_json) {
-            let result = match state.fluree.explain_connection(&query_json).await {
-                Ok(result) => {
-                    tracing::info!(status = "success", "explain completed (dataset path)");
-                    result
-                }
-                Err(e) => {
-                    let server_error = ServerError::Api(e);
-                    set_span_error_code(&span, "error:InvalidQuery");
-                    tracing::error!(error = %server_error, "explain execution failed");
-                    return Err(server_error);
-                }
-            };
-            return Ok(Json(result));
-        }
-
-        // Execute explain (HEAD fast path)
+        // Execute explain
         let loaded = if state.config.is_proxy_storage_mode() {
             state.fluree.ledger(&ledger_id).await.map_err(ServerError::Api)?
         } else {

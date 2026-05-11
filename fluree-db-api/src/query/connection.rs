@@ -435,65 +435,6 @@ impl Fluree {
             .await
     }
 
-    /// Explain a JSON-LD query via connection.
-    ///
-    /// Mirrors [`query_connection`] but emits the query plan rather than
-    /// executing it. The dataset spec (including any time-travel `from`
-    /// suffix like `mydb:main@t:5`) drives snapshot selection, so an
-    /// `--at` explain returns the plan at that historical `t` rather than
-    /// at HEAD.
-    ///
-    /// Multi-ledger dataset specs are rejected — explain is single-ledger
-    /// (consistent with [`Fluree::explain`] taking a `GraphDb`).
-    pub async fn explain_connection(&self, query_json: &JsonValue) -> Result<JsonValue> {
-        let (spec, qc_opts) = parse_dataset_spec(query_json)?;
-
-        if spec.is_empty() {
-            return Err(ApiError::query(
-                "Missing ledger specification in connection explain",
-            ));
-        }
-
-        let Some(view) = self
-            .prepare_single_view_for_connection(&spec, &qc_opts)
-            .await?
-        else {
-            return Err(ApiError::query(
-                "Multi-ledger datasets are not supported for explain; \
-                 specify a single `from` ledger (with optional time-travel suffix).",
-            ));
-        };
-
-        self.explain(&view, query_json).await
-    }
-
-    /// Explain a SPARQL query via connection. SPARQL counterpart to
-    /// [`explain_connection`] — requires exactly one `FROM` (with optional
-    /// time-travel suffix). Rejects `FROM NAMED` and multi-`FROM` queries,
-    /// since the planner is single-ledger.
-    pub async fn explain_connection_sparql(&self, sparql: &str) -> Result<JsonValue> {
-        let ast = parse_and_validate_sparql(sparql)?;
-        let spec = extract_sparql_dataset_spec(&ast)?;
-
-        if spec.is_empty() {
-            return Err(ApiError::query(
-                "Missing dataset specification in SPARQL explain (no FROM)",
-            ));
-        }
-
-        let Some(view) = self
-            .prepare_single_view_for_connection(&spec, &crate::QueryConnectionOptions::default())
-            .await?
-        else {
-            return Err(ApiError::query(
-                "Multi-ledger / FROM NAMED datasets are not supported for SPARQL explain; \
-                 use a single `FROM <ledger:branch>` (with optional time-travel suffix).",
-            ));
-        };
-
-        self.explain_sparql(&view, sparql).await
-    }
-
     /// Execute a SPARQL query via connection (dataset specified via SPARQL `FROM` / `FROM NAMED`).
     ///
     /// Note: SPARQL connection queries allow dataset clauses because the dataset

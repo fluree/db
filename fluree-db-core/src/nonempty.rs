@@ -35,7 +35,6 @@ impl<T> NonEmpty<T> {
     }
 
     /// Number of elements, always ≥ 1.
-    #[allow(clippy::len_without_is_empty)] // by construction never empty
     pub fn len(&self) -> usize {
         1 + self.tail.len()
     }
