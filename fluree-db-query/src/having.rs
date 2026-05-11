@@ -21,7 +21,7 @@
 use crate::binding::Batch;
 use crate::context::ExecutionContext;
 use crate::error::Result;
-use crate::expression::PreparedBoolExpression;
+use crate::eval::PreparedBoolExpression;
 use crate::filter::filter_batch;
 use crate::ir::Expression;
 use crate::operator::{
@@ -140,8 +140,8 @@ mod tests {
     #[tokio::test]
     async fn test_having_filters_rows() {
         use crate::context::ExecutionContext;
-        use crate::ir::FilterValue;
         use crate::var_registry::VarRegistry;
+        use fluree_db_core::value::FlakeValue;
 
         let snapshot = make_test_snapshot();
         let vars = VarRegistry::new();
@@ -192,7 +192,7 @@ mod tests {
         // HAVING ?count > 10
         let expr = Expression::gt(
             Expression::Var(VarId(1)), // ?count
-            Expression::Const(FilterValue::Long(10)),
+            Expression::Const(FlakeValue::Long(10)),
         );
 
         let mut op = HavingOperator::new(child, expr);
@@ -225,8 +225,8 @@ mod tests {
     #[tokio::test]
     async fn test_having_no_matches() {
         use crate::context::ExecutionContext;
-        use crate::ir::FilterValue;
         use crate::var_registry::VarRegistry;
+        use fluree_db_core::value::FlakeValue;
 
         let snapshot = make_test_snapshot();
         let vars = VarRegistry::new();
@@ -272,7 +272,7 @@ mod tests {
         // HAVING ?count > 100 (no rows match)
         let expr = Expression::gt(
             Expression::Var(VarId(1)),
-            Expression::Const(FilterValue::Long(100)),
+            Expression::Const(FlakeValue::Long(100)),
         );
 
         let mut op = HavingOperator::new(child, expr);
@@ -288,8 +288,8 @@ mod tests {
     #[tokio::test]
     async fn test_having_schema_preserved() {
         use crate::context::ExecutionContext;
-        use crate::ir::FilterValue;
         use crate::var_registry::VarRegistry;
+        use fluree_db_core::value::FlakeValue;
 
         let snapshot = make_test_snapshot();
         let vars = VarRegistry::new();
@@ -305,7 +305,7 @@ mod tests {
         let seed: BoxedOperator = Box::new(SeedOperator::from_batch_row(&batch, 0));
 
         // Any expression that passes
-        let expr = Expression::Const(FilterValue::Bool(true));
+        let expr = Expression::Const(FlakeValue::Boolean(true));
 
         let mut op = HavingOperator::new(seed, expr);
         op.open(&ctx).await.unwrap();
@@ -322,8 +322,8 @@ mod tests {
     #[tokio::test]
     async fn test_having_type_mismatch_filters_out_row() {
         use crate::context::ExecutionContext;
-        use crate::ir::FilterValue;
         use crate::var_registry::VarRegistry;
+        use fluree_db_core::value::FlakeValue;
 
         let snapshot = make_test_snapshot();
         let vars = VarRegistry::new();
@@ -373,7 +373,7 @@ mod tests {
         // HAVING ?count > 10
         let expr = Expression::gt(
             Expression::Var(VarId(1)),
-            Expression::Const(FilterValue::Long(10)),
+            Expression::Const(FlakeValue::Long(10)),
         );
 
         let mut op = HavingOperator::new(child, expr);

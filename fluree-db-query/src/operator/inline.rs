@@ -6,7 +6,7 @@
 use crate::binding::{Binding, BindingRow};
 use crate::context::ExecutionContext;
 use crate::error::Result;
-use crate::expression::PreparedBoolExpression;
+use crate::eval::PreparedBoolExpression;
 use crate::ir::Expression;
 use crate::var_registry::VarId;
 

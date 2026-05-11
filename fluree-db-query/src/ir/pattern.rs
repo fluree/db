@@ -8,9 +8,9 @@ use super::adapters::{
     GeoSearchPattern, IndexSearchPattern, R2rmlPattern, S2SearchPattern, VectorSearchPattern,
 };
 use super::expression::{Expression, Function};
+use super::grouping::Grouping;
 use super::path::PropertyPathPattern;
 use super::triple::TriplePattern;
-use crate::aggregate::AggregateSpec;
 use crate::binding::Binding;
 use crate::sort::SortSpec;
 use crate::var_registry::VarId;
@@ -33,14 +33,10 @@ pub struct SubqueryPattern {
     pub offset: Option<usize>,
     /// Whether to apply DISTINCT to results
     pub distinct: bool,
-    /// ORDER BY specifications
-    pub order_by: Vec<SortSpec>,
-    /// GROUP BY variables (for aggregates)
-    pub group_by: Vec<VarId>,
-    /// Aggregate specifications
-    pub aggregates: Vec<AggregateSpec>,
-    /// HAVING filter (post-aggregate)
-    pub having: Option<Expression>,
+    /// ORDER BY specs. Empty when the subquery is unordered.
+    pub ordering: Vec<SortSpec>,
+    /// Optional aggregation phase (GROUP BY / aggregates / HAVING).
+    pub grouping: Option<Grouping>,
 }
 
 impl SubqueryPattern {
@@ -52,10 +48,8 @@ impl SubqueryPattern {
             limit: None,
             offset: None,
             distinct: false,
-            order_by: Vec::new(),
-            group_by: Vec::new(),
-            aggregates: Vec::new(),
-            having: None,
+            ordering: Vec::new(),
+            grouping: None,
         }
     }
 
@@ -77,21 +71,15 @@ impl SubqueryPattern {
         self
     }
 
-    /// Set ORDER BY specifications
-    pub fn with_order_by(mut self, specs: Vec<SortSpec>) -> Self {
-        self.order_by = specs;
+    /// Set ORDER BY specs.
+    pub fn with_ordering(mut self, specs: Vec<SortSpec>) -> Self {
+        self.ordering = specs;
         self
     }
 
-    /// Set GROUP BY variables
-    pub fn with_group_by(mut self, vars: Vec<VarId>) -> Self {
-        self.group_by = vars;
-        self
-    }
-
-    /// Set aggregate specifications
-    pub fn with_aggregates(mut self, specs: Vec<AggregateSpec>) -> Self {
-        self.aggregates = specs;
+    /// Set the aggregation phase (GROUP BY / aggregates / HAVING).
+    pub fn with_grouping(mut self, grouping: Grouping) -> Self {
+        self.grouping = Some(grouping);
         self
     }
 

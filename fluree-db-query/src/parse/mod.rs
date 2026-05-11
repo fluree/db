@@ -599,13 +599,40 @@ fn parse_select(
     Ok(())
 }
 
+/// Returns true if the given (lowercased) function name is one of the
+/// SELECT-clause aggregate functions recognized by `parse_aggregate_fn_and_input`.
+///
+/// Used to dispatch S-expressions in the select clause between the aggregate
+/// path and the scalar-expression path.
+fn is_aggregate_name(name: &str) -> bool {
+    matches!(
+        name,
+        "count"
+            | "count-distinct"
+            | "countdistinct"
+            | "sum"
+            | "avg"
+            | "min"
+            | "max"
+            | "median"
+            | "variance"
+            | "stddev"
+            | "sample"
+            | "group-concat"
+            | "groupconcat"
+    )
+}
+
 /// Parse a string item from the select clause into a column.
 ///
-/// Handles two cases:
+/// Handles three cases:
 /// - Variable: `"?name"`
 /// - S-expression aggregate: `"(count ?x)"` or `"(as (count ?x) ?cnt)"` —
 ///   the spec is appended to `aggregates` and the output var becomes the
 ///   returned column.
+/// - S-expression scalar with alias: `"(as (coalesce ?a ?b) ?title)"` — the
+///   inner expression is captured as an `UnresolvedColumn::Computation` so lowering
+///   can desugar it to a `Pattern::Bind` with the alias as the projected var.
 ///
 /// Wildcard (`"*"`) is rejected here; it must be the entire `select` value
 /// and is handled at the top-level dispatch in `parse_query_inner`.
@@ -621,115 +648,95 @@ fn parse_select_string(
         ));
     }
 
-    if trimmed.starts_with('(') {
-        // S-expression: aggregate function call
-        let agg_spec = parse_aggregate_sexpr(trimmed)?;
-        let column = UnresolvedColumn::Var(Arc::from(agg_spec.output_var.as_ref()));
-        aggregates.push(agg_spec);
-        Ok(column)
-    } else {
+    if !trimmed.starts_with('(') {
         // Must be a variable - use validate_var_name for consistent error handling
         validate_var_name(trimmed)?;
-        Ok(UnresolvedColumn::Var(Arc::from(trimmed)))
+        return Ok(UnresolvedColumn::Var(Arc::from(trimmed)));
     }
-}
 
-// SexprToken and tokenization moved to sexpr_tokenize module
-
-/// Parse an S-expression aggregate function call
-///
-/// Supports legacy syntax:
-/// - `(count ?x)` - COUNT with auto-generated output var (?count)
-/// - `(as (count ?x) ?cnt)` - COUNT with explicit alias
-/// - `(count *)` - COUNT(*) for all rows
-/// - `(sum ?age)` - SUM
-/// - `(as (avg ?score) ?avgScore)` - AVG with alias
-/// - `(groupconcat ?name ", ")` - GROUP_CONCAT with separator as 2nd arg
-fn parse_aggregate_sexpr(s: &str) -> Result<ast::UnresolvedAggregateSpec> {
-    let trimmed = s.trim();
-
-    // Must start with ( and end with )
-    if !trimmed.starts_with('(') || !trimmed.ends_with(')') {
+    // S-expression form. Tokenize once to peek at the head and decide
+    // between aggregate (existing behavior) and scalar expression (new).
+    if !trimmed.ends_with(')') {
         return Err(ParseError::InvalidSelect(format!(
-            "aggregate expression must be wrapped in parentheses: {s}"
+            "S-expression must be wrapped in parentheses: {s}"
         )));
     }
-
-    // Tokenize the entire expression
     let tokens = sexpr_tokenize::tokenize_sexpr(trimmed)?;
-
-    // Should have exactly one top-level list
     if tokens.len() != 1 {
         return Err(ParseError::InvalidSelect(format!(
             "expected single S-expression, got {} tokens",
             tokens.len()
         )));
     }
-
     let list = tokens[0].as_list()?;
-
     if list.is_empty() {
         return Err(ParseError::InvalidSelect(
-            "empty aggregate expression".to_string(),
+            "empty S-expression in select".to_string(),
         ));
     }
+    let head = list[0].expect_atom("function name")?.to_lowercase();
 
-    // Get the function name (first element)
-    let fn_name = list[0]
-        .expect_atom("aggregate function name")?
-        .to_lowercase();
+    // (as <inner> ?alias) — could wrap an aggregate or a scalar expression.
+    if head == "as" {
+        if list.len() != 3 {
+            return Err(ParseError::InvalidSelect(format!(
+                "(as ...) requires exactly 2 arguments: (as <expr> ?alias), got {} elements",
+                list.len() - 1
+            )));
+        }
+        let inner = list[1].expect_list("first argument to 'as'")?;
+        if inner.is_empty() {
+            return Err(ParseError::InvalidSelect(
+                "empty inner expression in 'as'".to_string(),
+            ));
+        }
+        let inner_head = inner[0].expect_atom("function name")?.to_lowercase();
+        let alias = list[2].expect_atom("alias in 'as'")?;
+        if !is_variable(alias) {
+            return Err(ParseError::InvalidSelect(format!(
+                "alias must be a variable (start with '?'), got: {alias}"
+            )));
+        }
 
-    // Check if this is an `as` wrapper: (as (agg-fn ?var) ?alias)
-    if fn_name == "as" {
-        return parse_as_aggregate(list);
+        if is_aggregate_name(&inner_head) {
+            // Existing aggregate-with-alias path.
+            let (function, input_var) = parse_aggregate_fn_and_input(&inner_head, &inner[1..])?;
+            let agg_spec = ast::UnresolvedAggregateSpec {
+                function,
+                input_var: Arc::from(input_var),
+                output_var: Arc::from(alias),
+            };
+            let column = UnresolvedColumn::Var(Arc::from(alias));
+            aggregates.push(agg_spec);
+            return Ok(column);
+        }
+
+        // Scalar expression with explicit alias — desugars to a BIND.
+        let expr = filter_sexpr::expr_from_sexpr_token(&list[1])?;
+        return Ok(UnresolvedColumn::Computation {
+            expr,
+            alias: Arc::from(alias),
+        });
     }
 
-    // Otherwise, parse as a direct aggregate: (count ?x) or (groupconcat ?x ", ")
-    parse_direct_aggregate(&fn_name, &list[1..])
+    // Direct aggregate: (count ?x) or (groupconcat ?x ", ").
+    if is_aggregate_name(&head) {
+        let agg_spec = parse_direct_aggregate(&head, &list[1..])?;
+        let column = UnresolvedColumn::Var(Arc::from(agg_spec.output_var.as_ref()));
+        aggregates.push(agg_spec);
+        return Ok(column);
+    }
+
+    // Scalar expression without an alias — disallowed: there is no
+    // unambiguous way to name the projected column.
+    Err(ParseError::InvalidSelect(format!(
+        "scalar expression '{head}' in select requires an alias: use (as ({head} ...) ?alias)"
+    )))
 }
 
-/// Parse `(as (agg-fn ?var) ?alias)` form
-fn parse_as_aggregate(list: &[sexpr_tokenize::SexprToken]) -> Result<ast::UnresolvedAggregateSpec> {
-    // Format: (as <inner-aggregate> ?alias)
-    if list.len() != 3 {
-        return Err(ParseError::InvalidSelect(format!(
-            "(as ...) requires exactly 2 arguments: (as (agg ?var) ?alias), got {} elements",
-            list.len() - 1
-        )));
-    }
-
-    // Second element must be the inner aggregate (a list)
-    let inner_agg = list[1].expect_list("first argument to 'as'")?;
-
-    // Third element must be the alias variable
-    let alias = list[2].expect_atom("alias in 'as'")?;
-
-    if !is_variable(alias) {
-        return Err(ParseError::InvalidSelect(format!(
-            "alias must be a variable (start with '?'), got: {alias}"
-        )));
-    }
-
-    // Parse the inner aggregate
-    if inner_agg.is_empty() {
-        return Err(ParseError::InvalidSelect(
-            "empty inner aggregate in 'as'".to_string(),
-        ));
-    }
-
-    let inner_fn_name = inner_agg[0]
-        .expect_atom("aggregate function name")?
-        .to_lowercase();
-
-    // Parse the inner aggregate with explicit output var
-    let (function, input_var) = parse_aggregate_fn_and_input(&inner_fn_name, &inner_agg[1..])?;
-
-    Ok(ast::UnresolvedAggregateSpec {
-        function,
-        input_var: Arc::from(input_var),
-        output_var: Arc::from(alias),
-    })
-}
+// SexprToken and tokenization moved to sexpr_tokenize module.
+// Dispatch between aggregate and scalar-expression S-expressions in select
+// is handled inline by `parse_select_string`.
 
 /// Parse a direct aggregate like `(count ?x)` or `(groupconcat ?x ", ")`
 fn parse_direct_aggregate(
@@ -786,7 +793,9 @@ fn parse_aggregate_fn_and_input(
                 )));
             }
             let separator = if args.len() > 1 {
-                args[1].expect_atom("groupconcat separator")?.to_string()
+                // Accept both quoted and unquoted forms — both express a
+                // string literal here.
+                args[1].as_str()?.to_string()
             } else {
                 " ".to_string() // default separator
             };
@@ -1372,7 +1381,7 @@ mod tests {
     }
 
     #[test]
-    fn test_type_expansion() {
+    fn test_type_hydration() {
         let json = json!({
             "@context": { "ex": "http://example.org/" },
             "select": ["?s"],
@@ -1484,7 +1493,7 @@ mod tests {
     }
 
     #[test]
-    fn test_vocab_expansion() {
+    fn test_vocab_hydration() {
         let json = json!({
             "@context": {
                 "@vocab": "http://schema.org/"
@@ -1857,7 +1866,7 @@ mod tests {
     }
 
     #[test]
-    fn test_reference_value_expansion() {
+    fn test_reference_value_hydration() {
         // String values for @id-typed properties should expand to IRIs
         let json = json!({
             "@context": {
@@ -3135,6 +3144,308 @@ mod tests {
             "unexpected error: {msg}"
         );
         assert!(msg.contains("missing closing"), "unexpected error: {msg}");
+    }
+
+    // ==========================================
+    // SELECT-clause scalar expression tests
+    // ==========================================
+
+    #[test]
+    fn test_select_scalar_expr_with_alias_parses_to_expr_column() {
+        // (as (coalesce ?titleFr ?titleEn) ?title) should produce an Expr column.
+        let json = json!({
+            "@context": { "ex": "http://example.org/" },
+            "select": ["?scheme", "(as (coalesce ?titleFr ?titleEn) ?title)"],
+            "where": [
+                {"@id": "?scheme", "@type": "ex:Scheme"},
+                ["optional", {"@id": "?scheme", "ex:titleFr": "?titleFr"}],
+                ["optional", {"@id": "?scheme", "ex:titleEn": "?titleEn"}]
+            ]
+        });
+
+        let (ast, _) = parse_query_ast(&json, None).unwrap();
+        let cols = ast.select.columns();
+        assert_eq!(cols.len(), 2);
+        assert!(matches!(&cols[0], UnresolvedColumn::Var(n) if n.as_ref() == "?scheme"));
+        match &cols[1] {
+            UnresolvedColumn::Computation { expr, alias } => {
+                assert_eq!(alias.as_ref(), "?title");
+                match expr {
+                    UnresolvedExpression::Call { func, args } => {
+                        assert_eq!(func.as_ref(), "coalesce");
+                        assert_eq!(args.len(), 2);
+                    }
+                    other => panic!("expected Call, got {other:?}"),
+                }
+            }
+            other => panic!("expected Expr column, got {other:?}"),
+        }
+        // No aggregates should have been collected.
+        assert!(ast.options.aggregates.is_empty());
+    }
+
+    #[test]
+    fn test_select_scalar_expr_lowers_to_bind() {
+        // The scalar select expression should desugar to a Pattern::Bind in
+        // the IR, with the projection referring to the alias var.
+        use crate::ir::Pattern;
+        let json = json!({
+            "@context": { "ex": "http://example.org/" },
+            "select": ["?scheme", "(as (coalesce ?titleFr ?titleEn) ?title)"],
+            "where": [
+                {"@id": "?scheme", "ex:titleFr": "?titleFr"},
+                {"@id": "?scheme", "ex:titleEn": "?titleEn"}
+            ]
+        });
+
+        let mut vars = VarRegistry::new();
+        let encoder = encode::MemoryEncoder::with_common_namespaces();
+        let query = parse_query(&json, &encoder, &mut vars, None).unwrap();
+
+        // Exactly one Bind pattern, binding the alias to a Coalesce call.
+        let bind_count = query
+            .patterns
+            .iter()
+            .filter(|p| matches!(p, Pattern::Bind { .. }))
+            .count();
+        assert_eq!(
+            bind_count, 1,
+            "expected exactly one BIND pattern from select expression"
+        );
+
+        let title_var = vars.get("?title").expect("alias var registered");
+        let bind = query
+            .patterns
+            .iter()
+            .find_map(|p| match p {
+                Pattern::Bind { var, expr } if *var == title_var => Some(expr),
+                _ => None,
+            })
+            .expect("BIND for ?title");
+        // Expression should be a Coalesce function call.
+        match bind {
+            crate::ir::Expression::Call { func, args } => {
+                assert!(matches!(func, crate::ir::Function::Coalesce));
+                assert_eq!(args.len(), 2);
+            }
+            other => panic!("expected Call(Coalesce), got {other:?}"),
+        }
+        // No grouping phase (no aggregates here, so no post-bind channel).
+        assert!(query.grouping.is_none());
+    }
+
+    #[test]
+    fn test_select_scalar_expr_post_aggregate_bind() {
+        // (as (+ ?cnt 1) ?adjusted) where ?cnt is an aggregate output should
+        // land in the grouping's post-aggregation binds, not in patterns.
+        let json = json!({
+            "@context": { "ex": "http://example.org/" },
+            "select": [
+                "?name",
+                "(as (count ?favNums) ?cnt)",
+                "(as (+ ?cnt 1) ?adjusted)"
+            ],
+            "where": { "ex:name": "?name", "ex:favNums": "?favNums" },
+            "groupBy": ["?name"]
+        });
+
+        let mut vars = VarRegistry::new();
+        let encoder = encode::MemoryEncoder::with_common_namespaces();
+        let query = parse_query(&json, &encoder, &mut vars, None).unwrap();
+
+        // One aggregate, one post-aggregation BIND.
+        let aggregates: Vec<_> = query
+            .grouping
+            .as_ref()
+            .map(|g| g.aggregates().collect())
+            .unwrap_or_default();
+        assert_eq!(aggregates.len(), 1);
+        let post_binds = query
+            .grouping
+            .as_ref()
+            .and_then(crate::ir::Grouping::aggregation)
+            .map(|agg| agg.binds.as_slice())
+            .unwrap_or(&[]);
+        assert_eq!(post_binds.len(), 1);
+        let adjusted_var = vars.get("?adjusted").expect("?adjusted registered");
+        assert_eq!(post_binds[0].0, adjusted_var);
+    }
+
+    #[test]
+    fn test_select_scalar_expr_without_alias_errors() {
+        // A bare scalar S-expression in select must require an alias.
+        let json = json!({
+            "@context": { "ex": "http://example.org/" },
+            "select": ["?scheme", "(coalesce ?a ?b)"],
+            "where": { "@id": "?scheme", "ex:a": "?a", "ex:b": "?b" }
+        });
+
+        let err = parse_query_ast(&json, None).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("requires an alias"), "unexpected error: {msg}");
+    }
+
+    #[test]
+    fn test_select_scalar_expr_with_if_function() {
+        // IF is a builtin scalar conditional; should also work via (as ... ?alias).
+        let json = json!({
+            "@context": { "ex": "http://example.org/" },
+            "select": ["?p", "(as (if (> ?age 18) \"adult\" \"minor\") ?label)"],
+            "where": { "@id": "?p", "ex:age": "?age" }
+        });
+
+        let (ast, _) = parse_query_ast(&json, None).unwrap();
+        match &ast.select.columns()[1] {
+            UnresolvedColumn::Computation { alias, expr } => {
+                assert_eq!(alias.as_ref(), "?label");
+                assert!(
+                    matches!(expr, UnresolvedExpression::Call { func, .. } if func.as_ref() == "if")
+                );
+            }
+            other => panic!("expected Expr column, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_select_scalar_expr_quoted_keyword_stays_string() {
+        // Regression: a quoted "false" / "42" / "?nope" in a select expression
+        // must remain a string literal — not be re-parsed as a boolean,
+        // number, or variable. Regression for the SexprToken atom/string
+        // collapse that earlier versions had.
+        let json = json!({
+            "@context": { "ex": "http://example.org/" },
+            "select": [
+                "?p",
+                "(as (coalesce ?flag \"false\") ?fallback_bool)",
+                "(as (coalesce ?n \"42\") ?fallback_num)",
+                "(as (coalesce ?v \"?notavar\") ?fallback_varlike)"
+            ],
+            "where": { "@id": "?p", "ex:flag": "?flag", "ex:n": "?n", "ex:v": "?v" }
+        });
+        let (ast, _) = parse_query_ast(&json, None).unwrap();
+
+        // For each Expr column, the second arg of coalesce must be a string Const.
+        for (idx, expected) in [(1, "false"), (2, "42"), (3, "?notavar")] {
+            let col = &ast.select.columns()[idx];
+            let UnresolvedColumn::Computation { expr, .. } = col else {
+                panic!("col {idx}: expected Expr, got {col:?}");
+            };
+            let UnresolvedExpression::Call { func, args } = expr else {
+                panic!("col {idx}: expected Call, got {expr:?}");
+            };
+            assert_eq!(func.as_ref(), "coalesce");
+            match &args[1] {
+                UnresolvedExpression::Const(crate::parse::ast::UnresolvedFilterValue::String(
+                    s,
+                )) => {
+                    assert_eq!(s.as_ref(), expected, "col {idx} second arg");
+                }
+                other => panic!("col {idx} second arg: expected string Const, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn test_select_scalar_expr_xsd_cast_recognized() {
+        // Parity with SPARQL: xsd:integer / xsd:boolean / etc. cast
+        // constructors must lower to the dedicated `Function::Xsd*` variant
+        // rather than fall through to `Function::Custom`.
+        let json = json!({
+            "@context": { "ex": "http://example.org/" },
+            "select": [
+                "?p",
+                "(as (xsd:integer ?n) ?asInt)",
+                "(as (xsd:string ?n) ?asStr)"
+            ],
+            "where": { "@id": "?p", "ex:n": "?n" }
+        });
+        let mut vars = VarRegistry::new();
+        let encoder = encode::MemoryEncoder::with_common_namespaces();
+        let query = parse_query(&json, &encoder, &mut vars, None).unwrap();
+
+        let int_var = vars.get("?asInt").expect("?asInt registered");
+        let str_var = vars.get("?asStr").expect("?asStr registered");
+
+        let mut found_int = false;
+        let mut found_str = false;
+        for p in &query.patterns {
+            if let crate::ir::Pattern::Bind {
+                var,
+                expr: crate::ir::Expression::Call { func, .. },
+            } = p
+            {
+                if *var == int_var {
+                    assert!(matches!(func, crate::ir::Function::XsdInteger));
+                    found_int = true;
+                }
+                if *var == str_var {
+                    assert!(matches!(func, crate::ir::Function::XsdString));
+                    found_str = true;
+                }
+            }
+        }
+        assert!(
+            found_int,
+            "xsd:integer cast did not lower to Function::XsdInteger"
+        );
+        assert!(
+            found_str,
+            "xsd:string cast did not lower to Function::XsdString"
+        );
+    }
+
+    #[test]
+    fn test_select_scalar_expr_chained_post_binds() {
+        // Regression: an Expr that references a previous Expr alias which
+        // itself landed in post_binds must also land in post_binds. Otherwise
+        // the chained expression evaluates against an unbound variable.
+        let json = json!({
+            "@context": { "ex": "http://example.org/" },
+            "select": [
+                "?name",
+                "(as (count ?favNums) ?cnt)",
+                "(as (+ ?cnt 1) ?adjusted)",
+                "(as (+ ?adjusted 1) ?again)"
+            ],
+            "where": { "ex:name": "?name", "ex:favNums": "?favNums" },
+            "groupBy": ["?name"]
+        });
+
+        let mut vars = VarRegistry::new();
+        let encoder = encode::MemoryEncoder::with_common_namespaces();
+        let query = parse_query(&json, &encoder, &mut vars, None).unwrap();
+
+        // One aggregate, two post-aggregation BINDs (in select order).
+        let aggregates: Vec<_> = query
+            .grouping
+            .as_ref()
+            .map(|g| g.aggregates().collect())
+            .unwrap_or_default();
+        assert_eq!(aggregates.len(), 1);
+        let post_binds = query
+            .grouping
+            .as_ref()
+            .and_then(crate::ir::Grouping::aggregation)
+            .map(|agg| agg.binds.as_slice())
+            .unwrap_or(&[]);
+        assert_eq!(post_binds.len(), 2);
+
+        let adjusted_var = vars.get("?adjusted").expect("?adjusted registered");
+        let again_var = vars.get("?again").expect("?again registered");
+        assert_eq!(post_binds[0].0, adjusted_var);
+        assert_eq!(post_binds[1].0, again_var);
+
+        // No leaked Pattern::Bind for these — they must NOT have been
+        // pre-aggregation.
+        let bind_count = query
+            .patterns
+            .iter()
+            .filter(|p| matches!(p, crate::ir::Pattern::Bind { .. }))
+            .count();
+        assert_eq!(
+            bind_count, 0,
+            "chained post-bind expression must not leak into pre-aggregation patterns"
+        );
     }
 
     // ==========================================

@@ -6,7 +6,7 @@
 use crate::ast::expr::{BinaryOp, Expression as AstExpression, FunctionName, UnaryOp};
 use crate::ast::term::{Literal, LiteralValue};
 use fluree_db_core::FlakeValue;
-use fluree_db_query::ir::{Expression, FilterValue, Function};
+use fluree_db_query::ir::{Expression, Function};
 use fluree_db_query::parse::encode::IriEncoder;
 use fluree_vocab::xsd;
 
@@ -35,7 +35,7 @@ impl<E: IriEncoder> LoweringContext<'_, E> {
                 let full_iri = self.expand_iri(iri)?;
                 Ok(Expression::Call {
                     func: Function::Iri,
-                    args: vec![Expression::Const(FilterValue::String(full_iri))],
+                    args: vec![Expression::Const(FlakeValue::String(full_iri))],
                 })
             }
 
@@ -159,7 +159,7 @@ impl<E: IriEncoder> LoweringContext<'_, E> {
     ) -> Result<Expression> {
         let l = self.lower_expression(left)?;
         let r = self.lower_expression(right)?;
-        Ok(Expression::compare(func, l, r))
+        Ok(Expression::binary(func, l, r))
     }
 
     fn lower_arithmetic(
@@ -170,31 +170,39 @@ impl<E: IriEncoder> LoweringContext<'_, E> {
     ) -> Result<Expression> {
         let l = self.lower_expression(left)?;
         let r = self.lower_expression(right)?;
-        Ok(Expression::arithmetic(func, l, r))
+        Ok(Expression::binary(func, l, r))
     }
 
-    fn lower_filter_value(&self, lit: &Literal) -> Result<FilterValue> {
+    fn lower_filter_value(&self, lit: &Literal) -> Result<FlakeValue> {
         match &lit.value {
-            LiteralValue::Simple(s) => Ok(FilterValue::String(s.to_string())),
-            LiteralValue::LangTagged { value, .. } => Ok(FilterValue::String(value.to_string())),
-            LiteralValue::Integer(i) => Ok(FilterValue::Long(*i)),
-            LiteralValue::Double(d) => Ok(FilterValue::Double(*d)),
+            LiteralValue::Simple(s) => Ok(FlakeValue::String(s.to_string())),
+            LiteralValue::LangTagged { value, .. } => Ok(FlakeValue::String(value.to_string())),
+            LiteralValue::Integer(i) => Ok(FlakeValue::Long(*i)),
+            LiteralValue::Double(d) => Ok(FlakeValue::Double(*d)),
             LiteralValue::Decimal(d) => {
                 let val: f64 = d
                     .parse()
                     .map_err(|_| LowerError::invalid_decimal(d.as_ref(), lit.span))?;
-                Ok(FilterValue::Double(val))
+                Ok(FlakeValue::Double(val))
             }
-            LiteralValue::Boolean(b) => Ok(FilterValue::Bool(*b)),
+            LiteralValue::Boolean(b) => Ok(FlakeValue::Boolean(*b)),
             LiteralValue::Typed { value, datatype } => {
                 let fv = self.lower_typed_literal(value, datatype)?;
-                match fv {
-                    FlakeValue::Long(n) => Ok(FilterValue::Long(n)),
-                    FlakeValue::Double(d) => Ok(FilterValue::Double(d)),
-                    FlakeValue::Boolean(b) => Ok(FilterValue::Bool(b)),
-                    FlakeValue::String(s) => Ok(FilterValue::String(s)),
-                    fv if fv.is_temporal() || fv.is_duration() => Ok(FilterValue::Temporal(fv)),
-                    _ => Ok(FilterValue::String(value.to_string())),
+                // Pass through any FlakeValue variant the typed-literal
+                // lowerer produced; fall back to a string if it's a kind
+                // we don't have native support for as a filter constant.
+                if matches!(
+                    fv,
+                    FlakeValue::Long(_)
+                        | FlakeValue::Double(_)
+                        | FlakeValue::Boolean(_)
+                        | FlakeValue::String(_),
+                ) || fv.is_temporal()
+                    || fv.is_duration()
+                {
+                    Ok(fv)
+                } else {
+                    Ok(FlakeValue::String(value.to_string()))
                 }
             }
         }

@@ -855,13 +855,28 @@ pub enum UnresolvedColumn {
     /// Hydrate a subject (variable or IRI constant) into a nested JSON-LD
     /// object (e.g. `{"?person": ["*"]}`).
     Hydration(UnresolvedHydrationSpec),
+    /// A computed expression with an explicit alias.
+    ///
+    /// Written in the SELECT clause as `(as <expr> ?alias)`, e.g.
+    /// `(as (coalesce ?titleFr ?titleEn) ?title)`. Lowered to a
+    /// `Column::Var(alias)` projection plus a `Pattern::Bind { var: alias, expr }`
+    /// injected into the patterns list — or into `options.post_binds` when
+    /// the expression references an aggregate output variable.
+    Computation {
+        expr: UnresolvedExpression,
+        alias: Arc<str>,
+    },
 }
 
 impl UnresolvedColumn {
-    /// Returns the variable name if this is a `Var` column.
+    /// Returns the variable name if this column projects a single variable.
+    ///
+    /// `Computation` columns return their alias variable, since after
+    /// lowering the projection is just the alias VarId.
     pub fn var_name(&self) -> Option<&str> {
         match self {
             UnresolvedColumn::Var(name) => Some(name),
+            UnresolvedColumn::Computation { alias, .. } => Some(alias),
             UnresolvedColumn::Hydration(_) => None,
         }
     }
@@ -870,7 +885,7 @@ impl UnresolvedColumn {
     pub fn as_hydration(&self) -> Option<&UnresolvedHydrationSpec> {
         match self {
             UnresolvedColumn::Hydration(spec) => Some(spec),
-            UnresolvedColumn::Var(_) => None,
+            UnresolvedColumn::Var(_) | UnresolvedColumn::Computation { .. } => None,
         }
     }
 }
@@ -1064,6 +1079,18 @@ impl UnresolvedPattern {
             _ => None,
         }
     }
+}
+
+/// User-declared select shape from the input syntax. Parser-only — lowered
+/// into a `Projection` variant in the IR.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SelectShape {
+    /// Array-form select: each row is a tuple. Default; SPARQL and JSON-LD
+    /// array-form `select`.
+    #[default]
+    Tuple,
+    /// Bare-string `select: "?x"`: each row is a single bare value.
+    Scalar,
 }
 
 /// Unresolved query - the result of parsing before IRI resolution

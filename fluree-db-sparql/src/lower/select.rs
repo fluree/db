@@ -11,9 +11,8 @@ use crate::ast::query::{
 };
 use crate::span::SourceSpan;
 
-use fluree_db_query::aggregate::AggregateSpec;
-use fluree_db_query::ir::QueryOptions;
-use fluree_db_query::ir::{Expression, FilterValue, Pattern, SubqueryPattern};
+use fluree_db_query::ir::AggregateSpec;
+use fluree_db_query::ir::{Expression, FlakeValue, Grouping, Pattern, SubqueryPattern};
 use fluree_db_query::parse::encode::IriEncoder;
 use fluree_db_query::sort::{SortDirection, SortSpec};
 use fluree_db_query::var_registry::VarId;
@@ -31,10 +30,32 @@ pub(super) struct SelectBinds {
     pub post: Vec<(VarId, Expression)>,
 }
 
+/// LIMIT / OFFSET / ORDER BY values produced by `lower_base_modifiers`.
+/// Each lives on `Query` directly, so the lowering helper just hands them
+/// back as a bundle for the caller to attach.
+pub(super) struct BaseModifiers {
+    pub limit: Option<usize>,
+    pub offset: Option<usize>,
+    pub ordering: Vec<SortSpec>,
+}
+
 /// Result of lowering solution modifiers.
 pub(super) struct LoweredModifiers {
-    /// Query options (GROUP BY vars, aggregates, HAVING, ORDER BY, LIMIT, OFFSET, DISTINCT)
-    pub options: QueryOptions,
+    /// LIMIT, OFFSET, ORDER BY — lifted onto `Query` by the caller.
+    pub base: BaseModifiers,
+    /// Whether the SELECT carried `DISTINCT`. Lifted into the resulting
+    /// [`QueryOutput::Select::restriction`] by the caller.
+    pub distinct: bool,
+    /// GROUP BY variables. Empty when the surface SELECT had no `GROUP BY`
+    /// and no implied grouping was derived. Lifted into `Query.grouping`
+    /// by the caller.
+    pub group_by: Vec<VarId>,
+    /// Aggregate specs computed per group (or once if `group_by` is empty
+    /// and `aggregates` is non-empty — implicit single-group aggregation).
+    pub aggregates: Vec<AggregateSpec>,
+    /// HAVING expression (post-lift — aggregate calls have been hoisted into
+    /// `aggregates` with synthetic output variables, and this references them).
+    pub having: Option<Expression>,
     /// Pre-GROUP-BY BIND patterns for expression-based GROUP BY conditions.
     /// These must be injected into the WHERE pattern list before query building.
     pub pre_group_binds: Vec<Pattern>,
@@ -123,36 +144,35 @@ impl<E: IriEncoder> LoweringContext<'_, E> {
         modifiers: &SolutionModifiers,
         select: &SelectClause,
     ) -> Result<LoweredModifiers> {
-        let mut options = QueryOptions {
-            distinct: select.modifier == Some(SelectModifier::Distinct),
-            ..Default::default()
-        };
+        let distinct = select.modifier == Some(SelectModifier::Distinct);
+        let mut group_by: Vec<VarId> = Vec::new();
+        let mut having: Option<Expression> = None;
         let mut pre_group_binds = Vec::new();
 
         // LIMIT, OFFSET, ORDER BY
-        self.lower_base_modifiers(modifiers, &mut options)?;
+        let base = self.lower_base_modifiers(modifiers)?;
 
         // GROUP BY — supports both variables and expressions.
         // Expression GROUP BY like `GROUP BY (expr AS ?alias)` desugars to
         // a pre-group BIND pattern + GROUP BY on the alias variable.
-        if let Some(ref group_by) = modifiers.group_by {
-            let mut group_vars = Vec::with_capacity(group_by.conditions.len());
-            for cond in &group_by.conditions {
+        if let Some(ref group_by_clause) = modifiers.group_by {
+            let mut group_vars = Vec::with_capacity(group_by_clause.conditions.len());
+            for cond in &group_by_clause.conditions {
                 let (var_id, bind_pattern) = self.lower_group_condition(cond)?;
                 group_vars.push(var_id);
                 if let Some(pattern) = bind_pattern {
                     pre_group_binds.push(pattern);
                 }
             }
-            options.group_by = group_vars;
+            group_by = group_vars;
         }
 
         // HAVING (may reference aggregate expressions)
         let mut having_aggregates: Vec<AggregateSpec> = Vec::new();
-        if let Some(ref having) = modifiers.having {
+        if let Some(ref having_clause) = modifiers.having {
             let mut aggregate_aliases = self.build_aggregate_aliases(select)?;
             let mut having_pre_binds: Vec<Pattern> = Vec::new();
-            for cond in &having.conditions {
+            for cond in &having_clause.conditions {
                 self.collect_having_aggregates(
                     cond,
                     &mut aggregate_aliases,
@@ -162,58 +182,59 @@ impl<E: IriEncoder> LoweringContext<'_, E> {
             }
             self.aggregate_aliases = Some(aggregate_aliases);
             // Combine all HAVING conditions with AND
-            let filter = self.lower_having_conditions(&having.conditions)?;
-            options.having = Some(filter);
+            let filter = self.lower_having_conditions(&having_clause.conditions)?;
+            having = Some(filter);
             self.aggregate_aliases = None;
             pre_group_binds.extend(having_pre_binds);
         }
 
-        // Extract aggregates from SELECT clause
-        let (select_aggregates, select_agg_binds) = self.extract_aggregates(select)?;
-        options.aggregates = select_aggregates;
+        // Extract aggregates from SELECT clause, then append any aggregates
+        // lifted out of HAVING.
+        let (mut aggregates, select_agg_binds) = self.extract_aggregates(select)?;
         pre_group_binds.extend(select_agg_binds);
-        if !having_aggregates.is_empty() {
-            options.aggregates.extend(having_aggregates);
-        }
+        aggregates.extend(having_aggregates);
 
         // Auto-populate GROUP BY when aggregates present but no explicit GROUP BY
         // Per SPARQL semantics, all non-aggregated SELECT variables must be in GROUP BY
-        if !options.aggregates.is_empty() && options.group_by.is_empty() {
-            options.group_by = self.collect_non_aggregate_select_vars(select);
+        if !aggregates.is_empty() && group_by.is_empty() {
+            group_by = self.collect_non_aggregate_select_vars(select);
         }
 
         Ok(LoweredModifiers {
-            options,
+            base,
+            distinct,
+            group_by,
+            aggregates,
+            having,
             pre_group_binds,
         })
     }
 
-    /// Lower LIMIT, OFFSET, and ORDER BY modifiers (shared by SELECT and CONSTRUCT).
+    /// Lower LIMIT, OFFSET, and ORDER BY modifiers (shared by SELECT and
+    /// CONSTRUCT). Each rides on `Query` directly; the caller attaches them.
     pub(super) fn lower_base_modifiers(
         &mut self,
         modifiers: &SolutionModifiers,
-        options: &mut QueryOptions,
-    ) -> Result<()> {
-        // LIMIT
-        if let Some(ref limit_clause) = modifiers.limit {
-            options.limit = Some(limit_clause.value as usize);
-        }
+    ) -> Result<BaseModifiers> {
+        let limit = modifiers.limit.as_ref().map(|clause| clause.value as usize);
+        let offset = modifiers
+            .offset
+            .as_ref()
+            .map(|clause| clause.value as usize);
+        let ordering = match &modifiers.order_by {
+            Some(order_by) => order_by
+                .conditions
+                .iter()
+                .map(|cond| self.lower_order_condition(cond))
+                .collect::<Result<Vec<_>>>()?,
+            None => Vec::new(),
+        };
 
-        // OFFSET
-        if let Some(ref offset_clause) = modifiers.offset {
-            options.offset = Some(offset_clause.value as usize);
-        }
-
-        // ORDER BY (vars-only MVP)
-        if let Some(ref order_by) = modifiers.order_by {
-            let mut sort_specs = Vec::with_capacity(order_by.conditions.len());
-            for cond in &order_by.conditions {
-                sort_specs.push(self.lower_order_condition(cond)?);
-            }
-            options.order_by = sort_specs;
-        }
-
-        Ok(())
+        Ok(BaseModifiers {
+            limit,
+            offset,
+            ordering,
+        })
     }
 
     /// Lower an ORDER BY condition (vars-only MVP)
@@ -290,7 +311,7 @@ impl<E: IriEncoder> LoweringContext<'_, E> {
     fn lower_having_conditions(&mut self, conditions: &[AstExpression]) -> Result<Expression> {
         if conditions.is_empty() {
             // Should not happen - HAVING requires at least one condition
-            return Ok(Expression::Const(FilterValue::Bool(true)));
+            return Ok(Expression::Const(FlakeValue::Boolean(true)));
         }
 
         let mut exprs: Vec<Expression> = Vec::with_capacity(conditions.len());
@@ -396,11 +417,12 @@ impl<E: IriEncoder> LoweringContext<'_, E> {
             group_vars = self.collect_non_aggregate_select_vars(&select_clause);
         }
 
-        if !group_vars.is_empty() {
-            sq = sq.with_group_by(group_vars);
-        }
-        if !aggregates.is_empty() {
-            sq = sq.with_aggregates(aggregates);
+        // Lift GROUP BY / aggregates into the SubqueryPattern's grouping
+        // phase. Subselect HAVING isn't lowered here (its surface syntax is
+        // captured upstream and would require its own lowering); same for
+        // post-aggregation binds.
+        if let Some(grouping) = Grouping::assemble(group_vars, aggregates, Vec::new(), None) {
+            sq = sq.with_grouping(grouping);
         }
 
         // Apply LIMIT
@@ -438,7 +460,7 @@ impl<E: IriEncoder> LoweringContext<'_, E> {
                     direction,
                 });
             }
-            sq = sq.with_order_by(sort_specs);
+            sq = sq.with_ordering(sort_specs);
         }
 
         Ok(vec![Pattern::Subquery(sq)])

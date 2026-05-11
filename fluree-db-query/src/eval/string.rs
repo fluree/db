@@ -587,8 +587,8 @@ pub fn eval_str_lang<R: RowAccess>(
 mod tests {
     use super::*;
     use crate::binding::Batch;
-    use crate::ir::FilterValue;
     use crate::var_registry::VarId;
+    use fluree_db_core::value::FlakeValue;
     use fluree_db_core::Sid;
 
     fn make_string_batch() -> Batch {
@@ -626,7 +626,7 @@ mod tests {
         let result = eval_contains::<_>(
             &[
                 Expression::Var(VarId(0)),
-                Expression::Const(FilterValue::String("World".to_string())),
+                Expression::Const(FlakeValue::String("World".to_string())),
             ],
             &row,
             None,
@@ -649,7 +649,7 @@ mod tests {
         let result = eval_regex::<_>(
             &[
                 Expression::Var(VarId(0)),
-                Expression::Const(FilterValue::String("^Hello".to_string())),
+                Expression::Const(FlakeValue::String("^Hello".to_string())),
             ],
             &row,
             None,

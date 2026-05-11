@@ -469,7 +469,7 @@ impl Fluree {
     ///
     /// Applies reasoning from the primary view if set. When reasoning config
     /// on the primary view declares `f:schemaSource`, resolves the schema
-    /// bundle closure and attaches it to `executable.options.schema_bundle`.
+    /// bundle closure and attaches it to `executable.reasoning.schema_bundle`.
     async fn build_executable_for_dataset(
         &self,
         dataset: &DataSetDb,
@@ -480,13 +480,13 @@ impl Fluree {
         // Apply reasoning from primary view if set
         if let Some(primary) = dataset.primary() {
             if primary.reasoning().is_some() {
-                let query_has_reasoning = executable.options.reasoning.has_any_enabled();
-                let query_disabled = executable.options.reasoning.is_disabled();
+                let query_has_reasoning = executable.reasoning.modes.has_any_enabled();
+                let query_disabled = executable.reasoning.modes.is_disabled();
 
                 if let Some(effective) =
                     primary.effective_reasoning(query_has_reasoning, query_disabled)
                 {
-                    executable.options.reasoning = effective.clone();
+                    executable.reasoning.modes = effective.clone();
                 }
             }
 
@@ -504,7 +504,7 @@ impl Fluree {
         primary: &crate::view::GraphDb,
         executable: &mut ExecutableQuery,
     ) -> Result<()> {
-        if executable.options.reasoning.is_disabled() {
+        if executable.reasoning.modes.is_disabled() {
             return Ok(());
         }
         let Some(resolved) = primary.resolved_config() else {
@@ -533,7 +533,7 @@ impl Fluree {
             &bundle,
         )
         .await?;
-        executable.options.schema_bundle = Some(flakes);
+        executable.reasoning.schema_bundle = Some(flakes);
         Ok(())
     }
 

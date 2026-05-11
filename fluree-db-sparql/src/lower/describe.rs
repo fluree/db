@@ -15,12 +15,13 @@ use crate::SourceSpan;
 use fluree_db_query::binding::Binding;
 use fluree_db_query::ir::triple::{Ref, Term, TriplePattern};
 use fluree_db_query::ir::{
-    ConstructTemplate as QueryConstructTemplate, Expression, Pattern, Query, QueryOptions,
-    QueryOutput, SubqueryPattern,
+    ConstructTemplate as QueryConstructTemplate, Expression, Pattern, Query, QueryOutput,
+    ReasoningConfig, SubqueryPattern,
 };
 use fluree_db_query::parse::encode::IriEncoder;
 use fluree_db_query::var_registry::VarId;
 
+use super::select::BaseModifiers;
 use super::{LowerError, LoweringContext, Result};
 
 impl<E: IriEncoder> LoweringContext<'_, E> {
@@ -140,7 +141,11 @@ impl<E: IriEncoder> LoweringContext<'_, E> {
             orig_context: Some(ctx_val),
             output: QueryOutput::Construct(template),
             patterns,
-            options: QueryOptions::default(),
+            reasoning: ReasoningConfig::default(),
+            grouping: None,
+            ordering: Vec::new(),
+            limit: None,
+            offset: None,
             post_values: None,
         })
     }
@@ -186,11 +191,14 @@ impl<E: IriEncoder> LoweringContext<'_, E> {
             ));
         }
 
-        let mut opts = QueryOptions::default();
-        self.lower_base_modifiers(modifiers, &mut opts)?;
+        let BaseModifiers {
+            limit,
+            offset,
+            ordering,
+        } = self.lower_base_modifiers(modifiers)?;
 
         // For simplicity and predictable performance, require ORDER BY vars to be part of the subquery select list.
-        for spec in &opts.order_by {
+        for spec in &ordering {
             if !select_vars.contains(&spec.var) {
                 return Err(LowerError::unsupported_form(
                     "DESCRIBE ORDER BY on non-target variables",
@@ -199,9 +207,9 @@ impl<E: IriEncoder> LoweringContext<'_, E> {
             }
         }
 
-        subq.limit = opts.limit;
-        subq.offset = opts.offset;
-        subq.order_by = opts.order_by;
+        subq.limit = limit;
+        subq.offset = offset;
+        subq.ordering = ordering;
         Ok(())
     }
 }

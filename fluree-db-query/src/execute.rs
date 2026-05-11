@@ -28,7 +28,7 @@
 //! - `operator_tree`: Complete operator tree construction
 //! - `runner`: Unified execution runner (eliminates duplication)
 //!
-//! Use `execute_query` for simple execution or build an `ExecutableQuery` with custom `QueryOptions` for full control.
+//! Use `execute_query` for simple execution or build an `ExecutableQuery` with custom `ReasoningConfig` for full control.
 
 mod dependency;
 pub(crate) mod operator_tree;
@@ -67,8 +67,8 @@ pub use runner::{
 mod tests {
     use super::*;
     use crate::ir::triple::{Ref, Term, TriplePattern};
-    use crate::ir::QueryOptions;
-    use crate::ir::{Expression, FilterValue, Pattern};
+    use crate::ir::ReasoningConfig;
+    use crate::ir::{Expression, Pattern};
     use crate::ir::{Query, QueryOutput};
     use crate::planner::reorder_patterns;
     use crate::sort::SortSpec;
@@ -103,7 +103,11 @@ mod tests {
             orig_context: None,
             output: QueryOutput::wildcard(),
             patterns: vec![],
-            options: QueryOptions::default(),
+            reasoning: ReasoningConfig::default(),
+            grouping: None,
+            ordering: Vec::new(),
+            limit: None,
+            offset: None,
             post_values: None,
         };
         let executable = ExecutableQuery::simple(query);
@@ -117,27 +121,6 @@ mod tests {
         assert_eq!(results[0].len(), 1);
     }
 
-    #[tokio::test]
-    async fn test_query_options_builder() {
-        let opts = QueryOptions::new()
-            .with_limit(10)
-            .with_offset(5)
-            .with_distinct()
-            .with_order_by(vec![SortSpec::asc(VarId(0))]);
-
-        assert_eq!(opts.limit, Some(10));
-        assert_eq!(opts.offset, Some(5));
-        assert!(opts.distinct);
-        assert_eq!(opts.order_by.len(), 1);
-        assert!(opts.has_modifiers());
-    }
-
-    #[tokio::test]
-    async fn test_query_options_default_no_modifiers() {
-        let opts = QueryOptions::default();
-        assert!(!opts.has_modifiers());
-    }
-
     #[test]
     fn test_build_operator_tree_validates_select_vars() {
         let query = Query {
@@ -145,13 +128,16 @@ mod tests {
             orig_context: None,
             output: QueryOutput::select_all(vec![VarId(99)]), // Variable not in pattern
             patterns: vec![Pattern::Triple(make_pattern(VarId(0), "name", VarId(1)))],
-            options: QueryOptions::default(),
+            reasoning: ReasoningConfig::default(),
+            grouping: None,
+            ordering: Vec::new(),
+            limit: None,
+            offset: None,
             post_values: None,
         };
 
         let result = build_operator_tree(
             &query,
-            &QueryOptions::default(),
             None,
             &crate::temporal_mode::PlanningContext::current(),
         );
@@ -168,15 +154,16 @@ mod tests {
             orig_context: None,
             output: QueryOutput::select_all(vec![VarId(0)]),
             patterns: vec![Pattern::Triple(make_pattern(VarId(0), "name", VarId(1)))],
-            options: QueryOptions::default(),
+            reasoning: ReasoningConfig::default(),
+            grouping: None,
+            ordering: vec![SortSpec::asc(VarId(99))], // Invalid var
+            limit: None,
+            offset: None,
             post_values: None,
         };
 
-        let options = QueryOptions::new().with_order_by(vec![SortSpec::asc(VarId(99))]); // Invalid var
-
         let result = build_operator_tree(
             &query,
-            &options,
             None,
             &crate::temporal_mode::PlanningContext::current(),
         );
@@ -208,7 +195,7 @@ mod tests {
             Pattern::Triple(make_pattern(VarId(0), "age", VarId(1))),
             Pattern::Filter(Expression::gt(
                 Expression::Var(VarId(1)),
-                Expression::Const(FilterValue::Long(18)),
+                Expression::Const(FlakeValue::Long(18)),
             )),
         ];
 
@@ -231,7 +218,7 @@ mod tests {
             Pattern::Triple(make_pattern(score, "hasScore", score_v)),
             Pattern::Filter(Expression::gt(
                 Expression::Var(score_v),
-                Expression::Const(FilterValue::Double(0.4)),
+                Expression::Const(FlakeValue::Double(0.4)),
             )),
             Pattern::Triple(TriplePattern::new(
                 Ref::Var(score),
@@ -301,11 +288,11 @@ mod tests {
         let remaining = vec![Pattern::Filter(Expression::and(vec![
             Expression::gt(
                 Expression::Var(VarId(1)),
-                Expression::Const(FilterValue::Long(18)),
+                Expression::Const(FlakeValue::Long(18)),
             ),
             Expression::lt(
                 Expression::Var(VarId(1)),
-                Expression::Const(FilterValue::Long(65)),
+                Expression::Const(FlakeValue::Long(65)),
             ),
         ]))];
 

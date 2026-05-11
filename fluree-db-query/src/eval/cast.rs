@@ -324,22 +324,22 @@ fn canonical_decimal_string(d: &BigDecimal) -> String {
 mod tests {
     use super::*;
     use crate::binding::BindingRow;
-    use crate::ir::FilterValue;
+    use fluree_db_core::value::FlakeValue;
 
     fn long(v: i64) -> Expression {
-        Expression::Const(FilterValue::Long(v))
+        Expression::Const(FlakeValue::Long(v))
     }
 
     fn double(v: f64) -> Expression {
-        Expression::Const(FilterValue::Double(v))
+        Expression::Const(FlakeValue::Double(v))
     }
 
     fn bool_expr(v: bool) -> Expression {
-        Expression::Const(FilterValue::Bool(v))
+        Expression::Const(FlakeValue::Boolean(v))
     }
 
     fn string_expr(s: &str) -> Expression {
-        Expression::Const(FilterValue::String(s.to_string()))
+        Expression::Const(FlakeValue::String(s.to_string()))
     }
 
     fn empty_row() -> BindingRow<'static> {

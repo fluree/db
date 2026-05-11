@@ -558,16 +558,17 @@ fn extract_var(expr: &Expression) -> Option<VarId> {
 
 /// Extract a RangeValue from an expression if it's a constant
 fn extract_const(expr: &Expression) -> Option<RangeValue> {
-    use crate::ir::FilterValue;
+    use fluree_db_core::value::FlakeValue;
 
     match expr {
-        Expression::Const(FilterValue::Long(n)) => Some(RangeValue::Long(*n)),
+        Expression::Const(FlakeValue::Long(n)) => Some(RangeValue::Long(*n)),
         // NaN is not a meaningful range bound.
-        Expression::Const(FilterValue::Double(d)) if d.is_nan() => None,
-        Expression::Const(FilterValue::Double(d)) => Some(RangeValue::Double(*d)),
-        Expression::Const(FilterValue::String(s)) => Some(RangeValue::String(s.clone())),
-        Expression::Const(FilterValue::Temporal(fv)) => {
-            // Duration (non-totally-orderable) should NOT be pushed down as a range constraint
+        Expression::Const(FlakeValue::Double(d)) if d.is_nan() => None,
+        Expression::Const(FlakeValue::Double(d)) => Some(RangeValue::Double(*d)),
+        Expression::Const(FlakeValue::String(s)) => Some(RangeValue::String(s.clone())),
+        // Temporal/duration values: only totally-orderable kinds push down.
+        // Duration is partially ordered (months vs days) so skip it.
+        Expression::Const(fv) if fv.is_temporal() || fv.is_duration() => {
             if matches!(fv, FlakeValue::Duration(_)) {
                 None
             } else {
@@ -1563,14 +1564,14 @@ mod tests {
     }
 
     // Range extraction tests
-    use crate::ir::{Expression, FilterValue, Function};
+    use crate::ir::{Expression, FlakeValue, Function};
 
     #[test]
     fn test_extract_range_simple_gt() {
         // ?age > 18
         let expr = Expression::gt(
             Expression::Var(VarId(0)),
-            Expression::Const(FilterValue::Long(18)),
+            Expression::Const(FlakeValue::Long(18)),
         );
 
         let constraints = extract_range_constraints(&expr).expect("should extract");
@@ -1587,7 +1588,7 @@ mod tests {
         // ?age <= 65
         let expr = Expression::le(
             Expression::Var(VarId(0)),
-            Expression::Const(FilterValue::Long(65)),
+            Expression::Const(FlakeValue::Long(65)),
         );
 
         let constraints = extract_range_constraints(&expr).expect("should extract");
@@ -1602,7 +1603,7 @@ mod tests {
         // ?status = "active"
         let expr = Expression::eq(
             Expression::Var(VarId(0)),
-            Expression::Const(FilterValue::String("active".to_string())),
+            Expression::Const(FlakeValue::String("active".to_string())),
         );
 
         let constraints = extract_range_constraints(&expr).expect("should extract");
@@ -1623,7 +1624,7 @@ mod tests {
     fn test_extract_range_reversed_comparison() {
         // 18 < ?age (means ?age > 18)
         let expr = Expression::lt(
-            Expression::Const(FilterValue::Long(18)),
+            Expression::Const(FlakeValue::Long(18)),
             Expression::Var(VarId(0)),
         );
 
@@ -1642,11 +1643,11 @@ mod tests {
         let expr = Expression::and(vec![
             Expression::ge(
                 Expression::Var(VarId(0)),
-                Expression::Const(FilterValue::Long(18)),
+                Expression::Const(FlakeValue::Long(18)),
             ),
             Expression::lt(
                 Expression::Var(VarId(0)),
-                Expression::Const(FilterValue::Long(65)),
+                Expression::Const(FlakeValue::Long(65)),
             ),
         ]);
 
@@ -1665,11 +1666,11 @@ mod tests {
         let expr = Expression::and(vec![
             Expression::ge(
                 Expression::Var(VarId(0)),
-                Expression::Const(FilterValue::Long(18)),
+                Expression::Const(FlakeValue::Long(18)),
             ),
             Expression::gt(
                 Expression::Var(VarId(1)),
-                Expression::Const(FilterValue::Long(100)),
+                Expression::Const(FlakeValue::Long(100)),
             ),
         ]);
 
@@ -1688,11 +1689,11 @@ mod tests {
         let expr = Expression::or(vec![
             Expression::eq(
                 Expression::Var(VarId(0)),
-                Expression::Const(FilterValue::Long(1)),
+                Expression::Const(FlakeValue::Long(1)),
             ),
             Expression::eq(
                 Expression::Var(VarId(0)),
-                Expression::Const(FilterValue::Long(2)),
+                Expression::Const(FlakeValue::Long(2)),
             ),
         ]);
 
@@ -1704,7 +1705,7 @@ mod tests {
         // ?price > 19.99
         let expr = Expression::gt(
             Expression::Var(VarId(0)),
-            Expression::Const(FilterValue::Double(19.99)),
+            Expression::Const(FlakeValue::Double(19.99)),
         );
 
         let constraints = extract_range_constraints(&expr).expect("should extract");
@@ -1863,7 +1864,7 @@ mod tests {
         // ?age > 18
         let filter = Expression::gt(
             Expression::Var(VarId(0)),
-            Expression::Const(FilterValue::Long(18)),
+            Expression::Const(FlakeValue::Long(18)),
         );
 
         // Extract for ?age (VarId(0))
@@ -1882,11 +1883,11 @@ mod tests {
         let filter = Expression::and(vec![
             Expression::gt(
                 Expression::Var(VarId(0)),
-                Expression::Const(FilterValue::Long(18)),
+                Expression::Const(FlakeValue::Long(18)),
             ),
             Expression::lt(
                 Expression::Var(VarId(0)),
-                Expression::Const(FilterValue::Long(65)),
+                Expression::Const(FlakeValue::Long(65)),
             ),
         ]);
 
@@ -1904,7 +1905,7 @@ mod tests {
         // ?age > 18 - but we ask for bounds on ?name (VarId(1))
         let filter = Expression::gt(
             Expression::Var(VarId(0)),
-            Expression::Const(FilterValue::Long(18)),
+            Expression::Const(FlakeValue::Long(18)),
         );
 
         // No bounds for VarId(1)
@@ -1917,11 +1918,11 @@ mod tests {
         let filter = Expression::and(vec![
             Expression::gt(
                 Expression::Var(VarId(0)),
-                Expression::Const(FilterValue::Long(10)),
+                Expression::Const(FlakeValue::Long(10)),
             ),
             Expression::lt(
                 Expression::Var(VarId(0)),
-                Expression::Const(FilterValue::Long(5)),
+                Expression::Const(FlakeValue::Long(5)),
             ),
         ]);
 
@@ -1935,11 +1936,11 @@ mod tests {
         let filter = Expression::or(vec![
             Expression::eq(
                 Expression::Var(VarId(0)),
-                Expression::Const(FilterValue::Long(18)),
+                Expression::Const(FlakeValue::Long(18)),
             ),
             Expression::eq(
                 Expression::Var(VarId(0)),
-                Expression::Const(FilterValue::Long(21)),
+                Expression::Const(FlakeValue::Long(21)),
             ),
         ]);
 
@@ -1963,45 +1964,45 @@ mod tests {
         // (< 10 ?x 20) → range-safe
         let expr = sandwich(
             Function::Lt,
-            Expression::Const(FilterValue::Long(10)),
+            Expression::Const(FlakeValue::Long(10)),
             Expression::Var(VarId(0)),
-            Expression::Const(FilterValue::Long(20)),
+            Expression::Const(FlakeValue::Long(20)),
         );
         assert!(expr.is_range_safe());
 
         // (<= 10 ?x 20) → range-safe
         let expr = sandwich(
             Function::Le,
-            Expression::Const(FilterValue::Long(10)),
+            Expression::Const(FlakeValue::Long(10)),
             Expression::Var(VarId(0)),
-            Expression::Const(FilterValue::Long(20)),
+            Expression::Const(FlakeValue::Long(20)),
         );
         assert!(expr.is_range_safe());
 
         // (> 20 ?x 10) → range-safe
         let expr = sandwich(
             Function::Gt,
-            Expression::Const(FilterValue::Long(20)),
+            Expression::Const(FlakeValue::Long(20)),
             Expression::Var(VarId(0)),
-            Expression::Const(FilterValue::Long(10)),
+            Expression::Const(FlakeValue::Long(10)),
         );
         assert!(expr.is_range_safe());
 
         // (>= 20 ?x 10) → range-safe
         let expr = sandwich(
             Function::Ge,
-            Expression::Const(FilterValue::Long(20)),
+            Expression::Const(FlakeValue::Long(20)),
             Expression::Var(VarId(0)),
-            Expression::Const(FilterValue::Long(10)),
+            Expression::Const(FlakeValue::Long(10)),
         );
         assert!(expr.is_range_safe());
 
         // (= 5 ?x 5) → range-safe
         let expr = sandwich(
             Function::Eq,
-            Expression::Const(FilterValue::Long(5)),
+            Expression::Const(FlakeValue::Long(5)),
             Expression::Var(VarId(0)),
-            Expression::Const(FilterValue::Long(5)),
+            Expression::Const(FlakeValue::Long(5)),
         );
         assert!(expr.is_range_safe());
     }
@@ -2014,7 +2015,7 @@ mod tests {
             args: vec![
                 Expression::Var(VarId(0)),
                 Expression::Var(VarId(1)),
-                Expression::Const(FilterValue::Long(20)),
+                Expression::Const(FlakeValue::Long(20)),
             ],
         };
         assert!(!expr.is_range_safe());
@@ -2023,8 +2024,8 @@ mod tests {
         let expr = Expression::Call {
             func: Function::Lt,
             args: vec![
-                Expression::Const(FilterValue::Long(10)),
-                Expression::Const(FilterValue::Long(20)),
+                Expression::Const(FlakeValue::Long(10)),
+                Expression::Const(FlakeValue::Long(20)),
                 Expression::Var(VarId(0)),
             ],
         };
@@ -2035,7 +2036,7 @@ mod tests {
             func: Function::Lt,
             args: vec![
                 Expression::Var(VarId(0)),
-                Expression::Const(FilterValue::Long(10)),
+                Expression::Const(FlakeValue::Long(10)),
                 Expression::Var(VarId(1)),
             ],
         };
@@ -2047,9 +2048,9 @@ mod tests {
         // (< 10 ?x 20) → lower=10 exclusive, upper=20 exclusive
         let expr = sandwich(
             Function::Lt,
-            Expression::Const(FilterValue::Long(10)),
+            Expression::Const(FlakeValue::Long(10)),
             Expression::Var(VarId(0)),
-            Expression::Const(FilterValue::Long(20)),
+            Expression::Const(FlakeValue::Long(20)),
         );
 
         let constraints = extract_range_constraints(&expr).expect("should extract");
@@ -2066,9 +2067,9 @@ mod tests {
         // (<= 10 ?x 20) → lower=10 inclusive, upper=20 inclusive
         let expr = sandwich(
             Function::Le,
-            Expression::Const(FilterValue::Long(10)),
+            Expression::Const(FlakeValue::Long(10)),
             Expression::Var(VarId(0)),
-            Expression::Const(FilterValue::Long(20)),
+            Expression::Const(FlakeValue::Long(20)),
         );
 
         let constraints = extract_range_constraints(&expr).expect("should extract");
@@ -2085,9 +2086,9 @@ mod tests {
         // (> 20 ?x 10) → 20 > ?x > 10 → upper=20 exclusive, lower=10 exclusive
         let expr = sandwich(
             Function::Gt,
-            Expression::Const(FilterValue::Long(20)),
+            Expression::Const(FlakeValue::Long(20)),
             Expression::Var(VarId(0)),
-            Expression::Const(FilterValue::Long(10)),
+            Expression::Const(FlakeValue::Long(10)),
         );
 
         let constraints = extract_range_constraints(&expr).expect("should extract");
@@ -2106,9 +2107,9 @@ mod tests {
         // (>= 20 ?x 10) → 20 >= ?x >= 10 → upper=20 inclusive, lower=10 inclusive
         let expr = sandwich(
             Function::Ge,
-            Expression::Const(FilterValue::Long(20)),
+            Expression::Const(FlakeValue::Long(20)),
             Expression::Var(VarId(0)),
-            Expression::Const(FilterValue::Long(10)),
+            Expression::Const(FlakeValue::Long(10)),
         );
 
         let constraints = extract_range_constraints(&expr).expect("should extract");
@@ -2127,9 +2128,9 @@ mod tests {
         // (= 5 ?x 5) → point range: lower=5 inclusive, upper=5 inclusive
         let expr = sandwich(
             Function::Eq,
-            Expression::Const(FilterValue::Long(5)),
+            Expression::Const(FlakeValue::Long(5)),
             Expression::Var(VarId(0)),
-            Expression::Const(FilterValue::Long(5)),
+            Expression::Const(FlakeValue::Long(5)),
         );
 
         let constraints = extract_range_constraints(&expr).expect("should extract");
@@ -2147,9 +2148,9 @@ mod tests {
         // (= 5 ?x 10) → both constants must be equal for satisfiability
         let expr = sandwich(
             Function::Eq,
-            Expression::Const(FilterValue::Long(5)),
+            Expression::Const(FlakeValue::Long(5)),
             Expression::Var(VarId(0)),
-            Expression::Const(FilterValue::Long(10)),
+            Expression::Const(FlakeValue::Long(10)),
         );
 
         let constraints = extract_range_constraints(&expr).expect("should extract");
@@ -2168,9 +2169,9 @@ mod tests {
         // (< 10 ?x 20) should produce correct ObjectBounds
         let expr = sandwich(
             Function::Lt,
-            Expression::Const(FilterValue::Long(10)),
+            Expression::Const(FlakeValue::Long(10)),
             Expression::Var(VarId(0)),
-            Expression::Const(FilterValue::Long(20)),
+            Expression::Const(FlakeValue::Long(20)),
         );
 
         let bounds = extract_object_bounds_for_var(&expr, VarId(0)).expect("should extract bounds");
@@ -2189,7 +2190,7 @@ mod tests {
 
     #[test]
     fn test_pattern_cardinality_variants() {
-        use crate::ir::{Expression, FilterValue, SubqueryPattern};
+        use crate::ir::{Expression, FlakeValue, SubqueryPattern};
 
         let empty = HashSet::new();
 
@@ -2264,7 +2265,7 @@ mod tests {
 
         let filter = Pattern::Filter(Expression::gt(
             Expression::Var(VarId(0)),
-            Expression::Const(FilterValue::Long(0)),
+            Expression::Const(FlakeValue::Long(0)),
         ));
         assert!(matches!(
             estimate_pattern(&filter, &empty, None),
@@ -2273,7 +2274,7 @@ mod tests {
 
         let bind = Pattern::Bind {
             var: VarId(7),
-            expr: Expression::Const(FilterValue::Long(42)),
+            expr: Expression::Const(FlakeValue::Long(42)),
         };
         assert!(matches!(
             estimate_pattern(&bind, &empty, None),
@@ -2561,7 +2562,7 @@ mod tests {
             ]),
             Pattern::Filter(Expression::gt(
                 Expression::Var(age),
-                Expression::Const(FilterValue::Long(25)),
+                Expression::Const(FlakeValue::Long(25)),
             )),
         ];
         let reordered = reorder_patterns(&patterns, None, &HashSet::new());
@@ -2585,7 +2586,7 @@ mod tests {
             ]),
             Pattern::Filter(Expression::gt(
                 Expression::Var(age),
-                Expression::Const(FilterValue::Long(25)),
+                Expression::Const(FlakeValue::Long(25)),
             )),
         ];
         let reordered = reorder_patterns(&patterns, None, &HashSet::new());
@@ -2612,15 +2613,12 @@ mod tests {
                 var: double,
                 expr: Expression::Call {
                     func: Function::Mul,
-                    args: vec![
-                        Expression::Var(age),
-                        Expression::Const(FilterValue::Long(2)),
-                    ],
+                    args: vec![Expression::Var(age), Expression::Const(FlakeValue::Long(2))],
                 },
             },
             Pattern::Filter(Expression::gt(
                 Expression::Var(double),
-                Expression::Const(FilterValue::Long(50)),
+                Expression::Const(FlakeValue::Long(50)),
             )),
         ];
         let reordered = reorder_patterns(&patterns, None, &HashSet::new());
@@ -2642,7 +2640,7 @@ mod tests {
             },
             Pattern::Filter(Expression::gt(
                 Expression::Var(age),
-                Expression::Const(FilterValue::Long(25)),
+                Expression::Const(FlakeValue::Long(25)),
             )),
         ];
         let reordered = reorder_patterns(&patterns, None, &HashSet::new());
@@ -2676,7 +2674,7 @@ mod tests {
             )),
             Pattern::Filter(Expression::gt(
                 Expression::Var(age),
-                Expression::Const(FilterValue::Long(25)),
+                Expression::Const(FlakeValue::Long(25)),
             )),
         ];
         let reordered = reorder_patterns(&patterns, None, &HashSet::new());
@@ -2713,11 +2711,11 @@ mod tests {
             ]),
             Pattern::Filter(Expression::gt(
                 Expression::Var(age),
-                Expression::Const(FilterValue::Long(25)),
+                Expression::Const(FlakeValue::Long(25)),
             )),
             Pattern::Filter(Expression::eq(
                 Expression::Var(name),
-                Expression::Const(FilterValue::String("Alice".to_string())),
+                Expression::Const(FlakeValue::String("Alice".to_string())),
             )),
         ];
         let reordered = reorder_patterns(&patterns, None, &HashSet::new());
