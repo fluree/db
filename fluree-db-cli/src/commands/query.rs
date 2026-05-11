@@ -244,20 +244,56 @@ pub async fn run(
             // Execute query via remote HTTP
             let timer = Instant::now();
             let result = match (query_format, at, explain) {
-                (detect::QueryFormat::Sparql | detect::QueryFormat::JsonLd, Some(_), true) => {
-                    // Time-travel + explain isn't honored on the server side:
-                    // both `/explain` and `/explain/{ledger}` load the ledger
-                    // at HEAD and run explain there, so a remote --at --explain
-                    // would silently return the HEAD plan. Refuse rather than
-                    // mislead. Run with `--direct` for a local time-travel
-                    // explain, or drop `--at` to explain the HEAD plan.
-                    return Err(CliError::Usage(
-                        "remote --at --explain is not supported: the server's explain handler \
-                         loads the ledger at HEAD regardless of any time-travel `from`. \
-                         Use `--direct` for a local time-travel explain, or drop `--at` to \
-                         explain the HEAD plan on the remote."
-                            .to_string(),
-                    ));
+                (detect::QueryFormat::Sparql, Some(at_str), true) => {
+                    // Remote `--at --explain` over SPARQL: inject the time
+                    // suffix as a FROM and POST to the ledger-scoped explain
+                    // endpoint. Same shape as the non-explain SPARQL `--at`
+                    // case below — the server's `/explain/{ledger}` accepts
+                    // same-ledger FROM with time travel (see the
+                    // explain-time-travel fix). Queries with their own
+                    // FROM/FROM NAMED must encode time travel there.
+                    if fluree_db_api::sparql_dataset_ledger_ids(&content)
+                        .map(|v| !v.is_empty())
+                        .unwrap_or(false)
+                    {
+                        return Err(CliError::Usage(
+                            "SPARQL query already contains FROM/FROM NAMED; \
+                             for remote time travel, encode time travel in the FROM IRI \
+                             (e.g., FROM <ledger@t:1>) instead of using --at"
+                                .to_string(),
+                        ));
+                    }
+                    let spec = parse_time_spec(at_str);
+                    let suffix = time_spec_to_suffix(&spec);
+                    let from_iri = attach_time_suffix_preserving_fragment(&remote_alias, &suffix);
+                    let injected = inject_sparql_from_before_where(&content, &from_iri).ok_or_else(
+                        || {
+                            CliError::Usage(
+                                "unable to inject SPARQL FROM clause for remote time travel; \
+                                 please write the query as `SELECT ... WHERE { ... }` or include an explicit FROM"
+                                    .to_string(),
+                            )
+                        },
+                    )?;
+                    client.explain_sparql(&remote_alias, &injected).await?
+                }
+                (detect::QueryFormat::JsonLd, Some(at_str), true) => {
+                    // Remote `--at --explain` over JSON-LD: inject the
+                    // time-suffixed `from` into the body and POST to the
+                    // ledger-scoped explain endpoint. Path drives auth,
+                    // body's `from` drives snapshot selection.
+                    let spec = parse_time_spec(at_str);
+                    let suffix = time_spec_to_suffix(&spec);
+                    let from_id = attach_time_suffix_preserving_fragment(&remote_alias, &suffix);
+                    let mut json_query: serde_json::Value = serde_json::from_str(&content)?;
+                    if let Some(obj) = json_query.as_object_mut() {
+                        obj.insert("from".to_string(), serde_json::Value::String(from_id));
+                    } else {
+                        return Err(CliError::Input(
+                            "JSON-LD query must be a JSON object".to_string(),
+                        ));
+                    }
+                    client.explain_jsonld(&remote_alias, &json_query).await?
                 }
                 (detect::QueryFormat::Sparql, None, true) => {
                     client.explain_sparql(&remote_alias, &content).await?

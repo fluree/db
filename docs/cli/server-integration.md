@@ -196,12 +196,16 @@ or in an injected `FROM <mydb:main@t:N>` clause (for SPARQL). Posting to
 the connection-level endpoint instead would force auth to derive the
 ledger ID from `from` and reject scoped tokens.
 
-**Known limitation: `--at` + `--explain` over `--remote` is refused.** The
-server's explain handler (both connection- and ledger-scoped) loads the
-ledger at HEAD regardless of any time-travel `from`, so a remote
-`--at --explain` would silently return the HEAD plan. The CLI rejects the
-combination outright; pass `--direct` for a local time-travel explain, or
-drop `--at` to explain the HEAD plan against the remote.
+**Remote `--at --explain` flows through the same ledger-scoped path.** The
+CLI injects the time-travel suffix into `from` (JSON-LD) or as a `FROM
+<ledger@t:N>` clause (SPARQL), then POSTs to `POST /explain/{ledger}`.
+The server's explain handlers route those requests through a
+dataset-aware path so the request is processed against a view at the
+requested `t`. Note that Fluree maintains one set of index stats
+(latest), so explain plans for a given query text are largely
+independent of `t` — the value of `--at --explain` is in honoring the
+contract and consistency with the query path, not in producing
+materially different plans.
 
 ### `fluree branch list` (read-only)
 
