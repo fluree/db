@@ -1029,31 +1029,19 @@ ex:bob   ex:worksFor ex:acme .
     );
 }
 
-/// Pinning repro for the bulk-import arena-seal gap. Imported
-/// annotation-bearing ledger → follow-up `fluree.reindex(...)` (the
-/// same call the CLI's `fluree create --import` auto-seal step
-/// makes) should seal the annotation arena.
+/// End-to-end: imported annotation-bearing ledger → follow-up
+/// `fluree.reindex(...)` (the same call the CLI's
+/// `fluree create --import` auto-seal step makes) seals the
+/// annotation arena.
 ///
-/// Current behavior: signal IS propagated (`has_annotations` is
-/// true), reindex IS triggered, but `snapshot.annotation_index`
-/// stays `None`. Diagnosis: `Fluree::reindex` resolves attachment
-/// events via `ApiAttachmentEventsProvider`, which reads from
-/// `AttachmentNovelty.iter_event_pairs()`. For a freshly-imported
-/// ledger the overlay is empty (the f:reifies* flakes live in the
-/// base index, not novelty), so the provider returns
-/// `Augment([])`. The indexer's
-/// `build_and_persist_annotation_arena` then early-returns with no
-/// arena because `previous_index = None && events.is_empty()`.
-///
-/// The full fix needs one of: (a) the bulk-import pipeline
-/// populates `AttachmentNovelty` from the imported f:reifies*
-/// flakes before exiting, (b) the indexer's arena builder learns to
-/// walk the base index for f:reifies* when the sticky bit is set
-/// but events are empty, or (c) the provider walks the base index
-/// itself when overlay is empty. Out of scope for the signal-
-/// plumbing slice; tracked as a follow-up.
+/// Closes the bulk-import seal gap. `ApiAttachmentEventsProvider`
+/// scans the base index for `f:reifies*` flakes when the running
+/// `AttachmentNovelty` overlay is empty but the snapshot's sticky
+/// bit says annotations exist — so the freshly-imported state
+/// (where the f:reifies* flakes live in the base index, not the
+/// overlay) still produces a complete `Authoritative` event set
+/// for the indexer's arena builder.
 #[tokio::test]
-#[ignore = "pins the bulk-import arena-seal gap; signal plumbed but reindex provider doesn't see base-indexed f:reifies* flakes"]
 async fn import_then_reindex_seals_annotation_arena() {
     let db_dir = tempfile::tempdir().expect("db tmpdir");
     let data_dir = tempfile::tempdir().expect("data tmpdir");

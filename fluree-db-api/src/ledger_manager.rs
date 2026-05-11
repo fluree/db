@@ -694,6 +694,26 @@ impl LedgerManager {
         Some(RunningAttachmentEvents { coverage, events })
     }
 
+    /// Return a read-only `LedgerView` for a currently-loaded ledger
+    /// without forcing a load. Returns `None` when the ledger isn't
+    /// in the cache.
+    ///
+    /// Used by `ApiAttachmentEventsProvider`'s bulk-import seal path:
+    /// when the running overlay reports no events but the snapshot's
+    /// sticky bit says annotations exist (the post-import state),
+    /// the provider needs the snapshot + range_provider to scan the
+    /// base index for `f:reifies*` flakes itself.
+    pub async fn get_loaded_view(&self, ledger_id: &str) -> Option<LedgerView> {
+        let canonical_alias =
+            normalize_ledger_id(ledger_id).unwrap_or_else(|_| ledger_id.to_string());
+        let entries = self.entries.read().await;
+        let entry = entries.get(&canonical_alias)?;
+        let LoadState::Ready(handle) = entry else {
+            return None;
+        };
+        Some(handle.snapshot().await)
+    }
+
     /// Get cached handle or load from nameservice
     ///
     /// Uses single-flight pattern: concurrent requests for same ledger ID

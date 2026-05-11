@@ -370,11 +370,14 @@ pub struct ImportResult {
     pub summary: Option<ImportSummary>,
     /// Whether the imported dataset contains at least one
     /// `f:reifies*` flake (an edge-annotation bundle). The bulk-import
-    /// root currently writes `annotation_index: None` even when this
-    /// is `true`, so callers that want a sealed annotation arena
-    /// available immediately should follow up with
-    /// `Fluree::reindex(...)` (the CLI's `fluree create --import`
-    /// does this automatically). `false` when `build_index == false`.
+    /// root itself writes `annotation_index: None`, so callers that
+    /// want a sealed annotation arena available immediately should
+    /// follow up with `Fluree::reindex(...)` — the api's
+    /// `ApiAttachmentEventsProvider` scans the base index for
+    /// `f:reifies*` flakes when the running overlay is empty, so
+    /// reindex produces an authoritative arena from the just-imported
+    /// data. The CLI's `fluree create --import` performs this
+    /// follow-up automatically. `false` when `build_index == false`.
     pub has_annotations: bool,
 }
 

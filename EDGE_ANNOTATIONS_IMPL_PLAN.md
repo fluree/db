@@ -1041,9 +1041,11 @@ Three items from the original DoD are deliberately deferred:
    boundaries) or a structural-equivalence helper that loads both
    arenas and compares the row sets.
 
-2. 🟡 **Bulk import path — signal plumbed, seal path needs deeper work.**
+2. ✅ **Bulk import path — closed.** Annotation-bearing imports now
+   land with a sealed annotation arena after a single
+   `fluree create --import` command.
 
-   What landed:
+   Mechanism:
    - `ImportResult.has_annotations: bool` surfaces from
      `IndexUploadResult` (set in
      `fluree-db-api/src/import.rs` from the same predicate-dict
@@ -1052,38 +1054,37 @@ Three items from the original DoD are deliberately deferred:
      reads `result.has_annotations` after a successful import and
      auto-invokes `Fluree::reindex(...)` when true. Non-annotation
      imports skip the extra pass.
-   - `Fluree::reindex(...)` and CLI `fluree index` already wire the
-     api's `AttachmentEventsProvider` into the rebuild path (closed
-     earlier, pinned by
-     `it_edge_annotations_indexed::reindex_seals_arena_when_caching_enabled_no_provider_in_opts`),
-     so the auto-seal works for ledgers whose attachment events
-     live in `AttachmentNovelty`.
+   - `ApiAttachmentEventsProvider` (in
+     `fluree-db-api/src/indexer_attachment_provider.rs`) detects
+     the post-import state: when `try_running_attachment_events`
+     returns an empty event set AND the snapshot's sticky bit is
+     true AND a range provider is present, it walks the base
+     index for `f:reifies*` flakes itself
+     (`scan_base_index_for_attachment_events`), groups them by
+     annotation SID via per-predicate PSOT scans, decodes each
+     bundle into an `EdgeKey`, and surfaces the result as
+     `AttachmentEventCoverage::Authoritative`. The indexer then
+     seals an authoritative arena from those events.
+   - `LedgerManager::get_loaded_view` is new public api support
+     for the provider's base-index scan path.
 
-   What still doesn't seal:
-   - `Fluree::reindex` resolves attachment events via
-     `ApiAttachmentEventsProvider`, which reads from
-     `AttachmentNovelty.iter_event_pairs()`. After a fresh bulk
-     import, the overlay is empty — the f:reifies* flakes live in
-     the **base index**, not novelty. The provider therefore
-     returns `Augment([])`, and the indexer's arena builder
-     early-returns (no events, no previous arena → no work).
-   - The full fix needs one of: (a) bulk import populates
-     `AttachmentNovelty` from imported f:reifies* flakes before
-     exiting; (b) the indexer's arena builder walks the base index
-     for f:reifies* when sticky bit is true but events are empty;
-     (c) the provider walks the base index itself when overlay is
-     empty. Each is meaningful work; deferred as a follow-up.
+   The PSOT-based group-by-annotation-SID approach (rather than
+   SPOT s=ann scans) sidesteps a SPOT-direction scan quirk where
+   constant blank-node subjects (`namespace_code = 0`) don't
+   return rows reliably across all backends.
+
+   Pinning tests:
+   - `it_import::import_with_f_reifies_predicates_sets_has_annotations`
+   - `it_import::import_without_f_reifies_predicates_leaves_has_annotations_false`
+   - `it_import::import_then_reindex_seals_annotation_arena` (active —
+     end-to-end import → reindex → arena sealed).
+   - `it_edge_annotations_indexed::reindex_seals_arena_when_caching_enabled_no_provider_in_opts`
+     continues to pin the novelty-overlay path.
 
    New public api accessor:
    `Fluree::attachment_events_provider() ->
    Option<Arc<dyn AttachmentEventsProvider>>` — returns `Some` when
    ledger caching is enabled.
-
-   Pinning tests:
-   - `it_import::import_with_f_reifies_predicates_sets_has_annotations` (active)
-   - `it_import::import_without_f_reifies_predicates_leaves_has_annotations_false` (active)
-   - `it_import::import_then_reindex_seals_annotation_arena` (`#[ignore]`d
-     — flips to active when the seal-from-base-index path lands).
 
 3. ~~**Malformed-bundle telemetry counter.**~~ ✅ Closed:
    `AttachmentNovelty::observe_flakes` now skips malformed
