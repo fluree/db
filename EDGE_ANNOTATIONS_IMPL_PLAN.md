@@ -491,17 +491,27 @@ correctness items remaining):**
   from the body. The wildcard-hydration filter keeps `f:reifies*`
   out of the rendered body.
 
-  **M1b limitation: novelty-only.** The output path is
-  novelty-backed — it downcasts the overlay to
-  `fluree_db_novelty::Novelty` and reads `attachments`. Once a
-  ledger's annotation rows roll into base storage / a binary
-  arena (M2), this lookup returns nothing and the `@annotation`
-  output disappears, even though the durable `f:reifies*` facts
-  themselves remain queryable via normal scans. The M2 work
-  introduces an indexed/arena-backed lookup that the hydrator
-  consults alongside (or unified with) the novelty overlay. For
-  the M1 milestone — which is explicitly novelty-only end-to-end
-  — this is the documented behavior.
+  **M2 status: indexed + arena paths shipped.** The original M1b
+  limitation ("novelty-only — once rows roll into base storage, the
+  lookup returns nothing") was superseded during M2. `inject_annotations`
+  in `fluree-db-api/src/format/hydration.rs` now has two paths:
+  - **Arena-backed fast path:** when the snapshot has both an
+    `annotation_index` and a `content_store`, a single
+    `AnnotationArenaReader` is constructed per response and reused
+    across every edge lookup (amortizes CAS reads via branch + leaf
+    caches).
+  - **Scan fallback:** `db.range(POST, f:reifiesSubject, edge.s)`
+    queries the unified novelty + indexed-base view, so it works
+    whether the f:reifies* flakes live in novelty, in the base
+    index, or split across both. Used when the arena isn't sealed
+    yet, or when the snapshot has no `content_store`.
+
+  Regression test:
+  `subject_expansion_finds_annotation_after_reindex` —
+  inserts an annotated edge, triggers a full reindex (drains
+  novelty into base), reloads the ledger, asserts `@annotation`
+  still appears in wildcard subject expansion. This test would
+  have failed under the original M1b novelty-only behavior.
 - ✅ **Broader `it_edge_annotations.rs` integration tests.** Parallel
   annotations on one edge, multiplicity contract, cascade behavior,
   and lifecycle (RDF default vs. LPG opt-in) have been covered for
