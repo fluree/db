@@ -3659,29 +3659,24 @@ async fn delete_by_id_retracts_lang_tagged_literal_annotation_bundle() {
 // Pinning tests for items called out as open in EDGE_ANNOTATIONS_IMPL_PLAN.md
 // =====================================================================
 
-/// Pinning repro for the per-language cross-match gap called out in
-/// `EDGE_ANNOTATIONS_IMPL_PLAN.md` M1b status. Two annotations with
-/// the **same lexical string but different language tags** currently
-/// cross-match when an annotation-rooted query constrains the base
-/// edge's object by language.
+/// Pinning repro for the per-language cross-match gap. Two
+/// annotations with the **same lexical string but different
+/// language tags** must not cross-match when an annotation-rooted
+/// query constrains the base edge's object by language.
 ///
-/// `expand_edge_annotation_patterns` in
-/// `fluree-db-query/src/execute/where_plan.rs` clones `edge.dtc` onto
-/// the synthesized `f:reifiesObject` lookup, but the
-/// `f:reifiesObject` flake's wire layout does not carry the language
-/// tag in a position the scan filter consults — the JSON-LD writer
-/// emits a separate `f:reifiesLang` predicate and stores the object
-/// flake without per-flake `m.lang`. The right fix is the
-/// custom-operator path described in the plan
-/// ("⏳ Per-language disambiguation — same architectural shape …
-/// same custom-operator fix path"), which adds an explicit
-/// `f:reifiesLang` join key to the expansion.
+/// `expand_edge_annotation_patterns` emits a
+/// `(?ann f:reifiesLang "<tag>")` constraint triple at the IR
+/// level (unit-tested in
+/// `where_plan::tests::expand_edge_annotation_emits_reifies_lang_triple_for_lang_tagged_edge`)
+/// — but at execution time the triple does not actually filter, so
+/// both annotations still cross-match. The IR shape is in place;
+/// the diagnosis at the join/scan layer is not yet complete.
 ///
-/// Today the test fails — both annotations cross-match — so it is
-/// `#[ignore]`d. Future work that lands the language join key
-/// should flip this to an active test.
+/// Today this test fails — both annotations cross-match — so it is
+/// `#[ignore]`d. When the executor-side fix lands, flip the
+/// `#[ignore]` to make it an active regression guard.
 #[tokio::test]
-#[ignore = "pins the per-language cross-match gap from EDGE_ANNOTATIONS_IMPL_PLAN.md M1b"]
+#[ignore = "pins the per-language cross-match gap; IR-level constraint emits but does not filter at scan time"]
 async fn cross_language_annotation_does_not_cross_match() {
     let fluree = FlureeBuilder::memory().build_memory();
     let ledger_id = "it-edge-annotations-cross-language";
@@ -3737,6 +3732,31 @@ async fn cross_language_annotation_does_not_cross_match() {
         Some(2),
         "both annotation bodies must be inserted; got: {bare_rows:#?}"
     );
+
+    // Confirm both `f:reifiesLang` flakes landed (one per annotation).
+    // We scan directly because the user-facing query path filters
+    // system predicates from variable-predicate output.
+    {
+        use fluree_db_core::comparator::IndexType;
+        use fluree_db_core::range::{range_with_overlay, RangeMatch, RangeOptions, RangeTest};
+        use fluree_vocab::reifies_iris;
+        let reifies_lang_pid = ledger
+            .snapshot
+            .encode_iri(reifies_iris::LANG)
+            .expect("encode f:reifiesLang");
+        let lang_flakes = range_with_overlay(
+            &ledger.snapshot,
+            0,
+            ledger.novelty.as_ref(),
+            IndexType::Spot,
+            RangeTest::Eq,
+            RangeMatch::new().with_predicate(reifies_lang_pid),
+            RangeOptions::new().with_to_t(ledger.t()),
+        )
+        .await
+        .expect("scan f:reifiesLang");
+        assert_eq!(lang_flakes.len(), 2, "expected two f:reifiesLang flakes");
+    }
 
     // SPARQL gives an unambiguous syntax for language-tagged literal
     // matching (`"chat"@fr`). We use the RDF 1.2 `@reifies` form so

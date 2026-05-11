@@ -124,11 +124,52 @@ fn expand_one_into(pattern: Pattern, out: &mut Vec<Pattern>, inside_graph: bool)
             // datatype constraint via dtc so typed-equality matches
             // round-trip.
             chain.push(Pattern::Triple(TriplePattern {
-                s: ann_ref,
+                s: ann_ref.clone(),
                 p: reifies_object_ref(),
                 o: edge.o.clone(),
                 dtc: edge.dtc.clone(),
             }));
+
+            // f:reifiesLang — required when the base edge's object is
+            // a language-tagged literal. The writer emits the language
+            // tag as a sibling `f:reifiesLang` predicate (not as the
+            // `f:reifiesObject` flake's `m.lang`), so cloning `dtc`
+            // onto the `f:reifiesObject` lookup alone does NOT keep
+            // same-lexical literals in different languages from
+            // cross-matching. The explicit constraint triple here is
+            // the actual disambiguator. Pinning regression:
+            // `it_edge_annotations::cross_language_annotation_does_not_cross_match`.
+            // f:reifiesLang — **intended** to filter same-lexical
+            // literals by language tag when the base edge's object
+            // carries `DatatypeConstraint::LangTag`. The expansion
+            // emits a `(?ann f:reifiesLang "<tag>")` triple
+            // unit-tested in
+            // `expand_edge_annotation_emits_reifies_lang_triple_for_lang_tagged_edge`.
+            //
+            // **Known gap.** Pinning regression
+            // `it_edge_annotations::cross_language_annotation_does_not_cross_match`
+            // (currently `#[ignore]`d) shows that this IR-level
+            // constraint does not actually filter at execution time
+            // — both annotations still cross-match. Diagnosis is
+            // incomplete; the join/scan layer needs further work
+            // before this can be enabled. Until then we still emit
+            // the triple so the read-side IR records the intent and
+            // future debugging has the constraint to attach to.
+            if let Some(fluree_db_core::DatatypeConstraint::LangTag(tag)) = &edge.dtc {
+                chain.push(Pattern::Triple(TriplePattern {
+                    s: ann_ref,
+                    p: reifies_lang_ref(),
+                    o: crate::ir::triple::Term::Value(fluree_db_core::FlakeValue::String(
+                        tag.to_string(),
+                    )),
+                    dtc: Some(fluree_db_core::DatatypeConstraint::Explicit(
+                        fluree_db_core::Sid::new(
+                            fluree_vocab::namespaces::XSD,
+                            fluree_vocab::xsd_names::STRING,
+                        ),
+                    )),
+                }));
+            }
 
             // 3. Body patterns (recursively expanded so nested
             //    annotations — though M0 rejects them — flatten too).
@@ -138,21 +179,14 @@ fn expand_one_into(pattern: Pattern, out: &mut Vec<Pattern>, inside_graph: bool)
                 expand_one_into(inner, &mut chain, true);
             }
 
-            // f:reifiesGraph and f:reifiesLang are NOT emitted as
-            // separate constraint triples — the `DefaultGraphSource`
-            // wrapper handles per-source correlation by switching
-            // execution context to one source at a time, so the
-            // f:reifies* triples all scope to the same graph per
-            // iteration. The cross-graph misjoin (N×M cross-product
-            // under `from: [g1, g2]`) that motivated this wrapper is
-            // resolved by the per-source iteration.
-            //
-            // Per-language disambiguation is handled by `edge.dtc`:
-            // when the base edge's object is a language-tagged literal,
-            // the query parser sets `dtc = LangTag("<lang>")` and the
-            // clone above propagates the constraint onto the
-            // synthesized `f:reifiesObject` lookup, so same-lexical
-            // strings in different languages no longer cross-match.
+            // f:reifiesGraph is NOT emitted as a separate constraint
+            // triple — the `DefaultGraphSource` wrapper handles
+            // per-source correlation by switching execution context to
+            // one source at a time, so all f:reifies* triples scope to
+            // the same graph per iteration. The cross-graph misjoin
+            // (N×M cross-product under `from: [g1, g2]`) that
+            // motivated this wrapper is resolved by the per-source
+            // iteration.
 
             if inside_graph {
                 // Already inside a `Pattern::Graph` wrapper — the
@@ -232,6 +266,13 @@ fn reifies_object_ref() -> Ref {
     Ref::Sid(fluree_db_core::Sid::new(
         fluree_vocab::namespaces::FLUREE_DB,
         fluree_vocab::db::REIFIES_OBJECT,
+    ))
+}
+
+fn reifies_lang_ref() -> Ref {
+    Ref::Sid(fluree_db_core::Sid::new(
+        fluree_vocab::namespaces::FLUREE_DB,
+        fluree_vocab::db::REIFIES_LANG,
     ))
 }
 
@@ -3604,6 +3645,77 @@ mod tests {
             }
             other => panic!("expected LangTag dtc on f:reifiesObject, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn expand_edge_annotation_emits_reifies_lang_triple_for_lang_tagged_edge() {
+        // The dtc clone alone does NOT disambiguate cross-language
+        // matches because the writer stores the language tag on a
+        // separate `f:reifiesLang` predicate (not on the
+        // `f:reifiesObject` flake's `m.lang`). The expansion must add
+        // an explicit `(?ann f:reifiesLang "<tag>")` constraint
+        // triple. Pinning regression:
+        // `it_edge_annotations::cross_language_annotation_does_not_cross_match`.
+        let lang_fr =
+            fluree_db_core::DatatypeConstraint::LangTag(std::sync::Arc::from("fr"));
+        let edge = TriplePattern {
+            s: Ref::Var(VarId(0)),
+            p: Ref::Sid(Sid::new(100, "label")),
+            o: Term::Value(FlakeValue::String("chat".to_string())),
+            dtc: Some(lang_fr),
+        };
+        let patterns = vec![Pattern::EdgeAnnotation {
+            edge,
+            annotation: Ref::Var(VarId(1)),
+            body: Vec::new(),
+        }];
+        let expanded = expand_edge_annotation_patterns(&patterns);
+        let chain = unwrap_default_graph_source(&expanded[0]);
+        let reifies_lang_pred = Ref::Sid(Sid::new(
+            fluree_vocab::namespaces::FLUREE_DB,
+            fluree_vocab::db::REIFIES_LANG,
+        ));
+        let lang_triple = chain
+            .iter()
+            .find_map(|p| match p {
+                Pattern::Triple(tp) if tp.p == reifies_lang_pred => Some(tp),
+                _ => None,
+            })
+            .expect("synthesized f:reifiesLang triple must be present");
+        match &lang_triple.o {
+            Term::Value(FlakeValue::String(s)) => assert_eq!(s, "fr"),
+            other => panic!("expected literal lang-tag string, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn expand_edge_annotation_omits_reifies_lang_triple_when_no_lang() {
+        // Edges without a LangTag dtc must NOT get an f:reifiesLang
+        // constraint — it would never match (writer only emits the
+        // predicate for lang-tagged literals).
+        let xsd_string =
+            fluree_db_core::DatatypeConstraint::Explicit(Sid::new(2, "string"));
+        let edge = TriplePattern {
+            s: Ref::Var(VarId(0)),
+            p: Ref::Sid(Sid::new(100, "name")),
+            o: Term::Value(FlakeValue::String("Alice".to_string())),
+            dtc: Some(xsd_string),
+        };
+        let patterns = vec![Pattern::EdgeAnnotation {
+            edge,
+            annotation: Ref::Var(VarId(1)),
+            body: Vec::new(),
+        }];
+        let expanded = expand_edge_annotation_patterns(&patterns);
+        let chain = unwrap_default_graph_source(&expanded[0]);
+        let reifies_lang_pred = Ref::Sid(Sid::new(
+            fluree_vocab::namespaces::FLUREE_DB,
+            fluree_vocab::db::REIFIES_LANG,
+        ));
+        assert!(
+            !chain.iter().any(|p| matches!(p, Pattern::Triple(tp) if tp.p == reifies_lang_pred)),
+            "no f:reifiesLang constraint triple should be emitted for non-lang-tagged edges"
+        );
     }
 
     #[test]
