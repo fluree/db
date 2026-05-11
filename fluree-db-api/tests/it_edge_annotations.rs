@@ -3659,28 +3659,34 @@ async fn delete_by_id_retracts_lang_tagged_literal_annotation_bundle() {
 // Pinning tests for items called out as open in EDGE_ANNOTATIONS_IMPL_PLAN.md
 // =====================================================================
 
-/// Pinning repro for the per-language cross-match gap. Two
-/// annotations with the **same lexical string but different
+/// Two annotations with the **same lexical string but different
 /// language tags** must not cross-match when an annotation-rooted
 /// query constrains the base edge's object by language.
 ///
-/// The IR is structurally correct: `expand_edge_annotation_patterns`
-/// clones `edge.dtc` (= `LangTag("fr")` for `"chat"@fr`) onto the
-/// synthesized `f:reifiesObject` lookup, and the writer DOES store
-/// the language tag on the f:reifiesObject flake's `m.lang` (the
-/// sanity-check assertions below scan the actual flakes and confirm
-/// `dt=rdf:langString, m.lang=Some("fr"|"en")`). So the `LangTag`
-/// dtc filter in `binary_scan` ought to pick exactly one annotation
-/// per language.
-///
-/// The bug is somewhere downstream of the IR — candidates: the OPST
-/// exact-match path skipping the lang-tag filter applied in the
-/// range fallback (`binary_scan.rs:753-763`), the planner selecting
-/// a scan path that doesn't honor `dtc`, or
-/// `DefaultGraphSourceOperator`'s inner-subplan re-plan dropping the
-/// constraint. Test stays `#[ignore]`d until that's resolved.
+/// The disambiguator chain:
+/// - The SPARQL/JSON-LD lower step stamps
+///   `dtc = LangTag("<tag>")` onto the IR triple for a
+///   language-tagged literal object.
+/// - `expand_edge_annotation_patterns` clones that `dtc` onto the
+///   synthesized `f:reifiesObject` lookup triple. (Earlier
+///   diagnoses speculated the writer dropped the language tag onto
+///   a sibling `f:reifiesLang` predicate; the sanity-check
+///   assertions below confirm the language IS stored on the
+///   `f:reifiesObject` flake's `m.lang` — `dt=rdf:langString`,
+///   `m.lang=Some(<tag>)` — so the dtc clone is the right
+///   disambiguator.)
+/// - `binary_scan::flakes_to_bindings` applies the `LangTag` dtc
+///   filter (`binary_scan.rs:753-763`) to reject flakes whose
+///   `m.lang` doesn't match.
+/// - **And critically**, `collect_var_stats` walks into
+///   `Pattern::DefaultGraphSource` so the `?ann` variable that
+///   bridges the wrapper (inside the f:reifies* chain) AND a
+///   sibling triple outside is counted as a join var. Without that
+///   walk, the sibling scan emits-mask drops `?ann` and the
+///   wrapper's inner subplan joins independently — yielding the
+///   cartesian product over `?src` that this regression originally
+///   exhibited.
 #[tokio::test]
-#[ignore = "pins the per-language cross-match gap; IR is correct but executor doesn't honor LangTag dtc on f:reifiesObject"]
 async fn cross_language_annotation_does_not_cross_match() {
     let fluree = FlureeBuilder::memory().build_memory();
     let ledger_id = "it-edge-annotations-cross-language";
@@ -3783,17 +3789,48 @@ async fn cross_language_annotation_does_not_cross_match() {
         )
         .await
         .expect("scan f:reifiesObject");
-        eprintln!("--- f:reifiesObject flakes ---");
+        assert_eq!(obj_flakes.len(), 2, "expected two f:reifiesObject flakes");
+
+        // The where_plan expansion treats `edge.dtc = LangTag(...)`
+        // on the synthesized f:reifiesObject lookup as the per-
+        // language disambiguator. That depends on the writer
+        // storing the language tag on the flake's `m.lang`. Assert
+        // the exact wire layout the IR relies on so a future writer
+        // refactor can't silently move the language tag off the
+        // f:reifiesObject flake without flipping this test red.
+        let rdf_lang_string_sid = ledger
+            .snapshot
+            .encode_iri("http://www.w3.org/1999/02/22-rdf-syntax-ns#langString")
+            .expect("encode rdf:langString");
         for f in &obj_flakes {
-            eprintln!(
-                "  s={:?} o={:?} dt={:?} m.lang={:?}",
-                f.s,
+            assert_eq!(
                 f.o,
-                f.dt,
-                f.m.as_ref().and_then(|m| m.lang.as_ref())
+                fluree_db_core::value::FlakeValue::String("chat".to_string()),
+                "f:reifiesObject object must be the lexical string \"chat\"; got {:?}",
+                f.o
+            );
+            assert_eq!(
+                f.dt, rdf_lang_string_sid,
+                "f:reifiesObject dt must be rdf:langString for lang-tagged literal; got {:?}",
+                f.dt
+            );
+            assert!(
+                f.m.as_ref()
+                    .and_then(|m| m.lang.as_ref())
+                    .is_some_and(|l| l == "fr" || l == "en"),
+                "f:reifiesObject must carry m.lang in {{fr,en}}; got {:?}",
+                f.m
             );
         }
-        assert_eq!(obj_flakes.len(), 2, "expected two f:reifiesObject flakes");
+        let langs: std::collections::HashSet<String> = obj_flakes
+            .iter()
+            .filter_map(|f| f.m.as_ref().and_then(|m| m.lang.clone()))
+            .collect();
+        assert_eq!(
+            langs,
+            ["fr".to_string(), "en".to_string()].into_iter().collect(),
+            "f:reifiesObject m.lang values must be exactly {{fr, en}}"
+        );
     }
 
     // SPARQL gives an unambiguous syntax for language-tagged literal

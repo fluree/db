@@ -392,6 +392,25 @@ pub fn collect_var_stats(
                         vars.insert(v);
                     }
                 }
+                // The DefaultGraphSource wrapper is structurally
+                // transparent — its inner patterns are part of the
+                // surrounding WHERE clause for join / var-counting
+                // purposes. Walking into it is required so vars that
+                // bridge the wrapper (e.g. `?ann` used both inside
+                // the wrapped f:reifies* chain AND in a sibling
+                // triple outside) are counted as join vars and not
+                // pruned from sibling scan outputs.
+                //
+                // Without this, the per-language pinning test
+                // `cross_language_annotation_does_not_cross_match`
+                // mis-joins: the sibling `?ann ex:source ?src` scan
+                // sees `?ann.count == 1` and emits only `?src`,
+                // the wrapper's inner subplan binds `?ann`
+                // independently, and the merge yields a cartesian
+                // product over `?src`.
+                Pattern::DefaultGraphSource { patterns } => {
+                    walk(patterns, counts, vars);
+                }
                 _ => {}
             }
         }

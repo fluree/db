@@ -353,48 +353,36 @@ correctness items remaining):**
   asserts the correct N+M row count for the 2-graph + 1-edge-each
   scenario. `graph_wrapped_query_correctly_pairs_annotations_per_graph`
   continues to pin the GRAPH-scoped form.
-- ⏳ **Per-language disambiguation.** Same architectural shape as the
-  graph-bound bug above: `f:reifiesLang` is emitted by the write side
-  but not constrained in the read-side expansion, so cross-language
-  misjoin is possible when the same string is asserted with multiple
-  language tags. Same custom-operator fix path; lands in the same
-  slice.
+- ✅ **Per-language disambiguation.** Two annotations with the same
+  lexical string but different `@language` tags no longer cross-match.
 
-  **Status note — IR is correct, executor doesn't honor it.**
-  `expand_edge_annotation_patterns` clones `edge.dtc` onto the
-  synthesized `f:reifiesObject` lookup, which IS the architecturally
-  right disambiguator: the writer stores the language tag on the
-  f:reifiesObject flake's `m.lang` (verified by direct flake
-  inspection inside the integration repro — both flakes carry
-  `dt=rdf:langString, m.lang=Some(<tag>)`). With `dtc =
-  Some(LangTag("fr"))` on the lookup triple, `binary_scan`'s lang-tag
-  filter at `binary_scan.rs:753-763` should match exactly one
-  annotation. An earlier write-up here speculated the bug was the
-  writer dropping the lang tag and proposed a separate
-  `f:reifiesLang` constraint triple — that was wrong, the
-  speculation never verified the flake state, and the redundant
-  triple has since been removed.
+  Mechanism:
+  - The SPARQL/JSON-LD lower step stamps
+    `dtc = LangTag("<tag>")` on the IR triple for a
+    language-tagged literal object.
+  - `expand_edge_annotation_patterns` clones that `dtc` onto the
+    synthesized `f:reifiesObject` lookup. The writer stores the
+    language tag on the `f:reifiesObject` flake's `m.lang`
+    (`dt=rdf:langString, m.lang=Some(<tag>)` — asserted directly in
+    the repro), so the `LangTag` dtc filter in
+    `binary_scan::flakes_to_bindings` rejects flakes whose
+    `m.lang` doesn't match.
+  - **The fix that closed this gap:** `collect_var_stats` in
+    `fluree-db-query/src/execute/where_plan.rs` now walks into
+    `Pattern::DefaultGraphSource` so the `?ann` variable that
+    bridges the wrapper (inside the f:reifies* chain) AND a
+    sibling triple outside (`?ann ex:source ?src`) is counted as
+    a join var. Without that walk, the sibling scan's emit-mask
+    pruning dropped `?ann` from output, the wrapper's inner
+    subplan rebound `?ann` independently per row, and the merge
+    yielded a cartesian product over `?src`.
 
-  **Executor gap remains.** The integration repro
-  `cross_language_annotation_does_not_cross_match` still returns
-  both annotations. Candidates to investigate, in order of
-  likelihood:
-  - OPST exact-match path: for a triple with `dtc=Some(...)` and a
-    `Term::Value(FlakeValue::String(_))` object, `binary_scan.rs`
-    selects `IndexType::Opst`. The OPST scan loop may skip the
-    lang-tag filter applied in the range-fallback path
-    (`binary_scan.rs:753-763`).
-  - Planner reorder: the lang-tagged f:reifiesObject lookup gets
-    placed after `f:reifiesSubject`/`f:reifiesPredicate` bind
-    `?ann`, which means it runs as a constraint rather than a
-    source — the constraint path may have its own scan loop that
-    doesn't apply `dtc`.
-  - `DefaultGraphSourceOperator`: the inner-subplan re-plan via
-    `build_where_operators_seeded` may drop or transform the
-    constraint.
-
-  Test stays `#[ignore]`d as a stable repro until the executor-side
-  fix lands.
+  Regression test:
+  `cross_language_annotation_does_not_cross_match` (no longer
+  `#[ignore]`d) inserts two lang-tagged annotations with the same
+  lexical value, asserts the actual `f:reifiesObject` flake
+  state (`dt`, `m.lang`), and confirms a `<<( ?doc ex:label
+  "chat"@<tag> )>>` query returns exactly one source per language.
 - ✅ **Wildcard hide of anonymous annotation SIDs.** The hydration
   formatter (`fluree-db-api/src/format/hydration.rs::format_subject`)
   returns `Null` for top-level subject expansions whose root SID is
