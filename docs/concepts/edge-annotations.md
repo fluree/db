@@ -290,12 +290,9 @@ In LPG mode, an empty block mints a fresh annotation subject — a property-less
 
 ## Relationship to RDF-star and RDF 1.2
 
-`@annotation` lowers to the same model as JSON-LD-star annotation syntax and RDF 1.2 reifiers. The following three forms are equivalent at the storage layer:
+`@annotation` lowers to the same model as RDF 1.2 reifiers. The following equivalent forms all produce the same storage shape:
 
-```sparql
-# SPARQL-star asserted-triple annotation
-<< ex:alice ex:worksFor ex:acme >> ex:role "Engineer" .
-```
+JSON-LD `@annotation`:
 
 ```json
 {
@@ -306,6 +303,8 @@ In LPG mode, an empty block mints a fresh annotation subject — a property-less
   }
 }
 ```
+
+JSON-LD `@reifies`:
 
 ```json
 {
@@ -318,7 +317,87 @@ In LPG mode, an empty block mints a fresh annotation subject — a property-less
 }
 ```
 
+SPARQL 1.2 / RDF 1.2 annotation block:
+
+```sparql
+PREFIX ex: <http://example.org/>
+INSERT DATA {
+  ex:alice ex:worksFor ex:acme {| ex:role "Engineer" |} .
+}
+```
+
+SPARQL 1.2 / RDF 1.2 named reifier:
+
+```sparql
+PREFIX ex: <http://example.org/>
+INSERT DATA {
+  ex:alice ex:worksFor ex:acme ~ ex:emp1 {| ex:role "Engineer" |} .
+}
+```
+
+SPARQL 1.2 / RDF 1.2 explicit reifier with `rdf:reifies` — **query only** in v1:
+
+```sparql
+PREFIX rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#>
+PREFIX ex:  <http://example.org/>
+SELECT ?role WHERE {
+  ?ann rdf:reifies <<( ex:alice ex:worksFor ex:acme )>> .
+  ?ann ex:role ?role .
+}
+```
+
+The `rdf:reifies` + triple-term form is accepted in SPARQL `WHERE` clauses only; SPARQL UPDATE (`INSERT DATA`, `DELETE DATA`, `INSERT WHERE` / `DELETE WHERE` templates) accepts only the `~ {| |}` annotation-tail form. Both forms are semantically equivalent — use `~` for inserts and updates.
+
+(For DATA operations: anonymous `{| |}` and bare `_:` reifiers are allowed in `INSERT DATA` but rejected in `DELETE DATA` per SPARQL §3.1.3.)
+
+### Querying annotations from SPARQL
+
+The same three surface forms work in `WHERE` clauses. Inline:
+
+```sparql
+PREFIX ex: <http://example.org/>
+SELECT ?role WHERE {
+  ex:alice ex:worksFor ex:acme {| ex:role ?role |} .
+}
+```
+
+With a bound reifier variable (one row per parallel annotation):
+
+```sparql
+PREFIX ex: <http://example.org/>
+SELECT ?ann ?role WHERE {
+  ?p ex:worksFor ex:acme ~ ?ann {| ex:role ?role |} .
+}
+```
+
+Annotation-rooted via `rdf:reifies` — filter by metadata, return reified-edge endpoints:
+
+```sparql
+PREFIX rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#>
+PREFIX ex:  <http://example.org/>
+SELECT ?person ?org WHERE {
+  ?ann rdf:reifies <<( ?person ex:worksFor ?org )>> .
+  ?ann ex:role "Engineer" .
+}
+```
+
+Sibling triples about the reifier (here `?ann ex:role "Engineer"`) live in the surrounding scope and join via the standard executor — they do **not** need to live inside the `<<( ... )>>` term.
+
 Fluree's annotation is *lifecycle-coupled* to an asserted edge: the annotation describes a triple that's currently in the graph. RDF 1.2 also allows reifiers for unasserted propositions ("X claims Alice works for Acme, without us asserting it"). That mode is not supported in v1 — see *Current limits* below.
+
+### Legacy Fluree-specific `<< s p ?o >>` syntax
+
+Fluree predates RDF 1.2. The bare `<< s p o >>` SPARQL-star quoted-triple form (without parens) remains valid for the **Fluree-specific** `f:t` / `f:op` flake-metadata extraction:
+
+```sparql
+PREFIX f:  <https://ns.flur.ee/db#>
+PREFIX ex: <http://example.org/>
+SELECT ?age ?t ?op WHERE {
+  << ex:alice ex:age ?age >> f:t ?t ; f:op ?op .
+}
+```
+
+This binds `?t` to the transaction time and `?op` to the assert/retract flag of the matched flake. It is **not** edge annotations and is unrelated to the RDF 1.2 reifier surface above. Use `<<( ... )>>` (parenthesized) and `{| ... |}` for edge annotations; use bare `<< ... >>` only for `f:t` / `f:op`.
 
 ## Current limits
 

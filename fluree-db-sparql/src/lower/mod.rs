@@ -45,6 +45,7 @@
 //! - [`select`] — SELECT clause, solution modifiers, subqueries
 
 mod aggregate;
+mod annotation;
 mod ask;
 mod construct;
 mod describe;
@@ -3254,5 +3255,221 @@ mod tests {
             "Expected PropertyPath, got {:?}",
             query.patterns[0]
         );
+    }
+
+    // =========================================================================
+    // M4.3 — RDF 1.2 annotation lowering
+    // =========================================================================
+
+    #[test]
+    fn m43_annotation_block_lowers_to_edge_annotation_with_body() {
+        let query = lower_query(
+            "PREFIX ex: <http://example.org/>
+             SELECT * WHERE { ex:alice ex:worksFor ex:acme {| ex:role \"Engineer\" |} . }",
+        )
+        .expect("lower should succeed");
+        assert_eq!(query.patterns.len(), 1);
+        match &query.patterns[0] {
+            Pattern::EdgeAnnotation { body, annotation, .. } => {
+                assert_eq!(body.len(), 1, "one annotation entry → one body triple");
+                assert!(matches!(annotation, Ref::Var(_)), "anonymous reifier mints var");
+                match &body[0] {
+                    Pattern::Triple(tp) => {
+                        // Body triple's subject is the annotation reifier var.
+                        match (&tp.s, annotation) {
+                            (Ref::Var(a), Ref::Var(b)) => assert_eq!(a, b),
+                            _ => panic!("body subject should match annotation ref"),
+                        }
+                    }
+                    other => panic!("body[0] should be Pattern::Triple, got {other:?}"),
+                }
+            }
+            other => panic!("expected Pattern::EdgeAnnotation, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn m43_named_iri_reifier_resolves_to_iri_ref() {
+        let query = lower_query(
+            "PREFIX ex: <http://example.org/>
+             SELECT * WHERE { ex:alice ex:worksFor ex:acme ~ ex:rel {| ex:role \"x\" |} . }",
+        )
+        .unwrap();
+        match &query.patterns[0] {
+            Pattern::EdgeAnnotation { annotation, .. } => {
+                assert!(
+                    matches!(annotation, Ref::Iri(_) | Ref::Sid(_)),
+                    "explicit IRI reifier resolves to a constant ref, got {annotation:?}"
+                );
+            }
+            other => panic!("expected EdgeAnnotation, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn m43_named_var_reifier_resolves_to_var() {
+        let query = lower_query(
+            "PREFIX ex: <http://example.org/>
+             SELECT * WHERE { ex:alice ex:worksFor ex:acme ~ ?ann {| ex:role \"x\" |} . }",
+        )
+        .unwrap();
+        match &query.patterns[0] {
+            Pattern::EdgeAnnotation { annotation, .. } => {
+                assert!(matches!(annotation, Ref::Var(_)));
+            }
+            other => panic!("expected EdgeAnnotation, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn m43_empty_block_emits_empty_body() {
+        let query = lower_query(
+            "PREFIX ex: <http://example.org/>
+             SELECT * WHERE { ex:alice ex:worksFor ex:acme {| |} . }",
+        )
+        .unwrap();
+        match &query.patterns[0] {
+            Pattern::EdgeAnnotation { body, .. } => assert!(body.is_empty()),
+            other => panic!("expected EdgeAnnotation, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn m43_bare_tilde_reifier_emits_empty_body() {
+        let query = lower_query(
+            "PREFIX ex: <http://example.org/>
+             SELECT * WHERE { ex:alice ex:worksFor ex:acme ~ ?ann . }",
+        )
+        .unwrap();
+        match &query.patterns[0] {
+            Pattern::EdgeAnnotation { body, annotation, .. } => {
+                assert!(body.is_empty());
+                assert!(matches!(annotation, Ref::Var(_)));
+            }
+            other => panic!("expected EdgeAnnotation, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn m43_rdf_reifies_lowers_to_annotation_target_with_empty_body() {
+        let query = lower_query(
+            "PREFIX rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#>
+             PREFIX ex: <http://example.org/>
+             SELECT * WHERE { ?ann rdf:reifies <<( ex:alice ex:worksFor ex:acme )>> . }",
+        )
+        .unwrap();
+        // The pattern list contains exactly one AnnotationTarget. Sibling
+        // triples about ?ann (none in this query) would join via the
+        // standard executor — the AnnotationTarget itself carries no body.
+        let n = query
+            .patterns
+            .iter()
+            .filter(|p| matches!(p, Pattern::AnnotationTarget { .. }))
+            .count();
+        assert_eq!(n, 1, "expected exactly one AnnotationTarget IR pattern");
+        for p in &query.patterns {
+            if let Pattern::AnnotationTarget { body, .. } = p {
+                assert!(body.is_empty(), "M4.3 emits empty body");
+            }
+        }
+    }
+
+    #[test]
+    fn m43_sibling_triples_about_reifier_stay_in_outer_scope() {
+        // ?ann ex:role "Engineer" must remain a regular Pattern::Triple
+        // alongside the AnnotationTarget — NOT folded into body.
+        let query = lower_query(
+            "PREFIX rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#>
+             PREFIX ex: <http://example.org/>
+             SELECT * WHERE {
+               ?ann rdf:reifies <<( ex:alice ex:worksFor ex:acme )>> .
+               ?ann ex:role \"Engineer\" .
+             }",
+        )
+        .unwrap();
+        let n_target = query
+            .patterns
+            .iter()
+            .filter(|p| matches!(p, Pattern::AnnotationTarget { .. }))
+            .count();
+        let n_triple = query
+            .patterns
+            .iter()
+            .filter(|p| matches!(p, Pattern::Triple(_)))
+            .count();
+        assert_eq!(n_target, 1);
+        assert_eq!(n_triple, 1, "sibling stays as outer Pattern::Triple");
+        // And the body of AnnotationTarget is empty.
+        for p in &query.patterns {
+            if let Pattern::AnnotationTarget { body, .. } = p {
+                assert!(body.is_empty());
+            }
+        }
+    }
+
+    #[test]
+    fn m43_rebound_rdf_prefix_with_reifies_is_rejected_at_lower_time() {
+        // The parser recognizes `rdf:reifies` lexically. If the user
+        // rebinds `rdf:` to a non-standard namespace, the resulting
+        // IRI is NOT the standard rdf:reifies and must be rejected by
+        // the lower step. Mirrors the JSON-LD path's strict-IRI rule.
+        let err = lower_query(
+            "PREFIX rdf: <http://example.org/fake-rdf#>
+             PREFIX ex:  <http://example.org/>
+             SELECT * WHERE {
+               ?ann rdf:reifies <<( ex:a ex:b ex:c )>> .
+             }",
+        )
+        .expect_err("rebound rdf:reifies must be rejected at lower time");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("does not resolve to rdf:reifies"),
+            "expected prefix-rejection diagnostic, got: {msg}"
+        );
+    }
+
+    // =========================================================================
+    // M4.5 — CONSTRUCT boundary
+    // =========================================================================
+
+    #[test]
+    fn m45_construct_with_annotation_in_template_is_rejected() {
+        let err = lower_query(
+            "PREFIX ex: <http://example.org/>
+             CONSTRUCT { ex:alice ex:worksFor ex:acme {| ex:role \"Engineer\" |} }
+             WHERE { ex:alice ex:worksFor ex:acme }",
+        )
+        .expect_err("annotation in CONSTRUCT template must be rejected");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("CONSTRUCT projection of edge-annotation"),
+            "got: {msg}"
+        );
+    }
+
+    #[test]
+    fn m45_construct_without_annotation_in_template_works_with_annotation_where() {
+        // Annotation in WHERE filters the matches; template projects only
+        // ordinary triples. This must succeed.
+        lower_query(
+            "PREFIX ex: <http://example.org/>
+             CONSTRUCT { ?p ex:knows ex:acme }
+             WHERE { ?p ex:worksFor ex:acme {| ex:role \"Engineer\" |} . }",
+        )
+        .expect("CONSTRUCT-without-annotation-in-template + annotation-in-WHERE should lower");
+    }
+
+    #[test]
+    fn m43_does_not_trip_user_authored_reifies_firewall() {
+        // An @annotation lowering legitimately produces internal
+        // f:reifies* fan-out at execute time via
+        // expand_edge_annotation_patterns. The firewall must NOT
+        // reject it at lower time, because the f:reifies* triples
+        // don't appear in the IR yet.
+        let result = lower_query(
+            "PREFIX ex: <http://example.org/>
+             SELECT * WHERE { ex:alice ex:worksFor ex:acme {| ex:role \"x\" |} . }",
+        );
+        assert!(result.is_ok(), "lower should not be rejected by the firewall");
     }
 }

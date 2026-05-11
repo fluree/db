@@ -18,6 +18,7 @@ useful — a reviewer can merge without waiting for the next.
 | M2a | Scan-based indexed read path | works pre + post-index | ✅ shipped |
 | M2b | Binary annotation-arena format | O(log N) lookups, lazy load | ✅ shipped (slices 1–5) |
 | M3  | Planner / costing | — | ✅ shipped (M3.1 + M3.2 + M3.3) |
+| M4  | SPARQL 1.2 / RDF 1.2 surface — see `SPARQL_EDGE_ANNOTATIONS_IMPL_PLAN.md` | reuses M1 staging + M3 planning | ✅ shipped (M4.1–M4.6) |
 
 **M1 was split into two slices during implementation.** M1a and M1b
 are each independently mergeable. M1a is a complete write-side

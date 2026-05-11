@@ -100,9 +100,22 @@ impl<E: IriEncoder> LoweringContext<'_, E> {
                     }
                 }
                 _ => {
-                    // Regular triple pattern
-                    let lowered = self.lower_triple_pattern(tp)?;
-                    result.push(Pattern::Triple(lowered));
+                    // RDF 1.2 annotation tail: when a triple carries
+                    // `~ reifier? {| ... |}`, lower through the
+                    // annotation path so it becomes a
+                    // `Pattern::EdgeAnnotation` IR node. Otherwise
+                    // lower as an ordinary triple.
+                    if super::annotation::triple_has_annotation(tp) {
+                        let ann = tp
+                            .annotation
+                            .as_ref()
+                            .expect("triple_has_annotation guarantees Some");
+                        let pattern = self.lower_annotated_triple(tp, ann)?;
+                        result.push(pattern);
+                    } else {
+                        let lowered = self.lower_triple_pattern(tp)?;
+                        result.push(Pattern::Triple(lowered));
+                    }
                 }
             }
         }

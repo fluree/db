@@ -52,6 +52,29 @@ mod rdf_xml;
 mod sparql;
 mod sparql_xml;
 mod typed;
+
+/// Registry-name predicate: does this variable name belong to a
+/// non-projected internal / non-distinguished variable that should be
+/// hidden from `SELECT *` wildcard output?
+///
+/// Three categories are reserved:
+/// - `?__*` — planner / aggregate / property-path synthetics.
+/// - `?#*`  — annotation-reifier synthetics (the `#` is comment-start
+///   in the SPARQL lexer so users cannot lex this prefix).
+/// - `_:*`  — SPARQL blank nodes used in WHERE patterns. Per SPARQL
+///   §4.1.4 these are non-distinguished variables; they bind values
+///   but are not part of the SELECT scope, so they don't appear in
+///   `SELECT *` results. Hiding them here also covers
+///   blank-node-labelled reifiers (`~ _:ann`, `_:ann rdf:reifies …`)
+///   that the edge-annotation lowering registers under their literal
+///   blank-node label.
+///
+/// Every wildcard formatter (SPARQL JSON, SPARQL XML, JSON-LD, typed,
+/// agent-JSON, delimited) routes through this predicate so the rule
+/// stays consistent across output shapes.
+pub(crate) fn is_internal_var_name(name: &str) -> bool {
+    name.starts_with("?__") || name.starts_with("?#") || name.starts_with("_:")
+}
 mod xml_escape;
 
 pub use config::{AgentJsonContext, FormatterConfig, OutputFormat, QueryOutput};

@@ -807,6 +807,53 @@ async fn explain_tags_annotation_role_and_uses_arena_stats() {
 }
 
 #[tokio::test]
+async fn reindex_seals_arena_when_caller_supplies_only_a_provider() {
+    // Regression for the review finding: when the caller passes an
+    // `IndexerConfig` with `attachment_events_provider: Some(_)` but
+    // `attachment_events: None`, the api's reindex path must still
+    // resolve the provider into a concrete envelope — the direct
+    // rebuild path only consumes the concrete field, so skipping
+    // resolution would silently land the rebuild in scan-fallback.
+    use fluree_db_api::ReindexOptions;
+
+    let fluree = FlureeBuilder::memory()
+        .with_ledger_cache_config(fluree_db_api::LedgerManagerConfig::default())
+        .build_memory();
+    let ledger_id = "it/edge-annotations-indexed:reindex-seals-arena-caller-provider";
+    let ledger0 = genesis_ledger(&fluree, ledger_id);
+
+    fluree
+        .insert(ledger0, &annotated_insert())
+        .await
+        .expect("annotated insert");
+
+    // Caller hand-builds an `IndexerConfig` carrying only the
+    // attachment-events provider — no concrete events. The api's
+    // reindex path must call the provider during resolution.
+    let caller_provider = fluree
+        .attachment_events_provider()
+        .expect("api provider is available when ledger caching is enabled");
+    let caller_config =
+        fluree_db_indexer::IndexerConfig::default().with_attachment_events_provider(caller_provider);
+
+    fluree
+        .reindex(
+            ledger_id,
+            ReindexOptions::default().with_indexer_config(caller_config),
+        )
+        .await
+        .expect("reindex must succeed");
+
+    let post = fluree.ledger(ledger_id).await.expect("reload");
+    assert!(
+        post.snapshot.annotation_index.is_some(),
+        "reindex must seal an annotation arena via the caller-supplied \
+         AttachmentEventsProvider — got annotation_index=None which means \
+         the provider-only IndexerConfig branch is back to scan-fallback"
+    );
+}
+
+#[tokio::test]
 async fn reindex_seals_arena_when_caching_enabled_no_provider_in_opts() {
     // Closes the bulk-import → arena seal gap: a `fluree.reindex(...)`
     // call with default options should seal an authoritative arena

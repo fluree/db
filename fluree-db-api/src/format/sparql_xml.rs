@@ -56,14 +56,14 @@ pub fn format(
                 b.schema()
                     .iter()
                     .copied()
-                    .filter(|&vid| !result.vars.name(vid).starts_with("?__"))
+                    .filter(|&vid| !super::is_internal_var_name(result.vars.name(vid)))
                     .collect()
             })
             .unwrap_or_else(|| {
                 result
                     .vars
                     .iter()
-                    .filter(|(name, _)| !name.starts_with("?__"))
+                    .filter(|(name, _)| !super::is_internal_var_name(name))
                     .map(|(_, id)| id)
                     .collect()
             })

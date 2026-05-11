@@ -1150,6 +1150,31 @@ fn is_envelope(map: &Map<String, Value>) -> bool {
         .all(|k| matches!(k.as_str(), "@context" | "@graph" | "opts"))
 }
 
+/// True when `map` is a transaction wrapper (UPDATE / explicit
+/// Insert+opts shape) rather than a node-map. The wrapper carries
+/// clause keys (`where`, `delete`, `insert`, `upsert`, `values`,
+/// `opts`, `ledger`) plus the optional `@context`, but no predicates
+/// of its own — so we must not mint an `@id` for it. Each clause's
+/// value is itself a fresh top-level payload that we recurse into.
+///
+/// The check fires when at least one clause key is present and
+/// every key is either a clause key, `@context`, or `@id`/`@type`
+/// (rare in transaction docs but tolerated). The `@id`/`@type`
+/// tolerance lets through documents that have already been minted
+/// by an earlier pass.
+fn is_transaction_wrapper(map: &Map<String, Value>) -> bool {
+    const CLAUSE_KEYS: &[&str] = &["where", "delete", "insert", "upsert", "values"];
+    const WRAPPER_KEYS: &[&str] = &[
+        "where", "delete", "insert", "upsert", "values", "opts", "ledger", "@context", "from",
+        "fromNamed",
+    ];
+    let has_clause = CLAUSE_KEYS.iter().any(|k| map.contains_key(*k));
+    if !has_clause {
+        return false;
+    }
+    map.keys().all(|k| WRAPPER_KEYS.contains(&k.as_str()))
+}
+
 /// True when `map` is a JSON-LD value/list/variable wrapper rather
 /// than a node-map. These objects describe a literal value, a list,
 /// or a variable reference — they must not be treated as nodes (we
@@ -1211,6 +1236,24 @@ fn lower_object_with_subject(
         return Ok(());
     }
 
+    // Transaction-wrapper form: an UPDATE-style document
+    // `{"where": ..., "delete": ..., "insert": ..., "upsert": ...,
+    // "values": ..., "opts": ..., "ledger": ..., "@context": ...}`.
+    // The wrapper itself is not a node — it carries no predicates of
+    // its own — so we must not mint an `@id` for it. Recurse into the
+    // value of each clause that can carry annotations as if it were
+    // a fresh top-level document. `where`, `values`, `opts`, and
+    // `ledger` are query/control clauses (no annotations to lower at
+    // this layer) so we skip them.
+    if is_transaction_wrapper(map) {
+        for clause in ["insert", "delete", "upsert"] {
+            if let Some(clause_val) = map.get_mut(clause) {
+                lower_value_with_subject(clause_val, None, walk, ctx)?;
+            }
+        }
+        return Ok(());
+    }
+
     // Compute the in-effect graph selector for this node and its
     // children. Per-node `@graph: "<iri>"` overrides; otherwise we
     // inherit from the walker.
@@ -1225,18 +1268,36 @@ fn lower_object_with_subject(
     // 1. Honor `@reifies` on this node (rejected in v1 — see above).
     if map.contains_key(REIFIES_KEY) {
         let val = map.remove(REIFIES_KEY).unwrap();
+        // `@reifies` is one of the cases that requires a subject id; the
+        // lower function reads `map`'s `@id` directly, but the mint must
+        // run first so the value is present.
+        let _ = ensure_subject_id(map, walk, ctx);
         lower_reifies_block(map, val, ctx)?;
     }
 
-    // 2. Mint or read the @id so children can reference us.
-    let my_id = ensure_subject_id(map, walk, ctx);
-
-    // 3. Walk predicate-value pairs. Skip JSON-LD keywords plus their
+    // 2. Walk predicate-value pairs. Skip JSON-LD keywords plus their
     //    context aliases (e.g. `"id": "@id"`) so we don't treat the
     //    aliased subject reference as a regular predicate.
+    //
+    // **Lazy @id minting.** Only mint `@id` for this node when an
+    // annotation is actually being intercepted on one of its
+    // predicates. Minting unconditionally would:
+    //   (a) corrupt non-node objects that flow through this path
+    //       (e.g. txn-meta values like `ex:invalid: {"foo": "bar"}`),
+    //       making them look like valid JSON-LD nodes and bypassing
+    //       downstream validation; and
+    //   (b) introduce stray subjects that the rest of the parser
+    //       would expand into spurious flakes.
+    //
+    // The original eager-mint behavior caused regressions in
+    // `it_select_star_novelty_retract::expansion_applies_novelty_retractions`,
+    // `it_transact::object_var_test`, and the `it_txn_meta::*`
+    // negative-validation tests when the lowering pass ran on
+    // ordinary (non-annotation) transactions.
     let id_alias = walk.json_ld.id_key.as_str();
     let type_alias = walk.json_ld.type_key.as_str();
     let keys: Vec<String> = map.keys().cloned().collect();
+    let mut minted_id: Option<String> = read_existing_subject_id(map, walk);
     for key in keys {
         if key == "@id" || key == "@context" || key == "@graph" || key == "@type" {
             continue;
@@ -1252,15 +1313,87 @@ fn lower_object_with_subject(
         }
 
         let predicate = key.clone();
+
+        // Mint the parent @id lazily — only if this predicate's value
+        // actually carries an annotation we'll need to anchor. Use an
+        // immutable peek first so the borrow of `map` is released
+        // before we hand it back mutably to `ensure_subject_id`.
+        if minted_id.is_none() {
+            let needs_mint = map
+                .get(&key)
+                .map(value_subtree_carries_annotation)
+                .unwrap_or(false);
+            if needs_mint {
+                minted_id = Some(ensure_subject_id(map, walk, ctx));
+            }
+        }
+
         let value = map.get_mut(&key).expect("key collected from this map");
-        intercept_annotations_for_predicate(&my_id, &predicate, value, &child_walk, ctx)?;
+
+        // `intercept_annotations_for_predicate` only consults
+        // `parent_subject` when it finds an annotation block; passing a
+        // synthetic placeholder when no annotation is present is safe
+        // because the function returns early without using it.
+        let placeholder = String::new();
+        let parent = minted_id.as_deref().unwrap_or(&placeholder);
+        intercept_annotations_for_predicate(parent, &predicate, value, &child_walk, ctx)?;
 
         // Recurse into the rewritten value to catch nested forms.
+        // Reborrow because intercept_* may have mutated the map.
         if let Some(v) = map.get_mut(&key) {
-            lower_value_with_subject(v, Some(&my_id), &child_walk, ctx)?;
+            let parent_ref = minted_id.as_deref();
+            lower_value_with_subject(v, parent_ref, &child_walk, ctx)?;
         }
     }
     Ok(())
+}
+
+/// Read an already-present subject id from a node-map, honoring the
+/// JSON-LD `@id` alias declared in the active context. Returns `None`
+/// when neither key is present; in that case the caller decides whether
+/// minting is required (see lazy-mint logic above).
+fn read_existing_subject_id(map: &Map<String, Value>, walk: &WalkCtx<'_>) -> Option<String> {
+    if let Some(Value::String(s)) = map.get("@id") {
+        return Some(s.clone());
+    }
+    let id_alias = walk.json_ld.id_key.as_str();
+    if id_alias != "@id" {
+        if let Some(Value::String(s)) = map.get(id_alias) {
+            return Some(s.clone());
+        }
+    }
+    None
+}
+
+/// True iff `value`'s structural subtree contains an `@annotation`,
+/// `@edge`, or `@reifies` key. Used to gate the lazy `@id` mint so
+/// we only stamp an id on parent nodes that actually need to anchor
+/// a `f:reifiesSubject` pointer.
+///
+/// Stops at value/list/variable wrappers — those are NOT node-maps
+/// and the deferred-shape rejection inside
+/// `intercept_annotations_for_predicate` handles any annotation key
+/// they might carry.
+fn value_subtree_carries_annotation(value: &Value) -> bool {
+    match value {
+        Value::Object(map) => {
+            if map.contains_key(ANNOTATION_KEY)
+                || map.contains_key(EDGE_KEY)
+                || map.contains_key(REIFIES_KEY)
+            {
+                return true;
+            }
+            // Stop at value/list/variable wrappers — they can't host
+            // an annotation in v1, and recursing further would
+            // false-positive on inner keys that happen to match.
+            if is_jsonld_value_object(map) {
+                return false;
+            }
+            map.values().any(value_subtree_carries_annotation)
+        }
+        Value::Array(items) => items.iter().any(value_subtree_carries_annotation),
+        _ => false,
+    }
 }
 
 /// Variant of `intercept_annotations_in_value` that has the parent

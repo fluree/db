@@ -316,9 +316,10 @@ fn format_row_wildcard(
 
             let var_name = vars.name(var_id);
 
-            // Skip internal variables (e.g. ?__pp0, ?__s0, ?__n0) from wildcard output.
-            // The ?__ prefix is reserved for internal use.
-            if var_name.starts_with("?__") {
+            // Skip internal / non-distinguished variables (planner synthetics
+            // `?__*`, annotation-reifier synthetics `?#*`, SPARQL blank-node
+            // vars `_:*` per §4.1.4). See `format::is_internal_var_name`.
+            if super::is_internal_var_name(var_name) {
                 continue;
             }
 

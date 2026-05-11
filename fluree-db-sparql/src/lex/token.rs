@@ -292,6 +292,18 @@ pub enum TokenKind {
     /// `>>` (quoted triple end)
     TripleEnd,
 
+    // RDF 1.2 reifier / annotation delimiters
+    /// `<<(` (triple term start)
+    TripleTermStart,
+    /// `)>>` (triple term end)
+    TripleTermEnd,
+    /// `{|` (annotation block start)
+    AnnotationOpen,
+    /// `|}` (annotation block end)
+    AnnotationClose,
+    /// `~` (reifier marker)
+    Tilde,
+
     /// `.`
     Dot,
     /// `,`
@@ -633,6 +645,11 @@ impl std::fmt::Display for TokenKind {
             TokenKind::RBracket => write!(f, "]"),
             TokenKind::TripleStart => write!(f, "<<"),
             TokenKind::TripleEnd => write!(f, ">>"),
+            TokenKind::TripleTermStart => write!(f, "<<("),
+            TokenKind::TripleTermEnd => write!(f, ")>>"),
+            TokenKind::AnnotationOpen => write!(f, "{{|"),
+            TokenKind::AnnotationClose => write!(f, "|}}"),
+            TokenKind::Tilde => write!(f, "~"),
             TokenKind::Dot => write!(f, "."),
             TokenKind::Comma => write!(f, ","),
             TokenKind::Semicolon => write!(f, ";"),

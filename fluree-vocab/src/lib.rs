@@ -77,6 +77,12 @@ pub mod rdf {
 
     /// rdf:Property IRI (the class of RDF properties)
     pub const PROPERTY: &str = "http://www.w3.org/1999/02/22-rdf-syntax-ns#Property";
+
+    /// rdf:reifies IRI (RDF 1.2 reifier predicate). The triple
+    /// `<reifier> rdf:reifies <<( s p o )>>` introduces a reifier whose
+    /// other facts annotate the asserted edge `s p o`. Fluree maps this
+    /// to its native edge-annotation primitive.
+    pub const REIFIES: &str = "http://www.w3.org/1999/02/22-rdf-syntax-ns#reifies";
 }
 
 /// RDFS vocabulary constants

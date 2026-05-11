@@ -44,8 +44,11 @@ pub fn format(
                 b.schema()
                     .iter()
                     .copied()
-                    // Skip internal variables (?__pp0, ?__s0, etc.) from wildcard output.
-                    .filter(|&vid| !result.vars.name(vid).starts_with("?__"))
+                    // Skip internal variables from wildcard output:
+                    // - `?__pp0`, `?__agg_*` etc. (planner / aggregate synthetics)
+                    // - `?#...` (uncollidable annotation reifier synthetics —
+                    //   `#` is comment-start in SPARQL so users can't lex it)
+                    .filter(|&vid| !is_internal_var_name(result.vars.name(vid)))
                     .collect()
             })
             .unwrap_or_else(|| {
@@ -53,7 +56,7 @@ pub fn format(
                 result
                     .vars
                     .iter()
-                    .filter(|(name, _)| !name.starts_with("?__"))
+                    .filter(|(name, _)| !is_internal_var_name(name))
                     .map(|(_, id)| id)
                     .collect()
             })
@@ -113,6 +116,8 @@ pub fn format(
 fn strip_question_mark(var_name: &str) -> String {
     var_name.strip_prefix('?').unwrap_or(var_name).to_string()
 }
+
+use super::is_internal_var_name;
 
 /// Format a single binding to SPARQL JSON format
 ///

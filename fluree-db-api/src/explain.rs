@@ -302,6 +302,15 @@ fn explain_from_parsed(
                 Pattern::Subquery(sq) => {
                     collect_triples_in_order(out, &sq.patterns, normalize_ref, normalize_term);
                 }
+                // The `DefaultGraphSource` wrapper is introduced by
+                // `expand_edge_annotation_patterns` to keep `f:reifies*`
+                // lookups per-source-correlated in multi-graph default
+                // contexts. For explain purposes the triples inside it
+                // are the ones the optimizer sees, so recurse like
+                // `Graph` does.
+                Pattern::DefaultGraphSource { patterns, .. } => {
+                    collect_triples_in_order(out, patterns, normalize_ref, normalize_term);
+                }
                 // Non-triple patterns (FILTER, BIND, VALUES, SEARCH, etc.) don't contribute
                 // to triple-level selectivity scoring.
                 _ => {}
