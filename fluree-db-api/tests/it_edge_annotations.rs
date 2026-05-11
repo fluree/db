@@ -28,7 +28,7 @@ use std::sync::Arc;
 
 use fluree_db_api::FlureeBuilder;
 use serde_json::{json, Value as JsonValue};
-use support::{genesis_ledger, MemoryFluree, MemoryLedger};
+use support::{genesis_ledger, genesis_ledger_for_fluree, MemoryFluree, MemoryLedger};
 
 fn ctx() -> JsonValue {
     json!({
@@ -3652,5 +3652,379 @@ async fn delete_by_id_retracts_lang_tagged_literal_annotation_bundle() {
     assert!(
         post.is_empty(),
         "lang-tagged annotation must be retracted post-delete: got {post:#?}"
+    );
+}
+
+// =====================================================================
+// Pinning tests for items called out as open in EDGE_ANNOTATIONS_IMPL_PLAN.md
+// =====================================================================
+
+/// Pinning repro for the per-language cross-match gap called out in
+/// `EDGE_ANNOTATIONS_IMPL_PLAN.md` M1b status. Two annotations with
+/// the **same lexical string but different language tags** currently
+/// cross-match when an annotation-rooted query constrains the base
+/// edge's object by language.
+///
+/// `expand_edge_annotation_patterns` in
+/// `fluree-db-query/src/execute/where_plan.rs` clones `edge.dtc` onto
+/// the synthesized `f:reifiesObject` lookup, but the
+/// `f:reifiesObject` flake's wire layout does not carry the language
+/// tag in a position the scan filter consults — the JSON-LD writer
+/// emits a separate `f:reifiesLang` predicate and stores the object
+/// flake without per-flake `m.lang`. The right fix is the
+/// custom-operator path described in the plan
+/// ("⏳ Per-language disambiguation — same architectural shape …
+/// same custom-operator fix path"), which adds an explicit
+/// `f:reifiesLang` join key to the expansion.
+///
+/// Today the test fails — both annotations cross-match — so it is
+/// `#[ignore]`d. Future work that lands the language join key
+/// should flip this to an active test.
+#[tokio::test]
+#[ignore = "pins the per-language cross-match gap from EDGE_ANNOTATIONS_IMPL_PLAN.md M1b"]
+async fn cross_language_annotation_does_not_cross_match() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger_id = "it-edge-annotations-cross-language";
+    let ledger0 = genesis_ledger(&fluree, ledger_id);
+
+    // Two annotations on different subjects, same predicate, same
+    // lexical object value, different `@language` tags. Each
+    // annotation carries a distinct body source so the test can
+    // confirm which one matched. Using distinct subjects rather than
+    // a parallel array on one subject avoids any list/list-merge
+    // semantics in the JSON-LD parser and keeps the test focused on
+    // the dtc-propagation behavior in `f:reifiesObject`.
+    let insert = json!({
+        "@context": ctx(),
+        "@graph": [
+            {
+                "@id": "ex:doc1",
+                "ex:label": {
+                    "@value": "chat",
+                    "@language": "fr",
+                    "@annotation": { "@id": "ex:ann-fr", "ex:source": "fr-src" }
+                }
+            },
+            {
+                "@id": "ex:doc2",
+                "ex:label": {
+                    "@value": "chat",
+                    "@language": "en",
+                    "@annotation": { "@id": "ex:ann-en", "ex:source": "en-src" }
+                }
+            }
+        ]
+    });
+    fluree.insert(ledger0, &insert).await.expect("insert");
+
+    let ledger = fluree.ledger(ledger_id).await.expect("reload");
+
+    // Sanity check: both annotation bundles landed. We scan
+    // `f:reifiesObject` flakes for `ex:doc1` annotations.
+    let bare = json!({
+        "@context": ctx(),
+        "select": ["?ann", "?src"],
+        "where": {
+            "@id": "?ann",
+            "ex:source": "?src"
+        }
+    });
+    let bare_rows = support::query_jsonld_formatted(&fluree, &ledger, &bare)
+        .await
+        .expect("bare body query");
+    assert_eq!(
+        bare_rows.as_array().map(|a| a.len()),
+        Some(2),
+        "both annotation bodies must be inserted; got: {bare_rows:#?}"
+    );
+
+    // SPARQL gives an unambiguous syntax for language-tagged literal
+    // matching (`"chat"@fr`). We use the RDF 1.2 `@reifies` form so
+    // the test exercises the same `expand_edge_annotation_patterns`
+    // dtc-propagation code path that JSON-LD inline queries use.
+    let sparql_fr = r#"
+        PREFIX rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#>
+        PREFIX ex:  <http://example.org/>
+        SELECT ?src WHERE {
+          ?ann rdf:reifies <<( ?doc ex:label "chat"@fr )>> .
+          ?ann ex:source ?src .
+        }
+    "#;
+    let result_fr = support::query_sparql(&fluree, &ledger, sparql_fr)
+        .await
+        .expect("cross-language SPARQL query (fr)");
+    let bindings_fr = result_fr
+        .to_sparql_json(&ledger.snapshot)
+        .expect("sparql json")["results"]["bindings"]
+        .as_array()
+        .expect("bindings array")
+        .clone();
+    assert_eq!(
+        bindings_fr.len(),
+        1,
+        "cross-language annotation must not cross-match; got bindings: {bindings_fr:#?}"
+    );
+    assert_eq!(
+        bindings_fr[0]["src"]["value"].as_str(),
+        Some("fr-src"),
+        "fr-tagged annotation body must be the only match, got: {:?}",
+        bindings_fr[0]["src"]
+    );
+
+    // Mirror query with the English tag to prove the other side too.
+    let sparql_en = r#"
+        PREFIX rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#>
+        PREFIX ex:  <http://example.org/>
+        SELECT ?src WHERE {
+          ?ann rdf:reifies <<( ?doc ex:label "chat"@en )>> .
+          ?ann ex:source ?src .
+        }
+    "#;
+    let result_en = support::query_sparql(&fluree, &ledger, sparql_en)
+        .await
+        .expect("cross-language SPARQL query (en)");
+    let bindings_en = result_en
+        .to_sparql_json(&ledger.snapshot)
+        .expect("sparql json")["results"]["bindings"]
+        .as_array()
+        .expect("bindings array")
+        .clone();
+    assert_eq!(bindings_en.len(), 1, "got: {bindings_en:#?}");
+    assert_eq!(bindings_en[0]["src"]["value"].as_str(), Some("en-src"));
+}
+
+/// A file-backed ledger with an annotated edge must survive a full
+/// process restart (drop the `Fluree` handle entirely, rebuild from
+/// the same path) and still answer annotation queries from the
+/// rehydrated commit chain. Closes the "restart-from-commits" item
+/// from `EDGE_ANNOTATIONS_IMPL_PLAN.md` M1b broader-integration list.
+#[tokio::test]
+async fn annotations_survive_restart_from_commits() {
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let path = tmp.path().to_string_lossy().to_string();
+    let ledger_id = "it/edge-annotations:restart-from-commits";
+
+    // ---------- Session 1: insert ----------
+    {
+        let fluree = FlureeBuilder::file(&path).build().expect("build");
+        let ledger0 = genesis_ledger_for_fluree(&fluree, ledger_id);
+        let insert = json!({
+            "@context": ctx(),
+            "@id": "ex:alice",
+            "ex:worksFor": {
+                "@id": "ex:acme",
+                "@annotation": {
+                    "@id": "ex:emp-2024",
+                    "ex:role": "Engineer",
+                    "ex:since": "2024"
+                }
+            }
+        });
+        fluree.insert(ledger0, &insert).await.expect("seed insert");
+        // Explicitly drop the Fluree handle so the next session loads
+        // from the persisted commit chain rather than reusing the
+        // in-memory `LedgerManager` cache.
+        drop(fluree);
+    }
+
+    // ---------- Session 2: rebuild + query ----------
+    let fluree2 = FlureeBuilder::file(&path).build().expect("rebuild");
+    let ledger = fluree2
+        .ledger(ledger_id)
+        .await
+        .expect("load ledger after restart");
+
+    // Inline annotation query: confirms the f:reifies* bundle replayed
+    // from commits into novelty, the base edge is queryable, and the
+    // annotation body is reachable through `@annotation`.
+    let inline = json!({
+        "@context": ctx(),
+        "select": ["?person", "?org", "?role", "?since"],
+        "where": {
+            "@id": "?person",
+            "ex:worksFor": {
+                "@id": "?org",
+                "@annotation": { "ex:role": "?role", "ex:since": "?since" }
+            }
+        }
+    });
+    let inline_rows = support::query_jsonld_formatted(&fluree2, &ledger, &inline)
+        .await
+        .expect("inline annotation query after restart");
+    let rows = inline_rows.as_array().expect("rows array");
+    assert_eq!(
+        rows.len(),
+        1,
+        "exactly one annotation must replay; got: {rows:#?}"
+    );
+    let row = rows[0].as_array().expect("row tuple");
+    assert!(iri_matches(&row[0], "ex:alice", "http://example.org/alice"));
+    assert!(iri_matches(&row[1], "ex:acme", "http://example.org/acme"));
+    assert_eq!(row[2].as_str(), Some("Engineer"));
+    assert_eq!(row[3].as_str(), Some("2024"));
+
+    // Annotation-rooted query via `@reifies` — proves the reverse
+    // attachment lookup also survives restart.
+    let reifies = json!({
+        "@context": ctx(),
+        "select": ["?person", "?org"],
+        "where": {
+            "ex:role": "Engineer",
+            "@reifies": {
+                "@id": "?person",
+                "ex:worksFor": { "@id": "?org" }
+            }
+        }
+    });
+    let reifies_rows = support::query_jsonld_formatted(&fluree2, &ledger, &reifies)
+        .await
+        .expect("reifies query after restart");
+    let rows = reifies_rows.as_array().expect("rows array");
+    assert_eq!(rows.len(), 1, "got: {rows:#?}");
+}
+
+/// Policy visibility independence: when a policy hides the base
+/// edge's predicate, an annotation-rooted query that asks for the
+/// reified base edge must return zero rows — the annotation's
+/// body facts alone must not leak the hidden edge's existence.
+///
+/// Closes the "policy visibility independence" item from
+/// `EDGE_ANNOTATIONS_IMPL_PLAN.md` M1b broader-integration list, and
+/// pins the design-doc contract: "Annotation query rows require
+/// visibility of both the base edge and the matched annotation
+/// facts."
+///
+/// Mechanism: the IR-level expansion emits a `Pattern::Triple` for
+/// the base edge in addition to the `f:reifies*` lookups. The
+/// standard scan applies the policy filter to that triple, so a
+/// hidden base edge zeroes the row out before the body is even
+/// evaluated.
+#[tokio::test]
+async fn policy_hiding_base_edge_blocks_annotation_rooted_query() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger_id = "it/edge-annotations:policy-hides-base";
+    let ledger0 = genesis_ledger(&fluree, ledger_id);
+
+    // Insert the annotated edge.
+    let insert = json!({
+        "@context": ctx(),
+        "@id": "ex:alice",
+        "ex:worksFor": {
+            "@id": "ex:acme",
+            "@annotation": { "@id": "ex:emp-A", "ex:role": "Engineer" }
+        }
+    });
+    fluree.insert(ledger0, &insert).await.expect("insert");
+
+    // Sanity check: with no policy in effect, the annotation-rooted
+    // query returns the row.
+    let reifies_query = json!({
+        "@context": ctx(),
+        "select": ["?person", "?org"],
+        "where": {
+            "ex:role": "Engineer",
+            "@reifies": {
+                "@id": "?person",
+                "ex:worksFor": { "@id": "?org" }
+            }
+        }
+    });
+    let ledger = fluree.ledger(ledger_id).await.expect("reload");
+    let baseline = support::query_jsonld_formatted(&fluree, &ledger, &reifies_query)
+        .await
+        .expect("baseline (root) query");
+    assert_eq!(
+        baseline.as_array().map(|a| a.len()),
+        Some(1),
+        "baseline (root, no policy) must return one row; got: {baseline:#?}"
+    );
+
+    // Policy: deny `ex:worksFor` for everyone. The `f:query` requires
+    // an `?$identity` binding that the connection never supplies, so
+    // the required policy never matches and `ex:worksFor` is hidden
+    // wholesale. Other predicates (`ex:role`) inherit `default-allow`.
+    let policy_query = json!({
+        "@context": ctx(),
+        "from": ledger_id,
+        "opts": {
+            "default-allow": true,
+            "policy": [{
+                "@id": "ex:hide-worksFor",
+                "f:required": true,
+                "f:onProperty": [{"@id": "http://example.org/worksFor"}],
+                "f:action": "f:view",
+                "f:query": serde_json::to_string(&json!({
+                    "where": {
+                        "@id": "?$identity",
+                        "@type": "ex:NeverMatches"
+                    }
+                })).unwrap()
+            }]
+        },
+        "select": ["?person", "?org"],
+        "where": {
+            "ex:role": "Engineer",
+            "@reifies": {
+                "@id": "?person",
+                "ex:worksFor": { "@id": "?org" }
+            }
+        }
+    });
+
+    let with_policy = fluree
+        .query_connection(&policy_query)
+        .await
+        .expect("policy query");
+    let rows = with_policy
+        .to_jsonld(&ledger.snapshot)
+        .expect("to_jsonld");
+    assert_eq!(
+        rows,
+        json!([]),
+        "annotation-rooted query must return zero rows when policy hides \
+         the reified base edge — annotation metadata alone must not leak \
+         the hidden edge's existence; got: {rows:#?}"
+    );
+
+    // Counterpart: a query that asks ONLY for the annotation body
+    // (no `@reifies`, no base-edge triple) should still see the
+    // metadata, because `ex:role` is unaffected by the policy.
+    let body_only_query = json!({
+        "@context": ctx(),
+        "from": ledger_id,
+        "opts": {
+            "default-allow": true,
+            "policy": [{
+                "@id": "ex:hide-worksFor",
+                "f:required": true,
+                "f:onProperty": [{"@id": "http://example.org/worksFor"}],
+                "f:action": "f:view",
+                "f:query": serde_json::to_string(&json!({
+                    "where": {
+                        "@id": "?$identity",
+                        "@type": "ex:NeverMatches"
+                    }
+                })).unwrap()
+            }]
+        },
+        "select": ["?ann", "?role"],
+        "where": {
+            "@id": "?ann",
+            "ex:role": "?role"
+        }
+    });
+    let body_only = fluree
+        .query_connection(&body_only_query)
+        .await
+        .expect("body-only query");
+    let body_rows = body_only
+        .to_jsonld(&ledger.snapshot)
+        .expect("body-only to_jsonld");
+    let arr = body_rows.as_array().expect("array");
+    assert_eq!(
+        arr.len(),
+        1,
+        "body predicate `ex:role` is allowed under the policy — the body \
+         alone must still be queryable; got: {body_rows:#?}"
     );
 }

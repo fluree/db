@@ -358,8 +358,24 @@ correctness items remaining):**
   but not constrained in the read-side expansion, so cross-language
   misjoin is possible when the same string is asserted with multiple
   language tags. Same custom-operator fix path; lands in the same
-  slice. No pinning test today — needs setup that exercises
-  multi-language flakes through the inline annotation form.
+  slice.
+
+  **Status note.** `expand_edge_annotation_patterns` currently clones
+  `edge.dtc` onto the synthesized `f:reifiesObject` lookup with the
+  intent of disambiguating, and its in-source comment claims so. In
+  practice the dtc filter does not actually exclude cross-language
+  matches because the JSON-LD writer stores the `f:reifiesObject`
+  flake without the language tag in the scan-filterable position
+  (the language lives on the sibling `f:reifiesLang` predicate, not
+  on the `f:reifiesObject` flake's `m.lang`). The real fix is to
+  add a separate `f:reifiesLang` constraint triple into the expansion
+  (mirroring the planned graph-bound fix) so the lang tag is joined
+  through the IR, not assumed to ride along on `f:reifiesObject`.
+
+  **Pinning repro shipped:** `cross_language_annotation_does_not_cross_match`
+  in `it_edge_annotations.rs` is `#[ignore]`d today — it asserts the
+  desired single-row behavior. When the fix lands, flip the
+  `#[ignore]` to make it an active regression guard.
 - ✅ **Wildcard hide of anonymous annotation SIDs.** The hydration
   formatter (`fluree-db-api/src/format/hydration.rs::format_subject`)
   returns `Null` for top-level subject expansions whose root SID is
@@ -471,10 +487,21 @@ correctness items remaining):**
   consults alongside (or unified with) the novelty overlay. For
   the M1 milestone — which is explicitly novelty-only end-to-end
   — this is the documented behavior.
-- ⏳ **Broader `it_edge_annotations.rs` integration tests:** parallel
+- ✅ **Broader `it_edge_annotations.rs` integration tests.** Parallel
   annotations on one edge, multiplicity contract, cascade behavior,
-  lifecycle (RDF default vs. LPG opt-in), restart-from-commits,
-  policy visibility independence.
+  and lifecycle (RDF default vs. LPG opt-in) have been covered for
+  some time. The two remaining gaps were closed by:
+  - `annotations_survive_restart_from_commits` — file-backed
+    `Fluree`, drop the handle, rebuild from the same path, query;
+    confirms both inline `@annotation` and `@reifies` queries
+    survive a true process-restart (commit-chain replay into
+    novelty).
+  - `policy_hiding_base_edge_blocks_annotation_rooted_query` — pins
+    the design-doc contract that "annotation query rows require
+    visibility of both the base edge and the matched annotation
+    facts." Uses inline `opts.policy` to deny the base-edge
+    predicate; asserts annotation-rooted queries zero out while
+    body-only queries still see the body.
 
 - ❌ **Custom `EdgeAnnotationOp` / `AnnotationTargetOp` operators —
   not pursued.** The IR-level expansion approach achieves the same
