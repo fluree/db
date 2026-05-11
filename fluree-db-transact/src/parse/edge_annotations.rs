@@ -56,7 +56,7 @@
 //! module emits.
 
 use crate::error::{Result, TransactError};
-use fluree_graph_json_ld::{expand_iri, parse_context, ParsedContext};
+use fluree_graph_json_ld::{expand_iri, parse_context, ParsedContext, TypeValue};
 use fluree_vocab::reifies_iris;
 use serde_json::{json, Map, Value};
 
@@ -67,6 +67,280 @@ const REIFIES_KEY: &str = "@reifies";
 /// True when `key` is an annotation/edge keyword on the *object* side.
 fn is_annotation_key(key: &str) -> bool {
     key == ANNOTATION_KEY || key == EDGE_KEY
+}
+
+/// Classification of the object position on a reified base edge. Drives
+/// every site that produces an `f:reifies*` bundle (insert sibling,
+/// delete template, delete-by-selector WHERE), so that all writers mint
+/// the same `EdgeKey` for the same logical edge.
+///
+/// Constructed via [`classify_reified_object`] after `@annotation` /
+/// `@edge` have been removed from the object map.
+#[derive(Debug, Clone)]
+pub(crate) enum ReifiedObjectShape {
+    /// Object is an IRI or blank-node reference. The `String` is the
+    /// IRI / blank-node identifier (possibly minted upstream).
+    Iri(String),
+    /// Object is a literal. Fields capture the canonicalized JSON-LD
+    /// value object: only `@value` (always), `@type` (when explicit),
+    /// and `@language` (when explicit) survive — every other key is
+    /// rejected upstream.
+    Literal {
+        /// Canonical value-object JSON: `{"@value": ..., ?"@type": ...,
+        /// ?"@language": ...}`. Suitable for direct insertion under
+        /// `f:reifiesObject`. Callers needing the datatype string for
+        /// delete-WHERE generation can extract it via
+        /// `value.get("@type")`.
+        value: Value,
+        /// `@language` payload if explicit. Drives `f:reifiesLang`
+        /// emission — required so `EdgeKey::from_reifies_facts` decodes
+        /// to the same `lang` the base flake carries via `flake.m.lang`.
+        language: Option<String>,
+    },
+}
+
+/// Reject the deferred JSON-LD wrapper shapes that can't carry an edge
+/// annotation in v1: `@list`, `@set`, `@reverse`, `@variable`. Called
+/// before either classifier branch so wrapper rejection is uniform.
+pub(crate) fn reject_deferred_object_wrappers(map: &Map<String, Value>) -> Result<()> {
+    for key in ["@list", "@set", "@reverse", "@variable"] {
+        if map.contains_key(key) {
+            return Err(TransactError::UnsupportedFeature(format!(
+                "edge annotations on '{key}' wrappers are deferred (v1)"
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// Reject annotated literal value-objects whose effective datatype or
+/// language is determined by JSON-LD context coercion rather than by
+/// explicit `@type` / `@language` on the value object.
+///
+/// Why: the JSON-LD expander applies a predicate's term-coerced
+/// `@type` and the active default `@language` to bare `{"@value": ...}`
+/// objects, so the base flake's `EdgeKey` ends up with the coerced
+/// datatype / language. The reified bundle synthesized by this module,
+/// however, only copies *explicit* `@type` / `@language` from the
+/// value object. Without rejection, the two EdgeKeys would silently
+/// diverge — exactly the failure mode the gate tests in
+/// `it_edge_annotations.rs` (`edgekey_roundtrip_*`) guard against.
+///
+/// Resolution path for users: write `@type` and/or `@language`
+/// explicitly on the annotated value object. The non-annotated form
+/// of the same triple continues to use context coercion normally; the
+/// stricter rule applies only when `@annotation` / `@edge` is present.
+///
+/// Implementation: this helper is called *after* `@annotation` is
+/// stripped from the map but *before* `classify_reified_object`. It
+/// has no effect on the Ref / `@id` branch.
+pub(crate) fn reject_context_coercion_on_annotated_literal(
+    map: &Map<String, Value>,
+    predicate: &str,
+    context: &ParsedContext,
+) -> Result<()> {
+    let entry = context.get(predicate);
+
+    // Datatype coercion: any predicate-level `@type` (including `@id`,
+    // `@vocab`, `@json`) without an explicit `@type` on the value
+    // object means the expander applies the coercion, while the
+    // synthesized `f:reifiesObject` would carry no such datatype.
+    if let Some(e) = entry {
+        if e.type_.is_some() && !map.contains_key("@type") {
+            let coerced = match e.type_.as_ref().unwrap() {
+                TypeValue::Iri(t) => t.clone(),
+                TypeValue::Id => "@id".to_string(),
+                TypeValue::Vocab => "@vocab".to_string(),
+                TypeValue::Json => "@json".to_string(),
+            };
+            return Err(TransactError::Parse(format!(
+                "annotated literal on '{predicate}' relies on @context term coercion \
+                 (@type='{coerced}'); annotated literals must carry an explicit @type so the \
+                 reified f:reifiesObject bundle matches the base edge's EdgeKey. \
+                 Add @type to the value object."
+            )));
+        }
+    }
+
+    // Language coercion: a default `@language` (or per-term language)
+    // applies to string `@value` payloads when no explicit `@language`
+    // is set, producing a `lang`-tagged base flake while the reified
+    // bundle would not carry `f:reifiesLang`.
+    let value_is_string = matches!(map.get("@value"), Some(Value::String(_)));
+    if value_is_string && !map.contains_key("@language") {
+        // Per-term @language overrides context default; explicit
+        // `Some(None)` clears the default for this term.
+        let effective_lang: Option<&str> = entry
+            .and_then(|e| e.language.as_ref().map(|inner| inner.as_deref()))
+            .unwrap_or(context.language.as_deref());
+        if let Some(lang) = effective_lang {
+            return Err(TransactError::Parse(format!(
+                "annotated string literal on '{predicate}' relies on @context language coercion \
+                 (@language='{lang}'); annotated literals must carry an explicit @language so \
+                 the reified f:reifiesLang flake matches the base edge's EdgeKey. \
+                 Add @language to the value object."
+            )));
+        }
+    }
+
+    Ok(())
+}
+
+/// Classify an object-position map (with `@annotation`/`@edge` already
+/// stripped) into either a reference or a literal value-object.
+///
+/// Rules:
+/// - `{"@id": "..."}` → `Iri`. (Aliased `@id` keys, e.g. `"id"` under a
+///   custom JSON-LD context, are NOT resolved here — the caller must
+///   resolve aliasing via `ensure_subject_id` before invoking this
+///   function for the Ref path.)
+/// - `{"@value": "...", "@type": "@id"}` → `Iri` (JSON-LD identifier-
+///   typed literal form). The `@value` payload must be a string.
+/// - `{"@value": ..., ?"@type": ..., ?"@language": ...}` → `Literal`.
+///   Any other key on the map (besides those three) is rejected. A
+///   `@language` tag requires `@value` to be a string, and `@language`
+///   may not co-occur with an explicit `@type` (per RDF: an annotated
+///   string is either typed or language-tagged, never both).
+/// - `{"@list": ...}`, `{"@set": ...}`, `{"@reverse": ...}`,
+///   `{"@variable": ...}`, `{"@vocab": ...}` → deferred-shape rejection.
+///
+/// Wrapper rejection is performed up front via
+/// [`reject_deferred_object_wrappers`]; do not rely on this function
+/// alone for that check when constructing an `Iri` branch outside the
+/// classifier.
+pub(crate) fn classify_reified_object(map: &Map<String, Value>) -> Result<ReifiedObjectShape> {
+    reject_deferred_object_wrappers(map)?;
+
+    // Reject "@language without @value" — a meaningless value-object
+    // shape that would otherwise leak through to the Ref branch and
+    // leave the @language key on the base object after annotation
+    // stripping. Routing through here also keeps callers from having
+    // to repeat this guard.
+    if map.contains_key("@language") && !map.contains_key("@value") {
+        return Err(TransactError::Parse(
+            "@language requires a sibling @value on annotated objects".to_string(),
+        ));
+    }
+
+    if let Some(value_node) = map.get("@value") {
+        let ty = map.get("@type").and_then(|t| t.as_str());
+        if ty == Some("@id") {
+            let Some(iri) = value_node.as_str() else {
+                return Err(TransactError::Parse(
+                    "@value with @type=@id must be a string IRI".to_string(),
+                ));
+            };
+            if map.contains_key("@language") {
+                return Err(TransactError::Parse(
+                    "@language is invalid alongside @type=@id".to_string(),
+                ));
+            }
+            // Whitelist: the identifier-typed value-object form may
+            // carry only @value and @type. Stray keys (e.g. predicate
+            // properties left over from a malformed payload) indicate
+            // a deferred/ambiguous shape and are rejected here.
+            for k in map.keys() {
+                if k != "@value" && k != "@type" {
+                    return Err(TransactError::UnsupportedFeature(format!(
+                        "unexpected key '{k}' alongside @type=@id; \
+                         only @value and @type are supported on identifier-typed value objects"
+                    )));
+                }
+            }
+            return Ok(ReifiedObjectShape::Iri(iri.to_string()));
+        }
+        if ty == Some("@vocab") {
+            return Err(TransactError::UnsupportedFeature(
+                "@type=@vocab on annotated objects is deferred (v1); \
+                 use @id or expand to the resolved IRI"
+                    .to_string(),
+            ));
+        }
+
+        // Literal branch. Whitelist keys.
+        for k in map.keys() {
+            if k != "@value" && k != "@type" && k != "@language" {
+                return Err(TransactError::UnsupportedFeature(format!(
+                    "unexpected key '{k}' on annotated literal value object; \
+                     only @value, @type, and @language are supported"
+                )));
+            }
+        }
+        let datatype = ty.map(String::from);
+        let language = match map.get("@language") {
+            None => None,
+            Some(Value::String(s)) => Some(s.clone()),
+            Some(other) => {
+                return Err(TransactError::Parse(format!(
+                    "@language must be a string, got {other}"
+                )));
+            }
+        };
+
+        // Per RDF / JSON-LD: an annotated literal carries either an
+        // explicit datatype OR a language tag, never both. (A language-
+        // tagged string's datatype is implicitly `rdf:langString`, but
+        // it is never written alongside `@language` in JSON-LD.)
+        if datatype.is_some() && language.is_some() {
+            return Err(TransactError::Parse(
+                "@language and @type cannot co-occur on a literal value object; \
+                 use @language for language-tagged strings or @type for typed literals"
+                    .to_string(),
+            ));
+        }
+
+        // Language tags only apply to strings — emitting f:reifiesLang
+        // for a non-string base flake would produce a bundle that
+        // decodes to a different EdgeKey than the base flake's
+        // EdgeKey::from_flake (which derives lang from FlakeMeta.lang,
+        // populated only on string-shaped flakes).
+        if language.is_some() && !value_node.is_string() {
+            return Err(TransactError::Parse(format!(
+                "@language requires @value to be a string, got {value_node}"
+            )));
+        }
+
+        // Build a canonical value-object containing only whitelisted keys
+        // (rather than cloning the input map). Insertion order keeps the
+        // emitted JSON deterministic for snapshot-style tests.
+        let mut canon = Map::new();
+        canon.insert("@value".to_string(), value_node.clone());
+        if let Some(t) = &datatype {
+            canon.insert("@type".to_string(), json!(t));
+        }
+        if let Some(l) = &language {
+            canon.insert("@language".to_string(), json!(l));
+        }
+        return Ok(ReifiedObjectShape::Literal {
+            value: Value::Object(canon),
+            language,
+        });
+    }
+
+    if let Some(Value::String(id)) = map.get("@id") {
+        return Ok(ReifiedObjectShape::Iri(id.clone()));
+    }
+
+    Err(TransactError::Parse(
+        "annotated object must carry @id or @value".to_string(),
+    ))
+}
+
+/// Build the JSON payload for `f:reifiesObject` plus the optional
+/// `f:reifiesLang` companion. Mirrors [`EdgeKey::to_reifies_facts`]
+/// so writers and the binary decoder agree on bundle shape.
+///
+/// Returns `(object_payload, lang)`:
+/// - `Iri` → `({"@id": "..."}, None)`
+/// - `Literal { language: Some(l), ... }` → `(value_object, Some(l))`
+/// - `Literal { language: None, ... }` → `(value_object, None)`
+pub(crate) fn emit_reifies_object_payload(shape: &ReifiedObjectShape) -> (Value, Option<String>) {
+    match shape {
+        ReifiedObjectShape::Iri(id) => (json!({ "@id": id }), None),
+        ReifiedObjectShape::Literal {
+            value, language, ..
+        } => (value.clone(), language.clone()),
+    }
 }
 
 /// Mutable counter used to mint unique blank-node IDs for anonymous
@@ -457,6 +731,29 @@ fn walk_delete_for_annotations(
             Ok(())
         }
         Value::Object(map) => {
+            // Merge any per-node `@context` into the parent context.
+            // Symmetric with the insert walker — without this, a
+            // node-local term coercion would apply at expansion time
+            // but be invisible to
+            // `reject_context_coercion_on_annotated_literal`, masking
+            // an EdgeKey mismatch.
+            let local_merged: Option<ParsedContext> =
+                if let Some(local_ctx) = map.get("@context") {
+                    Some(
+                        fluree_graph_json_ld::parse_context_with_base(ctx, local_ctx).map_err(
+                            |e| {
+                                TransactError::Parse(format!(
+                                    "failed to parse nested @context during delete-clause \
+                                     annotation lowering: {e}"
+                                ))
+                            },
+                        )?,
+                    )
+                } else {
+                    None
+                };
+            let effective_ctx: &ParsedContext = local_merged.as_ref().unwrap_or(ctx);
+
             // Capture the parent's @id for `f:reifiesSubject`. Honor
             // context-aliased `@id` keys (e.g. `id: ...` when context
             // says `"id": "@id"`).
@@ -464,7 +761,7 @@ fn walk_delete_for_annotations(
                 .get("@id")
                 .and_then(Value::as_str)
                 .or_else(|| {
-                    let alias = ctx.id_key.as_str();
+                    let alias = effective_ctx.id_key.as_str();
                     if alias != "@id" {
                         map.get(alias).and_then(Value::as_str)
                     } else {
@@ -491,7 +788,7 @@ fn walk_delete_for_annotations(
             // avoid borrowing twice.
             let predicate_keys: Vec<String> = map
                 .keys()
-                .filter(|k| !k.starts_with('@') && *k != ctx.id_key.as_str())
+                .filter(|k| !k.starts_with('@') && *k != effective_ctx.id_key.as_str())
                 .cloned()
                 .collect();
 
@@ -502,7 +799,7 @@ fn walk_delete_for_annotations(
                     parent_id.as_deref(),
                     &key,
                     value,
-                    ctx,
+                    effective_ctx,
                     effective_graph,
                     out_templates,
                     out_where,
@@ -525,7 +822,7 @@ fn walk_delete_for_annotations(
                 if let Some(v) = map.get_mut(&key) {
                     walk_delete_for_annotations(
                         v,
-                        ctx,
+                        effective_ctx,
                         effective_graph,
                         out_templates,
                         out_where,
@@ -600,20 +897,14 @@ fn lift_annotations_under_predicate(
                         .to_string(),
                 )
             })?;
-            let object_id = map
-                .get("@id")
-                .and_then(Value::as_str)
-                .map(String::from)
-                .ok_or_else(|| {
-                    TransactError::Parse(
-                        "delete-clause @annotation requires the parent object node to carry \
-                         an explicit @id (the object of the reified edge)"
-                            .to_string(),
-                    )
-                })?;
+
             // Per-object `@graph` selector on the *base edge object*
             // overrides the inherited graph. Mirrors the
             // assertion-side walker's per-node graph extraction.
+            // Captured BEFORE shape classification so a Ref object's
+            // graph selector is preserved (literal value-objects
+            // never carry `@graph` — the classifier whitelist
+            // rejects it as a stray key).
             let object_graph: Option<String> = match map.get("@graph") {
                 Some(Value::String(s)) => Some(s.clone()),
                 Some(Value::Object(g)) => g.get("@id").and_then(Value::as_str).map(String::from),
@@ -626,10 +917,54 @@ fn lift_annotations_under_predicate(
                 return Ok(());
             };
 
+            // Wrapper rejection runs in both branches.
+            reject_deferred_object_wrappers(map)?;
+
+            // Classify the post-strip base-edge object. The value-
+            // object form drives a literal-shaped `f:reifiesObject`
+            // payload (plus `f:reifiesLang` when language-tagged); the
+            // node-map form resolves the @id (with context aliasing)
+            // and produces a Ref shape. Strip the per-node @graph
+            // selector before classifying so it doesn't trip the
+            // identifier-typed value-object stray-key check (it lives
+            // on the parent node, not on a value-object).
+            map.remove("@graph");
+            let object_shape = if map.contains_key("@value") || map.contains_key("@language") {
+                // Mirror the insert-path guard: annotated literals
+                // must NOT rely on @context coercion, since the
+                // synthesized f:reifies* bundle would otherwise decode
+                // to an EdgeKey that doesn't match the original
+                // assertion's. A by-id delete that doesn't match
+                // becomes a silent no-op.
+                reject_context_coercion_on_annotated_literal(map, predicate, ctx)?;
+                classify_reified_object(map)?
+            } else {
+                let id_alias = ctx.id_key.as_str();
+                let object_id = map
+                    .get("@id")
+                    .and_then(Value::as_str)
+                    .or_else(|| {
+                        if id_alias != "@id" {
+                            map.get(id_alias).and_then(Value::as_str)
+                        } else {
+                            None
+                        }
+                    })
+                    .map(String::from)
+                    .ok_or_else(|| {
+                        TransactError::Parse(
+                            "delete-clause @annotation requires the parent object node to carry \
+                             an explicit @id (the object of the reified edge)"
+                                .to_string(),
+                        )
+                    })?;
+                ReifiedObjectShape::Iri(object_id)
+            };
+
             build_annotation_delete(
                 parent_subject,
                 predicate,
-                &object_id,
+                &object_shape,
                 ann_block,
                 ctx,
                 effective_graph,
@@ -669,7 +1004,7 @@ fn lift_annotations_under_predicate(
 fn build_annotation_delete(
     parent_subject: &str,
     predicate: &str,
-    object_id: &str,
+    object: &ReifiedObjectShape,
     ann_block: Value,
     ctx: &ParsedContext,
     graph_iri: Option<&str>,
@@ -682,6 +1017,14 @@ fn build_annotation_delete(
             "@annotation value must be a JSON object".to_string(),
         ));
     };
+
+    // Compute the `f:reifiesObject` JSON payload plus optional
+    // `f:reifiesLang` companion once. Both the selector WHERE pattern
+    // and the delete template emit identical shape so the synthesized
+    // retract bundle decodes to the same EdgeKey as the original
+    // assertion (the contract the gate tests pin in
+    // `it_edge_annotations.rs`).
+    let (object_payload, lang_payload) = emit_reifies_object_payload(object);
     let id_alias = ctx.id_key.as_str();
     let explicit_id: Option<String> = ann_map
         .get("@id")
@@ -753,7 +1096,14 @@ fn build_annotation_delete(
             reifies_iris::PREDICATE.to_string(),
             json!({"@id": predicate}),
         );
-        where_node.insert(reifies_iris::OBJECT.to_string(), json!({"@id": object_id}));
+        where_node.insert(reifies_iris::OBJECT.to_string(), object_payload.clone());
+        if let Some(lang) = &lang_payload {
+            // Emit `f:reifiesLang` as an additional WHERE constraint
+            // so the selector form binds only annotations whose
+            // language tag matches — same lexical string across
+            // different languages must not collide.
+            where_node.insert(reifies_iris::LANG.to_string(), json!(lang));
+        }
         if let Some(graph) = graph_iri {
             where_node.insert(reifies_iris::GRAPH.to_string(), json!({"@id": graph}));
             // Named-graph case: wrap the node in the JLDQ s-expression
@@ -787,7 +1137,10 @@ fn build_annotation_delete(
         reifies_iris::PREDICATE.to_string(),
         json!({"@id": predicate}),
     );
-    template.insert(reifies_iris::OBJECT.to_string(), json!({"@id": object_id}));
+    template.insert(reifies_iris::OBJECT.to_string(), object_payload);
+    if let Some(lang) = lang_payload {
+        template.insert(reifies_iris::LANG.to_string(), json!(lang));
+    }
     // For named-graph annotations, both the f:reifies* flakes and
     // the synthetic annotation node live in the reified edge's
     // graph. Without this, the parser would emit default-graph
@@ -899,7 +1252,7 @@ fn ensure_subject_id(
 fn build_annotation_sibling(
     base_subject_id: Option<&str>,
     predicate: &str,
-    object_id: &str,
+    object: &ReifiedObjectShape,
     ann_block: Value,
     base_graph: Option<&str>,
     ctx: &mut LowerCtx,
@@ -939,7 +1292,18 @@ fn build_annotation_sibling(
         reifies_iris::PREDICATE.to_string(),
         json!({"@id": predicate}),
     );
-    ann_map.insert(reifies_iris::OBJECT.to_string(), json!({"@id": object_id}));
+
+    // f:reifiesObject and (optional) f:reifiesLang. For a literal
+    // object, the value payload is the canonical value-object built by
+    // the classifier; `EdgeKey::from_reifies_facts` derives `lang` from
+    // a separate `f:reifiesLang` flake, so language-tagged literals
+    // MUST emit it explicitly — otherwise the decoded EdgeKey would
+    // not match the writer's base-edge EdgeKey.
+    let (object_payload, lang_payload) = emit_reifies_object_payload(object);
+    ann_map.insert(reifies_iris::OBJECT.to_string(), object_payload);
+    if let Some(lang) = lang_payload {
+        ann_map.insert(reifies_iris::LANG.to_string(), json!(lang));
+    }
 
     // f:reifiesGraph — emitted iff the reified edge lives in a named
     // graph. Default-graph edges omit it (absence = default), which
@@ -1260,8 +1624,32 @@ fn lower_object_with_subject(
     let node_graph = extract_node_graph_selector(map);
     let node_graph_ref = node_graph.as_deref();
     let effective_graph = node_graph_ref.or(walk.graph);
+
+    // Merge any per-node `@context` into the walker's parent context.
+    // Without this, a node-local term definition (e.g. `"joinedAt":
+    // { "@id": "...", "@type": "xsd:date" }`) would apply at JSON-LD
+    // expansion time but be invisible to
+    // `reject_context_coercion_on_annotated_literal`, allowing the
+    // base flake's `EdgeKey` to diverge from the synthesized
+    // `f:reifies*` bundle. Mirrors the firewall scanner's context
+    // merge logic.
+    let local_merged: Option<ParsedContext> = if let Some(local_ctx) = map.get("@context") {
+        Some(
+            fluree_graph_json_ld::parse_context_with_base(walk.json_ld, local_ctx).map_err(
+                |e| {
+                    TransactError::Parse(format!(
+                        "failed to parse nested @context during edge-annotation lowering: {e}"
+                    ))
+                },
+            )?,
+        )
+    } else {
+        None
+    };
+    let effective_json_ld: &ParsedContext = local_merged.as_ref().unwrap_or(walk.json_ld);
+
     let child_walk = WalkCtx {
-        json_ld: walk.json_ld,
+        json_ld: effective_json_ld,
         graph: effective_graph,
     };
 
@@ -1413,16 +1801,6 @@ fn intercept_annotations_for_predicate(
             Ok(())
         }
         Value::Object(map) => {
-            // Detect literal-value-with-annotation deferred shape.
-            let has_value = map.contains_key("@value") || map.contains_key("@language");
-            let has_ann = map.contains_key(ANNOTATION_KEY) || map.contains_key(EDGE_KEY);
-            if has_value && has_ann {
-                return Err(TransactError::UnsupportedFeature(
-                    "literal-valued edge annotations are deferred to v2; \
-                     attach annotations only to object IRIs (with @id), not to typed literals"
-                        .to_string(),
-                ));
-            }
             if map.contains_key(ANNOTATION_KEY) && map.contains_key(EDGE_KEY) {
                 return Err(TransactError::Parse(
                     "edge annotation: cannot specify both @annotation and @edge on the same object"
@@ -1434,18 +1812,34 @@ fn intercept_annotations_for_predicate(
                 return Ok(());
             };
 
-            // Skip lowering for value/list/variable objects. (The
-            // literal-value rejection above already caught the
-            // `@annotation` + `@value` combination; this is a
-            // belt-and-braces guard.)
-            if is_jsonld_value_object(map) {
-                return Err(TransactError::UnsupportedFeature(
-                    "edge annotations are not supported on @list / @variable wrappers in v1"
-                        .to_string(),
-                ));
-            }
+            // Wrapper rejection runs in both branches.
+            reject_deferred_object_wrappers(map)?;
 
-            let object_id = ensure_subject_id(map, walk, ctx);
+            // Route maps carrying either `@value` or `@language`
+            // through the classifier — both are JSON-LD value-object
+            // signals. The classifier rejects `@language` without a
+            // sibling `@value`, so the Ref branch only receives
+            // object-position node-maps that are unambiguously
+            // identifier references.
+            //
+            // For the Ref branch, we route through `ensure_subject_id`
+            // so context-aliased `@id` keys (e.g. `"id"` under a
+            // custom JSON-LD context) and blank-node minting both
+            // work — building `ReifiedObjectShape::Iri` directly from
+            // the returned id.
+            let is_value_object_shape =
+                map.contains_key("@value") || map.contains_key("@language");
+            let shape = if is_value_object_shape {
+                // Reject @context-coerced literals before classifying
+                // so the synthesized f:reifies* bundle's EdgeKey
+                // cannot silently diverge from the base flake's.
+                reject_context_coercion_on_annotated_literal(map, predicate, walk.json_ld)?;
+                classify_reified_object(map)?
+            } else {
+                let object_id = ensure_subject_id(map, walk, ctx);
+                ReifiedObjectShape::Iri(object_id)
+            };
+
             if reifies_iris::ALL.contains(&predicate) {
                 return Err(TransactError::UnsupportedFeature(format!(
                     "'{predicate}' is a system-controlled predicate; use @annotation instead"
@@ -1454,7 +1848,7 @@ fn intercept_annotations_for_predicate(
             let synth = build_annotation_sibling(
                 Some(parent_subject),
                 predicate,
-                &object_id,
+                &shape,
                 ann_block,
                 walk.graph,
                 ctx,
@@ -1477,6 +1871,519 @@ mod tests {
         lower_edge_annotations(&mut doc)?;
         Ok(doc)
     }
+
+    // ---- ReifiedObjectShape classifier ----------------------------------
+
+    fn obj_map(v: Value) -> Map<String, Value> {
+        match v {
+            Value::Object(m) => m,
+            _ => panic!("expected JSON object"),
+        }
+    }
+
+    #[test]
+    fn classify_iri_via_at_id() {
+        let m = obj_map(json!({"@id": "ex:acme"}));
+        let shape = classify_reified_object(&m).unwrap();
+        assert!(matches!(shape, ReifiedObjectShape::Iri(ref s) if s == "ex:acme"));
+    }
+
+    #[test]
+    fn classify_iri_via_value_typed_id() {
+        let m = obj_map(json!({"@value": "ex:acme", "@type": "@id"}));
+        let shape = classify_reified_object(&m).unwrap();
+        assert!(matches!(shape, ReifiedObjectShape::Iri(ref s) if s == "ex:acme"));
+    }
+
+    #[test]
+    fn classify_iri_typed_id_rejects_non_string_value() {
+        let m = obj_map(json!({"@value": 42, "@type": "@id"}));
+        let err = classify_reified_object(&m).unwrap_err();
+        assert!(err.to_string().contains("@value with @type=@id"));
+    }
+
+    #[test]
+    fn classify_iri_typed_id_rejects_with_language() {
+        let m = obj_map(json!({"@value": "ex:acme", "@type": "@id", "@language": "en"}));
+        let err = classify_reified_object(&m).unwrap_err();
+        assert!(err.to_string().contains("@language is invalid alongside @type=@id"));
+    }
+
+    #[test]
+    fn classify_plain_string_literal() {
+        let m = obj_map(json!({"@value": "Alice"}));
+        let shape = classify_reified_object(&m).unwrap();
+        match shape {
+            ReifiedObjectShape::Literal { value, language } => {
+                assert_eq!(value, json!({"@value": "Alice"}));
+                assert!(language.is_none());
+            }
+            _ => panic!("expected Literal"),
+        }
+    }
+
+    #[test]
+    fn classify_typed_literal() {
+        let m = obj_map(json!({"@value": "2024-01-01", "@type": "xsd:date"}));
+        let shape = classify_reified_object(&m).unwrap();
+        match shape {
+            ReifiedObjectShape::Literal { value, language } => {
+                assert_eq!(value, json!({"@value": "2024-01-01", "@type": "xsd:date"}));
+                assert!(language.is_none());
+                // Datatype is derivable from value when needed:
+                assert_eq!(
+                    value.get("@type").and_then(|v| v.as_str()),
+                    Some("xsd:date")
+                );
+            }
+            _ => panic!("expected Literal"),
+        }
+    }
+
+    #[test]
+    fn classify_language_tagged_literal() {
+        let m = obj_map(json!({"@value": "chat", "@language": "fr"}));
+        let shape = classify_reified_object(&m).unwrap();
+        match shape {
+            ReifiedObjectShape::Literal { value, language } => {
+                assert_eq!(value, json!({"@value": "chat", "@language": "fr"}));
+                assert_eq!(language.as_deref(), Some("fr"));
+            }
+            _ => panic!("expected Literal"),
+        }
+    }
+
+    #[test]
+    fn classify_rejects_language_with_non_string_value() {
+        // RDF: language tags only apply to strings. Emitting f:reifiesLang
+        // for a numeric base flake would break the EdgeKey round-trip.
+        let m = obj_map(json!({"@value": 42, "@language": "en"}));
+        let err = classify_reified_object(&m).unwrap_err();
+        assert!(
+            err.to_string().contains("@language requires @value to be a string"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn classify_rejects_language_plus_type_combo() {
+        // JSON-LD: @language and @type cannot co-occur — a literal is
+        // either typed or language-tagged.
+        let m = obj_map(json!({
+            "@value": "Alice",
+            "@type": "xsd:string",
+            "@language": "en"
+        }));
+        let err = classify_reified_object(&m).unwrap_err();
+        assert!(
+            err.to_string().contains("@language and @type cannot co-occur"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn classify_rejects_non_string_language_tag() {
+        let m = obj_map(json!({"@value": "x", "@language": 7}));
+        let err = classify_reified_object(&m).unwrap_err();
+        assert!(err.to_string().contains("@language must be a string"));
+    }
+
+    #[test]
+    fn classify_rejects_language_without_value() {
+        // A meaningless value-object shape: `@language` requires a
+        // sibling `@value`. Without this guard, the caller's Ref
+        // dispatch would accept the map and silently drop @language.
+        let m = obj_map(json!({"@id": "ex:acme", "@language": "en"}));
+        let err = classify_reified_object(&m).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("@language requires a sibling @value"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn classify_typed_id_rejects_stray_key() {
+        // Identifier-typed value-object form may only carry @value and
+        // @type. Extra predicate-shaped keys indicate an ambiguous /
+        // deferred shape.
+        let m = obj_map(json!({
+            "@value": "ex:acme",
+            "@type": "@id",
+            "ex:bogus": "x"
+        }));
+        let err = classify_reified_object(&m).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("unexpected key 'ex:bogus' alongside @type=@id"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn rejects_term_coerced_datatype_on_annotated_literal() {
+        // `joinedAt` term coerces `@type` to xsd:date via @context.
+        // Without the rejection, the synthesized f:reifiesObject would
+        // be `{"@value": "2024-01-01"}` (xsd:string) while the base
+        // flake would be xsd:date — EdgeKey mismatch.
+        let doc = json!({
+            "@context": {
+                "ex": "http://example.org/",
+                "xsd": "http://www.w3.org/2001/XMLSchema#",
+                "joinedAt": { "@id": "ex:joinedAt", "@type": "xsd:date" }
+            },
+            "@id": "ex:alice",
+            "joinedAt": {
+                "@value": "2024-01-01",
+                "@annotation": { "ex:source": "hr" }
+            }
+        });
+        let err = lower(doc).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("@context term coercion")
+                && msg.contains("XMLSchema#date"),
+            "got: {msg}"
+        );
+        assert!(msg.contains("Add @type"));
+    }
+
+    #[test]
+    fn accepts_term_coerced_datatype_when_value_object_is_explicit() {
+        // Same shape as above but with explicit @type on the value
+        // object → no mismatch, no rejection.
+        let doc = json!({
+            "@context": {
+                "ex": "http://example.org/",
+                "xsd": "http://www.w3.org/2001/XMLSchema#",
+                "joinedAt": { "@id": "ex:joinedAt", "@type": "xsd:date" }
+            },
+            "@id": "ex:alice",
+            "joinedAt": {
+                "@value": "2024-01-01",
+                "@type": "xsd:date",
+                "@annotation": { "ex:source": "hr" }
+            }
+        });
+        let result = lower(doc).expect("explicit @type must lower cleanly");
+        let graph = result.get("@graph").and_then(|g| g.as_array()).unwrap();
+        let sibling = &graph[1];
+        assert_eq!(
+            sibling.get(reifies_iris::OBJECT).unwrap(),
+            &json!({"@value": "2024-01-01", "@type": "xsd:date"})
+        );
+    }
+
+    #[test]
+    fn rejects_default_language_on_annotated_string() {
+        let doc = json!({
+            "@context": { "@language": "fr", "ex": "http://example.org/" },
+            "@id": "ex:alice",
+            "ex:label": {
+                "@value": "chat",
+                "@annotation": { "ex:source": "lexicon" }
+            }
+        });
+        let err = lower(doc).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("@context language coercion (@language='fr')"),
+            "got: {err}"
+        );
+        assert!(err.to_string().contains("Add @language"));
+    }
+
+    #[test]
+    fn rejects_term_level_language_on_annotated_string() {
+        // Per-term @language overrides context default.
+        let doc = json!({
+            "@context": {
+                "ex": "http://example.org/",
+                "label": { "@id": "ex:label", "@language": "de" }
+            },
+            "@id": "ex:alice",
+            "label": {
+                "@value": "Buch",
+                "@annotation": { "ex:source": "lex" }
+            }
+        });
+        let err = lower(doc).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("@context language coercion (@language='de')"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn term_cleared_language_overrides_default_no_rejection() {
+        // Per-term `@language: null` clears the default. A bare
+        // `@value` under that term is NOT language-coerced, so the
+        // annotation is accepted without an explicit @language.
+        let doc = json!({
+            "@context": {
+                "@language": "fr",
+                "ex": "http://example.org/",
+                "code": { "@id": "ex:code", "@language": null }
+            },
+            "@id": "ex:alice",
+            "code": {
+                "@value": "ALPHA",
+                "@annotation": { "ex:source": "internal" }
+            }
+        });
+        lower(doc).expect("cleared per-term language must allow bare @value annotation");
+    }
+
+    #[test]
+    fn rejects_node_local_context_term_coercion_on_annotated_literal() {
+        // Per-node `@context` defines `joinedAt` with `@type: xsd:date`.
+        // The lowering walker must merge the local context into the
+        // parent's so the coercion guard fires.
+        let doc = json!({
+            "@context": {
+                "ex": "http://example.org/",
+                "xsd": "http://www.w3.org/2001/XMLSchema#"
+            },
+            "@id": "ex:alice",
+            "@context": {
+                "joinedAt": { "@id": "ex:joinedAt", "@type": "xsd:date" }
+            },
+            "joinedAt": {
+                "@value": "2024-01-01",
+                "@annotation": { "ex:source": "hr" }
+            }
+        });
+        let err = lower(doc).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("@context term coercion")
+                && (msg.contains("XMLSchema#date") || msg.contains("xsd:date")),
+            "got: {msg}"
+        );
+    }
+
+    #[test]
+    fn rejects_node_local_default_language_on_annotated_string() {
+        // Per-node `@context` introduces a default `@language`. The
+        // base flake would be language-tagged, but the synthesized
+        // bundle would not carry `f:reifiesLang` → EdgeKey mismatch.
+        let doc = json!({
+            "@context": { "ex": "http://example.org/" },
+            "@id": "ex:alice",
+            "@context": { "@language": "de" },
+            "ex:label": {
+                "@value": "Buch",
+                "@annotation": { "ex:source": "lex" }
+            }
+        });
+        let err = lower(doc).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("@context language coercion") && msg.contains("'de'"),
+            "got: {msg}"
+        );
+    }
+
+    #[test]
+    fn rejects_node_local_context_term_coercion_on_delete_clause() {
+        // Symmetric coverage on the delete pre-pass: a per-node
+        // `@context` inside the delete clause must merge into the
+        // effective context before the coercion guard runs.
+        let mut doc = json!({
+            "@context": {
+                "ex": "http://example.org/",
+                "xsd": "http://www.w3.org/2001/XMLSchema#"
+            },
+            "delete": {
+                "@context": {
+                    "joinedAt": { "@id": "ex:joinedAt", "@type": "xsd:date" }
+                },
+                "@id": "ex:alice",
+                "joinedAt": {
+                    "@value": "2024-01-01",
+                    "@annotation": { "@id": "ex:ann-stale" }
+                }
+            }
+        });
+        let err = lower_delete_annotation_blocks(&mut doc).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("@context term coercion")
+                && (msg.contains("XMLSchema#date") || msg.contains("xsd:date")),
+            "got: {msg}"
+        );
+    }
+
+    #[test]
+    fn rejects_term_coerced_id_typing_on_value_form_annotation() {
+        // `@type: "@id"` term coercion would make the base edge a Ref,
+        // not a literal. Annotated value-object form without explicit
+        // @type=@id would generate a literal f:reifiesObject while the
+        // base flake is a Ref. Reject.
+        let doc = json!({
+            "@context": {
+                "ex": "http://example.org/",
+                "ref": { "@id": "ex:ref", "@type": "@id" }
+            },
+            "@id": "ex:alice",
+            "ref": {
+                "@value": "ex:bob",
+                "@annotation": { "ex:source": "x" }
+            }
+        });
+        let err = lower(doc).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("@context term coercion (@type='@id')"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn intercept_rejects_language_without_value_on_object() {
+        // End-to-end regression for the routing fix: an object
+        // carrying `@language` without `@value` must NOT slip into the
+        // Ref branch via `ensure_subject_id` minting a blank.
+        let doc = json!({
+            "@id": "ex:alice",
+            "ex:label": {
+                "@id": "ex:acme",
+                "@language": "en",
+                "@annotation": { "ex:source": "hr" }
+            }
+        });
+        let err = lower(doc).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("@language requires a sibling @value"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn classify_rejects_list_wrapper() {
+        let m = obj_map(json!({"@list": [1, 2, 3], "@annotation": {"ex:k": "v"}}));
+        let err = classify_reified_object(&m).unwrap_err();
+        assert!(err.to_string().contains("'@list'"));
+    }
+
+    #[test]
+    fn classify_rejects_set_wrapper() {
+        let m = obj_map(json!({"@set": [1, 2]}));
+        let err = classify_reified_object(&m).unwrap_err();
+        assert!(err.to_string().contains("'@set'"));
+    }
+
+    #[test]
+    fn classify_rejects_reverse_wrapper() {
+        let m = obj_map(json!({"@reverse": {"ex:p": "x"}}));
+        let err = classify_reified_object(&m).unwrap_err();
+        assert!(err.to_string().contains("'@reverse'"));
+    }
+
+    #[test]
+    fn classify_rejects_variable_wrapper() {
+        let m = obj_map(json!({"@variable": "v"}));
+        let err = classify_reified_object(&m).unwrap_err();
+        assert!(err.to_string().contains("'@variable'"));
+    }
+
+    #[test]
+    fn classify_rejects_vocab_typed_value() {
+        let m = obj_map(json!({"@value": "term", "@type": "@vocab"}));
+        let err = classify_reified_object(&m).unwrap_err();
+        assert!(err.to_string().contains("@type=@vocab"));
+    }
+
+    #[test]
+    fn classify_rejects_stray_key_on_literal() {
+        let m = obj_map(json!({"@value": "Alice", "ex:bogus": "x"}));
+        let err = classify_reified_object(&m).unwrap_err();
+        assert!(err.to_string().contains("unexpected key 'ex:bogus'"));
+    }
+
+    #[test]
+    fn classify_rejects_empty_object() {
+        let m = obj_map(json!({}));
+        let err = classify_reified_object(&m).unwrap_err();
+        assert!(err.to_string().contains("@id or @value"));
+    }
+
+    #[test]
+    fn emit_payload_iri() {
+        let (payload, lang) =
+            emit_reifies_object_payload(&ReifiedObjectShape::Iri("ex:acme".to_string()));
+        assert_eq!(payload, json!({"@id": "ex:acme"}));
+        assert!(lang.is_none());
+    }
+
+    #[test]
+    fn emit_payload_plain_literal() {
+        let shape = classify_reified_object(&obj_map(json!({"@value": "Alice"}))).unwrap();
+        let (payload, lang) = emit_reifies_object_payload(&shape);
+        assert_eq!(payload, json!({"@value": "Alice"}));
+        assert!(lang.is_none());
+    }
+
+    #[test]
+    fn emit_payload_typed_literal() {
+        let shape = classify_reified_object(&obj_map(
+            json!({"@value": "2024-01-01", "@type": "xsd:date"}),
+        ))
+        .unwrap();
+        let (payload, lang) = emit_reifies_object_payload(&shape);
+        assert_eq!(payload, json!({"@value": "2024-01-01", "@type": "xsd:date"}));
+        assert!(lang.is_none());
+    }
+
+    #[test]
+    fn emit_payload_lang_tagged_literal() {
+        let shape =
+            classify_reified_object(&obj_map(json!({"@value": "chat", "@language": "fr"}))).unwrap();
+        let (payload, lang) = emit_reifies_object_payload(&shape);
+        assert_eq!(payload, json!({"@value": "chat", "@language": "fr"}));
+        assert_eq!(lang.as_deref(), Some("fr"));
+    }
+
+    #[test]
+    fn classify_canonicalizes_value_object_key_order_typed() {
+        // Canonical form preserves insertion order @value → @type
+        // regardless of input order. (The lang variant gets its own
+        // assertion below; the two forms can't co-occur.)
+        let shape = classify_reified_object(&obj_map(json!({
+            "@type": "xsd:date",
+            "@value": "2024-01-01",
+        })))
+        .unwrap();
+        match shape {
+            ReifiedObjectShape::Literal { value, .. } => {
+                let m = value.as_object().unwrap();
+                let keys: Vec<&str> = m.keys().map(|s| s.as_str()).collect();
+                assert_eq!(keys, vec!["@value", "@type"]);
+            }
+            _ => panic!("expected Literal"),
+        }
+    }
+
+    #[test]
+    fn classify_canonicalizes_value_object_key_order_lang() {
+        let shape = classify_reified_object(&obj_map(json!({
+            "@language": "fr",
+            "@value": "chat",
+        })))
+        .unwrap();
+        match shape {
+            ReifiedObjectShape::Literal { value, .. } => {
+                let m = value.as_object().unwrap();
+                let keys: Vec<&str> = m.keys().map(|s| s.as_str()).collect();
+                assert_eq!(keys, vec!["@value", "@language"]);
+            }
+            _ => panic!("expected Literal"),
+        }
+    }
+
+    // ---- Existing lowering tests ----------------------------------------
 
     #[test]
     fn lowers_inline_annotation_to_sibling_with_reifies_predicates() {
@@ -1562,6 +2469,32 @@ mod tests {
     }
 
     #[test]
+    fn annotation_resolves_context_aliased_id_on_ref_object() {
+        // Regression: prior to using ensure_subject_id's return value
+        // directly in the Ref branch, an object whose @id was aliased
+        // under a JSON-LD context (e.g. "id" instead of "@id") errored
+        // with "must carry @id or @value" because the classifier only
+        // checked literal "@id".
+        let doc = json!({
+            "@context": { "id": "@id", "ex": "http://example.org/" },
+            "id": "ex:alice",
+            "ex:worksFor": {
+                "id": "ex:acme",
+                "@annotation": { "ex:role": "Engineer" }
+            }
+        });
+        let result = lower(doc).expect("aliased @id on annotated ref must lower cleanly");
+        let graph = result.get("@graph").and_then(|g| g.as_array()).unwrap();
+        assert_eq!(graph.len(), 2, "original + sibling");
+        let sibling = &graph[1];
+        assert_eq!(
+            sibling.get(reifies_iris::OBJECT).unwrap(),
+            &json!({ "@id": "ex:acme" }),
+            "f:reifiesObject must carry the resolved IRI from the aliased id key"
+        );
+    }
+
+    #[test]
     fn edge_alias_normalizes_to_annotation() {
         let doc = json!({
             "@id": "ex:alice",
@@ -1576,7 +2509,7 @@ mod tests {
     }
 
     #[test]
-    fn rejects_literal_value_with_annotation() {
+    fn lowers_typed_literal_with_annotation_to_value_object_sibling() {
         let doc = json!({
             "@id": "ex:alice",
             "ex:joinedAt": {
@@ -1585,8 +2518,268 @@ mod tests {
                 "@annotation": { "ex:source": "ex:hr-system" }
             }
         });
-        let err = lower(doc).unwrap_err();
-        assert!(err.to_string().contains("literal-valued"));
+        let result = lower(doc).unwrap();
+        let graph = result
+            .get("@graph")
+            .and_then(|g| g.as_array())
+            .expect("envelope @graph form");
+        assert_eq!(graph.len(), 2, "original + 1 annotation sibling");
+
+        // Original payload retains the literal value object minus
+        // @annotation.
+        let original = &graph[0];
+        let nested = original.get("ex:joinedAt").unwrap().as_object().unwrap();
+        assert_eq!(nested.get("@value"), Some(&json!("2024-01-01")));
+        assert_eq!(nested.get("@type"), Some(&json!("xsd:date")));
+        assert!(!nested.contains_key("@annotation"));
+
+        // Sibling carries f:reifiesObject as the canonicalized value-
+        // object — not an @id reference. f:reifiesLang must be absent
+        // (no @language).
+        let sibling = &graph[1];
+        assert_eq!(
+            sibling.get(reifies_iris::OBJECT).unwrap(),
+            &json!({"@value": "2024-01-01", "@type": "xsd:date"})
+        );
+        assert!(
+            sibling.get(reifies_iris::LANG).is_none(),
+            "no @language → no f:reifiesLang"
+        );
+    }
+
+    #[test]
+    fn lowers_lang_tagged_literal_emits_reifies_lang() {
+        let doc = json!({
+            "@id": "ex:alice",
+            "ex:label": {
+                "@value": "chat",
+                "@language": "fr",
+                "@annotation": { "ex:source": "ex:lexicon" }
+            }
+        });
+        let result = lower(doc).unwrap();
+        let graph = result.get("@graph").and_then(|g| g.as_array()).unwrap();
+        let sibling = &graph[1];
+        assert_eq!(
+            sibling.get(reifies_iris::OBJECT).unwrap(),
+            &json!({"@value": "chat", "@language": "fr"})
+        );
+        // f:reifiesLang explicit — required for EdgeKey::from_reifies_facts
+        // to decode the same `lang` the base flake carries via flake.m.lang.
+        assert_eq!(sibling.get(reifies_iris::LANG).unwrap(), &json!("fr"));
+    }
+
+    #[test]
+    fn lowers_plain_string_literal_with_annotation() {
+        let doc = json!({
+            "@id": "ex:alice",
+            "ex:name": {
+                "@value": "Alice",
+                "@annotation": { "ex:source": "hr" }
+            }
+        });
+        let result = lower(doc).unwrap();
+        let graph = result.get("@graph").and_then(|g| g.as_array()).unwrap();
+        let sibling = &graph[1];
+        assert_eq!(
+            sibling.get(reifies_iris::OBJECT).unwrap(),
+            &json!({"@value": "Alice"})
+        );
+        assert!(sibling.get(reifies_iris::LANG).is_none());
+    }
+
+    // ---- Delete-pre-pass: literal-object support ------------------------
+
+    /// Run the delete-clause pre-pass on `doc` (assumes it has a
+    /// `delete` clause) and return the rewritten doc.
+    fn lower_delete(mut doc: Value) -> Result<Value> {
+        lower_delete_annotation_blocks(&mut doc)?;
+        Ok(doc)
+    }
+
+    fn templates(doc: &Value) -> &Vec<Value> {
+        match doc.get("delete").unwrap() {
+            Value::Array(a) => a,
+            _ => panic!("expected delete array"),
+        }
+    }
+
+    fn wheres(doc: &Value) -> &Vec<Value> {
+        match doc.get("where").unwrap() {
+            Value::Array(a) => a,
+            _ => panic!("expected where array"),
+        }
+    }
+
+    #[test]
+    fn delete_by_id_on_plain_string_literal_object_emits_value_object_template() {
+        let doc = json!({
+            "delete": {
+                "@id": "ex:alice",
+                "ex:name": {
+                    "@value": "Alice",
+                    "@annotation": { "@id": "ex:ann-1" }
+                }
+            }
+        });
+        let lowered = lower_delete(doc).unwrap();
+        let templates = templates(&lowered);
+        assert_eq!(templates.len(), 1);
+        let t = &templates[0];
+        assert_eq!(t.get("@id").unwrap(), &json!("ex:ann-1"));
+        assert_eq!(
+            t.get(reifies_iris::SUBJECT).unwrap(),
+            &json!({"@id": "ex:alice"})
+        );
+        assert_eq!(
+            t.get(reifies_iris::PREDICATE).unwrap(),
+            &json!({"@id": "ex:name"})
+        );
+        assert_eq!(
+            t.get(reifies_iris::OBJECT).unwrap(),
+            &json!({"@value": "Alice"})
+        );
+        assert!(t.get(reifies_iris::LANG).is_none());
+        // No WHERE for by-id delete.
+        assert!(lowered.get("where").is_none());
+    }
+
+    #[test]
+    fn delete_by_id_on_typed_literal_object() {
+        let doc = json!({
+            "delete": {
+                "@id": "ex:alice",
+                "ex:joinedAt": {
+                    "@value": "2024-01-01",
+                    "@type": "xsd:date",
+                    "@annotation": { "@id": "ex:ann-2" }
+                }
+            }
+        });
+        let lowered = lower_delete(doc).unwrap();
+        let t = &templates(&lowered)[0];
+        assert_eq!(
+            t.get(reifies_iris::OBJECT).unwrap(),
+            &json!({"@value": "2024-01-01", "@type": "xsd:date"})
+        );
+        assert!(t.get(reifies_iris::LANG).is_none());
+    }
+
+    #[test]
+    fn delete_by_id_on_lang_tagged_literal_object_emits_reifies_lang() {
+        let doc = json!({
+            "delete": {
+                "@id": "ex:alice",
+                "ex:label": {
+                    "@value": "chat",
+                    "@language": "fr",
+                    "@annotation": { "@id": "ex:ann-3" }
+                }
+            }
+        });
+        let lowered = lower_delete(doc).unwrap();
+        let t = &templates(&lowered)[0];
+        assert_eq!(
+            t.get(reifies_iris::OBJECT).unwrap(),
+            &json!({"@value": "chat", "@language": "fr"})
+        );
+        // Explicit f:reifiesLang on the delete template — without it,
+        // the retract's decoded EdgeKey would have lang=None while the
+        // original assertion's EdgeKey has lang=Some("fr"), and the
+        // retract flake would not cancel the assertion.
+        assert_eq!(t.get(reifies_iris::LANG).unwrap(), &json!("fr"));
+    }
+
+    #[test]
+    fn delete_by_selector_on_plain_string_literal_object() {
+        let doc = json!({
+            "delete": {
+                "@id": "ex:alice",
+                "ex:name": {
+                    "@value": "Alice",
+                    "@annotation": { "ex:source": "hr" }
+                }
+            }
+        });
+        let lowered = lower_delete(doc).unwrap();
+        let wn = &wheres(&lowered)[0];
+        assert_eq!(
+            wn.get(reifies_iris::OBJECT).unwrap(),
+            &json!({"@value": "Alice"})
+        );
+        let t = &templates(&lowered)[0];
+        assert_eq!(
+            t.get(reifies_iris::OBJECT).unwrap(),
+            &json!({"@value": "Alice"})
+        );
+        // Selector body property must appear on the WHERE node.
+        assert_eq!(wn.get("ex:source").unwrap(), &json!("hr"));
+    }
+
+    #[test]
+    fn delete_by_selector_on_lang_tagged_literal_emits_lang_in_where_and_template() {
+        let doc = json!({
+            "delete": {
+                "@id": "ex:alice",
+                "ex:label": {
+                    "@value": "chat",
+                    "@language": "fr",
+                    "@annotation": { "ex:source": "lexicon" }
+                }
+            }
+        });
+        let lowered = lower_delete(doc).unwrap();
+        let wn = &wheres(&lowered)[0];
+        assert_eq!(
+            wn.get(reifies_iris::OBJECT).unwrap(),
+            &json!({"@value": "chat", "@language": "fr"})
+        );
+        // f:reifiesLang on the WHERE selector pins the join to the
+        // right language tag — same lexical string in another
+        // language must not bind.
+        assert_eq!(wn.get(reifies_iris::LANG).unwrap(), &json!("fr"));
+        let t = &templates(&lowered)[0];
+        assert_eq!(t.get(reifies_iris::LANG).unwrap(), &json!("fr"));
+    }
+
+    /// Find the appended retract template — the first delete-clause
+    /// item that carries an `f:reifiesSubject` key. Used by tests
+    /// where the original delete node carries a non-`@id` keyword
+    /// (e.g. `@graph`) and therefore survives the stripping pass.
+    fn find_retract_template(doc: &Value) -> &Value {
+        templates(doc)
+            .iter()
+            .find(|v| {
+                v.as_object()
+                    .map(|m| m.contains_key(reifies_iris::SUBJECT))
+                    .unwrap_or(false)
+            })
+            .expect("a retract template must be appended")
+    }
+
+    #[test]
+    fn delete_by_id_on_literal_in_named_graph_keeps_graph_selector() {
+        let doc = json!({
+            "delete": {
+                "@graph": "ex:hr-graph",
+                "@id": "ex:alice",
+                "ex:name": {
+                    "@value": "Alice",
+                    "@annotation": { "@id": "ex:ann-g" }
+                }
+            }
+        });
+        let lowered = lower_delete(doc).unwrap();
+        let t = find_retract_template(&lowered);
+        assert_eq!(
+            t.get(reifies_iris::GRAPH).unwrap(),
+            &json!({"@id": "ex:hr-graph"})
+        );
+        assert_eq!(t.get("@graph").unwrap(), &json!("ex:hr-graph"));
+        assert_eq!(
+            t.get(reifies_iris::OBJECT).unwrap(),
+            &json!({"@value": "Alice"})
+        );
     }
 
     #[test]

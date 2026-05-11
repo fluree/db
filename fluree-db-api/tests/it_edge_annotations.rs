@@ -3026,3 +3026,457 @@ async fn graph_wrapped_query_correctly_pairs_annotations_per_graph() {
         );
     }
 }
+
+// =====================================================================
+// EdgeKey round-trip gate tests — literal-object annotations
+// =====================================================================
+//
+// Contract: every writer of a reifies bundle (insert sibling, in this
+// case) must produce flakes whose decoded `EdgeKey::from_reifies_facts`
+// equals the `EdgeKey::from_flake` of the base edge. If these two
+// disagree, hydration / cascade / by-selector retract all silently fail
+// to find each other.
+//
+// These tests exercise the full JSON-LD expansion → staging → flake
+// pipeline and decode the resulting bundle. They are the load-bearing
+// contract that protects against future drift between writer and
+// decoder.
+
+async fn edgekey_roundtrip_for_literal(
+    predicate_compact: &str,
+    predicate_full: &str,
+    literal_value: JsonValue,
+    test_label: &str,
+) {
+    use fluree_db_core::comparator::IndexType;
+    use fluree_db_core::edge::EdgeKey;
+    use fluree_db_core::range::{range_with_overlay, RangeMatch, RangeOptions, RangeTest};
+    use fluree_db_core::value::FlakeValue;
+    use fluree_vocab::reifies_iris;
+
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger_id = format!("it-edge-annotations-edgekey-roundtrip-{test_label}");
+    let ledger0 = genesis_ledger(&fluree, &ledger_id);
+
+    let mut literal_with_ann = literal_value
+        .as_object()
+        .expect("literal value must be an object")
+        .clone();
+    literal_with_ann.insert(
+        "@annotation".to_string(),
+        json!({ "ex:source": "hr-system" }),
+    );
+    let txn = json!({
+        "@context": ctx(),
+        "@id": "ex:alice",
+        predicate_compact: JsonValue::Object(literal_with_ann),
+    });
+    let committed = fluree.insert(ledger0, &txn).await.expect("seed insert");
+    let ledger = &committed.ledger;
+
+    let alice_sid = ledger
+        .snapshot
+        .encode_iri("http://example.org/alice")
+        .expect("encode alice IRI");
+    let predicate_sid = ledger
+        .snapshot
+        .encode_iri(predicate_full)
+        .expect("encode predicate IRI");
+    let reifies_subject_pid = ledger
+        .snapshot
+        .encode_iri(reifies_iris::SUBJECT)
+        .expect("encode f:reifiesSubject");
+
+    // 1. Base-edge flake.
+    let base_flakes = range_with_overlay(
+        &ledger.snapshot,
+        0,
+        ledger.novelty.as_ref(),
+        IndexType::Spot,
+        RangeTest::Eq,
+        RangeMatch::subject_predicate(alice_sid.clone(), predicate_sid.clone()),
+        RangeOptions::new().with_to_t(ledger.t()),
+    )
+    .await
+    .expect("scan base edge flake");
+    assert_eq!(
+        base_flakes.len(),
+        1,
+        "[{test_label}] expected exactly one base flake; got {base_flakes:#?}"
+    );
+    let base_flake = &base_flakes[0];
+    let base_edge_key = EdgeKey::from_flake(base_flake);
+
+    // 2. Locate the annotation subject via POST f:reifiesSubject → alice.
+    let ann_pointers = range_with_overlay(
+        &ledger.snapshot,
+        0,
+        ledger.novelty.as_ref(),
+        IndexType::Post,
+        RangeTest::Eq,
+        RangeMatch::predicate_object(
+            reifies_subject_pid.clone(),
+            FlakeValue::Ref(alice_sid.clone()),
+        ),
+        RangeOptions::new().with_to_t(ledger.t()),
+    )
+    .await
+    .expect("scan f:reifiesSubject pointers");
+    assert_eq!(
+        ann_pointers.len(),
+        1,
+        "[{test_label}] expected exactly one annotation; got {ann_pointers:#?}"
+    );
+    let ann_sid = ann_pointers[0].s.clone();
+
+    // 3. Full bundle for that annotation subject.
+    let ann_flakes = range_with_overlay(
+        &ledger.snapshot,
+        0,
+        ledger.novelty.as_ref(),
+        IndexType::Spot,
+        RangeTest::Eq,
+        RangeMatch::subject(ann_sid.clone()),
+        RangeOptions::new().with_to_t(ledger.t()),
+    )
+    .await
+    .expect("scan annotation subject flakes");
+    let bundle: Vec<_> = ann_flakes
+        .iter()
+        .filter(|f| fluree_db_core::is_reserved_reifies_predicate(&f.p))
+        .cloned()
+        .collect();
+    assert!(
+        !bundle.is_empty(),
+        "[{test_label}] annotation subject must carry an f:reifies* bundle; \
+         got flakes: {ann_flakes:#?}"
+    );
+    let decoded_key = EdgeKey::from_reifies_facts(&bundle).unwrap_or_else(|e| {
+        panic!(
+            "[{test_label}] decode failed: {e:?}; bundle: {bundle:#?}, base flake: {base_flake:?}"
+        )
+    });
+
+    // 4. The contract — decoded EdgeKey from the synthesized sibling
+    //    must equal the base edge's EdgeKey. Mismatch here is the
+    //    silent-failure mode that loses annotations.
+    assert_eq!(
+        decoded_key, base_edge_key,
+        "[{test_label}] decoded EdgeKey diverges from base-edge EdgeKey; \
+         base_flake: {base_flake:?}, bundle: {bundle:#?}"
+    );
+}
+
+#[tokio::test]
+async fn edgekey_roundtrip_plain_string_literal_annotation() {
+    edgekey_roundtrip_for_literal(
+        "ex:name",
+        "http://example.org/name",
+        json!({ "@value": "Alice" }),
+        "plain-string",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn edgekey_roundtrip_typed_literal_annotation() {
+    edgekey_roundtrip_for_literal(
+        "ex:joinedAt",
+        "http://example.org/joinedAt",
+        json!({ "@value": "2024-01-01", "@type": "xsd:date" }),
+        "typed-literal",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn edgekey_roundtrip_language_tagged_literal_annotation() {
+    // The motivating regression: without explicit f:reifiesLang
+    // emission, the decoded EdgeKey would have `lang = None` while
+    // the base flake's EdgeKey has `lang = Some("fr")`, and every
+    // downstream lookup for the annotation would silently miss.
+    edgekey_roundtrip_for_literal(
+        "ex:label",
+        "http://example.org/label",
+        json!({ "@value": "chat", "@language": "fr" }),
+        "lang-tagged",
+    )
+    .await;
+}
+
+// =====================================================================
+// Delete-path end-to-end coverage for literal-object annotations
+// =====================================================================
+
+/// Insert an annotated literal, then retract by annotation @id, and
+/// verify the f:reifiesSubject pointer no longer resolves. Mirrors the
+/// "live cancels assert" cascade contract enforced in the M1b cascade
+/// tests, but for literal-object annotations.
+#[tokio::test]
+async fn delete_by_id_retracts_literal_annotation_bundle() {
+    use fluree_db_core::comparator::IndexType;
+    use fluree_db_core::range::{range_with_overlay, RangeMatch, RangeOptions, RangeTest};
+    use fluree_db_core::value::FlakeValue;
+    use fluree_vocab::reifies_iris;
+
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger_id = "it-edge-annotations-literal-delete-by-id";
+    let ledger0 = genesis_ledger(&fluree, ledger_id);
+
+    let insert = json!({
+        "@context": ctx(),
+        "@id": "ex:alice",
+        "ex:name": {
+            "@value": "Alice",
+            "@annotation": { "@id": "ex:ann-1", "ex:source": "hr" }
+        }
+    });
+    let r1 = fluree.insert(ledger0, &insert).await.expect("insert");
+
+    let alice_sid = r1
+        .ledger
+        .snapshot
+        .encode_iri("http://example.org/alice")
+        .unwrap();
+    let reifies_subj_pid = r1
+        .ledger
+        .snapshot
+        .encode_iri(reifies_iris::SUBJECT)
+        .unwrap();
+
+    let pre = range_with_overlay(
+        &r1.ledger.snapshot,
+        0,
+        r1.ledger.novelty.as_ref(),
+        IndexType::Post,
+        RangeTest::Eq,
+        RangeMatch::predicate_object(
+            reifies_subj_pid.clone(),
+            FlakeValue::Ref(alice_sid.clone()),
+        ),
+        RangeOptions::new().with_to_t(r1.ledger.t()),
+    )
+    .await
+    .expect("pre scan");
+    assert_eq!(pre.len(), 1, "annotation must be present pre-delete");
+
+    let delete = json!({
+        "@context": ctx(),
+        "delete": {
+            "@id": "ex:alice",
+            "ex:name": {
+                "@value": "Alice",
+                "@annotation": { "@id": "ex:ann-1" }
+            }
+        }
+    });
+    let r2 = fluree.update(r1.ledger, &delete).await.expect("delete");
+
+    let post = range_with_overlay(
+        &r2.ledger.snapshot,
+        0,
+        r2.ledger.novelty.as_ref(),
+        IndexType::Post,
+        RangeTest::Eq,
+        RangeMatch::predicate_object(reifies_subj_pid, FlakeValue::Ref(alice_sid)),
+        RangeOptions::new().with_to_t(r2.ledger.t()),
+    )
+    .await
+    .expect("post scan");
+    assert!(
+        post.is_empty(),
+        "annotation must be retracted post-delete: got {post:#?}"
+    );
+}
+
+/// Selector-form delete: retract the annotation matching a selector
+/// body without specifying its @id. Exercises the new shape-aware
+/// WHERE template generation that emits `f:reifiesObject` as a literal
+/// value-object payload (instead of a `{"@id": ...}` ref).
+///
+/// Two parallel annotations on the same literal-object edge with
+/// different selector bodies; selector-form delete must retract only
+/// the matching one.
+#[tokio::test]
+async fn delete_by_selector_retracts_literal_annotation_disambiguating_on_body() {
+    use fluree_db_core::comparator::IndexType;
+    use fluree_db_core::range::{range_with_overlay, RangeMatch, RangeOptions, RangeTest};
+    use fluree_db_core::value::FlakeValue;
+    use fluree_vocab::reifies_iris;
+
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger_id = "it-edge-annotations-literal-delete-selector";
+    let ledger0 = genesis_ledger(&fluree, ledger_id);
+
+    // Two parallel annotations on the same literal edge, distinguished
+    // by selector body.
+    let insert = json!({
+        "@context": ctx(),
+        "@graph": [
+            { "@id": "ex:alice",
+              "ex:name": {
+                  "@value": "Alice",
+                  "@annotation": { "@id": "ex:ann-hr", "ex:source": "hr" }
+              }},
+            { "@id": "ex:alice",
+              "ex:name": {
+                  "@value": "Alice",
+                  "@annotation": { "@id": "ex:ann-payroll", "ex:source": "payroll" }
+              }}
+        ]
+    });
+    let r1 = fluree.insert(ledger0, &insert).await.expect("insert two");
+
+    let alice_sid = r1
+        .ledger
+        .snapshot
+        .encode_iri("http://example.org/alice")
+        .unwrap();
+    let reifies_subj_pid = r1
+        .ledger
+        .snapshot
+        .encode_iri(reifies_iris::SUBJECT)
+        .unwrap();
+
+    let pre = range_with_overlay(
+        &r1.ledger.snapshot,
+        0,
+        r1.ledger.novelty.as_ref(),
+        IndexType::Post,
+        RangeTest::Eq,
+        RangeMatch::predicate_object(
+            reifies_subj_pid.clone(),
+            FlakeValue::Ref(alice_sid.clone()),
+        ),
+        RangeOptions::new().with_to_t(r1.ledger.t()),
+    )
+    .await
+    .expect("pre scan");
+    assert_eq!(pre.len(), 2, "two annotations present pre-delete");
+
+    // Selector-form delete: retract the annotation whose body says
+    // `ex:source == "hr"`. The pre-pass mints a WHERE variable bound
+    // to all annotations on (ex:alice, ex:name, "Alice") whose body
+    // matches the selector.
+    let delete = json!({
+        "@context": ctx(),
+        "delete": {
+            "@id": "ex:alice",
+            "ex:name": {
+                "@value": "Alice",
+                "@annotation": { "ex:source": "hr" }
+            }
+        }
+    });
+    let r2 = fluree.update(r1.ledger, &delete).await.expect("delete");
+
+    // One annotation must remain (the payroll one).
+    let post = range_with_overlay(
+        &r2.ledger.snapshot,
+        0,
+        r2.ledger.novelty.as_ref(),
+        IndexType::Post,
+        RangeTest::Eq,
+        RangeMatch::predicate_object(reifies_subj_pid, FlakeValue::Ref(alice_sid)),
+        RangeOptions::new().with_to_t(r2.ledger.t()),
+    )
+    .await
+    .expect("post scan");
+    assert_eq!(
+        post.len(),
+        1,
+        "exactly one annotation must survive selector delete (the payroll one); got {post:#?}"
+    );
+    // The surviving annotation must be ex:ann-payroll.
+    let surviving_sid = &post[0].s;
+    let payroll_sid = r2
+        .ledger
+        .snapshot
+        .encode_iri("http://example.org/ann-payroll")
+        .unwrap();
+    assert_eq!(surviving_sid, &payroll_sid);
+}
+
+/// Same as above but for a language-tagged literal — the load-bearing
+/// case that motivates `f:reifiesLang` emission on the delete template.
+/// Without `f:reifiesLang`, the retract bundle would decode to an
+/// EdgeKey with `lang = None`, failing to cancel the assertion whose
+/// EdgeKey has `lang = Some("fr")`.
+#[tokio::test]
+async fn delete_by_id_retracts_lang_tagged_literal_annotation_bundle() {
+    use fluree_db_core::comparator::IndexType;
+    use fluree_db_core::range::{range_with_overlay, RangeMatch, RangeOptions, RangeTest};
+    use fluree_db_core::value::FlakeValue;
+    use fluree_vocab::reifies_iris;
+
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger_id = "it-edge-annotations-literal-delete-lang";
+    let ledger0 = genesis_ledger(&fluree, ledger_id);
+
+    let insert = json!({
+        "@context": ctx(),
+        "@id": "ex:alice",
+        "ex:label": {
+            "@value": "chat",
+            "@language": "fr",
+            "@annotation": { "@id": "ex:ann-fr", "ex:source": "lexicon" }
+        }
+    });
+    let r1 = fluree.insert(ledger0, &insert).await.expect("insert");
+
+    let alice_sid = r1
+        .ledger
+        .snapshot
+        .encode_iri("http://example.org/alice")
+        .unwrap();
+    let reifies_subj_pid = r1
+        .ledger
+        .snapshot
+        .encode_iri(reifies_iris::SUBJECT)
+        .unwrap();
+
+    let pre = range_with_overlay(
+        &r1.ledger.snapshot,
+        0,
+        r1.ledger.novelty.as_ref(),
+        IndexType::Post,
+        RangeTest::Eq,
+        RangeMatch::predicate_object(
+            reifies_subj_pid.clone(),
+            FlakeValue::Ref(alice_sid.clone()),
+        ),
+        RangeOptions::new().with_to_t(r1.ledger.t()),
+    )
+    .await
+    .expect("pre scan");
+    assert_eq!(pre.len(), 1);
+
+    let delete = json!({
+        "@context": ctx(),
+        "delete": {
+            "@id": "ex:alice",
+            "ex:label": {
+                "@value": "chat",
+                "@language": "fr",
+                "@annotation": { "@id": "ex:ann-fr" }
+            }
+        }
+    });
+    let r2 = fluree.update(r1.ledger, &delete).await.expect("delete");
+
+    let post = range_with_overlay(
+        &r2.ledger.snapshot,
+        0,
+        r2.ledger.novelty.as_ref(),
+        IndexType::Post,
+        RangeTest::Eq,
+        RangeMatch::predicate_object(reifies_subj_pid, FlakeValue::Ref(alice_sid)),
+        RangeOptions::new().with_to_t(r2.ledger.t()),
+    )
+    .await
+    .expect("post scan");
+    assert!(
+        post.is_empty(),
+        "lang-tagged annotation must be retracted post-delete: got {post:#?}"
+    );
+}
