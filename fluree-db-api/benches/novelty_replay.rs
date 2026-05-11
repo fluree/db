@@ -57,10 +57,7 @@ async fn populate(db_dir: &std::path::Path, alias: &str, commit_count: usize) {
         .without_indexing()
         .build()
         .expect("build file-backed Fluree (populate)");
-    let mut ledger = fluree
-        .create_ledger(alias)
-        .await
-        .expect("create_ledger");
+    let mut ledger = fluree.create_ledger(alias).await.expect("create_ledger");
     let index_config = IndexConfig {
         // Belt-and-braces with `without_indexing()`: a very high threshold
         // is meaningless when the indexer is disabled, but keeps the

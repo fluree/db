@@ -95,10 +95,7 @@ fn bench_reindex_full(c: &mut Criterion) {
                                 .build()
                                 .expect("build file-backed Fluree");
                         let alias = next_ledger_alias("reindex-full");
-                        let ledger = fluree
-                            .create_ledger(&alias)
-                            .await
-                            .expect("create_ledger");
+                        let ledger = fluree.create_ledger(&alias).await.expect("create_ledger");
                         let turtle = txn_data_to_turtle(&generate_txn_data(0, n));
                         // Use a permissive IndexConfig so the populate txn
                         // doesn't itself trigger background indexing

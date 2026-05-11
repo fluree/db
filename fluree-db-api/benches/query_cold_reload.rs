@@ -59,10 +59,7 @@ async fn populate(db_dir: &std::path::Path, alias: &str, base_nodes: usize) {
         .expect("build file-backed Fluree (populate)");
     let data = generate_txn_data(0, base_nodes);
     let turtle = txn_data_to_turtle(&data);
-    let ledger = fluree
-        .create_ledger(alias)
-        .await
-        .expect("create_ledger");
+    let ledger = fluree.create_ledger(alias).await.expect("create_ledger");
     let index_config = IndexConfig {
         reindex_min_bytes: 500_000_000,
         reindex_max_bytes: 500_000_000,
@@ -136,11 +133,7 @@ fn bench_query_cold_reload(c: &mut Criterion) {
                             FlureeBuilder::file(db_dir.path().to_string_lossy().to_string())
                                 .build()
                                 .expect("build file-backed Fluree (cold)");
-                        let snapshot = fluree
-                            .graph(&alias)
-                            .load()
-                            .await
-                            .expect("cold graph load");
+                        let snapshot = fluree.graph(&alias).load().await.expect("cold graph load");
                         black_box(snapshot);
                     });
                 },
@@ -170,11 +163,7 @@ fn bench_query_cold_reload(c: &mut Criterion) {
                             FlureeBuilder::file(db_dir.path().to_string_lossy().to_string())
                                 .build()
                                 .expect("build file-backed Fluree (cold+query)");
-                        let snapshot = fluree
-                            .graph(&alias)
-                            .load()
-                            .await
-                            .expect("cold graph load");
+                        let snapshot = fluree.graph(&alias).load().await.expect("cold graph load");
                         let result = snapshot
                             .query()
                             .sparql(QUERY)

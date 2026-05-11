@@ -110,10 +110,7 @@ async fn setup_indexed(n_products: usize) -> (tempfile::TempDir, Fluree, String)
         .expect("build file-backed Fluree");
 
     let alias = next_ledger_alias("query-hot-bsbm");
-    let ledger = fluree
-        .create_ledger(&alias)
-        .await
-        .expect("create_ledger");
+    let ledger = fluree.create_ledger(&alias).await.expect("create_ledger");
 
     let data = generate_dataset(n_products);
     let turtle = bsbm_data_to_turtle(&data);

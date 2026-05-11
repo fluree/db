@@ -108,10 +108,7 @@ fn bench_reindex_incremental(c: &mut Criterion) {
                                 .expect("build file-backed Fluree");
 
                         let alias = next_ledger_alias("reindex-incremental");
-                        let mut ledger = fluree
-                            .create_ledger(&alias)
-                            .await
-                            .expect("create_ledger");
+                        let mut ledger = fluree.create_ledger(&alias).await.expect("create_ledger");
 
                         // Base txn — all in one go to keep commit-chain
                         // depth low and isolate "delta over an indexed
