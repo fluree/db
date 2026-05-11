@@ -29,12 +29,11 @@
 use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
 use fluree_bench_support::gen::people::{generate_txn_data, txn_data_to_turtle};
 use fluree_bench_support::{
-    bench_runtime, current_profile, current_scale, init_tracing_for_bench, BenchScale,
+    bench_runtime, current_profile, current_scale, init_tracing_for_bench, next_ledger_alias,
+    BenchScale,
 };
 use fluree_db_api::admin::ReindexOptions;
 use fluree_db_api::{CommitOpts, FlureeBuilder, IndexConfig, TxnOpts};
-
-const LEDGER_ID: &str = "bench/reindex-full:main";
 
 fn scale_base_nodes(scale: BenchScale) -> usize {
     match scale {
@@ -95,8 +94,9 @@ fn bench_reindex_full(c: &mut Criterion) {
                             FlureeBuilder::file(db_dir.path().to_string_lossy().to_string())
                                 .build()
                                 .expect("build file-backed Fluree");
+                        let alias = next_ledger_alias("reindex-full");
                         let ledger = fluree
-                            .create_ledger(LEDGER_ID)
+                            .create_ledger(&alias)
                             .await
                             .expect("create_ledger");
                         let turtle = txn_data_to_turtle(&generate_txn_data(0, n));
@@ -117,16 +117,16 @@ fn bench_reindex_full(c: &mut Criterion) {
                             )
                             .await
                             .expect("populate insert");
-                        // Move db_dir + fluree into the iter so they live
-                        // for the duration of the measured op.
-                        (db_dir, fluree)
+                        // Move db_dir + fluree + alias into the iter so they
+                        // live for the duration of the measured op.
+                        (db_dir, fluree, alias)
                     })
                 },
                 // Measured: full reindex.
-                |(_db_dir, fluree)| {
+                |(_db_dir, fluree, alias)| {
                     rt.block_on(async {
                         let result = fluree
-                            .reindex(LEDGER_ID, ReindexOptions::default())
+                            .reindex(&alias, ReindexOptions::default())
                             .await
                             .expect("reindex");
                         black_box(result);

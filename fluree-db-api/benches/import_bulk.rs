@@ -14,6 +14,14 @@
 //! 2. `default_threads` — leaves `threads(...)` unset. Exercises the
 //!    parallel-import allocator and worker-cache code paths.
 //!
+//!    **Note:** the chassis's `bench_runtime()` is single-threaded by
+//!    default, which can bottleneck the parallel-import path on the
+//!    tokio scheduler before it saturates worker threads. To get a
+//!    meaningful parallel measurement, run with
+//!    `FLUREE_BENCH_RUNTIME=multi`. Without it, the comparison to
+//!    `single_threaded` should be read as "internal worker pool only,"
+//!    not full end-to-end parallel throughput.
+//!
 //! ## Matrix
 //!
 //!   inputs:    BenchScale → total_nodes (Tiny=1k, Small=10k, Medium=50k,
@@ -33,7 +41,8 @@
 use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
 use fluree_bench_support::gen::people::{generate_txn_data, txn_data_to_turtle};
 use fluree_bench_support::{
-    bench_runtime, current_profile, current_scale, init_tracing_for_bench, BenchScale,
+    bench_runtime, current_profile, current_scale, init_tracing_for_bench, next_ledger_alias,
+    BenchScale,
 };
 use fluree_db_api::FlureeBuilder;
 use std::io::Write;
@@ -130,17 +139,18 @@ fn bench_import_bulk(c: &mut Criterion) {
                             FlureeBuilder::file(db_dir.path().to_string_lossy().to_string())
                                 .build()
                                 .expect("build file-backed Fluree");
+                        let alias = next_ledger_alias("import-bulk-st");
                         // Move the tmpdirs into the iter so they live for
                         // the duration of the measured op (Drop after the
                         // timed block runs).
-                        (db_dir, data_dir, ttl_path, fluree)
+                        (db_dir, data_dir, ttl_path, fluree, alias)
                     })
                 },
                 // Measured: the import itself.
-                |(_db_dir, _data_dir, ttl_path, fluree)| {
+                |(_db_dir, _data_dir, ttl_path, fluree, alias)| {
                     rt.block_on(async {
                         let result = fluree
-                            .create("bench/import-bulk-st:main")
+                            .create(&alias)
                             .import(&ttl_path)
                             .threads(1)
                             .execute()
@@ -172,13 +182,14 @@ fn bench_import_bulk(c: &mut Criterion) {
                                 FlureeBuilder::file(db_dir.path().to_string_lossy().to_string())
                                     .build()
                                     .expect("build file-backed Fluree");
-                            (db_dir, data_dir, ttl_path, fluree)
+                            let alias = next_ledger_alias("import-bulk-mt");
+                            (db_dir, data_dir, ttl_path, fluree, alias)
                         })
                     },
-                    |(_db_dir, _data_dir, ttl_path, fluree)| {
+                    |(_db_dir, _data_dir, ttl_path, fluree, alias)| {
                         rt.block_on(async {
                             let result = fluree
-                                .create("bench/import-bulk-mt:main")
+                                .create(&alias)
                                 .import(&ttl_path)
                                 .execute()
                                 .await

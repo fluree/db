@@ -15,35 +15,53 @@ use rand::Rng;
 
 /// Two deterministic `f64` vectors of the requested dimension.
 ///
-/// Same algorithm as `vector_math.rs`'s `random_vectors`: salt the index `i`
-/// with `0` for the first vector and with `1000` for the second, hash with
-/// `DefaultHasher`, and project the resulting `u64` into `[-1.0, 1.0)`.
+/// Salts the loop index `i` with `0` for the first vector and `1000` for
+/// the second, feeds both into a *single shared* `DefaultHasher` whose
+/// state accumulates across the loop, and projects each finished `u64`
+/// into `[-1.0, 1.0)`. Byte-identical to the pre-chassis
+/// `vector_math.rs::random_vectors` — the shared-hasher accumulation
+/// matters because `Hasher::finish()` is not a reset, so each call
+/// returns a digest of the running state, not just the most recent
+/// `Hash::hash` input.
 ///
 /// Output is byte-identical across runs given the same `dim`.
 pub fn hashed_pair(dim: usize) -> (Vec<f64>, Vec<f64>) {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+
+    let mut hasher = DefaultHasher::new();
     let mut a = Vec::with_capacity(dim);
     let mut b = Vec::with_capacity(dim);
     for i in 0..dim {
-        a.push(hashed_value(i));
-        b.push(hashed_value(i + 1000));
+        i.hash(&mut hasher);
+        a.push(project(hasher.finish()));
+        (i + 1000).hash(&mut hasher);
+        b.push(project(hasher.finish()));
     }
     (a, b)
 }
 
 /// One deterministic `f64` vector of the requested dimension, salted by
 /// `seed`. Two calls with the same `(dim, seed)` return the same vector.
+/// Uses a fresh hasher per element (does not match `hashed_pair`'s
+/// shared-hasher discipline; this is for benches that don't need to
+/// reproduce the legacy `vector_math.rs` byte stream).
 pub fn hashed_one(dim: usize, seed: usize) -> Vec<f64> {
-    (0..dim).map(|i| hashed_value(i + seed)).collect()
-}
-
-/// Hash an index into `[-1.0, 1.0)`. Replicates `vector_math.rs`'s
-/// `(h as f64) / (u64::MAX as f64) * 2.0 - 1.0` projection.
-fn hashed_value(i: usize) -> f64 {
     use std::collections::hash_map::DefaultHasher;
     use std::hash::{Hash, Hasher};
-    let mut hasher = DefaultHasher::new();
-    i.hash(&mut hasher);
-    let h = hasher.finish();
+
+    (0..dim)
+        .map(|i| {
+            let mut hasher = DefaultHasher::new();
+            (i + seed).hash(&mut hasher);
+            project(hasher.finish())
+        })
+        .collect()
+}
+
+/// Project a `u64` hash digest into `[-1.0, 1.0)`. Matches the legacy
+/// `(h as f64) / (u64::MAX as f64) * 2.0 - 1.0` formula.
+fn project(h: u64) -> f64 {
     (h as f64) / (u64::MAX as f64) * 2.0 - 1.0
 }
 

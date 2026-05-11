@@ -33,11 +33,10 @@
 use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion};
 use fluree_bench_support::gen::people::{generate_txn_data, txn_data_to_turtle};
 use fluree_bench_support::{
-    bench_runtime, current_profile, current_scale, init_tracing_for_bench, BenchScale,
+    bench_runtime, current_profile, current_scale, init_tracing_for_bench, next_ledger_alias,
+    BenchScale,
 };
 use fluree_db_api::{CommitOpts, FlureeBuilder, IndexConfig, TxnOpts};
-
-const LEDGER_ID: &str = "bench/cold-reload:main";
 
 /// Map BenchScale to the base_nodes for this bench. We commit all base
 /// data in a single txn to isolate "amount of data" scaling from
@@ -51,16 +50,17 @@ fn scale_base_nodes(scale: BenchScale) -> usize {
     }
 }
 
-/// Populate a fresh file-backed ledger at `db_dir` with `base_nodes` of
-/// data, then drop the Fluree handle so subsequent opens are cold.
-async fn populate(db_dir: &std::path::Path, base_nodes: usize) {
+/// Populate a fresh file-backed ledger at `db_dir` (with the given
+/// `alias`) with `base_nodes` of data, then drop the Fluree handle so
+/// subsequent opens are cold.
+async fn populate(db_dir: &std::path::Path, alias: &str, base_nodes: usize) {
     let fluree = FlureeBuilder::file(db_dir.to_string_lossy().to_string())
         .build()
         .expect("build file-backed Fluree (populate)");
     let data = generate_txn_data(0, base_nodes);
     let turtle = txn_data_to_turtle(&data);
     let ledger = fluree
-        .create_ledger(LEDGER_ID)
+        .create_ledger(alias)
         .await
         .expect("create_ledger");
     let index_config = IndexConfig {
@@ -123,20 +123,21 @@ fn bench_query_cold_reload(c: &mut Criterion) {
                 || {
                     rt.block_on(async {
                         let db_dir = tempfile::tempdir().expect("db tmpdir");
-                        populate(db_dir.path(), n).await;
-                        db_dir
+                        let alias = next_ledger_alias("cold-reload");
+                        populate(db_dir.path(), &alias, n).await;
+                        (db_dir, alias)
                     })
                 },
                 // Measured: build a fresh Fluree at the same path and
                 // load the ledger.
-                |db_dir| {
+                |(db_dir, alias)| {
                     rt.block_on(async {
                         let fluree =
                             FlureeBuilder::file(db_dir.path().to_string_lossy().to_string())
                                 .build()
                                 .expect("build file-backed Fluree (cold)");
                         let snapshot = fluree
-                            .graph(LEDGER_ID)
+                            .graph(&alias)
                             .load()
                             .await
                             .expect("cold graph load");
@@ -149,6 +150,7 @@ fn bench_query_cold_reload(c: &mut Criterion) {
     );
 
     // --- Scenario 2: cold load + first query ---
+    // (note: setup mirrors scenario 1; alias is regenerated per iteration)
     group.bench_with_input(
         BenchmarkId::new("cold_load_plus_query", scale.as_str()),
         &base_nodes,
@@ -157,18 +159,19 @@ fn bench_query_cold_reload(c: &mut Criterion) {
                 || {
                     rt.block_on(async {
                         let db_dir = tempfile::tempdir().expect("db tmpdir");
-                        populate(db_dir.path(), n).await;
-                        db_dir
+                        let alias = next_ledger_alias("cold-reload");
+                        populate(db_dir.path(), &alias, n).await;
+                        (db_dir, alias)
                     })
                 },
-                |db_dir| {
+                |(db_dir, alias)| {
                     rt.block_on(async {
                         let fluree =
                             FlureeBuilder::file(db_dir.path().to_string_lossy().to_string())
                                 .build()
                                 .expect("build file-backed Fluree (cold+query)");
                         let snapshot = fluree
-                            .graph(LEDGER_ID)
+                            .graph(&alias)
                             .load()
                             .await
                             .expect("cold graph load");

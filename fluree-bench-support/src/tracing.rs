@@ -44,8 +44,10 @@ pub fn init_tracing_for_bench() {
         match std::env::var("FLUREE_BENCH_TRACING").ok().as_deref() {
             Some("1") => install_stderr_subscriber(),
             Some(other) if other.starts_with("file:") => {
-                // TODO(bench-3): wire up `BenchSpanLayer` here. For now, fall back
-                // to stderr so users get *something* when they ask for a file.
+                // `BenchSpanLayer` is reserved but not yet implemented; falls
+                // back to stderr so users get *something* when they ask for a
+                // file. Wiring up the JSON file writer is tracked under the
+                // bench-nightly follow-up work.
                 install_stderr_subscriber();
                 ::tracing::warn!(
                     target = %other,
@@ -77,13 +79,12 @@ fn install_stderr_subscriber() {
 /// `tracing_subscriber::Layer` that captures span open/close events with
 /// monotonic timestamps for later analysis.
 ///
-/// **Status:** skeleton. The full implementation lands in a later commit
-/// (see plan §5.2 item 1 + §4.5.2 docs). This stub exists so the public
-/// surface is stable from `bench-1`; benches can reference it but should
-/// not yet rely on it producing useful output.
-///
-/// Activated via `FLUREE_BENCH_TRACING=file:./out.json` once implemented;
-/// today it is a no-op layer.
+/// **Status:** skeleton — the public surface is stable but the body is
+/// reserved. Wiring up the JSON-file emit path is tracked under the
+/// `bench-nightly` follow-up; until then,
+/// `FLUREE_BENCH_TRACING=file:./out.json` falls back to the stderr
+/// subscriber. Benches can reference this type today but should not
+/// yet rely on it producing useful output.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct BenchSpanLayer;
 

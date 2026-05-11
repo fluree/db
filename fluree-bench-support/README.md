@@ -47,20 +47,24 @@ byte-identical across runs given the same parameters.
 | `gen::vectors` | lifted from `vector_math.rs` and `vector_query.rs` | vector benches |
 | `gen::corpora` | lifted from `fulltext_query.rs` | full-text benches |
 | `gen::people` | lifted from `insert_formats.rs` | insert/transact benches |
+| `gen::bsbm` | new in chassis | `query_hot_bsbm` and any future bench wanting multi-hop join + filter + aggregate query patterns |
 
 ### `fixtures` module
 
 Workspace-root `fluree-bench-support/fixtures/` resolution. The
-`load_or_generate(name, scale)` entry point is a stub today; bodies land in
-`bench-4` (vendored fixtures) and `bench-6` (remote fetch).
+`load_or_generate(name, scale)` entry point is a stub today; vendored
+fixture loading and remote fetch are tracked under the `bench-nightly`
+follow-up.
 
 ### `budget` module
 
 `RegressionBudget` schema + loader for `regression-budget.json` at the
 workspace root. The `check(...)` helper compares observed nanoseconds to
 `baseline * (1 + budget_pct/100)` and returns a `BudgetViolation` on
-failure. The `validate_against_workspace()` reconciler is a stub today;
-lands in `bench-5` (CI gate).
+failure. The bench/budget reconciler runs as the `workspace_reconcile`
+integration test (`fluree-bench-support/tests/workspace_reconcile.rs`)
+and is invoked by the `bench-gate` CI job — it is not exposed as a
+library function.
 
 ### `report` module
 
@@ -82,8 +86,10 @@ without hiding them behind macros.
 cargo test -p fluree-bench-support --lib
 ```
 
-37 unit tests cover the determinism contract on every generator, env-var
+44 unit tests cover the determinism contract on every generator, env-var
 parsing, budget loading, alias uniqueness, and tracing init idempotence.
+A separate integration test (`tests/workspace_reconcile.rs`) reconciles
+workspace `[[bench]]` entries with `regression-budget.json`.
 
 ## Adding to your crate
 

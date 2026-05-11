@@ -192,21 +192,35 @@ JSON. Adding a new category is one row here and one section in
 `regression-budget.json`. CI accepts any category as long as it's
 documented.
 
-| Category | Hot path | Where it lives |
+**Where benches actually live today:** every shipped bench (existing
+and new) is currently under one of three crates' `benches/` directories
+— `fluree-db-api/benches/`, `fluree-db-query/benches/`,
+`fluree-db-spatial/benches/`. The `index`, `novelty`, and `core`
+categories below are end-to-end-realised under `fluree-db-api/benches/`
+because their user-facing entry points (`Fluree::reindex`,
+`Fluree::trigger_index`, `fluree.graph(...).load()`) live there. If a
+future micro-bench wants to exercise `fluree-db-indexer`,
+`fluree-db-novelty`, or `fluree-db-core` directly, it can add a
+`benches/` directory under that crate; the chassis already supports it.
+
+| Category | Hot path | Where it lives today |
 |---|---|---|
-| `import` | bulk Turtle / N-Quads / JSON-LD ingest | `fluree-db-api/benches/import_*.rs` |
-| `transact` | stage + commit | `fluree-db-api/benches/transact_*.rs` |
-| `index` | full reindex; incremental; gc | `fluree-db-indexer/benches/index_*.rs` |
-| `query_hot` | BSBM-shape SPARQL on warm cache | `fluree-db-api/benches/query_hot_*.rs` |
-| `query_cold` | reload + first-query latency | `fluree-db-api/benches/query_cold_*.rs` |
-| `novelty` | replay, catch-up, bulk-apply | `fluree-db-novelty/benches/novelty_*.rs` |
-| `core` | namespace encode/decode and similar foundational ops | `fluree-db-core/benches/core_*.rs` |
-| `query` | scan/join/aggregate micro-benches inside `fluree-db-query` | `fluree-db-query/benches/query_*.rs` |
+| `import` | bulk Turtle / N-Quads / JSON-LD ingest | `fluree-db-api/benches/import_bulk.rs` |
+| `transact` | stage + commit | `fluree-db-api/benches/transact_commit.rs` |
+| `reindex` | full reindex; incremental | `fluree-db-api/benches/reindex_full.rs`, `fluree-db-api/benches/reindex_incremental.rs` |
+| `query_hot` | BSBM-shape SPARQL on warm cache | `fluree-db-api/benches/query_hot_bsbm.rs` |
+| `query_cold` | reload + first-query latency | `fluree-db-api/benches/query_cold_reload.rs` |
+| `novelty` | replay, catch-up, bulk-apply | `fluree-db-api/benches/novelty_replay.rs` |
 | `vector_math` | SIMD vs scalar math micro-benches | `fluree-db-query/benches/vector_math.rs` |
-| `spatial` | S2 covering / build / query | `fluree-db-spatial/benches/spatial_*.rs` |
+| `spatial` | S2 covering / build / query | `fluree-db-spatial/benches/spatial_bench.rs` |
 | `insert_formats` | JSON-LD vs Turtle insert format comparison | `fluree-db-api/benches/insert_formats.rs` |
 | `vector_query` | end-to-end vector similarity through the query engine | `fluree-db-api/benches/vector_query.rs` |
 | `fulltext_query` | full-text scoring through novelty + index | `fluree-db-api/benches/fulltext_query.rs` |
+
+**Reserved categories** (not yet in use; add a row here when you ship
+the first bench under that prefix): `core` (foundational ops —
+e.g., `fluree-db-core/benches/core_*.rs` once added), `query`
+(scan/join/aggregate micro-benches under `fluree-db-query/benches/`).
 
 ## Common patterns
 
@@ -445,12 +459,11 @@ When reviewing someone else's bench, check:
 
 ## Future work
 
-- The `BenchSpanLayer` (file-mode tracing) lands as part of the bench
-  chassis follow-up work; until then, file mode falls back to stderr.
-- The `fixtures::load_or_generate` body lands in `bench-4` (vendored
-  fixtures) and `bench-6` (remote fetch).
-- The `validate_against_workspace()` reconciler lands in `bench-5` along
-  with the CI gated job.
-
-These are tracked in the bench-infrastructure plan; opening a separate
-issue isn't needed.
+- `BenchSpanLayer` file-mode tracing (`FLUREE_BENCH_TRACING=file:...`)
+  is reserved but unimplemented; today it falls back to stderr.
+- `fixtures::load_or_generate` is a stub today; vendored fixture loading
+  and remote fetch are tracked in the `bench-nightly` follow-up.
+- The bench/budget reconciler runs as the `workspace_reconcile`
+  integration test (`fluree-bench-support/tests/workspace_reconcile.rs`)
+  and is invoked by the `bench-gate` CI job — there is no library
+  function for it.

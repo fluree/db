@@ -43,12 +43,11 @@
 use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion};
 use fluree_bench_support::gen::bsbm::{bsbm_data_to_turtle, generate_dataset};
 use fluree_bench_support::{
-    bench_runtime, current_profile, current_scale, init_tracing_for_bench, BenchScale,
+    bench_runtime, current_profile, current_scale, init_tracing_for_bench, next_ledger_alias,
+    BenchScale,
 };
 use fluree_db_api::admin::ReindexOptions;
 use fluree_db_api::{CommitOpts, Fluree, FlureeBuilder, IndexConfig, TxnOpts};
-
-const LEDGER_ID: &str = "bench/query-hot-bsbm:main";
 
 fn scale_n_products(scale: BenchScale) -> usize {
     match scale {
@@ -75,7 +74,6 @@ LIMIT 50
 
 const Q5: &str = r"
 PREFIX bsbm: <http://example.org/bsbm/>
-PREFIX xsd: <http://www.w3.org/2001/XMLSchema#>
 SELECT ?product ?label ?vendorLabel ?price WHERE {
   ?product a bsbm:Product ;
            bsbm:label ?label ;
@@ -101,17 +99,19 @@ LIMIT 25
 ";
 
 /// Build a populated, indexed file-backed Fluree ready for hot-cache
-/// query benchmarking. The caller keeps the returned `(TempDir, Fluree)`
-/// alive for the duration of the bench (the snapshot loaded from
-/// `fluree` borrows from it).
-async fn setup_indexed(n_products: usize) -> (tempfile::TempDir, Fluree) {
+/// query benchmarking. The caller keeps the returned `(TempDir, Fluree,
+/// alias)` alive for the duration of the bench (the snapshot loaded
+/// from `fluree` borrows from it; the alias is the ledger ID used for
+/// `graph(...)` lookup).
+async fn setup_indexed(n_products: usize) -> (tempfile::TempDir, Fluree, String) {
     let db_dir = tempfile::tempdir().expect("db tmpdir");
     let fluree = FlureeBuilder::file(db_dir.path().to_string_lossy().to_string())
         .build()
         .expect("build file-backed Fluree");
 
+    let alias = next_ledger_alias("query-hot-bsbm");
     let ledger = fluree
-        .create_ledger(LEDGER_ID)
+        .create_ledger(&alias)
         .await
         .expect("create_ledger");
 
@@ -138,11 +138,11 @@ async fn setup_indexed(n_products: usize) -> (tempfile::TempDir, Fluree) {
     // Reindex puts the data behind the binary columnar index so the
     // measured queries traverse the production hot path.
     let _ = fluree
-        .reindex(LEDGER_ID, ReindexOptions::default())
+        .reindex(&alias, ReindexOptions::default())
         .await
         .expect("reindex");
 
-    (db_dir, fluree)
+    (db_dir, fluree, alias)
 }
 
 fn bench_query_hot_bsbm(c: &mut Criterion) {
@@ -161,8 +161,8 @@ fn bench_query_hot_bsbm(c: &mut Criterion) {
     // Setup once per scale. `_db_dir` and `fluree` are held in scope so
     // `snapshot` (which borrows from `fluree`) stays valid for the
     // duration of the bench group.
-    let (_db_dir, fluree) = rt.block_on(setup_indexed(n_products));
-    let snapshot = rt.block_on(async { fluree.graph(LEDGER_ID).load().await.expect("graph load") });
+    let (_db_dir, fluree, alias) = rt.block_on(setup_indexed(n_products));
+    let snapshot = rt.block_on(async { fluree.graph(&alias).load().await.expect("graph load") });
 
     let mut group = c.benchmark_group("query_hot_bsbm");
     group.sample_size(profile.sample_size());

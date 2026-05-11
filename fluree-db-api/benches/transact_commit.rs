@@ -88,8 +88,6 @@ fn bench_transact_commit(c: &mut Criterion) {
     let profile = current_profile();
     let (base_nodes, commit_nodes) = scale_inputs(scale);
 
-    let fluree = FlureeBuilder::memory().build_memory();
-
     // Plenty of headroom; we don't want to trigger reindex during the bench.
     let index_config = IndexConfig {
         reindex_min_bytes: 500_000_000,
@@ -106,20 +104,28 @@ fn bench_transact_commit(c: &mut Criterion) {
     group.sampling_mode(criterion::SamplingMode::Flat);
 
     // --- Scenario 1: fresh ledger (no base load, just commit) ---
+    //
+    // Fluree handle is constructed *inside* iter_batched setup so each
+    // iteration starts with a clean in-memory state. Sharing one Fluree
+    // across all iterations of a `Full`-profile run lets created-ledger
+    // count accumulate (one per iteration ~30 iterations × 2 scenarios)
+    // and could skew later samples through allocator behavior.
     group.bench_with_input(
         BenchmarkId::new("fresh_ledger", scale.as_str()),
         &commit_nodes,
         |b, _| {
             b.iter_batched(
-                // Setup: fresh ledger. NOT measured.
+                // Setup: fresh Fluree + fresh ledger. NOT measured.
                 || {
                     rt.block_on(async {
+                        let fluree = FlureeBuilder::memory().build_memory();
                         let alias = next_ledger_alias("tc-fresh");
-                        fluree.create_ledger(&alias).await.unwrap()
+                        let ledger = fluree.create_ledger(&alias).await.unwrap();
+                        (fluree, ledger)
                     })
                 },
                 // Measured: one commit.
-                |ledger| {
+                |(fluree, ledger)| {
                     rt.block_on(async {
                         let result = fluree
                             .insert_turtle_with_opts(
@@ -146,9 +152,11 @@ fn bench_transact_commit(c: &mut Criterion) {
             &(base_nodes, commit_nodes),
             |b, _| {
                 b.iter_batched(
-                    // Setup: fresh ledger + base load. NOT measured.
+                    // Setup: fresh Fluree + fresh ledger + base load.
+                    // NOT measured.
                     || {
                         rt.block_on(async {
+                            let fluree = FlureeBuilder::memory().build_memory();
                             let alias = next_ledger_alias("tc-pop");
                             let mut ledger = fluree.create_ledger(&alias).await.unwrap();
                             for ttl in &base_turtles {
@@ -164,11 +172,11 @@ fn bench_transact_commit(c: &mut Criterion) {
                                     .unwrap();
                                 ledger = r.ledger;
                             }
-                            ledger
+                            (fluree, ledger)
                         })
                     },
                     // Measured: one commit on top of `base_nodes` of history.
-                    |ledger| {
+                    |(fluree, ledger)| {
                         rt.block_on(async {
                             let result = fluree
                                 .insert_turtle_with_opts(

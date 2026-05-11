@@ -142,8 +142,6 @@ fn bench_main(c: &mut Criterion) {
     //         SummaryRow::new("scenario_a").add("ms", 1.2).add("rows/s", 100.0),
     //         SummaryRow::new("scenario_b").add("ms", 1.4).add("rows/s",  90.0),
     //     ]);
-
-    let _ = profile; // silence unused-binding warning in the template
 }
 
 /// Placeholder workload. Delete this and replace the call in `b.iter(...)`

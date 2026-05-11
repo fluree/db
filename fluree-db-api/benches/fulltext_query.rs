@@ -29,12 +29,11 @@
 
 use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
 use fluree_bench_support::gen::corpora::random_paragraph;
-use fluree_bench_support::init_tracing_for_bench;
+use fluree_bench_support::{bench_runtime, current_profile, init_tracing_for_bench};
 use fluree_db_api::admin::ReindexOptions;
 use fluree_db_api::{CommitOpts, FlureeBuilder, IndexConfig, TxnOpts};
 use rand::prelude::*;
 use serde_json::{json, Value as JsonValue};
-use tokio::runtime::Runtime;
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -207,9 +206,9 @@ async fn setup_dataset_indexed(
 
 fn bench_fulltext_scan_all(c: &mut Criterion) {
     init_tracing_for_bench();
-    let rt = Runtime::new().unwrap();
+    let rt = bench_runtime();
     let mut group = c.benchmark_group("fulltext_scan_all");
-    group.sample_size(10);
+    group.sample_size(current_profile().sample_size());
 
     for &n in dataset_sizes() {
         eprintln!("  [setup] Inserting {n} @fulltext docs...");
@@ -231,9 +230,9 @@ fn bench_fulltext_scan_all(c: &mut Criterion) {
 
 fn bench_fulltext_scan_all_indexed(c: &mut Criterion) {
     init_tracing_for_bench();
-    let rt = Runtime::new().unwrap();
+    let rt = bench_runtime();
     let mut group = c.benchmark_group("fulltext_scan_all_indexed");
-    group.sample_size(10);
+    group.sample_size(current_profile().sample_size());
 
     for &n in dataset_sizes() {
         eprintln!("  [setup] Inserting {n} @fulltext docs + building index...");
@@ -256,9 +255,9 @@ fn bench_fulltext_scan_all_indexed(c: &mut Criterion) {
 
 fn bench_fulltext_scan_filtered(c: &mut Criterion) {
     init_tracing_for_bench();
-    let rt = Runtime::new().unwrap();
+    let rt = bench_runtime();
     let mut group = c.benchmark_group("fulltext_scan_filtered");
-    group.sample_size(10);
+    group.sample_size(current_profile().sample_size());
 
     for &n in dataset_sizes() {
         eprintln!("  [setup] Inserting {n} @fulltext docs...");
@@ -292,9 +291,9 @@ fn bench_fulltext_scan_filtered(c: &mut Criterion) {
 
 fn bench_fulltext_scan_filtered_indexed(c: &mut Criterion) {
     init_tracing_for_bench();
-    let rt = Runtime::new().unwrap();
+    let rt = bench_runtime();
     let mut group = c.benchmark_group("fulltext_scan_filtered_indexed");
-    group.sample_size(10);
+    group.sample_size(current_profile().sample_size());
 
     for &n in dataset_sizes() {
         eprintln!("  [setup] Inserting {n} @fulltext docs + building index...");

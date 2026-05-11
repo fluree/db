@@ -33,12 +33,12 @@
 use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion};
 use fluree_bench_support::gen::people::{generate_txn_data, txn_data_to_turtle};
 use fluree_bench_support::{
-    bench_runtime, current_profile, current_scale, init_tracing_for_bench, BenchScale,
+    bench_runtime, current_profile, current_scale, init_tracing_for_bench, next_ledger_alias,
+    BenchScale,
 };
 use fluree_db_api::admin::{ReindexOptions, TriggerIndexOptions};
 use fluree_db_api::{CommitOpts, Fluree, FlureeBuilder, IndexConfig, LedgerState, TxnOpts};
 
-const LEDGER_ID: &str = "bench/reindex-incremental:main";
 const DELTA_NODES_PER_COMMIT: usize = 10;
 
 fn scale_inputs(scale: BenchScale) -> (usize, usize) {
@@ -107,8 +107,9 @@ fn bench_reindex_incremental(c: &mut Criterion) {
                                 .build()
                                 .expect("build file-backed Fluree");
 
+                        let alias = next_ledger_alias("reindex-incremental");
                         let mut ledger = fluree
-                            .create_ledger(LEDGER_ID)
+                            .create_ledger(&alias)
                             .await
                             .expect("create_ledger");
 
@@ -122,7 +123,7 @@ fn bench_reindex_incremental(c: &mut Criterion) {
                         // simplest way to put the ledger into an
                         // "indexed" state from the public API.
                         let _ = fluree
-                            .reindex(LEDGER_ID, ReindexOptions::default())
+                            .reindex(&alias, ReindexOptions::default())
                             .await
                             .expect("baseline reindex");
 
@@ -134,7 +135,7 @@ fn bench_reindex_incremental(c: &mut Criterion) {
                         // index head, then apply `delta` commits above
                         // it. The next trigger_index will be incremental.
                         let mut ledger = fluree
-                            .ledger(LEDGER_ID)
+                            .ledger(&alias)
                             .await
                             .expect("reload after baseline reindex");
                         for i in 0..delta {
@@ -147,15 +148,15 @@ fn bench_reindex_incremental(c: &mut Criterion) {
                             ledger = insert_commit(&fluree, ledger, &txn).await;
                         }
 
-                        (db_dir, fluree)
+                        (db_dir, fluree, alias)
                     })
                 },
                 // Measured: trigger_index drives the orchestrator's
                 // incremental path against the novelty above the index.
-                |(_db_dir, fluree)| {
+                |(_db_dir, fluree, alias)| {
                     rt.block_on(async {
                         let result = fluree
-                            .trigger_index(LEDGER_ID, TriggerIndexOptions::default())
+                            .trigger_index(&alias, TriggerIndexOptions::default())
                             .await
                             .expect("trigger_index");
                         black_box(result);

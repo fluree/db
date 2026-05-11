@@ -25,9 +25,6 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
 
-# Lockfile-driven hashing for deterministic fixtures.
-sha2 = { workspace = true }
-
 [dev-dependencies]
 # Bench helpers are themselves trivially testable; small criterion dep is OK
 # but we keep the surface tiny so this crate doesn't pull criterion into

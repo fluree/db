@@ -49,10 +49,17 @@ pub enum BenchProfile {
 
 impl BenchProfile {
     /// Suggested criterion `sample_size`. Benches may override.
+    ///
+    /// `Quick` (PR-gated) keeps the sample tight (10) so the gate stays
+    /// under its wall-clock budget; `Full` uses criterion's default
+    /// (100) for a wider distribution suitable for the nightly. Both
+    /// are starting points — once `bench-nightly` lands and we have
+    /// flap data from real CI runs, we may need to bump `Full` higher
+    /// (200+) to bring noise within the regression-budget thresholds.
     pub fn sample_size(self) -> usize {
         match self {
             BenchProfile::Quick => 10,
-            BenchProfile::Full => 30,
+            BenchProfile::Full => 100,
         }
     }
 

@@ -145,23 +145,12 @@ pub fn check(
     }
 }
 
-/// Reconcile the workspace's declared `[[bench]]` entries with the budget
-/// file. Today this is a stub that always returns `Ok(())`; it lands in
-/// bench-5 once the CI gate is wired up.
-///
-/// The intended behavior:
-/// - Walk every `<crate>/Cargo.toml` for `[[bench]]` entries.
-/// - For each `(crate, bench)` pair, confirm the budget JSON contains at
-///   least one scale entry (or fall back to the default).
-/// - For each `(crate, bench)` in the budget JSON, confirm a matching
-///   `[[bench]]` entry exists. Stale budget entries fail the gate to keep
-///   the file from rotting.
-pub fn validate_against_workspace() -> Result<(), Vec<String>> {
-    // TODO(bench-5): implement the cargo-toml walk + reconcile. For now the
-    // chassis intentionally accepts any budget shape so it doesn't block the
-    // first set of benches from landing.
-    Ok(())
-}
+// Note: workspace reconciliation (bench Cargo.toml entries ↔
+// regression-budget.json) is implemented as the
+// `workspace_reconcile` integration test
+// (`fluree-bench-support/tests/workspace_reconcile.rs`) and invoked by
+// the `bench-gate` CI job. There is intentionally no library-level
+// `validate_against_workspace()` function — the test is the contract.
 
 #[derive(Debug, thiserror::Error)]
 pub enum BudgetError {

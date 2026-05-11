@@ -32,11 +32,11 @@
 use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion};
 use fluree_bench_support::gen::people::{generate_txn_data, txn_data_to_turtle};
 use fluree_bench_support::{
-    bench_runtime, current_profile, current_scale, init_tracing_for_bench, BenchScale,
+    bench_runtime, current_profile, current_scale, init_tracing_for_bench, next_ledger_alias,
+    BenchScale,
 };
 use fluree_db_api::{CommitOpts, FlureeBuilder, IndexConfig, TxnOpts};
 
-const LEDGER_ID: &str = "bench/novelty-replay:main";
 const NODES_PER_COMMIT: usize = 10;
 
 fn scale_commit_count(scale: BenchScale) -> usize {
@@ -52,13 +52,13 @@ fn scale_commit_count(scale: BenchScale) -> usize {
 /// **disabled**, insert `commit_count` small commits, then drop the
 /// handle. The disk now has a long commit chain with no index above it;
 /// the next open will cold-load via novelty replay.
-async fn populate(db_dir: &std::path::Path, commit_count: usize) {
+async fn populate(db_dir: &std::path::Path, alias: &str, commit_count: usize) {
     let fluree = FlureeBuilder::file(db_dir.to_string_lossy().to_string())
         .without_indexing()
         .build()
         .expect("build file-backed Fluree (populate)");
     let mut ledger = fluree
-        .create_ledger(LEDGER_ID)
+        .create_ledger(alias)
         .await
         .expect("create_ledger");
     let index_config = IndexConfig {
@@ -112,20 +112,21 @@ fn bench_novelty_replay(c: &mut Criterion) {
                 || {
                     rt.block_on(async {
                         let db_dir = tempfile::tempdir().expect("db tmpdir");
-                        populate(db_dir.path(), n).await;
-                        db_dir
+                        let alias = next_ledger_alias("novelty-replay");
+                        populate(db_dir.path(), &alias, n).await;
+                        (db_dir, alias)
                     })
                 },
                 // Measured: cold open + load. Without indexing, the
                 // load path goes entirely through novelty replay.
-                |db_dir| {
+                |(db_dir, alias)| {
                     rt.block_on(async {
                         let fluree =
                             FlureeBuilder::file(db_dir.path().to_string_lossy().to_string())
                                 .without_indexing()
                                 .build()
                                 .expect("build file-backed Fluree (cold)");
-                        let snapshot = fluree.graph(LEDGER_ID).load().await.expect("cold load");
+                        let snapshot = fluree.graph(&alias).load().await.expect("cold load");
                         black_box(snapshot);
                     });
                 },

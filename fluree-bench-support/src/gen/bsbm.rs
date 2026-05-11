@@ -121,9 +121,9 @@ pub fn generate_dataset(n_products: usize) -> BsbmData {
 
     let products: Vec<Product> = (0..n_products)
         .map(|i| {
-            // Deterministic price in [10.00, 510.00] cents (i.e., $0.10
-            // to $5.10) — small range so rangescan benches see meaningful
-            // selectivity across the product set.
+            // Deterministic price in 1000–50999 cents (i.e., $10.00 to
+            // $509.99) — wide enough range that range-filter benches see
+            // meaningful selectivity across the product set.
             let price_cents = 1_000 + ((i * 37) % 50_000) as u32;
             Product {
                 id: format!("ex:product-{i:06}"),

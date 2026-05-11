@@ -116,7 +116,10 @@ jobs:
     # Wall-clock budget: ~5–8 min on `ubuntu-latest` after rust-cache
     # warms up, ~12–15 min cold. The smoke run uses the `tiny` scale
     # (smallest input curve per bench) so the gate stays affordable.
+    # `timeout-minutes` caps the whole job so a hung bench fails fast
+    # instead of tying up the runner queue.
     runs-on: ubuntu-latest
+    timeout-minutes: 25
     env:
       FLUREE_BENCH_PROFILE: quick
       FLUREE_BENCH_SCALE: tiny
