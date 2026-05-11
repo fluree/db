@@ -139,9 +139,7 @@ impl Expression {
     ) -> Result<Option<ComparableValue>> {
         match self {
             Expression::Var(var) => match row.get(*var) {
-                Some(Binding::Lit { val, dtc, .. }) => {
-                    Ok(comparable_from_lit(val, dtc.datatype()))
-                }
+                Some(Binding::Lit { val, dtc, .. }) => Ok(comparable_from_lit(val, dtc.datatype())),
                 Some(Binding::EncodedLit {
                     o_kind,
                     o_key,

@@ -397,10 +397,13 @@ async fn sparql_basic_query_outputs_jsonld_and_sparql_json() {
     let sparql_json = result
         .to_sparql_json(&ledger.snapshot)
         .expect("to_sparql_json");
+    // Var order tracks the SELECT clause (`SELECT ?person ?fullName`) — the
+    // formatter no longer lex-sorts headers (matches W3C `agg02` semantics
+    // and user expectations of round-tripping their written column order).
     assert_eq!(
         sparql_json,
         json!({
-            "head": {"vars": ["fullName", "person"]},
+            "head": {"vars": ["person", "fullName"]},
             "results": {"bindings": [
                 {
                     "person": {"type": "uri", "value": "ex:jdoe"},

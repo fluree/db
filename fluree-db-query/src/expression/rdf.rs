@@ -226,21 +226,21 @@ fn walk_input_tier<R: RowAccess>(
             _ => None,
         },
         Expression::Const(fv) => Some(tier_from_filter_value(fv)),
-        Expression::Call { func, args } => match func {
-            Function::Add | Function::Sub | Function::Mul | Function::Div => {
-                let mut acc: Option<NumericResultTier> = None;
-                for arg in args {
-                    if let Some(t) = walk_input_tier(arg, row, ctx) {
-                        acc = Some(match acc {
-                            Some(prev) => prev.widen(t),
-                            None => t,
-                        });
-                    }
+        Expression::Call {
+            func: Function::Add | Function::Sub | Function::Mul | Function::Div,
+            args,
+        } => {
+            let mut acc: Option<NumericResultTier> = None;
+            for arg in args {
+                if let Some(t) = walk_input_tier(arg, row, ctx) {
+                    acc = Some(match acc {
+                        Some(prev) => prev.widen(t),
+                        None => t,
+                    });
                 }
-                acc
             }
-            _ => None,
-        },
+            acc
+        }
         _ => None,
     }
 }
