@@ -291,9 +291,11 @@ pub enum Commands {
         action: BranchAction,
     },
 
-    /// Drop (delete) a ledger
+    /// Drop (delete) a ledger or graph source
     Drop {
-        /// Ledger name to drop
+        /// Ledger or graph source name to drop. The server resolves as a ledger
+        /// first, then as a graph source — `fluree iceberg drop` is the
+        /// explicit graph-source variant.
         name: String,
 
         /// Required flag to confirm deletion
