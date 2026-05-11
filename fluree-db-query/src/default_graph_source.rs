@@ -1,0 +1,331 @@
+//! Default-graph-source operator — iterate the dataset's default graph
+//! sources and run an inner subplan once per source.
+//!
+//! This is a planner-internal construct. The
+//! `expand_edge_annotation_patterns` pass synthesizes
+//! [`Pattern::DefaultGraphSource`] around each expanded edge-annotation
+//! triple chain so that under multi-source default-graph queries
+//! (`from: [g1, g2]`), each source's base edge correlates only with
+//! its own annotation flakes — without this wrapper the f:reifies*
+//! lookups fan across all sources via `DatasetOperator` and produce
+//! an N×M cross-product against each base-edge match.
+//!
+//! Distinct from [`crate::graph::GraphOperator`]:
+//! - `GraphOperator` implements SPARQL `GRAPH ?g { ... }` semantics —
+//!   it iterates **named** graphs only.
+//! - This operator iterates **default** graphs (`from: [...]`
+//!   sources) and binds an internal variable to each source's
+//!   identifier per iteration.
+//!
+//! In single-source default-graph mode the operator runs the inner
+//! subplan exactly once with the single graph as scope — equivalent
+//! to no wrapper at all. The cost of always wrapping is therefore
+//! one extra `with_graph_ref` call per parent row in that case.
+
+use crate::binding::{Batch, Binding};
+use crate::context::ExecutionContext;
+use crate::context::WellKnownDatatypes;
+use crate::error::Result;
+use crate::execute::build_where_operators_seeded;
+use crate::ir::Pattern;
+use crate::operator::{BoxedOperator, Operator, OperatorState};
+use crate::seed::SeedOperator;
+use crate::temporal_mode::PlanningContext;
+use crate::var_registry::VarId;
+use async_trait::async_trait;
+use fluree_db_core::DatatypeConstraint;
+use fluree_db_core::FlakeValue;
+use std::sync::Arc;
+
+pub struct DefaultGraphSourceOperator {
+    child: BoxedOperator,
+    /// Internal variable bound to each source IRI per iteration.
+    graph_var: VarId,
+    inner_patterns: Vec<Pattern>,
+    well_known: WellKnownDatatypes,
+    schema: Arc<[VarId]>,
+    state: OperatorState,
+    result_buffer: Vec<Vec<Binding>>,
+    buffer_pos: usize,
+    planning: PlanningContext,
+}
+
+impl DefaultGraphSourceOperator {
+    pub fn new(
+        child: BoxedOperator,
+        graph_var: VarId,
+        inner_patterns: Vec<Pattern>,
+        planning: PlanningContext,
+    ) -> Self {
+        let parent_schema: std::collections::HashSet<VarId> =
+            child.schema().iter().copied().collect();
+
+        let mut inner_vars: std::collections::HashSet<VarId> = std::collections::HashSet::new();
+        for p in &inner_patterns {
+            inner_vars.extend(p.produced_vars());
+        }
+        // The graph var is bound by this operator, so include it in
+        // the schema even if no inner pattern produces it.
+        inner_vars.insert(graph_var);
+
+        let new_vars: Vec<VarId> = inner_vars
+            .iter()
+            .copied()
+            .filter(|v| !parent_schema.contains(v))
+            .collect();
+
+        let mut schema_vec: Vec<VarId> = child.schema().to_vec();
+        schema_vec.extend(&new_vars);
+        let schema = Arc::from(schema_vec.into_boxed_slice());
+
+        Self {
+            child,
+            graph_var,
+            inner_patterns,
+            well_known: WellKnownDatatypes::new(),
+            schema,
+            state: OperatorState::Created,
+            result_buffer: Vec::new(),
+            buffer_pos: 0,
+            planning,
+        }
+    }
+
+    /// Run the inner subplan against a single source graph and merge
+    /// each output row with the parent row, binding `graph_var` to the
+    /// source identifier.
+    async fn execute_in_source(
+        &mut self,
+        parent_ctx: &ExecutionContext<'_>,
+        graph: &crate::dataset::GraphRef<'_>,
+        parent_batch: &Batch,
+        row_idx: usize,
+    ) -> Result<()> {
+        let source_id: Arc<str> = Arc::clone(&graph.ledger_id);
+        let per_graph_ctx = parent_ctx.with_graph_ref(graph);
+
+        let seed = SeedOperator::from_batch_row(parent_batch, row_idx);
+        let mut inner = build_where_operators_seeded(
+            Some(Box::new(seed)),
+            &self.inner_patterns,
+            None,
+            None,
+            &self.planning,
+        )?;
+
+        inner.open(&per_graph_ctx).await?;
+
+        while let Some(batch) = inner.next_batch(&per_graph_ctx).await? {
+            for inner_row_idx in 0..batch.len() {
+                let mut merged_row: Vec<Binding> = Vec::with_capacity(self.schema.len());
+
+                for var in self.child.schema() {
+                    let binding = parent_batch
+                        .get(row_idx, *var)
+                        .cloned()
+                        .unwrap_or(Binding::Unbound);
+                    merged_row.push(binding);
+                }
+
+                let parent_len = self.child.schema().len();
+                for (_i, var) in self.schema.iter().enumerate().skip(parent_len) {
+                    if *var == self.graph_var {
+                        merged_row.push(Binding::Lit {
+                            val: FlakeValue::String(source_id.to_string()),
+                            dtc: DatatypeConstraint::Explicit(self.well_known.xsd_string.clone()),
+                            t: None,
+                            op: None,
+                            p_id: None,
+                        });
+                    } else {
+                        let binding = batch
+                            .get(inner_row_idx, *var)
+                            .cloned()
+                            .unwrap_or(Binding::Unbound);
+                        merged_row.push(binding);
+                    }
+                }
+
+                self.result_buffer.push(merged_row);
+            }
+        }
+
+        inner.close();
+        Ok(())
+    }
+
+    fn drain_buffer(&mut self) -> Result<Option<Batch>> {
+        if self.buffer_pos >= self.result_buffer.len() {
+            return Ok(None);
+        }
+
+        let num_cols = self.schema.len();
+        let mut columns: Vec<Vec<Binding>> = (0..num_cols).map(|_| Vec::new()).collect();
+
+        for row in &self.result_buffer[self.buffer_pos..] {
+            for (col_idx, binding) in row.iter().enumerate() {
+                if col_idx < columns.len() {
+                    columns[col_idx].push(binding.clone());
+                }
+            }
+        }
+
+        self.buffer_pos = self.result_buffer.len();
+
+        if columns.is_empty() || columns[0].is_empty() {
+            Ok(None)
+        } else {
+            Ok(Some(Batch::new(self.schema.clone(), columns)?))
+        }
+    }
+}
+
+#[async_trait]
+impl Operator for DefaultGraphSourceOperator {
+    fn schema(&self) -> &[VarId] {
+        &self.schema
+    }
+
+    async fn open(&mut self, ctx: &ExecutionContext<'_>) -> Result<()> {
+        self.child.open(ctx).await?;
+        self.state = OperatorState::Open;
+        self.result_buffer.clear();
+        self.buffer_pos = 0;
+        Ok(())
+    }
+
+    async fn next_batch(&mut self, ctx: &ExecutionContext<'_>) -> Result<Option<Batch>> {
+        if self.state != OperatorState::Open {
+            return Ok(None);
+        }
+
+        if self.buffer_pos < self.result_buffer.len() {
+            return self.drain_buffer();
+        }
+
+        loop {
+            let parent_batch = match self.child.next_batch(ctx).await? {
+                Some(b) if !b.is_empty() => b,
+                Some(_) => continue,
+                None => {
+                    self.state = OperatorState::Exhausted;
+                    return Ok(None);
+                }
+            };
+
+            self.result_buffer.clear();
+            self.buffer_pos = 0;
+
+            // Iterate the dataset's default graphs. When no dataset
+            // is attached (single-db mode), the inner subplan runs
+            // once against the existing context — the wrapper is a
+            // no-op for the single-graph path and the graph var
+            // binds to the active snapshot's ledger id.
+            for row_idx in 0..parent_batch.len() {
+                if let Some(ds) = ctx.dataset {
+                    // Iterate by index so the borrow of `ds` is
+                    // re-acquired per iteration, freeing the borrow
+                    // checker to let `execute_in_source` take `&mut
+                    // self` between iterations. GraphRef isn't Clone
+                    // (it carries borrowed snapshot references), so
+                    // we can't materialize the slice into an owned
+                    // Vec.
+                    let n = ds.default_graphs().len();
+                    for gi in 0..n {
+                        let graph = &ds.default_graphs()[gi];
+                        self.execute_in_source(ctx, graph, &parent_batch, row_idx)
+                            .await?;
+                    }
+                } else {
+                    // Single-db mode: synthesize a GraphRef from the
+                    // active snapshot so the inner subplan runs in
+                    // the same scope it would have without the wrap.
+                    let alias: Arc<str> = Arc::from(ctx.active_snapshot.ledger_id.as_str());
+                    // No dataset to pull a GraphRef from — execute
+                    // inner directly against the parent context and
+                    // bind the graph var to the snapshot alias.
+                    self.execute_in_default_singleton(ctx, &parent_batch, row_idx, alias)
+                        .await?;
+                }
+            }
+
+            if !self.result_buffer.is_empty() {
+                return self.drain_buffer();
+            }
+        }
+    }
+
+    fn close(&mut self) {
+        self.child.close();
+        self.result_buffer.clear();
+        self.state = OperatorState::Closed;
+    }
+
+    fn estimated_rows(&self) -> Option<usize> {
+        None
+    }
+}
+
+impl DefaultGraphSourceOperator {
+    /// Single-db fallback: no dataset means there's nothing to
+    /// iterate; run the inner subplan once against the parent
+    /// context and bind the graph var to the active snapshot's
+    /// alias. Mirrors what `GraphOperator` does for `?g unbound`
+    /// without a dataset.
+    async fn execute_in_default_singleton(
+        &mut self,
+        parent_ctx: &ExecutionContext<'_>,
+        parent_batch: &Batch,
+        row_idx: usize,
+        alias_iri: Arc<str>,
+    ) -> Result<()> {
+        let seed = SeedOperator::from_batch_row(parent_batch, row_idx);
+        let mut inner = build_where_operators_seeded(
+            Some(Box::new(seed)),
+            &self.inner_patterns,
+            None,
+            None,
+            &self.planning,
+        )?;
+
+        inner.open(parent_ctx).await?;
+
+        while let Some(batch) = inner.next_batch(parent_ctx).await? {
+            for inner_row_idx in 0..batch.len() {
+                let mut merged_row: Vec<Binding> = Vec::with_capacity(self.schema.len());
+
+                for var in self.child.schema() {
+                    let binding = parent_batch
+                        .get(row_idx, *var)
+                        .cloned()
+                        .unwrap_or(Binding::Unbound);
+                    merged_row.push(binding);
+                }
+
+                let parent_len = self.child.schema().len();
+                for (_i, var) in self.schema.iter().enumerate().skip(parent_len) {
+                    if *var == self.graph_var {
+                        merged_row.push(Binding::Lit {
+                            val: FlakeValue::String(alias_iri.to_string()),
+                            dtc: DatatypeConstraint::Explicit(self.well_known.xsd_string.clone()),
+                            t: None,
+                            op: None,
+                            p_id: None,
+                        });
+                    } else {
+                        let binding = batch
+                            .get(inner_row_idx, *var)
+                            .cloned()
+                            .unwrap_or(Binding::Unbound);
+                        merged_row.push(binding);
+                    }
+                }
+
+                self.result_buffer.push(merged_row);
+            }
+        }
+
+        inner.close();
+        Ok(())
+    }
+}

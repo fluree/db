@@ -333,30 +333,25 @@ correctness items remaining):**
   base-edge graph and the annotation graph aren't correlated through
   the `?ann` join key.
 
-  Pinning test:
-  `it_edge_annotations::cross_graph_misjoin_in_multi_source_default_known_limitation`
-  (asserts the current 4-row output for a 2-graph + 1-edge-each
-  scenario). When the architectural fix lands, this test flips to
-  asserting 2 rows. Workaround coverage:
-  `graph_wrapped_query_correctly_pairs_annotations_per_graph` shows
-  the GRAPH-scoped form returns the correct 1 row per graph.
+  ✅ **Fixed** by `feat: per-source correlation for edge-annotation
+  expansion`. The expansion now wraps each `EdgeAnnotation` /
+  `AnnotationTarget` triple chain in a planner-internal
+  `Pattern::DefaultGraphSource { graph, patterns }` IR variant.
+  `DefaultGraphSourceOperator` iterates the dataset's
+  `default_graphs()` and runs the inner subplan once per source via
+  `with_graph_ref`, binding the internal graph variable to the
+  source identifier per iteration. The wrapper is suppressed when
+  the expansion runs inside an explicit `Pattern::Graph` (the user
+  wrapper already provides per-graph correlation). In single-source
+  default-graph mode the wrapper runs the inner subplan exactly
+  once — equivalent to no wrapper.
 
-  **Fix path** (own slice, not in this changeset):
-  - **Preferred — custom operator**. An `EdgeAnnotation` /
-    `AnnotationTarget` operator that carries source-graph identity
-    through the join. Same vehicle handles per-language
-    disambiguation. Touches the planner + scan dispatch + dataset
-    fanout.
-  - **Alternative — graph-aware expansion rewrite**. At expansion
-    time, when context indicates a multi-source dataset, wrap the
-    expansion in a synthetic `Pattern::Graph { graph: ?fresh }` so
-    each iteration scopes per-graph. Pure IR rewrite but needs
-    dataset-shape plumbing into `build_where_plan` and only handles
-    named-graph cases (default-graph wrap excludes default data).
-
-  See the comment block on `expand_edge_annotation_patterns` in
-  `fluree-db-query/src/execute/where_plan.rs` for the in-code
-  contract.
+  Tests:
+  `multi_source_default_pairs_annotations_per_source_graph`
+  (formerly `cross_graph_misjoin_in_multi_source_default_known_limitation`)
+  asserts the correct N+M row count for the 2-graph + 1-edge-each
+  scenario. `graph_wrapped_query_correctly_pairs_annotations_per_graph`
+  continues to pin the GRAPH-scoped form.
 - ⏳ **Per-language disambiguation.** Same architectural shape as the
   graph-bound bug above: `f:reifiesLang` is emitted by the write side
   but not constrained in the read-side expansion, so cross-language

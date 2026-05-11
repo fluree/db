@@ -333,6 +333,29 @@ pub enum Pattern {
     /// - If `silent` is true, service errors produce empty results
     Service(ServicePattern),
 
+    /// Internal — iterate the dataset's *default* graph sources and run
+    /// `patterns` once per source, binding `graph` to the source's IRI
+    /// for each iteration.
+    ///
+    /// Distinct from [`Pattern::Graph`], which iterates **named**
+    /// graphs (SPARQL `GRAPH ?g { ... }`). This variant exists to let
+    /// the edge-annotation expansion correlate its triple chain with
+    /// a single source under multi-source default-graph queries
+    /// (`from: [g1, g2]`); without it the f:reifies* lookups fan
+    /// across all sources and produce an N×M cross-product against
+    /// each base-edge match.
+    ///
+    /// `graph` is a planner-minted internal variable that is not
+    /// projected to user output. Synthesis happens in
+    /// `expand_edge_annotation_patterns`; users cannot author this
+    /// variant directly.
+    DefaultGraphSource {
+        /// Internal variable bound to each source IRI per iteration.
+        graph: VarId,
+        /// Patterns to execute once per default graph source.
+        patterns: Vec<Pattern>,
+    },
+
     /// Edge-rooted annotation pattern.
     ///
     /// Lowered from JSON-LD `@annotation` (or its `@edge` alias) blocks
@@ -440,6 +463,10 @@ impl Pattern {
                 edge,
                 body: f(body),
             },
+            Pattern::DefaultGraphSource { graph, patterns } => Pattern::DefaultGraphSource {
+                graph,
+                patterns: f(patterns),
+            },
             other => other,
         }
     }
@@ -512,6 +539,12 @@ impl Pattern {
                 vars.extend(body.iter().flat_map(Pattern::referenced_vars));
                 vars
             }
+            Pattern::DefaultGraphSource { graph, patterns } => {
+                let mut vars: Vec<VarId> =
+                    patterns.iter().flat_map(Pattern::referenced_vars).collect();
+                vars.push(*graph);
+                vars
+            }
         }
     }
 
@@ -567,6 +600,15 @@ impl Pattern {
                 vars.extend(body.iter().flat_map(Pattern::produced_vars));
                 vars
             }
+            // The graph var is bound *by* the operator, not produced
+            // by the inner subplan. Inner produced vars surface to
+            // the outer schema so downstream joins still see them.
+            Pattern::DefaultGraphSource { graph, patterns } => {
+                let mut vars: Vec<VarId> =
+                    patterns.iter().flat_map(Pattern::produced_vars).collect();
+                vars.push(*graph);
+                vars
+            }
         }
     }
 
@@ -588,6 +630,9 @@ impl Pattern {
             Pattern::Subquery(sq) => sq.patterns.iter().any(|p| p.contains_function(target)),
             Pattern::EdgeAnnotation { body, .. } | Pattern::AnnotationTarget { body, .. } => {
                 body.iter().any(|p| p.contains_function(target))
+            }
+            Pattern::DefaultGraphSource { patterns, .. } => {
+                patterns.iter().any(|p| p.contains_function(target))
             }
             // Other pattern variants cannot contain general expressions.
             _ => false,

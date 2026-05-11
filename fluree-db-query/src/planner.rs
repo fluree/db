@@ -835,6 +835,14 @@ pub fn estimate_pattern(
                 row_count: estimate_triple_row_count(edge, bound_vars, stats),
             }
         }
+
+        // DefaultGraphSource wraps an inner subplan and runs it once
+        // per default-graph source. Cost is modeled like Graph — the
+        // inner branch's cardinality, scaled implicitly by the source
+        // count at runtime.
+        Pattern::DefaultGraphSource { patterns, .. } => PatternEstimate::Source {
+            row_count: estimate_branch_cardinality(patterns, stats),
+        },
     }
 }
 
@@ -1580,7 +1588,10 @@ mod tests {
             Term::Var(VarId(1)),
         );
         let scan_est = estimate_triple_row_count(&scan, &HashSet::new(), Some(&stats));
-        assert_eq!(scan_est, 800.0, "PropertyScan should equal annotation count");
+        assert_eq!(
+            scan_est, 800.0,
+            "PropertyScan should equal annotation count"
+        );
 
         // BoundObject: `?ann f:reifiesObject <some_object>`. With per-
         // slot NDV the estimate is `800 / 200 = 4` — annotations per

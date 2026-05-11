@@ -106,7 +106,8 @@ pub fn rewrite_patterns_for_r2rml(
             | Pattern::S2Search(_)
             | Pattern::Graph { .. }
             | Pattern::EdgeAnnotation { .. }
-            | Pattern::AnnotationTarget { .. } => {
+            | Pattern::AnnotationTarget { .. }
+            | Pattern::DefaultGraphSource { .. } => {
                 result_patterns.push(pattern.clone());
             }
         }

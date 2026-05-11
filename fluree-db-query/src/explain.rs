@@ -664,6 +664,13 @@ pub fn format_general_pattern(pattern: &Pattern) -> String {
                 body.len()
             )
         }
+        Pattern::DefaultGraphSource { graph, patterns } => {
+            format!(
+                "DEFAULT-GRAPH-SOURCE ?v{} {{ {} patterns }}",
+                graph.0,
+                patterns.len()
+            )
+        }
     }
 }
 

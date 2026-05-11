@@ -114,7 +114,8 @@ impl<E: IriEncoder> LoweringContext<'_, E> {
                 | Pattern::Service(_)
                 | Pattern::R2rml(_)
                 | Pattern::GeoSearch(_)
-                | Pattern::S2Search(_) => {}
+                | Pattern::S2Search(_)
+                | Pattern::DefaultGraphSource { .. } => {}
             }
         }
     }

@@ -27,6 +27,7 @@ pub(crate) mod count_rows;
 pub mod datalog_rules;
 pub mod dataset;
 pub mod dataset_operator;
+pub mod default_graph_source;
 pub mod dict_overlay;
 pub mod distinct;
 pub mod error;

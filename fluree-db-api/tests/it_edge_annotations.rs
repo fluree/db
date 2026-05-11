@@ -2745,29 +2745,26 @@ async fn delete_by_annotation_selector_avoids_user_var_collision() {
 }
 
 #[tokio::test]
-async fn cross_graph_misjoin_in_multi_source_default_known_limitation() {
-    // Pinning test for the documented cross-graph misjoin in
-    // `expand_edge_annotation_patterns` (see comment in
-    // `fluree-db-query/src/execute/where_plan.rs`).
+async fn multi_source_default_pairs_annotations_per_source_graph() {
+    // Architectural-fix coverage: under multi-source default-graph
+    // queries (`from: [g1, g2]`), each base-edge match must pair
+    // only with annotations from the SAME source graph — N+M rows,
+    // not N×M.
     //
     // Scenario: the same `(s, p, o)` edge is asserted in two named
     // graphs (g1, g2) with two different annotations. A query
-    // unions both graphs into the default graph (`from: [g1, g2]`)
-    // and asks for the edge plus its annotation role *without* a
-    // `Pattern::Graph` wrapper. The expansion produces a
-    // `?ann`-keyed join with no graph correlation, so each base-edge
-    // match is paired with annotations from BOTH graphs — N×M
-    // cross-product instead of the correct N+M.
+    // unions both graphs into the default graph and asks for the
+    // edge plus its annotation role *without* a `Pattern::Graph`
+    // wrapper. Before the fix the expansion's f:reifies* lookups
+    // fanned across both sources via `DatasetOperator` and produced
+    // an N×M cross-product (4 rows for the 2×2 case). The fix wraps
+    // each expanded triple chain in `Pattern::DefaultGraphSource`,
+    // which iterates dataset.default_graphs() and runs the inner
+    // subplan once per source — correlating base edge with its
+    // own-source annotations only.
     //
-    // This test asserts the **current** broken row count so a future
-    // fix (custom EdgeAnnotation operator with source-graph
-    // propagation, or graph-aware expansion rewrite) flips this
-    // assertion and prompts the cleanup. It is a regression detector
-    // for the bug, not coverage of correct behavior.
-    //
-    // Workaround for users today: wrap with `GRAPH ?g { ... }` so
-    // the executor iterates one graph at a time and the expanded
-    // triples scope per iteration.
+    // The previous bug-pinning test asserted 4 rows; this is the
+    // flipped correctness test it became.
     let fluree = FlureeBuilder::memory().build_memory();
     let ledger_id = "it/edge-annotations:cross-graph-misjoin";
     let ledger0 = genesis_ledger(&fluree, ledger_id);
@@ -2826,19 +2823,34 @@ async fn cross_graph_misjoin_in_multi_source_default_known_limitation() {
     let json = result.to_jsonld(&ledger.snapshot).expect("jsonld");
     let arr = json.as_array().expect("array");
 
-    // Bug signature: each annotation appears once per graph in the
-    // dataset rather than exactly once. With two graphs we get four
-    // rows; the correct count is two. When the architectural fix
-    // lands, this assertion will fail and the fixer should:
-    //   1. Update the comment in `expand_edge_annotation_patterns`
-    //      to note the bug is closed.
-    //   2. Convert this test to assert exactly two rows
-    //      (one per graph), each with role+ann from the same graph.
+    // Correctness: exactly one row per (base-edge, own-source
+    // annotation) pair — Engineer/ex:emp/A from graph-A and
+    // Manager/ex:emp/B from graph-B, no cross-pairs.
     assert_eq!(
         arr.len(),
-        4,
-        "known-bug pinning: multi-source default-graph annotation \
-         expansion produces N×M cross-product. Got: {arr:#?}"
+        2,
+        "must produce exactly N+M rows (one per source's annotation), \
+         not the pre-fix N×M cross-product. Got: {arr:#?}"
+    );
+
+    // Verify the row content is the per-source pairing, not any
+    // accidental misjoin with the right total.
+    let pairs: std::collections::HashSet<(String, String)> = arr
+        .iter()
+        .map(|row| {
+            let row = row.as_array().expect("row");
+            let role = row[0].as_str().expect("role").to_string();
+            let ann = row[1].as_str().expect("ann").to_string();
+            (role, ann)
+        })
+        .collect();
+    assert!(
+        pairs.contains(&("Engineer".to_string(), "ex:emp/A".to_string())),
+        "missing graph-A pair (Engineer, ex:emp/A) in: {pairs:?}"
+    );
+    assert!(
+        pairs.contains(&("Manager".to_string(), "ex:emp/B".to_string())),
+        "missing graph-B pair (Manager, ex:emp/B) in: {pairs:?}"
     );
 }
 

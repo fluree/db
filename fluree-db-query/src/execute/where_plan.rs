@@ -58,18 +58,49 @@ use super::pushdown::extract_bounds_from_filters;
 /// every container pattern (`Optional`, `Union`, `Minus`, `Exists`,
 /// `NotExists`, `Graph`, `Service`, `Subquery`).
 ///
-/// Exposed at crate scope so `/explain` can run the same expansion the
-/// executor does — otherwise edge-annotation queries would surface as
-/// empty in the explain output.
+/// Each expanded triple chain is wrapped in
+/// [`Pattern::DefaultGraphSource`] so the f:reifies* lookups
+/// correlate per source under multi-source default-graph queries
+/// (`from: [g1, g2]`). The wrapper is suppressed when the expansion
+/// runs inside an explicit `Pattern::Graph` — that wrapper already
+/// scopes execution to a single graph per iteration, so the extra
+/// per-source layer would be redundant.
+///
+/// Exposed at crate scope so `/explain` can run the same expansion
+/// the executor does — otherwise edge-annotation queries would
+/// surface as empty in the explain output.
 pub fn expand_edge_annotation_patterns(patterns: &[Pattern]) -> Vec<Pattern> {
+    let mut next_var = next_synth_var_index(patterns);
     let mut out = Vec::with_capacity(patterns.len());
     for p in patterns {
-        expand_one_into(p.clone(), &mut out);
+        expand_one_into(p.clone(), &mut out, &mut next_var, false);
     }
     out
 }
 
-fn expand_one_into(pattern: Pattern, out: &mut Vec<Pattern>) {
+/// Returns the smallest `VarId` index that is unused across `patterns`
+/// (recursively). Used to mint the internal graph variable for the
+/// `DefaultGraphSource` wrapper without colliding with user-visible
+/// VarIds. The synthesized variable never appears in projection — see
+/// `DefaultGraphSourceOperator` — so a name in the registry isn't
+/// strictly required for execution, but the index must be unique to
+/// avoid corrupting unrelated bindings.
+fn next_synth_var_index(patterns: &[Pattern]) -> u16 {
+    let mut max_seen: Option<u16> = None;
+    for p in patterns {
+        for v in p.referenced_vars() {
+            max_seen = Some(max_seen.map_or(v.0, |cur| cur.max(v.0)));
+        }
+    }
+    max_seen.map_or(0, |v| v.saturating_add(1))
+}
+
+fn expand_one_into(
+    pattern: Pattern,
+    out: &mut Vec<Pattern>,
+    next_var: &mut u16,
+    inside_graph: bool,
+) {
     match pattern {
         Pattern::EdgeAnnotation {
             edge,
@@ -81,27 +112,32 @@ fn expand_one_into(pattern: Pattern, out: &mut Vec<Pattern>) {
             edge,
             body,
         } => {
+            // Build the triple chain (base edge + three f:reifies*
+            // triples + recursively expanded body) into a local
+            // vector. The whole chain then gets wrapped in
+            // `Pattern::DefaultGraphSource` so the per-source
+            // iteration correlates them; the wrapper is skipped when
+            // we're already inside an explicit `Pattern::Graph`,
+            // which provides graph correlation by construction.
+            let mut chain: Vec<Pattern> = Vec::new();
+
             // 1. Base edge triple: provides visibility for both
             //    directions. The standard scan applies snapshot rules
             //    + policy filters here, so an `AnnotationTarget`
             //    operator-style visibility check is redundant.
-            out.push(Pattern::Triple(edge.clone()));
+            chain.push(Pattern::Triple(edge.clone()));
 
             // 2. Three required `f:reifies*` lookup triples that bind
             //    the annotation to the edge.
             let ann_ref = annotation.clone();
             let id_dt = fluree_db_core::edge::id_datatype_sid();
-            // f:reifiesSubject — links annotation to the edge's
-            // subject.
-            out.push(Pattern::Triple(TriplePattern {
+            chain.push(Pattern::Triple(TriplePattern {
                 s: ann_ref.clone(),
                 p: reifies_subject_ref(),
                 o: edge.s.clone().into(),
                 dtc: Some(fluree_db_core::DatatypeConstraint::Explicit(id_dt.clone())),
             }));
-            // f:reifiesPredicate — links annotation to the edge's
-            // predicate.
-            out.push(Pattern::Triple(TriplePattern {
+            chain.push(Pattern::Triple(TriplePattern {
                 s: ann_ref.clone(),
                 p: reifies_predicate_ref(),
                 o: edge.p.clone().into(),
@@ -110,72 +146,51 @@ fn expand_one_into(pattern: Pattern, out: &mut Vec<Pattern>) {
             // f:reifiesObject — preserves the original object's
             // datatype constraint via dtc so typed-equality matches
             // round-trip.
-            out.push(Pattern::Triple(TriplePattern {
+            chain.push(Pattern::Triple(TriplePattern {
                 s: ann_ref,
                 p: reifies_object_ref(),
                 o: edge.o.clone(),
                 dtc: edge.dtc.clone(),
             }));
 
-            // f:reifiesGraph and f:reifiesLang are NOT emitted as
-            // separate constraint triples in this expansion.
-            //
-            // **Safe shapes** (correct results):
-            //
-            // 1. **Single-graph queries** (no dataset; one ledger; no
-            //    `Pattern::Graph` wrapper). All scans run against the
-            //    same `(snapshot, g_id)` so the base edge and
-            //    f:reifies* lookups can only join annotations
-            //    co-located with the edge.
-            //
-            // 2. **`Pattern::Graph`-wrapped queries**. The wrapper
-            //    iterates one named graph at a time and binds the
-            //    inner scan context per iteration, so within each
-            //    iteration the base edge and the f:reifies* lookups
-            //    are all scoped to the same graph. `map_subpatterns`
-            //    further down preserves the wrapper around the
-            //    expansion, so the bug below cannot fire under this
-            //    shape.
-            //
-            // **Unsafe shape — KNOWN BUG: cross-graph annotation
-            // misjoin under multi-source default graph.**
-            //
-            // When the dataset's default graph is the union of two or
-            // more sources (SPARQL `FROM <g1> FROM <g2>` or the
-            // JSON-LD `from: [g1, g2]` analogue), each scan operator
-            // is fanned across the sources by `DatasetOperator` and
-            // produces flakes from *all* of them concatenated. The
-            // base-edge and f:reifies* triples join on `?ann` (the
-            // annotation subject) *without* a graph correlation, so
-            // a base-edge match in g1 can pair with an annotation
-            // from g2. Concretely, `(s,p,o)` asserted in both g1 and
-            // g2 with separate annotations produces N×M cross-product
-            // rows instead of N+M correctly-attributed rows.
-            //
-            // The fix needs either a custom EdgeAnnotation operator
-            // that carries source-graph identity through the join,
-            // or a graph-aware reordering that wraps the expansion in
-            // a synthetic `Pattern::Graph` when expansion runs
-            // against a multi-source dataset (and falls back to the
-            // current shape otherwise to preserve default-graph
-            // queries on single-ledger setups). Pinning test:
-            // `it_edge_annotations::cross_graph_misjoin_in_multi_source_default_known_limitation`.
-            //
-            // **Workaround**: wrap multi-source queries in
-            // `GRAPH ?g { ... }` (SPARQL) or the JSON-LD `@graph` /
-            // dataset-named-graph access form to force per-graph
-            // iteration.
-            //
-            // **Per-language disambiguation** has the same shape:
-            // the f:reifiesObject triple's `dtc` constraint matches
-            // datatype but not language, so the same string asserted
-            // in multiple languages can produce a cross-language
-            // misjoin. Same architectural fix path.
-
             // 3. Body patterns (recursively expanded so nested
             //    annotations — though M0 rejects them — flatten too).
+            //    The body inherits this expansion's wrapper context
+            //    (already inside the chain we'll wrap below).
             for inner in body {
-                expand_one_into(inner, out);
+                expand_one_into(inner, &mut chain, next_var, true);
+            }
+
+            // f:reifiesGraph and f:reifiesLang are NOT emitted as
+            // separate constraint triples — the `DefaultGraphSource`
+            // wrapper handles per-source correlation by switching
+            // execution context to one source at a time, so the
+            // f:reifies* triples all scope to the same graph per
+            // iteration. The cross-graph misjoin (N×M cross-product
+            // under `from: [g1, g2]`) that motivated this wrapper is
+            // resolved by the per-source iteration.
+            //
+            // **Per-language disambiguation** still has the original
+            // shape: the f:reifiesObject triple's `dtc` constraint
+            // matches datatype but not language, so the same string
+            // asserted in multiple languages can produce a
+            // cross-language misjoin within a single graph. The fix
+            // would extend `dtc` (or add a separate language
+            // constraint) — out of scope for this change.
+
+            if inside_graph {
+                // Already inside a `Pattern::Graph` wrapper — the
+                // existing wrapper scopes the inner subplan to one
+                // graph per iteration, so no extra correlation
+                // layer is needed.
+                out.extend(chain);
+            } else {
+                let graph_var = VarId(*next_var);
+                *next_var = next_var.saturating_add(1);
+                out.push(Pattern::DefaultGraphSource {
+                    graph: graph_var,
+                    patterns: chain,
+                });
             }
         }
 
@@ -183,21 +198,53 @@ fn expand_one_into(pattern: Pattern, out: &mut Vec<Pattern>) {
         // patterns inside Optional/Union/Minus/Exists/NotExists/
         // Graph/Service/Subquery get expanded too. The `map_subpatterns`
         // helper rebuilds the surrounding container around the result.
+        Pattern::Graph { .. } => {
+            // Inside an explicit Pattern::Graph, expansion must
+            // suppress the DefaultGraphSource wrapper — propagate
+            // `inside_graph = true`.
+            let expanded = pattern.map_subpatterns(&mut |inner| {
+                expand_edge_annotation_patterns_inside_graph(&inner, next_var)
+            });
+            out.push(expanded);
+        }
         Pattern::Optional(_)
         | Pattern::Minus(_)
         | Pattern::Exists(_)
         | Pattern::NotExists(_)
         | Pattern::Union(_)
-        | Pattern::Graph { .. }
         | Pattern::Service(_)
-        | Pattern::Subquery(_) => {
-            let expanded =
-                pattern.map_subpatterns(&mut |inner| expand_edge_annotation_patterns(&inner));
+        | Pattern::Subquery(_)
+        | Pattern::DefaultGraphSource { .. } => {
+            // Container patterns inherit the current `inside_graph`
+            // context. Threading the mutable `next_var` through the
+            // closure keeps minted indices unique across recursion.
+            let was_inside = inside_graph;
+            let expanded = pattern.map_subpatterns(&mut |inner| {
+                let mut out = Vec::with_capacity(inner.len());
+                for p in inner {
+                    expand_one_into(p, &mut out, next_var, was_inside);
+                }
+                out
+            });
             out.push(expanded);
         }
 
         other => out.push(other),
     }
+}
+
+/// Recursive entry that propagates `inside_graph = true`. Used by the
+/// `Pattern::Graph` arm above so its inner subtree doesn't synthesize
+/// a redundant `DefaultGraphSource`.
+fn expand_edge_annotation_patterns_inside_graph(
+    patterns: &[Pattern],
+    next_var: &mut u16,
+) -> Vec<Pattern> {
+    let mut out = Vec::with_capacity(patterns.len());
+    for p in patterns {
+        expand_one_into(p.clone(), &mut out, next_var, true);
+    }
+    out
 }
 
 fn reifies_subject_ref() -> Ref {
@@ -1992,6 +2039,25 @@ pub fn build_where_operators_seeded_with_needed(
                     inner_patterns.clone(),
                     *planning,
                 )));
+                i += 1;
+            }
+
+            Pattern::DefaultGraphSource {
+                graph,
+                patterns: inner_patterns,
+            } => {
+                // Internal — synthesized by `expand_edge_annotation_patterns`
+                // to correlate the f:reifies* triple chain with a single
+                // default-graph source under multi-source default queries.
+                let child = require_child(operator, "DEFAULT-GRAPH-SOURCE pattern")?;
+                operator = Some(Box::new(
+                    crate::default_graph_source::DefaultGraphSourceOperator::new(
+                        child,
+                        *graph,
+                        inner_patterns.clone(),
+                        *planning,
+                    ),
+                ));
                 i += 1;
             }
 
