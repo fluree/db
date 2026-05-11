@@ -401,6 +401,93 @@ Match data from multiple alternative patterns:
 }
 ```
 
+### Negation Patterns
+
+Restrict results to subjects that *do not* match a given pattern. Two forms
+are available; **prefer `not-exists` for the common "subjects without
+property `p`" case.**
+
+#### `not-exists` (canonical)
+
+`["not-exists", { ... }]` keeps rows for which the inner pattern has **no**
+solution under the current bindings:
+
+```json
+{
+  "where": [
+    { "@id": "?file", "@type": "ex:File" },
+    ["not-exists", { "@id": "?file", "ex:parent": "?p" }]
+  ],
+  "select": "?file"
+}
+```
+
+When the inner pattern is correlated to the outer **only via vars the inner
+itself produces** (here `?file`, produced by both the outer triple and the
+inner triple), and the inner does not reference any outer-only variable
+(e.g. via a `["filter", ...]` mentioning an outer var the inner doesn't
+produce), the planner builds the inner solution set **once** and probes it
+per outer row — the performant path on large outer streams. If either
+condition fails, the inner is rebuilt and re-run per outer row (still
+correct, but linear in the outer cardinality).
+
+`["exists", { ... }]` is the affirmative dual and uses the same dispatch.
+
+#### `OPTIONAL` + `(not (bound ?v))`
+
+The SPARQL-muscle-memory form `OPTIONAL { ... } FILTER (!bound(?v))` is
+spelled in JSON-LD as an `optional` followed by a filter using the supported
+`bound` function:
+
+```json
+{
+  "where": [
+    { "@id": "?file", "@type": "ex:File" },
+    ["optional", { "@id": "?file", "ex:parent": "?p" }],
+    ["filter", "(not (bound ?p))"]
+  ],
+  "select": "?file"
+}
+```
+
+The data filter form is equivalent: `["filter", ["not", ["bound", "?p"]]]`.
+
+When the `optional` block binds `?v`, the filter immediately tests
+`!bound(?v)`, and `?v` is not used after the filter, the planner rewrites
+this shape to a NOT EXISTS and dispatches it through the same strategy
+chooser as `not-exists`. The two forms therefore have the same plan and the
+same performance.
+
+#### `minus`
+
+`["minus", { ... }]` removes solutions whose shared variables match the
+inner pattern. Use when you want set-difference semantics rather than
+negation-as-failure (see SPARQL 1.1 §8.3 for the difference).
+
+#### Filter expression — supported "is-unbound" idioms
+
+The s-expression parser recognizes `not`, `and`, `or` as AST operators and
+`bound` as a function. The following are **not** parser tokens:
+
+| Attempt | Result |
+|---|---|
+| `(not (bound ?p))` | ✅ supported |
+| `["not", ["bound", "?p"]]` | ✅ supported (data filter form) |
+| `(!bound ?p)`, `(! (bound ?p))` | ❌ parse error — use `(not (bound ?p))` |
+| `(nil? ?p)` | ❌ parse error — use `(not (bound ?p))` |
+
+The "Unknown function" parse error includes a hint pointing at
+`(not (bound ?v))` or `["not-exists", ...]` for these common attempts.
+
+#### SPARQL → JSON-LD translation
+
+| SPARQL | JSON-LD |
+|---|---|
+| `FILTER NOT EXISTS { ?s :p ?v }` | `["not-exists", {"@id":"?s","ex:p":"?v"}]` |
+| `FILTER EXISTS { ?s :p ?v }` | `["exists", {"@id":"?s","ex:p":"?v"}]` |
+| `OPTIONAL { ?s :p ?v } FILTER(!bound(?v))` | `["optional", {"@id":"?s","ex:p":"?v"}]` then `["filter", "(not (bound ?v))"]` |
+| `?a :p ?b MINUS { ?a :q ?c }` | `{"@id":"?a","ex:p":"?b"}` then `["minus", {"@id":"?a","ex:q":"?c"}]` |
+
 ### Graph Patterns
 
 Scope patterns to a named graph:
@@ -773,7 +860,9 @@ Function names are case-insensitive. See [Vector Search](../indexing-and-search/
 
 ### Type Functions
 
-- `(bound ?var)` - Variable is bound
+- `(bound ?var)` - Variable is bound. To test for **absence**, see
+  [Negation Patterns](#negation-patterns) — `(not (bound ?v))` after
+  `optional` is supported, or use `["not-exists", ...]` directly.
 - `(isIRI ?x)` - Is an IRI
 - `(isBlank ?x)` - Is a blank node
 - `(isLiteral ?x)` - Is a literal

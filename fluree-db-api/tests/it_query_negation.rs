@@ -153,6 +153,70 @@ async fn not_exists_filters_subjects_without_nickname() {
     );
 }
 
+/// `OPTIONAL { ?s p ?v } FILTER(NOT BOUND(?v))` is the SPARQL-muscle-memory
+/// idiom for "subjects without a value for predicate p". It is recognized at
+/// `where_plan.rs:1595-1623` and dispatched through the shared EXISTS strategy
+/// helper, so this query should return the same rows as the pattern-level
+/// `["not-exists", ...]` form above. Inner shares ?person with the outer
+/// triple, so the helper picks `SemijoinOperator` (build-once + hash probe).
+#[tokio::test]
+async fn optional_not_bound_filters_same_as_not_exists() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger = seed_people(&fluree, "negation:people").await;
+    let ctx = ctx_ex();
+
+    let q = json!({
+        "@context": ctx,
+        "select": "?person",
+        "where": [
+            {"@id":"?person","ex:givenName":"?gname"},
+            ["optional", {"@id":"?person","ex:nickname":"?name"}],
+            ["filter", "(not (bound ?name))"]
+        ]
+    });
+
+    let rows = support::query_jsonld(&fluree, &ledger, &q)
+        .await
+        .unwrap()
+        .to_jsonld(&ledger.snapshot)
+        .unwrap();
+    assert_eq!(
+        normalize_rows(&rows),
+        normalize_rows(&json!(["ex:bob", "ex:carol"]))
+    );
+}
+
+/// Same idiom expressed in the data filter form `["not", ["bound", "?v"]]`
+/// rather than the s-expression form `"(not (bound ?v))"`. Both should parse
+/// to the same `Expression::Not(Expression::Call(Function::Bound, ...))` and
+/// hit the same OPTIONAL+not-bound rewrite.
+#[tokio::test]
+async fn optional_not_bound_data_form_filters_same_as_not_exists() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger = seed_people(&fluree, "negation:people").await;
+    let ctx = ctx_ex();
+
+    let q = json!({
+        "@context": ctx,
+        "select": "?person",
+        "where": [
+            {"@id":"?person","ex:givenName":"?gname"},
+            ["optional", {"@id":"?person","ex:nickname":"?name"}],
+            ["filter", ["not", ["bound", "?name"]]]
+        ]
+    });
+
+    let rows = support::query_jsonld(&fluree, &ledger, &q)
+        .await
+        .unwrap()
+        .to_jsonld(&ledger.snapshot)
+        .unwrap();
+    assert_eq!(
+        normalize_rows(&rows),
+        normalize_rows(&json!(["ex:bob", "ex:carol"]))
+    );
+}
+
 #[tokio::test]
 async fn not_exists_when_everyone_has_family_name_returns_none() {
     let fluree = FlureeBuilder::memory().build_memory();
