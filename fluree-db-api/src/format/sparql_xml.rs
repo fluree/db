@@ -71,12 +71,17 @@ pub fn format(
         result.output.select_vars_or_empty().to_vec()
     };
 
-    // Order head vars lexicographically by variable name (without '?') for stability.
-    let mut head_pairs: Vec<(String, fluree_db_query::VarId)> = head_vars
+    // Preserve the SELECT-clause-declared variable order (or, for wildcard,
+    // the schema's bound-var order). The W3C SPARQL Results XML format
+    // doesn't mandate a specific column order, but the W3C testsuite's
+    // result-comparison harness compares header order positionally — and
+    // most queries authored by users expect their `SELECT ?p ?c` order to
+    // round-trip. Lex-sorting (the previous behavior) flipped `?P, ?C` to
+    // `?C, ?P` and tripped W3C eval test `agg02`.
+    let head_pairs: Vec<(String, fluree_db_query::VarId)> = head_vars
         .iter()
         .map(|&var_id| (strip_question_mark(result.vars.name(var_id)), var_id))
         .collect();
-    head_pairs.sort_by(|(a, _), (b, _)| a.cmp(b));
 
     let head_names: Vec<String> = head_pairs.iter().map(|(name, _)| name.clone()).collect();
     let head_vars: Vec<fluree_db_query::VarId> = head_pairs.into_iter().map(|(_, id)| id).collect();

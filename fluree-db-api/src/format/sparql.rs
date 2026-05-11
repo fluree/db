@@ -61,13 +61,14 @@ pub fn format(
         result.output.select_vars_or_empty().to_vec()
     };
 
-    // Order head vars lexicographically by variable name (without '?').
-    // This also stabilizes output across planner reorderings.
-    let mut head_pairs: Vec<(String, fluree_db_query::VarId)> = head_vars
+    // Preserve the SELECT-clause-declared variable order (or, for wildcard,
+    // the schema's bound-var order). Lex-sorting (the previous behavior)
+    // flipped users' written `SELECT ?p ?c` into header order `?c, ?p` and
+    // tripped the W3C `agg02` eval test which compares headers positionally.
+    let head_pairs: Vec<(String, fluree_db_query::VarId)> = head_vars
         .iter()
         .map(|&var_id| (strip_question_mark(result.vars.name(var_id)), var_id))
         .collect();
-    head_pairs.sort_by(|(a, _), (b, _)| a.cmp(b));
 
     let vars: Vec<String> = head_pairs.iter().map(|(name, _)| name.clone()).collect();
     let head_vars: Vec<fluree_db_query::VarId> = head_pairs.into_iter().map(|(_, id)| id).collect();

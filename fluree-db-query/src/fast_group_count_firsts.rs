@@ -1,5 +1,5 @@
 use crate::binding::Binding;
-use crate::context::{ExecutionContext, WellKnownDatatypes};
+use crate::context::ExecutionContext;
 use crate::error::{QueryError, Result};
 use crate::fast_path_common::{fast_path_store, normalize_pred_sid};
 use crate::operator::BoxedOperator;
@@ -1526,7 +1526,12 @@ fn compute_group_by_object_star_topk(
     // Build output columns.
     let view = BinaryGraphView::with_novelty(Arc::clone(store), g_id, ctx.dict_novelty.clone())
         .with_namespace_codes_fallback(ctx.namespace_codes_fallback.clone());
-    let dt_count = WellKnownDatatypes::new().xsd_long;
+    // SPARQL §17.4.1.3: COUNT returns xsd:integer. The historical use of
+    // xsd:long here predated the W3C-correctness work — using xsd:integer
+    // matches both the slow-path AggregateOperator (`agg_count`) and the
+    // streaming `GroupAggregateOperator` (`AggState::Count.finalize`),
+    // and is what the W3C testsuite (e.g. `agg02`) checks for.
+    let dt_count = fluree_db_core::Sid::xsd_integer();
 
     let mut col_o1: Vec<Binding> = Vec::with_capacity(rows.len());
     let mut col_count: Vec<Binding> = Vec::with_capacity(rows.len());

@@ -4,7 +4,7 @@
 //! / `StatsView` without scanning the triple store.
 
 use crate::binding::{Batch, Binding};
-use crate::context::{ExecutionContext, WellKnownDatatypes};
+use crate::context::ExecutionContext;
 use crate::error::{QueryError, Result};
 use crate::operator::{Operator, OperatorState};
 use crate::var_registry::VarId;
@@ -37,7 +37,11 @@ impl StatsCountByPredicateOperator {
     }
 
     fn build_rows(&self, ctx: &ExecutionContext<'_>) -> Result<Vec<(Binding, Binding)>> {
-        let dt = WellKnownDatatypes::new().xsd_long;
+        // SPARQL §17.4.1.3: COUNT returns xsd:integer. Matches the
+        // slow-path AggregateOperator and streaming GroupAggregateOperator
+        // (both use Sid::xsd_integer); using xsd:long here previously
+        // tripped W3C eval test `agg02`.
+        let dt = fluree_db_core::Sid::xsd_integer();
         let store = ctx.binary_store.as_deref();
 
         // Prefer graph-scoped stats if present (and we can resolve p_id → Sid).
