@@ -624,7 +624,7 @@ pub(crate) fn analyze_property_join_plan(
     let analysis = analyze_property_join(triples_for_exec);
     let (width_score, optional_bonus) =
         property_join_width_score(triples_for_exec, &patterns[block_end_index..]);
-    let meets_width_threshold = width_score > PROPERTY_JOIN_MIN_WIDTH_SCORE;
+    let meets_width_threshold = width_score >= PROPERTY_JOIN_MIN_WIDTH_SCORE;
     let can_property_join = !has_upstream_seed && analysis.eligible() && meets_width_threshold;
     let tail = if can_property_join {
         collect_property_join_tail(patterns, block_end_index, triples_for_exec)
@@ -2842,6 +2842,24 @@ mod tests {
         assert_eq!(optional_bonus, 1.0);
         assert_eq!(score, 4.0);
         assert!(score > PROPERTY_JOIN_MIN_WIDTH_SCORE);
+    }
+
+    #[test]
+    fn test_property_join_plan_accepts_exact_width_threshold() {
+        let s = VarId(0);
+        let triples = vec![
+            make_pattern(s, "type", VarId(1)),
+            make_pattern(s, "text", VarId(2)),
+            make_pattern(s, "vector", VarId(3)),
+        ];
+        let patterns: Vec<Pattern> = triples.iter().cloned().map(Pattern::Triple).collect();
+
+        let (decision, _tail) =
+            analyze_property_join_plan(&patterns, patterns.len(), &triples, false);
+
+        assert_eq!(decision.width_score, PROPERTY_JOIN_MIN_WIDTH_SCORE);
+        assert!(decision.meets_width_threshold);
+        assert!(decision.can_property_join);
     }
 
     #[test]
