@@ -221,8 +221,7 @@ pub fn tokenize(src: &str) -> Result<Vec<Token>, LexError> {
                 while i < bytes.len() && is_ident_continue(bytes[i]) {
                     i += 1;
                 }
-                let raw =
-                    std::str::from_utf8(&bytes[name_start..i]).expect("ASCII identifier");
+                let raw = std::str::from_utf8(&bytes[name_start..i]).expect("ASCII identifier");
                 let kind = TokenKind::keyword_from_str(raw)
                     .unwrap_or_else(|| TokenKind::Ident(raw.to_string()));
                 push(&mut out, kind, start, i);
@@ -291,8 +290,8 @@ fn read_string(bytes: &[u8], start: usize, quote: u8) -> Result<(String, usize),
                     }
                     let hex = std::str::from_utf8(&bytes[hex_start..hex_end])
                         .map_err(|_| LexError::InvalidEscape(i - 1))?;
-                    let cp = u32::from_str_radix(hex, 16)
-                        .map_err(|_| LexError::InvalidEscape(i - 1))?;
+                    let cp =
+                        u32::from_str_radix(hex, 16).map_err(|_| LexError::InvalidEscape(i - 1))?;
                     if let Some(c) = char::from_u32(cp) {
                         out.push(c);
                     } else {
@@ -310,8 +309,7 @@ fn read_string(bytes: &[u8], start: usize, quote: u8) -> Result<(String, usize),
             out.push(b as char);
             i += 1;
         } else {
-            let s = std::str::from_utf8(&bytes[i..])
-                .map_err(|_| LexError::InvalidEscape(i))?;
+            let s = std::str::from_utf8(&bytes[i..]).map_err(|_| LexError::InvalidEscape(i))?;
             let ch = s.chars().next().unwrap();
             out.push(ch);
             i += ch.len_utf8();
@@ -358,8 +356,7 @@ fn read_number(bytes: &[u8], start: usize) -> Result<(TokenKind, usize), LexErro
                 }
                 let raw = std::str::from_utf8(&bytes[hex_start..i])
                     .map_err(|_| LexError::InvalidNumber(start))?;
-                let n = i64::from_str_radix(raw, 16)
-                    .map_err(|_| LexError::InvalidNumber(start))?;
+                let n = i64::from_str_radix(raw, 16).map_err(|_| LexError::InvalidNumber(start))?;
                 return Ok((TokenKind::Integer(n), i));
             }
             b'o' | b'O' => {
@@ -373,8 +370,7 @@ fn read_number(bytes: &[u8], start: usize) -> Result<(TokenKind, usize), LexErro
                 }
                 let raw = std::str::from_utf8(&bytes[o_start..i])
                     .map_err(|_| LexError::InvalidNumber(start))?;
-                let n = i64::from_str_radix(raw, 8)
-                    .map_err(|_| LexError::InvalidNumber(start))?;
+                let n = i64::from_str_radix(raw, 8).map_err(|_| LexError::InvalidNumber(start))?;
                 return Ok((TokenKind::Integer(n), i));
             }
             _ => {}
@@ -436,7 +432,10 @@ mod tests {
     #[test]
     fn keywords() {
         let toks = kinds("MATCH match Match");
-        assert_eq!(toks, vec![TokenKind::Match, TokenKind::Match, TokenKind::Match]);
+        assert_eq!(
+            toks,
+            vec![TokenKind::Match, TokenKind::Match, TokenKind::Match]
+        );
     }
 
     #[test]
@@ -509,7 +508,7 @@ mod tests {
             vec![TokenKind::String("hello".to_string())]
         );
         assert_eq!(
-            kinds(r#"'world'"#),
+            kinds(r"'world'"),
             vec![TokenKind::String("world".to_string())]
         );
         assert_eq!(
@@ -521,7 +520,7 @@ mod tests {
     #[test]
     fn numbers() {
         assert_eq!(kinds("42"), vec![TokenKind::Integer(42)]);
-        assert_eq!(kinds("3.14"), vec![TokenKind::Float(3.14)]);
+        assert_eq!(kinds("2.5"), vec![TokenKind::Float(2.5)]);
         assert_eq!(kinds("1e3"), vec![TokenKind::Float(1000.0)]);
         assert_eq!(kinds("0x1F"), vec![TokenKind::Integer(31)]);
     }

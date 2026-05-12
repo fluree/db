@@ -1,9 +1,9 @@
 //! Statement-level parser.
 
 use crate::ast::{
-    CreateClause, DeleteClause, MatchClause, MergeClause, OrderDirection, OrderItem, ProjectionItem,
-    Query, ReadClause, RemoveClause, RemoveItem, ReturnClause, SetClause, SetItem, Statement,
-    Update, UnwindClause, WithClause, WriteClause,
+    CreateClause, DeleteClause, MatchClause, MergeClause, OrderDirection, OrderItem,
+    ProjectionItem, Query, ReadClause, RemoveClause, RemoveItem, ReturnClause, SetClause, SetItem,
+    Statement, UnwindClause, Update, WithClause, WriteClause,
 };
 use crate::ast::{Expr, Variable};
 use crate::diag::{DiagCode, Diagnostic};
@@ -60,10 +60,7 @@ pub fn parse_statement(s: &mut TokenStream) -> Result<Statement, Diagnostic> {
             TokenKind::Detach => {
                 s.advance();
                 if !matches!(s.peek_kind(), TokenKind::Delete) {
-                    return Err(s.error(
-                        DiagCode::UnexpectedToken,
-                        "expected DELETE after DETACH",
-                    ));
+                    return Err(s.error(DiagCode::UnexpectedToken, "expected DELETE after DETACH"));
                 }
                 write_clauses.push(WriteClause::Delete(parse_delete(s, true)?));
             }
@@ -106,7 +103,10 @@ pub fn parse_statement(s: &mut TokenStream) -> Result<Statement, Diagnostic> {
             severity: crate::diag::Severity::Error,
             message: "query has no RETURN clause and no write operation".to_string(),
             span,
-            help: Some("add a `RETURN ...` clause or a write operation (CREATE/MERGE/SET/REMOVE/DELETE)".to_string()),
+            help: Some(
+                "add a `RETURN ...` clause or a write operation (CREATE/MERGE/SET/REMOVE/DELETE)"
+                    .to_string(),
+            ),
         })
     }
 }
@@ -221,9 +221,9 @@ fn parse_projection_items(s: &mut TokenStream) -> Result<Vec<ProjectionItem>, Di
     Ok(items)
 }
 
-fn parse_modifiers(
-    s: &mut TokenStream,
-) -> Result<(Vec<OrderItem>, Option<Expr>, Option<Expr>), Diagnostic> {
+type Modifiers = (Vec<OrderItem>, Option<Expr>, Option<Expr>);
+
+fn parse_modifiers(s: &mut TokenStream) -> Result<Modifiers, Diagnostic> {
     let mut order_by = Vec::new();
     if matches!(s.peek_kind(), TokenKind::Order) {
         s.advance();

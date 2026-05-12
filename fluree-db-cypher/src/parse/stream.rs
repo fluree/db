@@ -65,11 +65,7 @@ impl TokenStream {
         } else {
             Err(self.error(
                 DiagCode::UnexpectedToken,
-                format!(
-                    "expected `{}` but got `{}`",
-                    expected,
-                    self.peek_kind()
-                ),
+                format!("expected `{}` but got `{}`", expected, self.peek_kind()),
             ))
         }
     }
@@ -84,7 +80,12 @@ impl TokenStream {
         }
     }
 
-    pub fn error_at(&self, code: DiagCode, message: impl Into<String>, span: SourceSpan) -> Diagnostic {
+    pub fn error_at(
+        &self,
+        code: DiagCode,
+        message: impl Into<String>,
+        span: SourceSpan,
+    ) -> Diagnostic {
         Diagnostic {
             code,
             severity: Severity::Error,

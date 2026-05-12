@@ -75,33 +75,33 @@ pub enum TokenKind {
     Param(String),
 
     // ===== Punctuation =====
-    LParen,           // (
-    RParen,           // )
-    LBracket,         // [
-    RBracket,         // ]
-    LBrace,           // {
-    RBrace,           // }
-    Comma,            // ,
-    Semicolon,        // ;
-    Dot,              // .
-    DotDot,           // ..
-    Colon,            // :
-    Eq,               // =
-    NotEq,            // <>
-    Lt,               // <
-    Le,               // <=
-    Gt,               // >
-    Ge,               // >=
-    Plus,             // +
-    Minus,            // -
-    Star,             // *
-    Slash,            // /
-    Percent,          // %
-    Caret,            // ^
-    PlusEq,           // +=
-    Pipe,             // |
-    DashArrowRight,   // ->
-    LArrowDash,       // <-
+    LParen,         // (
+    RParen,         // )
+    LBracket,       // [
+    RBracket,       // ]
+    LBrace,         // {
+    RBrace,         // }
+    Comma,          // ,
+    Semicolon,      // ;
+    Dot,            // .
+    DotDot,         // ..
+    Colon,          // :
+    Eq,             // =
+    NotEq,          // <>
+    Lt,             // <
+    Le,             // <=
+    Gt,             // >
+    Ge,             // >=
+    Plus,           // +
+    Minus,          // -
+    Star,           // *
+    Slash,          // /
+    Percent,        // %
+    Caret,          // ^
+    PlusEq,         // +=
+    Pipe,           // |
+    DashArrowRight, // ->
+    LArrowDash,     // <-
     Eof,
 }
 

@@ -1,8 +1,6 @@
 //! Expression parser — Pratt-style precedence climbing.
 
-use crate::ast::{
-    BinOp, CaseExpr, Expr, FuncCall, Literal, MapLit, ParamRef, UnaryOp, Variable,
-};
+use crate::ast::{BinOp, CaseExpr, Expr, FuncCall, Literal, MapLit, ParamRef, UnaryOp, Variable};
 use crate::diag::{DiagCode, Diagnostic};
 use crate::lex::TokenKind;
 
@@ -181,17 +179,12 @@ fn parse_unary(s: &mut TokenStream) -> Result<Expr, Diagnostic> {
 
 fn parse_postfix(s: &mut TokenStream) -> Result<Expr, Diagnostic> {
     let mut e = parse_primary(s)?;
-    loop {
-        match s.peek_kind() {
-            TokenKind::Dot => {
-                let start = e.span();
-                s.advance();
-                let prop = parse_ident_or_keyword(s)?;
-                let end = s.peek_span();
-                e = Expr::Prop(Box::new(e), prop, start.union(end));
-            }
-            _ => break,
-        }
+    while let TokenKind::Dot = s.peek_kind() {
+        let start = e.span();
+        s.advance();
+        let prop = parse_ident_or_keyword(s)?;
+        let end = s.peek_span();
+        e = Expr::Prop(Box::new(e), prop, start.union(end));
     }
     Ok(e)
 }
@@ -307,8 +300,19 @@ fn parse_var_or_call(s: &mut TokenStream) -> Result<Expr, Diagnostic> {
         let lower = name.to_ascii_lowercase();
         if matches!(
             lower.as_str(),
-            "collect" | "head" | "tail" | "size" | "reverse" | "range" | "labels" | "keys"
-                | "properties" | "type" | "id" | "point" | "distance"
+            "collect"
+                | "head"
+                | "tail"
+                | "size"
+                | "reverse"
+                | "range"
+                | "labels"
+                | "keys"
+                | "properties"
+                | "type"
+                | "id"
+                | "point"
+                | "distance"
         ) {
             return Err(Diagnostic {
                 code: DiagCode::DeferredFunction,
@@ -378,4 +382,3 @@ pub fn parse_map_lit(s: &mut TokenStream) -> Result<MapLit, Diagnostic> {
         span: start.union(end),
     })
 }
-

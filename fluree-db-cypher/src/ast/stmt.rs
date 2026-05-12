@@ -157,8 +157,14 @@ pub struct RemoveClause {
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum RemoveItem {
-    Property { target: Variable, property: String },
-    Labels { target: Variable, labels: Vec<String> },
+    Property {
+        target: Variable,
+        property: String,
+    },
+    Labels {
+        target: Variable,
+        labels: Vec<String>,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq)]

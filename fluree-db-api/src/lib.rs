@@ -247,8 +247,7 @@ pub use fluree_db_sparql::{
 pub use fluree_db_cypher::{
     lower_cypher, parse_cypher, CypherAst, DiagCode as CypherDiagCode,
     Diagnostic as CypherDiagnostic, LowerError as CypherLowerError,
-    ParseOutput as CypherParseOutput, Severity as CypherSeverity,
-    SourceSpan as CypherSourceSpan,
+    ParseOutput as CypherParseOutput, Severity as CypherSeverity, SourceSpan as CypherSourceSpan,
 };
 pub use fluree_db_transact::lower_cypher_update::{
     lower_cypher_update, CypherLowerOpts, LowerCypherError,

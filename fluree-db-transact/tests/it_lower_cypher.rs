@@ -6,18 +6,23 @@
 //! tests once they land.
 
 use fluree_db_cypher::parse_cypher;
+use fluree_db_transact::ir::TxnOpts;
 use fluree_db_transact::ir::{TemplateTerm, TxnType};
 use fluree_db_transact::lower_cypher_update::{lower_cypher_update, CypherLowerOpts};
 use fluree_db_transact::namespace::NamespaceRegistry;
-use fluree_db_transact::ir::TxnOpts;
 
 fn lower(src: &str) -> fluree_db_transact::ir::Txn {
     let out = parse_cypher(src);
     assert!(!out.has_errors(), "parse errors: {:?}", out.diagnostics);
     let ast = out.ast.unwrap();
     let mut ns = NamespaceRegistry::new();
-    lower_cypher_update(&ast, &mut ns, TxnOpts::default(), CypherLowerOpts::default())
-        .expect("lower")
+    lower_cypher_update(
+        &ast,
+        &mut ns,
+        TxnOpts::default(),
+        CypherLowerOpts::default(),
+    )
+    .expect("lower")
 }
 
 #[test]
@@ -40,9 +45,7 @@ fn create_node_with_properties() {
 
 #[test]
 fn create_directed_relationship_emits_base_and_reifier_bundle() {
-    let txn = lower(
-        r#"CREATE (a:Person {name: "Alice"})-[:KNOWS]->(b:Person {name: "Bob"})"#,
-    );
+    let txn = lower(r#"CREATE (a:Person {name: "Alice"})-[:KNOWS]->(b:Person {name: "Bob"})"#);
     // 2 labels + 2 props + 1 base edge + 3 reifier bundle triples
     // (subject, predicate, object) = 8 templates.
     assert_eq!(
@@ -55,9 +58,7 @@ fn create_directed_relationship_emits_base_and_reifier_bundle() {
 
 #[test]
 fn create_relationship_with_properties_adds_body_triples() {
-    let txn = lower(
-        r#"CREATE (a:Person)-[:KNOWS {since: 2020}]->(b:Person)"#,
-    );
+    let txn = lower("CREATE (a:Person)-[:KNOWS {since: 2020}]->(b:Person)");
     // 2 labels + 1 base + 3 bundle + 1 ann body = 7
     assert_eq!(
         txn.insert_templates.len(),
@@ -100,7 +101,12 @@ fn create_undirected_relationship_is_rejected() {
     assert!(!out.has_errors());
     let ast = out.ast.unwrap();
     let mut ns = NamespaceRegistry::new();
-    let r = lower_cypher_update(&ast, &mut ns, TxnOpts::default(), CypherLowerOpts::default());
+    let r = lower_cypher_update(
+        &ast,
+        &mut ns,
+        TxnOpts::default(),
+        CypherLowerOpts::default(),
+    );
     assert!(r.is_err());
 }
 
@@ -115,7 +121,12 @@ fn create_bare_node_is_rejected() {
     }
     let ast = out.ast.unwrap();
     let mut ns = NamespaceRegistry::new();
-    let r = lower_cypher_update(&ast, &mut ns, TxnOpts::default(), CypherLowerOpts::default());
+    let r = lower_cypher_update(
+        &ast,
+        &mut ns,
+        TxnOpts::default(),
+        CypherLowerOpts::default(),
+    );
     assert!(r.is_err(), "expected rejection of bare CREATE ()");
 }
 
@@ -124,7 +135,12 @@ fn read_query_via_update_entry_is_rejected() {
     let out = parse_cypher("MATCH (n:Person) RETURN n");
     let ast = out.ast.unwrap();
     let mut ns = NamespaceRegistry::new();
-    let r = lower_cypher_update(&ast, &mut ns, TxnOpts::default(), CypherLowerOpts::default());
+    let r = lower_cypher_update(
+        &ast,
+        &mut ns,
+        TxnOpts::default(),
+        CypherLowerOpts::default(),
+    );
     assert!(r.is_err());
 }
 
@@ -142,8 +158,12 @@ fn merge_set_delete_remove_are_deferred() {
         }
         let ast = out.ast.unwrap();
         let mut ns = NamespaceRegistry::new();
-        let r =
-            lower_cypher_update(&ast, &mut ns, TxnOpts::default(), CypherLowerOpts::default());
+        let r = lower_cypher_update(
+            &ast,
+            &mut ns,
+            TxnOpts::default(),
+            CypherLowerOpts::default(),
+        );
         assert!(
             r.is_err(),
             "expected deferred-feature error for `{src}`, got {:?}",

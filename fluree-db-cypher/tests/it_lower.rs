@@ -25,9 +25,7 @@ fn match_labeled_node_returns_var() {
             // s = ?n, p = rdf:type Iri, o = Person Iri
             assert!(matches!(tp.s, Ref::Var(_)));
             assert!(matches!(&tp.p, Ref::Iri(iri) if iri.as_ref().ends_with("type")));
-            assert!(
-                matches!(&tp.o, Term::Iri(iri) if iri.as_ref() == "http://example.org/Person")
-            );
+            assert!(matches!(&tp.o, Term::Iri(iri) if iri.as_ref() == "http://example.org/Person"));
         }
         other => panic!("expected Triple, got {other:?}"),
     }
@@ -82,12 +80,16 @@ fn named_relationship_lowers_to_edge_annotation() {
         .patterns
         .iter()
         .any(|p| matches!(p, Pattern::EdgeAnnotation { .. }));
-    assert!(has_edge_ann, "expected EdgeAnnotation; got {:?}", q.patterns);
+    assert!(
+        has_edge_ann,
+        "expected EdgeAnnotation; got {:?}",
+        q.patterns
+    );
 }
 
 #[test]
 fn relationship_property_filter_lowers_to_edge_annotation_with_body() {
-    let q = lower(r#"MATCH (a:Person)-[:KNOWS {since: 2020}]->(b:Person) RETURN a, b"#);
+    let q = lower("MATCH (a:Person)-[:KNOWS {since: 2020}]->(b:Person) RETURN a, b");
     let ea = q
         .patterns
         .iter()
@@ -177,12 +179,10 @@ fn limit_and_skip() {
 
 #[test]
 fn where_clause_emits_filter() {
-    let q = lower(r#"MATCH (n:Person) WHERE n = n RETURN n"#);
+    let q = lower("MATCH (n:Person) WHERE n = n RETURN n");
     // 1 label + 1 filter = 2
     assert!(
-        q.patterns
-            .iter()
-            .any(|p| matches!(p, Pattern::Filter(_))),
+        q.patterns.iter().any(|p| matches!(p, Pattern::Filter(_))),
         "expected Filter; got {:?}",
         q.patterns
     );
@@ -199,9 +199,7 @@ fn optional_match() {
 fn reserved_predicate_is_rejected_in_property_filter() {
     // f:reifiesSubject is reserved. Any attempt to use it as a
     // property name in a Cypher pattern must be rejected.
-    let out = parse_cypher(
-        r#"MATCH (n:Person {reifiesSubject: "x"}) RETURN n"#,
-    );
+    let out = parse_cypher(r#"MATCH (n:Person {reifiesSubject: "x"}) RETURN n"#);
     assert!(!out.has_errors());
     let ast = out.ast.unwrap();
     let encoder = NoEncoder;

@@ -152,6 +152,6 @@ pub struct ParseOutput {
 
 impl ParseOutput {
     pub fn has_errors(&self) -> bool {
-        self.diagnostics.iter().any(|d| d.is_error())
+        self.diagnostics.iter().any(Diagnostic::is_error)
     }
 }

@@ -1,8 +1,8 @@
 //! Statement-level read-path lowering.
 
 use fluree_db_query::ir::{Pattern, Query, QueryOutput};
-use fluree_db_query::sort::{SortDirection, SortSpec};
 use fluree_db_query::parse::encode::IriEncoder;
+use fluree_db_query::sort::{SortDirection, SortSpec};
 use fluree_db_query::var_registry::VarId;
 use fluree_graph_json_ld::ParsedContext;
 
@@ -67,11 +67,13 @@ pub fn lower_query<E: IriEncoder>(
     })
 }
 
+type LoweredReturn = (QueryOutput, Vec<SortSpec>, Option<usize>, Option<usize>);
+
 fn lower_return<E: IriEncoder>(
     ctx: &mut LoweringContext<'_, E>,
     r: &ReturnClause,
     _patterns: &[Pattern],
-) -> Result<(QueryOutput, Vec<SortSpec>, Option<usize>, Option<usize>)> {
+) -> Result<LoweredReturn> {
     // Project items — only Var and Var-as-alias supported in v1. `*`
     // becomes Wildcard.
     let mut vars: Vec<VarId> = Vec::new();

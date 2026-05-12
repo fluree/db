@@ -5,8 +5,8 @@ use fluree_db_query::ir::{Pattern, Ref, Term, TriplePattern};
 use fluree_db_query::parse::encode::IriEncoder;
 
 use crate::ast::{
-    Direction, Expr, Label, MapLit, NodePattern, Pattern as CypherPattern, PatternPart,
-    RelPattern, Variable,
+    Direction, Expr, Label, MapLit, NodePattern, Pattern as CypherPattern, PatternPart, RelPattern,
+    Variable,
 };
 
 use super::context::LoweringContext;
@@ -112,10 +112,7 @@ fn lower_inline_props<E: IriEncoder>(
 }
 
 /// Inline pattern values must reduce to a literal or a bound variable.
-fn expr_to_object_term<E: IriEncoder>(
-    ctx: &mut LoweringContext<'_, E>,
-    e: &Expr,
-) -> Result<Term> {
+fn expr_to_object_term<E: IriEncoder>(ctx: &mut LoweringContext<'_, E>, e: &Expr) -> Result<Term> {
     match e {
         Expr::Lit(lit) => Ok(Term::Value(lower_literal(lit)?)),
         Expr::Var(v) => Ok(Term::Var(ctx.intern_var(&v.name))),
@@ -309,11 +306,7 @@ fn build_annotation_body<E: IriEncoder>(
             let pred_iri = ctx.resolve_predicate(key)?;
             let pred = Ref::Iri(pred_iri.into());
             let obj = expr_to_object_term(ctx, val_expr)?;
-            body.push(Pattern::Triple(TriplePattern::new(
-                ann.clone(),
-                pred,
-                obj,
-            )));
+            body.push(Pattern::Triple(TriplePattern::new(ann.clone(), pred, obj)));
         }
     }
     Ok(body)

@@ -31,7 +31,9 @@ pub enum LowerError {
     UnresolvedIri(String),
     #[error("attempt to use reserved Fluree system predicate: {0}")]
     ReservedPredicate(String),
-    #[error("bare node pattern `({0})` rejected — see GQL_CYPHER_SUPPORT.md \"Node existence model\"")]
+    #[error(
+        "bare node pattern `({0})` rejected — see GQL_CYPHER_SUPPORT.md \"Node existence model\""
+    )]
     BareNodePattern(String),
 }
 

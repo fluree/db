@@ -39,4 +39,4 @@ pub use span::SourceSpan;
 pub use validate::{validate, Capabilities};
 
 #[cfg(feature = "lowering")]
-pub use lower::{lower_cypher, LoweringContext, LowerError};
+pub use lower::{lower_cypher, LowerError, LoweringContext};

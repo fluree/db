@@ -5,8 +5,7 @@
 
 use crate::query::helpers::{
     build_query_result, parse_and_validate_sparql, parse_cypher_to_ir, parse_jsonld_query,
-    parse_sparql_to_ir,
-    prepare_for_execution, status_for_query_error, tracker_for_limits,
+    parse_sparql_to_ir, prepare_for_execution, status_for_query_error, tracker_for_limits,
     tracker_for_tracked_endpoint,
 };
 use crate::view::{GraphDb, QueryInput};

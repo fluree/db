@@ -36,7 +36,9 @@ fn parse_pattern_part(s: &mut TokenStream) -> Result<PatternPart, Diagnostic> {
             return Err(Diagnostic {
                 code: DiagCode::DeferredPathValue,
                 severity: crate::diag::Severity::Error,
-                message: "path variables (e.g., `p = (...)`) are deferred — path values are not in v1".to_string(),
+                message:
+                    "path variables (e.g., `p = (...)`) are deferred — path values are not in v1"
+                        .to_string(),
                 span: s.peek_span(),
                 help: Some("rewrite without the path binding".to_string()),
             });

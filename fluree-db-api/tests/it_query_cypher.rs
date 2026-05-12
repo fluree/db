@@ -78,7 +78,10 @@ async fn cypher_variable_length_rejected_at_lower() {
     let db = graphdb_from_ledger(&ledger0);
 
     let r = fluree
-        .query_cypher(&db, "MATCH (a:Person)-[:KNOWS*1..3]->(b:Person) RETURN a, b")
+        .query_cypher(
+            &db,
+            "MATCH (a:Person)-[:KNOWS*1..3]->(b:Person) RETURN a, b",
+        )
         .await;
     assert!(r.is_err(), "variable-length paths must be rejected in v1");
 }

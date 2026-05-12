@@ -120,9 +120,9 @@ pub(crate) fn parse_cypher_to_ir(
             .join("; ");
         return Err(ApiError::Internal(format!("Cypher parse: {msg}")));
     }
-    let ast = out.ast.ok_or_else(|| {
-        ApiError::Internal("Cypher parse returned no AST".to_string())
-    })?;
+    let ast = out
+        .ast
+        .ok_or_else(|| ApiError::Internal("Cypher parse returned no AST".to_string()))?;
 
     // Pull `@vocab` and named-term overrides out of the default
     // context.
