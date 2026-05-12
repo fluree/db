@@ -22,8 +22,8 @@
 //! All tests run against the file-backed (non-memory) path so
 //! storage inspection has a real CAS to verify against.
 //!
-//! See `EDGE_ANNOTATIONS_IMPL_PLAN.md` M2 §"Tests" and slice 5 in
-//! the session log.
+//! See `docs/design/edge-annotations.md` for the on-disk arena
+//! layout this suite validates.
 
 #![cfg(feature = "native")]
 

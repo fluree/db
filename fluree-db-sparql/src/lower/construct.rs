@@ -64,12 +64,12 @@ impl<E: IriEncoder> LoweringContext<'_, E> {
 
     /// Lower CONSTRUCT template triples to resolved TriplePatterns.
     ///
-    /// M4.5 boundary: CONSTRUCT projection of edge-annotation metadata
-    /// is not supported in v1. The Turtle-star vs RDF 1.2 reifier
-    /// output decision is tracked in `EDGE_ANNOTATIONS.md` "Deferred /
-    /// Out of v1 scope" — JSON-LD output via the JSON-LD formatter is
-    /// the only supported path. Annotation tails on template triples
-    /// are rejected here with a clear error.
+    /// CONSTRUCT projection of edge-annotation metadata is not
+    /// supported in v1. The Turtle-star vs RDF 1.2 reifier output
+    /// decision is tracked in `docs/concepts/edge-annotations.md`
+    /// "Current limits" — JSON-LD output via the JSON-LD formatter
+    /// is the only supported path. Annotation tails on template
+    /// triples are rejected here with a clear error.
     fn lower_construct_template(
         &mut self,
         triples: &[SparqlTriplePattern],
@@ -80,8 +80,9 @@ impl<E: IriEncoder> LoweringContext<'_, E> {
                 return Err(super::LowerError::not_implemented(
                     "SPARQL CONSTRUCT projection of edge-annotation metadata is not \
                      supported in v1. The Turtle-star vs RDF 1.2 reifier output \
-                     decision is tracked in EDGE_ANNOTATIONS.md (Deferred / Out of \
-                     v1 scope). Use JSON-LD output (which emits @annotation) instead.",
+                     decision is tracked in the Edge Annotations concept doc \
+                     (Current limits). Use JSON-LD output (which emits @annotation) \
+                     instead.",
                     tp.span,
                 ));
             }

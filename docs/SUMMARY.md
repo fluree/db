@@ -75,6 +75,7 @@
   - [Storage-agnostic commits and sync](design/storage-agnostic-commits-and-sync.md)
   - [ContentId and ContentStore](design/content-id-and-contentstore.md)
   - [Index format](design/index-format.md)
+  - [Edge annotations (storage internals)](design/edge-annotations.md)
   - [Namespace allocation and fallback modes](design/namespace-allocation.md)
   - [Ontology imports (`f:schemaSource` + `owl:imports`)](design/ontology-imports.md)
   - [Storage traits](design/storage-traits.md)

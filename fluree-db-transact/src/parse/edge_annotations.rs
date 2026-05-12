@@ -38,8 +38,8 @@
 //!    edge it reifies. We emit the base edge as a *sibling* top-level
 //!    node so the standard parser asserts it.
 //!
-//! Strict deferred-shape rejection (per
-//! `EDGE_ANNOTATIONS_IMPL_PLAN.md` decisions section):
+//! Strict deferred-shape rejection (per the contract in
+//! `docs/concepts/edge-annotations.md` "Current limits"):
 //!
 //! - Literal-valued annotations (`@value` + `@annotation`) → error.
 //! - Multi-triple `@reifies` (more than one predicate-object pair) →
@@ -365,7 +365,7 @@ pub(crate) struct LowerCtx {
     /// `false` (RDF default), an empty block is a no-op: no
     /// annotation subject is minted, no attachment row is written,
     /// and inserts remain idempotent at the `(s, p, o)` level.
-    /// See the Decisions section of `EDGE_ANNOTATIONS.md`.
+    /// See `docs/concepts/edge-annotations.md` "Empty annotation blocks".
     lpg_mode: bool,
 }
 
@@ -1281,8 +1281,8 @@ fn build_annotation_sibling(
         ));
     };
 
-    // Empty-body contract (per `EDGE_ANNOTATIONS.md` Decisions section
-    // "Empty `@annotation: {}`"). `@context` is purely structural and
+    // Empty-body contract (per `docs/concepts/edge-annotations.md`
+    // "Empty annotation blocks"). `@context` is purely structural and
     // doesn't count as a property; everything else does — including
     // an explicit `@id`, which signals the user wants annotation
     // identity. So the no-op case is exactly `{}` (or `{"@context": ...}`).

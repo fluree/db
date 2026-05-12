@@ -8,8 +8,9 @@
 //! - Bare reifier:               `s p o ~ <reifier>`
 //! - Reifier via `rdf:reifies`:  `?ann rdf:reifies <<( s p o )>>`
 //!
-//! See `SPARQL_EDGE_ANNOTATIONS_IMPL_PLAN.md` for the surface contract,
-//! including the per-context blank-node / variable rules.
+//! See `docs/concepts/edge-annotations.md` "SPARQL 1.2 / RDF 1.2
+//! surface" for the surface contract, including the per-operation
+//! blank-node / variable rules.
 
 use super::term::{BlankNode, Iri, ObjectTerm, PredicateTerm, SubjectTerm, Var};
 use crate::span::SourceSpan;

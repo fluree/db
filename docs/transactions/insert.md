@@ -354,15 +354,28 @@ The annotation subject can be left anonymous (a blank node is minted) or pinned 
 
 Inline `@annotation` queries return one row per occurrence.
 
+**Annotated literal-valued edges** are supported — write the object as a JSON-LD value object so the annotation has a sibling key to attach to:
+
+```json
+{
+  "@id": "ex:alice",
+  "ex:name": {
+    "@value": "Alice",
+    "@annotation": { "ex:source": "ex:hr-system" }
+  }
+}
+```
+
 **Deferred shapes** error with explicit messages:
 
-- Literal-valued annotations (`"@value": "...", "@annotation": ...`).
+- Annotations on list-occurrence triples (`@list` membership).
+- Reifiers for unasserted triples (`@reifies` must point at an asserted edge).
 - Multi-triple `@reifies` (more than one predicate-object pair under `@reifies`).
 - Annotation-of-annotation (nested `@annotation` inside an annotation body).
 - `@reifies` on the insert side (use the inline `@annotation` form instead).
 - User-authored mention of `https://ns.flur.ee/db#reifies*` IRIs (compact or full form).
 
-See [Retractions](retractions.md) for cascade semantics when a base edge or annotation metadata is removed.
+For the full surface — including SPARQL 1.2 / RDF 1.2 annotation tails (`{| |}`), the named reifier (`~`), the cardinality / multiplicity contract, anonymous vs explicit-IRI lifecycle, and named-graph behavior — see the [Edge annotations concept doc](../concepts/edge-annotations.md). For cascade semantics when a base edge or annotation metadata is removed, see [Retractions](retractions.md).
 
 ## Insert Semantics
 

@@ -1,11 +1,12 @@
 //! SPARQL 1.2 / RDF 1.2 edge-annotation integration tests.
 //!
-//! Inserts use the JSON-LD `@annotation` surface (M1); queries use the
-//! new SPARQL annotation surface (M4). Once M4.4 lands, parallel
-//! coverage with SPARQL UPDATE inserts joins these tests.
+//! Covers both the JSON-LD `@annotation` insert surface and the
+//! SPARQL 1.2 annotation tail / `~` reifier / `rdf:reifies` query
+//! surface that lower to the same underlying IR.
 //!
-//! See `SPARQL_EDGE_ANNOTATIONS_IMPL_PLAN.md` for the surface
-//! contract and the per-context blank-node / variable rules.
+//! See `docs/concepts/edge-annotations.md` "SPARQL 1.2 / RDF 1.2
+//! surface" for the user-facing surface contract and the
+//! per-operation blank-node / variable rules.
 
 mod support;
 

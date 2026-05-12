@@ -181,8 +181,8 @@ pub fn forward_arena_stats(rows: &[AnnotationForwardRow]) -> (i64, AnnotationSta
 ///
 /// Empty input produces an empty Vec — the caller decides whether to
 /// emit a zero-leaf branch or omit the section entirely (per
-/// `EDGE_ANNOTATIONS.md` Sidecar Artifacts, omission is only legal when
-/// the snapshot has zero `f:reifies*` bundles).
+/// `docs/design/edge-annotations.md` Sidecar arena layout, omission
+/// is only legal when the snapshot has zero `f:reifies*` bundles).
 ///
 /// **Routing-key cohesion.** Chunks are extended past
 /// `target_rows_per_leaf` whenever splitting would cut a `(edge, ann)`

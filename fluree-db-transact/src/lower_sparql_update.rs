@@ -105,8 +105,9 @@ impl BlankNodeCounter {
 
 /// SPARQL UPDATE context for annotation-tail expansion. Different
 /// operations have different blank-node / variable rules per SPARQL
-/// 1.1 Update §3.1 and the M4.4 contract in
-/// `SPARQL_EDGE_ANNOTATIONS_IMPL_PLAN.md`.
+/// 1.1 Update §3.1 and the per-operation table in
+/// `docs/concepts/edge-annotations.md` "SPARQL UPDATE rules by
+/// operation".
 #[derive(Clone, Copy, Debug)]
 enum AnnotationExpansionMode {
     /// `INSERT DATA { ... }` — ground triples; blank nodes mint fresh

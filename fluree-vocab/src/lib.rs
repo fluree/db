@@ -1614,8 +1614,7 @@ pub mod db {
     // an annotation reifies. **User transactions cannot assert or
     // retract these directly** — they are emitted only by the internal
     // `@annotation` / `@reifies` lowering path. See
-    // `EDGE_ANNOTATIONS.md` and the `EDGE_ANNOTATIONS_IMPL_PLAN.md` M1
-    // section for the full contract.
+    // `docs/design/edge-annotations.md` for the full contract.
 
     /// db:reifiesGraph - the named graph the reified edge lives in.
     /// Omitted entirely for default-graph edges (absence = default).

@@ -31,8 +31,8 @@
 //! `IndexRoot.annotation_index = None` keeps its "zero attachments"
 //! correctness guarantee.
 //!
-//! See `EDGE_ANNOTATIONS.md` (Forward/Reverse Attachment Index) for the
-//! design contract.
+//! See `docs/design/edge-annotations.md` (Sidecar arena layout) for
+//! the design contract.
 
 use fluree_db_core::{ContentId, EdgeKey, Sid};
 use serde::{Deserialize, Serialize};

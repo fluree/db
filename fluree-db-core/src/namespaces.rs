@@ -197,7 +197,7 @@ pub fn is_schema_class(cls: &Sid) -> bool {
 // encode an annotation's reified edge. These are **system-controlled** —
 // user transactions must never assert or retract them directly. The
 // predicates are emitted only by the internal `@annotation` / `@reifies`
-// lowering path. See `EDGE_ANNOTATIONS_IMPL_PLAN.md` M1.
+// lowering path. See `docs/design/edge-annotations.md`.
 
 /// True for `f:reifiesGraph` — the named graph of the reified edge.
 #[inline]

@@ -30,8 +30,8 @@
 //!   table in [`fluree_db_core::annotation_index`].
 //! - Empty branches/leaves are valid and decode to empty row vectors.
 //!
-//! See `EDGE_ANNOTATIONS.md` (storage shape) and `EDGE_ANNOTATIONS_IMPL_PLAN.md`
-//! M2 for the design contract.
+//! See `docs/design/edge-annotations.md` for the storage shape,
+//! sidecar arena layout, and replay-validation contract.
 
 pub mod builder;
 pub mod bundle;

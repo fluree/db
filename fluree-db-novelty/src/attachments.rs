@@ -251,10 +251,10 @@ impl AttachmentNovelty {
     /// the same annotation subject remain visible as ordinary RDF —
     /// only the attachment binding is dropped.
     ///
-    /// **Why skip rather than error:** the contract in
-    /// `EDGE_ANNOTATIONS_IMPL_PLAN.md` says replay validation should
-    /// "Reject (skip + telemetry counter) any ann_sid that has a
-    /// partial bundle." A single malformed bundle in commit replay
+    /// **Why skip rather than error:** the replay-validation contract
+    /// in `docs/design/edge-annotations.md` says "Reject (skip +
+    /// telemetry counter) any ann_sid that has a partial bundle."
+    /// A single malformed bundle in commit replay
     /// (e.g. legacy data or a tampered commit) would otherwise block
     /// the ledger from loading. Operators detect data corruption
     /// post-hoc via [`Self::observed_malformed_bundle_count`].

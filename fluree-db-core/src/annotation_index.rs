@@ -22,7 +22,7 @@
 //! defends against forgetting the sticky bit but cannot fix the
 //! inverse (arena present, bool false in memory).
 //!
-//! See `EDGE_ANNOTATIONS.md` (Sidecar Artifacts) for the design contract.
+//! See `docs/design/edge-annotations.md` for the design contract.
 
 use crate::ContentId;
 use serde::{Deserialize, Serialize};
@@ -152,7 +152,7 @@ pub struct AnnotationStats {
     pub distinct_lang_anns: u64,
 
     /// Live `f:reifiesListIndex` rows. v1 always 0 — list-element
-    /// annotations are deferred (see `EDGE_ANNOTATIONS.md` decisions).
+    /// annotations are deferred (see `docs/concepts/edge-annotations.md` "Current limits").
     #[serde(default)]
     pub reifies_list_index_rows: u64,
     /// Distinct list-index values across live reified edges.

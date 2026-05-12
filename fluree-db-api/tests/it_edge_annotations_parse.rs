@@ -14,8 +14,8 @@
 //!   still error at execution time until the planner is wired in M1's
 //!   read-side slice.
 //!
-//! See: `EDGE_ANNOTATIONS.md` (design contract) and
-//! `EDGE_ANNOTATIONS_IMPL_PLAN.md` (M1 split).
+//! See `docs/concepts/edge-annotations.md` for the user-facing
+//! surface contract.
 
 mod support;
 

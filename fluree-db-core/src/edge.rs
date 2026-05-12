@@ -14,8 +14,8 @@
 //!
 //! Total ordering and serde derive cleanly from the field types.
 //!
-//! See `EDGE_ANNOTATIONS_IMPL_PLAN.md` M1 (durable attachment encoding)
-//! for the contract this type implements.
+//! See `docs/design/edge-annotations.md` for the durable attachment
+//! encoding contract this type implements.
 
 use crate::flake::{Flake, FlakeMeta};
 use crate::namespaces::{
@@ -135,7 +135,7 @@ impl EdgeKey {
     ///
     /// Callers must not split or reorder the bundle — partial bundles
     /// are rejected by the replay validator (see
-    /// `EDGE_ANNOTATIONS_IMPL_PLAN.md` M1).
+    /// `docs/design/edge-annotations.md`).
     pub fn to_reifies_facts(&self, ann: &Sid, t: i64, op: bool) -> Vec<Flake> {
         let mut facts = Vec::with_capacity(7);
         let id_dt = id_datatype_sid();

@@ -18,7 +18,7 @@
 //! list-index facts in v1, …) are skipped with a `tracing::warn` and
 //! counted; the rest of the snapshot indexes normally. This mirrors
 //! the replay-validator behavior described in
-//! `EDGE_ANNOTATIONS_IMPL_PLAN.md` M2 ("the on-disk arena never
+//! `docs/design/edge-annotations.md` ("the on-disk arena never
 //! contains rows from malformed bundles").
 //!
 //! ## Inputs

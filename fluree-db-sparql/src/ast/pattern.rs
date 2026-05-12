@@ -191,7 +191,7 @@ pub enum GraphPattern {
     /// edge. Sibling triples about the reifier in the surrounding scope
     /// join through the executor on the reifier's variable — this AST
     /// node carries no body, by design (see
-    /// `SPARQL_EDGE_ANNOTATIONS_IMPL_PLAN.md` § M4.3).
+    /// `docs/concepts/edge-annotations.md` "SPARQL 1.2 / RDF 1.2 surface").
     AnnotationTarget {
         /// The annotation subject (the LHS of the `rdf:reifies` triple).
         reifier: SubjectTerm,

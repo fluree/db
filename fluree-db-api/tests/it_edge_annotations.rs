@@ -14,13 +14,14 @@
 //!   stays paired with its annotation across query boundaries —
 //!   regression coverage for the M1a `f:reifiesGraph` fix.
 //!
-//! See `EDGE_ANNOTATIONS.md` for the surface contract and
-//! `EDGE_ANNOTATIONS_IMPL_PLAN.md` for the milestone split.
+//! See `docs/concepts/edge-annotations.md` for the user-facing
+//! surface contract and `docs/design/edge-annotations.md` for the
+//! storage internals.
 //!
 //! Tests deliberately scope themselves to single-graph queries (or
 //! `Pattern::Graph`-wrapped patterns) to stay within the correctness
-//! envelope of the M1b expansion. The cross-graph misjoin gap is
-//! tracked in the plan and lands with the M2 custom-operator path.
+//! envelope of the IR-level expansion in
+//! `fluree-db-query/src/execute/where_plan.rs::expand_edge_annotation_patterns`.
 
 mod support;
 
@@ -3647,7 +3648,7 @@ async fn delete_by_id_retracts_lang_tagged_literal_annotation_bundle() {
 }
 
 // =====================================================================
-// Pinning tests for items called out as open in EDGE_ANNOTATIONS_IMPL_PLAN.md
+// Regression-coverage tests for corner-case contracts
 // =====================================================================
 
 /// Two annotations with the **same lexical string but different
@@ -3882,8 +3883,8 @@ async fn cross_language_annotation_does_not_cross_match() {
 /// A file-backed ledger with an annotated edge must survive a full
 /// process restart (drop the `Fluree` handle entirely, rebuild from
 /// the same path) and still answer annotation queries from the
-/// rehydrated commit chain. Closes the "restart-from-commits" item
-/// from `EDGE_ANNOTATIONS_IMPL_PLAN.md` M1b broader-integration list.
+/// rehydrated commit chain. Pins restart-from-commits behavior for
+/// annotated ledgers.
 #[tokio::test]
 async fn annotations_survive_restart_from_commits() {
     let tmp = tempfile::TempDir::new().expect("tempdir");
@@ -3974,11 +3975,10 @@ async fn annotations_survive_restart_from_commits() {
 /// reified base edge must return zero rows — the annotation's
 /// body facts alone must not leak the hidden edge's existence.
 ///
-/// Closes the "policy visibility independence" item from
-/// `EDGE_ANNOTATIONS_IMPL_PLAN.md` M1b broader-integration list, and
-/// pins the design-doc contract: "Annotation query rows require
+/// Pins the design contract: annotation query rows require
 /// visibility of both the base edge and the matched annotation
-/// facts."
+/// facts. See `docs/concepts/edge-annotations.md` and
+/// `docs/design/edge-annotations.md`.
 ///
 /// Mechanism: the IR-level expansion emits a `Pattern::Triple` for
 /// the base edge in addition to the `f:reifies*` lookups. The

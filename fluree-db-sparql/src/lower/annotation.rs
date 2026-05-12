@@ -10,7 +10,8 @@
 //! Sibling triples about a reifier variable are NOT folded into
 //! `body` — they sit in the surrounding scope and join via the
 //! standard executor on the bound reifier var. See
-//! `SPARQL_EDGE_ANNOTATIONS_IMPL_PLAN.md` § M4.3 for the rationale.
+//! `docs/concepts/edge-annotations.md` "SPARQL 1.2 / RDF 1.2 surface"
+//! for the rationale.
 
 use crate::ast::annotation::{Annotation, AnnotationBlock, ReifierId, TripleTerm};
 use crate::ast::term::{BlankNodeValue, SubjectTerm};

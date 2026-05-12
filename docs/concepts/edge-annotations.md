@@ -8,7 +8,7 @@ ex:alice ──[ ex:worksFor: { role: "Engineer", since: 2024-01-01, confidence:
 
 Annotations are first-class RDF data: properties on the annotation subject are stored as ordinary triples and participate in policy, history, indexing, and query like everything else. The only thing that's special is the *attachment*: a sidecar relation that records which annotation subject belongs to which edge. The fact indexes (and queries that don't ask for annotations) are unchanged.
 
-For the storage-internals view of how annotations are indexed, see [`EDGE_ANNOTATIONS.md`](https://github.com/fluree/db/blob/main/EDGE_ANNOTATIONS.md) at the repository root.
+For the storage-internals view — how the attachment sidecar is laid out, how the `f:reifies*` bundle encodes an edge, and how the index root carries the annotation arena — see the [Edge annotations design doc](../design/edge-annotations.md).
 
 ## When to use edge annotations
 
@@ -20,6 +20,17 @@ Reach for `@annotation` when you need any of these:
 - **Cypher / LPG imports.** Relationship properties round-trip without forcing every edge through an intermediate `:Relationship` node.
 
 If a fact is naturally about a *node* (Alice's birthdate, Acme's industry), put it on the node — not on the edge. Annotations are for facts about the *relationship*.
+
+## Where can I write edge annotations?
+
+| Surface | How | Notes |
+|---|---|---|
+| **JSON-LD insert / upsert / update** | `@annotation` (or alias `@edge`) on a value object, `@reifies` on a node | Most ergonomic. Full coverage including literal-valued edges, named graphs, parallel annotations, named reifiers, body cascades. |
+| **SPARQL 1.2 UPDATE** | `INSERT DATA { :s :p :o {\| ... \|} }`, `~ <reifier>`, optional `INSERT { } WHERE { }` templates | Use this when integrating with SPARQL pipelines or when porting from RDF 1.2 / SPARQL-star. See [SPARQL 1.2 surface](#sparql-12--rdf-12-surface) below for the per-operation rules. |
+| **Turtle / TriG / N-Quads file ingest** | Not natively (today) | The Turtle ingest path is RDF 1.1 + Fluree extensions; it does **not** parse RDF 1.2 annotation tails (`{\| ... \|}`) or the `~` reifier. Two routes work: (a) convert your `.ttl` to JSON-LD before ingesting, or (b) ingest the plain edges first and then add annotations with a follow-up SPARQL `INSERT DATA { :s :p :o {\| ... \|} }` transaction. Either route ends up with the same on-disk shape. |
+| **Cypher / LPG import** | Relationship-property syntax (`-[:T {p:v}]->`) | The storage primitive is in place; the full Cypher front-end (paths, `MERGE`, pattern comprehensions) is a separate workstream. Relationship properties round-trip today through the JSON-LD surface that imports emit. |
+
+The reserved-predicate firewall rejects user-authored `f:reifies*` predicates on every write surface (JSON-LD, SPARQL UPDATE, Turtle ingest, bulk import, raw transaction upload). The only way to mint an annotation is through `@annotation` / `@reifies` (JSON-LD) or the RDF 1.2 annotation tail (`~`, `{| |}`) in SPARQL — never by writing `f:reifiesSubject` triples directly.
 
 ## The surface
 
@@ -328,9 +339,11 @@ In RDF mode, `"@annotation": {}` is a no-op: no annotation subject is minted, no
 
 In LPG mode, an empty block mints a fresh annotation subject — a property-less relationship still has identity, the way Cypher relationships do.
 
-## Relationship to RDF-star and RDF 1.2
+## SPARQL 1.2 / RDF 1.2 surface
 
-`@annotation` lowers to the same model as RDF 1.2 reifiers. The following equivalent forms all produce the same storage shape:
+`@annotation` lowers to the same on-disk model as the RDF 1.2 annotation tail. All four equivalent forms below produce identical storage; pick whichever is ergonomic for your input.
+
+### Equivalent forms
 
 JSON-LD `@annotation`:
 
@@ -344,7 +357,7 @@ JSON-LD `@annotation`:
 }
 ```
 
-JSON-LD `@reifies`:
+JSON-LD `@reifies` (annotation-rooted form):
 
 ```json
 {
@@ -357,7 +370,7 @@ JSON-LD `@reifies`:
 }
 ```
 
-SPARQL 1.2 / RDF 1.2 annotation block:
+SPARQL 1.2 / RDF 1.2 annotation block (anonymous reifier):
 
 ```sparql
 PREFIX ex: <http://example.org/>
@@ -366,7 +379,7 @@ INSERT DATA {
 }
 ```
 
-SPARQL 1.2 / RDF 1.2 named reifier:
+SPARQL 1.2 / RDF 1.2 named reifier (`~`):
 
 ```sparql
 PREFIX ex: <http://example.org/>
@@ -375,24 +388,43 @@ INSERT DATA {
 }
 ```
 
-SPARQL 1.2 / RDF 1.2 explicit reifier with `rdf:reifies` — **query only** in v1:
+### Grammar reference (subset)
 
-```sparql
-PREFIX rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#>
-PREFIX ex:  <http://example.org/>
-SELECT ?role WHERE {
-  ?ann rdf:reifies <<( ex:alice ex:worksFor ex:acme )>> .
-  ?ann ex:role ?role .
-}
+The annotation tail attaches to the triple — not the object — per the RDF 1.2 grammar mirrored by SPARQL 1.2:
+
+```text
+annotation       ::= ( reifier | annotationBlock )*
+reifier          ::= '~' ( iri | BlankNode | Var )?
+annotationBlock  ::= '{|' predicateObjectList '|}'
+tripleTerm       ::= '<<(' ttSubject verb ttObject ')>>'
 ```
 
-The `rdf:reifies` + triple-term form is accepted in SPARQL `WHERE` clauses only; SPARQL UPDATE (`INSERT DATA`, `DELETE DATA`, `INSERT WHERE` / `DELETE WHERE` templates) accepts only the `~ {| |}` annotation-tail form. Both forms are semantically equivalent — use `~` for inserts and updates.
+Notes:
 
-(For DATA operations: anonymous `{| |}` and bare `_:` reifiers are allowed in `INSERT DATA` but rejected in `DELETE DATA` per SPARQL §3.1.3.)
+- An `annotationBlock` without a preceding `~` mints a fresh anonymous reifier.
+- A bare `~` (no identifier) is equivalent to `~` + a fresh blank node — useful when you want a reifier variable bound in WHERE but don't care about its IRI.
+- `tripleTerm` (the parenthesized `<<( s p o )>>` form) is accepted **only** as the object of `rdf:reifies`. Other uses error at parse time.
+- Property-path triples cannot carry an annotation tail. `?s ex:p1/ex:p2 ?o {| ... |}` is rejected — write a simple-predicate triple instead.
+
+### SPARQL UPDATE rules by operation
+
+Different UPDATE operations place different constraints on reifier identity per SPARQL Update §3.1 and §4.1. The contract below is what Fluree enforces.
+
+| Operation | `~ <iri>` (named) | `~ ?var` (variable) | `~ _:label` (blank) | `{\| \|}` with no `~` (anonymous) | `?ann rdf:reifies <<( ... )>>` |
+|---|---|---|---|---|---|
+| `INSERT DATA` | ✅ resolved via nameservice | ❌ vars not allowed in DATA | ✅ minted as fresh Sid for the operation | ✅ fresh blank reifier minted | ❌ DATA accepts only the `~ {\| \|}` form (semantically equivalent) |
+| `DELETE DATA` | ✅ addresses an existing reifier by stable IRI | ❌ vars not allowed in DATA | ❌ rejected per SPARQL §3.1.3 — blank nodes have no addressable identity in `DELETE DATA` | ❌ rejected (same reason) — use `DELETE WHERE` with a binding instead | ❌ same as `INSERT DATA` |
+| `INSERT { } WHERE { }` template | ✅ resolved | ✅ var bound by WHERE; resolves per solution | ✅ per-solution fresh blank (same label across the template = same per-solution blank) | ✅ per-solution fresh blank | ❌ INSERT templates accept only `~ {\| \|}` |
+| `DELETE { } WHERE { }` template | ✅ resolved | ✅ required — the only addressable identity in a DELETE template | ❌ blank nodes forbidden in DELETE templates per SPARQL §3.1.3 | ❌ rejected — anonymous reifier has no addressable identity. Use a named `~ ?ann` bound by WHERE. | ❌ same |
+| `DELETE { } INSERT { } WHERE { }` | DELETE clause follows DELETE rules; INSERT clause follows INSERT rules; WHERE follows query rules | Variable bound by WHERE; usable in both clauses | DELETE: rejected. INSERT: per-solution blank | DELETE: rejected. INSERT: per-solution blank | ❌ |
+
+The reserved-predicate firewall fires across all UPDATE entry points: `INSERT DATA { _:a f:reifiesSubject ex:b }` is rejected at parse time with an error pointing at `@annotation` / the `~ {| |}` syntax. Mint annotations only through the supported surface forms.
 
 ### Querying annotations from SPARQL
 
-The same three surface forms work in `WHERE` clauses. Inline:
+Three query shapes, each backed by a different sidecar lookup:
+
+**Inline anonymous** — match base edge, match metadata, no reifier identity needed:
 
 ```sparql
 PREFIX ex: <http://example.org/>
@@ -401,7 +433,7 @@ SELECT ?role WHERE {
 }
 ```
 
-With a bound reifier variable (one row per parallel annotation):
+**Inline with bound reifier** — one row per parallel annotation on the edge:
 
 ```sparql
 PREFIX ex: <http://example.org/>
@@ -410,7 +442,7 @@ SELECT ?ann ?role WHERE {
 }
 ```
 
-Annotation-rooted via `rdf:reifies` — filter by metadata, return reified-edge endpoints:
+**Annotation-rooted via `rdf:reifies`** — filter by metadata, return reified-edge endpoints:
 
 ```sparql
 PREFIX rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#>
@@ -423,7 +455,26 @@ SELECT ?person ?org WHERE {
 
 Sibling triples about the reifier (here `?ann ex:role "Engineer"`) live in the surrounding scope and join via the standard executor — they do **not** need to live inside the `<<( ... )>>` term.
 
-Fluree's annotation is *lifecycle-coupled* to an asserted edge: the annotation describes a triple that's currently in the graph. RDF 1.2 also allows reifiers for unasserted propositions ("X claims Alice works for Acme, without us asserting it"). That mode is not supported in v1 — see *Current limits* below.
+#### Blank nodes in `WHERE` clauses
+
+Per SPARQL §4.1.4, a blank-node label in a `WHERE` clause is a **non-distinguished variable** — bindable inside the BGP but not exposable via `SELECT`. The same rule applies to reifiers: `?p ex:worksFor ex:acme ~ _:ann { ... }` lets `_:ann` join across the BGP but does not surface in the result.
+
+Anonymous annotation blocks (`{| |}` without `~`) lower to a fresh non-distinguished variable internally (the formatter hides it from `SELECT *` so query output stays clean).
+
+#### Lifecycle coupling
+
+Fluree's annotation is *lifecycle-coupled* to an asserted edge: the annotation describes a triple that's currently in the graph. RDF 1.2 also allows reifiers for unasserted propositions ("X claims Alice works for Acme without us asserting it"). That mode is **not supported in v1** — see *Current limits* below.
+
+### Deferred SPARQL shapes (rejected at parse time)
+
+These produce a clear error with a span pointing at the offending construct:
+
+- **Triple terms outside `rdf:reifies`.** `ex:doc ex:mentions <<( :s :p :o )>>` is rejected. Use a separate annotation subject with `rdf:reifies` if you need to refer to a triple.
+- **Nested triple terms.** `<<( :s :p <<( :a :b :c )>> )>>` is rejected.
+- **Multi-triple reifiers.** One reifier identifier reifying more than one triple term in the same scope is rejected. A reifier corresponds to one edge occurrence.
+- **Annotation on a property-path triple.** `?s ex:p1/ex:p2 ?o {| ... |}` is rejected — the grammar only attaches annotations to simple-predicate triples.
+- **SPARQL `CONSTRUCT` template projecting annotation metadata.** Until the Turtle-star vs RDF 1.2 reifier output decision lands, a CONSTRUCT template containing an annotation tail or `rdf:reifies` returns `UnsupportedFeature`. CONSTRUCT *without* annotation in the template still works even when the WHERE pattern uses annotations to filter.
+- **Annotation on a literal-valued object in SPARQL UPDATE.** Use the JSON-LD path for annotated literals (see *Annotating literal-valued edges* above) until the SPARQL surface picks up parity.
 
 ### Legacy Fluree-specific `<< s p ?o >>` syntax
 
@@ -438,6 +489,8 @@ SELECT ?age ?t ?op WHERE {
 ```
 
 This binds `?t` to the transaction time and `?op` to the assert/retract flag of the matched flake. It is **not** edge annotations and is unrelated to the RDF 1.2 reifier surface above. Use `<<( ... )>>` (parenthesized) and `{| ... |}` for edge annotations; use bare `<< ... >>` only for `f:t` / `f:op`.
+
+The bare-quoted-triple form combined with an annotation tail (`<< :s :p :o >> :pred :obj {| ... |}`) is rejected at parse time — the two surfaces don't compose.
 
 ## Current limits
 
@@ -457,7 +510,7 @@ Today's surface covers the common LPG / RDF-star use cases. The following are no
 - Retraction cascade has a fast path: when both the index root and current novelty know the ledger has no annotations, base-edge retracts skip the attachment lookup entirely.
 - Branch fork, pack/sync, and ledger drop all walk annotation arena artifacts as part of the index reachability set, so annotated ledgers round-trip cleanly across these operations.
 
-For the index format, sidecar layout, sort orders, and garbage-collection treatment, read [`EDGE_ANNOTATIONS.md`](https://github.com/fluree/db/blob/main/EDGE_ANNOTATIONS.md). For the implementation milestones, see `EDGE_ANNOTATIONS_IMPL_PLAN.md`.
+For the index format, sidecar layout, sort orders, and garbage-collection treatment, see the [Edge annotations design doc](../design/edge-annotations.md).
 
 ## Cypher / LPG compatibility
 
@@ -482,7 +535,7 @@ A full Cypher front-end is its own workstream — path values, `MERGE`, pattern 
 
 ## See also
 
-- [`EDGE_ANNOTATIONS.md`](https://github.com/fluree/db/blob/main/EDGE_ANNOTATIONS.md) — design plan and storage internals.
+- [Edge annotations design](../design/edge-annotations.md) — storage internals (EdgeKey, sidecar arena, sticky-bit state machine, GC reachability).
 - [Datasets and named graphs](datasets-and-named-graphs.md) — annotations work in named graphs as well as the default graph.
 - [Time travel](time-travel.md) — annotation events live in history like every other fact.
 - [Policy enforcement](policy-enforcement.md) — annotation properties pass through normal policy checks.
