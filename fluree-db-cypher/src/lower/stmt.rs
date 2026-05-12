@@ -3,7 +3,7 @@
 use fluree_db_core::{DatatypeConstraint, FlakeValue, Sid};
 use fluree_db_query::binding::Binding;
 use fluree_db_query::ir::grouping::{AggregateFn, AggregateSpec, Grouping};
-use fluree_db_query::ir::{Pattern, Query, QueryOutput};
+use fluree_db_query::ir::{Pattern, Query, QueryOutput, SubqueryPattern};
 use fluree_db_query::parse::encode::IriEncoder;
 use fluree_db_query::sort::{SortDirection, SortSpec};
 use fluree_db_query::var_registry::VarId;
@@ -12,7 +12,8 @@ use fluree_vocab::namespaces::XSD;
 use fluree_vocab::xsd_names;
 
 use crate::ast::{
-    Expr, FuncCall, Literal, OrderDirection, ProjectionItem, ReadClause, ReturnClause, UnwindClause,
+    Expr, FuncCall, Literal, OrderDirection, ProjectionItem, ReadClause, ReturnClause,
+    UnwindClause, WithClause,
 };
 
 use super::context::LoweringContext;
@@ -43,10 +44,13 @@ pub fn lower_query<E: IriEncoder>(
                 }
                 patterns.push(Pattern::Optional(inner));
             }
-            ReadClause::With(_) => {
-                return Err(LowerError::unsupported(
-                    "WITH (subquery boundary) is deferred in v1 lowering — initial slice covers single-MATCH queries",
-                ));
+            ReadClause::With(w) => {
+                // WITH wraps all accumulated patterns (plus its own
+                // binds/aggregates/filter/order/limit) into a
+                // `Subquery`. Subsequent clauses operate on the
+                // subquery's projected variables.
+                let subq = lower_with(ctx, w, std::mem::take(&mut patterns))?;
+                patterns.push(Pattern::Subquery(subq));
             }
             ReadClause::Unwind(u) => {
                 patterns.push(lower_unwind(ctx, u)?);
@@ -90,70 +94,21 @@ fn lower_return<E: IriEncoder>(
     r: &ReturnClause,
     patterns: &mut Vec<Pattern>,
 ) -> Result<LoweredReturn> {
-    let mut vars: Vec<VarId> = Vec::new();
-    let mut aggregates: Vec<AggregateSpec> = Vec::new();
-    let mut saw_star = false;
-    let mut alias_counter = 0u32;
+    let mut projection = ProjectionState::new();
     for item in &r.items {
-        // `RETURN *` is the wildcard projection.
-        if let Expr::Var(v) = &item.expr {
-            if v.name == "*" {
-                saw_star = true;
-                continue;
-            }
-            // Bare variable without alias — project directly.
-            if item.alias.is_none() {
-                vars.push(ctx.intern_var(&v.name));
-                continue;
-            }
-        }
-
-        // Aggregate function calls in projection position lift into
-        // `AggregateSpec` entries and project the aggregate's output
-        // variable. No `Bind` is emitted — the planner inserts an
-        // aggregate stage.
-        if let Expr::Call(call) = &item.expr {
-            if let Some(agg_fn) = aggregate_fn(&call.name, call.distinct) {
-                let output_var = aggregate_output_var(ctx, &item.alias, &mut alias_counter);
-                let input_var = aggregate_input_var(ctx, call, &agg_fn)?;
-                aggregates.push(AggregateSpec {
-                    function: agg_fn,
-                    input_var,
-                    output_var,
-                    // The dedicated `CountDistinct` variant handles
-                    // distinct semantics for COUNT internally; for
-                    // SUM/AVG/etc. we forward the user's `DISTINCT`
-                    // marker.
-                    distinct: call.distinct
-                        && !matches!(call.name.to_ascii_lowercase().as_str(), "count"),
-                });
-                vars.push(output_var);
-                continue;
-            }
-        }
-
-        // Any other shape — including a bare Var with an alias, a
-        // computed expression with or without an alias — lowers via a
-        // `Bind` pattern that introduces a fresh (or aliased) VarId.
-        let lowered = lower_expr(ctx, &item.expr)?;
-        let alias_id = aggregate_output_var(ctx, &item.alias, &mut alias_counter);
-        patterns.push(Pattern::Bind {
-            var: alias_id,
-            expr: lowered,
-        });
-        vars.push(alias_id);
+        projection.add_item(ctx, patterns, item)?;
     }
 
-    let output = if saw_star {
+    let output = if projection.saw_star {
         if r.distinct {
             QueryOutput::wildcard_distinct()
         } else {
             QueryOutput::wildcard()
         }
     } else if r.distinct {
-        QueryOutput::select_distinct(vars)
+        QueryOutput::select_distinct(projection.vars)
     } else {
-        QueryOutput::select_all(vars)
+        QueryOutput::select_all(projection.vars)
     };
 
     let limit = const_usize(&r.limit)?;
@@ -161,7 +116,72 @@ fn lower_return<E: IriEncoder>(
 
     let ordering = lower_order_by(ctx, &r.order_by)?;
 
-    Ok((output, ordering, limit, offset, aggregates))
+    Ok((output, ordering, limit, offset, projection.aggregates))
+}
+
+/// Shared state used while lowering a projection list (RETURN, WITH).
+///
+/// Each item either: marks `saw_star`, is a bare-var projection
+/// (push to `vars`), is an aggregate (push to `aggregates` + project
+/// the aggregate's output VarId), or is a general expression (emit a
+/// `Bind` pattern + project the bound VarId).
+struct ProjectionState {
+    vars: Vec<VarId>,
+    aggregates: Vec<AggregateSpec>,
+    saw_star: bool,
+    alias_counter: u32,
+}
+
+impl ProjectionState {
+    fn new() -> Self {
+        Self {
+            vars: Vec::new(),
+            aggregates: Vec::new(),
+            saw_star: false,
+            alias_counter: 0,
+        }
+    }
+
+    fn add_item<E: IriEncoder>(
+        &mut self,
+        ctx: &mut LoweringContext<'_, E>,
+        patterns: &mut Vec<Pattern>,
+        item: &ProjectionItem,
+    ) -> Result<()> {
+        if let Expr::Var(v) = &item.expr {
+            if v.name == "*" {
+                self.saw_star = true;
+                return Ok(());
+            }
+            if item.alias.is_none() {
+                self.vars.push(ctx.intern_var(&v.name));
+                return Ok(());
+            }
+        }
+        if let Expr::Call(call) = &item.expr {
+            if let Some(agg_fn) = aggregate_fn(&call.name, call.distinct) {
+                let output_var = aggregate_output_var(ctx, &item.alias, &mut self.alias_counter);
+                let input_var = aggregate_input_var(ctx, call, &agg_fn)?;
+                self.aggregates.push(AggregateSpec {
+                    function: agg_fn,
+                    input_var,
+                    output_var,
+                    distinct: call.distinct
+                        && !matches!(call.name.to_ascii_lowercase().as_str(), "count"),
+                });
+                self.vars.push(output_var);
+                return Ok(());
+            }
+        }
+        let lowered = lower_expr(ctx, &item.expr)?;
+        let alias_id = aggregate_output_var(ctx, &item.alias, &mut self.alias_counter);
+        patterns.push(Pattern::Bind {
+            var: alias_id,
+            expr: lowered,
+        });
+        self.vars.push(alias_id);
+        Ok(())
+    }
 }
 
 /// Map a Cypher function name to an `AggregateFn`, if it is one of
@@ -263,6 +283,54 @@ fn const_usize(e: &Option<Expr>) -> Result<Option<usize>> {
             "non-literal SKIP/LIMIT is deferred — write a literal integer",
         )),
     }
+}
+
+/// Lower a `WITH` clause boundary to a `Pattern::Subquery`. All
+/// previously-accumulated patterns become the subquery body. The
+/// WITH's projection items become the subquery's select list.
+/// WITH-induced modifiers (WHERE, ORDER BY, SKIP, LIMIT) and
+/// aggregates apply inside the subquery.
+fn lower_with<E: IriEncoder>(
+    ctx: &mut LoweringContext<'_, E>,
+    w: &WithClause,
+    mut inner_patterns: Vec<Pattern>,
+) -> Result<SubqueryPattern> {
+    let mut projection = ProjectionState::new();
+    for item in &w.items {
+        projection.add_item(ctx, &mut inner_patterns, item)?;
+    }
+    if projection.saw_star {
+        return Err(LowerError::unsupported(
+            "WITH * is deferred in v1 — list the variables explicitly",
+        ));
+    }
+
+    // WITH WHERE filters the subquery's solution stream.
+    if let Some(where_expr) = &w.where_clause {
+        let filter = lower_expr(ctx, where_expr)?;
+        inner_patterns.push(Pattern::Filter(filter));
+    }
+
+    let grouping = Grouping::assemble(Vec::new(), projection.aggregates, Vec::new(), None);
+    let mut sq = SubqueryPattern::new(projection.vars, inner_patterns);
+
+    let ordering = lower_order_by(ctx, &w.order_by)?;
+    if !ordering.is_empty() {
+        sq = sq.with_ordering(ordering);
+    }
+    if let Some(limit) = const_usize(&w.limit)? {
+        sq = sq.with_limit(limit);
+    }
+    if let Some(offset) = const_usize(&w.skip)? {
+        sq = sq.with_offset(offset);
+    }
+    if w.distinct {
+        sq = sq.with_distinct();
+    }
+    if let Some(g) = grouping {
+        sq = sq.with_grouping(g);
+    }
+    Ok(sq)
 }
 
 /// Lower `UNWIND <list> AS x` to a `Pattern::Values` with one row per

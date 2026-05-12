@@ -499,6 +499,87 @@ fn aggregate_expression_arg_rejected_in_v1() {
 }
 
 #[test]
+fn with_boundary_lowers_to_subquery() {
+    let q = lower("MATCH (n:Person) WITH n MATCH (n)-[:KNOWS]->(b:Person) RETURN n, b");
+    let has_subquery = q.patterns.iter().any(|p| matches!(p, Pattern::Subquery(_)));
+    assert!(has_subquery, "expected a Subquery from WITH");
+}
+
+#[test]
+fn with_carries_where_filter() {
+    let q = lower("MATCH (n:Person) WITH n WHERE n = n MATCH (n)-[:KNOWS]->(b:Person) RETURN n, b");
+    let sq = q
+        .patterns
+        .iter()
+        .find_map(|p| match p {
+            Pattern::Subquery(sq) => Some(sq),
+            _ => None,
+        })
+        .expect("subquery");
+    let inner_has_filter = sq.patterns.iter().any(|p| matches!(p, Pattern::Filter(_)));
+    assert!(
+        inner_has_filter,
+        "WITH WHERE must place Filter inside the subquery"
+    );
+}
+
+#[test]
+fn with_carries_aggregate_grouping() {
+    let q = lower("MATCH (n:Person) WITH count(*) AS total, n WHERE n = n RETURN total");
+    let sq = q
+        .patterns
+        .iter()
+        .find_map(|p| match p {
+            Pattern::Subquery(sq) => Some(sq),
+            _ => None,
+        })
+        .expect("subquery");
+    assert!(
+        sq.grouping.is_some(),
+        "WITH with an aggregate must carry a Grouping in the subquery"
+    );
+}
+
+#[test]
+fn with_limit_skip_pushdown() {
+    let q = lower("MATCH (n:Person) WITH n SKIP 5 LIMIT 10 RETURN n");
+    let sq = q
+        .patterns
+        .iter()
+        .find_map(|p| match p {
+            Pattern::Subquery(sq) => Some(sq),
+            _ => None,
+        })
+        .expect("subquery");
+    assert_eq!(sq.limit, Some(10));
+    assert_eq!(sq.offset, Some(5));
+}
+
+#[test]
+fn nested_with_boundaries_nest_subqueries() {
+    let q = lower("MATCH (n:Person) WITH n WITH n MATCH (n)-[:KNOWS]->(b:Person) RETURN n, b");
+    // The outer pattern list should have one Subquery containing
+    // another Subquery (the inner WITH wraps the outer WITH's
+    // accumulated patterns).
+    let outer_sq = q
+        .patterns
+        .iter()
+        .find_map(|p| match p {
+            Pattern::Subquery(sq) => Some(sq),
+            _ => None,
+        })
+        .expect("outer subquery");
+    let inner_has_subquery = outer_sq
+        .patterns
+        .iter()
+        .any(|p| matches!(p, Pattern::Subquery(_)));
+    assert!(
+        inner_has_subquery,
+        "the outer Subquery must contain a nested Subquery for the first WITH"
+    );
+}
+
+#[test]
 fn reserved_predicate_is_rejected_in_property_filter() {
     // f:reifiesSubject is reserved. Any attempt to use it as a
     // property name in a Cypher pattern must be rejected.
