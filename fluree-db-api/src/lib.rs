@@ -3039,6 +3039,16 @@ impl Fluree {
     /// v1 supports CREATE only. SET / REMOVE / DELETE / DETACH
     /// DELETE / MERGE return clear deferred-feature errors. See
     /// `docs/concepts/cypher.md` for the surface.
+    ///
+    /// Context resolution: the ledger's configured `default_context`
+    /// (if any) supplies `@vocab` and bare-identifier overrides.
+    /// A CAS read or parse failure on a configured context
+    /// propagates as an error — writes never silently fall back to
+    /// the built-in vocab when a custom context was specified.
+    /// The built-in fallback (`http://example.org/`) applies only
+    /// when (a) the ledger has no nameservice record yet
+    /// (genesis / pre-commit), or (b) the record exists but no
+    /// `default_context` CID is configured.
     pub async fn transact_cypher(
         &self,
         ledger: LedgerState,
@@ -3060,14 +3070,24 @@ impl Fluree {
 
         // Mirror the read path: pull @vocab and term overrides out of
         // the ledger's default context so write Cypher resolves bare
-        // identifiers the same way `query_cypher` does. Best-effort —
-        // if the lookup fails (e.g., ledger has no published context),
-        // fall back to the lowering's built-in default vocab.
-        let default_context = self
-            .get_default_context(ledger.ledger_id())
-            .await
-            .ok()
-            .flatten();
+        // identifiers the same way `query_cypher` does.
+        //
+        // Two cases legitimately produce no context:
+        //   - `Ok(None)`: the ledger record exists but has no
+        //     `default_context` CID configured.
+        //   - `Err(ApiError::NotFound)`: the ledger has no nameservice
+        //     record yet (genesis / pre-commit). There's nothing to
+        //     load by definition.
+        //
+        // Every other error — CAS read failure, parse error, etc. —
+        // propagates so writes never silently land under the
+        // built-in vocab when a custom context was configured but
+        // couldn't be loaded.
+        let default_context = match self.get_default_context(ledger.ledger_id()).await {
+            Ok(ctx) => ctx,
+            Err(ApiError::NotFound(_)) => None,
+            Err(e) => return Err(e),
+        };
         let (vocab, overrides) =
             crate::query::helpers::extract_cypher_iri_mapping(default_context.as_ref());
         let cypher_opts = fluree_db_transact::lower_cypher_update::CypherLowerOpts {
