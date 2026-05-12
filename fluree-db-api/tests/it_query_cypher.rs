@@ -80,6 +80,52 @@ async fn cypher_property_accessor_in_where_filters_results() {
 }
 
 #[tokio::test]
+async fn cypher_property_accessor_is_nullable_for_missing_property() {
+    // Regression: WHERE n.missing IS NULL must match nodes that
+    // lack the property. A mandatory-join lowering would
+    // unconditionally drop them.
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger_id = "it/cypher:nullable-prop";
+    let ledger0 = genesis_ledger(&fluree, ledger_id);
+
+    // Alice has an age; Bob doesn't.
+    let txn = json!({
+        "@context": ctx(),
+        "@graph": [
+            {"@id": "ex:alice", "@type": "ex:Person", "ex:age": 25},
+            {"@id": "ex:bob",   "@type": "ex:Person"},
+        ]
+    });
+    let committed = fluree.insert(ledger0, &txn).await.expect("seed");
+    let db = graphdb_from_ledger(&committed.ledger);
+
+    // IS NULL: only Bob.
+    let result = fluree
+        .query_cypher(&db, "MATCH (n:Person) WHERE n.age IS NULL RETURN n")
+        .await
+        .expect("cypher IS NULL query");
+    assert_eq!(
+        result.row_count(),
+        1,
+        "IS NULL on a missing property must match the node without it"
+    );
+
+    // RETURN n.name across sparse property: even with no names, we
+    // get one row per Person — both Alice and Bob — with null name
+    // for Alice (no name set in this seed) and null name for Bob.
+    // The key contract is row preservation, not null surfacing.
+    let result = fluree
+        .query_cypher(&db, "MATCH (n:Person) RETURN n.name")
+        .await
+        .expect("cypher RETURN of sparse property");
+    assert_eq!(
+        result.row_count(),
+        2,
+        "RETURN of a sparse property must not drop rows for nodes lacking it"
+    );
+}
+
+#[tokio::test]
 async fn cypher_parse_error_returns_clear_diagnostic() {
     let fluree = FlureeBuilder::memory().build_memory();
     let ledger0 = genesis_ledger(&fluree, "it/cypher:parse-error");

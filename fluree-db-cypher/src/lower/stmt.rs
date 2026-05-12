@@ -145,6 +145,28 @@ fn lower_union_query<E: IriEncoder>(
     })
 }
 
+/// Augment a subquery's select list with any VarIds referenced by
+/// its ORDER BY specs that aren't already in the list.
+///
+/// SubqueryOperator's pipeline applies `ProjectOperator(select)`
+/// BEFORE `SortOperator(ordering)`, so a sort key absent from
+/// `select` is dropped before sorting can read it — silently
+/// un-sorting the subquery's output. The synthetic property-accessor
+/// vars (`?#__prop_*`) emitted by `lower_order_by` for `ORDER BY n.age`
+/// are exactly this case.
+///
+/// Surfacing the extra vars to the outer scope is safe because the
+/// `?#`-prefix convention causes the wildcard formatter to filter
+/// them out of `RETURN *` output (see `fluree-db-api/src/format/mod.rs`).
+fn augment_select_with_sort_vars(mut select: Vec<VarId>, ordering: &[SortSpec]) -> Vec<VarId> {
+    for spec in ordering {
+        if !select.contains(&spec.var) {
+            select.push(spec.var);
+        }
+    }
+    select
+}
+
 /// True if the query's RETURN uses `*`. Walks only the head query
 /// (the caller iterates the chain).
 fn uses_wildcard_return(q: &crate::ast::Query) -> bool {
@@ -174,7 +196,15 @@ impl SingleBranch {
     /// branch. The select list pins which variables surface out of
     /// the branch into the outer Union.
     fn into_subquery_pattern(self, select: Vec<VarId>) -> Pattern {
-        let mut sq = SubqueryPattern::new(select, self.patterns);
+        // SubqueryOperator applies ProjectOperator BEFORE SortOperator,
+        // so any sort key that isn't in `select` is dropped before
+        // sorting runs. Augment `select` with vars referenced by
+        // ordering. The synthetic property-accessor vars use the
+        // `?#__prop_*` naming convention which the wildcard
+        // formatter already filters from `RETURN *` output, so
+        // surfacing them into the outer scope is invisible to users.
+        let augmented_select = augment_select_with_sort_vars(select, &self.ordering);
+        let mut sq = SubqueryPattern::new(augmented_select, self.patterns);
         if let Some(limit) = self.limit {
             sq = sq.with_limit(limit);
         }
@@ -585,7 +615,13 @@ fn lower_with<E: IriEncoder>(
     // hand patterns to SubqueryPattern.
     let ordering = lower_order_by(ctx, &w.order_by, &mut inner_patterns)?;
 
-    let mut sq = SubqueryPattern::new(projection.vars, inner_patterns);
+    // SubqueryOperator runs Project BEFORE Sort. Sort keys not in
+    // `select` are dropped before the sort can see them, silently
+    // un-sorting the result. Augment `select` with any vars the
+    // ordering references (the synthetic `?#__prop_*` names stay
+    // hidden from `RETURN *` via the wildcard formatter filter).
+    let augmented_select = augment_select_with_sort_vars(projection.vars, &ordering);
+    let mut sq = SubqueryPattern::new(augmented_select, inner_patterns);
 
     if !ordering.is_empty() {
         sq = sq.with_ordering(ordering);

@@ -139,20 +139,34 @@ pub fn lower_expr<E: IriEncoder>(
 
 /// Resolve a Cypher `target.key` property accessor to a VarId.
 ///
-/// Emits a `Pattern::Triple(target, <key IRI>, ?#__prop_target_key)`
-/// into `aux` so the executor binds the property's value to the
-/// synthetic var. The synthetic var name is deterministic
-/// (`?#__prop_<target>_<key>`), so repeated references to the same
-/// accessor in the same scope share a VarId; the planner deduplicates
-/// the equivalent triple patterns at execution time.
+/// Emits `Pattern::Optional([Triple(target, <key IRI>, ?#__prop_target_key)])`
+/// into `aux`. The **optional** wrap matches Cypher's nullable
+/// property-access semantics: when the target has no value for the
+/// key, the accessor evaluates to null and the row still flows
+/// through the query, not filtered out by a mandatory join.
+///
+/// This makes the following work as Cypher users expect:
+///
+/// - `WHERE n.missing IS NULL` returns nodes lacking the property
+///   (the property var is unbound; `IS NULL` evaluates true).
+/// - `RETURN n.name` for a sparse property returns one row per
+///   matched node, with `null` where the property is absent.
+/// - `avg(n.age)` averages across nodes that have age, skipping
+///   nulls — the aggregate's natural unbound-input behavior.
+/// - `RETURN n.dept, count(*)` groups by dept (with a "null"
+///   group for nodes without one).
+/// - `WHERE n.age > 30` continues to filter to age-bearing nodes
+///   above 30: the `>` comparison on an unbound binding yields a
+///   filter-context error → effective boolean false → row excluded.
+///   Same end result as the previous mandatory-join behavior.
 ///
 /// Why always-emit rather than dedup at lower time: subquery
 /// boundaries (`WITH`) can drop the property variable from the
 /// outer scope if it isn't in the WITH's select list. A naive
 /// "have we already emitted this name?" check would skip the
 /// re-emit in the outer scope, leaving the property var unbound.
-/// Re-emitting is correct and the planner handles redundant triples
-/// cheaply.
+/// Re-emitting is correct and the planner handles redundant
+/// Optionals cheaply.
 ///
 /// v1 only accepts a bare-variable target (`n.prop`); chained
 /// accessors (`n.address.city`) and accessors on non-variable
@@ -182,11 +196,13 @@ pub(crate) fn resolve_property_accessor<E: IriEncoder>(
     let prop_var_name = format!("?#__prop_{}_{}", target_var.name, key);
     let prop_var = ctx.intern_var(&prop_var_name);
 
-    aux.push(Pattern::Triple(TriplePattern::new(
-        Ref::Var(target_id),
-        Ref::Iri(pred_iri.into()),
-        Term::Var(prop_var),
-    )));
+    aux.push(Pattern::Optional(vec![Pattern::Triple(
+        TriplePattern::new(
+            Ref::Var(target_id),
+            Ref::Iri(pred_iri.into()),
+            Term::Var(prop_var),
+        ),
+    )]));
     Ok(prop_var)
 }
 

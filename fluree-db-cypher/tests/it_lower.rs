@@ -734,39 +734,44 @@ fn with_where_without_aggregates_stays_a_filter() {
     );
 }
 
+/// Search the pattern tree for an Optional-wrapped Triple whose
+/// predicate is the given IRI. Property accessors emit this shape
+/// to give Cypher-nullable semantics.
+fn has_optional_prop_triple(patterns: &[Pattern], pred_iri: &str) -> bool {
+    patterns.iter().any(|p| match p {
+        Pattern::Optional(inner) => inner.iter().any(|ip| {
+            matches!(
+                ip,
+                Pattern::Triple(tp) if matches!(&tp.p, Ref::Iri(iri) if iri.as_ref() == pred_iri)
+            )
+        }),
+        _ => false,
+    })
+}
+
 #[test]
-fn property_accessor_in_where_emits_triple_and_binds() {
+fn property_accessor_in_where_emits_optional_triple_and_filter() {
     let q = lower("MATCH (n:Person) WHERE n.age > 30 RETURN n");
-    // Expect: 1 label triple + 1 property triple + 1 Filter
-    let triple_count = q
-        .patterns
-        .iter()
-        .filter(|p| matches!(p, Pattern::Triple(_)))
-        .count();
-    assert_eq!(
-        triple_count, 2,
-        "expected one label triple + one property accessor triple; got {:?}",
+    // Expect: 1 label triple + 1 Optional containing the property
+    // triple + 1 Filter.
+    assert!(
+        has_optional_prop_triple(&q.patterns, "http://example.org/age"),
+        "expected Optional-wrapped property triple for n.age; got {:?}",
         q.patterns
     );
     let has_filter = q.patterns.iter().any(|p| matches!(p, Pattern::Filter(_)));
     assert!(has_filter, "WHERE must emit a Filter");
 
-    // The property triple should sit before the Filter so the
-    // accessor's var is bound when the Filter evaluates.
-    let mut saw_prop_triple = false;
+    // The Optional(prop) must precede the Filter so the var is
+    // bound (or unbound) when the Filter evaluates.
+    let mut saw_opt = false;
     for p in &q.patterns {
         match p {
-            Pattern::Triple(tp) => {
-                if let Ref::Iri(iri) = &tp.p {
-                    if iri.as_ref() == "http://example.org/age" {
-                        saw_prop_triple = true;
-                    }
-                }
-            }
+            Pattern::Optional(_) => saw_opt = true,
             Pattern::Filter(_) => {
                 assert!(
-                    saw_prop_triple,
-                    "property triple must precede the Filter that reads it"
+                    saw_opt,
+                    "property Optional must precede the Filter that reads it"
                 );
             }
             _ => {}
@@ -775,15 +780,30 @@ fn property_accessor_in_where_emits_triple_and_binds() {
 }
 
 #[test]
-fn property_accessor_in_return_emits_triple_and_binds_then_projects() {
+fn property_accessor_is_nullable_for_is_null_check() {
+    // Regression: WHERE n.missing IS NULL must match nodes that
+    // lack the property. With a mandatory join, the property var
+    // would never be bound for those nodes and the row would be
+    // excluded outright — the IS NULL check would never see them.
+    // The Optional-wrap makes the property var legitimately unbound
+    // for those nodes, so `Bound(?prop)` evaluates false and
+    // `IS NULL` (i.e. `NOT Bound`) evaluates true.
+    let q = lower("MATCH (n:Person) WHERE n.missing IS NULL RETURN n");
+    assert!(
+        has_optional_prop_triple(&q.patterns, "http://example.org/missing"),
+        "IS NULL on a property still needs the Optional-wrapped triple in the pattern list"
+    );
+    let has_filter = q.patterns.iter().any(|p| matches!(p, Pattern::Filter(_)));
+    assert!(has_filter);
+}
+
+#[test]
+fn property_accessor_in_return_emits_optional_triple_and_bind() {
     let q = lower("MATCH (n:Person) RETURN n.name");
-    // Expect a property triple for n.name and a Bind that captures
-    // the synthetic var as the projection output.
-    let has_prop_triple = q.patterns.iter().any(|p| matches!(
-        p,
-        Pattern::Triple(tp) if matches!(&tp.p, Ref::Iri(iri) if iri.as_ref() == "http://example.org/name")
-    ));
-    assert!(has_prop_triple, "expected property triple for n.name");
+    assert!(
+        has_optional_prop_triple(&q.patterns, "http://example.org/name"),
+        "expected Optional-wrapped property triple for n.name"
+    );
     let has_bind = q.patterns.iter().any(|p| matches!(p, Pattern::Bind { .. }));
     assert!(has_bind, "RETURN of n.name must emit a Bind");
 }
@@ -793,11 +813,10 @@ fn property_accessor_in_aggregate_arg() {
     // RETURN avg(n.age) — the aggregate's input is a property var.
     use fluree_db_query::ir::grouping::{AggregateFn, Grouping};
     let q = lower("MATCH (n:Person) RETURN avg(n.age) AS avg_age");
-    let has_prop_triple = q.patterns.iter().any(|p| matches!(
-        p,
-        Pattern::Triple(tp) if matches!(&tp.p, Ref::Iri(iri) if iri.as_ref() == "http://example.org/age")
+    assert!(has_optional_prop_triple(
+        &q.patterns,
+        "http://example.org/age"
     ));
-    assert!(has_prop_triple);
     let grouping = q.grouping.expect("expected implicit grouping");
     match grouping {
         Grouping::Implicit { aggregation, .. } => {
@@ -837,15 +856,70 @@ fn property_accessor_drives_explicit_group_by() {
 #[test]
 fn property_accessor_in_order_by() {
     let q = lower("MATCH (n:Person) RETURN n ORDER BY n.age DESC");
-    let has_prop_triple = q.patterns.iter().any(|p| matches!(
-        p,
-        Pattern::Triple(tp) if matches!(&tp.p, Ref::Iri(iri) if iri.as_ref() == "http://example.org/age")
-    ));
     assert!(
-        has_prop_triple,
-        "ORDER BY n.age must emit the property triple"
+        has_optional_prop_triple(&q.patterns, "http://example.org/age"),
+        "ORDER BY n.age must emit the Optional-wrapped property triple"
     );
     assert_eq!(q.ordering.len(), 1);
+}
+
+#[test]
+fn with_order_by_property_includes_sort_var_in_subquery_select() {
+    // Regression for SubqueryOperator's Project-before-Sort order:
+    // when a WITH's ORDER BY references a property accessor, the
+    // synthetic sort var must be in the SubqueryPattern's select
+    // list, or it would be dropped by Project before Sort runs and
+    // the subquery would emerge effectively unordered.
+    let q = lower("MATCH (n:Person) WITH n ORDER BY n.age LIMIT 10 RETURN n");
+    let sq = q
+        .patterns
+        .iter()
+        .find_map(|p| match p {
+            Pattern::Subquery(sq) => Some(sq),
+            _ => None,
+        })
+        .expect("subquery from WITH");
+    // The select list should contain at least `n` and the synthetic
+    // `?#__prop_n_age` (the sort var).
+    let select_has_sort_var = sq.select.iter().any(|v| {
+        // We can't read VarRegistry from here, but at least one
+        // extra var beyond the projected `n` must be present.
+        let _ = v;
+        true
+    });
+    assert!(select_has_sort_var, "select list must not be empty");
+    assert!(
+        sq.select.len() >= 2,
+        "SubqueryPattern.select must include the sort var so Project doesn't drop it before Sort; got {} entries",
+        sq.select.len()
+    );
+    assert!(!sq.ordering.is_empty(), "ordering must be set");
+}
+
+#[test]
+fn union_branch_order_by_property_includes_sort_var() {
+    // Same Project-before-Sort issue applies to UNION branches:
+    // each branch is wrapped in a SubqueryPattern. If a branch
+    // uses ORDER BY n.prop, the sort var must surface to the
+    // branch's select list so Sort can read it.
+    let q = lower(
+        "MATCH (n:Person) RETURN n ORDER BY n.age UNION MATCH (n:Employee) RETURN n ORDER BY n.age",
+    );
+    let union = match q.patterns.first().expect("at least one pattern") {
+        Pattern::Union(b) => b,
+        other => panic!("expected Union, got {other:?}"),
+    };
+    for branch in union {
+        let sq = match &branch[0] {
+            Pattern::Subquery(sq) => sq,
+            other => panic!("expected Subquery in Union branch, got {other:?}"),
+        };
+        assert!(
+            sq.select.len() >= 2,
+            "UNION branch SubqueryPattern.select must include the sort var; got {} entries",
+            sq.select.len()
+        );
+    }
 }
 
 #[test]

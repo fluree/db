@@ -122,16 +122,27 @@ ORDER BY / SKIP / LIMIT
   `expr IN [a, b, ...]`, `CASE WHEN ... THEN ... END` (simple and
   subject forms), `EXISTS { pattern }`.
 - Property accessors `n.prop` in expression position. Lowered by
-  emitting an auxiliary triple `(n, <prop IRI>, ?#__prop_n_prop)`
-  before the consuming Filter/Bind/aggregate so the synthetic var
-  is bound when the expression evaluates. Bare-variable target
-  only in v1; chained accessors (`n.a.b`) are rejected.
+  emitting an auxiliary `Optional((n, <prop IRI>, ?#__prop_n_prop))`
+  before the consuming Filter/Bind/aggregate. The Optional wrap
+  preserves Cypher's nullable property-access semantics: when `n`
+  has no value for the key, the accessor evaluates to null instead
+  of dropping the row. This makes `WHERE n.missing IS NULL`
+  return nodes lacking the property, `RETURN n.name` return one
+  row per matched node (with null where the property is absent),
+  and `avg(n.age)` average across all matched nodes — skipping
+  nulls — as Cypher users expect. `WHERE n.age > 30` continues to
+  filter to age-bearing nodes above 30 (the `>` comparison on an
+  unbound binding yields filter-context false). Bare-variable
+  target only in v1; chained accessors (`n.a.b`) are rejected.
 - ORDER BY (variable or property-accessor keys), SKIP, LIMIT.
 - `UNWIND [literals] AS x` — inline list literal unwinding.
 - Aggregates: `count(*)`, `count(x)`, `count(DISTINCT x)`,
-  `sum(x)`, `avg(x)`, `min(x)`, `max(x)` (bare-variable arguments
-  only in v1). Mixed projections (`RETURN n, count(*) AS c`)
-  implicitly group by the non-aggregate projections.
+  `sum(x)`, `avg(x)`, `min(x)`, `max(x)`. Arguments may be a bare
+  variable (`count(n)`) or a property accessor (`avg(n.age)`);
+  other expression-valued arguments (`sum(n.age * 2)`) are deferred
+  pending a pre-aggregation `Bind`. Mixed projections
+  (`RETURN n, count(*) AS c`) implicitly group by the non-aggregate
+  projections.
 - `WITH ... [WHERE/ORDER BY/SKIP/LIMIT/DISTINCT]` — subquery
   boundary. WHERE that references aggregate aliases lowers to HAVING
   rather than a pre-aggregation Filter. Nested WITHs nest Subqueries.
