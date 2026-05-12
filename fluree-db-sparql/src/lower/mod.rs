@@ -196,8 +196,9 @@ fn reject_direct_reifies_in_patterns(patterns: &[Pattern]) -> Result<()> {
                 Pattern::Graph { patterns, .. } => walk(patterns)?,
                 Pattern::Service(sp) => walk(&sp.patterns)?,
                 Pattern::Subquery(sq) => walk(&sq.patterns)?,
-                Pattern::EdgeAnnotation { body, .. }
-                | Pattern::AnnotationTarget { body, .. } => walk(body)?,
+                Pattern::EdgeAnnotation { body, .. } | Pattern::AnnotationTarget { body, .. } => {
+                    walk(body)?
+                }
                 _ => {}
             }
         }
@@ -3270,9 +3271,14 @@ mod tests {
         .expect("lower should succeed");
         assert_eq!(query.patterns.len(), 1);
         match &query.patterns[0] {
-            Pattern::EdgeAnnotation { body, annotation, .. } => {
+            Pattern::EdgeAnnotation {
+                body, annotation, ..
+            } => {
                 assert_eq!(body.len(), 1, "one annotation entry → one body triple");
-                assert!(matches!(annotation, Ref::Var(_)), "anonymous reifier mints var");
+                assert!(
+                    matches!(annotation, Ref::Var(_)),
+                    "anonymous reifier mints var"
+                );
                 match &body[0] {
                     Pattern::Triple(tp) => {
                         // Body triple's subject is the annotation reifier var.
@@ -3310,7 +3316,9 @@ mod tests {
                 match &body[0] {
                     Pattern::Triple(tp) => match &tp.dtc {
                         Some(fluree_db_core::DatatypeConstraint::Explicit(_)) => {}
-                        other => panic!("body string literal must have Explicit dtc, got {other:?}"),
+                        other => {
+                            panic!("body string literal must have Explicit dtc, got {other:?}")
+                        }
                     },
                     other => panic!("body[0] should be Pattern::Triple, got {other:?}"),
                 }
@@ -3413,7 +3421,9 @@ mod tests {
         )
         .unwrap();
         match &query.patterns[0] {
-            Pattern::EdgeAnnotation { body, annotation, .. } => {
+            Pattern::EdgeAnnotation {
+                body, annotation, ..
+            } => {
                 assert!(body.is_empty());
                 assert!(matches!(annotation, Ref::Var(_)));
             }
@@ -3541,6 +3551,9 @@ mod tests {
             "PREFIX ex: <http://example.org/>
              SELECT * WHERE { ex:alice ex:worksFor ex:acme {| ex:role \"x\" |} . }",
         );
-        assert!(result.is_ok(), "lower should not be rejected by the firewall");
+        assert!(
+            result.is_ok(),
+            "lower should not be rejected by the firewall"
+        );
     }
 }

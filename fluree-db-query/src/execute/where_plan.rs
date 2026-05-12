@@ -186,9 +186,8 @@ fn expand_one_into(pattern: Pattern, out: &mut Vec<Pattern>, inside_graph: bool)
             // Inside an explicit Pattern::Graph, expansion must
             // suppress the DefaultGraphSource wrapper — propagate
             // `inside_graph = true`.
-            let expanded = pattern.map_subpatterns(&mut |inner| {
-                expand_edge_annotation_patterns_inside_graph(&inner)
-            });
+            let expanded = pattern
+                .map_subpatterns(&mut |inner| expand_edge_annotation_patterns_inside_graph(&inner));
             out.push(expanded);
         }
         Pattern::Optional(_)
@@ -247,7 +246,6 @@ fn reifies_object_ref() -> Ref {
         fluree_vocab::db::REIFIES_OBJECT,
     ))
 }
-
 
 #[inline]
 fn filter_not_bound_var(expr: &Expression) -> Option<VarId> {
@@ -3589,8 +3587,7 @@ mod tests {
 
     #[test]
     fn expand_edge_annotation_propagates_explicit_dtc_to_reifies_object() {
-        let xsd_string =
-            fluree_db_core::DatatypeConstraint::Explicit(Sid::new(2, "string"));
+        let xsd_string = fluree_db_core::DatatypeConstraint::Explicit(Sid::new(2, "string"));
         let edge = TriplePattern {
             s: Ref::Var(VarId(0)),
             p: Ref::Sid(Sid::new(100, "name")),
@@ -3603,7 +3600,11 @@ mod tests {
             body: Vec::new(),
         }];
         let expanded = expand_edge_annotation_patterns(&patterns);
-        assert_eq!(expanded.len(), 1, "expansion produces one DefaultGraphSource wrapper");
+        assert_eq!(
+            expanded.len(),
+            1,
+            "expansion produces one DefaultGraphSource wrapper"
+        );
         let chain = unwrap_default_graph_source(&expanded[0]);
         let reifies_obj = find_reifies_object_triple(chain);
         assert_eq!(reifies_obj.dtc, Some(xsd_string));
@@ -3615,8 +3616,7 @@ mod tests {
         // a language-tagged literal on the base edge must constrain the
         // synthesized f:reifiesObject lookup by the same lang tag, or
         // same-lexical strings in different languages would cross-match.
-        let lang_fr =
-            fluree_db_core::DatatypeConstraint::LangTag(std::sync::Arc::from("fr"));
+        let lang_fr = fluree_db_core::DatatypeConstraint::LangTag(std::sync::Arc::from("fr"));
         let edge = TriplePattern {
             s: Ref::Var(VarId(0)),
             p: Ref::Sid(Sid::new(100, "label")),

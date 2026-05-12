@@ -39,12 +39,12 @@ async fn seed_alice_engineer(ledger_id: &str) -> (MemoryFluree, MemoryLedger) {
 async fn sparql_annotation_block_inline_query_returns_role() {
     let (fluree, ledger) = seed_alice_engineer("it/sparql-ann/inline").await;
 
-    let sparql = r#"
+    let sparql = r"
         PREFIX ex: <http://example.org/>
         SELECT ?role WHERE {
           ex:alice ex:worksFor ex:acme {| ex:role ?role |} .
         }
-    "#;
+    ";
     let result = support::query_sparql(&fluree, &ledger, sparql)
         .await
         .expect("sparql annotation query");
@@ -56,9 +56,7 @@ async fn sparql_annotation_block_inline_query_returns_role() {
         .expect("bindings array")
         .clone();
     assert_eq!(bindings.len(), 1, "one annotation → one row: {bindings:#?}");
-    let role = bindings[0]["role"]["value"]
-        .as_str()
-        .expect("role value");
+    let role = bindings[0]["role"]["value"].as_str().expect("role value");
     assert_eq!(role, "Engineer");
 }
 
@@ -69,12 +67,12 @@ async fn sparql_named_var_reifier_binds_annotation_subject() {
     // The reifier var `?ann` is bindable in SELECT — but it's a
     // synthetic blank-node-like subject internally (the JSON-LD insert
     // was anonymous), so SPARQL should still surface it as a value.
-    let sparql = r#"
+    let sparql = r"
         PREFIX ex: <http://example.org/>
         SELECT ?role WHERE {
           ex:alice ex:worksFor ex:acme ~ ?ann {| ex:role ?role |} .
         }
-    "#;
+    ";
     let result = support::query_sparql(&fluree, &ledger, sparql)
         .await
         .expect("sparql named-var reifier query");
@@ -134,12 +132,12 @@ async fn sparql_rdf_reifies_form_returns_reified_edge() {
 #[tokio::test]
 async fn sparql_bare_triple_unaffected_by_annotation_presence() {
     let (fluree, ledger) = seed_alice_engineer("it/sparql-ann/bare").await;
-    let sparql = r#"
+    let sparql = r"
         PREFIX ex: <http://example.org/>
         SELECT ?person ?org WHERE {
           ?person ex:worksFor ?org .
         }
-    "#;
+    ";
     let result = support::query_sparql(&fluree, &ledger, sparql)
         .await
         .expect("bare-triple query");
@@ -198,12 +196,12 @@ async fn sparql_insert_data_with_anonymous_annotation_round_trips() {
     let ledger = result.ledger;
 
     // Read back via SPARQL annotation query.
-    let select = r#"
+    let select = r"
         PREFIX ex: <http://example.org/>
         SELECT ?role WHERE {
           ex:alice ex:worksFor ex:acme {| ex:role ?role |} .
         }
-    "#;
+    ";
     let bindings = support::query_sparql(&fluree, &ledger, select)
         .await
         .expect("read-back query")
@@ -237,12 +235,12 @@ async fn sparql_insert_data_with_named_blank_reifier_round_trips() {
         .expect("INSERT DATA with named blank reifier");
     let ledger = result.ledger;
 
-    let select = r#"
+    let select = r"
         PREFIX ex: <http://example.org/>
         SELECT ?role ?since WHERE {
           ex:alice ex:worksFor ex:acme {| ex:role ?role ; ex:since ?since |} .
         }
-    "#;
+    ";
     let bindings = support::query_sparql(&fluree, &ledger, select)
         .await
         .expect("query")
@@ -270,7 +268,11 @@ async fn sparql_delete_data_blank_reifier_is_rejected() {
         }
     "#;
     let parsed = fluree_db_sparql::parse_sparql(update);
-    assert!(!parsed.has_errors(), "parse should succeed: {:?}", parsed.diagnostics);
+    assert!(
+        !parsed.has_errors(),
+        "parse should succeed: {:?}",
+        parsed.diagnostics
+    );
     let ast = parsed.ast.unwrap();
     let mut ns = NamespaceRegistry::from_db(&ledger0.snapshot);
     let err = fluree_db_transact::lower_sparql_update_ast(&ast, &mut ns, TxnOpts::default())
@@ -317,15 +319,19 @@ async fn sparql_reifies_hidden_in_annotation_block_body_is_rejected() {
         let fluree = FlureeBuilder::memory().build_memory();
         genesis_ledger(&fluree, "it/sparql-ann-update/reifies-bypass")
     };
-    let update = r#"
+    let update = r"
         PREFIX ex: <http://example.org/>
         PREFIX f:  <https://ns.flur.ee/db#>
         INSERT DATA {
           ex:alice ex:worksFor ex:acme {| f:reifiesSubject ex:evil |} .
         }
-    "#;
+    ";
     let parsed = fluree_db_sparql::parse_sparql(update);
-    assert!(!parsed.has_errors(), "parse should succeed: {:?}", parsed.diagnostics);
+    assert!(
+        !parsed.has_errors(),
+        "parse should succeed: {:?}",
+        parsed.diagnostics
+    );
     let ast = parsed.ast.unwrap();
     let mut ns = NamespaceRegistry::from_db(&ledger0.snapshot);
     let err = fluree_db_transact::lower_sparql_update_ast(&ast, &mut ns, TxnOpts::default())
@@ -343,13 +349,13 @@ async fn sparql_user_authored_reifies_in_insert_data_is_rejected() {
         let fluree = FlureeBuilder::memory().build_memory();
         genesis_ledger(&fluree, "it/sparql-ann-update/user-reifies")
     };
-    let update = r#"
+    let update = r"
         PREFIX ex: <http://example.org/>
         PREFIX f:  <https://ns.flur.ee/db#>
         INSERT DATA {
           _:ann f:reifiesSubject ex:alice .
         }
-    "#;
+    ";
     let parsed = fluree_db_sparql::parse_sparql(update);
     assert!(!parsed.has_errors());
     let ast = parsed.ast.unwrap();
@@ -369,16 +375,18 @@ async fn sparql_select_star_does_not_leak_blank_node_reifier_named() {
     // Per SPARQL §4.1.4 blank nodes in WHERE are non-distinguished
     // variables and must not appear in `SELECT *` results.
     let (fluree, ledger) = seed_alice_engineer("it/sparql-ann/star-blank-named").await;
-    let sparql = r#"
+    let sparql = r"
         PREFIX ex: <http://example.org/>
         SELECT * WHERE {
           ex:alice ex:worksFor ex:acme ~ _:ann {| ex:role ?role |} .
         }
-    "#;
+    ";
     let result = support::query_sparql(&fluree, &ledger, sparql)
         .await
         .expect("query");
-    let head = result.to_sparql_json(&ledger.snapshot).expect("sparql json");
+    let head = result
+        .to_sparql_json(&ledger.snapshot)
+        .expect("sparql json");
     let names: Vec<String> = head["head"]["vars"]
         .as_array()
         .expect("head.vars")
@@ -398,18 +406,20 @@ async fn sparql_select_star_does_not_leak_blank_node_reifier_reifies_form() {
     // `lower_subject()`, which registers the blank node under `_:ann`.
     // Same §4.1.4 rule applies.
     let (fluree, ledger) = seed_alice_engineer("it/sparql-ann/star-blank-reifies").await;
-    let sparql = r#"
+    let sparql = r"
         PREFIX rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#>
         PREFIX ex:  <http://example.org/>
         SELECT * WHERE {
           _:ann rdf:reifies <<( ex:alice ex:worksFor ex:acme )>> .
           _:ann ex:role ?role .
         }
-    "#;
+    ";
     let result = support::query_sparql(&fluree, &ledger, sparql)
         .await
         .expect("query");
-    let head = result.to_sparql_json(&ledger.snapshot).expect("sparql json");
+    let head = result
+        .to_sparql_json(&ledger.snapshot)
+        .expect("sparql json");
     let names: Vec<String> = head["head"]["vars"]
         .as_array()
         .expect("head.vars")
@@ -429,12 +439,12 @@ async fn sparql_select_star_does_not_leak_anonymous_reifier() {
 
     // SELECT * over an anonymous annotation block must NOT expose the
     // synthetic anonymous-reifier variable. Only ?role should appear.
-    let sparql = r#"
+    let sparql = r"
         PREFIX ex: <http://example.org/>
         SELECT * WHERE {
           ex:alice ex:worksFor ex:acme {| ex:role ?role |} .
         }
-    "#;
+    ";
     let result = support::query_sparql(&fluree, &ledger, sparql)
         .await
         .expect("select-star query");
@@ -508,12 +518,12 @@ async fn sparql_modify_insert_template_with_annotation_round_trips() {
         .expect("INSERT WHERE with annotation template");
     let ledger2 = result2.ledger;
 
-    let select = r#"
+    let select = r"
         PREFIX ex: <http://example.org/>
         SELECT ?role WHERE {
           ex:alice ex:worksFor ex:acme {| ex:role ?role |} .
         }
-    "#;
+    ";
     let bindings = support::query_sparql(&fluree, &ledger2, select)
         .await
         .expect("read-back")

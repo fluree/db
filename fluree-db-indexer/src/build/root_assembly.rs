@@ -239,9 +239,13 @@ pub(crate) struct Fir6Inputs {
     /// - `Augment(events)` / `Unknown` / `None` — we can't prove
     ///   completeness without a base arena (the rebuild path
     ///   doesn't yet collect events from the resolver). Stay in
-    ///   scan-fallback (`annotation_index = None`); the next
-    ///   incremental pass with a populated overlay can seal an
-    ///   authoritative arena.
+    ///   scan-fallback (`annotation_index = None`) until an
+    ///   explicitly `Authoritative` source is supplied — i.e. a
+    ///   future rebuild whose caller passes the full event set,
+    ///   or an incremental pass that can prove its overlay
+    ///   coverage is authoritative. Augment alone cannot reseal
+    ///   from this state because the indexer has no way to
+    ///   recover the missing history.
     pub attachment_events: Option<crate::config::AttachmentEventCoverage>,
 }
 
@@ -380,12 +384,16 @@ pub(crate) async fn encode_and_write_root_v6(
     //                            recover historical attachments
     //                            beyond the supplied events. Stay
     //                            in scan-fallback (annotation_index
-    //                            = None). The next incremental pass
-    //                            with running overlay coverage can
-    //                            seal an arena. (A future slice can
-    //                            collect events from the resolver
-    //                            and turn this into Authoritative
-    //                            here.)
+    //                            = None) until an explicitly
+    //                            `Authoritative` source is provided
+    //                            (a future rebuild whose caller
+    //                            passes the full event set, or
+    //                            resolver-side event collection
+    //                            that lets the indexer produce its
+    //                            own complete history). Augment
+    //                            alone cannot reseal from this
+    //                            state — the indexer cannot
+    //                            reconstruct the missing history.
     //   Unknown / None        → no caller events; no-op.
     //
     // Events clipped to t <= inputs.index_t for the same reason as
@@ -435,6 +443,18 @@ pub(crate) async fn encode_and_write_root_v6(
         Some(AttachmentEventCoverage::Unknown) | None => {
             // Non-annotation ledger fast path or scan-fallback state.
         }
+    }
+
+    // Coerce `had_annotation_arena = true` on any
+    // indexer-produced root with `has_annotations = true`. The
+    // rationale matches the incremental builder's `build()`:
+    // every indexer pass on an annotation-bearing ledger
+    // represents history the indexer owns; the provider's
+    // base-index scan-fallback must not later reconstruct a
+    // live-only `Authoritative` arena from such a root. Bulk
+    // import is the only path that leaves the bit false.
+    if root.has_annotations {
+        root.had_annotation_arena = true;
     }
 
     // Attach garbage manifest and prev_index if provided.

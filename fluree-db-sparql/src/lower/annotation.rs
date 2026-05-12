@@ -103,9 +103,11 @@ impl<E: IriEncoder> LoweringContext<'_, E> {
                 // as a comment-start outside string literals, so no user
                 // variable can ever lex with this name. `lower_select_clause`
                 // filters these out of `SELECT *` expansion.
-                let var_id = self
-                    .vars
-                    .get_or_insert(&format!("?{}__ann_{}", INTERNAL_VAR_PREFIX, self.vars.len()));
+                let var_id = self.vars.get_or_insert(&format!(
+                    "?{}__ann_{}",
+                    INTERNAL_VAR_PREFIX,
+                    self.vars.len()
+                ));
                 Ok(Ref::Var(var_id))
             }
         }

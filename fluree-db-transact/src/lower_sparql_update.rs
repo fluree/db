@@ -277,9 +277,8 @@ fn expand_annotated_triples(
         // f:reifiesGraph is omitted (default graph only).
         // f:reifiesDatatype / f:reifiesLang / f:reifiesListIndex are
         // derived at flake time per the JSON-LD path's convention.
-        let pred_iri = |s: &'static str| -> PredicateTerm {
-            PredicateTerm::Iri(Iri::full(s, span))
-        };
+        let pred_iri =
+            |s: &'static str| -> PredicateTerm { PredicateTerm::Iri(Iri::full(s, span)) };
         out.push(TriplePattern::new(
             reifier.clone(),
             pred_iri(reifies_iris::SUBJECT),
@@ -325,9 +324,9 @@ fn subject_to_object(s: &SubjectTerm) -> Term {
         SubjectTerm::Var(v) => Term::Var(v.clone()),
         SubjectTerm::Iri(i) => Term::Iri(i.clone()),
         SubjectTerm::BlankNode(b) => Term::BlankNode(b.clone()),
-        SubjectTerm::QuotedTriple(_) => unreachable!(
-            "RDF-star quoted triples are rejected before annotation expansion"
-        ),
+        SubjectTerm::QuotedTriple(_) => {
+            unreachable!("RDF-star quoted triples are rejected before annotation expansion")
+        }
     }
 }
 
@@ -377,8 +376,10 @@ fn expand_annotated_triples_in_quad_pattern(
         }
     }
     expand_annotated_triples(&mut default_triples, mode, bnodes)?;
-    let mut out: Vec<QuadPatternElement> =
-        default_triples.into_iter().map(QuadPatternElement::Triple).collect();
+    let mut out: Vec<QuadPatternElement> = default_triples
+        .into_iter()
+        .map(QuadPatternElement::Triple)
+        .collect();
     out.extend(graph_blocks);
     pattern.patterns = out;
     Ok(())
@@ -400,13 +401,13 @@ fn reject_user_authored_reifies(
 ) -> Result<(), LowerError> {
     use fluree_vocab::reifies_iris;
 
-    fn check_predicate(
-        pred: &PredicateTerm,
-        prologue: &Prologue,
-    ) -> Result<(), LowerError> {
+    fn check_predicate(pred: &PredicateTerm, prologue: &Prologue) -> Result<(), LowerError> {
         if let PredicateTerm::Iri(iri) = pred {
             let expanded = expand_iri(iri, prologue)?;
-            if reifies_iris::ALL.iter().any(|known| *known == expanded.as_str()) {
+            if reifies_iris::ALL
+                .iter()
+                .any(|known| *known == expanded.as_str())
+            {
                 return Err(LowerError::UnsupportedFeature {
                     feature: "user-authored f:reifies* predicate in SPARQL UPDATE \
                               (system-controlled — use the `~ {| ... |}` annotation \
@@ -438,10 +439,9 @@ fn reject_user_authored_reifies_in_quad_pattern(
 ) -> Result<(), LowerError> {
     for el in &pattern.patterns {
         match el {
-            QuadPatternElement::Triple(t) => reject_user_authored_reifies(
-                std::slice::from_ref(t),
-                prologue,
-            )?,
+            QuadPatternElement::Triple(t) => {
+                reject_user_authored_reifies(std::slice::from_ref(t), prologue)?
+            }
             QuadPatternElement::Graph { triples, .. } => {
                 reject_user_authored_reifies(triples, prologue)?;
             }

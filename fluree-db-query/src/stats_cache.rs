@@ -64,8 +64,7 @@ pub(crate) fn cached_stats_view_for_db(
             indexed
         };
 
-        let mut view =
-            StatsView::from_db_stats_with_namespaces(&stats, db.snapshot.namespaces());
+        let mut view = StatsView::from_db_stats_with_namespaces(&stats, db.snapshot.namespaces());
         // Overlay arena-derived stats for `f:reifies*` predicates so the
         // join planner gets tight selectivity estimates on snapshots
         // with a built annotation index. See

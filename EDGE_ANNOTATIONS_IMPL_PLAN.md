@@ -1071,29 +1071,41 @@ here as a record of the mechanism).
           predicate-dict sticky bit),
        3. `snapshot.annotation_index.is_none()` (no arena
           currently sealed),
-       4. `!snapshot.had_annotation_arena` (no arena was *ever*
-          sealed for this ledger — distinguishes a fresh
-          annotation-bearing import from a defensive-drop state,
-          where the dropped arena's retract/reassert history
-          cannot be recovered from a live-only scan).
+       4. `!snapshot.had_annotation_arena` (the indexer has never
+          touched this ledger's annotation history — see below).
      When eligible, the provider walks the base index for
      `f:reifies*` flakes
      (`scan_base_index_for_attachment_events`), groups them by
      annotation SID via per-predicate PSOT scans, decodes each
      bundle into an `EdgeKey`, and surfaces the result as
      `AttachmentEventCoverage::Authoritative`. The indexer then
-     seals an authoritative arena from those events and flips
-     `IndexRoot.had_annotation_arena = true` (the sticky bit is
-     never cleared by any subsequent root assembly, including
-     defensive drops).
+     seals an authoritative arena from those events. Any further
+     indexer pass coerces `IndexRoot.had_annotation_arena = true`
+     (whether or not it seals — see below); the bit is never
+     cleared by any subsequent root assembly.
    - `LedgerManager::get_loaded_view` is new public api support
      for the provider's base-index scan path.
    - `IndexRoot.had_annotation_arena: bool` (carried in the
      FIR6 extended-flags byte, low byte of the historically-zero
-     `pad(2)` header field) is the durable signal that
-     distinguishes the two `has_annotations=true,
-     annotation_index=None` states. Backward compatible: old
-     roots decode the byte as `0` → `had_annotation_arena=false`.
+     `pad(2)` header field) is the durable signal that gates the
+     scan-fallback. Despite the name, the load-bearing meaning is
+     "base-index bootstrap is **not** allowed": the bit is set by
+     `IncrementalRootBuilder::build()` /
+     `encode_and_write_root_v6` on *any* indexer-produced root with
+     `has_annotations=true`, regardless of whether an arena was
+     sealed by that pass — covers both defensive-drop and
+     no-provider-seal cases. Only fresh bulk-import roots leave it
+     false, since they don't go through either indexer assembly
+     path. Wire backward compatibility:
+       - Old roots with `annotation_index = None` decode the byte
+         as `0` → `had_annotation_arena = false` (matches the
+         never-touched state).
+       - Old roots with `annotation_index = Some(_)` had no way to
+         write the extended bit, so the byte is `0`; the
+         **decoder coerces** `had_annotation_arena = true` from
+         `annotation_index.is_some()` (mirrors the encoder
+         coercion). Otherwise a later defensive drop would land
+         in the bootstrap-eligible state on these legacy roots.
 
    The PSOT-based group-by-annotation-SID approach (rather than
    SPOT s=ann scans) sidesteps a SPOT-direction scan quirk where

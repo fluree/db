@@ -849,7 +849,7 @@ mod tests {
         buf.extend_from_slice(&0u16.to_le_bytes()); // pad (2)
         buf.extend_from_slice(&index_t.to_le_bytes()); // index_t (8)
         buf.extend_from_slice(&base_t.to_le_bytes()); // base_t (8)
-        // ledger_id (u16 length prefix + UTF-8 bytes)
+                                                      // ledger_id (u16 length prefix + UTF-8 bytes)
         let lid = ledger_id.as_bytes();
         buf.extend_from_slice(&(lid.len() as u16).to_le_bytes());
         buf.extend_from_slice(lid);

@@ -1090,7 +1090,10 @@ mod tests {
         // matching the `~ _:ann` named-reifier form.
         assert_eq!(
             tok("~ _:ann"),
-            vec![TokenKind::Tilde, TokenKind::BlankNodeLabel(Arc::from("ann"))]
+            vec![
+                TokenKind::Tilde,
+                TokenKind::BlankNodeLabel(Arc::from("ann"))
+            ]
         );
 
         // A complete annotated triple shape lexes cleanly end-to-end.

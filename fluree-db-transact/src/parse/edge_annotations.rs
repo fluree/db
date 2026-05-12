@@ -742,21 +742,18 @@ fn walk_delete_for_annotations(
             // but be invisible to
             // `reject_context_coercion_on_annotated_literal`, masking
             // an EdgeKey mismatch.
-            let local_merged: Option<ParsedContext> =
-                if let Some(local_ctx) = map.get("@context") {
-                    Some(
-                        fluree_graph_json_ld::parse_context_with_base(ctx, local_ctx).map_err(
-                            |e| {
-                                TransactError::Parse(format!(
-                                    "failed to parse nested @context during delete-clause \
+            let local_merged: Option<ParsedContext> = if let Some(local_ctx) = map.get("@context") {
+                Some(
+                    fluree_graph_json_ld::parse_context_with_base(ctx, local_ctx).map_err(|e| {
+                        TransactError::Parse(format!(
+                            "failed to parse nested @context during delete-clause \
                                      annotation lowering: {e}"
-                                ))
-                            },
-                        )?,
-                    )
-                } else {
-                    None
-                };
+                        ))
+                    })?,
+                )
+            } else {
+                None
+            };
             let effective_ctx: &ParsedContext = local_merged.as_ref().unwrap_or(ctx);
 
             // Capture the parent's @id for `f:reifiesSubject`. Honor
@@ -1534,7 +1531,15 @@ fn is_envelope(map: &Map<String, Value>) -> bool {
 fn is_transaction_wrapper(map: &Map<String, Value>) -> bool {
     const CLAUSE_KEYS: &[&str] = &["where", "delete", "insert", "upsert", "values"];
     const WRAPPER_KEYS: &[&str] = &[
-        "where", "delete", "insert", "upsert", "values", "opts", "ledger", "@context", "from",
+        "where",
+        "delete",
+        "insert",
+        "upsert",
+        "values",
+        "opts",
+        "ledger",
+        "@context",
+        "from",
         "fromNamed",
     ];
     let has_clause = CLAUSE_KEYS.iter().any(|k| map.contains_key(*k));
@@ -1837,8 +1842,7 @@ fn intercept_annotations_for_predicate(
             // custom JSON-LD context) and blank-node minting both
             // work — building `ReifiedObjectShape::Iri` directly from
             // the returned id.
-            let is_value_object_shape =
-                map.contains_key("@value") || map.contains_key("@language");
+            let is_value_object_shape = map.contains_key("@value") || map.contains_key("@language");
             let shape = if is_value_object_shape {
                 // Reject @context-coerced literals before classifying
                 // so the synthesized f:reifies* bundle's EdgeKey
@@ -1916,7 +1920,9 @@ mod tests {
     fn classify_iri_typed_id_rejects_with_language() {
         let m = obj_map(json!({"@value": "ex:acme", "@type": "@id", "@language": "en"}));
         let err = classify_reified_object(&m).unwrap_err();
-        assert!(err.to_string().contains("@language is invalid alongside @type=@id"));
+        assert!(err
+            .to_string()
+            .contains("@language is invalid alongside @type=@id"));
     }
 
     #[test]
@@ -1970,7 +1976,8 @@ mod tests {
         let m = obj_map(json!({"@value": 42, "@language": "en"}));
         let err = classify_reified_object(&m).unwrap_err();
         assert!(
-            err.to_string().contains("@language requires @value to be a string"),
+            err.to_string()
+                .contains("@language requires @value to be a string"),
             "got: {err}"
         );
     }
@@ -1986,7 +1993,8 @@ mod tests {
         }));
         let err = classify_reified_object(&m).unwrap_err();
         assert!(
-            err.to_string().contains("@language and @type cannot co-occur"),
+            err.to_string()
+                .contains("@language and @type cannot co-occur"),
             "got: {err}"
         );
     }
@@ -2051,8 +2059,7 @@ mod tests {
         let err = lower(doc).unwrap_err();
         let msg = err.to_string();
         assert!(
-            msg.contains("@context term coercion")
-                && msg.contains("XMLSchema#date"),
+            msg.contains("@context term coercion") && msg.contains("XMLSchema#date"),
             "got: {msg}"
         );
         assert!(msg.contains("Add @type"));
@@ -2384,14 +2391,17 @@ mod tests {
         ))
         .unwrap();
         let (payload, lang) = emit_reifies_object_payload(&shape);
-        assert_eq!(payload, json!({"@value": "2024-01-01", "@type": "xsd:date"}));
+        assert_eq!(
+            payload,
+            json!({"@value": "2024-01-01", "@type": "xsd:date"})
+        );
         assert!(lang.is_none());
     }
 
     #[test]
     fn emit_payload_lang_tagged_literal() {
-        let shape =
-            classify_reified_object(&obj_map(json!({"@value": "chat", "@language": "fr"}))).unwrap();
+        let shape = classify_reified_object(&obj_map(json!({"@value": "chat", "@language": "fr"})))
+            .unwrap();
         let (payload, lang) = emit_reifies_object_payload(&shape);
         assert_eq!(payload, json!({"@value": "chat", "@language": "fr"}));
         assert_eq!(lang.as_deref(), Some("fr"));

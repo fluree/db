@@ -494,10 +494,7 @@ async fn run_bulk_import(
         {
             Ok(_) => {
                 if !quiet {
-                    eprintln!(
-                        "{} Annotation arena sealed.",
-                        "info:".cyan().bold()
-                    );
+                    eprintln!("{} Annotation arena sealed.", "info:".cyan().bold());
                 }
             }
             Err(e) => {

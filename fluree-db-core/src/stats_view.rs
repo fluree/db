@@ -502,12 +502,18 @@ mod tests {
             .expect("reifiesSubject synth missing");
         assert_eq!(subj.count, 800);
         assert_eq!(subj.ndv_subjects, 800);
-        assert_eq!(subj.ndv_values, 50, "reifiesSubject ndv = distinct subjects");
+        assert_eq!(
+            subj.ndv_values, 50,
+            "reifiesSubject ndv = distinct subjects"
+        );
 
         let pred = view
             .get_property(&Sid::new(FLUREE_DB, p::REIFIES_PREDICATE))
             .expect("reifiesPredicate synth missing");
-        assert_eq!(pred.ndv_values, 4, "reifiesPredicate ndv = distinct predicates");
+        assert_eq!(
+            pred.ndv_values, 4,
+            "reifiesPredicate ndv = distinct predicates"
+        );
 
         let obj = view
             .get_property(&Sid::new(FLUREE_DB, p::REIFIES_OBJECT))

@@ -254,7 +254,28 @@ impl IncrementalRootBuilder {
     }
 
     /// Consume the builder, returning the final root and all replaced CIDs.
-    pub fn build(self) -> (IndexRoot, Vec<ContentId>) {
+    pub fn build(mut self) -> (IndexRoot, Vec<ContentId>) {
+        // Coerce `had_annotation_arena = true` on any
+        // indexer-produced root with `has_annotations = true`.
+        //
+        // The sticky bit's load-bearing role is to gate the
+        // `ApiAttachmentEventsProvider`'s base-index scan-fallback,
+        // which is only correct for fresh bulk-import bootstrap.
+        // Any state reachable via the indexer — defensive drop,
+        // no-provider pass that left `annotation_index=None`,
+        // explicit seal — represents history the indexer is
+        // responsible for; the provider must not later
+        // reconstruct a live-only `Authoritative` arena from such
+        // a root.
+        //
+        // Bulk import never goes through this builder (it
+        // constructs `IndexRoot` directly in
+        // `fluree-db-api/src/import.rs`), so its
+        // `had_annotation_arena=false` state is preserved and
+        // remains the *only* bootstrap-eligible shape.
+        if self.root.has_annotations {
+            self.root.had_annotation_arena = true;
+        }
         (self.root, self.replaced_cids)
     }
 }

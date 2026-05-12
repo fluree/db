@@ -3250,10 +3250,7 @@ async fn delete_by_id_retracts_literal_annotation_bundle() {
         r1.ledger.novelty.as_ref(),
         IndexType::Post,
         RangeTest::Eq,
-        RangeMatch::predicate_object(
-            reifies_subj_pid.clone(),
-            FlakeValue::Ref(alice_sid.clone()),
-        ),
+        RangeMatch::predicate_object(reifies_subj_pid.clone(), FlakeValue::Ref(alice_sid.clone())),
         RangeOptions::new().with_to_t(r1.ledger.t()),
     )
     .await
@@ -3518,10 +3515,7 @@ async fn delete_by_selector_retracts_literal_annotation_disambiguating_on_body()
         r1.ledger.novelty.as_ref(),
         IndexType::Post,
         RangeTest::Eq,
-        RangeMatch::predicate_object(
-            reifies_subj_pid.clone(),
-            FlakeValue::Ref(alice_sid.clone()),
-        ),
+        RangeMatch::predicate_object(reifies_subj_pid.clone(), FlakeValue::Ref(alice_sid.clone())),
         RangeOptions::new().with_to_t(r1.ledger.t()),
     )
     .await
@@ -3615,10 +3609,7 @@ async fn delete_by_id_retracts_lang_tagged_literal_annotation_bundle() {
         r1.ledger.novelty.as_ref(),
         IndexType::Post,
         RangeTest::Eq,
-        RangeMatch::predicate_object(
-            reifies_subj_pid.clone(),
-            FlakeValue::Ref(alice_sid.clone()),
-        ),
+        RangeMatch::predicate_object(reifies_subj_pid.clone(), FlakeValue::Ref(alice_sid.clone())),
         RangeOptions::new().with_to_t(r1.ledger.t()),
     )
     .await
@@ -3738,7 +3729,7 @@ async fn cross_language_annotation_does_not_cross_match() {
         .await
         .expect("bare body query");
     assert_eq!(
-        bare_rows.as_array().map(|a| a.len()),
+        bare_rows.as_array().map(std::vec::Vec::len),
         Some(2),
         "both annotation bodies must be inserted; got: {bare_rows:#?}"
     );
@@ -4029,7 +4020,7 @@ async fn policy_hiding_base_edge_blocks_annotation_rooted_query() {
         .await
         .expect("baseline (root) query");
     assert_eq!(
-        baseline.as_array().map(|a| a.len()),
+        baseline.as_array().map(std::vec::Vec::len),
         Some(1),
         "baseline (root, no policy) must return one row; got: {baseline:#?}"
     );
@@ -4070,9 +4061,7 @@ async fn policy_hiding_base_edge_blocks_annotation_rooted_query() {
         .query_connection(&policy_query)
         .await
         .expect("policy query");
-    let rows = with_policy
-        .to_jsonld(&ledger.snapshot)
-        .expect("to_jsonld");
+    let rows = with_policy.to_jsonld(&ledger.snapshot).expect("to_jsonld");
     assert_eq!(
         rows,
         json!([]),

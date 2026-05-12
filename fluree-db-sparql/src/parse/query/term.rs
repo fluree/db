@@ -1,8 +1,6 @@
 //! Term parsing: subjects, predicates, objects, IRIs, literals, blank nodes.
 
-use crate::ast::annotation::{
-    Annotation, AnnotationBlock, AnnotationEntry, ReifierId, TripleTerm,
-};
+use crate::ast::annotation::{Annotation, AnnotationBlock, AnnotationEntry, ReifierId, TripleTerm};
 use crate::ast::path::PropertyPath;
 use crate::ast::{
     BlankNode, GraphPattern, Iri, IriValue, Literal, ObjectTerm, PredicateTerm, QuotedTriple,
@@ -702,8 +700,8 @@ impl super::Parser<'_> {
     /// `dtc`, same-lexical literals with different datatypes (or
     /// languages) would cross-match annotations on each other.
     fn parse_annotation_tail(&mut self) -> Option<Option<Annotation>> {
-        let starts_tail = self.stream.check(&TokenKind::Tilde)
-            || self.stream.check(&TokenKind::AnnotationOpen);
+        let starts_tail =
+            self.stream.check(&TokenKind::Tilde) || self.stream.check(&TokenKind::AnnotationOpen);
         if !starts_tail {
             return Some(None);
         }

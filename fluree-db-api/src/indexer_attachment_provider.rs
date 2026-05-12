@@ -86,21 +86,41 @@ impl AttachmentEventsProvider for ApiAttachmentEventsProvider {
         // the snapshot level (`has_annotations=true,
         // annotation_index=None`):
         //
-        //   - fresh import / never sealed
-        //     (`had_annotation_arena=false`) — safe to bootstrap.
-        //   - defensive-drop after a prior seal
-        //     (`had_annotation_arena=true`) — must NOT bootstrap.
-        //     The dropped arena carried historical retract/reassert
-        //     rows that aren't present in the currently-live base
-        //     index. A live-only `Authoritative` reseal would
-        //     silently lose that history. Stay in scan-fallback;
-        //     the next pass with `Augment` coverage from the running
-        //     overlay can reseal correctly.
+        //   - fresh bulk import — annotation-bearing flakes
+        //     landed via the bulk-import pipeline, no indexer
+        //     pass has ever processed them
+        //     (`had_annotation_arena=false`). Safe to bootstrap.
+        //   - any indexer-owned state
+        //     (`had_annotation_arena=true`). Must NOT bootstrap.
+        //     Covers both:
+        //       * defensive-drop after a prior arena seal — the
+        //         dropped arena carried historical retract/reassert
+        //         rows that aren't in the currently-live base.
+        //       * indexer pass on an annotation-bearing ledger
+        //         that didn't seal (e.g. no provider attached) —
+        //         the pass observed events that the live base
+        //         doesn't fully reflect.
+        //     In either case a live-only `Authoritative` reseal
+        //     would silently lose history. Stay in scan-fallback;
+        //     reseal will happen on a future pass that supplies
+        //     *explicit* `Authoritative` coverage. Plain `Augment`
+        //     with no base arena still gets refused by the
+        //     indexer (see
+        //     `fluree-db-indexer/src/build/incremental.rs` phase
+        //     3d's `Augment` branch) — Augment alone cannot
+        //     recover missing history.
         //
-        // The sticky `had_annotation_arena` bit (set on first seal,
-        // never cleared, plumbed through `IndexRoot.had_annotation_arena`
-        // and surfaced on `LedgerSnapshot.had_annotation_arena`) is
-        // the only signal that distinguishes the two states.
+        // The sticky `had_annotation_arena` bit — set whenever
+        // the indexer produces a root with `has_annotations=true`
+        // (regardless of whether an arena was sealed), never
+        // cleared, plumbed through `IndexRoot.had_annotation_arena`
+        // and surfaced on `LedgerSnapshot.had_annotation_arena` —
+        // is the only signal that distinguishes "indexer-owned"
+        // from "fresh bulk-import" states. Despite the name, the
+        // load-bearing meaning is closer to "base-index bootstrap
+        // is not allowed"; the bit is true for indexer-touched
+        // annotation-bearing roots even when no arena was ever
+        // sealed.
         //
         // Full gate (in order of cheapness):
         //   (i)   running overlay is empty,
@@ -165,7 +185,14 @@ impl AttachmentEventsProvider for ApiAttachmentEventsProvider {
 async fn scan_base_index_for_attachment_events(
     manager: &LedgerManager,
     ledger_id: &str,
-) -> Option<Vec<(fluree_db_core::edge::EdgeKey, fluree_db_core::Sid, i64, bool)>> {
+) -> Option<
+    Vec<(
+        fluree_db_core::edge::EdgeKey,
+        fluree_db_core::Sid,
+        i64,
+        bool,
+    )>,
+> {
     use fluree_db_core::comparator::IndexType;
     use fluree_db_core::edge::EdgeKey;
     use fluree_db_core::range::{range_with_overlay, RangeMatch, RangeOptions, RangeTest};
@@ -177,9 +204,7 @@ async fn scan_base_index_for_attachment_events(
     if !view.snapshot.has_annotations {
         return None;
     }
-    if view.snapshot.range_provider.is_none() {
-        return None;
-    }
+    view.snapshot.range_provider.as_ref()?;
     tracing::debug!(
         ledger_id,
         t = view.t,

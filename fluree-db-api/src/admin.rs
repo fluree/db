@@ -1024,9 +1024,7 @@ impl crate::Fluree {
         if indexer_config.attachment_events.is_none() {
             let ledger_has_annotations = ledger_state
                 .as_ref()
-                .map(|st| {
-                    st.snapshot.has_annotations || st.novelty.attachments.has_annotations()
-                })
+                .map(|st| st.snapshot.has_annotations || st.novelty.attachments.has_annotations())
                 .unwrap_or(false);
             if ledger_has_annotations {
                 // Caller-supplied provider wins; fall back to the API's
@@ -1045,8 +1043,7 @@ impl crate::Fluree {
                     // ledger handle even when the only LedgerState we
                     // hold above came from a fresh-load.
                     let _ = self.ledger_cached(&ledger_id).await;
-                    indexer_config.attachment_events =
-                        provider.attachment_events(&ledger_id).await;
+                    indexer_config.attachment_events = provider.attachment_events(&ledger_id).await;
                 }
             }
         }

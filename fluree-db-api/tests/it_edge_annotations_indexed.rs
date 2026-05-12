@@ -535,6 +535,77 @@ async fn had_annotation_arena_sticky_survives_defensive_drop() {
 }
 
 #[tokio::test]
+async fn indexer_pass_without_provider_marks_arena_history_owned() {
+    // A non-bulk-import ledger that accumulates annotation flakes
+    // through the normal commit pipeline and gets indexed *without*
+    // a provider must still mark the resulting root's sticky bit.
+    //
+    // Without this coercion, the root would land at
+    // (has_annotations=true, annotation_index=None,
+    //  had_annotation_arena=false) — the same shape as a fresh
+    // bulk-import — and a later empty-overlay provider pass could
+    // misclassify it as bootstrap-eligible and re-seal a
+    // live-only `Authoritative` arena, silently dropping any
+    // retract/reassert events that lived in the running overlay
+    // before the no-provider reindex consumed it.
+    //
+    // The coercion lives in `IncrementalRootBuilder::build()` /
+    // `encode_and_write_root_v6`: any indexer-produced root with
+    // `has_annotations=true` gets the sticky bit set, even when no
+    // arena is sealed. Bulk import never goes through these paths,
+    // so its `had_annotation_arena=false` state stays the unique
+    // bootstrap-eligible shape.
+    let fluree = FlureeBuilder::memory()
+        .with_ledger_cache_config(fluree_db_api::LedgerManagerConfig::default())
+        .build_memory();
+    let ledger_id = "it/edge-annotations-indexed:indexer-owns-annotation-history";
+
+    // Worker without provider — defensive drop / no-op annotation
+    // arena handling.
+    let (local, handle) = support::start_background_indexer_local(
+        fluree.backend().clone(),
+        Arc::new(fluree.nameservice_mode().clone()),
+        IndexerConfig::small(),
+    );
+
+    local
+        .run_until(async move {
+            let ledger0 = genesis_ledger(&fluree, ledger_id);
+            let after = fluree
+                .insert(ledger0, &annotated_insert())
+                .await
+                .expect("annotated insert");
+            support::trigger_index_and_wait(&handle, ledger_id, after.receipt.t).await;
+            support::wait_for_index_application(&fluree, ledger_id, after.receipt.t).await;
+
+            let post = fluree
+                .ledger_cached(ledger_id)
+                .await
+                .expect("cached load after no-provider reindex")
+                .snapshot()
+                .await
+                .to_ledger_state();
+            assert!(
+                post.snapshot.has_annotations,
+                "f:reifies* predicates were observed → sticky bit is set"
+            );
+            assert!(
+                post.snapshot.annotation_index.is_none(),
+                "no provider → no arena sealed"
+            );
+            assert!(
+                post.snapshot.had_annotation_arena,
+                "indexer-produced root with has_annotations=true MUST mark \
+                 had_annotation_arena=true, even when no arena is sealed — \
+                 otherwise a later empty-overlay provider pass would treat \
+                 this state like fresh import and bootstrap from a \
+                 live-only base-index scan, losing history"
+            );
+        })
+        .await;
+}
+
+#[tokio::test]
 async fn storage_inspection_finds_arena_artifacts() {
     // After a successful arena seal, the index root's
     // forward_branch_cid and reverse_branch_cid must resolve to
@@ -935,8 +1006,8 @@ async fn reindex_seals_arena_when_caller_supplies_only_a_provider() {
     let caller_provider = fluree
         .attachment_events_provider()
         .expect("api provider is available when ledger caching is enabled");
-    let caller_config =
-        fluree_db_indexer::IndexerConfig::default().with_attachment_events_provider(caller_provider);
+    let caller_config = fluree_db_indexer::IndexerConfig::default()
+        .with_attachment_events_provider(caller_provider);
 
     fluree
         .reindex(

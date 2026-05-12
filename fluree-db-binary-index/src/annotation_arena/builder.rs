@@ -433,7 +433,10 @@ mod tests {
         ];
         let (_, stats) = forward_arena_stats(&healthy);
         assert_eq!(stats.distinct_annotations, 3);
-        assert_eq!(stats.live_attachment_pairs, 3, "v1 invariant: pairs == anns");
+        assert_eq!(
+            stats.live_attachment_pairs, 3,
+            "v1 invariant: pairs == anns"
+        );
 
         // Multi-target anomaly: ann_a is attached to two edges. The
         // v1 stage-time invariant should prevent this on healthy

@@ -746,8 +746,8 @@ impl<'a> HydrationFormatter<'a> {
                     if !has_annotations {
                         values.push(rendered);
                     } else {
-                        let mut promoted = self
-                            .promote_literal_to_value_object_for_annotation(flake, rendered)?;
+                        let mut promoted =
+                            self.promote_literal_to_value_object_for_annotation(flake, rendered)?;
                         if let Some(obj) = promoted.as_object_mut() {
                             let ann_json = if bodies.len() == 1 {
                                 bodies.into_iter().next().unwrap()
@@ -1069,9 +1069,7 @@ impl<'a> HydrationFormatter<'a> {
                 .current_targets_merged(sid, &novelty_events, self.db.t)
                 .await
                 .map_err(|e| {
-                    FormatError::InvalidBinding(format!(
-                        "annotation membership lookup failed: {e}"
-                    ))
+                    FormatError::InvalidBinding(format!("annotation membership lookup failed: {e}"))
                 })?;
             return Ok(!live.is_empty());
         }
@@ -1084,7 +1082,11 @@ impl<'a> HydrationFormatter<'a> {
             .as_any()
             .downcast_ref::<fluree_db_novelty::Novelty>()
         {
-            return Ok(novelty.attachments.current_targets_for(sid).next().is_some());
+            return Ok(novelty
+                .attachments
+                .current_targets_for(sid)
+                .next()
+                .is_some());
         }
         Ok(false)
     }
@@ -1108,32 +1110,32 @@ impl<'a> HydrationFormatter<'a> {
             live_count = tracing::field::Empty,
         );
         async {
-        let Some(reader) = self.arena_reader.as_ref() else {
-            return Ok(None);
-        };
-        // Downcast the overlay to the concrete `Novelty` so we can
-        // reach `AttachmentNovelty`. If the overlay isn't `Novelty`
-        // (test fakes, future overlay types), bail to the scan path
-        // — proceeding with an empty novelty event slice would let
-        // the arena report stale indexed attachments while the
-        // overlay still holds unobserved retracts.
-        let Some(novelty) = self
-            .db
-            .overlay
-            .as_any()
-            .downcast_ref::<fluree_db_novelty::Novelty>()
-        else {
-            return Ok(None);
-        };
-        let novelty_events = novelty.attachments.collect_forward_events(edge_key);
-        let live = reader
-            .current_annotations_merged(edge_key, &novelty_events, self.db.t)
-            .await
-            .map_err(|e| {
-                FormatError::InvalidBinding(format!("annotation arena lookup failed: {e}"))
-            })?;
-        tracing::Span::current().record("live_count", live.len());
-        Ok(Some(live))
+            let Some(reader) = self.arena_reader.as_ref() else {
+                return Ok(None);
+            };
+            // Downcast the overlay to the concrete `Novelty` so we can
+            // reach `AttachmentNovelty`. If the overlay isn't `Novelty`
+            // (test fakes, future overlay types), bail to the scan path
+            // — proceeding with an empty novelty event slice would let
+            // the arena report stale indexed attachments while the
+            // overlay still holds unobserved retracts.
+            let Some(novelty) = self
+                .db
+                .overlay
+                .as_any()
+                .downcast_ref::<fluree_db_novelty::Novelty>()
+            else {
+                return Ok(None);
+            };
+            let novelty_events = novelty.attachments.collect_forward_events(edge_key);
+            let live = reader
+                .current_annotations_merged(edge_key, &novelty_events, self.db.t)
+                .await
+                .map_err(|e| {
+                    FormatError::InvalidBinding(format!("annotation arena lookup failed: {e}"))
+                })?;
+            tracing::Span::current().record("live_count", live.len());
+            Ok(Some(live))
         }
         .instrument(span)
         .await

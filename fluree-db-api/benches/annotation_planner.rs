@@ -194,7 +194,9 @@ fn bench_annotation_planner(c: &mut Criterion) {
 
         // Sanity: the arena ledger must have an annotation_index;
         // the scan ledger must not.
-        let arena_state = runtime.block_on(fluree_arena.ledger(&ledger_arena)).unwrap();
+        let arena_state = runtime
+            .block_on(fluree_arena.ledger(&ledger_arena))
+            .unwrap();
         assert!(
             arena_state.snapshot.annotation_index.is_some(),
             "arena ledger must have annotation_index after seal"

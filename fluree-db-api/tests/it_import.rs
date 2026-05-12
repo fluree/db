@@ -963,7 +963,7 @@ async fn import_with_f_reifies_predicates_sets_has_annotations() {
     // `f:reifies*` SIDs into the imported ledger's predicate
     // dictionary — which is what
     // `has_annotations`/`import_has_annotations` detection scans.
-    let ttl = r#"
+    let ttl = r"
 @prefix ex: <http://example.org/> .
 @prefix f:  <https://ns.flur.ee/db#> .
 
@@ -972,7 +972,7 @@ ex:alice ex:worksFor ex:acme .
 _:ann1 f:reifiesSubject   ex:alice ;
        f:reifiesPredicate ex:worksFor ;
        f:reifiesObject    ex:acme .
-"#;
+";
     let ttl_path = write_ttl(data_dir.path(), "annotated.ttl", ttl);
 
     let fluree = FlureeBuilder::file(db_dir.path().to_string_lossy().to_string())
@@ -1003,11 +1003,11 @@ async fn import_without_f_reifies_predicates_leaves_has_annotations_false() {
     let db_dir = tempfile::tempdir().expect("db tmpdir");
     let data_dir = tempfile::tempdir().expect("data tmpdir");
 
-    let ttl = r#"
+    let ttl = r"
 @prefix ex: <http://example.org/> .
 ex:alice ex:worksFor ex:acme .
 ex:bob   ex:worksFor ex:acme .
-"#;
+";
     let ttl_path = write_ttl(data_dir.path(), "plain.ttl", ttl);
 
     let fluree = FlureeBuilder::file(db_dir.path().to_string_lossy().to_string())
@@ -1046,7 +1046,7 @@ async fn import_then_reindex_seals_annotation_arena() {
     let db_dir = tempfile::tempdir().expect("db tmpdir");
     let data_dir = tempfile::tempdir().expect("data tmpdir");
 
-    let ttl = r#"
+    let ttl = r"
 @prefix ex: <http://example.org/> .
 @prefix f:  <https://ns.flur.ee/db#> .
 
@@ -1055,7 +1055,7 @@ ex:alice ex:worksFor ex:acme .
 _:ann1 f:reifiesSubject   ex:alice ;
        f:reifiesPredicate ex:worksFor ;
        f:reifiesObject    ex:acme .
-"#;
+";
     let ttl_path = write_ttl(data_dir.path(), "annotated.ttl", ttl);
 
     let fluree = FlureeBuilder::file(db_dir.path().to_string_lossy().to_string())

@@ -90,7 +90,8 @@ impl DefaultGraphSourceOperator {
         row_idx: usize,
     ) -> Result<()> {
         let per_graph_ctx = parent_ctx.with_graph_ref(graph);
-        self.run_inner_and_merge(&per_graph_ctx, parent_batch, row_idx).await
+        self.run_inner_and_merge(&per_graph_ctx, parent_batch, row_idx)
+            .await
     }
 
     /// Single-db fallback: no dataset means there's nothing to
@@ -103,7 +104,8 @@ impl DefaultGraphSourceOperator {
         parent_batch: &Batch,
         row_idx: usize,
     ) -> Result<()> {
-        self.run_inner_and_merge(parent_ctx, parent_batch, row_idx).await
+        self.run_inner_and_merge(parent_ctx, parent_batch, row_idx)
+            .await
     }
 
     async fn run_inner_and_merge(

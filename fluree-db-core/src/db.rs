@@ -70,25 +70,45 @@ pub struct LedgerSnapshotMetadata {
     ///   ran; arenas authoritative through `max_t`, novelty covers
     ///   the tail.
     /// - `has_annotations=true, annotation_index=None,
-    ///   had_annotation_arena=false` — fresh annotation-bearing
-    ///   import or never-sealed state. Readers fall back to scan;
-    ///   provider may bootstrap an `Authoritative` arena from a
-    ///   one-time base-index scan.
+    ///   had_annotation_arena=false` — fresh bulk-import state, no
+    ///   indexer pass has yet processed the annotation-bearing
+    ///   flakes. Readers fall back to scan; the provider may
+    ///   bootstrap an `Authoritative` arena from a one-time
+    ///   base-index scan.
     /// - `has_annotations=true, annotation_index=None,
-    ///   had_annotation_arena=true` — defensive-drop / lost
-    ///   coverage. Readers fall back to scan; the provider MUST NOT
-    ///   resurrect an `Authoritative` arena from a live-only scan
-    ///   (historical retract/reassert rows would be lost).
+    ///   had_annotation_arena=true` — indexer-owned annotation
+    ///   history with no current arena (defensive drop, or an
+    ///   indexer pass that processed annotation events without
+    ///   sealing). Readers fall back to scan; the provider MUST
+    ///   NOT bootstrap from a live-only scan — the indexer
+    ///   already owns history the live base doesn't fully
+    ///   reflect, so a live-only reseal would silently drop
+    ///   retract/reassert rows.
     /// - `has_annotations=false, annotation_index=Some(_)` is an
     ///   invariant violation; the FIR6 encoder coerces the sticky
     ///   bit when an arena is present.
     pub annotation_index: Option<crate::AnnotationIndexRoot>,
-    /// Sticky bit: `true` once an annotation arena has *ever* been
-    /// sealed for this ledger. Distinguishes a fresh
-    /// annotation-bearing import (never sealed → safe to bootstrap
-    /// via base-index scan) from a defensive-drop state (was sealed,
-    /// arena later dropped → must stay scan-fallback). Once set,
-    /// never cleared — even when the indexer drops the arena.
+    /// Sticky bit governing the `ApiAttachmentEventsProvider`'s
+    /// base-index scan-fallback. Despite the name, the
+    /// load-bearing meaning is "base-index bootstrap is **not**
+    /// allowed" — it's true on *any* indexer-produced root that
+    /// has annotation history (`has_annotations=true`), regardless
+    /// of whether an arena was actually sealed by that pass.
+    ///
+    /// Only fresh bulk-import roots leave the bit false, because
+    /// the import pipeline writes annotation flakes directly to
+    /// the base index without an indexer-owned event stream.
+    /// Those roots are the unique state where the provider may
+    /// reconstruct an `Authoritative` arena from a one-time
+    /// base-index scan.
+    ///
+    /// Once set, never cleared — including across defensive
+    /// drops, no-provider indexer passes, and any other state
+    /// transition. The FIR6 encoder coerces the bit on whenever
+    /// `annotation_index.is_some()`; the decoder coerces on whenever
+    /// either the extended-flags bit is set *or* an
+    /// `annotation_index` is present (handles pre-this-change
+    /// roots that already sealed an arena).
     pub had_annotation_arena: bool,
 }
 
@@ -186,12 +206,23 @@ pub struct LedgerSnapshot {
     /// pairs this field with `has_annotations` and
     /// `had_annotation_arena`.
     pub annotation_index: Option<crate::AnnotationIndexRoot>,
-    /// Sticky bit: `true` once this ledger has ever sealed an
-    /// annotation arena. Carried in `IndexRoot`'s flag bits; gates
-    /// the `ApiAttachmentEventsProvider` base-index scan-fallback
-    /// so a defensive-drop state (`has_annotations=true,
-    /// annotation_index=None, had_annotation_arena=true`) doesn't
-    /// get its history reconstructed from a live-only scan.
+    /// Sticky bit governing whether the
+    /// `ApiAttachmentEventsProvider` is allowed to bootstrap an
+    /// `Authoritative` annotation arena from a one-time base-index
+    /// scan. Despite the name, the load-bearing meaning is
+    /// "base-index bootstrap is **not** allowed":
+    /// - `false` only on fresh bulk-import roots (no indexer pass
+    ///   has touched the annotation history yet) — bootstrap is
+    ///   safe because the live base IS the complete history.
+    /// - `true` on any indexer-produced root with
+    ///   `has_annotations=true`, including defensive drops and
+    ///   indexer passes that didn't seal an arena — bootstrap is
+    ///   unsafe because the indexer owns history the live base
+    ///   doesn't fully reflect.
+    ///
+    /// Sticky: once set, never cleared. Carried in
+    /// `IndexRoot.had_annotation_arena` via the FIR6 extended-flags
+    /// byte.
     pub had_annotation_arena: bool,
 }
 
@@ -635,8 +666,10 @@ fn decode_fir6_metadata(bytes: &[u8]) -> std::io::Result<LedgerSnapshotMetadata>
 
     // Extended-flags byte at bytes[6] (must match
     // binary-index IndexRoot's `FLAG_EXT_*` set). Old roots
-    // wrote `0u16` to this position so they decode with all
-    // extended flags = false.
+    // wrote `0u16` to this position so the raw bit decodes
+    // false; the post-decode coercion below handles legacy
+    // roots whose `annotation_index` was sealed before this
+    // change shipped.
     const FLAG_EXT_HAD_ANNOTATION_ARENA: u8 = 1 << 0;
     let flags_ext = bytes[6];
     let had_annotation_arena = flags_ext & FLAG_EXT_HAD_ANNOTATION_ARENA != 0;
@@ -969,6 +1002,16 @@ fn decode_fir6_metadata(bytes: &[u8]) -> std::io::Result<LedgerSnapshotMetadata>
             ),
         ));
     }
+
+    // Decode-side coercion (mirrors `IndexRoot::decode`'s
+    // backward-compat fix): a root with a populated
+    // `annotation_index` implies `had_annotation_arena = true`,
+    // even if the extended-flags byte is zero (pre-this-change
+    // FIR6 roots that already had a sealed arena). Without this,
+    // a later defensive drop on such a root would land in the
+    // bootstrap-eligible state and the provider's base-index
+    // scan-fallback would silently lose retract/reassert history.
+    let had_annotation_arena = had_annotation_arena || annotation_index.is_some();
 
     Ok(LedgerSnapshotMetadata {
         ledger_id,

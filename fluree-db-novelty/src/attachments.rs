@@ -321,8 +321,7 @@ impl AttachmentNovelty {
             // the bundle on a base-edge retract. Mirrors the arena
             // builder's check.
             if edge.g != bundle_g {
-                self.observed_malformed_bundles =
-                    self.observed_malformed_bundles.saturating_add(1);
+                self.observed_malformed_bundles = self.observed_malformed_bundles.saturating_add(1);
                 tracing::warn!(
                     ?ann,
                     t,
@@ -634,18 +633,7 @@ mod tests {
         let bundle_default: Vec<Flake> = edge.to_reifies_facts(&ann, 5, true);
         let bundle_mismatch: Vec<Flake> = bundle_default
             .into_iter()
-            .map(|f| {
-                Flake::new_in_graph(
-                    g_a.clone(),
-                    f.s,
-                    f.p,
-                    f.o,
-                    f.dt,
-                    f.t,
-                    f.op,
-                    f.m,
-                )
-            })
+            .map(|f| Flake::new_in_graph(g_a.clone(), f.s, f.p, f.o, f.dt, f.t, f.op, f.m))
             .collect();
 
         let mut overlay = AttachmentNovelty::new();
