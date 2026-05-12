@@ -359,13 +359,22 @@ pub(crate) struct LowerCtx {
     /// Sibling top-level nodes synthesized during lowering. Each entry
     /// is a complete node-map ready for the standard parser to ingest.
     siblings: Vec<Value>,
+    /// When `true`, an empty `@annotation: {}` block mints a fresh
+    /// property-less annotation subject (LPG mode — Cypher
+    /// relationships retain identity without properties). When
+    /// `false` (RDF default), an empty block is a no-op: no
+    /// annotation subject is minted, no attachment row is written,
+    /// and inserts remain idempotent at the `(s, p, o)` level.
+    /// See the Decisions section of `EDGE_ANNOTATIONS.md`.
+    lpg_mode: bool,
 }
 
 impl LowerCtx {
-    fn new() -> Self {
+    fn new(lpg_mode: bool) -> Self {
         Self {
             next_anon_id: 0,
             siblings: Vec::new(),
+            lpg_mode,
         }
     }
 
@@ -455,7 +464,9 @@ fn scan_user_authored_reifies_iris(value: &Value, context: &ParsedContext) -> Re
 pub fn lower_edge_annotations(doc: &mut Value) -> Result<()> {
     let top_ctx = top_level_context(doc)?;
     scan_user_authored_reifies_iris(doc, &top_ctx)?;
-    lower_edge_annotations_after_firewall(doc, &top_ctx)
+    // Test / external callers that don't carry transaction options
+    // default to RDF mode (empty `@annotation: {}` is a no-op).
+    lower_edge_annotations_after_firewall(doc, &top_ctx, false)
 }
 
 /// Same as [`lower_edge_annotations`] minus the firewall scan.
@@ -465,11 +476,16 @@ pub fn lower_edge_annotations(doc: &mut Value) -> Result<()> {
 /// `delete`-clause pre-pass before the standard lowering. Both
 /// passes synthesize `f:reifies*` IRIs internally; running the
 /// firewall a second time would falsely flag those.
+///
+/// `lpg_mode` controls the empty-block contract: `false` (RDF
+/// default) makes `@annotation: {}` a no-op; `true` mints a fresh
+/// property-less annotation subject (Cypher relationship identity).
 pub fn lower_edge_annotations_after_firewall(
     doc: &mut Value,
     top_ctx: &ParsedContext,
+    lpg_mode: bool,
 ) -> Result<()> {
-    let mut ctx = LowerCtx::new();
+    let mut ctx = LowerCtx::new(lpg_mode);
     let walk_ctx = WalkCtx {
         json_ld: top_ctx,
         graph: None,
@@ -1250,7 +1266,7 @@ fn build_annotation_sibling(
     ann_block: Value,
     base_graph: Option<&str>,
     ctx: &mut LowerCtx,
-) -> Result<Value> {
+) -> Result<Option<Value>> {
     let base_subject_id = base_subject_id.ok_or_else(|| {
         TransactError::UnsupportedFeature(
             "edge annotations on deeply-nested predicate paths are not supported in v1; \
@@ -1264,6 +1280,23 @@ fn build_annotation_sibling(
             "@annotation value must be a JSON object describing the annotation subject".to_string(),
         ));
     };
+
+    // Empty-body contract (per `EDGE_ANNOTATIONS.md` Decisions section
+    // "Empty `@annotation: {}`"). `@context` is purely structural and
+    // doesn't count as a property; everything else does — including
+    // an explicit `@id`, which signals the user wants annotation
+    // identity. So the no-op case is exactly `{}` (or `{"@context": ...}`).
+    //
+    // - RDF mode (default): no annotation subject is minted, no
+    //   attachment row is written. Inserts remain idempotent at the
+    //   `(s, p, o)` level.
+    // - LPG mode (`opts.lpgEdgeLifecycle: true`): mint a fresh
+    //   property-less annotation subject so the relationship retains
+    //   identity (matches Cypher).
+    let body_is_empty = ann_map.iter().all(|(k, _)| k == "@context");
+    if body_is_empty && !ctx.lpg_mode {
+        return Ok(None);
+    }
 
     // Reject nested @annotation / @edge / @reifies anywhere in the body
     // — annotation-of-annotation is the deferred shape (v1).
@@ -1321,7 +1354,7 @@ fn build_annotation_sibling(
     // in-Rust `EdgeKey::to_reifies_facts` builder still emits both
     // for diagnostic clarity.
 
-    Ok(Value::Object(ann_map))
+    Ok(Some(Value::Object(ann_map)))
 }
 
 /// Lower a `@reifies` block on the enclosing node. The enclosing node
@@ -1859,7 +1892,11 @@ fn intercept_annotations_for_predicate(
                 walk.graph,
                 ctx,
             )?;
-            ctx.siblings.push(synth);
+            if let Some(node) = synth {
+                ctx.siblings.push(node);
+            }
+            // None = empty body in RDF mode = no-op (no attachment row
+            // written, base edge stays a plain triple).
             Ok(())
         }
         _ => Ok(()),

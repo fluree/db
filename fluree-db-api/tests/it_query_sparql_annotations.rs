@@ -687,3 +687,87 @@ async fn sparql_annotation_lang_tag_blocks_wrong_language_match() {
         "@en query against an @fr-only ledger must return zero rows: {bindings:#?}"
     );
 }
+
+#[tokio::test]
+async fn sparql_select_with_reifies_property_path_is_rejected() {
+    // The read-side firewall must walk `Pattern::PropertyPath`, not
+    // just `Pattern::Triple`. A transitive path over a system
+    // predicate like `?s f:reifiesSubject+ ?o` would otherwise let
+    // the user enumerate the reifies bundle through a path
+    // shorthand, defeating the same protection the bare-triple
+    // case blocks.
+    let (fluree, ledger) = seed_alice_engineer("it/sparql-ann/path-firewall").await;
+    let sparql = r"
+        PREFIX f: <https://ns.flur.ee/db#>
+        SELECT ?s ?o WHERE {
+          ?s f:reifiesSubject+ ?o .
+        }
+    ";
+    let err = support::query_sparql(&fluree, &ledger, sparql)
+        .await
+        .expect_err("property-path over f:reifies* must be rejected");
+    let msg = format!("{err:?} {err}");
+    assert!(
+        msg.contains("system-controlled"),
+        "expected reifies firewall diagnostic, got: {msg}"
+    );
+}
+
+#[tokio::test]
+async fn sparql_quoted_triple_with_annotation_tail_is_rejected() {
+    // Legacy `<< s p o >> ...` quoted-triple form is the f:t/f:op
+    // metadata-binding shape; it has no representation for an
+    // RDF 1.2 annotation tail (`{| ... |}`). Silently dropping the
+    // tail would lose user intent — reject explicitly.
+    let (fluree, ledger) = seed_alice_engineer("it/sparql-ann/quoted-triple-tail").await;
+    let sparql = r"
+        PREFIX ex: <http://example.org/>
+        PREFIX f:  <https://ns.flur.ee/db#>
+        SELECT ?t WHERE {
+          << ex:alice ex:worksFor ?o >> f:t ?t {| ex:role ?role |} .
+        }
+    ";
+    let err = support::query_sparql(&fluree, &ledger, sparql)
+        .await
+        .expect_err("quoted-triple subject + annotation tail must be rejected");
+    let msg = format!("{err:?} {err}");
+    assert!(
+        msg.contains("annotation tail") || msg.contains("quoted-triple"),
+        "expected quoted-triple-annotation rejection, got: {msg}"
+    );
+}
+
+#[tokio::test]
+async fn sparql_update_quoted_triple_with_annotation_tail_does_not_panic() {
+    // Mirrors the read-side test but exercises the UPDATE path.
+    // `<<:s :p :o>> ~ {| :ann :v |}` used to hit
+    // `unreachable!()` inside `expand_annotated_triples` because
+    // a QuotedTriple subject reached `subject_to_object`. The
+    // expansion path must reject this explicitly with an
+    // `UnsupportedFeature` error before that helper is called.
+    let ledger0 = {
+        let fluree = FlureeBuilder::memory().build_memory();
+        genesis_ledger(&fluree, "it/sparql-ann-update/quoted-triple-tail")
+    };
+    let update = r"
+        PREFIX ex: <http://example.org/>
+        INSERT DATA {
+          << ex:alice ex:worksFor ex:acme >> ex:ann ex:v {| ex:role ex:eng |} .
+        }
+    ";
+    let parsed = fluree_db_sparql::parse_sparql(update);
+    if parsed.has_errors() {
+        // Parser may already reject this shape; that's also acceptable
+        // — the point of the test is "no panic in the lowering path".
+        return;
+    }
+    let ast = parsed.ast.unwrap();
+    let mut ns = NamespaceRegistry::from_db(&ledger0.snapshot);
+    let err = fluree_db_transact::lower_sparql_update_ast(&ast, &mut ns, TxnOpts::default())
+        .expect_err("quoted-triple subject + annotation tail must be rejected");
+    let msg = format!("{err:?} {err}");
+    assert!(
+        msg.contains("quoted-triple") || msg.contains("annotation tail"),
+        "expected UnsupportedFeature on quoted-triple + tail, got: {msg}"
+    );
+}

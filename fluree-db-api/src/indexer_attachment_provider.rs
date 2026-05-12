@@ -275,12 +275,28 @@ async fn scan_base_index_for_attachment_events(
             let Ok(edge_key) = EdgeKey::from_reifies_facts(&bundle) else {
                 continue;
             };
-            // Assertion time from the f:reifiesSubject flake.
-            let t = bundle
+            // Assertion time from the f:reifiesSubject flake. The
+            // decode above only succeeds when the bundle carries a
+            // valid `f:reifiesSubject` row (the decoder returns
+            // `Missing` otherwise), so the find below should always
+            // hit. We treat a missing row as malformed — skip
+            // rather than fall back to `t=0`, which would seal a
+            // misdated row in the arena. If `EdgeKey::from_reifies_facts`
+            // ever loosens its `f:reifiesSubject` requirement, this
+            // gate keeps the arena's `t` axis trustworthy.
+            let Some(t) = bundle
                 .iter()
                 .find(|f| f.p == f_reifies_subject)
                 .map(|f| f.t)
-                .unwrap_or(0);
+            else {
+                tracing::warn!(
+                    ?ann_sid,
+                    ?g_id,
+                    "f:reifiesSubject flake absent from decoded bundle; \
+                     skipping (would have produced a t=0 arena row)"
+                );
+                continue;
+            };
             events.push((edge_key, ann_sid, t, /* op = */ true));
         }
     }

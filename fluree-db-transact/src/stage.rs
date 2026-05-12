@@ -819,11 +819,69 @@ pub async fn stage(
         )
         .await?;
         if !cascade.is_empty() {
-            tracing::debug!(
-                cascade_count = cascade.len(),
-                "cascading f:reifies* retracts for retracted base edges"
-            );
-            flakes.extend(cascade);
+            // Dedup cascade retracts against retracts already in
+            // `flakes` (e.g. a same-txn by-id annotation retract that
+            // targets the same bundle the cascade is producing) and
+            // against itself. `Flake`'s `Eq` ignores `t`/`op`, so we
+            // seed the seen set from existing retracts ONLY — otherwise
+            // a future assert of the same fact would suppress a
+            // legitimate cascade retract. (Today the reserved-
+            // predicate firewall makes this impossible for
+            // `f:reifies*`, but the gate stays correct either way.)
+            let cascade_in = cascade.len();
+            let mut seen: HashSet<Flake> =
+                HashSet::with_capacity(flakes.len() / 2 + cascade_in);
+            for f in flakes.iter().filter(|f| !f.op) {
+                seen.insert(f.clone());
+            }
+            let mut deduped: Vec<Flake> = Vec::with_capacity(cascade_in);
+            for f in cascade {
+                debug_assert!(!f.op, "cascade output must be pure-retract");
+                if seen.insert(f.clone()) {
+                    deduped.push(f);
+                }
+            }
+            let dropped = cascade_in - deduped.len();
+            if dropped > 0 {
+                tracing::debug!(
+                    cascade_in,
+                    cascade_out = deduped.len(),
+                    duplicates_dropped = dropped,
+                    "deduped overlapping cascade retracts"
+                );
+            }
+            if !deduped.is_empty() {
+                tracing::debug!(
+                    cascade_count = deduped.len(),
+                    "cascading f:reifies* retracts for retracted base edges"
+                );
+                flakes.extend(deduped);
+            }
+        }
+
+        // Stage-time single-target invariant: an annotation SID may be
+        // attached to at most one edge at a time. Re-pointing the same
+        // SID to a different edge in one transaction requires
+        // explicitly retracting the prior attachment in the same
+        // transaction (the retract + assert pair nets to one asserted
+        // `f:reifiesSubject` flake). We enforce this on the final
+        // flake set so the legitimate re-point shape passes (one
+        // retract for the old subject, one assert for the new),
+        // while two concurrent attaches against the same explicit-IRI
+        // `@id` fail loudly here rather than corrupting
+        // `EdgeKey::from_reifies_facts` downstream.
+        let mut asserted_subjects: HashMap<Sid, usize> = HashMap::new();
+        for f in &flakes {
+            if f.op && fluree_db_core::is_reifies_subject(&f.p) {
+                *asserted_subjects.entry(f.s.clone()).or_insert(0) += 1;
+            }
+        }
+        if let Some((ann_sid, count)) = asserted_subjects.iter().find(|(_, n)| **n > 1) {
+            return Err(TransactError::InvariantViolation(format!(
+                "annotation subject `{ann_sid}` would be attached to {count} different edges in one \
+                 transaction; an annotation may reify exactly one edge. Retract the prior \
+                 attachment in the same transaction if you intended to re-point it.",
+            )));
         }
 
         // Count fuel per staged non-schema flake (mirrors query-side fuel counting).

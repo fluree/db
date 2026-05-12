@@ -141,6 +141,15 @@ pub enum TransactError {
     #[error("Raw transaction upload failed: {0}")]
     RawTxnUpload(String),
 
+    /// Transaction violates a structural invariant of the staged
+    /// flake set — e.g. an annotation SID would be attached to more
+    /// than one edge in a single transaction without retracting the
+    /// prior attachment. Distinct from [`Self::Parse`] (input syntax)
+    /// and [`Self::UniqueConstraintViolation`] (schema-level
+    /// `f:enforceUnique`).
+    #[error("Transaction invariant violation: {0}")]
+    InvariantViolation(String),
+
     /// Unique constraint violation (`f:enforceUnique`).
     ///
     /// A property annotated with `f:enforceUnique true` has duplicate values

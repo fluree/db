@@ -251,6 +251,19 @@ impl EdgeKey {
     ///   responsibility; this fn doesn't cross-validate `s` across the
     ///   slice)
     ///
+    /// Validates **graph consistency** across the bundle:
+    /// - every `f:reifies*` flake in the slice must share the same
+    ///   flake-level `g` (rejects `MixedFlakeGraphs` otherwise — a
+    ///   tampered or partial bundle where rows leaked across graphs).
+    /// - when `f:reifiesGraph` is present, its value SID must match
+    ///   the flake-level `g` of the bundle. When absent, the bundle's
+    ///   flake-level `g` must be `None` (default graph). Mismatch is
+    ///   `GraphMismatch`.
+    ///
+    /// Non-`f:reifies*` flakes (annotation metadata about the
+    /// annotation subject) are ignored — they describe the annotation,
+    /// not the edge, and may legitimately live in a different graph.
+    ///
     /// Returns `Err` with a structured [`EdgeKeyDecodeError`] when the
     /// bundle is malformed; the replay validator surfaces this through
     /// telemetry.
@@ -261,8 +274,43 @@ impl EdgeKey {
         let mut o_pos: Option<(FlakeValue, Sid)> = None;
         let mut dt_pos: Option<Sid> = None;
         let mut lang: Option<String> = None;
+        // Flake-level `g` shared by every `f:reifies*` flake in this
+        // bundle. `None` until the first `f:reifies*` flake is seen;
+        // `Some(None)` means "default graph"; `Some(Some(sid))` means
+        // "named graph `sid`".
+        let mut bundle_g: Option<Option<Sid>> = None;
 
         for f in facts {
+            // Classify the predicate. Non-`f:reifies*` flakes describe
+            // the annotation subject as ordinary RDF and don't
+            // participate in the bundle's graph anchor — skip them
+            // before tracking `bundle_g` so a metadata fact in a
+            // different graph doesn't false-trigger `MixedFlakeGraphs`.
+            let is_bundle_flake = is_reifies_graph(&f.p)
+                || is_reifies_subject(&f.p)
+                || is_reifies_predicate(&f.p)
+                || is_reifies_object(&f.p)
+                || is_reifies_datatype(&f.p)
+                || is_reifies_lang(&f.p)
+                || is_reifies_list_index(&f.p);
+            if !is_bundle_flake {
+                continue;
+            }
+
+            // Bundle graph consistency: every f:reifies* flake must
+            // share the same flake-level `g`. The novelty observer
+            // and arena builder already enforce this at the caller
+            // layer by grouping, but the invariant belongs here so
+            // any future caller that doesn't pre-group can't slip a
+            // mixed-graph bundle through.
+            match &bundle_g {
+                None => bundle_g = Some(f.g.clone()),
+                Some(seen) if seen != &f.g => {
+                    return Err(EdgeKeyDecodeError::MixedFlakeGraphs);
+                }
+                _ => {}
+            }
+
             if is_reifies_graph(&f.p) {
                 if g.is_some() {
                     return Err(EdgeKeyDecodeError::Duplicate("f:reifiesGraph"));
@@ -336,6 +384,27 @@ impl EdgeKey {
             None => o_dt_from_flake,
         };
 
+        // Reconcile the decoded `f:reifiesGraph` value with the
+        // bundle's flake-level graph. They name the same thing from
+        // two angles:
+        //  - `g` (from the optional `f:reifiesGraph` flake) is the
+        //    graph the bundle *reifies* (the graph of the base edge).
+        //  - `bundle_g` is the graph the bundle *lives in* (where
+        //    the f:reifies* flakes themselves were asserted).
+        // The annotation subject lives in the same named graph as
+        // the edge it reifies (see `build_annotation_sibling` and
+        // `EdgeKey::to_reifies_facts`), so disagreement here means a
+        // tampered or buggy bundle. `bundle_g` is `Some` here because
+        // we required `f:reifiesSubject` above and that returns
+        // `Missing` otherwise.
+        let flake_level_g = bundle_g
+            .as_ref()
+            .expect("bundle_g set when at least f:reifiesSubject present")
+            .as_ref();
+        if g.as_ref() != flake_level_g {
+            return Err(EdgeKeyDecodeError::GraphMismatch);
+        }
+
         Ok(Self {
             g,
             s,
@@ -367,6 +436,18 @@ pub enum EdgeKeyDecodeError {
     /// `f:reifiesObject`'s flake-level datatype did not match the
     /// `f:reifiesDatatype` value. Indicates a tampered or buggy bundle.
     DatatypeMismatch,
+    /// Two or more `f:reifies*` flakes in the bundle had different
+    /// flake-level `g` values. The whole bundle must live in one
+    /// graph; a split slice indicates tampering, a partial-write, or
+    /// a caller that failed to pre-group rows by graph.
+    MixedFlakeGraphs,
+    /// The optional `f:reifiesGraph` value disagrees with the bundle's
+    /// flake-level `g`. The annotation subject lives in the same
+    /// named graph as the edge it reifies, so these two views of the
+    /// graph must match — a mismatch indicates a tampered or buggy
+    /// bundle (e.g. `f:reifiesGraph` missing on a named-graph edge,
+    /// or set to the wrong graph).
+    GraphMismatch,
     /// A predicate that v1 explicitly defers was present.
     DeferredFeature(&'static str),
 }
@@ -380,6 +461,13 @@ impl std::fmt::Display for EdgeKeyDecodeError {
             Self::DatatypeMismatch => {
                 write!(f, "f:reifiesObject dt mismatch with f:reifiesDatatype")
             }
+            Self::MixedFlakeGraphs => {
+                write!(f, "f:reifies* flakes in one bundle span multiple graphs")
+            }
+            Self::GraphMismatch => write!(
+                f,
+                "f:reifiesGraph value disagrees with the bundle's flake-level graph"
+            ),
             Self::DeferredFeature(p) => write!(f, "{p} is deferred to a future milestone"),
         }
     }
@@ -708,5 +796,113 @@ mod tests {
         assert_eq!(rebuilt.o, f.o);
         assert_eq!(rebuilt.dt, f.dt);
         assert_eq!(rebuilt.g, f.g);
+    }
+
+    #[test]
+    fn decode_rejects_mixed_flake_graphs() {
+        // Build a default-graph bundle, then retarget one flake's
+        // `g` to a named graph. The decoder must reject the slice
+        // outright — every `f:reifies*` flake in one bundle shares
+        // one graph. Callers that produce mixed-graph slices have
+        // a logic bug; the decoder firewalls them rather than
+        // silently decoding to a wrong-graph EdgeKey.
+        let f = sample_flake();
+        let key = EdgeKey::from_flake(&f);
+        let ann = Sid::new(13, "ann_mix");
+        let mut bundle = key.to_reifies_facts(&ann, 42, true);
+        // Pick one bundle flake and move it into a different graph.
+        let target = bundle
+            .iter_mut()
+            .find(|f| is_reifies_object(&f.p))
+            .expect("f:reifiesObject flake exists");
+        target.g = Some(Sid::new(13, "rogue_graph"));
+        let err = EdgeKey::from_reifies_facts(&bundle).unwrap_err();
+        assert_eq!(err, EdgeKeyDecodeError::MixedFlakeGraphs);
+    }
+
+    #[test]
+    fn decode_ignores_mixed_graphs_on_non_reifies_metadata() {
+        // Non-`f:reifies*` flakes describe the annotation subject,
+        // not the edge, and may legitimately live in another graph
+        // (uncommon but not malformed). The decoder skips them
+        // before tracking bundle graph, so they must NOT trigger
+        // `MixedFlakeGraphs` even when their `g` differs.
+        let f = sample_flake();
+        let key = EdgeKey::from_flake(&f);
+        let ann = Sid::new(13, "ann_meta");
+        let mut bundle = key.to_reifies_facts(&ann, 42, true);
+        bundle.push(Flake::new_in_graph(
+            Sid::new(13, "side_graph"),
+            ann,
+            Sid::new(13, "role"),
+            FlakeValue::String("Engineer".into()),
+            Sid::new(XSD, xsd_names::STRING),
+            42,
+            true,
+            None,
+        ));
+        let decoded =
+            EdgeKey::from_reifies_facts(&bundle).expect("metadata in another graph is OK");
+        assert_eq!(decoded, key);
+    }
+
+    #[test]
+    fn decode_rejects_graph_mismatch_when_named_graph_flake_missing() {
+        // A named-graph bundle (`f.g = Some(graph_a)` on every
+        // f:reifies* flake) without an `f:reifiesGraph` flake. The
+        // bundle decodes to `EdgeKey { g: None, ... }` (since no
+        // `f:reifiesGraph` was found) but its flakes live in
+        // `Some(graph_a)`. Mismatch → `GraphMismatch`.
+        let mut f = sample_flake();
+        f.g = Some(Sid::new(13, "graph_a"));
+        let key = EdgeKey::from_flake(&f);
+        let ann = Sid::new(13, "ann_g1");
+        let mut bundle = key.to_reifies_facts(&ann, 42, true);
+        bundle.retain(|f| !is_reifies_graph(&f.p));
+        let err = EdgeKey::from_reifies_facts(&bundle).unwrap_err();
+        assert_eq!(err, EdgeKeyDecodeError::GraphMismatch);
+    }
+
+    #[test]
+    fn decode_rejects_graph_mismatch_when_reifies_graph_points_elsewhere() {
+        // Symmetric counterpart: the `f:reifiesGraph` value points
+        // at a different graph SID than the one the bundle's flakes
+        // live in. A tampered or buggy writer.
+        let mut f = sample_flake();
+        f.g = Some(Sid::new(13, "graph_a"));
+        let key = EdgeKey::from_flake(&f);
+        let ann = Sid::new(13, "ann_g2");
+        let mut bundle = key.to_reifies_facts(&ann, 42, true);
+        let graph_flake = bundle
+            .iter_mut()
+            .find(|f| is_reifies_graph(&f.p))
+            .expect("f:reifiesGraph flake exists in a named-graph bundle");
+        graph_flake.o = FlakeValue::Ref(Sid::new(13, "graph_b"));
+        let err = EdgeKey::from_reifies_facts(&bundle).unwrap_err();
+        assert_eq!(err, EdgeKeyDecodeError::GraphMismatch);
+    }
+
+    #[test]
+    fn decode_rejects_graph_mismatch_when_default_graph_flake_carries_reifies_graph() {
+        // Inverse of the missing-flake case: bundle flakes are all
+        // `g = None` (default graph) but a stray `f:reifiesGraph`
+        // claims it reifies a named-graph edge. The two views of
+        // the graph disagree.
+        let f = sample_flake();
+        assert!(f.g.is_none(), "sample is default-graph");
+        let key = EdgeKey::from_flake(&f);
+        let ann = Sid::new(13, "ann_g3");
+        let mut bundle = key.to_reifies_facts(&ann, 42, true);
+        bundle.push(Flake::new(
+            ann,
+            Sid::new(FLUREE_DB, fluree_db_predicates::REIFIES_GRAPH),
+            FlakeValue::Ref(Sid::new(13, "graph_a")),
+            id_datatype_sid(),
+            42,
+            true,
+            None,
+        ));
+        let err = EdgeKey::from_reifies_facts(&bundle).unwrap_err();
+        assert_eq!(err, EdgeKeyDecodeError::GraphMismatch);
     }
 }

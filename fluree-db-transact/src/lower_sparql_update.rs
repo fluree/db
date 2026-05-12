@@ -260,6 +260,22 @@ fn expand_annotated_triples(
             continue;
         };
 
+        // Reject RDF-star quoted-triple subjects explicitly. The
+        // legacy `<< s p o >>` quoted-triple form has no compatible
+        // representation in the f:reifies* bundle (the base triple
+        // would need to embed inside f:reifiesSubject's object slot
+        // which violates the bundle shape), and `subject_to_object`
+        // below would otherwise hit its `unreachable!()` panic.
+        // Surface this as an explicit `UnsupportedFeature` so the
+        // user sees a real error rather than a transactor panic.
+        if let SubjectTerm::QuotedTriple(qt) = &tp.subject {
+            return Err(LowerError::UnsupportedFeature {
+                feature: "RDF-star quoted-triple subject combined with an RDF 1.2 \
+                          annotation tail (`{| ... |}`) in SPARQL UPDATE",
+                span: qt.span,
+            });
+        }
+
         // Reify the base edge and emit base + bundle + body. The base
         // triple stripped of its annotation goes through unchanged.
         let span = tp.span;

@@ -881,12 +881,18 @@ impl<'a> HydrationFormatter<'a> {
         async {
             // Arena-backed fast path.
             if self.arena_reader.is_some() {
-                if let Some(ann_sids) = self.arena_lookup_annotations(&edge_key).await? {
+                if let Some(mut ann_sids) = self.arena_lookup_annotations(&edge_key).await? {
                     tracing::Span::current().record("path", "arena");
                     tracing::Span::current().record("annotation_count", ann_sids.len());
                     if ann_sids.is_empty() {
                         return Ok(Vec::new());
                     }
+                    // Sort by Sid for stable, path-independent output
+                    // order. `merge_live_annotations` already returns
+                    // BTreeMap-sorted today, but pinning the sort here
+                    // keeps arena/scan parity if that helper ever
+                    // changes its collection order.
+                    ann_sids.sort();
                     return self
                         .render_annotation_bodies(&ann_sids, depth, visited, cache)
                         .await;
@@ -921,13 +927,14 @@ impl<'a> HydrationFormatter<'a> {
                 return Ok(Vec::new());
             }
 
-            let mut bodies: Vec<JsonValue> = Vec::new();
-            let ann_level = NestedSelectSpec::Wildcard {
-                refinements: HashMap::new(),
-                reverse: HashMap::new(),
-            };
+            // First pass: dedupe candidates and filter to those whose
+            // decoded bundle structurally matches `edge_key`. POST
+            // iteration is sorted by `s`, but we sort the matched set
+            // explicitly so the output order is path-independent and
+            // matches the arena fast path (see #3 in the edge-
+            // annotations review).
+            let mut matched_anns: Vec<Sid> = Vec::new();
             let mut seen: HashSet<Sid> = HashSet::new();
-
             for cand in &candidate_flakes {
                 let ann_sid = &cand.s;
                 if !seen.insert(ann_sid.clone()) {
@@ -952,19 +959,13 @@ impl<'a> HydrationFormatter<'a> {
                     continue;
                 }
 
-                let mut body = self
-                    .format_subject(ann_sid, &ann_level, depth.descend(), visited, cache)
-                    .await?;
-                if ann_sid.namespace_code == BLANK_NODE {
-                    if let Some(map) = body.as_object_mut() {
-                        map.remove("@id");
-                    }
-                }
-                bodies.push(body);
+                matched_anns.push(ann_sid.clone());
             }
+            matched_anns.sort();
 
-            tracing::Span::current().record("annotation_count", bodies.len());
-            Ok(bodies)
+            tracing::Span::current().record("annotation_count", matched_anns.len());
+            self.render_annotation_bodies(&matched_anns, depth, visited, cache)
+                .await
         }
         .instrument(span)
         .await
@@ -1073,22 +1074,45 @@ impl<'a> HydrationFormatter<'a> {
                 })?;
             return Ok(!live.is_empty());
         }
-        // No arena: rely on the overlay's own current_targets_for
+        // No arena: try the overlay's current_targets_for first
         // (the merge helper's edge-cancellation logic over the live
         // events).
-        if let Some(novelty) = self
+        let novelty_says_live = self
             .db
             .overlay
             .as_any()
             .downcast_ref::<fluree_db_novelty::Novelty>()
-        {
-            return Ok(novelty
-                .attachments
-                .current_targets_for(sid)
-                .next()
-                .is_some());
+            .is_some_and(|n| n.attachments.current_targets_for(sid).next().is_some());
+        if novelty_says_live {
+            return Ok(true);
         }
-        Ok(false)
+
+        // Fall back to an indexed-base SPOT probe. Without this, a
+        // ledger whose annotation flakes have rolled into the base
+        // index but never had an arena sealed (M2a scan-fallback
+        // ledgers, or any snapshot opened without a content_store)
+        // would leak the anonymous annotation SID as a top-level
+        // wildcard row — the discriminator (`f:reifiesSubject` on
+        // the SID) is in base storage but neither the arena reader
+        // nor the overlay has it. SPOT(s = sid) is the same shape
+        // `fetch_subject_properties` uses and survives the
+        // blank-node-subject quirk in practice (verified by the
+        // scan-fallback hydration path at `lookup_annotation_bodies`).
+        let f_reifies_subject = Sid::new(FLUREE_DB, fluree_vocab::db::REIFIES_SUBJECT);
+        let flakes = self
+            .db
+            .range(
+                IndexType::Spot,
+                RangeTest::Eq,
+                RangeMatch::subject(sid.clone()),
+            )
+            .await
+            .map_err(|e| {
+                FormatError::InvalidBinding(format!(
+                    "annotation membership SPOT probe failed: {e}"
+                ))
+            })?;
+        Ok(flakes.iter().any(|f| f.p == f_reifies_subject))
     }
 
     /// Arena-backed annotation lookup. Returns `Some(sids)` when the

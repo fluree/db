@@ -163,6 +163,24 @@ fn reject_direct_reifies_in_patterns(patterns: &[Pattern]) -> Result<()> {
         }
     }
 
+    fn reject_predicate_string(predicate: String) -> LowerError {
+        LowerError::not_implemented(
+            format!(
+                "predicate '{predicate}' is system-controlled; \
+                 read edge annotations through SPARQL-star \
+                 quoted-triple annotation syntax rather than \
+                 naming f:reifies* directly"
+            ),
+            (0..0).into(),
+        )
+    }
+
+    // Exhaustive over `Pattern` so adding a new variant forces a
+    // firewall decision rather than silently slipping through. The
+    // previous wildcard arm let `PropertyPath` (which carries a
+    // predicate Sid) bypass the check — e.g.
+    // `?s f:reifiesSubject+ ?o` was accepted, exposing the
+    // system-controlled chain through transitive paths.
     fn walk(patterns: &[Pattern]) -> Result<()> {
         for pattern in patterns {
             match pattern {
@@ -173,15 +191,12 @@ fn reject_direct_reifies_in_patterns(patterns: &[Pattern]) -> Result<()> {
                             Ref::Sid(sid) => format!("{sid}"),
                             _ => "<f:reifies*>".to_string(),
                         };
-                        return Err(LowerError::not_implemented(
-                            format!(
-                                "predicate '{predicate}' is system-controlled; \
-                                 read edge annotations through SPARQL-star \
-                                 quoted-triple annotation syntax rather than \
-                                 naming f:reifies* directly"
-                            ),
-                            (0..0).into(),
-                        ));
+                        return Err(reject_predicate_string(predicate));
+                    }
+                }
+                Pattern::PropertyPath(pp) => {
+                    if fluree_db_core::is_reserved_reifies_predicate(&pp.predicate) {
+                        return Err(reject_predicate_string(format!("{}", pp.predicate)));
                     }
                 }
                 Pattern::Optional(inner)
@@ -199,7 +214,18 @@ fn reject_direct_reifies_in_patterns(patterns: &[Pattern]) -> Result<()> {
                 Pattern::EdgeAnnotation { body, .. } | Pattern::AnnotationTarget { body, .. } => {
                     walk(body)?;
                 }
-                _ => {}
+                Pattern::DefaultGraphSource { patterns } => walk(patterns)?,
+                // Pattern types that don't carry an arbitrary triple
+                // predicate — adapters / search calls / leaf nodes.
+                // f:reifies* predicates can't appear inside them.
+                Pattern::Filter(_)
+                | Pattern::Bind { .. }
+                | Pattern::Values { .. }
+                | Pattern::IndexSearch(_)
+                | Pattern::VectorSearch(_)
+                | Pattern::R2rml(_)
+                | Pattern::GeoSearch(_)
+                | Pattern::S2Search(_) => {}
             }
         }
         Ok(())

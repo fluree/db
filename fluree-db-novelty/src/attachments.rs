@@ -318,8 +318,23 @@ impl AttachmentNovelty {
             // malformed bundle (e.g. `f:reifiesGraph` missing on a
             // named-graph edge, or a tampered commit) — file under
             // the wrong graph and the cascade fast-path can't find
-            // the bundle on a base-edge retract. Mirrors the arena
-            // builder's check.
+            // the bundle on a base-edge retract.
+            //
+            // **Belt-and-suspenders.** The invariant now lives in
+            // the decoder itself: `EdgeKey::from_reifies_facts`
+            // returns `EdgeKeyDecodeError::GraphMismatch` when
+            // `f:reifiesGraph` disagrees with the bundle's
+            // flake-level `g`, and `MixedFlakeGraphs` when the
+            // bundle's flakes don't share one graph. Since this
+            // observer groups by `(g, ann, t, op)` before calling
+            // the decoder, the inner slice is graph-uniform and
+            // the decoder's `GraphMismatch` check already covers
+            // every case this external check could fire on. The
+            // external check is kept as defense-in-depth: if a
+            // future refactor changes the decoder semantics or
+            // skips the reconciliation, this branch catches the
+            // regression with a structured warn that names both
+            // graphs.
             if edge.g != bundle_g {
                 self.observed_malformed_bundles = self.observed_malformed_bundles.saturating_add(1);
                 tracing::warn!(

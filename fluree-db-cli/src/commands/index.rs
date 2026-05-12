@@ -40,9 +40,25 @@ pub async fn run_index(ledger: Option<&str>, dirs: &FlureeDir) -> CliResult<()> 
     // correct but slower. The provider reads from the running
     // `LedgerManager`, so we cache the ledger first to make sure
     // its attachment overlay is loaded.
+    //
+    // **Sticky-bit gate.** Mirror `admin.rs::reindex`: only resolve
+    // for ledgers that have actually observed a `f:reifies*` flake.
+    // On non-annotation ledgers, going through the provider has been
+    // observed to disturb novelty bookkeeping for unrelated facts
+    // (regression caught by
+    // `it_select_star_novelty_retract::expansion_applies_novelty_retractions`).
+    // The CLI shared the same code shape pre-gate and was vulnerable
+    // to the same regression; keep the two paths symmetric.
     if let Some(provider) = fluree.attachment_events_provider() {
-        let _ = fluree.ledger_cached(&ledger_id).await;
-        config.attachment_events = provider.attachment_events(&ledger_id).await;
+        let handle = fluree.ledger_cached(&ledger_id).await.map_err(|e| {
+            CliError::Import(format!("indexing failed: failed to load ledger: {e}"))
+        })?;
+        let view = handle.snapshot().await;
+        let ledger_has_annotations =
+            view.snapshot.has_annotations || view.novelty.attachments.has_annotations();
+        if ledger_has_annotations {
+            config.attachment_events = provider.attachment_events(&ledger_id).await;
+        }
     }
 
     let cs = fluree
