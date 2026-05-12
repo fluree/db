@@ -18,6 +18,7 @@ use fluree_vocab::namespaces::{
 };
 use fluree_vocab::predicates::*;
 use std::collections::HashMap;
+use std::sync::OnceLock;
 
 use crate::sid::Sid;
 
@@ -245,8 +246,12 @@ pub fn is_reifies_list_index(sid: &Sid) -> bool {
 /// This is the canonical reserved-predicate firewall check used by every
 /// write surface (parse, lower_sparql_update, turtle ingest, import,
 /// raw_txn_upload, flake_sink) and by the read-side system-fact filter.
-/// Implemented as a single namespace-code check followed by a name
-/// dispatch — costs an integer compare plus one short string compare.
+/// Implemented as an integer compare on `namespace_code` followed by a
+/// `matches!` over seven short string literals (the predicate names are
+/// all under 24 bytes). LLVM compiles the `matches!` to a small jump
+/// table over byte-prefix-disambiguated arms; cost is dominated by the
+/// string-equality dispatch but stays bounded — the hot path on a
+/// non-`FLUREE_DB` SID returns after the integer compare alone.
 #[inline]
 pub fn is_reserved_reifies_predicate(sid: &Sid) -> bool {
     if sid.namespace_code != FLUREE_DB {
@@ -264,22 +269,77 @@ pub fn is_reserved_reifies_predicate(sid: &Sid) -> bool {
     )
 }
 
+/// Process-wide cache of the seven canonical `f:reifies*` predicate
+/// SIDs. Each entry holds an `Arc<str>` for the predicate name; the
+/// cache is populated once on first access and never reallocates.
+///
+/// Indices match the `[Graph, Subject, Predicate, Object, Datatype,
+/// Lang, ListIndex]` order documented on
+/// [`reifies_predicate_sids`].
+fn cached_reifies_predicate_sids() -> &'static [Sid; 7] {
+    static SIDS: OnceLock<[Sid; 7]> = OnceLock::new();
+    SIDS.get_or_init(|| {
+        [
+            Sid::new(FLUREE_DB, fluree_db_predicates::REIFIES_GRAPH),
+            Sid::new(FLUREE_DB, fluree_db_predicates::REIFIES_SUBJECT),
+            Sid::new(FLUREE_DB, fluree_db_predicates::REIFIES_PREDICATE),
+            Sid::new(FLUREE_DB, fluree_db_predicates::REIFIES_OBJECT),
+            Sid::new(FLUREE_DB, fluree_db_predicates::REIFIES_DATATYPE),
+            Sid::new(FLUREE_DB, fluree_db_predicates::REIFIES_LANG),
+            Sid::new(FLUREE_DB, fluree_db_predicates::REIFIES_LIST_INDEX),
+        ]
+    })
+}
+
+/// Borrow a single cached `f:reifies*` predicate SID. Cheaper than
+/// `Sid::new(FLUREE_DB, …)` on the bundle-build hot path — callers
+/// clone the static reference via the `Arc<str>` refcount bump
+/// instead of allocating a fresh `Arc::from(&str)` per flake.
+#[inline]
+pub fn reifies_graph_sid() -> &'static Sid {
+    &cached_reifies_predicate_sids()[0]
+}
+/// See [`reifies_graph_sid`].
+#[inline]
+pub fn reifies_subject_sid() -> &'static Sid {
+    &cached_reifies_predicate_sids()[1]
+}
+/// See [`reifies_graph_sid`].
+#[inline]
+pub fn reifies_predicate_sid() -> &'static Sid {
+    &cached_reifies_predicate_sids()[2]
+}
+/// See [`reifies_graph_sid`].
+#[inline]
+pub fn reifies_object_sid() -> &'static Sid {
+    &cached_reifies_predicate_sids()[3]
+}
+/// See [`reifies_graph_sid`].
+#[inline]
+pub fn reifies_datatype_sid() -> &'static Sid {
+    &cached_reifies_predicate_sids()[4]
+}
+/// See [`reifies_graph_sid`].
+#[inline]
+pub fn reifies_lang_sid() -> &'static Sid {
+    &cached_reifies_predicate_sids()[5]
+}
+/// See [`reifies_graph_sid`].
+#[inline]
+pub fn reifies_list_index_sid() -> &'static Sid {
+    &cached_reifies_predicate_sids()[6]
+}
+
 /// Construct the seven canonical `f:reifies*` predicate SIDs.
 ///
 /// Returned in the order `[Graph, Subject, Predicate, Object, Datatype,
-/// Lang, ListIndex]`. Callers that only need a subset should use the
-/// individual `is_reifies_*` helpers above; this is for the staging
-/// path and tests that need to emit the full bundle.
+/// Lang, ListIndex]`. Each `Sid` is cloned from the process-wide
+/// cache, so the call is allocation-free (Arc refcount bumps only).
+/// Callers that only need a subset should use the typed
+/// `reifies_*_sid()` accessors above to avoid the seven-element
+/// clone.
 pub fn reifies_predicate_sids() -> [Sid; 7] {
-    [
-        Sid::new(FLUREE_DB, fluree_db_predicates::REIFIES_GRAPH),
-        Sid::new(FLUREE_DB, fluree_db_predicates::REIFIES_SUBJECT),
-        Sid::new(FLUREE_DB, fluree_db_predicates::REIFIES_PREDICATE),
-        Sid::new(FLUREE_DB, fluree_db_predicates::REIFIES_OBJECT),
-        Sid::new(FLUREE_DB, fluree_db_predicates::REIFIES_DATATYPE),
-        Sid::new(FLUREE_DB, fluree_db_predicates::REIFIES_LANG),
-        Sid::new(FLUREE_DB, fluree_db_predicates::REIFIES_LIST_INDEX),
-    ]
+    cached_reifies_predicate_sids().clone()
 }
 
 /// Baseline namespace codes (code -> prefix) matching Fluree's reserved codepoints.

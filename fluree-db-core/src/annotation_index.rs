@@ -30,20 +30,28 @@ use serde::{Deserialize, Serialize};
 /// Aggregate counters populated at arena build time. Surfaced for
 /// cost-based planning (M3) and storage inspection.
 ///
-/// Per-slot NDV counters (added in M3.1 follow-up) are
-/// `#[serde(default)]` so older arena roots — written before this
-/// struct grew — deserialize cleanly with zeros. The planner treats
-/// a zero NDV for a slot as "no information" and falls back to the
-/// regular `IndexStats.properties` HLL for that predicate.
+/// **Every field is `#[serde(default)]`** so older arena roots —
+/// written before any given field landed — deserialize cleanly with
+/// zeros. This applies to the *original* four counters as well as
+/// the per-slot NDV counters added in the M3.1 follow-up: a missing
+/// field on the wire is treated as "no information" by the planner,
+/// which falls back to the regular `IndexStats.properties` HLL.
+/// Tagging all fields keeps the struct safely reorderable — if a
+/// future contributor inserts a new field anywhere in source order,
+/// old arenas still load.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AnnotationStats {
     /// Total forward-arena rows (one per asserted/retracted attachment event).
+    #[serde(default)]
     pub forward_rows: u64,
     /// Total reverse-arena rows (mirror of `forward_rows` after compaction).
+    #[serde(default)]
     pub reverse_rows: u64,
     /// Distinct edges with at least one current (live) attachment.
+    #[serde(default)]
     pub distinct_edges: u64,
     /// Distinct annotation subjects.
+    #[serde(default)]
     pub distinct_annotations: u64,
     /// Number of live `(edge, ann)` attachment pairs.
     ///

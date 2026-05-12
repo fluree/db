@@ -413,6 +413,18 @@ struct HydrationFormatter<'a> {
             dyn fluree_db_core::storage::ContentStore,
         >,
     >,
+    /// Cached downcast of `db.overlay` to the concrete
+    /// `fluree_db_novelty::Novelty` type. Computed once on `new()`
+    /// and reused across every annotation-hydration call site —
+    /// previously each call did its own
+    /// `as_any().downcast_ref::<Novelty>()` (three times per
+    /// ref-valued property: in the gate, in
+    /// `arena_lookup_annotations`, and twice in
+    /// `is_live_annotation_subject`). `None` means the overlay
+    /// isn't the concrete `Novelty` type (test fakes / future
+    /// overlays); callers fall back to the scan path the same way
+    /// they did before.
+    novelty: Option<&'a fluree_db_novelty::Novelty>,
 }
 
 impl<'a> HydrationFormatter<'a> {
@@ -439,6 +451,15 @@ impl<'a> HydrationFormatter<'a> {
             ),
             _ => None,
         };
+        // Cache the overlay's `Novelty` downcast once. The overlay
+        // pointer is fixed for the lifetime of the formatter (one
+        // hydration response), so doing the dynamic dispatch up
+        // front avoids three `as_any().downcast_ref::<Novelty>()`
+        // calls per ref-valued property at format time.
+        let novelty = db
+            .overlay
+            .as_any()
+            .downcast_ref::<fluree_db_novelty::Novelty>();
         Self {
             db,
             compactor,
@@ -447,6 +468,7 @@ impl<'a> HydrationFormatter<'a> {
             policy,
             tracker,
             arena_reader,
+            novelty,
         }
     }
 
@@ -853,12 +875,7 @@ impl<'a> HydrationFormatter<'a> {
         // (test fakes, future variants), keep the scan fallback so
         // we don't silently miss attachments.
         if !self.db.snapshot.has_annotations {
-            let novelty_clean = self
-                .db
-                .overlay
-                .as_any()
-                .downcast_ref::<fluree_db_novelty::Novelty>()
-                .map(|n| !n.attachments.has_annotations());
+            let novelty_clean = self.novelty.map(|n| !n.attachments.has_annotations());
             if matches!(novelty_clean, Some(true)) {
                 return Ok(Vec::new());
             }
@@ -1059,10 +1076,7 @@ impl<'a> HydrationFormatter<'a> {
         // Overlay-side: AttachmentNovelty's reverse map answers
         // "does this ann SID have any live target?" without policy.
         let novelty_events: Vec<(fluree_db_core::edge::EdgeKey, i64, bool)> = self
-            .db
-            .overlay
-            .as_any()
-            .downcast_ref::<fluree_db_novelty::Novelty>()
+            .novelty
             .map(|n| n.attachments.collect_reverse_events(sid))
             .unwrap_or_default();
         if let Some(reader) = self.arena_reader.as_ref() {
@@ -1078,10 +1092,7 @@ impl<'a> HydrationFormatter<'a> {
         // (the merge helper's edge-cancellation logic over the live
         // events).
         let novelty_says_live = self
-            .db
-            .overlay
-            .as_any()
-            .downcast_ref::<fluree_db_novelty::Novelty>()
+            .novelty
             .is_some_and(|n| n.attachments.current_targets_for(sid).next().is_some());
         if novelty_says_live {
             return Ok(true);
@@ -1108,9 +1119,7 @@ impl<'a> HydrationFormatter<'a> {
             )
             .await
             .map_err(|e| {
-                FormatError::InvalidBinding(format!(
-                    "annotation membership SPOT probe failed: {e}"
-                ))
+                FormatError::InvalidBinding(format!("annotation membership SPOT probe failed: {e}"))
             })?;
         Ok(flakes.iter().any(|f| f.p == f_reifies_subject))
     }
@@ -1137,18 +1146,14 @@ impl<'a> HydrationFormatter<'a> {
             let Some(reader) = self.arena_reader.as_ref() else {
                 return Ok(None);
             };
-            // Downcast the overlay to the concrete `Novelty` so we can
-            // reach `AttachmentNovelty`. If the overlay isn't `Novelty`
-            // (test fakes, future overlay types), bail to the scan path
-            // — proceeding with an empty novelty event slice would let
+            // The overlay must be the concrete `Novelty` type so we
+            // can reach `AttachmentNovelty`. If it isn't (test fakes,
+            // future overlay variants), bail to the scan path —
+            // proceeding with an empty novelty event slice would let
             // the arena report stale indexed attachments while the
-            // overlay still holds unobserved retracts.
-            let Some(novelty) = self
-                .db
-                .overlay
-                .as_any()
-                .downcast_ref::<fluree_db_novelty::Novelty>()
-            else {
+            // overlay still holds unobserved retracts. Downcast was
+            // cached at formatter construction; no per-call dispatch.
+            let Some(novelty) = self.novelty else {
                 return Ok(None);
             };
             let novelty_events = novelty.attachments.collect_forward_events(edge_key);

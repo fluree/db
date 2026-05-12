@@ -445,14 +445,14 @@ pub(crate) async fn encode_and_write_root_v6(
         }
     }
 
-    // Coerce `had_annotation_arena = true` on any
-    // indexer-produced root with `has_annotations = true`. The
-    // rationale matches the incremental builder's `build()`:
-    // every indexer pass on an annotation-bearing ledger
-    // represents history the indexer owns; the provider's
-    // base-index scan-fallback must not later reconstruct a
-    // live-only `Authoritative` arena from such a root. Bulk
-    // import is the only path that leaves the bit false.
+    // Sticky-bit coercion: see the canonical contract on
+    // `IndexRoot.had_annotation_arena` in
+    // `fluree-db-binary-index/src/format/index_root.rs`. Mirrors
+    // `IncrementalRootBuilder::build()` — every indexer pass on
+    // an annotation-bearing ledger represents history the indexer
+    // owns; the provider must not later reconstruct a live-only
+    // `Authoritative` arena from such a root. Bulk import is the
+    // only path that leaves the bit false.
     if root.has_annotations {
         root.had_annotation_arena = true;
     }

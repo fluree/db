@@ -4029,14 +4029,18 @@ where
             // dict moves into this struct literal.
             has_annotations: import_has_annotations,
             annotation_index: None,
-            // Bulk import never seals an annotation arena directly —
-            // that happens on the follow-up `reindex` pass. Leaving
-            // this `false` is the precondition the provider's
-            // base-index scan-fallback gates on: it bootstraps a
-            // first-time `Authoritative` arena only when
-            // `has_annotations=true && had_annotation_arena=false`,
-            // and *not* when a later defensive drop leaves
-            // `annotation_index=None` with the sticky bit set.
+            // Sticky-bit canonical contract lives on
+            // `IndexRoot.had_annotation_arena` in
+            // `fluree-db-binary-index/src/format/index_root.rs`.
+            // Bulk import is the *only* path that leaves the bit
+            // false (it bypasses both incremental and full-rebuild
+            // root-assembly paths, which both coerce the bit on).
+            // That makes the
+            // `has_annotations=true && had_annotation_arena=false`
+            // shape the unique bootstrap-eligible state the
+            // provider's base-index scan-fallback gates on — a
+            // later defensive drop carries the sticky bit forward
+            // and stays out of the bootstrap path.
             had_annotation_arena: false,
             ns_split_mode: fluree_db_core::ns_encoding::NsSplitMode::default(),
         };

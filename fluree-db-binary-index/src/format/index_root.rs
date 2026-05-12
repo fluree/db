@@ -573,6 +573,22 @@ impl IndexRoot {
     /// Determinism: namespaces sorted by ns_code, named graphs by g_id,
     /// orders by order_id, numbig/vectors/spatial/fulltext by p_id.
     pub fn encode(&self) -> Vec<u8> {
+        // Invariant guard for the sticky bit. The field doc says
+        // `had_annotation_arena` is "never cleared by any root
+        // assembly path" — a populated `annotation_index` in
+        // particular implies the bit was set on the seal that
+        // produced it. The encoder also coerces the wire bit on
+        // (below), so a forgotten in-memory flip never escapes to
+        // disk — but the in-memory invariant is still useful to
+        // pin in dev/CI so a regression in the seal/drop
+        // bookkeeping surfaces here instead of as a phantom
+        // bootstrap-eligible state on the next reindex.
+        debug_assert!(
+            self.had_annotation_arena || self.annotation_index.is_none(),
+            "had_annotation_arena=false with annotation_index=Some(_) violates the sticky-bit \
+             contract — once an arena is set, the bit must be set too. See IndexRoot field doc."
+        );
+
         let mut buf = Vec::with_capacity(8192);
 
         // ---- Header (24 bytes) ----
@@ -1566,10 +1582,15 @@ mod tests {
             reverse_branch_cid: dummy_rev,
             stats: fluree_db_core::AnnotationStats::default(),
         });
-        root_with_arena.had_annotation_arena = false; // simulate caller forgetting to set
+        // Set the sticky bit true (matches the in-memory invariant
+        // enforced by `encode()`'s `debug_assert!`) so the encode
+        // call succeeds; we then forcibly zero the extended-flags
+        // bytes to simulate a pre-this-change encoder that wrote
+        // `pad = 0` on the wire even when an arena was sealed.
+        // What's actually under test here is the *decoder's*
+        // legacy-byte coercion, not the encoder.
+        root_with_arena.had_annotation_arena = true;
         let mut bytes_legacy_with_arena = root_with_arena.encode();
-        // Forcibly zero the extended-flags bytes to simulate an
-        // encoder that predates this change.
         bytes_legacy_with_arena[6] = 0;
         bytes_legacy_with_arena[7] = 0;
         let decoded = IndexRoot::decode(&bytes_legacy_with_arena).unwrap();
@@ -1588,13 +1609,23 @@ mod tests {
     }
 
     #[test]
-    fn fir6_encoder_coerces_had_annotation_arena_when_arena_present() {
-        // Symmetric to the decode-side coercion: an encoder caller
-        // that constructs `annotation_index = Some(_)` without
-        // flipping the sticky bit must still produce a wire root
-        // with the bit set. Otherwise a fresh-load of that root
-        // and a subsequent defensive drop would land in the
-        // bootstrap-eligible state.
+    #[should_panic(expected = "had_annotation_arena=false with annotation_index=Some")]
+    fn fir6_encoder_debug_asserts_sticky_bit_when_arena_present() {
+        // The in-memory contract is now the source of truth: an
+        // `IndexRoot` with `annotation_index = Some(_)` must also
+        // carry `had_annotation_arena = true`. `encode()` debug-
+        // asserts the invariant so a regression in seal/drop
+        // bookkeeping fails fast in dev/CI rather than relying on
+        // the wire-format coercion to paper over it at release
+        // time.
+        //
+        // The encoder's `|| self.annotation_index.is_some()`
+        // coercion (around line 633) is retained as a release-build
+        // safety net — if `debug_assertions = false` and a caller
+        // somehow violates the invariant anyway, the wire bit is
+        // still forced on, preserving correct
+        // bootstrap-vs-defensive-drop semantics on the next
+        // reindex.
         let dummy_fwd = fluree_db_core::ContentId::from_hex_digest(
             fluree_db_core::CODEC_FLUREE_ANNOTATION_FORWARD_BRANCH,
             &fluree_db_core::sha256_hex(b"fwd"),
@@ -1613,17 +1644,10 @@ mod tests {
             reverse_branch_cid: dummy_rev,
             stats: fluree_db_core::AnnotationStats::default(),
         });
-        // Deliberately leave the sticky bit clear; encoder must
-        // coerce it on.
+        // Deliberately leave the sticky bit clear: the debug_assert
+        // in `encode()` must fire.
         root.had_annotation_arena = false;
-        let bytes = root.encode();
-        assert_ne!(
-            bytes[6] & IndexRoot::FLAG_EXT_HAD_ANNOTATION_ARENA,
-            0,
-            "encoder must coerce extended-flags bit when annotation_index is present"
-        );
-        let decoded = IndexRoot::decode(&bytes).unwrap();
-        assert!(decoded.had_annotation_arena);
+        let _ = root.encode();
     }
 
     #[test]

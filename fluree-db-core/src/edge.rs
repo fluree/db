@@ -20,12 +20,17 @@
 use crate::flake::{Flake, FlakeMeta};
 use crate::namespaces::{
     is_reifies_datatype, is_reifies_graph, is_reifies_lang, is_reifies_list_index,
-    is_reifies_object, is_reifies_predicate, is_reifies_subject,
+    is_reifies_object, is_reifies_predicate, is_reifies_subject, reifies_datatype_sid,
+    reifies_graph_sid, reifies_lang_sid, reifies_object_sid, reifies_predicate_sid,
+    reifies_subject_sid,
 };
 use crate::sid::Sid;
 use crate::value::FlakeValue;
+#[cfg(test)]
 use fluree_vocab::db as fluree_db_predicates;
-use fluree_vocab::namespaces::{FLUREE_DB, JSON_LD, XSD};
+use fluree_vocab::namespaces::{JSON_LD, XSD};
+#[cfg(test)]
+use fluree_vocab::namespaces::FLUREE_DB;
 use fluree_vocab::xsd_names;
 use serde::{Deserialize, Serialize};
 
@@ -151,10 +156,13 @@ impl EdgeKey {
         };
 
         // f:reifiesGraph — present iff edge is in a named graph.
+        // Predicate SIDs are cloned from the process-wide cache in
+        // `namespaces.rs` (Arc refcount bump, no allocation) instead
+        // of `Sid::new(FLUREE_DB, "reifies…")` per-flake.
         if let Some(g) = &self.g {
             facts.push(make(
                 ann.clone(),
-                Sid::new(FLUREE_DB, fluree_db_predicates::REIFIES_GRAPH),
+                reifies_graph_sid().clone(),
                 FlakeValue::Ref(g.clone()),
                 id_dt.clone(),
             ));
@@ -163,7 +171,7 @@ impl EdgeKey {
         // f:reifiesSubject — required.
         facts.push(make(
             ann.clone(),
-            Sid::new(FLUREE_DB, fluree_db_predicates::REIFIES_SUBJECT),
+            reifies_subject_sid().clone(),
             FlakeValue::Ref(self.s.clone()),
             id_dt.clone(),
         ));
@@ -171,7 +179,7 @@ impl EdgeKey {
         // f:reifiesPredicate — required.
         facts.push(make(
             ann.clone(),
-            Sid::new(FLUREE_DB, fluree_db_predicates::REIFIES_PREDICATE),
+            reifies_predicate_sid().clone(),
             FlakeValue::Ref(self.p.clone()),
             id_dt.clone(),
         ));
@@ -180,7 +188,7 @@ impl EdgeKey {
         // datatype on the flake so typed-equality lookups round-trip.
         facts.push(make(
             ann.clone(),
-            Sid::new(FLUREE_DB, fluree_db_predicates::REIFIES_OBJECT),
+            reifies_object_sid().clone(),
             self.o.clone(),
             self.dt.clone(),
         ));
@@ -190,7 +198,7 @@ impl EdgeKey {
         // inspecting the object value.
         facts.push(make(
             ann.clone(),
-            Sid::new(FLUREE_DB, fluree_db_predicates::REIFIES_DATATYPE),
+            reifies_datatype_sid().clone(),
             FlakeValue::Ref(self.dt.clone()),
             id_dt,
         ));
@@ -200,7 +208,7 @@ impl EdgeKey {
         if let Some(lang) = &self.lang {
             facts.push(make(
                 ann.clone(),
-                Sid::new(FLUREE_DB, fluree_db_predicates::REIFIES_LANG),
+                reifies_lang_sid().clone(),
                 FlakeValue::String(lang.clone()),
                 str_dt,
             ));
