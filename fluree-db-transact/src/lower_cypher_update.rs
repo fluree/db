@@ -181,7 +181,14 @@ impl<'a> CypherLowering<'a> {
                 }
                 WriteClause::Merge(_) => {
                     return Err(LowerCypherError::unsupported(
-                        "MERGE is deferred — initial Cypher write slice covers CREATE",
+                        "MERGE is deferred. Cypher's find-or-create semantics need a \
+                         search-first phase that the existing TxnType variants don't \
+                         model (Insert is unconditional; Upsert is delete-then-insert; \
+                         Update silently skips unbound variables). A v1.1 implementation \
+                         can layer it at the API level: snapshot-query for the \
+                         identifying pattern, then conditionally stage CREATE-shape \
+                         flakes when no match is found, or apply ON MATCH SET when \
+                         matches exist.",
                     ));
                 }
             }

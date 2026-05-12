@@ -160,6 +160,10 @@ pub enum ApiError {
     #[error("Cypher lowering error: {0}")]
     CypherLower(#[from] fluree_db_cypher::LowerError),
 
+    /// Cypher write-path lowering errors.
+    #[error("Cypher update lowering error: {0}")]
+    CypherUpdateLower(#[from] fluree_db_transact::lower_cypher_update::LowerCypherError),
+
     /// Turtle parse errors
     #[error("Turtle parse error: {0}")]
     Turtle(#[from] fluree_graph_turtle::TurtleError),
@@ -408,6 +412,7 @@ impl ApiError {
             | ApiError::SparqlLower(_)
             | ApiError::Cypher { .. }
             | ApiError::CypherLower(_)
+            | ApiError::CypherUpdateLower(_)
             | ApiError::Turtle(_)
             | ApiError::Json(_)
             | ApiError::Batch(_)

@@ -86,6 +86,42 @@ async fn cypher_variable_length_rejected_at_lower() {
 }
 
 #[tokio::test]
+async fn transact_cypher_create_round_trips_to_jsonld_query() {
+    // End-to-end: Cypher CREATE → stage → JSON-LD read sees the data.
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger0 = genesis_ledger(&fluree, "it/cypher:transact-create");
+
+    let result = fluree
+        .transact_cypher(ledger0, "CREATE (n:Person)")
+        .await
+        .expect("cypher create");
+
+    // Querying back via Cypher should find the node.
+    let db = graphdb_from_ledger(&result.ledger);
+    let rows = fluree
+        .query_cypher(&db, "MATCH (n:Person) RETURN n")
+        .await
+        .expect("cypher query");
+    assert_eq!(rows.row_count(), 1);
+}
+
+#[tokio::test]
+async fn transact_cypher_merge_returns_specific_deferred_error() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger0 = genesis_ledger(&fluree, "it/cypher:merge-deferred");
+
+    let err = fluree
+        .transact_cypher(ledger0, "MERGE (n:Person {name: \"Alice\"})")
+        .await
+        .expect_err("MERGE should be deferred");
+    let msg = format!("{err}");
+    assert!(
+        msg.contains("MERGE"),
+        "expected MERGE-specific deferral, got: {msg}"
+    );
+}
+
+#[tokio::test]
 async fn cypher_undirected_rejected_at_lower() {
     let fluree = FlureeBuilder::memory().build_memory();
     let ledger0 = genesis_ledger(&fluree, "it/cypher:undirected");

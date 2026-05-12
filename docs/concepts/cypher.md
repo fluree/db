@@ -118,9 +118,16 @@ ORDER BY / SKIP / LIMIT
   facts hidden via the existing `include_system_facts = false`
   filter.
 - `WHERE` expressions: comparison, AND/OR/NOT, arithmetic +/-/*//,
-  STARTS WITH / ENDS WITH / CONTAINS, IS NULL / IS NOT NULL.
+  STARTS WITH / ENDS WITH / CONTAINS, IS NULL / IS NOT NULL,
+  `expr IN [a, b, ...]`, `CASE WHEN ... THEN ... END` (simple and
+  subject forms), `EXISTS { pattern }`.
 - ORDER BY (variable keys only), SKIP, LIMIT.
-- `RETURN n`, `RETURN n, m`, `RETURN *`, `RETURN DISTINCT ...`.
+- `UNWIND [literals] AS x` — inline list literal unwinding.
+- Aggregates: `count(*)`, `count(x)`, `count(DISTINCT x)`,
+  `sum(x)`, `avg(x)`, `min(x)`, `max(x)` (bare-variable arguments
+  only in v1).
+- `RETURN n`, `RETURN n, m`, `RETURN *`, `RETURN DISTINCT ...`,
+  `RETURN expr AS alias` (lowered via `Bind`).
 
 ### Writes
 
@@ -128,9 +135,9 @@ ORDER BY / SKIP / LIMIT
 CREATE (a:Label {p:v})-[:T {q:w}]->(b:Label2)
 ```
 
-Lowered through the public `fluree_db_transact::lower_cypher_update`
-entry point — a top-level API wrapper is not yet exposed alongside
-`Fluree::query_cypher`.
+```rust
+let result = fluree.transact_cypher(ledger, cypher).await?;
+```
 
 - Directed typed relationships emit base triple + reifier bundle
   (LPG-mode default for Cypher).
@@ -146,18 +153,23 @@ These produce a clear error today and land in follow-on slices.
 - Variable-length paths `-[*N..M]->`.
 - Path values `MATCH p = (...)`.
 - `shortestPath`, `allShortestPaths`.
-- `WITH` subquery boundary, `UNWIND`.
+- `WITH` subquery boundary.
+- `UNWIND $param AS x` (parameter-bound list — needs API-layer
+  parameter substitution).
 - `UNION` / `UNION ALL` (type alternation `[:T1|T2]` already lowers
   through `Union` internally — top-level `UNION` between full clauses
   is the deferred piece).
-- `EXISTS { ... }` in expression position.
-- Aggregates (`count(*)`, `count(x)`, `sum`, `avg`, `min`, `max`,
-  `collect`).
-- `RETURN expr AS alias` — projection aliases not yet wired into the
-  result schema.
+- `collect(x)` aggregate (needs list-valued bindings/result format).
+- Expression-valued aggregate arguments (`sum(n + 1)`) — needs a
+  pre-aggregation `Bind`.
 - `collect(...)`, `labels(...)`, `keys(...)`, `properties(...)`,
   `type(r)`, `id(...)`, list/map functions generally.
-- `SET / REMOVE / DELETE / DETACH DELETE / MERGE`.
+- `SET / REMOVE / DELETE / DETACH DELETE`.
+- `MERGE` — Cypher's find-or-create needs a search-first phase that
+  the existing `TxnType` variants don't model. A v1.1 implementation
+  can layer it at the API level: snapshot-query for the identifying
+  pattern, then conditionally stage either a CREATE-shape transaction
+  or an ON MATCH SET update.
 - `MATCH ... CREATE ...` (WHERE-driven write templates).
 - `CALL` with side effects, stored procedures.
 - `LOAD CSV`, `FOREACH`, schema DDL.

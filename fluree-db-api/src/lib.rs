@@ -3029,6 +3029,45 @@ impl Fluree {
         OwnedTransactBuilder::new(self, ledger)
     }
 
+    /// Stage a Cypher write statement.
+    ///
+    /// The Cypher parser produces a Txn that mirrors what the JSON-LD
+    /// `@annotation` lowering produces: base triples plus an
+    /// `f:reifies*` reifier bundle for every directed typed
+    /// relationship (LPG-mode default).
+    ///
+    /// v1 supports CREATE only. SET / REMOVE / DELETE / DETACH
+    /// DELETE / MERGE return clear deferred-feature errors. See
+    /// `docs/concepts/cypher.md` for the surface.
+    pub async fn transact_cypher(
+        &self,
+        ledger: LedgerState,
+        cypher: &str,
+    ) -> Result<TransactResult> {
+        let out = fluree_db_cypher::parse_cypher(cypher);
+        if out.has_errors() {
+            let msg = out
+                .diagnostics
+                .iter()
+                .map(|d| format!("{}: {}", d.code, d.message))
+                .collect::<Vec<_>>()
+                .join("; ");
+            return Err(ApiError::cypher(msg, out.diagnostics));
+        }
+        let ast = out
+            .ast
+            .ok_or_else(|| ApiError::cypher("Cypher parse returned no AST", Vec::new()))?;
+
+        let mut ns = NamespaceRegistry::from_db(&ledger.snapshot);
+        let txn = fluree_db_transact::lower_cypher_update::lower_cypher_update(
+            &ast,
+            &mut ns,
+            TxnOpts::default(),
+            fluree_db_transact::lower_cypher_update::CypherLowerOpts::default(),
+        )?;
+        self.stage_owned(ledger).txn(txn).execute().await
+    }
+
     /// Create a FROM-driven query builder.
     ///
     /// Use this when the query body itself specifies which ledgers to target
