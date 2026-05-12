@@ -93,16 +93,10 @@ pub(crate) fn lower_query<E: IriEncoder>(
         patterns.extend(lowered);
     }
 
-    // Lower the reasoning config and ordering axes.
-    let reasoning = lower_options(&ast.options);
-    let ordering = lower_ordering(&ast.options, vars);
-    let limit = ast.options.limit;
-    let offset = ast.options.offset;
-
-    // Pre-register aggregate output VarIds so SELECT-clause scalar
-    // expressions can be classified as pre/post-aggregation. The same
-    // registration runs again inside `lower_grouping`;
-    // `vars.get_or_insert` is idempotent.
+    // Resolve aggregate output VarIds up front so we can classify each
+    // SELECT-clause computation as pre- or post-aggregation. Mirrors
+    // `fluree_db_sparql::lower::select::lower_select_expression_binds` so
+    // SPARQL and JSON-LD queries produce the same IR shape.
     let aggregate_output_vars: std::collections::HashSet<VarId> = ast
         .options
         .aggregates
@@ -113,11 +107,8 @@ pub(crate) fn lower_query<E: IriEncoder>(
     // Desugar SELECT-clause scalar expressions to BIND patterns. Pre/Post
     // placement is decided per-column by `lower_select_expr_bind`; we
     // accumulate post-bind aliases as we go so chained derivations
-    // (`(as (+ ?cnt 1) ?adj) (as (+ ?adj 1) ?again)`) correctly land in
-    // post-aggregation binds in source order.
-    //
-    // Mirrors `fluree_db_sparql::lower::select::lower_select_expression_binds`
-    // so SPARQL and JSON-LD queries produce the same IR shape.
+    // (`(as (+ ?cnt 1) ?adj) (as (+ ?adj 1) ?again)`) land in `post_binds`
+    // in source order.
     let mut post_bind_aliases: std::collections::HashSet<VarId> = std::collections::HashSet::new();
     let mut post_binds: Vec<(VarId, Expression)> = Vec::new();
     for column in ast.select.columns() {
@@ -146,8 +137,13 @@ pub(crate) fn lower_query<E: IriEncoder>(
         }
     }
 
-    // Build the grouping axis with the post-aggregation binds threaded in.
+    // Lower the reasoning config, ordering, and grouping (each is its own axis).
+    // Post-aggregation binds collected above ride inside the grouping phase.
+    let reasoning = lower_options(&ast.options);
+    let ordering = lower_ordering(&ast.options, vars);
     let grouping = lower_grouping(&ast.options, vars, post_binds)?;
+    let limit = ast.options.limit;
+    let offset = ast.options.offset;
 
     // Build QueryOutput from mode + lowered components. The parser guarantees
     // `selectOne` and `selectDistinct` are mutually exclusive (if-else dispatch
@@ -1233,9 +1229,9 @@ fn lower_subquery<E: IriEncoder>(
         sq = sq.with_ordering(sort_specs);
     }
 
-    // GROUP BY / aggregates / HAVING (needed for subqueries used in
-    // filters/unions). Subqueries reject Post-placement select expressions
-    // above, so no post-binds reach the grouping axis here.
+    // GROUP BY / aggregates / HAVING (needed for subqueries used in filters/unions).
+    // Subqueries have no post-aggregation bind channel; the loop above
+    // already rejects any SELECT computation classified as `Post`.
     sq.grouping = lower_grouping(&subquery.options, vars, Vec::new())?;
 
     Ok(sq)
@@ -1725,13 +1721,14 @@ fn lower_ordering(opts: &UnresolvedOptions, vars: &mut VarRegistry) -> Vec<SortS
 }
 
 /// Lower the unresolved aggregation surface (GROUP BY / aggregates / HAVING)
-/// plus any post-aggregation BINDs into the structural `Grouping` IR.
-/// Returns `None` when there is no aggregation phase at all (no GROUP BY,
-/// no aggregates, no HAVING, no post-binds).
+/// into the structural `Grouping` IR. Returns `None` when there is no
+/// aggregation phase at all (no GROUP BY, no aggregates, no HAVING, no
+/// post-aggregation binds).
 ///
-/// `post_binds` carries SELECT-clause scalar expressions whose lowering
-/// referenced an aggregate output (or another post-bind alias). They are
-/// applied after aggregation, in source order.
+/// `post_binds` are derived bindings that fire after every aggregate has
+/// been computed; they ride inside the resulting `Aggregation`. Subquery
+/// callers pass `Vec::new()` because [`SubqueryPattern`] has no post-bind
+/// channel.
 fn lower_grouping(
     opts: &UnresolvedOptions,
     vars: &mut VarRegistry,

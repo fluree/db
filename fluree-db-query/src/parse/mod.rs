@@ -3314,14 +3314,14 @@ mod tests {
             }
             other => panic!("expected Call(Coalesce), got {other:?}"),
         }
-        // No grouping phase at all (no aggregates, no post-binds).
+        // No grouping phase (no aggregates here, so no post-bind channel).
         assert!(query.grouping.is_none());
     }
 
     #[test]
     fn test_select_scalar_expr_post_aggregate_bind() {
         // (as (+ ?cnt 1) ?adjusted) where ?cnt is an aggregate output should
-        // land in the post-aggregation binds, not in patterns.
+        // land in the grouping's post-aggregation binds, not in patterns.
         let json = json!({
             "@context": { "ex": "http://example.org/" },
             "select": [
@@ -3342,9 +3342,8 @@ mod tests {
             .as_ref()
             .and_then(|g| g.aggregation())
             .expect("aggregation phase present");
-        // One aggregate created.
+        // One aggregate, one post-aggregation BIND.
         assert_eq!(agg.aggregates.len(), 1);
-        // The (+ ?cnt 1) bind must be post-aggregation.
         assert_eq!(agg.binds.len(), 1);
         let adjusted_var = vars.get("?adjusted").expect("?adjusted registered");
         assert_eq!(agg.binds[0].0, adjusted_var);
