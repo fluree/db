@@ -59,22 +59,43 @@ pub fn lower_query<E: IriEncoder>(
 /// Each branch is wrapped in a `Subquery` so it can carry its own
 /// solution modifiers and aggregates.
 ///
-/// Cypher requires every branch to project the same column names; we
-/// enforce this on the projected `VarId` lists.
+/// Cypher rules enforced here:
+/// - **Column-name match.** Every branch must project the same VarIds
+///   in the same order. Wildcard projection (`RETURN *`) is rejected
+///   in UNION branches because the projected-vars list is opaque
+///   (it expands at execution time to whatever is bound).
+/// - **Uniform variant.** The openCypher spec disallows mixing
+///   `UNION` and `UNION ALL` in the same chain — every join in the
+///   chain must use the same variant. We enforce this rather than
+///   silently collapsing to a single global bag/set choice.
 fn lower_union_query<E: IriEncoder>(
     ctx: &mut LoweringContext<'_, E>,
     q: &crate::ast::Query,
 ) -> Result<Query> {
     let mut branches: Vec<Vec<Pattern>> = Vec::new();
-    let mut all = false; // any UNION ALL in the chain → ALL semantics overall
+    let mut union_variant: Option<bool> = None; // Some(true) = UNION ALL, Some(false) = UNION
     let mut projected_vars: Option<Vec<VarId>> = None;
 
     let mut cursor = q;
     loop {
+        // Reject RETURN * in branches — wildcard's projected-vars
+        // list is empty at lower time, so column-name compatibility
+        // can't be checked. Users must enumerate columns.
+        if uses_wildcard_return(cursor) {
+            return Err(LowerError::unsupported(
+                "RETURN * is rejected in UNION branches — list columns explicitly so column-name compatibility can be checked at lower time",
+            ));
+        }
+
         let branch = lower_single_branch(ctx, cursor)?;
         let branch_vars = branch.projected_vars();
+        if branch_vars.is_empty() {
+            return Err(LowerError::unsupported(
+                "UNION branches must project at least one column",
+            ));
+        }
         match &projected_vars {
-            None => projected_vars = Some(branch_vars),
+            None => projected_vars = Some(branch_vars.clone()),
             Some(existing) if existing != &branch_vars => {
                 return Err(LowerError::unsupported(
                     "UNION branches must project the same columns in the same order (Cypher's column-name-match rule)",
@@ -82,13 +103,19 @@ fn lower_union_query<E: IriEncoder>(
             }
             _ => {}
         }
-        branches.push(vec![
-            branch.into_subquery_pattern(projected_vars.clone().unwrap())
-        ]);
+        branches.push(vec![branch.into_subquery_pattern(branch_vars)]);
 
         match &cursor.union_tail {
             Some(tail) => {
-                all = all || tail.all;
+                match union_variant {
+                    None => union_variant = Some(tail.all),
+                    Some(prev) if prev != tail.all => {
+                        return Err(LowerError::unsupported(
+                            "mixing `UNION` and `UNION ALL` in the same chain is not allowed — every join in a UNION chain must use the same variant",
+                        ));
+                    }
+                    _ => {}
+                }
                 cursor = &tail.right;
             }
             None => break,
@@ -96,6 +123,7 @@ fn lower_union_query<E: IriEncoder>(
     }
 
     let projected = projected_vars.expect("at least one branch");
+    let all = union_variant.unwrap_or(false);
     let output = if all {
         QueryOutput::select_all(projected)
     } else {
@@ -115,6 +143,15 @@ fn lower_union_query<E: IriEncoder>(
         post_values: None,
         include_system_facts: false,
     })
+}
+
+/// True if the query's RETURN uses `*`. Walks only the head query
+/// (the caller iterates the chain).
+fn uses_wildcard_return(q: &crate::ast::Query) -> bool {
+    q.return_clause
+        .items
+        .iter()
+        .any(|item| matches!(&item.expr, Expr::Var(v) if v.name == "*"))
 }
 
 struct SingleBranch {
@@ -187,10 +224,13 @@ fn lower_single_branch<E: IriEncoder>(
         }
     }
 
-    let (output, ordering, limit, offset, aggregates) =
+    let (output, ordering, limit, offset, group_keys, aggregates) =
         lower_return(ctx, &q.return_clause, &mut patterns)?;
 
-    let grouping = Grouping::assemble(Vec::new(), aggregates, Vec::new(), None);
+    // When the projection mixes aggregates with non-aggregate items,
+    // the non-aggregates become GROUP BY keys (Cypher's implicit
+    // grouping rule). RETURN has no WHERE/HAVING — those live on WITH.
+    let grouping = Grouping::assemble(group_keys, aggregates, Vec::new(), None);
 
     Ok(SingleBranch {
         patterns,
@@ -207,6 +247,7 @@ type LoweredReturn = (
     Vec<SortSpec>,
     Option<usize>,
     Option<usize>,
+    Vec<VarId>,
     Vec<AggregateSpec>,
 );
 
@@ -237,17 +278,41 @@ fn lower_return<E: IriEncoder>(
 
     let ordering = lower_order_by(ctx, &r.order_by)?;
 
-    Ok((output, ordering, limit, offset, projection.aggregates))
+    // GROUP BY keys are only meaningful when aggregates exist; if not,
+    // pass an empty list so Grouping::assemble produces None.
+    let group_keys = if projection.aggregates.is_empty() {
+        Vec::new()
+    } else {
+        projection.group_keys
+    };
+
+    Ok((
+        output,
+        ordering,
+        limit,
+        offset,
+        group_keys,
+        projection.aggregates,
+    ))
 }
 
 /// Shared state used while lowering a projection list (RETURN, WITH).
 ///
 /// Each item either: marks `saw_star`, is a bare-var projection
-/// (push to `vars`), is an aggregate (push to `aggregates` + project
-/// the aggregate's output VarId), or is a general expression (emit a
-/// `Bind` pattern + project the bound VarId).
+/// (push to `vars` and `group_keys`), is an aggregate (push to
+/// `aggregates` + project the aggregate's output VarId), or is a
+/// general expression (emit a `Bind` + project the bound VarId,
+/// which then participates in GROUP BY as a non-aggregate key).
+///
+/// `group_keys` holds the non-aggregate projected VarIds. When the
+/// projection mixes aggregates with non-aggregate items, Cypher
+/// semantics implicitly group by every non-aggregate projection.
+/// `Grouping::assemble` consumes `group_keys` as the GROUP BY list,
+/// producing `Grouping::Explicit` if both lists are populated and
+/// `Grouping::Implicit` for aggregates-only.
 struct ProjectionState {
     vars: Vec<VarId>,
+    group_keys: Vec<VarId>,
     aggregates: Vec<AggregateSpec>,
     saw_star: bool,
     alias_counter: u32,
@@ -257,6 +322,7 @@ impl ProjectionState {
     fn new() -> Self {
         Self {
             vars: Vec::new(),
+            group_keys: Vec::new(),
             aggregates: Vec::new(),
             saw_star: false,
             alias_counter: 0,
@@ -275,7 +341,9 @@ impl ProjectionState {
                 return Ok(());
             }
             if item.alias.is_none() {
-                self.vars.push(ctx.intern_var(&v.name));
+                let id = ctx.intern_var(&v.name);
+                self.vars.push(id);
+                self.group_keys.push(id);
                 return Ok(());
             }
         }
@@ -301,7 +369,30 @@ impl ProjectionState {
             expr: lowered,
         });
         self.vars.push(alias_id);
+        self.group_keys.push(alias_id);
         Ok(())
+    }
+
+    /// Returns the set of VarIds produced by aggregate stages. Used
+    /// by the WITH lowering to decide whether a WHERE expression
+    /// references aggregate outputs (= HAVING) or only pre-aggregation
+    /// bindings (= pre-aggregation Filter).
+    fn aggregate_output_vars(&self) -> std::collections::HashSet<VarId> {
+        self.aggregates.iter().map(|a| a.output_var).collect()
+    }
+}
+
+/// True if `expr` references any of the given VarIds.
+fn expression_references_any(
+    expr: &fluree_db_query::ir::Expression,
+    vars: &std::collections::HashSet<VarId>,
+) -> bool {
+    use fluree_db_query::ir::Expression;
+    match expr {
+        Expression::Var(v) => vars.contains(v),
+        Expression::Const(_) => false,
+        Expression::Call { args, .. } => args.iter().any(|a| expression_references_any(a, vars)),
+        Expression::Exists { .. } => false,
     }
 }
 
@@ -426,13 +517,49 @@ fn lower_with<E: IriEncoder>(
         ));
     }
 
-    // WITH WHERE filters the subquery's solution stream.
-    if let Some(where_expr) = &w.where_clause {
-        let filter = lower_expr(ctx, where_expr)?;
-        inner_patterns.push(Pattern::Filter(filter));
-    }
+    // WITH WHERE routing:
+    //
+    // - If no aggregates are projected, the WHERE filters the
+    //   subquery's pre-projection solution stream (regular Filter).
+    // - If aggregates are projected, the WHERE is HAVING-shaped: it
+    //   evaluates on per-group output rows. We don't try to split a
+    //   composite expression into pre-aggregation Filter + HAVING in
+    //   v1; the entire WITH WHERE becomes HAVING when aggregates are
+    //   present. References to non-aggregate group keys still
+    //   evaluate correctly because those bindings survive aggregation.
+    //
+    // The earlier broken behavior pushed the WHERE into `inner_patterns`
+    // as a Filter, which ran before aggregation and made any
+    // reference to an aggregate output variable (e.g. `WHERE c > 0`
+    // after `count(*) AS c`) silently match zero rows.
+    let having = if let Some(where_expr) = &w.where_clause {
+        let lowered = lower_expr(ctx, where_expr)?;
+        let agg_outputs = projection.aggregate_output_vars();
+        let references_aggregate =
+            !agg_outputs.is_empty() && expression_references_any(&lowered, &agg_outputs);
+        if !projection.aggregates.is_empty() && references_aggregate {
+            Some(lowered)
+        } else if projection.aggregates.is_empty() {
+            inner_patterns.push(Pattern::Filter(lowered));
+            None
+        } else {
+            // Aggregates exist but the WHERE doesn't reference any
+            // aggregate output — keep it as HAVING too. Pre-grouping
+            // filters belong in a MATCH WHERE clause that runs before
+            // the WITH, not after.
+            Some(lowered)
+        }
+    } else {
+        None
+    };
 
-    let grouping = Grouping::assemble(Vec::new(), projection.aggregates, Vec::new(), None);
+    let group_keys = if projection.aggregates.is_empty() {
+        Vec::new()
+    } else {
+        projection.group_keys
+    };
+
+    let grouping = Grouping::assemble(group_keys, projection.aggregates, Vec::new(), having);
     let mut sq = SubqueryPattern::new(projection.vars, inner_patterns);
 
     let ordering = lower_order_by(ctx, &w.order_by)?;

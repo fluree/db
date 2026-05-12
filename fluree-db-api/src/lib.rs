@@ -3058,12 +3058,29 @@ impl Fluree {
             .ast
             .ok_or_else(|| ApiError::cypher("Cypher parse returned no AST", Vec::new()))?;
 
+        // Mirror the read path: pull @vocab and term overrides out of
+        // the ledger's default context so write Cypher resolves bare
+        // identifiers the same way `query_cypher` does. Best-effort —
+        // if the lookup fails (e.g., ledger has no published context),
+        // fall back to the lowering's built-in default vocab.
+        let default_context = self
+            .get_default_context(ledger.ledger_id())
+            .await
+            .ok()
+            .flatten();
+        let (vocab, overrides) =
+            crate::query::helpers::extract_cypher_iri_mapping(default_context.as_ref());
+        let cypher_opts = fluree_db_transact::lower_cypher_update::CypherLowerOpts {
+            vocab: Some(vocab),
+            overrides,
+        };
+
         let mut ns = NamespaceRegistry::from_db(&ledger.snapshot);
         let txn = fluree_db_transact::lower_cypher_update::lower_cypher_update(
             &ast,
             &mut ns,
             TxnOpts::default(),
-            fluree_db_transact::lower_cypher_update::CypherLowerOpts::default(),
+            cypher_opts,
         )?;
         self.stage_owned(ledger).txn(txn).execute().await
     }

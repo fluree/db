@@ -622,6 +622,119 @@ fn union_branches_with_different_columns_are_rejected() {
 }
 
 #[test]
+fn union_mixed_variants_rejected() {
+    // openCypher disallows mixing UNION and UNION ALL in one chain;
+    // we surface the rule rather than silently collapsing to a single
+    // global bag/set choice.
+    let out = parse_cypher(
+        "MATCH (n:A) RETURN n UNION MATCH (n:B) RETURN n UNION ALL MATCH (n:C) RETURN n",
+    );
+    assert!(!out.has_errors());
+    let ast = out.ast.unwrap();
+    let encoder = NoEncoder;
+    let mut vars = VarRegistry::new();
+    let r = lower_cypher(&ast, &encoder, &mut vars);
+    assert!(r.is_err(), "mixed UNION / UNION ALL must be rejected");
+}
+
+#[test]
+fn union_wildcard_return_rejected() {
+    // `RETURN *` projects an opaque var list at lower time, so
+    // column-name compatibility across branches can't be checked.
+    let out = parse_cypher("MATCH (n:Person) RETURN * UNION MATCH (n:Employee) RETURN *");
+    assert!(!out.has_errors());
+    let ast = out.ast.unwrap();
+    let encoder = NoEncoder;
+    let mut vars = VarRegistry::new();
+    let r = lower_cypher(&ast, &encoder, &mut vars);
+    assert!(r.is_err(), "RETURN * in UNION branches must be rejected");
+}
+
+#[test]
+fn mixed_projection_emits_explicit_grouping() {
+    // RETURN n, count(*) AS c — mixing aggregates with a non-aggregate
+    // projection must produce a GROUP BY keyed on `n`, not an
+    // implicit single-group aggregation.
+    use fluree_db_query::ir::grouping::Grouping;
+    let q = lower("MATCH (n:Person) RETURN n, count(*) AS c");
+    let grouping = q.grouping.expect("expected grouping");
+    match grouping {
+        Grouping::Explicit { group_by, .. } => {
+            assert_eq!(group_by.len(), 1, "exactly one GROUP BY key (the bare `n`)");
+        }
+        Grouping::Implicit { .. } => panic!(
+            "RETURN with mixed aggregate + bare-var must produce Grouping::Explicit, got Implicit"
+        ),
+    }
+}
+
+#[test]
+fn pure_aggregate_emits_implicit_grouping() {
+    use fluree_db_query::ir::grouping::Grouping;
+    let q = lower("MATCH (n:Person) RETURN count(*) AS c");
+    let grouping = q.grouping.expect("expected grouping");
+    assert!(
+        matches!(grouping, Grouping::Implicit { .. }),
+        "no group keys → Implicit"
+    );
+}
+
+#[test]
+fn with_where_on_aggregate_alias_lowers_to_having() {
+    // `WITH count(*) AS c WHERE c > 0` references the aggregate
+    // output `c`. Pushing it as a Filter inside the subquery body
+    // would run before aggregation and never match. It must lower to
+    // the Grouping's `having` instead.
+    use fluree_db_query::ir::grouping::Grouping;
+    let q = lower("MATCH (n:Person) WITH count(*) AS c WHERE c = c RETURN c");
+    let sq = q
+        .patterns
+        .iter()
+        .find_map(|p| match p {
+            Pattern::Subquery(sq) => Some(sq),
+            _ => None,
+        })
+        .expect("subquery from WITH");
+    let inner_has_filter = sq.patterns.iter().any(|p| matches!(p, Pattern::Filter(_)));
+    assert!(
+        !inner_has_filter,
+        "WITH WHERE that references an aggregate alias must NOT be a pre-aggregation Filter; \
+         got patterns: {:?}",
+        sq.patterns
+    );
+    let grouping = sq.grouping.as_ref().expect("subquery must carry Grouping");
+    assert!(
+        grouping.having().is_some(),
+        "the WITH WHERE must lower to Grouping::having"
+    );
+    // The grouping itself should be Implicit since `count(*) AS c`
+    // alone has no group keys.
+    assert!(matches!(grouping, Grouping::Implicit { .. }));
+}
+
+#[test]
+fn with_where_without_aggregates_stays_a_filter() {
+    // When no aggregates are projected, WITH WHERE must remain a
+    // pre-projection Filter inside the subquery body (the original
+    // behavior).
+    let q = lower("MATCH (n:Person) WITH n WHERE n = n RETURN n");
+    let sq = q
+        .patterns
+        .iter()
+        .find_map(|p| match p {
+            Pattern::Subquery(sq) => Some(sq),
+            _ => None,
+        })
+        .expect("subquery");
+    let inner_has_filter = sq.patterns.iter().any(|p| matches!(p, Pattern::Filter(_)));
+    assert!(
+        inner_has_filter,
+        "non-aggregate WITH WHERE must stay a Filter; got {:?}",
+        sq.patterns
+    );
+}
+
+#[test]
 fn reserved_predicate_is_rejected_in_property_filter() {
     // f:reifiesSubject is reserved. Any attempt to use it as a
     // property name in a Cypher pattern must be rejected.

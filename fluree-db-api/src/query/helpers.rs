@@ -141,7 +141,11 @@ pub(crate) fn parse_cypher_to_ir(
 
 /// Extract `@vocab` and bare-identifier → IRI overrides from a
 /// JSON-LD `@context` object.
-fn extract_cypher_iri_mapping(
+///
+/// Shared by the read path (`parse_cypher_to_ir`) and the write path
+/// (`Fluree::transact_cypher`) so both surfaces honor the same
+/// ledger-context mappings.
+pub(crate) fn extract_cypher_iri_mapping(
     default_context: Option<&JsonValue>,
 ) -> (String, std::collections::HashMap<String, String>) {
     let mut vocab = "http://example.org/".to_string();

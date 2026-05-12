@@ -73,6 +73,12 @@ pub struct CypherLowerOpts {
     /// (labels, types, property keys). Defaults to
     /// `http://example.org/`.
     pub vocab: Option<String>,
+    /// Per-term IRI overrides. A bare Cypher identifier (label,
+    /// relationship type, property key) that has an entry here resolves
+    /// to the override IRI rather than `vocab + name`. Mirrors the
+    /// read-path `LoweringContext::overrides`, ensuring write Cypher
+    /// honors the same ledger context mappings as read Cypher.
+    pub overrides: std::collections::HashMap<String, String>,
 }
 
 /// Lower a parsed Cypher AST to a `Txn`. Only valid for write
@@ -98,6 +104,7 @@ pub fn lower_cypher_update(
 struct CypherLowering<'a> {
     ns: &'a mut NamespaceRegistry,
     vocab: String,
+    overrides: std::collections::HashMap<String, String>,
     vars: VarRegistry,
     txn_type: TxnType,
     delete_templates: Vec<TripleTemplate>,
@@ -121,6 +128,7 @@ impl<'a> CypherLowering<'a> {
         Self {
             ns,
             vocab,
+            overrides: cypher_opts.overrides,
             vars: VarRegistry::new(),
             txn_type: TxnType::Insert,
             delete_templates: Vec::new(),
@@ -384,6 +392,9 @@ impl<'a> CypherLowering<'a> {
     }
 
     fn resolve_iri(&self, name: &str) -> String {
+        if let Some(iri) = self.overrides.get(name) {
+            return iri.clone();
+        }
         format!("{}{}", self.vocab, name)
     }
 

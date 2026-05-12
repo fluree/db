@@ -125,9 +125,18 @@ ORDER BY / SKIP / LIMIT
 - `UNWIND [literals] AS x` — inline list literal unwinding.
 - Aggregates: `count(*)`, `count(x)`, `count(DISTINCT x)`,
   `sum(x)`, `avg(x)`, `min(x)`, `max(x)` (bare-variable arguments
-  only in v1).
+  only in v1). Mixed projections (`RETURN n, count(*) AS c`)
+  implicitly group by the non-aggregate projections.
+- `WITH ... [WHERE/ORDER BY/SKIP/LIMIT/DISTINCT]` — subquery
+  boundary. WHERE that references aggregate aliases lowers to HAVING
+  rather than a pre-aggregation Filter. Nested WITHs nest Subqueries.
 - `RETURN n`, `RETURN n, m`, `RETURN *`, `RETURN DISTINCT ...`,
   `RETURN expr AS alias` (lowered via `Bind`).
+- `UNION` and `UNION ALL` at the RETURN boundary. Every branch must
+  project the same VarIds in the same order; mixing `UNION` and
+  `UNION ALL` in one chain is rejected (matches the openCypher
+  spec). `RETURN *` is also rejected in UNION branches because its
+  projected-vars list is opaque at lower time.
 
 ### Writes
 
@@ -153,12 +162,8 @@ These produce a clear error today and land in follow-on slices.
 - Variable-length paths `-[*N..M]->`.
 - Path values `MATCH p = (...)`.
 - `shortestPath`, `allShortestPaths`.
-- `WITH` subquery boundary.
 - `UNWIND $param AS x` (parameter-bound list — needs API-layer
   parameter substitution).
-- `UNION` / `UNION ALL` (type alternation `[:T1|T2]` already lowers
-  through `Union` internally — top-level `UNION` between full clauses
-  is the deferred piece).
 - `collect(x)` aggregate (needs list-valued bindings/result format).
 - Expression-valued aggregate arguments (`sum(n + 1)`) — needs a
   pre-aggregation `Bind`.
