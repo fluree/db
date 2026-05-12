@@ -2306,6 +2306,7 @@ dependencies = [
  "fluree-db-core",
  "fluree-db-credential",
  "fluree-db-crypto",
+ "fluree-db-cypher",
  "fluree-db-iceberg",
  "fluree-db-indexer",
  "fluree-db-ledger",

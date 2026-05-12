@@ -243,6 +243,17 @@ pub use fluree_db_sparql::{
     UpdateOperation as SparqlUpdateOperation,
 };
 
+// Re-export Cypher types (product feature; always enabled).
+pub use fluree_db_cypher::{
+    lower_cypher, parse_cypher, CypherAst, DiagCode as CypherDiagCode,
+    Diagnostic as CypherDiagnostic, LowerError as CypherLowerError,
+    ParseOutput as CypherParseOutput, Severity as CypherSeverity,
+    SourceSpan as CypherSourceSpan,
+};
+pub use fluree_db_transact::lower_cypher_update::{
+    lower_cypher_update, CypherLowerOpts, LowerCypherError,
+};
+
 // Re-export policy types for access control
 pub use fluree_db_policy::{
     build_policy_set, build_policy_values_clause, filter_by_required, is_schema_flake,

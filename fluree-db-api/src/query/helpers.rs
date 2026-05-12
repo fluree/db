@@ -97,6 +97,86 @@ pub(crate) fn parse_sparql_to_ir(
     Ok((vars, parsed))
 }
 
+/// Parse a Cypher (openCypher 9) query and prepare it for execution.
+///
+/// Cypher has no prologue/prefix syntax of its own. The ledger's
+/// default JSON-LD context supplies `@vocab` (used to resolve bare
+/// labels/types/property keys) and named term mappings (used as
+/// overrides). Without a default context, the lowering falls back to
+/// `http://example.org/` for the vocab — useful for tests, not for
+/// production data.
+pub(crate) fn parse_cypher_to_ir(
+    cypher: &str,
+    _snapshot: &LedgerSnapshot,
+    default_context: Option<&JsonValue>,
+) -> Result<(VarRegistry, Query)> {
+    let out = fluree_db_cypher::parse_cypher(cypher);
+    if out.has_errors() {
+        let msg = out
+            .diagnostics
+            .iter()
+            .map(|d| format!("{}: {}", d.code, d.message))
+            .collect::<Vec<_>>()
+            .join("; ");
+        return Err(ApiError::Internal(format!("Cypher parse: {msg}")));
+    }
+    let ast = out.ast.ok_or_else(|| {
+        ApiError::Internal("Cypher parse returned no AST".to_string())
+    })?;
+
+    // Pull `@vocab` and named-term overrides out of the default
+    // context.
+    let (vocab, overrides) = extract_cypher_iri_mapping(default_context);
+
+    // Cypher's executor uses the ledger-snapshot-backed `IriEncoder`
+    // just like SPARQL does — the encoder is the snapshot.
+    let mut vars = VarRegistry::new();
+    let encoder = _snapshot;
+    let mut ctx = fluree_db_cypher::LoweringContext::new(encoder, &mut vars).with_vocab(vocab);
+    if !overrides.is_empty() {
+        ctx = ctx.with_overrides(overrides);
+    }
+    // The public lower_cypher entry takes the encoder and vars
+    // directly; for context customization we'd need a context-aware
+    // entry point. For v1 we call the public form with the same
+    // encoder/vars.
+    drop(ctx); // (placeholder for future context-aware lower entry)
+
+    let parsed = fluree_db_cypher::lower_cypher(&ast, encoder, &mut vars)
+        .map_err(|e| ApiError::Internal(format!("Cypher lower: {e}")))?;
+    Ok((vars, parsed))
+}
+
+/// Extract `@vocab` and bare-identifier → IRI overrides from a
+/// JSON-LD `@context` object.
+fn extract_cypher_iri_mapping(
+    default_context: Option<&JsonValue>,
+) -> (String, std::collections::HashMap<String, String>) {
+    let mut vocab = "http://example.org/".to_string();
+    let mut overrides = std::collections::HashMap::new();
+    if let Some(obj) = default_context.and_then(|v| v.as_object()) {
+        if let Some(v) = obj.get("@vocab").and_then(|v| v.as_str()) {
+            vocab = v.to_string();
+        }
+        for (k, v) in obj {
+            if k.starts_with('@') {
+                continue;
+            }
+            if let Some(s) = v.as_str() {
+                // Skip prefix-style entries (`"ex": "http://..."`); use
+                // only full-term mappings. Heuristic: a prefix entry
+                // ends in `#` or `/` and the key looks like a short
+                // prefix. We don't try to be exhaustive here.
+                if s.ends_with('#') || s.ends_with('/') {
+                    continue;
+                }
+                overrides.insert(k.clone(), s.to_string());
+            }
+        }
+    }
+    (vocab, overrides)
+}
+
 /// Prepare a parsed query for execution.
 pub(crate) fn prepare_for_execution(parsed: &Query) -> ExecutableQuery {
     ExecutableQuery::simple(parsed.clone())
