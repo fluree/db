@@ -245,7 +245,7 @@ async fn scan_base_index_for_attachment_events(
                 // Predicate IRI never observed on this ledger — skip.
                 continue;
             };
-            let flakes = range_with_overlay(
+            let flakes = match range_with_overlay(
                 &view.snapshot,
                 g_id,
                 overlay,
@@ -255,7 +255,26 @@ async fn scan_base_index_for_attachment_events(
                 RangeOptions::new().with_to_t(to_t),
             )
             .await
-            .ok()?;
+            {
+                Ok(flakes) => flakes,
+                Err(e) => {
+                    // The provider trait returns `Option`, so a
+                    // failed scan can only surface as "no coverage".
+                    // Log the underlying error before falling back —
+                    // a silent `None` would let the indexer take
+                    // the M2a scan path on every subsequent reindex
+                    // without anyone knowing the base-index probe
+                    // is broken.
+                    tracing::warn!(
+                        error = %e,
+                        predicate = %p_iri,
+                        ?g_id,
+                        "scan_base_index_for_attachment_events: PSOT scan failed; \
+                         falling back to no-coverage (indexer will skip arena seal this pass)"
+                    );
+                    return None;
+                }
+            };
             for f in flakes {
                 if !f.op {
                     // Skip retracted f:reifies* events: the seal pass

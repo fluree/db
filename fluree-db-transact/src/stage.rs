@@ -822,22 +822,49 @@ pub async fn stage(
             // Dedup cascade retracts against retracts already in
             // `flakes` (e.g. a same-txn by-id annotation retract that
             // targets the same bundle the cascade is producing) and
-            // against itself. `Flake`'s `Eq` ignores `t`/`op`, so we
-            // seed the seen set from existing retracts ONLY — otherwise
-            // a future assert of the same fact would suppress a
-            // legitimate cascade retract. (Today the reserved-
-            // predicate firewall makes this impossible for
-            // `f:reifies*`, but the gate stays correct either way.)
+            // against itself.
+            //
+            // `Flake`'s `Eq`/`Hash` ignore `g` (and `t`/`op`), so a
+            // plain `HashSet<Flake>` would collapse two retracts
+            // targeting the same `(s, p, o, dt, m)` in different
+            // named graphs — losing one of them and leaving the
+            // other graph's annotation bundle live. Key explicitly
+            // on the graph-bearing flake identity tuple instead.
+            //
+            // Seed from existing retracts ONLY (not asserts):
+            // otherwise an in-set assertion of the same fact would
+            // suppress a legitimate cascade retract via the
+            // `Eq`-ignores-`op` collapse. The reserved-predicate
+            // firewall makes this currently impossible for
+            // `f:reifies*`, but the gate stays correct either way.
+            type CascadeKey = (
+                Option<Sid>,
+                Sid,
+                Sid,
+                FlakeValue,
+                Sid,
+                Option<fluree_db_core::FlakeMeta>,
+            );
+            let key_of = |f: &Flake| -> CascadeKey {
+                (
+                    f.g.clone(),
+                    f.s.clone(),
+                    f.p.clone(),
+                    f.o.clone(),
+                    f.dt.clone(),
+                    f.m.clone(),
+                )
+            };
             let cascade_in = cascade.len();
-            let mut seen: HashSet<Flake> =
+            let mut seen: HashSet<CascadeKey> =
                 HashSet::with_capacity(flakes.len() / 2 + cascade_in);
             for f in flakes.iter().filter(|f| !f.op) {
-                seen.insert(f.clone());
+                seen.insert(key_of(f));
             }
             let mut deduped: Vec<Flake> = Vec::with_capacity(cascade_in);
             for f in cascade {
                 debug_assert!(!f.op, "cascade output must be pure-retract");
-                if seen.insert(f.clone()) {
+                if seen.insert(key_of(&f)) {
                     deduped.push(f);
                 }
             }

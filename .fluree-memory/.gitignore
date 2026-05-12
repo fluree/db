@@ -1,1 +1,4 @@
 .local/
+# Per-checkout agent-memory ledger snapshot. Not source — written by
+# the local memory tool and varies per machine / agent session.
+repo.ttl

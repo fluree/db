@@ -1460,6 +1460,12 @@ mod tests {
                 ..Default::default()
             },
         });
+        // Sticky-bit contract: a populated `annotation_index` implies
+        // the seal pass set `had_annotation_arena=true`. The encoder
+        // debug-asserts the in-memory pair so a regression in the
+        // seal bookkeeping surfaces here rather than as a phantom
+        // bootstrap-eligible state on the next reindex.
+        root.had_annotation_arena = true;
 
         // `minimal_root_v6` leaves `has_annotations = false`. The
         // encoder must coerce the sticky bit on whenever an arena is

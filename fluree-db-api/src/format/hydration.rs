@@ -958,9 +958,32 @@ impl<'a> HydrationFormatter<'a> {
                     continue;
                 }
 
+                // Structural bundle decode bypasses view policy by
+                // design — same justification as
+                // `is_live_annotation_subject`. The `f:reifies*`
+                // flakes are system-controlled discriminators, not
+                // user data; running them through the policy filter
+                // here would let a policy that incidentally hides
+                // FLUREE_DB-namespace predicates collapse the
+                // bundle decode and drop the annotation entirely,
+                // even when the annotation body would have been
+                // policy-visible. Reaching the body still goes
+                // through `format_subject` below, which applies
+                // policy normally — so user-data visibility is
+                // unchanged.
                 let bundle: Vec<Flake> = self
-                    .fetch_subject_properties(ann_sid)
-                    .await?
+                    .db
+                    .range(
+                        IndexType::Spot,
+                        RangeTest::Eq,
+                        RangeMatch::subject(ann_sid.clone()),
+                    )
+                    .await
+                    .map_err(|e| {
+                        FormatError::InvalidBinding(format!(
+                            "annotation bundle scan (SPOT s=ann) failed: {e}"
+                        ))
+                    })?
                     .into_iter()
                     .filter(|f| fluree_db_core::is_reserved_reifies_predicate(&f.p))
                     .collect();

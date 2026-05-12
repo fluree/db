@@ -193,11 +193,22 @@ fn resolve_reifier(
             // Mint a fresh labeled blank node so it round-trips through
             // the existing template lowering exactly like a user-supplied
             // `~ _:foo` would.
-            let label = bnodes.next();
-            // Strip the `_:` prefix that BlankNodeCounter::next attaches.
-            let stripped = label.strip_prefix("_:").unwrap_or(&label).to_string();
+            //
+            // **Reserved label space.** `BlankNodeCounter::next()`
+            // yields plain `_:b{N}` which can collide with
+            // user-authored `_:b0` — both would skolemize to the
+            // same SID (via `FlakeGenerator::skolemize_blank_node`
+            // keying on `(txn_id, label)`), silently fusing two
+            // distinct subjects. Prefix the synthesized label with
+            // `__fluree_ann_` so it can't conflict with any
+            // hand-written blank-node label. The prefix matches the
+            // by-selector retract's `?_fluree_del_ann_N` convention
+            // and surfaces clearly in any diagnostic output.
+            let raw = bnodes.next();
+            let stripped = raw.strip_prefix("_:").unwrap_or(&raw);
+            let reserved = format!("__fluree_ann_{stripped}");
             Ok(SubjectTerm::BlankNode(BlankNode::labeled(
-                stripped,
+                reserved,
                 annotation.span,
             )))
         }
