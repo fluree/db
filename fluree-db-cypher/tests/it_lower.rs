@@ -288,6 +288,102 @@ fn type_alternation_lowers_to_union_of_concrete_predicates() {
 }
 
 #[test]
+fn return_as_alias_emits_bind_and_projects_alias() {
+    // `RETURN n AS m` now wires via a Bind pattern that introduces the
+    // alias VarId, and the projection points at the alias rather than
+    // the source variable.
+    let q = lower("MATCH (n:Person) RETURN n AS m");
+    // The bind must reference m and bind it to n.
+    let bound = q
+        .patterns
+        .iter()
+        .find_map(|p| match p {
+            Pattern::Bind { var, expr } => Some((*var, expr.clone())),
+            _ => None,
+        })
+        .expect("expected a Bind pattern for the alias");
+    let projected = q.output.projected_vars().expect("projection vars");
+    assert_eq!(projected.len(), 1);
+    assert_eq!(projected[0], bound.0, "must project the alias VarId");
+}
+
+#[test]
+fn case_simple_form_lowers_to_nested_if() {
+    let q =
+        lower("MATCH (n:Person) RETURN CASE WHEN n = n THEN 1 WHEN n = n THEN 2 ELSE 3 END AS x");
+    let bind_expr = q
+        .patterns
+        .iter()
+        .find_map(|p| match p {
+            Pattern::Bind { expr, .. } => Some(expr.clone()),
+            _ => None,
+        })
+        .expect("CASE → Bind");
+    // Outer call must be Function::If.
+    match bind_expr {
+        fluree_db_query::ir::Expression::Call { func, .. } => {
+            assert!(
+                matches!(func, fluree_db_query::ir::Function::If),
+                "outermost CASE must lower to Function::If"
+            );
+        }
+        other => panic!("expected Call(If), got {other:?}"),
+    }
+}
+
+#[test]
+fn case_subject_form_desugars_to_equality() {
+    // CASE expr WHEN cand THEN val END uses the subject form; the
+    // condition must lower to `Function::Eq(subject, cand)`.
+    let q = lower("MATCH (n:Person) RETURN CASE n WHEN n THEN 1 ELSE 0 END AS x");
+    let _bind = q
+        .patterns
+        .iter()
+        .find_map(|p| match p {
+            Pattern::Bind { expr, .. } => Some(expr.clone()),
+            _ => None,
+        })
+        .expect("subject CASE → Bind");
+}
+
+#[test]
+fn in_list_lowers_to_function_in() {
+    let q = lower("MATCH (n:Person) WHERE n IN [n, n] RETURN n");
+    let filter_expr = q
+        .patterns
+        .iter()
+        .find_map(|p| match p {
+            Pattern::Filter(e) => Some(e.clone()),
+            _ => None,
+        })
+        .expect("WHERE → Filter");
+    match filter_expr {
+        fluree_db_query::ir::Expression::Call { func, args } => {
+            assert!(matches!(func, fluree_db_query::ir::Function::In));
+            assert_eq!(args.len(), 3, "test + 2 candidates");
+        }
+        other => panic!("expected Call(In), got {other:?}"),
+    }
+}
+
+#[test]
+fn exists_in_expression_lowers_to_expression_exists() {
+    let q = lower("MATCH (n:Person) WHERE EXISTS { (n)-[:KNOWS]->(m:Person) } RETURN n");
+    let filter_expr = q
+        .patterns
+        .iter()
+        .find_map(|p| match p {
+            Pattern::Filter(e) => Some(e.clone()),
+            _ => None,
+        })
+        .expect("WHERE → Filter");
+    assert!(
+        matches!(filter_expr, fluree_db_query::ir::Expression::Exists { .. }),
+        "expected Expression::Exists"
+    );
+}
+
+#[test]
 fn return_as_alias_is_rejected_in_v1() {
     // `RETURN n AS m` was previously accepted but silently dropped
     // the alias. v1 now rejects it explicitly.
@@ -296,8 +392,9 @@ fn return_as_alias_is_rejected_in_v1() {
     let ast = out.ast.unwrap();
     let encoder = NoEncoder;
     let mut vars = VarRegistry::new();
+    // No longer rejected — it lowers to Bind + alias projection.
     let r = lower_cypher(&ast, &encoder, &mut vars);
-    assert!(r.is_err(), "expected RETURN ... AS ... to be rejected");
+    assert!(r.is_ok(), "alias is now supported");
 }
 
 #[test]

@@ -49,7 +49,7 @@ pub fn lower_query<E: IriEncoder>(
         }
     }
 
-    let (output, ordering, limit, offset) = lower_return(ctx, &q.return_clause, &patterns)?;
+    let (output, ordering, limit, offset) = lower_return(ctx, &q.return_clause, &mut patterns)?;
 
     Ok(Query {
         context: ParsedContext::new(),
@@ -72,36 +72,42 @@ type LoweredReturn = (QueryOutput, Vec<SortSpec>, Option<usize>, Option<usize>);
 fn lower_return<E: IriEncoder>(
     ctx: &mut LoweringContext<'_, E>,
     r: &ReturnClause,
-    _patterns: &[Pattern],
+    patterns: &mut Vec<Pattern>,
 ) -> Result<LoweredReturn> {
-    // Project items — only Var and Var-as-alias supported in v1. `*`
-    // becomes Wildcard.
     let mut vars: Vec<VarId> = Vec::new();
     let mut saw_star = false;
+    let mut alias_counter = 0u32;
     for item in &r.items {
-        match &item.expr {
-            Expr::Var(v) if v.name == "*" => {
+        // `RETURN *` is the wildcard projection.
+        if let Expr::Var(v) = &item.expr {
+            if v.name == "*" {
                 saw_star = true;
+                continue;
             }
-            Expr::Var(v) => {
-                if item.alias.is_some() {
-                    // RETURN ... AS alias is parsed but the v1 lower
-                    // path doesn't yet rename the projected column —
-                    // returning the original variable would silently
-                    // discard the alias in the result schema.
-                    return Err(LowerError::unsupported(
-                        "RETURN ... AS alias is deferred in v1 — drop the alias for now",
-                    ));
-                }
+            // Bare variable without alias — project directly.
+            if item.alias.is_none() {
                 vars.push(ctx.intern_var(&v.name));
-            }
-            other => {
-                return Err(LowerError::unsupported(format!(
-                    "RETURN of `{:?}` is deferred — v1 covers RETURN of variables only",
-                    other_kind(other)
-                )));
+                continue;
             }
         }
+
+        // Any other shape — including a bare Var with an alias, a
+        // computed expression with or without an alias — lowers via a
+        // `Bind` pattern that introduces a fresh (or aliased) VarId.
+        let lowered = lower_expr(ctx, &item.expr)?;
+        let alias_id = match &item.alias {
+            Some(alias) => ctx.intern_var(&alias.name),
+            None => {
+                let name = format!("?#__ret_{alias_counter}");
+                alias_counter += 1;
+                ctx.intern_var(&name)
+            }
+        };
+        patterns.push(Pattern::Bind {
+            var: alias_id,
+            expr: lowered,
+        });
+        vars.push(alias_id);
     }
 
     let output = if saw_star {
@@ -159,27 +165,6 @@ fn const_usize(e: &Option<Expr>) -> Result<Option<usize>> {
     }
 }
 
-fn other_kind(e: &Expr) -> &'static str {
-    match e {
-        Expr::Lit(_) => "literal",
-        Expr::Call(_) => "function call",
-        Expr::Prop(_, _, _) => "property accessor",
-        Expr::BinOp(_, _, _, _) => "binary op",
-        Expr::UnaryOp(_, _, _) => "unary op",
-        Expr::List(_, _) => "list literal",
-        Expr::Case(_) => "CASE",
-        Expr::Exists(_, _) => "EXISTS",
-        Expr::In(_, _, _) => "IN",
-        Expr::IsNull(_, _) | Expr::IsNotNull(_, _) => "null test",
-        Expr::StartsWith(_, _, _) | Expr::EndsWith(_, _, _) | Expr::Contains(_, _, _) => {
-            "string predicate"
-        }
-        Expr::Param(_) => "parameter",
-        Expr::Var(_) => "variable",
-    }
-}
-
-// Convenience aliases so the unused-import linter relaxes on items
-// we plan to use in the next slice.
+// Silence the unused-import linter for items reused by other slices.
 #[allow(dead_code)]
 fn _retain(_p: &ProjectionItem) {}
