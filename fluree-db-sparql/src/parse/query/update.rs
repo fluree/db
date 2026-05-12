@@ -273,7 +273,7 @@ impl super::Parser<'_> {
             // Parse predicate-object list (simple predicates only, no paths)
             self.parse_construct_predicate_object_list(&subject, &mut triples)?;
             for t in triples {
-                patterns.push(QuadPatternElement::Triple(t));
+                patterns.push(QuadPatternElement::Triple(Box::new(t)));
             }
 
             // Optional dot

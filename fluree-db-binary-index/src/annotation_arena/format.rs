@@ -265,7 +265,7 @@ mod tests {
 
     fn sample_edge(idx: u8) -> EdgeKey {
         EdgeKey {
-            g: if idx % 2 == 0 {
+            g: if idx.is_multiple_of(2) {
                 None
             } else {
                 Some(sid(10, &format!("g{idx}")))

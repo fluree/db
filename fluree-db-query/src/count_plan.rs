@@ -968,7 +968,7 @@ mod tests {
             },
             having: None,
         });
-        let query = Query {
+        Query {
             context: ParsedContext::default(),
             orig_context: None,
             output: QueryOutput::select_all(vec![out_var]),
@@ -980,8 +980,7 @@ mod tests {
             reasoning: ReasoningConfig::default(),
             post_values: None,
             include_system_facts: false,
-        };
-        query
+        }
     }
 
     #[test]

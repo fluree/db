@@ -127,7 +127,7 @@ mod tests {
     use super::*;
     use crate::binding::Binding;
     use crate::seed::SeedOperator;
-    use fluree_db_core::{FlakeValue, LedgerSnapshot, Sid};
+    use fluree_db_core::{LedgerSnapshot, Sid};
 
     fn xsd_long() -> Sid {
         Sid::new(2, "long")

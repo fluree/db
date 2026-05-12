@@ -146,19 +146,21 @@ pub(crate) fn reject_context_coercion_on_annotated_literal(
     // object means the expander applies the coercion, while the
     // synthesized `f:reifiesObject` would carry no such datatype.
     if let Some(e) = entry {
-        if e.type_.is_some() && !map.contains_key("@type") {
-            let coerced = match e.type_.as_ref().unwrap() {
-                TypeValue::Iri(t) => t.clone(),
-                TypeValue::Id => "@id".to_string(),
-                TypeValue::Vocab => "@vocab".to_string(),
-                TypeValue::Json => "@json".to_string(),
-            };
-            return Err(TransactError::Parse(format!(
-                "annotated literal on '{predicate}' relies on @context term coercion \
-                 (@type='{coerced}'); annotated literals must carry an explicit @type so the \
-                 reified f:reifiesObject bundle matches the base edge's EdgeKey. \
-                 Add @type to the value object."
-            )));
+        if let Some(type_) = e.type_.as_ref() {
+            if !map.contains_key("@type") {
+                let coerced = match type_ {
+                    TypeValue::Iri(t) => t.clone(),
+                    TypeValue::Id => "@id".to_string(),
+                    TypeValue::Vocab => "@vocab".to_string(),
+                    TypeValue::Json => "@json".to_string(),
+                };
+                return Err(TransactError::Parse(format!(
+                    "annotated literal on '{predicate}' relies on @context term coercion \
+                     (@type='{coerced}'); annotated literals must carry an explicit @type so the \
+                     reified f:reifiesObject bundle matches the base edge's EdgeKey. \
+                     Add @type to the value object."
+                )));
+            }
         }
     }
 
@@ -591,14 +593,12 @@ pub fn lower_delete_annotation_blocks(doc: &mut Value) -> Result<()> {
     // synthesized retract template so the retract flake's
     // `g = Some(graph_sid)` matches the original assertion's flake
     // identity.
-    walk_delete_for_annotations(
-        &mut delete_val,
-        &top_ctx,
-        None,
-        &mut new_templates,
-        &mut new_where_patterns,
-        &mut next_var,
-    )?;
+    let mut sink = DeleteAnnotationSink {
+        out_templates: &mut new_templates,
+        out_where: &mut new_where_patterns,
+        next_var: &mut next_var,
+    };
+    walk_delete_for_annotations(&mut delete_val, &top_ctx, None, &mut sink)?;
 
     // Splice the new templates into the delete clause. Convert
     // single-object form to an array, then append.
@@ -702,6 +702,23 @@ fn is_empty_node(v: &Value) -> bool {
     obj.iter().all(|(k, _)| k == "@id" || k == "@context")
 }
 
+/// Accumulator state threaded through the delete-clause annotation
+/// walker, predicate-value lifter, and template builder. Bundles the
+/// three accumulating mutables (template list, WHERE pattern list,
+/// fresh-var counter) so the recursion can pass a single `&mut`
+/// borrow instead of three positional args.
+///
+/// `ParsedContext` and the per-subtree `inherited_graph` stay as
+/// recursion-local args — they're swapped per-node when a child
+/// brings its own `@context` or `@graph` selector, so packing them
+/// into the sink would force every recursive call to construct a
+/// new sink just to override one field.
+struct DeleteAnnotationSink<'a> {
+    out_templates: &'a mut Vec<Value>,
+    out_where: &'a mut Vec<Value>,
+    next_var: &'a mut u32,
+}
+
 /// Walk the delete clause looking for `@annotation` blocks. For each
 /// one with an explicit `@id`, build a retract template, then strip
 /// the `<predicate>: { ... @annotation: ... }` pair from its parent
@@ -717,21 +734,12 @@ fn walk_delete_for_annotations(
     val: &mut Value,
     ctx: &ParsedContext,
     inherited_graph: Option<&str>,
-    out_templates: &mut Vec<Value>,
-    out_where: &mut Vec<Value>,
-    next_var: &mut u32,
+    sink: &mut DeleteAnnotationSink<'_>,
 ) -> Result<()> {
     match val {
         Value::Array(items) => {
             for item in items {
-                walk_delete_for_annotations(
-                    item,
-                    ctx,
-                    inherited_graph,
-                    out_templates,
-                    out_where,
-                    next_var,
-                )?;
+                walk_delete_for_annotations(item, ctx, inherited_graph, sink)?;
             }
             Ok(())
         }
@@ -803,9 +811,7 @@ fn walk_delete_for_annotations(
                     value,
                     effective_ctx,
                     effective_graph,
-                    out_templates,
-                    out_where,
-                    next_var,
+                    sink,
                     &mut |strip_predicate| {
                         if strip_predicate {
                             keys_to_remove.push(key.clone());
@@ -822,14 +828,7 @@ fn walk_delete_for_annotations(
             let remaining: Vec<String> = map.keys().cloned().collect();
             for key in remaining {
                 if let Some(v) = map.get_mut(&key) {
-                    walk_delete_for_annotations(
-                        v,
-                        effective_ctx,
-                        effective_graph,
-                        out_templates,
-                        out_where,
-                        next_var,
-                    )?;
+                    walk_delete_for_annotations(v, effective_ctx, effective_graph, sink)?;
                 }
             }
             Ok(())
@@ -852,9 +851,7 @@ fn lift_annotations_under_predicate(
     value: &mut Value,
     ctx: &ParsedContext,
     inherited_graph: Option<&str>,
-    out_templates: &mut Vec<Value>,
-    out_where: &mut Vec<Value>,
-    next_var: &mut u32,
+    sink: &mut DeleteAnnotationSink<'_>,
     strip_callback: &mut dyn FnMut(bool),
 ) -> Result<()> {
     match value {
@@ -872,9 +869,7 @@ fn lift_annotations_under_predicate(
                     &mut item,
                     ctx,
                     inherited_graph,
-                    out_templates,
-                    out_where,
-                    next_var,
+                    sink,
                     &mut |s| item_stripped = s,
                 )?;
                 if !item_stripped {
@@ -970,9 +965,7 @@ fn lift_annotations_under_predicate(
                 ann_block,
                 ctx,
                 effective_graph,
-                out_templates,
-                out_where,
-                next_var,
+                sink,
             )?;
 
             // After lifting, the parent's predicate-value is just
@@ -1010,9 +1003,7 @@ fn build_annotation_delete(
     ann_block: Value,
     ctx: &ParsedContext,
     graph_iri: Option<&str>,
-    out_templates: &mut Vec<Value>,
-    out_where: &mut Vec<Value>,
-    next_var: &mut u32,
+    sink: &mut DeleteAnnotationSink<'_>,
 ) -> Result<()> {
     let Value::Object(mut ann_map) = ann_block else {
         return Err(TransactError::Parse(
@@ -1061,8 +1052,8 @@ fn build_annotation_delete(
         // pattern that constrains it to live annotations matching
         // the selector body and reifying the named edge, and use
         // the variable as the delete-template @id.
-        let var = format!("{SYNTH_VAR_PREFIX}{}", *next_var);
-        *next_var += 1;
+        let var = format!("{SYNTH_VAR_PREFIX}{}", *sink.next_var);
+        *sink.next_var += 1;
 
         // Strip the alias so we don't carry duplicate @id keys into
         // the WHERE pattern (we'll insert our own).
@@ -1121,9 +1112,10 @@ fn build_annotation_delete(
             // top-level `@context` rather than leaving them for a
             // resolution pass that doesn't run for this position.
             let expanded_graph = expand_iri(graph, ctx);
-            out_where.push(json!(["graph", expanded_graph, Value::Object(where_node),]));
+            sink.out_where
+                .push(json!(["graph", expanded_graph, Value::Object(where_node),]));
         } else {
-            out_where.push(Value::Object(where_node));
+            sink.out_where.push(Value::Object(where_node));
         }
 
         var
@@ -1154,7 +1146,7 @@ fn build_annotation_delete(
         template.insert(reifies_iris::GRAPH.to_string(), json!({"@id": graph}));
         template.insert("@graph".to_string(), Value::String(graph.to_string()));
     }
-    out_templates.push(Value::Object(template));
+    sink.out_templates.push(Value::Object(template));
     Ok(())
 }
 
@@ -2420,7 +2412,7 @@ mod tests {
         match shape {
             ReifiedObjectShape::Literal { value, .. } => {
                 let m = value.as_object().unwrap();
-                let keys: Vec<&str> = m.keys().map(|s| s.as_str()).collect();
+                let keys: Vec<&str> = m.keys().map(String::as_str).collect();
                 assert_eq!(keys, vec!["@value", "@type"]);
             }
             _ => panic!("expected Literal"),
@@ -2437,7 +2429,7 @@ mod tests {
         match shape {
             ReifiedObjectShape::Literal { value, .. } => {
                 let m = value.as_object().unwrap();
-                let keys: Vec<&str> = m.keys().map(|s| s.as_str()).collect();
+                let keys: Vec<&str> = m.keys().map(String::as_str).collect();
                 assert_eq!(keys, vec!["@value", "@language"]);
             }
             _ => panic!("expected Literal"),

@@ -354,7 +354,7 @@ fn expand_annotated_triples_in_quad_pattern(
     let mut graph_blocks: Vec<QuadPatternElement> = Vec::new();
     for el in std::mem::take(&mut pattern.patterns) {
         match el {
-            QuadPatternElement::Triple(t) => default_triples.push(t),
+            QuadPatternElement::Triple(t) => default_triples.push(*t),
             QuadPatternElement::Graph {
                 name,
                 triples,
@@ -378,7 +378,7 @@ fn expand_annotated_triples_in_quad_pattern(
     expand_annotated_triples(&mut default_triples, mode, bnodes)?;
     let mut out: Vec<QuadPatternElement> = default_triples
         .into_iter()
-        .map(QuadPatternElement::Triple)
+        .map(|t| QuadPatternElement::Triple(Box::new(t)))
         .collect();
     out.extend(graph_blocks);
     pattern.patterns = out;
@@ -404,10 +404,7 @@ fn reject_user_authored_reifies(
     fn check_predicate(pred: &PredicateTerm, prologue: &Prologue) -> Result<(), LowerError> {
         if let PredicateTerm::Iri(iri) = pred {
             let expanded = expand_iri(iri, prologue)?;
-            if reifies_iris::ALL
-                .iter()
-                .any(|known| *known == expanded.as_str())
-            {
+            if reifies_iris::ALL.contains(&expanded.as_str()) {
                 return Err(LowerError::UnsupportedFeature {
                     feature: "user-authored f:reifies* predicate in SPARQL UPDATE \
                               (system-controlled — use the `~ {| ... |}` annotation \
@@ -440,7 +437,7 @@ fn reject_user_authored_reifies_in_quad_pattern(
     for el in &pattern.patterns {
         match el {
             QuadPatternElement::Triple(t) => {
-                reject_user_authored_reifies(std::slice::from_ref(t), prologue)?
+                reject_user_authored_reifies(std::slice::from_ref(t.as_ref()), prologue)?;
             }
             QuadPatternElement::Graph { triples, .. } => {
                 reject_user_authored_reifies(triples, prologue)?;
@@ -723,7 +720,7 @@ fn lower_delete_where(
         .patterns
         .iter()
         .map(|el| match el {
-            QuadPatternElement::Triple(t) => Ok(t),
+            QuadPatternElement::Triple(t) => Ok(t.as_ref()),
             QuadPatternElement::Graph { span, .. } => Err(LowerError::UnsupportedFeature {
                 feature: "GRAPH blocks in DELETE WHERE",
                 span: *span,

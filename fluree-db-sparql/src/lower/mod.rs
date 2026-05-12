@@ -197,7 +197,7 @@ fn reject_direct_reifies_in_patterns(patterns: &[Pattern]) -> Result<()> {
                 Pattern::Service(sp) => walk(&sp.patterns)?,
                 Pattern::Subquery(sq) => walk(&sq.patterns)?,
                 Pattern::EdgeAnnotation { body, .. } | Pattern::AnnotationTarget { body, .. } => {
-                    walk(body)?
+                    walk(body)?;
                 }
                 _ => {}
             }

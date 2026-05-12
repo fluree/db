@@ -1227,11 +1227,9 @@ fn parse_literal_edge_annotation(
 
     // dtc precedence: the value object's parsed `@type`/`@language`
     // wins; the predicate's context-level dt_iri is the fallback.
-    let pattern_dtc = parsed.dtc.or_else(|| {
-        dt_iri
-            .as_deref()
-            .map(|iri| UnresolvedDatatypeConstraint::Explicit(Arc::from(iri)))
-    });
+    let pattern_dtc = parsed
+        .dtc
+        .or_else(|| dt_iri.map(|iri| UnresolvedDatatypeConstraint::Explicit(Arc::from(iri))));
 
     let mut edge = UnresolvedTriplePattern::new(subject.clone(), predicate, object);
     edge.dtc = pattern_dtc;
