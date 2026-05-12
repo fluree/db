@@ -3,7 +3,7 @@
 use crate::ast::{
     CreateClause, DeleteClause, MatchClause, MergeClause, OrderDirection, OrderItem,
     ProjectionItem, Query, ReadClause, RemoveClause, RemoveItem, ReturnClause, SetClause, SetItem,
-    Statement, UnwindClause, Update, WithClause, WriteClause,
+    Statement, UnionTail, UnwindClause, Update, WithClause, WriteClause,
 };
 use crate::ast::{Expr, Variable};
 use crate::diag::{DiagCode, Diagnostic};
@@ -92,9 +92,19 @@ pub fn parse_statement(s: &mut TokenStream) -> Result<Statement, Diagnostic> {
             span,
         }))
     } else if let Some(rc) = return_clause {
+        // After a RETURN, an optional `UNION [ALL] <next query>` may
+        // follow. Parse it right-recursively.
+        let union_tail = if matches!(s.peek_kind(), TokenKind::Union) {
+            Some(Box::new(parse_union_tail(s)?))
+        } else {
+            None
+        };
+        let end = s.peek_span();
+        let span = start.union(end);
         Ok(Statement::Query(Query {
             clauses: read_clauses,
             return_clause: rc,
+            union_tail,
             span,
         }))
     } else {
@@ -109,6 +119,30 @@ pub fn parse_statement(s: &mut TokenStream) -> Result<Statement, Diagnostic> {
             ),
         })
     }
+}
+
+/// Parse a `UNION [ALL] <query>` tail. The leading `UNION` keyword
+/// is consumed here.
+fn parse_union_tail(s: &mut TokenStream) -> Result<UnionTail, Diagnostic> {
+    let start = s.expect(&TokenKind::Union)?;
+    let all = s.eat(&TokenKind::All).is_some();
+    // The right side is another full query (read-shaped only —
+    // UNION of writes is rejected by Cypher).
+    let right = match parse_statement(s)? {
+        Statement::Query(q) => q,
+        Statement::Update(_) => {
+            return Err(s.error(
+                DiagCode::UnexpectedToken,
+                "UNION cannot combine write statements — both sides must be read queries",
+            ));
+        }
+    };
+    let end = s.peek_span();
+    Ok(UnionTail {
+        all,
+        right,
+        span: start.union(end),
+    })
 }
 
 fn parse_match(s: &mut TokenStream, _is_optional: bool) -> Result<MatchClause, Diagnostic> {

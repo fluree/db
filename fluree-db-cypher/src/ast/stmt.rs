@@ -17,10 +17,25 @@ pub enum Statement {
 }
 
 /// A read-shaped Cypher statement.
+///
+/// `union_tail` is `Some` when this query is followed by `UNION` (or
+/// `UNION ALL`) and another query. The structure is right-recursive
+/// so a chain `Q1 UNION Q2 UNION Q3` is represented as
+/// `Q1 { tail: Some(Union { right: Q2 { tail: Some(Union { right: Q3 })} }) }`.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Query {
     pub clauses: Vec<ReadClause>,
     pub return_clause: ReturnClause,
+    pub union_tail: Option<Box<UnionTail>>,
+    pub span: SourceSpan,
+}
+
+/// A `UNION` / `UNION ALL` continuation of a query.
+#[derive(Clone, Debug, PartialEq)]
+pub struct UnionTail {
+    /// `true` for `UNION ALL`, `false` for plain `UNION`.
+    pub all: bool,
+    pub right: Query,
     pub span: SourceSpan,
 }
 

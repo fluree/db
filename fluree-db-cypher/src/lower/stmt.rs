@@ -25,6 +25,139 @@ pub fn lower_query<E: IriEncoder>(
     ctx: &mut LoweringContext<'_, E>,
     q: &crate::ast::Query,
 ) -> Result<Query> {
+    if q.union_tail.is_some() {
+        return lower_union_query(ctx, q);
+    }
+
+    let SingleBranch {
+        patterns,
+        output,
+        ordering,
+        limit,
+        offset,
+        grouping,
+    } = lower_single_branch(ctx, q)?;
+
+    Ok(Query {
+        context: ParsedContext::new(),
+        orig_context: None,
+        output,
+        patterns,
+        grouping,
+        ordering,
+        limit,
+        offset,
+        reasoning: Default::default(),
+        post_values: None,
+        // System-fact filter ON — hides f:reifies* from untyped relationship matches.
+        include_system_facts: false,
+    })
+}
+
+/// Lower a chain of UNION-connected queries into a single top-level
+/// `Query` whose WHERE is a `Pattern::Union` of one branch per query.
+/// Each branch is wrapped in a `Subquery` so it can carry its own
+/// solution modifiers and aggregates.
+///
+/// Cypher requires every branch to project the same column names; we
+/// enforce this on the projected `VarId` lists.
+fn lower_union_query<E: IriEncoder>(
+    ctx: &mut LoweringContext<'_, E>,
+    q: &crate::ast::Query,
+) -> Result<Query> {
+    let mut branches: Vec<Vec<Pattern>> = Vec::new();
+    let mut all = false; // any UNION ALL in the chain → ALL semantics overall
+    let mut projected_vars: Option<Vec<VarId>> = None;
+
+    let mut cursor = q;
+    loop {
+        let branch = lower_single_branch(ctx, cursor)?;
+        let branch_vars = branch.projected_vars();
+        match &projected_vars {
+            None => projected_vars = Some(branch_vars),
+            Some(existing) if existing != &branch_vars => {
+                return Err(LowerError::unsupported(
+                    "UNION branches must project the same columns in the same order (Cypher's column-name-match rule)",
+                ));
+            }
+            _ => {}
+        }
+        branches.push(vec![
+            branch.into_subquery_pattern(projected_vars.clone().unwrap())
+        ]);
+
+        match &cursor.union_tail {
+            Some(tail) => {
+                all = all || tail.all;
+                cursor = &tail.right;
+            }
+            None => break,
+        }
+    }
+
+    let projected = projected_vars.expect("at least one branch");
+    let output = if all {
+        QueryOutput::select_all(projected)
+    } else {
+        QueryOutput::select_distinct(projected)
+    };
+
+    Ok(Query {
+        context: ParsedContext::new(),
+        orig_context: None,
+        output,
+        patterns: vec![Pattern::Union(branches)],
+        grouping: None,
+        ordering: Vec::new(),
+        limit: None,
+        offset: None,
+        reasoning: Default::default(),
+        post_values: None,
+        include_system_facts: false,
+    })
+}
+
+struct SingleBranch {
+    patterns: Vec<Pattern>,
+    output: QueryOutput,
+    ordering: Vec<SortSpec>,
+    limit: Option<usize>,
+    offset: Option<usize>,
+    grouping: Option<Grouping>,
+}
+
+impl SingleBranch {
+    /// The variables this branch projects, in order. Used to check
+    /// column-name compatibility across UNION branches.
+    fn projected_vars(&self) -> Vec<VarId> {
+        self.output.projected_vars().unwrap_or_default()
+    }
+
+    /// Wrap this branch into a `Pattern::Subquery` for use as a UNION
+    /// branch. The select list pins which variables surface out of
+    /// the branch into the outer Union.
+    fn into_subquery_pattern(self, select: Vec<VarId>) -> Pattern {
+        let mut sq = SubqueryPattern::new(select, self.patterns);
+        if let Some(limit) = self.limit {
+            sq = sq.with_limit(limit);
+        }
+        if let Some(offset) = self.offset {
+            sq = sq.with_offset(offset);
+        }
+        if !self.ordering.is_empty() {
+            sq = sq.with_ordering(self.ordering);
+        }
+        if let Some(g) = self.grouping {
+            sq = sq.with_grouping(g);
+        }
+        Pattern::Subquery(sq)
+    }
+}
+
+fn lower_single_branch<E: IriEncoder>(
+    ctx: &mut LoweringContext<'_, E>,
+    q: &crate::ast::Query,
+) -> Result<SingleBranch> {
     let mut patterns: Vec<Pattern> = Vec::new();
     for clause in &q.clauses {
         match clause {
@@ -45,10 +178,6 @@ pub fn lower_query<E: IriEncoder>(
                 patterns.push(Pattern::Optional(inner));
             }
             ReadClause::With(w) => {
-                // WITH wraps all accumulated patterns (plus its own
-                // binds/aggregates/filter/order/limit) into a
-                // `Subquery`. Subsequent clauses operate on the
-                // subquery's projected variables.
                 let subq = lower_with(ctx, w, std::mem::take(&mut patterns))?;
                 patterns.push(Pattern::Subquery(subq));
             }
@@ -61,23 +190,15 @@ pub fn lower_query<E: IriEncoder>(
     let (output, ordering, limit, offset, aggregates) =
         lower_return(ctx, &q.return_clause, &mut patterns)?;
 
-    // v1 has no GROUP BY surface, so any aggregates lift into an
-    // implicit single-group `Grouping`.
     let grouping = Grouping::assemble(Vec::new(), aggregates, Vec::new(), None);
 
-    Ok(Query {
-        context: ParsedContext::new(),
-        orig_context: None,
-        output,
+    Ok(SingleBranch {
         patterns,
-        grouping,
+        output,
         ordering,
         limit,
         offset,
-        reasoning: Default::default(),
-        post_values: None,
-        // System-fact filter ON — hides f:reifies* from untyped relationship matches.
-        include_system_facts: false,
+        grouping,
     })
 }
 

@@ -580,6 +580,48 @@ fn nested_with_boundaries_nest_subqueries() {
 }
 
 #[test]
+fn union_two_branches_lowers_to_union_of_subqueries() {
+    let q = lower("MATCH (n:Person) RETURN n UNION MATCH (n:Employee) RETURN n");
+    let union = match q.patterns.first().expect("at least one pattern") {
+        Pattern::Union(b) => b,
+        other => panic!("expected Pattern::Union, got {other:?}"),
+    };
+    assert_eq!(union.len(), 2, "two UNION branches");
+    for branch in union {
+        assert_eq!(branch.len(), 1, "each branch is a single Subquery");
+        assert!(matches!(branch[0], Pattern::Subquery(_)));
+    }
+    assert!(q.output.is_distinct(), "plain UNION must use DISTINCT");
+}
+
+#[test]
+fn union_all_uses_select_all() {
+    let q = lower("MATCH (n:Person) RETURN n UNION ALL MATCH (n:Employee) RETURN n");
+    assert!(!q.output.is_distinct(), "UNION ALL must NOT use DISTINCT");
+}
+
+#[test]
+fn union_three_branches() {
+    let q = lower("MATCH (n:A) RETURN n UNION MATCH (n:B) RETURN n UNION MATCH (n:C) RETURN n");
+    let union = match q.patterns.first().expect("at least one pattern") {
+        Pattern::Union(b) => b,
+        other => panic!("expected Pattern::Union, got {other:?}"),
+    };
+    assert_eq!(union.len(), 3, "three UNION branches");
+}
+
+#[test]
+fn union_branches_with_different_columns_are_rejected() {
+    let out = parse_cypher("MATCH (n:Person) RETURN n UNION MATCH (n:Person) RETURN n, n");
+    assert!(!out.has_errors());
+    let ast = out.ast.unwrap();
+    let encoder = NoEncoder;
+    let mut vars = VarRegistry::new();
+    let r = lower_cypher(&ast, &encoder, &mut vars);
+    assert!(r.is_err(), "differing column lists must be rejected");
+}
+
+#[test]
 fn reserved_predicate_is_rejected_in_property_filter() {
     // f:reifiesSubject is reserved. Any attempt to use it as a
     // property name in a Cypher pattern must be rejected.
