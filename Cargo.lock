@@ -2530,6 +2530,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "fluree-db-cypher"
+version = "4.0.3"
+dependencies = [
+ "fluree-db-core",
+ "fluree-db-query",
+ "fluree-graph-json-ld",
+ "fluree-vocab",
+ "insta",
+ "serde",
+ "serde_json",
+ "thiserror 1.0.69",
+ "tracing",
+ "winnow",
+]
+
+[[package]]
 name = "fluree-db-iceberg"
 version = "4.0.3"
 dependencies = [
