@@ -121,7 +121,12 @@ ORDER BY / SKIP / LIMIT
   STARTS WITH / ENDS WITH / CONTAINS, IS NULL / IS NOT NULL,
   `expr IN [a, b, ...]`, `CASE WHEN ... THEN ... END` (simple and
   subject forms), `EXISTS { pattern }`.
-- ORDER BY (variable keys only), SKIP, LIMIT.
+- Property accessors `n.prop` in expression position. Lowered by
+  emitting an auxiliary triple `(n, <prop IRI>, ?#__prop_n_prop)`
+  before the consuming Filter/Bind/aggregate so the synthetic var
+  is bound when the expression evaluates. Bare-variable target
+  only in v1; chained accessors (`n.a.b`) are rejected.
+- ORDER BY (variable or property-accessor keys), SKIP, LIMIT.
 - `UNWIND [literals] AS x` — inline list literal unwinding.
 - Aggregates: `count(*)`, `count(x)`, `count(DISTINCT x)`,
   `sum(x)`, `avg(x)`, `min(x)`, `max(x)` (bare-variable arguments

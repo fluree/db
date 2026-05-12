@@ -50,6 +50,36 @@ async fn cypher_match_labeled_node_finds_jsonld_typed_subject() {
 }
 
 #[tokio::test]
+async fn cypher_property_accessor_in_where_filters_results() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger_id = "it/cypher:prop-accessor-where";
+    let ledger0 = genesis_ledger(&fluree, ledger_id);
+
+    // Three Person nodes with different ages.
+    let txn = json!({
+        "@context": ctx(),
+        "@graph": [
+            {"@id": "ex:alice", "@type": "ex:Person", "ex:age": 25},
+            {"@id": "ex:bob",   "@type": "ex:Person", "ex:age": 35},
+            {"@id": "ex:carol", "@type": "ex:Person", "ex:age": 45},
+        ]
+    });
+    let committed = fluree.insert(ledger0, &txn).await.expect("seed");
+    let db = graphdb_from_ledger(&committed.ledger);
+
+    // Cypher property-accessor filter: only Bob and Carol are > 30.
+    let result = fluree
+        .query_cypher(&db, "MATCH (n:Person) WHERE n.age > 30 RETURN n")
+        .await
+        .expect("cypher property-accessor query");
+    assert_eq!(
+        result.row_count(),
+        2,
+        "expected exactly Bob and Carol (age > 30)"
+    );
+}
+
+#[tokio::test]
 async fn cypher_parse_error_returns_clear_diagnostic() {
     let fluree = FlureeBuilder::memory().build_memory();
     let ledger0 = genesis_ledger(&fluree, "it/cypher:parse-error");

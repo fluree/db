@@ -202,14 +202,17 @@ fn lower_single_branch<E: IriEncoder>(
                 let mut p = lower_pattern(ctx, &m.pattern)?;
                 patterns.append(&mut p);
                 if let Some(w) = &m.where_clause {
-                    let f = lower_expr(ctx, w)?;
+                    // Property accessors and other side-effecting
+                    // sub-expressions append auxiliary triples
+                    // before the Filter.
+                    let f = lower_expr(ctx, w, &mut patterns)?;
                     patterns.push(Pattern::Filter(f));
                 }
             }
             ReadClause::OptionalMatch(m) => {
                 let mut inner = lower_pattern(ctx, &m.pattern)?;
                 if let Some(w) = &m.where_clause {
-                    let f = lower_expr(ctx, w)?;
+                    let f = lower_expr(ctx, w, &mut inner)?;
                     inner.push(Pattern::Filter(f));
                 }
                 patterns.push(Pattern::Optional(inner));
@@ -276,7 +279,7 @@ fn lower_return<E: IriEncoder>(
     let limit = const_usize(&r.limit)?;
     let offset = const_usize(&r.skip)?;
 
-    let ordering = lower_order_by(ctx, &r.order_by)?;
+    let ordering = lower_order_by(ctx, &r.order_by, patterns)?;
 
     // GROUP BY keys are only meaningful when aggregates exist; if not,
     // pass an empty list so Grouping::assemble produces None.
@@ -350,7 +353,7 @@ impl ProjectionState {
         if let Expr::Call(call) = &item.expr {
             if let Some(agg_fn) = aggregate_fn(&call.name, call.distinct) {
                 let output_var = aggregate_output_var(ctx, &item.alias, &mut self.alias_counter);
-                let input_var = aggregate_input_var(ctx, call, &agg_fn)?;
+                let input_var = aggregate_input_var(ctx, call, &agg_fn, patterns)?;
                 self.aggregates.push(AggregateSpec {
                     function: agg_fn,
                     input_var,
@@ -362,7 +365,7 @@ impl ProjectionState {
                 return Ok(());
             }
         }
-        let lowered = lower_expr(ctx, &item.expr)?;
+        let lowered = lower_expr(ctx, &item.expr, patterns)?;
         let alias_id = aggregate_output_var(ctx, &item.alias, &mut self.alias_counter);
         patterns.push(Pattern::Bind {
             var: alias_id,
@@ -412,13 +415,15 @@ fn aggregate_fn(name: &str, distinct: bool) -> Option<AggregateFn> {
 }
 
 /// Resolve the aggregate's input variable: `None` for `count(*)`,
-/// a bare-variable VarId otherwise. Expression-valued aggregate
-/// arguments (e.g. `sum(n.age * 2)`) are deferred — they need a
-/// pre-aggregation `Bind`.
+/// a bare-variable VarId for `count(n)` / `sum(n)` / etc., or a
+/// property-accessor's synthetic VarId for `sum(n.age)`. Other
+/// expression-valued arguments (`sum(n.age * 2)`) are deferred —
+/// they need a pre-aggregation `Bind`.
 fn aggregate_input_var<E: IriEncoder>(
     ctx: &mut LoweringContext<'_, E>,
     call: &FuncCall,
     agg_fn: &AggregateFn,
+    aux: &mut Vec<Pattern>,
 ) -> Result<Option<VarId>> {
     if call.args.is_empty() {
         // count(*) — no input variable
@@ -438,8 +443,12 @@ fn aggregate_input_var<E: IriEncoder>(
     }
     match &call.args[0] {
         Expr::Var(v) => Ok(Some(ctx.intern_var(&v.name))),
+        Expr::Prop(target, key, _) => {
+            let var = crate::lower::expr::resolve_property_accessor(ctx, target, key, aux)?;
+            Ok(Some(var))
+        }
         _ => Err(LowerError::unsupported(format!(
-            "{}() argument must be a bare variable in v1 — expression arguments are deferred",
+            "{}() argument must be a bare variable or property accessor in v1 — other expressions are deferred",
             call.name
         ))),
     }
@@ -465,16 +474,23 @@ fn aggregate_output_var<E: IriEncoder>(
 fn lower_order_by<E: IriEncoder>(
     ctx: &mut LoweringContext<'_, E>,
     items: &[crate::ast::OrderItem],
+    aux: &mut Vec<Pattern>,
 ) -> Result<Vec<SortSpec>> {
     let mut out = Vec::with_capacity(items.len());
     for it in items {
-        // v1 only supports `ORDER BY <var>`. Expression-keyed ordering
-        // would need a pre-BIND, which we defer.
+        // ORDER BY accepts a bare variable or a property accessor
+        // (`ORDER BY n.age`). The latter resolves through the same
+        // helper that handles `n.age` in WHERE/RETURN, emitting the
+        // property triple into `aux` so the ordering key is bound
+        // before SortSpec evaluates.
         let var = match &it.expr {
             Expr::Var(v) => ctx.intern_var(&v.name),
+            Expr::Prop(target, key, _) => {
+                crate::lower::expr::resolve_property_accessor(ctx, target, key, aux)?
+            }
             _ => {
                 return Err(LowerError::unsupported(
-                    "ORDER BY accepts only a variable in v1 — use `WITH expr AS alias ORDER BY alias` once WITH lands",
+                    "ORDER BY accepts a variable or a property accessor in v1 (e.g., `ORDER BY n` or `ORDER BY n.age`) — richer expression-keyed ordering needs an explicit `WITH expr AS alias ORDER BY alias`",
                 ));
             }
         };
@@ -533,7 +549,10 @@ fn lower_with<E: IriEncoder>(
     // reference to an aggregate output variable (e.g. `WHERE c > 0`
     // after `count(*) AS c`) silently match zero rows.
     let having = if let Some(where_expr) = &w.where_clause {
-        let lowered = lower_expr(ctx, where_expr)?;
+        // Auxiliary triples (property accessors) emitted by the
+        // WHERE expression go into the subquery body before any
+        // Filter — they bind the values the WHERE needs to read.
+        let lowered = lower_expr(ctx, where_expr, &mut inner_patterns)?;
         let agg_outputs = projection.aggregate_output_vars();
         let references_aggregate =
             !agg_outputs.is_empty() && expression_references_any(&lowered, &agg_outputs);
@@ -560,9 +579,14 @@ fn lower_with<E: IriEncoder>(
     };
 
     let grouping = Grouping::assemble(group_keys, projection.aggregates, Vec::new(), having);
+
+    // ORDER BY may also reference property accessors; emit any
+    // resulting auxiliary triples into the subquery body before we
+    // hand patterns to SubqueryPattern.
+    let ordering = lower_order_by(ctx, &w.order_by, &mut inner_patterns)?;
+
     let mut sq = SubqueryPattern::new(projection.vars, inner_patterns);
 
-    let ordering = lower_order_by(ctx, &w.order_by)?;
     if !ordering.is_empty() {
         sq = sq.with_ordering(ordering);
     }

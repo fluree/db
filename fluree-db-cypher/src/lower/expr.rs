@@ -1,8 +1,9 @@
 //! Expression lowering — Cypher Expr → fluree-db-query Expression.
 
 use fluree_db_core::FlakeValue;
-use fluree_db_query::ir::{Expression, Function};
+use fluree_db_query::ir::{Expression, Function, Pattern, Ref, Term, TriplePattern};
 use fluree_db_query::parse::encode::IriEncoder;
+use fluree_db_query::var_registry::VarId;
 
 use crate::ast::{BinOp, CaseExpr, Expr, Literal, ParamRef, UnaryOp};
 
@@ -10,19 +11,29 @@ use super::context::LoweringContext;
 use super::pattern::lower_pattern;
 use super::{LowerError, Result};
 
-pub fn lower_expr<E: IriEncoder>(ctx: &mut LoweringContext<'_, E>, e: &Expr) -> Result<Expression> {
+/// Lower a Cypher expression to an `Expression`. Any auxiliary
+/// patterns the expression requires (e.g., property-accessor joins)
+/// are appended to `aux`. The caller is responsible for splicing
+/// `aux` into the enclosing pattern list before the position where
+/// the expression is evaluated.
+pub fn lower_expr<E: IriEncoder>(
+    ctx: &mut LoweringContext<'_, E>,
+    e: &Expr,
+    aux: &mut Vec<Pattern>,
+) -> Result<Expression> {
     match e {
         Expr::Var(v) => Ok(Expression::Var(ctx.intern_var(&v.name))),
         Expr::Lit(l) => Ok(Expression::Const(lower_literal(l)?)),
         Expr::Param(_) => Err(LowerError::unsupported(
             "parameter substitution is wired at the API layer, not the lowering layer; submit pre-substituted Cypher in v1",
         )),
-        Expr::Prop(_, _, _) => Err(LowerError::unsupported(
-            "property accessors (`n.prop`) inside expressions are deferred; project nodes via RETURN and reference properties in WHERE via separate triple patterns",
-        )),
+        Expr::Prop(target, key, _) => {
+            let prop_var = resolve_property_accessor(ctx, target, key, aux)?;
+            Ok(Expression::Var(prop_var))
+        }
         Expr::BinOp(op, l, r, _) => {
-            let l = lower_expr(ctx, l)?;
-            let r = lower_expr(ctx, r)?;
+            let l = lower_expr(ctx, l, aux)?;
+            let r = lower_expr(ctx, r, aux)?;
             let f = match op {
                 BinOp::Eq => Function::Eq,
                 BinOp::Ne => Function::Ne,
@@ -40,7 +51,7 @@ pub fn lower_expr<E: IriEncoder>(ctx: &mut LoweringContext<'_, E>, e: &Expr) -> 
             Ok(Expression::binary(f, l, r))
         }
         Expr::UnaryOp(op, inner, _) => {
-            let inner = lower_expr(ctx, inner)?;
+            let inner = lower_expr(ctx, inner, aux)?;
             let f = match op {
                 UnaryOp::Neg => Function::Negate,
                 UnaryOp::Not => Function::Not,
@@ -51,7 +62,7 @@ pub fn lower_expr<E: IriEncoder>(ctx: &mut LoweringContext<'_, E>, e: &Expr) -> 
             // Lower to `Function::In(test, candidate1, candidate2, ...)`.
             // The right-hand side must be a list literal in v1; parameter-
             // bound list expressions are deferred.
-            let test = lower_expr(ctx, left)?;
+            let test = lower_expr(ctx, left, aux)?;
             let items = match list.as_ref() {
                 Expr::List(items, _) => items,
                 _ => {
@@ -63,37 +74,37 @@ pub fn lower_expr<E: IriEncoder>(ctx: &mut LoweringContext<'_, E>, e: &Expr) -> 
             let mut args = Vec::with_capacity(items.len() + 1);
             args.push(test);
             for item in items {
-                args.push(lower_expr(ctx, item)?);
+                args.push(lower_expr(ctx, item, aux)?);
             }
             Ok(Expression::call(Function::In, args))
         }
         Expr::IsNull(inner, _) => {
-            let inner = lower_expr(ctx, inner)?;
+            let inner = lower_expr(ctx, inner, aux)?;
             Ok(Expression::call(Function::Not, vec![Expression::call(
                 Function::Bound,
                 vec![inner],
             )]))
         }
         Expr::IsNotNull(inner, _) => {
-            let inner = lower_expr(ctx, inner)?;
+            let inner = lower_expr(ctx, inner, aux)?;
             Ok(Expression::call(Function::Bound, vec![inner]))
         }
         Expr::StartsWith(l, r, _) => {
-            let l = lower_expr(ctx, l)?;
-            let r = lower_expr(ctx, r)?;
+            let l = lower_expr(ctx, l, aux)?;
+            let r = lower_expr(ctx, r, aux)?;
             Ok(Expression::binary(Function::StrStarts, l, r))
         }
         Expr::EndsWith(l, r, _) => {
-            let l = lower_expr(ctx, l)?;
-            let r = lower_expr(ctx, r)?;
+            let l = lower_expr(ctx, l, aux)?;
+            let r = lower_expr(ctx, r, aux)?;
             Ok(Expression::binary(Function::StrEnds, l, r))
         }
         Expr::Contains(l, r, _) => {
-            let l = lower_expr(ctx, l)?;
-            let r = lower_expr(ctx, r)?;
+            let l = lower_expr(ctx, l, aux)?;
+            let r = lower_expr(ctx, r, aux)?;
             Ok(Expression::binary(Function::Contains, l, r))
         }
-        Expr::Case(case) => lower_case(ctx, case),
+        Expr::Case(case) => lower_case(ctx, case, aux),
         Expr::Exists(pattern, _) => {
             let patterns = lower_pattern(ctx, pattern)?;
             Ok(Expression::Exists {
@@ -107,7 +118,7 @@ pub fn lower_expr<E: IriEncoder>(ctx: &mut LoweringContext<'_, E>, e: &Expr) -> 
         Expr::Call(call) => {
             let name = call.name.to_ascii_lowercase();
             let args: std::result::Result<Vec<_>, _> =
-                call.args.iter().map(|a| lower_expr(ctx, a)).collect();
+                call.args.iter().map(|a| lower_expr(ctx, a, aux)).collect();
             let args = args?;
             let func = match name.as_str() {
                 "coalesce" => Function::Coalesce,
@@ -126,6 +137,59 @@ pub fn lower_expr<E: IriEncoder>(ctx: &mut LoweringContext<'_, E>, e: &Expr) -> 
     }
 }
 
+/// Resolve a Cypher `target.key` property accessor to a VarId.
+///
+/// Emits a `Pattern::Triple(target, <key IRI>, ?#__prop_target_key)`
+/// into `aux` so the executor binds the property's value to the
+/// synthetic var. The synthetic var name is deterministic
+/// (`?#__prop_<target>_<key>`), so repeated references to the same
+/// accessor in the same scope share a VarId; the planner deduplicates
+/// the equivalent triple patterns at execution time.
+///
+/// Why always-emit rather than dedup at lower time: subquery
+/// boundaries (`WITH`) can drop the property variable from the
+/// outer scope if it isn't in the WITH's select list. A naive
+/// "have we already emitted this name?" check would skip the
+/// re-emit in the outer scope, leaving the property var unbound.
+/// Re-emitting is correct and the planner handles redundant triples
+/// cheaply.
+///
+/// v1 only accepts a bare-variable target (`n.prop`); chained
+/// accessors (`n.address.city`) and accessors on non-variable
+/// expressions (e.g., `(n {p:1}).p`) are rejected.
+pub(crate) fn resolve_property_accessor<E: IriEncoder>(
+    ctx: &mut LoweringContext<'_, E>,
+    target: &Expr,
+    key: &str,
+    aux: &mut Vec<Pattern>,
+) -> Result<VarId> {
+    let target_var = match target {
+        Expr::Var(v) => v,
+        Expr::Prop(_, _, _) => {
+            return Err(LowerError::unsupported(
+                "chained property accessors (`n.foo.bar`) are deferred — bind to an intermediate variable via WITH",
+            ));
+        }
+        _ => {
+            return Err(LowerError::unsupported(
+                "property accessors require a bare-variable target in v1 (e.g., `n.prop`)",
+            ));
+        }
+    };
+    let target_id = ctx.intern_var(&target_var.name);
+    let pred_iri = ctx.resolve_predicate(key)?;
+
+    let prop_var_name = format!("?#__prop_{}_{}", target_var.name, key);
+    let prop_var = ctx.intern_var(&prop_var_name);
+
+    aux.push(Pattern::Triple(TriplePattern::new(
+        Ref::Var(target_id),
+        Ref::Iri(pred_iri.into()),
+        Term::Var(prop_var),
+    )));
+    Ok(prop_var)
+}
+
 /// Lower a Cypher `CASE` expression to nested `Function::If` calls.
 ///
 /// Cypher has two forms:
@@ -137,6 +201,7 @@ pub fn lower_expr<E: IriEncoder>(ctx: &mut LoweringContext<'_, E>, e: &Expr) -> 
 fn lower_case<E: IriEncoder>(
     ctx: &mut LoweringContext<'_, E>,
     case: &CaseExpr,
+    aux: &mut Vec<Pattern>,
 ) -> Result<Expression> {
     if case.branches.is_empty() {
         return Err(LowerError::unsupported(
@@ -148,22 +213,22 @@ fn lower_case<E: IriEncoder>(
     // as Bound→false via Function::Coalesce with zero remaining args
     // (an empty Coalesce returns unbound).
     let else_expr = match &case.else_branch {
-        Some(e) => lower_expr(ctx, e)?,
+        Some(e) => lower_expr(ctx, e, aux)?,
         None => Expression::call(Function::Coalesce, Vec::new()),
     };
 
     // The subject expression, if any, lowered once and reused per branch
     // wrapped in equality.
     let subject = match &case.subject {
-        Some(s) => Some(lower_expr(ctx, s)?),
+        Some(s) => Some(lower_expr(ctx, s, aux)?),
         None => None,
     };
 
     // Right-fold over branches.
     let mut acc = else_expr;
     for (cond, val) in case.branches.iter().rev() {
-        let cond_expr = lower_expr(ctx, cond)?;
-        let val_expr = lower_expr(ctx, val)?;
+        let cond_expr = lower_expr(ctx, cond, aux)?;
+        let val_expr = lower_expr(ctx, val, aux)?;
         let test = match &subject {
             Some(subj) => Expression::binary(Function::Eq, subj.clone(), cond_expr),
             None => cond_expr,

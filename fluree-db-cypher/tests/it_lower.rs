@@ -735,6 +735,158 @@ fn with_where_without_aggregates_stays_a_filter() {
 }
 
 #[test]
+fn property_accessor_in_where_emits_triple_and_binds() {
+    let q = lower("MATCH (n:Person) WHERE n.age > 30 RETURN n");
+    // Expect: 1 label triple + 1 property triple + 1 Filter
+    let triple_count = q
+        .patterns
+        .iter()
+        .filter(|p| matches!(p, Pattern::Triple(_)))
+        .count();
+    assert_eq!(
+        triple_count, 2,
+        "expected one label triple + one property accessor triple; got {:?}",
+        q.patterns
+    );
+    let has_filter = q.patterns.iter().any(|p| matches!(p, Pattern::Filter(_)));
+    assert!(has_filter, "WHERE must emit a Filter");
+
+    // The property triple should sit before the Filter so the
+    // accessor's var is bound when the Filter evaluates.
+    let mut saw_prop_triple = false;
+    for p in &q.patterns {
+        match p {
+            Pattern::Triple(tp) => {
+                if let Ref::Iri(iri) = &tp.p {
+                    if iri.as_ref() == "http://example.org/age" {
+                        saw_prop_triple = true;
+                    }
+                }
+            }
+            Pattern::Filter(_) => {
+                assert!(
+                    saw_prop_triple,
+                    "property triple must precede the Filter that reads it"
+                );
+            }
+            _ => {}
+        }
+    }
+}
+
+#[test]
+fn property_accessor_in_return_emits_triple_and_binds_then_projects() {
+    let q = lower("MATCH (n:Person) RETURN n.name");
+    // Expect a property triple for n.name and a Bind that captures
+    // the synthetic var as the projection output.
+    let has_prop_triple = q.patterns.iter().any(|p| matches!(
+        p,
+        Pattern::Triple(tp) if matches!(&tp.p, Ref::Iri(iri) if iri.as_ref() == "http://example.org/name")
+    ));
+    assert!(has_prop_triple, "expected property triple for n.name");
+    let has_bind = q.patterns.iter().any(|p| matches!(p, Pattern::Bind { .. }));
+    assert!(has_bind, "RETURN of n.name must emit a Bind");
+}
+
+#[test]
+fn property_accessor_in_aggregate_arg() {
+    // RETURN avg(n.age) — the aggregate's input is a property var.
+    use fluree_db_query::ir::grouping::{AggregateFn, Grouping};
+    let q = lower("MATCH (n:Person) RETURN avg(n.age) AS avg_age");
+    let has_prop_triple = q.patterns.iter().any(|p| matches!(
+        p,
+        Pattern::Triple(tp) if matches!(&tp.p, Ref::Iri(iri) if iri.as_ref() == "http://example.org/age")
+    ));
+    assert!(has_prop_triple);
+    let grouping = q.grouping.expect("expected implicit grouping");
+    match grouping {
+        Grouping::Implicit { aggregation, .. } => {
+            let spec = aggregation.aggregates.first();
+            assert!(matches!(spec.function, AggregateFn::Avg));
+            assert!(
+                spec.input_var.is_some(),
+                "aggregate input var must reference the property accessor"
+            );
+        }
+        _ => panic!("expected Implicit grouping"),
+    }
+}
+
+#[test]
+fn property_accessor_drives_explicit_group_by() {
+    // RETURN n.dept, count(*) — the bare n.dept is a non-aggregate
+    // projection, so Cypher's implicit grouping rule must use the
+    // accessor's synthetic var as the GROUP BY key.
+    use fluree_db_query::ir::grouping::Grouping;
+    let q = lower("MATCH (n:Person) RETURN n.dept, count(*) AS total");
+    let grouping = q.grouping.expect("expected grouping");
+    match grouping {
+        Grouping::Explicit { group_by, .. } => {
+            assert_eq!(
+                group_by.len(),
+                1,
+                "exactly one GROUP BY key (the n.dept accessor)"
+            );
+        }
+        Grouping::Implicit { .. } => {
+            panic!("n.dept + count(*) must produce Explicit grouping, got Implicit")
+        }
+    }
+}
+
+#[test]
+fn property_accessor_in_order_by() {
+    let q = lower("MATCH (n:Person) RETURN n ORDER BY n.age DESC");
+    let has_prop_triple = q.patterns.iter().any(|p| matches!(
+        p,
+        Pattern::Triple(tp) if matches!(&tp.p, Ref::Iri(iri) if iri.as_ref() == "http://example.org/age")
+    ));
+    assert!(
+        has_prop_triple,
+        "ORDER BY n.age must emit the property triple"
+    );
+    assert_eq!(q.ordering.len(), 1);
+}
+
+#[test]
+fn chained_property_accessor_rejected() {
+    let out = parse_cypher("MATCH (n:Person) RETURN n.address.city");
+    if out.has_errors() {
+        return; // parser may reject; lower-time rejection is the v1 contract path
+    }
+    let ast = out.ast.unwrap();
+    let encoder = NoEncoder;
+    let mut vars = VarRegistry::new();
+    let r = lower_cypher(&ast, &encoder, &mut vars);
+    assert!(r.is_err(), "chained accessors should be rejected in v1");
+}
+
+#[test]
+fn reserved_predicate_via_property_accessor_rejected() {
+    // n.reifiesSubject — if it resolves to f:reifiesSubject, the
+    // reserved-predicate firewall must fire. With the default
+    // vocab `http://example.org/` it resolves to a non-reserved IRI,
+    // but with the f: prefix it would be rejected. Pin this with an
+    // override.
+    use std::collections::HashMap;
+    let mut overrides = HashMap::new();
+    overrides.insert(
+        "reifiesSubject".to_string(),
+        "https://ns.flur.ee/db#reifiesSubject".to_string(),
+    );
+    let out = parse_cypher("MATCH (n:Person) WHERE n.reifiesSubject = n.reifiesSubject RETURN n");
+    let ast = out.ast.unwrap();
+    let encoder = NoEncoder;
+    let mut vars = VarRegistry::new();
+    let mut ctx = LoweringContext::new(&encoder, &mut vars).with_overrides(overrides);
+    let r = lower_cypher_with_context(&ast, &mut ctx);
+    assert!(
+        r.is_err(),
+        "accessor resolving to f:reifies* must be rejected"
+    );
+}
+
+#[test]
 fn reserved_predicate_is_rejected_in_property_filter() {
     // f:reifiesSubject is reserved. Any attempt to use it as a
     // property name in a Cypher pattern must be rejected.
