@@ -28,9 +28,9 @@ use crate::sid::Sid;
 use crate::value::FlakeValue;
 #[cfg(test)]
 use fluree_vocab::db as fluree_db_predicates;
-use fluree_vocab::namespaces::{JSON_LD, XSD};
 #[cfg(test)]
 use fluree_vocab::namespaces::FLUREE_DB;
+use fluree_vocab::namespaces::{JSON_LD, XSD};
 use fluree_vocab::xsd_names;
 use serde::{Deserialize, Serialize};
 
