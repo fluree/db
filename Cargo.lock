@@ -3004,6 +3004,7 @@ dependencies = [
  "chrono",
  "fluree-db-binary-index",
  "fluree-db-core",
+ "fluree-db-cypher",
  "fluree-db-indexer",
  "fluree-db-ledger",
  "fluree-db-nameservice",
