@@ -398,6 +398,107 @@ fn return_as_alias_is_rejected_in_v1() {
 }
 
 #[test]
+fn unwind_inline_list_lowers_to_values() {
+    let q = lower("UNWIND [1, 2, 3] AS x MATCH (n:Person) RETURN n");
+    let has_values = q
+        .patterns
+        .iter()
+        .any(|p| matches!(p, Pattern::Values { .. }));
+    assert!(has_values, "expected a Values pattern from UNWIND");
+    let (vars, rows) = q
+        .patterns
+        .iter()
+        .find_map(|p| match p {
+            Pattern::Values { vars, rows } => Some((vars.clone(), rows.clone())),
+            _ => None,
+        })
+        .expect("values");
+    assert_eq!(vars.len(), 1, "single alias variable");
+    assert_eq!(rows.len(), 3, "three list elements");
+}
+
+#[test]
+fn unwind_param_is_rejected_in_v1() {
+    let out = parse_cypher("UNWIND $list AS x RETURN x");
+    assert!(!out.has_errors());
+    let ast = out.ast.unwrap();
+    let encoder = NoEncoder;
+    let mut vars = VarRegistry::new();
+    let r = lower_cypher(&ast, &encoder, &mut vars);
+    assert!(r.is_err(), "$param UNWIND deferred in v1");
+}
+
+#[test]
+fn count_star_lifts_to_implicit_grouping() {
+    let q = lower("MATCH (n:Person) RETURN count(*) AS total");
+    let grouping = q.grouping.expect("expected implicit grouping");
+    use fluree_db_query::ir::grouping::{AggregateFn, Grouping};
+    match grouping {
+        Grouping::Implicit { aggregation, .. } => {
+            assert_eq!(aggregation.aggregates.len(), 1);
+            let spec = aggregation.aggregates.first();
+            assert!(matches!(spec.function, AggregateFn::Count));
+            assert!(spec.input_var.is_none(), "count(*) has no input var");
+        }
+        other => panic!("expected Implicit grouping, got {other:?}"),
+    }
+}
+
+#[test]
+fn count_x_distinct_uses_dedicated_variant() {
+    let q = lower("MATCH (n:Person) RETURN count(DISTINCT n) AS distinct_n");
+    let grouping = q.grouping.expect("grouping");
+    use fluree_db_query::ir::grouping::{AggregateFn, Grouping};
+    match grouping {
+        Grouping::Implicit { aggregation, .. } => {
+            let spec = aggregation.aggregates.first();
+            assert!(matches!(spec.function, AggregateFn::CountDistinct));
+            assert!(spec.input_var.is_some());
+            assert!(
+                !spec.distinct,
+                "CountDistinct handles dedup internally; spec.distinct must be false"
+            );
+        }
+        _ => panic!("expected Implicit"),
+    }
+}
+
+#[test]
+fn sum_avg_min_max() {
+    use fluree_db_query::ir::grouping::{AggregateFn, Grouping};
+    for (src, expected) in [
+        ("MATCH (n:Person) RETURN sum(n) AS s", AggregateFn::Sum),
+        ("MATCH (n:Person) RETURN avg(n) AS a", AggregateFn::Avg),
+        ("MATCH (n:Person) RETURN min(n) AS m", AggregateFn::Min),
+        ("MATCH (n:Person) RETURN max(n) AS x", AggregateFn::Max),
+    ] {
+        let q = lower(src);
+        let grouping = q.grouping.expect(src);
+        match grouping {
+            Grouping::Implicit { aggregation, .. } => {
+                assert_eq!(aggregation.aggregates.first().function, expected, "{src}");
+            }
+            _ => panic!("expected Implicit for {src}"),
+        }
+    }
+}
+
+#[test]
+fn aggregate_expression_arg_rejected_in_v1() {
+    // sum(n + 1) — expression-valued argument requires a pre-Bind that
+    // we defer. The lower step rejects clearly.
+    let out = parse_cypher("MATCH (n:Person) RETURN sum(n + 1) AS s");
+    if out.has_errors() {
+        return; // parser may reject; either way is acceptable
+    }
+    let ast = out.ast.unwrap();
+    let encoder = NoEncoder;
+    let mut vars = VarRegistry::new();
+    let r = lower_cypher(&ast, &encoder, &mut vars);
+    assert!(r.is_err(), "expression-arg aggregates deferred");
+}
+
+#[test]
 fn reserved_predicate_is_rejected_in_property_filter() {
     // f:reifiesSubject is reserved. Any attempt to use it as a
     // property name in a Cypher pattern must be rejected.
