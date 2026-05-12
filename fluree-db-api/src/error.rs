@@ -406,6 +406,8 @@ impl ApiError {
             | ApiError::Config(_)
             | ApiError::Sparql { .. }
             | ApiError::SparqlLower(_)
+            | ApiError::Cypher { .. }
+            | ApiError::CypherLower(_)
             | ApiError::Turtle(_)
             | ApiError::Json(_)
             | ApiError::Batch(_)
@@ -434,3 +436,17 @@ impl ApiError {
 
 /// Result type alias for API operations
 pub type Result<T> = std::result::Result<T, ApiError>;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cypher_errors_map_to_client_error_status() {
+        let parse = ApiError::cypher("bad cypher", Vec::new());
+        assert_eq!(parse.status_code(), 400);
+
+        let lower = ApiError::CypherLower(fluree_db_cypher::LowerError::unsupported("x"));
+        assert_eq!(lower.status_code(), 400);
+    }
+}
