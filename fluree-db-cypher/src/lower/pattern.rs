@@ -1,6 +1,5 @@
 //! Pattern lowering — Cypher MATCH patterns → fluree-db-query Pattern.
 
-use fluree_db_core::FlakeValue;
 use fluree_db_query::ir::{Pattern, Ref, Term, TriplePattern};
 use fluree_db_query::parse::encode::IriEncoder;
 
@@ -167,41 +166,27 @@ fn lower_rel<E: IriEncoder>(
             Ref::Iri(iri.into())
         }
         _ => {
-            // Multiple types — emit a var predicate plus a Filter(IN ...)
-            // pattern. Note: a Union of triples would also work but is
-            // wider in the plan.
-            let var = ctx.fresh_synth();
-            let filter_targets: Vec<_> = rel
-                .types
-                .iter()
-                .map(|t| ctx.resolve_predicate(&t.name))
-                .collect::<std::result::Result<Vec<_>, _>>()?;
-            // Build a filter expression: ?__pred IN [iri1, iri2, ...]
-            // The IR's `Function::In` takes the value and the candidate
-            // list as args.
-            use fluree_db_query::ir::{Expression, Function};
-            let lhs = Expression::Var(var);
-            // Argument list shape for Function::In: first arg is the
-            // candidate, rest are the targets. (We follow whatever
-            // the existing SPARQL lowering does — `In` takes
-            // (value, ...candidates).)
-            let mut args = vec![lhs];
-            for iri in filter_targets {
-                args.push(Expression::Const(FlakeValue::String(iri)));
+            // Multiple types — emit a `Union` of one branch per type
+            // with a concrete predicate IRI. Using a var predicate +
+            // FILTER(IN ...) does not work: the predicate variable
+            // binds to an IRI/SID term but the IN comparison constants
+            // would be string literals, never matching.
+            let mut branches: Vec<Vec<Pattern>> = Vec::with_capacity(rel.types.len());
+            for t in &rel.types {
+                let iri = ctx.resolve_predicate(&t.name)?;
+                let mut branch = Vec::new();
+                push_rel_triple(
+                    ctx,
+                    &rel.var,
+                    &rel.props,
+                    Ref::Iri(iri.into()),
+                    s.clone(),
+                    o.clone(),
+                    &mut branch,
+                )?;
+                branches.push(branch);
             }
-            let filter_expr = Expression::call(Function::In, args);
-            // Will be appended below after triple/EdgeAnnotation
-            // construction.
-            push_rel_triple_with_var_predicate(
-                ctx,
-                &rel.var,
-                &rel.props,
-                Ref::Var(var),
-                s.clone(),
-                o.clone(),
-                out,
-            )?;
-            out.push(Pattern::Filter(filter_expr));
+            out.push(Pattern::Union(branches));
             return Ok(());
         }
     };
@@ -281,18 +266,6 @@ fn push_rel_triple<E: IriEncoder>(
             Ok(())
         }
     }
-}
-
-fn push_rel_triple_with_var_predicate<E: IriEncoder>(
-    ctx: &mut LoweringContext<'_, E>,
-    rel_var: &Option<Variable>,
-    rel_props: &Option<MapLit>,
-    pred: Ref,
-    s: Ref,
-    o: Ref,
-    out: &mut Vec<Pattern>,
-) -> Result<()> {
-    push_rel_triple(ctx, rel_var, rel_props, pred, s, o, out)
 }
 
 fn build_annotation_body<E: IriEncoder>(

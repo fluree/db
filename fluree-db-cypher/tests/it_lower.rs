@@ -1,7 +1,9 @@
 //! Read-path lowering tests — exercise the rules from
 //! GQL_CYPHER_SUPPORT.md §M5.3.
 
-use fluree_db_cypher::{lower_cypher, parse_cypher};
+use std::collections::HashMap;
+
+use fluree_db_cypher::{lower_cypher, lower_cypher_with_context, parse_cypher, LoweringContext};
 use fluree_db_query::ir::{Pattern, Ref, Term};
 use fluree_db_query::parse::encode::NoEncoder;
 use fluree_db_query::var_registry::VarRegistry;
@@ -193,6 +195,109 @@ fn optional_match() {
     let q = lower("MATCH (a:Person) OPTIONAL MATCH (a)-[:KNOWS]->(b:Person) RETURN a, b");
     let has_optional = q.patterns.iter().any(|p| matches!(p, Pattern::Optional(_)));
     assert!(has_optional);
+}
+
+#[test]
+fn lowering_context_vocab_override_applies_to_labels() {
+    // Regression: an earlier version built a LoweringContext with
+    // `.with_vocab(...)` and then dropped it, calling the default
+    // `lower_cypher` which constructed a fresh context with the
+    // built-in `http://example.org/` default. The context-aware
+    // entry point must honor a non-default vocab.
+    let out = parse_cypher("MATCH (n:Person) RETURN n");
+    assert!(!out.has_errors());
+    let ast = out.ast.unwrap();
+    let encoder = NoEncoder;
+    let mut vars = VarRegistry::new();
+    let mut ctx = LoweringContext::new(&encoder, &mut vars).with_vocab("https://schema.example/");
+    let q = lower_cypher_with_context(&ast, &mut ctx).expect("lower");
+
+    let label_iri = q
+        .patterns
+        .iter()
+        .find_map(|p| match p {
+            Pattern::Triple(tp) => match &tp.o {
+                Term::Iri(iri) => Some(iri.clone()),
+                _ => None,
+            },
+            _ => None,
+        })
+        .expect("a label triple");
+    assert_eq!(
+        label_iri.as_ref(),
+        "https://schema.example/Person",
+        "vocab override must produce the expected label IRI"
+    );
+}
+
+#[test]
+fn lowering_context_term_override_applies_to_label() {
+    // A term override (e.g. `"Person": "http://schema.org/Person"`)
+    // takes precedence over the @vocab fallback for that one label.
+    let out = parse_cypher("MATCH (n:Person) RETURN n");
+    let ast = out.ast.unwrap();
+    let encoder = NoEncoder;
+    let mut vars = VarRegistry::new();
+    let mut overrides = HashMap::new();
+    overrides.insert("Person".to_string(), "http://schema.org/Person".to_string());
+    let mut ctx = LoweringContext::new(&encoder, &mut vars)
+        .with_vocab("https://schema.example/")
+        .with_overrides(overrides);
+    let q = lower_cypher_with_context(&ast, &mut ctx).expect("lower");
+
+    let label_iri = q
+        .patterns
+        .iter()
+        .find_map(|p| match p {
+            Pattern::Triple(tp) => match &tp.o {
+                Term::Iri(iri) => Some(iri.clone()),
+                _ => None,
+            },
+            _ => None,
+        })
+        .expect("a label triple");
+    assert_eq!(label_iri.as_ref(), "http://schema.org/Person");
+}
+
+#[test]
+fn type_alternation_lowers_to_union_of_concrete_predicates() {
+    // Regression: the earlier lowering emitted a var predicate plus
+    // FILTER(IN [String(iri)…]), which never matches a predicate-
+    // position SID. The fix is `Union` of one branch per type.
+    let q = lower("MATCH (a:Person)-[:KNOWS|FOLLOWS]->(b:Person) RETURN a, b");
+    let union = q
+        .patterns
+        .iter()
+        .find_map(|p| match p {
+            Pattern::Union(branches) => Some(branches),
+            _ => None,
+        })
+        .expect("expected Union from type alternation");
+    assert_eq!(union.len(), 2, "two type alternatives → two Union branches");
+    // Each branch should contain at least one Triple naming the
+    // alternative as a constant Iri predicate.
+    for branch in union {
+        let has_concrete_pred = branch
+            .iter()
+            .any(|p| matches!(p, Pattern::Triple(tp) if matches!(&tp.p, Ref::Iri(_))));
+        assert!(
+            has_concrete_pred,
+            "each Union branch must use a concrete predicate Iri"
+        );
+    }
+}
+
+#[test]
+fn return_as_alias_is_rejected_in_v1() {
+    // `RETURN n AS m` was previously accepted but silently dropped
+    // the alias. v1 now rejects it explicitly.
+    let out = parse_cypher("MATCH (n:Person) RETURN n AS m");
+    assert!(!out.has_errors(), "parse should accept the alias syntax");
+    let ast = out.ast.unwrap();
+    let encoder = NoEncoder;
+    let mut vars = VarRegistry::new();
+    let r = lower_cypher(&ast, &encoder, &mut vars);
+    assert!(r.is_err(), "expected RETURN ... AS ... to be rejected");
 }
 
 #[test]

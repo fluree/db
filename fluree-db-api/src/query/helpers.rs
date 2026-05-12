@@ -107,7 +107,7 @@ pub(crate) fn parse_sparql_to_ir(
 /// production data.
 pub(crate) fn parse_cypher_to_ir(
     cypher: &str,
-    _snapshot: &LedgerSnapshot,
+    snapshot: &LedgerSnapshot,
     default_context: Option<&JsonValue>,
 ) -> Result<(VarRegistry, Query)> {
     let out = fluree_db_cypher::parse_cypher(cypher);
@@ -118,32 +118,24 @@ pub(crate) fn parse_cypher_to_ir(
             .map(|d| format!("{}: {}", d.code, d.message))
             .collect::<Vec<_>>()
             .join("; ");
-        return Err(ApiError::Internal(format!("Cypher parse: {msg}")));
+        return Err(ApiError::cypher(msg, out.diagnostics));
     }
     let ast = out
         .ast
-        .ok_or_else(|| ApiError::Internal("Cypher parse returned no AST".to_string()))?;
+        .ok_or_else(|| ApiError::cypher("Cypher parse returned no AST", Vec::new()))?;
 
     // Pull `@vocab` and named-term overrides out of the default
-    // context.
+    // context, then build a `LoweringContext` and pass it to the
+    // context-aware lower entry so the ledger's IRI mappings actually
+    // apply to bare Cypher identifiers.
     let (vocab, overrides) = extract_cypher_iri_mapping(default_context);
 
-    // Cypher's executor uses the ledger-snapshot-backed `IriEncoder`
-    // just like SPARQL does — the encoder is the snapshot.
     let mut vars = VarRegistry::new();
-    let encoder = _snapshot;
-    let mut ctx = fluree_db_cypher::LoweringContext::new(encoder, &mut vars).with_vocab(vocab);
+    let mut ctx = fluree_db_cypher::LoweringContext::new(snapshot, &mut vars).with_vocab(vocab);
     if !overrides.is_empty() {
         ctx = ctx.with_overrides(overrides);
     }
-    // The public lower_cypher entry takes the encoder and vars
-    // directly; for context customization we'd need a context-aware
-    // entry point. For v1 we call the public form with the same
-    // encoder/vars.
-    drop(ctx); // (placeholder for future context-aware lower entry)
-
-    let parsed = fluree_db_cypher::lower_cypher(&ast, encoder, &mut vars)
-        .map_err(|e| ApiError::Internal(format!("Cypher lower: {e}")))?;
+    let parsed = fluree_db_cypher::lower_cypher_with_context(&ast, &mut ctx)?;
     Ok((vars, parsed))
 }
 

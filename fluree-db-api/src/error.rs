@@ -149,6 +149,17 @@ pub enum ApiError {
     #[error("SPARQL lowering error: {0}")]
     SparqlLower(#[from] fluree_db_sparql::LowerError),
 
+    /// Cypher parse errors with structured diagnostics.
+    #[error("Cypher parse error: {message}")]
+    Cypher {
+        message: String,
+        diagnostics: Vec<fluree_db_cypher::Diagnostic>,
+    },
+
+    /// Cypher lowering errors (read path).
+    #[error("Cypher lowering error: {0}")]
+    CypherLower(#[from] fluree_db_cypher::LowerError),
+
     /// Turtle parse errors
     #[error("Turtle parse error: {0}")]
     Turtle(#[from] fluree_graph_turtle::TurtleError),
@@ -302,6 +313,17 @@ impl ApiError {
         diagnostics: Vec<fluree_db_sparql::Diagnostic>,
     ) -> Self {
         ApiError::Sparql {
+            message: message.into(),
+            diagnostics,
+        }
+    }
+
+    /// Create a Cypher error with diagnostics
+    pub fn cypher(
+        message: impl Into<String>,
+        diagnostics: Vec<fluree_db_cypher::Diagnostic>,
+    ) -> Self {
+        ApiError::Cypher {
             message: message.into(),
             diagnostics,
         }

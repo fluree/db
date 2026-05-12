@@ -84,13 +84,16 @@ fn lower_return<E: IriEncoder>(
                 saw_star = true;
             }
             Expr::Var(v) => {
-                let id = if let Some(alias) = &item.alias {
-                    ctx.intern_var(&alias.name);
-                    ctx.intern_var(&v.name)
-                } else {
-                    ctx.intern_var(&v.name)
-                };
-                vars.push(id);
+                if item.alias.is_some() {
+                    // RETURN ... AS alias is parsed but the v1 lower
+                    // path doesn't yet rename the projected column —
+                    // returning the original variable would silently
+                    // discard the alias in the result schema.
+                    return Err(LowerError::unsupported(
+                        "RETURN ... AS alias is deferred in v1 — drop the alias for now",
+                    ));
+                }
+                vars.push(ctx.intern_var(&v.name));
             }
             other => {
                 return Err(LowerError::unsupported(format!(

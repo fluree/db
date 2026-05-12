@@ -34,20 +34,19 @@ async fn cypher_match_labeled_node_finds_jsonld_typed_subject() {
     });
     let committed = fluree.insert(ledger0, &txn).await.expect("seed");
 
-    // Cypher: MATCH (n:Person) RETURN n
-    // With the default context's `ex:` prefix unavailable in Cypher
-    // (the resolver only knows `@vocab` and full-term mappings), we
-    // need to wire the test ledger with an `@vocab` that resolves
-    // `Person` to `http://example.org/Person`.
-    // For v1 the resolver default is `http://example.org/` which
-    // matches the test's `ex:` namespace.
+    // With the resolver default `@vocab = http://example.org/`, the
+    // Cypher label `Person` resolves to `http://example.org/Person` —
+    // the same IRI the JSON-LD insert produced via the `ex:` prefix.
     let db = graphdb_from_ledger(&committed.ledger);
-    let result = fluree.query_cypher(&db, "MATCH (n:Person) RETURN n").await;
-
-    // Even if execution fails for some downstream reason (e.g.,
-    // formatter expectations), parse + lower should succeed.
-    // The smoke test here is that the query reached the executor.
-    let _ = result; // do not assert on rows yet — formatter wiring follow-up
+    let result = fluree
+        .query_cypher(&db, "MATCH (n:Person) RETURN n")
+        .await
+        .expect("cypher query");
+    assert_eq!(
+        result.row_count(),
+        1,
+        "expected exactly one row for the lone Person"
+    );
 }
 
 #[tokio::test]

@@ -106,26 +106,31 @@ semantics. The cardinality contract:
 ### Reads
 
 ```text
-MATCH / OPTIONAL MATCH / WHERE / RETURN [DISTINCT] / ORDER BY /
-SKIP / LIMIT / UNION [ALL] / EXISTS { ... }
+MATCH / OPTIONAL MATCH / WHERE / RETURN [DISTINCT]
+ORDER BY / SKIP / LIMIT
 ```
 
 - Node patterns with labels and/or inline properties.
-- Directed typed relationships, alternations (`[:T1|T2]`), inverse
-  direction (`<-[:T]-`).
+- Directed typed relationships and type alternatives (`[:T1|T2]`,
+  lowered to a `Union` of concrete-predicate triples).
+- Inverse direction (`<-[:T]-`).
 - Untyped relationships (`[r]`) — predicate is variable, system
   facts hidden via the existing `include_system_facts = false`
   filter.
-- WHERE expressions: comparison, AND/OR/NOT, arithmetic +/-/*//,
+- `WHERE` expressions: comparison, AND/OR/NOT, arithmetic +/-/*//,
   STARTS WITH / ENDS WITH / CONTAINS, IS NULL / IS NOT NULL.
-- Aggregates: `count(*)`, `count(x)`, `sum`, `avg`, `min`, `max`.
-- ORDER BY (variable keys), SKIP, LIMIT.
+- ORDER BY (variable keys only), SKIP, LIMIT.
+- `RETURN n`, `RETURN n, m`, `RETURN *`, `RETURN DISTINCT ...`.
 
 ### Writes
 
 ```text
 CREATE (a:Label {p:v})-[:T {q:w}]->(b:Label2)
 ```
+
+Lowered through the public `fluree_db_transact::lower_cypher_update`
+entry point — a top-level API wrapper is not yet exposed alongside
+`Fluree::query_cypher`.
 
 - Directed typed relationships emit base triple + reifier bundle
   (LPG-mode default for Cypher).
@@ -134,8 +139,7 @@ CREATE (a:Label {p:v})-[:T {q:w}]->(b:Label2)
 
 ## v1 deferred — what to expect later
 
-These produce a clear error today. They will land in follow-on
-slices.
+These produce a clear error today and land in follow-on slices.
 
 - `MATCH (n)` without label/property/relationship constraint.
 - Undirected relationships `-[r]-`.
@@ -143,6 +147,14 @@ slices.
 - Path values `MATCH p = (...)`.
 - `shortestPath`, `allShortestPaths`.
 - `WITH` subquery boundary, `UNWIND`.
+- `UNION` / `UNION ALL` (type alternation `[:T1|T2]` already lowers
+  through `Union` internally — top-level `UNION` between full clauses
+  is the deferred piece).
+- `EXISTS { ... }` in expression position.
+- Aggregates (`count(*)`, `count(x)`, `sum`, `avg`, `min`, `max`,
+  `collect`).
+- `RETURN expr AS alias` — projection aliases not yet wired into the
+  result schema.
 - `collect(...)`, `labels(...)`, `keys(...)`, `properties(...)`,
   `type(r)`, `id(...)`, list/map functions generally.
 - `SET / REMOVE / DELETE / DETACH DELETE / MERGE`.
