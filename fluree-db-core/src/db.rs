@@ -63,19 +63,33 @@ pub struct LedgerSnapshotMetadata {
     pub has_annotations: bool,
     /// Optional inline pointer to the on-disk annotation arenas.
     ///
-    /// Combined with `has_annotations`:
-    /// - `(false, None)` — hard guarantee: zero attachments.
-    /// - `(true, Some(_))` — builder ran; arenas authoritative
-    ///   through `max_t`, novelty covers the tail.
-    /// - `(true, None)` — pre-builder transitional state; readers
-    ///   fall back to scan, cascade still runs.
-    /// - `(false, Some(_))` is an invariant violation; the FIR6
-    ///   encoder coerces the sticky bit when an arena is present.
-    ///
-    /// Pre-builder: always `None`; the cascade fast-path uses
-    /// `has_annotations` instead. Builder slice (M2b/3) populates
-    /// this field; downstream slices migrate readers off the boolean.
+    /// Combined with `has_annotations` and `had_annotation_arena`:
+    /// - `has_annotations=false, annotation_index=None` — hard
+    ///   guarantee: zero attachments.
+    /// - `has_annotations=true, annotation_index=Some(_)` — builder
+    ///   ran; arenas authoritative through `max_t`, novelty covers
+    ///   the tail.
+    /// - `has_annotations=true, annotation_index=None,
+    ///   had_annotation_arena=false` — fresh annotation-bearing
+    ///   import or never-sealed state. Readers fall back to scan;
+    ///   provider may bootstrap an `Authoritative` arena from a
+    ///   one-time base-index scan.
+    /// - `has_annotations=true, annotation_index=None,
+    ///   had_annotation_arena=true` — defensive-drop / lost
+    ///   coverage. Readers fall back to scan; the provider MUST NOT
+    ///   resurrect an `Authoritative` arena from a live-only scan
+    ///   (historical retract/reassert rows would be lost).
+    /// - `has_annotations=false, annotation_index=Some(_)` is an
+    ///   invariant violation; the FIR6 encoder coerces the sticky
+    ///   bit when an arena is present.
     pub annotation_index: Option<crate::AnnotationIndexRoot>,
+    /// Sticky bit: `true` once an annotation arena has *ever* been
+    /// sealed for this ledger. Distinguishes a fresh
+    /// annotation-bearing import (never sealed → safe to bootstrap
+    /// via base-index scan) from a defensive-drop state (was sealed,
+    /// arena later dropped → must stay scan-fallback). Once set,
+    /// never cleared — even when the indexer drops the arena.
+    pub had_annotation_arena: bool,
 }
 
 /// Database value at a specific point in time.
@@ -169,10 +183,16 @@ pub struct LedgerSnapshot {
     pub has_annotations: bool,
     /// On-disk annotation-arena pointer (forward/reverse branch CIDs +
     /// stats). See `crate::annotation_index` for the truth table that
-    /// pairs this field with `has_annotations`. `None` until the M2b
-    /// builder populates it; cascade fast-path consults
-    /// `has_annotations` in the meantime.
+    /// pairs this field with `has_annotations` and
+    /// `had_annotation_arena`.
     pub annotation_index: Option<crate::AnnotationIndexRoot>,
+    /// Sticky bit: `true` once this ledger has ever sealed an
+    /// annotation arena. Carried in `IndexRoot`'s flag bits; gates
+    /// the `ApiAttachmentEventsProvider` base-index scan-fallback
+    /// so a defensive-drop state (`has_annotations=true,
+    /// annotation_index=None, had_annotation_arena=true`) doesn't
+    /// get its history reconstructed from a live-only scan.
+    pub had_annotation_arena: bool,
 }
 
 impl Clone for LedgerSnapshot {
@@ -194,6 +214,7 @@ impl Clone for LedgerSnapshot {
             graph_registry: self.graph_registry.clone(),
             has_annotations: self.has_annotations,
             annotation_index: self.annotation_index.clone(),
+            had_annotation_arena: self.had_annotation_arena,
             content_store: self.content_store.clone(),
         }
     }
@@ -247,6 +268,7 @@ impl LedgerSnapshot {
             graph_registry: GraphRegistry::new_for_ledger(ledger_id),
             has_annotations: false,
             annotation_index: None,
+            had_annotation_arena: false,
             content_store: None,
         }
     }
@@ -285,6 +307,7 @@ impl LedgerSnapshot {
             graph_registry,
             has_annotations: meta.has_annotations,
             annotation_index: meta.annotation_index,
+            had_annotation_arena: meta.had_annotation_arena,
             content_store: None,
         })
     }
@@ -609,6 +632,14 @@ fn decode_fir6_metadata(bytes: &[u8]) -> std::io::Result<LedgerSnapshotMetadata>
     const FLAG_HAS_ANNOTATION_INDEX: u8 = 1 << 7;
     let has_annotations = flags & FLAG_HAS_ANNOTATIONS != 0;
     let has_annotation_index_section = flags & FLAG_HAS_ANNOTATION_INDEX != 0;
+
+    // Extended-flags byte at bytes[6] (must match
+    // binary-index IndexRoot's `FLAG_EXT_*` set). Old roots
+    // wrote `0u16` to this position so they decode with all
+    // extended flags = false.
+    const FLAG_EXT_HAD_ANNOTATION_ARENA: u8 = 1 << 0;
+    let flags_ext = bytes[6];
+    let had_annotation_arena = flags_ext & FLAG_EXT_HAD_ANNOTATION_ARENA != 0;
 
     #[inline]
     fn ensure(bytes: &[u8], pos: usize, need: usize, ctx: &str) -> std::io::Result<()> {
@@ -952,6 +983,7 @@ fn decode_fir6_metadata(bytes: &[u8]) -> std::io::Result<LedgerSnapshotMetadata>
         graph_iris,
         has_annotations,
         annotation_index,
+        had_annotation_arena,
     })
 }
 
@@ -1050,6 +1082,7 @@ mod tests {
             graph_iris: vec![],
             has_annotations: false,
             annotation_index: None,
+            had_annotation_arena: false,
         })
         .unwrap();
 

@@ -723,7 +723,7 @@ impl super::Parser<'_> {
                 let r_span = self.stream.current_span();
                 self.stream.advance(); // consume `~`
                 let r = self.parse_reifier_id_after_tilde();
-                last_span = r.as_ref().map(|x| x.span()).unwrap_or(r_span);
+                last_span = r.as_ref().map(ReifierId::span).unwrap_or(r_span);
                 reifier = r;
             } else if self.stream.check(&TokenKind::AnnotationOpen) {
                 if block.is_some() {

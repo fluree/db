@@ -77,20 +77,57 @@ impl AttachmentEventsProvider for ApiAttachmentEventsProvider {
         // here the indexer's arena builder early-returns and the
         // arena never seals.
         //
-        // When we see empty running events AND the snapshot's sticky
-        // bit is set AND the snapshot has range-providing index
-        // backing, walk the base index once for `f:reifies*` flakes,
-        // decode each bundle into an `EdgeKey`, and surface the
-        // result as `Authoritative` — a complete event set sourced
-        // from the indexed flakes themselves.
+        // The fallback walks the base index for `f:reifies*` flakes
+        // and surfaces the result as `Authoritative` — a complete
+        // event set sourced from the indexed live state. The scan
+        // **must only fire when no arena has *ever* been sealed**
+        // for this ledger — i.e. the first reindex after a fresh
+        // annotation-bearing import. Two states look identical at
+        // the snapshot level (`has_annotations=true,
+        // annotation_index=None`):
         //
-        // The scan is gated on `snapshot.has_annotations` so non-
-        // annotation ledgers pay nothing. It runs at most once per
-        // reindex pass (the resulting arena is sealed afterward and
-        // the running overlay covers future events).
+        //   - fresh import / never sealed
+        //     (`had_annotation_arena=false`) — safe to bootstrap.
+        //   - defensive-drop after a prior seal
+        //     (`had_annotation_arena=true`) — must NOT bootstrap.
+        //     The dropped arena carried historical retract/reassert
+        //     rows that aren't present in the currently-live base
+        //     index. A live-only `Authoritative` reseal would
+        //     silently lose that history. Stay in scan-fallback;
+        //     the next pass with `Augment` coverage from the running
+        //     overlay can reseal correctly.
+        //
+        // The sticky `had_annotation_arena` bit (set on first seal,
+        // never cleared, plumbed through `IndexRoot.had_annotation_arena`
+        // and surfaced on `LedgerSnapshot.had_annotation_arena`) is
+        // the only signal that distinguishes the two states.
+        //
+        // Full gate (in order of cheapness):
+        //   (i)   running overlay is empty,
+        //   (ii)  loaded view exists,
+        //   (iii) snapshot.has_annotations,
+        //   (iv)  snapshot.annotation_index.is_none(),
+        //   (v)   !snapshot.had_annotation_arena.
+        // The scan itself further gates on `snapshot.has_annotations`
+        // inside `scan_base_index_for_attachment_events`, so
+        // non-annotation ledgers pay nothing even if the cheap
+        // checks pass.
         if result.events.is_empty() {
-            if let Some(events) = scan_base_index_for_attachment_events(manager, ledger_id).await {
-                return Some(AttachmentEventCoverage::Authoritative(events));
+            let load_view = manager.get_loaded_view(ledger_id).await;
+            let bootstrap_eligible = load_view
+                .as_ref()
+                .map(|v| {
+                    v.snapshot.has_annotations
+                        && v.snapshot.annotation_index.is_none()
+                        && !v.snapshot.had_annotation_arena
+                })
+                .unwrap_or(false);
+            if bootstrap_eligible {
+                if let Some(events) =
+                    scan_base_index_for_attachment_events(manager, ledger_id).await
+                {
+                    return Some(AttachmentEventCoverage::Authoritative(events));
+                }
             }
         }
 
@@ -102,18 +139,29 @@ impl AttachmentEventsProvider for ApiAttachmentEventsProvider {
 }
 
 /// Walk the running ledger's base index for `f:reifies*` flakes and
-/// reconstruct the complete attachment-event set. Returns `None` when:
+/// reconstruct the currently-live attachment-event set. Returns `None`
+/// when:
 ///
 /// - the ledger isn't loaded into the manager,
 /// - the snapshot's sticky bit is clear (non-annotation ledger),
 /// - the snapshot has no range provider (no base index to scan), or
 /// - any structural inconsistency would corrupt the event set.
 ///
-/// The scan reads `POST f:reifiesSubject ?any` to enumerate candidate
-/// annotation subjects across every graph the snapshot exposes, then
-/// per-candidate fetches the full `f:reifies*` bundle via `SPOT s=?ann`
-/// and decodes it through `EdgeKey::from_reifies_facts`. Malformed
-/// bundles are skipped (consistent with `AttachmentNovelty::observe_flakes`).
+/// **Caller contract:** must only invoke when no arena exists yet
+/// (`snapshot.annotation_index.is_none()`). The scan reconstructs the
+/// currently-live event set only — it does not see retract/reassert
+/// history — so using it to "refresh" an existing arena would drop
+/// historical rows.
+///
+/// Strategy: for each reserved `f:reifiesSubject` / `f:reifiesPredicate`
+/// / `f:reifiesObject` / `f:reifiesLang` predicate, walk PSOT
+/// (`predicate = pX`) across every graph the snapshot exposes, group
+/// flakes in memory by annotation SID, and decode each bundle through
+/// `EdgeKey::from_reifies_facts`. We use PSOT-and-group rather than
+/// per-SID SPOT scans because a SPOT scan with a constant blank-node
+/// subject (namespace_code = 0) does not return rows reliably across
+/// all backends. Malformed bundles are skipped (consistent with
+/// `AttachmentNovelty::observe_flakes`).
 async fn scan_base_index_for_attachment_events(
     manager: &LedgerManager,
     ledger_id: &str,
@@ -121,7 +169,7 @@ async fn scan_base_index_for_attachment_events(
     use fluree_db_core::comparator::IndexType;
     use fluree_db_core::edge::EdgeKey;
     use fluree_db_core::range::{range_with_overlay, RangeMatch, RangeOptions, RangeTest};
-    use fluree_db_core::{is_reserved_reifies_predicate, FlakeValue, Sid};
+    use fluree_db_core::Sid;
     use std::collections::{BTreeMap, HashSet};
 
     let view = manager.get_loaded_view(ledger_id).await?;
@@ -209,8 +257,6 @@ async fn scan_base_index_for_attachment_events(
                 .map(|f| f.t)
                 .unwrap_or(0);
             events.push((edge_key, ann_sid, t, /* op = */ true));
-            // FlakeValue is unused — suppress the warning.
-            let _ = std::marker::PhantomData::<FlakeValue>;
         }
     }
 

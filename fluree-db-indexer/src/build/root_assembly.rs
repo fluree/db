@@ -327,6 +327,12 @@ pub(crate) async fn encode_and_write_root_v6(
         sketch_ref: inputs.sketch_ref,
         has_annotations,
         annotation_index: None,
+        // Sticky bit flipped to `true` below if the rebuild path
+        // seals an `Authoritative` arena. Rebuilds always start
+        // from scratch with no prior root, so this is the only
+        // signal carried forward — defensive-drop semantics live
+        // exclusively on the incremental path.
+        had_annotation_arena: false,
     };
 
     // `IndexStats.size` is defined as total commit data size (bytes) for the ledger.
@@ -403,6 +409,13 @@ pub(crate) async fn encode_and_write_root_v6(
                     ann.max_t,
                     job_t
                 );
+            }
+            if result.new_index.is_some() {
+                // Sticky flag: an arena was sealed at this t. Even if
+                // a later pass defensively drops it, this bit stays
+                // true so the provider's bootstrap scan-fallback is
+                // suppressed.
+                root.had_annotation_arena = true;
             }
             root.annotation_index = result.new_index;
             // No previous arena → no leaves to GC; replaced_leaf_cids

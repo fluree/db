@@ -227,6 +227,17 @@ impl IncrementalRootBuilder {
             self.replaced_cids.push(prev.reverse_branch_cid.clone());
         }
         self.replaced_cids.extend(previous_leaf_cids);
+        // Sticky bit: flip `had_annotation_arena` to `true` the
+        // moment any arena is sealed, and *never* clear it on
+        // subsequent calls — including when this call sets
+        // `new_index = None` (defensive drop). Without this, the
+        // post-drop root would look identical to a fresh import
+        // and the provider's bootstrap base-index scan-fallback
+        // could resurrect a live-only `Authoritative` arena,
+        // losing historical retract/reassert rows.
+        if new_index.is_some() {
+            self.root.had_annotation_arena = true;
+        }
         self.root.annotation_index = new_index;
     }
 

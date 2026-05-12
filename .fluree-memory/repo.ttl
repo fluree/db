@@ -1168,6 +1168,20 @@ mem:fact-01km06dhjzpgyvbs1yc5h0h28e a mem:Fact ;
     mem:branch "feature/default-context" ;
     mem:createdAt "2026-03-18T10:03:48.703812+00:00"^^xsd:dateTime .
 
+mem:fact-01krb618x0axad5mj8jev4ej0s a mem:Fact ;
+    mem:content "Annotation hydration arena lookups use full EdgeKey identity. The current read path is HydrationFormatter::arena_lookup_annotations -> AnnotationArenaReader::current_annotations_merged(edge_key, novelty_events, t), with novelty events from collect_forward_events(edge_key). The scan fallback decodes candidate bundles with EdgeKey::from_reifies_facts and compares cand_edge == edge_key, so language-tagged literal lookup depends on writers emitting f:reifiesLang to populate EdgeKey.lang." ;
+    mem:tag "EdgeKey" ;
+    mem:tag "annotation-arena" ;
+    mem:tag "edge-annotations" ;
+    mem:tag "hydration" ;
+    mem:tag "lang" ;
+    mem:scope mem:repo ;
+    mem:artifactRef "fluree-db-api/src/format/hydration.rs" ;
+    mem:artifactRef "fluree-db-binary-index/src/annotation_arena/reader.rs" ;
+    mem:artifactRef "fluree-db-core/src/edge.rs" ;
+    mem:branch "feature/edge-annotations" ;
+    mem:createdAt "2026-05-11T09:31:32.640122+00:00"^^xsd:dateTime .
+
 mem:fact-01kjg3zmevnz6mdn53wkqn08p0 a mem:Fact ;
     mem:content "Fluree uses CIDv1 for all content-addressed blobs. Implementation in fluree-db-core/src/content_id.rs wrapping `cid` crate.\n\nFormat: CIDv1 = version(1) + multicodec + multihash(SHA2-256, 32 bytes). Multicodec values in private-use range 0x300000+: Commit(0x300001), Txn(0x300002), IndexRoot(0x300003), IndexBranch/Leaf, DictBlob, Garbage, LedgerConfig, StatsSketch, GraphSourceSnapshot, SpatialIndex.\n\nKey APIs: ContentId::new(kind, bytes) hashes with SHA-256; verify(bytes) re-hashes and compares (NOT valid for commit-v2 which excludes trailing hash+sig); digest_hex() returns 64-char hex; Display uses base32-lower multibase." ;
     mem:tag "CIDv1" ;

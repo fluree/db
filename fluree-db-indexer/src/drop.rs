@@ -242,6 +242,7 @@ mod tests {
             garbage,
             sketch_ref: None,
             has_annotations: annotation_index.is_some(),
+            had_annotation_arena: annotation_index.is_some(),
             annotation_index,
             o_type_table: IndexRoot::build_o_type_table(&[], &[]),
             ns_split_mode: fluree_db_core::ns_encoding::NsSplitMode::default(),

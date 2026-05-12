@@ -443,7 +443,7 @@ fn reject_user_authored_reifies_in_quad_pattern(
                 prologue,
             )?,
             QuadPatternElement::Graph { triples, .. } => {
-                reject_user_authored_reifies(triples, prologue)?
+                reject_user_authored_reifies(triples, prologue)?;
             }
         }
     }

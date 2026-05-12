@@ -224,6 +224,26 @@ pub struct IndexRoot {
     /// `FLAG_HAS_ANNOTATIONS` on the wire, so the cascade fast-path
     /// can never desynchronize from a populated arena.
     pub annotation_index: Option<fluree_db_core::AnnotationIndexRoot>,
+
+    /// Sticky bit: `true` once an annotation arena has *ever* been
+    /// sealed for this ledger. Distinguishes a fresh
+    /// annotation-bearing import or never-sealed state
+    /// (`has_annotations=true, annotation_index=None,
+    /// had_annotation_arena=false`) — safe for a one-time
+    /// base-index `Authoritative` bootstrap scan — from a
+    /// defensive-drop state
+    /// (`has_annotations=true, annotation_index=None,
+    /// had_annotation_arena=true`) — historical retract/reassert
+    /// rows already lived in the dropped arena, so the provider
+    /// must stay in scan-fallback rather than reconstruct
+    /// `Authoritative` from a live-only PSOT scan.
+    ///
+    /// Once set, never cleared by any root assembly path. Carried
+    /// in the FIR6 extended-flags byte (low byte of the
+    /// historically-zero `pad(2)` header field); backward
+    /// compatibility: old roots have `pad = 0` so this decodes to
+    /// `false`, matching the "never sealed" state.
+    pub had_annotation_arena: bool,
 }
 
 impl IndexRoot {
@@ -524,6 +544,13 @@ impl IndexRoot {
     /// present.
     const FLAG_HAS_ANNOTATION_INDEX: u8 = 1 << 7;
 
+    /// Extended-flags bit (lives in the low byte of the
+    /// historically-zero `pad(2)` header field, i.e. `data[6]`).
+    /// `1` once an annotation arena has been sealed at any point
+    /// in this ledger's index history; never cleared by subsequent
+    /// root assembly. See `IndexRoot.had_annotation_arena`.
+    const FLAG_EXT_HAD_ANNOTATION_ARENA: u8 = 1 << 0;
+
     /// Encode to the binary FIR6 wire format.
     ///
     /// Determinism: namespaces sorted by ns_code, named graphs by g_id,
@@ -574,7 +601,15 @@ impl IndexRoot {
             0
         });
         buf.push(flags);
-        buf.extend_from_slice(&0u16.to_le_bytes()); // pad
+        // Extended-flags byte (low byte of historically-zero pad).
+        // High byte stays zero (reserved for future extension).
+        let flags_ext = if self.had_annotation_arena {
+            Self::FLAG_EXT_HAD_ANNOTATION_ARENA
+        } else {
+            0
+        };
+        buf.push(flags_ext);
+        buf.push(0); // reserved high pad byte
         buf.extend_from_slice(&self.index_t.to_le_bytes());
         buf.extend_from_slice(&self.base_t.to_le_bytes());
 
@@ -757,11 +792,17 @@ impl IndexRoot {
         }
 
         let flags = data[5];
-        let mut pos = 8; // skip pad(2)
+        // Extended-flags byte at data[6]; data[7] reserved.
+        // Old encoders (FIR6 with the original `pad(2)`) wrote
+        // `0u16` here, so old roots decode to all extended flags
+        // = false — matching the "never sealed an arena" state.
+        let flags_ext = data[6];
+        let mut pos = 8; // skip past flags_ext + reserved
         let index_t = read_i64_at(data, &mut pos)?;
         let base_t = read_i64_at(data, &mut pos)?;
         let lex_sorted_string_ids = (flags & Self::FLAG_LEX_SORTED_STRING_IDS) != 0;
         let has_annotations = (flags & Self::FLAG_HAS_ANNOTATIONS) != 0;
+        let had_annotation_arena = (flags_ext & Self::FLAG_EXT_HAD_ANNOTATION_ARENA) != 0;
 
         // Ledger ID
         let ledger_id = read_string(data, &mut pos)?;
@@ -1008,6 +1049,7 @@ impl IndexRoot {
             sketch_ref,
             has_annotations,
             annotation_index,
+            had_annotation_arena,
         })
     }
     /// Collect all CAS content-artifact CIDs referenced **directly** by this root.
@@ -1307,6 +1349,7 @@ mod tests {
             sketch_ref: None,
             has_annotations: false,
             annotation_index: None,
+            had_annotation_arena: false,
             ns_split_mode: fluree_db_core::ns_encoding::NsSplitMode::default(),
         }
     }
@@ -1397,6 +1440,60 @@ mod tests {
         assert!(snap.has_annotations, "snapshot path also sees sticky bit");
         let snap_ann = snap.annotation_index.expect("metadata path roundtrip");
         assert_eq!(snap_ann, ann);
+    }
+
+    #[test]
+    fn fir6_round_trip_had_annotation_arena_sticky() {
+        // The sticky bit lives in the extended-flags byte at
+        // `data[6]` (low byte of the historically-zero `pad(2)`
+        // header field). Old encoders wrote `0u16` there, so old
+        // roots decode to `had_annotation_arena = false` —
+        // matching the "never sealed" state.
+        let mut root = minimal_root_v6();
+        assert!(
+            !root.had_annotation_arena,
+            "minimal helper starts with the bit clear"
+        );
+        let bytes_clear = root.encode();
+        assert_eq!(
+            bytes_clear[6] & IndexRoot::FLAG_EXT_HAD_ANNOTATION_ARENA,
+            0,
+            "extended-flags byte (data[6]) carries the bit; clear when had_annotation_arena=false"
+        );
+        let decoded_clear = IndexRoot::decode(&bytes_clear).unwrap();
+        assert!(!decoded_clear.had_annotation_arena);
+
+        // Flip the bit, re-encode, verify byte position + decode.
+        root.had_annotation_arena = true;
+        let bytes_set = root.encode();
+        assert_ne!(
+            bytes_set[6] & IndexRoot::FLAG_EXT_HAD_ANNOTATION_ARENA,
+            0,
+            "extended-flags byte must reflect had_annotation_arena=true"
+        );
+        let decoded_set = IndexRoot::decode(&bytes_set).unwrap();
+        assert!(decoded_set.had_annotation_arena);
+
+        // Metadata-only path (`LedgerSnapshot::from_root_bytes`)
+        // must surface the same value.
+        let snap = fluree_db_core::LedgerSnapshot::from_root_bytes(&bytes_set).unwrap();
+        assert!(
+            snap.had_annotation_arena,
+            "metadata-only decode also surfaces the sticky bit"
+        );
+
+        // Backward compat: an artificially-zeroed extended-flags
+        // byte (simulating a pre-this-change FIR6 root) decodes
+        // to `had_annotation_arena = false`, NOT a panic or
+        // unsupported-version error.
+        let mut bytes_legacy = bytes_set.clone();
+        bytes_legacy[6] = 0;
+        bytes_legacy[7] = 0;
+        let decoded_legacy = IndexRoot::decode(&bytes_legacy).unwrap();
+        assert!(
+            !decoded_legacy.had_annotation_arena,
+            "old roots with pad=0 decode to bit clear (the 'never sealed' state)"
+        );
     }
 
     #[test]

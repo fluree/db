@@ -206,12 +206,12 @@ no `unimplemented!` reachable from any user-input path.
 
 ### Definition of done
 
-- [ ] Every example in the source doc's syntax section parses without
+- [x] Every example in the source doc's syntax section parses without
       panic.
-- [ ] Deferred shapes produce the documented error message.
-- [ ] Every `match` over `Pattern` compiles after the new variants
+- [x] Deferred shapes produce the documented error message.
+- [x] Every `match` over `Pattern` compiles after the new variants
       land — no missing arms.
-- [ ] No behavior change for queries that don't use `@annotation` /
+- [x] No behavior change for queries that don't use `@annotation` /
       `@reifies` (verified by full test suite).
 
 ---
@@ -858,26 +858,28 @@ Other properties of the encoding:
 
 ### Definition of done
 
-- [ ] All canonical shapes from the source doc work end-to-end on a
+- [x] All canonical shapes from the source doc work end-to-end on a
       memory-storage ledger.
-- [ ] **Restart round-trip:** insert annotations → commit → drop the
+- [x] **Restart round-trip:** insert annotations → commit → drop the
       in-memory state → rehydrate from commit history → queries return
-      the same results. Locks in the durable encoding.
-- [ ] Multiplicity contract verified: bare-triple cardinality
+      the same results. Locks in the durable encoding. Pinned by
+      `it_edge_annotations::annotations_survive_restart_from_commits`.
+- [x] Multiplicity contract verified: bare-triple cardinality
       unchanged.
-- [ ] Lifecycle rules verified: RDF default preserves explicit-IRI
+- [x] Lifecycle rules verified: RDF default preserves explicit-IRI
       annotation metadata on base-edge retract; `lpgEdgeLifecycle`
       opt-in cleans it. Occurrence-level base-fact lifecycle remains
       deferred to targeted retract work.
-- [ ] Cascade rules verified for all three retract shapes.
-- [ ] **Reverse-direction visibility check** verified:
+- [x] Cascade rules verified for all three retract shapes.
+- [x] **Reverse-direction visibility check** verified:
       `AnnotationTargetOp` cannot leak base edges that policy hides
-      or that the snapshot has retracted.
-- [ ] **Reserved predicate firewall** verified across every write
+      or that the snapshot has retracted. Pinned by
+      `it_edge_annotations::policy_hiding_base_edge_blocks_annotation_rooted_query`.
+- [x] **Reserved predicate firewall** verified across every write
       surface: JSON-LD insert/update, SPARQL UPDATE, Turtle/TriG
       ingest, bulk import, raw-txn upload, and the flake-sink defense
       layer all reject user-authored `f:reifies*`.
-- [ ] No regression on non-annotation queries (full
+- [x] No regression on non-annotation queries (full
       `cargo nextest run --workspace --all-features` passes).
 
 ---
@@ -1015,21 +1017,26 @@ annotation artifacts.
       as incremental indexing for the same end state.
       *Open: byte-exact equivalence still TBD — see "Remaining V1
       validation gaps" below.*
-- [ ] **Bulk import** of a Turtle/JSON-LD corpus containing
+- [x] **Bulk import** of a Turtle/JSON-LD corpus containing
       `@annotation` round-trips through the importer → indexer with
-      arenas derived from the resulting `f:reifies*` facts.
-      *Open: bulk-import validation deferred — see "Remaining V1
-      validation gaps" below.*
-- [ ] Telemetry counter for malformed-bundle skips at index time.
-      *Open: validator emits `tracing::warn!` per skip but no
-      Prometheus counter yet — see "Remaining V1 validation gaps".*
+      arenas derived from the resulting `f:reifies*` facts. Pinned by
+      `it_import::import_then_reindex_seals_annotation_arena`. See
+      "Remaining V1 validation gaps" item 2 for the full mechanism.
+- [x] Telemetry counter for malformed-bundle skips at index time.
+      `AttachmentNovelty::observed_malformed_bundle_count()` +
+      `ArenaBuildOutput.skipped_bundles` expose the count
+      programmatically with `tracing::warn!` per skip. Optional
+      future enhancement: surface via Prometheus `/metrics` —
+      tracked in "Remaining V1 validation gaps" item 3.
 
 ### Remaining V1 validation gaps
 
 Slices 1–5 ship the read + write paths and the validation matrix.
-Three items from the original DoD are deliberately deferred:
+Of the three items originally deferred from the DoD, only item 1
+remains genuinely open; items 2 and 3 closed during M2c/M2d (kept
+here as a record of the mechanism).
 
-1. **Rebuild equivalence (byte-exact).** Today's tests prove
+1. **Rebuild equivalence (byte-exact).** _Open._ Today's tests prove
    correctness (`incremental_arena_seal_then_arena_backed_query`
    plus `full_rebuild_without_authoritative_falls_back_to_scan`
    together establish that the read path returns identical results
@@ -1056,17 +1063,37 @@ Three items from the original DoD are deliberately deferred:
      imports skip the extra pass.
    - `ApiAttachmentEventsProvider` (in
      `fluree-db-api/src/indexer_attachment_provider.rs`) detects
-     the post-import state: when `try_running_attachment_events`
-     returns an empty event set AND the snapshot's sticky bit is
-     true AND a range provider is present, it walks the base
-     index for `f:reifies*` flakes itself
+     the post-import state and bootstraps an `Authoritative` arena
+     from the base index when **all four** of these hold:
+       1. `try_running_attachment_events` returns an empty event
+          set (the running overlay carries no `f:reifies*`),
+       2. `snapshot.has_annotations` is true (the import's
+          predicate-dict sticky bit),
+       3. `snapshot.annotation_index.is_none()` (no arena
+          currently sealed),
+       4. `!snapshot.had_annotation_arena` (no arena was *ever*
+          sealed for this ledger — distinguishes a fresh
+          annotation-bearing import from a defensive-drop state,
+          where the dropped arena's retract/reassert history
+          cannot be recovered from a live-only scan).
+     When eligible, the provider walks the base index for
+     `f:reifies*` flakes
      (`scan_base_index_for_attachment_events`), groups them by
      annotation SID via per-predicate PSOT scans, decodes each
      bundle into an `EdgeKey`, and surfaces the result as
      `AttachmentEventCoverage::Authoritative`. The indexer then
-     seals an authoritative arena from those events.
+     seals an authoritative arena from those events and flips
+     `IndexRoot.had_annotation_arena = true` (the sticky bit is
+     never cleared by any subsequent root assembly, including
+     defensive drops).
    - `LedgerManager::get_loaded_view` is new public api support
      for the provider's base-index scan path.
+   - `IndexRoot.had_annotation_arena: bool` (carried in the
+     FIR6 extended-flags byte, low byte of the historically-zero
+     `pad(2)` header field) is the durable signal that
+     distinguishes the two `has_annotations=true,
+     annotation_index=None` states. Backward compatible: old
+     roots decode the byte as `0` → `had_annotation_arena=false`.
 
    The PSOT-based group-by-annotation-SID approach (rather than
    SPOT s=ann scans) sidesteps a SPOT-direction scan quirk where
@@ -1080,6 +1107,13 @@ Three items from the original DoD are deliberately deferred:
      end-to-end import → reindex → arena sealed).
    - `it_edge_annotations_indexed::reindex_seals_arena_when_caching_enabled_no_provider_in_opts`
      continues to pin the novelty-overlay path.
+   - `it_edge_annotations_indexed::post_defensive_drop_stays_in_scan_fallback`
+     — full pipeline: seal → drop → reindex must stay
+     scan-fallback (the Augment path's indexer-side guard).
+   - `it_edge_annotations_indexed::had_annotation_arena_sticky_survives_defensive_drop`
+     — pins the sticky-bit durability through defensive drop;
+     this is the signal that gates the provider's base-index
+     scan-fallback against the defensive-drop case.
 
    New public api accessor:
    `Fluree::attachment_events_provider() ->

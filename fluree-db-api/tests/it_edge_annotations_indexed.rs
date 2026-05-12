@@ -433,6 +433,108 @@ async fn post_defensive_drop_stays_in_scan_fallback() {
 }
 
 #[tokio::test]
+async fn had_annotation_arena_sticky_survives_defensive_drop() {
+    // Pins the High-finding fix: the sticky
+    // `IndexRoot.had_annotation_arena` bit must be set the first
+    // time an arena is sealed and must persist across a defensive
+    // drop (when the indexer drops the arena because it received
+    // Unknown / None coverage). Without this persistence, the
+    // post-drop root looks identical to a fresh annotation-bearing
+    // import and the provider's bootstrap base-index scan-fallback
+    // could resurrect a live-only `Authoritative` arena, losing
+    // historical retract/reassert rows.
+    //
+    // Setup mirrors `post_defensive_drop_stays_in_scan_fallback`:
+    // step A seals an arena with provider attached; step B drops
+    // it by running the indexer without provider. The new
+    // assertion is on the sticky bit itself.
+    let fluree = FlureeBuilder::memory()
+        .with_ledger_cache_config(fluree_db_api::LedgerManagerConfig::default())
+        .build_memory();
+    let ledger_id = "it/edge-annotations-indexed:sticky-arena-bit";
+
+    let (local_a, handle_a) =
+        support::start_background_indexer_with_attachments(&fluree, IndexerConfig::small());
+
+    local_a
+        .run_until(async move {
+            let ledger0 = genesis_ledger(&fluree, ledger_id);
+            let after_a = fluree
+                .insert(ledger0, &annotated_insert())
+                .await
+                .expect("step A insert");
+            let _pre_a = fluree
+                .ledger_cached(ledger_id)
+                .await
+                .expect("pre-step-A cached load");
+            support::trigger_index_and_wait(&handle_a, ledger_id, after_a.receipt.t).await;
+            support::wait_for_index_application(&fluree, ledger_id, after_a.receipt.t).await;
+
+            let after_step_a = fluree
+                .ledger_cached(ledger_id)
+                .await
+                .expect("cached load after step A reindex")
+                .snapshot()
+                .await
+                .to_ledger_state();
+            assert!(
+                after_step_a.snapshot.annotation_index.is_some(),
+                "step A: arena sealed via provider"
+            );
+            assert!(
+                after_step_a.snapshot.had_annotation_arena,
+                "step A: sticky bit set on first seal"
+            );
+
+            let (local_b, handle_b) = support::start_background_indexer_local(
+                fluree.backend().clone(),
+                Arc::new(fluree.nameservice_mode().clone()),
+                IndexerConfig::small(),
+            );
+            local_b
+                .run_until(async move {
+                    let extra_b = json!({
+                        "@context": ctx(),
+                        "@id": "ex:bob",
+                        "ex:name": "Bob"
+                    });
+                    let after_b = fluree
+                        .insert(after_step_a, &extra_b)
+                        .await
+                        .expect("step B insert");
+                    support::trigger_index_and_wait(&handle_b, ledger_id, after_b.receipt.t).await;
+                    support::wait_for_index_application(&fluree, ledger_id, after_b.receipt.t)
+                        .await;
+                    let after_step_b = fluree
+                        .ledger_cached(ledger_id)
+                        .await
+                        .expect("cached load after step B reindex")
+                        .snapshot()
+                        .await
+                        .to_ledger_state();
+                    assert!(
+                        after_step_b.snapshot.annotation_index.is_none(),
+                        "step B: no provider → defensive drop on the new root"
+                    );
+                    assert!(
+                        after_step_b.snapshot.has_annotations,
+                        "step B: f:reifies* sticky bit persists"
+                    );
+                    assert!(
+                        after_step_b.snapshot.had_annotation_arena,
+                        "step B: had_annotation_arena MUST persist through \
+                         defensive drop — without this the provider's \
+                         bootstrap scan-fallback can't distinguish defensive \
+                         drop from fresh import and would seal a live-only \
+                         arena, losing retract/reassert history"
+                    );
+                })
+                .await;
+        })
+        .await;
+}
+
+#[tokio::test]
 async fn storage_inspection_finds_arena_artifacts() {
     // After a successful arena seal, the index root's
     // forward_branch_cid and reverse_branch_cid must resolve to

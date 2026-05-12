@@ -1036,7 +1036,7 @@ impl crate::Fluree {
                 let caller_provider = indexer_config.attachment_events_provider.as_deref();
                 let api_provider = self.attachment_events_provider();
                 let chosen_caller = caller_provider;
-                let chosen_api = api_provider.as_ref().map(|p| p.as_ref());
+                let chosen_api = api_provider.as_ref().map(AsRef::as_ref);
                 let provider_ref: Option<&dyn fluree_db_indexer::AttachmentEventsProvider> =
                     chosen_caller.or(chosen_api);
                 if let Some(provider) = provider_ref {
