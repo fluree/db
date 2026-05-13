@@ -3923,13 +3923,19 @@ where
                 }
             }
 
-            is::IndexStats {
+            let mut stats = is::IndexStats {
                 flakes: id_stats.total_flakes,
                 size: 0,
                 properties: Some(properties),
                 classes: None,
                 graphs: Some(graphs),
-            }
+            };
+            // Wire `total_commit_size` into `stats.size` and per-graph sizes,
+            // mirroring `root_assembly::compose_root_v6` for the normal indexing
+            // path. Without this, `info` reports `size: 0` everywhere even
+            // though the IndexRoot itself carries `total_commit_size`.
+            stats.distribute_total_size_by_flakes(total_commit_size);
+            stats
         });
 
         // Build CLI import summary before IndexRoot consumes predicate_sids_v6.

@@ -294,32 +294,7 @@ pub(crate) async fn encode_and_write_root_v6(
     // `IndexStats.size` is defined as total commit data size (bytes) for the ledger.
     // The root carries this as `total_commit_size`; ensure stats reflect it.
     if let Some(stats) = root.stats.as_mut() {
-        stats.size = root.total_commit_size;
-
-        // Populate per-graph `stats.graphs[*].size` as a proportional allocation of
-        // total commit size based on each graph's flake count.
-        //
-        // This is an estimate (not exact storage bytes), but it avoids reporting 0
-        // and remains consistent across rebuild/incremental paths.
-        if let Some(graphs) = stats.graphs.as_mut() {
-            let total_flakes: u64 = graphs.iter().map(|g| g.flakes).sum();
-            if total_flakes > 0 && stats.size > 0 {
-                let total_size = stats.size;
-                let n = graphs.len();
-                let mut assigned: u64 = 0;
-                for (i, g) in graphs.iter_mut().enumerate() {
-                    if i + 1 == n {
-                        // Last graph gets remainder so sums match exactly.
-                        g.size = total_size.saturating_sub(assigned);
-                    } else {
-                        let part = ((total_size as u128) * (g.flakes as u128)
-                            / (total_flakes as u128)) as u64;
-                        g.size = part;
-                        assigned = assigned.saturating_add(part);
-                    }
-                }
-            }
-        }
+        stats.distribute_total_size_by_flakes(root.total_commit_size);
     }
 
     // Attach garbage manifest and prev_index if provided.
