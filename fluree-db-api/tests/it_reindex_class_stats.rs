@@ -258,6 +258,8 @@ async fn reindex_class_stats_report_correct_datatypes() {
                 "ex:active": true,
                 "ex:created": { "@value": "2024-01-02T03:04:05Z", "@type": "xsd:dateTime" },
                 "ex:start":   { "@value": "2024-01-02", "@type": "xsd:date" },
+                "ex:moon":    { "@value": "2024-03", "@type": "xsd:gYearMonth" },
+                "ex:anniv":   { "@value": "--03-15", "@type": "xsd:gMonthDay" },
                 "ex:peer": { "@id": "ex:thing2" }
             },
             {
@@ -268,6 +270,8 @@ async fn reindex_class_stats_report_correct_datatypes() {
                 "ex:active": false,
                 "ex:created": { "@value": "2024-02-03T04:05:06Z", "@type": "xsd:dateTime" },
                 "ex:start":   { "@value": "2024-02-03", "@type": "xsd:date" },
+                "ex:moon":    { "@value": "2024-04", "@type": "xsd:gYearMonth" },
+                "ex:anniv":   { "@value": "--07-04", "@type": "xsd:gMonthDay" },
                 "ex:peer": { "@id": "ex:thing1" }
             }
         ]
@@ -346,6 +350,16 @@ async fn reindex_class_stats_report_correct_datatypes() {
         lookup_tag("http://example.org/start"),
         ValueTypeTag::DATE.as_u8(),
         "ex:start should be xsd:date"
+    );
+    assert_eq!(
+        lookup_tag("http://example.org/moon"),
+        ValueTypeTag::G_YEAR_MONTH.as_u8(),
+        "ex:moon should be xsd:gYearMonth"
+    );
+    assert_eq!(
+        lookup_tag("http://example.org/anniv"),
+        ValueTypeTag::G_MONTH_DAY.as_u8(),
+        "ex:anniv should be xsd:gMonthDay"
     );
     assert_eq!(
         lookup_tag("http://example.org/peer"),
