@@ -880,7 +880,6 @@ where
                 let mut per_graph_classes = crate::stats::build_class_stat_entries(
                     &spot_class_stats,
                     &predicate_sids,
-                    &shared.dt_tags,
                     &language_tags,
                     &run_dir,
                     &shared.ns_prefixes,

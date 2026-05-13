@@ -21,8 +21,10 @@ pub const DT_REF_ID: u16 = u16::MAX;
 ///
 /// # Datatype keys
 ///
-/// The inner `u16` key is a `DatatypeDictId` for literal values, or
-/// [`DT_REF_ID`] (`u16::MAX`) for object references (`@id`).
+/// The inner `u16` key holds a [`ValueTypeTag`] value (`as_u8() as u16`) for
+/// literal values, or [`DT_REF_ID`] (`u16::MAX`) for object references (`@id`).
+/// Stored in the `ValueTypeTag` domain because the SPOT-merge collector only
+/// has access to the per-flake `o_type` byte, not the datatype dictionary.
 #[derive(Debug, Default)]
 pub struct SpotClassStats {
     /// (g_id, class_sid64) → instance count (number of subjects with this rdf:type)
@@ -44,7 +46,6 @@ pub struct SpotClassStats {
 pub fn build_class_stats_json(
     cs: &SpotClassStats,
     predicate_sids: &[(u16, String)],
-    dt_tags: &[ValueTypeTag],
     run_dir: &std::path::Path,
     namespace_codes: &HashMap<u16, String>,
 ) -> std::io::Result<Vec<serde_json::Value>> {
@@ -145,10 +146,8 @@ pub fn build_class_stats_json(
                                 .map(|&(&dt, &count)| {
                                     if dt == DT_REF_ID {
                                         serde_json::json!(["@id", count])
-                                    } else if let Some(tag) = dt_tags.get(dt as usize) {
-                                        serde_json::json!([tag.as_u8(), count])
                                     } else {
-                                        serde_json::json!([dt, count])
+                                        serde_json::json!([dt as u8, count])
                                     }
                                 })
                                 .collect();
@@ -179,7 +178,6 @@ pub fn build_class_stats_json(
 pub fn build_class_stat_entries(
     cs: &SpotClassStats,
     predicate_sids: &[(u16, String)],
-    dt_tags: &[ValueTypeTag],
     language_tags: &[String],
     run_dir: &std::path::Path,
     namespace_codes: &HashMap<u16, String>,
@@ -250,19 +248,17 @@ pub fn build_class_stat_entries(
                         let psid_pair = predicate_sids.get(p_id as usize)?;
                         let property_sid = Sid::new(psid_pair.0, &psid_pair.1);
 
-                        // Build per-datatype counts.
+                        // Build per-datatype counts. The collector stores
+                        // `ValueTypeTag::as_u8() as u16` (or `DT_REF_ID` for
+                        // refs), so we can cast directly back to u8 — no
+                        // dictionary lookup needed.
                         let mut datatypes: Vec<(u8, u64)> = dt_map
                             .iter()
-                            .map(|(&dt_dict_id, &count)| {
-                                let tag = if dt_dict_id == DT_REF_ID {
-                                    fluree_db_core::value_id::ValueTypeTag::JSON_LD_ID.as_u8()
+                            .map(|(&dt_value, &count)| {
+                                let tag = if dt_value == DT_REF_ID {
+                                    ValueTypeTag::JSON_LD_ID.as_u8()
                                 } else {
-                                    dt_tags
-                                        .get(dt_dict_id as usize)
-                                        .map(|t| t.as_u8())
-                                        .unwrap_or(
-                                            fluree_db_core::value_id::ValueTypeTag::UNKNOWN.as_u8(),
-                                        )
+                                    dt_value as u8
                                 };
                                 (tag, count)
                             })

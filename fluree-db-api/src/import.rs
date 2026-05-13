@@ -3911,7 +3911,6 @@ where
                 let mut per_graph_classes = fluree_db_indexer::stats::build_class_stat_entries(
                     cs,
                     &predicate_sids_v6,
-                    &[],
                     &uploaded_dicts.language_tags,
                     input.run_dir,
                     input.namespace_codes,

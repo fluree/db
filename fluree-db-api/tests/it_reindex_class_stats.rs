@@ -229,3 +229,127 @@ async fn reindex_class_stats_survive_retraction() {
     // If Person class disappeared entirely (0 instances → no entry), that's also acceptable
     // since build_class_stat_entries only emits classes with count > 0.
 }
+
+// Regression: SpotClassStatsCollector stores ValueTypeTag values into the
+// per-class `prop_dts` map (keyed by `ValueTypeTag::as_u8() as u16`). A prior
+// version of `build_class_stat_entries` mis-interpreted those keys as
+// `DatatypeDictId` indices into a `dt_tags` lookup table, producing wrong tags
+// post-reindex (xsd:integer→xsd:boolean, xsd:date→rdf:langString, …) and
+// `UNKNOWN` on the import path (which passed `&[]` for dt_tags).
+#[tokio::test]
+async fn reindex_class_stats_report_correct_datatypes() {
+    use fluree_db_core::value_id::ValueTypeTag;
+
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger_id = "it/reindex-class-stats-datatypes:main";
+
+    let ledger0 = genesis_ledger_for_fluree(&fluree, ledger_id);
+    let tx = json!({
+        "@context": {
+            "ex": "http://example.org/",
+            "xsd": "http://www.w3.org/2001/XMLSchema#"
+        },
+        "@graph": [
+            {
+                "@id": "ex:thing1",
+                "@type": "ex:Thing",
+                "ex:label": "first",
+                "ex:count": 7,
+                "ex:active": true,
+                "ex:created": { "@value": "2024-01-02T03:04:05Z", "@type": "xsd:dateTime" },
+                "ex:start":   { "@value": "2024-01-02", "@type": "xsd:date" },
+                "ex:peer": { "@id": "ex:thing2" }
+            },
+            {
+                "@id": "ex:thing2",
+                "@type": "ex:Thing",
+                "ex:label": "second",
+                "ex:count": 11,
+                "ex:active": false,
+                "ex:created": { "@value": "2024-02-03T04:05:06Z", "@type": "xsd:dateTime" },
+                "ex:start":   { "@value": "2024-02-03", "@type": "xsd:date" },
+                "ex:peer": { "@id": "ex:thing1" }
+            }
+        ]
+    });
+
+    let _ = fluree
+        .insert_with_opts(
+            ledger0,
+            &tx,
+            TxnOpts::default(),
+            CommitOpts::default(),
+            &fluree_db_api::IndexConfig {
+                reindex_min_bytes: 1_000_000_000,
+                reindex_max_bytes: 1_000_000_000,
+            },
+        )
+        .await
+        .expect("insert");
+
+    fluree
+        .reindex(ledger_id, ReindexOptions::default())
+        .await
+        .expect("reindex");
+
+    let loaded = fluree.ledger(ledger_id).await.expect("load ledger");
+    let stats = loaded
+        .snapshot
+        .stats
+        .as_ref()
+        .expect("stats should be present after reindex");
+    let classes = stats.classes.as_ref().expect("classes should be present");
+
+    let thing = classes
+        .iter()
+        .find(|c| {
+            loaded.snapshot.decode_sid(&c.class_sid).as_deref() == Some("http://example.org/Thing")
+        })
+        .expect("Thing class should exist");
+
+    let lookup_tag = |iri: &str| -> u8 {
+        let p = thing
+            .properties
+            .iter()
+            .find(|p| loaded.snapshot.decode_sid(&p.property_sid).as_deref() == Some(iri))
+            .unwrap_or_else(|| panic!("missing property {iri}"));
+        assert_eq!(
+            p.datatypes.len(),
+            1,
+            "property {iri} should have exactly one datatype, got {:?}",
+            p.datatypes
+        );
+        p.datatypes[0].0
+    };
+
+    assert_eq!(
+        lookup_tag("http://example.org/label"),
+        ValueTypeTag::STRING.as_u8(),
+        "ex:label should be xsd:string"
+    );
+    assert_eq!(
+        lookup_tag("http://example.org/count"),
+        ValueTypeTag::INTEGER.as_u8(),
+        "ex:count should be xsd:integer"
+    );
+    assert_eq!(
+        lookup_tag("http://example.org/active"),
+        ValueTypeTag::BOOLEAN.as_u8(),
+        "ex:active should be xsd:boolean"
+    );
+    assert_eq!(
+        lookup_tag("http://example.org/created"),
+        ValueTypeTag::DATE_TIME.as_u8(),
+        "ex:created should be xsd:dateTime"
+    );
+    assert_eq!(
+        lookup_tag("http://example.org/start"),
+        ValueTypeTag::DATE.as_u8(),
+        "ex:start should be xsd:date"
+    );
+    assert_eq!(
+        lookup_tag("http://example.org/peer"),
+        ValueTypeTag::JSON_LD_ID.as_u8(),
+        "ex:peer (reference) should be JSON_LD_ID / @id"
+    );
+}
