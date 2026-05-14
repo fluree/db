@@ -881,6 +881,7 @@ where
                     &spot_class_stats,
                     &predicate_sids,
                     &language_tags,
+                    None, // rebuild path still uses cs.class_prop_refs (64-capped); separate follow-up.
                     &run_dir,
                     &shared.ns_prefixes,
                 )

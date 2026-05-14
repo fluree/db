@@ -9,6 +9,14 @@ use fluree_db_core::value_id::ValueTypeTag;
 use fluree_db_core::GraphId;
 use rustc_hash::FxHashMap;
 
+/// Uncapped per-class ref-target counts, keyed by
+/// `(g_id, class_sid64) -> p_id -> target_class_sid64 -> delta`. Produced by
+/// [`crate::stats::IdStatsHook::finalize_with_aggregate_properties`].
+pub type ClassRefTargets = HashMap<(GraphId, u64), HashMap<u32, HashMap<u64, i64>>>;
+
+/// FxHashMap-keyed variant used internally to match `SpotClassStats.class_prop_refs`.
+type ClassRefTargetsFx = FxHashMap<(GraphId, u64), FxHashMap<u32, FxHashMap<u64, u64>>>;
+
 /// Sentinel datatype value used in [`SpotClassStats`] for object-reference
 /// properties (`ObjKind::REF_ID`). Displayed as `@id` in stats output.
 pub const DT_REF_ID: u16 = u16::MAX;
@@ -175,10 +183,18 @@ pub fn build_class_stats_json(
 ///
 /// Parallel to `build_class_stats_json` but returns typed structs suitable for
 /// binary stats encoding in `IndexRoot`.
+/// `class_ref_targets_override`: when `Some`, this uncapped
+/// `(g_id, class_sid64) -> p_id -> target_class_sid64 -> count` map (e.g. from
+/// `IdStatsHook::finalize_with_aggregate_properties`) is used to derive
+/// `ref_classes`. When `None`, the function falls back to
+/// `cs.class_prop_refs`, which is populated via the legacy 64-class-capped
+/// `ClassBitsetTable` path and yields incomplete ref-class rollups on
+/// ledgers with more than 64 distinct classes.
 pub fn build_class_stat_entries(
     cs: &SpotClassStats,
     predicate_sids: &[(u16, String)],
     language_tags: &[String],
+    class_ref_targets_override: Option<&ClassRefTargets>,
     run_dir: &std::path::Path,
     namespace_codes: &HashMap<u16, String>,
 ) -> std::io::Result<HashMap<GraphId, Vec<fluree_db_core::ClassStatEntry>>> {
@@ -226,7 +242,27 @@ pub fn build_class_stat_entries(
     let mut class_entries: Vec<(&(GraphId, u64), &u64)> = cs.class_counts.iter().collect();
     class_entries.sort_by_key(|&(key, _)| *key);
 
-    let class_refs = &cs.class_prop_refs;
+    // Adapt the override map (counts: i64 deltas, may be negative) to the
+    // FxHashMap<u64, u64> shape that `cs.class_prop_refs` uses, so the
+    // inner property loop is identical regardless of source. Non-positive
+    // deltas are filtered.
+    let override_fx: Option<ClassRefTargetsFx> = class_ref_targets_override.map(|src| {
+        src.iter()
+            .map(|(&key, prop_map)| {
+                let converted: FxHashMap<u32, FxHashMap<u64, u64>> = prop_map
+                    .iter()
+                    .map(|(&p_id, target_map)| {
+                        let targets: FxHashMap<u64, u64> = target_map
+                            .iter()
+                            .filter_map(|(&t_sid, &d)| (d > 0).then_some((t_sid, d as u64)))
+                            .collect();
+                        (p_id, targets)
+                    })
+                    .collect();
+                (key, converted)
+            })
+            .collect()
+    });
 
     let mut per_graph: HashMap<GraphId, Vec<ClassStatEntry>> = HashMap::new();
 
@@ -235,7 +271,10 @@ pub fn build_class_stat_entries(
             Some(s) => s,
             None => continue,
         };
-        let ref_map = class_refs.get(&(g_id, class_sid64));
+        let ref_map = match override_fx {
+            Some(ref m) => m.get(&(g_id, class_sid64)),
+            None => cs.class_prop_refs.get(&(g_id, class_sid64)),
+        };
 
         let properties: Vec<ClassPropertyUsage> =
             if let Some(prop_map) = cs.class_prop_dts.get(&(g_id, class_sid64)) {
