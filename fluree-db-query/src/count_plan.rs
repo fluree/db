@@ -958,9 +958,7 @@ mod tests {
                 aggregates: fluree_db_core::NonEmpty::try_from_vec(vec![
                     crate::ir::AggregateSpec {
                         function: AggregateFn::CountAll,
-                        input_var: None,
                         output_var: out_var,
-                        distinct: false,
                     },
                 ])
                 .expect("non-empty"),

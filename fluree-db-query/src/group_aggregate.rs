@@ -38,7 +38,7 @@
 use crate::binding::{Batch, Binding};
 use crate::context::ExecutionContext;
 use crate::error::{QueryError, Result};
-use crate::ir::AggregateFn;
+use crate::ir::{AggregateFn, InputSemantics};
 // Note: JoinKey and Materializer would be used for multi-ledger/dataset mode
 // but for now we use GroupKeyOwned for single-ledger simplicity
 use crate::operator::{
@@ -54,19 +54,21 @@ use std::sync::Arc;
 use std::time::Instant;
 use tracing::Instrument;
 
-/// Specification for a streaming aggregate
+/// Specification for a streaming aggregate.
+///
+/// `function` carries every variant-correlated input (the read variable,
+/// the `distinct` flag, the GROUP_CONCAT separator); only the columnar
+/// projection (`input_col`) and the output binding (`output_var`) are
+/// extracted here because they're properties of the operator wiring, not
+/// of the aggregate itself.
 #[derive(Debug, Clone)]
 pub struct StreamingAggSpec {
-    /// The aggregate function
+    /// The aggregate function (carries its input variable + distinct flag).
     pub function: AggregateFn,
-    /// Input column index (None for COUNT(*))
+    /// Input column index in the upstream batch (None for COUNT(*)).
     pub input_col: Option<usize>,
-    /// Output variable ID
+    /// Output variable ID.
     pub output_var: VarId,
-    /// Whether DISTINCT was specified (e.g., SUM(DISTINCT ?x)).
-    /// Used by `all_streamable()` to route DISTINCT SUM/AVG to the
-    /// traditional AggregateOperator path which handles deduplication.
-    pub distinct: bool,
 }
 
 /// Per-group streaming aggregate state
@@ -210,24 +212,24 @@ fn materialize_for_minmax(binding: &Binding, gv: Option<&BinaryGraphView>) -> Bi
 impl AggState {
     fn new(func: &AggregateFn) -> Self {
         match func {
-            AggregateFn::Count | AggregateFn::CountAll => AggState::Count { n: 0 },
-            AggregateFn::CountDistinct => AggState::CountDistinct {
+            AggregateFn::Count(_) | AggregateFn::CountAll => AggState::Count { n: 0 },
+            AggregateFn::CountDistinct(_) => AggState::CountDistinct {
                 seen: HashSet::new(),
             },
-            AggregateFn::Sum => AggState::Sum {
+            AggregateFn::Sum { .. } => AggState::Sum {
                 total: 0.0,
                 has_int_only: true,
             },
-            AggregateFn::Avg => AggState::Avg { sum: 0.0, count: 0 },
-            AggregateFn::Min => AggState::Min { min: None },
-            AggregateFn::Max => AggState::Max { max: None },
+            AggregateFn::Avg { .. } => AggState::Avg { sum: 0.0, count: 0 },
+            AggregateFn::Min(_) => AggState::Min { min: None },
+            AggregateFn::Max(_) => AggState::Max { max: None },
             // Non-streamable: collect all values
-            AggregateFn::Median
-            | AggregateFn::Variance
-            | AggregateFn::Stddev
+            AggregateFn::Median { .. }
+            | AggregateFn::Variance { .. }
+            | AggregateFn::Stddev { .. }
             | AggregateFn::GroupConcat { .. } => AggState::Collect { values: Vec::new() },
             // SAMPLE is explicitly arbitrary in SPARQL; we pick the first observed value.
-            AggregateFn::Sample => AggState::Sample { sample: None },
+            AggregateFn::Sample(_) => AggState::Sample { sample: None },
         }
     }
 
@@ -359,7 +361,7 @@ impl AggState {
                 // them to the traditional AggregateOperator instead (via
                 // `all_streamable()` returning false). If a future non-streamable
                 // aggregate needs DISTINCT, pass the spec's distinct flag here.
-                crate::aggregate::apply_aggregate(func, &Binding::Grouped(values), false)
+                func.apply(&Binding::Grouped(values))
             }
         }
     }
@@ -610,29 +612,29 @@ impl GroupAggregateOperator {
         self
     }
 
-    /// Check if all aggregates are streamable (for planner optimization decisions)
+    /// Check if all aggregates are streamable (for planner optimization decisions).
     ///
-    /// DISTINCT SUM/AVG are not streamable because deduplication requires collecting
-    /// all values before computing the aggregate. COUNT(DISTINCT) and MIN/MAX(DISTINCT)
-    /// remain streamable — COUNT(DISTINCT) already tracks a HashSet, and DISTINCT is
-    /// idempotent for MIN/MAX.
+    /// `DISTINCT SUM`/`AVG` aren't streamable because the dedup pass must collect
+    /// every value before reducing. `Median`/`Variance`/`Stddev`/`GroupConcat`
+    /// are non-streamable regardless of DISTINCT — they likewise need every
+    /// value in hand. `COUNT(DISTINCT)` is streamable because its state machine
+    /// is a `HashSet` (the dedup IS the streaming state), and `Min`/`Max`/`Sample`
+    /// don't carry a DISTINCT flag at all.
     pub fn all_streamable(specs: &[StreamingAggSpec]) -> bool {
-        specs.iter().all(|spec| {
-            let is_streamable_fn = matches!(
-                spec.function,
-                AggregateFn::Count
-                    | AggregateFn::CountAll
-                    | AggregateFn::CountDistinct
-                    | AggregateFn::Sum
-                    | AggregateFn::Avg
-                    | AggregateFn::Min
-                    | AggregateFn::Max
-                    | AggregateFn::Sample
-            );
-            // DISTINCT SUM/AVG need to collect all values for dedup — not streamable
-            let distinct_blocks =
-                spec.distinct && matches!(spec.function, AggregateFn::Sum | AggregateFn::Avg);
-            is_streamable_fn && !distinct_blocks
+        specs.iter().all(|spec| match &spec.function {
+            AggregateFn::Count(_)
+            | AggregateFn::CountAll
+            | AggregateFn::CountDistinct(_)
+            | AggregateFn::Min(_)
+            | AggregateFn::Max(_)
+            | AggregateFn::Sample(_) => true,
+            AggregateFn::Sum(_, semantics) | AggregateFn::Avg(_, semantics) => {
+                matches!(semantics, InputSemantics::List)
+            }
+            AggregateFn::Median { .. }
+            | AggregateFn::Variance { .. }
+            | AggregateFn::Stddev { .. }
+            | AggregateFn::GroupConcat { .. } => false,
         })
     }
 
@@ -689,7 +691,6 @@ impl Operator for GroupAggregateOperator {
             && self.group_key_indices.is_empty()
             && self.agg_specs.len() == 1
             && matches!(self.agg_specs[0].function, AggregateFn::CountAll)
-            && !self.agg_specs[0].distinct
         {
             if let Some(count) = self.child.drain_count(ctx).await? {
                 let count_i64 = i64::try_from(count).map_err(|_| {
@@ -1064,10 +1065,9 @@ mod tests {
 
         // GROUP BY ?venue, COUNT(?paper) as ?count
         let agg_specs = vec![StreamingAggSpec {
-            function: AggregateFn::Count,
-            input_col: Some(1), // ?paper
+            function: AggregateFn::Count(VarId(1)), // ?paper
+            input_col: Some(1),
             output_var: VarId(2),
-            distinct: false,
         }];
 
         let mut op = GroupAggregateOperator::new(child, vec![VarId(0)], agg_specs, None, false);
@@ -1175,18 +1175,17 @@ mod tests {
         });
 
         // GROUP BY ?category, SUM(?value), AVG(?value)
+        let list = InputSemantics::List;
         let agg_specs = vec![
             StreamingAggSpec {
-                function: AggregateFn::Sum,
+                function: AggregateFn::Sum(VarId(1), list),
                 input_col: Some(1),
                 output_var: VarId(2),
-                distinct: false,
             },
             StreamingAggSpec {
-                function: AggregateFn::Avg,
+                function: AggregateFn::Avg(VarId(1), list),
                 input_col: Some(1),
                 output_var: VarId(3),
-                distinct: false,
             },
         ];
 
@@ -1228,56 +1227,54 @@ mod tests {
 
     #[test]
     fn test_all_streamable() {
+        let v0 = VarId(0);
         let streamable = vec![
             StreamingAggSpec {
-                function: AggregateFn::Count,
+                function: AggregateFn::Count(v0),
                 input_col: Some(0),
                 output_var: VarId(1),
-                distinct: false,
             },
             StreamingAggSpec {
-                function: AggregateFn::Sum,
+                function: AggregateFn::Sum(v0, InputSemantics::List),
                 input_col: Some(0),
                 output_var: VarId(2),
-                distinct: false,
             },
         ];
         assert!(GroupAggregateOperator::all_streamable(&streamable));
 
         let non_streamable = vec![
             StreamingAggSpec {
-                function: AggregateFn::Count,
+                function: AggregateFn::Count(v0),
                 input_col: Some(0),
                 output_var: VarId(1),
-                distinct: false,
             },
             StreamingAggSpec {
                 function: AggregateFn::GroupConcat {
+                    input: v0,
+                    semantics: InputSemantics::List,
                     separator: ",".to_string(),
                 },
                 input_col: Some(0),
                 output_var: VarId(2),
-                distinct: false,
             },
         ];
         assert!(!GroupAggregateOperator::all_streamable(&non_streamable));
 
         // DISTINCT SUM is not streamable (needs to collect all values for dedup)
         let distinct_sum = vec![StreamingAggSpec {
-            function: AggregateFn::Sum,
+            function: AggregateFn::Sum(v0, InputSemantics::Set),
             input_col: Some(0),
             output_var: VarId(1),
-            distinct: true,
         }];
         assert!(!GroupAggregateOperator::all_streamable(&distinct_sum));
 
-        // DISTINCT MIN is streamable (idempotent)
-        let distinct_min = vec![StreamingAggSpec {
-            function: AggregateFn::Min,
+        // MIN doesn't carry a `distinct` flag — the variant elides it because
+        // DISTINCT has no effect on min/max — so this is just a streamable Min.
+        let plain_min = vec![StreamingAggSpec {
+            function: AggregateFn::Min(v0),
             input_col: Some(0),
             output_var: VarId(1),
-            distinct: true,
         }];
-        assert!(GroupAggregateOperator::all_streamable(&distinct_min));
+        assert!(GroupAggregateOperator::all_streamable(&plain_min));
     }
 }

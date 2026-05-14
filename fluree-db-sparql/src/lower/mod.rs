@@ -330,7 +330,7 @@ mod tests {
     use super::*;
     use crate::parse::parse_sparql;
     use fluree_db_query::ir::triple::{Ref, Term};
-    use fluree_db_query::ir::{AggregateFn, AggregateSpec};
+    use fluree_db_query::ir::{AggregateFn, AggregateSpec, InputSemantics};
     use fluree_db_query::ir::{Expression, Grouping, PathModifier, Pattern};
     use fluree_db_query::parse::encode::MemoryEncoder;
     use fluree_db_query::sort::SortDirection;
@@ -1518,7 +1518,7 @@ mod tests {
 
         assert_eq!(aggregates_of(&query).len(), 1);
         let agg = aggregates_of(&query)[0];
-        assert!(matches!(agg.function, AggregateFn::Count));
+        assert!(matches!(agg.function, AggregateFn::Count(_)));
     }
 
     #[test]
@@ -1531,7 +1531,7 @@ mod tests {
 
         assert_eq!(aggregates_of(&query).len(), 1);
         let agg = aggregates_of(&query)[0];
-        assert!(matches!(agg.function, AggregateFn::CountDistinct));
+        assert!(matches!(agg.function, AggregateFn::CountDistinct(_)));
     }
 
     #[test]
@@ -1546,8 +1546,8 @@ mod tests {
 
         assert_eq!(aggregates_of(&query).len(), 1);
         let agg = aggregates_of(&query)[0];
-        assert!(matches!(agg.function, AggregateFn::CountDistinct));
-        assert!(agg.input_var.is_some()); // Should have resolved the variable
+        assert!(matches!(agg.function, AggregateFn::CountDistinct(_)));
+        assert!(agg.function.input_var().is_some()); // Should have resolved the variable
     }
 
     #[test]
@@ -1562,16 +1562,17 @@ mod tests {
 
         assert_eq!(aggregates_of(&query).len(), 1);
         let agg = aggregates_of(&query)[0];
-        assert!(matches!(agg.function, AggregateFn::CountDistinct));
-        assert!(agg.input_var.is_some());
+        assert!(matches!(agg.function, AggregateFn::CountDistinct(_)));
+        assert!(agg.function.input_var().is_some());
     }
 
     #[test]
     fn test_distinct_flag_count_vs_sum() {
-        // COUNT(DISTINCT) uses a dedicated AggregateFn::CountDistinct variant
-        // with distinct=false (dedup is built into the variant's HashSet state).
-        // SUM(DISTINCT) keeps AggregateFn::Sum with distinct=true (dedup happens
-        // at execution time via HashSet filtering in apply_aggregate).
+        // COUNT(DISTINCT) lowers to the dedicated AggregateFn::CountDistinct
+        // variant (its streaming state uses a HashSet rather than a counter).
+        // SUM(DISTINCT) lowers to AggregateFn::Sum with `distinct: true` —
+        // dedup happens at execution time via HashSet filtering in
+        // apply_aggregate.
         let query = lower_query(
             "PREFIX ex: <http://example.org/>
              SELECT (COUNT(DISTINCT ?s) AS ?c) (SUM(DISTINCT ?v) AS ?t)
@@ -1582,15 +1583,13 @@ mod tests {
         assert_eq!(aggregates_of(&query).len(), 2);
 
         let count_agg = aggregates_of(&query)[0];
-        assert!(matches!(count_agg.function, AggregateFn::CountDistinct));
-        assert!(
-            !count_agg.distinct,
-            "CountDistinct variant should clear the distinct flag"
-        );
+        assert!(matches!(count_agg.function, AggregateFn::CountDistinct(_)));
 
         let sum_agg = aggregates_of(&query)[1];
-        assert!(matches!(sum_agg.function, AggregateFn::Sum));
-        assert!(sum_agg.distinct, "SUM(DISTINCT) should set distinct=true");
+        assert!(matches!(
+            sum_agg.function,
+            AggregateFn::Sum(_, InputSemantics::Set)
+        ));
     }
 
     #[test]
@@ -1605,9 +1604,9 @@ mod tests {
         assert_eq!(aggregates_of(&query).len(), 1);
         assert!(matches!(
             aggregates_of(&query)[0].function,
-            AggregateFn::Sum
+            AggregateFn::Sum(..)
         ));
-        assert!(aggregates_of(&query)[0].input_var.is_some());
+        assert!(aggregates_of(&query)[0].function.input_var().is_some());
     }
 
     #[test]
@@ -1621,7 +1620,7 @@ mod tests {
         assert_eq!(aggregates_of(&query).len(), 1);
         assert!(matches!(
             aggregates_of(&query)[0].function,
-            AggregateFn::Sum
+            AggregateFn::Sum(..)
         ));
     }
 
@@ -1635,9 +1634,12 @@ mod tests {
 
         assert_eq!(aggregates_of(&query).len(), 1);
         let agg = aggregates_of(&query)[0];
-        assert!(matches!(agg.function, AggregateFn::Sum));
+        assert!(matches!(agg.function, AggregateFn::Sum(..)));
 
-        let input_var = agg.input_var.expect("expected aggregate input var");
+        let input_var = agg
+            .function
+            .input_var()
+            .expect("expected aggregate input var");
         let input_name = vars.name(input_var);
         assert!(
             input_name.starts_with("?__agg_expr_"),
@@ -1665,7 +1667,7 @@ mod tests {
         assert_eq!(aggregates_of(&query).len(), 1);
         assert!(matches!(
             aggregates_of(&query)[0].function,
-            AggregateFn::Avg
+            AggregateFn::Avg(..)
         ));
     }
 
@@ -1680,11 +1682,11 @@ mod tests {
         assert_eq!(aggregates_of(&query).len(), 2);
         assert!(matches!(
             aggregates_of(&query)[0].function,
-            AggregateFn::Min
+            AggregateFn::Min(_)
         ));
         assert!(matches!(
             aggregates_of(&query)[1].function,
-            AggregateFn::Max
+            AggregateFn::Max(_)
         ));
     }
 
@@ -1699,7 +1701,7 @@ mod tests {
         let aggs = aggregates_of(&query);
         assert_eq!(aggs.len(), 1);
         match &aggs[0].function {
-            AggregateFn::GroupConcat { separator } => {
+            AggregateFn::GroupConcat { separator, .. } => {
                 assert_eq!(separator, ", ");
             }
             _ => panic!("Expected GroupConcat"),
@@ -1717,7 +1719,7 @@ mod tests {
         assert_eq!(aggregates_of(&query).len(), 1);
         assert!(matches!(
             aggregates_of(&query)[0].function,
-            AggregateFn::Sample
+            AggregateFn::Sample(_)
         ));
     }
 
@@ -1733,7 +1735,10 @@ mod tests {
         assert_eq!(aggregates_of(&query).len(), 1);
         let agg = aggregates_of(&query)[0];
         assert!(matches!(agg.function, AggregateFn::CountAll));
-        assert!(agg.input_var.is_none(), "COUNT(*) should have no input var");
+        assert!(
+            agg.function.input_var().is_none(),
+            "COUNT(*) should have no input var"
+        );
     }
 
     #[test]
