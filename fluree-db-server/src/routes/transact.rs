@@ -33,7 +33,8 @@ use axum::response::{IntoResponse, Response};
 use axum::Json;
 use fluree_db_api::{
     lower_sparql_update, parse_sparql, with_index_request_correlation, CommitOpts,
-    IndexRequestCorrelation, NamespaceRegistry, SparqlQueryBody, TrackingOptions, TxnOpts, TxnType,
+    IndexRequestCorrelation, NamespaceRegistry, PolicyStats, SparqlQueryBody, TrackingOptions,
+    TrackingTally, TxnOpts, TxnType,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
@@ -67,6 +68,42 @@ pub struct TransactResponse {
     pub tx_id: String,
     /// Commit information
     pub commit: CommitInfo,
+    /// Execution time when tracking was requested
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub time: Option<String>,
+    /// Fuel consumed when tracking was requested
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fuel: Option<f64>,
+    /// Policy stats when policy tracking was requested
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub policy: Option<std::collections::HashMap<String, PolicyStats>>,
+}
+
+fn transact_response(
+    ledger_id: String,
+    t: i64,
+    tx_id: String,
+    commit_hash: String,
+    tally: Option<&TrackingTally>,
+) -> TransactResponse {
+    TransactResponse {
+        ledger_id,
+        t,
+        tx_id,
+        commit: CommitInfo { hash: commit_hash },
+        time: tally.and_then(|t| t.time.clone()),
+        fuel: tally.and_then(|t| t.fuel),
+        policy: tally.and_then(|t| t.policy.clone()),
+    }
+}
+
+fn record_tracking_on_span(span: &tracing::Span, tally: &TrackingTally) {
+    if let Some(ref time) = tally.time {
+        span.record("tracker_time", time.as_str());
+    }
+    if let Some(fuel) = tally.fuel {
+        span.record("tracker_fuel", fuel);
+    }
 }
 
 /// Compute transaction ID from request body (SHA-256 hash)
@@ -686,6 +723,7 @@ async fn insert_local(
                 TxnType::Insert,
                 &turtle,
                 &credential,
+                &headers,
                 author.as_deref(),
             )
             .await;
@@ -831,6 +869,7 @@ async fn upsert_local(
                 TxnType::Upsert,
                 &turtle,
                 &credential,
+                &headers,
                 author.as_deref(),
             )
             .await;
@@ -977,6 +1016,7 @@ async fn insert_ledger_local(
                 TxnType::Insert,
                 &turtle,
                 &credential,
+                &headers,
                 author.as_deref(),
             )
             .await;
@@ -1123,6 +1163,7 @@ async fn upsert_ledger_local(
                 TxnType::Upsert,
                 &turtle,
                 &credential,
+                &headers,
                 author.as_deref(),
             )
             .await;
@@ -1207,8 +1248,13 @@ async fn execute_transaction(
     let qc_opts = fluree_db_api::QueryConnectionOptions::from_json(body).unwrap_or_default();
 
     // Create execution span
-    let span =
-        tracing::debug_span!("transact_execute", ledger_id = ledger_id, txn_type = ?txn_type);
+    let span = tracing::debug_span!(
+        "transact_execute",
+        ledger_id = ledger_id,
+        txn_type = ?txn_type,
+        tracker_time = tracing::field::Empty,
+        tracker_fuel = tracing::field::Empty,
+    );
     async move {
         let span = tracing::Span::current();
 
@@ -1334,19 +1380,21 @@ async fn execute_transaction(
             }
         };
 
-        let response_json = Json(TransactResponse {
-            ledger_id: ledger_id.to_string(),
-            t: result.receipt.t,
+        if let Some(tally) = &result.tally {
+            record_tracking_on_span(&span, tally);
+        }
+        let response_json = Json(transact_response(
+            ledger_id.to_string(),
+            result.receipt.t,
             tx_id,
-            commit: CommitInfo {
-                hash: result.receipt.commit_id.to_string(),
-            },
-        });
+            result.receipt.commit_id.to_string(),
+            result.tally.as_ref(),
+        ));
 
         // Return tracking headers when a tally is present
-        match result.tally {
+        match &result.tally {
             Some(tally) => {
-                let hdrs = tracking_headers(&tally);
+                let hdrs = tracking_headers(tally);
                 Ok((hdrs, response_json).into_response())
             }
             None => Ok(response_json.into_response()),
@@ -1393,13 +1441,21 @@ async fn execute_turtle_transaction(
     txn_type: TxnType,
     turtle: &str,
     credential: &MaybeCredential,
+    headers: &FlureeHeaders,
     author: Option<&str>,
 ) -> Result<Response> {
     let is_trig = credential.is_trig();
 
     // Create execution span
     let format = if is_trig { "trig" } else { "turtle" };
-    let span = tracing::debug_span!("transact_execute", ledger_id = ledger_id, txn_type = ?txn_type, format = format);
+    let span = tracing::debug_span!(
+        "transact_execute",
+        ledger_id = ledger_id,
+        txn_type = ?txn_type,
+        format = format,
+        tracker_time = tracing::field::Empty,
+        tracker_fuel = tracing::field::Empty,
+    );
     async move {
         let span = tracing::Span::current();
 
@@ -1465,6 +1521,9 @@ async fn execute_turtle_transaction(
         if let Some(config) = &state.index_config {
             builder = builder.index_config(config.clone());
         }
+        if headers.has_tracking() {
+            builder = builder.tracking(headers.to_tracking_options());
+        }
 
         let correlation = index_request_correlation(
             &credential.headers,
@@ -1493,18 +1552,20 @@ async fn execute_turtle_transaction(
             }
         };
 
-        let response_json = Json(TransactResponse {
-            ledger_id: ledger_id.to_string(),
-            t: result.receipt.t,
+        if let Some(tally) = &result.tally {
+            record_tracking_on_span(&span, tally);
+        }
+        let response_json = Json(transact_response(
+            ledger_id.to_string(),
+            result.receipt.t,
             tx_id,
-            commit: CommitInfo {
-                hash: result.receipt.commit_id.to_string(),
-            },
-        });
+            result.receipt.commit_id.to_string(),
+            result.tally.as_ref(),
+        ));
 
-        match result.tally {
+        match &result.tally {
             Some(tally) => {
-                let hdrs = tracking_headers(&tally);
+                let hdrs = tracking_headers(tally);
                 Ok((hdrs, response_json).into_response())
             }
             None => Ok(response_json.into_response()),
@@ -1731,6 +1792,9 @@ async fn execute_sparql_update_request(
         if let Some(config) = &state.index_config {
             builder = builder.index_config(config.clone());
         }
+        if headers.has_tracking() {
+            builder = builder.tracking(headers.to_tracking_options());
+        }
         if let Some(ctx) = policy_ctx {
             builder = builder.policy(ctx);
         }
@@ -1776,18 +1840,20 @@ async fn execute_sparql_update_request(
         }
     };
 
-    let response_json = Json(TransactResponse {
+    if let Some(tally) = &result.tally {
+        record_tracking_on_span(parent_span, tally);
+    }
+    let response_json = Json(transact_response(
         ledger_id,
-        t: result.receipt.t,
+        result.receipt.t,
         tx_id,
-        commit: CommitInfo {
-            hash: result.receipt.commit_id.to_string(),
-        },
-    });
+        result.receipt.commit_id.to_string(),
+        result.tally.as_ref(),
+    ));
 
-    match result.tally {
+    match &result.tally {
         Some(tally) => {
-            let hdrs = tracking_headers(&tally);
+            let hdrs = tracking_headers(tally);
             Ok((hdrs, response_json).into_response())
         }
         None => Ok(response_json.into_response()),
