@@ -375,14 +375,15 @@ async fn s3_testcontainers_indexing_test() {
 
 /// End-to-end hard drop on S3 + DynamoDB.
 ///
-/// Covers the three fixes that were needed for Hard drop to work on AWS:
+/// Covers the fixes that were needed for Hard drop to work on AWS:
 /// 1. `DynamoDbNameService::purge` deletes every row under the alias (not just
 ///    flipping `meta.retracted = true`), so the alias can be re-initialized.
 /// 2. `S3Storage::list_prefix` parses the `fluree:s3://...` scheme like
 ///    reads/writes/deletes, so the enumeration actually finds artifacts under
 ///    the configured bucket prefix.
-/// 3. `drop_artifacts` enumerates per-subprefix (`commit/`, `txn/`, `index/`)
-///    so `TieredStorage` routes each list to the right tier.
+/// 3. `drop_artifacts` enumerates per-subprefix (`commit/`, `txn/`, `index/`,
+///    `config/`, and optionally `@shared/dicts/`) so `TieredStorage` routes
+///    each list to the right tier and no artifact class is missed.
 #[tokio::test]
 #[cfg(feature = "native")]
 async fn s3_testcontainers_hard_drop_clears_ledger() {
@@ -441,11 +442,28 @@ async fn s3_testcontainers_hard_drop_clears_ledger() {
     });
     let _ledger1 = fluree.update(ledger0, &tx).await.expect("update").ledger;
 
-    // Sanity: we wrote commit + meta artifacts to the bucket.
+    // Write a default context so the bucket also has `config/` artifacts
+    // (both `ConfigPayload` and `default_context` blobs are stored under
+    // `ContentKind::LedgerConfig` → `{ledger}/{branch}/config/`).
+    fluree
+        .set_default_context(
+            ledger_id,
+            &json!({"ex": "http://example.org/ns/", "rdf": "http://www.w3.org/1999/02/22-rdf-syntax-ns#"}),
+        )
+        .await
+        .expect("set_default_context");
+
+    // Sanity: commits and a config blob landed in the bucket.
     let keys_before = list_object_keys(&sdk_config, bucket).await;
     assert!(
         keys_before.iter().any(|k| k.contains("/commit/")),
         "expected commit artifacts before drop: {keys_before:?}"
+    );
+    assert!(
+        keys_before
+            .iter()
+            .any(|k| k.contains("/drop-test/main/config/")),
+        "expected a config artifact before drop: {keys_before:?}"
     );
 
     // Hard drop.
@@ -471,9 +489,9 @@ async fn s3_testcontainers_hard_drop_clears_ledger() {
         "hard drop must purge the NS record entirely, got: {after:?}"
     );
 
-    // Bucket cleared of this ledger's branch artifacts. (No assertion on the
-    // unrelated bucket prefix itself; only the per-ledger commit/txn/index
-    // subkeys should be gone.)
+    // Bucket cleared of every per-ledger artifact class we enumerate:
+    // commit/, txn/, index/, config/, and (since this is the only branch)
+    // @shared/dicts/. We don't assert on the bucket prefix itself.
     let keys_after = list_object_keys(&sdk_config, bucket).await;
     let stragglers: Vec<_> = keys_after
         .iter()
@@ -481,12 +499,14 @@ async fn s3_testcontainers_hard_drop_clears_ledger() {
             k.contains("/drop-test/main/commit/")
                 || k.contains("/drop-test/main/txn/")
                 || k.contains("/drop-test/main/index/")
+                || k.contains("/drop-test/main/config/")
+                || k.contains("/drop-test/@shared/dicts/")
         })
         .cloned()
         .collect();
     assert!(
         stragglers.is_empty(),
-        "expected no branch-scoped artifacts after hard drop, found: {stragglers:?}"
+        "expected no per-ledger artifacts after hard drop, found: {stragglers:?}"
     );
 
     // Re-initialization works because purge removed every row under the alias.
