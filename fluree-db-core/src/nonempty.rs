@@ -94,6 +94,11 @@ impl<T> NonEmpty<T> {
         1 + self.tail.len()
     }
 
+    /// This method is provided for customary hygiene but, by definition, NonEmpty is never empty.
+    pub fn is_empty(&self) -> bool {
+        false
+    }
+
     /// First element. Always present by construction.
     pub fn first(&self) -> &T {
         &self.head

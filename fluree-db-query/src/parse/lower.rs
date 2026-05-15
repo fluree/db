@@ -1429,7 +1429,8 @@ fn lower_filter_expr_inner<E: IriEncoder>(
             let func_name = lower_function_name(func);
             if let Function::Custom(unknown) = &func_name {
                 return Err(ParseError::InvalidFilter(format!(
-                    "Unknown function: {unknown}"
+                    "Unknown function: {unknown}{}",
+                    unknown_function_hint(unknown),
                 )));
             }
             Ok(Expression::Call {
@@ -1554,6 +1555,30 @@ fn lower_function_name(name: &str) -> Function {
         "xsd:decimal" | "http://www.w3.org/2001/xmlschema#decimal" => Function::XsdDecimal,
         "xsd:string" | "http://www.w3.org/2001/xmlschema#string" => Function::XsdString,
         other => Function::Custom(other.to_string()),
+    }
+}
+
+/// Format an actionable hint to append to an "Unknown function" parse error.
+///
+/// Two cases worth catching:
+///
+/// 1. Tokens that *imply* an unbound-variable test (`!bound`, `nil?`,
+///    `not-bound`, …) — point at the supported `bound` function or the
+///    `["not-exists", …]` pattern operator.
+///
+/// 2. Tokens starting with `!` (including a bare `!`) — point at the
+///    s-expression spelling of logical negation, `not`. Bare `!` is *not*
+///    treated as an unbound-test hint because the most common user attempt
+///    is plain negation like `(! (= ?age 18))`, not `(! (bound ?p))`.
+fn unknown_function_hint(name: &str) -> &'static str {
+    let lower = name.to_lowercase();
+    match lower.as_str() {
+        "!bound" | "nil?" | "not-bound" | "notbound" | "unbound" | "missing?" => {
+            " — to test for an unbound variable use `(not (bound ?v))` or the \
+             `[\"not-exists\", {...}]` pattern operator"
+        }
+        _ if lower.starts_with('!') => " — logical negation is spelled `not`, e.g. `(not (...))`",
+        _ => "",
     }
 }
 
@@ -3083,5 +3108,56 @@ mod tests {
         } else {
             panic!("Expected Union, got {:?}", results[0]);
         }
+    }
+
+    #[test]
+    fn unknown_function_hints_point_at_bound() {
+        for name in [
+            "!bound",
+            "nil?",
+            "not-bound",
+            "notbound",
+            "unbound",
+            "missing?",
+        ] {
+            let hint = unknown_function_hint(name);
+            assert!(
+                hint.contains("bound") && hint.contains("not-exists"),
+                "expected hint for {name:?} to mention `bound` and `not-exists`, got: {hint:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn unknown_function_hint_for_bang_prefix_points_at_not() {
+        // Bare `!` and arbitrary `!something` both fall through to the
+        // generic logical-negation hint — `!` is the natural typo for
+        // SPARQL `!`-style negation like `(! (= ?age 18))`, NOT a typo for
+        // `(! (bound ?p))`, so we don't push users toward an unbound-test
+        // they didn't ask for.
+        for name in ["!", "!foo", "!(= ?x 1)"] {
+            let hint = unknown_function_hint(name);
+            assert!(
+                hint.contains("not") && !hint.contains("bound"),
+                "expected {name:?} hint to mention `not` (no `bound`), got: {hint:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn unknown_function_hint_for_explicit_bound_attempts() {
+        // Tokens that *imply* an unbound test should get the bound/not-exists
+        // hint, not the generic negation hint.
+        let hint = unknown_function_hint("!bound");
+        assert!(
+            hint.contains("bound") && hint.contains("not-exists"),
+            "expected !bound hint to mention bound + not-exists, got: {hint:?}"
+        );
+    }
+
+    #[test]
+    fn unknown_function_hint_empty_for_unrelated_names() {
+        assert_eq!(unknown_function_hint("frobnicate"), "");
+        assert_eq!(unknown_function_hint("strlen2"), "");
     }
 }

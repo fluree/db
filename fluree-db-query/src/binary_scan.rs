@@ -985,6 +985,16 @@ impl BinaryScanOperator {
         })
     }
 
+    fn novelty_subject_id(ctx: &ExecutionContext<'_>, sid: &Sid) -> Option<u64> {
+        let dict_novelty = ctx.dict_novelty.as_ref()?;
+        if !dict_novelty.is_initialized() {
+            return None;
+        }
+        dict_novelty
+            .subjects
+            .find_subject(sid.namespace_code, sid.name.as_ref())
+    }
+
     /// Resolve s_id → Sid with caching.
     fn resolve_s_id(&mut self, s_id: u64) -> Result<Sid> {
         if let Some(sid) = self.sid_cache.get(&s_id) {
@@ -1590,6 +1600,13 @@ impl Operator for BinaryScanOperator {
             &p_sid,
         )
         .map_err(|e| QueryError::Internal(format!("build_filter: {e}")))?;
+
+        if filter.s_id.is_none() {
+            if let Some(sid) = s_sid.as_ref() {
+                filter.s_id = Self::novelty_subject_id(ctx, sid);
+            }
+        }
+
         tracing::debug!(
             ?self.pattern,
             s_bound = s_sid.is_some(),

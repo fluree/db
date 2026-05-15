@@ -37,6 +37,7 @@ members = [
     "fluree-search-httpd",
     "fluree-db-cli",
     "fluree-db-memory",
+    "fluree-bench-support",
 ]
 exclude = ["testsuite-sparql"]
 

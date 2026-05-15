@@ -112,6 +112,7 @@ num-bigdecimal = { package = "bigdecimal", version = "0.4" }
 # and its full dep tree when the feature is off.
 ed25519-dalek = "2.1"
 criterion = "0.5"
+fluree-bench-support = { path = "../fluree-bench-support" }
 rand = { workspace = true }
 fluree-db-nameservice-sync = { path = "../fluree-db-nameservice-sync" }
 
@@ -145,6 +146,34 @@ harness = false
 
 [[bench]]
 name = "insert_formats"
+harness = false
+
+[[bench]]
+name = "import_bulk"
+harness = false
+
+[[bench]]
+name = "transact_commit"
+harness = false
+
+[[bench]]
+name = "query_cold_reload"
+harness = false
+
+[[bench]]
+name = "reindex_full"
+harness = false
+
+[[bench]]
+name = "reindex_incremental"
+harness = false
+
+[[bench]]
+name = "novelty_replay"
+harness = false
+
+[[bench]]
+name = "query_hot_bsbm"
 harness = false
 
 [lints]
