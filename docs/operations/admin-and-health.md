@@ -236,15 +236,15 @@ See [Admin Authentication](../api/endpoints.md#admin-authentication) for details
 
 ### POST /v1/fluree/drop
 
-Drop (delete) a ledger:
+Drop a ledger or graph source:
 
 ```bash
-# Soft drop (retract from nameservice, preserve files)
+# Soft drop (retract from nameservice, preserve storage artifacts)
 curl -X POST http://localhost:8090/v1/fluree/drop \
   -H "Content-Type: application/json" \
   -d '{"ledger": "mydb:main"}'
 
-# Hard drop (delete all files - IRREVERSIBLE)
+# Hard drop (delete managed storage artifacts - IRREVERSIBLE)
 curl -X POST http://localhost:8090/v1/fluree/drop \
   -H "Content-Type: application/json" \
   -d '{"ledger": "mydb:main", "hard": true}'
@@ -253,7 +253,7 @@ curl -X POST http://localhost:8090/v1/fluree/drop \
 **Response:**
 ```json
 {
-  "ledger": "mydb:main",
+  "ledger_id": "mydb:main",
   "status": "dropped",
   "files_deleted": 23
 }
@@ -268,8 +268,10 @@ curl -X POST http://localhost:8090/v1/fluree/drop \
 **Authentication:** When `--admin-auth-mode=required`, requires Bearer token from a trusted issuer.
 
 **Drop Modes:**
-- **Soft** (default): Retracts from nameservice, files remain (recoverable)
-- **Hard**: Deletes all files (irreversible)
+- **Soft** (default): Marks the ledger retracted in the nameservice; artifacts remain and the alias stays reserved.
+- **Hard**: Deletes managed storage artifacts and purges the nameservice record where supported, allowing alias reuse. Deleted artifacts are irreversible.
+
+If no ledger is found, the endpoint tries the same name as a graph source on branch `main`.
 
 See [Dropping Ledgers](../getting-started/rust-api.md#dropping-ledgers) for more details.
 
