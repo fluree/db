@@ -862,7 +862,11 @@ mod tests {
     }
 
     fn sum_of(input: VarId, distinct: bool) -> AggregateFn {
-        let semantics = if distinct { InputSemantics::Set } else { InputSemantics::List };
+        let semantics = if distinct {
+            InputSemantics::Set
+        } else {
+            InputSemantics::List
+        };
         AggregateFn::Sum(input, semantics)
     }
 

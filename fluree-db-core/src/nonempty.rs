@@ -65,12 +65,6 @@ impl<T> NonEmpty<T> {
         std::iter::once(&mut self.head).chain(self.tail.iter_mut())
     }
 
-    /// Consume self and iterate over all elements in order, starting with
-    /// the head.
-    pub fn into_iter(self) -> impl DoubleEndedIterator<Item = T> {
-        std::iter::once(self.head).chain(self.tail)
-    }
-
     /// Map `f` over each element, returning a new `NonEmpty<U>`. Length is
     /// preserved (the head is always mapped to a head), so the result is
     /// also non-empty by construction.
