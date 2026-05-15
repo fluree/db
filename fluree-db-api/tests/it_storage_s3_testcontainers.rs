@@ -372,3 +372,126 @@ async fn s3_testcontainers_indexing_test() {
         })
         .await;
 }
+
+/// End-to-end hard drop on S3 + DynamoDB.
+///
+/// Covers the three fixes that were needed for Hard drop to work on AWS:
+/// 1. `DynamoDbNameService::purge` deletes every row under the alias (not just
+///    flipping `meta.retracted = true`), so the alias can be re-initialized.
+/// 2. `S3Storage::list_prefix` parses the `fluree:s3://...` scheme like
+///    reads/writes/deletes, so the enumeration actually finds artifacts under
+///    the configured bucket prefix.
+/// 3. `drop_artifacts` enumerates per-subprefix (`commit/`, `txn/`, `index/`)
+///    so `TieredStorage` routes each list to the right tier.
+#[tokio::test]
+#[cfg(feature = "native")]
+async fn s3_testcontainers_hard_drop_clears_ledger() {
+    use fluree_db_api::{DropMode, DropStatus};
+
+    let (_lock, _container, endpoint) = start_localstack("s3,dynamodb").await;
+    let sdk_config = sdk_config_for_localstack(&endpoint).await;
+
+    let bucket = "fluree-drop-test";
+    let table = "fluree-drop-test-ns";
+    ensure_bucket(&sdk_config, bucket).await;
+    ensure_dynamodb_table(&sdk_config, table).await;
+
+    let storage = S3Storage::new(
+        &sdk_config,
+        S3Config {
+            bucket: bucket.to_string(),
+            prefix: Some("fluree-data".to_string()),
+            endpoint: None,
+            timeout_ms: Some(30_000),
+            max_retries: None,
+            retry_base_delay_ms: None,
+            retry_max_delay_ms: None,
+        },
+    )
+    .await
+    .expect("S3Storage::new");
+
+    let nameservice = DynamoDbNameService::new(
+        &sdk_config,
+        DynamoDbConfig {
+            table_name: table.to_string(),
+            region: None,
+            endpoint: None,
+            timeout_ms: Some(30_000),
+        },
+    )
+    .await
+    .expect("DynamoDbNameService::new");
+
+    let fluree = build_fluree(storage.clone(), nameservice.clone());
+
+    let ledger_id = "drop-test:main";
+    let ledger0 = fluree
+        .create_ledger(ledger_id)
+        .await
+        .expect("create ledger");
+
+    let tx = json!({
+        "@context": [support::default_context(), {"ex": "http://example.org/ns/"}],
+        "insert": (0..10).map(|i| json!({
+            "@id": format!("ex:person{}", i),
+            "@type": "ex:Person",
+            "ex:name": format!("Person {}", i)
+        })).collect::<Vec<_>>()
+    });
+    let _ledger1 = fluree.update(ledger0, &tx).await.expect("update").ledger;
+
+    // Sanity: we wrote commit + meta artifacts to the bucket.
+    let keys_before = list_object_keys(&sdk_config, bucket).await;
+    assert!(
+        keys_before.iter().any(|k| k.contains("/commit/")),
+        "expected commit artifacts before drop: {keys_before:?}"
+    );
+
+    // Hard drop.
+    let report = fluree
+        .drop_ledger(ledger_id, DropMode::Hard)
+        .await
+        .expect("drop_ledger");
+    assert_eq!(report.status, DropStatus::Dropped);
+    assert!(
+        report.artifacts_deleted > 0,
+        "expected hard drop to remove artifacts, got 0 with warnings: {:?}",
+        report.warnings
+    );
+
+    // Nameservice purged: lookup returns None and we can re-init the alias.
+    let after = fluree
+        .nameservice()
+        .lookup(ledger_id)
+        .await
+        .expect("lookup after drop");
+    assert!(
+        after.is_none(),
+        "hard drop must purge the NS record entirely, got: {after:?}"
+    );
+
+    // Bucket cleared of this ledger's branch artifacts. (No assertion on the
+    // unrelated bucket prefix itself; only the per-ledger commit/txn/index
+    // subkeys should be gone.)
+    let keys_after = list_object_keys(&sdk_config, bucket).await;
+    let stragglers: Vec<_> = keys_after
+        .iter()
+        .filter(|k| {
+            k.contains("/drop-test/main/commit/")
+                || k.contains("/drop-test/main/txn/")
+                || k.contains("/drop-test/main/index/")
+        })
+        .cloned()
+        .collect();
+    assert!(
+        stragglers.is_empty(),
+        "expected no branch-scoped artifacts after hard drop, found: {stragglers:?}"
+    );
+
+    // Re-initialization works because purge removed every row under the alias.
+    let _reinit = fluree
+        .create_ledger(ledger_id)
+        .await
+        .expect("re-create ledger after hard drop");
+}

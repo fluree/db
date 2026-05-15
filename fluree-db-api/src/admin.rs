@@ -10,7 +10,10 @@
 //! available on read-only storage.
 
 use crate::{error::ApiError, tx::IndexingMode, Result};
-use fluree_db_core::{address_path::ledger_id_to_path_prefix, format_ledger_id, DEFAULT_BRANCH};
+use fluree_db_core::{
+    address_path::{ledger_id_to_path_prefix, shared_prefix_for_path},
+    format_ledger_id, DEFAULT_BRANCH,
+};
 use fluree_db_indexer::{clean_garbage, rebuild_index_from_commits, CleanGarbageConfig};
 use fluree_db_nameservice::NsRecord;
 use std::time::Duration;
@@ -237,6 +240,17 @@ impl crate::Fluree {
     /// This only stops the in-process background worker. External indexers
     /// (Lambda, etc.) **MUST** check `NsRecord.retracted` before indexing
     /// and before publishing to prevent recreating files after drop.
+    ///
+    /// # Branch safety
+    ///
+    /// `drop_ledger` operates on a single branch's `ledger_id` and does **not**
+    /// cascade to child branches. Hard-dropping a parent branch (e.g.
+    /// `mydb:main`) while child branches are still alive will delete
+    /// commit/index artifacts that those children may resolve through the
+    /// branched content store, breaking their reads. Drop child branches via
+    /// [`drop_branch`](Self::drop_branch) first, or accept the breakage. The
+    /// `@shared/dicts/` namespace is automatically preserved when sibling
+    /// branches are live; commit/index/config artifacts are not.
     pub async fn drop_ledger(&self, ledger_id: &str, mode: DropMode) -> Result<DropReport> {
         // 1. Normalize ledger_id (ensure branch suffix)
         let ledger_id = normalize_ledger_id(ledger_id);
@@ -269,7 +283,13 @@ impl crate::Fluree {
         // 4. Delete artifacts (Hard mode)
         // Run deletion even for NotFound/AlreadyRetracted - enables admin cleanup
         if matches!(mode, DropMode::Hard) {
-            let (count, warnings) = self.drop_artifacts(&ledger_id, record.as_ref()).await;
+            // Cross-branch `@shared` dicts may only be wiped when this is the
+            // last live branch of the ledger. Anything else risks breaking
+            // sibling branches that still resolve via the shared namespace.
+            let include_shared = self.is_last_live_branch(&ledger_id).await;
+            let (count, warnings) = self
+                .drop_artifacts(&ledger_id, record.as_ref(), include_shared)
+                .await;
             report.artifacts_deleted = count;
             report.warnings.extend(warnings);
         }
@@ -396,7 +416,11 @@ impl crate::Fluree {
             handle.wait_for_idle(ledger_id).await;
         }
 
-        let (count, warnings) = self.drop_artifacts(ledger_id, record).await;
+        // Branch path: never wipe `@shared` here. Sibling branches and any
+        // surviving parent may still reference shared dicts; deferring shared
+        // cleanup to a final ledger-level drop is safer than risking a live
+        // branch with missing blobs.
+        let (count, warnings) = self.drop_artifacts(ledger_id, record, false).await;
         report.artifacts_deleted += count;
         report.warnings.extend(warnings);
 
@@ -447,21 +471,53 @@ impl crate::Fluree {
         }
     }
 
+    /// Determine whether `ledger_id` is the only live (non-retracted) branch
+    /// of its ledger name.
+    ///
+    /// Used to gate cross-branch (`@shared/`) cleanup: only safe to wipe when
+    /// no sibling branches remain. Returns `false` on lookup failure so we
+    /// err toward leaving shared blobs in place rather than risking a live
+    /// branch with broken dict reads.
+    async fn is_last_live_branch(&self, ledger_id: &str) -> bool {
+        let (name, _branch) = match fluree_db_core::ledger_id::split_ledger_id(ledger_id) {
+            Ok(p) => p,
+            Err(_) => return false,
+        };
+        match self.nameservice().list_branches(&name).await {
+            Ok(records) => records.iter().all(|r| r.ledger_id == ledger_id),
+            Err(e) => {
+                warn!(error = %e, "list_branches failed during drop; preserving @shared");
+                false
+            }
+        }
+    }
+
     /// Delete all storage artifacts for a ledger.
     ///
     /// Uses a two-path strategy:
-    /// - **Fast path**: `list_prefix` on the entire ledger root — catches all
-    ///   subdirectories (commit/, txn/, index/, config/, etc.). Works for
-    ///   file, S3, and memory backends.
+    /// - **Fast path**: list each known subprefix (`commit/`, `txn/`, `index/`,
+    ///   and optionally `@shared/dicts/`) under the ledger root and batch
+    ///   delete. Enumerating per-subprefix is required so that `TieredStorage`
+    ///   routes commit/txn listings to the commit tier and index listings to
+    ///   the index tier — a single ledger-root list misses the commit tier
+    ///   entirely in split commit/index deployments.
     /// - **Slow path**: If `list_prefix` fails (e.g., IPFS), walks the commit
     ///   chain + index tree to collect all CIDs, derives storage addresses, and
     ///   deletes each individually.
+    ///
+    /// `include_shared` controls whether `{ledger_name}/@shared/dicts/` (cross-
+    /// branch dict blobs) is also wiped. This must only be `true` when no other
+    /// non-retracted branches of this ledger remain, since dicts are shared
+    /// across branches. Leaving `@shared/` in place when other branches are
+    /// alive avoids breaking their dict reads, at the cost of orphan blobs
+    /// until a final ledger drop or explicit GC.
     ///
     /// Returns `(count_deleted, warnings)`.
     async fn drop_artifacts(
         &self,
         ledger_id: &str,
         record: Option<&fluree_db_nameservice::NsRecord>,
+        include_shared: bool,
     ) -> (usize, Vec<String>) {
         let mut warnings = Vec::new();
         let storage = match self.admin_storage() {
@@ -476,42 +532,96 @@ impl crate::Fluree {
         };
         let storage_method = storage.storage_method();
 
-        // Build the ledger root prefix: fluree:{method}://{ledger_path}/
-        let prefix = match ledger_id_to_path_prefix(ledger_id) {
+        // Build the per-branch path prefix (e.g. "mydb/main").
+        let branch_prefix = match ledger_id_to_path_prefix(ledger_id) {
             Ok(p) => p,
             Err(e) => {
                 warnings.push(format!("Invalid ledger ID '{ledger_id}': {e}"));
                 return (0, warnings);
             }
         };
-        let ledger_root = format!("fluree:{storage_method}://{prefix}/");
 
-        // Fast path: list everything under the ledger root and batch delete
-        match storage.list_prefix(&ledger_root).await {
-            Ok(mut files) => {
-                files.sort();
-                let mut count = 0;
-                for file in &files {
-                    if let Err(e) = storage.delete(file).await {
-                        warn!(file = %file, error = %e, "Failed to delete artifact");
-                        warnings.push(format!("Failed to delete {file}: {e}"));
-                    } else {
-                        count += 1;
+        // Enumerate explicit subprefixes. `TieredStorage` routes by substring
+        // (`/commit/`, `/txn/` → commit tier; otherwise → index tier), so we
+        // must hit each one separately. `index/` covers index roots, garbage,
+        // and all object subkinds (branches, leaves, dicts when per-branch);
+        // `config/` covers the LedgerConfig blob and the default-context blob,
+        // both stored as `ContentKind::LedgerConfig`.
+        let mut subprefixes = vec![
+            format!("fluree:{storage_method}://{branch_prefix}/commit/"),
+            format!("fluree:{storage_method}://{branch_prefix}/txn/"),
+            format!("fluree:{storage_method}://{branch_prefix}/index/"),
+            format!("fluree:{storage_method}://{branch_prefix}/config/"),
+        ];
+
+        if include_shared {
+            // Cross-branch dict blobs: {ledger}/@shared/dicts/. Caller is
+            // responsible for ensuring no other branches still need them.
+            let shared = shared_prefix_for_path(ledger_id);
+            subprefixes.push(format!("fluree:{storage_method}://{shared}/dicts/"));
+        }
+
+        let mut total = 0usize;
+        let mut any_listed = false;
+        let mut listing_errors: Vec<String> = Vec::new();
+
+        for sub in &subprefixes {
+            match storage.list_prefix(sub).await {
+                Ok(files) => {
+                    any_listed = true;
+                    let mut sorted = files;
+                    sorted.sort();
+                    for file in &sorted {
+                        if let Err(e) = storage.delete(file).await {
+                            warn!(file = %file, error = %e, "Failed to delete artifact");
+                            warnings.push(format!("Failed to delete {file}: {e}"));
+                        } else {
+                            total += 1;
+                        }
                     }
                 }
-                info!(count = count, "Fast-path artifact deletion complete");
-                (count, warnings)
-            }
-            Err(e) => {
-                // Slow path: walk CID chains (any backend without list_prefix)
-                info!(
-                    error = %e,
-                    "list_prefix unavailable, falling back to CID-walking drop"
-                );
-                self.drop_artifacts_by_cid_walk(ledger_id, record, &mut warnings)
-                    .await
+                Err(e) => {
+                    let msg = format!("list_prefix({sub}) failed: {e}");
+                    warn!(error = %e, prefix = %sub, "list_prefix failed during drop");
+                    listing_errors.push(msg);
+                }
             }
         }
+
+        // Two failure modes to handle distinctly:
+        //
+        // - No subprefix listed successfully: backend doesn't support
+        //   list_prefix at all (or every call errored). Fall back to the CID
+        //   walk so we still remove what we can address.
+        // - Some succeeded, some failed: we likely deleted a partial set of
+        //   artifacts. Run the CID walk as a cleanup pass — `release` is
+        //   idempotent on already-deleted CIDs — and record the listing
+        //   errors as warnings so callers see the partial-failure.
+        if !any_listed {
+            info!(
+                errors = ?listing_errors,
+                "list_prefix unavailable for all subprefixes, falling back to CID-walking drop"
+            );
+            return self
+                .drop_artifacts_by_cid_walk(ledger_id, record, &mut warnings)
+                .await;
+        }
+
+        if !listing_errors.is_empty() {
+            warn!(
+                errors = ?listing_errors,
+                "fast-path drop had partial listing failures; running CID walk to clean up"
+            );
+            warnings.extend(listing_errors);
+            let (extra, cid_warnings) = self
+                .drop_artifacts_by_cid_walk(ledger_id, record, &mut Vec::new())
+                .await;
+            total += extra;
+            warnings.extend(cid_warnings);
+        }
+
+        info!(count = total, "Fast-path artifact deletion complete");
+        (total, warnings)
     }
 
     /// Slow-path artifact deletion: walk commit + index chains to collect CIDs,
