@@ -124,6 +124,7 @@
   - [Policy in queries](security/policy-in-queries.md)
   - [Policy in transactions](security/policy-in-transactions.md)
   - [Programmatic policy API (Rust)](security/programmatic-policy.md)
+  - [Cross-ledger policy](security/cross-ledger-policy.md)
 
 - [Indexing and search](indexing-and-search/README.md)
   - [Background indexing](indexing-and-search/background-indexing.md)

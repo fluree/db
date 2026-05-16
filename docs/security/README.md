@@ -71,6 +71,17 @@ Using policies in Rust applications:
 - Transaction-side policy enforcement
 - Historical views with policy
 
+### [Cross-ledger policy](cross-ledger-policy.md)
+
+Govern many data ledgers from one model ledger via `f:policySource`
+with `f:ledger`:
+- Two-ledger configuration pattern (model M, data D)
+- `f:policyClass` filtering with exact-IRI intersection
+- `f:AccessPolicy` baseline default
+- Engaging the policy path over HTTP
+- Failure modes (HTTP 502 + structured body)
+- Cache and update semantics
+
 ## Key Concepts
 
 ### Data-Level Security
