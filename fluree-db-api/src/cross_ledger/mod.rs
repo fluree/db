@@ -9,5 +9,9 @@
 //! `docs/design/cross-ledger-model-enforcement.md`.
 
 pub mod error;
+mod resolver;
+mod types;
 
 pub use error::CrossLedgerError;
+pub use resolver::resolve_graph_ref;
+pub use types::{ArtifactKind, GovernanceArtifact, ResolveCtx, ResolvedGraph};
