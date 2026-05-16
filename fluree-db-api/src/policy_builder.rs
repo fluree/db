@@ -422,8 +422,10 @@ async fn load_policies_by_identity(
 
 /// Load policies by querying for subjects of the given class types.
 ///
-/// Legacy equivalent: `wrap-class-policy`
-async fn load_policies_by_class(
+/// Legacy equivalent: `wrap-class-policy`. `pub(crate)` so the
+/// cross-ledger resolver can reuse the same load path against a
+/// model ledger's snapshot.
+pub(crate) async fn load_policies_by_class(
     snapshot: &LedgerSnapshot,
     overlay: &dyn fluree_db_core::OverlayProvider,
     to_t: i64,

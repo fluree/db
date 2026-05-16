@@ -167,33 +167,32 @@ pub async fn resolve_graph_ref(
 
 /// Dispatch per `ArtifactKind` to the subsystem-specific projector.
 ///
-/// Slice 3 placeholder — every kind returns
-/// `TranslationFailed { detail: "not yet implemented" }`. Slice 4
-/// fills in `PolicyRules`; later phases add the rest.
+/// Phase 1a implements `PolicyRules`; other kinds land in later
+/// phases per the design doc's phasing table.
 async fn materialize(
     kind: ArtifactKind,
     canonical_ledger_id: &str,
     graph_iri: &str,
-    _resolved_t: i64,
-    _ctx: &mut ResolveCtx<'_>,
+    resolved_t: i64,
+    ctx: &mut ResolveCtx<'_>,
 ) -> Result<ResolvedGraph, CrossLedgerError> {
-    let _ = canonical_ledger_id;
-    let _ = graph_iri;
-    let _ = kind;
-    Err(CrossLedgerError::TranslationFailed {
-        ledger_id: canonical_ledger_id.to_string(),
-        graph_iri: graph_iri.to_string(),
-        detail: format!("artifact materialization for {kind:?} not yet implemented"),
-    })
-}
-
-// The `GovernanceArtifact` enum currently has only the `PolicyRules`
-// variant; the suppression below keeps the materialization placeholder
-// honest about constructing one even while no caller does. It's
-// removed once slice 4 lands an actual producer.
-#[allow(dead_code)]
-fn _governance_artifact_construction_guard(wire: fluree_db_policy::PolicyArtifactWire) {
-    let _ = GovernanceArtifact::PolicyRules(wire);
+    match kind {
+        ArtifactKind::PolicyRules => {
+            let wire = super::policy_materializer::materialize_policy_rules(
+                canonical_ledger_id,
+                graph_iri,
+                resolved_t,
+                ctx.fluree,
+            )
+            .await?;
+            Ok(ResolvedGraph {
+                model_ledger_id: canonical_ledger_id.to_string(),
+                graph_iri: graph_iri.to_string(),
+                resolved_t,
+                artifact: GovernanceArtifact::PolicyRules(wire),
+            })
+        }
+    }
 }
 
 #[cfg(test)]

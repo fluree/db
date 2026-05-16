@@ -9,6 +9,7 @@
 //! `docs/design/cross-ledger-model-enforcement.md`.
 
 pub mod error;
+mod policy_materializer;
 mod resolver;
 mod types;
 
