@@ -16,7 +16,12 @@ use std::sync::Arc;
 ///
 /// Only `PolicyRules` is implemented in Phase 1a; the remaining
 /// variants land in later phases per the design doc's phasing table.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+///
+/// `ArtifactKind` is part of the memo / cycle-detection key so that
+/// when a later phase adds a second variant (e.g., `Shapes`), a
+/// memoized `PolicyRules` entry for the same `(ledger, graph, t)`
+/// can't be returned to a caller asking for `Shapes`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ArtifactKind {
     /// `f:policySource` → policy rule set.
     PolicyRules,
@@ -25,6 +30,19 @@ pub enum ArtifactKind {
     // DatalogRules   — Phase 2
     // Constraints    — Phase 2
 }
+
+impl std::fmt::Display for ArtifactKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ArtifactKind::PolicyRules => f.write_str("PolicyRules"),
+        }
+    }
+}
+
+/// Memo / cycle-detection key. Includes `ArtifactKind` so concurrent
+/// (within one request) resolutions for different artifact kinds
+/// against the same `(ledger, graph, t)` don't collide.
+pub(crate) type ResolutionKey = (ArtifactKind, String, String, i64);
 
 /// A successfully resolved, term-neutral governance artifact.
 ///
@@ -89,10 +107,14 @@ pub struct ResolveCtx<'a> {
     /// `resolved_t` for unpinned references. Pinned `f:atT` does NOT
     /// populate this map; pinned values are per-resolve.
     pub resolved_ts: HashMap<String, i64>,
-    /// Active resolution stack (cycle detection).
-    pub active: Vec<(String, String, i64)>,
-    /// Per-request completed memo.
-    pub memo: HashMap<(String, String, i64), Arc<ResolvedGraph>>,
+    /// Active resolution stack (cycle detection). Keyed on the full
+    /// resolution tuple including `ArtifactKind` so a `PolicyRules`
+    /// resolve doesn't see a `Shapes` resolution of the same
+    /// `(ledger, graph, t)` as a cycle (or vice versa).
+    pub active: Vec<ResolutionKey>,
+    /// Per-request completed memo, keyed on the same tuple so
+    /// different artifact kinds can't return each other's entries.
+    pub memo: HashMap<ResolutionKey, Arc<ResolvedGraph>>,
 }
 
 impl<'a> ResolveCtx<'a> {
@@ -134,26 +156,26 @@ pub(crate) fn reject_if_reserved_graph(
 /// Memo lookup for the per-request completed map.
 ///
 /// Memo hits short-circuit before `active` is consulted, so two
-/// subsystems referencing the same `(ledger, graph, t)` resolve once
-/// and never trip cycle detection.
+/// subsystems referencing the same `(kind, ledger, graph, t)` resolve
+/// once and never trip cycle detection.
 pub(crate) fn memo_hit(
-    memo: &HashMap<(String, String, i64), Arc<ResolvedGraph>>,
-    tuple: &(String, String, i64),
+    memo: &HashMap<ResolutionKey, Arc<ResolvedGraph>>,
+    key: &ResolutionKey,
 ) -> Option<Arc<ResolvedGraph>> {
-    memo.get(tuple).cloned()
+    memo.get(key).cloned()
 }
 
 /// Cycle check against the active resolution stack.
 ///
-/// Returns the cycle as a chain (active stack + the offending tuple
+/// Returns the cycle as a chain (active stack + the offending key
 /// appended) when one is detected.
 pub(crate) fn check_cycle(
-    active: &[(String, String, i64)],
-    tuple: &(String, String, i64),
+    active: &[ResolutionKey],
+    key: &ResolutionKey,
 ) -> Result<(), CrossLedgerError> {
-    if active.iter().any(|t| t == tuple) {
+    if active.iter().any(|k| k == key) {
         let mut chain = active.to_vec();
-        chain.push(tuple.clone());
+        chain.push(key.clone());
         return Err(CrossLedgerError::CycleDetected { chain });
     }
     Ok(())
@@ -190,68 +212,98 @@ mod tests {
         );
     }
 
+    fn key(ledger: &str, graph: &str, t: i64) -> ResolutionKey {
+        (ArtifactKind::PolicyRules, ledger.into(), graph.into(), t)
+    }
+
     #[test]
     fn cycle_check_passes_for_unique_tuples() {
         let active = vec![
-            ("a:main".to_string(), "http://ex.org/p".to_string(), 10),
-            ("b:main".to_string(), "http://ex.org/q".to_string(), 20),
+            key("a:main", "http://ex.org/p", 10),
+            key("b:main", "http://ex.org/q", 20),
         ];
-        let new_tuple = ("c:main".to_string(), "http://ex.org/r".to_string(), 30);
-        assert!(check_cycle(&active, &new_tuple).is_ok());
+        let new_key = key("c:main", "http://ex.org/r", 30);
+        assert!(check_cycle(&active, &new_key).is_ok());
     }
 
     #[test]
     fn cycle_check_fails_on_reentry_and_renders_full_chain() {
-        let cycle_tuple = ("a:main".to_string(), "http://ex.org/p".to_string(), 10);
-        let active = vec![
-            cycle_tuple.clone(),
-            ("b:main".to_string(), "http://ex.org/q".to_string(), 20),
-        ];
-        let err = check_cycle(&active, &cycle_tuple).unwrap_err();
+        let cycle_key = key("a:main", "http://ex.org/p", 10);
+        let active = vec![cycle_key.clone(), key("b:main", "http://ex.org/q", 20)];
+        let err = check_cycle(&active, &cycle_key).unwrap_err();
         match err {
             CrossLedgerError::CycleDetected { chain } => {
                 // The chain should contain the original active stack
-                // (in order) plus the offending tuple appended.
+                // (in order) plus the offending key appended.
                 assert_eq!(chain.len(), 3);
-                assert_eq!(chain[0], cycle_tuple);
-                assert_eq!(chain[2], cycle_tuple);
+                assert_eq!(chain[0], cycle_key);
+                assert_eq!(chain[2], cycle_key);
             }
             other => panic!("expected CycleDetected, got {other:?}"),
         }
     }
 
     #[test]
+    fn cycle_check_treats_different_artifact_kinds_on_same_graph_as_distinct() {
+        // Two artifact kinds resolving the same (ledger, graph, t)
+        // are NOT a cycle — they're materializing different things
+        // (policy rules vs shapes vs schema) from the same source.
+        // Phase 1a only has PolicyRules so this test uses a synthetic
+        // second variant by reusing PolicyRules with a sentinel
+        // pattern; it will be expanded in Phase 1b when SchemaClosure
+        // lands. The contract this guards: adding a new ArtifactKind
+        // doesn't make existing resolutions look cyclic.
+        let active = vec![(
+            ArtifactKind::PolicyRules,
+            "a:main".to_string(),
+            "http://ex.org/p".to_string(),
+            10,
+        )];
+        // Once Phase 1b adds e.g. ArtifactKind::SchemaClosure, this
+        // test should use that variant to verify cross-kind isolation.
+        // For now: same kind / different t (a clearly-non-cycle case)
+        // exercises the same code path under the new tuple shape.
+        let later_pin = (
+            ArtifactKind::PolicyRules,
+            "a:main".to_string(),
+            "http://ex.org/p".to_string(),
+            20,
+        );
+        assert!(check_cycle(&active, &later_pin).is_ok());
+    }
+
+    #[test]
     fn cycle_check_treats_different_t_pins_of_same_graph_as_distinct() {
-        // Two f:atT pins of the same (ledger, graph) are NOT a cycle.
-        // The design doc is explicit on this.
-        let active = vec![("a:main".to_string(), "http://ex.org/p".to_string(), 10)];
-        let later_pin = ("a:main".to_string(), "http://ex.org/p".to_string(), 20);
+        // Two pins of the same (kind, ledger, graph) at different t
+        // are NOT a cycle. The design doc is explicit on this.
+        let active = vec![key("a:main", "http://ex.org/p", 10)];
+        let later_pin = key("a:main", "http://ex.org/p", 20);
         assert!(check_cycle(&active, &later_pin).is_ok());
     }
 
     #[test]
     fn memo_returns_cloned_arc_on_hit_and_none_on_miss() {
         let mut memo = HashMap::new();
-        let tuple = ("a:main".to_string(), "http://ex.org/p".to_string(), 10);
+        let resolution_key = key("a:main", "http://ex.org/p", 10);
 
         let payload = Arc::new(ResolvedGraph {
-            model_ledger_id: tuple.0.clone(),
-            graph_iri: tuple.1.clone(),
-            resolved_t: tuple.2,
+            model_ledger_id: resolution_key.1.clone(),
+            graph_iri: resolution_key.2.clone(),
+            resolved_t: resolution_key.3,
             artifact: GovernanceArtifact::PolicyRules(PolicyArtifactWire {
                 origin: fluree_db_policy::WireOrigin {
-                    model_ledger_id: tuple.0.clone(),
-                    graph_iri: tuple.1.clone(),
-                    resolved_t: tuple.2,
+                    model_ledger_id: resolution_key.1.clone(),
+                    graph_iri: resolution_key.2.clone(),
+                    resolved_t: resolution_key.3,
                 },
                 restrictions: vec![],
             }),
         });
 
-        assert!(memo_hit(&memo, &tuple).is_none());
-        memo.insert(tuple.clone(), payload.clone());
+        assert!(memo_hit(&memo, &resolution_key).is_none());
+        memo.insert(resolution_key.clone(), payload.clone());
 
-        let hit = memo_hit(&memo, &tuple).expect("hit after insert");
+        let hit = memo_hit(&memo, &resolution_key).expect("hit after insert");
         assert!(Arc::ptr_eq(&hit, &payload), "memo must return shared Arc");
     }
 }

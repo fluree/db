@@ -140,19 +140,26 @@ pub async fn resolve_graph_ref(
         head_t
     };
 
-    let tuple = (canonical_ledger_id.clone(), graph_iri.to_string(), resolved_t);
+    let key: (ArtifactKind, String, String, i64) = (
+        kind,
+        canonical_ledger_id.clone(),
+        graph_iri.to_string(),
+        resolved_t,
+    );
 
     // (5) Memo hit — short-circuit cross-subsystem de-dup before
     // entering `active`, so two subsystems referencing the same
-    // (M, graph, t) never look like a cycle to each other.
-    if let Some(hit) = memo_hit(&ctx.memo, &tuple) {
+    // (kind, M, graph, t) never look like a cycle to each other.
+    // ArtifactKind is part of the key: a memoized PolicyRules entry
+    // never short-circuits a Shapes lookup for the same graph.
+    if let Some(hit) = memo_hit(&ctx.memo, &key) {
         return Ok(hit);
     }
 
     // (6) Cycle check.
-    check_cycle(&ctx.active, &tuple)?;
+    check_cycle(&ctx.active, &key)?;
 
-    ctx.active.push(tuple.clone());
+    ctx.active.push(key.clone());
 
     // Materialize. Slice 3 provides the dispatch shape; the actual
     // projector lands in slice 4.
@@ -172,7 +179,7 @@ pub async fn resolve_graph_ref(
 
     let resolved = materialize_result?;
     let arc = Arc::new(resolved);
-    ctx.memo.insert(tuple, arc.clone());
+    ctx.memo.insert(key, arc.clone());
     Ok(arc)
 }
 

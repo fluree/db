@@ -81,13 +81,19 @@ pub(crate) struct ResolveCtx<'a, S, N> {
     /// subsequent unpinned reference to that model in the same request
     /// reuses it.
     pub resolved_ts: &'a mut HashMap<String, i64>,
-    /// Active resolution stack — the chain of `(ledger, graph,
-    /// resolved_t)` tuples currently being resolved. Used only for cycle
-    /// detection; an entry is pushed before recursion and popped after.
-    pub active: &'a mut Vec<(String, String, i64)>,
+    /// Active resolution stack — the chain of `(kind, ledger, graph,
+    /// resolved_t)` tuples currently being resolved. Used only for
+    /// cycle detection; an entry is pushed before recursion and
+    /// popped after. `ArtifactKind` is part of the key so a
+    /// `PolicyRules` resolve of `(M, graph, t)` doesn't make a
+    /// `Shapes` resolve of the same `(M, graph, t)` look like a
+    /// cycle (or vice versa).
+    pub active: &'a mut Vec<(ArtifactKind, String, String, i64)>,
     /// Per-request memo of fully-resolved artifacts. Hits short-circuit
     /// without storage round-trip and without entering the cycle stack.
-    pub memo: &'a mut HashMap<(String, String, i64), Arc<ResolvedGraph>>,
+    /// Same `ArtifactKind`-extended key as `active` so different
+    /// artifact kinds can't return each other's memo entries.
+    pub memo: &'a mut HashMap<(ArtifactKind, String, String, i64), Arc<ResolvedGraph>>,
 }
 ```
 
@@ -126,7 +132,7 @@ The helper performs, in order:
    `ctx.memo` and the global cache.
 7. **Caching.** On cache hit the materialized artifact is returned
    directly. On miss the artifact is inserted under the key
-   `(canonical_model_ledger_id, graph_iri, resolved_t)`.
+   `(ArtifactKind, canonical_model_ledger_id, graph_iri, resolved_t)`.
 
 A `ResolvedGraph` is term-neutral and t-fixed:
 
@@ -290,10 +296,12 @@ opaque-blob variant to the binary-index cache (the artifact is
 serialized to bytes at the cache boundary), and is deferred until
 the artifact representation stabilizes.
 
-The key is `(canonical_model_ledger_id, graph_iri, resolved_t)`. New
-commits to M produce new keys without explicit invalidation;
-unreferenced entries age out under the cache's eviction policy.
-There is no "watermark-on-write" channel.
+The key is `(ArtifactKind, canonical_model_ledger_id, graph_iri,
+resolved_t)`. `ArtifactKind` is part of the key so a memoized
+`PolicyRules` entry never short-circuits a `Shapes` lookup of the
+same `(M, graph, t)`. New commits to M produce new keys without
+explicit invalidation; unreferenced entries age out under the
+cache's eviction policy. There is no "watermark-on-write" channel.
 
 The cache value is the term-neutral `ResolvedGraph` (IRIs, not Sids).
 Per-data-ledger interning is not part of the cache key — the cache

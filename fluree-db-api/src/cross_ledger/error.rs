@@ -120,20 +120,21 @@ pub enum CrossLedgerError {
         ledger_id: String,
     },
 
-    /// Cycle detected through the `(ledger, graph, resolved_t)` chain.
+    /// Cycle detected through the `(kind, ledger, graph, resolved_t)`
+    /// chain.
     #[error("cycle detected in cross-ledger resolution: {}", chain_display(chain))]
     CycleDetected {
         /// The active resolution stack at the point the cycle was
         /// detected, ordered from outermost to innermost.
-        chain: Vec<(String, String, i64)>,
+        chain: Vec<(super::ArtifactKind, String, String, i64)>,
     },
 }
 
 /// Render the resolution chain for diagnostic display.
-fn chain_display(chain: &[(String, String, i64)]) -> String {
+fn chain_display(chain: &[(super::ArtifactKind, String, String, i64)]) -> String {
     chain
         .iter()
-        .map(|(ledger, graph, t)| format!("{ledger}#{graph}@t={t}"))
+        .map(|(kind, ledger, graph, t)| format!("{kind}({ledger}#{graph}@t={t})"))
         .collect::<Vec<_>>()
         .join(" → ")
 }
@@ -143,17 +144,18 @@ mod tests {
     use super::*;
 
     #[test]
-    fn cycle_display_renders_chain_in_order() {
+    fn cycle_display_renders_chain_in_order_with_artifact_kind() {
+        use super::super::ArtifactKind;
         let err = CrossLedgerError::CycleDetected {
             chain: vec![
-                ("a:main".into(), "http://ex.org/p".into(), 10),
-                ("b:main".into(), "http://ex.org/q".into(), 20),
-                ("a:main".into(), "http://ex.org/p".into(), 10),
+                (ArtifactKind::PolicyRules, "a:main".into(), "http://ex.org/p".into(), 10),
+                (ArtifactKind::PolicyRules, "b:main".into(), "http://ex.org/q".into(), 20),
+                (ArtifactKind::PolicyRules, "a:main".into(), "http://ex.org/p".into(), 10),
             ],
         };
         let msg = err.to_string();
-        assert!(msg.contains("a:main#http://ex.org/p@t=10"));
-        assert!(msg.contains("b:main#http://ex.org/q@t=20"));
+        assert!(msg.contains("PolicyRules(a:main#http://ex.org/p@t=10)"));
+        assert!(msg.contains("PolicyRules(b:main#http://ex.org/q@t=20)"));
         assert!(msg.contains(" → "));
     }
 
