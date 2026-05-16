@@ -640,7 +640,24 @@ impl Fluree {
                 &mut ctx,
             )
             .await?;
-            let crate::cross_ledger::GovernanceArtifact::PolicyRules(wire) = &resolved.artifact;
+            let crate::cross_ledger::GovernanceArtifact::PolicyRules(wire) = &resolved.artifact
+            else {
+                // resolve_graph_ref dispatches on ArtifactKind, so
+                // requesting PolicyRules must yield PolicyRules.
+                // Surfacing this as TranslationFailed rather than
+                // panicking keeps the failure path uniform for
+                // operators reading the response body.
+                return Err(crate::error::ApiError::CrossLedger(
+                    crate::cross_ledger::CrossLedgerError::TranslationFailed {
+                        ledger_id: resolved.model_ledger_id.clone(),
+                        graph_iri: resolved.graph_iri.clone(),
+                        detail: "resolver returned a non-PolicyRules artifact for an \
+                                ArtifactKind::PolicyRules request; this is a bug in \
+                                the resolver dispatch"
+                            .into(),
+                    },
+                ));
+            };
 
             // Apply the data ledger's configured policy_class set as
             // an exact-IRI intersection filter on the wire's

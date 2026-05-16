@@ -14,27 +14,27 @@ use std::sync::Arc;
 
 /// Which subsystem's artifact is being resolved.
 ///
-/// Only `PolicyRules` is implemented in Phase 1a; the remaining
-/// variants land in later phases per the design doc's phasing table.
-///
-/// `ArtifactKind` is part of the memo / cycle-detection key so that
-/// when a later phase adds a second variant (e.g., `Shapes`), a
+/// `ArtifactKind` is part of the memo / cycle-detection key so a
 /// memoized `PolicyRules` entry for the same `(ledger, graph, t)`
-/// can't be returned to a caller asking for `Shapes`.
+/// can't be returned to a caller asking for `Constraints` (or any
+/// future variant), and vice versa.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ArtifactKind {
     /// `f:policySource` → policy rule set.
     PolicyRules,
-    // SchemaClosure  — Phase 1b
-    // Shapes         — Phase 2
-    // DatalogRules   — Phase 2
-    // Constraints    — Phase 2
+    /// `f:constraintsSource` → set of property IRIs declared
+    /// `f:enforceUnique true` on the model ledger.
+    Constraints,
+    // SchemaClosure  — reserved
+    // Shapes         — reserved
+    // DatalogRules   — reserved
 }
 
 impl std::fmt::Display for ArtifactKind {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             ArtifactKind::PolicyRules => f.write_str("PolicyRules"),
+            ArtifactKind::Constraints => f.write_str("Constraints"),
         }
     }
 }
@@ -75,10 +75,67 @@ pub enum GovernanceArtifact {
     /// Policy rule set in IRI-form. Translate to `PolicySet` via
     /// `fluree_db_policy::build_policy_set_from_wire`.
     PolicyRules(PolicyArtifactWire),
-    // SchemaClosure(SchemaBundleWire) — Phase 1b
-    // Shapes(ShapeSetWire)            — Phase 2
-    // DatalogRules(DatalogRuleSetWire) — Phase 2
-    // Constraints(ConstraintSetWire)  — Phase 2
+    /// `f:enforceUnique` property declarations in IRI-form.
+    /// Translate to D's Sid space via
+    /// [`ConstraintsArtifactWire::translate_to_sids`].
+    Constraints(ConstraintsArtifactWire),
+    // SchemaClosure(SchemaBundleWire) — reserved
+    // Shapes(ShapeSetWire)            — reserved
+    // DatalogRules(DatalogRuleSetWire) — reserved
+}
+
+/// Term-neutral wire form for a constraints artifact.
+///
+/// A constraints artifact is structurally simple: a list of
+/// property IRIs that the model ledger has annotated as
+/// `f:enforceUnique true`. The translator encodes each IRI
+/// against the data ledger's snapshot to produce the Sid set
+/// that the existing `enforce_unique_constraints` flow consumes.
+///
+/// IRIs that fail to resolve against D's snapshot are silently
+/// dropped — D has no data of those properties, so the constraint
+/// cannot be violated either way. The same semantics apply
+/// same-ledger via `encode_iri` returning `None` for unseen
+/// namespaces.
+#[derive(Debug, Clone)]
+pub struct ConstraintsArtifactWire {
+    /// Provenance for diagnostics and cache key derivation.
+    pub origin: WireOrigin,
+    /// Property IRIs declared `f:enforceUnique true` on the model
+    /// ledger's constraints graph.
+    pub property_iris: Vec<String>,
+}
+
+impl ConstraintsArtifactWire {
+    /// Translate the IRI list into property Sids against the
+    /// data ledger's snapshot. Unresolvable IRIs are dropped.
+    pub fn translate_to_sids(
+        &self,
+        snapshot: &fluree_db_core::LedgerSnapshot,
+    ) -> Vec<fluree_db_core::Sid> {
+        self.property_iris
+            .iter()
+            .filter_map(|iri| snapshot.encode_iri(iri))
+            .collect()
+    }
+}
+
+/// Provenance for a cross-ledger wire artifact.
+///
+/// Shared across `Constraints` and any future variant in this
+/// crate. `PolicyArtifactWire` carries its own `WireOrigin` from
+/// `fluree-db-policy` — identical shape, kept separate to avoid
+/// pulling fluree-db-api into the policy crate. A future
+/// unification would centralize these in `fluree-db-core`.
+#[derive(Debug, Clone)]
+pub struct WireOrigin {
+    /// Canonical model ledger id (`NsRecord.ledger_id`).
+    pub model_ledger_id: String,
+    /// Graph IRI within the model ledger whose triples produced
+    /// this artifact.
+    pub graph_iri: String,
+    /// Model ledger `t` at which the artifact was materialized.
+    pub resolved_t: i64,
 }
 
 /// Per-request resolution context.

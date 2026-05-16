@@ -512,13 +512,19 @@ async fn stage_with_config_shacl(
 /// Loads config from the pre-txn state (via `view.base()`) and checks
 /// staged flakes against `f:enforceUnique` annotations. Zero-cost when
 /// no `f:transactDefaults` / `f:uniqueEnabled` is configured.
+///
+/// `fluree` is required so cross-ledger `f:constraintsSource` references
+/// can be resolved against the model ledger. Pass the parent `Fluree`
+/// instance — the staging path always has it on `&self`.
 async fn enforce_unique_after_staging(
     view: &StagedLedger,
     graph_delta: &FxHashMap<u16, String>,
+    fluree: &crate::Fluree,
 ) -> std::result::Result<(), fluree_db_transact::TransactError> {
     let config = load_transaction_config(view.base()).await;
     if let Some(cfg) = &config {
-        let per_graph_unique = resolve_per_graph_unique_sids(view, cfg, graph_delta).await?;
+        let per_graph_unique =
+            resolve_per_graph_unique_sids(view, cfg, graph_delta, fluree).await?;
         enforce_unique_constraints(view, &per_graph_unique, graph_delta).await?;
     }
     Ok(())
@@ -535,8 +541,15 @@ async fn resolve_per_graph_unique_sids(
     view: &StagedLedger,
     config: &LedgerConfig,
     graph_delta: &FxHashMap<u16, String>,
+    fluree: &crate::Fluree,
 ) -> std::result::Result<HashMap<GraphId, FxHashSet<Sid>>, fluree_db_transact::TransactError> {
     let snapshot = view.db();
+    // One resolution context per tx — cross-ledger sources for
+    // different affected graphs in the same tx share memo / resolved_t.
+    let mut resolve_ctx = crate::cross_ledger::ResolveCtx::new(
+        snapshot.ledger_id.as_str(),
+        fluree,
+    );
 
     // Build reverse map: graph SID → g_id for flake graph resolution
     let mut sid_to_gid: HashMap<Sid, GraphId> = HashMap::new();
@@ -590,19 +603,78 @@ async fn resolve_per_graph_unique_sids(
             None => continue,
         };
 
-        // Resolve constraint source graph IDs
-        let source_g_ids = if transact_config.constraints_sources.is_empty() {
-            // Default: annotations in the default graph (g_id=0)
-            vec![0u16]
-        } else {
-            resolve_constraint_source_g_ids(&transact_config.constraints_sources, snapshot)?
-        };
-
-        // Load f:enforceUnique annotations from each source graph
+        // Split constraint sources by locality. Local sources read
+        // annotations from a graph on the data ledger; cross-ledger
+        // sources resolve via the shared cross-ledger resolver against
+        // a model ledger and translate back into D's Sid space.
         let mut unique_sids = FxHashSet::default();
-        for source_g_id in source_g_ids {
-            let annotations = read_enforce_unique_from_graph(view, source_g_id).await?;
+
+        if transact_config.constraints_sources.is_empty() {
+            // Default: annotations in the default graph (g_id=0)
+            let annotations = read_enforce_unique_from_graph(view, 0u16).await?;
             unique_sids.extend(annotations);
+        } else {
+            let mut local_sources: Vec<&fluree_db_core::ledger_config::GraphSourceRef> =
+                Vec::new();
+            let mut cross_sources: Vec<&fluree_db_core::ledger_config::GraphSourceRef> =
+                Vec::new();
+            for source in &transact_config.constraints_sources {
+                if source.ledger.is_some() {
+                    cross_sources.push(source);
+                } else {
+                    local_sources.push(source);
+                }
+            }
+
+            // Local: resolve to g_ids and scan.
+            if !local_sources.is_empty() {
+                let local_g_ids = resolve_constraint_source_g_ids_for(
+                    &local_sources,
+                    snapshot,
+                )?;
+                for source_g_id in local_g_ids {
+                    let annotations =
+                        read_enforce_unique_from_graph(view, source_g_id).await?;
+                    unique_sids.extend(annotations);
+                }
+            }
+
+            // Cross-ledger: materialize via the resolver, translate
+            // each property IRI back to a Sid on D.
+            for source in cross_sources {
+                let resolved = crate::cross_ledger::resolve_graph_ref(
+                    source,
+                    crate::cross_ledger::ArtifactKind::Constraints,
+                    &mut resolve_ctx,
+                )
+                .await
+                .map_err(|e| {
+                    // Resolver errors are operator-facing and need to
+                    // fail the transaction clearly. Wrap in
+                    // TransactError::Parse so the staging pipeline can
+                    // propagate; the API layer (ApiError::Transact) is
+                    // the resulting HTTP class. The detail string
+                    // preserves the underlying CrossLedgerError display
+                    // so operators see model_ledger_id / graph_iri /
+                    // failure variant in the body.
+                    fluree_db_transact::TransactError::Parse(format!(
+                        "f:constraintsSource cross-ledger resolution failed: {e}"
+                    ))
+                })?;
+                let crate::cross_ledger::GovernanceArtifact::Constraints(wire) =
+                    &resolved.artifact
+                else {
+                    return Err(fluree_db_transact::TransactError::Parse(
+                        "cross-ledger resolver returned a non-Constraints \
+                         artifact for ArtifactKind::Constraints (bug in \
+                         resolver dispatch)"
+                            .into(),
+                    ));
+                };
+                for sid in wire.translate_to_sids(snapshot) {
+                    unique_sids.insert(sid);
+                }
+            }
         }
 
         if !unique_sids.is_empty() {
@@ -613,23 +685,29 @@ async fn resolve_per_graph_unique_sids(
     Ok(per_graph)
 }
 
-/// Resolve `GraphSourceRef` list to graph IDs.
+/// Resolve a `GraphSourceRef` list to graph IDs on the local ledger.
 ///
 /// Maps each `f:graphSelector` IRI to a concrete graph ID:
 /// - `f:defaultGraph` → 0
 /// - Named graph IRI → lookup in `GraphRegistry`
 ///
 /// Fails closed: dropping a constraint source silently would weaken
-/// uniqueness enforcement under a misconfiguration, so unknown selectors
-/// and unsupported `GraphSourceRef` fields (`f:ledger`, `f:atT`,
-/// `f:trustPolicy`, `f:rollbackGuard`) return a parse error. Matches the
-/// shapes / policy resolvers.
-fn resolve_constraint_source_g_ids(
-    sources: &[fluree_db_core::ledger_config::GraphSourceRef],
+/// uniqueness enforcement under a misconfiguration, so unknown
+/// selectors and unsupported `GraphSourceRef` fields (`f:atT`,
+/// `f:trustPolicy`, `f:rollbackGuard`) return a parse error.
+///
+/// `f:ledger` (cross-ledger) is supported via
+/// `cross_ledger::resolve_graph_ref` and is dispatched at
+/// [`resolve_per_graph_unique_sids`]; this function sees only
+/// already-partitioned local sources and rejects `f:ledger` as a
+/// defensive guard against bypassing the partition.
+fn resolve_constraint_source_g_ids_for(
+    sources: &[&fluree_db_core::ledger_config::GraphSourceRef],
     snapshot: &fluree_db_core::LedgerSnapshot,
 ) -> std::result::Result<Vec<GraphId>, fluree_db_transact::TransactError> {
     let mut g_ids = Vec::new();
     for source in sources {
+        let source = *source;
         if source.ledger.is_some() {
             return Err(fluree_db_transact::TransactError::Parse(
                 "f:constraintsSource with cross-ledger f:ledger reference is not yet supported"
@@ -1215,7 +1293,7 @@ impl crate::Fluree {
         let (view, ns_registry) = stage_txn(ledger, txn, ns_registry, options).await?;
 
         // Enforce uniqueness constraints (independent of shacl feature)
-        enforce_unique_after_staging(&view, &graph_delta).await?;
+        enforce_unique_after_staging(&view, &graph_delta, self).await?;
 
         Ok(StageResult {
             view,
@@ -1290,7 +1368,7 @@ impl crate::Fluree {
         let (view, ns_registry) = stage_txn(ledger, txn, ns_registry, options).await?;
 
         // Enforce uniqueness constraints (independent of shacl feature)
-        enforce_unique_after_staging(&view, &graph_delta).await?;
+        enforce_unique_after_staging(&view, &graph_delta, self).await?;
 
         Ok(StageResult {
             view,
@@ -1345,7 +1423,7 @@ impl crate::Fluree {
             .map_err(|e| TrackedErrorResponse::new(400, e.to_string(), tracker.tally()))?;
 
         // Enforce uniqueness constraints (independent of shacl feature)
-        enforce_unique_after_staging(&view, &graph_delta)
+        enforce_unique_after_staging(&view, &graph_delta, self)
             .await
             .map_err(|e| TrackedErrorResponse::new(400, e.to_string(), tracker.tally()))?;
 

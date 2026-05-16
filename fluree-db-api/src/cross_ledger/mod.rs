@@ -9,6 +9,7 @@
 //! `docs/design/cross-ledger-model-enforcement.md`.
 
 mod cache;
+mod constraints_materializer;
 pub mod error;
 mod policy_materializer;
 mod resolver;
@@ -17,4 +18,7 @@ mod types;
 pub use cache::GovernanceCache;
 pub use error::CrossLedgerError;
 pub use resolver::resolve_graph_ref;
-pub use types::{ArtifactKind, GovernanceArtifact, ResolveCtx, ResolvedGraph};
+pub use types::{
+    ArtifactKind, ConstraintsArtifactWire, GovernanceArtifact, ResolveCtx, ResolvedGraph,
+    WireOrigin,
+};

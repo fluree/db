@@ -84,7 +84,9 @@ async fn resolves_policy_graph_from_model_ledger_into_term_neutral_wire() {
     assert_eq!(resolved.graph_iri, policy_graph_iri);
     assert!(resolved.resolved_t > 0, "must resolve to a real commit t");
 
-    let GovernanceArtifact::PolicyRules(wire) = &resolved.artifact;
+    let GovernanceArtifact::PolicyRules(wire) = &resolved.artifact else {
+        panic!("expected PolicyRules artifact for ArtifactKind::PolicyRules, got {:?}", resolved.artifact);
+    };
     assert_eq!(wire.origin.model_ledger_id, model_id);
     assert_eq!(wire.origin.graph_iri, policy_graph_iri);
     assert_eq!(wire.origin.resolved_t, resolved.resolved_t);
@@ -188,7 +190,9 @@ async fn structural_detection_picks_up_custom_typed_policies() {
         .await
         .expect("cross-ledger resolution with custom-typed policy");
 
-    let GovernanceArtifact::PolicyRules(wire) = &resolved.artifact;
+    let GovernanceArtifact::PolicyRules(wire) = &resolved.artifact else {
+        panic!("expected PolicyRules artifact for ArtifactKind::PolicyRules, got {:?}", resolved.artifact);
+    };
     assert_eq!(
         wire.restrictions.len(),
         1,
@@ -249,7 +253,9 @@ async fn multiple_rdf_types_are_all_captured_in_policy_types() {
     .await
     .expect("dual-typed resolves");
 
-    let GovernanceArtifact::PolicyRules(wire) = &resolved.artifact;
+    let GovernanceArtifact::PolicyRules(wire) = &resolved.artifact else {
+        panic!("expected PolicyRules artifact for ArtifactKind::PolicyRules, got {:?}", resolved.artifact);
+    };
     let r = &wire.restrictions[0];
 
     // Both types must be present (order-independent).
@@ -309,7 +315,9 @@ async fn missing_effect_on_typed_policy_is_picked_up_as_deny() {
     .await
     .expect("missing-effect typed policy resolves");
 
-    let GovernanceArtifact::PolicyRules(wire) = &resolved.artifact;
+    let GovernanceArtifact::PolicyRules(wire) = &resolved.artifact else {
+        panic!("expected PolicyRules artifact for ArtifactKind::PolicyRules, got {:?}", resolved.artifact);
+    };
     assert_eq!(
         wire.restrictions.len(),
         1,
@@ -768,7 +776,9 @@ async fn empty_policy_graph_yields_empty_wire_artifact() {
         .await
         .expect("empty graph resolves successfully");
 
-    let GovernanceArtifact::PolicyRules(wire) = &resolved.artifact;
+    let GovernanceArtifact::PolicyRules(wire) = &resolved.artifact else {
+        panic!("expected PolicyRules artifact for ArtifactKind::PolicyRules, got {:?}", resolved.artifact);
+    };
     assert!(
         wire.restrictions.is_empty(),
         "non-policy data in graph must yield zero restrictions, got {}",

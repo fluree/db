@@ -232,6 +232,21 @@ async fn materialize(
                 artifact: GovernanceArtifact::PolicyRules(wire),
             })
         }
+        ArtifactKind::Constraints => {
+            let wire = super::constraints_materializer::materialize_constraints(
+                canonical_ledger_id,
+                graph_iri,
+                resolved_t,
+                ctx.fluree,
+            )
+            .await?;
+            Ok(ResolvedGraph {
+                model_ledger_id: canonical_ledger_id.to_string(),
+                graph_iri: graph_iri.to_string(),
+                resolved_t,
+                artifact: GovernanceArtifact::Constraints(wire),
+            })
+        }
     }
 }
 
