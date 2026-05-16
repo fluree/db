@@ -547,6 +547,42 @@ impl Fluree {
         }
 
         let db_ref = db.as_graph_db_ref();
+
+        // Cross-ledger detection: if `reasoning.schema_source` has
+        // `f:ledger` set, dispatch through the cross-ledger resolver
+        // and translate the resulting `SchemaArtifactWire` into a
+        // SchemaBundleFlakes against D's snapshot. Same-ledger
+        // configs go through the existing local path unchanged.
+        let schema_source = reasoning.schema_source.as_ref().expect("checked above");
+        if schema_source.ledger.is_some() {
+            let mut ctx = crate::cross_ledger::ResolveCtx::new(
+                db_ref.snapshot.ledger_id.as_str(),
+                self,
+            );
+            let resolved = crate::cross_ledger::resolve_graph_ref(
+                schema_source,
+                crate::cross_ledger::ArtifactKind::SchemaClosure,
+                &mut ctx,
+            )
+            .await?;
+            let crate::cross_ledger::GovernanceArtifact::SchemaClosure(wire) =
+                &resolved.artifact
+            else {
+                return Err(crate::error::ApiError::CrossLedger(
+                    crate::cross_ledger::CrossLedgerError::TranslationFailed {
+                        ledger_id: resolved.model_ledger_id.clone(),
+                        graph_iri: resolved.graph_iri.clone(),
+                        detail: "resolver returned a non-SchemaClosure artifact for a \
+                                SchemaClosure request; resolver dispatch bug"
+                            .into(),
+                    },
+                ));
+            };
+            let flakes = wire.translate_to_schema_bundle_flakes(db_ref.snapshot)?;
+            executable.reasoning.schema_bundle = Some(flakes);
+            return Ok(());
+        }
+
         let Some(bundle) = crate::ontology_imports::resolve_schema_bundle(
             db_ref.snapshot,
             db_ref.overlay,

@@ -25,7 +25,11 @@ pub enum ArtifactKind {
     /// `f:constraintsSource` → set of property IRIs declared
     /// `f:enforceUnique true` on the model ledger.
     Constraints,
-    // SchemaClosure  — reserved
+    /// `f:schemaSource` → schema/ontology axiom triples projected
+    /// from the model ledger's ontology graph. Single-graph only
+    /// in Phase 1b-a; transitive `owl:imports` recursion lands in
+    /// a follow-up.
+    SchemaClosure,
     // Shapes         — reserved
     // DatalogRules   — reserved
 }
@@ -35,6 +39,7 @@ impl std::fmt::Display for ArtifactKind {
         match self {
             ArtifactKind::PolicyRules => f.write_str("PolicyRules"),
             ArtifactKind::Constraints => f.write_str("Constraints"),
+            ArtifactKind::SchemaClosure => f.write_str("SchemaClosure"),
         }
     }
 }
@@ -79,7 +84,14 @@ pub enum GovernanceArtifact {
     /// Translate to D's Sid space via
     /// [`ConstraintsArtifactWire::translate_to_sids`].
     Constraints(ConstraintsArtifactWire),
-    // SchemaClosure(SchemaBundleWire) — reserved
+    /// Schema/ontology triples in IRI-form (whitelisted subset:
+    /// rdfs:subClassOf / subPropertyOf / domain / range,
+    /// owl:inverseOf / equivalentClass / equivalentProperty /
+    /// sameAs / imports, plus rdf:type for owl:Class /
+    /// owl:ObjectProperty / etc.). Translate to a
+    /// `fluree_db_query::SchemaBundleFlakes` via
+    /// [`SchemaArtifactWire::translate_to_schema_bundle_flakes`].
+    SchemaClosure(SchemaArtifactWire),
     // Shapes(ShapeSetWire)            — reserved
     // DatalogRules(DatalogRuleSetWire) — reserved
 }
@@ -117,6 +129,92 @@ impl ConstraintsArtifactWire {
             .iter()
             .filter_map(|iri| snapshot.encode_iri(iri))
             .collect()
+    }
+}
+
+/// Term-neutral wire form for a schema/ontology artifact.
+///
+/// Carries the whitelisted schema axiom triples (rdfs:subClassOf,
+/// owl:equivalentClass, owl:imports, rdf:type for owl:Class/etc.,
+/// plus the rest of the schema-bundle whitelist) in IRI form. The
+/// translator on D encodes each IRI against D's snapshot and builds
+/// a `SchemaBundleFlakes` from the result. IRIs that fail to encode
+/// drop their triples — same semantics as the same-ledger
+/// `build_schema_bundle_flakes` flow, where `encode_iri` returning
+/// `None` for an unseen IRI contributes nothing.
+///
+/// Phase 1b-a constraint: the materializer projects only Ref-valued
+/// objects (every predicate / class in the schema whitelist is
+/// Ref-valued in practice — owl:hasValue and similar literal-valued
+/// predicates aren't in the whitelist). Future literal handling
+/// lands if a use case requires it.
+#[derive(Debug, Clone)]
+pub struct SchemaArtifactWire {
+    /// Provenance for diagnostics and cache key derivation.
+    pub origin: WireOrigin,
+    /// Schema triples in the order they were read from M's graph.
+    /// Translation re-sorts into the four index orderings.
+    pub triples: Vec<WireTriple>,
+}
+
+/// IRI-form schema triple. All three positions are IRIs in the
+/// whitelisted projection.
+#[derive(Debug, Clone)]
+pub struct WireTriple {
+    pub s: String,
+    pub p: String,
+    pub o: String,
+}
+
+impl SchemaArtifactWire {
+    /// Translate to a Sid-form `SchemaBundleFlakes` against the
+    /// data ledger's snapshot.
+    ///
+    /// Each triple's IRIs are encoded via `snapshot.encode_iri`.
+    /// Failed encodings drop the triple — D has no data of those
+    /// IRIs so the missing axiom can't fire on instance data D
+    /// doesn't have, matching same-ledger semantics. The
+    /// downstream whitelist check in
+    /// `SchemaBundleFlakes::from_collected_schema_triples` is the
+    /// canonical filter; if a future cross-ledger producer emits
+    /// non-whitelist triples they'll drop there.
+    pub fn translate_to_schema_bundle_flakes(
+        &self,
+        snapshot: &fluree_db_core::LedgerSnapshot,
+    ) -> fluree_db_query::error::Result<std::sync::Arc<fluree_db_query::schema_bundle::SchemaBundleFlakes>>
+    {
+        use fluree_db_core::flake::Flake;
+        use fluree_db_core::value::FlakeValue;
+        use fluree_db_core::Sid;
+
+        let mut collected: Vec<Flake> = Vec::with_capacity(self.triples.len());
+        for t in &self.triples {
+            let (Some(s_sid), Some(p_sid), Some(o_sid)) = (
+                snapshot.encode_iri(&t.s),
+                snapshot.encode_iri(&t.p),
+                snapshot.encode_iri(&t.o),
+            ) else {
+                continue;
+            };
+            collected.push(Flake {
+                g: None,
+                s: s_sid,
+                p: p_sid,
+                o: FlakeValue::Ref(o_sid),
+                // @id is the canonical datatype for Ref-valued
+                // objects. JSON_LD is a well-known namespace code
+                // pre-registered at genesis on every ledger, so this
+                // Sid construction is stable across ledgers.
+                dt: Sid::new(fluree_vocab::namespaces::JSON_LD, "id"),
+                t: 0,
+                op: true,
+                m: None,
+            });
+        }
+        fluree_db_query::schema_bundle::SchemaBundleFlakes::from_collected_schema_triples(
+            collected,
+        )
+        .map(std::sync::Arc::new)
     }
 }
 

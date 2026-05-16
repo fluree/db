@@ -80,6 +80,55 @@ impl SchemaBundleFlakes {
         }
     }
 
+    /// Build a bundle from a pre-collected flake list. Shared by
+    /// the same-ledger ([`build_schema_bundle_flakes`]) and
+    /// cross-ledger (the API crate's `SchemaArtifactWire::translate_to_schema_bundle_flakes`)
+    /// paths so both apply the same sort + dedupe discipline and
+    /// produce the same four index orderings.
+    ///
+    /// The caller is responsible for whitelist correctness — both
+    /// callers project only whitelist-matching triples before
+    /// invoking this helper. The function does not re-validate.
+    pub fn from_collected_schema_triples(mut collected: Vec<Flake>) -> Result<Self> {
+        if collected.is_empty() {
+            return Ok(Self::empty());
+        }
+
+        collected.sort_by(|a, b| {
+            a.s.cmp(&b.s)
+                .then_with(|| a.p.cmp(&b.p))
+                .then_with(|| a.o.cmp(&b.o))
+                .then_with(|| a.t.cmp(&b.t))
+                .then_with(|| a.op.cmp(&b.op))
+        });
+        collected.dedup_by(|a, b| {
+            a.s == b.s && a.p == b.p && a.o == b.o && a.t == b.t && a.op == b.op
+        });
+
+        let mut spot = collected.clone();
+        let mut psot = collected.clone();
+        let mut post = collected.clone();
+        let mut opst = collected;
+
+        spot.sort_by(IndexType::Spot.comparator());
+        psot.sort_by(IndexType::Psot.comparator());
+        post.sort_by(IndexType::Post.comparator());
+        opst.sort_by(IndexType::Opst.comparator());
+
+        // Epoch is just the flake count for cross-ledger; same-ledger
+        // mixes in the source graph ids via the existing
+        // build_schema_bundle_flakes path.
+        let epoch: u64 = spot.len() as u64;
+
+        Ok(Self {
+            spot: spot.into(),
+            psot: psot.into(),
+            post: post.into(),
+            opst: opst.into(),
+            epoch,
+        })
+    }
+
     /// Total number of projected flakes (same across all index orderings).
     pub fn len(&self) -> usize {
         self.spot.len()

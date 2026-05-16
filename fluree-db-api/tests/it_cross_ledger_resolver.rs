@@ -264,6 +264,154 @@ async fn multiple_rdf_types_are_all_captured_in_policy_types() {
     assert!(r.policy_types.contains(&"http://example.org/ns/OrgPolicy".to_string()));
 }
 
+/// Cross-ledger schema materialization picks up the whitelisted
+/// ontology axiom triples in M's schema graph and projects them
+/// into IRI form. Reasoner-level enforcement is exercised
+/// separately; this test pins the wire artifact contract — the
+/// materializer hits the right whitelist, decodes M's Sids to
+/// IRIs that survive transport, and origin metadata reflects M.
+#[tokio::test]
+async fn cross_ledger_schema_materializes_whitelisted_axioms() {
+    let fluree = FlureeBuilder::memory().build_memory();
+
+    let model_id = "test/cross-ledger/schema:main";
+    let model = genesis_ledger(&fluree, model_id);
+    let schema_graph_iri = "http://example.org/ontology/core";
+
+    // M's schema graph: a small class hierarchy + a property
+    // hierarchy that should both surface in the wire artifact.
+    let trig = format!(
+        r#"
+        @prefix owl:  <http://www.w3.org/2002/07/owl#> .
+        @prefix rdf:  <http://www.w3.org/1999/02/22-rdf-syntax-ns#> .
+        @prefix rdfs: <http://www.w3.org/2000/01/rdf-schema#> .
+        @prefix ex:   <http://example.org/ns/> .
+
+        GRAPH <{schema_graph_iri}> {{
+            ex:Animal  rdf:type           owl:Class .
+            ex:Dog     rdf:type           owl:Class ;
+                       rdfs:subClassOf    ex:Animal .
+
+            ex:knows   rdf:type           owl:ObjectProperty .
+            ex:friend  rdf:type           owl:ObjectProperty ;
+                       rdfs:subPropertyOf ex:knows .
+        }}
+    "#
+    );
+    fluree
+        .stage_owned(model)
+        .upsert_turtle(&trig)
+        .execute()
+        .await
+        .expect("seed M schema graph");
+
+    let data_id = "test/cross-ledger/schema-d:main";
+    let _ = genesis_ledger(&fluree, data_id);
+
+    let mut ctx = ResolveCtx::new(data_id, &fluree);
+    let resolved = resolve_graph_ref(
+        &cross_ref(model_id, schema_graph_iri),
+        ArtifactKind::SchemaClosure,
+        &mut ctx,
+    )
+    .await
+    .expect("cross-ledger schema resolution");
+
+    assert_eq!(resolved.model_ledger_id, model_id);
+    assert_eq!(resolved.graph_iri, schema_graph_iri);
+
+    let GovernanceArtifact::SchemaClosure(wire) = &resolved.artifact else {
+        panic!(
+            "expected SchemaClosure artifact for ArtifactKind::SchemaClosure, \
+             got {:?}",
+            resolved.artifact
+        );
+    };
+    assert_eq!(wire.origin.model_ledger_id, model_id);
+    assert_eq!(wire.origin.graph_iri, schema_graph_iri);
+
+    // The wire must include the rdfs:subClassOf axiom in IRI form.
+    let triples = &wire.triples;
+    let subclass_axiom = triples.iter().find(|t| {
+        t.s == "http://example.org/ns/Dog"
+            && t.p == "http://www.w3.org/2000/01/rdf-schema#subClassOf"
+            && t.o == "http://example.org/ns/Animal"
+    });
+    assert!(
+        subclass_axiom.is_some(),
+        "wire must include ex:Dog rdfs:subClassOf ex:Animal in IRI form, got: {triples:?}"
+    );
+
+    // ...and the rdfs:subPropertyOf axiom.
+    let subproperty_axiom = triples.iter().find(|t| {
+        t.s == "http://example.org/ns/friend"
+            && t.p == "http://www.w3.org/2000/01/rdf-schema#subPropertyOf"
+            && t.o == "http://example.org/ns/knows"
+    });
+    assert!(
+        subproperty_axiom.is_some(),
+        "wire must include ex:friend rdfs:subPropertyOf ex:knows, got: {triples:?}"
+    );
+
+    // ...and the rdf:type owl:Class declarations.
+    let class_decl = triples.iter().find(|t| {
+        t.s == "http://example.org/ns/Animal"
+            && t.p == "http://www.w3.org/1999/02/22-rdf-syntax-ns#type"
+            && t.o == "http://www.w3.org/2002/07/owl#Class"
+    });
+    assert!(
+        class_decl.is_some(),
+        "wire must include ex:Animal rdf:type owl:Class, got: {triples:?}"
+    );
+}
+
+/// A cross-ledger schema reference against a model ledger that
+/// holds no schema triples (or no whitelisted axioms) yields a wire
+/// artifact with zero triples — not an error.
+#[tokio::test]
+async fn cross_ledger_schema_empty_graph_yields_empty_wire() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let model_id = "test/cross-ledger/schema-empty:main";
+    let model = genesis_ledger(&fluree, model_id);
+
+    // Non-schema data in a named graph so the graph EXISTS.
+    let graph_iri = "http://example.org/non-schema";
+    fluree
+        .stage_owned(model)
+        .upsert_turtle(&format!(
+            r#"
+            @prefix ex: <http://example.org/ns/> .
+
+            GRAPH <{graph_iri}> {{
+                ex:alice ex:name "Alice" .
+            }}
+        "#
+        ))
+        .execute()
+        .await
+        .expect("seed non-schema data");
+
+    let data_id = "test/cross-ledger/schema-empty-d:main";
+    let _ = genesis_ledger(&fluree, data_id);
+
+    let mut ctx = ResolveCtx::new(data_id, &fluree);
+    let resolved = resolve_graph_ref(
+        &cross_ref(model_id, graph_iri),
+        ArtifactKind::SchemaClosure,
+        &mut ctx,
+    )
+    .await
+    .expect("cross-ledger schema resolution against non-schema graph");
+
+    let GovernanceArtifact::SchemaClosure(wire) = &resolved.artifact else {
+        panic!("expected SchemaClosure");
+    };
+    assert!(
+        wire.triples.is_empty(),
+        "non-schema data in graph must yield zero whitelisted triples"
+    );
+}
+
 /// A canonically-typed policy (`rdf:type f:AccessPolicy`) that has
 /// NEITHER `f:allow` nor `f:query` is treated as `Deny` by the same-
 /// ledger materializer (with a warning) — so the cross-ledger
