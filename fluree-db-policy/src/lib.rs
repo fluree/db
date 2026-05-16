@@ -62,5 +62,6 @@ pub use types::{
     PolicyValue, PolicyWrapper, PropertyPolicyEntry, TargetMode,
 };
 pub use wire::{
-    build_policy_set_from_wire, PolicyArtifactWire, WireOrigin, WirePolicyValue, WireRestriction,
+    build_policy_set_from_wire, wire_to_restrictions, PolicyArtifactWire, WireOrigin,
+    WirePolicyValue, WireRestriction,
 };

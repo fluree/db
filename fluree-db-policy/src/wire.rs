@@ -100,30 +100,51 @@ pub enum WirePolicyValue {
     Query(String),
 }
 
-/// Translate a wire artifact into a Sid-form [`PolicySet`] against a
-/// data ledger's term space.
+/// Translate a wire artifact into a list of Sid-form
+/// [`PolicyRestriction`]s against a data ledger's term space.
+///
+/// This is the lower-level entry point used by the API layer when it
+/// needs to merge cross-ledger restrictions into the existing
+/// `build_policy_context_from_opts` flow (which builds the indexed
+/// `PolicySet` itself with stats applied later). Callers that just
+/// want a ready-to-use `PolicySet` should use
+/// [`build_policy_set_from_wire`] instead.
 ///
 /// `resolve_iri` is the term-translation hook. Production wraps
-/// `LedgerSnapshot::encode_iri`. Tests can pass an in-memory stub.
+/// `LedgerSnapshot::encode_iri`; tests can pass an in-memory stub.
 ///
-/// IRIs that fail to resolve are dropped from their target set: the
+/// `policy_class_filter` (optional) is an exact IRI intersection
+/// against each restriction's `policy_types`. When `Some(set)`:
+///
+/// - A restriction passes if any IRI in its `policy_types` appears
+///   in `set`.
+/// - A restriction whose `policy_types` is empty is **dropped**
+///   (an untyped policy can never satisfy a class-based filter).
+///
+/// When `None`, every restriction in the wire artifact is included
+/// — useful for callers that have already filtered, or for tests.
+///
+/// IRIs that fail to resolve are dropped from their target set; the
 /// restriction is still included in the result with the unresolvable
-/// targets removed (its `id` remains observable for diagnostics).
-/// Whether unresolved IRIs should instead be interned on demand
-/// against D is a separate decision that lands with the resolver
-/// itself (a later slice); this function preserves whatever the
-/// closure returns and applies no policy of its own.
-pub fn build_policy_set_from_wire<R>(
+/// targets removed. Its `id` remains observable for diagnostics. The
+/// resolver itself decides whether unresolved IRIs should be
+/// interned on demand against D — this function preserves whatever
+/// the closure returns and applies no policy of its own.
+pub fn wire_to_restrictions<R>(
     wire: &PolicyArtifactWire,
     resolve_iri: R,
-    stats: Option<&IndexStats>,
-    action_filter: PolicyAction,
-) -> Result<PolicySet>
+    policy_class_filter: Option<&HashSet<String>>,
+) -> Result<Vec<PolicyRestriction>>
 where
     R: Fn(&str) -> Option<Sid>,
 {
-    let mut restrictions = Vec::with_capacity(wire.restrictions.len());
+    let mut out = Vec::with_capacity(wire.restrictions.len());
     for w in &wire.restrictions {
+        if let Some(filter) = policy_class_filter {
+            if !w.policy_types.iter().any(|t| filter.contains(t)) {
+                continue;
+            }
+        }
         let targets: HashSet<Sid> = w.targets.iter().filter_map(|iri| resolve_iri(iri)).collect();
         let for_classes: HashSet<Sid> = w
             .for_classes
@@ -135,7 +156,7 @@ where
             WirePolicyValue::Deny => PolicyValue::Deny,
             WirePolicyValue::Query(json) => PolicyValue::Query(PolicyQuery { json: json.clone() }),
         };
-        restrictions.push(PolicyRestriction {
+        out.push(PolicyRestriction {
             id: w.id.clone(),
             target_mode: w.target_mode,
             targets,
@@ -150,6 +171,26 @@ where
             class_check_needed: false,
         });
     }
+    Ok(out)
+}
+
+/// Translate a wire artifact directly into a Sid-form [`PolicySet`].
+///
+/// Thin wrapper over [`wire_to_restrictions`] + [`build_policy_set`]
+/// — useful for callers (and tests) that don't need to fold the
+/// restrictions into the same-ledger materializer's flow. Does no
+/// `policy_class` filtering; pass a pre-filtered wire artifact (or
+/// use `wire_to_restrictions` directly with a filter).
+pub fn build_policy_set_from_wire<R>(
+    wire: &PolicyArtifactWire,
+    resolve_iri: R,
+    stats: Option<&IndexStats>,
+    action_filter: PolicyAction,
+) -> Result<PolicySet>
+where
+    R: Fn(&str) -> Option<Sid>,
+{
+    let restrictions = wire_to_restrictions(wire, resolve_iri, None)?;
     Ok(build_policy_set(restrictions, stats, action_filter))
 }
 
@@ -347,6 +388,101 @@ mod tests {
         let wire_miss = wire_set.restrictions_for_flake(&alice_sid, &unrelated);
         assert_eq!(local_miss.len(), 0);
         assert_eq!(wire_miss.len(), 0);
+    }
+
+    #[test]
+    fn policy_class_filter_keeps_matching_restrictions_and_drops_others() {
+        // Two restrictions: one typed as f:AccessPolicy, one as
+        // ex:OrgPolicy. Filtering on {ex:OrgPolicy} must keep only
+        // the second; filtering on {f:AccessPolicy, ex:OrgPolicy}
+        // must keep both; filtering on {ex:Unrelated} must keep
+        // neither.
+        let access_iri = "https://ns.flur.ee/db#AccessPolicy";
+        let org_iri = "http://example.org/ns/OrgPolicy";
+        let unrelated_iri = "http://example.org/ns/Unrelated";
+
+        let wire = PolicyArtifactWire {
+            origin: wire_origin(),
+            restrictions: vec![
+                WireRestriction {
+                    id: "ex:r-access".into(),
+                    policy_types: vec![access_iri.into()],
+                    target_mode: TargetMode::Default,
+                    targets: vec![],
+                    action: PolicyAction::View,
+                    value: WirePolicyValue::Allow,
+                    required: false,
+                    message: None,
+                    class_policy: false,
+                    for_classes: vec![],
+                },
+                WireRestriction {
+                    id: "ex:r-org".into(),
+                    policy_types: vec![org_iri.into()],
+                    target_mode: TargetMode::Default,
+                    targets: vec![],
+                    action: PolicyAction::View,
+                    value: WirePolicyValue::Allow,
+                    required: false,
+                    message: None,
+                    class_policy: false,
+                    for_classes: vec![],
+                },
+            ],
+        };
+
+        // Only ex:OrgPolicy → drop the access-typed rule.
+        let org_only: HashSet<String> = [org_iri.to_string()].into_iter().collect();
+        let kept = wire_to_restrictions(&wire, stub_resolver(&[]), Some(&org_only))
+            .expect("filter to org only");
+        assert_eq!(kept.len(), 1);
+        assert_eq!(kept[0].id, "ex:r-org");
+
+        // Both classes → keep both.
+        let both: HashSet<String> =
+            [access_iri.to_string(), org_iri.to_string()].into_iter().collect();
+        let kept = wire_to_restrictions(&wire, stub_resolver(&[]), Some(&both))
+            .expect("filter to both");
+        assert_eq!(kept.len(), 2);
+
+        // Unrelated class → drop everything.
+        let unrelated: HashSet<String> = [unrelated_iri.to_string()].into_iter().collect();
+        let kept = wire_to_restrictions(&wire, stub_resolver(&[]), Some(&unrelated))
+            .expect("filter to unrelated");
+        assert!(kept.is_empty());
+
+        // None filter → keep everything.
+        let kept = wire_to_restrictions(&wire, stub_resolver(&[]), None).expect("no filter");
+        assert_eq!(kept.len(), 2);
+    }
+
+    #[test]
+    fn policy_class_filter_drops_untyped_restrictions() {
+        // A restriction with empty policy_types can never satisfy a
+        // class filter — even one with a permissive class set —
+        // because there's no rdf:type to match. Such restrictions
+        // are dropped when any filter is supplied.
+        let wire = PolicyArtifactWire {
+            origin: wire_origin(),
+            restrictions: vec![WireRestriction {
+                id: "ex:untyped".into(),
+                policy_types: vec![],
+                target_mode: TargetMode::Default,
+                targets: vec![],
+                action: PolicyAction::View,
+                value: WirePolicyValue::Allow,
+                required: false,
+                message: None,
+                class_policy: false,
+                for_classes: vec![],
+            }],
+        };
+
+        let filter: HashSet<String> =
+            ["https://ns.flur.ee/db#AccessPolicy".to_string()].into_iter().collect();
+        let kept = wire_to_restrictions(&wire, stub_resolver(&[]), Some(&filter))
+            .expect("filter with untyped");
+        assert!(kept.is_empty(), "untyped restriction must be dropped");
     }
 
     #[test]

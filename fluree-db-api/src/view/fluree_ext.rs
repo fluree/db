@@ -608,6 +608,71 @@ impl Fluree {
             opts.clone()
         };
 
+        // Cross-ledger detection: if the resolved config's
+        // f:policySource carries an f:ledger reference, route through
+        // the cross-ledger resolver. Same-ledger configs continue
+        // through the unchanged local path.
+        let source = view
+            .resolved_config
+            .as_ref()
+            .and_then(|c| c.policy.as_ref())
+            .and_then(|p| p.policy_source.as_ref());
+
+        let is_cross_ledger = source.is_some_and(|s| s.ledger.is_some());
+
+        if is_cross_ledger {
+            // Phase 1a: cross-ledger + identity-mode is not supported.
+            // The model ledger contributes policy rules; the data
+            // ledger contributes identity binding. Mixing them
+            // ambiguously is a fail-closed config error.
+            if effective_opts.identity.is_some() {
+                return Err(crate::error::ApiError::config(
+                    "cross-ledger f:policySource cannot be combined with opts.identity \
+                     in Phase 1a; use opts.policy_class with the cross-ledger config",
+                ));
+            }
+
+            let source = source.expect("checked above");
+            let mut ctx = crate::cross_ledger::ResolveCtx::new(view.snapshot.ledger_id.as_str(), self);
+            let resolved = crate::cross_ledger::resolve_graph_ref(
+                source,
+                crate::cross_ledger::ArtifactKind::PolicyRules,
+                &mut ctx,
+            )
+            .await?;
+            let crate::cross_ledger::GovernanceArtifact::PolicyRules(wire) = &resolved.artifact;
+
+            // Apply the data ledger's configured policy_class set as
+            // an exact-IRI intersection filter on the wire's
+            // restrictions. Empty / unset class set means "let every
+            // typed policy through" — typical when D wants M's full
+            // ruleset and trusts the model ledger's authoring.
+            let filter: Option<std::collections::HashSet<String>> = effective_opts
+                .policy_class
+                .as_ref()
+                .filter(|v| !v.is_empty())
+                .map(|v| v.iter().cloned().collect());
+            let snapshot_ref = &view.snapshot;
+            let restrictions = fluree_db_policy::wire_to_restrictions(
+                wire,
+                |iri| snapshot_ref.encode_iri(iri),
+                filter.as_ref(),
+            )
+            .map_err(crate::error::ApiError::from)?;
+
+            let policy_ctx = crate::policy_builder::build_policy_context_from_opts_with_cross_ledger(
+                &view.snapshot,
+                view.overlay.as_ref(),
+                view.novelty_for_stats(),
+                view.t,
+                &effective_opts,
+                &[0], // identity-mode uses [0]; unused under cross-ledger
+                restrictions,
+            )
+            .await?;
+            return Ok(view.with_policy(Arc::new(policy_ctx)));
+        }
+
         let policy_graphs = if let Some(ref resolved) = view.resolved_config {
             let source = resolved
                 .policy
