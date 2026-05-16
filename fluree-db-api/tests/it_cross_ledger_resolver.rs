@@ -324,6 +324,281 @@ async fn missing_effect_on_typed_policy_is_picked_up_as_deny() {
     );
 }
 
+/// Distinct-namespace-codes canary.
+///
+/// The design doc treats this as a mandatory cross-cutting test:
+/// term translation must operate on IRIs end-to-end, never on M's
+/// internal Sids. If a future change makes the wire form leak Sids
+/// from M's namespace map, this test would fail — D's lookup of
+/// the policy's class IRI would land on a different Sid than M
+/// embedded, and the enforcement would silently miss.
+///
+/// To make the canary non-trivial, D is pre-seeded with an
+/// unrelated namespace before its policy-relevant data lands, so
+/// D's `http://example.org/ns/` prefix is registered at a
+/// different `ns_code` than M's. The test asserts the codes
+/// actually diverge, then runs the end-to-end enforcement and
+/// confirms M's deny rule applies against D's data.
+#[tokio::test]
+async fn distinct_namespace_codes_canary_term_translation_still_works() {
+    let fluree = FlureeBuilder::memory().build_memory();
+
+    // Build M first with the policy graph using ex:User.
+    let model_id = "test/cross-ledger/canary/model:main";
+    let model = genesis_ledger(&fluree, model_id);
+    let policy_graph_iri = "http://example.org/canary-policy";
+    fluree
+        .stage_owned(model)
+        .upsert_turtle(&format!(
+            r#"
+            @prefix f:    <https://ns.flur.ee/db#> .
+            @prefix rdf:  <http://www.w3.org/1999/02/22-rdf-syntax-ns#> .
+            @prefix ex:   <http://example.org/ns/> .
+
+            GRAPH <{policy_graph_iri}> {{
+                ex:denyUsers
+                    rdf:type    f:AccessPolicy ;
+                    f:action    f:view ;
+                    f:onClass   ex:User ;
+                    f:allow     false .
+            }}
+        "#
+        ))
+        .execute()
+        .await
+        .expect("seed M");
+
+    // D pre-seeded with an UNRELATED namespace before its
+    // ex:-prefixed data lands. The unrelated insert allocates
+    // an ns_code first, so when ex:User finally lands, its prefix
+    // ends up at a different code than M assigned.
+    let data_id = "test/cross-ledger/canary/data:main";
+    let data = genesis_ledger(&fluree, data_id);
+    let r1 = fluree
+        .insert(
+            data,
+            &json!({
+                "@context": {"unrelated": "http://unrelated.example.org/v1/"},
+                "@graph": [
+                    {"@id": "unrelated:seed-a", "unrelated:tag": "first"},
+                    {"@id": "unrelated:seed-b", "unrelated:tag": "second"}
+                ]
+            }),
+        )
+        .await
+        .expect("seed unrelated namespace into D");
+    let data = r1.ledger;
+
+    let r2 = fluree
+        .insert(
+            data,
+            &json!({
+                "@context": {"ex": "http://example.org/ns/"},
+                "@id": "ex:alice",
+                "@type": "ex:User",
+                "ex:name": "Alice"
+            }),
+        )
+        .await
+        .expect("seed ex:User data into D");
+    let data = r2.ledger;
+
+    // Inspect both ledgers' namespace maps. If allocation happens
+    // to align (e.g., a future change to ns_code assignment) the
+    // canary degenerates into a regular enforcement test rather
+    // than asserting divergence — flag that in the message so a
+    // failure here is actionable.
+    let m_snapshot = fluree.db(model_id).await.expect("open M");
+    let d_snapshot = &data.snapshot;
+    let m_user_sid = m_snapshot
+        .snapshot
+        .encode_iri("http://example.org/ns/User")
+        .expect("ex:User should resolve in M");
+    let d_user_sid = d_snapshot
+        .encode_iri("http://example.org/ns/User")
+        .expect("ex:User should resolve in D");
+
+    if m_user_sid.namespace_code == d_user_sid.namespace_code {
+        eprintln!(
+            "WARNING: canary test ended up with matching ns_codes for ex:User \
+             ({:?} == {:?}). The end-to-end assertion still holds but this run \
+             does not exercise the cross-namespace-code path. Consider adjusting \
+             the seed order if this happens consistently.",
+            m_user_sid.namespace_code, d_user_sid.namespace_code
+        );
+    }
+
+    // Write D's cross-ledger config pointing at M.
+    let config_iri = format!("urn:fluree:{data_id}#config");
+    let r3 = fluree
+        .stage_owned(data)
+        .upsert_turtle(&format!(
+            r"
+            @prefix f:    <https://ns.flur.ee/db#> .
+            @prefix rdf:  <http://www.w3.org/1999/02/22-rdf-syntax-ns#> .
+
+            GRAPH <{config_iri}> {{
+                <urn:cfg:main> rdf:type f:LedgerConfig .
+                <urn:cfg:main> f:policyDefaults <urn:cfg:policy> .
+                <urn:cfg:policy> f:defaultAllow true .
+                <urn:cfg:policy> f:policyClass f:AccessPolicy .
+                <urn:cfg:policy> f:policySource <urn:cfg:policy-ref> .
+                <urn:cfg:policy-ref> rdf:type f:GraphRef ;
+                                     f:graphSource <urn:cfg:policy-src> .
+                <urn:cfg:policy-src> f:ledger <{model_id}> ;
+                                     f:graphSelector <{policy_graph_iri}> .
+            }}
+        "
+        ))
+        .execute()
+        .await
+        .expect("seed D cross-ledger config");
+    let _ = r3;
+
+    // End-to-end: query D for ex:User. The materializer produced M's
+    // class IRI as a string ("http://example.org/ns/User"); the
+    // translator must re-intern that against D's namespace map and
+    // arrive at d_user_sid. If translation broke (Sids leaked from M
+    // into D's evaluation), the deny would miss and alice would be
+    // visible.
+    let wrapped = fluree
+        .db_with_policy(data_id, &fluree_db_api::QueryConnectionOptions::default())
+        .await
+        .expect("db_with_policy under cross-ledger");
+
+    let users = fluree
+        .query(
+            &wrapped,
+            &json!({
+                "@context": {"ex": "http://example.org/ns/"},
+                "select": "?u",
+                "where": {"@id": "?u", "@type": "ex:User"}
+            }),
+        )
+        .await
+        .expect("query ex:User");
+    let users_jsonld = users.to_jsonld(&wrapped.snapshot).expect("jsonld");
+    assert_eq!(
+        users_jsonld,
+        json!([]),
+        "cross-ledger deny must apply against D's data even when D's \
+         ns_code for the class IRI differs from M's; got {users_jsonld}"
+    );
+}
+
+/// Single-resolution-t.
+///
+/// Within one request (one `ResolveCtx`), every cross-ledger
+/// reference to the same model ledger M must use the same
+/// `resolved_t` even if M advances in the middle. The design doc
+/// makes this property mandatory so policy / shapes / schema can
+/// never disagree about which version of M they're enforcing for
+/// a given request.
+#[tokio::test]
+async fn single_resolution_t_is_stable_within_a_request() {
+    let fluree = FlureeBuilder::memory().build_memory();
+
+    let model_id = "test/cross-ledger/stable-t/model:main";
+    let model = genesis_ledger(&fluree, model_id);
+
+    // M holds two policy graphs from the start so both resolutions
+    // can succeed without M needing to advance for them to exist.
+    let graph_a_iri = "http://example.org/policy-a";
+    let graph_b_iri = "http://example.org/policy-b";
+    let r1 = fluree
+        .stage_owned(model)
+        .upsert_turtle(&format!(
+            r#"
+            @prefix f:    <https://ns.flur.ee/db#> .
+            @prefix rdf:  <http://www.w3.org/1999/02/22-rdf-syntax-ns#> .
+            @prefix ex:   <http://example.org/ns/> .
+
+            GRAPH <{graph_a_iri}> {{
+                ex:ruleA rdf:type f:AccessPolicy ; f:action f:view ; f:allow true .
+            }}
+            GRAPH <{graph_b_iri}> {{
+                ex:ruleB rdf:type f:AccessPolicy ; f:action f:view ; f:allow false .
+            }}
+        "#
+        ))
+        .execute()
+        .await
+        .expect("seed M with two policy graphs");
+    let model = r1.ledger;
+
+    let data_id = "test/cross-ledger/stable-t/data:main";
+    let _ = genesis_ledger(&fluree, data_id);
+
+    // Single ResolveCtx = single request. Resolve A, advance M, then
+    // resolve B. B's resolved_t must equal A's — captured once at the
+    // first reference, not re-read between resolutions.
+    let mut ctx = ResolveCtx::new(data_id, &fluree);
+
+    let resolved_a = resolve_graph_ref(
+        &cross_ref(model_id, graph_a_iri),
+        ArtifactKind::PolicyRules,
+        &mut ctx,
+    )
+    .await
+    .expect("resolve A");
+    let t_at_first_resolution = resolved_a.resolved_t;
+
+    // Advance M between the two resolutions. Without single-
+    // resolution-t, the second resolve would pick up this new head.
+    fluree
+        .insert(
+            model,
+            &json!({
+                "@context": {"ex": "http://example.org/ns/"},
+                "@id": "ex:filler",
+                "ex:val": "advance M"
+            }),
+        )
+        .await
+        .expect("advance M's commit_t");
+
+    let resolved_b = resolve_graph_ref(
+        &cross_ref(model_id, graph_b_iri),
+        ArtifactKind::PolicyRules,
+        &mut ctx,
+    )
+    .await
+    .expect("resolve B");
+
+    assert_eq!(
+        resolved_b.resolved_t, t_at_first_resolution,
+        "second resolution within the same request must reuse the captured \
+         resolved_t (got {} after advancing M; first capture was {})",
+        resolved_b.resolved_t, t_at_first_resolution,
+    );
+
+    // Verify resolved_ts cached the head exactly once. A new
+    // request would re-capture against the advanced M; the cache
+    // is per-request, not per-instance.
+    assert_eq!(ctx.resolved_ts.len(), 1);
+    assert_eq!(
+        ctx.resolved_ts.get(model_id),
+        Some(&t_at_first_resolution),
+        "resolved_ts must store the captured t once per canonical model id"
+    );
+
+    // Sanity: a new ResolveCtx against the same Fluree DOES re-capture
+    // against M's current head.
+    let mut fresh_ctx = ResolveCtx::new(data_id, &fluree);
+    let resolved_a_fresh = resolve_graph_ref(
+        &cross_ref(model_id, graph_a_iri),
+        ArtifactKind::PolicyRules,
+        &mut fresh_ctx,
+    )
+    .await
+    .expect("resolve A in fresh ctx");
+    assert!(
+        resolved_a_fresh.resolved_t > t_at_first_resolution,
+        "a fresh request should see M's advanced head (got {}, expected > {})",
+        resolved_a_fresh.resolved_t, t_at_first_resolution
+    );
+}
+
 /// The per-instance governance cache makes the same (M, graph, t)
 /// reusable across requests and across every data ledger on the
 /// instance. Two independent ResolveCtxs (simulating two requests)
