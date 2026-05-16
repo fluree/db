@@ -3,8 +3,9 @@
 //! The single helper shared by every subsystem (policy / shapes /
 //! schema / rules / constraints). Materialization is dispatched per
 //! [`ArtifactKind`]; only `PolicyRules` is implemented in Phase 1a
-//! (this slice provides the orchestration skeleton — the per-kind
-//! materializer is added in slice 4).
+//! and dispatches into `policy_materializer`. Other kinds will return
+//! `CrossLedgerError::TranslationFailed` until their projector lands
+//! in a later phase.
 //!
 //! See `docs/design/cross-ledger-model-enforcement.md`.
 
@@ -21,27 +22,27 @@ use std::sync::Arc;
 ///
 /// Performs, in order:
 ///
-/// 1. Validate this is actually a cross-ledger ref (`f:ledger` set)
-///    and that unsupported Phase-4 fields (`f:trustPolicy`,
-///    `f:rollbackGuard`) are absent.
+/// 1. Reject Phase-3 and Phase-4 fields (`f:atT`, `f:trustPolicy`,
+///    `f:rollbackGuard`) with [`CrossLedgerError::UnsupportedFeature`];
+///    validate this is a cross-ledger ref (`f:ledger` and
+///    `f:graphSelector` both set).
 /// 2. Canonicalize the model ledger id via the nameservice
 ///    (`nameservice.lookup`); fail with `ModelLedgerMissing` if the
 ///    ledger is absent or retracted on this instance.
 /// 3. Reject `#config` / `#txn-meta` selectors before any storage
 ///    round-trip on M.
-/// 4. Capture `resolved_t` — `f:atT` pin if set, else lazy per-request
-///    head-t in `ctx.resolved_ts`.
-/// 5. Form the tuple `(canonical_model_ledger_id, graph_iri,
-///    resolved_t)` and check `ctx.memo`. On hit, return immediately.
-/// 6. Check `ctx.active` for cycles. On miss, push and call into the
-///    per-kind materializer.
+/// 4. Capture `resolved_t` lazily: read `ctx.resolved_ts[model_id]`
+///    on hit, else read M's head `commit_t` once and store. Pinned
+///    `f:atT` is rejected at step (1) until Phase 3.
+/// 5. Form the resolution key
+///    `(ArtifactKind, canonical_model_ledger_id, graph_iri,
+///    resolved_t)` and check `ctx.memo`. On hit, return immediately
+///    — cross-subsystem de-dup runs before cycle detection.
+/// 6. Check `ctx.active` for cycles. On miss, push and call into
+///    the per-kind materializer.
 /// 7. On materializer success, pop `active`, insert into `memo`, and
-///    return.
-///
-/// Materialization itself is not implemented in this slice — the
-/// per-kind dispatch returns
-/// `CrossLedgerError::TranslationFailed { detail: "..." }` so call
-/// sites can be wired before the projector lands.
+///    return. On failure, pop `active` so a deeper failure doesn't
+///    poison subsequent calls.
 pub async fn resolve_graph_ref(
     graph_ref: &GraphSourceRef,
     kind: ArtifactKind,

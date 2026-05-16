@@ -46,8 +46,10 @@ pub(crate) type ResolutionKey = (ArtifactKind, String, String, i64);
 
 /// A successfully resolved, term-neutral governance artifact.
 ///
-/// Cached at the API layer by `(model_ledger_id, graph_iri,
-/// resolved_t)`; per-data-ledger interning is a separate step.
+/// Cached at the API layer by `(ArtifactKind, model_ledger_id,
+/// graph_iri, resolved_t)` — see [`ResolutionKey`]. Per-data-ledger
+/// interning is a separate step that happens at the wire→PolicySet
+/// boundary against D's snapshot.
 #[derive(Debug, Clone)]
 pub struct ResolvedGraph {
     /// Canonical model ledger id this artifact came from.
@@ -56,16 +58,18 @@ pub struct ResolvedGraph {
     pub graph_iri: String,
     /// Model ledger `t` at which the artifact was materialized.
     pub resolved_t: i64,
-    /// The artifact itself, tagged by subsystem.
+    /// The artifact itself, tagged by subsystem. Pattern-match this
+    /// against the expected `GovernanceArtifact` variant for the
+    /// requesting `ArtifactKind`.
     pub artifact: GovernanceArtifact,
 }
 
 /// Tagged union of governance artifacts.
 ///
-/// The kind is named so a `ResolveCtx` memo (which is keyed only on
-/// `(ledger, graph, t)`) can carry mixed artifact types without
-/// dynamic dispatch and so callers can pattern-match to extract the
-/// shape they expect.
+/// The variant is paired with [`ArtifactKind`] in [`ResolutionKey`]
+/// so the memo can carry mixed artifact types without dynamic
+/// dispatch — callers pattern-match to extract the shape they
+/// expect.
 #[derive(Debug, Clone)]
 pub enum GovernanceArtifact {
     /// Policy rule set in IRI-form. Translate to `PolicySet` via
@@ -79,24 +83,26 @@ pub enum GovernanceArtifact {
 
 /// Per-request resolution context.
 ///
-/// Born with the full lifetime / consistency model so the resolver
-/// API is correct from day one even before materialization lands:
+/// Holds the full lifetime / consistency model for cross-ledger
+/// resolution within a single request:
 ///
 /// - `resolved_ts` captures the lazy per-request head-t per
-///   canonical model ledger id (governance-context capture). Lookup
-///   on miss reads M's head once and stores it; later unpinned
+///   canonical model ledger id (governance-context capture).
+///   Lookup on miss reads M's head once and stores it; subsequent
 ///   references to the same M reuse the same value so policy and
 ///   shapes can never disagree about which version of M they're
-///   enforcing.
+///   enforcing. `f:atT` pins are rejected as
+///   [`CrossLedgerError::UnsupportedFeature`] until Phase 3 lands,
+///   so the only `resolved_t` source today is this lazy capture.
 ///
-/// - `active` is the resolution stack used for cycle detection. Push
-///   before recursion, pop after. A tuple is a cycle only when it is
+/// - `active` is the resolution stack used for cycle detection.
+///   Push before recursion, pop after. A key is a cycle only when
 ///   encountered while *already on the stack*.
 ///
 /// - `memo` is the per-request completed map. Subsequent references
-///   to the same `(ledger, graph, t)` tuple — from any subsystem —
-///   short-circuit on a memo hit. Memo hits never enter `active`,
-///   so cross-subsystem de-dup never trips cycle detection.
+///   to the same [`ResolutionKey`] — from any subsystem — short-
+///   circuit on a memo hit. Memo hits never enter `active`, so
+///   cross-subsystem de-dup never trips cycle detection.
 pub struct ResolveCtx<'a> {
     /// Canonical data-ledger id D.
     pub data_ledger_id: &'a str,
@@ -104,8 +110,9 @@ pub struct ResolveCtx<'a> {
     /// constraint) the referenced model ledger.
     pub fluree: &'a Fluree,
     /// Lazy governance-context capture: canonical model ledger id →
-    /// `resolved_t` for unpinned references. Pinned `f:atT` does NOT
-    /// populate this map; pinned values are per-resolve.
+    /// `resolved_t`. Phase 1a is the only producer (M's head at
+    /// first reference); pinned `f:atT` is rejected upstream until
+    /// Phase 3.
     pub resolved_ts: HashMap<String, i64>,
     /// Active resolution stack (cycle detection). Keyed on the full
     /// resolution tuple including `ArtifactKind` so a `PolicyRules`
