@@ -91,6 +91,25 @@ pub enum CrossLedgerError {
         detail: String,
     },
 
+    /// A `GraphSourceRef` field is parsed but its implementation is
+    /// deferred to a later phase (`f:atT` → Phase 3, `f:trustPolicy` /
+    /// `f:rollbackGuard` → Phase 4). The request fails closed rather
+    /// than silently ignoring the field, so operators don't discover
+    /// after the fact that their configured constraint had no effect.
+    #[error(
+        "feature '{feature}' on a cross-ledger f:GraphRef is not yet implemented \
+         ({phase}); request fails closed rather than ignoring the field"
+    )]
+    UnsupportedFeature {
+        /// Field name (e.g., `f:atT`, `f:trustPolicy`, `f:rollbackGuard`).
+        feature: &'static str,
+        /// Phase tag for operator diagnostics.
+        phase: &'static str,
+        /// Canonical model ledger id (or the raw alias if canonicalization
+        /// didn't happen).
+        ledger_id: String,
+    },
+
     /// `f:ledger` targets a ledger on a different instance.
     ///
     /// Same-instance is the v1 contract; cross-instance federation
@@ -187,6 +206,11 @@ mod tests {
                 ledger_id: "remote:m:main".into(),
             },
             CrossLedgerError::CycleDetected { chain: vec![] },
+            CrossLedgerError::UnsupportedFeature {
+                feature: "f:atT",
+                phase: "Phase 3",
+                ledger_id: "m:main".into(),
+            },
         ];
 
         for v in variants {

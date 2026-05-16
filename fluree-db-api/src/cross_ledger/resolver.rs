@@ -47,18 +47,29 @@ pub async fn resolve_graph_ref(
     kind: ArtifactKind,
     ctx: &mut ResolveCtx<'_>,
 ) -> Result<Arc<ResolvedGraph>, CrossLedgerError> {
-    // (1) Phase-4 fields not yet supported. Surface a clear failure
-    // rather than silently ignoring them.
-    if graph_ref.trust_policy.is_some() {
-        return Err(CrossLedgerError::TrustCheckFailed {
+    // (1) Phase 3 / Phase 4 fields are parsed but not yet honored. Fail
+    // closed — partial behavior (e.g., accepting f:atT and opening M
+    // at that t with no retention check) would silently degrade the
+    // contract operators think they're getting.
+    if graph_ref.at_t.is_some() {
+        return Err(CrossLedgerError::UnsupportedFeature {
+            feature: "f:atT",
+            phase: "Phase 3",
             ledger_id: graph_ref.ledger.clone().unwrap_or_default(),
-            detail: "f:trustPolicy is not yet supported (Phase 4)".into(),
+        });
+    }
+    if graph_ref.trust_policy.is_some() {
+        return Err(CrossLedgerError::UnsupportedFeature {
+            feature: "f:trustPolicy",
+            phase: "Phase 4",
+            ledger_id: graph_ref.ledger.clone().unwrap_or_default(),
         });
     }
     if graph_ref.rollback_guard.is_some() {
-        return Err(CrossLedgerError::TrustCheckFailed {
+        return Err(CrossLedgerError::UnsupportedFeature {
+            feature: "f:rollbackGuard",
+            phase: "Phase 4",
             ledger_id: graph_ref.ledger.clone().unwrap_or_default(),
-            detail: "f:rollbackGuard is not yet supported (Phase 4)".into(),
         });
     }
 
@@ -114,13 +125,13 @@ pub async fn resolve_graph_ref(
     // different alias spelling.
     reject_if_reserved_graph(&canonical_ledger_id, graph_iri)?;
 
-    // (4) resolved_t: pinned f:atT or lazy per-request capture.
-    let resolved_t = if let Some(pinned) = graph_ref.at_t {
-        // Pinned values are NOT stored in resolved_ts; only unpinned
-        // captures are. This keeps the lazy-capture cache from being
-        // polluted by per-resolve pins.
-        pinned
-    } else if let Some(t) = ctx.resolved_ts.get(&canonical_ledger_id) {
+    // (4) resolved_t: lazy per-request capture. f:atT pins are
+    // rejected at step (1) above (Phase 3, not yet implemented), so
+    // every cross-ledger reference resolves against M's current head
+    // for the duration of the request. Per-model entries are written
+    // once and reused; subsequent unpinned references to the same M
+    // in the same request hit the cache.
+    let resolved_t = if let Some(t) = ctx.resolved_ts.get(&canonical_ledger_id) {
         *t
     } else {
         let head_t = ns_record.commit_t;
@@ -263,6 +274,33 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn at_t_pin_is_rejected_until_phase_3() {
+        // f:atT is parsed by the config layer but Phase 3 hasn't
+        // landed the retention/pinning semantics yet. Accepting the
+        // pin and using it as the resolved_t would silently bypass
+        // the "no fallback to nearest-available" retention guard
+        // the design doc requires, so resolve_graph_ref must reject.
+        let fluree = FlureeBuilder::memory().build_memory();
+        let mut ctx = ResolveCtx::new("d:main", &fluree);
+
+        let mut pinned = cross_ref("m:main", "http://example.org/policy");
+        pinned.at_t = Some(5);
+
+        let err = resolve_graph_ref(&pinned, ArtifactKind::PolicyRules, &mut ctx)
+            .await
+            .unwrap_err();
+        match err {
+            CrossLedgerError::UnsupportedFeature {
+                feature, phase, ..
+            } => {
+                assert_eq!(feature, "f:atT");
+                assert_eq!(phase, "Phase 3");
+            }
+            other => panic!("expected UnsupportedFeature for f:atT, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
     async fn trust_policy_field_is_rejected_until_phase_4() {
         let fluree = FlureeBuilder::memory().build_memory();
         let mut ctx = ResolveCtx::new("d:main", &fluree);
@@ -275,9 +313,38 @@ mod tests {
         let err = resolve_graph_ref(&ref_with_trust, ArtifactKind::PolicyRules, &mut ctx)
             .await
             .unwrap_err();
-        assert!(
-            matches!(err, CrossLedgerError::TrustCheckFailed { ref detail, .. } if detail.contains("Phase 4")),
-            "expected Phase-4 TrustCheckFailed, got {err:?}"
-        );
+        match err {
+            CrossLedgerError::UnsupportedFeature {
+                feature, phase, ..
+            } => {
+                assert_eq!(feature, "f:trustPolicy");
+                assert_eq!(phase, "Phase 4");
+            }
+            other => panic!("expected UnsupportedFeature for f:trustPolicy, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn rollback_guard_field_is_rejected_until_phase_4() {
+        let fluree = FlureeBuilder::memory().build_memory();
+        let mut ctx = ResolveCtx::new("d:main", &fluree);
+
+        let mut ref_with_guard = cross_ref("m:main", "http://example.org/policy");
+        ref_with_guard.rollback_guard = Some(fluree_db_core::ledger_config::RollbackGuard {
+            min_t: Some(100),
+        });
+
+        let err = resolve_graph_ref(&ref_with_guard, ArtifactKind::PolicyRules, &mut ctx)
+            .await
+            .unwrap_err();
+        match err {
+            CrossLedgerError::UnsupportedFeature {
+                feature, phase, ..
+            } => {
+                assert_eq!(feature, "f:rollbackGuard");
+                assert_eq!(phase, "Phase 4");
+            }
+            other => panic!("expected UnsupportedFeature for f:rollbackGuard, got {other:?}"),
+        }
     }
 }
