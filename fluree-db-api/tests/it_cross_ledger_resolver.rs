@@ -418,15 +418,19 @@ async fn distinct_namespace_codes_canary_term_translation_still_works() {
         .encode_iri("http://example.org/ns/User")
         .expect("ex:User should resolve in D");
 
-    if m_user_sid.namespace_code == d_user_sid.namespace_code {
-        eprintln!(
-            "WARNING: canary test ended up with matching ns_codes for ex:User \
-             ({:?} == {:?}). The end-to-end assertion still holds but this run \
-             does not exercise the cross-namespace-code path. Consider adjusting \
-             the seed order if this happens consistently.",
-            m_user_sid.namespace_code, d_user_sid.namespace_code
-        );
-    }
+    // Hard assertion: a CI run where these happen to align would
+    // report the canary green without actually exercising the
+    // cross-namespace-code path. The seed order above (M seeded
+    // with ex: first, D seeded with an unrelated namespace before
+    // ex:) is constructed specifically to force divergence — if a
+    // future ns-allocation change ever makes these collide, the
+    // test needs to be re-seeded, not silently tolerated.
+    assert_ne!(
+        m_user_sid.namespace_code, d_user_sid.namespace_code,
+        "canary seeding must produce distinct ns_codes for ex:User on M vs D \
+         (got M={:?}, D={:?}); adjust the seed order until they diverge",
+        m_user_sid.namespace_code, d_user_sid.namespace_code,
+    );
 
     // Write D's cross-ledger config pointing at M.
     let config_iri = format!("urn:fluree:{data_id}#config");
