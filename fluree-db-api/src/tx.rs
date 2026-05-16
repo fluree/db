@@ -595,7 +595,7 @@ async fn resolve_per_graph_unique_sids(
             // Default: annotations in the default graph (g_id=0)
             vec![0u16]
         } else {
-            resolve_constraint_source_g_ids(&transact_config.constraints_sources, snapshot)
+            resolve_constraint_source_g_ids(&transact_config.constraints_sources, snapshot)?
         };
 
         // Load f:enforceUnique annotations from each source graph
@@ -618,27 +618,56 @@ async fn resolve_per_graph_unique_sids(
 /// Maps each `f:graphSelector` IRI to a concrete graph ID:
 /// - `f:defaultGraph` → 0
 /// - Named graph IRI → lookup in `GraphRegistry`
+///
+/// Fails closed: dropping a constraint source silently would weaken
+/// uniqueness enforcement under a misconfiguration, so unknown selectors
+/// and unsupported `GraphSourceRef` fields (`f:ledger`, `f:atT`,
+/// `f:trustPolicy`, `f:rollbackGuard`) return a parse error. Matches the
+/// shapes / policy resolvers.
 fn resolve_constraint_source_g_ids(
     sources: &[fluree_db_core::ledger_config::GraphSourceRef],
     snapshot: &fluree_db_core::LedgerSnapshot,
-) -> Vec<GraphId> {
+) -> std::result::Result<Vec<GraphId>, fluree_db_transact::TransactError> {
     let mut g_ids = Vec::new();
     for source in sources {
+        if source.ledger.is_some() {
+            return Err(fluree_db_transact::TransactError::Parse(
+                "f:constraintsSource with cross-ledger f:ledger reference is not yet supported"
+                    .into(),
+            ));
+        }
+        if source.at_t.is_some() {
+            return Err(fluree_db_transact::TransactError::Parse(
+                "f:constraintsSource with f:atT (temporal pinning) is not yet supported".into(),
+            ));
+        }
+        if source.trust_policy.is_some() {
+            return Err(fluree_db_transact::TransactError::Parse(
+                "f:constraintsSource with f:trustPolicy is not yet supported".into(),
+            ));
+        }
+        if source.rollback_guard.is_some() {
+            return Err(fluree_db_transact::TransactError::Parse(
+                "f:constraintsSource with f:rollbackGuard is not yet supported".into(),
+            ));
+        }
+
         let g_id = match source.graph_selector.as_deref() {
             Some(iri) if iri == config_iris::DEFAULT_GRAPH => Some(0u16),
             Some(iri) => snapshot.graph_registry.graph_id_for_iri(iri),
             None => Some(0u16), // no selector → default graph
         };
-        if let Some(id) = g_id {
-            g_ids.push(id);
-        } else {
-            tracing::debug!(
-                selector = ?source.graph_selector,
-                "Constraint source graph not found in registry — skipping"
-            );
+        match g_id {
+            Some(id) => g_ids.push(id),
+            None => {
+                return Err(fluree_db_transact::TransactError::Parse(format!(
+                    "f:constraintsSource graph '{}' not found in this ledger's graph registry",
+                    source.graph_selector.as_deref().unwrap_or("<none>"),
+                )));
+            }
         }
     }
-    g_ids
+    Ok(g_ids)
 }
 
 /// Read `f:enforceUnique true` annotations from a single graph.

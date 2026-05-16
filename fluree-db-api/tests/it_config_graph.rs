@@ -2794,3 +2794,153 @@ async fn policy_source_cross_ledger_fails_closed() {
         "expected cross-ledger rejection, got: {msg}"
     );
 }
+
+// =============================================================================
+// f:constraintsSource fail-closed behavior
+//
+// The previous resolver silently skipped unknown graph selectors (a
+// uniqueness constraint would just stop being enforced) and silently ignored
+// `f:ledger` / `f:atT` / `f:trustPolicy` / `f:rollbackGuard`. Both are
+// security-relevant: an operator who configures a constraint source
+// should never get less enforcement than they asked for. Each must now
+// surface as a parse error at transact time.
+// =============================================================================
+
+#[tokio::test]
+async fn constraints_source_unknown_graph_fails_closed() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger_id = "it/constraints-source-unknown:main";
+    let ledger = genesis_ledger(&fluree, ledger_id);
+
+    // Seed annotation + data
+    let r1 = fluree
+        .insert(
+            ledger,
+            &json!({
+                "@context": {
+                    "ex": "http://example.org/",
+                    "f": "https://ns.flur.ee/db#"
+                },
+                "@graph": [
+                    {"@id": "ex:email", "f:enforceUnique": true},
+                    {"@id": "ex:alice", "ex:email": "alice@example.com"}
+                ]
+            }),
+        )
+        .await
+        .unwrap();
+
+    // Enable unique and point constraintsSource at a graph that doesn't exist.
+    let config_iri = config_graph_iri(ledger_id);
+    let trig = format!(
+        r"
+        @prefix f: <https://ns.flur.ee/db#> .
+        @prefix rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#> .
+
+        GRAPH <{config_iri}> {{
+            <urn:config:main> rdf:type f:LedgerConfig .
+            <urn:config:main> f:transactDefaults <urn:config:transact> .
+            <urn:config:transact> f:uniqueEnabled true .
+            <urn:config:transact> f:constraintsSource <urn:config:constraints-ref> .
+            <urn:config:constraints-ref> rdf:type f:GraphRef ;
+                                         f:graphSource <urn:config:constraints-src> .
+            <urn:config:constraints-src> f:graphSelector <http://example.org/missing-constraints> .
+        }}
+    "
+    );
+    let r2 = fluree
+        .stage_owned(r1.ledger)
+        .upsert_turtle(&trig)
+        .execute()
+        .await
+        .expect("config write should succeed");
+
+    let err = fluree
+        .insert(
+            r2.ledger,
+            &json!({
+                "@context": {"ex": "http://example.org/"},
+                "@id": "ex:bob",
+                "ex:email": "alice@example.com"
+            }),
+        )
+        .await
+        .expect_err("unknown constraintsSource graph must reject the transaction");
+
+    assert!(
+        matches!(
+            err,
+            fluree_db_api::ApiError::Transact(fluree_db_transact::TransactError::Parse(_))
+        ),
+        "expected TransactError::Parse, got: {err:?}"
+    );
+    let msg = err.to_string();
+    assert!(
+        msg.contains("constraintsSource") && msg.contains("not found"),
+        "expected unknown-graph diagnostic, got: {msg}"
+    );
+}
+
+#[tokio::test]
+async fn constraints_source_cross_ledger_fails_closed() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger_id = "it/constraints-source-xledger:main";
+    let ledger = genesis_ledger(&fluree, ledger_id);
+
+    let r1 = fluree
+        .insert(
+            ledger,
+            &json!({
+                "@context": {
+                    "ex": "http://example.org/",
+                    "f": "https://ns.flur.ee/db#"
+                },
+                "@graph": [{"@id": "ex:email", "f:enforceUnique": true}]
+            }),
+        )
+        .await
+        .unwrap();
+
+    let config_iri = config_graph_iri(ledger_id);
+    let trig = format!(
+        r"
+        @prefix f: <https://ns.flur.ee/db#> .
+        @prefix rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#> .
+
+        GRAPH <{config_iri}> {{
+            <urn:config:main> rdf:type f:LedgerConfig .
+            <urn:config:main> f:transactDefaults <urn:config:transact> .
+            <urn:config:transact> f:uniqueEnabled true .
+            <urn:config:transact> f:constraintsSource <urn:config:constraints-ref> .
+            <urn:config:constraints-ref> rdf:type f:GraphRef ;
+                                         f:graphSource <urn:config:constraints-src> .
+            <urn:config:constraints-src> f:ledger <urn:fluree:model-ledger:main> ;
+                                         f:graphSelector <http://example.org/constraints> .
+        }}
+    "
+    );
+    let r2 = fluree
+        .stage_owned(r1.ledger)
+        .upsert_turtle(&trig)
+        .execute()
+        .await
+        .expect("config write should succeed");
+
+    let err = fluree
+        .insert(
+            r2.ledger,
+            &json!({
+                "@context": {"ex": "http://example.org/"},
+                "@id": "ex:bob",
+                "ex:email": "bob@example.com"
+            }),
+        )
+        .await
+        .expect_err("cross-ledger constraintsSource must reject the transaction");
+
+    let msg = err.to_string();
+    assert!(
+        msg.contains("cross-ledger") || msg.contains("f:ledger"),
+        "expected cross-ledger rejection, got: {msg}"
+    );
+}
