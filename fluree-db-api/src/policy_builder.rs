@@ -503,7 +503,10 @@ async fn load_policies_of_classes(
 /// because the scan layer filters out internal `fluree:ledger` predicates
 /// when the predicate is a variable. Since all policy vocabulary predicates
 /// are in the `fluree:ledger` namespace, we must query them explicitly.
-async fn load_policy_restriction(
+///
+/// `pub(crate)` so the cross-ledger materializer can reuse the same
+/// per-policy predicate fan-out against a model ledger's snapshot.
+pub(crate) async fn load_policy_restriction(
     snapshot: &LedgerSnapshot,
     overlay: &dyn fluree_db_core::OverlayProvider,
     to_t: i64,

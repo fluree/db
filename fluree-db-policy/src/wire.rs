@@ -52,10 +52,23 @@ pub struct WireOrigin {
 /// because ordering is irrelevant to PolicySet construction and Vec
 /// serializes more efficiently. They are rebuilt into HashSets during
 /// translation.
+///
+/// `policy_types` carries the rule subject's `rdf:type` IRIs so the
+/// translation step can filter by the data ledger's configured
+/// `f:policyClass` set via exact IRI intersection. This keeps the
+/// cross-ledger cache shareable across every data ledger that
+/// references the same model graph — different policy-class
+/// configurations don't produce different wire artifacts.
 #[derive(Debug, Clone)]
 pub struct WireRestriction {
     /// Policy rule IRI (subject in the source graph).
     pub id: String,
+    /// Every `rdf:type` value declared on the rule subject in the
+    /// source graph (decoded to IRI form). Used by the translator to
+    /// intersect with the data ledger's configured `f:policyClass`
+    /// set. Phase 1a uses exact IRI matching only; subclass
+    /// entailment is a later enhancement.
+    pub policy_types: Vec<String>,
     /// Targeting mode (`f:onSubject` / `f:onProperty` / `f:onClass` /
     /// default).
     pub target_mode: TargetMode,
@@ -190,6 +203,7 @@ mod tests {
             origin: wire_origin(),
             restrictions: vec![WireRestriction {
                 id: "http://example.org/rules/allow-name".into(),
+                policy_types: vec!["https://ns.flur.ee/db#AccessPolicy".into()],
                 target_mode: TargetMode::OnProperty,
                 targets: vec![name_iri.into()],
                 action: PolicyAction::View,
@@ -232,6 +246,7 @@ mod tests {
             origin: wire_origin(),
             restrictions: vec![WireRestriction {
                 id: "http://example.org/rules/partial".into(),
+                policy_types: vec!["https://ns.flur.ee/db#AccessPolicy".into()],
                 target_mode: TargetMode::OnProperty,
                 targets: vec![name_iri.into(), unknown_iri.into()],
                 action: PolicyAction::View,
@@ -297,6 +312,7 @@ mod tests {
             origin: wire_origin(),
             restrictions: vec![WireRestriction {
                 id: "http://example.org/rules/r1".into(),
+                policy_types: vec!["https://ns.flur.ee/db#AccessPolicy".into()],
                 target_mode: TargetMode::OnProperty,
                 targets: vec![name_iri.into()],
                 action: PolicyAction::View,
@@ -343,6 +359,7 @@ mod tests {
             origin: wire_origin(),
             restrictions: vec![WireRestriction {
                 id: "http://example.org/rules/cond".into(),
+                policy_types: vec!["https://ns.flur.ee/db#AccessPolicy".into()],
                 target_mode: TargetMode::Default,
                 targets: vec![],
                 action: PolicyAction::View,

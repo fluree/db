@@ -118,6 +118,16 @@ async fn resolves_policy_graph_from_model_ledger_into_term_neutral_wire() {
         r.value
     );
 
+    // policy_types must carry the rule's rdf:type set in IRI form —
+    // this is what the translation step intersects against the data
+    // ledger's configured f:policyClass set.
+    assert_eq!(
+        r.policy_types,
+        vec!["https://ns.flur.ee/db#AccessPolicy".to_string()],
+        "policy_types must record the rule's rdf:type IRIs, got {:?}",
+        r.policy_types
+    );
+
     // The wire artifact is also memoized — a second resolve of the
     // same (M, graph, t) tuple within the same context must return
     // the same Arc without re-materializing.
@@ -128,6 +138,124 @@ async fn resolves_policy_graph_from_model_ledger_into_term_neutral_wire() {
         std::sync::Arc::ptr_eq(&resolved, &resolved2),
         "second resolve must be a memo hit, not a fresh materialization"
     );
+}
+
+/// Structural detection: a subject that has `f:allow` but declares a
+/// **non-`f:AccessPolicy`** rdf:type is still materialized. The
+/// translation step (slice 5) is where the data ledger's configured
+/// f:policyClass set gets intersected against the rule's policy_types.
+/// The wire materializer must not pre-filter by class.
+#[tokio::test]
+async fn structural_detection_picks_up_custom_typed_policies() {
+    let fluree = FlureeBuilder::memory().build_memory();
+
+    let model_id = "test/cross-ledger/custom-typed:main";
+    let model = genesis_ledger(&fluree, model_id);
+
+    let policy_graph_iri = "http://example.org/custom-policy-graph";
+    // Policy is typed as ex:OrgPolicy, NOT f:AccessPolicy. It has
+    // f:allow set so structural detection must include it. policy_types
+    // must record `ex:OrgPolicy` so slice 5 can filter appropriately.
+    let trig = format!(
+        r#"
+        @prefix f:    <https://ns.flur.ee/db#> .
+        @prefix rdf:  <http://www.w3.org/1999/02/22-rdf-syntax-ns#> .
+        @prefix ex:   <http://example.org/ns/> .
+
+        GRAPH <{policy_graph_iri}> {{
+            ex:orgRule
+                rdf:type    ex:OrgPolicy ;
+                f:action    f:view ;
+                f:onClass   ex:Document ;
+                f:allow     false .
+        }}
+    "#
+    );
+    fluree
+        .stage_owned(model)
+        .upsert_turtle(&trig)
+        .execute()
+        .await
+        .expect("write custom-typed policy");
+
+    let data_id = "test/cross-ledger/custom-typed-d:main";
+    let _ = genesis_ledger(&fluree, data_id);
+
+    let mut ctx = ResolveCtx::new(data_id, &fluree);
+    let graph_ref = cross_ref(model_id, policy_graph_iri);
+
+    let resolved = resolve_graph_ref(&graph_ref, ArtifactKind::PolicyRules, &mut ctx)
+        .await
+        .expect("cross-ledger resolution with custom-typed policy");
+
+    let GovernanceArtifact::PolicyRules(wire) = &resolved.artifact;
+    assert_eq!(
+        wire.restrictions.len(),
+        1,
+        "structural detection must pick up the f:allow-bearing subject regardless of class"
+    );
+    let r = &wire.restrictions[0];
+    assert!(r.id.contains("orgRule"));
+    assert_eq!(
+        r.policy_types,
+        vec!["http://example.org/ns/OrgPolicy".to_string()],
+        "policy_types must record ex:OrgPolicy, NOT f:AccessPolicy: got {:?}",
+        r.policy_types
+    );
+}
+
+/// A policy that declares **multiple** rdf:type values must surface
+/// every type in policy_types. The translation step uses set
+/// intersection against the data ledger's policy_class config; a
+/// rule typed as both `f:AccessPolicy` and `ex:OrgPolicy` must be
+/// selectable via either configured class.
+#[tokio::test]
+async fn multiple_rdf_types_are_all_captured_in_policy_types() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let model_id = "test/cross-ledger/multi-typed:main";
+    let model = genesis_ledger(&fluree, model_id);
+    let policy_graph_iri = "http://example.org/multi-typed-graph";
+    let trig = format!(
+        r#"
+        @prefix f:    <https://ns.flur.ee/db#> .
+        @prefix rdf:  <http://www.w3.org/1999/02/22-rdf-syntax-ns#> .
+        @prefix ex:   <http://example.org/ns/> .
+
+        GRAPH <{policy_graph_iri}> {{
+            ex:dualTyped
+                rdf:type    f:AccessPolicy , ex:OrgPolicy ;
+                f:action    f:view ;
+                f:onClass   ex:Doc ;
+                f:allow     true .
+        }}
+    "#
+    );
+    fluree
+        .stage_owned(model)
+        .upsert_turtle(&trig)
+        .execute()
+        .await
+        .expect("write dual-typed policy");
+
+    let data_id = "test/cross-ledger/multi-typed-d:main";
+    let _ = genesis_ledger(&fluree, data_id);
+
+    let mut ctx = ResolveCtx::new(data_id, &fluree);
+    let resolved = resolve_graph_ref(
+        &cross_ref(model_id, policy_graph_iri),
+        ArtifactKind::PolicyRules,
+        &mut ctx,
+    )
+    .await
+    .expect("dual-typed resolves");
+
+    let GovernanceArtifact::PolicyRules(wire) = &resolved.artifact;
+    let r = &wire.restrictions[0];
+
+    // Both types must be present (order-independent).
+    assert_eq!(r.policy_types.len(), 2);
+    assert!(r.policy_types.contains(&"https://ns.flur.ee/db#AccessPolicy".to_string()));
+    assert!(r.policy_types.contains(&"http://example.org/ns/OrgPolicy".to_string()));
 }
 
 /// A cross-ledger ref to a graph IRI that doesn't exist on the model
