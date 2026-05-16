@@ -196,7 +196,7 @@ async fn drop_ledger_idempotent() {
 
 /// Test that drop normalizes alias (adds :main if missing).
 #[tokio::test]
-async fn drop_ledger_normalizes_alias() {
+async fn drop_ledger_accepts_bare_name_and_default_suffix() {
     let tmp = tempfile::TempDir::new().expect("tempdir");
     let path = tmp.path().to_string_lossy().to_string();
 
@@ -214,13 +214,176 @@ async fn drop_ledger_normalizes_alias() {
     });
     fluree.insert(ledger, &tx).await.expect("insert");
 
-    // Drop with short alias (should normalize to :main)
+    // Bare name is the canonical form; report.ledger_id is the ledger name.
     let report = fluree
         .drop_ledger("normalize-test", DropMode::Soft)
         .await
         .expect("drop");
     assert_eq!(report.status, DropStatus::Dropped);
-    assert_eq!(report.ledger_id, "normalize-test:main");
+    assert_eq!(report.ledger_id, "normalize-test");
+    assert!(
+        report.warnings.is_empty(),
+        "bare name should not warn: {:?}",
+        report.warnings
+    );
+    assert_eq!(report.branch_reports.len(), 1);
+    assert_eq!(report.branch_reports[0].ledger_id, "normalize-test:main");
+}
+
+/// `drop_ledger("name:main")` is still accepted for compatibility, but
+/// surfaces a warning nudging callers to pass the bare name.
+#[tokio::test]
+async fn drop_ledger_main_suffix_warns_but_works() {
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let path = tmp.path().to_string_lossy().to_string();
+
+    let fluree = FlureeBuilder::file(&path).build().expect("build");
+
+    let ledger_id = "suffix-test:main";
+    let db = LedgerSnapshot::genesis(ledger_id);
+    let ledger = LedgerState::new(db, Novelty::new(0));
+    let tx = json!({"@context": {"ex": "http://example.org/"}, "@id": "ex:x", "ex:n": 1});
+    fluree.insert(ledger, &tx).await.expect("insert");
+
+    let report = fluree
+        .drop_ledger("suffix-test:main", DropMode::Soft)
+        .await
+        .expect("drop");
+    assert_eq!(report.status, DropStatus::Dropped);
+    assert_eq!(report.ledger_id, "suffix-test");
+    assert!(
+        report
+            .warnings
+            .iter()
+            .any(|w| w.contains("branch-qualified id 'suffix-test:main'")),
+        "expected branch-qualified warning, got: {:?}",
+        report.warnings
+    );
+}
+
+/// `drop_ledger("name:non-default")` is rejected — callers must use
+/// `drop_branch` for branch-scoped drops.
+#[tokio::test]
+async fn drop_ledger_rejects_non_default_branch_suffix() {
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let path = tmp.path().to_string_lossy().to_string();
+    let fluree = FlureeBuilder::file(&path).build().expect("build");
+
+    let err = fluree
+        .drop_ledger("mydb:dev", DropMode::Soft)
+        .await
+        .expect_err("non-default branch suffix should be rejected");
+    let msg = format!("{err}");
+    assert!(msg.contains("drop_branch"), "msg={msg}");
+}
+
+/// Hard-drop of a multi-branch ledger: every branch is purged (including
+/// retracted ones), per-branch reports are returned in leaf-first order,
+/// and the cross-branch `@shared/dicts/` namespace is wiped at the end.
+#[tokio::test]
+async fn drop_ledger_hard_clears_every_branch_and_shared() {
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let path = tmp.path().to_string_lossy().to_string();
+    let fluree = FlureeBuilder::file(&path).build().expect("build");
+
+    // root (main) + two children
+    let main = fluree.create_ledger("multi-drop").await.unwrap();
+    let txn = json!({
+        "@context": {"ex": "http://example.org/ns/"},
+        "@graph": [{"@id": "ex:seed", "ex:val": 1}]
+    });
+    fluree.insert(main, &txn).await.unwrap();
+
+    fluree
+        .create_branch("multi-drop", "dev", None, None)
+        .await
+        .unwrap();
+    fluree
+        .create_branch("multi-drop", "feature-x", Some("dev"), None)
+        .await
+        .unwrap();
+
+    // Drop `dev` while `feature-x` still references it. Because `dev` has a
+    // live child, `drop_branch` retracts it (deferred=true) instead of
+    // purging — that's the "retracted-but-not-purged" state we want to
+    // exercise in the whole-ledger drop below.
+    let dev_drop = fluree.drop_branch("multi-drop", "dev").await.unwrap();
+    assert!(
+        dev_drop.deferred,
+        "dev should retract-as-deferred while feature-x lives"
+    );
+    let dev_record = fluree
+        .nameservice()
+        .lookup("multi-drop:dev")
+        .await
+        .unwrap()
+        .expect("dev record still present");
+    assert!(
+        dev_record.retracted,
+        "dev should be retracted before whole-ledger drop"
+    );
+
+    // Pre-condition: branches exist on disk
+    let admin = fluree.admin_storage().expect("managed backend");
+    let pre = admin
+        .list_prefix("fluree:file://multi-drop/")
+        .await
+        .expect("list pre");
+    assert!(
+        !pre.is_empty(),
+        "expected branch artifacts before drop, got: {pre:?}"
+    );
+
+    // Whole-ledger drop.
+    let report = fluree
+        .drop_ledger("multi-drop", DropMode::Hard)
+        .await
+        .expect("drop_ledger");
+    assert_eq!(report.status, DropStatus::Dropped);
+    assert_eq!(report.ledger_id, "multi-drop");
+    assert!(
+        report.branch_reports.len() >= 2,
+        "expected per-branch reports, got: {:?}",
+        report.branch_reports
+    );
+
+    // Leaf-first order: feature-x (which sourced from dev) must come before
+    // dev, and dev before main, in the report.
+    let order: Vec<&str> = report
+        .branch_reports
+        .iter()
+        .map(|r| r.ledger_id.as_str())
+        .collect();
+    let pos = |id: &str| order.iter().position(|s| *s == id);
+    if let (Some(fx), Some(dev), Some(m)) = (
+        pos("multi-drop:feature-x"),
+        pos("multi-drop:dev"),
+        pos("multi-drop:main"),
+    ) {
+        assert!(fx < dev, "feature-x before dev, got order: {order:?}");
+        assert!(dev < m, "dev before main, got order: {order:?}");
+    }
+
+    // Nameservice empty for this ledger name.
+    assert!(fluree
+        .nameservice()
+        .list_branches("multi-drop")
+        .await
+        .unwrap()
+        .is_empty());
+
+    // Storage cleared of all branches AND @shared/dicts/.
+    let post = admin
+        .list_prefix("fluree:file://multi-drop/")
+        .await
+        .expect("list post");
+    assert!(
+        post.is_empty(),
+        "expected no artifacts under multi-drop/ after hard drop, got: {post:?}"
+    );
+
+    // Alias is reusable.
+    let _new = fluree.create_ledger("multi-drop").await.expect("recreate");
 }
 
 /// Test that drop cancels pending indexing before deletion (the flake fix).

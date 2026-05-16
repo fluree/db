@@ -730,7 +730,9 @@ async fn main() -> Result<()> {
 
 #### Dropping Ledgers
 
-Use `drop_ledger` to retract a ledger or to permanently remove its managed storage artifacts:
+`drop_ledger` operates on the **whole ledger** — every branch under a ledger
+name, including retracted-but-not-purged branches and the cross-branch
+`@shared/dicts/` namespace. Use `drop_branch` to remove a single branch.
 
 ```rust
 use fluree_db_api::{FlureeBuilder, DropMode, DropStatus, Result};
@@ -739,59 +741,89 @@ use fluree_db_api::{FlureeBuilder, DropMode, DropStatus, Result};
 async fn main() -> Result<()> {
     let fluree = FlureeBuilder::file("./data").build()?;
 
-    // Soft drop: retract from nameservice, preserve storage artifacts
-    let report = fluree.drop_ledger("mydb:main", DropMode::Soft).await?;
+    // Soft drop: retract every branch in the nameservice, preserve artifacts
+    let report = fluree.drop_ledger("mydb", DropMode::Soft).await?;
     match report.status {
         DropStatus::Dropped => println!("Ledger dropped"),
         DropStatus::AlreadyRetracted => println!("Already dropped"),
         DropStatus::NotFound => println!("Ledger not found"),
     }
 
-    // Hard drop: delete managed storage artifacts (IRREVERSIBLE)
-    let report = fluree.drop_ledger("mydb:main", DropMode::Hard).await?;
-    println!("Deleted {} storage artifacts", report.artifacts_deleted);
+    // Hard drop: delete artifacts for every branch + @shared/dicts (IRREVERSIBLE)
+    let report = fluree.drop_ledger("mydb", DropMode::Hard).await?;
+    println!(
+        "Dropped {} branches; deleted {} storage artifacts",
+        report.branch_reports.len(),
+        report.artifacts_deleted
+    );
+    for br in &report.branch_reports {
+        println!("  - {} ({:?})", br.ledger_id, br.status);
+    }
 
     Ok(())
 }
 ```
 
+**Accepted inputs:**
+
+| Input | Behavior |
+|-------|----------|
+| `"mydb"` | Whole-ledger drop (canonical form). |
+| `"mydb:main"` | Accepted for backwards compatibility; a warning is attached to the report. |
+| `"mydb:dev"` (any non-default branch suffix) | **Rejected** with a `400`/`ApiError::Http`. Use `drop_branch("mydb", "dev")` instead. |
+
 **Drop Modes:**
 
 | Mode | Behavior | Reversible |
 |------|----------|------------|
-| `DropMode::Soft` (default) | Marks the ledger retracted in the nameservice; artifacts remain and the alias stays reserved | Partially; requires administrative recovery |
-| `DropMode::Hard` | Deletes managed storage artifacts and purges the nameservice record where supported | **No** for deleted artifacts |
+| `DropMode::Soft` (default) | Marks every branch retracted in the nameservice; artifacts remain | Partially; requires administrative recovery |
+| `DropMode::Hard` | Deletes managed storage artifacts for every branch, wipes `@shared/dicts/`, and purges nameservice records so the name can be reused | **No** for deleted artifacts |
 
 **Drop Sequence:**
 
-1. Normalizes the ledger ID (ensures `:main` suffix)
-2. Cancels any pending background indexing
-3. Waits for in-progress indexing to complete
-4. In hard mode: deletes managed storage artifacts (commits, txns, indexes, config/context blobs, and related content)
-5. In soft mode: retracts from nameservice; in hard mode: purges the nameservice record where supported
-6. Disconnects from ledger cache (if caching enabled)
+1. Parses input (rejects non-default branch suffixes).
+2. Snapshots every NsRecord under the ledger name via `all_records` (so retracted branches are included). Enumeration failures propagate as `Err`.
+3. Sorts branches leaf-first via `source_branch` parent pointers — partial failures leave orphan parents, never dangling children.
+4. Cancels and waits for pending background indexing on each branch.
+5. For each branch: deletes per-branch artifacts (commit/txn/index/config) in hard mode; retracts (soft) or drops the NS record (hard) using the parent-aware path so surviving parents have accurate child counts.
+6. Hard mode: wipes `{ledger_name}/@shared/dicts/` after every branch is gone.
+7. Disconnects each branch from the ledger cache.
 
-**When to use `drop_ledger`:**
+**Report shape:**
 
-- **Cleanup**: Remove test ledgers or unused data
-- **Data lifecycle**: Permanently delete ledgers that are no longer needed
-- **Admin operations**: Clean up after migrations or failures
+`DropReport.ledger_id` is the bare ledger name. `artifacts_deleted` and
+`warnings` aggregate across branches plus the shared cleanup;
+`branch_reports: Vec<BranchDropReport>` carries per-branch detail in
+leaf-first order — useful for surfacing partial failures.
+
+**`drop_branch` for single branches:**
+
+```rust
+let report = fluree.drop_branch("mydb", "dev").await?;
+```
+
+`drop_branch` refuses the **root** branch (any branch whose
+`source_branch.is_none()`). `"main"` carries no special meaning; a ledger
+created with a different initial branch (e.g. `mydb:trunk`) has that
+branch as its root and is the one that `drop_branch` will refuse.
 
 **Idempotency:**
 
 Safe to call multiple times:
-- Returns `DropStatus::AlreadyRetracted` if previously dropped
-- Hard mode still attempts deletion for `NotFound`/`AlreadyRetracted` (useful for admin cleanup)
+- Returns `DropStatus::AlreadyRetracted` when every branch was already retracted (hard mode still runs cleanup for these).
+- Returns `DropStatus::NotFound` without touching storage when no NsRecord exists for the ledger name. Orphaned storage with no nameservice pointer is not swept by `drop_ledger`; that's a separate admin concern.
+- On a real per-branch nameservice failure, returns `ApiError::Drop` without touching parents or `@shared/dicts/`. Each step is idempotent under partial progress, so retry is safe.
 
 **Warnings:**
 
-The `DropReport` includes a `warnings` field for any non-fatal errors encountered during the operation (e.g., failed to delete a specific file). Always check this for hard drops:
-
 ```rust
-let report = fluree.drop_ledger("mydb:main", DropMode::Hard).await?;
-if !report.warnings.is_empty() {
-    for warning in &report.warnings {
-        eprintln!("Warning: {}", warning);
+let report = fluree.drop_ledger("mydb", DropMode::Hard).await?;
+for warning in &report.warnings {
+    eprintln!("Warning: {warning}");
+}
+for br in &report.branch_reports {
+    for warning in &br.warnings {
+        eprintln!("  {}: {warning}", br.ledger_id);
     }
 }
 ```

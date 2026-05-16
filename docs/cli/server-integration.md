@@ -599,7 +599,7 @@ ledger-level `POST /drop` endpoint.
 | Field | Type | Required | Description |
 |-------|------|----------|-------------|
 | `ledger` | string | Yes | Ledger name without branch suffix. |
-| `branch` | string | Yes | Branch to drop. Cannot be `"main"`. |
+| `branch` | string | Yes | Branch to drop. Cannot be the **root** branch (any branch with `source_branch.is_none()`). `"main"` carries no special meaning — it's the default and so the root on most ledgers, but a ledger created with a different initial branch will refuse that branch instead, and a non-root branch named `"main"` is droppable. Use `POST /drop` to remove the whole ledger including its root. |
 
 ### Auth
 
@@ -610,7 +610,8 @@ Admin-protected (same bracket as `/branch`, `/rebase`, `/merge`,
 
 The reference server's `Fluree::drop_branch`:
 
-1. Refuses to drop `"main"` with `400`.
+1. Refuses the **root** branch with `400` (structural check on
+   `source_branch.is_none()`, not a name comparison).
 2. If the branch is **retracted** already → returns status `already_retracted`.
 3. If the branch has children (`branches > 0`) → **soft-retracts** it (preserves
    storage so children can still resolve), returns `deferred: true`.
@@ -648,7 +649,7 @@ The CLI's `print_branch_dropped` reads `ledger_id`, `deferred`,
 
 | Status | When |
 |--------|------|
-| `400` | Attempting to drop `"main"`; malformed JSON body. |
+| `400` | Attempting to drop the root branch (`source_branch.is_none()`); malformed JSON body. |
 | `401` / `403` | Admin token required and absent/invalid. |
 | `404` | Branch not found (the underlying lookup miss surfaces as `ApiError::NotFound` → 404). |
 | `5xx` | Storage / nameservice errors during purge. |
@@ -680,7 +681,7 @@ Content-Type: application/json
 | Field | Type | Required | Server default | Description |
 |-------|------|----------|----------------|-------------|
 | `ledger` | string | Yes | — | Ledger name without branch suffix. |
-| `branch` | string | Yes | — | Branch to rebase. Cannot be `"main"`. |
+| `branch` | string | Yes | — | Branch to rebase. Cannot be the **root** branch (`source_branch.is_none()`) — it has no parent to rebase onto. The check is structural, not name-based. |
 | `strategy` | string | No | `"take-both"` | One of `take-both`, `abort`, `take-source`, `take-branch`, `skip`. Parsed by `ConflictStrategy::from_str_name`; unknown values respond `400`. |
 
 ### Auth
@@ -739,7 +740,7 @@ The CLI's `print_rebase_result` reads `fast_forward`, `branch`, `source_head_t`,
 
 | Status | When |
 |--------|------|
-| `400` | Rebasing `"main"` (`InvalidBranch`); branch has no `source_branch` (root branch); unknown / unsupported strategy; malformed JSON body. |
+| `400` | Rebasing the root branch (no `source_branch` — surfaced as `InvalidBranch`); unknown / unsupported strategy; malformed JSON body. |
 | `401` / `403` | Admin token required and absent/invalid. |
 | `404` | Branch or its source not found. |
 | `409` | `BranchConflict` — currently raised when `strategy=abort` and any commit conflicts with the source delta. |

@@ -149,12 +149,6 @@ impl crate::Fluree {
         branch: &str,
         strategy: ConflictStrategy,
     ) -> Result<RebaseReport> {
-        if branch == "main" {
-            return Err(ApiError::InvalidBranch(
-                "Cannot rebase the main branch".to_string(),
-            ));
-        }
-
         let branch_id = format_ledger_id(ledger_name, branch);
         let branch_record = self
             .nameservice()
@@ -162,8 +156,15 @@ impl crate::Fluree {
             .await?
             .ok_or_else(|| ApiError::NotFound(branch_id.clone()))?;
 
+        // Refuse the root branch structurally — there's nothing to rebase
+        // onto. "main" carries no special meaning here; a ledger whose root
+        // is named "trunk" will be refused on `trunk`, and a non-root branch
+        // named "main" can be rebased like any other.
         let source_name = branch_record.source_branch.as_ref().ok_or_else(|| {
-            ApiError::InvalidBranch(format!("Branch {branch_id} has no source branch"))
+            ApiError::InvalidBranch(format!(
+                "Cannot rebase the root branch '{branch}' of ledger '{ledger_name}' \
+                 (it has no parent to rebase onto)."
+            ))
         })?;
 
         let source_id = format_ledger_id(ledger_name, source_name);

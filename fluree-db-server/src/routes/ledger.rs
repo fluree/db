@@ -190,13 +190,18 @@ pub struct DropRequest {
 /// Drop ledger response
 #[derive(Serialize)]
 pub struct DropResponse {
-    /// Ledger identifier
+    /// Ledger name (whole-ledger drop is now scoped to the name, not a
+    /// specific branch). Equal to the `name` field of every NsRecord that
+    /// was dropped.
     pub ledger_id: String,
-    /// Drop status
+    /// Drop status (aggregate across branches)
     pub status: String,
-    /// Files deleted (hard mode only)
+    /// Files deleted (hard mode only) — sum across branches + shared cleanup.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub files_deleted: Option<usize>,
+    /// Per-branch ledger_ids that were dropped, in leaf-first order.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub branches_dropped: Vec<String>,
     /// Warnings (if any)
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub warnings: Vec<String>,
@@ -216,10 +221,17 @@ impl From<DropReport> for DropResponse {
             None
         };
 
+        let branches_dropped = report
+            .branch_reports
+            .iter()
+            .map(|b| b.ledger_id.clone())
+            .collect();
+
         DropResponse {
             ledger_id: report.ledger_id,
             status: status.to_string(),
             files_deleted,
+            branches_dropped,
             warnings: report.warnings,
         }
     }
@@ -325,6 +337,7 @@ async fn drop_local(state: Arc<AppState>, request: Request) -> Result<Json<DropR
                 ledger_id: format!("{}:{}", gs_report.name, gs_report.branch),
                 status: gs_status.to_string(),
                 files_deleted: None,
+                branches_dropped: Vec::new(),
                 warnings: gs_report.warnings,
             }));
         }
