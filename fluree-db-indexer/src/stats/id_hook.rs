@@ -179,12 +179,22 @@ fn otype_to_value_type_tag(ot: fluree_db_core::o_type::OType) -> ValueTypeTag {
         OType::XSD_DOUBLE => ValueTypeTag::DOUBLE,
         OType::XSD_FLOAT => ValueTypeTag::FLOAT,
         OType::XSD_DECIMAL => ValueTypeTag::DECIMAL,
+        // NUM_BIG_OVERFLOW is intentionally NOT mapped here: it carries both
+        // `FlakeValue::Decimal` (arbitrary-precision xsd:decimal) and
+        // `FlakeValue::BigInt` (xsd:integer overflow > i64) — they share
+        // `ObjKind::NUM_BIG`. Disambiguating requires inspecting the NumBig
+        // arena entry (`StoredBigValue::BigDec` vs `BigInt`), which is not
+        // available here. Falling through to UNKNOWN is the honest answer
+        // until the collector is plumbed with arena access or the semantic
+        // dt tag is preserved alongside the o_type byte.
         OType::XSD_DATE => ValueTypeTag::DATE,
         OType::XSD_TIME => ValueTypeTag::TIME,
         OType::XSD_DATE_TIME => ValueTypeTag::DATE_TIME,
         OType::XSD_G_YEAR => ValueTypeTag::G_YEAR,
+        OType::XSD_G_YEAR_MONTH => ValueTypeTag::G_YEAR_MONTH,
         OType::XSD_G_MONTH => ValueTypeTag::G_MONTH,
         OType::XSD_G_DAY => ValueTypeTag::G_DAY,
+        OType::XSD_G_MONTH_DAY => ValueTypeTag::G_MONTH_DAY,
         OType::XSD_STRING => ValueTypeTag::STRING,
         OType::XSD_ANY_URI => ValueTypeTag::ANY_URI,
         OType::XSD_NORMALIZED_STRING => ValueTypeTag::NORMALIZED_STRING,
