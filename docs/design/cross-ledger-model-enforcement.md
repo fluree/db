@@ -1,29 +1,34 @@
 # Cross-ledger model enforcement
 
-Fluree's `f:GraphRef` shape was designed to point at "the graph that
-holds my policy / shapes / schema / rules / constraints." Today that
-pointer is constrained to the *current* ledger. This document
-specifies the contract for making the pointer cross-ledger so that a
-single **model ledger** — holding the ontology, SHACL shapes, policy
-rule set, datalog rules, and uniqueness constraints — can be
-referenced by many **data ledgers** that it governs.
+Fluree's `f:GraphRef` shape lets a data ledger reference a graph
+containing policy / shapes / schema / rules / constraints. Without
+cross-ledger references, every data ledger has to carry its own
+copy of those governance artifacts. This document explains the
+contracts that make `f:GraphRef` work cross-ledger so a single
+**model ledger** — holding the ontology, SHACL shapes, policy rule
+set, datalog rules, and uniqueness constraints — can be referenced
+by many **data ledgers** it governs.
 
-Status: design — implementation lands incrementally per the phasing
-in the last section.
+For the user-facing how-to (TriG examples, configuration steps),
+see [Cross-ledger policy](../security/cross-ledger-policy.md). This
+document explains the design decisions behind that mechanism: why
+the resolver returns term-neutral artifacts, why the cache is
+keyed the way it is, what the identity contract is, and how
+failures are surfaced.
 
 Topics:
 
-- Glossary and the basic shape of cross-ledger enforcement.
+- Glossary and what "cross-ledger" means at the contract level.
 - The resolver contract: a single `resolve_graph_ref` helper shared
-  by all five subsystems, returning term-neutral artifacts.
+  by every subsystem, returning term-neutral artifacts.
 - Term-space translation — why model-ledger Sids/GraphIds/t values
   cannot leak into data-ledger execution.
-- Resolution time, `f:atT` pinning, caching, and failure variants.
+- Resolution time, caching, and failure variants.
 - Policy IR identity split — definitional vs contextual term
   binding.
 - Trust model, reserved-graph guards, cycle detection, drop
   interaction.
-- Phasing and scope.
+- Scope: what the resolver covers today and what's deferred.
 
 Related docs:
 
@@ -58,42 +63,46 @@ This is read-only: cross-ledger writes are out of scope.
 
 ## The resolver contract
 
-All five subsystems — policy, shapes, schema, datalog rules,
-constraints — share a single helper:
+Every subsystem that needs to read a cross-ledger graph goes
+through the same helper:
 
 ```rust
-pub(crate) async fn resolve_graph_ref<S, N>(
-    graph_ref: &GraphRef,
-    ctx: &ResolveCtx<'_, S, N>,
-) -> Result<ResolvedGraph, CrossLedgerError>;
+pub async fn resolve_graph_ref(
+    graph_ref: &GraphSourceRef,
+    kind: ArtifactKind,
+    ctx: &mut ResolveCtx<'_>,
+) -> Result<Arc<ResolvedGraph>, CrossLedgerError>;
 ```
 
-where `ResolveCtx` carries everything the resolver needs without each
-subsystem rebuilding the surrounding state:
+where `ResolveCtx` carries everything the resolver needs without
+each subsystem rebuilding the surrounding state:
 
 ```rust
-pub(crate) struct ResolveCtx<'a, S, N> {
-    pub data_ledger_id: &'a str,                    // canonical id of D
-    pub fluree: &'a Fluree<S, N>,                    // nameservice lookup of M
-    /// Governance-context capture: lazily-populated map from canonical
-    /// model ledger id → `resolved_t` for this request. First
-    /// cross-ledger resolve to a given model populates the entry; every
-    /// subsequent unpinned reference to that model in the same request
-    /// reuses it.
-    pub resolved_ts: &'a mut HashMap<String, i64>,
-    /// Active resolution stack — the chain of `(kind, ledger, graph,
-    /// resolved_t)` tuples currently being resolved. Used only for
-    /// cycle detection; an entry is pushed before recursion and
-    /// popped after. `ArtifactKind` is part of the key so a
-    /// `PolicyRules` resolve of `(M, graph, t)` doesn't make a
-    /// `Shapes` resolve of the same `(M, graph, t)` look like a
-    /// cycle (or vice versa).
-    pub active: &'a mut Vec<(ArtifactKind, String, String, i64)>,
-    /// Per-request memo of fully-resolved artifacts. Hits short-circuit
-    /// without storage round-trip and without entering the cycle stack.
-    /// Same `ArtifactKind`-extended key as `active` so different
-    /// artifact kinds can't return each other's memo entries.
-    pub memo: &'a mut HashMap<(ArtifactKind, String, String, i64), Arc<ResolvedGraph>>,
+pub struct ResolveCtx<'a> {
+    /// Canonical data-ledger id D.
+    pub data_ledger_id: &'a str,
+    /// The Fluree instance hosting D and (per the same-instance
+    /// constraint) the referenced model ledger.
+    pub fluree: &'a Fluree,
+    /// Governance-context capture: lazily-populated map from
+    /// canonical model ledger id → `resolved_t` for this request.
+    /// The first reference to a given model populates the entry;
+    /// every subsequent reference in the same request reuses it.
+    pub resolved_ts: HashMap<String, i64>,
+    /// Active resolution stack — the chain of `(kind, ledger,
+    /// graph, resolved_t)` tuples currently being resolved. Used
+    /// only for cycle detection; an entry is pushed before
+    /// recursion and popped after. `ArtifactKind` is part of the
+    /// key so a `PolicyRules` resolve of `(M, graph, t)` doesn't
+    /// make a `Shapes` resolve of the same `(M, graph, t)` look
+    /// like a cycle (or vice versa).
+    pub active: Vec<(ArtifactKind, String, String, i64)>,
+    /// Per-request memo of fully-resolved artifacts. Hits short-
+    /// circuit without storage round-trip and without entering the
+    /// cycle stack. Same `ArtifactKind`-extended key as `active`
+    /// so different artifact kinds can't return each other's
+    /// entries.
+    pub memo: HashMap<(ArtifactKind, String, String, i64), Arc<ResolvedGraph>>,
 }
 ```
 
@@ -138,29 +147,28 @@ A `ResolvedGraph` is term-neutral and t-fixed:
 
 ```rust
 pub struct ResolvedGraph {
-    pub model_ledger_id: String,    // canonical
+    pub model_ledger_id: String,       // canonical
     pub graph_iri: String,
     pub resolved_t: i64,
-    pub artifact: GovernanceArtifact, // tagged union per subsystem
-    pub fingerprint: ContentId,      // for downstream cache keys
+    pub artifact: GovernanceArtifact,  // tagged union per subsystem
 }
 ```
 
-The `GovernanceArtifact` variants are:
+`GovernanceArtifact` is a tagged union with one variant per
+subsystem. Only `PolicyRules` is implemented today; the rest are
+named in [Scope](#scope) and land as new variants when their
+materializers do.
 
 ```rust
 pub enum GovernanceArtifact {
-    PolicyRules(PolicyRuleSet),       // canonical IR, IRI-form
-    Shapes(ShapeSet),                 // SHACL shapes in IRI-form
-    SchemaClosure(SchemaBundleIR),    // ontology in IRI-form
-    DatalogRules(DatalogRuleSet),     // rules in IRI-form
-    Constraints(ConstraintSet),       // f:enforceUnique annotations
+    PolicyRules(PolicyArtifactWire),   // IRI-form policy rules
 }
 ```
 
 Each variant is **term-neutral**: every subject, predicate, object,
 class, and datatype reference is stored as an IRI (or canonical
-literal), never as a model-ledger Sid or GraphId.
+literal), never as a model-ledger Sid or GraphId. The data-ledger
+consumer re-interns IRIs against its own dictionary at use time.
 
 ## Term-space translation
 
@@ -289,12 +297,14 @@ binary-index crate sits below `fluree-db-api`, `fluree-db-policy`,
 and the cross-ledger module; making it depend upward on typed
 governance-artifact representations would be a layering inversion.
 
-For Phase 1a the implementation is a Moka cache bounded by entry
-count, scoped to a `Fluree` instance. Single memory-pool unification
-with `LeafletCache` is a follow-up that requires adding an
-opaque-blob variant to the binary-index cache (the artifact is
-serialized to bytes at the cache boundary), and is deferred until
-the artifact representation stabilizes.
+The implementation is a Moka TinyLFU cache bounded by entry count
+(see `cross_ledger::GovernanceCache`), scoped to a `Fluree`
+instance. Single memory-pool unification with `LeafletCache` would
+require adding an opaque-blob variant to the binary-index cache
+(serializing the artifact to bytes at the cache boundary) and is
+deliberately deferred until the artifact representation
+stabilizes — keeping the two caches separate while artifact shapes
+are still evolving prevents premature coupling.
 
 The key is `(ArtifactKind, canonical_model_ledger_id, graph_iri,
 resolved_t)`. `ArtifactKind` is part of the key so a memoized
@@ -337,15 +347,25 @@ pub enum CrossLedgerError {
     /// the model dictionary lost, malformed rule, etc.).
     TranslationFailed { ledger_id: String, graph_iri: String, detail: String },
 
-    /// `f:trustPolicy` failed verification, or `f:rollbackGuard`
-    /// would be violated. (Phase 4.)
+    /// `f:trustPolicy` verification failed (reserved for when
+    /// trust-policy enforcement is implemented; see Scope).
     TrustCheckFailed { ledger_id: String, detail: String },
+
+    /// `f:atT`, `f:trustPolicy`, or `f:rollbackGuard` was set on
+    /// a `GraphSourceRef`. Those fields are parsed by the config
+    /// layer but their semantics are not yet implemented (see
+    /// Scope); the request fails closed rather than silently
+    /// ignoring the field.
+    UnsupportedFeature { feature: &'static str, phase: &'static str, ledger_id: String },
 
     /// `f:ledger` targets a ledger on a different instance.
     CrossInstanceUnsupported { ledger_id: String },
 
-    /// Cycle detected through `(ledger, graph, resolved_t)` chain.
-    CycleDetected { chain: Vec<(String, String, i64)> },
+    /// Cycle detected through the `(kind, ledger, graph, resolved_t)`
+    /// chain.
+    CycleDetected {
+        chain: Vec<(ArtifactKind, String, String, i64)>,
+    },
 }
 ```
 
@@ -357,15 +377,12 @@ fallback to "no policy" or "no shapes."
 A data ledger D's `#config` declaring `f:ledger <M>` is itself the
 capability assertion. Writing to D's `#config` already requires
 policy authority on D, so "whoever can write D's `#config` asserts
-that M is a trusted governance source for D."
+that M is a trusted governance source for D" is the binding
+decision; no separate consent is required from M.
 
-For v1, no consent is required from M. Phase 4 introduces
-`f:trustPolicy` and `f:rollbackGuard` for ledgers that need
-stronger guarantees (commit signer allowlist, hash pin, maximum
-staleness window).
-
-Cross-instance federation requires a different trust model (auth,
-transport, signing) and is out of scope.
+Cross-instance federation would require a different trust model
+(auth, transport, signing for ledgers hosted on different
+nameservices) and is out of scope. See [Scope](#scope).
 
 ## Reserved-graph guard
 
@@ -403,78 +420,88 @@ active-vs-completed distinction surfaced explicitly.
 
 ## Drop interaction
 
-V1: if a data ledger D references model ledger M and M is dropped,
+If a data ledger D references model ledger M and M is dropped,
 the next request against D that needs governance from M fails
 closed with `ModelLedgerMissing`. There is no reverse-reference
-index and no rejection of M's drop based on outstanding references.
+index and no rejection of M's drop based on outstanding
+references.
 
-This is the smallest contract that's safe; introducing reverse
-indexes requires nameservice schema work and is deferred. Operators
-who need stronger guarantees can publish a `f:trustPolicy` (Phase 4)
-or coordinate drops at the application layer.
+This is the smallest contract that's safe — operators get a clear
+failure on the next governed request rather than a silent shift in
+enforcement. Introducing reverse indexes would require nameservice
+schema work and is out of scope (see [Scope](#scope)). Operators
+who need stronger guarantees coordinate drops at the application
+layer for now.
 
-## Same-instance constraint (v1)
+## Same-instance constraint
 
 Both D and M must:
 
 - Belong to the same nameservice instance.
 - Live within the same storage namespace.
 
-Same-instance failures surface as `CrossInstanceUnsupported` before
-any storage round-trip.
+A reference that targets a ledger on a different instance surfaces
+as `CrossInstanceUnsupported` before any storage round-trip. This
+boundary is enforced implicitly by the nameservice lookup — a
+ledger not present in this instance's nameservice can't be
+canonicalized — and the variant exists so a future cross-instance
+mode can be added without rewriting the failure taxonomy.
 
-## Phasing
+## Scope
 
-| Phase | Scope | Status |
-|-------|-------|--------|
-| 0     | Same-ledger fail-closed across the five subsystems (policy, shapes, schema, constraints, rules). | Policy, shapes, schema, constraints: done. Rules: pending (deferred behind this design). |
-| 1a    | `f:policySource` cross-ledger via `resolve_graph_ref`. Policy IR identity split lands as part of this. | After this doc. |
-| 1b    | `f:schemaSource` + `f:ontologyImportMap` cross-ledger; transitive imports across ≥2 model ledgers. | After 1a. |
-| 2     | `f:shapesSource`, `f:rulesSource`, `f:constraintsSource` cross-ledger via the same resolver. | After 1a/1b. |
-| 3     | `f:atT` temporal pinning. | After 2. |
-| 4     | `f:trustPolicy`, `f:rollbackGuard`. Separate RFE. | Out of scope here. |
+### Implemented
 
-## Test plan (per phase)
+- `f:policySource` cross-ledger via `resolve_graph_ref`. The
+  policy IR carries definitional/contextual term references
+  separately so the model ledger contributes rules while the
+  data ledger contributes identity binding.
+- Per-request memo + per-instance governance cache, both keyed
+  on `(ArtifactKind, canonical_model_ledger_id, graph_iri,
+  resolved_t)`.
+- Reserved-graph guard (rejects `#config` / `#txn-meta` on M
+  before any storage round-trip).
+- Reserved-feature rejection: `f:atT`, `f:trustPolicy`, and
+  `f:rollbackGuard` are surfaced as `UnsupportedFeature` rather
+  than silently ignored.
+- Identity-mode + cross-ledger combination fails closed with a
+  config error — the design's "M contributes rules, D
+  contributes identity" boundary is enforced at the request
+  surface.
 
-Acceptance tests live next to the subsystems they exercise:
+### Reserved
 
-- `it_policy_cross_ledger.rs` — D references policy in M; query
-  against D enforces M's policies; inline `opts.policy` still
-  merges; fail-closed when M is unreachable.
-- `it_schema_cross_ledger.rs` — extension of
-  `it_reasoning_imports.rs` across a ledger boundary; transitive
-  imports across two model ledgers; cycle detection.
-- `it_shapes_cross_ledger.rs` — tx against D validates against
-  shapes in M.
-- `it_at_t_pinning.rs` — `f:atT N` pins; commits after N don't
-  affect the governed query.
-- `it_fail_closed.rs` — every failure variant rejects the request.
+The following subsystems share the resolver's contract but their
+materializers aren't implemented. Each lands as a new
+`GovernanceArtifact` variant + per-subsystem materializer:
 
-Two cross-cutting tests are mandatory regardless of phase:
+- `f:schemaSource` + `f:ontologyImportMap` cross-ledger
+  (transitive ontology imports across multiple model ledgers).
+- `f:shapesSource` cross-ledger (SHACL shapes).
+- `f:rulesSource` cross-ledger (datalog rules). The same-ledger
+  routing for `f:rulesSource` is also still pending; the
+  cross-ledger path will route through the shared resolver
+  once same-ledger lands.
+- `f:constraintsSource` cross-ledger (uniqueness annotations).
+- `f:atT` temporal pinning (currently rejected as
+  `UnsupportedFeature`).
+- `f:trustPolicy` and `f:rollbackGuard` (rejected as
+  `UnsupportedFeature` for the same reason).
 
-- **Distinct namespace codes.** M and D both interned the same
-  class IRI under different `ns_code` values; the resolved artifact
-  re-interns correctly against D and policy/shapes fire as
-  expected. This is the canary for term-space translation.
-- **Single-resolution-t.** Within one request, every subsystem
-  receives the same `resolved_t` for M, even when admission and
-  enforcement happen tens of milliseconds apart and M advanced in
-  between.
+### Out of scope
 
-Tests must drive through `Fluree::db()` (not
-`GraphDb::from_ledger_state`) so the config-graph path is exercised.
-
-## Out of scope
-
-- **Cross-instance federation.** Different nameservices, transport,
-  cross-org auth/signing. Separate RFE.
-- **`f:trustPolicy` / `f:rollbackGuard` implementations.** Phase 4.
+- **Cross-instance federation.** Different nameservices,
+  transport, cross-org auth/signing.
 - **Auto-resolution by IRI namespace.** "Which model governs
   `schema:*`?" — application-layer concern.
 - **Writing back to a model ledger from a governed ledger's
-  request.** Read-only references only.
-- **Reverse-reference indexes for safe drop.** V1 allows M to be
-  dropped; D fails closed on next request.
+  request.** Cross-ledger references are read-only.
+- **Reverse-reference indexes for safe drop.** A drop on M
+  surfaces on the next governed request against D, not at
+  drop time.
+- **Subclass entailment in policy_class filtering.** The
+  filter is exact-IRI; D must name the same class IRI M
+  declared. Mirrors same-ledger `load_policies_by_class`
+  semantics.
 
 ## Error type and HTTP mapping
 
