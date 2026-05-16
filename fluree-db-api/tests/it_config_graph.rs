@@ -2657,3 +2657,140 @@ async fn configured_fulltext_properties_for_indexer_shape() {
         }
     }
 }
+
+// =============================================================================
+// f:policySource fail-closed behavior
+//
+// `build_policy_context` (the path used by server transact handlers and the CLI
+// insert command) must NOT silently fall back to the default graph when the
+// configured `f:policySource` cannot be resolved. Falling back would re-enable
+// any default-graph policy rules under a config the operator clearly intended
+// to redirect, and would also swallow the cross-ledger / temporal rejection
+// emitted by `resolve_policy_source_g_ids`.
+// =============================================================================
+
+#[tokio::test]
+async fn policy_source_unknown_graph_fails_closed() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger_id = "it/policy-source-unknown:main";
+    let ledger = genesis_ledger(&fluree, ledger_id);
+
+    // Some data in the default graph (irrelevant to the assertion, but proves
+    // the fallback would have had something to enforce against).
+    let r1 = fluree
+        .insert(
+            ledger,
+            &json!({
+                "@context": {"ex": "http://example.org/ns/"},
+                "@graph": [{"@id": "ex:alice", "@type": "ex:User", "ex:name": "Alice"}]
+            }),
+        )
+        .await
+        .unwrap();
+
+    // Config points f:policySource at a graph IRI that does not exist in the
+    // registry. Pre-fix this logged a warning and returned `[0]`.
+    let config_iri = config_graph_iri(ledger_id);
+    let trig = format!(
+        r"
+        @prefix f: <https://ns.flur.ee/db#> .
+        @prefix rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#> .
+
+        GRAPH <{config_iri}> {{
+            <urn:config:main> rdf:type f:LedgerConfig .
+            <urn:config:main> f:policyDefaults <urn:config:policy> .
+            <urn:config:policy> f:policySource <urn:config:policy-ref> .
+            <urn:config:policy-ref> rdf:type f:GraphRef ;
+                                    f:graphSource <urn:config:policy-source> .
+            <urn:config:policy-source> f:graphSelector <http://example.org/does-not-exist> .
+        }}
+    "
+    );
+    let r2 = fluree
+        .stage_owned(r1.ledger)
+        .upsert_turtle(&trig)
+        .execute()
+        .await
+        .expect("config write");
+    let ledger = r2.ledger;
+
+    let opts = QueryConnectionOptions::default();
+    let err = fluree_db_api::build_policy_context(
+        &ledger.snapshot,
+        ledger.novelty.as_ref(),
+        Some(ledger.novelty.as_ref()),
+        ledger.t(),
+        &opts,
+    )
+    .await
+    .expect_err("unknown f:policySource graph must fail closed");
+
+    let msg = err.to_string();
+    assert!(
+        msg.contains("policySource") && msg.contains("not found"),
+        "expected unknown-graph error, got: {msg}"
+    );
+}
+
+#[tokio::test]
+async fn policy_source_cross_ledger_fails_closed() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger_id = "it/policy-source-xledger:main";
+    let ledger = genesis_ledger(&fluree, ledger_id);
+
+    let r1 = fluree
+        .insert(
+            ledger,
+            &json!({
+                "@context": {"ex": "http://example.org/ns/"},
+                "@graph": [{"@id": "ex:alice", "@type": "ex:User"}]
+            }),
+        )
+        .await
+        .unwrap();
+
+    // Config asks for cross-ledger policy via f:ledger. `resolve_policy_source_g_ids`
+    // already rejects this; the regression we're guarding is the prior fallback
+    // in `resolve_policy_graphs_from_config` that swallowed the error.
+    let config_iri = config_graph_iri(ledger_id);
+    let trig = format!(
+        r"
+        @prefix f: <https://ns.flur.ee/db#> .
+        @prefix rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#> .
+
+        GRAPH <{config_iri}> {{
+            <urn:config:main> rdf:type f:LedgerConfig .
+            <urn:config:main> f:policyDefaults <urn:config:policy> .
+            <urn:config:policy> f:policySource <urn:config:policy-ref> .
+            <urn:config:policy-ref> rdf:type f:GraphRef ;
+                                    f:graphSource <urn:config:policy-source> .
+            <urn:config:policy-source> f:ledger <urn:fluree:model-ledger:main> ;
+                                       f:graphSelector <http://example.org/policy> .
+        }}
+    "
+    );
+    let r2 = fluree
+        .stage_owned(r1.ledger)
+        .upsert_turtle(&trig)
+        .execute()
+        .await
+        .expect("config write");
+    let ledger = r2.ledger;
+
+    let opts = QueryConnectionOptions::default();
+    let err = fluree_db_api::build_policy_context(
+        &ledger.snapshot,
+        ledger.novelty.as_ref(),
+        Some(ledger.novelty.as_ref()),
+        ledger.t(),
+        &opts,
+    )
+    .await
+    .expect_err("cross-ledger f:policySource must fail closed");
+
+    let msg = err.to_string();
+    assert!(
+        msg.contains("cross-ledger") || msg.contains("f:ledger"),
+        "expected cross-ledger rejection, got: {msg}"
+    );
+}
