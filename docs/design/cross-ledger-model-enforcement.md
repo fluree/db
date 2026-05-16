@@ -73,10 +73,21 @@ subsystem rebuilding the surrounding state:
 
 ```rust
 pub(crate) struct ResolveCtx<'a, S, N> {
-    pub data_ledger_id: &'a str,        // canonical id of D
-    pub fluree: &'a Fluree<S, N>,        // for nameservice lookup of M
-    pub admit_time: Instant,             // request admission timestamp
-    pub seen: &'a mut Vec<(String, String, i64)>, // cycle detection
+    pub data_ledger_id: &'a str,                    // canonical id of D
+    pub fluree: &'a Fluree<S, N>,                    // nameservice lookup of M
+    /// Governance-context capture: lazily-populated map from canonical
+    /// model ledger id → `resolved_t` for this request. First
+    /// cross-ledger resolve to a given model populates the entry; every
+    /// subsequent unpinned reference to that model in the same request
+    /// reuses it.
+    pub resolved_ts: &'a mut HashMap<String, i64>,
+    /// Active resolution stack — the chain of `(ledger, graph,
+    /// resolved_t)` tuples currently being resolved. Used only for cycle
+    /// detection; an entry is pushed before recursion and popped after.
+    pub active: &'a mut Vec<(String, String, i64)>,
+    /// Per-request memo of fully-resolved artifacts. Hits short-circuit
+    /// without storage round-trip and without entering the cycle stack.
+    pub memo: &'a mut HashMap<(String, String, i64), Arc<ResolvedGraph>>,
 }
 ```
 
@@ -92,17 +103,27 @@ The helper performs, in order:
 3. **Reserved-graph guard.** Selectors that would resolve to
    `#config` or `#txn-meta` on M are rejected *before* any storage
    round-trip.
-4. **Resolved-t selection.** If `f:atT` is set, use it; otherwise
-   use M's latest committed `t` at `ctx.admit_time`. The chosen
-   value is **captured once per request** and reused across every
-   subsystem call within the same request — policy and shapes can
-   never disagree about which version of M they're enforcing.
-5. **Cycle check.** The tuple `(canonical_model_ledger_id,
-   graph_iri, resolved_t)` is checked against `ctx.seen`. Two
-   different `atT` pins of the same `(ledger, graph)` are not a
-   cycle; the same triple is.
+4. **Governance-context capture (`resolved_t`).** If `f:atT N` is set,
+   `resolved_t = N`. Otherwise, look up `ctx.resolved_ts[model_id]`;
+   on miss, read M's current head `t` and store it. The capture is
+   **lazy and per request**: the head is consulted only on the first
+   unpinned reference to a given model, and every later unpinned
+   reference in the same request reuses the same `resolved_t` so
+   policy and shapes can never disagree about which version of M
+   they're enforcing.
+5. **Memo / cycle check.** Form the tuple `(canonical_model_ledger_id,
+   graph_iri, resolved_t)`. If it appears in `ctx.memo`, return the
+   memoized artifact (this is the cross-subsystem de-dup path —
+   `policySource` and `shapesSource` pointing at the same model graph
+   resolve once). Otherwise check it against `ctx.active` (the
+   resolution stack); presence there means a true cycle and is an
+   error. Two different `atT` pins of the same `(ledger, graph)` are
+   not a cycle; the same triple is. Push the tuple onto `active`
+   before recursing into transitive imports.
 6. **Translation and materialization.** The graph at `resolved_t` is
    read and projected into term-neutral form (see next section).
+   Pop the tuple from `active` and insert the resolved artifact into
+   `ctx.memo` and the global cache.
 7. **Caching.** On cache hit the materialized artifact is returned
    directly. On miss the artifact is inserted under the key
    `(canonical_model_ledger_id, graph_iri, resolved_t)`.
@@ -209,14 +230,17 @@ state. This keeps trust one-directional.
 
 | Case                       | Behavior |
 |----------------------------|----------|
-| No `f:atT`                 | `resolved_t` = M's latest committed `t` at request admission. Captured once. |
-| `f:atT N`                  | `resolved_t = N`. M time-travels to that point. |
+| No `f:atT`                 | On first unpinned reference to M in this request, read M's current head `t` and cache it in `ctx.resolved_ts[model_id]`. Subsequent unpinned references to the same M reuse it. |
+| `f:atT N`                  | `resolved_t = N`. Per-resolve, not stored in `resolved_ts`. M time-travels to that point. |
 | `f:atT N`, N pruned        | Fail closed (see [Failure variants](#failure-variants)). No fallback to nearest-available. |
-| Mid-request M advancement  | Not reflected in the current request. The next request re-admits at the new head. |
+| Mid-request M advancement  | Not reflected in the current request. The next request re-captures on its first reference. |
 
-`resolved_t` is captured **once per request** in `ResolveCtx`, not
-per subsystem call. Without this, policy and shapes could enforce
-against different versions of M for the same request.
+Capture is **lazy and per request**: a request that never needs M
+never pays for M's head lookup. Once captured, `resolved_t` is
+stable across every subsystem in that request — policy and shapes
+can never disagree about which version of M they're enforcing. This
+is what makes the "model edit propagates atomically to all governed
+datasets" property hold within a single request boundary.
 
 ## Caching
 
@@ -305,13 +329,27 @@ M could leak commit metadata to D's request handler.
 
 ## Cycle detection
 
-The resolver maintains a `seen: Vec<(canonical_ledger_id, graph_iri,
-resolved_t)>` chain in `ResolveCtx`. Detection runs on the resolved
-tuple. Two distinct `atT` pins of the same `(ledger, graph)` are not
-a cycle. Two distinct graphs on the same ledger are not a cycle.
+Two structures, distinct purposes:
 
-This is the same BFS+dedupe pattern the existing same-ledger
-`owl:imports` resolver uses, generalized to a 3-tuple.
+- `ctx.active` is the **active resolution stack** — push the
+  `(canonical_ledger_id, graph_iri, resolved_t)` tuple before
+  recursing into a transitive import, pop on return. A tuple is a
+  cycle only if it is encountered while *already on the stack*.
+- `ctx.memo` is the **per-request completed map**. Once a tuple
+  resolves successfully, it lands here. Subsequent references to
+  the same tuple — from any subsystem in the same request — short-
+  circuit on the memo, never enter `active`, and never trip cycle
+  detection.
+
+So if `policySource` and `shapesSource` both reference the same
+`(ledger, graph, t)`, the second resolve is a memo hit, not a
+cycle. Two different `atT` pins of the same `(ledger, graph)` are
+not a cycle. Two different graphs on the same ledger are not a
+cycle. Only re-entering an in-flight tuple is.
+
+This generalizes the BFS+dedupe pattern the existing same-ledger
+`owl:imports` resolver uses to a 3-tuple, with the
+active-vs-completed distinction surfaced explicitly.
 
 ## Drop interaction
 
@@ -388,19 +426,33 @@ Tests must drive through `Fluree::db()` (not
 - **Reverse-reference indexes for safe drop.** V1 allows M to be
   dropped; D fails closed on next request.
 
-## Open questions for review
+## Error type and HTTP mapping
 
-- Should `resolved_t` capture happen at request admission or at
-  first cross-ledger resolution within the request? Spec currently
-  says admission; admission is simpler and avoids a per-resolver
-  inconsistency window, at the cost of materializing M's head even
-  when no subsystem ends up consulting M.
-- Should the `seen` chain be per-request or per-resolver-instance?
-  Per-request prevents a malicious config from making the same
-  resolver loop indefinitely across different subsystems; spec
-  defaults to per-request.
-- Should `CrossLedgerError` surface to the HTTP status as 502
-  (upstream-style) or 500? Argument for 502: operator distinction
-  between "your data ledger is broken" and "the model ledger this
-  data ledger depends on is broken." Not load-bearing on the
-  internal contract.
+`CrossLedgerError` surfaces through the API crate as a dedicated
+variant:
+
+```rust
+pub enum ApiError {
+    // ...
+    /// Cross-ledger governance resolution failed. The wrapped
+    /// variant carries the specific failure (missing ledger, graph
+    /// missing at t, retention pruned, etc.) for audit and
+    /// operator diagnostics.
+    #[error("Cross-ledger error: {0}")]
+    CrossLedger(#[from] CrossLedgerError),
+}
+```
+
+It is **not** collapsed into `ApiError::Http { status: 502, .. }` —
+preserving the structured variant is what makes "the model ledger
+this data ledger depends on is broken" distinguishable from "your
+data ledger is broken" in logs and audit trails.
+
+HTTP status mapping: **502 Bad Gateway** is the default. A model
+ledger dependency that cannot be resolved or used is conceptually
+an upstream-dependency failure, not an internal panic. 424 Failed
+Dependency is semantically closer but less commonly handled by
+client tooling; 502 is the pragmatic choice. The server layer reads
+the variant for the response body so callers can branch on the
+specific failure even when the status is generic.
+
