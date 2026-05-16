@@ -226,6 +226,32 @@ request context. The model ledger contributes rules and definitions;
 it never contributes identity, authentication keys, or session
 state. This keeps trust one-directional.
 
+### Identity-mode resolution under cross-ledger policy
+
+The same-ledger materializer in `policy_builder.rs` supports three
+modes, in priority order: identity (request identity → policies via
+that identity's `f:policyClass`), policy_class (configured class IRIs
+→ all policies of that class), and policy (inline JSON-LD).
+
+Cross-ledger does **not** generalize "identity mode" by querying
+M for `<identity> f:policyClass ?class`. The identity binding lives
+in D and the request context; querying M for identity records would
+either return empty (M has no entry for D's user) or — worse — match a
+model-ledger identity that happens to share an IRI with D's user. The
+resulting policy attribution is silently wrong.
+
+Concretely, cross-ledger policy resolution always uses
+**policy_class mode**: the data ledger's effective policy classes
+(from `opts.policyClass` or D's config) are looked up in M to load
+the corresponding policy rules. The request identity is bound to
+`?$identity` at evaluation time against D and the request context,
+exactly as in the same-ledger flow.
+
+If the data ledger's effective config does not specify
+`f:policyClass`, cross-ledger policy enforcement loads no rules
+from M (Allow/Deny depend on `f:defaultAllow`). Inline `opts.policy`
+JSON-LD continues to merge against D, never against M.
+
 ## Resolution time and `f:atT`
 
 | Case                       | Behavior |
@@ -244,20 +270,29 @@ datasets" property hold within a single request boundary.
 
 ## Caching
 
-Resolved artifacts are cached in the existing global `LeafletCache`
-(TinyLFU, byte budget `FLUREE_LEAFLET_CACHE_BYTES`). Reasons:
+Resolved artifacts are cached at the **API layer** (in
+`fluree-db-api`), not in `fluree-db-binary-index::LeafletCache`. The
+binary-index crate sits below `fluree-db-api`, `fluree-db-policy`,
+and the cross-ledger module; making it depend upward on typed
+governance-artifact representations would be a layering inversion.
 
-- One memory pool, one tuning knob.
-- Same eviction discipline as decoded leaflets.
-- Naturally bounded by the existing 8 GiB default.
+For Phase 1a the implementation is a Moka cache bounded by entry
+count, scoped to a `Fluree` instance. Single memory-pool unification
+with `LeafletCache` is a follow-up that requires adding an
+opaque-blob variant to the binary-index cache (the artifact is
+serialized to bytes at the cache boundary), and is deferred until
+the artifact representation stabilizes.
 
 The key is `(canonical_model_ledger_id, graph_iri, resolved_t)`. New
 commits to M produce new keys without explicit invalidation;
-unreferenced entries age out under TinyLFU. There is no
-"watermark-on-write" channel.
+unreferenced entries age out under the cache's eviction policy.
+There is no "watermark-on-write" channel.
 
 The cache value is the term-neutral `ResolvedGraph` (IRIs, not Sids).
-Per-data-ledger interning is not part of the cache key.
+Per-data-ledger interning is not part of the cache key — the cache
+is shareable across every data ledger that references the same
+`(model, graph, t)`, which is what makes "model edit propagates
+atomically to all governed datasets" cheap.
 
 ## Failure variants
 
