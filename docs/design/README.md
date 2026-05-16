@@ -36,6 +36,10 @@ How Fluree assigns `ns_code` values for IRIs (prefix trie matching, fallback spl
 
 How the reasoner consumes schema from a named `f:schemaSource` graph and transitively resolves `owl:imports`: resolution order, the `SchemaBundleOverlay` projection, schema-triple whitelist, and caching.
 
+### [Cross-ledger model enforcement](cross-ledger-model-enforcement.md)
+
+How a single **model ledger** can hold the ontology, SHACL shapes, policy rules, datalog rules, and uniqueness constraints that govern many **data ledgers** that reference it via `f:GraphRef` (`f:ledger`, `f:atT`). Specifies the shared resolver contract, term-space translation, policy IR identity split, failure variants, caching, and phasing.
+
 ### [Storage Traits](storage-traits.md)
 
 Storage trait architecture: `StorageRead`, `StorageWrite`, `ContentAddressedWrite`, `Storage`, and `NameService` trait design with guidance for implementing new backends.

@@ -76,6 +76,7 @@
   - [Index format](design/index-format.md)
   - [Namespace allocation and fallback modes](design/namespace-allocation.md)
   - [Ontology imports (`f:schemaSource` + `owl:imports`)](design/ontology-imports.md)
+  - [Cross-ledger model enforcement](design/cross-ledger-model-enforcement.md)
   - [Storage traits](design/storage-traits.md)
 
 - [HTTP API (fluree-db-server)](api/README.md)
