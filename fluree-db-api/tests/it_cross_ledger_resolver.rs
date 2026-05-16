@@ -258,6 +258,72 @@ async fn multiple_rdf_types_are_all_captured_in_policy_types() {
     assert!(r.policy_types.contains(&"http://example.org/ns/OrgPolicy".to_string()));
 }
 
+/// A canonically-typed policy (`rdf:type f:AccessPolicy`) that has
+/// NEITHER `f:allow` nor `f:query` is treated as `Deny` by the same-
+/// ledger materializer (with a warning) — so the cross-ledger
+/// materializer must surface the same subject. Structural detection
+/// on `f:allow ∪ f:query` alone would miss it; the additional
+/// `rdf:type f:AccessPolicy` scan closes that gap.
+#[tokio::test]
+async fn missing_effect_on_typed_policy_is_picked_up_as_deny() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let model_id = "test/cross-ledger/missing-effect:main";
+    let model = genesis_ledger(&fluree, model_id);
+    let policy_graph_iri = "http://example.org/missing-effect-graph";
+
+    // Policy is canonically typed but declares no f:allow / f:query.
+    // It does declare f:onClass so target_mode is OnClass — without
+    // the rdf:type-driven structural scan this subject would never
+    // be discovered, and the deny would silently disappear cross-
+    // ledger while still applying same-ledger.
+    let trig = format!(
+        r#"
+        @prefix f:    <https://ns.flur.ee/db#> .
+        @prefix rdf:  <http://www.w3.org/1999/02/22-rdf-syntax-ns#> .
+        @prefix ex:   <http://example.org/ns/> .
+
+        GRAPH <{policy_graph_iri}> {{
+            ex:incompleteDeny
+                rdf:type    f:AccessPolicy ;
+                f:action    f:view ;
+                f:onClass   ex:User .
+        }}
+    "#
+    );
+    fluree
+        .stage_owned(model)
+        .upsert_turtle(&trig)
+        .execute()
+        .await
+        .expect("write canonical-typed effect-less policy");
+
+    let data_id = "test/cross-ledger/missing-effect-d:main";
+    let _ = genesis_ledger(&fluree, data_id);
+
+    let mut ctx = ResolveCtx::new(data_id, &fluree);
+    let resolved = resolve_graph_ref(
+        &cross_ref(model_id, policy_graph_iri),
+        ArtifactKind::PolicyRules,
+        &mut ctx,
+    )
+    .await
+    .expect("missing-effect typed policy resolves");
+
+    let GovernanceArtifact::PolicyRules(wire) = &resolved.artifact;
+    assert_eq!(
+        wire.restrictions.len(),
+        1,
+        "canonical-typed policy must be surfaced even without f:allow / f:query"
+    );
+    let r = &wire.restrictions[0];
+    assert!(r.id.contains("incompleteDeny"));
+    assert!(
+        matches!(r.value, fluree_db_policy::WirePolicyValue::Deny),
+        "missing-effect on canonical type must materialize as Deny (mirroring same-ledger); got {:?}",
+        r.value
+    );
+}
+
 /// A cross-ledger ref to a graph IRI that doesn't exist on the model
 /// ledger surfaces as GraphMissingAtT — not silently empty, not
 /// TranslationFailed. The fail-closed contract names this failure

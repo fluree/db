@@ -52,6 +52,16 @@ use fluree_db_core::{
     FlakeValue, IndexType, LedgerSnapshot, RangeMatch, RangeTest, Sid,
 };
 use fluree_vocab::policy_iris;
+
+/// Canonical policy class IRI. Subjects typed exactly as this are
+/// included in the structural detection set even when they're missing
+/// `f:allow` and `f:query`, mirroring the same-ledger
+/// `load_policy_restriction` behavior that maps such "missing-effect"
+/// policies to `Deny` (fail-closed). Without this scan, a canonically-
+/// typed policy with no effect would be silently absent cross-ledger
+/// while still being enforced as Deny same-ledger — a divergence the
+/// design doc forbids.
+const ACCESS_POLICY_IRI: &str = "https://ns.flur.ee/db#AccessPolicy";
 use fluree_db_policy::{
     PolicyArtifactWire, PolicyRestriction, PolicyValue, WireOrigin, WirePolicyValue,
     WireRestriction,
@@ -108,7 +118,11 @@ pub(super) async fn materialize_policy_rules(
     );
 
     // 4. Structural detection — find every subject that has at least
-    //    one f:allow or f:query triple in this graph.
+    //    one f:allow or f:query triple OR is canonically typed as
+    //    f:AccessPolicy. The latter scan covers the case where a
+    //    canonically-typed policy is missing both effect predicates;
+    //    same-ledger load_policy_restriction maps that to Deny
+    //    (fail-closed), and the cross-ledger flow must agree.
     let mut policy_subjects: HashSet<Sid> = HashSet::new();
     for pred_sid in [allow_sid, query_sid] {
         let flakes = m_view
@@ -118,6 +132,32 @@ pub(super) async fn materialize_policy_rules(
                 ledger_id: canonical_model_ledger_id.to_string(),
                 graph_iri: graph_iri.to_string(),
                 detail: format!("range scan for policy-effect predicate failed: {e}"),
+            })?;
+        for flake in flakes.into_iter().filter(|f| f.op) {
+            policy_subjects.insert(flake.s);
+        }
+    }
+
+    // Union in subjects typed exactly as f:AccessPolicy. We don't
+    // attempt subclass entailment or scan for arbitrary types — the
+    // canonical class is the only structural baseline; custom-typed
+    // policies still need an explicit effect predicate to be picked
+    // up cross-ledger. That's a documented Phase 1a limitation.
+    if let Some(access_policy_sid) = m_db.snapshot.encode_iri(ACCESS_POLICY_IRI) {
+        let flakes = m_view
+            .range(
+                IndexType::Post,
+                RangeTest::Eq,
+                RangeMatch::predicate_object(
+                    rdf_type_sid.clone(),
+                    FlakeValue::Ref(access_policy_sid),
+                ),
+            )
+            .await
+            .map_err(|e| CrossLedgerError::TranslationFailed {
+                ledger_id: canonical_model_ledger_id.to_string(),
+                graph_iri: graph_iri.to_string(),
+                detail: format!("range scan for rdf:type f:AccessPolicy failed: {e}"),
             })?;
         for flake in flakes.into_iter().filter(|f| f.op) {
             policy_subjects.insert(flake.s);
