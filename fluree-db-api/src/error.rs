@@ -278,6 +278,18 @@ pub enum ApiError {
     /// Builder validation errors (one or more problems with builder configuration)
     #[error("{0}")]
     Builder(BuilderErrors),
+
+    /// Cross-ledger governance resolution failed.
+    ///
+    /// Wrapped variant carries the specific failure (missing ledger,
+    /// graph missing at t, retention pruned, reserved graph,
+    /// translation failure, trust failure, cross-instance, cycle).
+    /// HTTP layer maps this to 502; the variant is preserved in the
+    /// response body so callers can branch on it. Every variant is
+    /// fail-closed — there is no silent fallback to "no policy" or
+    /// "no shapes" when a cross-ledger dependency cannot be served.
+    #[error("Cross-ledger error: {0}")]
+    CrossLedger(#[from] crate::cross_ledger::CrossLedgerError),
 }
 
 impl ApiError {
@@ -396,6 +408,14 @@ impl ApiError {
             ) => 409,
             // Other transaction errors are usually validation failures
             ApiError::Transact(_) => 400,
+            // Cross-ledger model dependency could not be resolved /
+            // used. Conceptually an upstream-dependency failure, not
+            // an internal panic. 502 Bad Gateway is the pragmatic
+            // choice; 424 Failed Dependency is closer semantically
+            // but less commonly handled by client tooling. The
+            // wrapped variant is preserved for callers that branch
+            // on the specific failure.
+            ApiError::CrossLedger(_) => 502,
             // Internal/infrastructure errors
             _ => 500,
         }

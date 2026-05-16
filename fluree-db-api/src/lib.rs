@@ -39,6 +39,7 @@ pub mod bm25_worker;
 mod commit_data;
 pub mod commit_transfer;
 pub mod config_resolver;
+pub mod cross_ledger;
 #[cfg(feature = "credential")]
 pub mod credential;
 pub mod dataset;
