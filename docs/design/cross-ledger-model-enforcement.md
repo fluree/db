@@ -248,9 +248,16 @@ the corresponding policy rules. The request identity is bound to
 exactly as in the same-ledger flow.
 
 If the data ledger's effective config does not specify
-`f:policyClass`, cross-ledger policy enforcement loads no rules
-from M (Allow/Deny depend on `f:defaultAllow`). Inline `opts.policy`
-JSON-LD continues to merge against D, never against M.
+`f:policyClass`, the filter defaults to `{f:AccessPolicy}` — the
+canonical policy class IRI. Cross-ledger enforcement then pulls
+in every rule in M's policy graph that's typed as
+`f:AccessPolicy` directly. Custom-typed rules (e.g.,
+`ex:OrgPolicy`) require an explicit `f:policyClass` entry in D's
+config to be enforced. This default is intentionally a small
+allowlist rather than "every structural rule from M": operators
+opt into custom-class enforcement by naming it, never by
+omission. Inline `opts.policy` JSON-LD continues to merge against
+D, never against M.
 
 ## Resolution time and `f:atT`
 

@@ -482,6 +482,141 @@ async fn baseline_access_policy_class_enforced() {
     );
 }
 
+/// When D's config sets `f:policySource` cross-ledger but omits
+/// `f:policyClass` entirely, the filter must default to
+/// `{f:AccessPolicy}` — NOT "every rule in M's policy graph." A
+/// model graph containing both an `f:AccessPolicy` and an
+/// `ex:OrgPolicy` rule must enforce only the former; the operator
+/// has to opt into custom-class enforcement explicitly.
+#[tokio::test]
+async fn omitted_policy_class_defaults_to_access_policy_only() {
+    let fluree = FlureeBuilder::memory().build_memory();
+
+    let model_id = "test/cross-ledger-filter/default-class/model:main";
+    let model = genesis_ledger(&fluree, model_id);
+    let policy_graph_iri = "http://example.org/mixed-policies";
+
+    // M holds two policies: one canonical, one custom-typed. Both
+    // are deny-on-class — the canonical one targets ex:User, the
+    // custom one targets ex:Doc. The custom one MUST NOT be picked
+    // up under default-class filtering.
+    fluree
+        .stage_owned(model)
+        .upsert_turtle(&format!(
+            r#"
+            @prefix f:    <https://ns.flur.ee/db#> .
+            @prefix rdf:  <http://www.w3.org/1999/02/22-rdf-syntax-ns#> .
+            @prefix ex:   <http://example.org/ns/> .
+
+            GRAPH <{policy_graph_iri}> {{
+                ex:denyUsers
+                    rdf:type    f:AccessPolicy ;
+                    f:action    f:view ;
+                    f:onClass   ex:User ;
+                    f:allow     false .
+
+                ex:orgDenyDocs
+                    rdf:type    ex:OrgPolicy ;
+                    f:action    f:view ;
+                    f:onClass   ex:Doc ;
+                    f:allow     false .
+            }}
+        "#
+        ))
+        .execute()
+        .await
+        .expect("seed M with mixed policy classes");
+
+    let data_id = "test/cross-ledger-filter/default-class/data:main";
+    let data = genesis_ledger(&fluree, data_id);
+    let r1 = fluree
+        .insert(
+            data,
+            &json!({
+                "@context": {"ex": "http://example.org/ns/"},
+                "@graph": [
+                    {"@id": "ex:alice", "@type": "ex:User"},
+                    {"@id": "ex:doc1", "@type": "ex:Doc"}
+                ]
+            }),
+        )
+        .await
+        .unwrap();
+    let data = r1.ledger;
+
+    // D config: defaultAllow=true; no f:policyClass set at all;
+    // f:policySource points at M.
+    let config_iri = config_graph_iri(data_id);
+    fluree
+        .stage_owned(data)
+        .upsert_turtle(&format!(
+            r"
+            @prefix f:    <https://ns.flur.ee/db#> .
+            @prefix rdf:  <http://www.w3.org/1999/02/22-rdf-syntax-ns#> .
+
+            GRAPH <{config_iri}> {{
+                <urn:cfg:main> rdf:type f:LedgerConfig .
+                <urn:cfg:main> f:policyDefaults <urn:cfg:policy> .
+                <urn:cfg:policy> f:defaultAllow true .
+                <urn:cfg:policy> f:policySource <urn:cfg:policy-ref> .
+                <urn:cfg:policy-ref> rdf:type f:GraphRef ;
+                                     f:graphSource <urn:cfg:policy-src> .
+                <urn:cfg:policy-src> f:ledger <{model_id}> ;
+                                     f:graphSelector <{policy_graph_iri}> .
+            }}
+        "
+        ))
+        .execute()
+        .await
+        .expect("seed D config (no policy_class)");
+
+    let wrapped = fluree
+        .db_with_policy(data_id, &QueryConnectionOptions::default())
+        .await
+        .expect("db_with_policy");
+
+    // ex:User: canonical f:AccessPolicy rule must enforce → empty.
+    let users = fluree
+        .query(
+            &wrapped,
+            &json!({
+                "@context": {"ex": "http://example.org/ns/"},
+                "select": "?u",
+                "where": {"@id": "?u", "@type": "ex:User"}
+            }),
+        )
+        .await
+        .expect("query users");
+    let users_jsonld = users.to_jsonld(&wrapped.snapshot).expect("jsonld users");
+    assert_eq!(
+        users_jsonld,
+        json!([]),
+        "default f:AccessPolicy filter must enforce the canonical-typed rule; got {users_jsonld}"
+    );
+
+    // ex:Doc: only the custom-typed ex:OrgPolicy rule denies it. With
+    // no f:policyClass set, the default filter is {f:AccessPolicy},
+    // so the custom rule is dropped at translation. defaultAllow=true
+    // governs and ex:doc1 must remain visible.
+    let docs = fluree
+        .query(
+            &wrapped,
+            &json!({
+                "@context": {"ex": "http://example.org/ns/"},
+                "select": "?d",
+                "where": {"@id": "?d", "@type": "ex:Doc"}
+            }),
+        )
+        .await
+        .expect("query docs");
+    let docs_rendered = docs.to_jsonld(&wrapped.snapshot).expect("jsonld docs").to_string();
+    assert!(
+        docs_rendered.contains("doc1"),
+        "omitted f:policyClass must NOT pick up ex:OrgPolicy-typed rules; \
+         ex:doc1 should remain visible, got {docs_rendered}"
+    );
+}
+
 /// Combining `opts.identity` with cross-ledger `f:policySource` is
 /// a fail-closed config error in Phase 1a: the model ledger
 /// contributes policy rules, the data ledger contributes identity

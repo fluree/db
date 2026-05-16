@@ -644,19 +644,33 @@ impl Fluree {
 
             // Apply the data ledger's configured policy_class set as
             // an exact-IRI intersection filter on the wire's
-            // restrictions. Empty / unset class set means "let every
-            // typed policy through" — typical when D wants M's full
-            // ruleset and trusts the model ledger's authoring.
-            let filter: Option<std::collections::HashSet<String>> = effective_opts
+            // restrictions. The contract is:
+            //
+            //   filter = effective_opts.policy_class, OR
+            //            {f:AccessPolicy} when no policy_class is set.
+            //
+            // f:AccessPolicy is the canonical / baseline policy class
+            // — declaring `f:policySource` cross-ledger pulls those
+            // rules in automatically. Custom-typed rules require
+            // an explicit `f:policyClass` in D's config to be
+            // enforced. This is the safer default than "load every
+            // structurally-policy-looking subject from M," which
+            // would silently include rules the operator never opted
+            // into.
+            const DEFAULT_POLICY_CLASS_IRI: &str = "https://ns.flur.ee/db#AccessPolicy";
+            let filter: std::collections::HashSet<String> = effective_opts
                 .policy_class
                 .as_ref()
                 .filter(|v| !v.is_empty())
-                .map(|v| v.iter().cloned().collect());
+                .map(|v| v.iter().cloned().collect())
+                .unwrap_or_else(|| {
+                    [DEFAULT_POLICY_CLASS_IRI.to_string()].into_iter().collect()
+                });
             let snapshot_ref = &view.snapshot;
             let restrictions = fluree_db_policy::wire_to_restrictions(
                 wire,
                 |iri| snapshot_ref.encode_iri(iri),
-                filter.as_ref(),
+                Some(&filter),
             )
             .map_err(crate::error::ApiError::from)?;
 
