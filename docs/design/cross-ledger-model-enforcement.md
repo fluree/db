@@ -461,6 +461,14 @@ mode can be added without rewriting the failure taxonomy.
   create a duplicate value on one of those properties is
   rejected with `TransactError::UniqueConstraintViolation`
   even though the annotation never lives on D.
+- `f:schemaSource` cross-ledger via the same shared resolver.
+  The whitelisted schema axiom triples in M's ontology graph
+  (rdfs:subClassOf, rdfs:subPropertyOf, rdfs:domain, rdfs:range,
+  owl:equivalentClass / equivalentProperty / inverseOf / sameAs /
+  imports, and rdf:type for the schema-class set) are projected
+  into a `SchemaBundleFlakes` against D's snapshot and feed D's
+  reasoner. Single-graph only today; transitive `owl:imports`
+  recursion across multiple model ledgers is reserved.
 - Per-request memo + per-instance governance cache, both keyed
   on `(ArtifactKind, canonical_model_ledger_id, graph_iri,
   resolved_t)`.
@@ -480,8 +488,15 @@ The following subsystems share the resolver's contract but their
 materializers aren't implemented. Each lands as a new
 `GovernanceArtifact` variant + per-subsystem materializer:
 
-- `f:schemaSource` + `f:ontologyImportMap` cross-ledger
-  (transitive ontology imports across multiple model ledgers).
+- Transitive `owl:imports` recursion across multiple model
+  ledgers (Phase 1b's full scope). The single-graph schema
+  materialization above already projects M's `owl:imports`
+  triples into the wire so a future reader can see what M
+  declared — the recursion through `resolve_graph_ref`
+  (which would exercise `ResolveCtx.active` for cycle detection
+  across ledgers) lands separately.
+- `f:ontologyImportMap` cross-ledger (mapping table entries
+  whose `f:graphRef` targets another model ledger).
 - `f:shapesSource` cross-ledger (SHACL shapes).
 - `f:rulesSource` cross-ledger (datalog rules). The same-ledger
   routing for `f:rulesSource` is also still pending; the

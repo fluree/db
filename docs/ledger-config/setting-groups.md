@@ -40,7 +40,7 @@ When `f:policySource` is set, the policy loader scans the specified graph for po
 
 **Cross-ledger references are supported on `f:policySource`.** The graph source can name another ledger via `f:ledger`, so a single model ledger can hold policy rules that govern many data ledgers. See [Cross-ledger policy](../security/cross-ledger-policy.md) for the configuration pattern and the contract on `f:policyClass` filtering, baseline `f:AccessPolicy` semantics, and the failure modes.
 
-**Not yet honored on `f:policySource`** (parsed by the config layer but rejected at request time with a clear error): `f:atT` temporal pinning, `f:trustPolicy` verification, `f:rollbackGuard` freshness constraints. Cross-ledger references are also supported on `f:constraintsSource` (see [Cross-ledger policy and constraints](../security/cross-ledger-policy.md#cross-ledger-uniqueness-constraints)). The remaining `f:GraphRef`-shaped predicates (`f:shapesSource`, `f:schemaSource`, `f:rulesSource`) remain same-ledger only — setting `f:ledger` on those produces an error.
+**Not yet honored on `f:policySource`** (parsed by the config layer but rejected at request time with a clear error): `f:atT` temporal pinning, `f:trustPolicy` verification, `f:rollbackGuard` freshness constraints. Cross-ledger references are also supported on `f:constraintsSource` and `f:schemaSource` (single graph only — transitive `owl:imports` recursion across ledgers is not yet supported). See [Cross-ledger policy, constraints, and schema](../security/cross-ledger-policy.md). The remaining `f:GraphRef`-shaped predicates (`f:shapesSource`, `f:rulesSource`) remain same-ledger only — setting `f:ledger` on those produces an error.
 
 ### Example: policies in the default graph
 
@@ -363,7 +363,7 @@ A `f:GraphRef` has two levels: the outer node carries the type and optional trus
 | `f:trustPolicy` | `f:GraphRef` | object | How to verify the referenced graph (future) |
 | `f:rollbackGuard` | `f:GraphRef` | object | Freshness constraints (future) |
 | `f:graphSelector` | `f:graphSource` | IRI | Target graph: `f:defaultGraph`, `f:txnMetaGraph`, or a named graph IRI |
-| `f:ledger` | `f:graphSource` | IRI | Ledger identifier. Supported on `f:policySource` and `f:constraintsSource` (see [Cross-ledger policy and constraints](../security/cross-ledger-policy.md)); rejected on `f:shapesSource`, `f:schemaSource`, `f:rulesSource` until those subsystems route through the cross-ledger resolver. |
+| `f:ledger` | `f:graphSource` | IRI | Ledger identifier. Supported on `f:policySource`, `f:constraintsSource`, and `f:schemaSource` (single graph only; see [Cross-ledger policy, constraints, and schema](../security/cross-ledger-policy.md)); rejected on `f:shapesSource`, `f:rulesSource` until those subsystems route through the cross-ledger resolver. |
 | `f:atT` | `f:graphSource` | integer | Pin to a specific transaction time (optional) |
 
 For the common case of referencing a graph within the same ledger, only `f:graphSelector` is needed inside `f:graphSource`:
@@ -384,4 +384,4 @@ f:policySource [
 ] .
 ```
 
-Cross-ledger `f:GraphRef` (using `f:ledger` to reference another ledger) is honored by `f:policySource` and `f:constraintsSource` — see [Cross-ledger policy and constraints](../security/cross-ledger-policy.md) for end-to-end patterns. The other source predicates (`f:shapesSource`, `f:schemaSource`, `f:rulesSource`) accept the field in their parse layer but the cross-ledger materializers for those subsystems aren't implemented yet; setting `f:ledger` on them produces an explicit error rather than a silent fallback.
+Cross-ledger `f:GraphRef` (using `f:ledger` to reference another ledger) is honored by `f:policySource`, `f:constraintsSource`, and `f:schemaSource` (single graph only — transitive `owl:imports` recursion across ledgers is not yet supported on schema). See [Cross-ledger policy, constraints, and schema](../security/cross-ledger-policy.md) for end-to-end patterns. The remaining source predicates (`f:shapesSource`, `f:rulesSource`) accept the field in their parse layer but the cross-ledger materializers for those subsystems aren't implemented yet; setting `f:ledger` on them produces an explicit error rather than a silent fallback.

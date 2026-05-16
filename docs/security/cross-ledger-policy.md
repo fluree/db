@@ -1,22 +1,29 @@
-# Cross-ledger policy and constraints
+# Cross-ledger policy, constraints, and schema
 
 A single **model ledger** can hold governance artifacts —
-policy rules and uniqueness constraints — that govern many
-**data ledgers** that reference it. Update the model once and
-every governed data ledger sees the new rules / constraints on
-its next request, with no per-dataset duplication.
+policy rules, uniqueness constraints, and ontology/schema
+axioms — that govern many **data ledgers** that reference it.
+Update the model once and every governed data ledger sees the
+new rules / constraints / schema on its next request, with no
+per-dataset duplication.
 
-Two subsystems are wired today:
+Three subsystems are wired today:
 
 - **Cross-ledger policy** (`f:policySource` with `f:ledger`) —
   M's policy rule set is applied to queries against D.
 - **Cross-ledger constraints** (`f:constraintsSource` with
   `f:ledger`) — M's `f:enforceUnique` annotations are applied
   to transactions against D.
+- **Cross-ledger schema** (`f:schemaSource` with `f:ledger`) —
+  M's RDFS/OWL axioms (class hierarchy, property hierarchy,
+  domain/range, equivalences, owl:imports declarations) feed
+  D's reasoner. Single-graph only today; transitive
+  `owl:imports` recursion across multiple model ledgers is
+  reserved.
 
-Other subsystems (`f:schemaSource`, `f:shapesSource`,
-`f:rulesSource`) share the resolver's contract but their
-materializers are not yet implemented; see the design doc's
+The remaining subsystems (`f:shapesSource`, `f:rulesSource`)
+share the resolver's contract but their materializers are not
+yet implemented; see the design doc's
 [Scope](../design/cross-ledger-model-enforcement.md#scope)
 section.
 
@@ -234,6 +241,88 @@ A few specifics that differ from cross-ledger policy:
   `f:policyClass` filtering — every property M declares unique
   applies.
 
+## Cross-ledger schema / ontology
+
+Same two-ledger pattern, third subsystem. M holds an RDFS/OWL
+schema in a named graph (class hierarchy, property hierarchy,
+domain/range, equivalences); D references that graph in its
+`#config` under `f:reasoningDefaults.f:schemaSource`. When D's
+queries enable reasoning, M's axioms feed the reasoner exactly
+as if they lived on D.
+
+```trig
+# On model ledger M — ontology in a named graph
+@prefix owl:  <http://www.w3.org/2002/07/owl#> .
+@prefix rdf:  <http://www.w3.org/1999/02/22-rdf-syntax-ns#> .
+@prefix rdfs: <http://www.w3.org/2000/01/rdf-schema#> .
+@prefix ex:   <http://example.org/ns/> .
+
+GRAPH <http://example.org/ontology/core> {
+    ex:Animal  rdf:type        owl:Class .
+    ex:Dog     rdf:type        owl:Class ;
+               rdfs:subClassOf ex:Animal .
+
+    ex:knows   rdf:type           owl:ObjectProperty .
+    ex:friend  rdf:type           owl:ObjectProperty ;
+               rdfs:subPropertyOf ex:knows .
+}
+```
+
+```trig
+# On data ledger D — #config
+@prefix f:   <https://ns.flur.ee/db#> .
+@prefix rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#> .
+
+GRAPH <urn:fluree:mydb:main#config> {
+    <urn:cfg:main> rdf:type f:LedgerConfig ;
+        f:reasoningDefaults <urn:cfg:reasoning> .
+
+    <urn:cfg:reasoning>
+        f:reasoningModes  ( "rdfs" "owl2-rl" ) ;
+        f:schemaSource    <urn:cfg:schema-ref> .
+
+    <urn:cfg:schema-ref> rdf:type f:GraphRef ;
+        f:graphSource <urn:cfg:schema-src> .
+
+    <urn:cfg:schema-src>
+        f:ledger        <org/ontology:main> ;
+        f:graphSelector <http://example.org/ontology/core> .
+}
+```
+
+With this config, a query against D for `?s rdf:type ex:Animal`
+returns every `ex:Dog` instance on D (subClassOf reasoning) —
+even though `ex:Dog rdfs:subClassOf ex:Animal` never appears on
+D itself.
+
+The materializer pulls a **whitelisted subset** of axioms from
+M's schema graph: the predicates `rdfs:subClassOf`,
+`rdfs:subPropertyOf`, `rdfs:domain`, `rdfs:range`,
+`owl:inverseOf`, `owl:equivalentClass`, `owl:equivalentProperty`,
+`owl:sameAs`, `owl:imports`, plus `rdf:type` declarations for
+the schema class set (`owl:Class`, `owl:ObjectProperty`,
+`owl:DatatypeProperty`, the property characteristic classes,
+`owl:Ontology`, `rdf:Property`). Instance data in the schema
+graph is filtered out; only axioms cross over.
+
+A few specifics that differ from cross-ledger policy:
+
+- Reasoning must be **enabled** for cross-ledger schema to take
+  effect. The data ledger's config can set
+  `f:reasoningModes` (e.g., `["rdfs"]` or `["owl2-rl"]`), or
+  the query can opt in via the `reasoning` option.
+- Failures during cross-ledger schema resolution surface as
+  `ApiError::OntologyImport` (with the underlying
+  `CrossLedgerError` displayed in the message) rather than
+  `ApiError::CrossLedger`. That preserves continuity with the
+  same-ledger ontology-imports error path.
+- Single graph only in this phase: `owl:imports` triples in
+  M's schema graph are carried through to the wire (so a
+  future reader can see them), but the resolver does NOT
+  transitively follow them across ledger boundaries yet. If M's
+  schema declares `owl:imports <X>` where X is on a different
+  model ledger M2, that import isn't resolved.
+
 ## Limitations
 
 The following behaviors are **not yet implemented** and fail
@@ -246,7 +335,8 @@ closed when configured:
 | `f:rollbackGuard` (freshness constraints)  | Request fails with `UnsupportedFeature`. |
 | `opts.identity` + cross-ledger `f:policySource` | Request fails with a config error. Identity-mode loads policies via the identity's `f:policyClass` triples, which would have to resolve in D (the identity isn't an M concept); combining the two modes ambiguously is rejected rather than silently choosing one. Use `opts.policy_class` with cross-ledger configs. |
 | `f:policySource` with `f:graphSelector` naming M's `#config` or `#txn-meta` | Request fails with `ReservedGraphSelected` before any storage read on M. |
-| `f:ledger` on `f:shapesSource`, `f:schemaSource`, `f:rulesSource` | Request fails — cross-ledger support is currently implemented for `f:policySource` and `f:constraintsSource` only. |
+| `f:ledger` on `f:shapesSource`, `f:rulesSource` | Request fails — cross-ledger support is currently implemented for `f:policySource`, `f:constraintsSource`, and `f:schemaSource` only. |
+| Transitive `owl:imports` across model ledgers (`f:schemaSource` recursion) | Not yet honored. Imports inside M's schema graph are projected but the resolver doesn't follow them across ledger boundaries. |
 
 The other reserved fields and source predicates may land in
 later releases; the resolver's contract is shared across all of

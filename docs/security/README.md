@@ -71,15 +71,18 @@ Using policies in Rust applications:
 - Transaction-side policy enforcement
 - Historical views with policy
 
-### [Cross-ledger policy and constraints](cross-ledger-policy.md)
+### [Cross-ledger policy, constraints, and schema](cross-ledger-policy.md)
 
 Govern many data ledgers from one model ledger via
-`f:policySource` and `f:constraintsSource` with `f:ledger`:
+`f:policySource`, `f:constraintsSource`, and `f:schemaSource`
+with `f:ledger`:
 - Two-ledger configuration pattern (model M, data D)
 - Cross-ledger policy: `f:policyClass` filtering, `f:AccessPolicy`
   baseline, engaging the policy path over HTTP
 - Cross-ledger uniqueness constraints: tx-time enforcement of
   M's `f:enforceUnique` annotations on D's transactions
+- Cross-ledger schema/ontology: M's RDFS/OWL axioms feed D's
+  reasoner (single graph, transitive `owl:imports` deferred)
 - Failure modes and HTTP status mapping
 - Cache and update semantics
 
