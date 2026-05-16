@@ -455,6 +455,12 @@ mode can be added without rewriting the failure taxonomy.
   policy IR carries definitional/contextual term references
   separately so the model ledger contributes rules while the
   data ledger contributes identity binding.
+- `f:constraintsSource` cross-ledger via the same shared
+  resolver. M's `f:enforceUnique true` annotations on
+  properties apply to D's transactions; a tx that would
+  create a duplicate value on one of those properties is
+  rejected with `TransactError::UniqueConstraintViolation`
+  even though the annotation never lives on D.
 - Per-request memo + per-instance governance cache, both keyed
   on `(ArtifactKind, canonical_model_ledger_id, graph_iri,
   resolved_t)`.
@@ -463,8 +469,8 @@ mode can be added without rewriting the failure taxonomy.
 - Reserved-feature rejection: `f:atT`, `f:trustPolicy`, and
   `f:rollbackGuard` are surfaced as `UnsupportedFeature` rather
   than silently ignored.
-- Identity-mode + cross-ledger combination fails closed with a
-  config error — the design's "M contributes rules, D
+- Identity-mode + cross-ledger policy combination fails closed
+  with a config error — the design's "M contributes rules, D
   contributes identity" boundary is enforced at the request
   surface.
 
@@ -481,7 +487,6 @@ materializers aren't implemented. Each lands as a new
   routing for `f:rulesSource` is also still pending; the
   cross-ledger path will route through the shared resolver
   once same-ledger lands.
-- `f:constraintsSource` cross-ledger (uniqueness annotations).
 - `f:atT` temporal pinning (currently rejected as
   `UnsupportedFeature`).
 - `f:trustPolicy` and `f:rollbackGuard` (rejected as

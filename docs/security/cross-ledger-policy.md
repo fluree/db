@@ -1,9 +1,24 @@
-# Cross-ledger policy
+# Cross-ledger policy and constraints
 
-Cross-ledger policy lets a single **model ledger** hold a policy
-rule set that governs many **data ledgers** that reference it.
-Update the model once and every governed data ledger sees the new
-rules on its next request — no per-dataset rule duplication.
+A single **model ledger** can hold governance artifacts —
+policy rules and uniqueness constraints — that govern many
+**data ledgers** that reference it. Update the model once and
+every governed data ledger sees the new rules / constraints on
+its next request, with no per-dataset duplication.
+
+Two subsystems are wired today:
+
+- **Cross-ledger policy** (`f:policySource` with `f:ledger`) —
+  M's policy rule set is applied to queries against D.
+- **Cross-ledger constraints** (`f:constraintsSource` with
+  `f:ledger`) — M's `f:enforceUnique` annotations are applied
+  to transactions against D.
+
+Other subsystems (`f:schemaSource`, `f:shapesSource`,
+`f:rulesSource`) share the resolver's contract but their
+materializers are not yet implemented; see the design doc's
+[Scope](../design/cross-ledger-model-enforcement.md#scope)
+section.
 
 This page covers how to configure cross-ledger policy. For the
 underlying design (resolver contract, term-space translation,
@@ -155,6 +170,70 @@ When using the in-process Rust API, calling
 policy path, even with empty opts. Programmatic users don't see
 this gating.
 
+## Cross-ledger uniqueness constraints
+
+Same two-ledger pattern, different subsystem. M holds an
+`f:enforceUnique true` annotation on a property; D references
+M's constraints graph in its `#config`. Every transaction
+against D that would create a duplicate value on that property
+is rejected.
+
+```trig
+# On model ledger M
+@prefix f:  <https://ns.flur.ee/db#> .
+@prefix ex: <http://example.org/ns/> .
+
+GRAPH <http://example.org/governance/constraints> {
+    ex:email f:enforceUnique true .
+}
+```
+
+```trig
+# On data ledger D — #config
+@prefix f:   <https://ns.flur.ee/db#> .
+@prefix rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#> .
+
+GRAPH <urn:fluree:mydb:main#config> {
+    <urn:cfg:main> rdf:type f:LedgerConfig ;
+        f:transactDefaults <urn:cfg:transact> .
+
+    <urn:cfg:transact>
+        f:uniqueEnabled      true ;
+        f:constraintsSource  <urn:cfg:cref> .
+
+    <urn:cfg:cref> rdf:type f:GraphRef ;
+        f:graphSource <urn:cfg:csrc> .
+
+    <urn:cfg:csrc>
+        f:ledger        <org/governance:main> ;
+        f:graphSelector <http://example.org/governance/constraints> .
+}
+```
+
+After this config lands on D, the next transaction that creates
+a duplicate `ex:email` value is rejected with
+`TransactError::UniqueConstraintViolation`. The annotation
+itself never appears on D — D enforces it because its config
+points at M.
+
+A few specifics that differ from cross-ledger policy:
+
+- Constraints are enforced at **transaction time**, not query
+  time. No HTTP header gymnastics are needed to engage them —
+  the staging pipeline picks them up automatically whenever the
+  data ledger's config has `f:uniqueEnabled true` plus a
+  cross-ledger `f:constraintsSource`.
+- Failures during cross-ledger constraints resolution surface
+  as `TransactError::Parse` (mapped to HTTP **400 Bad Request**
+  at the API layer) rather than `ApiError::CrossLedger` (502).
+  That's a staging-pipeline quirk — the error message preserves
+  the underlying cross-ledger failure variant for diagnostics,
+  but the HTTP status differs from the query-side policy path.
+- The wire artifact for constraints is simpler than policy:
+  just a list of property IRIs. There's no equivalent of
+  `f:policyClass` filtering — every property M declares unique
+  applies.
+
 ## Limitations
 
 The following behaviors are **not yet implemented** and fail
@@ -167,7 +246,7 @@ closed when configured:
 | `f:rollbackGuard` (freshness constraints)  | Request fails with `UnsupportedFeature`. |
 | `opts.identity` + cross-ledger `f:policySource` | Request fails with a config error. Identity-mode loads policies via the identity's `f:policyClass` triples, which would have to resolve in D (the identity isn't an M concept); combining the two modes ambiguously is rejected rather than silently choosing one. Use `opts.policy_class` with cross-ledger configs. |
 | `f:policySource` with `f:graphSelector` naming M's `#config` or `#txn-meta` | Request fails with `ReservedGraphSelected` before any storage read on M. |
-| `f:ledger` on `f:shapesSource`, `f:schemaSource`, `f:rulesSource`, `f:constraintsSource` | Request fails — cross-ledger support is currently only implemented for `f:policySource`. |
+| `f:ledger` on `f:shapesSource`, `f:schemaSource`, `f:rulesSource` | Request fails — cross-ledger support is currently implemented for `f:policySource` and `f:constraintsSource` only. |
 
 The other reserved fields and source predicates may land in
 later releases; the resolver's contract is shared across all of
