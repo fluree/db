@@ -1044,7 +1044,7 @@ Existing endpoint, extended with graph source fallback. Request body is unchange
 2. If the ledger drop report has `status: "not_found"`, try dropping as a **graph source** (default branch `"main"`)
 3. If both return not found, return the not-found response
 
-**Response:** Same schema as ledger drop: `{ "ledger_id": "name:branch", "status": "dropped"|"already_retracted"|"not_found", "warnings": [...] }`. For graph sources, `ledger_id` contains the graph source ID (e.g., `"warehouse-orders:main"`).
+**Response:** Same schema as ledger drop: `{ "ledger_id": "name:branch", "status": "dropped"|"already_retracted"|"not_found", "files_deleted": 23, "warnings": [...] }`. `files_deleted` is omitted when zero and is currently omitted for graph-source fallback responses. For graph sources, `ledger_id` contains the graph source ID (e.g., `"warehouse-orders:main"`).
 
 ### `fluree iceberg map` (Iceberg graph source creation)
 

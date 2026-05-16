@@ -1,6 +1,6 @@
 # fluree drop
 
-Drop (delete) a ledger or graph source.
+Hard-drop a ledger or graph source.
 
 ## Usage
 
@@ -22,9 +22,13 @@ fluree drop <NAME> --force
 
 ## Description
 
-Permanently deletes a ledger or graph source. The `--force` flag is required to prevent accidental deletion.
+Deletes a ledger using the same hard-drop mode as `POST /drop` with `"hard": true`. For managed storage backends, Fluree deletes storage artifacts and removes the nameservice record where the backend supports purge, allowing the alias to be reused. Deleted artifacts are irreversible.
 
 The command first tries to drop the name as a ledger. If no ledger is found, it tries to drop it as a graph source. This means `fluree drop` works uniformly for both ledgers and graph sources like Iceberg mappings.
+
+The `--force` flag is required to prevent accidental deletion. There is no CLI soft-drop flag; use the HTTP or Rust API if you need to retract a ledger while preserving artifacts.
+
+Graph source cleanup is implementation-specific. The command retracts the graph source record and performs any available hard-drop cleanup for that graph source type; warnings are printed when cleanup is partial.
 
 ## Examples
 
@@ -41,6 +45,11 @@ fluree drop warehouse-orders --force
 Ledger:
 ```
 Dropped ledger 'oldledger'
+```
+
+Ledger with artifact cleanup:
+```
+Dropped ledger 'oldledger' (deleted 23 artifacts)
 ```
 
 Graph source:

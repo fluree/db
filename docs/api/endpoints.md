@@ -1203,7 +1203,7 @@ curl -X POST http://localhost:8090/v1/fluree/create \
 
 ### POST /drop
 
-Drop (delete) a ledger.
+Drop a ledger or graph source.
 
 **URL:**
 ```
@@ -1224,31 +1224,31 @@ POST /drop
 | Field | Type | Required | Description |
 |-------|------|----------|-------------|
 | `ledger` | string | Yes | Ledger ID (e.g., "mydb" or "mydb:main") |
-| `hard` | boolean | No | If `true`, permanently delete all storage files. Default: `false` (soft drop) |
+| `hard` | boolean | No | If `true`, delete managed storage artifacts and purge the nameservice record where the backend supports purge. Default: `false` (soft drop) |
 
 **Drop Modes:**
 
-- **Soft drop** (`hard: false`, default): Retracts the ledger from the nameservice but preserves all data files. The ledger can potentially be recovered.
-- **Hard drop** (`hard: true`): Permanently deletes all commit and index files. **This is irreversible.**
+- **Soft drop** (`hard: false`, default): Marks the ledger as retracted in the nameservice and preserves storage artifacts. The alias remains reserved; normal create/load paths treat the ledger as unavailable.
+- **Hard drop** (`hard: true`): Deletes managed storage artifacts, then purges the nameservice record so the alias can be reused on backends with purge support. **This is irreversible for deleted artifacts.**
+
+If no ledger is found, the server tries the same name as a graph source on branch `main`. Graph source hard-drop cleanup is best effort and may be implementation-specific; graph-source fallback responses currently omit `files_deleted`.
 
 **Response:**
 
 ```json
 {
-  "ledger": "mydb:main",
+  "ledger_id": "mydb:main",
   "status": "dropped",
-  "files_deleted": {
-    "commit": 15,
-    "index": 8
-  }
+  "files_deleted": 23
 }
 ```
 
-| Field | Description |
-|-------|-------------|
-| `ledger` | Normalized ledger ID |
-| `status` | One of: `"dropped"`, `"already_retracted"`, `"not_found"` |
-| `files_deleted` | File counts (only populated for hard drop) |
+| Field | Type | Description |
+|-------|------|-------------|
+| `ledger_id` | string | Normalized ledger ID, or graph source ID if the graph-source fallback handled the request |
+| `status` | string | One of: `"dropped"`, `"already_retracted"`, `"not_found"` |
+| `files_deleted` | integer | Number of managed storage artifacts deleted; omitted when zero |
+| `warnings` | string[] | Non-fatal cleanup warnings; omitted when empty |
 
 **Status Codes:**
 - `200 OK` - Drop successful (or already dropped/not found)
@@ -1261,25 +1261,25 @@ POST /drop
 1. Normalizes the ledger ID (ensures branch suffix like `:main`)
 2. Cancels any pending background indexing
 3. Waits for in-progress indexing to complete
-4. In hard mode: deletes all storage artifacts (commits + indexes)
-5. Retracts from nameservice
+4. In hard mode: deletes managed storage artifacts (commits, txns, indexes, config/context blobs, and related content)
+5. In soft mode: retracts from nameservice; in hard mode: purges the nameservice record where supported
 6. Disconnects from ledger cache
 
 **Idempotency:**
 
 Safe to call multiple times:
 - Returns `"already_retracted"` if the ledger was previously dropped
-- Hard mode still attempts file deletion even for already-retracted ledgers (useful for cleanup)
+- Hard mode still attempts artifact deletion even for already-retracted or not-found ledgers (useful for cleanup)
 
 **Examples:**
 
 ```bash
-# Soft drop (retract only, preserve files)
+# Soft drop (retract only, preserve storage artifacts)
 curl -X POST http://localhost:8090/v1/fluree/drop \
   -H "Content-Type: application/json" \
   -d '{"ledger": "mydb:main"}'
 
-# Hard drop (delete all files - IRREVERSIBLE)
+# Hard drop (delete managed storage artifacts - IRREVERSIBLE)
 curl -X POST http://localhost:8090/v1/fluree/drop \
   -H "Content-Type: application/json" \
   -d '{"ledger": "mydb:main", "hard": true}'
@@ -1532,9 +1532,9 @@ POST /drop-branch
 ```json
 {
   "ledger_id": "mydb:feature-x",
-  "status": "Dropped",
+  "status": "dropped",
   "deferred": false,
-  "artifacts_deleted": 5,
+  "files_deleted": 5,
   "cascaded": [],
   "warnings": []
 }
@@ -1542,12 +1542,12 @@ POST /drop-branch
 
 | Field | Type | Description |
 |-------|------|-------------|
-| `ledger_id` | Full ledger:branch identifier of the dropped branch |
-| `status` | Drop status (`"Dropped"`, `"AlreadyRetracted"`, `"NotFound"`) |
-| `deferred` | `true` if the branch has children — retracted but storage preserved |
-| `artifacts_deleted` | Number of storage artifacts removed |
-| `cascaded` | List of ancestor branch ledger_ids that were cascade-dropped |
-| `warnings` | Any non-fatal warnings during the drop |
+| `ledger_id` | string | Full ledger:branch identifier of the dropped branch |
+| `status` | string | Drop status (`"dropped"`, `"already_retracted"`, `"not_found"`) |
+| `deferred` | boolean | `true` if the branch has children — retracted but storage preserved |
+| `files_deleted` | integer | Number of storage artifacts removed; omitted when zero |
+| `cascaded` | string[] | List of ancestor branch ledger_ids that were cascade-dropped; omitted when empty |
+| `warnings` | string[] | Any non-fatal warnings during the drop; omitted when empty |
 
 **Behavior:**
 

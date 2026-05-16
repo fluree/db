@@ -437,8 +437,10 @@ Full permissions (recommended):
         "dynamodb:GetItem",
         "dynamodb:PutItem",
         "dynamodb:UpdateItem",
+        "dynamodb:DeleteItem",
         "dynamodb:Query",
-        "dynamodb:BatchGetItem"
+        "dynamodb:BatchGetItem",
+        "dynamodb:BatchWriteItem"
       ],
       "Resource": [
         "arn:aws:dynamodb:*:*:table/fluree-nameservice",
@@ -461,8 +463,10 @@ If you also use `ensure_table()` for automated table creation (development/testi
         "dynamodb:GetItem",
         "dynamodb:PutItem",
         "dynamodb:UpdateItem",
+        "dynamodb:DeleteItem",
         "dynamodb:Query",
         "dynamodb:BatchGetItem",
+        "dynamodb:BatchWriteItem",
         "dynamodb:CreateTable",
         "dynamodb:DescribeTable"
       ],
@@ -475,7 +479,7 @@ If you also use `ensure_table()` for automated table creation (development/testi
 }
 ```
 
-Minimal permissions (if not using `all_records`, `all_graph_source_records`, or graph sources):
+Minimal runtime permissions (if not using `all_records`, `all_graph_source_records`, graph sources, or hard-drop purge):
 
 ```json
 {
@@ -494,6 +498,8 @@ Minimal permissions (if not using `all_records`, `all_graph_source_records`, or 
   ]
 }
 ```
+
+Hard drops and branch-drop cascade cleanup require `dynamodb:DeleteItem`. Backends that purge all nameservice items for a ledger partition also need `dynamodb:BatchWriteItem`.
 
 ## Local Development
 

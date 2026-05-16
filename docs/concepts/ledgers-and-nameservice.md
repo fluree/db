@@ -53,9 +53,9 @@ Ledgers are created implicitly through the first transaction and persist until e
 
 Ledgers can be marked as retracted (soft delete), which:
 - Marks the ledger as inactive in the nameservice
-- Preserves all historical data
-- Prevents new transactions (but allows historical queries)
-- Can be reversed if needed
+- Preserves storage artifacts
+- Prevents normal load/create/write paths from treating the alias as active
+- Keeps the alias reserved until an administrator purges or otherwise repairs the nameservice record
 
 ## The Nameservice
 
@@ -286,12 +286,12 @@ curl http://localhost:8090/v1/fluree/ledgers
 
 #### Retraction
 
-Mark ledgers as inactive:
+Mark ledgers as inactive without deleting storage artifacts:
 
 ```rust
 // Pseudo-code
 nameservice.retract("mydb:old-branch").await?;
-// Sets retracted=true, prevents new transactions
+// Sets retracted=true; the alias remains reserved.
 ```
 
 ### Storage Backends
@@ -726,9 +726,9 @@ Understanding how records evolve:
    - Large gaps indicate indexing lag
    - May need to tune indexing frequency or resources
 
-3. **Handle Retraction Carefully**: Retracted ledgers preserve history
+3. **Handle Retraction Carefully**: Retracted ledgers preserve storage artifacts
    - Use for soft deletes, not hard deletes
-   - Historical queries still work on retracted ledgers
+   - Do not assume normal query/load APIs will open a retracted ledger; administrative recovery may require nameservice repair or purge
 
 ### Performance Considerations
 
