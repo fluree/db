@@ -335,7 +335,7 @@ async fn cross_ledger_schema_materializes_whitelisted_axioms() {
     let subclass_axiom = triples.iter().find(|t| {
         t.s == "http://example.org/ns/Dog"
             && t.p == "http://www.w3.org/2000/01/rdf-schema#subClassOf"
-            && t.o == "http://example.org/ns/Animal"
+            && matches!(&t.o, fluree_db_api::cross_ledger::WireObject::Ref(o) if o == "http://example.org/ns/Animal")
     });
     assert!(
         subclass_axiom.is_some(),
@@ -346,7 +346,7 @@ async fn cross_ledger_schema_materializes_whitelisted_axioms() {
     let subproperty_axiom = triples.iter().find(|t| {
         t.s == "http://example.org/ns/friend"
             && t.p == "http://www.w3.org/2000/01/rdf-schema#subPropertyOf"
-            && t.o == "http://example.org/ns/knows"
+            && matches!(&t.o, fluree_db_api::cross_ledger::WireObject::Ref(o) if o == "http://example.org/ns/knows")
     });
     assert!(
         subproperty_axiom.is_some(),
@@ -357,7 +357,7 @@ async fn cross_ledger_schema_materializes_whitelisted_axioms() {
     let class_decl = triples.iter().find(|t| {
         t.s == "http://example.org/ns/Animal"
             && t.p == "http://www.w3.org/1999/02/22-rdf-syntax-ns#type"
-            && t.o == "http://www.w3.org/2002/07/owl#Class"
+            && matches!(&t.o, fluree_db_api::cross_ledger::WireObject::Ref(o) if o == "http://www.w3.org/2002/07/owl#Class")
     });
     assert!(
         class_decl.is_some(),

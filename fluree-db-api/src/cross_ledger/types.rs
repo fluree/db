@@ -157,13 +157,53 @@ pub struct SchemaArtifactWire {
     pub triples: Vec<WireTriple>,
 }
 
-/// IRI-form schema triple. All three positions are IRIs in the
-/// whitelisted projection.
+/// IRI-form triple used by both `SchemaArtifactWire` and
+/// `ShapesArtifactWire`. Subject and predicate are always IRIs;
+/// the object can be either a Ref (IRI) or a literal value with
+/// its datatype IRI / language tag. Schema's whitelist is
+/// Ref-only in practice; SHACL's whitelist includes literal-valued
+/// predicates (`sh:minCount`, `sh:pattern`, `sh:message`, ...).
 #[derive(Debug, Clone)]
 pub struct WireTriple {
     pub s: String,
     pub p: String,
-    pub o: String,
+    pub o: WireObject,
+}
+
+/// IRI-form object value carried in a `WireTriple`.
+///
+/// `Ref(iri)` survives the round-trip as an `IRI → Sid` encode at
+/// the data ledger. `Literal { value, datatype, lang }` reconstructs
+/// the original `FlakeValue` against D by branching on `datatype`:
+/// xsd:integer → `Long`, xsd:boolean → `Boolean`, xsd:string → `String`,
+/// xsd:decimal → `Decimal`, xsd:dateTime → `DateTime`, etc. Unknown
+/// datatypes fall back to `FlakeValue::String(value)` rather than
+/// failing — the SHACL compiler will simply not match them on
+/// type-sensitive constraints, which is the same observable behavior
+/// as if the constraint weren't authored.
+#[derive(Debug, Clone)]
+pub enum WireObject {
+    /// IRI reference; encoded via `snapshot.encode_iri` at the data
+    /// ledger to produce a `FlakeValue::Ref(Sid)`.
+    Ref(String),
+    /// Literal value in its canonical lexical form, paired with the
+    /// datatype IRI and optional language tag. The datatype IRI is
+    /// the XSD/RDF IRI (e.g., `http://www.w3.org/2001/XMLSchema#integer`)
+    /// or `http://www.w3.org/1999/02/22-rdf-syntax-ns#langString` for
+    /// language-tagged strings.
+    Literal {
+        value: String,
+        datatype: String,
+        lang: Option<String>,
+    },
+}
+
+impl WireObject {
+    /// Helper for callers that only emit Refs (e.g., schema's
+    /// whitelist projection). Equivalent to `WireObject::Ref(iri)`.
+    pub fn iri(iri: impl Into<String>) -> Self {
+        WireObject::Ref(iri.into())
+    }
 }
 
 impl SchemaArtifactWire {
@@ -189,10 +229,15 @@ impl SchemaArtifactWire {
 
         let mut collected: Vec<Flake> = Vec::with_capacity(self.triples.len());
         for t in &self.triples {
+            // Schema whitelist projects Refs only; any literal-valued
+            // object on a whitelisted predicate is silently skipped
+            // (such triples can't survive the schema-bundle path
+            // anyway — the reasoner expects Ref-valued schema axioms).
+            let WireObject::Ref(o_iri) = &t.o else { continue };
             let (Some(s_sid), Some(p_sid), Some(o_sid)) = (
                 snapshot.encode_iri(&t.s),
                 snapshot.encode_iri(&t.p),
-                snapshot.encode_iri(&t.o),
+                snapshot.encode_iri(o_iri),
             ) else {
                 continue;
             };

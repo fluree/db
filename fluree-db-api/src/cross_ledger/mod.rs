@@ -21,5 +21,5 @@ pub use error::CrossLedgerError;
 pub use resolver::resolve_graph_ref;
 pub use types::{
     ArtifactKind, ConstraintsArtifactWire, GovernanceArtifact, ResolveCtx, ResolvedGraph,
-    SchemaArtifactWire, WireOrigin, WireTriple,
+    SchemaArtifactWire, WireObject, WireOrigin, WireTriple,
 };

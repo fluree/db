@@ -14,7 +14,7 @@
 //! across ledgers. Transitive cross-ledger imports land in a
 //! follow-up.
 
-use super::types::{SchemaArtifactWire, WireOrigin, WireTriple};
+use super::types::{SchemaArtifactWire, WireObject, WireOrigin, WireTriple};
 use super::CrossLedgerError;
 use crate::Fluree;
 use fluree_db_core::{
@@ -245,7 +245,7 @@ fn push_ref_triple(
     out.push(WireTriple {
         s: s_iri,
         p: p_iri,
-        o: o_iri,
+        o: WireObject::Ref(o_iri),
     });
     Ok(())
 }
