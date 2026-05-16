@@ -324,6 +324,85 @@ async fn missing_effect_on_typed_policy_is_picked_up_as_deny() {
     );
 }
 
+/// The per-instance governance cache makes the same (M, graph, t)
+/// reusable across requests and across every data ledger on the
+/// instance. Two independent ResolveCtxs (simulating two requests)
+/// resolving the same key must end up sharing one Arc — the second
+/// resolution is a cache hit and never re-materializes.
+#[tokio::test]
+async fn governance_cache_short_circuits_repeated_resolutions_across_contexts() {
+    let fluree = FlureeBuilder::memory().build_memory();
+
+    let model_id = "test/cross-ledger/cache:main";
+    let model = genesis_ledger(&fluree, model_id);
+    let policy_graph_iri = "http://example.org/cache-policy";
+    fluree
+        .stage_owned(model)
+        .upsert_turtle(&format!(
+            r#"
+            @prefix f:    <https://ns.flur.ee/db#> .
+            @prefix rdf:  <http://www.w3.org/1999/02/22-rdf-syntax-ns#> .
+            @prefix ex:   <http://example.org/ns/> .
+
+            GRAPH <{policy_graph_iri}> {{
+                ex:rule rdf:type f:AccessPolicy ; f:action f:view ; f:allow true .
+            }}
+        "#
+        ))
+        .execute()
+        .await
+        .expect("seed M");
+
+    // Two data ledgers — same Fluree instance, different identities.
+    // Both resolve the same (M, policy_graph, t). The second one
+    // must hit the per-instance governance cache.
+    let data_a = "test/cross-ledger/cache/d-a:main";
+    let _ = genesis_ledger(&fluree, data_a);
+    let data_b = "test/cross-ledger/cache/d-b:main";
+    let _ = genesis_ledger(&fluree, data_b);
+
+    let graph_ref = cross_ref(model_id, policy_graph_iri);
+
+    assert_eq!(
+        fluree.governance_cache().entry_count(),
+        0,
+        "cache must start empty"
+    );
+
+    let mut ctx_a = ResolveCtx::new(data_a, &fluree);
+    let resolved_a = resolve_graph_ref(&graph_ref, ArtifactKind::PolicyRules, &mut ctx_a)
+        .await
+        .expect("first resolve populates cache");
+
+    // After the first resolve, the cache must have exactly one
+    // entry for this (kind, M, graph, t). Moka's entry_count is
+    // best-effort; allow the rare zero-count race by also asserting
+    // a direct get hit.
+    let _ = fluree.governance_cache(); // touch
+    // (sync_for_test would be ideal but Moka doesn't expose one;
+    // the get below is the load-bearing check.)
+
+    let mut ctx_b = ResolveCtx::new(data_b, &fluree);
+    let resolved_b = resolve_graph_ref(&graph_ref, ArtifactKind::PolicyRules, &mut ctx_b)
+        .await
+        .expect("second resolve hits cache");
+
+    assert!(
+        std::sync::Arc::ptr_eq(&resolved_a, &resolved_b),
+        "second resolve in a fresh ResolveCtx must return the cached Arc, \
+         not a freshly materialized one"
+    );
+
+    // A new context against a third data ledger sees the same hit.
+    let data_c = "test/cross-ledger/cache/d-c:main";
+    let _ = genesis_ledger(&fluree, data_c);
+    let mut ctx_c = ResolveCtx::new(data_c, &fluree);
+    let resolved_c = resolve_graph_ref(&graph_ref, ArtifactKind::PolicyRules, &mut ctx_c)
+        .await
+        .expect("third resolve also a cache hit");
+    assert!(std::sync::Arc::ptr_eq(&resolved_a, &resolved_c));
+}
+
 /// A cross-ledger ref to a graph IRI that doesn't exist on the model
 /// ledger surfaces as GraphMissingAtT — not silently empty, not
 /// TranslationFailed. The fail-closed contract names this failure

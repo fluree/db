@@ -8,11 +8,13 @@
 //! Contract and semantics: see
 //! `docs/design/cross-ledger-model-enforcement.md`.
 
+mod cache;
 pub mod error;
 mod policy_materializer;
 mod resolver;
 mod types;
 
+pub use cache::GovernanceCache;
 pub use error::CrossLedgerError;
 pub use resolver::resolve_graph_ref;
 pub use types::{ArtifactKind, GovernanceArtifact, ResolveCtx, ResolvedGraph};

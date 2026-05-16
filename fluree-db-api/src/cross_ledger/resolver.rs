@@ -36,13 +36,19 @@ use std::sync::Arc;
 ///    `f:atT` is rejected at step (1) until Phase 3.
 /// 5. Form the resolution key
 ///    `(ArtifactKind, canonical_model_ledger_id, graph_iri,
-///    resolved_t)` and check `ctx.memo`. On hit, return immediately
-///    — cross-subsystem de-dup runs before cycle detection.
+///    resolved_t)` and check, in order: (a) `ctx.memo` (per-request
+///    de-dup); (b) `fluree.governance_cache()` (per-instance, shared
+///    across requests and across every data ledger that references
+///    the same (M, graph, t)). On hit at either layer, return —
+///    cross-subsystem de-dup runs before cycle detection, and a
+///    governance-cache hit is also folded into `ctx.memo` so later
+///    calls in the same request short-circuit at (a).
 /// 6. Check `ctx.active` for cycles. On miss, push and call into
 ///    the per-kind materializer.
-/// 7. On materializer success, pop `active`, insert into `memo`, and
-///    return. On failure, pop `active` so a deeper failure doesn't
-///    poison subsequent calls.
+/// 7. On materializer success, pop `active`, insert into both
+///    `ctx.memo` and `fluree.governance_cache()`, and return. On
+///    failure, pop `active` so a deeper failure doesn't poison
+///    subsequent calls.
 pub async fn resolve_graph_ref(
     graph_ref: &GraphSourceRef,
     kind: ArtifactKind,
@@ -148,12 +154,22 @@ pub async fn resolve_graph_ref(
         resolved_t,
     );
 
-    // (5) Memo hit — short-circuit cross-subsystem de-dup before
+    // (5a) Memo hit — short-circuit cross-subsystem de-dup before
     // entering `active`, so two subsystems referencing the same
     // (kind, M, graph, t) never look like a cycle to each other.
     // ArtifactKind is part of the key: a memoized PolicyRules entry
     // never short-circuits a Shapes lookup for the same graph.
     if let Some(hit) = memo_hit(&ctx.memo, &key) {
+        return Ok(hit);
+    }
+
+    // (5b) Per-instance governance cache hit — shareable across
+    // requests and across every data ledger on this instance that
+    // references the same (M, graph, t). Writeback below on miss.
+    // The per-request memo is populated alongside so subsequent
+    // resolutions in this same request short-circuit at (5a).
+    if let Some(hit) = ctx.fluree.governance_cache().get(&key) {
+        ctx.memo.insert(key.clone(), hit.clone());
         return Ok(hit);
     }
 
@@ -180,7 +196,12 @@ pub async fn resolve_graph_ref(
 
     let resolved = materialize_result?;
     let arc = Arc::new(resolved);
-    ctx.memo.insert(key, arc.clone());
+    // Write back to both the per-request memo and the per-instance
+    // cache. Subsequent calls in this same request hit the memo;
+    // subsequent calls in *other* requests on this instance hit
+    // the governance cache.
+    ctx.memo.insert(key.clone(), arc.clone());
+    ctx.fluree.governance_cache().insert(key, arc.clone());
     Ok(arc)
 }
 
