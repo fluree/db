@@ -141,9 +141,32 @@ impl Fluree {
         };
         let resolved = config_resolver::resolve_effective_config(&config, graph_iri);
 
+        // Pre-resolve `f:rulesSource` to a local graph id so the
+        // datalog rule extractor scans the configured graph rather
+        // than the query graph. We do this here (not in
+        // apply_config_datalog) because the lookup is identity-
+        // independent — override gates affect *whether* datalog
+        // runs and which override identity may flip enabled/etc.,
+        // not where rules live.
+        //
+        // Cross-ledger references (`f:ledger` set) are skipped —
+        // they dispatch through the cross-ledger resolver at query
+        // time, not through a local graph id.
+        let rules_source_g_id = resolved
+            .datalog
+            .as_ref()
+            .and_then(|d| d.rules_source.as_ref())
+            .filter(|src| src.ledger.is_none())
+            .and_then(|src| match src.graph_selector.as_deref() {
+                Some(iri) if iri == fluree_vocab::config_iris::DEFAULT_GRAPH => Some(0u16),
+                Some(iri) => view.snapshot.graph_registry.graph_id_for_iri(iri),
+                None => Some(0u16),
+            });
+
         Ok(view
             .with_ledger_config(config)
-            .with_resolved_config(resolved))
+            .with_resolved_config(resolved)
+            .with_rules_source_g_id(rules_source_g_id))
     }
 
     /// Load the current view (immutable snapshot) from a ledger.
@@ -824,13 +847,16 @@ impl Fluree {
             None => return view,
         };
 
-        match config_resolver::merge_datalog_opts(resolved, server_identity) {
-            Some(config) => view
-                .with_datalog_enabled(config.enabled)
-                .with_query_time_rules_allowed(config.allow_query_time_rules)
-                .with_datalog_override_allowed(config.override_allowed),
-            None => view,
-        }
+        let Some(config) = config_resolver::merge_datalog_opts(resolved, server_identity) else {
+            return view;
+        };
+
+        // `rules_source_g_id` is pre-resolved by
+        // `resolve_and_attach_config` (identity-independent), so
+        // we don't reapply it here.
+        view.with_datalog_enabled(config.enabled)
+            .with_query_time_rules_allowed(config.allow_query_time_rules)
+            .with_datalog_override_allowed(config.override_allowed)
     }
 }
 

@@ -360,6 +360,20 @@ pub struct ReasoningConfig {
     ///
     /// When `None`, reasoning reads schema from `db.g_id` directly.
     pub schema_bundle: Option<Arc<SchemaBundleFlakes>>,
+    /// Pre-resolved local graph id from `f:rulesSource`.
+    ///
+    /// Populated upstream (in `fluree-db-api`) when the ledger
+    /// config points the datalog rule extractor at a non-default
+    /// graph. When `Some(g)`, `compute_derived_facts` extracts
+    /// `f:rule` flakes from graph `g`; the rules themselves still
+    /// execute against the query graph (`db.g_id`). When `None`,
+    /// extraction defaults to `db.g_id` — the legacy behaviour.
+    ///
+    /// Cross-ledger rules (where `f:rulesSource` carries
+    /// `f:ledger`) surface as resolved JSON-LD rule definitions
+    /// in [`ReasoningModes::rules`] before query execution; this
+    /// field stays `None` in that case.
+    pub rules_source_g_id: Option<fluree_db_core::GraphId>,
 }
 
 impl ReasoningConfig {
@@ -391,6 +405,12 @@ impl ReasoningConfig {
     /// `fluree_db_api::ontology_imports::resolve_schema_bundle`.
     pub fn with_schema_bundle(mut self, bundle: Arc<SchemaBundleFlakes>) -> Self {
         self.schema_bundle = Some(bundle);
+        self
+    }
+
+    /// Attach a pre-resolved local rules-source graph id.
+    pub fn with_rules_source_g_id(mut self, g_id: Option<fluree_db_core::GraphId>) -> Self {
+        self.rules_source_g_id = g_id;
         self
     }
 

@@ -256,9 +256,15 @@ pub async fn prepare_execution_with_config(
             // axioms (e.g. `?p a owl:TransitiveProperty`) from the import
             // closure are visible when scanning g_id=0, and base-overlay
             // novelty remains visible for other graphs.
-            let derived_overlay =
-                compute_derived_facts(db.snapshot, db.g_id, effective_overlay, db.t, &reasoning)
-                    .await;
+            let derived_overlay = compute_derived_facts(
+                db.snapshot,
+                db.g_id,
+                effective_overlay,
+                db.t,
+                &reasoning,
+                query.reasoning.rules_source_g_id,
+            )
+            .await;
 
             // Step 4: Build ontology for OWL2-QL mode (if enabled)
             let reasoning_overlay_for_ontology: Option<ReasoningOverlay<'_>> = derived_overlay

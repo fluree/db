@@ -166,6 +166,13 @@ pub struct GraphDb {
     pub(crate) query_time_rules_allowed: bool,
     /// Whether the query can override datalog config settings. Default: `true`.
     pub(crate) datalog_override_allowed: bool,
+    /// Pre-resolved graph id from `f:rulesSource.graphSelector` on
+    /// the local ledger. When `Some(g)`, the datalog rule extractor
+    /// scans graph `g` for `f:rule` flakes instead of the default
+    /// graph. `None` keeps the legacy behaviour (rules read from
+    /// the same graph as the query, defaulting to `g_id=0`).
+    /// Cross-ledger rules surface separately on `rules_source_iri`.
+    pub(crate) rules_source_g_id: Option<fluree_db_core::GraphId>,
 
     // ========================================================================
     // Graph source context (optional — set when view is created from a graph source)
@@ -236,6 +243,7 @@ impl GraphDb {
             datalog_enabled: true,
             query_time_rules_allowed: true,
             datalog_override_allowed: true,
+            rules_source_g_id: None,
             graph_source_id: None,
         }
     }
@@ -557,6 +565,20 @@ impl GraphDb {
     /// Check if queries can override datalog config settings.
     pub fn datalog_override_allowed(&self) -> bool {
         self.datalog_override_allowed
+    }
+
+    /// Set the local graph id that the datalog rule extractor should
+    /// scan for `f:rule` flakes (resolved from `f:rulesSource`).
+    pub fn with_rules_source_g_id(mut self, g_id: Option<fluree_db_core::GraphId>) -> Self {
+        self.rules_source_g_id = g_id;
+        self
+    }
+
+    /// Get the local graph id that the datalog rule extractor should
+    /// scan. `None` keeps the legacy behaviour (rules read from the
+    /// query graph).
+    pub fn rules_source_g_id(&self) -> Option<fluree_db_core::GraphId> {
+        self.rules_source_g_id
     }
 }
 

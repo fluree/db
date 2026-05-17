@@ -508,6 +508,12 @@ impl Fluree {
             }
         }
 
+        // Carry the pre-resolved `f:rulesSource` graph id (if any)
+        // into the executable so `compute_derived_facts` extracts
+        // datalog rules from the configured graph instead of the
+        // query graph.
+        executable.reasoning.rules_source_g_id = db.rules_source_g_id();
+
         // Resolve `f:schemaSource` + `owl:imports` closure, if configured.
         self.attach_schema_bundle(db, &mut executable).await?;
 
