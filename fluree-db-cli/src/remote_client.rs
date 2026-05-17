@@ -1203,6 +1203,30 @@ impl RemoteLedgerClient {
         .await
     }
 
+    /// Drop a named graph from a branch on the remote server.
+    ///
+    /// Calls `POST {base_url}/drop-graph` with a JSON body. `ledger` is a
+    /// full ledger identifier (e.g. `"mydb:main"`); `graph` is the full
+    /// IRI of the named graph to drop.
+    pub async fn drop_named_graph(
+        &self,
+        ledger: &str,
+        graph: &str,
+    ) -> Result<serde_json::Value, RemoteLedgerError> {
+        let url = self.op_url_root("drop-graph");
+        let body = serde_json::json!({
+            "ledger": ledger,
+            "graph": graph,
+        });
+        self.send_json(
+            reqwest::Method::POST,
+            &url,
+            "application/json",
+            Some(RequestBody::Json(&body)),
+        )
+        .await
+    }
+
     /// Rebase a branch on the remote server.
     ///
     /// Calls `POST {base_url}/rebase` with a JSON body.

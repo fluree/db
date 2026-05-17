@@ -253,6 +253,19 @@ WHERE {
 }
 ```
 
+### Creation is implicit
+
+There is no "create graph" operation. The first transaction that targets a new graph IRI — via TriG, JSON-LD with `@graph`, or SPARQL `INSERT … GRAPH <iri> …` — registers it and assigns a stable `g_id` (3+ for user graphs). Subsequent inserts into the same IRI land in the same registered slot.
+
+### Listing and dropping graphs
+
+Two CLI commands cover the rest of the lifecycle:
+
+- **[`fluree graph list`](../cli/graph.md#fluree-graph-list)** — lists user graphs registered on a branch (with `--include-system` to also show the default and system graphs). Reads the `named-graphs` section of the standard `/info` response.
+- **[`fluree graph drop`](../cli/graph.md#fluree-graph-drop)** — transactionally retracts every triple currently asserted under a named graph. Produces one new commit at `t + 1` whose flakes are all retractions; history at older `t` values is preserved, and the graph IRI keeps its `g_id` so future inserts land in the same slot. Drops are per-branch.
+
+The default graph, `urn:fluree:{ledger_id}#txn-meta`, and `urn:fluree:{ledger_id}#config` cannot be dropped. The Rust API entry point is `Fluree::drop_named_graph(ledger_id, graph_iri)`; over HTTP it is `POST /v1/fluree/drop-graph` (admin-protected). See the [server-integration contract](../cli/server-integration.md#drop-named-graph-contract) for the wire details.
+
 ### Graph Metadata
 
 For transaction-scoped metadata, Fluree uses the **`txn-meta`** named graph (see above). Transaction metadata is stored as properties on commit subjects in `txn-meta`, and can be queried independently of user data.

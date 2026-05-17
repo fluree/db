@@ -133,6 +133,11 @@ pub async fn run(cli: Cli) -> error::CliResult<()> {
             commands::drop::run(&name, force, &fluree_dir).await
         }
 
+        Commands::Graph { action } => {
+            let fluree_dir = config::require_fluree_dir(config_path)?;
+            commands::graph::run(action, &fluree_dir, direct).await
+        }
+
         Commands::Insert {
             args,
             expr,

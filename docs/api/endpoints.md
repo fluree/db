@@ -1584,6 +1584,82 @@ curl -X POST http://localhost:8090/v1/fluree/drop-branch \
   -d '{"ledger": "mydb", "branch": "dev"}'
 ```
 
+### POST /drop-graph
+
+Drop a single named graph from one branch of a ledger by transactionally
+retracting every triple currently asserted under that graph IRI. The drop
+runs as a normal commit at `t = current_t + 1` — history at earlier `t`
+values is preserved. Admin-protected.
+
+**URL:**
+```
+POST /drop-graph
+```
+
+**Request body:**
+
+```json
+{
+  "ledger": "mydb:main",
+  "graph": "urn:example:org/payroll"
+}
+```
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| `ledger` | string | Yes | Full ledger identifier. A bare ledger name (`"mydb"`) is normalized to `"mydb:main"`. |
+| `graph` | string | Yes | Full **absolute** IRI of the named graph to drop. Must have a `<scheme>:<rest>` head (relative references like `payroll` are rejected) and contain no whitespace or RFC 3987-excluded characters. Leading/trailing whitespace is rejected, not trimmed. |
+
+**Response body (200 OK):**
+
+```json
+{
+  "ledger_id": "mydb:main",
+  "graph_iri": "urn:example:org/payroll",
+  "retracted": 42,
+  "committed": true,
+  "t": 18
+}
+```
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `ledger_id` | string | Normalized `ledger:branch` identifier the drop targeted |
+| `graph_iri` | string | Graph IRI that was dropped (echoed) |
+| `retracted` | integer | Number of flakes retracted by the drop commit; `0` for a no-op |
+| `committed` | boolean | `true` when a new commit was produced; `false` for a no-op drop on an empty graph |
+| `t` | integer | Current commit `t` for the branch after the drop |
+
+**Behavior:**
+
+- **Transactional and history-preserving.** A query `as-of` an earlier `t` still sees the graph populated.
+- **Per-branch.** Only affects the targeted branch — sibling branches that share the same graph IRI are not touched.
+- **Refuses system graphs.** The default graph, `urn:fluree:{ledger_id}#txn-meta`, and `urn:fluree:{ledger_id}#config` cannot be dropped (400 Bad Request).
+- **Refuses unknown graphs.** Returns 404 when `graph` is not registered in the ledger's graph registry — the call never auto-registers a new graph slot.
+- **Idempotent.** A second call on an already-empty graph returns `committed: false`, `retracted: 0` without producing a commit.
+
+**Status codes:**
+
+- `200 OK` - Drop succeeded (commit produced or no-op)
+- `400 Bad Request` - Malformed IRI, empty IRI, or system-graph IRI
+- `401`/`403` - Admin token required and absent/invalid
+- `404 Not Found` - Ledger or graph IRI not found
+- `500 Internal Server Error` - Server error
+
+**Examples:**
+
+```bash
+# Drop a named graph on the default branch
+curl -X POST http://localhost:8090/v1/fluree/drop-graph \
+  -H "Content-Type: application/json" \
+  -d '{"ledger": "mydb", "graph": "urn:example:org/payroll"}'
+
+# Drop on a non-default branch
+curl -X POST http://localhost:8090/v1/fluree/drop-graph \
+  -H "Content-Type: application/json" \
+  -d '{"ledger": "mydb:feature-x", "graph": "http://example.org/graphs/scratch"}'
+```
+
 ### POST /rebase
 
 Rebase a branch onto its source branch's current HEAD. Admin-protected.

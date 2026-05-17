@@ -10,6 +10,7 @@
   - [info](cli/info.md)
   - [branch](cli/branch.md)
   - [drop](cli/drop.md)
+  - [graph](cli/graph.md)
   - [insert](cli/insert.md)
   - [upsert](cli/upsert.md)
   - [update](cli/update.md)

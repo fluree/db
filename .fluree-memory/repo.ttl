@@ -1168,6 +1168,26 @@ mem:fact-01km06dhjzpgyvbs1yc5h0h28e a mem:Fact ;
     mem:branch "feature/default-context" ;
     mem:createdAt "2026-03-18T10:03:48.703812+00:00"^^xsd:dateTime .
 
+mem:decision-01krvht9hdmca3m5j1rz761g46 a mem:Decision ;
+    mem:content "`Fluree::drop_named_graph(ledger_id, graph_iri)` is a **transactional, history-preserving, per-branch** retract: it stages a SPARQL `DELETE { GRAPH <iri> { ?s ?p ?o } } WHERE { GRAPH <iri> { ?s ?p ?o } }` through `stage(&handle).txn(...)` and produces one normal commit. System graphs (default, txn-meta g_id=1, config g_id=2) are rejected with 400; unknown graph IRIs return 404 *before* staging so the registry isn't silently extended. `graph_iri` must be an absolute IRI per `validate_absolute_iri` (no whitespace, no C0/DEL controls, no RFC 3987-excluded chars, `<scheme>:<rest>` head). Idempotent: re-dropping an empty graph reports `committed=false`, `retracted=0` without creating a commit. Wire endpoint: `POST /drop-graph` admin-protected; CLI: `fluree graph drop <iri> --ledger <id> [--remote]`; companion read-only `fluree graph list` reads `named-graphs` from `/info`." ;
+    mem:tag "admin" ;
+    mem:tag "api-design" ;
+    mem:tag "drop" ;
+    mem:tag "named-graph" ;
+    mem:tag "transactional" ;
+    mem:scope mem:repo ;
+    mem:artifactRef "docs/api/endpoints.md" ;
+    mem:artifactRef "docs/cli/graph.md" ;
+    mem:artifactRef "docs/cli/server-integration.md" ;
+    mem:artifactRef "fluree-db-api/src/admin.rs" ;
+    mem:artifactRef "fluree-db-api/tests/it_drop_named_graph.rs" ;
+    mem:artifactRef "fluree-db-cli/src/commands/graph.rs" ;
+    mem:artifactRef "fluree-db-server/src/routes/ledger.rs" ;
+    mem:branch "feature/drop-branch" ;
+    mem:createdAt "2026-05-17T18:05:17.741794+00:00"^^xsd:dateTime ;
+    mem:rationale "Named-graph data is interleaved in the same index/leaves/dicts as the rest of the ledger — there is no storage prefix to wipe the way drop_branch/drop_ledger do. A transactional retract is the only approach that composes cleanly with branches, rebases, replication, and Fluree's immutable history model. Alternative: structural drop + reindex (rejected as a needless rewrite of history)." ;
+    mem:alternatives "structural drop with graph_registry mark + reindex skip; soft/hard mode like drop_ledger" .
+
 mem:fact-01kjg3zmevnz6mdn53wkqn08p0 a mem:Fact ;
     mem:content "Fluree uses CIDv1 for all content-addressed blobs. Implementation in fluree-db-core/src/content_id.rs wrapping `cid` crate.\n\nFormat: CIDv1 = version(1) + multicodec + multihash(SHA2-256, 32 bytes). Multicodec values in private-use range 0x300000+: Commit(0x300001), Txn(0x300002), IndexRoot(0x300003), IndexBranch/Leaf, DictBlob, Garbage, LedgerConfig, StatsSketch, GraphSourceSnapshot, SpatialIndex.\n\nKey APIs: ContentId::new(kind, bytes) hashes with SHA-256; verify(bytes) re-hashes and compares (NOT valid for commit-v2 which excludes trailing hash+sig); digest_hex() returns 64-char hex; Display uses base32-lower multibase." ;
     mem:tag "CIDv1" ;
