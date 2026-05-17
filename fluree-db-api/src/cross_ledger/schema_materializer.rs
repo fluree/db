@@ -34,7 +34,7 @@ pub(super) async fn materialize_schema(
 
     // 1. Open M at resolved_t.
     let m_db = fluree
-        .db_at_t(canonical_model_ledger_id, resolved_t)
+        .load_graph_db_at_t(canonical_model_ledger_id, resolved_t)
         .await
         .map_err(|e| CrossLedgerError::TranslationFailed {
             ledger_id: canonical_model_ledger_id.to_string(),
