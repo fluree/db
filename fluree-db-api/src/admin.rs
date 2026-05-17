@@ -1182,24 +1182,36 @@ impl crate::Fluree {
             "Reindex completed"
         );
 
-        // 6. Spawn async garbage collection (non-blocking)
-        let gc_store = self.content_store(&ledger_id);
-        let gc_root_id = index_result.root_id.clone();
-        let gc_config = CleanGarbageConfig {
-            max_old_indexes: Some(gc_max_old_indexes),
-            min_time_garbage_mins: Some(gc_min_time_mins),
-        };
-        tokio::spawn(async move {
-            if let Err(e) = clean_garbage(gc_store.as_ref(), &gc_root_id, gc_config).await {
-                tracing::warn!(
-                    error = %e,
-                    root_id = %gc_root_id,
-                    "Background garbage collection failed (non-fatal)"
-                );
-            } else {
-                tracing::debug!(root_id = %gc_root_id, "Background garbage collection completed");
-            }
-        });
+        // 6. Spawn async garbage collection (non-blocking) only after enough
+        // published index versions can exist to exceed retention.
+        let gc_keep_count = 1_i64 + i64::from(gc_max_old_indexes);
+        if index_result.index_t <= gc_keep_count {
+            tracing::debug!(
+                root_id = %index_result.root_id,
+                index_t = index_result.index_t,
+                gc_keep_count,
+                "Skipping background garbage collection; index chain cannot exceed retention yet"
+            );
+        } else {
+            let gc_store = self.content_store(&ledger_id);
+            let gc_root_id = index_result.root_id.clone();
+            let gc_config = CleanGarbageConfig {
+                max_old_indexes: Some(gc_max_old_indexes),
+                min_time_garbage_mins: Some(gc_min_time_mins),
+                ..Default::default()
+            };
+            tokio::spawn(async move {
+                if let Err(e) = clean_garbage(gc_store.as_ref(), &gc_root_id, gc_config).await {
+                    tracing::warn!(
+                        error = %e,
+                        root_id = %gc_root_id,
+                        "Background garbage collection failed (non-fatal)"
+                    );
+                } else {
+                    tracing::debug!(root_id = %gc_root_id, "Background garbage collection completed");
+                }
+            });
+        }
 
         Ok(ReindexResult {
             ledger_id,

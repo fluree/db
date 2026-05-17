@@ -143,7 +143,7 @@ impl DiskArtifactCache {
                     0
                 }
                 Ok(bytes) => {
-                    tracing::debug!(
+                    tracing::trace!(
                         cache_dir = %root.display(),
                         budget_bytes = bytes,
                         "using FLUREE_DISK_CACHE_BUDGET_BYTES override"

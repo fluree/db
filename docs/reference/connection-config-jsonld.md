@@ -148,6 +148,8 @@ Supported fields (parsed and **applied** by Rust):
   - Rust applies a single **operation timeout** of `max(read, write, list)`
 - `s3MaxRetries`, `s3RetryBaseDelayMs`, `s3RetryMaxDelayMs`
   - Rust maps `s3MaxRetries` to AWS SDK `max_attempts = max_retries + 1`
+- `s3MaxConcurrentRequests`
+  - Optional per-storage-instance cap on concurrent S3 SDK operations
 
 #### Standard S3 (AWS)
 
@@ -195,6 +197,10 @@ Guidance:
 - **Standard S3 in AWS**: omit `s3Endpoint` (let the SDK pick defaults)
 - **Express One Zone**: omit `s3Endpoint`
 - **LocalStack/MinIO/custom**: set `s3Endpoint`
+
+For serverless index-storage tradeoffs, including Standard S3 vs S3 Express One
+Zone benchmark ranges, see
+[Serverless Storage Choices](../operations/serverless-storage.md).
 
 #### addressIdentifier
 

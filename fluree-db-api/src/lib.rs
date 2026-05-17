@@ -1059,6 +1059,7 @@ async fn build_s3_storage_from_config(
         max_retries: s3_config.max_retries.map(|n| n as u32),
         retry_base_delay_ms: s3_config.retry_base_delay_ms,
         retry_max_delay_ms: s3_config.retry_max_delay_ms,
+        max_concurrent_requests: s3_config.max_concurrent_requests,
     };
 
     let storage = S3Storage::new(sdk_config, raw_config)
@@ -1371,6 +1372,7 @@ impl FlureeBuilder {
             max_retries: None,
             retry_base_delay_ms: None,
             retry_max_delay_ms: None,
+            max_concurrent_requests: None,
             address_identifier: None,
         };
 
@@ -1467,6 +1469,15 @@ impl FlureeBuilder {
     pub fn s3_retry_max_delay_ms(mut self, ms: u64) -> Self {
         if let StorageType::S3(s3) = &mut self.config.index_storage.storage_type {
             s3.retry_max_delay_ms = Some(ms);
+        }
+        self
+    }
+
+    /// Set the maximum concurrent S3 SDK requests per storage instance.
+    #[cfg(feature = "aws")]
+    pub fn s3_max_concurrent_requests(mut self, n: usize) -> Self {
+        if let StorageType::S3(s3) = &mut self.config.index_storage.storage_type {
+            s3.max_concurrent_requests = Some(n.max(1));
         }
         self
     }
@@ -2055,6 +2066,7 @@ impl FlureeBuilder {
                 max_retries: s3_cfg.max_retries.map(|n| n as u32),
                 retry_base_delay_ms: s3_cfg.retry_base_delay_ms,
                 retry_max_delay_ms: s3_cfg.retry_max_delay_ms,
+                max_concurrent_requests: s3_cfg.max_concurrent_requests,
             },
         )
         .await
@@ -2131,6 +2143,7 @@ impl FlureeBuilder {
                 max_retries: s3_cfg.max_retries.map(|n| n as u32),
                 retry_base_delay_ms: s3_cfg.retry_base_delay_ms,
                 retry_max_delay_ms: s3_cfg.retry_max_delay_ms,
+                max_concurrent_requests: s3_cfg.max_concurrent_requests,
             },
         )
         .await

@@ -88,6 +88,12 @@ Distributed storage using S3 and DynamoDB:
 - Usage costs
 - More complex setup
 
+For cloud and serverless deployments, commit and index storage can be split.
+Prefer Standard S3 for commits because commits are the durable source of truth.
+Indexes are reproducible from commits, so they can use either Standard S3 or S3
+Express One Zone depending on latency and cost requirements. See
+[Serverless Storage Choices](serverless-storage.md) for benchmark-backed guidance.
+
 ### IPFS Storage
 
 Decentralized content-addressed storage via a local Kubo node:

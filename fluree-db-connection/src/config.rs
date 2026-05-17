@@ -57,6 +57,7 @@ pub struct S3StorageConfig {
     pub max_retries: Option<u64>,
     pub retry_base_delay_ms: Option<u64>,
     pub retry_max_delay_ms: Option<u64>,
+    pub max_concurrent_requests: Option<usize>,
     /// Optional address identifier
     pub address_identifier: Option<Arc<str>>,
 }
@@ -399,6 +400,12 @@ fn parse_storage_node(graph: &ConfigGraph, node: &JsonValue) -> Result<StorageCo
             max_retries: resolve_u64(graph, node, vocab::FIELD_S3_MAX_RETRIES),
             retry_base_delay_ms: resolve_u64(graph, node, vocab::FIELD_S3_RETRY_BASE_DELAY_MS),
             retry_max_delay_ms: resolve_u64(graph, node, vocab::FIELD_S3_RETRY_MAX_DELAY_MS),
+            max_concurrent_requests: resolve_u64(
+                graph,
+                node,
+                vocab::FIELD_S3_MAX_CONCURRENT_REQUESTS,
+            )
+            .map(|n| n as usize),
             address_identifier: address_identifier.clone(),
         };
 

@@ -202,7 +202,7 @@ Connection node:
 
 Storage node:
 - File: `filePath`, `AES256Key`
-- S3: `s3Bucket`, `s3Prefix`, `s3Endpoint`, `s3ReadTimeoutMs`, `s3WriteTimeoutMs`, `s3ListTimeoutMs`, `s3MaxRetries`, `s3RetryBaseDelayMs`, `s3RetryMaxDelayMs`
+- S3: `s3Bucket`, `s3Prefix`, `s3Endpoint`, `s3ReadTimeoutMs`, `s3WriteTimeoutMs`, `s3ListTimeoutMs`, `s3MaxRetries`, `s3RetryBaseDelayMs`, `s3RetryMaxDelayMs`, `s3MaxConcurrentRequests`
 
 Publisher node:
 - DynamoDB nameservice: `dynamodbTable`, `dynamodbRegion`, `dynamodbEndpoint`, `dynamodbTimeoutMs`
