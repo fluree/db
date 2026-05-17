@@ -35,7 +35,12 @@ pub enum ArtifactKind {
     /// from the model ledger's shapes graph. Carries literals as
     /// well as Refs.
     Shapes,
-    // DatalogRules   — reserved
+    /// `f:rulesSource` → datalog rule definitions projected from
+    /// the model ledger's rules graph. The wire form carries the
+    /// raw JSON-LD rule bodies (term-portable: each rule's IRIs
+    /// resolve at parse time against D's snapshot, matching how
+    /// query-time rules in `opts.rules` are handled).
+    Rules,
 }
 
 impl std::fmt::Display for ArtifactKind {
@@ -45,6 +50,7 @@ impl std::fmt::Display for ArtifactKind {
             ArtifactKind::Constraints => f.write_str("Constraints"),
             ArtifactKind::SchemaClosure => f.write_str("SchemaClosure"),
             ArtifactKind::Shapes => f.write_str("Shapes"),
+            ArtifactKind::Rules => f.write_str("Rules"),
         }
     }
 }
@@ -104,7 +110,14 @@ pub enum GovernanceArtifact {
     /// encodable. M-only IRIs that D has never seen are dropped
     /// silently — those shapes can't apply to data D doesn't have.
     Shapes(ShapesArtifactWire),
-    // DatalogRules(DatalogRuleSetWire) — reserved
+    /// Datalog rule definitions in JSON-LD form. Each entry is
+    /// the raw `f:rule` body the model ledger stored as
+    /// `FlakeValue::Json`. Rule parsing happens against D's
+    /// snapshot at query time via the existing
+    /// [`fluree_db_query::datalog_rules`] code path —
+    /// no term translation is needed because rules are inherently
+    /// IRI-keyed JSON-LD documents.
+    Rules(RulesArtifactWire),
 }
 
 /// Term-neutral wire form for a constraints artifact.
@@ -400,6 +413,55 @@ fn literal_to_flake_value(value: &str, datatype: &str) -> fluree_db_core::FlakeV
             .map(FlakeValue::Double)
             .unwrap_or_else(|_| FlakeValue::String(value.to_string())),
         _ => FlakeValue::String(value.to_string()),
+    }
+}
+
+/// Term-neutral wire form for a datalog rules artifact.
+///
+/// Rules are JSON-LD documents — IRI references inside `where` /
+/// `insert` patterns are resolved against the data ledger's
+/// snapshot at parse time by
+/// [`fluree_db_query::datalog_rules::parse_query_time_rule`], the
+/// same path query-time rules from `opts.rules` use. We therefore
+/// just carry the raw JSON bodies on the wire; no Sid mapping is
+/// performed up front.
+///
+/// The materializer scans M's rules graph for `f:rule` flakes
+/// whose object is `FlakeValue::Json` (the only form the rule
+/// extractor recognises) and emits one `String` per rule.
+#[derive(Debug, Clone)]
+pub struct RulesArtifactWire {
+    /// Provenance for diagnostics and cache key derivation.
+    pub origin: WireOrigin,
+    /// Raw JSON-LD bodies of each `f:rule` definition discovered
+    /// on M's rules graph. Order preserves the materializer's
+    /// scan order; deduplication is the consumer's concern.
+    pub rules: Vec<String>,
+}
+
+impl RulesArtifactWire {
+    /// Decode each rule body into a `serde_json::Value` ready for
+    /// `execute_datalog_rules_with_query_rules`'s
+    /// `query_time_rules` slot. Malformed JSON entries are
+    /// skipped with a warning — a single bad rule should not
+    /// poison the entire ledger's reasoning pass.
+    pub fn parsed_rules(&self) -> Vec<serde_json::Value> {
+        let mut out = Vec::with_capacity(self.rules.len());
+        for (idx, raw) in self.rules.iter().enumerate() {
+            match serde_json::from_str(raw) {
+                Ok(v) => out.push(v),
+                Err(e) => {
+                    tracing::warn!(
+                        rule_index = idx,
+                        error = %e,
+                        ledger = %self.origin.model_ledger_id,
+                        graph = %self.origin.graph_iri,
+                        "skipping malformed cross-ledger rule"
+                    );
+                }
+            }
+        }
+        out
     }
 }
 

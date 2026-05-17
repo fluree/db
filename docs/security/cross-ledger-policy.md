@@ -21,11 +21,12 @@ Three subsystems are wired today:
   `owl:imports` recursion across multiple model ledgers is
   reserved.
 
-The remaining subsystems (`f:shapesSource`, `f:rulesSource`)
-share the resolver's contract but their materializers are not
-yet implemented; see the design doc's
-[Scope](../design/cross-ledger-model-enforcement.md#scope)
-section.
+SHACL shapes (`f:shapesSource`) and datalog rules
+(`f:rulesSource`) now resolve through the same
+cross-ledger contract — shapes compile against the data ledger's
+staged namespace at validation time, rules feed the data ledger's
+existing query-time rule evaluator. See the matrix below for the
+full set of supported subsystems.
 
 This page covers how to configure cross-ledger policy. For the
 underlying design (resolver contract, term-space translation,
@@ -335,7 +336,6 @@ closed when configured:
 | `f:rollbackGuard` (freshness constraints)  | Request fails with `UnsupportedFeature`. |
 | `opts.identity` + cross-ledger `f:policySource` | Request fails with a config error. Identity-mode loads policies via the identity's `f:policyClass` triples, which would have to resolve in D (the identity isn't an M concept); combining the two modes ambiguously is rejected rather than silently choosing one. Use `opts.policy_class` with cross-ledger configs. |
 | `f:policySource` with `f:graphSelector` naming M's `#config` or `#txn-meta` | Request fails with `ReservedGraphSelected` before any storage read on M. |
-| `f:ledger` on `f:shapesSource`, `f:rulesSource` | Request fails — cross-ledger support is currently implemented for `f:policySource`, `f:constraintsSource`, and `f:schemaSource` only. |
 | Transitive `owl:imports` across model ledgers (`f:schemaSource` recursion) | Not yet honored. Imports inside M's schema graph are projected but the resolver doesn't follow them across ledger boundaries. |
 
 The other reserved fields and source predicates may land in

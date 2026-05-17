@@ -274,6 +274,21 @@ async fn materialize(
                 artifact: GovernanceArtifact::Shapes(wire),
             })
         }
+        ArtifactKind::Rules => {
+            let wire = super::rules_materializer::materialize_rules(
+                canonical_ledger_id,
+                graph_iri,
+                resolved_t,
+                ctx.fluree,
+            )
+            .await?;
+            Ok(ResolvedGraph {
+                model_ledger_id: canonical_ledger_id.to_string(),
+                graph_iri: graph_iri.to_string(),
+                resolved_t,
+                artifact: GovernanceArtifact::Rules(wire),
+            })
+        }
     }
 }
 

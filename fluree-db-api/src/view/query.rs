@@ -514,10 +514,76 @@ impl Fluree {
         // query graph.
         executable.reasoning.rules_source_g_id = db.rules_source_g_id();
 
+        // Cross-ledger `f:rulesSource`: when M is referenced via
+        // `f:ledger`, resolve M's rules graph through the
+        // cross-ledger resolver and merge the JSON rule bodies into
+        // `executable.reasoning.rules` so they pass through the
+        // existing query-time rule code path. Same-ledger references
+        // are handled above via `rules_source_g_id`.
+        self.attach_cross_ledger_rules(db, &mut executable).await?;
+
         // Resolve `f:schemaSource` + `owl:imports` closure, if configured.
         self.attach_schema_bundle(db, &mut executable).await?;
 
         Ok(executable)
+    }
+
+    /// If the resolved datalog config carries a cross-ledger
+    /// `f:rulesSource`, dispatch through the cross-ledger resolver
+    /// and append the parsed JSON rules to
+    /// `executable.reasoning.rules`. Short-circuits when:
+    /// - the view has no resolved config,
+    /// - no `f:rulesSource` is configured,
+    /// - `f:rulesSource` is purely local (`f:ledger` unset — handled
+    ///   by the `rules_source_g_id` pre-resolution path),
+    /// - datalog reasoning is not enabled on the executable (no point
+    ///   pulling rules we won't run).
+    ///
+    /// Errors propagate as `ApiError::CrossLedger`; the server maps
+    /// those to HTTP 502.
+    async fn attach_cross_ledger_rules(
+        &self,
+        db: &GraphDb,
+        executable: &mut ExecutableQuery,
+    ) -> Result<()> {
+        if !executable.reasoning.modes.datalog {
+            return Ok(());
+        }
+        let Some(resolved) = db.resolved_config() else {
+            return Ok(());
+        };
+        let Some(datalog) = resolved.datalog.as_ref() else {
+            return Ok(());
+        };
+        let Some(source) = datalog.rules_source.as_ref() else {
+            return Ok(());
+        };
+        if source.ledger.is_none() {
+            return Ok(());
+        }
+
+        let db_ref = db.as_graph_db_ref();
+        let mut ctx =
+            crate::cross_ledger::ResolveCtx::new(db_ref.snapshot.ledger_id.as_str(), self);
+        let resolved = crate::cross_ledger::resolve_graph_ref(
+            source,
+            crate::cross_ledger::ArtifactKind::Rules,
+            &mut ctx,
+        )
+        .await?;
+        let crate::cross_ledger::GovernanceArtifact::Rules(wire) = &resolved.artifact else {
+            return Err(crate::error::ApiError::CrossLedger(
+                crate::cross_ledger::CrossLedgerError::TranslationFailed {
+                    ledger_id: resolved.model_ledger_id.clone(),
+                    graph_iri: resolved.graph_iri.clone(),
+                    detail: "resolver returned a non-Rules artifact for a Rules request; \
+                             resolver dispatch bug"
+                        .into(),
+                },
+            ));
+        };
+        executable.reasoning.modes.rules.extend(wire.parsed_rules());
+        Ok(())
     }
 
     /// Resolve the schema bundle from the ledger's reasoning config and attach

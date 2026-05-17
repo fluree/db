@@ -13,6 +13,7 @@ mod constraints_materializer;
 pub mod error;
 mod policy_materializer;
 mod resolver;
+mod rules_materializer;
 mod schema_materializer;
 mod shapes_materializer;
 mod types;
@@ -22,5 +23,5 @@ pub use error::CrossLedgerError;
 pub use resolver::resolve_graph_ref;
 pub use types::{
     ArtifactKind, ConstraintsArtifactWire, GovernanceArtifact, ResolveCtx, ResolvedGraph,
-    SchemaArtifactWire, ShapesArtifactWire, WireObject, WireOrigin, WireTriple,
+    RulesArtifactWire, SchemaArtifactWire, ShapesArtifactWire, WireObject, WireOrigin, WireTriple,
 };
