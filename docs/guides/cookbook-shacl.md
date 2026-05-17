@@ -339,6 +339,7 @@ Semantics:
 - `f:shapesSource` is **authoritative, not additive**: when set, shapes come exclusively from the configured graph. Shapes in the default graph are ignored.
 - `f:shapesSource` is **non-overridable** — it can only be set in the config graph, not via transaction/query-time options.
 - Use `f:graphSelector f:defaultGraph` to explicitly point at the default graph (same as omitting `f:shapesSource`).
+- `f:shapesSource` also supports **cross-ledger references** — set `f:ledger` on the inner `f:graphSource` to compile shapes from a different ledger at validation time. See [Cross-ledger governance — Cross-ledger SHACL shapes](../security/cross-ledger-policy.md#cross-ledger-shacl-shapes) for the end-to-end pattern.
 
 ## Inline shapes per transaction
 

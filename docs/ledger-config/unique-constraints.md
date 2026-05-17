@@ -77,6 +77,15 @@ f:transactDefaults [
 ] .
 ```
 
+### Cross-ledger constraint source
+
+`f:constraintsSource` also supports **cross-ledger references** —
+set `f:ledger` on the inner `f:graphSource` to load
+`f:enforceUnique` annotations from another ledger at transaction
+time. See
+[Cross-ledger governance — Cross-ledger constraints](../security/cross-ledger-policy.md#cross-ledger-uniqueness-constraints)
+for the end-to-end pattern and failure modes.
+
 ## What gets enforced
 
 Once enabled, any transaction that would result in **two or more distinct subjects** holding the same value for a unique property **within the same graph** is rejected.

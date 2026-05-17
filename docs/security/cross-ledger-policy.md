@@ -1,13 +1,14 @@
-# Cross-ledger policy, constraints, and schema
+# Cross-ledger governance
 
 A single **model ledger** can hold governance artifacts —
-policy rules, uniqueness constraints, and ontology/schema
-axioms — that govern many **data ledgers** that reference it.
-Update the model once and every governed data ledger sees the
-new rules / constraints / schema on its next request, with no
-per-dataset duplication.
+policy rules, uniqueness constraints, ontology/schema axioms,
+SHACL shapes, and datalog rules — that govern many **data
+ledgers** that reference it. Update the model once and every
+governed data ledger sees the new artifacts on its next
+request, with no per-dataset duplication.
 
-Three subsystems are wired today:
+All five `f:GraphRef`-shaped governance predicates support
+cross-ledger references today:
 
 - **Cross-ledger policy** (`f:policySource` with `f:ledger`) —
   M's policy rule set is applied to queries against D.
@@ -20,15 +21,15 @@ Three subsystems are wired today:
   D's reasoner. Single-graph only today; transitive
   `owl:imports` recursion across multiple model ledgers is
   reserved.
+- **Cross-ledger SHACL shapes** (`f:shapesSource` with
+  `f:ledger`) — M's shape definitions are compiled against D's
+  staged namespace at validation time and rejected/accepted
+  transactions on D accordingly.
+- **Cross-ledger datalog rules** (`f:rulesSource` with
+  `f:ledger`) — M's `f:rule` JSON bodies feed D's query-time
+  datalog evaluator alongside any rules D stores locally.
 
-SHACL shapes (`f:shapesSource`) and datalog rules
-(`f:rulesSource`) now resolve through the same
-cross-ledger contract — shapes compile against the data ledger's
-staged namespace at validation time, rules feed the data ledger's
-existing query-time rule evaluator. See the matrix below for the
-full set of supported subsystems.
-
-This page covers how to configure cross-ledger policy. For the
+This page covers configuration for all five. For the
 underlying design (resolver contract, term-space translation,
 cache shape, failure taxonomy) see
 [Cross-ledger model enforcement](../design/cross-ledger-model-enforcement.md).
@@ -323,6 +324,122 @@ A few specifics that differ from cross-ledger policy:
   transitively follow them across ledger boundaries yet. If M's
   schema declares `owl:imports <X>` where X is on a different
   model ledger M2, that import isn't resolved.
+
+## Cross-ledger SHACL shapes
+
+Configure `f:shapesSource` on D's `#config` under
+`f:shaclDefaults`. When the source carries `f:ledger`, the
+resolver pulls M's shapes graph at transaction time, compiles
+the SHACL whitelist against D's *staged* namespace registry
+(post-stage, not pre-stage — so IRIs the in-flight transaction
+introduced are encodable), and feeds the resulting overlay to
+the same SHACL engine the same-ledger path uses.
+
+```trig
+# On model ledger M — shapes in a named graph
+@prefix sh:   <http://www.w3.org/ns/shacl#> .
+@prefix ex:   <http://example.org/ns/> .
+
+GRAPH <http://example.org/governance/shapes> {
+    ex:PersonShape a sh:NodeShape ;
+        sh:targetClass ex:Person ;
+        sh:property [
+            sh:path     ex:name ;
+            sh:minCount 1 ;
+            sh:datatype xsd:string
+        ] .
+}
+```
+
+```trig
+# On data ledger D — #config
+@prefix f:   <https://ns.flur.ee/db#> .
+
+GRAPH <urn:fluree:data:main#config> {
+    <urn:cfg:main>      a f:LedgerConfig ;
+                        f:shaclDefaults <urn:cfg:shacl> .
+    <urn:cfg:shacl>     f:shaclEnabled  true ;
+                        f:shapesSource  <urn:cfg:sref> .
+    <urn:cfg:sref>      a f:GraphRef ;
+                        f:graphSource   <urn:cfg:ssrc> .
+    <urn:cfg:ssrc>      f:ledger        <model:main> ;
+                        f:graphSelector <http://example.org/governance/shapes> .
+}
+```
+
+Specifics:
+
+- Shapes are **compiled against D's staged namespace registry**,
+  not its pre-stage snapshot. The in-flight transaction's
+  ns_registry sees the IRIs the transaction is introducing
+  (e.g., `ex:Person` declared by the same tx the shape is
+  validating), which the pre-stage snapshot doesn't.
+- IRIs the staged registry has never seen are dropped silently —
+  M-only IRIs can't apply to data D doesn't have, and
+  allocating a fresh namespace code for an M-only term would
+  introduce namespace churn into D for no benefit.
+- Inline `opts.shapes` layers **additively** on top of the
+  cross-ledger source: both shape sets enforce. See
+  [Cookbook: SHACL validation — Inline shapes per
+  transaction](../guides/cookbook-shacl.md#inline-shapes-per-transaction).
+
+## Cross-ledger datalog rules
+
+Configure `f:rulesSource` on D's `#config` under
+`f:datalogDefaults`. When the source carries `f:ledger`, the
+resolver pulls the `f:rule` JSON bodies from M's rules graph at
+query time and merges them into D's query-time datalog evaluator
+alongside any rules D stores locally and any rules supplied via
+the top-level `rules` query field.
+
+```trig
+# On model ledger M — rules in a named graph
+@prefix f:   <https://ns.flur.ee/db#> .
+@prefix ex:  <http://example.org/> .
+
+GRAPH <http://example.org/governance/rules> {
+    ex:grandparentRule f:rule """
+        {
+          \"@context\": {\"ex\": \"http://example.org/\"},
+          \"where\":   {\"@id\": \"?p\", \"ex:parent\": {\"ex:parent\": \"?g\"}},
+          \"insert\":  {\"@id\": \"?p\", \"ex:grandparent\": {\"@id\": \"?g\"}}
+        }
+    """^^rdf:JSON .
+}
+```
+
+```trig
+# On data ledger D — #config
+@prefix f:   <https://ns.flur.ee/db#> .
+
+GRAPH <urn:fluree:data:main#config> {
+    <urn:cfg:main>     a f:LedgerConfig ;
+                       f:datalogDefaults <urn:cfg:datalog> .
+    <urn:cfg:datalog>  f:datalogEnabled  true ;
+                       f:rulesSource     <urn:cfg:rref> .
+    <urn:cfg:rref>     a f:GraphRef ;
+                       f:graphSource     <urn:cfg:rsrc> .
+    <urn:cfg:rsrc>     f:ledger          <model:main> ;
+                       f:graphSelector   <http://example.org/governance/rules> .
+}
+```
+
+Specifics:
+
+- Rules are **inherently term-portable** — the JSON body is a
+  JSON-LD document whose IRIs resolve at parse time against
+  D's snapshot, the same way query-time rules from the top-level
+  `rules` field are handled. No term translation step on the
+  wire.
+- Engaging the rules still requires datalog reasoning on the
+  query: either `"reasoning": "datalog"` on the JSON-LD query
+  or `PRAGMA reasoning: datalog` on SPARQL.
+- **Fail-closed on malformed rules.** A bad JSON body in M's
+  rules graph errors the query rather than silently dropping
+  the rule (this differs from query-time `rules` where a single
+  bad entry only logs a warning — cross-ledger rules are
+  admin-authored, so silently weakening the configured
+  reasoning model is the worst failure mode).
 
 ## Limitations
 

@@ -226,4 +226,4 @@ No special CLI commands are needed — config is data, written and queried like 
 
 ## Related
 
-- [Cross-ledger policy](../security/cross-ledger-policy.md) — Configure one model ledger to govern many data ledgers via `f:policySource` with `f:ledger`. Builds on the `f:GraphRef` shape documented in [setting groups](setting-groups.md#policy-defaults).
+- [Cross-ledger governance](../security/cross-ledger-policy.md) — Configure one model ledger to govern many data ledgers. Every `f:GraphRef`-shaped predicate (`f:policySource`, `f:constraintsSource`, `f:schemaSource`, `f:shapesSource`, `f:rulesSource`) accepts `f:ledger` to reference another ledger. Builds on the `f:GraphRef` shape documented in [setting groups](setting-groups.md#policy-defaults).
