@@ -104,6 +104,7 @@ mod tests {
             owl_datalog: false,
             explicit_none: false,
             rules: vec![],
+            ontology: None,
         };
 
         let (rewritten, diag) = rewrite_query_patterns(&patterns, None, &modes, None);
