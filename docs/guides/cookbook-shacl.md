@@ -381,9 +381,13 @@ ledger.
 
 Semantics:
 
-- **Additive, not replacing.** Inline shapes enforce *alongside*
-  any shapes from `f:shapesSource` (same-ledger or cross-ledger).
-  A subject must satisfy every shape from every source.
+- **Additive with the configured source.** Inline shapes enforce
+  *alongside* whatever `f:shapesSource` resolves to. A subject
+  must satisfy every shape from both sources. Note that
+  `f:shapesSource` is itself singular — its `f:graphSource` is
+  either local (no `f:ledger`) or cross-ledger (with `f:ledger`),
+  not both at the same time. Inline shapes don't change that;
+  they layer on top of whichever variant is configured.
 - **Transient.** The shapes never appear in the ledger's data and
   vanish after the transaction completes. The next transaction
   without `opts.shapes` runs without them.

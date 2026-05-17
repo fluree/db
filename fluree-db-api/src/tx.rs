@@ -492,9 +492,19 @@ pub(crate) async fn apply_shacl_policy_to_staged_view(
     //     `f:shapesSource` resolution is skipped — the wire is
     //     the authoritative shape source for this transaction.
     // Overlay holders keep `SchemaBundleOverlay` alive for the
-    // lifetime of `shape_dbs`'s borrow. Cross-ledger shapes and
-    // inline-opts shapes live in separate holders so both can
-    // contribute additively when both are configured.
+    // lifetime of `shape_dbs`'s borrow.
+    //
+    // Source layering for SHACL shapes:
+    // - `f:shapesSource` is structurally singular
+    //   (`Option<GraphSourceRef>` on the config schema), so at
+    //   most one of {same-ledger, cross-ledger} can be the
+    //   configured source. The branch below picks whichever one
+    //   is active; they don't merge — a config can't represent
+    //   both at once.
+    // - Inline `opts.shapes` is *separate* from `f:shapesSource`
+    //   and layers additively with whichever configured source
+    //   ran. That's why this holder is independent — both bundles
+    //   can be live in the same tx.
     #[allow(unused_assignments)]
     let mut cl_overlay_holder = None;
     #[allow(unused_assignments)]
