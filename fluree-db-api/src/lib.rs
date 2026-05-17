@@ -56,6 +56,7 @@ pub mod graph_source;
 pub mod graph_transact_builder;
 pub mod import;
 mod indexer_fulltext_provider;
+mod inline_ontology;
 #[cfg(feature = "shacl")]
 mod inline_shapes;
 mod ledger;

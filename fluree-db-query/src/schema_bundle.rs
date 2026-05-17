@@ -143,6 +143,15 @@ impl SchemaBundleFlakes {
         self.epoch
     }
 
+    /// Return the projected flakes as a flat `Vec`, suitable for
+    /// feeding back into [`Self::from_collected_schema_triples`]
+    /// (e.g., to merge with another bundle). Uses the SPOT
+    /// ordering as the canonical source — sort + dedupe + index
+    /// rebuild happens inside `from_collected_schema_triples`.
+    pub fn flakes_for_merge(&self) -> Vec<Flake> {
+        self.spot.iter().cloned().collect()
+    }
+
     fn flakes(&self, index: IndexType) -> &[Flake] {
         match index {
             IndexType::Spot => &self.spot,

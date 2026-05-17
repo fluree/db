@@ -57,6 +57,23 @@ pub struct ReasoningModes {
     /// These rules are merged with database rules when datalog reasoning is enabled.
     /// Each rule should have `where` and `insert` clauses.
     pub rules: Vec<serde_json::Value>,
+
+    /// Inline ontology / schema axioms supplied with the query
+    /// (JSON-LD format).
+    ///
+    /// Carries RDFS / OWL axioms (rdfs:subClassOf,
+    /// rdfs:subPropertyOf, owl:inverseOf, owl:equivalentClass,
+    /// rdf:type owl:Class / owl:TransitiveProperty, …) that the
+    /// reasoner should treat as if they came from the ledger's
+    /// `f:schemaSource` graph. Layered additively on top of any
+    /// configured schemaSource bundle; never persisted.
+    ///
+    /// The runner parses these against a temporary
+    /// `NamespaceRegistry` seeded from the live snapshot, projects
+    /// them through the same whitelist as the cross-ledger schema
+    /// materializer, and merges the resulting flakes into
+    /// `ReasoningConfig.schema_bundle` before reasoning runs.
+    pub ontology: Option<serde_json::Value>,
 }
 
 impl ReasoningModes {
@@ -222,6 +239,17 @@ impl ReasoningModes {
                 _ => {
                     return Err("rules must be an array".to_string());
                 }
+            }
+        }
+
+        // Parse query-time ontology (RDFS / OWL axioms supplied
+        // inline). Layered on top of f:schemaSource at reasoning
+        // prep; doesn't itself flip any mode flag — reasoning is
+        // a separate decision (auto-RDFS still applies if a
+        // schema hierarchy exists).
+        if let Some(ontology) = query.get("ontology") {
+            if !ontology.is_null() {
+                modes.ontology = Some(ontology.clone());
             }
         }
 

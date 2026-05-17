@@ -631,24 +631,62 @@ impl Fluree {
         if executable.reasoning.modes.is_disabled() {
             return Ok(());
         }
-        let Some(resolved) = db.resolved_config() else {
-            return Ok(());
-        };
-        let Some(reasoning) = resolved.reasoning.as_ref() else {
-            return Ok(());
-        };
-        if reasoning.schema_source.is_none() {
-            return Ok(());
-        }
 
         let db_ref = db.as_graph_db_ref();
 
-        // Cross-ledger detection: if `reasoning.schema_source` has
-        // `f:ledger` set, dispatch through the cross-ledger resolver
-        // and translate the resulting `SchemaArtifactWire` into a
-        // SchemaBundleFlakes against D's snapshot. Same-ledger
-        // configs go through the existing local path unchanged.
-        let schema_source = reasoning.schema_source.as_ref().expect("checked above");
+        // 1. Resolve the configured `f:schemaSource` (if any) into a
+        //    bundle. Either branch — cross-ledger or local — may yield
+        //    None when the field isn't configured.
+        let configured_bundle = self
+            .resolve_configured_schema_bundle(db, &db_ref, ctx)
+            .await?;
+
+        // 2. Parse inline `opts.ontology` axioms (if any) into a
+        //    bundle. Layered on top of `configured_bundle` so a
+        //    query can extend the ledger's reasoning with per-request
+        //    axioms without persisting them.
+        let inline_bundle = match executable.reasoning.modes.ontology.as_ref() {
+            Some(json) => {
+                crate::inline_ontology::parse_inline_ontology_to_bundle(json, db_ref.snapshot)?
+            }
+            None => None,
+        };
+
+        // 3. Merge.
+        executable.reasoning.schema_bundle = match (configured_bundle, inline_bundle) {
+            (None, None) => None,
+            (Some(b), None) | (None, Some(b)) => Some(b),
+            (Some(a), Some(b)) => Some(crate::inline_ontology::merge_bundles(a, b)?),
+        };
+        Ok(())
+    }
+
+    /// Resolve the configured `f:schemaSource` (same- or cross-ledger)
+    /// into a [`SchemaBundleFlakes`]. Returns `Ok(None)` when no
+    /// `f:schemaSource` is configured. Extracted so
+    /// [`attach_schema_bundle`] can layer the inline ontology on top
+    /// regardless of which configured branch ran (or whether either
+    /// ran).
+    async fn resolve_configured_schema_bundle(
+        &self,
+        db: &GraphDb,
+        db_ref: &fluree_db_core::GraphDbRef<'_>,
+        ctx: &mut crate::cross_ledger::ResolveCtx<'_>,
+    ) -> Result<Option<std::sync::Arc<fluree_db_query::schema_bundle::SchemaBundleFlakes>>> {
+        let Some(resolved) = db.resolved_config() else {
+            return Ok(None);
+        };
+        let Some(reasoning) = resolved.reasoning.as_ref() else {
+            return Ok(None);
+        };
+        let Some(schema_source) = reasoning.schema_source.as_ref() else {
+            return Ok(None);
+        };
+
+        // Cross-ledger detection: if the source carries `f:ledger`,
+        // dispatch through the cross-ledger resolver and translate
+        // the resulting `SchemaArtifactWire` into a SchemaBundleFlakes
+        // against D's snapshot.
         if schema_source.ledger.is_some() {
             let resolved = crate::cross_ledger::resolve_graph_ref(
                 schema_source,
@@ -668,9 +706,9 @@ impl Fluree {
                     },
                 ));
             };
-            let flakes = wire.translate_to_schema_bundle_flakes(db_ref.snapshot)?;
-            executable.reasoning.schema_bundle = Some(flakes);
-            return Ok(());
+            return Ok(Some(
+                wire.translate_to_schema_bundle_flakes(db_ref.snapshot)?,
+            ));
         }
 
         let Some(bundle) = crate::ontology_imports::resolve_schema_bundle(
@@ -681,7 +719,7 @@ impl Fluree {
         )
         .await?
         else {
-            return Ok(());
+            return Ok(None);
         };
 
         let flakes = crate::ontology_imports::get_or_build_schema_bundle_flakes(
@@ -690,9 +728,7 @@ impl Fluree {
             &bundle,
         )
         .await?;
-
-        executable.reasoning.schema_bundle = Some(flakes);
-        Ok(())
+        Ok(Some(flakes))
     }
 
     /// Execute against a GraphDb with policy awareness.
