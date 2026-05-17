@@ -1808,7 +1808,7 @@ impl crate::Fluree {
         };
 
         let stage_result = self
-            .stage_turtle_insert(ledger, turtle, Some(index_config))
+            .stage_turtle_insert(ledger, turtle, Some(index_config), None)
             .await?;
 
         let StageResult {
@@ -1862,6 +1862,7 @@ impl crate::Fluree {
         ledger: LedgerState,
         turtle: &str,
         index_config: Option<&IndexConfig>,
+        tracker: Option<&Tracker>,
     ) -> Result<StageResult> {
         use fluree_db_transact::{generate_txn_id, stage_flakes, FlakeSink};
 
@@ -1889,10 +1890,15 @@ impl crate::Fluree {
         tracing::info!(flake_count = flakes.len(), "turtle parsed to flakes");
 
         // Stage the flakes (backpressure + optional policy)
-        let options = match index_config {
+        let mut options = match index_config {
             Some(cfg) => StageOptions::new().with_index_config(cfg),
             None => StageOptions::default(),
         };
+        if let Some(tracker) = tracker {
+            if tracker.is_enabled() {
+                options = options.with_tracker(tracker);
+            }
+        }
         let view = stage_flakes(ledger, flakes, options).await?;
 
         // Apply SHACL policy to the staged view. Plain Turtle has no named-graph
@@ -1905,7 +1911,7 @@ impl crate::Fluree {
             StagedShaclContext {
                 graph_delta: None,
                 graph_sids: None,
-                tracker: None,
+                tracker,
             },
         )
         .await
