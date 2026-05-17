@@ -2267,26 +2267,13 @@ pub async fn incremental_index(
                 let total_class_entries = entries_by_key.len();
                 let mut visited_class_entries = 0usize;
                 let mut last_property_merge_log = Instant::now();
+                let mut next_merged_class_progress = 500usize;
                 for (&(g_id, class_sid64), entry) in &mut entries_by_key {
                     visited_class_entries += 1;
                     if let Some(props) = class_properties.get(&(g_id, class_sid64)) {
                         let class_merge_started = Instant::now();
                         let existing_property_count = entry.properties.len();
                         let novelty_property_count = props.len();
-                        if merged_class_entries < 10
-                            || existing_property_count >= 100
-                            || novelty_property_count >= 100
-                        {
-                            tracing::debug!(
-                                g_id,
-                                class_sid64,
-                                existing_property_count,
-                                novelty_property_count,
-                                visited_class_entries,
-                                total_entries = total_class_entries,
-                                "Phase 3b: class property attribution entry starting"
-                            );
-                        }
                         let class_dts = class_prop_dts.get(&(g_id, class_sid64));
                         let class_refs = ref_edges.get(&(g_id, class_sid64));
                         let class_langs = class_prop_lang_deltas.get(&(g_id, class_sid64));
@@ -2333,50 +2320,10 @@ pub async fn incremental_index(
                             .collect();
 
                         let total_class_properties = prop_set.len();
-                        let base_ref_class_count: usize =
-                            entry.properties.iter().map(|pu| pu.ref_classes.len()).sum();
-                        if merged_class_entries < 10
-                            || total_class_properties >= 100
-                            || base_ref_class_count >= 100
-                        {
-                            tracing::debug!(
-                                g_id,
-                                class_sid64,
-                                existing_property_count,
-                                novelty_property_count,
-                                total_class_properties,
-                                base_ref_class_count,
-                                visited_class_entries,
-                                total_entries = total_class_entries,
-                                "Phase 3b: merging class property attribution entry"
-                            );
-                        }
-
                         let mut merged_properties = Vec::with_capacity(total_class_properties);
                         let mut merged_property_count = 0usize;
                         let mut last_class_property_log = Instant::now();
                         for &cp_id in &prop_set {
-                            if merged_property_count < 3
-                                || last_class_property_log.elapsed()
-                                    >= std::time::Duration::from_secs(5)
-                            {
-                                tracing::debug!(
-                                    g_id,
-                                    class_sid64,
-                                    cp_id,
-                                    merged_property_count,
-                                    total_class_properties,
-                                    has_base_property = base_prop_by_pid.contains_key(&cp_id),
-                                    has_datatype_delta =
-                                        class_dts.is_some_and(|m| m.contains_key(&cp_id)),
-                                    has_lang_delta =
-                                        class_langs.is_some_and(|m| m.contains_key(&cp_id)),
-                                    ref_delta_count = class_refs
-                                        .and_then(|m| m.get(&cp_id))
-                                        .map_or(0, std::collections::HashMap::len),
-                                    "Phase 3b: class property attribution property starting"
-                                );
-                            }
                             let iri = novelty.shared.predicates.resolve(cp_id).unwrap_or("");
                             let p_sid = match trie.longest_match(iri) {
                                 Some((code, plen)) => fluree_db_core::Sid::new(code, &iri[plen..]),
@@ -2441,17 +2388,6 @@ pub async fn incremental_index(
                             }
                             if let Some(ref_delta) = class_refs.and_then(|m| m.get(&cp_id)) {
                                 let ref_delta_count = ref_delta.len();
-                                if ref_delta_count >= 25 || merged_class_entries < 10 {
-                                    tracing::debug!(
-                                        g_id,
-                                        class_sid64,
-                                        cp_id,
-                                        ref_delta_count,
-                                        merged_property_count,
-                                        total_class_properties,
-                                        "Phase 3b: merging novelty ref-class deltas"
-                                    );
-                                }
                                 let mut merged_ref_delta_count = 0usize;
                                 let mut last_ref_delta_log = Instant::now();
                                 for (&target, &cnt) in ref_delta {
@@ -2560,7 +2496,7 @@ pub async fn incremental_index(
                             &new_subject_suffix,
                         );
                     }
-                    if merged_class_entries > 0 && merged_class_entries.is_multiple_of(500) {
+                    if merged_class_entries >= next_merged_class_progress {
                         tracing::debug!(
                             merged_class_entries,
                             total_entries = total_class_entries,
@@ -2573,6 +2509,7 @@ pub async fn incremental_index(
                             "Phase 3b: property attribution merge progress"
                         );
                         last_property_merge_log = Instant::now();
+                        next_merged_class_progress = next_merged_class_progress.saturating_add(500);
                     } else if last_property_merge_log.elapsed() >= std::time::Duration::from_secs(5)
                     {
                         tracing::debug!(
