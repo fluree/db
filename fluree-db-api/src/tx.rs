@@ -252,6 +252,96 @@ pub(crate) struct StagedShaclContext<'a> {
 
     /// Optional tracker for SHACL fuel accounting during validation.
     pub tracker: Option<&'a fluree_db_core::Tracker>,
+
+    /// Cross-ledger shapes artifact, pre-resolved at the API
+    /// boundary and threaded through staging as an internal
+    /// governance input. When `Some`, this artifact is the shape
+    /// source rather than `f:shapesSource`'s local graph selector.
+    /// The wire is compiled against `staged_ns` (below) so IRIs
+    /// the in-flight transaction introduced are encodable; M-only
+    /// IRIs are dropped (their shapes can't apply to data D
+    /// doesn't have).
+    pub cross_ledger_shapes: Option<&'a crate::cross_ledger::ShapesArtifactWire>,
+
+    /// Staged `NamespaceRegistry` — D's snapshot namespaces plus
+    /// any IRIs the in-flight transaction has registered. Required
+    /// when `cross_ledger_shapes` is `Some`; consulted as the term
+    /// context for compiling M's wire-form shapes against D.
+    pub staged_ns: Option<&'a fluree_db_transact::namespace::NamespaceRegistry>,
+}
+
+/// Inspect the data ledger's resolved config and, when
+/// `f:shapesSource` carries a cross-ledger `f:ledger` reference,
+/// resolve the model ledger's shapes graph into a wire artifact
+/// at transaction entry — before staging starts.
+///
+/// Returns `None` when no cross-ledger shapes are configured (so
+/// the staging path uses the unchanged same-ledger flow). Returns
+/// `Some(ResolvedGraph)` when a wire artifact has been
+/// materialized; the caller threads the artifact into the staging
+/// context so SHACL compilation at validation time can use the
+/// pre-resolved wire instead of querying the model ledger again.
+///
+/// All cross-ledger failure modes (missing model, reserved graph,
+/// unsupported phase fields) surface here as `TransactError::Parse`
+/// formatting the underlying `CrossLedgerError`. The HTTP layer
+/// maps these to 400 (TransactError → BAD_REQUEST), matching the
+/// constraints path's HTTP class. A future refactor that surfaces
+/// `ApiError::CrossLedger` (HTTP 502) through the staging error
+/// type would preserve the variant.
+#[cfg(feature = "shacl")]
+async fn resolve_cross_ledger_shapes_for_tx(
+    ledger: &LedgerState,
+    fluree: &crate::Fluree,
+) -> std::result::Result<
+    Option<std::sync::Arc<crate::cross_ledger::ResolvedGraph>>,
+    fluree_db_transact::TransactError,
+> {
+    // Load the same config the same-ledger SHACL path loads (from
+    // pre-tx state). resolve_ledger_config returns None on a fresh
+    // ledger with no #config — in that case there's no cross-ledger
+    // to dispatch.
+    let config = match crate::config_resolver::resolve_ledger_config(
+        &ledger.snapshot,
+        ledger.novelty.as_ref(),
+        ledger.t(),
+    )
+    .await
+    {
+        Ok(Some(c)) => c,
+        Ok(None) => return Ok(None),
+        Err(e) => {
+            return Err(fluree_db_transact::TransactError::Parse(format!(
+                "failed to load ledger config while resolving cross-ledger f:shapesSource: {e}"
+            )));
+        }
+    };
+    let shapes_source = config
+        .shacl
+        .as_ref()
+        .and_then(|s| s.shapes_source.as_ref());
+    let Some(source) = shapes_source else {
+        return Ok(None);
+    };
+    if source.ledger.is_none() {
+        return Ok(None);
+    }
+    let mut ctx = crate::cross_ledger::ResolveCtx::new(
+        ledger.snapshot.ledger_id.as_str(),
+        fluree,
+    );
+    let resolved = crate::cross_ledger::resolve_graph_ref(
+        source,
+        crate::cross_ledger::ArtifactKind::Shapes,
+        &mut ctx,
+    )
+    .await
+    .map_err(|e| {
+        fluree_db_transact::TransactError::Parse(format!(
+            "f:shapesSource cross-ledger resolution failed: {e}"
+        ))
+    })?;
+    Ok(Some(resolved))
 }
 
 /// Resolve `f:shapesSource` from a loaded `LedgerConfig` into concrete graph
@@ -384,18 +474,59 @@ pub(crate) async fn apply_shacl_policy_to_staged_view(
         return Ok(());
     }
 
-    // 4. Resolve `f:shapesSource` into concrete graph IDs. Defaults to
-    //    `[0]` when unset — preserves the historical "shapes in the default
-    //    graph" behavior for configs that don't opt into named-graph shape
-    //    storage.
-    let shapes_g_ids = resolve_shapes_source_g_ids(config.as_deref(), &base.snapshot)?;
+    // 4a. Cross-ledger shapes: when a `ShapesArtifactWire` is
+    //     threaded through `ctx`, compile it against the staged
+    //     `NamespaceRegistry` (which has D's snapshot namespaces
+    //     PLUS any IRIs the in-flight transaction registered).
+    //     This sidesteps the pre-staging-snapshot bug: IRIs that
+    //     the tx is introducing (e.g., the very `ex:Person`
+    //     instance being validated) are encodable here, where
+    //     they wouldn't be against `base.snapshot`. M-only IRIs
+    //     that D has never seen drop their triples — the shape
+    //     can't apply to data D doesn't have, and allocating a
+    //     fresh ns_code for every M-only term would churn D's
+    //     namespace map for no benefit.
+    //
+    //     When this branch is taken, the same-ledger
+    //     `f:shapesSource` resolution is skipped — the wire is
+    //     the authoritative shape source for this transaction.
+    // `cl_overlay_holder` keeps the SchemaBundleOverlay alive for
+    // the lifetime of `shape_dbs`'s borrow. Only the cross-ledger
+    // branch populates it; the same-ledger branch leaves it None.
+    #[allow(unused_assignments)]
+    let mut cl_overlay_holder = None;
+    let shape_dbs: Vec<fluree_db_core::GraphDbRef<'_>> =
+        if let (Some(wire), Some(staged_ns)) = (ctx.cross_ledger_shapes, ctx.staged_ns) {
+            let bundle = wire
+                .translate_to_schema_bundle_flakes(staged_ns)
+                .map_err(|e| {
+                    fluree_db_transact::TransactError::Parse(format!(
+                        "cross-ledger shapes wire translation failed: {e}"
+                    ))
+                })?;
+            cl_overlay_holder = Some(
+                fluree_db_query::schema_bundle::SchemaBundleOverlay::new(
+                    base.novelty.as_ref(),
+                    bundle,
+                ),
+            );
+            vec![fluree_db_core::GraphDbRef::new(
+                &base.snapshot,
+                0u16,
+                cl_overlay_holder.as_ref().expect("just set above"),
+                base.t(),
+            )]
+        } else {
+            // 4b. Same-ledger path. Resolve `f:shapesSource` into
+            //     concrete graph IDs; default to `[0]` when unset.
+            let shapes_g_ids =
+                resolve_shapes_source_g_ids(config.as_deref(), &base.snapshot)?;
+            shapes_g_ids
+                .iter()
+                .map(|g_id| base.as_graph_db_ref(*g_id))
+                .collect()
+        };
 
-    // Build one GraphDbRef per shape graph so shapes transacted into any of
-    // them — including the config graph itself — participate in compilation.
-    let shape_dbs: Vec<_> = shapes_g_ids
-        .iter()
-        .map(|g_id| base.as_graph_db_ref(*g_id))
-        .collect();
     let engine = ShaclEngine::from_dbs_with_overlay(&shape_dbs, base.ledger_id())
         .await
         .map_err(fluree_db_transact::TransactError::from)?;
@@ -475,6 +606,7 @@ async fn stage_with_config_shacl(
     txn: Txn,
     ns_registry: NamespaceRegistry,
     options: StageOptions<'_>,
+    fluree: &crate::Fluree,
 ) -> std::result::Result<(StagedLedger, NamespaceRegistry), fluree_db_transact::TransactError> {
     // Capture graph_delta + tracker before stage_txn consumes the options/txn.
     // graph_delta is used both for per-graph config lookup and for rebuilding
@@ -482,6 +614,15 @@ async fn stage_with_config_shacl(
     // sid_for_iri hits the trie cache — no new allocations).
     let graph_delta = txn.graph_delta.clone();
     let tracker = options.tracker;
+
+    // Detect cross-ledger SHACL config at the API boundary BEFORE
+    // staging starts: read D's resolved config and, if
+    // f:shapesSource carries f:ledger, resolve the wire artifact
+    // from M now so the per-tx ResolveCtx benefits from memo +
+    // governance cache. The wire is then threaded through
+    // staging as an internal governance input and compiled
+    // against the staged namespace registry at validation time.
+    let cross_ledger_shapes = resolve_cross_ledger_shapes_for_tx(&ledger, fluree).await?;
 
     let (view, mut ns_registry) = stage_txn(ledger, txn, ns_registry, options).await?;
 
@@ -496,6 +637,11 @@ async fn stage_with_config_shacl(
             graph_delta: Some(&graph_delta),
             graph_sids: Some(&graph_sids),
             tracker,
+            cross_ledger_shapes: cross_ledger_shapes.as_deref().and_then(|r| match &r.artifact {
+                crate::cross_ledger::GovernanceArtifact::Shapes(wire) => Some(wire),
+                _ => None,
+            }),
+            staged_ns: cross_ledger_shapes.as_deref().map(|_| &ns_registry),
         },
     )
     .await?;
@@ -1288,7 +1434,7 @@ impl crate::Fluree {
 
         #[cfg(feature = "shacl")]
         let (view, ns_registry) =
-            stage_with_config_shacl(ledger, txn, ns_registry, options).await?;
+            stage_with_config_shacl(ledger, txn, ns_registry, options, self).await?;
         #[cfg(not(feature = "shacl"))]
         let (view, ns_registry) = stage_txn(ledger, txn, ns_registry, options).await?;
 
@@ -1363,7 +1509,7 @@ impl crate::Fluree {
 
         #[cfg(feature = "shacl")]
         let (view, ns_registry) =
-            stage_with_config_shacl(ledger, txn, ns_registry, options).await?;
+            stage_with_config_shacl(ledger, txn, ns_registry, options, self).await?;
         #[cfg(not(feature = "shacl"))]
         let (view, ns_registry) = stage_txn(ledger, txn, ns_registry, options).await?;
 
@@ -1414,7 +1560,7 @@ impl crate::Fluree {
         }
 
         #[cfg(feature = "shacl")]
-        let (view, ns_registry) = stage_with_config_shacl(ledger, txn, ns_registry, options)
+        let (view, ns_registry) = stage_with_config_shacl(ledger, txn, ns_registry, options, self)
             .await
             .map_err(|e| TrackedErrorResponse::new(400, e.to_string(), tracker.tally()))?;
         #[cfg(not(feature = "shacl"))]
@@ -2013,6 +2159,13 @@ impl crate::Fluree {
                 graph_delta: None,
                 graph_sids: None,
                 tracker: None,
+                // Turtle insert doesn't go through the
+                // cross-ledger dispatch path today; cross-ledger
+                // SHACL on Turtle inserts can be added by calling
+                // resolve_cross_ledger_shapes_for_tx here when
+                // the use case lands.
+                cross_ledger_shapes: None,
+                staged_ns: None,
             },
         )
         .await

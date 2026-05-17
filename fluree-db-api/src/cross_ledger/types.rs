@@ -26,11 +26,15 @@ pub enum ArtifactKind {
     /// `f:enforceUnique true` on the model ledger.
     Constraints,
     /// `f:schemaSource` → schema/ontology axiom triples projected
-    /// from the model ledger's ontology graph. Single-graph only
-    /// in Phase 1b-a; transitive `owl:imports` recursion lands in
-    /// a follow-up.
+    /// from the model ledger's ontology graph. Single-graph only;
+    /// transitive `owl:imports` recursion across ledgers is
+    /// reserved.
     SchemaClosure,
-    // Shapes         — reserved
+    /// `f:shapesSource` → SHACL shape triples (whitelist + rdf:list
+    /// internals for sh:in / sh:and / sh:or / sh:xone) projected
+    /// from the model ledger's shapes graph. Carries literals as
+    /// well as Refs.
+    Shapes,
     // DatalogRules   — reserved
 }
 
@@ -40,6 +44,7 @@ impl std::fmt::Display for ArtifactKind {
             ArtifactKind::PolicyRules => f.write_str("PolicyRules"),
             ArtifactKind::Constraints => f.write_str("Constraints"),
             ArtifactKind::SchemaClosure => f.write_str("SchemaClosure"),
+            ArtifactKind::Shapes => f.write_str("Shapes"),
         }
     }
 }
@@ -92,7 +97,13 @@ pub enum GovernanceArtifact {
     /// `fluree_db_query::SchemaBundleFlakes` via
     /// [`SchemaArtifactWire::translate_to_schema_bundle_flakes`].
     SchemaClosure(SchemaArtifactWire),
-    // Shapes(ShapeSetWire)            — reserved
+    /// SHACL shape triples in IRI-form. Translate via
+    /// [`ShapesArtifactWire::translate_to_schema_bundle_flakes`]
+    /// against the *staged* `NamespaceRegistry` (not D's base
+    /// snapshot) so IRIs the in-flight transaction introduced are
+    /// encodable. M-only IRIs that D has never seen are dropped
+    /// silently — those shapes can't apply to data D doesn't have.
+    Shapes(ShapesArtifactWire),
     // DatalogRules(DatalogRuleSetWire) — reserved
 }
 
@@ -260,6 +271,135 @@ impl SchemaArtifactWire {
             collected,
         )
         .map(std::sync::Arc::new)
+    }
+}
+
+/// Term-neutral wire form for a SHACL shapes artifact.
+///
+/// Carries the SHACL whitelist triples (sh:targetClass / sh:property /
+/// sh:minCount / sh:pattern / ... — the full vocabulary
+/// `ShapeCompiler::compile_from_dbs` scans for) plus the
+/// rdf:first / rdf:rest internals needed for sh:in / sh:and /
+/// sh:or / sh:xone list expansion. Object positions handle both
+/// Ref and Literal via [`WireObject`].
+///
+/// **Translation timing matters.** The translator on D must run
+/// against the *staged* `NamespaceRegistry`, not the pre-staging
+/// snapshot. The staging registry contains IRIs that the in-flight
+/// transaction is introducing (e.g., `ex:User` declared by the
+/// tx being validated); the pre-stage snapshot does not.
+/// Translating against the wrong context drops everything and the
+/// shape silently doesn't apply.
+///
+/// IRIs the staged registry hasn't seen are dropped silently —
+/// the shape couldn't apply to data D doesn't have anyway, and
+/// allocating a fresh namespace code for an M-only IRI would
+/// introduce namespace churn into D for no benefit.
+#[derive(Debug, Clone)]
+pub struct ShapesArtifactWire {
+    /// Provenance for diagnostics and cache key derivation.
+    pub origin: WireOrigin,
+    /// SHACL whitelist triples + rdf:list internals in the order
+    /// the materializer read them from M.
+    pub triples: Vec<WireTriple>,
+}
+
+impl ShapesArtifactWire {
+    /// Translate to a Sid-form `SchemaBundleFlakes` against the
+    /// data ledger's *staged* namespace registry. The bundle is
+    /// then wrapped in `SchemaBundleOverlay` and fed to
+    /// `ShaclEngine::from_dbs_with_overlay`.
+    ///
+    /// `staged_ns` is the `NamespaceRegistry` that the staging
+    /// pipeline carries — it has D's snapshot namespaces *plus*
+    /// any IRIs the in-flight transaction has registered. Encoding
+    /// is lookup-only (`NamespaceRegistry::lookup_sid_for_iri`);
+    /// unknown IRIs drop their triples rather than allocating
+    /// fresh codes in D.
+    ///
+    /// Literal object values reconstruct via the same datatype
+    /// dispatch the schema translator uses — xsd:integer → Long,
+    /// xsd:boolean → Boolean, etc.; unknown datatypes fall back
+    /// to `FlakeValue::String`.
+    pub fn translate_to_schema_bundle_flakes(
+        &self,
+        staged_ns: &fluree_db_transact::namespace::NamespaceRegistry,
+    ) -> fluree_db_query::error::Result<std::sync::Arc<fluree_db_query::schema_bundle::SchemaBundleFlakes>>
+    {
+        use fluree_db_core::flake::Flake;
+        use fluree_db_core::Sid;
+
+        let mut collected: Vec<Flake> = Vec::with_capacity(self.triples.len());
+        for t in &self.triples {
+            let (Some(s_sid), Some(p_sid)) = (
+                staged_ns.lookup_sid_for_iri(&t.s),
+                staged_ns.lookup_sid_for_iri(&t.p),
+            ) else {
+                continue;
+            };
+            let (o_value, dt_sid) = match &t.o {
+                WireObject::Ref(o_iri) => {
+                    let Some(o_sid) = staged_ns.lookup_sid_for_iri(o_iri) else {
+                        continue;
+                    };
+                    (
+                        fluree_db_core::FlakeValue::Ref(o_sid),
+                        Sid::new(fluree_vocab::namespaces::JSON_LD, "id"),
+                    )
+                }
+                WireObject::Literal {
+                    value,
+                    datatype,
+                    lang: _,
+                } => {
+                    let dt_sid = staged_ns.lookup_sid_for_iri(datatype).unwrap_or_else(
+                        || Sid::new(fluree_vocab::namespaces::XSD, "string"),
+                    );
+                    (literal_to_flake_value(value, datatype), dt_sid)
+                }
+            };
+            collected.push(Flake {
+                g: None,
+                s: s_sid,
+                p: p_sid,
+                o: o_value,
+                dt: dt_sid,
+                t: 0,
+                op: true,
+                m: None,
+            });
+        }
+        fluree_db_query::schema_bundle::SchemaBundleFlakes::from_collected_schema_triples(
+            collected,
+        )
+        .map(std::sync::Arc::new)
+    }
+}
+
+/// Decode a wire literal into the matching `FlakeValue`. Falls back
+/// to `String(value)` on parse failure or unknown datatype — the
+/// SHACL compiler will simply not match the value on type-sensitive
+/// constraints, same as if the constraint weren't authored.
+fn literal_to_flake_value(value: &str, datatype: &str) -> fluree_db_core::FlakeValue {
+    use fluree_db_core::FlakeValue;
+    const XSD: &str = "http://www.w3.org/2001/XMLSchema#";
+    let local = datatype.strip_prefix(XSD).unwrap_or("");
+    match local {
+        "boolean" => value
+            .parse::<bool>()
+            .map(FlakeValue::Boolean)
+            .unwrap_or_else(|_| FlakeValue::String(value.to_string())),
+        "integer" | "long" | "int" | "short" | "byte" | "nonNegativeInteger"
+        | "positiveInteger" | "negativeInteger" | "nonPositiveInteger"
+        | "unsignedLong" | "unsignedInt" | "unsignedShort" | "unsignedByte" => value
+            .parse::<i64>()
+            .map(FlakeValue::Long)
+            .unwrap_or_else(|_| FlakeValue::String(value.to_string())),
+        "double" | "float" => value
+            .parse::<f64>()
+            .map(FlakeValue::Double)
+            .unwrap_or_else(|_| FlakeValue::String(value.to_string())),
+        _ => FlakeValue::String(value.to_string()),
     }
 }
 
