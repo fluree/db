@@ -340,6 +340,67 @@ Semantics:
 - `f:shapesSource` is **non-overridable** — it can only be set in the config graph, not via transaction/query-time options.
 - Use `f:graphSelector f:defaultGraph` to explicitly point at the default graph (same as omitting `f:shapesSource`).
 
+## Inline shapes per transaction
+
+In addition to shapes stored in a ledger, a transaction can supply
+**inline shapes** via the `opts.shapes` field. The shapes are
+enforced only for that one transaction and never written into the
+ledger.
+
+```json
+{
+  "@context": {"ex": "http://example.org/ns/"},
+  "@id":   "ex:alice",
+  "@type": "ex:Person",
+  "opts": {
+    "shapes": {
+      "@context": {
+        "ex":  "http://example.org/ns/",
+        "sh":  "http://www.w3.org/ns/shacl#",
+        "xsd": "http://www.w3.org/2001/XMLSchema#"
+      },
+      "@graph": [
+        {
+          "@id":            "ex:PersonShape",
+          "@type":          "sh:NodeShape",
+          "sh:targetClass": {"@id": "ex:Person"},
+          "sh:property":    {"@id": "ex:pshape_name"}
+        },
+        {
+          "@id":         "ex:pshape_name",
+          "sh:path":     {"@id": "ex:name"},
+          "sh:minCount": 1,
+          "sh:datatype": {"@id": "xsd:string"}
+        }
+      ]
+    }
+  }
+}
+```
+
+Semantics:
+
+- **Additive, not replacing.** Inline shapes enforce *alongside*
+  any shapes from `f:shapesSource` (same-ledger or cross-ledger).
+  A subject must satisfy every shape from every source.
+- **Transient.** The shapes never appear in the ledger's data and
+  vanish after the transaction completes. The next transaction
+  without `opts.shapes` runs without them.
+- **Gated by config.** If `f:shaclEnabled false` (or no graph is
+  enabled), inline shapes do not bypass that posture — operator
+  config wins. To use inline shapes on a fresh ledger with no
+  config, the shapes-exist heuristic enables validation
+  automatically.
+- **No audit trail.** Because inline shapes don't persist, it
+  isn't possible to reconstruct "which shapes validated which
+  commit" from ledger history. If auditability matters, store
+  shapes in a `f:shapesSource` graph instead.
+
+Use cases that fit well: ad-hoc shape testing before committing
+to `f:shapesSource`, per-tenant validation layers in an
+application server, request-scoped governance that should not
+become part of permanent ledger state.
+
 ## Validation modes
 
 - **`f:ValidationReject`** (default): on any violation, the transaction fails with `ShaclViolation(report)`. The formatted report lists each violation's focus node, property path, and message.

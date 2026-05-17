@@ -1272,7 +1272,14 @@ async fn execute_transaction(
             .or_else(|| author.map(String::from));
 
         // TxnOpts: unchanged by identity; commit provenance flows through CommitOpts.
-        let txn_opts = TxnOpts::default();
+        // Pick up `opts.shapes` from the body so inline SHACL shapes
+        // reach the staging path. Other TxnOpts fields are not yet
+        // surfaced over HTTP (branch/context/etc. come from headers
+        // or query params); add them here if a use case lands.
+        let mut txn_opts = TxnOpts::default();
+        if let Some(shapes) = body.get("opts").and_then(|o| o.get("shapes")) {
+            txn_opts.shapes = Some(shapes.clone());
+        }
 
         // Build and execute the transaction via the builder API.
         // Hoisted above CommitOpts assembly so we can spawn the raw-txn upload

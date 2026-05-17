@@ -460,6 +460,28 @@ pub struct TxnOpts {
     /// the transaction JSON, defaulting to `true`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub strict_compact_iri: Option<bool>,
+
+    /// Inline SHACL shape definitions for *this transaction only*.
+    ///
+    /// JSON-LD document carrying SHACL shapes (sh:NodeShape /
+    /// sh:targetClass / sh:property / ...). When set, the shapes are
+    /// parsed at SHACL validation time against the staged namespace
+    /// registry and added to the engine's shape source list — they
+    /// enforce additively alongside any same-ledger or cross-ledger
+    /// shapes configured via `f:shapesSource`. The shapes themselves
+    /// are not staged into the data ledger; they exist only for this
+    /// transaction's validation pass.
+    ///
+    /// Use cases: ad-hoc shape testing before committing to `#config`,
+    /// per-tenant validation layers, application-level shape governance
+    /// that should not live in the ledger's permanent state.
+    ///
+    /// Trade-off vs same-ledger shapes: inline shapes leave no audit
+    /// trail in the ledger ("which shapes validated which commit?"
+    /// can't be reconstructed from history). If auditability matters,
+    /// prefer `f:shapesSource`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub shapes: Option<serde_json::Value>,
 }
 
 impl TxnOpts {

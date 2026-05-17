@@ -39,9 +39,9 @@ pub mod bm25_worker;
 mod commit_data;
 pub mod commit_transfer;
 pub mod config_resolver;
-pub mod cross_ledger;
 #[cfg(feature = "credential")]
 pub mod credential;
+pub mod cross_ledger;
 pub mod dataset;
 mod error;
 pub mod explain;
@@ -56,6 +56,8 @@ pub mod graph_source;
 pub mod graph_transact_builder;
 pub mod import;
 mod indexer_fulltext_provider;
+#[cfg(feature = "shacl")]
+mod inline_shapes;
 mod ledger;
 pub mod ledger_info;
 mod merge;

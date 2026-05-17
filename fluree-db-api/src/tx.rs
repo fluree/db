@@ -268,6 +268,14 @@ pub(crate) struct StagedShaclContext<'a> {
     /// when `cross_ledger_shapes` is `Some`; consulted as the term
     /// context for compiling M's wire-form shapes against D.
     pub staged_ns: Option<&'a fluree_db_transact::namespace::NamespaceRegistry>,
+
+    /// Inline shape bundle parsed from `txn.opts.shapes` against the
+    /// staged namespace registry. When `Some`, the bundle attaches
+    /// as an additional shape source alongside any same-ledger
+    /// `f:shapesSource` or cross-ledger wire — they enforce
+    /// additively. Inline shapes do not persist into the ledger.
+    pub inline_shape_bundle:
+        Option<std::sync::Arc<fluree_db_query::schema_bundle::SchemaBundleFlakes>>,
 }
 
 /// Inspect the data ledger's resolved config and, when
@@ -316,20 +324,14 @@ async fn resolve_cross_ledger_shapes_for_tx(
             )));
         }
     };
-    let shapes_source = config
-        .shacl
-        .as_ref()
-        .and_then(|s| s.shapes_source.as_ref());
+    let shapes_source = config.shacl.as_ref().and_then(|s| s.shapes_source.as_ref());
     let Some(source) = shapes_source else {
         return Ok(None);
     };
     if source.ledger.is_none() {
         return Ok(None);
     }
-    let mut ctx = crate::cross_ledger::ResolveCtx::new(
-        ledger.snapshot.ledger_id.as_str(),
-        fluree,
-    );
+    let mut ctx = crate::cross_ledger::ResolveCtx::new(ledger.snapshot.ledger_id.as_str(), fluree);
     let resolved = crate::cross_ledger::resolve_graph_ref(
         source,
         crate::cross_ledger::ArtifactKind::Shapes,
@@ -490,12 +492,15 @@ pub(crate) async fn apply_shacl_policy_to_staged_view(
     //     When this branch is taken, the same-ledger
     //     `f:shapesSource` resolution is skipped — the wire is
     //     the authoritative shape source for this transaction.
-    // `cl_overlay_holder` keeps the SchemaBundleOverlay alive for
-    // the lifetime of `shape_dbs`'s borrow. Only the cross-ledger
-    // branch populates it; the same-ledger branch leaves it None.
+    // Overlay holders keep `SchemaBundleOverlay` alive for the
+    // lifetime of `shape_dbs`'s borrow. Cross-ledger shapes and
+    // inline-opts shapes live in separate holders so both can
+    // contribute additively when both are configured.
     #[allow(unused_assignments)]
     let mut cl_overlay_holder = None;
-    let shape_dbs: Vec<fluree_db_core::GraphDbRef<'_>> =
+    #[allow(unused_assignments)]
+    let mut inline_overlay_holder = None;
+    let mut shape_dbs: Vec<fluree_db_core::GraphDbRef<'_>> =
         if let (Some(wire), Some(staged_ns)) = (ctx.cross_ledger_shapes, ctx.staged_ns) {
             let bundle = wire
                 .translate_to_schema_bundle_flakes(staged_ns)
@@ -504,12 +509,10 @@ pub(crate) async fn apply_shacl_policy_to_staged_view(
                         "cross-ledger shapes wire translation failed: {e}"
                     ))
                 })?;
-            cl_overlay_holder = Some(
-                fluree_db_query::schema_bundle::SchemaBundleOverlay::new(
-                    base.novelty.as_ref(),
-                    bundle,
-                ),
-            );
+            cl_overlay_holder = Some(fluree_db_query::schema_bundle::SchemaBundleOverlay::new(
+                base.novelty.as_ref(),
+                bundle,
+            ));
             vec![fluree_db_core::GraphDbRef::new(
                 &base.snapshot,
                 0u16,
@@ -519,13 +522,32 @@ pub(crate) async fn apply_shacl_policy_to_staged_view(
         } else {
             // 4b. Same-ledger path. Resolve `f:shapesSource` into
             //     concrete graph IDs; default to `[0]` when unset.
-            let shapes_g_ids =
-                resolve_shapes_source_g_ids(config.as_deref(), &base.snapshot)?;
+            let shapes_g_ids = resolve_shapes_source_g_ids(config.as_deref(), &base.snapshot)?;
             shapes_g_ids
                 .iter()
                 .map(|g_id| base.as_graph_db_ref(*g_id))
                 .collect()
         };
+
+    // 4c. Inline `opts.shapes`: attach the per-transaction shape
+    //     bundle alongside whichever non-inline source ran above.
+    //     Inline shapes never replace configured shapes; they layer
+    //     additively (the SHACL engine treats multiple shape DBs as
+    //     a union). The bundle was already constructed against the
+    //     staged namespace registry at `stage_with_config_shacl`
+    //     entry, so encoding is consistent with the live tx.
+    if let Some(bundle) = ctx.inline_shape_bundle.clone() {
+        inline_overlay_holder = Some(fluree_db_query::schema_bundle::SchemaBundleOverlay::new(
+            base.novelty.as_ref(),
+            bundle,
+        ));
+        shape_dbs.push(fluree_db_core::GraphDbRef::new(
+            &base.snapshot,
+            0u16,
+            inline_overlay_holder.as_ref().expect("just set above"),
+            base.t(),
+        ));
+    }
 
     let engine = ShaclEngine::from_dbs_with_overlay(&shape_dbs, base.ledger_id())
         .await
@@ -614,6 +636,12 @@ async fn stage_with_config_shacl(
     // sid_for_iri hits the trie cache — no new allocations).
     let graph_delta = txn.graph_delta.clone();
     let tracker = options.tracker;
+    // Capture inline shapes JSON now — stage_txn consumes `txn`.
+    // Parsing happens *after* staging so the FlakeSink encodes
+    // against the post-staging `ns_registry`, matching the term
+    // context cross-ledger shapes compile against.
+    let inline_shapes_json = txn.opts.shapes.clone();
+    let inline_shapes_ledger_id = ledger.snapshot.ledger_id.to_string();
 
     // Detect cross-ledger SHACL config at the API boundary BEFORE
     // staging starts: read D's resolved config and, if
@@ -626,6 +654,21 @@ async fn stage_with_config_shacl(
 
     let (view, mut ns_registry) = stage_txn(ledger, txn, ns_registry, options).await?;
 
+    // Parse inline shapes (if any) against the staged namespace
+    // registry. The bundle becomes an additional shape DB in
+    // `apply_shacl_policy_to_staged_view` alongside any same- or
+    // cross-ledger sources — enforcement is additive.
+    let inline_shape_bundle = if let Some(shapes_json) = inline_shapes_json.as_ref() {
+        crate::inline_shapes::parse_inline_shapes_to_bundle(
+            shapes_json,
+            &mut ns_registry,
+            view.base().t(),
+            &inline_shapes_ledger_id,
+        )?
+    } else {
+        None
+    };
+
     let graph_sids: HashMap<GraphId, Sid> = graph_delta
         .iter()
         .map(|(&g_id, iri)| (g_id, ns_registry.sid_for_iri(iri)))
@@ -637,11 +680,14 @@ async fn stage_with_config_shacl(
             graph_delta: Some(&graph_delta),
             graph_sids: Some(&graph_sids),
             tracker,
-            cross_ledger_shapes: cross_ledger_shapes.as_deref().and_then(|r| match &r.artifact {
-                crate::cross_ledger::GovernanceArtifact::Shapes(wire) => Some(wire),
-                _ => None,
-            }),
+            cross_ledger_shapes: cross_ledger_shapes
+                .as_deref()
+                .and_then(|r| match &r.artifact {
+                    crate::cross_ledger::GovernanceArtifact::Shapes(wire) => Some(wire),
+                    _ => None,
+                }),
             staged_ns: cross_ledger_shapes.as_deref().map(|_| &ns_registry),
+            inline_shape_bundle,
         },
     )
     .await?;
@@ -692,10 +738,7 @@ async fn resolve_per_graph_unique_sids(
     let snapshot = view.db();
     // One resolution context per tx — cross-ledger sources for
     // different affected graphs in the same tx share memo / resolved_t.
-    let mut resolve_ctx = crate::cross_ledger::ResolveCtx::new(
-        snapshot.ledger_id.as_str(),
-        fluree,
-    );
+    let mut resolve_ctx = crate::cross_ledger::ResolveCtx::new(snapshot.ledger_id.as_str(), fluree);
 
     // Build reverse map: graph SID → g_id for flake graph resolution
     let mut sid_to_gid: HashMap<Sid, GraphId> = HashMap::new();
@@ -760,10 +803,8 @@ async fn resolve_per_graph_unique_sids(
             let annotations = read_enforce_unique_from_graph(view, 0u16).await?;
             unique_sids.extend(annotations);
         } else {
-            let mut local_sources: Vec<&fluree_db_core::ledger_config::GraphSourceRef> =
-                Vec::new();
-            let mut cross_sources: Vec<&fluree_db_core::ledger_config::GraphSourceRef> =
-                Vec::new();
+            let mut local_sources: Vec<&fluree_db_core::ledger_config::GraphSourceRef> = Vec::new();
+            let mut cross_sources: Vec<&fluree_db_core::ledger_config::GraphSourceRef> = Vec::new();
             for source in &transact_config.constraints_sources {
                 if source.ledger.is_some() {
                     cross_sources.push(source);
@@ -774,13 +815,9 @@ async fn resolve_per_graph_unique_sids(
 
             // Local: resolve to g_ids and scan.
             if !local_sources.is_empty() {
-                let local_g_ids = resolve_constraint_source_g_ids_for(
-                    &local_sources,
-                    snapshot,
-                )?;
+                let local_g_ids = resolve_constraint_source_g_ids_for(&local_sources, snapshot)?;
                 for source_g_id in local_g_ids {
-                    let annotations =
-                        read_enforce_unique_from_graph(view, source_g_id).await?;
+                    let annotations = read_enforce_unique_from_graph(view, source_g_id).await?;
                     unique_sids.extend(annotations);
                 }
             }
@@ -807,8 +844,7 @@ async fn resolve_per_graph_unique_sids(
                         "f:constraintsSource cross-ledger resolution failed: {e}"
                     ))
                 })?;
-                let crate::cross_ledger::GovernanceArtifact::Constraints(wire) =
-                    &resolved.artifact
+                let crate::cross_ledger::GovernanceArtifact::Constraints(wire) = &resolved.artifact
                 else {
                     return Err(fluree_db_transact::TransactError::Parse(
                         "cross-ledger resolver returned a non-Constraints \
@@ -2166,6 +2202,10 @@ impl crate::Fluree {
                 // the use case lands.
                 cross_ledger_shapes: None,
                 staged_ns: None,
+                // Turtle insert API has no `opts.shapes` surface
+                // today — inline SHACL flows in over the JSON
+                // transaction path. Wireable later if needed.
+                inline_shape_bundle: None,
             },
         )
         .await
