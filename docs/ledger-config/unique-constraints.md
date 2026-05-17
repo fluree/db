@@ -77,6 +77,15 @@ f:transactDefaults [
 ] .
 ```
 
+### Cross-ledger constraint source
+
+`f:constraintsSource` also supports **cross-ledger references** —
+set `f:ledger` on the inner `f:graphSource` to load
+`f:enforceUnique` annotations from another ledger at transaction
+time. See
+[Cross-ledger governance — Cross-ledger constraints](../security/cross-ledger-policy.md#cross-ledger-uniqueness-constraints)
+for the end-to-end pattern and failure modes.
+
 ## What gets enforced
 
 Once enabled, any transaction that would result in **two or more distinct subjects** holding the same value for a unique property **within the same graph** is rejected.
@@ -132,6 +141,50 @@ Upserts that change a value are handled correctly. When an upsert retracts the o
 ### Idempotent re-insert
 
 Re-asserting the same `(subject, property, value)` triple that already exists is allowed. One subject still holds the value — no violation.
+
+## Inline `opts.uniqueProperties` per transaction
+
+In addition to constraints stored in the ledger, a transaction can
+supply **inline unique-property declarations** via the
+`opts.uniqueProperties` field. The properties are enforced only for
+that one transaction; the list itself never persists.
+
+```json
+{
+  "@context": {"ex": "http://example.org/ns/"},
+  "@id":      "ex:bob",
+  "ex:email": "alice@example.org",
+  "opts": {
+    "uniqueProperties": [
+      "http://example.org/ns/email"
+    ]
+  }
+}
+```
+
+Each entry must be a **full IRI** (not a compact prefix form). IRIs
+that the ledger's namespace map has never seen are dropped silently
+— no instance of the property exists, so the constraint cannot be
+violated either way; this matches the same-ledger contract.
+
+Semantics:
+
+- **Additive, not replacing.** Inline properties union with whatever
+  `f:constraintsSource` already resolves to (same-ledger or
+  cross-ledger). A property is enforced if either source declares it.
+- **Transient.** The list is never written into the ledger. The next
+  transaction without `opts.uniqueProperties` runs without it.
+- **No-config enforcement.** Inline properties drive enforcement
+  even on a ledger with no `f:transactDefaults` block — the inline
+  list is itself the configuration for this transaction.
+- **No audit trail.** Without persistence it's not reconstructable
+  which constraints validated which commit. If auditability matters,
+  declare the constraint in a `f:constraintsSource` graph instead.
+
+Use cases that fit well: per-tenant constraints layered on top of
+operator-set baselines; one-off bulk loads that need extra hygiene
+without polluting `#config`; testing a candidate constraint before
+committing the annotation.
 
 ## Error message
 

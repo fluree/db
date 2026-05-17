@@ -117,6 +117,65 @@ pub async fn build_policy_context_from_opts(
     opts: &QueryConnectionOptions,
     policy_graphs: &[fluree_db_core::GraphId],
 ) -> Result<PolicyContext> {
+    build_policy_context_from_opts_inner(
+        snapshot,
+        overlay,
+        novelty_for_stats,
+        to_t,
+        opts,
+        policy_graphs,
+        None,
+    )
+    .await
+}
+
+/// Cross-ledger variant of [`build_policy_context_from_opts`].
+///
+/// `cross_ledger_restrictions` is a pre-materialized list produced
+/// against a model ledger by the cross-ledger resolver and
+/// translated into D's term space via
+/// `fluree_db_policy::wire_to_restrictions` (with D's configured
+/// `policy_class` set already applied as a filter). When supplied,
+/// the local same-ledger policy load (`load_policies_by_class` /
+/// `parse_inline_policy`) is bypassed for the class / inline-policy
+/// branch — those restrictions are used as-is. Identity loading and
+/// `?$identity` binding still run locally against D per the
+/// identity contract in the design doc.
+///
+/// `policy_graphs` is still consulted for the identity-mode path
+/// (`opts.identity` set) because identity binding always resolves
+/// against the data ledger; cross-ledger never contributes identity
+/// records.
+pub async fn build_policy_context_from_opts_with_cross_ledger(
+    snapshot: &LedgerSnapshot,
+    overlay: &dyn fluree_db_core::OverlayProvider,
+    novelty_for_stats: Option<&Novelty>,
+    to_t: i64,
+    opts: &QueryConnectionOptions,
+    policy_graphs: &[fluree_db_core::GraphId],
+    cross_ledger_restrictions: Vec<PolicyRestriction>,
+) -> Result<PolicyContext> {
+    build_policy_context_from_opts_inner(
+        snapshot,
+        overlay,
+        novelty_for_stats,
+        to_t,
+        opts,
+        policy_graphs,
+        Some(cross_ledger_restrictions),
+    )
+    .await
+}
+
+async fn build_policy_context_from_opts_inner(
+    snapshot: &LedgerSnapshot,
+    overlay: &dyn fluree_db_core::OverlayProvider,
+    novelty_for_stats: Option<&Novelty>,
+    to_t: i64,
+    opts: &QueryConnectionOptions,
+    policy_graphs: &[fluree_db_core::GraphId],
+    cross_ledger_restrictions: Option<Vec<PolicyRestriction>>,
+) -> Result<PolicyContext> {
     struct PolicyStatsLookup<'a> {
         overlay: &'a dyn fluree_db_core::OverlayProvider,
     }
@@ -189,7 +248,22 @@ pub async fn build_policy_context_from_opts(
             None
         };
 
-        let restrictions = if let Some(classes) = &opts.policy_class {
+        let restrictions = if let Some(mut merged) = cross_ledger_restrictions {
+            // Cross-ledger short-circuit: the resolver already
+            // materialized restrictions from the model ledger and
+            // (per the identity contract) the wire artifact has been
+            // filtered by opts.policy_class. opts.policy (inline
+            // JSON-LD) still applies and gets merged below.
+            //
+            // Moving — not cloning — the owned input keeps
+            // model-ledger policy sets (which can be large: each
+            // `PolicyRestriction` carries strings + hash sets) from
+            // paying a per-request copy.
+            if let Some(policy_json) = &opts.policy {
+                merged.extend(parse_inline_policy(snapshot, policy_json)?);
+            }
+            merged
+        } else if let Some(classes) = &opts.policy_class {
             load_policies_by_class(snapshot, overlay, to_t, classes, policy_graphs).await?
         } else if let Some(policy_json) = &opts.policy {
             parse_inline_policy(snapshot, policy_json)?
@@ -422,8 +496,10 @@ async fn load_policies_by_identity(
 
 /// Load policies by querying for subjects of the given class types.
 ///
-/// Legacy equivalent: `wrap-class-policy`
-async fn load_policies_by_class(
+/// Legacy equivalent: `wrap-class-policy`. `pub(crate)` so the
+/// cross-ledger resolver can reuse the same load path against a
+/// model ledger's snapshot.
+pub(crate) async fn load_policies_by_class(
     snapshot: &LedgerSnapshot,
     overlay: &dyn fluree_db_core::OverlayProvider,
     to_t: i64,
@@ -501,7 +577,10 @@ async fn load_policies_of_classes(
 /// because the scan layer filters out internal `fluree:ledger` predicates
 /// when the predicate is a variable. Since all policy vocabulary predicates
 /// are in the `fluree:ledger` namespace, we must query them explicitly.
-async fn load_policy_restriction(
+///
+/// `pub(crate)` so the cross-ledger materializer can reuse the same
+/// per-policy predicate fan-out against a model ledger's snapshot.
+pub(crate) async fn load_policy_restriction(
     snapshot: &LedgerSnapshot,
     overlay: &dyn fluree_db_core::OverlayProvider,
     to_t: i64,

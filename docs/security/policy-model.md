@@ -230,6 +230,7 @@ History queries against the same shape produce a complete audit trail of policy 
 - [Policy in queries](policy-in-queries.md) — read-time enforcement details
 - [Policy in transactions](policy-in-transactions.md) — write-time enforcement details
 - [Programmatic policy API (Rust)](programmatic-policy.md) — `PolicyContext`, builder helpers, combining algorithm
+- [Cross-ledger policy](cross-ledger-policy.md) — one model ledger governs many data ledgers via `f:policySource` with `f:ledger`
 - [Authentication](authentication.md) — identities, JWTs, bearer-token verification
 - [Configuration](../operations/configuration.md) — server-side policy defaults (`data_auth_default_policy_class`, etc.)
 - [Vocabulary reference](../reference/vocabulary.md#policy-vocabulary) — predicate IRIs

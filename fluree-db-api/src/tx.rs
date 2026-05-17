@@ -252,6 +252,97 @@ pub(crate) struct StagedShaclContext<'a> {
 
     /// Optional tracker for SHACL fuel accounting during validation.
     pub tracker: Option<&'a fluree_db_core::Tracker>,
+
+    /// Cross-ledger shapes artifact, pre-resolved at the API
+    /// boundary and threaded through staging as an internal
+    /// governance input. When `Some`, this artifact is the shape
+    /// source rather than `f:shapesSource`'s local graph selector.
+    /// The wire is compiled against `staged_ns` (below) so IRIs
+    /// the in-flight transaction introduced are encodable; M-only
+    /// IRIs are dropped (their shapes can't apply to data D
+    /// doesn't have).
+    pub cross_ledger_shapes: Option<&'a crate::cross_ledger::ShapesArtifactWire>,
+
+    /// Staged `NamespaceRegistry` — D's snapshot namespaces plus
+    /// any IRIs the in-flight transaction has registered. Required
+    /// when `cross_ledger_shapes` is `Some`; consulted as the term
+    /// context for compiling M's wire-form shapes against D.
+    pub staged_ns: Option<&'a fluree_db_transact::namespace::NamespaceRegistry>,
+
+    /// Inline shape bundle parsed from `txn.opts.shapes` against the
+    /// staged namespace registry. When `Some`, the bundle attaches
+    /// as an additional shape source alongside any same-ledger
+    /// `f:shapesSource` or cross-ledger wire — they enforce
+    /// additively. Inline shapes do not persist into the ledger.
+    pub inline_shape_bundle:
+        Option<std::sync::Arc<fluree_db_query::schema_bundle::SchemaBundleFlakes>>,
+}
+
+/// Inspect the data ledger's resolved config and, when
+/// `f:shapesSource` carries a cross-ledger `f:ledger` reference,
+/// resolve the model ledger's shapes graph into a wire artifact
+/// at transaction entry — before staging starts.
+///
+/// Returns `None` when no cross-ledger shapes are configured (so
+/// the staging path uses the unchanged same-ledger flow). Returns
+/// `Some(ResolvedGraph)` when a wire artifact has been
+/// materialized; the caller threads the artifact into the staging
+/// context so SHACL compilation at validation time can use the
+/// pre-resolved wire instead of querying the model ledger again.
+///
+/// All cross-ledger failure modes (missing model, reserved graph,
+/// unsupported phase fields) surface here as `TransactError::Parse`
+/// formatting the underlying `CrossLedgerError`. The HTTP layer
+/// maps these to 400 (TransactError → BAD_REQUEST), matching the
+/// constraints path's HTTP class. A future refactor that surfaces
+/// `ApiError::CrossLedger` (HTTP 502) through the staging error
+/// type would preserve the variant.
+#[cfg(feature = "shacl")]
+async fn resolve_cross_ledger_shapes_for_tx(
+    ledger: &LedgerState,
+    ctx: &mut crate::cross_ledger::ResolveCtx<'_>,
+) -> std::result::Result<
+    Option<std::sync::Arc<crate::cross_ledger::ResolvedGraph>>,
+    fluree_db_transact::TransactError,
+> {
+    // Load the same config the same-ledger SHACL path loads (from
+    // pre-tx state). resolve_ledger_config returns None on a fresh
+    // ledger with no #config — in that case there's no cross-ledger
+    // to dispatch.
+    let config = match crate::config_resolver::resolve_ledger_config(
+        &ledger.snapshot,
+        ledger.novelty.as_ref(),
+        ledger.t(),
+    )
+    .await
+    {
+        Ok(Some(c)) => c,
+        Ok(None) => return Ok(None),
+        Err(e) => {
+            return Err(fluree_db_transact::TransactError::Parse(format!(
+                "failed to load ledger config while resolving cross-ledger f:shapesSource: {e}"
+            )));
+        }
+    };
+    let shapes_source = config.shacl.as_ref().and_then(|s| s.shapes_source.as_ref());
+    let Some(source) = shapes_source else {
+        return Ok(None);
+    };
+    if source.ledger.is_none() {
+        return Ok(None);
+    }
+    let resolved = crate::cross_ledger::resolve_graph_ref(
+        source,
+        crate::cross_ledger::ArtifactKind::Shapes,
+        ctx,
+    )
+    .await
+    .map_err(|e| {
+        fluree_db_transact::TransactError::Parse(format!(
+            "f:shapesSource cross-ledger resolution failed: {e}"
+        ))
+    })?;
+    Ok(Some(resolved))
 }
 
 /// Resolve `f:shapesSource` from a loaded `LedgerConfig` into concrete graph
@@ -384,18 +475,89 @@ pub(crate) async fn apply_shacl_policy_to_staged_view(
         return Ok(());
     }
 
-    // 4. Resolve `f:shapesSource` into concrete graph IDs. Defaults to
-    //    `[0]` when unset — preserves the historical "shapes in the default
-    //    graph" behavior for configs that don't opt into named-graph shape
-    //    storage.
-    let shapes_g_ids = resolve_shapes_source_g_ids(config.as_deref(), &base.snapshot)?;
+    // 4a. Cross-ledger shapes: when a `ShapesArtifactWire` is
+    //     threaded through `ctx`, compile it against the staged
+    //     `NamespaceRegistry` (which has D's snapshot namespaces
+    //     PLUS any IRIs the in-flight transaction registered).
+    //     This sidesteps the pre-staging-snapshot bug: IRIs that
+    //     the tx is introducing (e.g., the very `ex:Person`
+    //     instance being validated) are encodable here, where
+    //     they wouldn't be against `base.snapshot`. M-only IRIs
+    //     that D has never seen drop their triples — the shape
+    //     can't apply to data D doesn't have, and allocating a
+    //     fresh ns_code for every M-only term would churn D's
+    //     namespace map for no benefit.
+    //
+    //     When this branch is taken, the same-ledger
+    //     `f:shapesSource` resolution is skipped — the wire is
+    //     the authoritative shape source for this transaction.
+    // Overlay holders keep `SchemaBundleOverlay` alive for the
+    // lifetime of `shape_dbs`'s borrow.
+    //
+    // Source layering for SHACL shapes:
+    // - `f:shapesSource` is structurally singular
+    //   (`Option<GraphSourceRef>` on the config schema), so at
+    //   most one of {same-ledger, cross-ledger} can be the
+    //   configured source. The branch below picks whichever one
+    //   is active; they don't merge — a config can't represent
+    //   both at once.
+    // - Inline `opts.shapes` is *separate* from `f:shapesSource`
+    //   and layers additively with whichever configured source
+    //   ran. That's why this holder is independent — both bundles
+    //   can be live in the same tx.
+    #[allow(unused_assignments)]
+    let mut cl_overlay_holder = None;
+    #[allow(unused_assignments)]
+    let mut inline_overlay_holder = None;
+    let mut shape_dbs: Vec<fluree_db_core::GraphDbRef<'_>> =
+        if let (Some(wire), Some(staged_ns)) = (ctx.cross_ledger_shapes, ctx.staged_ns) {
+            let bundle = wire
+                .translate_to_schema_bundle_flakes(staged_ns)
+                .map_err(|e| {
+                    fluree_db_transact::TransactError::Parse(format!(
+                        "cross-ledger shapes wire translation failed: {e}"
+                    ))
+                })?;
+            cl_overlay_holder = Some(fluree_db_query::schema_bundle::SchemaBundleOverlay::new(
+                base.novelty.as_ref(),
+                bundle,
+            ));
+            vec![fluree_db_core::GraphDbRef::new(
+                &base.snapshot,
+                0u16,
+                cl_overlay_holder.as_ref().expect("just set above"),
+                base.t(),
+            )]
+        } else {
+            // 4b. Same-ledger path. Resolve `f:shapesSource` into
+            //     concrete graph IDs; default to `[0]` when unset.
+            let shapes_g_ids = resolve_shapes_source_g_ids(config.as_deref(), &base.snapshot)?;
+            shapes_g_ids
+                .iter()
+                .map(|g_id| base.as_graph_db_ref(*g_id))
+                .collect()
+        };
 
-    // Build one GraphDbRef per shape graph so shapes transacted into any of
-    // them — including the config graph itself — participate in compilation.
-    let shape_dbs: Vec<_> = shapes_g_ids
-        .iter()
-        .map(|g_id| base.as_graph_db_ref(*g_id))
-        .collect();
+    // 4c. Inline `opts.shapes`: attach the per-transaction shape
+    //     bundle alongside whichever non-inline source ran above.
+    //     Inline shapes never replace configured shapes; they layer
+    //     additively (the SHACL engine treats multiple shape DBs as
+    //     a union). The bundle was already constructed against the
+    //     staged namespace registry at `stage_with_config_shacl`
+    //     entry, so encoding is consistent with the live tx.
+    if let Some(bundle) = ctx.inline_shape_bundle.clone() {
+        inline_overlay_holder = Some(fluree_db_query::schema_bundle::SchemaBundleOverlay::new(
+            base.novelty.as_ref(),
+            bundle,
+        ));
+        shape_dbs.push(fluree_db_core::GraphDbRef::new(
+            &base.snapshot,
+            0u16,
+            inline_overlay_holder.as_ref().expect("just set above"),
+            base.t(),
+        ));
+    }
+
     let engine = ShaclEngine::from_dbs_with_overlay(&shape_dbs, base.ledger_id())
         .await
         .map_err(fluree_db_transact::TransactError::from)?;
@@ -472,9 +634,10 @@ fn format_violations(violations: &[fluree_db_shacl::ValidationResult]) -> String
 #[cfg(feature = "shacl")]
 async fn stage_with_config_shacl(
     ledger: LedgerState,
-    txn: Txn,
+    mut txn: Txn,
     ns_registry: NamespaceRegistry,
     options: StageOptions<'_>,
+    resolve_ctx: &mut crate::cross_ledger::ResolveCtx<'_>,
 ) -> std::result::Result<(StagedLedger, NamespaceRegistry), fluree_db_transact::TransactError> {
     // Capture graph_delta + tracker before stage_txn consumes the options/txn.
     // graph_delta is used both for per-graph config lookup and for rebuilding
@@ -482,8 +645,47 @@ async fn stage_with_config_shacl(
     // sid_for_iri hits the trie cache — no new allocations).
     let graph_delta = txn.graph_delta.clone();
     let tracker = options.tracker;
+    // Move inline shapes JSON off the txn — stage_txn consumes
+    // `txn` immediately after this, and the in-flight staging
+    // path itself never reads `opts.shapes`. Taking avoids
+    // cloning a potentially large JSON-LD doc just to keep both
+    // copies for one extra moment.
+    //
+    // INVARIANT: `stage_with_config_shacl` is *not* retry-safe.
+    // The `take()` here moves `opts.shapes` out of the txn, so a
+    // retry on the same `Txn` value would silently skip inline
+    // SHACL validation on the second attempt. If a retry policy
+    // is ever added to the staging path, defer the take until
+    // after `stage_txn` returns successfully — or clone here
+    // and accept the cost.
+    let inline_shapes_json = txn.opts.shapes.take();
+    let inline_shapes_ledger_id = ledger.snapshot.ledger_id.to_string();
+
+    // Detect cross-ledger SHACL config at the API boundary BEFORE
+    // staging starts: read D's resolved config and, if
+    // f:shapesSource carries f:ledger, resolve the wire artifact
+    // from M now so the per-tx ResolveCtx benefits from memo +
+    // governance cache. The wire is then threaded through
+    // staging as an internal governance input and compiled
+    // against the staged namespace registry at validation time.
+    let cross_ledger_shapes = resolve_cross_ledger_shapes_for_tx(&ledger, resolve_ctx).await?;
 
     let (view, mut ns_registry) = stage_txn(ledger, txn, ns_registry, options).await?;
+
+    // Parse inline shapes (if any) against the staged namespace
+    // registry. The bundle becomes an additional shape DB in
+    // `apply_shacl_policy_to_staged_view` alongside any same- or
+    // cross-ledger sources — enforcement is additive.
+    let inline_shape_bundle = if let Some(shapes_json) = inline_shapes_json.as_ref() {
+        crate::inline_shapes::parse_inline_shapes_to_bundle(
+            shapes_json,
+            &mut ns_registry,
+            view.base().t(),
+            &inline_shapes_ledger_id,
+        )?
+    } else {
+        None
+    };
 
     let graph_sids: HashMap<GraphId, Sid> = graph_delta
         .iter()
@@ -496,6 +698,14 @@ async fn stage_with_config_shacl(
             graph_delta: Some(&graph_delta),
             graph_sids: Some(&graph_sids),
             tracker,
+            cross_ledger_shapes: cross_ledger_shapes
+                .as_deref()
+                .and_then(|r| match &r.artifact {
+                    crate::cross_ledger::GovernanceArtifact::Shapes(wire) => Some(wire),
+                    _ => None,
+                }),
+            staged_ns: cross_ledger_shapes.as_deref().map(|_| &ns_registry),
+            inline_shape_bundle,
         },
     )
     .await?;
@@ -512,16 +722,113 @@ async fn stage_with_config_shacl(
 /// Loads config from the pre-txn state (via `view.base()`) and checks
 /// staged flakes against `f:enforceUnique` annotations. Zero-cost when
 /// no `f:transactDefaults` / `f:uniqueEnabled` is configured.
+///
+/// `fluree` is required so cross-ledger `f:constraintsSource` references
+/// can be resolved against the model ledger. Pass the parent `Fluree`
+/// instance — the staging path always has it on `&self`.
 async fn enforce_unique_after_staging(
     view: &StagedLedger,
     graph_delta: &FxHashMap<u16, String>,
+    resolve_ctx: &mut crate::cross_ledger::ResolveCtx<'_>,
+    inline_unique_properties: Option<&[String]>,
+    staged_ns: &NamespaceRegistry,
 ) -> std::result::Result<(), fluree_db_transact::TransactError> {
     let config = load_transaction_config(view.base()).await;
-    if let Some(cfg) = &config {
-        let per_graph_unique = resolve_per_graph_unique_sids(view, cfg, graph_delta).await?;
-        enforce_unique_constraints(view, &per_graph_unique, graph_delta).await?;
+
+    // Start with config-resolved per-graph SIDs (same/cross ledger).
+    // No config → empty; inline properties below can still drive
+    // enforcement when set.
+    let mut per_graph_unique: HashMap<GraphId, FxHashSet<Sid>> = match &config {
+        Some(cfg) => resolve_per_graph_unique_sids(view, cfg, graph_delta, resolve_ctx).await?,
+        None => HashMap::new(),
+    };
+
+    // Layer inline `opts.uniqueProperties` additively. Apply to
+    // every affected graph so the constraint behaves as
+    // "for this tx, these properties must be unique wherever they
+    // appear" — matching how `f:enforceUnique` annotations work
+    // when configured in the default graph against a per-graph
+    // tx.
+    //
+    // Lookup is against the *staged* `NamespaceRegistry`, not
+    // `view.db()` (which is the pre-stage snapshot). The staged
+    // registry sees IRIs the in-flight tx introduced, so a tx
+    // that declares `ex:email` and constrains it inline in one
+    // shot resolves correctly. `lookup_sid_for_iri` is pure-read,
+    // so an unknown IRI returns `None` rather than allocating —
+    // we then fail-closed with `TransactError::Parse`. The
+    // non-strict path would have folded unknown IRIs into the
+    // EMPTY namespace and silently produced a non-matching Sid,
+    // making the constraint *effectively unenforced* with no
+    // error and no warning.
+    if let Some(iris) = inline_unique_properties.filter(|v| !v.is_empty()) {
+        let mut inline_sids: FxHashSet<Sid> = FxHashSet::default();
+        let mut unresolved: Vec<&str> = Vec::new();
+        for iri in iris {
+            match staged_ns.lookup_sid_for_iri(iri) {
+                Some(sid) => {
+                    inline_sids.insert(sid);
+                }
+                None => unresolved.push(iri),
+            }
+        }
+        if !unresolved.is_empty() {
+            return Err(fluree_db_transact::TransactError::Parse(format!(
+                "opts.uniqueProperties references IRIs not known to this ledger \
+                 (declare the property first, or correct the IRI): {}",
+                unresolved.join(", ")
+            )));
+        }
+        if !inline_sids.is_empty() {
+            for g_id in affected_graph_ids(view, graph_delta) {
+                per_graph_unique
+                    .entry(g_id)
+                    .or_default()
+                    .extend(inline_sids.iter().cloned());
+            }
+        }
     }
+
+    if per_graph_unique.is_empty() {
+        return Ok(());
+    }
+    enforce_unique_constraints(view, &per_graph_unique, graph_delta).await?;
     Ok(())
+}
+
+/// Derive the set of graph IDs touched by staged flakes. Used by
+/// both the config-resolved constraints path and the inline
+/// `opts.uniqueProperties` path so they enforce against the same
+/// set of graphs.
+fn affected_graph_ids(
+    view: &StagedLedger,
+    graph_delta: &FxHashMap<u16, String>,
+) -> FxHashSet<GraphId> {
+    let snapshot = view.db();
+    let mut sid_to_gid: HashMap<Sid, GraphId> = HashMap::new();
+    for (&g_id, iri) in graph_delta {
+        if let Some(sid) = snapshot.encode_iri(iri) {
+            sid_to_gid.insert(sid, g_id);
+        }
+    }
+    for (g_id, iri) in snapshot.graph_registry.iter_entries() {
+        if let Some(sid) = snapshot.encode_iri(iri) {
+            sid_to_gid.entry(sid).or_insert(g_id);
+        }
+    }
+
+    let mut out: FxHashSet<GraphId> = FxHashSet::default();
+    for flake in view.staged_flakes() {
+        if !flake.op {
+            continue;
+        }
+        let g_id = match &flake.g {
+            None => 0u16,
+            Some(g_sid) => sid_to_gid.get(g_sid).copied().unwrap_or(0),
+        };
+        out.insert(g_id);
+    }
+    out
 }
 
 /// Resolve per-graph unique property SIDs from `f:enforceUnique` annotations.
@@ -535,42 +842,10 @@ async fn resolve_per_graph_unique_sids(
     view: &StagedLedger,
     config: &LedgerConfig,
     graph_delta: &FxHashMap<u16, String>,
+    resolve_ctx: &mut crate::cross_ledger::ResolveCtx<'_>,
 ) -> std::result::Result<HashMap<GraphId, FxHashSet<Sid>>, fluree_db_transact::TransactError> {
     let snapshot = view.db();
-
-    // Build reverse map: graph SID → g_id for flake graph resolution
-    let mut sid_to_gid: HashMap<Sid, GraphId> = HashMap::new();
-    for (&g_id, iri) in graph_delta {
-        if let Some(sid) = snapshot.encode_iri(iri) {
-            sid_to_gid.insert(sid, g_id);
-        }
-    }
-    // Also include pre-existing named graphs from the registry
-    for (g_id, iri) in snapshot.graph_registry.iter_entries() {
-        if let Some(sid) = snapshot.encode_iri(iri) {
-            sid_to_gid.entry(sid).or_insert(g_id);
-        }
-    }
-
-    // Derive affected graph IDs from staged flakes (not graph_delta)
-    let mut affected_g_ids: FxHashSet<GraphId> = FxHashSet::default();
-    for flake in view.staged_flakes() {
-        if !flake.op {
-            continue;
-        }
-        let g_id = match &flake.g {
-            None => 0u16,
-            Some(g_sid) => sid_to_gid.get(g_sid).copied().unwrap_or_else(|| {
-                tracing::debug!(
-                    ?g_sid,
-                    "Staged flake with unknown graph SID — treating as default"
-                );
-                0
-            }),
-        };
-        affected_g_ids.insert(g_id);
-    }
-
+    let affected_g_ids = affected_graph_ids(view, graph_delta);
     let mut per_graph: HashMap<GraphId, FxHashSet<Sid>> = HashMap::new();
 
     for &g_id in &affected_g_ids {
@@ -590,19 +865,71 @@ async fn resolve_per_graph_unique_sids(
             None => continue,
         };
 
-        // Resolve constraint source graph IDs
-        let source_g_ids = if transact_config.constraints_sources.is_empty() {
-            // Default: annotations in the default graph (g_id=0)
-            vec![0u16]
-        } else {
-            resolve_constraint_source_g_ids(&transact_config.constraints_sources, snapshot)
-        };
-
-        // Load f:enforceUnique annotations from each source graph
+        // Split constraint sources by locality. Local sources read
+        // annotations from a graph on the data ledger; cross-ledger
+        // sources resolve via the shared cross-ledger resolver against
+        // a model ledger and translate back into D's Sid space.
         let mut unique_sids = FxHashSet::default();
-        for source_g_id in source_g_ids {
-            let annotations = read_enforce_unique_from_graph(view, source_g_id).await?;
+
+        if transact_config.constraints_sources.is_empty() {
+            // Default: annotations in the default graph (g_id=0)
+            let annotations = read_enforce_unique_from_graph(view, 0u16).await?;
             unique_sids.extend(annotations);
+        } else {
+            let mut local_sources: Vec<&fluree_db_core::ledger_config::GraphSourceRef> = Vec::new();
+            let mut cross_sources: Vec<&fluree_db_core::ledger_config::GraphSourceRef> = Vec::new();
+            for source in &transact_config.constraints_sources {
+                if source.ledger.is_some() {
+                    cross_sources.push(source);
+                } else {
+                    local_sources.push(source);
+                }
+            }
+
+            // Local: resolve to g_ids and scan.
+            if !local_sources.is_empty() {
+                let local_g_ids = resolve_constraint_source_g_ids_for(&local_sources, snapshot)?;
+                for source_g_id in local_g_ids {
+                    let annotations = read_enforce_unique_from_graph(view, source_g_id).await?;
+                    unique_sids.extend(annotations);
+                }
+            }
+
+            // Cross-ledger: materialize via the resolver, translate
+            // each property IRI back to a Sid on D.
+            for source in cross_sources {
+                let resolved = crate::cross_ledger::resolve_graph_ref(
+                    source,
+                    crate::cross_ledger::ArtifactKind::Constraints,
+                    resolve_ctx,
+                )
+                .await
+                .map_err(|e| {
+                    // Resolver errors are operator-facing and need to
+                    // fail the transaction clearly. Wrap in
+                    // TransactError::Parse so the staging pipeline can
+                    // propagate; the API layer (ApiError::Transact) is
+                    // the resulting HTTP class. The detail string
+                    // preserves the underlying CrossLedgerError display
+                    // so operators see model_ledger_id / graph_iri /
+                    // failure variant in the body.
+                    fluree_db_transact::TransactError::Parse(format!(
+                        "f:constraintsSource cross-ledger resolution failed: {e}"
+                    ))
+                })?;
+                let crate::cross_ledger::GovernanceArtifact::Constraints(wire) = &resolved.artifact
+                else {
+                    return Err(fluree_db_transact::TransactError::Parse(
+                        "cross-ledger resolver returned a non-Constraints \
+                         artifact for ArtifactKind::Constraints (bug in \
+                         resolver dispatch)"
+                            .into(),
+                    ));
+                };
+                for sid in wire.translate_to_sids(snapshot) {
+                    unique_sids.insert(sid);
+                }
+            }
         }
 
         if !unique_sids.is_empty() {
@@ -613,32 +940,67 @@ async fn resolve_per_graph_unique_sids(
     Ok(per_graph)
 }
 
-/// Resolve `GraphSourceRef` list to graph IDs.
+/// Resolve a `GraphSourceRef` list to graph IDs on the local ledger.
 ///
 /// Maps each `f:graphSelector` IRI to a concrete graph ID:
 /// - `f:defaultGraph` → 0
 /// - Named graph IRI → lookup in `GraphRegistry`
-fn resolve_constraint_source_g_ids(
-    sources: &[fluree_db_core::ledger_config::GraphSourceRef],
+///
+/// Fails closed: dropping a constraint source silently would weaken
+/// uniqueness enforcement under a misconfiguration, so unknown
+/// selectors and unsupported `GraphSourceRef` fields (`f:atT`,
+/// `f:trustPolicy`, `f:rollbackGuard`) return a parse error.
+///
+/// `f:ledger` (cross-ledger) is supported via
+/// `cross_ledger::resolve_graph_ref` and is dispatched at
+/// [`resolve_per_graph_unique_sids`]; this function sees only
+/// already-partitioned local sources and rejects `f:ledger` as a
+/// defensive guard against bypassing the partition.
+fn resolve_constraint_source_g_ids_for(
+    sources: &[&fluree_db_core::ledger_config::GraphSourceRef],
     snapshot: &fluree_db_core::LedgerSnapshot,
-) -> Vec<GraphId> {
+) -> std::result::Result<Vec<GraphId>, fluree_db_transact::TransactError> {
     let mut g_ids = Vec::new();
     for source in sources {
+        let source = *source;
+        if source.ledger.is_some() {
+            return Err(fluree_db_transact::TransactError::Parse(
+                "f:constraintsSource with cross-ledger f:ledger reference is not yet supported"
+                    .into(),
+            ));
+        }
+        if source.at_t.is_some() {
+            return Err(fluree_db_transact::TransactError::Parse(
+                "f:constraintsSource with f:atT (temporal pinning) is not yet supported".into(),
+            ));
+        }
+        if source.trust_policy.is_some() {
+            return Err(fluree_db_transact::TransactError::Parse(
+                "f:constraintsSource with f:trustPolicy is not yet supported".into(),
+            ));
+        }
+        if source.rollback_guard.is_some() {
+            return Err(fluree_db_transact::TransactError::Parse(
+                "f:constraintsSource with f:rollbackGuard is not yet supported".into(),
+            ));
+        }
+
         let g_id = match source.graph_selector.as_deref() {
             Some(iri) if iri == config_iris::DEFAULT_GRAPH => Some(0u16),
             Some(iri) => snapshot.graph_registry.graph_id_for_iri(iri),
             None => Some(0u16), // no selector → default graph
         };
-        if let Some(id) = g_id {
-            g_ids.push(id);
-        } else {
-            tracing::debug!(
-                selector = ?source.graph_selector,
-                "Constraint source graph not found in registry — skipping"
-            );
+        match g_id {
+            Some(id) => g_ids.push(id),
+            None => {
+                return Err(fluree_db_transact::TransactError::Parse(format!(
+                    "f:constraintsSource graph '{}' not found in this ledger's graph registry",
+                    source.graph_selector.as_deref().unwrap_or("<none>"),
+                )));
+            }
         }
     }
-    g_ids
+    Ok(g_ids)
 }
 
 /// Read `f:enforceUnique true` annotations from a single graph.
@@ -1154,9 +1516,11 @@ impl crate::Fluree {
             txn.graph_delta.extend(named_graph_delta);
         }
 
-        // Extract txn_meta and graph_delta before staging consumes the Txn
+        // Extract txn_meta, graph_delta, and any inline uniqueness
+        // properties before staging consumes the Txn.
         let txn_meta = txn.txn_meta.clone();
         let graph_delta = txn.graph_delta.clone();
+        let inline_unique_properties = txn.opts.unique_properties.clone();
 
         // Use external tracker if provided, otherwise fall back to limits-only tracker
         let limits_tracker;
@@ -1179,14 +1543,29 @@ impl crate::Fluree {
             options = options.with_policy(p);
         }
 
+        // Single per-tx ResolveCtx shared by every cross-ledger
+        // governance lookup (SHACL shapes, constraints, …) so the
+        // tx observes a coherent `resolved_t` per model ledger
+        // across all subsystems. `ledger_id_owned` keeps a string
+        // alive past the `ledger` move into `stage_with_config_shacl`.
+        let ledger_id_owned: String = ledger.snapshot.ledger_id.to_string();
+        let mut resolve_ctx = crate::cross_ledger::ResolveCtx::new(&ledger_id_owned, self);
+
         #[cfg(feature = "shacl")]
         let (view, ns_registry) =
-            stage_with_config_shacl(ledger, txn, ns_registry, options).await?;
+            stage_with_config_shacl(ledger, txn, ns_registry, options, &mut resolve_ctx).await?;
         #[cfg(not(feature = "shacl"))]
         let (view, ns_registry) = stage_txn(ledger, txn, ns_registry, options).await?;
 
         // Enforce uniqueness constraints (independent of shacl feature)
-        enforce_unique_after_staging(&view, &graph_delta).await?;
+        enforce_unique_after_staging(
+            &view,
+            &graph_delta,
+            &mut resolve_ctx,
+            inline_unique_properties.as_deref(),
+            &ns_registry,
+        )
+        .await?;
 
         Ok(StageResult {
             view,
@@ -1237,9 +1616,11 @@ impl crate::Fluree {
                 })?;
         }
 
-        // Extract txn_meta and graph_delta before staging consumes the Txn
+        // Extract txn_meta, graph_delta, and any inline uniqueness
+        // properties before staging consumes the Txn.
         let txn_meta = txn.txn_meta.clone();
         let graph_delta = txn.graph_delta.clone();
+        let inline_unique_properties = txn.opts.unique_properties.clone();
 
         let mut options = match index_config {
             Some(cfg) => StageOptions::new().with_index_config(cfg),
@@ -1254,14 +1635,26 @@ impl crate::Fluree {
             }
         }
 
+        // Single per-tx ResolveCtx; see comment on the matching
+        // block above for the consistency rationale.
+        let ledger_id_owned: String = ledger.snapshot.ledger_id.to_string();
+        let mut resolve_ctx = crate::cross_ledger::ResolveCtx::new(&ledger_id_owned, self);
+
         #[cfg(feature = "shacl")]
         let (view, ns_registry) =
-            stage_with_config_shacl(ledger, txn, ns_registry, options).await?;
+            stage_with_config_shacl(ledger, txn, ns_registry, options, &mut resolve_ctx).await?;
         #[cfg(not(feature = "shacl"))]
         let (view, ns_registry) = stage_txn(ledger, txn, ns_registry, options).await?;
 
         // Enforce uniqueness constraints (independent of shacl feature)
-        enforce_unique_after_staging(&view, &graph_delta).await?;
+        enforce_unique_after_staging(
+            &view,
+            &graph_delta,
+            &mut resolve_ctx,
+            inline_unique_properties.as_deref(),
+            &ns_registry,
+        )
+        .await?;
 
         Ok(StageResult {
             view,
@@ -1294,9 +1687,11 @@ impl crate::Fluree {
             .map_err(|e| TrackedErrorResponse::new(400, e.to_string(), tracker.tally()))?
         };
 
-        // Extract txn_meta and graph_delta before staging consumes the Txn
+        // Extract txn_meta, graph_delta, and any inline uniqueness
+        // properties before staging consumes the Txn.
         let txn_meta = txn.txn_meta.clone();
         let graph_delta = txn.graph_delta.clone();
+        let inline_unique_properties = txn.opts.unique_properties.clone();
 
         // Build stage options with policy and tracker
         let mut options = StageOptions::new()
@@ -1306,19 +1701,31 @@ impl crate::Fluree {
             options = options.with_index_config(cfg);
         }
 
+        // Single per-tx ResolveCtx; see comment on the matching
+        // block above for the consistency rationale.
+        let ledger_id_owned: String = ledger.snapshot.ledger_id.to_string();
+        let mut resolve_ctx = crate::cross_ledger::ResolveCtx::new(&ledger_id_owned, self);
+
         #[cfg(feature = "shacl")]
-        let (view, ns_registry) = stage_with_config_shacl(ledger, txn, ns_registry, options)
-            .await
-            .map_err(|e| TrackedErrorResponse::new(400, e.to_string(), tracker.tally()))?;
+        let (view, ns_registry) =
+            stage_with_config_shacl(ledger, txn, ns_registry, options, &mut resolve_ctx)
+                .await
+                .map_err(|e| TrackedErrorResponse::new(400, e.to_string(), tracker.tally()))?;
         #[cfg(not(feature = "shacl"))]
         let (view, ns_registry) = stage_txn(ledger, txn, ns_registry, options)
             .await
             .map_err(|e| TrackedErrorResponse::new(400, e.to_string(), tracker.tally()))?;
 
         // Enforce uniqueness constraints (independent of shacl feature)
-        enforce_unique_after_staging(&view, &graph_delta)
-            .await
-            .map_err(|e| TrackedErrorResponse::new(400, e.to_string(), tracker.tally()))?;
+        enforce_unique_after_staging(
+            &view,
+            &graph_delta,
+            &mut resolve_ctx,
+            inline_unique_properties.as_deref(),
+            &ns_registry,
+        )
+        .await
+        .map_err(|e| TrackedErrorResponse::new(400, e.to_string(), tracker.tally()))?;
 
         Ok(StageResult {
             view,
@@ -1906,6 +2313,17 @@ impl crate::Fluree {
                 graph_delta: None,
                 graph_sids: None,
                 tracker: None,
+                // Turtle insert doesn't go through the
+                // cross-ledger dispatch path today; cross-ledger
+                // SHACL on Turtle inserts can be added by calling
+                // resolve_cross_ledger_shapes_for_tx here when
+                // the use case lands.
+                cross_ledger_shapes: None,
+                staged_ns: None,
+                // Turtle insert API has no `opts.shapes` surface
+                // today — inline SHACL flows in over the JSON
+                // transaction path. Wireable later if needed.
+                inline_shape_bundle: None,
             },
         )
         .await

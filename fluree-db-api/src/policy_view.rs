@@ -152,7 +152,7 @@ pub async fn wrap_policy_view<'a>(
 ) -> Result<PolicyWrappedView<'a>> {
     let policy_graphs =
         resolve_policy_graphs_from_config(&ledger.snapshot, ledger.novelty.as_ref(), ledger.t())
-            .await;
+            .await?;
 
     let policy_ctx = policy_builder::build_policy_context_from_opts(
         &ledger.snapshot,
@@ -177,7 +177,8 @@ pub async fn wrap_policy_view_historical<'a>(
     view: &'a HistoricalLedgerView,
     opts: &QueryConnectionOptions,
 ) -> Result<PolicyWrappedView<'a>> {
-    let policy_graphs = resolve_policy_graphs_from_config(&view.snapshot, view, view.to_t()).await;
+    let policy_graphs =
+        resolve_policy_graphs_from_config(&view.snapshot, view, view.to_t()).await?;
 
     // Extract novelty from the view for stats computation (needed for f:onClass)
     let novelty_for_stats: Option<&Novelty> = view.overlay().map(std::convert::AsRef::as_ref);
@@ -218,7 +219,7 @@ pub async fn build_policy_context(
     to_t: i64,
     opts: &QueryConnectionOptions,
 ) -> Result<PolicyContext> {
-    let policy_graphs = resolve_policy_graphs_from_config(snapshot, overlay, to_t).await;
+    let policy_graphs = resolve_policy_graphs_from_config(snapshot, overlay, to_t).await?;
 
     policy_builder::build_policy_context_from_opts(
         snapshot,
@@ -262,28 +263,33 @@ pub async fn wrap_identity_policy_view<'a>(
 
 /// Read the config graph and resolve `f:policySource` to graph IDs.
 ///
-/// Returns `[0]` (default graph) if the config graph is empty, unreadable,
-/// or doesn't specify a policy source.
+/// Fails closed: if a config exists but cannot be loaded, or if a configured
+/// `f:policySource` cannot be resolved (unknown graph selector, unsupported
+/// cross-ledger / temporal / trust fields), the error is propagated instead
+/// of silently falling back to the default graph.
+///
+/// Returns `[0]` (default graph) only when no config has been written to the
+/// ledger yet (`Ok(None)`) or no `f:policySource` is configured — in both
+/// cases the caller's policy rules, if any, live in the default graph.
 async fn resolve_policy_graphs_from_config(
     snapshot: &LedgerSnapshot,
     overlay: &dyn OverlayProvider,
     to_t: i64,
-) -> Vec<fluree_db_core::GraphId> {
+) -> Result<Vec<fluree_db_core::GraphId>> {
     let config = match crate::config_resolver::resolve_ledger_config(snapshot, overlay, to_t).await
     {
         Ok(Some(c)) => c,
-        _ => return vec![0],
+        Ok(None) => return Ok(vec![0]),
+        Err(e) => {
+            return Err(crate::error::ApiError::config(format!(
+                "Failed to load ledger config while resolving f:policySource: {e}"
+            )));
+        }
     };
     let resolved = crate::config_resolver::resolve_effective_config(&config, None);
     let source = resolved
         .policy
         .as_ref()
         .and_then(|p| p.policy_source.as_ref());
-    match policy_builder::resolve_policy_source_g_ids(source, snapshot) {
-        Ok(g_ids) => g_ids,
-        Err(e) => {
-            tracing::warn!(error = %e, "Failed to resolve f:policySource — using default graph");
-            vec![0]
-        }
-    }
+    policy_builder::resolve_policy_source_g_ids(source, snapshot)
 }

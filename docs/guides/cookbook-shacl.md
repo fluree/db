@@ -339,6 +339,72 @@ Semantics:
 - `f:shapesSource` is **authoritative, not additive**: when set, shapes come exclusively from the configured graph. Shapes in the default graph are ignored.
 - `f:shapesSource` is **non-overridable** — it can only be set in the config graph, not via transaction/query-time options.
 - Use `f:graphSelector f:defaultGraph` to explicitly point at the default graph (same as omitting `f:shapesSource`).
+- `f:shapesSource` also supports **cross-ledger references** — set `f:ledger` on the inner `f:graphSource` to compile shapes from a different ledger at validation time. See [Cross-ledger governance — Cross-ledger SHACL shapes](../security/cross-ledger-policy.md#cross-ledger-shacl-shapes) for the end-to-end pattern.
+
+## Inline shapes per transaction
+
+In addition to shapes stored in a ledger, a transaction can supply
+**inline shapes** via the `opts.shapes` field. The shapes are
+enforced only for that one transaction and never written into the
+ledger.
+
+```json
+{
+  "@context": {"ex": "http://example.org/ns/"},
+  "@id":   "ex:alice",
+  "@type": "ex:Person",
+  "opts": {
+    "shapes": {
+      "@context": {
+        "ex":  "http://example.org/ns/",
+        "sh":  "http://www.w3.org/ns/shacl#",
+        "xsd": "http://www.w3.org/2001/XMLSchema#"
+      },
+      "@graph": [
+        {
+          "@id":            "ex:PersonShape",
+          "@type":          "sh:NodeShape",
+          "sh:targetClass": {"@id": "ex:Person"},
+          "sh:property":    {"@id": "ex:pshape_name"}
+        },
+        {
+          "@id":         "ex:pshape_name",
+          "sh:path":     {"@id": "ex:name"},
+          "sh:minCount": 1,
+          "sh:datatype": {"@id": "xsd:string"}
+        }
+      ]
+    }
+  }
+}
+```
+
+Semantics:
+
+- **Additive with the configured source.** Inline shapes enforce
+  *alongside* whatever `f:shapesSource` resolves to. A subject
+  must satisfy every shape from both sources. Note that
+  `f:shapesSource` is itself singular — its `f:graphSource` is
+  either local (no `f:ledger`) or cross-ledger (with `f:ledger`),
+  not both at the same time. Inline shapes don't change that;
+  they layer on top of whichever variant is configured.
+- **Transient.** The shapes never appear in the ledger's data and
+  vanish after the transaction completes. The next transaction
+  without `opts.shapes` runs without them.
+- **Gated by config.** If `f:shaclEnabled false` (or no graph is
+  enabled), inline shapes do not bypass that posture — operator
+  config wins. To use inline shapes on a fresh ledger with no
+  config, the shapes-exist heuristic enables validation
+  automatically.
+- **No audit trail.** Because inline shapes don't persist, it
+  isn't possible to reconstruct "which shapes validated which
+  commit" from ledger history. If auditability matters, store
+  shapes in a `f:shapesSource` graph instead.
+
+Use cases that fit well: ad-hoc shape testing before committing
+to `f:shapesSource`, per-tenant validation layers in an
+application server, request-scoped governance that should not
+become part of permanent ledger state.
 
 ## Validation modes
 

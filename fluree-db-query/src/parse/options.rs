@@ -477,11 +477,12 @@ fn rewrite_having_aggregates(
 pub fn parse_reasoning(
     obj: &serde_json::Map<String, JsonValue>,
 ) -> Result<Option<crate::ir::ReasoningModes>> {
-    // Check if either reasoning or rules is present
+    // Check if reasoning, rules, or ontology is present.
     let has_reasoning = obj.contains_key("reasoning");
     let has_rules = obj.contains_key("rules");
+    let has_ontology = obj.contains_key("ontology");
 
-    if !has_reasoning && !has_rules {
+    if !has_reasoning && !has_rules && !has_ontology {
         return Ok(None);
     }
 

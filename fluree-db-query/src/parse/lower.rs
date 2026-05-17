@@ -1704,6 +1704,7 @@ fn lower_options(opts: &UnresolvedOptions) -> ReasoningConfig {
     ReasoningConfig {
         modes: opts.reasoning.clone().unwrap_or_default(),
         schema_bundle: None,
+        rules_source_g_id: None,
     }
 }
 

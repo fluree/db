@@ -76,6 +76,7 @@
   - [Index format](design/index-format.md)
   - [Namespace allocation and fallback modes](design/namespace-allocation.md)
   - [Ontology imports (`f:schemaSource` + `owl:imports`)](design/ontology-imports.md)
+  - [Cross-ledger model enforcement](design/cross-ledger-model-enforcement.md)
   - [Storage traits](design/storage-traits.md)
 
 - [HTTP API (fluree-db-server)](api/README.md)
@@ -123,6 +124,7 @@
   - [Policy in queries](security/policy-in-queries.md)
   - [Policy in transactions](security/policy-in-transactions.md)
   - [Programmatic policy API (Rust)](security/programmatic-policy.md)
+  - [Cross-ledger governance](security/cross-ledger-policy.md)
 
 - [Indexing and search](indexing-and-search/README.md)
   - [Background indexing](indexing-and-search/background-indexing.md)
