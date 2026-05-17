@@ -179,6 +179,7 @@ async fn s3_testcontainers_basic_test() {
             max_retries: None,
             retry_base_delay_ms: None,
             retry_max_delay_ms: None,
+            max_concurrent_requests: None,
         },
     )
     .await
@@ -274,6 +275,7 @@ async fn s3_testcontainers_indexing_test() {
             max_retries: None,
             retry_base_delay_ms: None,
             retry_max_delay_ms: None,
+            max_concurrent_requests: None,
         },
     )
     .await
@@ -407,6 +409,7 @@ async fn s3_testcontainers_hard_drop_clears_ledger() {
             max_retries: None,
             retry_base_delay_ms: None,
             retry_max_delay_ms: None,
+            max_concurrent_requests: None,
         },
     )
     .await

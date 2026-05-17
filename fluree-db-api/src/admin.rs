@@ -1188,6 +1188,7 @@ impl crate::Fluree {
         let gc_config = CleanGarbageConfig {
             max_old_indexes: Some(gc_max_old_indexes),
             min_time_garbage_mins: Some(gc_min_time_mins),
+            ..Default::default()
         };
         tokio::spawn(async move {
             if let Err(e) = clean_garbage(gc_store.as_ref(), &gc_root_id, gc_config).await {

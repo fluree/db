@@ -1714,11 +1714,21 @@ pub async fn incremental_index(
 
         // Load prior sketches from the base root's sketch_ref (if present).
         let prior_properties = if let Some(ref cid) = base_root.sketch_ref {
-            match stats::load_sketch_blob(content_store.as_ref(), cid).await {
-                Ok(Some(blob)) => match blob.into_properties() {
+            match fetch_cached_index_bytes(
+                content_store.as_ref(),
+                cid,
+                &cache_dir,
+                format!("sketch blob {cid}"),
+            )
+            .await
+            {
+                Ok(bytes) => match stats::HllSketchBlob::from_json_bytes(&bytes)
+                    .and_then(stats::HllSketchBlob::into_properties)
+                {
                     Ok(props) => {
                         tracing::debug!(
                             entries = props.len(),
+                            bytes = bytes.len(),
                             "loaded prior HLL sketches for incremental refresh"
                         );
                         props
@@ -1728,7 +1738,7 @@ pub async fn incremental_index(
                         std::collections::HashMap::new()
                     }
                 },
-                Ok(None) => {
+                Err(IndexerError::StorageRead(e)) if e.contains("not found") => {
                     tracing::debug!(
                         "sketch blob CID present but content not found, starting fresh"
                     );
@@ -2225,12 +2235,26 @@ pub async fn incremental_index(
 
                 // Build property attribution for each class entry.
                 let property_merge_started = Instant::now();
+                tracing::debug!(
+                    total_entries = entries_by_key.len(),
+                    classes_with_properties = class_properties.len(),
+                    class_prop_dts = class_prop_dts.len(),
+                    class_prop_lang_deltas = class_prop_lang_deltas.len(),
+                    classes_with_ref_edges = ref_edges.len(),
+                    "Phase 3b: property attribution merge starting"
+                );
                 let ref_class_sid_lookups = AtomicUsize::new(0usize);
                 let ref_class_sid_hits = AtomicUsize::new(0usize);
                 let mut merged_class_entries = 0usize;
                 let total_class_entries = entries_by_key.len();
+                let mut visited_class_entries = 0usize;
+                let mut last_property_merge_log = Instant::now();
                 for (&(g_id, class_sid64), entry) in &mut entries_by_key {
+                    visited_class_entries += 1;
                     if let Some(props) = class_properties.get(&(g_id, class_sid64)) {
+                        let class_merge_started = Instant::now();
+                        let existing_property_count = entry.properties.len();
+                        let novelty_property_count = props.len();
                         let class_dts = class_prop_dts.get(&(g_id, class_sid64));
                         let class_refs = ref_edges.get(&(g_id, class_sid64));
                         let class_langs = class_prop_lang_deltas.get(&(g_id, class_sid64));
@@ -2385,6 +2409,20 @@ pub async fn incremental_index(
                             })
                             .collect();
                         merged_class_entries += 1;
+                        let class_merge_ms = class_merge_started.elapsed().as_millis() as u64;
+                        if class_merge_ms >= 1_000 {
+                            tracing::debug!(
+                                g_id,
+                                class_sid64,
+                                existing_property_count,
+                                novelty_property_count,
+                                merged_properties = entry.properties.len(),
+                                class_merge_ms,
+                                visited_class_entries,
+                                total_entries = total_class_entries,
+                                "Phase 3b: slow class property attribution merge"
+                            );
+                        }
                     }
                     // Resolve class SID if still placeholder.
                     if entry.class_sid.name.is_empty() && entry.class_sid.namespace_code == 0 {
@@ -2406,6 +2444,22 @@ pub async fn incremental_index(
                             elapsed_ms = property_merge_started.elapsed().as_millis() as u64,
                             "Phase 3b: property attribution merge progress"
                         );
+                        last_property_merge_log = Instant::now();
+                    } else if last_property_merge_log.elapsed() >= std::time::Duration::from_secs(5)
+                    {
+                        tracing::debug!(
+                            visited_class_entries,
+                            merged_class_entries,
+                            total_entries = total_class_entries,
+                            ref_class_sid_lookups = ref_class_sid_lookups.load(Ordering::Relaxed),
+                            ref_class_sid_hits = ref_class_sid_hits.load(Ordering::Relaxed),
+                            resolve_class_sid_calls =
+                                resolve_class_sid_calls.load(Ordering::Relaxed),
+                            phase_elapsed_ms = phase3b_started.elapsed().as_millis() as u64,
+                            elapsed_ms = property_merge_started.elapsed().as_millis() as u64,
+                            "Phase 3b: property attribution merge still running"
+                        );
+                        last_property_merge_log = Instant::now();
                     }
                 }
                 tracing::debug!(
@@ -2473,6 +2527,7 @@ pub async fn incremental_index(
         use crate::stats::SchemaExtractor;
         use fluree_db_core::o_type::OType;
         use fluree_db_core::{Flake, FlakeValue, Sid};
+        let phase3c_started = Instant::now();
 
         let rdfs_subclass_iri = format!("{}subClassOf", fluree_vocab::rdfs::NS);
         let rdfs_subprop_iri = format!("{}subPropertyOf", fluree_vocab::rdfs::NS);
@@ -2487,6 +2542,12 @@ pub async fn incremental_index(
         });
 
         if has_schema_records {
+            tracing::debug!(
+                subclass_p_id,
+                subprop_p_id,
+                novelty_records = novelty.records.len(),
+                "Phase 3c: incremental V6 schema refresh starting"
+            );
             match fluree_db_binary_index::read::binary_index_store::BinaryIndexStore::load_from_root_v6(
                 content_store.clone(),
                 base_root,
@@ -2558,7 +2619,10 @@ pub async fn incremental_index(
 
                     let updated_schema = extractor.finalize(novelty.max_t);
                     root_builder.set_schema(updated_schema);
-                    tracing::debug!("Phase 3c: incremental V6 schema refreshed");
+                    tracing::debug!(
+                        elapsed_ms = phase3c_started.elapsed().as_millis() as u64,
+                        "Phase 3c: incremental V6 schema refreshed"
+                    );
                 }
                 Err(e) => {
                     tracing::warn!(
@@ -2568,16 +2632,33 @@ pub async fn incremental_index(
                     );
                 }
             }
+        } else {
+            tracing::debug!(
+                elapsed_ms = phase3c_started.elapsed().as_millis() as u64,
+                "Phase 3c: no schema records in novelty; carrying forward base schema"
+            );
         }
     }
 
     // ---- Phase 4: Root assembly ----
+    let phase4_started = Instant::now();
+    tracing::debug!(
+        base_index_t = base_root.index_t,
+        new_index_t = novelty.max_t,
+        total_new_leaves,
+        "Phase 4: incremental root assembly starting"
+    );
     root_builder.set_prev_index(Some(BinaryPrevIndexRef {
         t: base_root.index_t,
         id: base_root_id.clone(),
     }));
 
     let (new_root, replaced_cids) = root_builder.build();
+    tracing::debug!(
+        replaced_cids = replaced_cids.len(),
+        elapsed_ms = phase4_started.elapsed().as_millis() as u64,
+        "Phase 4: root builder finalized"
+    );
 
     // Write garbage manifest.
     if !replaced_cids.is_empty() {
@@ -2585,6 +2666,12 @@ pub async fn incremental_index(
             .iter()
             .map(std::string::ToString::to_string)
             .collect();
+        let garbage_write_started = Instant::now();
+        tracing::debug!(
+            replaced_cids = garbage_strings.len(),
+            index_t = new_root.index_t,
+            "Phase 4: writing garbage record"
+        );
         let garbage_cid = gc::write_garbage_record(
             content_store.as_ref(),
             ledger_id,
@@ -2593,6 +2680,11 @@ pub async fn incremental_index(
         )
         .await
         .map_err(|e| IndexerError::StorageWrite(e.to_string()))?;
+        tracing::debug!(
+            %garbage_cid,
+            elapsed_ms = garbage_write_started.elapsed().as_millis() as u64,
+            "Phase 4: garbage record written"
+        );
 
         // Set garbage on the root before encoding.
         let mut final_root = new_root;
@@ -2607,7 +2699,19 @@ pub async fn incremental_index(
             final_root.index_t,
         )?;
 
+        let root_encode_started = Instant::now();
         let root_bytes = final_root.encode();
+        tracing::debug!(
+            bytes = root_bytes.len(),
+            elapsed_ms = root_encode_started.elapsed().as_millis() as u64,
+            "Phase 4: encoded incremental index root"
+        );
+        let root_write_started = Instant::now();
+        tracing::debug!(
+            bytes = root_bytes.len(),
+            index_t = final_root.index_t,
+            "Phase 4: writing incremental index root"
+        );
         let root_id = content_store
             .put(ContentKind::IndexRoot, &root_bytes)
             .await
@@ -2619,6 +2723,8 @@ pub async fn incremental_index(
             index_t = final_root.index_t,
             replaced = replaced_cids.len(),
             new_leaves = total_new_leaves,
+            root_write_ms = root_write_started.elapsed().as_millis() as u64,
+            phase4_elapsed_ms = phase4_started.elapsed().as_millis() as u64,
             "V6 incremental index root published"
         );
 
@@ -2644,7 +2750,19 @@ pub async fn incremental_index(
             &novelty.shared.ns_prefixes,
             final_root.index_t,
         )?;
+        let root_encode_started = Instant::now();
         let root_bytes = final_root.encode();
+        tracing::debug!(
+            bytes = root_bytes.len(),
+            elapsed_ms = root_encode_started.elapsed().as_millis() as u64,
+            "Phase 4: encoded incremental index root"
+        );
+        let root_write_started = Instant::now();
+        tracing::debug!(
+            bytes = root_bytes.len(),
+            index_t = final_root.index_t,
+            "Phase 4: writing incremental index root"
+        );
         let root_id = content_store
             .put(ContentKind::IndexRoot, &root_bytes)
             .await
@@ -2655,6 +2773,8 @@ pub async fn incremental_index(
             %root_id,
             index_t = final_root.index_t,
             new_leaves = total_new_leaves,
+            root_write_ms = root_write_started.elapsed().as_millis() as u64,
+            phase4_elapsed_ms = phase4_started.elapsed().as_millis() as u64,
             "V6 incremental index root published (no garbage)"
         );
 

@@ -40,6 +40,7 @@ pub use record::GarbageRecord;
 
 use crate::error::Result;
 use fluree_db_core::{ContentId, ContentKind, ContentStore};
+use std::path::PathBuf;
 
 /// Default maximum number of old indexes to retain
 pub const DEFAULT_MAX_OLD_INDEXES: u32 = 5;
@@ -58,6 +59,8 @@ pub struct CleanGarbageConfig {
     ///
     /// Garbage records must be at least this old before their nodes can be deleted.
     pub min_time_garbage_mins: Option<u32>,
+    /// Optional disk artifact cache for root and garbage-record reads.
+    pub artifact_cache_dir: Option<PathBuf>,
 }
 
 /// Result of garbage collection

@@ -1047,6 +1047,15 @@ impl BackgroundIndexerWorker {
                     let gc_config = crate::gc::CleanGarbageConfig {
                         max_old_indexes: Some(self.config.gc_max_old_indexes),
                         min_time_garbage_mins: Some(self.config.gc_min_time_mins),
+                        artifact_cache_dir: Some(
+                            self.config
+                                .data_dir
+                                .as_ref()
+                                .map(|d| d.join("binary_artifact_cache"))
+                                .unwrap_or_else(|| {
+                                    std::env::temp_dir().join("fluree_binary_cache")
+                                }),
+                        ),
                     };
                     tokio::spawn(async move {
                         if let Err(e) =

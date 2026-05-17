@@ -20,9 +20,10 @@
 //!
 //! ## Timeout Configuration
 //!
-//! The `timeout_ms` setting controls the total operation timeout, which **includes
-//! SDK retry time**. For Lambda environments, ensure this value accounts for your
-//! function's remaining execution time.
+//! The `timeout_ms` setting bounds each S3 request send and response-body
+//! collection. The SDK operation timeout applied to sends includes SDK retry
+//! time. For Lambda environments, ensure this value accounts for your function's
+//! remaining execution time.
 
 pub mod address;
 
@@ -40,7 +41,11 @@ use fluree_db_core::{
     StorageExtResult, StorageList, StorageRead, StorageWrite,
 };
 use std::fmt::Debug;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
+
+const DEFAULT_MAX_CONCURRENT_REQUESTS: usize = 32;
 
 /// S3 storage configuration
 #[derive(Debug, Clone, Default)]
@@ -59,6 +64,11 @@ pub struct S3Config {
     pub retry_base_delay_ms: Option<u64>,
     /// Max backoff for retries in milliseconds
     pub retry_max_delay_ms: Option<u64>,
+    /// Maximum concurrent S3 SDK operations per storage instance.
+    ///
+    /// This bounds in-flight reads/writes/deletes so retry storms cannot create
+    /// an unbounded queue inside the SDK HTTP layer.
+    pub max_concurrent_requests: Option<usize>,
 }
 
 /// S3-based storage backend
@@ -78,6 +88,9 @@ pub struct S3Storage {
     prefix: Option<String>,
     /// Per-request send timeout (from `S3Config::timeout_ms`, or default 35s)
     send_timeout: Duration,
+    /// Storage-level bulkhead for all S3 SDK operations from this instance.
+    request_semaphore: Arc<Semaphore>,
+    max_concurrent_requests: usize,
 }
 
 impl Debug for S3Storage {
@@ -86,6 +99,7 @@ impl Debug for S3Storage {
             .field("bucket", &self.bucket)
             .field("prefix", &self.prefix)
             .field("is_express", &Self::is_express_bucket(&self.bucket))
+            .field("max_concurrent_requests", &self.max_concurrent_requests)
             .finish()
     }
 }
@@ -109,6 +123,7 @@ impl S3Storage {
     ///     bucket: "my-bucket".to_string(),
     ///     prefix: Some("data".to_string()),
     ///     timeout_ms: Some(30000),
+    ///     ..Default::default()
     /// };
     /// let storage = S3Storage::new(&sdk_config, s3_config).await?;
     /// ```
@@ -161,12 +176,18 @@ impl S3Storage {
             .timeout_ms
             .map(Duration::from_millis)
             .unwrap_or(Duration::from_secs(35));
+        let max_concurrent_requests = config
+            .max_concurrent_requests
+            .unwrap_or(DEFAULT_MAX_CONCURRENT_REQUESTS)
+            .max(1);
 
         Ok(Self {
             client,
             bucket: config.bucket,
             prefix: config.prefix,
             send_timeout,
+            request_semaphore: Arc::new(Semaphore::new(max_concurrent_requests)),
+            max_concurrent_requests,
         })
     }
 
@@ -177,6 +198,8 @@ impl S3Storage {
             bucket,
             prefix,
             send_timeout: Duration::from_secs(35),
+            request_semaphore: Arc::new(Semaphore::new(DEFAULT_MAX_CONCURRENT_REQUESTS)),
+            max_concurrent_requests: DEFAULT_MAX_CONCURRENT_REQUESTS,
         }
     }
 
@@ -221,6 +244,24 @@ impl S3Storage {
         self.prefix.as_deref()
     }
 
+    async fn acquire_request_permit_core(
+        &self,
+    ) -> std::result::Result<OwnedSemaphorePermit, CoreError> {
+        self.request_semaphore
+            .clone()
+            .acquire_owned()
+            .await
+            .map_err(|_| CoreError::io("S3 request limiter closed"))
+    }
+
+    async fn acquire_request_permit_ext(&self) -> StorageExtResult<OwnedSemaphorePermit> {
+        self.request_semaphore
+            .clone()
+            .acquire_owned()
+            .await
+            .map_err(|_| StorageExtError::io("S3 request limiter closed"))
+    }
+
     /// Convert a Fluree address to an S3 key
     fn to_key(&self, address: &str) -> std::result::Result<String, CoreError> {
         address_to_key(address, self.prefix.as_deref())
@@ -241,6 +282,7 @@ impl StorageRead for S3Storage {
 
         let send_timeout = self.send_timeout;
         let key = self.to_key(address)?;
+        let permit = self.acquire_request_permit_core().await?;
         let total_started = Instant::now();
 
         let send_started = Instant::now();
@@ -280,13 +322,27 @@ impl StorageRead for S3Storage {
         }
 
         let body_collect_started = Instant::now();
-        let bytes = response
-            .body
-            .collect()
-            .await
-            .map_err(|e| CoreError::io(format!("Failed to read S3 body: {e}")))?
-            .into_bytes()
-            .to_vec();
+        let bytes = match tokio::time::timeout(send_timeout, response.body.collect()).await {
+            Ok(Ok(body)) => body.into_bytes().to_vec(),
+            Ok(Err(e)) => return Err(CoreError::io(format!("Failed to read S3 body: {e}"))),
+            Err(_) => {
+                let body_collect_elapsed_ms = body_collect_started.elapsed().as_millis() as u64;
+                tracing::error!(
+                    bucket = self.bucket.as_str(),
+                    key = key.as_str(),
+                    address,
+                    body_collect_elapsed_ms,
+                    timeout_ms = send_timeout.as_millis() as u64,
+                    is_express = Self::is_express_bucket(&self.bucket),
+                    "s3 read_bytes: body collect timed out"
+                );
+                return Err(CoreError::io(format!(
+                    "S3 GetObject body timed out after {} ms for {}",
+                    send_timeout.as_millis(),
+                    key
+                )));
+            }
+        };
         let body_collect_elapsed_ms = body_collect_started.elapsed().as_millis() as u64;
         let total_elapsed_ms = total_started.elapsed().as_millis() as u64;
 
@@ -303,6 +359,7 @@ impl StorageRead for S3Storage {
             );
         }
 
+        drop(permit);
         Ok(bytes)
     }
 
@@ -311,44 +368,129 @@ impl StorageRead for S3Storage {
         address: &str,
         range: std::ops::Range<u64>,
     ) -> std::result::Result<Vec<u8>, CoreError> {
+        const SLOW_S3_RANGE_SEND_WARN_MS: u64 = 1_000;
+        const SLOW_S3_RANGE_BODY_WARN_MS: u64 = 5_000;
+
         if range.start >= range.end {
             return Ok(Vec::new());
         }
         let key = self.to_key(address)?;
         let range_header = format!("bytes={}-{}", range.start, range.end - 1);
+        let send_timeout = self.send_timeout;
+        let permit = self.acquire_request_permit_core().await?;
+        let total_started = Instant::now();
+        let send_started = Instant::now();
 
-        let response = self
+        let request = self
             .client
             .get_object()
             .bucket(&self.bucket)
             .key(&key)
-            .range(range_header)
-            .send()
-            .await
-            .map_err(|e| map_s3_error_core(e, &key))?;
+            .range(range_header.clone());
 
-        let bytes = response
-            .body
-            .collect()
-            .await
-            .map_err(|e| CoreError::io(format!("Failed to read S3 body: {e}")))?
-            .into_bytes()
-            .to_vec();
+        let response = match tokio::time::timeout(send_timeout, request.send()).await {
+            Ok(Ok(response)) => response,
+            Ok(Err(e)) => return Err(map_s3_error_core(e, &key)),
+            Err(_) => {
+                let send_elapsed_ms = send_started.elapsed().as_millis() as u64;
+                tracing::error!(
+                    bucket = self.bucket.as_str(),
+                    key = key.as_str(),
+                    address,
+                    range = range_header.as_str(),
+                    send_elapsed_ms,
+                    timeout_ms = send_timeout.as_millis() as u64,
+                    is_express = Self::is_express_bucket(&self.bucket),
+                    "s3 read_byte_range: get_object send timed out"
+                );
+                return Err(CoreError::io(format!(
+                    "S3 ranged GetObject timed out after {} ms for {}",
+                    send_timeout.as_millis(),
+                    key
+                )));
+            }
+        };
+        let send_elapsed_ms = send_started.elapsed().as_millis() as u64;
 
+        if send_elapsed_ms >= SLOW_S3_RANGE_SEND_WARN_MS {
+            tracing::debug!(
+                bucket = self.bucket.as_str(),
+                key = key.as_str(),
+                address,
+                range = range_header.as_str(),
+                send_elapsed_ms,
+                is_express = Self::is_express_bucket(&self.bucket),
+                "s3 read_byte_range: slow get_object send"
+            );
+        }
+
+        let body_started = Instant::now();
+        let bytes = match tokio::time::timeout(send_timeout, response.body.collect()).await {
+            Ok(Ok(body)) => body.into_bytes().to_vec(),
+            Ok(Err(e)) => return Err(CoreError::io(format!("Failed to read S3 body: {e}"))),
+            Err(_) => {
+                let body_elapsed_ms = body_started.elapsed().as_millis() as u64;
+                tracing::error!(
+                    bucket = self.bucket.as_str(),
+                    key = key.as_str(),
+                    address,
+                    range = range_header.as_str(),
+                    body_elapsed_ms,
+                    timeout_ms = send_timeout.as_millis() as u64,
+                    is_express = Self::is_express_bucket(&self.bucket),
+                    "s3 read_byte_range: body collect timed out"
+                );
+                return Err(CoreError::io(format!(
+                    "S3 ranged GetObject body timed out after {} ms for {}",
+                    send_timeout.as_millis(),
+                    key
+                )));
+            }
+        };
+        let body_elapsed_ms = body_started.elapsed().as_millis() as u64;
+        if body_elapsed_ms >= SLOW_S3_RANGE_BODY_WARN_MS {
+            tracing::debug!(
+                bucket = self.bucket.as_str(),
+                key = key.as_str(),
+                address,
+                range = range_header.as_str(),
+                body_bytes = bytes.len(),
+                body_elapsed_ms,
+                total_elapsed_ms = total_started.elapsed().as_millis() as u64,
+                is_express = Self::is_express_bucket(&self.bucket),
+                "s3 read_byte_range: slow body collect"
+            );
+        }
+
+        drop(permit);
         Ok(bytes)
     }
 
     async fn exists(&self, address: &str) -> std::result::Result<bool, CoreError> {
         let key = self.to_key(address)?;
+        let permit = self.acquire_request_permit_core().await?;
 
-        match self
-            .client
-            .head_object()
-            .bucket(&self.bucket)
-            .key(&key)
-            .send()
-            .await
-        {
+        let request = self.client.head_object().bucket(&self.bucket).key(&key);
+
+        let result = match tokio::time::timeout(self.send_timeout, request.send()).await {
+            Ok(result) => result,
+            Err(_) => {
+                tracing::error!(
+                    bucket = self.bucket.as_str(),
+                    key = key.as_str(),
+                    address,
+                    timeout_ms = self.send_timeout.as_millis() as u64,
+                    is_express = Self::is_express_bucket(&self.bucket),
+                    "s3 exists: head_object timed out"
+                );
+                return Err(CoreError::io(format!(
+                    "S3 HeadObject timed out after {} ms for {}",
+                    self.send_timeout.as_millis(),
+                    key
+                )));
+            }
+        };
+        let exists = match result {
             Ok(_) => Ok(true),
             Err(e) => {
                 // Pattern match on SdkError to avoid panic from into_service_error()
@@ -366,7 +508,9 @@ impl StorageRead for S3Storage {
                     _ => Err(map_s3_error_core(e, &key)),
                 }
             }
-        }
+        }?;
+        drop(permit);
+        Ok(exists)
     }
 
     async fn list_prefix(&self, prefix: &str) -> std::result::Result<Vec<String>, CoreError> {
@@ -397,10 +541,26 @@ impl StorageRead for S3Storage {
                 request = request.continuation_token(token);
             }
 
-            let response = request
-                .send()
-                .await
-                .map_err(|e| map_s3_error_core(e, &full_prefix))?;
+            let permit = self.acquire_request_permit_core().await?;
+            let response = match tokio::time::timeout(self.send_timeout, request.send()).await {
+                Ok(Ok(response)) => response,
+                Ok(Err(e)) => return Err(map_s3_error_core(e, &full_prefix)),
+                Err(_) => {
+                    tracing::error!(
+                        bucket = self.bucket.as_str(),
+                        prefix = full_prefix.as_str(),
+                        timeout_ms = self.send_timeout.as_millis() as u64,
+                        is_express = Self::is_express_bucket(&self.bucket),
+                        "s3 list_prefix_with_metadata: list_objects_v2 timed out"
+                    );
+                    return Err(CoreError::io(format!(
+                        "S3 ListObjectsV2 timed out after {} ms for {}",
+                        self.send_timeout.as_millis(),
+                        full_prefix
+                    )));
+                }
+            };
+            drop(permit);
 
             for object in response.contents() {
                 if let Some(key) = object.key() {
@@ -425,17 +585,57 @@ impl StorageRead for S3Storage {
 #[async_trait]
 impl StorageWrite for S3Storage {
     async fn write_bytes(&self, address: &str, bytes: &[u8]) -> std::result::Result<(), CoreError> {
-        let key = self.to_key(address)?;
+        const SLOW_S3_PUT_WARN_MS: u64 = 1_000;
 
-        self.client
+        let key = self.to_key(address)?;
+        let send_timeout = self.send_timeout;
+        let permit = self.acquire_request_permit_core().await?;
+        let started = Instant::now();
+
+        let request = self
+            .client
             .put_object()
             .bucket(&self.bucket)
             .key(&key)
-            .body(ByteStream::from(bytes.to_vec()))
-            .send()
-            .await
-            .map_err(|e| map_s3_error_core(e, &key))?;
+            .body(ByteStream::from(bytes.to_vec()));
 
+        match tokio::time::timeout(send_timeout, request.send()).await {
+            Ok(Ok(_)) => {}
+            Ok(Err(e)) => return Err(map_s3_error_core(e, &key)),
+            Err(_) => {
+                let elapsed_ms = started.elapsed().as_millis() as u64;
+                tracing::error!(
+                    bucket = self.bucket.as_str(),
+                    key = key.as_str(),
+                    address,
+                    bytes = bytes.len(),
+                    elapsed_ms,
+                    timeout_ms = send_timeout.as_millis() as u64,
+                    is_express = Self::is_express_bucket(&self.bucket),
+                    "s3 write_bytes: put_object timed out"
+                );
+                return Err(CoreError::io(format!(
+                    "S3 PutObject timed out after {} ms for {}",
+                    send_timeout.as_millis(),
+                    key
+                )));
+            }
+        }
+
+        let elapsed_ms = started.elapsed().as_millis() as u64;
+        if elapsed_ms >= SLOW_S3_PUT_WARN_MS {
+            tracing::debug!(
+                bucket = self.bucket.as_str(),
+                key = key.as_str(),
+                address,
+                bytes = bytes.len(),
+                elapsed_ms,
+                is_express = Self::is_express_bucket(&self.bucket),
+                "s3 write_bytes: slow put_object"
+            );
+        }
+
+        drop(permit);
         Ok(())
     }
 
@@ -493,17 +693,51 @@ impl ContentAddressedWrite for S3Storage {
 #[async_trait]
 impl StorageDelete for S3Storage {
     async fn delete(&self, address: &str) -> StorageExtResult<()> {
+        const SLOW_S3_DELETE_WARN_MS: u64 = 1_000;
+
         let key = address_to_key(address, self.prefix.as_deref())
             .map_err(|e| StorageExtError::io(format!("Invalid address: {e}")))?;
+        let send_timeout = self.send_timeout;
+        let permit = self.acquire_request_permit_ext().await?;
+        let started = Instant::now();
 
-        self.client
-            .delete_object()
-            .bucket(&self.bucket)
-            .key(&key)
-            .send()
-            .await
-            .map_err(|e| map_s3_error_ext(e, &key))?;
+        let request = self.client.delete_object().bucket(&self.bucket).key(&key);
 
+        match tokio::time::timeout(send_timeout, request.send()).await {
+            Ok(Ok(_)) => {}
+            Ok(Err(e)) => return Err(map_s3_error_ext(e, &key)),
+            Err(_) => {
+                let elapsed_ms = started.elapsed().as_millis() as u64;
+                tracing::error!(
+                    bucket = self.bucket.as_str(),
+                    key = key.as_str(),
+                    address,
+                    elapsed_ms,
+                    timeout_ms = send_timeout.as_millis() as u64,
+                    is_express = Self::is_express_bucket(&self.bucket),
+                    "s3 delete: delete_object timed out"
+                );
+                return Err(StorageExtError::io(format!(
+                    "S3 DeleteObject timed out after {} ms for {}",
+                    send_timeout.as_millis(),
+                    key
+                )));
+            }
+        }
+
+        let elapsed_ms = started.elapsed().as_millis() as u64;
+        if elapsed_ms >= SLOW_S3_DELETE_WARN_MS {
+            tracing::debug!(
+                bucket = self.bucket.as_str(),
+                key = key.as_str(),
+                address,
+                elapsed_ms,
+                is_express = Self::is_express_bucket(&self.bucket),
+                "s3 delete: slow delete_object"
+            );
+        }
+
+        drop(permit);
         Ok(())
     }
 }
@@ -528,10 +762,26 @@ impl StorageList for S3Storage {
                 request = request.continuation_token(token);
             }
 
-            let response = request
-                .send()
-                .await
-                .map_err(|e| map_s3_error_ext(e, &full_prefix))?;
+            let permit = self.acquire_request_permit_ext().await?;
+            let response = match tokio::time::timeout(self.send_timeout, request.send()).await {
+                Ok(Ok(response)) => response,
+                Ok(Err(e)) => return Err(map_s3_error_ext(e, &full_prefix)),
+                Err(_) => {
+                    tracing::error!(
+                        bucket = self.bucket.as_str(),
+                        prefix = full_prefix.as_str(),
+                        timeout_ms = self.send_timeout.as_millis() as u64,
+                        is_express = Self::is_express_bucket(&self.bucket),
+                        "s3 list_prefix: list_objects_v2 timed out"
+                    );
+                    return Err(StorageExtError::io(format!(
+                        "S3 ListObjectsV2 timed out after {} ms for {}",
+                        self.send_timeout.as_millis(),
+                        full_prefix
+                    )));
+                }
+            };
+            drop(permit);
 
             for object in response.contents() {
                 if let Some(key) = object.key() {
@@ -568,10 +818,26 @@ impl StorageList for S3Storage {
             request = request.continuation_token(token);
         }
 
-        let response = request
-            .send()
-            .await
-            .map_err(|e| map_s3_error_ext(e, &full_prefix))?;
+        let permit = self.acquire_request_permit_ext().await?;
+        let response = match tokio::time::timeout(self.send_timeout, request.send()).await {
+            Ok(Ok(response)) => response,
+            Ok(Err(e)) => return Err(map_s3_error_ext(e, &full_prefix)),
+            Err(_) => {
+                tracing::error!(
+                    bucket = self.bucket.as_str(),
+                    prefix = full_prefix.as_str(),
+                    timeout_ms = self.send_timeout.as_millis() as u64,
+                    is_express = Self::is_express_bucket(&self.bucket),
+                    "s3 list_prefix_paginated: list_objects_v2 timed out"
+                );
+                return Err(StorageExtError::io(format!(
+                    "S3 ListObjectsV2 timed out after {} ms for {}",
+                    self.send_timeout.as_millis(),
+                    full_prefix
+                )));
+            }
+        };
+        drop(permit);
 
         let addresses: Vec<String> = response
             .contents()
@@ -595,15 +861,34 @@ const MAX_S3_CAS_RETRIES: u32 = 5;
 impl S3Storage {
     /// S3 put with `If-None-Match: *` (create-if-absent).
     async fn put_if_absent(&self, key: &str, bytes: &[u8]) -> StorageExtResult<bool> {
-        let result = self
+        let permit = self.acquire_request_permit_ext().await?;
+        let request = self
             .client
             .put_object()
             .bucket(&self.bucket)
             .key(key)
             .body(ByteStream::from(bytes.to_vec()))
-            .if_none_match("*")
-            .send()
-            .await;
+            .if_none_match("*");
+
+        let result = match tokio::time::timeout(self.send_timeout, request.send()).await {
+            Ok(result) => result,
+            Err(_) => {
+                tracing::error!(
+                    bucket = self.bucket.as_str(),
+                    key,
+                    bytes = bytes.len(),
+                    timeout_ms = self.send_timeout.as_millis() as u64,
+                    is_express = Self::is_express_bucket(&self.bucket),
+                    "s3 cas insert: put_object timed out"
+                );
+                return Err(StorageExtError::io(format!(
+                    "S3 conditional PutObject timed out after {} ms for {}",
+                    self.send_timeout.as_millis(),
+                    key
+                )));
+            }
+        };
+        drop(permit);
 
         match result {
             Ok(_) => Ok(true),
@@ -620,15 +905,34 @@ impl S3Storage {
             format!("\"{etag}\"")
         };
 
-        let result = self
+        let permit = self.acquire_request_permit_ext().await?;
+        let request = self
             .client
             .put_object()
             .bucket(&self.bucket)
             .key(key)
             .body(ByteStream::from(bytes.to_vec()))
-            .if_match(&etag_quoted)
-            .send()
-            .await;
+            .if_match(&etag_quoted);
+
+        let result = match tokio::time::timeout(self.send_timeout, request.send()).await {
+            Ok(result) => result,
+            Err(_) => {
+                tracing::error!(
+                    bucket = self.bucket.as_str(),
+                    key,
+                    bytes = bytes.len(),
+                    timeout_ms = self.send_timeout.as_millis() as u64,
+                    is_express = Self::is_express_bucket(&self.bucket),
+                    "s3 cas update: put_object timed out"
+                );
+                return Err(StorageExtError::io(format!(
+                    "S3 conditional PutObject timed out after {} ms for {}",
+                    self.send_timeout.as_millis(),
+                    key
+                )));
+            }
+        };
+        drop(permit);
 
         match result {
             Ok(output) => {
@@ -644,25 +948,50 @@ impl S3Storage {
 
     /// S3 get with ETag extraction.
     async fn get_with_etag(&self, key: &str) -> StorageExtResult<(Vec<u8>, String)> {
-        let response = self
-            .client
-            .get_object()
-            .bucket(&self.bucket)
-            .key(key)
-            .send()
-            .await
-            .map_err(|e| map_s3_error_ext(e, key))?;
+        let permit = self.acquire_request_permit_ext().await?;
+        let request = self.client.get_object().bucket(&self.bucket).key(key);
+
+        let response = match tokio::time::timeout(self.send_timeout, request.send()).await {
+            Ok(Ok(response)) => response,
+            Ok(Err(e)) => return Err(map_s3_error_ext(e, key)),
+            Err(_) => {
+                tracing::error!(
+                    bucket = self.bucket.as_str(),
+                    key,
+                    timeout_ms = self.send_timeout.as_millis() as u64,
+                    is_express = Self::is_express_bucket(&self.bucket),
+                    "s3 cas read: get_object timed out"
+                );
+                return Err(StorageExtError::io(format!(
+                    "S3 CAS GetObject timed out after {} ms for {}",
+                    self.send_timeout.as_millis(),
+                    key
+                )));
+            }
+        };
 
         let etag = response.e_tag().map(normalize_etag).unwrap_or_default();
 
-        let bytes = response
-            .body
-            .collect()
-            .await
-            .map_err(|e| StorageExtError::io(format!("Failed to read S3 body: {e}")))?
-            .into_bytes()
-            .to_vec();
+        let bytes = match tokio::time::timeout(self.send_timeout, response.body.collect()).await {
+            Ok(Ok(body)) => body.into_bytes().to_vec(),
+            Ok(Err(e)) => return Err(StorageExtError::io(format!("Failed to read S3 body: {e}"))),
+            Err(_) => {
+                tracing::error!(
+                    bucket = self.bucket.as_str(),
+                    key,
+                    timeout_ms = self.send_timeout.as_millis() as u64,
+                    is_express = Self::is_express_bucket(&self.bucket),
+                    "s3 cas read: body collect timed out"
+                );
+                return Err(StorageExtError::io(format!(
+                    "S3 CAS GetObject body timed out after {} ms for {}",
+                    self.send_timeout.as_millis(),
+                    key
+                )));
+            }
+        };
 
+        drop(permit);
         Ok((bytes, etag))
     }
 }
