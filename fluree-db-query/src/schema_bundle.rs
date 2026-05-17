@@ -101,9 +101,8 @@ impl SchemaBundleFlakes {
                 .then_with(|| a.t.cmp(&b.t))
                 .then_with(|| a.op.cmp(&b.op))
         });
-        collected.dedup_by(|a, b| {
-            a.s == b.s && a.p == b.p && a.o == b.o && a.t == b.t && a.op == b.op
-        });
+        collected
+            .dedup_by(|a, b| a.s == b.s && a.p == b.p && a.o == b.o && a.t == b.t && a.op == b.op);
 
         let mut spot = collected.clone();
         let mut psot = collected.clone();

@@ -26,8 +26,7 @@ async fn json_body(resp: http::Response<Body>) -> (StatusCode, JsonValue) {
         .await
         .expect("collect body")
         .to_bytes();
-    let json: JsonValue =
-        serde_json::from_slice(&bytes).unwrap_or(JsonValue::Null);
+    let json: JsonValue = serde_json::from_slice(&bytes).unwrap_or(JsonValue::Null);
     (status, json)
 }
 

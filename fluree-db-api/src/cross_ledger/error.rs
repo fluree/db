@@ -28,9 +28,7 @@ pub enum CrossLedgerError {
 
     /// `f:ledger` resolves but the named graph IRI has no entry in the
     /// model ledger's graph registry at `resolved_t`.
-    #[error(
-        "graph '{graph_iri}' is not present in model ledger '{ledger_id}' at t={resolved_t}"
-    )]
+    #[error("graph '{graph_iri}' is not present in model ledger '{ledger_id}' at t={resolved_t}")]
     GraphMissingAtT {
         /// Canonical model ledger id.
         ledger_id: String,
@@ -69,9 +67,7 @@ pub enum CrossLedgerError {
     /// The resolver successfully read the graph but could not translate
     /// it to term-neutral form (malformed rule, missing IRI on a Sid
     /// the model dictionary lost, etc.).
-    #[error(
-        "could not materialize graph '{graph_iri}' in model ledger '{ledger_id}': {detail}"
-    )]
+    #[error("could not materialize graph '{graph_iri}' in model ledger '{ledger_id}': {detail}")]
     TranslationFailed {
         /// Canonical model ledger id.
         ledger_id: String,
@@ -114,7 +110,9 @@ pub enum CrossLedgerError {
     ///
     /// Same-instance is the v1 contract; cross-instance federation
     /// requires a different trust model and transport.
-    #[error("model ledger '{ledger_id}' is on a different instance; cross-instance is not supported")]
+    #[error(
+        "model ledger '{ledger_id}' is on a different instance; cross-instance is not supported"
+    )]
     CrossInstanceUnsupported {
         /// The user-supplied ledger reference that triggered this.
         ledger_id: String,
@@ -148,9 +146,24 @@ mod tests {
         use super::super::ArtifactKind;
         let err = CrossLedgerError::CycleDetected {
             chain: vec![
-                (ArtifactKind::PolicyRules, "a:main".into(), "http://ex.org/p".into(), 10),
-                (ArtifactKind::PolicyRules, "b:main".into(), "http://ex.org/q".into(), 20),
-                (ArtifactKind::PolicyRules, "a:main".into(), "http://ex.org/p".into(), 10),
+                (
+                    ArtifactKind::PolicyRules,
+                    "a:main".into(),
+                    "http://ex.org/p".into(),
+                    10,
+                ),
+                (
+                    ArtifactKind::PolicyRules,
+                    "b:main".into(),
+                    "http://ex.org/q".into(),
+                    20,
+                ),
+                (
+                    ArtifactKind::PolicyRules,
+                    "a:main".into(),
+                    "http://ex.org/p".into(),
+                    10,
+                ),
             ],
         };
         let msg = err.to_string();

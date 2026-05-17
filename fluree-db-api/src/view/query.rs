@@ -555,18 +555,15 @@ impl Fluree {
         // configs go through the existing local path unchanged.
         let schema_source = reasoning.schema_source.as_ref().expect("checked above");
         if schema_source.ledger.is_some() {
-            let mut ctx = crate::cross_ledger::ResolveCtx::new(
-                db_ref.snapshot.ledger_id.as_str(),
-                self,
-            );
+            let mut ctx =
+                crate::cross_ledger::ResolveCtx::new(db_ref.snapshot.ledger_id.as_str(), self);
             let resolved = crate::cross_ledger::resolve_graph_ref(
                 schema_source,
                 crate::cross_ledger::ArtifactKind::SchemaClosure,
                 &mut ctx,
             )
             .await?;
-            let crate::cross_ledger::GovernanceArtifact::SchemaClosure(wire) =
-                &resolved.artifact
+            let crate::cross_ledger::GovernanceArtifact::SchemaClosure(wire) = &resolved.artifact
             else {
                 return Err(crate::error::ApiError::CrossLedger(
                     crate::cross_ledger::CrossLedgerError::TranslationFailed {

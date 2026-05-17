@@ -48,9 +48,7 @@
 
 use super::CrossLedgerError;
 use crate::Fluree;
-use fluree_db_core::{
-    FlakeValue, IndexType, LedgerSnapshot, RangeMatch, RangeTest, Sid,
-};
+use fluree_db_core::{FlakeValue, IndexType, LedgerSnapshot, RangeMatch, RangeTest, Sid};
 use fluree_vocab::policy_iris;
 
 /// Canonical policy class IRI. Subjects typed exactly as this are
@@ -101,8 +99,18 @@ pub(super) async fn materialize_policy_rules(
     //    namespace map. These come from default namespaces
     //    (fluree, rdf) which are pre-registered at genesis, so a
     //    failure here means M is corrupt.
-    let allow_sid = encode_system_iri(&m_db.snapshot, policy_iris::ALLOW, canonical_model_ledger_id, graph_iri)?;
-    let query_sid = encode_system_iri(&m_db.snapshot, policy_iris::QUERY, canonical_model_ledger_id, graph_iri)?;
+    let allow_sid = encode_system_iri(
+        &m_db.snapshot,
+        policy_iris::ALLOW,
+        canonical_model_ledger_id,
+        graph_iri,
+    )?;
+    let query_sid = encode_system_iri(
+        &m_db.snapshot,
+        policy_iris::QUERY,
+        canonical_model_ledger_id,
+        graph_iri,
+    )?;
     let rdf_type_sid = encode_system_iri(
         &m_db.snapshot,
         rdf_type_iri(),
@@ -110,12 +118,8 @@ pub(super) async fn materialize_policy_rules(
         graph_iri,
     )?;
 
-    let m_view = fluree_db_core::GraphDbRef::new(
-        &m_db.snapshot,
-        g_id,
-        m_db.overlay.as_ref(),
-        m_db.t,
-    );
+    let m_view =
+        fluree_db_core::GraphDbRef::new(&m_db.snapshot, g_id, m_db.overlay.as_ref(), m_db.t);
 
     // 4. Structural detection — find every subject that has at least
     //    one f:allow or f:query triple OR is canonically typed as
@@ -126,7 +130,11 @@ pub(super) async fn materialize_policy_rules(
     let mut policy_subjects: HashSet<Sid> = HashSet::new();
     for pred_sid in [allow_sid, query_sid] {
         let flakes = m_view
-            .range(IndexType::Post, RangeTest::Eq, RangeMatch::predicate(pred_sid))
+            .range(
+                IndexType::Post,
+                RangeTest::Eq,
+                RangeMatch::predicate(pred_sid),
+            )
             .await
             .map_err(|e| CrossLedgerError::TranslationFailed {
                 ledger_id: canonical_model_ledger_id.to_string(),
@@ -273,15 +281,16 @@ async fn read_rdf_types(
         let FlakeValue::Ref(class_sid) = flake.o else {
             continue; // non-Ref rdf:type isn't valid; skip silently
         };
-        let iri = snapshot.decode_sid(&class_sid).ok_or_else(|| {
-            CrossLedgerError::TranslationFailed {
-                ledger_id: canonical_model_ledger_id.to_string(),
-                graph_iri: graph_iri.to_string(),
-                detail: format!(
-                    "could not decode rdf:type Sid {class_sid:?} on policy {subject:?}"
-                ),
-            }
-        })?;
+        let iri =
+            snapshot
+                .decode_sid(&class_sid)
+                .ok_or_else(|| CrossLedgerError::TranslationFailed {
+                    ledger_id: canonical_model_ledger_id.to_string(),
+                    graph_iri: graph_iri.to_string(),
+                    detail: format!(
+                        "could not decode rdf:type Sid {class_sid:?} on policy {subject:?}"
+                    ),
+                })?;
         out.push(iri);
     }
     Ok(out)
@@ -303,16 +312,17 @@ fn restriction_to_wire(
     let decode_set = |sids: &HashSet<Sid>, field: &str| -> Result<Vec<String>, CrossLedgerError> {
         let mut out = Vec::with_capacity(sids.len());
         for sid in sids {
-            let iri = snapshot.decode_sid(sid).ok_or_else(|| {
-                CrossLedgerError::TranslationFailed {
-                    ledger_id: canonical_model_ledger_id.to_string(),
-                    graph_iri: graph_iri.to_string(),
-                    detail: format!(
-                        "could not decode Sid {sid:?} on field '{field}' of policy {}",
-                        r.id,
-                    ),
-                }
-            })?;
+            let iri =
+                snapshot
+                    .decode_sid(sid)
+                    .ok_or_else(|| CrossLedgerError::TranslationFailed {
+                        ledger_id: canonical_model_ledger_id.to_string(),
+                        graph_iri: graph_iri.to_string(),
+                        detail: format!(
+                            "could not decode Sid {sid:?} on field '{field}' of policy {}",
+                            r.id,
+                        ),
+                    })?;
             out.push(iri);
         }
         Ok(out)

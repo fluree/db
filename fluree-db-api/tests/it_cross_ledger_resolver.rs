@@ -45,7 +45,7 @@ async fn resolves_policy_graph_from_model_ledger_into_term_neutral_wire() {
     // simplest way to populate a non-default graph in one transaction).
     let policy_graph_iri = "http://example.org/policy-graph";
     let trig = format!(
-        r#"
+        r"
         @prefix f:    <https://ns.flur.ee/db#> .
         @prefix rdf:  <http://www.w3.org/1999/02/22-rdf-syntax-ns#> .
         @prefix ex:   <http://example.org/ns/> .
@@ -57,7 +57,7 @@ async fn resolves_policy_graph_from_model_ledger_into_term_neutral_wire() {
                 f:onClass       ex:User ;
                 f:allow         false .
         }}
-    "#
+    "
     );
     fluree
         .stage_owned(model)
@@ -85,7 +85,10 @@ async fn resolves_policy_graph_from_model_ledger_into_term_neutral_wire() {
     assert!(resolved.resolved_t > 0, "must resolve to a real commit t");
 
     let GovernanceArtifact::PolicyRules(wire) = &resolved.artifact else {
-        panic!("expected PolicyRules artifact for ArtifactKind::PolicyRules, got {:?}", resolved.artifact);
+        panic!(
+            "expected PolicyRules artifact for ArtifactKind::PolicyRules, got {:?}",
+            resolved.artifact
+        );
     };
     assert_eq!(wire.origin.model_ledger_id, model_id);
     assert_eq!(wire.origin.graph_iri, policy_graph_iri);
@@ -159,7 +162,7 @@ async fn structural_detection_picks_up_custom_typed_policies() {
     // f:allow set so structural detection must include it. policy_types
     // must record `ex:OrgPolicy` so slice 5 can filter appropriately.
     let trig = format!(
-        r#"
+        r"
         @prefix f:    <https://ns.flur.ee/db#> .
         @prefix rdf:  <http://www.w3.org/1999/02/22-rdf-syntax-ns#> .
         @prefix ex:   <http://example.org/ns/> .
@@ -171,7 +174,7 @@ async fn structural_detection_picks_up_custom_typed_policies() {
                 f:onClass   ex:Document ;
                 f:allow     false .
         }}
-    "#
+    "
     );
     fluree
         .stage_owned(model)
@@ -191,7 +194,10 @@ async fn structural_detection_picks_up_custom_typed_policies() {
         .expect("cross-ledger resolution with custom-typed policy");
 
     let GovernanceArtifact::PolicyRules(wire) = &resolved.artifact else {
-        panic!("expected PolicyRules artifact for ArtifactKind::PolicyRules, got {:?}", resolved.artifact);
+        panic!(
+            "expected PolicyRules artifact for ArtifactKind::PolicyRules, got {:?}",
+            resolved.artifact
+        );
     };
     assert_eq!(
         wire.restrictions.len(),
@@ -220,7 +226,7 @@ async fn multiple_rdf_types_are_all_captured_in_policy_types() {
     let model = genesis_ledger(&fluree, model_id);
     let policy_graph_iri = "http://example.org/multi-typed-graph";
     let trig = format!(
-        r#"
+        r"
         @prefix f:    <https://ns.flur.ee/db#> .
         @prefix rdf:  <http://www.w3.org/1999/02/22-rdf-syntax-ns#> .
         @prefix ex:   <http://example.org/ns/> .
@@ -232,7 +238,7 @@ async fn multiple_rdf_types_are_all_captured_in_policy_types() {
                 f:onClass   ex:Doc ;
                 f:allow     true .
         }}
-    "#
+    "
     );
     fluree
         .stage_owned(model)
@@ -254,14 +260,21 @@ async fn multiple_rdf_types_are_all_captured_in_policy_types() {
     .expect("dual-typed resolves");
 
     let GovernanceArtifact::PolicyRules(wire) = &resolved.artifact else {
-        panic!("expected PolicyRules artifact for ArtifactKind::PolicyRules, got {:?}", resolved.artifact);
+        panic!(
+            "expected PolicyRules artifact for ArtifactKind::PolicyRules, got {:?}",
+            resolved.artifact
+        );
     };
     let r = &wire.restrictions[0];
 
     // Both types must be present (order-independent).
     assert_eq!(r.policy_types.len(), 2);
-    assert!(r.policy_types.contains(&"https://ns.flur.ee/db#AccessPolicy".to_string()));
-    assert!(r.policy_types.contains(&"http://example.org/ns/OrgPolicy".to_string()));
+    assert!(r
+        .policy_types
+        .contains(&"https://ns.flur.ee/db#AccessPolicy".to_string()));
+    assert!(r
+        .policy_types
+        .contains(&"http://example.org/ns/OrgPolicy".to_string()));
 }
 
 /// Cross-ledger schema materialization picks up the whitelisted
@@ -281,7 +294,7 @@ async fn cross_ledger_schema_materializes_whitelisted_axioms() {
     // M's schema graph: a small class hierarchy + a property
     // hierarchy that should both surface in the wire artifact.
     let trig = format!(
-        r#"
+        r"
         @prefix owl:  <http://www.w3.org/2002/07/owl#> .
         @prefix rdf:  <http://www.w3.org/1999/02/22-rdf-syntax-ns#> .
         @prefix rdfs: <http://www.w3.org/2000/01/rdf-schema#> .
@@ -296,7 +309,7 @@ async fn cross_ledger_schema_materializes_whitelisted_axioms() {
             ex:friend  rdf:type           owl:ObjectProperty ;
                        rdfs:subPropertyOf ex:knows .
         }}
-    "#
+    "
     );
     fluree
         .stage_owned(model)
@@ -431,7 +444,7 @@ async fn missing_effect_on_typed_policy_is_picked_up_as_deny() {
     // be discovered, and the deny would silently disappear cross-
     // ledger while still applying same-ledger.
     let trig = format!(
-        r#"
+        r"
         @prefix f:    <https://ns.flur.ee/db#> .
         @prefix rdf:  <http://www.w3.org/1999/02/22-rdf-syntax-ns#> .
         @prefix ex:   <http://example.org/ns/> .
@@ -442,7 +455,7 @@ async fn missing_effect_on_typed_policy_is_picked_up_as_deny() {
                 f:action    f:view ;
                 f:onClass   ex:User .
         }}
-    "#
+    "
     );
     fluree
         .stage_owned(model)
@@ -464,7 +477,10 @@ async fn missing_effect_on_typed_policy_is_picked_up_as_deny() {
     .expect("missing-effect typed policy resolves");
 
     let GovernanceArtifact::PolicyRules(wire) = &resolved.artifact else {
-        panic!("expected PolicyRules artifact for ArtifactKind::PolicyRules, got {:?}", resolved.artifact);
+        panic!(
+            "expected PolicyRules artifact for ArtifactKind::PolicyRules, got {:?}",
+            resolved.artifact
+        );
     };
     assert_eq!(
         wire.restrictions.len(),
@@ -506,7 +522,7 @@ async fn distinct_namespace_codes_canary_term_translation_still_works() {
     fluree
         .stage_owned(model)
         .upsert_turtle(&format!(
-            r#"
+            r"
             @prefix f:    <https://ns.flur.ee/db#> .
             @prefix rdf:  <http://www.w3.org/1999/02/22-rdf-syntax-ns#> .
             @prefix ex:   <http://example.org/ns/> .
@@ -518,7 +534,7 @@ async fn distinct_namespace_codes_canary_term_translation_still_works() {
                     f:onClass   ex:User ;
                     f:allow     false .
             }}
-        "#
+        "
         ))
         .execute()
         .await
@@ -668,7 +684,7 @@ async fn single_resolution_t_is_stable_within_a_request() {
     let r1 = fluree
         .stage_owned(model)
         .upsert_turtle(&format!(
-            r#"
+            r"
             @prefix f:    <https://ns.flur.ee/db#> .
             @prefix rdf:  <http://www.w3.org/1999/02/22-rdf-syntax-ns#> .
             @prefix ex:   <http://example.org/ns/> .
@@ -679,7 +695,7 @@ async fn single_resolution_t_is_stable_within_a_request() {
             GRAPH <{graph_b_iri}> {{
                 ex:ruleB rdf:type f:AccessPolicy ; f:action f:view ; f:allow false .
             }}
-        "#
+        "
         ))
         .execute()
         .await
@@ -755,7 +771,8 @@ async fn single_resolution_t_is_stable_within_a_request() {
     assert!(
         resolved_a_fresh.resolved_t > t_at_first_resolution,
         "a fresh request should see M's advanced head (got {}, expected > {})",
-        resolved_a_fresh.resolved_t, t_at_first_resolution
+        resolved_a_fresh.resolved_t,
+        t_at_first_resolution
     );
 }
 
@@ -774,7 +791,7 @@ async fn governance_cache_short_circuits_repeated_resolutions_across_contexts() 
     fluree
         .stage_owned(model)
         .upsert_turtle(&format!(
-            r#"
+            r"
             @prefix f:    <https://ns.flur.ee/db#> .
             @prefix rdf:  <http://www.w3.org/1999/02/22-rdf-syntax-ns#> .
             @prefix ex:   <http://example.org/ns/> .
@@ -782,7 +799,7 @@ async fn governance_cache_short_circuits_repeated_resolutions_across_contexts() 
             GRAPH <{policy_graph_iri}> {{
                 ex:rule rdf:type f:AccessPolicy ; f:action f:view ; f:allow true .
             }}
-        "#
+        "
         ))
         .execute()
         .await
@@ -814,8 +831,8 @@ async fn governance_cache_short_circuits_repeated_resolutions_across_contexts() 
     // best-effort; allow the rare zero-count race by also asserting
     // a direct get hit.
     let _ = fluree.governance_cache(); // touch
-    // (sync_for_test would be ideal but Moka doesn't expose one;
-    // the get below is the load-bearing check.)
+                                       // (sync_for_test would be ideal but Moka doesn't expose one;
+                                       // the get below is the load-bearing check.)
 
     let mut ctx_b = ResolveCtx::new(data_b, &fluree);
     let resolved_b = resolve_graph_ref(&graph_ref, ArtifactKind::PolicyRules, &mut ctx_b)
@@ -925,7 +942,10 @@ async fn empty_policy_graph_yields_empty_wire_artifact() {
         .expect("empty graph resolves successfully");
 
     let GovernanceArtifact::PolicyRules(wire) = &resolved.artifact else {
-        panic!("expected PolicyRules artifact for ArtifactKind::PolicyRules, got {:?}", resolved.artifact);
+        panic!(
+            "expected PolicyRules artifact for ArtifactKind::PolicyRules, got {:?}",
+            resolved.artifact
+        );
     };
     assert!(
         wire.restrictions.is_empty(),

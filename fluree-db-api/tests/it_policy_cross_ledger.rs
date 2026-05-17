@@ -32,7 +32,7 @@ async fn data_ledger_query_enforces_model_ledger_deny_policy() {
 
     let policy_graph_iri = "http://example.org/m-policies";
     let m_trig = format!(
-        r#"
+        r"
         @prefix f:    <https://ns.flur.ee/db#> .
         @prefix rdf:  <http://www.w3.org/1999/02/22-rdf-syntax-ns#> .
         @prefix ex:   <http://example.org/ns/> .
@@ -44,7 +44,7 @@ async fn data_ledger_query_enforces_model_ledger_deny_policy() {
                 f:onClass   ex:User ;
                 f:allow     false .
         }}
-    "#
+    "
     );
     fluree
         .stage_owned(model)
@@ -121,9 +121,7 @@ async fn data_ledger_query_enforces_model_ledger_deny_policy() {
         .query(&wrapped, &q_users)
         .await
         .expect("query ex:User under cross-ledger policy");
-    let users_jsonld = users
-        .to_jsonld(&wrapped.snapshot)
-        .expect("jsonld users");
+    let users_jsonld = users.to_jsonld(&wrapped.snapshot).expect("jsonld users");
     assert_eq!(
         users_jsonld,
         json!([]),
@@ -189,7 +187,7 @@ async fn custom_class_policy_enforced_when_data_ledger_includes_class() {
     fluree
         .stage_owned(model)
         .upsert_turtle(&format!(
-            r#"
+            r"
             @prefix f:    <https://ns.flur.ee/db#> .
             @prefix rdf:  <http://www.w3.org/1999/02/22-rdf-syntax-ns#> .
             @prefix ex:   <http://example.org/ns/> .
@@ -201,7 +199,7 @@ async fn custom_class_policy_enforced_when_data_ledger_includes_class() {
                     f:onClass   ex:User ;
                     f:allow     false .
             }}
-        "#
+        "
         ))
         .execute()
         .await
@@ -292,7 +290,7 @@ async fn custom_class_policy_skipped_when_data_ledger_omits_class() {
     fluree
         .stage_owned(model)
         .upsert_turtle(&format!(
-            r#"
+            r"
             @prefix f:    <https://ns.flur.ee/db#> .
             @prefix rdf:  <http://www.w3.org/1999/02/22-rdf-syntax-ns#> .
             @prefix ex:   <http://example.org/ns/> .
@@ -304,7 +302,7 @@ async fn custom_class_policy_skipped_when_data_ledger_omits_class() {
                     f:onClass   ex:User ;
                     f:allow     false .
             }}
-        "#
+        "
         ))
         .execute()
         .await
@@ -399,7 +397,7 @@ async fn baseline_access_policy_class_enforced() {
     fluree
         .stage_owned(model)
         .upsert_turtle(&format!(
-            r#"
+            r"
             @prefix f:    <https://ns.flur.ee/db#> .
             @prefix rdf:  <http://www.w3.org/1999/02/22-rdf-syntax-ns#> .
             @prefix ex:   <http://example.org/ns/> .
@@ -411,7 +409,7 @@ async fn baseline_access_policy_class_enforced() {
                     f:onClass   ex:User ;
                     f:allow     false .
             }}
-        "#
+        "
         ))
         .execute()
         .await
@@ -503,7 +501,7 @@ async fn omitted_policy_class_defaults_to_access_policy_only() {
     fluree
         .stage_owned(model)
         .upsert_turtle(&format!(
-            r#"
+            r"
             @prefix f:    <https://ns.flur.ee/db#> .
             @prefix rdf:  <http://www.w3.org/1999/02/22-rdf-syntax-ns#> .
             @prefix ex:   <http://example.org/ns/> .
@@ -521,7 +519,7 @@ async fn omitted_policy_class_defaults_to_access_policy_only() {
                     f:onClass   ex:Doc ;
                     f:allow     false .
             }}
-        "#
+        "
         ))
         .execute()
         .await
@@ -609,7 +607,10 @@ async fn omitted_policy_class_defaults_to_access_policy_only() {
         )
         .await
         .expect("query docs");
-    let docs_rendered = docs.to_jsonld(&wrapped.snapshot).expect("jsonld docs").to_string();
+    let docs_rendered = docs
+        .to_jsonld(&wrapped.snapshot)
+        .expect("jsonld docs")
+        .to_string();
     assert!(
         docs_rendered.contains("doc1"),
         "omitted f:policyClass must NOT pick up ex:OrgPolicy-typed rules; \
@@ -632,7 +633,7 @@ async fn cross_ledger_plus_identity_mode_fails_closed() {
     fluree
         .stage_owned(model)
         .upsert_turtle(&format!(
-            r#"
+            r"
             @prefix f:    <https://ns.flur.ee/db#> .
             @prefix rdf:  <http://www.w3.org/1999/02/22-rdf-syntax-ns#> .
             @prefix ex:   <http://example.org/ns/> .
@@ -640,7 +641,7 @@ async fn cross_ledger_plus_identity_mode_fails_closed() {
             GRAPH <{policy_graph_iri}> {{
                 ex:rule1 rdf:type f:AccessPolicy ; f:action f:view ; f:allow true .
             }}
-        "#
+        "
         ))
         .execute()
         .await

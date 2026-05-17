@@ -32,9 +32,7 @@ pub(super) async fn materialize_constraints(
         .map_err(|e| CrossLedgerError::TranslationFailed {
             ledger_id: canonical_model_ledger_id.to_string(),
             graph_iri: graph_iri.to_string(),
-            detail: format!(
-                "failed to open model ledger snapshot at t={resolved_t}: {e}"
-            ),
+            detail: format!("failed to open model ledger snapshot at t={resolved_t}: {e}"),
         })?;
 
     // 2. Resolve graph_iri → g_id in M's graph registry.
@@ -66,17 +64,10 @@ pub(super) async fn materialize_constraints(
 
     // 4. Scan POST for ?prop f:enforceUnique true. The matching
     //    subjects ARE the property IRIs we want.
-    let m_view = fluree_db_core::GraphDbRef::new(
-        &m_db.snapshot,
-        g_id,
-        m_db.overlay.as_ref(),
-        m_db.t,
-    );
-    let match_val = RangeMatch::predicate_object(
-        enforce_unique_sid,
-        FlakeValue::Boolean(true),
-    )
-    .with_datatype(xsd_boolean_sid);
+    let m_view =
+        fluree_db_core::GraphDbRef::new(&m_db.snapshot, g_id, m_db.overlay.as_ref(), m_db.t);
+    let match_val = RangeMatch::predicate_object(enforce_unique_sid, FlakeValue::Boolean(true))
+        .with_datatype(xsd_boolean_sid);
 
     let flakes = m_view
         .range(IndexType::Post, RangeTest::Eq, match_val)
@@ -84,9 +75,7 @@ pub(super) async fn materialize_constraints(
         .map_err(|e| CrossLedgerError::TranslationFailed {
             ledger_id: canonical_model_ledger_id.to_string(),
             graph_iri: graph_iri.to_string(),
-            detail: format!(
-                "range scan for f:enforceUnique annotations failed: {e}"
-            ),
+            detail: format!("range scan for f:enforceUnique annotations failed: {e}"),
         })?;
 
     // 5. Decode each property Sid back to its IRI. A failure to

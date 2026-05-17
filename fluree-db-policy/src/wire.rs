@@ -145,7 +145,11 @@ where
                 continue;
             }
         }
-        let targets: HashSet<Sid> = w.targets.iter().filter_map(|iri| resolve_iri(iri)).collect();
+        let targets: HashSet<Sid> = w
+            .targets
+            .iter()
+            .filter_map(|iri| resolve_iri(iri))
+            .collect();
         let for_classes: HashSet<Sid> = w
             .for_classes
             .iter()
@@ -271,7 +275,10 @@ mod tests {
             .expect("name should be indexed");
         assert_eq!(entries.len(), 1);
         let PropertyPolicyEntry { idx, .. } = entries[0];
-        assert_eq!(set.restrictions[idx].id, "http://example.org/rules/allow-name");
+        assert_eq!(
+            set.restrictions[idx].id,
+            "http://example.org/rules/allow-name"
+        );
     }
 
     #[test]
@@ -439,10 +446,11 @@ mod tests {
         assert_eq!(kept[0].id, "ex:r-org");
 
         // Both classes → keep both.
-        let both: HashSet<String> =
-            [access_iri.to_string(), org_iri.to_string()].into_iter().collect();
-        let kept = wire_to_restrictions(&wire, stub_resolver(&[]), Some(&both))
-            .expect("filter to both");
+        let both: HashSet<String> = [access_iri.to_string(), org_iri.to_string()]
+            .into_iter()
+            .collect();
+        let kept =
+            wire_to_restrictions(&wire, stub_resolver(&[]), Some(&both)).expect("filter to both");
         assert_eq!(kept.len(), 2);
 
         // Unrelated class → drop everything.
@@ -478,8 +486,9 @@ mod tests {
             }],
         };
 
-        let filter: HashSet<String> =
-            ["https://ns.flur.ee/db#AccessPolicy".to_string()].into_iter().collect();
+        let filter: HashSet<String> = ["https://ns.flur.ee/db#AccessPolicy".to_string()]
+            .into_iter()
+            .collect();
         let kept = wire_to_restrictions(&wire, stub_resolver(&[]), Some(&filter))
             .expect("filter with untyped");
         assert!(kept.is_empty(), "untyped restriction must be dropped");

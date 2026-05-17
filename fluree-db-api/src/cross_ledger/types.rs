@@ -232,8 +232,9 @@ impl SchemaArtifactWire {
     pub fn translate_to_schema_bundle_flakes(
         &self,
         snapshot: &fluree_db_core::LedgerSnapshot,
-    ) -> fluree_db_query::error::Result<std::sync::Arc<fluree_db_query::schema_bundle::SchemaBundleFlakes>>
-    {
+    ) -> fluree_db_query::error::Result<
+        std::sync::Arc<fluree_db_query::schema_bundle::SchemaBundleFlakes>,
+    > {
         use fluree_db_core::flake::Flake;
         use fluree_db_core::value::FlakeValue;
         use fluree_db_core::Sid;
@@ -244,7 +245,9 @@ impl SchemaArtifactWire {
             // object on a whitelisted predicate is silently skipped
             // (such triples can't survive the schema-bundle path
             // anyway — the reasoner expects Ref-valued schema axioms).
-            let WireObject::Ref(o_iri) = &t.o else { continue };
+            let WireObject::Ref(o_iri) = &t.o else {
+                continue;
+            };
             let (Some(s_sid), Some(p_sid), Some(o_sid)) = (
                 snapshot.encode_iri(&t.s),
                 snapshot.encode_iri(&t.p),
@@ -267,10 +270,8 @@ impl SchemaArtifactWire {
                 m: None,
             });
         }
-        fluree_db_query::schema_bundle::SchemaBundleFlakes::from_collected_schema_triples(
-            collected,
-        )
-        .map(std::sync::Arc::new)
+        fluree_db_query::schema_bundle::SchemaBundleFlakes::from_collected_schema_triples(collected)
+            .map(std::sync::Arc::new)
     }
 }
 
@@ -324,8 +325,9 @@ impl ShapesArtifactWire {
     pub fn translate_to_schema_bundle_flakes(
         &self,
         staged_ns: &fluree_db_transact::namespace::NamespaceRegistry,
-    ) -> fluree_db_query::error::Result<std::sync::Arc<fluree_db_query::schema_bundle::SchemaBundleFlakes>>
-    {
+    ) -> fluree_db_query::error::Result<
+        std::sync::Arc<fluree_db_query::schema_bundle::SchemaBundleFlakes>,
+    > {
         use fluree_db_core::flake::Flake;
         use fluree_db_core::Sid;
 
@@ -352,9 +354,9 @@ impl ShapesArtifactWire {
                     datatype,
                     lang: _,
                 } => {
-                    let dt_sid = staged_ns.lookup_sid_for_iri(datatype).unwrap_or_else(
-                        || Sid::new(fluree_vocab::namespaces::XSD, "string"),
-                    );
+                    let dt_sid = staged_ns
+                        .lookup_sid_for_iri(datatype)
+                        .unwrap_or_else(|| Sid::new(fluree_vocab::namespaces::XSD, "string"));
                     (literal_to_flake_value(value, datatype), dt_sid)
                 }
             };
@@ -369,10 +371,8 @@ impl ShapesArtifactWire {
                 m: None,
             });
         }
-        fluree_db_query::schema_bundle::SchemaBundleFlakes::from_collected_schema_triples(
-            collected,
-        )
-        .map(std::sync::Arc::new)
+        fluree_db_query::schema_bundle::SchemaBundleFlakes::from_collected_schema_triples(collected)
+            .map(std::sync::Arc::new)
     }
 }
 
@@ -390,8 +390,8 @@ fn literal_to_flake_value(value: &str, datatype: &str) -> fluree_db_core::FlakeV
             .map(FlakeValue::Boolean)
             .unwrap_or_else(|_| FlakeValue::String(value.to_string())),
         "integer" | "long" | "int" | "short" | "byte" | "nonNegativeInteger"
-        | "positiveInteger" | "negativeInteger" | "nonPositiveInteger"
-        | "unsignedLong" | "unsignedInt" | "unsignedShort" | "unsignedByte" => value
+        | "positiveInteger" | "negativeInteger" | "nonPositiveInteger" | "unsignedLong"
+        | "unsignedInt" | "unsignedShort" | "unsignedByte" => value
             .parse::<i64>()
             .map(FlakeValue::Long)
             .unwrap_or_else(|_| FlakeValue::String(value.to_string())),

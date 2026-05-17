@@ -33,14 +33,14 @@ async fn data_ledger_tx_enforces_model_ledger_unique_constraint() {
 
     let constraints_graph_iri = "http://example.org/governance/constraints";
     let m_trig = format!(
-        r#"
+        r"
         @prefix f:    <https://ns.flur.ee/db#> .
         @prefix ex:   <http://example.org/ns/> .
 
         GRAPH <{constraints_graph_iri}> {{
             ex:email f:enforceUnique true .
         }}
-    "#
+    "
     );
     fluree
         .stage_owned(model)

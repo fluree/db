@@ -633,7 +633,8 @@ impl Fluree {
             }
 
             let source = source.expect("checked above");
-            let mut ctx = crate::cross_ledger::ResolveCtx::new(view.snapshot.ledger_id.as_str(), self);
+            let mut ctx =
+                crate::cross_ledger::ResolveCtx::new(view.snapshot.ledger_id.as_str(), self);
             let resolved = crate::cross_ledger::resolve_graph_ref(
                 source,
                 crate::cross_ledger::ArtifactKind::PolicyRules,
@@ -680,9 +681,7 @@ impl Fluree {
                 .as_ref()
                 .filter(|v| !v.is_empty())
                 .map(|v| v.iter().cloned().collect())
-                .unwrap_or_else(|| {
-                    [DEFAULT_POLICY_CLASS_IRI.to_string()].into_iter().collect()
-                });
+                .unwrap_or_else(|| [DEFAULT_POLICY_CLASS_IRI.to_string()].into_iter().collect());
             let snapshot_ref = &view.snapshot;
             let restrictions = fluree_db_policy::wire_to_restrictions(
                 wire,
@@ -691,16 +690,17 @@ impl Fluree {
             )
             .map_err(crate::error::ApiError::from)?;
 
-            let policy_ctx = crate::policy_builder::build_policy_context_from_opts_with_cross_ledger(
-                &view.snapshot,
-                view.overlay.as_ref(),
-                view.novelty_for_stats(),
-                view.t,
-                &effective_opts,
-                &[0], // identity-mode uses [0]; unused under cross-ledger
-                restrictions,
-            )
-            .await?;
+            let policy_ctx =
+                crate::policy_builder::build_policy_context_from_opts_with_cross_ledger(
+                    &view.snapshot,
+                    view.overlay.as_ref(),
+                    view.novelty_for_stats(),
+                    view.t,
+                    &effective_opts,
+                    &[0], // identity-mode uses [0]; unused under cross-ledger
+                    restrictions,
+                )
+                .await?;
             return Ok(view.with_policy(Arc::new(policy_ctx)));
         }
 

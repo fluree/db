@@ -35,9 +35,7 @@ pub(super) async fn materialize_shapes(
         .map_err(|e| CrossLedgerError::TranslationFailed {
             ledger_id: canonical_model_ledger_id.to_string(),
             graph_iri: graph_iri.to_string(),
-            detail: format!(
-                "failed to open model ledger snapshot at t={resolved_t}: {e}"
-            ),
+            detail: format!("failed to open model ledger snapshot at t={resolved_t}: {e}"),
         })?;
 
     let g_id = m_db
@@ -52,18 +50,42 @@ pub(super) async fn materialize_shapes(
 
     // SHACL whitelist — mirrors fluree_db_shacl::ShapeCompiler::compile_from_dbs
     let shacl_predicate_names: &[&str] = &[
-        "targetClass", "targetNode", "targetSubjectsOf", "targetObjectsOf",
-        "property", "path",
-        "minCount", "maxCount",
-        "datatype", "nodeKind", "class",
-        "minInclusive", "maxInclusive", "minExclusive", "maxExclusive",
-        "pattern", "flags", "minLength", "maxLength",
-        "hasValue", "in",
-        "equals", "disjoint", "lessThan", "lessThanOrEquals",
-        "closed", "ignoredProperties",
-        "uniqueLang", "languageIn",
-        "not", "and", "or", "xone",
-        "severity", "message", "name",
+        "targetClass",
+        "targetNode",
+        "targetSubjectsOf",
+        "targetObjectsOf",
+        "property",
+        "path",
+        "minCount",
+        "maxCount",
+        "datatype",
+        "nodeKind",
+        "class",
+        "minInclusive",
+        "maxInclusive",
+        "minExclusive",
+        "maxExclusive",
+        "pattern",
+        "flags",
+        "minLength",
+        "maxLength",
+        "hasValue",
+        "in",
+        "equals",
+        "disjoint",
+        "lessThan",
+        "lessThanOrEquals",
+        "closed",
+        "ignoredProperties",
+        "uniqueLang",
+        "languageIn",
+        "not",
+        "and",
+        "or",
+        "xone",
+        "severity",
+        "message",
+        "name",
     ];
 
     let mut shacl_predicate_sids: Vec<Sid> = Vec::new();
@@ -105,7 +127,10 @@ pub(super) async fn materialize_shapes(
         }
     }
 
-    for opt_sid in [rdf_first_sid, rdf_rest_sid].iter().filter_map(|s| s.as_ref()) {
+    for opt_sid in [rdf_first_sid, rdf_rest_sid]
+        .iter()
+        .filter_map(|s| s.as_ref())
+    {
         let flakes = fluree_db_core::range_with_overlay(
             &m_db.snapshot,
             g_id,
@@ -149,22 +174,26 @@ fn push_triple(
     canonical_model_ledger_id: &str,
     graph_iri: &str,
 ) -> Result<(), CrossLedgerError> {
-    let s_iri = snapshot.decode_sid(&f.s).ok_or_else(|| {
-        CrossLedgerError::TranslationFailed {
+    let s_iri = snapshot
+        .decode_sid(&f.s)
+        .ok_or_else(|| CrossLedgerError::TranslationFailed {
             ledger_id: canonical_model_ledger_id.to_string(),
             graph_iri: graph_iri.to_string(),
             detail: format!("could not decode shape subject Sid {:?}", f.s),
-        }
-    })?;
-    let p_iri = snapshot.decode_sid(&f.p).ok_or_else(|| {
-        CrossLedgerError::TranslationFailed {
+        })?;
+    let p_iri = snapshot
+        .decode_sid(&f.p)
+        .ok_or_else(|| CrossLedgerError::TranslationFailed {
             ledger_id: canonical_model_ledger_id.to_string(),
             graph_iri: graph_iri.to_string(),
             detail: format!("could not decode shape predicate Sid {:?}", f.p),
-        }
-    })?;
+        })?;
     let o = encode_object(&f.o, &f.dt, snapshot, canonical_model_ledger_id, graph_iri)?;
-    out.push(WireTriple { s: s_iri, p: p_iri, o });
+    out.push(WireTriple {
+        s: s_iri,
+        p: p_iri,
+        o,
+    });
     Ok(())
 }
 
@@ -176,18 +205,19 @@ fn encode_object(
     graph_iri: &str,
 ) -> Result<WireObject, CrossLedgerError> {
     if let FlakeValue::Ref(o_sid) = o {
-        let iri = snapshot.decode_sid(o_sid).ok_or_else(|| {
-            CrossLedgerError::TranslationFailed {
-                ledger_id: canonical_model_ledger_id.to_string(),
-                graph_iri: graph_iri.to_string(),
-                detail: format!("could not decode shape object Sid {o_sid:?}"),
-            }
-        })?;
+        let iri =
+            snapshot
+                .decode_sid(o_sid)
+                .ok_or_else(|| CrossLedgerError::TranslationFailed {
+                    ledger_id: canonical_model_ledger_id.to_string(),
+                    graph_iri: graph_iri.to_string(),
+                    detail: format!("could not decode shape object Sid {o_sid:?}"),
+                })?;
         return Ok(WireObject::Ref(iri));
     }
-    let datatype_iri = snapshot.decode_sid(dt).unwrap_or_else(|| {
-        "http://www.w3.org/2001/XMLSchema#string".to_string()
-    });
+    let datatype_iri = snapshot
+        .decode_sid(dt)
+        .unwrap_or_else(|| "http://www.w3.org/2001/XMLSchema#string".to_string());
     let value = flake_value_to_lexical(o);
     Ok(WireObject::Literal {
         value,

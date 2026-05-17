@@ -10,8 +10,8 @@
 //! See `docs/design/cross-ledger-model-enforcement.md`.
 
 use super::types::{
-    check_cycle, memo_hit, reject_if_reserved_graph, ArtifactKind, GovernanceArtifact,
-    ResolveCtx, ResolvedGraph,
+    check_cycle, memo_hit, reject_if_reserved_graph, ArtifactKind, GovernanceArtifact, ResolveCtx,
+    ResolvedGraph,
 };
 use super::CrossLedgerError;
 use fluree_db_core::ledger_config::GraphSourceRef;
@@ -83,23 +83,27 @@ pub async fn resolve_graph_ref(
     // Caller is expected to invoke this only for cross-ledger refs
     // (graph_ref.ledger.is_some()). A same-ledger ref would be a
     // bug at the call site, not a user-facing failure.
-    let raw_ledger_ref = graph_ref.ledger.as_deref().ok_or_else(|| {
-        CrossLedgerError::TranslationFailed {
-            ledger_id: String::new(),
-            graph_iri: graph_ref.graph_selector.clone().unwrap_or_default(),
-            detail: "resolve_graph_ref called without f:ledger; same-ledger refs \
+    let raw_ledger_ref =
+        graph_ref
+            .ledger
+            .as_deref()
+            .ok_or_else(|| CrossLedgerError::TranslationFailed {
+                ledger_id: String::new(),
+                graph_iri: graph_ref.graph_selector.clone().unwrap_or_default(),
+                detail: "resolve_graph_ref called without f:ledger; same-ledger refs \
                     must use the local resolver"
-                .into(),
-        }
-    })?;
+                    .into(),
+            })?;
 
-    let graph_iri = graph_ref.graph_selector.as_deref().ok_or_else(|| {
-        CrossLedgerError::TranslationFailed {
-            ledger_id: raw_ledger_ref.to_string(),
-            graph_iri: String::new(),
-            detail: "cross-ledger references require an explicit f:graphSelector".into(),
-        }
-    })?;
+    let graph_iri =
+        graph_ref
+            .graph_selector
+            .as_deref()
+            .ok_or_else(|| CrossLedgerError::TranslationFailed {
+                ledger_id: raw_ledger_ref.to_string(),
+                graph_iri: String::new(),
+                detail: "cross-ledger references require an explicit f:graphSelector".into(),
+            })?;
 
     // (2) Canonicalize via the nameservice. Same-instance is enforced
     // implicitly: anything outside our nameservice can't be looked
@@ -142,8 +146,7 @@ pub async fn resolve_graph_ref(
         *t
     } else {
         let head_t = ns_record.commit_t;
-        ctx.resolved_ts
-            .insert(canonical_ledger_id.clone(), head_t);
+        ctx.resolved_ts.insert(canonical_ledger_id.clone(), head_t);
         head_t
     };
 
@@ -180,14 +183,8 @@ pub async fn resolve_graph_ref(
 
     // Materialize. Slice 3 provides the dispatch shape; the actual
     // projector lands in slice 4.
-    let materialize_result = materialize(
-        kind,
-        &canonical_ledger_id,
-        graph_iri,
-        resolved_t,
-        ctx,
-    )
-    .await;
+    let materialize_result =
+        materialize(kind, &canonical_ledger_id, graph_iri, resolved_t, ctx).await;
 
     // Always pop active, even on error, so a failure deeper in the
     // chain doesn't leave stale entries that trip cycle detection
@@ -364,9 +361,7 @@ mod tests {
             .await
             .unwrap_err();
         match err {
-            CrossLedgerError::UnsupportedFeature {
-                feature, phase, ..
-            } => {
+            CrossLedgerError::UnsupportedFeature { feature, phase, .. } => {
                 assert_eq!(feature, "f:atT");
                 assert_eq!(phase, "Phase 3");
             }
@@ -388,9 +383,7 @@ mod tests {
             .await
             .unwrap_err();
         match err {
-            CrossLedgerError::UnsupportedFeature {
-                feature, phase, ..
-            } => {
+            CrossLedgerError::UnsupportedFeature { feature, phase, .. } => {
                 assert_eq!(feature, "f:trustPolicy");
                 assert_eq!(phase, "Phase 4");
             }
@@ -404,17 +397,14 @@ mod tests {
         let mut ctx = ResolveCtx::new("d:main", &fluree);
 
         let mut ref_with_guard = cross_ref("m:main", "http://example.org/policy");
-        ref_with_guard.rollback_guard = Some(fluree_db_core::ledger_config::RollbackGuard {
-            min_t: Some(100),
-        });
+        ref_with_guard.rollback_guard =
+            Some(fluree_db_core::ledger_config::RollbackGuard { min_t: Some(100) });
 
         let err = resolve_graph_ref(&ref_with_guard, ArtifactKind::PolicyRules, &mut ctx)
             .await
             .unwrap_err();
         match err {
-            CrossLedgerError::UnsupportedFeature {
-                feature, phase, ..
-            } => {
+            CrossLedgerError::UnsupportedFeature { feature, phase, .. } => {
                 assert_eq!(feature, "f:rollbackGuard");
                 assert_eq!(phase, "Phase 4");
             }

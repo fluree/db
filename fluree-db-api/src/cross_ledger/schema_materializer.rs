@@ -39,9 +39,7 @@ pub(super) async fn materialize_schema(
         .map_err(|e| CrossLedgerError::TranslationFailed {
             ledger_id: canonical_model_ledger_id.to_string(),
             graph_iri: graph_iri.to_string(),
-            detail: format!(
-                "failed to open model ledger snapshot at t={resolved_t}: {e}"
-            ),
+            detail: format!("failed to open model ledger snapshot at t={resolved_t}: {e}"),
         })?;
 
     // 2. Resolve graph_iri → g_id in M's graph registry.
@@ -94,12 +92,8 @@ pub(super) async fn materialize_schema(
     let rdf_type_sid = m_db.snapshot.encode_iri(rdf::TYPE);
 
     // 4. Build M's view at the requested graph + t.
-    let m_view = fluree_db_core::GraphDbRef::new(
-        &m_db.snapshot,
-        g_id,
-        m_db.overlay.as_ref(),
-        m_db.t,
-    );
+    let m_view =
+        fluree_db_core::GraphDbRef::new(&m_db.snapshot, g_id, m_db.overlay.as_ref(), m_db.t);
     let opts = RangeOptions::default().with_to_t(m_db.t);
 
     // 5. Per-predicate PSOT scans for hierarchy / OWL axioms; per-
@@ -167,7 +161,9 @@ pub(super) async fn materialize_schema(
                 if !is_rdf_type(&f.p) {
                     continue;
                 }
-                let FlakeValue::Ref(ref obj) = f.o else { continue };
+                let FlakeValue::Ref(ref obj) = f.o else {
+                    continue;
+                };
                 if !is_schema_class(obj) {
                     continue;
                 }
@@ -185,8 +181,8 @@ pub(super) async fn materialize_schema(
     }
 
     let _ = m_view; // ensures the GraphDbRef binding is consumed; the
-                   // per-predicate scans hit range_with_overlay directly
-                   // for parity with build_schema_bundle_flakes.
+                    // per-predicate scans hit range_with_overlay directly
+                    // for parity with build_schema_bundle_flakes.
 
     Ok(SchemaArtifactWire {
         origin: WireOrigin {
@@ -221,27 +217,27 @@ fn push_ref_triple(
         // unexpected and silently skipped for Phase 1b-a.
         return Ok(());
     };
-    let s_iri = snapshot.decode_sid(s).ok_or_else(|| {
-        CrossLedgerError::TranslationFailed {
+    let s_iri = snapshot
+        .decode_sid(s)
+        .ok_or_else(|| CrossLedgerError::TranslationFailed {
             ledger_id: canonical_model_ledger_id.to_string(),
             graph_iri: graph_iri.to_string(),
             detail: format!("could not decode schema subject Sid {s:?}"),
-        }
-    })?;
-    let p_iri = snapshot.decode_sid(p).ok_or_else(|| {
-        CrossLedgerError::TranslationFailed {
+        })?;
+    let p_iri = snapshot
+        .decode_sid(p)
+        .ok_or_else(|| CrossLedgerError::TranslationFailed {
             ledger_id: canonical_model_ledger_id.to_string(),
             graph_iri: graph_iri.to_string(),
             detail: format!("could not decode schema predicate Sid {p:?}"),
-        }
-    })?;
-    let o_iri = snapshot.decode_sid(o_sid).ok_or_else(|| {
-        CrossLedgerError::TranslationFailed {
+        })?;
+    let o_iri = snapshot
+        .decode_sid(o_sid)
+        .ok_or_else(|| CrossLedgerError::TranslationFailed {
             ledger_id: canonical_model_ledger_id.to_string(),
             graph_iri: graph_iri.to_string(),
             detail: format!("could not decode schema object Sid {o_sid:?}"),
-        }
-    })?;
+        })?;
     out.push(WireTriple {
         s: s_iri,
         p: p_iri,

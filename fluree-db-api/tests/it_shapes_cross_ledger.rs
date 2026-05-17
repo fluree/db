@@ -31,7 +31,7 @@ async fn data_ledger_tx_rejected_by_cross_ledger_shape() {
 
     let shapes_graph_iri = "http://example.org/governance/shapes";
     let m_trig = format!(
-        r#"
+        r"
         @prefix sh:   <http://www.w3.org/ns/shacl#> .
         @prefix rdf:  <http://www.w3.org/1999/02/22-rdf-syntax-ns#> .
         @prefix xsd:  <http://www.w3.org/2001/XMLSchema#> .
@@ -47,7 +47,7 @@ async fn data_ledger_tx_rejected_by_cross_ledger_shape() {
                 sh:minCount 1 ;
                 sh:datatype xsd:string .
         }}
-    "#
+    "
     );
     fluree
         .stage_owned(model)
@@ -104,9 +104,7 @@ async fn data_ledger_tx_rejected_by_cross_ledger_shape() {
     assert!(
         matches!(
             err,
-            fluree_db_api::ApiError::Transact(
-                fluree_db_transact::TransactError::ShaclViolation(_)
-            )
+            fluree_db_api::ApiError::Transact(fluree_db_transact::TransactError::ShaclViolation(_))
         ),
         "expected ShaclViolation from M's cross-ledger shape, got: {err:?}"
     );
@@ -123,7 +121,7 @@ async fn data_ledger_tx_passes_when_cross_ledger_shape_satisfied() {
     fluree
         .stage_owned(model)
         .upsert_turtle(&format!(
-            r#"
+            r"
             @prefix sh:   <http://www.w3.org/ns/shacl#> .
             @prefix rdf:  <http://www.w3.org/1999/02/22-rdf-syntax-ns#> .
             @prefix xsd:  <http://www.w3.org/2001/XMLSchema#> .
@@ -139,7 +137,7 @@ async fn data_ledger_tx_passes_when_cross_ledger_shape_satisfied() {
                     sh:minCount 1 ;
                     sh:datatype xsd:string .
             }}
-        "#
+        "
         ))
         .execute()
         .await
