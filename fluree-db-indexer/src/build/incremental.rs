@@ -2255,6 +2255,20 @@ pub async fn incremental_index(
                         let class_merge_started = Instant::now();
                         let existing_property_count = entry.properties.len();
                         let novelty_property_count = props.len();
+                        if merged_class_entries < 10
+                            || existing_property_count >= 100
+                            || novelty_property_count >= 100
+                        {
+                            tracing::debug!(
+                                g_id,
+                                class_sid64,
+                                existing_property_count,
+                                novelty_property_count,
+                                visited_class_entries,
+                                total_entries = total_class_entries,
+                                "Phase 3b: class property attribution entry starting"
+                            );
+                        }
                         let class_dts = class_prop_dts.get(&(g_id, class_sid64));
                         let class_refs = ref_edges.get(&(g_id, class_sid64));
                         let class_langs = class_prop_lang_deltas.get(&(g_id, class_sid64));
@@ -2300,114 +2314,139 @@ pub async fn incremental_index(
                             })
                             .collect();
 
-                        entry.properties = prop_set
-                            .iter()
-                            .map(|&cp_id| {
-                                let iri = novelty.shared.predicates.resolve(cp_id).unwrap_or("");
-                                let p_sid = match trie.longest_match(iri) {
-                                    Some((code, plen)) => {
-                                        fluree_db_core::Sid::new(code, &iri[plen..])
-                                    }
-                                    None => fluree_db_core::Sid::new(0, iri),
-                                };
-                                let base_pu = base_prop_by_pid.get(&cp_id).copied();
+                        let total_class_properties = prop_set.len();
+                        let base_ref_class_count: usize =
+                            entry.properties.iter().map(|pu| pu.ref_classes.len()).sum();
+                        if merged_class_entries < 10
+                            || total_class_properties >= 100
+                            || base_ref_class_count >= 100
+                        {
+                            tracing::debug!(
+                                g_id,
+                                class_sid64,
+                                existing_property_count,
+                                novelty_property_count,
+                                total_class_properties,
+                                base_ref_class_count,
+                                visited_class_entries,
+                                total_entries = total_class_entries,
+                                "Phase 3b: merging class property attribution entry"
+                            );
+                        }
 
-                                // Merge base + novelty datatypes.
-                                let mut merged_dts: std::collections::HashMap<u8, i64> =
-                                    std::collections::HashMap::new();
-                                if let Some(bpu) = base_pu {
-                                    for &(dt, cnt) in &bpu.datatypes {
-                                        *merged_dts.entry(dt).or_insert(0) += cnt as i64;
-                                    }
-                                }
-                                if let Some(dt_delta) = class_dts.and_then(|m| m.get(&cp_id)) {
-                                    for (&dt, &cnt) in dt_delta {
-                                        *merged_dts.entry(dt).or_insert(0) += cnt;
-                                    }
-                                }
-                                let datatypes: Vec<(u8, u64)> = merged_dts
-                                    .into_iter()
-                                    .filter(|(_, v)| *v > 0)
-                                    .map(|(dt, v)| (dt, v as u64))
-                                    .collect();
+                        let mut merged_properties = Vec::with_capacity(total_class_properties);
+                        let mut merged_property_count = 0usize;
+                        let mut last_class_property_log = Instant::now();
+                        for &cp_id in &prop_set {
+                            let iri = novelty.shared.predicates.resolve(cp_id).unwrap_or("");
+                            let p_sid = match trie.longest_match(iri) {
+                                Some((code, plen)) => fluree_db_core::Sid::new(code, &iri[plen..]),
+                                None => fluree_db_core::Sid::new(0, iri),
+                            };
+                            let base_pu = base_prop_by_pid.get(&cp_id).copied();
 
-                                // Merge base + novelty langs.
-                                let mut merged_langs: std::collections::HashMap<String, i64> =
-                                    std::collections::HashMap::new();
-                                if let Some(bpu) = base_pu {
-                                    for (tag, cnt) in &bpu.langs {
-                                        *merged_langs.entry(tag.clone()).or_insert(0) +=
-                                            *cnt as i64;
-                                    }
+                            // Merge base + novelty datatypes.
+                            let mut merged_dts: std::collections::HashMap<u8, i64> =
+                                std::collections::HashMap::new();
+                            if let Some(bpu) = base_pu {
+                                for &(dt, cnt) in &bpu.datatypes {
+                                    *merged_dts.entry(dt).or_insert(0) += cnt as i64;
                                 }
-                                if let Some(lang_delta) = class_langs.and_then(|m| m.get(&cp_id)) {
-                                    for (&lid, &cnt) in lang_delta {
-                                        let tag = lang_id_to_tag
-                                            .get(&lid)
-                                            .cloned()
-                                            .unwrap_or_else(|| format!("lang:{lid}"));
-                                        *merged_langs.entry(tag).or_insert(0) += cnt;
-                                    }
+                            }
+                            if let Some(dt_delta) = class_dts.and_then(|m| m.get(&cp_id)) {
+                                for (&dt, &cnt) in dt_delta {
+                                    *merged_dts.entry(dt).or_insert(0) += cnt;
                                 }
-                                let langs: Vec<(String, u64)> = merged_langs
-                                    .into_iter()
-                                    .filter(|(_, v)| *v > 0)
-                                    .map(|(tag, v)| (tag, v as u64))
-                                    .collect();
+                            }
+                            let datatypes: Vec<(u8, u64)> = merged_dts
+                                .into_iter()
+                                .filter(|(_, v)| *v > 0)
+                                .map(|(dt, v)| (dt, v as u64))
+                                .collect();
 
-                                // Merge base + novelty ref_classes.
-                                let mut merged_refs: std::collections::HashMap<u64, i64> =
-                                    std::collections::HashMap::new();
-                                if let Some(bpu) = base_pu {
-                                    for rc in &bpu.ref_classes {
-                                        ref_class_sid_lookups.fetch_add(1, Ordering::Relaxed);
-                                        let rc_sid64 = store_opt
-                                            .as_ref()
-                                            .and_then(|s| {
-                                                s.find_subject_id_by_parts(
-                                                    rc.class_sid.namespace_code,
-                                                    &rc.class_sid.name,
-                                                )
-                                                .ok()
-                                                .flatten()
-                                            })
-                                            .unwrap_or(0);
-                                        if rc_sid64 != 0 {
-                                            ref_class_sid_hits.fetch_add(1, Ordering::Relaxed);
-                                            *merged_refs.entry(rc_sid64).or_insert(0) +=
-                                                rc.count as i64;
-                                        }
-                                    }
+                            // Merge base + novelty langs.
+                            let mut merged_langs: std::collections::HashMap<String, i64> =
+                                std::collections::HashMap::new();
+                            if let Some(bpu) = base_pu {
+                                for (tag, cnt) in &bpu.langs {
+                                    *merged_langs.entry(tag.clone()).or_insert(0) += *cnt as i64;
                                 }
-                                if let Some(ref_delta) = class_refs.and_then(|m| m.get(&cp_id)) {
-                                    for (&target, &cnt) in ref_delta {
-                                        *merged_refs.entry(target).or_insert(0) += cnt;
-                                    }
+                            }
+                            if let Some(lang_delta) = class_langs.and_then(|m| m.get(&cp_id)) {
+                                for (&lid, &cnt) in lang_delta {
+                                    let tag = lang_id_to_tag
+                                        .get(&lid)
+                                        .cloned()
+                                        .unwrap_or_else(|| format!("lang:{lid}"));
+                                    *merged_langs.entry(tag).or_insert(0) += cnt;
                                 }
-                                let ref_classes: Vec<is::ClassRefCount> = merged_refs
-                                    .into_iter()
-                                    .filter(|(_, v)| *v > 0)
-                                    .map(|(target_sid64, cnt)| {
-                                        let cs = resolve_class_sid(
-                                            target_sid64,
-                                            store_opt.as_deref(),
-                                            &new_subject_suffix,
-                                        );
-                                        is::ClassRefCount {
-                                            class_sid: cs,
-                                            count: cnt as u64,
-                                        }
-                                    })
-                                    .collect();
+                            }
+                            let langs: Vec<(String, u64)> = merged_langs
+                                .into_iter()
+                                .filter(|(_, v)| *v > 0)
+                                .map(|(tag, v)| (tag, v as u64))
+                                .collect();
 
-                                is::ClassPropertyUsage {
-                                    property_sid: p_sid,
-                                    datatypes,
-                                    langs,
-                                    ref_classes,
+                            // Merge by Sid directly. The old path converted every
+                            // base ref-class Sid back through the reverse dictionary,
+                            // which can demand-load dictionary leaves during Phase 3b.
+                            let mut merged_refs: std::collections::HashMap<
+                                fluree_db_core::Sid,
+                                i64,
+                            > = std::collections::HashMap::new();
+                            if let Some(bpu) = base_pu {
+                                for rc in &bpu.ref_classes {
+                                    *merged_refs.entry(rc.class_sid.clone()).or_insert(0) +=
+                                        rc.count as i64;
                                 }
-                            })
-                            .collect();
+                            }
+                            if let Some(ref_delta) = class_refs.and_then(|m| m.get(&cp_id)) {
+                                for (&target, &cnt) in ref_delta {
+                                    ref_class_sid_lookups.fetch_add(1, Ordering::Relaxed);
+                                    let cs = resolve_class_sid(
+                                        target,
+                                        store_opt.as_deref(),
+                                        &new_subject_suffix,
+                                    );
+                                    ref_class_sid_hits.fetch_add(1, Ordering::Relaxed);
+                                    *merged_refs.entry(cs).or_insert(0) += cnt;
+                                }
+                            }
+                            let ref_classes: Vec<is::ClassRefCount> = merged_refs
+                                .into_iter()
+                                .filter(|(_, v)| *v > 0)
+                                .map(|(class_sid, cnt)| is::ClassRefCount {
+                                    class_sid,
+                                    count: cnt as u64,
+                                })
+                                .collect();
+
+                            merged_properties.push(is::ClassPropertyUsage {
+                                property_sid: p_sid,
+                                datatypes,
+                                langs,
+                                ref_classes,
+                            });
+                            merged_property_count += 1;
+
+                            if last_class_property_log.elapsed()
+                                >= std::time::Duration::from_secs(5)
+                            {
+                                tracing::debug!(
+                                    g_id,
+                                    class_sid64,
+                                    merged_property_count,
+                                    total_class_properties,
+                                    ref_class_sid_lookups =
+                                        ref_class_sid_lookups.load(Ordering::Relaxed),
+                                    elapsed_ms = class_merge_started.elapsed().as_millis() as u64,
+                                    phase_elapsed_ms = phase3b_started.elapsed().as_millis() as u64,
+                                    "Phase 3b: class property attribution entry still merging"
+                                );
+                                last_class_property_log = Instant::now();
+                            }
+                        }
+                        entry.properties = merged_properties;
                         merged_class_entries += 1;
                         let class_merge_ms = class_merge_started.elapsed().as_millis() as u64;
                         if class_merge_ms >= 1_000 {

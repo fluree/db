@@ -1041,36 +1041,48 @@ impl BackgroundIndexerWorker {
                             "Successfully indexed ledger"
                         );
 
-                    // Spawn garbage collection (fire-and-forget, non-fatal).
-                    let gc_store = self.backend.content_store(&index_result.ledger_id);
-                    let gc_root_id = index_result.root_id.clone();
-                    let gc_config = crate::gc::CleanGarbageConfig {
-                        max_old_indexes: Some(self.config.gc_max_old_indexes),
-                        min_time_garbage_mins: Some(self.config.gc_min_time_mins),
-                        artifact_cache_dir: Some(
-                            self.config
-                                .data_dir
-                                .as_ref()
-                                .map(|d| d.join("binary_artifact_cache"))
-                                .unwrap_or_else(|| {
-                                    std::env::temp_dir().join("fluree_binary_cache")
-                                }),
-                        ),
-                    };
-                    tokio::spawn(async move {
-                        if let Err(e) =
-                            crate::gc::clean_garbage(gc_store.as_ref(), &gc_root_id, gc_config)
-                                .await
-                        {
-                            warn!(
-                                error = %e,
-                                root_id = %gc_root_id,
-                                "Background GC failed (non-fatal)"
-                            );
-                        } else {
-                            debug!(root_id = %gc_root_id, "Background GC completed");
-                        }
-                    });
+                    // Spawn garbage collection only after enough published index
+                    // versions can exist to exceed retention. The collector still
+                    // checks the exact prev-index chain and age thresholds.
+                    let gc_keep_count = 1_i64 + i64::from(self.config.gc_max_old_indexes);
+                    if index_result.index_t <= gc_keep_count {
+                        debug!(
+                            root_id = %index_result.root_id,
+                            index_t = index_result.index_t,
+                            gc_keep_count,
+                            "Skipping background GC; index chain cannot exceed retention yet"
+                        );
+                    } else {
+                        let gc_store = self.backend.content_store(&index_result.ledger_id);
+                        let gc_root_id = index_result.root_id.clone();
+                        let gc_config = crate::gc::CleanGarbageConfig {
+                            max_old_indexes: Some(self.config.gc_max_old_indexes),
+                            min_time_garbage_mins: Some(self.config.gc_min_time_mins),
+                            artifact_cache_dir: Some(
+                                self.config
+                                    .data_dir
+                                    .as_ref()
+                                    .map(|d| d.join("binary_artifact_cache"))
+                                    .unwrap_or_else(|| {
+                                        std::env::temp_dir().join("fluree_binary_cache")
+                                    }),
+                            ),
+                        };
+                        tokio::spawn(async move {
+                            if let Err(e) =
+                                crate::gc::clean_garbage(gc_store.as_ref(), &gc_root_id, gc_config)
+                                    .await
+                            {
+                                warn!(
+                                    error = %e,
+                                    root_id = %gc_root_id,
+                                    "Background GC failed (non-fatal)"
+                                );
+                            } else {
+                                debug!(root_id = %gc_root_id, "Background GC completed");
+                            }
+                        });
+                    }
 
                     // Resolve waiters
                     let mut states = self.states.lock().await;
