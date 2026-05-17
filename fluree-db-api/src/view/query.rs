@@ -514,16 +514,26 @@ impl Fluree {
         // query graph.
         executable.reasoning.rules_source_g_id = db.rules_source_g_id();
 
+        // Build a single per-request `ResolveCtx` so every
+        // cross-ledger artifact (rules, schema, …) captured by this
+        // query observes a coherent head-t per model ledger. Two
+        // separate contexts would each lazy-capture a head-t and
+        // could disagree if M advances between awaits — that breaks
+        // the resolver's per-request consistency contract.
+        let mut ctx = crate::cross_ledger::ResolveCtx::new(db.as_graph_db_ref().snapshot.ledger_id.as_str(), self);
+
         // Cross-ledger `f:rulesSource`: when M is referenced via
         // `f:ledger`, resolve M's rules graph through the
         // cross-ledger resolver and merge the JSON rule bodies into
         // `executable.reasoning.rules` so they pass through the
         // existing query-time rule code path. Same-ledger references
         // are handled above via `rules_source_g_id`.
-        self.attach_cross_ledger_rules(db, &mut executable).await?;
+        self.attach_cross_ledger_rules(db, &mut executable, &mut ctx)
+            .await?;
 
         // Resolve `f:schemaSource` + `owl:imports` closure, if configured.
-        self.attach_schema_bundle(db, &mut executable).await?;
+        self.attach_schema_bundle(db, &mut executable, &mut ctx)
+            .await?;
 
         Ok(executable)
     }
@@ -545,6 +555,7 @@ impl Fluree {
         &self,
         db: &GraphDb,
         executable: &mut ExecutableQuery,
+        ctx: &mut crate::cross_ledger::ResolveCtx<'_>,
     ) -> Result<()> {
         if !executable.reasoning.modes.datalog {
             return Ok(());
@@ -562,13 +573,10 @@ impl Fluree {
             return Ok(());
         }
 
-        let db_ref = db.as_graph_db_ref();
-        let mut ctx =
-            crate::cross_ledger::ResolveCtx::new(db_ref.snapshot.ledger_id.as_str(), self);
         let resolved = crate::cross_ledger::resolve_graph_ref(
             source,
             crate::cross_ledger::ArtifactKind::Rules,
-            &mut ctx,
+            ctx,
         )
         .await?;
         let crate::cross_ledger::GovernanceArtifact::Rules(wire) = &resolved.artifact else {
@@ -582,7 +590,7 @@ impl Fluree {
                 },
             ));
         };
-        executable.reasoning.modes.rules.extend(wire.parsed_rules());
+        executable.reasoning.modes.rules.extend(wire.parsed_rules()?);
         Ok(())
     }
 
@@ -604,6 +612,7 @@ impl Fluree {
         &self,
         db: &GraphDb,
         executable: &mut ExecutableQuery,
+        ctx: &mut crate::cross_ledger::ResolveCtx<'_>,
     ) -> Result<()> {
         if executable.reasoning.modes.is_disabled() {
             return Ok(());
@@ -627,12 +636,10 @@ impl Fluree {
         // configs go through the existing local path unchanged.
         let schema_source = reasoning.schema_source.as_ref().expect("checked above");
         if schema_source.ledger.is_some() {
-            let mut ctx =
-                crate::cross_ledger::ResolveCtx::new(db_ref.snapshot.ledger_id.as_str(), self);
             let resolved = crate::cross_ledger::resolve_graph_ref(
                 schema_source,
                 crate::cross_ledger::ArtifactKind::SchemaClosure,
-                &mut ctx,
+                ctx,
             )
             .await?;
             let crate::cross_ledger::GovernanceArtifact::SchemaClosure(wire) = &resolved.artifact

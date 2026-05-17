@@ -38,15 +38,13 @@ pub(super) async fn materialize_shapes(
             detail: format!("failed to open model ledger snapshot at t={resolved_t}: {e}"),
         })?;
 
-    let g_id = m_db
-        .snapshot
-        .graph_registry
-        .graph_id_for_iri(graph_iri)
-        .ok_or_else(|| CrossLedgerError::GraphMissingAtT {
+    let g_id = super::resolve_selector_g_id(&m_db.snapshot, graph_iri).ok_or_else(|| {
+        CrossLedgerError::GraphMissingAtT {
             ledger_id: canonical_model_ledger_id.to_string(),
             graph_iri: graph_iri.to_string(),
             resolved_t,
-        })?;
+        }
+    })?;
 
     // SHACL whitelist — mirrors fluree_db_shacl::ShapeCompiler::compile_from_dbs
     let shacl_predicate_names: &[&str] = &[

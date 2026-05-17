@@ -42,16 +42,15 @@ pub(super) async fn materialize_schema(
             detail: format!("failed to open model ledger snapshot at t={resolved_t}: {e}"),
         })?;
 
-    // 2. Resolve graph_iri → g_id in M's graph registry.
-    let g_id = m_db
-        .snapshot
-        .graph_registry
-        .graph_id_for_iri(graph_iri)
-        .ok_or_else(|| CrossLedgerError::GraphMissingAtT {
+    // 2. Resolve graph_iri → g_id in M's graph registry (handling
+    //    `f:defaultGraph` as g_id=0).
+    let g_id = super::resolve_selector_g_id(&m_db.snapshot, graph_iri).ok_or_else(|| {
+        CrossLedgerError::GraphMissingAtT {
             ledger_id: canonical_model_ledger_id.to_string(),
             graph_iri: graph_iri.to_string(),
             resolved_t,
-        })?;
+        }
+    })?;
 
     // 3. Encode the whitelist IRIs against M's namespace map. Same
     //    whitelist as fluree_db_query::schema_bundle::build_schema_bundle_flakes

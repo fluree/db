@@ -25,3 +25,19 @@ pub use types::{
     ArtifactKind, ConstraintsArtifactWire, GovernanceArtifact, ResolveCtx, ResolvedGraph,
     RulesArtifactWire, SchemaArtifactWire, ShapesArtifactWire, WireObject, WireOrigin, WireTriple,
 };
+
+/// Resolve a `f:graphSelector` IRI against a model ledger snapshot,
+/// honoring `f:defaultGraph` as `g_id = 0`. Used by every
+/// materializer to translate the selector IRI carried on the wire
+/// into a concrete graph id. Returns `None` when the IRI is neither
+/// `f:defaultGraph` nor present in the snapshot's `graph_registry`;
+/// callers map `None` to [`CrossLedgerError::GraphMissingAtT`].
+pub(crate) fn resolve_selector_g_id(
+    snapshot: &fluree_db_core::LedgerSnapshot,
+    graph_iri: &str,
+) -> Option<fluree_db_core::GraphId> {
+    if graph_iri == fluree_vocab::config_iris::DEFAULT_GRAPH {
+        return Some(0u16);
+    }
+    snapshot.graph_registry.graph_id_for_iri(graph_iri)
+}

@@ -124,6 +124,132 @@ async fn data_ledger_query_pulls_rules_from_model_ledger() {
 }
 
 #[tokio::test]
+async fn cross_ledger_rules_with_default_graph_selector() {
+    // Cross-ledger f:rulesSource with `f:graphSelector f:defaultGraph`
+    // must resolve to M's g_id=0 (not collide with the named-graph
+    // registry lookup). Without the fix, this returned
+    // GraphMissingAtT because `https://ns.flur.ee/db#defaultGraph`
+    // isn't a registered graph IRI on M.
+    let fluree = FlureeBuilder::memory().build_memory();
+
+    let model_id = "test/cross-ledger-rules/default-graph-model:main";
+    let model = genesis_ledger(&fluree, model_id);
+
+    // Insert the rule into M's *default* graph (no GRAPH wrapper).
+    let rule_doc = json!({
+        "@context": {
+            "ex": "http://example.org/",
+            "f":  "https://ns.flur.ee/db#"
+        },
+        "@id": "ex:grandparentRule",
+        "f:rule": {
+            "@type":  "@json",
+            "@value": {
+                "@context": {"ex": "http://example.org/"},
+                "where":    {"@id": "?p", "ex:parent": {"ex:parent": "?g"}},
+                "insert":   {"@id": "?p", "ex:grandparent": {"@id": "?g"}}
+            }
+        }
+    });
+    fluree
+        .insert(model, &rule_doc)
+        .await
+        .expect("seed M default graph with rule");
+
+    // D's config points at M's default graph via f:defaultGraph.
+    let data_id = "test/cross-ledger-rules/default-graph-data:main";
+    let data = genesis_ledger(&fluree, data_id);
+    let cfg = config_iri(data_id);
+    let cfg_trig = format!(
+        r"
+        @prefix f:   <https://ns.flur.ee/db#> .
+        @prefix rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#> .
+
+        GRAPH <{cfg}> {{
+            <urn:cfg:main>      rdf:type          f:LedgerConfig .
+            <urn:cfg:main>      f:datalogDefaults <urn:cfg:datalog> .
+            <urn:cfg:datalog>   f:datalogEnabled  true .
+            <urn:cfg:datalog>   f:rulesSource     <urn:cfg:rules-ref> .
+            <urn:cfg:rules-ref> rdf:type          f:GraphRef ;
+                                f:graphSource     <urn:cfg:rules-src> .
+            <urn:cfg:rules-src> f:ledger          <{model_id}> ;
+                                f:graphSelector   f:defaultGraph .
+        }}
+    "
+    );
+    let r = fluree
+        .stage_owned(data)
+        .upsert_turtle(&cfg_trig)
+        .execute()
+        .await
+        .expect("seed D config (cross-ledger + f:defaultGraph)");
+    let data = r.ledger;
+
+    let family = json!({
+        "@context": {"ex": "http://example.org/"},
+        "@graph": [
+            {"@id": "ex:alice", "ex:parent": {"@id": "ex:bob"}},
+            {"@id": "ex:bob",   "ex:parent": {"@id": "ex:charlie"}}
+        ]
+    });
+    fluree.insert(data, &family).await.expect("seed D family");
+
+    let view = fluree.db(data_id).await.expect("load D");
+    let q = json!({
+        "@context": {"ex": "http://example.org/"},
+        "select": "?g",
+        "where":  {"@id": "ex:alice", "ex:grandparent": "?g"},
+        "reasoning": "datalog"
+    });
+    let data = fluree.ledger(data_id).await.expect("reload D");
+    let rows = fluree
+        .query(&view, &q)
+        .await
+        .expect("cross-ledger rule via f:defaultGraph must work")
+        .to_jsonld(&data.snapshot)
+        .expect("to_jsonld");
+    let results = normalize_rows(&rows);
+    assert!(
+        results.contains(&json!("ex:charlie")),
+        "expected charlie derived via cross-ledger f:defaultGraph; got: {results:?}"
+    );
+}
+
+/// Defense-in-depth: `RulesArtifactWire::parsed_rules` must
+/// `Err(CrossLedgerError::TranslationFailed)` on any malformed JSON
+/// body rather than silently dropping the entry. Cross-ledger
+/// governance is admin-authored; silently weakening the reasoning
+/// model is the worst failure mode.
+///
+/// Normal write paths (Turtle/JSON-LD insert) reject malformed JSON
+/// literals at the storage boundary — so this is structurally
+/// unreachable through user code today. The guard remains because
+/// the wire boundary can be reached by future formats, repairs, or
+/// out-of-band index writes; the unit test pins the behaviour.
+#[test]
+fn parsed_rules_fails_closed_on_malformed_json() {
+    use fluree_db_api::cross_ledger::{RulesArtifactWire, WireOrigin};
+
+    let wire = RulesArtifactWire {
+        origin: WireOrigin {
+            model_ledger_id: "test/m:main".into(),
+            graph_iri: "http://example.org/rules".into(),
+            resolved_t: 1,
+        },
+        rules: vec!["{ valid: false".into()],
+    };
+
+    let err = wire
+        .parsed_rules()
+        .expect_err("malformed JSON must fail closed");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("malformed cross-ledger rule"),
+        "expected explicit malformed-rule diagnostic, got: {msg}"
+    );
+}
+
+#[tokio::test]
 async fn missing_model_ledger_surfaces_cross_ledger_error() {
     // f:rulesSource → a model ledger that doesn't exist. The
     // resolver must return CrossLedgerError::ModelLedgerMissing

@@ -84,16 +84,15 @@ pub(super) async fn materialize_policy_rules(
             detail: format!("failed to open model ledger snapshot at t={resolved_t}: {e}"),
         })?;
 
-    // 2. Resolve graph_iri → g_id in M's graph registry.
-    let g_id = m_db
-        .snapshot
-        .graph_registry
-        .graph_id_for_iri(graph_iri)
-        .ok_or_else(|| CrossLedgerError::GraphMissingAtT {
+    // 2. Resolve graph_iri → g_id in M's graph registry (handling
+    //    `f:defaultGraph` as g_id=0).
+    let g_id = super::resolve_selector_g_id(&m_db.snapshot, graph_iri).ok_or_else(|| {
+        CrossLedgerError::GraphMissingAtT {
             ledger_id: canonical_model_ledger_id.to_string(),
             graph_iri: graph_iri.to_string(),
             resolved_t,
-        })?;
+        }
+    })?;
 
     // 3. Encode the predicate IRIs we need to scan against M's
     //    namespace map. These come from default namespaces

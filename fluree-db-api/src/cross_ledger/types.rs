@@ -442,26 +442,33 @@ pub struct RulesArtifactWire {
 impl RulesArtifactWire {
     /// Decode each rule body into a `serde_json::Value` ready for
     /// `execute_datalog_rules_with_query_rules`'s
-    /// `query_time_rules` slot. Malformed JSON entries are
-    /// skipped with a warning — a single bad rule should not
-    /// poison the entire ledger's reasoning pass.
-    pub fn parsed_rules(&self) -> Vec<serde_json::Value> {
+    /// `query_time_rules` slot.
+    ///
+    /// **Fail-closed**: a single malformed entry returns
+    /// [`super::CrossLedgerError::TranslationFailed`] rather than
+    /// silently dropping the rule. Cross-ledger governance is
+    /// administrator-authored — silently weakening the configured
+    /// reasoning model would be the worst possible behaviour. The
+    /// per-query path that maps `opts.rules` *does* tolerate
+    /// individual bad rules, but that's a self-service surface
+    /// where the author is the requester.
+    pub fn parsed_rules(&self) -> Result<Vec<serde_json::Value>, super::CrossLedgerError> {
         let mut out = Vec::with_capacity(self.rules.len());
         for (idx, raw) in self.rules.iter().enumerate() {
             match serde_json::from_str(raw) {
                 Ok(v) => out.push(v),
                 Err(e) => {
-                    tracing::warn!(
-                        rule_index = idx,
-                        error = %e,
-                        ledger = %self.origin.model_ledger_id,
-                        graph = %self.origin.graph_iri,
-                        "skipping malformed cross-ledger rule"
-                    );
+                    return Err(super::CrossLedgerError::TranslationFailed {
+                        ledger_id: self.origin.model_ledger_id.clone(),
+                        graph_iri: self.origin.graph_iri.clone(),
+                        detail: format!(
+                            "malformed cross-ledger rule at index {idx}: {e}"
+                        ),
+                    });
                 }
             }
         }
-        out
+        Ok(out)
     }
 }
 

@@ -147,6 +147,95 @@ async fn rules_source_in_named_graph_is_honored() {
 }
 
 #[tokio::test]
+async fn unknown_rules_source_graph_iri_fails_loudly() {
+    // Misconfiguration: f:rulesSource points at a graph IRI that
+    // doesn't exist in this ledger. Must surface as a config error
+    // at db() load time, not silently fall back to "no rules".
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger_id = "rules-src/unknown-graph:main";
+    let ledger = genesis_ledger(&fluree, ledger_id);
+
+    let cfg = config_iri(ledger_id);
+    let bad_iri = "http://example.org/this-graph-does-not-exist";
+    let cfg_trig = format!(
+        r"
+        @prefix f:   <https://ns.flur.ee/db#> .
+        @prefix rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#> .
+
+        GRAPH <{cfg}> {{
+            <urn:cfg:main>      rdf:type          f:LedgerConfig .
+            <urn:cfg:main>      f:datalogDefaults <urn:cfg:datalog> .
+            <urn:cfg:datalog>   f:datalogEnabled  true .
+            <urn:cfg:datalog>   f:rulesSource     <urn:cfg:rules-ref> .
+            <urn:cfg:rules-ref> rdf:type          f:GraphRef ;
+                                f:graphSource     <urn:cfg:rules-src> .
+            <urn:cfg:rules-src> f:graphSelector   <{bad_iri}> .
+        }}
+    "
+    );
+    fluree
+        .stage_owned(ledger)
+        .upsert_turtle(&cfg_trig)
+        .execute()
+        .await
+        .expect("seed misconfigured rulesSource");
+
+    let err = fluree
+        .db(ledger_id)
+        .await
+        .expect_err("unknown rulesSource graph IRI must fail loudly");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("f:rulesSource") && msg.contains("not found"),
+        "expected explicit f:rulesSource error, got: {msg}"
+    );
+}
+
+#[tokio::test]
+async fn rules_source_with_unsupported_at_t_fails_loudly() {
+    // f:atT on f:rulesSource is reserved (Phase 3+). Must surface
+    // as a config error rather than silently disabling rules.
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger_id = "rules-src/unsupported-at-t:main";
+    let ledger = genesis_ledger(&fluree, ledger_id);
+
+    let cfg = config_iri(ledger_id);
+    let cfg_trig = format!(
+        r"
+        @prefix f:   <https://ns.flur.ee/db#> .
+        @prefix rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#> .
+
+        GRAPH <{cfg}> {{
+            <urn:cfg:main>      rdf:type          f:LedgerConfig .
+            <urn:cfg:main>      f:datalogDefaults <urn:cfg:datalog> .
+            <urn:cfg:datalog>   f:datalogEnabled  true .
+            <urn:cfg:datalog>   f:rulesSource     <urn:cfg:rules-ref> .
+            <urn:cfg:rules-ref> rdf:type          f:GraphRef ;
+                                f:graphSource     <urn:cfg:rules-src> .
+            <urn:cfg:rules-src> f:graphSelector   f:defaultGraph ;
+                                f:atT             5 .
+        }}
+    "
+    );
+    fluree
+        .stage_owned(ledger)
+        .upsert_turtle(&cfg_trig)
+        .execute()
+        .await
+        .expect("seed config with reserved f:atT");
+
+    let err = fluree
+        .db(ledger_id)
+        .await
+        .expect_err("f:atT on f:rulesSource must surface as a config error");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("f:atT"),
+        "expected f:atT mention in error, got: {msg}"
+    );
+}
+
+#[tokio::test]
 async fn rule_in_named_graph_without_rules_source_is_ignored() {
     // Negative control: same rule, same named graph, but NO
     // f:rulesSource configured. The extractor defaults to the

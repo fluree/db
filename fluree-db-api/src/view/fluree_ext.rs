@@ -143,25 +143,20 @@ impl Fluree {
 
         // Pre-resolve `f:rulesSource` to a local graph id so the
         // datalog rule extractor scans the configured graph rather
-        // than the query graph. We do this here (not in
-        // apply_config_datalog) because the lookup is identity-
-        // independent — override gates affect *whether* datalog
-        // runs and which override identity may flip enabled/etc.,
-        // not where rules live.
+        // than the query graph. Identity-independent, so done here
+        // and not in apply_config_datalog (override gates affect
+        // *whether* datalog runs, not where rules live).
         //
-        // Cross-ledger references (`f:ledger` set) are skipped —
-        // they dispatch through the cross-ledger resolver at query
-        // time, not through a local graph id.
-        let rules_source_g_id = resolved
-            .datalog
-            .as_ref()
-            .and_then(|d| d.rules_source.as_ref())
-            .filter(|src| src.ledger.is_none())
-            .and_then(|src| match src.graph_selector.as_deref() {
-                Some(iri) if iri == fluree_vocab::config_iris::DEFAULT_GRAPH => Some(0u16),
-                Some(iri) => view.snapshot.graph_registry.graph_id_for_iri(iri),
-                None => Some(0u16),
-            });
+        // Cross-ledger references (`f:ledger` set) skip this path
+        // and dispatch through the cross-ledger resolver at query
+        // time. Misconfigured same-ledger references (unknown
+        // graph IRI, or unsupported `GraphSourceRef` dimensions
+        // like `f:atT` / `f:trustPolicy` / `f:rollbackGuard`) fail
+        // here — silently dropping a configured rules source would
+        // let a typo or premature feature use silently disable
+        // governance the operator believed to be in effect.
+        let rules_source_g_id =
+            resolve_local_rules_source_g_id(resolved.datalog.as_ref(), &view.snapshot)?;
 
         Ok(view
             .with_ledger_config(config)
@@ -863,6 +858,64 @@ impl Fluree {
 // ============================================================================
 // Helpers
 // ============================================================================
+
+/// Resolve a same-ledger `f:rulesSource` selector to a local graph id.
+///
+/// Returns:
+/// - `Ok(Some(g_id))` for a valid local reference (named graph or
+///   `f:defaultGraph` → `g_id=0`).
+/// - `Ok(None)` when there is no `f:datalogDefaults` block or no
+///   `f:rulesSource` inside it, or when the reference is
+///   cross-ledger (handled by the resolver at query time).
+/// - `Err(ApiError)` for misconfigurations the operator would
+///   want to know about: unsupported `GraphSourceRef` dimensions
+///   (`f:atT`, `f:trustPolicy`, `f:rollbackGuard`), or a
+///   `f:graphSelector` IRI that the snapshot's graph registry
+///   doesn't recognise.
+///
+/// Failing closed here matches the SHACL same-ledger resolver
+/// (`tx::resolve_shapes_source_g_ids`) — a typo in the config
+/// graph shouldn't silently downgrade the configured reasoning
+/// model.
+fn resolve_local_rules_source_g_id(
+    datalog: Option<&fluree_db_core::ledger_config::DatalogDefaults>,
+    snapshot: &fluree_db_core::LedgerSnapshot,
+) -> Result<Option<fluree_db_core::GraphId>> {
+    let Some(src) = datalog.and_then(|d| d.rules_source.as_ref()) else {
+        return Ok(None);
+    };
+    if src.ledger.is_some() {
+        // Cross-ledger — query-time resolver handles it.
+        return Ok(None);
+    }
+    if src.at_t.is_some() {
+        return Err(ApiError::config(
+            "f:rulesSource with f:atT (temporal pinning) is not yet supported",
+        ));
+    }
+    if src.trust_policy.is_some() {
+        return Err(ApiError::config(
+            "f:rulesSource with f:trustPolicy is not yet supported",
+        ));
+    }
+    if src.rollback_guard.is_some() {
+        return Err(ApiError::config(
+            "f:rulesSource with f:rollbackGuard is not yet supported",
+        ));
+    }
+    let g_id = match src.graph_selector.as_deref() {
+        Some(iri) if iri == fluree_vocab::config_iris::DEFAULT_GRAPH => Some(0u16),
+        Some(iri) => snapshot.graph_registry.graph_id_for_iri(iri),
+        None => Some(0u16),
+    };
+    match g_id {
+        Some(id) => Ok(Some(id)),
+        None => Err(ApiError::config(format!(
+            "f:rulesSource graph '{}' not found in this ledger's graph registry",
+            src.graph_selector.as_deref().unwrap_or("<none>"),
+        ))),
+    }
+}
 
 /// Populate `DictNovelty` from a view's novelty overlay, routing through the
 /// persisted dictionaries when a `BinaryIndexStore` is available.
