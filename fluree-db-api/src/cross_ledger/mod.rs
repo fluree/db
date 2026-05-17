@@ -26,18 +26,32 @@ pub use types::{
     RulesArtifactWire, SchemaArtifactWire, ShapesArtifactWire, WireObject, WireOrigin, WireTriple,
 };
 
-/// Resolve a `f:graphSelector` IRI against a model ledger snapshot,
-/// honoring `f:defaultGraph` as `g_id = 0`. Used by every
-/// materializer to translate the selector IRI carried on the wire
-/// into a concrete graph id. Returns `None` when the IRI is neither
-/// `f:defaultGraph` nor present in the snapshot's `graph_registry`;
-/// callers map `None` to [`CrossLedgerError::GraphMissingAtT`].
+/// Resolve a `f:graphSelector` IRI against a model ledger snapshot.
+///
+/// - `f:defaultGraph` → `Ok(Some(0))`.
+/// - `f:txnMetaGraph` → `Err(ReservedGraphSelected)`. The
+///   txn-meta graph carries commit-time provenance and is never a
+///   legitimate cross-ledger target; rejecting the sentinel here
+///   matches the per-canonical-ledger reserved-graph guard
+///   ([`crate::cross_ledger::types::reject_if_reserved_graph`])
+///   and surfaces the dedicated error variant instead of letting
+///   the request leak to a `GraphMissingAtT` after touching M.
+/// - Named graph IRI present in the snapshot's registry →
+///   `Ok(Some(g_id))`.
+/// - Otherwise → `Ok(None)`; callers map to
+///   [`CrossLedgerError::GraphMissingAtT`] with the full context
+///   (ledger id, resolved_t) that this helper doesn't carry.
 pub(crate) fn resolve_selector_g_id(
     snapshot: &fluree_db_core::LedgerSnapshot,
     graph_iri: &str,
-) -> Option<fluree_db_core::GraphId> {
+) -> Result<Option<fluree_db_core::GraphId>, CrossLedgerError> {
     if graph_iri == fluree_vocab::config_iris::DEFAULT_GRAPH {
-        return Some(0u16);
+        return Ok(Some(0u16));
     }
-    snapshot.graph_registry.graph_id_for_iri(graph_iri)
+    if graph_iri == fluree_vocab::config_iris::TXN_META_GRAPH {
+        return Err(CrossLedgerError::ReservedGraphSelected {
+            graph_iri: graph_iri.to_string(),
+        });
+    }
+    Ok(snapshot.graph_registry.graph_id_for_iri(graph_iri))
 }

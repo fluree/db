@@ -35,7 +35,7 @@ pub(super) async fn materialize_rules(
             detail: format!("failed to open model ledger snapshot at t={resolved_t}: {e}"),
         })?;
 
-    let g_id = super::resolve_selector_g_id(&m_db.snapshot, graph_iri).ok_or_else(|| {
+    let g_id = super::resolve_selector_g_id(&m_db.snapshot, graph_iri)?.ok_or_else(|| {
         CrossLedgerError::GraphMissingAtT {
             ledger_id: canonical_model_ledger_id.to_string(),
             graph_iri: graph_iri.to_string(),

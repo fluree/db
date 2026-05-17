@@ -300,7 +300,7 @@ pub(crate) struct StagedShaclContext<'a> {
 #[cfg(feature = "shacl")]
 async fn resolve_cross_ledger_shapes_for_tx(
     ledger: &LedgerState,
-    fluree: &crate::Fluree,
+    ctx: &mut crate::cross_ledger::ResolveCtx<'_>,
 ) -> std::result::Result<
     Option<std::sync::Arc<crate::cross_ledger::ResolvedGraph>>,
     fluree_db_transact::TransactError,
@@ -331,11 +331,10 @@ async fn resolve_cross_ledger_shapes_for_tx(
     if source.ledger.is_none() {
         return Ok(None);
     }
-    let mut ctx = crate::cross_ledger::ResolveCtx::new(ledger.snapshot.ledger_id.as_str(), fluree);
     let resolved = crate::cross_ledger::resolve_graph_ref(
         source,
         crate::cross_ledger::ArtifactKind::Shapes,
-        &mut ctx,
+        ctx,
     )
     .await
     .map_err(|e| {
@@ -628,7 +627,7 @@ async fn stage_with_config_shacl(
     txn: Txn,
     ns_registry: NamespaceRegistry,
     options: StageOptions<'_>,
-    fluree: &crate::Fluree,
+    resolve_ctx: &mut crate::cross_ledger::ResolveCtx<'_>,
 ) -> std::result::Result<(StagedLedger, NamespaceRegistry), fluree_db_transact::TransactError> {
     // Capture graph_delta + tracker before stage_txn consumes the options/txn.
     // graph_delta is used both for per-graph config lookup and for rebuilding
@@ -650,7 +649,7 @@ async fn stage_with_config_shacl(
     // governance cache. The wire is then threaded through
     // staging as an internal governance input and compiled
     // against the staged namespace registry at validation time.
-    let cross_ledger_shapes = resolve_cross_ledger_shapes_for_tx(&ledger, fluree).await?;
+    let cross_ledger_shapes = resolve_cross_ledger_shapes_for_tx(&ledger, resolve_ctx).await?;
 
     let (view, mut ns_registry) = stage_txn(ledger, txn, ns_registry, options).await?;
 
@@ -711,12 +710,12 @@ async fn stage_with_config_shacl(
 async fn enforce_unique_after_staging(
     view: &StagedLedger,
     graph_delta: &FxHashMap<u16, String>,
-    fluree: &crate::Fluree,
+    resolve_ctx: &mut crate::cross_ledger::ResolveCtx<'_>,
 ) -> std::result::Result<(), fluree_db_transact::TransactError> {
     let config = load_transaction_config(view.base()).await;
     if let Some(cfg) = &config {
         let per_graph_unique =
-            resolve_per_graph_unique_sids(view, cfg, graph_delta, fluree).await?;
+            resolve_per_graph_unique_sids(view, cfg, graph_delta, resolve_ctx).await?;
         enforce_unique_constraints(view, &per_graph_unique, graph_delta).await?;
     }
     Ok(())
@@ -733,12 +732,9 @@ async fn resolve_per_graph_unique_sids(
     view: &StagedLedger,
     config: &LedgerConfig,
     graph_delta: &FxHashMap<u16, String>,
-    fluree: &crate::Fluree,
+    resolve_ctx: &mut crate::cross_ledger::ResolveCtx<'_>,
 ) -> std::result::Result<HashMap<GraphId, FxHashSet<Sid>>, fluree_db_transact::TransactError> {
     let snapshot = view.db();
-    // One resolution context per tx — cross-ledger sources for
-    // different affected graphs in the same tx share memo / resolved_t.
-    let mut resolve_ctx = crate::cross_ledger::ResolveCtx::new(snapshot.ledger_id.as_str(), fluree);
 
     // Build reverse map: graph SID → g_id for flake graph resolution
     let mut sid_to_gid: HashMap<Sid, GraphId> = HashMap::new();
@@ -828,7 +824,7 @@ async fn resolve_per_graph_unique_sids(
                 let resolved = crate::cross_ledger::resolve_graph_ref(
                     source,
                     crate::cross_ledger::ArtifactKind::Constraints,
-                    &mut resolve_ctx,
+                    resolve_ctx,
                 )
                 .await
                 .map_err(|e| {
@@ -1468,14 +1464,22 @@ impl crate::Fluree {
             options = options.with_policy(p);
         }
 
+        // Single per-tx ResolveCtx shared by every cross-ledger
+        // governance lookup (SHACL shapes, constraints, …) so the
+        // tx observes a coherent `resolved_t` per model ledger
+        // across all subsystems. `ledger_id_owned` keeps a string
+        // alive past the `ledger` move into `stage_with_config_shacl`.
+        let ledger_id_owned: String = ledger.snapshot.ledger_id.to_string();
+        let mut resolve_ctx = crate::cross_ledger::ResolveCtx::new(&ledger_id_owned, self);
+
         #[cfg(feature = "shacl")]
         let (view, ns_registry) =
-            stage_with_config_shacl(ledger, txn, ns_registry, options, self).await?;
+            stage_with_config_shacl(ledger, txn, ns_registry, options, &mut resolve_ctx).await?;
         #[cfg(not(feature = "shacl"))]
         let (view, ns_registry) = stage_txn(ledger, txn, ns_registry, options).await?;
 
         // Enforce uniqueness constraints (independent of shacl feature)
-        enforce_unique_after_staging(&view, &graph_delta, self).await?;
+        enforce_unique_after_staging(&view, &graph_delta, &mut resolve_ctx).await?;
 
         Ok(StageResult {
             view,
@@ -1543,14 +1547,19 @@ impl crate::Fluree {
             }
         }
 
+        // Single per-tx ResolveCtx; see comment on the matching
+        // block above for the consistency rationale.
+        let ledger_id_owned: String = ledger.snapshot.ledger_id.to_string();
+        let mut resolve_ctx = crate::cross_ledger::ResolveCtx::new(&ledger_id_owned, self);
+
         #[cfg(feature = "shacl")]
         let (view, ns_registry) =
-            stage_with_config_shacl(ledger, txn, ns_registry, options, self).await?;
+            stage_with_config_shacl(ledger, txn, ns_registry, options, &mut resolve_ctx).await?;
         #[cfg(not(feature = "shacl"))]
         let (view, ns_registry) = stage_txn(ledger, txn, ns_registry, options).await?;
 
         // Enforce uniqueness constraints (independent of shacl feature)
-        enforce_unique_after_staging(&view, &graph_delta, self).await?;
+        enforce_unique_after_staging(&view, &graph_delta, &mut resolve_ctx).await?;
 
         Ok(StageResult {
             view,
@@ -1595,17 +1604,23 @@ impl crate::Fluree {
             options = options.with_index_config(cfg);
         }
 
+        // Single per-tx ResolveCtx; see comment on the matching
+        // block above for the consistency rationale.
+        let ledger_id_owned: String = ledger.snapshot.ledger_id.to_string();
+        let mut resolve_ctx = crate::cross_ledger::ResolveCtx::new(&ledger_id_owned, self);
+
         #[cfg(feature = "shacl")]
-        let (view, ns_registry) = stage_with_config_shacl(ledger, txn, ns_registry, options, self)
-            .await
-            .map_err(|e| TrackedErrorResponse::new(400, e.to_string(), tracker.tally()))?;
+        let (view, ns_registry) =
+            stage_with_config_shacl(ledger, txn, ns_registry, options, &mut resolve_ctx)
+                .await
+                .map_err(|e| TrackedErrorResponse::new(400, e.to_string(), tracker.tally()))?;
         #[cfg(not(feature = "shacl"))]
         let (view, ns_registry) = stage_txn(ledger, txn, ns_registry, options)
             .await
             .map_err(|e| TrackedErrorResponse::new(400, e.to_string(), tracker.tally()))?;
 
         // Enforce uniqueness constraints (independent of shacl feature)
-        enforce_unique_after_staging(&view, &graph_delta, self)
+        enforce_unique_after_staging(&view, &graph_delta, &mut resolve_ctx)
             .await
             .map_err(|e| TrackedErrorResponse::new(400, e.to_string(), tracker.tally()))?;
 

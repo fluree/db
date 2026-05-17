@@ -36,7 +36,7 @@ pub(super) async fn materialize_constraints(
         })?;
 
     // 2. Resolve graph_iri → g_id in M's graph registry.
-    let g_id = super::resolve_selector_g_id(&m_db.snapshot, graph_iri).ok_or_else(|| {
+    let g_id = super::resolve_selector_g_id(&m_db.snapshot, graph_iri)?.ok_or_else(|| {
         CrossLedgerError::GraphMissingAtT {
             ledger_id: canonical_model_ledger_id.to_string(),
             graph_iri: graph_iri.to_string(),

@@ -520,7 +520,17 @@ impl Fluree {
         // separate contexts would each lazy-capture a head-t and
         // could disagree if M advances between awaits — that breaks
         // the resolver's per-request consistency contract.
-        let mut ctx = crate::cross_ledger::ResolveCtx::new(db.as_graph_db_ref().snapshot.ledger_id.as_str(), self);
+        //
+        // Seeded from `db.cross_ledger_resolved_ts` so a preceding
+        // `wrap_policy` call's captures carry forward: policy and
+        // reasoning/rules on the same M must agree on which
+        // version of M they're enforcing, even though they enter
+        // through separate Rust API calls.
+        let mut ctx = crate::cross_ledger::ResolveCtx::with_resolved_ts(
+            db.as_graph_db_ref().snapshot.ledger_id.as_str(),
+            self,
+            (**db.cross_ledger_resolved_ts()).clone(),
+        );
 
         // Cross-ledger `f:rulesSource`: when M is referenced via
         // `f:ledger`, resolve M's rules graph through the
@@ -590,7 +600,11 @@ impl Fluree {
                 },
             ));
         };
-        executable.reasoning.modes.rules.extend(wire.parsed_rules()?);
+        executable
+            .reasoning
+            .modes
+            .rules
+            .extend(wire.parsed_rules()?);
         Ok(())
     }
 

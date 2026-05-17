@@ -651,8 +651,20 @@ impl Fluree {
             }
 
             let source = source.expect("checked above");
-            let mut ctx =
-                crate::cross_ledger::ResolveCtx::new(view.snapshot.ledger_id.as_str(), self);
+            // Seed from any prior governance-context capture stored
+            // on the view (e.g., an earlier `wrap_policy` in the
+            // same logical request). The merged resolved_ts is
+            // written back below so the subsequent `query` call's
+            // own ResolveCtx observes the same per-ledger head-t.
+            //
+            // `ledger_id_owned` keeps a string alive past the
+            // eventual `view` move at the end of this branch.
+            let ledger_id_owned: String = view.snapshot.ledger_id.to_string();
+            let mut ctx = crate::cross_ledger::ResolveCtx::with_resolved_ts(
+                &ledger_id_owned,
+                self,
+                (**view.cross_ledger_resolved_ts()).clone(),
+            );
             let resolved = crate::cross_ledger::resolve_graph_ref(
                 source,
                 crate::cross_ledger::ArtifactKind::PolicyRules,
@@ -719,7 +731,13 @@ impl Fluree {
                     restrictions,
                 )
                 .await?;
-            return Ok(view.with_policy(Arc::new(policy_ctx)));
+            // Carry the per-ledger head-t captures forward onto
+            // the returned view so any later `query()` in this same
+            // logical request sees the same M version policy did.
+            let view = view
+                .with_policy(Arc::new(policy_ctx))
+                .with_cross_ledger_resolved_ts(Arc::new(ctx.resolved_ts));
+            return Ok(view);
         }
 
         let policy_graphs = if let Some(ref resolved) = view.resolved_config {

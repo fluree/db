@@ -461,9 +461,7 @@ impl RulesArtifactWire {
                     return Err(super::CrossLedgerError::TranslationFailed {
                         ledger_id: self.origin.model_ledger_id.clone(),
                         graph_iri: self.origin.graph_iri.clone(),
-                        detail: format!(
-                            "malformed cross-ledger rule at index {idx}: {e}"
-                        ),
+                        detail: format!("malformed cross-ledger rule at index {idx}: {e}"),
                     });
                 }
             }
@@ -540,6 +538,31 @@ impl<'a> ResolveCtx<'a> {
             data_ledger_id,
             fluree,
             resolved_ts: HashMap::new(),
+            active: Vec::new(),
+            memo: HashMap::new(),
+        }
+    }
+
+    /// Build a resolution context pre-seeded with `resolved_t`
+    /// captures from an earlier stage of the same logical request.
+    ///
+    /// Used by query preparation when a prior `wrap_policy` call on
+    /// the same view already pinned a model ledger's `resolved_t`:
+    /// the new context inherits that pin so a second cross-ledger
+    /// reference to the same M can't re-capture a later head and
+    /// disagree with policy on which M version is in effect.
+    /// `memo` and `active` are *not* shared — those are
+    /// per-resolution-call state (cycle detection, dedup within a
+    /// single dispatch tree) and don't carry across calls.
+    pub fn with_resolved_ts(
+        data_ledger_id: &'a str,
+        fluree: &'a Fluree,
+        resolved_ts: HashMap<String, i64>,
+    ) -> Self {
+        Self {
+            data_ledger_id,
+            fluree,
+            resolved_ts,
             active: Vec::new(),
             memo: HashMap::new(),
         }

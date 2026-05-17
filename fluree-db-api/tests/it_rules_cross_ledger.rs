@@ -250,6 +250,79 @@ fn parsed_rules_fails_closed_on_malformed_json() {
 }
 
 #[tokio::test]
+async fn cross_ledger_f_txn_meta_graph_selector_rejected() {
+    // `f:txnMetaGraph` is a reserved sentinel — the model
+    // ledger's txn-meta graph is never a legitimate cross-ledger
+    // target (it carries commit-time provenance). The selector
+    // helper must surface ReservedGraphSelected *before* any
+    // storage I/O on M.
+    let fluree = FlureeBuilder::memory().build_memory();
+
+    let model_id = "test/cross-ledger-rules/txn-meta-selector-model:main";
+    let model = genesis_ledger(&fluree, model_id);
+    // Commit one trivial fact so M is published to the nameservice;
+    // the resolver looks up M by id before reaching the selector
+    // check, and an unpublished M short-circuits as ModelLedgerMissing.
+    fluree
+        .insert(
+            model,
+            &json!({
+                "@context": {"ex": "http://example.org/"},
+                "@id":     "ex:bootstrap",
+                "ex:tag":  "init"
+            }),
+        )
+        .await
+        .expect("publish M");
+
+    let data_id = "test/cross-ledger-rules/txn-meta-selector-data:main";
+    let data = genesis_ledger(&fluree, data_id);
+
+    let cfg = config_iri(data_id);
+    let cfg_trig = format!(
+        r"
+        @prefix f:   <https://ns.flur.ee/db#> .
+        @prefix rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#> .
+
+        GRAPH <{cfg}> {{
+            <urn:cfg:main>      rdf:type          f:LedgerConfig .
+            <urn:cfg:main>      f:datalogDefaults <urn:cfg:datalog> .
+            <urn:cfg:datalog>   f:datalogEnabled  true .
+            <urn:cfg:datalog>   f:rulesSource     <urn:cfg:rules-ref> .
+            <urn:cfg:rules-ref> rdf:type          f:GraphRef ;
+                                f:graphSource     <urn:cfg:rules-src> .
+            <urn:cfg:rules-src> f:ledger          <{model_id}> ;
+                                f:graphSelector   f:txnMetaGraph .
+        }}
+    "
+    );
+    fluree
+        .stage_owned(data)
+        .upsert_turtle(&cfg_trig)
+        .execute()
+        .await
+        .expect("seed D config selecting f:txnMetaGraph");
+
+    let view = fluree.db(data_id).await.expect("load D");
+    let q = json!({
+        "@context": {"ex": "http://example.org/"},
+        "select": "?g",
+        "where":  {"@id": "ex:alice", "ex:grandparent": "?g"},
+        "reasoning": "datalog"
+    });
+    let err = fluree
+        .query(&view, &q)
+        .await
+        .expect_err("f:txnMetaGraph selector must surface ReservedGraphSelected");
+
+    let msg = err.to_string();
+    assert!(
+        matches!(err, fluree_db_api::ApiError::CrossLedger(_)) && msg.contains("txnMetaGraph"),
+        "expected ApiError::CrossLedger naming the reserved sentinel, got: {err:?}"
+    );
+}
+
+#[tokio::test]
 async fn missing_model_ledger_surfaces_cross_ledger_error() {
     // f:rulesSource → a model ledger that doesn't exist. The
     // resolver must return CrossLedgerError::ModelLedgerMissing
