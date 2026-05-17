@@ -3519,18 +3519,10 @@ where
                 )
                 .map_err(|e| ImportError::IndexBuild(e.to_string()))?;
 
-                let stats_output = stats_hook.map(|h| {
-                    let stats_finalize_start = Instant::now();
-                    tracing::info!("finalizing import id stats");
-                    let output = h.finalize_with_aggregate_properties();
-                    tracing::info!(
-                        elapsed_ms = stats_finalize_start.elapsed().as_millis(),
-                        "finalized import id stats"
-                    );
-                    (output, spot_class_stats)
-                });
-
-                // Meta chunk is always the last chunk when present.
+                // Meta chunk is always the last chunk when present. We build
+                // it BEFORE stats finalize and share the IdStatsHook so the
+                // g_id=1 records contribute to graph_flakes (otherwise the
+                // per-graph stats entry for txn-meta is missing entirely).
                 let g1_result = if let Some(meta_commit) = commits.last() {
                     let cfg_g1 = fluree_db_indexer::BuildConfig {
                         run_dir: v3_runs_g1,
@@ -3552,13 +3544,24 @@ where
                         fluree_db_indexer::build_indexes_from_commits(
                             std::slice::from_ref(meta_commit),
                             &cfg_g1,
-                            None, // no stats in txn-meta build
+                            stats_hook.as_mut(),
                         )
                         .map_err(|e| ImportError::IndexBuild(e.to_string()))?,
                     )
                 } else {
                     None
                 };
+
+                let stats_output = stats_hook.map(|h| {
+                    let stats_finalize_start = Instant::now();
+                    tracing::info!("finalizing import id stats");
+                    let output = h.finalize_with_aggregate_properties();
+                    tracing::info!(
+                        elapsed_ms = stats_finalize_start.elapsed().as_millis(),
+                        "finalized import id stats"
+                    );
+                    (output, spot_class_stats)
+                });
 
                 // Merge g_id=0 and g_id=1 results for upload/root assembly.
                 let mut order_results = g0_result.order_results;
@@ -3850,7 +3853,9 @@ where
 
             (class_counts, class_ref_targets)
         } else {
-            (id_hook_class_counts, id_hook_class_ref_targets)
+            // Clone — the uncapped id_hook_class_ref_targets is also used
+            // below as the authoritative source for class stats ref_classes.
+            (id_hook_class_counts, id_hook_class_ref_targets.clone())
         };
 
         let stats_v6: Option<fluree_db_core::IndexStats> = id_stats_result.map(|id_stats| {
@@ -3911,8 +3916,11 @@ where
                 let mut per_graph_classes = fluree_db_indexer::stats::build_class_stat_entries(
                     cs,
                     &predicate_sids_v6,
-                    &[],
                     &uploaded_dicts.language_tags,
+                    // Use the uncapped per-class ref-targets from IdStatsHook
+                    // instead of `cs.class_prop_refs` (which is populated via
+                    // the 64-class-capped ClassBitsetTable).
+                    Some(&id_hook_class_ref_targets),
                     input.run_dir,
                     input.namespace_codes,
                 )
@@ -3924,13 +3932,19 @@ where
                 }
             }
 
-            is::IndexStats {
+            let mut stats = is::IndexStats {
                 flakes: id_stats.total_flakes,
                 size: 0,
                 properties: Some(properties),
                 classes: None,
                 graphs: Some(graphs),
-            }
+            };
+            // Wire `total_commit_size` into `stats.size` and per-graph sizes,
+            // mirroring `root_assembly::compose_root_v6` for the normal indexing
+            // path. Without this, `info` reports `size: 0` everywhere even
+            // though the IndexRoot itself carries `total_commit_size`.
+            stats.distribute_total_size_by_flakes(total_commit_size);
+            stats
         });
 
         // Build CLI import summary before IndexRoot consumes predicate_sids_v6.

@@ -880,8 +880,8 @@ where
                 let mut per_graph_classes = crate::stats::build_class_stat_entries(
                     &spot_class_stats,
                     &predicate_sids,
-                    &shared.dt_tags,
                     &language_tags,
+                    None, // rebuild path still uses cs.class_prop_refs (64-capped); separate follow-up.
                     &run_dir,
                     &shared.ns_prefixes,
                 )

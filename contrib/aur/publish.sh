@@ -40,10 +40,17 @@ sed -i \
   -e "s/^sha256sums_aarch64=.*/sha256sums_aarch64=('${SHA_ARM}')/" \
   "${WORK}/aur/PKGBUILD"
 
+# makepkg refuses to run as root, so we create an in-container `builder` user
+# and chown the bind-mounted /work to it. We must chown back to the host
+# runner's uid/gid before the container exits — otherwise the subsequent
+# host-side `git add` can't write `.git/index.lock` and the trap can't clean up.
 echo "==> Regenerating .SRCINFO via makepkg in archlinux:base-devel"
-docker run --rm -v "${WORK}/aur:/work" -w /work archlinux:base-devel bash -c '
+docker run --rm -v "${WORK}/aur:/work" -w /work \
+  -e HOST_UID="$(id -u)" -e HOST_GID="$(id -g)" \
+  archlinux:base-devel bash -c '
   useradd -m builder && chown -R builder /work
   su builder -c "makepkg --printsrcinfo" > .SRCINFO
+  chown -R "$HOST_UID:$HOST_GID" /work
 '
 
 cd "${WORK}/aur"

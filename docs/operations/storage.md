@@ -272,19 +272,29 @@ See [Storage Encryption](../security/encryption.md) for full documentation.
 │   │   └── dev.json
 │   └── customers/
 │       └── main.json
-├── commit/                   # Transaction commits
-│   ├── abc123def456.commit
-│   └── def456abc789.commit
-├── index/                    # Index snapshots
-│   ├── mydb-main-t100.idx
-│   └── mydb-main-t150.idx
+├── mydb/
+│   ├── main/
+│   │   ├── commit/          # Commit blobs (*.fcv2)
+│   │   ├── txn/             # Transaction metadata (*.json)
+│   │   ├── config/          # Ledger config blobs
+│   │   └── index/
+│   │       ├── roots/       # Index root descriptors (*.fir6)
+│   │       ├── objects/
+│   │       │   ├── branches/
+│   │       │   ├── leaves/
+│   │       │   └── history/
+│   │       ├── garbage/
+│   │       ├── stats/
+│   │       └── spatial/
+│   ├── dev/
+│   │   └── ...
+│   └── @shared/
+│       └── dicts/           # Dictionaries shared by all branches
 └── graph-sources/            # Graph sources
     └── products-search/
         └── main/
-            └── bm25/
-                ├── manifest.json
-                └── t150/
-                    └── snapshot.bin
+            ├── mapping/
+            └── snapshots/
 ```
 
 ### File Formats
@@ -293,10 +303,13 @@ See [Storage Encryption](../security/encryption.md) for full documentation.
 ```json
 {
   "ledger_id": "mydb:main",
+  "name": "mydb",
+  "branch": "main",
   "commit_t": 150,
   "index_t": 145,
-  "commit_id": "bafybeig...commitT150",
-  "index_id": "bafybeig...indexRootT145"
+  "commit_head_id": "bafybeig...commitT150",
+  "index_head_id": "bafybeig...indexRootT145",
+  "retracted": false
 }
 ```
 
@@ -306,8 +319,12 @@ See [Storage Encryption](../security/encryption.md) for full documentation.
 - Cryptographic signatures
 
 **Indexes (Binary):**
-- SPOT, POST, OPST, PSOT trees
+- Root descriptors, branch manifests, leaf pages, and history sidecars
 - Optimized for query performance
+
+**Shared dictionaries (Binary):**
+- Cross-branch dictionary blobs under `{ledger}/@shared/dicts/`
+- May be referenced by more than one branch of the same ledger
 
 ### File System Requirements
 
@@ -328,19 +345,27 @@ See [Storage Encryption](../security/encryption.md) for full documentation.
 
 ```text
 s3://fluree-prod-data/
-├── commit/
-│   ├── abc123def456.commit
-│   └── def456abc789.commit
-├── index/
-│   ├── mydb-main-t100.idx
-│   └── mydb-main-t150.idx
+├── mydb/
+│   ├── main/
+│   │   ├── commit/
+│   │   ├── txn/
+│   │   ├── config/
+│   │   └── index/
+│   │       ├── roots/
+│   │       ├── objects/
+│   │       │   ├── branches/
+│   │       │   ├── leaves/
+│   │       │   └── history/
+│   │       ├── garbage/
+│   │       ├── stats/
+│   │       └── spatial/
+│   └── @shared/
+│       └── dicts/
 └── graph-sources/
     └── products-search/
         └── main/
-            └── bm25/
-                ├── manifest.json
-                └── t150/
-                    └── snapshot.bin
+            ├── mapping/
+            └── snapshots/
 ```
 
 ### DynamoDB Schema
@@ -375,7 +400,8 @@ Required IAM permissions:
   "Action": [
     "s3:GetObject",
     "s3:PutObject",
-    "s3:ListBucket"
+    "s3:ListBucket",
+    "s3:DeleteObject"
   ],
   "Resource": [
     "arn:aws:s3:::fluree-prod-data",
@@ -392,8 +418,10 @@ Required IAM permissions:
     "dynamodb:GetItem",
     "dynamodb:PutItem",
     "dynamodb:UpdateItem",
+    "dynamodb:DeleteItem",
     "dynamodb:Query",
-    "dynamodb:BatchGetItem"
+    "dynamodb:BatchGetItem",
+    "dynamodb:BatchWriteItem"
   ],
   "Resource": [
     "arn:aws:dynamodb:us-east-1:*:table/fluree-nameservice",

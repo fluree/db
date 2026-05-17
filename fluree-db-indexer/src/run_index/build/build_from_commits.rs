@@ -482,11 +482,23 @@ pub fn build_indexes_from_commits(
             let remap_progress = config.remap_progress.clone();
             let target_g_id = config.g_id;
             let collect_stats = stats_hook.is_some();
+            // Propagate rdf:type p_id so the worker hook can track per-subject
+            // class membership and ref history. Without this, `on_record`
+            // short-circuits at the `rdf_type_p_id` check and
+            // `subject_ref_history` stays empty even when
+            // `track_ref_targets` is true.
+            let worker_rdf_type_pid = spot_rdf_type_p_id;
 
             handles.push(scope.spawn(
                 move || -> io::Result<(u64, Option<crate::stats::IdStatsHook>)> {
                     let mut local_total = 0u64;
-                    let mut worker_hook = collect_stats.then(crate::stats::IdStatsHook::new);
+                    let mut worker_hook = collect_stats.then(|| {
+                        let mut h = crate::stats::IdStatsHook::new();
+                        if let Some(pid) = worker_rdf_type_pid {
+                            h.set_rdf_type_p_id(pid);
+                        }
+                        h
+                    });
                     loop {
                         let pos = next_chunk.fetch_add(1, Ordering::Relaxed);
                         if pos >= commits_ref.len() {

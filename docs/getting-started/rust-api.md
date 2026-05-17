@@ -730,7 +730,7 @@ async fn main() -> Result<()> {
 
 #### Dropping Ledgers
 
-Use `drop_ledger` to permanently remove a ledger:
+Use `drop_ledger` to retract a ledger or to permanently remove its managed storage artifacts:
 
 ```rust
 use fluree_db_api::{FlureeBuilder, DropMode, DropStatus, Result};
@@ -739,7 +739,7 @@ use fluree_db_api::{FlureeBuilder, DropMode, DropStatus, Result};
 async fn main() -> Result<()> {
     let fluree = FlureeBuilder::file("./data").build()?;
 
-    // Soft drop: retract from nameservice, preserve files
+    // Soft drop: retract from nameservice, preserve storage artifacts
     let report = fluree.drop_ledger("mydb:main", DropMode::Soft).await?;
     match report.status {
         DropStatus::Dropped => println!("Ledger dropped"),
@@ -747,11 +747,9 @@ async fn main() -> Result<()> {
         DropStatus::NotFound => println!("Ledger not found"),
     }
 
-    // Hard drop: delete all files (IRREVERSIBLE)
+    // Hard drop: delete managed storage artifacts (IRREVERSIBLE)
     let report = fluree.drop_ledger("mydb:main", DropMode::Hard).await?;
-    println!("Deleted {} commit files, {} index files",
-        report.commit_files_deleted,
-        report.index_files_deleted);
+    println!("Deleted {} storage artifacts", report.artifacts_deleted);
 
     Ok(())
 }
@@ -761,16 +759,16 @@ async fn main() -> Result<()> {
 
 | Mode | Behavior | Reversible |
 |------|----------|------------|
-| `DropMode::Soft` (default) | Retracts from nameservice only, files remain | Yes |
-| `DropMode::Hard` | Retracts + deletes all storage artifacts | **No** |
+| `DropMode::Soft` (default) | Marks the ledger retracted in the nameservice; artifacts remain and the alias stays reserved | Partially; requires administrative recovery |
+| `DropMode::Hard` | Deletes managed storage artifacts and purges the nameservice record where supported | **No** for deleted artifacts |
 
 **Drop Sequence:**
 
 1. Normalizes the ledger ID (ensures `:main` suffix)
 2. Cancels any pending background indexing
 3. Waits for in-progress indexing to complete
-4. In hard mode: deletes all commit and index files
-5. Retracts from nameservice
+4. In hard mode: deletes managed storage artifacts (commits, txns, indexes, config/context blobs, and related content)
+5. In soft mode: retracts from nameservice; in hard mode: purges the nameservice record where supported
 6. Disconnects from ledger cache (if caching enabled)
 
 **When to use `drop_ledger`:**
