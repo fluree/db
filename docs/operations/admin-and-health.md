@@ -236,44 +236,51 @@ See [Admin Authentication](../api/endpoints.md#admin-authentication) for details
 
 ### POST /v1/fluree/drop
 
-Drop a ledger or graph source:
+Drop an **entire ledger** (every branch under the name, plus `@shared/dicts/` in hard mode) or, as a fallback, a graph source with the same name:
 
 ```bash
-# Soft drop (retract from nameservice, preserve storage artifacts)
+# Soft drop the whole "mydb" ledger (retract every branch)
 curl -X POST http://localhost:8090/v1/fluree/drop \
   -H "Content-Type: application/json" \
-  -d '{"ledger": "mydb:main"}'
+  -d '{"ledger": "mydb"}'
 
-# Hard drop (delete managed storage artifacts - IRREVERSIBLE)
+# Hard drop (delete every branch's artifacts + @shared/dicts - IRREVERSIBLE)
 curl -X POST http://localhost:8090/v1/fluree/drop \
   -H "Content-Type: application/json" \
-  -d '{"ledger": "mydb:main", "hard": true}'
+  -d '{"ledger": "mydb", "hard": true}'
 ```
+
+`ledger` accepts the bare ledger name. The branch-qualified form
+`"mydb:main"` is accepted for backwards compatibility with a warning;
+non-default branch suffixes like `"mydb:dev"` are **rejected** — use
+[`POST /drop-branch`](../api/endpoints.md#post-drop-branch) to drop a
+single branch.
 
 **Response:**
 ```json
 {
-  "ledger_id": "mydb:main",
+  "ledger_id": "mydb",
   "status": "dropped",
-  "files_deleted": 23
+  "files_deleted": 73,
+  "branches_dropped": ["mydb:feature-x", "mydb:dev", "mydb:main"]
 }
 ```
 
 | Status | Description |
 |--------|-------------|
-| `dropped` | Successfully dropped |
-| `already_retracted` | Was previously dropped |
-| `not_found` | Ledger doesn't exist |
+| `dropped` | Successfully dropped (aggregate across branches) |
+| `already_retracted` | Every branch was previously retracted |
+| `not_found` | No nameservice record exists for the name |
 
 **Authentication:** When `--admin-auth-mode=required`, requires Bearer token from a trusted issuer.
 
 **Drop Modes:**
-- **Soft** (default): Marks the ledger retracted in the nameservice; artifacts remain and the alias stays reserved.
-- **Hard**: Deletes managed storage artifacts and purges the nameservice record where supported, allowing alias reuse. Deleted artifacts are irreversible.
+- **Soft** (default): Marks every branch retracted in the nameservice; artifacts remain and aliases stay reserved.
+- **Hard**: Deletes per-branch storage artifacts and `@shared/dicts/`, then purges the nameservice records so the ledger name can be reused. Branches are dropped leaf-first; on a per-branch nameservice failure the operation aborts with `500` before touching parents or shared cleanup (retry is safe — each step is idempotent).
 
-If no ledger is found, the endpoint tries the same name as a graph source on branch `main`.
+If no nameservice record is found for the name, the endpoint tries the same name as a graph source on branch `main`. Truly orphaned storage with no nameservice pointer is **not** swept by `/drop`.
 
-See [Dropping Ledgers](../getting-started/rust-api.md#dropping-ledgers) for more details.
+See [Dropping Ledgers](../getting-started/rust-api.md#dropping-ledgers) and [`POST /drop`](../api/endpoints.md#post-drop) for the full reference.
 
 ## API Specification
 

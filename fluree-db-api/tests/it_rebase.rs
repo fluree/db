@@ -471,7 +471,11 @@ async fn rebase_branch_point_updated() {
     assert_eq!(dev_record.commit_t, source_after.commit_t);
 }
 
-/// Cannot rebase the main branch.
+/// Cannot rebase the root branch — refusal is structural, not name-based.
+/// "main" is the default and so the root on most ledgers, but a ledger
+/// created with a different initial branch (e.g. "trunk") will refuse
+/// rebases against that branch instead, while allowing rebases on a
+/// non-root branch that happens to be named "main".
 #[tokio::test]
 async fn rebase_main_refused() {
     let fluree = FlureeBuilder::memory().build_memory();
@@ -482,9 +486,28 @@ async fn rebase_main_refused() {
         .await
         .expect_err("rebasing main should fail");
 
+    let msg = err.to_string();
     assert!(
-        err.to_string().contains("main"),
-        "expected error about main branch, got: {err}"
+        msg.contains("root branch") && msg.contains("main"),
+        "expected error about root branch, got: {msg}"
+    );
+}
+
+/// Mirror of the structural refusal for a non-main root branch.
+#[tokio::test]
+async fn rebase_refuses_non_main_root() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    fluree.create_ledger("mydb:trunk").await.unwrap();
+
+    let err = fluree
+        .rebase_branch("mydb", "trunk", ConflictStrategy::default())
+        .await
+        .expect_err("rebasing non-main root should fail");
+
+    let msg = err.to_string();
+    assert!(
+        msg.contains("root branch") && msg.contains("trunk"),
+        "expected error about root branch, got: {msg}"
     );
 }
 

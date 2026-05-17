@@ -1203,7 +1203,8 @@ curl -X POST http://localhost:8090/v1/fluree/create \
 
 ### POST /drop
 
-Drop a ledger or graph source.
+Drop a whole ledger (every branch under the supplied name) or, as a
+fallback, a graph source with the same name.
 
 **URL:**
 ```
@@ -1216,84 +1217,91 @@ POST /drop
 
 ```json
 {
-  "ledger": "mydb:main",
+  "ledger": "mydb",
   "hard": false
 }
 ```
 
 | Field | Type | Required | Description |
 |-------|------|----------|-------------|
-| `ledger` | string | Yes | Ledger ID (e.g., "mydb" or "mydb:main") |
-| `hard` | boolean | No | If `true`, delete managed storage artifacts and purge the nameservice record where the backend supports purge. Default: `false` (soft drop) |
+| `ledger` | string | Yes | Ledger name (e.g., `"mydb"`). The branch-qualified form `"mydb:main"` is accepted for backwards compatibility but a warning is attached. Non-default branch suffixes like `"mydb:dev"` are **rejected** — use the [`POST /drop-branch`](#post-drop-branch) endpoint (or call `drop_branch` in the Rust API) to drop a single branch. |
+| `hard` | boolean | No | If `true`, delete managed storage artifacts and purge the nameservice records. Default: `false` (soft drop). |
+
+**Scope:**
+
+`/drop` operates on the **whole ledger** — every branch under the ledger name, including any retracted-but-not-purged branches. Branches are dropped leaf-first so that if the operation aborts mid-way the surviving state stays consistent (orphan parents, never dangling children). The cross-branch `@shared/dicts/` namespace is cleaned up at the very end.
 
 **Drop Modes:**
 
-- **Soft drop** (`hard: false`, default): Marks the ledger as retracted in the nameservice and preserves storage artifacts. The alias remains reserved; normal create/load paths treat the ledger as unavailable.
-- **Hard drop** (`hard: true`): Deletes managed storage artifacts, then purges the nameservice record so the alias can be reused on backends with purge support. **This is irreversible for deleted artifacts.**
+- **Soft drop** (`hard: false`, default): Marks every branch as retracted in the nameservice and preserves storage artifacts. Aliases remain reserved; normal create/load paths treat the ledger as unavailable.
+- **Hard drop** (`hard: true`): Deletes managed storage artifacts for every branch and purges the nameservice records so the name can be reused. **This is irreversible for deleted artifacts.**
 
-If no ledger is found, the server tries the same name as a graph source on branch `main`. Graph source hard-drop cleanup is best effort and may be implementation-specific; graph-source fallback responses currently omit `files_deleted`.
+If no ledger is found by name, the server tries the same name as a graph source on branch `main`. Graph source hard-drop cleanup is best effort; graph-source fallback responses omit `branches_dropped` and `files_deleted`.
 
 **Response:**
 
 ```json
 {
-  "ledger_id": "mydb:main",
+  "ledger_id": "mydb",
   "status": "dropped",
-  "files_deleted": 23
+  "files_deleted": 73,
+  "branches_dropped": ["mydb:feature-x", "mydb:dev", "mydb:main"]
 }
 ```
 
 | Field | Type | Description |
 |-------|------|-------------|
-| `ledger_id` | string | Normalized ledger ID, or graph source ID if the graph-source fallback handled the request |
-| `status` | string | One of: `"dropped"`, `"already_retracted"`, `"not_found"` |
-| `files_deleted` | integer | Number of managed storage artifacts deleted; omitted when zero |
+| `ledger_id` | string | Ledger name (or graph source ID if the graph-source fallback handled the request) |
+| `status` | string | Aggregate status across branches. One of: `"dropped"`, `"already_retracted"`, `"not_found"` |
+| `files_deleted` | integer | Number of managed storage artifacts deleted (sum across branches + `@shared/dicts/` cleanup); omitted when zero |
+| `branches_dropped` | string[] | Per-branch `ledger_id`s that were dropped, in leaf-first order; omitted when empty |
 | `warnings` | string[] | Non-fatal cleanup warnings; omitted when empty |
 
 **Status Codes:**
 - `200 OK` - Drop successful (or already dropped/not found)
-- `400 Bad Request` - Invalid request body
+- `400 Bad Request` - Invalid request body, or a non-default branch suffix was supplied
 - `401 Unauthorized` - Bearer token required (when admin auth enabled)
-- `500 Internal Server Error` - Server error
+- `500 Internal Server Error` - Branch enumeration failed, or another unrecoverable error
 
 **Drop Sequence:**
 
-1. Normalizes the ledger ID (ensures branch suffix like `:main`)
-2. Cancels any pending background indexing
-3. Waits for in-progress indexing to complete
-4. In hard mode: deletes managed storage artifacts (commits, txns, indexes, config/context blobs, and related content)
-5. In soft mode: retracts from nameservice; in hard mode: purges the nameservice record where supported
-6. Disconnects from ledger cache
+1. Parses input. `"mydb"` is the canonical form; `"mydb:main"` is accepted with a warning; anything else (`"mydb:dev"`, etc.) returns a `400`.
+2. Enumerates every NsRecord under the ledger name (including retracted ones).
+3. Sorts branches leaf-first via the `source_branch` parent pointers.
+4. Cancels and waits for pending background indexing on each branch.
+5. For each branch (leaf-first): deletes managed storage artifacts (hard mode) and retracts (soft) or removes the NS record (hard). Hard mode uses the parent-aware drop path so child counts on surviving parents stay accurate even under partial failure.
+6. Hard mode only: wipes the cross-branch `{ledger_name}/@shared/dicts/` namespace.
+7. Disconnects every branch from the ledger cache.
 
 **Idempotency:**
 
 Safe to call multiple times:
-- Returns `"already_retracted"` if the ledger was previously dropped
-- Hard mode still attempts artifact deletion even for already-retracted or not-found ledgers (useful for cleanup)
+- Returns `"already_retracted"` when every branch was already retracted (hard mode still proceeds with cleanup for these).
+- Returns `"not_found"` without touching storage when no nameservice record exists for the ledger name. Truly orphaned artifacts with no nameservice pointer are **not** swept by `/drop`; that's a separate admin concern.
 
 **Examples:**
 
 ```bash
-# Soft drop (retract only, preserve storage artifacts)
+# Soft drop the whole "mydb" ledger
 curl -X POST http://localhost:8090/v1/fluree/drop \
   -H "Content-Type: application/json" \
-  -d '{"ledger": "mydb:main"}'
+  -d '{"ledger": "mydb"}'
 
-# Hard drop (delete managed storage artifacts - IRREVERSIBLE)
+# Hard drop (delete every branch's artifacts + @shared/dicts - IRREVERSIBLE)
 curl -X POST http://localhost:8090/v1/fluree/drop \
   -H "Content-Type: application/json" \
-  -d '{"ledger": "mydb:main", "hard": true}'
+  -d '{"ledger": "mydb", "hard": true}'
 
 # Drop with auth token (when admin auth enabled)
 curl -X POST http://localhost:8090/v1/fluree/drop \
   -H "Content-Type: application/json" \
   -H "Authorization: Bearer eyJ..." \
-  -d '{"ledger": "mydb:main", "hard": true}'
+  -d '{"ledger": "mydb", "hard": true}'
 
-# Drop with short ledger ID (auto-resolves to :main)
+# Backwards-compatible form (accepted with a warning; prefer the bare name)
 curl -X POST http://localhost:8090/v1/fluree/drop \
   -H "Content-Type: application/json" \
-  -d '{"ledger": "mydb"}'
+  -d '{"ledger": "mydb:main"}'
 ```
 
 ### GET /context/{ledger...}
