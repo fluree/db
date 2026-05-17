@@ -40,6 +40,12 @@ pub enum CrossLedgerError {
 
     /// `f:atT N` was requested but the model ledger no longer retains
     /// state at `N` (index pruning, history retention).
+    ///
+    /// **Reserved for Phase 3** — `f:atT` is rejected upstream as
+    /// `UnsupportedFeature` until that phase lands, so this
+    /// variant is currently unreachable from the resolver. Kept in
+    /// the taxonomy so the surface stays stable when Phase 3
+    /// flips it on.
     #[error(
         "model ledger '{ledger_id}' no longer retains state at t={requested_t} \
          (oldest available is t={oldest_available_t})"

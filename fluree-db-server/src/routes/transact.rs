@@ -1334,6 +1334,14 @@ async fn execute_transaction(
                 };
                 iris.push(s.to_string());
             }
+            // Empty array (`"uniqueProperties": []`) is intentionally
+            // treated as "no inline constraints" rather than an error
+            // — operators may build the array dynamically server-side
+            // and end up with zero entries; that's a request for no
+            // constraint enforcement, not a misconfiguration. Leaving
+            // `TxnOpts.unique_properties` as `None` keeps the staging
+            // pipeline on its fast-path (skip the inline branch
+            // entirely).
             if !iris.is_empty() {
                 txn_opts.unique_properties = Some(iris);
             }

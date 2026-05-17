@@ -705,7 +705,7 @@ impl Fluree {
             // structurally-policy-looking subject from M," which
             // would silently include rules the operator never opted
             // into.
-            const DEFAULT_POLICY_CLASS_IRI: &str = "https://ns.flur.ee/db#AccessPolicy";
+            const DEFAULT_POLICY_CLASS_IRI: &str = fluree_vocab::policy_iris::ACCESS_POLICY;
             let filter: std::collections::HashSet<String> = effective_opts
                 .policy_class
                 .as_ref()

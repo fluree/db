@@ -145,16 +145,52 @@ where
                 continue;
             }
         }
+        // Translate target IRIs against D's term space. IRIs M
+        // references but D has never seen drop here.
+        //
+        // A WARN log surfaces the drop so operators can debug a
+        // cross-ledger policy that quietly narrows scope: if every
+        // target IRI is M-only, the resulting restriction has an
+        // empty target set and `build_policy_set` treats it as
+        // "applies to nothing" — effectively a no-op. The
+        // alternative (dropping the entire restriction on
+        // any-targets-empty) would diverge from same-ledger
+        // semantics, where a same-ledger policy with the same IRI
+        // set also produces an empty `targets` and the same
+        // engine behavior. We surface the discrepancy via logs
+        // rather than silently changing scope OR diverging from
+        // the same-ledger contract.
+        let total_targets = w.targets.len();
         let targets: HashSet<Sid> = w
             .targets
             .iter()
             .filter_map(|iri| resolve_iri(iri))
             .collect();
+        if total_targets > 0 && targets.len() < total_targets {
+            tracing::warn!(
+                restriction_id = ?w.id,
+                requested = total_targets,
+                resolved = targets.len(),
+                "cross-ledger policy restriction has target IRIs not registered \
+                 on the data ledger; those targets will not be enforced. Register \
+                 the IRIs on D, or remove them from the model ledger restriction."
+            );
+        }
+        let total_for_classes = w.for_classes.len();
         let for_classes: HashSet<Sid> = w
             .for_classes
             .iter()
             .filter_map(|iri| resolve_iri(iri))
             .collect();
+        if total_for_classes > 0 && for_classes.len() < total_for_classes {
+            tracing::warn!(
+                restriction_id = ?w.id,
+                requested = total_for_classes,
+                resolved = for_classes.len(),
+                "cross-ledger policy restriction has for-class IRIs not registered \
+                 on the data ledger; class scope will be narrower than authored."
+            );
+        }
         let value = match &w.value {
             WirePolicyValue::Allow => PolicyValue::Allow,
             WirePolicyValue::Deny => PolicyValue::Deny,

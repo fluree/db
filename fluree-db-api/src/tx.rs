@@ -650,6 +650,14 @@ async fn stage_with_config_shacl(
     // path itself never reads `opts.shapes`. Taking avoids
     // cloning a potentially large JSON-LD doc just to keep both
     // copies for one extra moment.
+    //
+    // INVARIANT: `stage_with_config_shacl` is *not* retry-safe.
+    // The `take()` here moves `opts.shapes` out of the txn, so a
+    // retry on the same `Txn` value would silently skip inline
+    // SHACL validation on the second attempt. If a retry policy
+    // is ever added to the staging path, defer the take until
+    // after `stage_txn` returns successfully — or clone here
+    // and accept the cost.
     let inline_shapes_json = txn.opts.shapes.take();
     let inline_shapes_ledger_id = ledger.snapshot.ledger_id.to_string();
 

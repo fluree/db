@@ -54,35 +54,12 @@ pub async fn resolve_graph_ref(
     kind: ArtifactKind,
     ctx: &mut ResolveCtx<'_>,
 ) -> Result<Arc<ResolvedGraph>, CrossLedgerError> {
-    // (1) Phase 3 / Phase 4 fields are parsed but not yet honored. Fail
-    // closed — partial behavior (e.g., accepting f:atT and opening M
-    // at that t with no retention check) would silently degrade the
-    // contract operators think they're getting.
-    if graph_ref.at_t.is_some() {
-        return Err(CrossLedgerError::UnsupportedFeature {
-            feature: "f:atT",
-            phase: "Phase 3",
-            ledger_id: graph_ref.ledger.clone().unwrap_or_default(),
-        });
-    }
-    if graph_ref.trust_policy.is_some() {
-        return Err(CrossLedgerError::UnsupportedFeature {
-            feature: "f:trustPolicy",
-            phase: "Phase 4",
-            ledger_id: graph_ref.ledger.clone().unwrap_or_default(),
-        });
-    }
-    if graph_ref.rollback_guard.is_some() {
-        return Err(CrossLedgerError::UnsupportedFeature {
-            feature: "f:rollbackGuard",
-            phase: "Phase 4",
-            ledger_id: graph_ref.ledger.clone().unwrap_or_default(),
-        });
-    }
-
-    // Caller is expected to invoke this only for cross-ledger refs
-    // (graph_ref.ledger.is_some()). A same-ledger ref would be a
-    // bug at the call site, not a user-facing failure.
+    // (0) `resolve_graph_ref` is the cross-ledger dispatcher. A
+    // same-ledger ref hitting this path is a caller bug — fail with
+    // `TranslationFailed` carrying the offending selector so the
+    // error names the actual problem, rather than degrading into a
+    // downstream `UnsupportedFeature` error whose `ledger_id` would
+    // be empty.
     let raw_ledger_ref =
         graph_ref
             .ledger
@@ -94,6 +71,34 @@ pub async fn resolve_graph_ref(
                     must use the local resolver"
                     .into(),
             })?;
+
+    // (1) Phase 3 / Phase 4 fields are parsed but not yet honored. Fail
+    // closed — partial behavior (e.g., accepting f:atT and opening M
+    // at that t with no retention check) would silently degrade the
+    // contract operators think they're getting. `raw_ledger_ref` is
+    // now guaranteed Some, so the error messages carry a real ledger
+    // id.
+    if graph_ref.at_t.is_some() {
+        return Err(CrossLedgerError::UnsupportedFeature {
+            feature: "f:atT",
+            phase: "Phase 3",
+            ledger_id: raw_ledger_ref.to_string(),
+        });
+    }
+    if graph_ref.trust_policy.is_some() {
+        return Err(CrossLedgerError::UnsupportedFeature {
+            feature: "f:trustPolicy",
+            phase: "Phase 4",
+            ledger_id: raw_ledger_ref.to_string(),
+        });
+    }
+    if graph_ref.rollback_guard.is_some() {
+        return Err(CrossLedgerError::UnsupportedFeature {
+            feature: "f:rollbackGuard",
+            phase: "Phase 4",
+            ledger_id: raw_ledger_ref.to_string(),
+        });
+    }
 
     let graph_iri =
         graph_ref
@@ -197,6 +202,16 @@ pub async fn resolve_graph_ref(
     // cache. Subsequent calls in this same request hit the memo;
     // subsequent calls in *other* requests on this instance hit
     // the governance cache.
+    //
+    // Benign read/write race: two concurrent requests can both
+    // miss at (5b), each materialize independently, and each
+    // write its own `Arc`. The cache ends up holding whichever
+    // write completed last; the loser's `Arc` is dropped when
+    // its request finishes. Wire artifacts are pure functions of
+    // `(kind, model_ledger, graph, resolved_t)`, so the two
+    // materialized values are structurally identical — duplicate
+    // work, not duplicate semantics. Single-flight is a possible
+    // future optimization but not a correctness requirement.
     ctx.memo.insert(key.clone(), arc.clone());
     ctx.fluree.governance_cache().insert(key, arc.clone());
     Ok(arc)

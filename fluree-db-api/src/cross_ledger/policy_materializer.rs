@@ -51,15 +51,14 @@ use crate::Fluree;
 use fluree_db_core::{FlakeValue, IndexType, LedgerSnapshot, RangeMatch, RangeTest, Sid};
 use fluree_vocab::policy_iris;
 
-/// Canonical policy class IRI. Subjects typed exactly as this are
-/// included in the structural detection set even when they're missing
-/// `f:allow` and `f:query`, mirroring the same-ledger
-/// `load_policy_restriction` behavior that maps such "missing-effect"
-/// policies to `Deny` (fail-closed). Without this scan, a canonically-
-/// typed policy with no effect would be silently absent cross-ledger
-/// while still being enforced as Deny same-ledger — a divergence the
-/// design doc forbids.
-const ACCESS_POLICY_IRI: &str = "https://ns.flur.ee/db#AccessPolicy";
+// Canonical policy class IRI lives in `fluree_vocab::policy_iris::ACCESS_POLICY`.
+// Subjects typed exactly as this are included in the structural
+// detection set even when they're missing `f:allow` and `f:query`,
+// mirroring the same-ledger `load_policy_restriction` behavior
+// that maps such "missing-effect" policies to `Deny` (fail-closed).
+// Without this scan, a canonically-typed policy with no effect would
+// be silently absent cross-ledger while still being enforced as Deny
+// same-ledger — a divergence the design doc forbids.
 use fluree_db_policy::{
     PolicyArtifactWire, PolicyRestriction, PolicyValue, WireOrigin, WirePolicyValue,
     WireRestriction,
@@ -160,7 +159,7 @@ pub(super) async fn materialize_policy_rules(
     // canonical class is the only structural baseline; custom-typed
     // policies still need an explicit effect predicate to be picked
     // up cross-ledger. That's a documented Phase 1a limitation.
-    if let Some(access_policy_sid) = m_db.snapshot.encode_iri(ACCESS_POLICY_IRI) {
+    if let Some(access_policy_sid) = m_db.snapshot.encode_iri(policy_iris::ACCESS_POLICY) {
         let flakes = m_view
             .range(
                 IndexType::Post,
