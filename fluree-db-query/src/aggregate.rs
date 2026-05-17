@@ -79,7 +79,7 @@ impl AggregateOperator {
         let mut group_size_col: Option<usize> = None;
 
         for (agg_idx, spec) in aggregates.iter().enumerate() {
-            match spec.input_var {
+            match spec.function.input_var() {
                 Some(input_var) => {
                     // Regular aggregate with input variable
                     if let Some(col_idx) = child_schema.iter().position(|v| *v == input_var) {
@@ -195,7 +195,7 @@ impl Operator for AggregateOperator {
                         Some(agg_idx) => {
                             // This column needs aggregation
                             let spec = &self.aggregates[agg_idx];
-                            apply_aggregate(&spec.function, input_binding, spec.distinct)
+                            spec.function.apply(input_binding)
                         }
                         None => {
                             // Pass through unchanged
@@ -218,7 +218,7 @@ impl Operator for AggregateOperator {
                         Some(col_idx) => (0..batch.len())
                             .map(|row_idx| {
                                 let input_binding = batch.get_by_col(row_idx, *col_idx);
-                                apply_aggregate(&spec.function, input_binding, spec.distinct)
+                                spec.function.apply(input_binding)
                             })
                             .collect(),
                         None => {
@@ -271,43 +271,54 @@ impl Operator for AggregateOperator {
     }
 }
 
-/// Apply an aggregate function to a binding
-///
-/// If the binding is `Grouped(values)`, compute the aggregate.
-/// Otherwise, pass through unchanged (shouldn't happen in normal usage).
-/// When `distinct` is true, deduplicates values before aggregation.
-pub fn apply_aggregate(func: &AggregateFn, binding: &Binding, distinct: bool) -> Binding {
-    match binding {
-        Binding::Grouped(values) => {
-            if distinct {
-                let mut seen = HashSet::with_capacity(values.len());
-                let deduped: Vec<Binding> =
-                    values.iter().filter(|b| seen.insert(*b)).cloned().collect();
-                compute_aggregate(func, &deduped)
-            } else {
-                compute_aggregate(func, values)
-            }
+impl AggregateFn {
+    /// Apply this aggregate function to a binding.
+    ///
+    /// If the binding is `Grouped(values)`, compute the aggregate;
+    /// non-grouped values pass through (e.g. group-key columns).
+    /// Variants that need an upstream dedup pass (see
+    /// [`Self::needs_input_dedup`]) get one before being handed to
+    /// [`Self::compute`].
+    pub fn apply(&self, binding: &Binding) -> Binding {
+        let Binding::Grouped(values) = binding else {
+            return binding.clone();
+        };
+        if self.needs_input_dedup() {
+            let mut seen = HashSet::with_capacity(values.len());
+            let deduped: Vec<Binding> =
+                values.iter().filter(|b| seen.insert(*b)).cloned().collect();
+            self.compute(&deduped)
+        } else {
+            self.compute(values)
         }
-        // Non-grouped values pass through (e.g., group key columns)
-        other => other.clone(),
     }
-}
 
-/// Compute aggregate over a list of bindings
-fn compute_aggregate(func: &AggregateFn, values: &[Binding]) -> Binding {
-    match func {
-        AggregateFn::Count => agg_count(values),
-        AggregateFn::CountAll => agg_count_all(values),
-        AggregateFn::CountDistinct => agg_count_distinct(values),
-        AggregateFn::Sum => agg_sum(values),
-        AggregateFn::Avg => agg_avg(values),
-        AggregateFn::Min => agg_min(values),
-        AggregateFn::Max => agg_max(values),
-        AggregateFn::Median => agg_median(values),
-        AggregateFn::Variance => agg_variance(values),
-        AggregateFn::Stddev => agg_stddev(values),
-        AggregateFn::GroupConcat { separator } => agg_group_concat(values, separator),
-        AggregateFn::Sample => agg_sample(values),
+    /// Whether [`Self::apply`] must deduplicate input values before
+    /// reducing. True for variants whose [`InputSemantics`] is
+    /// [`InputSemantics::Set`]; false for everything else, including
+    /// [`Self::CountDistinct`] — its streaming state is already a
+    /// `HashSet`, so an additional dedup pass would be redundant.
+    fn needs_input_dedup(&self) -> bool {
+        self.is_distinct() && !matches!(self, AggregateFn::CountDistinct(_))
+    }
+
+    /// Compute the aggregate result over an already-prepared list of
+    /// bindings (deduplicated upstream by [`Self::apply`] if needed).
+    fn compute(&self, values: &[Binding]) -> Binding {
+        match self {
+            Self::Count(_) => agg_count(values),
+            Self::CountAll => agg_count_all(values),
+            Self::CountDistinct(_) => agg_count_distinct(values),
+            Self::Sum { .. } => agg_sum(values),
+            Self::Avg { .. } => agg_avg(values),
+            Self::Min(_) => agg_min(values),
+            Self::Max(_) => agg_max(values),
+            Self::Median { .. } => agg_median(values),
+            Self::Variance { .. } => agg_variance(values),
+            Self::Stddev { .. } => agg_stddev(values),
+            Self::GroupConcat { separator, .. } => agg_group_concat(values, separator),
+            Self::Sample(_) => agg_sample(values),
+        }
     }
 }
 
@@ -591,6 +602,7 @@ fn extract_numbers(values: &[Binding]) -> Vec<f64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ir::InputSemantics;
 
     #[test]
     fn test_agg_count() {
@@ -849,11 +861,20 @@ mod tests {
         assert!(matches!(result, Binding::Unbound));
     }
 
+    fn sum_of(input: VarId, distinct: bool) -> AggregateFn {
+        let semantics = if distinct {
+            InputSemantics::Set
+        } else {
+            InputSemantics::List
+        };
+        AggregateFn::Sum(input, semantics)
+    }
+
     #[test]
     fn test_apply_aggregate_non_grouped() {
         // Non-grouped values pass through unchanged
         let binding = Binding::lit(FlakeValue::Long(42), xsd_integer());
-        let result = apply_aggregate(&AggregateFn::Sum, &binding, false);
+        let result = sum_of(VarId(0), false).apply(&binding);
         assert_eq!(result, binding);
     }
 
@@ -865,7 +886,7 @@ mod tests {
             Binding::lit(FlakeValue::Long(3), xsd_integer()),
         ]);
 
-        let result = apply_aggregate(&AggregateFn::Sum, &grouped, false);
+        let result = sum_of(VarId(0), false).apply(&grouped);
         let (val, _) = result.as_lit().unwrap();
         assert_eq!(*val, FlakeValue::Long(6));
     }
@@ -881,7 +902,7 @@ mod tests {
             Binding::lit(FlakeValue::Long(2), xsd_integer()), // duplicate
         ]);
 
-        let result = apply_aggregate(&AggregateFn::Sum, &grouped, true);
+        let result = sum_of(VarId(0), true).apply(&grouped);
         let (val, _) = result.as_lit().unwrap();
         assert_eq!(*val, FlakeValue::Long(6)); // 1+2+3 = 6, not 1+2+1+3+2 = 9
     }

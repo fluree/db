@@ -6,54 +6,117 @@ use fluree_db_core::NonEmpty;
 use super::expression::Expression;
 use crate::var_registry::VarId;
 
-/// Aggregate function kinds.
+/// How an aggregate function interprets duplicate input values.
 ///
-/// `DISTINCT` handling is split: `COUNT(DISTINCT)` has a dedicated variant
-/// (`CountDistinct`) because its streaming state uses a `HashSet` rather
-/// than a simple counter. All other DISTINCT aggregates (SUM, AVG, …) use
-/// their normal variant with `AggregateSpec::distinct = true`, and dedup
-/// is applied at execution time.
-#[derive(Debug, Clone, PartialEq)]
-pub enum AggregateFn {
-    /// COUNT — count non-Unbound values of a variable
-    Count,
-    /// COUNT(*) — count all rows in a group regardless of variable values
-    CountAll,
-    /// COUNT(DISTINCT) — count distinct non-Unbound values (dedicated variant
-    /// for streaming HashSet state; `AggregateSpec::distinct` is false here)
-    CountDistinct,
-    /// SUM — numeric sum
-    Sum,
-    /// AVG — numeric average
-    Avg,
-    /// MIN — minimum value by comparison
-    Min,
-    /// MAX — maximum value by comparison
-    Max,
-    /// MEDIAN — median value
-    Median,
-    /// VARIANCE — population variance
-    Variance,
-    /// STDDEV — population standard deviation
-    Stddev,
-    /// GROUP_CONCAT — concatenate strings with separator
-    GroupConcat { separator: String },
-    /// SAMPLE — return an arbitrary value
-    Sample,
+/// SPARQL aggregates can be written with or without the `DISTINCT`
+/// modifier. The modifier doesn't change what the input *is* (the
+/// executor always carries a multiset of `Binding`s) — it changes how
+/// the aggregate *interprets* that input.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InputSemantics {
+    /// Treat the input as a list — every occurrence counted (default).
+    List,
+    /// Treat the input as a set — duplicates collapsed (`DISTINCT`).
+    Set,
 }
 
-/// Specification for a single aggregate operation.
+/// Aggregate function kinds, with each variant carrying exactly the fields
+/// that variant needs:
+///
+/// - The input variable is part of every variant except [`Self::CountAll`]
+///   (which counts rows regardless of values). Variants that take an input
+///   carry it inline, so "Sum without an input" or "CountAll with an input"
+///   are structurally unrepresentable.
+/// - [`InputSemantics`] rides only on variants where SPARQL's `DISTINCT`
+///   modifier actually changes the result. `Min`, `Max`, and `Sample` omit
+///   it because their values are unchanged by deduplication; `Count` /
+///   `CountDistinct` are separate variants for the same reason plus a
+///   streaming-state distinction (counter vs. `HashSet`).
+#[derive(Debug, Clone, PartialEq)]
+pub enum AggregateFn {
+    /// `COUNT(?x)` — count non-Unbound values of a variable.
+    Count(VarId),
+    /// `COUNT(*)` — count all rows in a group regardless of values.
+    CountAll,
+    /// `COUNT(DISTINCT ?x)` — count distinct non-Unbound values. Separate
+    /// variant because its streaming state uses a `HashSet` rather than a
+    /// counter.
+    CountDistinct(VarId),
+    /// `SUM(?x)` or `SUM(DISTINCT ?x)`.
+    Sum(VarId, InputSemantics),
+    /// `AVG(?x)` or `AVG(DISTINCT ?x)`.
+    Avg(VarId, InputSemantics),
+    /// `MIN(?x)` — DISTINCT is a no-op for min, so no flag.
+    Min(VarId),
+    /// `MAX(?x)` — DISTINCT is a no-op for max, so no flag.
+    Max(VarId),
+    /// `MEDIAN(?x)` or `MEDIAN(DISTINCT ?x)`.
+    Median(VarId, InputSemantics),
+    /// `VARIANCE(?x)` or `VARIANCE(DISTINCT ?x)` — population variance.
+    Variance(VarId, InputSemantics),
+    /// `STDDEV(?x)` or `STDDEV(DISTINCT ?x)` — population standard deviation.
+    Stddev(VarId, InputSemantics),
+    /// `GROUP_CONCAT(?x; SEPARATOR=…)` or its DISTINCT form. Stays in
+    /// struct form because of the extra `separator` field.
+    GroupConcat {
+        input: VarId,
+        semantics: InputSemantics,
+        separator: String,
+    },
+    /// `SAMPLE(?x)` — an arbitrary value; DISTINCT is a no-op.
+    Sample(VarId),
+}
+
+impl AggregateFn {
+    /// Variable this aggregate reads from each row, if any. Returns `None`
+    /// only for [`Self::CountAll`].
+    pub fn input_var(&self) -> Option<VarId> {
+        match self {
+            Self::CountAll => None,
+            Self::Count(v)
+            | Self::CountDistinct(v)
+            | Self::Sum(v, _)
+            | Self::Avg(v, _)
+            | Self::Min(v)
+            | Self::Max(v)
+            | Self::Median(v, _)
+            | Self::Variance(v, _)
+            | Self::Stddev(v, _)
+            | Self::Sample(v) => Some(*v),
+            Self::GroupConcat { input, .. } => Some(*input),
+        }
+    }
+
+    /// Whether `DISTINCT` was requested. `true` for [`Self::CountDistinct`]
+    /// (its own dedicated variant) and for any variant whose
+    /// [`InputSemantics`] is [`InputSemantics::Set`]; always `false` on
+    /// `Min`/`Max`/`Sample`/`Count`/`CountAll`, which don't carry the
+    /// modifier at all.
+    pub fn is_distinct(&self) -> bool {
+        matches!(
+            self,
+            Self::CountDistinct(_)
+                | Self::Sum(_, InputSemantics::Set)
+                | Self::Avg(_, InputSemantics::Set)
+                | Self::Median(_, InputSemantics::Set)
+                | Self::Variance(_, InputSemantics::Set)
+                | Self::Stddev(_, InputSemantics::Set)
+                | Self::GroupConcat {
+                    semantics: InputSemantics::Set,
+                    ..
+                }
+        )
+    }
+}
+
+/// Specification for a single aggregate operation: the function applied to
+/// each group plus the variable the result is bound to.
 #[derive(Debug, Clone)]
 pub struct AggregateSpec {
     /// The aggregate function to apply.
     pub function: AggregateFn,
-    /// Input variable (contains `Grouped` values after GROUP BY). `None`
-    /// for `COUNT(*)`, which counts all rows regardless of values.
-    pub input_var: Option<VarId>,
     /// Output variable for the aggregate result.
     pub output_var: VarId,
-    /// Whether `DISTINCT` was specified (e.g., `SUM(DISTINCT ?x)`).
-    pub distinct: bool,
 }
 
 /// The aggregation stage of a grouping phase: aggregate functions computed

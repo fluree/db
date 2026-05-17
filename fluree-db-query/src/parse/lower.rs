@@ -17,7 +17,7 @@ use crate::binding::Binding;
 use crate::context::WellKnownDatatypes;
 use crate::ir::triple::{Ref, Term, TriplePattern};
 use crate::ir::ReasoningConfig;
-use crate::ir::{AggregateFn, AggregateSpec};
+use crate::ir::{AggregateFn, AggregateSpec, InputSemantics};
 use crate::ir::{
     Column, ConstructTemplate, ForwardItem, Grouping, HydrationSpec, NestedSelectSpec, Projection,
     Query, QueryOutput, Restriction, Root,
@@ -1658,44 +1658,49 @@ fn lower_sort_spec(spec: &UnresolvedSortSpec, vars: &mut VarRegistry) -> SortSpe
     SortSpec { var, direction }
 }
 
-/// Lower an unresolved aggregate function to a resolved AggregateFn
-fn lower_aggregate_fn(f: &UnresolvedAggregateFn) -> AggregateFn {
-    match f {
-        UnresolvedAggregateFn::Count => AggregateFn::Count,
-        UnresolvedAggregateFn::CountDistinct => AggregateFn::CountDistinct,
-        UnresolvedAggregateFn::Sum => AggregateFn::Sum,
-        UnresolvedAggregateFn::Avg => AggregateFn::Avg,
-        UnresolvedAggregateFn::Min => AggregateFn::Min,
-        UnresolvedAggregateFn::Max => AggregateFn::Max,
-        UnresolvedAggregateFn::Median => AggregateFn::Median,
-        UnresolvedAggregateFn::Variance => AggregateFn::Variance,
-        UnresolvedAggregateFn::Stddev => AggregateFn::Stddev,
+/// Lower an unresolved aggregate spec to a resolved [`AggregateSpec`].
+///
+/// `spec.input_var == "*"` is the COUNT(*) form and maps to
+/// [`AggregateFn::CountAll`]. Every other form binds the input variable
+/// inside the matching `AggregateFn` variant. JSON-LD has no surface
+/// `DISTINCT` modifier today, so every variant that carries
+/// [`InputSemantics`] is built with [`InputSemantics::List`];
+/// `UnresolvedAggregateFn::CountDistinct` targets the dedicated
+/// [`AggregateFn::CountDistinct`] variant instead.
+fn lower_aggregate_spec(spec: &UnresolvedAggregateSpec, vars: &mut VarRegistry) -> AggregateSpec {
+    let output_var = vars.get_or_insert(&spec.output_var);
+
+    // COUNT(*) — input="*" means count rows regardless of values.
+    if spec.input_var.as_ref() == "*" {
+        return AggregateSpec {
+            function: AggregateFn::CountAll,
+            output_var,
+        };
+    }
+
+    let input = vars.get_or_insert(&spec.input_var);
+    let list = InputSemantics::List;
+    let function = match &spec.function {
+        UnresolvedAggregateFn::Count => AggregateFn::Count(input),
+        UnresolvedAggregateFn::CountDistinct => AggregateFn::CountDistinct(input),
+        UnresolvedAggregateFn::Sum => AggregateFn::Sum(input, list),
+        UnresolvedAggregateFn::Avg => AggregateFn::Avg(input, list),
+        UnresolvedAggregateFn::Min => AggregateFn::Min(input),
+        UnresolvedAggregateFn::Max => AggregateFn::Max(input),
+        UnresolvedAggregateFn::Median => AggregateFn::Median(input, list),
+        UnresolvedAggregateFn::Variance => AggregateFn::Variance(input, list),
+        UnresolvedAggregateFn::Stddev => AggregateFn::Stddev(input, list),
         UnresolvedAggregateFn::GroupConcat { separator } => AggregateFn::GroupConcat {
+            input,
+            semantics: list,
             separator: separator.clone(),
         },
-        UnresolvedAggregateFn::Sample => AggregateFn::Sample,
-    }
-}
+        UnresolvedAggregateFn::Sample => AggregateFn::Sample(input),
+    };
 
-/// Lower an unresolved aggregate spec to a resolved AggregateSpec
-fn lower_aggregate_spec(spec: &UnresolvedAggregateSpec, vars: &mut VarRegistry) -> AggregateSpec {
-    // Handle COUNT(*) - input="*" means count all rows
-    if spec.input_var.as_ref() == "*" {
-        // COUNT(*) uses CountAll function and has no input variable
-        AggregateSpec {
-            function: AggregateFn::CountAll,
-            input_var: None,
-            output_var: vars.get_or_insert(&spec.output_var),
-            distinct: false,
-        }
-    } else {
-        // Regular aggregate with input variable
-        AggregateSpec {
-            function: lower_aggregate_fn(&spec.function),
-            input_var: Some(vars.get_or_insert(&spec.input_var)),
-            output_var: vars.get_or_insert(&spec.output_var),
-            distinct: false,
-        }
+    AggregateSpec {
+        function,
+        output_var,
     }
 }
 

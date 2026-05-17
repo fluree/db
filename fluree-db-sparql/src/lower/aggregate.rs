@@ -8,7 +8,7 @@ use crate::ast::expr::{AggregateFunction, Expression};
 use crate::ast::query::{SelectClause, SelectVariable, SelectVariables};
 
 use fluree_db_query::ir::Pattern;
-use fluree_db_query::ir::{AggregateFn, AggregateSpec};
+use fluree_db_query::ir::{AggregateFn, AggregateSpec, InputSemantics};
 use fluree_db_query::parse::encode::IriEncoder;
 use fluree_db_query::var_registry::VarId;
 
@@ -219,30 +219,52 @@ impl<E: IriEncoder> LoweringContext<'_, E> {
         };
 
         let input_var = self.lower_aggregate_input_var(expr, pre_binds)?;
-        let agg_fn = match expr {
-            Some(_) => self.map_aggregate_function(
-                function,
-                *distinct,
-                separator.as_ref().map(std::convert::AsRef::as_ref),
-            ),
-            None => AggregateFn::CountAll,
+        let semantics = if *distinct {
+            InputSemantics::Set
+        } else {
+            InputSemantics::List
+        };
+        let function = match (function, input_var) {
+            // COUNT(*) — DISTINCT * is not meaningful for COUNT.
+            (AggregateFunction::Count, None) => {
+                if *distinct {
+                    return Err(LowerError::not_implemented("COUNT(DISTINCT *)", *span));
+                }
+                AggregateFn::CountAll
+            }
+            // Every non-COUNT aggregate needs an input variable. The caller
+            // is responsible for ensuring `expr` is `Some(_)`; reaching this
+            // arm with `None` means a malformed AST.
+            (_, None) => {
+                return Err(LowerError::not_implemented(
+                    "aggregate without input expression (only COUNT(*) supports that)",
+                    *span,
+                ));
+            }
+            (AggregateFunction::Count, Some(v)) => {
+                if *distinct {
+                    AggregateFn::CountDistinct(v)
+                } else {
+                    AggregateFn::Count(v)
+                }
+            }
+            (AggregateFunction::Sum, Some(v)) => AggregateFn::Sum(v, semantics),
+            (AggregateFunction::Avg, Some(v)) => AggregateFn::Avg(v, semantics),
+            // DISTINCT is a semantic no-op for Min/Max/Sample; drop it at
+            // the IR boundary so the variant invariant holds.
+            (AggregateFunction::Min, Some(v)) => AggregateFn::Min(v),
+            (AggregateFunction::Max, Some(v)) => AggregateFn::Max(v),
+            (AggregateFunction::Sample, Some(v)) => AggregateFn::Sample(v),
+            (AggregateFunction::GroupConcat, Some(v)) => AggregateFn::GroupConcat {
+                input: v,
+                semantics,
+                separator: separator.as_deref().unwrap_or(" ").to_string(),
+            },
         };
 
-        if matches!(agg_fn, AggregateFn::CountAll) && *distinct {
-            return Err(LowerError::not_implemented("COUNT(DISTINCT *)", *span));
-        }
-
-        // COUNT(DISTINCT) is represented as a dedicated AggregateFn::CountDistinct
-        // variant (with its own streaming HashSet state), so clear the distinct flag
-        // to avoid a redundant double-dedup in AggregateOperator. All other functions
-        // (SUM, AVG, MIN, MAX, etc.) use the flag for dedup at execution time.
-        let distinct = *distinct && !matches!(agg_fn, AggregateFn::CountDistinct);
-
         Ok(AggregateSpec {
-            function: agg_fn,
-            input_var,
+            function,
             output_var,
-            distinct,
         })
     }
 
@@ -371,32 +393,6 @@ impl<E: IriEncoder> LoweringContext<'_, E> {
         }
 
         Ok((aggregates, pre_binds))
-    }
-
-    /// Map SPARQL AggregateFunction to engine AggregateFn.
-    fn map_aggregate_function(
-        &self,
-        function: &AggregateFunction,
-        distinct: bool,
-        separator: Option<&str>,
-    ) -> AggregateFn {
-        match function {
-            AggregateFunction::Count => {
-                if distinct {
-                    AggregateFn::CountDistinct
-                } else {
-                    AggregateFn::Count
-                }
-            }
-            AggregateFunction::Sum => AggregateFn::Sum,
-            AggregateFunction::Avg => AggregateFn::Avg,
-            AggregateFunction::Min => AggregateFn::Min,
-            AggregateFunction::Max => AggregateFn::Max,
-            AggregateFunction::GroupConcat => AggregateFn::GroupConcat {
-                separator: separator.unwrap_or(" ").to_string(),
-            },
-            AggregateFunction::Sample => AggregateFn::Sample,
-        }
     }
 
     /// Collect non-aggregate SELECT variables for implicit GROUP BY.
