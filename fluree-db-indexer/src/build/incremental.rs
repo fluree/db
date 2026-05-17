@@ -2233,6 +2233,24 @@ pub async fn incremental_index(
                     "Phase 3b: applied class count deltas"
                 );
 
+                let mut class_sid_cache: std::collections::HashMap<u64, fluree_db_core::Sid> =
+                    entries_by_key
+                        .iter()
+                        .filter_map(|(&(_, class_sid64), entry)| {
+                            if entry.class_sid.name.is_empty()
+                                && entry.class_sid.namespace_code == 0
+                            {
+                                None
+                            } else {
+                                Some((class_sid64, entry.class_sid.clone()))
+                            }
+                        })
+                        .collect();
+                tracing::debug!(
+                    cached_class_sids = class_sid_cache.len(),
+                    "Phase 3b: cached class Sid values for property attribution merge"
+                );
+
                 // Build property attribution for each class entry.
                 let property_merge_started = Instant::now();
                 tracing::debug!(
@@ -2338,6 +2356,27 @@ pub async fn incremental_index(
                         let mut merged_property_count = 0usize;
                         let mut last_class_property_log = Instant::now();
                         for &cp_id in &prop_set {
+                            if merged_property_count < 3
+                                || last_class_property_log.elapsed()
+                                    >= std::time::Duration::from_secs(5)
+                            {
+                                tracing::debug!(
+                                    g_id,
+                                    class_sid64,
+                                    cp_id,
+                                    merged_property_count,
+                                    total_class_properties,
+                                    has_base_property = base_prop_by_pid.contains_key(&cp_id),
+                                    has_datatype_delta =
+                                        class_dts.is_some_and(|m| m.contains_key(&cp_id)),
+                                    has_lang_delta =
+                                        class_langs.is_some_and(|m| m.contains_key(&cp_id)),
+                                    ref_delta_count = class_refs
+                                        .and_then(|m| m.get(&cp_id))
+                                        .map_or(0, std::collections::HashMap::len),
+                                    "Phase 3b: class property attribution property starting"
+                                );
+                            }
                             let iri = novelty.shared.predicates.resolve(cp_id).unwrap_or("");
                             let p_sid = match trie.longest_match(iri) {
                                 Some((code, plen)) => fluree_db_core::Sid::new(code, &iri[plen..]),
@@ -2401,15 +2440,65 @@ pub async fn incremental_index(
                                 }
                             }
                             if let Some(ref_delta) = class_refs.and_then(|m| m.get(&cp_id)) {
+                                let ref_delta_count = ref_delta.len();
+                                if ref_delta_count >= 25 || merged_class_entries < 10 {
+                                    tracing::debug!(
+                                        g_id,
+                                        class_sid64,
+                                        cp_id,
+                                        ref_delta_count,
+                                        merged_property_count,
+                                        total_class_properties,
+                                        "Phase 3b: merging novelty ref-class deltas"
+                                    );
+                                }
+                                let mut merged_ref_delta_count = 0usize;
+                                let mut last_ref_delta_log = Instant::now();
                                 for (&target, &cnt) in ref_delta {
                                     ref_class_sid_lookups.fetch_add(1, Ordering::Relaxed);
-                                    let cs = resolve_class_sid(
-                                        target,
-                                        store_opt.as_deref(),
-                                        &new_subject_suffix,
-                                    );
-                                    ref_class_sid_hits.fetch_add(1, Ordering::Relaxed);
+                                    let cs = if let Some(cs) = class_sid_cache.get(&target) {
+                                        ref_class_sid_hits.fetch_add(1, Ordering::Relaxed);
+                                        cs.clone()
+                                    } else {
+                                        let sid =
+                                            fluree_db_core::subject_id::SubjectId::from_u64(target);
+                                        let cs = if let Some(suffix) =
+                                            new_subject_suffix.get(&(sid.ns_code(), sid.local_id()))
+                                        {
+                                            resolve_class_sid_novelty_hits
+                                                .fetch_add(1, Ordering::Relaxed);
+                                            fluree_db_core::Sid::new(sid.ns_code(), suffix.as_str())
+                                        } else {
+                                            resolve_class_sid_fallbacks
+                                                .fetch_add(1, Ordering::Relaxed);
+                                            fluree_db_core::Sid::new(
+                                                sid.ns_code(),
+                                                sid.local_id().to_string(),
+                                            )
+                                        };
+                                        class_sid_cache.insert(target, cs.clone());
+                                        cs
+                                    };
                                     *merged_refs.entry(cs).or_insert(0) += cnt;
+                                    merged_ref_delta_count += 1;
+                                    if last_ref_delta_log.elapsed()
+                                        >= std::time::Duration::from_secs(5)
+                                    {
+                                        tracing::debug!(
+                                            g_id,
+                                            class_sid64,
+                                            cp_id,
+                                            merged_ref_delta_count,
+                                            ref_delta_count,
+                                            class_sid_cache_size = class_sid_cache.len(),
+                                            elapsed_ms =
+                                                class_merge_started.elapsed().as_millis() as u64,
+                                            phase_elapsed_ms =
+                                                phase3b_started.elapsed().as_millis() as u64,
+                                            "Phase 3b: novelty ref-class deltas still merging"
+                                        );
+                                        last_ref_delta_log = Instant::now();
+                                    }
                                 }
                             }
                             let ref_classes: Vec<is::ClassRefCount> = merged_refs
