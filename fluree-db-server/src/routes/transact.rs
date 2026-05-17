@@ -1280,6 +1280,19 @@ async fn execute_transaction(
         if let Some(shapes) = body.get("opts").and_then(|o| o.get("shapes")) {
             txn_opts.shapes = Some(shapes.clone());
         }
+        if let Some(unique_props) = body
+            .get("opts")
+            .and_then(|o| o.get("uniqueProperties"))
+            .and_then(|v| v.as_array())
+        {
+            let iris: Vec<String> = unique_props
+                .iter()
+                .filter_map(|v| v.as_str().map(std::string::ToString::to_string))
+                .collect();
+            if !iris.is_empty() {
+                txn_opts.unique_properties = Some(iris);
+            }
+        }
 
         // Build and execute the transaction via the builder API.
         // Hoisted above CommitOpts assembly so we can spawn the raw-txn upload

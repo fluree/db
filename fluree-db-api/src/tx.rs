@@ -711,14 +711,80 @@ async fn enforce_unique_after_staging(
     view: &StagedLedger,
     graph_delta: &FxHashMap<u16, String>,
     resolve_ctx: &mut crate::cross_ledger::ResolveCtx<'_>,
+    inline_unique_properties: Option<&[String]>,
 ) -> std::result::Result<(), fluree_db_transact::TransactError> {
     let config = load_transaction_config(view.base()).await;
-    if let Some(cfg) = &config {
-        let per_graph_unique =
-            resolve_per_graph_unique_sids(view, cfg, graph_delta, resolve_ctx).await?;
-        enforce_unique_constraints(view, &per_graph_unique, graph_delta).await?;
+
+    // Start with config-resolved per-graph SIDs (same/cross ledger).
+    // No config → empty; inline properties below can still drive
+    // enforcement when set.
+    let mut per_graph_unique: HashMap<GraphId, FxHashSet<Sid>> = match &config {
+        Some(cfg) => resolve_per_graph_unique_sids(view, cfg, graph_delta, resolve_ctx).await?,
+        None => HashMap::new(),
+    };
+
+    // Layer inline `opts.uniqueProperties` additively. Apply to
+    // every affected graph so the constraint behaves as
+    // "for this tx, these properties must be unique wherever they
+    // appear" — matching how `f:enforceUnique` annotations work
+    // when configured in the default graph against a per-graph
+    // tx.
+    if let Some(iris) = inline_unique_properties.filter(|v| !v.is_empty()) {
+        let snapshot = view.db();
+        let inline_sids: FxHashSet<Sid> = iris
+            .iter()
+            .filter_map(|iri| snapshot.encode_iri(iri))
+            .collect();
+        if !inline_sids.is_empty() {
+            for g_id in affected_graph_ids(view, graph_delta) {
+                per_graph_unique
+                    .entry(g_id)
+                    .or_default()
+                    .extend(inline_sids.iter().cloned());
+            }
+        }
     }
+
+    if per_graph_unique.is_empty() {
+        return Ok(());
+    }
+    enforce_unique_constraints(view, &per_graph_unique, graph_delta).await?;
     Ok(())
+}
+
+/// Derive the set of graph IDs touched by staged flakes. Used by
+/// both the config-resolved constraints path and the inline
+/// `opts.uniqueProperties` path so they enforce against the same
+/// set of graphs.
+fn affected_graph_ids(
+    view: &StagedLedger,
+    graph_delta: &FxHashMap<u16, String>,
+) -> FxHashSet<GraphId> {
+    let snapshot = view.db();
+    let mut sid_to_gid: HashMap<Sid, GraphId> = HashMap::new();
+    for (&g_id, iri) in graph_delta {
+        if let Some(sid) = snapshot.encode_iri(iri) {
+            sid_to_gid.insert(sid, g_id);
+        }
+    }
+    for (g_id, iri) in snapshot.graph_registry.iter_entries() {
+        if let Some(sid) = snapshot.encode_iri(iri) {
+            sid_to_gid.entry(sid).or_insert(g_id);
+        }
+    }
+
+    let mut out: FxHashSet<GraphId> = FxHashSet::default();
+    for flake in view.staged_flakes() {
+        if !flake.op {
+            continue;
+        }
+        let g_id = match &flake.g {
+            None => 0u16,
+            Some(g_sid) => sid_to_gid.get(g_sid).copied().unwrap_or(0),
+        };
+        out.insert(g_id);
+    }
+    out
 }
 
 /// Resolve per-graph unique property SIDs from `f:enforceUnique` annotations.
@@ -735,40 +801,7 @@ async fn resolve_per_graph_unique_sids(
     resolve_ctx: &mut crate::cross_ledger::ResolveCtx<'_>,
 ) -> std::result::Result<HashMap<GraphId, FxHashSet<Sid>>, fluree_db_transact::TransactError> {
     let snapshot = view.db();
-
-    // Build reverse map: graph SID → g_id for flake graph resolution
-    let mut sid_to_gid: HashMap<Sid, GraphId> = HashMap::new();
-    for (&g_id, iri) in graph_delta {
-        if let Some(sid) = snapshot.encode_iri(iri) {
-            sid_to_gid.insert(sid, g_id);
-        }
-    }
-    // Also include pre-existing named graphs from the registry
-    for (g_id, iri) in snapshot.graph_registry.iter_entries() {
-        if let Some(sid) = snapshot.encode_iri(iri) {
-            sid_to_gid.entry(sid).or_insert(g_id);
-        }
-    }
-
-    // Derive affected graph IDs from staged flakes (not graph_delta)
-    let mut affected_g_ids: FxHashSet<GraphId> = FxHashSet::default();
-    for flake in view.staged_flakes() {
-        if !flake.op {
-            continue;
-        }
-        let g_id = match &flake.g {
-            None => 0u16,
-            Some(g_sid) => sid_to_gid.get(g_sid).copied().unwrap_or_else(|| {
-                tracing::debug!(
-                    ?g_sid,
-                    "Staged flake with unknown graph SID — treating as default"
-                );
-                0
-            }),
-        };
-        affected_g_ids.insert(g_id);
-    }
-
+    let affected_g_ids = affected_graph_ids(view, graph_delta);
     let mut per_graph: HashMap<GraphId, FxHashSet<Sid>> = HashMap::new();
 
     for &g_id in &affected_g_ids {
@@ -1439,9 +1472,11 @@ impl crate::Fluree {
             txn.graph_delta.extend(named_graph_delta);
         }
 
-        // Extract txn_meta and graph_delta before staging consumes the Txn
+        // Extract txn_meta, graph_delta, and any inline uniqueness
+        // properties before staging consumes the Txn.
         let txn_meta = txn.txn_meta.clone();
         let graph_delta = txn.graph_delta.clone();
+        let inline_unique_properties = txn.opts.unique_properties.clone();
 
         // Use external tracker if provided, otherwise fall back to limits-only tracker
         let limits_tracker;
@@ -1479,7 +1514,13 @@ impl crate::Fluree {
         let (view, ns_registry) = stage_txn(ledger, txn, ns_registry, options).await?;
 
         // Enforce uniqueness constraints (independent of shacl feature)
-        enforce_unique_after_staging(&view, &graph_delta, &mut resolve_ctx).await?;
+        enforce_unique_after_staging(
+            &view,
+            &graph_delta,
+            &mut resolve_ctx,
+            inline_unique_properties.as_deref(),
+        )
+        .await?;
 
         Ok(StageResult {
             view,
@@ -1530,9 +1571,11 @@ impl crate::Fluree {
                 })?;
         }
 
-        // Extract txn_meta and graph_delta before staging consumes the Txn
+        // Extract txn_meta, graph_delta, and any inline uniqueness
+        // properties before staging consumes the Txn.
         let txn_meta = txn.txn_meta.clone();
         let graph_delta = txn.graph_delta.clone();
+        let inline_unique_properties = txn.opts.unique_properties.clone();
 
         let mut options = match index_config {
             Some(cfg) => StageOptions::new().with_index_config(cfg),
@@ -1559,7 +1602,13 @@ impl crate::Fluree {
         let (view, ns_registry) = stage_txn(ledger, txn, ns_registry, options).await?;
 
         // Enforce uniqueness constraints (independent of shacl feature)
-        enforce_unique_after_staging(&view, &graph_delta, &mut resolve_ctx).await?;
+        enforce_unique_after_staging(
+            &view,
+            &graph_delta,
+            &mut resolve_ctx,
+            inline_unique_properties.as_deref(),
+        )
+        .await?;
 
         Ok(StageResult {
             view,
@@ -1592,9 +1641,11 @@ impl crate::Fluree {
             .map_err(|e| TrackedErrorResponse::new(400, e.to_string(), tracker.tally()))?
         };
 
-        // Extract txn_meta and graph_delta before staging consumes the Txn
+        // Extract txn_meta, graph_delta, and any inline uniqueness
+        // properties before staging consumes the Txn.
         let txn_meta = txn.txn_meta.clone();
         let graph_delta = txn.graph_delta.clone();
+        let inline_unique_properties = txn.opts.unique_properties.clone();
 
         // Build stage options with policy and tracker
         let mut options = StageOptions::new()
@@ -1620,9 +1671,14 @@ impl crate::Fluree {
             .map_err(|e| TrackedErrorResponse::new(400, e.to_string(), tracker.tally()))?;
 
         // Enforce uniqueness constraints (independent of shacl feature)
-        enforce_unique_after_staging(&view, &graph_delta, &mut resolve_ctx)
-            .await
-            .map_err(|e| TrackedErrorResponse::new(400, e.to_string(), tracker.tally()))?;
+        enforce_unique_after_staging(
+            &view,
+            &graph_delta,
+            &mut resolve_ctx,
+            inline_unique_properties.as_deref(),
+        )
+        .await
+        .map_err(|e| TrackedErrorResponse::new(400, e.to_string(), tracker.tally()))?;
 
         Ok(StageResult {
             view,

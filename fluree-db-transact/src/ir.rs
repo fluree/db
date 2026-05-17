@@ -482,6 +482,27 @@ pub struct TxnOpts {
     /// prefer `f:shapesSource`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub shapes: Option<serde_json::Value>,
+
+    /// Inline `f:enforceUnique` declarations for *this transaction only*.
+    ///
+    /// Each entry is a property IRI (full IRI; not compact prefix
+    /// form) that the uniqueness enforcer should treat as
+    /// `f:enforceUnique true` for the duration of this transaction.
+    /// IRIs the data ledger's namespace map has never seen are
+    /// dropped silently — no instance of the property exists on D,
+    /// so no constraint can be violated. The list is unioned with
+    /// whatever `f:constraintsSource` resolves to (same-ledger or
+    /// cross-ledger) and never replaces it.
+    ///
+    /// Inline constraints do not persist into the ledger. The next
+    /// transaction without `opts.uniqueProperties` runs without
+    /// them (same trade-off as `opts.shapes`).
+    ///
+    /// Use cases: enforce a constraint for an ad-hoc bulk-load
+    /// without committing the annotation to `#config`; per-tenant
+    /// uniqueness layered on top of operator-set baselines.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub unique_properties: Option<Vec<String>>,
 }
 
 impl TxnOpts {
