@@ -423,36 +423,42 @@ impl ShapesArtifactWire {
 
 /// Decode a wire literal into the matching `FlakeValue`.
 ///
-/// Returns `Err` when the lexical form fails to parse against the
-/// declared datatype (e.g., `"abc"^^xsd:integer`). The caller
-/// surfaces these as `TranslationFailed` — silently re-typing to
-/// `FlakeValue::String` would change shape semantics on D. Unknown
-/// (non-xsd) datatypes fall through to `String(value)` because the
-/// caller has *already* validated the datatype IRI is registered
-/// on D; an unknown but-registered datatype is the application's
-/// to interpret.
+/// Delegates to [`fluree_db_transact::value_convert::parse_xsd_lexical`]
+/// so cross-ledger SHACL literals parse with the **same parser the
+/// same-ledger import path uses** for every XSD-recognized datatype:
+/// integer family (with `i64 → BigInt` overflow), `xsd:decimal`
+/// (arbitrary-precision), `xsd:dateTime` / `xsd:date` / `xsd:time`,
+/// the `xsd:gYear*` family, `xsd:duration` / `dayTimeDuration` /
+/// `yearMonthDuration`, `xsd:double` / `xsd:float`, `xsd:boolean`,
+/// the string family, and `rdf:JSON`. SHACL range / `sh:hasValue`
+/// constraints against any of these now produce identical match
+/// behavior between same- and cross-ledger shape sources.
+///
+/// Returns `Err(detail)` when the lexical form is invalid against a
+/// recognized XSD datatype (e.g., `"abc"^^xsd:integer`). The caller
+/// surfaces this as `TranslationFailed` rather than silently
+/// re-typing the literal to `FlakeValue::String`, which would
+/// change shape semantics on D.
+///
+/// **Non-XSD datatypes deliberately fall through to
+/// `FlakeValue::String(value)`.** The translator's outer
+/// `translate_to_schema_bundle_flakes` has already validated that
+/// the datatype IRI is registered on D, so this is the
+/// application-defined custom-datatype case: Fluree has no
+/// `FlakeValue` variant for it, and the same-ledger import path
+/// stores the same lexical form as a `String` under the same
+/// datatype Sid. Cross-ledger must produce an identical flake
+/// shape so the SHACL engine matches identically. Failing closed
+/// here instead of mirroring same-ledger would *diverge* the two
+/// code paths and break the parity contract.
 fn literal_to_flake_value(
     value: &str,
     datatype: &str,
 ) -> Result<fluree_db_core::FlakeValue, String> {
     use fluree_db_core::FlakeValue;
-    const XSD: &str = "http://www.w3.org/2001/XMLSchema#";
-    let local = datatype.strip_prefix(XSD).unwrap_or("");
-    match local {
-        "boolean" => value.parse::<bool>().map(FlakeValue::Boolean).map_err(|e| {
-            format!("invalid xsd:boolean lexical `{value}` on cross-ledger shape: {e}")
-        }),
-        "integer" | "long" | "int" | "short" | "byte" | "nonNegativeInteger"
-        | "positiveInteger" | "negativeInteger" | "nonPositiveInteger" | "unsignedLong"
-        | "unsignedInt" | "unsignedShort" | "unsignedByte" => {
-            value.parse::<i64>().map(FlakeValue::Long).map_err(|e| {
-                format!("invalid xsd:{local} lexical `{value}` on cross-ledger shape: {e}")
-            })
-        }
-        "double" | "float" => value.parse::<f64>().map(FlakeValue::Double).map_err(|e| {
-            format!("invalid xsd:{local} lexical `{value}` on cross-ledger shape: {e}")
-        }),
-        _ => Ok(FlakeValue::String(value.to_string())),
+    match fluree_db_transact::value_convert::parse_xsd_lexical(value, datatype)? {
+        Some(fv) => Ok(fv),
+        None => Ok(FlakeValue::String(value.to_string())),
     }
 }
 

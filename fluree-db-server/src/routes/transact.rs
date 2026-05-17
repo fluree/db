@@ -1279,16 +1279,35 @@ async fn execute_transaction(
         let mut txn_opts = TxnOpts::default();
         if let Some(shapes) = body.get("opts").and_then(|o| o.get("shapes")) {
             // Validate at the boundary: `shapes` must be a JSON-LD
-            // document (object) or list of documents (array).
+            // document (object) or an array of JSON-LD documents.
             // Letting scalars / nulls fall through to
             // `fluree_graph_json_ld::expand` surfaces as a fuzzy
             // internal parse error rather than the precise 400
             // the caller deserves.
-            if !shapes.is_object() && !shapes.is_array() {
-                set_span_error_code(&span, "error:BadRequest");
-                return Err(ServerError::bad_request(
-                    "opts.shapes must be a JSON-LD object or array of objects",
-                ));
+            //
+            // For the array form, every element must itself be an
+            // object — `[42]` or `[null]` would have passed the
+            // top-level type check, then failed downstream with a
+            // confusing message that doesn't match the documented
+            // contract.
+            match shapes {
+                JsonValue::Object(_) => {}
+                JsonValue::Array(arr) => {
+                    for (idx, item) in arr.iter().enumerate() {
+                        if !item.is_object() {
+                            set_span_error_code(&span, "error:BadRequest");
+                            return Err(ServerError::bad_request(format!(
+                                "opts.shapes[{idx}] must be a JSON-LD object; got {item}"
+                            )));
+                        }
+                    }
+                }
+                _ => {
+                    set_span_error_code(&span, "error:BadRequest");
+                    return Err(ServerError::bad_request(
+                        "opts.shapes must be a JSON-LD object or array of objects",
+                    ));
+                }
             }
             txn_opts.shapes = Some(shapes.clone());
         }
