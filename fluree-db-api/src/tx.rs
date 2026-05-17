@@ -624,7 +624,7 @@ fn format_violations(violations: &[fluree_db_shacl::ValidationResult]) -> String
 #[cfg(feature = "shacl")]
 async fn stage_with_config_shacl(
     ledger: LedgerState,
-    txn: Txn,
+    mut txn: Txn,
     ns_registry: NamespaceRegistry,
     options: StageOptions<'_>,
     resolve_ctx: &mut crate::cross_ledger::ResolveCtx<'_>,
@@ -635,11 +635,12 @@ async fn stage_with_config_shacl(
     // sid_for_iri hits the trie cache — no new allocations).
     let graph_delta = txn.graph_delta.clone();
     let tracker = options.tracker;
-    // Capture inline shapes JSON now — stage_txn consumes `txn`.
-    // Parsing happens *after* staging so the FlakeSink encodes
-    // against the post-staging `ns_registry`, matching the term
-    // context cross-ledger shapes compile against.
-    let inline_shapes_json = txn.opts.shapes.clone();
+    // Move inline shapes JSON off the txn — stage_txn consumes
+    // `txn` immediately after this, and the in-flight staging
+    // path itself never reads `opts.shapes`. Taking avoids
+    // cloning a potentially large JSON-LD doc just to keep both
+    // copies for one extra moment.
+    let inline_shapes_json = txn.opts.shapes.take();
     let inline_shapes_ledger_id = ledger.snapshot.ledger_id.to_string();
 
     // Detect cross-ledger SHACL config at the API boundary BEFORE

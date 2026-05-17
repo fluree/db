@@ -645,9 +645,15 @@ impl Fluree {
         //    bundle. Layered on top of `configured_bundle` so a
         //    query can extend the ledger's reasoning with per-request
         //    axioms without persisting them.
-        let inline_bundle = match executable.reasoning.modes.ontology.as_ref() {
+        //
+        //    `take()` so the (potentially large) raw JSON-LD doesn't
+        //    ride along on `ReasoningModes.ontology` for the rest of
+        //    query preparation — `Query::with_patterns` clones the
+        //    reasoning config downstream, and only the compiled
+        //    `SchemaBundleFlakes` overlay is needed past this point.
+        let inline_bundle = match executable.reasoning.modes.ontology.take() {
             Some(json) => {
-                crate::inline_ontology::parse_inline_ontology_to_bundle(json, db_ref.snapshot)?
+                crate::inline_ontology::parse_inline_ontology_to_bundle(&json, db_ref.snapshot)?
             }
             None => None,
         };

@@ -248,13 +248,17 @@ async fn build_policy_context_from_opts_inner(
             None
         };
 
-        let restrictions = if let Some(xl) = cross_ledger_restrictions.clone() {
+        let restrictions = if let Some(mut merged) = cross_ledger_restrictions {
             // Cross-ledger short-circuit: the resolver already
             // materialized restrictions from the model ledger and
             // (per the identity contract) the wire artifact has been
             // filtered by opts.policy_class. opts.policy (inline
             // JSON-LD) still applies and gets merged below.
-            let mut merged = xl;
+            //
+            // Moving — not cloning — the owned input keeps
+            // model-ledger policy sets (which can be large: each
+            // `PolicyRestriction` carries strings + hash sets) from
+            // paying a per-request copy.
             if let Some(policy_json) = &opts.policy {
                 merged.extend(parse_inline_policy(snapshot, policy_json)?);
             }
