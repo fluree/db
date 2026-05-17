@@ -68,6 +68,16 @@ use std::collections::HashSet;
 
 /// Materialize the policy graph at `graph_iri` in model ledger `M` at
 /// `resolved_t` into a `PolicyArtifactWire`.
+#[tracing::instrument(
+    name = "cross_ledger.policy.materialize",
+    level = "debug",
+    skip(fluree),
+    fields(
+        model_ledger = canonical_model_ledger_id,
+        graph_iri = graph_iri,
+        resolved_t = resolved_t,
+    ),
+)]
 pub(super) async fn materialize_policy_rules(
     canonical_model_ledger_id: &str,
     graph_iri: &str,

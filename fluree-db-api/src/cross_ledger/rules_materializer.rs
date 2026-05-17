@@ -20,6 +20,16 @@ use crate::Fluree;
 use fluree_db_core::{FlakeValue, IndexType, RangeMatch, RangeOptions, RangeTest};
 use fluree_vocab::fluree::RULE;
 
+#[tracing::instrument(
+    name = "cross_ledger.rules.materialize",
+    level = "debug",
+    skip(fluree),
+    fields(
+        model_ledger = canonical_model_ledger_id,
+        graph_iri = graph_iri,
+        resolved_t = resolved_t,
+    ),
+)]
 pub(super) async fn materialize_rules(
     canonical_model_ledger_id: &str,
     graph_iri: &str,

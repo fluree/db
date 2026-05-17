@@ -23,6 +23,16 @@ use fluree_db_core::{
 const SHACL: &str = "http://www.w3.org/ns/shacl#";
 const RDF: &str = "http://www.w3.org/1999/02/22-rdf-syntax-ns#";
 
+#[tracing::instrument(
+    name = "cross_ledger.shapes.materialize",
+    level = "debug",
+    skip(fluree),
+    fields(
+        model_ledger = canonical_model_ledger_id,
+        graph_iri = graph_iri,
+        resolved_t = resolved_t,
+    ),
+)]
 pub(super) async fn materialize_shapes(
     canonical_model_ledger_id: &str,
     graph_iri: &str,

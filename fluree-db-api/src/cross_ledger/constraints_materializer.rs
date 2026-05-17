@@ -19,6 +19,16 @@ use fluree_vocab::config_iris;
 
 /// Materialize the constraints graph at `graph_iri` in model
 /// ledger `M` at `resolved_t` into a `ConstraintsArtifactWire`.
+#[tracing::instrument(
+    name = "cross_ledger.constraints.materialize",
+    level = "debug",
+    skip(fluree),
+    fields(
+        model_ledger = canonical_model_ledger_id,
+        graph_iri = graph_iri,
+        resolved_t = resolved_t,
+    ),
+)]
 pub(super) async fn materialize_constraints(
     canonical_model_ledger_id: &str,
     graph_iri: &str,
