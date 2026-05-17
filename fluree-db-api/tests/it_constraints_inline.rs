@@ -137,12 +137,14 @@ async fn inline_unique_property_accepts_unique_values() {
 }
 
 #[tokio::test]
-async fn inline_property_unknown_to_ledger_is_dropped_silently() {
-    // An inline IRI the ledger has never seen has no instances
-    // and cannot be violated; the enforcer drops it rather than
-    // failing the transaction. This matches the same-ledger
-    // contract where `encode_iri` returning None drops the
-    // would-be constraint.
+async fn inline_property_unknown_to_ledger_fails_loudly() {
+    // An inline IRI the ledger has never seen — neither
+    // pre-tx nor introduced by this tx — must surface as a
+    // parse error rather than silently becoming a no-op.
+    // The non-strict `encode_iri` folds unknown IRIs into the
+    // EMPTY namespace, which would match nothing and silently
+    // disable enforcement; the strict path used here rejects
+    // them up front so typos can't quietly weaken governance.
     let fluree = FlureeBuilder::memory().build_memory();
     let ledger = genesis_ledger(&fluree, "test/inline-constraints/unknown:main");
 
@@ -150,7 +152,7 @@ async fn inline_property_unknown_to_ledger_is_dropped_silently() {
         unique_properties: Some(vec!["http://never-seen.org/ns/whatever".to_string()]),
         ..TxnOpts::default()
     };
-    fluree
+    let err = fluree
         .insert_with_opts(
             ledger,
             &json!({
@@ -163,5 +165,11 @@ async fn inline_property_unknown_to_ledger_is_dropped_silently() {
             &test_index_cfg(),
         )
         .await
-        .expect("inline IRI absent from D's ns map must not fail the tx");
+        .expect_err("unknown inline-unique IRI must fail the tx, not silently no-op");
+
+    let msg = err.to_string();
+    assert!(
+        msg.contains("opts.uniqueProperties") && msg.contains("never-seen.org"),
+        "expected explicit unresolved-IRI diagnostic, got: {msg}"
+    );
 }

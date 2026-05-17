@@ -186,7 +186,15 @@ fn push_triple(
             graph_iri: graph_iri.to_string(),
             detail: format!("could not decode shape predicate Sid {:?}", f.p),
         })?;
-    let o = encode_object(&f.o, &f.dt, snapshot, canonical_model_ledger_id, graph_iri)?;
+    let lang = f.m.as_ref().and_then(|m| m.lang.clone());
+    let o = encode_object(
+        &f.o,
+        &f.dt,
+        lang,
+        snapshot,
+        canonical_model_ledger_id,
+        graph_iri,
+    )?;
     out.push(WireTriple {
         s: s_iri,
         p: p_iri,
@@ -198,6 +206,7 @@ fn push_triple(
 fn encode_object(
     o: &FlakeValue,
     dt: &Sid,
+    lang: Option<String>,
     snapshot: &LedgerSnapshot,
     canonical_model_ledger_id: &str,
     graph_iri: &str,
@@ -213,28 +222,78 @@ fn encode_object(
                 })?;
         return Ok(WireObject::Ref(iri));
     }
-    let datatype_iri = snapshot
-        .decode_sid(dt)
-        .unwrap_or_else(|| "http://www.w3.org/2001/XMLSchema#string".to_string());
-    let value = flake_value_to_lexical(o);
+    // Fail-closed on datatype decode. M's snapshot owns the dt Sid
+    // it stored; if `decode_sid` returns None the snapshot is
+    // corrupt or the dt Sid is otherwise unresolvable — silently
+    // coercing every such literal to `xsd:string` would change
+    // the shape's `sh:datatype` semantics (a `sh:datatype
+    // xsd:integer` would collapse into a string-typed value that
+    // matches differently on D).
+    let datatype_iri =
+        snapshot
+            .decode_sid(dt)
+            .ok_or_else(|| CrossLedgerError::TranslationFailed {
+                ledger_id: canonical_model_ledger_id.to_string(),
+                graph_iri: graph_iri.to_string(),
+                detail: format!("could not decode shape literal datatype Sid {dt:?}"),
+            })?;
+    let value = flake_value_to_lexical(o, canonical_model_ledger_id, graph_iri)?;
     Ok(WireObject::Literal {
         value,
         datatype: datatype_iri,
-        lang: None,
+        lang,
     })
 }
 
-fn flake_value_to_lexical(o: &FlakeValue) -> String {
-    match o {
+/// Render a [`FlakeValue`] into its canonical xsd lexical form for
+/// the wire. Every variant has an explicit case so the wire can be
+/// round-tripped on D without fidelity loss. Variants without a
+/// canonical lexical form for SHACL purposes (`Vector`, `GeoPoint`)
+/// surface as `TranslationFailed` — `sh:hasValue` on a non-XSD
+/// custom Fluree datatype is out of scope for cross-ledger shapes
+/// and must be flagged rather than fall through to a
+/// `Debug`-formatted lossy string.
+fn flake_value_to_lexical(
+    o: &FlakeValue,
+    canonical_model_ledger_id: &str,
+    graph_iri: &str,
+) -> Result<String, CrossLedgerError> {
+    Ok(match o {
         FlakeValue::String(s) => s.clone(),
         FlakeValue::Boolean(b) => b.to_string(),
         FlakeValue::Long(n) => n.to_string(),
         FlakeValue::Double(f) => f.to_string(),
         FlakeValue::BigInt(b) => b.to_string(),
         FlakeValue::Decimal(d) => d.to_string(),
+        FlakeValue::DateTime(v) => v.to_string(),
+        FlakeValue::Date(v) => v.to_string(),
+        FlakeValue::Time(v) => v.to_string(),
+        FlakeValue::GYear(v) => v.to_string(),
+        FlakeValue::GYearMonth(v) => v.to_string(),
+        FlakeValue::GMonth(v) => v.to_string(),
+        FlakeValue::GDay(v) => v.to_string(),
+        FlakeValue::GMonthDay(v) => v.to_string(),
+        FlakeValue::YearMonthDuration(v) => v.to_string(),
+        FlakeValue::DayTimeDuration(v) => v.to_string(),
+        FlakeValue::Duration(v) => v.to_string(),
         FlakeValue::Json(s) => s.clone(),
         FlakeValue::Null => String::new(),
         FlakeValue::Ref(_) => unreachable!("Ref handled at encode_object"),
-        other => format!("{other:?}"),
-    }
+        FlakeValue::Vector(_) | FlakeValue::GeoPoint(_) => {
+            return Err(CrossLedgerError::TranslationFailed {
+                ledger_id: canonical_model_ledger_id.to_string(),
+                graph_iri: graph_iri.to_string(),
+                detail: format!(
+                    "shape literal uses a Fluree-specific datatype \
+                     (`{}`) that has no canonical xsd lexical form for \
+                     cross-ledger transport",
+                    match o {
+                        FlakeValue::Vector(_) => "Vector",
+                        FlakeValue::GeoPoint(_) => "GeoPoint",
+                        _ => unreachable!(),
+                    }
+                ),
+            });
+        }
+    })
 }

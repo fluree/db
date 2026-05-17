@@ -713,6 +713,7 @@ async fn enforce_unique_after_staging(
     graph_delta: &FxHashMap<u16, String>,
     resolve_ctx: &mut crate::cross_ledger::ResolveCtx<'_>,
     inline_unique_properties: Option<&[String]>,
+    staged_ns: &NamespaceRegistry,
 ) -> std::result::Result<(), fluree_db_transact::TransactError> {
     let config = load_transaction_config(view.base()).await;
 
@@ -730,12 +731,36 @@ async fn enforce_unique_after_staging(
     // appear" — matching how `f:enforceUnique` annotations work
     // when configured in the default graph against a per-graph
     // tx.
+    //
+    // Lookup is against the *staged* `NamespaceRegistry`, not
+    // `view.db()` (which is the pre-stage snapshot). The staged
+    // registry sees IRIs the in-flight tx introduced, so a tx
+    // that declares `ex:email` and constrains it inline in one
+    // shot resolves correctly. `lookup_sid_for_iri` is pure-read,
+    // so an unknown IRI returns `None` rather than allocating —
+    // we then fail-closed with `TransactError::Parse`. The
+    // non-strict path would have folded unknown IRIs into the
+    // EMPTY namespace and silently produced a non-matching Sid,
+    // making the constraint *effectively unenforced* with no
+    // error and no warning.
     if let Some(iris) = inline_unique_properties.filter(|v| !v.is_empty()) {
-        let snapshot = view.db();
-        let inline_sids: FxHashSet<Sid> = iris
-            .iter()
-            .filter_map(|iri| snapshot.encode_iri(iri))
-            .collect();
+        let mut inline_sids: FxHashSet<Sid> = FxHashSet::default();
+        let mut unresolved: Vec<&str> = Vec::new();
+        for iri in iris {
+            match staged_ns.lookup_sid_for_iri(iri) {
+                Some(sid) => {
+                    inline_sids.insert(sid);
+                }
+                None => unresolved.push(iri),
+            }
+        }
+        if !unresolved.is_empty() {
+            return Err(fluree_db_transact::TransactError::Parse(format!(
+                "opts.uniqueProperties references IRIs not known to this ledger \
+                 (declare the property first, or correct the IRI): {}",
+                unresolved.join(", ")
+            )));
+        }
         if !inline_sids.is_empty() {
             for g_id in affected_graph_ids(view, graph_delta) {
                 per_graph_unique
@@ -1520,6 +1545,7 @@ impl crate::Fluree {
             &graph_delta,
             &mut resolve_ctx,
             inline_unique_properties.as_deref(),
+            &ns_registry,
         )
         .await?;
 
@@ -1608,6 +1634,7 @@ impl crate::Fluree {
             &graph_delta,
             &mut resolve_ctx,
             inline_unique_properties.as_deref(),
+            &ns_registry,
         )
         .await?;
 
@@ -1677,6 +1704,7 @@ impl crate::Fluree {
             &graph_delta,
             &mut resolve_ctx,
             inline_unique_properties.as_deref(),
+            &ns_registry,
         )
         .await
         .map_err(|e| TrackedErrorResponse::new(400, e.to_string(), tracker.tally()))?;

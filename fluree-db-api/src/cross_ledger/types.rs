@@ -352,7 +352,7 @@ impl ShapesArtifactWire {
             ) else {
                 continue;
             };
-            let (o_value, dt_sid) = match &t.o {
+            let (o_value, dt_sid, meta) = match &t.o {
                 WireObject::Ref(o_iri) => {
                     let Some(o_sid) = staged_ns.lookup_sid_for_iri(o_iri) else {
                         continue;
@@ -360,17 +360,49 @@ impl ShapesArtifactWire {
                     (
                         fluree_db_core::FlakeValue::Ref(o_sid),
                         Sid::new(fluree_vocab::namespaces::JSON_LD, "id"),
+                        None,
                     )
                 }
                 WireObject::Literal {
                     value,
                     datatype,
-                    lang: _,
+                    lang,
                 } => {
-                    let dt_sid = staged_ns
-                        .lookup_sid_for_iri(datatype)
-                        .unwrap_or_else(|| Sid::new(fluree_vocab::namespaces::XSD, "string"));
-                    (literal_to_flake_value(value, datatype), dt_sid)
+                    // Language-tagged literals always carry
+                    // `rdf:langString` as their datatype Sid; the
+                    // tag itself lives on `FlakeMeta.lang`. The
+                    // wire's `datatype` IRI for these is
+                    // conventionally `rdf:langString` too, but we
+                    // bind the Sid from the constant — no lookup
+                    // needed, no D-side namespace mismatch
+                    // possible.
+                    if let Some(tag) = lang.as_ref() {
+                        (
+                            fluree_db_core::FlakeValue::String(value.clone()),
+                            Sid::new(fluree_vocab::namespaces::RDF, "langString"),
+                            Some(fluree_db_core::flake::FlakeMeta::with_lang(tag.as_str())),
+                        )
+                    } else {
+                        // Fail-closed on unknown datatype IRI. The
+                        // legacy fallback (re-type to xsd:string)
+                        // silently changed the shape's
+                        // `sh:datatype` semantics on D; the
+                        // legacy literal-parse fallback did the
+                        // same when "100"^^xsd:integer failed to
+                        // parse. Either is a real fidelity loss
+                        // — surface as TranslationFailed instead.
+                        let Some(dt_sid) = staged_ns.lookup_sid_for_iri(datatype) else {
+                            return Err(fluree_db_query::error::QueryError::Internal(format!(
+                                "cross-ledger shape literal datatype {datatype} \
+                                     is not registered on the data ledger; \
+                                     register the datatype IRI on D before \
+                                     referencing it from M's shapes"
+                            )));
+                        };
+                        let parsed = literal_to_flake_value(value, datatype)
+                            .map_err(fluree_db_query::error::QueryError::Internal)?;
+                        (parsed, dt_sid, None)
+                    }
                 }
             };
             collected.push(Flake {
@@ -381,7 +413,7 @@ impl ShapesArtifactWire {
                 dt: dt_sid,
                 t: 0,
                 op: true,
-                m: None,
+                m: meta,
             });
         }
         fluree_db_query::schema_bundle::SchemaBundleFlakes::from_collected_schema_triples(collected)
@@ -389,30 +421,38 @@ impl ShapesArtifactWire {
     }
 }
 
-/// Decode a wire literal into the matching `FlakeValue`. Falls back
-/// to `String(value)` on parse failure or unknown datatype — the
-/// SHACL compiler will simply not match the value on type-sensitive
-/// constraints, same as if the constraint weren't authored.
-fn literal_to_flake_value(value: &str, datatype: &str) -> fluree_db_core::FlakeValue {
+/// Decode a wire literal into the matching `FlakeValue`.
+///
+/// Returns `Err` when the lexical form fails to parse against the
+/// declared datatype (e.g., `"abc"^^xsd:integer`). The caller
+/// surfaces these as `TranslationFailed` — silently re-typing to
+/// `FlakeValue::String` would change shape semantics on D. Unknown
+/// (non-xsd) datatypes fall through to `String(value)` because the
+/// caller has *already* validated the datatype IRI is registered
+/// on D; an unknown but-registered datatype is the application's
+/// to interpret.
+fn literal_to_flake_value(
+    value: &str,
+    datatype: &str,
+) -> Result<fluree_db_core::FlakeValue, String> {
     use fluree_db_core::FlakeValue;
     const XSD: &str = "http://www.w3.org/2001/XMLSchema#";
     let local = datatype.strip_prefix(XSD).unwrap_or("");
     match local {
-        "boolean" => value
-            .parse::<bool>()
-            .map(FlakeValue::Boolean)
-            .unwrap_or_else(|_| FlakeValue::String(value.to_string())),
+        "boolean" => value.parse::<bool>().map(FlakeValue::Boolean).map_err(|e| {
+            format!("invalid xsd:boolean lexical `{value}` on cross-ledger shape: {e}")
+        }),
         "integer" | "long" | "int" | "short" | "byte" | "nonNegativeInteger"
         | "positiveInteger" | "negativeInteger" | "nonPositiveInteger" | "unsignedLong"
-        | "unsignedInt" | "unsignedShort" | "unsignedByte" => value
-            .parse::<i64>()
-            .map(FlakeValue::Long)
-            .unwrap_or_else(|_| FlakeValue::String(value.to_string())),
-        "double" | "float" => value
-            .parse::<f64>()
-            .map(FlakeValue::Double)
-            .unwrap_or_else(|_| FlakeValue::String(value.to_string())),
-        _ => FlakeValue::String(value.to_string()),
+        | "unsignedInt" | "unsignedShort" | "unsignedByte" => {
+            value.parse::<i64>().map(FlakeValue::Long).map_err(|e| {
+                format!("invalid xsd:{local} lexical `{value}` on cross-ledger shape: {e}")
+            })
+        }
+        "double" | "float" => value.parse::<f64>().map(FlakeValue::Double).map_err(|e| {
+            format!("invalid xsd:{local} lexical `{value}` on cross-ledger shape: {e}")
+        }),
+        _ => Ok(FlakeValue::String(value.to_string())),
     }
 }
 

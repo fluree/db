@@ -1278,17 +1278,43 @@ async fn execute_transaction(
         // or query params); add them here if a use case lands.
         let mut txn_opts = TxnOpts::default();
         if let Some(shapes) = body.get("opts").and_then(|o| o.get("shapes")) {
+            // Validate at the boundary: `shapes` must be a JSON-LD
+            // document (object) or list of documents (array).
+            // Letting scalars / nulls fall through to
+            // `fluree_graph_json_ld::expand` surfaces as a fuzzy
+            // internal parse error rather than the precise 400
+            // the caller deserves.
+            if !shapes.is_object() && !shapes.is_array() {
+                set_span_error_code(&span, "error:BadRequest");
+                return Err(ServerError::bad_request(
+                    "opts.shapes must be a JSON-LD object or array of objects",
+                ));
+            }
             txn_opts.shapes = Some(shapes.clone());
         }
-        if let Some(unique_props) = body
-            .get("opts")
-            .and_then(|o| o.get("uniqueProperties"))
-            .and_then(|v| v.as_array())
-        {
-            let iris: Vec<String> = unique_props
-                .iter()
-                .filter_map(|v| v.as_str().map(std::string::ToString::to_string))
-                .collect();
+        if let Some(unique_props_raw) = body.get("opts").and_then(|o| o.get("uniqueProperties")) {
+            // Must be a JSON array. A scalar (or null) is a type
+            // error, not "empty list".
+            let Some(arr) = unique_props_raw.as_array() else {
+                set_span_error_code(&span, "error:BadRequest");
+                return Err(ServerError::bad_request(
+                    "opts.uniqueProperties must be an array of property IRI strings",
+                ));
+            };
+            // Every element must be a string. `filter_map` would
+            // silently drop integers/bools/etc. — that's exactly
+            // the silent-weakening pattern this PR pulls out of
+            // the rest of the governance code.
+            let mut iris: Vec<String> = Vec::with_capacity(arr.len());
+            for (idx, v) in arr.iter().enumerate() {
+                let Some(s) = v.as_str() else {
+                    set_span_error_code(&span, "error:BadRequest");
+                    return Err(ServerError::bad_request(format!(
+                        "opts.uniqueProperties[{idx}] must be a string IRI; got {v}"
+                    )));
+                };
+                iris.push(s.to_string());
+            }
             if !iris.is_empty() {
                 txn_opts.unique_properties = Some(iris);
             }
