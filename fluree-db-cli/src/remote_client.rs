@@ -53,7 +53,10 @@ fn encode_ledger_segment(s: &str) -> Cow<'_, str> {
 
 use crate::cli::PolicyArgs;
 use fluree_db_api::{ExportCommitsResponse, PushCommitsResponse};
-use fluree_db_core::pack::PackRequest;
+use fluree_db_core::pack::{
+    decode_frame, encode_end_frame, encode_manifest_frame, read_stream_preamble, PackError,
+    PackFrame, PackRequest, DEFAULT_MAX_PAYLOAD,
+};
 use fluree_db_nameservice::NsRecord;
 
 /// Build the set of HTTP headers that carry policy enforcement options to a
@@ -1099,6 +1102,109 @@ impl RemoteLedgerClient {
     }
 
     // =========================================================================
+    // RDF export
+    // =========================================================================
+
+    /// Fetch an RDF export of a ledger from the remote.
+    ///
+    /// Calls `POST {base_url}/export/<ledger>` with the JSON body documented
+    /// in the `/export` Contract. Returns the raw response bytes (the
+    /// requested RDF format) — the caller is responsible for writing them
+    /// to the desired sink.
+    pub async fn export_rdf(
+        &self,
+        ledger: &str,
+        body: &serde_json::Value,
+    ) -> Result<bytes::Bytes, RemoteLedgerError> {
+        let url = self.op_url("export", ledger);
+        let req_body = Some(RequestBody::Json(body));
+
+        let resp = self
+            .build_request(reqwest::Method::POST, &url, "application/json", &req_body)
+            .send()
+            .await
+            .map_err(Self::map_network_error)?;
+
+        let resp = if resp.status() == StatusCode::UNAUTHORIZED && self.try_refresh().await {
+            self.build_request(reqwest::Method::POST, &url, "application/json", &req_body)
+                .send()
+                .await
+                .map_err(Self::map_network_error)?
+        } else {
+            resp
+        };
+
+        if !resp.status().is_success() {
+            return Err(Self::map_error(resp).await);
+        }
+
+        resp.bytes()
+            .await
+            .map_err(|e| RemoteLedgerError::InvalidResponse(format!("read body: {e}")))
+    }
+
+    // =========================================================================
+    // Default context
+    // =========================================================================
+
+    /// Fetch the default JSON-LD context for a ledger.
+    ///
+    /// Calls `GET {base_url}/context/<ledger>`. Server returns
+    /// `{ "@context": <object|null> }`. Returns the unwrapped context value
+    /// (object or `Null`).
+    pub async fn get_context(&self, ledger: &str) -> Result<serde_json::Value, RemoteLedgerError> {
+        let url = self.op_url("context", ledger);
+        let resp = self
+            .send_json(reqwest::Method::GET, &url, "application/json", None)
+            .await?;
+        Ok(resp
+            .get("@context")
+            .cloned()
+            .unwrap_or(serde_json::Value::Null))
+    }
+
+    /// Replace the default JSON-LD context for a ledger.
+    ///
+    /// Calls `PUT {base_url}/context/<ledger>` with `context` as the body.
+    /// `context` should be the bare prefix→IRI object; the server also
+    /// accepts a `{ "@context": {...} }` wrapper.
+    pub async fn set_context(
+        &self,
+        ledger: &str,
+        context: &serde_json::Value,
+    ) -> Result<serde_json::Value, RemoteLedgerError> {
+        let url = self.op_url("context", ledger);
+        self.send_json(
+            reqwest::Method::PUT,
+            &url,
+            "application/json",
+            Some(RequestBody::Json(context)),
+        )
+        .await
+    }
+
+    // =========================================================================
+    // Commit log
+    // =========================================================================
+
+    /// Fetch lightweight commit summaries from the remote.
+    ///
+    /// Calls `GET {base_url}/log/<ledger>?limit=<N>`. The server returns
+    /// summaries newest-first by `t`, capped at the server's hard maximum.
+    pub async fn commit_log(
+        &self,
+        ledger: &str,
+        limit: Option<usize>,
+    ) -> Result<serde_json::Value, RemoteLedgerError> {
+        let mut url = self.op_url("log", ledger);
+        if let Some(n) = limit {
+            url.push_str(&format!("?limit={n}"));
+        }
+        self.send_json(reqwest::Method::GET, &url, "application/json", None)
+            .await
+    }
+
+    // =========================================================================
     // Reindex
     // =========================================================================
 
@@ -1532,6 +1638,43 @@ impl RemoteLedgerClient {
         }
     }
 
+    /// Stream a `.flpack` archive of a remote ledger to `writer`.
+    ///
+    /// Builds a `PackRequest` for the ledger's current head and POSTs to
+    /// `/pack/{ledger}`. As frames arrive, they are written through to
+    /// `writer` unchanged **except** for the terminating End frame: we
+    /// swap that for a synthesized `phase: "nameservice"` manifest frame
+    /// (constructed from the supplied `ns_record`) followed by End. The
+    /// resulting byte stream is byte-compatible with `Fluree::archive_ledger`
+    /// and importable via `fluree create --from <file>.flpack`.
+    ///
+    /// Surfaces a server `Error` frame as a `RemoteLedgerError` and stops
+    /// without writing the End — callers should clean up partial output.
+    /// Returns the count of pack frames forwarded (header / data / inner
+    /// manifest), excluding the synthesized nameservice manifest and End.
+    pub async fn archive_ledger_to_writer<W: tokio::io::AsyncWrite + Unpin + Send>(
+        &self,
+        ledger: &str,
+        request: &PackRequest,
+        ns_record: &NsRecord,
+        writer: &mut W,
+    ) -> Result<usize, RemoteLedgerError> {
+        use futures::StreamExt as _;
+
+        let resp = self.fetch_pack_response(ledger, request).await?;
+        let resp = resp.ok_or_else(|| {
+            RemoteLedgerError::ServerError(format!(
+                "remote does not support /pack for '{ledger}' (404/405/406/501)"
+            ))
+        })?;
+
+        let manifest = build_archive_manifest(ns_record, request.want_index_root_id.is_some());
+        let stream = resp
+            .bytes_stream()
+            .map(|r| r.map(|b| b.to_vec()).map_err(|e| e.to_string()));
+        splice_archive_stream(stream, writer, &manifest).await
+    }
+
     /// Fetch the NsRecord via the storage proxy.
     ///
     /// Returns `Ok(Some(record))` on 200, `Ok(None)` on 404.
@@ -1596,6 +1739,143 @@ impl RemoteLedgerClient {
 enum RequestBody<'a> {
     Json(&'a serde_json::Value),
     Text(&'a str),
+}
+
+/// Build the `phase: "nameservice"` manifest emitted at the end of a
+/// `.flpack` archive. Mirrors `Fluree::archive_ledger`'s synthesis: index
+/// fields ride along only when index artifacts are actually archived.
+pub(crate) fn build_archive_manifest(
+    ns_record: &NsRecord,
+    archived_index: bool,
+) -> serde_json::Value {
+    let mut manifest = serde_json::json!({
+        "phase": "nameservice",
+        "ledger_id": ns_record.ledger_id,
+        "name": ns_record.name,
+        "branch": ns_record.branch,
+        "commit_t": ns_record.commit_t,
+    });
+    if let Some(cid) = ns_record.commit_head_id.as_ref() {
+        manifest["commit_head_id"] = serde_json::Value::String(cid.to_string());
+    }
+    if archived_index {
+        if let Some(cid) = ns_record.index_head_id.as_ref() {
+            manifest["index_head_id"] = serde_json::Value::String(cid.to_string());
+            manifest["index_t"] = serde_json::Value::from(ns_record.index_t);
+        }
+    }
+    manifest
+}
+
+/// Drive a pack-stream copy from `stream` to `writer`, swapping the
+/// terminal End frame for `manifest_frame` + End. Splitting this out from
+/// `archive_ledger_to_writer` lets us test the frame-walking logic without
+/// a real HTTP server: feed in pre-encoded chunks and compare the writer's
+/// captured bytes byte-for-byte.
+///
+/// The `stream` yields chunked archive bytes; chunk boundaries are
+/// arbitrary (frames may straddle them). Returns the count of pack frames
+/// forwarded, excluding the synthesized manifest and End.
+pub(crate) async fn splice_archive_stream<S, W>(
+    stream: S,
+    writer: &mut W,
+    manifest_frame: &serde_json::Value,
+) -> Result<usize, RemoteLedgerError>
+where
+    S: futures::Stream<Item = std::result::Result<Vec<u8>, String>> + Unpin,
+    W: tokio::io::AsyncWrite + Unpin + Send,
+{
+    use futures::StreamExt as _;
+    use tokio::io::AsyncWriteExt as _;
+
+    let mut stream = stream;
+    let mut buf: Vec<u8> = Vec::with_capacity(64 * 1024);
+    let mut preamble_consumed = false;
+    let mut frames_forwarded: usize = 0;
+    let mut end_seen = false;
+
+    while let Some(chunk) = stream.next().await {
+        let bytes = chunk.map_err(|e| RemoteLedgerError::Network(format!("pack stream: {e}")))?;
+        buf.extend_from_slice(&bytes);
+
+        // Drain any complete preamble + frames out of the buffer.
+        // Distinguish `PackError::Incomplete` (need more bytes — not a
+        // protocol error) from every other variant. Without that split,
+        // a corrupt magic / oversize payload / invalid frame type would
+        // be swallowed as "need more" and the loop would buffer until
+        // EOF, defeating the decoder's max-payload guard and surfacing
+        // a misleading "ended before End frame" error.
+        loop {
+            if !preamble_consumed {
+                match read_stream_preamble(&buf) {
+                    Ok(consumed) => {
+                        writer.write_all(&buf[..consumed]).await.map_err(|e| {
+                            RemoteLedgerError::Network(format!("archive write: {e}"))
+                        })?;
+                        buf.drain(..consumed);
+                        preamble_consumed = true;
+                    }
+                    Err(PackError::Incomplete(_)) => break,
+                    Err(e) => {
+                        return Err(RemoteLedgerError::InvalidResponse(format!(
+                            "invalid pack stream preamble: {e}"
+                        )));
+                    }
+                }
+            }
+
+            if end_seen {
+                break;
+            }
+
+            match decode_frame(&buf, DEFAULT_MAX_PAYLOAD) {
+                Ok((frame, consumed)) => match frame {
+                    PackFrame::End => {
+                        buf.drain(..consumed);
+                        end_seen = true;
+                    }
+                    PackFrame::Error(msg) => {
+                        return Err(RemoteLedgerError::ServerError(format!(
+                            "remote pack error: {msg}"
+                        )));
+                    }
+                    PackFrame::Header(_) | PackFrame::Data { .. } | PackFrame::Manifest(_) => {
+                        writer.write_all(&buf[..consumed]).await.map_err(|e| {
+                            RemoteLedgerError::Network(format!("archive write: {e}"))
+                        })?;
+                        buf.drain(..consumed);
+                        frames_forwarded += 1;
+                    }
+                },
+                Err(PackError::Incomplete(_)) => break,
+                Err(e) => {
+                    return Err(RemoteLedgerError::InvalidResponse(format!(
+                        "invalid pack frame: {e}"
+                    )));
+                }
+            }
+        }
+    }
+
+    if !end_seen {
+        return Err(RemoteLedgerError::InvalidResponse(
+            "pack stream ended before End frame".to_string(),
+        ));
+    }
+
+    let mut tail = Vec::with_capacity(512);
+    encode_manifest_frame(manifest_frame, &mut tail);
+    encode_end_frame(&mut tail);
+    writer
+        .write_all(&tail)
+        .await
+        .map_err(|e| RemoteLedgerError::Network(format!("archive write: {e}")))?;
+    writer
+        .flush()
+        .await
+        .map_err(|e| RemoteLedgerError::Network(format!("archive flush: {e}")))?;
+
+    Ok(frames_forwarded)
 }
 
 fn extract_error_message(body: &str) -> String {
@@ -1760,5 +2040,209 @@ mod tests {
             });
         let debug = format!("{client:?}");
         assert!(debug.contains("has_refresh: true"));
+    }
+
+    // =========================================================================
+    // splice_archive_stream — frame substitution tests
+    // =========================================================================
+    //
+    // These exercise the End → manifest+End swap without needing a real
+    // server: build a valid pack stream in-memory, feed it as one or many
+    // chunks to `splice_archive_stream`, and assert the writer sees
+    // [preamble][header][data...][synthesized manifest][End], with the
+    // original End dropped.
+
+    use fluree_db_core::pack::{
+        encode_data_frame, encode_end_frame, encode_error_frame, encode_header_frame,
+        write_stream_preamble, PackHeader, PREAMBLE_SIZE,
+    };
+    use fluree_db_core::{ContentId, ContentKind};
+    use futures::stream;
+
+    fn sample_ns_record() -> NsRecord {
+        let mut record = NsRecord::new("mydb".to_string(), "main".to_string());
+        record.commit_head_id = Some(ContentId::new(ContentKind::Commit, b"head"));
+        record.commit_t = 7;
+        record.index_head_id = Some(ContentId::new(ContentKind::IndexRoot, b"idx"));
+        record.index_t = 5;
+        record
+    }
+
+    /// Build a minimal valid pack stream:
+    /// [preamble][header frame][N data frames][end].
+    fn build_pack_stream(data_payloads: &[&[u8]]) -> Vec<u8> {
+        let mut buf = Vec::new();
+        write_stream_preamble(&mut buf);
+        let header = PackHeader::commits_only(Some(data_payloads.len() as u32), true);
+        encode_header_frame(&header, &mut buf);
+        for (i, payload) in data_payloads.iter().enumerate() {
+            let cid = ContentId::new(ContentKind::Commit, format!("commit-{i}").as_bytes());
+            encode_data_frame(&cid, payload, &mut buf);
+        }
+        encode_end_frame(&mut buf);
+        buf
+    }
+
+    fn drive_splice(
+        chunks: Vec<Vec<u8>>,
+        manifest: serde_json::Value,
+    ) -> Result<(usize, Vec<u8>), RemoteLedgerError> {
+        let stream = stream::iter(chunks.into_iter().map(Ok::<Vec<u8>, String>));
+        let mut output: Vec<u8> = Vec::new();
+        let frames = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(super::splice_archive_stream(stream, &mut output, &manifest))?;
+        Ok((frames, output))
+    }
+
+    #[test]
+    fn splice_drops_end_and_appends_manifest_then_end() {
+        let pack = build_pack_stream(&[b"commit-bytes-1", b"commit-bytes-2"]);
+        let manifest = build_archive_manifest(&sample_ns_record(), true);
+        let (frames, output) = drive_splice(vec![pack.clone()], manifest.clone()).unwrap();
+
+        // Header + 2 data frames forwarded; manifest + End synthesized below.
+        assert_eq!(frames, 3);
+
+        // Output must NOT match the input bytes verbatim — End was replaced.
+        assert_ne!(output, pack);
+
+        // First (PREAMBLE_SIZE + header_frame_len) bytes of input must
+        // appear unchanged at the start of the output.
+        assert!(output.starts_with(&pack[..PREAMBLE_SIZE]));
+
+        // The original End is one byte (FRAME_END = 0xFF). The output's
+        // last byte should also be that same End byte, but preceded by an
+        // injected manifest frame rather than appearing immediately after
+        // the last data frame.
+        let last = *output.last().expect("output not empty");
+        assert_eq!(last, 0xFF, "trailing byte must still be End frame");
+
+        // Decode the output and verify the new manifest sits where the End
+        // used to be.
+        let mut pos = read_stream_preamble(&output).expect("valid preamble");
+        let mut frames_seen: Vec<&'static str> = Vec::new();
+        let mut last_manifest: Option<serde_json::Value> = None;
+        loop {
+            let (frame, consumed) =
+                decode_frame(&output[pos..], DEFAULT_MAX_PAYLOAD).expect("decodable");
+            pos += consumed;
+            match frame {
+                PackFrame::Header(_) => frames_seen.push("header"),
+                PackFrame::Data { .. } => frames_seen.push("data"),
+                PackFrame::Manifest(json) => {
+                    last_manifest = Some(json);
+                    frames_seen.push("manifest");
+                }
+                PackFrame::End => {
+                    frames_seen.push("end");
+                    break;
+                }
+                PackFrame::Error(_) => panic!("unexpected error frame"),
+            }
+        }
+        assert_eq!(
+            frames_seen,
+            vec!["header", "data", "data", "manifest", "end"]
+        );
+        let m = last_manifest.expect("manifest frame present");
+        assert_eq!(m.get("phase").and_then(|v| v.as_str()), Some("nameservice"));
+        assert_eq!(m.get("ledger_id"), manifest.get("ledger_id"));
+        assert_eq!(m.get("commit_t"), manifest.get("commit_t"));
+        assert_eq!(m.get("index_head_id"), manifest.get("index_head_id"));
+    }
+
+    #[test]
+    fn splice_handles_chunk_boundaries_inside_frames() {
+        // Same pack, but split across many small chunks so that frame
+        // boundaries fall inside individual chunks. The buffered decode
+        // path must still produce identical output.
+        let pack = build_pack_stream(&[b"first-commit", b"second-commit"]);
+        let manifest = build_archive_manifest(&sample_ns_record(), true);
+
+        let (frames_one, output_one) = drive_splice(vec![pack.clone()], manifest.clone()).unwrap();
+        let chunked: Vec<Vec<u8>> = pack.chunks(7).map(<[u8]>::to_vec).collect();
+        let (frames_many, output_many) = drive_splice(chunked, manifest).unwrap();
+
+        assert_eq!(frames_one, frames_many);
+        assert_eq!(output_one, output_many);
+    }
+
+    #[test]
+    fn splice_omits_index_fields_when_archived_index_is_false() {
+        let pack = build_pack_stream(&[b"commit"]);
+        let manifest = build_archive_manifest(&sample_ns_record(), /* archived_index */ false);
+        assert!(manifest.get("index_head_id").is_none());
+        assert!(manifest.get("index_t").is_none());
+
+        let (_, output) = drive_splice(vec![pack], manifest).unwrap();
+        let mut pos = read_stream_preamble(&output).unwrap();
+        let mut found_manifest_without_index = false;
+        loop {
+            let (frame, consumed) = decode_frame(&output[pos..], DEFAULT_MAX_PAYLOAD).unwrap();
+            pos += consumed;
+            match frame {
+                PackFrame::Manifest(json)
+                    if json.get("phase").and_then(|v| v.as_str()) == Some("nameservice") =>
+                {
+                    assert!(json.get("index_head_id").is_none());
+                    assert!(json.get("index_t").is_none());
+                    found_manifest_without_index = true;
+                }
+                PackFrame::End => break,
+                _ => {}
+            }
+        }
+        assert!(
+            found_manifest_without_index,
+            "nameservice manifest must be present without index fields"
+        );
+    }
+
+    #[test]
+    fn splice_propagates_server_error_frame() {
+        // Build a stream that emits an Error frame instead of End — the
+        // server signals failure mid-pack. We must surface this rather
+        // than silently truncating the archive.
+        let mut buf = Vec::new();
+        write_stream_preamble(&mut buf);
+        let header = PackHeader::commits_only(Some(0), true);
+        encode_header_frame(&header, &mut buf);
+        encode_error_frame("simulated remote pack failure", &mut buf);
+        encode_end_frame(&mut buf);
+
+        let manifest = build_archive_manifest(&sample_ns_record(), false);
+        let result = drive_splice(vec![buf], manifest);
+        match result {
+            Err(RemoteLedgerError::ServerError(msg)) => {
+                assert!(msg.contains("simulated remote pack failure"));
+            }
+            other => panic!("expected ServerError, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn splice_rejects_invalid_magic_promptly_not_as_incomplete() {
+        // First 4 bytes should be the FPK1 magic; corrupt them and feed
+        // the rest of a valid stream. The decoder's preamble check must
+        // surface as a fatal `InvalidResponse` rather than being swallowed
+        // as "need more bytes" until EOF.
+        let mut bad = build_pack_stream(&[b"commit"]);
+        bad[0] = 0x00; // break the magic
+        bad[1] = 0x00;
+
+        let manifest = build_archive_manifest(&sample_ns_record(), false);
+        let result = drive_splice(vec![bad], manifest);
+        match result {
+            Err(RemoteLedgerError::InvalidResponse(msg)) => {
+                assert!(
+                    msg.contains("preamble") || msg.contains("magic"),
+                    "expected magic/preamble error, got: {msg}"
+                );
+            }
+            other => panic!("expected InvalidResponse for bad magic, got {other:?}"),
+        }
     }
 }
