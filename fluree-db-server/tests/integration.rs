@@ -2338,6 +2338,125 @@ async fn query_with_max_fuel_returns_fuel_header() {
     assert!(json_contains_string(&json, "Bob"));
 }
 
+#[tokio::test]
+async fn json_transaction_with_meta_reports_decimal_fuel() {
+    let (_tmp, state) = test_state().await;
+    let app = build_router(state.clone());
+
+    let create_body = serde_json::json!({ "ledger": "test:txfuel" });
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/fluree/create")
+                .header("content-type", "application/json")
+                .body(Body::from(create_body.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+
+    let insert_body = serde_json::json!({
+        "@context": { "ex": "http://example.org/" },
+        "insert": [{ "@id": "ex:alice", "ex:name": "Alice" }],
+        "opts": { "meta": true }
+    });
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/fluree/insert")
+                .header("content-type", "application/json")
+                .header("fluree-ledger", "test:txfuel")
+                .body(Body::from(insert_body.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    let fuel_header = resp
+        .headers()
+        .get("x-fdb-fuel")
+        .expect("tracked transaction should include x-fdb-fuel")
+        .to_str()
+        .expect("fuel header should be valid ASCII")
+        .parse::<f64>()
+        .expect("fuel header should parse as decimal fuel");
+    let (status, json) = json_body(resp).await;
+    assert_eq!(status, StatusCode::OK);
+
+    let fuel = json
+        .get("fuel")
+        .and_then(JsonValue::as_f64)
+        .expect("tracked transaction response should include decimal fuel");
+    assert_eq!(fuel, fuel_header);
+    assert!(
+        (100.0..1000.0).contains(&fuel),
+        "fuel should be reported in fuel units, not raw micro-fuel: {fuel}"
+    );
+}
+
+#[tokio::test]
+async fn sparql_update_with_tracking_header_reports_decimal_fuel() {
+    let (_tmp, state) = test_state().await;
+    let app = build_router(state.clone());
+
+    let create_body = serde_json::json!({ "ledger": "test:sparqlfuel" });
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/fluree/create")
+                .header("content-type", "application/json")
+                .body(Body::from(create_body.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+
+    let update = r#"
+        PREFIX ex: <http://example.org/>
+        INSERT DATA { ex:carol ex:name "Carol" . }
+    "#;
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/fluree/update/test:sparqlfuel")
+                .header("content-type", "application/sparql-update")
+                .header("fluree-track-fuel", "true")
+                .body(Body::from(update))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    let fuel_header = resp
+        .headers()
+        .get("x-fdb-fuel")
+        .expect("tracked SPARQL UPDATE should include x-fdb-fuel")
+        .to_str()
+        .expect("fuel header should be valid ASCII")
+        .parse::<f64>()
+        .expect("fuel header should parse as decimal fuel");
+    let (status, json) = json_body(resp).await;
+    assert_eq!(status, StatusCode::OK);
+
+    let fuel = json
+        .get("fuel")
+        .and_then(JsonValue::as_f64)
+        .expect("tracked SPARQL UPDATE response should include decimal fuel");
+    assert_eq!(fuel, fuel_header);
+    assert!(
+        (100.0..1000.0).contains(&fuel),
+        "fuel should be reported in fuel units, not raw micro-fuel: {fuel}"
+    );
+}
+
 // ============================================================================
 // Discovery endpoint: /.well-known/fluree.json
 // ============================================================================
