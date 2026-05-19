@@ -108,13 +108,13 @@ async fn run_local(name: &str, dirs: &FlureeDir) -> CliResult<()> {
             if active.as_deref() == Some(name) {
                 config::clear_active_ledger(dirs.data_dir())?;
             }
-            if report.artifacts_deleted > 0 {
-                println!(
-                    "Dropped ledger '{name}' (deleted {} artifacts)",
-                    report.artifacts_deleted
-                );
-            } else {
-                println!("Dropped ledger '{name}'");
+            let branch_count = report.branch_reports.len();
+            match (report.artifacts_deleted, branch_count) {
+                (0, _) => println!("Dropped ledger '{name}'"),
+                (n, 1) => println!("Dropped ledger '{name}' (deleted {n} artifacts)"),
+                (n, b) => {
+                    println!("Dropped ledger '{name}' (deleted {n} artifacts across {b} branches)");
+                }
             }
             for w in &report.warnings {
                 eprintln!("  warning: {w}");

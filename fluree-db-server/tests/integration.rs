@@ -2112,7 +2112,7 @@ async fn soft_drop_blocks_recreate() {
     assert_eq!(resp.status(), StatusCode::CREATED);
 
     // Soft drop
-    let drop_body = serde_json::json!({ "ledger": "test:main", "hard": false });
+    let drop_body = serde_json::json!({ "ledger": "test", "hard": false });
     let resp = app
         .clone()
         .oneshot(
