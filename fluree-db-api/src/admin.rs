@@ -541,7 +541,7 @@ impl crate::Fluree {
     ///
     /// # Errors
     /// - `ApiError::NotFound` if the branch does not exist
-    /// - `ApiError::Http(400)` if attempting to drop the root branch
+    /// - `ApiError::Http(400)` if attempting to drop the root
     pub async fn drop_branch(&self, ledger_name: &str, branch: &str) -> Result<BranchDropReport> {
         let ledger_id = format_ledger_id(ledger_name, branch);
         info!(ledger_id = %ledger_id, "Dropping branch");
@@ -563,7 +563,7 @@ impl crate::Fluree {
             return Err(ApiError::Http {
                 status: 400,
                 message: format!(
-                    "Cannot drop the root branch '{branch}' of ledger '{ledger_name}'. \
+                    "Cannot drop '{branch}': it is the root of ledger '{ledger_name}'. \
                      Use drop_ledger to remove the whole ledger."
                 ),
             });

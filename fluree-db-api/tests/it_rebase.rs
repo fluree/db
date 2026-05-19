@@ -488,12 +488,12 @@ async fn rebase_main_refused() {
 
     let msg = err.to_string();
     assert!(
-        msg.contains("root branch") && msg.contains("main"),
-        "expected error about root branch, got: {msg}"
+        msg.contains("root") && msg.contains("main"),
+        "expected error about root, got: {msg}"
     );
 }
 
-/// Mirror of the structural refusal for a non-main root branch.
+/// Mirror of the structural refusal for a non-main root.
 #[tokio::test]
 async fn rebase_refuses_non_main_root() {
     let fluree = FlureeBuilder::memory().build_memory();
@@ -506,8 +506,8 @@ async fn rebase_refuses_non_main_root() {
 
     let msg = err.to_string();
     assert!(
-        msg.contains("root branch") && msg.contains("trunk"),
-        "expected error about root branch, got: {msg}"
+        msg.contains("root") && msg.contains("trunk"),
+        "expected error about root, got: {msg}"
     );
 }
 

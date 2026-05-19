@@ -156,14 +156,14 @@ impl crate::Fluree {
             .await?
             .ok_or_else(|| ApiError::NotFound(branch_id.clone()))?;
 
-        // Refuse the root branch structurally — there's nothing to rebase
-        // onto. "main" carries no special meaning here; a ledger whose root
-        // is named "trunk" will be refused on `trunk`, and a non-root branch
+        // Refuse the root structurally — there's nothing to rebase onto.
+        // "main" carries no special meaning here; a ledger whose root is
+        // named "trunk" will be refused on `trunk`, and a non-root branch
         // named "main" can be rebased like any other.
         let source_name = branch_record.source_branch.as_ref().ok_or_else(|| {
             ApiError::InvalidBranch(format!(
-                "Cannot rebase the root branch '{branch}' of ledger '{ledger_name}' \
-                 (it has no parent to rebase onto)."
+                "Cannot rebase '{branch}': it is the root of ledger '{ledger_name}' \
+                 (no parent to rebase onto)."
             ))
         })?;
 
