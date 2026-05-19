@@ -94,7 +94,15 @@ where
     }
 
     async fn drop_branch(&self, ledger_id: &str) -> Result<Option<u32>> {
-        self.inner.drop_branch(ledger_id).await
+        let remaining = self.inner.drop_branch(ledger_id).await?;
+        // Symmetric with `Publisher::retract` / `Publisher::purge`: subscribers
+        // (ledger cache, query peers) rely on `LedgerRetracted` to clear
+        // their per-branch state. Without this notification the new
+        // whole-ledger drop path would leave stale caches behind.
+        self.event_bus.notify(NameServiceEvent::LedgerRetracted {
+            ledger_id: ledger_id.to_string(),
+        });
+        Ok(remaining)
     }
 
     async fn reset_head(&self, ledger_id: &str, snapshot: NsRecordSnapshot) -> Result<()> {
