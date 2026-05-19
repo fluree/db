@@ -14,8 +14,9 @@ pub async fn run(
 ) -> CliResult<()> {
     if let Some(remote_name) = remote_flag {
         let alias = context::resolve_ledger(ledger, dirs)?;
+        let ledger_id = context::to_ledger_id(&alias);
         let client = context::build_remote_client(remote_name, dirs).await?;
-        let result = run_remote(&alias, oneline, count, &client).await;
+        let result = run_remote(&ledger_id, oneline, count, &client).await;
         context::persist_refreshed_tokens(&client, remote_name, dirs).await;
         return result;
     }
@@ -23,7 +24,8 @@ pub async fn run(
     if !direct {
         if let Some(client) = context::try_server_route_client(dirs) {
             let alias = context::resolve_ledger(ledger, dirs)?;
-            let result = run_remote(&alias, oneline, count, &client).await;
+            let ledger_id = context::to_ledger_id(&alias);
+            let result = run_remote(&ledger_id, oneline, count, &client).await;
             context::persist_refreshed_tokens(&client, context::LOCAL_SERVER_REMOTE, dirs).await;
             return result;
         }
