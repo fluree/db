@@ -3322,7 +3322,11 @@ impl Fluree {
         // without an owning handle. The bounded channel still gives us
         // backpressure as long as the consumer keeps draining.
         let producer = pack::stream_archive(self, &handle, &request, manifest, tx);
-        let consumer = async {
+        // `async move` so the consumer owns `rx`. On consumer error the
+        // closure unwinds, `rx` drops, the channel closes, and the producer's
+        // bounded `send` returns `Err` — otherwise `tokio::join!` would keep
+        // polling a producer that is permanently blocked on a full channel.
+        let consumer = async move {
             while let Some(chunk) = rx.recv().await {
                 let bytes = chunk.map_err(|e| ApiError::internal(format!("pack stream: {e}")))?;
                 writer
