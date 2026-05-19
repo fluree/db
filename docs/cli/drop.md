@@ -12,7 +12,7 @@ fluree drop <NAME> --force
 
 | Argument | Description |
 |----------|-------------|
-| `<NAME>` | Ledger name (bare, e.g. `mydb`) or graph source name. Branch-qualified ledger ids like `mydb:main` are accepted with a warning; non-default suffixes like `mydb:dev` are rejected — use `fluree branch drop dev --ledger mydb` to drop a single branch. |
+| `<NAME>` | Ledger name (bare, e.g. `mydb`) or graph source name. Branch-qualified ledger ids (including `mydb:main`) are rejected — use `fluree branch drop <branch> --ledger mydb` to drop a single branch. |
 
 ## Options
 

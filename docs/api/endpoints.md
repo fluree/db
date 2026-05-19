@@ -1224,7 +1224,7 @@ POST /drop
 
 | Field | Type | Required | Description |
 |-------|------|----------|-------------|
-| `ledger` | string | Yes | Ledger name (e.g., `"mydb"`). The branch-qualified form `"mydb:main"` is accepted for backwards compatibility but a warning is attached. Non-default branch suffixes like `"mydb:dev"` are **rejected** — use the [`POST /drop-branch`](#post-drop-branch) endpoint (or call `drop_branch` in the Rust API) to drop a single branch. |
+| `ledger` | string | Yes | Ledger name (e.g., `"mydb"`). Any branch-qualified form (including `"mydb:main"`) is **rejected** with a `400` — use the [`POST /drop-branch`](#post-drop-branch) endpoint (or call `drop_branch` in the Rust API) to drop a single branch. |
 | `hard` | boolean | No | If `true`, delete managed storage artifacts and purge the nameservice records. Default: `false` (soft drop). |
 
 **Scope:**
@@ -1259,13 +1259,13 @@ If no ledger is found by name, the server tries the same name as a graph source 
 
 **Status Codes:**
 - `200 OK` - Drop successful (or already dropped/not found)
-- `400 Bad Request` - Invalid request body, or a non-default branch suffix was supplied
+- `400 Bad Request` - Invalid request body, or any branch-qualified ledger id was supplied
 - `401 Unauthorized` - Bearer token required (when admin auth enabled)
 - `500 Internal Server Error` - Branch enumeration failed, or another unrecoverable error
 
 **Drop Sequence:**
 
-1. Parses input. `"mydb"` is the canonical form; `"mydb:main"` is accepted with a warning; anything else (`"mydb:dev"`, etc.) returns a `400`.
+1. Parses input. `"mydb"` is the canonical form; any branch-qualified id (`"mydb:main"`, `"mydb:dev"`, …) returns a `400`.
 2. Enumerates every NsRecord under the ledger name (including retracted ones).
 3. Sorts branches leaf-first via the `source_branch` parent pointers.
 4. Cancels and waits for pending background indexing on each branch.

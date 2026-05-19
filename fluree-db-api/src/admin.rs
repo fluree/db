@@ -221,15 +221,13 @@ fn normalize_ledger_id(ledger_id: &str) -> String {
 /// Parse a `drop_ledger` input.
 ///
 /// Accepted forms:
-/// - `"mydb"`: whole-ledger drop. Returns `("mydb", None)`.
-/// - `"mydb:main"`: whole-ledger drop, but a warning is returned to nudge
-///   callers away from the branch-qualified form. Returns
-///   `("mydb", Some(warning))`.
-/// - `"mydb:dev"` (or any non-default branch suffix): rejected with
-///   `ApiError::Http(400)` — likely a caller that meant `drop_branch`.
-fn parse_whole_ledger_input(input: &str) -> Result<(String, Option<String>)> {
+/// - `"mydb"`: whole-ledger drop. Returns `"mydb"`.
+/// - Any branch-qualified id (`"mydb:main"`, `"mydb:dev"`, …) is rejected
+///   with `ApiError::Http(400)`. `:main` is not special: callers passing
+///   the suffix likely expected branch-level semantics, so they're routed
+///   to `drop_branch` with the same error shape as a non-default suffix.
+fn parse_whole_ledger_input(input: &str) -> Result<String> {
     use fluree_db_core::ledger_id::split_ledger_id;
-    use fluree_db_core::DEFAULT_BRANCH;
 
     let bad_input = |msg: String| ApiError::Http {
         status: 400,
@@ -239,23 +237,18 @@ fn parse_whole_ledger_input(input: &str) -> Result<(String, Option<String>)> {
     if !input.contains(':') {
         let (name, _) = split_ledger_id(input)
             .map_err(|e| bad_input(format!("Invalid ledger name '{input}': {e}")))?;
-        return Ok((name, None));
+        return Ok(name);
     }
 
     let (name, branch) = split_ledger_id(input)
         .map_err(|e| bad_input(format!("Invalid ledger id '{input}': {e}")))?;
 
-    if branch == DEFAULT_BRANCH {
-        let warning = format!(
-            "drop_ledger received branch-qualified id '{input}'; treating as whole-ledger drop of '{name}'. \
-             Pass the bare ledger name to silence this warning, or use drop_branch to drop a single branch."
-        );
-        return Ok((name, Some(warning)));
-    }
-
+    // No branch suffix is accepted — including the default-name suffix —
+    // so callers can't be surprised by `drop_ledger("mydb:main")` quietly
+    // removing every other branch alongside main.
     Err(bad_input(format!(
-        "drop_ledger drops the whole ledger and does not accept a non-default branch suffix '{branch}'. \
-         Use drop_branch(\"{name}\", \"{branch}\") to drop a single branch, or pass \"{name}\" to drop the whole ledger."
+        "drop_ledger drops the whole ledger and does not accept a branch suffix '{branch}'. \
+         Pass \"{name}\" to drop the whole ledger, or use drop_branch(\"{name}\", \"{branch}\") to drop a single branch."
     )))
 }
 
@@ -340,11 +333,9 @@ impl crate::Fluree {
     /// # Input forms
     ///
     /// - `"mydb"` → drop the whole `mydb` ledger.
-    /// - `"mydb:main"` → drop the whole `mydb` ledger; a warning is recorded
-    ///   because the suffix is informational and likely indicates a caller
-    ///   that previously expected branch-level semantics.
-    /// - `"mydb:dev"` (or any non-default branch suffix) → rejected. The
-    ///   caller probably meant `drop_branch("mydb", "dev")`.
+    /// - `"mydb:<any-branch>"` (including `"mydb:main"`) → rejected with a
+    ///   `400`. `:main` carries no special meaning, so the caller probably
+    ///   meant `drop_branch("mydb", "<branch>")` if they passed a suffix.
     ///
     /// # Safety
     ///
@@ -369,16 +360,13 @@ impl crate::Fluree {
     /// (Lambda, etc.) **MUST** check `NsRecord.retracted` before indexing
     /// and before publishing to prevent recreating files after drop.
     pub async fn drop_ledger(&self, ledger_id: &str, mode: DropMode) -> Result<DropReport> {
-        let (ledger_name, suffix_warning) = parse_whole_ledger_input(ledger_id)?;
+        let ledger_name = parse_whole_ledger_input(ledger_id)?;
         info!(ledger_name = %ledger_name, mode = ?mode, "Dropping whole ledger");
 
         let mut report = DropReport {
             ledger_id: ledger_name.clone(),
             ..Default::default()
         };
-        if let Some(w) = suffix_warning {
-            report.warnings.push(w);
-        }
 
         // 1. Snapshot every record under this ledger name. Use `all_records`
         // (not `list_branches`, which excludes retracted) so hard-drop cleans
