@@ -250,9 +250,8 @@ curl -X POST http://localhost:8090/v1/fluree/drop \
   -d '{"ledger": "mydb", "hard": true}'
 ```
 
-`ledger` accepts the bare ledger name. The branch-qualified form
-`"mydb:main"` is accepted for backwards compatibility with a warning;
-non-default branch suffixes like `"mydb:dev"` are **rejected** — use
+`ledger` accepts the bare ledger name. Any branch-qualified form
+(including `"mydb:main"`) is **rejected** — use
 [`POST /drop-branch`](../api/endpoints.md#post-drop-branch) to drop a
 single branch.
 

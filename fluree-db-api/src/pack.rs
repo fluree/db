@@ -344,6 +344,60 @@ pub async fn stream_pack(
     }
 }
 
+/// Generate a self-contained ledger archive stream (`.flpack`).
+///
+/// On success, frames are: header → data frames → optional index manifest +
+/// artifacts → `phase: "nameservice"` manifest → End. That manifest is what
+/// allows `fluree create --from <file>.flpack` to reconstruct the
+/// nameservice record without contacting any remote — see
+/// `docs/operations/pack-archive-restore.md` for the full format.
+///
+/// `nameservice_manifest` should be a JSON object containing at least
+/// `phase: "nameservice"`, `ledger_id`, `name`, `branch`, `commit_head_id`,
+/// and `commit_t`. `index_head_id` / `index_t` should only be included when
+/// the archive actually carries those artifacts.
+///
+/// Unlike [`stream_pack`], on producer failure this **does not** emit an
+/// Error frame followed by End. Instead it drops the sender and returns
+/// `Err(message)`. The consumer sees the channel close cleanly, and callers
+/// (e.g. `Fluree::archive_ledger`) propagate the error rather than persisting
+/// a corrupt partial archive on disk.
+pub async fn stream_archive(
+    fluree: &crate::Fluree,
+    handle: &LedgerHandle,
+    request: &PackRequest,
+    nameservice_manifest: serde_json::Value,
+    frame_tx: mpsc::Sender<PackChunk>,
+) -> std::result::Result<PackStreamResult, String> {
+    let result = stream_pack_inner(fluree, handle, request, &frame_tx).await;
+
+    match result {
+        Ok(stats) => {
+            let mut manifest_buf = Vec::with_capacity(512);
+            encode_manifest_frame(&nameservice_manifest, &mut manifest_buf);
+            frame_tx
+                .send(Ok(manifest_buf))
+                .await
+                .map_err(|_| "client disconnected before manifest".to_string())?;
+
+            let mut end_buf = Vec::new();
+            encode_end_frame(&mut end_buf);
+            frame_tx
+                .send(Ok(end_buf))
+                .await
+                .map_err(|_| "client disconnected before end".to_string())?;
+            Ok(stats)
+        }
+        Err(err_msg) => {
+            warn!(error = %err_msg, "archive stream error");
+            // Drop the sender by returning; the consumer sees a clean close
+            // and we surface the error to the caller. No Error/End frames
+            // are emitted so we never persist a partial archive.
+            Err(err_msg)
+        }
+    }
+}
+
 async fn stream_pack_inner(
     fluree: &crate::Fluree,
     handle: &LedgerHandle,

@@ -769,8 +769,7 @@ async fn main() -> Result<()> {
 | Input | Behavior |
 |-------|----------|
 | `"mydb"` | Whole-ledger drop (canonical form). |
-| `"mydb:main"` | Accepted for backwards compatibility; a warning is attached to the report. |
-| `"mydb:dev"` (any non-default branch suffix) | **Rejected** with a `400`/`ApiError::Http`. Use `drop_branch("mydb", "dev")` instead. |
+| `"mydb:<branch>"` (including `"mydb:main"`) | **Rejected** with a `400`/`ApiError::Http`. Use `drop_branch("mydb", "<branch>")` to drop a single branch. |
 
 **Drop Modes:**
 

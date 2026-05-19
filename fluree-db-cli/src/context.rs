@@ -231,9 +231,14 @@ pub async fn build_remote_mode(
     };
 
     let client = build_client_from_auth(&base_url, &remote.auth);
+    // Canonicalize the remote alias so the URL path carries the full
+    // `name:branch` form. The server's `can_read` check is a literal string
+    // match against the path, so a token scoped to `mydb:main` would 404 if
+    // we sent `mydb` here.
+    let remote_alias = to_ledger_id(ledger_alias);
     Ok(LedgerMode::Tracked {
         client: Box::new(client),
-        remote_alias: ledger_alias.to_string(),
+        remote_alias,
         local_alias: ledger_alias.to_string(),
         remote_name: remote_name_str.to_string(),
     })

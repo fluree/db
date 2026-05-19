@@ -2348,26 +2348,7 @@ pub async fn incremental_index(
         let mut final_root = new_root;
         final_root.garbage = Some(BinaryGarbageRef { id: garbage_cid });
         if let Some(stats) = final_root.stats.as_mut() {
-            stats.size = final_root.total_commit_size;
-            if let Some(graphs) = stats.graphs.as_mut() {
-                let total_flakes: u64 = graphs.iter().map(|g| g.flakes).sum();
-                if total_flakes > 0 && stats.size > 0 {
-                    let total_size = stats.size;
-                    let n = graphs.len();
-                    let mut assigned: u64 = 0;
-                    for (i, g) in graphs.iter_mut().enumerate() {
-                        if i + 1 == n {
-                            g.size = total_size.saturating_sub(assigned);
-                        } else {
-                            let part = ((total_size as u128) * (g.flakes as u128)
-                                / (total_flakes as u128))
-                                as u64;
-                            g.size = part;
-                            assigned = assigned.saturating_add(part);
-                        }
-                    }
-                }
-            }
+            stats.distribute_total_size_by_flakes(final_root.total_commit_size);
         }
 
         super::root_assembly::reconcile_ns_at_publish(
@@ -2404,26 +2385,7 @@ pub async fn incremental_index(
     } else {
         let mut final_root = new_root;
         if let Some(stats) = final_root.stats.as_mut() {
-            stats.size = final_root.total_commit_size;
-            if let Some(graphs) = stats.graphs.as_mut() {
-                let total_flakes: u64 = graphs.iter().map(|g| g.flakes).sum();
-                if total_flakes > 0 && stats.size > 0 {
-                    let total_size = stats.size;
-                    let n = graphs.len();
-                    let mut assigned: u64 = 0;
-                    for (i, g) in graphs.iter_mut().enumerate() {
-                        if i + 1 == n {
-                            g.size = total_size.saturating_sub(assigned);
-                        } else {
-                            let part = ((total_size as u128) * (g.flakes as u128)
-                                / (total_flakes as u128))
-                                as u64;
-                            g.size = part;
-                            assigned = assigned.saturating_add(part);
-                        }
-                    }
-                }
-            }
+            stats.distribute_total_size_by_flakes(final_root.total_commit_size);
         }
 
         super::root_assembly::reconcile_ns_at_publish(

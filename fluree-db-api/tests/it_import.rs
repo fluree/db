@@ -290,6 +290,25 @@ ex:bob a ex:User ;
     let stats = ledger.snapshot.stats.as_ref().unwrap();
     assert!(stats.flakes > 0, "should have flake count in stats");
 
+    // Regression: `stats.size` and per-graph `graphs[*].size` must be wired
+    // from the IndexRoot's `total_commit_size`. Without the
+    // `distribute_total_size_by_flakes` call in the import path, both
+    // surface as 0 in `info` even though the commit blobs do have bytes.
+    assert!(
+        stats.size > 0,
+        "stats.size should reflect total commit blob bytes, got 0"
+    );
+    let graphs = stats.graphs.as_ref().expect("graphs should be present");
+    let default_graph_size = graphs
+        .iter()
+        .find(|g| g.g_id == 0)
+        .map(|g| g.size)
+        .unwrap_or(0);
+    assert!(
+        default_graph_size > 0,
+        "default graph (g_id=0) size should be > 0"
+    );
+
     // Property stats: schema:name should have count=2 (Alice, Bob)
     let name_count = property_count(&ledger.snapshot, "http://schema.org/name");
     assert_eq!(name_count, Some(2), "schema:name should have count=2");

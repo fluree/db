@@ -520,8 +520,8 @@ async fn drop_main_refused() {
         .await
         .expect_err("dropping main should fail");
     assert!(
-        err.to_string().contains("root branch"),
-        "error should mention root branch: {err}"
+        err.to_string().contains("root"),
+        "error should mention root: {err}"
     );
 }
 
@@ -539,7 +539,7 @@ async fn drop_branch_refuses_non_main_root() {
         .expect_err("dropping the root (named trunk) should fail");
     let msg = err.to_string();
     assert!(
-        msg.contains("root branch") && msg.contains("trunk"),
+        msg.contains("root") && msg.contains("trunk"),
         "error should mention root and trunk: {msg}"
     );
 }
