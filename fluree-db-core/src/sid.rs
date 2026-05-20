@@ -115,6 +115,15 @@ impl Sid {
         SID.clone()
     }
 
+    /// XSD `xsd:decimal` SID.
+    ///
+    /// Cached via `LazyLock` — the `Arc<str>` is allocated once and reused.
+    pub fn xsd_decimal() -> Sid {
+        use std::sync::LazyLock;
+        static SID: LazyLock<Sid> = LazyLock::new(|| Sid::new(namespaces::XSD, xsd_names::DECIMAL));
+        SID.clone()
+    }
+
     /// XSD `xsd:string` SID.
     ///
     /// Cached via `LazyLock` — the `Arc<str>` is allocated once and reused.
