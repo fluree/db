@@ -388,13 +388,14 @@ async fn subquery_inside_union() {
         .unwrap()
         .to_jsonld(&ledger.snapshot)
         .unwrap();
-    assert_eq!(
-        normalize_rows(&rows),
-        normalize_rows(&json!([
-            ["Alice", 42.333_333_333_333_336_f64],
-            ["Cam", 7.5_f64]
-        ]))
-    );
+    // Per W3C, AVG of integers yields xsd:decimal (JSON-LD serializes as string).
+    let normalized = normalize_rows(&rows);
+    let avg_alice: f64 = normalized[0][1].as_str().unwrap().parse().unwrap();
+    let avg_cam: f64 = normalized[1][1].as_str().unwrap().parse().unwrap();
+    assert_eq!(normalized[0][0].as_str().unwrap(), "Alice");
+    assert!((avg_alice - 42.333_333_333_333_336_f64).abs() < 1e-12);
+    assert_eq!(normalized[1][0].as_str().unwrap(), "Cam");
+    assert!((avg_cam - 7.5_f64).abs() < 1e-12);
 }
 
 #[tokio::test]
@@ -418,7 +419,11 @@ async fn subquery_union_branch_query_alone_has_results() {
         .unwrap()
         .to_jsonld(&ledger.snapshot)
         .unwrap();
-    assert_eq!(rows, json!([["Alice", 42.333_333_333_333_336_f64]]));
+    // AVG of integers yields xsd:decimal (JSON-LD: string).
+    let row = &rows.as_array().unwrap()[0].as_array().unwrap();
+    assert_eq!(row[0].as_str().unwrap(), "Alice");
+    let avg: f64 = row[1].as_str().unwrap().parse().unwrap();
+    assert!((avg - 42.333_333_333_333_336_f64).abs() < 1e-12);
 }
 
 #[tokio::test]
