@@ -179,6 +179,7 @@ async fn s3_testcontainers_basic_test() {
             max_retries: None,
             retry_base_delay_ms: None,
             retry_max_delay_ms: None,
+            max_concurrent_requests: None,
         },
     )
     .await
@@ -274,6 +275,7 @@ async fn s3_testcontainers_indexing_test() {
             max_retries: None,
             retry_base_delay_ms: None,
             retry_max_delay_ms: None,
+            max_concurrent_requests: None,
         },
     )
     .await
@@ -407,6 +409,7 @@ async fn s3_testcontainers_hard_drop_clears_ledger() {
             max_retries: None,
             retry_base_delay_ms: None,
             retry_max_delay_ms: None,
+            max_concurrent_requests: None,
         },
     )
     .await
@@ -427,6 +430,7 @@ async fn s3_testcontainers_hard_drop_clears_ledger() {
     let fluree = build_fluree(storage.clone(), nameservice.clone());
 
     let ledger_id = "drop-test:main";
+    let ledger_name = "drop-test";
     let ledger0 = fluree
         .create_ledger(ledger_id)
         .await
@@ -468,7 +472,7 @@ async fn s3_testcontainers_hard_drop_clears_ledger() {
 
     // Hard drop.
     let report = fluree
-        .drop_ledger(ledger_id, DropMode::Hard)
+        .drop_ledger(ledger_name, DropMode::Hard)
         .await
         .expect("drop_ledger");
     assert_eq!(report.status, DropStatus::Dropped);

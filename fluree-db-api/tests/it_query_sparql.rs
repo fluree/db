@@ -810,13 +810,20 @@ async fn sparql_aggregate_avg_over_values() {
         .unwrap();
     let jsonld = result.to_jsonld(&ledger.snapshot).expect("to_jsonld");
 
-    let avg = jsonld
+    // Per W3C, AVG of integers yields xsd:decimal — JSON-LD renders decimals
+    // as strings to preserve exactness (vs. xsd:double which renders as a
+    // number). Parse the string and check the numeric value.
+    let avg_cell = jsonld
         .as_array()
         .and_then(|arr| arr.first())
         .and_then(|row| row.as_array())
         .and_then(|row| row.first())
-        .and_then(serde_json::Value::as_f64)
-        .expect("avg result");
+        .expect("avg cell");
+    let avg: f64 = avg_cell
+        .as_str()
+        .expect("avg rendered as decimal string")
+        .parse()
+        .expect("decimal parses as number");
     assert!((avg - 17.666_666_666_666_67).abs() < 1e-12);
 }
 
@@ -840,12 +847,19 @@ async fn sparql_group_by_having_filters_groups() {
         .unwrap();
     let jsonld = result.to_jsonld(&ledger.snapshot).expect("to_jsonld");
 
+    // Per W3C, AVG of integers yields xsd:decimal — JSON-LD serializes
+    // decimals as strings to preserve precision.
     let mut values: Vec<f64> = jsonld
         .as_array()
         .expect("avg rows array")
         .iter()
         .flat_map(|row| row.as_array().expect("row array").iter())
-        .filter_map(serde_json::Value::as_f64)
+        .map(|cell| {
+            cell.as_str()
+                .expect("avg cell rendered as decimal string")
+                .parse::<f64>()
+                .expect("parses as number")
+        })
         .collect();
     values.sort_by(|a, b| a.partial_cmp(b).unwrap());
 
@@ -923,8 +937,18 @@ async fn sparql_multiple_select_expressions_with_aggregate_alias() {
 
     let rows = normalize_rows(&jsonld);
     assert_eq!(rows.len(), 1);
-    let avg = rows[0][0].as_f64().expect("avg");
-    let ceil = rows[0][1].as_f64().expect("ceil");
+    // Per W3C, AVG of integers yields xsd:decimal (JSON-LD: string);
+    // CEIL of an xsd:decimal yields xsd:decimal too.
+    let avg: f64 = rows[0][0]
+        .as_str()
+        .expect("avg as decimal string")
+        .parse()
+        .expect("parses");
+    let ceil: f64 = rows[0][1]
+        .as_str()
+        .expect("ceil as decimal string")
+        .parse()
+        .expect("parses");
     assert!((avg - 17.666_666_666_666_67).abs() < 1e-12);
     assert!((ceil - 18.0).abs() < 1e-12);
 }
@@ -1018,7 +1042,12 @@ async fn sparql_mix_of_grouped_values_and_aggregates() {
                 .iter()
                 .map(|v| v.as_i64().expect("favNum"))
                 .collect::<Vec<_>>();
-            let avg = row[1].as_f64().expect("avg");
+            // AVG of integers → xsd:decimal (JSON string).
+            let avg: f64 = row[1]
+                .as_str()
+                .expect("avg as decimal string")
+                .parse()
+                .expect("parses");
             let person = row[2].as_str().expect("person").to_string();
             let handle = row[3].as_str().expect("handle").to_string();
             let max = row[4].as_i64().expect("max");
@@ -2797,6 +2826,53 @@ async fn sparql_isnumeric_decimal() {
 
     // price is decimal → true, label is string → false
     assert_eq!(jsonld, json!([["食べ物", true, false]]));
+}
+
+#[tokio::test]
+async fn sparql_sum_avg_over_xsd_decimal_repro() {
+    // Repro for reported bug: SUM(?x) over xsd:decimal returns 0,
+    // AVG(?x) returns unbound. SUM(xsd:integer) and MIN/MAX over the same
+    // decimals work, so the bug is specific to arithmetic aggregates +
+    // xsd:decimal.
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger = seed_builtin_fn_data(&fluree, "agg:decimal-sum").await;
+
+    let query = r"
+        PREFIX ex: <http://example.org/ns/>
+        SELECT
+          (SUM(?price) AS ?total)
+          (AVG(?price) AS ?avg)
+          (MIN(?price) AS ?lo)
+          (MAX(?price) AS ?hi)
+          (COUNT(?price) AS ?n)
+        WHERE { ?x ex:price ?price }
+    ";
+
+    let result = support::query_sparql(&fluree, &ledger, query)
+        .await
+        .expect("aggregate over decimal");
+    let sparql_json = result
+        .to_sparql_json(&ledger.snapshot)
+        .expect("to_sparql_json");
+    let bindings = normalize_sparql_bindings(&sparql_json);
+    assert_eq!(bindings.len(), 1);
+    let row = &bindings[0];
+
+    // 12.50 + 7.99 = 20.49 — exact xsd:decimal arithmetic, not lossy f64.
+    let total = row.get("total").expect("total bound");
+    assert_eq!(total["value"].as_str().unwrap(), "20.49");
+    assert_eq!(
+        total["datatype"].as_str().unwrap(),
+        "http://www.w3.org/2001/XMLSchema#decimal",
+        "SUM(xsd:decimal) must yield xsd:decimal per W3C arithmetic promotion"
+    );
+
+    let avg = row.get("avg").expect("avg bound (not Unbound)");
+    assert_eq!(avg["value"].as_str().unwrap(), "10.245");
+    assert_eq!(
+        avg["datatype"].as_str().unwrap(),
+        "http://www.w3.org/2001/XMLSchema#decimal"
+    );
 }
 
 #[tokio::test]

@@ -547,9 +547,16 @@ impl<'a> OwnedTransactBuilder<'a> {
 
         // Direct flake path for InsertTurtle
         if let TransactOperation::InsertTurtle(turtle) = op {
+            let tracker = self
+                .core
+                .tracking
+                .clone()
+                .map(Tracker::new)
+                .unwrap_or_else(Tracker::disabled);
+            let tracker_ref = tracker.is_enabled().then_some(&tracker);
             let stage_result = self
                 .fluree
-                .stage_turtle_insert(self.ledger, turtle, Some(&index_config))
+                .stage_turtle_insert(self.ledger, turtle, Some(&index_config), tracker_ref)
                 .await?;
             return Ok(Staged {
                 view: stage_result.view,
@@ -793,8 +800,9 @@ pub(crate) async fn commit_with_handle(
             // Direct flake path for InsertTurtle (bypass JSON-LD / IR)
             if let TransactOperation::InsertTurtle(turtle) = op {
                 let ledger_id = ledger_state.ledger_id().to_string();
+                let tracker_ref = tracker.is_enabled().then_some(&tracker);
                 let stage_result = fluree
-                    .stage_turtle_insert(ledger_state, turtle, Some(&index_config))
+                    .stage_turtle_insert(ledger_state, turtle, Some(&index_config), tracker_ref)
                     .await?;
                 // Spawn raw Turtle upload when explicitly opted-in — overlaps
                 // with the commit prelude (sequencing lookup, envelope apply).
@@ -988,7 +996,7 @@ pub(crate) async fn commit_with_handle(
                     commit_opts_base.clone()
                 };
                 let stage_result = fluree
-                    .stage_turtle_insert(ledger_state, turtle, Some(&index_config))
+                    .stage_turtle_insert(ledger_state, turtle, Some(&index_config), tracker_ref)
                     .await?;
                 (stage_result, TxnType::Insert, commit_opts)
             }

@@ -26,6 +26,7 @@
 //!     bucket: "my-bucket".to_string(),
 //!     prefix: Some("ledgers".to_string()),
 //!     timeout_ms: Some(30000),
+//!     ..Default::default()
 //! };
 //! let storage = S3Storage::new(&sdk_config, s3_config).await?;
 //!

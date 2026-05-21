@@ -115,6 +115,8 @@ When tracking is enabled, the response includes tracking information as top-leve
 
 The `fuel` value is decimal with up to 3 places of precision. The HTTP `x-fdb-fuel` response header carries the same value.
 
+Tracked transaction responses (`/insert`, `/upsert`, `/update`, including Turtle/TriG and SPARQL UPDATE when tracking headers are used) expose the same top-level `time`, `fuel`, and `policy` fields when present, alongside the transaction receipt fields.
+
 ## Best Practices
 
 ### Tracking

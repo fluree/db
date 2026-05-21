@@ -1063,6 +1063,7 @@ async fn build_s3_storage_from_config(
         max_retries: s3_config.max_retries.map(|n| n as u32),
         retry_base_delay_ms: s3_config.retry_base_delay_ms,
         retry_max_delay_ms: s3_config.retry_max_delay_ms,
+        max_concurrent_requests: s3_config.max_concurrent_requests,
     };
 
     let storage = S3Storage::new(sdk_config, raw_config)
@@ -1375,6 +1376,7 @@ impl FlureeBuilder {
             max_retries: None,
             retry_base_delay_ms: None,
             retry_max_delay_ms: None,
+            max_concurrent_requests: None,
             address_identifier: None,
         };
 
@@ -1471,6 +1473,15 @@ impl FlureeBuilder {
     pub fn s3_retry_max_delay_ms(mut self, ms: u64) -> Self {
         if let StorageType::S3(s3) = &mut self.config.index_storage.storage_type {
             s3.retry_max_delay_ms = Some(ms);
+        }
+        self
+    }
+
+    /// Set the maximum concurrent S3 SDK requests per storage instance.
+    #[cfg(feature = "aws")]
+    pub fn s3_max_concurrent_requests(mut self, n: usize) -> Self {
+        if let StorageType::S3(s3) = &mut self.config.index_storage.storage_type {
+            s3.max_concurrent_requests = Some(n.max(1));
         }
         self
     }
@@ -2059,6 +2070,7 @@ impl FlureeBuilder {
                 max_retries: s3_cfg.max_retries.map(|n| n as u32),
                 retry_base_delay_ms: s3_cfg.retry_base_delay_ms,
                 retry_max_delay_ms: s3_cfg.retry_max_delay_ms,
+                max_concurrent_requests: s3_cfg.max_concurrent_requests,
             },
         )
         .await
@@ -2135,6 +2147,7 @@ impl FlureeBuilder {
                 max_retries: s3_cfg.max_retries.map(|n| n as u32),
                 retry_base_delay_ms: s3_cfg.retry_base_delay_ms,
                 retry_max_delay_ms: s3_cfg.retry_max_delay_ms,
+                max_concurrent_requests: s3_cfg.max_concurrent_requests,
             },
         )
         .await
@@ -3266,6 +3279,150 @@ impl Fluree {
     /// ```
     pub fn export(&self, ledger_id: &str) -> export_builder::ExportBuilder<'_> {
         export_builder::ExportBuilder::new(self, ledger_id.to_string())
+    }
+
+    /// Stream a self-contained ledger archive (`.flpack`) for `ledger_id`.
+    ///
+    /// This is the export side of the `fluree create --from <file>.flpack`
+    /// pipeline. Frame bytes (header → commits → optional indexes →
+    /// nameservice manifest → end) are written to `writer` in order, so the
+    /// caller can target a file, stdout, or any `AsyncWrite` sink without
+    /// buffering the full archive in memory.
+    ///
+    /// `include_indexes` controls whether binary index artifacts ride along
+    /// (`true` → instantly queryable on import; `false` → smaller archive,
+    /// import will need to reindex). When the ledger has no index root, the
+    /// flag is silently downgraded to commits-only.
+    pub async fn archive_ledger<W: tokio::io::AsyncWrite + Unpin + Send>(
+        &self,
+        ledger_id: &str,
+        include_indexes: bool,
+        writer: &mut W,
+    ) -> Result<pack::PackStreamResult> {
+        use tokio::io::AsyncWriteExt as _;
+
+        let record = self
+            .nameservice()
+            .lookup(ledger_id)
+            .await?
+            .ok_or_else(|| ApiError::NotFound(ledger_id.to_string()))?;
+
+        let canonical_id = record.ledger_id.clone();
+        let handle = self.ledger_cached(&canonical_id).await?;
+
+        // Source the manifest *and* the pack request from the same view, so
+        // the archive bytes and the manifest pointers always agree. Reading
+        // the heads from the nameservice record while reading the pack
+        // contents from the cached handle could disagree if the cache is
+        // behind a freshly committed head.
+        let view = handle.snapshot().await;
+
+        let head_commit_id = view.head_commit_id.clone().ok_or_else(|| {
+            ApiError::internal(format!("ledger {canonical_id} has no head commit to pack"))
+        })?;
+
+        // `full_ledger_pack_request` silently drops the index when the
+        // ledger has none. Mirror that decision here so we never advertise
+        // an `index_head_id` we did not archive.
+        let archived_index = if include_indexes {
+            view.head_index_id.clone()
+        } else {
+            None
+        };
+        let request = match archived_index.clone() {
+            Some(index_root) => pack::PackRequest::with_indexes(
+                vec![head_commit_id.clone()],
+                vec![],
+                index_root,
+                None,
+            ),
+            None => pack::PackRequest::commits(vec![head_commit_id.clone()], vec![]),
+        };
+
+        let mut manifest = serde_json::json!({
+            "phase": "nameservice",
+            "ledger_id": canonical_id,
+            "name": record.name,
+            "branch": record.branch,
+            "commit_head_id": head_commit_id.to_string(),
+            "commit_t": view.t,
+        });
+        if let Some(cid) = archived_index.as_ref() {
+            manifest["index_head_id"] = serde_json::Value::String(cid.to_string());
+            manifest["index_t"] = serde_json::Value::from(view.index_t());
+        }
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<pack::PackChunk>(64);
+
+        // Run producer and consumer concurrently in the same task: the
+        // producer is borrowing `&self`, so we cannot `tokio::spawn` it
+        // without an owning handle. The bounded channel still gives us
+        // backpressure as long as the consumer keeps draining.
+        let producer = pack::stream_archive(self, &handle, &request, manifest, tx);
+        // `async move` so the consumer owns `rx`. On consumer error the
+        // closure unwinds, `rx` drops, the channel closes, and the producer's
+        // bounded `send` returns `Err` — otherwise `tokio::join!` would keep
+        // polling a producer that is permanently blocked on a full channel.
+        let consumer = async move {
+            while let Some(chunk) = rx.recv().await {
+                let bytes = chunk.map_err(|e| ApiError::internal(format!("pack stream: {e}")))?;
+                writer
+                    .write_all(&bytes)
+                    .await
+                    .map_err(|e| ApiError::internal(format!("archive write: {e}")))?;
+            }
+            writer
+                .flush()
+                .await
+                .map_err(|e| ApiError::internal(format!("archive flush: {e}")))?;
+            Ok::<_, ApiError>(())
+        };
+
+        let (producer_result, consumer_result) = tokio::join!(producer, consumer);
+        // Surface a producer-side failure even if the consumer drained
+        // cleanly. Without this, a corrupt or empty archive would land on
+        // disk and `archive_ledger` would still report success.
+        let stats = producer_result
+            .map_err(|e| ApiError::internal(format!("archive generation failed: {e}")))?;
+        consumer_result?;
+        Ok(stats)
+    }
+
+    /// Walk the commit chain for a ledger and return per-commit summaries.
+    ///
+    /// `limit` caps the number of returned summaries (newest-first by `t`).
+    /// The returned `total` reflects the full chain length regardless of cap;
+    /// truncation is implied by `summaries.len() < total`.
+    ///
+    /// Uses a branch-aware content store so the walk crosses fork points —
+    /// pre-fork commits live under the source branch's namespace, not the
+    /// current branch's.
+    pub async fn commit_log(
+        &self,
+        ledger_id: &str,
+        limit: Option<usize>,
+    ) -> Result<(Vec<CommitSummary>, usize)> {
+        let record = self
+            .nameservice()
+            .lookup(ledger_id)
+            .await?
+            .ok_or_else(|| ApiError::NotFound(ledger_id.to_string()))?;
+
+        let head = match record.commit_head_id.as_ref() {
+            Some(id) => id.clone(),
+            None => return Ok((Vec::new(), 0)),
+        };
+
+        let store = fluree_db_nameservice::branched_content_store_for_record(
+            self.backend(),
+            self.nameservice(),
+            &record,
+        )
+        .await?;
+
+        let (summaries, total) =
+            fluree_db_core::walk_commit_summaries(&store, &head, 0, limit).await?;
+        Ok((summaries, total))
     }
 
     /// Get the default JSON-LD context for a ledger.

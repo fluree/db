@@ -103,6 +103,7 @@ impl StorageRegistry {
             max_retries: s3_config.max_retries.map(|n| n as u32),
             retry_base_delay_ms: s3_config.retry_base_delay_ms,
             retry_max_delay_ms: s3_config.retry_max_delay_ms,
+            max_concurrent_requests: s3_config.max_concurrent_requests,
         };
 
         let storage = S3Storage::new(sdk_config, raw_config)
