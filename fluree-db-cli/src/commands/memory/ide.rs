@@ -643,18 +643,34 @@ struct JsonMcpInstall<'a> {
 /// follow-up side effects (e.g. rules-file install) and should gate
 /// them on `Ok(InstallOutcome::Installed)`.
 fn install_json_mcp_config(opts: JsonMcpInstall<'_>) -> CliResult<InstallOutcome> {
+    let manual_snippet = || {
+        format!(
+            "\"{}\": {{\n  \"fluree-memory\": {}\n}}",
+            opts.top_key,
+            serde_json::to_string_pretty(&opts.entry).unwrap_or_default()
+        )
+    };
+
     let mut config = match load_config(opts.config_path, opts.default) {
         LoadedConfig::MissingOrEmpty(v) | LoadedConfig::Parsed(v) => v,
         LoadedConfig::Unsafe { reason } => {
-            let snippet = format!(
-                "\"{}\": {{\n  \"fluree-memory\": {}\n}}",
-                opts.top_key,
-                serde_json::to_string_pretty(&opts.entry).unwrap_or_default()
-            );
-            warn_unsafe_config(opts.config_path, &reason, &snippet);
+            warn_unsafe_config(opts.config_path, &reason, &manual_snippet());
             return Ok(InstallOutcome::ManualRequired);
         }
     };
+
+    // The root is guaranteed to be an object by load_config, but the
+    // existing value under `top_key` (if any) might not be. Refuse rather
+    // than clobber — e.g. don't silently turn `{"mcpServers": []}` into
+    // `{"mcpServers": {"fluree-memory": ...}}`.
+    if let Some(existing) = config.get(opts.top_key) {
+        if !existing.is_object() {
+            let reason = format!("\"{}\" exists but is not a JSON object", opts.top_key);
+            warn_unsafe_config(opts.config_path, &reason, &manual_snippet());
+            return Ok(InstallOutcome::ManualRequired);
+        }
+    }
+
     merge_mcp_entry(&mut config, opts.top_key, opts.entry);
     write_config(opts.config_path, &config)?;
     println!("  Installed: {}", opts.config_path.display());
@@ -1358,6 +1374,48 @@ mod tests {
         assert_eq!(outcome, InstallOutcome::ManualRequired);
         // File untouched.
         assert_eq!(std::fs::read_to_string(&config_path).unwrap(), "[]");
+    }
+
+    #[test]
+    fn install_json_mcp_config_refuses_non_object_top_key() {
+        // Root is an object (so load_config returns Parsed), but the
+        // top_key holds a non-object value. We must NOT silently replace
+        // the array with our merged object — that would clobber whatever
+        // the user had configured under that key.
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("a.json");
+        let original = r#"{"mcpServers":[]}"#;
+        std::fs::write(&config_path, original).unwrap();
+        let outcome = install_json_mcp_config(JsonMcpInstall {
+            config_path: &config_path,
+            top_key: "mcpServers",
+            default: serde_json::json!({ "mcpServers": {} }),
+            entry: serde_json::json!({ "command": "fluree" }),
+        })
+        .unwrap();
+        assert_eq!(outcome, InstallOutcome::ManualRequired);
+        assert_eq!(std::fs::read_to_string(&config_path).unwrap(), original);
+    }
+
+    #[test]
+    fn install_json_mcp_config_merges_into_existing_object_top_key() {
+        // Existing entries under top_key are preserved; we only insert
+        // (or overwrite) `fluree-memory`.
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("a.json");
+        std::fs::write(&config_path, r#"{"mcpServers":{"other":{"command":"x"}}}"#).unwrap();
+        let outcome = install_json_mcp_config(JsonMcpInstall {
+            config_path: &config_path,
+            top_key: "mcpServers",
+            default: serde_json::json!({ "mcpServers": {} }),
+            entry: serde_json::json!({ "command": "fluree" }),
+        })
+        .unwrap();
+        assert_eq!(outcome, InstallOutcome::Installed);
+        let written: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&config_path).unwrap()).unwrap();
+        assert_eq!(written["mcpServers"]["other"]["command"], "x");
+        assert_eq!(written["mcpServers"]["fluree-memory"]["command"], "fluree");
     }
 
     #[test]
