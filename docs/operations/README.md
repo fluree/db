@@ -32,6 +32,14 @@ Storage backend options:
 - Storage selection criteria
 - Switching between storage modes
 
+### [Serverless Storage Choices](serverless-storage.md)
+
+Cloud/serverless storage placement guidance:
+- Standard S3 vs S3 Express One Zone for index storage
+- Why commits should normally remain on Standard S3
+- Expected transaction, query, and indexing latency ranges
+- Lambda disk cache and S3 concurrency tuning notes
+
 ### [IPFS Storage](ipfs-storage.md)
 
 IPFS-specific setup and configuration:
