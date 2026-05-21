@@ -29,11 +29,15 @@ use crate::telemetry::{
     create_request_span, extract_request_id, extract_trace_id, set_span_error_code,
 };
 use axum::extract::{Path, Request, State};
+use axum::http::{HeaderMap, HeaderValue};
 use axum::response::{IntoResponse, Response};
 use axum::Json;
 use fluree_db_api::{
-    lower_sparql_update, parse_sparql, with_index_request_correlation, CommitOpts,
+    lower_sparql_update, parse_sparql, with_index_request_correlation, ApiError, CommitOpts,
     IndexRequestCorrelation, NamespaceRegistry, SparqlQueryBody, TrackingOptions, TxnOpts, TxnType,
+};
+use fluree_db_consensus::{
+    IdempotencyKey, SubmissionError, Submitter, TransactionRequest,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
@@ -83,6 +87,91 @@ fn compute_tx_id(body: &JsonValue) -> String {
 fn compute_tx_id_sparql(sparql: &str) -> String {
     let hash = Sha256::digest(sparql.as_bytes());
     format!("fluree:tx:sha256:{}", hex::encode(hash))
+}
+
+/// Extract an [`IdempotencyKey`] from the `Idempotency-Key` request header.
+///
+/// Returns `None` when the header is absent or empty. Non-UTF-8 header values
+/// are also treated as absent — the consensus layer can only key on strings.
+fn extract_idempotency_key(headers: &HeaderMap) -> Option<IdempotencyKey> {
+    headers
+        .get("Idempotency-Key")
+        .and_then(|v| v.to_str().ok())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(IdempotencyKey::new)
+}
+
+/// Map a [`SubmissionError`] to the [`ServerError`] / HTTP status the rest
+/// of the server expects.
+fn submission_error_to_server_error(err: SubmissionError) -> ServerError {
+    match err {
+        SubmissionError::KeyCollision | SubmissionError::AlreadyInFlight => {
+            ServerError::Api(ApiError::http(409, err.to_string()))
+        }
+        SubmissionError::Submission(msg) => ServerError::internal(msg),
+    }
+}
+
+/// Build a response that optionally echoes the supplied `Idempotency-Key`
+/// back to the client. Echoing signals that the server tracked the key for
+/// idempotent retry; absence signals it was ignored.
+fn build_consensus_response(
+    response_json: Json<TransactResponse>,
+    idempotency_key: Option<&IdempotencyKey>,
+) -> Response {
+    if let Some(key) = idempotency_key {
+        if let Ok(value) = HeaderValue::from_str(key.as_str()) {
+            let mut hdrs = HeaderMap::new();
+            hdrs.insert("Idempotency-Key", value);
+            return (hdrs, response_json).into_response();
+        }
+    }
+    response_json.into_response()
+}
+
+/// Submit a prepared transaction through monolithic consensus.
+///
+/// Used by [`execute_transaction`] when the request is eligible for the
+/// consensus path (currently: `Insert` without tracking or policy). All the
+/// upstream preparation (header injection, identity wiring, opts assembly,
+/// `tx_id` derivation) happens in the caller; this helper is purely the
+/// submission + response shaping step.
+async fn submit_via_consensus(
+    state: &AppState,
+    ledger_id: &str,
+    request: TransactionRequest,
+    tx_id: String,
+) -> Result<Response> {
+    let receipt = match state.consensus.submit(ledger_id, request).await {
+        Ok(receipt) => {
+            tracing::info!(
+                status = "success",
+                commit_t = receipt.commit.t,
+                commit_id = %receipt.commit.commit_id,
+                "transaction committed via consensus"
+            );
+            receipt
+        }
+        Err(err) => {
+            set_span_error_code(&tracing::Span::current(), "error:InvalidTransaction");
+            tracing::error!(error = %err, "transaction submission failed");
+            return Err(submission_error_to_server_error(err));
+        }
+    };
+
+    let response_json = Json(TransactResponse {
+        ledger_id: ledger_id.to_string(),
+        t: receipt.commit.t,
+        tx_id,
+        commit: CommitInfo {
+            hash: receipt.commit.commit_id.to_string(),
+        },
+    });
+    Ok(build_consensus_response(
+        response_json,
+        receipt.idempotency_key.as_ref(),
+    ))
 }
 
 /// If the request was signed (credentialed), return the *original* signed envelope
@@ -402,7 +491,7 @@ async fn update_local(
 
         tracing::info!(status = "start", "transaction request received");
 
-        let mut body_json = match credential.body_json() {
+        let body_json = match credential.body_json() {
             Ok(json) => json,
             Err(e) => {
                 set_span_error_code(&span, "error:BadRequest");
@@ -429,10 +518,11 @@ async fn update_local(
             &state,
             &ledger_id,
             TxnType::Update,
-            &mut body_json,
+            body_json,
             &credential,
             author.as_deref(),
             &headers,
+            None,
         )
         .await
     }
@@ -548,7 +638,7 @@ async fn update_ledger_local(
 
         tracing::info!(status = "start", "ledger transaction request received");
 
-        let mut body_json = match credential.body_json() {
+        let body_json = match credential.body_json() {
             Ok(json) => json,
             Err(e) => {
                 set_span_error_code(&span, "error:BadRequest");
@@ -575,10 +665,11 @@ async fn update_ledger_local(
             &state,
             &ledger_id,
             TxnType::Update,
-            &mut body_json,
+            body_json,
             &credential,
             author.as_deref(),
             &headers,
+            None,
         )
         .await
     }
@@ -693,7 +784,7 @@ async fn insert_local(
 
         tracing::info!(status = "start", "insert transaction requested");
 
-        let mut body_json = match credential.body_json() {
+        let body_json = match credential.body_json() {
             Ok(json) => json,
             Err(e) => {
                 set_span_error_code(&span, "error:BadRequest");
@@ -720,10 +811,11 @@ async fn insert_local(
             &state,
             &ledger_id,
             TxnType::Insert,
-            &mut body_json,
+            body_json,
             &credential,
             author.as_deref(),
             &headers,
+            extract_idempotency_key(&credential.headers),
         )
         .await
     }
@@ -838,7 +930,7 @@ async fn upsert_local(
 
         tracing::info!(status = "start", "upsert transaction requested");
 
-        let mut body_json = match credential.body_json() {
+        let body_json = match credential.body_json() {
             Ok(json) => json,
             Err(e) => {
                 set_span_error_code(&span, "error:BadRequest");
@@ -865,10 +957,11 @@ async fn upsert_local(
             &state,
             &ledger_id,
             TxnType::Upsert,
-            &mut body_json,
+            body_json,
             &credential,
             author.as_deref(),
             &headers,
+            None,
         )
         .await
     }
@@ -984,7 +1077,7 @@ async fn insert_ledger_local(
 
         tracing::info!(status = "start", "ledger insert transaction requested");
 
-        let mut body_json = match credential.body_json() {
+        let body_json = match credential.body_json() {
             Ok(json) => json,
             Err(e) => {
                 set_span_error_code(&span, "error:BadRequest");
@@ -1011,10 +1104,11 @@ async fn insert_ledger_local(
             &state,
             &ledger_id,
             TxnType::Insert,
-            &mut body_json,
+            body_json,
             &credential,
             author.as_deref(),
             &headers,
+            extract_idempotency_key(&credential.headers),
         )
         .await
     }
@@ -1130,7 +1224,7 @@ async fn upsert_ledger_local(
 
         tracing::info!(status = "start", "ledger upsert transaction requested");
 
-        let mut body_json = match credential.body_json() {
+        let body_json = match credential.body_json() {
             Ok(json) => json,
             Err(e) => {
                 set_span_error_code(&span, "error:BadRequest");
@@ -1157,10 +1251,11 @@ async fn upsert_ledger_local(
             &state,
             &ledger_id,
             TxnType::Upsert,
-            &mut body_json,
+            body_json,
             &credential,
             author.as_deref(),
             &headers,
+            None,
         )
         .await
     }
@@ -1177,13 +1272,14 @@ async fn execute_transaction(
     state: &AppState,
     ledger_id: &str,
     txn_type: TxnType,
-    body: &mut JsonValue,
+    mut body: JsonValue,
     credential: &MaybeCredential,
     author: Option<&str>,
     headers: &FlureeHeaders,
+    idempotency_key: Option<IdempotencyKey>,
 ) -> Result<Response> {
     // Inject header-based tracking options into body opts (header defaults, body overrides)
-    inject_headers_into_txn(body, headers);
+    inject_headers_into_txn(&mut body, headers);
 
     // Apply bearer identity + server-default policy-class to opts, honoring the
     // root-identity impersonation semantic (see routes::policy_auth). After this
@@ -1193,18 +1289,18 @@ async fn execute_transaction(
     crate::routes::policy_auth::apply_auth_identity_to_opts(
         state,
         ledger_id,
-        body,
+        &mut body,
         author,
         default_policy_class.as_deref(),
     )
     .await;
 
     // Extract tracking options from body (after header injection)
-    let tracking = tracking_options_from_body(body);
+    let tracking = tracking_options_from_body(&body);
 
     // Parse QueryConnectionOptions from the finalized body opts. These drive
     // PolicyContext construction below.
-    let qc_opts = fluree_db_api::QueryConnectionOptions::from_json(body).unwrap_or_default();
+    let qc_opts = fluree_db_api::QueryConnectionOptions::from_json(&body).unwrap_or_default();
 
     // Create execution span
     let span =
@@ -1213,7 +1309,7 @@ async fn execute_transaction(
         let span = tracing::Span::current();
 
         // Compute tx-id from request body (before any modification)
-        let tx_id = compute_tx_id(body);
+        let tx_id = compute_tx_id(&body);
 
         tracing::debug!(tx_id = %tx_id, "computed transaction ID");
 
@@ -1290,11 +1386,30 @@ async fn execute_transaction(
             commit_opts = commit_opts.with_raw_txn_spawned(content_store, raw_txn);
         }
 
+        // Consensus path: insert without tracking or policy goes through
+        // `state.consensus.submit()` so the submission is recorded for
+        // idempotent retry and status lookup. Tracked / policy-bearing
+        // requests stay on the direct builder path until the richer
+        // execution surface is migrated.
+        if matches!(txn_type, TxnType::Insert)
+            && tracking.is_none()
+            && policy_ctx.is_none()
+        {
+            let request = TransactionRequest {
+                idempotency_key,
+                txn_type,
+                txn_json: body,
+                txn_opts,
+                commit_opts,
+            };
+            return submit_via_consensus(state, ledger_id, request, tx_id).await;
+        }
+
         let builder = fluree.stage(&handle);
         let builder = match txn_type {
-            TxnType::Insert => builder.insert(body),
-            TxnType::Upsert => builder.upsert(body),
-            TxnType::Update => builder.update(body),
+            TxnType::Insert => builder.insert(&body),
+            TxnType::Upsert => builder.upsert(&body),
+            TxnType::Update => builder.update(&body),
         };
         let mut builder = builder.txn_opts(txn_opts).commit_opts(commit_opts);
         if let Some(config) = &state.index_config {

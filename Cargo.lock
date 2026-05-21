@@ -2898,6 +2898,7 @@ dependencies = [
  "fluree-db-api",
  "fluree-db-binary-index",
  "fluree-db-connection",
+ "fluree-db-consensus",
  "fluree-db-core",
  "fluree-db-credential",
  "fluree-db-nameservice",
