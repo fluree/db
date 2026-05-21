@@ -1354,6 +1354,21 @@ mem:fact-01kjte1yw4jyrqvnpq27mr2m9v a mem:Fact ;
     mem:branch "main" ;
     mem:createdAt "2026-03-03T18:06:09.284115+00:00"^^xsd:dateTime .
 
+mem:fact-01ks1m2nn2exrjt7tjkmzgqtg2 a mem:Fact ;
+    mem:content "SUM/AVG aggregates use a shared `NumericAcc` in fluree-db-query/src/aggregate.rs that handles xsd:integer/decimal/double + BigInt with W3C type promotion (Integer→Decimal→Double, sticky upward). Inputs flow through `binding_to_numeric` (Lit + inline-encoded NUM_INT/NUM_F64) or `extract_numeric_with_gv` in group_aggregate.rs (also decodes NUM_BIG via BinaryGraphView). AVG of integer/decimal inputs yields xsd:decimal (W3C op:numeric-divide), with division precision capped at AVG_DECIMAL_PRECISION=34 (decimal128) to bound output. Both streaming (group_aggregate.rs AggState::Sum/Avg) and non-streaming (aggregate.rs agg_sum/agg_avg) paths share the accumulator." ;
+    mem:tag "aggregate" ;
+    mem:tag "avg" ;
+    mem:tag "decimal" ;
+    mem:tag "numeric-promotion" ;
+    mem:tag "sparql" ;
+    mem:tag "sum" ;
+    mem:scope mem:repo ;
+    mem:artifactRef "fluree-db-query/src/aggregate.rs" ;
+    mem:artifactRef "fluree-db-query/src/group_aggregate.rs" ;
+    mem:branch "main" ;
+    mem:createdAt "2026-05-20T02:40:16.034976+00:00"^^xsd:dateTime ;
+    mem:rationale "Pre-fix the extractors only handled Long/Double/Boolean and silently dropped FlakeValue::Decimal, causing SUM(decimal)=0 and AVG(decimal)=Unbound. The shared NumericAcc keeps the streaming and non-streaming paths in sync and prevents future drift between them." .
+
 mem:constraint-01kp8yczz09ndt54ztchbheeyb a mem:Constraint ;
     mem:content "JSON-LD transaction parsing does NOT auto-promote bare string values to IRI references. User data becomes an IRI only when wrapped in `{\"@id\": \"...\"}` or when the property has `@type: \"@id\"` in `@context`. The former `looks_like_iri` heuristic (three sites in parse/jsonld.rs) was removed — it silently promoted strings starting with `http://`/`https://`/`did:`/`fluree:`/`urn:` to IRIs, which violated the JSON-LD spec (especially for `{\"@value\": \"...\"}`, explicitly a literal)." ;
     mem:tag "iri" ;

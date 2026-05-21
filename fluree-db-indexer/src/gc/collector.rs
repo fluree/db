@@ -19,6 +19,7 @@ use crate::error::Result;
 use fluree_db_binary_index::IndexRoot;
 use fluree_db_core::storage::ContentStore;
 use fluree_db_core::ContentId;
+use std::path::Path;
 
 /// Entry in the prev-index chain.
 pub(crate) struct IndexChainEntry {
@@ -88,9 +89,23 @@ pub async fn clean_garbage(
         .unwrap_or(DEFAULT_MIN_TIME_GARBAGE_MINS);
     let min_age_ms = min_age_mins as i64 * 60 * 1000;
     let now_ms = current_timestamp_ms();
+    let started = std::time::Instant::now();
 
     // 1. Walk prev_index chain to collect all index versions (tolerant of missing roots)
-    let index_chain = walk_prev_index_chain_cs(store, current_root_id).await?;
+    let index_chain = walk_prev_index_chain_cs_cached(
+        store,
+        current_root_id,
+        config.artifact_cache_dir.as_deref(),
+    )
+    .await?;
+    tracing::debug!(
+        root_id = %current_root_id,
+        chain_len = index_chain.len(),
+        max_old_indexes,
+        min_age_mins,
+        elapsed_ms = started.elapsed().as_millis() as u64,
+        "GC prev-index chain walk complete"
+    );
 
     // Retention: keep current + max_old_indexes
     // With max_old_indexes=5, keep_count=6 (indices 0..5)
@@ -141,27 +156,30 @@ pub async fn clean_garbage(
         };
 
         // Load the garbage record by CID
-        let record = match store.get(garbage_id).await {
-            Ok(bytes) => match parse_garbage_record(&bytes) {
-                Ok(r) => r,
+        let record =
+            match get_cached_or_remote(store, garbage_id, config.artifact_cache_dir.as_deref())
+                .await
+            {
+                Ok(bytes) => match parse_garbage_record(&bytes) {
+                    Ok(r) => r,
+                    Err(e) => {
+                        tracing::debug!(
+                            t = manifest_entry.t,
+                            error = %e,
+                            "Failed to parse garbage record, stopping GC"
+                        );
+                        break;
+                    }
+                },
                 Err(e) => {
                     tracing::debug!(
                         t = manifest_entry.t,
                         error = %e,
-                        "Failed to parse garbage record, stopping GC"
+                        "Failed to load garbage record (may already be released), stopping GC"
                     );
                     break;
                 }
-            },
-            Err(e) => {
-                tracing::debug!(
-                    t = manifest_entry.t,
-                    error = %e,
-                    "Failed to load garbage record (may already be released), stopping GC"
-                );
-                break;
-            }
-        };
+            };
 
         // Check age: if created_at_ms is 0 (old format) or too recent, stop.
         // Newer manifests will be even more recent, so break is correct.
@@ -176,6 +194,13 @@ pub async fn clean_garbage(
         }
 
         // Release the garbage nodes (CID strings parsed back to ContentId).
+        let release_started = std::time::Instant::now();
+        tracing::debug!(
+            t = manifest_entry.t,
+            garbage_id = %garbage_id,
+            items = record.garbage.len(),
+            "GC releasing garbage record items"
+        );
         for item in &record.garbage {
             match item.parse::<ContentId>() {
                 Ok(cid) => {
@@ -198,6 +223,13 @@ pub async fn clean_garbage(
                 }
             }
         }
+        tracing::debug!(
+            t = manifest_entry.t,
+            garbage_id = %garbage_id,
+            deleted_count,
+            elapsed_ms = release_started.elapsed().as_millis() as u64,
+            "GC garbage record item release pass complete"
+        );
 
         // Release entry_to_delete's own garbage manifest
         if let Some(ref old_garbage_id) = entry_to_delete.garbage_id {
@@ -248,15 +280,41 @@ pub(crate) async fn walk_prev_index_chain_cs(
     store: &dyn ContentStore,
     current_root_id: &ContentId,
 ) -> Result<Vec<IndexChainEntry>> {
+    walk_prev_index_chain_cs_cached(store, current_root_id, None).await
+}
+
+async fn get_cached_or_remote(
+    store: &dyn ContentStore,
+    id: &ContentId,
+    cache_dir: Option<&Path>,
+) -> Result<Vec<u8>> {
+    match cache_dir {
+        Some(cache_dir) => Ok(
+            fluree_db_binary_index::read::artifact_cache::fetch_cached_bytes_cid(
+                store, id, cache_dir,
+            )
+            .await
+            .map_err(|e| crate::error::IndexerError::StorageRead(e.to_string()))?,
+        ),
+        None => Ok(store.get(id).await?),
+    }
+}
+
+pub(crate) async fn walk_prev_index_chain_cs_cached(
+    store: &dyn ContentStore,
+    current_root_id: &ContentId,
+    cache_dir: Option<&Path>,
+) -> Result<Vec<IndexChainEntry>> {
     let mut chain = Vec::new();
     let mut current_id = current_root_id.clone();
 
     loop {
-        let bytes = match store.get(&current_id).await {
+        let read_started = std::time::Instant::now();
+        let bytes = match get_cached_or_remote(store, &current_id, cache_dir).await {
             Ok(b) => b,
             Err(e) => {
                 if chain.is_empty() {
-                    return Err(e.into());
+                    return Err(e);
                 }
                 tracing::debug!(
                     root_id = %current_id,
@@ -265,6 +323,13 @@ pub(crate) async fn walk_prev_index_chain_cs(
                 break;
             }
         };
+        tracing::trace!(
+            root_id = %current_id,
+            bytes = bytes.len(),
+            elapsed_ms = read_started.elapsed().as_millis() as u64,
+            from_cache_enabled = cache_dir.is_some(),
+            "GC loaded prev-index root"
+        );
 
         let (t, prev_index_id, garbage_id, root) = parse_chain_fields(&bytes)?;
 
@@ -415,6 +480,7 @@ mod tests {
         let config = CleanGarbageConfig {
             max_old_indexes: Some(5),
             min_time_garbage_mins: Some(0),
+            ..Default::default()
         };
         let result = clean_garbage(&store, &root_cid, config).await.unwrap();
         assert_eq!(result.indexes_cleaned, 0);
@@ -558,6 +624,7 @@ mod tests {
         let config = CleanGarbageConfig {
             max_old_indexes: Some(1),
             min_time_garbage_mins: Some(30),
+            ..Default::default()
         };
 
         let store = test_store(&storage);
@@ -627,6 +694,7 @@ mod tests {
         let config = CleanGarbageConfig {
             max_old_indexes: Some(1),
             min_time_garbage_mins: Some(30),
+            ..Default::default()
         };
 
         let store = test_store(&storage);
@@ -690,6 +758,7 @@ mod tests {
         let config = CleanGarbageConfig {
             max_old_indexes: Some(1),
             min_time_garbage_mins: Some(30),
+            ..Default::default()
         };
 
         let store = test_store(&storage);
@@ -802,6 +871,7 @@ mod tests {
         let config = CleanGarbageConfig {
             max_old_indexes: Some(1),
             min_time_garbage_mins: Some(30),
+            ..Default::default()
         };
 
         let store = test_store(&storage);
@@ -938,6 +1008,7 @@ mod tests {
         let config = CleanGarbageConfig {
             max_old_indexes: Some(0),
             min_time_garbage_mins: Some(30),
+            ..Default::default()
         };
         let result = clean_garbage(&store, &new_root_cid, config).await.unwrap();
 

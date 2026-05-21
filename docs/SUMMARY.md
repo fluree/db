@@ -177,6 +177,7 @@
   - [Configuration](operations/configuration.md)
   - [Running with Docker](operations/docker.md)
   - [Storage modes (memory/file/AWS/IPFS)](operations/storage.md)
+  - [Serverless storage choices](operations/serverless-storage.md)
   - [IPFS storage](operations/ipfs-storage.md)
   - [DynamoDB nameservice](operations/dynamodb-guide.md)
   - [Query peers and replication](operations/query-peers.md)
