@@ -640,7 +640,7 @@ async fn update_local(
             &credential,
             author.as_deref(),
             &headers,
-            None,
+            extract_idempotency_key(&credential.headers),
         )
         .await
     }
@@ -787,7 +787,7 @@ async fn update_ledger_local(
             &credential,
             author.as_deref(),
             &headers,
-            None,
+            extract_idempotency_key(&credential.headers),
         )
         .await
     }
@@ -1079,7 +1079,7 @@ async fn upsert_local(
             &credential,
             author.as_deref(),
             &headers,
-            None,
+            extract_idempotency_key(&credential.headers),
         )
         .await
     }
@@ -1373,7 +1373,7 @@ async fn upsert_ledger_local(
             &credential,
             author.as_deref(),
             &headers,
-            None,
+            extract_idempotency_key(&credential.headers),
         )
         .await
     }
@@ -1422,15 +1422,13 @@ async fn execute_transaction(
         let txn_opts = TxnOpts::default();
         let commit_opts = build_commit_opts(did.as_deref(), credential, &state.fluree, &handle);
 
-        // Consensus path: insert without tracking or policy goes through
-        // `state.consensus.submit()` so the submission is recorded for
-        // idempotent retry and status lookup. Tracked / policy-bearing
-        // requests stay on the direct builder path until the richer
-        // execution surface is migrated.
-        if matches!(txn_type, TxnType::Insert)
-            && prepared_transaction.tracking.is_none()
-            && policy_ctx.is_none()
-        {
+        // Consensus path: any JSON-LD transaction without tracking or policy
+        // goes through `state.consensus.submit()` so the submission is
+        // recorded for idempotent retry and status lookup. Tracked /
+        // policy-bearing requests stay on the direct builder path, which
+        // exposes the tracking tally and policy enforcement the consensus
+        // submission surface does not yet carry.
+        if prepared_transaction.tracking.is_none() && policy_ctx.is_none() {
             let request = TransactionRequest {
                 idempotency_key,
                 txn_type,
