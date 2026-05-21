@@ -1,6 +1,6 @@
 [package]
 name = "testsuite-sparql"
-version = "4.0.3"
+version = "4.0.4"
 edition = "2021"
 publish = false
 
