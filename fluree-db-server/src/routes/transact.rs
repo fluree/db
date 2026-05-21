@@ -34,7 +34,8 @@ use axum::response::{IntoResponse, Response};
 use axum::Json;
 use fluree_db_api::{
     lower_sparql_update, parse_sparql, with_index_request_correlation, ApiError, CommitOpts,
-    IndexRequestCorrelation, NamespaceRegistry, SparqlQueryBody, TrackingOptions, TxnOpts, TxnType,
+    Fluree, IndexRequestCorrelation, LedgerHandle, NamespaceRegistry, PolicyContext,
+    QueryConnectionOptions, SparqlQueryBody, TrackingOptions, TxnOpts, TxnType,
 };
 use fluree_db_consensus::{
     IdempotencyKey, SubmissionError, Submitter, TransactionRequest,
@@ -128,6 +129,123 @@ fn build_consensus_response(
         }
     }
     response_json.into_response()
+}
+
+/// The mutated body plus options extracted from it.
+///
+/// Returned by [`prepare_transaction_body`] and consumed downstream by both
+/// the consensus and direct-builder paths.
+struct PreparedTransaction {
+    body: JsonValue,
+    tracking: Option<TrackingOptions>,
+    qc_opts: QueryConnectionOptions,
+}
+
+/// Phase 1 of [`execute_transaction`]: prepare the JSON-LD request body.
+///
+/// Injects header-derived options, applies bearer-identity / policy-class
+/// defaults to the body's opts (which the rest of the pipeline reads),
+/// then extracts the tracking and policy options from the finalized body.
+async fn prepare_transaction_body(
+    state: &AppState,
+    ledger_id: &str,
+    mut body: JsonValue,
+    headers: &FlureeHeaders,
+    author: Option<&str>,
+) -> PreparedTransaction {
+    inject_headers_into_txn(&mut body, headers);
+
+    let default_policy_class = state.config.data_auth().default_policy_class.clone();
+    crate::routes::policy_auth::apply_auth_identity_to_opts(
+        state,
+        ledger_id,
+        &mut body,
+        author,
+        default_policy_class.as_deref(),
+    )
+    .await;
+
+    let tracking = tracking_options_from_body(&body);
+    let qc_opts = QueryConnectionOptions::from_json(&body).unwrap_or_default();
+
+    PreparedTransaction {
+        body,
+        tracking,
+        qc_opts,
+    }
+}
+
+/// Build a [`PolicyContext`] from the prepared opts when any policy inputs
+/// are present.
+///
+/// Returns `Ok(None)` for requests that should run under root (no policy
+/// inputs in the finalized opts). Failures from the underlying API are
+/// surfaced as `error:PolicyBuildFailed` on the current span before being
+/// converted to a [`ServerError`].
+async fn build_policy_context(
+    handle: &LedgerHandle,
+    qc_opts: &QueryConnectionOptions,
+) -> Result<Option<PolicyContext>> {
+    if !qc_opts.has_any_policy_inputs() {
+        return Ok(None);
+    }
+
+    let snap = handle.snapshot().await;
+    match fluree_db_api::build_policy_context(
+        &snap.snapshot,
+        snap.novelty.as_ref(),
+        Some(snap.novelty.as_ref()),
+        snap.t,
+        qc_opts,
+    )
+    .await
+    {
+        Ok(ctx) => Ok(Some(ctx)),
+        Err(e) => {
+            let server_error = ServerError::Api(e);
+            set_span_error_code(&tracing::Span::current(), "error:PolicyBuildFailed");
+            tracing::error!(error = %server_error, "failed to build policy context");
+            Err(server_error)
+        }
+    }
+}
+
+/// Resolve the effective identity for a transaction.
+///
+/// Prefers the (possibly-impersonated) `opts.identity` so the commit records
+/// who the transaction was executed AS; falls back to the bearer-derived
+/// author. The original bearer identity that authorized the request is
+/// captured separately in the impersonation audit log emitted by
+/// `apply_auth_identity_to_opts` — commits stay attributable to the policy
+/// subject responsible for the data change, while the audit trail captures
+/// the operator who performed the action.
+fn effective_did(qc_opts: &QueryConnectionOptions, author: Option<&str>) -> Option<String> {
+    qc_opts
+        .identity
+        .clone()
+        .or_else(|| author.map(String::from))
+}
+
+/// Build the [`CommitOpts`] for the transaction.
+///
+/// Encodes the effective identity (so the commit records its author) and,
+/// for signed requests, spawns the raw-envelope upload in parallel so it
+/// overlaps with the rest of the pipeline.
+fn build_commit_opts(
+    did: Option<&str>,
+    credential: &MaybeCredential,
+    fluree: &Fluree,
+    handle: &LedgerHandle,
+) -> CommitOpts {
+    let mut commit_opts = match did {
+        Some(d) => CommitOpts::default().identity(d.to_string()),
+        None => CommitOpts::default(),
+    };
+    if let Some(raw_txn) = raw_txn_from_credential(credential) {
+        let content_store = fluree.content_store(handle.ledger_id());
+        commit_opts = commit_opts.with_raw_txn_spawned(content_store, raw_txn);
+    }
+    commit_opts
 }
 
 /// Submit a prepared transaction through monolithic consensus.
@@ -1272,49 +1390,23 @@ async fn execute_transaction(
     state: &AppState,
     ledger_id: &str,
     txn_type: TxnType,
-    mut body: JsonValue,
+    body: JsonValue,
     credential: &MaybeCredential,
     author: Option<&str>,
     headers: &FlureeHeaders,
     idempotency_key: Option<IdempotencyKey>,
 ) -> Result<Response> {
-    // Inject header-based tracking options into body opts (header defaults, body overrides)
-    inject_headers_into_txn(&mut body, headers);
+    let prepared_transaction =
+        prepare_transaction_body(state, ledger_id, body, headers, author).await;
 
-    // Apply bearer identity + server-default policy-class to opts, honoring the
-    // root-identity impersonation semantic (see routes::policy_auth). After this
-    // call, body.opts.identity / policy-class reflect the effective identity
-    // used for policy enforcement.
-    let default_policy_class = state.config.data_auth().default_policy_class.clone();
-    crate::routes::policy_auth::apply_auth_identity_to_opts(
-        state,
-        ledger_id,
-        &mut body,
-        author,
-        default_policy_class.as_deref(),
-    )
-    .await;
-
-    // Extract tracking options from body (after header injection)
-    let tracking = tracking_options_from_body(&body);
-
-    // Parse QueryConnectionOptions from the finalized body opts. These drive
-    // PolicyContext construction below.
-    let qc_opts = fluree_db_api::QueryConnectionOptions::from_json(&body).unwrap_or_default();
-
-    // Create execution span
     let span =
         tracing::debug_span!("transact_execute", ledger_id = ledger_id, txn_type = ?txn_type);
     async move {
         let span = tracing::Span::current();
 
-        // Compute tx-id from request body (before any modification)
-        let tx_id = compute_tx_id(&body);
-
+        let tx_id = compute_tx_id(&prepared_transaction.body);
         tracing::debug!(tx_id = %tx_id, "computed transaction ID");
 
-        // Get cached ledger handle (loads if not cached)
-        // Transaction execution is only in transaction mode (peers forward)
         let handle = match state.fluree.ledger_cached(ledger_id).await {
             Ok(handle) => handle,
             Err(e) => {
@@ -1325,66 +1417,10 @@ async fn execute_transaction(
             }
         };
 
-        // Build a PolicyContext from the finalized opts if any policy inputs
-        // are present. This covers:
-        //   - unsigned bearer requests (identity now forced into opts)
-        //   - impersonation requests (opts.identity from body/header)
-        //   - explicit opts.policy / opts.policy-class on any request
-        // Requests with no policy inputs still run under root (today's behavior).
-        let policy_ctx = if qc_opts.has_any_policy_inputs() {
-            let snap = handle.snapshot().await;
-            match fluree_db_api::build_policy_context(
-                &snap.snapshot,
-                snap.novelty.as_ref(),
-                Some(snap.novelty.as_ref()),
-                snap.t,
-                &qc_opts,
-            )
-            .await
-            {
-                Ok(ctx) => Some(ctx),
-                Err(e) => {
-                    let server_error = ServerError::Api(e);
-                    set_span_error_code(&span, "error:PolicyBuildFailed");
-                    tracing::error!(error = %server_error, "failed to build policy context");
-                    return Err(server_error);
-                }
-            }
-        } else {
-            None
-        };
-
-        // Effective author: prefer the (possibly-impersonated) opts.identity
-        // so the commit records who the transaction was executed AS. The
-        // original bearer identity that authorized the request is captured in
-        // the `policy impersonation: bearer=... target=... ledger=...` audit
-        // log emitted by `apply_auth_identity_to_opts`. The two-source design
-        // is deliberate: commits should remain attributable to the policy
-        // subject responsible for the data change, while the audit trail
-        // captures the operator who performed the action.
-        let did = qc_opts
-            .identity
-            .clone()
-            .or_else(|| author.map(String::from));
-
-        // TxnOpts: unchanged by identity; commit provenance flows through CommitOpts.
+        let policy_ctx = build_policy_context(&handle, &prepared_transaction.qc_opts).await?;
+        let did = effective_did(&prepared_transaction.qc_opts, author);
         let txn_opts = TxnOpts::default();
-
-        // Build and execute the transaction via the builder API.
-        // Hoisted above CommitOpts assembly so we can spawn the raw-txn upload
-        // in parallel with the rest of the pipeline when the request is signed.
-        let fluree = &state.fluree;
-
-        // If the request was signed, ALWAYS store the original signed envelope for provenance.
-        // (No opt-in needed; this is the primary reason to store txn payloads.)
-        let mut commit_opts = match &did {
-            Some(d) => CommitOpts::default().identity(d.clone()),
-            None => CommitOpts::default(),
-        };
-        if let Some(raw_txn) = raw_txn_from_credential(credential) {
-            let content_store = fluree.content_store(handle.ledger_id());
-            commit_opts = commit_opts.with_raw_txn_spawned(content_store, raw_txn);
-        }
+        let commit_opts = build_commit_opts(did.as_deref(), credential, &state.fluree, &handle);
 
         // Consensus path: insert without tracking or policy goes through
         // `state.consensus.submit()` so the submission is recorded for
@@ -1392,30 +1428,30 @@ async fn execute_transaction(
         // requests stay on the direct builder path until the richer
         // execution surface is migrated.
         if matches!(txn_type, TxnType::Insert)
-            && tracking.is_none()
+            && prepared_transaction.tracking.is_none()
             && policy_ctx.is_none()
         {
             let request = TransactionRequest {
                 idempotency_key,
                 txn_type,
-                txn_json: body,
+                txn_json: prepared_transaction.body,
                 txn_opts,
                 commit_opts,
             };
             return submit_via_consensus(state, ledger_id, request, tx_id).await;
         }
 
-        let builder = fluree.stage(&handle);
+        let builder = state.fluree.stage(&handle);
         let builder = match txn_type {
-            TxnType::Insert => builder.insert(&body),
-            TxnType::Upsert => builder.upsert(&body),
-            TxnType::Update => builder.update(&body),
+            TxnType::Insert => builder.insert(&prepared_transaction.body),
+            TxnType::Upsert => builder.upsert(&prepared_transaction.body),
+            TxnType::Update => builder.update(&prepared_transaction.body),
         };
         let mut builder = builder.txn_opts(txn_opts).commit_opts(commit_opts);
         if let Some(config) = &state.index_config {
             builder = builder.index_config(config.clone());
         }
-        if let Some(opts) = tracking {
+        if let Some(opts) = prepared_transaction.tracking {
             builder = builder.tracking(opts);
         }
         if let Some(ctx) = policy_ctx {
