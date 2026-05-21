@@ -193,3 +193,161 @@ impl SubmissionLookup for MonolithicConsensus {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use fluree_db_api::FlureeBuilder;
+    use fluree_db_transact::{CommitOpts, TxnOpts, TxnType};
+    use serde_json::{json, Value as JsonValue};
+
+    /// Build a Fluree + `MonolithicConsensus` + initialized ledger.
+    ///
+    /// Each test gets its own in-memory Fluree, so tests don't share state
+    /// and the same `ledger_id` is safe to reuse across tests.
+    async fn setup() -> (Arc<fluree_db_api::Fluree>, MonolithicConsensus, String) {
+        let fluree = Arc::new(FlureeBuilder::memory().build_memory());
+        let ledger_id = "test/consensus:main".to_string();
+        fluree
+            .create_ledger(&ledger_id)
+            .await
+            .expect("create ledger");
+        let index_config = fluree_db_ledger::IndexConfig {
+            reindex_min_bytes: 1024 * 1024,
+            reindex_max_bytes: 1024 * 1024 * 100,
+        };
+        let consensus = MonolithicConsensus::new(Arc::clone(&fluree), index_config);
+        (fluree, consensus, ledger_id)
+    }
+
+    fn sample_insert(name: &str) -> JsonValue {
+        json!({
+            "@context": {"ex": "http://example.org/"},
+            "@graph": [{
+                "@id": format!("ex:{name}"),
+                "ex:name": name
+            }]
+        })
+    }
+
+    fn request(key: Option<&str>, body: JsonValue) -> TransactionRequest {
+        TransactionRequest {
+            idempotency_key: key.map(IdempotencyKey::new),
+            txn_type: TxnType::Insert,
+            txn_json: body,
+            txn_opts: TxnOpts::default(),
+            commit_opts: CommitOpts::default(),
+        }
+    }
+
+    #[tokio::test]
+    async fn anonymous_submission_returns_receipt() {
+        let (_fluree, consensus, ledger_id) = setup().await;
+
+        let receipt = consensus
+            .submit(&ledger_id, request(None, sample_insert("alice")))
+            .await
+            .expect("submission to succeed");
+
+        assert!(receipt.idempotency_key.is_none());
+        assert!(receipt.commit.flake_count > 0);
+    }
+
+    #[tokio::test]
+    async fn keyed_submission_is_visible_via_status_lookup() {
+        let (_fluree, consensus, ledger_id) = setup().await;
+        let key = IdempotencyKey::new("01J5XAMPLE001");
+
+        let receipt = consensus
+            .submit(
+                &ledger_id,
+                request(Some(key.as_str()), sample_insert("alice")),
+            )
+            .await
+            .expect("submission to succeed");
+        assert_eq!(receipt.idempotency_key.as_ref(), Some(&key));
+
+        match consensus.status(&ledger_id, &key).await {
+            SubmissionState::Committed(stored) => {
+                assert_eq!(stored.commit.t, receipt.commit.t);
+                assert_eq!(stored.commit.commit_id, receipt.commit.commit_id);
+            }
+            other => panic!("expected Committed, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn status_returns_unknown_for_unseen_key() {
+        let (_fluree, consensus, ledger_id) = setup().await;
+        let key = IdempotencyKey::new("01J5UNKNOWN");
+
+        assert!(matches!(
+            consensus.status(&ledger_id, &key).await,
+            SubmissionState::Unknown
+        ));
+    }
+
+    #[tokio::test]
+    async fn idempotent_retry_returns_cached_receipt() {
+        let (_fluree, consensus, ledger_id) = setup().await;
+        let key = IdempotencyKey::new("01J5RETRY001");
+        let body = sample_insert("alice");
+
+        let first = consensus
+            .submit(&ledger_id, request(Some(key.as_str()), body.clone()))
+            .await
+            .expect("first submission to succeed");
+
+        let second = consensus
+            .submit(&ledger_id, request(Some(key.as_str()), body))
+            .await
+            .expect("retry with same body should return cached receipt");
+
+        // Same receipt — the second call should NOT have re-executed.
+        // If it had, the new transaction would advance `t` past the first.
+        assert_eq!(first.commit.t, second.commit.t);
+        assert_eq!(first.commit.commit_id, second.commit.commit_id);
+    }
+
+    #[tokio::test]
+    async fn key_collision_with_different_body_errors() {
+        let (_fluree, consensus, ledger_id) = setup().await;
+        let key = IdempotencyKey::new("01J5COLLIDE001");
+
+        consensus
+            .submit(
+                &ledger_id,
+                request(Some(key.as_str()), sample_insert("alice")),
+            )
+            .await
+            .expect("first submission to succeed");
+
+        let err = consensus
+            .submit(&ledger_id, request(Some(key.as_str()), sample_insert("bob")))
+            .await
+            .expect_err("second submission with different body should fail");
+
+        assert!(
+            matches!(err, SubmissionError::KeyCollision),
+            "expected KeyCollision, got {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn anonymous_submissions_do_not_populate_cache() {
+        let (_fluree, consensus, ledger_id) = setup().await;
+
+        consensus
+            .submit(&ledger_id, request(None, sample_insert("alice")))
+            .await
+            .expect("anonymous submission");
+
+        // A fresh keyed submission with any body should succeed — no anonymous
+        // entry should sit in the cache to clash with it.
+        let key = IdempotencyKey::new("01J5FRESH001");
+        consensus
+            .submit(&ledger_id, request(Some(key.as_str()), sample_insert("bob")))
+            .await
+            .expect("fresh keyed submission should succeed after anonymous");
+    }
+}
