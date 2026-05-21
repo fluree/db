@@ -10,13 +10,45 @@ use crate::{
     TransactionReceipt, TransactionRequest,
 };
 use async_trait::async_trait;
-use fluree_db_api::{Fluree, LedgerManager};
+use fluree_db_api::{Fluree, LedgerHandle, LedgerManager, PolicyContext, QueryConnectionOptions};
 use fluree_db_ledger::IndexConfig;
 use fluree_db_transact::TxnType;
 use moka::future::Cache;
+use serde_json::Value as JsonValue;
 use sha2::{Digest, Sha256};
 use std::sync::Arc;
 use std::time::Duration;
+
+/// Build a [`PolicyContext`] from the ledger state when the transaction body
+/// carries policy inputs (identity / policy class in its `opts`).
+///
+/// Returns `Ok(None)` when there are no policy inputs — the transaction runs
+/// under root. The context is built from a snapshot of the ledger this node
+/// is about to stage against, so policy enforcement reflects the same state
+/// the transaction commits onto. Building it here, rather than having the
+/// caller pre-build and pass it, keeps the policy context bound to the
+/// executing node's state — the shape a replicated implementation needs.
+async fn build_policy_context(
+    ledger_handle: &LedgerHandle,
+    txn_json: &JsonValue,
+) -> Result<Option<PolicyContext>, SubmissionError> {
+    let qc_opts = QueryConnectionOptions::from_json(txn_json).unwrap_or_default();
+    if !qc_opts.has_any_policy_inputs() {
+        return Ok(None);
+    }
+
+    let snap = ledger_handle.snapshot().await;
+    fluree_db_api::build_policy_context(
+        &snap.snapshot,
+        snap.novelty.as_ref(),
+        Some(snap.novelty.as_ref()),
+        snap.t,
+        &qc_opts,
+    )
+    .await
+    .map(Some)
+    .map_err(|e| SubmissionError::Submission(format!("policy context: {e}")))
+}
 
 /// Default TTL for idempotency cache entries (1 hour).
 ///
@@ -105,6 +137,8 @@ impl MonolithicConsensus {
             .await
             .map_err(|e| SubmissionError::Submission(format!("ledger load: {e}")))?;
 
+        let policy_ctx = build_policy_context(&ledger_handle, &txn_json).await?;
+
         // The builder API holds the ledger write lock and replaces the cached
         // state internally for the duration of stage + commit — no manual
         // lock/clone/replace dance is needed here.
@@ -120,6 +154,9 @@ impl MonolithicConsensus {
             .index_config(self.index_config.clone());
         if let Some(tracking) = tracking {
             builder = builder.tracking(tracking);
+        }
+        if let Some(policy) = policy_ctx {
+            builder = builder.policy(policy);
         }
 
         let result = builder
@@ -210,8 +247,8 @@ impl SubmissionLookup for MonolithicConsensus {
 mod tests {
     use super::*;
     use fluree_db_api::FlureeBuilder;
-    use fluree_db_transact::{CommitOpts, TxnOpts, TxnType};
-    use serde_json::{json, Value as JsonValue};
+    use fluree_db_transact::{CommitOpts, TxnOpts};
+    use serde_json::json;
 
     /// Build a Fluree + `MonolithicConsensus` + initialized ledger.
     ///

@@ -34,8 +34,8 @@ use axum::response::{IntoResponse, Response};
 use axum::Json;
 use fluree_db_api::{
     lower_sparql_update, parse_sparql, with_index_request_correlation, ApiError, CommitOpts,
-    Fluree, IndexRequestCorrelation, LedgerHandle, NamespaceRegistry, PolicyContext,
-    QueryConnectionOptions, SparqlQueryBody, TrackingOptions, TxnOpts, TxnType,
+    Fluree, IndexRequestCorrelation, LedgerHandle, NamespaceRegistry, QueryConnectionOptions,
+    SparqlQueryBody, TrackingOptions, TxnOpts, TxnType,
 };
 use fluree_db_consensus::{
     IdempotencyKey, SubmissionError, Submitter, TransactionReceipt, TransactionRequest,
@@ -177,41 +177,6 @@ async fn prepare_transaction_body(
         body,
         tracking,
         qc_opts,
-    }
-}
-
-/// Build a [`PolicyContext`] from the prepared opts when any policy inputs
-/// are present.
-///
-/// Returns `Ok(None)` for requests that should run under root (no policy
-/// inputs in the finalized opts). Failures from the underlying API are
-/// surfaced as `error:PolicyBuildFailed` on the current span before being
-/// converted to a [`ServerError`].
-async fn build_policy_context(
-    handle: &LedgerHandle,
-    qc_opts: &QueryConnectionOptions,
-) -> Result<Option<PolicyContext>> {
-    if !qc_opts.has_any_policy_inputs() {
-        return Ok(None);
-    }
-
-    let snap = handle.snapshot().await;
-    match fluree_db_api::build_policy_context(
-        &snap.snapshot,
-        snap.novelty.as_ref(),
-        Some(snap.novelty.as_ref()),
-        snap.t,
-        qc_opts,
-    )
-    .await
-    {
-        Ok(ctx) => Ok(Some(ctx)),
-        Err(e) => {
-            let server_error = ServerError::Api(e);
-            set_span_error_code(&tracing::Span::current(), "error:PolicyBuildFailed");
-            tracing::error!(error = %server_error, "failed to build policy context");
-            Err(server_error)
-        }
     }
 }
 
@@ -1409,6 +1374,9 @@ async fn execute_transaction(
         let tx_id = compute_tx_id(&prepared_transaction.body);
         tracing::debug!(tx_id = %tx_id, "computed transaction ID");
 
+        // Resolve the ledger handle up front so a missing ledger surfaces as
+        // a 404 here, before submission. The handle is also the source of the
+        // canonical ledger ID used to scope the raw-txn content store.
         let handle = match state.fluree.ledger_cached(ledger_id).await {
             Ok(handle) => handle,
             Err(e) => {
@@ -1419,89 +1387,22 @@ async fn execute_transaction(
             }
         };
 
-        let policy_ctx = build_policy_context(&handle, &prepared_transaction.qc_opts).await?;
         let did = effective_did(&prepared_transaction.qc_opts, author);
-        let txn_opts = TxnOpts::default();
         let commit_opts = build_commit_opts(did.as_deref(), credential, &state.fluree, &handle);
 
-        // Consensus path: any JSON-LD transaction without policy enforcement
-        // goes through `state.consensus.submit()` so the submission is
-        // recorded for idempotent retry and status lookup. Policy-bearing
-        // requests stay on the direct builder path, which carries the policy
-        // enforcement the consensus submission surface does not yet expose.
-        if policy_ctx.is_none() {
-            let request = TransactionRequest {
-                idempotency_key,
-                txn_type,
-                txn_json: prepared_transaction.body,
-                txn_opts,
-                commit_opts,
-                tracking: prepared_transaction.tracking,
-            };
-            return submit_via_consensus(state, ledger_id, request, tx_id).await;
-        }
-
-        let builder = state.fluree.stage(&handle);
-        let builder = match txn_type {
-            TxnType::Insert => builder.insert(&prepared_transaction.body),
-            TxnType::Upsert => builder.upsert(&prepared_transaction.body),
-            TxnType::Update => builder.update(&prepared_transaction.body),
+        // Every JSON-LD transaction goes through consensus. Policy context,
+        // tracking, and execution are all handled by the submission layer;
+        // policy is built there from the ledger state the transaction
+        // actually stages against.
+        let request = TransactionRequest {
+            idempotency_key,
+            txn_type,
+            txn_json: prepared_transaction.body,
+            txn_opts: TxnOpts::default(),
+            commit_opts,
+            tracking: prepared_transaction.tracking,
         };
-        let mut builder = builder.txn_opts(txn_opts).commit_opts(commit_opts);
-        if let Some(config) = &state.index_config {
-            builder = builder.index_config(config.clone());
-        }
-        if let Some(opts) = prepared_transaction.tracking {
-            builder = builder.tracking(opts);
-        }
-        if let Some(ctx) = policy_ctx {
-            builder = builder.policy(ctx);
-        }
-
-        let correlation = index_request_correlation(
-            &credential.headers,
-            extract_request_id(&credential.headers, &state.telemetry_config),
-            match txn_type {
-                TxnType::Insert => "insert",
-                TxnType::Upsert => "upsert",
-                TxnType::Update => "update",
-            },
-        );
-        let result = match with_index_request_correlation(correlation, builder.execute()).await {
-            Ok(result) => {
-                tracing::info!(
-                    status = "success",
-                    commit_t = result.receipt.t,
-                    commit_id = %result.receipt.commit_id,
-                    "transaction committed"
-                );
-                result
-            }
-            Err(e) => {
-                let server_error = ServerError::Api(e);
-                set_span_error_code(&span, "error:InvalidTransaction");
-                tracing::error!(error = %server_error, "transaction failed");
-                return Err(server_error);
-            }
-        };
-
-        let response_json = Json(TransactResponse {
-            ledger_id: ledger_id.to_string(),
-            t: result.receipt.t,
-            tx_id,
-            commit: CommitInfo {
-                hash: result.receipt.commit_id.to_string(),
-            },
-        });
-
-        // Return tracking headers when a tally is present
-        match result.tally {
-            Some(tally) => {
-                let hdrs = tracking_headers(&tally);
-                Ok((hdrs, response_json).into_response())
-            }
-            None => Ok(response_json.into_response()),
-        }
+        submit_via_consensus(state, ledger_id, request, tx_id).await
     }
     .instrument(span)
     .await
