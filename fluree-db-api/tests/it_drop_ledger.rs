@@ -27,6 +27,7 @@ async fn drop_ledger_soft_mode_retracts_only() {
     let fluree = FlureeBuilder::file(&path).build().expect("build");
 
     let ledger_id = "drop-soft-test:main";
+    let ledger_name = "drop-soft-test";
     let db = LedgerSnapshot::genesis(ledger_id);
     let ledger = LedgerState::new(db, Novelty::new(0));
 
@@ -41,7 +42,7 @@ async fn drop_ledger_soft_mode_retracts_only() {
 
     // Soft drop - should only retract, not delete files
     let report = fluree
-        .drop_ledger(ledger_id, DropMode::Soft)
+        .drop_ledger(ledger_name, DropMode::Soft)
         .await
         .expect("drop");
     assert_eq!(report.status, DropStatus::Dropped);
@@ -82,6 +83,7 @@ async fn drop_ledger_hard_mode_deletes_files() {
     let fluree = FlureeBuilder::file(&path).build().expect("build");
 
     let ledger_id = "drop-hard-test:main";
+    let ledger_name = "drop-hard-test";
     let db = LedgerSnapshot::genesis(ledger_id);
     let ledger = LedgerState::new(db, Novelty::new(0));
 
@@ -112,7 +114,7 @@ async fn drop_ledger_hard_mode_deletes_files() {
 
     // Hard drop - should delete files and retract
     let report = fluree
-        .drop_ledger(ledger_id, DropMode::Hard)
+        .drop_ledger(ledger_name, DropMode::Hard)
         .await
         .expect("drop");
     assert_eq!(report.status, DropStatus::Dropped);
@@ -154,7 +156,7 @@ async fn drop_ledger_not_found() {
     let fluree = FlureeBuilder::file(&path).build().expect("build");
 
     let report = fluree
-        .drop_ledger("nonexistent:main", DropMode::Soft)
+        .drop_ledger("nonexistent", DropMode::Soft)
         .await
         .expect("drop");
     assert_eq!(report.status, DropStatus::NotFound);
@@ -169,6 +171,7 @@ async fn drop_ledger_idempotent() {
     let fluree = FlureeBuilder::file(&path).build().expect("build");
 
     let ledger_id = "drop-idem-test:main";
+    let ledger_name = "drop-idem-test";
     let db = LedgerSnapshot::genesis(ledger_id);
     let ledger = LedgerState::new(db, Novelty::new(0));
 
@@ -181,14 +184,14 @@ async fn drop_ledger_idempotent() {
 
     // First drop
     let r1 = fluree
-        .drop_ledger(ledger_id, DropMode::Soft)
+        .drop_ledger(ledger_name, DropMode::Soft)
         .await
         .expect("drop1");
     assert_eq!(r1.status, DropStatus::Dropped);
 
     // Second drop - should be idempotent
     let r2 = fluree
-        .drop_ledger(ledger_id, DropMode::Soft)
+        .drop_ledger(ledger_name, DropMode::Soft)
         .await
         .expect("drop2");
     assert_eq!(r2.status, DropStatus::AlreadyRetracted);
@@ -196,7 +199,7 @@ async fn drop_ledger_idempotent() {
 
 /// Test that drop normalizes alias (adds :main if missing).
 #[tokio::test]
-async fn drop_ledger_normalizes_alias() {
+async fn drop_ledger_accepts_bare_name_and_default_suffix() {
     let tmp = tempfile::TempDir::new().expect("tempdir");
     let path = tmp.path().to_string_lossy().to_string();
 
@@ -214,13 +217,172 @@ async fn drop_ledger_normalizes_alias() {
     });
     fluree.insert(ledger, &tx).await.expect("insert");
 
-    // Drop with short alias (should normalize to :main)
+    // Bare name is the canonical form; report.ledger_id is the ledger name.
     let report = fluree
         .drop_ledger("normalize-test", DropMode::Soft)
         .await
         .expect("drop");
     assert_eq!(report.status, DropStatus::Dropped);
-    assert_eq!(report.ledger_id, "normalize-test:main");
+    assert_eq!(report.ledger_id, "normalize-test");
+    assert!(
+        report.warnings.is_empty(),
+        "bare name should not warn: {:?}",
+        report.warnings
+    );
+    assert_eq!(report.branch_reports.len(), 1);
+    assert_eq!(report.branch_reports[0].ledger_id, "normalize-test:main");
+}
+
+/// `drop_ledger("name:main")` is rejected even though `:main` is the default
+/// branch — callers must pass the bare ledger name. The error names
+/// `drop_branch` so callers wanting a single-branch drop know where to go.
+#[tokio::test]
+async fn drop_ledger_rejects_main_suffix() {
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let path = tmp.path().to_string_lossy().to_string();
+
+    let fluree = FlureeBuilder::file(&path).build().expect("build");
+
+    let ledger_id = "suffix-test:main";
+    let db = LedgerSnapshot::genesis(ledger_id);
+    let ledger = LedgerState::new(db, Novelty::new(0));
+    let tx = json!({"@context": {"ex": "http://example.org/"}, "@id": "ex:x", "ex:n": 1});
+    fluree.insert(ledger, &tx).await.expect("insert");
+
+    let err = fluree
+        .drop_ledger("suffix-test:main", DropMode::Soft)
+        .await
+        .expect_err("drop_ledger with :main suffix should be rejected");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("branch suffix 'main'") && msg.contains("drop_branch"),
+        "expected suffix-rejection error mentioning drop_branch, got: {msg}"
+    );
+}
+
+/// `drop_ledger("name:non-default")` is rejected — callers must use
+/// `drop_branch` for branch-scoped drops.
+#[tokio::test]
+async fn drop_ledger_rejects_non_default_branch_suffix() {
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let path = tmp.path().to_string_lossy().to_string();
+    let fluree = FlureeBuilder::file(&path).build().expect("build");
+
+    let err = fluree
+        .drop_ledger("mydb:dev", DropMode::Soft)
+        .await
+        .expect_err("non-default branch suffix should be rejected");
+    let msg = format!("{err}");
+    assert!(msg.contains("drop_branch"), "msg={msg}");
+}
+
+/// Hard-drop of a multi-branch ledger: every branch is purged (including
+/// retracted ones), per-branch reports are returned in leaf-first order,
+/// and the cross-branch `@shared/dicts/` namespace is wiped at the end.
+#[tokio::test]
+async fn drop_ledger_hard_clears_every_branch_and_shared() {
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let path = tmp.path().to_string_lossy().to_string();
+    let fluree = FlureeBuilder::file(&path).build().expect("build");
+
+    // root (main) + two children
+    let main = fluree.create_ledger("multi-drop").await.unwrap();
+    let txn = json!({
+        "@context": {"ex": "http://example.org/ns/"},
+        "@graph": [{"@id": "ex:seed", "ex:val": 1}]
+    });
+    fluree.insert(main, &txn).await.unwrap();
+
+    fluree
+        .create_branch("multi-drop", "dev", None, None)
+        .await
+        .unwrap();
+    fluree
+        .create_branch("multi-drop", "feature-x", Some("dev"), None)
+        .await
+        .unwrap();
+
+    // Drop `dev` while `feature-x` still references it. Because `dev` has a
+    // live child, `drop_branch` retracts it (deferred=true) instead of
+    // purging — that's the "retracted-but-not-purged" state we want to
+    // exercise in the whole-ledger drop below.
+    let dev_drop = fluree.drop_branch("multi-drop", "dev").await.unwrap();
+    assert!(
+        dev_drop.deferred,
+        "dev should retract-as-deferred while feature-x lives"
+    );
+    let dev_record = fluree
+        .nameservice()
+        .lookup("multi-drop:dev")
+        .await
+        .unwrap()
+        .expect("dev record still present");
+    assert!(
+        dev_record.retracted,
+        "dev should be retracted before whole-ledger drop"
+    );
+
+    // Pre-condition: branches exist on disk
+    let admin = fluree.admin_storage().expect("managed backend");
+    let pre = admin
+        .list_prefix("fluree:file://multi-drop/")
+        .await
+        .expect("list pre");
+    assert!(
+        !pre.is_empty(),
+        "expected branch artifacts before drop, got: {pre:?}"
+    );
+
+    // Whole-ledger drop.
+    let report = fluree
+        .drop_ledger("multi-drop", DropMode::Hard)
+        .await
+        .expect("drop_ledger");
+    assert_eq!(report.status, DropStatus::Dropped);
+    assert_eq!(report.ledger_id, "multi-drop");
+    assert!(
+        report.branch_reports.len() >= 2,
+        "expected per-branch reports, got: {:?}",
+        report.branch_reports
+    );
+
+    // Leaf-first order: feature-x (which sourced from dev) must come before
+    // dev, and dev before main, in the report.
+    let order: Vec<&str> = report
+        .branch_reports
+        .iter()
+        .map(|r| r.ledger_id.as_str())
+        .collect();
+    let pos = |id: &str| order.iter().position(|s| *s == id);
+    if let (Some(fx), Some(dev), Some(m)) = (
+        pos("multi-drop:feature-x"),
+        pos("multi-drop:dev"),
+        pos("multi-drop:main"),
+    ) {
+        assert!(fx < dev, "feature-x before dev, got order: {order:?}");
+        assert!(dev < m, "dev before main, got order: {order:?}");
+    }
+
+    // Nameservice empty for this ledger name.
+    assert!(fluree
+        .nameservice()
+        .list_branches("multi-drop")
+        .await
+        .unwrap()
+        .is_empty());
+
+    // Storage cleared of all branches AND @shared/dicts/.
+    let post = admin
+        .list_prefix("fluree:file://multi-drop/")
+        .await
+        .expect("list post");
+    assert!(
+        post.is_empty(),
+        "expected no artifacts under multi-drop/ after hard drop, got: {post:?}"
+    );
+
+    // Alias is reusable.
+    let _new = fluree.create_ledger("multi-drop").await.expect("recreate");
 }
 
 /// Test that drop cancels pending indexing before deletion (the flake fix).
@@ -244,6 +406,7 @@ async fn drop_ledger_cancels_pending_indexing() {
     local
         .run_until(async move {
             let ledger_id = "drop-cancel-test:main";
+            let ledger_name = "drop-cancel-test";
             let db = LedgerSnapshot::genesis(ledger_id);
             let ledger = LedgerState::new(db, Novelty::new(0));
 
@@ -281,7 +444,7 @@ async fn drop_ledger_cancels_pending_indexing() {
             // This is the key test: drop should handle the race gracefully
             let report = timeout(
                 Duration::from_secs(30),
-                fluree.drop_ledger(ledger_id, DropMode::Hard),
+                fluree.drop_ledger(ledger_name, DropMode::Hard),
             )
             .await
             .expect("drop timed out")
@@ -330,6 +493,7 @@ async fn drop_ledger_hard_mode_deletes_even_when_retracted() {
     let fluree = FlureeBuilder::file(&path).build().expect("build");
 
     let ledger_id = "drop-hard-retracted:main";
+    let ledger_name = "drop-hard-retracted";
     let db = LedgerSnapshot::genesis(ledger_id);
     let ledger = LedgerState::new(db, Novelty::new(0));
 
@@ -342,7 +506,7 @@ async fn drop_ledger_hard_mode_deletes_even_when_retracted() {
 
     // First soft drop (retract only)
     let r1 = fluree
-        .drop_ledger(ledger_id, DropMode::Soft)
+        .drop_ledger(ledger_name, DropMode::Soft)
         .await
         .expect("soft drop");
     assert_eq!(r1.status, DropStatus::Dropped);
@@ -365,7 +529,7 @@ async fn drop_ledger_hard_mode_deletes_even_when_retracted() {
 
     // Second hard drop (should still delete files)
     let r2 = fluree
-        .drop_ledger(ledger_id, DropMode::Hard)
+        .drop_ledger(ledger_name, DropMode::Hard)
         .await
         .expect("hard drop");
     assert_eq!(r2.status, DropStatus::AlreadyRetracted);
@@ -399,6 +563,7 @@ async fn drop_ledger_disconnects_from_cache() {
     let fluree = FlureeBuilder::file(&path).build().expect("build");
 
     let ledger_id = "drop-cache-test:main";
+    let ledger_name = "drop-cache-test";
 
     // Create a ledger (publishes to nameservice)
     let ledger = fluree.create_ledger(ledger_id).await.expect("create");
@@ -419,7 +584,7 @@ async fn drop_ledger_disconnects_from_cache() {
 
     // Drop the ledger (should disconnect from cache)
     let report = fluree
-        .drop_ledger(ledger_id, DropMode::Soft)
+        .drop_ledger(ledger_name, DropMode::Soft)
         .await
         .expect("drop");
     assert_eq!(report.status, DropStatus::Dropped);

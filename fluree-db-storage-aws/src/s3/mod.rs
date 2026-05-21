@@ -383,10 +383,8 @@ impl StorageRead for S3Storage {
         let mut objects = Vec::new();
         let mut continuation_token = None;
 
-        let full_prefix = match &self.prefix {
-            Some(p) => format!("{}/{}", p.trim_end_matches('/'), prefix),
-            None => prefix.to_string(),
-        };
+        let full_prefix = build_list_prefix(prefix, self.prefix.as_deref())
+            .map_err(|e| CoreError::io(format!("Invalid list prefix: {e}")))?;
 
         loop {
             let mut request = self
@@ -516,11 +514,8 @@ impl StorageList for S3Storage {
         let mut addresses = Vec::new();
         let mut continuation_token = None;
 
-        // Build the full prefix including any configured prefix
-        let full_prefix = match &self.prefix {
-            Some(p) => format!("{}/{}", p.trim_end_matches('/'), prefix),
-            None => prefix.to_string(),
-        };
+        let full_prefix = build_list_prefix(prefix, self.prefix.as_deref())
+            .map_err(|e| StorageExtError::io(format!("Invalid list prefix: {e}")))?;
 
         loop {
             let mut request = self
@@ -559,11 +554,8 @@ impl StorageList for S3Storage {
         continuation_token: Option<String>,
         max_keys: usize,
     ) -> StorageExtResult<NsListResult> {
-        // Build the full prefix including any configured prefix
-        let full_prefix = match &self.prefix {
-            Some(p) => format!("{}/{}", p.trim_end_matches('/'), prefix),
-            None => prefix.to_string(),
-        };
+        let full_prefix = build_list_prefix(prefix, self.prefix.as_deref())
+            .map_err(|e| StorageExtError::io(format!("Invalid list prefix: {e}")))?;
 
         let mut request = self
             .client
@@ -741,6 +733,40 @@ impl StorageCas for S3Storage {
 /// Result of a list operation (re-export for convenience)
 pub type ListResult = NsListResult;
 
+/// Build the full S3 key prefix for a list operation.
+///
+/// Mirrors the address parsing used by reads/writes/deletes so callers can
+/// pass a fluree address (`fluree:s3://ledger/main/`) or a raw path
+/// (`ledger/main/`) and have the configured bucket prefix correctly prepended.
+/// An empty `prefix` lists everything under the bucket prefix (or the whole
+/// bucket if no prefix is configured).
+fn build_list_prefix(prefix: &str, bucket_prefix: Option<&str>) -> Result<String> {
+    let has_trailing_slash = prefix.ends_with('/');
+    let path = if prefix.is_empty() {
+        ""
+    } else {
+        address::parse_fluree_address(prefix)?
+    };
+
+    let with_trailing = if has_trailing_slash && !path.ends_with('/') && !path.is_empty() {
+        format!("{path}/")
+    } else {
+        path.to_string()
+    };
+
+    Ok(match bucket_prefix {
+        Some(bp) => {
+            let bp = bp.trim_end_matches('/');
+            if with_trailing.is_empty() {
+                format!("{bp}/")
+            } else {
+                format!("{bp}/{with_trailing}")
+            }
+        }
+        None => with_trailing,
+    })
+}
+
 // Error mapping helpers
 
 /// Map an SDK error to CoreError, properly handling 404 as NotFound
@@ -856,5 +882,59 @@ mod tests {
         assert!(config.prefix.is_none());
         assert!(config.endpoint.is_none());
         assert!(config.timeout_ms.is_none());
+    }
+
+    #[test]
+    fn test_build_list_prefix_strips_fluree_scheme() {
+        assert_eq!(
+            build_list_prefix("fluree:s3://ledger/main/", Some("fluree-data")).unwrap(),
+            "fluree-data/ledger/main/"
+        );
+    }
+
+    #[test]
+    fn test_build_list_prefix_no_bucket_prefix() {
+        assert_eq!(
+            build_list_prefix("fluree:s3://ledger/main/commit/", None).unwrap(),
+            "ledger/main/commit/"
+        );
+    }
+
+    #[test]
+    fn test_build_list_prefix_raw_path() {
+        // Callers that already stripped the scheme should still work.
+        assert_eq!(
+            build_list_prefix("ledger/main/commit/", Some("fluree-data")).unwrap(),
+            "fluree-data/ledger/main/commit/"
+        );
+    }
+
+    #[test]
+    fn test_build_list_prefix_preserves_trailing_slash() {
+        assert_eq!(
+            build_list_prefix("fluree:s3://ledger/main", Some("fluree-data")).unwrap(),
+            "fluree-data/ledger/main"
+        );
+        assert_eq!(
+            build_list_prefix("fluree:s3://ledger/main/", Some("fluree-data")).unwrap(),
+            "fluree-data/ledger/main/"
+        );
+    }
+
+    #[test]
+    fn test_build_list_prefix_empty_lists_bucket_root() {
+        assert_eq!(
+            build_list_prefix("", Some("fluree-data")).unwrap(),
+            "fluree-data/"
+        );
+        assert_eq!(build_list_prefix("", None).unwrap(), "");
+    }
+
+    #[test]
+    fn test_build_list_prefix_trims_bucket_prefix_trailing_slash() {
+        assert_eq!(
+            build_list_prefix("fluree:s3://ledger/main/", Some("fluree-data/")).unwrap(),
+            "fluree-data/ledger/main/"
+        );
     }
 }

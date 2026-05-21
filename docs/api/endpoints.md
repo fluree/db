@@ -382,6 +382,60 @@ Each flake is a tuple: `[subject, predicate, object, datatype, operation]`. Oper
 
 **Peer mode:** Forwards to the transactor.
 
+### GET /log/*ledger
+
+Return a paginated list of lightweight commit summaries (newest-first by `t`). Server-side equivalent of `fluree log`. Read-auth — does **not** require storage-replication permissions, unlike `/commits`.
+
+**URL:**
+
+```
+GET /log/<ledger...>?limit=<N>
+```
+
+**Query Parameters:**
+
+- `limit` (optional, default `100`): Number of summaries to return. Server clamps to a hard maximum (reference: `5000`).
+
+**Request Headers:**
+
+```http
+Authorization: Bearer <token>   (when data auth is enabled)
+```
+
+**Response Body (200 OK):**
+
+```json
+{
+  "ledger_id": "mydb:main",
+  "commits": [
+    {
+      "t": 12,
+      "commit_id": "bafy...",
+      "time": "2026-04-25T12:00:00Z",
+      "asserts": 3,
+      "retracts": 0,
+      "flake_count": 3,
+      "message": null
+    }
+  ],
+  "count": 12,
+  "truncated": false
+}
+```
+
+`commits` is strictly newest-first by `t` and capped by `limit`. `count` is the full chain length; `truncated == count > commits.len()`. `message` is extracted from `txn_meta` when an `f:message` entry with a string value is present, otherwise `null`. Each summary mirrors `fluree_db_core::CommitSummary`.
+
+**Branch-aware walk:** The walk loads commit envelopes via a branch-aware content store so it can cross fork points — pre-fork commits live under the source branch's namespace.
+
+**Responses:**
+
+- `200 OK`: Summaries returned (possibly empty array when the ledger has no commits)
+- `401 Unauthorized`: Bearer token required but missing
+- `404 Not Found`: Ledger does not exist; or the bearer cannot `can_read`
+- `5xx`: Storage / nameservice errors during walk
+
+**Peer mode:** Forwards to the transactor.
+
 ### GET /commits/*ledger
 
 Export commit blobs from a ledger using stable cursors. Pages walk backward via each commit's `parents` — O(limit) per page regardless of ledger size. Used by `fluree pull` and `fluree clone`.
@@ -1203,7 +1257,8 @@ curl -X POST http://localhost:8090/v1/fluree/create \
 
 ### POST /drop
 
-Drop (delete) a ledger.
+Drop a whole ledger (every branch under the supplied name) or, as a
+fallback, a graph source with the same name.
 
 **URL:**
 ```
@@ -1216,84 +1271,91 @@ POST /drop
 
 ```json
 {
-  "ledger": "mydb:main",
+  "ledger": "mydb",
   "hard": false
 }
 ```
 
 | Field | Type | Required | Description |
 |-------|------|----------|-------------|
-| `ledger` | string | Yes | Ledger ID (e.g., "mydb" or "mydb:main") |
-| `hard` | boolean | No | If `true`, permanently delete all storage files. Default: `false` (soft drop) |
+| `ledger` | string | Yes | Ledger name (e.g., `"mydb"`). Any branch-qualified form (including `"mydb:main"`) is **rejected** with a `400` — use the [`POST /drop-branch`](#post-drop-branch) endpoint (or call `drop_branch` in the Rust API) to drop a single branch. |
+| `hard` | boolean | No | If `true`, delete managed storage artifacts and purge the nameservice records. Default: `false` (soft drop). |
+
+**Scope:**
+
+`/drop` operates on the **whole ledger** — every branch under the ledger name, including any retracted-but-not-purged branches. Branches are dropped leaf-first so that if the operation aborts mid-way the surviving state stays consistent (orphan parents, never dangling children). The cross-branch `@shared/dicts/` namespace is cleaned up at the very end.
 
 **Drop Modes:**
 
-- **Soft drop** (`hard: false`, default): Retracts the ledger from the nameservice but preserves all data files. The ledger can potentially be recovered.
-- **Hard drop** (`hard: true`): Permanently deletes all commit and index files. **This is irreversible.**
+- **Soft drop** (`hard: false`, default): Marks every branch as retracted in the nameservice and preserves storage artifacts. Aliases remain reserved; normal create/load paths treat the ledger as unavailable.
+- **Hard drop** (`hard: true`): Deletes managed storage artifacts for every branch and purges the nameservice records so the name can be reused. **This is irreversible for deleted artifacts.**
+
+If no ledger is found by name, the server tries the same name as a graph source on branch `main`. Graph source hard-drop cleanup is best effort; graph-source fallback responses omit `branches_dropped` and `files_deleted`.
 
 **Response:**
 
 ```json
 {
-  "ledger": "mydb:main",
+  "ledger_id": "mydb",
   "status": "dropped",
-  "files_deleted": {
-    "commit": 15,
-    "index": 8
-  }
+  "files_deleted": 73,
+  "branches_dropped": ["mydb:feature-x", "mydb:dev", "mydb:main"]
 }
 ```
 
-| Field | Description |
-|-------|-------------|
-| `ledger` | Normalized ledger ID |
-| `status` | One of: `"dropped"`, `"already_retracted"`, `"not_found"` |
-| `files_deleted` | File counts (only populated for hard drop) |
+| Field | Type | Description |
+|-------|------|-------------|
+| `ledger_id` | string | Ledger name (or graph source ID if the graph-source fallback handled the request) |
+| `status` | string | Aggregate status across branches. One of: `"dropped"`, `"already_retracted"`, `"not_found"` |
+| `files_deleted` | integer | Number of managed storage artifacts deleted (sum across branches + `@shared/dicts/` cleanup); omitted when zero |
+| `branches_dropped` | string[] | Per-branch `ledger_id`s that were dropped, in leaf-first order; omitted when empty |
+| `warnings` | string[] | Non-fatal cleanup warnings; omitted when empty |
 
 **Status Codes:**
 - `200 OK` - Drop successful (or already dropped/not found)
-- `400 Bad Request` - Invalid request body
+- `400 Bad Request` - Invalid request body, or any branch-qualified ledger id was supplied
 - `401 Unauthorized` - Bearer token required (when admin auth enabled)
-- `500 Internal Server Error` - Server error
+- `500 Internal Server Error` - Branch enumeration failed, or another unrecoverable error
 
 **Drop Sequence:**
 
-1. Normalizes the ledger ID (ensures branch suffix like `:main`)
-2. Cancels any pending background indexing
-3. Waits for in-progress indexing to complete
-4. In hard mode: deletes all storage artifacts (commits + indexes)
-5. Retracts from nameservice
-6. Disconnects from ledger cache
+1. Parses input. `"mydb"` is the canonical form; any branch-qualified id (`"mydb:main"`, `"mydb:dev"`, …) returns a `400`.
+2. Enumerates every NsRecord under the ledger name (including retracted ones).
+3. Sorts branches leaf-first via the `source_branch` parent pointers.
+4. Cancels and waits for pending background indexing on each branch.
+5. For each branch (leaf-first): deletes managed storage artifacts (hard mode) and retracts (soft) or removes the NS record (hard). Hard mode uses the parent-aware drop path so child counts on surviving parents stay accurate even under partial failure.
+6. Hard mode only: wipes the cross-branch `{ledger_name}/@shared/dicts/` namespace.
+7. Disconnects every branch from the ledger cache.
 
 **Idempotency:**
 
 Safe to call multiple times:
-- Returns `"already_retracted"` if the ledger was previously dropped
-- Hard mode still attempts file deletion even for already-retracted ledgers (useful for cleanup)
+- Returns `"already_retracted"` when every branch was already retracted (hard mode still proceeds with cleanup for these).
+- Returns `"not_found"` without touching storage when no nameservice record exists for the ledger name. Truly orphaned artifacts with no nameservice pointer are **not** swept by `/drop`; that's a separate admin concern.
 
 **Examples:**
 
 ```bash
-# Soft drop (retract only, preserve files)
+# Soft drop the whole "mydb" ledger
 curl -X POST http://localhost:8090/v1/fluree/drop \
   -H "Content-Type: application/json" \
-  -d '{"ledger": "mydb:main"}'
+  -d '{"ledger": "mydb"}'
 
-# Hard drop (delete all files - IRREVERSIBLE)
+# Hard drop (delete every branch's artifacts + @shared/dicts - IRREVERSIBLE)
 curl -X POST http://localhost:8090/v1/fluree/drop \
   -H "Content-Type: application/json" \
-  -d '{"ledger": "mydb:main", "hard": true}'
+  -d '{"ledger": "mydb", "hard": true}'
 
 # Drop with auth token (when admin auth enabled)
 curl -X POST http://localhost:8090/v1/fluree/drop \
   -H "Content-Type: application/json" \
   -H "Authorization: Bearer eyJ..." \
-  -d '{"ledger": "mydb:main", "hard": true}'
+  -d '{"ledger": "mydb", "hard": true}'
 
-# Drop with short ledger ID (auto-resolves to :main)
+# Backwards-compatible form (accepted with a warning; prefer the bare name)
 curl -X POST http://localhost:8090/v1/fluree/drop \
   -H "Content-Type: application/json" \
-  -d '{"ledger": "mydb"}'
+  -d '{"ledger": "mydb:main"}'
 ```
 
 ### GET /context/{ledger...}
@@ -1532,9 +1594,9 @@ POST /drop-branch
 ```json
 {
   "ledger_id": "mydb:feature-x",
-  "status": "Dropped",
+  "status": "dropped",
   "deferred": false,
-  "artifacts_deleted": 5,
+  "files_deleted": 5,
   "cascaded": [],
   "warnings": []
 }
@@ -1542,12 +1604,12 @@ POST /drop-branch
 
 | Field | Type | Description |
 |-------|------|-------------|
-| `ledger_id` | Full ledger:branch identifier of the dropped branch |
-| `status` | Drop status (`"Dropped"`, `"AlreadyRetracted"`, `"NotFound"`) |
-| `deferred` | `true` if the branch has children — retracted but storage preserved |
-| `artifacts_deleted` | Number of storage artifacts removed |
-| `cascaded` | List of ancestor branch ledger_ids that were cascade-dropped |
-| `warnings` | Any non-fatal warnings during the drop |
+| `ledger_id` | string | Full ledger:branch identifier of the dropped branch |
+| `status` | string | Drop status (`"dropped"`, `"already_retracted"`, `"not_found"`) |
+| `deferred` | boolean | `true` if the branch has children — retracted but storage preserved |
+| `files_deleted` | integer | Number of storage artifacts removed; omitted when zero |
+| `cascaded` | string[] | List of ancestor branch ledger_ids that were cascade-dropped; omitted when empty |
+| `warnings` | string[] | Any non-fatal warnings during the drop; omitted when empty |
 
 **Behavior:**
 
@@ -2232,6 +2294,64 @@ curl -X POST http://localhost:8090/v1/fluree/reindex \
 - `500 Internal Server Error` — reindex failed
 
 When triggering indexing through the Rust API instead, see `Fluree::reindex` and `ReindexOptions`. For background incremental indexing (which runs automatically as commits are made), see [Background indexing](../indexing-and-search/background-indexing.md).
+
+### POST /export/*ledger
+
+Return ledger data as RDF in the requested format (Turtle, N-Triples, N-Quads, TriG, or JSON-LD). Server-side equivalent of `fluree export`.
+
+**Auth bracket: admin-protected** — same middleware as `/create`, `/drop`, `/reindex`, and the branch admin endpoints. Today's implementation reads from the binary index without per-flake policy filtering, so it does not live in the data-read bracket alongside `/query` and `/show`. Adding policy-filtered streaming export would let it move to read-auth in the future.
+
+**URL:**
+
+```
+POST /export/<ledger...>
+```
+
+**Request Body:**
+
+```json
+{
+  "format": "turtle",
+  "all_graphs": false,
+  "graph": "http://example.org/people",
+  "context": { "ex": "http://example.org/" },
+  "at": "t:42"
+}
+```
+
+| Field | Type | Required | Default | Description |
+|-------|------|----------|---------|-------------|
+| `format` | string | No | `"turtle"` | One of `turtle`/`ttl`, `ntriples`/`nt`, `nquads`/`n-quads`, `trig`, `jsonld`/`json-ld`/`json`. Case-insensitive. |
+| `all_graphs` | bool | No | `false` | Export every named graph as a dataset. Requires `format` ∈ `trig` / `nquads`. Mutually exclusive with `graph`. |
+| `graph` | string | No | — | IRI of a single named graph to export. Mutually exclusive with `all_graphs`. |
+| `context` | object | No | ledger default | Prefix map for Turtle/TriG/JSON-LD output. Either a bare object or `{"@context": {…}}`. |
+| `at` | string | No | latest | Time spec — integer (`"42"`), ISO-8601 datetime, or commit CID prefix. |
+
+An empty body is treated as all-default (Turtle export at HEAD).
+
+**Response Headers:**
+
+| Format | Content-Type |
+|--------|--------------|
+| Turtle | `text/turtle; charset=utf-8` |
+| N-Triples | `application/n-triples; charset=utf-8` |
+| N-Quads | `application/n-quads; charset=utf-8` |
+| TriG | `application/trig; charset=utf-8` |
+| JSON-LD | `application/ld+json; charset=utf-8` |
+
+**Response Body (200 OK):**
+
+The raw RDF for the requested format. The reference server today buffers the full export in memory before responding; implementations are free to stream chunked bodies, and clients MUST be prepared to read until EOF.
+
+**Status Codes:**
+
+- `200 OK` — export complete
+- `400 Bad Request` — unknown format; conflicting `all_graphs` + `graph`; `all_graphs` with non-dataset format; unknown graph IRI; malformed JSON; ledger not indexed (`ApiError::Config`)
+- `401` / `403` — admin token required and absent/invalid
+- `404 Not Found` — ledger does not exist
+- `5xx` — storage / nameservice / encoding errors
+
+**Peer mode:** Forwards to the transactor.
 
 ## Admin Authentication
 

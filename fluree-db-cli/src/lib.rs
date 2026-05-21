@@ -50,14 +50,33 @@ pub async fn run(cli: Cli) -> error::CliResult<()> {
             parallelism,
             leaflet_rows,
             leaflets_per_leaf,
+            remote,
         } => {
-            let fluree_dir = config::require_fluree_dir(config_path)?;
-
             if from.is_some() && memory.is_some() {
                 return Err(error::CliError::Usage(
                     "--from and --memory are mutually exclusive".into(),
                 ));
             }
+
+            // `--remote` doesn't write any local state, so it must work even
+            // when the user has no project-local `.fluree/` directory — fall
+            // back to global config for remote registration lookups.
+            if let Some(remote_name) = remote {
+                if from.is_some() || memory.is_some() {
+                    return Err(error::CliError::Usage(
+                        "--remote can only create empty ledgers; \
+                         use `fluree publish <remote> <ledger>` to push local commits to a remote, \
+                         or run `fluree create` locally first then publish."
+                            .to_string(),
+                    ));
+                }
+                let fluree_dir = config::require_fluree_dir_or_global(config_path)?;
+                return commands::create::run_remote(&ledger, &remote_name, &fluree_dir).await;
+            }
+
+            // Local-create paths still require a project `.fluree/` so the
+            // new ledger lands in a discoverable place rather than $FLUREE_HOME.
+            let fluree_dir = config::require_fluree_dir(config_path)?;
 
             if let Some(memory_path) = memory {
                 return commands::create::run_memory_import(
@@ -128,9 +147,13 @@ pub async fn run(cli: Cli) -> error::CliResult<()> {
             commands::branch::run(action, &fluree_dir, direct).await
         }
 
-        Commands::Drop { name, force } => {
+        Commands::Drop {
+            name,
+            force,
+            remote,
+        } => {
             let fluree_dir = config::require_fluree_dir(config_path)?;
-            commands::drop::run(&name, force, &fluree_dir).await
+            commands::drop::run(&name, force, &fluree_dir, remote.as_deref(), direct).await
         }
 
         Commands::Insert {
@@ -240,6 +263,7 @@ pub async fn run(cli: Cli) -> error::CliResult<()> {
             to,
             predicate,
             format,
+            remote,
         } => {
             let fluree_dir = config::require_fluree_dir_or_global(config_path)?;
             commands::history::run(
@@ -250,6 +274,8 @@ pub async fn run(cli: Cli) -> error::CliResult<()> {
                 predicate.as_deref(),
                 &format,
                 &fluree_dir,
+                remote.as_deref(),
+                direct,
             )
             .await
         }
@@ -257,15 +283,28 @@ pub async fn run(cli: Cli) -> error::CliResult<()> {
         Commands::Context { action } => {
             let fluree_dir = config::require_fluree_dir_or_global(config_path)?;
             match action {
-                cli::ContextAction::Get { ledger } => {
-                    commands::context_cmd::get(ledger.as_deref(), &fluree_dir).await
+                cli::ContextAction::Get { ledger, remote } => {
+                    commands::context_cmd::get(
+                        ledger.as_deref(),
+                        &fluree_dir,
+                        remote.as_deref(),
+                        direct,
+                    )
+                    .await
                 }
-                cli::ContextAction::Set { ledger, expr, file } => {
+                cli::ContextAction::Set {
+                    ledger,
+                    expr,
+                    file,
+                    remote,
+                } => {
                     commands::context_cmd::set(
                         ledger.as_deref(),
                         expr.as_deref(),
                         file.as_ref(),
                         &fluree_dir,
+                        remote.as_deref(),
+                        direct,
                     )
                     .await
                 }
@@ -275,22 +314,29 @@ pub async fn run(cli: Cli) -> error::CliResult<()> {
         Commands::Export {
             ledger,
             format,
+            output,
+            no_indexes,
             all_graphs,
             graph,
             context,
             context_file,
             at,
+            remote,
         } => {
             let fluree_dir = config::require_fluree_dir_or_global(config_path)?;
             commands::export::run(
                 ledger.as_deref(),
                 &format,
+                output.as_deref(),
+                no_indexes,
                 all_graphs,
                 graph.as_deref(),
                 context.as_deref(),
                 context_file.as_deref(),
                 at.as_deref(),
                 &fluree_dir,
+                remote.as_deref(),
+                direct,
             )
             .await
         }
@@ -299,9 +345,18 @@ pub async fn run(cli: Cli) -> error::CliResult<()> {
             ledger,
             oneline,
             count,
+            remote,
         } => {
             let fluree_dir = config::require_fluree_dir_or_global(config_path)?;
-            commands::log::run(ledger.as_deref(), oneline, count, &fluree_dir).await
+            commands::log::run(
+                ledger.as_deref(),
+                oneline,
+                count,
+                &fluree_dir,
+                remote.as_deref(),
+                direct,
+            )
+            .await
         }
 
         Commands::Show {

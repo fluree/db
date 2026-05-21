@@ -2112,7 +2112,7 @@ async fn soft_drop_blocks_recreate() {
     assert_eq!(resp.status(), StatusCode::CREATED);
 
     // Soft drop
-    let drop_body = serde_json::json!({ "ledger": "test:main", "hard": false });
+    let drop_body = serde_json::json!({ "ledger": "test", "hard": false });
     let resp = app
         .clone()
         .oneshot(
@@ -2336,6 +2336,125 @@ async fn query_with_max_fuel_returns_fuel_header() {
         "Response should have fuel field in body"
     );
     assert!(json_contains_string(&json, "Bob"));
+}
+
+#[tokio::test]
+async fn json_transaction_with_meta_reports_decimal_fuel() {
+    let (_tmp, state) = test_state().await;
+    let app = build_router(state.clone());
+
+    let create_body = serde_json::json!({ "ledger": "test:txfuel" });
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/fluree/create")
+                .header("content-type", "application/json")
+                .body(Body::from(create_body.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+
+    let insert_body = serde_json::json!({
+        "@context": { "ex": "http://example.org/" },
+        "insert": [{ "@id": "ex:alice", "ex:name": "Alice" }],
+        "opts": { "meta": true }
+    });
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/fluree/insert")
+                .header("content-type", "application/json")
+                .header("fluree-ledger", "test:txfuel")
+                .body(Body::from(insert_body.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    let fuel_header = resp
+        .headers()
+        .get("x-fdb-fuel")
+        .expect("tracked transaction should include x-fdb-fuel")
+        .to_str()
+        .expect("fuel header should be valid ASCII")
+        .parse::<f64>()
+        .expect("fuel header should parse as decimal fuel");
+    let (status, json) = json_body(resp).await;
+    assert_eq!(status, StatusCode::OK);
+
+    let fuel = json
+        .get("fuel")
+        .and_then(JsonValue::as_f64)
+        .expect("tracked transaction response should include decimal fuel");
+    assert_eq!(fuel, fuel_header);
+    assert!(
+        (100.0..1000.0).contains(&fuel),
+        "fuel should be reported in fuel units, not raw micro-fuel: {fuel}"
+    );
+}
+
+#[tokio::test]
+async fn sparql_update_with_tracking_header_reports_decimal_fuel() {
+    let (_tmp, state) = test_state().await;
+    let app = build_router(state.clone());
+
+    let create_body = serde_json::json!({ "ledger": "test:sparqlfuel" });
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/fluree/create")
+                .header("content-type", "application/json")
+                .body(Body::from(create_body.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+
+    let update = r#"
+        PREFIX ex: <http://example.org/>
+        INSERT DATA { ex:carol ex:name "Carol" . }
+    "#;
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/fluree/update/test:sparqlfuel")
+                .header("content-type", "application/sparql-update")
+                .header("fluree-track-fuel", "true")
+                .body(Body::from(update))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    let fuel_header = resp
+        .headers()
+        .get("x-fdb-fuel")
+        .expect("tracked SPARQL UPDATE should include x-fdb-fuel")
+        .to_str()
+        .expect("fuel header should be valid ASCII")
+        .parse::<f64>()
+        .expect("fuel header should parse as decimal fuel");
+    let (status, json) = json_body(resp).await;
+    assert_eq!(status, StatusCode::OK);
+
+    let fuel = json
+        .get("fuel")
+        .and_then(JsonValue::as_f64)
+        .expect("tracked SPARQL UPDATE response should include decimal fuel");
+    assert_eq!(fuel, fuel_header);
+    assert!(
+        (100.0..1000.0).contains(&fuel),
+        "fuel should be reported in fuel units, not raw micro-fuel: {fuel}"
+    );
 }
 
 // ============================================================================
@@ -2819,4 +2938,174 @@ async fn commits_endpoint_without_token_returns_401() {
         StatusCode::UNAUTHORIZED,
         "missing token should return 401 when storage proxy is enabled"
     );
+}
+
+// =============================================================================
+// Explain time-travel — server-side honoring of `--at`-style FROM
+// =============================================================================
+//
+// These exercise the fix for explain endpoints silently loading HEAD even
+// when the body carries a time-travel `from` / SPARQL FROM <ledger@t:N>.
+
+async fn explain_test_setup() -> (TempDir, axum::Router) {
+    let (tmp, state) = test_state().await;
+    let app = build_router(state.clone());
+
+    // Create
+    let create_body = serde_json::json!({ "ledger": "tt:main" });
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/fluree/create")
+                .header("content-type", "application/json")
+                .body(Body::from(create_body.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+
+    // Insert one triple to produce t=1
+    let insert_body = serde_json::json!({
+        "@context": { "ex": "http://example.org/" },
+        "@id": "ex:alice",
+        "ex:name": "Alice"
+    });
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/fluree/insert/tt:main")
+                .header("content-type", "application/json")
+                .body(Body::from(insert_body.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    (tmp, app)
+}
+
+#[tokio::test]
+async fn explain_ledger_scoped_jsonld_with_time_travel_returns_plan() {
+    let (_tmp, app) = explain_test_setup().await;
+
+    // JSON-LD explain at t=1 (the head we just created). With the fix,
+    // the body's time-travel `from` is honored — pre-fix it was silently
+    // dropped and explain ran against HEAD.
+    let body = serde_json::json!({
+        "@context": { "ex": "http://example.org/" },
+        "from": "tt:main@t:1",
+        "select": ["?s", "?name"],
+        "where": { "@id": "?s", "ex:name": "?name" }
+    });
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/fluree/explain/tt:main")
+                .header("content-type", "application/json")
+                .body(Body::from(body.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let (status, json) = json_body(resp).await;
+    assert_eq!(status, StatusCode::OK, "explain failed: {json}");
+    assert!(
+        json.get("plan").is_some() || json.get("optimized").is_some() || !json.is_null(),
+        "explain output should include a plan; got: {json}"
+    );
+}
+
+#[tokio::test]
+async fn explain_ledger_scoped_sparql_with_same_ledger_from_no_longer_rejected() {
+    let (_tmp, app) = explain_test_setup().await;
+
+    // SPARQL with a time-travel FROM that targets the same ledger as the
+    // URL path. Before the fix this returned 400
+    // ("SPARQL FROM/FROM NAMED is not supported for explain on the
+    // ledger-scoped endpoint"). After the fix it routes through the
+    // connection-explain path and returns the plan at the requested t.
+    let sparql = "SELECT ?s ?p ?o FROM <tt:main@t:1> WHERE { ?s ?p ?o }";
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/fluree/explain/tt:main")
+                .header("content-type", "application/sparql-query")
+                .body(Body::from(sparql.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let (status, json) = json_body(resp).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "ledger-scoped SPARQL explain with same-ledger FROM should succeed; got: {json}"
+    );
+}
+
+#[tokio::test]
+async fn explain_ledger_scoped_sparql_with_cross_ledger_from_rejected() {
+    let (_tmp, app) = explain_test_setup().await;
+
+    // SPARQL FROM targeting a *different* ledger than the URL path should
+    // be rejected with a ledger-mismatch BadRequest — same shape as the
+    // JSON-LD path's `normalize_ledger_scoped_from` does today.
+    let sparql = "SELECT ?s ?p ?o FROM <otherdb:main> WHERE { ?s ?p ?o }";
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/fluree/explain/tt:main")
+                .header("content-type", "application/sparql-query")
+                .body(Body::from(sparql.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let (status, json) = json_body(resp).await;
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "cross-ledger SPARQL FROM should be rejected; got: {json}"
+    );
+    assert!(
+        json_contains_string(&json, "Ledger mismatch") || json_contains_string(&json, "otherdb"),
+        "error should mention the ledger mismatch; got: {json}"
+    );
+}
+
+#[tokio::test]
+async fn explain_connection_jsonld_with_time_travel_returns_plan() {
+    let (_tmp, app) = explain_test_setup().await;
+
+    // Connection-level JSON-LD explain — uses body's `from` (with
+    // time-travel suffix) to drive both auth scope (via base ledger) and
+    // snapshot selection.
+    let body = serde_json::json!({
+        "@context": { "ex": "http://example.org/" },
+        "from": "tt:main@t:1",
+        "select": ["?s", "?name"],
+        "where": { "@id": "?s", "ex:name": "?name" }
+    });
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/fluree/explain")
+                .header("content-type", "application/json")
+                .body(Body::from(body.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let (status, json) = json_body(resp).await;
+    assert_eq!(status, StatusCode::OK, "explain failed: {json}");
 }
