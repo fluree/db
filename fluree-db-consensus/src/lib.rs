@@ -23,6 +23,7 @@ pub mod monolithic;
 pub use monolithic::{MonolithicConsensus, DEFAULT_IDEMPOTENCY_TTL};
 
 use async_trait::async_trait;
+use fluree_db_api::{TrackingOptions, TrackingTally};
 use fluree_db_transact::{CommitOpts, CommitReceipt, TxnOpts, TxnType};
 use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
@@ -74,22 +75,28 @@ impl From<&str> for IdempotencyKey {
 /// `idempotency_key` is optional: callers who want idempotent retry or
 /// after-the-fact status lookup provide one; callers who don't care can
 /// omit it and forfeit those guarantees.
+///
+/// `tracking` enables fuel/time/policy accounting; when present, the
+/// resulting [`TransactionReceipt`] carries a [`TrackingTally`].
 pub struct TransactionRequest {
     pub idempotency_key: Option<IdempotencyKey>,
     pub txn_type: TxnType,
     pub txn_json: JsonValue,
     pub txn_opts: TxnOpts,
     pub commit_opts: CommitOpts,
+    pub tracking: Option<TrackingOptions>,
 }
 
 /// Receipt returned once a submission is durably accepted.
 ///
 /// `idempotency_key` echoes whatever the caller provided in the request, or
-/// `None` if the submission was anonymous.
+/// `None` if the submission was anonymous. `tally` carries the fuel/time/
+/// policy accounting when the request enabled tracking, `None` otherwise.
 #[derive(Debug, Clone)]
 pub struct TransactionReceipt {
     pub idempotency_key: Option<IdempotencyKey>,
     pub commit: CommitReceipt,
+    pub tally: Option<TrackingTally>,
 }
 
 /// State of a previously-submitted transaction, accessible by idempotency key.

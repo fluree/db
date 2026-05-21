@@ -6,12 +6,13 @@
 //! do not need cross-node coordination.
 
 use crate::{
-    SubmissionError, IdempotencyKey, SubmissionLookup, SubmissionState, Submitter,
+    IdempotencyKey, SubmissionError, SubmissionLookup, SubmissionState, Submitter,
     TransactionReceipt, TransactionRequest,
 };
 use async_trait::async_trait;
 use fluree_db_api::{Fluree, LedgerManager};
 use fluree_db_ledger::IndexConfig;
+use fluree_db_transact::TxnType;
 use moka::future::Cache;
 use sha2::{Digest, Sha256};
 use std::sync::Arc;
@@ -89,36 +90,47 @@ impl MonolithicConsensus {
         ledger_id: &str,
         request: TransactionRequest,
     ) -> Result<TransactionReceipt, SubmissionError> {
+        let TransactionRequest {
+            idempotency_key,
+            txn_type,
+            txn_json,
+            txn_opts,
+            commit_opts,
+            tracking,
+        } = request;
+
         let ledger_handle = self
             .ledger_manager()?
             .get_or_load(ledger_id)
             .await
             .map_err(|e| SubmissionError::Submission(format!("ledger load: {e}")))?;
 
-        let mut write_guard = ledger_handle.lock_for_write().await;
-        let ledger_state = write_guard.clone_state();
+        // The builder API holds the ledger write lock and replaces the cached
+        // state internally for the duration of stage + commit — no manual
+        // lock/clone/replace dance is needed here.
+        let builder = self.fluree.stage(&ledger_handle);
+        let builder = match txn_type {
+            TxnType::Insert => builder.insert(&txn_json),
+            TxnType::Upsert => builder.upsert(&txn_json),
+            TxnType::Update => builder.update(&txn_json),
+        };
+        let mut builder = builder
+            .txn_opts(txn_opts)
+            .commit_opts(commit_opts)
+            .index_config(self.index_config.clone());
+        if let Some(tracking) = tracking {
+            builder = builder.tracking(tracking);
+        }
 
-        let result = self
-            .fluree
-            .transact(
-                ledger_state,
-                request.txn_type,
-                &request.txn_json,
-                request.txn_opts,
-                request.commit_opts,
-                &self.index_config,
-            )
+        let result = builder
+            .execute()
             .await
             .map_err(|e| SubmissionError::Submission(format!("transact: {e}")))?;
 
-        ledger_handle
-            .sync_binary_store_from_state(&result.ledger)
-            .await;
-        write_guard.replace(result.ledger);
-
         Ok(TransactionReceipt {
-            idempotency_key: request.idempotency_key,
+            idempotency_key,
             commit: result.receipt,
+            tally: result.tally,
         })
     }
 }
@@ -237,6 +249,7 @@ mod tests {
             txn_json: body,
             txn_opts: TxnOpts::default(),
             commit_opts: CommitOpts::default(),
+            tracking: None,
         }
     }
 

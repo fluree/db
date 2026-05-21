@@ -38,7 +38,7 @@ use fluree_db_api::{
     QueryConnectionOptions, SparqlQueryBody, TrackingOptions, TxnOpts, TxnType,
 };
 use fluree_db_consensus::{
-    IdempotencyKey, SubmissionError, Submitter, TransactionRequest,
+    IdempotencyKey, SubmissionError, Submitter, TransactionReceipt, TransactionRequest,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
@@ -114,21 +114,26 @@ fn submission_error_to_server_error(err: SubmissionError) -> ServerError {
     }
 }
 
-/// Build a response that optionally echoes the supplied `Idempotency-Key`
-/// back to the client. Echoing signals that the server tracked the key for
-/// idempotent retry; absence signals it was ignored.
+/// Build a response from a consensus receipt, attaching the headers the
+/// receipt implies.
+///
+/// Echoes the `Idempotency-Key` when the submission carried one (signalling
+/// that the server tracked it for idempotent retry; absence signals it was
+/// ignored), and attaches the tracking headers when a tally is present.
 fn build_consensus_response(
     response_json: Json<TransactResponse>,
-    idempotency_key: Option<&IdempotencyKey>,
+    receipt: &TransactionReceipt,
 ) -> Response {
-    if let Some(key) = idempotency_key {
+    let mut headers = HeaderMap::new();
+    if let Some(key) = &receipt.idempotency_key {
         if let Ok(value) = HeaderValue::from_str(key.as_str()) {
-            let mut hdrs = HeaderMap::new();
-            hdrs.insert("Idempotency-Key", value);
-            return (hdrs, response_json).into_response();
+            headers.insert("Idempotency-Key", value);
         }
     }
-    response_json.into_response()
+    if let Some(tally) = &receipt.tally {
+        headers.extend(tracking_headers(tally));
+    }
+    (headers, response_json).into_response()
 }
 
 /// The mutated body plus options extracted from it.
@@ -286,10 +291,7 @@ async fn submit_via_consensus(
             hash: receipt.commit.commit_id.to_string(),
         },
     });
-    Ok(build_consensus_response(
-        response_json,
-        receipt.idempotency_key.as_ref(),
-    ))
+    Ok(build_consensus_response(response_json, &receipt))
 }
 
 /// If the request was signed (credentialed), return the *original* signed envelope
@@ -1422,19 +1424,19 @@ async fn execute_transaction(
         let txn_opts = TxnOpts::default();
         let commit_opts = build_commit_opts(did.as_deref(), credential, &state.fluree, &handle);
 
-        // Consensus path: any JSON-LD transaction without tracking or policy
+        // Consensus path: any JSON-LD transaction without policy enforcement
         // goes through `state.consensus.submit()` so the submission is
-        // recorded for idempotent retry and status lookup. Tracked /
-        // policy-bearing requests stay on the direct builder path, which
-        // exposes the tracking tally and policy enforcement the consensus
-        // submission surface does not yet carry.
-        if prepared_transaction.tracking.is_none() && policy_ctx.is_none() {
+        // recorded for idempotent retry and status lookup. Policy-bearing
+        // requests stay on the direct builder path, which carries the policy
+        // enforcement the consensus submission surface does not yet expose.
+        if policy_ctx.is_none() {
             let request = TransactionRequest {
                 idempotency_key,
                 txn_type,
                 txn_json: prepared_transaction.body,
                 txn_opts,
                 commit_opts,
+                tracking: prepared_transaction.tracking,
             };
             return submit_via_consensus(state, ledger_id, request, tx_id).await;
         }
