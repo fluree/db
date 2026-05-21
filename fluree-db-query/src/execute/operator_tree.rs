@@ -43,8 +43,8 @@ use crate::groupby::GroupByOperator;
 use crate::having::HavingOperator;
 use crate::ir::triple::{Ref, Term, TriplePattern};
 use crate::ir::{
-    AggregateFn, AggregateSpec, Aggregation, Expression, Grouping, PathModifier, Pattern, Query,
-    QueryOutput,
+    AggregateFn, AggregateSpec, Aggregation, Expression, Grouping, InputSemantics, PathModifier,
+    Pattern, Query, QueryOutput,
 };
 use crate::limit::LimitOperator;
 use crate::offset::OffsetOperator;
@@ -444,13 +444,13 @@ fn implicit_single_aggregate(query: &Query) -> Option<&AggregateSpec> {
 ///
 /// Returns `Some(output_var)` if the query has:
 /// - SELECT output (not CONSTRUCT/BOOLEAN/WILDCARD)
-/// - Exactly one aggregate: `COUNT(*)` (not distinct, no input var)
+/// - Exactly one aggregate: `COUNT(*)` (`AggregateFn::CountAll`)
 /// - No group_by, having, post-aggregation binds, order_by, offset, or DISTINCT
 /// - LIMIT >= 1 (or no limit)
 /// - SELECT vars == `[agg.output_var]`
 pub(crate) fn detect_count_all_aggregate(query: &Query) -> Option<VarId> {
     let agg = implicit_single_aggregate(query)?;
-    if agg.distinct || !matches!(agg.function, AggregateFn::CountAll) || agg.input_var.is_some() {
+    if !matches!(agg.function, AggregateFn::CountAll) {
         return None;
     }
     let select_vars = query.output.projected_vars()?;
@@ -470,10 +470,9 @@ pub(crate) fn detect_count_all_aggregate(query: &Query) -> Option<VarId> {
 /// - SELECT vars == `[agg.output_var]`
 fn detect_count_distinct_aggregate(query: &Query) -> Option<(VarId, VarId)> {
     let agg = implicit_single_aggregate(query)?;
-    if agg.distinct || !matches!(agg.function, AggregateFn::CountDistinct) {
+    let AggregateFn::CountDistinct(in_var) = agg.function else {
         return None;
-    }
-    let in_var = agg.input_var?;
+    };
     let select_vars = query.output.projected_vars()?;
     if select_vars.len() != 1 || select_vars[0] != agg.output_var {
         return None;
@@ -487,12 +486,9 @@ fn detect_count_distinct_aggregate(query: &Query) -> Option<(VarId, VarId)> {
 /// Same standard constraints as [`detect_count_all_aggregate`].
 fn detect_count_aggregate(query: &Query) -> Option<(Option<VarId>, VarId)> {
     let agg = implicit_single_aggregate(query)?;
-    if agg.distinct {
-        return None;
-    }
     let input_var = match agg.function {
-        AggregateFn::CountAll if agg.input_var.is_none() => None,
-        AggregateFn::Count => Some(agg.input_var?),
+        AggregateFn::CountAll => None,
+        AggregateFn::Count(v) => Some(v),
         _ => return None,
     };
     let select_vars = query.output.projected_vars()?;
@@ -572,15 +568,10 @@ fn detect_predicate_group_by_object_count_topk(
         return None;
     }
     let agg = aggregates.first();
-    if agg.distinct {
-        return None;
-    }
-    let is_count = matches!(agg.function, AggregateFn::Count | AggregateFn::CountAll);
-    if !is_count {
-        return None;
-    }
-    if matches!(agg.function, AggregateFn::Count) && agg.input_var != Some(s_var) {
-        return None;
+    match &agg.function {
+        AggregateFn::CountAll => {}
+        AggregateFn::Count(v) if *v == s_var => {}
+        _ => return None,
     }
     if !binds.is_empty() {
         return None;
@@ -679,9 +670,6 @@ fn detect_group_by_object_star_topk(
     let mut max_out: Option<VarId> = None;
     let mut sample_out: Option<VarId> = None;
     for agg in aggregates.iter() {
-        if agg.distinct {
-            return None;
-        }
         match agg.function {
             AggregateFn::CountAll => {
                 if count_out.is_some() {
@@ -689,29 +677,26 @@ fn detect_group_by_object_star_topk(
                 }
                 count_out = Some(agg.output_var);
             }
-            AggregateFn::Count => {
+            AggregateFn::Count(v) if v == subj_var => {
                 if count_out.is_some() {
-                    return None;
-                }
-                if agg.input_var != Some(subj_var) {
                     return None;
                 }
                 count_out = Some(agg.output_var);
             }
-            AggregateFn::Min => {
-                if min_out.is_some() || agg.input_var != Some(subj_var) {
+            AggregateFn::Min(v) if v == subj_var => {
+                if min_out.is_some() {
                     return None;
                 }
                 min_out = Some(agg.output_var);
             }
-            AggregateFn::Max => {
-                if max_out.is_some() || agg.input_var != Some(subj_var) {
+            AggregateFn::Max(v) if v == subj_var => {
+                if max_out.is_some() {
                     return None;
                 }
                 max_out = Some(agg.output_var);
             }
-            AggregateFn::Sample => {
-                if sample_out.is_some() || agg.input_var != Some(subj_var) {
+            AggregateFn::Sample(v) if v == subj_var => {
+                if sample_out.is_some() {
                     return None;
                 }
                 sample_out = Some(agg.output_var);
@@ -764,10 +749,10 @@ fn detect_sum_strlen_group_concat_subquery(query: &Query) -> Option<(Ref, Arc<st
 
     // Outer aggregate must be SUM(?v) (where ?v is the STRLEN bind var).
     let outer_agg = implicit_single_aggregate(query)?;
-    if outer_agg.distinct || outer_agg.function != AggregateFn::Sum {
-        return None;
-    }
-    let strlen_var = outer_agg.input_var?;
+    let strlen_var = match outer_agg.function {
+        AggregateFn::Sum(input, InputSemantics::List) => input,
+        _ => return None,
+    };
 
     // Patterns: one Subquery + one Bind(strlen_var = STRLEN(?cat)).
     if query.patterns.len() != 2 {
@@ -818,10 +803,14 @@ fn detect_sum_strlen_group_concat_subquery(query: &Query) -> Option<(Ref, Arc<st
     }
     let inner_agg = sq_aggregates.first();
     let (sep, input_var) = match &inner_agg.function {
-        AggregateFn::GroupConcat { separator } => (separator.as_str(), inner_agg.input_var?),
+        AggregateFn::GroupConcat {
+            separator,
+            input,
+            semantics: InputSemantics::List,
+        } => (separator.as_str(), *input),
         _ => return None,
     };
-    if inner_agg.distinct || inner_agg.output_var != *cat_var {
+    if inner_agg.output_var != *cat_var {
         return None;
     }
 
@@ -995,18 +984,12 @@ fn detect_predicate_minmax_string(query: &Query) -> Option<(Ref, MinMaxMode, Var
     };
     let (_s_var, pred, o_var) = validate_simple_triple(tp)?;
 
-    // Aggregate must be MIN(?o) or MAX(?o) (not distinct).
-    if agg.distinct {
-        return None;
-    }
+    // Aggregate must be MIN(?o) or MAX(?o).
     let mode = match agg.function {
-        AggregateFn::Min => MinMaxMode::Min,
-        AggregateFn::Max => MinMaxMode::Max,
+        AggregateFn::Min(v) if v == o_var => MinMaxMode::Min,
+        AggregateFn::Max(v) if v == o_var => MinMaxMode::Max,
         _ => return None,
     };
-    if agg.input_var? != o_var {
-        return None;
-    }
 
     // SELECT must be exactly the aggregate output var.
     let select_vars = query.output.projected_vars()?;
@@ -1026,7 +1009,10 @@ fn detect_predicate_avg_numeric(query: &Query) -> Option<(Ref, VarId)> {
         return None;
     };
     let (_s_var, pred, o_var) = validate_simple_triple(tp)?;
-    if agg.distinct || !matches!(agg.function, AggregateFn::Avg) || agg.input_var? != o_var {
+    let AggregateFn::Avg(input, InputSemantics::List) = agg.function else {
+        return None;
+    };
+    if input != o_var {
         return None;
     }
     let select_vars = query.output.projected_vars()?;
@@ -1045,7 +1031,7 @@ fn detect_count_rows_with_encoded_filters(
 )> {
     // Must be single COUNT aggregate, no grouping/having/binds/etc.
     let agg = implicit_single_aggregate(query)?;
-    if agg.distinct || !matches!(agg.function, AggregateFn::Count | AggregateFn::CountAll) {
+    if !matches!(agg.function, AggregateFn::Count(_) | AggregateFn::CountAll) {
         return None;
     }
 
@@ -1070,7 +1056,7 @@ fn detect_count_rows_with_encoded_filters(
     let (s_var, _pred, o_var) = validate_simple_triple(tp)?;
 
     // COUNT(?s) or COUNT(*) only.
-    if matches!(agg.function, AggregateFn::Count) && agg.input_var != Some(s_var) {
+    if matches!(agg.function, AggregateFn::Count(v) if v != s_var) {
         return None;
     }
 
@@ -1151,7 +1137,7 @@ fn detect_predicate_count_rows_numeric_compare(
     if query.patterns.len() != 2 {
         return None;
     }
-    if agg.distinct || !matches!(agg.function, AggregateFn::Count | AggregateFn::CountAll) {
+    if !matches!(agg.function, AggregateFn::Count(_) | AggregateFn::CountAll) {
         return None;
     }
 
@@ -1162,7 +1148,7 @@ fn detect_predicate_count_rows_numeric_compare(
     };
 
     let (s_var, pred, o_var) = validate_simple_triple(tp)?;
-    if matches!(agg.function, AggregateFn::Count) && agg.input_var != Some(s_var) {
+    if matches!(agg.function, AggregateFn::Count(v) if v != s_var) {
         return None;
     }
 
@@ -1200,9 +1186,9 @@ fn detect_string_prefix_sum_strstarts(query: &Query) -> Option<(Ref, Arc<str>, V
     use crate::ir::{Expression, FlakeValue, Function};
 
     let agg = implicit_single_aggregate(query)?;
-    if agg.distinct || !matches!(agg.function, AggregateFn::Sum) {
+    let AggregateFn::Sum(sum_input, InputSemantics::List) = agg.function else {
         return None;
-    }
+    };
     let select_vars = query.output.projected_vars()?;
     if select_vars.len() != 1 || select_vars[0] != agg.output_var {
         return None;
@@ -1216,7 +1202,7 @@ fn detect_string_prefix_sum_strstarts(query: &Query) -> Option<(Ref, Arc<str>, V
         _ => return None,
     };
     let (_s_var, pred, o_var) = validate_simple_triple(tp)?;
-    if agg.input_var != Some(bind_var) {
+    if sum_input != bind_var {
         return None;
     }
 
@@ -1367,12 +1353,10 @@ fn detect_stats_count_by_predicate(query: &Query) -> Option<(VarId, VarId)> {
         return None;
     }
     let agg = aggregates.first();
-    if !matches!(agg.function, AggregateFn::Count) {
+    let AggregateFn::Count(input_var) = agg.function else {
         return None;
-    }
-
+    };
     // COUNT input must be a non-predicate variable (subject or object)
-    let input_var = agg.input_var?;
     if input_var != *s_var && input_var != *o_var {
         return None;
     }
@@ -1400,9 +1384,9 @@ fn detect_fused_scan_sum_i64(query: &Query) -> Option<(Ref, SumExprI64, VarId)> 
     if select_vars.len() != 1 || select_vars[0] != agg.output_var {
         return None;
     }
-    if agg.distinct || !matches!(agg.function, AggregateFn::Sum) {
+    let AggregateFn::Sum(sum_input, InputSemantics::List) = agg.function else {
         return None;
-    }
+    };
 
     match query.patterns.as_slice() {
         [Pattern::Triple(tp)] => {
@@ -1410,7 +1394,7 @@ fn detect_fused_scan_sum_i64(query: &Query) -> Option<(Ref, SumExprI64, VarId)> 
             let Term::Var(o_var) = &tp.o else {
                 return None;
             };
-            if agg.input_var != Some(*o_var) {
+            if sum_input != *o_var {
                 return None;
             }
             Some((pred, SumExprI64::Identity, agg.output_var))
@@ -1422,7 +1406,7 @@ fn detect_fused_scan_sum_i64(query: &Query) -> Option<(Ref, SumExprI64, VarId)> 
             };
 
             // Bind must define the aggregate input var, and SUM must use it.
-            if agg.input_var != Some(*var) {
+            if sum_input != *var {
                 return None;
             }
 
@@ -2546,7 +2530,7 @@ fn build_operator_tree_inner(
         let mut seen_output_vars: HashSet<VarId> = HashSet::new();
 
         for spec in &aggregates_vec {
-            if let Some(input_var) = spec.input_var {
+            if let Some(input_var) = spec.function.input_var() {
                 if !current_schema.contains(&input_var) {
                     return Err(QueryError::VariableNotFound(format!(
                         "Aggregate input variable {input_var:?} not found in schema"
@@ -2583,13 +2567,13 @@ fn build_operator_tree_inner(
             .iter()
             .map(|spec| {
                 let input_col = spec
-                    .input_var
+                    .function
+                    .input_var()
                     .and_then(|v| current_schema.iter().position(|&sv| sv == v));
                 StreamingAggSpec {
                     function: spec.function.clone(),
                     input_col,
                     output_var: spec.output_var,
-                    distinct: spec.distinct,
                 }
             })
             .collect();
@@ -3001,10 +2985,8 @@ mod tests {
                 aggregation: Aggregation {
                     aggregates: fluree_db_core::NonEmpty::try_from_vec(vec![
                         crate::ir::AggregateSpec {
-                            function: crate::ir::AggregateFn::CountDistinct,
-                            input_var: Some(counted_o),
+                            function: crate::ir::AggregateFn::CountDistinct(counted_o),
                             output_var: out,
-                            distinct: false,
                         },
                     ])
                     .unwrap(),
