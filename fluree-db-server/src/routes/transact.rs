@@ -655,7 +655,6 @@ async fn update_local(
             &credential,
             author.as_deref(),
             &headers,
-            extract_idempotency_key(&credential.headers),
         )
         .await
     }
@@ -802,7 +801,6 @@ async fn update_ledger_local(
             &credential,
             author.as_deref(),
             &headers,
-            extract_idempotency_key(&credential.headers),
         )
         .await
     }
@@ -949,7 +947,6 @@ async fn insert_local(
             &credential,
             author.as_deref(),
             &headers,
-            extract_idempotency_key(&credential.headers),
         )
         .await
     }
@@ -1096,7 +1093,6 @@ async fn upsert_local(
             &credential,
             author.as_deref(),
             &headers,
-            extract_idempotency_key(&credential.headers),
         )
         .await
     }
@@ -1244,7 +1240,6 @@ async fn insert_ledger_local(
             &credential,
             author.as_deref(),
             &headers,
-            extract_idempotency_key(&credential.headers),
         )
         .await
     }
@@ -1392,7 +1387,6 @@ async fn upsert_ledger_local(
             &credential,
             author.as_deref(),
             &headers,
-            extract_idempotency_key(&credential.headers),
         )
         .await
     }
@@ -1413,8 +1407,8 @@ async fn execute_transaction(
     credential: &MaybeCredential,
     author: Option<&str>,
     headers: &FlureeHeaders,
-    idempotency_key: Option<IdempotencyKey>,
 ) -> Result<Response> {
+    let idempotency_key = extract_idempotency_key(&credential.headers);
     let prepared_transaction =
         prepare_transaction_body(state, ledger_id, body, headers, author).await;
 
@@ -1445,7 +1439,7 @@ async fn execute_transaction(
         };
 
         let did = effective_did(&prepared_transaction.governance, author);
-        let commit_opts = build_commit_opts(did.as_deref(), credential, &state.fluree, &handle);
+        let commit_opts = build_commit_opts(did, credential, &state.fluree, &handle);
 
         // Every JSON-LD transaction goes through consensus. Policy context,
         // tracking, and execution are all handled by the submission layer;
