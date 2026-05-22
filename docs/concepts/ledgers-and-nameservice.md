@@ -53,9 +53,9 @@ Ledgers are created implicitly through the first transaction and persist until e
 
 Ledgers can be marked as retracted (soft delete), which:
 - Marks the ledger as inactive in the nameservice
-- Preserves all historical data
-- Prevents new transactions (but allows historical queries)
-- Can be reversed if needed
+- Preserves storage artifacts
+- Prevents normal load/create/write paths from treating the alias as active
+- Keeps the alias reserved until an administrator purges or otherwise repairs the nameservice record
 
 ## The Nameservice
 
@@ -286,12 +286,12 @@ curl http://localhost:8090/v1/fluree/ledgers
 
 #### Retraction
 
-Mark ledgers as inactive:
+Mark ledgers as inactive without deleting storage artifacts:
 
 ```rust
 // Pseudo-code
 nameservice.retract("mydb:old-branch").await?;
-// Sets retracted=true, prevents new transactions
+// Sets retracted=true; the alias remains reserved.
 ```
 
 ### Storage Backends
@@ -519,7 +519,13 @@ fluree branch list --ledger mydb
 
 #### Dropping a Branch
 
-Branches can be deleted with `drop_branch`. The `main` branch cannot be dropped.
+Branches can be deleted with `drop_branch`. The **root** branch — any branch
+whose `source_branch.is_none()` on its `NsRecord` — cannot be dropped via
+`drop_branch`; use [`drop_ledger`](#dropping-a-whole-ledger) to remove the
+entire ledger including its root. `"main"` is the default branch name and so
+is the root on most ledgers, but the refusal is structural: a ledger created
+as `mydb:trunk` has `trunk` as its root, and `drop_branch("mydb", "trunk")`
+will be refused. Conversely, a non-root branch named `"main"` is droppable.
 
 Branches use **reference counting** (`branches` field on `NsRecord`) to track child branches. This enables safe deletion:
 
@@ -726,9 +732,9 @@ Understanding how records evolve:
    - Large gaps indicate indexing lag
    - May need to tune indexing frequency or resources
 
-3. **Handle Retraction Carefully**: Retracted ledgers preserve history
+3. **Handle Retraction Carefully**: Retracted ledgers preserve storage artifacts
    - Use for soft deletes, not hard deletes
-   - Historical queries still work on retracted ledgers
+   - Do not assume normal query/load APIs will open a retracted ledger; administrative recovery may require nameservice repair or purge
 
 ### Performance Considerations
 

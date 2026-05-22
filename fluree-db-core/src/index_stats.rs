@@ -68,6 +68,41 @@ pub struct IndexStats {
     pub graphs: Option<Vec<GraphStatsEntry>>,
 }
 
+impl IndexStats {
+    /// Set `self.size` to `total_commit_size` and proportionally distribute it
+    /// across `self.graphs[*].size` based on each graph's flake count.
+    ///
+    /// The per-graph allocation is an estimate (not exact storage bytes), but
+    /// it avoids reporting 0 and stays consistent across the root_assembly,
+    /// incremental, and import code paths. The last graph absorbs the
+    /// remainder so the sum equals `total_commit_size` exactly.
+    ///
+    /// No-op for the per-graph distribution if there are no graphs, no flakes,
+    /// or `total_commit_size` is zero; `self.size` is still set in all cases.
+    pub fn distribute_total_size_by_flakes(&mut self, total_commit_size: u64) {
+        self.size = total_commit_size;
+        let Some(graphs) = self.graphs.as_mut() else {
+            return;
+        };
+        let total_flakes: u64 = graphs.iter().map(|g| g.flakes).sum();
+        if total_flakes == 0 || total_commit_size == 0 {
+            return;
+        }
+        let n = graphs.len();
+        let mut assigned: u64 = 0;
+        for (i, g) in graphs.iter_mut().enumerate() {
+            if i + 1 == n {
+                g.size = total_commit_size.saturating_sub(assigned);
+            } else {
+                let part = ((total_commit_size as u128) * (g.flakes as u128)
+                    / (total_flakes as u128)) as u64;
+                g.size = part;
+                assigned = assigned.saturating_add(part);
+            }
+        }
+    }
+}
+
 // === Class-Property Statistics ===
 
 /// Statistics for a single class (rdf:type target).

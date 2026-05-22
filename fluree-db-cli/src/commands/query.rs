@@ -245,8 +245,13 @@ pub async fn run(
             let timer = Instant::now();
             let result = match (query_format, at, explain) {
                 (detect::QueryFormat::Sparql, Some(at_str), true) => {
-                    // Remote time travel explain uses connection-scoped SPARQL:
-                    // server requires FROM clause to identify the ledger/time.
+                    // Remote `--at --explain` over SPARQL: inject the time
+                    // suffix as a FROM and POST to the ledger-scoped explain
+                    // endpoint. Same shape as the non-explain SPARQL `--at`
+                    // case below — the server's `/explain/{ledger}` accepts
+                    // same-ledger FROM with time travel (see the
+                    // explain-time-travel fix). Queries with their own
+                    // FROM/FROM NAMED must encode time travel there.
                     if fluree_db_api::sparql_dataset_ledger_ids(&content)
                         .map(|v| !v.is_empty())
                         .unwrap_or(false)
@@ -270,11 +275,13 @@ pub async fn run(
                             )
                         },
                     )?;
-                    client.explain_connection_sparql(&injected).await?
+                    client.explain_sparql(&remote_alias, &injected).await?
                 }
                 (detect::QueryFormat::JsonLd, Some(at_str), true) => {
-                    // Remote time travel explain uses connection-scoped JSON-LD:
-                    // inject `"from": "<ledger>@t:..."` and POST to /explain.
+                    // Remote `--at --explain` over JSON-LD: inject the
+                    // time-suffixed `from` into the body and POST to the
+                    // ledger-scoped explain endpoint. Path drives auth,
+                    // body's `from` drives snapshot selection.
                     let spec = parse_time_spec(at_str);
                     let suffix = time_spec_to_suffix(&spec);
                     let from_id = attach_time_suffix_preserving_fragment(&remote_alias, &suffix);
@@ -286,7 +293,7 @@ pub async fn run(
                             "JSON-LD query must be a JSON object".to_string(),
                         ));
                     }
-                    client.explain_connection_jsonld(&json_query).await?
+                    client.explain_jsonld(&remote_alias, &json_query).await?
                 }
                 (detect::QueryFormat::Sparql, None, true) => {
                     client.explain_sparql(&remote_alias, &content).await?
@@ -296,12 +303,12 @@ pub async fn run(
                     client.explain_jsonld(&remote_alias, &json_query).await?
                 }
                 (detect::QueryFormat::Sparql, Some(at_str), false) => {
-                    // Remote time travel uses connection-scoped SPARQL:
-                    // server requires FROM clause to identify the ledger/time.
-                    //
-                    // We inject a single FROM before WHERE for the common SELECT shape.
-                    // If the query already has FROM/FROM NAMED, require the user to encode
-                    // time travel there (avoid ambiguous semantics).
+                    // Remote time-travel via ledger-scoped SPARQL: path drives
+                    // auth (`can_read("mydb:main")` matches scoped tokens),
+                    // injected FROM carries the @t:N suffix for snapshot
+                    // resolution. We inject a single FROM before WHERE for
+                    // the common SELECT shape; queries with their own
+                    // FROM/FROM NAMED must encode time travel there.
                     if fluree_db_api::sparql_dataset_ledger_ids(&content)
                         .map(|v| !v.is_empty())
                         .unwrap_or(false)
@@ -325,11 +332,11 @@ pub async fn run(
                             )
                         },
                     )?;
-                    client.query_connection_sparql(&injected).await?
+                    client.query_sparql(&remote_alias, &injected).await?
                 }
                 (detect::QueryFormat::JsonLd, Some(at_str), false) => {
-                    // Remote time travel uses connection-scoped JSON-LD:
-                    // inject `"from": "<ledger>@t:..."` and POST to /query.
+                    // Remote time-travel via ledger-scoped JSON-LD: path
+                    // drives auth, body's `from` carries the @t:N suffix.
                     let spec = parse_time_spec(at_str);
                     let suffix = time_spec_to_suffix(&spec);
                     let from_id = attach_time_suffix_preserving_fragment(&remote_alias, &suffix);
@@ -341,7 +348,7 @@ pub async fn run(
                             "JSON-LD query must be a JSON object".to_string(),
                         ));
                     }
-                    client.query_connection_jsonld(&json_query).await?
+                    client.query_jsonld(&remote_alias, &json_query).await?
                 }
                 (detect::QueryFormat::Sparql, None, false) => {
                     client.query_sparql(&remote_alias, &content).await?

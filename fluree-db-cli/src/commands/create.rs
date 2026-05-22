@@ -15,6 +15,29 @@ pub struct ImportOpts {
     pub leaflets_per_leaf: usize,
 }
 
+/// `fluree create <ledger> --remote <name>` — create an empty ledger on the
+/// remote server. Only the empty-create case is supported; bulk imports
+/// (`--from`, `--memory`) require local data ingestion and are dispatched
+/// before this is reached. Active-ledger pointer is **not** touched —
+/// remote storage is separate from local.
+pub async fn run_remote(ledger: &str, remote_name: &str, dirs: &FlureeDir) -> CliResult<()> {
+    let client = context::build_remote_client(remote_name, dirs).await?;
+    let ledger_id = context::to_ledger_id(ledger);
+    let response = client.create_ledger(&ledger_id).await.map_err(|e| {
+        CliError::Remote(format!(
+            "failed to create '{ledger}' on remote '{remote_name}': {e}"
+        ))
+    })?;
+    context::persist_refreshed_tokens(&client, remote_name, dirs).await;
+
+    let resolved = response
+        .get("ledger")
+        .and_then(|v| v.as_str())
+        .unwrap_or(&ledger_id);
+    println!("Created ledger '{resolved}' on remote '{remote_name}'");
+    Ok(())
+}
+
 pub async fn run(
     ledger: &str,
     from: Option<&Path>,

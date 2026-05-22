@@ -29,9 +29,24 @@ A pack can include just commits + txn blobs (compact, sufficient for full restor
 
 ### Archive (export to `.flpack`)
 
-The CLI does not yet have a dedicated `fluree export --format flpack` command. To produce a `.flpack` file today, use the pack HTTP endpoint directly or the Rust API (see below).
+```bash
+# Local ledger
+fluree export mydb --format ledger -o mydb.flpack
 
-From the CLI, the closest equivalent is `fluree clone` which uses the pack protocol internally for transfer, then writes objects to local CAS.
+# Smaller archive without binary index artifacts (importer will reindex):
+fluree export mydb --format ledger --no-indexes -o mydb.flpack
+
+# Remote ledger (cold-archive a production ledger to local disk):
+fluree export mydb --remote prod --format ledger -o mydb.flpack
+```
+
+`--format ledger` (alias `--format flpack`) writes the full `fluree-pack-v1` archive — commits, txn blobs, and (unless `--no-indexes`) index artifacts — plus a `phase: "nameservice"` manifest frame that lets the importer reconstruct commit/index head pointers.
+
+`-o FILE` is required when stdout is a TTY (the archive is binary). Pipe-friendly forms work too: `fluree export mydb --format ledger > mydb.flpack`.
+
+The local path calls `Fluree::archive_ledger`. The `--remote` path calls `GET /storage/ns/:ledger-id` to fetch the remote NsRecord, then streams `POST /pack/*ledger` and substitutes the nameservice manifest in place of the terminal End frame on the fly — so a remote-sourced archive is byte-compatible with a locally-generated one. Both endpoints require a Bearer token with `fluree.storage.*` permissions (same auth bracket as `fluree clone` / `pull`).
+
+For non-CLI archive flows (S3 upload, custom storage), use `Fluree::archive_ledger` directly — see [Rust API usage](#rust-api-usage) below.
 
 ### Restore (import from `.flpack`)
 

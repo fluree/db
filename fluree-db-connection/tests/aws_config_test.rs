@@ -313,7 +313,8 @@ fn test_full_aws_config() {
                 "@type": "Storage",
                 "s3Bucket": "fluree-indexes",
                 "s3Prefix": "prod/indexes",
-                "s3ReadTimeoutMs": 5000
+                "s3ReadTimeoutMs": 5000,
+                "s3MaxConcurrentRequests": 16
             },
             {
                 "@id": "s3CommitStorage",
@@ -353,6 +354,7 @@ fn test_full_aws_config() {
             assert_eq!(&*s3_config.bucket, "fluree-indexes");
             assert_eq!(s3_config.prefix.as_deref(), Some("prod/indexes"));
             assert_eq!(s3_config.read_timeout_ms, Some(5000));
+            assert_eq!(s3_config.max_concurrent_requests, Some(16));
         }
         _ => panic!("Expected S3 index storage"),
     }

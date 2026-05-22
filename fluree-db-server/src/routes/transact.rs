@@ -33,8 +33,8 @@ use axum::http::{HeaderMap, HeaderValue};
 use axum::response::{IntoResponse, Response};
 use axum::Json;
 use fluree_db_api::{
-    ApiError, CommitOpts, Fluree, GovernanceOptions, LedgerHandle, TrackingOptions, TxnOpts,
-    TxnType,
+    ApiError, CommitOpts, Fluree, GovernanceOptions, LedgerHandle, PolicyStats, TrackingOptions,
+    TrackingTally, TxnOpts, TxnType,
 };
 use fluree_db_consensus::{
     IdempotencyKey, SubmissionError, Submitter, TransactionBody, TransactionReceipt,
@@ -72,6 +72,42 @@ pub struct TransactResponse {
     pub tx_id: String,
     /// Commit information
     pub commit: CommitInfo,
+    /// Execution time when tracking was requested
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub time: Option<String>,
+    /// Fuel consumed when tracking was requested
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fuel: Option<f64>,
+    /// Policy stats when policy tracking was requested
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub policy: Option<std::collections::HashMap<String, PolicyStats>>,
+}
+
+fn transact_response(
+    ledger_id: String,
+    t: i64,
+    tx_id: String,
+    commit_hash: String,
+    tally: Option<&TrackingTally>,
+) -> TransactResponse {
+    TransactResponse {
+        ledger_id,
+        t,
+        tx_id,
+        commit: CommitInfo { hash: commit_hash },
+        time: tally.and_then(|t| t.time.clone()),
+        fuel: tally.and_then(|t| t.fuel),
+        policy: tally.and_then(|t| t.policy.clone()),
+    }
+}
+
+fn record_tracking_on_span(span: &tracing::Span, tally: &TrackingTally) {
+    if let Some(ref time) = tally.time {
+        span.record("tracker_time", time.as_str());
+    }
+    if let Some(fuel) = tally.fuel {
+        span.record("tracker_fuel", fuel);
+    }
 }
 
 /// Compute transaction ID from request body (SHA-256 hash)
@@ -251,14 +287,16 @@ async fn submit_via_consensus(
         }
     };
 
-    let response_json = Json(TransactResponse {
-        ledger_id: ledger_id.to_string(),
-        t: receipt.commit.t,
+    if let Some(tally) = &receipt.tally {
+        record_tracking_on_span(&tracing::Span::current(), tally);
+    }
+    let response_json = Json(transact_response(
+        ledger_id.to_string(),
+        receipt.commit.t,
         tx_id,
-        commit: CommitInfo {
-            hash: receipt.commit.commit_id.to_string(),
-        },
-    });
+        receipt.commit.commit_id.to_string(),
+        receipt.tally.as_ref(),
+    ));
     Ok(build_consensus_response(response_json, &receipt))
 }
 
@@ -865,6 +903,7 @@ async fn insert_local(
                 TxnType::Insert,
                 &turtle,
                 &credential,
+                &headers,
                 author.as_deref(),
             )
             .await;
@@ -1011,6 +1050,7 @@ async fn upsert_local(
                 TxnType::Upsert,
                 &turtle,
                 &credential,
+                &headers,
                 author.as_deref(),
             )
             .await;
@@ -1158,6 +1198,7 @@ async fn insert_ledger_local(
                 TxnType::Insert,
                 &turtle,
                 &credential,
+                &headers,
                 author.as_deref(),
             )
             .await;
@@ -1305,6 +1346,7 @@ async fn upsert_ledger_local(
                 TxnType::Upsert,
                 &turtle,
                 &credential,
+                &headers,
                 author.as_deref(),
             )
             .await;
@@ -1369,8 +1411,13 @@ async fn execute_transaction(
     let prepared_transaction =
         prepare_transaction_body(state, ledger_id, body, headers, author).await;
 
-    let span =
-        tracing::debug_span!("transact_execute", ledger_id = ledger_id, txn_type = ?txn_type);
+    let span = tracing::debug_span!(
+        "transact_execute",
+        ledger_id = ledger_id,
+        txn_type = ?txn_type,
+        tracker_time = tracing::field::Empty,
+        tracker_fuel = tracing::field::Empty,
+    );
     async move {
         let span = tracing::Span::current();
 
@@ -1441,13 +1488,21 @@ async fn execute_turtle_transaction(
     txn_type: TxnType,
     turtle: &str,
     credential: &MaybeCredential,
+    headers: &FlureeHeaders,
     author: Option<&str>,
 ) -> Result<Response> {
     let is_trig = credential.is_trig();
 
     // Create execution span
     let format = if is_trig { "trig" } else { "turtle" };
-    let span = tracing::debug_span!("transact_execute", ledger_id = ledger_id, txn_type = ?txn_type, format = format);
+    let span = tracing::debug_span!(
+        "transact_execute",
+        ledger_id = ledger_id,
+        txn_type = ?txn_type,
+        format = format,
+        tracker_time = tracing::field::Empty,
+        tracker_fuel = tracing::field::Empty,
+    );
     async move {
         let span = tracing::Span::current();
 
@@ -1479,15 +1534,18 @@ async fn execute_turtle_transaction(
 
         let commit_opts = build_commit_opts(author, credential, &state.fluree, &handle);
 
-        // Turtle/TriG carries no `opts`, so there are no policy or tracking
-        // inputs; the consensus layer handles the rest of execution.
+        // Turtle/TriG carries no body `opts`, so policy runs under root.
+        // Tracking, however, is header-driven and applies to every format.
+        let tracking = headers
+            .has_tracking()
+            .then(|| headers.to_tracking_options());
         let request = TransactionRequest {
             idempotency_key: extract_idempotency_key(&credential.headers),
             txn_type,
             body: TransactionBody::Turtle(turtle.to_string()),
             txn_opts: TxnOpts::default(),
             commit_opts,
-            tracking: None,
+            tracking,
             governance: GovernanceOptions::default(),
         };
         submit_via_consensus(state, ledger_id, request, tx_id).await
@@ -1602,14 +1660,17 @@ async fn execute_sparql_update_request(
     // ledger write lock — so namespace allocation shares the staging
     // registry and the namespace-conflict retry that pre-lowering required
     // is gone. `txn_type` is nominal: the lowered Txn carries the real
-    // insert/update semantics.
+    // insert/update semantics. Tracking is header-driven for SPARQL.
+    let tracking = headers
+        .has_tracking()
+        .then(|| headers.to_tracking_options());
     let request = TransactionRequest {
         idempotency_key: extract_idempotency_key(&credential.headers),
         txn_type: TxnType::Update,
         body: TransactionBody::Sparql(sparql),
         txn_opts: TxnOpts::default(),
         commit_opts,
-        tracking: None,
+        tracking,
         governance,
     };
     submit_via_consensus(state, &ledger_id, request, tx_id).await

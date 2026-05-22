@@ -13,6 +13,7 @@
 
 use std::collections::HashMap;
 use std::io;
+use std::path::Path;
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -28,6 +29,26 @@ use fluree_db_core::value_id::{ObjKey, ObjKind};
 use fluree_db_core::DatatypeDictId;
 
 use crate::run_index::resolve::resolver::{RebuildChunk, ResolverError, SharedResolverState};
+
+async fn fetch_cached_or_get(
+    cs: &dyn ContentStore,
+    cid: &ContentId,
+    cache_dir: Option<&Path>,
+    context: impl Into<String>,
+) -> Result<Vec<u8>, IncrementalResolveError> {
+    let context = context.into();
+    match cache_dir {
+        Some(cache_dir) => {
+            fluree_db_binary_index::read::artifact_cache::fetch_cached_bytes_cid(cs, cid, cache_dir)
+                .await
+                .map_err(|e| IncrementalResolveError::RootLoad(format!("{context}: {e}")))
+        }
+        None => cs
+            .get(cid)
+            .await
+            .map_err(|e| IncrementalResolveError::RootLoad(format!("{context}: {e}"))),
+    }
+}
 
 // ============================================================================
 // Error type
@@ -166,12 +187,13 @@ pub async fn resolve_incremental_commits_v6(
     // 1. Load and decode IndexRoot.
     let (root_bytes, t_root_load_ms) = {
         let t0 = Instant::now();
-        let bytes = cs.get(&config.base_root_id).await.map_err(|e| {
-            IncrementalResolveError::RootLoad(format!(
-                "failed to load FIR6 root {}: {}",
-                config.base_root_id, e
-            ))
-        })?;
+        let bytes = fetch_cached_or_get(
+            cs.as_ref(),
+            &config.base_root_id,
+            config.artifact_cache_dir.as_deref(),
+            format!("failed to load FIR6 root {}", config.base_root_id),
+        )
+        .await?;
         (bytes, t0.elapsed().as_millis() as u64)
     };
 
@@ -259,12 +281,13 @@ pub async fn resolve_incremental_commits_v6(
             }
             let nb_map = shared.numbigs.entry(ga.g_id).or_default();
             for (p_id, cid) in &ga.numbig {
-                let bytes = cs.get(cid).await.map_err(|e| {
-                    IncrementalResolveError::RootLoad(format!(
-                        "numbig arena load for g_id={}, p_id={}: {}",
-                        ga.g_id, p_id, e
-                    ))
-                })?;
+                let bytes = fetch_cached_or_get(
+                    cs.as_ref(),
+                    cid,
+                    config.artifact_cache_dir.as_deref(),
+                    format!("numbig arena load for g_id={}, p_id={}", ga.g_id, p_id),
+                )
+                .await?;
                 let arena =
                     fluree_db_binary_index::arena::numbig::read_numbig_arena_from_bytes(&bytes)
                         .map_err(|e| {
@@ -283,12 +306,16 @@ pub async fn resolve_incremental_commits_v6(
         )> = Vec::new();
         for ga in &root.graph_arenas {
             for vref in &ga.vectors {
-                let manifest_bytes = cs.get(&vref.manifest).await.map_err(|e| {
-                    IncrementalResolveError::RootLoad(format!(
-                        "vector manifest load for g_id={}, p_id={}: {}",
-                        ga.g_id, vref.p_id, e
-                    ))
-                })?;
+                let manifest_bytes = fetch_cached_or_get(
+                    cs.as_ref(),
+                    &vref.manifest,
+                    config.artifact_cache_dir.as_deref(),
+                    format!(
+                        "vector manifest load for g_id={}, p_id={}",
+                        ga.g_id, vref.p_id
+                    ),
+                )
+                .await?;
                 let manifest =
                     fluree_db_binary_index::arena::vector::read_vector_manifest(&manifest_bytes)
                         .map_err(|e| {
@@ -319,6 +346,7 @@ pub async fn resolve_incremental_commits_v6(
             &config.head_commit_id,
             config.from_t,
             config.max_commit_bytes,
+            config.artifact_cache_dir.as_deref(),
         )
         .await?;
         (commits, t0.elapsed().as_millis() as u64)
@@ -359,12 +387,16 @@ pub async fn resolve_incremental_commits_v6(
                         "vector shard CID parse for g_id={g_id}, p_id={p_id}: {e}"
                     ))
                 })?;
-                let bytes = cs.get(&cid).await.map_err(|e| {
-                    IncrementalResolveError::RootLoad(format!(
-                        "vector shard load for g_id={g_id}, p_id={p_id}, cid={}: {e}",
+                let bytes = fetch_cached_or_get(
+                    cs.as_ref(),
+                    &cid,
+                    config.artifact_cache_dir.as_deref(),
+                    format!(
+                        "vector shard load for g_id={g_id}, p_id={p_id}, cid={}",
                         shard_info.cas
-                    ))
-                })?;
+                    ),
+                )
+                .await?;
                 let shard =
                     fluree_db_binary_index::arena::vector::read_vector_shard_from_bytes(&bytes)
                         .map_err(|e| {
@@ -834,6 +866,7 @@ async fn walk_commit_chain_since(
     head_id: &ContentId,
     from_t: i64,
     max_commit_bytes: Option<usize>,
+    cache_dir: Option<&Path>,
 ) -> Result<Vec<WalkedCommit>, IncrementalResolveError> {
     let walk_started = Instant::now();
 
@@ -863,9 +896,22 @@ async fn walk_commit_chain_since(
             }
         }
 
-        let bytes = cs.get(&cid).await.map_err(|e| {
-            IncrementalResolveError::CommitChain(format!("failed to load commit {cid}: {e}"))
-        })?;
+        let bytes = match cache_dir {
+            Some(cache_dir) => {
+                fluree_db_binary_index::read::artifact_cache::fetch_cached_bytes_cid(
+                    cs, &cid, cache_dir,
+                )
+                .await
+                .map_err(|e| {
+                    IncrementalResolveError::CommitChain(format!(
+                        "failed to load commit {cid}: {e}"
+                    ))
+                })?
+            }
+            None => cs.get(&cid).await.map_err(|e| {
+                IncrementalResolveError::CommitChain(format!("failed to load commit {cid}: {e}"))
+            })?,
+        };
         cumulative_bytes += bytes.len();
         commits.push(WalkedCommit { cid, t, bytes });
     }

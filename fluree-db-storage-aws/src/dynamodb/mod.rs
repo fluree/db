@@ -705,81 +705,12 @@ impl NameService for DynamoDbNameService {
             .cloned()
             .unwrap_or_default();
 
-        // Conditionally delete the meta item first — this is the linearization
-        // point that prevents a double-drop race. If two callers race, only one
-        // wins the conditional delete; the other gets ConditionalCheckFailed and
-        // we return NotFound, avoiding a double parent-count decrement.
-        match self
-            .client
-            .delete_item()
-            .table_name(&self.table_name)
-            .key(ATTR_PK, AttributeValue::S(pk.clone()))
-            .key(ATTR_SK, AttributeValue::S(SK_META.to_string()))
-            .condition_expression("attribute_exists(#pk)")
-            .expression_attribute_names("#pk", ATTR_PK)
-            .send()
-            .await
-        {
-            Ok(_) => {}
-            Err(aws_sdk_dynamodb::error::SdkError::ServiceError(se))
-                if matches!(
-                    se.err(),
-                    aws_sdk_dynamodb::operation::delete_item::DeleteItemError::ConditionalCheckFailedException(_)
-                ) =>
-            {
-                return Err(NameServiceError::not_found(ledger_id));
-            }
-            Err(e) => {
-                return Err(NameServiceError::storage(format!(
-                    "DynamoDB conditional delete failed: {e}"
-                )));
-            }
-        }
-
-        // Delete remaining (non-meta) items via BatchWriteItem
-        let delete_requests: Vec<_> = items
-            .iter()
-            .filter_map(|item| {
-                let sk_val = item.get(ATTR_SK)?.as_s().ok()?;
-                if sk_val == SK_META {
-                    return None; // already deleted above
-                }
-                Some(
-                    aws_sdk_dynamodb::types::WriteRequest::builder()
-                        .delete_request(
-                            aws_sdk_dynamodb::types::DeleteRequest::builder()
-                                .key(ATTR_PK, AttributeValue::S(pk.clone()))
-                                .key(ATTR_SK, AttributeValue::S(sk_val.to_string()))
-                                .build()
-                                .expect("delete request keys set"),
-                        )
-                        .build(),
-                )
-            })
-            .collect();
-
-        let mut remaining: std::collections::HashMap<String, Vec<_>> =
-            std::collections::HashMap::new();
-        remaining.insert(self.table_name.clone(), delete_requests);
-
-        while !remaining.is_empty() {
-            // DynamoDB BatchWriteItem accepts at most 25 items total per call.
-            // We already chunked into ≤25-item batches per table, but after
-            // unprocessed retries the map may have items across tables.
-            let mut builder = self.client.batch_write_item();
-            for (table, items) in &remaining {
-                builder = builder.request_items(table, items.clone());
-            }
-
-            let result = builder.send().await.map_err(|e| {
-                NameServiceError::storage(format!("DynamoDB batch delete failed: {e}"))
-            })?;
-
-            remaining = result.unprocessed_items().cloned().unwrap_or_default();
-
-            if !remaining.is_empty() {
-                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-            }
+        // Atomic linearization point: conditional delete of meta, then sweep
+        // every remaining row under this pk. If meta is already gone, another
+        // caller already won — surface as NotFound here so we don't decrement
+        // the parent's branch count twice.
+        if !self.delete_all_rows_for_pk(&pk, &items).await? {
+            return Err(NameServiceError::not_found(ledger_id));
         }
 
         // Decrement parent's child count if this branch had a parent
@@ -1063,12 +994,118 @@ impl Publisher for DynamoDbNameService {
         Ok(())
     }
 
+    async fn purge(&self, ledger_id: &str) -> std::result::Result<(), NameServiceError> {
+        // Hard drop: delete every row under this pk (meta/head/index/status/
+        // config, plus any other ledger-level rows). Idempotent — if the
+        // record is already gone we return Ok so repeated drops are safe.
+        let pk = Self::normalize(ledger_id);
+        let items = self.query_all_items(&pk).await?;
+        let _ = self.delete_all_rows_for_pk(&pk, &items).await?;
+        Ok(())
+    }
+
     fn publishing_ledger_id(&self, ledger_id: &str) -> Option<String> {
         Some(Self::normalize(ledger_id))
     }
 }
 
 impl DynamoDbNameService {
+    /// Conditionally delete the meta row and sweep every remaining row under `pk`.
+    ///
+    /// Always attempts to sweep non-meta rows, even when the conditional meta
+    /// delete fails (meta already gone). That handles the partial-failure
+    /// replay case: a prior caller could have deleted meta and crashed before
+    /// sweeping head/index/status/config; the next purge must finish the job.
+    ///
+    /// Returns `Ok(true)` if this caller won the conditional delete on meta
+    /// (the linearization point — used by `drop_branch` to gate its single
+    /// parent-count decrement). Returns `Ok(false)` if meta was already gone.
+    /// In both cases the remaining rows are swept.
+    async fn delete_all_rows_for_pk(
+        &self,
+        pk: &str,
+        items: &[Item],
+    ) -> std::result::Result<bool, NameServiceError> {
+        let meta_was_present = match self
+            .client
+            .delete_item()
+            .table_name(&self.table_name)
+            .key(ATTR_PK, AttributeValue::S(pk.to_string()))
+            .key(ATTR_SK, AttributeValue::S(SK_META.to_string()))
+            .condition_expression("attribute_exists(#pk)")
+            .expression_attribute_names("#pk", ATTR_PK)
+            .send()
+            .await
+        {
+            Ok(_) => true,
+            Err(aws_sdk_dynamodb::error::SdkError::ServiceError(se))
+                if matches!(
+                    se.err(),
+                    aws_sdk_dynamodb::operation::delete_item::DeleteItemError::ConditionalCheckFailedException(_)
+                ) =>
+            {
+                false
+            }
+            Err(e) => {
+                return Err(NameServiceError::storage(format!(
+                    "DynamoDB conditional delete failed: {e}"
+                )));
+            }
+        };
+
+        // Sweep remaining (non-meta) items via BatchWriteItem. DynamoDB
+        // BatchWriteItem accepts at most 25 items per call; chunk accordingly.
+        // Runs unconditionally so a half-completed purge is finished on the
+        // next call.
+        let mut delete_requests: Vec<aws_sdk_dynamodb::types::WriteRequest> = items
+            .iter()
+            .filter_map(|item| {
+                let sk_val = item.get(ATTR_SK)?.as_s().ok()?;
+                if sk_val == SK_META {
+                    return None;
+                }
+                Some(
+                    aws_sdk_dynamodb::types::WriteRequest::builder()
+                        .delete_request(
+                            aws_sdk_dynamodb::types::DeleteRequest::builder()
+                                .key(ATTR_PK, AttributeValue::S(pk.to_string()))
+                                .key(ATTR_SK, AttributeValue::S(sk_val.to_string()))
+                                .build()
+                                .expect("delete request keys set"),
+                        )
+                        .build(),
+                )
+            })
+            .collect();
+
+        while !delete_requests.is_empty() {
+            let chunk_size = delete_requests.len().min(25);
+            let chunk: Vec<_> = delete_requests.drain(..chunk_size).collect();
+
+            let mut remaining: std::collections::HashMap<String, Vec<_>> =
+                std::collections::HashMap::new();
+            remaining.insert(self.table_name.clone(), chunk);
+
+            while !remaining.is_empty() {
+                let mut builder = self.client.batch_write_item();
+                for (table, batch) in &remaining {
+                    builder = builder.request_items(table, batch.clone());
+                }
+
+                let result = builder.send().await.map_err(|e| {
+                    NameServiceError::storage(format!("DynamoDB batch delete failed: {e}"))
+                })?;
+
+                remaining = result.unprocessed_items().cloned().unwrap_or_default();
+                if !remaining.is_empty() {
+                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                }
+            }
+        }
+
+        Ok(meta_was_present)
+    }
+
     /// Shared helper for publish_index and publish_index_allow_equal.
     ///
     /// First attempts the update with only the monotonicity `condition`
