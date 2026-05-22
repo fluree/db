@@ -228,11 +228,11 @@ async fn prepare_transaction_body(
 /// `apply_auth_identity_to_opts` — commits stay attributable to the policy
 /// subject responsible for the data change, while the audit trail captures
 /// the operator who performed the action.
-fn effective_did(governance: &GovernanceOptions, author: Option<&str>) -> Option<String> {
-    governance
-        .identity
-        .clone()
-        .or_else(|| author.map(String::from))
+fn effective_did<'a>(
+    governance: &'a GovernanceOptions,
+    author: Option<&'a str>,
+) -> Option<&'a str> {
+    governance.identity.as_deref().or(author)
 }
 
 /// Build the [`CommitOpts`] for the transaction.

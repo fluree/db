@@ -135,7 +135,12 @@ impl MonolithicConsensus {
                 hasher.update(text.as_bytes());
             }
         }
-        hasher.update(format!("{:?}", request.txn_type).as_bytes());
+        let txn_type_tag: &[u8] = match request.txn_type {
+            TxnType::Insert => b"insert",
+            TxnType::Upsert => b"upsert",
+            TxnType::Update => b"update",
+        };
+        hasher.update(txn_type_tag);
         hasher.finalize().into()
     }
 
@@ -236,10 +241,9 @@ impl Submitter for MonolithicConsensus {
             match existing.state {
                 SubmissionState::Committed(receipt) => return Ok(receipt),
                 SubmissionState::InFlight => return Err(SubmissionError::AlreadyInFlight),
-                SubmissionState::Failed(_) | SubmissionState::Unknown => {
-                    // Allow re-attempt of a previously-failed submission with
-                    // the same body. Falls through to the normal submission path.
-                }
+                // A previously-failed submission is re-attemptable with the
+                // same key — failures may be transient.
+                SubmissionState::Failed(_) | SubmissionState::Unknown => {}
             }
         }
 
