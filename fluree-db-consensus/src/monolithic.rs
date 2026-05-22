@@ -65,6 +65,10 @@ async fn build_policy_context(
 /// body, and status lookups for the expired key return [`SubmissionState::Unknown`].
 pub const DEFAULT_IDEMPOTENCY_TTL: Duration = Duration::from_secs(3600);
 
+/// Upper bound on idempotency cache entries, so sustained keyed traffic
+/// can't grow the cache without limit between TTL evictions.
+const IDEMPOTENCY_CACHE_CAPACITY: u64 = 100_000;
+
 /// Composite cache key: `(ledger_id, idempotency_key)`. Submissions on
 /// different ledgers with the same key are independent.
 type SubmissionCacheKey = (String, IdempotencyKey);
@@ -102,7 +106,10 @@ impl MonolithicConsensus {
 
     /// Construct with a caller-specified idempotency TTL.
     pub fn with_ttl(fluree: Arc<Fluree>, index_config: IndexConfig, ttl: Duration) -> Self {
-        let cache = Cache::builder().time_to_live(ttl).build();
+        let cache = Cache::builder()
+            .time_to_live(ttl)
+            .max_capacity(IDEMPOTENCY_CACHE_CAPACITY)
+            .build();
         Self {
             fluree,
             index_config,
