@@ -234,28 +234,39 @@ impl Submitter for MonolithicConsensus {
         let cache_key = (ledger_id.to_string(), idempotency_key);
         let body_hash = Self::hash_request_body(&request);
 
-        if let Some(existing) = self.cache.get(&cache_key).await {
-            if existing.body_hash != body_hash {
-                return Err(SubmissionError::KeyCollision);
-            }
-            match existing.state {
-                SubmissionState::Committed(receipt) => return Ok(receipt),
-                SubmissionState::InFlight => return Err(SubmissionError::AlreadyInFlight),
-                // A previously-failed submission is re-attemptable with the
-                // same key — failures may be transient.
-                SubmissionState::Failed(_) | SubmissionState::Unknown => {}
-            }
-        }
-
-        self.cache
-            .insert(
-                cache_key.clone(),
-                CachedSubmission {
+        // Atomically claim the key. `or_insert_with_if` writes a fresh
+        // `InFlight` marker when the key is absent, or replaces a prior
+        // failed attempt for the same body — failures are re-attemptable.
+        // Concurrent submissions for the same key see `is_fresh() == false`
+        // and collapse onto the existing submission; only the caller that
+        // wins the claim goes on to execute.
+        let claim = self
+            .cache
+            .entry(cache_key.clone())
+            .or_insert_with_if(
+                std::future::ready(CachedSubmission {
                     state: SubmissionState::InFlight,
                     body_hash,
+                }),
+                |existing| {
+                    matches!(existing.state, SubmissionState::Failed(_))
+                        && existing.body_hash == body_hash
                 },
             )
             .await;
+
+        if !claim.is_fresh() {
+            let existing = claim.into_value();
+            if existing.body_hash != body_hash {
+                return Err(SubmissionError::KeyCollision);
+            }
+            // Claim lost and the body matches, so the entry is a completed
+            // or still-running submission for the same transaction.
+            return match existing.state {
+                SubmissionState::Committed(receipt) => Ok(receipt),
+                _ => Err(SubmissionError::AlreadyInFlight),
+            };
+        }
 
         let outcome = self.execute_transaction(ledger_id, request).await;
 
