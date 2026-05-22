@@ -141,11 +141,15 @@ pub enum SubmissionError {
     #[error("submission with this key is already in progress")]
     AlreadyInFlight,
 
-    /// Implementation-defined submission failure. Surfaces transactor,
-    /// storage, network, or consensus-protocol errors as a string so
-    /// callers do not couple to any one implementation's error taxonomy.
-    #[error("submission failed: {0}")]
-    Submission(String),
+    /// The submission was processed and failed.
+    ///
+    /// `status` is the HTTP status code categorising the failure — `4xx`
+    /// for a bad request (malformed transaction, policy denial, missing
+    /// ledger), `5xx` for an internal failure. Carrying the status lets
+    /// callers render an accurate response without coupling to any one
+    /// implementation's error taxonomy.
+    #[error("{message}")]
+    Execution { status: u16, message: String },
 }
 
 /// Submit transactions for processing.

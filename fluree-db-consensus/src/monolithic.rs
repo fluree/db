@@ -10,13 +10,24 @@ use crate::{
     TransactionBody, TransactionReceipt, TransactionRequest,
 };
 use async_trait::async_trait;
-use fluree_db_api::{Fluree, LedgerHandle, LedgerManager, PolicyContext, QueryConnectionOptions};
+use fluree_db_api::{
+    ApiError, Fluree, LedgerHandle, LedgerManager, PolicyContext, QueryConnectionOptions,
+};
 use fluree_db_ledger::IndexConfig;
 use fluree_db_transact::TxnType;
 use moka::future::Cache;
 use sha2::{Digest, Sha256};
 use std::sync::Arc;
 use std::time::Duration;
+
+/// Map a transaction-pipeline error into a [`SubmissionError`], preserving
+/// the HTTP status so the caller can render an accurate response.
+fn execution_failure(err: ApiError) -> SubmissionError {
+    SubmissionError::Execution {
+        status: err.status_code(),
+        message: err.to_string(),
+    }
+}
 
 /// Build a [`PolicyContext`] from the ledger state when the transaction body
 /// carries policy inputs (identity / policy class in its `opts`).
@@ -51,7 +62,7 @@ async fn build_policy_context(
     )
     .await
     .map(Some)
-    .map_err(|e| SubmissionError::Submission(format!("policy context: {e}")))
+    .map_err(execution_failure)
 }
 
 /// Default TTL for idempotency cache entries (1 hour).
@@ -125,10 +136,9 @@ impl MonolithicConsensus {
     }
 
     fn ledger_manager(&self) -> Result<&Arc<LedgerManager>, SubmissionError> {
-        self.fluree.ledger_manager().ok_or_else(|| {
-            SubmissionError::Submission(
-                "LedgerManager is not configured on the Fluree instance".into(),
-            )
+        self.fluree.ledger_manager().ok_or_else(|| SubmissionError::Execution {
+            status: 500,
+            message: "LedgerManager is not configured on the Fluree instance".into(),
         })
     }
 
@@ -150,7 +160,7 @@ impl MonolithicConsensus {
             .ledger_manager()?
             .get_or_load(ledger_id)
             .await
-            .map_err(|e| SubmissionError::Submission(format!("ledger load: {e}")))?;
+            .map_err(execution_failure)?;
 
         let policy_ctx = build_policy_context(&ledger_handle, &body).await?;
 
@@ -170,9 +180,10 @@ impl MonolithicConsensus {
                 staged.upsert_turtle(text.as_str())
             }
             (TransactionBody::Turtle(_), TxnType::Update) => {
-                return Err(SubmissionError::Submission(
-                    "Turtle/TriG is not supported for update transactions".into(),
-                ));
+                return Err(SubmissionError::Execution {
+                    status: 400,
+                    message: "Turtle/TriG is not supported for update transactions".into(),
+                });
             }
         };
         let mut builder = staged
@@ -186,10 +197,7 @@ impl MonolithicConsensus {
             builder = builder.policy(policy);
         }
 
-        let result = builder
-            .execute()
-            .await
-            .map_err(|e| SubmissionError::Submission(format!("transact: {e}")))?;
+        let result = builder.execute().await.map_err(execution_failure)?;
 
         Ok(TransactionReceipt {
             idempotency_key,
@@ -510,10 +518,13 @@ mod tests {
             .submit(&ledger_id, req)
             .await
             .expect_err("view-only policy should block the write");
-        assert!(
-            matches!(err, SubmissionError::Submission(_)),
-            "expected a submission failure, got {err:?}"
-        );
+        // A policy denial is a client error — it must carry a 4xx status.
+        match err {
+            SubmissionError::Execution { status, .. } => {
+                assert!((400..500).contains(&status), "expected 4xx, got {status}");
+            }
+            other => panic!("expected Execution, got {other:?}"),
+        }
     }
 
     #[tokio::test]
@@ -526,7 +537,10 @@ mod tests {
             .submit(missing, request(Some(key.as_str()), sample_insert("alice")))
             .await
             .expect_err("submission to a missing ledger should fail");
-        assert!(matches!(err, SubmissionError::Submission(_)), "got {err:?}");
+        assert!(
+            matches!(err, SubmissionError::Execution { .. }),
+            "expected an execution failure, got {err:?}"
+        );
 
         match consensus.status(missing, &key).await {
             SubmissionState::Failed(_) => {}
@@ -577,10 +591,12 @@ ex:alice ex:name "Alice" ."#
             .submit(&ledger_id, req)
             .await
             .expect_err("Turtle is not a valid update body");
-        assert!(
-            matches!(err, SubmissionError::Submission(_)),
-            "expected a submission failure, got {err:?}"
-        );
+        match err {
+            SubmissionError::Execution { status, .. } => {
+                assert_eq!(status, 400, "Turtle-update rejection should be 400");
+            }
+            other => panic!("expected Execution, got {other:?}"),
+        }
     }
 
     #[tokio::test]

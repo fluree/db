@@ -106,13 +106,16 @@ fn extract_idempotency_key(headers: &HeaderMap) -> Option<IdempotencyKey> {
 
 /// Map a [`SubmissionError`] to the [`ServerError`] / HTTP status the rest
 /// of the server expects.
+///
+/// `Execution` carries the status from the underlying transaction pipeline
+/// (e.g. 422 for a validation failure, 404 for a missing ledger), so it is
+/// passed through rather than collapsed to a 500.
 fn submission_error_to_server_error(err: SubmissionError) -> ServerError {
-    match err {
-        SubmissionError::KeyCollision | SubmissionError::AlreadyInFlight => {
-            ServerError::Api(ApiError::http(409, err.to_string()))
-        }
-        SubmissionError::Submission(msg) => ServerError::internal(msg),
-    }
+    let status = match &err {
+        SubmissionError::KeyCollision | SubmissionError::AlreadyInFlight => 409,
+        SubmissionError::Execution { status, .. } => *status,
+    };
+    ServerError::Api(ApiError::http(status, err.to_string()))
 }
 
 /// Build a response from a consensus receipt, attaching the headers the
