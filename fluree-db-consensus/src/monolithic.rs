@@ -246,7 +246,7 @@ impl SubmissionLookup for MonolithicConsensus {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use fluree_db_api::FlureeBuilder;
+    use fluree_db_api::{FlureeBuilder, TrackingOptions};
     use fluree_db_transact::{CommitOpts, TxnOpts};
     use serde_json::json;
 
@@ -399,5 +399,134 @@ mod tests {
             .submit(&ledger_id, request(Some(key.as_str()), sample_insert("bob")))
             .await
             .expect("fresh keyed submission should succeed after anonymous");
+    }
+
+    #[tokio::test]
+    async fn upsert_routes_through_consensus() {
+        let (_fluree, consensus, ledger_id) = setup().await;
+
+        let mut req = request(None, sample_insert("alice"));
+        req.txn_type = TxnType::Upsert;
+
+        let receipt = consensus
+            .submit(&ledger_id, req)
+            .await
+            .expect("upsert to succeed");
+        assert!(receipt.commit.flake_count > 0);
+    }
+
+    #[tokio::test]
+    async fn tracking_enabled_submission_carries_tally() {
+        let (_fluree, consensus, ledger_id) = setup().await;
+
+        let mut req = request(None, sample_insert("alice"));
+        req.tracking = Some(TrackingOptions {
+            track_time: true,
+            track_fuel: true,
+            track_policy: false,
+            max_fuel: None,
+        });
+
+        let receipt = consensus
+            .submit(&ledger_id, req)
+            .await
+            .expect("tracked submission to succeed");
+        assert!(
+            receipt.tally.is_some(),
+            "a tracking-enabled submission should carry a tally"
+        );
+    }
+
+    #[tokio::test]
+    async fn policy_default_allow_permits_transaction() {
+        let (_fluree, consensus, ledger_id) = setup().await;
+
+        // `default-allow: true` in `opts` is a policy input — it triggers
+        // policy-context construction inside the consensus layer — and it
+        // permits the write.
+        let body = json!({
+            "@context": {"ex": "http://example.org/"},
+            "@graph": [{"@id": "ex:alice", "ex:name": "Alice"}],
+            "opts": {"default-allow": true}
+        });
+
+        let receipt = consensus
+            .submit(&ledger_id, request(None, body))
+            .await
+            .expect("policy-permitted transaction to succeed");
+        assert!(receipt.commit.flake_count > 0);
+    }
+
+    #[tokio::test]
+    async fn view_only_policy_blocks_transaction() {
+        let (_fluree, consensus, ledger_id) = setup().await;
+
+        // A view-only policy grants `f:view` but never `f:modify`; with
+        // `default-allow: false` the write has no grant, so the consensus
+        // layer's policy enforcement must reject it.
+        let body = json!({
+            "@context": {"ex": "http://example.org/"},
+            "insert": {"@id": "ex:john", "ex:name": "John"},
+            "opts": {
+                "policy": [{
+                    "@id": "ex:viewOnly",
+                    "f:action": [{"@id": "f:view"}],
+                    "f:allow": true
+                }],
+                "default-allow": false
+            }
+        });
+        let mut req = request(None, body);
+        req.txn_type = TxnType::Update;
+
+        let err = consensus
+            .submit(&ledger_id, req)
+            .await
+            .expect_err("view-only policy should block the write");
+        assert!(
+            matches!(err, SubmissionError::Submission(_)),
+            "expected a submission failure, got {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_submission_is_recorded_as_failed() {
+        let (_fluree, consensus, _ledger_id) = setup().await;
+        let key = IdempotencyKey::new("01J5FAILED001");
+        let missing = "test/missing-ledger:main";
+
+        let err = consensus
+            .submit(missing, request(Some(key.as_str()), sample_insert("alice")))
+            .await
+            .expect_err("submission to a missing ledger should fail");
+        assert!(matches!(err, SubmissionError::Submission(_)), "got {err:?}");
+
+        match consensus.status(missing, &key).await {
+            SubmissionState::Failed(_) => {}
+            other => panic!("expected Failed, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn failed_submission_can_be_retried() {
+        let (fluree, consensus, _ledger_id) = setup().await;
+        let key = IdempotencyKey::new("01J5RETRYAFTERFAIL");
+        let ledger = "test/created-later:main";
+        let body = sample_insert("alice");
+
+        // First attempt fails — the ledger does not exist yet.
+        consensus
+            .submit(ledger, request(Some(key.as_str()), body.clone()))
+            .await
+            .expect_err("first attempt should fail before the ledger exists");
+
+        // Create the ledger, then retry with the same key + body. A cached
+        // `Failed` entry must not block the retry.
+        fluree.create_ledger(ledger).await.expect("create ledger");
+        let receipt = consensus
+            .submit(ledger, request(Some(key.as_str()), body))
+            .await
+            .expect("retry after the ledger exists should succeed");
+        assert!(receipt.commit.flake_count > 0);
     }
 }
