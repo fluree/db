@@ -18,8 +18,8 @@ use std::sync::Arc;
 mod support;
 
 use fluree_db_api::{
-    ExportCommitsRequest, FlureeBuilder, IndexConfig, LedgerManagerConfig, PushCommitsRequest,
-    QueryConnectionOptions,
+    ExportCommitsRequest, FlureeBuilder, GovernanceOptions, IndexConfig, LedgerManagerConfig,
+    PushCommitsRequest,
 };
 use serde_json::json;
 use support::{genesis_ledger, start_background_indexer_local, trigger_index_and_wait};
@@ -618,7 +618,7 @@ async fn push_roundtrip_named_graph_retractions() {
                 .push_commits_with_handle(
                     &tgt_handle,
                     push_req,
-                    &QueryConnectionOptions::default(),
+                    &GovernanceOptions::default(),
                     &IndexConfig {
                         reindex_min_bytes: 100_000,
                         reindex_max_bytes: 1_000_000_000,

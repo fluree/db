@@ -141,9 +141,7 @@ impl<'a> TransactCore<'a> {
     }
 
     pub(crate) fn set_pre_built_txn(&mut self, txn: Txn) {
-        if self.operation.is_some()
-            || self.pre_built_txn.is_some()
-            || self.pending_sparql.is_some()
+        if self.operation.is_some() || self.pre_built_txn.is_some() || self.pending_sparql.is_some()
         {
             self.errors.push(BuilderError::Conflict {
                 field: "operation",
@@ -155,9 +153,7 @@ impl<'a> TransactCore<'a> {
     }
 
     pub(crate) fn set_sparql_update(&mut self, sparql: &'a str) {
-        if self.operation.is_some()
-            || self.pre_built_txn.is_some()
-            || self.pending_sparql.is_some()
+        if self.operation.is_some() || self.pre_built_txn.is_some() || self.pending_sparql.is_some()
         {
             self.errors.push(BuilderError::Conflict {
                 field: "operation",
@@ -183,9 +179,7 @@ impl<'a> TransactCore<'a> {
     pub(crate) fn validate(&self) -> std::result::Result<(), BuilderErrors> {
         let mut errors = self.errors.clone();
         // Exactly one of operation / pre_built_txn / pending_sparql must be set.
-        if self.operation.is_none()
-            && self.pre_built_txn.is_none()
-            && self.pending_sparql.is_none()
+        if self.operation.is_none() && self.pre_built_txn.is_none() && self.pending_sparql.is_none()
         {
             errors.push(BuilderError::Missing {
                 field: "operation",
@@ -845,9 +839,8 @@ pub(crate) async fn commit_with_handle(
                 .ast
                 .ok_or_else(|| ApiError::http(400, "Failed to parse SPARQL UPDATE".to_string()))?;
             let mut ns = NamespaceRegistry::from_db(&ledger_state.snapshot);
-            let txn = lower_sparql_update_ast(&ast, &mut ns, core.txn_opts).map_err(|e| {
-                ApiError::http(400, format!("SPARQL UPDATE lowering error: {e}"))
-            })?;
+            let txn = lower_sparql_update_ast(&ast, &mut ns, core.txn_opts)
+                .map_err(|e| ApiError::http(400, format!("SPARQL UPDATE lowering error: {e}")))?;
             let txn_type = txn.txn_type;
             let stage_result = fluree
                 .stage_transaction_from_txn(

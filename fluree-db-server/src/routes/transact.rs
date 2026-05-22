@@ -33,7 +33,7 @@ use axum::http::{HeaderMap, HeaderValue};
 use axum::response::{IntoResponse, Response};
 use axum::Json;
 use fluree_db_api::{
-    ApiError, CommitOpts, Fluree, LedgerHandle, QueryConnectionOptions, TrackingOptions, TxnOpts,
+    ApiError, CommitOpts, Fluree, GovernanceOptions, LedgerHandle, TrackingOptions, TxnOpts,
     TxnType,
 };
 use fluree_db_consensus::{
@@ -146,7 +146,7 @@ fn build_consensus_response(
 struct PreparedTransaction {
     body: JsonValue,
     tracking: Option<TrackingOptions>,
-    qc_opts: QueryConnectionOptions,
+    governance: GovernanceOptions,
 }
 
 /// Phase 1 of [`execute_transaction`]: prepare the JSON-LD request body.
@@ -174,12 +174,12 @@ async fn prepare_transaction_body(
     .await;
 
     let tracking = tracking_options_from_body(&body);
-    let qc_opts = QueryConnectionOptions::from_json(&body).unwrap_or_default();
+    let governance = GovernanceOptions::from_json(&body).unwrap_or_default();
 
     PreparedTransaction {
         body,
         tracking,
-        qc_opts,
+        governance,
     }
 }
 
@@ -192,8 +192,8 @@ async fn prepare_transaction_body(
 /// `apply_auth_identity_to_opts` — commits stay attributable to the policy
 /// subject responsible for the data change, while the audit trail captures
 /// the operator who performed the action.
-fn effective_did(qc_opts: &QueryConnectionOptions, author: Option<&str>) -> Option<String> {
-    qc_opts
+fn effective_did(governance: &GovernanceOptions, author: Option<&str>) -> Option<String> {
+    governance
         .identity
         .clone()
         .or_else(|| author.map(String::from))
@@ -1390,7 +1390,7 @@ async fn execute_transaction(
             }
         };
 
-        let did = effective_did(&prepared_transaction.qc_opts, author);
+        let did = effective_did(&prepared_transaction.governance, author);
         let commit_opts = build_commit_opts(did.as_deref(), credential, &state.fluree, &handle);
 
         // Every JSON-LD transaction goes through consensus. Policy context,
@@ -1404,7 +1404,7 @@ async fn execute_transaction(
             txn_opts: TxnOpts::default(),
             commit_opts,
             tracking: prepared_transaction.tracking,
-            policy: prepared_transaction.qc_opts,
+            governance: prepared_transaction.governance,
         };
         submit_via_consensus(state, ledger_id, request, tx_id).await
     }
@@ -1488,7 +1488,7 @@ async fn execute_turtle_transaction(
             txn_opts: TxnOpts::default(),
             commit_opts,
             tracking: None,
-            policy: QueryConnectionOptions::default(),
+            governance: GovernanceOptions::default(),
         };
         submit_via_consensus(state, ledger_id, request, tx_id).await
     }
@@ -1578,7 +1578,7 @@ async fn execute_sparql_update_request(
             return Err(e);
         }
     };
-    let policy = QueryConnectionOptions {
+    let governance = GovernanceOptions {
         identity: effective_identity.clone(),
         policy_class: if headers.policy_class.is_empty() {
             None
@@ -1610,7 +1610,7 @@ async fn execute_sparql_update_request(
         txn_opts: TxnOpts::default(),
         commit_opts,
         tracking: None,
-        policy,
+        governance,
     };
     submit_via_consensus(state, &ledger_id, request, tx_id).await
 }

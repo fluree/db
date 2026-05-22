@@ -110,7 +110,7 @@ pub use commit_transfer::{
     PushCommitsRequest, PushCommitsResponse,
 };
 pub use dataset::{
-    sparql_dataset_ledger_ids, DatasetParseError, DatasetSpec, GraphSource, QueryConnectionOptions,
+    sparql_dataset_ledger_ids, DatasetParseError, DatasetSpec, GovernanceOptions, GraphSource,
     TimeSpec,
 };
 pub use error::{ApiError, BuilderError, BuilderErrors, Result};

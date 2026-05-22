@@ -101,7 +101,7 @@ impl FlureeToolService {
             |e: fluree_db_api::ApiError| rmcp::ErrorData::internal_error(e.to_string(), None);
         let result = match identity {
             Some(id) => {
-                let opts = fluree_db_api::QueryConnectionOptions {
+                let opts = fluree_db_api::GovernanceOptions {
                     identity: Some(id.to_string()),
                     ..Default::default()
                 };

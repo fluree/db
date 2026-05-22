@@ -1325,7 +1325,7 @@ async fn execute_sparql_ledger(
             .map(|d| !d.default_graphs.is_empty() || !d.named_graphs.is_empty() || d.to_graph.is_some())
             .unwrap_or(false);
 
-        // Build QueryConnectionOptions from the resolved identity plus header-supplied
+        // Build GovernanceOptions from the resolved identity plus header-supplied
         // policy fields. SPARQL has no body `opts` block, so headers are the only
         // transport for `policy-class`, `policy`, `policy-values`, and `default-allow`.
         let policy_values_map = headers.policy_values_map().map_err(|e| {
@@ -1333,7 +1333,7 @@ async fn execute_sparql_ledger(
             tracing::warn!(error = %e, "invalid fluree-policy-values header");
             e
         })?;
-        let qc_opts = fluree_db_api::QueryConnectionOptions {
+        let qc_opts = fluree_db_api::GovernanceOptions {
             identity: identity.map(String::from),
             policy_class: if headers.policy_class.is_empty() {
                 None

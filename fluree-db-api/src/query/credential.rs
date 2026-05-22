@@ -1,7 +1,7 @@
 use serde_json::Value as JsonValue;
 
 use crate::query::helpers::parse_and_validate_sparql;
-use crate::{ApiError, DatasetSpec, Fluree, QueryConnectionOptions, QueryResult, Result};
+use crate::{ApiError, DatasetSpec, Fluree, GovernanceOptions, QueryResult, Result};
 
 #[cfg(feature = "credential")]
 use crate::credential;
@@ -69,7 +69,7 @@ impl Fluree {
             ));
         }
 
-        let opts = QueryConnectionOptions {
+        let opts = GovernanceOptions {
             identity: Some(identity),
             policy_values: values_map,
             ..Default::default()

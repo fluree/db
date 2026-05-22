@@ -6,12 +6,12 @@
 //! do not need cross-node coordination.
 
 use crate::{
-    IdempotencyKey, SubmissionError, SubmissionLookup, SubmissionState, Submitter,
-    TransactionBody, TransactionReceipt, TransactionRequest,
+    IdempotencyKey, SubmissionError, SubmissionLookup, SubmissionState, Submitter, TransactionBody,
+    TransactionReceipt, TransactionRequest,
 };
 use async_trait::async_trait;
 use fluree_db_api::{
-    ApiError, Fluree, LedgerHandle, LedgerManager, PolicyContext, QueryConnectionOptions,
+    ApiError, Fluree, GovernanceOptions, LedgerHandle, LedgerManager, PolicyContext,
 };
 use fluree_db_ledger::IndexConfig;
 use fluree_db_transact::TxnType;
@@ -39,9 +39,9 @@ fn execution_failure(err: ApiError) -> SubmissionError {
 /// the executing node's state — the shape a replicated implementation needs.
 async fn build_policy_context(
     ledger_handle: &LedgerHandle,
-    policy: &QueryConnectionOptions,
+    governance: &GovernanceOptions,
 ) -> Result<Option<PolicyContext>, SubmissionError> {
-    if !policy.has_any_policy_inputs() {
+    if !governance.has_any_policy_inputs() {
         return Ok(None);
     }
 
@@ -51,7 +51,7 @@ async fn build_policy_context(
         snap.novelty.as_ref(),
         Some(snap.novelty.as_ref()),
         snap.t,
-        policy,
+        governance,
     )
     .await
     .map(Some)
@@ -133,10 +133,12 @@ impl MonolithicConsensus {
     }
 
     fn ledger_manager(&self) -> Result<&Arc<LedgerManager>, SubmissionError> {
-        self.fluree.ledger_manager().ok_or_else(|| SubmissionError::Execution {
-            status: 500,
-            message: "LedgerManager is not configured on the Fluree instance".into(),
-        })
+        self.fluree
+            .ledger_manager()
+            .ok_or_else(|| SubmissionError::Execution {
+                status: 500,
+                message: "LedgerManager is not configured on the Fluree instance".into(),
+            })
     }
 
     async fn execute_transaction(
@@ -151,7 +153,7 @@ impl MonolithicConsensus {
             txn_opts,
             commit_opts,
             tracking,
-            policy,
+            governance,
         } = request;
 
         let ledger_handle = self
@@ -160,7 +162,7 @@ impl MonolithicConsensus {
             .await
             .map_err(execution_failure)?;
 
-        let policy_ctx = build_policy_context(&ledger_handle, &policy).await?;
+        let policy_ctx = build_policy_context(&ledger_handle, &governance).await?;
 
         // The builder API holds the ledger write lock and replaces the cached
         // state internally for the duration of stage + commit — no manual
@@ -171,12 +173,8 @@ impl MonolithicConsensus {
             (TransactionBody::JsonLd(json), TxnType::Insert) => staged.insert(json),
             (TransactionBody::JsonLd(json), TxnType::Upsert) => staged.upsert(json),
             (TransactionBody::JsonLd(json), TxnType::Update) => staged.update(json),
-            (TransactionBody::Turtle(text), TxnType::Insert) => {
-                staged.insert_turtle(text.as_str())
-            }
-            (TransactionBody::Turtle(text), TxnType::Upsert) => {
-                staged.upsert_turtle(text.as_str())
-            }
+            (TransactionBody::Turtle(text), TxnType::Insert) => staged.insert_turtle(text.as_str()),
+            (TransactionBody::Turtle(text), TxnType::Upsert) => staged.upsert_turtle(text.as_str()),
             (TransactionBody::Turtle(_), TxnType::Update) => {
                 return Err(SubmissionError::Execution {
                     status: 400,
@@ -323,7 +321,7 @@ mod tests {
             txn_opts: TxnOpts::default(),
             commit_opts: CommitOpts::default(),
             tracking: None,
-            policy: QueryConnectionOptions::default(),
+            governance: GovernanceOptions::default(),
         }
     }
 
@@ -410,7 +408,10 @@ mod tests {
             .expect("first submission to succeed");
 
         let err = consensus
-            .submit(&ledger_id, request(Some(key.as_str()), sample_insert("bob")))
+            .submit(
+                &ledger_id,
+                request(Some(key.as_str()), sample_insert("bob")),
+            )
             .await
             .expect_err("second submission with different body should fail");
 
@@ -433,7 +434,10 @@ mod tests {
         // entry should sit in the cache to clash with it.
         let key = IdempotencyKey::new("01J5FRESH001");
         consensus
-            .submit(&ledger_id, request(Some(key.as_str()), sample_insert("bob")))
+            .submit(
+                &ledger_id,
+                request(Some(key.as_str()), sample_insert("bob")),
+            )
             .await
             .expect("fresh keyed submission should succeed after anonymous");
     }
@@ -481,7 +485,7 @@ mod tests {
         // `default-allow: true` is a policy input — it triggers policy-context
         // construction inside the consensus layer — and it permits the write.
         let mut req = request(None, sample_insert("alice"));
-        req.policy = QueryConnectionOptions {
+        req.governance = GovernanceOptions {
             default_allow: true,
             ..Default::default()
         };
@@ -506,7 +510,7 @@ mod tests {
         });
         let mut req = request(None, body);
         req.txn_type = TxnType::Update;
-        req.policy = QueryConnectionOptions {
+        req.governance = GovernanceOptions {
             policy: Some(json!([{
                 "@id": "ex:viewOnly",
                 "f:action": [{"@id": "f:view"}],
@@ -563,7 +567,7 @@ ex:alice ex:name "Alice" ."#;
             txn_opts: TxnOpts::default(),
             commit_opts: CommitOpts::default(),
             tracking: None,
-            policy: QueryConnectionOptions::default(),
+            governance: GovernanceOptions::default(),
         };
 
         let receipt = consensus
@@ -588,7 +592,7 @@ ex:alice ex:name "Alice" ."#
             txn_opts: TxnOpts::default(),
             commit_opts: CommitOpts::default(),
             tracking: None,
-            policy: QueryConnectionOptions::default(),
+            governance: GovernanceOptions::default(),
         };
 
         let err = consensus
@@ -617,7 +621,7 @@ ex:alice ex:name "Alice" ."#
             txn_opts: TxnOpts::default(),
             commit_opts: CommitOpts::default(),
             tracking: None,
-            policy: QueryConnectionOptions::default(),
+            governance: GovernanceOptions::default(),
         };
 
         let receipt = consensus
@@ -638,7 +642,7 @@ ex:alice ex:name "Alice" ."#
             txn_opts: TxnOpts::default(),
             commit_opts: CommitOpts::default(),
             tracking: None,
-            policy: QueryConnectionOptions::default(),
+            governance: GovernanceOptions::default(),
         };
 
         let err = consensus

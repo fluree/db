@@ -10,7 +10,7 @@ use crate::extract::{FlureeHeaders, MaybeDataBearer};
 use crate::state::AppState;
 use axum::extract::{Path, Request, State};
 use axum::response::{IntoResponse, Response};
-use fluree_db_api::{PushCommitsRequest, PushCommitsResponse, QueryConnectionOptions};
+use fluree_db_api::{GovernanceOptions, PushCommitsRequest, PushCommitsResponse};
 use std::sync::Arc;
 
 /// Push commits to a ledger (ledger in path tail).
@@ -71,7 +71,7 @@ async fn push_ledger_local(
 
     // Build policy options.
     //
-    let mut opts = QueryConnectionOptions {
+    let mut opts = GovernanceOptions {
         // Identity is non-spoofable: derived from bearer token (fluree.identity ?? sub).
         identity: bearer.as_ref().and_then(|p| p.identity.clone()),
         // Allow client-provided inline policy and policy-values headers.

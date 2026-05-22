@@ -3,7 +3,7 @@ use std::sync::Arc;
 use serde_json::Value as JsonValue;
 
 use crate::{
-    ApiError, Batch, DatasetSpec, ExecutableQuery, OverlayProvider, QueryConnectionOptions, Result,
+    ApiError, Batch, DatasetSpec, ExecutableQuery, GovernanceOptions, OverlayProvider, Result,
     Tracker, TrackingOptions, VarRegistry,
 };
 
@@ -248,7 +248,7 @@ pub(crate) fn status_for_query_error(err: &fluree_db_query::QueryError) -> u16 {
 
 pub(crate) fn parse_dataset_spec(
     query_json: &JsonValue,
-) -> Result<(DatasetSpec, QueryConnectionOptions)> {
+) -> Result<(DatasetSpec, GovernanceOptions)> {
     DatasetSpec::from_query_json(query_json).map_err(|e| ApiError::query(e.to_string()))
 }
 

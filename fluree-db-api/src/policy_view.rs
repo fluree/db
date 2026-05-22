@@ -13,10 +13,10 @@
 //! # Usage
 //!
 //! ```ignore
-//! use fluree_db_api::{Fluree, PolicyWrappedView, QueryConnectionOptions};
+//! use fluree_db_api::{Fluree, PolicyWrappedView, GovernanceOptions};
 //!
 //! let ledger = fluree.ledger("mydb:main").await?;
-//! let opts = QueryConnectionOptions { identity: Some("did:example:user".into()), ..Default::default() };
+//! let opts = GovernanceOptions { identity: Some("did:example:user".into()), ..Default::default() };
 //!
 //! // Wrap the ledger view with policy
 //! let wrapped = fluree.wrap_policy_view(&ledger, &opts).await?;
@@ -25,7 +25,7 @@
 //! let results = fluree.query_wrapped(&wrapped, &query).await?;
 //! ```
 
-use crate::dataset::QueryConnectionOptions;
+use crate::dataset::GovernanceOptions;
 use crate::error::Result;
 use crate::policy_builder;
 use fluree_db_core::{LedgerSnapshot, OverlayProvider};
@@ -140,7 +140,7 @@ impl<'a> PolicyWrappedView<'a> {
 /// # Example
 ///
 /// ```ignore
-/// let opts = QueryConnectionOptions {
+/// let opts = GovernanceOptions {
 ///     identity: Some("did:example:user".to_string()),
 ///     ..Default::default()
 /// };
@@ -148,7 +148,7 @@ impl<'a> PolicyWrappedView<'a> {
 /// ```
 pub async fn wrap_policy_view<'a>(
     ledger: &'a LedgerState,
-    opts: &QueryConnectionOptions,
+    opts: &GovernanceOptions,
 ) -> Result<PolicyWrappedView<'a>> {
     let policy_graphs =
         resolve_policy_graphs_from_config(&ledger.snapshot, ledger.novelty.as_ref(), ledger.t())
@@ -175,7 +175,7 @@ pub async fn wrap_policy_view<'a>(
 /// Similar to `wrap_policy_view` but for historical views.
 pub async fn wrap_policy_view_historical<'a>(
     view: &'a HistoricalLedgerView,
-    opts: &QueryConnectionOptions,
+    opts: &GovernanceOptions,
 ) -> Result<PolicyWrappedView<'a>> {
     let policy_graphs = resolve_policy_graphs_from_config(&view.snapshot, view, view.to_t()).await;
 
@@ -216,7 +216,7 @@ pub async fn build_policy_context(
     overlay: &dyn OverlayProvider,
     novelty_for_stats: Option<&Novelty>,
     to_t: i64,
-    opts: &QueryConnectionOptions,
+    opts: &GovernanceOptions,
 ) -> Result<PolicyContext> {
     let policy_graphs = resolve_policy_graphs_from_config(snapshot, overlay, to_t).await;
 
@@ -252,7 +252,7 @@ pub async fn wrap_identity_policy_view<'a>(
     identity_iri: &str,
     default_allow: bool,
 ) -> Result<PolicyWrappedView<'a>> {
-    let opts = QueryConnectionOptions {
+    let opts = GovernanceOptions {
         identity: Some(identity_iri.to_string()),
         default_allow,
         ..Default::default()

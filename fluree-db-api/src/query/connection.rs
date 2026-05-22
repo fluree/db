@@ -6,8 +6,8 @@ use crate::query::helpers::{
 };
 use crate::view::{DataSetDb, GraphDb};
 use crate::{
-    ApiError, DatasetSpec, Fluree, FormatterConfig, PolicyContext, QueryConnectionOptions,
-    QueryResult, Result,
+    ApiError, DatasetSpec, Fluree, FormatterConfig, GovernanceOptions, PolicyContext, QueryResult,
+    Result,
 };
 use fluree_db_query::r2rml::{R2rmlProvider, R2rmlTableProvider};
 
@@ -17,7 +17,7 @@ impl Fluree {
     async fn prepare_single_view_for_connection(
         &self,
         spec: &DatasetSpec,
-        qc_opts: &QueryConnectionOptions,
+        qc_opts: &GovernanceOptions,
     ) -> Result<Option<GraphDb>> {
         let Some(view) = self.try_single_view_from_spec(spec).await? else {
             return Ok(None);
@@ -34,7 +34,7 @@ impl Fluree {
     async fn build_dataset_for_connection(
         &self,
         spec: &DatasetSpec,
-        qc_opts: &QueryConnectionOptions,
+        qc_opts: &GovernanceOptions,
     ) -> Result<DataSetDb> {
         if qc_opts.has_any_policy_inputs() {
             self.build_dataset_view_with_policy(spec, qc_opts).await
@@ -46,7 +46,7 @@ impl Fluree {
     async fn prepare_single_view_for_connection_tracked(
         &self,
         spec: &DatasetSpec,
-        qc_opts: &QueryConnectionOptions,
+        qc_opts: &GovernanceOptions,
     ) -> TrackedResult<Option<GraphDb>> {
         let view = self
             .try_single_view_from_spec(spec)
@@ -69,7 +69,7 @@ impl Fluree {
     async fn build_dataset_for_connection_tracked(
         &self,
         spec: &DatasetSpec,
-        qc_opts: &QueryConnectionOptions,
+        qc_opts: &GovernanceOptions,
     ) -> TrackedResult<DataSetDb> {
         let dataset = if qc_opts.has_any_policy_inputs() {
             self.build_dataset_view_with_policy(spec, qc_opts).await
@@ -647,7 +647,7 @@ impl Fluree {
         &self,
         view: crate::view::GraphDb,
         source: &crate::dataset::GraphSource,
-        global_opts: &crate::QueryConnectionOptions,
+        global_opts: &crate::GovernanceOptions,
     ) -> Result<crate::view::GraphDb> {
         // Per-source policy takes precedence
         if let Some(policy_override) = &source.policy_override {

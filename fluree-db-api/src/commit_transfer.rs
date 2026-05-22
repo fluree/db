@@ -18,7 +18,7 @@
 //! Pages walk backward via `parents` — O(limit) per page regardless of
 //! ledger size. Used by pull and clone operations.
 
-use crate::dataset::QueryConnectionOptions;
+use crate::dataset::GovernanceOptions;
 use crate::error::{ApiError, Result};
 use crate::policy_builder::build_policy_context_from_opts;
 use crate::tx::{IndexingMode, IndexingStatus};
@@ -114,7 +114,7 @@ impl Fluree {
         &self,
         handle: &LedgerHandle,
         request: PushCommitsRequest,
-        opts: &QueryConnectionOptions,
+        opts: &GovernanceOptions,
         index_config: &IndexConfig,
     ) -> Result<PushCommitsResponse> {
         if request.commits.is_empty() {
@@ -644,7 +644,7 @@ async fn build_policy_ctx_for_push(
     base: &LedgerState,
     evolving: &Novelty,
     current_t: i64,
-    opts: &QueryConnectionOptions,
+    opts: &GovernanceOptions,
 ) -> Result<PolicyContext> {
     // Build policy context from opts against current state (db + evolving novelty).
     build_policy_context_from_opts(

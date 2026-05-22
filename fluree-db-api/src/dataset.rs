@@ -287,9 +287,9 @@ pub struct GraphSource {
 
 /// Per-source policy override options
 ///
-/// A subset of `QueryConnectionOptions` that can be applied per-source.
+/// A subset of `GovernanceOptions` that can be applied per-source.
 /// When present on a `GraphSource`, this policy takes precedence over any
-/// global policy specified in `QueryConnectionOptions`.
+/// global policy specified in `GovernanceOptions`.
 #[derive(Debug, Clone, Default)]
 pub struct SourcePolicyOverride {
     pub identity: Option<String>,
@@ -311,12 +311,12 @@ impl SourcePolicyOverride {
             || self.default_allow.is_some()
     }
 
-    /// Convert to `QueryConnectionOptions` for policy wrapping.
+    /// Convert to `GovernanceOptions` for policy wrapping.
     ///
-    /// This creates a minimal `QueryConnectionOptions` with only the policy
+    /// This creates a minimal `GovernanceOptions` with only the policy
     /// fields from this override, suitable for passing to `wrap_policy()`.
-    pub fn to_query_connection_options(&self) -> QueryConnectionOptions {
-        QueryConnectionOptions {
+    pub fn to_query_connection_options(&self) -> GovernanceOptions {
+        GovernanceOptions {
             identity: self.identity.clone(),
             policy_class: self.policy_class.clone(),
             policy: self.policy.clone(),
@@ -659,10 +659,10 @@ impl DatasetSpec {
     /// - Both `fromNamed` (object) and `from-named` (array, legacy) are accepted.
     pub fn from_query_json(
         json: &JsonValue,
-    ) -> Result<(Self, QueryConnectionOptions), DatasetParseError> {
+    ) -> Result<(Self, GovernanceOptions), DatasetParseError> {
         let obj = match json.as_object() {
             Some(o) => o,
-            None => return Ok((Self::new(), QueryConnectionOptions::default())),
+            None => return Ok((Self::new(), GovernanceOptions::default())),
         };
 
         let opts_obj = obj.get("opts").and_then(|v| v.as_object());
@@ -740,7 +740,7 @@ impl DatasetSpec {
         // Validate alias uniqueness across all sources
         validate_alias_uniqueness(&spec)?;
 
-        let qc_opts = QueryConnectionOptions::from_json(json)?;
+        let qc_opts = GovernanceOptions::from_json(json)?;
         Ok((spec, qc_opts))
     }
 }
@@ -756,7 +756,7 @@ impl DatasetSpec {
 /// - `meta` (tracking enablement: bool or object)
 /// - `max-fuel` (fuel limit, also enables fuel tracking)
 #[derive(Debug, Clone, Default)]
-pub struct QueryConnectionOptions {
+pub struct GovernanceOptions {
     pub identity: Option<String>,
     pub policy_class: Option<Vec<String>>,
     pub policy: Option<JsonValue>,
@@ -766,7 +766,7 @@ pub struct QueryConnectionOptions {
     pub tracking: TrackingOptions,
 }
 
-impl QueryConnectionOptions {
+impl GovernanceOptions {
     pub fn from_json(query: &JsonValue) -> Result<Self, DatasetParseError> {
         let obj = match query.as_object() {
             Some(o) => o,

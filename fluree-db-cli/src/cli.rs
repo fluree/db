@@ -126,10 +126,10 @@ impl PolicyArgs {
         }
     }
 
-    /// Convert into a `QueryConnectionOptions` usable by the fluree-db-api.
+    /// Convert into a `GovernanceOptions` usable by the fluree-db-api.
     /// Returns an error if `--policy` or `--policy-values` failed to parse.
-    pub fn to_options(&self) -> Result<fluree_db_api::QueryConnectionOptions, String> {
-        Ok(fluree_db_api::QueryConnectionOptions {
+    pub fn to_options(&self) -> Result<fluree_db_api::GovernanceOptions, String> {
+        Ok(fluree_db_api::GovernanceOptions {
             identity: self.identity.clone(),
             policy_class: if self.policy_class.is_empty() {
                 None

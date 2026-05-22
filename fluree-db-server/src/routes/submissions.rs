@@ -10,9 +10,7 @@ use axum::{
     extract::{Path, State},
     Json,
 };
-use fluree_db_consensus::{
-    IdempotencyKey, SubmissionLookup, SubmissionState, TransactionReceipt,
-};
+use fluree_db_consensus::{IdempotencyKey, SubmissionLookup, SubmissionState, TransactionReceipt};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 
@@ -32,12 +30,8 @@ pub struct SubmissionStatusParams {
 pub enum SubmissionStateResponse {
     Unknown,
     InFlight,
-    Committed {
-        receipt: TransactionReceiptResponse,
-    },
-    Failed {
-        error: String,
-    },
+    Committed { receipt: TransactionReceiptResponse },
+    Failed { error: String },
 }
 
 #[derive(Serialize)]
