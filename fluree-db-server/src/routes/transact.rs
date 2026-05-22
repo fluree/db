@@ -139,6 +139,13 @@ fn extract_idempotency_key(headers: &HeaderMap) -> Option<IdempotencyKey> {
         .map(IdempotencyKey::new)
 }
 
+/// Tracking options requested via headers, or `None` when none were requested.
+fn tracking_from_headers(headers: &FlureeHeaders) -> Option<TrackingOptions> {
+    headers
+        .has_tracking()
+        .then(|| headers.to_tracking_options())
+}
+
 /// Map a [`SubmissionError`] to the [`ServerError`] / HTTP status the rest
 /// of the server expects.
 ///
@@ -1536,9 +1543,7 @@ async fn execute_turtle_transaction(
 
         // Turtle/TriG carries no body `opts`, so policy runs under root.
         // Tracking, however, is header-driven and applies to every format.
-        let tracking = headers
-            .has_tracking()
-            .then(|| headers.to_tracking_options());
+        let tracking = tracking_from_headers(headers);
         let request = TransactionRequest {
             idempotency_key: extract_idempotency_key(&credential.headers),
             txn_type,
@@ -1661,9 +1666,7 @@ async fn execute_sparql_update_request(
     // registry and the namespace-conflict retry that pre-lowering required
     // is gone. `txn_type` is nominal: the lowered Txn carries the real
     // insert/update semantics. Tracking is header-driven for SPARQL.
-    let tracking = headers
-        .has_tracking()
-        .then(|| headers.to_tracking_options());
+    let tracking = tracking_from_headers(headers);
     let request = TransactionRequest {
         idempotency_key: extract_idempotency_key(&credential.headers),
         txn_type: TxnType::Update,
