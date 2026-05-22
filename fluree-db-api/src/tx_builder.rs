@@ -831,12 +831,7 @@ pub(crate) async fn commit_with_handle(
             // no namespace-conflict retry is possible.
             let parsed = fluree_db_sparql::parse_sparql(sparql);
             if parsed.has_errors() {
-                let messages: Vec<String> = parsed
-                    .diagnostics
-                    .iter()
-                    .filter(|d| d.is_error())
-                    .map(|d| d.message.clone())
-                    .collect();
+                let messages: Vec<String> = parsed.errors().map(|d| d.message.clone()).collect();
                 return Err(ApiError::http(
                     400,
                     format!("SPARQL UPDATE parse error: {}", messages.join("; ")),
