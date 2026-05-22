@@ -33,9 +33,8 @@ use axum::http::{HeaderMap, HeaderValue};
 use axum::response::{IntoResponse, Response};
 use axum::Json;
 use fluree_db_api::{
-    lower_sparql_update, parse_sparql, with_index_request_correlation, ApiError, CommitOpts,
-    Fluree, IndexRequestCorrelation, LedgerHandle, NamespaceRegistry, QueryConnectionOptions,
-    SparqlQueryBody, TrackingOptions, TxnOpts, TxnType,
+    ApiError, CommitOpts, Fluree, LedgerHandle, QueryConnectionOptions, TrackingOptions, TxnOpts,
+    TxnType,
 };
 use fluree_db_consensus::{
     IdempotencyKey, SubmissionError, Submitter, TransactionBody, TransactionReceipt,
@@ -1405,6 +1404,7 @@ async fn execute_transaction(
             txn_opts: TxnOpts::default(),
             commit_opts,
             tracking: prepared_transaction.tracking,
+            policy: prepared_transaction.qc_opts,
         };
         submit_via_consensus(state, ledger_id, request, tx_id).await
     }
@@ -1418,14 +1418,6 @@ async fn execute_transaction(
 fn compute_tx_id_turtle(turtle: &str) -> String {
     let hash = Sha256::digest(turtle.as_bytes());
     format!("fluree:tx:sha256:{}", hex::encode(hash))
-}
-
-fn index_request_correlation(
-    headers: &axum::http::HeaderMap,
-    request_id: Option<String>,
-    operation: &'static str,
-) -> IndexRequestCorrelation {
-    IndexRequestCorrelation::new(request_id, extract_trace_id(headers), Some(operation))
 }
 
 /// Execute a Turtle/TriG transaction
@@ -1496,6 +1488,7 @@ async fn execute_turtle_transaction(
             txn_opts: TxnOpts::default(),
             commit_opts,
             tracking: None,
+            policy: QueryConnectionOptions::default(),
         };
         submit_via_consensus(state, ledger_id, request, tx_id).await
     }
@@ -1552,44 +1545,8 @@ async fn execute_sparql_update_request(
     // Enforce write access for unsigned requests when bearer is present/required
     enforce_write_access(state, &ledger_id, bearer, credential)?;
 
-    // Parse SPARQL
-    let parse_output = parse_sparql(&sparql);
-    if parse_output.has_errors() {
-        let errors: Vec<String> = parse_output
-            .diagnostics
-            .iter()
-            .filter(|d| d.is_error())
-            .map(|d| d.message.clone())
-            .collect();
-        set_span_error_code(parent_span, "error:SparqlParse");
-        tracing::warn!(errors = ?errors, "SPARQL UPDATE parse errors");
-        return Err(ServerError::bad_request(format!(
-            "SPARQL UPDATE parse error: {}",
-            errors.join("; ")
-        )));
-    }
-
-    let ast = match parse_output.ast {
-        Some(ast) => ast,
-        None => {
-            set_span_error_code(parent_span, "error:SparqlParse");
-            return Err(ServerError::bad_request("Failed to parse SPARQL UPDATE"));
-        }
-    };
-
-    // Verify this is an UPDATE operation
-    let update_op = match &ast.body {
-        SparqlQueryBody::Update(op) => op,
-        _ => {
-            set_span_error_code(parent_span, "error:BadRequest");
-            tracing::warn!("Expected SPARQL UPDATE, got query");
-            return Err(ServerError::bad_request(
-                "Expected SPARQL UPDATE operation, got query. Use the /query endpoint for SELECT/CONSTRUCT/ASK/DESCRIBE.",
-            ));
-        }
-    };
-
-    // Get ledger handle
+    // Resolve the ledger handle up front: a missing ledger surfaces as a 404
+    // here, and the handle provides the canonical ledger ID for commit_opts.
     let handle = match state.fluree.ledger_cached(&ledger_id).await {
         Ok(handle) => handle,
         Err(e) => {
@@ -1601,9 +1558,9 @@ async fn execute_sparql_update_request(
     };
 
     // Resolve the effective identity honoring the root-impersonation semantic.
-    // For SPARQL UPDATE, impersonation is driven by the `fluree-identity` header
-    // (there is no body-level opts block). Policy-class / policy / policy-values
-    // headers are not yet plumbed for SPARQL UPDATE.
+    // For SPARQL UPDATE, impersonation is driven by the `fluree-identity`
+    // header (there is no body-level opts block); the remaining policy inputs
+    // come from the policy-class / policy / policy-values headers.
     let bearer_identity = effective_author(credential, bearer);
     let effective_identity = crate::routes::policy_auth::resolve_sparql_identity(
         state,
@@ -1621,7 +1578,7 @@ async fn execute_sparql_update_request(
             return Err(e);
         }
     };
-    let qc_opts = fluree_db_api::QueryConnectionOptions {
+    let policy = QueryConnectionOptions {
         identity: effective_identity.clone(),
         policy_class: if headers.policy_class.is_empty() {
             None
@@ -1634,153 +1591,28 @@ async fn execute_sparql_update_request(
         ..Default::default()
     };
 
-    let fluree = &state.fluree;
-    let correlation = index_request_correlation(
-        &credential.headers,
-        extract_request_id(&credential.headers, &state.telemetry_config),
-        "sparql-update",
+    let commit_opts = build_commit_opts(
+        effective_identity.as_deref(),
+        credential,
+        &state.fluree,
+        &handle,
     );
 
-    // Bounded retry around snapshot fetch + lowering + execute.
-    //
-    // `lower_sparql_update` allocates IRIs against a `NamespaceRegistry` built
-    // from the *current* snapshot to assign Sids to template terms. Two
-    // concurrent SPARQL UPDATEs racing on a fresh namespace can both pick the
-    // same first-time code for *different* prefixes, then the second writer
-    // hits `TransactError::NamespaceConflict` at staging because the staging
-    // registry sees the first writer's commit. The fix: re-fetch the snapshot
-    // and re-lower against the latest namespace allocations. Bounded to 3
-    // attempts to avoid livelock; the conflict is rare (requires concurrent
-    // writers AND first-time-namespace contention), so 1 retry is usually
-    // enough.
-    const MAX_NS_RETRIES: usize = 3;
-    let mut last_error: Option<ServerError> = None;
-    let mut result = None;
-    for attempt in 1..=MAX_NS_RETRIES {
-        let cached_state = handle.snapshot().await;
-        let mut ns = NamespaceRegistry::from_db(&cached_state.snapshot);
-
-        // Build PolicyContext from the resolved identity plus all header-supplied
-        // policy fields. Rebuilt each attempt because it depends on the snapshot.
-        let policy_ctx = if qc_opts.has_any_policy_inputs() {
-            match fluree_db_api::build_policy_context(
-                &cached_state.snapshot,
-                cached_state.novelty.as_ref(),
-                Some(cached_state.novelty.as_ref()),
-                cached_state.t,
-                &qc_opts,
-            )
-            .await
-            {
-                Ok(ctx) => Some(ctx),
-                Err(e) => {
-                    let server_error = ServerError::Api(e);
-                    set_span_error_code(parent_span, "error:PolicyBuildFailed");
-                    tracing::error!(error = %server_error, "failed to build policy context for SPARQL UPDATE");
-                    return Err(server_error);
-                }
-            }
-        } else {
-            None
-        };
-
-        let txn = match lower_sparql_update(update_op, &ast.prologue, &mut ns, TxnOpts::default()) {
-            Ok(txn) => txn,
-            Err(e) => {
-                set_span_error_code(parent_span, "error:SparqlLower");
-                tracing::warn!(error = %e, "SPARQL UPDATE lowering failed");
-                return Err(ServerError::SparqlUpdateLower(e));
-            }
-        };
-
-        tracing::debug!(
-            tx_id = %tx_id,
-            attempt,
-            txn_type = ?txn.txn_type,
-            where_patterns = txn.where_patterns.len(),
-            delete_templates = txn.delete_templates.len(),
-            insert_templates = txn.insert_templates.len(),
-            "SPARQL UPDATE lowered to Txn IR"
-        );
-
-        let mut builder = fluree.stage(&handle).txn(txn);
-        let mut commit_opts = CommitOpts::default();
-        if let Some(d) = &effective_identity {
-            commit_opts = commit_opts.identity(d.clone());
-        }
-        // If the request was signed, ALWAYS store the original signed envelope
-        // for provenance. Spawn the upload in parallel with the rest of the
-        // pipeline. Re-spawning across retries is harmless: the content store
-        // is content-addressed so duplicate puts are idempotent.
-        if let Some(raw_txn) = raw_txn_from_credential(credential) {
-            let content_store = fluree.content_store(handle.ledger_id());
-            commit_opts = commit_opts.with_raw_txn_spawned(content_store, raw_txn);
-        }
-        builder = builder.commit_opts(commit_opts);
-        if let Some(config) = &state.index_config {
-            builder = builder.index_config(config.clone());
-        }
-        if let Some(ctx) = policy_ctx {
-            builder = builder.policy(ctx);
-        }
-
-        match with_index_request_correlation(correlation.clone(), builder.execute()).await {
-            Ok(r) => {
-                tracing::info!(
-                    status = "success",
-                    attempt,
-                    commit_t = r.receipt.t,
-                    commit_id = %r.receipt.commit_id,
-                    "SPARQL UPDATE committed"
-                );
-                result = Some(r);
-                break;
-            }
-            Err(fluree_db_api::ApiError::Transact(
-                fluree_db_api::TransactError::NamespaceConflict(msg),
-            )) if attempt < MAX_NS_RETRIES => {
-                tracing::warn!(
-                    attempt,
-                    max_attempts = MAX_NS_RETRIES,
-                    %msg,
-                    "SPARQL UPDATE namespace conflict; re-lowering against latest snapshot"
-                );
-                continue;
-            }
-            Err(e) => {
-                let server_error = ServerError::Api(e);
-                set_span_error_code(parent_span, "error:InvalidTransaction");
-                tracing::error!(error = %server_error, attempt, "SPARQL UPDATE failed");
-                last_error = Some(server_error);
-                break;
-            }
-        }
-    }
-    let result = match result {
-        Some(r) => r,
-        None => {
-            return Err(last_error.unwrap_or_else(|| {
-                ServerError::internal("SPARQL UPDATE failed after retries with no captured error")
-            }));
-        }
+    // The query is parsed and lowered inside the consensus layer, under the
+    // ledger write lock — so namespace allocation shares the staging
+    // registry and the namespace-conflict retry that pre-lowering required
+    // is gone. `txn_type` is nominal: the lowered Txn carries the real
+    // insert/update semantics.
+    let request = TransactionRequest {
+        idempotency_key: extract_idempotency_key(&credential.headers),
+        txn_type: TxnType::Update,
+        body: TransactionBody::Sparql(sparql),
+        txn_opts: TxnOpts::default(),
+        commit_opts,
+        tracking: None,
+        policy,
     };
-
-    let response_json = Json(TransactResponse {
-        ledger_id,
-        t: result.receipt.t,
-        tx_id,
-        commit: CommitInfo {
-            hash: result.receipt.commit_id.to_string(),
-        },
-    });
-
-    match result.tally {
-        Some(tally) => {
-            let hdrs = tracking_headers(&tally);
-            Ok((hdrs, response_json).into_response())
-        }
-        None => Ok(response_json.into_response()),
-    }
+    submit_via_consensus(state, &ledger_id, request, tx_id).await
 }
 
 // ===== Peer mode forwarding =====

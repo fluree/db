@@ -29,26 +29,19 @@ fn execution_failure(err: ApiError) -> SubmissionError {
     }
 }
 
-/// Build a [`PolicyContext`] from the ledger state when the transaction body
-/// carries policy inputs (identity / policy class in its `opts`).
+/// Build a [`PolicyContext`] from the request's policy inputs.
 ///
 /// Returns `Ok(None)` when there are no policy inputs — the transaction runs
 /// under root. The context is built from a snapshot of the ledger this node
 /// is about to stage against, so policy enforcement reflects the same state
 /// the transaction commits onto. Building it here, rather than having the
-/// caller pre-build and pass it, keeps the policy context bound to the
-/// executing node's state — the shape a replicated implementation needs.
+/// caller pre-build and pass a context, keeps the policy context bound to
+/// the executing node's state — the shape a replicated implementation needs.
 async fn build_policy_context(
     ledger_handle: &LedgerHandle,
-    body: &TransactionBody,
+    policy: &QueryConnectionOptions,
 ) -> Result<Option<PolicyContext>, SubmissionError> {
-    // Only JSON-LD bodies carry an `opts` object; Turtle/TriG is pure RDF
-    // text with no place for policy inputs, so it always runs under root.
-    let TransactionBody::JsonLd(json) = body else {
-        return Ok(None);
-    };
-    let qc_opts = QueryConnectionOptions::from_json(json).unwrap_or_default();
-    if !qc_opts.has_any_policy_inputs() {
+    if !policy.has_any_policy_inputs() {
         return Ok(None);
     }
 
@@ -58,7 +51,7 @@ async fn build_policy_context(
         snap.novelty.as_ref(),
         Some(snap.novelty.as_ref()),
         snap.t,
-        &qc_opts,
+        policy,
     )
     .await
     .map(Some)
@@ -130,6 +123,10 @@ impl MonolithicConsensus {
                 hasher.update(b"turtle");
                 hasher.update(text.as_bytes());
             }
+            TransactionBody::Sparql(text) => {
+                hasher.update(b"sparql");
+                hasher.update(text.as_bytes());
+            }
         }
         hasher.update(format!("{:?}", request.txn_type).as_bytes());
         hasher.finalize().into()
@@ -154,6 +151,7 @@ impl MonolithicConsensus {
             txn_opts,
             commit_opts,
             tracking,
+            policy,
         } = request;
 
         let ledger_handle = self
@@ -162,7 +160,7 @@ impl MonolithicConsensus {
             .await
             .map_err(execution_failure)?;
 
-        let policy_ctx = build_policy_context(&ledger_handle, &body).await?;
+        let policy_ctx = build_policy_context(&ledger_handle, &policy).await?;
 
         // The builder API holds the ledger write lock and replaces the cached
         // state internally for the duration of stage + commit — no manual
@@ -185,6 +183,9 @@ impl MonolithicConsensus {
                     message: "Turtle/TriG is not supported for update transactions".into(),
                 });
             }
+            // SPARQL UPDATE carries its own insert/update semantics in the
+            // query, so `txn_type` is ignored for this body.
+            (TransactionBody::Sparql(query), _) => staged.sparql_update(query.as_str()),
         };
         let mut builder = staged
             .txn_opts(txn_opts)
@@ -322,6 +323,7 @@ mod tests {
             txn_opts: TxnOpts::default(),
             commit_opts: CommitOpts::default(),
             tracking: None,
+            policy: QueryConnectionOptions::default(),
         }
     }
 
@@ -476,17 +478,16 @@ mod tests {
     async fn policy_default_allow_permits_transaction() {
         let (_fluree, consensus, ledger_id) = setup().await;
 
-        // `default-allow: true` in `opts` is a policy input — it triggers
-        // policy-context construction inside the consensus layer — and it
-        // permits the write.
-        let body = json!({
-            "@context": {"ex": "http://example.org/"},
-            "@graph": [{"@id": "ex:alice", "ex:name": "Alice"}],
-            "opts": {"default-allow": true}
-        });
+        // `default-allow: true` is a policy input — it triggers policy-context
+        // construction inside the consensus layer — and it permits the write.
+        let mut req = request(None, sample_insert("alice"));
+        req.policy = QueryConnectionOptions {
+            default_allow: true,
+            ..Default::default()
+        };
 
         let receipt = consensus
-            .submit(&ledger_id, request(None, body))
+            .submit(&ledger_id, req)
             .await
             .expect("policy-permitted transaction to succeed");
         assert!(receipt.commit.flake_count > 0);
@@ -501,18 +502,19 @@ mod tests {
         // layer's policy enforcement must reject it.
         let body = json!({
             "@context": {"ex": "http://example.org/"},
-            "insert": {"@id": "ex:john", "ex:name": "John"},
-            "opts": {
-                "policy": [{
-                    "@id": "ex:viewOnly",
-                    "f:action": [{"@id": "f:view"}],
-                    "f:allow": true
-                }],
-                "default-allow": false
-            }
+            "insert": {"@id": "ex:john", "ex:name": "John"}
         });
         let mut req = request(None, body);
         req.txn_type = TxnType::Update;
+        req.policy = QueryConnectionOptions {
+            policy: Some(json!([{
+                "@id": "ex:viewOnly",
+                "f:action": [{"@id": "f:view"}],
+                "f:allow": true
+            }])),
+            default_allow: false,
+            ..Default::default()
+        };
 
         let err = consensus
             .submit(&ledger_id, req)
@@ -561,6 +563,7 @@ ex:alice ex:name "Alice" ."#;
             txn_opts: TxnOpts::default(),
             commit_opts: CommitOpts::default(),
             tracking: None,
+            policy: QueryConnectionOptions::default(),
         };
 
         let receipt = consensus
@@ -585,6 +588,7 @@ ex:alice ex:name "Alice" ."#
             txn_opts: TxnOpts::default(),
             commit_opts: CommitOpts::default(),
             tracking: None,
+            policy: QueryConnectionOptions::default(),
         };
 
         let err = consensus
@@ -594,6 +598,56 @@ ex:alice ex:name "Alice" ."#
         match err {
             SubmissionError::Execution { status, .. } => {
                 assert_eq!(status, 400, "Turtle-update rejection should be 400");
+            }
+            other => panic!("expected Execution, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn sparql_update_routes_through_consensus() {
+        let (_fluree, consensus, ledger_id) = setup().await;
+
+        let req = TransactionRequest {
+            idempotency_key: None,
+            txn_type: TxnType::Update,
+            body: TransactionBody::Sparql(
+                r#"INSERT DATA { <http://example.org/alice> <http://example.org/name> "Alice" . }"#
+                    .to_string(),
+            ),
+            txn_opts: TxnOpts::default(),
+            commit_opts: CommitOpts::default(),
+            tracking: None,
+            policy: QueryConnectionOptions::default(),
+        };
+
+        let receipt = consensus
+            .submit(&ledger_id, req)
+            .await
+            .expect("SPARQL UPDATE to succeed");
+        assert!(receipt.commit.flake_count > 0);
+    }
+
+    #[tokio::test]
+    async fn sparql_parse_error_is_rejected() {
+        let (_fluree, consensus, ledger_id) = setup().await;
+
+        let req = TransactionRequest {
+            idempotency_key: None,
+            txn_type: TxnType::Update,
+            body: TransactionBody::Sparql("INSERT DATA { this is not valid sparql".to_string()),
+            txn_opts: TxnOpts::default(),
+            commit_opts: CommitOpts::default(),
+            tracking: None,
+            policy: QueryConnectionOptions::default(),
+        };
+
+        let err = consensus
+            .submit(&ledger_id, req)
+            .await
+            .expect_err("malformed SPARQL should be rejected");
+        match err {
+            SubmissionError::Execution { status, .. } => {
+                assert_eq!(status, 400, "SPARQL parse error should be 400");
             }
             other => panic!("expected Execution, got {other:?}"),
         }

@@ -25,8 +25,8 @@ use crate::{
 use fluree_db_core::{ContentId, ContentKind};
 use fluree_db_ledger::{IndexConfig, LedgerState, StagedLedger};
 use fluree_db_transact::{
-    parse_trig_phase1, CommitOpts, NamedGraphBlock, NamespaceRegistry, RawTrigMeta, Txn, TxnOpts,
-    TxnType,
+    lower_sparql_update_ast, parse_trig_phase1, CommitOpts, NamedGraphBlock, NamespaceRegistry,
+    RawTrigMeta, Txn, TxnOpts, TxnType,
 };
 
 // ============================================================================
@@ -112,8 +112,11 @@ impl TransactOperation<'_> {
 /// Shared fields for both transaction builders.
 pub(crate) struct TransactCore<'a> {
     pub(crate) operation: Option<TransactOperation<'a>>,
-    /// Pre-built transaction IR (bypasses parsing, used for SPARQL UPDATE)
+    /// Pre-built transaction IR (bypasses parsing).
     pub(crate) pre_built_txn: Option<Txn>,
+    /// Raw SPARQL UPDATE text, lowered to a `Txn` under the write lock during
+    /// `execute()` so its namespace allocation shares the staging registry.
+    pub(crate) pending_sparql: Option<&'a str>,
     pub(crate) txn_opts: TxnOpts,
     pub(crate) commit_opts: CommitOpts,
     pub(crate) index_config: Option<IndexConfig>,
@@ -127,6 +130,7 @@ impl<'a> TransactCore<'a> {
         Self {
             operation: None,
             pre_built_txn: None,
+            pending_sparql: None,
             txn_opts: TxnOpts::default(),
             commit_opts: CommitOpts::default(),
             index_config: None,
@@ -137,13 +141,30 @@ impl<'a> TransactCore<'a> {
     }
 
     pub(crate) fn set_pre_built_txn(&mut self, txn: Txn) {
-        if self.operation.is_some() || self.pre_built_txn.is_some() {
+        if self.operation.is_some()
+            || self.pre_built_txn.is_some()
+            || self.pending_sparql.is_some()
+        {
             self.errors.push(BuilderError::Conflict {
                 field: "operation",
                 message: "Transaction operation already set; cannot set pre-built txn".to_string(),
             });
         } else {
             self.pre_built_txn = Some(txn);
+        }
+    }
+
+    pub(crate) fn set_sparql_update(&mut self, sparql: &'a str) {
+        if self.operation.is_some()
+            || self.pre_built_txn.is_some()
+            || self.pending_sparql.is_some()
+        {
+            self.errors.push(BuilderError::Conflict {
+                field: "operation",
+                message: "Transaction operation already set; cannot set SPARQL UPDATE".to_string(),
+            });
+        } else {
+            self.pending_sparql = Some(sparql);
         }
     }
 
@@ -161,11 +182,14 @@ impl<'a> TransactCore<'a> {
 
     pub(crate) fn validate(&self) -> std::result::Result<(), BuilderErrors> {
         let mut errors = self.errors.clone();
-        // Either operation or pre_built_txn must be set
-        if self.operation.is_none() && self.pre_built_txn.is_none() {
+        // Exactly one of operation / pre_built_txn / pending_sparql must be set.
+        if self.operation.is_none()
+            && self.pre_built_txn.is_none()
+            && self.pending_sparql.is_none()
+        {
             errors.push(BuilderError::Missing {
                 field: "operation",
-                hint: "Call .insert(), .upsert(), .update(), .insert_turtle(), .upsert_turtle(), or .txn()",
+                hint: "Call .insert(), .upsert(), .update(), .insert_turtle(), .upsert_turtle(), .sparql_update(), or .txn()",
             });
         }
         if errors.is_empty() {
@@ -693,6 +717,18 @@ impl<'a> RefTransactBuilder<'a> {
         self
     }
 
+    /// Set the operation to a SPARQL UPDATE.
+    ///
+    /// Unlike [`txn`](Self::txn), the query is parsed and lowered during
+    /// `execute()` — under the ledger write lock — so its namespace
+    /// allocation and staging share one registry. This avoids the
+    /// namespace-conflict retry that pre-lowering against an unlocked
+    /// snapshot would require.
+    pub fn sparql_update(mut self, sparql: &'a str) -> Self {
+        self.core.set_sparql_update(sparql);
+        self
+    }
+
     // -- Option setters --
 
     /// Set transaction options (author, context, etc.).
@@ -768,15 +804,51 @@ pub(crate) async fn commit_with_handle(
 
     // Fast path retains legacy behavior for complex cases that cannot be retried
     // without cloning inputs (e.g., pre-built Txn IR), or when using tracked+policy staging.
-    if core.pre_built_txn.is_some() || core.policy.is_some() {
+    if core.pre_built_txn.is_some() || core.pending_sparql.is_some() || core.policy.is_some() {
         // Acquire write lock
         let mut write_guard = handle.lock_for_write().await;
         let ledger_state = write_guard.clone_state();
 
-        // Handle pre-built Txn (SPARQL UPDATE) vs operation-based transaction
+        // Handle pre-built Txn / SPARQL UPDATE / operation-based transaction.
         let (stage_result, txn_type, commit_opts) = if let Some(txn) = core.pre_built_txn {
             let txn_type = txn.txn_type;
             // For pre-built Txn, don't attach raw_txn (we don't have the original format)
+            let stage_result = fluree
+                .stage_transaction_from_txn(
+                    ledger_state,
+                    txn,
+                    Some(&index_config),
+                    core.policy.as_ref(),
+                    Some(&tracker),
+                )
+                .await?;
+            (stage_result, txn_type, core.commit_opts)
+        } else if let Some(sparql) = core.pending_sparql {
+            // Parse + lower under the write lock: the namespace registry is
+            // built from the locked `ledger_state`, the same state staging
+            // runs against — so lowering and staging share one registry and
+            // no namespace-conflict retry is possible.
+            let parsed = fluree_db_sparql::parse_sparql(sparql);
+            if parsed.has_errors() {
+                let messages: Vec<String> = parsed
+                    .diagnostics
+                    .iter()
+                    .filter(|d| d.is_error())
+                    .map(|d| d.message.clone())
+                    .collect();
+                return Err(ApiError::http(
+                    400,
+                    format!("SPARQL UPDATE parse error: {}", messages.join("; ")),
+                ));
+            }
+            let ast = parsed
+                .ast
+                .ok_or_else(|| ApiError::http(400, "Failed to parse SPARQL UPDATE".to_string()))?;
+            let mut ns = NamespaceRegistry::from_db(&ledger_state.snapshot);
+            let txn = lower_sparql_update_ast(&ast, &mut ns, core.txn_opts).map_err(|e| {
+                ApiError::http(400, format!("SPARQL UPDATE lowering error: {e}"))
+            })?;
+            let txn_type = txn.txn_type;
             let stage_result = fluree
                 .stage_transaction_from_txn(
                     ledger_state,

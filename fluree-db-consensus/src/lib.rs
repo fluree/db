@@ -23,7 +23,7 @@ pub mod monolithic;
 pub use monolithic::{MonolithicConsensus, DEFAULT_IDEMPOTENCY_TTL};
 
 use async_trait::async_trait;
-use fluree_db_api::{TrackingOptions, TrackingTally};
+use fluree_db_api::{QueryConnectionOptions, TrackingOptions, TrackingTally};
 use fluree_db_transact::{CommitOpts, CommitReceipt, TxnOpts, TxnType};
 use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
@@ -77,6 +77,10 @@ pub enum TransactionBody {
     JsonLd(JsonValue),
     /// Turtle or TriG RDF text. The parser handles TriG `GRAPH` blocks.
     Turtle(String),
+    /// SPARQL UPDATE query text. The lowered `Txn` carries its own
+    /// insert/update semantics, so [`TransactionRequest::txn_type`] is
+    /// nominal for this variant.
+    Sparql(String),
 }
 
 /// Transaction submission payload.
@@ -91,6 +95,12 @@ pub enum TransactionBody {
 ///
 /// `tracking` enables fuel/time/policy accounting; when present, the
 /// resulting [`TransactionReceipt`] carries a [`TrackingTally`].
+///
+/// `policy` carries the identity and policy configuration for the
+/// transaction. The implementation builds the policy context from it
+/// against the ledger state it executes against. Callers assemble it from
+/// wherever the inputs live — a JSON-LD body's `opts`, or request headers
+/// for SPARQL. Its nested `tracking` field is unused; see `tracking` above.
 pub struct TransactionRequest {
     pub idempotency_key: Option<IdempotencyKey>,
     pub txn_type: TxnType,
@@ -98,6 +108,7 @@ pub struct TransactionRequest {
     pub txn_opts: TxnOpts,
     pub commit_opts: CommitOpts,
     pub tracking: Option<TrackingOptions>,
+    pub policy: QueryConnectionOptions,
 }
 
 /// Receipt returned once a submission is durably accepted.
