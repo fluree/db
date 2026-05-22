@@ -33,8 +33,9 @@ use axum::http::{HeaderMap, HeaderValue};
 use axum::response::{IntoResponse, Response};
 use axum::Json;
 use fluree_db_api::{
-    ApiError, CommitOpts, Fluree, GovernanceOptions, LedgerHandle, PolicyStats, TrackingOptions,
-    TrackingTally, TxnOpts, TxnType,
+    with_index_request_correlation, ApiError, CommitOpts, Fluree, GovernanceOptions,
+    IndexRequestCorrelation, LedgerHandle, PolicyStats, TrackingOptions, TrackingTally, TxnOpts,
+    TxnType,
 };
 use fluree_db_consensus::{
     IdempotencyKey, SubmissionError, Submitter, TransactionBody, TransactionReceipt,
@@ -264,20 +265,38 @@ fn build_commit_opts(
     commit_opts
 }
 
-/// Submit a prepared transaction through monolithic consensus.
+/// Submit a prepared transaction through monolithic consensus and shape the
+/// HTTP response.
 ///
-/// Used by [`execute_transaction`] when the request is eligible for the
-/// consensus path (currently: `Insert` without tracking or policy). All the
-/// upstream preparation (header injection, identity wiring, opts assembly,
-/// `tx_id` derivation) happens in the caller; this helper is purely the
-/// submission + response shaping step.
+/// All upstream preparation (header injection, identity wiring, opts
+/// assembly, `tx_id` derivation) happens in the caller. Request correlation
+/// is attached around the submission so background index work the
+/// transaction triggers stays attributable to the originating request.
 async fn submit_via_consensus(
     state: &AppState,
     ledger_id: &str,
     request: TransactionRequest,
     tx_id: String,
+    headers: &HeaderMap,
 ) -> Result<Response> {
-    let receipt = match state.consensus.submit(ledger_id, request).await {
+    let operation = match &request.body {
+        TransactionBody::Sparql(_) => "sparql-update",
+        _ => match request.txn_type {
+            TxnType::Insert => "insert",
+            TxnType::Upsert => "upsert",
+            TxnType::Update => "update",
+        },
+    };
+    let correlation = IndexRequestCorrelation::new(
+        extract_request_id(headers, &state.telemetry_config),
+        extract_trace_id(headers),
+        Some(operation),
+    );
+
+    let submission =
+        with_index_request_correlation(correlation, state.consensus.submit(ledger_id, request))
+            .await;
+    let receipt = match submission {
         Ok(receipt) => {
             tracing::info!(
                 status = "success",
@@ -1454,7 +1473,7 @@ async fn execute_transaction(
             tracking: prepared_transaction.tracking,
             governance: prepared_transaction.governance,
         };
-        submit_via_consensus(state, ledger_id, request, tx_id).await
+        submit_via_consensus(state, ledger_id, request, tx_id, &credential.headers).await
     }
     .instrument(span)
     .await
@@ -1547,7 +1566,7 @@ async fn execute_turtle_transaction(
             tracking,
             governance: GovernanceOptions::default(),
         };
-        submit_via_consensus(state, ledger_id, request, tx_id).await
+        submit_via_consensus(state, ledger_id, request, tx_id, &credential.headers).await
     }
     .instrument(span)
     .await
@@ -1670,7 +1689,7 @@ async fn execute_sparql_update_request(
         tracking,
         governance,
     };
-    submit_via_consensus(state, &ledger_id, request, tx_id).await
+    submit_via_consensus(state, &ledger_id, request, tx_id, &credential.headers).await
 }
 
 // ===== Peer mode forwarding =====
