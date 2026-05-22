@@ -66,6 +66,19 @@ impl From<&str> for IdempotencyKey {
     }
 }
 
+/// The transaction payload in its submitted form.
+///
+/// The variant fixes how the body is parsed and staged; [`TransactionRequest::txn_type`]
+/// independently fixes the insert/update/upsert semantics. Not every
+/// combination is valid — Turtle/TriG bodies do not support `Update`
+/// (SPARQL UPDATE is the update path for RDF text).
+pub enum TransactionBody {
+    /// A JSON-LD transaction document.
+    JsonLd(JsonValue),
+    /// Turtle or TriG RDF text. The parser handles TriG `GRAPH` blocks.
+    Turtle(String),
+}
+
 /// Transaction submission payload.
 ///
 /// Carries the transaction itself plus everything an implementation needs to
@@ -81,7 +94,7 @@ impl From<&str> for IdempotencyKey {
 pub struct TransactionRequest {
     pub idempotency_key: Option<IdempotencyKey>,
     pub txn_type: TxnType,
-    pub txn_json: JsonValue,
+    pub body: TransactionBody,
     pub txn_opts: TxnOpts,
     pub commit_opts: CommitOpts,
     pub tracking: Option<TrackingOptions>,

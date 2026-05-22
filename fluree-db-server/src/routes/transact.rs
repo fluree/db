@@ -38,7 +38,8 @@ use fluree_db_api::{
     SparqlQueryBody, TrackingOptions, TxnOpts, TxnType,
 };
 use fluree_db_consensus::{
-    IdempotencyKey, SubmissionError, Submitter, TransactionReceipt, TransactionRequest,
+    IdempotencyKey, SubmissionError, Submitter, TransactionBody, TransactionReceipt,
+    TransactionRequest,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
@@ -1397,7 +1398,7 @@ async fn execute_transaction(
         let request = TransactionRequest {
             idempotency_key,
             txn_type,
-            txn_json: prepared_transaction.body,
+            body: TransactionBody::JsonLd(prepared_transaction.body),
             txn_opts: TxnOpts::default(),
             commit_opts,
             tracking: prepared_transaction.tracking,
@@ -1481,86 +1482,19 @@ async fn execute_turtle_transaction(
             }
         };
 
-        let did = author.map(String::from);
+        let commit_opts = build_commit_opts(author, credential, &state.fluree, &handle);
 
-        let txn_opts = TxnOpts::default();
-
-        // Build fluree handle first so we can spawn the raw-txn upload in
-        // parallel with the rest of the pipeline.
-        let fluree = &state.fluree;
-
-        // If the request was signed, ALWAYS store the original signed envelope for provenance.
-        let mut commit_opts = match &did {
-            Some(d) => CommitOpts::default().identity(d.clone()),
-            None => CommitOpts::default(),
+        // Turtle/TriG carries no `opts`, so there are no policy or tracking
+        // inputs; the consensus layer handles the rest of execution.
+        let request = TransactionRequest {
+            idempotency_key: extract_idempotency_key(&credential.headers),
+            txn_type,
+            body: TransactionBody::Turtle(turtle.to_string()),
+            txn_opts: TxnOpts::default(),
+            commit_opts,
+            tracking: None,
         };
-        if let Some(raw_txn) = raw_txn_from_credential(credential) {
-            let content_store = fluree.content_store(handle.ledger_id());
-            commit_opts = commit_opts.with_raw_txn_spawned(content_store, raw_txn);
-        }
-
-        let builder = fluree.stage(&handle);
-        let builder = match txn_type {
-            // Insert with plain Turtle: use fast direct flake path
-            TxnType::Insert => builder.insert_turtle(turtle),
-            // Upsert: use upsert_turtle which handles GRAPH blocks for named graphs
-            TxnType::Upsert => builder.upsert_turtle(turtle),
-            TxnType::Update => {
-                // Update with Turtle is not supported - use SPARQL UPDATE instead
-                set_span_error_code(&span, "error:BadRequest");
-                return Err(ServerError::bad_request(
-                    "Turtle format is not supported for update transactions. Use SPARQL UPDATE instead.",
-                ));
-            }
-        };
-        let mut builder = builder.txn_opts(txn_opts).commit_opts(commit_opts);
-        if let Some(config) = &state.index_config {
-            builder = builder.index_config(config.clone());
-        }
-
-        let correlation = index_request_correlation(
-            &credential.headers,
-            extract_request_id(&credential.headers, &state.telemetry_config),
-            match txn_type {
-                TxnType::Insert => "insert",
-                TxnType::Upsert => "upsert",
-                TxnType::Update => "update",
-            },
-        );
-        let result = match with_index_request_correlation(correlation, builder.execute()).await {
-            Ok(result) => {
-                tracing::info!(
-                    status = "success",
-                    commit_t = result.receipt.t,
-                    commit_id = %result.receipt.commit_id,
-                    "Turtle/TriG transaction committed"
-                );
-                result
-            }
-            Err(e) => {
-                let server_error = ServerError::Api(e);
-                set_span_error_code(&span, "error:InvalidTransaction");
-                tracing::error!(error = %server_error, "Turtle/TriG transaction failed");
-                return Err(server_error);
-            }
-        };
-
-        let response_json = Json(TransactResponse {
-            ledger_id: ledger_id.to_string(),
-            t: result.receipt.t,
-            tx_id,
-            commit: CommitInfo {
-                hash: result.receipt.commit_id.to_string(),
-            },
-        });
-
-        match result.tally {
-            Some(tally) => {
-                let hdrs = tracking_headers(&tally);
-                Ok((hdrs, response_json).into_response())
-            }
-            None => Ok(response_json.into_response()),
-        }
+        submit_via_consensus(state, ledger_id, request, tx_id).await
     }
     .instrument(span)
     .await

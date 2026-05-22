@@ -7,14 +7,13 @@
 
 use crate::{
     IdempotencyKey, SubmissionError, SubmissionLookup, SubmissionState, Submitter,
-    TransactionReceipt, TransactionRequest,
+    TransactionBody, TransactionReceipt, TransactionRequest,
 };
 use async_trait::async_trait;
 use fluree_db_api::{Fluree, LedgerHandle, LedgerManager, PolicyContext, QueryConnectionOptions};
 use fluree_db_ledger::IndexConfig;
 use fluree_db_transact::TxnType;
 use moka::future::Cache;
-use serde_json::Value as JsonValue;
 use sha2::{Digest, Sha256};
 use std::sync::Arc;
 use std::time::Duration;
@@ -30,9 +29,14 @@ use std::time::Duration;
 /// executing node's state — the shape a replicated implementation needs.
 async fn build_policy_context(
     ledger_handle: &LedgerHandle,
-    txn_json: &JsonValue,
+    body: &TransactionBody,
 ) -> Result<Option<PolicyContext>, SubmissionError> {
-    let qc_opts = QueryConnectionOptions::from_json(txn_json).unwrap_or_default();
+    // Only JSON-LD bodies carry an `opts` object; Turtle/TriG is pure RDF
+    // text with no place for policy inputs, so it always runs under root.
+    let TransactionBody::JsonLd(json) = body else {
+        return Ok(None);
+    };
+    let qc_opts = QueryConnectionOptions::from_json(json).unwrap_or_default();
     if !qc_opts.has_any_policy_inputs() {
         return Ok(None);
     }
@@ -104,7 +108,18 @@ impl MonolithicConsensus {
 
     fn hash_request_body(request: &TransactionRequest) -> [u8; 32] {
         let mut hasher = Sha256::new();
-        hasher.update(request.txn_json.to_string().as_bytes());
+        // The format tag keeps a JSON-LD body and a Turtle body that happen
+        // to stringify alike from hashing to the same value.
+        match &request.body {
+            TransactionBody::JsonLd(json) => {
+                hasher.update(b"jsonld");
+                hasher.update(json.to_string().as_bytes());
+            }
+            TransactionBody::Turtle(text) => {
+                hasher.update(b"turtle");
+                hasher.update(text.as_bytes());
+            }
+        }
         hasher.update(format!("{:?}", request.txn_type).as_bytes());
         hasher.finalize().into()
     }
@@ -125,7 +140,7 @@ impl MonolithicConsensus {
         let TransactionRequest {
             idempotency_key,
             txn_type,
-            txn_json,
+            body,
             txn_opts,
             commit_opts,
             tracking,
@@ -137,18 +152,30 @@ impl MonolithicConsensus {
             .await
             .map_err(|e| SubmissionError::Submission(format!("ledger load: {e}")))?;
 
-        let policy_ctx = build_policy_context(&ledger_handle, &txn_json).await?;
+        let policy_ctx = build_policy_context(&ledger_handle, &body).await?;
 
         // The builder API holds the ledger write lock and replaces the cached
         // state internally for the duration of stage + commit — no manual
-        // lock/clone/replace dance is needed here.
-        let builder = self.fluree.stage(&ledger_handle);
-        let builder = match txn_type {
-            TxnType::Insert => builder.insert(&txn_json),
-            TxnType::Upsert => builder.upsert(&txn_json),
-            TxnType::Update => builder.update(&txn_json),
+        // lock/clone/replace dance is needed here. The (body, txn_type) pair
+        // selects the staging operation; Turtle/TriG has no update form.
+        let staged = self.fluree.stage(&ledger_handle);
+        let staged = match (&body, txn_type) {
+            (TransactionBody::JsonLd(json), TxnType::Insert) => staged.insert(json),
+            (TransactionBody::JsonLd(json), TxnType::Upsert) => staged.upsert(json),
+            (TransactionBody::JsonLd(json), TxnType::Update) => staged.update(json),
+            (TransactionBody::Turtle(text), TxnType::Insert) => {
+                staged.insert_turtle(text.as_str())
+            }
+            (TransactionBody::Turtle(text), TxnType::Upsert) => {
+                staged.upsert_turtle(text.as_str())
+            }
+            (TransactionBody::Turtle(_), TxnType::Update) => {
+                return Err(SubmissionError::Submission(
+                    "Turtle/TriG is not supported for update transactions".into(),
+                ));
+            }
         };
-        let mut builder = builder
+        let mut builder = staged
             .txn_opts(txn_opts)
             .commit_opts(commit_opts)
             .index_config(self.index_config.clone());
@@ -248,7 +275,7 @@ mod tests {
     use super::*;
     use fluree_db_api::{FlureeBuilder, TrackingOptions};
     use fluree_db_transact::{CommitOpts, TxnOpts};
-    use serde_json::json;
+    use serde_json::{json, Value as JsonValue};
 
     /// Build a Fluree + `MonolithicConsensus` + initialized ledger.
     ///
@@ -283,7 +310,7 @@ mod tests {
         TransactionRequest {
             idempotency_key: key.map(IdempotencyKey::new),
             txn_type: TxnType::Insert,
-            txn_json: body,
+            body: TransactionBody::JsonLd(body),
             txn_opts: TxnOpts::default(),
             commit_opts: CommitOpts::default(),
             tracking: None,
@@ -505,6 +532,55 @@ mod tests {
             SubmissionState::Failed(_) => {}
             other => panic!("expected Failed, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn turtle_insert_routes_through_consensus() {
+        let (_fluree, consensus, ledger_id) = setup().await;
+
+        let turtle = r#"@prefix ex: <http://example.org/> .
+ex:alice ex:name "Alice" ."#;
+        let req = TransactionRequest {
+            idempotency_key: None,
+            txn_type: TxnType::Insert,
+            body: TransactionBody::Turtle(turtle.to_string()),
+            txn_opts: TxnOpts::default(),
+            commit_opts: CommitOpts::default(),
+            tracking: None,
+        };
+
+        let receipt = consensus
+            .submit(&ledger_id, req)
+            .await
+            .expect("turtle insert to succeed");
+        assert!(receipt.commit.flake_count > 0);
+    }
+
+    #[tokio::test]
+    async fn turtle_update_is_rejected() {
+        let (_fluree, consensus, ledger_id) = setup().await;
+
+        let req = TransactionRequest {
+            idempotency_key: None,
+            txn_type: TxnType::Update,
+            body: TransactionBody::Turtle(
+                r#"@prefix ex: <http://example.org/> .
+ex:alice ex:name "Alice" ."#
+                    .to_string(),
+            ),
+            txn_opts: TxnOpts::default(),
+            commit_opts: CommitOpts::default(),
+            tracking: None,
+        };
+
+        let err = consensus
+            .submit(&ledger_id, req)
+            .await
+            .expect_err("Turtle is not a valid update body");
+        assert!(
+            matches!(err, SubmissionError::Submission(_)),
+            "expected a submission failure, got {err:?}"
+        );
     }
 
     #[tokio::test]
