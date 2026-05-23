@@ -334,18 +334,7 @@ impl Fluree {
         .map_err(PushError::into_api_error)?;
 
         let mut new_state = new_state;
-        if crate::ns_helpers::binary_store_missing_snapshot_namespaces(&new_state) {
-            let cache_dir = self.binary_store_cache_dir();
-            // Result unused: load_and_attach mutates new_state in-place
-            let _store = crate::ledger_manager::load_and_attach_binary_store(
-                self.backend(),
-                self.nameservice(),
-                &mut new_state,
-                &cache_dir,
-                Some(std::sync::Arc::clone(self.leaflet_cache())),
-            )
-            .await?;
-        }
+        self.refresh_index(&mut new_state).await?;
 
         // 8) Compute indexing status from the updated state.
         let indexing_enabled = self.indexing_mode.is_enabled() && self.defaults_indexing_enabled();
