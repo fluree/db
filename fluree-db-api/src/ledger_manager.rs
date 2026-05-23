@@ -66,10 +66,16 @@ fn monotonic_secs() -> u64 {
 /// Transactions hold this guard across stage+commit to serialize writes
 /// to the same ledger.
 pub struct LedgerWriteGuard<'a> {
+    ledger: &'a LedgerHandle,
     guard: tokio::sync::MutexGuard<'a, LedgerState>,
 }
 
-impl LedgerWriteGuard<'_> {
+impl<'a> LedgerWriteGuard<'a> {
+    /// Get the ledger whose write lock this guard holds.
+    pub fn ledger(&self) -> &'a LedgerHandle {
+        self.ledger
+    }
+
     /// Get reference to current state
     pub fn state(&self) -> &LedgerState {
         &self.guard
@@ -177,6 +183,7 @@ impl LedgerHandle {
     pub async fn lock_for_write(&self) -> LedgerWriteGuard<'_> {
         self.touch();
         LedgerWriteGuard {
+            ledger: self,
             guard: self.inner.state.lock().await,
         }
     }
