@@ -16,7 +16,7 @@
 use serde_json::Value as JsonValue;
 
 use crate::error::{BuilderError, BuilderErrors};
-use crate::ledger_manager::LedgerHandle;
+use crate::ledger_manager::{LedgerHandle, LedgerWriteGuard};
 use crate::tx::{IndexingMode, IndexingStatus, StageResult, TransactResult, TransactResultRef};
 use crate::{
     ApiError, Fluree, PolicyContext, Result, TrackedErrorResponse, TrackedTransactionInput,
@@ -776,8 +776,43 @@ impl<'a> RefTransactBuilder<'a> {
 }
 
 // ============================================================================
-// Shared commit helper (used by RefTransactBuilder and GraphTransactBuilder)
+// Shared commit helpers (used by RefTransactBuilder, GraphTransactBuilder,
+// and the branch-graph operations: merge, rebase, revert)
 // ============================================================================
+
+/// Finalize a successful commit against the cached [`LedgerHandle`].
+///
+/// Performs the work every commit path sharing a handle must do — reattach
+/// the binary store for any new snapshot namespaces, sync the cached
+/// binary store, replace the cached state, and trigger background indexing
+/// when needed. Consumes the write guard, releasing the lock before the
+/// (potentially slow) reindex trigger so other writers aren't blocked
+/// behind it.
+pub(crate) async fn apply_commit(
+    fluree: &Fluree,
+    mut write_guard: LedgerWriteGuard<'_>,
+    mut new_state: LedgerState,
+    commit_t: i64,
+    needs_reindex: bool,
+) -> Result<()> {
+    let ledger = write_guard.ledger();
+
+    fluree.refresh_index(&mut new_state).await?;
+
+    // Sync binary_store BEFORE replacing state so concurrent readers never
+    // observe the new state with a stale binary_store.
+    ledger.sync_binary_store_from_state(&new_state).await;
+    write_guard.replace(new_state);
+    drop(write_guard);
+
+    if needs_reindex {
+        if let IndexingMode::Background(h) = &fluree.indexing_mode {
+            h.trigger(ledger.ledger_id(), commit_t).await;
+        }
+    }
+
+    Ok(())
+}
 
 /// Stage and commit a transaction against a cached ledger handle.
 ///
@@ -785,7 +820,7 @@ impl<'a> RefTransactBuilder<'a> {
 /// `GraphTransactBuilder::commit()`.
 pub(crate) async fn commit_with_handle(
     fluree: &Fluree,
-    handle: &LedgerHandle,
+    ledger: &LedgerHandle,
     core: TransactCore<'_>,
 ) -> Result<TransactResultRef> {
     core.validate().map_err(ApiError::Builder)?;
@@ -807,7 +842,7 @@ pub(crate) async fn commit_with_handle(
     // without cloning inputs (e.g., pre-built Txn IR), or when using tracked+policy staging.
     if core.pre_built_txn.is_some() || core.pending_sparql.is_some() || core.policy.is_some() {
         // Acquire write lock
-        let mut write_guard = handle.lock_for_write().await;
+        let write_guard = ledger.lock_for_write().await;
         let ledger_state = write_guard.clone_state();
 
         // Handle pre-built Txn / SPARQL UPDATE / operation-based transaction.
@@ -937,7 +972,7 @@ pub(crate) async fn commit_with_handle(
             .with_graph_delta(graph_delta.into_iter().collect());
 
         // Handle no-op
-        let (receipt, mut new_state) =
+        let (receipt, new_state) =
             if !view.has_staged() && matches!(txn_type, TxnType::Update | TxnType::Upsert) {
                 let (base, _) = view.into_parts();
                 (
@@ -954,7 +989,6 @@ pub(crate) async fn commit_with_handle(
                     .await?
             };
 
-        // Compute indexing status
         let indexing_status = IndexingStatus {
             enabled: fluree.indexing_mode.is_enabled(),
             needed: new_state.should_reindex(&index_config),
@@ -963,30 +997,14 @@ pub(crate) async fn commit_with_handle(
             commit_t: receipt.t,
         };
 
-        if crate::ns_helpers::binary_store_missing_snapshot_namespaces(&new_state) {
-            let cache_dir = fluree.binary_store_cache_dir();
-            // Result unused: load_and_attach mutates new_state in-place
-            let _store = crate::ledger_manager::load_and_attach_binary_store(
-                fluree.backend(),
-                fluree.nameservice(),
-                &mut new_state,
-                &cache_dir,
-                Some(std::sync::Arc::clone(fluree.leaflet_cache())),
-            )
-            .await?;
-        }
-
-        // Update cache — sync binary_store BEFORE replacing state so that
-        // concurrent readers never see the new state with a stale binary_store.
-        handle.sync_binary_store_from_state(&new_state).await;
-        write_guard.replace(new_state);
-
-        // Trigger background indexing if needed (outside cache update is fine here)
-        if let IndexingMode::Background(h) = &fluree.indexing_mode {
-            if indexing_status.needed {
-                h.trigger(handle.ledger_id(), receipt.t).await;
-            }
-        }
+        apply_commit(
+            fluree,
+            write_guard,
+            new_state,
+            receipt.t,
+            indexing_status.needed,
+        )
+        .await?;
 
         return Ok(TransactResultRef {
             receipt,
@@ -1035,7 +1053,7 @@ pub(crate) async fn commit_with_handle(
     const MAX_RETRIES: usize = 16;
     for _attempt in 0..MAX_RETRIES {
         // Snapshot current cached state (brief lock), then stage without holding the write lock.
-        let snap = handle.snapshot().await;
+        let snap = ledger.snapshot().await;
         let base_t = snap.t;
         let base_head_id = snap.head_commit_id.clone();
         let ledger_state = snap.to_ledger_state();
@@ -1101,7 +1119,7 @@ pub(crate) async fn commit_with_handle(
         } = stage_result;
 
         // Acquire write lock only for the commit + cache update section.
-        let mut write_guard = handle.lock_for_write().await;
+        let write_guard = ledger.lock_for_write().await;
         let current_t = write_guard.state().t();
         let current_head_id = write_guard.state().head_commit_id.as_ref();
 
@@ -1135,7 +1153,7 @@ pub(crate) async fn commit_with_handle(
             });
         }
 
-        let (receipt, mut new_state) = fluree
+        let (receipt, new_state) = fluree
             .commit_staged(view, ns_registry, &index_config, commit_opts)
             .await?;
 
@@ -1147,31 +1165,14 @@ pub(crate) async fn commit_with_handle(
             commit_t: receipt.t,
         };
 
-        if crate::ns_helpers::binary_store_missing_snapshot_namespaces(&new_state) {
-            let cache_dir = fluree.binary_store_cache_dir();
-            // Result unused: load_and_attach mutates new_state in-place
-            let _store = crate::ledger_manager::load_and_attach_binary_store(
-                fluree.backend(),
-                fluree.nameservice(),
-                &mut new_state,
-                &cache_dir,
-                Some(std::sync::Arc::clone(fluree.leaflet_cache())),
-            )
-            .await?;
-        }
-
-        // Update cache — sync binary_store BEFORE replacing state so that
-        // concurrent readers never see the new state with a stale binary_store.
-        handle.sync_binary_store_from_state(&new_state).await;
-        write_guard.replace(new_state);
-        drop(write_guard);
-
-        // Trigger background indexing if needed (after cache update; no need to hold lock)
-        if let IndexingMode::Background(h) = &fluree.indexing_mode {
-            if indexing_status.needed {
-                h.trigger(handle.ledger_id(), receipt.t).await;
-            }
-        }
+        apply_commit(
+            fluree,
+            write_guard,
+            new_state,
+            receipt.t,
+            indexing_status.needed,
+        )
+        .await?;
 
         return Ok(TransactResultRef {
             receipt,
