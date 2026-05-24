@@ -220,7 +220,7 @@ impl MonolithicConsensus {
 
 #[async_trait]
 impl Submitter for MonolithicConsensus {
-    async fn submit(
+    async fn transact(
         &self,
         ledger_id: &str,
         request: TransactionRequest,
@@ -352,7 +352,7 @@ mod tests {
         let (_fluree, consensus, ledger_id) = setup().await;
 
         let receipt = consensus
-            .submit(&ledger_id, request(None, sample_insert("alice")))
+            .transact(&ledger_id, request(None, sample_insert("alice")))
             .await
             .expect("submission to succeed");
 
@@ -366,7 +366,7 @@ mod tests {
         let key = IdempotencyKey::new("01J5XAMPLE001");
 
         let receipt = consensus
-            .submit(
+            .transact(
                 &ledger_id,
                 request(Some(key.as_str()), sample_insert("alice")),
             )
@@ -401,12 +401,12 @@ mod tests {
         let body = sample_insert("alice");
 
         let first = consensus
-            .submit(&ledger_id, request(Some(key.as_str()), body.clone()))
+            .transact(&ledger_id, request(Some(key.as_str()), body.clone()))
             .await
             .expect("first submission to succeed");
 
         let second = consensus
-            .submit(&ledger_id, request(Some(key.as_str()), body))
+            .transact(&ledger_id, request(Some(key.as_str()), body))
             .await
             .expect("retry with same body should return cached receipt");
 
@@ -422,7 +422,7 @@ mod tests {
         let key = IdempotencyKey::new("01J5COLLIDE001");
 
         consensus
-            .submit(
+            .transact(
                 &ledger_id,
                 request(Some(key.as_str()), sample_insert("alice")),
             )
@@ -430,7 +430,7 @@ mod tests {
             .expect("first submission to succeed");
 
         let err = consensus
-            .submit(
+            .transact(
                 &ledger_id,
                 request(Some(key.as_str()), sample_insert("bob")),
             )
@@ -448,7 +448,7 @@ mod tests {
         let (_fluree, consensus, ledger_id) = setup().await;
 
         consensus
-            .submit(&ledger_id, request(None, sample_insert("alice")))
+            .transact(&ledger_id, request(None, sample_insert("alice")))
             .await
             .expect("anonymous submission");
 
@@ -456,7 +456,7 @@ mod tests {
         // entry should sit in the cache to clash with it.
         let key = IdempotencyKey::new("01J5FRESH001");
         consensus
-            .submit(
+            .transact(
                 &ledger_id,
                 request(Some(key.as_str()), sample_insert("bob")),
             )
@@ -472,7 +472,7 @@ mod tests {
         req.txn_type = TxnType::Upsert;
 
         let receipt = consensus
-            .submit(&ledger_id, req)
+            .transact(&ledger_id, req)
             .await
             .expect("upsert to succeed");
         assert!(receipt.commit.flake_count > 0);
@@ -491,7 +491,7 @@ mod tests {
         });
 
         let receipt = consensus
-            .submit(&ledger_id, req)
+            .transact(&ledger_id, req)
             .await
             .expect("tracked submission to succeed");
         assert!(
@@ -513,7 +513,7 @@ mod tests {
         };
 
         let receipt = consensus
-            .submit(&ledger_id, req)
+            .transact(&ledger_id, req)
             .await
             .expect("policy-permitted transaction to succeed");
         assert!(receipt.commit.flake_count > 0);
@@ -543,7 +543,7 @@ mod tests {
         };
 
         let err = consensus
-            .submit(&ledger_id, req)
+            .transact(&ledger_id, req)
             .await
             .expect_err("view-only policy should block the write");
         // A policy denial is a client error — it must carry a 4xx status.
@@ -562,7 +562,7 @@ mod tests {
         let missing = "test/missing-ledger:main";
 
         let err = consensus
-            .submit(missing, request(Some(key.as_str()), sample_insert("alice")))
+            .transact(missing, request(Some(key.as_str()), sample_insert("alice")))
             .await
             .expect_err("submission to a missing ledger should fail");
         assert!(
@@ -593,7 +593,7 @@ ex:alice ex:name "Alice" ."#;
         };
 
         let receipt = consensus
-            .submit(&ledger_id, req)
+            .transact(&ledger_id, req)
             .await
             .expect("turtle insert to succeed");
         assert!(receipt.commit.flake_count > 0);
@@ -618,7 +618,7 @@ ex:alice ex:name "Alice" ."#
         };
 
         let err = consensus
-            .submit(&ledger_id, req)
+            .transact(&ledger_id, req)
             .await
             .expect_err("Turtle is not a valid update body");
         match err {
@@ -647,7 +647,7 @@ ex:alice ex:name "Alice" ."#
         };
 
         let receipt = consensus
-            .submit(&ledger_id, req)
+            .transact(&ledger_id, req)
             .await
             .expect("SPARQL UPDATE to succeed");
         assert!(receipt.commit.flake_count > 0);
@@ -668,7 +668,7 @@ ex:alice ex:name "Alice" ."#
         };
 
         let err = consensus
-            .submit(&ledger_id, req)
+            .transact(&ledger_id, req)
             .await
             .expect_err("malformed SPARQL should be rejected");
         match err {
@@ -688,7 +688,7 @@ ex:alice ex:name "Alice" ."#
 
         // First attempt fails — the ledger does not exist yet.
         consensus
-            .submit(ledger, request(Some(key.as_str()), body.clone()))
+            .transact(ledger, request(Some(key.as_str()), body.clone()))
             .await
             .expect_err("first attempt should fail before the ledger exists");
 
@@ -696,7 +696,7 @@ ex:alice ex:name "Alice" ."#
         // `Failed` entry must not block the retry.
         fluree.create_ledger(ledger).await.expect("create ledger");
         let receipt = consensus
-            .submit(ledger, request(Some(key.as_str()), body))
+            .transact(ledger, request(Some(key.as_str()), body))
             .await
             .expect("retry after the ledger exists should succeed");
         assert!(receipt.commit.flake_count > 0);

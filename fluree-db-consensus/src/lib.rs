@@ -182,7 +182,7 @@ pub enum SubmissionError {
 /// [`SubmissionLookup`].
 #[async_trait]
 pub trait Submitter: Send + Sync {
-    async fn submit(
+    async fn transact(
         &self,
         ledger_id: &str,
         request: TransactionRequest,

@@ -272,7 +272,7 @@ fn build_commit_opts(
 /// assembly, `tx_id` derivation) happens in the caller. Request correlation
 /// is attached around the submission so background index work the
 /// transaction triggers stays attributable to the originating request.
-async fn submit_via_consensus(
+async fn transact_via_consensus(
     state: &AppState,
     ledger_id: &str,
     request: TransactionRequest,
@@ -294,7 +294,7 @@ async fn submit_via_consensus(
     );
 
     let submission =
-        with_index_request_correlation(correlation, state.consensus.submit(ledger_id, request))
+        with_index_request_correlation(correlation, state.consensus.transact(ledger_id, request))
             .await;
     let receipt = match submission {
         Ok(receipt) => {
@@ -1473,7 +1473,7 @@ async fn execute_transaction(
             tracking: prepared_transaction.tracking,
             governance: prepared_transaction.governance,
         };
-        submit_via_consensus(state, ledger_id, request, tx_id, &credential.headers).await
+        transact_via_consensus(state, ledger_id, request, tx_id, &credential.headers).await
     }
     .instrument(span)
     .await
@@ -1566,7 +1566,7 @@ async fn execute_turtle_transaction(
             tracking,
             governance: GovernanceOptions::default(),
         };
-        submit_via_consensus(state, ledger_id, request, tx_id, &credential.headers).await
+        transact_via_consensus(state, ledger_id, request, tx_id, &credential.headers).await
     }
     .instrument(span)
     .await
@@ -1689,7 +1689,7 @@ async fn execute_sparql_update_request(
         tracking,
         governance,
     };
-    submit_via_consensus(state, &ledger_id, request, tx_id, &credential.headers).await
+    transact_via_consensus(state, &ledger_id, request, tx_id, &credential.headers).await
 }
 
 // ===== Peer mode forwarding =====
