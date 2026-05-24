@@ -791,12 +791,13 @@ impl Fluree {
     /// behind it.
     pub(crate) async fn finalize_commit(
         &self,
-        mut write_guard: LedgerWriteGuard<'_>,
+        mut write_guard: LedgerWriteGuard,
         mut new_state: LedgerState,
         commit_t: i64,
         needs_reindex: bool,
     ) -> Result<()> {
-        let ledger = write_guard.ledger();
+        // Clone (cheap Arc-clone) so the handle outlives the guard's drop.
+        let ledger = write_guard.ledger().clone();
 
         self.refresh_index(&mut new_state).await?;
 
