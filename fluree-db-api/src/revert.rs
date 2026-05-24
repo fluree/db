@@ -347,9 +347,18 @@ impl crate::Fluree {
             graph_delta,
         } = collect_from_commits(commits, |f| f.invert_at(0));
 
-        let target_state = self
-            .load_queryable_state_with_store(branch_store.clone(), branch_record)
-            .await?;
+        // Acquire state under the ledger write lock when a manager is
+        // available, serializing with regular transactions. Without a
+        // manager (embedded use with no shared cache), fall back to a
+        // fresh storage load — there's nothing to protect against.
+        let write_guard = self.lock_ledger(branch_id).await?;
+        let target_state = match write_guard.as_ref() {
+            Some(guard) => guard.clone_state(),
+            None => {
+                self.load_queryable_state_with_store(branch_store.clone(), branch_record)
+                    .await?
+            }
+        };
 
         let staged = self
             .apply_two_way_strategy(inverted, conflict_keys, strategy, &target_state)
@@ -400,7 +409,7 @@ impl crate::Fluree {
 
         let content_store = self.content_store(branch_id);
         let publisher = self.publisher()?;
-        let (receipt, _new_state) = fluree_db_transact::commit(
+        let (receipt, new_state) = fluree_db_transact::commit(
             view,
             ns_registry,
             &content_store,
@@ -409,6 +418,12 @@ impl crate::Fluree {
             commit_opts,
         )
         .await?;
+
+        if let Some(guard) = write_guard {
+            let needs_reindex = new_state.should_reindex(&self.index_config);
+            self.finalize_commit(guard, new_state, receipt.t, needs_reindex)
+                .await?;
+        }
 
         Ok(RevertWriteOutcome::Wrote(receipt))
     }
