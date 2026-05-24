@@ -781,6 +781,20 @@ impl<'a> RefTransactBuilder<'a> {
 // ============================================================================
 
 impl Fluree {
+    /// Acquire the write lock on the cached ledger for `ledger_id`.
+    ///
+    /// Returns `None` when no ledger manager is configured (embedded use
+    /// without a shared cache to protect). Callers in that mode should
+    /// fall back to a fresh storage load.
+    pub(crate) async fn lock_ledger(&self, ledger_id: &str) -> Result<Option<LedgerWriteGuard>> {
+        match self.ledger_manager.as_ref() {
+            Some(mgr) => Ok(Some(
+                mgr.get_or_load(ledger_id).await?.lock_for_write().await,
+            )),
+            None => Ok(None),
+        }
+    }
+
     /// Finalize a successful commit against the cached [`LedgerHandle`].
     ///
     /// Performs the work every commit path sharing a handle must do — reattach
