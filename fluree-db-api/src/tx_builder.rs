@@ -771,7 +771,7 @@ impl<'a> RefTransactBuilder<'a> {
 
     /// Stage + commit the transaction, updating the handle in-place.
     pub async fn execute(self) -> Result<TransactResultRef> {
-        commit_with_handle(self.fluree, self.handle, self.core).await
+        self.fluree.commit_with_handle(self.handle, self.core).await
     }
 }
 
@@ -780,410 +780,401 @@ impl<'a> RefTransactBuilder<'a> {
 // and the branch-graph operations: merge, rebase, revert)
 // ============================================================================
 
-/// Finalize a successful commit against the cached [`LedgerHandle`].
-///
-/// Performs the work every commit path sharing a handle must do — reattach
-/// the binary store for any new snapshot namespaces, sync the cached
-/// binary store, replace the cached state, and trigger background indexing
-/// when needed. Consumes the write guard, releasing the lock before the
-/// (potentially slow) reindex trigger so other writers aren't blocked
-/// behind it.
-pub(crate) async fn apply_commit(
-    fluree: &Fluree,
-    mut write_guard: LedgerWriteGuard<'_>,
-    mut new_state: LedgerState,
-    commit_t: i64,
-    needs_reindex: bool,
-) -> Result<()> {
-    let ledger = write_guard.ledger();
+impl Fluree {
+    /// Finalize a successful commit against the cached [`LedgerHandle`].
+    ///
+    /// Performs the work every commit path sharing a handle must do — reattach
+    /// the binary store for any new snapshot namespaces, sync the cached
+    /// binary store, replace the cached state, and trigger background indexing
+    /// when needed. Consumes the write guard, releasing the lock before the
+    /// (potentially slow) reindex trigger so other writers aren't blocked
+    /// behind it.
+    pub(crate) async fn finalize_commit(
+        &self,
+        mut write_guard: LedgerWriteGuard<'_>,
+        mut new_state: LedgerState,
+        commit_t: i64,
+        needs_reindex: bool,
+    ) -> Result<()> {
+        let ledger = write_guard.ledger();
 
-    fluree.refresh_index(&mut new_state).await?;
+        self.refresh_index(&mut new_state).await?;
 
-    // Sync binary_store BEFORE replacing state so concurrent readers never
-    // observe the new state with a stale binary_store.
-    ledger.sync_binary_store_from_state(&new_state).await;
-    write_guard.replace(new_state);
-    drop(write_guard);
+        // Sync binary_store BEFORE replacing state so concurrent readers never
+        // observe the new state with a stale binary_store.
+        ledger.sync_binary_store_from_state(&new_state).await;
+        write_guard.replace(new_state);
+        drop(write_guard);
 
-    if needs_reindex {
-        if let IndexingMode::Background(h) = &fluree.indexing_mode {
-            h.trigger(ledger.ledger_id(), commit_t).await;
+        if needs_reindex {
+            if let IndexingMode::Background(h) = &self.indexing_mode {
+                h.trigger(ledger.ledger_id(), commit_t).await;
+            }
         }
+
+        Ok(())
     }
 
-    Ok(())
-}
+    /// Stage and commit a transaction against a cached ledger handle.
+    ///
+    /// This is the shared logic for `RefTransactBuilder::execute()` and
+    /// `GraphTransactBuilder::commit()`.
+    pub(crate) async fn commit_with_handle(
+        &self,
+        ledger: &LedgerHandle,
+        core: TransactCore<'_>,
+    ) -> Result<TransactResultRef> {
+        core.validate().map_err(ApiError::Builder)?;
 
-/// Stage and commit a transaction against a cached ledger handle.
-///
-/// This is the shared logic for `RefTransactBuilder::execute()` and
-/// `GraphTransactBuilder::commit()`.
-pub(crate) async fn commit_with_handle(
-    fluree: &Fluree,
-    ledger: &LedgerHandle,
-    core: TransactCore<'_>,
-) -> Result<TransactResultRef> {
-    core.validate().map_err(ApiError::Builder)?;
+        let index_config = core
+            .index_config
+            .clone()
+            .unwrap_or_else(crate::server_defaults::default_index_config);
+        let store_raw_txn = core.txn_opts.store_raw_txn.unwrap_or(false);
 
-    let index_config = core
-        .index_config
-        .clone()
-        .unwrap_or_else(crate::server_defaults::default_index_config);
-    let store_raw_txn = core.txn_opts.store_raw_txn.unwrap_or(false);
+        // Create tracker from builder-level tracking options when present.
+        // This tracker is passed into the staging pipeline so fuel is counted per flake.
+        let tracker = core
+            .tracking
+            .map(Tracker::new)
+            .unwrap_or_else(Tracker::disabled);
 
-    // Create tracker from builder-level tracking options when present.
-    // This tracker is passed into the staging pipeline so fuel is counted per flake.
-    let tracker = core
-        .tracking
-        .map(Tracker::new)
-        .unwrap_or_else(Tracker::disabled);
+        // Fast path retains legacy behavior for complex cases that cannot be retried
+        // without cloning inputs (e.g., pre-built Txn IR), or when using tracked+policy staging.
+        if core.pre_built_txn.is_some() || core.pending_sparql.is_some() || core.policy.is_some() {
+            // Acquire write lock
+            let write_guard = ledger.lock_for_write().await;
+            let ledger_state = write_guard.clone_state();
 
-    // Fast path retains legacy behavior for complex cases that cannot be retried
-    // without cloning inputs (e.g., pre-built Txn IR), or when using tracked+policy staging.
-    if core.pre_built_txn.is_some() || core.pending_sparql.is_some() || core.policy.is_some() {
-        // Acquire write lock
-        let write_guard = ledger.lock_for_write().await;
-        let ledger_state = write_guard.clone_state();
-
-        // Handle pre-built Txn / SPARQL UPDATE / operation-based transaction.
-        let (stage_result, txn_type, commit_opts) = if let Some(txn) = core.pre_built_txn {
-            let txn_type = txn.txn_type;
-            // For pre-built Txn, don't attach raw_txn (we don't have the original format)
-            let stage_result = fluree
-                .stage_transaction_from_txn(
-                    ledger_state,
-                    txn,
-                    Some(&index_config),
-                    core.policy.as_ref(),
-                    Some(&tracker),
-                )
-                .await?;
-            (stage_result, txn_type, core.commit_opts)
-        } else if let Some(sparql) = core.pending_sparql {
-            // Parse + lower under the write lock: the namespace registry is
-            // built from the locked `ledger_state`, the same state staging
-            // runs against — so lowering and staging share one registry and
-            // no namespace-conflict retry is possible.
-            let parsed = fluree_db_sparql::parse_sparql(sparql);
-            if parsed.has_errors() {
-                let messages: Vec<String> = parsed.errors().map(|d| d.message.clone()).collect();
-                return Err(ApiError::http(
-                    400,
-                    format!("SPARQL UPDATE parse error: {}", messages.join("; ")),
-                ));
-            }
-            let ast = parsed
-                .ast
-                .ok_or_else(|| ApiError::http(400, "Failed to parse SPARQL UPDATE".to_string()))?;
-            let mut ns = NamespaceRegistry::from_db(&ledger_state.snapshot);
-            let txn = lower_sparql_update_ast(&ast, &mut ns, core.txn_opts)
-                .map_err(|e| ApiError::http(400, format!("SPARQL UPDATE lowering error: {e}")))?;
-            let txn_type = txn.txn_type;
-            let stage_result = fluree
-                .stage_transaction_from_txn(
-                    ledger_state,
-                    txn,
-                    Some(&index_config),
-                    core.policy.as_ref(),
-                    Some(&tracker),
-                )
-                .await?;
-            (stage_result, txn_type, core.commit_opts)
-        } else {
-            let op = core.operation.unwrap(); // safe: validate checks
-
-            // Direct flake path for InsertTurtle (bypass JSON-LD / IR)
-            if let TransactOperation::InsertTurtle(turtle) = op {
-                let ledger_id = ledger_state.ledger_id().to_string();
-                let tracker_ref = tracker.is_enabled().then_some(&tracker);
-                let stage_result = fluree
-                    .stage_turtle_insert(ledger_state, turtle, Some(&index_config), tracker_ref)
-                    .await?;
-                // Spawn raw Turtle upload when explicitly opted-in — overlaps
-                // with the commit prelude (sequencing lookup, envelope apply).
-                let commit_opts = if core.commit_opts.raw_txn.is_none()
-                    && core.commit_opts.raw_txn_upload.is_none()
-                    && store_raw_txn
-                {
-                    let content_store = fluree.content_store(&ledger_id);
-                    core.commit_opts.with_raw_txn_spawned(
-                        content_store,
-                        serde_json::Value::String(turtle.to_string()),
-                    )
-                } else {
-                    core.commit_opts
-                };
-                (stage_result, TxnType::Insert, commit_opts)
-            } else {
-                let txn_type = op.txn_type();
-                // Parse transaction, extracting TriG metadata and named graphs for Turtle inputs
-                let parsed = op.to_json_with_trig_meta()?;
-                let txn_json = parsed.json;
-                let trig_meta = parsed.trig_meta;
-                let named_graphs = parsed.named_graphs;
-                let ledger_id = ledger_state.ledger_id().to_string();
-
-                // Spawn raw_txn upload when explicitly opted-in, or skip if a
-                // signed credential envelope has already been pre-set.
-                let commit_opts = if core.commit_opts.raw_txn.is_none()
-                    && core.commit_opts.raw_txn_upload.is_none()
-                    && store_raw_txn
-                {
-                    let content_store = fluree.content_store(&ledger_id);
-                    core.commit_opts
-                        .with_raw_txn_spawned(content_store, txn_json.clone())
-                } else {
-                    core.commit_opts
-                };
-
-                // Stage with external tracker when tracking is enabled
-                let tracker_ref = if tracker.is_enabled() {
-                    Some(&tracker)
-                } else {
-                    None
-                };
-                let stage_result = fluree
-                    .stage_transaction_with_named_graphs_tracked(
+            // Handle pre-built Txn / SPARQL UPDATE / operation-based transaction.
+            let (stage_result, txn_type, commit_opts) = if let Some(txn) = core.pre_built_txn {
+                let txn_type = txn.txn_type;
+                // For pre-built Txn, don't attach raw_txn (we don't have the original format)
+                let stage_result = self
+                    .stage_transaction_from_txn(
                         ledger_state,
-                        txn_type,
-                        &txn_json,
-                        core.txn_opts,
+                        txn,
                         Some(&index_config),
-                        trig_meta.as_ref(),
-                        &named_graphs,
-                        tracker_ref,
                         core.policy.as_ref(),
+                        Some(&tracker),
                     )
                     .await?;
-                (stage_result, txn_type, commit_opts)
-            }
-        };
-
-        let StageResult {
-            view,
-            ns_registry,
-            txn_meta,
-            graph_delta,
-        } = stage_result;
-
-        // Add extracted transaction metadata and graph delta to commit opts
-        let commit_opts = commit_opts
-            .with_txn_meta(txn_meta)
-            .with_graph_delta(graph_delta.into_iter().collect());
-
-        // Handle no-op
-        let (receipt, new_state) =
-            if !view.has_staged() && matches!(txn_type, TxnType::Update | TxnType::Upsert) {
-                let (base, _) = view.into_parts();
-                (
-                    fluree_db_transact::CommitReceipt {
-                        commit_id: ContentId::new(ContentKind::Commit, &[]),
-                        t: base.t(),
-                        flake_count: 0,
-                    },
-                    base,
-                )
+                (stage_result, txn_type, core.commit_opts)
+            } else if let Some(sparql) = core.pending_sparql {
+                // Parse + lower under the write lock: the namespace registry is
+                // built from the locked `ledger_state`, the same state staging
+                // runs against — so lowering and staging share one registry and
+                // no namespace-conflict retry is possible.
+                let parsed = fluree_db_sparql::parse_sparql(sparql);
+                if parsed.has_errors() {
+                    let messages: Vec<String> =
+                        parsed.errors().map(|d| d.message.clone()).collect();
+                    return Err(ApiError::http(
+                        400,
+                        format!("SPARQL UPDATE parse error: {}", messages.join("; ")),
+                    ));
+                }
+                let ast = parsed.ast.ok_or_else(|| {
+                    ApiError::http(400, "Failed to parse SPARQL UPDATE".to_string())
+                })?;
+                let mut ns = NamespaceRegistry::from_db(&ledger_state.snapshot);
+                let txn = lower_sparql_update_ast(&ast, &mut ns, core.txn_opts).map_err(|e| {
+                    ApiError::http(400, format!("SPARQL UPDATE lowering error: {e}"))
+                })?;
+                let txn_type = txn.txn_type;
+                let stage_result = self
+                    .stage_transaction_from_txn(
+                        ledger_state,
+                        txn,
+                        Some(&index_config),
+                        core.policy.as_ref(),
+                        Some(&tracker),
+                    )
+                    .await?;
+                (stage_result, txn_type, core.commit_opts)
             } else {
-                fluree
-                    .commit_staged(view, ns_registry, &index_config, commit_opts)
-                    .await?
+                let op = core.operation.unwrap(); // safe: validate checks
+
+                // Direct flake path for InsertTurtle (bypass JSON-LD / IR)
+                if let TransactOperation::InsertTurtle(turtle) = op {
+                    let ledger_id = ledger_state.ledger_id().to_string();
+                    let tracker_ref = tracker.is_enabled().then_some(&tracker);
+                    let stage_result = self
+                        .stage_turtle_insert(ledger_state, turtle, Some(&index_config), tracker_ref)
+                        .await?;
+                    // Spawn raw Turtle upload when explicitly opted-in — overlaps
+                    // with the commit prelude (sequencing lookup, envelope apply).
+                    let commit_opts = if core.commit_opts.raw_txn.is_none()
+                        && core.commit_opts.raw_txn_upload.is_none()
+                        && store_raw_txn
+                    {
+                        let content_store = self.content_store(&ledger_id);
+                        core.commit_opts.with_raw_txn_spawned(
+                            content_store,
+                            serde_json::Value::String(turtle.to_string()),
+                        )
+                    } else {
+                        core.commit_opts
+                    };
+                    (stage_result, TxnType::Insert, commit_opts)
+                } else {
+                    let txn_type = op.txn_type();
+                    // Parse transaction, extracting TriG metadata and named graphs for Turtle inputs
+                    let parsed = op.to_json_with_trig_meta()?;
+                    let txn_json = parsed.json;
+                    let trig_meta = parsed.trig_meta;
+                    let named_graphs = parsed.named_graphs;
+                    let ledger_id = ledger_state.ledger_id().to_string();
+
+                    // Spawn raw_txn upload when explicitly opted-in, or skip if a
+                    // signed credential envelope has already been pre-set.
+                    let commit_opts = if core.commit_opts.raw_txn.is_none()
+                        && core.commit_opts.raw_txn_upload.is_none()
+                        && store_raw_txn
+                    {
+                        let content_store = self.content_store(&ledger_id);
+                        core.commit_opts
+                            .with_raw_txn_spawned(content_store, txn_json.clone())
+                    } else {
+                        core.commit_opts
+                    };
+
+                    // Stage with external tracker when tracking is enabled
+                    let tracker_ref = if tracker.is_enabled() {
+                        Some(&tracker)
+                    } else {
+                        None
+                    };
+                    let stage_result = self
+                        .stage_transaction_with_named_graphs_tracked(
+                            ledger_state,
+                            txn_type,
+                            &txn_json,
+                            core.txn_opts,
+                            Some(&index_config),
+                            trig_meta.as_ref(),
+                            &named_graphs,
+                            tracker_ref,
+                            core.policy.as_ref(),
+                        )
+                        .await?;
+                    (stage_result, txn_type, commit_opts)
+                }
             };
 
-        let indexing_status = IndexingStatus {
-            enabled: fluree.indexing_mode.is_enabled(),
-            needed: new_state.should_reindex(&index_config),
-            novelty_size: new_state.novelty_size(),
-            index_t: new_state.index_t(),
-            commit_t: receipt.t,
-        };
+            let StageResult {
+                view,
+                ns_registry,
+                txn_meta,
+                graph_delta,
+            } = stage_result;
 
-        apply_commit(
-            fluree,
-            write_guard,
-            new_state,
-            receipt.t,
-            indexing_status.needed,
-        )
-        .await?;
+            // Add extracted transaction metadata and graph delta to commit opts
+            let commit_opts = commit_opts
+                .with_txn_meta(txn_meta)
+                .with_graph_delta(graph_delta.into_iter().collect());
 
-        return Ok(TransactResultRef {
-            receipt,
-            indexing: indexing_status,
-            tally: tracker.tally(),
-        });
-    }
-
-    // Optimistic staging path: stage outside the write lock to allow parallel parsing/staging
-    // in bulk import scenarios. Commit is still serialized by the write lock for safety.
-    let op = core.operation.unwrap(); // safe: validate checks
-    let txn_opts = core.txn_opts.clone();
-    let commit_opts_base = core.commit_opts.clone();
-
-    // Pre-parse JSON/TriG once when possible (independent of ledger state).
-    enum OpPlan<'a> {
-        InsertTurtle(&'a str),
-        JsonLike {
-            txn_type: TxnType,
-            txn_json: JsonValue,
-            trig_meta: Option<RawTrigMeta>,
-            named_graphs: Vec<NamedGraphBlock>,
-        },
-    }
-
-    let op_plan = match op {
-        TransactOperation::InsertTurtle(turtle) => OpPlan::InsertTurtle(turtle),
-        _ => {
-            let txn_type = op.txn_type();
-            let parsed = op.to_json_with_trig_meta()?;
-            OpPlan::JsonLike {
-                txn_type,
-                txn_json: parsed.json,
-                trig_meta: parsed.trig_meta,
-                named_graphs: parsed.named_graphs,
-            }
-        }
-    };
-
-    let tracker_ref = if tracker.is_enabled() {
-        Some(&tracker)
-    } else {
-        None
-    };
-
-    const MAX_RETRIES: usize = 16;
-    for _attempt in 0..MAX_RETRIES {
-        // Snapshot current cached state (brief lock), then stage without holding the write lock.
-        let snap = ledger.snapshot().await;
-        let base_t = snap.t;
-        let base_head_id = snap.head_commit_id.clone();
-        let ledger_state = snap.to_ledger_state();
-
-        let ledger_id = ledger_state.ledger_id().to_string();
-        let (stage_result, txn_type, commit_opts) = match &op_plan {
-            OpPlan::InsertTurtle(turtle) => {
-                // Spawn raw Turtle upload in parallel with staging when opted in.
-                // On retry, the prior attempt's pending upload was released via its
-                // Drop guard; this iteration re-spawns a fresh upload.
-                let commit_opts = if commit_opts_base.raw_txn.is_none() && store_raw_txn {
-                    let content_store = fluree.content_store(&ledger_id);
-                    commit_opts_base.clone().with_raw_txn_spawned(
-                        content_store,
-                        serde_json::Value::String((*turtle).to_string()),
+            // Handle no-op
+            let (receipt, new_state) =
+                if !view.has_staged() && matches!(txn_type, TxnType::Update | TxnType::Upsert) {
+                    let (base, _) = view.into_parts();
+                    (
+                        fluree_db_transact::CommitReceipt {
+                            commit_id: ContentId::new(ContentKind::Commit, &[]),
+                            t: base.t(),
+                            flake_count: 0,
+                        },
+                        base,
                     )
                 } else {
-                    commit_opts_base.clone()
-                };
-                let stage_result = fluree
-                    .stage_turtle_insert(ledger_state, turtle, Some(&index_config), tracker_ref)
-                    .await?;
-                (stage_result, TxnType::Insert, commit_opts)
-            }
-            OpPlan::JsonLike {
-                txn_type,
-                txn_json,
-                trig_meta,
-                named_graphs,
-            } => {
-                // Spawn raw_txn upload in parallel with staging when opted in.
-                let commit_opts = if commit_opts_base.raw_txn.is_none() && store_raw_txn {
-                    let content_store = fluree.content_store(&ledger_id);
-                    commit_opts_base
-                        .clone()
-                        .with_raw_txn_spawned(content_store, txn_json.clone())
-                } else {
-                    commit_opts_base.clone()
+                    self.commit_staged(view, ns_registry, &index_config, commit_opts)
+                        .await?
                 };
 
-                let stage_result = fluree
-                    .stage_transaction_with_named_graphs_tracked(
-                        ledger_state,
-                        *txn_type,
-                        txn_json,
-                        txn_opts.clone(),
-                        Some(&index_config),
-                        trig_meta.as_ref(),
-                        named_graphs,
-                        tracker_ref,
-                        None,
-                    )
-                    .await?;
-                (stage_result, *txn_type, commit_opts)
-            }
-        };
+            let indexing_status = IndexingStatus {
+                enabled: self.indexing_mode.is_enabled(),
+                needed: new_state.should_reindex(&index_config),
+                novelty_size: new_state.novelty_size(),
+                index_t: new_state.index_t(),
+                commit_t: receipt.t,
+            };
 
-        let StageResult {
-            view,
-            ns_registry,
-            txn_meta,
-            graph_delta,
-        } = stage_result;
+            self.finalize_commit(write_guard, new_state, receipt.t, indexing_status.needed)
+                .await?;
 
-        // Acquire write lock only for the commit + cache update section.
-        let write_guard = ledger.lock_for_write().await;
-        let current_t = write_guard.state().t();
-        let current_head_id = write_guard.state().head_commit_id.as_ref();
-
-        // If state changed since snapshot, retry staging against the latest state.
-        if current_t != base_t || current_head_id != base_head_id.as_ref() {
-            continue;
-        }
-
-        // Add extracted transaction metadata and graph delta to commit opts
-        let commit_opts = commit_opts
-            .with_txn_meta(txn_meta)
-            .with_graph_delta(graph_delta.into_iter().collect());
-
-        // Handle no-op updates: return success without committing.
-        if !view.has_staged() && matches!(txn_type, TxnType::Update | TxnType::Upsert) {
-            let (base, _) = view.into_parts();
             return Ok(TransactResultRef {
-                receipt: fluree_db_transact::CommitReceipt {
-                    commit_id: ContentId::new(ContentKind::Commit, &[]),
-                    t: base.t(),
-                    flake_count: 0,
-                },
-                indexing: IndexingStatus {
-                    enabled: fluree.indexing_mode.is_enabled(),
-                    needed: false,
-                    novelty_size: base.novelty_size(),
-                    index_t: base.index_t(),
-                    commit_t: base.t(),
-                },
+                receipt,
+                indexing: indexing_status,
                 tally: tracker.tally(),
             });
         }
 
-        let (receipt, new_state) = fluree
-            .commit_staged(view, ns_registry, &index_config, commit_opts)
-            .await?;
+        // Optimistic staging path: stage outside the write lock to allow parallel parsing/staging
+        // in bulk import scenarios. Commit is still serialized by the write lock for safety.
+        let op = core.operation.unwrap(); // safe: validate checks
+        let txn_opts = core.txn_opts.clone();
+        let commit_opts_base = core.commit_opts.clone();
 
-        let indexing_status = IndexingStatus {
-            enabled: fluree.indexing_mode.is_enabled(),
-            needed: new_state.should_reindex(&index_config),
-            novelty_size: new_state.novelty_size(),
-            index_t: new_state.index_t(),
-            commit_t: receipt.t,
+        // Pre-parse JSON/TriG once when possible (independent of ledger state).
+        enum OpPlan<'a> {
+            InsertTurtle(&'a str),
+            JsonLike {
+                txn_type: TxnType,
+                txn_json: JsonValue,
+                trig_meta: Option<RawTrigMeta>,
+                named_graphs: Vec<NamedGraphBlock>,
+            },
+        }
+
+        let op_plan = match op {
+            TransactOperation::InsertTurtle(turtle) => OpPlan::InsertTurtle(turtle),
+            _ => {
+                let txn_type = op.txn_type();
+                let parsed = op.to_json_with_trig_meta()?;
+                OpPlan::JsonLike {
+                    txn_type,
+                    txn_json: parsed.json,
+                    trig_meta: parsed.trig_meta,
+                    named_graphs: parsed.named_graphs,
+                }
+            }
         };
 
-        apply_commit(
-            fluree,
-            write_guard,
-            new_state,
-            receipt.t,
-            indexing_status.needed,
-        )
-        .await?;
+        let tracker_ref = if tracker.is_enabled() {
+            Some(&tracker)
+        } else {
+            None
+        };
 
-        return Ok(TransactResultRef {
-            receipt,
-            indexing: indexing_status,
-            tally: tracker.tally(),
-        });
+        const MAX_RETRIES: usize = 16;
+        for _attempt in 0..MAX_RETRIES {
+            // Snapshot current cached state (brief lock), then stage without holding the write lock.
+            let snap = ledger.snapshot().await;
+            let base_t = snap.t;
+            let base_head_id = snap.head_commit_id.clone();
+            let ledger_state = snap.to_ledger_state();
+
+            let ledger_id = ledger_state.ledger_id().to_string();
+            let (stage_result, txn_type, commit_opts) = match &op_plan {
+                OpPlan::InsertTurtle(turtle) => {
+                    // Spawn raw Turtle upload in parallel with staging when opted in.
+                    // On retry, the prior attempt's pending upload was released via its
+                    // Drop guard; this iteration re-spawns a fresh upload.
+                    let commit_opts = if commit_opts_base.raw_txn.is_none() && store_raw_txn {
+                        let content_store = self.content_store(&ledger_id);
+                        commit_opts_base.clone().with_raw_txn_spawned(
+                            content_store,
+                            serde_json::Value::String((*turtle).to_string()),
+                        )
+                    } else {
+                        commit_opts_base.clone()
+                    };
+                    let stage_result = self
+                        .stage_turtle_insert(ledger_state, turtle, Some(&index_config), tracker_ref)
+                        .await?;
+                    (stage_result, TxnType::Insert, commit_opts)
+                }
+                OpPlan::JsonLike {
+                    txn_type,
+                    txn_json,
+                    trig_meta,
+                    named_graphs,
+                } => {
+                    // Spawn raw_txn upload in parallel with staging when opted in.
+                    let commit_opts = if commit_opts_base.raw_txn.is_none() && store_raw_txn {
+                        let content_store = self.content_store(&ledger_id);
+                        commit_opts_base
+                            .clone()
+                            .with_raw_txn_spawned(content_store, txn_json.clone())
+                    } else {
+                        commit_opts_base.clone()
+                    };
+
+                    let stage_result = self
+                        .stage_transaction_with_named_graphs_tracked(
+                            ledger_state,
+                            *txn_type,
+                            txn_json,
+                            txn_opts.clone(),
+                            Some(&index_config),
+                            trig_meta.as_ref(),
+                            named_graphs,
+                            tracker_ref,
+                            None,
+                        )
+                        .await?;
+                    (stage_result, *txn_type, commit_opts)
+                }
+            };
+
+            let StageResult {
+                view,
+                ns_registry,
+                txn_meta,
+                graph_delta,
+            } = stage_result;
+
+            // Acquire write lock only for the commit + cache update section.
+            let write_guard = ledger.lock_for_write().await;
+            let current_t = write_guard.state().t();
+            let current_head_id = write_guard.state().head_commit_id.as_ref();
+
+            // If state changed since snapshot, retry staging against the latest state.
+            if current_t != base_t || current_head_id != base_head_id.as_ref() {
+                continue;
+            }
+
+            // Add extracted transaction metadata and graph delta to commit opts
+            let commit_opts = commit_opts
+                .with_txn_meta(txn_meta)
+                .with_graph_delta(graph_delta.into_iter().collect());
+
+            // Handle no-op updates: return success without committing.
+            if !view.has_staged() && matches!(txn_type, TxnType::Update | TxnType::Upsert) {
+                let (base, _) = view.into_parts();
+                return Ok(TransactResultRef {
+                    receipt: fluree_db_transact::CommitReceipt {
+                        commit_id: ContentId::new(ContentKind::Commit, &[]),
+                        t: base.t(),
+                        flake_count: 0,
+                    },
+                    indexing: IndexingStatus {
+                        enabled: self.indexing_mode.is_enabled(),
+                        needed: false,
+                        novelty_size: base.novelty_size(),
+                        index_t: base.index_t(),
+                        commit_t: base.t(),
+                    },
+                    tally: tracker.tally(),
+                });
+            }
+
+            let (receipt, new_state) = self
+                .commit_staged(view, ns_registry, &index_config, commit_opts)
+                .await?;
+
+            let indexing_status = IndexingStatus {
+                enabled: self.indexing_mode.is_enabled(),
+                needed: new_state.should_reindex(&index_config),
+                novelty_size: new_state.novelty_size(),
+                index_t: new_state.index_t(),
+                commit_t: receipt.t,
+            };
+
+            self.finalize_commit(write_guard, new_state, receipt.t, indexing_status.needed)
+                .await?;
+
+            return Ok(TransactResultRef {
+                receipt,
+                indexing: indexing_status,
+                tally: tracker.tally(),
+            });
+        }
+
+        Err(ApiError::internal(format!(
+            "transaction commit retry limit exceeded ({MAX_RETRIES} attempts)"
+        )))
     }
-
-    Err(ApiError::internal(format!(
-        "transaction commit retry limit exceeded ({MAX_RETRIES} attempts)"
-    )))
 }
 
 #[cfg(test)]
