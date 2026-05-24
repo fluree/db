@@ -62,13 +62,6 @@ async fn push_ledger_local(
         }
     }
 
-    // Load cached ledger handle.
-    let handle = state
-        .fluree
-        .ledger_cached(&ledger)
-        .await
-        .map_err(ServerError::Api)?;
-
     // Build policy options.
     //
     let mut opts = GovernanceOptions {
@@ -102,7 +95,7 @@ async fn push_ledger_local(
 
     let fluree = &state.fluree;
     let resp = fluree
-        .push_commits_with_handle(&handle, body, &opts, index_config)
+        .push_commits(&ledger, body, &opts, index_config)
         .await
         .map_err(ServerError::Api)?;
 

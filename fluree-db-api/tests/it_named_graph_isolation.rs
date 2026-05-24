@@ -603,7 +603,6 @@ async fn push_roundtrip_named_graph_retractions() {
 
             let tgt_id = "it/push-ng-tgt:main";
             let _tgt_ledger = fluree.create_ledger(tgt_id).await.expect("create target");
-            let tgt_handle = fluree.ledger_cached(tgt_id).await.expect("target handle");
 
             // Export returns newest → oldest; push needs oldest → newest.
             let mut push_commits = export.commits;
@@ -615,8 +614,8 @@ async fn push_roundtrip_named_graph_retractions() {
             };
 
             let push_result = fluree
-                .push_commits_with_handle(
-                    &tgt_handle,
+                .push_commits(
+                    tgt_id,
                     push_req,
                     &GovernanceOptions::default(),
                     &IndexConfig {

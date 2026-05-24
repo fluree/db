@@ -105,14 +105,14 @@ pub struct PushedHead {
     pub commit_id: ContentId,
 }
 
-/// Push precomputed commits to a ledger handle (transaction server mode).
+/// Push precomputed commits to a ledger (transaction server mode).
 ///
 /// This acquires the ledger write mutex for the duration of validation + publish,
 /// so pushes are serialized with normal transactions.
 impl Fluree {
-    pub async fn push_commits_with_handle(
+    pub async fn push_commits(
         &self,
-        handle: &LedgerHandle,
+        ledger_id: &str,
         request: PushCommitsRequest,
         opts: &GovernanceOptions,
         index_config: &IndexConfig,
@@ -122,7 +122,10 @@ impl Fluree {
         }
 
         // 0) Lock ledger state for write (serialize with transactions).
-        let mut guard = handle.lock_for_write().await;
+        let mut guard = self
+            .lock_ledger(ledger_id)
+            .await?
+            .ok_or_else(|| ApiError::internal("push requires a ledger manager"))?;
         let mut base_state = guard.clone_state();
 
         // 1) Read current head ref (CAS expected).
@@ -350,18 +353,21 @@ impl Fluree {
 
         // Sync binary_store BEFORE replacing state so that concurrent readers
         // (via snapshot()) never see the new state with a stale binary_store.
-        handle.sync_binary_store_from_state(&new_state).await;
+        guard
+            .ledger()
+            .sync_binary_store_from_state(&new_state)
+            .await;
         guard.replace(new_state);
 
         // 9) Trigger background indexing if enabled and needed.
         if let IndexingMode::Background(idx_handle) = &self.indexing_mode {
             if indexing_enabled && indexing_needed {
-                idx_handle.trigger(handle.ledger_id(), final_head.t).await;
+                idx_handle.trigger(ledger_id, final_head.t).await;
             }
         }
 
         Ok(PushCommitsResponse {
-            ledger: handle.ledger_id().to_string(),
+            ledger: ledger_id.to_string(),
             accepted: decoded.len(),
             head: PushedHead {
                 t: final_head.t,
@@ -1321,7 +1327,7 @@ impl Fluree {
     /// `commits` must be ordered oldest → newest.
     pub async fn import_commits_incremental(
         &self,
-        handle: &LedgerHandle,
+        ledger_id: &str,
         commits: Vec<Base64Bytes>,
         blobs: HashMap<String, Base64Bytes>,
     ) -> Result<CommitImportResult> {
@@ -1329,7 +1335,10 @@ impl Fluree {
             return Err(ApiError::http(400, "no commits to import"));
         }
 
-        let mut guard = handle.lock_for_write().await;
+        let mut guard = self
+            .lock_ledger(ledger_id)
+            .await?
+            .ok_or_else(|| ApiError::internal("import requires a ledger manager"))?;
         let base_state = guard.clone_state();
 
         // 1) Read current head ref.
@@ -1438,13 +1447,16 @@ impl Fluree {
 
         // Sync binary_store BEFORE replacing state so that concurrent readers
         // (via snapshot()) never see the new state with a stale binary_store.
-        handle.sync_binary_store_from_state(&new_state).await;
+        guard
+            .ledger()
+            .sync_binary_store_from_state(&new_state)
+            .await;
         guard.replace(new_state);
 
         // 10) Trigger background indexing if enabled and needed.
         if let IndexingMode::Background(idx_handle) = &self.indexing_mode {
             if indexing_enabled && indexing_needed {
-                idx_handle.trigger(handle.ledger_id(), final_head.t).await;
+                idx_handle.trigger(ledger_id, final_head.t).await;
             }
         }
 
