@@ -850,7 +850,7 @@ impl Fluree {
 
         if needs_reindex {
             if let IndexingMode::Background(h) = &self.indexing_mode {
-                h.trigger(ledger.ledger_id(), commit_t).await;
+                h.trigger(ledger.id(), commit_t).await;
             }
         }
 

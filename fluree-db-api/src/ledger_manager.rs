@@ -222,7 +222,7 @@ impl LedgerHandle {
     }
 
     /// Get ledger ID
-    pub fn ledger_id(&self) -> &str {
+    pub fn id(&self) -> &str {
         &self.inner.ledger_id
     }
 
@@ -1319,7 +1319,7 @@ impl LedgerManager {
                     "notify: catching up commits (incremental)"
                 );
 
-                let ledger_id_canonical = handle.ledger_id().to_string();
+                let ledger_id_canonical = handle.id().to_string();
                 let cs: Arc<dyn ContentStore> = cs_for_record().await?;
 
                 // Load commits outside any lock.

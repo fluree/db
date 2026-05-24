@@ -1026,7 +1026,7 @@ impl Fluree {
             .unwrap_or(EXPORT_DEFAULT_LIMIT)
             .min(EXPORT_MAX_LIMIT);
 
-        let ledger_id = handle.ledger_id();
+        let ledger_id = handle.id();
 
         // Read current head.
         let head_ref = self
@@ -1181,7 +1181,7 @@ impl Fluree {
         handle: &LedgerHandle,
         response: &ExportCommitsResponse,
     ) -> Result<BulkImportResult> {
-        let ledger_id = handle.ledger_id();
+        let ledger_id = handle.id();
         let storage = self.admin_storage().ok_or_else(|| {
             ApiError::config("import_commits_bulk requires a managed storage backend")
         })?;
@@ -1245,7 +1245,7 @@ impl Fluree {
         head_commit_id: &ContentId,
         head_t: i64,
     ) -> Result<()> {
-        let ledger_id = handle.ledger_id();
+        let ledger_id = handle.id();
         let new_ref = RefValue {
             id: Some(head_commit_id.clone()),
             t: head_t,
@@ -1288,7 +1288,7 @@ impl Fluree {
         index_id: &ContentId,
         index_t: i64,
     ) -> Result<()> {
-        let ledger_id = handle.ledger_id();
+        let ledger_id = handle.id();
         let new_ref = RefValue {
             id: Some(index_id.clone()),
             t: index_t,

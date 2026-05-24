@@ -259,7 +259,7 @@ fn build_commit_opts(
         None => CommitOpts::default(),
     };
     if let Some(raw_txn) = raw_txn_from_credential(credential) {
-        let content_store = fluree.content_store(handle.ledger_id());
+        let content_store = fluree.content_store(handle.id());
         commit_opts = commit_opts.with_raw_txn_spawned(content_store, raw_txn);
     }
     commit_opts
