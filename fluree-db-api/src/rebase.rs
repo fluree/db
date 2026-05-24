@@ -179,11 +179,6 @@ impl crate::Fluree {
         })?;
         let source_head_t = source_record.commit_t;
 
-        // Disconnect branch from ledger manager to prevent stale reads.
-        if let Some(ref lm) = self.ledger_manager {
-            lm.disconnect(&branch_id).await;
-        }
-
         // Build a BranchedContentStore for reading commits across namespaces.
         let branch_store = LedgerState::build_branched_store(
             &self.nameservice_mode,

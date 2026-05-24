@@ -22,8 +22,9 @@ use crate::{
     ApiError, Fluree, PolicyContext, Result, TrackedErrorResponse, TrackedTransactionInput,
     Tracker, TrackingOptions,
 };
-use fluree_db_core::{ContentId, ContentKind};
+use fluree_db_core::{ContentId, ContentKind, ContentStore};
 use fluree_db_ledger::{IndexConfig, LedgerState, StagedLedger};
+use fluree_db_nameservice::NsRecord;
 use fluree_db_transact::{
     lower_sparql_update_ast, parse_trig_phase1, CommitOpts, NamedGraphBlock, NamespaceRegistry,
     RawTrigMeta, Txn, TxnOpts, TxnType,
@@ -795,6 +796,33 @@ impl Fluree {
         }
     }
 
+    /// Acquire write-locked target state for a branch-graph operation, or
+    /// fall back to a fresh storage load when no manager is configured.
+    ///
+    /// Returns the (optional) write guard alongside the target state.
+    /// When the guard is `Some`, the state was cloned from the locked
+    /// cache; when `None`, it was loaded fresh from storage via
+    /// `fallback_store`/`fallback_record`.
+    pub(crate) async fn lock_or_load<C>(
+        &self,
+        ledger_id: &str,
+        fallback_store: C,
+        fallback_record: NsRecord,
+    ) -> Result<(Option<LedgerWriteGuard>, LedgerState)>
+    where
+        C: ContentStore + Clone + 'static,
+    {
+        let write_guard = self.lock_ledger(ledger_id).await?;
+        let state = match write_guard.as_ref() {
+            Some(guard) => guard.clone_state(),
+            None => {
+                self.load_queryable_state_with_store(fallback_store, fallback_record)
+                    .await?
+            }
+        };
+        Ok((write_guard, state))
+    }
+
     /// Finalize a successful commit against the cached [`LedgerHandle`].
     ///
     /// Performs the work every commit path sharing a handle must do — reattach
@@ -810,7 +838,6 @@ impl Fluree {
         commit_t: i64,
         needs_reindex: bool,
     ) -> Result<()> {
-        // Clone (cheap Arc-clone) so the handle outlives the guard's drop.
         let ledger = write_guard.ledger().clone();
 
         self.refresh_index(&mut new_state).await?;
@@ -857,7 +884,6 @@ impl Fluree {
         // Fast path retains legacy behavior for complex cases that cannot be retried
         // without cloning inputs (e.g., pre-built Txn IR), or when using tracked+policy staging.
         if core.pre_built_txn.is_some() || core.pending_sparql.is_some() || core.policy.is_some() {
-            // Acquire write lock
             let write_guard = ledger.lock_for_write().await;
             let ledger_state = write_guard.clone_state();
 

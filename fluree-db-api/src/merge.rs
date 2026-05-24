@@ -324,14 +324,9 @@ impl crate::Fluree {
         // available, serializing with regular transactions on the target
         // branch. Without a manager (embedded use, no shared cache), fall
         // back to a fresh storage load — there's nothing to protect.
-        let write_guard = self.lock_ledger(target_id).await?;
-        let target_state = match write_guard.as_ref() {
-            Some(guard) => guard.clone_state(),
-            None => {
-                self.load_queryable_state_with_store(target_store, target_record.clone())
-                    .await?
-            }
-        };
+        let (write_guard, target_state) = self
+            .lock_or_load(target_id, target_store, target_record.clone())
+            .await?;
 
         // Collect source flakes and metadata: walk source commits from HEAD
         // to ancestor, gathering flakes, namespace deltas, and graph deltas.

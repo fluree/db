@@ -351,14 +351,9 @@ impl crate::Fluree {
         // available, serializing with regular transactions. Without a
         // manager (embedded use with no shared cache), fall back to a
         // fresh storage load — there's nothing to protect against.
-        let write_guard = self.lock_ledger(branch_id).await?;
-        let target_state = match write_guard.as_ref() {
-            Some(guard) => guard.clone_state(),
-            None => {
-                self.load_queryable_state_with_store(branch_store.clone(), branch_record)
-                    .await?
-            }
-        };
+        let (write_guard, target_state) = self
+            .lock_or_load(branch_id, branch_store.clone(), branch_record)
+            .await?;
 
         let staged = self
             .apply_two_way_strategy(inverted, conflict_keys, strategy, &target_state)
