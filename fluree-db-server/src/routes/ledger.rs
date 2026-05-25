@@ -1390,6 +1390,7 @@ pub async fn merge(State(state): State<Arc<AppState>>, request: Request) -> Resp
 async fn merge_local(state: Arc<AppState>, request: Request) -> Result<impl IntoResponse> {
     let (parts, body) = request.into_parts();
     let headers = FlureeHeaders::from_headers(&parts.headers)?;
+    let idempotency_key = extract_idempotency_key(&parts.headers);
 
     let body_bytes = axum::body::to_bytes(body, 50 * 1024 * 1024)
         .await
@@ -1426,35 +1427,44 @@ async fn merge_local(state: Arc<AppState>, request: Request) -> Result<impl Into
             "branch merge requested"
         );
 
-        let report = match state
-            .fluree
-            .merge_branch(&req.ledger, &req.source, req.target.as_deref(), strategy)
-            .await
-        {
-            Ok(report) => report,
-            Err(e) => {
-                let server_error = ServerError::Api(e);
+        // Keep the bare ledger name accessible after the consensus call —
+        // `format_ledger_id` below needs it with the receipt's resolved target.
+        let ledger_name = req.ledger.clone();
+        let req = fluree_db_consensus::MergeRequest {
+            idempotency_key,
+            ledger_name: req.ledger,
+            source_branch: req.source,
+            target_branch: req.target,
+            strategy,
+        };
+
+        let receipt = match state.consensus.merge(req).await {
+            Ok(receipt) => receipt,
+            Err(err) => {
                 set_span_error_code(&span, "error:BranchMergeFailed");
-                tracing::error!(error = %server_error, "branch merge failed");
-                return Err(server_error);
+                tracing::error!(error = %err, "branch merge failed");
+                return Err(submission_error_to_server_error(err));
             }
         };
 
-        let ledger_id = fluree_db_core::ledger_id::format_ledger_id(&req.ledger, &report.target);
+        let ledger_id = fluree_db_core::ledger_id::format_ledger_id(&ledger_name, &receipt.target);
+        // Fast-forward merges don't apply a conflict strategy — match the
+        // prior wire shape by omitting the field in that case.
+        let strategy_out = (!receipt.fast_forward).then(|| receipt.strategy.as_str().to_string());
         let response = MergeBranchResponse {
             ledger_id,
-            target: report.target,
-            source: report.source,
-            fast_forward: report.fast_forward,
-            new_head_t: report.new_head_t,
-            commits_copied: report.commits_copied,
-            conflict_count: report.conflict_count,
-            strategy: report.strategy,
+            target: receipt.target,
+            source: receipt.source,
+            fast_forward: receipt.fast_forward,
+            new_head_t: receipt.new_head_t,
+            commits_copied: receipt.commits_copied,
+            conflict_count: receipt.conflict_count,
+            strategy: strategy_out,
         };
 
         tracing::info!(
             status = "success",
-            fast_forward = report.fast_forward,
+            fast_forward = response.fast_forward,
             "branch merged"
         );
         Ok((StatusCode::OK, Json(response)))

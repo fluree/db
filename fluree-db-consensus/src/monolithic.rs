@@ -6,9 +6,9 @@
 //! do not need cross-node coordination.
 
 use crate::{
-    IdempotencyKey, OperationReceipt, RevertReceipt, RevertRequest, RevertSelection, SubmissionError,
-    SubmissionLookup, SubmissionState, Submitter, TransactionBody, TransactionReceipt,
-    TransactionRequest,
+    IdempotencyKey, MergeReceipt, MergeRequest, OperationReceipt, RevertReceipt, RevertRequest,
+    RevertSelection, SubmissionError, SubmissionLookup, SubmissionState, Submitter,
+    TransactionBody, TransactionReceipt, TransactionRequest,
 };
 use async_trait::async_trait;
 use fluree_db_api::{
@@ -355,6 +355,61 @@ impl MonolithicConsensus {
             new_head_id: outcome.new_head_id,
         })
     }
+
+    fn hash_merge_body(request: &MergeRequest) -> [u8; 32] {
+        let mut hasher = Sha256::new();
+        hasher.update(request.ledger_name.as_bytes());
+        hasher.update([0u8]);
+        hasher.update(request.source_branch.as_bytes());
+        hasher.update([0u8]);
+        match &request.target_branch {
+            Some(target) => {
+                hasher.update([1u8]);
+                hasher.update(target.as_bytes());
+                hasher.update([0u8]);
+            }
+            None => hasher.update([0u8]),
+        }
+        hasher.update([request.strategy as u8]);
+        hasher.finalize().into()
+    }
+
+    async fn execute_merge(
+        &self,
+        request: MergeRequest,
+    ) -> Result<MergeReceipt, SubmissionError> {
+        let MergeRequest {
+            idempotency_key,
+            ledger_name,
+            source_branch,
+            target_branch,
+            strategy,
+            ..
+        } = request;
+
+        let report = self
+            .fluree
+            .merge_branch(
+                &ledger_name,
+                &source_branch,
+                target_branch.as_deref(),
+                strategy,
+            )
+            .await
+            .map_err(execution_failure)?;
+
+        Ok(MergeReceipt {
+            idempotency_key,
+            source: report.source,
+            target: report.target,
+            fast_forward: report.fast_forward,
+            new_head_t: report.new_head_t,
+            new_head_id: report.new_head_id,
+            commits_copied: report.commits_copied,
+            conflict_count: report.conflict_count,
+            strategy,
+        })
+    }
 }
 
 fn hash_commit_ref(hasher: &mut Sha256, commit: &CommitRef) {
@@ -394,7 +449,9 @@ impl Submitter for MonolithicConsensus {
         if let Some(receipt) = self.try_claim_slot(cache_key.clone(), body_hash).await? {
             return match receipt {
                 OperationReceipt::Transaction(receipt) => Ok(receipt),
-                OperationReceipt::Revert(_) => Err(SubmissionError::KeyCollision),
+                OperationReceipt::Revert(_) | OperationReceipt::Merge(_) => {
+                    Err(SubmissionError::KeyCollision)
+                }
             };
         }
 
@@ -421,12 +478,45 @@ impl Submitter for MonolithicConsensus {
         if let Some(receipt) = self.try_claim_slot(cache_key.clone(), body_hash).await? {
             return match receipt {
                 OperationReceipt::Revert(receipt) => Ok(receipt),
-                OperationReceipt::Transaction(_) => Err(SubmissionError::KeyCollision),
+                OperationReceipt::Transaction(_) | OperationReceipt::Merge(_) => {
+                    Err(SubmissionError::KeyCollision)
+                }
             };
         }
 
         let outcome = self.execute_revert(request).await;
         self.record_outcome(cache_key, body_hash, &outcome, OperationReceipt::Revert)
+            .await;
+        outcome
+    }
+
+    async fn merge(
+        &self,
+        request: MergeRequest,
+    ) -> Result<MergeReceipt, SubmissionError> {
+        let Some(idempotency_key) = request.idempotency_key.clone() else {
+            return self.execute_merge(request).await;
+        };
+
+        // Namespace the cache by `ledger:source_branch`. The source branch
+        // uniquely identifies the merge from the client's perspective and is
+        // always known up front — no need to pre-resolve the target.
+        let ledger_id =
+            fluree_db_api::format_ledger_id(&request.ledger_name, &request.source_branch);
+        let cache_key = (ledger_id, idempotency_key);
+        let body_hash = Self::hash_merge_body(&request);
+
+        if let Some(receipt) = self.try_claim_slot(cache_key.clone(), body_hash).await? {
+            return match receipt {
+                OperationReceipt::Merge(receipt) => Ok(receipt),
+                OperationReceipt::Transaction(_) | OperationReceipt::Revert(_) => {
+                    Err(SubmissionError::KeyCollision)
+                }
+            };
+        }
+
+        let outcome = self.execute_merge(request).await;
+        self.record_outcome(cache_key, body_hash, &outcome, OperationReceipt::Merge)
             .await;
         outcome
     }
@@ -960,6 +1050,126 @@ ex:alice ex:name "Alice" ."#
             .revert(revert_request(Some(key), commit, ConflictStrategy::Abort))
             .await
             .expect_err("revert with a transaction's key should collide");
+        assert!(
+            matches!(err, SubmissionError::KeyCollision),
+            "expected KeyCollision, got {err:?}"
+        );
+    }
+
+    /// Build a Fluree + consensus + a parent branch with one commit + a child
+    /// `feature` branch with one additional commit — the minimum setup a
+    /// merge test needs.
+    async fn setup_with_feature_branch() -> (Arc<fluree_db_api::Fluree>, MonolithicConsensus) {
+        let (fluree, consensus, parent_id) = setup().await;
+        // Genesis commit on `main` so the branch has a head to fork from.
+        consensus
+            .transact(&parent_id, request(None, sample_insert("__genesis__")))
+            .await
+            .expect("seed commit to succeed");
+        fluree
+            .create_branch("test/consensus", "feature", Some("main"), None)
+            .await
+            .expect("create feature branch");
+        // One commit on `feature` so the merge has something to apply.
+        consensus
+            .transact(
+                "test/consensus:feature",
+                request(None, sample_insert("alice")),
+            )
+            .await
+            .expect("commit on feature to succeed");
+        (fluree, consensus)
+    }
+
+    fn merge_request(key: Option<&str>) -> MergeRequest {
+        MergeRequest {
+            idempotency_key: key.map(IdempotencyKey::new),
+            ledger_name: "test/consensus".to_string(),
+            source_branch: "feature".to_string(),
+            target_branch: Some("main".to_string()),
+            strategy: ConflictStrategy::default(),
+        }
+    }
+
+    #[tokio::test]
+    async fn anonymous_merge_returns_receipt() {
+        let (_fluree, consensus) = setup_with_feature_branch().await;
+
+        let receipt = consensus
+            .merge(merge_request(None))
+            .await
+            .expect("merge to succeed");
+
+        assert!(receipt.idempotency_key.is_none());
+        assert_eq!(receipt.source, "feature");
+        assert_eq!(receipt.target, "main");
+        // `main` hasn't advanced since `feature` branched, so the merge
+        // resolves to a fast-forward.
+        assert!(receipt.fast_forward);
+    }
+
+    #[tokio::test]
+    async fn idempotent_merge_returns_cached_receipt() {
+        let (_fluree, consensus) = setup_with_feature_branch().await;
+        let key = "01J5MERGERETRY";
+
+        let first = consensus
+            .merge(merge_request(Some(key)))
+            .await
+            .expect("first merge to succeed");
+
+        let second = consensus
+            .merge(merge_request(Some(key)))
+            .await
+            .expect("retry with same body should return cached receipt");
+
+        // Same receipt — the second call must not have re-executed.
+        // A second merge attempt against the already-merged target would
+        // change the head or fail; either way the t/id would differ.
+        assert_eq!(first.new_head_t, second.new_head_t);
+        assert_eq!(first.new_head_id, second.new_head_id);
+    }
+
+    #[tokio::test]
+    async fn keyed_merge_is_visible_via_status_lookup() {
+        let (_fluree, consensus) = setup_with_feature_branch().await;
+        let key = IdempotencyKey::new("01J5MERGESTATUS");
+
+        let receipt = consensus
+            .merge(merge_request(Some(key.as_str())))
+            .await
+            .expect("merge to succeed");
+
+        // Status namespacing for merge is `ledger:source_branch`.
+        let cache_ledger_id = fluree_db_api::format_ledger_id("test/consensus", "feature");
+        match consensus.status(&cache_ledger_id, &key).await {
+            SubmissionState::Committed(OperationReceipt::Merge(stored)) => {
+                assert_eq!(stored.new_head_t, receipt.new_head_t);
+                assert_eq!(stored.new_head_id, receipt.new_head_id);
+                assert_eq!(stored.fast_forward, receipt.fast_forward);
+            }
+            other => panic!("expected Committed(Merge), got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn merge_key_collides_with_transaction_key() {
+        let (_fluree, consensus) = setup_with_feature_branch().await;
+        let key = "01J5MIXEDMERGEKEY";
+
+        // A keyed transaction on `ledger:feature` claims the cache slot.
+        consensus
+            .transact(
+                "test/consensus:feature",
+                request(Some(key), sample_insert("dave")),
+            )
+            .await
+            .expect("keyed transaction to succeed");
+
+        let err = consensus
+            .merge(merge_request(Some(key)))
+            .await
+            .expect_err("merge with a transaction's key should collide");
         assert!(
             matches!(err, SubmissionError::KeyCollision),
             "expected KeyCollision, got {err:?}"

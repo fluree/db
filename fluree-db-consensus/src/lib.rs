@@ -152,6 +152,34 @@ pub struct RevertReceipt {
     pub new_head_id: CommitId,
 }
 
+/// Merge submission payload.
+///
+/// Replays `source_branch` onto `target_branch` (or the source's parent
+/// branch if `target_branch` is `None`), producing either a fast-forward
+/// update of the target's HEAD or a general merge commit. `strategy`
+/// controls how conflicts between source and target flakes are resolved.
+pub struct MergeRequest {
+    pub idempotency_key: Option<IdempotencyKey>,
+    pub ledger_name: String,
+    pub source_branch: String,
+    pub target_branch: Option<String>,
+    pub strategy: ConflictStrategy,
+}
+
+/// Receipt returned once a merge is durably accepted.
+#[derive(Debug, Clone)]
+pub struct MergeReceipt {
+    pub idempotency_key: Option<IdempotencyKey>,
+    pub source: String,
+    pub target: String,
+    pub fast_forward: bool,
+    pub new_head_t: i64,
+    pub new_head_id: CommitId,
+    pub commits_copied: usize,
+    pub conflict_count: usize,
+    pub strategy: ConflictStrategy,
+}
+
 /// Receipt for any operation submitted through consensus.
 ///
 /// Variants correspond one-to-one with [`Submitter`] methods. The umbrella
@@ -162,6 +190,7 @@ pub struct RevertReceipt {
 pub enum OperationReceipt {
     Transaction(TransactionReceipt),
     Revert(RevertReceipt),
+    Merge(MergeReceipt),
 }
 
 /// State of a previously-submitted operation, accessible by idempotency key.
@@ -239,6 +268,15 @@ pub trait Submitter: Send + Sync {
         &self,
         request: RevertRequest,
     ) -> Result<RevertReceipt, SubmissionError>;
+
+    /// Replay a source branch onto a target branch — fast-forward when the
+    /// target hasn't diverged, otherwise a merge commit under the supplied
+    /// conflict strategy. Carries the same idempotency semantics as
+    /// [`transact`](Self::transact).
+    async fn merge(
+        &self,
+        request: MergeRequest,
+    ) -> Result<MergeReceipt, SubmissionError>;
 }
 
 /// Look up the state of a previously-submitted transaction by its

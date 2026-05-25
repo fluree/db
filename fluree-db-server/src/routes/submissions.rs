@@ -11,8 +11,8 @@ use axum::{
     Json,
 };
 use fluree_db_consensus::{
-    IdempotencyKey, OperationReceipt, RevertReceipt, SubmissionLookup, SubmissionState,
-    TransactionReceipt,
+    IdempotencyKey, MergeReceipt, OperationReceipt, RevertReceipt, SubmissionLookup,
+    SubmissionState, TransactionReceipt,
 };
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
@@ -44,6 +44,7 @@ pub enum SubmissionStateResponse {
 pub enum OperationStatusResponse {
     Transaction(TransactionStatusResponse),
     Revert(RevertStatusResponse),
+    Merge(MergeStatusResponse),
 }
 
 #[derive(Serialize)]
@@ -63,6 +64,20 @@ pub struct RevertStatusResponse {
     pub strategy: String,
     pub new_head_t: i64,
     pub new_head_id: String,
+}
+
+#[derive(Serialize)]
+pub struct MergeStatusResponse {
+    pub idempotency_key: Option<String>,
+    pub source: String,
+    pub target: String,
+    pub fast_forward: bool,
+    pub new_head_t: i64,
+    pub new_head_id: String,
+    pub commits_copied: usize,
+    pub conflict_count: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub strategy: Option<String>,
 }
 
 pub async fn submission_status(
@@ -94,6 +109,7 @@ impl From<OperationReceipt> for OperationStatusResponse {
         match receipt {
             OperationReceipt::Transaction(r) => Self::Transaction(r.into()),
             OperationReceipt::Revert(r) => Self::Revert(r.into()),
+            OperationReceipt::Merge(r) => Self::Merge(r.into()),
         }
     }
 }
@@ -123,6 +139,25 @@ impl From<RevertReceipt> for RevertStatusResponse {
             strategy: receipt.strategy.as_str().to_string(),
             new_head_t: receipt.new_head_t,
             new_head_id: receipt.new_head_id.to_string(),
+        }
+    }
+}
+
+impl From<MergeReceipt> for MergeStatusResponse {
+    fn from(receipt: MergeReceipt) -> Self {
+        // Fast-forward merges don't apply a conflict strategy — omit the
+        // field to match the immediate `POST /merge` response shape.
+        let strategy = (!receipt.fast_forward).then(|| receipt.strategy.as_str().to_string());
+        Self {
+            idempotency_key: receipt.idempotency_key.map(|k| k.as_str().to_string()),
+            source: receipt.source,
+            target: receipt.target,
+            fast_forward: receipt.fast_forward,
+            new_head_t: receipt.new_head_t,
+            new_head_id: receipt.new_head_id.to_string(),
+            commits_copied: receipt.commits_copied,
+            conflict_count: receipt.conflict_count,
+            strategy,
         }
     }
 }
