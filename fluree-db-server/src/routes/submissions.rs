@@ -10,7 +10,10 @@ use axum::{
     extract::{Path, State},
     Json,
 };
-use fluree_db_consensus::{IdempotencyKey, SubmissionLookup, SubmissionState, TransactionReceipt};
+use fluree_db_consensus::{
+    IdempotencyKey, OperationReceipt, RevertReceipt, SubmissionLookup, SubmissionState,
+    TransactionReceipt,
+};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 
@@ -30,16 +33,36 @@ pub struct SubmissionStatusParams {
 pub enum SubmissionStateResponse {
     Unknown,
     InFlight,
-    Committed { receipt: TransactionReceiptResponse },
+    Committed { status: OperationStatusResponse },
     Failed { error: String },
 }
 
+/// Polymorphic status response — discriminated by the operation kind that
+/// produced it, so callers can recover the per-op fields after the fact.
 #[derive(Serialize)]
-pub struct TransactionReceiptResponse {
+#[serde(tag = "operation", rename_all = "snake_case")]
+pub enum OperationStatusResponse {
+    Transaction(TransactionStatusResponse),
+    Revert(RevertStatusResponse),
+}
+
+#[derive(Serialize)]
+pub struct TransactionStatusResponse {
     pub idempotency_key: Option<String>,
     pub commit_id: String,
     pub t: i64,
     pub flake_count: usize,
+}
+
+#[derive(Serialize)]
+pub struct RevertStatusResponse {
+    pub idempotency_key: Option<String>,
+    pub branch: String,
+    pub reverted_commits: Vec<String>,
+    pub conflict_count: usize,
+    pub strategy: String,
+    pub new_head_t: i64,
+    pub new_head_id: String,
 }
 
 pub async fn submission_status(
@@ -57,7 +80,7 @@ impl From<SubmissionState> for SubmissionStateResponse {
             SubmissionState::Unknown => Self::Unknown,
             SubmissionState::InFlight => Self::InFlight,
             SubmissionState::Committed(receipt) => Self::Committed {
-                receipt: receipt.into(),
+                status: receipt.into(),
             },
             SubmissionState::Failed(err) => Self::Failed {
                 error: err.to_string(),
@@ -66,13 +89,40 @@ impl From<SubmissionState> for SubmissionStateResponse {
     }
 }
 
-impl From<TransactionReceipt> for TransactionReceiptResponse {
+impl From<OperationReceipt> for OperationStatusResponse {
+    fn from(receipt: OperationReceipt) -> Self {
+        match receipt {
+            OperationReceipt::Transaction(r) => Self::Transaction(r.into()),
+            OperationReceipt::Revert(r) => Self::Revert(r.into()),
+        }
+    }
+}
+
+impl From<TransactionReceipt> for TransactionStatusResponse {
     fn from(receipt: TransactionReceipt) -> Self {
         Self {
             idempotency_key: receipt.idempotency_key.map(|k| k.as_str().to_string()),
             commit_id: receipt.commit.commit_id.to_string(),
             t: receipt.commit.t,
             flake_count: receipt.commit.flake_count,
+        }
+    }
+}
+
+impl From<RevertReceipt> for RevertStatusResponse {
+    fn from(receipt: RevertReceipt) -> Self {
+        Self {
+            idempotency_key: receipt.idempotency_key.map(|k| k.as_str().to_string()),
+            branch: receipt.branch,
+            reverted_commits: receipt
+                .reverted_commits
+                .into_iter()
+                .map(|id| id.to_string())
+                .collect(),
+            conflict_count: receipt.conflict_count,
+            strategy: receipt.strategy.as_str().to_string(),
+            new_head_t: receipt.new_head_t,
+            new_head_id: receipt.new_head_id.to_string(),
         }
     }
 }

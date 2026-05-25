@@ -114,7 +114,8 @@ pub use dataset::{
     TimeSpec,
 };
 pub use error::{ApiError, BuilderError, BuilderErrors, Result};
-pub use fluree_db_core::ContentId;
+pub use fluree_db_core::ledger_id::format_ledger_id;
+pub use fluree_db_core::{CommitId, ContentId};
 pub use fluree_db_core::RemoteObject;
 pub use fluree_db_core::{
     commit_to_summary, find_common_ancestor, walk_commit_summaries, CommitSummary, CommonAncestor,

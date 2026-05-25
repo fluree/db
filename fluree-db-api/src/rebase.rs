@@ -26,7 +26,7 @@ use tracing::Instrument;
 
 /// Strategy for resolving conflicts when branch and source modifications
 /// overlap on the same (subject, predicate, graph) tuple.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
 pub enum ConflictStrategy {
     /// Replay as-is, both values coexist (multi-cardinality). Default.
     #[default]

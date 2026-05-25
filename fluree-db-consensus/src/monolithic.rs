@@ -6,12 +6,13 @@
 //! do not need cross-node coordination.
 
 use crate::{
-    IdempotencyKey, SubmissionError, SubmissionLookup, SubmissionState, Submitter, TransactionBody,
-    TransactionReceipt, TransactionRequest,
+    IdempotencyKey, OperationReceipt, RevertReceipt, RevertRequest, RevertSelection, SubmissionError,
+    SubmissionLookup, SubmissionState, Submitter, TransactionBody, TransactionReceipt,
+    TransactionRequest,
 };
 use async_trait::async_trait;
 use fluree_db_api::{
-    ApiError, Fluree, GovernanceOptions, LedgerHandle, LedgerManager, PolicyContext,
+    ApiError, CommitRef, Fluree, GovernanceOptions, LedgerHandle, LedgerManager, PolicyContext,
 };
 use fluree_db_ledger::IndexConfig;
 use fluree_db_transact::TxnType;
@@ -216,6 +217,162 @@ impl MonolithicConsensus {
             tally: result.tally,
         })
     }
+
+    /// Atomically claim an idempotency slot in the cache.
+    ///
+    /// Returns `Ok(None)` when the caller wins the claim and must execute
+    /// the operation. Returns `Ok(Some(receipt))` when an earlier
+    /// submission with the same key and body already completed. Returns
+    /// `Err(KeyCollision)` for a mismatched body or `Err(AlreadyInFlight)`
+    /// when another caller's execution is still running.
+    async fn try_claim_slot(
+        &self,
+        cache_key: SubmissionCacheKey,
+        body_hash: [u8; 32],
+    ) -> Result<Option<OperationReceipt>, SubmissionError> {
+        // `or_insert_with_if` writes a fresh `InFlight` marker when the key
+        // is absent, or replaces a prior failed attempt for the same body —
+        // failures are re-attemptable. Concurrent submissions for the same
+        // key see `is_fresh() == false` and collapse onto the existing
+        // submission; only the caller that wins the claim goes on to execute.
+        let claim = self
+            .cache
+            .entry(cache_key)
+            .or_insert_with_if(
+                std::future::ready(CachedSubmission {
+                    state: SubmissionState::InFlight,
+                    body_hash,
+                }),
+                |existing| {
+                    matches!(existing.state, SubmissionState::Failed(_))
+                        && existing.body_hash == body_hash
+                },
+            )
+            .await;
+
+        if claim.is_fresh() {
+            return Ok(None);
+        }
+
+        let existing = claim.into_value();
+        if existing.body_hash != body_hash {
+            return Err(SubmissionError::KeyCollision);
+        }
+        match existing.state {
+            SubmissionState::Committed(receipt) => Ok(Some(receipt)),
+            _ => Err(SubmissionError::AlreadyInFlight),
+        }
+    }
+
+    /// Record the outcome of a freshly-executed claim back into the cache.
+    ///
+    /// `wrap` lifts the per-operation receipt into the umbrella
+    /// [`OperationReceipt`] so the cache stays uniform across operation
+    /// kinds.
+    async fn record_outcome<R, F>(
+        &self,
+        cache_key: SubmissionCacheKey,
+        body_hash: [u8; 32],
+        outcome: &Result<R, SubmissionError>,
+        wrap: F,
+    ) where
+        R: Clone,
+        F: FnOnce(R) -> OperationReceipt,
+    {
+        let final_state = match outcome {
+            Ok(receipt) => SubmissionState::Committed(wrap(receipt.clone())),
+            Err(err) => SubmissionState::Failed(err.clone()),
+        };
+        self.cache
+            .insert(
+                cache_key,
+                CachedSubmission {
+                    state: final_state,
+                    body_hash,
+                },
+            )
+            .await;
+    }
+
+    fn hash_revert_body(request: &RevertRequest) -> [u8; 32] {
+        let mut hasher = Sha256::new();
+        hasher.update(request.ledger_name.as_bytes());
+        hasher.update([0u8]);
+        hasher.update(request.branch.as_bytes());
+        hasher.update([0u8]);
+        match &request.selection {
+            RevertSelection::Commits(commits) => {
+                hasher.update([0u8]);
+                hasher.update((commits.len() as u64).to_le_bytes());
+                for commit in commits.iter() {
+                    hash_commit_ref(&mut hasher, commit);
+                }
+            }
+            RevertSelection::Range { from, to } => {
+                hasher.update([1u8]);
+                hash_commit_ref(&mut hasher, from);
+                hash_commit_ref(&mut hasher, to);
+            }
+        }
+        hasher.update([request.strategy as u8]);
+        hasher.finalize().into()
+    }
+
+    async fn execute_revert(
+        &self,
+        request: RevertRequest,
+    ) -> Result<RevertReceipt, SubmissionError> {
+        let RevertRequest {
+            idempotency_key,
+            ledger_name,
+            branch,
+            selection,
+            strategy,
+            ..
+        } = request;
+
+        let result = match selection {
+            RevertSelection::Commits(commits) => {
+                self.fluree
+                    .revert_commits(&ledger_name, &branch, commits.into_vec(), strategy)
+                    .await
+            }
+            RevertSelection::Range { from, to } => {
+                self.fluree
+                    .revert_range(&ledger_name, &branch, from, to, strategy)
+                    .await
+            }
+        };
+
+        let outcome = result.map_err(execution_failure)?;
+        Ok(RevertReceipt {
+            idempotency_key,
+            branch,
+            reverted_commits: outcome.reverted_commits,
+            conflict_count: outcome.conflict_count,
+            strategy,
+            new_head_t: outcome.new_head_t,
+            new_head_id: outcome.new_head_id,
+        })
+    }
+}
+
+fn hash_commit_ref(hasher: &mut Sha256, commit: &CommitRef) {
+    match commit {
+        CommitRef::Exact(id) => {
+            hasher.update([0u8]);
+            hasher.update(id.to_bytes());
+        }
+        CommitRef::Prefix(prefix) => {
+            hasher.update([1u8]);
+            hasher.update(prefix.as_bytes());
+            hasher.update([0u8]);
+        }
+        CommitRef::T(t) => {
+            hasher.update([2u8]);
+            hasher.update(t.to_le_bytes());
+        }
+    }
 }
 
 #[async_trait]
@@ -234,56 +391,43 @@ impl Submitter for MonolithicConsensus {
         let cache_key = (ledger_id.to_string(), idempotency_key);
         let body_hash = Self::hash_request_body(&request);
 
-        // Atomically claim the key. `or_insert_with_if` writes a fresh
-        // `InFlight` marker when the key is absent, or replaces a prior
-        // failed attempt for the same body — failures are re-attemptable.
-        // Concurrent submissions for the same key see `is_fresh() == false`
-        // and collapse onto the existing submission; only the caller that
-        // wins the claim goes on to execute.
-        let claim = self
-            .cache
-            .entry(cache_key.clone())
-            .or_insert_with_if(
-                std::future::ready(CachedSubmission {
-                    state: SubmissionState::InFlight,
-                    body_hash,
-                }),
-                |existing| {
-                    matches!(existing.state, SubmissionState::Failed(_))
-                        && existing.body_hash == body_hash
-                },
-            )
-            .await;
-
-        if !claim.is_fresh() {
-            let existing = claim.into_value();
-            if existing.body_hash != body_hash {
-                return Err(SubmissionError::KeyCollision);
-            }
-            // Claim lost and the body matches, so the entry is a completed
-            // or still-running submission for the same transaction.
-            return match existing.state {
-                SubmissionState::Committed(receipt) => Ok(receipt),
-                _ => Err(SubmissionError::AlreadyInFlight),
+        if let Some(receipt) = self.try_claim_slot(cache_key.clone(), body_hash).await? {
+            return match receipt {
+                OperationReceipt::Transaction(receipt) => Ok(receipt),
+                OperationReceipt::Revert(_) => Err(SubmissionError::KeyCollision),
             };
         }
 
         let outcome = self.execute_transaction(ledger_id, request).await;
-
-        let final_state = match &outcome {
-            Ok(receipt) => SubmissionState::Committed(receipt.clone()),
-            Err(err) => SubmissionState::Failed(err.clone()),
-        };
-        self.cache
-            .insert(
-                cache_key,
-                CachedSubmission {
-                    state: final_state,
-                    body_hash,
-                },
-            )
+        self.record_outcome(cache_key, body_hash, &outcome, OperationReceipt::Transaction)
             .await;
+        outcome
+    }
 
+    async fn revert(
+        &self,
+        request: RevertRequest,
+    ) -> Result<RevertReceipt, SubmissionError> {
+        let Some(idempotency_key) = request.idempotency_key.clone() else {
+            return self.execute_revert(request).await;
+        };
+
+        // Cache key uses the same `ledger:branch` form as `transact` so a
+        // single status-lookup endpoint works uniformly across op kinds.
+        let ledger_id = fluree_db_api::format_ledger_id(&request.ledger_name, &request.branch);
+        let cache_key = (ledger_id, idempotency_key);
+        let body_hash = Self::hash_revert_body(&request);
+
+        if let Some(receipt) = self.try_claim_slot(cache_key.clone(), body_hash).await? {
+            return match receipt {
+                OperationReceipt::Revert(receipt) => Ok(receipt),
+                OperationReceipt::Transaction(_) => Err(SubmissionError::KeyCollision),
+            };
+        }
+
+        let outcome = self.execute_revert(request).await;
+        self.record_outcome(cache_key, body_hash, &outcome, OperationReceipt::Revert)
+            .await;
         outcome
     }
 }
@@ -302,7 +446,7 @@ impl SubmissionLookup for MonolithicConsensus {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use fluree_db_api::{FlureeBuilder, TrackingOptions};
+    use fluree_db_api::{CommitId, CommitRef, ConflictStrategy, FlureeBuilder, TrackingOptions};
     use fluree_db_transact::{CommitOpts, TxnOpts};
     use serde_json::{json, Value as JsonValue};
 
@@ -375,11 +519,11 @@ mod tests {
         assert_eq!(receipt.idempotency_key.as_ref(), Some(&key));
 
         match consensus.status(&ledger_id, &key).await {
-            SubmissionState::Committed(stored) => {
+            SubmissionState::Committed(OperationReceipt::Transaction(stored)) => {
                 assert_eq!(stored.commit.t, receipt.commit.t);
                 assert_eq!(stored.commit.commit_id, receipt.commit.commit_id);
             }
-            other => panic!("expected Committed, got {other:?}"),
+            other => panic!("expected Committed(Transaction), got {other:?}"),
         }
     }
 
@@ -700,5 +844,125 @@ ex:alice ex:name "Alice" ."#
             .await
             .expect("retry after the ledger exists should succeed");
         assert!(receipt.commit.flake_count > 0);
+    }
+
+    /// Submit two inserts against the test ledger and return the second
+    /// commit's ID — the first call seeds the genesis commit (which cannot
+    /// be reverted) and the second produces the revertable commit every
+    /// revert test needs.
+    async fn seed_commit(consensus: &MonolithicConsensus, ledger_id: &str, name: &str) -> CommitId {
+        consensus
+            .transact(ledger_id, request(None, sample_insert("__genesis__")))
+            .await
+            .expect("genesis transaction to succeed");
+        let receipt = consensus
+            .transact(ledger_id, request(None, sample_insert(name)))
+            .await
+            .expect("seed transaction to succeed");
+        receipt.commit.commit_id
+    }
+
+    fn revert_request(
+        key: Option<&str>,
+        commit: CommitId,
+        strategy: ConflictStrategy,
+    ) -> RevertRequest {
+        RevertRequest {
+            idempotency_key: key.map(IdempotencyKey::new),
+            ledger_name: "test/consensus".to_string(),
+            branch: "main".to_string(),
+            selection: RevertSelection::single(CommitRef::Exact(commit)),
+            strategy,
+        }
+    }
+
+    #[tokio::test]
+    async fn anonymous_revert_returns_receipt() {
+        let (_fluree, consensus, ledger_id) = setup().await;
+        let commit = seed_commit(&consensus, &ledger_id, "alice").await;
+
+        let receipt = consensus
+            .revert(revert_request(None, commit, ConflictStrategy::Abort))
+            .await
+            .expect("revert to succeed");
+
+        assert!(receipt.idempotency_key.is_none());
+        assert_eq!(receipt.reverted_commits.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn idempotent_revert_returns_cached_receipt() {
+        let (_fluree, consensus, ledger_id) = setup().await;
+        let commit = seed_commit(&consensus, &ledger_id, "alice").await;
+        let key = "01J5REVERTRETRY";
+
+        let first = consensus
+            .revert(revert_request(
+                Some(key),
+                commit.clone(),
+                ConflictStrategy::Abort,
+            ))
+            .await
+            .expect("first revert to succeed");
+
+        let second = consensus
+            .revert(revert_request(Some(key), commit, ConflictStrategy::Abort))
+            .await
+            .expect("retry with same body should return cached receipt");
+
+        // Same receipt — the second call must not have re-executed.
+        // A second revert would advance `new_head_t` past the first.
+        assert_eq!(first.new_head_t, second.new_head_t);
+        assert_eq!(first.new_head_id, second.new_head_id);
+    }
+
+    #[tokio::test]
+    async fn keyed_revert_is_visible_via_status_lookup() {
+        let (_fluree, consensus, ledger_id) = setup().await;
+        let commit = seed_commit(&consensus, &ledger_id, "alice").await;
+        let key = IdempotencyKey::new("01J5REVERTSTATUS");
+
+        let receipt = consensus
+            .revert(revert_request(
+                Some(key.as_str()),
+                commit,
+                ConflictStrategy::Abort,
+            ))
+            .await
+            .expect("revert to succeed");
+
+        match consensus.status(&ledger_id, &key).await {
+            SubmissionState::Committed(OperationReceipt::Revert(stored)) => {
+                assert_eq!(stored.new_head_t, receipt.new_head_t);
+                assert_eq!(stored.new_head_id, receipt.new_head_id);
+            }
+            other => panic!("expected Committed(Revert), got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn revert_key_collides_with_transaction_key() {
+        let (_fluree, consensus, ledger_id) = setup().await;
+        let key = "01J5MIXEDKEY";
+        // Seed a non-genesis commit so the revert target is valid.
+        let commit = seed_commit(&consensus, &ledger_id, "alice").await;
+
+        // A keyed transaction claims the key on this ledger:branch.
+        consensus
+            .transact(&ledger_id, request(Some(key), sample_insert("carol")))
+            .await
+            .expect("keyed transaction to succeed");
+
+        // A revert reusing the same key must collide — the cached entry is
+        // a `Transaction` receipt, not a `Revert` one, so the bodies cannot
+        // match.
+        let err = consensus
+            .revert(revert_request(Some(key), commit, ConflictStrategy::Abort))
+            .await
+            .expect_err("revert with a transaction's key should collide");
+        assert!(
+            matches!(err, SubmissionError::KeyCollision),
+            "expected KeyCollision, got {err:?}"
+        );
     }
 }

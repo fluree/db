@@ -131,7 +131,7 @@ fn compute_tx_id_sparql(sparql: &str) -> String {
 ///
 /// Returns `None` when the header is absent or empty. Non-UTF-8 header values
 /// are also treated as absent — the consensus layer can only key on strings.
-fn extract_idempotency_key(headers: &HeaderMap) -> Option<IdempotencyKey> {
+pub(crate) fn extract_idempotency_key(headers: &HeaderMap) -> Option<IdempotencyKey> {
     headers
         .get("Idempotency-Key")
         .and_then(|v| v.to_str().ok())
@@ -153,7 +153,7 @@ fn tracking_from_headers(headers: &FlureeHeaders) -> Option<TrackingOptions> {
 /// `Execution` carries the status from the underlying transaction pipeline
 /// (e.g. 422 for a validation failure, 404 for a missing ledger), so it is
 /// passed through rather than collapsed to a 500.
-fn submission_error_to_server_error(err: SubmissionError) -> ServerError {
+pub(crate) fn submission_error_to_server_error(err: SubmissionError) -> ServerError {
     let status = match &err {
         SubmissionError::KeyCollision | SubmissionError::AlreadyInFlight => 409,
         SubmissionError::Execution { status, .. } => *status,

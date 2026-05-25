@@ -23,7 +23,9 @@ pub mod monolithic;
 pub use monolithic::{MonolithicConsensus, DEFAULT_IDEMPOTENCY_TTL};
 
 use async_trait::async_trait;
-use fluree_db_api::{GovernanceOptions, TrackingOptions, TrackingTally};
+use fluree_db_api::{
+    CommitId, ConflictStrategy, GovernanceOptions, RevertSelection, TrackingOptions, TrackingTally,
+};
 use fluree_db_transact::{CommitOpts, CommitReceipt, TxnOpts, TxnType};
 use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
@@ -124,7 +126,45 @@ pub struct TransactionReceipt {
     pub tally: Option<TrackingTally>,
 }
 
-/// State of a previously-submitted transaction, accessible by idempotency key.
+/// Revert submission payload.
+///
+/// Produces a single inverse commit on the given branch that retracts the
+/// effects of the commits identified by `selection`. `strategy` controls
+/// how conflicts between the reverted flakes and the branch head's current
+/// facts are resolved.
+pub struct RevertRequest {
+    pub idempotency_key: Option<IdempotencyKey>,
+    pub ledger_name: String,
+    pub branch: String,
+    pub selection: RevertSelection,
+    pub strategy: ConflictStrategy,
+}
+
+/// Receipt returned once a revert is durably accepted.
+#[derive(Debug, Clone)]
+pub struct RevertReceipt {
+    pub idempotency_key: Option<IdempotencyKey>,
+    pub branch: String,
+    pub reverted_commits: Vec<CommitId>,
+    pub conflict_count: usize,
+    pub strategy: ConflictStrategy,
+    pub new_head_t: i64,
+    pub new_head_id: CommitId,
+}
+
+/// Receipt for any operation submitted through consensus.
+///
+/// Variants correspond one-to-one with [`Submitter`] methods. The umbrella
+/// type lets [`SubmissionState`] and the idempotency cache stay uniform
+/// across operation kinds without erasing per-op typing at the trait
+/// methods themselves.
+#[derive(Debug, Clone)]
+pub enum OperationReceipt {
+    Transaction(TransactionReceipt),
+    Revert(RevertReceipt),
+}
+
+/// State of a previously-submitted operation, accessible by idempotency key.
 #[derive(Debug, Clone)]
 pub enum SubmissionState {
     /// No submission with this key is known.
@@ -132,7 +172,7 @@ pub enum SubmissionState {
     /// Submission accepted, durability not yet acknowledged.
     InFlight,
     /// Submission durably accepted and committed.
-    Committed(TransactionReceipt),
+    Committed(OperationReceipt),
     /// Submission attempted but failed.
     Failed(SubmissionError),
 }
@@ -164,22 +204,25 @@ pub enum SubmissionError {
     Execution { status: u16, message: String },
 }
 
-/// Submit transactions for processing.
+/// Submit operations for processing.
 ///
-/// Implementations choose how acceptance is achieved — local execution for
-/// monolithic, leader replication for Raft, quorum voting for BFT — but
-/// the caller's contract is identical: pass a [`TransactionRequest`], await
-/// the future, get a [`TransactionReceipt`] when durably accepted.
+/// Each method represents an operation kind — transactions, reverts, and
+/// (later) merges and rebases — that requires durable acceptance through
+/// the same consensus path. Implementations choose how acceptance is
+/// achieved (local execution for monolithic, leader replication for Raft,
+/// quorum voting for BFT) but the caller's contract is identical per
+/// method: pass a request, await the future, get the per-op receipt when
+/// durably accepted.
 ///
-/// "Durably accepted" means the transaction is persisted and visible to
+/// "Durably accepted" means the operation is persisted and visible to
 /// subsequent reads on this same consensus instance. Cross-instance read
 /// consistency (e.g., querying a follower right after writing on a leader)
 /// is handled at the read path, not here.
 ///
-/// Dropping the returned future does **not** cancel the underlying submission.
-/// Once accepted internally, the work proceeds to completion regardless. To
-/// learn the outcome after dropping, look up by idempotency key via
-/// [`SubmissionLookup`].
+/// Dropping the returned future does **not** cancel the underlying
+/// submission. Once accepted internally, the work proceeds to completion
+/// regardless. To learn the outcome after dropping, look up by idempotency
+/// key via [`SubmissionLookup`].
 #[async_trait]
 pub trait Submitter: Send + Sync {
     async fn transact(
@@ -187,6 +230,15 @@ pub trait Submitter: Send + Sync {
         ledger_id: &str,
         request: TransactionRequest,
     ) -> Result<TransactionReceipt, SubmissionError>;
+
+    /// Revert the effects of one or more commits on a branch as a single
+    /// inverse commit. Carries the same idempotency semantics as
+    /// [`transact`](Self::transact) — a `Some(idempotency_key)` collapses
+    /// retries and enables later status lookup via [`SubmissionLookup`].
+    async fn revert(
+        &self,
+        request: RevertRequest,
+    ) -> Result<RevertReceipt, SubmissionError>;
 }
 
 /// Look up the state of a previously-submitted transaction by its
