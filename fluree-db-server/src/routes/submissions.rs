@@ -11,7 +11,7 @@ use axum::{
     Json,
 };
 use fluree_db_consensus::{
-    IdempotencyKey, MergeReceipt, OperationReceipt, RevertReceipt, SubmissionLookup,
+    IdempotencyKey, MergeReceipt, OperationReceipt, RebaseReceipt, RevertReceipt, SubmissionLookup,
     SubmissionState, TransactionReceipt,
 };
 use serde::{Deserialize, Serialize};
@@ -45,6 +45,7 @@ pub enum OperationStatusResponse {
     Transaction(TransactionStatusResponse),
     Revert(RevertStatusResponse),
     Merge(MergeStatusResponse),
+    Rebase(RebaseStatusResponse),
 }
 
 #[derive(Serialize)]
@@ -80,6 +81,21 @@ pub struct MergeStatusResponse {
     pub strategy: Option<String>,
 }
 
+#[derive(Serialize)]
+pub struct RebaseStatusResponse {
+    pub idempotency_key: Option<String>,
+    pub branch: String,
+    pub fast_forward: bool,
+    pub replayed: usize,
+    pub skipped: usize,
+    pub conflicts: usize,
+    pub failures: usize,
+    pub total_commits: usize,
+    pub source_head_t: i64,
+    pub source_head_id: String,
+    pub strategy: String,
+}
+
 pub async fn submission_status(
     State(state): State<Arc<AppState>>,
     Path(params): Path<SubmissionStatusParams>,
@@ -110,6 +126,7 @@ impl From<OperationReceipt> for OperationStatusResponse {
             OperationReceipt::Transaction(r) => Self::Transaction(r.into()),
             OperationReceipt::Revert(r) => Self::Revert(r.into()),
             OperationReceipt::Merge(r) => Self::Merge(r.into()),
+            OperationReceipt::Rebase(r) => Self::Rebase(r.into()),
         }
     }
 }
@@ -158,6 +175,24 @@ impl From<MergeReceipt> for MergeStatusResponse {
             commits_copied: receipt.commits_copied,
             conflict_count: receipt.conflict_count,
             strategy,
+        }
+    }
+}
+
+impl From<RebaseReceipt> for RebaseStatusResponse {
+    fn from(receipt: RebaseReceipt) -> Self {
+        Self {
+            idempotency_key: receipt.idempotency_key.map(|k| k.as_str().to_string()),
+            branch: receipt.branch,
+            fast_forward: receipt.fast_forward,
+            replayed: receipt.replayed,
+            skipped: receipt.skipped,
+            conflicts: receipt.conflicts,
+            failures: receipt.failures,
+            total_commits: receipt.total_commits,
+            source_head_t: receipt.source_head_t,
+            source_head_id: receipt.source_head_id.to_string(),
+            strategy: receipt.strategy.as_str().to_string(),
         }
     }
 }

@@ -1257,6 +1257,7 @@ pub async fn rebase(State(state): State<Arc<AppState>>, request: Request) -> Res
 async fn rebase_local(state: Arc<AppState>, request: Request) -> Result<impl IntoResponse> {
     let (parts, body) = request.into_parts();
     let headers = FlureeHeaders::from_headers(&parts.headers)?;
+    let idempotency_key = extract_idempotency_key(&parts.headers);
 
     let body_bytes = axum::body::to_bytes(body, 50 * 1024 * 1024)
         .await
@@ -1291,37 +1292,39 @@ async fn rebase_local(state: Arc<AppState>, request: Request) -> Result<impl Int
             "branch rebase requested"
         );
 
-        let report = match state
-            .fluree
-            .rebase_branch(&req.ledger, &req.branch, strategy)
-            .await
-        {
-            Ok(report) => report,
-            Err(e) => {
-                let server_error = ServerError::Api(e);
+        let ledger_id = fluree_db_core::ledger_id::format_ledger_id(&req.ledger, &req.branch);
+        let req = fluree_db_consensus::RebaseRequest {
+            idempotency_key,
+            ledger_name: req.ledger,
+            branch: req.branch,
+            strategy,
+        };
+
+        let receipt = match state.consensus.rebase(req).await {
+            Ok(receipt) => receipt,
+            Err(err) => {
                 set_span_error_code(&span, "error:BranchRebaseFailed");
-                tracing::error!(error = %server_error, "branch rebase failed");
-                return Err(server_error);
+                tracing::error!(error = %err, "branch rebase failed");
+                return Err(submission_error_to_server_error(err));
             }
         };
 
-        let ledger_id = fluree_db_core::ledger_id::format_ledger_id(&req.ledger, &req.branch);
         let response = RebaseBranchResponse {
             ledger_id,
-            branch: req.branch,
-            fast_forward: report.fast_forward,
-            replayed: report.replayed,
-            skipped: report.skipped,
-            conflicts: report.conflicts.len(),
-            failures: report.failures.len(),
-            total_commits: report.total_commits,
-            source_head_t: report.source_head_t,
+            branch: receipt.branch,
+            fast_forward: receipt.fast_forward,
+            replayed: receipt.replayed,
+            skipped: receipt.skipped,
+            conflicts: receipt.conflicts,
+            failures: receipt.failures,
+            total_commits: receipt.total_commits,
+            source_head_t: receipt.source_head_t,
         };
 
         tracing::info!(
             status = "success",
-            fast_forward = report.fast_forward,
-            replayed = report.replayed,
+            fast_forward = response.fast_forward,
+            replayed = response.replayed,
             "branch rebased"
         );
         Ok((StatusCode::OK, Json(response)))

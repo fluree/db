@@ -6,9 +6,9 @@
 //! do not need cross-node coordination.
 
 use crate::{
-    IdempotencyKey, MergeReceipt, MergeRequest, OperationReceipt, RevertReceipt, RevertRequest,
-    RevertSelection, SubmissionError, SubmissionLookup, SubmissionState, Submitter,
-    TransactionBody, TransactionReceipt, TransactionRequest,
+    IdempotencyKey, MergeReceipt, MergeRequest, OperationReceipt, RebaseReceipt, RebaseRequest,
+    RevertReceipt, RevertRequest, RevertSelection, SubmissionError, SubmissionLookup,
+    SubmissionState, Submitter, TransactionBody, TransactionReceipt, TransactionRequest,
 };
 use async_trait::async_trait;
 use fluree_db_api::{
@@ -410,6 +410,49 @@ impl MonolithicConsensus {
             strategy,
         })
     }
+
+    fn hash_rebase_body(request: &RebaseRequest) -> [u8; 32] {
+        let mut hasher = Sha256::new();
+        hasher.update(request.ledger_name.as_bytes());
+        hasher.update([0u8]);
+        hasher.update(request.branch.as_bytes());
+        hasher.update([0u8]);
+        hasher.update([request.strategy as u8]);
+        hasher.finalize().into()
+    }
+
+    async fn execute_rebase(
+        &self,
+        request: RebaseRequest,
+    ) -> Result<RebaseReceipt, SubmissionError> {
+        let RebaseRequest {
+            idempotency_key,
+            ledger_name,
+            branch,
+            strategy,
+            ..
+        } = request;
+
+        let report = self
+            .fluree
+            .rebase_branch(&ledger_name, &branch, strategy)
+            .await
+            .map_err(execution_failure)?;
+
+        Ok(RebaseReceipt {
+            idempotency_key,
+            branch,
+            fast_forward: report.fast_forward,
+            replayed: report.replayed,
+            skipped: report.skipped,
+            conflicts: report.conflicts.len(),
+            failures: report.failures.len(),
+            total_commits: report.total_commits,
+            source_head_t: report.source_head_t,
+            source_head_id: report.source_head_id,
+            strategy,
+        })
+    }
 }
 
 fn hash_commit_ref(hasher: &mut Sha256, commit: &CommitRef) {
@@ -449,9 +492,9 @@ impl Submitter for MonolithicConsensus {
         if let Some(receipt) = self.try_claim_slot(cache_key.clone(), body_hash).await? {
             return match receipt {
                 OperationReceipt::Transaction(receipt) => Ok(receipt),
-                OperationReceipt::Revert(_) | OperationReceipt::Merge(_) => {
-                    Err(SubmissionError::KeyCollision)
-                }
+                OperationReceipt::Revert(_)
+                | OperationReceipt::Merge(_)
+                | OperationReceipt::Rebase(_) => Err(SubmissionError::KeyCollision),
             };
         }
 
@@ -478,9 +521,9 @@ impl Submitter for MonolithicConsensus {
         if let Some(receipt) = self.try_claim_slot(cache_key.clone(), body_hash).await? {
             return match receipt {
                 OperationReceipt::Revert(receipt) => Ok(receipt),
-                OperationReceipt::Transaction(_) | OperationReceipt::Merge(_) => {
-                    Err(SubmissionError::KeyCollision)
-                }
+                OperationReceipt::Transaction(_)
+                | OperationReceipt::Merge(_)
+                | OperationReceipt::Rebase(_) => Err(SubmissionError::KeyCollision),
             };
         }
 
@@ -509,14 +552,44 @@ impl Submitter for MonolithicConsensus {
         if let Some(receipt) = self.try_claim_slot(cache_key.clone(), body_hash).await? {
             return match receipt {
                 OperationReceipt::Merge(receipt) => Ok(receipt),
-                OperationReceipt::Transaction(_) | OperationReceipt::Revert(_) => {
-                    Err(SubmissionError::KeyCollision)
-                }
+                OperationReceipt::Transaction(_)
+                | OperationReceipt::Revert(_)
+                | OperationReceipt::Rebase(_) => Err(SubmissionError::KeyCollision),
             };
         }
 
         let outcome = self.execute_merge(request).await;
         self.record_outcome(cache_key, body_hash, &outcome, OperationReceipt::Merge)
+            .await;
+        outcome
+    }
+
+    async fn rebase(
+        &self,
+        request: RebaseRequest,
+    ) -> Result<RebaseReceipt, SubmissionError> {
+        let Some(idempotency_key) = request.idempotency_key.clone() else {
+            return self.execute_rebase(request).await;
+        };
+
+        // Rebase rewrites `branch` itself, so the cache namespace is the
+        // branch being rebased — the natural identifier from the client's
+        // perspective and the URL they'd use to check status.
+        let ledger_id = fluree_db_api::format_ledger_id(&request.ledger_name, &request.branch);
+        let cache_key = (ledger_id, idempotency_key);
+        let body_hash = Self::hash_rebase_body(&request);
+
+        if let Some(receipt) = self.try_claim_slot(cache_key.clone(), body_hash).await? {
+            return match receipt {
+                OperationReceipt::Rebase(receipt) => Ok(receipt),
+                OperationReceipt::Transaction(_)
+                | OperationReceipt::Revert(_)
+                | OperationReceipt::Merge(_) => Err(SubmissionError::KeyCollision),
+            };
+        }
+
+        let outcome = self.execute_rebase(request).await;
+        self.record_outcome(cache_key, body_hash, &outcome, OperationReceipt::Rebase)
             .await;
         outcome
     }
@@ -1170,6 +1243,94 @@ ex:alice ex:name "Alice" ."#
             .merge(merge_request(Some(key)))
             .await
             .expect_err("merge with a transaction's key should collide");
+        assert!(
+            matches!(err, SubmissionError::KeyCollision),
+            "expected KeyCollision, got {err:?}"
+        );
+    }
+
+    fn rebase_request(key: Option<&str>) -> RebaseRequest {
+        RebaseRequest {
+            idempotency_key: key.map(IdempotencyKey::new),
+            ledger_name: "test/consensus".to_string(),
+            branch: "feature".to_string(),
+            strategy: ConflictStrategy::default(),
+        }
+    }
+
+    #[tokio::test]
+    async fn anonymous_rebase_returns_receipt() {
+        let (_fluree, consensus) = setup_with_feature_branch().await;
+
+        let receipt = consensus
+            .rebase(rebase_request(None))
+            .await
+            .expect("rebase to succeed");
+
+        assert!(receipt.idempotency_key.is_none());
+        assert_eq!(receipt.branch, "feature");
+    }
+
+    #[tokio::test]
+    async fn idempotent_rebase_returns_cached_receipt() {
+        let (_fluree, consensus) = setup_with_feature_branch().await;
+        let key = "01J5REBASERETRY";
+
+        let first = consensus
+            .rebase(rebase_request(Some(key)))
+            .await
+            .expect("first rebase to succeed");
+
+        let second = consensus
+            .rebase(rebase_request(Some(key)))
+            .await
+            .expect("retry with same body should return cached receipt");
+
+        assert_eq!(first.source_head_t, second.source_head_t);
+        assert_eq!(first.source_head_id, second.source_head_id);
+        assert_eq!(first.replayed, second.replayed);
+    }
+
+    #[tokio::test]
+    async fn keyed_rebase_is_visible_via_status_lookup() {
+        let (_fluree, consensus) = setup_with_feature_branch().await;
+        let key = IdempotencyKey::new("01J5REBASESTATUS");
+
+        let receipt = consensus
+            .rebase(rebase_request(Some(key.as_str())))
+            .await
+            .expect("rebase to succeed");
+
+        // Cache namespace for rebase is `ledger:branch` (the branch being rebased).
+        let cache_ledger_id = fluree_db_api::format_ledger_id("test/consensus", "feature");
+        match consensus.status(&cache_ledger_id, &key).await {
+            SubmissionState::Committed(OperationReceipt::Rebase(stored)) => {
+                assert_eq!(stored.source_head_t, receipt.source_head_t);
+                assert_eq!(stored.source_head_id, receipt.source_head_id);
+                assert_eq!(stored.fast_forward, receipt.fast_forward);
+            }
+            other => panic!("expected Committed(Rebase), got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn rebase_key_collides_with_transaction_key() {
+        let (_fluree, consensus) = setup_with_feature_branch().await;
+        let key = "01J5MIXEDREBASEKEY";
+
+        // A keyed transaction on `ledger:feature` claims the cache slot.
+        consensus
+            .transact(
+                "test/consensus:feature",
+                request(Some(key), sample_insert("eve")),
+            )
+            .await
+            .expect("keyed transaction to succeed");
+
+        let err = consensus
+            .rebase(rebase_request(Some(key)))
+            .await
+            .expect_err("rebase with a transaction's key should collide");
         assert!(
             matches!(err, SubmissionError::KeyCollision),
             "expected KeyCollision, got {err:?}"

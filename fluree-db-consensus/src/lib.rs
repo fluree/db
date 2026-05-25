@@ -180,6 +180,33 @@ pub struct MergeReceipt {
     pub strategy: ConflictStrategy,
 }
 
+/// Rebase submission payload.
+///
+/// Replays `branch`'s unique commits on top of its source branch's current
+/// HEAD, resolving conflicts according to `strategy`.
+pub struct RebaseRequest {
+    pub idempotency_key: Option<IdempotencyKey>,
+    pub ledger_name: String,
+    pub branch: String,
+    pub strategy: ConflictStrategy,
+}
+
+/// Receipt returned once a rebase is durably accepted.
+#[derive(Debug, Clone)]
+pub struct RebaseReceipt {
+    pub idempotency_key: Option<IdempotencyKey>,
+    pub branch: String,
+    pub fast_forward: bool,
+    pub replayed: usize,
+    pub skipped: usize,
+    pub conflicts: usize,
+    pub failures: usize,
+    pub total_commits: usize,
+    pub source_head_t: i64,
+    pub source_head_id: CommitId,
+    pub strategy: ConflictStrategy,
+}
+
 /// Receipt for any operation submitted through consensus.
 ///
 /// Variants correspond one-to-one with [`Submitter`] methods. The umbrella
@@ -191,6 +218,7 @@ pub enum OperationReceipt {
     Transaction(TransactionReceipt),
     Revert(RevertReceipt),
     Merge(MergeReceipt),
+    Rebase(RebaseReceipt),
 }
 
 /// State of a previously-submitted operation, accessible by idempotency key.
@@ -277,6 +305,14 @@ pub trait Submitter: Send + Sync {
         &self,
         request: MergeRequest,
     ) -> Result<MergeReceipt, SubmissionError>;
+
+    /// Replay a branch's unique commits on top of its source branch's
+    /// current HEAD, under the supplied conflict strategy. Carries the
+    /// same idempotency semantics as [`transact`](Self::transact).
+    async fn rebase(
+        &self,
+        request: RebaseRequest,
+    ) -> Result<RebaseReceipt, SubmissionError>;
 }
 
 /// Look up the state of a previously-submitted transaction by its
