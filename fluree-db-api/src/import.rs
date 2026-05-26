@@ -31,7 +31,10 @@
 //! even though chunk parsing is parallel.
 
 use crate::error::ApiError;
-use fluree_db_core::{ContentId, ContentKind, ContentStore, RemoteObject, Storage, StorageRead};
+use fluree_db_core::{
+    ContentId, ContentKind, ContentStore, FuelExceededError, RemoteObject, Storage, StorageRead,
+    Tracker, TrackingTally,
+};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -144,6 +147,12 @@ pub struct ImportConfig {
     pub leaf_target_rows: usize,
     /// Optional progress callback invoked at key pipeline milestones.
     pub progress: Option<ProgressFn>,
+    /// Optional execution tracker. When enabled, fuel is charged per chunk
+    /// using the same formula as `stage_transaction`: 100 fuel baseline per
+    /// commit plus 1 micro-fuel per encoded flake. If the tracker carries a
+    /// `max_fuel` limit, the import aborts with `ImportError::FuelExceeded`
+    /// as soon as the limit is exceeded. Default: `Tracker::disabled()`.
+    pub tracker: Tracker,
 }
 
 impl std::fmt::Debug for ImportConfig {
@@ -154,6 +163,7 @@ impl std::fmt::Debug for ImportConfig {
             .field("chunk_size_mb", &self.chunk_size_mb)
             .field("chunk_max_flakes", &self.chunk_max_flakes)
             .field("progress", &self.progress.as_ref().map(|_| "..."))
+            .field("tracker_enabled", &self.tracker.is_enabled())
             .finish_non_exhaustive()
     }
 }
@@ -179,6 +189,7 @@ impl Default for ImportConfig {
             leaflets_per_leaf: 10,
             leaf_target_rows: 250_000,
             progress: None,
+            tracker: Tracker::disabled(),
         }
     }
 }
@@ -368,6 +379,9 @@ pub struct ImportResult {
     pub index_t: i64,
     /// Optional summary of top classes, properties, and connections.
     pub summary: Option<ImportSummary>,
+    /// Tracking tally (fuel, time) when a tracker was supplied via
+    /// `ImportBuilder::tracker(...)`. `None` when tracking was disabled.
+    pub tally: Option<TrackingTally>,
 }
 
 /// Lightweight summary of the imported dataset for CLI display.
@@ -406,6 +420,8 @@ pub enum ImportError {
     NoChunks(String),
     /// Directory contains both Turtle and JSON-LD files.
     MixedFormats(String),
+    /// Tracker max-fuel limit exceeded mid-import.
+    FuelExceeded(FuelExceededError),
 }
 
 impl std::fmt::Display for ImportError {
@@ -420,6 +436,12 @@ impl std::fmt::Display for ImportError {
             Self::Io(e) => write!(f, "I/O: {e}"),
             Self::NoChunks(msg) => write!(f, "no chunks: {msg}"),
             Self::MixedFormats(msg) => write!(f, "mixed formats: {msg}"),
+            Self::FuelExceeded(e) => write!(
+                f,
+                "fuel limit exceeded: used {} of {} fuel",
+                e.used_fuel(),
+                e.limit_fuel()
+            ),
         }
     }
 }
@@ -441,6 +463,12 @@ impl From<std::io::Error> for ImportError {
 impl From<fluree_db_core::Error> for ImportError {
     fn from(e: fluree_db_core::Error) -> Self {
         Self::Storage(e.to_string())
+    }
+}
+
+impl From<FuelExceededError> for ImportError {
+    fn from(e: FuelExceededError) -> Self {
+        Self::FuelExceeded(e)
     }
 }
 
@@ -1048,6 +1076,16 @@ impl<'a> ImportBuilder<'a> {
         self
     }
 
+    /// Attach an execution tracker for fuel accounting. Mirrors transaction
+    /// fuel charging: 100 fuel baseline per commit + 1 micro-fuel per flake.
+    /// When the tracker carries a `max_fuel` limit, the import aborts with
+    /// `ImportError::FuelExceeded` as soon as the limit is hit. The final
+    /// tally is returned on `ImportResult::tally`.
+    pub fn tracker(mut self, tracker: Tracker) -> Self {
+        self.config.tracker = tracker;
+        self
+    }
+
     /// Effective resource settings that will be used for this import (auto-derived when not set).
     /// Use this to report to the user what memory budget and parallelism the import will use.
     pub fn effective_import_settings(&self) -> EffectiveImportSettings {
@@ -1574,6 +1612,7 @@ where
         root_id,
         index_t,
         summary,
+        tally: config.tracker.tally(),
     })
 }
 
@@ -1780,6 +1819,15 @@ where
                 let result = finalize_parsed_chunk(state, parsed, ns_delta, env.storage, env.alias)
                     .await
                     .map_err(|e| ImportError::Transact(e.to_string()))?;
+
+                // Fuel: 100 fuel baseline per commit + 1 micro-fuel per flake,
+                // matching the per-chunk-as-transaction model in `stage.rs`.
+                if env.config.tracker.is_enabled() {
+                    env.config.tracker.consume_fuel(100_000)?;
+                    env.config
+                        .tracker
+                        .consume_fuel(result.flake_count as u64)?;
+                }
 
                 // Collect txn-meta for this commit (no I/O, just captures data already in scope).
                 commit_metas.push(CommitMeta {
@@ -2462,6 +2510,12 @@ where
                     .map_err(|e| ImportError::Transact(e.to_string()))?
             };
 
+            // Fuel: 100 fuel baseline per commit + 1 micro-fuel per flake.
+            if config.tracker.is_enabled() {
+                config.tracker.consume_fuel(100_000)?;
+                config.tracker.consume_fuel(result.flake_count as u64)?;
+            }
+
             // Collect txn-meta for this commit.
             {
                 let previous_commit_hex = commit_metas.last().map(|m| m.commit_hash_hex.clone());
@@ -2691,6 +2745,12 @@ where
                         .await
                         .map_err(|e| ImportError::Transact(e.to_string()))?
                 };
+
+                // Fuel: 100 fuel baseline per commit + 1 micro-fuel per flake.
+                if config.tracker.is_enabled() {
+                    config.tracker.consume_fuel(100_000)?;
+                    config.tracker.consume_fuel(result.flake_count as u64)?;
+                }
 
                 // Collect txn-meta for this commit.
                 {
