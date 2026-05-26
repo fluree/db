@@ -680,3 +680,112 @@ async fn history_range_iri_object_novelty_only() {
         "novelty-only history over a ref-valued predicate must bind @t and @op"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Case: literal `@id` that does not resolve to any subject in the data.
+//
+// Bug report: a history query with `{"@id": "<non-existent IRI>", ...}` was
+// silently dropping the subject filter and returning every history row for
+// the genesis transaction (t=1). The filter binding for a non-matching
+// subject literal must behave the same as a non-matching pattern in a
+// regular query — return zero rows.
+// ---------------------------------------------------------------------------
+#[tokio::test]
+async fn history_range_nonexistent_id_returns_empty() {
+    let tmp = tempfile::tempdir().expect("create temp dir");
+    let fluree = FlureeBuilder::file(tmp.path().to_str().unwrap())
+        .build()
+        .expect("build");
+    let ledger_id = "test/history-nonexistent-id:main";
+    let ledger0 = fluree.create_ledger(ledger_id).await.expect("create");
+
+    // Genesis transaction with several subjects so the t=1 leaflet has
+    // enough rows that the bug — falling back to an unconstrained scan —
+    // would surface as a non-empty result.
+    let tx1 = json!({
+        "@context": ctx(),
+        "@graph": [
+            {"@id": "ex:alice",   "ex:name": "Alice"},
+            {"@id": "ex:bob",     "ex:name": "Bob"},
+            {"@id": "ex:carol",   "ex:name": "Carol"},
+        ],
+    });
+    let r1 = fluree.insert(ledger0, &tx1).await.expect("tx1");
+    assert_eq!(r1.receipt.t, 1);
+    assert_eq!(reindex_to_current(&fluree, ledger_id).await, 1);
+
+    // Sanity: real subject returns its row.
+    let q_real = json!({
+        "@context": ctx(),
+        "from": format!("{ledger_id}@t:1"),
+        "to":   format!("{ledger_id}@t:latest"),
+        "select": ["?v", "?t", "?op"],
+        "where": [{
+            "@id": "ex:alice",
+            "ex:name": {"@value": "?v", "@t": "?t", "@op": "?op"}
+        }],
+    });
+    let real_rows = run_history_query(&fluree, &q_real).await;
+    assert_eq!(
+        real_rows,
+        vec![("Alice".to_string(), 1, true)],
+        "control: existing subject must still return its history"
+    );
+
+    // Bug repro: non-existent subject IRI.
+    let q_missing = json!({
+        "@context": ctx(),
+        "from": format!("{ledger_id}@t:1"),
+        "to":   format!("{ledger_id}@t:latest"),
+        "select": ["?v", "?t", "?op"],
+        "where": [{
+            "@id": "http://does-not-exist.example/x",
+            "ex:name": {"@value": "?v", "@t": "?t", "@op": "?op"}
+        }],
+    });
+    let missing_rows = run_history_query(&fluree, &q_missing).await;
+    assert!(
+        missing_rows.is_empty(),
+        "non-matching @id must return zero rows; got {missing_rows:#?}"
+    );
+}
+
+/// Same as above but novelty-only (no reindex) — verifies the novelty
+/// path also treats a non-matching literal subject as empty rather than
+/// falling through to an unconstrained scan.
+#[tokio::test]
+async fn history_range_nonexistent_id_returns_empty_novelty_only() {
+    let tmp = tempfile::tempdir().expect("create temp dir");
+    let fluree = FlureeBuilder::file(tmp.path().to_str().unwrap())
+        .build()
+        .expect("build");
+    let ledger_id = "test/history-nonexistent-id-novelty:main";
+    let ledger0 = fluree.create_ledger(ledger_id).await.expect("create");
+
+    let tx1 = json!({
+        "@context": ctx(),
+        "@graph": [
+            {"@id": "ex:alice",   "ex:name": "Alice"},
+            {"@id": "ex:bob",     "ex:name": "Bob"},
+            {"@id": "ex:carol",   "ex:name": "Carol"},
+        ],
+    });
+    let r1 = fluree.insert(ledger0, &tx1).await.expect("tx1");
+    assert_eq!(r1.receipt.t, 1);
+
+    let q_missing = json!({
+        "@context": ctx(),
+        "from": format!("{ledger_id}@t:1"),
+        "to":   format!("{ledger_id}@t:latest"),
+        "select": ["?v", "?t", "?op"],
+        "where": [{
+            "@id": "http://does-not-exist.example/x",
+            "ex:name": {"@value": "?v", "@t": "?t", "@op": "?op"}
+        }],
+    });
+    let missing_rows = run_history_query(&fluree, &q_missing).await;
+    assert!(
+        missing_rows.is_empty(),
+        "non-matching @id must return zero rows (novelty-only); got {missing_rows:#?}"
+    );
+}

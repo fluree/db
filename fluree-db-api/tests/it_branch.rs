@@ -455,6 +455,7 @@ async fn drop_branch_leaf() {
         .unwrap();
     let report = fluree.drop_branch("mydb", "dev").await.unwrap();
 
+    assert_eq!(report.status, fluree_db_api::DropStatus::Dropped);
     assert!(!report.deferred, "leaf branch should not be deferred");
     assert_eq!(report.ledger_id, "mydb:dev");
 
@@ -462,6 +463,48 @@ async fn drop_branch_leaf() {
     let branches = fluree.list_branches("mydb").await.unwrap();
     let names: Vec<&str> = branches.iter().map(|r| r.branch.as_str()).collect();
     assert_eq!(names, vec!["main"]);
+}
+
+/// A second `drop_branch` on the same branch must report
+/// `DropStatus::AlreadyRetracted` (not silently re-report `Dropped`).
+/// The CLI relies on this to render a "no-op" message instead of
+/// claiming a successful drop the second time.
+#[tokio::test]
+async fn drop_branch_is_idempotent_already_retracted() {
+    let fluree = FlureeBuilder::memory().build_memory();
+
+    let ledger = fluree.create_ledger("mydb").await.unwrap();
+    let txn = json!({
+        "@context": {"ex": "http://example.org/ns/"},
+        "@graph": [{"@id": "ex:seed", "ex:val": 1}]
+    });
+    fluree.insert(ledger, &txn).await.unwrap();
+
+    // Create a child off "dev" so the first drop on "dev" is forced into
+    // the deferred / soft-retract path. That preserves the nameservice
+    // record (retracted = true) and lets a second drop_branch observe it.
+    fluree
+        .create_branch("mydb", "dev", None, None)
+        .await
+        .unwrap();
+    fluree
+        .create_branch("mydb", "feature", Some("dev"), None)
+        .await
+        .unwrap();
+
+    let first = fluree.drop_branch("mydb", "dev").await.unwrap();
+    assert_eq!(first.status, fluree_db_api::DropStatus::Dropped);
+    assert!(
+        first.deferred,
+        "drop with children must defer (record kept, retracted = true)"
+    );
+
+    let second = fluree.drop_branch("mydb", "dev").await.unwrap();
+    assert_eq!(
+        second.status,
+        fluree_db_api::DropStatus::AlreadyRetracted,
+        "second drop must observe the retracted record and report AlreadyRetracted",
+    );
 }
 
 /// Cannot drop the root branch. "main" is the default, so dropping it on a

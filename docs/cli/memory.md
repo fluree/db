@@ -76,6 +76,17 @@ Configured 1 tool.
 
 With `--yes`: auto-confirms all installations without prompting. In a non-interactive shell (piped stdin) without `--yes`, MCP installation is skipped with a message.
 
+### Detection signals
+
+`init` detects an IDE if **any** of these is true:
+
+- A known binary is on `PATH` (`claude`, `code`, `cursor`, `windsurf`, `zed`).
+- The IDE's app bundle is in `/Applications` or `~/Applications` (macOS).
+- A home-dir marker exists (`~/.claude`, `~/.cursor`, `~/.vscode`, `~/.codeium/windsurf`, `~/.zed`, `~/.config/zed`).
+- The IDE's user-config dir exists (`~/.config/Code`, `~/.config/Cursor`, …; on macOS: `~/Library/Application Support/<App>`; on Windows: `%APPDATA%\<App>`).
+
+If your IDE is installed but missed (commonly: a fresh install that's never been launched and isn't on `PATH`), install MCP for it directly with `fluree memory mcp-install --ide <tool>`. See [memory/reference/ide-matrix.md](../memory/reference/ide-matrix.md) for the full table.
+
 ## fluree memory add
 
 Store a new memory.
