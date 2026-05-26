@@ -221,6 +221,18 @@ pub fn detect_system_memory_mb() -> usize {
     16 * 1024
 }
 
+/// Charge the per-commit fuel cost: 100 fuel baseline + 1 micro-fuel
+/// per flake. No-op when tracking is disabled. Used by every commit
+/// loop (parallel, remote-serial, local-serial) to keep the import
+/// fuel formula identical to the per-transaction `stage.rs` path.
+fn charge_commit_fuel(tracker: &Tracker, flake_count: u64) -> Result<(), FuelExceededError> {
+    if tracker.is_enabled() {
+        tracker.consume_fuel(100_000)?;
+        tracker.consume_fuel(flake_count)?;
+    }
+    Ok(())
+}
+
 fn env_flag(name: &str) -> bool {
     std::env::var(name)
         .map(|value| {
@@ -1822,10 +1834,7 @@ where
 
                 // Fuel: 100 fuel baseline per commit + 1 micro-fuel per flake,
                 // matching the per-chunk-as-transaction model in `stage.rs`.
-                if env.config.tracker.is_enabled() {
-                    env.config.tracker.consume_fuel(100_000)?;
-                    env.config.tracker.consume_fuel(result.flake_count as u64)?;
-                }
+                charge_commit_fuel(&env.config.tracker, result.flake_count as u64)?;
 
                 // Collect txn-meta for this commit (no I/O, just captures data already in scope).
                 commit_metas.push(CommitMeta {
@@ -2509,10 +2518,7 @@ where
             };
 
             // Fuel: 100 fuel baseline per commit + 1 micro-fuel per flake.
-            if config.tracker.is_enabled() {
-                config.tracker.consume_fuel(100_000)?;
-                config.tracker.consume_fuel(result.flake_count as u64)?;
-            }
+            charge_commit_fuel(&config.tracker, result.flake_count as u64)?;
 
             // Collect txn-meta for this commit.
             {
@@ -2745,10 +2751,7 @@ where
                 };
 
                 // Fuel: 100 fuel baseline per commit + 1 micro-fuel per flake.
-                if config.tracker.is_enabled() {
-                    config.tracker.consume_fuel(100_000)?;
-                    config.tracker.consume_fuel(result.flake_count as u64)?;
-                }
+                charge_commit_fuel(&config.tracker, result.flake_count as u64)?;
 
                 // Collect txn-meta for this commit.
                 {
