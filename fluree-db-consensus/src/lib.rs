@@ -27,7 +27,7 @@ use fluree_db_api::{
     CommitId, ConflictStrategy, GovernanceOptions, IndexingStatus, RevertSelection, TrackingOptions,
     TrackingTally,
 };
-use fluree_db_transact::{CommitOpts, CommitReceipt, TxnOpts, TxnType};
+use fluree_db_transact::{CommitOpts, CommitReceipt, TxnOpts};
 use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
 use std::collections::HashMap;
@@ -72,18 +72,27 @@ impl From<&str> for IdempotencyKey {
 
 /// The transaction payload in its submitted form.
 ///
-/// The variant fixes how the body is parsed and staged; [`TransactionRequest::txn_type`]
-/// independently fixes the insert/update/upsert semantics. Not every
-/// combination is valid — Turtle/TriG bodies do not support `Update`
-/// (SPARQL UPDATE is the update path for RDF text).
+/// Each variant fixes both the parser path *and* the insert/upsert/update
+/// semantics, so invalid combinations (e.g. Turtle-Update, TriG-Insert)
+/// are unrepresentable at the type level. SPARQL UPDATE encodes its own
+/// semantics in the query and so has no per-op variants.
 pub enum TransactionBody {
-    /// A JSON-LD transaction document.
-    JsonLd(JsonValue),
-    /// Turtle or TriG RDF text. The parser handles TriG `GRAPH` blocks.
-    Turtle(String),
-    /// SPARQL UPDATE query text. The lowered `Txn` carries its own
-    /// insert/update semantics, so [`TransactionRequest::txn_type`] is
-    /// nominal for this variant.
+    /// JSON-LD document staged as pure insert (no retractions).
+    JsonLdInsert(JsonValue),
+    /// JSON-LD document staged with upsert semantics
+    /// (existing-value retraction per `(subject, predicate)`).
+    JsonLdUpsert(JsonValue),
+    /// JSON-LD document staged as an update (general retract + assert).
+    JsonLdUpdate(JsonValue),
+    /// Plain Turtle text (`text/turtle`) staged as pure insert.
+    TurtleInsert(String),
+    /// Plain Turtle text (`text/turtle`) staged with upsert semantics.
+    TurtleUpsert(String),
+    /// TriG text (`application/trig`) staged with upsert semantics —
+    /// `GRAPH` blocks require the upsert path so no insert variant exists.
+    TrigUpsert(String),
+    /// SPARQL UPDATE query text; the lowered `Txn` carries its own
+    /// insert/update semantics.
     Sparql(String),
 }
 
@@ -107,7 +116,6 @@ pub enum TransactionBody {
 /// request headers for SPARQL.
 pub struct TransactionRequest {
     pub idempotency_key: Option<IdempotencyKey>,
-    pub txn_type: TxnType,
     pub body: TransactionBody,
     pub txn_opts: TxnOpts,
     pub commit_opts: CommitOpts,

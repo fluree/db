@@ -280,12 +280,12 @@ async fn transact_via_consensus(
     headers: &HeaderMap,
 ) -> Result<Response> {
     let operation = match &request.body {
+        TransactionBody::JsonLdInsert(_) | TransactionBody::TurtleInsert(_) => "insert",
+        TransactionBody::JsonLdUpsert(_)
+        | TransactionBody::TurtleUpsert(_)
+        | TransactionBody::TrigUpsert(_) => "upsert",
+        TransactionBody::JsonLdUpdate(_) => "update",
         TransactionBody::Sparql(_) => "sparql-update",
-        _ => match request.txn_type {
-            TxnType::Insert => "insert",
-            TxnType::Upsert => "upsert",
-            TxnType::Update => "update",
-        },
     };
     let correlation = IndexRequestCorrelation::new(
         extract_request_id(headers, &state.telemetry_config),
@@ -1464,10 +1464,14 @@ async fn execute_transaction(
         // tracking, and execution are all handled by the submission layer;
         // policy is built there from the ledger state the transaction
         // actually stages against.
+        let body = match txn_type {
+            TxnType::Insert => TransactionBody::JsonLdInsert(prepared_transaction.body),
+            TxnType::Upsert => TransactionBody::JsonLdUpsert(prepared_transaction.body),
+            TxnType::Update => TransactionBody::JsonLdUpdate(prepared_transaction.body),
+        };
         let request = TransactionRequest {
             idempotency_key,
-            txn_type,
-            body: TransactionBody::JsonLd(prepared_transaction.body),
+            body,
             txn_opts: TxnOpts::default(),
             commit_opts,
             tracking: prepared_transaction.tracking,
@@ -1557,10 +1561,20 @@ async fn execute_turtle_transaction(
         // Turtle/TriG carries no body `opts`, so policy runs under root.
         // Tracking, however, is header-driven and applies to every format.
         let tracking = tracking_from_headers(headers);
+        // (TriG, Insert) is rejected above and (Turtle/TriG, Update) is
+        // unreachable here — none of the callers pass `TxnType::Update`
+        // for a Turtle body, and the consensus `TransactionBody` has no
+        // Turtle-Update variant.
+        let body = match (is_trig, txn_type) {
+            (false, TxnType::Insert) => TransactionBody::TurtleInsert(turtle.to_string()),
+            (false, TxnType::Upsert) => TransactionBody::TurtleUpsert(turtle.to_string()),
+            (true, TxnType::Upsert) => TransactionBody::TrigUpsert(turtle.to_string()),
+            (true, TxnType::Insert) => unreachable!("rejected above"),
+            (_, TxnType::Update) => unreachable!("Turtle callers never pass Update"),
+        };
         let request = TransactionRequest {
             idempotency_key: extract_idempotency_key(&credential.headers),
-            txn_type,
-            body: TransactionBody::Turtle(turtle.to_string()),
+            body,
             txn_opts: TxnOpts::default(),
             commit_opts,
             tracking,
@@ -1677,12 +1691,10 @@ async fn execute_sparql_update_request(
     // The query is parsed and lowered inside the consensus layer, under the
     // ledger write lock — so namespace allocation shares the staging
     // registry and the namespace-conflict retry that pre-lowering required
-    // is gone. `txn_type` is nominal: the lowered Txn carries the real
-    // insert/update semantics. Tracking is header-driven for SPARQL.
+    // is gone. Tracking is header-driven for SPARQL.
     let tracking = tracking_from_headers(headers);
     let request = TransactionRequest {
         idempotency_key: extract_idempotency_key(&credential.headers),
-        txn_type: TxnType::Update,
         body: TransactionBody::Sparql(sparql),
         txn_opts: TxnOpts::default(),
         commit_opts,

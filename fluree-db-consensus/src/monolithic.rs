@@ -17,7 +17,6 @@ use fluree_db_api::{
     PolicyContext, PushCommitsRequest,
 };
 use fluree_db_ledger::IndexConfig;
-use fluree_db_transact::TxnType;
 use moka::future::Cache;
 use sha2::{Digest, Sha256};
 use std::sync::Arc;
@@ -122,15 +121,33 @@ impl MonolithicConsensus {
 
     fn hash_request_body(request: &TransactionRequest) -> [u8; 32] {
         let mut hasher = Sha256::new();
-        // The format tag keeps a JSON-LD body and a Turtle body that happen
-        // to stringify alike from hashing to the same value.
+        // Each variant tag distinguishes both format and insert/upsert/update
+        // semantics — same bytes under a different variant produce different
+        // hashes, so two retries that disagree on operation kind collide
+        // correctly.
         match &request.body {
-            TransactionBody::JsonLd(json) => {
-                hasher.update(b"jsonld");
+            TransactionBody::JsonLdInsert(json) => {
+                hasher.update(b"jsonld-insert");
                 hasher.update(json.to_string().as_bytes());
             }
-            TransactionBody::Turtle(text) => {
-                hasher.update(b"turtle");
+            TransactionBody::JsonLdUpsert(json) => {
+                hasher.update(b"jsonld-upsert");
+                hasher.update(json.to_string().as_bytes());
+            }
+            TransactionBody::JsonLdUpdate(json) => {
+                hasher.update(b"jsonld-update");
+                hasher.update(json.to_string().as_bytes());
+            }
+            TransactionBody::TurtleInsert(text) => {
+                hasher.update(b"turtle-insert");
+                hasher.update(text.as_bytes());
+            }
+            TransactionBody::TurtleUpsert(text) => {
+                hasher.update(b"turtle-upsert");
+                hasher.update(text.as_bytes());
+            }
+            TransactionBody::TrigUpsert(text) => {
+                hasher.update(b"trig-upsert");
                 hasher.update(text.as_bytes());
             }
             TransactionBody::Sparql(text) => {
@@ -138,12 +155,6 @@ impl MonolithicConsensus {
                 hasher.update(text.as_bytes());
             }
         }
-        let txn_type_tag: &[u8] = match request.txn_type {
-            TxnType::Insert => b"insert",
-            TxnType::Upsert => b"upsert",
-            TxnType::Update => b"update",
-        };
-        hasher.update(txn_type_tag);
         hasher.finalize().into()
     }
 
@@ -163,7 +174,6 @@ impl MonolithicConsensus {
     ) -> Result<TransactionReceipt, SubmissionError> {
         let TransactionRequest {
             idempotency_key,
-            txn_type,
             body,
             txn_opts,
             commit_opts,
@@ -181,24 +191,18 @@ impl MonolithicConsensus {
 
         // The builder API holds the ledger write lock and replaces the cached
         // state internally for the duration of stage + commit — no manual
-        // lock/clone/replace dance is needed here. The (body, txn_type) pair
-        // selects the staging operation; Turtle/TriG has no update form.
+        // lock/clone/replace dance is needed here. Each body variant fixes
+        // both the parser path and the insert/upsert/update semantics.
         let staged = self.fluree.stage(&ledger_handle);
-        let staged = match (&body, txn_type) {
-            (TransactionBody::JsonLd(json), TxnType::Insert) => staged.insert(json),
-            (TransactionBody::JsonLd(json), TxnType::Upsert) => staged.upsert(json),
-            (TransactionBody::JsonLd(json), TxnType::Update) => staged.update(json),
-            (TransactionBody::Turtle(text), TxnType::Insert) => staged.insert_turtle(text.as_str()),
-            (TransactionBody::Turtle(text), TxnType::Upsert) => staged.upsert_turtle(text.as_str()),
-            (TransactionBody::Turtle(_), TxnType::Update) => {
-                return Err(SubmissionError::Execution {
-                    status: 400,
-                    message: "Turtle/TriG is not supported for update transactions".into(),
-                });
+        let staged = match &body {
+            TransactionBody::JsonLdInsert(json) => staged.insert(json),
+            TransactionBody::JsonLdUpsert(json) => staged.upsert(json),
+            TransactionBody::JsonLdUpdate(json) => staged.update(json),
+            TransactionBody::TurtleInsert(text) => staged.insert_turtle(text.as_str()),
+            TransactionBody::TurtleUpsert(text) | TransactionBody::TrigUpsert(text) => {
+                staged.upsert_turtle(text.as_str())
             }
-            // SPARQL UPDATE carries its own insert/update semantics in the
-            // query, so `txn_type` is ignored for this body.
-            (TransactionBody::Sparql(query), _) => staged.sparql_update(query.as_str()),
+            TransactionBody::Sparql(query) => staged.sparql_update(query.as_str()),
         };
         let mut builder = staged
             .txn_opts(txn_opts)
@@ -738,8 +742,7 @@ mod tests {
     fn request(key: Option<&str>, body: JsonValue) -> TransactionRequest {
         TransactionRequest {
             idempotency_key: key.map(IdempotencyKey::new),
-            txn_type: TxnType::Insert,
-            body: TransactionBody::JsonLd(body),
+            body: TransactionBody::JsonLdInsert(body),
             txn_opts: TxnOpts::default(),
             commit_opts: CommitOpts::default(),
             tracking: None,
@@ -869,7 +872,7 @@ mod tests {
         let (_fluree, consensus, ledger_id) = setup().await;
 
         let mut req = request(None, sample_insert("alice"));
-        req.txn_type = TxnType::Upsert;
+        req.body = TransactionBody::JsonLdUpsert(sample_insert("alice"));
 
         let receipt = consensus
             .transact(&ledger_id, req)
@@ -930,8 +933,8 @@ mod tests {
             "@context": {"ex": "http://example.org/"},
             "insert": {"@id": "ex:john", "ex:name": "John"}
         });
-        let mut req = request(None, body);
-        req.txn_type = TxnType::Update;
+        let mut req = request(None, body.clone());
+        req.body = TransactionBody::JsonLdUpdate(body);
         req.governance = GovernanceOptions {
             policy: Some(json!([{
                 "@id": "ex:viewOnly",
@@ -984,8 +987,7 @@ mod tests {
 ex:alice ex:name "Alice" ."#;
         let req = TransactionRequest {
             idempotency_key: None,
-            txn_type: TxnType::Insert,
-            body: TransactionBody::Turtle(turtle.to_string()),
+            body: TransactionBody::TurtleInsert(turtle.to_string()),
             txn_opts: TxnOpts::default(),
             commit_opts: CommitOpts::default(),
             tracking: None,
@@ -1000,42 +1002,11 @@ ex:alice ex:name "Alice" ."#;
     }
 
     #[tokio::test]
-    async fn turtle_update_is_rejected() {
-        let (_fluree, consensus, ledger_id) = setup().await;
-
-        let req = TransactionRequest {
-            idempotency_key: None,
-            txn_type: TxnType::Update,
-            body: TransactionBody::Turtle(
-                r#"@prefix ex: <http://example.org/> .
-ex:alice ex:name "Alice" ."#
-                    .to_string(),
-            ),
-            txn_opts: TxnOpts::default(),
-            commit_opts: CommitOpts::default(),
-            tracking: None,
-            governance: GovernanceOptions::default(),
-        };
-
-        let err = consensus
-            .transact(&ledger_id, req)
-            .await
-            .expect_err("Turtle is not a valid update body");
-        match err {
-            SubmissionError::Execution { status, .. } => {
-                assert_eq!(status, 400, "Turtle-update rejection should be 400");
-            }
-            other => panic!("expected Execution, got {other:?}"),
-        }
-    }
-
-    #[tokio::test]
     async fn sparql_update_routes_through_consensus() {
         let (_fluree, consensus, ledger_id) = setup().await;
 
         let req = TransactionRequest {
             idempotency_key: None,
-            txn_type: TxnType::Update,
             body: TransactionBody::Sparql(
                 r#"INSERT DATA { <http://example.org/alice> <http://example.org/name> "Alice" . }"#
                     .to_string(),
@@ -1059,7 +1030,6 @@ ex:alice ex:name "Alice" ."#
 
         let req = TransactionRequest {
             idempotency_key: None,
-            txn_type: TxnType::Update,
             body: TransactionBody::Sparql("INSERT DATA { this is not valid sparql".to_string()),
             txn_opts: TxnOpts::default(),
             commit_opts: CommitOpts::default(),
