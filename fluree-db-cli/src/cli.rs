@@ -307,6 +307,12 @@ pub enum Commands {
         remote: Option<String>,
     },
 
+    /// Manage named graphs within a ledger
+    Graph {
+        #[command(subcommand)]
+        action: GraphAction,
+    },
+
     /// Insert data into a ledger
     ///
     /// Examples:
@@ -779,6 +785,72 @@ pub enum Commands {
     Iceberg {
         #[command(subcommand)]
         action: IcebergAction,
+    },
+}
+
+/// Named-graph subcommands.
+#[derive(Subcommand)]
+pub enum GraphAction {
+    /// List the user-defined named graphs registered on a branch
+    ///
+    /// Reads the `named-graphs` section of the standard `info` payload
+    /// for the targeted branch and, by default, hides the default graph
+    /// and the system `txn-meta` / `config` graphs. Pass
+    /// `--include-system` to show all four kinds.
+    ///
+    /// Examples:
+    ///   fluree graph list
+    ///   fluree graph list --ledger mydb:feature-x
+    ///   fluree graph list --ledger mydb --remote origin
+    ///   fluree graph list --ledger mydb --include-system --json
+    List {
+        /// Ledger identifier (e.g. "mydb" or "mydb:feature-x").
+        /// Defaults to the active ledger.
+        #[arg(long)]
+        ledger: Option<String>,
+
+        /// List graphs on a remote server (by remote name, e.g. "origin")
+        #[arg(long)]
+        remote: Option<String>,
+
+        /// Emit the filtered `named-graphs` JSON array instead of a table.
+        /// The same `--include-system` filter applies as for the table view.
+        #[arg(long)]
+        json: bool,
+
+        /// Include the default graph and the system `txn-meta` / `config`
+        /// graphs in the output. Off by default.
+        #[arg(long)]
+        include_system: bool,
+    },
+
+    /// Drop a named graph from a single branch of a ledger
+    ///
+    /// Issues a transactional retract: every triple currently asserted
+    /// in the target graph is retracted in one new commit. History is
+    /// preserved — queries `as-of` an earlier `t` still see the graph
+    /// populated. The graph IRI remains registered so it can be
+    /// re-populated by a later insert.
+    ///
+    /// Refuses the default graph and the system `txn-meta` / `config`
+    /// graphs.
+    ///
+    /// Examples:
+    ///   fluree graph drop urn:example:org/payroll --ledger mydb
+    ///   fluree graph drop urn:example:org/payroll --ledger mydb:feature-x
+    ///   fluree graph drop urn:example:org/payroll --ledger mydb --remote origin
+    Drop {
+        /// Full IRI of the named graph to drop.
+        iri: String,
+
+        /// Ledger identifier (e.g. "mydb" or "mydb:feature-x").
+        /// Defaults to the active ledger.
+        #[arg(long)]
+        ledger: Option<String>,
+
+        /// Execute against a remote server (by remote name, e.g. "origin")
+        #[arg(long)]
+        remote: Option<String>,
     },
 }
 

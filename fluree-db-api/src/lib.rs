@@ -91,6 +91,7 @@ pub mod search;
 pub use admin::{
     BranchDropReport,
     DropMode,
+    DropNamedGraphReport,
     DropReport,
     DropStatus,
     GraphSourceDropReport,

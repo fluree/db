@@ -12,7 +12,9 @@ use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::Json;
 use fluree_db_api::wire::{ReindexRequest, ReindexResponse};
-use fluree_db_api::{ApiError, BranchDropReport, DropMode, DropReport, DropStatus};
+use fluree_db_api::{
+    ApiError, BranchDropReport, DropMode, DropNamedGraphReport, DropReport, DropStatus,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
 use sha2::{Digest, Sha256};
@@ -1190,6 +1192,122 @@ async fn drop_branch_local(
             "branch dropped"
         );
         Ok(Json(DropBranchResponse::from(report)))
+    }
+    .instrument(span)
+    .await
+}
+
+// =============================================================================
+// Drop Named Graph
+// =============================================================================
+
+/// Drop named graph request body
+#[derive(Deserialize)]
+pub struct DropNamedGraphRequest {
+    /// Full ledger identifier (e.g. `"mydb:main"`; the server defaults to
+    /// the `:main` branch when no branch is supplied).
+    pub ledger: String,
+    /// Full IRI of the named graph to drop.
+    pub graph: String,
+}
+
+/// Drop named graph response
+#[derive(Serialize)]
+pub struct DropNamedGraphResponse {
+    /// Full ledger:branch identifier the drop targeted (echoed)
+    pub ledger_id: String,
+    /// Graph IRI that was dropped (echoed)
+    pub graph_iri: String,
+    /// Number of flakes retracted by the drop commit (0 when no-op).
+    pub retracted: usize,
+    /// `true` when a new commit was produced; `false` when the target graph
+    /// was already empty and the call was a no-op.
+    pub committed: bool,
+    /// Current commit `t` for the branch after the drop (unchanged when
+    /// `committed = false`).
+    pub t: i64,
+}
+
+impl From<DropNamedGraphReport> for DropNamedGraphResponse {
+    fn from(report: DropNamedGraphReport) -> Self {
+        DropNamedGraphResponse {
+            ledger_id: report.ledger_id,
+            graph_iri: report.graph_iri,
+            retracted: report.retracted,
+            committed: report.committed,
+            t: report.t,
+        }
+    }
+}
+
+/// Drop a named graph from a single branch.
+///
+/// POST /fluree/drop-graph
+///
+/// Request body:
+/// - `ledger`: Full ledger identifier (e.g. `"mydb"` or `"mydb:main"`)
+/// - `graph`: Full IRI of the named graph to drop
+///
+/// Refuses the default graph, the system `txn-meta` graph, and the system
+/// `config` graph. Unknown graph IRIs return `404`.
+pub async fn drop_named_graph(State(state): State<Arc<AppState>>, request: Request) -> Response {
+    if state.config.server_role == ServerRole::Peer {
+        return forward_write_request(&state, request).await;
+    }
+
+    drop_named_graph_local(state, request).await.into_response()
+}
+
+async fn drop_named_graph_local(
+    state: Arc<AppState>,
+    request: Request,
+) -> Result<Json<DropNamedGraphResponse>> {
+    let headers = FlureeHeaders::from_headers(request.headers())?;
+
+    let body_bytes = axum::body::to_bytes(request.into_body(), 50 * 1024 * 1024)
+        .await
+        .map_err(|e| ServerError::bad_request(format!("Failed to read body: {e}")))?;
+    let req: DropNamedGraphRequest = serde_json::from_slice(&body_bytes)
+        .map_err(|e| ServerError::bad_request(format!("Invalid JSON: {e}")))?;
+
+    let request_id = extract_request_id(&headers.raw, &state.telemetry_config);
+    let trace_id = extract_trace_id(&headers.raw);
+
+    let span = create_request_span(
+        "graph:drop",
+        request_id.as_deref(),
+        trace_id.as_deref(),
+        Some(&req.ledger),
+        None,
+        None,
+    );
+    async move {
+        let span = tracing::Span::current();
+
+        tracing::info!(
+            status = "start",
+            graph = %req.graph,
+            "named graph drop requested"
+        );
+
+        let report = match state.fluree.drop_named_graph(&req.ledger, &req.graph).await {
+            Ok(report) => report,
+            Err(e) => {
+                let server_error = ServerError::Api(e);
+                set_span_error_code(&span, "error:DropNamedGraphFailed");
+                tracing::error!(error = %server_error, "named graph drop failed");
+                return Err(server_error);
+            }
+        };
+
+        tracing::info!(
+            status = "success",
+            retracted = report.retracted,
+            committed = report.committed,
+            t = report.t,
+            "named graph dropped"
+        );
+        Ok(Json(DropNamedGraphResponse::from(report)))
     }
     .instrument(span)
     .await

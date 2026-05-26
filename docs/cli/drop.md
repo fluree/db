@@ -71,6 +71,36 @@ error: drop_ledger drops the whole ledger and does not accept a non-default
        branch, or pass "mydb" to drop the whole ledger.
 ```
 
+## Dropping a single named graph
+
+To drop just one **named graph** inside a ledger (without removing the
+ledger, the branch, or any other graph), use `fluree graph drop`:
+
+```bash
+# Drop one named graph (active ledger, default branch)
+fluree graph drop urn:example:org/payroll
+
+# Drop on a specific ledger / branch
+fluree graph drop urn:example:org/payroll --ledger mydb
+fluree graph drop http://example.org/graphs/scratch --ledger mydb:feature-x
+
+# Drop via a tracked remote server
+fluree graph drop urn:example:org/payroll --ledger mydb --remote origin
+```
+
+Unlike `fluree drop`, `fluree graph drop` is **transactional and history-
+preserving**: it produces a normal commit at `t = current + 1` whose
+flakes retract every triple currently asserted in the graph, leaves the
+graph IRI registered (so subsequent inserts land in the same graph slot),
+and lets queries `as-of` an earlier `t` still see the dropped data.
+
+The graph IRI must be an absolute IRI (e.g. `urn:...`, `http://...`).
+The default graph and the system graphs (`urn:fluree:{ledger_id}#txn-meta`
+and `urn:fluree:{ledger_id}#config`) cannot be dropped.
+
+To see what graphs exist on a ledger, use `fluree graph list` (or look
+at the `named-graphs` section of `fluree info <ledger>`).
+
 ## See Also
 
 - [create](create.md) - Create a new ledger
