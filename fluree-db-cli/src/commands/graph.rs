@@ -99,16 +99,26 @@ async fn run_list(
         config_graph_iri(resolved_ledger)
     };
 
-    let entries: Vec<&serde_json::Value> = graphs
-        .iter()
-        .filter(|entry| {
+    let mut parsed: Vec<(&serde_json::Value, Option<u16>)> = Vec::with_capacity(graphs.len());
+    for entry in graphs {
+        let g_id = match entry.get("g-id").and_then(serde_json::Value::as_u64) {
+            Some(n) => Some(u16::try_from(n).map_err(|_| {
+                CliError::Usage(format!(
+                    "info response contains out-of-range g-id {n}; GraphId is u16 (max 65535)"
+                ))
+            })?),
+            None => None,
+        };
+        parsed.push((entry, g_id));
+    }
+
+    let entries: Vec<(&serde_json::Value, Option<u16>)> = parsed
+        .into_iter()
+        .filter(|(entry, g_id)| {
             if include_system {
                 return true;
             }
-            let g_id = entry
-                .get("g-id")
-                .and_then(serde_json::Value::as_u64)
-                .unwrap_or(u64::MAX) as u16;
+            let g_id = g_id.unwrap_or(u16::MAX);
             let iri = entry
                 .get("iri")
                 .and_then(serde_json::Value::as_str)
@@ -118,7 +128,7 @@ async fn run_list(
         .collect();
 
     if json {
-        let arr = serde_json::Value::Array(entries.into_iter().cloned().collect());
+        let arr = serde_json::Value::Array(entries.iter().map(|(e, _)| (*e).clone()).collect());
         println!(
             "{}",
             serde_json::to_string_pretty(&arr).unwrap_or_else(|_| arr.to_string()),
@@ -140,19 +150,18 @@ async fn run_list(
     let mut table = Table::new();
     table.set_content_arrangement(ContentArrangement::Dynamic);
     table.set_header(vec!["IRI", "Kind", "g-id", "Flakes", "Size"]);
-    for entry in entries {
+    for (entry, g_id) in entries {
         let iri = entry
             .get("iri")
             .and_then(serde_json::Value::as_str)
             .unwrap_or("-");
-        let g_id_u64 = entry.get("g-id").and_then(serde_json::Value::as_u64);
-        let g_id_label = g_id_u64
+        let g_id_label = g_id
             .map(|v| v.to_string())
             .unwrap_or_else(|| "-".to_string());
-        let kind = match g_id_u64 {
-            Some(0) => "default",
-            Some(id) if (id as u16) == TXN_META_GRAPH_ID => "system:txn-meta",
-            Some(id) if (id as u16) == CONFIG_GRAPH_ID => "system:config",
+        let kind = match g_id {
+            Some(DEFAULT_GRAPH_ID) => "default",
+            Some(TXN_META_GRAPH_ID) => "system:txn-meta",
+            Some(CONFIG_GRAPH_ID) => "system:config",
             Some(_) => "user",
             None => "?",
         };
