@@ -1824,9 +1824,7 @@ where
                 // matching the per-chunk-as-transaction model in `stage.rs`.
                 if env.config.tracker.is_enabled() {
                     env.config.tracker.consume_fuel(100_000)?;
-                    env.config
-                        .tracker
-                        .consume_fuel(result.flake_count as u64)?;
+                    env.config.tracker.consume_fuel(result.flake_count as u64)?;
                 }
 
                 // Collect txn-meta for this commit (no I/O, just captures data already in scope).

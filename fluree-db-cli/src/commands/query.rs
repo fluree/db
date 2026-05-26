@@ -602,12 +602,8 @@ pub async fn run(
                 output::format_result(&result, output_format, query_format, effective_limit)?;
             println!("{}", output.text);
             if let Some((fuel, time, policy)) = tracked_tally {
-                let tally_suffix = format_tally_suffix(
-                    fuel,
-                    time.as_deref(),
-                    policy.as_ref(),
-                    tracking_metrics,
-                );
+                let tally_suffix =
+                    format_tally_suffix(fuel, time.as_deref(), policy.as_ref(), tracking_metrics);
                 let time_str = format_duration(elapsed);
                 let total = output.total_rows;
                 match effective_limit {
@@ -616,10 +612,7 @@ pub async fn run(
                         format_count(n),
                         format_count(total),
                     ),
-                    _ => eprintln!(
-                        "({} rows, {time_str}{tally_suffix})",
-                        format_count(total),
-                    ),
+                    _ => eprintln!("({} rows, {time_str}{tally_suffix})", format_count(total),),
                 }
             } else {
                 print_footer(output.total_rows, effective_limit, elapsed);
@@ -670,14 +663,16 @@ pub async fn run(
                     detect::QueryFormat::Sparql => None,
                 };
                 let timer = Instant::now();
-                let builder = GraphSnapshotQueryBuilder::new_from_parts(&fluree, &view).tracking(opts);
+                let builder =
+                    GraphSnapshotQueryBuilder::new_from_parts(&fluree, &view).tracking(opts);
                 let builder = match query_format {
                     detect::QueryFormat::Sparql => builder.sparql(content.as_str()),
                     detect::QueryFormat::JsonLd => builder.jsonld(json_query.as_ref().unwrap()),
                 };
-                let response = builder.execute_tracked().await.map_err(|e| {
-                    CliError::Api(fluree_db_api::ApiError::http(e.status, e.error))
-                })?;
+                let response = builder
+                    .execute_tracked()
+                    .await
+                    .map_err(|e| CliError::Api(fluree_db_api::ApiError::http(e.status, e.error)))?;
                 let elapsed = timer.elapsed();
 
                 // Render the formatted result through the existing output pipeline so
