@@ -38,7 +38,7 @@ use fluree_db_api::{
     TxnType,
 };
 use fluree_db_consensus::{
-    IdempotencyKey, SubmissionError, Submitter, TransactionBody, TransactionReceipt,
+    Committer, IdempotencyKey, SubmissionError, TransactionBody, TransactionReceipt,
     TransactionRequest,
 };
 use serde::{Deserialize, Serialize};

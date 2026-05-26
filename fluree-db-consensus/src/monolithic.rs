@@ -6,9 +6,9 @@
 //! do not need cross-node coordination.
 
 use crate::{
-    IdempotencyKey, MergeReceipt, MergeRequest, OperationReceipt, PushReceipt, PushRequest,
-    RebaseReceipt, RebaseRequest, RevertReceipt, RevertRequest, RevertSelection, SubmissionError,
-    SubmissionLookup, SubmissionState, Submitter, TransactionBody, TransactionReceipt,
+    Committer, IdempotencyKey, MergeReceipt, MergeRequest, OperationReceipt, PushReceipt,
+    PushRequest, RebaseReceipt, RebaseRequest, RevertReceipt, RevertRequest, RevertSelection,
+    SubmissionError, SubmissionLookup, SubmissionState, TransactionBody, TransactionReceipt,
     TransactionRequest,
 };
 use async_trait::async_trait;
@@ -562,7 +562,7 @@ fn hash_commit_ref(hasher: &mut Sha256, commit: &CommitRef) {
 }
 
 #[async_trait]
-impl Submitter for MonolithicConsensus {
+impl Committer for MonolithicConsensus {
     async fn transact(
         &self,
         request: TransactionRequest,

@@ -10,7 +10,7 @@
 //!   coordination.
 //!
 //! Future implementations (Raft for crash-fault tolerance, BFT for byzantine
-//! tolerance) will live alongside, behind the same [`Submitter`] trait.
+//! tolerance) will live alongside, behind the same [`Committer`] trait.
 //!
 //! Submission identity and status lookup are driven by optional
 //! [`IdempotencyKey`]s. Callers who want idempotent retry or after-the-fact
@@ -258,7 +258,7 @@ pub struct PushReceipt {
 
 /// Receipt for any operation submitted through consensus.
 ///
-/// Variants correspond one-to-one with [`Submitter`] trait methods. The
+/// Variants correspond one-to-one with [`Committer`] trait methods. The
 /// umbrella type lets [`SubmissionState`] and the idempotency cache stay
 /// uniform across operation kinds without erasing per-op typing at the
 /// trait methods themselves.
@@ -313,7 +313,7 @@ pub enum SubmissionError {
     /// The consensus implementation has reached its in-flight operation
     /// cap and refused the submission without executing it. Callers
     /// should retry with backoff.
-    #[error("submitter overloaded; in-flight operation cap reached")]
+    #[error("committer overloaded; in-flight operation cap reached")]
     Overloaded,
 }
 
@@ -337,7 +337,7 @@ pub enum SubmissionError {
 /// regardless. To learn the outcome after dropping, look up by idempotency
 /// key via [`SubmissionLookup`].
 #[async_trait]
-pub trait Submitter: Send + Sync {
+pub trait Committer: Send + Sync {
     /// Stage and commit a transaction.
     async fn transact(
         &self,
@@ -365,11 +365,11 @@ pub trait Submitter: Send + Sync {
 /// Look up the state of a previously-submitted transaction by its
 /// idempotency key.
 ///
-/// Pairs with [`Submitter`] for callers that need to discover the outcome
+/// Pairs with [`Committer`] for callers that need to discover the outcome
 /// of a submission whose returned future was lost (timeout, disconnect,
-/// process restart). Most implementations of [`Submitter`] also implement
+/// process restart). Most implementations of [`Committer`] also implement
 /// this trait, but they are intentionally separable — a thin submission
-/// proxy might implement only [`Submitter`] and delegate status lookup
+/// proxy might implement only [`Committer`] and delegate status lookup
 /// elsewhere.
 #[async_trait]
 pub trait SubmissionLookup: Send + Sync {

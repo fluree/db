@@ -14,7 +14,7 @@ use axum::response::{IntoResponse, Response};
 use axum::Json;
 use fluree_db_api::wire::{ReindexRequest, ReindexResponse};
 use fluree_db_api::{ApiError, BranchDropReport, DropMode, DropReport, DropStatus};
-use fluree_db_consensus::Submitter;
+use fluree_db_consensus::Committer;
 use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
 use sha2::{Digest, Sha256};
