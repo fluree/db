@@ -20,9 +20,21 @@ Only the Cursor config sets `FLUREE_HOME` automatically. For the other IDEs, the
 
 If memory ends up in a platform-global store instead of `<repo>/.fluree-memory/`, the fix is to add `FLUREE_HOME` manually to the relevant MCP config, pointing at an absolute path (or a variable the IDE interpolates — Cursor supports `${workspaceFolder}`; other IDEs' support varies). Then restart the IDE.
 
+## Detection
+
+`fluree memory init` detects each IDE via four signal classes (any one is enough):
+
+1. **Binary on `PATH`** — `claude`, `code`, `cursor`, `windsurf`, `zed`. This is the most reliable cross-platform signal and the primary signal for Claude Code, which has no `.app` bundle.
+2. **macOS app bundle** — `/Applications/<App>.app` or `~/Applications/<App>.app`.
+3. **Home-dir marker** — `~/.cursor`, `~/.vscode`, `~/.codeium/windsurf`, `~/.zed`, `~/.config/zed`, `~/.claude`, `~/.claude.json`.
+4. **User-config dir** — `<config>/Code`, `<config>/Cursor`, `<config>/Windsurf`, `<config>/Zed`, where `<config>` is `~/.config` (Linux), `~/Library/Application Support` (macOS), or `%APPDATA%` (Windows). VS Code on Linux, for example, stores its first-launch marker as `~/.config/Code/`, not `~/.vscode/`.
+
+A freshly installed IDE that has never been launched **and** isn't on `PATH` may go undetected. If `init` misses your IDE, install MCP for it directly: `fluree memory mcp-install --ide <tool>`.
+
 ## Known gotchas
 
-- **Zed + JSONC**: If `.zed/settings.json` contains `//` comments, `mcp-install` refuses to write to avoid corrupting your settings. Paste the snippet yourself or strip comments first.
+- **Zed + JSONC**: If `.zed/settings.json` contains `//` comments, `mcp-install` refuses to write to avoid corrupting your settings. Paste the snippet yourself or strip comments first. The same refusal now applies to `.cursor/mcp.json`, `.vscode/mcp.json`, and `~/.codeium/windsurf/mcp_config.json` — any non-empty config that fails to parse as plain JSON is left alone, and `mcp-install` prints a snippet for you to paste in.
 - **Windsurf globals**: Windsurf's MCP config is user-global, not per-repo. If you work across multiple repos, you likely need to leave `FLUREE_HOME` unset and rely on walk-up — or switch the env var per project manually.
 - **Cursor restarts**: Cursor caches MCP servers aggressively. If a change to `.cursor/mcp.json` doesn't take effect, fully quit Cursor (Cmd-Q on macOS) rather than just reloading the window.
-- **Claude Code CLAUDE.md**: The rules section is appended at the end of `CLAUDE.md` (only if one doesn't already mention `fluree memory` or `memory_recall`). If you have a large existing CLAUDE.md, make sure the agent is actually reading to the end.
+- **Claude Code CLAUDE.md**: The rules section is appended at the end of `<repo>/CLAUDE.md` (only if one doesn't already mention `fluree memory` or `memory_recall`). If you have a large existing CLAUDE.md, make sure the agent is actually reading to the end.
+- **Running from a subdir**: `init` resolves the project root by walking up from the cwd to the nearest `.git`. The Claude Code installer registers MCP keyed by that root (not by your subdir cwd), so running `fluree memory init` from `crates/foo/` behaves identically to running it from the repo root.
