@@ -92,13 +92,13 @@ pub(super) async fn materialize_schema(
 
     let schema_predicates: Vec<Sid> = schema_predicate_iris
         .iter()
-        .filter_map(|iri| m_db.snapshot.encode_iri(iri))
+        .filter_map(|iri| m_db.snapshot.encode_iri_strict(iri))
         .collect();
     let schema_classes: Vec<Sid> = schema_class_iris
         .iter()
-        .filter_map(|iri| m_db.snapshot.encode_iri(iri))
+        .filter_map(|iri| m_db.snapshot.encode_iri_strict(iri))
         .collect();
-    let rdf_type_sid = m_db.snapshot.encode_iri(rdf::TYPE);
+    let rdf_type_sid = m_db.snapshot.encode_iri_strict(rdf::TYPE);
 
     // 4. Build M's view at the requested graph + t.
     let m_view =

@@ -55,3 +55,30 @@ pub(crate) fn resolve_selector_g_id(
     }
     Ok(snapshot.graph_registry.graph_id_for_iri(graph_iri))
 }
+
+/// Encode a fixed system IRI (e.g. `rdf:type`, `f:allow`) against a
+/// model-ledger snapshot, returning a structured error if the IRI's
+/// namespace is not registered.
+///
+/// Uses `encode_iri_strict` so a missing well-known prefix surfaces as
+/// [`CrossLedgerError::TranslationFailed`] rather than silently
+/// falling back to an EMPTY-namespace Sid that would match nothing in
+/// M's flakes (silent governance downgrade).
+pub(crate) fn encode_system_iri(
+    snapshot: &fluree_db_core::LedgerSnapshot,
+    iri: &str,
+    canonical_model_ledger_id: &str,
+    graph_iri: &str,
+) -> Result<fluree_db_core::Sid, CrossLedgerError> {
+    snapshot
+        .encode_iri_strict(iri)
+        .ok_or_else(|| CrossLedgerError::TranslationFailed {
+            ledger_id: canonical_model_ledger_id.to_string(),
+            graph_iri: graph_iri.to_string(),
+            detail: format!(
+                "system IRI '{iri}' is not in the model ledger's namespace map; \
+                 this usually indicates the model ledger is corrupted or did \
+                 not initialize default namespaces"
+            ),
+        })
+}

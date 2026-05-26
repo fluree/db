@@ -12,9 +12,9 @@
 //! values.
 
 use super::types::{ConstraintsArtifactWire, WireOrigin};
-use super::CrossLedgerError;
+use super::{encode_system_iri, CrossLedgerError};
 use crate::Fluree;
-use fluree_db_core::{FlakeValue, IndexType, LedgerSnapshot, RangeMatch, RangeTest, Sid};
+use fluree_db_core::{FlakeValue, IndexType, RangeMatch, RangeTest};
 use fluree_vocab::config_iris;
 
 /// Materialize the constraints graph at `graph_iri` in model
@@ -114,23 +114,4 @@ pub(super) async fn materialize_constraints(
         },
         property_iris,
     })
-}
-
-fn encode_system_iri(
-    snapshot: &LedgerSnapshot,
-    iri: &str,
-    canonical_model_ledger_id: &str,
-    graph_iri: &str,
-) -> Result<Sid, CrossLedgerError> {
-    snapshot
-        .encode_iri(iri)
-        .ok_or_else(|| CrossLedgerError::TranslationFailed {
-            ledger_id: canonical_model_ledger_id.to_string(),
-            graph_iri: graph_iri.to_string(),
-            detail: format!(
-                "system IRI '{iri}' is not in the model ledger's namespace \
-                 map; this usually indicates the model ledger is corrupted \
-                 or did not initialize default namespaces"
-            ),
-        })
 }

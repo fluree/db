@@ -98,12 +98,12 @@ pub(super) async fn materialize_shapes(
 
     let mut shacl_predicate_sids: Vec<Sid> = Vec::new();
     for name in shacl_predicate_names {
-        if let Some(sid) = m_db.snapshot.encode_iri(&format!("{SHACL}{name}")) {
+        if let Some(sid) = m_db.snapshot.encode_iri_strict(&format!("{SHACL}{name}")) {
             shacl_predicate_sids.push(sid);
         }
     }
-    let rdf_first_sid = m_db.snapshot.encode_iri(&format!("{RDF}first"));
-    let rdf_rest_sid = m_db.snapshot.encode_iri(&format!("{RDF}rest"));
+    let rdf_first_sid = m_db.snapshot.encode_iri_strict(&format!("{RDF}first"));
+    let rdf_rest_sid = m_db.snapshot.encode_iri_strict(&format!("{RDF}rest"));
 
     let opts = RangeOptions::default().with_to_t(m_db.t);
     let mut triples: Vec<WireTriple> = Vec::new();

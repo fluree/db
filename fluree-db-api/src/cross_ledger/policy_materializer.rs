@@ -46,7 +46,7 @@
 //!   `TranslationFailed` (no silent drop; dropping a target would
 //!   produce a structurally weaker policy than authored).
 
-use super::CrossLedgerError;
+use super::{encode_system_iri, CrossLedgerError};
 use crate::Fluree;
 use fluree_db_core::{FlakeValue, IndexType, LedgerSnapshot, RangeMatch, RangeTest, Sid};
 use fluree_vocab::policy_iris;
@@ -159,7 +159,7 @@ pub(super) async fn materialize_policy_rules(
     // canonical class is the only structural baseline; custom-typed
     // policies still need an explicit effect predicate to be picked
     // up cross-ledger. That's a documented Phase 1a limitation.
-    if let Some(access_policy_sid) = m_db.snapshot.encode_iri(policy_iris::ACCESS_POLICY) {
+    if let Some(access_policy_sid) = m_db.snapshot.encode_iri_strict(policy_iris::ACCESS_POLICY) {
         let flakes = m_view
             .range(
                 IndexType::Post,
@@ -240,25 +240,6 @@ fn rdf_type_iri() -> &'static str {
     // and pre-registered in every Fluree ledger via the RDF
     // namespace code.
     "http://www.w3.org/1999/02/22-rdf-syntax-ns#type"
-}
-
-fn encode_system_iri(
-    snapshot: &LedgerSnapshot,
-    iri: &str,
-    canonical_model_ledger_id: &str,
-    graph_iri: &str,
-) -> Result<Sid, CrossLedgerError> {
-    snapshot
-        .encode_iri(iri)
-        .ok_or_else(|| CrossLedgerError::TranslationFailed {
-            ledger_id: canonical_model_ledger_id.to_string(),
-            graph_iri: graph_iri.to_string(),
-            detail: format!(
-                "system IRI '{iri}' is not in the model ledger's namespace map; \
-                 this usually indicates the model ledger is corrupted or did \
-                 not initialize default namespaces"
-            ),
-        })
 }
 
 /// Read every `rdf:type` value for `subject` in the policy graph and

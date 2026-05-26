@@ -56,7 +56,7 @@ pub(super) async fn materialize_rules(
     // No `f:rule` predicate in M's namespace map → M never authored
     // rules. Treat the same as an empty rule set so the caller's
     // downstream merge is a no-op.
-    let Some(rule_pred_sid) = m_db.snapshot.encode_iri(RULE) else {
+    let Some(rule_pred_sid) = m_db.snapshot.encode_iri_strict(RULE) else {
         return Ok(RulesArtifactWire {
             origin: WireOrigin {
                 model_ledger_id: canonical_model_ledger_id.to_string(),

@@ -151,7 +151,7 @@ impl ConstraintsArtifactWire {
     ) -> Vec<fluree_db_core::Sid> {
         self.property_iris
             .iter()
-            .filter_map(|iri| snapshot.encode_iri(iri))
+            .filter_map(|iri| snapshot.encode_iri_strict(iri))
             .collect()
     }
 }
@@ -162,10 +162,10 @@ impl ConstraintsArtifactWire {
 /// owl:equivalentClass, owl:imports, rdf:type for owl:Class/etc.,
 /// plus the rest of the schema-bundle whitelist) in IRI form. The
 /// translator on D encodes each IRI against D's snapshot and builds
-/// a `SchemaBundleFlakes` from the result. IRIs that fail to encode
-/// drop their triples — same semantics as the same-ledger
-/// `build_schema_bundle_flakes` flow, where `encode_iri` returning
-/// `None` for an unseen IRI contributes nothing.
+/// a `SchemaBundleFlakes` from the result. Triples whose subject,
+/// predicate, or object IRI has no registered namespace on D are
+/// dropped — D has no instance data under those IRIs, so the missing
+/// axiom can't fire on data D doesn't have.
 ///
 /// Phase 1b-a constraint: the materializer projects only Ref-valued
 /// objects (every predicate / class in the schema whitelist is
@@ -207,8 +207,8 @@ pub struct WireTriple {
 /// as if the constraint weren't authored.
 #[derive(Debug, Clone)]
 pub enum WireObject {
-    /// IRI reference; encoded via `snapshot.encode_iri` at the data
-    /// ledger to produce a `FlakeValue::Ref(Sid)`.
+    /// IRI reference; encoded via `snapshot.encode_iri_strict` at the
+    /// data ledger to produce a `FlakeValue::Ref(Sid)`.
     Ref(String),
     /// Literal value in its canonical lexical form, paired with the
     /// datatype IRI and optional language tag. The datatype IRI is
@@ -234,11 +234,11 @@ impl SchemaArtifactWire {
     /// Translate to a Sid-form `SchemaBundleFlakes` against the
     /// data ledger's snapshot.
     ///
-    /// Each triple's IRIs are encoded via `snapshot.encode_iri`.
-    /// Failed encodings drop the triple — D has no data of those
-    /// IRIs so the missing axiom can't fire on instance data D
-    /// doesn't have, matching same-ledger semantics. The
-    /// downstream whitelist check in
+    /// Each triple's IRIs are encoded via `snapshot.encode_iri_strict`.
+    /// Triples whose subject, predicate, or object IRI has no
+    /// registered namespace on D are dropped — D has no instance
+    /// data under those IRIs so the missing axiom can't fire on data
+    /// D doesn't have. The downstream whitelist check in
     /// `SchemaBundleFlakes::from_collected_schema_triples` is the
     /// canonical filter; if a future cross-ledger producer emits
     /// non-whitelist triples they'll drop there.
@@ -262,9 +262,9 @@ impl SchemaArtifactWire {
                 continue;
             };
             let (Some(s_sid), Some(p_sid), Some(o_sid)) = (
-                snapshot.encode_iri(&t.s),
-                snapshot.encode_iri(&t.p),
-                snapshot.encode_iri(o_iri),
+                snapshot.encode_iri_strict(&t.s),
+                snapshot.encode_iri_strict(&t.p),
+                snapshot.encode_iri_strict(o_iri),
             ) else {
                 continue;
             };
