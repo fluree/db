@@ -353,11 +353,57 @@ pub async fn query(
             if let Some(max_bytes) = headers.max_bytes() {
                 config = config.with_max_bytes(max_bytes);
             }
+            let content_type = "application/vnd.fluree.agent+json; charset=utf-8";
+
+            // Tracked agent-json: keep the agent envelope as the response body
+            // (so agents see the same shape), but surface fuel/time/policy via
+            // x-fdb-* response headers.
+            if headers.has_tracking() {
+                let tracking_opts = headers.to_tracking_options();
+                let response = state
+                    .fluree
+                    .query_from()
+                    .sparql(&sparql)
+                    .format(config)
+                    .tracking(tracking_opts)
+                    .execute_tracked()
+                    .await;
+                return match response {
+                    Ok(r) => {
+                        let tally = TrackingTally {
+                            time: r.time.clone(),
+                            fuel: r.fuel,
+                            policy: r.policy.clone(),
+                        };
+                        let mut resp_headers = tracking_headers(&tally);
+                        resp_headers.insert(
+                            axum::http::header::CONTENT_TYPE,
+                            content_type.parse().expect("content-type parses"),
+                        );
+                        tracing::info!(
+                            status = "success",
+                            query_kind = "sparql",
+                            format = "agent-json",
+                            tracked = true,
+                            time = ?r.time,
+                            fuel = r.fuel,
+                        );
+                        Ok((resp_headers, Json(r.result)).into_response())
+                    }
+                    Err(e) => {
+                        let server_error =
+                            ServerError::Api(fluree_db_api::ApiError::http(e.status, e.error));
+                        set_span_error_code(&span, "error:QueryFailed");
+                        tracing::error!(error = %server_error, query_kind = "sparql", "tracked agent-json SPARQL connection query failed");
+                        Err(server_error)
+                    }
+                };
+            }
+
             let result = state.fluree.query_from().sparql(&sparql).format(config).execute_formatted().await;
             return match result {
                 Ok(json) => {
                     tracing::info!(status = "success", query_kind = "sparql", format = "agent-json");
-                    let content_type = "application/vnd.fluree.agent+json; charset=utf-8";
                     Ok(([(axum::http::header::CONTENT_TYPE, content_type)], Json(json)).into_response())
                 }
                 Err(e) => {
