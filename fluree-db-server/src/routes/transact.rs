@@ -280,18 +280,10 @@ async fn transact_via_consensus(
     tx_id: String,
     headers: &HeaderMap,
 ) -> Result<Response> {
-    let operation = match &request.body {
-        TransactionBody::JsonLdInsert(_) | TransactionBody::TurtleInsert(_) => "insert",
-        TransactionBody::JsonLdUpsert(_)
-        | TransactionBody::TurtleUpsert(_)
-        | TransactionBody::TrigUpsert(_) => "upsert",
-        TransactionBody::JsonLdUpdate(_) => "update",
-        TransactionBody::Sparql(_) => "sparql-update",
-    };
     let correlation = IndexRequestCorrelation::new(
         extract_request_id(headers, &state.telemetry_config),
         extract_trace_id(headers),
-        Some(operation),
+        Some(request.body.operation_tag()),
     );
 
     let submission =

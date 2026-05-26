@@ -96,6 +96,20 @@ pub enum TransactionBody {
     Sparql(String),
 }
 
+impl TransactionBody {
+    /// Stable short name for this body's operation kind. Used in
+    /// telemetry / correlation, so spelling matches across the variants
+    /// that share semantics.
+    pub fn operation_tag(&self) -> &'static str {
+        match self {
+            Self::JsonLdInsert(_) | Self::TurtleInsert(_) => "insert",
+            Self::JsonLdUpsert(_) | Self::TurtleUpsert(_) | Self::TrigUpsert(_) => "upsert",
+            Self::JsonLdUpdate(_) => "update",
+            Self::Sparql(_) => "sparql-update",
+        }
+    }
+}
+
 /// Transaction submission payload.
 ///
 /// Carries the transaction itself plus everything an implementation needs to
