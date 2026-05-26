@@ -43,7 +43,7 @@ pub mod namespace;
 pub mod parse;
 pub mod raw_txn_upload;
 pub mod stage;
-mod value_convert;
+pub mod value_convert;
 
 #[cfg(feature = "import")]
 pub mod import;

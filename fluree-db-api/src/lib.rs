@@ -41,6 +41,7 @@ pub mod commit_transfer;
 pub mod config_resolver;
 #[cfg(feature = "credential")]
 pub mod credential;
+pub mod cross_ledger;
 pub mod dataset;
 mod error;
 pub mod explain;
@@ -55,6 +56,9 @@ pub mod graph_source;
 pub mod graph_transact_builder;
 pub mod import;
 mod indexer_fulltext_provider;
+mod inline_ontology;
+#[cfg(feature = "shacl")]
+mod inline_shapes;
 mod ledger;
 pub mod ledger_info;
 mod merge;
@@ -91,6 +95,7 @@ pub mod search;
 pub use admin::{
     BranchDropReport,
     DropMode,
+    DropNamedGraphReport,
     DropReport,
     DropStatus,
     GraphSourceDropReport,
@@ -2274,6 +2279,7 @@ impl FlureeBuilder {
             index_config,
         } = parts;
         let leaflet_cache = make_leaflet_cache(&config);
+        let governance_cache = std::sync::Arc::new(cross_ledger::GovernanceCache::new());
 
         let ledger_manager = ledger_cache_config.map(|mut lm_config| {
             if lm_config.leaflet_cache.is_none() {
@@ -2291,6 +2297,7 @@ impl FlureeBuilder {
             backend,
             nameservice_mode: nameservice,
             leaflet_cache,
+            governance_cache,
             indexing_mode,
             index_config,
             r2rml_cache: std::sync::Arc::new(graph_source::R2rmlCache::with_defaults()),
@@ -2525,6 +2532,13 @@ pub struct Fluree {
     nameservice_mode: NameServiceMode,
     /// Shared global cache for decoded index artifacts (one budget).
     leaflet_cache: std::sync::Arc<fluree_db_binary_index::LeafletCache>,
+    /// Per-instance cache for resolved cross-ledger governance
+    /// artifacts (`f:policySource` from a model ledger, etc.). Keyed
+    /// on `(ArtifactKind, model_ledger_id, graph_iri, resolved_t)`
+    /// so a single entry is reusable across every data ledger on
+    /// this instance that references the same model graph at the
+    /// same model `t`.
+    governance_cache: std::sync::Arc<cross_ledger::GovernanceCache>,
     /// Indexing mode (disabled or background with handle)
     pub indexing_mode: tx::IndexingMode,
     /// Novelty backpressure thresholds used by commits and soft-trigger logic.
@@ -2577,6 +2591,7 @@ impl Fluree {
             backend,
             nameservice_mode: nameservice,
             leaflet_cache,
+            governance_cache: std::sync::Arc::new(cross_ledger::GovernanceCache::new()),
             indexing_mode: tx::IndexingMode::Disabled,
             index_config: server_defaults::default_index_config(),
             r2rml_cache: std::sync::Arc::new(graph_source::R2rmlCache::with_defaults()),
@@ -2599,6 +2614,7 @@ impl Fluree {
             backend: StorageBackend::Managed(Arc::new(storage)),
             nameservice_mode: nameservice,
             leaflet_cache,
+            governance_cache: std::sync::Arc::new(cross_ledger::GovernanceCache::new()),
             indexing_mode,
             index_config: server_defaults::default_index_config(),
             r2rml_cache: std::sync::Arc::new(graph_source::R2rmlCache::with_defaults()),
@@ -2764,6 +2780,15 @@ impl Fluree {
                 cache_dir: self.binary_store_cache_dir(),
             },
         )
+    }
+
+    /// Per-instance cache for cross-ledger governance artifacts.
+    ///
+    /// Exposed so the resolver in `cross_ledger::resolver` can plug
+    /// the cache between per-request memo and materialization, and
+    /// for callers that want to introspect occupancy in tests.
+    pub fn governance_cache(&self) -> &Arc<cross_ledger::GovernanceCache> {
+        &self.governance_cache
     }
 
     /// Get the raw address-based storage for admin/GC operations.

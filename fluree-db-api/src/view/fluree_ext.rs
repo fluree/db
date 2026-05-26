@@ -141,9 +141,27 @@ impl Fluree {
         };
         let resolved = config_resolver::resolve_effective_config(&config, graph_iri);
 
+        // Pre-resolve `f:rulesSource` to a local graph id so the
+        // datalog rule extractor scans the configured graph rather
+        // than the query graph. Identity-independent, so done here
+        // and not in apply_config_datalog (override gates affect
+        // *whether* datalog runs, not where rules live).
+        //
+        // Cross-ledger references (`f:ledger` set) skip this path
+        // and dispatch through the cross-ledger resolver at query
+        // time. Misconfigured same-ledger references (unknown
+        // graph IRI, or unsupported `GraphSourceRef` dimensions
+        // like `f:atT` / `f:trustPolicy` / `f:rollbackGuard`) fail
+        // here — silently dropping a configured rules source would
+        // let a typo or premature feature use silently disable
+        // governance the operator believed to be in effect.
+        let rules_source_g_id =
+            resolve_local_rules_source_g_id(resolved.datalog.as_ref(), &view.snapshot)?;
+
         Ok(view
             .with_ledger_config(config)
-            .with_resolved_config(resolved))
+            .with_resolved_config(resolved)
+            .with_rules_source_g_id(rules_source_g_id))
     }
 
     /// Load the current view (immutable snapshot) from a ledger.
@@ -608,6 +626,120 @@ impl Fluree {
             opts.clone()
         };
 
+        // Cross-ledger detection: if the resolved config's
+        // f:policySource carries an f:ledger reference, route through
+        // the cross-ledger resolver. Same-ledger configs continue
+        // through the unchanged local path.
+        let source = view
+            .resolved_config
+            .as_ref()
+            .and_then(|c| c.policy.as_ref())
+            .and_then(|p| p.policy_source.as_ref());
+
+        let is_cross_ledger = source.is_some_and(|s| s.ledger.is_some());
+
+        if is_cross_ledger {
+            // Phase 1a: cross-ledger + identity-mode is not supported.
+            // The model ledger contributes policy rules; the data
+            // ledger contributes identity binding. Mixing them
+            // ambiguously is a fail-closed config error.
+            if effective_opts.identity.is_some() {
+                return Err(crate::error::ApiError::config(
+                    "cross-ledger f:policySource cannot be combined with opts.identity \
+                     in Phase 1a; use opts.policy_class with the cross-ledger config",
+                ));
+            }
+
+            let source = source.expect("checked above");
+            // Seed from any prior governance-context capture stored
+            // on the view (e.g., an earlier `wrap_policy` in the
+            // same logical request). The merged resolved_ts is
+            // written back below so the subsequent `query` call's
+            // own ResolveCtx observes the same per-ledger head-t.
+            //
+            // `ledger_id_owned` keeps a string alive past the
+            // eventual `view` move at the end of this branch.
+            let ledger_id_owned: String = view.snapshot.ledger_id.to_string();
+            let mut ctx = crate::cross_ledger::ResolveCtx::with_resolved_ts(
+                &ledger_id_owned,
+                self,
+                (**view.cross_ledger_resolved_ts()).clone(),
+            );
+            let resolved = crate::cross_ledger::resolve_graph_ref(
+                source,
+                crate::cross_ledger::ArtifactKind::PolicyRules,
+                &mut ctx,
+            )
+            .await?;
+            let crate::cross_ledger::GovernanceArtifact::PolicyRules(wire) = &resolved.artifact
+            else {
+                // resolve_graph_ref dispatches on ArtifactKind, so
+                // requesting PolicyRules must yield PolicyRules.
+                // Surfacing this as TranslationFailed rather than
+                // panicking keeps the failure path uniform for
+                // operators reading the response body.
+                return Err(crate::error::ApiError::CrossLedger(
+                    crate::cross_ledger::CrossLedgerError::TranslationFailed {
+                        ledger_id: resolved.model_ledger_id.clone(),
+                        graph_iri: resolved.graph_iri.clone(),
+                        detail: "resolver returned a non-PolicyRules artifact for an \
+                                ArtifactKind::PolicyRules request; this is a bug in \
+                                the resolver dispatch"
+                            .into(),
+                    },
+                ));
+            };
+
+            // Apply the data ledger's configured policy_class set as
+            // an exact-IRI intersection filter on the wire's
+            // restrictions. The contract is:
+            //
+            //   filter = effective_opts.policy_class, OR
+            //            {f:AccessPolicy} when no policy_class is set.
+            //
+            // f:AccessPolicy is the canonical / baseline policy class
+            // — declaring `f:policySource` cross-ledger pulls those
+            // rules in automatically. Custom-typed rules require
+            // an explicit `f:policyClass` in D's config to be
+            // enforced. This is the safer default than "load every
+            // structurally-policy-looking subject from M," which
+            // would silently include rules the operator never opted
+            // into.
+            const DEFAULT_POLICY_CLASS_IRI: &str = fluree_vocab::policy_iris::ACCESS_POLICY;
+            let filter: std::collections::HashSet<String> = effective_opts
+                .policy_class
+                .as_ref()
+                .filter(|v| !v.is_empty())
+                .map(|v| v.iter().cloned().collect())
+                .unwrap_or_else(|| [DEFAULT_POLICY_CLASS_IRI.to_string()].into_iter().collect());
+            let snapshot_ref = &view.snapshot;
+            let restrictions = fluree_db_policy::wire_to_restrictions(
+                wire,
+                |iri| snapshot_ref.encode_iri(iri),
+                Some(&filter),
+            )
+            .map_err(crate::error::ApiError::from)?;
+
+            let policy_ctx =
+                crate::policy_builder::build_policy_context_from_opts_with_cross_ledger(
+                    &view.snapshot,
+                    view.overlay.as_ref(),
+                    view.novelty_for_stats(),
+                    view.t,
+                    &effective_opts,
+                    &[0], // identity-mode uses [0]; unused under cross-ledger
+                    restrictions,
+                )
+                .await?;
+            // Carry the per-ledger head-t captures forward onto
+            // the returned view so any later `query()` in this same
+            // logical request sees the same M version policy did.
+            let view = view
+                .with_policy(Arc::new(policy_ctx))
+                .with_cross_ledger_resolved_ts(Arc::new(ctx.resolved_ts));
+            return Ok(view);
+        }
+
         let policy_graphs = if let Some(ref resolved) = view.resolved_config {
             let source = resolved
                 .policy
@@ -728,19 +860,80 @@ impl Fluree {
             None => return view,
         };
 
-        match config_resolver::merge_datalog_opts(resolved, server_identity) {
-            Some(config) => view
-                .with_datalog_enabled(config.enabled)
-                .with_query_time_rules_allowed(config.allow_query_time_rules)
-                .with_datalog_override_allowed(config.override_allowed),
-            None => view,
-        }
+        let Some(config) = config_resolver::merge_datalog_opts(resolved, server_identity) else {
+            return view;
+        };
+
+        // `rules_source_g_id` is pre-resolved by
+        // `resolve_and_attach_config` (identity-independent), so
+        // we don't reapply it here.
+        view.with_datalog_enabled(config.enabled)
+            .with_query_time_rules_allowed(config.allow_query_time_rules)
+            .with_datalog_override_allowed(config.override_allowed)
     }
 }
 
 // ============================================================================
 // Helpers
 // ============================================================================
+
+/// Resolve a same-ledger `f:rulesSource` selector to a local graph id.
+///
+/// Returns:
+/// - `Ok(Some(g_id))` for a valid local reference (named graph or
+///   `f:defaultGraph` → `g_id=0`).
+/// - `Ok(None)` when there is no `f:datalogDefaults` block or no
+///   `f:rulesSource` inside it, or when the reference is
+///   cross-ledger (handled by the resolver at query time).
+/// - `Err(ApiError)` for misconfigurations the operator would
+///   want to know about: unsupported `GraphSourceRef` dimensions
+///   (`f:atT`, `f:trustPolicy`, `f:rollbackGuard`), or a
+///   `f:graphSelector` IRI that the snapshot's graph registry
+///   doesn't recognise.
+///
+/// Failing closed here matches the SHACL same-ledger resolver
+/// (`tx::resolve_shapes_source_g_ids`) — a typo in the config
+/// graph shouldn't silently downgrade the configured reasoning
+/// model.
+fn resolve_local_rules_source_g_id(
+    datalog: Option<&fluree_db_core::ledger_config::DatalogDefaults>,
+    snapshot: &fluree_db_core::LedgerSnapshot,
+) -> Result<Option<fluree_db_core::GraphId>> {
+    let Some(src) = datalog.and_then(|d| d.rules_source.as_ref()) else {
+        return Ok(None);
+    };
+    if src.ledger.is_some() {
+        // Cross-ledger — query-time resolver handles it.
+        return Ok(None);
+    }
+    if src.at_t.is_some() {
+        return Err(ApiError::config(
+            "f:rulesSource with f:atT (temporal pinning) is not yet supported",
+        ));
+    }
+    if src.trust_policy.is_some() {
+        return Err(ApiError::config(
+            "f:rulesSource with f:trustPolicy is not yet supported",
+        ));
+    }
+    if src.rollback_guard.is_some() {
+        return Err(ApiError::config(
+            "f:rulesSource with f:rollbackGuard is not yet supported",
+        ));
+    }
+    let g_id = match src.graph_selector.as_deref() {
+        Some(iri) if iri == fluree_vocab::config_iris::DEFAULT_GRAPH => Some(0u16),
+        Some(iri) => snapshot.graph_registry.graph_id_for_iri(iri),
+        None => Some(0u16),
+    };
+    match g_id {
+        Some(id) => Ok(Some(id)),
+        None => Err(ApiError::config(format!(
+            "f:rulesSource graph '{}' not found in this ledger's graph registry",
+            src.graph_selector.as_deref().unwrap_or("<none>"),
+        ))),
+    }
+}
 
 /// Populate `DictNovelty` from a view's novelty overlay, routing through the
 /// persisted dictionaries when a `BinaryIndexStore` is available.

@@ -157,8 +157,15 @@ across all queries.
 See [Setting groups — datalogDefaults](../ledger-config/setting-groups.md) for
 full configuration options.
 
-When both stored and query-time rules are present, they are **merged** and
-execute together in the same fixpoint loop.
+`f:rulesSource` also supports cross-ledger references — set
+`f:ledger` on the inner `f:graphSource` to pull `f:rule` JSON
+bodies from another ledger at query time. See
+[Cross-ledger governance — Cross-ledger datalog rules](../security/cross-ledger-policy.md#cross-ledger-datalog-rules)
+for the end-to-end pattern and failure modes.
+
+When stored rules, cross-ledger rules, and query-time rules are
+present, they are all **merged** and execute together in the
+same fixpoint loop.
 
 ## Examples
 

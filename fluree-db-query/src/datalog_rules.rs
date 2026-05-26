@@ -994,20 +994,33 @@ pub async fn execute_datalog_rules(
     db: GraphDbRef<'_>,
     max_iterations: usize,
 ) -> Result<DatalogExecutionResult> {
-    execute_datalog_rules_with_query_rules(db, max_iterations, &[]).await
+    execute_datalog_rules_with_query_rules(db, max_iterations, &[], None).await
 }
 
 /// Execute datalog rules with optional query-time rules
 ///
 /// This is the full implementation that supports both database-stored rules
 /// and query-time rules passed as JSON-LD.
+///
+/// `rules_source_g_id` overrides the graph that `extract_datalog_rules`
+/// scans for `f:rule` flakes. When `None`, extraction reads from
+/// `db.g_id` (legacy behaviour). When `Some(g)`, a separate
+/// `GraphDbRef` is built at graph `g` and used only for rule
+/// extraction — the fixpoint loop still executes against `db`.
 pub async fn execute_datalog_rules_with_query_rules(
     db: GraphDbRef<'_>,
     max_iterations: usize,
     query_time_rules: &[serde_json::Value],
+    rules_source_g_id: Option<fluree_db_core::GraphId>,
 ) -> Result<DatalogExecutionResult> {
-    // Extract rules from database
-    let mut rule_set = extract_datalog_rules(db).await?;
+    // Extract rules from the configured source graph if set,
+    // otherwise from the query graph. The fixpoint loop below
+    // continues to execute against `db` regardless.
+    let rules_db = match rules_source_g_id {
+        Some(rg) if rg != db.g_id => GraphDbRef::new(db.snapshot, rg, db.overlay, db.t),
+        _ => db,
+    };
+    let mut rule_set = extract_datalog_rules(rules_db).await?;
 
     // Parse and add query-time rules
     for (idx, rule_json) in query_time_rules.iter().enumerate() {

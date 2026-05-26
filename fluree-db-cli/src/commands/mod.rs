@@ -6,6 +6,7 @@ pub mod context_cmd;
 pub mod create;
 pub mod drop;
 pub mod export;
+pub mod graph;
 pub mod history;
 pub mod iceberg;
 pub mod index;
