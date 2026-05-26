@@ -295,6 +295,12 @@ pub enum SubmissionError {
     /// implementation's error taxonomy.
     #[error("{message}")]
     Execution { status: u16, message: String },
+
+    /// The consensus implementation has reached its in-flight operation
+    /// cap and refused the submission without executing it. Callers
+    /// should retry with backoff.
+    #[error("submitter overloaded; in-flight operation cap reached")]
+    Overloaded,
 }
 
 /// Submit operations for processing.

@@ -21,6 +21,7 @@ use moka::future::Cache;
 use sha2::{Digest, Sha256};
 use std::sync::Arc;
 use std::time::Duration;
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
 /// Map a transaction-pipeline error into a [`SubmissionError`], preserving
 /// the HTTP status so the caller can render an accurate response.
@@ -71,6 +72,12 @@ pub const DEFAULT_IDEMPOTENCY_TTL: Duration = Duration::from_secs(3600);
 /// can't grow the cache without limit between TTL evictions.
 const IDEMPOTENCY_CACHE_CAPACITY: u64 = 100_000;
 
+/// Default cap on in-flight submissions; calls beyond this count are
+/// refused with [`SubmissionError::Overloaded`]. Bounding the in-flight
+/// count is what keeps the per-request body memory from growing without
+/// limit under sustained load.
+pub const DEFAULT_PENDING_LIMIT: usize = 1024;
+
 /// Composite cache key: `(ledger_id, idempotency_key)`. Submissions on
 /// different ledgers with the same key are independent.
 type SubmissionCacheKey = (String, IdempotencyKey);
@@ -98,6 +105,7 @@ pub struct MonolithicConsensus {
     fluree: Arc<Fluree>,
     index_config: IndexConfig,
     cache: Cache<SubmissionCacheKey, CachedSubmission>,
+    admission: Arc<Semaphore>,
 }
 
 impl MonolithicConsensus {
@@ -116,7 +124,27 @@ impl MonolithicConsensus {
             fluree,
             index_config,
             cache,
+            admission: Arc::new(Semaphore::new(DEFAULT_PENDING_LIMIT)),
         }
+    }
+
+    /// Override the in-flight pending-operation cap (defaults to
+    /// [`DEFAULT_PENDING_LIMIT`]). Submissions arriving while `limit`
+    /// operations are already in flight are refused with
+    /// [`SubmissionError::Overloaded`] rather than queued.
+    pub fn with_pending_limit(mut self, limit: usize) -> Self {
+        self.admission = Arc::new(Semaphore::new(limit));
+        self
+    }
+
+    /// Try to claim one of the in-flight admission permits, refusing the
+    /// submission outright when the cap is reached. The returned permit
+    /// drops (and releases its slot) when the caller's submission future
+    /// completes.
+    fn try_admit(&self) -> Result<OwnedSemaphorePermit, SubmissionError> {
+        Arc::clone(&self.admission)
+            .try_acquire_owned()
+            .map_err(|_| SubmissionError::Overloaded)
     }
 
     fn hash_request_body(request: &TransactionRequest) -> [u8; 32] {
@@ -542,6 +570,8 @@ impl Submitter for MonolithicConsensus {
         &self,
         request: TransactionRequest,
     ) -> Result<TransactionReceipt, SubmissionError> {
+        let _permit = self.try_admit()?;
+
         // Anonymous submissions (no idempotency key) skip the cache
         // entirely — no retry-collapse and no later status lookup.
         let Some(idempotency_key) = request.idempotency_key.clone() else {
@@ -568,6 +598,8 @@ impl Submitter for MonolithicConsensus {
         &self,
         request: RevertRequest,
     ) -> Result<RevertReceipt, SubmissionError> {
+        let _permit = self.try_admit()?;
+
         let Some(idempotency_key) = request.idempotency_key.clone() else {
             return self.execute_revert(request).await;
         };
@@ -595,6 +627,8 @@ impl Submitter for MonolithicConsensus {
         &self,
         request: MergeRequest,
     ) -> Result<MergeReceipt, SubmissionError> {
+        let _permit = self.try_admit()?;
+
         let Some(idempotency_key) = request.idempotency_key.clone() else {
             return self.execute_merge(request).await;
         };
@@ -624,6 +658,8 @@ impl Submitter for MonolithicConsensus {
         &self,
         request: RebaseRequest,
     ) -> Result<RebaseReceipt, SubmissionError> {
+        let _permit = self.try_admit()?;
+
         let Some(idempotency_key) = request.idempotency_key.clone() else {
             return self.execute_rebase(request).await;
         };
@@ -652,6 +688,8 @@ impl Submitter for MonolithicConsensus {
         &self,
         request: PushRequest,
     ) -> Result<PushReceipt, SubmissionError> {
+        let _permit = self.try_admit()?;
+
         let Some(idempotency_key) = request.idempotency_key.clone() else {
             return self.execute_push(request).await;
         };
@@ -1418,6 +1456,23 @@ ex:alice ex:name "Alice" ."#;
             }
             other => panic!("expected Execution, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn submission_rejected_when_pending_cap_reached() {
+        // Override the cap to zero so no permit is ever available — every
+        // submission must hit `Overloaded` instead of executing.
+        let (_fluree, consensus, ledger_id) = setup().await;
+        let consensus = consensus.with_pending_limit(0);
+
+        let err = consensus
+            .transact(request(&ledger_id, None, sample_insert("alice")))
+            .await
+            .expect_err("limit=0 should refuse every submission");
+        assert!(
+            matches!(err, SubmissionError::Overloaded),
+            "expected Overloaded, got {err:?}"
+        );
     }
 
     #[tokio::test]

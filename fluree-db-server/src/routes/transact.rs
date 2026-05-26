@@ -156,6 +156,7 @@ fn tracking_from_headers(headers: &FlureeHeaders) -> Option<TrackingOptions> {
 pub(crate) fn submission_error_to_server_error(err: SubmissionError) -> ServerError {
     let status = match &err {
         SubmissionError::KeyCollision | SubmissionError::AlreadyInFlight => 409,
+        SubmissionError::Overloaded => 503,
         SubmissionError::Execution { status, .. } => *status,
     };
     ServerError::Api(ApiError::http(status, err.to_string()))
