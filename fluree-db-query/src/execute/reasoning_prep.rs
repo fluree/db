@@ -170,6 +170,7 @@ pub async fn compute_derived_facts(
     overlay: &dyn fluree_db_core::OverlayProvider,
     to_t: i64,
     reasoning: &ReasoningModes,
+    rules_source_g_id: Option<GraphId>,
 ) -> Option<Arc<DerivedFactsOverlay>> {
     use crate::datalog_rules::execute_datalog_rules_with_query_rules;
 
@@ -213,6 +214,7 @@ pub async fn compute_derived_facts(
     if reasoning.datalog {
         tracing::debug!(
             query_time_rules = reasoning.rules.len(),
+            rules_source_g_id = ?rules_source_g_id,
             "executing user-defined datalog rules"
         );
         const MAX_DATALOG_ITERATIONS: usize = 100;
@@ -232,6 +234,7 @@ pub async fn compute_derived_facts(
                 combined_db,
                 MAX_DATALOG_ITERATIONS,
                 &reasoning.rules,
+                rules_source_g_id,
             )
             .await
         } else {
@@ -240,6 +243,7 @@ pub async fn compute_derived_facts(
                 base_db,
                 MAX_DATALOG_ITERATIONS,
                 &reasoning.rules,
+                rules_source_g_id,
             )
             .await
         };

@@ -254,6 +254,17 @@ impl Fluree {
                         graph_delta: Some(&routing.graph_iris),
                         graph_sids: Some(&routing.graph_sids),
                         tracker: None,
+                        // Commit replay doesn't engage the
+                        // cross-ledger dispatch (the leader
+                        // already validated against M when the
+                        // commit was authored); followers
+                        // re-validate same-ledger only.
+                        cross_ledger_shapes: None,
+                        staged_ns: None,
+                        // Inline shapes are an authoring-time
+                        // construct; commit replay carries no
+                        // `opts` payload.
+                        inline_shape_bundle: None,
                     },
                 )
                 .await

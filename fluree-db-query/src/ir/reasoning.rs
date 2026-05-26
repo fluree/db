@@ -57,6 +57,23 @@ pub struct ReasoningModes {
     /// These rules are merged with database rules when datalog reasoning is enabled.
     /// Each rule should have `where` and `insert` clauses.
     pub rules: Vec<serde_json::Value>,
+
+    /// Inline ontology / schema axioms supplied with the query
+    /// (JSON-LD format).
+    ///
+    /// Carries RDFS / OWL axioms (rdfs:subClassOf,
+    /// rdfs:subPropertyOf, owl:inverseOf, owl:equivalentClass,
+    /// rdf:type owl:Class / owl:TransitiveProperty, …) that the
+    /// reasoner should treat as if they came from the ledger's
+    /// `f:schemaSource` graph. Layered additively on top of any
+    /// configured schemaSource bundle; never persisted.
+    ///
+    /// The runner parses these against a temporary
+    /// `NamespaceRegistry` seeded from the live snapshot, projects
+    /// them through the same whitelist as the cross-ledger schema
+    /// materializer, and merges the resulting flakes into
+    /// `ReasoningConfig.schema_bundle` before reasoning runs.
+    pub ontology: Option<serde_json::Value>,
 }
 
 impl ReasoningModes {
@@ -225,6 +242,17 @@ impl ReasoningModes {
             }
         }
 
+        // Parse query-time ontology (RDFS / OWL axioms supplied
+        // inline). Layered on top of f:schemaSource at reasoning
+        // prep; doesn't itself flip any mode flag — reasoning is
+        // a separate decision (auto-RDFS still applies if a
+        // schema hierarchy exists).
+        if let Some(ontology) = query.get("ontology") {
+            if !ontology.is_null() {
+                modes.ontology = Some(ontology.clone());
+            }
+        }
+
         Ok(modes)
     }
 
@@ -360,6 +388,20 @@ pub struct ReasoningConfig {
     ///
     /// When `None`, reasoning reads schema from `db.g_id` directly.
     pub schema_bundle: Option<Arc<SchemaBundleFlakes>>,
+    /// Pre-resolved local graph id from `f:rulesSource`.
+    ///
+    /// Populated upstream (in `fluree-db-api`) when the ledger
+    /// config points the datalog rule extractor at a non-default
+    /// graph. When `Some(g)`, `compute_derived_facts` extracts
+    /// `f:rule` flakes from graph `g`; the rules themselves still
+    /// execute against the query graph (`db.g_id`). When `None`,
+    /// extraction defaults to `db.g_id` — the legacy behaviour.
+    ///
+    /// Cross-ledger rules (where `f:rulesSource` carries
+    /// `f:ledger`) surface as resolved JSON-LD rule definitions
+    /// in [`ReasoningModes::rules`] before query execution; this
+    /// field stays `None` in that case.
+    pub rules_source_g_id: Option<fluree_db_core::GraphId>,
 }
 
 impl ReasoningConfig {
@@ -391,6 +433,12 @@ impl ReasoningConfig {
     /// `fluree_db_api::ontology_imports::resolve_schema_bundle`.
     pub fn with_schema_bundle(mut self, bundle: Arc<SchemaBundleFlakes>) -> Self {
         self.schema_bundle = Some(bundle);
+        self
+    }
+
+    /// Attach a pre-resolved local rules-source graph id.
+    pub fn with_rules_source_g_id(mut self, g_id: Option<fluree_db_core::GraphId>) -> Self {
+        self.rules_source_g_id = g_id;
         self
     }
 

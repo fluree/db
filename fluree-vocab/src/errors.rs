@@ -174,6 +174,15 @@ pub const INDEXING_DISABLED: &str = "err:system/IndexingDisabled";
 /// Reindex conflict
 pub const REINDEX_CONFLICT: &str = "err:system/ReindexConflict";
 
+/// Cross-ledger model dependency could not be resolved or used.
+///
+/// Surfaces from `f:GraphRef` with `f:ledger` pointing at a model
+/// ledger that is missing, retracted, structurally broken, or
+/// otherwise unable to provide the requested governance artifact.
+/// Mapped to HTTP 502 since this is an upstream-dependency
+/// failure rather than an internal server error.
+pub const CROSS_LEDGER: &str = "err:system/CrossLedgerError";
+
 // =============================================================================
 // Helper Functions
 // =============================================================================

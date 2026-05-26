@@ -223,3 +223,7 @@ No special CLI commands are needed — config is data, written and queried like 
 - [Setting groups](setting-groups.md) — All setting groups with fields and examples
 - [Override control](override-control.md) — Resolution precedence, identity gating, monotonicity
 - [Unique constraints](unique-constraints.md) — Enforcing property value uniqueness with `f:enforceUnique`
+
+## Related
+
+- [Cross-ledger governance](../security/cross-ledger-policy.md) — Configure one model ledger to govern many data ledgers. Every `f:GraphRef`-shaped predicate (`f:policySource`, `f:constraintsSource`, `f:schemaSource`, `f:shapesSource`, `f:rulesSource`) accepts `f:ledger` to reference another ledger. Builds on the `f:GraphRef` shape documented in [setting groups](setting-groups.md#policy-defaults).

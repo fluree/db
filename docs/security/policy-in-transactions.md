@@ -253,6 +253,7 @@ Unsigned bearer-authenticated transactions build a `PolicyContext` from the (pos
 - [Policy model and inputs](policy-model.md) — node shape, combining algorithm, request-time options
 - [Policy enforcement (concepts)](../concepts/policy-enforcement.md) — model overview
 - [Policy in queries](policy-in-queries.md) — read-time enforcement
+- [Cross-ledger policy](cross-ledger-policy.md) — transaction-time enforcement under cross-ledger `f:policySource`
 - [Cookbook: Access control policies](../guides/cookbook-policies.md) — worked patterns
 - [Programmatic policy API (Rust)](programmatic-policy.md) — building `PolicyContext` and using `transact_tracked_with_policy`
 - [Signed / credentialed transactions](../transactions/signed-transactions.md) — JWS / VC transaction wrapping

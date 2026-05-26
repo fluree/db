@@ -397,6 +397,12 @@ pub struct EffectiveDatalogConfig {
     pub allow_query_time_rules: bool,
     /// Whether the query can override these settings.
     pub override_allowed: bool,
+    /// Pre-resolved `f:rulesSource` reference. When `Some`, the rule
+    /// extractor reads `f:rule` flakes from this `GraphSourceRef`
+    /// instead of the default graph. Cross-ledger (`f:ledger` set)
+    /// dispatches to the cross-ledger resolver at query time; pure
+    /// local references resolve to a graph id in the same ledger.
+    pub rules_source: Option<fluree_db_core::ledger_config::GraphSourceRef>,
 }
 
 /// Compute effective datalog settings from resolved config, respecting override control.
@@ -415,6 +421,7 @@ pub fn merge_datalog_opts(
         enabled: datalog.enabled.unwrap_or(true),
         allow_query_time_rules: datalog.allow_query_time_rules.unwrap_or(true),
         override_allowed,
+        rules_source: datalog.rules_source.clone(),
     })
 }
 

@@ -1740,6 +1740,16 @@ pub mod policy_iris {
     /// `https://ns.flur.ee/db#policyClass` - policy class marker
     pub const POLICY_CLASS: &str = "https://ns.flur.ee/db#policyClass";
 
+    /// `https://ns.flur.ee/db#AccessPolicy` - canonical / baseline
+    /// policy class IRI. Subjects typed exactly as this are
+    /// included in the default cross-ledger materialization set
+    /// when no `f:policyClass` filter is configured, and form the
+    /// implicit policy class on the same-ledger path. Hard-coded
+    /// references existed in `cross_ledger::policy_materializer`
+    /// and `view::fluree_ext`; promoted here so the IRI lives in
+    /// the vocab module like the rest of the policy vocab.
+    pub const ACCESS_POLICY: &str = "https://ns.flur.ee/db#AccessPolicy";
+
     /// `https://ns.flur.ee/db#allow` - allow/deny flag
     pub const ALLOW: &str = "https://ns.flur.ee/db#allow";
 
