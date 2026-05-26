@@ -47,6 +47,7 @@ mod index;
 mod query_eval;
 mod schema;
 mod types;
+mod wire;
 
 pub use class_lookup::{lookup_subject_classes, populate_class_cache};
 pub use error::{PolicyError, Result};
@@ -59,4 +60,8 @@ pub use schema::is_schema_flake;
 pub use types::{
     FlakePolicyEntry, PolicyAction, PolicyDecision, PolicyQuery, PolicyRestriction, PolicySet,
     PolicyValue, PolicyWrapper, PropertyPolicyEntry, TargetMode,
+};
+pub use wire::{
+    build_policy_set_from_wire, wire_to_restrictions, PolicyArtifactWire, WireOrigin,
+    WirePolicyValue, WireRestriction,
 };

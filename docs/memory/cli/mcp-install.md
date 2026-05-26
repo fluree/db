@@ -22,6 +22,8 @@ fluree memory mcp-install [--ide <IDE>]
 | `windsurf` | `~/.codeium/windsurf/mcp_config.json` (global) | — |
 | `zed` | `<repo>/.zed/settings.json` (key: `context_servers`) | Skips if JSONC detected |
 
+If an existing target file isn't valid JSON (JSONC with comments, hand-edited corruption, etc.), `mcp-install` refuses to overwrite it and prints a snippet you can paste in manually. This applies to all per-repo configs above, plus Windsurf's global file.
+
 Legacy aliases: `claude-vscode` and `github-copilot` both map to `vscode`.
 
 When `--ide` is omitted, the first **unconfigured** detected tool is used; defaults to `claude-code` if nothing's detected.

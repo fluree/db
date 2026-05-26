@@ -9,6 +9,7 @@ use crate::{
     ApiError, DatasetSpec, Fluree, FormatterConfig, PolicyContext, QueryConnectionOptions,
     QueryResult, Result,
 };
+use fluree_db_core::TrackingOptions;
 use fluree_db_query::r2rml::{R2rmlProvider, R2rmlTableProvider};
 
 type TrackedResult<T> = std::result::Result<T, crate::query::TrackedErrorResponse>;
@@ -185,6 +186,7 @@ impl Fluree {
         &self,
         query_json: &JsonValue,
         format_config: Option<FormatterConfig>,
+        tracking_override: Option<TrackingOptions>,
     ) -> std::result::Result<crate::query::TrackedQueryResponse, crate::query::TrackedErrorResponse>
     {
         let (spec, qc_opts) = parse_dataset_spec(query_json)
@@ -203,7 +205,7 @@ impl Fluree {
             .await?
         {
             return self
-                .query_tracked(&view, query_json, format_config, None)
+                .query_tracked(&view, query_json, format_config, tracking_override)
                 .await;
         }
 
@@ -212,7 +214,7 @@ impl Fluree {
             .build_dataset_for_connection_tracked(&spec, &qc_opts)
             .await?;
 
-        self.query_dataset_tracked(&dataset, query_json, format_config, None)
+        self.query_dataset_tracked(&dataset, query_json, format_config, tracking_override)
             .await
     }
 
@@ -222,7 +224,8 @@ impl Fluree {
         query_json: &JsonValue,
     ) -> std::result::Result<crate::query::TrackedQueryResponse, crate::query::TrackedErrorResponse>
     {
-        self.query_connection_jsonld_tracked(query_json, None).await
+        self.query_connection_jsonld_tracked(query_json, None, None)
+            .await
     }
 
     /// Execute a JSON-LD query via connection with explicit policy context.
@@ -288,6 +291,7 @@ impl Fluree {
         &self,
         query_json: &JsonValue,
         format_config: Option<FormatterConfig>,
+        tracking_override: Option<TrackingOptions>,
         r2rml_provider: &dyn R2rmlProvider,
         r2rml_table_provider: &dyn R2rmlTableProvider,
     ) -> std::result::Result<crate::query::TrackedQueryResponse, crate::query::TrackedErrorResponse>
@@ -312,7 +316,7 @@ impl Fluree {
                     &view,
                     query_json,
                     format_config,
-                    None,
+                    tracking_override,
                     r2rml_provider,
                     r2rml_table_provider,
                 )
@@ -327,7 +331,7 @@ impl Fluree {
             &dataset,
             query_json,
             format_config,
-            None,
+            tracking_override,
             r2rml_provider,
             r2rml_table_provider,
         )
@@ -339,6 +343,7 @@ impl Fluree {
         query_json: &JsonValue,
         policy: &PolicyContext,
         format_config: Option<FormatterConfig>,
+        tracking_override: Option<TrackingOptions>,
         r2rml_provider: &dyn R2rmlProvider,
         r2rml_table_provider: &dyn R2rmlTableProvider,
     ) -> std::result::Result<crate::query::TrackedQueryResponse, crate::query::TrackedErrorResponse>
@@ -367,7 +372,7 @@ impl Fluree {
                     &view,
                     query_json,
                     format_config,
-                    None,
+                    tracking_override,
                     r2rml_provider,
                     r2rml_table_provider,
                 )
@@ -383,7 +388,7 @@ impl Fluree {
             &dataset,
             query_json,
             format_config,
-            None,
+            tracking_override,
             r2rml_provider,
             r2rml_table_provider,
         )
@@ -398,6 +403,7 @@ impl Fluree {
         query_json: &JsonValue,
         policy: &PolicyContext,
         format_config: Option<FormatterConfig>,
+        tracking_override: Option<TrackingOptions>,
     ) -> std::result::Result<crate::query::TrackedQueryResponse, crate::query::TrackedErrorResponse>
     {
         let (spec, _qc_opts) = parse_dataset_spec(query_json)
@@ -421,7 +427,7 @@ impl Fluree {
             let view = view.with_policy(Arc::new(policy.clone()));
             let view = self.apply_config_defaults(view, None);
             return self
-                .query_tracked(&view, query_json, format_config, None)
+                .query_tracked(&view, query_json, format_config, tracking_override)
                 .await;
         }
 
@@ -431,7 +437,7 @@ impl Fluree {
             .await
             .map_err(|e| crate::query::TrackedErrorResponse::new(500, e.to_string(), None))?;
         let dataset = apply_policy_to_dataset(dataset, policy);
-        self.query_dataset_tracked(&dataset, query_json, format_config, None)
+        self.query_dataset_tracked(&dataset, query_json, format_config, tracking_override)
             .await
     }
 
@@ -563,6 +569,7 @@ impl Fluree {
         &self,
         sparql: &str,
         format_config: Option<FormatterConfig>,
+        tracking_override: Option<TrackingOptions>,
     ) -> std::result::Result<crate::query::TrackedQueryResponse, crate::query::TrackedErrorResponse>
     {
         let ast = parse_and_validate_sparql(sparql)
@@ -583,7 +590,7 @@ impl Fluree {
             .await
             .map_err(|e| crate::query::TrackedErrorResponse::new(500, e.to_string(), None))?;
 
-        self.query_dataset_tracked(&dataset, sparql, format_config, None)
+        self.query_dataset_tracked(&dataset, sparql, format_config, tracking_override)
             .await
     }
 
@@ -591,6 +598,7 @@ impl Fluree {
         &self,
         sparql: &str,
         format_config: Option<FormatterConfig>,
+        tracking_override: Option<TrackingOptions>,
         r2rml_provider: &dyn R2rmlProvider,
         r2rml_table_provider: &dyn R2rmlTableProvider,
     ) -> std::result::Result<crate::query::TrackedQueryResponse, crate::query::TrackedErrorResponse>
@@ -617,7 +625,7 @@ impl Fluree {
             &dataset,
             sparql,
             format_config,
-            None,
+            tracking_override,
             r2rml_provider,
             r2rml_table_provider,
         )
@@ -634,6 +642,7 @@ impl Fluree {
         sparql: &str,
         policy: &PolicyContext,
         format_config: Option<FormatterConfig>,
+        tracking_override: Option<TrackingOptions>,
     ) -> std::result::Result<crate::query::TrackedQueryResponse, crate::query::TrackedErrorResponse>
     {
         let ast = parse_and_validate_sparql(sparql)
@@ -655,7 +664,7 @@ impl Fluree {
             .map_err(|e| crate::query::TrackedErrorResponse::new(500, e.to_string(), None))?;
         let dataset = apply_policy_to_dataset(dataset, policy);
 
-        self.query_dataset_tracked(&dataset, sparql, format_config, None)
+        self.query_dataset_tracked(&dataset, sparql, format_config, tracking_override)
             .await
     }
 
@@ -664,6 +673,7 @@ impl Fluree {
         sparql: &str,
         policy: &PolicyContext,
         format_config: Option<FormatterConfig>,
+        tracking_override: Option<TrackingOptions>,
         r2rml_provider: &dyn R2rmlProvider,
         r2rml_table_provider: &dyn R2rmlTableProvider,
     ) -> std::result::Result<crate::query::TrackedQueryResponse, crate::query::TrackedErrorResponse>
@@ -691,7 +701,7 @@ impl Fluree {
             &dataset,
             sparql,
             format_config,
-            None,
+            tracking_override,
             r2rml_provider,
             r2rml_table_provider,
         )

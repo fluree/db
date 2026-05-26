@@ -271,6 +271,7 @@ This is the standard service-account pattern: register your CLI/app-server ident
 - [Policy model and inputs](policy-model.md) — node shape, combining algorithm, request-time options
 - [Policy enforcement (concepts)](../concepts/policy-enforcement.md) — model overview
 - [Policy in transactions](policy-in-transactions.md) — write-time enforcement
+- [Cross-ledger policy](cross-ledger-policy.md) — query-time engagement under cross-ledger `f:policySource`
 - [Cookbook: Access control policies](../guides/cookbook-policies.md) — worked patterns
 - [Programmatic policy API (Rust)](programmatic-policy.md) — building `PolicyContext` in code
 - [Query reference](../query/README.md) — SPARQL and JSON-LD syntax

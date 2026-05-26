@@ -59,8 +59,8 @@ Cost ladder (per event):
 | Flake returned from a `db.range` call (e.g. SHACL graph reads, graph crawl) | 0.001 |
 | Overlay/novelty row materialized | 0.001 |
 | R2RML row emitted (Iceberg/Parquet) | 0.001 |
-| Transaction commit baseline (once per commit) | 100.000 |
-| Staged flake (per non-schema flake in a transaction) | 0.001 |
+| Transaction commit baseline (once per commit, including each bulk-import chunk) | 100.000 |
+| Staged flake (per flake in a transaction or bulk-import chunk) | 0.001 |
 | `REGEX` / `REPLACE` evaluation | 0.001 |
 | Hash function (`MD5`, `SHA1`, `SHA256`, `SHA384`, `SHA512`) | 0.001 |
 | `UUID` / `STRUUID` | 0.001 |

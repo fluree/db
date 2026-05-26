@@ -369,16 +369,12 @@ pub async fn stage(
             f
         };
 
-        // Count fuel per staged non-schema flake (mirrors query-side fuel counting).
-        // NOTE: fuel exhaustion now returns an error (previously silently ignored).
-        // This is intentional — transactions exceeding fuel limits should fail
-        // before policy enforcement runs.
+        // Charge 1 micro-fuel per staged flake. Matches query-side scan fuel,
+        // which also charges per flake without filtering schema flakes.
+        // Fuel exhaustion returns an error so transactions exceeding fuel
+        // limits fail before policy enforcement runs.
         if let Some(tracker) = options.tracker {
-            for flake in &flakes {
-                if !is_schema_flake(&flake.p, &flake.o) {
-                    tracker.consume_fuel(1)?;
-                }
-            }
+            tracker.consume_fuel(flakes.len() as u64)?;
         }
 
         // Enforce modify policies (if policy context provided and not root)
@@ -478,14 +474,9 @@ pub async fn stage_flakes(
             }
         };
 
-        // 3. Count fuel per staged non-schema flake.
-        // NOTE: fuel exhaustion now returns an error (previously silently ignored).
+        // 3. Charge 1 micro-fuel per staged flake.
         if let Some(tracker) = options.tracker {
-            for flake in &flakes {
-                if !is_schema_flake(&flake.p, &flake.o) {
-                    tracker.consume_fuel(1)?;
-                }
-            }
+            tracker.consume_fuel(flakes.len() as u64)?;
         }
 
         // 4. Policy enforcement

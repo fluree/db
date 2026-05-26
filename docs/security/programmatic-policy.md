@@ -441,4 +441,5 @@ match graph.query(&fluree).jsonld(&query).execute().await {
 - [Policy Model](policy-model.md) - Policy structure and evaluation
 - [Policy in Queries](policy-in-queries.md) - Query-time enforcement
 - [Policy in Transactions](policy-in-transactions.md) - Transaction-time enforcement
+- [Cross-ledger policy](cross-ledger-policy.md) - Govern many data ledgers from one model ledger via `f:policySource` with `f:ledger`; `db_with_policy` dispatches automatically when the data ledger's `#config` is cross-ledger.
 - [Rust API](../getting-started/rust-api.md) - General Rust API usage

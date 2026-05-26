@@ -7,7 +7,7 @@
 //! micro-fuel. Use the helper methods (`limit_fuel`, `used_fuel`) for
 //! user-facing decimal representations.
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -106,7 +106,7 @@ impl TrackingOptions {
 }
 
 /// Policy execution statistics: `{:executed N :allowed M}`
-#[derive(Debug, Clone, Default, Serialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct PolicyStats {
     pub executed: u64,
     pub allowed: u64,

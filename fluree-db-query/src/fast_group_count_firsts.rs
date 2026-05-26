@@ -139,7 +139,6 @@ impl PredicateGroupCountFirstsOperator {
             function: AggregateFn::CountAll,
             input_col: None,
             output_var: self.count_var,
-            distinct: false,
         }];
         let grouped: BoxedOperator = Box::new(GroupAggregateOperator::new(
             scan,
@@ -389,7 +388,6 @@ impl PredicateObjectCountFirstsOperator {
             function: AggregateFn::CountAll,
             input_col: None,
             output_var: self.count_var,
-            distinct: false,
         }];
         let mut op: BoxedOperator = Box::new(GroupAggregateOperator::new(
             scan,

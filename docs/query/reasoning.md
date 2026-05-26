@@ -210,6 +210,53 @@ In SPARQL queries, reasoning is controlled via the Fluree-specific
 complementary mechanism for navigating transitive and inverse relationships
 directly in the query pattern — see [SPARQL](sparql.md) for details.
 
+## Inline ontology per query
+
+In addition to ontology axioms stored in the ledger (via
+`f:schemaSource`), a query can supply **inline ontology axioms**
+via the top-level `ontology` field. The axioms are used only for
+this query's reasoning pass and never persist.
+
+```json
+{
+  "@context": {"ex": "http://example.org/ns/"},
+  "select":    "?name",
+  "where":     {"@id": "?p", "@type": "ex:Person", "ex:name": "?name"},
+  "reasoning": "rdfs",
+  "ontology": {
+    "@context": {
+      "ex":   "http://example.org/ns/",
+      "rdfs": "http://www.w3.org/2000/01/rdf-schema#"
+    },
+    "@id":             "ex:Employee",
+    "rdfs:subClassOf": {"@id": "ex:Person"}
+  }
+}
+```
+
+Semantics:
+
+- **Additive, not replacing.** Inline axioms layer on top of
+  whatever `f:schemaSource` configured for the ledger (same- or
+  cross-ledger). Both contribute to the bundle the reasoner sees.
+- **Transient.** Axioms never persist. The next query without
+  `ontology` runs against only the configured bundle.
+- **Reasoning mode still required.** Inline axioms don't enable
+  reasoning on their own — set `reasoning` (or rely on auto-RDFS
+  when a hierarchy exists) so the engine actually uses them.
+- **Namespace-scoped.** IRIs the snapshot already knows reuse
+  their codes; previously-unseen IRIs allocate request-scoped
+  codes that are discarded with the response — the on-disk
+  dictionary is untouched.
+- **No audit trail.** Without persistence, "which axioms drove
+  which result" can't be reconstructed from history. Store
+  long-lived ontologies in a graph and reference via
+  `f:schemaSource` if auditability matters.
+
+Use cases that fit well: testing a candidate ontology before
+committing it to the ledger, per-tenant axiom layers, exploratory
+analytics with hypothetical sub-class chains.
+
 ## Interaction with ledger configuration
 
 If `f:reasoningDefaults` is set in the ledger configuration graph (see

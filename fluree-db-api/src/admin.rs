@@ -107,6 +107,36 @@ pub struct GraphSourceDropReport {
     pub warnings: Vec<String>,
 }
 
+/// Report of a `drop_named_graph` call.
+///
+/// Named-graph drops are **transactional**: they produce a normal commit that
+/// retracts every triple currently asserted in `graph_iri` at the time the
+/// drop runs. History is preserved — queries `as-of` an earlier `t` still see
+/// the graph populated; only HEAD-time queries see it empty. The graph IRI
+/// remains registered so it can be re-populated by a later insert.
+///
+/// `retracted` and `committed` together describe the outcome:
+/// - graph existed and had data → `retracted > 0`, `committed = true`
+/// - graph existed but was already empty → `retracted = 0`, `committed = false`
+/// - graph IRI was unknown → the call returns `ApiError::NotFound` instead of
+///   producing a report.
+#[derive(Debug, Clone, Default)]
+pub struct DropNamedGraphReport {
+    /// Full `ledger:branch` identifier the drop targeted.
+    pub ledger_id: String,
+    /// Graph IRI that was dropped (echoed for clarity).
+    pub graph_iri: String,
+    /// Number of flakes retracted by the drop commit. `0` if the graph was
+    /// already empty (no commit was produced in that case).
+    pub retracted: usize,
+    /// Whether a new commit was created. `false` when there was nothing to
+    /// retract and the call was a no-op.
+    pub committed: bool,
+    /// Current commit `t` for the branch after the drop. Equal to the
+    /// pre-drop `t` when `committed = false`.
+    pub t: i64,
+}
+
 /// Report of a branch drop operation
 #[derive(Debug, Clone, Default)]
 pub struct BranchDropReport {
@@ -216,6 +246,129 @@ pub struct IndexStatusResult {
 /// Otherwise, `:main` is appended as the default branch.
 fn normalize_ledger_id(ledger_id: &str) -> String {
     fluree_db_core::normalize_ledger_id(ledger_id).unwrap_or_else(|_| ledger_id.to_string())
+}
+
+/// Validate that `value` is an absolute IRI suitable for admin lookup.
+///
+/// This is intentionally a minimal check, not a full RFC 3987 parser. It
+/// enforces only the properties the admin path actually needs:
+///
+/// - No leading/trailing whitespace, and no whitespace anywhere in the
+///   value (preserves caller-exact identity in error messages).
+/// - None of the characters RFC 3987 excludes from an IRI
+///   (`<`, `>`, `"`, `{`, `}`, `|`, `\`, `^`, `` ` ``).
+/// - A valid `<scheme>:<rest>` head per RFC 3986 §3.1: `scheme` starts
+///   with ALPHA and contains only ALPHA / DIGIT / `+` / `-` / `.`,
+///   `rest` is non-empty.
+///
+/// Returns the error message to surface as `400` on failure.
+fn validate_absolute_iri(value: &str) -> std::result::Result<(), String> {
+    if value.is_empty() {
+        return Err("graph IRI is required and cannot be empty".to_string());
+    }
+    // RFC 3987 excludes whitespace, C0 controls (`U+0000..=U+001F`), DEL
+    // (`U+007F`), and the bracket/quote characters below. The C0 check is
+    // important because callers can otherwise sneak a ` ` past
+    // `is_whitespace` and have it surface as a SPARQL parse 500 instead
+    // of the documented 400.
+    if value.chars().any(|c| {
+        matches!(c, '<' | '>' | '"' | '{' | '}' | '|' | '\\' | '^' | '`')
+            || c.is_whitespace()
+            || c <= '\u{20}'
+            || c == '\u{7F}'
+    }) {
+        return Err(format!(
+            "Invalid graph IRI '{value}': contains whitespace, a control character, \
+             or a character not allowed in an IRI \
+             (one of `<`, `>`, `\"`, `{{`, `}}`, `|`, `\\`, `^`, `` ` ``)"
+        ));
+    }
+    // `<scheme>:<rest>` per RFC 3986 §3.1.
+    let (scheme, rest) = value.split_once(':').ok_or_else(|| {
+        format!("Invalid graph IRI '{value}': missing scheme (expected an absolute IRI like 'urn:...' or 'http://...')")
+    })?;
+    let mut sc = scheme.chars();
+    let first = sc
+        .next()
+        .ok_or_else(|| format!("Invalid graph IRI '{value}': scheme is empty"))?;
+    if !first.is_ascii_alphabetic() {
+        return Err(format!(
+            "Invalid graph IRI '{value}': scheme must start with an ASCII letter"
+        ));
+    }
+    if !sc.all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '-' | '.')) {
+        return Err(format!(
+            "Invalid graph IRI '{value}': scheme contains a character outside ALPHA / DIGIT / '+' / '-' / '.'"
+        ));
+    }
+    if rest.is_empty() {
+        return Err(format!(
+            "Invalid graph IRI '{value}': scheme is followed by an empty body"
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod validate_absolute_iri_tests {
+    use super::validate_absolute_iri;
+
+    #[test]
+    fn accepts_typical_iris() {
+        assert!(validate_absolute_iri("http://example.org/g").is_ok());
+        assert!(validate_absolute_iri("https://example.org/path?x=1").is_ok());
+        assert!(validate_absolute_iri("urn:example:org/payroll").is_ok());
+        assert!(validate_absolute_iri("urn:fluree:mydb:main#config").is_ok());
+        assert!(validate_absolute_iri("ftp://example.org").is_ok());
+    }
+
+    #[test]
+    fn rejects_empty() {
+        assert!(validate_absolute_iri("").is_err());
+    }
+
+    #[test]
+    fn rejects_relative_iri() {
+        assert!(validate_absolute_iri("payroll").is_err());
+        assert!(validate_absolute_iri("/absolute/path").is_err());
+        assert!(validate_absolute_iri("ex:").is_err());
+    }
+
+    #[test]
+    fn rejects_whitespace() {
+        assert!(validate_absolute_iri(" http://example.org").is_err());
+        assert!(validate_absolute_iri("http://example.org ").is_err());
+        assert!(validate_absolute_iri("http://example.org/with space").is_err());
+        assert!(validate_absolute_iri("http://example.org\n").is_err());
+    }
+
+    #[test]
+    fn rejects_disallowed_iri_characters() {
+        for bad in ['<', '>', '"', '{', '}', '|', '\\', '^', '`'] {
+            assert!(
+                validate_absolute_iri(&format!("http://example.org/{bad}")).is_err(),
+                "should reject {bad}"
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_c0_and_del_controls() {
+        for cp in [0u32, 0x01, 0x09, 0x0A, 0x0D, 0x1F, 0x7F] {
+            let c = char::from_u32(cp).unwrap();
+            assert!(
+                validate_absolute_iri(&format!("http://example.org/{c}")).is_err(),
+                "should reject control U+{cp:04X}"
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_bad_scheme() {
+        assert!(validate_absolute_iri("1http://example.org").is_err());
+        assert!(validate_absolute_iri("ht_tp://example.org").is_err());
+        assert!(validate_absolute_iri(":nopath").is_err());
+    }
 }
 
 /// Parse a `drop_ledger` input.
@@ -601,6 +754,174 @@ impl crate::Fluree {
             "Branch dropped"
         );
         Ok(report)
+    }
+
+    /// Drop a named graph from a single branch by retracting every triple
+    /// currently asserted under `graph_iri`.
+    ///
+    /// This is a **transactional** drop: it produces one normal commit at
+    /// `t = current_t + 1` whose flakes are all retractions of the graph's
+    /// current contents. History is preserved — a query `as-of` an earlier
+    /// `t` still sees the graph populated. The graph IRI remains registered
+    /// so it can be re-populated by a later insert.
+    ///
+    /// # Arguments
+    ///
+    /// * `ledger_id` - Full ledger identifier (`"mydb"` is normalized to
+    ///   `"mydb:main"`). The drop only affects the targeted branch.
+    /// * `graph_iri` - Full IRI of the named graph to drop (matched exactly
+    ///   against the ledger's graph registry).
+    ///
+    /// # Restrictions
+    ///
+    /// The following graph identifiers are **always** rejected with
+    /// `ApiError::Http(400)`:
+    /// - The default graph (`graph_iri` is empty or refers to g_id 0).
+    /// - The system `txn-meta` graph (`urn:fluree:{ledger_id}#txn-meta`,
+    ///   g_id 1).
+    /// - The system `config` graph (`urn:fluree:{ledger_id}#config`, g_id 2).
+    ///
+    /// An unknown user graph IRI (one that is not in the ledger's graph
+    /// registry) returns `ApiError::NotFound`.
+    ///
+    /// # Behavior
+    ///
+    /// 1. Normalizes the ledger id (`":main"` default).
+    /// 2. Resolves `graph_iri` against the snapshot's `GraphRegistry`.
+    /// 3. Builds a `DELETE { GRAPH <iri> { ?s ?p ?o } } WHERE { ... }`
+    ///    transaction and stages it through the same pipeline used by user
+    ///    SPARQL updates.
+    /// 4. If the WHERE matches zero flakes (graph already empty), no commit
+    ///    is produced and `committed = false` is reported.
+    ///
+    /// # Errors
+    ///
+    /// - `ApiError::Http(400)` — `graph_iri` is empty, malformed, or names a
+    ///   protected system graph.
+    /// - `ApiError::NotFound` — the ledger does not exist, or `graph_iri` is
+    ///   not registered in this ledger's graph registry.
+    pub async fn drop_named_graph(
+        &self,
+        ledger_id: &str,
+        graph_iri: &str,
+    ) -> Result<DropNamedGraphReport> {
+        use fluree_db_core::graph_registry::{
+            config_graph_iri, txn_meta_graph_iri, CONFIG_GRAPH_ID, DEFAULT_GRAPH_ID,
+            TXN_META_GRAPH_ID,
+        };
+        use fluree_db_transact::{NamespaceRegistry, TxnOpts};
+
+        let bad_request = |msg: String| ApiError::Http {
+            status: 400,
+            message: msg,
+        };
+
+        if graph_iri.is_empty() {
+            return Err(bad_request(
+                "graph IRI is required and cannot drop the default graph".to_string(),
+            ));
+        }
+        // The CLI / HTTP contract is "full graph IRI". We enforce that
+        // exactly here so an accidentally trimmed value or a relative
+        // reference that happens to match a registry entry can't slip
+        // through. `validate_absolute_iri` rejects whitespace, the
+        // characters RFC 3987 excludes from an IRI, and any value
+        // lacking a proper `<scheme>:<rest>` head.
+        validate_absolute_iri(graph_iri).map_err(bad_request)?;
+
+        let ledger_id = normalize_ledger_id(ledger_id);
+
+        // Reject system graphs purely by IRI shape — this catches the case
+        // even on ledgers whose registry was seeded permissively without
+        // the config graph (legacy roots).
+        if graph_iri == txn_meta_graph_iri(&ledger_id) {
+            return Err(bad_request(format!(
+                "Cannot drop the txn-meta system graph '{graph_iri}'"
+            )));
+        }
+        if graph_iri == config_graph_iri(&ledger_id) {
+            return Err(bad_request(format!(
+                "Cannot drop the config system graph '{graph_iri}'"
+            )));
+        }
+
+        info!(ledger_id = %ledger_id, graph_iri = %graph_iri, "Dropping named graph");
+
+        let handle = self.ledger_cached(&ledger_id).await?;
+        let pre_drop_t = handle.t().await;
+        let view = handle.snapshot().await;
+        let snapshot = &view.snapshot;
+
+        let g_id = snapshot
+            .graph_registry
+            .graph_id_for_iri(graph_iri)
+            .ok_or_else(|| {
+                ApiError::NotFound(format!(
+                    "Named graph '{graph_iri}' is not registered in ledger '{ledger_id}'"
+                ))
+            })?;
+
+        // Belt-and-suspenders: a registry built from a non-standard root could
+        // theoretically map a user-supplied IRI to a system slot. Refuse it.
+        if matches!(g_id, DEFAULT_GRAPH_ID | TXN_META_GRAPH_ID | CONFIG_GRAPH_ID) {
+            return Err(bad_request(format!(
+                "Cannot drop system graph '{graph_iri}' (g_id={g_id})"
+            )));
+        }
+
+        // Build and lower the SPARQL DELETE. We use the explicit
+        // `DELETE { GRAPH <g> { ... } } WHERE { GRAPH <g> { ... } }` form
+        // because `DELETE WHERE` does not yet support GRAPH blocks.
+        let sparql = format!(
+            "DELETE {{ GRAPH <{graph_iri}> {{ ?s ?p ?o }} }} \
+             WHERE {{ GRAPH <{graph_iri}> {{ ?s ?p ?o }} }}"
+        );
+        let parsed = fluree_db_sparql::parse_sparql(&sparql);
+        if parsed.has_errors() {
+            return Err(ApiError::internal(format!(
+                "drop_named_graph: SPARQL parse failed for graph IRI '{graph_iri}': {:?}",
+                parsed.diagnostics
+            )));
+        }
+        let ast = parsed.ast.ok_or_else(|| {
+            ApiError::internal("drop_named_graph: SPARQL parser returned no AST".to_string())
+        })?;
+
+        let mut ns_registry = NamespaceRegistry::from_db(snapshot);
+        let txn =
+            fluree_db_transact::lower_sparql_update_ast(&ast, &mut ns_registry, TxnOpts::default())
+                .map_err(|e| {
+                    ApiError::internal(format!(
+                        "drop_named_graph: failed to lower SPARQL update: {e}"
+                    ))
+                })?;
+        drop(view);
+
+        let result = self.stage(&handle).txn(txn).execute().await?;
+        let retracted = result.receipt.flake_count;
+        let committed = retracted > 0;
+        let new_t = if committed {
+            result.receipt.t
+        } else {
+            pre_drop_t
+        };
+
+        info!(
+            ledger_id = %ledger_id,
+            graph_iri = %graph_iri,
+            retracted,
+            committed,
+            t = new_t,
+            "Named graph dropped",
+        );
+
+        Ok(DropNamedGraphReport {
+            ledger_id,
+            graph_iri: graph_iri.to_string(),
+            retracted,
+            committed,
+            t: new_t,
+        })
     }
 
     /// Cancel indexing, delete storage artifacts, purge nameservice record,

@@ -10,6 +10,7 @@ description = "Policy enforcement for Fluree DB queries and transactions"
 fluree-db-core = { path = "../fluree-db-core" }
 fluree-vocab = { path = "../fluree-vocab" }
 thiserror = { workspace = true }
+tracing = { workspace = true }
 uuid = { version = "1.0", features = ["v4"] }
 futures = { workspace = true }
 
