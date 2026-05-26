@@ -294,8 +294,7 @@ async fn transact_via_consensus(
     );
 
     let submission =
-        with_index_request_correlation(correlation, state.consensus.transact(ledger_id, request))
-            .await;
+        with_index_request_correlation(correlation, state.consensus.transact(request)).await;
     let receipt = match submission {
         Ok(receipt) => {
             tracing::info!(
@@ -1471,6 +1470,7 @@ async fn execute_transaction(
         };
         let request = TransactionRequest {
             idempotency_key,
+            ledger_id: ledger_id.to_string(),
             body,
             txn_opts: TxnOpts::default(),
             commit_opts,
@@ -1574,6 +1574,7 @@ async fn execute_turtle_transaction(
         };
         let request = TransactionRequest {
             idempotency_key: extract_idempotency_key(&credential.headers),
+            ledger_id: ledger_id.to_string(),
             body,
             txn_opts: TxnOpts::default(),
             commit_opts,
@@ -1695,6 +1696,7 @@ async fn execute_sparql_update_request(
     let tracking = tracking_from_headers(headers);
     let request = TransactionRequest {
         idempotency_key: extract_idempotency_key(&credential.headers),
+        ledger_id: ledger_id.clone(),
         body: TransactionBody::Sparql(sparql),
         txn_opts: TxnOpts::default(),
         commit_opts,

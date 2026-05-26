@@ -116,6 +116,7 @@ pub enum TransactionBody {
 /// request headers for SPARQL.
 pub struct TransactionRequest {
     pub idempotency_key: Option<IdempotencyKey>,
+    pub ledger_id: String,
     pub body: TransactionBody,
     pub txn_opts: TxnOpts,
     pub commit_opts: CommitOpts,
@@ -243,10 +244,10 @@ pub struct PushReceipt {
 
 /// Receipt for any operation submitted through consensus.
 ///
-/// Variants correspond one-to-one with [`Submitter`] methods. The umbrella
-/// type lets [`SubmissionState`] and the idempotency cache stay uniform
-/// across operation kinds without erasing per-op typing at the trait
-/// methods themselves.
+/// Variants correspond one-to-one with [`Submitter`] trait methods. The
+/// umbrella type lets [`SubmissionState`] and the idempotency cache stay
+/// uniform across operation kinds without erasing per-op typing at the
+/// trait methods themselves.
 #[derive(Debug, Clone)]
 pub enum OperationReceipt {
     Transaction(TransactionReceipt),
@@ -317,16 +318,14 @@ pub enum SubmissionError {
 /// key via [`SubmissionLookup`].
 #[async_trait]
 pub trait Submitter: Send + Sync {
+    /// Stage and commit a transaction.
     async fn transact(
         &self,
-        ledger_id: &str,
         request: TransactionRequest,
     ) -> Result<TransactionReceipt, SubmissionError>;
 
     /// Revert the effects of one or more commits on a branch as a single
-    /// inverse commit. Carries the same idempotency semantics as
-    /// [`transact`](Self::transact) — a `Some(idempotency_key)` collapses
-    /// retries and enables later status lookup via [`SubmissionLookup`].
+    /// inverse commit.
     async fn revert(
         &self,
         request: RevertRequest,
@@ -334,24 +333,21 @@ pub trait Submitter: Send + Sync {
 
     /// Replay a source branch onto a target branch — fast-forward when the
     /// target hasn't diverged, otherwise a merge commit under the supplied
-    /// conflict strategy. Carries the same idempotency semantics as
-    /// [`transact`](Self::transact).
+    /// conflict strategy.
     async fn merge(
         &self,
         request: MergeRequest,
     ) -> Result<MergeReceipt, SubmissionError>;
 
     /// Replay a branch's unique commits on top of its source branch's
-    /// current HEAD, under the supplied conflict strategy. Carries the
-    /// same idempotency semantics as [`transact`](Self::transact).
+    /// current HEAD.
     async fn rebase(
         &self,
         request: RebaseRequest,
     ) -> Result<RebaseReceipt, SubmissionError>;
 
     /// Ingest precomputed commit v2 blobs onto a ledger, advancing its
-    /// commit head. Carries the same idempotency semantics as
-    /// [`transact`](Self::transact).
+    /// commit head.
     async fn push(
         &self,
         request: PushRequest,

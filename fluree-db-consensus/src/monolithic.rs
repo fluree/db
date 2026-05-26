@@ -169,11 +169,11 @@ impl MonolithicConsensus {
 
     async fn execute_transaction(
         &self,
-        ledger_id: &str,
         request: TransactionRequest,
     ) -> Result<TransactionReceipt, SubmissionError> {
         let TransactionRequest {
             idempotency_key,
+            ledger_id,
             body,
             txn_opts,
             commit_opts,
@@ -183,7 +183,7 @@ impl MonolithicConsensus {
 
         let ledger_handle = self
             .ledger_manager()?
-            .get_or_load(ledger_id)
+            .get_or_load(&ledger_id)
             .await
             .map_err(execution_failure)?;
 
@@ -540,29 +540,25 @@ fn hash_commit_ref(hasher: &mut Sha256, commit: &CommitRef) {
 impl Submitter for MonolithicConsensus {
     async fn transact(
         &self,
-        ledger_id: &str,
         request: TransactionRequest,
     ) -> Result<TransactionReceipt, SubmissionError> {
-        // Anonymous submissions skip the idempotency cache entirely:
-        // no key means no retry-collapse and no later status lookup.
+        // Anonymous submissions (no idempotency key) skip the cache
+        // entirely — no retry-collapse and no later status lookup.
         let Some(idempotency_key) = request.idempotency_key.clone() else {
-            return self.execute_transaction(ledger_id, request).await;
+            return self.execute_transaction(request).await;
         };
 
-        let cache_key = (ledger_id.to_string(), idempotency_key);
+        let cache_key = (request.ledger_id.clone(), idempotency_key);
         let body_hash = Self::hash_request_body(&request);
 
         if let Some(receipt) = self.try_claim_slot(cache_key.clone(), body_hash).await? {
             return match receipt {
-                OperationReceipt::Transaction(receipt) => Ok(receipt),
-                OperationReceipt::Revert(_)
-                | OperationReceipt::Merge(_)
-                | OperationReceipt::Rebase(_)
-                | OperationReceipt::Push(_) => Err(SubmissionError::KeyCollision),
+                OperationReceipt::Transaction(r) => Ok(r),
+                _ => Err(SubmissionError::KeyCollision),
             };
         }
 
-        let outcome = self.execute_transaction(ledger_id, request).await;
+        let outcome = self.execute_transaction(request).await;
         self.record_outcome(cache_key, body_hash, &outcome, OperationReceipt::Transaction)
             .await;
         outcome
@@ -584,11 +580,8 @@ impl Submitter for MonolithicConsensus {
 
         if let Some(receipt) = self.try_claim_slot(cache_key.clone(), body_hash).await? {
             return match receipt {
-                OperationReceipt::Revert(receipt) => Ok(receipt),
-                OperationReceipt::Transaction(_)
-                | OperationReceipt::Merge(_)
-                | OperationReceipt::Rebase(_)
-                | OperationReceipt::Push(_) => Err(SubmissionError::KeyCollision),
+                OperationReceipt::Revert(r) => Ok(r),
+                _ => Err(SubmissionError::KeyCollision),
             };
         }
 
@@ -606,9 +599,9 @@ impl Submitter for MonolithicConsensus {
             return self.execute_merge(request).await;
         };
 
-        // Namespace the cache by `ledger:source_branch`. The source branch
-        // uniquely identifies the merge from the client's perspective and is
-        // always known up front — no need to pre-resolve the target.
+        // Namespace by `ledger:source_branch` — uniquely identifies the
+        // merge from the client's perspective and is always known up
+        // front, no need to pre-resolve the target.
         let ledger_id =
             fluree_db_api::format_ledger_id(&request.ledger_name, &request.source_branch);
         let cache_key = (ledger_id, idempotency_key);
@@ -616,11 +609,8 @@ impl Submitter for MonolithicConsensus {
 
         if let Some(receipt) = self.try_claim_slot(cache_key.clone(), body_hash).await? {
             return match receipt {
-                OperationReceipt::Merge(receipt) => Ok(receipt),
-                OperationReceipt::Transaction(_)
-                | OperationReceipt::Revert(_)
-                | OperationReceipt::Rebase(_)
-                | OperationReceipt::Push(_) => Err(SubmissionError::KeyCollision),
+                OperationReceipt::Merge(r) => Ok(r),
+                _ => Err(SubmissionError::KeyCollision),
             };
         }
 
@@ -638,20 +628,17 @@ impl Submitter for MonolithicConsensus {
             return self.execute_rebase(request).await;
         };
 
-        // Rebase rewrites `branch` itself, so the cache namespace is the
-        // branch being rebased — the natural identifier from the client's
-        // perspective and the URL they'd use to check status.
+        // Rebase rewrites `branch` itself, so cache by the branch being
+        // rebased — natural client identifier and matches the URL they'd
+        // use to check status.
         let ledger_id = fluree_db_api::format_ledger_id(&request.ledger_name, &request.branch);
         let cache_key = (ledger_id, idempotency_key);
         let body_hash = Self::hash_rebase_body(&request);
 
         if let Some(receipt) = self.try_claim_slot(cache_key.clone(), body_hash).await? {
             return match receipt {
-                OperationReceipt::Rebase(receipt) => Ok(receipt),
-                OperationReceipt::Transaction(_)
-                | OperationReceipt::Revert(_)
-                | OperationReceipt::Merge(_)
-                | OperationReceipt::Push(_) => Err(SubmissionError::KeyCollision),
+                OperationReceipt::Rebase(r) => Ok(r),
+                _ => Err(SubmissionError::KeyCollision),
             };
         }
 
@@ -670,18 +657,14 @@ impl Submitter for MonolithicConsensus {
         };
 
         // Push targets a fully-qualified `ledger:branch` directly, so the
-        // cache key matches the existing `transact` namespacing — and the
-        // status URL matches the URL the caller already used to push.
+        // cache key matches `transact` namespacing.
         let cache_key = (request.ledger_id.clone(), idempotency_key);
         let body_hash = Self::hash_push_body(&request);
 
         if let Some(receipt) = self.try_claim_slot(cache_key.clone(), body_hash).await? {
             return match receipt {
-                OperationReceipt::Push(receipt) => Ok(receipt),
-                OperationReceipt::Transaction(_)
-                | OperationReceipt::Revert(_)
-                | OperationReceipt::Merge(_)
-                | OperationReceipt::Rebase(_) => Err(SubmissionError::KeyCollision),
+                OperationReceipt::Push(r) => Ok(r),
+                _ => Err(SubmissionError::KeyCollision),
             };
         }
 
@@ -739,9 +722,10 @@ mod tests {
         })
     }
 
-    fn request(key: Option<&str>, body: JsonValue) -> TransactionRequest {
+    fn request(ledger_id: &str, key: Option<&str>, body: JsonValue) -> TransactionRequest {
         TransactionRequest {
             idempotency_key: key.map(IdempotencyKey::new),
+            ledger_id: ledger_id.to_string(),
             body: TransactionBody::JsonLdInsert(body),
             txn_opts: TxnOpts::default(),
             commit_opts: CommitOpts::default(),
@@ -755,7 +739,7 @@ mod tests {
         let (_fluree, consensus, ledger_id) = setup().await;
 
         let receipt = consensus
-            .transact(&ledger_id, request(None, sample_insert("alice")))
+            .transact(request(&ledger_id, None, sample_insert("alice")))
             .await
             .expect("submission to succeed");
 
@@ -769,10 +753,11 @@ mod tests {
         let key = IdempotencyKey::new("01J5XAMPLE001");
 
         let receipt = consensus
-            .transact(
+            .transact(request(
                 &ledger_id,
-                request(Some(key.as_str()), sample_insert("alice")),
-            )
+                Some(key.as_str()),
+                sample_insert("alice"),
+            ))
             .await
             .expect("submission to succeed");
         assert_eq!(receipt.idempotency_key.as_ref(), Some(&key));
@@ -804,12 +789,12 @@ mod tests {
         let body = sample_insert("alice");
 
         let first = consensus
-            .transact(&ledger_id, request(Some(key.as_str()), body.clone()))
+            .transact(request(&ledger_id, Some(key.as_str()), body.clone()))
             .await
             .expect("first submission to succeed");
 
         let second = consensus
-            .transact(&ledger_id, request(Some(key.as_str()), body))
+            .transact(request(&ledger_id, Some(key.as_str()), body))
             .await
             .expect("retry with same body should return cached receipt");
 
@@ -825,18 +810,20 @@ mod tests {
         let key = IdempotencyKey::new("01J5COLLIDE001");
 
         consensus
-            .transact(
+            .transact(request(
                 &ledger_id,
-                request(Some(key.as_str()), sample_insert("alice")),
-            )
+                Some(key.as_str()),
+                sample_insert("alice"),
+            ))
             .await
             .expect("first submission to succeed");
 
         let err = consensus
-            .transact(
+            .transact(request(
                 &ledger_id,
-                request(Some(key.as_str()), sample_insert("bob")),
-            )
+                Some(key.as_str()),
+                sample_insert("bob"),
+            ))
             .await
             .expect_err("second submission with different body should fail");
 
@@ -851,7 +838,7 @@ mod tests {
         let (_fluree, consensus, ledger_id) = setup().await;
 
         consensus
-            .transact(&ledger_id, request(None, sample_insert("alice")))
+            .transact(request(&ledger_id, None, sample_insert("alice")))
             .await
             .expect("anonymous submission");
 
@@ -859,10 +846,11 @@ mod tests {
         // entry should sit in the cache to clash with it.
         let key = IdempotencyKey::new("01J5FRESH001");
         consensus
-            .transact(
+            .transact(request(
                 &ledger_id,
-                request(Some(key.as_str()), sample_insert("bob")),
-            )
+                Some(key.as_str()),
+                sample_insert("bob"),
+            ))
             .await
             .expect("fresh keyed submission should succeed after anonymous");
     }
@@ -871,11 +859,11 @@ mod tests {
     async fn upsert_routes_through_consensus() {
         let (_fluree, consensus, ledger_id) = setup().await;
 
-        let mut req = request(None, sample_insert("alice"));
+        let mut req = request(&ledger_id, None, sample_insert("alice"));
         req.body = TransactionBody::JsonLdUpsert(sample_insert("alice"));
 
         let receipt = consensus
-            .transact(&ledger_id, req)
+            .transact(req)
             .await
             .expect("upsert to succeed");
         assert!(receipt.commit.flake_count > 0);
@@ -885,7 +873,7 @@ mod tests {
     async fn tracking_enabled_submission_carries_tally() {
         let (_fluree, consensus, ledger_id) = setup().await;
 
-        let mut req = request(None, sample_insert("alice"));
+        let mut req = request(&ledger_id, None, sample_insert("alice"));
         req.tracking = Some(TrackingOptions {
             track_time: true,
             track_fuel: true,
@@ -894,7 +882,7 @@ mod tests {
         });
 
         let receipt = consensus
-            .transact(&ledger_id, req)
+            .transact(req)
             .await
             .expect("tracked submission to succeed");
         assert!(
@@ -909,14 +897,14 @@ mod tests {
 
         // `default-allow: true` is a policy input — it triggers policy-context
         // construction inside the consensus layer — and it permits the write.
-        let mut req = request(None, sample_insert("alice"));
+        let mut req = request(&ledger_id, None, sample_insert("alice"));
         req.governance = GovernanceOptions {
             default_allow: true,
             ..Default::default()
         };
 
         let receipt = consensus
-            .transact(&ledger_id, req)
+            .transact(req)
             .await
             .expect("policy-permitted transaction to succeed");
         assert!(receipt.commit.flake_count > 0);
@@ -933,7 +921,7 @@ mod tests {
             "@context": {"ex": "http://example.org/"},
             "insert": {"@id": "ex:john", "ex:name": "John"}
         });
-        let mut req = request(None, body.clone());
+        let mut req = request(&ledger_id, None, body.clone());
         req.body = TransactionBody::JsonLdUpdate(body);
         req.governance = GovernanceOptions {
             policy: Some(json!([{
@@ -946,7 +934,7 @@ mod tests {
         };
 
         let err = consensus
-            .transact(&ledger_id, req)
+            .transact(req)
             .await
             .expect_err("view-only policy should block the write");
         // A policy denial is a client error — it must carry a 4xx status.
@@ -965,7 +953,7 @@ mod tests {
         let missing = "test/missing-ledger:main";
 
         let err = consensus
-            .transact(missing, request(Some(key.as_str()), sample_insert("alice")))
+            .transact(request(missing, Some(key.as_str()), sample_insert("alice")))
             .await
             .expect_err("submission to a missing ledger should fail");
         assert!(
@@ -987,6 +975,7 @@ mod tests {
 ex:alice ex:name "Alice" ."#;
         let req = TransactionRequest {
             idempotency_key: None,
+            ledger_id: ledger_id.clone(),
             body: TransactionBody::TurtleInsert(turtle.to_string()),
             txn_opts: TxnOpts::default(),
             commit_opts: CommitOpts::default(),
@@ -995,7 +984,7 @@ ex:alice ex:name "Alice" ."#;
         };
 
         let receipt = consensus
-            .transact(&ledger_id, req)
+            .transact(req)
             .await
             .expect("turtle insert to succeed");
         assert!(receipt.commit.flake_count > 0);
@@ -1007,6 +996,7 @@ ex:alice ex:name "Alice" ."#;
 
         let req = TransactionRequest {
             idempotency_key: None,
+            ledger_id: ledger_id.clone(),
             body: TransactionBody::Sparql(
                 r#"INSERT DATA { <http://example.org/alice> <http://example.org/name> "Alice" . }"#
                     .to_string(),
@@ -1018,7 +1008,7 @@ ex:alice ex:name "Alice" ."#;
         };
 
         let receipt = consensus
-            .transact(&ledger_id, req)
+            .transact(req)
             .await
             .expect("SPARQL UPDATE to succeed");
         assert!(receipt.commit.flake_count > 0);
@@ -1030,6 +1020,7 @@ ex:alice ex:name "Alice" ."#;
 
         let req = TransactionRequest {
             idempotency_key: None,
+            ledger_id: ledger_id.clone(),
             body: TransactionBody::Sparql("INSERT DATA { this is not valid sparql".to_string()),
             txn_opts: TxnOpts::default(),
             commit_opts: CommitOpts::default(),
@@ -1038,7 +1029,7 @@ ex:alice ex:name "Alice" ."#;
         };
 
         let err = consensus
-            .transact(&ledger_id, req)
+            .transact(req)
             .await
             .expect_err("malformed SPARQL should be rejected");
         match err {
@@ -1058,7 +1049,7 @@ ex:alice ex:name "Alice" ."#;
 
         // First attempt fails — the ledger does not exist yet.
         consensus
-            .transact(ledger, request(Some(key.as_str()), body.clone()))
+            .transact(request(ledger, Some(key.as_str()), body.clone()))
             .await
             .expect_err("first attempt should fail before the ledger exists");
 
@@ -1066,7 +1057,7 @@ ex:alice ex:name "Alice" ."#;
         // `Failed` entry must not block the retry.
         fluree.create_ledger(ledger).await.expect("create ledger");
         let receipt = consensus
-            .transact(ledger, request(Some(key.as_str()), body))
+            .transact(request(ledger, Some(key.as_str()), body))
             .await
             .expect("retry after the ledger exists should succeed");
         assert!(receipt.commit.flake_count > 0);
@@ -1078,11 +1069,11 @@ ex:alice ex:name "Alice" ."#;
     /// revert test needs.
     async fn seed_commit(consensus: &MonolithicConsensus, ledger_id: &str, name: &str) -> CommitId {
         consensus
-            .transact(ledger_id, request(None, sample_insert("__genesis__")))
+            .transact(request(ledger_id, None, sample_insert("__genesis__")))
             .await
             .expect("genesis transaction to succeed");
         let receipt = consensus
-            .transact(ledger_id, request(None, sample_insert(name)))
+            .transact(request(ledger_id, None, sample_insert(name)))
             .await
             .expect("seed transaction to succeed");
         receipt.commit.commit_id
@@ -1175,7 +1166,7 @@ ex:alice ex:name "Alice" ."#;
 
         // A keyed transaction claims the key on this ledger:branch.
         consensus
-            .transact(&ledger_id, request(Some(key), sample_insert("carol")))
+            .transact(request(&ledger_id, Some(key), sample_insert("carol")))
             .await
             .expect("keyed transaction to succeed");
 
@@ -1199,7 +1190,7 @@ ex:alice ex:name "Alice" ."#;
         let (fluree, consensus, parent_id) = setup().await;
         // Genesis commit on `main` so the branch has a head to fork from.
         consensus
-            .transact(&parent_id, request(None, sample_insert("__genesis__")))
+            .transact(request(&parent_id, None, sample_insert("__genesis__")))
             .await
             .expect("seed commit to succeed");
         fluree
@@ -1208,10 +1199,11 @@ ex:alice ex:name "Alice" ."#;
             .expect("create feature branch");
         // One commit on `feature` so the merge has something to apply.
         consensus
-            .transact(
+            .transact(request(
                 "test/consensus:feature",
-                request(None, sample_insert("alice")),
-            )
+                None,
+                sample_insert("alice"),
+            ))
             .await
             .expect("commit on feature to succeed");
         (fluree, consensus)
@@ -1295,10 +1287,11 @@ ex:alice ex:name "Alice" ."#;
 
         // A keyed transaction on `ledger:feature` claims the cache slot.
         consensus
-            .transact(
+            .transact(request(
                 "test/consensus:feature",
-                request(Some(key), sample_insert("dave")),
-            )
+                Some(key),
+                sample_insert("dave"),
+            ))
             .await
             .expect("keyed transaction to succeed");
 
@@ -1383,10 +1376,11 @@ ex:alice ex:name "Alice" ."#;
 
         // A keyed transaction on `ledger:feature` claims the cache slot.
         consensus
-            .transact(
+            .transact(request(
                 "test/consensus:feature",
-                request(Some(key), sample_insert("eve")),
-            )
+                Some(key),
+                sample_insert("eve"),
+            ))
             .await
             .expect("keyed transaction to succeed");
 
@@ -1433,7 +1427,7 @@ ex:alice ex:name "Alice" ."#;
 
         // A keyed transaction on `ledger:main` claims the cache slot.
         consensus
-            .transact(&ledger_id, request(Some(key), sample_insert("frank")))
+            .transact(request(&ledger_id, Some(key), sample_insert("frank")))
             .await
             .expect("keyed transaction to succeed");
 
