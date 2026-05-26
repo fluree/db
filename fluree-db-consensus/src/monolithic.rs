@@ -6,13 +6,15 @@
 //! do not need cross-node coordination.
 
 use crate::{
-    IdempotencyKey, MergeReceipt, MergeRequest, OperationReceipt, RebaseReceipt, RebaseRequest,
-    RevertReceipt, RevertRequest, RevertSelection, SubmissionError, SubmissionLookup,
-    SubmissionState, Submitter, TransactionBody, TransactionReceipt, TransactionRequest,
+    IdempotencyKey, MergeReceipt, MergeRequest, OperationReceipt, PushReceipt, PushRequest,
+    RebaseReceipt, RebaseRequest, RevertReceipt, RevertRequest, RevertSelection, SubmissionError,
+    SubmissionLookup, SubmissionState, Submitter, TransactionBody, TransactionReceipt,
+    TransactionRequest,
 };
 use async_trait::async_trait;
 use fluree_db_api::{
-    ApiError, CommitRef, Fluree, GovernanceOptions, LedgerHandle, LedgerManager, PolicyContext,
+    ApiError, Base64Bytes, CommitRef, Fluree, GovernanceOptions, LedgerHandle, LedgerManager,
+    PolicyContext, PushCommitsRequest,
 };
 use fluree_db_ledger::IndexConfig;
 use fluree_db_transact::TxnType;
@@ -453,6 +455,63 @@ impl MonolithicConsensus {
             strategy,
         })
     }
+
+    fn hash_push_body(request: &PushRequest) -> [u8; 32] {
+        let mut hasher = Sha256::new();
+        hasher.update(request.ledger_id.as_bytes());
+        hasher.update([0u8]);
+        hasher.update((request.commits.len() as u64).to_le_bytes());
+        for commit in &request.commits {
+            hasher.update((commit.len() as u64).to_le_bytes());
+            hasher.update(commit);
+        }
+        // Sort auxiliary blob keys so the hash is order-independent across
+        // retries that serialize the map differently.
+        let mut blob_keys: Vec<&String> = request.blobs.keys().collect();
+        blob_keys.sort();
+        hasher.update((blob_keys.len() as u64).to_le_bytes());
+        for key in blob_keys {
+            hasher.update((key.len() as u64).to_le_bytes());
+            hasher.update(key.as_bytes());
+            let value = &request.blobs[key];
+            hasher.update((value.len() as u64).to_le_bytes());
+            hasher.update(value);
+        }
+        hasher.finalize().into()
+    }
+
+    async fn execute_push(
+        &self,
+        request: PushRequest,
+    ) -> Result<PushReceipt, SubmissionError> {
+        let PushRequest {
+            idempotency_key,
+            ledger_id,
+            commits,
+            blobs,
+            governance,
+        } = request;
+
+        let payload = PushCommitsRequest {
+            commits: commits.into_iter().map(Base64Bytes).collect(),
+            blobs: blobs.into_iter().map(|(k, v)| (k, Base64Bytes(v))).collect(),
+        };
+
+        let response = self
+            .fluree
+            .push_commits(&ledger_id, payload, &governance, &self.index_config)
+            .await
+            .map_err(execution_failure)?;
+
+        Ok(PushReceipt {
+            idempotency_key,
+            ledger: response.ledger,
+            accepted: response.accepted,
+            head_t: response.head.t,
+            head_id: response.head.commit_id,
+            indexing: response.indexing,
+        })
+    }
 }
 
 fn hash_commit_ref(hasher: &mut Sha256, commit: &CommitRef) {
@@ -494,7 +553,8 @@ impl Submitter for MonolithicConsensus {
                 OperationReceipt::Transaction(receipt) => Ok(receipt),
                 OperationReceipt::Revert(_)
                 | OperationReceipt::Merge(_)
-                | OperationReceipt::Rebase(_) => Err(SubmissionError::KeyCollision),
+                | OperationReceipt::Rebase(_)
+                | OperationReceipt::Push(_) => Err(SubmissionError::KeyCollision),
             };
         }
 
@@ -523,7 +583,8 @@ impl Submitter for MonolithicConsensus {
                 OperationReceipt::Revert(receipt) => Ok(receipt),
                 OperationReceipt::Transaction(_)
                 | OperationReceipt::Merge(_)
-                | OperationReceipt::Rebase(_) => Err(SubmissionError::KeyCollision),
+                | OperationReceipt::Rebase(_)
+                | OperationReceipt::Push(_) => Err(SubmissionError::KeyCollision),
             };
         }
 
@@ -554,7 +615,8 @@ impl Submitter for MonolithicConsensus {
                 OperationReceipt::Merge(receipt) => Ok(receipt),
                 OperationReceipt::Transaction(_)
                 | OperationReceipt::Revert(_)
-                | OperationReceipt::Rebase(_) => Err(SubmissionError::KeyCollision),
+                | OperationReceipt::Rebase(_)
+                | OperationReceipt::Push(_) => Err(SubmissionError::KeyCollision),
             };
         }
 
@@ -584,12 +646,43 @@ impl Submitter for MonolithicConsensus {
                 OperationReceipt::Rebase(receipt) => Ok(receipt),
                 OperationReceipt::Transaction(_)
                 | OperationReceipt::Revert(_)
-                | OperationReceipt::Merge(_) => Err(SubmissionError::KeyCollision),
+                | OperationReceipt::Merge(_)
+                | OperationReceipt::Push(_) => Err(SubmissionError::KeyCollision),
             };
         }
 
         let outcome = self.execute_rebase(request).await;
         self.record_outcome(cache_key, body_hash, &outcome, OperationReceipt::Rebase)
+            .await;
+        outcome
+    }
+
+    async fn push(
+        &self,
+        request: PushRequest,
+    ) -> Result<PushReceipt, SubmissionError> {
+        let Some(idempotency_key) = request.idempotency_key.clone() else {
+            return self.execute_push(request).await;
+        };
+
+        // Push targets a fully-qualified `ledger:branch` directly, so the
+        // cache key matches the existing `transact` namespacing — and the
+        // status URL matches the URL the caller already used to push.
+        let cache_key = (request.ledger_id.clone(), idempotency_key);
+        let body_hash = Self::hash_push_body(&request);
+
+        if let Some(receipt) = self.try_claim_slot(cache_key.clone(), body_hash).await? {
+            return match receipt {
+                OperationReceipt::Push(receipt) => Ok(receipt),
+                OperationReceipt::Transaction(_)
+                | OperationReceipt::Revert(_)
+                | OperationReceipt::Merge(_)
+                | OperationReceipt::Rebase(_) => Err(SubmissionError::KeyCollision),
+            };
+        }
+
+        let outcome = self.execute_push(request).await;
+        self.record_outcome(cache_key, body_hash, &outcome, OperationReceipt::Push)
             .await;
         outcome
     }
@@ -1331,6 +1424,57 @@ ex:alice ex:name "Alice" ."#
             .rebase(rebase_request(Some(key)))
             .await
             .expect_err("rebase with a transaction's key should collide");
+        assert!(
+            matches!(err, SubmissionError::KeyCollision),
+            "expected KeyCollision, got {err:?}"
+        );
+    }
+
+    fn push_request(key: Option<&str>, commits: Vec<Vec<u8>>) -> PushRequest {
+        PushRequest {
+            idempotency_key: key.map(IdempotencyKey::new),
+            ledger_id: "test/consensus:main".to_string(),
+            commits,
+            blobs: std::collections::HashMap::new(),
+            governance: GovernanceOptions::default(),
+        }
+    }
+
+    #[tokio::test]
+    async fn empty_push_returns_execution_error() {
+        let (_fluree, consensus, _ledger_id) = setup().await;
+
+        let err = consensus
+            .push(push_request(None, vec![]))
+            .await
+            .expect_err("push with no commits should be rejected");
+        match err {
+            SubmissionError::Execution { status, .. } => {
+                assert_eq!(status, 400, "empty push must report a 400");
+            }
+            other => panic!("expected Execution, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn push_key_collides_with_transaction_key() {
+        let (_fluree, consensus, ledger_id) = setup().await;
+        let key = "01J5MIXEDPUSHKEY";
+
+        // A keyed transaction on `ledger:main` claims the cache slot.
+        consensus
+            .transact(&ledger_id, request(Some(key), sample_insert("frank")))
+            .await
+            .expect("keyed transaction to succeed");
+
+        // The push reuses the same key on the same ledger:main — the cached
+        // Transaction receipt body-hash will not match the push body-hash,
+        // so the slot-claim returns KeyCollision before any push validation
+        // runs. Commits payload is empty for that reason.
+        let err = consensus
+            .push(push_request(Some(key), vec![]))
+            .await
+            .expect_err("push with a transaction's key should collide");
         assert!(
             matches!(err, SubmissionError::KeyCollision),
             "expected KeyCollision, got {err:?}"

@@ -11,8 +11,8 @@ use axum::{
     Json,
 };
 use fluree_db_consensus::{
-    IdempotencyKey, MergeReceipt, OperationReceipt, RebaseReceipt, RevertReceipt, SubmissionLookup,
-    SubmissionState, TransactionReceipt,
+    IdempotencyKey, MergeReceipt, OperationReceipt, PushReceipt, RebaseReceipt, RevertReceipt,
+    SubmissionLookup, SubmissionState, TransactionReceipt,
 };
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
@@ -46,6 +46,7 @@ pub enum OperationStatusResponse {
     Revert(RevertStatusResponse),
     Merge(MergeStatusResponse),
     Rebase(RebaseStatusResponse),
+    Push(PushStatusResponse),
 }
 
 #[derive(Serialize)]
@@ -96,6 +97,15 @@ pub struct RebaseStatusResponse {
     pub strategy: String,
 }
 
+#[derive(Serialize)]
+pub struct PushStatusResponse {
+    pub idempotency_key: Option<String>,
+    pub ledger: String,
+    pub accepted: usize,
+    pub head_t: i64,
+    pub head_id: String,
+}
+
 pub async fn submission_status(
     State(state): State<Arc<AppState>>,
     Path(params): Path<SubmissionStatusParams>,
@@ -127,6 +137,7 @@ impl From<OperationReceipt> for OperationStatusResponse {
             OperationReceipt::Revert(r) => Self::Revert(r.into()),
             OperationReceipt::Merge(r) => Self::Merge(r.into()),
             OperationReceipt::Rebase(r) => Self::Rebase(r.into()),
+            OperationReceipt::Push(r) => Self::Push(r.into()),
         }
     }
 }
@@ -193,6 +204,18 @@ impl From<RebaseReceipt> for RebaseStatusResponse {
             source_head_t: receipt.source_head_t,
             source_head_id: receipt.source_head_id.to_string(),
             strategy: receipt.strategy.as_str().to_string(),
+        }
+    }
+}
+
+impl From<PushReceipt> for PushStatusResponse {
+    fn from(receipt: PushReceipt) -> Self {
+        Self {
+            idempotency_key: receipt.idempotency_key.map(|k| k.as_str().to_string()),
+            ledger: receipt.ledger,
+            accepted: receipt.accepted,
+            head_t: receipt.head_t,
+            head_id: receipt.head_id.to_string(),
         }
     }
 }

@@ -24,11 +24,13 @@ pub use monolithic::{MonolithicConsensus, DEFAULT_IDEMPOTENCY_TTL};
 
 use async_trait::async_trait;
 use fluree_db_api::{
-    CommitId, ConflictStrategy, GovernanceOptions, RevertSelection, TrackingOptions, TrackingTally,
+    CommitId, ConflictStrategy, GovernanceOptions, IndexingStatus, RevertSelection, TrackingOptions,
+    TrackingTally,
 };
 use fluree_db_transact::{CommitOpts, CommitReceipt, TxnOpts, TxnType};
 use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
+use std::collections::HashMap;
 use std::fmt;
 use thiserror::Error;
 
@@ -102,8 +104,7 @@ pub enum TransactionBody {
 /// configuration for the transaction. The implementation builds the policy
 /// context from it against the ledger state it executes against. Callers
 /// assemble it from wherever the inputs live — a JSON-LD body's `opts`, or
-/// request headers for SPARQL. Its nested `tracking` field is unused; see
-/// `tracking` above.
+/// request headers for SPARQL.
 pub struct TransactionRequest {
     pub idempotency_key: Option<IdempotencyKey>,
     pub txn_type: TxnType,
@@ -207,6 +208,31 @@ pub struct RebaseReceipt {
     pub strategy: ConflictStrategy,
 }
 
+/// Push submission payload.
+///
+/// Carries precomputed commit v2 blobs (oldest-first) to be validated,
+/// stored, and appended to the target ledger's commit head. `blobs` is an
+/// auxiliary map of any non-commit objects (e.g., `commit.txn`) the
+/// commits reference, keyed by content ID or legacy address.
+pub struct PushRequest {
+    pub idempotency_key: Option<IdempotencyKey>,
+    pub ledger_id: String,
+    pub commits: Vec<Vec<u8>>,
+    pub blobs: HashMap<String, Vec<u8>>,
+    pub governance: GovernanceOptions,
+}
+
+/// Receipt returned once a push is durably accepted.
+#[derive(Debug, Clone)]
+pub struct PushReceipt {
+    pub idempotency_key: Option<IdempotencyKey>,
+    pub ledger: String,
+    pub accepted: usize,
+    pub head_t: i64,
+    pub head_id: CommitId,
+    pub indexing: IndexingStatus,
+}
+
 /// Receipt for any operation submitted through consensus.
 ///
 /// Variants correspond one-to-one with [`Submitter`] methods. The umbrella
@@ -219,6 +245,7 @@ pub enum OperationReceipt {
     Revert(RevertReceipt),
     Merge(MergeReceipt),
     Rebase(RebaseReceipt),
+    Push(PushReceipt),
 }
 
 /// State of a previously-submitted operation, accessible by idempotency key.
@@ -313,6 +340,14 @@ pub trait Submitter: Send + Sync {
         &self,
         request: RebaseRequest,
     ) -> Result<RebaseReceipt, SubmissionError>;
+
+    /// Ingest precomputed commit v2 blobs onto a ledger, advancing its
+    /// commit head. Carries the same idempotency semantics as
+    /// [`transact`](Self::transact).
+    async fn push(
+        &self,
+        request: PushRequest,
+    ) -> Result<PushReceipt, SubmissionError>;
 }
 
 /// Look up the state of a previously-submitted transaction by its

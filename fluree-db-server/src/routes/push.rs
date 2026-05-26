@@ -7,10 +7,12 @@
 use crate::config::ServerRole;
 use crate::error::{Result, ServerError};
 use crate::extract::{FlureeHeaders, MaybeDataBearer};
+use crate::routes::transact::{extract_idempotency_key, submission_error_to_server_error};
 use crate::state::AppState;
 use axum::extract::{Path, Request, State};
 use axum::response::{IntoResponse, Response};
-use fluree_db_api::{GovernanceOptions, PushCommitsRequest, PushCommitsResponse};
+use fluree_db_api::{GovernanceOptions, PushCommitsRequest, PushCommitsResponse, PushedHead};
+use fluree_db_consensus::{PushRequest, Submitter};
 use std::sync::Arc;
 
 /// Push commits to a ledger (ledger in path tail).
@@ -64,7 +66,7 @@ async fn push_ledger_local(
 
     // Build policy options.
     //
-    let mut opts = GovernanceOptions {
+    let mut governance = GovernanceOptions {
         // Identity is non-spoofable: derived from bearer token (fluree.identity ?? sub).
         identity: bearer.as_ref().and_then(|p| p.identity.clone()),
         // Allow client-provided inline policy and policy-values headers.
@@ -75,29 +77,39 @@ async fn push_ledger_local(
 
     // Force server default policy-class if configured (non-spoofable).
     if let Some(pc) = data_auth.default_policy_class.as_ref() {
-        opts.policy_class = Some(vec![pc.clone()]);
+        governance.policy_class = Some(vec![pc.clone()]);
     } else if !headers.policy_class.is_empty() {
-        opts.policy_class = Some(headers.policy_class.clone());
+        governance.policy_class = Some(headers.policy_class.clone());
     }
 
-    // Index config: server-level override if present, else canonical default.
-    let index_config_owned = state
-        .index_config
-        .clone()
-        .unwrap_or_else(fluree_db_api::server_defaults::default_index_config);
-    let index_config = &index_config_owned;
+    let idempotency_key = extract_idempotency_key(&headers.raw);
 
-    // Parse JSON body.
     let bytes = axum::body::to_bytes(request.into_body(), 50 * 1024 * 1024)
         .await
         .map_err(|e| ServerError::bad_request(format!("failed to read request body: {e}")))?;
-    let body: PushCommitsRequest = serde_json::from_slice(&bytes)?;
+    let parsed: PushCommitsRequest = serde_json::from_slice(&bytes)?;
 
-    let fluree = &state.fluree;
-    let resp = fluree
-        .push_commits(&ledger, body, &opts, index_config)
+    let req = PushRequest {
+        idempotency_key,
+        ledger_id: ledger,
+        commits: parsed.commits.into_iter().map(|b| b.0).collect(),
+        blobs: parsed.blobs.into_iter().map(|(k, v)| (k, v.0)).collect(),
+        governance,
+    };
+
+    let receipt = state
+        .consensus
+        .push(req)
         .await
-        .map_err(ServerError::Api)?;
+        .map_err(submission_error_to_server_error)?;
 
-    Ok(axum::Json(resp))
+    Ok(axum::Json(PushCommitsResponse {
+        ledger: receipt.ledger,
+        accepted: receipt.accepted,
+        head: PushedHead {
+            t: receipt.head_t,
+            commit_id: receipt.head_id,
+        },
+        indexing: receipt.indexing,
+    }))
 }

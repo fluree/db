@@ -139,7 +139,6 @@ impl PolicyArgs {
             policy: self.resolve_policy()?,
             policy_values: self.resolve_policy_values()?,
             default_allow: self.default_allow,
-            tracking: Default::default(),
         })
     }
 }

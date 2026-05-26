@@ -31,10 +31,7 @@
 //! let result = fluree.query_dataset(&dataset, &query).await?;
 //! ```
 
-use fluree_db_core::{
-    ledger_id::{split_time_travel_suffix, LedgerIdTimeSpec},
-    TrackingOptions,
-};
+use fluree_db_core::ledger_id::{split_time_travel_suffix, LedgerIdTimeSpec};
 use fluree_db_sparql::ast::{DatasetClause as SparqlDatasetClause, IriValue};
 
 /// Convert a SPARQL IriValue to a string for use as a ledger identifier.
@@ -322,7 +319,6 @@ impl SourcePolicyOverride {
             policy: self.policy.clone(),
             policy_values: self.policy_values.clone(),
             default_allow: self.default_allow.unwrap_or(false),
-            tracking: TrackingOptions::default(),
         }
     }
 }
@@ -753,8 +749,10 @@ impl DatasetSpec {
 /// - `policy`
 /// - `policy-values`
 /// - `default-allow`
-/// - `meta` (tracking enablement: bool or object)
-/// - `max-fuel` (fuel limit, also enables fuel tracking)
+///
+/// Tracking-related opts keys (`meta`, `max-fuel`) live on a separate
+/// [`TrackingOptions`] path; they are parsed and propagated by the
+/// transaction route, not by this type.
 #[derive(Debug, Clone, Default)]
 pub struct GovernanceOptions {
     pub identity: Option<String>,
@@ -762,8 +760,6 @@ pub struct GovernanceOptions {
     pub policy: Option<JsonValue>,
     pub policy_values: Option<HashMap<String, JsonValue>>,
     pub default_allow: bool,
-    /// Tracking options parsed from `meta` and `max-fuel` in opts
-    pub tracking: TrackingOptions,
 }
 
 impl GovernanceOptions {
@@ -783,9 +779,6 @@ impl GovernanceOptions {
                 )))
             }
         };
-
-        // Parse tracking options from opts
-        let tracking = TrackingOptions::from_opts_value(opts_val);
 
         let identity = opts
             .get("identity")
@@ -852,7 +845,6 @@ impl GovernanceOptions {
             policy,
             policy_values,
             default_allow,
-            tracking,
         })
     }
 
