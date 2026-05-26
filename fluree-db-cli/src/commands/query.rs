@@ -6,6 +6,7 @@ use crate::error::{CliError, CliResult};
 use crate::input;
 use crate::output::{self, OutputFormatKind};
 use fluree_db_api::server_defaults::FlureeDir;
+use fluree_db_api::{GraphSnapshotQueryBuilder, TrackingOptions};
 use std::path::Path;
 use std::time::Instant;
 
@@ -101,6 +102,8 @@ pub async fn run(
     dirs: &FlureeDir,
     remote_flag: Option<&str>,
     direct: bool,
+    track: bool,
+    max_fuel: Option<f64>,
     policy: &PolicyArgs,
 ) -> CliResult<()> {
     const BENCH_ROWS: usize = 5;
@@ -156,6 +159,39 @@ pub async fn run(
         }
     }
 
+    // --track / --max-fuel: validate combinations and build tracking options.
+    // --max-fuel implies --track. Tracking uses an alternate SDK path that
+    // returns a pre-formatted result, so it is incompatible with --bench,
+    // --explain, and the delimited fast paths (TSV/CSV).
+    let tracking_opts = if track || max_fuel.is_some() {
+        if bench {
+            return Err(CliError::Usage(
+                "--track is not compatible with --bench".to_string(),
+            ));
+        }
+        if explain {
+            return Err(CliError::Usage(
+                "--track is not compatible with --explain".to_string(),
+            ));
+        }
+        if matches!(output_format, OutputFormatKind::Tsv | OutputFormatKind::Csv) {
+            return Err(CliError::Usage(
+                "--track is not compatible with --format tsv/csv".to_string(),
+            ));
+        }
+        let max_fuel_micro = max_fuel
+            .filter(|f| *f > 0.0)
+            .map(|f| (f * 1000.0).round().max(0.0) as u64);
+        Some(TrackingOptions {
+            track_time: true,
+            track_fuel: true,
+            track_policy: true,
+            max_fuel: max_fuel_micro,
+        })
+    } else {
+        None
+    };
+
     // Resolve ledger mode: --remote flag, local, tracked, or auto-route to local server
     let mode = if let Some(remote_name) = remote_flag {
         let alias = context::resolve_ledger(explicit_ledger, dirs)?;
@@ -176,6 +212,16 @@ pub async fn run(
             remote_name,
             ..
         } => {
+            // --track / --max-fuel are not yet wired through the remote HTTP
+            // client. The server itself supports tracking (hit the endpoint
+            // with `fluree-track-fuel: true` directly); the CLI wiring is a
+            // follow-up.
+            if tracking_opts.is_some() {
+                eprintln!(
+                    "warning: --track / --max-fuel are not yet wired through the remote \
+                     query client; ignoring for this request"
+                );
+            }
             // Attach policy flags to the remote client so headers + body opts
             // ride through on every request (see RemoteLedgerClient::with_policy).
             let client = client.with_policy(policy.clone());
@@ -427,6 +473,66 @@ pub async fn run(
                 let elapsed = timer.elapsed();
                 println!("{}", serde_json::to_string_pretty(&resp)?);
                 eprintln!("(explain, {})", format_duration(elapsed));
+                return Ok(());
+            }
+
+            // Tracked path: route through the tracked SDK builder so we get a
+            // pre-formatted JsonValue plus fuel/time/policy tally. Mutually
+            // exclusive with --bench / --explain / TSV / CSV (checked above).
+            if let Some(opts) = tracking_opts.clone() {
+                let json_query: Option<serde_json::Value> = match query_format {
+                    detect::QueryFormat::JsonLd => Some(serde_json::from_str(&content)?),
+                    detect::QueryFormat::Sparql => None,
+                };
+                let timer = Instant::now();
+                let builder = GraphSnapshotQueryBuilder::new_from_parts(&fluree, &view).tracking(opts);
+                let builder = match query_format {
+                    detect::QueryFormat::Sparql => builder.sparql(content.as_str()),
+                    detect::QueryFormat::JsonLd => builder.jsonld(json_query.as_ref().unwrap()),
+                };
+                let response = builder.execute_tracked().await.map_err(|e| {
+                    CliError::Api(fluree_db_api::ApiError::http(e.status, e.error))
+                })?;
+                let elapsed = timer.elapsed();
+
+                // Render the formatted result through the existing output pipeline so
+                // --format {json,typed-json,table} continues to apply.
+                let display_format = match output_format {
+                    OutputFormatKind::TypedJson => OutputFormatKind::TypedJson,
+                    _ if query_format == detect::QueryFormat::JsonLd => OutputFormatKind::Json,
+                    _ => output_format,
+                };
+                let output =
+                    output::format_result(&response.result, display_format, query_format, None)?;
+                println!("{}", output.text);
+
+                // Tally to stderr; preserve the existing row/time footer too.
+                let mut tally_parts: Vec<String> = Vec::new();
+                if let Some(t) = &response.time {
+                    tally_parts.push(format!("time {t}"));
+                }
+                if let Some(f) = response.fuel {
+                    tally_parts.push(format!("fuel {f}"));
+                }
+                if let Some(policy) = &response.policy {
+                    if !policy.is_empty() {
+                        let total_exec: u64 = policy.values().map(|s| s.executed).sum();
+                        let total_allowed: u64 = policy.values().map(|s| s.allowed).sum();
+                        tally_parts.push(format!(
+                            "policy {total_allowed}/{total_exec}"
+                        ));
+                    }
+                }
+                let tally_suffix = if tally_parts.is_empty() {
+                    String::new()
+                } else {
+                    format!(", {}", tally_parts.join(", "))
+                };
+                eprintln!(
+                    "({} rows, query: {}{tally_suffix})",
+                    format_count(output.total_rows),
+                    format_duration(elapsed),
+                );
                 return Ok(());
             }
 

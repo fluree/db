@@ -478,6 +478,16 @@ pub enum Commands {
         #[arg(long)]
         remote: Option<String>,
 
+        /// Report tracking tally (fuel, time, policy) to stderr after results.
+        /// Implied by --max-fuel.
+        #[arg(long)]
+        track: bool,
+
+        /// Abort the query if fuel consumption exceeds this decimal limit
+        /// (e.g. `--max-fuel 1000`). Implies `--track`.
+        #[arg(long)]
+        max_fuel: Option<f64>,
+
         #[command(flatten)]
         policy: PolicyArgs,
     },

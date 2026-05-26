@@ -234,6 +234,8 @@ pub async fn run(cli: Cli) -> error::CliResult<()> {
             jsonld,
             at,
             remote,
+            track,
+            max_fuel,
             policy,
         } => {
             let fluree_dir = config::require_fluree_dir_or_global(config_path)?;
@@ -251,6 +253,8 @@ pub async fn run(cli: Cli) -> error::CliResult<()> {
                 &fluree_dir,
                 remote.as_deref(),
                 direct,
+                track,
+                max_fuel,
                 &policy,
             )
             .await
