@@ -341,6 +341,84 @@ PolicyContext construction) lives in
 `fluree-db-server/src/routes/policy_auth.rs` — useful as a concrete
 implementation reference if you're porting the contract to another server.
 
+## Tracking Contract
+
+CLI tracking flags (`--track`, `--track-fuel`, `--track-time`,
+`--track-policy`, `--max-fuel`) ride on every query request as HTTP headers.
+A server that implements this contract makes the same flags Just Work
+against the bundled Fluree server, a CLI-auto-routed local server, an
+explicit `--remote`, and any custom HTTP implementation.
+
+### Request headers
+
+| Header | CLI flag(s) | Type | Notes |
+|---|---|---|---|
+| `fluree-track-meta` | `--track` | `"true"` (presence-truthy) | Shorthand: enable fuel + time + policy. |
+| `fluree-track-fuel` | `--track-fuel` (also implied by `--max-fuel`) | `"true"` | Report total fuel consumed. |
+| `fluree-track-time` | `--track-time` | `"true"` | Report query execution time. |
+| `fluree-track-policy` | `--track-policy` | `"true"` | Report per-policy executed/allowed counts. |
+| `fluree-max-fuel` | `--max-fuel <N>` | decimal string | Abort with `400` (or equivalent) when fuel exceeds `N`. Implies fuel tracking. |
+
+The CLI only sends headers that map to enabled flags — a server should
+treat each header as independent. `fluree-track-meta` is a shorthand that
+the server may expand to all three; alternatively, when `--track` is set
+the CLI may collapse to the single `fluree-track-meta` header for cleaner
+wire format.
+
+For JSON-LD requests, equivalent body opts exist (`opts.meta`,
+`opts.max-fuel`); the CLI prefers headers so a single transport works
+across JSON-LD and SPARQL. Servers should accept either.
+
+### Required server behavior
+
+1. **Inspect the headers (and body opts) and build a tracker** before
+   executing the query. Tracker construction is per-request — never reuse
+   one across requests.
+
+2. **Enforce `fluree-max-fuel` strictly**: abort the query as soon as
+   accumulated fuel would exceed the limit and return an error response.
+   The reference server returns `400 Bad Request` with a body describing
+   the limit and the amount used.
+
+3. **Return a `TrackedQueryResponse`-shaped body** when any tracking
+   header is present:
+
+   ```json
+   {
+     "status": 200,
+     "result": <the normal query result body>,
+     "time": "12.34ms",
+     "fuel": 1234.567,
+     "policy": { "<policy-id>": { "executed": 3, "allowed": 2 } }
+   }
+   ```
+
+   Only include `time`, `fuel`, `policy` for metrics the client actually
+   requested. The `result` field carries whatever the untracked response
+   body would have been (SPARQL JSON, JSON-LD, agent-json, etc.). For
+   agent-json responses the server SHOULD return the bare agent-json
+   envelope as the response body and surface the tally only via the
+   response headers below, so agents see the same shape they always do.
+
+4. **Echo the tally on response headers** so callers that don't parse
+   the JSON body (e.g. delimited or binary formats) can still read them:
+
+   | Response header | Source | Format |
+   |---|---|---|
+   | `x-fdb-fuel` | tracker.fuel | decimal string |
+   | `x-fdb-time` | tracker.time | duration string, e.g. `"12.34ms"` |
+   | `x-fdb-policy` | tracker.policy | JSON object |
+
+### Reference behavior
+
+The reference server's per-route wiring lives in
+`fluree-db-server/src/routes/query.rs` (see the `has_tracking()` branch
+on the ledger-scoped and connection-scoped query handlers). The tracker
+implementation, micro-fuel internals (1 fuel = 1000 micro-fuel), and the
+`TrackedQueryResponse` / `PolicyStats` shapes are defined in
+`fluree-db-core/src/tracking.rs`. The full fuel cost ladder for queries
+and transactions is in `docs/query/tracking-and-fuel.md`.
+
 ## Merge Preview Contract
 
 `fluree branch diff` issues a single read-only request:

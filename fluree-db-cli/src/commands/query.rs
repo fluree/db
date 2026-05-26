@@ -10,6 +10,123 @@ use fluree_db_api::{GraphSnapshotQueryBuilder, TrackingOptions};
 use std::path::Path;
 use std::time::Instant;
 
+/// CLI tracking flags (mirrors the granular `fluree-track-*` HTTP headers
+/// and the `fluree-max-fuel` cap). `--track` is shorthand for fuel + time +
+/// policy; `--max-fuel` implies `--track-fuel`.
+#[derive(Clone, Copy, Default)]
+pub struct TrackingFlags {
+    pub track: bool,
+    pub track_fuel: bool,
+    pub track_time: bool,
+    pub track_policy: bool,
+    pub max_fuel: Option<f64>,
+}
+
+impl TrackingFlags {
+    /// Whether any tracking output was requested by the user.
+    fn any(&self) -> bool {
+        self.track
+            || self.track_fuel
+            || self.track_time
+            || self.track_policy
+            || self.max_fuel.is_some()
+    }
+
+    /// Resolve which individual metrics should be enabled, after applying
+    /// shorthand semantics: `--track` enables all three; `--max-fuel`
+    /// enables `track_fuel`.
+    fn effective(&self) -> (bool, bool, bool) {
+        let fuel = self.track || self.track_fuel || self.max_fuel.is_some();
+        let time = self.track || self.track_time;
+        let policy = self.track || self.track_policy;
+        (fuel, time, policy)
+    }
+
+    /// Build SDK TrackingOptions from the flag set, or None when no metrics
+    /// are requested.
+    fn as_options(&self) -> Option<TrackingOptions> {
+        if !self.any() {
+            return None;
+        }
+        let (fuel, time, policy) = self.effective();
+        let max_fuel_micro = self
+            .max_fuel
+            .filter(|f| *f > 0.0)
+            .map(|f| (f * 1000.0).round().max(0.0) as u64);
+        Some(TrackingOptions {
+            track_time: time,
+            track_fuel: fuel,
+            track_policy: policy,
+            max_fuel: max_fuel_micro,
+        })
+    }
+
+    /// Build the HTTP request headers that map 1:1 to the flag set.
+    /// Empty when no tracking was requested.
+    fn as_request_headers(&self) -> Vec<(&'static str, String)> {
+        let mut out = Vec::new();
+        if !self.any() {
+            return out;
+        }
+        let (fuel, time, policy) = self.effective();
+        // `--track` collapses to the meta omnibus header for cleaner wire format.
+        if self.track {
+            out.push(("fluree-track-meta", "true".to_string()));
+        } else {
+            if fuel {
+                out.push(("fluree-track-fuel", "true".to_string()));
+            }
+            if time {
+                out.push(("fluree-track-time", "true".to_string()));
+            }
+            if policy {
+                out.push(("fluree-track-policy", "true".to_string()));
+            }
+        }
+        if let Some(limit) = self.max_fuel.filter(|f| *f > 0.0) {
+            out.push(("fluree-max-fuel", format!("{limit}")));
+        }
+        out
+    }
+}
+
+/// Append fuel/time/policy fields from a tracked response to the existing
+/// row/time footer. `metrics` is `(track_fuel, track_time, track_policy)` —
+/// only requested fields are shown, even if the server returned more.
+fn format_tally_suffix(
+    fuel: Option<f64>,
+    time: Option<&str>,
+    policy: Option<&std::collections::HashMap<String, fluree_db_api::PolicyStats>>,
+    metrics: (bool, bool, bool),
+) -> String {
+    let (want_fuel, want_time, want_policy) = metrics;
+    let mut parts: Vec<String> = Vec::new();
+    if want_time {
+        if let Some(t) = time {
+            parts.push(format!("time {t}"));
+        }
+    }
+    if want_fuel {
+        if let Some(f) = fuel {
+            parts.push(format!("fuel {f}"));
+        }
+    }
+    if want_policy {
+        if let Some(p) = policy {
+            if !p.is_empty() {
+                let total_exec: u64 = p.values().map(|s| s.executed).sum();
+                let total_allowed: u64 = p.values().map(|s| s.allowed).sum();
+                parts.push(format!("policy {total_allowed}/{total_exec}"));
+            }
+        }
+    }
+    if parts.is_empty() {
+        String::new()
+    } else {
+        format!(", {}", parts.join(", "))
+    }
+}
+
 /// Parse a `--at` value into a `TimeSpec`.
 ///
 /// Accepts:
@@ -102,8 +219,7 @@ pub async fn run(
     dirs: &FlureeDir,
     remote_flag: Option<&str>,
     direct: bool,
-    track: bool,
-    max_fuel: Option<f64>,
+    tracking: TrackingFlags,
     policy: &PolicyArgs,
 ) -> CliResult<()> {
     const BENCH_ROWS: usize = 5;
@@ -159,38 +275,29 @@ pub async fn run(
         }
     }
 
-    // --track / --max-fuel: validate combinations and build tracking options.
-    // --max-fuel implies --track. Tracking uses an alternate SDK path that
-    // returns a pre-formatted result, so it is incompatible with --bench,
-    // --explain, and the delimited fast paths (TSV/CSV).
-    let tracking_opts = if track || max_fuel.is_some() {
+    // --track* / --max-fuel: validate combinations and resolve metrics.
+    // Tracking uses an alternate code path that emits a tally to stderr, so
+    // it is incompatible with --bench, --explain, and the delimited fast
+    // paths (TSV/CSV).
+    if tracking.any() {
         if bench {
             return Err(CliError::Usage(
-                "--track is not compatible with --bench".to_string(),
+                "--track* / --max-fuel are not compatible with --bench".to_string(),
             ));
         }
         if explain {
             return Err(CliError::Usage(
-                "--track is not compatible with --explain".to_string(),
+                "--track* / --max-fuel are not compatible with --explain".to_string(),
             ));
         }
         if matches!(output_format, OutputFormatKind::Tsv | OutputFormatKind::Csv) {
             return Err(CliError::Usage(
-                "--track is not compatible with --format tsv/csv".to_string(),
+                "--track* / --max-fuel are not compatible with --format tsv/csv".to_string(),
             ));
         }
-        let max_fuel_micro = max_fuel
-            .filter(|f| *f > 0.0)
-            .map(|f| (f * 1000.0).round().max(0.0) as u64);
-        Some(TrackingOptions {
-            track_time: true,
-            track_fuel: true,
-            track_policy: true,
-            max_fuel: max_fuel_micro,
-        })
-    } else {
-        None
-    };
+    }
+    let tracking_opts = tracking.as_options();
+    let tracking_metrics = tracking.effective();
 
     // Resolve ledger mode: --remote flag, local, tracked, or auto-route to local server
     let mode = if let Some(remote_name) = remote_flag {
@@ -212,16 +319,14 @@ pub async fn run(
             remote_name,
             ..
         } => {
-            // --track / --max-fuel are not yet wired through the remote HTTP
-            // client. The server itself supports tracking (hit the endpoint
-            // with `fluree-track-fuel: true` directly); the CLI wiring is a
-            // follow-up.
-            if tracking_opts.is_some() {
-                eprintln!(
-                    "warning: --track / --max-fuel are not yet wired through the remote \
-                     query client; ignoring for this request"
-                );
-            }
+            // Resolve tracking headers once; empty when no --track* / --max-fuel
+            // flag was set. Sent on every non-explain query path below.
+            let tracking_headers = tracking.as_request_headers();
+            let is_tracked = tracking_opts.is_some();
+            // Tracking is incompatible with TSV/CSV and explain (already
+            // rejected up-front by the early validation block). It is, however,
+            // compatible with --at: time-travel headers (FROM injection for
+            // SPARQL, body `from` for JSON-LD) compose with tracking headers.
             // Attach policy flags to the remote client so headers + body opts
             // ride through on every request (see RemoteLedgerClient::with_policy).
             let client = client.with_policy(policy.clone());
@@ -378,7 +483,13 @@ pub async fn run(
                             )
                         },
                     )?;
-                    client.query_sparql(&remote_alias, &injected).await?
+                    if is_tracked {
+                        client
+                            .query_sparql_with_headers(&remote_alias, &injected, &tracking_headers)
+                            .await?
+                    } else {
+                        client.query_sparql(&remote_alias, &injected).await?
+                    }
                 }
                 (detect::QueryFormat::JsonLd, Some(at_str), false) => {
                     // Remote time-travel via ledger-scoped JSON-LD: path
@@ -394,14 +505,40 @@ pub async fn run(
                             "JSON-LD query must be a JSON object".to_string(),
                         ));
                     }
-                    client.query_jsonld(&remote_alias, &json_query).await?
+                    if is_tracked {
+                        client
+                            .query_jsonld_with_headers(
+                                &remote_alias,
+                                &json_query,
+                                &tracking_headers,
+                            )
+                            .await?
+                    } else {
+                        client.query_jsonld(&remote_alias, &json_query).await?
+                    }
                 }
                 (detect::QueryFormat::Sparql, None, false) => {
-                    client.query_sparql(&remote_alias, &content).await?
+                    if is_tracked {
+                        client
+                            .query_sparql_with_headers(&remote_alias, &content, &tracking_headers)
+                            .await?
+                    } else {
+                        client.query_sparql(&remote_alias, &content).await?
+                    }
                 }
                 (detect::QueryFormat::JsonLd, None, false) => {
                     let json_query: serde_json::Value = serde_json::from_str(&content)?;
-                    client.query_jsonld(&remote_alias, &json_query).await?
+                    if is_tracked {
+                        client
+                            .query_jsonld_with_headers(
+                                &remote_alias,
+                                &json_query,
+                                &tracking_headers,
+                            )
+                            .await?
+                    } else {
+                        client.query_jsonld(&remote_alias, &json_query).await?
+                    }
                 }
             };
             let elapsed = timer.elapsed();
@@ -413,6 +550,32 @@ pub async fn run(
                 eprintln!("(explain, {})", format_duration(elapsed));
                 return Ok(());
             }
+
+            // When tracking was requested, the server returned a
+            // `TrackedQueryResponse` envelope `{ status, result, time, fuel,
+            // policy }`. Peel off the result for rendering and capture the
+            // tally for the footer.
+            let (result, tracked_tally) = if is_tracked {
+                let envelope = result;
+                let inner = envelope
+                    .get("result")
+                    .cloned()
+                    .unwrap_or(serde_json::Value::Null);
+                let time = envelope
+                    .get("time")
+                    .and_then(serde_json::Value::as_str)
+                    .map(String::from);
+                let fuel = envelope.get("fuel").and_then(serde_json::Value::as_f64);
+                let policy = envelope.get("policy").and_then(|v| {
+                    serde_json::from_value::<
+                        std::collections::HashMap<String, fluree_db_api::PolicyStats>,
+                    >(v.clone())
+                    .ok()
+                });
+                (inner, Some((fuel, time, policy)))
+            } else {
+                (result, None)
+            };
 
             // Safety: rendering a `table` for millions of rows will effectively hang the CLI.
             // For table output, show a preview unless the result set is small (or --bench is used).
@@ -438,7 +601,29 @@ pub async fn run(
             let output =
                 output::format_result(&result, output_format, query_format, effective_limit)?;
             println!("{}", output.text);
-            print_footer(output.total_rows, effective_limit, elapsed);
+            if let Some((fuel, time, policy)) = tracked_tally {
+                let tally_suffix = format_tally_suffix(
+                    fuel,
+                    time.as_deref(),
+                    policy.as_ref(),
+                    tracking_metrics,
+                );
+                let time_str = format_duration(elapsed);
+                let total = output.total_rows;
+                match effective_limit {
+                    Some(n) if n < total => eprintln!(
+                        "(first {} of {} rows, {time_str}{tally_suffix})",
+                        format_count(n),
+                        format_count(total),
+                    ),
+                    _ => eprintln!(
+                        "({} rows, {time_str}{tally_suffix})",
+                        format_count(total),
+                    ),
+                }
+            } else {
+                print_footer(output.total_rows, effective_limit, elapsed);
+            }
         }
         LedgerMode::Local { fluree, alias } => {
             // Load a single view (optionally time-traveled) and execute against it.
@@ -506,30 +691,14 @@ pub async fn run(
                     output::format_result(&response.result, display_format, query_format, None)?;
                 println!("{}", output.text);
 
-                // Tally to stderr; preserve the existing row/time footer too.
-                let mut tally_parts: Vec<String> = Vec::new();
-                if let Some(t) = &response.time {
-                    tally_parts.push(format!("time {t}"));
-                }
-                if let Some(f) = response.fuel {
-                    tally_parts.push(format!("fuel {f}"));
-                }
-                if let Some(policy) = &response.policy {
-                    if !policy.is_empty() {
-                        let total_exec: u64 = policy.values().map(|s| s.executed).sum();
-                        let total_allowed: u64 = policy.values().map(|s| s.allowed).sum();
-                        tally_parts.push(format!(
-                            "policy {total_allowed}/{total_exec}"
-                        ));
-                    }
-                }
-                let tally_suffix = if tally_parts.is_empty() {
-                    String::new()
-                } else {
-                    format!(", {}", tally_parts.join(", "))
-                };
+                let tally_suffix = format_tally_suffix(
+                    response.fuel,
+                    response.time.as_deref(),
+                    response.policy.as_ref(),
+                    tracking_metrics,
+                );
                 eprintln!(
-                    "({} rows, query: {}{tally_suffix})",
+                    "({} rows, {}{tally_suffix})",
                     format_count(output.total_rows),
                     format_duration(elapsed),
                 );

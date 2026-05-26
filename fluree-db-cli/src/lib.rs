@@ -235,6 +235,9 @@ pub async fn run(cli: Cli) -> error::CliResult<()> {
             at,
             remote,
             track,
+            track_fuel,
+            track_time,
+            track_policy,
             max_fuel,
             policy,
         } => {
@@ -253,8 +256,13 @@ pub async fn run(cli: Cli) -> error::CliResult<()> {
                 &fluree_dir,
                 remote.as_deref(),
                 direct,
-                track,
-                max_fuel,
+                commands::query::TrackingFlags {
+                    track,
+                    track_fuel,
+                    track_time,
+                    track_policy,
+                    max_fuel,
+                },
                 &policy,
             )
             .await
