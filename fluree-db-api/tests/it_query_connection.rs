@@ -570,3 +570,77 @@ WHERE {
     );
     assert!(tracked.fuel.unwrap() > 0.0, "fuel should be positive");
 }
+
+#[tokio::test]
+async fn query_from_sparql_with_tracking_setter_reports_fuel() {
+    use fluree_db_api::TrackingOptions;
+    assert_index_defaults();
+    let fluree = FlureeBuilder::memory().build_memory();
+    let _ledger = seed_people_ledger(&fluree, "people:main").await;
+
+    let sparql = r"
+PREFIX ex: <http://example.org/ns/>
+PREFIX schema: <http://schema.org/>
+SELECT ?name
+FROM <people:main>
+WHERE {
+  ?person a ex:Person ;
+          schema:name ?name .
+}
+";
+
+    let tracked = fluree
+        .query_from()
+        .sparql(sparql)
+        .tracking(TrackingOptions {
+            track_time: true,
+            track_fuel: true,
+            track_policy: false,
+            max_fuel: None,
+        })
+        .execute_tracked()
+        .await
+        .expect("query_from().sparql().tracking().execute_tracked() should succeed");
+
+    assert_eq!(tracked.status, 200);
+    assert!(
+        tracked.fuel.is_some(),
+        "fuel should be present when tracking() was set on the builder"
+    );
+    assert!(tracked.fuel.unwrap() > 0.0, "fuel should be positive");
+    assert!(
+        tracked.policy.is_none(),
+        "policy should not be present when track_policy = false"
+    );
+}
+
+#[tokio::test]
+async fn query_from_jsonld_with_track_all_reports_fuel_and_time() {
+    assert_index_defaults();
+    let fluree = FlureeBuilder::memory().build_memory();
+    let _ledger = seed_people_ledger(&fluree, "people:main").await;
+
+    let query = json!({
+        "@context": {
+            "ex": "http://example.org/ns/",
+            "schema": "http://schema.org/"
+        },
+        "from": "people:main",
+        "select": "?name",
+        "where": [
+            { "@id": "?person", "@type": "ex:Person", "schema:name": "?name" }
+        ]
+    });
+
+    let tracked = fluree
+        .query_from()
+        .jsonld(&query)
+        .track_all()
+        .execute_tracked()
+        .await
+        .expect("query_from().jsonld().track_all().execute_tracked() should succeed");
+
+    assert_eq!(tracked.status, 200);
+    assert!(tracked.fuel.is_some() && tracked.fuel.unwrap() > 0.0);
+    assert!(tracked.time.is_some());
+}

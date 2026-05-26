@@ -717,6 +717,18 @@ impl<'a> FromQueryBuilder<'a> {
         self
     }
 
+    /// Enable tracking of all metrics (fuel, time, policy).
+    pub fn track_all(mut self) -> Self {
+        self.core.set_track_all();
+        self
+    }
+
+    /// Set custom tracking options.
+    pub fn tracking(mut self, opts: TrackingOptions) -> Self {
+        self.core.set_tracking(opts);
+        self
+    }
+
     /// Enable BM25/Vector index providers.
     pub fn with_index_providers(mut self) -> Self {
         self.core.set_index_providers();
@@ -1059,8 +1071,10 @@ impl<'a> FromQueryBuilder<'a> {
 
     /// Execute with tracking (fuel, time, policy stats).
     ///
-    /// The connection layer constructs its own tracker from the query body,
-    /// so custom tracking options are not supported on this builder.
+    /// When `.tracking()` or `.track_all()` has been called, the supplied
+    /// `TrackingOptions` are used. Otherwise the connection layer falls back
+    /// to its defaults (JSON-LD reads `opts.meta` / `opts.max-fuel` from the
+    /// query body; SPARQL defaults to all-enabled).
     pub async fn execute_tracked(
         mut self,
     ) -> std::result::Result<TrackedQueryResponse, TrackedErrorResponse> {
@@ -1072,6 +1086,7 @@ impl<'a> FromQueryBuilder<'a> {
 
         let r2rml = self.core.r2rml.take();
         let format_config = self.core.format.take();
+        let tracking = self.core.tracking.take();
         let input = self.core.input.take().unwrap();
         match input {
             QueryInput::JsonLd(json) => match &self.policy {
@@ -1082,6 +1097,7 @@ impl<'a> FromQueryBuilder<'a> {
                                 json,
                                 policy,
                                 format_config,
+                                tracking,
                                 provider.as_ref(),
                                 table_provider.as_ref(),
                             )
@@ -1093,6 +1109,7 @@ impl<'a> FromQueryBuilder<'a> {
                                 json,
                                 policy,
                                 format_config,
+                                tracking,
                             )
                             .await
                     }
@@ -1103,6 +1120,7 @@ impl<'a> FromQueryBuilder<'a> {
                             .query_connection_jsonld_tracked_with_r2rml(
                                 json,
                                 format_config,
+                                tracking,
                                 provider.as_ref(),
                                 table_provider.as_ref(),
                             )
@@ -1110,7 +1128,7 @@ impl<'a> FromQueryBuilder<'a> {
                     }
                     None => {
                         self.fluree
-                            .query_connection_jsonld_tracked(json, format_config)
+                            .query_connection_jsonld_tracked(json, format_config, tracking)
                             .await
                     }
                 },
@@ -1123,7 +1141,7 @@ impl<'a> FromQueryBuilder<'a> {
                                 sparql,
                                 policy,
                                 format_config,
-                                None,
+                                tracking,
                                 provider.as_ref(),
                                 table_provider.as_ref(),
                             )
@@ -1135,7 +1153,7 @@ impl<'a> FromQueryBuilder<'a> {
                                 sparql,
                                 policy,
                                 format_config,
-                                None,
+                                tracking,
                             )
                             .await
                     }
@@ -1146,7 +1164,7 @@ impl<'a> FromQueryBuilder<'a> {
                             .query_connection_sparql_tracked_with_r2rml(
                                 sparql,
                                 format_config,
-                                None,
+                                tracking,
                                 provider.as_ref(),
                                 table_provider.as_ref(),
                             )
@@ -1154,7 +1172,7 @@ impl<'a> FromQueryBuilder<'a> {
                     }
                     None => {
                         self.fluree
-                            .query_connection_sparql_tracked(sparql, format_config, None)
+                            .query_connection_sparql_tracked(sparql, format_config, tracking)
                             .await
                     }
                 },
