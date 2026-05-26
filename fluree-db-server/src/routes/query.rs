@@ -369,6 +369,40 @@ pub async fn query(
             };
         }
 
+        // Tracked path: if fluree-track-* / fluree-max-fuel headers are present,
+        // run through the tracking pipeline and emit fuel/time headers + tally body.
+        if headers.has_tracking() {
+            let tracking_opts = headers.to_tracking_options();
+            let response = state
+                .fluree
+                .query_connection_sparql_tracked(&sparql, None, Some(tracking_opts))
+                .await;
+            let response = match response {
+                Ok(r) => r,
+                Err(e) => {
+                    let server_error =
+                        ServerError::Api(fluree_db_api::ApiError::http(e.status, e.error));
+                    set_span_error_code(&span, "error:QueryFailed");
+                    tracing::error!(error = %server_error, query_kind = "sparql", "tracked SPARQL connection query failed");
+                    return Err(server_error);
+                }
+            };
+            let tally = TrackingTally {
+                time: response.time.clone(),
+                fuel: response.fuel,
+                policy: response.policy.clone(),
+            };
+            let resp_headers = tracking_headers(&tally);
+            tracing::info!(
+                status = "success",
+                query_kind = "sparql",
+                tracked = true,
+                time = ?response.time,
+                fuel = response.fuel
+            );
+            return Ok((resp_headers, Json(response)).into_response());
+        }
+
         match state.fluree.query_from().sparql(&sparql).execute_formatted().await {
             Ok(result) => {
                 tracing::info!(

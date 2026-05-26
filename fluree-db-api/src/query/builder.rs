@@ -1123,6 +1123,7 @@ impl<'a> FromQueryBuilder<'a> {
                                 sparql,
                                 policy,
                                 format_config,
+                                None,
                                 provider.as_ref(),
                                 table_provider.as_ref(),
                             )
@@ -1134,6 +1135,7 @@ impl<'a> FromQueryBuilder<'a> {
                                 sparql,
                                 policy,
                                 format_config,
+                                None,
                             )
                             .await
                     }
@@ -1144,6 +1146,7 @@ impl<'a> FromQueryBuilder<'a> {
                             .query_connection_sparql_tracked_with_r2rml(
                                 sparql,
                                 format_config,
+                                None,
                                 provider.as_ref(),
                                 table_provider.as_ref(),
                             )
@@ -1151,7 +1154,7 @@ impl<'a> FromQueryBuilder<'a> {
                     }
                     None => {
                         self.fluree
-                            .query_connection_sparql_tracked(sparql, format_config)
+                            .query_connection_sparql_tracked(sparql, format_config, None)
                             .await
                     }
                 },

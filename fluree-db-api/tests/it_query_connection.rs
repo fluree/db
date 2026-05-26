@@ -534,7 +534,7 @@ WHERE {
 ";
 
     let tracked = fluree
-        .query_connection_sparql_tracked(sparql, None)
+        .query_connection_sparql_tracked(sparql, None, None)
         .await
         .expect("query_connection_sparql_tracked should succeed");
 
