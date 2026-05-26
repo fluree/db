@@ -82,8 +82,13 @@ impl crate::Fluree {
             strategy = strategy.as_str()
         );
         async move {
-            self.revert_inner(ledger_name, branch, RevertSelection::single(commit), strategy)
-                .await
+            self.revert_inner(
+                ledger_name,
+                branch,
+                RevertSelection::single(commit),
+                strategy,
+            )
+            .await
         }
         .instrument(span)
         .await
@@ -154,8 +159,13 @@ impl crate::Fluree {
             strategy = strategy.as_str()
         );
         async move {
-            self.revert_inner(ledger_name, branch, RevertSelection::range(from, to), strategy)
-                .await
+            self.revert_inner(
+                ledger_name,
+                branch,
+                RevertSelection::range(from, to),
+                strategy,
+            )
+            .await
         }
         .instrument(span)
         .await

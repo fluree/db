@@ -24,8 +24,8 @@ pub use monolithic::{MonolithicConsensus, DEFAULT_IDEMPOTENCY_TTL};
 
 use async_trait::async_trait;
 use fluree_db_api::{
-    CommitId, ConflictStrategy, GovernanceOptions, IndexingStatus, RevertSelection, TrackingOptions,
-    TrackingTally,
+    CommitId, ConflictStrategy, GovernanceOptions, IndexingStatus, RevertSelection,
+    TrackingOptions, TrackingTally,
 };
 use fluree_db_transact::{CommitOpts, CommitReceipt, TxnOpts};
 use serde::{Deserialize, Serialize};
@@ -346,32 +346,20 @@ pub trait Submitter: Send + Sync {
 
     /// Revert the effects of one or more commits on a branch as a single
     /// inverse commit.
-    async fn revert(
-        &self,
-        request: RevertRequest,
-    ) -> Result<RevertReceipt, SubmissionError>;
+    async fn revert(&self, request: RevertRequest) -> Result<RevertReceipt, SubmissionError>;
 
     /// Replay a source branch onto a target branch — fast-forward when the
     /// target hasn't diverged, otherwise a merge commit under the supplied
     /// conflict strategy.
-    async fn merge(
-        &self,
-        request: MergeRequest,
-    ) -> Result<MergeReceipt, SubmissionError>;
+    async fn merge(&self, request: MergeRequest) -> Result<MergeReceipt, SubmissionError>;
 
     /// Replay a branch's unique commits on top of its source branch's
     /// current HEAD.
-    async fn rebase(
-        &self,
-        request: RebaseRequest,
-    ) -> Result<RebaseReceipt, SubmissionError>;
+    async fn rebase(&self, request: RebaseRequest) -> Result<RebaseReceipt, SubmissionError>;
 
     /// Ingest precomputed commit v2 blobs onto a ledger, advancing its
     /// commit head.
-    async fn push(
-        &self,
-        request: PushRequest,
-    ) -> Result<PushReceipt, SubmissionError>;
+    async fn push(&self, request: PushRequest) -> Result<PushReceipt, SubmissionError>;
 }
 
 /// Look up the state of a previously-submitted transaction by its

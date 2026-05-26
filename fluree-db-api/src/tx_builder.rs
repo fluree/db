@@ -1021,9 +1021,9 @@ impl Fluree {
         commit_opts_base: &CommitOpts,
         tracker_ref: Option<&Tracker>,
         index_config: &IndexConfig,
-        store_raw_txn: bool,
     ) -> Result<(StageResult, TxnType, CommitOpts)> {
         let ledger_id = ledger_state.ledger_id().to_string();
+        let store_raw_txn = txn_opts.store_raw_txn.unwrap_or(false);
         match op_plan {
             OpPlan::InsertTurtle(turtle) => {
                 let commit_opts = self.maybe_spawn_txn_upload(
@@ -1207,7 +1207,6 @@ impl Fluree {
                     &commit_opts_base,
                     tracker_ref,
                     &index_config,
-                    store_raw_txn,
                 )
                 .await?;
 

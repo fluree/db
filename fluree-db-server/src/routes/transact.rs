@@ -1484,6 +1484,17 @@ fn compute_tx_id_turtle(turtle: &str) -> String {
     format!("fluree:tx:sha256:{}", hex::encode(hash))
 }
 
+/// Operation kind for the Turtle/TriG transaction path.
+///
+/// Narrower than [`TxnType`] — Turtle bodies cannot represent an update
+/// (SPARQL UPDATE is the update path for RDF text), so the variant is
+/// excluded at the type level rather than checked at runtime.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+enum TurtleOp {
+    Insert,
+    Upsert,
+}
+
 /// Execute a Turtle/TriG transaction
 ///
 /// This function handles both:
@@ -1499,17 +1510,6 @@ fn compute_tx_id_turtle(turtle: &str) -> String {
 /// - **Upsert with Turtle/TriG** (`/upsert`): Uses `upsert_turtle` which handles GRAPH blocks
 ///   and supports named graph ingestion. For each (subject, predicate) pair, existing values
 ///   are retracted before new values are asserted.
-/// Operation kind for the Turtle/TriG transaction path.
-///
-/// Narrower than [`TxnType`] — Turtle bodies cannot represent an update
-/// (SPARQL UPDATE is the update path for RDF text), so the variant is
-/// excluded at the type level rather than checked at runtime.
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
-enum TurtleOp {
-    Insert,
-    Upsert,
-}
-
 async fn execute_turtle_transaction(
     state: &AppState,
     ledger_id: &str,
@@ -1684,7 +1684,6 @@ async fn execute_sparql_update_request(
         policy: headers.policy.clone(),
         policy_values: policy_values_map,
         default_allow: headers.default_allow,
-        ..Default::default()
     };
 
     let commit_opts = build_commit_opts(

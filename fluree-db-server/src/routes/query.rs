@@ -1400,7 +1400,6 @@ async fn execute_sparql_ledger(
             policy: headers.policy.clone(),
             policy_values: policy_values_map,
             default_allow: headers.default_allow,
-            ..Default::default()
         };
 
         let wants_sparql_xml = headers.wants_sparql_results_xml();

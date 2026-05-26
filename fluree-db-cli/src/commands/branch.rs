@@ -766,7 +766,7 @@ async fn run_revert(
                                 &ledger_name,
                                 branch_name,
                                 commit_ref,
-                                preview_opts(conflict_strategy.clone()),
+                                preview_opts(conflict_strategy),
                             )
                             .await?
                     }
@@ -780,7 +780,7 @@ async fn run_revert(
                                 &ledger_name,
                                 branch_name,
                                 refs,
-                                preview_opts(conflict_strategy.clone()),
+                                preview_opts(conflict_strategy),
                             )
                             .await?
                     }
@@ -795,7 +795,7 @@ async fn run_revert(
                                 branch_name,
                                 from_ref,
                                 to_ref,
-                                preview_opts(conflict_strategy.clone()),
+                                preview_opts(conflict_strategy),
                             )
                             .await?
                     }

@@ -408,10 +408,7 @@ impl MonolithicConsensus {
         hasher.finalize().into()
     }
 
-    async fn execute_merge(
-        &self,
-        request: MergeRequest,
-    ) -> Result<MergeReceipt, SubmissionError> {
+    async fn execute_merge(&self, request: MergeRequest) -> Result<MergeReceipt, SubmissionError> {
         let MergeRequest {
             idempotency_key,
             ledger_name,
@@ -512,10 +509,7 @@ impl MonolithicConsensus {
         hasher.finalize().into()
     }
 
-    async fn execute_push(
-        &self,
-        request: PushRequest,
-    ) -> Result<PushReceipt, SubmissionError> {
+    async fn execute_push(&self, request: PushRequest) -> Result<PushReceipt, SubmissionError> {
         let PushRequest {
             idempotency_key,
             ledger_id,
@@ -526,7 +520,10 @@ impl MonolithicConsensus {
 
         let payload = PushCommitsRequest {
             commits: commits.into_iter().map(Base64Bytes).collect(),
-            blobs: blobs.into_iter().map(|(k, v)| (k, Base64Bytes(v))).collect(),
+            blobs: blobs
+                .into_iter()
+                .map(|(k, v)| (k, Base64Bytes(v)))
+                .collect(),
         };
 
         let response = self
@@ -589,15 +586,17 @@ impl Submitter for MonolithicConsensus {
         }
 
         let outcome = self.execute_transaction(request).await;
-        self.record_outcome(cache_key, body_hash, &outcome, OperationReceipt::Transaction)
-            .await;
+        self.record_outcome(
+            cache_key,
+            body_hash,
+            &outcome,
+            OperationReceipt::Transaction,
+        )
+        .await;
         outcome
     }
 
-    async fn revert(
-        &self,
-        request: RevertRequest,
-    ) -> Result<RevertReceipt, SubmissionError> {
+    async fn revert(&self, request: RevertRequest) -> Result<RevertReceipt, SubmissionError> {
         let _permit = self.try_admit()?;
 
         let Some(idempotency_key) = request.idempotency_key.clone() else {
@@ -623,10 +622,7 @@ impl Submitter for MonolithicConsensus {
         outcome
     }
 
-    async fn merge(
-        &self,
-        request: MergeRequest,
-    ) -> Result<MergeReceipt, SubmissionError> {
+    async fn merge(&self, request: MergeRequest) -> Result<MergeReceipt, SubmissionError> {
         let _permit = self.try_admit()?;
 
         let Some(idempotency_key) = request.idempotency_key.clone() else {
@@ -654,10 +650,7 @@ impl Submitter for MonolithicConsensus {
         outcome
     }
 
-    async fn rebase(
-        &self,
-        request: RebaseRequest,
-    ) -> Result<RebaseReceipt, SubmissionError> {
+    async fn rebase(&self, request: RebaseRequest) -> Result<RebaseReceipt, SubmissionError> {
         let _permit = self.try_admit()?;
 
         let Some(idempotency_key) = request.idempotency_key.clone() else {
@@ -684,10 +677,7 @@ impl Submitter for MonolithicConsensus {
         outcome
     }
 
-    async fn push(
-        &self,
-        request: PushRequest,
-    ) -> Result<PushReceipt, SubmissionError> {
+    async fn push(&self, request: PushRequest) -> Result<PushReceipt, SubmissionError> {
         let _permit = self.try_admit()?;
 
         let Some(idempotency_key) = request.idempotency_key.clone() else {
@@ -900,10 +890,7 @@ mod tests {
         let mut req = request(&ledger_id, None, sample_insert("alice"));
         req.body = TransactionBody::JsonLdUpsert(sample_insert("alice"));
 
-        let receipt = consensus
-            .transact(req)
-            .await
-            .expect("upsert to succeed");
+        let receipt = consensus.transact(req).await.expect("upsert to succeed");
         assert!(receipt.commit.flake_count > 0);
     }
 
