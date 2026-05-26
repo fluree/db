@@ -916,7 +916,7 @@ async fn insert_local(
             return execute_turtle_transaction(
                 &state,
                 &ledger_id,
-                TxnType::Insert,
+                TurtleOp::Insert,
                 &turtle,
                 &credential,
                 &headers,
@@ -1062,7 +1062,7 @@ async fn upsert_local(
             return execute_turtle_transaction(
                 &state,
                 &ledger_id,
-                TxnType::Upsert,
+                TurtleOp::Upsert,
                 &turtle,
                 &credential,
                 &headers,
@@ -1209,7 +1209,7 @@ async fn insert_ledger_local(
             return execute_turtle_transaction(
                 &state,
                 &ledger,
-                TxnType::Insert,
+                TurtleOp::Insert,
                 &turtle,
                 &credential,
                 &headers,
@@ -1356,7 +1356,7 @@ async fn upsert_ledger_local(
             return execute_turtle_transaction(
                 &state,
                 &ledger,
-                TxnType::Upsert,
+                TurtleOp::Upsert,
                 &turtle,
                 &credential,
                 &headers,
@@ -1499,10 +1499,21 @@ fn compute_tx_id_turtle(turtle: &str) -> String {
 /// - **Upsert with Turtle/TriG** (`/upsert`): Uses `upsert_turtle` which handles GRAPH blocks
 ///   and supports named graph ingestion. For each (subject, predicate) pair, existing values
 ///   are retracted before new values are asserted.
+/// Operation kind for the Turtle/TriG transaction path.
+///
+/// Narrower than [`TxnType`] — Turtle bodies cannot represent an update
+/// (SPARQL UPDATE is the update path for RDF text), so the variant is
+/// excluded at the type level rather than checked at runtime.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+enum TurtleOp {
+    Insert,
+    Upsert,
+}
+
 async fn execute_turtle_transaction(
     state: &AppState,
     ledger_id: &str,
-    txn_type: TxnType,
+    op: TurtleOp,
     turtle: &str,
     credential: &MaybeCredential,
     headers: &FlureeHeaders,
@@ -1515,7 +1526,7 @@ async fn execute_turtle_transaction(
     let span = tracing::debug_span!(
         "transact_execute",
         ledger_id = ledger_id,
-        txn_type = ?txn_type,
+        op = ?op,
         format = format,
         tracker_time = tracing::field::Empty,
         tracker_fuel = tracing::field::Empty,
@@ -1523,8 +1534,11 @@ async fn execute_turtle_transaction(
     async move {
         let span = tracing::Span::current();
 
-        // TriG on /insert is not supported - named graphs require upsert path
-        if is_trig && txn_type == TxnType::Insert {
+        // TriG carries `GRAPH` blocks, which need the upsert path. The
+        // op-type is constrained by [`TurtleOp`] at the boundary; the
+        // is_trig check below is the one invariant that lives at runtime
+        // because content-type is parsed from HTTP.
+        if is_trig && op == TurtleOp::Insert {
             set_span_error_code(&span, "error:BadRequest");
             tracing::warn!("TriG format not supported on insert endpoint");
             return Err(ServerError::bad_request(
@@ -1554,16 +1568,14 @@ async fn execute_turtle_transaction(
         // Turtle/TriG carries no body `opts`, so policy runs under root.
         // Tracking, however, is header-driven and applies to every format.
         let tracking = tracking_from_headers(headers);
-        // (TriG, Insert) is rejected above and (Turtle/TriG, Update) is
-        // unreachable here — none of the callers pass `TxnType::Update`
-        // for a Turtle body, and the consensus `TransactionBody` has no
-        // Turtle-Update variant.
-        let body = match (is_trig, txn_type) {
-            (false, TxnType::Insert) => TransactionBody::TurtleInsert(turtle.to_string()),
-            (false, TxnType::Upsert) => TransactionBody::TurtleUpsert(turtle.to_string()),
-            (true, TxnType::Upsert) => TransactionBody::TrigUpsert(turtle.to_string()),
-            (true, TxnType::Insert) => unreachable!("rejected above"),
-            (_, TxnType::Update) => unreachable!("Turtle callers never pass Update"),
+        // Only the three valid cases remain after the (TriG, Insert)
+        // rejection above: Turtle+Insert, Turtle+Upsert, TriG+Upsert.
+        let body = if is_trig {
+            TransactionBody::TrigUpsert(turtle.to_string())
+        } else if op == TurtleOp::Insert {
+            TransactionBody::TurtleInsert(turtle.to_string())
+        } else {
+            TransactionBody::TurtleUpsert(turtle.to_string())
         };
         let request = TransactionRequest {
             idempotency_key: extract_idempotency_key(&credential.headers),
