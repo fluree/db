@@ -1339,6 +1339,34 @@ mem:constraint-01kjte29y3cp8mae56xy6yfv2n a mem:Constraint ;
     mem:branch "main" ;
     mem:createdAt "2026-03-03T18:06:20.611062+00:00"^^xsd:dateTime .
 
+mem:constraint-01ksa8r11bg19hsb6wqnd9h8kp a mem:Constraint ;
+    mem:content "History scan persisted pass must skip when a literal-bound pattern component (subject Ref::Iri/Ref::Sid or predicate) fails to resolve to a store id. BinaryFilter currently only constrains s_id/p_id (object filtering is not applied in the persisted scan), so leaving them None walks every leaflet and emits every base row whose t falls in range — surfacing as \"non-matching @id returns all genesis facts\". Novelty still runs because flake_matches_range_eq is keyed on the snapshot-space s_sid/p_sid and short-circuits to empty correctly.</content>\n<severity>must</severity>\n<refs>[\"fluree-db-query/src/binary_history.rs\", \"fluree-db-api/tests/it_query_history_range.rs\"]</refs>\n</invoke>" ;
+    mem:tag "binary-scan" ;
+    mem:tag "filter" ;
+    mem:tag "gotcha" ;
+    mem:tag "history" ;
+    mem:tag "query" ;
+    mem:scope mem:repo ;
+    mem:branch "main" ;
+    mem:createdAt "2026-05-23T11:15:22.795697+00:00"^^xsd:dateTime .
+
+mem:decision-01ksj0awgy3h55453a7p40tw30 a mem:Decision ;
+    mem:content "Fuel charging is now per-flake without schema exclusion. stage.rs previously skipped schema flakes via is_schema_flake with a misleading comment claiming it 'mirrors query-side fuel'; query-side scans actually charge per-flake unconditionally. Removed the filter and applied the same 100 fuel baseline + 1 micro-fuel/flake formula to bulk imports (per-chunk). ImportBuilder::tracker(Tracker) attaches an external tracker; ImportResult.tally returns the final TrackingTally; mid-import limit exhaustion surfaces as ImportError::FuelExceeded." ;
+    mem:tag "fuel" ;
+    mem:tag "import" ;
+    mem:tag "stage" ;
+    mem:tag "tracking" ;
+    mem:tag "transact" ;
+    mem:scope mem:repo ;
+    mem:artifactRef "docs/query/tracking-and-fuel.md" ;
+    mem:artifactRef "fluree-db-api/src/import.rs" ;
+    mem:artifactRef "fluree-db-core/src/tracking.rs" ;
+    mem:artifactRef "fluree-db-transact/src/stage.rs" ;
+    mem:branch "main" ;
+    mem:createdAt "2026-05-26T11:22:19.038786+00:00"^^xsd:dateTime ;
+    mem:rationale "Consistent fuel semantics across stage, query, and import. Schema-flake exclusion was undocumented and under-charged schema-heavy work; also dropped a hot-path dependency on fluree-db-policy." ;
+    mem:alternatives "Keep schema exclusion in stage and add a matching filter to import; charge import on a per-flake basis without a per-chunk baseline." .
+
 mem:fact-01kjte0r70p5ppv4cjkfyyedpe a mem:Fact ;
     mem:content "SPARQL Testsuite critical gotchas:\n- MUST `cd testsuite-sparql/` first — excluded from workspace, `cargo test -p testsuite-sparql` from root FAILS\n- Syntax tests run by default; eval tests need `--include-ignored`\n- Each test runs in subprocess with 5s/10s timeouts — panics show as \"Subprocess error\"\n- W3C data in git submodule `rdf-tests/`; URL→local: strip `https://w3c.github.io/rdf-tests/`, prepend `testsuite-sparql/rdf-tests/`\n- `make investigate` only searches syntax report — use `make investigate-eval` for eval failures\n- Key commands: `make count-eval`, `make test-eval-cat CAT=functions`, `make summary`, `make classify`" ;
     mem:tag "commands" ;
