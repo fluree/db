@@ -1674,8 +1674,10 @@ impl Operator for BinaryScanOperator {
                         FlakeValue::String(_) => Err(std::io::Error::other(
                             "string without dtc: type ambiguous (could be langString)",
                         )),
-                        _ => value_to_otype_okey_simple(bound_o, store_ref)
-                            .map_err(|e| std::io::Error::other(e.to_string())),
+                        // Propagate the io::Error kind unchanged: a NotFound here
+                        // (value absent from the persisted dict) routes to the
+                        // overlay-only fallback below instead of a wide base scan.
+                        _ => value_to_otype_okey_simple(bound_o, store_ref),
                     }
                 }
                 (None, Some(_lang)) => Err(std::io::Error::new(
@@ -2612,50 +2614,68 @@ fn otype_from_dt_sid(dt_sid: &Sid, store: &BinaryIndexStore) -> Option<OType> {
 pub(crate) fn value_to_otype_okey_simple(
     val: &FlakeValue,
     store: &BinaryIndexStore,
-) -> Result<(OType, u64)> {
+) -> std::io::Result<(OType, u64)> {
     use fluree_db_core::value_id::ObjKey;
+    use std::io::{Error, ErrorKind};
 
     match val {
         FlakeValue::Null => Ok((OType::NULL, 0)),
         FlakeValue::Boolean(b) => Ok((OType::XSD_BOOLEAN, *b as u64)),
         FlakeValue::Long(n) => Ok((OType::XSD_INTEGER, ObjKey::encode_i64(*n).as_u64())),
         FlakeValue::Double(d) => {
+            // Encoding failures are NOT NotFound: the value could still exist in
+            // the base index under a representation we can't compute, so callers
+            // must leave the scan un-narrowed (correctness-preserving) rather
+            // than treating it as provably absent.
             if d.is_finite() {
                 ObjKey::encode_f64(*d)
                     .map(|key| (OType::XSD_DOUBLE, key.as_u64()))
                     .map_err(|_| {
-                        QueryError::execution("cannot encode f64 for V6 index".to_string())
+                        Error::new(ErrorKind::InvalidData, "cannot encode f64 for V6 index")
                     })
             } else {
-                Err(QueryError::execution(
-                    "non-finite double in bound object".to_string(),
+                Err(Error::new(
+                    ErrorKind::InvalidData,
+                    "non-finite double in bound object",
                 ))
             }
         }
         FlakeValue::Ref(sid) => {
-            let s_id = store
-                .find_subject_id_by_parts(sid.namespace_code, &sid.name)
-                .map_err(|e| QueryError::execution(format!("find_subject_id_by_parts: {e}")))?
-                .ok_or_else(|| {
-                    QueryError::execution("ref object not found in V6 dict".to_string())
-                })?;
+            // Resolve via `sid_to_store_s_id`: a fast by-parts lookup, then a
+            // fallback that rebuilds the IRI *from the store's own namespace
+            // table* (`store.sid_to_iri`) and re-finds it. This recovers the
+            // common by-parts miss where the SID is EMPTY/OVERFLOW-coded and
+            // carries the full IRI in `name` (e.g. an rdfs:Class object after
+            // bulk import), so a *present* ref isn't mistaken for absent.
+            //
+            // It is NOT a general "decode via the query snapshot" fallback —
+            // this helper only has the store, so for non-EMPTY codes it relies
+            // on canonical encoding keeping snapshot/store namespace codes in
+            // agreement. Only a miss through both steps is treated as absent,
+            // letting the caller short-circuit to the overlay-only path
+            // (NotFound) instead of scanning the whole predicate.
+            let s_id = crate::sid_iri::sid_to_store_s_id(store, sid)?.ok_or_else(|| {
+                Error::new(ErrorKind::NotFound, "ref object not found in V6 dict")
+            })?;
             Ok((OType::IRI_REF, s_id))
         }
         FlakeValue::String(s) => {
+            // String interning has no namespace dimension, so a miss here is a
+            // reliable "absent from base dict" signal (NotFound).
             let str_id = store
                 .find_string_id(s)
-                .map_err(|e| QueryError::execution(format!("find_string_id: {e}")))?
+                .map_err(|e| Error::other(format!("find_string_id: {e}")))?
                 .ok_or_else(|| {
-                    QueryError::execution("string value not found in V6 dict".to_string())
+                    Error::new(ErrorKind::NotFound, "string value not found in V6 dict")
                 })?;
             Ok((OType::XSD_STRING, str_id as u64))
         }
         FlakeValue::Json(s) => {
             let str_id = store
                 .find_string_id(s)
-                .map_err(|e| QueryError::execution(format!("find_string_id: {e}")))?
+                .map_err(|e| Error::other(format!("find_string_id: {e}")))?
                 .ok_or_else(|| {
-                    QueryError::execution("JSON value not found in V6 dict".to_string())
+                    Error::new(ErrorKind::NotFound, "JSON value not found in V6 dict")
                 })?;
             Ok((OType::RDF_JSON, str_id as u64))
         }
@@ -2685,9 +2705,10 @@ pub(crate) fn value_to_otype_okey_simple(
             OType::XSD_G_MONTH_DAY,
             ObjKey::encode_g_month_day(g.month(), g.day()).as_u64(),
         )),
-        _ => Err(QueryError::execution(format!(
-            "unsupported FlakeValue variant for V6 fast-path: {val:?}"
-        ))),
+        _ => Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            format!("unsupported FlakeValue variant for V6 fast-path: {val:?}"),
+        )),
     }
 }
 

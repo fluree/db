@@ -908,7 +908,8 @@ fn translate_term_to_v6(
         Term::Value(val) => {
             // For literal values, we need the FlakeValue → (o_type, o_key) translation.
             // Use the Sid-based dt info from the FlakeValue if available.
-            let (ot, ok) = crate::binary_scan::value_to_otype_okey_simple(val, store)?;
+            let (ot, ok) = crate::binary_scan::value_to_otype_okey_simple(val, store)
+                .map_err(|e| QueryError::from_io("value_to_otype_okey_simple", e))?;
             Ok((ot.as_u16(), ok))
         }
         Term::Var(_) => Err(QueryError::InvalidQuery(
