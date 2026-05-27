@@ -440,6 +440,7 @@ struct GraphRoutingResult {
     /// (unresolved) graphs are intentionally omitted — no per-graph config can
     /// exist for a graph that isn't yet known to the store, so those fall back
     /// to the ledger-wide SHACL baseline.
+    #[cfg(feature = "shacl")]
     graph_iris: rustc_hash::FxHashMap<GraphId, String>,
 }
 
@@ -463,6 +464,7 @@ fn derive_graph_routing(state: &LedgerState, flakes: &[&Flake]) -> GraphRoutingR
     if graph_sids_set.is_empty() {
         return GraphRoutingResult {
             graph_sids: HashMap::new(),
+            #[cfg(feature = "shacl")]
             graph_iris: rustc_hash::FxHashMap::default(),
         };
     }
@@ -473,6 +475,7 @@ fn derive_graph_routing(state: &LedgerState, flakes: &[&Flake]) -> GraphRoutingR
         .and_then(|te| Arc::clone(&te.0).downcast::<BinaryIndexStore>().ok());
 
     let mut result: HashMap<GraphId, Sid> = HashMap::new();
+    #[cfg(feature = "shacl")]
     let mut graph_iris: rustc_hash::FxHashMap<GraphId, String> = rustc_hash::FxHashMap::default();
     let mut max_g_id: GraphId = 1; // 0=default, 1=txn-meta
     let mut unresolved: Vec<Sid> = Vec::new();
@@ -498,7 +501,10 @@ fn derive_graph_routing(state: &LedgerState, flakes: &[&Flake]) -> GraphRoutingR
         if let Some((g_id, iri)) = resolved {
             max_g_id = max_g_id.max(g_id);
             result.insert(g_id, g_sid.clone());
+            #[cfg(feature = "shacl")]
             graph_iris.insert(g_id, iri);
+            #[cfg(not(feature = "shacl"))]
+            drop(iri);
         } else {
             unresolved.push(g_sid.clone());
         }
@@ -513,6 +519,7 @@ fn derive_graph_routing(state: &LedgerState, flakes: &[&Flake]) -> GraphRoutingR
 
     GraphRoutingResult {
         graph_sids: result,
+        #[cfg(feature = "shacl")]
         graph_iris,
     }
 }
