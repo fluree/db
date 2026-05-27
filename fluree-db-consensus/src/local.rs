@@ -1,19 +1,18 @@
-//! Per-operation execution pipeline.
+//! [`Committer`] implementation that drives the per-operation execution
+//! pipeline against a local [`Fluree`] instance.
 //!
-//! Single-node, no admission control, no idempotency cache — just the
-//! parse → stage → policy → commit work that every consensus
-//! implementation needs to do somewhere. [`MonolithicConsensus`] wraps
-//! this with admission + idempotency; a future replicated
-//! implementation will share the same pipeline and add quorum
-//! acceptance on top.
+//! Translates each typed request into the corresponding `Fluree::*`
+//! call and lifts the result back into the umbrella receipt type.
+//! Holds no admission, idempotency, or replication state.
 //!
-//! [`MonolithicConsensus`]: crate::MonolithicConsensus
+//! [`Committer`]: crate::Committer
 
 use crate::{
-    MergeReceipt, MergeRequest, PushReceipt, PushRequest, RebaseReceipt, RebaseRequest,
+    Committer, MergeReceipt, MergeRequest, PushReceipt, PushRequest, RebaseReceipt, RebaseRequest,
     RevertReceipt, RevertRequest, RevertSelection, SubmissionError, TransactionBody,
     TransactionReceipt, TransactionRequest,
 };
+use async_trait::async_trait;
 use fluree_db_api::{
     ApiError, Base64Bytes, Fluree, GovernanceOptions, LedgerHandle, LedgerManager, PolicyContext,
     PushCommitsRequest,
@@ -23,9 +22,8 @@ use std::sync::Arc;
 
 /// Per-operation execution path against a local [`Fluree`] instance.
 ///
-/// Translates each typed request into the corresponding `Fluree::*` call
-/// and lifts the result back into the umbrella receipt type. Holds no
-/// admission or idempotency state — callers layer those on top.
+/// Translates each typed request into the corresponding `Fluree::*`
+/// call and lifts the result back into the umbrella receipt type.
 pub struct LocalCommitter {
     fluree: Arc<Fluree>,
     index_config: IndexConfig,
@@ -39,12 +37,6 @@ impl LocalCommitter {
         }
     }
 
-    /// Borrow the underlying Fluree handle. Used by wrappers that want
-    /// to share the same instance (e.g. for status lookups).
-    pub fn fluree(&self) -> &Arc<Fluree> {
-        &self.fluree
-    }
-
     fn ledger_manager(&self) -> Result<&Arc<LedgerManager>, SubmissionError> {
         self.fluree
             .ledger_manager()
@@ -53,8 +45,11 @@ impl LocalCommitter {
                 message: "LedgerManager is not configured on the Fluree instance".into(),
             })
     }
+}
 
-    pub async fn transact(
+#[async_trait]
+impl Committer for LocalCommitter {
+    async fn transact(
         &self,
         request: TransactionRequest,
     ) -> Result<TransactionReceipt, SubmissionError> {
@@ -111,7 +106,7 @@ impl LocalCommitter {
         })
     }
 
-    pub async fn revert(&self, request: RevertRequest) -> Result<RevertReceipt, SubmissionError> {
+    async fn revert(&self, request: RevertRequest) -> Result<RevertReceipt, SubmissionError> {
         let RevertRequest {
             idempotency_key,
             ledger_name,
@@ -146,7 +141,7 @@ impl LocalCommitter {
         })
     }
 
-    pub async fn merge(&self, request: MergeRequest) -> Result<MergeReceipt, SubmissionError> {
+    async fn merge(&self, request: MergeRequest) -> Result<MergeReceipt, SubmissionError> {
         let MergeRequest {
             idempotency_key,
             ledger_name,
@@ -180,7 +175,7 @@ impl LocalCommitter {
         })
     }
 
-    pub async fn rebase(&self, request: RebaseRequest) -> Result<RebaseReceipt, SubmissionError> {
+    async fn rebase(&self, request: RebaseRequest) -> Result<RebaseReceipt, SubmissionError> {
         let RebaseRequest {
             idempotency_key,
             ledger_name,
@@ -210,7 +205,7 @@ impl LocalCommitter {
         })
     }
 
-    pub async fn push(&self, request: PushRequest) -> Result<PushReceipt, SubmissionError> {
+    async fn push(&self, request: PushRequest) -> Result<PushReceipt, SubmissionError> {
         let PushRequest {
             idempotency_key,
             ledger_id,
