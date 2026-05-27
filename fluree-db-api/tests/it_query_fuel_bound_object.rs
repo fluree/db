@@ -56,11 +56,20 @@ async fn seed(fluree: &fluree_db_api::Fluree) {
         }));
     }
     for i in 0..N {
+        // `ns:tag` is deliberately mixed-datatype (string on even, integer on
+        // odd), so a plain-string object on it can't be narrowed to a single
+        // datatype and exercises the "type ambiguous" path in scan `open()`.
+        let tag = if i % 2 == 0 {
+            json!(format!("tag-{i}"))
+        } else {
+            json!(i)
+        };
         graph.push(json!({
             "@id": format!("ns:widget-{i}"),
             "@type": "ns:Widget",
             "ns:name": format!("widget name {i}"),
             "ns:owner": { "@id": format!("ns:owner-{}", i % 5) },
+            "ns:tag": tag,
         }));
     }
 
@@ -127,6 +136,37 @@ async fn tracked_count(fluree: &fluree_db_api::Fluree, class_iri: &str) -> (Opti
         .and_then(serde_json::Value::as_str)
         .and_then(|s| s.parse::<i64>().ok());
     (count, fuel)
+}
+
+#[tokio::test]
+async fn bound_object_absent_string_does_not_scan_predicate() {
+    assert_index_defaults();
+    let fluree = FlureeBuilder::memory().build_memory();
+    seed(&fluree).await;
+
+    // `ns:tag` is mixed-datatype, so a plain-string object hits the
+    // "type ambiguous (xsd:string vs langString)" path — it can't be narrowed
+    // to one (o_type, o_key) range. An *absent* string still must short-circuit:
+    // xsd:string and langString share an interned string id, so a dict miss
+    // proves no string-typed flake can match. Must NOT full-scan ns:tag.
+    let (ghost_rows, ghost_fuel) = tracked(
+        &fluree,
+        json!({ "@id": "?s", "ns:tag": "tag-nonexistent-value" }),
+    )
+    .await;
+    assert_eq!(ghost_rows, 0, "absent string matches nothing");
+    assert!(
+        ghost_fuel <= ABSENT_FUEL_CEILING,
+        "absent string burned {ghost_fuel} fuel (ceiling {ABSENT_FUEL_CEILING}); \
+         a full ns:tag predicate scan regressed"
+    );
+
+    // Present string still resolves correctly. Narrowing the present ambiguous
+    // case is intentionally not attempted (it would change langString match
+    // semantics), so this path still full-scans — assert correctness only.
+    let (present_rows, _present_fuel) =
+        tracked(&fluree, json!({ "@id": "?s", "ns:tag": "tag-0" })).await;
+    assert_eq!(present_rows, 1, "present string matches exactly widget-0");
 }
 
 #[tokio::test]

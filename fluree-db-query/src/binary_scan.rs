@@ -1667,13 +1667,29 @@ impl Operator for BinaryScanOperator {
                     value_to_otype_okey(bound_o, dt_sid, lang, store_ref, dict_novelty)
                 }
                 (None, None) => {
-                    // Without a datatype constraint, we can only safely encode non-string
-                    // values. String values are ambiguous — could be xsd:string or
-                    // rdf:langString — so skip them to avoid type mismatch.
                     match bound_o {
-                        FlakeValue::String(_) => Err(std::io::Error::other(
-                            "string without dtc: type ambiguous (could be langString)",
-                        )),
+                        // A string without a datatype constraint is ambiguous: it
+                        // could be xsd:string or rdf:langString, which encode to
+                        // different o_types, so we can't build one tight
+                        // (o_type, o_key) range and must leave the scan un-narrowed.
+                        //
+                        // BUT both share the same interned string id, so if the
+                        // string isn't in the dict at all, no string-typed flake
+                        // (any datatype/lang) can match. Surface NotFound in that
+                        // case to short-circuit to the overlay-only path instead of
+                        // a full predicate scan. (A NotFound here is a base-dict
+                        // miss; the overlay-only fallback still checks novelty, so
+                        // this stays correct when the value is novelty-only.)
+                        FlakeValue::String(s) => match store_ref.find_string_id(s) {
+                            Ok(Some(_)) => Err(std::io::Error::other(
+                                "string without dtc: type ambiguous (could be langString)",
+                            )),
+                            Ok(None) => Err(std::io::Error::new(
+                                std::io::ErrorKind::NotFound,
+                                "string value not found in V6 dict",
+                            )),
+                            Err(e) => Err(std::io::Error::other(format!("find_string_id: {e}"))),
+                        },
                         // Propagate the io::Error kind unchanged: a NotFound here
                         // (value absent from the persisted dict) routes to the
                         // overlay-only fallback below instead of a wide base scan.
