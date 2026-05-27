@@ -236,6 +236,28 @@ Same admin auth bracket as `/create`, `/drop`, `/reindex`. See
 Same admin auth bracket as `/create`, `/drop`, `/reindex`. See
 [Branch Drop Contract](#branch-drop-contract).
 
+### `fluree graph drop --remote <name>` (admin-protected)
+
+- `POST {api_base_url}/drop-graph` with `{ ledger, graph }`
+
+Drops a single named graph from one branch of a ledger by transactionally
+retracting every triple currently asserted in it. History is preserved —
+queries `as-of` an earlier `t` still see the graph populated. The graph IRI
+remains registered so it can be re-populated by a later insert. Refuses the
+default graph and the system `txn-meta` / `config` graphs. Same admin auth
+bracket as `/create`, `/drop`, `/reindex`. See
+[Drop Named Graph Contract](#drop-named-graph-contract).
+
+### `fluree graph list` (read-only)
+
+- `GET {api_base_url}/info/*ledger`
+
+Lists the user-defined named graphs registered on the targeted branch by
+parsing the `named-graphs` section of the standard `/info` response. No
+new endpoint is required. The CLI hides the default graph and the system
+`txn-meta` / `config` graphs by default; `--include-system` surfaces them
+alongside user graphs. See [Graph List Contract](#graph-list-contract).
+
 ### `fluree branch rebase --remote <name>` (admin-protected)
 
 - `POST {api_base_url}/rebase` with `{ ledger, branch, strategy? }`
@@ -340,6 +362,84 @@ The route-level wiring (header merge, gate, force-override, audit log,
 PolicyContext construction) lives in
 `fluree-db-server/src/routes/policy_auth.rs` — useful as a concrete
 implementation reference if you're porting the contract to another server.
+
+## Tracking Contract
+
+CLI tracking flags (`--track`, `--track-fuel`, `--track-time`,
+`--track-policy`, `--max-fuel`) ride on every query request as HTTP headers.
+A server that implements this contract makes the same flags Just Work
+against the bundled Fluree server, a CLI-auto-routed local server, an
+explicit `--remote`, and any custom HTTP implementation.
+
+### Request headers
+
+| Header | CLI flag(s) | Type | Notes |
+|---|---|---|---|
+| `fluree-track-meta` | `--track` | `"true"` (presence-truthy) | Shorthand: enable fuel + time + policy. |
+| `fluree-track-fuel` | `--track-fuel` (also implied by `--max-fuel`) | `"true"` | Report total fuel consumed. |
+| `fluree-track-time` | `--track-time` | `"true"` | Report query execution time. |
+| `fluree-track-policy` | `--track-policy` | `"true"` | Report per-policy executed/allowed counts. |
+| `fluree-max-fuel` | `--max-fuel <N>` | decimal string | Abort with `400` (or equivalent) when fuel exceeds `N`. Implies fuel tracking. |
+
+The CLI only sends headers that map to enabled flags — a server should
+treat each header as independent. `fluree-track-meta` is a shorthand that
+the server may expand to all three; alternatively, when `--track` is set
+the CLI may collapse to the single `fluree-track-meta` header for cleaner
+wire format.
+
+For JSON-LD requests, equivalent body opts exist (`opts.meta`,
+`opts.max-fuel`); the CLI prefers headers so a single transport works
+across JSON-LD and SPARQL. Servers should accept either.
+
+### Required server behavior
+
+1. **Inspect the headers (and body opts) and build a tracker** before
+   executing the query. Tracker construction is per-request — never reuse
+   one across requests.
+
+2. **Enforce `fluree-max-fuel` strictly**: abort the query as soon as
+   accumulated fuel would exceed the limit and return an error response.
+   The reference server returns `400 Bad Request` with a body describing
+   the limit and the amount used.
+
+3. **Return a `TrackedQueryResponse`-shaped body** when any tracking
+   header is present:
+
+   ```json
+   {
+     "status": 200,
+     "result": <the normal query result body>,
+     "time": "12.34ms",
+     "fuel": 1234.567,
+     "policy": { "<policy-id>": { "executed": 3, "allowed": 2 } }
+   }
+   ```
+
+   Only include `time`, `fuel`, `policy` for metrics the client actually
+   requested. The `result` field carries whatever the untracked response
+   body would have been (SPARQL JSON, JSON-LD, agent-json, etc.). For
+   agent-json responses the server SHOULD return the bare agent-json
+   envelope as the response body and surface the tally only via the
+   response headers below, so agents see the same shape they always do.
+
+4. **Echo the tally on response headers** so callers that don't parse
+   the JSON body (e.g. delimited or binary formats) can still read them:
+
+   | Response header | Source | Format |
+   |---|---|---|
+   | `x-fdb-fuel` | tracker.fuel | decimal string |
+   | `x-fdb-time` | tracker.time | duration string, e.g. `"12.34ms"` |
+   | `x-fdb-policy` | tracker.policy | JSON object |
+
+### Reference behavior
+
+The reference server's per-route wiring lives in
+`fluree-db-server/src/routes/query.rs` (see the `has_tracking()` branch
+on the ledger-scoped and connection-scoped query handlers). The tracker
+implementation, micro-fuel internals (1 fuel = 1000 micro-fuel), and the
+`TrackedQueryResponse` / `PolicyStats` shapes are defined in
+`fluree-db-core/src/tracking.rs`. The full fuel cost ladder for queries
+and transactions is in `docs/query/tracking-and-fuel.md`.
 
 ## Merge Preview Contract
 
@@ -751,6 +851,162 @@ The CLI's `print_branch_dropped` reads `ledger_id`, `deferred`,
 | Request / response shapes | `DropBranchRequest`, `DropBranchResponse` (same file) |
 | Underlying API | `fluree_db_api::Fluree::drop_branch` (`fluree-db-api/src/admin.rs`) |
 | Report struct | `fluree_db_api::BranchDropReport` |
+
+## Graph List Contract
+
+`fluree graph list --ledger <ledger> [--remote <name>] [--include-system] [--json]` does **not** call a dedicated endpoint. It reuses:
+
+```
+GET {api_base_url}/info/*ledger
+```
+
+and parses the `named-graphs` array out of the response. Servers that already implement the [`/info` Response Contract](#info-response-contract-cli-minimum) below are compatible with `fluree graph list` as long as they populate that array.
+
+### Auth
+
+Read-only. Same auth bracket as `GET /info/*ledger`.
+
+### Required response field
+
+The CLI requires `info.ledger.named-graphs` (or top-level `named-graphs` for older response shapes) to be a JSON array. Each entry must be a JSON object with at least:
+
+| Field | Type | Notes |
+|-------|------|-------|
+| `iri` | string | Full IRI of the named graph. Use `"urn:default"` for the default graph slot (`g-id = 0`) so the CLI can recognize it and filter it under `--include-system`. |
+| `g-id` | integer | Stable graph identifier in the registry. `0` = default, `1` = `urn:fluree:{ledger_id}#txn-meta`, `2` = `urn:fluree:{ledger_id}#config`, `>= 3` = user-defined graphs. |
+| `flakes` | integer | Number of currently-asserted flakes in this graph at the response's `t`. May be `0`. |
+| `size` | integer | On-disk size in bytes attributed to this graph in the binary index. May be `0`. |
+
+Additional fields are allowed and ignored by the CLI. Returning a stable order is recommended for paginated UIs but not required by the CLI.
+
+### CLI filtering
+
+The CLI's table and `--json` output both apply the same filter:
+
+- By default, entries with `g-id ∈ {0, 1, 2}` or `iri == "urn:default"` or `iri` equal to the ledger's `txn-meta` / `config` IRI are **omitted**.
+- `--include-system` shows all four kinds (default, `txn-meta`, `config`, user).
+
+The table view computes a `Kind` column from `g-id` plus the well-known IRI helpers in `fluree_db_core::graph_registry`.
+
+### Error responses
+
+| Status | When |
+|--------|------|
+| `401` | Bearer required and absent/invalid (same as `/info`). |
+| `404` | Ledger does not exist. |
+| `5xx` | Storage / nameservice errors. |
+
+A response that omits `named-graphs` is treated by the CLI as an outdated server; it prints a clear "info response is missing `named-graphs`" usage error rather than silently showing an empty list.
+
+### Reference implementation
+
+| Concern | Canonical location |
+|---------|-------------------|
+| HTTP route | `fluree-db-server/src/routes/ledger.rs::info_ledger_tail` |
+| Payload assembly | `fluree-db-api/src/ledger_info.rs::build_ledger_info` (populates `named-graphs`) |
+| CLI dispatcher | `fluree-db-cli/src/commands/graph.rs::run_list` |
+| System-graph constants | `fluree_db_core::graph_registry::{DEFAULT_GRAPH_ID, TXN_META_GRAPH_ID, CONFIG_GRAPH_ID, txn_meta_graph_iri, config_graph_iri}` |
+
+## Drop Named Graph Contract
+
+`fluree graph drop <graph-iri> --ledger <ledger> --remote <name>` issues:
+
+```
+POST {api_base_url}/drop-graph
+Content-Type: application/json
+
+{
+  "ledger": "mydb:main",
+  "graph": "urn:example:org/payroll"
+}
+```
+
+Note the endpoint is `/drop-graph` (hyphenated) — separate from the
+ledger-level `POST /drop` and branch-level `POST /drop-branch` endpoints.
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| `ledger` | string | Yes | Full ledger identifier. A bare ledger name (`"mydb"`) is normalized to `"mydb:main"`. To target a branch other than the root, use the explicit `"mydb:feature-x"` form. |
+| `graph` | string | Yes | Full **absolute** IRI of the named graph to drop. Must have a valid `<scheme>:<rest>` head per RFC 3986 §3.1 and contain none of the characters RFC 3987 excludes from an IRI (whitespace, `<`, `>`, `"`, `{`, `}`, <code>&#124;</code>, `\`, `^`, `` ` ``). Relative references (e.g. `payroll`) and leading/trailing whitespace are rejected — not trimmed. |
+
+### Auth
+
+Admin-protected (same bracket as `/create`, `/drop`, `/drop-branch`,
+`/branch`, `/rebase`, `/merge`, `/reindex`).
+
+### Behavior
+
+The reference server's `Fluree::drop_named_graph`:
+
+1. **Normalizes** the ledger id (`:main` default).
+2. **Validates** the graph IRI as an absolute IRI (`<scheme>:<rest>` with
+   no whitespace or RFC 3987-excluded characters), then rejects the system
+   graphs:
+   - the default graph (empty / `g_id == 0`),
+   - the `txn-meta` graph (`urn:fluree:{ledger_id}#txn-meta`, `g_id == 1`),
+   - the `config` graph (`urn:fluree:{ledger_id}#config`, `g_id == 2`).
+3. **Resolves** `graph` against the snapshot's `GraphRegistry`. An unknown
+   IRI returns `404` rather than silently registering a new graph slot.
+4. **Stages and commits** a SPARQL UPDATE equivalent to
+   `DELETE { GRAPH <iri> { ?s ?p ?o } } WHERE { GRAPH <iri> { ?s ?p ?o } }`
+   through the same pipeline used by user updates. This produces one new
+   commit at `t = current_t + 1` whose flakes are retractions only.
+5. **Reports a no-op** (`committed: false`, `retracted: 0`) when the graph
+   was already empty — no new commit is created.
+
+Key properties:
+
+- **History preserving.** A query `as-of` an earlier `t` still sees every
+  triple that was previously asserted in the graph.
+- **Per-branch scope.** Drops only affect the branch in `ledger`. Sibling
+  branches that share the same graph IRI are not touched.
+- **Registry stable.** The graph IRI keeps its `g_id`; a subsequent
+  insert into the same IRI lands in the same logical graph rather than a
+  new slot.
+
+### Response (`200 OK`)
+
+```jsonc
+{
+  "ledger_id": "mydb:main",
+  "graph_iri": "urn:example:org/payroll",
+  "retracted": 42,
+  "committed": true,
+  "t": 18
+}
+```
+
+| Field | Type | Notes |
+|-------|------|-------|
+| `ledger_id` | string | Normalized `ledger:branch` identifier the drop targeted. |
+| `graph_iri` | string | Graph IRI that was dropped (echoed). |
+| `retracted` | integer | Number of flakes retracted by the drop commit. `0` when the graph was already empty. |
+| `committed` | bool | `true` when a new commit was produced; `false` for a no-op drop on an empty graph. |
+| `t` | integer | Current commit `t` for the branch after the drop. Equal to the pre-drop `t` when `committed` is `false`. |
+
+The CLI's `fluree graph drop` printer (`commands/graph.rs`) reads
+`ledger_id`, `graph_iri`, `retracted`, `committed`, and `t` — populate
+them all.
+
+### Error responses
+
+| Status | When |
+|--------|------|
+| `400` | `graph` is empty, has whitespace or any IRI-excluded character, lacks a `<scheme>:<rest>` head (relative reference), or names a system graph (default, `txn-meta`, `config`); malformed JSON body. |
+| `401` / `403` | Admin token required and absent/invalid. |
+| `404` | Ledger does not exist; or `graph` is not registered in the ledger's graph registry. |
+| `5xx` | Storage / nameservice / commit-write errors during the retract commit. |
+
+### Reference implementation
+
+| Concern | Canonical location |
+|---------|-------------------|
+| HTTP route + auth | `fluree-db-server/src/routes/ledger.rs::drop_named_graph` |
+| Request / response shapes | `DropNamedGraphRequest`, `DropNamedGraphResponse` (same file) |
+| Underlying API | `fluree_db_api::Fluree::drop_named_graph` (`fluree-db-api/src/admin.rs`) |
+| Absolute-IRI validator | `validate_absolute_iri` (same file) |
+| Report struct | `fluree_db_api::DropNamedGraphReport` |
+| Graph registry | `fluree_db_core::graph_registry` (system graph constants and IRI helpers) |
 
 ## Rebase Contract
 
@@ -1210,6 +1466,7 @@ The CLI currently treats `GET {api_base_url}/info/*ledger` as an opaque JSON obj
 
 - `t` (integer): required for `fluree clone` and `fluree pull` preflight and for `fluree push` conflict checks.
 - `commitId` (string CID): required for `fluree push` when `t > 0` so it can detect divergence.
+- `ledger.named-graphs` (array): required for `fluree graph list`. See the [Graph List Contract](#graph-list-contract) for the per-entry schema (`iri`, `g-id`, `flakes`, `size`). A top-level `named-graphs` array is also accepted for older response shapes; new implementations should nest it under `ledger`.
 
 Other fields are optional and may be used only for display.
 

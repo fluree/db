@@ -158,6 +158,107 @@ pub(crate) fn convert_string_literal(
     (fv, dt_sid)
 }
 
+/// Parse a typed XSD-style lexical form into the matching
+/// `FlakeValue` variant, *without* touching the namespace
+/// allocator. Used by surfaces that already hold a resolved
+/// datatype Sid (e.g., the cross-ledger SHACL translator) and
+/// need same-ledger-parity parsing for SHACL `sh:hasValue` /
+/// range comparisons.
+///
+/// Return values:
+/// - `Ok(Some(fv))` — recognized XSD (or `rdf:JSON`) datatype
+///   parsed successfully.
+/// - `Err(msg)` — recognized datatype whose lexical form is
+///   invalid (e.g., `"abc"^^xsd:integer`). Callers should
+///   surface this as a hard error rather than silently
+///   coerce to `FlakeValue::String`.
+/// - `Ok(None)` — datatype IRI is not in the XSD / RDF /
+///   Fluree-recognized set. Callers store the value as
+///   `FlakeValue::String` and preserve the declared datatype
+///   Sid; the application is responsible for interpreting
+///   non-recognized datatypes.
+///
+/// `rdf:langString` is intentionally NOT handled here — the
+/// language tag rides on `FlakeMeta`, not on the FlakeValue,
+/// so the caller has to construct the meta separately and the
+/// value is just a plain string.
+pub fn parse_xsd_lexical(value: &str, dt_iri: &str) -> Result<Option<FlakeValue>, String> {
+    Ok(Some(match dt_iri {
+        xsd::STRING | xsd::NORMALIZED_STRING | xsd::TOKEN | xsd::LANGUAGE | xsd::ANY_URI => {
+            FlakeValue::String(value.to_string())
+        }
+        xsd::INTEGER
+        | xsd::LONG
+        | xsd::INT
+        | xsd::SHORT
+        | xsd::BYTE
+        | xsd::UNSIGNED_LONG
+        | xsd::UNSIGNED_INT
+        | xsd::UNSIGNED_SHORT
+        | xsd::UNSIGNED_BYTE
+        | xsd::NON_NEGATIVE_INTEGER
+        | xsd::POSITIVE_INTEGER
+        | xsd::NON_POSITIVE_INTEGER
+        | xsd::NEGATIVE_INTEGER => match parse_integer(value) {
+            FlakeValue::String(_) => {
+                return Err(format!("invalid {dt_iri} lexical `{value}`"));
+            }
+            other => other,
+        },
+        xsd::DOUBLE | xsd::FLOAT => value
+            .parse::<f64>()
+            .map(FlakeValue::Double)
+            .map_err(|e| format!("invalid {dt_iri} lexical `{value}`: {e}"))?,
+        xsd::DECIMAL => value
+            .parse::<bigdecimal::BigDecimal>()
+            .map(|d| FlakeValue::Decimal(Box::new(d)))
+            .map_err(|e| format!("invalid xsd:decimal lexical `{value}`: {e}"))?,
+        xsd::BOOLEAN => match value {
+            "true" | "1" => FlakeValue::Boolean(true),
+            "false" | "0" => FlakeValue::Boolean(false),
+            _ => return Err(format!("invalid xsd:boolean lexical `{value}`")),
+        },
+        xsd::DATE_TIME => DateTime::parse(value)
+            .map(|dt| FlakeValue::DateTime(Box::new(dt)))
+            .map_err(|e| format!("invalid xsd:dateTime lexical `{value}`: {e}"))?,
+        xsd::DATE => Date::parse(value)
+            .map(|d| FlakeValue::Date(Box::new(d)))
+            .map_err(|e| format!("invalid xsd:date lexical `{value}`: {e}"))?,
+        xsd::TIME => Time::parse(value)
+            .map(|t| FlakeValue::Time(Box::new(t)))
+            .map_err(|e| format!("invalid xsd:time lexical `{value}`: {e}"))?,
+        xsd::G_YEAR => GYear::parse(value)
+            .map(|v| FlakeValue::GYear(Box::new(v)))
+            .map_err(|e| format!("invalid xsd:gYear lexical `{value}`: {e}"))?,
+        xsd::G_YEAR_MONTH => GYearMonth::parse(value)
+            .map(|v| FlakeValue::GYearMonth(Box::new(v)))
+            .map_err(|e| format!("invalid xsd:gYearMonth lexical `{value}`: {e}"))?,
+        xsd::G_MONTH => GMonth::parse(value)
+            .map(|v| FlakeValue::GMonth(Box::new(v)))
+            .map_err(|e| format!("invalid xsd:gMonth lexical `{value}`: {e}"))?,
+        xsd::G_DAY => GDay::parse(value)
+            .map(|v| FlakeValue::GDay(Box::new(v)))
+            .map_err(|e| format!("invalid xsd:gDay lexical `{value}`: {e}"))?,
+        xsd::G_MONTH_DAY => GMonthDay::parse(value)
+            .map(|v| FlakeValue::GMonthDay(Box::new(v)))
+            .map_err(|e| format!("invalid xsd:gMonthDay lexical `{value}`: {e}"))?,
+        xsd::DURATION => Duration::parse(value)
+            .map(|v| FlakeValue::Duration(Box::new(v)))
+            .map_err(|e| format!("invalid xsd:duration lexical `{value}`: {e}"))?,
+        xsd::DAY_TIME_DURATION => DayTimeDuration::parse(value)
+            .map(|v| FlakeValue::DayTimeDuration(Box::new(v)))
+            .map_err(|e| format!("invalid xsd:dayTimeDuration lexical `{value}`: {e}"))?,
+        xsd::YEAR_MONTH_DURATION => YearMonthDuration::parse(value)
+            .map(|v| FlakeValue::YearMonthDuration(Box::new(v)))
+            .map_err(|e| format!("invalid xsd:yearMonthDuration lexical `{value}`: {e}"))?,
+        rdf::JSON => FlakeValue::Json(value.to_string()),
+        // Non-XSD / non-Fluree-recognized datatype. Caller treats
+        // the value as a plain string under the (already-registered)
+        // application datatype Sid.
+        _ => return Ok(None),
+    }))
+}
+
 /// Parse an integer string into FlakeValue::Long or FlakeValue::BigInt.
 pub(crate) fn parse_integer(value: &str) -> FlakeValue {
     if let Ok(n) = value.parse::<i64>() {

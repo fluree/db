@@ -1452,6 +1452,78 @@ async fn execute_transaction(
         let did = effective_did(&prepared_transaction.governance, author);
         let commit_opts = build_commit_opts(did, credential, &state.fluree, &handle);
 
+        // Pick up `opts.shapes` and `opts.uniqueProperties` from the body
+        // so inline SHACL shapes and unique-property constraints reach the
+        // staging path. Other `TxnOpts` fields are not yet surfaced over
+        // HTTP (branch/context/etc. come from headers or query params);
+        // add them here if a use case lands.
+        let mut txn_opts = TxnOpts::default();
+        if let Some(shapes) = prepared_transaction
+            .body
+            .get("opts")
+            .and_then(|o| o.get("shapes"))
+        {
+            // Validate at the boundary: `shapes` must be a JSON-LD
+            // document (object) or an array of JSON-LD documents.
+            // Letting scalars / nulls fall through to
+            // `fluree_graph_json_ld::expand` surfaces as a fuzzy
+            // internal parse error rather than the precise 400
+            // the caller deserves.
+            match shapes {
+                JsonValue::Object(_) => {}
+                JsonValue::Array(arr) => {
+                    for (idx, item) in arr.iter().enumerate() {
+                        if !item.is_object() {
+                            set_span_error_code(&span, "error:BadRequest");
+                            return Err(ServerError::bad_request(format!(
+                                "opts.shapes[{idx}] must be a JSON-LD object; got {item}"
+                            )));
+                        }
+                    }
+                }
+                _ => {
+                    set_span_error_code(&span, "error:BadRequest");
+                    return Err(ServerError::bad_request(
+                        "opts.shapes must be a JSON-LD object or array of objects",
+                    ));
+                }
+            }
+            txn_opts.shapes = Some(shapes.clone());
+        }
+        if let Some(unique_props_raw) = prepared_transaction
+            .body
+            .get("opts")
+            .and_then(|o| o.get("uniqueProperties"))
+        {
+            // Must be a JSON array. A scalar (or null) is a type
+            // error, not "empty list".
+            let Some(arr) = unique_props_raw.as_array() else {
+                set_span_error_code(&span, "error:BadRequest");
+                return Err(ServerError::bad_request(
+                    "opts.uniqueProperties must be an array of property IRI strings",
+                ));
+            };
+            // Every element must be a string. `filter_map` would
+            // silently drop integers/bools/etc. — that's the silent-
+            // weakening pattern we deliberately don't want here.
+            let mut iris: Vec<String> = Vec::with_capacity(arr.len());
+            for (idx, v) in arr.iter().enumerate() {
+                let Some(s) = v.as_str() else {
+                    set_span_error_code(&span, "error:BadRequest");
+                    return Err(ServerError::bad_request(format!(
+                        "opts.uniqueProperties[{idx}] must be a string IRI; got {v}"
+                    )));
+                };
+                iris.push(s.to_string());
+            }
+            // Empty array is intentionally treated as "no inline
+            // constraints" rather than an error — operators may build
+            // the array dynamically and end up with zero entries.
+            if !iris.is_empty() {
+                txn_opts.unique_properties = Some(iris);
+            }
+        }
+
         // Every JSON-LD transaction goes through consensus. Policy context,
         // tracking, and execution are all handled by the submission layer;
         // policy is built there from the ledger state the transaction
@@ -1465,7 +1537,7 @@ async fn execute_transaction(
             idempotency_key,
             ledger_id: ledger_id.to_string(),
             body,
-            txn_opts: TxnOpts::default(),
+            txn_opts,
             commit_opts,
             tracking: prepared_transaction.tracking,
             governance: prepared_transaction.governance,

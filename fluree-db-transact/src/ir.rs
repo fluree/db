@@ -460,6 +460,49 @@ pub struct TxnOpts {
     /// the transaction JSON, defaulting to `true`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub strict_compact_iri: Option<bool>,
+
+    /// Inline SHACL shape definitions for *this transaction only*.
+    ///
+    /// JSON-LD document carrying SHACL shapes (sh:NodeShape /
+    /// sh:targetClass / sh:property / ...). When set, the shapes are
+    /// parsed at SHACL validation time against the staged namespace
+    /// registry and added to the engine's shape source list — they
+    /// enforce additively alongside any same-ledger or cross-ledger
+    /// shapes configured via `f:shapesSource`. The shapes themselves
+    /// are not staged into the data ledger; they exist only for this
+    /// transaction's validation pass.
+    ///
+    /// Use cases: ad-hoc shape testing before committing to `#config`,
+    /// per-tenant validation layers, application-level shape governance
+    /// that should not live in the ledger's permanent state.
+    ///
+    /// Trade-off vs same-ledger shapes: inline shapes leave no audit
+    /// trail in the ledger ("which shapes validated which commit?"
+    /// can't be reconstructed from history). If auditability matters,
+    /// prefer `f:shapesSource`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub shapes: Option<serde_json::Value>,
+
+    /// Inline `f:enforceUnique` declarations for *this transaction only*.
+    ///
+    /// Each entry is a property IRI (full IRI; not compact prefix
+    /// form) that the uniqueness enforcer should treat as
+    /// `f:enforceUnique true` for the duration of this transaction.
+    /// IRIs the data ledger's namespace map has never seen are
+    /// dropped silently — no instance of the property exists on D,
+    /// so no constraint can be violated. The list is unioned with
+    /// whatever `f:constraintsSource` resolves to (same-ledger or
+    /// cross-ledger) and never replaces it.
+    ///
+    /// Inline constraints do not persist into the ledger. The next
+    /// transaction without `opts.uniqueProperties` runs without
+    /// them (same trade-off as `opts.shapes`).
+    ///
+    /// Use cases: enforce a constraint for an ad-hoc bulk-load
+    /// without committing the annotation to `#config`; per-tenant
+    /// uniqueness layered on top of operator-set baselines.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub unique_properties: Option<Vec<String>>,
 }
 
 impl TxnOpts {

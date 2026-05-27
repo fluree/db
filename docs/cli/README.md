@@ -54,6 +54,7 @@ fluree query 'SELECT ?name WHERE { ?s <http://example.org/name> ?name }'
 | [`list`](list.md) | List all ledgers |
 | [`info`](info.md) | Show detailed information about a ledger |
 | [`drop`](drop.md) | Drop (delete) a ledger |
+| [`graph`](graph.md) | Manage named graphs within a ledger (list, drop) |
 | [`insert`](insert.md) | Insert data into a ledger |
 | [`upsert`](upsert.md) | Upsert data (insert or update existing) |
 | [`update`](update.md) | Update with WHERE/DELETE/INSERT patterns |

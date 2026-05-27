@@ -44,6 +44,7 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .route("/reindex", post(ledger::reindex))
         .route("/branch", post(ledger::create_branch))
         .route("/drop-branch", post(ledger::drop_branch))
+        .route("/drop-graph", post(ledger::drop_named_graph))
         .route("/rebase", post(ledger::rebase))
         .route("/merge", post(ledger::merge))
         .route("/revert", post(ledger::revert))

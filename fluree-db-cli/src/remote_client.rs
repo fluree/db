@@ -793,6 +793,89 @@ impl RemoteLedgerClient {
         .await
     }
 
+    // -------------------------------------------------------------------------
+    // Tracked variants
+    //
+    // These mirror the four query methods above but attach arbitrary extra
+    // request headers (typically `fluree-track-*` / `fluree-max-fuel`). When
+    // tracking headers are present the server returns a `TrackedQueryResponse`
+    // JSON envelope `{ status, result, time, fuel, policy }`; the caller is
+    // responsible for extracting `result` for display and the sibling fields
+    // for the tally.
+    // -------------------------------------------------------------------------
+
+    /// JSON-LD ledger-scoped query with extra request headers.
+    pub async fn query_jsonld_with_headers(
+        &self,
+        ledger: &str,
+        body: &serde_json::Value,
+        extra_headers: &[(&'static str, String)],
+    ) -> Result<serde_json::Value, RemoteLedgerError> {
+        let url = Self::with_default_context_param(self.op_url("query", ledger));
+        self.send_json_with_headers(
+            reqwest::Method::POST,
+            &url,
+            "application/json",
+            extra_headers,
+            Some(RequestBody::Json(body)),
+        )
+        .await
+    }
+
+    /// SPARQL ledger-scoped query with extra request headers.
+    pub async fn query_sparql_with_headers(
+        &self,
+        ledger: &str,
+        sparql: &str,
+        extra_headers: &[(&'static str, String)],
+    ) -> Result<serde_json::Value, RemoteLedgerError> {
+        let url = Self::with_default_context_param(self.op_url("query", ledger));
+        self.send_json_with_headers(
+            reqwest::Method::POST,
+            &url,
+            "application/sparql-query",
+            extra_headers,
+            Some(RequestBody::Text(sparql)),
+        )
+        .await
+    }
+
+    /// JSON-LD connection-scoped query (ledger in body `from`) with extra
+    /// request headers.
+    pub async fn query_connection_jsonld_with_headers(
+        &self,
+        body: &serde_json::Value,
+        extra_headers: &[(&'static str, String)],
+    ) -> Result<serde_json::Value, RemoteLedgerError> {
+        let url = Self::with_default_context_param(self.op_url_root("query"));
+        self.send_json_with_headers(
+            reqwest::Method::POST,
+            &url,
+            "application/json",
+            extra_headers,
+            Some(RequestBody::Json(body)),
+        )
+        .await
+    }
+
+    /// SPARQL connection-scoped query (ledger in `FROM` clause) with extra
+    /// request headers.
+    pub async fn query_connection_sparql_with_headers(
+        &self,
+        sparql: &str,
+        extra_headers: &[(&'static str, String)],
+    ) -> Result<serde_json::Value, RemoteLedgerError> {
+        let url = self.op_url_root("query");
+        self.send_json_with_headers(
+            reqwest::Method::POST,
+            &url,
+            "application/sparql-query",
+            extra_headers,
+            Some(RequestBody::Text(sparql)),
+        )
+        .await
+    }
+
     // =========================================================================
     // Explain
     // =========================================================================
@@ -1299,6 +1382,30 @@ impl RemoteLedgerClient {
         let body = serde_json::json!({
             "ledger": ledger,
             "branch": branch,
+        });
+        self.send_json(
+            reqwest::Method::POST,
+            &url,
+            "application/json",
+            Some(RequestBody::Json(&body)),
+        )
+        .await
+    }
+
+    /// Drop a named graph from a branch on the remote server.
+    ///
+    /// Calls `POST {base_url}/drop-graph` with a JSON body. `ledger` is a
+    /// full ledger identifier (e.g. `"mydb:main"`); `graph` is the full
+    /// IRI of the named graph to drop.
+    pub async fn drop_named_graph(
+        &self,
+        ledger: &str,
+        graph: &str,
+    ) -> Result<serde_json::Value, RemoteLedgerError> {
+        let url = self.op_url_root("drop-graph");
+        let body = serde_json::json!({
+            "ledger": ledger,
+            "graph": graph,
         });
         self.send_json(
             reqwest::Method::POST,
