@@ -101,14 +101,14 @@ struct CachedSubmission {
 /// Idempotency is tracked in an in-memory TTL cache. The cache is not
 /// persisted across restarts; that is acceptable here because a process
 /// restart loses any in-flight submissions anyway.
-pub struct MonolithicConsensus {
+pub struct MonolithicCommitter {
     fluree: Arc<Fluree>,
     index_config: IndexConfig,
     cache: Cache<SubmissionCacheKey, CachedSubmission>,
     admission: Arc<Semaphore>,
 }
 
-impl MonolithicConsensus {
+impl MonolithicCommitter {
     /// Construct with the default 1-hour idempotency TTL.
     pub fn new(fluree: Arc<Fluree>, index_config: IndexConfig) -> Self {
         Self::with_ttl(fluree, index_config, DEFAULT_IDEMPOTENCY_TTL)
@@ -562,7 +562,7 @@ fn hash_commit_ref(hasher: &mut Sha256, commit: &CommitRef) {
 }
 
 #[async_trait]
-impl Committer for MonolithicConsensus {
+impl Committer for MonolithicCommitter {
     async fn transact(
         &self,
         request: TransactionRequest,
@@ -704,7 +704,7 @@ impl Committer for MonolithicConsensus {
 }
 
 #[async_trait]
-impl SubmissionLookup for MonolithicConsensus {
+impl SubmissionLookup for MonolithicCommitter {
     async fn status(&self, ledger_id: &str, key: &IdempotencyKey) -> SubmissionState {
         let cache_key = (ledger_id.to_string(), key.clone());
         match self.cache.get(&cache_key).await {
@@ -721,11 +721,11 @@ mod tests {
     use fluree_db_transact::{CommitOpts, TxnOpts};
     use serde_json::{json, Value as JsonValue};
 
-    /// Build a Fluree + `MonolithicConsensus` + initialized ledger.
+    /// Build a Fluree + `MonolithicCommitter` + initialized ledger.
     ///
     /// Each test gets its own in-memory Fluree, so tests don't share state
     /// and the same `ledger_id` is safe to reuse across tests.
-    async fn setup() -> (Arc<fluree_db_api::Fluree>, MonolithicConsensus, String) {
+    async fn setup() -> (Arc<fluree_db_api::Fluree>, MonolithicCommitter, String) {
         let fluree = Arc::new(FlureeBuilder::memory().build_memory());
         let ledger_id = "test/consensus:main".to_string();
         fluree
@@ -736,7 +736,7 @@ mod tests {
             reindex_min_bytes: 1024 * 1024,
             reindex_max_bytes: 1024 * 1024 * 100,
         };
-        let consensus = MonolithicConsensus::new(Arc::clone(&fluree), index_config);
+        let consensus = MonolithicCommitter::new(Arc::clone(&fluree), index_config);
         (fluree, consensus, ledger_id)
     }
 
@@ -1092,7 +1092,7 @@ ex:alice ex:name "Alice" ."#;
     /// commit's ID — the first call seeds the genesis commit (which cannot
     /// be reverted) and the second produces the revertable commit every
     /// revert test needs.
-    async fn seed_commit(consensus: &MonolithicConsensus, ledger_id: &str, name: &str) -> CommitId {
+    async fn seed_commit(consensus: &MonolithicCommitter, ledger_id: &str, name: &str) -> CommitId {
         consensus
             .transact(request(ledger_id, None, sample_insert("__genesis__")))
             .await
@@ -1211,7 +1211,7 @@ ex:alice ex:name "Alice" ."#;
     /// Build a Fluree + consensus + a parent branch with one commit + a child
     /// `feature` branch with one additional commit — the minimum setup a
     /// merge test needs.
-    async fn setup_with_feature_branch() -> (Arc<fluree_db_api::Fluree>, MonolithicConsensus) {
+    async fn setup_with_feature_branch() -> (Arc<fluree_db_api::Fluree>, MonolithicCommitter) {
         let (fluree, consensus, parent_id) = setup().await;
         // Genesis commit on `main` so the branch has a head to fork from.
         consensus

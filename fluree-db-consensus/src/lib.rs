@@ -4,7 +4,7 @@
 //! and accepted into a ledger. Each implementation has its own trust model
 //! and durability mechanism:
 //!
-//! - [`MonolithicConsensus`] — a single integrated unit handles every
+//! - [`MonolithicCommitter`] — a single integrated unit handles every
 //!   transaction; the local execution stream is the agreement. Used for
 //!   development, testing, and deployments that do not need cross-node
 //!   coordination.
@@ -20,7 +20,7 @@
 
 pub mod monolithic;
 
-pub use monolithic::{MonolithicConsensus, DEFAULT_IDEMPOTENCY_TTL};
+pub use monolithic::{MonolithicCommitter, DEFAULT_IDEMPOTENCY_TTL};
 
 use async_trait::async_trait;
 use fluree_db_api::{
