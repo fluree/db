@@ -20,7 +20,7 @@ use crate::peer::{ForwardingClient, PeerState, ProxyNameService, ProxyStorage};
 use crate::registry::LedgerRegistry;
 use crate::telemetry::TelemetryConfig;
 use fluree_db_api::{Fluree, FlureeBuilder, IndexConfig, NameServiceMode};
-use fluree_db_consensus::MonolithicCommitter;
+use fluree_db_consensus::CachingCommitter;
 use std::path::PathBuf;
 use std::sync::atomic::AtomicU64;
 use std::sync::Arc;
@@ -45,10 +45,10 @@ pub struct AppState {
     /// Optional index configuration
     pub index_config: Option<IndexConfig>,
 
-    /// Transaction submission interface (monolithic consensus over the local
-    /// transactor). Always present; only meaningful when this node accepts
-    /// writes (peer-mode nodes forward writes elsewhere).
-    pub consensus: Arc<MonolithicCommitter>,
+    /// Transaction submission interface. Always present; only meaningful
+    /// when this node accepts writes (peer-mode nodes forward writes
+    /// elsewhere).
+    pub consensus: Arc<CachingCommitter>,
 
     /// Ledger registry for tracking loaded ledgers and their watermarks
     pub registry: Arc<LedgerRegistry>,
@@ -176,7 +176,7 @@ impl AppState {
                 .unwrap_or_else(fluree_db_api::server_defaults::default_reindex_max_bytes),
         };
 
-        let consensus = Arc::new(MonolithicCommitter::new(
+        let consensus = Arc::new(CachingCommitter::new(
             Arc::clone(&fluree),
             index_config.clone(),
         ));

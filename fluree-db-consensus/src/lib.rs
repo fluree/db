@@ -4,13 +4,17 @@
 //! and accepted into a ledger. Each implementation has its own trust model
 //! and durability mechanism:
 //!
-//! - [`MonolithicCommitter`] — a single integrated unit handles every
-//!   transaction; the local execution stream is the agreement. Used for
-//!   development, testing, and deployments that do not need cross-node
-//!   coordination.
+//! - [`LocalCommitter`] — runs the parse → stage → policy → commit
+//!   pipeline against a local [`Fluree`](fluree_db_api::Fluree) instance.
+//!   The base over which other committers compose.
+//! - [`CachingCommitter`] — wraps an inner committer with an
+//!   in-memory idempotency cache (TTL-bounded retry collapse + status
+//!   lookup via [`SubmissionLookup`]) and an admission-control
+//!   semaphore that bounds in-flight submissions.
 //!
-//! Future implementations (Raft for crash-fault tolerance, BFT for byzantine
-//! tolerance) will live alongside, behind the same [`Committer`] trait.
+//! Future implementations (Raft for crash-fault tolerance, BFT for
+//! byzantine tolerance) will live alongside, behind the same
+//! [`Committer`] trait, and compose the same way.
 //!
 //! Submission identity and status lookup are driven by optional
 //! [`IdempotencyKey`]s. Callers who want idempotent retry or after-the-fact
@@ -18,9 +22,11 @@
 //! [`TransactionRequest`]; submissions sharing a key collapse to a single
 //! outcome. Callers who don't need those guarantees may omit the key.
 
+pub mod caching;
 pub mod local;
 pub mod monolithic;
 
+pub use caching::{CachingCommitter, DEFAULT_IDEMPOTENCY_TTL};
 pub use local::LocalCommitter;
 pub use monolithic::{MonolithicCommitter, DEFAULT_IDEMPOTENCY_TTL};
 
@@ -116,7 +122,7 @@ impl TransactionBody {
 ///
 /// Carries the transaction itself plus everything an implementation needs to
 /// process it. Implementation-specific knobs (e.g., Raft propose timeout,
-/// monolithic backpressure overrides) live on the implementation, not here.
+/// per-committer admission overrides) live on the implementation, not here.
 ///
 /// `idempotency_key` is optional: callers who want idempotent retry or
 /// after-the-fact status lookup provide one; callers who don't care can
@@ -321,13 +327,12 @@ pub enum SubmissionError {
 
 /// Submit operations for processing.
 ///
-/// Each method represents an operation kind — transactions, reverts, and
-/// (later) merges and rebases — that requires durable acceptance through
-/// the same consensus path. Implementations choose how acceptance is
-/// achieved (local execution for monolithic, leader replication for Raft,
-/// quorum voting for BFT) but the caller's contract is identical per
-/// method: pass a request, await the future, get the per-op receipt when
-/// durably accepted.
+/// Each method represents an operation kind — transactions, reverts,
+/// merges, rebases, pushes — that requires durable acceptance.
+/// Implementations choose how acceptance is achieved (direct local
+/// execution, leader replication for Raft, quorum voting for BFT) but
+/// the caller's contract is identical per method: pass a request, await
+/// the future, get the per-op receipt when durably accepted.
 ///
 /// "Durably accepted" means the operation is persisted and visible to
 /// subsequent reads on this same consensus instance. Cross-instance read

@@ -1,9 +1,18 @@
-//! Monolithic consensus implementation.
+//! In-memory idempotency layer around an inner [`Committer`].
 //!
-//! A single integrated unit handles receiving, ordering, and executing every
-//! transaction. No replication, no quorum — the local execution stream *is*
-//! the agreement. Suitable for development, testing, and deployments that
-//! do not need cross-node coordination.
+//! Wraps another committer with two pieces of bookkeeping:
+//!
+//! - A TTL-bounded cache keyed by `(ledger_id, idempotency_key)` so
+//!   retries with the same key collapse onto a single execution and so
+//!   [`SubmissionLookup::status`] can recover the outcome after a lost
+//!   response. Anonymous submissions skip the cache entirely.
+//! - An admission semaphore that caps in-flight submissions and refuses
+//!   new work with [`SubmissionError::Overloaded`] once the cap is
+//!   reached — the bound is what keeps the per-submission body memory
+//!   from growing without limit under sustained load.
+//!
+//! Execution itself is delegated to the inner committer; this layer
+//! adds no operation-pipeline work of its own.
 
 use crate::{
     Committer, IdempotencyKey, LocalCommitter, MergeReceipt, MergeRequest, OperationReceipt,
@@ -50,23 +59,18 @@ struct CachedSubmission {
     body_hash: [u8; 32],
 }
 
-/// Monolithic consensus over the local Fluree transaction infrastructure.
+/// Idempotency cache + admission control around an inner [`Committer`].
 ///
-/// Resolves the target ledger via the [`LedgerManager`] on the supplied
-/// [`Fluree`] instance, takes the write lock, runs stage + commit through
-/// the existing transactor, and replaces the cached ledger state with the
-/// post-commit state.
-///
-/// Idempotency is tracked in an in-memory TTL cache. The cache is not
-/// persisted across restarts; that is acceptable here because a process
-/// restart loses any in-flight submissions anyway.
-pub struct MonolithicCommitter<C: Committer = LocalCommitter> {
+/// The cache is in-memory and not persisted across restarts; that is
+/// acceptable because a process restart loses any in-flight submissions
+/// anyway.
+pub struct CachingCommitter<C: Committer = LocalCommitter> {
     executor: C,
     cache: Cache<SubmissionCacheKey, CachedSubmission>,
     admission: Arc<Semaphore>,
 }
 
-impl MonolithicCommitter<LocalCommitter> {
+impl CachingCommitter<LocalCommitter> {
     /// Construct with the default 1-hour idempotency TTL.
     pub fn new(fluree: Arc<Fluree>, index_config: IndexConfig) -> Self {
         Self::with_ttl(fluree, index_config, DEFAULT_IDEMPOTENCY_TTL)
@@ -78,7 +82,7 @@ impl MonolithicCommitter<LocalCommitter> {
     }
 }
 
-impl<C: Committer> MonolithicCommitter<C> {
+impl<C: Committer> CachingCommitter<C> {
     /// Wrap an arbitrary inner [`Committer`] with this committer's
     /// admission control and idempotency cache. Use when you want to
     /// compose this layer over something other than the default
@@ -332,7 +336,7 @@ fn hash_commit_ref(hasher: &mut Sha256, commit: &CommitRef) {
 }
 
 #[async_trait]
-impl<C: Committer> Committer for MonolithicCommitter<C> {
+impl<C: Committer> Committer for CachingCommitter<C> {
     async fn transact(
         &self,
         request: TransactionRequest,
@@ -474,7 +478,7 @@ impl<C: Committer> Committer for MonolithicCommitter<C> {
 }
 
 #[async_trait]
-impl<C: Committer> SubmissionLookup for MonolithicCommitter<C> {
+impl<C: Committer> SubmissionLookup for CachingCommitter<C> {
     async fn status(&self, ledger_id: &str, key: &IdempotencyKey) -> SubmissionState {
         let cache_key = (ledger_id.to_string(), key.clone());
         match self.cache.get(&cache_key).await {
@@ -493,11 +497,11 @@ mod tests {
     use fluree_db_transact::{CommitOpts, TxnOpts};
     use serde_json::{json, Value as JsonValue};
 
-    /// Build a Fluree + `MonolithicCommitter` + initialized ledger.
+    /// Build a Fluree + `CachingCommitter` + initialized ledger.
     ///
     /// Each test gets its own in-memory Fluree, so tests don't share state
     /// and the same `ledger_id` is safe to reuse across tests.
-    async fn setup() -> (Arc<fluree_db_api::Fluree>, MonolithicCommitter, String) {
+    async fn setup() -> (Arc<fluree_db_api::Fluree>, CachingCommitter, String) {
         let fluree = Arc::new(FlureeBuilder::memory().build_memory());
         let ledger_id = "test/consensus:main".to_string();
         fluree
@@ -508,7 +512,7 @@ mod tests {
             reindex_min_bytes: 1024 * 1024,
             reindex_max_bytes: 1024 * 1024 * 100,
         };
-        let consensus = MonolithicCommitter::new(Arc::clone(&fluree), index_config);
+        let consensus = CachingCommitter::new(Arc::clone(&fluree), index_config);
         (fluree, consensus, ledger_id)
     }
 
@@ -864,7 +868,7 @@ ex:alice ex:name "Alice" ."#;
     /// commit's ID — the first call seeds the genesis commit (which cannot
     /// be reverted) and the second produces the revertable commit every
     /// revert test needs.
-    async fn seed_commit(consensus: &MonolithicCommitter, ledger_id: &str, name: &str) -> CommitId {
+    async fn seed_commit(consensus: &CachingCommitter, ledger_id: &str, name: &str) -> CommitId {
         consensus
             .transact(request(ledger_id, None, sample_insert("__genesis__")))
             .await
@@ -983,7 +987,7 @@ ex:alice ex:name "Alice" ."#;
     /// Build a Fluree + consensus + a parent branch with one commit + a child
     /// `feature` branch with one additional commit — the minimum setup a
     /// merge test needs.
-    async fn setup_with_feature_branch() -> (Arc<fluree_db_api::Fluree>, MonolithicCommitter) {
+    async fn setup_with_feature_branch() -> (Arc<fluree_db_api::Fluree>, CachingCommitter) {
         let (fluree, consensus, parent_id) = setup().await;
         // Genesis commit on `main` so the branch has a head to fork from.
         consensus

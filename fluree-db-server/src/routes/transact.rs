@@ -266,8 +266,8 @@ fn build_commit_opts(
     commit_opts
 }
 
-/// Submit a prepared transaction through monolithic consensus and shape the
-/// HTTP response.
+/// Submit a prepared transaction through the configured committer and
+/// shape the HTTP response.
 ///
 /// All upstream preparation (header injection, identity wiring, opts
 /// assembly, `tx_id` derivation) happens in the caller. Request correlation
