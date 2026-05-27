@@ -60,13 +60,13 @@ struct CachedSubmission {
 /// Idempotency is tracked in an in-memory TTL cache. The cache is not
 /// persisted across restarts; that is acceptable here because a process
 /// restart loses any in-flight submissions anyway.
-pub struct MonolithicCommitter {
-    committer: LocalCommitter,
+pub struct MonolithicCommitter<C: Committer = LocalCommitter> {
+    executor: C,
     cache: Cache<SubmissionCacheKey, CachedSubmission>,
     admission: Arc<Semaphore>,
 }
 
-impl MonolithicCommitter {
+impl MonolithicCommitter<LocalCommitter> {
     /// Construct with the default 1-hour idempotency TTL.
     pub fn new(fluree: Arc<Fluree>, index_config: IndexConfig) -> Self {
         Self::with_ttl(fluree, index_config, DEFAULT_IDEMPOTENCY_TTL)
@@ -74,12 +74,29 @@ impl MonolithicCommitter {
 
     /// Construct with a caller-specified idempotency TTL.
     pub fn with_ttl(fluree: Arc<Fluree>, index_config: IndexConfig, ttl: Duration) -> Self {
+        Self::wrapping_with_ttl(LocalCommitter::new(fluree, index_config), ttl)
+    }
+}
+
+impl<C: Committer> MonolithicCommitter<C> {
+    /// Wrap an arbitrary inner [`Committer`] with this committer's
+    /// admission control and idempotency cache. Use when you want to
+    /// compose this layer over something other than the default
+    /// [`LocalCommitter`] (e.g. on top of `RaftCommitter` so keyed
+    /// retries dedup before they hit the Raft log).
+    pub fn wrapping(executor: C) -> Self {
+        Self::wrapping_with_ttl(executor, DEFAULT_IDEMPOTENCY_TTL)
+    }
+
+    /// Variant of [`wrapping`](Self::wrapping) with an explicit
+    /// idempotency-cache TTL.
+    pub fn wrapping_with_ttl(executor: C, ttl: Duration) -> Self {
         let cache = Cache::builder()
             .time_to_live(ttl)
             .max_capacity(IDEMPOTENCY_CACHE_CAPACITY)
             .build();
         Self {
-            committer: LocalCommitter::new(fluree, index_config),
+            executor,
             cache,
             admission: Arc::new(Semaphore::new(DEFAULT_PENDING_LIMIT)),
         }
@@ -315,7 +332,7 @@ fn hash_commit_ref(hasher: &mut Sha256, commit: &CommitRef) {
 }
 
 #[async_trait]
-impl Committer for MonolithicCommitter {
+impl<C: Committer> Committer for MonolithicCommitter<C> {
     async fn transact(
         &self,
         request: TransactionRequest,
@@ -325,7 +342,7 @@ impl Committer for MonolithicCommitter {
         // Anonymous submissions (no idempotency key) skip the cache
         // entirely — no retry-collapse and no later status lookup.
         let Some(idempotency_key) = request.idempotency_key.clone() else {
-            return self.committer.transact(request).await;
+            return self.executor.transact(request).await;
         };
 
         let cache_key = (request.ledger_id.clone(), idempotency_key);
@@ -338,7 +355,7 @@ impl Committer for MonolithicCommitter {
             };
         }
 
-        let outcome = self.committer.transact(request).await;
+        let outcome = self.executor.transact(request).await;
         self.record_outcome(
             cache_key,
             body_hash,
@@ -353,7 +370,7 @@ impl Committer for MonolithicCommitter {
         let _permit = self.try_admit()?;
 
         let Some(idempotency_key) = request.idempotency_key.clone() else {
-            return self.committer.revert(request).await;
+            return self.executor.revert(request).await;
         };
 
         // Cache key uses the same `ledger:branch` form as `transact` so a
@@ -369,7 +386,7 @@ impl Committer for MonolithicCommitter {
             };
         }
 
-        let outcome = self.committer.revert(request).await;
+        let outcome = self.executor.revert(request).await;
         self.record_outcome(cache_key, body_hash, &outcome, OperationReceipt::Revert)
             .await;
         outcome
@@ -379,7 +396,7 @@ impl Committer for MonolithicCommitter {
         let _permit = self.try_admit()?;
 
         let Some(idempotency_key) = request.idempotency_key.clone() else {
-            return self.committer.merge(request).await;
+            return self.executor.merge(request).await;
         };
 
         // Namespace by `ledger:source_branch` — uniquely identifies the
@@ -397,7 +414,7 @@ impl Committer for MonolithicCommitter {
             };
         }
 
-        let outcome = self.committer.merge(request).await;
+        let outcome = self.executor.merge(request).await;
         self.record_outcome(cache_key, body_hash, &outcome, OperationReceipt::Merge)
             .await;
         outcome
@@ -407,7 +424,7 @@ impl Committer for MonolithicCommitter {
         let _permit = self.try_admit()?;
 
         let Some(idempotency_key) = request.idempotency_key.clone() else {
-            return self.committer.rebase(request).await;
+            return self.executor.rebase(request).await;
         };
 
         // Rebase rewrites `branch` itself, so cache by the branch being
@@ -424,7 +441,7 @@ impl Committer for MonolithicCommitter {
             };
         }
 
-        let outcome = self.committer.rebase(request).await;
+        let outcome = self.executor.rebase(request).await;
         self.record_outcome(cache_key, body_hash, &outcome, OperationReceipt::Rebase)
             .await;
         outcome
@@ -434,7 +451,7 @@ impl Committer for MonolithicCommitter {
         let _permit = self.try_admit()?;
 
         let Some(idempotency_key) = request.idempotency_key.clone() else {
-            return self.committer.push(request).await;
+            return self.executor.push(request).await;
         };
 
         // Push targets a fully-qualified `ledger:branch` directly, so the
@@ -449,7 +466,7 @@ impl Committer for MonolithicCommitter {
             };
         }
 
-        let outcome = self.committer.push(request).await;
+        let outcome = self.executor.push(request).await;
         self.record_outcome(cache_key, body_hash, &outcome, OperationReceipt::Push)
             .await;
         outcome
@@ -457,7 +474,7 @@ impl Committer for MonolithicCommitter {
 }
 
 #[async_trait]
-impl SubmissionLookup for MonolithicCommitter {
+impl<C: Committer> SubmissionLookup for MonolithicCommitter<C> {
     async fn status(&self, ledger_id: &str, key: &IdempotencyKey) -> SubmissionState {
         let cache_key = (ledger_id.to_string(), key.clone());
         match self.cache.get(&cache_key).await {
