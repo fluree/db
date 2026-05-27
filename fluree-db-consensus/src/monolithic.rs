@@ -6,60 +6,19 @@
 //! do not need cross-node coordination.
 
 use crate::{
-    Committer, IdempotencyKey, MergeReceipt, MergeRequest, OperationReceipt, PushReceipt,
-    PushRequest, RebaseReceipt, RebaseRequest, RevertReceipt, RevertRequest, RevertSelection,
-    SubmissionError, SubmissionLookup, SubmissionState, TransactionBody, TransactionReceipt,
-    TransactionRequest,
+    Committer, IdempotencyKey, LocalCommitter, MergeReceipt, MergeRequest, OperationReceipt,
+    PushReceipt, PushRequest, RebaseReceipt, RebaseRequest, RevertReceipt, RevertRequest,
+    RevertSelection, SubmissionError, SubmissionLookup, SubmissionState, TransactionBody,
+    TransactionReceipt, TransactionRequest,
 };
 use async_trait::async_trait;
-use fluree_db_api::{
-    ApiError, Base64Bytes, CommitRef, Fluree, GovernanceOptions, LedgerHandle, LedgerManager,
-    PolicyContext, PushCommitsRequest,
-};
+use fluree_db_api::{CommitRef, Fluree};
 use fluree_db_ledger::IndexConfig;
 use moka::future::Cache;
 use sha2::{Digest, Sha256};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
-
-/// Map a transaction-pipeline error into a [`SubmissionError`], preserving
-/// the HTTP status so the caller can render an accurate response.
-fn execution_failure(err: ApiError) -> SubmissionError {
-    SubmissionError::Execution {
-        status: err.status_code(),
-        message: err.to_string(),
-    }
-}
-
-/// Build a [`PolicyContext`] from the request's policy inputs.
-///
-/// Returns `Ok(None)` when there are no policy inputs — the transaction runs
-/// under root. The context is built from a snapshot of the ledger this node
-/// is about to stage against, so policy enforcement reflects the same state
-/// the transaction commits onto. Building it here, rather than having the
-/// caller pre-build and pass a context, keeps the policy context bound to
-/// the executing node's state — the shape a replicated implementation needs.
-async fn build_policy_context(
-    ledger_handle: &LedgerHandle,
-    governance: &GovernanceOptions,
-) -> Result<Option<PolicyContext>, SubmissionError> {
-    if !governance.has_any_policy_inputs() {
-        return Ok(None);
-    }
-
-    let snap = ledger_handle.snapshot().await;
-    fluree_db_api::build_policy_context(
-        &snap.snapshot,
-        snap.novelty.as_ref(),
-        Some(snap.novelty.as_ref()),
-        snap.t,
-        governance,
-    )
-    .await
-    .map(Some)
-    .map_err(execution_failure)
-}
 
 /// Default TTL for idempotency cache entries (1 hour).
 ///
@@ -102,8 +61,7 @@ struct CachedSubmission {
 /// persisted across restarts; that is acceptable here because a process
 /// restart loses any in-flight submissions anyway.
 pub struct MonolithicConsensus {
-    fluree: Arc<Fluree>,
-    index_config: IndexConfig,
+    committer: LocalCommitter,
     cache: Cache<SubmissionCacheKey, CachedSubmission>,
     admission: Arc<Semaphore>,
 }
@@ -121,8 +79,7 @@ impl MonolithicConsensus {
             .max_capacity(IDEMPOTENCY_CACHE_CAPACITY)
             .build();
         Self {
-            fluree,
-            index_config,
+            committer: LocalCommitter::new(fluree, index_config),
             cache,
             admission: Arc::new(Semaphore::new(DEFAULT_PENDING_LIMIT)),
         }
@@ -184,72 +141,6 @@ impl MonolithicConsensus {
             }
         }
         hasher.finalize().into()
-    }
-
-    fn ledger_manager(&self) -> Result<&Arc<LedgerManager>, SubmissionError> {
-        self.fluree
-            .ledger_manager()
-            .ok_or_else(|| SubmissionError::Execution {
-                status: 500,
-                message: "LedgerManager is not configured on the Fluree instance".into(),
-            })
-    }
-
-    async fn execute_transaction(
-        &self,
-        request: TransactionRequest,
-    ) -> Result<TransactionReceipt, SubmissionError> {
-        let TransactionRequest {
-            idempotency_key,
-            ledger_id,
-            body,
-            txn_opts,
-            commit_opts,
-            tracking,
-            governance,
-        } = request;
-
-        let ledger_handle = self
-            .ledger_manager()?
-            .get_or_load(&ledger_id)
-            .await
-            .map_err(execution_failure)?;
-
-        let policy_ctx = build_policy_context(&ledger_handle, &governance).await?;
-
-        // The builder API holds the ledger write lock and replaces the cached
-        // state internally for the duration of stage + commit — no manual
-        // lock/clone/replace dance is needed here. Each body variant fixes
-        // both the parser path and the insert/upsert/update semantics.
-        let staged = self.fluree.stage(&ledger_handle);
-        let staged = match &body {
-            TransactionBody::JsonLdInsert(json) => staged.insert(json),
-            TransactionBody::JsonLdUpsert(json) => staged.upsert(json),
-            TransactionBody::JsonLdUpdate(json) => staged.update(json),
-            TransactionBody::TurtleInsert(text) => staged.insert_turtle(text.as_str()),
-            TransactionBody::TurtleUpsert(text) | TransactionBody::TrigUpsert(text) => {
-                staged.upsert_turtle(text.as_str())
-            }
-            TransactionBody::Sparql(query) => staged.sparql_update(query.as_str()),
-        };
-        let mut builder = staged
-            .txn_opts(txn_opts)
-            .commit_opts(commit_opts)
-            .index_config(self.index_config.clone());
-        if let Some(tracking) = tracking {
-            builder = builder.tracking(tracking);
-        }
-        if let Some(policy) = policy_ctx {
-            builder = builder.policy(policy);
-        }
-
-        let result = builder.execute().await.map_err(execution_failure)?;
-
-        Ok(TransactionReceipt {
-            idempotency_key,
-            commit: result.receipt,
-            tally: result.tally,
-        })
     }
 
     /// Atomically claim an idempotency slot in the cache.
@@ -352,44 +243,6 @@ impl MonolithicConsensus {
         hasher.finalize().into()
     }
 
-    async fn execute_revert(
-        &self,
-        request: RevertRequest,
-    ) -> Result<RevertReceipt, SubmissionError> {
-        let RevertRequest {
-            idempotency_key,
-            ledger_name,
-            branch,
-            selection,
-            strategy,
-            ..
-        } = request;
-
-        let result = match selection {
-            RevertSelection::Commits(commits) => {
-                self.fluree
-                    .revert_commits(&ledger_name, &branch, commits.into_vec(), strategy)
-                    .await
-            }
-            RevertSelection::Range { from, to } => {
-                self.fluree
-                    .revert_range(&ledger_name, &branch, from, to, strategy)
-                    .await
-            }
-        };
-
-        let outcome = result.map_err(execution_failure)?;
-        Ok(RevertReceipt {
-            idempotency_key,
-            branch,
-            reverted_commits: outcome.reverted_commits,
-            conflict_count: outcome.conflict_count,
-            strategy,
-            new_head_t: outcome.new_head_t,
-            new_head_id: outcome.new_head_id,
-        })
-    }
-
     fn hash_merge_body(request: &MergeRequest) -> [u8; 32] {
         let mut hasher = Sha256::new();
         hasher.update(request.ledger_name.as_bytes());
@@ -408,40 +261,6 @@ impl MonolithicConsensus {
         hasher.finalize().into()
     }
 
-    async fn execute_merge(&self, request: MergeRequest) -> Result<MergeReceipt, SubmissionError> {
-        let MergeRequest {
-            idempotency_key,
-            ledger_name,
-            source_branch,
-            target_branch,
-            strategy,
-            ..
-        } = request;
-
-        let report = self
-            .fluree
-            .merge_branch(
-                &ledger_name,
-                &source_branch,
-                target_branch.as_deref(),
-                strategy,
-            )
-            .await
-            .map_err(execution_failure)?;
-
-        Ok(MergeReceipt {
-            idempotency_key,
-            source: report.source,
-            target: report.target,
-            fast_forward: report.fast_forward,
-            new_head_t: report.new_head_t,
-            new_head_id: report.new_head_id,
-            commits_copied: report.commits_copied,
-            conflict_count: report.conflict_count,
-            strategy,
-        })
-    }
-
     fn hash_rebase_body(request: &RebaseRequest) -> [u8; 32] {
         let mut hasher = Sha256::new();
         hasher.update(request.ledger_name.as_bytes());
@@ -450,39 +269,6 @@ impl MonolithicConsensus {
         hasher.update([0u8]);
         hasher.update([request.strategy as u8]);
         hasher.finalize().into()
-    }
-
-    async fn execute_rebase(
-        &self,
-        request: RebaseRequest,
-    ) -> Result<RebaseReceipt, SubmissionError> {
-        let RebaseRequest {
-            idempotency_key,
-            ledger_name,
-            branch,
-            strategy,
-            ..
-        } = request;
-
-        let report = self
-            .fluree
-            .rebase_branch(&ledger_name, &branch, strategy)
-            .await
-            .map_err(execution_failure)?;
-
-        Ok(RebaseReceipt {
-            idempotency_key,
-            branch,
-            fast_forward: report.fast_forward,
-            replayed: report.replayed,
-            skipped: report.skipped,
-            conflicts: report.conflicts.len(),
-            failures: report.failures.len(),
-            total_commits: report.total_commits,
-            source_head_t: report.source_head_t,
-            source_head_id: report.source_head_id,
-            strategy,
-        })
     }
 
     fn hash_push_body(request: &PushRequest) -> [u8; 32] {
@@ -507,39 +293,6 @@ impl MonolithicConsensus {
             hasher.update(value);
         }
         hasher.finalize().into()
-    }
-
-    async fn execute_push(&self, request: PushRequest) -> Result<PushReceipt, SubmissionError> {
-        let PushRequest {
-            idempotency_key,
-            ledger_id,
-            commits,
-            blobs,
-            governance,
-        } = request;
-
-        let payload = PushCommitsRequest {
-            commits: commits.into_iter().map(Base64Bytes).collect(),
-            blobs: blobs
-                .into_iter()
-                .map(|(k, v)| (k, Base64Bytes(v)))
-                .collect(),
-        };
-
-        let response = self
-            .fluree
-            .push_commits(&ledger_id, payload, &governance, &self.index_config)
-            .await
-            .map_err(execution_failure)?;
-
-        Ok(PushReceipt {
-            idempotency_key,
-            ledger: response.ledger,
-            accepted: response.accepted,
-            head_t: response.head.t,
-            head_id: response.head.commit_id,
-            indexing: response.indexing,
-        })
     }
 }
 
@@ -572,7 +325,7 @@ impl Committer for MonolithicConsensus {
         // Anonymous submissions (no idempotency key) skip the cache
         // entirely — no retry-collapse and no later status lookup.
         let Some(idempotency_key) = request.idempotency_key.clone() else {
-            return self.execute_transaction(request).await;
+            return self.committer.transact(request).await;
         };
 
         let cache_key = (request.ledger_id.clone(), idempotency_key);
@@ -585,7 +338,7 @@ impl Committer for MonolithicConsensus {
             };
         }
 
-        let outcome = self.execute_transaction(request).await;
+        let outcome = self.committer.transact(request).await;
         self.record_outcome(
             cache_key,
             body_hash,
@@ -600,7 +353,7 @@ impl Committer for MonolithicConsensus {
         let _permit = self.try_admit()?;
 
         let Some(idempotency_key) = request.idempotency_key.clone() else {
-            return self.execute_revert(request).await;
+            return self.committer.revert(request).await;
         };
 
         // Cache key uses the same `ledger:branch` form as `transact` so a
@@ -616,7 +369,7 @@ impl Committer for MonolithicConsensus {
             };
         }
 
-        let outcome = self.execute_revert(request).await;
+        let outcome = self.committer.revert(request).await;
         self.record_outcome(cache_key, body_hash, &outcome, OperationReceipt::Revert)
             .await;
         outcome
@@ -626,7 +379,7 @@ impl Committer for MonolithicConsensus {
         let _permit = self.try_admit()?;
 
         let Some(idempotency_key) = request.idempotency_key.clone() else {
-            return self.execute_merge(request).await;
+            return self.committer.merge(request).await;
         };
 
         // Namespace by `ledger:source_branch` — uniquely identifies the
@@ -644,7 +397,7 @@ impl Committer for MonolithicConsensus {
             };
         }
 
-        let outcome = self.execute_merge(request).await;
+        let outcome = self.committer.merge(request).await;
         self.record_outcome(cache_key, body_hash, &outcome, OperationReceipt::Merge)
             .await;
         outcome
@@ -654,7 +407,7 @@ impl Committer for MonolithicConsensus {
         let _permit = self.try_admit()?;
 
         let Some(idempotency_key) = request.idempotency_key.clone() else {
-            return self.execute_rebase(request).await;
+            return self.committer.rebase(request).await;
         };
 
         // Rebase rewrites `branch` itself, so cache by the branch being
@@ -671,7 +424,7 @@ impl Committer for MonolithicConsensus {
             };
         }
 
-        let outcome = self.execute_rebase(request).await;
+        let outcome = self.committer.rebase(request).await;
         self.record_outcome(cache_key, body_hash, &outcome, OperationReceipt::Rebase)
             .await;
         outcome
@@ -681,7 +434,7 @@ impl Committer for MonolithicConsensus {
         let _permit = self.try_admit()?;
 
         let Some(idempotency_key) = request.idempotency_key.clone() else {
-            return self.execute_push(request).await;
+            return self.committer.push(request).await;
         };
 
         // Push targets a fully-qualified `ledger:branch` directly, so the
@@ -696,7 +449,7 @@ impl Committer for MonolithicConsensus {
             };
         }
 
-        let outcome = self.execute_push(request).await;
+        let outcome = self.committer.push(request).await;
         self.record_outcome(cache_key, body_hash, &outcome, OperationReceipt::Push)
             .await;
         outcome
@@ -717,7 +470,9 @@ impl SubmissionLookup for MonolithicConsensus {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use fluree_db_api::{CommitId, CommitRef, ConflictStrategy, FlureeBuilder, TrackingOptions};
+    use fluree_db_api::{
+        CommitId, CommitRef, ConflictStrategy, FlureeBuilder, GovernanceOptions, TrackingOptions,
+    };
     use fluree_db_transact::{CommitOpts, TxnOpts};
     use serde_json::{json, Value as JsonValue};
 

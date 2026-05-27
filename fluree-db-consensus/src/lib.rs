@@ -18,8 +18,10 @@
 //! [`TransactionRequest`]; submissions sharing a key collapse to a single
 //! outcome. Callers who don't need those guarantees may omit the key.
 
+pub mod local;
 pub mod monolithic;
 
+pub use local::LocalCommitter;
 pub use monolithic::{MonolithicConsensus, DEFAULT_IDEMPOTENCY_TTL};
 
 use async_trait::async_trait;
