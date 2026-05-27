@@ -1418,7 +1418,7 @@ async fn rebase_local(state: Arc<AppState>, request: Request) -> Result<impl Int
             strategy,
         };
 
-        let receipt = match state.consensus.rebase(req).await {
+        let receipt = match state.committer.rebase(req).await {
             Ok(receipt) => receipt,
             Err(err) => {
                 set_span_error_code(&span, "error:BranchRebaseFailed");
@@ -1559,7 +1559,7 @@ async fn merge_local(state: Arc<AppState>, request: Request) -> Result<impl Into
             strategy,
         };
 
-        let receipt = match state.consensus.merge(req).await {
+        let receipt = match state.committer.merge(req).await {
             Ok(receipt) => receipt,
             Err(err) => {
                 set_span_error_code(&span, "error:BranchMergeFailed");
@@ -1758,7 +1758,7 @@ async fn revert_local(state: Arc<AppState>, request: Request) -> Result<impl Int
             strategy,
         };
 
-        let receipt = match state.consensus.revert(req).await {
+        let receipt = match state.committer.revert(req).await {
             Ok(receipt) => receipt,
             Err(err) => {
                 set_span_error_code(&span, "error:BranchRevertFailed");

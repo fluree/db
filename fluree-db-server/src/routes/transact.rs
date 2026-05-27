@@ -287,7 +287,7 @@ async fn transact_via_consensus(
     );
 
     let submission =
-        with_index_request_correlation(correlation, state.consensus.transact(request)).await;
+        with_index_request_correlation(correlation, state.committer.transact(request)).await;
     let receipt = match submission {
         Ok(receipt) => {
             tracing::info!(

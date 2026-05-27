@@ -98,7 +98,7 @@ async fn push_ledger_local(
     };
 
     let receipt = state
-        .consensus
+        .committer
         .push(req)
         .await
         .map_err(submission_error_to_server_error)?;

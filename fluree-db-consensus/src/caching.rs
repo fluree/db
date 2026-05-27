@@ -503,7 +503,7 @@ mod tests {
     /// and the same `ledger_id` is safe to reuse across tests.
     async fn setup() -> (Arc<fluree_db_api::Fluree>, CachingCommitter, String) {
         let fluree = Arc::new(FlureeBuilder::memory().build_memory());
-        let ledger_id = "test/consensus:main".to_string();
+        let ledger_id = "test/committer:main".to_string();
         fluree
             .create_ledger(&ledger_id)
             .await
@@ -512,8 +512,8 @@ mod tests {
             reindex_min_bytes: 1024 * 1024,
             reindex_max_bytes: 1024 * 1024 * 100,
         };
-        let consensus = CachingCommitter::new(Arc::clone(&fluree), index_config);
-        (fluree, consensus, ledger_id)
+        let committer = CachingCommitter::new(Arc::clone(&fluree), index_config);
+        (fluree, committer, ledger_id)
     }
 
     fn sample_insert(name: &str) -> JsonValue {
@@ -540,9 +540,9 @@ mod tests {
 
     #[tokio::test]
     async fn anonymous_submission_returns_receipt() {
-        let (_fluree, consensus, ledger_id) = setup().await;
+        let (_fluree, committer, ledger_id) = setup().await;
 
-        let receipt = consensus
+        let receipt = committer
             .transact(request(&ledger_id, None, sample_insert("alice")))
             .await
             .expect("submission to succeed");
@@ -553,10 +553,10 @@ mod tests {
 
     #[tokio::test]
     async fn keyed_submission_is_visible_via_status_lookup() {
-        let (_fluree, consensus, ledger_id) = setup().await;
+        let (_fluree, committer, ledger_id) = setup().await;
         let key = IdempotencyKey::new("01J5XAMPLE001");
 
-        let receipt = consensus
+        let receipt = committer
             .transact(request(
                 &ledger_id,
                 Some(key.as_str()),
@@ -566,7 +566,7 @@ mod tests {
             .expect("submission to succeed");
         assert_eq!(receipt.idempotency_key.as_ref(), Some(&key));
 
-        match consensus.status(&ledger_id, &key).await {
+        match committer.status(&ledger_id, &key).await {
             SubmissionState::Committed(OperationReceipt::Transaction(stored)) => {
                 assert_eq!(stored.commit.t, receipt.commit.t);
                 assert_eq!(stored.commit.commit_id, receipt.commit.commit_id);
@@ -577,27 +577,27 @@ mod tests {
 
     #[tokio::test]
     async fn status_returns_unknown_for_unseen_key() {
-        let (_fluree, consensus, ledger_id) = setup().await;
+        let (_fluree, committer, ledger_id) = setup().await;
         let key = IdempotencyKey::new("01J5UNKNOWN");
 
         assert!(matches!(
-            consensus.status(&ledger_id, &key).await,
+            committer.status(&ledger_id, &key).await,
             SubmissionState::Unknown
         ));
     }
 
     #[tokio::test]
     async fn idempotent_retry_returns_cached_receipt() {
-        let (_fluree, consensus, ledger_id) = setup().await;
+        let (_fluree, committer, ledger_id) = setup().await;
         let key = IdempotencyKey::new("01J5RETRY001");
         let body = sample_insert("alice");
 
-        let first = consensus
+        let first = committer
             .transact(request(&ledger_id, Some(key.as_str()), body.clone()))
             .await
             .expect("first submission to succeed");
 
-        let second = consensus
+        let second = committer
             .transact(request(&ledger_id, Some(key.as_str()), body))
             .await
             .expect("retry with same body should return cached receipt");
@@ -610,10 +610,10 @@ mod tests {
 
     #[tokio::test]
     async fn key_collision_with_different_body_errors() {
-        let (_fluree, consensus, ledger_id) = setup().await;
+        let (_fluree, committer, ledger_id) = setup().await;
         let key = IdempotencyKey::new("01J5COLLIDE001");
 
-        consensus
+        committer
             .transact(request(
                 &ledger_id,
                 Some(key.as_str()),
@@ -622,7 +622,7 @@ mod tests {
             .await
             .expect("first submission to succeed");
 
-        let err = consensus
+        let err = committer
             .transact(request(
                 &ledger_id,
                 Some(key.as_str()),
@@ -639,9 +639,9 @@ mod tests {
 
     #[tokio::test]
     async fn anonymous_submissions_do_not_populate_cache() {
-        let (_fluree, consensus, ledger_id) = setup().await;
+        let (_fluree, committer, ledger_id) = setup().await;
 
-        consensus
+        committer
             .transact(request(&ledger_id, None, sample_insert("alice")))
             .await
             .expect("anonymous submission");
@@ -649,7 +649,7 @@ mod tests {
         // A fresh keyed submission with any body should succeed — no anonymous
         // entry should sit in the cache to clash with it.
         let key = IdempotencyKey::new("01J5FRESH001");
-        consensus
+        committer
             .transact(request(
                 &ledger_id,
                 Some(key.as_str()),
@@ -661,18 +661,18 @@ mod tests {
 
     #[tokio::test]
     async fn upsert_routes_through_consensus() {
-        let (_fluree, consensus, ledger_id) = setup().await;
+        let (_fluree, committer, ledger_id) = setup().await;
 
         let mut req = request(&ledger_id, None, sample_insert("alice"));
         req.body = TransactionBody::JsonLdUpsert(sample_insert("alice"));
 
-        let receipt = consensus.transact(req).await.expect("upsert to succeed");
+        let receipt = committer.transact(req).await.expect("upsert to succeed");
         assert!(receipt.commit.flake_count > 0);
     }
 
     #[tokio::test]
     async fn tracking_enabled_submission_carries_tally() {
-        let (_fluree, consensus, ledger_id) = setup().await;
+        let (_fluree, committer, ledger_id) = setup().await;
 
         let mut req = request(&ledger_id, None, sample_insert("alice"));
         req.tracking = Some(TrackingOptions {
@@ -682,7 +682,7 @@ mod tests {
             max_fuel: None,
         });
 
-        let receipt = consensus
+        let receipt = committer
             .transact(req)
             .await
             .expect("tracked submission to succeed");
@@ -694,7 +694,7 @@ mod tests {
 
     #[tokio::test]
     async fn policy_default_allow_permits_transaction() {
-        let (_fluree, consensus, ledger_id) = setup().await;
+        let (_fluree, committer, ledger_id) = setup().await;
 
         // `default-allow: true` is a policy input — it triggers policy-context
         // construction inside the consensus layer — and it permits the write.
@@ -704,7 +704,7 @@ mod tests {
             ..Default::default()
         };
 
-        let receipt = consensus
+        let receipt = committer
             .transact(req)
             .await
             .expect("policy-permitted transaction to succeed");
@@ -713,7 +713,7 @@ mod tests {
 
     #[tokio::test]
     async fn view_only_policy_blocks_transaction() {
-        let (_fluree, consensus, ledger_id) = setup().await;
+        let (_fluree, committer, ledger_id) = setup().await;
 
         // A view-only policy grants `f:view` but never `f:modify`; with
         // `default-allow: false` the write has no grant, so the consensus
@@ -734,7 +734,7 @@ mod tests {
             ..Default::default()
         };
 
-        let err = consensus
+        let err = committer
             .transact(req)
             .await
             .expect_err("view-only policy should block the write");
@@ -749,11 +749,11 @@ mod tests {
 
     #[tokio::test]
     async fn failed_submission_is_recorded_as_failed() {
-        let (_fluree, consensus, _ledger_id) = setup().await;
+        let (_fluree, committer, _ledger_id) = setup().await;
         let key = IdempotencyKey::new("01J5FAILED001");
         let missing = "test/missing-ledger:main";
 
-        let err = consensus
+        let err = committer
             .transact(request(missing, Some(key.as_str()), sample_insert("alice")))
             .await
             .expect_err("submission to a missing ledger should fail");
@@ -762,7 +762,7 @@ mod tests {
             "expected an execution failure, got {err:?}"
         );
 
-        match consensus.status(missing, &key).await {
+        match committer.status(missing, &key).await {
             SubmissionState::Failed(_) => {}
             other => panic!("expected Failed, got {other:?}"),
         }
@@ -770,7 +770,7 @@ mod tests {
 
     #[tokio::test]
     async fn turtle_insert_routes_through_consensus() {
-        let (_fluree, consensus, ledger_id) = setup().await;
+        let (_fluree, committer, ledger_id) = setup().await;
 
         let turtle = r#"@prefix ex: <http://example.org/> .
 ex:alice ex:name "Alice" ."#;
@@ -784,7 +784,7 @@ ex:alice ex:name "Alice" ."#;
             governance: GovernanceOptions::default(),
         };
 
-        let receipt = consensus
+        let receipt = committer
             .transact(req)
             .await
             .expect("turtle insert to succeed");
@@ -793,7 +793,7 @@ ex:alice ex:name "Alice" ."#;
 
     #[tokio::test]
     async fn sparql_update_routes_through_consensus() {
-        let (_fluree, consensus, ledger_id) = setup().await;
+        let (_fluree, committer, ledger_id) = setup().await;
 
         let req = TransactionRequest {
             idempotency_key: None,
@@ -808,7 +808,7 @@ ex:alice ex:name "Alice" ."#;
             governance: GovernanceOptions::default(),
         };
 
-        let receipt = consensus
+        let receipt = committer
             .transact(req)
             .await
             .expect("SPARQL UPDATE to succeed");
@@ -817,7 +817,7 @@ ex:alice ex:name "Alice" ."#;
 
     #[tokio::test]
     async fn sparql_parse_error_is_rejected() {
-        let (_fluree, consensus, ledger_id) = setup().await;
+        let (_fluree, committer, ledger_id) = setup().await;
 
         let req = TransactionRequest {
             idempotency_key: None,
@@ -829,7 +829,7 @@ ex:alice ex:name "Alice" ."#;
             governance: GovernanceOptions::default(),
         };
 
-        let err = consensus
+        let err = committer
             .transact(req)
             .await
             .expect_err("malformed SPARQL should be rejected");
@@ -843,13 +843,13 @@ ex:alice ex:name "Alice" ."#;
 
     #[tokio::test]
     async fn failed_submission_can_be_retried() {
-        let (fluree, consensus, _ledger_id) = setup().await;
+        let (fluree, committer, _ledger_id) = setup().await;
         let key = IdempotencyKey::new("01J5RETRYAFTERFAIL");
         let ledger = "test/created-later:main";
         let body = sample_insert("alice");
 
         // First attempt fails — the ledger does not exist yet.
-        consensus
+        committer
             .transact(request(ledger, Some(key.as_str()), body.clone()))
             .await
             .expect_err("first attempt should fail before the ledger exists");
@@ -857,7 +857,7 @@ ex:alice ex:name "Alice" ."#;
         // Create the ledger, then retry with the same key + body. A cached
         // `Failed` entry must not block the retry.
         fluree.create_ledger(ledger).await.expect("create ledger");
-        let receipt = consensus
+        let receipt = committer
             .transact(request(ledger, Some(key.as_str()), body))
             .await
             .expect("retry after the ledger exists should succeed");
@@ -868,12 +868,12 @@ ex:alice ex:name "Alice" ."#;
     /// commit's ID — the first call seeds the genesis commit (which cannot
     /// be reverted) and the second produces the revertable commit every
     /// revert test needs.
-    async fn seed_commit(consensus: &CachingCommitter, ledger_id: &str, name: &str) -> CommitId {
-        consensus
+    async fn seed_commit(committer: &CachingCommitter, ledger_id: &str, name: &str) -> CommitId {
+        committer
             .transact(request(ledger_id, None, sample_insert("__genesis__")))
             .await
             .expect("genesis transaction to succeed");
-        let receipt = consensus
+        let receipt = committer
             .transact(request(ledger_id, None, sample_insert(name)))
             .await
             .expect("seed transaction to succeed");
@@ -887,7 +887,7 @@ ex:alice ex:name "Alice" ."#;
     ) -> RevertRequest {
         RevertRequest {
             idempotency_key: key.map(IdempotencyKey::new),
-            ledger_name: "test/consensus".to_string(),
+            ledger_name: "test/committer".to_string(),
             branch: "main".to_string(),
             selection: RevertSelection::single(CommitRef::Exact(commit)),
             strategy,
@@ -896,10 +896,10 @@ ex:alice ex:name "Alice" ."#;
 
     #[tokio::test]
     async fn anonymous_revert_returns_receipt() {
-        let (_fluree, consensus, ledger_id) = setup().await;
-        let commit = seed_commit(&consensus, &ledger_id, "alice").await;
+        let (_fluree, committer, ledger_id) = setup().await;
+        let commit = seed_commit(&committer, &ledger_id, "alice").await;
 
-        let receipt = consensus
+        let receipt = committer
             .revert(revert_request(None, commit, ConflictStrategy::Abort))
             .await
             .expect("revert to succeed");
@@ -910,11 +910,11 @@ ex:alice ex:name "Alice" ."#;
 
     #[tokio::test]
     async fn idempotent_revert_returns_cached_receipt() {
-        let (_fluree, consensus, ledger_id) = setup().await;
-        let commit = seed_commit(&consensus, &ledger_id, "alice").await;
+        let (_fluree, committer, ledger_id) = setup().await;
+        let commit = seed_commit(&committer, &ledger_id, "alice").await;
         let key = "01J5REVERTRETRY";
 
-        let first = consensus
+        let first = committer
             .revert(revert_request(
                 Some(key),
                 commit.clone(),
@@ -923,7 +923,7 @@ ex:alice ex:name "Alice" ."#;
             .await
             .expect("first revert to succeed");
 
-        let second = consensus
+        let second = committer
             .revert(revert_request(Some(key), commit, ConflictStrategy::Abort))
             .await
             .expect("retry with same body should return cached receipt");
@@ -936,11 +936,11 @@ ex:alice ex:name "Alice" ."#;
 
     #[tokio::test]
     async fn keyed_revert_is_visible_via_status_lookup() {
-        let (_fluree, consensus, ledger_id) = setup().await;
-        let commit = seed_commit(&consensus, &ledger_id, "alice").await;
+        let (_fluree, committer, ledger_id) = setup().await;
+        let commit = seed_commit(&committer, &ledger_id, "alice").await;
         let key = IdempotencyKey::new("01J5REVERTSTATUS");
 
-        let receipt = consensus
+        let receipt = committer
             .revert(revert_request(
                 Some(key.as_str()),
                 commit,
@@ -949,7 +949,7 @@ ex:alice ex:name "Alice" ."#;
             .await
             .expect("revert to succeed");
 
-        match consensus.status(&ledger_id, &key).await {
+        match committer.status(&ledger_id, &key).await {
             SubmissionState::Committed(OperationReceipt::Revert(stored)) => {
                 assert_eq!(stored.new_head_t, receipt.new_head_t);
                 assert_eq!(stored.new_head_id, receipt.new_head_id);
@@ -960,13 +960,13 @@ ex:alice ex:name "Alice" ."#;
 
     #[tokio::test]
     async fn revert_key_collides_with_transaction_key() {
-        let (_fluree, consensus, ledger_id) = setup().await;
+        let (_fluree, committer, ledger_id) = setup().await;
         let key = "01J5MIXEDKEY";
         // Seed a non-genesis commit so the revert target is valid.
-        let commit = seed_commit(&consensus, &ledger_id, "alice").await;
+        let commit = seed_commit(&committer, &ledger_id, "alice").await;
 
         // A keyed transaction claims the key on this ledger:branch.
-        consensus
+        committer
             .transact(request(&ledger_id, Some(key), sample_insert("carol")))
             .await
             .expect("keyed transaction to succeed");
@@ -974,7 +974,7 @@ ex:alice ex:name "Alice" ."#;
         // A revert reusing the same key must collide — the cached entry is
         // a `Transaction` receipt, not a `Revert` one, so the bodies cannot
         // match.
-        let err = consensus
+        let err = committer
             .revert(revert_request(Some(key), commit, ConflictStrategy::Abort))
             .await
             .expect_err("revert with a transaction's key should collide");
@@ -984,36 +984,36 @@ ex:alice ex:name "Alice" ."#;
         );
     }
 
-    /// Build a Fluree + consensus + a parent branch with one commit + a child
+    /// Build a Fluree + committer + a parent branch with one commit + a child
     /// `feature` branch with one additional commit — the minimum setup a
     /// merge test needs.
     async fn setup_with_feature_branch() -> (Arc<fluree_db_api::Fluree>, CachingCommitter) {
-        let (fluree, consensus, parent_id) = setup().await;
+        let (fluree, committer, parent_id) = setup().await;
         // Genesis commit on `main` so the branch has a head to fork from.
-        consensus
+        committer
             .transact(request(&parent_id, None, sample_insert("__genesis__")))
             .await
             .expect("seed commit to succeed");
         fluree
-            .create_branch("test/consensus", "feature", Some("main"), None)
+            .create_branch("test/committer", "feature", Some("main"), None)
             .await
             .expect("create feature branch");
         // One commit on `feature` so the merge has something to apply.
-        consensus
+        committer
             .transact(request(
-                "test/consensus:feature",
+                "test/committer:feature",
                 None,
                 sample_insert("alice"),
             ))
             .await
             .expect("commit on feature to succeed");
-        (fluree, consensus)
+        (fluree, committer)
     }
 
     fn merge_request(key: Option<&str>) -> MergeRequest {
         MergeRequest {
             idempotency_key: key.map(IdempotencyKey::new),
-            ledger_name: "test/consensus".to_string(),
+            ledger_name: "test/committer".to_string(),
             source_branch: "feature".to_string(),
             target_branch: Some("main".to_string()),
             strategy: ConflictStrategy::default(),
@@ -1022,9 +1022,9 @@ ex:alice ex:name "Alice" ."#;
 
     #[tokio::test]
     async fn anonymous_merge_returns_receipt() {
-        let (_fluree, consensus) = setup_with_feature_branch().await;
+        let (_fluree, committer) = setup_with_feature_branch().await;
 
-        let receipt = consensus
+        let receipt = committer
             .merge(merge_request(None))
             .await
             .expect("merge to succeed");
@@ -1039,15 +1039,15 @@ ex:alice ex:name "Alice" ."#;
 
     #[tokio::test]
     async fn idempotent_merge_returns_cached_receipt() {
-        let (_fluree, consensus) = setup_with_feature_branch().await;
+        let (_fluree, committer) = setup_with_feature_branch().await;
         let key = "01J5MERGERETRY";
 
-        let first = consensus
+        let first = committer
             .merge(merge_request(Some(key)))
             .await
             .expect("first merge to succeed");
 
-        let second = consensus
+        let second = committer
             .merge(merge_request(Some(key)))
             .await
             .expect("retry with same body should return cached receipt");
@@ -1061,17 +1061,17 @@ ex:alice ex:name "Alice" ."#;
 
     #[tokio::test]
     async fn keyed_merge_is_visible_via_status_lookup() {
-        let (_fluree, consensus) = setup_with_feature_branch().await;
+        let (_fluree, committer) = setup_with_feature_branch().await;
         let key = IdempotencyKey::new("01J5MERGESTATUS");
 
-        let receipt = consensus
+        let receipt = committer
             .merge(merge_request(Some(key.as_str())))
             .await
             .expect("merge to succeed");
 
         // Status namespacing for merge is `ledger:source_branch`.
-        let cache_ledger_id = fluree_db_api::format_ledger_id("test/consensus", "feature");
-        match consensus.status(&cache_ledger_id, &key).await {
+        let cache_ledger_id = fluree_db_api::format_ledger_id("test/committer", "feature");
+        match committer.status(&cache_ledger_id, &key).await {
             SubmissionState::Committed(OperationReceipt::Merge(stored)) => {
                 assert_eq!(stored.new_head_t, receipt.new_head_t);
                 assert_eq!(stored.new_head_id, receipt.new_head_id);
@@ -1083,20 +1083,20 @@ ex:alice ex:name "Alice" ."#;
 
     #[tokio::test]
     async fn merge_key_collides_with_transaction_key() {
-        let (_fluree, consensus) = setup_with_feature_branch().await;
+        let (_fluree, committer) = setup_with_feature_branch().await;
         let key = "01J5MIXEDMERGEKEY";
 
         // A keyed transaction on `ledger:feature` claims the cache slot.
-        consensus
+        committer
             .transact(request(
-                "test/consensus:feature",
+                "test/committer:feature",
                 Some(key),
                 sample_insert("dave"),
             ))
             .await
             .expect("keyed transaction to succeed");
 
-        let err = consensus
+        let err = committer
             .merge(merge_request(Some(key)))
             .await
             .expect_err("merge with a transaction's key should collide");
@@ -1109,7 +1109,7 @@ ex:alice ex:name "Alice" ."#;
     fn rebase_request(key: Option<&str>) -> RebaseRequest {
         RebaseRequest {
             idempotency_key: key.map(IdempotencyKey::new),
-            ledger_name: "test/consensus".to_string(),
+            ledger_name: "test/committer".to_string(),
             branch: "feature".to_string(),
             strategy: ConflictStrategy::default(),
         }
@@ -1117,9 +1117,9 @@ ex:alice ex:name "Alice" ."#;
 
     #[tokio::test]
     async fn anonymous_rebase_returns_receipt() {
-        let (_fluree, consensus) = setup_with_feature_branch().await;
+        let (_fluree, committer) = setup_with_feature_branch().await;
 
-        let receipt = consensus
+        let receipt = committer
             .rebase(rebase_request(None))
             .await
             .expect("rebase to succeed");
@@ -1130,15 +1130,15 @@ ex:alice ex:name "Alice" ."#;
 
     #[tokio::test]
     async fn idempotent_rebase_returns_cached_receipt() {
-        let (_fluree, consensus) = setup_with_feature_branch().await;
+        let (_fluree, committer) = setup_with_feature_branch().await;
         let key = "01J5REBASERETRY";
 
-        let first = consensus
+        let first = committer
             .rebase(rebase_request(Some(key)))
             .await
             .expect("first rebase to succeed");
 
-        let second = consensus
+        let second = committer
             .rebase(rebase_request(Some(key)))
             .await
             .expect("retry with same body should return cached receipt");
@@ -1150,17 +1150,17 @@ ex:alice ex:name "Alice" ."#;
 
     #[tokio::test]
     async fn keyed_rebase_is_visible_via_status_lookup() {
-        let (_fluree, consensus) = setup_with_feature_branch().await;
+        let (_fluree, committer) = setup_with_feature_branch().await;
         let key = IdempotencyKey::new("01J5REBASESTATUS");
 
-        let receipt = consensus
+        let receipt = committer
             .rebase(rebase_request(Some(key.as_str())))
             .await
             .expect("rebase to succeed");
 
         // Cache namespace for rebase is `ledger:branch` (the branch being rebased).
-        let cache_ledger_id = fluree_db_api::format_ledger_id("test/consensus", "feature");
-        match consensus.status(&cache_ledger_id, &key).await {
+        let cache_ledger_id = fluree_db_api::format_ledger_id("test/committer", "feature");
+        match committer.status(&cache_ledger_id, &key).await {
             SubmissionState::Committed(OperationReceipt::Rebase(stored)) => {
                 assert_eq!(stored.source_head_t, receipt.source_head_t);
                 assert_eq!(stored.source_head_id, receipt.source_head_id);
@@ -1172,20 +1172,20 @@ ex:alice ex:name "Alice" ."#;
 
     #[tokio::test]
     async fn rebase_key_collides_with_transaction_key() {
-        let (_fluree, consensus) = setup_with_feature_branch().await;
+        let (_fluree, committer) = setup_with_feature_branch().await;
         let key = "01J5MIXEDREBASEKEY";
 
         // A keyed transaction on `ledger:feature` claims the cache slot.
-        consensus
+        committer
             .transact(request(
-                "test/consensus:feature",
+                "test/committer:feature",
                 Some(key),
                 sample_insert("eve"),
             ))
             .await
             .expect("keyed transaction to succeed");
 
-        let err = consensus
+        let err = committer
             .rebase(rebase_request(Some(key)))
             .await
             .expect_err("rebase with a transaction's key should collide");
@@ -1198,7 +1198,7 @@ ex:alice ex:name "Alice" ."#;
     fn push_request(key: Option<&str>, commits: Vec<Vec<u8>>) -> PushRequest {
         PushRequest {
             idempotency_key: key.map(IdempotencyKey::new),
-            ledger_id: "test/consensus:main".to_string(),
+            ledger_id: "test/committer:main".to_string(),
             commits,
             blobs: std::collections::HashMap::new(),
             governance: GovernanceOptions::default(),
@@ -1207,9 +1207,9 @@ ex:alice ex:name "Alice" ."#;
 
     #[tokio::test]
     async fn empty_push_returns_execution_error() {
-        let (_fluree, consensus, _ledger_id) = setup().await;
+        let (_fluree, committer, _ledger_id) = setup().await;
 
-        let err = consensus
+        let err = committer
             .push(push_request(None, vec![]))
             .await
             .expect_err("push with no commits should be rejected");
@@ -1225,10 +1225,10 @@ ex:alice ex:name "Alice" ."#;
     async fn submission_rejected_when_pending_cap_reached() {
         // Override the cap to zero so no permit is ever available — every
         // submission must hit `Overloaded` instead of executing.
-        let (_fluree, consensus, ledger_id) = setup().await;
-        let consensus = consensus.with_pending_limit(0);
+        let (_fluree, committer, ledger_id) = setup().await;
+        let committer = committer.with_pending_limit(0);
 
-        let err = consensus
+        let err = committer
             .transact(request(&ledger_id, None, sample_insert("alice")))
             .await
             .expect_err("limit=0 should refuse every submission");
@@ -1240,11 +1240,11 @@ ex:alice ex:name "Alice" ."#;
 
     #[tokio::test]
     async fn push_key_collides_with_transaction_key() {
-        let (_fluree, consensus, ledger_id) = setup().await;
+        let (_fluree, committer, ledger_id) = setup().await;
         let key = "01J5MIXEDPUSHKEY";
 
         // A keyed transaction on `ledger:main` claims the cache slot.
-        consensus
+        committer
             .transact(request(&ledger_id, Some(key), sample_insert("frank")))
             .await
             .expect("keyed transaction to succeed");
@@ -1253,7 +1253,7 @@ ex:alice ex:name "Alice" ."#;
         // Transaction receipt body-hash will not match the push body-hash,
         // so the slot-claim returns KeyCollision before any push validation
         // runs. Commits payload is empty for that reason.
-        let err = consensus
+        let err = committer
             .push(push_request(Some(key), vec![]))
             .await
             .expect_err("push with a transaction's key should collide");

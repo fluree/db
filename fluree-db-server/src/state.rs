@@ -48,7 +48,7 @@ pub struct AppState {
     /// Transaction submission interface. Always present; only meaningful
     /// when this node accepts writes (peer-mode nodes forward writes
     /// elsewhere).
-    pub consensus: Arc<CachingCommitter>,
+    pub committer: Arc<CachingCommitter>,
 
     /// Ledger registry for tracking loaded ledgers and their watermarks
     pub registry: Arc<LedgerRegistry>,
@@ -176,7 +176,7 @@ impl AppState {
                 .unwrap_or_else(fluree_db_api::server_defaults::default_reindex_max_bytes),
         };
 
-        let consensus = Arc::new(CachingCommitter::new(
+        let committer = Arc::new(CachingCommitter::new(
             Arc::clone(&fluree),
             index_config.clone(),
         ));
@@ -187,7 +187,7 @@ impl AppState {
             telemetry_config,
             start_time: Instant::now(),
             index_config: Some(index_config),
-            consensus,
+            committer,
             registry,
             #[cfg(feature = "oidc")]
             jwks_cache,

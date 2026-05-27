@@ -111,7 +111,7 @@ pub async fn submission_status(
     Path(params): Path<SubmissionStatusParams>,
 ) -> Json<SubmissionStateResponse> {
     let key = IdempotencyKey::new(params.key);
-    let lookup_state = state.consensus.status(&params.ledger, &key).await;
+    let lookup_state = state.committer.status(&params.ledger, &key).await;
     Json(SubmissionStateResponse::from(lookup_state))
 }
 
