@@ -1,18 +1,23 @@
-//! Regression test for bound-object scans against the binary (FIR6) index.
+//! Regression tests for bound-object queries whose object is **absent** from
+//! the persisted dictionary, against the binary (FIR6) index.
 //!
-//! Bug (fix #1): a constant object that is **absent** from the persisted
-//! dictionary (a class that no entity is typed as, or a ref IRI that no flake
-//! references) used to drop the object filter and fall into the un-narrowed
-//! catch-all in `BinaryScanOperator::open`, scanning the *entire* predicate and
-//! post-filtering to discover 0 matches. Cost scaled with predicate cardinality
-//! (e.g. ~1 fuel per `rdf:type` flake), so a query returning nothing could cost
-//! hundreds of thousands of fuel.
+//! Bug class: a constant object that no flake references (a class nothing is
+//! typed as, or a ref IRI never interned) used to be mishandled as "can't
+//! narrow" instead of "provably empty", causing a full predicate scan:
+//!   - `BinaryScanOperator::open` dropped the object filter into its
+//!     un-narrowed catch-all and post-filtered the whole predicate;
+//!   - `count_bound_object_v6` errored and fell back to a generic
+//!     scan + aggregate.
 //!
-//! An object value provably absent from the base dictionary cannot be
-//! referenced by any base flake, so the scan must short-circuit to the
-//! overlay-only (novelty) path instead. This test pins that invariant: the
-//! fuel for an absent-object query is bounded by a small constant **independent
-//! of dataset size**, while present-value lookups still return correct rows.
+//! Either way cost scaled with predicate cardinality (~1 fuel per `rdf:type`
+//! flake), so a query returning nothing could burn hundreds of thousands of
+//! fuel.
+//!
+//! An object provably absent from the base dictionary cannot be referenced by
+//! any base flake, so these paths must short-circuit (scan → overlay-only;
+//! count → 0). These tests pin that invariant: fuel for an absent-object query
+//! stays bounded by a small constant **independent of dataset size**, while
+//! present-value lookups still return correct rows/counts.
 
 #![cfg(feature = "native")]
 
@@ -92,6 +97,61 @@ async fn tracked(fluree: &fluree_db_api::Fluree, where_obj: JsonValue) -> (usize
         .expect("result should be a JSON array");
     let fuel = result.fuel.expect("fuel should be present under track_all");
     (rows, fuel)
+}
+
+/// Run a tracked SPARQL scalar COUNT, returning `(count, fuel)`. Uses SPARQL so
+/// the planner selects the `count_bound_object_v6` fast path.
+async fn tracked_count(fluree: &fluree_db_api::Fluree, class_iri: &str) -> (Option<i64>, f64) {
+    let sparql =
+        format!("SELECT (COUNT(?s) AS ?n) FROM <{LEDGER_ID}> WHERE {{ ?s a <{class_iri}> }}");
+    let result = fluree
+        .query_from()
+        .sparql(&sparql)
+        .track_all()
+        .execute_tracked()
+        .await
+        .expect("tracked count query should succeed");
+
+    assert_eq!(result.status, 200, "count query status");
+    let fuel = result.fuel.expect("fuel should be present under track_all");
+    // W3C SPARQL JSON: results.bindings[0].<var>.value
+    let count = result
+        .result
+        .get("results")
+        .and_then(|r| r.get("bindings"))
+        .and_then(serde_json::Value::as_array)
+        .and_then(|b| b.first())
+        .and_then(|row| row.as_object())
+        .and_then(|row| row.values().next())
+        .and_then(|cell| cell.get("value"))
+        .and_then(serde_json::Value::as_str)
+        .and_then(|s| s.parse::<i64>().ok());
+    (count, fuel)
+}
+
+#[tokio::test]
+async fn bound_object_absent_count_does_not_scan_predicate() {
+    assert_index_defaults();
+    let fluree = FlureeBuilder::memory().build_memory();
+    seed(&fluree).await;
+
+    // Present class: the fast COUNT path returns the correct total. (Note: the
+    // V6 count fast path reads leaflets directly and is currently unmetered, so
+    // we don't assert on its fuel — only on correctness.)
+    let (present_count, _present_fuel) =
+        tracked_count(&fluree, "http://example.org/ns#Widget").await;
+    assert_eq!(present_count, Some(N as i64), "present class count");
+
+    // Absent class: COUNT must short-circuit to 0 instead of falling back to a
+    // full predicate scan + aggregate. The fallback IS metered, so pre-fix this
+    // burned ~N fuel; post-fix it stays bounded regardless of N.
+    let (ghost_count, ghost_fuel) = tracked_count(&fluree, "http://example.org/ns#Ghost").await;
+    assert_eq!(ghost_count, Some(0), "absent class counts 0");
+    assert!(
+        ghost_fuel <= ABSENT_FUEL_CEILING,
+        "absent-class COUNT burned {ghost_fuel} fuel (ceiling {ABSENT_FUEL_CEILING}); \
+         it fell back to a full rdf:type scan (~{N} flakes) instead of returning 0"
+    );
 }
 
 #[tokio::test]

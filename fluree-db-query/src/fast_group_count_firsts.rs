@@ -1,8 +1,8 @@
 use crate::binding::Binding;
 use crate::context::{ExecutionContext, WellKnownDatatypes};
 use crate::error::{QueryError, Result};
-use crate::fast_path_common::{fast_path_store, normalize_pred_sid};
-use crate::ir::triple::Term;
+use crate::fast_path_common::{fast_path_store, normalize_pred_sid, subject_ref_to_s_id};
+use crate::ir::triple::{Ref, Term};
 use crate::operator::BoxedOperator;
 use crate::operator::{Operator, OperatorState};
 use crate::var_registry::VarId;
@@ -23,7 +23,7 @@ use fluree_db_binary_index::{
 };
 use fluree_db_core::o_type::OType;
 use fluree_db_core::subject_id::SubjectId;
-use fluree_db_core::{FlakeValue, GraphId, Sid};
+use fluree_db_core::{FlakeValue, GraphId, LedgerSnapshot, Sid};
 use rustc_hash::{FxHashMap, FxHashSet};
 use std::cmp::Ordering;
 use std::collections::HashMap;
@@ -432,6 +432,7 @@ impl Operator for PredicateObjectCountFirstsOperator {
         {
             if let Some(binary_index_store) = ctx.binary_store.as_ref() {
                 match count_bound_object_v6(
+                    ctx.active_snapshot,
                     binary_index_store,
                     ctx.binary_g_id,
                     &self.predicate,
@@ -583,15 +584,23 @@ fn resolve_predicate_id_v6(
 /// `(o_type, o_key)` to skip whole leaflets, and decodes only `o_key` + `o_type`
 /// columns when needed.
 fn count_bound_object_v6(
+    snapshot: &LedgerSnapshot,
     store: &BinaryIndexStore,
     g_id: GraphId,
-    predicate: &crate::ir::triple::Ref,
+    predicate: &Ref,
     object: &Term,
 ) -> Result<i64> {
     let p_id = resolve_predicate_id_v6(predicate, store)?;
 
-    // Translate the bound object term into V6 (o_type, o_key).
-    let (target_o_type, target_o_key) = translate_term_to_v6(object, store, p_id, g_id)?;
+    // Translate the bound object term into V6 (o_type, o_key). A `None` here is
+    // a *conclusive* base-dict miss (refs are resolved snapshot-aware); since
+    // this path runs only with no novelty overlay, the count is exactly 0 —
+    // return without a fallback full-predicate scan.
+    let Some((target_o_type, target_o_key)) =
+        translate_term_to_v6(object, snapshot, store, p_id, g_id)?
+    else {
+        return Ok(0);
+    };
 
     let branch = store
         .branch_for_order(g_id, RunSortOrder::Post)
@@ -880,37 +889,48 @@ fn group_count_v6(
 }
 
 /// Translate a bound object `Term` to V6 `(o_type, o_key)`.
+///
+/// Return values:
+/// - `Ok(Some(..))` — resolved to a persisted `(o_type, o_key)`.
+/// - `Ok(None)` — the object is **conclusively absent from the base dict**.
+///   Combined with the caller's no-novelty (`epoch == 0`) gate, "absent from
+///   base dict" implies "absent from the logical DB", so the caller reports a
+///   0 count.
+/// - `Err(..)` — genuine error or unbound object; routes to the generic
+///   fallback.
+///
+/// Refs (`Term::Iri` and `Term::Sid`) resolve through `subject_ref_to_s_id`,
+/// which is snapshot-aware: a `Sid` is decoded via `snapshot.decode_sid` (then
+/// `store.sid_to_iri`) and re-looked-up by full IRI. This makes a `None` a
+/// genuine base miss rather than a "store can't decode this snapshot namespace
+/// code" false negative — so returning a 0 count stays sound even for
+/// pre-encoded `Term::Sid` objects of unknown provenance.
 fn translate_term_to_v6(
     term: &Term,
+    snapshot: &LedgerSnapshot,
     store: &BinaryIndexStore,
     _p_id: u32,
     _g_id: GraphId,
-) -> Result<(u16, u64)> {
+) -> Result<Option<(u16, u64)>> {
     match term {
-        Term::Sid(sid) => {
-            let s_id = store
-                .find_subject_id_by_parts(sid.namespace_code, &sid.name)
-                .map_err(|e| QueryError::execution(format!("find_subject_id_by_parts: {e}")))?
-                .ok_or_else(|| {
-                    QueryError::execution("bound object SID not found in V6 dict".to_string())
-                })?;
-            Ok((OType::IRI_REF.as_u16(), s_id))
-        }
-        Term::Iri(iri) => {
-            let s_id = store
-                .find_subject_id(iri)
-                .map_err(|e| QueryError::execution(format!("find_subject_id: {e}")))?
-                .ok_or_else(|| {
-                    QueryError::execution("bound object IRI not found in V6 dict".to_string())
-                })?;
-            Ok((OType::IRI_REF.as_u16(), s_id))
-        }
+        Term::Iri(iri) => Ok(
+            subject_ref_to_s_id(snapshot, store, &Ref::Iri(iri.clone()))?
+                .map(|s_id| (OType::IRI_REF.as_u16(), s_id)),
+        ),
+        Term::Sid(sid) => Ok(
+            subject_ref_to_s_id(snapshot, store, &Ref::Sid(sid.clone()))?
+                .map(|s_id| (OType::IRI_REF.as_u16(), s_id)),
+        ),
         Term::Value(val) => {
-            // For literal values, we need the FlakeValue → (o_type, o_key) translation.
-            // Use the Sid-based dt info from the FlakeValue if available.
-            let (ot, ok) = crate::binary_scan::value_to_otype_okey_simple(val, store)
-                .map_err(|e| QueryError::from_io("value_to_otype_okey_simple", e))?;
-            Ok((ot.as_u16(), ok))
+            // Literal values: the FlakeValue → (o_type, o_key) translation.
+            // A NotFound means the value isn't in the persisted dict — conclusive
+            // for literals (no namespace ambiguity). Other errors are genuine and
+            // propagate to the fallback. (Ref-valued objects arrive as Term::Iri.)
+            match crate::binary_scan::value_to_otype_okey_simple(val, store) {
+                Ok((ot, ok)) => Ok(Some((ot.as_u16(), ok))),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+                Err(e) => Err(QueryError::from_io("value_to_otype_okey_simple", e)),
+            }
         }
         Term::Var(_) => Err(QueryError::InvalidQuery(
             "fast-path requires a bound object".to_string(),
