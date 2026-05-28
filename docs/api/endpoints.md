@@ -1144,12 +1144,11 @@ Content-Type: application/json
     "asOf":    "2024-01-01T12:00:00Z",
     "ledgers": { "myledger:main": 1042, "other:main": 87 }
   },
-  "results": { "alice": [...], "bob": {...} },
-  "errors":  {}
+  "results": { "alice": [...], "bob": {...} }
 }
 ```
 
-Clients branch on `body.status` (`"ok"` | `"partial"` | `"all_failed"`) rather than HTTP code for the aggregate outcome; per-alias errors and timeouts live inside `errors`.
+(`errors` is omitted when no sub-query failed; `meta` is omitted when `opts.meta` is unset.) Clients branch on `body.status` (`"ok"` | `"partial"` | `"all_failed"`) rather than HTTP code for the aggregate outcome; per-alias errors and timeouts live inside `errors` when present.
 
 **Status Codes:**
 - `200 OK` — envelope parsed and executed; body's `status` reports the per-alias aggregate (including `all_failed`).

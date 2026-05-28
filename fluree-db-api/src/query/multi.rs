@@ -238,13 +238,9 @@ pub struct MultiQueryMeta {
 pub enum MultiQueryValidationError {
     #[error("envelope must contain at least one sub-query")]
     EmptyEnvelope,
-    #[error(
-        "envelope has {actual} sub-queries; server limit is {limit}"
-    )]
+    #[error("envelope has {actual} sub-queries; server limit is {limit}")]
     TooManyQueries { actual: usize, limit: usize },
-    #[error(
-        "envelope references {actual} distinct ledgers; server limit is {limit}"
-    )]
+    #[error("envelope references {actual} distinct ledgers; server limit is {limit}")]
     TooManyDistinctLedgers { actual: usize, limit: usize },
     #[error("sub-query alias must not be empty")]
     EmptyAlias,
@@ -268,15 +264,11 @@ pub enum MultiQueryValidationError {
         "sub-query '{alias}': missing or empty 'from' — each sub-query must specify its own dataset"
     )]
     MissingFrom { alias: String },
-    #[error(
-        "opts.maxConcurrency = {value} exceeds server limit {limit}"
-    )]
+    #[error("opts.maxConcurrency = {value} exceeds server limit {limit}")]
     MaxConcurrencyExceeded { value: u64, limit: usize },
     #[error("opts.maxConcurrency must be at least 1")]
     MaxConcurrencyZero,
-    #[error(
-        "opts.timeoutMs = {value} exceeds server limit {limit}"
-    )]
+    #[error("opts.timeoutMs = {value} exceeds server limit {limit}")]
     TimeoutExceeded { value: u64, limit: u64 },
     #[error(
         "envelope-level fuel budget (max-fuel) is not supported in v1; \
@@ -402,12 +394,12 @@ fn validate_jsonld_subquery(
     envelope_pinned: bool,
     distinct: &mut BTreeSet<String>,
 ) -> Result<(), MultiQueryValidationError> {
-    let body = sq
-        .query
-        .as_object()
-        .ok_or_else(|| MultiQueryValidationError::JsonLdBodyNotObject {
-            alias: alias.to_string(),
-        })?;
+    let body =
+        sq.query
+            .as_object()
+            .ok_or_else(|| MultiQueryValidationError::JsonLdBodyNotObject {
+                alias: alias.to_string(),
+            })?;
 
     // History queries (explicit `to` endpoint) span a range across two `t`
     // values rather than a single snapshot. The envelope's shared-snapshot
@@ -664,7 +656,9 @@ fn sparql_extract_from(sparql: &str) -> Option<Vec<ExtractedFrom>> {
         QueryBody::Update(_) => None,
     };
 
-    let Some(ds) = dataset else { return Some(Vec::new()); };
+    let Some(ds) = dataset else {
+        return Some(Vec::new());
+    };
 
     let mut out = Vec::new();
     for iri in ds.default_graphs.iter().chain(ds.named_graphs.iter()) {
@@ -859,10 +853,7 @@ fn is_namespace_iri(s: &str) -> bool {
 ///
 /// - Envelope prefixes are prepended only if `sparql` has no `PREFIX` declarations.
 /// - Envelope `BASE` is prepended only if `sparql` has no `BASE` declaration.
-pub fn apply_sparql_context(
-    sparql: &str,
-    directives: &SparqlContextDirectives,
-) -> String {
+pub fn apply_sparql_context(sparql: &str, directives: &SparqlContextDirectives) -> String {
     let has_prefix = sparql_has_directive(sparql, "PREFIX");
     let has_base = sparql_has_directive(sparql, "BASE");
 
@@ -1058,7 +1049,10 @@ mod tests {
         };
         assert!(matches!(
             validate_envelope(&req, &bounds),
-            Err(MultiQueryValidationError::TooManyQueries { actual: 10, limit: 5 })
+            Err(MultiQueryValidationError::TooManyQueries {
+                actual: 10,
+                limit: 5
+            })
         ));
     }
 
@@ -1078,7 +1072,10 @@ mod tests {
         };
         assert!(matches!(
             validate_envelope(&req, &bounds),
-            Err(MultiQueryValidationError::TooManyDistinctLedgers { actual: 3, limit: 2 })
+            Err(MultiQueryValidationError::TooManyDistinctLedgers {
+                actual: 3,
+                limit: 2
+            })
         ));
     }
 
@@ -1109,7 +1106,10 @@ mod tests {
             Some(AsOf::Iso("2024-01-01T00:00:00Z".into())),
         );
         let err = validate_envelope(&req, &MultiQueryBounds::DEFAULT).unwrap_err();
-        assert!(matches!(err, MultiQueryValidationError::AsOfCollision { .. }));
+        assert!(matches!(
+            err,
+            MultiQueryValidationError::AsOfCollision { .. }
+        ));
     }
 
     #[test]
@@ -1122,7 +1122,10 @@ mod tests {
             Some(AsOf::Iso("2024-01-01T00:00:00Z".into())),
         );
         let err = validate_envelope(&req, &MultiQueryBounds::DEFAULT).unwrap_err();
-        assert!(matches!(err, MultiQueryValidationError::AsOfCollision { .. }));
+        assert!(matches!(
+            err,
+            MultiQueryValidationError::AsOfCollision { .. }
+        ));
     }
 
     #[test]
@@ -1134,7 +1137,10 @@ mod tests {
             .insert("t".into(), json!(99));
         let req = envelope_with(&[("a", sq)], Some(AsOf::Iso("2024-01-01T00:00:00Z".into())));
         let err = validate_envelope(&req, &MultiQueryBounds::DEFAULT).unwrap_err();
-        assert!(matches!(err, MultiQueryValidationError::AsOfCollision { .. }));
+        assert!(matches!(
+            err,
+            MultiQueryValidationError::AsOfCollision { .. }
+        ));
     }
 
     #[test]
@@ -1149,7 +1155,10 @@ mod tests {
         sq.opts = Some(json!({ "t": 42 }));
         let req = envelope_with(&[("a", sq)], None);
         let err = validate_envelope(&req, &MultiQueryBounds::DEFAULT).unwrap_err();
-        assert!(matches!(err, MultiQueryValidationError::OptsTNotAllowed { .. }));
+        assert!(matches!(
+            err,
+            MultiQueryValidationError::OptsTNotAllowed { .. }
+        ));
     }
 
     #[test]
@@ -1166,10 +1175,7 @@ mod tests {
 
     #[test]
     fn rejects_missing_from_sparql() {
-        let req = envelope_with(
-            &[("a", sparql("SELECT ?x WHERE { ?x ?p ?o }"))],
-            None,
-        );
+        let req = envelope_with(&[("a", sparql("SELECT ?x WHERE { ?x ?p ?o }"))], None);
         let err = validate_envelope(&req, &MultiQueryBounds::DEFAULT).unwrap_err();
         assert!(matches!(err, MultiQueryValidationError::MissingFrom { .. }));
     }
@@ -1183,7 +1189,10 @@ mod tests {
             ..MultiQueryBounds::DEFAULT
         };
         let err = validate_envelope(&req, &bounds).unwrap_err();
-        assert!(matches!(err, MultiQueryValidationError::MaxConcurrencyExceeded { .. }));
+        assert!(matches!(
+            err,
+            MultiQueryValidationError::MaxConcurrencyExceeded { .. }
+        ));
     }
 
     #[test]
@@ -1195,7 +1204,10 @@ mod tests {
             ..MultiQueryBounds::DEFAULT
         };
         let err = validate_envelope(&req, &bounds).unwrap_err();
-        assert!(matches!(err, MultiQueryValidationError::TimeoutExceeded { .. }));
+        assert!(matches!(
+            err,
+            MultiQueryValidationError::TimeoutExceeded { .. }
+        ));
     }
 
     #[test]
@@ -1207,7 +1219,10 @@ mod tests {
         };
         let req = envelope_with(&[("a", sq)], None);
         let err = validate_envelope(&req, &MultiQueryBounds::DEFAULT).unwrap_err();
-        assert!(matches!(err, MultiQueryValidationError::JsonLdBodyNotObject { .. }));
+        assert!(matches!(
+            err,
+            MultiQueryValidationError::JsonLdBodyNotObject { .. }
+        ));
     }
 
     #[test]
@@ -1219,7 +1234,10 @@ mod tests {
         };
         let req = envelope_with(&[("a", sq)], None);
         let err = validate_envelope(&req, &MultiQueryBounds::DEFAULT).unwrap_err();
-        assert!(matches!(err, MultiQueryValidationError::SparqlBodyNotString { .. }));
+        assert!(matches!(
+            err,
+            MultiQueryValidationError::SparqlBodyNotString { .. }
+        ));
     }
 
     #[test]
@@ -1376,7 +1394,10 @@ mod tests {
     // -------------------------------------------------------------------------
 
     fn pin_count(extracted: &[ExtractedFrom]) -> usize {
-        extracted.iter().filter(|e| e.pin_location.is_some()).count()
+        extracted
+            .iter()
+            .filter(|e| e.pin_location.is_some())
+            .count()
     }
 
     #[test]
@@ -1387,8 +1408,7 @@ mod tests {
             "SELECT * FROM <ledger@commit:abc123> WHERE { ?x ?p ?o }",
         ];
         for sparql in cases {
-            let extracted =
-                sparql_extract_from(sparql).expect("SPARQL parses");
+            let extracted = sparql_extract_from(sparql).expect("SPARQL parses");
             assert!(
                 pin_count(&extracted) >= 1,
                 "expected temporal pin in: {sparql} (got {extracted:?})"
@@ -1486,7 +1506,10 @@ mod tests {
         };
         let req = envelope_with(&[("a", sq)], Some(AsOf::Iso("2024-01-01T00:00:00Z".into())));
         let err = validate_envelope(&req, &MultiQueryBounds::DEFAULT).unwrap_err();
-        assert!(matches!(err, MultiQueryValidationError::AsOfCollision { .. }));
+        assert!(matches!(
+            err,
+            MultiQueryValidationError::AsOfCollision { .. }
+        ));
     }
 
     #[test]
@@ -1519,7 +1542,10 @@ mod tests {
         };
         let req = envelope_with(&[("a", sq)], Some(AsOf::Iso("2024-01-01T00:00:00Z".into())));
         let err = validate_envelope(&req, &MultiQueryBounds::DEFAULT).unwrap_err();
-        assert!(matches!(err, MultiQueryValidationError::AsOfCollision { .. }));
+        assert!(matches!(
+            err,
+            MultiQueryValidationError::AsOfCollision { .. }
+        ));
     }
 
     // -------------------------------------------------------------------------
@@ -1644,9 +1670,7 @@ mod tests {
 
     #[test]
     fn sparql_history_range_query_rejected() {
-        let sq = sparql(
-            "SELECT ?x FROM <ledgerA@t:1> TO <ledgerA@t:latest> WHERE { ?x ?p ?o }",
-        );
+        let sq = sparql("SELECT ?x FROM <ledgerA@t:1> TO <ledgerA@t:latest> WHERE { ?x ?p ?o }");
         let req = envelope_with(&[("a", sq)], None);
         let err = validate_envelope(&req, &MultiQueryBounds::DEFAULT).unwrap_err();
         assert!(matches!(
@@ -1709,9 +1733,6 @@ mod tests {
         let mut req = envelope_with(&[("a", jsonld("ledgerA"))], None);
         req.opts = Some(json!({ "maxConcurrency": 0 }));
         let err = validate_envelope(&req, &MultiQueryBounds::DEFAULT).unwrap_err();
-        assert!(matches!(
-            err,
-            MultiQueryValidationError::MaxConcurrencyZero
-        ));
+        assert!(matches!(err, MultiQueryValidationError::MaxConcurrencyZero));
     }
 }

@@ -256,7 +256,10 @@ async fn multi_query_response_echoes_snapshot_ledgers() {
     let snapshot = &body["snapshot"];
     assert!(snapshot["asOf"].is_string(), "asOf should echo server-now");
     let t = snapshot["ledgers"]["mq:snap"].as_i64();
-    assert!(t.is_some() && t.unwrap() >= 1, "snapshot.ledgers should pin mq:snap to t >= 1, got: {snapshot}");
+    assert!(
+        t.is_some() && t.unwrap() >= 1,
+        "snapshot.ledgers should pin mq:snap to t >= 1, got: {snapshot}"
+    );
 }
 
 // =============================================================================

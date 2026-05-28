@@ -270,8 +270,8 @@ mod tests {
             success("b", serde_json::json!([{"x": 2}])),
         ];
         let snap = snapshot_with(&[("ledgerA", 42)]);
-        let resp = assemble_response(outcomes, &snap, &MultiQueryBounds::DEFAULT, false, 5)
-            .unwrap();
+        let resp =
+            assemble_response(outcomes, &snap, &MultiQueryBounds::DEFAULT, false, 5).unwrap();
         assert_eq!(resp.status, MultiQueryStatus::Ok);
         assert_eq!(resp.results.len(), 2);
         assert!(resp.errors.is_empty());
@@ -279,13 +279,10 @@ mod tests {
 
     #[test]
     fn all_failure_yields_all_failed_status() {
-        let outcomes = vec![
-            err("a", "api_error", "syntax"),
-            timeout("b", 1_000),
-        ];
+        let outcomes = vec![err("a", "api_error", "syntax"), timeout("b", 1_000)];
         let snap = snapshot_with(&[("ledgerA", 42)]);
-        let resp = assemble_response(outcomes, &snap, &MultiQueryBounds::DEFAULT, false, 5)
-            .unwrap();
+        let resp =
+            assemble_response(outcomes, &snap, &MultiQueryBounds::DEFAULT, false, 5).unwrap();
         assert_eq!(resp.status, MultiQueryStatus::AllFailed);
         assert!(resp.results.is_empty());
         assert_eq!(resp.errors.len(), 2);
@@ -299,8 +296,8 @@ mod tests {
             err("b", "api_error", "boom"),
         ];
         let snap = snapshot_with(&[("ledgerA", 42)]);
-        let resp = assemble_response(outcomes, &snap, &MultiQueryBounds::DEFAULT, false, 5)
-            .unwrap();
+        let resp =
+            assemble_response(outcomes, &snap, &MultiQueryBounds::DEFAULT, false, 5).unwrap();
         assert_eq!(resp.status, MultiQueryStatus::Partial);
         assert_eq!(resp.results.len(), 1);
         assert_eq!(resp.errors.len(), 1);
@@ -310,8 +307,8 @@ mod tests {
     fn snapshot_info_echoes_as_of_and_ledgers() {
         let outcomes = vec![success("a", serde_json::json!([]))];
         let snap = snapshot_with(&[("ledgerA", 42), ("ledgerB", 99)]);
-        let resp = assemble_response(outcomes, &snap, &MultiQueryBounds::DEFAULT, false, 5)
-            .unwrap();
+        let resp =
+            assemble_response(outcomes, &snap, &MultiQueryBounds::DEFAULT, false, 5).unwrap();
         assert_eq!(
             resp.snapshot.as_of.as_deref(),
             Some("2024-01-01T00:00:00.000Z")
@@ -324,8 +321,8 @@ mod tests {
     fn snapshot_ledgers_are_sorted_for_determinism() {
         let outcomes = vec![success("a", serde_json::json!([]))];
         let snap = snapshot_with(&[("ledgerC", 3), ("ledgerA", 1), ("ledgerB", 2)]);
-        let resp = assemble_response(outcomes, &snap, &MultiQueryBounds::DEFAULT, false, 5)
-            .unwrap();
+        let resp =
+            assemble_response(outcomes, &snap, &MultiQueryBounds::DEFAULT, false, 5).unwrap();
         let keys: Vec<&String> = resp.snapshot.ledgers.keys().collect();
         assert_eq!(keys, vec!["ledgerA", "ledgerB", "ledgerC"]);
     }
@@ -375,8 +372,8 @@ mod tests {
             },
         }];
         let snap = snapshot_with(&[("ledgerA", 42)]);
-        let resp = assemble_response(outcomes, &snap, &MultiQueryBounds::DEFAULT, true, 10)
-            .unwrap();
+        let resp =
+            assemble_response(outcomes, &snap, &MultiQueryBounds::DEFAULT, true, 10).unwrap();
         let meta = resp.meta.unwrap();
         assert_eq!(meta.elapsed_ms, Some(10));
         assert_eq!(meta.fuel_total, Some(123.0));
@@ -386,8 +383,8 @@ mod tests {
     fn meta_omitted_when_not_requested() {
         let outcomes = vec![success("a", serde_json::json!([]))];
         let snap = snapshot_with(&[("ledgerA", 42)]);
-        let resp = assemble_response(outcomes, &snap, &MultiQueryBounds::DEFAULT, false, 5)
-            .unwrap();
+        let resp =
+            assemble_response(outcomes, &snap, &MultiQueryBounds::DEFAULT, false, 5).unwrap();
         assert!(resp.meta.is_none());
     }
 }

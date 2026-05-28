@@ -516,10 +516,7 @@ mod tests {
 
     #[test]
     fn dispatch_config_uses_envelope_opts_when_below_limit() {
-        let env = envelope_with_opts(
-            json!({ "maxConcurrency": 4, "timeoutMs": 5000 }),
-            1,
-        );
+        let env = envelope_with_opts(json!({ "maxConcurrency": 4, "timeoutMs": 5000 }), 1);
         let bounds = MultiQueryBounds::DEFAULT;
         let cfg = DispatchConfig::from_envelope(&env, &bounds);
         assert_eq!(cfg.max_concurrency, 4);
@@ -528,10 +525,7 @@ mod tests {
 
     #[test]
     fn dispatch_config_clamps_to_server_limits() {
-        let env = envelope_with_opts(
-            json!({ "maxConcurrency": 9999, "timeoutMs": 9_999_999 }),
-            1,
-        );
+        let env = envelope_with_opts(json!({ "maxConcurrency": 9999, "timeoutMs": 9_999_999 }), 1);
         let bounds = MultiQueryBounds {
             max_concurrency: 8,
             max_envelope_timeout_ms: 30_000,

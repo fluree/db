@@ -2500,18 +2500,16 @@ async fn execute_dataset_query(
     // Delegate the actual execution to the connection-scoped sub-query helper —
     // the same path the multi-query dispatcher uses for each sub-query alias.
     let tracked = has_tracking_opts(&query);
-    let outcome = run_jsonld_subquery(state, &query)
-        .await
-        .map_err(|e| {
-            set_span_error_code(span, "error:InvalidQuery");
-            tracing::error!(
-                error = %e,
-                query_kind = "dataset",
-                tracked,
-                "dataset query failed"
-            );
-            e
-        })?;
+    let outcome = run_jsonld_subquery(state, &query).await.map_err(|e| {
+        set_span_error_code(span, "error:InvalidQuery");
+        tracing::error!(
+            error = %e,
+            query_kind = "dataset",
+            tracked,
+            "dataset query failed"
+        );
+        e
+    })?;
 
     if let Some(tally) = outcome.tally {
         // Record tracker fields on the execution span (parity with prior behavior).
@@ -2661,19 +2659,14 @@ pub(crate) async fn run_sparql_subquery(
     }
 }
 
-
 // =============================================================================
 // Multi-query envelope handler
 // =============================================================================
 
-use fluree_db_api::query::multi::{
-    MultiQueryBounds, MultiQueryRequest, MultiQueryValidationError,
-};
+use fluree_db_api::query::multi::{MultiQueryBounds, MultiQueryRequest, MultiQueryValidationError};
 use fluree_db_api::query::multi_snapshot::resolve_envelope_snapshot;
 
-use super::multi_dispatch::{
-    dispatch_multi_query, DispatchConfig, MultiQueryIdentityContext,
-};
+use super::multi_dispatch::{dispatch_multi_query, DispatchConfig, MultiQueryIdentityContext};
 use super::multi_response::{assemble_response, ResponseAssemblyError};
 
 /// `POST /v1/fluree/multi-query`
@@ -2749,15 +2742,14 @@ pub async fn multi_query(
         let bounds = MultiQueryBounds::DEFAULT;
 
         // Validation — maps to 4xx with a structured error body.
-        let distinct_ledgers = match fluree_db_api::query::multi::validate_envelope(
-            &envelope, &bounds,
-        ) {
-            Ok(distinct) => distinct,
-            Err(err) => {
-                set_span_error_code(&span, "error:BadRequest");
-                return Err(validation_error_to_server(&err));
-            }
-        };
+        let distinct_ledgers =
+            match fluree_db_api::query::multi::validate_envelope(&envelope, &bounds) {
+                Ok(distinct) => distinct,
+                Err(err) => {
+                    set_span_error_code(&span, "error:BadRequest");
+                    return Err(validation_error_to_server(&err));
+                }
+            };
 
         // Bearer ledger-scope enforcement — parity with single-query
         // /query and /query/:ledger. Unsigned bearer tokens may carry a

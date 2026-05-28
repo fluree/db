@@ -49,7 +49,10 @@ pub struct EnvelopeSnapshot {
 #[derive(Debug, thiserror::Error)]
 pub enum EnvelopeSnapshotError {
     #[error("invalid ISO 8601 timestamp for asOf: {iso} ({source})")]
-    InvalidIso { iso: String, source: chrono::ParseError },
+    InvalidIso {
+        iso: String,
+        source: chrono::ParseError,
+    },
     #[error("failed to load ledger '{ledger}' for snapshot resolution: {source}")]
     LedgerLoad { ledger: String, source: ApiError },
     #[error("failed to resolve asOf for ledger '{ledger}': {source}")]
@@ -141,12 +144,11 @@ async fn resolve_iso_to_t(fluree: &Fluree, ledger_id: &str, iso: &str) -> Result
     let ledger = view.to_ledger_state();
     let current_t = ledger.t();
 
-    let dt = DateTime::parse_from_rfc3339(iso).map_err(|source| {
-        EnvelopeSnapshotError::InvalidIso {
+    let dt =
+        DateTime::parse_from_rfc3339(iso).map_err(|source| EnvelopeSnapshotError::InvalidIso {
             iso: iso.to_string(),
             source,
-        }
-    })?;
+        })?;
     // ledger#time flakes store epoch milliseconds; mirror the rounding rule
     // from load_graph_db_at so sub-millisecond ISO precision doesn't push us
     // off-by-one before the intended commit (especially around genesis).
@@ -490,7 +492,8 @@ mod tests {
         // Span-based rewrite only touches the parsed FROM <iri> — markers
         // inside string literals or other IRI positions are untouched.
         let snap = snapshot(&[("ledgerA", 42)]);
-        let sparql = r#"SELECT ?x FROM <ledgerA> WHERE { ?x <http://example.org/p> "note: <ledgerA>" }"#;
+        let sparql =
+            r#"SELECT ?x FROM <ledgerA> WHERE { ?x <http://example.org/p> "note: <ledgerA>" }"#;
         let out = apply_snapshot_to_sparql(sparql, &snap);
         // The literal occurrence inside the string literal stays bare.
         assert!(out.contains(r#""note: <ledgerA>""#), "got: {out}");
@@ -543,7 +546,8 @@ mod tests {
     #[test]
     fn sparql_fragment_iri_from_named_clause_gets_t_spliced_before_fragment() {
         let snap = snapshot(&[("ledgerA", 42), ("ledgerB", 99)]);
-        let sparql = "SELECT ?x FROM <ledgerA#txn-meta> FROM NAMED <ledgerB#extras> WHERE { ?x ?p ?o }";
+        let sparql =
+            "SELECT ?x FROM <ledgerA#txn-meta> FROM NAMED <ledgerB#extras> WHERE { ?x ?p ?o }";
         let out = apply_snapshot_to_sparql(sparql, &snap);
         assert!(out.contains("FROM <ledgerA@t:42#txn-meta>"), "got: {out}");
         assert!(

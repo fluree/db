@@ -170,10 +170,16 @@ envelope entry).
     "alice": [ { "name": "Alice" } ],
     "bob":   { "head": { "vars": ["name"] }, "results": { "bindings": [...] } }
   },
-  "errors": {},
   "meta":   { "fuel_total": 1234.5, "elapsed_ms": 87 }
 }
 ```
+
+> **Field omission:** `errors` is omitted from the response when no
+> sub-query failed (zero entries → field skipped, not emitted as
+> `{}`). `meta` is omitted when `opts.meta` isn't set. `snapshot.asOf`
+> is omitted when the envelope used an integer `asOf` (no shared
+> wall-clock interpretation). Examples below show only the fields
+> that would appear in each scenario.
 
 ### Fields
 
@@ -199,18 +205,24 @@ envelope entry).
 
 ## Bounds
 
-The server enforces several limits per envelope. The defaults are the
-single-tenant server config; production deployments tune these via server
-settings.
+The server enforces several limits per envelope.
 
-| Bound | Default | Override surface |
-|-------|---------|------------------|
-| Max sub-queries / envelope | 64 | static server config only |
-| Max distinct ledgers / envelope | 8 | static server config only |
-| Max concurrent sub-queries | 16 | static + `opts.maxConcurrency` (clamped to static) |
-| Envelope wall deadline | 60_000 ms | static + `opts.timeoutMs` (clamped to static) |
+> **v1 status:** all server-side bounds use compile-time defaults
+> (`MultiQueryBounds::DEFAULT`). Per-server tuning via
+> `ServerConfig` / configuration file is **not yet wired** — the
+> "Override surface" column below lists the *request-side* knobs that
+> already work (`opts.maxConcurrency`, `opts.timeoutMs`). Static
+> configuration of the underlying limits is planned for a future
+> release.
+
+| Bound | v1 value | Override surface |
+|-------|----------|------------------|
+| Max sub-queries / envelope | 64 | request cannot override |
+| Max distinct ledgers / envelope | 8 | request cannot override |
+| Max concurrent sub-queries | 16 | `opts.maxConcurrency` (clamped to 16) |
+| Envelope wall deadline | 60_000 ms | `opts.timeoutMs` (clamped to 60_000) |
 | Per-sub-query timeout | `min(opts.timeoutMs, remaining envelope budget)` | `opts.timeoutMs` per-sub-query or per-envelope |
-| Response size | 64 MiB | static server config only |
+| Response size | 64 MiB | request cannot override |
 
 **Per-sub-query effective timeout** is computed when the sub-query
 acquires its concurrency permit, not at envelope entry. A sub-query that
