@@ -83,6 +83,7 @@
 - [HTTP API (fluree-db-server)](api/README.md)
   - [Overview](api/overview.md)
   - [Endpoints](api/endpoints.md)
+  - [Multi-query envelope](api/multi-query.md)
   - [Headers, content types, and request sizing](api/headers.md)
   - [Signed requests (JWS/VC)](api/signed-requests.md)
   - [Errors and status codes](api/errors.md)
