@@ -1156,7 +1156,7 @@ Content-Type: application/json
 - `401 Unauthorized` — authentication required and missing.
 - `500 Internal Server Error` — envelope infra failed (snapshot resolution couldn't load a ledger; response exceeds the size cap during assembly).
 
-**Full reference:** see [Multi-query envelope](multi-query.md) for the complete envelope contract, merge rules, snapshot semantics, bounds table, examples, and the explicit list of v1 limitations (history queries, envelope-level fuel budget).
+**Full reference:** see [Multi-query envelope](multi-query.md) for the complete envelope contract, merge rules, snapshot semantics, bounds table, examples, and the explicit list of current limitations (history queries, envelope-level fuel budget, response cap enforcement, SPARQL policy gap).
 
 ### GET/POST /explain
 

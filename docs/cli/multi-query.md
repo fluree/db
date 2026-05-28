@@ -35,14 +35,7 @@ fluree multi-query [FILE] [OPTIONS]
 
 Policy flags ride on the underlying HTTP request as `fluree-policy-*`
 headers; the server folds them into the envelope's top-level `opts`
-before validation, and the standard envelope → sub-query opts merge
-carries them into every alias. **They take effect on JSON-LD
-sub-queries** via the same code path single-query `/query` uses. **For
-SPARQL sub-queries** the headers are accepted and bearer ledger-scope
-still applies, but identity / policy threading via
-`QueryConnectionOptions` is not consumed in v1 — the same parity gap
-that exists today for connection-scoped SPARQL on `/query`. See
-[Limitations](#limitations) for the canonical list.
+before validation, and the standard envelope → sub-query opts merge carries them into every alias. **They take effect on JSON-LD sub-queries** via the same code path single-query `/query` uses. **For SPARQL sub-queries** the headers are accepted and bearer ledger-scope still applies, but identity / policy threading via `QueryConnectionOptions` is not consumed — the same gap that exists for connection-scoped SPARQL on `/query`. See [Limitations](#limitations) for the canonical list.
 
 ## Description
 
@@ -51,9 +44,7 @@ Each sub-query carries its own `from` and its own language (JSON-LD or
 SPARQL); the server runs them in parallel under bounded concurrency
 and returns a per-alias response map plus an aggregate `status`.
 
-See [Multi-query envelope](../api/multi-query.md) for the full envelope
-wire format, response shape, snapshot semantics, merge rules, bounds,
-and v1 limitations.
+See [Multi-query envelope](../api/multi-query.md) for the full envelope wire format, response shape, snapshot semantics, merge rules, bounds, and current limitations.
 
 ## Transport
 
@@ -158,17 +149,13 @@ envelope JSON malformed).
 
 ## Limitations
 
-Multi-query is a v1 feature with the explicit scope-cuts listed in the
-[envelope reference](../api/multi-query.md#limitations) — most notably:
+The full list lives in the [envelope reference](../api/multi-query.md#limitations). Highlights:
 
-- History queries (`to` field / `FROM <…> TO <…>`) rejected with 400.
-- Envelope-level `opts.max-fuel` rejected with 400 (per-sub-query
-  `opts.max-fuel` still works).
-- Response size cap is best-effort, not an OOM guard.
-- `opts.t` at any level inside the envelope is rejected — use `from`
-  or envelope `asOf`.
-- SPARQL sub-queries don't thread bearer identity — parity gap with
-  single-query connection-scoped SPARQL.
+- History queries (`to` field / `FROM <…> TO <…>`) are rejected with 400.
+- Envelope-level `opts.max-fuel` is rejected with 400 (per-sub-query `opts.max-fuel` still works).
+- Response size cap is enforced at assembly, not throughout dispatch; peak memory during dispatch can exceed the envelope cap.
+- `opts.t` at any level inside the envelope is rejected — use `from` or envelope `asOf`.
+- SPARQL sub-queries do not consume merged policy opts — same gap as single-query connection-scoped SPARQL.
 
 ## See also
 

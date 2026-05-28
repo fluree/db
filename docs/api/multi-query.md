@@ -1,7 +1,7 @@
 # Multi-query envelope
 
 > **Endpoint:** `POST /v1/fluree/multi-query`
-> **Status:** v1 (envelope contract stable; some features deferred — see [Limitations](#limitations))
+> **Status:** envelope contract stable; some features explicitly out of scope — see [Limitations](#limitations).
 
 Bundle multiple independent queries — JSON-LD, SPARQL, or both — into a single
 HTTP request that runs them in parallel against one shared snapshot moment.
@@ -109,10 +109,8 @@ produce invalid SPARQL.
 ### `opts` merge
 
 - Sub-query keys win on conflict.
-- Per-sub-query overrides supported in v1: `meta`, `policy`, `identity`,
-  `timeoutMs`, `max-fuel`.
-- `opts.t` is **rejected inside a multi-query envelope** at any level.
-  Pin time via `from` (sub-query level) or `asOf` (envelope level).
+- Per-sub-query overrides recognised: `meta`, `policy`, `identity`, `timeoutMs`, `max-fuel`.
+- `opts.t` is **rejected inside a multi-query envelope** at any level. Pin time via `from` (sub-query level) or `asOf` (envelope level).
 
 ---
 
@@ -207,16 +205,10 @@ envelope entry).
 
 The server enforces several limits per envelope.
 
-> **v1 status:** all server-side bounds use compile-time defaults
-> (`MultiQueryBounds::DEFAULT`). Per-server tuning via
-> `ServerConfig` / configuration file is **not yet wired** — the
-> "Override surface" column below lists the *request-side* knobs that
-> already work (`opts.maxConcurrency`, `opts.timeoutMs`). Static
-> configuration of the underlying limits is planned for a future
-> release.
+> The "Override surface" column below lists the request-side knobs that already work (`opts.maxConcurrency`, `opts.timeoutMs`). The other limits are compile-time defaults (`MultiQueryBounds::DEFAULT`) and not server-tunable today.
 
-| Bound | v1 value | Override surface |
-|-------|----------|------------------|
+| Bound | Value | Override surface |
+|-------|-------|------------------|
 | Max sub-queries / envelope | 64 | request cannot override |
 | Max distinct ledgers / envelope | 8 | request cannot override |
 | Max concurrent sub-queries | 16 | `opts.maxConcurrency` (clamped to 16) |
@@ -416,52 +408,14 @@ Response (HTTP 200):
 
 ## Limitations
 
-These are explicit v1 scope-cuts. Each has an issue tracking the lift.
+The following are not supported and produce documented behaviour rather than silent partial success.
 
-- **History queries are not supported inside envelopes.** A JSON-LD body
-  with a `to` field or a SPARQL query with `FROM <a@t:1> TO <a@t:latest>`
-  is rejected with `400 Bad Request`. History queries span a `t`-range
-  rather than a single snapshot, so the envelope's shared-snapshot
-  contract doesn't compose meaningfully. Run them as single queries via
-  `/query`.
-- **Envelope-level fuel budget is not enforced.** `opts.max-fuel` /
-  `max_fuel` / `maxFuel` at the envelope level is rejected with
-  `400 Bad Request`. Per-sub-query `opts.max-fuel` works unchanged.
-  Shared-atomic envelope budget needs a thread-safe budget tracker
-  plumbed through every fuel-charge site in the query engine — planned
-  for a future release.
-- **Cancellation is "Tier B".** When the envelope deadline fires,
-  in-flight blocking storage reads complete within a few hundred
-  milliseconds (cache hit: <5 ms; remote S3 range read: 50–200 ms)
-  before the future is observed as cancelled. No new work starts after
-  cancellation. Sub-millisecond cancellation latency requires injecting
-  a `CancellationToken` into the index store — planned for a future
-  release.
-- **`opts.t` is not accepted at any level inside the envelope.** Pin
-  time via `from` (e.g., `from: "ledger@t:42"`) or envelope `asOf`.
-- **Response size cap is best-effort, not an OOM guard.** Each
-  sub-query result is bounded by a per-sub-query post-format check that
-  catches a single runaway alias before it contributes to assembly,
-  and the assembler enforces the envelope-level cap when stitching
-  per-alias results together. But each sub-query still fully
-  materializes its result in memory before the per-sub-query check
-  fires — peak memory during dispatch is therefore bounded by
-  `max_concurrency × max_subquery_response_bytes`, not by the envelope
-  cap alone. Per-sub-query streaming serialization with byte-level
-  budget back-pressure is planned for a future release.
-- **SPARQL sub-queries don't consume merged policy opts (identity,
-  policy-class, policy, policy-values, default-allow).** The headers
-  ride through the transport, the server folds them into the
-  envelope's top-level `opts`, and the envelope → sub-query opts merge
-  carries them into each sub-query's opts — but the
-  connection-scoped SPARQL dispatch path (`query_from().sparql()`)
-  does not read body opts. JSON-LD sub-queries get full policy
-  threading via `apply_auth_identity_to_opts`; SPARQL sub-queries
-  observe bearer ledger-scope only. This is the same parity gap that
-  exists today for single-query connection-scoped SPARQL (`POST
-  /query` with `Content-Type: application/sparql-query` and an inline
-  `FROM`); the fix lands on both endpoints together via
-  `QueryConnectionOptions`-aware SPARQL dispatch.
+- **History queries are rejected.** A JSON-LD body with a `to` field or a SPARQL query with `FROM <a@t:1> TO <a@t:latest>` is rejected with `400 Bad Request`. History spans a `t`-range; the envelope's shared-snapshot contract has no meaning over a range. Use single queries against `/query` for history.
+- **Envelope-level fuel budget is rejected.** `opts.max-fuel` / `max_fuel` / `maxFuel` at the envelope level is rejected with `400 Bad Request` because the dispatcher does not currently share a fuel budget across parallel sub-queries. Per-sub-query `opts.max-fuel` works unchanged.
+- **Cancellation latency is bounded by in-flight storage reads.** When the envelope deadline fires, the dispatcher aborts the `JoinSet`; in-flight blocking storage reads still complete before the dropped future is observed (cache hit: under 5 ms; remote S3 range read: up to a few hundred ms). No new work starts after cancellation.
+- **`opts.t` is rejected at every level inside the envelope.** Pin time via `from` (e.g., `from: "ledger@t:42"`) or envelope `asOf`.
+- **Response size cap is enforced at assembly, not throughout dispatch.** Each sub-query result is checked against the per-sub-query cap once after it returns, and the assembler enforces the envelope-level cap as it stitches the response. Peak memory during dispatch is bounded by `max_concurrency × max_subquery_response_bytes`, which can exceed the envelope cap while individual sub-queries are running.
+- **SPARQL sub-queries do not consume merged policy opts (identity, policy-class, policy, policy-values, default-allow).** The headers ride through the transport, the server folds them into the envelope's top-level `opts`, and the envelope → sub-query opts merge carries them into each sub-query's opts — but the connection-scoped SPARQL dispatch path (`query_from().sparql()`) does not read body opts. JSON-LD sub-queries get full policy threading via `apply_auth_identity_to_opts`; SPARQL sub-queries observe bearer ledger-scope only. This is the same gap that exists for single-query connection-scoped SPARQL (`POST /query` with `Content-Type: application/sparql-query` and an inline `FROM`).
 
 ---
 
