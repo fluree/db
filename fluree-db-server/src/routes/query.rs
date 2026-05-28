@@ -2661,6 +2661,7 @@ pub(crate) async fn run_sparql_subquery(
     }
 }
 
+
 // =============================================================================
 // Multi-query envelope handler
 // =============================================================================
@@ -2670,7 +2671,9 @@ use fluree_db_api::query::multi::{
 };
 use fluree_db_api::query::multi_snapshot::resolve_envelope_snapshot;
 
-use super::multi_dispatch::{dispatch_multi_query, DispatchConfig};
+use super::multi_dispatch::{
+    dispatch_multi_query, DispatchConfig, MultiQueryIdentityContext,
+};
 use super::multi_response::{assemble_response, ResponseAssemblyError};
 
 /// `POST /v1/fluree/multi-query`
@@ -2734,6 +2737,15 @@ pub async fn multi_query(
             ServerError::bad_request(format!("invalid multi-query envelope: {e}"))
         })?;
 
+        // Inject fluree-* headers (policy-class, policy, policy-values,
+        // max-fuel, etc.) into the envelope's top-level opts *before*
+        // validation. This way the envelope-level rejections (max-fuel
+        // unsupported, maxConcurrency bounds) catch values supplied via
+        // headers the same as they catch body opts, and the merged opts
+        // carry the headers into every sub-query as defaults — parity
+        // with single-query `inject_headers_into_query`.
+        let envelope = inject_headers_into_envelope(envelope, &headers);
+
         let bounds = MultiQueryBounds::DEFAULT;
 
         // Validation — maps to 4xx with a structured error body.
@@ -2746,7 +2758,32 @@ pub async fn multi_query(
                 return Err(validation_error_to_server(&err));
             }
         };
-        let _ = &headers; // headers reserved for future identity / policy threading
+
+        // Bearer ledger-scope enforcement — parity with single-query
+        // /query and /query/:ledger. Unsigned bearer tokens may carry a
+        // scope that limits which ledgers they can read; any envelope
+        // referencing a ledger outside that scope is rejected with 404
+        // (avoiding existence leak), matching the single-query response.
+        if let Some(principal) = bearer.0.as_ref() {
+            if !credential.is_signed() {
+                for ledger_id in &distinct_ledgers {
+                    if !principal.can_read(ledger_id) {
+                        set_span_error_code(&span, "error:Forbidden");
+                        return Err(ServerError::not_found("Ledger not found"));
+                    }
+                }
+            }
+        }
+
+        // Resolve effective identity (signed DID > bearer identity) and
+        // the server-default policy-class — the dispatcher applies both
+        // to each JSON-LD sub-query's opts via
+        // `apply_auth_identity_to_opts`, matching the single-query
+        // handler's identity / policy-class injection.
+        let identity_ctx = MultiQueryIdentityContext {
+            identity: effective_identity(&credential, &bearer),
+            default_policy_class: data_auth.default_policy_class.clone(),
+        };
 
         let envelope_started = std::time::Instant::now();
 
@@ -2776,6 +2813,7 @@ pub async fn multi_query(
             envelope,
             Arc::clone(&snapshot),
             config,
+            Arc::new(identity_ctx),
         )
         .await;
 
@@ -2813,6 +2851,25 @@ fn validation_error_to_server(err: &MultiQueryValidationError) -> ServerError {
     let msg = err.to_string();
     // Validation errors are always client-fault — surface as 4xx.
     ServerError::bad_request(msg)
+}
+
+/// Inject `fluree-*` headers (policy-class, policy, policy-values, etc.)
+/// into the envelope's top-level `opts`. Sub-query opts merge against
+/// these envelope defaults during dispatch, so the headers reach every
+/// alias without per-sub-query repetition.
+fn inject_headers_into_envelope(
+    mut envelope: MultiQueryRequest,
+    headers: &FlureeHeaders,
+) -> MultiQueryRequest {
+    let mut opts = envelope
+        .opts
+        .take()
+        .unwrap_or_else(|| JsonValue::Object(serde_json::Map::new()));
+    if let Some(obj) = opts.as_object_mut() {
+        headers.inject_into_opts(obj);
+    }
+    envelope.opts = Some(opts);
+    envelope
 }
 
 /// Did the envelope opts request meta tracking?

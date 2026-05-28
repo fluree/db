@@ -40,6 +40,7 @@ use tracing::Instrument;
 use crate::error::ServerError;
 use crate::state::AppState;
 
+use super::policy_auth::apply_auth_identity_to_opts;
 use super::query::{run_jsonld_subquery, run_sparql_subquery, SubqueryOutput};
 
 /// Per-alias outcome assembled into the response by task #5.
@@ -74,6 +75,36 @@ pub(crate) enum AliasOutcomeKind {
 pub(crate) struct DispatchConfig {
     pub max_concurrency: usize,
     pub envelope_timeout_ms: u64,
+    /// Per-sub-query result-size ceiling in bytes, derived from
+    /// [`MultiQueryBounds::max_response_size_bytes`]. This is a
+    /// defensive belt-and-suspenders check that catches a single
+    /// runaway sub-query before it contributes to envelope-wide memory
+    /// pressure — the assembly-time envelope cap is the strict
+    /// guarantee, this one is the per-task early-exit.
+    pub max_subquery_response_bytes: usize,
+}
+
+/// Bearer-derived identity inputs applied to every JSON-LD sub-query.
+///
+/// `apply_auth_identity_to_opts` injects `identity` and the server's
+/// `default_policy_class` into each sub-query body's opts before
+/// dispatch — same code path the single-query `/query` handler uses for
+/// JSON-LD requests. The result is uniform identity behaviour across
+/// the two endpoints.
+///
+/// **SPARQL note:** the current single-query connection-scoped SPARQL
+/// path (i.e. when SPARQL declares its own `FROM <ledger>`) does not
+/// thread identity either. v1 multi-query matches that for parity;
+/// identity threading for connection-scoped SPARQL is a follow-up that
+/// lands on both endpoints at once.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct MultiQueryIdentityContext {
+    /// Effective principal identity for this envelope. `None` when no
+    /// authenticated principal is present (development mode).
+    pub identity: Option<String>,
+    /// Server-default policy class applied when the request doesn't
+    /// override via `opts.policy-class` (JSON-LD).
+    pub default_policy_class: Option<String>,
 }
 
 impl DispatchConfig {
@@ -92,9 +123,16 @@ impl DispatchConfig {
             .map(|v| v.min(bounds.max_envelope_timeout_ms))
             .unwrap_or(bounds.max_envelope_timeout_ms);
 
+        // Per-sub-query cap defaults to the envelope cap — a single
+        // alias is allowed to consume the whole budget, but no more. This
+        // keeps the worst case bounded without artificially partitioning
+        // among aliases that might be cheap.
+        let max_subquery_response_bytes = bounds.max_response_size_bytes;
+
         Self {
             max_concurrency,
             envelope_timeout_ms,
+            max_subquery_response_bytes,
         }
     }
 }
@@ -110,6 +148,7 @@ pub(crate) async fn dispatch_multi_query(
     envelope: MultiQueryRequest,
     snapshot: Arc<EnvelopeSnapshot>,
     config: DispatchConfig,
+    identity_ctx: Arc<MultiQueryIdentityContext>,
 ) -> Vec<AliasOutcome> {
     let envelope_context = Arc::new(envelope.context.clone());
     let envelope_opts = Arc::new(envelope.opts.clone());
@@ -128,6 +167,7 @@ pub(crate) async fn dispatch_multi_query(
         let envelope_context = Arc::clone(&envelope_context);
         let envelope_opts = Arc::clone(&envelope_opts);
         let semaphore = Arc::clone(&semaphore);
+        let identity_ctx = Arc::clone(&identity_ctx);
 
         let span = tracing::debug_span!(
             "sub_query",
@@ -176,12 +216,36 @@ pub(crate) async fn dispatch_multi_query(
                     envelope_context.as_ref().as_ref(),
                     envelope_opts.as_ref().as_ref(),
                     snapshot.as_ref(),
+                    identity_ctx.as_ref(),
                 );
                 let kind = match tokio::time::timeout(effective, exec).await {
-                    Ok(Ok(output)) => AliasOutcomeKind::Success {
-                        data: output.data,
-                        tally: output.tally,
-                    },
+                    Ok(Ok(output)) => {
+                        // Per-sub-query post-format size check. Each
+                        // alias result is serialized once for sizing
+                        // (a serialization the assembler would have
+                        // done anyway); if a single sub-query result is
+                        // already over the per-sub-query budget we mark
+                        // it as an error and drop the data, so a
+                        // runaway query doesn't sit in memory waiting
+                        // for envelope assembly to reject it.
+                        let bytes = serde_json::to_vec(&output.data)
+                            .map(|v| v.len())
+                            .unwrap_or(0);
+                        if bytes > config.max_subquery_response_bytes {
+                            AliasOutcomeKind::Error {
+                                code: "response_too_large".into(),
+                                message: format!(
+                                    "sub-query result is {bytes} bytes, exceeds per-sub-query cap of {} bytes",
+                                    config.max_subquery_response_bytes
+                                ),
+                            }
+                        } else {
+                            AliasOutcomeKind::Success {
+                                data: output.data,
+                                tally: output.tally,
+                            }
+                        }
+                    }
                     Ok(Err(server_err)) => AliasOutcomeKind::Error {
                         code: classify_error(&server_err),
                         message: server_err.to_string(),
@@ -271,6 +335,7 @@ async fn execute_subquery(
     envelope_context: Option<&JsonValue>,
     envelope_opts: Option<&JsonValue>,
     snapshot: &EnvelopeSnapshot,
+    identity_ctx: &MultiQueryIdentityContext,
 ) -> Result<SubqueryOutput, ServerError> {
     // Merge opts (envelope defaults, sub-query wins on key conflict).
     let merged_opts_val = merged_opts(envelope_opts, sub.opts.as_ref());
@@ -304,6 +369,24 @@ async fn execute_subquery(
                     obj.insert("opts".to_string(), opts);
                 }
             }
+
+            // Identity / default-policy-class injection. We use the
+            // sub-query's primary ledger (first entry in its `from`) as
+            // the impersonation-check context — sub-queries that span
+            // multiple ledgers fall back to the first as a conservative
+            // default. Matches single-query `/query` behaviour where
+            // ledger-id comes from a single source (path / header /
+            // body) per request.
+            let primary_ledger = primary_ledger_from_jsonld(&query_body);
+            apply_auth_identity_to_opts(
+                &state,
+                primary_ledger.as_deref().unwrap_or(""),
+                &mut query_body,
+                identity_ctx.identity.as_deref(),
+                identity_ctx.default_policy_class.as_deref(),
+            )
+            .await;
+
             apply_snapshot_to_jsonld(&mut query_body, snapshot);
 
             run_jsonld_subquery(&state, &query_body).await
@@ -324,9 +407,56 @@ async fn execute_subquery(
             } else {
                 None
             };
+            // SPARQL identity threading is a follow-up: the single-query
+            // connection-scoped SPARQL path doesn't currently thread
+            // identity either, so v1 multi-query matches that behavior
+            // for parity. Documented in docs/api/multi-query.md as a v1
+            // limitation; SPARQL identity threading via
+            // QueryConnectionOptions will land alongside the same fix
+            // on the single-query path.
             run_sparql_subquery(&state, &with_snapshot, tracking).await
         }
     }
+}
+
+/// Extract the first ledger identifier (with any temporal suffix
+/// stripped) from a JSON-LD sub-query body's `from` field. Used as the
+/// impersonation-check context for [`apply_auth_identity_to_opts`].
+///
+/// Sub-queries that span multiple ledgers fall back to the first entry —
+/// the impersonation check is per-bearer, not per-ledger, and asserting
+/// against the first ledger is conservative (a bearer that can
+/// impersonate against one ledger in a multi-ledger sub-query is
+/// trusted with that sub-query as a whole).
+fn primary_ledger_from_jsonld(query: &JsonValue) -> Option<String> {
+    let from = query.as_object()?.get("from")?;
+    let raw = match from {
+        JsonValue::String(s) => s.clone(),
+        JsonValue::Array(arr) => arr.iter().find_map(|v| match v {
+            JsonValue::String(s) => Some(s.clone()),
+            JsonValue::Object(obj) => obj
+                .get("@id")
+                .or_else(|| obj.get("id"))
+                .and_then(JsonValue::as_str)
+                .map(str::to_string),
+            _ => None,
+        })?,
+        JsonValue::Object(obj) => obj
+            .get("@id")
+            .or_else(|| obj.get("id"))
+            .and_then(JsonValue::as_str)?
+            .to_string(),
+        _ => return None,
+    };
+    // Strip a `@t:`/`@iso:`/`@commit:` suffix and any `#fragment` to
+    // align with the snapshot map / impersonation-table keying.
+    let bare = raw.split('#').next().unwrap_or(&raw);
+    for marker in ["@t:", "@iso:", "@commit:"] {
+        if let Some(idx) = bare.find(marker) {
+            return Some(bare[..idx].to_string());
+        }
+    }
+    Some(bare.to_string())
 }
 
 fn sub_query_timeout_ms(

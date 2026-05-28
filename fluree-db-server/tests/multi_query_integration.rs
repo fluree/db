@@ -483,6 +483,41 @@ async fn multi_query_max_concurrency_zero_returns_400() {
 // =============================================================================
 
 #[tokio::test]
+async fn multi_query_fragment_ledger_sparql_runs_at_envelope_t() {
+    // Regression: SPARQL `FROM <ledger#txn-meta>` must be pinned to the
+    // envelope's resolved `t` (with `@t:N` spliced before the fragment).
+    // Pre-fix, the rewrite was skipped because `value_str != bare`.
+    let (_tmp, state) = test_state().await;
+    let app = build_router(state);
+    create_ledger(&app, "mq:frag").await;
+    insert_one(&app, "mq:frag", "ex:f", "F").await;
+
+    let envelope = json!({
+        "queries": {
+            "txn": {
+                "language": "sparql",
+                "query": "SELECT ?s ?t FROM <mq:frag#txn-meta> WHERE { ?s <https://ns.flur.ee/db#t> ?t } LIMIT 1"
+            }
+        }
+    });
+    let (status, body) = post_envelope(&app, &envelope).await;
+    assert_eq!(status, StatusCode::OK, "got body: {body}");
+    // The query targets txn-meta and should resolve through the pinned
+    // ledger — it must not error out as a "ledger not found" or run
+    // against an unpinned snapshot. Any returned bindings are fine; the
+    // important assertion is that the alias landed in results not
+    // errors.
+    assert!(
+        body["results"]["txn"].is_object() || body["results"]["txn"].is_array(),
+        "txn alias should succeed against the txn-meta graph, got: {body}"
+    );
+    assert!(
+        body["errors"].is_null() || body["errors"].as_object().unwrap().is_empty(),
+        "no errors expected, got: {body}"
+    );
+}
+
+#[tokio::test]
 async fn multi_query_meta_block_included_when_opts_meta_true() {
     let (_tmp, state) = test_state().await;
     let app = build_router(state);

@@ -282,6 +282,13 @@ fn bare_ledger_id(s: &str) -> &str {
     bare
 }
 
+/// Does this identifier string carry a Fluree temporal marker (`@t:`,
+/// `@iso:`, `@commit:`)? Used to skip rewrite on already-pinned IRIs.
+/// Fragment suffixes (`#named-graph`) are not temporal and do not match.
+fn has_temporal_marker(s: &str) -> bool {
+    ["@t:", "@iso:", "@commit:"].iter().any(|m| s.contains(m))
+}
+
 /// Apply the envelope snapshot to a SPARQL sub-query, returning a new query
 /// string with `FROM <iri>` / `FROM NAMED <iri>` rewritten as
 /// `FROM <iri@t:N>` for each ledger present in the snapshot map.
@@ -320,13 +327,21 @@ pub fn apply_snapshot_to_sparql(sparql: &str, snapshot: &EnvelopeSnapshot) -> St
             let value_str: &str = value.as_ref();
             let bare = bare_ledger_id(value_str);
             if let Some(t) = snapshot.ledgers.get(bare) {
-                // Skip if the IRI already carries a temporal suffix; we don't
-                // overwrite explicit pins (validation should have rejected the
-                // envelope before we got here, but be defensive).
-                if value_str != bare {
+                // Defensive: skip IRIs that already carry an explicit
+                // temporal pin. Validation rejects collisions when
+                // envelope asOf is set, so this only fires in the
+                // no-asOf path where an inner pin should win.
+                if has_temporal_marker(value_str) {
                     continue;
                 }
-                let replacement = format!("<{value_str}@t:{t}>");
+                // Splice `@t:N` BEFORE any `#fragment` so named-graph
+                // selectors (e.g. `<ledger#txn-meta>`) are pinned
+                // correctly: `<ledger@t:42#txn-meta>`. The dataset parser
+                // reattaches the fragment after temporal parsing.
+                let replacement = match value_str.split_once('#') {
+                    Some((base, fragment)) => format!("<{base}@t:{t}#{fragment}>"),
+                    None => format!("<{value_str}@t:{t}>"),
+                };
                 edits.push((iri.span.start, iri.span.end, replacement));
             }
         }
@@ -508,6 +523,33 @@ mod tests {
         let sparql = "SELECT ?x FROM <ledgerA@t:99> WHERE { ?x ?p ?o }";
         let out = apply_snapshot_to_sparql(sparql, &snap);
         assert_eq!(out, sparql);
+    }
+
+    #[test]
+    fn sparql_fragment_iri_gets_t_spliced_before_fragment() {
+        // FROM <ledger#txn-meta> must be rewritten to
+        // FROM <ledger@t:42#txn-meta> — @t goes BEFORE the fragment
+        // because the dataset parser separates fragment from temporal
+        // suffix and reattaches the fragment after the time-spec.
+        let snap = snapshot(&[("ledgerA", 42)]);
+        let sparql = "SELECT ?x FROM <ledgerA#txn-meta> WHERE { ?x ?p ?o }";
+        let out = apply_snapshot_to_sparql(sparql, &snap);
+        assert!(
+            out.contains("FROM <ledgerA@t:42#txn-meta>"),
+            "expected fragment preserved with t spliced before, got: {out}"
+        );
+    }
+
+    #[test]
+    fn sparql_fragment_iri_from_named_clause_gets_t_spliced_before_fragment() {
+        let snap = snapshot(&[("ledgerA", 42), ("ledgerB", 99)]);
+        let sparql = "SELECT ?x FROM <ledgerA#txn-meta> FROM NAMED <ledgerB#extras> WHERE { ?x ?p ?o }";
+        let out = apply_snapshot_to_sparql(sparql, &snap);
+        assert!(out.contains("FROM <ledgerA@t:42#txn-meta>"), "got: {out}");
+        assert!(
+            out.contains("FROM NAMED <ledgerB@t:99#extras>"),
+            "got: {out}"
+        );
     }
 
     // -------------------------------------------------------------------------

@@ -427,6 +427,23 @@ These are explicit v1 scope-cuts. Each has an issue tracking the lift.
   release.
 - **`opts.t` is not accepted at any level inside the envelope.** Pin
   time via `from` (e.g., `from: "ledger@t:42"`) or envelope `asOf`.
+- **Response size cap is best-effort, not an OOM guard.** Each
+  sub-query result is bounded by a per-sub-query post-format check that
+  catches a single runaway alias before it contributes to assembly,
+  and the assembler enforces the envelope-level cap when stitching
+  per-alias results together. But each sub-query still fully
+  materializes its result in memory before the per-sub-query check
+  fires — peak memory during dispatch is therefore bounded by
+  `max_concurrency × max_subquery_response_bytes`, not by the envelope
+  cap alone. Per-sub-query streaming serialization with byte-level
+  budget back-pressure is planned for a future release.
+- **SPARQL sub-queries don't thread bearer identity / server-default
+  policy-class.** JSON-LD sub-queries pick these up via
+  `apply_auth_identity_to_opts` (same path as single-query `/query`).
+  SPARQL sub-queries currently match the single-query connection-scoped
+  SPARQL path, which also doesn't thread identity. Identity threading
+  for connection-scoped SPARQL will land on both endpoints together so
+  the parity stays clean.
 
 ---
 
