@@ -64,6 +64,8 @@ Cost ladder (per event):
 | R2RML row emitted (Iceberg/Parquet) | 0.001 |
 | Transaction commit baseline (once per commit, including each bulk-import chunk) | 10.000 |
 | Staged flake (per flake in a transaction or bulk-import chunk) | 0.001 |
+| Indexer CAS write (per successful `put` / `put_with_id` / `content_write_bytes` made by an index build) | 1.000 |
+| Re-encoded leaflet inside an FLI3 leaf write (passthrough leaflets are not charged) | 1.000 |
 | `REGEX` / `REPLACE` evaluation | 0.001 |
 | Hash function (`MD5`, `SHA1`, `SHA256`, `SHA384`, `SHA512`) | 0.001 |
 | `UUID` / `STRUUID` | 0.001 |
@@ -74,6 +76,14 @@ Cost ladder (per event):
 Cheap operations (comparisons, arithmetic, type checks, simple string ops, datetime extraction, etc.) cost zero — instrumentation overhead would dwarf the actual cost.
 
 The **query floor** guarantees every fuel-tracked query reports at least `1.000` fuel: a query touching no persisted data still costs the floor, and a query that errors during parsing/planning still reports it. I/O "touches" cost `0.010` each, so a scan-dominated query reports roughly `1.000 + 0.010 × (leaflet/dict touches)`. The fuel schedule above is defined in one place — `fluree-db-core/src/tracking.rs` (`tracking::schedule`).
+
+### Indexing Fuel
+
+Indexer CAS writes are billed through a `MeteredContentStore` wrapper that the build entry points install around the caller-supplied content store. Every successful `put` / `put_with_id` / `content_write_bytes` charges the base **1.000 fuel** rate — including index leaves, branch manifests, root manifests, dict packs / reverse-tree nodes, history sidecars, garbage records, stats sketches, and (incremental) spatial / fulltext arenas.
+
+FLI3 leaf writes carry an additional per-leaflet charge of **1.000 fuel per re-encoded leaflet**. Passthrough leaflets (byte-copies carried forward from a prior leaf during an incremental update) are **not** charged because no zstd encoding work was performed — so a 100-leaflet leaf where only two leaflets were touched by novelty bills `1 + 2 = 3` fuel, not `1 + 100`. The two FLI3 leaf upload sites (`build::upload::upload_indexes_to_cas` for full rebuild, `build::incremental::upload_leaf_blobs` for incremental) compute the count from `LeafInfo::re_encoded_leaflet_count`.
+
+Indexing fuel is **measurement only**: indexer trackers are no-limit. A partial index is worse than a slow one, so the indexer never aborts mid-build on a fuel limit. The plain public entry points (`build_index_for_record`, `rebuild_index_from_commits`) pass a disabled tracker and report `fuel: None`. The `*_with_tracker` variants (used by `/reindex`) wrap the store, propagate a fuel-enabled tracker, and stamp the final tally on `IndexResult::fuel` — `Some(0.0)` for an already-current build, `Some(N)` for one that did real work. `/reindex` always populates `fuel`; the wire response carries it as `fuel` (omitted when `None`).
 
 ### Setting Fuel Limits
 
