@@ -185,6 +185,36 @@ See [Ledger portability](#ledger-portability-flpack-files) below for the on-disk
 - `GET {api_base_url}/info/*ledger`
 - `GET {api_base_url}/exists/*ledger`
 
+### `fluree multi-query`
+
+- `POST {api_base_url}/multi-query`
+
+Bundles N JSON-LD and/or SPARQL sub-queries into a single envelope that
+the server runs in parallel against one resolved snapshot moment. The
+CLI reads the envelope JSON (file / stdin / `-e` inline) and POSTs it
+to the connection-scoped `/multi-query` endpoint — each sub-query
+declares its own `from`, so there is no ledger-scoped variant.
+
+Unlike `fluree query`, multi-query has **no in-process / local-only
+execution path**: the dispatcher lives in `fluree-db-server` and only
+the server exposes `/multi-query`. The CLI therefore requires a server
+transport:
+
+- **`--remote <name>`** — explicit; routes through the named remote's
+  configured `base_url`.
+- **Auto-route to a locally running `fluree server`** — used when
+  `--remote` is omitted and `server.meta.json` reports a live pid;
+  bypassed by `--direct`.
+- **No transport available** — the CLI surfaces an error pointing at
+  both options above rather than hanging or silently falling back.
+
+Auth, tracking, and policy headers all ride on the underlying
+`RemoteLedgerClient` transport — the envelope itself uses
+body-resident `opts` (`asOf`, `meta`, `maxConcurrency`, `timeoutMs`)
+and per-sub-query `opts` overrides instead of CLI flags. See
+[Multi-query envelope](../api/multi-query.md) for the full envelope
+contract, response shape, and v1 limitations.
+
 When the CLI is invoked with policy flags (`--as`, `--policy-class`,
 `--policy`, `--policy-file`, `--policy-values`, `--policy-values-file`,
 `--default-allow`), it carries them on every data API request via the headers

@@ -273,6 +273,26 @@ pub async fn run(cli: Cli) -> error::CliResult<()> {
             .await
         }
 
+        Commands::MultiQuery {
+            args,
+            expr,
+            file,
+            format,
+            remote,
+        } => {
+            let fluree_dir = config::require_fluree_dir_or_global(config_path)?;
+            commands::multi_query::run(
+                &args,
+                expr.as_deref(),
+                file.as_deref(),
+                &format,
+                &fluree_dir,
+                remote.as_deref(),
+                direct,
+            )
+            .await
+        }
+
         Commands::History {
             entity,
             ledger,

@@ -308,6 +308,75 @@ fn query_no_input_errors() {
     );
 }
 
+// ============================================================================
+// multi-query CLI
+// ============================================================================
+
+#[test]
+fn multi_query_help_shows_subcommand() {
+    cargo_bin_cmd!("fluree")
+        .args(["multi-query", "--help"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("multi-query"))
+        .stdout(predicate::str::contains("--remote"))
+        .stdout(predicate::str::contains("envelope"));
+}
+
+#[test]
+fn multi_query_invalid_json_rejected() {
+    let tmp = TempDir::new().unwrap();
+    fluree_cmd(&tmp).arg("init").assert().success();
+    // Inline malformed JSON — should fail at parse time before any
+    // transport resolution.
+    fluree_cmd(&tmp)
+        .args(["multi-query", "-e", "{ not json"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("not valid JSON"));
+}
+
+#[test]
+fn multi_query_without_transport_surfaces_help() {
+    let tmp = TempDir::new().unwrap();
+    fluree_cmd(&tmp).arg("init").assert().success();
+    // Valid envelope JSON, no --remote, no running local server. The
+    // CLI should explain both transport options rather than hanging or
+    // producing a cryptic error.
+    let envelope = r#"{"queries":{"a":{"language":"jsonld","query":{"from":"x","select":["?s"],"where":{"@id":"?s"}}}}}"#;
+    fluree_cmd(&tmp)
+        .args(["multi-query", "-e", envelope])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("--remote").or(predicate::str::contains("server start")));
+}
+
+#[test]
+fn multi_query_direct_flag_rejects_no_remote() {
+    let tmp = TempDir::new().unwrap();
+    fluree_cmd(&tmp).arg("init").assert().success();
+    // --direct disables auto-routing entirely; without --remote the
+    // command must error rather than hang.
+    let envelope = r#"{"queries":{"a":{"language":"jsonld","query":{"from":"x","select":["?s"],"where":{"@id":"?s"}}}}}"#;
+    fluree_cmd(&tmp)
+        .args(["--direct", "multi-query", "-e", envelope])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("no in-process execution path"));
+}
+
+#[test]
+fn multi_query_unknown_remote_errors() {
+    let tmp = TempDir::new().unwrap();
+    fluree_cmd(&tmp).arg("init").assert().success();
+    let envelope = r#"{"queries":{"a":{"language":"jsonld","query":{"from":"x","select":["?s"],"where":{"@id":"?s"}}}}}"#;
+    fluree_cmd(&tmp)
+        .args(["multi-query", "--remote", "nonexistent", "-e", envelope])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("nonexistent"));
+}
+
 #[test]
 fn query_positional_inline() {
     let tmp = TempDir::new().unwrap();

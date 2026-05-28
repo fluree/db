@@ -511,6 +511,45 @@ pub enum Commands {
         policy: PolicyArgs,
     },
 
+    /// Execute a multi-query envelope (multiple queries against a shared snapshot)
+    ///
+    /// Bundles N JSON-LD and/or SPARQL queries into a single request that
+    /// runs them in parallel against one resolved snapshot moment. Each
+    /// sub-query declares its own `from`; envelope-level `@context` /
+    /// `opts` / `asOf` lift into every sub-query as defaults.
+    ///
+    /// Examples:
+    ///   fluree multi-query envelope.json --remote origin
+    ///   cat envelope.json | fluree multi-query --remote origin
+    ///   fluree multi-query -e '{"queries":{"a":{"language":"jsonld","query":{"from":"mydb","select":["?s"],"where":{"@id":"?s"}}}}}'
+    ///
+    /// See `docs/api/multi-query.md` for the full envelope wire format.
+    #[command(name = "multi-query")]
+    MultiQuery {
+        /// Optional path to envelope JSON file. With 0 args reads from
+        /// stdin (or use -e / -f).
+        #[arg(num_args = 0..=1)]
+        args: Vec<String>,
+
+        /// Inline envelope JSON.
+        #[arg(short = 'e', long = "expr")]
+        expr: Option<String>,
+
+        /// Read envelope from a file.
+        #[arg(short = 'f', long = "file")]
+        file: Option<PathBuf>,
+
+        /// Output format. `json` (default) prints the response envelope
+        /// as-is; `pretty` indents it; `aliases` prints per-alias result
+        /// sections with status/errors at the top.
+        #[arg(long, default_value = "json")]
+        format: String,
+
+        /// Execute against a remote server (by remote name, e.g., "origin").
+        #[arg(long)]
+        remote: Option<String>,
+    },
+
     /// Show change history for an entity
     History {
         /// Entity IRI (e.g., "ex:alice" or full IRI). Uses stored prefixes for expansion.

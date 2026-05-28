@@ -15,6 +15,7 @@
   - [upsert](cli/upsert.md)
   - [update](cli/update.md)
   - [query](cli/query.md)
+  - [multi-query](cli/multi-query.md)
   - [history](cli/history.md)
   - [export](cli/export.md)
   - [context](cli/context.md)

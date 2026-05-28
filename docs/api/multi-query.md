@@ -463,6 +463,7 @@ These are explicit v1 scope-cuts. Each has an issue tracking the lift.
 
 - [Query endpoint reference](endpoints.md#post-query) — single-query
   `POST /query`
+- [`fluree multi-query` CLI](../cli/multi-query.md)
 - [Headers and content types](headers.md)
 - [Signed requests (JWS/VC)](signed-requests.md)
 - [Errors and status codes](errors.md)

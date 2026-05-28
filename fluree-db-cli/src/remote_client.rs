@@ -793,6 +793,26 @@ impl RemoteLedgerClient {
         .await
     }
 
+    /// Execute a multi-query envelope. The envelope's `queries` map carries
+    /// per-alias sub-queries (JSON-LD and/or SPARQL); each sub-query
+    /// declares its own `from`. The server runs them in parallel against a
+    /// single shared snapshot moment and returns a per-alias response.
+    ///
+    /// See [`docs/api/multi-query.md`] for the envelope wire format.
+    pub async fn multi_query(
+        &self,
+        envelope: &serde_json::Value,
+    ) -> Result<serde_json::Value, RemoteLedgerError> {
+        let url = self.op_url_root("multi-query");
+        self.send_json(
+            reqwest::Method::POST,
+            &url,
+            "application/json",
+            Some(RequestBody::Json(envelope)),
+        )
+        .await
+    }
+
     // -------------------------------------------------------------------------
     // Tracked variants
     //
