@@ -33,10 +33,16 @@ fluree multi-query [FILE] [OPTIONS]
 | `--policy-values-file <FILE>` | Read policy-values JSON from a file |
 | `--default-allow` | Permit access when no matching policy rules exist |
 
-All policy flags ride on the underlying HTTP request as
-`fluree-policy-*` headers; the server folds them into the envelope's
-top-level `opts` before validation, so they reach every sub-query
-through the normal opts merge.
+Policy flags ride on the underlying HTTP request as `fluree-policy-*`
+headers; the server folds them into the envelope's top-level `opts`
+before validation, and the standard envelope → sub-query opts merge
+carries them into every alias. **They take effect on JSON-LD
+sub-queries** via the same code path single-query `/query` uses. **For
+SPARQL sub-queries** the headers are accepted and bearer ledger-scope
+still applies, but identity / policy threading via
+`QueryConnectionOptions` is not consumed in v1 — the same parity gap
+that exists today for connection-scoped SPARQL on `/query`. See
+[Limitations](#limitations) for the canonical list.
 
 ## Description
 

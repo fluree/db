@@ -449,13 +449,19 @@ These are explicit v1 scope-cuts. Each has an issue tracking the lift.
   `max_concurrency × max_subquery_response_bytes`, not by the envelope
   cap alone. Per-sub-query streaming serialization with byte-level
   budget back-pressure is planned for a future release.
-- **SPARQL sub-queries don't thread bearer identity / server-default
-  policy-class.** JSON-LD sub-queries pick these up via
-  `apply_auth_identity_to_opts` (same path as single-query `/query`).
-  SPARQL sub-queries currently match the single-query connection-scoped
-  SPARQL path, which also doesn't thread identity. Identity threading
-  for connection-scoped SPARQL will land on both endpoints together so
-  the parity stays clean.
+- **SPARQL sub-queries don't consume merged policy opts (identity,
+  policy-class, policy, policy-values, default-allow).** The headers
+  ride through the transport, the server folds them into the
+  envelope's top-level `opts`, and the envelope → sub-query opts merge
+  carries them into each sub-query's opts — but the
+  connection-scoped SPARQL dispatch path (`query_from().sparql()`)
+  does not read body opts. JSON-LD sub-queries get full policy
+  threading via `apply_auth_identity_to_opts`; SPARQL sub-queries
+  observe bearer ledger-scope only. This is the same parity gap that
+  exists today for single-query connection-scoped SPARQL (`POST
+  /query` with `Content-Type: application/sparql-query` and an inline
+  `FROM`); the fix lands on both endpoints together via
+  `QueryConnectionOptions`-aware SPARQL dispatch.
 
 ---
 

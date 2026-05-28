@@ -359,11 +359,27 @@ For `POST /multi-query`, the CLI **does not** inject policy fields into the
 envelope body — it sends headers only. The server folds the headers into the
 envelope's top-level `opts` **before validation** (so envelope-level
 rejections like `max-fuel` apply to header-supplied values too), and the
-standard envelope→sub-query opts merge then carries them into every alias.
-This means a CLI-supplied `--policy-class` reaches every JSON-LD sub-query as
-a default and rides through to every SPARQL sub-query as the same
-`fluree-policy-class` header the connection-scoped SPARQL path already
-honors.
+standard envelope → sub-query opts merge then carries them into every alias.
+
+**Per-language effect:**
+
+- **JSON-LD sub-queries** consume the merged `opts.identity` /
+  `opts.policy-class` / `opts.policy` / `opts.policy-values` /
+  `opts.default-allow` via `apply_auth_identity_to_opts` and the regular
+  connection-scoped JSON-LD dispatch path — same code path
+  `POST /query` uses for single queries.
+- **SPARQL sub-queries** match the **single-query connection-scoped
+  SPARQL** behavior of `POST /query` with `Content-Type:
+  application/sparql-query` and an inline `FROM`: bearer-scope reads
+  apply, but identity threading via `QueryConnectionOptions` (`opts
+  .identity`, `opts.policy-class`, etc.) is not currently consumed by
+  that path. The headers still ride through the transport, and the
+  envelope-level fold still happens, but the SPARQL dispatcher (`query
+  _from().sparql()`) does not act on policy opts in v1. This parity
+  gap is the same one documented for connection-scoped SPARQL today;
+  the fix lands on both endpoints together. See
+  [Multi-query envelope → Limitations](../api/multi-query.md#limitations)
+  for the canonical v1 list.
 
 ### Required server behavior
 

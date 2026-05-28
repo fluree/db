@@ -378,6 +378,34 @@ fn multi_query_unknown_remote_errors() {
 }
 
 #[test]
+fn multi_query_missing_positional_file_errors_clearly() {
+    // Regression: a typoed positional file name must surface as a
+    // "failed to read <path>" error rather than silently routing to
+    // stdin and executing whatever happened to be piped in.
+    let tmp = TempDir::new().unwrap();
+    fluree_cmd(&tmp).arg("init").assert().success();
+    fluree_cmd(&tmp)
+        .args(["multi-query", "definitely-not-a-real-file.json"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("definitely-not-a-real-file.json"));
+}
+
+#[test]
+fn multi_query_unknown_format_errors_before_network() {
+    // --format is validated up front so a typo can't burn the
+    // server-side multi-query before failing locally.
+    let tmp = TempDir::new().unwrap();
+    fluree_cmd(&tmp).arg("init").assert().success();
+    let envelope = r#"{"queries":{"a":{"language":"jsonld","query":{"from":"x","select":["?s"],"where":{"@id":"?s"}}}}}"#;
+    fluree_cmd(&tmp)
+        .args(["multi-query", "--format", "jzon", "-e", envelope])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("unknown output format"));
+}
+
+#[test]
 fn query_positional_inline() {
     let tmp = TempDir::new().unwrap();
     fluree_cmd(&tmp).arg("init").assert().success();

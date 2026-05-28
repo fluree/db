@@ -32,13 +32,19 @@ pub async fn run(
     direct: bool,
     policy: &PolicyArgs,
 ) -> CliResult<()> {
-    // Positional arg, if present, is interpreted as a file path — same
-    // shape as `fluree query <FILE>` with no inline / no -f.
-    let positional_file = args.first().map(Path::new).filter(|p| {
-        // Treat as a file only if it actually exists; otherwise let
-        // the inline / stdin path take over with a clearer error.
-        p.exists() && p.is_file()
-    });
+    // Reject unknown --format values **before** the network round-trip
+    // so a typo like `--format jzon` doesn't burn the server-side work
+    // and the bearer's fuel.
+    validate_format(format)?;
+
+    // Positional arg, if present, is always interpreted as a file path
+    // — the only other shape multi-query accepts via positional would be
+    // inline JSON, but inline goes through -e to disambiguate. If the
+    // file doesn't exist, `read_input` surfaces a clear "failed to read
+    // <path>: No such file or directory" rather than silently falling
+    // through to stdin (which the previous existence filter caused under
+    // a piped shell).
+    let positional_file = args.first().map(Path::new);
 
     let source = input::resolve_input(expr, None, file_flag, positional_file)?;
     let content = input::read_input(&source)?;
@@ -108,7 +114,7 @@ pub async fn run(
         context::persist_refreshed_tokens(&client, name, dirs).await;
     }
 
-    print_response(&response, format)?;
+    print_response(&response, format);
     Ok(())
 }
 
@@ -121,7 +127,20 @@ fn no_transport_error() -> CliError {
     ))
 }
 
-fn print_response(response: &JsonValue, format: &str) -> CliResult<()> {
+/// Reject unsupported `--format` values up front, before any envelope
+/// parsing or network round-trip. Keeps the typo cost cheap — local
+/// usage error instead of a successful server-side multi-query whose
+/// result we can't print.
+fn validate_format(format: &str) -> CliResult<()> {
+    match format.to_lowercase().as_str() {
+        "json" | "pretty" | "aliases" => Ok(()),
+        other => Err(CliError::Usage(format!(
+            "unknown output format '{other}'; valid formats: json, pretty, aliases"
+        ))),
+    }
+}
+
+fn print_response(response: &JsonValue, format: &str) {
     match format.to_lowercase().as_str() {
         "json" => {
             // Pass-through: compact JSON, single line. Matches default
@@ -137,16 +156,12 @@ fn print_response(response: &JsonValue, format: &str) -> CliResult<()> {
                 serde_json::to_string_pretty(response).expect("serialize response")
             );
         }
-        "aliases" => {
-            print_per_alias(response);
-        }
-        other => {
-            return Err(CliError::Usage(format!(
-                "unknown output format '{other}'; valid formats: json, pretty, aliases"
-            )));
-        }
+        "aliases" => print_per_alias(response),
+        // Unreachable: `validate_format` is called at command entry
+        // before any of the work that produces a response, so an
+        // invalid value can never reach this branch.
+        other => unreachable!("unvalidated format '{other}' reached print_response"),
     }
-    Ok(())
 }
 
 /// Per-alias section view: status header, snapshot summary, then each
