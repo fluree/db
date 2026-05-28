@@ -57,8 +57,9 @@ async fn seed(fluree: &fluree_db_api::Fluree) {
     }
     for i in 0..N {
         // `ns:tag` is deliberately mixed-datatype (string on even, integer on
-        // odd), so a plain-string object on it can't be narrowed to a single
-        // datatype and exercises the "type ambiguous" path in scan `open()`.
+        // odd). xsd:string is its only string-compatible datatype, so a
+        // plain-string lookup still narrows to a tight xsd:string seek — the
+        // integer values can't match a string and don't block the narrowing.
         let tag = if i % 2 == 0 {
             json!(format!("tag-{i}"))
         } else {
@@ -81,11 +82,21 @@ async fn seed(fluree: &fluree_db_api::Fluree) {
     rebuild_and_publish_index(fluree, LEDGER_ID).await;
 }
 
-/// Run a tracked JSON-LD query, returning `(row_count, fuel)`.
+/// Run a tracked JSON-LD `select ["?s"]` query against `LEDGER_ID`.
 async fn tracked(fluree: &fluree_db_api::Fluree, where_obj: JsonValue) -> (usize, f64) {
+    tracked_on(fluree, LEDGER_ID, where_obj).await
+}
+
+/// Run a tracked JSON-LD `select ["?s"]` query against an explicit ledger,
+/// returning `(row_count, fuel)`.
+async fn tracked_on(
+    fluree: &fluree_db_api::Fluree,
+    ledger_id: &str,
+    where_obj: JsonValue,
+) -> (usize, f64) {
     let query = json!({
         "@context": ctx(),
-        "from": LEDGER_ID,
+        "from": ledger_id,
         "select": ["?s"],
         "where": where_obj,
     });
@@ -144,11 +155,11 @@ async fn bound_object_absent_string_does_not_scan_predicate() {
     let fluree = FlureeBuilder::memory().build_memory();
     seed(&fluree).await;
 
-    // `ns:tag` is mixed-datatype, so a plain-string object hits the
-    // "type ambiguous (xsd:string vs langString)" path — it can't be narrowed
-    // to one (o_type, o_key) range. An *absent* string still must short-circuit:
-    // xsd:string and langString share an interned string id, so a dict miss
-    // proves no string-typed flake can match. Must NOT full-scan ns:tag.
+    // `ns:tag` mixes xsd:string + int; xsd:string is its only string-compatible
+    // datatype, so a plain-string lookup narrows to a tight xsd:string seek. An
+    // *absent* string resolves to no str_id → NotFound → overlay-only, returning
+    // nothing without a full predicate scan. (The `(None,None)` find_string_id
+    // probe for non-narrowable predicates is covered by the langString test.)
     let (ghost_rows, ghost_fuel) = tracked(
         &fluree,
         json!({ "@id": "?s", "ns:tag": "tag-nonexistent-value" }),
@@ -161,12 +172,87 @@ async fn bound_object_absent_string_does_not_scan_predicate() {
          a full ns:tag predicate scan regressed"
     );
 
-    // Present string still resolves correctly. Narrowing the present ambiguous
-    // case is intentionally not attempted (it would change langString match
-    // semantics), so this path still full-scans — assert correctness only.
-    let (present_rows, _present_fuel) =
+    // Present string now narrows via per-predicate datatype stats: ns:tag is
+    // mixed xsd:string + int, but xsd:string is the only string-compatible tag,
+    // so a plain-string lookup seeks (XSD_STRING, str_id) — bounded fuel + correct.
+    let (present_rows, present_fuel) =
         tracked(&fluree, json!({ "@id": "?s", "ns:tag": "tag-0" })).await;
     assert_eq!(present_rows, 1, "present string matches exactly widget-0");
+    assert!(
+        present_fuel <= ABSENT_FUEL_CEILING,
+        "present string on mixed string+int predicate burned {present_fuel} fuel; \
+         expected a tight xsd:string seek, not a full scan"
+    );
+
+    // Pure xsd:string predicate (ns:name) also narrows to a tight seek.
+    let (name_rows, name_fuel) =
+        tracked(&fluree, json!({ "@id": "?s", "ns:name": "widget name 0" })).await;
+    assert_eq!(
+        name_rows, 1,
+        "present string on pure-string predicate matches widget-0"
+    );
+    assert!(
+        name_fuel <= ABSENT_FUEL_CEILING,
+        "present string on pure xsd:string predicate burned {name_fuel} fuel; expected a tight seek"
+    );
+}
+
+#[tokio::test]
+async fn untyped_string_on_langstring_predicate_stays_lenient_and_short_circuits_absent() {
+    // `ns:label` has BOTH xsd:string and rdf:langString values, so the gate must
+    // DECLINE to narrow (langString present). Two things to verify:
+    //   1. Negative guard: a present untyped string stays lenient — it matches
+    //      across both datatypes (xsd:string "shared" and "shared"@en).
+    //   2. The non-narrowable path's absent-string short-circuit still works: an
+    //      absent string hits the `(None,None)` find_string_id probe → NotFound
+    //      → overlay-only, so it must NOT full-scan the (large) ns:label predicate.
+    // The bulk of distinct labels makes a full scan visibly exceed the ceiling.
+    assert_index_defaults();
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger_id = "fuel-langstring:main";
+    let ledger0 = genesis_ledger(&fluree, ledger_id);
+
+    let mut graph = vec![
+        json!({ "@id": "ns:plain", "ns:label": "shared" }),
+        json!({ "@id": "ns:tagged", "ns:label": { "@value": "shared", "@language": "en" } }),
+    ];
+    for i in 0..N {
+        graph.push(json!({ "@id": format!("ns:row-{i}"), "ns:label": format!("label-{i}") }));
+    }
+    fluree
+        .insert(ledger0, &json!({ "@context": ctx(), "@graph": graph }))
+        .await
+        .expect("insert");
+    rebuild_and_publish_index(&fluree, ledger_id).await;
+
+    // (1) Present "shared" → lenient match across xsd:string + langString. This
+    // predicate has langString, so it intentionally does NOT narrow (Phase 2),
+    // hence we assert correctness only, not fuel.
+    let (present_rows, _present_fuel) = tracked_on(
+        &fluree,
+        ledger_id,
+        json!({ "@id": "?s", "ns:label": "shared" }),
+    )
+    .await;
+    assert_eq!(
+        present_rows, 2,
+        "untyped 'shared' must match both xsd:string and langString (lenient); \
+         optimizer must not narrow when langString is present"
+    );
+
+    // (2) Absent string → short-circuit via the find_string_id probe, no scan.
+    let (absent_rows, absent_fuel) = tracked_on(
+        &fluree,
+        ledger_id,
+        json!({ "@id": "?s", "ns:label": "no-such-label" }),
+    )
+    .await;
+    assert_eq!(absent_rows, 0, "absent string matches nothing");
+    assert!(
+        absent_fuel <= ABSENT_FUEL_CEILING,
+        "absent string on a langString predicate burned {absent_fuel} fuel (ceiling \
+         {ABSENT_FUEL_CEILING}); the find_string_id short-circuit regressed"
+    );
 }
 
 #[tokio::test]

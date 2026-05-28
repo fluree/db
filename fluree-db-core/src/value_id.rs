@@ -604,6 +604,29 @@ impl ValueTypeTag {
     pub const FULL_TEXT: Self = Self(39);
     pub const UNKNOWN: Self = Self(255);
 
+    /// String-compatible datatypes: those whose values decode to
+    /// `FlakeValue::String`. An untyped string query value can only match flakes
+    /// of these datatypes, so an optimizer may narrow a bare-string lookup to a
+    /// single one of these — but only when exactly one is present for the
+    /// predicate (and it is non-lang; langString also needs a language id).
+    ///
+    /// `UNKNOWN` is intentionally excluded: it may stand in for an unrecognized
+    /// string-valued datatype, so its presence must be treated as unsafe to narrow.
+    #[inline]
+    pub const fn is_string_compatible(self) -> bool {
+        matches!(
+            self,
+            Self::STRING
+                | Self::LANG_STRING
+                | Self::ANY_URI
+                | Self::NORMALIZED_STRING
+                | Self::TOKEN
+                | Self::LANGUAGE
+                | Self::BASE64_BINARY
+                | Self::HEX_BINARY
+        )
+    }
+
     /// Resolve a (namespace_code, local_name) pair to a ValueTypeTag.
     ///
     /// This is the primary entry point for the resolver. Matches against

@@ -2549,11 +2549,41 @@ fn infer_exact_datatype_sid_from_stats(
     value: &FlakeValue,
 ) -> Option<Sid> {
     let stats = stats_view?.get_graph_property(g_id, p_id)?;
-    let mut tags = stats
+    let present: Vec<fluree_db_core::ValueTypeTag> = stats
         .datatypes
         .iter()
         .filter_map(|(tag, count)| (*count > 0).then_some(*tag))
-        .collect::<Vec<_>>();
+        .collect();
+
+    // Untyped string values can only match string-compatible datatypes, so
+    // non-string tags on the predicate (int/date/ref/…) are irrelevant. Narrow
+    // when exactly one string-compatible tag is present and it is non-lang
+    // (langString needs a language id → multi-slice path). UNKNOWN is unsafe —
+    // it may stand in for a string-valued datatype, so its presence declines
+    // narrowing. These stats are novelty-aware (the datatype set reflects base +
+    // novelty), so "only one string-compatible tag" is a conclusive statement
+    // about the whole logical DB, not just the base index.
+    if matches!(value, FlakeValue::String(_)) {
+        if present.contains(&fluree_db_core::ValueTypeTag::UNKNOWN) {
+            return None;
+        }
+        let mut strs: Vec<fluree_db_core::ValueTypeTag> = present
+            .iter()
+            .copied()
+            .filter(|t| t.is_string_compatible())
+            .collect();
+        strs.sort();
+        strs.dedup();
+        return match strs.as_slice() {
+            [only] if *only != fluree_db_core::ValueTypeTag::LANG_STRING => {
+                datatype_sid_for_untyped_value(value, *only)
+            }
+            _ => None,
+        };
+    }
+
+    // Non-string values: exact single-datatype inference.
+    let mut tags = present;
     tags.sort();
     tags.dedup();
     if tags.len() != 1 {
@@ -2618,6 +2648,33 @@ fn datatype_sid_for_untyped_value(
             }
             fluree_db_core::ValueTypeTag::LONG => Some(Sid::new(namespaces::XSD, xsd_names::LONG)),
             fluree_db_core::ValueTypeTag::INT => Some(Sid::new(namespaces::XSD, xsd_names::INT)),
+            _ => None,
+        },
+        // Untyped string → the single string-compatible datatype the caller's
+        // stats gate selected. langString is intentionally absent: it needs a
+        // language id, so it routes through the (future) multi-slice path.
+        FlakeValue::String(_) => match tag {
+            fluree_db_core::ValueTypeTag::STRING => {
+                Some(Sid::new(namespaces::XSD, xsd_names::STRING))
+            }
+            fluree_db_core::ValueTypeTag::ANY_URI => {
+                Some(Sid::new(namespaces::XSD, xsd_names::ANY_URI))
+            }
+            fluree_db_core::ValueTypeTag::NORMALIZED_STRING => {
+                Some(Sid::new(namespaces::XSD, xsd_names::NORMALIZED_STRING))
+            }
+            fluree_db_core::ValueTypeTag::TOKEN => {
+                Some(Sid::new(namespaces::XSD, xsd_names::TOKEN))
+            }
+            fluree_db_core::ValueTypeTag::LANGUAGE => {
+                Some(Sid::new(namespaces::XSD, xsd_names::LANGUAGE))
+            }
+            fluree_db_core::ValueTypeTag::BASE64_BINARY => {
+                Some(Sid::new(namespaces::XSD, xsd_names::BASE64_BINARY))
+            }
+            fluree_db_core::ValueTypeTag::HEX_BINARY => {
+                Some(Sid::new(namespaces::XSD, xsd_names::HEX_BINARY))
+            }
             _ => None,
         },
         _ => None,
