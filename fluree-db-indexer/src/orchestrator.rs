@@ -1034,6 +1034,11 @@ impl BackgroundIndexerWorker {
         // background indexing pass is measured. Indexing never enforces a
         // limit — measurement only. The tally is logged on success and
         // propagated to all waiters via IndexOutcome::Completed::fuel.
+        //
+        // The tracker is kept by reference (clone is cheap — Option<Arc<...>>)
+        // so we can still read its tally if the build fails after partial CAS
+        // writes. Without this the only fuel signal for failed background
+        // builds would be lost when no caller is waiting.
         let build_tracker = fluree_db_core::tracking::Tracker::new(
             fluree_db_core::tracking::TrackingOptions {
                 track_fuel: true,
@@ -1042,7 +1047,7 @@ impl BackgroundIndexerWorker {
         );
         let result = crate::build_index_for_record_with_tracker(
             content_store,
-            build_tracker,
+            build_tracker.clone(),
             &record,
             self.config.clone(),
         )
@@ -1054,11 +1059,16 @@ impl BackgroundIndexerWorker {
                 if let Err(e) =
                     crate::publish_index_result(self.nameservice.as_ref(), &index_result).await
                 {
+                    // Surface the build's fuel + index_t on publish failure —
+                    // in background mode there is no caller, so this is the
+                    // only place the (already-paid-for) work shows up.
                     warn!(
-                    ledger_id = %ledger_id,
-                            error = %e,
-                            "Failed to publish index, will retry"
-                        );
+                        ledger_id = %ledger_id,
+                        index_t = index_result.index_t,
+                        fuel = ?index_result.fuel,
+                        error = %e,
+                        "Failed to publish index, will retry"
+                    );
                     self.schedule_retry(ledger_id, &e.to_string()).await;
                 } else {
                     info!(
@@ -1134,11 +1144,16 @@ impl BackgroundIndexerWorker {
                 }
             }
             Err(e) => {
+                // Partial fuel from CAS writes that happened before the
+                // build failed. Best-effort signal — disabled tracker or
+                // a failure before the first write reports None / 0.
+                let partial_fuel = build_tracker.tally().and_then(|t| t.fuel);
                 warn!(
-                ledger_id = %ledger_id,
-                        error = %e,
-                        "Indexing failed, will retry"
-                    );
+                    ledger_id = %ledger_id,
+                    partial_fuel = ?partial_fuel,
+                    error = %e,
+                    "Indexing failed, will retry"
+                );
                 self.schedule_retry(ledger_id, &e.to_string()).await;
             }
         }
