@@ -2497,78 +2497,167 @@ async fn execute_dataset_query(
         }
     }
 
-    // Execute through the connection path which handles dataset parsing
-    if has_tracking_opts(&query) {
-        let response = match state
-            .fluree
-            .query_from()
-            .jsonld(&query)
-            .execute_tracked()
-            .await
-        {
-            Ok(response) => response,
-            Err(e) => {
-                let server_error =
-                    ServerError::Api(fluree_db_api::ApiError::http(e.status, e.error));
-                set_span_error_code(span, "error:InvalidQuery");
-                tracing::error!(
-                    error = %server_error,
-                    query_kind = "dataset",
-                    "tracked dataset query failed"
-                );
-                return Err(server_error);
-            }
-        };
+    // Delegate the actual execution to the connection-scoped sub-query helper —
+    // the same path the multi-query dispatcher uses for each sub-query alias.
+    let tracked = has_tracking_opts(&query);
+    let outcome = run_jsonld_subquery(state, &query)
+        .await
+        .map_err(|e| {
+            set_span_error_code(span, "error:InvalidQuery");
+            tracing::error!(
+                error = %e,
+                query_kind = "dataset",
+                tracked,
+                "dataset query failed"
+            );
+            e
+        })?;
 
-        // Record tracker fields on the execution span
-        if let Some(ref time) = response.time {
+    if let Some(tally) = outcome.tally {
+        // Record tracker fields on the execution span (parity with prior behavior).
+        if let Some(ref time) = tally.time {
             span.record("tracker_time", time.as_str());
         }
-        if let Some(fuel) = response.fuel {
+        if let Some(fuel) = tally.fuel {
             span.record("tracker_fuel", fuel);
         }
+        let headers = tracking_headers(&tally);
+        let response =
+            fluree_db_api::TrackedQueryResponse::success(outcome.data, Some(tally.clone()));
+        tracing::info!(
+            status = "success",
+            tracked = true,
+            query_kind = "dataset",
+            time = ?tally.time,
+            fuel = tally.fuel
+        );
+        Ok((headers, Json(response)).into_response())
+    } else {
+        tracing::info!(
+            status = "success",
+            query_kind = "dataset",
+            result_count = outcome.data.as_array().map(std::vec::Vec::len).unwrap_or(0)
+        );
+        Ok((HeaderMap::new(), Json(outcome.data)).into_response())
+    }
+}
 
+// =============================================================================
+// Sub-query execution helpers (shared between single-query handlers and the
+// multi-query envelope dispatcher).
+// =============================================================================
+
+/// Output of a single sub-query execution.
+///
+/// The caller is responsible for assembling either an HTTP response
+/// (single-query path) or a per-alias entry inside a multi-query envelope
+/// response (multi-query path).
+#[derive(Debug)]
+pub(crate) struct SubqueryOutput {
+    /// JSON-formatted query result. For JSON-LD: the formatted query JSON.
+    /// For SPARQL: SPARQL 1.1 Results JSON (or whichever format the
+    /// connection-builder produced).
+    pub data: JsonValue,
+    /// Tracking telemetry. Populated when `opts.meta` (JSON-LD) or
+    /// `fluree-track-*` headers (SPARQL) requested tracking; `None` otherwise.
+    pub tally: Option<TrackingTally>,
+}
+
+/// Execute a JSON-LD sub-query through the connection (`query_from()`) path.
+///
+/// This is the same path the single-query handler uses for queries with
+/// dataset features (`from` array, `fromNamed`, time-travel) via
+/// [`execute_dataset_query`]. No HTTP wrapping is performed — the caller
+/// assembles the result into either an `axum::Response` (single-query) or a
+/// multi-query envelope entry (multi-query dispatcher).
+///
+/// The caller is expected to:
+/// - Have already merged envelope-level `@context` and `opts` into
+///   `query_json` (multi-query path) or to have processed headers and policy
+///   via `inject_headers_into_query` (single-query path).
+/// - Have validated envelope bounds and `asOf` collision rules at envelope
+///   parse time (multi-query path).
+/// - Be inside whichever tracing span the caller chose to attribute this
+///   execution to (this function does not create its own span).
+///
+/// Tracking is enabled implicitly when [`has_tracking_opts`] returns true for
+/// the query body — matching the existing single-query semantics.
+pub(crate) async fn run_jsonld_subquery(
+    state: &AppState,
+    query_json: &JsonValue,
+) -> Result<SubqueryOutput> {
+    if has_tracking_opts(query_json) {
+        let response = state
+            .fluree
+            .query_from()
+            .jsonld(query_json)
+            .execute_tracked()
+            .await
+            .map_err(|e| ServerError::Api(fluree_db_api::ApiError::http(e.status, e.error)))?;
         let tally = TrackingTally {
             time: response.time.clone(),
             fuel: response.fuel,
             policy: response.policy.clone(),
         };
-        let headers = tracking_headers(&tally);
-
-        tracing::info!(
-            status = "success",
-            tracked = true,
-            query_kind = "dataset",
-            time = ?response.time,
-            fuel = response.fuel
-        );
-        Ok((headers, Json(response)).into_response())
+        Ok(SubqueryOutput {
+            data: response.result,
+            tally: Some(tally),
+        })
     } else {
-        match state
+        let data = state
             .fluree
             .query_from()
-            .jsonld(&query)
+            .jsonld(query_json)
             .execute_formatted()
             .await
-        {
-            Ok(result) => {
-                tracing::info!(
-                    status = "success",
-                    query_kind = "dataset",
-                    result_count = result.as_array().map(std::vec::Vec::len).unwrap_or(0)
-                );
-                Ok((HeaderMap::new(), Json(result)).into_response())
-            }
-            Err(e) => {
-                let server_error = ServerError::Api(e);
-                set_span_error_code(span, "error:InvalidQuery");
-                tracing::error!(
-                    error = %server_error,
-                    query_kind = "dataset",
-                    "dataset query failed"
-                );
-                Err(server_error)
-            }
-        }
+            .map_err(ServerError::Api)?;
+        Ok(SubqueryOutput { data, tally: None })
+    }
+}
+
+/// Execute a SPARQL sub-query through the connection (`query_from()`) path.
+///
+/// The SPARQL string carries its own `FROM <ledger>` dataset clause; the
+/// connection builder routes through nameservice / snapshot loading without
+/// extra wiring.
+///
+/// `tracked` mirrors the single-query convention of "tracking is requested
+/// when the corresponding tracking headers / opts were set." For SPARQL there
+/// is no body `opts` block, so the caller passes the resolved flag.
+#[expect(dead_code)]
+// Used by: the multi-query envelope dispatcher (Task #4) for each SPARQL
+// sub-query. Single-query callers will adopt it in a follow-up to share
+// the connection-scoped SPARQL execution path.
+pub(crate) async fn run_sparql_subquery(
+    state: &AppState,
+    sparql: &str,
+    tracked: bool,
+) -> Result<SubqueryOutput> {
+    if tracked {
+        let response = state
+            .fluree
+            .query_from()
+            .sparql(sparql)
+            .execute_tracked()
+            .await
+            .map_err(|e| ServerError::Api(fluree_db_api::ApiError::http(e.status, e.error)))?;
+        let tally = TrackingTally {
+            time: response.time.clone(),
+            fuel: response.fuel,
+            policy: response.policy.clone(),
+        };
+        Ok(SubqueryOutput {
+            data: response.result,
+            tally: Some(tally),
+        })
+    } else {
+        let data = state
+            .fluree
+            .query_from()
+            .sparql(sparql)
+            .execute_formatted()
+            .await
+            .map_err(ServerError::Api)?;
+        Ok(SubqueryOutput { data, tally: None })
     }
 }
