@@ -224,6 +224,13 @@ fn apply_jsonld_from(from: &mut JsonValue, ledgers: &HashMap<String, i64>) {
 }
 
 fn pin_string_entry(s: String, ledgers: &HashMap<String, i64>) -> JsonValue {
+    // If the identifier already carries an explicit temporal pin (e.g.
+    // `ledgerA@t:42`), leave it alone — the user-specified pin wins. Without
+    // this check we'd rewrite to `{ "@id": "ledgerA@t:42", "t": current }`
+    // which the dataset parser interprets as `t` overriding the suffix.
+    if string_has_explicit_pin(&s) {
+        return JsonValue::String(s);
+    }
     let bare = bare_ledger_id(&s);
     if let Some(t) = ledgers.get(bare) {
         let mut obj = JsonMap::new();
@@ -236,17 +243,31 @@ fn pin_string_entry(s: String, ledgers: &HashMap<String, i64>) -> JsonValue {
 }
 
 fn pin_object_entry(obj: &mut JsonMap<String, JsonValue>, ledgers: &HashMap<String, i64>) {
+    // Explicit object-level pin wins over envelope snapshot — same rule as
+    // string-form, applied to `t` / `at` fields and to a marker-bearing
+    // `@id`/`id`.
+    if obj.contains_key("t") || obj.contains_key("at") {
+        return;
+    }
     let id = obj
         .get("@id")
         .or_else(|| obj.get("id"))
         .and_then(JsonValue::as_str)
         .map(str::to_string);
     let Some(id) = id else { return };
+    if string_has_explicit_pin(&id) {
+        return;
+    }
     let bare = bare_ledger_id(&id);
     let Some(t) = ledgers.get(bare).copied() else {
         return;
     };
     obj.insert("t".to_string(), JsonValue::Number(t.into()));
+}
+
+/// Does this identifier string carry a `@t:`/`@iso:`/`@commit:` suffix?
+fn string_has_explicit_pin(s: &str) -> bool {
+    ["@t:", "@iso:", "@commit:"].iter().any(|m| s.contains(m))
 }
 
 /// Bare ledger id (no temporal suffix, no named-graph fragment). Mirrors the
@@ -487,5 +508,93 @@ mod tests {
         let sparql = "SELECT ?x FROM <ledgerA@t:99> WHERE { ?x ?p ?o }";
         let out = apply_snapshot_to_sparql(sparql, &snap);
         assert_eq!(out, sparql);
+    }
+
+    // -------------------------------------------------------------------------
+    // Inner pin preserved when envelope omits asOf (review fix High #1)
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn jsonld_string_from_with_suffix_left_untouched() {
+        // Inner explicit pin (`@t:42`) wins — applier must leave the string
+        // alone. Otherwise we'd rewrite to {"@id":"ledgerA@t:42","t":99}
+        // and the object `t` would silently override the suffix.
+        let snap = snapshot(&[("ledgerA", 99)]);
+        let mut query = json!({
+            "from": "ledgerA@t:42",
+            "select": {"?s": ["*"]},
+            "where": []
+        });
+        apply_snapshot_to_jsonld(&mut query, &snap);
+        assert_eq!(query["from"], "ledgerA@t:42");
+    }
+
+    #[test]
+    fn jsonld_string_from_with_iso_suffix_left_untouched() {
+        let snap = snapshot(&[("ledgerA", 99)]);
+        let mut query = json!({
+            "from": "ledgerA@iso:2024-01-01T00:00:00Z",
+            "select": {"?s": ["*"]},
+            "where": []
+        });
+        apply_snapshot_to_jsonld(&mut query, &snap);
+        assert_eq!(query["from"], "ledgerA@iso:2024-01-01T00:00:00Z");
+    }
+
+    #[test]
+    fn jsonld_object_from_with_explicit_t_field_left_untouched() {
+        let snap = snapshot(&[("ledgerA", 99)]);
+        let mut query = json!({
+            "from": { "@id": "ledgerA", "t": 42 },
+            "select": {"?s": ["*"]},
+            "where": []
+        });
+        apply_snapshot_to_jsonld(&mut query, &snap);
+        // Original t survives — applier doesn't overwrite when a pin exists.
+        assert_eq!(query["from"]["t"], 42);
+    }
+
+    #[test]
+    fn jsonld_object_from_with_explicit_at_field_left_untouched() {
+        let snap = snapshot(&[("ledgerA", 99)]);
+        let mut query = json!({
+            "from": { "@id": "ledgerA", "at": "commit:abc123" },
+            "select": {"?s": ["*"]},
+            "where": []
+        });
+        apply_snapshot_to_jsonld(&mut query, &snap);
+        assert_eq!(query["from"]["at"], "commit:abc123");
+        // No `t` added — `at` is the active pin.
+        assert!(query["from"].as_object().unwrap().get("t").is_none());
+    }
+
+    #[test]
+    fn jsonld_object_from_with_id_suffix_left_untouched() {
+        let snap = snapshot(&[("ledgerA", 99)]);
+        let mut query = json!({
+            "from": { "@id": "ledgerA@t:42" },
+            "select": {"?s": ["*"]},
+            "where": []
+        });
+        apply_snapshot_to_jsonld(&mut query, &snap);
+        // No `t` field added — the suffix in @id is the pin.
+        assert_eq!(query["from"]["@id"], "ledgerA@t:42");
+        assert!(query["from"].as_object().unwrap().get("t").is_none());
+    }
+
+    #[test]
+    fn jsonld_mixed_array_preserves_pinned_entries_only() {
+        // Two entries for the same ledger: one with an explicit pin, one bare.
+        // The pinned entry stays; the bare entry gets the envelope's t.
+        let snap = snapshot(&[("ledgerA", 99), ("ledgerB", 42)]);
+        let mut query = json!({
+            "from": ["ledgerA@t:1", "ledgerB"],
+            "select": {"?s": ["*"]},
+            "where": []
+        });
+        apply_snapshot_to_jsonld(&mut query, &snap);
+        assert_eq!(query["from"][0], "ledgerA@t:1");
+        assert_eq!(query["from"][1]["@id"], "ledgerB");
+        assert_eq!(query["from"][1]["t"], 42);
     }
 }

@@ -272,10 +272,23 @@ pub enum MultiQueryValidationError {
         "opts.maxConcurrency = {value} exceeds server limit {limit}"
     )]
     MaxConcurrencyExceeded { value: u64, limit: usize },
+    #[error("opts.maxConcurrency must be at least 1")]
+    MaxConcurrencyZero,
     #[error(
         "opts.timeoutMs = {value} exceeds server limit {limit}"
     )]
     TimeoutExceeded { value: u64, limit: u64 },
+    #[error(
+        "envelope-level fuel budget (max-fuel) is not supported in v1; \
+         set per-sub-query opts.max-fuel instead"
+    )]
+    EnvelopeFuelBudgetUnsupported,
+    #[error(
+        "sub-query '{alias}': history queries (with 'to' / FROM <...> TO <...>) \
+         are not yet supported inside multi-query envelopes — run them as \
+         single queries"
+    )]
+    HistoryQueryInEnvelope { alias: String },
 }
 
 /// Validate an envelope against server bounds and the merge/collision rules.
@@ -352,6 +365,9 @@ fn validate_envelope_opts(
     bounds: &MultiQueryBounds,
 ) -> Result<(), MultiQueryValidationError> {
     if let Some(mc) = opts.get("maxConcurrency").and_then(JsonValue::as_u64) {
+        if mc == 0 {
+            return Err(MultiQueryValidationError::MaxConcurrencyZero);
+        }
         if (mc as usize) > bounds.max_concurrency {
             return Err(MultiQueryValidationError::MaxConcurrencyExceeded {
                 value: mc,
@@ -366,6 +382,16 @@ fn validate_envelope_opts(
                 limit: bounds.max_envelope_timeout_ms,
             });
         }
+    }
+    // Envelope-level fuel budget would need shared-atomic accounting across
+    // parallel sub-queries to be enforceable; v1 supports per-sub-query
+    // max-fuel only. Rejecting outright keeps "envelope total" from being
+    // silently multiplied across N aliases.
+    if opts.contains_key("max-fuel")
+        || opts.contains_key("max_fuel")
+        || opts.contains_key("maxFuel")
+    {
+        return Err(MultiQueryValidationError::EnvelopeFuelBudgetUnsupported);
     }
     Ok(())
 }
@@ -382,6 +408,15 @@ fn validate_jsonld_subquery(
         .ok_or_else(|| MultiQueryValidationError::JsonLdBodyNotObject {
             alias: alias.to_string(),
         })?;
+
+    // History queries (explicit `to` endpoint) span a range across two `t`
+    // values rather than a single snapshot. The envelope's shared-snapshot
+    // contract doesn't compose meaningfully with that; reject in v1.
+    if body.contains_key("to") {
+        return Err(MultiQueryValidationError::HistoryQueryInEnvelope {
+            alias: alias.to_string(),
+        });
+    }
 
     // Inner `t` field is a temporal pin.
     if envelope_pinned && body.contains_key("t") {
@@ -435,6 +470,12 @@ fn validate_sparql_subquery(
             alias: alias.to_string(),
         })?;
 
+    if sparql_is_history_query(body) {
+        return Err(MultiQueryValidationError::HistoryQueryInEnvelope {
+            alias: alias.to_string(),
+        });
+    }
+
     // If the SPARQL fails to parse, defer to the downstream parser for a
     // clearer error at execution time — validation only enforces the
     // multi-query invariants, not SPARQL grammar.
@@ -461,6 +502,24 @@ fn validate_sparql_subquery(
     }
 
     Ok(())
+}
+
+/// Detect Fluree's SPARQL history-range extension: `FROM <a> TO <b>`. The
+/// parser surfaces this via `DatasetClause::to_graph`.
+fn sparql_is_history_query(sparql: &str) -> bool {
+    use fluree_db_sparql::ast::QueryBody;
+    let parsed = fluree_db_sparql::parse_sparql(sparql);
+    let Some(ast) = parsed.ast.as_ref() else {
+        return false;
+    };
+    let dataset = match &ast.body {
+        QueryBody::Select(q) => q.dataset.as_ref(),
+        QueryBody::Construct(q) => q.dataset.as_ref(),
+        QueryBody::Ask(q) => q.dataset.as_ref(),
+        QueryBody::Describe(q) => q.dataset.as_ref(),
+        QueryBody::Update(_) => None,
+    };
+    dataset.map(|d| d.to_graph.is_some()).unwrap_or(false)
 }
 
 // =============================================================================
@@ -1555,5 +1614,104 @@ mod tests {
         });
         let directives = SparqlContextDirectives::from_context(&ctx);
         assert!(directives.base.is_none());
+    }
+
+    // -------------------------------------------------------------------------
+    // History queries rejected (review fix High #2)
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn jsonld_history_query_with_to_field_rejected() {
+        let sq = MultiQuerySubquery {
+            language: SubqueryLanguage::JsonLd,
+            query: json!({
+                "from": "ledgerA@t:1",
+                "to":   "ledgerA@t:latest",
+                "select": {"?s": ["*"]},
+                "where": []
+            }),
+            opts: None,
+        };
+        let req = envelope_with(&[("a", sq)], None);
+        let err = validate_envelope(&req, &MultiQueryBounds::DEFAULT).unwrap_err();
+        match err {
+            MultiQueryValidationError::HistoryQueryInEnvelope { ref alias } => {
+                assert_eq!(alias, "a")
+            }
+            other => panic!("expected HistoryQueryInEnvelope, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn sparql_history_range_query_rejected() {
+        let sq = sparql(
+            "SELECT ?x FROM <ledgerA@t:1> TO <ledgerA@t:latest> WHERE { ?x ?p ?o }",
+        );
+        let req = envelope_with(&[("a", sq)], None);
+        let err = validate_envelope(&req, &MultiQueryBounds::DEFAULT).unwrap_err();
+        assert!(matches!(
+            err,
+            MultiQueryValidationError::HistoryQueryInEnvelope { .. }
+        ));
+    }
+
+    // -------------------------------------------------------------------------
+    // Envelope-level max-fuel rejected (review fix Medium #1)
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn rejects_envelope_max_fuel() {
+        let mut req = envelope_with(&[("a", jsonld("ledgerA"))], None);
+        req.opts = Some(json!({ "max-fuel": 1000 }));
+        let err = validate_envelope(&req, &MultiQueryBounds::DEFAULT).unwrap_err();
+        assert!(matches!(
+            err,
+            MultiQueryValidationError::EnvelopeFuelBudgetUnsupported
+        ));
+    }
+
+    #[test]
+    fn rejects_envelope_max_fuel_snake_case() {
+        let mut req = envelope_with(&[("a", jsonld("ledgerA"))], None);
+        req.opts = Some(json!({ "max_fuel": 1000 }));
+        let err = validate_envelope(&req, &MultiQueryBounds::DEFAULT).unwrap_err();
+        assert!(matches!(
+            err,
+            MultiQueryValidationError::EnvelopeFuelBudgetUnsupported
+        ));
+    }
+
+    #[test]
+    fn rejects_envelope_max_fuel_camel_case() {
+        let mut req = envelope_with(&[("a", jsonld("ledgerA"))], None);
+        req.opts = Some(json!({ "maxFuel": 1000 }));
+        let err = validate_envelope(&req, &MultiQueryBounds::DEFAULT).unwrap_err();
+        assert!(matches!(
+            err,
+            MultiQueryValidationError::EnvelopeFuelBudgetUnsupported
+        ));
+    }
+
+    #[test]
+    fn per_subquery_max_fuel_still_allowed() {
+        let mut sq = jsonld("ledgerA");
+        sq.opts = Some(json!({ "max-fuel": 1000 }));
+        let req = envelope_with(&[("a", sq)], None);
+        validate_envelope(&req, &MultiQueryBounds::DEFAULT).unwrap();
+    }
+
+    // -------------------------------------------------------------------------
+    // maxConcurrency: 0 rejected (review fix Medium #2)
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn rejects_max_concurrency_zero() {
+        let mut req = envelope_with(&[("a", jsonld("ledgerA"))], None);
+        req.opts = Some(json!({ "maxConcurrency": 0 }));
+        let err = validate_envelope(&req, &MultiQueryBounds::DEFAULT).unwrap_err();
+        assert!(matches!(
+            err,
+            MultiQueryValidationError::MaxConcurrencyZero
+        ));
     }
 }
