@@ -113,8 +113,33 @@ pub const CURRENT_INDEX_VERSION: i32 = 2;
 pub async fn build_index_for_record(
     content_store: std::sync::Arc<dyn ContentStore>,
     record: &fluree_db_nameservice::NsRecord,
+    config: IndexerConfig,
+) -> Result<IndexResult> {
+    build_index_for_record_with_tracker(
+        content_store,
+        fluree_db_core::tracking::Tracker::disabled(),
+        record,
+        config,
+    )
+    .await
+}
+
+/// Same as [`build_index_for_record`], but wraps `content_store` in a
+/// [`crate::fuel::MeteredContentStore`] for the duration of the build and
+/// charges fuel against `tracker`. Pass a fuel-enabled, no-limit tracker
+/// created at the API boundary; the indexer never enforces a fuel limit
+/// (measurement only).
+pub async fn build_index_for_record_with_tracker(
+    content_store: std::sync::Arc<dyn ContentStore>,
+    tracker: fluree_db_core::tracking::Tracker,
+    record: &fluree_db_nameservice::NsRecord,
     mut config: IndexerConfig,
 ) -> Result<IndexResult> {
+    let content_store: std::sync::Arc<dyn ContentStore> =
+        std::sync::Arc::new(crate::fuel::MeteredContentStore::new(
+            content_store,
+            tracker.clone(),
+        ));
     let ledger_id = record.ledger_id.as_str();
 
     // If a config provider is attached, let it refresh the per-run
@@ -183,7 +208,14 @@ pub async fn build_index_for_record(
                 "attempting incremental index"
             );
 
-            match incremental_index(content_store.clone(), ledger_id, record, config.clone()).await
+            match incremental_index(
+                content_store.clone(),
+                tracker.clone(),
+                ledger_id,
+                record,
+                config.clone(),
+            )
+            .await
             {
                 Ok(result) => {
                     return Ok(result);
@@ -211,7 +243,14 @@ pub async fn build_index_for_record(
             commit_gap,
             "starting full rebuild path"
         );
-        rebuild_index_from_commits(content_store, ledger_id, record, config).await
+        build::rebuild::rebuild_index_from_commits(
+            content_store,
+            tracker,
+            ledger_id,
+            record,
+            config,
+        )
+        .await
     }
     .instrument(span)
     .await
@@ -232,13 +271,32 @@ pub async fn build_index_for_ledger(
     ledger_id: &str,
     config: IndexerConfig,
 ) -> Result<IndexResult> {
+    build_index_for_ledger_with_tracker(
+        content_store,
+        fluree_db_core::tracking::Tracker::disabled(),
+        nameservice,
+        ledger_id,
+        config,
+    )
+    .await
+}
+
+/// Same as [`build_index_for_ledger`], but takes a fuel tracker; see
+/// [`build_index_for_record_with_tracker`] for the semantics.
+pub async fn build_index_for_ledger_with_tracker(
+    content_store: std::sync::Arc<dyn ContentStore>,
+    tracker: fluree_db_core::tracking::Tracker,
+    nameservice: &dyn NameService,
+    ledger_id: &str,
+    config: IndexerConfig,
+) -> Result<IndexResult> {
     let record = nameservice
         .lookup(ledger_id)
         .await
         .map_err(|e| IndexerError::NameService(e.to_string()))?
         .ok_or_else(|| IndexerError::LedgerNotFound(ledger_id.to_string()))?;
 
-    build_index_for_record(content_store, &record, config).await
+    build_index_for_record_with_tracker(content_store, tracker, &record, config).await
 }
 
 /// Build a binary index from an existing nameservice record.
@@ -254,7 +312,14 @@ pub async fn rebuild_index_from_commits(
     record: &fluree_db_nameservice::NsRecord,
     config: IndexerConfig,
 ) -> Result<IndexResult> {
-    build::rebuild::rebuild_index_from_commits(content_store, ledger_id, record, config).await
+    build::rebuild::rebuild_index_from_commits(
+        content_store,
+        fluree_db_core::tracking::Tracker::disabled(),
+        ledger_id,
+        record,
+        config,
+    )
+    .await
 }
 
 /// Like [`rebuild_index_from_commits`], but accepts a caller-provided
@@ -270,8 +335,14 @@ pub async fn rebuild_index_from_commits_with_store<C>(
 where
     C: ContentStore + Clone + Send + Sync + 'static,
 {
-    build::rebuild::rebuild_index_from_commits_with_store(commit_store, ledger_id, record, config)
-        .await
+    build::rebuild::rebuild_index_from_commits_with_store(
+        commit_store,
+        fluree_db_core::tracking::Tracker::disabled(),
+        ledger_id,
+        record,
+        config,
+    )
+    .await
 }
 
 /// Incremental index from an existing FIR6 root.
@@ -280,11 +351,12 @@ where
 /// novelty into affected FLI3 leaves, and publishes a new FIR6 root.
 async fn incremental_index(
     content_store: std::sync::Arc<dyn fluree_db_core::ContentStore>,
+    tracker: fluree_db_core::tracking::Tracker,
     ledger_id: &str,
     record: &fluree_db_nameservice::NsRecord,
     config: IndexerConfig,
 ) -> Result<IndexResult> {
-    build::incremental::incremental_index(content_store, ledger_id, record, config).await
+    build::incremental::incremental_index(content_store, tracker, ledger_id, record, config).await
 }
 
 /// Upload index artifacts (FLI3 leaves, FHS1 sidecars, FBR3 branches) to CAS.
@@ -292,7 +364,12 @@ pub async fn upload_indexes_to_cas(
     content_store: &dyn fluree_db_core::ContentStore,
     build_result: &BuildResult,
 ) -> Result<UploadedIndexes> {
-    build::upload::upload_indexes_to_cas(content_store, build_result).await
+    build::upload::upload_indexes_to_cas(
+        content_store,
+        &fluree_db_core::tracking::Tracker::disabled(),
+        build_result,
+    )
+    .await
 }
 
 /// Upload dictionary artifacts from persisted flat files to CAS.
