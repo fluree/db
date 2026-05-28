@@ -2344,6 +2344,7 @@ dependencies = [
  "fs2",
  "futures",
  "hex",
+ "indexmap 2.13.0",
  "itoa",
  "mimalloc",
  "moka",

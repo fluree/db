@@ -5,6 +5,7 @@ mod connection;
 mod credential;
 mod graph_source;
 pub(crate) mod helpers;
+pub mod multi;
 pub mod nameservice_builder;
 
 use serde_json::Value as JsonValue;

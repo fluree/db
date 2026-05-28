@@ -67,6 +67,7 @@ fluree-graph-json-ld = { path = "../fluree-graph-json-ld" }
 async-trait.workspace = true
 chrono.workspace = true
 futures.workspace = true
+indexmap.workspace = true
 moka.workspace = true
 rustc-hash = "2"
 thiserror.workspace = true
