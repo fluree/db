@@ -397,22 +397,26 @@ fn validate_jsonld_subquery(
             alias: alias.to_string(),
         })?;
 
-    for ledger_id in jsonld_from_ledger_strings(from) {
-        if envelope_pinned && string_has_temporal_marker(&ledger_id) {
-            return Err(MultiQueryValidationError::AsOfCollision {
-                alias: alias.to_string(),
-                location: format!("'from' contains temporal pin: {ledger_id}"),
-            });
-        }
-        distinct.insert(strip_temporal_suffix(&ledger_id).to_string());
-    }
-
-    if distinct.is_empty() {
-        // `from` was present but yielded no ledger identifiers (e.g., empty
-        // array or non-string entries) — treat as missing.
+    let extracted = jsonld_extract_from(from);
+    if extracted.is_empty() {
+        // `from` was present but yielded no ledger identifiers (empty array,
+        // object missing `@id`/`id`, or an unsupported shape) — surface as
+        // missing so downstream parsing produces a clearer error if needed.
         return Err(MultiQueryValidationError::MissingFrom {
             alias: alias.to_string(),
         });
+    }
+
+    for entry in extracted {
+        if envelope_pinned {
+            if let Some(loc) = entry.pin_location {
+                return Err(MultiQueryValidationError::AsOfCollision {
+                    alias: alias.to_string(),
+                    location: loc,
+                });
+            }
+        }
+        distinct.insert(entry.ledger);
     }
 
     Ok(())
@@ -431,22 +435,29 @@ fn validate_sparql_subquery(
             alias: alias.to_string(),
         })?;
 
-    if envelope_pinned && sparql_has_temporal_pin(body) {
-        return Err(MultiQueryValidationError::AsOfCollision {
-            alias: alias.to_string(),
-            location: "SPARQL FROM <...@t:...> clause".to_string(),
-        });
-    }
+    // If the SPARQL fails to parse, defer to the downstream parser for a
+    // clearer error at execution time — validation only enforces the
+    // multi-query invariants, not SPARQL grammar.
+    let Some(extracted) = sparql_extract_from(body) else {
+        return Ok(());
+    };
 
-    let from_ledgers = sparql_from_ledgers(body);
-    if from_ledgers.is_empty() {
+    if extracted.is_empty() {
         return Err(MultiQueryValidationError::MissingFrom {
             alias: alias.to_string(),
         });
     }
 
-    for ledger in from_ledgers {
-        distinct.insert(strip_temporal_suffix(&ledger).to_string());
+    for entry in extracted {
+        if envelope_pinned {
+            if let Some(loc) = entry.pin_location {
+                return Err(MultiQueryValidationError::AsOfCollision {
+                    alias: alias.to_string(),
+                    location: loc,
+                });
+            }
+        }
+        distinct.insert(entry.ledger);
     }
 
     Ok(())
@@ -456,33 +467,101 @@ fn validate_sparql_subquery(
 // Ledger / temporal-pin extraction helpers
 // =============================================================================
 
-/// Pull ledger identifier strings out of a JSON-LD `from` value.
+/// Per-entry result of `from`-extraction: the bare ledger identifier and, when
+/// the entry carries an explicit temporal pin, a human-readable location string
+/// used in the collision error message.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ExtractedFrom {
+    /// Bare ledger identifier with any `@t:`/`@iso:`/`@commit:` suffix and
+    /// `#named-graph` fragment stripped.
+    ledger: String,
+    /// `Some(location)` if the source entry expressed a temporal pin
+    /// (suffix marker in the identifier string, or an explicit `t`/`at` field
+    /// on an object-form entry).
+    pin_location: Option<String>,
+}
+
+/// Extract per-entry ledger identifiers and temporal-pin status from a JSON-LD
+/// `from` value.
 ///
-/// `from` may be a string, an array of strings, or an array of objects with
-/// `@id`. Non-string entries are skipped silently — the language parsers
-/// produce a clearer downstream error.
-fn jsonld_from_ledger_strings(from: &JsonValue) -> Vec<String> {
+/// Mirrors the dataset parser surface (`parse_single_graph_source` /
+/// `parse_graph_sources` in `crate::dataset`):
+/// - String → single graph source. The identifier may carry a
+///   `@t:`/`@iso:`/`@commit:` suffix (temporal pin) and an optional
+///   `#named-graph` fragment.
+/// - Object → single graph source with `@id`/`id` for the identifier and
+///   optional `t` (integer) or `at` (string: `commit:HASH` or ISO timestamp)
+///   for an explicit temporal pin.
+/// - Array → any mix of the two element shapes above.
+///
+/// Entries that lack a usable identifier (empty string, object without
+/// `@id`/`id`) are skipped silently — the language parsers produce a clearer
+/// error at execution time.
+fn jsonld_extract_from(from: &JsonValue) -> Vec<ExtractedFrom> {
     let mut out = Vec::new();
-    match from {
-        JsonValue::String(s) if !s.is_empty() => out.push(s.clone()),
+    extract_jsonld_from_value(from, &mut out);
+    out
+}
+
+fn extract_jsonld_from_value(val: &JsonValue, out: &mut Vec<ExtractedFrom>) {
+    match val {
+        JsonValue::String(s) if !s.is_empty() => {
+            out.push(extract_jsonld_from_string(s));
+        }
+        JsonValue::Object(obj) => {
+            if let Some(entry) = extract_jsonld_from_object(obj) {
+                out.push(entry);
+            }
+        }
         JsonValue::Array(items) => {
             for item in items {
-                match item {
-                    JsonValue::String(s) if !s.is_empty() => out.push(s.clone()),
-                    JsonValue::Object(obj) => {
-                        if let Some(id) = obj.get("@id").and_then(JsonValue::as_str) {
-                            if !id.is_empty() {
-                                out.push(id.to_string());
-                            }
-                        }
-                    }
-                    _ => {}
-                }
+                extract_jsonld_from_value(item, out);
             }
         }
         _ => {}
     }
-    out
+}
+
+fn extract_jsonld_from_string(s: &str) -> ExtractedFrom {
+    let pin_location = TEMPORAL_MARKERS.iter().find_map(|m| {
+        if s.contains(m) {
+            Some(format!("'from' contains temporal pin: {s}"))
+        } else {
+            None
+        }
+    });
+    ExtractedFrom {
+        ledger: strip_temporal_suffix(s).to_string(),
+        pin_location,
+    }
+}
+
+fn extract_jsonld_from_object(obj: &JsonMap<String, JsonValue>) -> Option<ExtractedFrom> {
+    let id = obj
+        .get("@id")
+        .or_else(|| obj.get("id"))
+        .and_then(JsonValue::as_str)
+        .filter(|s| !s.is_empty())?;
+
+    let mut entry = extract_jsonld_from_string(id);
+
+    // Explicit `t`/`at` on the object are temporal pins regardless of any
+    // suffix on the identifier; their presence is enough to flag a collision.
+    if entry.pin_location.is_none() {
+        if obj.contains_key("t") {
+            entry.pin_location = Some(format!(
+                "'from' object for '{}' carries explicit 't' field",
+                entry.ledger
+            ));
+        } else if obj.contains_key("at") {
+            entry.pin_location = Some(format!(
+                "'from' object for '{}' carries explicit 'at' field",
+                entry.ledger
+            ));
+        }
+    }
+
+    Some(entry)
 }
 
 /// Strip a `@t:`/`@iso:`/`@commit:` suffix from a ledger identifier so distinct
@@ -499,96 +578,62 @@ fn strip_temporal_suffix(ledger: &str) -> &str {
     bare
 }
 
-/// Lightweight detector: does this string carry a Fluree temporal pin?
-fn string_has_temporal_marker(s: &str) -> bool {
-    TEMPORAL_MARKERS.iter().any(|m| s.contains(m))
-}
-
 const TEMPORAL_MARKERS: &[&str] = &["@t:", "@iso:", "@commit:"];
 
-/// Detect a temporal pin anywhere inside angle-bracketed IRIs in a SPARQL
-/// query string.
+/// Extract per-IRI ledger identifiers and temporal-pin status from a SPARQL
+/// query's `FROM` / `FROM NAMED` dataset clauses.
 ///
-/// The Fluree temporal markers (`@t:`, `@iso:`, `@commit:`) are extensions that
-/// only appear in IRIs intended as time-travel pins; any occurrence inside
-/// `<...>` is treated as a pin for collision purposes.
-fn sparql_has_temporal_pin(sparql: &str) -> bool {
-    let mut chars = sparql.char_indices();
-    while let Some((_, c)) = chars.next() {
-        if c == '<' {
-            // Scan until '>' for any temporal marker.
-            let mut iri = String::new();
-            for (_, ic) in chars.by_ref() {
-                if ic == '>' {
-                    break;
-                }
-                iri.push(ic);
-            }
-            if string_has_temporal_marker(&iri) {
-                return true;
-            }
-        }
-    }
-    false
-}
+/// Uses the real SPARQL parser ([`fluree_db_sparql::parse_sparql`]) so
+/// commented-out `FROM` clauses and string literals containing the word
+/// don't trip detection. Prefixed-name IRIs are ignored (they can't be ledger
+/// references without context resolution); only full `<iri>` literals
+/// participate.
+///
+/// Returns `None` when the SPARQL fails to parse — validation defers to the
+/// downstream parser so the user sees a clearer SPARQL-parse error rather than
+/// a misleading "missing from" or false-negative collision check.
+fn sparql_extract_from(sparql: &str) -> Option<Vec<ExtractedFrom>> {
+    use fluree_db_sparql::ast::QueryBody;
 
-/// Extract ledger identifiers from `FROM <iri>` and `FROM NAMED <iri>` clauses
-/// in a SPARQL query string.
-///
-/// This is a coarse scanner — sufficient for distinct-ledger counting, not a
-/// substitute for the SPARQL parser. Anything inside `<...>` immediately
-/// following a `FROM` keyword (with optional `NAMED`) is treated as a ledger
-/// reference.
-fn sparql_from_ledgers(sparql: &str) -> Vec<String> {
+    let parsed = fluree_db_sparql::parse_sparql(sparql);
+    let ast = parsed.ast.as_ref()?;
+    let dataset = match &ast.body {
+        QueryBody::Select(q) => q.dataset.as_ref(),
+        QueryBody::Construct(q) => q.dataset.as_ref(),
+        QueryBody::Ask(q) => q.dataset.as_ref(),
+        QueryBody::Describe(q) => q.dataset.as_ref(),
+        QueryBody::Update(_) => None,
+    };
+
+    let Some(ds) = dataset else { return Some(Vec::new()); };
+
     let mut out = Vec::new();
-    let bytes = sparql.as_bytes();
-    let lower = sparql.to_ascii_lowercase();
-    let lower_bytes = lower.as_bytes();
-    let mut i = 0;
-
-    while i + 4 <= lower_bytes.len() {
-        if &lower_bytes[i..i + 4] == b"from"
-            && (i == 0 || !is_sparql_ident_char(lower_bytes[i - 1] as char))
-            && (i + 4 == lower_bytes.len() || !is_sparql_ident_char(lower_bytes[i + 4] as char))
-        {
-            // Found a FROM keyword. Skip optional "NAMED" and whitespace.
-            let mut j = i + 4;
-            j = skip_ws(lower_bytes, j);
-            if j + 5 <= lower_bytes.len() && &lower_bytes[j..j + 5] == b"named" {
-                let after = j + 5;
-                if after == lower_bytes.len() || !is_sparql_ident_char(lower_bytes[after] as char) {
-                    j = after;
-                    j = skip_ws(lower_bytes, j);
-                }
-            }
-            if j < bytes.len() && bytes[j] == b'<' {
-                // Capture IRI up to matching '>'.
-                let start = j + 1;
-                if let Some(end_off) = bytes[start..].iter().position(|&b| b == b'>') {
-                    let iri = &sparql[start..start + end_off];
-                    if !iri.is_empty() {
-                        out.push(iri.to_string());
-                    }
-                    i = start + end_off + 1;
-                    continue;
-                }
-            }
+    for iri in ds.default_graphs.iter().chain(ds.named_graphs.iter()) {
+        if let Some(entry) = extract_sparql_iri(iri) {
+            out.push(entry);
         }
-        i += 1;
     }
-
-    out
+    if let Some(to) = ds.to_graph.as_ref() {
+        if let Some(entry) = extract_sparql_iri(to) {
+            out.push(entry);
+        }
+    }
+    Some(out)
 }
 
-fn skip_ws(bytes: &[u8], mut i: usize) -> usize {
-    while i < bytes.len() && bytes[i].is_ascii_whitespace() {
-        i += 1;
+fn extract_sparql_iri(iri: &fluree_db_sparql::ast::Iri) -> Option<ExtractedFrom> {
+    use fluree_db_sparql::ast::IriValue;
+    // Prefixed names need context resolution to be ledger references; skip
+    // them here. Full IRIs are taken at face value as ledger identifiers
+    // (matching how the server interprets `FROM <ledger>` today).
+    let value = match &iri.value {
+        IriValue::Full(s) => s.as_ref(),
+        IriValue::Prefixed { .. } => return None,
+    };
+    if value.is_empty() {
+        return None;
     }
-    i
-}
-
-fn is_sparql_ident_char(c: char) -> bool {
-    c.is_ascii_alphanumeric() || c == '_'
+    Some(extract_jsonld_from_string(value))
 }
 
 // =============================================================================
@@ -661,9 +706,19 @@ impl SparqlContextDirectives {
     /// Extract prefix-shaped term mappings and the optional `@base` from a
     /// merged JSON-LD context.
     ///
-    /// "Prefix-shaped" means a top-level key whose value is a string IRI; term
-    /// definitions with `@id`/`@type`/`@container` are JSON-LD-only and dropped
-    /// for SPARQL purposes, as is `@vocab` (no SPARQL equivalent).
+    /// To qualify for SPARQL `PREFIX` injection, a context entry must:
+    /// - Have a key that's a valid SPARQL `PN_PREFIX` (ASCII letters/digits/
+    ///   underscore/hyphen, starting with a letter or underscore).
+    /// - Have a string value that's a **namespace IRI**: either contains a
+    ///   URI-scheme `://` separator or ends with `#` / `/` (the conventional
+    ///   namespace terminators).
+    ///
+    /// JSON-LD term *aliases* like `"name": "schema:name"` are CURIE mappings,
+    /// not absolute namespaces, and don't qualify — emitting them as
+    /// `PREFIX name: <schema:name>` would produce invalid SPARQL.
+    /// JSON-LD term *definitions* (object values with `@id`/`@type`/
+    /// `@container`) are likewise JSON-LD-only and dropped here, as is
+    /// `@vocab` (no SPARQL equivalent).
     pub fn from_context(ctx: &JsonValue) -> Self {
         let mut out = Self::default();
         let Some(obj) = ctx.as_object() else {
@@ -672,7 +727,7 @@ impl SparqlContextDirectives {
         for (k, v) in obj {
             match k.as_str() {
                 "@base" => {
-                    if let Some(s) = v.as_str() {
+                    if let Some(s) = v.as_str().filter(|s| is_absolute_iri(s)) {
                         out.base = Some(s.to_string());
                     }
                 }
@@ -680,7 +735,8 @@ impl SparqlContextDirectives {
                 "@vocab" | "@version" | "@language" | "@protected" | "@import" => {}
                 _ if k.starts_with('@') => {}
                 _ => {
-                    if let Some(iri) = v.as_str() {
+                    let Some(iri) = v.as_str() else { continue };
+                    if is_valid_pn_prefix(k) && is_namespace_iri(iri) {
                         out.prefixes.push(format!("PREFIX {k}: <{iri}>"));
                     }
                 }
@@ -688,6 +744,55 @@ impl SparqlContextDirectives {
         }
         out
     }
+}
+
+/// Conservative SPARQL `PN_PREFIX` check: ASCII letter or underscore, then
+/// letters/digits/underscore/hyphen. The W3C grammar permits more (Unicode
+/// letters, period, etc.) but the safe ASCII subset covers every common
+/// vocabulary prefix in the wild without risking malformed output.
+fn is_valid_pn_prefix(s: &str) -> bool {
+    let mut chars = s.chars();
+    let Some(first) = chars.next() else {
+        return false;
+    };
+    if !(first.is_ascii_alphabetic() || first == '_') {
+        return false;
+    }
+    chars.all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+}
+
+/// Absolute-IRI check: starts with a URI scheme followed by `:`, with at
+/// least one further character after the colon. Distinct from
+/// [`is_namespace_iri`] in that it does not require `#`/`/` termination —
+/// used for `@base` (which is typically a document URI without a trailing
+/// separator).
+fn is_absolute_iri(s: &str) -> bool {
+    let Some((scheme, rest)) = s.split_once(':') else {
+        return false;
+    };
+    if rest.is_empty() {
+        return false;
+    }
+    let mut chars = scheme.chars();
+    let Some(first) = chars.next() else {
+        return false;
+    };
+    if !first.is_ascii_alphabetic() {
+        return false;
+    }
+    chars.all(|c| c.is_ascii_alphanumeric() || c == '+' || c == '-' || c == '.')
+}
+
+/// Namespace-IRI check: an absolute IRI that either uses a hierarchical
+/// scheme (`://`) or ends with the conventional namespace terminators (`#`
+/// or `/`). This excludes JSON-LD CURIE aliases like `schema:name` while
+/// accepting both standard HTTP namespaces and URN-style ones like
+/// `urn:example:vocab#`.
+fn is_namespace_iri(s: &str) -> bool {
+    if !is_absolute_iri(s) {
+        return false;
+    }
+    s.contains("://") || s.ends_with('#') || s.ends_with('/')
 }
 
 /// Prepend envelope-derived `PREFIX` / `BASE` directives to a SPARQL query
@@ -721,6 +826,11 @@ pub fn apply_sparql_context(
         prelude.push_str(sparql);
         prelude
     }
+}
+
+/// Identifier-character predicate for SPARQL keyword boundary detection.
+fn is_sparql_ident_char(c: char) -> bool {
+    c.is_ascii_alphanumeric() || c == '_'
 }
 
 /// Case-insensitive detection of a SPARQL keyword directive at any
@@ -1203,27 +1313,247 @@ mod tests {
     }
 
     // -------------------------------------------------------------------------
-    // Temporal-pin scanner sanity
+    // Temporal-pin scanner sanity (AST-based)
     // -------------------------------------------------------------------------
+
+    fn pin_count(extracted: &[ExtractedFrom]) -> usize {
+        extracted.iter().filter(|e| e.pin_location.is_some()).count()
+    }
 
     #[test]
     fn sparql_temporal_pin_detected_in_from() {
-        assert!(sparql_has_temporal_pin("SELECT * FROM <ledger@t:42> WHERE { }"));
-        assert!(sparql_has_temporal_pin(
-            "SELECT * FROM NAMED <ledger@iso:2024-01-01T00:00:00Z> WHERE { }"
-        ));
-        assert!(sparql_has_temporal_pin(
-            "SELECT * FROM <ledger@commit:abc123> WHERE { }"
-        ));
+        let cases = [
+            "SELECT * FROM <ledger@t:42> WHERE { ?x ?p ?o }",
+            "SELECT * FROM NAMED <ledger@iso:2024-01-01T00:00:00Z> WHERE { ?x ?p ?o }",
+            "SELECT * FROM <ledger@commit:abc123> WHERE { ?x ?p ?o }",
+        ];
+        for sparql in cases {
+            let extracted =
+                sparql_extract_from(sparql).expect("SPARQL parses");
+            assert!(
+                pin_count(&extracted) >= 1,
+                "expected temporal pin in: {sparql} (got {extracted:?})"
+            );
+        }
     }
 
     #[test]
     fn sparql_temporal_pin_not_detected_in_plain_query() {
-        assert!(!sparql_has_temporal_pin(
-            "SELECT * FROM <ledger> WHERE { ?x ?p ?o }"
-        ));
-        assert!(!sparql_has_temporal_pin(
-            "PREFIX ex: <http://example.org/> SELECT * WHERE { ?x ex:name ?n }"
-        ));
+        let extracted = sparql_extract_from("SELECT * FROM <ledger> WHERE { ?x ?p ?o }")
+            .expect("SPARQL parses");
+        assert_eq!(pin_count(&extracted), 0);
+
+        let extracted = sparql_extract_from(
+            "PREFIX ex: <http://example.org/> SELECT * FROM <ledger> WHERE { ?x ex:name ?n }",
+        )
+        .expect("SPARQL parses");
+        assert_eq!(pin_count(&extracted), 0);
+    }
+
+    #[test]
+    fn sparql_temporal_marker_inside_string_literal_not_flagged() {
+        // The marker only appears inside a string literal (not a FROM IRI),
+        // so the AST-based detector should not flag it — substring scans
+        // would false-positive here.
+        let sparql = r#"SELECT ?x FROM <ledgerA> WHERE { ?x <http://example.org/note> "see @t:42 in the docs" }"#;
+        let extracted = sparql_extract_from(sparql).expect("SPARQL parses");
+        assert_eq!(pin_count(&extracted), 0);
+    }
+
+    #[test]
+    fn sparql_extract_returns_none_on_parse_failure() {
+        // Syntactically invalid SPARQL — extractor returns None so the
+        // downstream parser produces the user-facing error rather than
+        // validation guessing.
+        let extracted = sparql_extract_from("not a SPARQL query");
+        assert!(extracted.is_none());
+    }
+
+    // -------------------------------------------------------------------------
+    // JSON-LD object-form `from` (review fix High #2)
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn jsonld_object_from_with_explicit_t_field_flagged_under_envelope_asof() {
+        let sq = MultiQuerySubquery {
+            language: SubqueryLanguage::JsonLd,
+            query: json!({
+                "from": { "@id": "ledgerA", "t": 42 },
+                "select": {"?s": ["*"]},
+                "where": []
+            }),
+            opts: None,
+        };
+        let req = envelope_with(&[("a", sq)], Some(AsOf::Iso("2024-01-01T00:00:00Z".into())));
+        let err = validate_envelope(&req, &MultiQueryBounds::DEFAULT).unwrap_err();
+        assert!(
+            matches!(err, MultiQueryValidationError::AsOfCollision { ref location, .. } if location.contains("'t' field")),
+            "got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn jsonld_object_from_with_explicit_at_field_flagged_under_envelope_asof() {
+        let sq = MultiQuerySubquery {
+            language: SubqueryLanguage::JsonLd,
+            query: json!({
+                "from": { "id": "ledgerA", "at": "commit:abc123" },
+                "select": {"?s": ["*"]},
+                "where": []
+            }),
+            opts: None,
+        };
+        let req = envelope_with(&[("a", sq)], Some(AsOf::Iso("2024-01-01T00:00:00Z".into())));
+        let err = validate_envelope(&req, &MultiQueryBounds::DEFAULT).unwrap_err();
+        assert!(
+            matches!(err, MultiQueryValidationError::AsOfCollision { ref location, .. } if location.contains("'at' field")),
+            "got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn jsonld_object_from_in_array_with_t_field_flagged() {
+        let sq = MultiQuerySubquery {
+            language: SubqueryLanguage::JsonLd,
+            query: json!({
+                "from": [
+                    "ledgerA",
+                    { "@id": "ledgerB", "t": 99 }
+                ],
+                "select": {"?s": ["*"]},
+                "where": []
+            }),
+            opts: None,
+        };
+        let req = envelope_with(&[("a", sq)], Some(AsOf::Iso("2024-01-01T00:00:00Z".into())));
+        let err = validate_envelope(&req, &MultiQueryBounds::DEFAULT).unwrap_err();
+        assert!(matches!(err, MultiQueryValidationError::AsOfCollision { .. }));
+    }
+
+    #[test]
+    fn jsonld_object_from_without_explicit_pin_accepted_under_envelope_asof() {
+        let sq = MultiQuerySubquery {
+            language: SubqueryLanguage::JsonLd,
+            query: json!({
+                "from": { "@id": "ledgerA", "alias": "primary" },
+                "select": {"?s": ["*"]},
+                "where": []
+            }),
+            opts: None,
+        };
+        let req = envelope_with(&[("a", sq)], Some(AsOf::Iso("2024-01-01T00:00:00Z".into())));
+        let distinct = validate_envelope(&req, &MultiQueryBounds::DEFAULT).unwrap();
+        assert!(distinct.contains("ledgerA"));
+    }
+
+    #[test]
+    fn jsonld_object_from_with_id_containing_suffix_still_flagged() {
+        // Suffix in the identifier string — same collision as string form.
+        let sq = MultiQuerySubquery {
+            language: SubqueryLanguage::JsonLd,
+            query: json!({
+                "from": { "@id": "ledgerA@t:42" },
+                "select": {"?s": ["*"]},
+                "where": []
+            }),
+            opts: None,
+        };
+        let req = envelope_with(&[("a", sq)], Some(AsOf::Iso("2024-01-01T00:00:00Z".into())));
+        let err = validate_envelope(&req, &MultiQueryBounds::DEFAULT).unwrap_err();
+        assert!(matches!(err, MultiQueryValidationError::AsOfCollision { .. }));
+    }
+
+    // -------------------------------------------------------------------------
+    // Per-subquery emptiness (review fix High #1)
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn rejects_second_subquery_with_empty_from_array_after_valid_first() {
+        let valid = jsonld("ledgerA");
+        let empty = MultiQuerySubquery {
+            language: SubqueryLanguage::JsonLd,
+            query: json!({
+                "from": [],
+                "select": {"?s": ["*"]},
+                "where": []
+            }),
+            opts: None,
+        };
+        let req = envelope_with(&[("a", valid), ("b", empty)], None);
+        let err = validate_envelope(&req, &MultiQueryBounds::DEFAULT).unwrap_err();
+        match err {
+            MultiQueryValidationError::MissingFrom { ref alias } => assert_eq!(alias, "b"),
+            other => panic!("expected MissingFrom on alias 'b', got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rejects_subquery_with_object_from_missing_id() {
+        let valid = jsonld("ledgerA");
+        let no_id = MultiQuerySubquery {
+            language: SubqueryLanguage::JsonLd,
+            query: json!({
+                "from": { "alias": "primary" },
+                "select": {"?s": ["*"]},
+                "where": []
+            }),
+            opts: None,
+        };
+        let req = envelope_with(&[("a", valid), ("b", no_id)], None);
+        let err = validate_envelope(&req, &MultiQueryBounds::DEFAULT).unwrap_err();
+        match err {
+            MultiQueryValidationError::MissingFrom { ref alias } => assert_eq!(alias, "b"),
+            other => panic!("expected MissingFrom on alias 'b', got {other:?}"),
+        }
+    }
+
+    // -------------------------------------------------------------------------
+    // SPARQL prefix-shape filtering (review fix Medium #2)
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn sparql_directives_skip_curie_alias_term_mappings() {
+        // "name": "schema:name" is a JSON-LD term alias, not a namespace IRI.
+        // Emitting `PREFIX name: <schema:name>` would produce invalid SPARQL.
+        let ctx = json!({
+            "schema": "http://schema.org/",
+            "name":   "schema:name"
+        });
+        let directives = SparqlContextDirectives::from_context(&ctx);
+        assert_eq!(directives.prefixes.len(), 1);
+        assert!(directives.prefixes[0].contains("PREFIX schema:"));
+        assert!(!directives.prefixes.iter().any(|p| p.contains("name:")));
+    }
+
+    #[test]
+    fn sparql_directives_skip_invalid_prefix_names() {
+        // Key with characters not in the conservative PN_PREFIX subset.
+        let ctx = json!({
+            "1abc":      "http://example.org/",  // starts with digit
+            "with space": "http://example.org/", // contains space
+            "ok":        "http://example.org/"
+        });
+        let directives = SparqlContextDirectives::from_context(&ctx);
+        assert_eq!(directives.prefixes.len(), 1);
+        assert!(directives.prefixes[0].contains("PREFIX ok:"));
+    }
+
+    #[test]
+    fn sparql_directives_accept_urn_namespace_with_hash_terminator() {
+        let ctx = json!({
+            "ex": "urn:example:vocab#"
+        });
+        let directives = SparqlContextDirectives::from_context(&ctx);
+        assert_eq!(directives.prefixes.len(), 1);
+        assert!(directives.prefixes[0].contains("urn:example:vocab#"));
+    }
+
+    #[test]
+    fn sparql_directives_skip_non_absolute_base() {
+        let ctx = json!({
+            "@base": "/relative/path"
+        });
+        let directives = SparqlContextDirectives::from_context(&ctx);
+        assert!(directives.base.is_none());
     }
 }

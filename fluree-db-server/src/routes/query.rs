@@ -2621,9 +2621,11 @@ pub(crate) async fn run_jsonld_subquery(
 /// connection builder routes through nameservice / snapshot loading without
 /// extra wiring.
 ///
-/// `tracked` mirrors the single-query convention of "tracking is requested
-/// when the corresponding tracking headers / opts were set." For SPARQL there
-/// is no body `opts` block, so the caller passes the resolved flag.
+/// `tracking` accepts the full [`TrackingOptions`] surface (selective
+/// `meta` flags, `max_fuel`) so the multi-query dispatcher can thread
+/// envelope-level or per-alias options through. `None` runs the
+/// non-tracked builder path; `Some(opts)` runs the tracked path with those
+/// options applied.
 #[expect(dead_code)]
 // Used by: the multi-query envelope dispatcher (Task #4) for each SPARQL
 // sub-query. Single-query callers will adopt it in a follow-up to share
@@ -2631,13 +2633,14 @@ pub(crate) async fn run_jsonld_subquery(
 pub(crate) async fn run_sparql_subquery(
     state: &AppState,
     sparql: &str,
-    tracked: bool,
+    tracking: Option<fluree_db_api::TrackingOptions>,
 ) -> Result<SubqueryOutput> {
-    if tracked {
+    if let Some(opts) = tracking {
         let response = state
             .fluree
             .query_from()
             .sparql(sparql)
+            .tracking(opts)
             .execute_tracked()
             .await
             .map_err(|e| ServerError::Api(fluree_db_api::ApiError::http(e.status, e.error)))?;
