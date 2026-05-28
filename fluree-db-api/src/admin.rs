@@ -10,11 +10,11 @@
 //! available on read-only storage.
 
 use crate::{error::ApiError, tx::IndexingMode, Result};
+use fluree_db_core::tracking::{Tracker, TrackingOptions};
 use fluree_db_core::{
     address_path::{ledger_id_to_path_prefix, shared_prefix_for_path},
     format_ledger_id, DEFAULT_BRANCH,
 };
-use fluree_db_core::tracking::{Tracker, TrackingOptions};
 use fluree_db_indexer::{
     clean_garbage, rebuild_index_from_commits_with_tracker, CleanGarbageConfig,
 };

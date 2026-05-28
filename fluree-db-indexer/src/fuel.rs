@@ -161,8 +161,8 @@ impl ContentStore for MeteredContentStore {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use fluree_db_core::tracking::{micro_to_fuel, TrackingOptions};
     use fluree_db_core::storage::MemoryContentStore;
+    use fluree_db_core::tracking::{micro_to_fuel, TrackingOptions};
 
     fn enabled_tracker() -> Tracker {
         Tracker::new(TrackingOptions {

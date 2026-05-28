@@ -140,11 +140,9 @@ pub async fn build_index_for_record_with_tracker(
     record: &fluree_db_nameservice::NsRecord,
     mut config: IndexerConfig,
 ) -> Result<IndexResult> {
-    let content_store: std::sync::Arc<dyn ContentStore> =
-        std::sync::Arc::new(crate::fuel::MeteredContentStore::new(
-            content_store,
-            tracker.clone(),
-        ));
+    let content_store: std::sync::Arc<dyn ContentStore> = std::sync::Arc::new(
+        crate::fuel::MeteredContentStore::new(content_store, tracker.clone()),
+    );
     let ledger_id = record.ledger_id.as_str();
 
     // If a config provider is attached, let it refresh the per-run

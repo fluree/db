@@ -1039,12 +1039,11 @@ impl BackgroundIndexerWorker {
         // so we can still read its tally if the build fails after partial CAS
         // writes. Without this the only fuel signal for failed background
         // builds would be lost when no caller is waiting.
-        let build_tracker = fluree_db_core::tracking::Tracker::new(
-            fluree_db_core::tracking::TrackingOptions {
+        let build_tracker =
+            fluree_db_core::tracking::Tracker::new(fluree_db_core::tracking::TrackingOptions {
                 track_fuel: true,
                 ..Default::default()
-            },
-        );
+            });
         let result = crate::build_index_for_record_with_tracker(
             content_store,
             build_tracker.clone(),

@@ -193,10 +193,7 @@ async fn trigger_index_reports_positive_fuel() {
                 .await
                 .expect("trigger_index");
 
-            assert!(
-                trigger.index_t >= committed_t,
-                "indexed to >= committed t"
-            );
+            assert!(trigger.index_t >= committed_t, "indexed to >= committed t");
             let fuel = trigger
                 .fuel
                 .expect("background indexer always populates fuel");
