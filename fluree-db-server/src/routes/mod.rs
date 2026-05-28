@@ -11,6 +11,7 @@ mod iceberg;
 mod ledger;
 mod log;
 mod multi_dispatch;
+mod multi_response;
 mod nameservice_refs;
 mod pack;
 mod policy_auth;
@@ -82,6 +83,7 @@ pub fn build_router(state: Arc<AppState>) -> Router {
             "/query/*ledger",
             get(query::query_ledger_tail).post(query::query_ledger_tail),
         )
+        .route("/multi-query", post(query::multi_query))
         .route("/explain", get(query::explain).post(query::explain))
         .route(
             "/explain/*ledger",

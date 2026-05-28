@@ -2626,10 +2626,6 @@ pub(crate) async fn run_jsonld_subquery(
 /// envelope-level or per-alias options through. `None` runs the
 /// non-tracked builder path; `Some(opts)` runs the tracked path with those
 /// options applied.
-#[expect(dead_code)]
-// Used by: the multi-query envelope dispatcher (Task #4) for each SPARQL
-// sub-query. Single-query callers will adopt it in a follow-up to share
-// the connection-scoped SPARQL execution path.
 pub(crate) async fn run_sparql_subquery(
     state: &AppState,
     sparql: &str,
@@ -2663,4 +2659,177 @@ pub(crate) async fn run_sparql_subquery(
             .map_err(ServerError::Api)?;
         Ok(SubqueryOutput { data, tally: None })
     }
+}
+
+// =============================================================================
+// Multi-query envelope handler
+// =============================================================================
+
+use fluree_db_api::query::multi::{
+    MultiQueryBounds, MultiQueryRequest, MultiQueryValidationError,
+};
+use fluree_db_api::query::multi_snapshot::resolve_envelope_snapshot;
+
+use super::multi_dispatch::{dispatch_multi_query, DispatchConfig};
+use super::multi_response::{assemble_response, ResponseAssemblyError};
+
+/// `POST /v1/fluree/multi-query`
+///
+/// Execute a bundle of independent queries against a single resolved
+/// snapshot moment, in parallel under bounded concurrency.
+///
+/// Wire format documented in `fluree_db_api::query::multi`. Envelope-level
+/// validation (bounds, asOf collision, opts.t rejection, history-query
+/// rejection, envelope max-fuel rejection) runs before any sub-query
+/// executes; per-alias outcomes (success, error, timeout) are assembled
+/// into the response body's `results` / `errors` map and the top-level
+/// `status` field summarizes the aggregate.
+///
+/// HTTP status mapping:
+/// - **4xx** — envelope validation failed (bounds violation, asOf
+///   collision, malformed entry, etc.). No `results` / `errors` keys.
+/// - **5xx** — envelope infra failed (snapshot resolution dies; response
+///   exceeds the size cap during assembly).
+/// - **200** — anything else, including all-sub-queries-failed. Clients
+///   branch on `body.status` (`"ok"` | `"partial"` | `"all_failed"`)
+///   rather than HTTP code for per-alias outcomes.
+pub async fn multi_query(
+    State(state): State<Arc<AppState>>,
+    headers: FlureeHeaders,
+    bearer: MaybeDataBearer,
+    credential: MaybeCredential,
+) -> Result<Response> {
+    let request_id = extract_request_id(&credential.headers, &state.telemetry_config);
+    let trace_id = extract_trace_id(&credential.headers);
+    let span = create_request_span(
+        "multi_query",
+        request_id.as_deref(),
+        trace_id.as_deref(),
+        None,
+        None,
+        Some("multi-query"),
+    );
+
+    async move {
+        let span = tracing::Span::current();
+        tracing::info!(status = "start", "multi-query request received");
+
+        // Auth: bearer or signed credential. Mirrors single-query
+        // /fluree/query top-level handler.
+        let data_auth = state.config.data_auth();
+        if data_auth.mode == crate::config::DataAuthMode::Required
+            && !credential.is_signed()
+            && bearer.0.is_none()
+        {
+            set_span_error_code(&span, "error:Unauthorized");
+            return Err(ServerError::unauthorized(
+                "data auth required: provide a bearer token or signed request",
+            ));
+        }
+
+        // Parse envelope body via credential to honor JWS-wrapped requests.
+        let body: JsonValue = credential.body_json()?;
+        let envelope: MultiQueryRequest = serde_json::from_value(body).map_err(|e| {
+            set_span_error_code(&span, "error:BadRequest");
+            ServerError::bad_request(format!("invalid multi-query envelope: {e}"))
+        })?;
+
+        let bounds = MultiQueryBounds::DEFAULT;
+
+        // Validation — maps to 4xx with a structured error body.
+        let distinct_ledgers = match fluree_db_api::query::multi::validate_envelope(
+            &envelope, &bounds,
+        ) {
+            Ok(distinct) => distinct,
+            Err(err) => {
+                set_span_error_code(&span, "error:BadRequest");
+                return Err(validation_error_to_server(&err));
+            }
+        };
+        let _ = &headers; // headers reserved for future identity / policy threading
+
+        let envelope_started = std::time::Instant::now();
+
+        // Snapshot resolution — 5xx on failure.
+        let snapshot = match resolve_envelope_snapshot(
+            state.fluree.as_ref(),
+            &distinct_ledgers,
+            envelope.as_of.as_ref(),
+        )
+        .await
+        {
+            Ok(snap) => Arc::new(snap),
+            Err(err) => {
+                set_span_error_code(&span, "error:SnapshotResolutionFailed");
+                tracing::error!(error = %err, "multi-query snapshot resolution failed");
+                return Err(ServerError::Api(err));
+            }
+        };
+
+        // Detect whether the envelope opted into meta — used downstream to
+        // include the aggregate meta block in the response.
+        let include_meta = envelope_meta_enabled(envelope.opts.as_ref());
+
+        let config = DispatchConfig::from_envelope(&envelope, &bounds);
+        let outcomes = dispatch_multi_query(
+            Arc::clone(&state),
+            envelope,
+            Arc::clone(&snapshot),
+            config,
+        )
+        .await;
+
+        let elapsed_ms = envelope_started.elapsed().as_millis().min(u64::MAX as u128) as u64;
+
+        let response = assemble_response(
+            outcomes,
+            snapshot.as_ref(),
+            &bounds,
+            include_meta,
+            elapsed_ms,
+        )
+        .map_err(|e| match e {
+            ResponseAssemblyError::ResponseSizeExceeded { .. } => {
+                set_span_error_code(&span, "error:ResponseTooLarge");
+                ServerError::internal(e.to_string())
+            }
+        })?;
+
+        tracing::info!(
+            status = "success",
+            query_kind = "multi",
+            response_status = ?response.status,
+            elapsed_ms,
+        );
+        Ok((HeaderMap::new(), Json(response)).into_response())
+    }
+    .instrument(span)
+    .await
+}
+
+/// Map a validation error to the appropriate `ServerError`, preserving the
+/// structured discriminator in the message so clients can branch on it.
+fn validation_error_to_server(err: &MultiQueryValidationError) -> ServerError {
+    let msg = err.to_string();
+    // Validation errors are always client-fault — surface as 4xx.
+    ServerError::bad_request(msg)
+}
+
+/// Did the envelope opts request meta tracking?
+///
+/// Matches the same shapes the single-query path recognizes
+/// ([`has_tracking_opts`]) so users don't have to learn a new opts vocab
+/// for the envelope.
+fn envelope_meta_enabled(opts: Option<&JsonValue>) -> bool {
+    let Some(opts) = opts.and_then(JsonValue::as_object) else {
+        return false;
+    };
+    if let Some(meta) = opts.get("meta") {
+        match meta {
+            JsonValue::Bool(true) => return true,
+            JsonValue::Object(o) if !o.is_empty() => return true,
+            _ => {}
+        }
+    }
+    false
 }
