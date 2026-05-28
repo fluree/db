@@ -83,7 +83,16 @@ Indexer CAS writes are billed through a `MeteredContentStore` wrapper that the b
 
 FLI3 leaf writes carry an additional per-leaflet charge of **1.000 fuel per re-encoded leaflet**. Passthrough leaflets (byte-copies carried forward from a prior leaf during an incremental update) are **not** charged because no zstd encoding work was performed — so a 100-leaflet leaf where only two leaflets were touched by novelty bills `1 + 2 = 3` fuel, not `1 + 100`. The two FLI3 leaf upload sites (`build::upload::upload_indexes_to_cas` for full rebuild, `build::incremental::upload_leaf_blobs` for incremental) compute the count from `LeafInfo::re_encoded_leaflet_count`.
 
-Indexing fuel is **measurement only**: indexer trackers are no-limit. A partial index is worse than a slow one, so the indexer never aborts mid-build on a fuel limit. The plain public entry points (`build_index_for_record`, `rebuild_index_from_commits`) pass a disabled tracker and report `fuel: None`. The `*_with_tracker` variants (used by `/reindex`) wrap the store, propagate a fuel-enabled tracker, and stamp the final tally on `IndexResult::fuel` — `Some(0.0)` for an already-current build, `Some(N)` for one that did real work. `/reindex` always populates `fuel`; the wire response carries it as `fuel` (omitted when `None`).
+Indexing fuel is **measurement only**: indexer trackers are no-limit. A partial index is worse than a slow one, so the indexer never aborts mid-build on a fuel limit. The plain public entry points (`build_index_for_record`, `rebuild_index_from_commits`) pass a disabled tracker and report `fuel: None`. The `*_with_tracker` variants wrap the store, propagate a fuel-enabled tracker, and stamp the final tally on `IndexResult::fuel` — `Some(0.0)` for an already-current build, `Some(N)` for one that did real work.
+
+Where fuel surfaces depends on who initiated the build:
+
+- **`/reindex` (standalone, user-triggered):** the API creates a per-request fuel tracker, returns `ReindexResponse.fuel`. CLI prints `Fuel: N.NNN`.
+- **`trigger_index` (standalone, waits for background completion):** the orchestrator creates a per-build tracker; `TriggerIndexResult.fuel` carries the result. **Coalesced trigger callers** all receive the fuel of the single build that satisfied them.
+- **Background indexer (no caller waiting):** the orchestrator still creates a per-build tracker and logs the tally on the completion `info!` line (`fuel = ...`), but does not return it anywhere.
+- **Combined transactor + post-commit indexing (`maybe_refresh_after_commit` / `require_refresh_before_commit`):** measured with a per-build tracker and logged on the completion line; intentionally **not** attributed to the transaction's tracking response.
+
+`IndexOutcome::Completed` carries `fuel: Option<f64>` so `wait()` callers and waiter handles see the same value. Already-satisfied early-returns (waiter satisfied by a previously-published index) report `Some(0.0)` so callers can distinguish "no work" from "not tracked".
 
 ### Setting Fuel Limits
 

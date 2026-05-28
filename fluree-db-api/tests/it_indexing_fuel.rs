@@ -155,6 +155,60 @@ async fn build_index_for_record_already_current_reports_zero_fuel() {
 }
 
 #[tokio::test]
+async fn trigger_index_reports_positive_fuel() {
+    use fluree_db_api::tx::IndexingMode;
+    use fluree_db_api::TriggerIndexOptions;
+    use std::sync::Arc;
+    use support::start_background_indexer_local;
+
+    let mut fluree = FlureeBuilder::memory().build_memory();
+    let (local, indexer_handle) = start_background_indexer_local(
+        fluree.backend().clone(),
+        Arc::new(fluree.nameservice_mode().clone()),
+        fluree_db_indexer::IndexerConfig::default(),
+    );
+    fluree.set_indexing_mode(IndexingMode::Background(indexer_handle));
+
+    local
+        .run_until(async move {
+            let ledger = fluree
+                .create_ledger("it-indexing-fuel-trigger")
+                .await
+                .expect("create_ledger");
+            let tx = json!({
+                "@context": {"ex": "http://example.org/"},
+                "@graph": [
+                    {"@id": "ex:a", "@type": "ex:Person", "ex:name": "Alice"},
+                    {"@id": "ex:b", "@type": "ex:Person", "ex:name": "Bob"},
+                ]
+            });
+            let result = fluree.insert(ledger, &tx).await.expect("insert");
+            let committed_t = result.ledger.t();
+
+            let trigger = fluree
+                .trigger_index(
+                    "it-indexing-fuel-trigger:main",
+                    TriggerIndexOptions::default(),
+                )
+                .await
+                .expect("trigger_index");
+
+            assert!(
+                trigger.index_t >= committed_t,
+                "indexed to >= committed t"
+            );
+            let fuel = trigger
+                .fuel
+                .expect("background indexer always populates fuel");
+            assert!(
+                fuel > 0.0,
+                "background indexer should charge non-zero fuel for real work; got {fuel}"
+            );
+        })
+        .await;
+}
+
+#[tokio::test]
 async fn non_tracked_rebuild_reports_fuel_none() {
     let fluree = FlureeBuilder::memory().build_memory();
     let ledger_id = "it/indexing-fuel-none:main";

@@ -205,6 +205,12 @@ pub struct TriggerIndexResult {
     pub index_t: i64,
     /// Content identifier of the index root (when available)
     pub root_id: Option<fluree_db_core::ContentId>,
+    /// Total fuel charged for the build that satisfied this trigger. The
+    /// background orchestrator always measures with a per-build tracker, so
+    /// this is normally `Some(N)` (or `Some(0.0)` when the requested t was
+    /// already indexed and no work was needed). Coalesced trigger callers
+    /// all receive the fuel of the single build that satisfied them.
+    pub fuel: Option<f64>,
 }
 
 /// Result of reindex operation
@@ -1416,6 +1422,7 @@ impl crate::Fluree {
                 ledger_id,
                 index_t: 0,
                 root_id: None,
+                fuel: Some(0.0),
             });
         }
 
@@ -1470,10 +1477,15 @@ impl crate::Fluree {
         macro_rules! finish_wait {
             ($outcome:expr) => {
                 match $outcome {
-                    IndexOutcome::Completed { index_t, root_id } => {
+                    IndexOutcome::Completed {
+                        index_t,
+                        root_id,
+                        fuel,
+                    } => {
                         info!(
                             ledger_id = %ledger_id,
                             index_t = index_t,
+                            fuel = ?fuel,
                             elapsed_ms = wait_started.elapsed().as_millis() as u64,
                             "Indexing completed"
                         );
@@ -1481,6 +1493,7 @@ impl crate::Fluree {
                             ledger_id: ledger_id.clone(),
                             index_t,
                             root_id,
+                            fuel,
                         });
                     }
                     IndexOutcome::Failed(msg) => {
