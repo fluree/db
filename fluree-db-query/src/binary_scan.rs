@@ -1662,77 +1662,78 @@ impl Operator for BinaryScanOperator {
                 None
             };
 
-            // Refs carry no datatype/lang, so they bypass the literal-value
-            // machinery entirely and resolve snapshot-aware (decode_sid → store
-            // IRI lookup) via `subject_ref_to_s_id`. This mirrors the subject path
-            // (`build_filter_from_snapshot_sids`) and the count path, so a raw
-            // `Term::Sid` object whose namespace code the store can't decode isn't
-            // mistaken for absent (which would route to overlay-only and wrongly
-            // drop a present base match). `Ok(None)` is a conclusive base miss.
-            let encoded: std::io::Result<(OType, u64)> = if let FlakeValue::Ref(sid) = bound_o {
+            // An untyped string that stats couldn't pin to a single datatype:
+            // the predicate has langString and/or multiple string-compatible
+            // datatypes, so we can't build one tight (o_type, o_key) seek.
+            let untyped_string = dt_sid.is_none()
+                && lang.is_none()
+                && inferred_dt_sid.is_none()
+                && matches!(bound_o, FlakeValue::String(_));
+
+            if let FlakeValue::Ref(sid) = bound_o {
+                // Refs carry no datatype/lang, so they bypass the literal-value
+                // machinery and resolve snapshot-aware (decode_sid → store IRI
+                // lookup) via `subject_ref_to_s_id` — mirroring the subject path
+                // (`build_filter_from_snapshot_sids`) and the count path. A raw
+                // `Term::Sid` whose namespace code the store can't decode is thus
+                // not mistaken for absent. `Ok(None)` is a conclusive base miss.
                 match subject_ref_to_s_id(ctx.active_snapshot, store_ref, &Ref::Sid(sid.clone())) {
-                    Ok(Some(s_id)) => Ok((OType::IRI_REF, s_id)),
-                    Ok(None) => Err(std::io::Error::new(
-                        std::io::ErrorKind::NotFound,
-                        "ref object not found in base dict",
-                    )),
-                    Err(e) => Err(std::io::Error::other(e.to_string())),
+                    Ok(Some(s_id)) => {
+                        filter.o_type = Some(OType::IRI_REF.as_u16());
+                        filter.o_key = Some(s_id);
+                    }
+                    Ok(None) => return self.open_overlay_only_fallback(ctx, &s_sid, &p_sid).await,
+                    // Genuine error — keep correctness by leaving the filter un-narrowed.
+                    Err(_) => {}
+                }
+            } else if untyped_string {
+                // All string datatypes/langs share one interned string id, so set it
+                // as the `o_key` filter (o_type left wild). POST orders
+                // (p_id, o_type, o_key), so o_key without o_type is NOT a tight key
+                // range — the cursor still scans the predicate's broad leaf range and
+                // loads candidate leaflets, but `filter_batch` drops rows whose o_key
+                // differs *before* value decode. Leaflets emptied by that filter
+                // return no batch, so they incur neither the per-leaflet fuel charge
+                // nor a dict decode — cutting the dominant cost while the value
+                // post-filter preserves lenient matching across string datatypes/langs
+                // (overlay rows are filtered the same way, so novelty langStrings
+                // aren't dropped). Mirrors the untyped-numeric o_key prefilter. An
+                // absent string can't be in the base dict at all → overlay-only.
+                if let FlakeValue::String(s) = bound_o {
+                    match store_ref.find_string_id(s) {
+                        Ok(Some(str_id)) => filter.o_key = Some(str_id as u64),
+                        Ok(None) => {
+                            return self.open_overlay_only_fallback(ctx, &s_sid, &p_sid).await
+                        }
+                        Err(_) => {}
+                    }
                 }
             } else {
-                match (dt_sid.or(inferred_dt_sid.as_ref()), lang) {
+                let encoded = match (dt_sid.or(inferred_dt_sid.as_ref()), lang) {
                     (Some(dt_sid), lang) => {
                         value_to_otype_okey(bound_o, dt_sid, lang, store_ref, dict_novelty)
                     }
-                    (None, None) => {
-                        match bound_o {
-                            // A string without a datatype constraint is ambiguous: it
-                            // could be xsd:string or rdf:langString, which encode to
-                            // different o_types, so we can't build one tight
-                            // (o_type, o_key) range and must leave the scan un-narrowed.
-                            //
-                            // BUT both share the same interned string id, so if the
-                            // string isn't in the dict at all, no string-typed flake
-                            // (any datatype/lang) can match. Surface NotFound in that
-                            // case to short-circuit to the overlay-only path instead of
-                            // a full predicate scan. (A NotFound here is a base-dict
-                            // miss; the overlay-only fallback still checks novelty, so
-                            // this stays correct when the value is novelty-only.)
-                            FlakeValue::String(s) => match store_ref.find_string_id(s) {
-                                Ok(Some(_)) => Err(std::io::Error::other(
-                                    "string without dtc: type ambiguous (could be langString)",
-                                )),
-                                Ok(None) => Err(std::io::Error::new(
-                                    std::io::ErrorKind::NotFound,
-                                    "string value not found in V6 dict",
-                                )),
-                                Err(e) => {
-                                    Err(std::io::Error::other(format!("find_string_id: {e}")))
-                                }
-                            },
-                            // Propagate the io::Error kind unchanged: a NotFound here
-                            // (value absent from the persisted dict) routes to the
-                            // overlay-only fallback below instead of a wide base scan.
-                            _ => value_to_otype_okey_simple(bound_o, store_ref),
-                        }
-                    }
+                    // Refs and untyped strings are handled above; this is reached
+                    // for untyped non-string values (numeric/bool/date/…).
+                    (None, None) => value_to_otype_okey_simple(bound_o, store_ref),
                     (None, Some(_lang)) => Err(std::io::Error::new(
                         std::io::ErrorKind::InvalidData,
                         "lang tag requires datatype constraint",
                     )),
-                }
-            };
+                };
 
-            match encoded {
-                Ok((ot, key)) => {
-                    filter.o_type = Some(ot.as_u16());
-                    filter.o_key = Some(key);
-                }
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                    // Novelty may contain the value, but base index can't; avoid wide base scan.
-                    return self.open_overlay_only_fallback(ctx, &s_sid, &p_sid).await;
-                }
-                Err(_) => {
-                    // If encoding fails, keep correctness by leaving the filter un-narrowed.
+                match encoded {
+                    Ok((ot, key)) => {
+                        filter.o_type = Some(ot.as_u16());
+                        filter.o_key = Some(key);
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                        // Value absent from base dict; overlay-only still checks novelty.
+                        return self.open_overlay_only_fallback(ctx, &s_sid, &p_sid).await;
+                    }
+                    Err(_) => {
+                        // If encoding fails, keep correctness by leaving the filter un-narrowed.
+                    }
                 }
             }
         }

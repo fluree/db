@@ -199,14 +199,17 @@ async fn bound_object_absent_string_does_not_scan_predicate() {
 
 #[tokio::test]
 async fn untyped_string_on_langstring_predicate_stays_lenient_and_short_circuits_absent() {
-    // `ns:label` has BOTH xsd:string and rdf:langString values, so the gate must
-    // DECLINE to narrow (langString present). Two things to verify:
-    //   1. Negative guard: a present untyped string stays lenient — it matches
-    //      across both datatypes (xsd:string "shared" and "shared"@en).
-    //   2. The non-narrowable path's absent-string short-circuit still works: an
-    //      absent string hits the `(None,None)` find_string_id probe → NotFound
-    //      → overlay-only, so it must NOT full-scan the (large) ns:label predicate.
-    // The bulk of distinct labels makes a full scan visibly exceed the ceiling.
+    // `ns:label` has BOTH xsd:string and rdf:langString values, so it can't be
+    // narrowed to a single (o_type, str_id) seek. Three things to verify:
+    //   1. Lenient: a present untyped string still matches across both datatypes
+    //      (xsd:string "shared" and "shared"@en).
+    //   2. Bounded fuel anyway: all string forms share the interned str_id, so the
+    //      cursor filters non-matching rows before value decode; leaflets it empties
+    //      return no batch, so present "shared" stays cheap without dropping the
+    //      langString match.
+    //   3. Absent string short-circuits: find_string_id miss → overlay-only, so it
+    //      must NOT full-scan the (large) ns:label predicate.
+    // The bulk of distinct labels makes a value-decoding full scan exceed the ceiling.
     assert_index_defaults();
     let fluree = FlureeBuilder::memory().build_memory();
     let ledger_id = "fuel-langstring:main";
@@ -225,10 +228,12 @@ async fn untyped_string_on_langstring_predicate_stays_lenient_and_short_circuits
         .expect("insert");
     rebuild_and_publish_index(&fluree, ledger_id).await;
 
-    // (1) Present "shared" → lenient match across xsd:string + langString. This
-    // predicate has langString, so it intentionally does NOT narrow (Phase 2),
-    // hence we assert correctness only, not fuel.
-    let (present_rows, _present_fuel) = tracked_on(
+    // (1) Present "shared" → lenient match across xsd:string + langString, AND
+    // bounded fuel: the predicate can't narrow to one (o_type, str_id) seek, but
+    // all string forms share the interned str_id, so the cursor filters
+    // non-matching rows before value decode — leaflets it empties return no batch,
+    // so they cost no fuel — without dropping the langString match.
+    let (present_rows, present_fuel) = tracked_on(
         &fluree,
         ledger_id,
         json!({ "@id": "?s", "ns:label": "shared" }),
@@ -238,6 +243,11 @@ async fn untyped_string_on_langstring_predicate_stays_lenient_and_short_circuits
         present_rows, 2,
         "untyped 'shared' must match both xsd:string and langString (lenient); \
          optimizer must not narrow when langString is present"
+    );
+    assert!(
+        present_fuel <= ABSENT_FUEL_CEILING,
+        "present string on a langString predicate burned {present_fuel} fuel; \
+         expected the o_key filter to drop non-matching rows before value decode"
     );
 
     // (2) Absent string → short-circuit via the find_string_id probe, no scan.
