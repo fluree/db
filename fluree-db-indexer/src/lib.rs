@@ -31,6 +31,7 @@ mod build;
 pub mod config;
 pub mod drop;
 pub mod error;
+pub mod fuel;
 pub mod fulltext_hook;
 pub mod gc;
 #[path = "stats/hll256.rs"]

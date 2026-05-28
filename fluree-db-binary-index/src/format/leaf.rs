@@ -72,6 +72,12 @@ pub struct LeafInfo {
     pub first_key: RunRecordV2,
     /// Last routing key of the leaf.
     pub last_key: RunRecordV2,
+    /// Number of leaflets in this leaf that were freshly (re-)encoded, as
+    /// opposed to passthrough byte-copies of an existing leaflet. Drives the
+    /// per-leaflet portion of indexer CAS-write fuel charges. For full-rebuild
+    /// output this equals the total leaflet count; for incremental updates it
+    /// counts only the leaflets that were merged + re-encoded.
+    pub re_encoded_leaflet_count: u32,
 }
 
 // ── Writer ─────────────────────────────────────────────────────────────
@@ -286,6 +292,7 @@ impl LeafWriter {
 
         // 2. Build the leaf blob.
         let leaflets = std::mem::take(&mut self.encoded_leaflets);
+        let re_encoded_leaflet_count = leaflets.len() as u32;
         let leaf_bytes = build_leaf_blob(
             self.order,
             &leaflets,
@@ -305,6 +312,7 @@ impl LeafWriter {
             total_rows,
             first_key: first_record,
             last_key: last_record,
+            re_encoded_leaflet_count,
         });
 
         // Reset for next leaf.

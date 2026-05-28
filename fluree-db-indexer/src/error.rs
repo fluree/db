@@ -60,6 +60,13 @@ pub enum IndexerError {
     /// General-purpose error for spatial index building and other auxiliary pipelines.
     #[error("{0}")]
     Other(String),
+
+    /// Fuel limit exceeded during an indexer CAS write. Indexing trackers are
+    /// expected to be no-limit (measurement only), so in normal use this is
+    /// unreachable — it exists for defensive type safety if a caller supplies
+    /// a limited tracker.
+    #[error("Indexer fuel limit exceeded: {0}")]
+    FuelExceeded(#[from] fluree_db_core::tracking::FuelExceededError),
 }
 
 impl From<serde_json::Error> for IndexerError {

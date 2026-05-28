@@ -78,6 +78,13 @@ pub mod schedule {
     /// Transaction/commit baseline, charged once per `stage` and once per
     /// bulk-import commit chunk.
     pub const TXN_BASELINE_MICRO_FUEL: u64 = 10_000;
+
+    /// Per successful indexer CAS write. Charged once per `put`, `put_with_id`,
+    /// or `content_write_bytes` call made by the indexer. For `IndexLeaf` writes
+    /// an additional charge of this same rate is applied per *re-encoded*
+    /// leaflet inside the leaf (passthrough leaflets are byte-copied and not
+    /// charged).
+    pub const INDEX_CAS_WRITE_MICRO_FUEL: u64 = 1000;
 }
 
 /// Tracking options parsed from query `opts`
