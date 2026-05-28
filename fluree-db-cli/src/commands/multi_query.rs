@@ -57,8 +57,16 @@ pub async fn run(
     // a locally running `fluree server`. --direct disables auto-routing
     // and forces an error in the no-remote case since multi-query has no
     // in-process execution path.
-    let client = match remote_flag {
-        Some(name) => context::build_remote_client(name, dirs).await?,
+    //
+    // remote_name carries the named-remote slug only when we need to
+    // persist refreshed OAuth tokens after the round-trip — the
+    // auto-route (local server) and unauthenticated paths skip
+    // persistence because the local server doesn't require a token.
+    let (client, remote_name) = match remote_flag {
+        Some(name) => (
+            context::build_remote_client(name, dirs).await?,
+            Some(name.to_string()),
+        ),
         None => {
             if direct {
                 return Err(CliError::Usage(
@@ -68,7 +76,7 @@ pub async fn run(
                 ));
             }
             match try_server_route_client(dirs) {
-                Some(c) => c,
+                Some(c) => (c, None),
                 None => return Err(no_transport_error()),
             }
         }
@@ -78,6 +86,16 @@ pub async fn run(
         .multi_query(&envelope)
         .await
         .map_err(|e| CliError::Remote(format!("multi-query request failed: {e}")))?;
+
+    // Persist any OIDC token refresh that happened silently during the
+    // round-trip back to config.toml. Without this, a successful
+    // multi-query leaves the remote's stored credentials stale —
+    // next command refreshes again, or fails outright if the refresh
+    // token has rotated. The single-query path does the same after
+    // every remote call.
+    if let Some(name) = remote_name.as_deref() {
+        context::persist_refreshed_tokens(&client, name, dirs).await;
+    }
 
     print_response(&response, format)?;
     Ok(())

@@ -1662,7 +1662,7 @@ mod tests {
         let err = validate_envelope(&req, &MultiQueryBounds::DEFAULT).unwrap_err();
         match err {
             MultiQueryValidationError::HistoryQueryInEnvelope { ref alias } => {
-                assert_eq!(alias, "a")
+                assert_eq!(alias, "a");
             }
             other => panic!("expected HistoryQueryInEnvelope, got {other:?}"),
         }

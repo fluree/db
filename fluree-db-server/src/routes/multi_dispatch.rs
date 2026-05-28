@@ -293,7 +293,7 @@ pub(crate) async fn dispatch_multi_query(
                     None => break,
                 }
             }
-            _ = &mut deadline_sleep => {
+            () = &mut deadline_sleep => {
                 set.abort_all();
                 // Drain remaining tasks; aborted ones return JoinError, and
                 // tasks that already completed return normally.

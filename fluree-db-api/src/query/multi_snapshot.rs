@@ -353,7 +353,7 @@ pub fn apply_snapshot_to_sparql(sparql: &str, snapshot: &EnvelopeSnapshot) -> St
         return sparql.to_string();
     }
 
-    edits.sort_by(|a, b| a.0.cmp(&b.0));
+    edits.sort_by_key(|edit| edit.0);
     // Apply right-to-left.
     let mut out = sparql.to_string();
     for (start, end, replacement) in edits.into_iter().rev() {
