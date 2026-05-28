@@ -1749,7 +1749,7 @@ impl BinaryGraphView {
 
     /// Attach a fuel tracker. When set, each forward-pack dict touch (a call
     /// into the persisted dict that didn't short-circuit through novelty)
-    /// charges 1 fuel.
+    /// charges one dict touch (`schedule::DICT_TOUCH_MICRO_FUEL`).
     pub fn with_tracker(mut self, tracker: fluree_db_core::Tracker) -> Self {
         if tracker.is_enabled() {
             self.tracker = Some(tracker);
@@ -1760,7 +1760,8 @@ impl BinaryGraphView {
     #[inline]
     fn charge_dict_touch(&self) -> io::Result<()> {
         if let Some(t) = &self.tracker {
-            t.consume_fuel(1000).map_err(io::Error::other)?;
+            t.consume_fuel(fluree_db_core::tracking::schedule::DICT_TOUCH_MICRO_FUEL)
+                .map_err(io::Error::other)?;
         }
         Ok(())
     }

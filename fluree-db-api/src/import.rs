@@ -227,7 +227,7 @@ pub fn detect_system_memory_mb() -> usize {
 /// fuel formula identical to the per-transaction `stage.rs` path.
 fn charge_commit_fuel(tracker: &Tracker, flake_count: u64) -> Result<(), FuelExceededError> {
     if tracker.is_enabled() {
-        tracker.consume_fuel(100_000)?;
+        tracker.consume_fuel(fluree_db_core::tracking::schedule::TXN_BASELINE_MICRO_FUEL)?;
         tracker.consume_fuel(flake_count)?;
     }
     Ok(())

@@ -57,7 +57,7 @@ pub struct BinaryCursor {
     epoch: u64,
     /// Time bound for overlay ops (only emit ops with t <= to_t).
     to_t: i64,
-    /// Optional fuel tracker. When set, charges 1 fuel per leaflet returned.
+    /// Optional fuel tracker. When set, charges one index touch per leaflet returned.
     tracker: Option<Tracker>,
 }
 
@@ -130,8 +130,9 @@ impl BinaryCursor {
         }
     }
 
-    /// Attach a fuel tracker. Charges 1 fuel (1000 micro-fuel) per leaflet
-    /// returned by `next_batch` (regardless of cache hit/miss).
+    /// Attach a fuel tracker. Charges one index touch
+    /// (`schedule::INDEX_TOUCH_MICRO_FUEL`) per leaflet returned by
+    /// `next_batch` (regardless of cache hit/miss).
     pub fn with_tracker(mut self, tracker: Tracker) -> Self {
         if tracker.is_enabled() {
             self.tracker = Some(tracker);
@@ -317,11 +318,13 @@ impl BinaryCursor {
                         continue;
                     }
 
-                    // Charge 1 fuel per leaflet returned (per-touch, regardless
-                    // of cache state). Caller can downcast the io::Error to
-                    // recover the original FuelExceededError.
+                    // Charge one index touch per leaflet returned (per-touch,
+                    // regardless of cache state). Caller can downcast the
+                    // io::Error to recover the original FuelExceededError.
                     if let Some(tracker) = &self.tracker {
-                        if let Err(e) = tracker.consume_fuel(1000) {
+                        if let Err(e) = tracker.consume_fuel(
+                            fluree_db_core::tracking::schedule::INDEX_TOUCH_MICRO_FUEL,
+                        ) {
                             return Err(io::Error::other(e));
                         }
                     }
