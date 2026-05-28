@@ -62,7 +62,7 @@ Cost ladder (per event):
 | Overlay/novelty row materialized | 0.001 |
 | History row scanned (base + in-range sidecar rows) | 0.001 |
 | R2RML row emitted (Iceberg/Parquet) | 0.001 |
-| Transaction commit baseline (once per commit, including each bulk-import chunk) | 100.000 |
+| Transaction commit baseline (once per commit, including each bulk-import chunk) | 10.000 |
 | Staged flake (per flake in a transaction or bulk-import chunk) | 0.001 |
 | `REGEX` / `REPLACE` evaluation | 0.001 |
 | Hash function (`MD5`, `SHA1`, `SHA256`, `SHA384`, `SHA512`) | 0.001 |

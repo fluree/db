@@ -77,7 +77,7 @@ pub mod schedule {
 
     /// Transaction/commit baseline, charged once per `stage` and once per
     /// bulk-import commit chunk.
-    pub const TXN_BASELINE_MICRO_FUEL: u64 = 100_000;
+    pub const TXN_BASELINE_MICRO_FUEL: u64 = 10_000;
 }
 
 /// Tracking options parsed from query `opts`

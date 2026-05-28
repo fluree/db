@@ -148,7 +148,7 @@ pub struct ImportConfig {
     /// Optional progress callback invoked at key pipeline milestones.
     pub progress: Option<ProgressFn>,
     /// Optional execution tracker. When enabled, fuel is charged per chunk
-    /// using the same formula as `stage_transaction`: 100 fuel baseline per
+    /// using the same formula as `stage_transaction`: 10 fuel baseline per
     /// commit plus 1 micro-fuel per encoded flake. If the tracker carries a
     /// `max_fuel` limit, the import aborts with `ImportError::FuelExceeded`
     /// as soon as the limit is exceeded. Default: `Tracker::disabled()`.
@@ -221,7 +221,7 @@ pub fn detect_system_memory_mb() -> usize {
     16 * 1024
 }
 
-/// Charge the per-commit fuel cost: 100 fuel baseline + 1 micro-fuel
+/// Charge the per-commit fuel cost: 10 fuel baseline + 1 micro-fuel
 /// per flake. No-op when tracking is disabled. Used by every commit
 /// loop (parallel, remote-serial, local-serial) to keep the import
 /// fuel formula identical to the per-transaction `stage.rs` path.
@@ -1089,7 +1089,7 @@ impl<'a> ImportBuilder<'a> {
     }
 
     /// Attach an execution tracker for fuel accounting. Mirrors transaction
-    /// fuel charging: 100 fuel baseline per commit + 1 micro-fuel per flake.
+    /// fuel charging: 10 fuel baseline per commit + 1 micro-fuel per flake.
     /// When the tracker carries a `max_fuel` limit, the import aborts with
     /// `ImportError::FuelExceeded` as soon as the limit is hit. The final
     /// tally is returned on `ImportResult::tally`.
@@ -1832,7 +1832,7 @@ where
                     .await
                     .map_err(|e| ImportError::Transact(e.to_string()))?;
 
-                // Fuel: 100 fuel baseline per commit + 1 micro-fuel per flake,
+                // Fuel: 10 fuel baseline per commit + 1 micro-fuel per flake,
                 // matching the per-chunk-as-transaction model in `stage.rs`.
                 charge_commit_fuel(&env.config.tracker, result.flake_count as u64)?;
 
@@ -2517,7 +2517,7 @@ where
                     .map_err(|e| ImportError::Transact(e.to_string()))?
             };
 
-            // Fuel: 100 fuel baseline per commit + 1 micro-fuel per flake.
+            // Fuel: 10 fuel baseline per commit + 1 micro-fuel per flake.
             charge_commit_fuel(&config.tracker, result.flake_count as u64)?;
 
             // Collect txn-meta for this commit.
@@ -2750,7 +2750,7 @@ where
                         .map_err(|e| ImportError::Transact(e.to_string()))?
                 };
 
-                // Fuel: 100 fuel baseline per commit + 1 micro-fuel per flake.
+                // Fuel: 10 fuel baseline per commit + 1 micro-fuel per flake.
                 charge_commit_fuel(&config.tracker, result.flake_count as u64)?;
 
                 // Collect txn-meta for this commit.

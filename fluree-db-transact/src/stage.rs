@@ -195,7 +195,7 @@ pub async fn stage(
             }
         }
 
-        // Per-transaction baseline (100 fuel) covering parse, validation,
+        // Per-transaction baseline (10 fuel) covering parse, validation,
         // commit log write, and indexing overhead. Per-flake cost (1 micro-fuel)
         // is charged later against the staged flake set.
         if let Some(tracker) = options.tracker {
@@ -449,7 +449,7 @@ pub async fn stage_flakes(
             }
         }
 
-        // Per-transaction baseline (100 fuel) covering parse, validation,
+        // Per-transaction baseline (10 fuel) covering parse, validation,
         // commit log write, and indexing overhead. Per-flake cost (1 micro-fuel)
         // is charged below.
         if let Some(tracker) = options.tracker {
