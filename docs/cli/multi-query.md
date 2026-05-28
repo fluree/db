@@ -48,19 +48,13 @@ See [Multi-query envelope](../api/multi-query.md) for the full envelope wire for
 
 ## Transport
 
-**`fluree multi-query` requires a Fluree server.** The dispatcher
-lives in `fluree-db-server` and only the HTTP endpoint
-(`POST /multi-query`) exposes it.
+`fluree multi-query` runs the envelope through whichever of three transports applies:
 
-Transport resolution, in priority order:
+1. **`--remote <name>`** — explicit; routes through the named remote from `remotes.toml`. OIDC token refresh is persisted back to `config.toml` after the round-trip.
+2. **Auto-route to a locally running `fluree server`** — used when `--remote` is omitted and `server.meta.json` reports a live pid. Suppressed by `--direct`.
+3. **In-process local** — `fluree multi-query` calls `Fluree::multi_query()` directly against the storage tree configured for this `.fluree/` directory. Used when neither `--remote` nor a running local server is available, or when `--direct` is set. This is the natural counterpart to `fluree query` running locally.
 
-1. **`--remote <name>`** — explicit; routes through the named remote
-   from `remotes.toml`.
-2. **Auto-route to a locally running `fluree server`** — used when
-   `--remote` is omitted and `server.meta.json` reports a live pid.
-   Suppressed by `--direct`.
-3. **No transport** — the CLI exits with an error pointing at both
-   options above; it does not hang or silently fall back.
+In-process mode reads the same storage path, indexing thresholds, and prefix table as every other local CLI command. No HTTP, no server, no auth — the caller already has direct access to the storage tree.
 
 ## Examples
 

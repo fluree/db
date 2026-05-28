@@ -1,34 +1,34 @@
 //! Multi-query envelope response assembly.
 //!
 //! Turns the dispatcher's `Vec<AliasOutcome>` into a wire-shape
-//! [`MultiQueryResponse`], measuring serialized byte size as each result is
-//! added so an oversized response surfaces as an envelope-level error rather
-//! than blowing memory.
+//! [`MultiQueryResponse`], measuring serialized byte size as each result
+//! is added so an oversized response surfaces as an envelope-level error
+//! rather than blowing memory.
 //!
-//! Sizing is incremental and approximate: each per-alias successful result
-//! is serialized once with `serde_json::to_vec`, its byte length is added to
-//! a running total alongside a small fudge for envelope overhead, and the
-//! assembler aborts with [`ResponseAssemblyError::ResponseSizeExceeded`]
-//! once the running total crosses
-//! [`MultiQueryBounds::max_response_size_bytes`]. Building a single huge
-//! `JsonValue` and measuring after would defeat the purpose.
+//! Sizing is incremental and approximate: each per-alias successful
+//! result is serialized once with `serde_json::to_vec`, its byte length
+//! is added to a running total alongside a small fudge for envelope
+//! overhead, and the assembler aborts with
+//! [`ResponseAssemblyError::ResponseSizeExceeded`] once the running
+//! total crosses [`MultiQueryBounds::max_response_size_bytes`].
 
-use fluree_db_api::query::multi::{
-    MultiQueryBounds, MultiQueryMeta, MultiQueryResponse, MultiQueryStatus, SnapshotInfo,
-};
-use fluree_db_api::query::multi_snapshot::EnvelopeSnapshot;
-use fluree_db_api::TrackingTally;
+use indexmap::IndexMap;
 use serde_json::{Map as JsonMap, Value as JsonValue};
 
-use super::multi_dispatch::{AliasOutcome, AliasOutcomeKind};
+use crate::query::multi::{
+    MultiQueryBounds, MultiQueryMeta, MultiQueryResponse, MultiQueryStatus, SnapshotInfo,
+};
+use crate::query::multi_dispatch::{AliasOutcome, AliasOutcomeKind};
+use crate::query::multi_snapshot::EnvelopeSnapshot;
+use crate::TrackingTally;
 
-/// Envelope-level failure during response assembly. Maps to a 5xx response;
-/// per-alias failures stay inside [`MultiQueryResponse::errors`] and do not
-/// surface here.
+/// Envelope-level failure during response assembly. Maps to a 5xx HTTP
+/// response when used by the server handler; per-alias failures stay
+/// inside [`MultiQueryResponse::errors`] and do not surface here.
 #[derive(Debug, thiserror::Error)]
-pub(crate) enum ResponseAssemblyError {
+pub enum ResponseAssemblyError {
     #[error(
-        "assembled response would exceed server response-size cap of {limit} bytes \
+        "assembled response would exceed response-size cap of {limit} bytes \
          (reached {actual} bytes at alias '{alias}')"
     )]
     ResponseSizeExceeded {
@@ -39,16 +39,10 @@ pub(crate) enum ResponseAssemblyError {
 }
 
 /// Assemble a [`MultiQueryResponse`] from the dispatcher's per-alias
-/// outcomes, the resolved envelope snapshot, and the server's response-size
-/// cap.
+/// outcomes, the resolved envelope snapshot, and the bounds.
 ///
-/// Returns:
-/// - `Ok(response, status_is_partial)` on success. The boolean exists for
-///   HTTP-layer signaling but is also encoded in `response.status` so the
-///   caller can pick whichever it prefers.
-/// - `Err(ResponseSizeExceeded)` when the running serialized total crosses
-///   `bounds.max_response_size_bytes`. The error names the alias whose
-///   addition pushed the total over.
+/// Crate-internal — fed by `run_envelope` which the builder calls.
+/// External callers reach the assembled response via the builder.
 ///
 /// `include_meta` controls whether the response carries an aggregate
 /// [`MultiQueryMeta`] block; the caller derives this from envelope opts
@@ -63,6 +57,10 @@ pub(crate) fn assemble_response(
     let snapshot_info = build_snapshot_info(snapshot);
     let mut results: JsonMap<String, JsonValue> = JsonMap::new();
     let mut errors: JsonMap<String, JsonValue> = JsonMap::new();
+    // Per-alias tracking telemetry, preserved in submission order via
+    // IndexMap so a client can correlate `tracking[alias]` against
+    // `results[alias]` without re-sorting.
+    let mut tracking: IndexMap<String, TrackingTally> = IndexMap::new();
 
     let mut byte_total: usize = ENVELOPE_OVERHEAD_BYTES;
     let mut success_count: usize = 0;
@@ -88,6 +86,9 @@ pub(crate) fn assemble_response(
                         actual: byte_total,
                         limit: bounds.max_response_size_bytes,
                     });
+                }
+                if let Some(t) = tally {
+                    tracking.insert(alias.clone(), t);
                 }
                 results.insert(alias, entry);
             }
@@ -141,13 +142,14 @@ pub(crate) fn assemble_response(
         snapshot: snapshot_info,
         results,
         errors,
+        tracking,
         meta,
     })
 }
 
-/// Status corresponds to the per-alias success/failure counts. Validation
-/// already rejected empty envelopes, so the `(0, 0)` case is unreachable in
-/// production — we still map it to `AllFailed` defensively.
+/// Status corresponds to the per-alias success/failure counts.
+/// Validation already rejected empty envelopes, so the `(0, 0)` case is
+/// unreachable in production — we still map it to `AllFailed` defensively.
 fn derive_status(success_count: usize, failure_count: usize) -> MultiQueryStatus {
     match (success_count, failure_count) {
         (0, _) => MultiQueryStatus::AllFailed,
@@ -158,10 +160,10 @@ fn derive_status(success_count: usize, failure_count: usize) -> MultiQueryStatus
 
 fn build_snapshot_info(snapshot: &EnvelopeSnapshot) -> SnapshotInfo {
     let mut ledgers = JsonMap::new();
-    // Sort ledgers by name for deterministic response shape (helps caching
-    // and trace diffing across requests).
+    // Sort ledgers by name for deterministic response shape (helps
+    // caching and trace diffing across requests).
     let mut sorted: Vec<(&String, &i64)> = snapshot.ledgers.iter().collect();
-    sorted.sort_by(|a, b| a.0.cmp(b.0));
+    sorted.sort_by_key(|&(k, _)| k);
     for (ledger, t) in sorted {
         ledgers.insert(ledger.clone(), JsonValue::Number((*t).into()));
     }
@@ -201,29 +203,26 @@ fn accumulate_fuel(total: &mut Option<f64>, tally: Option<&TrackingTally>) {
     *total = Some(total.unwrap_or(0.0) + t);
 }
 
-/// Approximate serialized length of a JSON value without owning the bytes.
-///
-/// Uses `serde_json::to_vec` which is allocating but reliable. For v1 this
-/// is acceptable — successful results are typically the dominant
-/// contributor and we'd serialize them anyway when sending the response.
+/// Approximate serialized length of a JSON value without owning the
+/// bytes. Uses `serde_json::to_vec` which is allocating but reliable.
 fn approximate_serialized_len(value: &JsonValue) -> usize {
     serde_json::to_vec(value).map(|v| v.len()).unwrap_or(0)
 }
 
 /// Approximate bytes consumed by the outer envelope skeleton (status,
-/// snapshot block keys, brackets, separators, etc.). Conservative so we err
-/// on the side of cutting off slightly earlier than the strict cap.
+/// snapshot block keys, brackets, separators, etc.). Conservative so we
+/// err on the side of cutting off slightly earlier than the strict cap.
 const ENVELOPE_OVERHEAD_BYTES: usize = 256;
 
 /// Approximate bytes per per-alias entry beyond the entry's own JSON
-/// (quoted alias key, colon, comma). The alias's character length is added
-/// separately at the call site so non-ASCII alias keys are accounted for.
+/// (quoted alias key, colon, comma). The alias's character length is
+/// added separately at the call site so non-ASCII alias keys are
+/// accounted for.
 const PER_ENTRY_OVERHEAD_BYTES: usize = 6;
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use fluree_db_api::query::multi::MultiQueryBounds;
     use std::collections::HashMap;
 
     fn snapshot_with(pairs: &[(&str, i64)]) -> EnvelopeSnapshot {
@@ -350,9 +349,7 @@ mod tests {
                 assert_eq!(limit, 2_500);
                 assert!(actual > 2_500);
                 // The first entry (a) fits under the cap; the second (b)
-                // pushes the running total over. Attribution names the
-                // offending alias, not the first oversized one in absolute
-                // terms.
+                // pushes the running total over.
                 assert_eq!(alias, "b");
             }
         }
@@ -386,5 +383,119 @@ mod tests {
         let resp =
             assemble_response(outcomes, &snap, &MultiQueryBounds::DEFAULT, false, 5).unwrap();
         assert!(resp.meta.is_none());
+    }
+
+    fn success_with_tally(alias: &str, data: JsonValue, tally: TrackingTally) -> AliasOutcome {
+        AliasOutcome {
+            alias: alias.to_string(),
+            kind: AliasOutcomeKind::Success {
+                data,
+                tally: Some(tally),
+            },
+        }
+    }
+
+    #[test]
+    fn per_alias_tracking_populated_when_sub_query_has_tally() {
+        let outcomes = vec![
+            success_with_tally(
+                "alice",
+                serde_json::json!([]),
+                TrackingTally {
+                    time: Some("5ms".into()),
+                    fuel: Some(12.3),
+                    policy: None,
+                },
+            ),
+            success_with_tally(
+                "brian",
+                serde_json::json!([]),
+                TrackingTally {
+                    time: Some("3ms".into()),
+                    fuel: Some(8.1),
+                    policy: None,
+                },
+            ),
+        ];
+        let snap = snapshot_with(&[("ledgerA", 42)]);
+        let resp =
+            assemble_response(outcomes, &snap, &MultiQueryBounds::DEFAULT, true, 87).unwrap();
+        assert_eq!(resp.tracking.len(), 2);
+        let alice = &resp.tracking["alice"];
+        assert_eq!(alice.time.as_deref(), Some("5ms"));
+        assert_eq!(alice.fuel, Some(12.3));
+        let brian = &resp.tracking["brian"];
+        assert_eq!(brian.fuel, Some(8.1));
+        // Envelope-level rollup still works alongside per-alias.
+        let meta = resp.meta.unwrap();
+        assert!(
+            (meta.fuel_total.unwrap() - 20.4).abs() < 1e-9,
+            "fuel_total should sum per-alias fuel"
+        );
+        assert_eq!(meta.elapsed_ms, Some(87));
+    }
+
+    #[test]
+    fn per_alias_tracking_only_includes_aliases_that_tracked() {
+        // 'alice' tracked, 'brian' did not. Tracking map has only alice.
+        let outcomes = vec![
+            success_with_tally(
+                "alice",
+                serde_json::json!([]),
+                TrackingTally {
+                    time: Some("5ms".into()),
+                    fuel: Some(10.0),
+                    policy: None,
+                },
+            ),
+            success("brian", serde_json::json!([])),
+        ];
+        let snap = snapshot_with(&[("ledgerA", 42)]);
+        let resp =
+            assemble_response(outcomes, &snap, &MultiQueryBounds::DEFAULT, false, 5).unwrap();
+        assert_eq!(resp.tracking.len(), 1);
+        assert!(resp.tracking.contains_key("alice"));
+        assert!(!resp.tracking.contains_key("brian"));
+    }
+
+    #[test]
+    fn per_alias_tracking_preserves_submission_order() {
+        let outcomes = vec![
+            success_with_tally(
+                "zulu",
+                serde_json::json!([]),
+                TrackingTally {
+                    time: None,
+                    fuel: Some(1.0),
+                    policy: None,
+                },
+            ),
+            success_with_tally(
+                "alpha",
+                serde_json::json!([]),
+                TrackingTally {
+                    time: None,
+                    fuel: Some(2.0),
+                    policy: None,
+                },
+            ),
+        ];
+        let snap = snapshot_with(&[("ledgerA", 42)]);
+        let resp =
+            assemble_response(outcomes, &snap, &MultiQueryBounds::DEFAULT, false, 5).unwrap();
+        let keys: Vec<&String> = resp.tracking.keys().collect();
+        assert_eq!(keys, vec!["zulu", "alpha"]);
+    }
+
+    #[test]
+    fn per_alias_tracking_empty_when_no_sub_query_tracked() {
+        let outcomes = vec![
+            success("a", serde_json::json!([])),
+            success("b", serde_json::json!([])),
+        ];
+        let snap = snapshot_with(&[("ledgerA", 42)]);
+        let resp =
+            assemble_response(outcomes, &snap, &MultiQueryBounds::DEFAULT, false, 5).unwrap();
+        assert!(resp.tracking.is_empty());
     }
 }

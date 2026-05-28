@@ -221,22 +221,11 @@ CLI reads the envelope JSON (file / stdin / `-e` inline) and POSTs it
 to the connection-scoped `/multi-query` endpoint — each sub-query
 declares its own `from`, so there is no ledger-scoped variant.
 
-Unlike `fluree query`, multi-query has **no in-process / local-only
-execution path**: the dispatcher lives in `fluree-db-server` and only
-the server exposes `/multi-query`. The CLI therefore requires a server
-transport:
+`fluree multi-query` resolves its transport in the same priority as `fluree query`:
 
-- **`--remote <name>`** — explicit; routes through the named remote's
-  configured `base_url`. OIDC token refresh is persisted back to
-  `config.toml` after a successful round-trip (same code path
-  `fluree query --remote` uses via
-  [`context::persist_refreshed_tokens`]).
-- **Auto-route to a locally running `fluree server`** — used when
-  `--remote` is omitted and `server.meta.json` reports a live pid;
-  bypassed by `--direct`. No token persistence on this branch (the
-  local server doesn't require auth).
-- **No transport available** — the CLI surfaces an error pointing at
-  both options above rather than hanging or silently falling back.
+- **`--remote <name>`** — explicit; routes through the named remote's configured `base_url`. OIDC token refresh is persisted back to `config.toml` after a successful round-trip (same code path `fluree query --remote` uses via [`context::persist_refreshed_tokens`]).
+- **Auto-route to a locally running `fluree server`** — used when `--remote` is omitted and `server.meta.json` reports a live pid; bypassed by `--direct`. No token persistence on this branch (the local server doesn't require auth).
+- **In-process local** — when neither of the above applies (no remote, no running server, or `--direct` with no remote), the CLI calls `Fluree::multi_query()` directly against the storage tree configured for this `.fluree/` directory. Same code path the server handler ultimately invokes; the only thing that changes is the boundary at which the request enters the api crate. No HTTP, no auth, no impersonation gate — the caller already has direct authority over the local storage.
 
 **Authentication** uses the same `MaybeCredential` + `MaybeDataBearer`
 extractor stack as `/query` — Bearer tokens (JWT/JWS) and signed
@@ -245,9 +234,7 @@ every distinct ledger referenced in the envelope**: any out-of-scope
 ledger triggers a 404 on the whole envelope (existence-leak avoidance
 matching `/query`'s behavior), *not* a per-alias error.
 
-**Envelope-resident knobs replace single-query CLI flags.** Multi-query
-doesn't take `--at` (use envelope-level `asOf`), `--track-*` /
-`--max-fuel` (use envelope-level `opts.meta` and per-sub-query `opts.max-fuel`), or `--policy*` flags (the same policy headers ride through the transport, but each sub-query carries its own `from` so they apply per-ledger via the standard policy path). See [Multi-query envelope](../api/multi-query.md) for the full envelope contract, response shape, merge rules, bounds, and current limitations (history queries rejected, envelope `max-fuel` rejected, response cap enforced at assembly, SPARQL policy parity gap).
+**Envelope-resident knobs replace some single-query CLI flags.** Multi-query doesn't take `--at` (use envelope-level `asOf`) or `--track-*` / `--max-fuel` (use envelope-level `opts.meta` and per-sub-query `opts.max-fuel`). It **does** accept the full `--policy*` flag bundle (`--as`, `--policy-class`, `--policy`, `--policy-file`, `--policy-values`, `--policy-values-file`, `--default-allow`) — the same surface `fluree query` exposes. The headers ride through the transport identically; each sub-query carries its own `from`, so policy applies per-ledger via the standard server-side policy path. See [Multi-query envelope](../api/multi-query.md) for the full envelope contract, response shape, merge rules, bounds, and current limitations (history queries rejected, envelope `max-fuel` rejected, response cap enforced at assembly, SPARQL policy parity gap).
 
 ### `fluree branch list` (read-only)
 

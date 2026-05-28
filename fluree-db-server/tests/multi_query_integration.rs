@@ -548,3 +548,121 @@ async fn multi_query_meta_block_included_when_opts_meta_true() {
         "meta.elapsed_ms should be present: {body}"
     );
 }
+
+#[tokio::test]
+async fn multi_query_per_alias_tracking_surfaces_under_opts_meta() {
+    // When envelope opts.meta is true, every sub-query runs with
+    // tracking and the response carries a top-level `tracking` map
+    // mirroring `results` — one entry per alias with the same shape
+    // single-query `/query` returns for tracked requests.
+    let (_tmp, state) = test_state().await;
+    let app = build_router(state);
+    create_ledger(&app, "mq:track").await;
+    insert_one(&app, "mq:track", "ex:alice", "Alice").await;
+    insert_one(&app, "mq:track", "ex:brian", "Brian").await;
+
+    let envelope = json!({
+        "opts": { "meta": true },
+        "queries": {
+            "by_alice": {
+                "language": "jsonld",
+                "query": {
+                    "@context": { "ex": "http://example.org/" },
+                    "from": "mq:track",
+                    "select": ["?name"],
+                    "where": { "@id": "?s", "ex:name": "?name" }
+                }
+            },
+            "by_brian": {
+                "language": "jsonld",
+                "query": {
+                    "@context": { "ex": "http://example.org/" },
+                    "from": "mq:track",
+                    "select": ["?id"],
+                    "where": { "@id": "?id", "ex:name": "?name" }
+                }
+            }
+        }
+    });
+    let (status, body) = post_envelope(&app, &envelope).await;
+    assert_eq!(status, StatusCode::OK, "got body: {body}");
+
+    let tracking = &body["tracking"];
+    assert!(
+        tracking.is_object(),
+        "tracking map should be present when opts.meta is true, got: {body}"
+    );
+    // Both aliases tracked; each entry mirrors the single-query
+    // TrackedQueryResponse fields (time / fuel / policy are siblings).
+    for alias in ["by_alice", "by_brian"] {
+        let entry = &tracking[alias];
+        assert!(
+            entry.is_object(),
+            "tracking[{alias}] should be an object, got: {entry}"
+        );
+        // At least one of the trackable metrics must be present.
+        let has_metric = entry.get("time").is_some()
+            || entry.get("fuel").is_some()
+            || entry.get("policy").is_some();
+        assert!(
+            has_metric,
+            "tracking[{alias}] should report time / fuel / policy, got: {entry}"
+        );
+    }
+
+    // Aggregate fuel_total in meta is the sum across aliases.
+    assert!(
+        body["meta"]["fuel_total"].is_f64() || body["meta"]["fuel_total"].is_i64(),
+        "meta.fuel_total should be present: {body}"
+    );
+}
+
+#[tokio::test]
+async fn multi_query_per_alias_tracking_only_for_tracked_aliases() {
+    // Per-sub-query opts.meta on one alias only — the response's
+    // tracking map should hold that alias, but not the un-tracked one.
+    let (_tmp, state) = test_state().await;
+    let app = build_router(state);
+    create_ledger(&app, "mq:psel").await;
+    insert_one(&app, "mq:psel", "ex:p", "P").await;
+
+    let envelope = json!({
+        "queries": {
+            "tracked": {
+                "language": "jsonld",
+                "query": {
+                    "@context": { "ex": "http://example.org/" },
+                    "from": "mq:psel",
+                    "select": ["?name"],
+                    "where": { "@id": "?s", "ex:name": "?name" }
+                },
+                "opts": { "meta": true }
+            },
+            "untracked": {
+                "language": "jsonld",
+                "query": {
+                    "@context": { "ex": "http://example.org/" },
+                    "from": "mq:psel",
+                    "select": ["?name"],
+                    "where": { "@id": "?s", "ex:name": "?name" }
+                }
+            }
+        }
+    });
+    let (status, body) = post_envelope(&app, &envelope).await;
+    assert_eq!(status, StatusCode::OK, "got body: {body}");
+
+    let tracking = &body["tracking"];
+    assert!(
+        tracking.is_object(),
+        "tracking map should be present when one sub-query opted in: {body}"
+    );
+    assert!(
+        tracking.get("tracked").is_some(),
+        "tracked alias should appear in tracking map: {body}"
+    );
+    assert!(
+        tracking.get("untracked").is_none(),
+        "untracked alias should NOT appear in tracking map: {body}"
+    );
+}

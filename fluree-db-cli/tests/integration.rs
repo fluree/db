@@ -337,32 +337,38 @@ fn multi_query_invalid_json_rejected() {
 }
 
 #[test]
-fn multi_query_without_transport_surfaces_help() {
+fn multi_query_local_no_ledger_errors_at_envelope_execution() {
+    // No --remote, no running local server, no `create` of the
+    // referenced ledger. The CLI should fall back to in-process local
+    // execution against the empty storage tree; envelope reaches the
+    // dispatcher which fails to resolve the missing ledger and surfaces
+    // a clear error (not a "no transport" complaint).
     let tmp = TempDir::new().unwrap();
     fluree_cmd(&tmp).arg("init").assert().success();
-    // Valid envelope JSON, no --remote, no running local server. The
-    // CLI should explain both transport options rather than hanging or
-    // producing a cryptic error.
-    let envelope = r#"{"queries":{"a":{"language":"jsonld","query":{"from":"x","select":["?s"],"where":{"@id":"?s"}}}}}"#;
+    let envelope = r#"{"queries":{"a":{"language":"jsonld","query":{"from":"definitely-no-such-ledger","select":["?s"],"where":{"@id":"?s"}}}}}"#;
     fluree_cmd(&tmp)
         .args(["multi-query", "-e", envelope])
         .assert()
         .failure()
-        .stderr(predicate::str::contains("--remote").or(predicate::str::contains("server start")));
+        .stderr(predicate::str::contains("definitely-no-such-ledger"));
 }
 
 #[test]
-fn multi_query_direct_flag_rejects_no_remote() {
+fn multi_query_direct_flag_runs_in_process() {
+    // --direct now means "skip auto-route, execute in-process locally"
+    // — the same semantic as fluree query --direct. Without --remote
+    // the command runs against local storage; the envelope still needs
+    // to reference a ledger that exists, so this test confirms the
+    // transport path is local-in-process by checking that the error
+    // mentions the missing ledger (not a transport / remote error).
     let tmp = TempDir::new().unwrap();
     fluree_cmd(&tmp).arg("init").assert().success();
-    // --direct disables auto-routing entirely; without --remote the
-    // command must error rather than hang.
-    let envelope = r#"{"queries":{"a":{"language":"jsonld","query":{"from":"x","select":["?s"],"where":{"@id":"?s"}}}}}"#;
+    let envelope = r#"{"queries":{"a":{"language":"jsonld","query":{"from":"missing-ledger","select":["?s"],"where":{"@id":"?s"}}}}}"#;
     fluree_cmd(&tmp)
         .args(["--direct", "multi-query", "-e", envelope])
         .assert()
         .failure()
-        .stderr(predicate::str::contains("no in-process execution path"));
+        .stderr(predicate::str::contains("missing-ledger"));
 }
 
 #[test]
@@ -389,6 +395,48 @@ fn multi_query_missing_positional_file_errors_clearly() {
         .assert()
         .failure()
         .stderr(predicate::str::contains("definitely-not-a-real-file.json"));
+}
+
+#[test]
+fn multi_query_local_in_process_against_seeded_ledger_succeeds() {
+    // End-to-end check that the relocated dispatcher works locally
+    // without any HTTP server. Create a ledger via the CLI, insert
+    // a fact, then run a multi-query envelope against it and confirm
+    // the inserted value appears in the response.
+    let tmp = TempDir::new().unwrap();
+    fluree_cmd(&tmp).arg("init").assert().success();
+    fluree_cmd(&tmp)
+        .args(["create", "lc:main"])
+        .assert()
+        .success();
+    fluree_cmd(&tmp)
+        .args([
+            "insert",
+            "lc:main",
+            r#"{"@context":{"ex":"http://example.org/"},"@id":"ex:alice","ex:name":"Alice"}"#,
+        ])
+        .assert()
+        .success();
+
+    let envelope = r#"{
+        "queries": {
+            "find": {
+                "language": "jsonld",
+                "query": {
+                    "@context": { "ex": "http://example.org/" },
+                    "from":     "lc:main",
+                    "select":   ["?name"],
+                    "where":    { "@id": "?s", "ex:name": "?name" }
+                }
+            }
+        }
+    }"#;
+    fluree_cmd(&tmp)
+        .args(["multi-query", "--format", "pretty", "-e", envelope])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("\"status\": \"ok\""))
+        .stdout(predicate::str::contains("Alice"));
 }
 
 #[test]

@@ -10,8 +10,6 @@ mod export;
 mod iceberg;
 mod ledger;
 mod log;
-mod multi_dispatch;
-mod multi_response;
 mod nameservice_refs;
 mod pack;
 mod policy_auth;

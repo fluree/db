@@ -108,9 +108,19 @@ produce invalid SPARQL.
 
 ### `opts` merge
 
-- Sub-query keys win on conflict.
-- Per-sub-query overrides recognised: `meta`, `policy`, `identity`, `timeoutMs`, `max-fuel`.
-- `opts.t` is **rejected inside a multi-query envelope** at any level. Pin time via `from` (sub-query level) or `asOf` (envelope level).
+Opts come from three layers, merged shallowly with **the most specific layer winning** on key conflict:
+
+| Layer | Where it lives | Precedence |
+|-------|----------------|------------|
+| 1. Envelope opts | top-level `opts` on the envelope | lowest — applies as defaults to every sub-query |
+| 2. Sub-query opts | `opts` on each entry of the `queries` map (the wrapper around `language` + `query`) | middle — wins over envelope |
+| 3. Query body opts | `opts` *inside* the JSON-LD query body (`sub.query["opts"]`) | **highest — wins over both** |
+
+This precedence is security-relevant. The HTTP server's bearer/identity gate runs against the **pre-merged** opts and writes its decision into the body layer (layer 3), where the dispatcher's merge then makes it the final word. Inverting the order would let an envelope-level or sub-query-level `opts.identity` clobber the gate's decision.
+
+- Per-sub-query overrides recognised at any layer: `meta`, `policy`, `policy-class`, `policy-values`, `identity`, `default-allow`, `timeoutMs`, `max-fuel`.
+- `opts.t` is **rejected at every layer** inside a multi-query envelope (envelope opts, sub-query opts, AND body opts). Pin time via `from` (per sub-query) or envelope `asOf`.
+- Envelope-level `opts.max-fuel` is rejected up-front (see [Limitations](#limitations)); per-sub-query `opts.max-fuel` (in either layer 2 or layer 3) is honoured.
 
 ---
 
@@ -168,16 +178,15 @@ envelope entry).
     "alice": [ { "name": "Alice" } ],
     "bob":   { "head": { "vars": ["name"] }, "results": { "bindings": [...] } }
   },
-  "meta":   { "fuel_total": 1234.5, "elapsed_ms": 87 }
+  "tracking": {
+    "alice": { "time": "5ms", "fuel": 1024.0 },
+    "bob":   { "time": "3ms", "fuel": 210.5 }
+  },
+  "meta": { "fuel_total": 1234.5, "elapsed_ms": 87 }
 }
 ```
 
-> **Field omission:** `errors` is omitted from the response when no
-> sub-query failed (zero entries → field skipped, not emitted as
-> `{}`). `meta` is omitted when `opts.meta` isn't set. `snapshot.asOf`
-> is omitted when the envelope used an integer `asOf` (no shared
-> wall-clock interpretation). Examples below show only the fields
-> that would appear in each scenario.
+> **Field omission:** `errors` is omitted from the response when no sub-query failed (zero entries → field skipped, not emitted as `{}`). `tracking` is omitted when no sub-query ran with tracking enabled. `meta` is omitted when `opts.meta` isn't set at the envelope level. `snapshot.asOf` is omitted when the envelope used an integer `asOf` (no shared wall-clock interpretation). Examples below show only the fields that would appear in each scenario.
 
 ### Fields
 
@@ -188,7 +197,21 @@ envelope entry).
 | `snapshot.ledgers` | object (ledger → integer) | Per-ledger numeric `t` every sub-query observed. **Each value is independent** — see the atomicity caveat above. |
 | `results` | object (alias → query result) | Successful sub-queries, keyed by alias. JSON-LD aliases get the JSON-LD query result shape; SPARQL aliases get SPARQL Results JSON. Aliases that errored are absent here. |
 | `errors` | object (alias → error entry) | Failed or timed-out sub-queries. Each entry has `code`, `message`, and (for timeouts) `effective_timeout_ms`. Omitted when empty. |
-| `meta` | object \| absent | Aggregate fuel / wall-clock elapsed. Included when `opts.meta` is enabled at the envelope level. |
+| `tracking` | object (alias → tally) | Per-alias telemetry (`time`, `fuel`, `policy`) for each sub-query that ran with tracking enabled. Mirrors single-query `/query`'s tracked-response shape, one entry per alias. Indexed by alias and ordered to match `results`. Omitted when no sub-query tracked. |
+| `meta.fuel_total` | number \| absent | Envelope-level rollup of per-alias fuel. Sum across every sub-query that tracked. Included when envelope `opts.meta` is enabled. |
+| `meta.elapsed_ms` | number \| absent | Envelope wall-clock duration (entry → response assembly). Included when envelope `opts.meta` is enabled. Note: this is the envelope wall-clock, not a sum across parallel sub-queries — sub-queries run concurrently, so summing per-alias `time` would over-count. |
+
+#### Tracking detail
+
+Each entry in `tracking` mirrors the single-query [`TrackedQueryResponse`](endpoints.md#post-query) shape with three optional siblings:
+
+- `time` — formatted execution time string (e.g., `"5ms"`).
+- `fuel` — decimal fuel consumed.
+- `policy` — per-policy `{ executed, allowed }` stats when policy tracking is requested.
+
+Which siblings populate depends on what the sub-query's merged opts requested (`opts.meta: true` enables all three; selective `opts.meta: { time: true, fuel: true }` enables a subset; `opts.max-fuel: N` implicitly enables fuel tracking).
+
+A sub-query whose opts didn't enable tracking will not appear in the `tracking` map at all — making it easy for tracking-unaware clients to ignore the field entirely.
 
 ### HTTP status mapping
 

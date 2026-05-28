@@ -30,6 +30,7 @@
 //! is **shared time resolution, not distributed atomicity** — multi-ledger
 //! envelopes do not have a single global commit clock.
 
+use indexmap::IndexMap;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map as JsonMap, Value as JsonValue};
 use std::collections::BTreeSet;
@@ -182,7 +183,16 @@ pub struct MultiQueryResponse {
     /// Per-alias error entries for sub-queries that failed or timed out.
     #[serde(skip_serializing_if = "JsonMap::is_empty", default)]
     pub errors: JsonMap<String, JsonValue>,
-    /// Optional fuel/timing aggregates when `opts.meta` is enabled.
+    /// Per-alias tracking telemetry (time / fuel / policy), populated for
+    /// each sub-query whose merged opts enabled tracking. Mirrors the
+    /// single-query [`crate::TrackedQueryResponse`]'s `time` / `fuel` /
+    /// `policy` siblings, indexed by alias. Empty (and skipped in the
+    /// JSON wire format) when no sub-query had tracking enabled.
+    #[serde(skip_serializing_if = "IndexMap::is_empty", default)]
+    pub tracking: IndexMap<String, crate::TrackingTally>,
+    /// Envelope-level aggregate metadata (fuel rollup + envelope wall
+    /// elapsed). Populated when envelope-level `opts.meta` is enabled.
+    /// Per-alias telemetry lives in [`Self::tracking`].
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub meta: Option<MultiQueryMeta>,
 }
@@ -356,6 +366,17 @@ fn validate_envelope_opts(
     opts: &JsonMap<String, JsonValue>,
     bounds: &MultiQueryBounds,
 ) -> Result<(), MultiQueryValidationError> {
+    // opts.t at envelope level is rejected for the same reason it's
+    // rejected on sub-queries: the canonical place to pin time inside a
+    // multi-query envelope is `from` (per sub-query) or `asOf`
+    // (envelope-wide). Allowing opts.t here would create a second,
+    // ambiguous envelope-level pin in addition to `asOf`.
+    if opts.contains_key("t") {
+        return Err(MultiQueryValidationError::OptsTNotAllowed {
+            alias: "<envelope>".to_string(),
+        });
+    }
+
     if let Some(mc) = opts.get("maxConcurrency").and_then(JsonValue::as_u64) {
         if mc == 0 {
             return Err(MultiQueryValidationError::MaxConcurrencyZero);
@@ -408,6 +429,20 @@ fn validate_jsonld_subquery(
         return Err(MultiQueryValidationError::HistoryQueryInEnvelope {
             alias: alias.to_string(),
         });
+    }
+
+    // `opts.t` inside the query body is rejected at every level (same rule
+    // applied to envelope.opts and sub.opts elsewhere in `validate_envelope`).
+    // The opts merge now gives body opts highest precedence, so a body-level
+    // `opts.t` would be the authoritative pin if we allowed it through —
+    // exactly the silent-override path the canonical "pin via `from` or
+    // `asOf`" rule exists to prevent.
+    if let Some(body_opts) = body.get("opts").and_then(JsonValue::as_object) {
+        if body_opts.contains_key("t") {
+            return Err(MultiQueryValidationError::OptsTNotAllowed {
+                alias: alias.to_string(),
+            });
+        }
     }
 
     // Inner `t` field is a temporal pin.
@@ -1150,6 +1185,19 @@ mod tests {
     }
 
     #[test]
+    fn rejects_opts_t_at_envelope_level() {
+        let mut req = envelope_with(&[("a", jsonld("ledgerA"))], None);
+        req.opts = Some(json!({ "t": 42 }));
+        let err = validate_envelope(&req, &MultiQueryBounds::DEFAULT).unwrap_err();
+        match err {
+            MultiQueryValidationError::OptsTNotAllowed { ref alias } => {
+                assert_eq!(alias, "<envelope>");
+            }
+            other => panic!("expected OptsTNotAllowed at envelope, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn rejects_opts_t_in_subquery() {
         let mut sq = jsonld("ledgerA");
         sq.opts = Some(json!({ "t": 42 }));
@@ -1159,6 +1207,34 @@ mod tests {
             err,
             MultiQueryValidationError::OptsTNotAllowed { .. }
         ));
+    }
+
+    #[test]
+    fn rejects_opts_t_in_jsonld_body_opts() {
+        // Regression: opts.t must be rejected everywhere it can appear.
+        // Body opts now win the dispatcher's merge with highest
+        // precedence, so a body-level opts.t would be the authoritative
+        // pin if it slipped past validation — exactly the silent
+        // override the "pin via from / asOf only" rule exists to
+        // prevent. Mirrors the existing envelope/sub.opts checks.
+        let sq = MultiQuerySubquery {
+            language: SubqueryLanguage::JsonLd,
+            query: json!({
+                "from":   "ledgerA",
+                "select": ["?s"],
+                "where":  { "@id": "?s" },
+                "opts":   { "t": 42 }
+            }),
+            opts: None,
+        };
+        let req = envelope_with(&[("a", sq)], None);
+        let err = validate_envelope(&req, &MultiQueryBounds::DEFAULT).unwrap_err();
+        match err {
+            MultiQueryValidationError::OptsTNotAllowed { ref alias } => {
+                assert_eq!(alias, "a");
+            }
+            other => panic!("expected OptsTNotAllowed for body opts.t, got {other:?}"),
+        }
     }
 
     #[test]
