@@ -14,7 +14,10 @@ use fluree_db_core::{
     address_path::{ledger_id_to_path_prefix, shared_prefix_for_path},
     format_ledger_id, DEFAULT_BRANCH,
 };
-use fluree_db_indexer::{clean_garbage, rebuild_index_from_commits, CleanGarbageConfig};
+use fluree_db_core::tracking::{Tracker, TrackingOptions};
+use fluree_db_indexer::{
+    clean_garbage, rebuild_index_from_commits_with_tracker, CleanGarbageConfig,
+};
 use fluree_db_nameservice::NsRecord;
 use std::time::Duration;
 use tracing::{debug, info, warn};
@@ -215,6 +218,9 @@ pub struct ReindexResult {
     pub root_id: fluree_db_core::ContentId,
     /// Build statistics
     pub stats: fluree_db_indexer::IndexStats,
+    /// Total fuel charged for this reindex (decimal). `None` only if fuel
+    /// tracking was disabled at the caller; `/reindex` always populates it.
+    pub fuel: Option<f64>,
 }
 
 /// Result of index_status query
@@ -1670,8 +1676,17 @@ impl crate::Fluree {
             }
         }
 
-        let index_result = rebuild_index_from_commits(
+        // Reindex is a user-triggered API call; create a fuel-enabled,
+        // no-limit tracker per request so the response can report total fuel.
+        // Indexing never enforces a fuel limit (measurement only) — a partial
+        // index is worse than a slow one.
+        let reindex_tracker = Tracker::new(TrackingOptions {
+            track_fuel: true,
+            ..Default::default()
+        });
+        let index_result = rebuild_index_from_commits_with_tracker(
             self.content_store(&ledger_id),
+            reindex_tracker,
             &ledger_id,
             &record,
             indexer_config,
@@ -1748,6 +1763,7 @@ impl crate::Fluree {
             index_t: index_result.index_t,
             root_id: index_result.root_id,
             stats: index_result.stats,
+            fuel: index_result.fuel,
         })
     }
 }

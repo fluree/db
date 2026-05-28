@@ -524,11 +524,13 @@ pub async fn incremental_index(
 
     if novelty.records.is_empty() {
         tracing::debug!("no new records resolved; returning existing V6 root");
+        // fuel is filled in by the outer entry point from the tracker tally.
         return Ok(IndexResult {
             root_id: base_root_id,
             index_t: novelty.max_t,
             ledger_id: ledger_id.to_string(),
             stats: IndexStats::default(),
+            fuel: None,
         });
     }
 
@@ -2808,6 +2810,8 @@ pub async fn incremental_index(
                 branch_count: by_graph.len(),
                 total_bytes: root_bytes.len(),
             },
+            // Outer entry point fills fuel from the tracker tally.
+            fuel: None,
         })
     } else {
         let mut final_root = new_root;
@@ -2858,6 +2862,7 @@ pub async fn incremental_index(
                 branch_count: by_graph.len(),
                 total_bytes: root_bytes.len(),
             },
+            fuel: None,
         })
     }
 }

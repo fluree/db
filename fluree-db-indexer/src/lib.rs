@@ -86,6 +86,11 @@ pub struct IndexResult {
     pub ledger_id: String,
     /// Index build statistics
     pub stats: IndexStats,
+    /// Total fuel charged for this build. `Some(_)` when fuel tracking was
+    /// enabled at the entry point (see [`build_index_for_record_with_tracker`]),
+    /// `None` when the build went through the plain non-tracking API. An
+    /// already-current build reports `Some(0.0)` if tracking was enabled.
+    pub fuel: Option<f64>,
 }
 
 /// Statistics from index building
@@ -176,7 +181,9 @@ pub async fn build_index_for_record_with_tracker(
             "loaded ledger state for index build"
         );
 
-        // If index is already current, return it
+        // If index is already current, return it. Report fuel as Some(0.0)
+        // when tracking is enabled (no CAS work was done) so callers can
+        // distinguish "no work" from "not tracked".
         if let Some(ref root_id) = record.index_head_id {
             if record.index_t >= record.commit_t {
                 tracing::info!(
@@ -185,11 +192,13 @@ pub async fn build_index_for_record_with_tracker(
                     commit_t = record.commit_t,
                     "index already current; returning existing root"
                 );
+                let fuel = tracker.tracks_fuel().then_some(0.0);
                 return Ok(IndexResult {
                     root_id: root_id.clone(),
                     index_t: record.index_t,
                     ledger_id: ledger_id.to_string(),
                     stats: IndexStats::default(),
+                    fuel,
                 });
             }
         }
@@ -217,7 +226,8 @@ pub async fn build_index_for_record_with_tracker(
             )
             .await
             {
-                Ok(result) => {
+                Ok(mut result) => {
+                    result.fuel = tally_fuel(&tracker);
                     return Ok(result);
                 }
                 Err(e) => {
@@ -243,17 +253,26 @@ pub async fn build_index_for_record_with_tracker(
             commit_gap,
             "starting full rebuild path"
         );
-        build::rebuild::rebuild_index_from_commits(
+        let mut result = build::rebuild::rebuild_index_from_commits(
             content_store,
-            tracker,
+            tracker.clone(),
             ledger_id,
             record,
             config,
         )
-        .await
+        .await?;
+        result.fuel = tally_fuel(&tracker);
+        Ok(result)
     }
     .instrument(span)
     .await
+}
+
+/// Snapshot the tracker's current decimal fuel total, or `None` when fuel
+/// tracking was not enabled at this tracker (so callers can distinguish
+/// "no work" from "not tracked").
+fn tally_fuel(tracker: &fluree_db_core::tracking::Tracker) -> Option<f64> {
+    tracker.tally().and_then(|t| t.fuel)
 }
 
 /// External indexer entry point
@@ -320,6 +339,32 @@ pub async fn rebuild_index_from_commits(
         config,
     )
     .await
+}
+
+/// Same as [`rebuild_index_from_commits`], but wraps `content_store` in a
+/// [`crate::fuel::MeteredContentStore`] so the rebuild's CAS writes are
+/// billed against `tracker`, and stamps the resulting [`IndexResult::fuel`]
+/// with the tracker's final tally.
+pub async fn rebuild_index_from_commits_with_tracker(
+    content_store: std::sync::Arc<dyn ContentStore>,
+    tracker: fluree_db_core::tracking::Tracker,
+    ledger_id: &str,
+    record: &fluree_db_nameservice::NsRecord,
+    config: IndexerConfig,
+) -> Result<IndexResult> {
+    let metered: std::sync::Arc<dyn ContentStore> = std::sync::Arc::new(
+        crate::fuel::MeteredContentStore::new(content_store, tracker.clone()),
+    );
+    let mut result = build::rebuild::rebuild_index_from_commits(
+        metered,
+        tracker.clone(),
+        ledger_id,
+        record,
+        config,
+    )
+    .await?;
+    result.fuel = tally_fuel(&tracker);
+    Ok(result)
 }
 
 /// Like [`rebuild_index_from_commits`], but accepts a caller-provided
