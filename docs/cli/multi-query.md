@@ -25,6 +25,18 @@ fluree multi-query [FILE] [OPTIONS]
 | `-f, --file <FILE>` | Read envelope from a file |
 | `--format <FORMAT>` | Output format: `json` (compact, default), `pretty` (indented), or `aliases` (per-alias sections) |
 | `--remote <NAME>` | Execute against a named remote server |
+| `--as <IDENTITY>` | Bearer identity to assume (subject to the impersonation gate — see [Policy Contract](server-integration.md#policy-enforcement-contract)) |
+| `--policy-class <IRI>` | Policy class IRI(s); repeatable |
+| `--policy <JSON>` | Inline policy JSON (`fluree-policy`) |
+| `--policy-file <FILE>` | Read inline policy JSON from a file |
+| `--policy-values <JSON>` | Variable bindings for parameterized policies |
+| `--policy-values-file <FILE>` | Read policy-values JSON from a file |
+| `--default-allow` | Permit access when no matching policy rules exist |
+
+All policy flags ride on the underlying HTTP request as
+`fluree-policy-*` headers; the server folds them into the envelope's
+top-level `opts` before validation, so they reach every sub-query
+through the normal opts merge.
 
 ## Description
 

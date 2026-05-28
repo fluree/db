@@ -548,6 +548,9 @@ pub enum Commands {
         /// Execute against a remote server (by remote name, e.g., "origin").
         #[arg(long)]
         remote: Option<String>,
+
+        #[command(flatten)]
+        policy: PolicyArgs,
     },
 
     /// Show change history for an entity

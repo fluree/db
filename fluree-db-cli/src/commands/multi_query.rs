@@ -11,6 +11,7 @@
 //! If neither is available, surface a clear error pointing the user at
 //! both options.
 
+use crate::cli::PolicyArgs;
 use crate::context::{self, try_server_route_client};
 use crate::error::{CliError, CliResult};
 use crate::input;
@@ -20,6 +21,7 @@ use serde_json::Value as JsonValue;
 use std::path::Path;
 
 /// Run the `multi-query` subcommand.
+#[allow(clippy::too_many_arguments)]
 pub async fn run(
     args: &[String],
     expr: Option<&str>,
@@ -28,6 +30,7 @@ pub async fn run(
     dirs: &FlureeDir,
     remote_flag: Option<&str>,
     direct: bool,
+    policy: &PolicyArgs,
 ) -> CliResult<()> {
     // Positional arg, if present, is interpreted as a file path — same
     // shape as `fluree query <FILE>` with no inline / no -f.
@@ -81,6 +84,14 @@ pub async fn run(
             }
         }
     };
+
+    // Attach CLI policy flags as request headers (fluree-policy-class,
+    // fluree-policy, fluree-policy-values, fluree-default-allow,
+    // fluree-identity). The server folds these into the envelope's
+    // top-level opts before validation via inject_headers_into_envelope,
+    // so they reach every sub-query through the normal opts merge —
+    // same behavior single-query enjoys via inject_headers_into_query.
+    let client = client.with_policy(policy.clone());
 
     let response = client
         .multi_query(&envelope)

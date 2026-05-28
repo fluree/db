@@ -279,6 +279,7 @@ pub async fn run(cli: Cli) -> error::CliResult<()> {
             file,
             format,
             remote,
+            policy,
         } => {
             let fluree_dir = config::require_fluree_dir_or_global(config_path)?;
             commands::multi_query::run(
@@ -289,6 +290,7 @@ pub async fn run(cli: Cli) -> error::CliResult<()> {
                 &fluree_dir,
                 remote.as_deref(),
                 direct,
+                &policy,
             )
             .await
         }
