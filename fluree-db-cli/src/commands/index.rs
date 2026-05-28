@@ -123,6 +123,9 @@ pub async fn run_reindex(
                 "Reindexed {} to t={} (root: {})",
                 alias, result.index_t, result.root_id
             );
+            if let Some(fuel) = result.fuel {
+                println!("Fuel: {fuel:.3}");
+            }
         }
     }
 

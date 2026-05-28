@@ -64,7 +64,7 @@ Cost ladder (per event):
 | R2RML row emitted (Iceberg/Parquet) | 0.001 |
 | Transaction commit baseline (once per commit, including each bulk-import chunk) | 10.000 |
 | Staged flake (per flake in a transaction or bulk-import chunk) | 0.001 |
-| Indexer CAS write (per successful `put` / `put_with_id` / `content_write_bytes` made by an index build) | 1.000 |
+| Indexer CAS write (per successful `ContentStore::put` / `put_with_id` made by an index build) | 1.000 |
 | Re-encoded leaflet inside an FLI3 leaf write (passthrough leaflets are not charged) | 1.000 |
 | `REGEX` / `REPLACE` evaluation | 0.001 |
 | Hash function (`MD5`, `SHA1`, `SHA256`, `SHA384`, `SHA512`) | 0.001 |
@@ -79,7 +79,7 @@ The **query floor** guarantees every fuel-tracked query reports at least `1.000`
 
 ### Indexing Fuel
 
-Indexer CAS writes are billed through a `MeteredContentStore` wrapper that the build entry points install around the caller-supplied content store. Every successful `put` / `put_with_id` / `content_write_bytes` charges the base **1.000 fuel** rate — including index leaves, branch manifests, root manifests, dict packs / reverse-tree nodes, history sidecars, garbage records, stats sketches, and (incremental) spatial / fulltext arenas.
+Indexer CAS writes are billed through a `MeteredContentStore` wrapper that the build entry points install around the caller-supplied content store. Every successful `ContentStore::put` / `put_with_id` charges the base **1.000 fuel** rate — including index leaves, branch manifests, root manifests, dict packs / reverse-tree nodes, history sidecars, garbage records, stats sketches, and (incremental) spatial / fulltext arenas. The lower-level `Storage::content_write_bytes` is **not** currently wrapped; the only indexer code path that uses it is the dead-code spatial rebuild helper. If that path is wired up, add a storage-level wrapper first (or migrate it to `ContentStore::put`).
 
 FLI3 leaf writes carry an additional per-leaflet charge of **1.000 fuel per re-encoded leaflet**. Passthrough leaflets (byte-copies carried forward from a prior leaf during an incremental update) are **not** charged because no zstd encoding work was performed — so a 100-leaflet leaf where only two leaflets were touched by novelty bills `1 + 2 = 3` fuel, not `1 + 100`. The two FLI3 leaf upload sites (`build::upload::upload_indexes_to_cas` for full rebuild, `build::incremental::upload_leaf_blobs` for incremental) compute the count from `LeafInfo::re_encoded_leaflet_count`.
 

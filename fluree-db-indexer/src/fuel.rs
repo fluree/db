@@ -3,7 +3,9 @@
 //! Centralises the rule for billing indexer work to a fuel `Tracker`:
 //!
 //! - 1 [`INDEX_CAS_WRITE_MICRO_FUEL`] per successful indexer CAS write
-//!   (`put`, `put_with_id`, or `content_write_bytes`).
+//!   (`ContentStore::put` or `put_with_id`). The lower-level
+//!   `Storage::content_write_bytes` path is not wrapped — it has no active
+//!   indexer call site today.
 //! - **Additionally**, for FLI3 leaf writes, 1 [`INDEX_CAS_WRITE_MICRO_FUEL`]
 //!   per *re-encoded* leaflet in the leaf. Passthrough leaflets (byte-copied
 //!   from a prior leaf in an incremental update) are not charged because no
