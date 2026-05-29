@@ -2016,3 +2016,225 @@ async fn dataset_staged_transaction_with_novel_namespace() {
         normalize_rows(&json!([["Alice", "Acme Corp"]]))
     );
 }
+
+// =============================================================================
+// Connection-path baseline: JSON-LD GRAPH alias with bound subject from outer
+// =============================================================================
+//
+// Default-graph WHERE patterns bind `?book` via `movie.isBasedOn`; a subsequent
+// `["graph", "<alias>", { @id: "?book", ... }]` clause is expected to resolve
+// `?book` inside the aliased named graph (a different ledger). Submitted via
+// `query_from()` — the same engine entrypoint the HTTP `/v1/fluree/query`
+// route uses for dataset queries. See fluree/db#1259.
+#[tokio::test]
+async fn dataset_fromnamed_alias_bound_subject_via_connection() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let _movies = seed_movies_ledger(&fluree, "movies:main").await;
+    let _books = seed_books_ledger(&fluree, "books:main").await;
+
+    let query = json!({
+        "from": "movies:main",
+        "fromNamed": { "books_g": { "@id": "books:main" } },
+        "@context": ctx_schema_value(),
+        "select": ["?movieName", "?book", "?bookName", "?isbn"],
+        "where": [
+            {"id": "?movie", "type": "Movie", "name": "?movieName", "isBasedOn": "?book"},
+            ["graph", "books_g", {"id": "?book", "name": "?bookName", "isbn": "?isbn"}]
+        ]
+    });
+
+    let result = fluree
+        .query_from()
+        .jsonld(&query)
+        .execute_formatted()
+        .await
+        .expect("dataset connection query should succeed");
+
+    assert_eq!(
+        normalize_rows(&result),
+        normalize_rows(&json!([
+            [
+                "The Hitchhiker's Guide to the Galaxy",
+                "https://www.wikidata.org/wiki/Q3107329",
+                "The Hitchhiker's Guide to the Galaxy",
+                "0-330-25864-8"
+            ],
+            [
+                "Gone with the Wind",
+                "https://www.wikidata.org/wiki/Q2870",
+                "Gone with the Wind",
+                "0-582-41805-4"
+            ]
+        ]))
+    );
+}
+
+// =============================================================================
+// fluree/db#1259 Issue 1: `from: [array]` union through the connection path.
+// =============================================================================
+//
+// Engine accepts an array-form `from` for default-graph union. The HTTP
+// dispatcher rejects it because `get_ledger_id` only accepts a string `from`;
+// this test isolates the engine entrypoint to prove the gap is at the route
+// layer, not deeper. The HTTP-layer regression lives in
+// `fluree-db-server/tests/multi_ledger_query_integration.rs`.
+#[tokio::test]
+async fn dataset_from_array_union_via_connection() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let _people = seed_people_ledger(&fluree, "people:main").await;
+    let _people2 = seed_people2_ledger(&fluree, "people2:main").await;
+
+    let query = json!({
+        "from": ["people:main", "people2:main"],
+        "@context": {"ex": "http://example.org/ns/", "schema": "http://schema.org/"},
+        "select": ["?name"],
+        "where": {"@id": "?p", "@type": "ex:Person", "schema:name": "?name"}
+    });
+
+    let result = fluree
+        .query_from()
+        .jsonld(&query)
+        .execute_formatted()
+        .await
+        .expect("array `from` union should succeed through the engine");
+
+    assert_eq!(
+        normalize_rows(&result),
+        normalize_rows(&json!([["Alice"], ["Bob"], ["Charlie"], ["Diana"]]))
+    );
+}
+
+// =============================================================================
+// fluree/db#1259 Issue 3: `fromNamed`-only (no `from`) through the connection path.
+// =============================================================================
+//
+// With only `fromNamed` and no default graph, `FromQueryBuilder::execute_formatted`
+// errors at the format step with "No default graph for formatting" — the formatter
+// has no fallback to a named graph's view (unlike `DatasetQueryBuilder`, which
+// uses `dataset.primary()` and does fall back). Un-ignore after the fix lands.
+#[ignore = "TODO(fluree/db#1259) un-ignore in Commit 4: FromQueryBuilder primary-view fallback"]
+#[tokio::test]
+async fn dataset_fromnamed_only_no_default_via_connection() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let _people = seed_people_ledger(&fluree, "people:main").await;
+    let _people2 = seed_people2_ledger(&fluree, "people2:main").await;
+
+    let query = json!({
+        "fromNamed": {
+            "g1": {"@id": "people:main"},
+            "g2": {"@id": "people2:main"}
+        },
+        "@context": {"ex": "http://example.org/ns/", "schema": "http://schema.org/"},
+        "select": ["?g", "?name"],
+        "where": [["graph", "?g", {"@id": "?p", "@type": "ex:Person", "schema:name": "?name"}]]
+    });
+
+    let result = fluree
+        .query_from()
+        .jsonld(&query)
+        .execute_formatted()
+        .await
+        .expect("fromNamed-only should succeed through the engine");
+
+    // Each named graph iterated under ?g must contribute a (?g, ?name) row.
+    let rows = normalize_rows(&result);
+    assert_eq!(
+        rows.len(),
+        4,
+        "expected 4 rows (Alice, Bob, Charlie, Diana); got {rows:?}"
+    );
+}
+
+// =============================================================================
+// fluree/db#1259 Issue 2: nested-projection across graph boundary mis-decodes IRIs.
+// =============================================================================
+//
+// `from: catalog` (default), `fromNamed: { lists_g: lists }`. WHERE binds
+// `?list` inside the lists ledger via the GRAPH alias. The nested SELECT
+// projects `?list.contains` — refs whose properties live in the *default*
+// catalog ledger.
+//
+// The two ledgers register *different* sets of namespaces. The formatter
+// uses a single snapshot's namespace dict for SID -> IRI decoding, so SIDs
+// coming out of the named ledger decode to the wrong IRI prefix or to
+// `UnknownNamespace`. Un-ignore after the fix lands.
+#[ignore = "TODO(fluree/db#1259) un-ignore in Commit 6: per-ledger hydration formatter via IriMatch.ledger_alias"]
+#[tokio::test]
+async fn dataset_nested_projection_cross_graph_iri_resolution_via_connection() {
+    let fluree = FlureeBuilder::memory().build_memory();
+
+    let catalog0 = genesis_ledger(&fluree, "catalog:main");
+    let _catalog = fluree
+        .insert(
+            catalog0,
+            &json!({
+                "@context": {"@vocab": "http://example.org/catalog/"},
+                "@graph": [
+                    {"@id": "http://example.org/items/q1", "@type": "Item",
+                     "name": "Item One", "isbn": "0001"}
+                ]
+            }),
+        )
+        .await
+        .unwrap()
+        .ledger;
+
+    let lists0 = genesis_ledger(&fluree, "lists:main");
+    let _lists = fluree
+        .insert(
+            lists0,
+            &json!({
+                "@context": {"@vocab": "http://example.org/lists/"},
+                "@graph": [
+                    {"@id": "http://example.org/lists/summer", "@type": "List",
+                     "name": "Summer",
+                     "contains": [
+                         {"@id": "http://example.org/items/q1"}
+                     ]}
+                ]
+            }),
+        )
+        .await
+        .unwrap()
+        .ledger;
+
+    let query = json!({
+        "from": "catalog:main",
+        "fromNamed": { "lists_g": { "@id": "lists:main" } },
+        "@context": {
+            "@vocab": "http://example.org/lists/",
+            "catalog": "http://example.org/catalog/"
+        },
+        "select": {"?list": [
+            "@id",
+            "name",
+            {"contains": ["@id", "catalog:name", "catalog:isbn"]}
+        ]},
+        "where": [["graph", "lists_g", {"@id": "?list", "@type": "List"}]]
+    });
+
+    let result = fluree
+        .query_from()
+        .jsonld(&query)
+        .execute_formatted()
+        .await
+        .expect("nested cross-graph projection should succeed");
+
+    // The bound `?list` IRI must come back as the *lists* ledger's
+    // `http://example.org/lists/summer`. When the bug fires, the formatter
+    // decodes that SID against the *catalog* snapshot's namespace dict and
+    // emits a mangled IRI (e.g. `http://example.org/items/summer`).
+    let s = result.to_string();
+    assert!(
+        s.contains("http://example.org/lists/summer"),
+        "expected @id `http://example.org/lists/summer`; got: {s}"
+    );
+
+    // The nested `contains` projection must hydrate the catalog item's name
+    // and isbn. When the bug fires the cross-graph nested projection silently
+    // drops these.
+    assert!(
+        s.contains("Item One") && s.contains("0001"),
+        "expected nested catalog properties (name=Item One, isbn=0001); got: {s}"
+    );
+}
