@@ -218,7 +218,6 @@ async fn query_with_from_object_through_dispatcher_returns_200() {
 /// `FromQueryBuilder::execute_formatted` errors `"No default graph for
 /// formatting"` (Commit 4 unblocks). This test only goes green when both
 /// land — un-ignored in Commit 4.
-#[ignore = "TODO(fluree/db#1259) un-ignore in Commit 4: requires dispatcher (Commit 3) + formatter primary fallback (Commit 4)"]
 #[tokio::test]
 async fn query_with_fromnamed_only_no_from_through_dispatcher_returns_200() {
     let (_tmp, state) = seed_two_people_ledgers().await;

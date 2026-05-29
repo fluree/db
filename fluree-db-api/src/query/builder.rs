@@ -21,8 +21,8 @@ use crate::format::FormatterConfig;
 use crate::query::helpers::parse_dataset_spec;
 use crate::view::{DataSetDb, GraphDb, QueryInput};
 use crate::{
-    ApiError, Fluree, PolicyContext, QueryResult, Result, TrackedErrorResponse,
-    TrackedQueryResponse, TrackingOptions,
+    ApiError, DatasetSpec, Fluree, GraphSource, PolicyContext, QueryResult, Result,
+    TrackedErrorResponse, TrackedQueryResponse, TrackingOptions,
 };
 
 use fluree_db_query::r2rml::{R2rmlProvider, R2rmlTableProvider};
@@ -687,6 +687,25 @@ pub struct FromQueryBuilder<'a> {
     policy: Option<Arc<PolicyContext>>,
 }
 
+/// Pick a representative `GraphSource` from a parsed dataset spec to use as
+/// the snapshot the formatter compacts SIDs against.
+///
+/// Mirrors `DataSetDb::primary()`: prefer the first default graph; fall back
+/// to the first named graph when only `fromNamed` was supplied. Returns
+/// `None` only when the spec is fully empty — a case the connection path
+/// surfaces upstream as `"Missing ledger specification in connection query"`.
+///
+/// Today the formatter still uses a single view's namespace dict for all SID
+/// decoding, which causes cross-ledger projections to mis-decode IRIs
+/// (fluree/db#1259 Issue 2). The follow-up refactor threads per-ledger
+/// snapshots through the formatter; this helper only addresses the narrower
+/// "no default graph" failure.
+fn pick_format_view_alias(spec: &DatasetSpec) -> Option<&GraphSource> {
+    spec.default_graphs
+        .first()
+        .or_else(|| spec.named_graphs.first())
+}
+
 impl<'a> FromQueryBuilder<'a> {
     /// Create a new builder (called by `Fluree::query_from()`).
     pub(crate) fn new(fluree: &'a Fluree) -> Self {
@@ -895,7 +914,7 @@ impl<'a> FromQueryBuilder<'a> {
                     },
                 };
                 let (spec, _) = parse_dataset_spec(json)?;
-                if let Some(alias) = spec.default_graphs.first() {
+                if let Some(alias) = pick_format_view_alias(&spec) {
                     let view = self.fluree.db(alias.identifier.as_str()).await?;
                     Ok(result
                         .format_async(view.as_graph_db_ref(), &format_config)
@@ -938,7 +957,7 @@ impl<'a> FromQueryBuilder<'a> {
                 };
                 let ast = crate::query::helpers::parse_and_validate_sparql(sparql)?;
                 let spec = crate::query::helpers::extract_sparql_dataset_spec(&ast)?;
-                if let Some(alias) = spec.default_graphs.first() {
+                if let Some(alias) = pick_format_view_alias(&spec) {
                     let view = self.fluree.db(alias.identifier.as_str()).await?;
                     Ok(result
                         .format_async(view.as_graph_db_ref(), &format_config)
@@ -1002,7 +1021,7 @@ impl<'a> FromQueryBuilder<'a> {
                     },
                 };
                 let (spec, _) = parse_dataset_spec(json)?;
-                if let Some(alias) = spec.default_graphs.first() {
+                if let Some(alias) = pick_format_view_alias(&spec) {
                     let view = self.fluree.db(alias.identifier.as_str()).await?;
                     crate::format::format_results_string_async(
                         &result,
@@ -1051,7 +1070,7 @@ impl<'a> FromQueryBuilder<'a> {
                 };
                 let ast = crate::query::helpers::parse_and_validate_sparql(sparql)?;
                 let spec = crate::query::helpers::extract_sparql_dataset_spec(&ast)?;
-                if let Some(alias) = spec.default_graphs.first() {
+                if let Some(alias) = pick_format_view_alias(&spec) {
                     let view = self.fluree.db(alias.identifier.as_str()).await?;
                     crate::format::format_results_string_async(
                         &result,
