@@ -46,6 +46,7 @@ use super::iri::IriCompactor;
 use super::{FormatError, Result};
 use crate::QueryResult;
 use fluree_db_core::comparator::IndexType;
+use fluree_db_core::query_bounds::RangeOptions;
 use fluree_db_core::range::{RangeMatch, RangeTest};
 use fluree_db_core::value::FlakeValue;
 use fluree_db_core::{Flake, GraphDbRef, Sid, Tracker};
@@ -58,6 +59,7 @@ use futures::future::BoxFuture;
 use futures::FutureExt;
 use serde_json::{json, Value as JsonValue};
 use std::collections::{BTreeMap, HashMap, HashSet};
+use std::sync::Arc;
 
 /// Cache key: (Sid, local_spec_hash, depth_remaining)
 ///
@@ -117,6 +119,38 @@ struct PredicateContext<'a> {
     flakes: &'a [&'a Flake],
     /// Explicit nested selection spec for this predicate (if any).
     explicit_sub_spec: Option<&'a NestedSelectSpec>,
+}
+
+/// Build the forward-predicate allow-list for one hydration level.
+///
+/// Returned to the range provider via [`RangeOptions::predicate_filter`] so
+/// the SPOT-per-subject scan can skip dict touches on unselected predicates.
+///
+/// - `Wildcard`: returns `None` — the projection wants every predicate, so
+///   no filter is applied and the legacy decode-everything path runs.
+/// - `Explicit` with no `ForwardItem::Property` entries (e.g., `@id`-only or
+///   reverse-only): still returns `Some(empty)`. The range provider will
+///   short-circuit every base row, which is correct — no forward predicate
+///   was selected.
+///
+/// `ForwardItem::Id` is skipped because `@id` is derived from the subject
+/// Sid in the caller, not from a flake. Reverse predicates are not included
+/// either — they go through `fetch_reverse_properties`, which already does
+/// a single-predicate POST scan and isn't affected by this filter.
+fn predicate_filter_for_level(level: &NestedSelectSpec) -> Option<Arc<[Sid]>> {
+    match level {
+        NestedSelectSpec::Wildcard { .. } => None,
+        NestedSelectSpec::Explicit { forward, .. } => {
+            let preds: Vec<Sid> = forward
+                .iter()
+                .filter_map(|item| match item {
+                    ForwardItem::Property { predicate, .. } => Some(predicate.clone()),
+                    ForwardItem::Id => None,
+                })
+                .collect();
+            Some(Arc::from(preds))
+        }
+    }
 }
 
 /// Hash a `NestedSelectSpec` to a u64 cache key. We can't derive `Hash`
@@ -449,8 +483,13 @@ impl<'a> HydrationFormatter<'a> {
                 obj.insert("@id".to_string(), json!(self.compactor.compact_sid(sid)?));
             }
 
-            // Fetch forward properties
-            let flakes = self.fetch_subject_properties(sid).await?;
+            // Fetch forward properties. For Explicit projections we hand the
+            // range provider a predicate allow-list so it can skip object
+            // decode / dict touches / subject re-resolve on discarded rows;
+            // Wildcard projections want every predicate, so the filter stays
+            // None and the legacy SPOT-everything path runs unchanged.
+            let predicate_filter = predicate_filter_for_level(level);
+            let flakes = self.fetch_subject_properties(sid, predicate_filter).await?;
 
             // Group flakes by predicate
             let mut by_pred: HashMap<Sid, Vec<&Flake>> = HashMap::new();
@@ -1015,17 +1054,36 @@ impl<'a> HydrationFormatter<'a> {
         }
     }
 
-    /// Fetch all properties for a subject using SPOT index
+    /// Fetch a subject's forward flakes via the SPOT index, optionally
+    /// narrowed to a projection-predicate allow-list.
     ///
-    /// When policy is set, filters flakes according to view policies.
-    /// When policy is None, returns all flakes (zero overhead).
-    async fn fetch_subject_properties(&self, sid: &Sid) -> Result<Vec<Flake>> {
+    /// `predicate_filter` mirrors [`RangeOptions::predicate_filter`]: when
+    /// `Some`, the range provider drops non-listed predicates **before**
+    /// resolving the subject Sid, decoding the object, or charging
+    /// dict-touch fuel. When `None`, behavior matches the legacy
+    /// SPOT-everything path (used for `*`-wildcard projections where every
+    /// predicate is wanted).
+    ///
+    /// When policy is set, the returned flakes are post-filtered by view
+    /// policy. Per-flake / per-leaflet / per-dict-touch fuel charges happen
+    /// inside `db.range_with_opts` via the `GraphDbRef` tracker.
+    async fn fetch_subject_properties(
+        &self,
+        sid: &Sid,
+        predicate_filter: Option<Arc<[Sid]>>,
+    ) -> Result<Vec<Flake>> {
+        let opts = RangeOptions::default();
+        let opts = match predicate_filter {
+            Some(allow) => opts.with_predicate_filter(allow),
+            None => opts,
+        };
         let flakes = self
             .db
-            .range(
+            .range_with_opts(
                 IndexType::Spot,
                 RangeTest::Eq,
                 RangeMatch::subject(sid.clone()),
+                opts,
             )
             .await
             .map_err(|e| {
@@ -1033,8 +1091,6 @@ impl<'a> HydrationFormatter<'a> {
             })?;
 
         // Policy filtering: only when policy is Some and not root.
-        // Per-flake / per-leaflet / per-dict-touch fuel charges happen inside
-        // db.range via the GraphDbRef tracker — no extra charge needed here.
         if let Some(policy_ctx) = self.policy {
             if !policy_ctx.wrapper().is_root() {
                 return Ok(self.filter_flakes_by_policy(flakes, policy_ctx));
