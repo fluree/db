@@ -30,7 +30,7 @@ use fluree_db_core::{
 use crate::binding::{Batch, Binding};
 use crate::context::ExecutionContext;
 use crate::error::{QueryError, Result};
-use crate::fast_path_common::contiguous_id_range;
+use crate::fast_path_common::{contiguous_id_range, subject_ref_to_s_id};
 use crate::ir::triple::{Ref, Term, TriplePattern};
 use crate::ir::{Expression, Function};
 use crate::object_binding::{late_materialized_object_binding, materialized_object_binding};
@@ -1662,39 +1662,78 @@ impl Operator for BinaryScanOperator {
                 None
             };
 
-            let encoded = match (dt_sid.or(inferred_dt_sid.as_ref()), lang) {
-                (Some(dt_sid), lang) => {
-                    value_to_otype_okey(bound_o, dt_sid, lang, store_ref, dict_novelty)
+            // An untyped string that stats couldn't pin to a single datatype:
+            // the predicate has langString and/or multiple string-compatible
+            // datatypes, so we can't build one tight (o_type, o_key) seek.
+            let untyped_string = dt_sid.is_none()
+                && lang.is_none()
+                && inferred_dt_sid.is_none()
+                && matches!(bound_o, FlakeValue::String(_));
+
+            if let FlakeValue::Ref(sid) = bound_o {
+                // Refs carry no datatype/lang, so they bypass the literal-value
+                // machinery and resolve snapshot-aware (decode_sid → store IRI
+                // lookup) via `subject_ref_to_s_id` — mirroring the subject path
+                // (`build_filter_from_snapshot_sids`) and the count path. A raw
+                // `Term::Sid` whose namespace code the store can't decode is thus
+                // not mistaken for absent. `Ok(None)` is a conclusive base miss.
+                match subject_ref_to_s_id(ctx.active_snapshot, store_ref, &Ref::Sid(sid.clone())) {
+                    Ok(Some(s_id)) => {
+                        filter.o_type = Some(OType::IRI_REF.as_u16());
+                        filter.o_key = Some(s_id);
+                    }
+                    Ok(None) => return self.open_overlay_only_fallback(ctx, &s_sid, &p_sid).await,
+                    // Genuine error — keep correctness by leaving the filter un-narrowed.
+                    Err(_) => {}
                 }
-                (None, None) => {
-                    // Without a datatype constraint, we can only safely encode non-string
-                    // values. String values are ambiguous — could be xsd:string or
-                    // rdf:langString — so skip them to avoid type mismatch.
-                    match bound_o {
-                        FlakeValue::String(_) => Err(std::io::Error::other(
-                            "string without dtc: type ambiguous (could be langString)",
-                        )),
-                        _ => value_to_otype_okey_simple(bound_o, store_ref)
-                            .map_err(|e| std::io::Error::other(e.to_string())),
+            } else if untyped_string {
+                // All string datatypes/langs share one interned string id, so set it
+                // as the `o_key` filter (o_type left wild). POST orders
+                // (p_id, o_type, o_key), so o_key without o_type is NOT a tight key
+                // range — the cursor still scans the predicate's broad leaf range and
+                // loads candidate leaflets, but `filter_batch` drops rows whose o_key
+                // differs *before* value decode. Leaflets emptied by that filter
+                // return no batch, so they incur neither the per-leaflet fuel charge
+                // nor a dict decode — cutting the dominant cost while the value
+                // post-filter preserves lenient matching across string datatypes/langs
+                // (overlay rows are filtered the same way, so novelty langStrings
+                // aren't dropped). Mirrors the untyped-numeric o_key prefilter. An
+                // absent string can't be in the base dict at all → overlay-only.
+                if let FlakeValue::String(s) = bound_o {
+                    match store_ref.find_string_id(s) {
+                        Ok(Some(str_id)) => filter.o_key = Some(str_id as u64),
+                        Ok(None) => {
+                            return self.open_overlay_only_fallback(ctx, &s_sid, &p_sid).await
+                        }
+                        Err(_) => {}
                     }
                 }
-                (None, Some(_lang)) => Err(std::io::Error::new(
-                    std::io::ErrorKind::InvalidData,
-                    "lang tag requires datatype constraint",
-                )),
-            };
+            } else {
+                let encoded = match (dt_sid.or(inferred_dt_sid.as_ref()), lang) {
+                    (Some(dt_sid), lang) => {
+                        value_to_otype_okey(bound_o, dt_sid, lang, store_ref, dict_novelty)
+                    }
+                    // Refs and untyped strings are handled above; this is reached
+                    // for untyped non-string values (numeric/bool/date/…).
+                    (None, None) => value_to_otype_okey_simple(bound_o, store_ref),
+                    (None, Some(_lang)) => Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "lang tag requires datatype constraint",
+                    )),
+                };
 
-            match encoded {
-                Ok((ot, key)) => {
-                    filter.o_type = Some(ot.as_u16());
-                    filter.o_key = Some(key);
-                }
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                    // Novelty may contain the value, but base index can't; avoid wide base scan.
-                    return self.open_overlay_only_fallback(ctx, &s_sid, &p_sid).await;
-                }
-                Err(_) => {
-                    // If encoding fails, keep correctness by leaving the filter un-narrowed.
+                match encoded {
+                    Ok((ot, key)) => {
+                        filter.o_type = Some(ot.as_u16());
+                        filter.o_key = Some(key);
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                        // Value absent from base dict; overlay-only still checks novelty.
+                        return self.open_overlay_only_fallback(ctx, &s_sid, &p_sid).await;
+                    }
+                    Err(_) => {
+                        // If encoding fails, keep correctness by leaving the filter un-narrowed.
+                    }
                 }
             }
         }
@@ -2511,11 +2550,41 @@ fn infer_exact_datatype_sid_from_stats(
     value: &FlakeValue,
 ) -> Option<Sid> {
     let stats = stats_view?.get_graph_property(g_id, p_id)?;
-    let mut tags = stats
+    let present: Vec<fluree_db_core::ValueTypeTag> = stats
         .datatypes
         .iter()
         .filter_map(|(tag, count)| (*count > 0).then_some(*tag))
-        .collect::<Vec<_>>();
+        .collect();
+
+    // Untyped string values can only match string-compatible datatypes, so
+    // non-string tags on the predicate (int/date/ref/…) are irrelevant. Narrow
+    // when exactly one string-compatible tag is present and it is non-lang
+    // (langString needs a language id → multi-slice path). UNKNOWN is unsafe —
+    // it may stand in for a string-valued datatype, so its presence declines
+    // narrowing. These stats are novelty-aware (the datatype set reflects base +
+    // novelty), so "only one string-compatible tag" is a conclusive statement
+    // about the whole logical DB, not just the base index.
+    if matches!(value, FlakeValue::String(_)) {
+        if present.contains(&fluree_db_core::ValueTypeTag::UNKNOWN) {
+            return None;
+        }
+        let mut strs: Vec<fluree_db_core::ValueTypeTag> = present
+            .iter()
+            .copied()
+            .filter(|t| t.is_string_compatible())
+            .collect();
+        strs.sort();
+        strs.dedup();
+        return match strs.as_slice() {
+            [only] if *only != fluree_db_core::ValueTypeTag::LANG_STRING => {
+                datatype_sid_for_untyped_value(value, *only)
+            }
+            _ => None,
+        };
+    }
+
+    // Non-string values: exact single-datatype inference.
+    let mut tags = present;
     tags.sort();
     tags.dedup();
     if tags.len() != 1 {
@@ -2582,6 +2651,33 @@ fn datatype_sid_for_untyped_value(
             fluree_db_core::ValueTypeTag::INT => Some(Sid::new(namespaces::XSD, xsd_names::INT)),
             _ => None,
         },
+        // Untyped string → the single string-compatible datatype the caller's
+        // stats gate selected. langString is intentionally absent: it needs a
+        // language id, so it routes through the (future) multi-slice path.
+        FlakeValue::String(_) => match tag {
+            fluree_db_core::ValueTypeTag::STRING => {
+                Some(Sid::new(namespaces::XSD, xsd_names::STRING))
+            }
+            fluree_db_core::ValueTypeTag::ANY_URI => {
+                Some(Sid::new(namespaces::XSD, xsd_names::ANY_URI))
+            }
+            fluree_db_core::ValueTypeTag::NORMALIZED_STRING => {
+                Some(Sid::new(namespaces::XSD, xsd_names::NORMALIZED_STRING))
+            }
+            fluree_db_core::ValueTypeTag::TOKEN => {
+                Some(Sid::new(namespaces::XSD, xsd_names::TOKEN))
+            }
+            fluree_db_core::ValueTypeTag::LANGUAGE => {
+                Some(Sid::new(namespaces::XSD, xsd_names::LANGUAGE))
+            }
+            fluree_db_core::ValueTypeTag::BASE64_BINARY => {
+                Some(Sid::new(namespaces::XSD, xsd_names::BASE64_BINARY))
+            }
+            fluree_db_core::ValueTypeTag::HEX_BINARY => {
+                Some(Sid::new(namespaces::XSD, xsd_names::HEX_BINARY))
+            }
+            _ => None,
+        },
         _ => None,
     }
 }
@@ -2612,50 +2708,68 @@ fn otype_from_dt_sid(dt_sid: &Sid, store: &BinaryIndexStore) -> Option<OType> {
 pub(crate) fn value_to_otype_okey_simple(
     val: &FlakeValue,
     store: &BinaryIndexStore,
-) -> Result<(OType, u64)> {
+) -> std::io::Result<(OType, u64)> {
     use fluree_db_core::value_id::ObjKey;
+    use std::io::{Error, ErrorKind};
 
     match val {
         FlakeValue::Null => Ok((OType::NULL, 0)),
         FlakeValue::Boolean(b) => Ok((OType::XSD_BOOLEAN, *b as u64)),
         FlakeValue::Long(n) => Ok((OType::XSD_INTEGER, ObjKey::encode_i64(*n).as_u64())),
         FlakeValue::Double(d) => {
+            // Encoding failures are NOT NotFound: the value could still exist in
+            // the base index under a representation we can't compute, so callers
+            // must leave the scan un-narrowed (correctness-preserving) rather
+            // than treating it as provably absent.
             if d.is_finite() {
                 ObjKey::encode_f64(*d)
                     .map(|key| (OType::XSD_DOUBLE, key.as_u64()))
                     .map_err(|_| {
-                        QueryError::execution("cannot encode f64 for V6 index".to_string())
+                        Error::new(ErrorKind::InvalidData, "cannot encode f64 for V6 index")
                     })
             } else {
-                Err(QueryError::execution(
-                    "non-finite double in bound object".to_string(),
+                Err(Error::new(
+                    ErrorKind::InvalidData,
+                    "non-finite double in bound object",
                 ))
             }
         }
         FlakeValue::Ref(sid) => {
-            let s_id = store
-                .find_subject_id_by_parts(sid.namespace_code, &sid.name)
-                .map_err(|e| QueryError::execution(format!("find_subject_id_by_parts: {e}")))?
-                .ok_or_else(|| {
-                    QueryError::execution("ref object not found in V6 dict".to_string())
-                })?;
+            // Resolve via `sid_to_store_s_id`: a fast by-parts lookup, then a
+            // fallback that rebuilds the IRI *from the store's own namespace
+            // table* (`store.sid_to_iri`) and re-finds it. This recovers the
+            // common by-parts miss where the SID is EMPTY/OVERFLOW-coded and
+            // carries the full IRI in `name` (e.g. an rdfs:Class object after
+            // bulk import), so a *present* ref isn't mistaken for absent.
+            //
+            // It is NOT a general "decode via the query snapshot" fallback —
+            // this helper only has the store, so for non-EMPTY codes it relies
+            // on canonical encoding keeping snapshot/store namespace codes in
+            // agreement. Only a miss through both steps is treated as absent,
+            // letting the caller short-circuit to the overlay-only path
+            // (NotFound) instead of scanning the whole predicate.
+            let s_id = crate::sid_iri::sid_to_store_s_id(store, sid)?.ok_or_else(|| {
+                Error::new(ErrorKind::NotFound, "ref object not found in V6 dict")
+            })?;
             Ok((OType::IRI_REF, s_id))
         }
         FlakeValue::String(s) => {
+            // String interning has no namespace dimension, so a miss here is a
+            // reliable "absent from base dict" signal (NotFound).
             let str_id = store
                 .find_string_id(s)
-                .map_err(|e| QueryError::execution(format!("find_string_id: {e}")))?
+                .map_err(|e| Error::other(format!("find_string_id: {e}")))?
                 .ok_or_else(|| {
-                    QueryError::execution("string value not found in V6 dict".to_string())
+                    Error::new(ErrorKind::NotFound, "string value not found in V6 dict")
                 })?;
             Ok((OType::XSD_STRING, str_id as u64))
         }
         FlakeValue::Json(s) => {
             let str_id = store
                 .find_string_id(s)
-                .map_err(|e| QueryError::execution(format!("find_string_id: {e}")))?
+                .map_err(|e| Error::other(format!("find_string_id: {e}")))?
                 .ok_or_else(|| {
-                    QueryError::execution("JSON value not found in V6 dict".to_string())
+                    Error::new(ErrorKind::NotFound, "JSON value not found in V6 dict")
                 })?;
             Ok((OType::RDF_JSON, str_id as u64))
         }
@@ -2685,9 +2799,10 @@ pub(crate) fn value_to_otype_okey_simple(
             OType::XSD_G_MONTH_DAY,
             ObjKey::encode_g_month_day(g.month(), g.day()).as_u64(),
         )),
-        _ => Err(QueryError::execution(format!(
-            "unsupported FlakeValue variant for V6 fast-path: {val:?}"
-        ))),
+        _ => Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            format!("unsupported FlakeValue variant for V6 fast-path: {val:?}"),
+        )),
     }
 }
 
