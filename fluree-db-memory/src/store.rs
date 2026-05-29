@@ -764,44 +764,6 @@ WHERE {{\n\
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use fluree_db_api::FlureeBuilder;
-
-    #[tokio::test]
-    async fn is_initialized_finds_memory_ledger_by_normalized_id() {
-        let fluree = FlureeBuilder::memory().build_memory();
-        fluree
-            .create_ledger(MEMORY_LEDGER)
-            .await
-            .expect("create memory ledger");
-        let store = MemoryStore::new(fluree, None);
-
-        assert!(
-            store.is_initialized().await.expect("check initialized"),
-            "ledger_exists should accept the normalized __memory:main ledger id"
-        );
-    }
-
-    #[tokio::test]
-    async fn drop_and_reinit_drops_by_whole_ledger_name() {
-        let fluree = FlureeBuilder::memory().build_memory();
-        let store = MemoryStore::new(fluree, None);
-        store.initialize().await.expect("initialize memory store");
-
-        store
-            .drop_and_reinit()
-            .await
-            .expect("drop and reinitialize memory ledger");
-
-        assert!(
-            store.is_initialized().await.expect("check initialized"),
-            "memory ledger should exist after drop_and_reinit"
-        );
-    }
-}
-
 // ---------------------------------------------------------------------------
 // SPARQL result parsing helpers
 // ---------------------------------------------------------------------------
@@ -1094,5 +1056,43 @@ fn iri_to_kind(iri: &str) -> Option<MemoryKind> {
         // Backwards compat: map removed kinds to Fact
         "Preference" | "Artifact" => Some(MemoryKind::Fact),
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use fluree_db_api::FlureeBuilder;
+
+    #[tokio::test]
+    async fn is_initialized_finds_memory_ledger_by_normalized_id() {
+        let fluree = FlureeBuilder::memory().build_memory();
+        fluree
+            .create_ledger(MEMORY_LEDGER)
+            .await
+            .expect("create memory ledger");
+        let store = MemoryStore::new(fluree, None);
+
+        assert!(
+            store.is_initialized().await.expect("check initialized"),
+            "ledger_exists should accept the normalized __memory:main ledger id"
+        );
+    }
+
+    #[tokio::test]
+    async fn drop_and_reinit_drops_by_whole_ledger_name() {
+        let fluree = FlureeBuilder::memory().build_memory();
+        let store = MemoryStore::new(fluree, None);
+        store.initialize().await.expect("initialize memory store");
+
+        store
+            .drop_and_reinit()
+            .await
+            .expect("drop and reinitialize memory ledger");
+
+        assert!(
+            store.is_initialized().await.expect("check initialized"),
+            "memory ledger should exist after drop_and_reinit"
+        );
     }
 }
