@@ -149,13 +149,20 @@ fn has_policy_opts(query_json: &JsonValue) -> bool {
         || opts.get("policy").is_some()
 }
 
-/// Helper to extract ledger ID from request (for JSON-LD queries)
+/// Helper to extract ledger ID from request (for JSON-LD queries).
+///
+/// Priority: path > header > body. Within body, a string `from` wins (the
+/// common single-ledger case). Dataset-shaped bodies (array `from`, object
+/// `from`, or `fromNamed`-only) fall through to a representative-identifier
+/// pick — the value is used only for span tracing, bearer-token scope
+/// checking, and policy-class / default-context injection. The downstream
+/// dataset path re-parses the body via `DatasetSpec::from_query_json` and
+/// does not consume this returned ID.
 fn get_ledger_id(
     path_ledger: Option<&str>,
     headers: &FlureeHeaders,
     body: &JsonValue,
 ) -> Result<String> {
-    // Priority: path > header > body.from
     if let Some(ledger) = path_ledger {
         return Ok(ledger.to_string());
     }
@@ -164,11 +171,84 @@ fn get_ledger_id(
         return Ok(ledger.clone());
     }
 
-    if let Some(from) = body.get("from").and_then(|v| v.as_str()) {
-        return Ok(from.to_string());
+    if let Some(id) = extract_representative_ledger_id(body) {
+        return Ok(id);
     }
 
     Err(ServerError::MissingLedger)
+}
+
+/// Pick a representative ledger identifier from a JSON-LD query body for
+/// tracing / scope / policy-class purposes when the route has no path or
+/// header ledger.
+///
+/// Precedence:
+/// 1. String `from` (the common single-ledger case).
+/// 2. Array `from` — first entry, as either a string or `{"@id": ...}`.
+/// 3. Object `from` — its `@id`.
+/// 4. `fromNamed` object — first entry's `@id` (insertion order is preserved
+///    by `serde_json::Map`).
+///
+/// Returns `None` when the body has no resolvable ledger reference; the
+/// caller surfaces `MissingLedger` in that case.
+fn extract_representative_ledger_id(body: &JsonValue) -> Option<String> {
+    if let Some(from) = body.get("from") {
+        if let Some(s) = from.as_str() {
+            return Some(s.to_string());
+        }
+        if let Some(arr) = from.as_array() {
+            if let Some(first) = arr.first() {
+                if let Some(s) = first.as_str() {
+                    return Some(s.to_string());
+                }
+                if let Some(id) = first.get("@id").and_then(|v| v.as_str()) {
+                    return Some(id.to_string());
+                }
+            }
+        }
+        if let Some(id) = from.get("@id").and_then(|v| v.as_str()) {
+            return Some(id.to_string());
+        }
+    }
+    if let Some(obj) = body.get("fromNamed").and_then(|v| v.as_object()) {
+        for entry in obj.values() {
+            if let Some(id) = entry.get("@id").and_then(|v| v.as_str()) {
+                return Some(id.to_string());
+            }
+        }
+    }
+    None
+}
+
+/// Extract every ledger identifier a dataset-shaped JSON-LD query body
+/// references, for bearer-token scope enforcement. Returns `None` when the
+/// body is not dataset-shaped (no extra check needed beyond the
+/// representative identifier already validated upstream).
+///
+/// Returns `Some(vec![])` if the body is dataset-shaped but the spec can't
+/// be parsed; in that case the caller has already validated the
+/// representative identifier, and the downstream engine will surface a
+/// proper parse error.
+///
+/// Mirrors the SPARQL path's per-FROM scope enforcement (see the
+/// `sparql_dataset_ledger_ids` loop earlier in this module).
+fn extract_dataset_ledger_ids(body: &JsonValue) -> Option<Vec<String>> {
+    let is_dataset =
+        body.get("from").is_some_and(|v| !v.is_string()) || body.get("fromNamed").is_some();
+    if !is_dataset {
+        return None;
+    }
+    let ids = fluree_db_api::DatasetSpec::from_query_json(body)
+        .ok()
+        .map(|(spec, _)| {
+            spec.default_graphs
+                .iter()
+                .chain(spec.named_graphs.iter())
+                .map(|s| s.identifier.clone())
+                .collect()
+        })
+        .unwrap_or_default();
+    Some(ids)
 }
 
 /// Inject header values into query JSON (modifies the query in place)
@@ -492,17 +572,37 @@ pub async fn query(
         // Inject header values into query opts
         inject_headers_into_query(&mut query_json, &headers);
 
-        // Enforce bearer ledger scope for unsigned requests
+        // Enforce bearer ledger scope for unsigned requests.
+        //
+        // For dataset-shaped bodies (array `from`, object `from`,
+        // `fromNamed`), iterate every referenced identifier so an unscoped
+        // ledger cannot slip through behind the representative one. This
+        // mirrors the SPARQL path's per-FROM check upstream in this handler.
         if let Some(p) = bearer.0.as_ref() {
-            if !credential.is_signed() && !p.can_read(&ledger_id) {
-                set_span_error_code(&span, "error:Forbidden");
-                // Avoid existence leak
-                return Err(ServerError::not_found("Ledger not found"));
+            if !credential.is_signed() {
+                if !p.can_read(&ledger_id) {
+                    set_span_error_code(&span, "error:Forbidden");
+                    // Avoid existence leak
+                    return Err(ServerError::not_found("Ledger not found"));
+                }
+                if let Some(extra) = extract_dataset_ledger_ids(&query_json) {
+                    for id in &extra {
+                        if id != &ledger_id && !p.can_read(id) {
+                            set_span_error_code(&span, "error:Forbidden");
+                            return Err(ServerError::not_found("Ledger not found"));
+                        }
+                    }
+                }
             }
         }
 
         // Apply bearer identity + server-default policy-class to opts, honoring
         // the root-identity impersonation semantic (see routes::policy_auth).
+        //
+        // TODO(fluree/db#1259-followup): for dataset-shaped bodies this still
+        // keys identity / policy-class injection on the representative ledger
+        // only. Per-ledger identity / policy semantics for multi-ledger
+        // connection queries are a separate concern.
         let identity = effective_identity(&credential, &bearer);
         let policy_class = data_auth.default_policy_class.as_deref();
         crate::routes::policy_auth::apply_auth_identity_to_opts(
@@ -514,6 +614,10 @@ pub async fn query(
         )
         .await;
 
+        // Default-context injection keys on the representative ledger; this
+        // matches existing behavior for single-`from` requests and is a
+        // sensible default for dataset-shaped bodies until per-graph default
+        // contexts are addressed as a follow-up to fluree/db#1259.
         inject_default_context_if_requested(
             &state,
             &ledger_id,
@@ -2231,10 +2335,26 @@ pub async fn explain(
         inject_headers_into_query(&mut query_json, &headers);
 
         // Enforce bearer ledger scope for unsigned requests (base id only).
+        //
+        // For dataset-shaped bodies (array `from`, object `from`, `fromNamed`),
+        // iterate every referenced identifier so an unscoped ledger cannot
+        // slip through behind the representative one. `extract_dataset_ledger_ids`
+        // returns base ledger ids (time-travel suffix already stripped by
+        // `parse_ledger_id_time_travel` in DatasetSpec parsing).
         if let Some(p) = bearer.0.as_ref() {
-            if !credential.is_signed() && !p.can_read(&ledger_id) {
-                set_span_error_code(&span, "error:Forbidden");
-                return Err(ServerError::not_found("Ledger not found"));
+            if !credential.is_signed() {
+                if !p.can_read(&ledger_id) {
+                    set_span_error_code(&span, "error:Forbidden");
+                    return Err(ServerError::not_found("Ledger not found"));
+                }
+                if let Some(extra) = extract_dataset_ledger_ids(&query_json) {
+                    for id in &extra {
+                        if id != &ledger_id && !p.can_read(id) {
+                            set_span_error_code(&span, "error:Forbidden");
+                            return Err(ServerError::not_found("Ledger not found"));
+                        }
+                    }
+                }
             }
         }
 

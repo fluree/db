@@ -132,7 +132,6 @@ async fn seed_two_people_ledgers() -> (TempDir, Arc<AppState>) {
 /// `dataset_from_array_union_via_connection`). The HTTP dispatcher's
 /// `get_ledger_id` currently rejects with 400 `MissingLedger` because it
 /// only accepts a string `from`.
-#[ignore = "TODO(fluree/db#1259) un-ignore in Commit 3: get_ledger_id dataset-shape fall-through"]
 #[tokio::test]
 async fn query_with_from_array_union_through_dispatcher_returns_200() {
     let (_tmp, state) = seed_two_people_ledgers().await;
@@ -175,7 +174,6 @@ async fn query_with_from_array_union_through_dispatcher_returns_200() {
 
 /// Issue 1 variant: `from: {"@id": "ledger:test"}` (object form) through
 /// the connection-scoped route.
-#[ignore = "TODO(fluree/db#1259) un-ignore in Commit 3: get_ledger_id dataset-shape fall-through"]
 #[tokio::test]
 async fn query_with_from_object_through_dispatcher_returns_200() {
     let (_tmp, state) = seed_two_people_ledgers().await;
