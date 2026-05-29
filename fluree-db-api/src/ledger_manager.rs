@@ -394,8 +394,18 @@ pub enum FreshnessCheck {
 /// Note: Loading sends `Result<LedgerHandle>` to waiters (they need the handle).
 ///       Reloading sends `Result<()>` to waiters (handle already obtained).
 enum LoadState {
-    /// Initial load in progress - waiters receive handle on success
-    Loading(Vec<oneshot::Sender<std::result::Result<LedgerHandle, Arc<ApiError>>>>),
+    /// Initial load in progress - waiters receive handle on success.
+    ///
+    /// `generation` is a per-slot token allocated from
+    /// [`LedgerManager::load_generation`] when the leader inserts this entry.
+    /// A [`LoadingLeaderGuard`]'s detached cleanup removes the slot only if the
+    /// current `Loading` carries the same generation, so a stale guard can
+    /// never clobber a *new* leader's slot that was inserted after the original
+    /// orphan was cleared (e.g. by `disconnect`).
+    Loading {
+        generation: u64,
+        waiters: Vec<oneshot::Sender<std::result::Result<LedgerHandle, Arc<ApiError>>>>,
+    },
     /// Loaded and cached
     Ready(LedgerHandle),
     /// Reload in progress - handle stays valid, waiters receive () on success
@@ -403,6 +413,74 @@ enum LoadState {
         handle: LedgerHandle,
         waiters: Vec<oneshot::Sender<std::result::Result<(), Arc<ApiError>>>>,
     },
+}
+
+// ============================================================================
+// LoadingLeaderGuard - cancellation safety for single-flight loads
+// ============================================================================
+
+/// Cancellation-safety guard for a single-flight load leader in
+/// [`LedgerManager::get_or_load`].
+///
+/// The leader inserts [`LoadState::Loading`] before awaiting load I/O and only
+/// clears it on the publish path. If the leader future is dropped (cancelled)
+/// in between — an HTTP handler future dropped on client disconnect, an
+/// aborted task, an outer `tokio::time::timeout` — the `Loading` slot would be
+/// orphaned forever: [`LedgerManager::sweep_idle`] deliberately never evicts
+/// `Loading`, so every later caller for that ledger would park on `rx.await`
+/// indefinitely (a permanent per-ledger wedge).
+///
+/// On drop-before-publish this guard reclaims the orphaned slot. Removing the
+/// entry drops the queued waiter `oneshot` senders, so parked waiters receive
+/// `RecvError` (surfaced as `ApiError::internal("load cancelled")`) and the
+/// next caller re-elects a fresh leader. The leader calls [`Self::disarm`]
+/// once it has published (success or error), making normal completion a no-op.
+struct LoadingLeaderGuard {
+    entries: Arc<RwLock<HashMap<String, LoadState>>>,
+    alias: String,
+    /// Generation of the `Loading` slot this leader inserted. Cleanup removes
+    /// the slot only when it still carries this generation (ABA protection).
+    generation: u64,
+    armed: bool,
+}
+
+impl LoadingLeaderGuard {
+    /// Mark the load as published; the subsequent drop becomes a no-op.
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for LoadingLeaderGuard {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        // Drop is synchronous but the `entries` lock is async, so hand the
+        // cleanup to a detached task. A runtime context is present whenever a
+        // leader future is dropped on a worker thread (poll-time cancellation,
+        // task abort, or outer-future drop); if there is none, there is no
+        // runtime left to wedge.
+        let Ok(rt) = tokio::runtime::Handle::try_current() else {
+            return;
+        };
+        let entries = Arc::clone(&self.entries);
+        let alias = std::mem::take(&mut self.alias);
+        let generation = self.generation;
+        rt.spawn(async move {
+            let mut entries = entries.write().await;
+            // Only reclaim OUR still-`Loading` slot. A generation mismatch means
+            // the original orphan was already cleared (e.g. by `disconnect`) and
+            // a new leader inserted a fresh slot — never clobber that, nor a
+            // `Ready`/`Reloading` entry a later leader published.
+            if matches!(
+                entries.get(&alias),
+                Some(LoadState::Loading { generation: g, .. }) if *g == generation
+            ) {
+                entries.remove(&alias);
+            }
+        });
+    }
 }
 
 // ============================================================================
@@ -569,7 +647,10 @@ pub(crate) async fn load_and_attach_binary_store(
 /// and idle eviction.
 pub struct LedgerManager {
     /// Cached ledger handles + loading state
-    entries: RwLock<HashMap<String, LoadState>>,
+    ///
+    /// `Arc` so a [`LoadingLeaderGuard`] can reclaim an orphaned `Loading`
+    /// slot from a detached cleanup task if a load leader future is cancelled.
+    entries: Arc<RwLock<HashMap<String, LoadState>>>,
     /// Storage backend for ledger loading
     backend: StorageBackend,
     /// Shared cache for index nodes
@@ -579,6 +660,10 @@ pub struct LedgerManager {
     config: LedgerManagerConfig,
     /// Shutdown flag — prevents load/reload leaders from re-inserting after disconnect_all
     shutdown: AtomicBool,
+    /// Monotonic generation source for `LoadState::Loading` slots. Lets a
+    /// [`LoadingLeaderGuard`]'s detached cleanup distinguish its own orphaned
+    /// slot from a fresh slot inserted by a later leader (ABA protection).
+    load_generation: AtomicU64,
 }
 
 impl LedgerManager {
@@ -594,11 +679,12 @@ impl LedgerManager {
         config: LedgerManagerConfig,
     ) -> Self {
         Self {
-            entries: RwLock::new(HashMap::new()),
+            entries: Arc::new(RwLock::new(HashMap::new())),
             backend,
             nameservice_mode: nameservice,
             config,
             shutdown: AtomicBool::new(false),
+            load_generation: AtomicU64::new(0),
         }
     }
 
@@ -633,7 +719,7 @@ impl LedgerManager {
         }
 
         // Slow path: need to coordinate loading
-        let (_should_load, rx) = {
+        let (rx, generation) = {
             let mut entries = self.entries.write().await;
 
             match entries.get_mut(&canonical_alias) {
@@ -645,16 +731,24 @@ impl LedgerManager {
                     // Handle is valid even during reload
                     return Ok(handle.clone());
                 }
-                Some(LoadState::Loading(waiters)) => {
+                Some(LoadState::Loading { waiters, .. }) => {
                     // Someone else is loading - add ourselves as waiter
                     let (tx, rx) = oneshot::channel();
                     waiters.push(tx);
-                    (false, Some(rx))
+                    (Some(rx), 0)
                 }
                 None => {
-                    // We're first - mark as loading, release lock, do I/O
-                    entries.insert(canonical_alias.clone(), LoadState::Loading(Vec::new()));
-                    (true, None)
+                    // We're first - mark as loading (with a fresh generation),
+                    // release lock, do I/O.
+                    let generation = self.load_generation.fetch_add(1, Ordering::Relaxed);
+                    entries.insert(
+                        canonical_alias.clone(),
+                        LoadState::Loading {
+                            generation,
+                            waiters: Vec::new(),
+                        },
+                    );
+                    (None, generation)
                 }
             }
         };
@@ -677,18 +771,29 @@ impl LedgerManager {
                 });
         }
 
-        // We're the loader - do the I/O without holding manager lock
-        // Note: We pass the original address to nameservice (it handles resolution),
-        // but cache under the canonical address for consistent lookup
-        let result = LedgerState::load(&self.nameservice_mode, ledger_id, &self.backend)
+        // We're the loader. Arm a guard over the `Loading` slot: if this
+        // leader future is cancelled before it publishes (HTTP handler dropped
+        // on client disconnect, task abort, outer timeout), the guard reclaims
+        // the slot so waiters unblock and a fresh caller re-elects a leader —
+        // otherwise the slot orphans forever and wedges the ledger.
+        let mut leader_guard = LoadingLeaderGuard {
+            entries: Arc::clone(&self.entries),
+            alias: canonical_alias.clone(),
+            generation,
+            armed: true,
+        };
+
+        // Do ALL load I/O — including the binary index store attach, which
+        // performs S3 reads — WITHOUT holding the manager lock. Holding the
+        // `entries` write lock across that I/O previously turned the entire
+        // ledger cache into a global mutex for the duration of any cold load.
+        // Note: we pass the original address to nameservice (it handles
+        // resolution), but cache under the canonical address.
+        let load_result = LedgerState::load(&self.nameservice_mode, ledger_id, &self.backend)
             .await
             .map_err(ApiError::from); // Convert LedgerError to ApiError
 
-        // Publish result to waiters
-        let mut entries = self.entries.write().await;
-        let shutting_down = self.is_shutdown();
-
-        match result {
+        let publish = match load_result {
             Ok(mut state) => {
                 // Attempt to load binary index store (v2 only).
                 // Non-fatal: if loading fails, log and continue without binary index.
@@ -711,11 +816,27 @@ impl LedgerManager {
                         None
                     }
                 };
+                Ok(LedgerHandle::new(
+                    canonical_alias.clone(),
+                    state,
+                    binary_store,
+                ))
+            }
+            Err(e) => Err(e),
+        };
 
-                let handle = LedgerHandle::new(canonical_alias.clone(), state, binary_store);
+        // Publish under a brief lock. There is no `.await` between acquiring
+        // the lock and disarming the guard, so the leader cannot be cancelled
+        // mid-publish: either the guard already fired (we never reached here)
+        // or the publish runs to completion in this poll.
+        let mut entries = self.entries.write().await;
+        let shutting_down = self.is_shutdown();
+        leader_guard.disarm();
 
+        match publish {
+            Ok(handle) => {
                 // Notify waiters
-                if let Some(LoadState::Loading(waiters)) = entries.remove(&canonical_alias) {
+                if let Some(LoadState::Loading { waiters, .. }) = entries.remove(&canonical_alias) {
                     for tx in waiters {
                         let _ = tx.send(Ok(handle.clone()));
                     }
@@ -734,7 +855,7 @@ impl LedgerManager {
                 let error_for_waiters = Arc::new(ApiError::http(e.status_code(), e.to_string()));
 
                 // Notify waiters of failure
-                if let Some(LoadState::Loading(waiters)) = entries.remove(&canonical_alias) {
+                if let Some(LoadState::Loading { waiters, .. }) = entries.remove(&canonical_alias) {
                     for tx in waiters {
                         let _ = tx.send(Err(Arc::clone(&error_for_waiters)));
                     }
@@ -822,7 +943,7 @@ impl LedgerManager {
                     waiters.push(tx);
                     ReloadAction::WaitForReload(rx)
                 }
-                Some(LoadState::Loading(waiters)) => {
+                Some(LoadState::Loading { waiters, .. }) => {
                     // Initial load in progress - wait for it, then done
                     let (tx, rx) = oneshot::channel();
                     waiters.push(tx);
@@ -1722,8 +1843,20 @@ mod tests {
         // Directly insert Loading entries (simulates in-flight loads)
         {
             let mut entries = mgr.entries.write().await;
-            entries.insert("ledger_a:main".to_string(), LoadState::Loading(Vec::new()));
-            entries.insert("ledger_b:main".to_string(), LoadState::Loading(Vec::new()));
+            entries.insert(
+                "ledger_a:main".to_string(),
+                LoadState::Loading {
+                    generation: 0,
+                    waiters: Vec::new(),
+                },
+            );
+            entries.insert(
+                "ledger_b:main".to_string(),
+                LoadState::Loading {
+                    generation: 0,
+                    waiters: Vec::new(),
+                },
+            );
         }
 
         // Verify entries exist
@@ -1766,7 +1899,10 @@ mod tests {
             if !mgr.shutdown.load(Ordering::Acquire) {
                 entries.insert(
                     "should_not_appear:main".to_string(),
-                    LoadState::Loading(Vec::new()),
+                    LoadState::Loading {
+                        generation: 0,
+                        waiters: Vec::new(),
+                    },
                 );
             }
         }
@@ -1776,6 +1912,166 @@ mod tests {
             let entries = mgr.entries.read().await;
             assert_eq!(entries.len(), 0);
         }
+    }
+
+    // ========================================================================
+    // Cancellation-safety tests - LoadingLeaderGuard
+    // ========================================================================
+
+    fn make_test_manager() -> LedgerManager {
+        use fluree_db_core::MemoryStorage;
+        use fluree_db_nameservice::memory::MemoryNameService;
+        let backend = StorageBackend::Managed(Arc::new(MemoryStorage::new()));
+        let ns_mode = crate::NameServiceMode::ReadWrite(Arc::new(MemoryNameService::new()));
+        LedgerManager::new(backend, ns_mode, LedgerManagerConfig::default())
+    }
+
+    /// Regression: a leader future cancelled mid-load must NOT orphan its
+    /// `Loading` slot. Before the guard, the slot persisted forever (sweep_idle
+    /// never evicts Loading) and every later caller wedged on `rx.await`.
+    #[tokio::test]
+    async fn test_cancelled_leader_does_not_orphan_loading_slot() {
+        let mgr = make_test_manager();
+        {
+            let mut entries = mgr.entries.write().await;
+            entries.insert(
+                "x:main".to_string(),
+                LoadState::Loading {
+                    generation: 0,
+                    waiters: Vec::new(),
+                },
+            );
+        }
+        // Simulate a leader that inserted Loading then was dropped before publish.
+        {
+            let _guard = LoadingLeaderGuard {
+                entries: Arc::clone(&mgr.entries),
+                alias: "x:main".to_string(),
+                generation: 0,
+                armed: true,
+            };
+            // dropped here WITHOUT disarm() == cancelled leader
+        }
+        // Cleanup is detached; give it a few scheduler turns to run.
+        for _ in 0..20 {
+            tokio::task::yield_now().await;
+            if mgr.entries.read().await.get("x:main").is_none() {
+                break;
+            }
+        }
+        assert!(
+            mgr.entries.read().await.get("x:main").is_none(),
+            "orphaned Loading slot must be reclaimed when the leader future is dropped"
+        );
+    }
+
+    /// A waiter parked on the orphaned slot must unblock (RecvError) when the
+    /// cancelled leader's guard reclaims the slot — not hang to the 900s limit.
+    #[tokio::test]
+    async fn test_waiter_unblocks_when_leader_cancelled() {
+        let mgr = make_test_manager();
+        let (tx, rx) = oneshot::channel::<std::result::Result<LedgerHandle, Arc<ApiError>>>();
+        {
+            let mut entries = mgr.entries.write().await;
+            entries.insert(
+                "x:main".to_string(),
+                LoadState::Loading {
+                    generation: 0,
+                    waiters: vec![tx],
+                },
+            );
+        }
+        {
+            let _guard = LoadingLeaderGuard {
+                entries: Arc::clone(&mgr.entries),
+                alias: "x:main".to_string(),
+                generation: 0,
+                armed: true,
+            };
+        }
+        // Removing the slot drops the sender -> the waiter observes RecvError
+        // instead of hanging forever.
+        let res = tokio::time::timeout(Duration::from_secs(2), rx)
+            .await
+            .expect("waiter must not hang after the leader is cancelled");
+        assert!(
+            res.is_err(),
+            "waiter should receive RecvError once the orphaned slot is reclaimed"
+        );
+    }
+
+    /// A leader that publishes (disarms) must leave its slot intact — the
+    /// guard's drop is a no-op on the success path.
+    #[tokio::test]
+    async fn test_disarmed_guard_leaves_slot_intact() {
+        let mgr = make_test_manager();
+        {
+            let mut entries = mgr.entries.write().await;
+            entries.insert(
+                "x:main".to_string(),
+                LoadState::Loading {
+                    generation: 0,
+                    waiters: Vec::new(),
+                },
+            );
+        }
+        {
+            let mut guard = LoadingLeaderGuard {
+                entries: Arc::clone(&mgr.entries),
+                alias: "x:main".to_string(),
+                generation: 0,
+                armed: true,
+            };
+            guard.disarm();
+        }
+        for _ in 0..5 {
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            mgr.entries.read().await.get("x:main").is_some(),
+            "a disarmed guard must not touch the slot"
+        );
+    }
+
+    /// ABA protection: a stale guard whose original slot was already cleared
+    /// (e.g. by `disconnect`) and replaced by a NEW leader's `Loading` slot
+    /// (different generation) must NOT remove the new leader's slot.
+    #[tokio::test]
+    async fn test_stale_guard_does_not_clobber_new_leader_slot() {
+        let mgr = make_test_manager();
+        // A new leader has inserted a fresh slot with generation 7.
+        {
+            let mut entries = mgr.entries.write().await;
+            entries.insert(
+                "x:main".to_string(),
+                LoadState::Loading {
+                    generation: 7,
+                    waiters: Vec::new(),
+                },
+            );
+        }
+        // A stale guard from a previous, already-cleared load (generation 3)
+        // is dropped now.
+        {
+            let _guard = LoadingLeaderGuard {
+                entries: Arc::clone(&mgr.entries),
+                alias: "x:main".to_string(),
+                generation: 3,
+                armed: true,
+            };
+        }
+        for _ in 0..10 {
+            tokio::task::yield_now().await;
+        }
+        // The new leader's slot (gen 7) must survive the stale guard's cleanup.
+        let entries = mgr.entries.read().await;
+        assert!(
+            matches!(
+                entries.get("x:main"),
+                Some(LoadState::Loading { generation: 7, .. })
+            ),
+            "stale guard (gen 3) must not remove the new leader's slot (gen 7)"
+        );
     }
 
     #[test]
