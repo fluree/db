@@ -755,6 +755,9 @@ impl LedgerManager {
         // Manager lock released here
 
         if let Some(rx) = rx {
+            // TEMP DIAGNOSTIC (revert before merge): a waiter parked here with
+            // no matching leader publish is the orphaned-Loading signature.
+            tracing::info!(alias = %canonical_alias, "ledger.load.waiter.park");
             // Wait for the loader to finish
             // Note: Waiters receive an Http error (preserving status code) since
             // ApiError isn't Clone. The leader (first caller) gets the full error type.
@@ -783,6 +786,11 @@ impl LedgerManager {
             armed: true,
         };
 
+        // TEMP DIAGNOSTIC (revert before merge): leader load phases at info! so
+        // a hang localizes to nameservice (DDB, no default timeout) vs storage
+        // (S3, 35s/attempt) vs the binary-store attach.
+        tracing::info!(alias = %canonical_alias, "ledger.load.leader.begin");
+
         // Do ALL load I/O — including the binary index store attach, which
         // performs S3 reads — WITHOUT holding the manager lock. Holding the
         // `entries` write lock across that I/O previously turned the entire
@@ -792,6 +800,11 @@ impl LedgerManager {
         let load_result = LedgerState::load(&self.nameservice_mode, ledger_id, &self.backend)
             .await
             .map_err(ApiError::from); // Convert LedgerError to ApiError
+        tracing::info!(
+            alias = %canonical_alias,
+            ok = load_result.is_ok(),
+            "ledger.load.state.done"
+        );
 
         let publish = match load_result {
             Ok(mut state) => {
@@ -816,6 +829,7 @@ impl LedgerManager {
                         None
                     }
                 };
+                tracing::info!(alias = %canonical_alias, "ledger.load.binary_store.done");
                 Ok(LedgerHandle::new(
                     canonical_alias.clone(),
                     state,
@@ -824,6 +838,13 @@ impl LedgerManager {
             }
             Err(e) => Err(e),
         };
+
+        // TEMP DIAGNOSTIC (revert before merge): leader reached publish.
+        tracing::info!(
+            alias = %canonical_alias,
+            ok = publish.is_ok(),
+            "ledger.load.leader.publish"
+        );
 
         // Publish under a brief lock. There is no `.await` between acquiring
         // the lock and disarming the guard, so the leader cannot be cancelled

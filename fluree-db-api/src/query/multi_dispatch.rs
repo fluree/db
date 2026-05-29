@@ -374,16 +374,36 @@ pub(crate) async fn run_envelope(
     // observable when at least validation + snapshot succeed.
     let started = Instant::now();
 
+    // TEMP DIAGNOSTIC (revert before merge): localize the multi-query wedge by
+    // emitting info-level phase markers. info! (not debug!) so they are visible
+    // at the deployed Lambda's default log level; these violate the
+    // debug_span! convention deliberately and only for this debugging branch.
+    tracing::info!(aliases = envelope.queries.len(), "mq.run_envelope.start");
+
     let distinct_ledgers = validate_envelope(&envelope, bounds)?;
+    tracing::info!(
+        distinct_ledgers = distinct_ledgers.len(),
+        "mq.validate.ok; resolving snapshot"
+    );
 
     let snapshot = Arc::new(
         resolve_envelope_snapshot(fluree.as_ref(), &distinct_ledgers, envelope.as_of.as_ref())
             .await
+            .inspect_err(|e| tracing::warn!(error = %e, "mq.snapshot.err"))
             .map_err(MultiQueryError::Snapshot)?,
+    );
+    tracing::info!(
+        ledgers = snapshot.ledgers.len(),
+        "mq.snapshot.resolved; dispatching"
     );
 
     let include_meta = envelope_meta_enabled(envelope.opts.as_ref());
     let config = DispatchConfig::from_envelope(&envelope, bounds);
+    tracing::info!(
+        max_concurrency = config.max_concurrency,
+        envelope_timeout_ms = config.envelope_timeout_ms,
+        "mq.dispatch.config"
+    );
 
     let outcomes = dispatch_subqueries(
         fluree,
@@ -393,6 +413,10 @@ pub(crate) async fn run_envelope(
         default_format,
     )
     .await;
+    tracing::info!(
+        outcomes = outcomes.len(),
+        "mq.dispatch.complete; assembling"
+    );
     let elapsed_ms = started.elapsed().as_millis().min(u64::MAX as u128) as u64;
 
     let response = assemble_response(
@@ -403,6 +427,7 @@ pub(crate) async fn run_envelope(
         elapsed_ms,
     )
     .map_err(MultiQueryError::ResponseAssembly)?;
+    tracing::info!("mq.assemble.ok");
 
     Ok(response)
 }
@@ -452,8 +477,14 @@ async fn dispatch_subqueries(
             result_status = tracing::field::Empty,
         );
 
+        // TEMP DIAGNOSTIC (revert before merge): per-sub-query lifecycle at
+        // info! so a never-returning sub-query is visible (spawn + permit
+        // acquired, but no done) in the deployed Lambda logs.
+        let log_alias = alias.clone();
+
         set.spawn(
             async move {
+                tracing::info!(alias = %log_alias, "mq.sub.spawn");
                 let _permit = match semaphore.acquire_owned().await {
                     Ok(p) => p,
                     Err(_) => {
@@ -466,6 +497,7 @@ async fn dispatch_subqueries(
                         );
                     }
                 };
+                tracing::info!(alias = %log_alias, "mq.sub.permit.acquired");
 
                 // Effective timeout = min(opts.timeoutMs, remaining envelope budget),
                 // computed at permit acquisition, not envelope entry.
@@ -520,11 +552,13 @@ async fn dispatch_subqueries(
                     },
                 };
 
-                match &kind {
-                    AliasOutcomeKind::Success { .. } => span.record("result_status", "ok"),
-                    AliasOutcomeKind::Error { .. } => span.record("result_status", "error"),
-                    AliasOutcomeKind::Timeout { .. } => span.record("result_status", "timeout"),
+                let status = match &kind {
+                    AliasOutcomeKind::Success { .. } => "ok",
+                    AliasOutcomeKind::Error { .. } => "error",
+                    AliasOutcomeKind::Timeout { .. } => "timeout",
                 };
+                span.record("result_status", status);
+                tracing::info!(alias = %log_alias, status, "mq.sub.done");
 
                 (idx, kind)
             }
@@ -556,6 +590,11 @@ async fn dispatch_subqueries(
                 }
             }
             () = &mut deadline_sleep => {
+                // TEMP DIAGNOSTIC (revert before merge): distinguishes "deadline
+                // never fired" from "fired but aborts couldn't land" — abort
+                // cannot interrupt a task parked in a sync block_on section, so
+                // the drain below can still hang past the fired deadline.
+                tracing::warn!(remaining = set.len(), "mq.drain.deadline_fired");
                 set.abort_all();
                 while let Some(joined) = set.join_next().await {
                     if let Ok((idx, kind)) = joined {
@@ -564,6 +603,7 @@ async fn dispatch_subqueries(
                         }
                     }
                 }
+                tracing::warn!("mq.drain.deadline_drained");
                 break;
             }
         }
