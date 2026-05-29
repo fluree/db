@@ -488,8 +488,19 @@ impl<'a> HydrationFormatter<'a> {
             // decode / dict touches / subject re-resolve on discarded rows;
             // Wildcard projections want every predicate, so the filter stays
             // None and the legacy SPOT-everything path runs unchanged.
+            //
+            // Single-predicate fast path: SPOT(s,p,*) narrows the cursor's
+            // leaflet key-range to the (s, p) prefix directly, skipping the
+            // predicate-filter machinery and the in-batch scan over the
+            // subject's other predicate rows. K ≥ 2 stays on the
+            // SPOT(s,*,*) + predicate_filter path because two cursor
+            // descents would each pay their own INDEX_TOUCH (0.010 fuel)
+            // and beat the single-scan baseline.
             let predicate_filter = predicate_filter_for_level(level);
-            let flakes = self.fetch_subject_properties(sid, predicate_filter).await?;
+            let flakes = match predicate_filter.as_deref() {
+                Some([only]) => self.fetch_subject_predicate_pair(sid, only).await?,
+                _ => self.fetch_subject_properties(sid, predicate_filter).await?,
+            };
 
             // Group flakes by predicate
             let mut by_pred: HashMap<Sid, Vec<&Flake>> = HashMap::new();
@@ -1091,6 +1102,39 @@ impl<'a> HydrationFormatter<'a> {
             })?;
 
         // Policy filtering: only when policy is Some and not root.
+        if let Some(policy_ctx) = self.policy {
+            if !policy_ctx.wrapper().is_root() {
+                return Ok(self.filter_flakes_by_policy(flakes, policy_ctx));
+            }
+        }
+
+        Ok(flakes)
+    }
+
+    /// Fetch one `(subject, predicate)` pair via the SPOT index.
+    ///
+    /// Caller invariant: the projection's level is Explicit with exactly
+    /// one forward `Property` item. This narrows the cursor's leaflet
+    /// key-range to the `(s, p)` prefix — same number of cursor descents
+    /// and same `INDEX_TOUCH` fuel as the SPOT(s,*,*) + `predicate_filter`
+    /// path, but skips the per-row `binary_search` against the filter and
+    /// the in-batch scan over the subject's other predicate rows. Worth it
+    /// on fat subjects; a CPU/clarity wash on small ones.
+    async fn fetch_subject_predicate_pair(&self, sid: &Sid, pred: &Sid) -> Result<Vec<Flake>> {
+        let flakes = self
+            .db
+            .range(
+                IndexType::Spot,
+                RangeTest::Eq,
+                RangeMatch::subject_predicate(sid.clone(), pred.clone()),
+            )
+            .await
+            .map_err(|e| {
+                FormatError::InvalidBinding(format!(
+                    "Failed to fetch (subject, predicate) pair: {e}"
+                ))
+            })?;
+
         if let Some(policy_ctx) = self.policy {
             if !policy_ctx.wrapper().is_root() {
                 return Ok(self.filter_flakes_by_policy(flakes, policy_ctx));

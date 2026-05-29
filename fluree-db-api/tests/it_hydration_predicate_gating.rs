@@ -166,6 +166,54 @@ async fn wildcard_projection_matches_full_explicit_projection() {
     );
 }
 
+/// K=1 single-predicate fast path: a projection naming exactly one forward
+/// predicate routes through `SPOT(s,p,*)` (via `RangeMatch::subject_predicate`)
+/// rather than `SPOT(s,*,*)` + predicate_filter. Correctness contract: the
+/// JSON output must include the requested predicate and `@id`, and nothing
+/// else.
+///
+/// Fuel-wise, K=1 should be ≤ a K=2 narrow projection on the same subject —
+/// one fewer survivor row, one fewer dict touch.
+#[tokio::test]
+async fn single_predicate_projection_uses_sp_pair_path() {
+    let tmp = tempfile::tempdir().expect("create temp dir");
+    let path = tmp.path().to_str().unwrap();
+    let ledger_id = "hyd/single-pred:main";
+    seed_eight_string_predicates(path, ledger_id).await;
+    let fluree = FlureeBuilder::file(path).build().expect("reopen");
+
+    // K=1: just one forward predicate.
+    let single = explicit_query(ledger_id, &["ex:p3"]);
+    let resp = fluree
+        .query_from()
+        .jsonld(&single)
+        .execute_formatted()
+        .await
+        .expect("execute_formatted");
+    let row = resp.as_array().expect("rows").first().expect("row");
+    let obj = row.as_object().expect("obj");
+
+    assert!(obj.contains_key("@id"));
+    assert!(obj.contains_key("ex:p3"), "row: {row:?}");
+    for unselected in [
+        "ex:p1", "ex:p2", "ex:p4", "ex:p5", "ex:p6", "ex:p7", "ex:p8",
+    ] {
+        assert!(
+            !obj.contains_key(unselected),
+            "K=1 projection should not emit `{unselected}` — row: {row:?}",
+        );
+    }
+
+    // Fuel sanity: K=1 should not cost MORE than K=2 on the same subject.
+    // (Strict-less is harder to assert without flake; same-or-less is safe.)
+    let k1_fuel = tracked_fuel(&fluree, &single).await;
+    let k2_fuel = tracked_fuel(&fluree, &explicit_query(ledger_id, &["ex:p3", "ex:p4"])).await;
+    assert!(
+        k1_fuel <= k2_fuel + 0.001,
+        "K=1 fuel ({k1_fuel:.3}) should be ≤ K=2 fuel ({k2_fuel:.3}) on the same subject",
+    );
+}
+
 /// Per-key bytes also drop: the formatter only emits keys for predicates the
 /// projection asked for. (Same as today — this is a smoke test that we
 /// haven't broken the actual JSON output shape.)
