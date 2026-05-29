@@ -362,18 +362,20 @@ fn binary_range_eq_v3(
 
     // Resolve the optional projection-predicate allow-list once.
     //
-    // `predicate_filter_p_ids` is the persisted-dict p_id set used in the row
-    // loop to skip decode/resolve for unselected base flakes; unresolvable
-    // Sids simply don't appear (the base scan can't surface them). The
-    // original Sid slice still gates the overlay translator so novel
-    // predicates in the allow-list survive the overlay path even without a
-    // persisted p_id.
-    let predicate_filter_p_ids: Option<Vec<u32>> = opts.predicate_filter.as_deref().map(|sids| {
-        let mut ids: Vec<u32> = sids.iter().filter_map(|s| store.sid_to_p_id(s)).collect();
-        ids.sort_unstable();
-        ids.dedup();
-        ids
-    });
+    // `predicate_filter_p_ids` is the row-loop's allow-set of `u32` p_ids.
+    // We seed it with persisted-dict resolutions here; novelty-only
+    // predicates (no persisted p_id yet) get appended below after overlay
+    // translation surfaces their ephemeral p_ids via `ephemeral_p_id_to_sid`.
+    // Without that extension, an overlay assert on a novelty-only selected
+    // predicate would survive the overlay translator's Sid filter, land in
+    // the cursor stream with an ephemeral p_id, and then get silently
+    // dropped here.
+    let mut predicate_filter_p_ids: Option<Vec<u32>> =
+        opts.predicate_filter.as_deref().map(|sids| {
+            sids.iter()
+                .filter_map(|s| store.sid_to_p_id(s))
+                .collect::<Vec<u32>>()
+        });
 
     // Create cursor: use range-narrowed scan when any filter field is bound,
     // matching the pattern in BinaryScanOperator::open. For novelty-only subjects
@@ -457,6 +459,25 @@ fn binary_range_eq_v3(
         let epoch = overlay.epoch();
         cursor.set_overlay_ops(ops);
         cursor.set_epoch(epoch);
+    }
+
+    // Extend the row-loop allow-set with ephemeral p_ids whose mapped Sid is
+    // in the caller's allow-list — these are novelty-only predicates that
+    // have no persisted p_id yet, so they were not captured during the
+    // initial Sid-to-p_id resolution. The overlay translator already let
+    // them through via Sid match; without this step the row loop would
+    // drop them under their cursor-side ephemeral p_id.
+    if let (Some(allow_sids), Some(allow_ids)) = (
+        opts.predicate_filter.as_deref(),
+        predicate_filter_p_ids.as_mut(),
+    ) {
+        for (eph_p_id, sid) in &ephemeral_p_id_to_sid {
+            if allow_sids.iter().any(|s| s == sid) {
+                allow_ids.push(*eph_p_id);
+            }
+        }
+        allow_ids.sort_unstable();
+        allow_ids.dedup();
     }
 
     // Iterate and decode to Flakes.

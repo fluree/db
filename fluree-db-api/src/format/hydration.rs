@@ -496,8 +496,16 @@ impl<'a> HydrationFormatter<'a> {
             // SPOT(s,*,*) + predicate_filter path because two cursor
             // descents would each pay their own INDEX_TOUCH (0.010 fuel)
             // and beat the single-scan baseline.
+            //
+            // Zero-predicate fast path (K = 0): an Explicit level with no
+            // forward `Property` items — e.g. `["@id"]` or reverse-only —
+            // skips the forward fetch entirely. Opening the cursor would
+            // still pay one INDEX_TOUCH (0.010 fuel) per leaflet batch
+            // even though the row loop drops every row. `@id` and reverse
+            // properties are emitted by the dedicated paths further down.
             let predicate_filter = predicate_filter_for_level(level);
             let flakes = match predicate_filter.as_deref() {
+                Some([]) => Vec::new(),
                 Some([only]) => self.fetch_subject_predicate_pair(sid, only).await?,
                 _ => self.fetch_subject_properties(sid, predicate_filter).await?,
             };

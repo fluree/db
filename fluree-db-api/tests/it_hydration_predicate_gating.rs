@@ -298,6 +298,101 @@ async fn overlay_retract_on_selected_predicate_is_honored() {
     );
 }
 
+/// Regression: a novelty-only selected predicate must survive the K≥2 gate.
+///
+/// Setup: seed + reindex base (so `ex:p1` is in the persisted predicate dict),
+/// then INSERT a brand-new `ex:noveltyPred` without reindexing — its Sid has
+/// no persisted p_id, only a novelty assignment, and surfaces in the cursor
+/// stream under an ephemeral p_id assigned by the overlay translator.
+///
+/// Before the ephemeral-p_id extension fix, the row-loop gate was built
+/// from persisted-dict resolutions only; the ephemeral p_id was unknown to
+/// the allow-list and the row got silently dropped. Projection should now
+/// include both values.
+#[tokio::test]
+async fn novelty_only_predicate_survives_k_ge_2_gate() {
+    let tmp = tempfile::tempdir().expect("create temp dir");
+    let path = tmp.path().to_str().unwrap();
+    let ledger_id = "hyd/novelty-only-pred:main";
+    seed_eight_string_predicates(path, ledger_id).await;
+    let fluree = FlureeBuilder::file(path).build().expect("reopen");
+    let ledger = fluree.ledger(ledger_id).await.expect("load");
+
+    // Assert a brand-new predicate that doesn't exist in the persisted dict.
+    let insert = json!({
+        "@context": ctx(),
+        "@id": "ex:subj-1",
+        "ex:noveltyPred": "novelty-value",
+    });
+    fluree
+        .insert(ledger, &insert)
+        .await
+        .expect("insert novelty");
+
+    // K=2 projection: one persisted predicate + the novelty-only one. Both
+    // must come back. (K=2 → goes through SPOT(s,*,*) + predicate_filter,
+    // which is the path the bug lived on.)
+    let q = explicit_query(ledger_id, &["ex:p1", "ex:noveltyPred"]);
+    let resp = fluree
+        .query_from()
+        .jsonld(&q)
+        .execute_formatted()
+        .await
+        .expect("execute_formatted");
+    let row = resp.as_array().expect("rows").first().expect("row");
+    let obj = row.as_object().expect("obj");
+    assert!(
+        obj.contains_key("ex:p1"),
+        "persisted predicate: row: {row:?}"
+    );
+    assert!(
+        obj.contains_key("ex:noveltyPred"),
+        "novelty-only predicate must not be dropped by the persisted-id gate \
+         — row: {row:?}",
+    );
+}
+
+/// Regression: an Explicit projection with no forward `Property` items
+/// (e.g. `["@id"]`) must NOT open the SPOT cursor. Opening it would still
+/// pay one INDEX_TOUCH (0.010 fuel) per leaflet batch even though every
+/// row is filtered out by the row loop.
+#[tokio::test]
+async fn id_only_projection_skips_forward_cursor() {
+    let tmp = tempfile::tempdir().expect("create temp dir");
+    let path = tmp.path().to_str().unwrap();
+    let ledger_id = "hyd/id-only:main";
+    seed_eight_string_predicates(path, ledger_id).await;
+    let fluree = FlureeBuilder::file(path).build().expect("reopen");
+
+    // K=0 projection: just `@id`. No forward predicates → no SPOT scan.
+    let q = json!({
+        "@context": ctx(),
+        "from": ledger_id,
+        "select": { "ex:subj-1": ["@id"] },
+    });
+    let resp = fluree
+        .query_from()
+        .jsonld(&q)
+        .execute_formatted()
+        .await
+        .expect("execute_formatted");
+    let row = resp.as_array().expect("rows").first().expect("row");
+    let obj = row.as_object().expect("obj");
+    assert_eq!(obj.len(), 1, "only @id should appear — row: {row:?}");
+    assert!(obj.contains_key("@id"));
+
+    // Fuel sanity: K=0 should cost strictly less than K=1 on the same subject.
+    // K=1 still opens the cursor (one INDEX_TOUCH + one survivor row +
+    // one dict touch); K=0 doesn't open the cursor at all (saves at minimum
+    // one INDEX_TOUCH per surveyed subject root).
+    let k0_fuel = tracked_fuel(&fluree, &q).await;
+    let k1_fuel = tracked_fuel(&fluree, &explicit_query(ledger_id, &["ex:p1"])).await;
+    assert!(
+        k0_fuel + 0.005 < k1_fuel,
+        "K=0 ({k0_fuel:.3}) should be measurably cheaper than K=1 ({k1_fuel:.3})",
+    );
+}
+
 /// Overlay retract on an UNSELECTED predicate is invisible — the discarded
 /// retract should never surface as either an absent key (it wasn't selected)
 /// or a smuggled-in row (overlay filter must not promote non-selected ops).
