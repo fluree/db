@@ -3,9 +3,9 @@
 //! Provides `query_dataset` for multi-ledger queries.
 
 use crate::query::helpers::{
-    build_query_result, parse_and_validate_sparql, parse_jsonld_query, parse_sparql_to_ir,
-    prepare_for_execution, status_for_query_error, tracker_for_limits,
-    tracker_for_tracked_endpoint,
+    build_query_result, charge_query_floor, parse_and_validate_sparql, parse_jsonld_query,
+    parse_sparql_to_ir, prepare_for_execution, status_for_query_error, tracked_query_tracker,
+    tracker_for_limits,
 };
 use crate::view::{DataSetDb, QueryInput};
 use crate::{ApiError, ExecutableQuery, Fluree, QueryResult, Result, Tracker, TrackingOptions};
@@ -81,6 +81,17 @@ impl Fluree {
             .primary()
             .ok_or_else(|| ApiError::query("Dataset has no graphs for query execution"))?;
 
+        // 0. Tracker for fuel limits. Charge the floor up front so a sub-floor
+        // `max-fuel` is rejected before parse/plan; no-op when fuel isn't
+        // tracked. (The single-ledger fast path above delegates to `query`,
+        // which charges the floor itself — so we only reach here, and charge
+        // once, on the genuine multi-ledger/dataset path.)
+        let tracker = match &input {
+            QueryInput::JsonLd(json) => tracker_for_limits(json),
+            QueryInput::Sparql(_) => Tracker::disabled(),
+        };
+        charge_query_floor(&tracker).map_err(fluree_db_query::QueryError::from)?;
+
         // 1. Parse to common IR (using primary db for namespace resolution).
         let (vars, mut parsed) = match &input {
             QueryInput::JsonLd(json) => parse_jsonld_query(
@@ -101,12 +112,6 @@ impl Fluree {
 
         // 2. Build executable with optional reasoning override from primary view
         let executable = self.build_executable_for_dataset(dataset, &parsed).await?;
-
-        // 3. Get tracker for fuel limits
-        let tracker = match &input {
-            QueryInput::JsonLd(json) => tracker_for_limits(json),
-            QueryInput::Sparql(_) => Tracker::disabled(),
-        };
 
         // 4. Execute against merged dataset
         let batches = self
@@ -175,6 +180,16 @@ impl Fluree {
             .primary()
             .ok_or_else(|| ApiError::query("Dataset has no graphs for query execution"))?;
 
+        // 0. Tracker for fuel limits. Charge the floor up front so a sub-floor
+        // `max-fuel` is rejected before parse/plan; no-op when fuel isn't
+        // tracked. (The single-ledger fast path above delegates to
+        // `query_view_with_r2rml`, which charges the floor — so we charge once.)
+        let tracker = match &input {
+            QueryInput::JsonLd(json) => tracker_for_limits(json),
+            QueryInput::Sparql(_) => Tracker::disabled(),
+        };
+        charge_query_floor(&tracker).map_err(fluree_db_query::QueryError::from)?;
+
         // 1. Parse to common IR (using primary db for namespace resolution).
         let (vars, mut parsed) = match &input {
             QueryInput::JsonLd(json) => parse_jsonld_query(
@@ -193,12 +208,6 @@ impl Fluree {
 
         // 2. Build executable with optional reasoning override from primary view
         let executable = self.build_executable_for_dataset(dataset, &parsed).await?;
-
-        // 3. Get tracker for fuel limits
-        let tracker = match &input {
-            QueryInput::JsonLd(json) => tracker_for_limits(json),
-            QueryInput::Sparql(_) => Tracker::disabled(),
-        };
 
         // 4. Execute against merged dataset
         let batches = self
@@ -236,16 +245,12 @@ impl Fluree {
     {
         let input = q.into();
 
-        // Get tracker: use caller-provided options if given, otherwise fall back
-        // to defaults (all-enabled for SPARQL, opts-derived for JSON-LD).
-        let tracker = if let Some(opts) = tracking_override {
-            Tracker::new(opts)
-        } else {
-            match &input {
-                QueryInput::JsonLd(json) => tracker_for_tracked_endpoint(json),
-                QueryInput::Sparql(_) => Tracker::new(TrackingOptions::all_enabled()),
-            }
-        };
+        // Tracker: caller-provided options if given, else per-input defaults.
+        let tracker = tracked_query_tracker(&input, &tracking_override);
+
+        // Charge the one-time query floor before parsing (see `query_tracked`).
+        charge_query_floor(&tracker)
+            .map_err(|e| crate::query::TrackedErrorResponse::fuel_exceeded(&e, tracker.tally()))?;
 
         // Determine output format: caller override > input-type default
         let default_format = match &input {
@@ -356,14 +361,11 @@ impl Fluree {
     {
         let input = q.into();
 
-        let tracker = if let Some(opts) = tracking_override {
-            Tracker::new(opts)
-        } else {
-            match &input {
-                QueryInput::JsonLd(json) => tracker_for_tracked_endpoint(json),
-                QueryInput::Sparql(_) => Tracker::new(TrackingOptions::all_enabled()),
-            }
-        };
+        let tracker = tracked_query_tracker(&input, &tracking_override);
+
+        // Charge the one-time query floor before parsing (see `query_tracked`).
+        charge_query_floor(&tracker)
+            .map_err(|e| crate::query::TrackedErrorResponse::fuel_exceeded(&e, tracker.tally()))?;
 
         let default_format = match &input {
             QueryInput::Sparql(_) => crate::format::FormatterConfig::sparql_json(),

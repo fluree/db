@@ -82,7 +82,9 @@ async fn background_indexing_trigger_wait_then_load_index_root() {
 
             // 3) Wait + assert we can load the persisted root
             match completion.wait().await {
-                fluree_db_api::IndexOutcome::Completed { index_t, root_id } => {
+                fluree_db_api::IndexOutcome::Completed {
+                    index_t, root_id, ..
+                } => {
                     assert!(
                         index_t >= commit_t,
                         "index_t ({index_t}) should be >= commit_t ({commit_t})"

@@ -2036,7 +2036,8 @@ impl Operator for BinaryScanOperator {
             // Overlay/novelty rows are in-memory; charge per row at 1 micro-fuel.
             let n = self.flakes_to_bindings(&mut columns, ctx, batch_size - produced)?;
             for _ in 0..n {
-                ctx.tracker.consume_fuel(1)?;
+                ctx.tracker
+                    .consume_fuel(fluree_db_core::tracking::schedule::PER_ROW_MICRO_FUEL)?;
             }
             produced += n;
         }

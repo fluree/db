@@ -111,11 +111,7 @@ impl MemoryStore {
 
     /// Check if the memory ledger has been initialized.
     pub async fn is_initialized(&self) -> Result<bool> {
-        Ok(self
-            .fluree
-            .ledger_exists(MEMORY_LEDGER_ID)
-            .await
-            .unwrap_or(false))
+        Ok(self.fluree.ledger_exists(MEMORY_LEDGER_ID).await?)
     }
 
     /// Initialize the memory ledger and file structure.
@@ -207,7 +203,7 @@ impl MemoryStore {
         if self.is_initialized().await? {
             debug!("Dropping __memory ledger for rebuild");
             self.fluree
-                .drop_ledger(MEMORY_LEDGER_ID, fluree_db_api::DropMode::Hard)
+                .drop_ledger(MEMORY_LEDGER, fluree_db_api::DropMode::Hard)
                 .await?;
         }
 
@@ -765,6 +761,44 @@ WHERE {{\n\
         }
 
         Ok(count)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use fluree_db_api::FlureeBuilder;
+
+    #[tokio::test]
+    async fn is_initialized_finds_memory_ledger_by_normalized_id() {
+        let fluree = FlureeBuilder::memory().build_memory();
+        fluree
+            .create_ledger(MEMORY_LEDGER)
+            .await
+            .expect("create memory ledger");
+        let store = MemoryStore::new(fluree, None);
+
+        assert!(
+            store.is_initialized().await.expect("check initialized"),
+            "ledger_exists should accept the normalized __memory:main ledger id"
+        );
+    }
+
+    #[tokio::test]
+    async fn drop_and_reinit_drops_by_whole_ledger_name() {
+        let fluree = FlureeBuilder::memory().build_memory();
+        let store = MemoryStore::new(fluree, None);
+        store.initialize().await.expect("initialize memory store");
+
+        store
+            .drop_and_reinit()
+            .await
+            .expect("drop and reinitialize memory ledger");
+
+        assert!(
+            store.is_initialized().await.expect("check initialized"),
+            "memory ledger should exist after drop_and_reinit"
+        );
     }
 }
 

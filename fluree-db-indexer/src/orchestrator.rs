@@ -117,6 +117,13 @@ pub enum IndexOutcome {
         index_t: i64,
         /// Content identifier of the index root
         root_id: Option<fluree_db_core::ContentId>,
+        /// Total fuel charged for the build that satisfied this waiter.
+        /// `Some(0.0)` when no work was needed (the waiter was satisfied by
+        /// an already-published index); `Some(N)` for a build that ran;
+        /// `None` only if fuel tracking was disabled for this orchestrator.
+        /// Coalesced waiters all receive the fuel total for the single build
+        /// that satisfied them.
+        fuel: Option<f64>,
     },
     /// Indexing failed after retries exhausted or fatal error
     Failed(String),
@@ -848,6 +855,7 @@ impl BackgroundIndexerWorker {
                             let outcome = IndexOutcome::Completed {
                                 index_t: current_index_t,
                                 root_id: Some(root_id),
+                                fuel: Some(0.0),
                             };
                             state.resolve_waiters_below(current_index_t, outcome);
                             state.recalculate_pending_min_t();
@@ -876,6 +884,7 @@ impl BackgroundIndexerWorker {
                             let outcome = IndexOutcome::Completed {
                                 index_t: current_index_t,
                                 root_id: None,
+                                fuel: Some(0.0),
                             };
                             state.resolve_waiters_below(current_index_t, outcome);
                             state.recalculate_pending_min_t();
@@ -954,6 +963,7 @@ impl BackgroundIndexerWorker {
                     let outcome = IndexOutcome::Completed {
                         index_t: current_index_t,
                         root_id: Some(root_id.clone()),
+                        fuel: Some(0.0),
                     };
                     state.resolve_waiters_below(current_index_t, outcome);
                 } else if current_index_t == 0 {
@@ -961,6 +971,7 @@ impl BackgroundIndexerWorker {
                     let outcome = IndexOutcome::Completed {
                         index_t: current_index_t,
                         root_id: None,
+                        fuel: Some(0.0),
                     };
                     state.resolve_waiters_below(current_index_t, outcome);
                 } else {
@@ -1019,8 +1030,27 @@ impl BackgroundIndexerWorker {
                 return;
             }
         };
-        let result =
-            crate::build_index_for_record(content_store, &record, self.config.clone()).await;
+        // Always create a fuel-enabled, no-limit tracker per build so each
+        // background indexing pass is measured. Indexing never enforces a
+        // limit — measurement only. The tally is logged on success and
+        // propagated to all waiters via IndexOutcome::Completed::fuel.
+        //
+        // The tracker is kept by reference (clone is cheap — Option<Arc<...>>)
+        // so we can still read its tally if the build fails after partial CAS
+        // writes. Without this the only fuel signal for failed background
+        // builds would be lost when no caller is waiting.
+        let build_tracker =
+            fluree_db_core::tracking::Tracker::new(fluree_db_core::tracking::TrackingOptions {
+                track_fuel: true,
+                ..Default::default()
+            });
+        let result = crate::build_index_for_record_with_tracker(
+            content_store,
+            build_tracker.clone(),
+            &record,
+            self.config.clone(),
+        )
+        .await;
 
         match result {
             Ok(index_result) => {
@@ -1028,16 +1058,22 @@ impl BackgroundIndexerWorker {
                 if let Err(e) =
                     crate::publish_index_result(self.nameservice.as_ref(), &index_result).await
                 {
+                    // Surface the build's fuel + index_t on publish failure —
+                    // in background mode there is no caller, so this is the
+                    // only place the (already-paid-for) work shows up.
                     warn!(
-                    ledger_id = %ledger_id,
-                            error = %e,
-                            "Failed to publish index, will retry"
-                        );
+                        ledger_id = %ledger_id,
+                        index_t = index_result.index_t,
+                        fuel = ?index_result.fuel,
+                        error = %e,
+                        "Failed to publish index, will retry"
+                    );
                     self.schedule_retry(ledger_id, &e.to_string()).await;
                 } else {
                     info!(
                     ledger_id = %ledger_id,
                             index_t = index_result.index_t,
+                            fuel = ?index_result.fuel,
                             "Successfully indexed ledger"
                         );
 
@@ -1084,12 +1120,15 @@ impl BackgroundIndexerWorker {
                         });
                     }
 
-                    // Resolve waiters
+                    // Resolve waiters. Coalesced waiters all receive the same
+                    // fuel value — the cost of the single build that
+                    // satisfied them.
                     let mut states = self.states.lock().await;
                     if let Some(state) = states.get_mut(ledger_id) {
                         let outcome = IndexOutcome::Completed {
                             index_t: index_result.index_t,
                             root_id: Some(index_result.root_id.clone()),
+                            fuel: index_result.fuel,
                         };
                         state.resolve_waiters_below(index_result.index_t, outcome);
                         state.last_index_t = index_result.index_t;
@@ -1104,11 +1143,16 @@ impl BackgroundIndexerWorker {
                 }
             }
             Err(e) => {
+                // Partial fuel from CAS writes that happened before the
+                // build failed. Best-effort signal — disabled tracker or
+                // a failure before the first write reports None / 0.
+                let partial_fuel = build_tracker.tally().and_then(|t| t.fuel);
                 warn!(
-                ledger_id = %ledger_id,
-                        error = %e,
-                        "Indexing failed, will retry"
-                    );
+                    ledger_id = %ledger_id,
+                    partial_fuel = ?partial_fuel,
+                    error = %e,
+                    "Indexing failed, will retry"
+                );
                 self.schedule_retry(ledger_id, &e.to_string()).await;
             }
         }
@@ -1273,14 +1317,43 @@ where
         indexer_config.incremental_max_commit_bytes = Some(index_config.reindex_max_bytes);
     }
 
+    // Per-build fuel tracker — the transactor combined path measures but does
+    // not surface fuel back through the transaction response. The resulting
+    // IndexResult.fuel is logged below; callers may also read it via
+    // PostCommitIndexResult.refresh but should not attribute it to their
+    // commit's tracking response.
+    let build_tracker =
+        fluree_db_core::tracking::Tracker::new(fluree_db_core::tracking::TrackingOptions {
+            track_fuel: true,
+            ..Default::default()
+        });
     let build_result = if let Some(record) = current_ns_record(&ledger) {
-        crate::build_index_for_record(cs.clone(), record, indexer_config).await
+        crate::build_index_for_record_with_tracker(
+            cs.clone(),
+            build_tracker,
+            record,
+            indexer_config,
+        )
+        .await
     } else {
-        crate::build_index_for_ledger(cs.clone(), nameservice, &ledger_addr, indexer_config).await
+        crate::build_index_for_ledger_with_tracker(
+            cs.clone(),
+            build_tracker,
+            nameservice,
+            &ledger_addr,
+            indexer_config,
+        )
+        .await
     };
 
     match build_result {
         Ok(result) => {
+            tracing::info!(
+                ledger_id = %ledger_addr,
+                index_t = result.index_t,
+                fuel = ?result.fuel,
+                "post-commit index build complete"
+            );
             // Track publish result but continue regardless
             let publish_result = nameservice
                 .publish_index(&ledger_addr, result.index_t, &result.root_id)
@@ -1356,11 +1429,39 @@ where
         .await
         .map_err(|e| IndexerError::NameService(e.to_string()))?;
 
+    // Per-build fuel tracker — measurement only; the pre-commit refresh path
+    // returns Ok(LedgerState) and so cannot surface fuel back to the caller.
+    // The tally is logged below.
+    let build_tracker =
+        fluree_db_core::tracking::Tracker::new(fluree_db_core::tracking::TrackingOptions {
+            track_fuel: true,
+            ..Default::default()
+        });
     let result = if let Some(record) = current_ns_record(&ledger) {
-        crate::build_index_for_record(cs.clone(), record, indexer_config).await?
+        crate::build_index_for_record_with_tracker(
+            cs.clone(),
+            build_tracker,
+            record,
+            indexer_config,
+        )
+        .await?
     } else {
-        crate::build_index_for_ledger(cs.clone(), nameservice, &ledger_addr, indexer_config).await?
+        crate::build_index_for_ledger_with_tracker(
+            cs.clone(),
+            build_tracker,
+            nameservice,
+            &ledger_addr,
+            indexer_config,
+        )
+        .await?
     };
+
+    tracing::info!(
+        ledger_id = %ledger_addr,
+        index_t = result.index_t,
+        fuel = ?result.fuel,
+        "pre-commit index refresh complete"
+    );
 
     nameservice
         .publish_index(&ledger_addr, result.index_t, &result.root_id)
@@ -2009,6 +2110,7 @@ mod tests {
         let outcome = IndexOutcome::Completed {
             index_t: 5,
             root_id: None,
+            fuel: Some(0.0),
         };
         let cloned = outcome.clone();
         assert!(matches!(cloned, IndexOutcome::Completed { index_t: 5, .. }));

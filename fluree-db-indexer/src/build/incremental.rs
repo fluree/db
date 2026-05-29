@@ -322,6 +322,7 @@ async fn execute_phase2_task(
     task: Phase2Task,
     config: &IndexerConfig,
     content_store: Arc<dyn fluree_db_core::storage::ContentStore>,
+    tracker: fluree_db_core::tracking::Tracker,
     cache_dir: std::path::PathBuf,
 ) -> Result<Phase2TaskOutput> {
     let Phase2Task {
@@ -358,7 +359,7 @@ async fn execute_phase2_task(
                 cache_dir.clone(),
             )
             .await?;
-            upload_leaf_blobs(content_store.as_ref(), &result, &cache_dir).await?;
+            upload_leaf_blobs(content_store.as_ref(), &tracker, &result, &cache_dir).await?;
             Phase2TaskOutput {
                 seq,
                 g_id,
@@ -375,7 +376,7 @@ async fn execute_phase2_task(
         Phase2TaskKind::DefaultFresh => {
             let result =
                 build_fresh_default_graph_v3(&sorted_records, &sorted_ops, order, g_id, config)?;
-            upload_leaf_blobs(content_store.as_ref(), &result, &cache_dir).await?;
+            upload_leaf_blobs(content_store.as_ref(), &tracker, &result, &cache_dir).await?;
             Phase2TaskOutput {
                 seq,
                 g_id,
@@ -406,7 +407,7 @@ async fn execute_phase2_task(
                 cache_dir.clone(),
             )
             .await?;
-            upload_leaf_blobs(content_store.as_ref(), &result, &cache_dir).await?;
+            upload_leaf_blobs(content_store.as_ref(), &tracker, &result, &cache_dir).await?;
             let branch_cid = content_store
                 .put(ContentKind::IndexBranch, &result.branch_bytes)
                 .await
@@ -431,7 +432,7 @@ async fn execute_phase2_task(
         }
         Phase2TaskKind::NamedFresh => {
             let result = build_fresh_named_graph_v3(&sorted_records, order, g_id, config)?;
-            upload_leaf_blobs(content_store.as_ref(), &result, &cache_dir).await?;
+            upload_leaf_blobs(content_store.as_ref(), &tracker, &result, &cache_dir).await?;
             let branch_cid = content_store
                 .put(ContentKind::IndexBranch, &result.branch_bytes)
                 .await
@@ -485,6 +486,7 @@ async fn execute_phase2_task(
 /// incremental conditions are met.
 pub async fn incremental_index(
     content_store: Arc<dyn ContentStore>,
+    tracker: fluree_db_core::tracking::Tracker,
     ledger_id: &str,
     record: &fluree_db_nameservice::NsRecord,
     config: IndexerConfig,
@@ -522,11 +524,13 @@ pub async fn incremental_index(
 
     if novelty.records.is_empty() {
         tracing::debug!("no new records resolved; returning existing V6 root");
+        // fuel is filled in by the outer entry point from the tracker tally.
         return Ok(IndexResult {
             root_id: base_root_id,
             index_t: novelty.max_t,
             ledger_id: ledger_id.to_string(),
             stats: IndexStats::default(),
+            fuel: None,
         });
     }
 
@@ -627,7 +631,10 @@ pub async fn incremental_index(
         .map(|task| {
             let content_store = content_store.clone();
             let cache_dir = cache_dir.clone();
-            async move { execute_phase2_task(task, config_ref, content_store, cache_dir).await }
+            let task_tracker = tracker.clone();
+            async move {
+                execute_phase2_task(task, config_ref, content_store, task_tracker, cache_dir).await
+            }
         })
         .buffer_unordered(concurrency)
         .collect::<Vec<_>>()
@@ -2803,6 +2810,8 @@ pub async fn incremental_index(
                 branch_count: by_graph.len(),
                 total_bytes: root_bytes.len(),
             },
+            // Outer entry point fills fuel from the tracker tally.
+            fuel: None,
         })
     } else {
         let mut final_root = new_root;
@@ -2853,6 +2862,7 @@ pub async fn incremental_index(
                 branch_count: by_graph.len(),
                 total_bytes: root_bytes.len(),
             },
+            fuel: None,
         })
     }
 }
@@ -2864,8 +2874,14 @@ pub async fn incremental_index(
 /// Upload leaf and sidecar blobs from a branch update result.
 ///
 /// Shared by all four code paths: default-graph existing/fresh, named-graph existing/fresh.
+///
+/// `tracker` is used only for the per-leaflet portion of FLI3 leaf fuel
+/// charges. The base per-write fuel is charged automatically by
+/// [`crate::fuel::MeteredContentStore`] when `content_store` is the metered
+/// wrapper.
 async fn upload_leaf_blobs(
     content_store: &dyn ContentStore,
+    tracker: &fluree_db_core::tracking::Tracker,
     result: &BranchUpdateResult,
     cache_dir: &std::path::Path,
 ) -> Result<()> {
@@ -2877,6 +2893,7 @@ async fn upload_leaf_blobs(
             .put(ContentKind::IndexLeaf, &blob.info.leaf_bytes)
             .await
             .map_err(|e| IndexerError::StorageWrite(e.to_string()))?;
+        crate::fuel::charge_extra_leaflets(tracker, blob.info.re_encoded_leaflet_count)?;
         debug_assert!(leaf_cid == blob.info.leaf_cid);
         cache_artifact_bytes(cache_dir, &leaf_cid, &blob.info.leaf_bytes, "index_leaf");
         leaf_bytes += blob.info.leaf_bytes.len() as u64;

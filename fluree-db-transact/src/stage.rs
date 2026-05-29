@@ -14,6 +14,7 @@ use crate::generate::{infer_datatype, FlakeAccumulator, FlakeGenerator};
 use crate::ir::InlineValues;
 use crate::ir::{TemplateTerm, TripleTemplate, Txn, TxnType};
 use crate::namespace::NamespaceRegistry;
+use fluree_db_core::tracking::schedule::TXN_BASELINE_MICRO_FUEL;
 use fluree_db_core::OverlayProvider;
 use fluree_db_core::Tracker;
 use fluree_db_core::{Flake, FlakeValue, GraphId, Sid};
@@ -194,11 +195,11 @@ pub async fn stage(
             }
         }
 
-        // Per-transaction baseline (100 fuel) covering parse, validation,
+        // Per-transaction baseline (10 fuel) covering parse, validation,
         // commit log write, and indexing overhead. Per-flake cost (1 micro-fuel)
         // is charged later against the staged flake set.
         if let Some(tracker) = options.tracker {
-            tracker.consume_fuel(100_000)?;
+            tracker.consume_fuel(TXN_BASELINE_MICRO_FUEL)?;
         }
 
         let new_t = ledger.t() + 1;
@@ -448,11 +449,11 @@ pub async fn stage_flakes(
             }
         }
 
-        // Per-transaction baseline (100 fuel) covering parse, validation,
+        // Per-transaction baseline (10 fuel) covering parse, validation,
         // commit log write, and indexing overhead. Per-flake cost (1 micro-fuel)
         // is charged below.
         if let Some(tracker) = options.tracker {
-            tracker.consume_fuel(100_000)?;
+            tracker.consume_fuel(TXN_BASELINE_MICRO_FUEL)?;
         }
 
         // 2. Build graph routing map.

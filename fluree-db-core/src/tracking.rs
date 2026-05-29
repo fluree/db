@@ -36,6 +36,57 @@ pub fn fuel_to_micro(fuel: f64) -> u64 {
     (fuel * MICRO_FUEL_PER_FUEL as f64).round().max(0.0) as u64
 }
 
+/// Fuel schedule — the central, named source for the engine's structural fuel
+/// charges: the query floor, I/O "touches", the per-row/per-flake rate, and the
+/// transaction baseline. All values are **micro-fuel** (1 fuel = 1000 micro-fuel).
+///
+/// Not (yet) centralized here: per-call expression/function micro-charges
+/// (1–5 µf for hashing, UUID, geo, vector, fulltext, etc.) and R2RML row
+/// charges, which are applied inline at their `eval`/r2rml sites. The public
+/// cost ladder in `docs/query/tracking-and-fuel.md` lists all of them.
+///
+/// To re-scale a charge defined here, change it once and every call site picks
+/// it up. History: I/O "touches" were rescaled from 1000 µf (1.000 fuel) to
+/// 10 µf (0.010 fuel) so scan-dominated queries report fuel proportionate to a
+/// transaction's flat baseline. The per-row/per-flake rate (1 µf) is the floor
+/// of the integer unit and was left unchanged.
+pub mod schedule {
+    /// One-time floor charged once at query entry (before parsing). Guarantees
+    /// a fuel-tracked query reports at least 1.000 fuel and that parse/plan
+    /// errors still reflect a non-zero cost.
+    pub const QUERY_FLOOR_MICRO_FUEL: u64 = 1000;
+
+    /// Per index-leaflet batch read during a binary cursor scan, charged once
+    /// per batch returned regardless of cache state.
+    pub const INDEX_TOUCH_MICRO_FUEL: u64 = 10;
+
+    /// Per persisted forward-dict decode (id → value) during result
+    /// materialization.
+    pub const DICT_TOUCH_MICRO_FUEL: u64 = 10;
+
+    /// Base charge per history-scan leaflet. Per-row costs (base rows +
+    /// in-range sidecar rows, at [`PER_ROW_MICRO_FUEL`] each) are added on top
+    /// at the call site.
+    pub const HISTORY_LEAF_TOUCH_MICRO_FUEL: u64 = 10;
+
+    /// Per row/flake materialized from in-memory state: `db.range` flakes,
+    /// overlay/novelty rows, and history rows. The same 1 µf-per-unit rate also
+    /// applies to staged flakes during transactions and bulk imports, where it
+    /// is charged as a raw count (`flakes.len()`) at those call sites.
+    pub const PER_ROW_MICRO_FUEL: u64 = 1;
+
+    /// Transaction/commit baseline, charged once per `stage` and once per
+    /// bulk-import commit chunk.
+    pub const TXN_BASELINE_MICRO_FUEL: u64 = 10_000;
+
+    /// Per successful indexer CAS write. Charged once per `put`, `put_with_id`,
+    /// or `content_write_bytes` call made by the indexer. For `IndexLeaf` writes
+    /// an additional charge of this same rate is applied per *re-encoded*
+    /// leaflet inside the leaf (passthrough leaflets are byte-copied and not
+    /// charged).
+    pub const INDEX_CAS_WRITE_MICRO_FUEL: u64 = 1000;
+}
+
 /// Tracking options parsed from query `opts`
 #[derive(Debug, Clone, Default)]
 pub struct TrackingOptions {
@@ -285,4 +336,63 @@ pub struct TrackingTally {
 fn format_time_ms(duration: Duration) -> String {
     let ms = duration.as_secs_f64() * 1000.0;
     format!("{ms:.2}ms")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::schedule::*;
+    use super::*;
+
+    fn fuel_tracker(max_fuel: Option<u64>) -> Tracker {
+        Tracker::new(TrackingOptions {
+            track_fuel: true,
+            max_fuel,
+            ..Default::default()
+        })
+    }
+
+    #[test]
+    fn query_floor_reports_one_fuel() {
+        let t = fuel_tracker(None);
+        t.consume_fuel(QUERY_FLOOR_MICRO_FUEL).unwrap();
+        assert_eq!(t.tally().unwrap().fuel, Some(1.0));
+    }
+
+    #[test]
+    fn index_dict_history_touches_are_one_hundredth_fuel() {
+        for touch in [
+            INDEX_TOUCH_MICRO_FUEL,
+            DICT_TOUCH_MICRO_FUEL,
+            HISTORY_LEAF_TOUCH_MICRO_FUEL,
+        ] {
+            let t = fuel_tracker(None);
+            t.consume_fuel(touch).unwrap();
+            assert_eq!(t.tally().unwrap().fuel, Some(0.01), "touch={touch}");
+        }
+    }
+
+    #[test]
+    fn floor_plus_one_touch_reports_one_point_zero_one() {
+        let t = fuel_tracker(None);
+        t.consume_fuel(QUERY_FLOOR_MICRO_FUEL).unwrap();
+        t.consume_fuel(INDEX_TOUCH_MICRO_FUEL).unwrap();
+        assert_eq!(t.tally().unwrap().fuel, Some(1.01));
+    }
+
+    #[test]
+    fn floor_exceeds_max_fuel_below_one() {
+        // max-fuel: 0.5 leaves no room for the 1.000 floor.
+        let t = fuel_tracker(Some(fuel_to_micro(0.5)));
+        let err = t.consume_fuel(QUERY_FLOOR_MICRO_FUEL).unwrap_err();
+        assert_eq!(err.limit_fuel(), 0.5);
+        assert_eq!(err.used_fuel(), 1.0);
+    }
+
+    #[test]
+    fn max_fuel_one_admits_floor_but_not_a_touch() {
+        // max-fuel: 1 permits exactly the floor; the next persisted touch fails.
+        let t = fuel_tracker(Some(fuel_to_micro(1.0)));
+        t.consume_fuel(QUERY_FLOOR_MICRO_FUEL).unwrap();
+        assert!(t.consume_fuel(INDEX_TOUCH_MICRO_FUEL).is_err());
+    }
 }

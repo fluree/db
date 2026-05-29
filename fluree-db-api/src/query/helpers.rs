@@ -2,6 +2,7 @@ use std::sync::Arc;
 
 use serde_json::Value as JsonValue;
 
+use crate::view::QueryInput;
 use crate::{
     ApiError, Batch, DatasetSpec, ExecutableQuery, OverlayProvider, QueryConnectionOptions, Result,
     Tracker, TrackingOptions, VarRegistry,
@@ -219,6 +220,40 @@ pub(crate) fn tracker_for_tracked_endpoint(query_json: &JsonValue) -> Tracker {
         Tracker::new(tracking)
     } else {
         Tracker::new(TrackingOptions::all_enabled())
+    }
+}
+
+/// Charge the one-time query floor at execution entry.
+///
+/// Every fuel-tracked query is charged [`schedule::QUERY_FLOOR_MICRO_FUEL`]
+/// once, before parsing, so that (a) a successful query always reports at least
+/// 1.000 fuel, (b) a parse/plan error with tracking still reports the floor, and
+/// (c) the floor counts toward any `max-fuel` budget. No-op when fuel isn't
+/// tracked (disabled tracker or `track_fuel == false`), since `consume_fuel`
+/// short-circuits in that case.
+///
+/// Returns the same `FuelExceededError` a mid-execution overrun would, so a
+/// `max-fuel` below the floor is rejected up front.
+pub(crate) fn charge_query_floor(
+    tracker: &Tracker,
+) -> std::result::Result<(), fluree_db_core::FuelExceededError> {
+    tracker.consume_fuel(fluree_db_core::tracking::schedule::QUERY_FLOOR_MICRO_FUEL)
+}
+
+/// Tracker for a "tracked" query path: an explicit `tracking_override` if given,
+/// otherwise the per-input default — opts-derived for JSON-LD, all-enabled for
+/// SPARQL (which has no `opts` carrier). This is the single derivation shared by
+/// the view/dataset tracked entry points and [`floor_only_tally`].
+pub(crate) fn tracked_query_tracker(
+    input: &QueryInput<'_>,
+    tracking_override: &Option<TrackingOptions>,
+) -> Tracker {
+    match tracking_override {
+        Some(opts) => Tracker::new(opts.clone()),
+        None => match input {
+            QueryInput::JsonLd(json) => tracker_for_tracked_endpoint(json),
+            QueryInput::Sparql(_) => Tracker::new(TrackingOptions::all_enabled()),
+        },
     }
 }
 

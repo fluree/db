@@ -274,7 +274,7 @@ impl BinaryHistoryScanOperator {
                             };
                             let base_rows = leaflet.row_count as u64;
                             ctx.tracker.consume_fuel(
-                                1000u64
+                                fluree_db_core::tracking::schedule::HISTORY_LEAF_TOUCH_MICRO_FUEL
                                     .saturating_add(sidecar_rows)
                                     .saturating_add(base_rows),
                             )?;
@@ -407,7 +407,10 @@ impl BinaryHistoryScanOperator {
                             return;
                         }
                     }
-                    if let Err(e) = ctx.tracker.consume_fuel(1) {
+                    if let Err(e) = ctx
+                        .tracker
+                        .consume_fuel(fluree_db_core::tracking::schedule::PER_ROW_MICRO_FUEL)
+                    {
                         fuel_err = Some(e);
                         return;
                     }

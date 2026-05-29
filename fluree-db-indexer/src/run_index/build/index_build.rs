@@ -70,6 +70,10 @@ pub struct PersistedLeafInfo {
     pub total_rows: u64,
     pub first_key: fluree_db_binary_index::format::run_record_v2::RunRecordV2,
     pub last_key: fluree_db_binary_index::format::run_record_v2::RunRecordV2,
+    /// See [`LeafInfo::re_encoded_leaflet_count`]. Carried through the
+    /// rebuild's spool-to-disk step so the upload step can charge the
+    /// correct per-leaflet fuel.
+    pub re_encoded_leaflet_count: u32,
 }
 
 /// Result for a single graph's V2 index build.
@@ -280,6 +284,7 @@ pub(crate) fn finish_graph_v2(
                 total_rows,
                 first_key,
                 last_key,
+                re_encoded_leaflet_count,
             } = info;
 
             let leaf_path = graph_dir.join(leaf_cid.to_string());
@@ -307,6 +312,7 @@ pub(crate) fn finish_graph_v2(
                 total_rows,
                 first_key,
                 last_key,
+                re_encoded_leaflet_count,
             })
         })
         .collect::<io::Result<Vec<_>>>()?;

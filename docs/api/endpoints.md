@@ -2409,7 +2409,8 @@ curl -X POST http://localhost:8090/v1/fluree/reindex \
     "leaf_count": 614,
     "branch_count": 23,
     "total_bytes": 47185920
-  }
+  },
+  "fuel": 1734.0
 }
 ```
 
@@ -2422,6 +2423,7 @@ curl -X POST http://localhost:8090/v1/fluree/reindex \
 | `stats.leaf_count` | Number of leaf nodes written |
 | `stats.branch_count` | Number of branch nodes written |
 | `stats.total_bytes` | Bytes written to storage during the reindex |
+| `fuel` | Total decimal fuel charged for the reindex's CAS writes (1.000 per write + 1.000 per re-encoded leaflet in FLI3 leaves). `0.0` if the index was already current. See [Tracking and Fuel](../query/tracking-and-fuel.md#indexing-fuel) for the full schedule. |
 
 **Status Codes:**
 - `200 OK` — reindex complete
