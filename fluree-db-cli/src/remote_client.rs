@@ -803,11 +803,24 @@ impl RemoteLedgerClient {
         &self,
         envelope: &serde_json::Value,
     ) -> Result<serde_json::Value, RemoteLedgerError> {
+        self.multi_query_with_headers(envelope, &[]).await
+    }
+
+    /// Execute a multi-query envelope with extra request headers (e.g.
+    /// `fluree-output-format`, `fluree-normalize-arrays`). Mirrors
+    /// [`Self::multi_query`] but attaches caller-supplied headers so the
+    /// server can pick the per-alias [`FormatterConfig`].
+    pub async fn multi_query_with_headers(
+        &self,
+        envelope: &serde_json::Value,
+        extra_headers: &[(&'static str, String)],
+    ) -> Result<serde_json::Value, RemoteLedgerError> {
         let url = self.op_url_root("multi-query");
-        self.send_json(
+        self.send_json_with_headers(
             reqwest::Method::POST,
             &url,
             "application/json",
+            extra_headers,
             Some(RequestBody::Json(envelope)),
         )
         .await

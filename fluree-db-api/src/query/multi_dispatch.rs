@@ -31,9 +31,26 @@
 //! let fluree: Arc<Fluree> = Arc::new(FlureeBuilder::memory().build_memory());
 //! let response = fluree.multi_query()
 //!     .envelope(envelope)
+//!     .format(FormatterConfig::typed_json().with_normalize_arrays())
 //!     .execute()
 //!     .await?;
 //! ```
+//!
+//! `.format(...)` is optional. Without it, JSON-LD aliases format as
+//! JSON-LD and SPARQL aliases as SPARQL Results JSON. When set, the
+//! format reaches each alias according to its shape:
+//!
+//! - `TypedJson`, `SparqlJson`, `AgentJson` — applied to **every** alias
+//!   (these are cross-language shapes by design).
+//! - `JsonLd` — applied to JSON-LD aliases; SPARQL aliases keep their
+//!   SPARQL Results JSON default. This is what makes the CLI's
+//!   `--normalize-arrays` (a JsonLd + normalize_arrays config) compose
+//!   cleanly with mixed-language envelopes.
+//! - `Tsv` / `Csv` / `SparqlXml` / `RdfXml` — rejected at `.execute()`
+//!   with [`MultiQueryError::UnsupportedFormat`]: the envelope's `results`
+//!   map can only carry JSON values.
+//!
+//! See [`MultiQueryBuilder::format`] for the full table.
 //!
 //! Downstream consumers (HTTP servers, custom dispatchers) can also
 //! call [`run_envelope`] directly if they want to skip the builder.
@@ -46,6 +63,7 @@ use tokio::sync::Semaphore;
 use tokio::task::JoinSet;
 use tracing::Instrument;
 
+use crate::format::{FormatterConfig, OutputFormat};
 use crate::query::multi::{
     apply_sparql_context, merged_context, merged_opts, validate_envelope, MultiQueryBounds,
     MultiQueryRequest, MultiQueryResponse, MultiQuerySubquery, MultiQueryValidationError,
@@ -86,6 +104,32 @@ pub enum MultiQueryError {
     /// before `.execute()`.
     #[error("multi-query envelope was not provided before execute()")]
     EnvelopeRequired,
+    /// The supplied [`FormatterConfig`] produces a non-JSON output
+    /// (TSV / CSV / SPARQL XML / RDF XML). A multi-query envelope
+    /// embeds each alias's result inside a JSON response object, so
+    /// only JSON-producing formats are valid here.
+    #[error(
+        "format {format:?} produces non-JSON output and cannot be used inside a multi-query envelope; \
+         supported formats: JsonLd, SparqlJson, TypedJson, AgentJson"
+    )]
+    UnsupportedFormat { format: OutputFormat },
+}
+
+/// Whether a [`FormatterConfig`] produces JSON output that can be embedded
+/// inside the multi-query envelope's `results` map.
+///
+/// JSON-producing formats (`JsonLd`, `SparqlJson`, `TypedJson`, `AgentJson`)
+/// are accepted; anything that produces a bytes-/string-shaped payload
+/// (`Tsv`, `Csv`, `SparqlXml`, `RdfXml`) is rejected — those need a
+/// designed per-alias binary response story that doesn't exist in v1.
+fn is_json_output_format(format: OutputFormat) -> bool {
+    matches!(
+        format,
+        OutputFormat::JsonLd
+            | OutputFormat::SparqlJson
+            | OutputFormat::TypedJson
+            | OutputFormat::AgentJson
+    )
 }
 
 // =============================================================================
@@ -199,6 +243,7 @@ pub struct MultiQueryBuilder {
     fluree: Arc<Fluree>,
     envelope: Option<MultiQueryRequest>,
     bounds: MultiQueryBounds,
+    format: Option<FormatterConfig>,
 }
 
 impl MultiQueryBuilder {
@@ -207,6 +252,7 @@ impl MultiQueryBuilder {
             fluree,
             envelope: None,
             bounds: MultiQueryBounds::DEFAULT,
+            format: None,
         }
     }
 
@@ -224,6 +270,38 @@ impl MultiQueryBuilder {
         self
     }
 
+    /// Apply this [`FormatterConfig`] as the envelope-wide default
+    /// output format. Matches the single-query `.format(...)` vocabulary
+    /// on [`crate::query::builder::FromQueryBuilder`].
+    ///
+    /// # How the format reaches each alias
+    ///
+    /// The envelope's `results` map is always JSON, so only JSON-producing
+    /// [`OutputFormat`] values are valid here. Their treatment differs by
+    /// design:
+    ///
+    /// | [`OutputFormat`]     | JSON-LD aliases    | SPARQL aliases                                     |
+    /// |----------------------|--------------------|----------------------------------------------------|
+    /// | `TypedJson`          | applies            | applies (cross-language typed shape)               |
+    /// | `SparqlJson`         | applies            | applies (cross-language SPARQL Results JSON shape) |
+    /// | `AgentJson`          | applies            | applies (cross-language agent envelope)            |
+    /// | `JsonLd`             | applies            | **skipped** — SPARQL Results JSON default kept     |
+    /// | `Tsv` / `Csv` / `SparqlXml` / `RdfXml` | rejected at [`Self::execute`] with [`MultiQueryError::UnsupportedFormat`] | rejected |
+    ///
+    /// `JsonLd` is treated as a JSON-LD-language shape: applying it to a
+    /// SPARQL `SELECT` alias would silently swap out SPARQL Results JSON
+    /// for the JSON-LD shape, which is rarely what the caller wants.
+    /// This is also why the CLI's `--normalize-arrays` (which builds a
+    /// `JsonLd` + `normalize_arrays` config) only affects JSON-LD aliases
+    /// without rejecting mixed-language envelopes.
+    ///
+    /// Without a call, defaults stay as today: JSON-LD aliases format
+    /// as JSON-LD, SPARQL aliases format as SPARQL Results JSON.
+    pub fn format(mut self, config: FormatterConfig) -> Self {
+        self.format = Some(config);
+        self
+    }
+
     /// Execute the envelope and return the assembled response.
     ///
     /// Validates → resolves the snapshot → dispatches sub-queries in
@@ -233,7 +311,12 @@ impl MultiQueryBuilder {
     /// `Err(MultiQueryError)`.
     pub async fn execute(self) -> Result<MultiQueryResponse, MultiQueryError> {
         let envelope = self.envelope.ok_or(MultiQueryError::EnvelopeRequired)?;
-        run_envelope(self.fluree, envelope, &self.bounds).await
+        if let Some(cfg) = self.format.as_ref() {
+            if !is_json_output_format(cfg.format) {
+                return Err(MultiQueryError::UnsupportedFormat { format: cfg.format });
+            }
+        }
+        run_envelope(self.fluree, envelope, &self.bounds, self.format).await
     }
 }
 
@@ -281,6 +364,7 @@ pub(crate) async fn run_envelope(
     fluree: Arc<Fluree>,
     envelope: MultiQueryRequest,
     bounds: &MultiQueryBounds,
+    default_format: Option<FormatterConfig>,
 ) -> Result<MultiQueryResponse, MultiQueryError> {
     // Envelope wall-clock starts here so meta.elapsed_ms reflects the
     // full pipeline the client observes: validation, snapshot
@@ -301,7 +385,14 @@ pub(crate) async fn run_envelope(
     let include_meta = envelope_meta_enabled(envelope.opts.as_ref());
     let config = DispatchConfig::from_envelope(&envelope, bounds);
 
-    let outcomes = dispatch_subqueries(fluree, envelope, Arc::clone(&snapshot), config).await;
+    let outcomes = dispatch_subqueries(
+        fluree,
+        envelope,
+        Arc::clone(&snapshot),
+        config,
+        default_format,
+    )
+    .await;
     let elapsed_ms = started.elapsed().as_millis().min(u64::MAX as u128) as u64;
 
     let response = assemble_response(
@@ -330,9 +421,11 @@ async fn dispatch_subqueries(
     envelope: MultiQueryRequest,
     snapshot: Arc<EnvelopeSnapshot>,
     config: DispatchConfig,
+    default_format: Option<FormatterConfig>,
 ) -> Vec<AliasOutcome> {
     let envelope_context = Arc::new(envelope.context.clone());
     let envelope_opts = Arc::new(envelope.opts.clone());
+    let envelope_format = Arc::new(default_format);
 
     let semaphore = Arc::new(Semaphore::new(config.max_concurrency));
     let deadline = Instant::now() + Duration::from_millis(config.envelope_timeout_ms);
@@ -345,6 +438,7 @@ async fn dispatch_subqueries(
         let snapshot = Arc::clone(&snapshot);
         let envelope_context = Arc::clone(&envelope_context);
         let envelope_opts = Arc::clone(&envelope_opts);
+        let envelope_format = Arc::clone(&envelope_format);
         let semaphore = Arc::clone(&semaphore);
 
         let span = tracing::debug_span!(
@@ -389,6 +483,7 @@ async fn dispatch_subqueries(
                     sub,
                     envelope_context.as_ref().as_ref(),
                     envelope_opts.as_ref().as_ref(),
+                    envelope_format.as_ref().as_ref(),
                     snapshot.as_ref(),
                 );
                 let kind = match tokio::time::timeout(effective, exec).await {
@@ -503,6 +598,7 @@ async fn execute_subquery(
     sub: MultiQuerySubquery,
     envelope_context: Option<&JsonValue>,
     envelope_opts: Option<&JsonValue>,
+    envelope_format: Option<&FormatterConfig>,
     snapshot: &EnvelopeSnapshot,
 ) -> crate::Result<SubqueryOutput> {
     // Three-layer opts merge with body opts winning. The body layer is
@@ -552,7 +648,7 @@ async fn execute_subquery(
 
             apply_snapshot_to_jsonld(&mut query_body, snapshot);
 
-            run_jsonld_subquery(fluree, &query_body).await
+            run_jsonld_subquery(fluree, &query_body, envelope_format.cloned()).await
         }
         SubqueryLanguage::Sparql => {
             let sparql = sub.query.as_str().unwrap_or_default();
@@ -570,7 +666,28 @@ async fn execute_subquery(
             } else {
                 None
             };
-            run_sparql_subquery(fluree, &with_snapshot, tracking).await
+            // Envelope formats fall into two classes for SPARQL aliases:
+            //
+            // - **Cross-language shapes** (`TypedJson`, `SparqlJson`,
+            //   `AgentJson`): the caller consciously picked a unified
+            //   output shape. Apply it to SPARQL aliases too.
+            // - **JSON-LD shape** (`JsonLd`, with or without
+            //   `normalize_arrays`): would coerce SELECT results out of
+            //   SPARQL Results JSON for no clear gain — and silently
+            //   change the SPARQL alias's wire shape away from the
+            //   per-language default the caller expects. Skip it; the
+            //   SPARQL builder's default (SPARQL Results JSON) takes
+            //   over.
+            //
+            // This keeps `--normalize-arrays` (which on the CLI maps to
+            // `FormatterConfig::jsonld().with_normalize_arrays()`)
+            // applying ONLY to JSON-LD aliases, matching the CLI's
+            // documented "normalize-arrays applies to JSON-LD aliases"
+            // semantics without rejecting mixed envelopes.
+            let sparql_format = envelope_format
+                .filter(|cfg| !matches!(cfg.format, OutputFormat::JsonLd))
+                .cloned();
+            run_sparql_subquery(fluree, &with_snapshot, tracking, sparql_format).await
         }
     }
 }

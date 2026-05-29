@@ -25,7 +25,7 @@ use std::sync::Arc;
 
 use fluree_db_api::query::multi::{MultiQueryBounds, MultiQueryRequest, MultiQueryStatus};
 use fluree_db_api::query::multi_dispatch::MultiQueryError;
-use fluree_db_api::FlureeBuilder;
+use fluree_db_api::{FlureeBuilder, FormatterConfig};
 use serde_json::json;
 use support::{genesis_ledger, MemoryFluree, MemoryLedger};
 
@@ -394,5 +394,184 @@ async fn multi_query_builder_bounds_override_is_threaded_through() {
     assert!(
         matches!(err, MultiQueryError::ResponseAssembly(_)),
         "expected ResponseAssembly error from oversized response, got: {err:?}"
+    );
+}
+
+// =============================================================================
+// Output formatting (envelope-default `.format(...)`)
+// =============================================================================
+
+#[tokio::test]
+async fn multi_query_builder_typed_json_format_applies_to_jsonld_alias() {
+    // `.format(FormatterConfig::typed_json())` on the envelope builder
+    // should make every JSON-LD alias's result use the typed-value shape
+    // (`@value` / `@type` on literals, `@id` on IRIs). Confirms the
+    // envelope-default format actually reaches the JSON-LD sub-query
+    // execution path.
+    let fluree = Arc::new(FlureeBuilder::memory().build_memory());
+    ignore_ledgers(seed_two_ledgers(&fluree).await);
+
+    let envelope: MultiQueryRequest = serde_json::from_value(json!({
+        "@context": { "schema": "http://schema.org/" },
+        "queries": {
+            "people": {
+                "language": "jsonld",
+                "query": { "from": "mq:users",
+                           "select": ["?n"],
+                           "where": { "@id": "?u", "schema:name": "?n" } }
+            }
+        }
+    }))
+    .expect("envelope deserialises");
+
+    let response = fluree
+        .multi_query()
+        .envelope(envelope)
+        .format(FormatterConfig::typed_json())
+        .execute()
+        .await
+        .expect("envelope executes");
+
+    assert_eq!(response.status, MultiQueryStatus::Ok);
+    // TypedJson wraps literals in {"@value": ..., "@type": ...} objects.
+    let dump = serde_json::to_string(&response.results["people"]).unwrap();
+    assert!(
+        dump.contains("@value"),
+        "TypedJson alias should emit @value-shaped literals, got: {dump}"
+    );
+}
+
+#[tokio::test]
+async fn multi_query_builder_rejects_non_json_format() {
+    // `.format(FormatterConfig::tsv())` produces byte-shaped output that
+    // can't be carried inside the JSON envelope. `.execute()` should
+    // surface this as `MultiQueryError::UnsupportedFormat` before any
+    // sub-query dispatches, so the typo cost stays cheap.
+    let fluree = Arc::new(FlureeBuilder::memory().build_memory());
+    ignore_ledgers(seed_two_ledgers(&fluree).await);
+
+    let envelope: MultiQueryRequest = serde_json::from_value(json!({
+        "@context": { "schema": "http://schema.org/" },
+        "queries": {
+            "a": {
+                "language": "jsonld",
+                "query": { "from": "mq:users",
+                           "select": ["?n"],
+                           "where": { "@id": "?u", "schema:name": "?n" } }
+            }
+        }
+    }))
+    .expect("envelope deserialises");
+
+    let err = fluree
+        .multi_query()
+        .envelope(envelope)
+        .format(FormatterConfig::tsv())
+        .execute()
+        .await
+        .expect_err("TSV format should be rejected");
+
+    assert!(
+        matches!(err, MultiQueryError::UnsupportedFormat { .. }),
+        "expected UnsupportedFormat error, got: {err:?}"
+    );
+}
+
+#[tokio::test]
+async fn multi_query_jsonld_normalize_arrays_does_not_change_sparql_alias_shape() {
+    // Regression: `.format(FormatterConfig::jsonld().with_normalize_arrays())`
+    // on the envelope must apply ONLY to JSON-LD aliases. SPARQL aliases keep
+    // their default SPARQL Results JSON shape (`{ head, results: { bindings } }`).
+    // The CLI's `--normalize-arrays` flag relies on this — it builds a JsonLd
+    // formatter config, and the dispatcher is responsible for routing it
+    // per-language.
+    let fluree = Arc::new(FlureeBuilder::memory().build_memory());
+    ignore_ledgers(seed_two_ledgers(&fluree).await);
+
+    let envelope: MultiQueryRequest = serde_json::from_value(json!({
+        "@context": { "schema": "http://schema.org/" },
+        "queries": {
+            "jsonld_alias": {
+                "language": "jsonld",
+                "query": { "from": "mq:users",
+                           "select": ["?n"],
+                           "where": { "@id": "?u", "schema:name": "?n" } }
+            },
+            "sparql_alias": {
+                "language": "sparql",
+                "query": "SELECT ?n FROM <mq:users> WHERE { ?u schema:name ?n }"
+            }
+        }
+    }))
+    .expect("envelope deserialises");
+
+    let response = fluree
+        .multi_query()
+        .envelope(envelope)
+        .format(FormatterConfig::jsonld().with_normalize_arrays())
+        .execute()
+        .await
+        .expect("envelope executes");
+
+    assert_eq!(response.status, MultiQueryStatus::Ok);
+
+    // SPARQL alias keeps SPARQL Results JSON shape — `head` + `results.bindings`
+    // are the canonical SPARQL JSON markers; their absence here would mean
+    // the dispatcher coerced the SPARQL result through the JsonLd formatter.
+    let sparql_result = &response.results["sparql_alias"];
+    assert!(
+        sparql_result.get("head").is_some(),
+        "SPARQL alias should keep SPARQL Results JSON shape; got: {sparql_result}"
+    );
+    assert!(
+        sparql_result
+            .get("results")
+            .and_then(|r| r.get("bindings"))
+            .is_some(),
+        "SPARQL alias should keep SPARQL Results JSON shape; got: {sparql_result}"
+    );
+
+    // JSON-LD alias did receive the envelope format — the rows are an
+    // array (JSON-LD shape), not a SPARQL Results JSON envelope.
+    let jsonld_result = &response.results["jsonld_alias"];
+    assert!(
+        jsonld_result.is_array(),
+        "JSON-LD alias should keep JSON-LD shape; got: {jsonld_result}"
+    );
+}
+
+#[tokio::test]
+async fn multi_query_builder_default_format_unchanged_without_format_call() {
+    // No `.format(...)` call → JSON-LD aliases continue to format as
+    // JSON-LD (no `@value` wrapping). Regression guard so threading
+    // the new builder option through the dispatcher doesn't silently
+    // change the per-alias default for existing callers.
+    let fluree = Arc::new(FlureeBuilder::memory().build_memory());
+    ignore_ledgers(seed_two_ledgers(&fluree).await);
+
+    let envelope: MultiQueryRequest = serde_json::from_value(json!({
+        "@context": { "schema": "http://schema.org/" },
+        "queries": {
+            "people": {
+                "language": "jsonld",
+                "query": { "from": "mq:users",
+                           "select": ["?n"],
+                           "where": { "@id": "?u", "schema:name": "?n" } }
+            }
+        }
+    }))
+    .expect("envelope deserialises");
+
+    let response = fluree
+        .multi_query()
+        .envelope(envelope)
+        .execute()
+        .await
+        .expect("envelope executes");
+
+    let dump = serde_json::to_string(&response.results["people"]).unwrap();
+    assert!(
+        !dump.contains("@value"),
+        "default format should NOT wrap literals in @value, got: {dump}"
     );
 }

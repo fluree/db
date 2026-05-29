@@ -236,6 +236,14 @@ matching `/query`'s behavior), *not* a per-alias error.
 
 **Envelope-resident knobs replace some single-query CLI flags.** Multi-query doesn't take `--at` (use envelope-level `asOf`) or `--track-*` / `--max-fuel` (use envelope-level `opts.meta` and per-sub-query `opts.max-fuel`). It **does** accept the full `--policy*` flag bundle (`--as`, `--policy-class`, `--policy`, `--policy-file`, `--policy-values`, `--policy-values-file`, `--default-allow`) — the same surface `fluree query` exposes. The headers ride through the transport identically; each sub-query carries its own `from`, so policy applies per-ledger via the standard server-side policy path. See [Multi-query envelope](../api/multi-query.md) for the full envelope contract, response shape, merge rules, bounds, and current limitations (history queries rejected, envelope `max-fuel` rejected, response cap enforced at assembly, SPARQL policy parity gap).
 
+**Output formatting** uses two independent CLI flags:
+
+- `--format json|typed-json` selects the per-alias result shape (server-side formatter applied to each alias's entry inside `results`). Mirrors the `--format` flag on `fluree query`.
+- `--normalize-arrays` wraps single-valued JSON-LD properties in arrays. Composes with `--format` on JSON-LD aliases; on SPARQL aliases it is a no-op (SPARQL Results JSON has its own binding shape).
+- `--output json|pretty|aliases` controls how the CLI prints the response **envelope** on the terminal; it doesn't affect alias results.
+
+On the wire, `--format` / `--normalize-arrays` ride as `Fluree-Output-Format` / `Fluree-Normalize-Arrays` headers when going through `--remote` or auto-route; the in-process path wires them straight into the api crate's `MultiQueryBuilder::format(...)`. The server reads them with precedence `Fluree-Output-Format > Fluree-Normalize-Arrays alone > Accept-header content negotiation`. Unknown `Fluree-Output-Format` values return **400 Bad Request**; `Accept` values that produce byte/string payloads (TSV / CSV / SPARQL XML / RDF XML) return **406 Not Acceptable** when no explicit `Fluree-Output-Format` is set. `--format typed-json` is cross-language (applied to every alias); `--format json` (the default) keeps SPARQL aliases on SPARQL Results JSON. See [Multi-query envelope → Output formatting](../api/multi-query.md#output-formatting) for the full table.
+
 ### `fluree branch list` (read-only)
 
 - `GET {api_base_url}/branch/{ledger}` — note **singular** `branch`, ledger is a

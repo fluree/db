@@ -10,6 +10,7 @@
 //! a test fixture can run one sub-query at a time without involving the
 //! envelope dispatcher.
 
+use crate::format::FormatterConfig;
 use crate::{ApiError, Fluree, Result, TrackingOptions, TrackingTally};
 use serde_json::Value as JsonValue;
 
@@ -45,14 +46,20 @@ pub struct SubqueryOutput {
 ///
 /// Tracking is enabled implicitly when the query body's `opts` carry a
 /// recognised tracking trigger (matches the single-query convention).
+///
+/// `format` overrides the default per-language output format when set.
+/// `None` preserves the original JSON-LD default.
 pub async fn run_jsonld_subquery(
     fluree: &Fluree,
     query_json: &JsonValue,
+    format: Option<FormatterConfig>,
 ) -> Result<SubqueryOutput> {
     if has_tracking_opts(query_json) {
-        let response = fluree
-            .query_from()
-            .jsonld(query_json)
+        let mut builder = fluree.query_from().jsonld(query_json);
+        if let Some(cfg) = format {
+            builder = builder.format(cfg);
+        }
+        let response = builder
             .execute_tracked()
             .await
             .map_err(|e| ApiError::http(e.status, e.error))?;
@@ -66,11 +73,11 @@ pub async fn run_jsonld_subquery(
             tally: Some(tally),
         })
     } else {
-        let data = fluree
-            .query_from()
-            .jsonld(query_json)
-            .execute_formatted()
-            .await?;
+        let mut builder = fluree.query_from().jsonld(query_json);
+        if let Some(cfg) = format {
+            builder = builder.format(cfg);
+        }
+        let data = builder.execute_formatted().await?;
         Ok(SubqueryOutput { data, tally: None })
     }
 }
@@ -85,16 +92,21 @@ pub async fn run_jsonld_subquery(
 /// `tracking` accepts the full [`TrackingOptions`] surface (selective
 /// `meta` flags, `max_fuel`). `None` runs the non-tracked builder path;
 /// `Some(opts)` runs the tracked path with those options applied.
+///
+/// `format` overrides the default per-language output format when set.
+/// `None` preserves the original SPARQL Results JSON default.
 pub async fn run_sparql_subquery(
     fluree: &Fluree,
     sparql: &str,
     tracking: Option<TrackingOptions>,
+    format: Option<FormatterConfig>,
 ) -> Result<SubqueryOutput> {
     if let Some(opts) = tracking {
-        let response = fluree
-            .query_from()
-            .sparql(sparql)
-            .tracking(opts)
+        let mut builder = fluree.query_from().sparql(sparql).tracking(opts);
+        if let Some(cfg) = format {
+            builder = builder.format(cfg);
+        }
+        let response = builder
             .execute_tracked()
             .await
             .map_err(|e| ApiError::http(e.status, e.error))?;
@@ -108,11 +120,11 @@ pub async fn run_sparql_subquery(
             tally: Some(tally),
         })
     } else {
-        let data = fluree
-            .query_from()
-            .sparql(sparql)
-            .execute_formatted()
-            .await?;
+        let mut builder = fluree.query_from().sparql(sparql);
+        if let Some(cfg) = format {
+            builder = builder.format(cfg);
+        }
+        let data = builder.execute_formatted().await?;
         Ok(SubqueryOutput { data, tally: None })
     }
 }

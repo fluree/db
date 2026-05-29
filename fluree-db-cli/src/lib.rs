@@ -278,6 +278,8 @@ pub async fn run(cli: Cli) -> error::CliResult<()> {
             expr,
             file,
             format,
+            normalize_arrays,
+            output,
             remote,
             policy,
         } => {
@@ -287,6 +289,8 @@ pub async fn run(cli: Cli) -> error::CliResult<()> {
                 expr.as_deref(),
                 file.as_deref(),
                 &format,
+                normalize_arrays,
+                &output,
                 &fluree_dir,
                 remote.as_deref(),
                 direct,

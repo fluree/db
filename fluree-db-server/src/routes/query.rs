@@ -2501,7 +2501,7 @@ async fn execute_dataset_query(
     // the same path the multi-query dispatcher uses for each sub-query alias.
     let tracked = has_tracking_opts(&query);
     let outcome =
-        fluree_db_api::query::multi_run::run_jsonld_subquery(state.fluree.as_ref(), &query)
+        fluree_db_api::query::multi_run::run_jsonld_subquery(state.fluree.as_ref(), &query, None)
             .await
             .map_err(|e| {
                 let server_error = ServerError::Api(e);
@@ -2608,6 +2608,26 @@ pub async fn multi_query(
             ));
         }
 
+        // Negotiate output format from request headers. Multi-query
+        // assembles each alias's result inside a JSON envelope, so
+        // byte-/string-shaped formats (TSV/CSV/SPARQL XML/RDF/XML) are
+        // rejected with 406; unknown `Fluree-Output-Format` values are
+        // rejected with 400. Tag the span with the error class that
+        // actually fired (not a constant) so trace dashboards filter
+        // correctly.
+        let envelope_format = match negotiate_multi_query_format(&headers) {
+            Ok(f) => f,
+            Err(err) => {
+                let code = match &err {
+                    ServerError::NotAcceptable(_) => "error:NotAcceptable",
+                    ServerError::BadRequest(_) => "error:BadRequest",
+                    _ => "error:NotAcceptable",
+                };
+                set_span_error_code(&span, code);
+                return Err(err);
+            }
+        };
+
         // Parse envelope body via credential to honor JWS-wrapped requests.
         let body: JsonValue = credential.body_json()?;
         let mut envelope: MultiQueryRequest = serde_json::from_value(body).map_err(|e| {
@@ -2697,14 +2717,11 @@ pub async fn multi_query(
         // resolve snapshot → dispatch → assemble. Per-alias outcomes
         // are folded into the response body; only envelope-level
         // failures bubble up as `MultiQueryError`.
-        let response = match state
-            .fluree
-            .multi_query()
-            .envelope(envelope)
-            .bounds(bounds)
-            .execute()
-            .await
-        {
+        let mut builder = state.fluree.multi_query().envelope(envelope).bounds(bounds);
+        if let Some(cfg) = envelope_format {
+            builder = builder.format(cfg);
+        }
+        let response = match builder.execute().await {
             Ok(r) => r,
             Err(MultiQueryError::Validation(err)) => {
                 set_span_error_code(&span, "error:BadRequest");
@@ -2725,6 +2742,13 @@ pub async fn multi_query(
                     "multi-query envelope was not provided to the dispatcher".to_string(),
                 ));
             }
+            Err(MultiQueryError::UnsupportedFormat { format }) => {
+                set_span_error_code(&span, "error:NotAcceptable");
+                return Err(ServerError::not_acceptable(format!(
+                    "multi-query format {format:?} produces non-JSON output \
+                     and cannot be used inside a multi-query envelope"
+                )));
+            }
         };
 
         tracing::info!(
@@ -2744,6 +2768,113 @@ fn validation_error_to_server(err: &MultiQueryValidationError) -> ServerError {
     let msg = err.to_string();
     // Validation errors are always client-fault — surface as 4xx.
     ServerError::bad_request(msg)
+}
+
+/// Negotiate the per-alias output format from the request headers.
+///
+/// Precedence (most specific wins):
+///
+/// 1. **`Fluree-Output-Format` header** — opt-in fluree-specific selector
+///    that mirrors the CLI's `--format` flag (`json` | `typed-json`).
+///    `Fluree-Normalize-Arrays: true` layers on top of either value, the
+///    same as `fluree query --format ... --normalize-arrays`.
+/// 2. **`Accept` header** — standard HTTP content negotiation.
+///    `application/vnd.fluree.agent+json` selects
+///    [`FormatterConfig::agent_json`] (honouring `Fluree-Max-Bytes`).
+/// 3. **Default** — no format set, so the api crate's per-language
+///    defaults (JSON-LD aliases → JSON-LD, SPARQL aliases → SPARQL JSON).
+///
+/// Byte-/string-shaped Accept values (TSV/CSV/SPARQL XML/RDF XML) are
+/// explicit requests for a shape the envelope cannot satisfy — reject
+/// with 406 Not Acceptable so the client gets a clear error rather than
+/// a silent downgrade.
+fn negotiate_multi_query_format(
+    headers: &FlureeHeaders,
+) -> std::result::Result<Option<fluree_db_api::FormatterConfig>, ServerError> {
+    // Precedence (must match docs/api/multi-query.md): `Fluree-Output-Format`
+    // is the most specific selector and wins over `Accept`. We resolve it
+    // first; only if it's absent do we look at `Accept`. The byte-shape
+    // Accept rejection (TSV / CSV / XML / RDF XML → 406) only fires when
+    // the caller hasn't already pinned a format via `Fluree-Output-Format` —
+    // otherwise a header pair like `Accept: text/csv` +
+    // `Fluree-Output-Format: typed-json` would return 406 instead of
+    // honouring the explicit selector.
+    let output_format = header_value(&headers.raw, "fluree-output-format");
+    let normalize_arrays = header_is_true(&headers.raw, "fluree-normalize-arrays");
+
+    // Fluree-Output-Format is the CLI-facing selector. Recognised values
+    // mirror `fluree query --format`: `json` (per-language default) and
+    // `typed-json` (always-typed literal/IRI shape). Unknown values are
+    // rejected before any sub-query runs.
+    if let Some(value) = output_format {
+        let lower = value.to_ascii_lowercase();
+        match lower.as_str() {
+            "json" => {
+                if normalize_arrays {
+                    return Ok(Some(
+                        fluree_db_api::FormatterConfig::jsonld().with_normalize_arrays(),
+                    ));
+                }
+                return Ok(None);
+            }
+            "typed-json" | "typed_json" | "typedjson" => {
+                let mut config = fluree_db_api::FormatterConfig::typed_json();
+                if normalize_arrays {
+                    config = config.with_normalize_arrays();
+                }
+                return Ok(Some(config));
+            }
+            other => {
+                return Err(ServerError::bad_request(format!(
+                    "unknown Fluree-Output-Format value '{other}'; \
+                     valid values for multi-query: json, typed-json"
+                )));
+            }
+        }
+    }
+    // No `Fluree-Output-Format`, but `Fluree-Normalize-Arrays: true` alone
+    // still flips the default JSON-LD config — same behaviour as
+    // `fluree query --normalize-arrays` without `--format`.
+    if normalize_arrays {
+        return Ok(Some(
+            fluree_db_api::FormatterConfig::jsonld().with_normalize_arrays(),
+        ));
+    }
+
+    // No explicit Fluree-Output-Format — fall back to Accept negotiation.
+    // Byte-shape values can't be embedded in the envelope's JSON results
+    // map, so a TSV/CSV/XML/RDF XML request without an explicit selector
+    // is a clear "wrong endpoint" — return 406 with a clear error.
+    if headers.wants_tsv()
+        || headers.wants_csv()
+        || headers.wants_sparql_results_xml()
+        || headers.wants_rdf_xml()
+    {
+        return Err(ServerError::not_acceptable(
+            "multi-query envelopes can only return JSON results; \
+             TSV / CSV / SPARQL XML / RDF XML are not supported here",
+        ));
+    }
+
+    if headers.wants_agent_json() {
+        let mut config = fluree_db_api::FormatterConfig::agent_json();
+        if let Some(max_bytes) = headers.max_bytes() {
+            config = config.with_max_bytes(max_bytes);
+        }
+        return Ok(Some(config));
+    }
+    Ok(None)
+}
+
+fn header_value<'a>(headers: &'a axum::http::HeaderMap, name: &str) -> Option<&'a str> {
+    headers.get(name).and_then(|v| v.to_str().ok())
+}
+
+fn header_is_true(headers: &axum::http::HeaderMap, name: &str) -> bool {
+    match header_value(headers, name) {
+        Some(v) => v.eq_ignore_ascii_case("true") || v == "1" || v.is_empty(),
+        None => false,
+    }
 }
 
 /// Inject `fluree-*` headers (policy-class, policy, policy-values, etc.)

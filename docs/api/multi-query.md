@@ -251,6 +251,84 @@ completed sub-queries land in `results` normally.
 
 ---
 
+## Output formatting
+
+By default, each alias formats with its language's natural shape: JSON-LD
+sub-queries emit JSON-LD, SPARQL sub-queries emit SPARQL 1.1 Results JSON.
+
+### In-process (Rust builder)
+
+The builder accepts an envelope-wide `FormatterConfig` via `.format(...)`
+matching the single-query `fluree.query_from().format(...)` vocabulary.
+
+```rust
+use fluree_db_api::FormatterConfig;
+
+let response = fluree
+    .multi_query()
+    .envelope(envelope)
+    .format(FormatterConfig::typed_json().with_normalize_arrays())
+    .execute()
+    .await?;
+```
+
+The envelope's `results` map is always JSON, so only JSON-producing
+formats are accepted. Their treatment differs by design — cross-language
+shapes apply to every alias, JSON-LD applies only to JSON-LD aliases,
+non-JSON formats are rejected up front:
+
+| Format | Builder method | JSON-LD aliases | SPARQL aliases |
+|--------|----------------|-----------------|----------------|
+| Typed JSON | `FormatterConfig::typed_json()` | applies | **applies** (cross-language typed shape) |
+| SPARQL Results JSON | `FormatterConfig::sparql_json()` | applies | **applies** (cross-language SPARQL Results shape) |
+| Agent JSON | `FormatterConfig::agent_json()` | applies | **applies** (cross-language agent envelope; honours `with_max_bytes(...)`) |
+| JSON-LD | `FormatterConfig::jsonld()` | applies | **skipped** — SPARQL Results JSON default kept |
+| TSV / CSV / SPARQL XML / RDF/XML | (any non-JSON `OutputFormat`) | rejected at `.execute()` with `MultiQueryError::UnsupportedFormat` | rejected |
+
+The "JSON-LD applies only to JSON-LD aliases" rule keeps `--normalize-arrays`
+(which builds `FormatterConfig::jsonld().with_normalize_arrays()`) from
+silently coercing SPARQL `SELECT` results out of SPARQL Results JSON. If
+you want a unified shape across both languages, pick `TypedJson`,
+`SparqlJson`, or `AgentJson` instead.
+
+Non-JSON formats (TSV, CSV, SPARQL XML, RDF/XML) are rejected at
+`.execute()` time with `MultiQueryError::UnsupportedFormat` — a multi-query
+envelope can't embed byte/string payloads inside its JSON `results` map.
+
+### Over HTTP
+
+The HTTP handler picks a format from request headers in this precedence
+order (most specific wins):
+
+1. **`Fluree-Output-Format` header** — explicit per-alias selector.
+   `json` keeps per-language defaults; `typed-json` selects
+   [`FormatterConfig::typed_json`]. Unknown values return `400 Bad
+   Request`. This is what the CLI's `--format` flag sends on the wire.
+2. **`Fluree-Normalize-Arrays: true`** — layers array normalization on
+   the chosen format (or on the default JSON-LD shape when no
+   `Fluree-Output-Format` is set). Matches the CLI's
+   `--normalize-arrays`.
+3. **`Accept` header** — standard content negotiation.
+   `application/vnd.fluree.agent+json` selects
+   [`FormatterConfig::agent_json`] (honouring `Fluree-Max-Bytes` if set).
+
+`Accept` values that produce byte/string payloads — `text/tab-separated-values`,
+`text/csv`, `application/sparql-results+xml`, `application/rdf+xml` —
+are rejected with **406 Not Acceptable** since they can't be embedded
+inside the envelope's JSON `results` map.
+
+| Header configuration | Effect |
+|----------------------|--------|
+| (none) | Per-language defaults (JSON-LD aliases → JSON-LD, SPARQL aliases → SPARQL JSON). |
+| `Fluree-Output-Format: json` | Same as default. |
+| `Fluree-Output-Format: typed-json` | All aliases format as typed JSON. |
+| `Fluree-Normalize-Arrays: true` | Default JSON-LD shape with single-value properties wrapped in arrays (applies to JSON-LD aliases). |
+| `Fluree-Output-Format: typed-json` + `Fluree-Normalize-Arrays: true` | Typed JSON with array normalization. |
+| `Accept: application/vnd.fluree.agent+json` | All aliases format as Agent JSON. `Fluree-Max-Bytes` sets per-alias byte budget. |
+| `Accept: text/csv`, `Accept: application/rdf+xml`, etc. | **406 Not Acceptable**. |
+
+---
+
 ## Examples
 
 ### Minimal — two JSON-LD queries, no envelope settings
@@ -439,6 +517,7 @@ The following are not supported and produce documented behaviour rather than sil
 - **`opts.t` is rejected at every level inside the envelope.** Pin time via `from` (e.g., `from: "ledger@t:42"`) or envelope `asOf`.
 - **Response size cap is enforced at assembly, not throughout dispatch.** Each sub-query result is checked against the per-sub-query cap once after it returns, and the assembler enforces the envelope-level cap as it stitches the response. Peak memory during dispatch is bounded by `max_concurrency × max_subquery_response_bytes`, which can exceed the envelope cap while individual sub-queries are running.
 - **SPARQL sub-queries do not consume merged policy opts (identity, policy-class, policy, policy-values, default-allow).** The headers ride through the transport, the server folds them into the envelope's top-level `opts`, and the envelope → sub-query opts merge carries them into each sub-query's opts — but the connection-scoped SPARQL dispatch path (`query_from().sparql()`) does not read body opts. JSON-LD sub-queries get full policy threading via `apply_auth_identity_to_opts`; SPARQL sub-queries observe bearer ledger-scope only. This is the same gap that exists for single-query connection-scoped SPARQL (`POST /query` with `Content-Type: application/sparql-query` and an inline `FROM`).
+- **Output formats are limited to JSON-producing shapes.** The envelope always assembles a JSON response body, so TSV, CSV, SPARQL Results XML, and RDF/XML are not available per-alias. Use single queries against `/query` when you need a byte/string payload.
 
 ---
 

@@ -666,3 +666,163 @@ async fn multi_query_per_alias_tracking_only_for_tracked_aliases() {
         "untracked alias should NOT appear in tracking map: {body}"
     );
 }
+
+// =============================================================================
+// Per-alias output format negotiation
+// =============================================================================
+
+/// Helper: POST a multi-query envelope with the given extra request headers.
+async fn post_envelope_with_headers(
+    app: &axum::Router,
+    envelope: &JsonValue,
+    extra: &[(&str, &str)],
+) -> (StatusCode, JsonValue) {
+    let mut req = Request::builder()
+        .method("POST")
+        .uri("/v1/fluree/multi-query")
+        .header("content-type", "application/json");
+    for (k, v) in extra {
+        req = req.header(*k, *v);
+    }
+    let resp = app
+        .clone()
+        .oneshot(req.body(Body::from(envelope.to_string())).unwrap())
+        .await
+        .unwrap();
+    json_body(resp).await
+}
+
+#[tokio::test]
+async fn multi_query_fluree_output_format_typed_json_wraps_literals() {
+    let (_tmp, state) = test_state().await;
+    let app = build_router(state);
+    create_ledger(&app, "mq:fmt").await;
+    insert_one(&app, "mq:fmt", "ex:alice", "Alice").await;
+
+    let envelope = json!({
+        "queries": {
+            "people": {
+                "language": "jsonld",
+                "query": {
+                    "@context": { "ex": "http://example.org/" },
+                    "from": "mq:fmt",
+                    "select": ["?name"],
+                    "where": { "@id": "?s", "ex:name": "?name" }
+                }
+            }
+        }
+    });
+
+    let (status, body) =
+        post_envelope_with_headers(&app, &envelope, &[("fluree-output-format", "typed-json")])
+            .await;
+    assert_eq!(status, StatusCode::OK, "got body: {body}");
+    assert_eq!(body["status"], "ok");
+    // TypedJson wraps literals in `{ "@value": ..., "@type": ... }`.
+    let dump = body["results"]["people"].to_string();
+    assert!(
+        dump.contains("@value"),
+        "typed-json should emit @value-shaped literals: {dump}"
+    );
+}
+
+#[tokio::test]
+async fn multi_query_fluree_output_format_unknown_value_returns_400() {
+    let (_tmp, state) = test_state().await;
+    let app = build_router(state);
+    create_ledger(&app, "mq:fmtbad").await;
+    insert_one(&app, "mq:fmtbad", "ex:alice", "Alice").await;
+
+    let envelope = json!({
+        "queries": {
+            "people": {
+                "language": "jsonld",
+                "query": {
+                    "@context": { "ex": "http://example.org/" },
+                    "from": "mq:fmtbad",
+                    "select": ["?name"],
+                    "where": { "@id": "?s", "ex:name": "?name" }
+                }
+            }
+        }
+    });
+
+    let (status, _body) = post_envelope_with_headers(
+        &app,
+        &envelope,
+        &[("fluree-output-format", "table")], // not JSON-producing
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn multi_query_fluree_output_format_wins_over_byte_shape_accept() {
+    // Precedence regression: `Fluree-Output-Format: typed-json` is more
+    // specific than the `Accept` header, so an Accept value the envelope
+    // can't satisfy on its own (like `text/csv`) must still be honoured
+    // as long as a valid Fluree-Output-Format is set. Otherwise a CLI
+    // that emits both a typed-json selector and a generic Accept couldn't
+    // safely cohabit with content negotiation rules.
+    let (_tmp, state) = test_state().await;
+    let app = build_router(state);
+    create_ledger(&app, "mq:fmtprec").await;
+    insert_one(&app, "mq:fmtprec", "ex:alice", "Alice").await;
+
+    let envelope = json!({
+        "queries": {
+            "people": {
+                "language": "jsonld",
+                "query": {
+                    "@context": { "ex": "http://example.org/" },
+                    "from": "mq:fmtprec",
+                    "select": ["?name"],
+                    "where": { "@id": "?s", "ex:name": "?name" }
+                }
+            }
+        }
+    });
+
+    let (status, body) = post_envelope_with_headers(
+        &app,
+        &envelope,
+        &[
+            ("fluree-output-format", "typed-json"),
+            ("accept", "text/csv"), // would 406 on its own
+        ],
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "got body: {body}");
+    let dump = body["results"]["people"].to_string();
+    assert!(
+        dump.contains("@value"),
+        "explicit Fluree-Output-Format must override conflicting Accept: {dump}"
+    );
+}
+
+#[tokio::test]
+async fn multi_query_tsv_accept_returns_406() {
+    let (_tmp, state) = test_state().await;
+    let app = build_router(state);
+    create_ledger(&app, "mq:tsv").await;
+    insert_one(&app, "mq:tsv", "ex:alice", "Alice").await;
+
+    let envelope = json!({
+        "queries": {
+            "people": {
+                "language": "jsonld",
+                "query": {
+                    "@context": { "ex": "http://example.org/" },
+                    "from": "mq:tsv",
+                    "select": ["?name"],
+                    "where": { "@id": "?s", "ex:name": "?name" }
+                }
+            }
+        }
+    });
+
+    let (status, _body) =
+        post_envelope_with_headers(&app, &envelope, &[("accept", "text/tab-separated-values")])
+            .await;
+    assert_eq!(status, StatusCode::NOT_ACCEPTABLE);
+}

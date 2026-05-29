@@ -23,9 +23,67 @@ use colored::Colorize;
 use fluree_db_api::query::multi::MultiQueryRequest;
 use fluree_db_api::query::multi_dispatch::MultiQueryError;
 use fluree_db_api::server_defaults::FlureeDir;
+use fluree_db_api::FormatterConfig;
 use serde_json::Value as JsonValue;
 use std::path::Path;
 use std::sync::Arc;
+
+/// Per-alias result format selected from `--format` (matches
+/// `fluree query` semantics).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AliasFormat {
+    /// Default JSON-LD / SPARQL Results JSON shapes per alias language.
+    Json,
+    /// `{ "@value": ..., "@type": ... }` typed literal wrappers.
+    TypedJson,
+}
+
+impl AliasFormat {
+    fn parse(raw: &str) -> CliResult<Self> {
+        match raw.to_lowercase().as_str() {
+            "json" => Ok(Self::Json),
+            "typed-json" | "typed_json" | "typedjson" => Ok(Self::TypedJson),
+            other => Err(CliError::Usage(format!(
+                "unknown --format value '{other}'; valid: json, typed-json"
+            ))),
+        }
+    }
+
+    /// Build a [`FormatterConfig`] for the api-crate builder. Returns
+    /// `None` when neither `--format typed-json` nor `--normalize-arrays`
+    /// was supplied — in that case the api crate's per-language defaults
+    /// (JSON-LD for JSON-LD aliases, SPARQL JSON for SPARQL aliases) are
+    /// what the user wants.
+    fn to_formatter_config(self, normalize_arrays: bool) -> Option<FormatterConfig> {
+        match (self, normalize_arrays) {
+            (Self::Json, false) => None,
+            (Self::Json, true) => Some(FormatterConfig::jsonld().with_normalize_arrays()),
+            (Self::TypedJson, false) => Some(FormatterConfig::typed_json()),
+            (Self::TypedJson, true) => Some(FormatterConfig::typed_json().with_normalize_arrays()),
+        }
+    }
+}
+
+/// Envelope display selection from `--output`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EnvelopeView {
+    Json,
+    Pretty,
+    Aliases,
+}
+
+impl EnvelopeView {
+    fn parse(raw: &str) -> CliResult<Self> {
+        match raw.to_lowercase().as_str() {
+            "json" => Ok(Self::Json),
+            "pretty" => Ok(Self::Pretty),
+            "aliases" => Ok(Self::Aliases),
+            other => Err(CliError::Usage(format!(
+                "unknown --output value '{other}'; valid: json, pretty, aliases"
+            ))),
+        }
+    }
+}
 
 /// Run the `multi-query` subcommand.
 #[allow(clippy::too_many_arguments)]
@@ -34,15 +92,19 @@ pub async fn run(
     expr: Option<&str>,
     file_flag: Option<&Path>,
     format: &str,
+    normalize_arrays: bool,
+    output: &str,
     dirs: &FlureeDir,
     remote_flag: Option<&str>,
     direct: bool,
     policy: &PolicyArgs,
 ) -> CliResult<()> {
-    // Reject unknown --format values **before** the network round-trip
-    // so a typo like `--format jzon` doesn't burn the server-side work
-    // and the bearer's fuel.
-    validate_format(format)?;
+    // Reject unknown --format / --output values **before** the network
+    // round-trip so a typo like `--format jzon` doesn't burn the
+    // server-side work and the bearer's fuel.
+    let alias_format = AliasFormat::parse(format)?;
+    let envelope_view = EnvelopeView::parse(output)?;
+    let formatter_config = alias_format.to_formatter_config(normalize_arrays);
 
     // Positional arg, if present, is always interpreted as a file path
     // — the only other shape multi-query accepts via positional would be
@@ -78,6 +140,12 @@ pub async fn run(
     // can persist any silent OIDC token refresh back to config.toml
     // after the round-trip. Auto-route and local-in-process paths skip
     // persistence (no remote credentials to update).
+    // Header pair sent with --remote / auto-route requests so the server
+    // can build the matching FormatterConfig. Local (in-process) requests
+    // build the config from `formatter_config` directly without going
+    // through the header round-trip.
+    let format_headers = format_request_headers(alias_format, normalize_arrays);
+
     let response = match remote_flag {
         Some(name) => {
             let client = context::build_remote_client(name, dirs).await?;
@@ -87,7 +155,7 @@ pub async fn run(
             // validation via inject_headers_into_envelope.
             let client = client.with_policy(policy.clone());
             let response = client
-                .multi_query(&envelope)
+                .multi_query_with_headers(&envelope, &format_headers)
                 .await
                 .map_err(|e| CliError::Remote(format!("multi-query request failed: {e}")))?;
             // Persist refreshed OAuth tokens back to config.toml so the
@@ -102,18 +170,40 @@ pub async fn run(
                 Some(client) => {
                     let client = client.with_policy(policy.clone());
                     client
-                        .multi_query(&envelope)
+                        .multi_query_with_headers(&envelope, &format_headers)
                         .await
                         .map_err(|e| CliError::Remote(format!("multi-query request failed: {e}")))?
                 }
-                None => run_in_process(dirs, envelope, policy).await?,
+                None => run_in_process(dirs, envelope, formatter_config, policy).await?,
             }
         }
-        None => run_in_process(dirs, envelope, policy).await?,
+        None => run_in_process(dirs, envelope, formatter_config, policy).await?,
     };
 
-    print_response(&response, format);
+    print_response(&response, envelope_view);
     Ok(())
+}
+
+/// Build the `fluree-output-format` / `fluree-normalize-arrays` headers
+/// the server reads to construct the same [`FormatterConfig`] the
+/// in-process path builds locally. Empty when the user picked the
+/// per-language defaults — saves a round trip through the header
+/// extractor.
+fn format_request_headers(
+    alias_format: AliasFormat,
+    normalize_arrays: bool,
+) -> Vec<(&'static str, String)> {
+    let mut headers = Vec::new();
+    match alias_format {
+        AliasFormat::Json => {}
+        AliasFormat::TypedJson => {
+            headers.push(("fluree-output-format", "typed-json".to_string()));
+        }
+    }
+    if normalize_arrays {
+        headers.push(("fluree-normalize-arrays", "true".to_string()));
+    }
+    headers
 }
 
 /// Execute the envelope in-process via [`Fluree::multi_query`] against
@@ -128,6 +218,7 @@ pub async fn run(
 async fn run_in_process(
     dirs: &FlureeDir,
     envelope_json: JsonValue,
+    formatter_config: Option<FormatterConfig>,
     policy: &PolicyArgs,
 ) -> CliResult<JsonValue> {
     let mut envelope: MultiQueryRequest = serde_json::from_value(envelope_json).map_err(|e| {
@@ -139,12 +230,11 @@ async fn run_in_process(
     inject_policy_into_envelope(&mut envelope, policy)?;
 
     let fluree = Arc::new(context::build_fluree(dirs)?);
-    let response = fluree
-        .multi_query()
-        .envelope(envelope)
-        .execute()
-        .await
-        .map_err(map_multi_query_error)?;
+    let mut builder = fluree.multi_query().envelope(envelope);
+    if let Some(cfg) = formatter_config {
+        builder = builder.format(cfg);
+    }
+    let response = builder.execute().await.map_err(map_multi_query_error)?;
 
     serde_json::to_value(&response)
         .map_err(|e| CliError::Input(format!("failed to serialize multi-query response: {e}")))
@@ -231,43 +321,28 @@ fn map_multi_query_error(err: MultiQueryError) -> CliError {
         MultiQueryError::EnvelopeRequired => {
             CliError::Input("envelope was not provided to the dispatcher".to_string())
         }
+        MultiQueryError::UnsupportedFormat { format } => CliError::Input(format!(
+            "format {format:?} produces non-JSON output and cannot be used inside a multi-query envelope"
+        )),
     }
 }
 
-/// Reject unsupported `--format` values up front, before any envelope
-/// parsing or network round-trip. Keeps the typo cost cheap — local
-/// usage error instead of a successful server-side multi-query whose
-/// result we can't print.
-fn validate_format(format: &str) -> CliResult<()> {
-    match format.to_lowercase().as_str() {
-        "json" | "pretty" | "aliases" => Ok(()),
-        other => Err(CliError::Usage(format!(
-            "unknown output format '{other}'; valid formats: json, pretty, aliases"
-        ))),
-    }
-}
-
-fn print_response(response: &JsonValue, format: &str) {
-    match format.to_lowercase().as_str() {
-        "json" => {
-            // Pass-through: compact JSON, single line. Matches default
-            // `fluree query --format json` shape (machine-friendly).
+fn print_response(response: &JsonValue, view: EnvelopeView) {
+    match view {
+        EnvelopeView::Json => {
+            // Pass-through: compact JSON, single line. Machine-friendly.
             println!(
                 "{}",
                 serde_json::to_string(response).expect("serialize response")
             );
         }
-        "pretty" => {
+        EnvelopeView::Pretty => {
             println!(
                 "{}",
                 serde_json::to_string_pretty(response).expect("serialize response")
             );
         }
-        "aliases" => print_per_alias(response),
-        // Unreachable: `validate_format` is called at command entry
-        // before any of the work that produces a response, so an
-        // invalid value can never reach this branch.
-        other => unreachable!("unvalidated format '{other}' reached print_response"),
+        EnvelopeView::Aliases => print_per_alias(response),
     }
 }
 
@@ -421,5 +496,99 @@ mod tests {
         let policy = PolicyArgs::default();
         inject_policy_into_envelope(&mut envelope, &policy).unwrap();
         assert!(envelope.opts.is_none());
+    }
+
+    // -------------------------------------------------------------------------
+    // --format / --output / --normalize-arrays parsing & header building
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn alias_format_parses_json_and_typed_json_and_rejects_unknown() {
+        assert_eq!(AliasFormat::parse("json").unwrap(), AliasFormat::Json);
+        assert_eq!(
+            AliasFormat::parse("typed-json").unwrap(),
+            AliasFormat::TypedJson
+        );
+        assert_eq!(
+            AliasFormat::parse("Typed_JSON").unwrap(),
+            AliasFormat::TypedJson
+        );
+        let err = AliasFormat::parse("table").unwrap_err();
+        assert!(matches!(err, CliError::Usage(_)), "got: {err:?}");
+    }
+
+    #[test]
+    fn envelope_view_parses_each_variant_and_rejects_unknown() {
+        assert_eq!(EnvelopeView::parse("json").unwrap(), EnvelopeView::Json);
+        assert_eq!(EnvelopeView::parse("pretty").unwrap(), EnvelopeView::Pretty);
+        assert_eq!(
+            EnvelopeView::parse("aliases").unwrap(),
+            EnvelopeView::Aliases
+        );
+        let err = EnvelopeView::parse("typed-json").unwrap_err();
+        assert!(matches!(err, CliError::Usage(_)), "got: {err:?}");
+    }
+
+    #[test]
+    fn alias_format_json_without_normalize_yields_none_config() {
+        // `--format json` with no --normalize-arrays should keep per-language
+        // defaults — passing None to the builder preserves JSON-LD / SPARQL
+        // JSON shapes for the respective aliases.
+        assert!(AliasFormat::Json.to_formatter_config(false).is_none());
+    }
+
+    #[test]
+    fn alias_format_json_with_normalize_yields_jsonld_normalized() {
+        let cfg = AliasFormat::Json
+            .to_formatter_config(true)
+            .expect("normalize-arrays implies a config");
+        assert!(cfg.normalize_arrays);
+        assert_eq!(cfg.format, fluree_db_api::OutputFormat::JsonLd);
+    }
+
+    #[test]
+    fn alias_format_typed_json_with_and_without_normalize() {
+        let bare = AliasFormat::TypedJson.to_formatter_config(false).unwrap();
+        assert_eq!(bare.format, fluree_db_api::OutputFormat::TypedJson);
+        assert!(!bare.normalize_arrays);
+
+        let normalized = AliasFormat::TypedJson.to_formatter_config(true).unwrap();
+        assert_eq!(normalized.format, fluree_db_api::OutputFormat::TypedJson);
+        assert!(normalized.normalize_arrays);
+    }
+
+    #[test]
+    fn format_request_headers_omits_defaults() {
+        // `--format json` without `--normalize-arrays` is the default —
+        // emitting no headers keeps the wire chatty-free.
+        let headers = format_request_headers(AliasFormat::Json, false);
+        assert!(headers.is_empty(), "got: {headers:?}");
+    }
+
+    #[test]
+    fn format_request_headers_attaches_typed_json_and_normalize() {
+        let headers = format_request_headers(AliasFormat::TypedJson, true);
+        assert!(
+            headers
+                .iter()
+                .any(|(k, v)| *k == "fluree-output-format" && v == "typed-json"),
+            "got: {headers:?}"
+        );
+        assert!(
+            headers
+                .iter()
+                .any(|(k, v)| *k == "fluree-normalize-arrays" && v == "true"),
+            "got: {headers:?}"
+        );
+    }
+
+    #[test]
+    fn format_request_headers_normalize_alone_only_attaches_that_header() {
+        // `--format json --normalize-arrays` should send the normalize
+        // header on its own — the server reads it as "default JSON-LD,
+        // with array normalization" the same way the local builder does.
+        let headers = format_request_headers(AliasFormat::Json, true);
+        assert_eq!(headers.len(), 1);
+        assert_eq!(headers[0], ("fluree-normalize-arrays", "true".to_string()));
     }
 }

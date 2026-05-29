@@ -431,8 +431,12 @@ fn multi_query_local_in_process_against_seeded_ledger_succeeds() {
             }
         }
     }"#;
+    // `--output pretty` selects the envelope display; `--format` now
+    // controls per-alias result shape (`json` | `typed-json`) and
+    // defaults to `json` here, so the response uses the JSON-LD default
+    // for the single alias.
     fluree_cmd(&tmp)
-        .args(["multi-query", "--format", "pretty", "-e", envelope])
+        .args(["multi-query", "--output", "pretty", "-e", envelope])
         .assert()
         .success()
         .stdout(predicate::str::contains("\"status\": \"ok\""))
@@ -440,7 +444,55 @@ fn multi_query_local_in_process_against_seeded_ledger_succeeds() {
 }
 
 #[test]
-fn multi_query_unknown_format_errors_before_network() {
+fn multi_query_typed_json_format_emits_typed_literals() {
+    // `--format typed-json` makes every alias emit `@value`-wrapped
+    // literals — end-to-end coverage that the CLI threads the new
+    // alias-format flag through to the dispatcher.
+    let tmp = TempDir::new().unwrap();
+    fluree_cmd(&tmp).arg("init").assert().success();
+    fluree_cmd(&tmp)
+        .args(["create", "lct:main"])
+        .assert()
+        .success();
+    fluree_cmd(&tmp)
+        .args([
+            "insert",
+            "lct:main",
+            r#"{"@context":{"ex":"http://example.org/"},"@id":"ex:alice","ex:name":"Alice"}"#,
+        ])
+        .assert()
+        .success();
+
+    let envelope = r#"{
+        "queries": {
+            "find": {
+                "language": "jsonld",
+                "query": {
+                    "@context": { "ex": "http://example.org/" },
+                    "from":     "lct:main",
+                    "select":   ["?name"],
+                    "where":    { "@id": "?s", "ex:name": "?name" }
+                }
+            }
+        }
+    }"#;
+    fluree_cmd(&tmp)
+        .args([
+            "multi-query",
+            "--format",
+            "typed-json",
+            "--output",
+            "pretty",
+            "-e",
+            envelope,
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("@value"));
+}
+
+#[test]
+fn multi_query_unknown_alias_format_errors_before_network() {
     // --format is validated up front so a typo can't burn the
     // server-side multi-query before failing locally.
     let tmp = TempDir::new().unwrap();
@@ -450,7 +502,20 @@ fn multi_query_unknown_format_errors_before_network() {
         .args(["multi-query", "--format", "jzon", "-e", envelope])
         .assert()
         .failure()
-        .stderr(predicate::str::contains("unknown output format"));
+        .stderr(predicate::str::contains("unknown --format value"));
+}
+
+#[test]
+fn multi_query_unknown_envelope_view_errors_before_network() {
+    // --output (envelope display) is validated up front too.
+    let tmp = TempDir::new().unwrap();
+    fluree_cmd(&tmp).arg("init").assert().success();
+    let envelope = r#"{"queries":{"a":{"language":"jsonld","query":{"from":"x","select":["?s"],"where":{"@id":"?s"}}}}}"#;
+    fluree_cmd(&tmp)
+        .args(["multi-query", "--output", "tabular", "-e", envelope])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("unknown --output value"));
 }
 
 #[test]

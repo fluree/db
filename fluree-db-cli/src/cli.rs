@@ -539,11 +539,23 @@ pub enum Commands {
         #[arg(short = 'f', long = "file")]
         file: Option<PathBuf>,
 
-        /// Output format. `json` (default) prints the response envelope
-        /// as-is; `pretty` indents it; `aliases` prints per-alias result
-        /// sections with status/errors at the top.
+        /// Per-alias result format (`json` or `typed-json`). Matches the
+        /// same flag on `fluree query`. Applies to every alias's result
+        /// inside the envelope's `results` map.
         #[arg(long, default_value = "json")]
         format: String,
+
+        /// Normalize arrays: always wrap multi-value JSON-LD properties in
+        /// arrays. Matches the same flag on `fluree query`; applies to
+        /// JSON-LD aliases.
+        #[arg(long)]
+        normalize_arrays: bool,
+
+        /// Envelope display format. `json` (default) prints the response
+        /// envelope as-is; `pretty` indents it; `aliases` prints per-alias
+        /// result sections with status/errors at the top.
+        #[arg(long, default_value = "json")]
+        output: String,
 
         /// Execute against a remote server (by remote name, e.g., "origin").
         #[arg(long)]
