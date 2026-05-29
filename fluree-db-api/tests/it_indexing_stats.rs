@@ -161,6 +161,7 @@ async fn property_and_class_statistics_persist_in_db_root() {
             let fluree_db_api::IndexOutcome::Completed {
                 index_t,
                 root_id,
+                ..
             } = outcome
             else {
                 unreachable!("helper only returns Completed")
@@ -1811,7 +1812,10 @@ async fn large_dataset_statistics_accuracy() {
 
                 let outcome =
                     trigger_index_and_wait_outcome(&handle, ledger.ledger_id(), commit_t).await;
-                let fluree_db_api::IndexOutcome::Completed { index_t, root_id } = outcome else {
+                let fluree_db_api::IndexOutcome::Completed {
+                    index_t, root_id, ..
+                } = outcome
+                else {
                     unreachable!("helper only returns Completed")
                 };
                 assert!(

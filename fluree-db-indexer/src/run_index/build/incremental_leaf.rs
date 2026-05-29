@@ -246,6 +246,7 @@ fn passthrough_entire_leaf(input: &LeafUpdateInput<'_>) -> io::Result<LeafUpdate
                 total_rows: header.total_rows,
                 first_key,
                 last_key,
+                re_encoded_leaflet_count: 0,
             },
         }],
     })
@@ -477,24 +478,26 @@ fn assemble_output_leaves(
         return Ok(LeafUpdateOutput { leaves: vec![] });
     }
 
-    // Convert ProcessedLeafletV3 into (EncodedLeaflet, Vec<HistEntryV2>) pairs
-    // for assembly.
-    let mut leaflet_data: Vec<(EncodedLeaflet, Vec<HistEntryV2>)> =
+    // Convert ProcessedLeafletV3 into (EncodedLeaflet, Vec<HistEntryV2>, was_re_encoded)
+    // triples for assembly. `was_re_encoded` distinguishes passthrough byte-copies
+    // from leaflets that the merge actually re-encoded; the count is propagated
+    // into LeafInfo and drives the per-leaflet portion of CAS-write fuel.
+    let mut leaflet_data: Vec<(EncodedLeaflet, Vec<HistEntryV2>, bool)> =
         Vec::with_capacity(processed.len());
 
     for p in processed {
-        let encoded = match p.encoded {
+        let (encoded, was_re_encoded) = match p.encoded {
             EncodedLeafletInfo::Passthrough { dir_entry, payload } => {
-                reconstruct_encoded_leaflet(dir_entry, payload)
+                (reconstruct_encoded_leaflet(dir_entry, payload), false)
             }
-            EncodedLeafletInfo::Encoded(e) => e,
+            EncodedLeafletInfo::Encoded(e) => (e, true),
         };
-        leaflet_data.push((encoded, p.history));
+        leaflet_data.push((encoded, p.history, was_re_encoded));
     }
 
     // Group leaflets into leaves by row count.
     let mut leaves = Vec::new();
-    let mut current_group: Vec<(EncodedLeaflet, Vec<HistEntryV2>)> = Vec::new();
+    let mut current_group: Vec<(EncodedLeaflet, Vec<HistEntryV2>, bool)> = Vec::new();
     let mut current_rows: u64 = 0;
 
     for item in leaflet_data {
@@ -521,11 +524,12 @@ fn assemble_output_leaves(
     Ok(LeafUpdateOutput { leaves: output })
 }
 
-/// Build a single leaf blob from a group of (EncodedLeaflet, history) pairs.
+/// Build a single leaf blob from a group of (EncodedLeaflet, history, was_re_encoded) triples.
 fn build_leaf_from_group(
     group: Vec<(
         fluree_db_binary_index::format::leaflet::EncodedLeaflet,
         Vec<HistEntryV2>,
+        bool,
     )>,
     order: RunSortOrder,
 ) -> io::Result<LeafInfo> {
@@ -533,7 +537,7 @@ fn build_leaf_from_group(
 
     // Build sidecar from history entries.
     let mut sidecar_builder = HistSidecarBuilder::new();
-    for (_, history) in &group {
+    for (_, history, _) in &group {
         sidecar_builder.start_leaflet();
         for entry in history {
             sidecar_builder.push_entry(*entry);
@@ -551,14 +555,15 @@ fn build_leaf_from_group(
     // Extract first/last routing keys (raw ordered key bytes).
     let first_key_bytes = group
         .first()
-        .map(|(e, _)| e.first_key)
+        .map(|(e, _, _)| e.first_key)
         .unwrap_or([0u8; ORDERED_KEY_V2_SIZE]);
     let last_key_bytes = group
         .last()
-        .map(|(e, _)| e.last_key)
+        .map(|(e, _, _)| e.last_key)
         .unwrap_or([0u8; ORDERED_KEY_V2_SIZE]);
 
-    let owned_leaflets: Vec<EncodedLeaflet> = group.into_iter().map(|(e, _)| e).collect();
+    let re_encoded_leaflet_count = group.iter().filter(|(_, _, was_re)| *was_re).count() as u32;
+    let owned_leaflets: Vec<EncodedLeaflet> = group.into_iter().map(|(e, _, _)| e).collect();
 
     let leaf_bytes = build_leaf_blob_raw_keys(
         order,
@@ -584,6 +589,7 @@ fn build_leaf_from_group(
         total_rows,
         first_key,
         last_key,
+        re_encoded_leaflet_count,
     })
 }
 

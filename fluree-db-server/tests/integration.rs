@@ -2564,8 +2564,10 @@ async fn json_transaction_with_meta_reports_decimal_fuel() {
         .and_then(JsonValue::as_f64)
         .expect("tracked transaction response should include decimal fuel");
     assert_eq!(fuel, fuel_header);
+    // Transaction baseline is 10.000 fuel + 1 µfuel/flake; any small txn
+    // should land between the baseline and well under raw-micro-fuel scale.
     assert!(
-        (100.0..1000.0).contains(&fuel),
+        (10.0..1000.0).contains(&fuel),
         "fuel should be reported in fuel units, not raw micro-fuel: {fuel}"
     );
 }
@@ -2623,8 +2625,10 @@ async fn sparql_update_with_tracking_header_reports_decimal_fuel() {
         .and_then(JsonValue::as_f64)
         .expect("tracked SPARQL UPDATE response should include decimal fuel");
     assert_eq!(fuel, fuel_header);
+    // Transaction baseline is 10.000 fuel + 1 µfuel/flake; any small txn
+    // should land between the baseline and well under raw-micro-fuel scale.
     assert!(
-        (100.0..1000.0).contains(&fuel),
+        (10.0..1000.0).contains(&fuel),
         "fuel should be reported in fuel units, not raw micro-fuel: {fuel}"
     );
 }

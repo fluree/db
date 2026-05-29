@@ -275,8 +275,9 @@ async fn fuel_integration_test() {
     );
 
     // Fuel should roughly correspond to the number of flakes traversed
-    // (may not be exact due to query optimization differences). Per-row charge
-    // is 1 fuel each in this step.
+    // (may not be exact due to query optimization differences). This in-memory
+    // fixture scans the overlay path at 1 micro-fuel (0.001 fuel) per row, plus
+    // the one-time 1.000-fuel query floor.
     let total_flakes = ledger.current_stats().flakes as f64;
     // Some in-memory fixtures don't materialize stats; avoid asserting against zero.
     if total_flakes > 0.0 {
@@ -290,10 +291,9 @@ async fn fuel_integration_test() {
     // Test fuel limits (short-circuiting)
     // =========================================================================
 
-    // Query with very low fuel limit should fail. The fixture is in-memory
-    // (genesis, no binary index), so this exercises the overlay path which
-    // charges 1 micro-fuel per row; a 0.001-fuel limit (1 micro-fuel) trips
-    // on the second row.
+    // Query with very low fuel limit should fail. Every query is charged a
+    // 1.000-fuel floor at entry (before parsing), so a 0.001-fuel limit is
+    // tripped by the floor itself, before any rows are scanned.
     let query_with_limit = json!({
         "@context": support::default_context(),
         "select": ["?s", "?p", "?o"],

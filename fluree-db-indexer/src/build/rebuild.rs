@@ -33,11 +33,12 @@ use tracing::Instrument;
 /// 6. Upload artifacts to CAS and write BinaryIndexRoot
 pub async fn rebuild_index_from_commits(
     content_store: std::sync::Arc<dyn ContentStore>,
+    tracker: fluree_db_core::tracking::Tracker,
     ledger_id: &str,
     record: &fluree_db_nameservice::NsRecord,
     config: IndexerConfig,
 ) -> Result<IndexResult> {
-    rebuild_index_from_commits_with_store(content_store, ledger_id, record, config).await
+    rebuild_index_from_commits_with_store(content_store, tracker, ledger_id, record, config).await
 }
 
 /// Like [`rebuild_index_from_commits`], but accepts a caller-provided
@@ -46,6 +47,7 @@ pub async fn rebuild_index_from_commits(
 /// chain falls through to parent namespaces via `BranchedContentStore`).
 pub async fn rebuild_index_from_commits_with_store<C>(
     commit_store: C,
+    tracker: fluree_db_core::tracking::Tracker,
     ledger_id: &str,
     record: &fluree_db_nameservice::NsRecord,
     config: IndexerConfig,
@@ -916,9 +918,10 @@ where
             );
 
             // Phase E-V3: Upload V3 artifacts to CAS.
-            let v3_uploaded = super::upload::upload_indexes_to_cas(&content_store, &v3_result)
-                .instrument(tracing::debug_span!("upload_v3_indexes"))
-                .await?;
+            let v3_uploaded =
+                super::upload::upload_indexes_to_cas(&content_store, &tracker, &v3_result)
+                    .instrument(tracing::debug_span!("upload_v3_indexes"))
+                    .await?;
 
             // Phase F-V3: Upload dicts + assemble FIR6 root.
             let uploaded_dicts =
