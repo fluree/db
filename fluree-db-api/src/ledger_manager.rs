@@ -755,9 +755,9 @@ impl LedgerManager {
         // Manager lock released here
 
         if let Some(rx) = rx {
-            // TEMP DIAGNOSTIC (revert before merge): a waiter parked here with
+            // Phase instrumentation (debug!): a waiter parked here with
             // no matching leader publish is the orphaned-Loading signature.
-            tracing::info!(alias = %canonical_alias, "ledger.load.waiter.park");
+            tracing::debug!(alias = %canonical_alias, "ledger.load.waiter.park");
             // Wait for the loader to finish
             // Note: Waiters receive an Http error (preserving status code) since
             // ApiError isn't Clone. The leader (first caller) gets the full error type.
@@ -786,10 +786,10 @@ impl LedgerManager {
             armed: true,
         };
 
-        // TEMP DIAGNOSTIC (revert before merge): leader load phases at info! so
-        // a hang localizes to nameservice (DDB, no default timeout) vs storage
-        // (S3, 35s/attempt) vs the binary-store attach.
-        tracing::info!(alias = %canonical_alias, "ledger.load.leader.begin");
+        // Phase instrumentation (debug!): leader load phases localize a hang to
+        // nameservice (DDB, no default timeout) vs storage (S3, 35s/attempt) vs
+        // the binary-store attach.
+        tracing::debug!(alias = %canonical_alias, "ledger.load.leader.begin");
 
         // Do ALL load I/O — including the binary index store attach, which
         // performs S3 reads — WITHOUT holding the manager lock. Holding the
@@ -800,7 +800,7 @@ impl LedgerManager {
         let load_result = LedgerState::load(&self.nameservice_mode, ledger_id, &self.backend)
             .await
             .map_err(ApiError::from); // Convert LedgerError to ApiError
-        tracing::info!(
+        tracing::debug!(
             alias = %canonical_alias,
             ok = load_result.is_ok(),
             "ledger.load.state.done"
@@ -829,7 +829,7 @@ impl LedgerManager {
                         None
                     }
                 };
-                tracing::info!(alias = %canonical_alias, "ledger.load.binary_store.done");
+                tracing::debug!(alias = %canonical_alias, "ledger.load.binary_store.done");
                 Ok(LedgerHandle::new(
                     canonical_alias.clone(),
                     state,
@@ -839,8 +839,8 @@ impl LedgerManager {
             Err(e) => Err(e),
         };
 
-        // TEMP DIAGNOSTIC (revert before merge): leader reached publish.
-        tracing::info!(
+        // Phase instrumentation (debug!): leader reached publish.
+        tracing::debug!(
             alias = %canonical_alias,
             ok = publish.is_ok(),
             "ledger.load.leader.publish"

@@ -374,14 +374,14 @@ pub(crate) async fn run_envelope(
     // observable when at least validation + snapshot succeed.
     let started = Instant::now();
 
-    // TEMP DIAGNOSTIC (revert before merge): localize the multi-query wedge by
-    // emitting info-level phase markers. info! (not debug!) so they are visible
-    // at the deployed Lambda's default log level; these violate the
-    // debug_span! convention deliberately and only for this debugging branch.
-    tracing::info!(aliases = envelope.queries.len(), "mq.run_envelope.start");
+    // Phase instrumentation (debug!): `mq.*` markers localize where an
+    // envelope spends time or stalls (validation, snapshot resolution,
+    // dispatch, per-sub-query lifecycle, drain). debug! keeps them zero-cost
+    // at the prod info! level while remaining available for diagnosis.
+    tracing::debug!(aliases = envelope.queries.len(), "mq.run_envelope.start");
 
     let distinct_ledgers = validate_envelope(&envelope, bounds)?;
-    tracing::info!(
+    tracing::debug!(
         distinct_ledgers = distinct_ledgers.len(),
         "mq.validate.ok; resolving snapshot"
     );
@@ -392,14 +392,14 @@ pub(crate) async fn run_envelope(
             .inspect_err(|e| tracing::warn!(error = %e, "mq.snapshot.err"))
             .map_err(MultiQueryError::Snapshot)?,
     );
-    tracing::info!(
+    tracing::debug!(
         ledgers = snapshot.ledgers.len(),
         "mq.snapshot.resolved; dispatching"
     );
 
     let include_meta = envelope_meta_enabled(envelope.opts.as_ref());
     let config = DispatchConfig::from_envelope(&envelope, bounds);
-    tracing::info!(
+    tracing::debug!(
         max_concurrency = config.max_concurrency,
         envelope_timeout_ms = config.envelope_timeout_ms,
         "mq.dispatch.config"
@@ -413,7 +413,7 @@ pub(crate) async fn run_envelope(
         default_format,
     )
     .await;
-    tracing::info!(
+    tracing::debug!(
         outcomes = outcomes.len(),
         "mq.dispatch.complete; assembling"
     );
@@ -427,7 +427,7 @@ pub(crate) async fn run_envelope(
         elapsed_ms,
     )
     .map_err(MultiQueryError::ResponseAssembly)?;
-    tracing::info!("mq.assemble.ok");
+    tracing::debug!("mq.assemble.ok");
 
     Ok(response)
 }
@@ -477,14 +477,13 @@ async fn dispatch_subqueries(
             result_status = tracing::field::Empty,
         );
 
-        // TEMP DIAGNOSTIC (revert before merge): per-sub-query lifecycle at
-        // info! so a never-returning sub-query is visible (spawn + permit
-        // acquired, but no done) in the deployed Lambda logs.
+        // Phase instrumentation (debug!): per-sub-query lifecycle — a
+        // never-returning sub-query shows spawn + permit.acquired but no done.
         let log_alias = alias.clone();
 
         set.spawn(
             async move {
-                tracing::info!(alias = %log_alias, "mq.sub.spawn");
+                tracing::debug!(alias = %log_alias, "mq.sub.spawn");
                 let _permit = match semaphore.acquire_owned().await {
                     Ok(p) => p,
                     Err(_) => {
@@ -497,7 +496,7 @@ async fn dispatch_subqueries(
                         );
                     }
                 };
-                tracing::info!(alias = %log_alias, "mq.sub.permit.acquired");
+                tracing::debug!(alias = %log_alias, "mq.sub.permit.acquired");
 
                 // Effective timeout = min(opts.timeoutMs, remaining envelope budget),
                 // computed at permit acquisition, not envelope entry.
@@ -558,7 +557,7 @@ async fn dispatch_subqueries(
                     AliasOutcomeKind::Timeout { .. } => "timeout",
                 };
                 span.record("result_status", status);
-                tracing::info!(alias = %log_alias, status, "mq.sub.done");
+                tracing::debug!(alias = %log_alias, status, "mq.sub.done");
 
                 (idx, kind)
             }
@@ -590,7 +589,7 @@ async fn dispatch_subqueries(
                 }
             }
             () = &mut deadline_sleep => {
-                // TEMP DIAGNOSTIC (revert before merge): distinguishes "deadline
+                // Phase instrumentation (debug!): distinguishes "deadline
                 // never fired" from "fired but aborts couldn't land" — abort
                 // cannot interrupt a task parked in a sync block_on section, so
                 // the drain below can still hang past the fired deadline.
