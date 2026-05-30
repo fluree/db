@@ -1081,47 +1081,65 @@ impl LedgerManager {
                     armed: true,
                 };
 
-                // We're the reload leader - do ALL I/O (including the binary
-                // store attach, which reads S3) without the `entries` lock, and
-                // release the handle `state` lock before taking `entries` so the
-                // two locks never overlap (avoids the entries↔state ordering
+                // We're the reload leader. Build the replacement state + binary
+                // store WITHOUT holding the handle `state` lock, so concurrent
+                // queries (snapshot() -> state.lock()) are not blocked behind the
+                // reload's nameservice/S3/index I/O. The lock is taken only for
+                // the brief coherent swap below. The `entries` lock is likewise
+                // not held over any of this and is acquired after the swap, so
+                // the two locks never overlap (avoids the entries↔state ordering
                 // hazard with `current_t`).
-                let result = {
-                    let mut write_guard = handle.lock_for_write().await;
-                    let loaded =
-                        LedgerState::load(&self.nameservice_mode, ledger_id, &self.backend)
-                            .await
-                            .map_err(ApiError::from);
-                    match loaded {
-                        Ok(mut new_state) => {
-                            // Attempt to load binary index store (v2 only)
-                            let new_binary_store = match load_and_attach_binary_store(
-                                &self.backend,
-                                self.nameservice_mode.reader(),
-                                &mut new_state,
-                                &self.config.cache_dir,
-                                self.config.leaflet_cache.clone(),
-                            )
-                            .await
-                            {
-                                Ok(store) => store,
-                                Err(e) => {
-                                    tracing::warn!(
-                                        ledger_id = %ledger_id,
-                                        error = %e,
-                                        "Failed to load binary store during reload, continuing without"
-                                    );
-                                    None
-                                }
-                            };
+                let loaded = LedgerState::load(&self.nameservice_mode, ledger_id, &self.backend)
+                    .await
+                    .map_err(ApiError::from);
+                let result = match loaded {
+                    Ok(mut new_state) => {
+                        // Attempt to load binary index store (v2 only) — still off-lock.
+                        let new_binary_store = match load_and_attach_binary_store(
+                            &self.backend,
+                            self.nameservice_mode.reader(),
+                            &mut new_state,
+                            &self.config.cache_dir,
+                            self.config.leaflet_cache.clone(),
+                        )
+                        .await
+                        {
+                            Ok(store) => store,
+                            Err(e) => {
+                                tracing::warn!(
+                                    ledger_id = %ledger_id,
+                                    error = %e,
+                                    "Failed to load binary store during reload, continuing without"
+                                );
+                                None
+                            }
+                        };
+
+                        // Brief coherent swap. Lock order: state -> binary_store;
+                        // acquire both before mutating so there is no `.await`
+                        // between the two assignments (no incoherent
+                        // state/binary_store window on cancellation, and readers
+                        // blocked on `state` never observe a half-applied swap).
+                        let mut write_guard = handle.lock_for_write().await;
+                        if new_state.t() >= write_guard.state().t() {
+                            let mut bs_guard = handle.inner.binary_store.lock().await;
                             write_guard.replace(new_state);
-                            // Update binary_store coherently (state lock held → correct order).
-                            *handle.inner.binary_store.lock().await = new_binary_store;
-                            Ok(())
+                            *bs_guard = new_binary_store;
+                        } else {
+                            // A concurrent commit advanced the in-memory state
+                            // past the reloaded storage HEAD (a txn took the
+                            // still-valid handle via get_or_load's Reloading
+                            // fast path while we loaded). Keep the fresher
+                            // in-memory state rather than clobber the commit.
+                            tracing::debug!(
+                                ledger_id = %ledger_id,
+                                "reload: in-memory state newer than reloaded storage; skipping swap"
+                            );
                         }
-                        Err(e) => Err(e),
+                        Ok(())
+                        // state (and binary_store) guards dropped here, before `entries`.
                     }
-                    // write_guard (handle state lock) dropped here, before `entries`.
+                    Err(e) => Err(e),
                 };
 
                 // Publish under a brief `entries` lock — no `.await` between the
