@@ -2753,6 +2753,71 @@ mod tests {
         assert_eq!(val, FlakeValue::Long(1_350_000));
     }
 
+    /// Regression guard: `LeafletCache` single-flight must not starve a small
+    /// runtime. N callers contending on the same cold dict-leaf key (1 leader
+    /// runs the load under `block_in_place`, the rest wait) must all complete
+    /// on a 2-worker runtime. Before the fix the waiters parked both workers
+    /// synchronously with no `block_in_place`, so nothing drove the reactor and
+    /// the leader's `block_on` never completed — a hard, container-burning wedge
+    /// (the residual after the dict/pack bridge fix). Watchdog'd so a regression
+    /// fails instead of hanging.
+    #[test]
+    fn leaflet_cache_single_flight_frees_workers_under_contention() {
+        use crate::read::leaflet_cache::LeafletCache;
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        let (tx, rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            let rt = tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(2)
+                .enable_all()
+                .build()
+                .unwrap();
+            let done = rt.block_on(async {
+                let cache = std::sync::Arc::new(LeafletCache::with_max_mb(64));
+                let handle = tokio::runtime::Handle::current();
+                let mut tasks = Vec::new();
+                for _ in 0..8 {
+                    let c = std::sync::Arc::clone(&cache);
+                    let h = handle.clone();
+                    tasks.push(tokio::spawn(async move {
+                        // All 8 contend on the SAME cold key: 1 leader, 7 waiters.
+                        c.try_get_or_load_dict_leaf(0xABCD_u128, || {
+                            // Leader load bridges to async S3, like the dict path.
+                            tokio::task::block_in_place(|| {
+                                h.block_on(async {
+                                    tokio::time::sleep(Duration::from_millis(50)).await;
+                                });
+                            });
+                            Ok::<_, std::io::Error>(std::sync::Arc::from(
+                                vec![1u8, 2, 3].into_boxed_slice(),
+                            ))
+                        })
+                    }));
+                }
+                let mut ok = 0usize;
+                for t in tasks {
+                    if matches!(t.await, Ok(Ok(_))) {
+                        ok += 1;
+                    }
+                }
+                ok
+            });
+            let _ = tx.send(done);
+        });
+
+        match rx.recv_timeout(Duration::from_secs(8)) {
+            Ok(n) => assert_eq!(
+                n, 8,
+                "all single-flight callers must complete on a 2-worker runtime"
+            ),
+            Err(_) => panic!(
+                "LeafletCache single-flight wedged a 2-worker runtime under contention (regression)"
+            ),
+        }
+    }
+
     /// Regression guard for the multi-query worker-starvation wedge.
     ///
     /// `run_sync_on_runtime` is the sync→async bridge for all CAS-backed index
