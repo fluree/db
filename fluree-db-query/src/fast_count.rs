@@ -461,67 +461,60 @@ fn count_triples_from_branch_manifest(store: &BinaryIndexStore, g_id: GraphId) -
     Ok(0)
 }
 
-/// Fast-path: count distinct subjects across all triples.
-pub fn count_distinct_subjects_operator(
-    out_var: VarId,
-    fallback: Option<BoxedOperator>,
-) -> FastPathOperator {
-    FastPathOperator::new(
-        out_var,
-        move |ctx| {
-            let Some(store) = fast_path_store(ctx) else {
-                return Ok(None);
-            };
-            // SPOT key layout: s_id(8) + p_id(4) + o_type(2) + o_key(8) + o_i(4).
-            // Distinct subjects = lead bytes [0..8].
-            let count = count_distinct_lead_groups(store, ctx.binary_g_id, RunSortOrder::Spot, 8)?;
-            let count_i64 = count_to_i64(count, "COUNT(DISTINCT) subjects")?;
-            Ok(Some(build_count_batch(out_var, count_i64)?))
-        },
-        fallback,
-        "distinct subject COUNT",
-    )
+/// Which triple position a `COUNT(DISTINCT ?v)` over `?s ?p ?o` targets.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum DistinctPosition {
+    Subjects,
+    Predicates,
+    Objects,
 }
 
-/// Fast-path: count distinct predicates across all triples.
-pub fn count_distinct_predicates_operator(
+/// Fast-path: count distinct subjects / predicates / objects across all triples.
+///
+/// Subjects (SPOT) and objects (OPST) are answered metadata-only from leaflet
+/// `lead_group_count` with a boundary-overlap correction; predicates use PSOT
+/// `p_const` transitions (PSOT leaflets are predicate-homogeneous). The two
+/// dedup algorithms genuinely differ, so they stay distinct behind the
+/// `position` branch — only the operator/dispatch shell is unified.
+pub fn count_distinct_position_operator(
+    position: DistinctPosition,
     out_var: VarId,
     fallback: Option<BoxedOperator>,
 ) -> FastPathOperator {
+    let label = match position {
+        DistinctPosition::Subjects => "distinct subject COUNT",
+        DistinctPosition::Predicates => "distinct predicate COUNT",
+        DistinctPosition::Objects => "distinct object COUNT",
+    };
     FastPathOperator::new(
         out_var,
         move |ctx| {
             let Some(store) = fast_path_store(ctx) else {
                 return Ok(None);
             };
-            let count = count_distinct_predicates_psot(store, ctx.binary_g_id)?;
-            let count_i64 = count_to_i64(count, "COUNT(DISTINCT) predicates")?;
-            Ok(Some(build_count_batch(out_var, count_i64)?))
-        },
-        fallback,
-        "distinct predicate COUNT",
-    )
-}
-
-/// Fast-path: count distinct objects across all triples.
-pub fn count_distinct_objects_operator(
-    out_var: VarId,
-    fallback: Option<BoxedOperator>,
-) -> FastPathOperator {
-    FastPathOperator::new(
-        out_var,
-        move |ctx| {
-            let Some(store) = fast_path_store(ctx) else {
-                return Ok(None);
+            let (count, overflow_label) = match position {
+                // SPOT key layout: s_id(8) + p_id(4) + o_type(2) + o_key(8) + o_i(4).
+                // Distinct subjects = lead bytes [0..8].
+                DistinctPosition::Subjects => (
+                    count_distinct_lead_groups(store, ctx.binary_g_id, RunSortOrder::Spot, 8)?,
+                    "COUNT(DISTINCT) subjects",
+                ),
+                DistinctPosition::Predicates => (
+                    count_distinct_predicates_psot(store, ctx.binary_g_id)?,
+                    "COUNT(DISTINCT) predicates",
+                ),
+                // OPST key layout: o_type(2) + o_key(8) + o_i(4) + p_id(4) + s_id(8).
+                // Distinct objects = lead bytes [0..10].
+                DistinctPosition::Objects => (
+                    count_distinct_lead_groups(store, ctx.binary_g_id, RunSortOrder::Opst, 10)?,
+                    "COUNT(DISTINCT) objects",
+                ),
             };
-            // OPST key layout: o_type(2) + o_key(8) + o_i(4) + p_id(4) + s_id(8).
-            // Distinct objects = lead bytes [0..10].
-            let count = count_distinct_lead_groups(store, ctx.binary_g_id, RunSortOrder::Opst, 10)?;
-            let count_i64 = count_to_i64(count, "COUNT(DISTINCT) objects")?;
+            let count_i64 = count_to_i64(count, overflow_label)?;
             Ok(Some(build_count_batch(out_var, count_i64)?))
         },
         fallback,
-        "distinct object COUNT",
+        label,
     )
 }
 

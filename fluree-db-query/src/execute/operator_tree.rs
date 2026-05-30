@@ -11,10 +11,9 @@ use crate::error::{QueryError, Result};
 use crate::eval::PreparedBoolExpression;
 use crate::fast_count::{
     count_blank_node_subjects_operator, count_distinct_object_operator,
-    count_distinct_objects_operator, count_distinct_predicates_operator,
-    count_distinct_subjects_operator, count_literal_objects_operator,
+    count_distinct_position_operator, count_literal_objects_operator,
     count_rows_lang_filter_operator, count_rows_numeric_compare_operator, count_rows_operator,
-    count_triples_operator, NumericCompareOp,
+    count_triples_operator, DistinctPosition, NumericCompareOp,
 };
 use crate::fast_exists_join_count_distinct_object::exists_join_count_distinct_object_operator;
 use crate::fast_fused_scan_sum::{
@@ -1589,32 +1588,12 @@ fn detect_count_literal_objects(query: &Query) -> Option<VarId> {
     Some(out_var)
 }
 
-fn detect_count_distinct_objects(query: &Query) -> Option<VarId> {
-    let (in_var, out_var) = detect_count_distinct_aggregate(query)?;
-
-    // Pattern shape: exactly one triple with all vars.
-    if query.patterns.len() != 1 {
-        return None;
-    }
-    let Pattern::Triple(tp) = &query.patterns[0] else {
-        return None;
-    };
-    let Ref::Var(_sv) = &tp.s else { return None };
-    let Ref::Var(_pv) = &tp.p else { return None };
-    let Term::Var(ov) = &tp.o else { return None };
-    if tp.dtc.is_some() {
-        return None;
-    }
-
-    // COUNT(DISTINCT ?o) specifically.
-    if in_var != *ov {
-        return None;
-    }
-
-    Some(out_var)
-}
-
-fn detect_count_distinct_subjects(query: &Query) -> Option<VarId> {
+/// Detect `SELECT (COUNT(DISTINCT ?v) AS ?c) WHERE { ?s ?p ?o }` and resolve
+/// which triple position `?v` binds. All three positions must be variables (the
+/// fast paths read whole-permutation metadata), matching the prior three
+/// separate detectors exactly. Priority on positional ambiguity (e.g. `?x ?p ?x`)
+/// is subjects → predicates → objects, preserving the old dispatch order.
+fn detect_count_distinct_position(query: &Query) -> Option<(DistinctPosition, VarId)> {
     let (in_var, out_var) = detect_count_distinct_aggregate(query)?;
 
     // Pattern shape: exactly one triple with all vars.
@@ -1625,43 +1604,23 @@ fn detect_count_distinct_subjects(query: &Query) -> Option<VarId> {
         return None;
     };
     let Ref::Var(sv) = &tp.s else { return None };
-    let Ref::Var(_pv) = &tp.p else { return None };
-    let Term::Var(_ov) = &tp.o else { return None };
+    let Ref::Var(pv) = &tp.p else { return None };
+    let Term::Var(ov) = &tp.o else { return None };
     if tp.dtc.is_some() {
         return None;
     }
 
-    // COUNT(DISTINCT ?s) specifically.
-    if in_var != *sv {
-        return None;
-    }
-
-    Some(out_var)
-}
-
-fn detect_count_distinct_predicates(query: &Query) -> Option<VarId> {
-    let (in_var, out_var) = detect_count_distinct_aggregate(query)?;
-
-    // Pattern shape: exactly one triple with all vars.
-    if query.patterns.len() != 1 {
-        return None;
-    }
-    let Pattern::Triple(tp) = &query.patterns[0] else {
+    let position = if in_var == *sv {
+        DistinctPosition::Subjects
+    } else if in_var == *pv {
+        DistinctPosition::Predicates
+    } else if in_var == *ov {
+        DistinctPosition::Objects
+    } else {
         return None;
     };
-    let Ref::Var(_sv) = &tp.s else { return None };
-    let Ref::Var(pv) = &tp.p else { return None };
-    let Term::Var(_ov) = &tp.o else { return None };
-    if tp.dtc.is_some() {
-        return None;
-    }
 
-    // COUNT(DISTINCT ?p) specifically.
-    if in_var != *pv {
-        return None;
-    }
-
-    Some(out_var)
+    Some((position, out_var))
 }
 
 fn detect_count_triples(query: &Query) -> Option<VarId> {
@@ -2142,24 +2101,17 @@ fn build_operator_tree_inner(
         }
     }
 
-    // Fast-path: `SELECT (COUNT(DISTINCT ?s) AS ?c) WHERE { ?s ?p ?o }`
-    // answered metadata-only from SPOT leaflet `lead_group_count` + boundary correction.
+    // Fast-path: `SELECT (COUNT(DISTINCT ?s|?p|?o) AS ?c) WHERE { ?s ?p ?o }`
+    // answered metadata-only: subjects from SPOT `lead_group_count` + boundary
+    // correction, predicates from PSOT `p_const` transitions, objects from OPST
+    // `lead_group_count` + boundary correction. The object variant is mutually
+    // exclusive with every detector between here and its old position, so folding
+    // it into this block does not change which fast path fires.
     if enable_fused_fast_paths {
-        if let Some(out_var) = detect_count_distinct_subjects(query) {
+        if let Some((position, out_var)) = detect_count_distinct_position(query) {
             let fallback = build_operator_tree_inner(query, stats.clone(), false, planning)?;
-            return Ok(Box::new(count_distinct_subjects_operator(
-                out_var,
-                Some(fallback),
-            )));
-        }
-    }
-
-    // Fast-path: `SELECT (COUNT(DISTINCT ?p) AS ?c) WHERE { ?s ?p ?o }`
-    // answered metadata-only from PSOT leaflet `p_const` transitions.
-    if enable_fused_fast_paths {
-        if let Some(out_var) = detect_count_distinct_predicates(query) {
-            let fallback = build_operator_tree_inner(query, stats.clone(), false, planning)?;
-            return Ok(Box::new(count_distinct_predicates_operator(
+            return Ok(Box::new(count_distinct_position_operator(
+                position,
                 out_var,
                 Some(fallback),
             )));
@@ -2229,18 +2181,6 @@ fn build_operator_tree_inner(
             return Ok(Box::new(transitive_path_plus_count_all_operator(
                 p1,
                 p2,
-                out_var,
-                Some(fallback),
-            )));
-        }
-    }
-
-    // Fast-path: `SELECT (COUNT(DISTINCT ?o) AS ?c) WHERE { ?s ?p ?o }`
-    // answered metadata-only from OPST leaflet `lead_group_count` + boundary correction.
-    if enable_fused_fast_paths {
-        if let Some(out_var) = detect_count_distinct_objects(query) {
-            let fallback = build_operator_tree_inner(query, stats.clone(), false, planning)?;
-            return Ok(Box::new(count_distinct_objects_operator(
                 out_var,
                 Some(fallback),
             )));
