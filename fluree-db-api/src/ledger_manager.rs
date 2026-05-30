@@ -1662,18 +1662,20 @@ impl LedgerManager {
 
     /// Returns the cached ledger's current `t`, or `None` if not cached.
     pub async fn current_t(&self, ledger_id: &str) -> Option<i64> {
-        let entries = self.entries.read().await;
-        match entries.get(ledger_id) {
-            Some(LoadState::Ready(handle)) => {
-                let (t, _, _) = handle.state_metrics().await;
-                Some(t)
+        // Clone the handle out and drop the `entries` read guard BEFORE locking
+        // the handle `state` (via state_metrics): never hold `entries` across a
+        // `state` lock, so there is no entries↔state acquisition-order pair to
+        // deadlock with writers. Mirrors `notify`.
+        let handle = {
+            let entries = self.entries.read().await;
+            match entries.get(ledger_id) {
+                Some(LoadState::Ready(handle)) => handle.clone(),
+                Some(LoadState::Reloading { handle, .. }) => handle.clone(),
+                _ => return None,
             }
-            Some(LoadState::Reloading { handle, .. }) => {
-                let (t, _, _) = handle.state_metrics().await;
-                Some(t)
-            }
-            _ => None,
-        }
+        };
+        let (t, _, _) = handle.state_metrics().await;
+        Some(t)
     }
 }
 
