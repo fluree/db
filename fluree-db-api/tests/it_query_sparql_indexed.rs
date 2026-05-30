@@ -861,6 +861,270 @@ async fn indexed_overlay_count_reflects_retract_and_reassert() {
         .await;
 }
 
+/// Regression (Tier-2): a filterless `COUNT(*)` over a single bound-predicate
+/// triple must track novelty even though the metadata count planner bails on
+/// overlay.
+///
+/// Under overlay, `count_plan`/`count_rows` (strategy a) decline and the query
+/// falls back to the generic `GroupAggregate(COUNT(*))` over a scan. That
+/// pushdown now fires through `DatasetOperator`/`BinaryScanOperator::drain_count`
+/// — the count-only "clean lane" sums the overlay-merged cursor's rows without
+/// materializing bindings. This verifies the lane reflects both an overlay
+/// assertion and an overlay retraction of `ex:knows` edges.
+#[tokio::test]
+async fn indexed_overlay_count_star_drain_count_reflects_overlay() {
+    assert_index_defaults();
+    let fluree = FlureeBuilder::memory()
+        .with_ledger_cache_config(LedgerManagerConfig::default())
+        .build_memory();
+    let ledger_id = "it/overlay-count-drain:main";
+
+    let (local, handle) = start_background_indexer_local(
+        fluree.backend().clone(),
+        Arc::new(fluree.nameservice_mode().clone()),
+        fluree_db_indexer::IndexerConfig::small(),
+    );
+
+    local
+        .run_until(async move {
+            let index_cfg = IndexConfig {
+                reindex_min_bytes: 0,
+                reindex_max_bytes: 10_000_000,
+            };
+
+            // Phase 1: Seed and index 3 ex:knows edges (a→b, a→c, b→c).
+            let ledger0 = genesis_ledger_for_fluree(&fluree, ledger_id);
+            let baseline = json!({
+                "@context": { "ex": "http://example.org/ns/" },
+                "@graph": [
+                    {"@id": "ex:a", "ex:knows": [{"@id": "ex:b"}, {"@id": "ex:c"}]},
+                    {"@id": "ex:b", "ex:knows": {"@id": "ex:c"}}
+                ]
+            });
+            let ledger1 = fluree
+                .insert_with_opts(
+                    ledger0,
+                    &baseline,
+                    TxnOpts::default(),
+                    CommitOpts::default(),
+                    &index_cfg,
+                )
+                .await
+                .expect("baseline insert")
+                .ledger;
+
+            let outcome = trigger_index_and_wait_outcome(&handle, ledger_id, ledger1.t()).await;
+            if let fluree_db_api::IndexOutcome::Completed { index_t, .. } = outcome {
+                assert_eq!(index_t, 1, "should index to t=1");
+            }
+
+            // Bound predicate, unbound subject + object, no FILTER => the scan is
+            // `count_only_eligible` and drain_count counts the cursor directly.
+            let query = r"
+                PREFIX ex: <http://example.org/ns/>
+                SELECT (COUNT(*) AS ?cnt)
+                WHERE { ?s ex:knows ?o . }
+            ";
+
+            let view1 = fluree
+                .db_at_t(ledger_id, ledger1.t())
+                .await
+                .expect("load view at t=1");
+            let result = fluree
+                .query(&view1, QueryInput::Sparql(query))
+                .await
+                .expect("count at t=1");
+            let jsonld = result.to_jsonld(&view1.snapshot).expect("to_jsonld");
+            assert_eq!(
+                normalize_rows(&jsonld),
+                normalize_rows(&json!([[3]])),
+                "indexed-only count should be 3"
+            );
+
+            // Phase 2: Assert a new edge in novelty (c→a).
+            let assert = json!({
+                "@context": { "ex": "http://example.org/ns/" },
+                "@graph": [ {"@id": "ex:c", "ex:knows": {"@id": "ex:a"}} ]
+            });
+            let ledger2 = fluree
+                .insert(ledger1, &assert)
+                .await
+                .expect("assert in novelty")
+                .ledger;
+
+            let view2 = fluree
+                .db_at_t(ledger_id, ledger2.t())
+                .await
+                .expect("load view at t=2");
+            let result = fluree
+                .query(&view2, QueryInput::Sparql(query))
+                .await
+                .expect("count at t=2");
+            let jsonld = result.to_jsonld(&view2.snapshot).expect("to_jsonld");
+            assert_eq!(
+                normalize_rows(&jsonld),
+                normalize_rows(&json!([[4]])),
+                "count should reflect the overlay assertion"
+            );
+
+            // Phase 3: Retract an indexed edge in novelty (a→b).
+            let retract = json!({
+                "@context": { "ex": "http://example.org/ns/" },
+                "delete": [ {"@id": "ex:a", "ex:knows": {"@id": "ex:b"}} ]
+            });
+            let ledger3 = fluree
+                .update(ledger2, &retract)
+                .await
+                .expect("retract in novelty")
+                .ledger;
+
+            let view3 = fluree
+                .db_at_t(ledger_id, ledger3.t())
+                .await
+                .expect("load view at t=3");
+            let result = fluree
+                .query(&view3, QueryInput::Sparql(query))
+                .await
+                .expect("count at t=3");
+            let jsonld = result.to_jsonld(&view3.snapshot).expect("to_jsonld");
+            assert_eq!(
+                normalize_rows(&jsonld),
+                normalize_rows(&json!([[3]])),
+                "count should reflect the overlay retraction"
+            );
+        })
+        .await;
+}
+
+/// Regression (Tier-2): the encoded-prefilter `COUNT` path (`CountRowsOperator`)
+/// must track novelty. It now gates on `allow_cursor_fast_path` (strategy b)
+/// instead of `fast_path_store`, so its overlay-merging `DatasetOperator::scan`
+/// `fast_child` runs under overlay rather than bailing to the generic fallback.
+/// Exercised via `FILTER(?s = ?o)` (an encoded `SubjectEqObjectRef` prefilter).
+#[tokio::test]
+async fn indexed_overlay_count_encoded_filter_reflects_overlay() {
+    assert_index_defaults();
+    let fluree = FlureeBuilder::memory()
+        .with_ledger_cache_config(LedgerManagerConfig::default())
+        .build_memory();
+    let ledger_id = "it/overlay-count-encoded-filter:main";
+
+    let (local, handle) = start_background_indexer_local(
+        fluree.backend().clone(),
+        Arc::new(fluree.nameservice_mode().clone()),
+        fluree_db_indexer::IndexerConfig::small(),
+    );
+
+    local
+        .run_until(async move {
+            let index_cfg = IndexConfig {
+                reindex_min_bytes: 0,
+                reindex_max_bytes: 10_000_000,
+            };
+
+            // Phase 1: Seed two self-loops (a→a, b→b) and one non-loop (c→d).
+            let ledger0 = genesis_ledger_for_fluree(&fluree, ledger_id);
+            let baseline = json!({
+                "@context": { "ex": "http://example.org/ns/" },
+                "@graph": [
+                    {"@id": "ex:a", "ex:rel": {"@id": "ex:a"}},
+                    {"@id": "ex:b", "ex:rel": {"@id": "ex:b"}},
+                    {"@id": "ex:c", "ex:rel": {"@id": "ex:d"}}
+                ]
+            });
+            let ledger1 = fluree
+                .insert_with_opts(
+                    ledger0,
+                    &baseline,
+                    TxnOpts::default(),
+                    CommitOpts::default(),
+                    &index_cfg,
+                )
+                .await
+                .expect("baseline insert")
+                .ledger;
+
+            let outcome = trigger_index_and_wait_outcome(&handle, ledger_id, ledger1.t()).await;
+            if let fluree_db_api::IndexOutcome::Completed { index_t, .. } = outcome {
+                assert_eq!(index_t, 1, "should index to t=1");
+            }
+
+            let query = r"
+                PREFIX ex: <http://example.org/ns/>
+                SELECT (COUNT(*) AS ?cnt)
+                WHERE { ?s ex:rel ?o . FILTER(?s = ?o) }
+            ";
+
+            let view1 = fluree
+                .db_at_t(ledger_id, ledger1.t())
+                .await
+                .expect("load view at t=1");
+            let result = fluree
+                .query(&view1, QueryInput::Sparql(query))
+                .await
+                .expect("count at t=1");
+            let jsonld = result.to_jsonld(&view1.snapshot).expect("to_jsonld");
+            assert_eq!(
+                normalize_rows(&jsonld),
+                normalize_rows(&json!([[2]])),
+                "indexed-only self-loop count should be 2"
+            );
+
+            // Phase 2: Assert a new self-loop in novelty (e→e).
+            let assert = json!({
+                "@context": { "ex": "http://example.org/ns/" },
+                "@graph": [ {"@id": "ex:e", "ex:rel": {"@id": "ex:e"}} ]
+            });
+            let ledger2 = fluree
+                .insert(ledger1, &assert)
+                .await
+                .expect("assert in novelty")
+                .ledger;
+
+            let view2 = fluree
+                .db_at_t(ledger_id, ledger2.t())
+                .await
+                .expect("load view at t=2");
+            let result = fluree
+                .query(&view2, QueryInput::Sparql(query))
+                .await
+                .expect("count at t=2");
+            let jsonld = result.to_jsonld(&view2.snapshot).expect("to_jsonld");
+            assert_eq!(
+                normalize_rows(&jsonld),
+                normalize_rows(&json!([[3]])),
+                "encoded-filter count should reflect the overlay self-loop assertion"
+            );
+
+            // Phase 3: Retract an indexed self-loop in novelty (a→a).
+            let retract = json!({
+                "@context": { "ex": "http://example.org/ns/" },
+                "delete": [ {"@id": "ex:a", "ex:rel": {"@id": "ex:a"}} ]
+            });
+            let ledger3 = fluree
+                .update(ledger2, &retract)
+                .await
+                .expect("retract in novelty")
+                .ledger;
+
+            let view3 = fluree
+                .db_at_t(ledger_id, ledger3.t())
+                .await
+                .expect("load view at t=3");
+            let result = fluree
+                .query(&view3, QueryInput::Sparql(query))
+                .await
+                .expect("count at t=3");
+            let jsonld = result.to_jsonld(&view3.snapshot).expect("to_jsonld");
+            assert_eq!(
+                normalize_rows(&jsonld),
+                normalize_rows(&json!([[2]])),
+                "encoded-filter count should reflect the overlay self-loop retraction"
+            );
+        })
+        .await;
+}
+
 /// Regression: the `<S> <p>+ ?o` COUNT(*) fast path must incorporate novelty.
 ///
 /// Property-path+ COUNT used to gate on `fast_path_store`, which bails the
