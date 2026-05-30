@@ -710,10 +710,28 @@ impl BackgroundIndexerWorker {
                     let mut states = self.states.lock().await;
                     if let Some(state) = states.get_mut(&ledger_id) {
                         state.last_error = Some("indexer task panicked".to_string());
-                        state.phase = IndexPhase::Pending;
-                        state.next_retry_at =
-                            Some(tokio::time::Instant::now() + retry_backoff(state.retry_count));
-                        state.retry_count = state.retry_count.saturating_add(1);
+                        if state.cancelled {
+                            // Cancelled mid-build: resolve as cancelled and go
+                            // idle (mirror schedule_retry / the run-loop cancel
+                            // cleanup). Setting Pending here would strand it:
+                            // pending_min_t is already cleared, so it would
+                            // never be re-processed yet report busy forever.
+                            state.resolve_waiters_below(i64::MAX, IndexOutcome::Cancelled);
+                            state.pending_min_t = None;
+                            state.phase = IndexPhase::Idle;
+                            state.cancelled = false;
+                        } else if state.has_pending_work() {
+                            // Retryable work remains: back off and retry.
+                            state.phase = IndexPhase::Pending;
+                            state.next_retry_at = Some(
+                                tokio::time::Instant::now() + retry_backoff(state.retry_count),
+                            );
+                            state.retry_count = state.retry_count.saturating_add(1);
+                        } else {
+                            // Nothing pending to retry — go idle rather than
+                            // leave it stuck Pending/busy.
+                            state.phase = IndexPhase::Idle;
+                        }
                     }
                 }
                 debug!(ledger_id = %ledger_id, "process_ledger returned");
