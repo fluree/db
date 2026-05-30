@@ -334,97 +334,11 @@ fn count_rows_for_predicate_lang_psot(
     Ok(total)
 }
 
-// ---------------------------------------------------------------------------
-// 2) COUNT(DISTINCT ?o) for single predicate `?s <p> ?o` (POST scan, encoded IDs)
-// ---------------------------------------------------------------------------
-
-/// Fast-path fused scan + COUNT(DISTINCT ?o) for a single predicate.
-pub fn count_distinct_object_operator(
-    predicate: Ref,
-    out_var: VarId,
-    fallback: Option<BoxedOperator>,
-) -> FastPathOperator {
-    FastPathOperator::new(
-        out_var,
-        move |ctx| {
-            let Some(store) = fast_path_store(ctx) else {
-                return Ok(None);
-            };
-            match count_distinct_object_post(store, ctx.binary_g_id, &predicate)? {
-                Some(count) => Ok(Some(build_count_batch(
-                    out_var,
-                    count_to_i64(count, "COUNT(DISTINCT)")?,
-                )?)),
-                None => Ok(None), // Unsupported at runtime — fall through to planned pipeline.
-            }
-        },
-        fallback,
-        "COUNT(DISTINCT)",
-    )
-}
-
-/// COUNT DISTINCT objects for a bound predicate by scanning POST.
-///
-/// Returns `None` when the fast-path cannot guarantee correctness (e.g., mixed o_type).
-fn count_distinct_object_post(
-    store: &BinaryIndexStore,
-    g_id: GraphId,
-    predicate: &Ref,
-) -> Result<Option<u64>> {
-    let pred_sid = normalize_pred_sid(store, predicate)?;
-    let Some(p_id) = store.sid_to_p_id(&pred_sid) else {
-        // Predicate not present in the persisted dict — empty result.
-        return Ok(Some(0));
-    };
-
-    let leaves = leaf_entries_for_predicate(store, g_id, RunSortOrder::Post, p_id);
-
-    // For now: only handle the common case where the object is an IRI ref (e.g., rdf:type).
-    // This avoids all dictionary decoding and is already a huge win for DBLP.
-    let required_o_type = OType::IRI_REF.as_u16();
-
-    let projection = projection_okey_only();
-
-    let mut prev_okey: Option<u64> = None;
-    let mut distinct: u64 = 0;
-
-    for leaf_entry in leaves {
-        let handle = store
-            .open_leaf_handle(&leaf_entry.leaf_cid, leaf_entry.sidecar_cid.as_ref(), false)
-            .map_err(|e| QueryError::Internal(format!("leaf open: {e}")))?;
-
-        let dir = handle.dir();
-        for (leaflet_idx, entry) in dir.entries.iter().enumerate() {
-            if entry.row_count == 0 {
-                continue;
-            }
-            if entry.p_const != Some(p_id) {
-                continue;
-            }
-            // Require o_type_const and require it to be IRI_REF for now.
-            if entry.o_type_const != Some(required_o_type) {
-                return Ok(None);
-            }
-
-            let batch = handle
-                .load_columns(leaflet_idx, &projection, RunSortOrder::Post)
-                .map_err(|e| QueryError::Internal(format!("load columns: {e}")))?;
-
-            for row in 0..batch.row_count {
-                let okey = batch.o_key.get(row);
-                if prev_okey != Some(okey) {
-                    distinct += 1;
-                    prev_okey = Some(okey);
-                }
-            }
-        }
-    }
-
-    Ok(Some(distinct))
-}
+// COUNT(DISTINCT ?o) for a single predicate now lives in the consolidated
+// `fast_predicate_scalar_agg` module alongside SUM/AVG (shared POST-scan driver).
 
 // ---------------------------------------------------------------------------
-// 3) COUNT(*) / COUNT(?x) for `?s ?p ?o` and COUNT(DISTINCT ?lead)
+// COUNT(*) / COUNT(?x) for `?s ?p ?o` and COUNT(DISTINCT ?lead)
 // ---------------------------------------------------------------------------
 
 /// Fast-path: count total triples across all patterns.

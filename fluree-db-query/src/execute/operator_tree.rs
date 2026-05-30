@@ -10,27 +10,25 @@ use crate::distinct::DistinctOperator;
 use crate::error::{QueryError, Result};
 use crate::eval::PreparedBoolExpression;
 use crate::fast_count::{
-    count_blank_node_subjects_operator, count_distinct_object_operator,
-    count_distinct_position_operator, count_literal_objects_operator,
-    count_rows_lang_filter_operator, count_rows_numeric_compare_operator, count_rows_operator,
-    count_triples_operator, DistinctPosition, NumericCompareOp,
+    count_blank_node_subjects_operator, count_distinct_position_operator,
+    count_literal_objects_operator, count_rows_lang_filter_operator,
+    count_rows_numeric_compare_operator, count_rows_operator, count_triples_operator,
+    DistinctPosition, NumericCompareOp,
 };
 use crate::fast_exists_join_count_distinct_object::exists_join_count_distinct_object_operator;
-use crate::fast_fused_scan_sum::{
-    fused_scan_sum_i64_operator, DateComponentFn, NumericUnaryFn, SumExprI64,
-};
 use crate::fast_group_count_firsts::{
     GroupByObjectStarTopKOperator, PredicateGroupCountFirstsOperator,
     PredicateObjectCountFirstsOperator,
 };
 use crate::fast_label_regex_type::label_regex_type_operator;
-use crate::fast_min_max_string::{
-    predicate_avg_numeric_operator, predicate_min_max_string_operator, MinMaxMode,
-};
+use crate::fast_min_max_string::{predicate_min_max_string_operator, MinMaxMode};
 use crate::fast_multicolumn_join_count_all::multicolumn_join_count_all_operator;
 use crate::fast_optional_chain_head_count_all::predicate_optional_chain_head_count_all;
 use crate::fast_path_plus_count_all::{
     property_path_plus_count_all_operator, transitive_path_plus_count_all_operator,
+};
+use crate::fast_predicate_scalar_agg::{
+    predicate_scalar_agg_operator, DateComponentFn, NumericUnaryFn, ScalarAggKind, SumExprI64,
 };
 use crate::fast_star_const_order_topk::star_const_ordered_limit_operator;
 use crate::fast_string_prefix_count_all::{
@@ -1891,9 +1889,9 @@ fn build_operator_tree_inner(
             // Build fallback operator tree without this fast path to preserve correctness in
             // pre-index / history / policy contexts.
             let fallback = build_operator_tree_inner(query, stats.clone(), false, planning)?;
-            return Ok(Box::new(fused_scan_sum_i64_operator(
+            return Ok(Box::new(predicate_scalar_agg_operator(
+                ScalarAggKind::Sum(scalar),
                 pred,
-                scalar,
                 out_var,
                 Some(fallback),
             )));
@@ -1905,7 +1903,8 @@ fn build_operator_tree_inner(
     if enable_fused_fast_paths {
         if let Some((pred, out_var)) = detect_predicate_avg_numeric(query) {
             let fallback = build_operator_tree_inner(query, stats.clone(), false, planning)?;
-            return Ok(Box::new(predicate_avg_numeric_operator(
+            return Ok(Box::new(predicate_scalar_agg_operator(
+                ScalarAggKind::AvgNumeric,
                 pred,
                 out_var,
                 Some(fallback),
@@ -1918,7 +1917,8 @@ fn build_operator_tree_inner(
     if enable_fused_fast_paths {
         if let Some((pred, out_var)) = detect_predicate_count_distinct_object(query) {
             let fallback = build_operator_tree_inner(query, stats.clone(), false, planning)?;
-            return Ok(Box::new(count_distinct_object_operator(
+            return Ok(Box::new(predicate_scalar_agg_operator(
+                ScalarAggKind::CountDistinctObject,
                 pred,
                 out_var,
                 Some(fallback),
