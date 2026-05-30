@@ -195,6 +195,17 @@ pub struct BinaryScanOperator {
     /// `mode == Current`, it is constructed by `ScanDatasetBuilder` directly
     /// and emits current-state bindings without the `op` channel.
     mode: crate::temporal_mode::TemporalMode,
+    /// Whether the attached store is backed by remote / network storage (S3,
+    /// IPFS, peer proxy). Set in `open()` from `BinaryIndexStore::is_remote()`.
+    ///
+    /// When `true`, the synchronous cursor produce+decode region of
+    /// `next_batch` (which bridges to async S3 via `block_on` deep inside leaf
+    /// and dict reads) is relocated onto a tokio blocking context via
+    /// `block_in_place`, so the runtime's core workers stay free to drive the
+    /// IO reactor and timer. Local file / in-memory scans (`false`) keep the
+    /// region inline on the worker — a per-batch hop there would be a
+    /// regression since every query flows through this operator.
+    remote_scan: bool,
 }
 
 /// A filter that can be evaluated on encoded index columns (no term decoding).
@@ -644,6 +655,7 @@ impl BinaryScanOperator {
             range_iter: None,
             unresolved_bound_subject_iri: None,
             mode,
+            remote_scan: false,
         }
     }
 
@@ -659,6 +671,46 @@ impl BinaryScanOperator {
             .flatten()
             .max()
             .map_or(0, |m| m + 1)
+    }
+
+    /// Drain the binary cursor, decoding rows into `columns` until `batch_size`
+    /// rows are produced or the cursor is exhausted. Returns the number of rows
+    /// produced.
+    ///
+    /// This is the synchronous produce+decode region of `next_batch`. It is
+    /// kept as a standalone `&mut self` method so the caller can run it either
+    /// inline (local stores) or under `tokio::task::block_in_place` (remote
+    /// stores) without duplicating the loop body. See `next_batch` for the
+    /// rationale.
+    fn drain_cursor_into_columns(
+        &mut self,
+        columns: &mut [Vec<Binding>],
+        batch_size: usize,
+        ctx: &ExecutionContext<'_>,
+    ) -> Result<usize> {
+        let mut produced = 0usize;
+        while produced < batch_size {
+            let Some(cursor) = &mut self.cursor else {
+                break;
+            };
+
+            match cursor.next_batch() {
+                Ok(Some(batch)) => {
+                    // Per-leaflet fuel charge happens inside cursor.next_batch.
+                    let n = self.batch_to_bindings(&batch, columns, Some(ctx))?;
+                    produced += n;
+                }
+                Ok(None) => {
+                    // Cursor exhausted — drop it so we can proceed to `range_iter`.
+                    self.cursor = None;
+                    break;
+                }
+                Err(e) => {
+                    return Err(QueryError::from_io("V3 cursor", e));
+                }
+            }
+        }
+        Ok(produced)
     }
 
     /// Convert collected columns into a Batch, handling empty-schema and exhaustion.
@@ -1554,6 +1606,10 @@ impl Operator for BinaryScanOperator {
         // Resolve store and g_id from context.
         self.store = ctx.binary_store.clone();
         self.g_id = ctx.binary_g_id;
+        // Remote/CAS-backed stores block on async S3 deep inside leaf/dict
+        // reads; flag so `next_batch` relocates its synchronous produce+decode
+        // region onto a blocking context (see `next_batch`).
+        self.remote_scan = self.store.as_ref().is_some_and(|s| s.is_remote());
 
         // Multi-graph fanout is handled by DatasetOperator, which wraps
         // BinaryScanOperator at the scan construction sites (where_plan.rs,
@@ -2007,30 +2063,40 @@ impl Operator for BinaryScanOperator {
             .map(|_| Vec::with_capacity(batch_size))
             .collect();
 
-        let mut produced = 0usize;
-
         // Prefer binary cursor (indexed data), then drain any overlay-only fallback flakes.
-        while produced < batch_size {
-            let Some(cursor) = &mut self.cursor else {
-                break;
-            };
+        //
+        // The cursor produce+decode region is synchronous but bridges to async
+        // S3 via `block_on` deep inside leaf and dict reads. On a small
+        // multi-thread runtime (e.g. AWS Lambda's 2 workers) running it inline
+        // can park every worker inside `block_on`, starving the IO reactor and
+        // timer and wedging the runtime. For remote/CAS-backed stores we
+        // relocate the region onto a blocking context via `block_in_place`,
+        // which converts the current worker to a blocking thread and lets
+        // tokio spin up a replacement to keep driving the reactor. The nested
+        // `block_in_place` inside the leaf/dict bridges is then a harmless
+        // no-op. Local file / in-memory scans keep the region inline — taking
+        // the hop per batch on the all-local path would be a real regression
+        // since every query flows through this operator.
+        //
+        // The loop body is identical in both arms; only its execution context
+        // differs. `block_in_place` (unlike `spawn_blocking`) imposes no
+        // `Send`/`'static` bound, so `apply_inline` — which borrows `ctx` and
+        // can itself trigger S3/dict decode — stays inside the blocking region
+        // with byte-for-byte identical semantics, and there is no cancellation
+        // hole (the region runs to completion with no intervening await).
+        let use_block_in_place = self.remote_scan
+            && matches!(
+                tokio::runtime::Handle::try_current().map(|h| h.runtime_flavor()),
+                Ok(tokio::runtime::RuntimeFlavor::MultiThread)
+            );
 
-            match cursor.next_batch() {
-                Ok(Some(batch)) => {
-                    // Per-leaflet fuel charge happens inside cursor.next_batch.
-                    let n = self.batch_to_bindings(&batch, &mut columns, Some(ctx))?;
-                    produced += n;
-                }
-                Ok(None) => {
-                    // Cursor exhausted — drop it so we can proceed to `range_iter`.
-                    self.cursor = None;
-                    break;
-                }
-                Err(e) => {
-                    return Err(QueryError::from_io("V3 cursor", e));
-                }
-            }
-        }
+        let mut produced = if use_block_in_place {
+            tokio::task::block_in_place(|| {
+                self.drain_cursor_into_columns(&mut columns, batch_size, ctx)
+            })?
+        } else {
+            self.drain_cursor_into_columns(&mut columns, batch_size, ctx)?
+        };
 
         if produced < batch_size && self.range_iter.is_some() {
             // Overlay/novelty rows are in-memory; charge per row at 1 micro-fuel.

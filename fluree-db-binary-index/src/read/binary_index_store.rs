@@ -326,6 +326,19 @@ impl BinaryIndexStore {
         self.base_t
     }
 
+    /// Whether this store's content backend is remote / network-backed (S3,
+    /// IPFS, peer proxy) and therefore blocks a runtime worker on `block_on`
+    /// during leaf / dict reads.
+    ///
+    /// Stores with no attached CAS (pure in-memory / test stores) are treated
+    /// as local. Used by `BinaryScanOperator` to decide whether to relocate
+    /// its synchronous produce+decode region onto the tokio blocking pool.
+    pub fn is_remote(&self) -> bool {
+        self.cas
+            .as_ref()
+            .is_some_and(fluree_db_core::ContentStore::is_remote)
+    }
+
     /// Set the ledger's split mode for canonical IRI encoding.
     ///
     /// Called after loading to sync with the snapshot's `ns_split_mode`.

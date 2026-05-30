@@ -242,6 +242,24 @@ pub const STORAGE_METHOD_S3: &str = "s3";
 /// Storage method for IPFS (Kubo) content-addressed storage.
 pub const STORAGE_METHOD_IPFS: &str = "ipfs";
 
+/// Whether a storage method identifier denotes a remote / network-backed
+/// backend whose reads block on async IO (S3, IPFS, peer proxy, …) versus a
+/// fast local backend (`file`, `memory`).
+///
+/// Used to decide whether the synchronous produce+decode region of a binary
+/// scan should be relocated onto the tokio blocking pool (remote) or run
+/// inline on the worker (local). Unknown methods are treated as **remote** so
+/// new network backends are correct by default; only the two known-fast local
+/// backends (`file`, `memory`) stay inline.
+pub fn storage_method_is_remote(method: &str) -> bool {
+    // The local methods are `STORAGE_METHOD_FILE` ("file") and
+    // `STORAGE_METHOD_MEMORY` ("memory"). `STORAGE_METHOD_FILE` lives behind
+    // the `native` feature, so the literals are spelled out here to keep this
+    // helper feature-independent. Everything else (s3, ipfs, proxy, unknown
+    // network backends) is treated as remote.
+    !matches!(method, "file" | "memory")
+}
+
 /// Identifies the storage method/scheme for CID-to-address mapping.
 ///
 /// Every storage backend must declare its method name (e.g.,
@@ -376,6 +394,17 @@ pub trait ContentStore: Debug + Send + Sync {
         None
     }
 
+    /// Whether this content store is backed by remote / network storage whose
+    /// reads block on async IO (S3, IPFS, peer proxy, …).
+    ///
+    /// Defaults to `false` (local / in-memory). Remote backends override this
+    /// so callers can relocate synchronous decode regions onto the tokio
+    /// blocking pool instead of wedging a runtime worker on a `block_on`
+    /// bridge. See [`storage_method_is_remote`].
+    fn is_remote(&self) -> bool {
+        false
+    }
+
     /// Signal that this content is no longer needed and may be reclaimed.
     ///
     /// Implementations should make a best effort to free the underlying
@@ -430,6 +459,10 @@ impl ContentStore for Arc<dyn ContentStore> {
 
     fn resolve_local_path(&self, id: &ContentId) -> Option<std::path::PathBuf> {
         self.as_ref().resolve_local_path(id)
+    }
+
+    fn is_remote(&self) -> bool {
+        self.as_ref().is_remote()
     }
 
     async fn release(&self, id: &ContentId) -> Result<()> {
@@ -595,6 +628,10 @@ impl<S: Storage + Send + Sync> ContentStore for StorageContentStore<S> {
         // Fallback: index roots stored with .json before .fir6 rename
         let legacy = self.legacy_index_root_address(id)?;
         self.storage.resolve_local_path(&legacy)
+    }
+
+    fn is_remote(&self) -> bool {
+        storage_method_is_remote(&self.method)
     }
 
     async fn get_range(&self, id: &ContentId, range: std::ops::Range<u64>) -> Result<Vec<u8>> {
@@ -836,6 +873,12 @@ impl ContentStore for BranchedContentStore {
         self.branch_store
             .resolve_local_path(id)
             .or_else(|| self.parents.iter().find_map(|p| p.resolve_local_path(id)))
+    }
+
+    fn is_remote(&self) -> bool {
+        // Remote if the branch's own store or any parent in the fallback DAG is
+        // remote — a read miss can walk into a parent and block on network IO.
+        self.branch_store.is_remote() || self.parents.iter().any(BranchedContentStore::is_remote)
     }
 
     async fn get_range(&self, id: &ContentId, range: std::ops::Range<u64>) -> Result<Vec<u8>> {
