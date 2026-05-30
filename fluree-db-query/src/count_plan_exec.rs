@@ -21,10 +21,10 @@ use crate::fast_path_common::{
     allow_cursor_fast_path, build_count_batch, build_psot_cursor_for_predicate,
     collect_subjects_for_predicate_set, collect_subjects_for_predicate_sorted,
     collect_subjects_with_object_in_set, count_rows_for_predicate_psot, cursor_projection_sid_only,
-    intersect_many_sorted, leaf_entries_for_predicate, normalize_pred_sid,
-    projection_sid_otype_okey, sum_post_object_counts_filtered, FastPathOperator, ObjectFilterMode,
-    PostObjectGroupCountIter, PsotObjectFilterCountIter, PsotSubjectCountIter,
-    PsotSubjectWeightedSumIter,
+    cursor_projection_sid_otype_okey, intersect_many_sorted, leaf_entries_for_predicate,
+    normalize_pred_sid, projection_sid_otype_okey, sum_post_object_counts_filtered,
+    FastPathOperator, ObjectFilterMode, PostObjectGroupCountIter, PsotObjectFilterCountIter,
+    PsotSubjectCountIter, PsotSubjectWeightedSumIter,
 };
 use crate::ir::triple::Ref;
 use crate::operator::BoxedOperator;
@@ -140,10 +140,9 @@ fn plan_overlay_supported(root: &CountPlanRoot) -> bool {
 
 fn scalar_overlay_supported(node: &ScalarNode) -> bool {
     match node {
-        ScalarNode::TotalRowCount { .. } => true,
+        ScalarNode::TotalRowCount { .. } | ScalarNode::CompositeJoinPairCount { .. } => true,
         ScalarNode::Sum { source } => stream_overlay_supported(source),
-        ScalarNode::CompositeJoinPairCount { .. }
-        | ScalarNode::SumExcluding { .. }
+        ScalarNode::SumExcluding { .. }
         | ScalarNode::SumFiltered { .. }
         | ScalarNode::PostObjectFilteredSum { .. }
         | ScalarNode::TotalMinusPostObjectFilteredSum { .. } => false,
@@ -381,7 +380,7 @@ fn execute_scalar(node: &ScalarNode, ec: &ExecCtx<'_, '_>) -> Result<Option<u64>
         ScalarNode::TotalRowCount { pred } => total_row_count(ec, pred),
 
         ScalarNode::CompositeJoinPairCount { pred1, pred2 } => {
-            Ok(Some(count_composite_join_pairs(store, g_id, pred1, pred2)?))
+            count_composite_join_pairs(ec, pred1, pred2)
         }
 
         ScalarNode::Sum { source } => sum_stream(source, ec, None, None),
@@ -1591,27 +1590,111 @@ impl<'a> PsotSoIter<'a> {
     }
 }
 
+/// Streams `SoKey { s, o_type, o_key }` rows from an overlay-merged PSOT cursor,
+/// in `(s, o_type, o_key)` order (matching `SoKey`'s ordering and `PsotSoIter`).
+struct CursorSoIter {
+    cursor: BinaryCursor,
+    current: Option<fluree_db_binary_index::ColumnBatch>,
+    row: usize,
+}
+
+impl CursorSoIter {
+    fn new(cursor: BinaryCursor) -> Self {
+        Self {
+            cursor,
+            current: None,
+            row: 0,
+        }
+    }
+
+    fn next_row(&mut self) -> Result<Option<SoKey>> {
+        loop {
+            if self.current.is_none() {
+                self.current = self
+                    .cursor
+                    .next_batch()
+                    .map_err(|e| QueryError::Internal(format!("count-plan cursor batch: {e}")))?;
+                self.row = 0;
+                if self.current.is_none() {
+                    return Ok(None);
+                }
+            }
+            let batch = self.current.as_ref().unwrap();
+            if self.row >= batch.row_count {
+                self.current = None;
+                continue;
+            }
+            let key = SoKey {
+                s: batch.s_id.get(self.row),
+                o_type: batch.o_type.get(self.row),
+                o_key: batch.o_key.get(self.row),
+            };
+            self.row += 1;
+            return Ok(Some(key));
+        }
+    }
+}
+
+/// A `(s, o_type, o_key)` row stream — metadata or overlay lane.
+enum SoRows<'a> {
+    /// Genuinely empty (predicate absent from the base index, no overlay).
+    Empty,
+    Meta(PsotSoIter<'a>),
+    Cursor(CursorSoIter),
+}
+
+impl SoRows<'_> {
+    fn next_row(&mut self) -> Result<Option<SoKey>> {
+        match self {
+            SoRows::Empty => Ok(None),
+            SoRows::Meta(it) => it.next_row(),
+            SoRows::Cursor(c) => c.next_row(),
+        }
+    }
+}
+
+/// Build an `(s, o_type, o_key)` row stream for `pred` — metadata leaflet scan
+/// (no overlay) or the overlay-merging PSOT cursor. `Ok(None)` bails the plan.
+fn so_rows<'a>(ec: &ExecCtx<'a, '_>, pred: &Ref) -> Result<Option<SoRows<'a>>> {
+    let store: &'a Arc<BinaryIndexStore> = ec.store;
+    let sid = normalize_pred_sid(store, pred)?;
+    let Some(p_id) = store.sid_to_p_id(&sid) else {
+        return Ok(if ec.overlay {
+            None
+        } else {
+            Some(SoRows::Empty)
+        });
+    };
+    if ec.overlay {
+        let Some(cursor) = build_psot_cursor_for_predicate(
+            ec.ctx,
+            store,
+            ec.g_id,
+            sid,
+            p_id,
+            cursor_projection_sid_otype_okey(),
+        )?
+        else {
+            return Ok(None);
+        };
+        Ok(Some(SoRows::Cursor(CursorSoIter::new(cursor))))
+    } else {
+        Ok(Some(SoRows::Meta(PsotSoIter::new(store, ec.g_id, p_id))))
+    }
+}
+
 /// Count `(s, o)` pairs present in BOTH predicate relations via a streaming
 /// merge-join on the composite `(s_id, o_type, o_key)` key. Each shared pair is
 /// counted once (intersection cardinality), NOT the product of per-subject counts.
-fn count_composite_join_pairs(
-    store: &Arc<BinaryIndexStore>,
-    g_id: GraphId,
-    p1: &Ref,
-    p2: &Ref,
-) -> Result<u64> {
-    let p1_sid = normalize_pred_sid(store, p1)?;
-    let p2_sid = normalize_pred_sid(store, p2)?;
-
-    let Some(p1_id) = store.sid_to_p_id(&p1_sid) else {
-        return Ok(0);
+/// `Ok(None)` bails the plan (overlay present but a predicate is absent from the
+/// base index, or an overlay flake failed to translate).
+fn count_composite_join_pairs(ec: &ExecCtx<'_, '_>, p1: &Ref, p2: &Ref) -> Result<Option<u64>> {
+    let Some(mut it1) = so_rows(ec, p1)? else {
+        return Ok(None);
     };
-    let Some(p2_id) = store.sid_to_p_id(&p2_sid) else {
-        return Ok(0);
+    let Some(mut it2) = so_rows(ec, p2)? else {
+        return Ok(None);
     };
-
-    let mut it1 = PsotSoIter::new(store, g_id, p1_id);
-    let mut it2 = PsotSoIter::new(store, g_id, p2_id);
 
     let mut a = it1.next_row()?;
     let mut b = it2.next_row()?;
@@ -1629,5 +1712,5 @@ fn count_composite_join_pairs(
         }
     }
 
-    Ok(count)
+    Ok(Some(count))
 }

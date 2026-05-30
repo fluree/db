@@ -1649,6 +1649,140 @@ async fn indexed_overlay_optional_count_reflects_overlay() {
         .await;
 }
 
+/// Regression: a composite (s,o)-join `COUNT(*)` (`?s p1 ?o . ?s p2 ?o`, sharing
+/// both subject and object var) must track novelty. `count_plan` lowers this to
+/// `CompositeJoinPairCount`, a merge-intersection on `(s_id, o_type, o_key)`.
+/// The overlay lane streams both relations' `(s, o)` rows from the
+/// overlay-merging PSOT cursor. Verifies tracking of an overlay assertion that
+/// creates a shared pair and a retraction that removes one.
+#[tokio::test]
+async fn indexed_overlay_composite_join_count_reflects_overlay() {
+    assert_index_defaults();
+    let fluree = FlureeBuilder::memory()
+        .with_ledger_cache_config(LedgerManagerConfig::default())
+        .build_memory();
+    let ledger_id = "it/overlay-composite-count:main";
+
+    let (local, handle) = start_background_indexer_local(
+        fluree.backend().clone(),
+        Arc::new(fluree.nameservice_mode().clone()),
+        fluree_db_indexer::IndexerConfig::small(),
+    );
+
+    local
+        .run_until(async move {
+            let index_cfg = IndexConfig {
+                reindex_min_bytes: 0,
+                reindex_max_bytes: 10_000_000,
+            };
+
+            // a likes {x,y} owns {x,z} → shared {x}; b likes {p} owns {p} → shared {p}.
+            // COUNT(*) over (?s likes ?o . ?s owns ?o) = 2.
+            let ledger0 = genesis_ledger_for_fluree(&fluree, ledger_id);
+            let baseline = json!({
+                "@context": { "ex": "http://example.org/ns/" },
+                "@graph": [
+                    {
+                        "@id": "ex:a",
+                        "ex:likes": [{"@id": "ex:x"}, {"@id": "ex:y"}],
+                        "ex:owns": [{"@id": "ex:x"}, {"@id": "ex:z"}]
+                    },
+                    {"@id": "ex:b", "ex:likes": {"@id": "ex:p"}, "ex:owns": {"@id": "ex:p"}}
+                ]
+            });
+            let ledger1 = fluree
+                .insert_with_opts(
+                    ledger0,
+                    &baseline,
+                    TxnOpts::default(),
+                    CommitOpts::default(),
+                    &index_cfg,
+                )
+                .await
+                .expect("baseline insert")
+                .ledger;
+
+            let outcome = trigger_index_and_wait_outcome(&handle, ledger_id, ledger1.t()).await;
+            if let fluree_db_api::IndexOutcome::Completed { index_t, .. } = outcome {
+                assert_eq!(index_t, 1, "should index to t=1");
+            }
+
+            let query = r"
+                PREFIX ex: <http://example.org/ns/>
+                SELECT (COUNT(*) AS ?cnt)
+                WHERE { ?s ex:likes ?o . ?s ex:owns ?o }
+            ";
+
+            let view1 = fluree
+                .db_at_t(ledger_id, ledger1.t())
+                .await
+                .expect("load view at t=1");
+            let result = fluree
+                .query(&view1, QueryInput::Sparql(query))
+                .await
+                .expect("count at t=1");
+            let jsonld = result.to_jsonld(&view1.snapshot).expect("to_jsonld");
+            assert_eq!(
+                normalize_rows(&jsonld),
+                normalize_rows(&json!([[2]])),
+                "indexed-only composite-join count should be 2 ((a,x), (b,p))"
+            );
+
+            // a owns y in novelty → shared {x,y} → total = 2 + 1 = 3.
+            let assert = json!({
+                "@context": { "ex": "http://example.org/ns/" },
+                "@graph": [ {"@id": "ex:a", "ex:owns": {"@id": "ex:y"}} ]
+            });
+            let ledger2 = fluree
+                .insert(ledger1, &assert)
+                .await
+                .expect("assert in novelty")
+                .ledger;
+
+            let view2 = fluree
+                .db_at_t(ledger_id, ledger2.t())
+                .await
+                .expect("load view at t=2");
+            let result = fluree
+                .query(&view2, QueryInput::Sparql(query))
+                .await
+                .expect("count at t=2");
+            let jsonld = result.to_jsonld(&view2.snapshot).expect("to_jsonld");
+            assert_eq!(
+                normalize_rows(&jsonld),
+                normalize_rows(&json!([[3]])),
+                "composite-join count should reflect a owning y ((a,x),(a,y),(b,p))"
+            );
+
+            // Retract b owns p in novelty → b shared {} → total = 2.
+            let retract = json!({
+                "@context": { "ex": "http://example.org/ns/" },
+                "delete": [ {"@id": "ex:b", "ex:owns": {"@id": "ex:p"}} ]
+            });
+            let ledger3 = fluree
+                .update(ledger2, &retract)
+                .await
+                .expect("retract in novelty")
+                .ledger;
+
+            let view3 = fluree
+                .db_at_t(ledger_id, ledger3.t())
+                .await
+                .expect("load view at t=3");
+            let result = fluree
+                .query(&view3, QueryInput::Sparql(query))
+                .await
+                .expect("count at t=3");
+            let jsonld = result.to_jsonld(&view3.snapshot).expect("to_jsonld");
+            assert_eq!(
+                normalize_rows(&jsonld),
+                normalize_rows(&json!([[2]])),
+                "composite-join count should reflect b losing owns p ((a,x),(a,y))"
+            );
+        })
+        .await;
+}
+
 /// Regression: the `<S> <p>+ ?o` COUNT(*) fast path must incorporate novelty.
 ///
 /// Property-path+ COUNT used to gate on `fast_path_store`, which bails the
