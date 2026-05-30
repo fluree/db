@@ -112,8 +112,35 @@ where
     let ledger_id = ledger_id.to_string();
     let _prev_root_id = record.index_head_id.clone();
     let commit_t = record.commit_t;
-    // Drive the rebuild's block_on on a dedicated runtime so its S3 IO reactor
-    // is advanced by dedicated workers, not the (possibly starved) main runtime.
+    // Drive the rebuild's `block_on` on a dedicated runtime so the future, its
+    // timers, and any tasks it spawns are advanced by dedicated workers rather
+    // than the (possibly starved) main runtime.
+    //
+    // Isolation boundary — what this DOES and does NOT cover:
+    //   * Covered: the rebuild future itself, sleeps/timeouts, `tokio::spawn`ed
+    //     work, and any S3 connection *opened during the rebuild* (its socket
+    //     and hyper connection-driver task register on this dedicated runtime,
+    //     because `block_on` enters its context, so `Handle::current()` inside
+    //     the future resolves here).
+    //   * NOT covered: a connection *reused from the AWS SDK's shared pool*.
+    //     The S3 client is built once from a cached `SdkConfig` on the main
+    //     runtime and cloned everywhere, so its hyper pool is process-wide; a
+    //     pooled connection keeps its driver task and registered socket on
+    //     whichever runtime first established it (typically the main one). If
+    //     that runtime is fully starved, a reused connection can still stall —
+    //     this dedicated runtime cannot re-home an existing socket's reactor.
+    //
+    // That residual gap is acceptable here: (1) full rebuilds are rare and
+    // admin-triggered (the hot incremental path in incremental.rs prefetches
+    // and never `block_on`s under `spawn_blocking`); (2) under the load that
+    // starves the main runtime the pool is busy, so the rebuild tends to open
+    // its own (covered) connections; and (3) the de-starvation fixes on the
+    // read/bridge paths (block_in_place at the sync bridges + moka
+    // single-flight) keep the main reactor live, so even reused connections are
+    // driven. A hard boundary
+    // would require a dedicated S3 client/HTTP connector for the rebuild, which
+    // would break the storage-agnostic `ContentStore` abstraction this fn is
+    // written against — not justified for this path.
     let handle = dedicated_rebuild_runtime().handle().clone();
     let parent_span = tracing::Span::current();
 

@@ -53,7 +53,7 @@ use std::collections::BTreeMap;
 use std::future::Future;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tokio::sync::{oneshot, watch, Mutex, Notify};
+use tokio::sync::{oneshot, watch, Mutex, Notify, Semaphore};
 use tracing::{debug, error, info, warn};
 
 /// Exponential indexing-retry backoff: `100ms * 2^retry_count`, capped at 30s.
@@ -268,12 +268,65 @@ impl LedgerIndexState {
         self.pending_min_t = self.waiters.iter().map(|(min_t, _)| *min_t).min();
         if self.pending_min_t.is_none() {
             self.phase = IndexPhase::Idle;
+            // An Idle ledger has nothing to retry; a lingering deadline here
+            // would otherwise keep waking (and hot-spin) the worker loop —
+            // see `is_processable` and the retry-deadline computation in run().
+            self.next_retry_at = None;
         }
     }
 
     /// Check if there's any pending work
     fn has_pending_work(&self) -> bool {
         self.pending_min_t.is_some() || !self.waiters.is_empty()
+    }
+
+    /// True when the worker should act on this ledger: it has pending work
+    /// that hasn't been cancelled. This is the single eligibility predicate
+    /// shared by BOTH the retry-deadline computation and the per-tick
+    /// processing scan in `run()`, so they can never diverge. A stale
+    /// `next_retry_at` left on an idle/cancelled state therefore can never
+    /// wake (or hot-spin) the worker for work that won't be processed.
+    fn is_processable(&self) -> bool {
+        self.pending_min_t.is_some() && !self.cancelled
+    }
+
+    /// True when this entry is fully terminal and can be dropped from the
+    /// states map to bound its growth. The map keeps one entry per distinct
+    /// ledger ever triggered and otherwise never shrinks; pruning idle entries
+    /// keeps it sized to the active working set rather than the historical set.
+    ///
+    /// Safe to drop because every `IndexerHandle` accessor treats an absent
+    /// ledger as Idle (`status` → None, `is_pending`/`pending_ledgers` → not
+    /// busy, `wait_for_idle`/`wait_all_idle` → idle), `trigger` re-creates the
+    /// entry via `or_default`, and the only retained scalars (`last_index_t`,
+    /// `retry_count`, `last_error`) are re-derived or reset on the next cycle.
+    fn is_prunable(&self) -> bool {
+        self.phase == IndexPhase::Idle
+            && self.waiters.is_empty()
+            && self.pending_min_t.is_none()
+            && self.next_retry_at.is_none()
+            && !self.cancelled
+    }
+
+    /// Defensive normalization for the run-loop dispatch site. `process_ledger`
+    /// marks the entry `InProgress` before its async work; every terminal path
+    /// is expected to demote it back to Pending/Idle. If it ever returns while
+    /// still `InProgress` (e.g. a future refactor inserts an early `return`/`?`
+    /// between the InProgress mark and the completion handler), the ledger would
+    /// be orphaned — reported busy forever, blocking `wait_for_idle` and never
+    /// re-dispatched. Demote to Pending if work remains, else Idle. Returns the
+    /// phase it demoted to, or None if no normalization was needed.
+    fn normalize_orphaned_inprogress(&mut self) -> Option<IndexPhase> {
+        if self.phase != IndexPhase::InProgress {
+            return None;
+        }
+        let demote_to = if self.is_processable() {
+            IndexPhase::Pending
+        } else {
+            IndexPhase::Idle
+        };
+        self.phase = demote_to;
+        Some(demote_to)
     }
 }
 
@@ -491,6 +544,7 @@ impl IndexerHandle {
                 // Resolve all waiters as cancelled (they haven't been satisfied)
                 state.resolve_waiters_below(i64::MAX, IndexOutcome::Cancelled);
                 state.pending_min_t = None;
+                state.next_retry_at = None;
                 if state.phase == IndexPhase::Pending {
                     state.phase = IndexPhase::Idle;
                 }
@@ -515,6 +569,7 @@ impl IndexerHandle {
             state.cancelled = true;
             state.resolve_waiters_below(i64::MAX, IndexOutcome::Cancelled);
             state.pending_min_t = None;
+            state.next_retry_at = None;
             if state.phase == IndexPhase::Pending {
                 state.phase = IndexPhase::Idle;
             }
@@ -604,7 +659,17 @@ pub struct BackgroundIndexerWorker {
     states: Arc<Mutex<LedgerStates>>,
     tick_rx: watch::Receiver<u64>,
     idle_notify: Arc<Notify>,
+    /// Bounds concurrent detached background-GC tasks. Each successful index
+    /// spawns at most one GC pass; without a cap, a slow `clean_garbage`
+    /// against fast indexing could pile up unbounded detached tasks. We
+    /// `try_acquire` a permit before spawning and skip GC when the cap is
+    /// reached — safe because GC re-scans the full prev-index chain on every
+    /// run, so a skipped pass is reattempted after the next successful index.
+    gc_semaphore: Arc<Semaphore>,
 }
+
+/// Max concurrent background-GC tasks (see `BackgroundIndexerWorker::gc_semaphore`).
+const MAX_CONCURRENT_GC: usize = 4;
 
 impl BackgroundIndexerWorker {
     /// Create a new worker and its associated handle
@@ -624,6 +689,7 @@ impl BackgroundIndexerWorker {
             states: states.clone(),
             tick_rx,
             idle_notify: idle_notify.clone(),
+            gc_semaphore: Arc::new(Semaphore::new(MAX_CONCURRENT_GC)),
         };
 
         let handle = IndexerHandle {
@@ -644,10 +710,21 @@ impl BackgroundIndexerWorker {
     /// 4. Handles cancellation and backoff
     pub async fn run(mut self) {
         loop {
-            // Compute next retry deadline
+            // Compute next retry deadline. Only states that are actually
+            // processable (pending work, not cancelled) may contribute: a
+            // deadline left behind on an idle/cancelled state would otherwise
+            // wake the loop to a tick where `ledgers_to_process` finds nothing,
+            // and — because that stale deadline is already in the past —
+            // `sleep_until` would return immediately on every subsequent
+            // iteration, hot-spinning the worker. `is_processable()` keeps this
+            // in lockstep with the processing scan below.
             let retry_deadline = {
                 let states = self.states.lock().await;
-                states.values().filter_map(|s| s.next_retry_at).min()
+                states
+                    .values()
+                    .filter(|s| s.is_processable())
+                    .filter_map(|s| s.next_retry_at)
+                    .min()
             };
 
             // Wait for tick OR retry deadline (whichever comes first)
@@ -676,9 +753,7 @@ impl BackgroundIndexerWorker {
                 states
                     .iter()
                     .filter(|(_, state)| {
-                        state.pending_min_t.is_some()
-                            && !state.cancelled
-                            && state.next_retry_at.is_none_or(|t| t <= now)
+                        state.is_processable() && state.next_retry_at.is_none_or(|t| t <= now)
                     })
                     .map(|(ledger_id, _)| ledger_id.clone())
                     .collect()
@@ -718,6 +793,7 @@ impl BackgroundIndexerWorker {
                             // never be re-processed yet report busy forever.
                             state.resolve_waiters_below(i64::MAX, IndexOutcome::Cancelled);
                             state.pending_min_t = None;
+                            state.next_retry_at = None;
                             state.phase = IndexPhase::Idle;
                             state.cancelled = false;
                         } else if state.has_pending_work() {
@@ -730,23 +806,69 @@ impl BackgroundIndexerWorker {
                         } else {
                             // Nothing pending to retry — go idle rather than
                             // leave it stuck Pending/busy.
+                            state.next_retry_at = None;
                             state.phase = IndexPhase::Idle;
+                        }
+                    }
+                } else {
+                    // Safety net for the normal (non-panic) return: all return
+                    // paths funnel back through this single dispatch site, so
+                    // catch a missed InProgress→terminal transition here rather
+                    // than relying on every branch (see
+                    // `normalize_orphaned_inprogress`).
+                    let mut states = self.states.lock().await;
+                    if let Some(state) = states.get_mut(&ledger_id) {
+                        if let Some(demoted_to) = state.normalize_orphaned_inprogress() {
+                            warn!(
+                                ledger_id = %ledger_id,
+                                ?demoted_to,
+                                "process_ledger returned while still InProgress; normalizing \
+                                 (a terminal phase transition was missed — likely a bug)"
+                            );
                         }
                     }
                 }
                 debug!(ledger_id = %ledger_id, "process_ledger returned");
             }
 
-            // Handle cancelled ledgers
+            // Handle cancelled ledgers, then prune fully-idle entries so the
+            // states map stays sized to the active working set (it otherwise
+            // grows once per distinct ledger and never shrinks).
             {
                 let mut states = self.states.lock().await;
                 for state in states.values_mut() {
-                    if state.cancelled && state.has_pending_work() {
+                    if !state.cancelled {
+                        continue;
+                    }
+                    // Cancelled with work still queued: resolve waiters as
+                    // cancelled and reset to idle.
+                    if state.has_pending_work() {
                         state.resolve_waiters_below(i64::MAX, IndexOutcome::Cancelled);
                         state.pending_min_t = None;
+                        state.next_retry_at = None;
                         state.phase = IndexPhase::Idle;
+                    }
+                    // Clear the cancelled flag once the ledger has reached a
+                    // terminal idle state — either reset just above, or a
+                    // cancelled in-progress build has since completed and
+                    // `recalculate_pending_min_t()` set it Idle. A still-
+                    // InProgress build keeps the flag (cancel still suppresses
+                    // its retry). Without this, a cancelled-then-completed ledger
+                    // keeps cancelled=true forever, so `is_prunable()` never lets
+                    // the states map reclaim it.
+                    if state.phase == IndexPhase::Idle && !state.has_pending_work() {
                         state.cancelled = false;
                     }
+                }
+                let before = states.len();
+                states.retain(|_, state| !state.is_prunable());
+                let pruned = before - states.len();
+                if pruned > 0 {
+                    debug!(
+                        pruned,
+                        remaining = states.len(),
+                        "Pruned idle ledger states"
+                    );
                 }
             }
 
@@ -832,6 +954,7 @@ impl BackgroundIndexerWorker {
                         IndexOutcome::Failed("Ledger not found".to_string()),
                     );
                     state.pending_min_t = None;
+                    state.next_retry_at = None;
                     state.phase = IndexPhase::Idle;
                 }
                 return;
@@ -980,6 +1103,7 @@ impl BackgroundIndexerWorker {
 
                 // Check if cancelled during lookup
                 if state.cancelled {
+                    state.next_retry_at = None;
                     state.phase = IndexPhase::Idle;
                     debug!(
                         ledger_id = %ledger_id,
@@ -1140,7 +1264,8 @@ impl BackgroundIndexerWorker {
                             gc_keep_count,
                             "Skipping background GC; index chain cannot exceed retention yet"
                         );
-                    } else {
+                    } else if let Ok(gc_permit) = Arc::clone(&self.gc_semaphore).try_acquire_owned()
+                    {
                         let gc_store = self.backend.content_store(&index_result.ledger_id);
                         let gc_root_id = index_result.root_id.clone();
                         let gc_config = crate::gc::CleanGarbageConfig {
@@ -1157,6 +1282,9 @@ impl BackgroundIndexerWorker {
                             ),
                         };
                         tokio::spawn(async move {
+                            // Hold the permit for the task's lifetime; dropping it
+                            // on completion frees a GC slot.
+                            let _gc_permit = gc_permit;
                             if let Err(e) =
                                 crate::gc::clean_garbage(gc_store.as_ref(), &gc_root_id, gc_config)
                                     .await
@@ -1170,6 +1298,16 @@ impl BackgroundIndexerWorker {
                                 debug!(root_id = %gc_root_id, "Background GC completed");
                             }
                         });
+                    } else {
+                        // GC concurrency cap reached — skip this pass. GC re-scans
+                        // the full prev-index chain each run, so the next
+                        // successful index reattempts; nothing is lost.
+                        debug!(
+                            ledger_id = %ledger_id,
+                            root_id = %index_result.root_id,
+                            max_concurrent_gc = MAX_CONCURRENT_GC,
+                            "Skipping background GC; concurrency cap reached (will retry after a later index)"
+                        );
                     }
 
                     // Resolve waiters. Coalesced waiters all receive the same
@@ -1218,6 +1356,7 @@ impl BackgroundIndexerWorker {
             if state.cancelled {
                 state.resolve_waiters_below(i64::MAX, IndexOutcome::Cancelled);
                 state.pending_min_t = None;
+                state.next_retry_at = None;
                 state.phase = IndexPhase::Idle;
                 return;
             }
@@ -2111,6 +2250,292 @@ mod tests {
             assert!(state.next_retry_at.is_none());
             assert_eq!(state.retry_count, 0);
         }
+    }
+
+    #[tokio::test]
+    async fn test_cancel_clears_retry_deadline() {
+        // Regression: a ledger put into backoff and then cancelled must not
+        // keep a `next_retry_at`. A leftover (past) deadline would wake the
+        // worker loop to a tick where the cancelled ledger is filtered out of
+        // `ledgers_to_process`, then — being in the past — `sleep_until` would
+        // return immediately on every subsequent iteration, hot-spinning the
+        // worker.
+        let storage = MemoryStorage::new();
+        let ns = Arc::new(MemoryNameService::new());
+        let (worker, handle) = BackgroundIndexerWorker::new(
+            StorageBackend::Managed(Arc::new(storage)),
+            ns,
+            IndexerConfig::small(),
+        );
+
+        let _c1 = handle.trigger("test:main", 1).await;
+        worker.schedule_retry("test:main", "boom").await;
+        {
+            let states = handle.states.lock().await;
+            assert!(states.get("test:main").unwrap().next_retry_at.is_some());
+        }
+
+        // Cancelling must drop the retry deadline and leave the ledger
+        // un-processable (so it contributes no wake).
+        assert!(handle.cancel("test:main").await);
+        {
+            let states = handle.states.lock().await;
+            let state = states.get("test:main").unwrap();
+            assert!(state.next_retry_at.is_none());
+            assert!(!state.is_processable());
+        }
+    }
+
+    #[tokio::test]
+    async fn test_retry_deadline_ignores_unprocessable_states() {
+        use std::time::Duration;
+
+        // Guards the run-loop deadline computation: only processable states
+        // (pending work, not cancelled) may contribute a retry deadline.
+        // Mirrors the exact expression used in `run()`.
+        let storage = MemoryStorage::new();
+        let ns = Arc::new(MemoryNameService::new());
+        let (_worker, handle) = BackgroundIndexerWorker::new(
+            StorageBackend::Managed(Arc::new(storage)),
+            ns,
+            IndexerConfig::small(),
+        );
+
+        let now = tokio::time::Instant::now();
+        let past = now - Duration::from_secs(60);
+        let future = now + Duration::from_secs(60);
+
+        {
+            let mut states = handle.states.lock().await;
+
+            // Cancelled with a stale (past) deadline — must be ignored.
+            states.insert(
+                "cancelled".to_string(),
+                LedgerIndexState {
+                    pending_min_t: Some(5),
+                    cancelled: true,
+                    next_retry_at: Some(past),
+                    ..Default::default()
+                },
+            );
+            // Idle leftover: no pending work, stale deadline — must be ignored.
+            states.insert(
+                "idle".to_string(),
+                LedgerIndexState {
+                    pending_min_t: None,
+                    cancelled: false,
+                    next_retry_at: Some(past),
+                    ..Default::default()
+                },
+            );
+            // Genuinely processable, retry in the future — the only contributor.
+            states.insert(
+                "live".to_string(),
+                LedgerIndexState {
+                    pending_min_t: Some(3),
+                    cancelled: false,
+                    next_retry_at: Some(future),
+                    ..Default::default()
+                },
+            );
+
+            assert!(!states["cancelled"].is_processable());
+            assert!(!states["idle"].is_processable());
+            assert!(states["live"].is_processable());
+
+            let deadline = states
+                .values()
+                .filter(|s| s.is_processable())
+                .filter_map(|s| s.next_retry_at)
+                .min();
+            assert_eq!(
+                deadline,
+                Some(future),
+                "only the processable state's future deadline should be selected"
+            );
+        }
+    }
+
+    #[test]
+    fn test_normalize_orphaned_inprogress() {
+        // Not InProgress → no-op.
+        let mut idle = LedgerIndexState::default();
+        assert_eq!(idle.normalize_orphaned_inprogress(), None);
+        assert_eq!(idle.phase, IndexPhase::Idle);
+
+        // Orphaned InProgress with pending work → demote to Pending so it
+        // gets re-dispatched.
+        let mut busy_pending = LedgerIndexState {
+            phase: IndexPhase::InProgress,
+            pending_min_t: Some(7),
+            ..Default::default()
+        };
+        assert_eq!(
+            busy_pending.normalize_orphaned_inprogress(),
+            Some(IndexPhase::Pending)
+        );
+        assert_eq!(busy_pending.phase, IndexPhase::Pending);
+
+        // Orphaned InProgress with no pending work → demote to Idle.
+        let mut busy_empty = LedgerIndexState {
+            phase: IndexPhase::InProgress,
+            pending_min_t: None,
+            ..Default::default()
+        };
+        assert_eq!(
+            busy_empty.normalize_orphaned_inprogress(),
+            Some(IndexPhase::Idle)
+        );
+        assert_eq!(busy_empty.phase, IndexPhase::Idle);
+
+        // Cancelled InProgress is not processable → Idle.
+        let mut busy_cancelled = LedgerIndexState {
+            phase: IndexPhase::InProgress,
+            pending_min_t: Some(3),
+            cancelled: true,
+            ..Default::default()
+        };
+        assert_eq!(
+            busy_cancelled.normalize_orphaned_inprogress(),
+            Some(IndexPhase::Idle)
+        );
+    }
+
+    #[test]
+    fn test_is_prunable() {
+        use std::time::Duration;
+
+        // Fully terminal idle entry → prunable.
+        assert!(LedgerIndexState::default().is_prunable());
+
+        // Pending work → keep.
+        assert!(!LedgerIndexState {
+            phase: IndexPhase::Pending,
+            pending_min_t: Some(1),
+            ..Default::default()
+        }
+        .is_prunable());
+
+        // InProgress → keep.
+        assert!(!LedgerIndexState {
+            phase: IndexPhase::InProgress,
+            ..Default::default()
+        }
+        .is_prunable());
+
+        // Idle but in backoff (deadline set) → keep, so the retry isn't lost.
+        let now = tokio::time::Instant::now();
+        assert!(!LedgerIndexState {
+            phase: IndexPhase::Idle,
+            next_retry_at: Some(now + Duration::from_secs(1)),
+            ..Default::default()
+        }
+        .is_prunable());
+
+        // Cancelled flag still set → keep until the run loop clears it.
+        assert!(!LedgerIndexState {
+            phase: IndexPhase::Idle,
+            cancelled: true,
+            ..Default::default()
+        }
+        .is_prunable());
+    }
+
+    #[tokio::test]
+    async fn test_run_loop_prunes_idle_and_keeps_active() {
+        // End-to-end: a fully-idle entry is pruned on a tick while an entry
+        // with pending work survives. Drives the real `run()` loop.
+        let storage = MemoryStorage::new();
+        let ns = Arc::new(MemoryNameService::new());
+        let (worker, handle) = BackgroundIndexerWorker::new(
+            StorageBackend::Managed(Arc::new(storage)),
+            ns,
+            IndexerConfig::small(),
+        );
+
+        // Seed a prunable idle entry directly.
+        {
+            let mut states = handle.states.lock().await;
+            states.insert("idle:ledger".to_string(), LedgerIndexState::default());
+        }
+
+        let run_handle = tokio::spawn(worker.run());
+
+        // A trigger for a ledger that does not exist in the (empty) nameservice
+        // resolves its waiter as Failed and the entry settles to Idle, while
+        // also ticking the loop so the seeded idle entry is pruned.
+        let completion = handle.trigger("missing:ledger", 1).await;
+        let _ = completion.wait().await;
+
+        // Give the post-processing prune a moment to run on a subsequent tick.
+        handle.trigger("missing:ledger", 1).await;
+
+        // Poll until the idle entry is pruned (bounded).
+        let mut pruned = false;
+        for _ in 0..50 {
+            {
+                let states = handle.states.lock().await;
+                if !states.contains_key("idle:ledger") {
+                    pruned = true;
+                    break;
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(pruned, "fully-idle seeded entry should have been pruned");
+
+        run_handle.abort();
+    }
+
+    #[tokio::test]
+    async fn test_run_loop_clears_and_prunes_terminal_cancelled_state() {
+        // Mirrors the cancel-races-InProgress aftermath: a cancelled build
+        // completes, `recalculate_pending_min_t()` sets Idle, but `cancelled`
+        // stays true. The run-loop cleanup must clear the flag on this terminal
+        // idle entry so `is_prunable()` lets the states map reclaim it.
+        let storage = MemoryStorage::new();
+        let ns = Arc::new(MemoryNameService::new());
+        let (worker, handle) = BackgroundIndexerWorker::new(
+            StorageBackend::Managed(Arc::new(storage)),
+            ns,
+            IndexerConfig::small(),
+        );
+
+        {
+            let mut states = handle.states.lock().await;
+            states.insert(
+                "cancelled:done".to_string(),
+                LedgerIndexState {
+                    phase: IndexPhase::Idle,
+                    cancelled: true,
+                    ..Default::default()
+                },
+            );
+        }
+
+        let run_handle = tokio::spawn(worker.run());
+
+        // Tick the loop (a missing ledger settles to Idle and is also pruned).
+        let _ = handle.trigger("missing:ledger", 1).await.wait().await;
+        handle.trigger("missing:ledger", 1).await;
+
+        let mut pruned = false;
+        for _ in 0..50 {
+            {
+                let states = handle.states.lock().await;
+                if !states.contains_key("cancelled:done") {
+                    pruned = true;
+                    break;
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(
+            pruned,
+            "terminal cancelled idle entry should have its flag cleared and be pruned"
+        );
+
+        run_handle.abort();
     }
 
     #[tokio::test]
