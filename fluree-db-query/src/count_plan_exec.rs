@@ -1,20 +1,26 @@
 //! Count-only plan executor — evaluates a `CountPlan` against a `BinaryIndexStore`.
 //!
 //! The executor wraps as a `FastPathOperator` closure. During `open()`:
-//! 1. Call `fast_path_store(ctx)` — return `Ok(None)` if not binary-index (triggers fallback)
+//! 1. Gate on `allow_cursor_fast_path(ctx)` + a binary-index store — `Ok(None)`
+//!    (triggers fallback) otherwise. Unlike `fast_path_store`, this does NOT
+//!    bail on overlay/`to_t`: an overlay/time-travel lane reads the
+//!    novelty-merged PSOT cursor instead of base-leaflet metadata.
 //! 2. Resolve all `Ref` predicates to `p_id`s
-//! 3. Recursively evaluate the plan tree using existing iterator primitives
+//! 3. Recursively evaluate the plan tree. Nodes without an overlay lane are
+//!    rejected by `plan_overlay_supported` so they fall back under overlay.
 //! 4. Return single count batch
 //!
 //! See `count_plan.rs` for the IR definition and planner.
 
+use crate::context::ExecutionContext;
 use crate::count_plan::{
     ChainFold, CountPlan, CountPlanRoot, KeySetNode, ScalarNode, StreamNode, TailWeight,
 };
 use crate::error::{QueryError, Result};
 use crate::fast_path_common::{
-    build_count_batch, collect_subjects_for_predicate_set, collect_subjects_for_predicate_sorted,
-    collect_subjects_with_object_in_set, count_rows_for_predicate_psot, fast_path_store,
+    allow_cursor_fast_path, build_count_batch, build_psot_cursor_for_predicate,
+    collect_subjects_for_predicate_set, collect_subjects_for_predicate_sorted,
+    collect_subjects_with_object_in_set, count_rows_for_predicate_psot, cursor_projection_sid_only,
     intersect_many_sorted, leaf_entries_for_predicate, normalize_pred_sid,
     projection_sid_otype_okey, sum_post_object_counts_filtered, FastPathOperator, ObjectFilterMode,
     PostObjectGroupCountIter, PsotObjectFilterCountIter, PsotSubjectCountIter,
@@ -22,11 +28,27 @@ use crate::fast_path_common::{
 };
 use crate::ir::triple::Ref;
 use crate::operator::BoxedOperator;
-use fluree_db_binary_index::{BinaryIndexStore, RunSortOrder};
+use fluree_db_binary_index::{BinaryCursor, BinaryIndexStore, RunSortOrder};
 use fluree_db_core::GraphId;
 use rustc_hash::{FxHashMap, FxHashSet};
 use std::cmp::Ordering;
 use std::sync::Arc;
+
+/// Per-execution bundle threaded through the plan evaluator.
+///
+/// Carries the store + graph plus whether an **overlay lane** is required:
+/// novelty is present (`overlay.epoch() != 0`) or the query is time-travel
+/// (`to_t < max_t`). When `overlay` is false the metadata (base-leaflet)
+/// primitives are exact and used as before; when true the subject-keyed nodes
+/// route through the overlay-merging PSOT cursor instead. Nodes not yet
+/// overlay-aware are rejected up-front by [`plan_overlay_supported`], so the
+/// `overlay` lane is only entered for shapes that support it.
+struct ExecCtx<'a, 'c> {
+    ctx: &'a ExecutionContext<'c>,
+    store: &'a Arc<BinaryIndexStore>,
+    g_id: GraphId,
+    overlay: bool,
+}
 
 /// Create a `FastPathOperator` that executes a `CountPlan`.
 pub(crate) fn count_plan_operator(
@@ -37,12 +59,43 @@ pub(crate) fn count_plan_operator(
     Box::new(FastPathOperator::new(
         out_var,
         move |ctx| {
-            let Some(store) = fast_path_store(ctx) else {
+            // Strategy (b) gate: the subject-keyed shapes route through the
+            // overlay-merging cursor, so we no longer bail on overlay/`to_t`
+            // here (unlike `fast_path_store`). Multi-ledger / `from_t` / non-root
+            // policy still bail.
+            if !allow_cursor_fast_path(ctx) {
+                return Ok(None);
+            }
+            let Some(store) = ctx.binary_store.as_ref() else {
                 return Ok(None);
             };
             let g_id = ctx.binary_g_id;
 
-            match execute_plan(&plan.root, store, g_id)? {
+            // Overlay lane needed when novelty is present or the query is
+            // time-travel (`to_t < max_t`) — in both cases the base-leaflet
+            // metadata primitives are not exact.
+            let overlay = ctx
+                .overlay
+                .map(fluree_db_core::OverlayProvider::epoch)
+                .unwrap_or(0)
+                != 0
+                || ctx.to_t != store.max_t();
+
+            // Only some node types have an overlay lane so far; any other node
+            // under overlay must bail to the (correct, slower) generic fallback
+            // rather than read stale base-only counts.
+            if overlay && !plan_overlay_supported(&plan.root) {
+                return Ok(None);
+            }
+
+            let ec = ExecCtx {
+                ctx,
+                store,
+                g_id,
+                overlay,
+            };
+
+            match execute_plan(&plan.root, &ec)? {
                 Some(count) => {
                     let count_i64 = i64::try_from(count)
                         .map_err(|_| QueryError::execution("COUNT(*) exceeds i64 in count plan"))?;
@@ -60,14 +113,210 @@ pub(crate) fn count_plan_operator(
 // Plan evaluation
 // ===========================================================================
 
-fn execute_plan(
-    root: &CountPlanRoot,
-    store: &Arc<BinaryIndexStore>,
-    g_id: GraphId,
-) -> Result<Option<u64>> {
+fn execute_plan(root: &CountPlanRoot, ec: &ExecCtx<'_, '_>) -> Result<Option<u64>> {
     match root {
-        CountPlanRoot::Scalar(scalar) => execute_scalar(scalar, store, g_id),
-        CountPlanRoot::Chain(chain) => execute_chain(chain, store, g_id),
+        CountPlanRoot::Scalar(scalar) => execute_scalar(scalar, ec),
+        // Chain is metadata-only (rejected under overlay by plan_overlay_supported).
+        CountPlanRoot::Chain(chain) => execute_chain(chain, ec.store, ec.g_id),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Overlay-lane support
+// ---------------------------------------------------------------------------
+
+/// Whether every node in the plan has an overlay-aware execution lane.
+///
+/// When false and an overlay/time-travel lane is required, the executor bails
+/// to the generic fallback (correct, just not metadata-fast) rather than
+/// reading stale base-only counts. So far only the subject-keyed scalar/star
+/// shapes are covered; object/POST/chain shapes are added incrementally.
+fn plan_overlay_supported(root: &CountPlanRoot) -> bool {
+    match root {
+        CountPlanRoot::Scalar(s) => scalar_overlay_supported(s),
+        CountPlanRoot::Chain(_) => false,
+    }
+}
+
+fn scalar_overlay_supported(node: &ScalarNode) -> bool {
+    match node {
+        ScalarNode::TotalRowCount { .. } => true,
+        ScalarNode::Sum { source } => stream_overlay_supported(source),
+        ScalarNode::CompositeJoinPairCount { .. }
+        | ScalarNode::SumExcluding { .. }
+        | ScalarNode::SumFiltered { .. }
+        | ScalarNode::PostObjectFilteredSum { .. }
+        | ScalarNode::TotalMinusPostObjectFilteredSum { .. } => false,
+    }
+}
+
+fn stream_overlay_supported(node: &StreamNode) -> bool {
+    match node {
+        StreamNode::SubjectCountScan { .. } => true,
+        StreamNode::StarJoin { children } => children.iter().all(stream_overlay_supported),
+        StreamNode::OptionalJoin { .. }
+        | StreamNode::AntiJoin { .. }
+        | StreamNode::SemiJoin { .. } => false,
+    }
+}
+
+/// A subject-keyed `(s_id, count)` group stream — metadata or overlay lane.
+enum SubjectGroups<'a> {
+    /// Genuinely empty (predicate absent from the base index, no overlay).
+    Empty,
+    /// Base-leaflet metadata lane.
+    Meta(PsotSubjectCountIter<'a>),
+    /// Overlay-merging PSOT cursor lane.
+    Cursor(CursorSubjectGroups),
+}
+
+impl SubjectGroups<'_> {
+    fn next_group(&mut self) -> Result<Option<(u64, u64)>> {
+        match self {
+            SubjectGroups::Empty => Ok(None),
+            SubjectGroups::Meta(it) => it.next_group(),
+            SubjectGroups::Cursor(c) => c.next_group(),
+        }
+    }
+}
+
+/// Streams `(s_id, edge_count)` groups from an overlay-merged PSOT cursor.
+///
+/// Mirrors `SubjectCountStreamV6` in `fast_union_star_count_all`; kept local to
+/// the count-plan overlay lane. The cursor yields rows in PSOT order, so a
+/// running group-by on `s_id` produces the same `(subject, count)` pairs that
+/// `PsotSubjectCountIter` derives from leaflet metadata — but over the
+/// novelty-merged row stream.
+struct CursorSubjectGroups {
+    cursor: BinaryCursor,
+    current: Option<fluree_db_binary_index::ColumnBatch>,
+    row: usize,
+    cur_s: Option<u64>,
+    cur_count: u64,
+}
+
+impl CursorSubjectGroups {
+    fn new(cursor: BinaryCursor) -> Self {
+        Self {
+            cursor,
+            current: None,
+            row: 0,
+            cur_s: None,
+            cur_count: 0,
+        }
+    }
+
+    fn next_group(&mut self) -> Result<Option<(u64, u64)>> {
+        loop {
+            if self.current.is_none() {
+                self.current = self
+                    .cursor
+                    .next_batch()
+                    .map_err(|e| QueryError::Internal(format!("count-plan cursor batch: {e}")))?;
+                self.row = 0;
+                if self.current.is_none() {
+                    if let Some(s) = self.cur_s.take() {
+                        let n = std::mem::take(&mut self.cur_count);
+                        return Ok(Some((s, n)));
+                    }
+                    return Ok(None);
+                }
+            }
+
+            let batch = self.current.as_ref().unwrap();
+            if self.row >= batch.row_count {
+                self.current = None;
+                continue;
+            }
+            let s = batch.s_id.get(self.row);
+            if self.cur_s.is_none() {
+                self.cur_s = Some(s);
+                self.cur_count = 0;
+            } else if self.cur_s != Some(s) {
+                let out_s = self.cur_s.replace(s).unwrap();
+                let out_n = std::mem::replace(&mut self.cur_count, 0);
+                // Don't advance row; reprocess it into the new group.
+                return Ok(Some((out_s, out_n)));
+            }
+            self.cur_count += 1;
+            self.row += 1;
+        }
+    }
+}
+
+/// Build a subject-count group stream for `pred`, choosing the metadata lane
+/// (base leaflets) when no overlay/time-travel is in effect, else the
+/// overlay-merging PSOT cursor lane.
+///
+/// `Ok(None)` signals the whole plan must bail to the fallback: the predicate
+/// is absent from the base index while novelty is present (it may carry
+/// overlay-only rows a `p_id` cursor cannot reach), or an overlay flake failed
+/// to translate. `Ok(Some(Empty))` is a genuinely empty stream.
+fn subject_groups<'a>(ec: &ExecCtx<'a, '_>, pred: &Ref) -> Result<Option<SubjectGroups<'a>>> {
+    let store: &'a Arc<BinaryIndexStore> = ec.store;
+    let sid = normalize_pred_sid(store, pred)?;
+    let Some(p_id) = store.sid_to_p_id(&sid) else {
+        return Ok(if ec.overlay {
+            None
+        } else {
+            Some(SubjectGroups::Empty)
+        });
+    };
+    if ec.overlay {
+        let Some(cursor) = build_psot_cursor_for_predicate(
+            ec.ctx,
+            store,
+            ec.g_id,
+            sid,
+            p_id,
+            cursor_projection_sid_only(),
+        )?
+        else {
+            return Ok(None);
+        };
+        Ok(Some(SubjectGroups::Cursor(CursorSubjectGroups::new(
+            cursor,
+        ))))
+    } else {
+        Ok(Some(SubjectGroups::Meta(PsotSubjectCountIter::new(
+            store, ec.g_id, p_id,
+        )?)))
+    }
+}
+
+/// Total row count for a predicate — metadata leaflet sum (no overlay) or a
+/// row count over the overlay-merged PSOT cursor. `Ok(None)` bails the plan.
+fn total_row_count(ec: &ExecCtx<'_, '_>, pred: &Ref) -> Result<Option<u64>> {
+    let sid = normalize_pred_sid(ec.store, pred)?;
+    let Some(p_id) = ec.store.sid_to_p_id(&sid) else {
+        return Ok(if ec.overlay { None } else { Some(0) });
+    };
+    if ec.overlay {
+        let Some(mut cursor) = build_psot_cursor_for_predicate(
+            ec.ctx,
+            ec.store,
+            ec.g_id,
+            sid,
+            p_id,
+            cursor_projection_sid_only(),
+        )?
+        else {
+            return Ok(None);
+        };
+        let mut total: u64 = 0;
+        while let Some(batch) = cursor
+            .next_batch()
+            .map_err(|e| QueryError::Internal(format!("count-plan cursor batch: {e}")))?
+        {
+            total = total
+                .checked_add(batch.row_count as u64)
+                .ok_or_else(|| QueryError::execution("COUNT(*) overflow in count plan"))?;
+        }
+        Ok(Some(total))
+    } else {
+        Ok(Some(count_rows_for_predicate_psot(
+            ec.store, ec.g_id, p_id,
+        )?))
     }
 }
 
@@ -75,28 +324,19 @@ fn execute_plan(
 // Scalar evaluation
 // ---------------------------------------------------------------------------
 
-fn execute_scalar(
-    node: &ScalarNode,
-    store: &Arc<BinaryIndexStore>,
-    g_id: GraphId,
-) -> Result<Option<u64>> {
+fn execute_scalar(node: &ScalarNode, ec: &ExecCtx<'_, '_>) -> Result<Option<u64>> {
+    // Metadata-only sub-paths read `store`/`g_id` directly; they only run when
+    // `ec.overlay` is false (otherwise rejected by `plan_overlay_supported`).
+    let store = ec.store;
+    let g_id = ec.g_id;
     match node {
-        ScalarNode::TotalRowCount { pred } => {
-            let sid = normalize_pred_sid(store, pred)?;
-            let Some(p_id) = store.sid_to_p_id(&sid) else {
-                return Ok(Some(0));
-            };
-            Ok(Some(count_rows_for_predicate_psot(store, g_id, p_id)?))
-        }
+        ScalarNode::TotalRowCount { pred } => total_row_count(ec, pred),
 
         ScalarNode::CompositeJoinPairCount { pred1, pred2 } => {
             Ok(Some(count_composite_join_pairs(store, g_id, pred1, pred2)?))
         }
 
-        ScalarNode::Sum { source } => {
-            let total = sum_stream(source, store, g_id, None, None)?;
-            Ok(total)
-        }
+        ScalarNode::Sum { source } => sum_stream(source, ec, None, None),
 
         ScalarNode::SumExcluding { source, excluded } => {
             let exclude_sorted = execute_keyset_as_sorted(excluded, store, g_id)?;
@@ -104,8 +344,7 @@ fn execute_scalar(
                 Some(s) => s,
                 None => return Ok(None),
             };
-            let total = sum_stream(source, store, g_id, Some(&exclude_sorted), None)?;
-            Ok(total)
+            sum_stream(source, ec, Some(&exclude_sorted), None)
         }
 
         ScalarNode::SumFiltered { source, filter } => {
@@ -114,8 +353,7 @@ fn execute_scalar(
                 Some(s) => s,
                 None => return Ok(None),
             };
-            let total = sum_stream(source, store, g_id, None, Some(&filter_sorted))?;
-            Ok(total)
+            sum_stream(source, ec, None, Some(&filter_sorted))
         }
 
         ScalarNode::PostObjectFilteredSum {
@@ -175,22 +413,21 @@ fn execute_scalar(
 /// per-subject filtering (matching `fast_minus_count_all.rs` and `fast_exists_count_all.rs`).
 fn sum_stream(
     node: &StreamNode,
-    store: &Arc<BinaryIndexStore>,
-    g_id: GraphId,
+    ec: &ExecCtx<'_, '_>,
     exclude_sorted: Option<&[u64]>,
     include_sorted: Option<&[u64]>,
 ) -> Result<Option<u64>> {
+    let store = ec.store;
+    let g_id = ec.g_id;
     match node {
         StreamNode::SubjectCountScan { pred } => {
-            let sid = normalize_pred_sid(store, pred)?;
-            let Some(p_id) = store.sid_to_p_id(&sid) else {
-                return Ok(Some(0));
+            let Some(mut groups) = subject_groups(ec, pred)? else {
+                return Ok(None); // overlay bail
             };
-            let mut iter = PsotSubjectCountIter::new(store, g_id, p_id)?;
             let mut excl_idx: usize = 0;
             let mut incl_idx: usize = 0;
             let mut total: u128 = 0;
-            while let Some((s, count)) = iter.next_group()? {
+            while let Some((s, count)) = groups.next_group()? {
                 if is_excluded(s, exclude_sorted, &mut excl_idx) {
                     continue;
                 }
@@ -203,7 +440,7 @@ fn sum_stream(
         }
 
         StreamNode::StarJoin { children } => {
-            sum_star_join(children, store, g_id, exclude_sorted, include_sorted)
+            sum_star_join(children, ec, exclude_sorted, include_sorted)
         }
 
         StreamNode::OptionalJoin {
@@ -226,7 +463,7 @@ fn sum_stream(
             };
             // Merge with any existing sorted exclusion list.
             let merged = merge_sorted_lists(exclude_sorted, &exclude_list);
-            sum_stream(source, store, g_id, Some(&merged), include_sorted)
+            sum_stream(source, ec, Some(&merged), include_sorted)
         }
 
         StreamNode::SemiJoin { source, filter } => {
@@ -240,7 +477,7 @@ fn sum_stream(
                 Some(existing) => intersect_sorted_pair(existing, &filter_list),
                 None => filter_list,
             };
-            sum_stream(source, store, g_id, exclude_sorted, Some(&merged))
+            sum_stream(source, ec, exclude_sorted, Some(&merged))
         }
     }
 }
@@ -321,22 +558,22 @@ fn intersect_sorted_pair(a: &[u64], b: &[u64]) -> Vec<u64> {
 /// Formula: `Σ_{s in all, not excluded, included} Π_i count_i(s)`
 fn sum_star_join(
     children: &[StreamNode],
-    store: &Arc<BinaryIndexStore>,
-    g_id: GraphId,
+    ec: &ExecCtx<'_, '_>,
     exclude_sorted: Option<&[u64]>,
     include_sorted: Option<&[u64]>,
 ) -> Result<Option<u64>> {
     // All children must be SubjectCountScan for the streaming N-way merge.
-    let mut iters: Vec<PsotSubjectCountIter<'_>> = Vec::with_capacity(children.len());
+    let mut iters: Vec<SubjectGroups<'_>> = Vec::with_capacity(children.len());
     for child in children {
         let StreamNode::SubjectCountScan { pred } = child else {
             return Ok(None);
         };
-        let sid = normalize_pred_sid(store, pred)?;
-        let Some(p_id) = store.sid_to_p_id(&sid) else {
-            return Ok(Some(0));
+        // Absent predicate (no overlay) yields an empty stream → the N-way
+        // intersection is empty → total 0; absent under overlay bails (None).
+        let Some(groups) = subject_groups(ec, pred)? else {
+            return Ok(None);
         };
-        iters.push(PsotSubjectCountIter::new(store, g_id, p_id)?);
+        iters.push(groups);
     }
 
     let mut curr: Vec<Option<(u64, u64)>> = Vec::with_capacity(iters.len());

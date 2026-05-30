@@ -1125,6 +1125,138 @@ async fn indexed_overlay_count_encoded_filter_reflects_overlay() {
         .await;
 }
 
+/// Regression: a star-join `COUNT(*)` (`?s p1 ?o1 . ?s p2 ?o2`) must track
+/// novelty. This shape is handled only by the generic `count_plan`, which used
+/// to bail entirely on overlay. `count_plan_exec` now has an overlay lane:
+/// subject-count streams come from the overlay-merging PSOT cursor instead of
+/// base-leaflet metadata, and the star multiply runs over those. Verifies the
+/// count tracks an overlay assertion (a subject gaining the second predicate)
+/// and an overlay retraction (a subject losing the first).
+#[tokio::test]
+async fn indexed_overlay_star_join_count_reflects_overlay() {
+    assert_index_defaults();
+    let fluree = FlureeBuilder::memory()
+        .with_ledger_cache_config(LedgerManagerConfig::default())
+        .build_memory();
+    let ledger_id = "it/overlay-star-count:main";
+
+    let (local, handle) = start_background_indexer_local(
+        fluree.backend().clone(),
+        Arc::new(fluree.nameservice_mode().clone()),
+        fluree_db_indexer::IndexerConfig::small(),
+    );
+
+    local
+        .run_until(async move {
+            let index_cfg = IndexConfig {
+                reindex_min_bytes: 0,
+                reindex_max_bytes: 10_000_000,
+            };
+
+            // Phase 1: a,b have both age+name; c has age only. Star count = 2.
+            let ledger0 = genesis_ledger_for_fluree(&fluree, ledger_id);
+            let baseline = json!({
+                "@context": { "ex": "http://example.org/ns/" },
+                "@graph": [
+                    {"@id": "ex:a", "ex:age": 30, "ex:name": "A"},
+                    {"@id": "ex:b", "ex:age": 40, "ex:name": "B"},
+                    {"@id": "ex:c", "ex:age": 50}
+                ]
+            });
+            let ledger1 = fluree
+                .insert_with_opts(
+                    ledger0,
+                    &baseline,
+                    TxnOpts::default(),
+                    CommitOpts::default(),
+                    &index_cfg,
+                )
+                .await
+                .expect("baseline insert")
+                .ledger;
+
+            let outcome = trigger_index_and_wait_outcome(&handle, ledger_id, ledger1.t()).await;
+            if let fluree_db_api::IndexOutcome::Completed { index_t, .. } = outcome {
+                assert_eq!(index_t, 1, "should index to t=1");
+            }
+
+            // Star: COUNT(*) = Σ_s count_age(s) × count_name(s) over s with both.
+            let query = r"
+                PREFIX ex: <http://example.org/ns/>
+                SELECT (COUNT(*) AS ?cnt)
+                WHERE { ?s ex:age ?a . ?s ex:name ?n . }
+            ";
+
+            let view1 = fluree
+                .db_at_t(ledger_id, ledger1.t())
+                .await
+                .expect("load view at t=1");
+            let result = fluree
+                .query(&view1, QueryInput::Sparql(query))
+                .await
+                .expect("count at t=1");
+            let jsonld = result.to_jsonld(&view1.snapshot).expect("to_jsonld");
+            assert_eq!(
+                normalize_rows(&jsonld),
+                normalize_rows(&json!([[2]])),
+                "indexed-only star count should be 2 (a, b)"
+            );
+
+            // Phase 2: c gains a name in novelty → now has both → star count = 3.
+            let assert = json!({
+                "@context": { "ex": "http://example.org/ns/" },
+                "@graph": [ {"@id": "ex:c", "ex:name": "C"} ]
+            });
+            let ledger2 = fluree
+                .insert(ledger1, &assert)
+                .await
+                .expect("assert in novelty")
+                .ledger;
+
+            let view2 = fluree
+                .db_at_t(ledger_id, ledger2.t())
+                .await
+                .expect("load view at t=2");
+            let result = fluree
+                .query(&view2, QueryInput::Sparql(query))
+                .await
+                .expect("count at t=2");
+            let jsonld = result.to_jsonld(&view2.snapshot).expect("to_jsonld");
+            assert_eq!(
+                normalize_rows(&jsonld),
+                normalize_rows(&json!([[3]])),
+                "star count should reflect c gaining a name in novelty"
+            );
+
+            // Phase 3: retract a's age in novelty → a drops out → star count = 2.
+            let retract = json!({
+                "@context": { "ex": "http://example.org/ns/" },
+                "delete": [ {"@id": "ex:a", "ex:age": 30} ]
+            });
+            let ledger3 = fluree
+                .update(ledger2, &retract)
+                .await
+                .expect("retract in novelty")
+                .ledger;
+
+            let view3 = fluree
+                .db_at_t(ledger_id, ledger3.t())
+                .await
+                .expect("load view at t=3");
+            let result = fluree
+                .query(&view3, QueryInput::Sparql(query))
+                .await
+                .expect("count at t=3");
+            let jsonld = result.to_jsonld(&view3.snapshot).expect("to_jsonld");
+            assert_eq!(
+                normalize_rows(&jsonld),
+                normalize_rows(&json!([[2]])),
+                "star count should reflect a losing its age in novelty (b, c)"
+            );
+        })
+        .await;
+}
+
 /// Regression: the `<S> <p>+ ?o` COUNT(*) fast path must incorporate novelty.
 ///
 /// Property-path+ COUNT used to gate on `fast_path_store`, which bails the
