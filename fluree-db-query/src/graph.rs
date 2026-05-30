@@ -146,6 +146,32 @@ impl GraphOperator {
         // Switch to the named graph context
         let graph_ctx = ctx.with_active_graph(graph_iri.clone());
 
+        // Stamp inner-batch bindings with the graph's ledger provenance when
+        // the broader dataset spans multiple ledgers. Without this, bindings
+        // from a `GRAPH <alias>` scope come out as plain `Binding::Sid`
+        // because the inner scan sees only one active graph and DatasetOperator
+        // skips its `needs_provenance` path. The downstream format/hydration
+        // layer relies on `Binding::IriMatch.ledger_alias` to route SID
+        // decoding to the originating ledger's namespace dict
+        // (fluree/db#1259 Issue 2).
+        let (stamp_ledger_id, needs_stamping) = graph_ctx
+            .dataset
+            .map(|ds| {
+                let mut iter = ds
+                    .default_graphs()
+                    .iter()
+                    .chain(ds.named_graphs_iter().map(|(_, g)| g));
+                let first = iter.next();
+                let multi = first
+                    .is_some_and(|f| iter.any(|g| g.ledger_id.as_ref() != f.ledger_id.as_ref()));
+                let ledger_id = ds
+                    .named_graph(&graph_iri)
+                    .map(|g| Arc::clone(&g.ledger_id))
+                    .unwrap_or_else(|| Arc::clone(&graph_iri));
+                (ledger_id, multi)
+            })
+            .unwrap_or_else(|| (Arc::clone(&graph_iri), false));
+
         // Check if this graph is backed by an R2RML mapping.
         // Prefer the precomputed set (populated in runner.rs for dataset queries),
         // but fall back to asking the provider dynamically for the no-dataset
@@ -197,6 +223,13 @@ impl GraphOperator {
         inner.open(&graph_ctx).await?;
 
         while let Some(batch) = inner.next_batch(&graph_ctx).await? {
+            // See `stamp_ledger_id` derivation above for why this happens
+            // only in multi-ledger datasets.
+            let batch = if needs_stamping {
+                crate::dataset_operator::stamp_provenance(batch, &stamp_ledger_id, &graph_ctx)?
+            } else {
+                batch
+            };
             // Merge each inner result with parent row
             for inner_row_idx in 0..batch.len() {
                 let mut merged_row = Vec::with_capacity(self.schema.len());

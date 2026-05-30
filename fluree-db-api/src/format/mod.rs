@@ -345,6 +345,88 @@ pub async fn format_results_async(
     }
 }
 
+/// Format multi-ledger query results with a pre-built [`LedgerFormatContext`].
+///
+/// Hydration columns route per [`Binding::IriMatch.ledger_alias`] to the
+/// originating ledger's snapshot + namespace dict. SELECT / ASK / CONSTRUCT
+/// branches fall back to the primary view's compactor (their result rows
+/// come from a single ledger by construction).
+///
+/// Used by the connection-scoped builder for cross-ledger result rows;
+/// see fluree/db#1259 Issue 2.
+pub(crate) async fn format_results_async_with_dataset(
+    result: &QueryResult,
+    context: &ParsedContext,
+    ctx: &LedgerFormatContext<'_>,
+    config: &FormatterConfig,
+    policy: Option<&fluree_db_policy::PolicyContext>,
+    tracker: Option<&Tracker>,
+) -> Result<JsonValue> {
+    if matches!(config.format, OutputFormat::Tsv | OutputFormat::Csv) {
+        return Err(FormatError::InvalidBinding(format!(
+            "{:?} format produces bytes/String, not JsonValue. \
+             Use format_results_string() or QueryResult::to_tsv()/to_csv() instead.",
+            config.format
+        )));
+    }
+
+    let primary_compactor = ctx.primary_compactor();
+
+    if result.output.construct_template().is_some() {
+        if config.format != OutputFormat::JsonLd {
+            return Err(FormatError::InvalidBinding(
+                "CONSTRUCT queries only support JSON-LD output format".to_string(),
+            ));
+        }
+        return construct::format(result, primary_compactor);
+    }
+
+    if let Some(result) = format_ask(result, config) {
+        return result;
+    }
+
+    if result.output.has_hydration() {
+        if !matches!(
+            config.format,
+            OutputFormat::JsonLd | OutputFormat::TypedJson
+        ) {
+            return Err(FormatError::InvalidBinding(
+                "Hydration only supports JSON-LD and TypedJson output formats".to_string(),
+            ));
+        }
+        let _ = context; // currently unused — per-ledger compactors built upstream
+        let v = hydration::format_async(result, ctx, config, policy, tracker).await?;
+        return if result.output.is_select_one() {
+            match v {
+                JsonValue::Array(mut rows) => Ok(rows.drain(..).next().unwrap_or(JsonValue::Null)),
+                other => Ok(other),
+            }
+        } else {
+            Ok(v)
+        };
+    }
+
+    // Non-hydration SELECT dispatch uses the primary compactor — result rows
+    // for these paths don't carry per-ledger SIDs that need routing.
+    match config.format {
+        OutputFormat::JsonLd => jsonld::format(result, primary_compactor, config),
+        OutputFormat::SparqlJson => sparql::format(result, primary_compactor, config),
+        OutputFormat::TypedJson => typed::format(result, primary_compactor, config),
+        OutputFormat::AgentJson => agent_json::format(result, primary_compactor, config),
+        OutputFormat::SparqlXml => Err(FormatError::InvalidBinding(
+            "SPARQL XML produces String, not JsonValue. Use format_results_string_async() instead."
+                .to_string(),
+        )),
+        OutputFormat::RdfXml => Err(FormatError::InvalidBinding(
+            "RDF/XML produces String, not JsonValue. Use format_results_string_async() instead."
+                .to_string(),
+        )),
+        OutputFormat::Tsv | OutputFormat::Csv => {
+            unreachable!("Delimited formats rejected before dispatch")
+        }
+    }
+}
+
 /// Format query results to a JSON string using async database access
 ///
 /// Async convenience function that formats and serializes in one step.

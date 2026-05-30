@@ -62,7 +62,7 @@ use serde_json::{json, Value as JsonValue};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
 
-/// Cache key: (Sid, local_spec_hash, depth_remaining)
+/// Cache key: (Sid, local_spec_hash, depth_remaining, source_ledger)
 ///
 /// The local_spec_hash is computed from the current `NestedSelectSpec`,
 /// NOT any top-level spec. This serves two purposes:
@@ -70,7 +70,12 @@ use std::sync::Arc;
 /// - Multiple top-level hydration columns share entries when they land on
 ///   the same Sid with structurally identical levels, and stay separated
 ///   when their levels differ.
-type CacheKey = (Sid, u64, usize);
+///
+/// The trailing `Option<Arc<str>>` is the source ledger (matches
+/// `Binding::IriMatch.ledger_alias`) — Sids from different ledgers may share
+/// `(namespace_code, name)` values yet refer to entirely different subjects.
+/// Single-ledger queries always pass `None` here; the extra word is negligible.
+type CacheKey = (Sid, u64, usize, Option<Arc<str>>);
 
 /// Depth bookkeeping for one hydration call.
 ///
@@ -238,21 +243,34 @@ fn hash_reverse<H: std::hash::Hasher>(
 /// Returns `Ok(None)` when the binding is unbound, poisoned, missing, or not
 /// subject-shaped (literals, IRIs that didn't match a known subject, etc.).
 /// Such columns render as `null` rather than skipping the row entirely.
+/// Returns `(root_sid, source_ledger)`. The `source_ledger` is `Some` only for
+/// `Binding::IriMatch`, which is what the engine produces in multi-ledger
+/// dataset mode (see `DatasetOperator::stamp_binding`). For plain
+/// `Binding::Sid` in single-ledger mode the source ledger is `None` and
+/// callers route to the primary view.
 fn resolve_root_sid_from_binding(
     result: &QueryResult,
     binding: Option<&Binding>,
-) -> Result<Option<Sid>> {
+) -> Result<Option<(Sid, Option<Arc<str>>)>> {
     match binding {
         Some(b) if b.is_encoded() => {
             let materialized = super::materialize::materialize_binding(result, b)?;
             Ok(match materialized {
-                Binding::Sid { sid, .. } => Some(sid),
-                Binding::IriMatch { primary_sid, .. } => Some(primary_sid),
+                Binding::Sid { sid, .. } => Some((sid, None)),
+                Binding::IriMatch {
+                    primary_sid,
+                    ledger_alias,
+                    ..
+                } => Some((primary_sid, Some(ledger_alias))),
                 _ => None,
             })
         }
-        Some(Binding::Sid { sid, .. }) => Ok(Some(sid.clone())),
-        Some(Binding::IriMatch { primary_sid, .. }) => Ok(Some(primary_sid.clone())),
+        Some(Binding::Sid { sid, .. }) => Ok(Some((sid.clone(), None))),
+        Some(Binding::IriMatch {
+            primary_sid,
+            ledger_alias,
+            ..
+        }) => Ok(Some((primary_sid.clone(), Some(Arc::clone(ledger_alias))))),
         Some(Binding::Unbound | Binding::Poisoned) | None => Ok(None),
         Some(
             Binding::Lit { .. }
@@ -271,27 +289,51 @@ fn resolve_root_sid_from_binding(
 /// expands it via [`HydrationFormatter::format_subject`] using the column's
 /// own level and depth budget. A variable root that's unbound for this row
 /// renders as `null` rather than skipping the row entirely.
-async fn format_hydration_column(
-    formatter: &HydrationFormatter<'_>,
+///
+/// For multi-ledger queries the binding may carry an `IriMatch.ledger_alias`
+/// that scopes property lookups + IRI compaction to the originating ledger;
+/// `build_row_formatter` constructs a transient [`HydrationFormatter`] for
+/// that row using the right entry from `ctx`.
+#[allow(clippy::too_many_arguments)] // mirror HydrationFormatter::new's plumbing
+async fn format_hydration_column<'a>(
+    ctx: &'a LedgerFormatContext<'a>,
+    config: &FormatterConfig,
+    policy: Option<&'a PolicyContext>,
+    tracker: Option<&'a Tracker>,
     spec: &HydrationSpec,
     result: &QueryResult,
     batch: &fluree_db_query::Batch,
     row_idx: usize,
     cache: &mut HashMap<CacheKey, JsonValue>,
 ) -> Result<JsonValue> {
-    let root_sid: Sid = match &spec.root {
-        Root::Sid(sid) => sid.clone(),
+    let (root_sid, source_ledger): (Sid, Option<Arc<str>>) = match &spec.root {
+        Root::Sid(sid) => (sid.clone(), None),
         Root::Var(var_id) => {
-            let Some(sid) = resolve_root_sid_from_binding(result, batch.get(row_idx, *var_id))?
+            let Some((sid, source)) =
+                resolve_root_sid_from_binding(result, batch.get(row_idx, *var_id))?
             else {
                 return Ok(JsonValue::Null);
             };
-            sid
+            (sid, source)
         }
     };
 
+    let scoped_db = match tracker {
+        Some(t) => ctx.db_for(source_ledger.as_ref()).with_tracker(t),
+        None => ctx.db_for(source_ledger.as_ref()),
+    };
+    let scoped_compactor = ctx.compactor_for(source_ledger.as_ref());
+    let scoped_formatter = HydrationFormatter::new(
+        scoped_db,
+        scoped_compactor,
+        source_ledger,
+        config,
+        policy,
+        tracker,
+    );
+
     let mut visited = HashSet::new();
-    formatter
+    scoped_formatter
         .format_subject(
             &root_sid,
             &spec.level,
@@ -327,20 +369,22 @@ pub async fn format_async(
         FormatError::InvalidBinding("Hydration format called on non-Select output".into())
     })?;
 
+    // The primary formatter handles `Column::Var` (non-hydration) cells —
+    // those use the primary view's compactor for flat IRI compaction. Each
+    // hydration column constructs its own scoped formatter inside
+    // `format_hydration_column`, routed by `Binding::IriMatch.ledger_alias`.
+    //
     // Attach the tracker to the primary GraphDbRef so db.range calls inside
     // the formatter charge per-leaflet + per-dict-touch fuel through the
     // BinaryGraphView/BinaryCursor wiring (not just the per-flake baseline).
-    //
-    // For Multi contexts, per-entry tracker attachment is handled where the
-    // entries are constructed; this primary db is the fallback for sites
-    // without per-binding provenance.
     let primary_db = match tracker {
         Some(t) => ctx.primary_db().with_tracker(t),
         None => ctx.primary_db(),
     };
     let primary_compactor = ctx.primary_compactor();
 
-    let formatter = HydrationFormatter::new(primary_db, primary_compactor, config, policy, tracker);
+    let formatter =
+        HydrationFormatter::new(primary_db, primary_compactor, None, config, policy, tracker);
 
     // Shared cache across all rows and all hydration columns. The cache key
     // includes a hash of the current `NestedSelectSpec`, so columns with
@@ -393,7 +437,7 @@ pub async fn format_async(
                     },
                     Column::Hydration(spec) => {
                         format_hydration_column(
-                            &formatter, spec, result, batch, row_idx, &mut cache,
+                            ctx, config, policy, tracker, spec, result, batch, row_idx, &mut cache,
                         )
                         .await?
                     }
@@ -424,6 +468,12 @@ pub async fn format_async(
 struct HydrationFormatter<'a> {
     db: GraphDbRef<'a>,
     compactor: &'a IriCompactor,
+    /// Source ledger this formatter is scoped to, matching
+    /// `Binding::IriMatch.ledger_alias`. `None` for the primary formatter
+    /// or single-ledger queries. Mixed into [`CacheKey`] so the shared
+    /// hydration cache doesn't collide across ledgers with overlapping SID
+    /// numeric values.
+    source_ledger: Option<Arc<str>>,
     /// Whether to emit typed JSON (`{"@value": ..., "@type": ...}`) for all literals.
     typed: bool,
     /// Whether to always wrap property values in arrays (even single-valued).
@@ -439,6 +489,7 @@ impl<'a> HydrationFormatter<'a> {
     fn new(
         db: GraphDbRef<'a>,
         compactor: &'a IriCompactor,
+        source_ledger: Option<Arc<str>>,
         config: &FormatterConfig,
         policy: Option<&'a PolicyContext>,
         tracker: Option<&'a Tracker>,
@@ -446,6 +497,7 @@ impl<'a> HydrationFormatter<'a> {
         Self {
             db,
             compactor,
+            source_ledger,
             typed: config.format == OutputFormat::TypedJson,
             normalize_arrays: config.normalize_arrays,
             policy,
@@ -472,7 +524,12 @@ impl<'a> HydrationFormatter<'a> {
         cache: &'b mut HashMap<CacheKey, JsonValue>,
     ) -> BoxFuture<'b, Result<JsonValue>> {
         async move {
-            let cache_key = (sid.clone(), compute_level_hash(level), depth.remaining());
+            let cache_key = (
+                sid.clone(),
+                compute_level_hash(level),
+                depth.remaining(),
+                self.source_ledger.clone(),
+            );
 
             // Check cache first (same Sid + spec + depth = same result)
             if let Some(cached) = cache.get(&cache_key) {
@@ -481,7 +538,7 @@ impl<'a> HydrationFormatter<'a> {
 
             // Cycle detection - if already in current path, return just @id
             if !visited.insert(sid.clone()) {
-                return Ok(json!({ "@id": self.compactor.compact_sid(sid)? }));
+                return Ok(json!({ "@id": self.compactor.compact_sid_for_id(sid)? }));
             }
 
             // Build object with sorted keys for determinism (BTreeMap)
@@ -491,7 +548,10 @@ impl<'a> HydrationFormatter<'a> {
             // - Always include for nested hydrations (identity of an expanded ref)
             // - Otherwise include when wildcard or explicit @id selection
             if depth.current > 0 || level.includes_id() {
-                obj.insert("@id".to_string(), json!(self.compactor.compact_sid(sid)?));
+                obj.insert(
+                    "@id".to_string(),
+                    json!(self.compactor.compact_sid_for_id(sid)?),
+                );
             }
 
             // Fetch forward properties. For Explicit projections we hand the
@@ -692,7 +752,9 @@ impl<'a> HydrationFormatter<'a> {
                             );
                         } else {
                             // Max depth reached, just @id
-                            values.push(json!({ "@id": self.compactor.compact_sid(ref_sid)? }));
+                            values.push(
+                                json!({ "@id": self.compactor.compact_sid_for_id(ref_sid)? }),
+                            );
                         }
                     }
                 }
@@ -739,7 +801,7 @@ impl<'a> HydrationFormatter<'a> {
                 );
             } else {
                 // No expansion - just @id
-                values.push(json!({ "@id": self.compactor.compact_sid(subject_sid)? }));
+                values.push(json!({ "@id": self.compactor.compact_sid_for_id(subject_sid)? }));
             }
         }
         Ok(values)
@@ -807,7 +869,7 @@ impl<'a> HydrationFormatter<'a> {
                 FlakeValue::Null => Ok(JsonValue::Null),
                 FlakeValue::Ref(sid) => {
                     // This shouldn't happen for literals, but handle gracefully
-                    Ok(json!({ "@id": self.compactor.compact_sid(sid)? }))
+                    Ok(json!({ "@id": self.compactor.compact_sid_for_id(sid)? }))
                 }
                 // Extended numeric types - serialize as string
                 FlakeValue::BigInt(n) => Ok(JsonValue::String(n.to_string())),
@@ -851,7 +913,7 @@ impl<'a> HydrationFormatter<'a> {
             FlakeValue::Json(json_str) => JsonValue::String(json_str.clone()), // Fallback for non-@json context
             FlakeValue::Null => return Ok(JsonValue::Null),
             FlakeValue::Ref(sid) => {
-                return Ok(json!({ "@id": self.compactor.compact_sid(sid)? }));
+                return Ok(json!({ "@id": self.compactor.compact_sid_for_id(sid)? }));
             }
             // Extended numeric types - serialize as string with @type
             FlakeValue::BigInt(n) => JsonValue::String(n.to_string()),
@@ -950,7 +1012,9 @@ impl<'a> HydrationFormatter<'a> {
                 serde_json::from_str::<JsonValue>(s).unwrap_or_else(|_| json!(s))
             }
             FlakeValue::Null => return Ok(JsonValue::Null),
-            FlakeValue::Ref(sid) => return Ok(json!({ "@id": self.compactor.compact_sid(sid)? })),
+            FlakeValue::Ref(sid) => {
+                return Ok(json!({ "@id": self.compactor.compact_sid_for_id(sid)? }))
+            }
             FlakeValue::BigInt(n) => json!(n.to_string()),
             FlakeValue::Decimal(d) => json!(d.to_string()),
             FlakeValue::DateTime(dt) => json!(dt.to_string()),
@@ -1065,7 +1129,7 @@ impl<'a> HydrationFormatter<'a> {
                 "@json should have been handled above".to_string(),
             )),
             FlakeValue::Null => Ok(JsonValue::Null),
-            FlakeValue::Ref(sid) => Ok(json!({ "@id": self.compactor.compact_sid(sid)? })),
+            FlakeValue::Ref(sid) => Ok(json!({ "@id": self.compactor.compact_sid_for_id(sid)? })),
             FlakeValue::BigInt(n) => Ok(JsonValue::String(n.to_string())),
             FlakeValue::Decimal(d) => Ok(JsonValue::String(d.to_string())),
             FlakeValue::DateTime(dt) => Ok(JsonValue::String(dt.to_string())),
@@ -1247,14 +1311,18 @@ mod tests {
         let sid = Sid::new(100, "alice");
         let spec_hash = 12345u64;
 
-        let key1: CacheKey = (sid.clone(), spec_hash, 0);
-        let key2: CacheKey = (sid.clone(), spec_hash, 1);
-        let key3: CacheKey = (sid, spec_hash, 0);
+        let key1: CacheKey = (sid.clone(), spec_hash, 0, None);
+        let key2: CacheKey = (sid.clone(), spec_hash, 1, None);
+        let key3: CacheKey = (sid.clone(), spec_hash, 0, None);
 
         // Different depths should produce different keys
         assert_ne!(key1, key2);
-        // Same Sid + spec + depth should be equal
+        // Same Sid + spec + depth + source-ledger should be equal
         assert_eq!(key1, key3);
+
+        // Source-ledger discriminates cache entries with otherwise identical keys.
+        let key4: CacheKey = (sid, spec_hash, 0, Some(Arc::from("other:main")));
+        assert_ne!(key1, key4);
     }
 
     fn explicit(forward: Vec<ForwardItem>) -> NestedSelectSpec {

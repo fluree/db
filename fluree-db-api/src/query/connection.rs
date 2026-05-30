@@ -791,7 +791,7 @@ impl Fluree {
     }
 }
 
-fn apply_policy_to_dataset(mut dataset: DataSetDb, policy: &PolicyContext) -> DataSetDb {
+pub(crate) fn apply_policy_to_dataset(mut dataset: DataSetDb, policy: &PolicyContext) -> DataSetDb {
     let policy = Arc::new(policy.clone());
 
     dataset.default = dataset

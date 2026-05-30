@@ -150,6 +150,16 @@ impl IriCompactor {
         Ok(self.compact_vocab_iri(&iri))
     }
 
+    /// Decode a Sid and compact for `@id` position.
+    ///
+    /// Per JSON-LD rules, `@vocab` MUST NOT compact node identifiers; only
+    /// explicit prefixes/terms and `@base` apply. Use this in place of
+    /// [`compact_sid`] when emitting an `@id` value.
+    pub fn compact_sid_for_id(&self, sid: &Sid) -> Result<String> {
+        let iri = self.decode_sid(sid)?;
+        Ok(self.compact_id_iri(&iri))
+    }
+
     /// Compact an IRI string (already decoded) as a forward predicate.
     ///
     /// Used for IriMatch bindings where the canonical IRI is already available.

@@ -913,15 +913,39 @@ impl<'a> FromQueryBuilder<'a> {
                         None => self.fluree.query_connection(json).await?,
                     },
                 };
-                let (spec, _) = parse_dataset_spec(json)?;
-                if let Some(alias) = pick_format_view_alias(&spec) {
-                    let view = self.fluree.db(alias.identifier.as_str()).await?;
-                    Ok(result
-                        .format_async(view.as_graph_db_ref(), &format_config)
-                        .await?)
-                } else {
-                    Err(ApiError::query("No default graph for formatting"))
+                let (spec, qc_opts) = parse_dataset_spec(json)?;
+                if pick_format_view_alias(&spec).is_none() {
+                    return Err(ApiError::query("No default graph for formatting"));
                 }
+                // Rebuild the full dataset for formatting so per-IriMatch
+                // ledger routing in hydration sees every queried ledger's
+                // namespace dict. Uses the same build path the query
+                // execution above used, so the per-source policy + reasoning
+                // overrides resolve identically (fluree/db#1259 Issue 2).
+                let dataset = if qc_opts.has_any_policy_inputs() {
+                    self.fluree
+                        .build_dataset_view_with_policy(&spec, &qc_opts)
+                        .await?
+                } else {
+                    self.fluree.build_dataset_view(&spec).await?
+                };
+                let dataset = match &self.policy {
+                    Some(policy) => {
+                        crate::query::connection::apply_policy_to_dataset(dataset, policy)
+                    }
+                    None => dataset,
+                };
+                let ctx =
+                    crate::format::LedgerFormatContext::from_dataset(&dataset, &result.context);
+                Ok(crate::format::format_results_async_with_dataset(
+                    &result,
+                    &result.context,
+                    &ctx,
+                    &format_config,
+                    None,
+                    None,
+                )
+                .await?)
             }
             QueryInput::Sparql(sparql) => {
                 let result = match &self.policy {

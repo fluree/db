@@ -25,8 +25,10 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use fluree_db_core::GraphDbRef;
+use fluree_graph_json_ld::ParsedContext;
 
 use super::iri::IriCompactor;
+use crate::view::DataSetDb;
 
 /// Per-ledger view + compactor needed by the hydration formatter.
 ///
@@ -107,5 +109,40 @@ impl<'a> LedgerFormatContext<'a> {
     /// Convenience: primary view's `IriCompactor`.
     pub fn primary_compactor(&self) -> &IriCompactor {
         self.compactor_for(None)
+    }
+
+    /// Build a `Multi` context from a `DataSetDb`.
+    ///
+    /// Each unique view (deduped by `GraphDb.ledger_id`, since the dataset
+    /// builder registers each named view under both its alias and its
+    /// canonical identifier) gets its own [`IriCompactor`] built from the
+    /// view's own snapshot namespace map. The primary entry is whichever
+    /// view `DataSetDb::primary()` selects.
+    ///
+    /// Always returns `Multi`, even when the dataset is effectively a
+    /// single ledger. A single-entry `Multi` is slightly more expensive at
+    /// lookup time than a `Single` (one HashMap miss per call into
+    /// `db_for` / `compactor_for`), but it keeps this constructor lifetime-
+    /// simple (no self-borrow) and the cost is negligible relative to the
+    /// rest of hydration work.
+    pub(crate) fn from_dataset(dataset: &'a DataSetDb, context: &ParsedContext) -> Self {
+        let primary_view = dataset
+            .primary()
+            .expect("LedgerFormatContext::from_dataset called on empty dataset");
+
+        let mut ledgers: HashMap<Arc<str>, LedgerEntry<'a>> = HashMap::new();
+        for view in dataset.default.iter().chain(dataset.named.values()) {
+            ledgers
+                .entry(Arc::clone(&view.ledger_id))
+                .or_insert_with(|| LedgerEntry {
+                    db: view.as_graph_db_ref(),
+                    compactor: Arc::new(IriCompactor::new(view.snapshot.namespaces(), context)),
+                });
+        }
+
+        Self::Multi {
+            primary: Arc::clone(&primary_view.ledger_id),
+            ledgers,
+        }
     }
 }
