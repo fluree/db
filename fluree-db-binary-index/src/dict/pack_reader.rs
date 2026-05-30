@@ -385,27 +385,32 @@ fn fetch_and_load(
         return Ok(LazyLoaded { meta, mmap });
     }
 
-    // Remote fetch: spawn a thread so we can block_on the async CAS get
-    // without conflicting with the current Tokio runtime (works on both
-    // current-thread and multi-thread flavors).
-    let handle = tokio::runtime::Handle::try_current()
-        .map_err(|_| io::Error::other("lazy pack fetch requires a Tokio runtime"))?;
+    // Remote fetch: bridge the sync lookup to the async CAS get via the shared
+    // `run_sync_on_runtime` helper. It uses `block_in_place(handle.block_on)`
+    // on a multi-thread runtime (a replacement worker keeps driving the
+    // reactor while this thread blocks) and a self-contained helper runtime on
+    // current-thread. The previous `thread::spawn` + outer-`Handle::block_on`
+    // + `.join()` re-injected the fetch onto the OUTER runtime with no
+    // `block_in_place`, which can wedge a small (e.g. 2-worker) runtime under
+    // query fan-out (every worker parked with no thread driving the reactor).
     let cs = Arc::clone(&ctx.cs);
     let cid = pack_cid.clone();
-    let bytes = std::thread::spawn(move || handle.block_on(cs.get(&cid)))
-        .join()
-        .map_err(|_| io::Error::other("lazy pack fetch thread panicked"))?
-        .map_err(|e| {
-            tracing::debug!(
-                cid = %pack_cid,
-                cache_path = %cache_path.display(),
-                first_id = expected_first_id,
-                last_id = expected_last_id,
-                error = %e,
-                "remote lazy fetch for forward pack failed"
-            );
-            io::Error::other(format!("lazy pack fetch: {e}"))
-        })?;
+    let bytes = crate::read::binary_index_store::run_sync_on_runtime(async move {
+        cs.get(&cid)
+            .await
+            .map_err(|e| io::Error::other(e.to_string()))
+    })
+    .map_err(|e| {
+        tracing::debug!(
+            cid = %pack_cid,
+            cache_path = %cache_path.display(),
+            first_id = expected_first_id,
+            last_id = expected_last_id,
+            error = %e,
+            "remote lazy fetch for forward pack failed"
+        );
+        io::Error::other(format!("lazy pack fetch: {e}"))
+    })?;
 
     // Write to cache, then mmap the cache file (no heap duplication).
     atomic_write_to_cache(cache_path, &bytes)?;

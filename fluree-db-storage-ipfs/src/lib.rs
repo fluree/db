@@ -190,11 +190,6 @@ impl ContentStore for IpfsStorage {
         Ok(expected_id)
     }
 
-    fn is_remote(&self) -> bool {
-        // IPFS reads block on the Kubo HTTP RPC — always remote.
-        true
-    }
-
     async fn release(&self, id: &ContentId) -> fluree_db_core::error::Result<()> {
         let cid_str = id.to_string();
         let raw_cid = Self::to_raw_cid(&cid_str).map_err(fluree_db_core::error::Error::storage)?;

@@ -74,7 +74,24 @@ fn cas_sync_timeout() -> Option<Duration> {
         .map(Duration::from_millis)
 }
 
-fn run_sync_on_runtime<T, Fut>(fut: Fut) -> io::Result<T>
+/// Drive an async future to completion from synchronous code, safely on any
+/// Tokio runtime flavor.
+///
+/// On a **multi-thread** runtime this uses `block_in_place(handle.block_on)`:
+/// the calling worker is converted to a blocking thread and Tokio promotes a
+/// replacement that keeps driving the IO reactor / timer, so the awaited
+/// future (e.g. an S3 `get`) makes progress even while this thread blocks.
+/// On a **current-thread** (or unknown / absent) runtime it runs the future on
+/// a self-contained helper runtime so it never deadlocks the single thread.
+///
+/// This is the canonical sync→async bridge for the index read path. All
+/// CAS-backed reads (leaf bytes, dict-tree leaves, forward packs) must go
+/// through it. A hand-rolled bridge that spawns a thread, calls
+/// `Handle::block_on` on the outer runtime, and waits on `rx.recv()` instead
+/// re-injects the fetch onto the outer runtime with no `block_in_place`; on a
+/// small (e.g. 2-worker) runtime every worker can then park in `recv` with no
+/// thread left to drive the reactor, so the fetch never completes — a hard wedge.
+pub(crate) fn run_sync_on_runtime<T, Fut>(fut: Fut) -> io::Result<T>
 where
     T: Send + 'static,
     Fut: std::future::Future<Output = io::Result<T>> + Send + 'static,
@@ -324,19 +341,6 @@ impl BinaryIndexStore {
 
     pub fn base_t(&self) -> i64 {
         self.base_t
-    }
-
-    /// Whether this store's content backend is remote / network-backed (S3,
-    /// IPFS, peer proxy) and therefore blocks a runtime worker on `block_on`
-    /// during leaf / dict reads.
-    ///
-    /// Stores with no attached CAS (pure in-memory / test stores) are treated
-    /// as local. Used by `BinaryScanOperator` to decide whether to relocate
-    /// its synchronous produce+decode region onto the tokio blocking pool.
-    pub fn is_remote(&self) -> bool {
-        self.cas
-            .as_ref()
-            .is_some_and(fluree_db_core::ContentStore::is_remote)
     }
 
     /// Set the ledger's split mode for canonical IRI encoding.
@@ -2747,5 +2751,63 @@ mod tests {
             )
             .unwrap();
         assert_eq!(val, FlakeValue::Long(1_350_000));
+    }
+
+    /// Regression guard for the multi-query worker-starvation wedge.
+    ///
+    /// `run_sync_on_runtime` is the sync→async bridge for all CAS-backed index
+    /// reads (leaf bytes, dict-tree leaves, forward packs). It must free the
+    /// runtime's workers under fan-out so N > `worker_threads` concurrent
+    /// bridges all complete. The pre-fix dict/pack bridges hand-rolled
+    /// `thread::spawn` + outer-`Handle::block_on` + `recv`/`join` with no
+    /// `block_in_place`, so on a small (2-worker) runtime every worker parked
+    /// in `recv` with nothing left to drive the reactor — a hard deadlock.
+    ///
+    /// Driven on a child thread with a `recv_timeout` watchdog so a regression
+    /// fails the test instead of hanging the suite.
+    #[test]
+    fn run_sync_on_runtime_frees_workers_under_fanout() {
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        let (tx, rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            let rt = tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(2)
+                .enable_all()
+                .build()
+                .unwrap();
+            let done = rt.block_on(async {
+                let mut tasks = Vec::new();
+                for _ in 0..32 {
+                    tasks.push(tokio::spawn(async {
+                        // Bridge a simulated async CAS read from sync code, just
+                        // like the dict/pack/leaf read paths do.
+                        run_sync_on_runtime(async {
+                            tokio::time::sleep(Duration::from_millis(50)).await;
+                            Ok::<(), std::io::Error>(())
+                        })
+                    }));
+                }
+                let mut ok = 0usize;
+                for t in tasks {
+                    if matches!(t.await, Ok(Ok(()))) {
+                        ok += 1;
+                    }
+                }
+                ok
+            });
+            let _ = tx.send(done);
+        });
+
+        match rx.recv_timeout(Duration::from_secs(8)) {
+            Ok(done) => assert_eq!(
+                done, 32,
+                "all bridged fetches must complete on a 2-worker runtime"
+            ),
+            Err(_) => {
+                panic!("run_sync_on_runtime wedged a 2-worker runtime under fan-out (regression)")
+            }
+        }
     }
 }
