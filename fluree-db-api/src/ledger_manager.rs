@@ -911,18 +911,32 @@ impl LedgerManager {
         let shutting_down = self.is_shutdown();
         leader_guard.disarm();
 
+        // We only own the slot — and may remove/notify/cache it — if it is
+        // still OUR `Loading` (generation match). If `disconnect` cleared it and
+        // a newer leader inserted a fresh `Loading`, that slot belongs to the
+        // newer leader: publishing over it would clobber it and notify its
+        // waiters with our stale result. In that case we just return our own
+        // result to the direct caller without touching the cache. (The
+        // generation also guards the detached drop cleanup.)
+        let owns_slot = matches!(
+            entries.get(&canonical_alias),
+            Some(LoadState::Loading { generation: g, .. }) if *g == generation
+        );
+
         match publish {
             Ok(handle) => {
-                // Notify waiters
-                if let Some(LoadState::Loading { waiters, .. }) = entries.remove(&canonical_alias) {
-                    for tx in waiters {
-                        let _ = tx.send(Ok(handle.clone()));
+                if owns_slot {
+                    if let Some(LoadState::Loading { waiters, .. }) =
+                        entries.remove(&canonical_alias)
+                    {
+                        for tx in waiters {
+                            let _ = tx.send(Ok(handle.clone()));
+                        }
                     }
-                }
-
-                // Don't re-insert into cache if shutdown has been initiated
-                if !shutting_down {
-                    entries.insert(canonical_alias, LoadState::Ready(handle.clone()));
+                    // Don't re-insert into cache if shutdown has been initiated
+                    if !shutting_down {
+                        entries.insert(canonical_alias, LoadState::Ready(handle.clone()));
+                    }
                 }
                 Ok(handle)
             }
@@ -930,12 +944,15 @@ impl LedgerManager {
                 // Capture error with status code for waiters before consuming the error
                 // Note: Waiters receive an Http error (preserving status code);
                 // the leader (first caller) gets the original error type preserved.
-                let error_for_waiters = Arc::new(ApiError::http(e.status_code(), e.to_string()));
-
-                // Notify waiters of failure
-                if let Some(LoadState::Loading { waiters, .. }) = entries.remove(&canonical_alias) {
-                    for tx in waiters {
-                        let _ = tx.send(Err(Arc::clone(&error_for_waiters)));
+                if owns_slot {
+                    let error_for_waiters =
+                        Arc::new(ApiError::http(e.status_code(), e.to_string()));
+                    if let Some(LoadState::Loading { waiters, .. }) =
+                        entries.remove(&canonical_alias)
+                    {
+                        for tx in waiters {
+                            let _ = tx.send(Err(Arc::clone(&error_for_waiters)));
+                        }
                     }
                 }
 
@@ -1148,18 +1165,31 @@ impl LedgerManager {
                 let shutting_down = self.is_shutdown();
                 reload_guard.disarm();
 
+                // Only publish if WE still own the slot (our `Reloading`
+                // generation). If `disconnect` cleared it and a newer reload
+                // inserted a fresh `Reloading`, that slot belongs to the newer
+                // leader; removing/notifying/restoring over it would deliver our
+                // stale success/error to its waiters and clobber it. In that
+                // case do nothing and return our own result to the caller.
+                let owns_slot = matches!(
+                    entries.get(&canonical_alias),
+                    Some(LoadState::Reloading { generation: g, .. }) if *g == generation
+                );
+
                 match result {
                     Ok(()) => {
                         // Notify waiters and restore Ready state (unless shutting down)
-                        if let Some(LoadState::Reloading {
-                            handle, waiters, ..
-                        }) = entries.remove(&canonical_alias)
-                        {
-                            for tx in waiters {
-                                let _ = tx.send(Ok(()));
-                            }
-                            if !shutting_down {
-                                entries.insert(canonical_alias, LoadState::Ready(handle));
+                        if owns_slot {
+                            if let Some(LoadState::Reloading {
+                                handle, waiters, ..
+                            }) = entries.remove(&canonical_alias)
+                            {
+                                for tx in waiters {
+                                    let _ = tx.send(Ok(()));
+                                }
+                                if !shutting_down {
+                                    entries.insert(canonical_alias, LoadState::Ready(handle));
+                                }
                             }
                         }
                         Ok(())
@@ -1167,19 +1197,20 @@ impl LedgerManager {
                     Err(e) => {
                         // Capture error with status code for waiters before consuming the error
                         // Note: Waiters receive Http error (preserving status code); leader gets original type
-                        let error_for_waiters =
-                            Arc::new(ApiError::http(e.status_code(), e.to_string()));
-
-                        // Notify waiters of failure, restore Ready (keep old data) unless shutting down
-                        if let Some(LoadState::Reloading {
-                            handle, waiters, ..
-                        }) = entries.remove(&canonical_alias)
-                        {
-                            for tx in waiters {
-                                let _ = tx.send(Err(Arc::clone(&error_for_waiters)));
-                            }
-                            if !shutting_down {
-                                entries.insert(canonical_alias, LoadState::Ready(handle));
+                        if owns_slot {
+                            let error_for_waiters =
+                                Arc::new(ApiError::http(e.status_code(), e.to_string()));
+                            // Notify waiters of failure, restore Ready (keep old data) unless shutting down
+                            if let Some(LoadState::Reloading {
+                                handle, waiters, ..
+                            }) = entries.remove(&canonical_alias)
+                            {
+                                for tx in waiters {
+                                    let _ = tx.send(Err(Arc::clone(&error_for_waiters)));
+                                }
+                                if !shutting_down {
+                                    entries.insert(canonical_alias, LoadState::Ready(handle));
+                                }
                             }
                         }
                         // Leader returns the original error (preserves full type/variant)
