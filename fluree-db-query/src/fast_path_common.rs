@@ -195,6 +195,24 @@ pub fn cursor_projection_sid_only() -> ColumnProjection {
     }
 }
 
+/// Projection for `BinaryCursor` that outputs OType + OKey columns.
+///
+/// Object-only counterpart of [`cursor_projection_sid_otype_okey`] for paths
+/// that fold over object values without needing the subject (e.g. POST-ordered
+/// scalar aggregates). Columns are in `output` as required by `BinaryCursor`.
+#[inline]
+pub fn cursor_projection_otype_okey() -> ColumnProjection {
+    ColumnProjection {
+        output: {
+            let mut s = ColumnSet::EMPTY;
+            s.insert(ColumnId::OType);
+            s.insert(ColumnId::OKey);
+            s
+        },
+        internal: ColumnSet::EMPTY,
+    }
+}
+
 // ---------------------------------------------------------------------------
 // 3. Leaf range scanning
 // ---------------------------------------------------------------------------
@@ -1330,13 +1348,182 @@ pub fn sum_post_object_counts_filtered(
 // 8. BinaryCursor construction
 // ---------------------------------------------------------------------------
 
-/// Build a `BinaryCursor` for a single predicate in PSOT order with overlay support.
+/// Construct a `BinaryCursor` over an explicit key range + filter in `order`,
+/// without overlay merging or `to_t` filtering.
 ///
-/// This is the cursor-based counterpart of the leaf-entry iterators in sections 7/7b.
-/// It supports overlay merging (uncommitted flakes), so it works even when
-/// `ctx.overlay` is set — unlike the raw leaf-entry scan which requires `fast_path_store`.
+/// Lowest-level shared cursor constructor: looks up the branch for `order` and,
+/// on success, builds the cursor. Callers are responsible for `set_to_t` (and
+/// any overlay wiring) afterwards. Returns `None` when the branch for `order`
+/// does not exist for `g_id`.
 ///
-/// Returns `None` if the PSOT branch does not exist for the given graph.
+/// Used directly by object-/subject-range-bounded fast paths
+/// (`fast_string_prefix_count_all`, `fast_star_const_order_topk`) and as the
+/// base of [`build_overlay_cursor_for_predicate`].
+pub fn build_range_cursor(
+    store: &Arc<BinaryIndexStore>,
+    g_id: GraphId,
+    order: RunSortOrder,
+    min_key: &RunRecordV2,
+    max_key: &RunRecordV2,
+    filter: BinaryFilter,
+    projection: ColumnProjection,
+) -> Option<BinaryCursor> {
+    let branch = Arc::clone(store.branch_for_order(g_id, order)?);
+    Some(BinaryCursor::new(
+        Arc::clone(store),
+        order,
+        branch,
+        min_key,
+        max_key,
+        filter,
+        projection,
+    ))
+}
+
+/// Collect the novelty-overlay ops for a single predicate, translated into the
+/// binary-index `OverlayOp` representation and sorted/resolved for `order`.
+///
+/// Returns `Ok(Some(ops))` on success (`ops` may be empty), or `Ok(None)` when
+/// any flake fails to translate — in which case the caller must disable the
+/// fast path for correctness. Only meaningful when an overlay carrying novelty
+/// is present (`epoch != 0`).
+fn collect_resolved_overlay_ops(
+    ctx: &ExecutionContext<'_>,
+    store: &Arc<BinaryIndexStore>,
+    g_id: GraphId,
+    order: RunSortOrder,
+    pred_sid: &Sid,
+) -> Result<Option<Vec<fluree_db_binary_index::read::types::OverlayOp>>> {
+    use std::collections::HashMap;
+    let dn = ctx.dict_novelty.clone().unwrap_or_else(|| {
+        Arc::new(fluree_db_core::dict_novelty::DictNovelty::new_uninitialized())
+    });
+    let mut ephemeral_preds = HashMap::new();
+    let mut next_ep = store.predicate_count();
+    let mut ops = Vec::new();
+    let mut translate_failed = false;
+    let mut translate_fail_count: u32 = 0;
+
+    ctx.overlay().for_each_overlay_flake(
+        g_id,
+        crate::binary_scan::sort_order_to_index_type(order),
+        None,
+        None,
+        true,
+        ctx.to_t,
+        &mut |flake| {
+            if flake.p != *pred_sid {
+                return;
+            }
+            match crate::binary_scan::translate_one_flake_v3_pub(
+                flake,
+                store,
+                Some(&dn),
+                ctx.runtime_small_dicts,
+                &mut ephemeral_preds,
+                &mut next_ep,
+                g_id,
+            ) {
+                Ok(op) => ops.push(op),
+                Err(e) => {
+                    translate_failed = true;
+                    translate_fail_count = translate_fail_count.saturating_add(1);
+                    if translate_fail_count == 1 {
+                        tracing::warn!(
+                            error = %e,
+                            s = %flake.s,
+                            p = %flake.p,
+                            t = flake.t,
+                            op = flake.op,
+                            "fast-path cursor: overlay flake translation failed; disabling fast path for correctness"
+                        );
+                    }
+                }
+            }
+        },
+    );
+
+    if translate_failed {
+        tracing::debug!(
+            failures = translate_fail_count,
+            "fast-path cursor: falling back due to overlay translation failures"
+        );
+        return Ok(None);
+    }
+
+    if !ops.is_empty() {
+        fluree_db_binary_index::read::types::sort_overlay_ops(&mut ops, order);
+        fluree_db_binary_index::read::types::resolve_overlay_ops(&mut ops);
+    }
+    Ok(Some(ops))
+}
+
+/// Build a per-predicate `BinaryCursor` in `order`, folding in the novelty
+/// overlay and honoring `to_t`.
+///
+/// `order` must be a *predicate-bounded* order — [`RunSortOrder::Psot`] or
+/// [`RunSortOrder::Post`] — because both place `p_id` first in their key, so
+/// [`predicate_range_keys`] bounds the scan to one predicate. `Opst` is
+/// object-keyed (its `p_id` is not a primary key component) and is intentionally
+/// unsupported here; object-ordered cursors must be range-bounded by object
+/// instead (see `fast_string_prefix_count_all::count_prefix_rows_opst`).
+///
+/// Unlike the raw leaf-entry scans, this folds uncommitted overlay flakes into
+/// the cursor, so it stays correct when `ctx.overlay` carries novelty or when
+/// `ctx.to_t < max_t` — operators using it should gate on
+/// [`allow_cursor_fast_path`], not [`fast_path_store`]. Returns `None` if the
+/// branch for `order` is absent, or if an overlay flake fails to translate (fast
+/// path disabled for correctness).
+pub fn build_overlay_cursor_for_predicate(
+    ctx: &ExecutionContext<'_>,
+    store: &Arc<BinaryIndexStore>,
+    g_id: GraphId,
+    order: RunSortOrder,
+    pred_sid: Sid,
+    p_id: u32,
+    projection: ColumnProjection,
+) -> Result<Option<BinaryCursor>> {
+    debug_assert!(
+        matches!(order, RunSortOrder::Psot | RunSortOrder::Post),
+        "build_overlay_cursor_for_predicate requires a p_id-primary order \
+         (Psot or Post); got {order:?}"
+    );
+
+    let (min_key, max_key) = predicate_range_keys(p_id, g_id);
+    let filter = BinaryFilter {
+        p_id: Some(p_id),
+        ..Default::default()
+    };
+    let Some(mut cursor) =
+        build_range_cursor(store, g_id, order, &min_key, &max_key, filter, projection)
+    else {
+        return Ok(None);
+    };
+    cursor.set_to_t(ctx.to_t);
+
+    // Fold the novelty overlay in. Skip the walk entirely when there is no
+    // novelty (epoch 0): the persisted index alone is then exact.
+    if ctx.overlay.is_some() {
+        let epoch = ctx.overlay().epoch();
+        if epoch != 0 {
+            match collect_resolved_overlay_ops(ctx, store, g_id, order, &pred_sid)? {
+                Some(ops) => {
+                    if !ops.is_empty() {
+                        cursor.set_overlay_ops(ops);
+                    }
+                }
+                None => return Ok(None),
+            }
+        }
+        cursor.set_epoch(epoch);
+    }
+
+    Ok(Some(cursor))
+}
+
+/// Build a per-predicate PSOT overlay cursor (subject-ordered within the
+/// predicate). Thin wrapper over [`build_overlay_cursor_for_predicate`].
+#[inline]
 pub fn build_psot_cursor_for_predicate(
     ctx: &ExecutionContext<'_>,
     store: &Arc<BinaryIndexStore>,
@@ -1345,96 +1532,41 @@ pub fn build_psot_cursor_for_predicate(
     p_id: u32,
     projection: ColumnProjection,
 ) -> Result<Option<BinaryCursor>> {
-    let Some(branch) = store.branch_for_order(g_id, RunSortOrder::Psot) else {
-        return Ok(None);
-    };
-    let branch = Arc::clone(branch);
-
-    let (min_key, max_key) = predicate_range_keys(p_id, g_id);
-
-    let filter = BinaryFilter {
-        p_id: Some(p_id),
-        ..Default::default()
-    };
-
-    let mut cursor = BinaryCursor::new(
-        Arc::clone(store),
+    build_overlay_cursor_for_predicate(
+        ctx,
+        store,
+        g_id,
         RunSortOrder::Psot,
-        branch,
-        &min_key,
-        &max_key,
-        filter,
+        pred_sid,
+        p_id,
         projection,
-    );
-    cursor.set_to_t(ctx.to_t);
+    )
+}
 
-    // Overlay merge — pre-filter by predicate.
-    if ctx.overlay.is_some() {
-        use std::collections::HashMap;
-        let dn = ctx.dict_novelty.clone().unwrap_or_else(|| {
-            Arc::new(fluree_db_core::dict_novelty::DictNovelty::new_uninitialized())
-        });
-        let mut ephemeral_preds = HashMap::new();
-        let mut next_ep = store.predicate_count();
-        let mut ops = Vec::new();
-        let mut translate_failed = false;
-        let mut translate_fail_count: u32 = 0;
-
-        ctx.overlay().for_each_overlay_flake(
-            g_id,
-            fluree_db_core::IndexType::Psot,
-            None,
-            None,
-            true,
-            ctx.to_t,
-            &mut |flake| {
-                if flake.p != pred_sid {
-                    return;
-                }
-                match crate::binary_scan::translate_one_flake_v3_pub(
-                    flake,
-                    store,
-                    Some(&dn),
-                    ctx.runtime_small_dicts,
-                    &mut ephemeral_preds,
-                    &mut next_ep,
-                    g_id,
-                ) {
-                    Ok(op) => ops.push(op),
-                    Err(e) => {
-                        translate_failed = true;
-                        translate_fail_count = translate_fail_count.saturating_add(1);
-                        if translate_fail_count == 1 {
-                            tracing::warn!(
-                                error = %e,
-                                s = %flake.s,
-                                p = %flake.p,
-                                t = flake.t,
-                                op = flake.op,
-                                "fast-path cursor: overlay flake translation failed; disabling fast path for correctness"
-                            );
-                        }
-                    }
-                }
-            },
-        );
-        if translate_failed {
-            tracing::debug!(
-                failures = translate_fail_count,
-                "fast-path cursor: falling back due to overlay translation failures"
-            );
-            return Ok(None);
-        }
-
-        if !ops.is_empty() {
-            fluree_db_binary_index::read::types::sort_overlay_ops(&mut ops, RunSortOrder::Psot);
-            fluree_db_binary_index::read::types::resolve_overlay_ops(&mut ops);
-            cursor.set_overlay_ops(ops);
-        }
-        cursor.set_epoch(ctx.overlay().epoch());
-    }
-
-    Ok(Some(cursor))
+/// Build a per-predicate POST overlay cursor (object-ordered within the
+/// predicate). Thin wrapper over [`build_overlay_cursor_for_predicate`].
+///
+/// POST groups rows by `(o_type, o_key)` within the predicate, so adjacent rows
+/// share an object — the natural shape for object-folding aggregates and
+/// distinct-object counts that must stay overlay-correct.
+#[inline]
+pub fn build_post_cursor_for_predicate(
+    ctx: &ExecutionContext<'_>,
+    store: &Arc<BinaryIndexStore>,
+    g_id: GraphId,
+    pred_sid: Sid,
+    p_id: u32,
+    projection: ColumnProjection,
+) -> Result<Option<BinaryCursor>> {
+    build_overlay_cursor_for_predicate(
+        ctx,
+        store,
+        g_id,
+        RunSortOrder::Post,
+        pred_sid,
+        p_id,
+        projection,
+    )
 }
 
 /// Resolve a bound `Ref` (Iri or Sid) to its internal `s_id` (u64).

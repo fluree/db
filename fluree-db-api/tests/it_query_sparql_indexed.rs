@@ -2373,3 +2373,159 @@ async fn indexed_iri_ref_and_blank_node_resolve_correctly() {
         })
         .await;
 }
+
+/// POST overlay cursor coverage: `SUM(?o)`, `AVG(?o)`, and `COUNT(DISTINCT ?o)`
+/// over a single predicate must reflect uncommitted novelty (overlay) — both
+/// asserts and retracts — not only the persisted index.
+///
+/// The no-overlay baseline takes the leaflet-metadata scan; once novelty is
+/// present the same `AggState` folds over a POST overlay cursor
+/// (`build_post_cursor_for_predicate`). Numeric values exercise SUM/AVG; the
+/// IRI-ref `ex:tag` predicate exercises adjacent-dedup COUNT(DISTINCT), including
+/// a retract that drops an object's only edge (distinct count must shrink).
+#[tokio::test]
+async fn indexed_overlay_scalar_agg_reflects_assert_and_retract() {
+    assert_index_defaults();
+    let fluree = FlureeBuilder::memory()
+        .with_ledger_cache_config(LedgerManagerConfig::default())
+        .build_memory();
+    let ledger_id = "it/overlay-scalar-agg:main";
+
+    let (local, handle) = start_background_indexer_local(
+        fluree.backend().clone(),
+        Arc::new(fluree.nameservice_mode().clone()),
+        fluree_db_indexer::IndexerConfig::small(),
+    );
+
+    local
+        .run_until(async move {
+            let index_cfg = IndexConfig {
+                reindex_min_bytes: 0,
+                reindex_max_bytes: 10_000_000,
+            };
+
+            let sum_q = r"PREFIX ex: <http://example.org/ns/>
+                SELECT (SUM(?o) AS ?v) WHERE { ?s ex:n ?o }";
+            let avg_q = r"PREFIX ex: <http://example.org/ns/>
+                SELECT (AVG(?o) AS ?v) WHERE { ?s ex:n ?o }";
+            let cd_q = r"PREFIX ex: <http://example.org/ns/>
+                SELECT (COUNT(DISTINCT ?o) AS ?v) WHERE { ?s ex:tag ?o }";
+
+            // Phase 1: seed + index. n: a=10, b=20, c=30; tag: a→X, b→Y, c→X.
+            let ledger0 = genesis_ledger_for_fluree(&fluree, ledger_id);
+            let baseline = json!({
+                "@context": { "ex": "http://example.org/ns/" },
+                "@graph": [
+                    {"@id": "ex:a", "ex:n": 10, "ex:tag": {"@id": "ex:X"}},
+                    {"@id": "ex:b", "ex:n": 20, "ex:tag": {"@id": "ex:Y"}},
+                    {"@id": "ex:c", "ex:n": 30, "ex:tag": {"@id": "ex:X"}}
+                ]
+            });
+            let ledger1 = fluree
+                .insert_with_opts(
+                    ledger0,
+                    &baseline,
+                    TxnOpts::default(),
+                    CommitOpts::default(),
+                    &index_cfg,
+                )
+                .await
+                .expect("baseline insert")
+                .ledger;
+            let outcome = trigger_index_and_wait_outcome(&handle, ledger_id, ledger1.t()).await;
+            if let fluree_db_api::IndexOutcome::Completed { index_t, .. } = outcome {
+                assert_eq!(index_t, 1, "should index to t=1");
+            }
+
+            // Phase 1 — baseline (no overlay → leaflet-metadata lane):
+            // SUM=60, AVG=20, distinct={X,Y}=2.
+            let view1 = fluree
+                .db_at_t(ledger_id, ledger1.t())
+                .await
+                .expect("view t=1");
+            for (q, expected) in [
+                (sum_q, json!([[60]])),
+                (avg_q, json!([[20.0]])),
+                (cd_q, json!([[2]])),
+            ] {
+                let result = fluree
+                    .query(&view1, QueryInput::Sparql(q))
+                    .await
+                    .expect("baseline query");
+                let jsonld = result.to_jsonld(&view1.snapshot).expect("to_jsonld");
+                assert_eq!(
+                    normalize_rows(&jsonld),
+                    normalize_rows(&expected),
+                    "baseline {q}"
+                );
+            }
+
+            // Phase 2 — assert d (n=40, tag→Z) in novelty (overlay → POST cursor lane):
+            // SUM=100, AVG=25, distinct={X,Y,Z}=3.
+            let extend = json!({
+                "@context": { "ex": "http://example.org/ns/" },
+                "@graph": [ {"@id": "ex:d", "ex:n": 40, "ex:tag": {"@id": "ex:Z"}} ]
+            });
+            let ledger2 = fluree
+                .insert(ledger1, &extend)
+                .await
+                .expect("overlay assert")
+                .ledger;
+            let view2 = fluree
+                .db_at_t(ledger_id, ledger2.t())
+                .await
+                .expect("view t=2");
+            for (q, expected) in [
+                (sum_q, json!([[100]])),
+                (avg_q, json!([[25.0]])),
+                (cd_q, json!([[3]])),
+            ] {
+                let result = fluree
+                    .query(&view2, QueryInput::Sparql(q))
+                    .await
+                    .expect("post-assert query");
+                let jsonld = result.to_jsonld(&view2.snapshot).expect("to_jsonld");
+                assert_eq!(
+                    normalize_rows(&jsonld),
+                    normalize_rows(&expected),
+                    "after assert {q}"
+                );
+            }
+
+            // Phase 3 — retract a's n=10 and b's only tag edge (→Y) in novelty:
+            // SUM=20+30+40=90, AVG=30, distinct={X,Z}=2 (Y dropped).
+            let retract = json!({
+                "@context": { "ex": "http://example.org/ns/" },
+                "delete": [
+                    {"@id": "ex:a", "ex:n": 10},
+                    {"@id": "ex:b", "ex:tag": {"@id": "ex:Y"}}
+                ]
+            });
+            let ledger3 = fluree
+                .update(ledger2, &retract)
+                .await
+                .expect("overlay retract")
+                .ledger;
+            let view3 = fluree
+                .db_at_t(ledger_id, ledger3.t())
+                .await
+                .expect("view t=3");
+            for (q, expected) in [
+                (sum_q, json!([[90]])),
+                (avg_q, json!([[30.0]])),
+                (cd_q, json!([[2]])),
+            ] {
+                let result = fluree
+                    .query(&view3, QueryInput::Sparql(q))
+                    .await
+                    .expect("post-retract query");
+                let jsonld = result.to_jsonld(&view3.snapshot).expect("to_jsonld");
+                assert_eq!(
+                    normalize_rows(&jsonld),
+                    normalize_rows(&expected),
+                    "after retract {q}"
+                );
+            }
+        })
+        .await;
+}

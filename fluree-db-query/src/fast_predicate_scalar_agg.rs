@@ -18,8 +18,9 @@
 use crate::binding::{Batch, Binding};
 use crate::error::{QueryError, Result};
 use crate::fast_path_common::{
-    build_i64_singleton_batch, count_to_i64, fast_path_store, leaf_entries_for_predicate,
-    normalize_pred_sid, projection_okey_only, FastPathOperator,
+    allow_cursor_fast_path, build_i64_singleton_batch, build_post_cursor_for_predicate,
+    count_to_i64, cursor_projection_otype_okey, leaf_entries_for_predicate, normalize_pred_sid,
+    projection_okey_only, FastPathOperator,
 };
 use crate::ir::triple::Ref;
 use crate::operator::BoxedOperator;
@@ -154,10 +155,27 @@ pub fn predicate_scalar_agg_operator(
     FastPathOperator::new(
         out_var,
         move |ctx| {
-            let Some(store) = fast_path_store(ctx) else {
+            if !allow_cursor_fast_path(ctx) {
+                return Ok(None);
+            }
+            let Some(store) = ctx.binary_store.as_ref() else {
                 return Ok(None);
             };
-            match scan_predicate_scalar_agg(store, ctx.binary_g_id, &predicate, kind)? {
+            // No-overlay HEAD reads take the leaflet-metadata scan (with its
+            // constant-folding / directory shortcuts). An uncommitted overlay or
+            // `to_t < max_t` would make that scan stale, so fold the same
+            // aggregate over a POST overlay cursor instead.
+            let has_overlay = ctx
+                .overlay
+                .map(fluree_db_core::OverlayProvider::epoch)
+                .unwrap_or(0)
+                != 0;
+            let result = if !has_overlay && ctx.to_t == store.max_t() {
+                scan_predicate_scalar_agg(store, ctx.binary_g_id, &predicate, kind)?
+            } else {
+                scan_predicate_scalar_agg_overlay(ctx, store, ctx.binary_g_id, &predicate, kind)?
+            };
+            match result {
                 Some(output) => Ok(Some(output.into_batch(out_var)?)),
                 None => Ok(None), // Unsupported at runtime — fall through to planned pipeline.
             }
@@ -241,6 +259,73 @@ impl AggState {
             }
         })
     }
+
+    /// Fold `count` rows that each contribute the same constant `val` (SUM only).
+    ///
+    /// The metadata lane's constant-folding shortcut: when a scalar is constant
+    /// for a homogeneous leaflet's `o_type`, the whole leaflet folds with no
+    /// column IO. No-op for non-SUM kinds (which never request a constant fold).
+    fn fold_constant_sum(&mut self, val: i64, count: u32) {
+        if let AggState::Sum { sum, .. } = self {
+            *sum = sum.saturating_add(val.saturating_mul(i64::from(count)));
+        }
+    }
+
+    /// Fold a single row's object `(o_type, o_key)` into the accumulator.
+    ///
+    /// The per-row fold shared by both the leaflet-metadata scan and the POST
+    /// overlay cursor scan, so the two lanes stay byte-for-byte consistent.
+    /// Returns `Ok(false)` when the value is unsupported for this aggregate (a
+    /// non-numeric/heterogeneous `o_type`, or a non-IRI object for
+    /// COUNT(DISTINCT)) and the caller must fall back to the planned pipeline.
+    fn fold_row(&mut self, o_type: u16, o_key: u64) -> Result<bool> {
+        match self {
+            AggState::Sum { scalar, sum } => {
+                let Some(v) = scalar.eval_i64(o_type, o_key) else {
+                    return Ok(false);
+                };
+                *sum = sum.saturating_add(v);
+            }
+            AggState::Avg {
+                required_otype,
+                sum,
+                compensation,
+                count,
+            } => {
+                if !OType::from_u16(o_type).is_numeric() {
+                    return Ok(false);
+                }
+                match *required_otype {
+                    None => *required_otype = Some(o_type),
+                    Some(existing) if existing != o_type => return Ok(false),
+                    Some(_) => {}
+                }
+                let val = decode_numeric_as_f64(o_type, o_key)?;
+                // Kahan summation: compensate for lost low-order bits.
+                let y = val - *compensation;
+                let t = *sum + y;
+                *compensation = (t - *sum) - y;
+                *sum = t;
+                *count = count.saturating_add(1);
+            }
+            AggState::CountDistinct {
+                prev_okey,
+                distinct,
+            } => {
+                // Only the IRI-ref object case (avoids dictionary decoding).
+                if o_type != OType::IRI_REF.as_u16() {
+                    return Ok(false);
+                }
+                // POST orders by (p_id, o_type, o_key, ..), so o_key is monotonic
+                // within the IRI-ref group — adjacent dedup is exact.
+                if *prev_okey != Some(o_key) {
+                    *distinct += 1;
+                    *prev_okey = Some(o_key);
+                }
+            }
+        }
+        Ok(true)
+    }
 }
 
 /// Result for a predicate that is absent from the persisted dictionary
@@ -281,100 +366,132 @@ fn scan_predicate_scalar_agg(
                 continue;
             }
 
-            match &mut state {
-                AggState::Sum { scalar, sum } => {
-                    // Constant folding: if the scalar is constant for this o_type,
-                    // avoid any column IO.
-                    if let Some(ot) = entry.o_type_const {
-                        if let Some(const_val) = scalar.constant_for_otype(ot) {
-                            *sum = sum
-                                .saturating_add(const_val.saturating_mul(entry.row_count as i64));
-                            continue;
-                        }
-                    }
-
-                    let mut needed = ColumnSet::EMPTY;
-                    needed.insert(ColumnId::OKey);
-                    if entry.o_type_const.is_none() {
-                        needed.insert(ColumnId::OType);
-                    }
-                    let projection = ColumnProjection {
-                        output: ColumnSet::EMPTY,
-                        internal: needed,
-                    };
-                    let batch = handle
-                        .load_columns(leaflet_idx, &projection, RunSortOrder::Post)
-                        .map_err(|e| QueryError::Internal(format!("load columns: {e}")))?;
-
-                    for row in 0..batch.row_count {
-                        let o_key = batch.o_key.get(row);
-                        let ot = entry
-                            .o_type_const
-                            .unwrap_or_else(|| batch.o_type.get_or(row, 0));
-                        let Some(v) = scalar.eval_i64(ot, o_key) else {
-                            // Unsupported datatype mix for this scalar fast-path.
-                            return Ok(None);
-                        };
-                        *sum = sum.saturating_add(v);
+            // Constant-folding shortcut: a SUM scalar that is constant for this
+            // homogeneous leaflet's `o_type` folds with no column IO.
+            if let ScalarAggKind::Sum(scalar) = kind {
+                if let Some(ot) = entry.o_type_const {
+                    if let Some(const_val) = scalar.constant_for_otype(ot) {
+                        state.fold_constant_sum(const_val, entry.row_count);
+                        continue;
                     }
                 }
-                AggState::Avg {
-                    required_otype,
-                    sum,
-                    compensation,
-                    count,
-                } => {
-                    let Some(o_type) = entry.o_type_const else {
-                        return Ok(None);
-                    };
-                    let ot = OType::from_u16(o_type);
-                    if !ot.is_numeric() {
-                        return Ok(None);
-                    }
-                    match *required_otype {
-                        None => *required_otype = Some(o_type),
-                        Some(existing) if existing != o_type => return Ok(None),
-                        Some(_) => {}
-                    }
+            }
 
-                    let projection = projection_okey_only();
-                    let batch = handle
-                        .load_columns(leaflet_idx, &projection, RunSortOrder::Post)
-                        .map_err(|e| QueryError::Internal(format!("load columns: {e}")))?;
-                    for row in 0..batch.row_count {
-                        let val = decode_numeric_as_f64(o_type, batch.o_key.get(row))?;
-                        // Kahan summation: compensate for lost low-order bits.
-                        let y = val - *compensation;
-                        let t = *sum + y;
-                        *compensation = (t - *sum) - y;
-                        *sum = t;
-                    }
-                    *count = count.saturating_add(batch.row_count as u64);
+            // Otherwise scan rows: pick the projection and the `o_type` to fold
+            // each row under (the leaflet constant, or per-row OType for mixed
+            // SUM leaflets). `None` ⇒ the leaflet is unsupported for this kind.
+            let Some((projection, const_otype)) = leaflet_scan_plan(kind, entry.o_type_const)
+            else {
+                return Ok(None);
+            };
+            let batch = handle
+                .load_columns(leaflet_idx, &projection, RunSortOrder::Post)
+                .map_err(|e| QueryError::Internal(format!("load columns: {e}")))?;
+            for row in 0..batch.row_count {
+                let o_key = batch.o_key.get(row);
+                let o_type = const_otype.unwrap_or_else(|| batch.o_type.get_or(row, 0));
+                if !state.fold_row(o_type, o_key)? {
+                    return Ok(None);
                 }
-                AggState::CountDistinct {
-                    prev_okey,
-                    distinct,
-                } => {
-                    // Only handle the common IRI-ref object case (e.g. rdf:type),
-                    // which avoids dictionary decoding entirely.
-                    if entry.o_type_const != Some(OType::IRI_REF.as_u16()) {
-                        return Ok(None);
-                    }
+            }
+        }
+    }
 
-                    let projection = projection_okey_only();
-                    let batch = handle
-                        .load_columns(leaflet_idx, &projection, RunSortOrder::Post)
-                        .map_err(|e| QueryError::Internal(format!("load columns: {e}")))?;
-                    // POST orders by (p_id, o_type, o_key, ..), so o_key is
-                    // monotonic across leaflets — adjacent dedup is exact.
-                    for row in 0..batch.row_count {
-                        let okey = batch.o_key.get(row);
-                        if *prev_okey != Some(okey) {
-                            *distinct += 1;
-                            *prev_okey = Some(okey);
-                        }
-                    }
-                }
+    Ok(Some(state.finalize()?))
+}
+
+/// Per-leaflet plan for the no-overlay metadata scan: the column projection to
+/// load and the constant `o_type` to fold every row under (`None` ⇒ read the
+/// per-row OType column). Returns `None` when the leaflet is unsupported for
+/// `kind` and the caller must fall back to the planned pipeline.
+fn leaflet_scan_plan(
+    kind: ScalarAggKind,
+    o_type_const: Option<u16>,
+) -> Option<(ColumnProjection, Option<u16>)> {
+    match kind {
+        // SUM reads OKey always, plus OType only for heterogeneous leaflets.
+        ScalarAggKind::Sum(_) => {
+            let mut needed = ColumnSet::EMPTY;
+            needed.insert(ColumnId::OKey);
+            if o_type_const.is_none() {
+                needed.insert(ColumnId::OType);
+            }
+            Some((
+                ColumnProjection {
+                    output: ColumnSet::EMPTY,
+                    internal: needed,
+                },
+                o_type_const,
+            ))
+        }
+        // AVG needs a homogeneous numeric leaflet so it can read OKey only.
+        ScalarAggKind::AvgNumeric => {
+            let ot = o_type_const?;
+            if !OType::from_u16(ot).is_numeric() {
+                return None;
+            }
+            Some((projection_okey_only(), Some(ot)))
+        }
+        // COUNT(DISTINCT) handles only the IRI-ref object case (no dict decode).
+        ScalarAggKind::CountDistinctObject => {
+            if o_type_const != Some(OType::IRI_REF.as_u16()) {
+                return None;
+            }
+            Some((projection_okey_only(), o_type_const))
+        }
+    }
+}
+
+/// Overlay-aware counterpart of [`scan_predicate_scalar_agg`]: folds the same
+/// [`AggState`] over a POST overlay cursor that merges uncommitted novelty and
+/// honors `to_t`. Used when an overlay carries novelty or `to_t < max_t`, where
+/// the leaflet-metadata scan would be stale.
+fn scan_predicate_scalar_agg_overlay(
+    ctx: &crate::context::ExecutionContext<'_>,
+    store: &Arc<BinaryIndexStore>,
+    g_id: GraphId,
+    predicate: &Ref,
+    kind: ScalarAggKind,
+) -> Result<Option<AggOutput>> {
+    let pred_sid = normalize_pred_sid(store, predicate)?;
+    let Some(p_id) = store.sid_to_p_id(&pred_sid) else {
+        // Predicate absent from the persisted dictionary. With novelty present it
+        // may exist only in the overlay (no `p_id` to range-bound a cursor), so
+        // fall back to the planned pipeline; otherwise the input is genuinely empty.
+        let overlay_has_rows = ctx
+            .overlay
+            .map(fluree_db_core::OverlayProvider::epoch)
+            .unwrap_or(0)
+            != 0;
+        return if overlay_has_rows {
+            Ok(None)
+        } else {
+            Ok(Some(empty_result(kind)))
+        };
+    };
+
+    let Some(mut cursor) = build_post_cursor_for_predicate(
+        ctx,
+        store,
+        g_id,
+        pred_sid,
+        p_id,
+        cursor_projection_otype_okey(),
+    )?
+    else {
+        return Ok(None);
+    };
+
+    let mut state = AggState::new(kind);
+    while let Some(batch) = cursor
+        .next_batch()
+        .map_err(|e| QueryError::Internal(format!("scalar-agg cursor: {e}")))?
+    {
+        for row in 0..batch.row_count {
+            let o_type = batch.o_type.get_or(row, 0);
+            let o_key = batch.o_key.get(row);
+            if !state.fold_row(o_type, o_key)? {
+                return Ok(None);
             }
         }
     }

@@ -75,6 +75,20 @@ pub fn index_type_to_sort_order(index: IndexType) -> RunSortOrder {
     }
 }
 
+/// Convert `RunSortOrder` (binary-index-layer) to `IndexType` (query-layer).
+///
+/// Inverse of [`index_type_to_sort_order`]. Used when building a per-predicate
+/// overlay cursor in a given order to select the matching novelty overlay index
+/// for `OverlayProvider::for_each_overlay_flake`.
+pub fn sort_order_to_index_type(order: RunSortOrder) -> IndexType {
+    match order {
+        RunSortOrder::Spot => IndexType::Spot,
+        RunSortOrder::Psot => IndexType::Psot,
+        RunSortOrder::Post => IndexType::Post,
+        RunSortOrder::Opst => IndexType::Opst,
+    }
+}
+
 /// Build a schema vector from a triple pattern, respecting `EmitMask` pruning.
 ///
 /// Returns `(schema, s_var_pos, p_var_pos, o_var_pos)` where positions are
