@@ -43,6 +43,7 @@
 use super::config::{FormatterConfig, OutputFormat};
 use super::datatype::is_inferable_datatype;
 use super::iri::IriCompactor;
+use super::ledger_ctx::LedgerFormatContext;
 use super::{FormatError, Result};
 use crate::QueryResult;
 use fluree_db_core::comparator::IndexType;
@@ -312,8 +313,7 @@ async fn format_hydration_column(
 /// When `policy` is `None`, no filtering is applied (zero overhead).
 pub async fn format_async(
     result: &QueryResult,
-    db: GraphDbRef<'_>,
-    compactor: &IriCompactor,
+    ctx: &LedgerFormatContext<'_>,
     config: &FormatterConfig,
     policy: Option<&PolicyContext>,
     tracker: Option<&Tracker>,
@@ -327,15 +327,20 @@ pub async fn format_async(
         FormatError::InvalidBinding("Hydration format called on non-Select output".into())
     })?;
 
-    // Attach the tracker to the GraphDbRef so db.range calls inside the
-    // formatter charge per-leaflet + per-dict-touch fuel through the
+    // Attach the tracker to the primary GraphDbRef so db.range calls inside
+    // the formatter charge per-leaflet + per-dict-touch fuel through the
     // BinaryGraphView/BinaryCursor wiring (not just the per-flake baseline).
-    let db = match tracker {
-        Some(t) => db.with_tracker(t),
-        None => db,
+    //
+    // For Multi contexts, per-entry tracker attachment is handled where the
+    // entries are constructed; this primary db is the fallback for sites
+    // without per-binding provenance.
+    let primary_db = match tracker {
+        Some(t) => ctx.primary_db().with_tracker(t),
+        None => ctx.primary_db(),
     };
+    let primary_compactor = ctx.primary_compactor();
 
-    let formatter = HydrationFormatter::new(db, compactor, config, policy, tracker);
+    let formatter = HydrationFormatter::new(primary_db, primary_compactor, config, policy, tracker);
 
     // Shared cache across all rows and all hydration columns. The cache key
     // includes a hash of the current `NestedSelectSpec`, so columns with
@@ -373,11 +378,17 @@ pub async fn format_async(
                 let value = match column {
                     Column::Var(v) => match batch.get(row_idx, *v) {
                         Some(binding) if formatter.typed => {
-                            super::typed::format_binding_with_result(result, binding, compactor)?
+                            super::typed::format_binding_with_result(
+                                result,
+                                binding,
+                                primary_compactor,
+                            )?
                         }
-                        Some(binding) => {
-                            super::jsonld::format_binding_with_result(result, binding, compactor)?
-                        }
+                        Some(binding) => super::jsonld::format_binding_with_result(
+                            result,
+                            binding,
+                            primary_compactor,
+                        )?,
                         None => JsonValue::Null,
                     },
                     Column::Hydration(spec) => {

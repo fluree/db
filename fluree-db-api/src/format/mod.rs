@@ -47,6 +47,7 @@ pub mod delimited;
 mod hydration;
 pub mod iri;
 mod jsonld;
+mod ledger_ctx;
 mod materialize;
 mod rdf_xml;
 mod sparql;
@@ -56,6 +57,7 @@ mod xml_escape;
 
 pub use config::{AgentJsonContext, FormatterConfig, OutputFormat, QueryOutput};
 pub use iri::IriCompactor;
+pub(crate) use ledger_ctx::LedgerFormatContext;
 
 use crate::QueryResult;
 use fluree_db_core::LedgerSnapshot;
@@ -303,8 +305,14 @@ pub async fn format_results_async(
             (Some(novelty), None) => GraphDbRef::new(db.snapshot, db.g_id, novelty.as_ref(), db.t),
             (None, _) => db,
         };
-        let v = hydration::format_async(result, hydration_db, &compactor, config, policy, tracker)
-            .await?;
+        // Wrap into a Single ledger context. Per-ledger routing (Multi) is
+        // built by the connection-scoped query builder for cross-ledger
+        // result rows; see fluree/db#1259 Issue 2.
+        let ctx = LedgerFormatContext::Single {
+            db: hydration_db,
+            compactor: &compactor,
+        };
+        let v = hydration::format_async(result, &ctx, config, policy, tracker).await?;
         // Hydration formatter returns an array of rows; honor selectOne by
         // returning the first row (or null if empty).
         return if result.output.is_select_one() {
