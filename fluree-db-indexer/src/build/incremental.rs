@@ -16,6 +16,7 @@
 //! 4. **Dict updates**: Update reverse trees + forward packs for new subjects/strings
 //! 5. **Root assembly**: `IncrementalRootBuilder` → encode → CAS write → publish
 
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
@@ -30,7 +31,7 @@ use futures::stream::{self, StreamExt};
 use crate::error::{IndexerError, Result};
 use crate::gc;
 use crate::run_index::build::incremental_branch::{
-    update_branch, BranchUpdateConfig, BranchUpdateResult,
+    touched_leaf_refs, update_branch, BranchUpdateConfig, BranchUpdateResult,
 };
 use crate::run_index::build::incremental_resolve::{
     resolve_incremental_commits_v6, IncrementalResolveConfig,
@@ -142,11 +143,17 @@ async fn upload_dict_blob_cached(
     Ok(cid)
 }
 
-/// Run `update_branch` on a blocking thread.
+/// Run `update_branch`: async-prefetch the touched leaves/sidecars, then do
+/// the CPU-bound copy-on-write update on a blocking thread.
 ///
-/// Uses `spawn_blocking` instead of `block_in_place` so this works on both
-/// multi-threaded and current-thread tokio runtimes (the latter is used by
-/// `#[tokio::test]`).
+/// All CAS I/O happens here, on the async runtime — NOT inside the
+/// `spawn_blocking` closure. The previous version fetched leaves on demand via
+/// `handle.block_on(S3)` from inside the blocking closure; on a blocking-pool
+/// thread that `block_on` has no tokio worker to drive its reactor, so under
+/// slow remote storage (S3) + concurrent builds it can stall — a wedge that
+/// never reproduces on a local filesystem (cache hits resolve instantly). We
+/// prefetch the touched set (mirroring `build/dicts.rs`) so the blocking
+/// closure only reads in-memory maps.
 async fn run_update_branch(
     branch_bytes: Vec<u8>,
     sorted_records: Vec<RunRecordV2>,
@@ -155,129 +162,106 @@ async fn run_update_branch(
     content_store: Arc<dyn fluree_db_core::storage::ContentStore>,
     cache_dir: std::path::PathBuf,
 ) -> std::result::Result<(BranchUpdateResult, Phase2FetchStatsSnapshot), IndexerError> {
-    let handle = tokio::runtime::Handle::current();
     let parent_span = tracing::Span::current();
-    let stats = Arc::new(Phase2FetchStats::default());
-    let task_stats = Arc::clone(&stats);
+    let stats = Phase2FetchStats::default();
+
+    // The leaves (+ sidecars) update_branch will request: exactly the leaves
+    // with a non-empty novelty slice. Computed with the same slicing logic, so
+    // the prefetched set matches its requests exactly.
+    let touched = touched_leaf_refs(
+        &branch_bytes,
+        &sorted_records,
+        &sorted_ops,
+        branch_config.order,
+    )
+    .map_err(|e| IndexerError::StorageRead(format!("compute touched leaves: {e}")))?;
+
+    // Prefetch (async, off any blocking thread). Dedups by CID.
+    let mut leaf_map: HashMap<ContentId, Vec<u8>> = HashMap::new();
+    let mut sidecar_map: HashMap<ContentId, Vec<u8>> = HashMap::new();
+    for (leaf_cid, sidecar_cid) in &touched {
+        if !leaf_map.contains_key(leaf_cid) {
+            let cached_before = cache_dir.join(leaf_cid.to_string()).exists();
+            let started = Instant::now();
+            let bytes = fluree_db_binary_index::read::artifact_cache::fetch_cached_bytes_cid(
+                content_store.as_ref(),
+                leaf_cid,
+                &cache_dir,
+            )
+            .await
+            .map_err(|e| IndexerError::StorageRead(format!("prefetch leaf {leaf_cid}: {e}")))?;
+            stats.leaf_fetches.fetch_add(1, Ordering::Relaxed);
+            stats
+                .leaf_fetch_ms
+                .fetch_add(started.elapsed().as_millis() as u64, Ordering::Relaxed);
+            stats
+                .leaf_bytes
+                .fetch_add(bytes.len() as u64, Ordering::Relaxed);
+            if cached_before {
+                stats.leaf_cache_hits.fetch_add(1, Ordering::Relaxed);
+            } else {
+                stats.leaf_cache_misses.fetch_add(1, Ordering::Relaxed);
+            }
+            leaf_map.insert(leaf_cid.clone(), bytes);
+        }
+        if let Some(sc) = sidecar_cid {
+            if !sidecar_map.contains_key(sc) {
+                let cached_before = cache_dir.join(sc.to_string()).exists();
+                let started = Instant::now();
+                match fluree_db_binary_index::read::artifact_cache::fetch_cached_bytes_cid(
+                    content_store.as_ref(),
+                    sc,
+                    &cache_dir,
+                )
+                .await
+                {
+                    Ok(bytes) => {
+                        stats.sidecar_fetches.fetch_add(1, Ordering::Relaxed);
+                        stats
+                            .sidecar_fetch_ms
+                            .fetch_add(started.elapsed().as_millis() as u64, Ordering::Relaxed);
+                        stats
+                            .sidecar_bytes
+                            .fetch_add(bytes.len() as u64, Ordering::Relaxed);
+                        if cached_before {
+                            stats.sidecar_cache_hits.fetch_add(1, Ordering::Relaxed);
+                        } else {
+                            stats.sidecar_cache_misses.fetch_add(1, Ordering::Relaxed);
+                        }
+                        sidecar_map.insert(sc.clone(), bytes);
+                    }
+                    // A sidecar listed in the manifest may not exist in storage;
+                    // treat NotFound as "absent" (closure returns None), same as
+                    // the previous on-demand path.
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                        stats.sidecar_absent.fetch_add(1, Ordering::Relaxed);
+                    }
+                    Err(e) => {
+                        return Err(IndexerError::StorageRead(format!(
+                            "prefetch sidecar {sc}: {e}"
+                        )));
+                    }
+                }
+            }
+        }
+    }
+
+    // CPU-bound CoW update on a blocking thread. The fetch closures read the
+    // prefetched in-memory maps — no `block_on`, no S3 inside the closure.
     let result = tokio::task::spawn_blocking(move || {
         let _guard = parent_span.enter();
-        let cs = content_store.clone();
-        let cs2 = content_store;
-        let cache_dir2 = cache_dir.clone();
-        let leaf_stats = Arc::clone(&task_stats);
-        let sidecar_stats = Arc::clone(&task_stats);
         update_branch(
             &branch_bytes,
             &sorted_records,
             &sorted_ops,
             &branch_config,
             &|cid| {
-                let cached_before = cache_dir.join(cid.to_string()).exists();
-                let fetch_started = Instant::now();
-                let result = handle.block_on(async {
-                    fluree_db_binary_index::read::artifact_cache::fetch_cached_bytes_cid(
-                        cs.as_ref(),
-                        cid,
-                        &cache_dir,
-                    )
-                    .await
-                });
-                let elapsed_ms = fetch_started.elapsed().as_millis() as u64;
-                leaf_stats.leaf_fetches.fetch_add(1, Ordering::Relaxed);
-                leaf_stats
-                    .leaf_fetch_ms
-                    .fetch_add(elapsed_ms, Ordering::Relaxed);
-                match &result {
-                    Ok(bytes) => {
-                        leaf_stats
-                            .leaf_bytes
-                            .fetch_add(bytes.len() as u64, Ordering::Relaxed);
-                        if cached_before {
-                            leaf_stats.leaf_cache_hits.fetch_add(1, Ordering::Relaxed);
-                        } else {
-                            leaf_stats.leaf_cache_misses.fetch_add(1, Ordering::Relaxed);
-                        }
-                        tracing::trace!(
-                            %cid,
-                            cached_before,
-                            bytes = bytes.len(),
-                            elapsed_ms,
-                            "V6 Phase 2 leaf fetch"
-                        );
-                    }
-                    Err(err) => {
-                        tracing::debug!(
-                            %cid,
-                            cached_before,
-                            elapsed_ms,
-                            error = %err,
-                            "V6 Phase 2 leaf fetch failed"
-                        );
-                    }
-                }
-                result
+                leaf_map
+                    .get(cid)
+                    .cloned()
+                    .ok_or_else(|| std::io::Error::other(format!("leaf {cid} not prefetched")))
             },
-            &|cid| {
-                let cached_before = cache_dir2.join(cid.to_string()).exists();
-                let fetch_started = Instant::now();
-                let result = handle.block_on(async {
-                    fluree_db_binary_index::read::artifact_cache::fetch_cached_bytes_cid(
-                        cs2.as_ref(),
-                        cid,
-                        &cache_dir2,
-                    )
-                    .await
-                });
-                let elapsed_ms = fetch_started.elapsed().as_millis() as u64;
-                sidecar_stats
-                    .sidecar_fetches
-                    .fetch_add(1, Ordering::Relaxed);
-                sidecar_stats
-                    .sidecar_fetch_ms
-                    .fetch_add(elapsed_ms, Ordering::Relaxed);
-                match &result {
-                    Ok(bytes) => {
-                        sidecar_stats
-                            .sidecar_bytes
-                            .fetch_add(bytes.len() as u64, Ordering::Relaxed);
-                        if cached_before {
-                            sidecar_stats
-                                .sidecar_cache_hits
-                                .fetch_add(1, Ordering::Relaxed);
-                        } else {
-                            sidecar_stats
-                                .sidecar_cache_misses
-                                .fetch_add(1, Ordering::Relaxed);
-                        }
-                        tracing::trace!(
-                            %cid,
-                            cached_before,
-                            bytes = bytes.len(),
-                            elapsed_ms,
-                            "V6 Phase 2 sidecar fetch"
-                        );
-                    }
-                    Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-                        sidecar_stats.sidecar_absent.fetch_add(1, Ordering::Relaxed);
-                    }
-                    Err(err) => {
-                        tracing::debug!(
-                            %cid,
-                            cached_before,
-                            elapsed_ms,
-                            error = %err,
-                            "V6 Phase 2 sidecar fetch failed"
-                        );
-                    }
-                }
-                result.map(Some).or_else(|e| match e.kind() {
-                    std::io::ErrorKind::NotFound => {
-                        tracing::debug!("sidecar not found (treating as absent): {e}");
-                        Ok(None)
-                    }
-                    _ => Err(e),
-                })
-            },
+            &|cid| Ok(sidecar_map.get(cid).cloned()),
         )
     })
     .await
