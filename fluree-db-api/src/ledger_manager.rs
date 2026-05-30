@@ -408,8 +408,12 @@ enum LoadState {
     },
     /// Loaded and cached
     Ready(LedgerHandle),
-    /// Reload in progress - handle stays valid, waiters receive () on success
+    /// Reload in progress - handle stays valid, waiters receive () on success.
+    ///
+    /// `generation` is a per-slot token (same source as `Loading`) so a
+    /// [`ReloadLeaderGuard`]'s cleanup only reclaims its own orphaned slot.
     Reloading {
+        generation: u64,
         handle: LedgerHandle,
         waiters: Vec<oneshot::Sender<std::result::Result<(), Arc<ApiError>>>>,
     },
@@ -476,6 +480,59 @@ impl Drop for LoadingLeaderGuard {
             if matches!(
                 entries.get(&alias),
                 Some(LoadState::Loading { generation: g, .. }) if *g == generation
+            ) {
+                entries.remove(&alias);
+            }
+        });
+    }
+}
+
+/// Cancellation-safety guard for a reload leader in [`LedgerManager::reload`].
+///
+/// `reload` transitions `Ready(h) → Reloading{h, waiters}` and only clears it
+/// on the publish path. A dropped reload-leader future would otherwise orphan
+/// the `Reloading` slot forever; unlike `Loading` this does NOT wedge query
+/// reads (`get_or_load` returns the still-valid handle for `Reloading`), but it
+/// permanently stalls future `reload`s and `current_t` for that ledger.
+///
+/// On drop-before-publish this guard evicts its own orphaned slot (generation
+/// match), dropping the waiter senders so parked reloaders get `RecvError`
+/// (surfaced as `ApiError::internal("reload cancelled")`). Eviction is safe —
+/// the next query cold-loads the ledger fresh — and avoids re-inserting after a
+/// concurrent `disconnect`/shutdown. The leader calls [`Self::disarm`] once it
+/// has published.
+struct ReloadLeaderGuard {
+    entries: Arc<RwLock<HashMap<String, LoadState>>>,
+    alias: String,
+    generation: u64,
+    armed: bool,
+}
+
+impl ReloadLeaderGuard {
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for ReloadLeaderGuard {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        let Ok(rt) = tokio::runtime::Handle::try_current() else {
+            return;
+        };
+        let entries = Arc::clone(&self.entries);
+        let alias = std::mem::take(&mut self.alias);
+        let generation = self.generation;
+        rt.spawn(async move {
+            let mut entries = entries.write().await;
+            // Only reclaim OUR still-`Reloading` slot (generation match), so a
+            // stale guard never clobbers a fresh slot inserted after the orphan
+            // was cleared.
+            if matches!(
+                entries.get(&alias),
+                Some(LoadState::Reloading { generation: g, .. }) if *g == generation
             ) {
                 entries.remove(&alias);
             }
@@ -937,7 +994,10 @@ impl LedgerManager {
             normalize_ledger_id(ledger_id).unwrap_or_else(|_| ledger_id.to_string());
 
         enum ReloadAction {
-            BecomeLeader(LedgerHandle),
+            BecomeLeader {
+                handle: LedgerHandle,
+                generation: u64,
+            },
             WaitForReload(oneshot::Receiver<std::result::Result<(), Arc<ApiError>>>),
             WaitForInitialLoad(oneshot::Receiver<std::result::Result<LedgerHandle, Arc<ApiError>>>),
             NotLoaded,
@@ -949,14 +1009,18 @@ impl LedgerManager {
 
             match entries.get_mut(&canonical_alias) {
                 Some(LoadState::Ready(h)) => {
-                    // Transition to Reloading, become leader
+                    // Transition to Reloading, become leader. Tag the slot with
+                    // a fresh generation so a cancelled leader's guard reclaims
+                    // only its own slot.
                     let handle = h.clone();
+                    let generation = self.load_generation.fetch_add(1, Ordering::Relaxed);
                     let reloading = LoadState::Reloading {
+                        generation,
                         handle: handle.clone(),
                         waiters: Vec::new(),
                     };
                     entries.insert(canonical_alias.clone(), reloading);
-                    ReloadAction::BecomeLeader(handle)
+                    ReloadAction::BecomeLeader { handle, generation }
                 }
                 Some(LoadState::Reloading { waiters, .. }) => {
                     // Join existing reload
@@ -1007,48 +1071,71 @@ impl LedgerManager {
                     })
             }
 
-            ReloadAction::BecomeLeader(handle) => {
-                // We're the reload leader - do I/O without manager lock
-                let mut write_guard = handle.lock_for_write().await;
+            ReloadAction::BecomeLeader { handle, generation } => {
+                // Guard the Reloading slot: a cancelled reload-leader future
+                // would otherwise orphan it (stalling future reloads/current_t).
+                let mut reload_guard = ReloadLeaderGuard {
+                    entries: Arc::clone(&self.entries),
+                    alias: canonical_alias.clone(),
+                    generation,
+                    armed: true,
+                };
 
-                let result = LedgerState::load(&self.nameservice_mode, ledger_id, &self.backend)
-                    .await
-                    .map_err(ApiError::from); // Convert LedgerError to ApiError
+                // We're the reload leader - do ALL I/O (including the binary
+                // store attach, which reads S3) without the `entries` lock, and
+                // release the handle `state` lock before taking `entries` so the
+                // two locks never overlap (avoids the entries↔state ordering
+                // hazard with `current_t`).
+                let result = {
+                    let mut write_guard = handle.lock_for_write().await;
+                    let loaded =
+                        LedgerState::load(&self.nameservice_mode, ledger_id, &self.backend)
+                            .await
+                            .map_err(ApiError::from);
+                    match loaded {
+                        Ok(mut new_state) => {
+                            // Attempt to load binary index store (v2 only)
+                            let new_binary_store = match load_and_attach_binary_store(
+                                &self.backend,
+                                self.nameservice_mode.reader(),
+                                &mut new_state,
+                                &self.config.cache_dir,
+                                self.config.leaflet_cache.clone(),
+                            )
+                            .await
+                            {
+                                Ok(store) => store,
+                                Err(e) => {
+                                    tracing::warn!(
+                                        ledger_id = %ledger_id,
+                                        error = %e,
+                                        "Failed to load binary store during reload, continuing without"
+                                    );
+                                    None
+                                }
+                            };
+                            write_guard.replace(new_state);
+                            // Update binary_store coherently (state lock held → correct order).
+                            *handle.inner.binary_store.lock().await = new_binary_store;
+                            Ok(())
+                        }
+                        Err(e) => Err(e),
+                    }
+                    // write_guard (handle state lock) dropped here, before `entries`.
+                };
 
-                // Publish result under lock
+                // Publish under a brief `entries` lock — no `.await` between the
+                // lock and disarm, so the leader can't be cancelled mid-publish.
                 let mut entries = self.entries.write().await;
                 let shutting_down = self.is_shutdown();
+                reload_guard.disarm();
 
                 match result {
-                    Ok(mut new_state) => {
-                        // Attempt to load binary index store (v2 only)
-                        let new_binary_store = match load_and_attach_binary_store(
-                            &self.backend,
-                            self.nameservice_mode.reader(),
-                            &mut new_state,
-                            &self.config.cache_dir,
-                            self.config.leaflet_cache.clone(),
-                        )
-                        .await
-                        {
-                            Ok(store) => store,
-                            Err(e) => {
-                                tracing::warn!(
-                                    ledger_id = %ledger_id,
-                                    error = %e,
-                                    "Failed to load binary store during reload, continuing without"
-                                );
-                                None
-                            }
-                        };
-
-                        write_guard.replace(new_state);
-                        // Update binary_store coherently with the new state
-                        *handle.inner.binary_store.lock().await = new_binary_store;
-
+                    Ok(()) => {
                         // Notify waiters and restore Ready state (unless shutting down)
-                        if let Some(LoadState::Reloading { handle, waiters }) =
-                            entries.remove(&canonical_alias)
+                        if let Some(LoadState::Reloading {
+                            handle, waiters, ..
+                        }) = entries.remove(&canonical_alias)
                         {
                             for tx in waiters {
                                 let _ = tx.send(Ok(()));
@@ -1066,8 +1153,9 @@ impl LedgerManager {
                             Arc::new(ApiError::http(e.status_code(), e.to_string()));
 
                         // Notify waiters of failure, restore Ready (keep old data) unless shutting down
-                        if let Some(LoadState::Reloading { handle, waiters }) =
-                            entries.remove(&canonical_alias)
+                        if let Some(LoadState::Reloading {
+                            handle, waiters, ..
+                        }) = entries.remove(&canonical_alias)
                         {
                             for tx in waiters {
                                 let _ = tx.send(Err(Arc::clone(&error_for_waiters)));
@@ -2092,6 +2180,95 @@ mod tests {
                 Some(LoadState::Loading { generation: 7, .. })
             ),
             "stale guard (gen 3) must not remove the new leader's slot (gen 7)"
+        );
+    }
+
+    // ========================================================================
+    // Cancellation-safety tests - ReloadLeaderGuard
+    // ========================================================================
+
+    /// Build a minimal cached handle for guard tests (genesis snapshot, empty
+    /// novelty, no binary store).
+    fn make_test_handle(alias: &str) -> LedgerHandle {
+        use fluree_db_core::db::LedgerSnapshot;
+        use fluree_db_novelty::Novelty;
+        let state = LedgerState::new(LedgerSnapshot::genesis(alias), Novelty::new(0));
+        LedgerHandle::new(alias.to_string(), state, None)
+    }
+
+    /// Regression: a reload-leader future cancelled mid-load must not orphan its
+    /// `Reloading` slot (which would stall future reloads/current_t).
+    #[tokio::test]
+    async fn test_cancelled_reload_leader_reclaims_reloading_slot() {
+        let mgr = make_test_manager();
+        let handle = make_test_handle("x:main");
+        {
+            let mut entries = mgr.entries.write().await;
+            entries.insert(
+                "x:main".to_string(),
+                LoadState::Reloading {
+                    generation: 5,
+                    handle: handle.clone(),
+                    waiters: Vec::new(),
+                },
+            );
+        }
+        {
+            let _guard = ReloadLeaderGuard {
+                entries: Arc::clone(&mgr.entries),
+                alias: "x:main".to_string(),
+                generation: 5,
+                armed: true,
+            };
+            // dropped WITHOUT disarm() == cancelled reload leader
+        }
+        for _ in 0..20 {
+            tokio::task::yield_now().await;
+            if mgr.entries.read().await.get("x:main").is_none() {
+                break;
+            }
+        }
+        assert!(
+            mgr.entries.read().await.get("x:main").is_none(),
+            "orphaned Reloading slot must be reclaimed when the reload leader is dropped"
+        );
+    }
+
+    /// ABA: a stale reload guard must not clobber a fresh slot (different
+    /// generation, or a `Loading`/`Ready` a later caller installed).
+    #[tokio::test]
+    async fn test_stale_reload_guard_does_not_clobber_new_slot() {
+        let mgr = make_test_manager();
+        let handle = make_test_handle("x:main");
+        {
+            let mut entries = mgr.entries.write().await;
+            entries.insert(
+                "x:main".to_string(),
+                LoadState::Reloading {
+                    generation: 9,
+                    handle,
+                    waiters: Vec::new(),
+                },
+            );
+        }
+        {
+            let _guard = ReloadLeaderGuard {
+                entries: Arc::clone(&mgr.entries),
+                alias: "x:main".to_string(),
+                generation: 4,
+                armed: true,
+            };
+        }
+        for _ in 0..10 {
+            tokio::task::yield_now().await;
+        }
+        let entries = mgr.entries.read().await;
+        assert!(
+            matches!(
+                entries.get("x:main"),
+                Some(LoadState::Reloading { generation: 9, .. })
+            ),
+            "stale reload guard (gen 4) must not remove the newer slot (gen 9)"
         );
     }
 
