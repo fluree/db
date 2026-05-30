@@ -15,6 +15,30 @@ use super::upload_dicts::upload_dicts_from_disk;
 
 use tracing::Instrument;
 
+/// Dedicated multi-thread runtime used to drive the full-rebuild's `block_on`.
+///
+/// The rebuild pipeline runs on a `spawn_blocking` thread (it holds non-Send
+/// dictionaries across awaits) and `block_on`s its S3 reads/writes. Driving
+/// that `block_on` with the *main* runtime's handle means its IO reactor is
+/// only advanced when a main worker is free — on a small-worker runtime under
+/// concurrent load the rebuild's S3 IO can stall (the same starvation class as
+/// the read-path bridges, just lower-exposure since a rebuild is rare). Driving
+/// it on a small dedicated runtime gives the rebuild its own reactor/workers,
+/// independent of main-runtime pressure. Lazily built; ~2 workers is plenty to
+/// drive epoll (the rebuild's CPU parallelism uses its own thread pools, not
+/// tokio workers).
+fn dedicated_rebuild_runtime() -> &'static tokio::runtime::Runtime {
+    static RT: std::sync::OnceLock<tokio::runtime::Runtime> = std::sync::OnceLock::new();
+    RT.get_or_init(|| {
+        tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .thread_name("fluree-index-rebuild")
+            .build()
+            .expect("build dedicated index-rebuild runtime")
+    })
+}
+
 ///
 /// Unlike `build_index_for_ledger`, this skips the nameservice lookup and
 /// the "already current" early-return check. Use this when you already have
@@ -88,7 +112,9 @@ where
     let ledger_id = ledger_id.to_string();
     let _prev_root_id = record.index_head_id.clone();
     let commit_t = record.commit_t;
-    let handle = tokio::runtime::Handle::current();
+    // Drive the rebuild's block_on on a dedicated runtime so its S3 IO reactor
+    // is advanced by dedicated workers, not the (possibly starved) main runtime.
+    let handle = dedicated_rebuild_runtime().handle().clone();
     let parent_span = tracing::Span::current();
 
     tokio::task::spawn_blocking(move || {
