@@ -48,12 +48,23 @@ use crate::{publish_index_result, IndexResult};
 use fluree_db_core::Storage;
 use fluree_db_core::StorageBackend;
 use fluree_db_nameservice::ReadWriteNameService;
+use futures::FutureExt;
 use std::collections::BTreeMap;
 use std::future::Future;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::{oneshot, watch, Mutex, Notify};
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, warn};
+
+/// Exponential indexing-retry backoff: `100ms * 2^retry_count`, capped at 30s.
+/// Matches `schedule_retry` so every retry path backs off consistently instead
+/// of hot-spinning at a fixed interval (e.g. the "nameservice reports index_t
+/// but no index_head_id" gate, plausible on slow / eventually-consistent S3).
+fn retry_backoff(retry_count: u32) -> Duration {
+    let exp = retry_count.min(20);
+    let factor = 1u64.checked_shl(exp).unwrap_or(u64::MAX);
+    Duration::from_millis(100u64.saturating_mul(factor).min(30_000))
+}
 
 tokio::task_local! {
     static INDEX_REQUEST_CORRELATION: IndexRequestCorrelation;
@@ -679,10 +690,32 @@ impl BackgroundIndexerWorker {
                 "Background indexer worker tick"
             );
 
-            // Process each ledger
+            // Process each ledger. Isolate each one in a panic boundary: a
+            // panic in one ledger's build (or its bookkeeping) must NOT unwind
+            // out of `run()` and kill the single worker task — that would stop
+            // ALL indexing permanently (the JoinHandle is detached, nothing
+            // restarts it) and eventually wedge commits everywhere via novelty
+            // backpressure. On a caught panic, reset that ledger to retry.
             for ledger_id in ledgers_to_process {
                 debug!(ledger_id = %ledger_id, "Dispatching queued ledger to process_ledger");
-                self.process_ledger(&ledger_id).await;
+                let outcome = std::panic::AssertUnwindSafe(self.process_ledger(&ledger_id))
+                    .catch_unwind()
+                    .await;
+                if outcome.is_err() {
+                    error!(
+                        ledger_id = %ledger_id,
+                        "Indexer process_ledger PANICKED; isolating so the worker survives, \
+                         scheduling retry"
+                    );
+                    let mut states = self.states.lock().await;
+                    if let Some(state) = states.get_mut(&ledger_id) {
+                        state.last_error = Some("indexer task panicked".to_string());
+                        state.phase = IndexPhase::Pending;
+                        state.next_retry_at =
+                            Some(tokio::time::Instant::now() + retry_backoff(state.retry_count));
+                        state.retry_count = state.retry_count.saturating_add(1);
+                    }
+                }
                 debug!(ledger_id = %ledger_id, "process_ledger returned");
             }
 
@@ -912,8 +945,9 @@ impl BackgroundIndexerWorker {
                             state.last_error =
                                 Some("Nameservice missing index_head_id".to_string());
                             state.phase = IndexPhase::Pending;
-                            state.next_retry_at =
-                                Some(tokio::time::Instant::now() + Duration::from_millis(250));
+                            state.next_retry_at = Some(
+                                tokio::time::Instant::now() + retry_backoff(state.retry_count),
+                            );
                             state.retry_count = state.retry_count.saturating_add(1);
                             warn!(
                                 ledger_id = %ledger_id,
@@ -979,7 +1013,7 @@ impl BackgroundIndexerWorker {
                     state.last_error = Some("Nameservice missing index_head_id".to_string());
                     state.phase = IndexPhase::Pending;
                     state.next_retry_at =
-                        Some(tokio::time::Instant::now() + Duration::from_millis(250));
+                        Some(tokio::time::Instant::now() + retry_backoff(state.retry_count));
                     state.retry_count = state.retry_count.saturating_add(1);
                     return;
                 }
@@ -1024,7 +1058,7 @@ impl BackgroundIndexerWorker {
                     state.last_error = Some(e.to_string());
                     state.phase = IndexPhase::Pending;
                     state.next_retry_at =
-                        Some(tokio::time::Instant::now() + Duration::from_millis(250));
+                        Some(tokio::time::Instant::now() + retry_backoff(state.retry_count));
                     state.retry_count = state.retry_count.saturating_add(1);
                 }
                 return;
