@@ -2,7 +2,8 @@ use crate::binding::Binding;
 use crate::context::{ExecutionContext, WellKnownDatatypes};
 use crate::error::{QueryError, Result};
 use crate::fast_path_common::{
-    build_psot_cursor_for_predicate, fast_path_store, normalize_pred_sid, subject_ref_to_s_id,
+    allow_cursor_fast_path, build_psot_cursor_for_predicate, fast_path_store, normalize_pred_sid,
+    subject_ref_to_s_id,
 };
 use crate::ir::triple::{Ref, Term};
 use crate::operator::BoxedOperator;
@@ -38,16 +39,6 @@ use std::sync::Arc;
 #[inline]
 fn should_fallback(ctx: &ExecutionContext<'_>) -> bool {
     fast_path_store(ctx).is_none()
-}
-
-#[inline]
-fn allow_cursor_fast_path(ctx: &ExecutionContext<'_>) -> bool {
-    // History mode is filtered at the planner — see
-    // `execute::operator_tree::build_operator_tree_inner` — so this gate
-    // doesn't duplicate that check.
-    !ctx.is_multi_ledger()
-        && ctx.from_t.is_none()
-        && ctx.policy_enforcer.as_ref().is_none_or(|p| p.is_root())
 }
 
 // ---------------------------------------------------------------------------

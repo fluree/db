@@ -1731,6 +1731,21 @@ pub fn fast_path_store<'a>(ctx: &'a ExecutionContext<'_>) -> Option<&'a Arc<Bina
     Some(store)
 }
 
+/// Cursor-flavored fast-path gate (strategy (b)).
+///
+/// Unlike [`allow_fast_path`], this does **not** reject uncommitted overlay or
+/// `to_t < max_t`: operators using this gate read through a [`BinaryCursor`]
+/// (built by [`build_psot_cursor_for_predicate`]) that folds the novelty overlay
+/// in and honors `to_t`, so those cases stay correct. It still requires
+/// single-ledger, no `from_t`, and root (or no) policy; History mode is filtered
+/// at the planner level.
+#[inline]
+pub fn allow_cursor_fast_path(ctx: &ExecutionContext<'_>) -> bool {
+    !ctx.is_multi_ledger()
+        && ctx.from_t.is_none()
+        && ctx.policy_enforcer.as_ref().is_none_or(|p| p.is_root())
+}
+
 // ---------------------------------------------------------------------------
 // 11. Generic fast-path operator
 // ---------------------------------------------------------------------------

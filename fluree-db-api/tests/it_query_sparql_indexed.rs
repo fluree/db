@@ -774,6 +774,146 @@ async fn indexed_overlay_count_reflects_retract_and_reassert() {
         .await;
 }
 
+/// Regression: the `<S> <p>+ ?o` COUNT(*) fast path must incorporate novelty.
+///
+/// Property-path+ COUNT used to gate on `fast_path_store`, which bails the
+/// instant an uncommitted overlay is present — so its (overlay-aware) PSOT
+/// cursor was dead code. It now gates on `allow_cursor_fast_path` like the
+/// transitive-path operator, building adjacency from the overlay-merged cursor.
+/// This verifies the count tracks both an overlay assertion and an overlay
+/// retraction of `knows` edges.
+#[tokio::test]
+async fn indexed_overlay_property_path_plus_count_reflects_overlay() {
+    assert_index_defaults();
+    let fluree = FlureeBuilder::memory()
+        .with_ledger_cache_config(LedgerManagerConfig::default())
+        .build_memory();
+    let ledger_id = "it/overlay-path-plus-count:main";
+
+    let (local, handle) = start_background_indexer_local(
+        fluree.backend().clone(),
+        Arc::new(fluree.nameservice_mode().clone()),
+        fluree_db_indexer::IndexerConfig::small(),
+    );
+
+    local
+        .run_until(async move {
+            let index_cfg = IndexConfig {
+                reindex_min_bytes: 0,
+                reindex_max_bytes: 10_000_000,
+            };
+
+            // Phase 1: Seed and index a knows-chain p1 -> p2 -> p3 -> p4.
+            // Reachable from p1 via knows+ = {p2, p3, p4} = 3.
+            let ledger0 = genesis_ledger_for_fluree(&fluree, ledger_id);
+            let baseline = json!({
+                "@context": { "ex": "http://example.org/ns/" },
+                "@graph": [
+                    {"@id": "ex:p1", "ex:knows": {"@id": "ex:p2"}},
+                    {"@id": "ex:p2", "ex:knows": {"@id": "ex:p3"}},
+                    {"@id": "ex:p3", "ex:knows": {"@id": "ex:p4"}}
+                ]
+            });
+            let ledger1 = fluree
+                .insert_with_opts(
+                    ledger0,
+                    &baseline,
+                    TxnOpts::default(),
+                    CommitOpts::default(),
+                    &index_cfg,
+                )
+                .await
+                .expect("baseline insert")
+                .ledger;
+
+            let outcome = trigger_index_and_wait_outcome(&handle, ledger_id, ledger1.t()).await;
+            if let fluree_db_api::IndexOutcome::Completed { index_t, .. } = outcome {
+                assert_eq!(index_t, 1, "should index to t=1");
+            }
+
+            let query = r"
+                PREFIX ex: <http://example.org/ns/>
+                SELECT (COUNT(*) AS ?cnt)
+                WHERE { ex:p1 ex:knows+ ?o . }
+            ";
+
+            // Baseline (no overlay): fast path runs against the binary index only.
+            let view1 = fluree
+                .db_at_t(ledger_id, ledger1.t())
+                .await
+                .expect("load view at t=1");
+            let result = fluree
+                .query(&view1, QueryInput::Sparql(query))
+                .await
+                .expect("count at t=1");
+            let jsonld = result.to_jsonld(&view1.snapshot).expect("to_jsonld");
+            assert_eq!(
+                normalize_rows(&jsonld),
+                normalize_rows(&json!([[3]])),
+                "baseline knows+ reachable count from p1 should be 3"
+            );
+
+            // Phase 2: Assert p4 -> p5 in novelty (overlay).
+            // Reachable from p1 via knows+ = {p2, p3, p4, p5} = 4.
+            let extend = json!({
+                "@context": { "ex": "http://example.org/ns/" },
+                "@graph": [
+                    {"@id": "ex:p4", "ex:knows": {"@id": "ex:p5"}}
+                ]
+            });
+            let ledger2 = fluree
+                .insert(ledger1, &extend)
+                .await
+                .expect("extend in novelty")
+                .ledger;
+
+            let view2 = fluree
+                .db_at_t(ledger_id, ledger2.t())
+                .await
+                .expect("load view at t=2");
+            let result = fluree
+                .query(&view2, QueryInput::Sparql(query))
+                .await
+                .expect("count at t=2");
+            let jsonld = result.to_jsonld(&view2.snapshot).expect("to_jsonld");
+            assert_eq!(
+                normalize_rows(&jsonld),
+                normalize_rows(&json!([[4]])),
+                "count should reflect the overlay-asserted knows edge"
+            );
+
+            // Phase 3: Retract p2 -> p3 in novelty. The effective graph is now
+            // p1 -> p2, p3 -> p4, p4 -> p5, so only {p2} is reachable from p1.
+            let retract = json!({
+                "@context": { "ex": "http://example.org/ns/" },
+                "delete": [
+                    {"@id": "ex:p2", "ex:knows": {"@id": "ex:p3"}}
+                ]
+            });
+            let ledger3 = fluree
+                .update(ledger2, &retract)
+                .await
+                .expect("retract in novelty")
+                .ledger;
+
+            let view3 = fluree
+                .db_at_t(ledger_id, ledger3.t())
+                .await
+                .expect("load view at t=3");
+            let result = fluree
+                .query(&view3, QueryInput::Sparql(query))
+                .await
+                .expect("count at t=3");
+            let jsonld = result.to_jsonld(&view3.snapshot).expect("to_jsonld");
+            assert_eq!(
+                normalize_rows(&jsonld),
+                normalize_rows(&json!([[1]])),
+                "count should reflect the overlay-retracted knows edge"
+            );
+        })
+        .await;
+}
+
 /// Regression: GROUP BY + COUNT top-k should reflect novelty deltas even when
 /// the binary index is present and overlay introduces retractions/assertions.
 #[tokio::test]

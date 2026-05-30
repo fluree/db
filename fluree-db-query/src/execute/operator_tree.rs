@@ -29,13 +29,14 @@ use crate::fast_min_max_string::{
 };
 use crate::fast_multicolumn_join_count_all::multicolumn_join_count_all_operator;
 use crate::fast_optional_chain_head_count_all::predicate_optional_chain_head_count_all;
-use crate::fast_property_path_plus_count_all::property_path_plus_count_all_operator;
+use crate::fast_path_plus_count_all::{
+    property_path_plus_count_all_operator, transitive_path_plus_count_all_operator,
+};
 use crate::fast_star_const_order_topk::star_const_ordered_limit_operator;
 use crate::fast_string_prefix_count_all::{
     string_prefix_count_all_operator, string_prefix_sum_strstarts_operator,
 };
 use crate::fast_sum_strlen_group_concat::sum_strlen_group_concat_operator;
-use crate::fast_transitive_path_plus_count_all::transitive_path_plus_count_all_operator;
 use crate::fast_union_star_count_all::{UnionCountMode, UnionStarCountAllOperator};
 use crate::group_aggregate::{GroupAggregateOperator, StreamingAggSpec};
 use crate::groupby::GroupByOperator;
