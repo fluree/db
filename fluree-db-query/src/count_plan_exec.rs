@@ -154,9 +154,23 @@ fn stream_overlay_supported(node: &StreamNode) -> bool {
     match node {
         StreamNode::SubjectCountScan { .. } => true,
         StreamNode::StarJoin { children } => children.iter().all(stream_overlay_supported),
-        StreamNode::OptionalJoin { .. }
-        | StreamNode::AntiJoin { .. }
-        | StreamNode::SemiJoin { .. } => false,
+        StreamNode::AntiJoin { source, excluded } => {
+            stream_overlay_supported(source) && keyset_overlay_supported(excluded)
+        }
+        StreamNode::SemiJoin { source, filter } => {
+            stream_overlay_supported(source) && keyset_overlay_supported(filter)
+        }
+        StreamNode::OptionalJoin { .. } => false,
+    }
+}
+
+/// Subject-keyed keysets have an overlay lane; the object-keyed
+/// `SubjectsWithObjectIn` does not (yet).
+fn keyset_overlay_supported(node: &KeySetNode) -> bool {
+    match node {
+        KeySetNode::SubjectSet { .. } | KeySetNode::SubjectsSorted { .. } => true,
+        KeySetNode::IntersectSorted { children } => children.iter().all(keyset_overlay_supported),
+        KeySetNode::SubjectsWithObjectIn { .. } => false,
     }
 }
 
@@ -284,6 +298,32 @@ fn subject_groups<'a>(ec: &ExecCtx<'a, '_>, pred: &Ref) -> Result<Option<Subject
     }
 }
 
+/// Distinct subjects for `pred`, ascending — metadata (no overlay) or the
+/// overlay-merged PSOT cursor. The PSOT cursor yields rows in `(p, s, …)` order,
+/// so consecutive-subject grouping produces distinct subjects already sorted.
+/// `Ok(None)` bails the plan.
+fn subject_keys_sorted(ec: &ExecCtx<'_, '_>, pred: &Ref) -> Result<Option<Vec<u64>>> {
+    if ec.overlay {
+        let Some(mut groups) = subject_groups(ec, pred)? else {
+            return Ok(None);
+        };
+        let mut out: Vec<u64> = Vec::new();
+        while let Some((s, _)) = groups.next_group()? {
+            // One group per distinct subject, emitted in ascending order.
+            out.push(s);
+        }
+        Ok(Some(out))
+    } else {
+        let sid = normalize_pred_sid(ec.store, pred)?;
+        let Some(p_id) = ec.store.sid_to_p_id(&sid) else {
+            return Ok(Some(Vec::new()));
+        };
+        Ok(Some(collect_subjects_for_predicate_sorted(
+            ec.store, ec.g_id, p_id,
+        )?))
+    }
+}
+
 /// Total row count for a predicate — metadata leaflet sum (no overlay) or a
 /// row count over the overlay-merged PSOT cursor. `Ok(None)` bails the plan.
 fn total_row_count(ec: &ExecCtx<'_, '_>, pred: &Ref) -> Result<Option<u64>> {
@@ -339,7 +379,7 @@ fn execute_scalar(node: &ScalarNode, ec: &ExecCtx<'_, '_>) -> Result<Option<u64>
         ScalarNode::Sum { source } => sum_stream(source, ec, None, None),
 
         ScalarNode::SumExcluding { source, excluded } => {
-            let exclude_sorted = execute_keyset_as_sorted(excluded, store, g_id)?;
+            let exclude_sorted = execute_keyset_as_sorted(excluded, ec)?;
             let exclude_sorted = match exclude_sorted {
                 Some(s) => s,
                 None => return Ok(None),
@@ -348,7 +388,7 @@ fn execute_scalar(node: &ScalarNode, ec: &ExecCtx<'_, '_>) -> Result<Option<u64>
         }
 
         ScalarNode::SumFiltered { source, filter } => {
-            let filter_sorted = execute_keyset_as_sorted(filter, store, g_id)?;
+            let filter_sorted = execute_keyset_as_sorted(filter, ec)?;
             let filter_sorted = match filter_sorted {
                 Some(s) => s,
                 None => return Ok(None),
@@ -364,7 +404,7 @@ fn execute_scalar(node: &ScalarNode, ec: &ExecCtx<'_, '_>) -> Result<Option<u64>
             let Some(p_id) = store.sid_to_p_id(&sid) else {
                 return Ok(Some(0));
             };
-            let filter_sorted = execute_keyset_as_sorted(object_filter, store, g_id)?;
+            let filter_sorted = execute_keyset_as_sorted(object_filter, ec)?;
             let filter_sorted = match filter_sorted {
                 Some(s) => s,
                 None => return Ok(None),
@@ -384,7 +424,7 @@ fn execute_scalar(node: &ScalarNode, ec: &ExecCtx<'_, '_>) -> Result<Option<u64>
                 return Ok(Some(0));
             };
             let total = count_rows_for_predicate_psot(store, g_id, p_id)?;
-            let excluded_sorted = execute_keyset_as_sorted(excluded_objects, store, g_id)?;
+            let excluded_sorted = execute_keyset_as_sorted(excluded_objects, ec)?;
             let excluded_sorted = match excluded_sorted {
                 Some(s) => s,
                 None => return Ok(None),
@@ -456,7 +496,7 @@ fn sum_stream(
         ),
 
         StreamNode::AntiJoin { source, excluded } => {
-            let exclude_list = execute_keyset_as_sorted(excluded, store, g_id)?;
+            let exclude_list = execute_keyset_as_sorted(excluded, ec)?;
             let exclude_list = match exclude_list {
                 Some(s) => s,
                 None => return Ok(None),
@@ -467,7 +507,7 @@ fn sum_stream(
         }
 
         StreamNode::SemiJoin { source, filter } => {
-            let filter_list = execute_keyset_as_sorted(filter, store, g_id)?;
+            let filter_list = execute_keyset_as_sorted(filter, ec)?;
             let filter_list = match filter_list {
                 Some(s) => s,
                 None => return Ok(None),
@@ -806,24 +846,21 @@ fn sum_optional_join(
 /// Primary keyset evaluator: returns a sorted `Vec<u64>`.
 ///
 /// All callers in Phase B use sorted lists for streaming merge-skip/merge-keep.
-fn execute_keyset_as_sorted(
-    node: &KeySetNode,
-    store: &Arc<BinaryIndexStore>,
-    g_id: GraphId,
-) -> Result<Option<Vec<u64>>> {
+fn execute_keyset_as_sorted(node: &KeySetNode, ec: &ExecCtx<'_, '_>) -> Result<Option<Vec<u64>>> {
+    let store = ec.store;
+    let g_id = ec.g_id;
     match node {
         KeySetNode::SubjectsSorted { pred } | KeySetNode::SubjectSet { pred } => {
-            let sid = normalize_pred_sid(store, pred)?;
-            let Some(p_id) = store.sid_to_p_id(&sid) else {
-                return Ok(Some(Vec::new()));
-            };
-            Ok(Some(collect_subjects_for_predicate_sorted(
-                store, g_id, p_id,
-            )?))
+            subject_keys_sorted(ec, pred)
         }
         KeySetNode::SubjectsWithObjectIn { pred, object_set } => {
+            // Object-keyed; no overlay lane yet (rejected up-front by
+            // `keyset_overlay_supported`, so this only runs in the metadata lane).
+            if ec.overlay {
+                return Ok(None);
+            }
             // Need a hash set for the object filter, then sort the result.
-            let obj_set = execute_keyset_as_hash_set(object_set, store, g_id)?;
+            let obj_set = execute_keyset_as_hash_set(object_set, ec)?;
             let obj_set = match obj_set {
                 Some(s) => s,
                 None => return Ok(None),
@@ -844,7 +881,7 @@ fn execute_keyset_as_sorted(
         KeySetNode::IntersectSorted { children } => {
             let mut lists: Vec<Vec<u64>> = Vec::with_capacity(children.len());
             for child in children {
-                let sorted = execute_keyset_as_sorted(child, store, g_id)?;
+                let sorted = execute_keyset_as_sorted(child, ec)?;
                 let sorted = match sorted {
                     Some(s) => s,
                     None => return Ok(None),
@@ -860,20 +897,27 @@ fn execute_keyset_as_sorted(
 /// needs `collect_subjects_with_object_in_set(&FxHashSet)`.
 fn execute_keyset_as_hash_set(
     node: &KeySetNode,
-    store: &Arc<BinaryIndexStore>,
-    g_id: GraphId,
+    ec: &ExecCtx<'_, '_>,
 ) -> Result<Option<FxHashSet<u64>>> {
     match node {
         KeySetNode::SubjectSet { pred } => {
-            let sid = normalize_pred_sid(store, pred)?;
-            let Some(p_id) = store.sid_to_p_id(&sid) else {
+            if ec.overlay {
+                let Some(v) = subject_keys_sorted(ec, pred)? else {
+                    return Ok(None);
+                };
+                return Ok(Some(v.into_iter().collect()));
+            }
+            let sid = normalize_pred_sid(ec.store, pred)?;
+            let Some(p_id) = ec.store.sid_to_p_id(&sid) else {
                 return Ok(Some(FxHashSet::default()));
             };
-            Ok(Some(collect_subjects_for_predicate_set(store, g_id, p_id)?))
+            Ok(Some(collect_subjects_for_predicate_set(
+                ec.store, ec.g_id, p_id,
+            )?))
         }
         _ => {
             // Fall back: get sorted, convert to set.
-            let sorted = execute_keyset_as_sorted(node, store, g_id)?;
+            let sorted = execute_keyset_as_sorted(node, ec)?;
             match sorted {
                 Some(v) => Ok(Some(v.into_iter().collect())),
                 None => Ok(None),
