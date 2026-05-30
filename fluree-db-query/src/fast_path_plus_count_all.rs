@@ -106,6 +106,20 @@ fn count_reachable_plus_from_fixed_subject(
         return Ok(Some(reach_count_plus(&adj, seed)));
     }
 
+    // The fixed subject was not found in the persisted dictionary. The fallback
+    // below matches it by scanning `resolve_subject_iri`, which is persisted-only:
+    // under an uncommitted overlay the start subject may exist solely in novelty
+    // (e.g. `ex:new` inserted but not yet indexed), so it would never match and we
+    // would undercount to 0. Bail to the (correct) generic pipeline in that case.
+    if ctx
+        .overlay
+        .map(fluree_db_core::OverlayProvider::epoch)
+        .unwrap_or(0)
+        != 0
+    {
+        return Ok(None);
+    }
+
     let target_iri = match subj {
         Ref::Iri(iri) => Some(iri.to_string()),
         Ref::Sid(sid) => ctx

@@ -1001,6 +1001,97 @@ async fn indexed_overlay_property_path_plus_count_reflects_overlay() {
         .await;
 }
 
+/// Regression: `<S> <p>+ ?o` COUNT(*) where the fixed start subject `<S>` exists
+/// ONLY in novelty (overlay), not the persisted index. The fast path resolves the
+/// fixed subject via the persisted dictionary; an overlay-only subject can't be
+/// resolved there, so the operator must bail to the generic pipeline rather than
+/// undercount to 0.
+#[tokio::test]
+async fn indexed_overlay_property_path_plus_count_subject_in_overlay_only() {
+    assert_index_defaults();
+    let fluree = FlureeBuilder::memory()
+        .with_ledger_cache_config(LedgerManagerConfig::default())
+        .build_memory();
+    let ledger_id = "it/overlay-path-plus-subject-novelty:main";
+
+    let (local, handle) = start_background_indexer_local(
+        fluree.backend().clone(),
+        Arc::new(fluree.nameservice_mode().clone()),
+        fluree_db_indexer::IndexerConfig::small(),
+    );
+
+    local
+        .run_until(async move {
+            let index_cfg = IndexConfig {
+                reindex_min_bytes: 0,
+                reindex_max_bytes: 10_000_000,
+            };
+
+            // Phase 1: Seed and index a knows-chain p1 -> p2 -> p3 (no ex:new).
+            let ledger0 = genesis_ledger_for_fluree(&fluree, ledger_id);
+            let baseline = json!({
+                "@context": { "ex": "http://example.org/ns/" },
+                "@graph": [
+                    {"@id": "ex:p1", "ex:knows": {"@id": "ex:p2"}},
+                    {"@id": "ex:p2", "ex:knows": {"@id": "ex:p3"}}
+                ]
+            });
+            let ledger1 = fluree
+                .insert_with_opts(
+                    ledger0,
+                    &baseline,
+                    TxnOpts::default(),
+                    CommitOpts::default(),
+                    &index_cfg,
+                )
+                .await
+                .expect("baseline insert")
+                .ledger;
+
+            let outcome = trigger_index_and_wait_outcome(&handle, ledger_id, ledger1.t()).await;
+            if let fluree_db_api::IndexOutcome::Completed { index_t, .. } = outcome {
+                assert_eq!(index_t, 1, "should index to t=1");
+            }
+
+            // Phase 2: Introduce a NEW subject ex:new only in novelty, linking it
+            // into the indexed chain: ex:new -> p1. Reachable from ex:new via
+            // knows+ = {p1, p2, p3} = 3.
+            let extend = json!({
+                "@context": { "ex": "http://example.org/ns/" },
+                "@graph": [
+                    {"@id": "ex:new", "ex:knows": {"@id": "ex:p1"}}
+                ]
+            });
+            let ledger2 = fluree
+                .insert(ledger1, &extend)
+                .await
+                .expect("insert new subject in novelty")
+                .ledger;
+
+            let query = r"
+                PREFIX ex: <http://example.org/ns/>
+                SELECT (COUNT(*) AS ?cnt)
+                WHERE { ex:new ex:knows+ ?o . }
+            ";
+
+            let view2 = fluree
+                .db_at_t(ledger_id, ledger2.t())
+                .await
+                .expect("load view at t=2");
+            let result = fluree
+                .query(&view2, QueryInput::Sparql(query))
+                .await
+                .expect("count at t=2");
+            let jsonld = result.to_jsonld(&view2.snapshot).expect("to_jsonld");
+            assert_eq!(
+                normalize_rows(&jsonld),
+                normalize_rows(&json!([[3]])),
+                "overlay-only start subject must not undercount (expected 3 reachable)"
+            );
+        })
+        .await;
+}
+
 /// Regression: GROUP BY + COUNT top-k should reflect novelty deltas even when
 /// the binary index is present and overlay introduces retractions/assertions.
 #[tokio::test]
