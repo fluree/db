@@ -207,8 +207,8 @@ pub enum Commands {
         ledger: String,
 
         /// Import data from a file or directory.
-        /// Accepts a single .ttl, .json, or .jsonld file, or a directory of
-        /// .ttl/.trig or .jsonld files (bulk import, bypasses novelty).
+        /// Accepts a single .ttl, .nt, .json, or .jsonld file, or a directory of
+        /// .ttl/.nt/.trig or .jsonld files (bulk import, bypasses novelty).
         /// Files in a directory are processed in lexicographic order.
         #[arg(long)]
         from: Option<PathBuf>,

@@ -39,7 +39,8 @@ pub fn detect_data_format(
     if let Some(p) = path {
         if let Some(ext) = p.extension().and_then(|e| e.to_str()) {
             return match ext.to_lowercase().as_str() {
-                "ttl" => Ok(DataFormat::Turtle),
+                // `.nt` (N-Triples) is a Turtle subset — same parser.
+                "ttl" | "nt" => Ok(DataFormat::Turtle),
                 "json" | "jsonld" => Ok(DataFormat::JsonLd),
                 _ => sniff_data_format(content),
             };

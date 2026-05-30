@@ -694,9 +694,9 @@ impl ChunkSource {
 
 /// Resolve the import path into a `ChunkSource`.
 ///
-/// - If `path` is a directory: discover `.ttl`/`.trig`/`.jsonld` files (sorted lexicographically).
+/// - If `path` is a directory: discover `.ttl`/`.nt`/`.trig`/`.jsonld` files (sorted lexicographically).
 /// - If `path` is a single large `.ttl` file: auto-split using `TurtleChunkReader`.
-/// - If `path` is a single small `.ttl`/`.trig`/`.jsonld` file: treat as a single-element `Files` source.
+/// - If `path` is a single small `.ttl`/`.nt`/`.trig`/`.jsonld` file: treat as a single-element `Files` source.
 fn resolve_chunk_source(
     path: &Path,
     config: &ImportConfig,
@@ -717,10 +717,12 @@ fn resolve_chunk_source(
     let file_size = std::fs::metadata(path)?.len();
     let chunk_size_bytes = config.effective_chunk_size_mb() as u64 * 1024 * 1024;
 
+    // `.nt` (N-Triples) is a strict subset of Turtle, so it streams/splits
+    // through the same triple-boundary reader as `.ttl`.
     let is_ttl = path
         .extension()
         .and_then(|ext| ext.to_str())
-        .is_some_and(|ext| ext.eq_ignore_ascii_case("ttl"));
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("ttl") || ext.eq_ignore_ascii_case("nt"));
 
     if is_ttl && file_size > chunk_size_bytes {
         // Large file: stream chunks via background reader thread.
@@ -812,7 +814,8 @@ async fn resolve_remote_objects(
             .and_then(|e| e.to_str())
             .map(str::to_ascii_lowercase);
         match ext.as_deref() {
-            Some("ttl") => {
+            // `.nt` (N-Triples) is a Turtle subset — parse it as Turtle.
+            Some("ttl" | "nt") => {
                 has_ttl = true;
                 accepted.push(obj);
                 extensions.push(RemoteFormat::Ttl);
@@ -844,7 +847,7 @@ async fn resolve_remote_objects(
 
     if accepted.is_empty() {
         return Err(ImportError::NoChunks(
-            "remote source contains no .ttl/.trig/.jsonld objects".into(),
+            "remote source contains no .ttl/.nt/.trig/.jsonld objects".into(),
         ));
     }
 
@@ -1143,7 +1146,7 @@ impl<'a> CreateBuilder<'a> {
 
     /// Attach a bulk import to this create operation.
     ///
-    /// `path` can be a directory containing `.ttl`/`.trig`/`.jsonld` files
+    /// `path` can be a directory containing `.ttl`/`.nt`/`.trig`/`.jsonld` files
     /// (sorted lexicographically), or a single `.ttl`/`.jsonld` file.
     pub fn import(self, path: impl AsRef<Path>) -> ImportBuilder<'a> {
         ImportBuilder::new(self.fluree, self.ledger_id, path.as_ref().to_path_buf())
@@ -1186,7 +1189,7 @@ impl<'a> CreateBuilder<'a> {
 /// What kind of data files a directory contains.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DirectoryFormat {
-    /// Only `.ttl` / `.trig` files found.
+    /// Only `.ttl` / `.nt` / `.trig` files found.
     Turtle,
     /// Only `.jsonld` files found.
     JsonLd,
@@ -1194,7 +1197,7 @@ pub enum DirectoryFormat {
 
 /// Scan a directory and determine its data format.
 ///
-/// Returns [`DirectoryFormat::Turtle`] if all supported files are `.ttl`/`.trig`,
+/// Returns [`DirectoryFormat::Turtle`] if all supported files are `.ttl`/`.nt`/`.trig`,
 /// [`DirectoryFormat::JsonLd`] if all are `.jsonld`.
 /// Returns [`ImportError::MixedFormats`] on mixed formats,
 /// [`ImportError::NoChunks`] on empty directories or directories with no supported files.
@@ -1212,7 +1215,7 @@ pub fn scan_directory_format(dir: &Path) -> std::result::Result<DirectoryFormat,
         }
         if let Some(ext) = entry.path().extension().and_then(|e| e.to_str()) {
             match ext.to_ascii_lowercase().as_str() {
-                "ttl" | "trig" => has_turtle = true,
+                "ttl" | "trig" | "nt" => has_turtle = true,
                 "jsonld" => has_jsonld = true,
                 _ => {}
             }
@@ -1228,7 +1231,7 @@ pub fn scan_directory_format(dir: &Path) -> std::result::Result<DirectoryFormat,
         (true, false) => Ok(DirectoryFormat::Turtle),
         (false, true) => Ok(DirectoryFormat::JsonLd),
         (false, false) => Err(ImportError::NoChunks(format!(
-            "no supported data files (.ttl, .trig, .jsonld) found in {}",
+            "no supported data files (.ttl, .nt, .trig, .jsonld) found in {}",
             dir.display()
         ))),
     }
@@ -1238,7 +1241,7 @@ pub fn scan_directory_format(dir: &Path) -> std::result::Result<DirectoryFormat,
 // Chunk discovery
 // ============================================================================
 
-/// Discover and sort `.ttl`, `.trig`, or `.jsonld` files from a directory (case-insensitive).
+/// Discover and sort `.ttl`, `.nt`, `.trig`, or `.jsonld` files from a directory (case-insensitive).
 ///
 /// Returns an error if the directory contains a mix of Turtle (`.ttl`/`.trig`) and
 /// JSON-LD (`.jsonld`) files — all files must be the same format family.
@@ -1266,6 +1269,7 @@ fn discover_chunks(dir: &Path) -> std::result::Result<Vec<PathBuf>, ImportError>
                 .and_then(|ext| ext.to_str())
                 .is_some_and(|ext| {
                     ext.eq_ignore_ascii_case("ttl")
+                        || ext.eq_ignore_ascii_case("nt")
                         || ext.eq_ignore_ascii_case("trig")
                         || ext.eq_ignore_ascii_case("jsonld")
                 })

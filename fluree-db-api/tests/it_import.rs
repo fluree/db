@@ -963,3 +963,126 @@ async fn import_single_malformed_jsonld_file_errors() {
         "expected a parse/transact error for malformed JSON-LD, got: {msg}"
     );
 }
+
+// ============================================================================
+// N-Triples (.nt) import tests
+//
+// N-Triples is a strict subset of Turtle, so `.nt` files dispatch to the same
+// Turtle parser. These verify the import pipeline discovers and parses `.nt`
+// for both single-file and directory imports.
+// ============================================================================
+
+/// Write a string to a temp file with the given name and return the path.
+fn write_data(dir: &std::path::Path, name: &str, content: &str) -> std::path::PathBuf {
+    let path = dir.join(name);
+    let mut f = std::fs::File::create(&path).expect("create data file");
+    f.write_all(content.as_bytes()).expect("write data");
+    path
+}
+
+#[tokio::test]
+async fn import_single_nt_file_then_query() {
+    let db_dir = tempfile::tempdir().expect("db tmpdir");
+    let data_dir = tempfile::tempdir().expect("data tmpdir");
+
+    // N-Triples: full IRIs, one triple per line.
+    let nt = "\
+<http://example.org/ns/alice> <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> <http://example.org/ns/User> .
+<http://example.org/ns/alice> <http://schema.org/name> \"Alice\" .
+<http://example.org/ns/bob> <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> <http://example.org/ns/User> .
+<http://example.org/ns/bob> <http://schema.org/name> \"Bob\" .
+";
+
+    let nt_path = write_data(data_dir.path(), "people.nt", nt);
+
+    let fluree = FlureeBuilder::file(db_dir.path().to_string_lossy().to_string())
+        .build()
+        .expect("build file-backed Fluree");
+
+    let result = fluree
+        .create("test/import-nt-single:main")
+        .import(&nt_path)
+        .threads(2)
+        .memory_budget_mb(256)
+        .cleanup(false)
+        .execute()
+        .await
+        .expect("single .nt import should succeed");
+
+    assert!(result.flake_count > 0, "should have flakes");
+    assert!(result.root_id.is_some(), "index should have been built");
+
+    let ledger = fluree
+        .ledger("test/import-nt-single:main")
+        .await
+        .expect("load ledger after .nt import");
+
+    let query = json!({
+        "@context": { "schema": "http://schema.org/" },
+        "select": ["?name"],
+        "where": { "schema:name": "?name" }
+    });
+
+    let qr = support::query_jsonld(&fluree, &ledger, &query)
+        .await
+        .expect("query after .nt import");
+    let json = qr.to_jsonld(&ledger.snapshot).expect("format jsonld");
+    let names = extract_sorted_strings(&json);
+
+    assert_eq!(names, vec!["Alice", "Bob"]);
+}
+
+#[tokio::test]
+async fn import_nt_directory_then_query() {
+    let db_dir = tempfile::tempdir().expect("db tmpdir");
+    let data_dir = tempfile::tempdir().expect("data tmpdir");
+
+    // Two .nt files with disjoint subjects. Directory discovery must recognize
+    // the `.nt` extension (previously only .ttl/.trig/.jsonld were discovered).
+    write_data(
+        data_dir.path(),
+        "a_people.nt",
+        "<http://example.org/ns/alice> <http://schema.org/name> \"Alice\" .\n",
+    );
+    write_data(
+        data_dir.path(),
+        "b_people.nt",
+        "<http://example.org/ns/bob> <http://schema.org/name> \"Bob\" .\n",
+    );
+
+    let fluree = FlureeBuilder::file(db_dir.path().to_string_lossy().to_string())
+        .build()
+        .expect("build file-backed Fluree");
+
+    let result = fluree
+        .create("test/import-nt-dir:main")
+        .import(data_dir.path())
+        .threads(2)
+        .memory_budget_mb(256)
+        .cleanup(false)
+        .execute()
+        .await
+        .expect("directory .nt import should succeed");
+
+    assert_eq!(result.t, 2, "two .nt files => t=2");
+    assert!(result.flake_count > 0);
+
+    let ledger = fluree
+        .ledger("test/import-nt-dir:main")
+        .await
+        .expect("load ledger");
+
+    let query = json!({
+        "@context": { "schema": "http://schema.org/" },
+        "select": ["?name"],
+        "where": { "schema:name": "?name" }
+    });
+
+    let qr = support::query_jsonld(&fluree, &ledger, &query)
+        .await
+        .expect("query after .nt directory import");
+    let json = qr.to_jsonld(&ledger.snapshot).expect("format jsonld");
+    let names = extract_sorted_strings(&json);
+
+    assert_eq!(names, vec!["Alice", "Bob"]);
+}
