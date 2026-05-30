@@ -160,7 +160,15 @@ fn stream_overlay_supported(node: &StreamNode) -> bool {
         StreamNode::SemiJoin { source, filter } => {
             stream_overlay_supported(source) && keyset_overlay_supported(filter)
         }
-        StreamNode::OptionalJoin { .. } => false,
+        StreamNode::OptionalJoin {
+            required,
+            optional_groups,
+        } => {
+            stream_overlay_supported(required)
+                && optional_groups
+                    .iter()
+                    .all(|grp| grp.iter().all(stream_overlay_supported))
+        }
     }
 }
 
@@ -457,8 +465,6 @@ fn sum_stream(
     exclude_sorted: Option<&[u64]>,
     include_sorted: Option<&[u64]>,
 ) -> Result<Option<u64>> {
-    let store = ec.store;
-    let g_id = ec.g_id;
     match node {
         StreamNode::SubjectCountScan { pred } => {
             let Some(mut groups) = subject_groups(ec, pred)? else {
@@ -489,8 +495,7 @@ fn sum_stream(
         } => sum_optional_join(
             required,
             optional_groups,
-            store,
-            g_id,
+            ec,
             exclude_sorted,
             include_sorted,
         ),
@@ -668,31 +673,30 @@ fn sum_star_join(
 fn sum_optional_join(
     required: &StreamNode,
     optional_groups: &[Vec<StreamNode>],
-    store: &Arc<BinaryIndexStore>,
-    g_id: GraphId,
+    ec: &ExecCtx<'_, '_>,
     exclude_sorted: Option<&[u64]>,
     include_sorted: Option<&[u64]>,
 ) -> Result<Option<u64>> {
-    // Collect required iterators (single scan or star join children).
-    let mut req_iters: Vec<PsotSubjectCountIter<'_>> = Vec::new();
+    // Collect required iterators (single scan or star join children). An absent
+    // required predicate yields an `Empty` stream (no overlay) → no subjects →
+    // total 0; absent under overlay bails (`None`).
+    let mut req_iters: Vec<SubjectGroups<'_>> = Vec::new();
     match required {
         StreamNode::SubjectCountScan { pred } => {
-            let sid = normalize_pred_sid(store, pred)?;
-            let Some(p_id) = store.sid_to_p_id(&sid) else {
-                return Ok(Some(0));
+            let Some(groups) = subject_groups(ec, pred)? else {
+                return Ok(None);
             };
-            req_iters.push(PsotSubjectCountIter::new(store, g_id, p_id)?);
+            req_iters.push(groups);
         }
         StreamNode::StarJoin { children } => {
             for child in children {
                 let StreamNode::SubjectCountScan { pred } = child else {
                     return Ok(None);
                 };
-                let sid = normalize_pred_sid(store, pred)?;
-                let Some(p_id) = store.sid_to_p_id(&sid) else {
-                    return Ok(Some(0));
+                let Some(groups) = subject_groups(ec, pred)? else {
+                    return Ok(None);
                 };
-                req_iters.push(PsotSubjectCountIter::new(store, g_id, p_id)?);
+                req_iters.push(groups);
             }
         }
         _ => return Ok(None),
@@ -702,26 +706,30 @@ fn sum_optional_join(
     // An optional predicate that is absent in the store makes the entire group `always_one`.
     struct OptGroup<'a> {
         always_one: bool,
-        iters: Vec<PsotSubjectCountIter<'a>>,
+        iters: Vec<SubjectGroups<'a>>,
         cur: Vec<Option<(u64, u64)>>,
     }
 
     let mut opt_groups: Vec<OptGroup<'_>> = Vec::with_capacity(optional_groups.len());
     for grp in optional_groups {
         let mut always_one = false;
-        let mut iters: Vec<PsotSubjectCountIter<'_>> = Vec::with_capacity(grp.len());
+        let mut iters: Vec<SubjectGroups<'_>> = Vec::with_capacity(grp.len());
         for node in grp {
             let StreamNode::SubjectCountScan { pred } = node else {
                 return Ok(None);
             };
-            let sid = normalize_pred_sid(store, pred)?;
-            let Some(p_id) = store.sid_to_p_id(&sid) else {
-                // Absent optional predicate => group never matches => multiplier 1.
+            let Some(groups) = subject_groups(ec, pred)? else {
+                return Ok(None);
+            };
+            if matches!(groups, SubjectGroups::Empty) {
+                // Absent optional predicate (no overlay) => group never matches
+                // => multiplier 1. (Under overlay an absent predicate bails
+                // above instead, since it may carry overlay-only rows.)
                 always_one = true;
                 iters.clear();
                 break;
-            };
-            iters.push(PsotSubjectCountIter::new(store, g_id, p_id)?);
+            }
+            iters.push(groups);
         }
         let mut cur: Vec<Option<(u64, u64)>> = Vec::with_capacity(iters.len());
         for it in &mut iters {

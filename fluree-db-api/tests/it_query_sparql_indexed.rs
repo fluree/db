@@ -1517,6 +1517,138 @@ async fn indexed_overlay_exists_subject_count_reflects_overlay() {
         .await;
 }
 
+/// Regression: a subject `OPTIONAL` `COUNT(*)` must track novelty, including
+/// the OPTIONAL multiplicity. `count_plan` lowers `?s p ?a . OPTIONAL { ?s q ?t }`
+/// to `Sum(OptionalJoin { required, optional_groups })` with the per-subject
+/// formula `count_p(s) × max(1, count_q(s))`. The overlay lane draws both the
+/// required and optional subject-count streams from the overlay-merging PSOT
+/// cursor. Verifies the count tracks an overlay assertion that raises a
+/// multiplier and a retraction that lowers one.
+#[tokio::test]
+async fn indexed_overlay_optional_count_reflects_overlay() {
+    assert_index_defaults();
+    let fluree = FlureeBuilder::memory()
+        .with_ledger_cache_config(LedgerManagerConfig::default())
+        .build_memory();
+    let ledger_id = "it/overlay-optional-count:main";
+
+    let (local, handle) = start_background_indexer_local(
+        fluree.backend().clone(),
+        Arc::new(fluree.nameservice_mode().clone()),
+        fluree_db_indexer::IndexerConfig::small(),
+    );
+
+    local
+        .run_until(async move {
+            let index_cfg = IndexConfig {
+                reindex_min_bytes: 0,
+                reindex_max_bytes: 10_000_000,
+            };
+
+            // a: 2 tags, b: 1 tag, c: 0 tags. Each has one age.
+            // COUNT(*) = 1×2 + 1×1 + 1×max(1,0) = 4.
+            let ledger0 = genesis_ledger_for_fluree(&fluree, ledger_id);
+            let baseline = json!({
+                "@context": { "ex": "http://example.org/ns/" },
+                "@graph": [
+                    {"@id": "ex:a", "ex:age": 30, "ex:tag": ["m", "n"]},
+                    {"@id": "ex:b", "ex:age": 40, "ex:tag": "m"},
+                    {"@id": "ex:c", "ex:age": 50}
+                ]
+            });
+            let ledger1 = fluree
+                .insert_with_opts(
+                    ledger0,
+                    &baseline,
+                    TxnOpts::default(),
+                    CommitOpts::default(),
+                    &index_cfg,
+                )
+                .await
+                .expect("baseline insert")
+                .ledger;
+
+            let outcome = trigger_index_and_wait_outcome(&handle, ledger_id, ledger1.t()).await;
+            if let fluree_db_api::IndexOutcome::Completed { index_t, .. } = outcome {
+                assert_eq!(index_t, 1, "should index to t=1");
+            }
+
+            let query = r"
+                PREFIX ex: <http://example.org/ns/>
+                SELECT (COUNT(*) AS ?cnt)
+                WHERE { ?s ex:age ?a . OPTIONAL { ?s ex:tag ?t } }
+            ";
+
+            let view1 = fluree
+                .db_at_t(ledger_id, ledger1.t())
+                .await
+                .expect("load view at t=1");
+            let result = fluree
+                .query(&view1, QueryInput::Sparql(query))
+                .await
+                .expect("count at t=1");
+            let jsonld = result.to_jsonld(&view1.snapshot).expect("to_jsonld");
+            assert_eq!(
+                normalize_rows(&jsonld),
+                normalize_rows(&json!([[4]])),
+                "indexed-only OPTIONAL count should be 4 (2 + 1 + 1)"
+            );
+
+            // c gains two tags in novelty → c: 1×2 → total = 2 + 1 + 2 = 5.
+            let assert = json!({
+                "@context": { "ex": "http://example.org/ns/" },
+                "@graph": [ {"@id": "ex:c", "ex:tag": ["x", "y"]} ]
+            });
+            let ledger2 = fluree
+                .insert(ledger1, &assert)
+                .await
+                .expect("assert in novelty")
+                .ledger;
+
+            let view2 = fluree
+                .db_at_t(ledger_id, ledger2.t())
+                .await
+                .expect("load view at t=2");
+            let result = fluree
+                .query(&view2, QueryInput::Sparql(query))
+                .await
+                .expect("count at t=2");
+            let jsonld = result.to_jsonld(&view2.snapshot).expect("to_jsonld");
+            assert_eq!(
+                normalize_rows(&jsonld),
+                normalize_rows(&json!([[5]])),
+                "OPTIONAL count should reflect c gaining two tags (2+1+2)"
+            );
+
+            // Retract one of a's tags in novelty → a: 1×1 → total = 1 + 1 + 2 = 4.
+            let retract = json!({
+                "@context": { "ex": "http://example.org/ns/" },
+                "delete": [ {"@id": "ex:a", "ex:tag": "n"} ]
+            });
+            let ledger3 = fluree
+                .update(ledger2, &retract)
+                .await
+                .expect("retract in novelty")
+                .ledger;
+
+            let view3 = fluree
+                .db_at_t(ledger_id, ledger3.t())
+                .await
+                .expect("load view at t=3");
+            let result = fluree
+                .query(&view3, QueryInput::Sparql(query))
+                .await
+                .expect("count at t=3");
+            let jsonld = result.to_jsonld(&view3.snapshot).expect("to_jsonld");
+            assert_eq!(
+                normalize_rows(&jsonld),
+                normalize_rows(&json!([[4]])),
+                "OPTIONAL count should reflect a losing a tag (1+1+2)"
+            );
+        })
+        .await;
+}
+
 /// Regression: the `<S> <p>+ ?o` COUNT(*) fast path must incorporate novelty.
 ///
 /// Property-path+ COUNT used to gate on `fast_path_store`, which bails the
