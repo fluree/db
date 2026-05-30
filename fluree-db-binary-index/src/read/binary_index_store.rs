@@ -67,7 +67,12 @@ pub(crate) struct DictionarySet {
     pub(crate) dt_sids: Vec<Sid>,
 }
 
-fn cas_sync_timeout() -> Option<Duration> {
+/// Optional per-fetch ceiling for CAS reads bridged from sync code, from
+/// `FLUREE_CAS_SYNC_TIMEOUT_MS`. `None` (the default) means no ceiling beyond
+/// the storage backend's own request timeout (e.g. S3's 35s send_timeout).
+/// Applied by the leaf, dict, and pack read bridges so a stalled fetch becomes
+/// a bounded error instead of an unbounded block.
+pub(crate) fn cas_sync_timeout() -> Option<Duration> {
     std::env::var("FLUREE_CAS_SYNC_TIMEOUT_MS")
         .ok()
         .and_then(|v| v.parse::<u64>().ok())

@@ -395,10 +395,24 @@ fn fetch_and_load(
     // query fan-out (every worker parked with no thread driving the reactor).
     let cs = Arc::clone(&ctx.cs);
     let cid = pack_cid.clone();
+    let timeout = crate::read::binary_index_store::cas_sync_timeout();
     let bytes = crate::read::binary_index_store::run_sync_on_runtime(async move {
-        cs.get(&cid)
-            .await
-            .map_err(|e| io::Error::other(e.to_string()))
+        let fetch = async {
+            cs.get(&cid)
+                .await
+                .map_err(|e| io::Error::other(e.to_string()))
+        };
+        // Optional per-fetch ceiling (FLUREE_CAS_SYNC_TIMEOUT_MS): a stalled
+        // pack fetch self-aborts instead of blocking.
+        match timeout {
+            Some(dur) => tokio::time::timeout(dur, fetch).await.map_err(|_| {
+                io::Error::other(format!(
+                    "forward pack CAS fetch timed out after {}ms",
+                    dur.as_millis()
+                ))
+            })?,
+            None => fetch.await,
+        }
     })
     .map_err(|e| {
         tracing::debug!(

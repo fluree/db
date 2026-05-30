@@ -414,19 +414,33 @@ impl DictTreeReader {
             // `block_in_place`: on a small (e.g. 2-worker) runtime every worker
             // could park in `recv()` with no thread left to drive the reactor,
             // so the fetch never completed — a hard wedge under query fan-out.
+            let timeout = crate::read::binary_index_store::cas_sync_timeout();
             crate::read::binary_index_store::run_sync_on_runtime(async move {
-                if let Some(cache_dir) = disk_cache_dir {
-                    crate::read::artifact_cache::fetch_cached_bytes_cid(
-                        cs.as_ref(),
-                        &cid,
-                        &cache_dir,
-                    )
-                    .await
-                    .map_err(|e| io::Error::other(e.to_string()))
-                } else {
-                    cs.get(&cid)
+                let fetch = async {
+                    if let Some(cache_dir) = disk_cache_dir {
+                        crate::read::artifact_cache::fetch_cached_bytes_cid(
+                            cs.as_ref(),
+                            &cid,
+                            &cache_dir,
+                        )
                         .await
                         .map_err(|e| io::Error::other(e.to_string()))
+                    } else {
+                        cs.get(&cid)
+                            .await
+                            .map_err(|e| io::Error::other(e.to_string()))
+                    }
+                };
+                // Optional per-fetch ceiling (FLUREE_CAS_SYNC_TIMEOUT_MS): a
+                // stalled dict-leaf fetch self-aborts instead of blocking.
+                match timeout {
+                    Some(dur) => tokio::time::timeout(dur, fetch).await.map_err(|_| {
+                        io::Error::other(format!(
+                            "dict leaf CAS fetch timed out after {}ms",
+                            dur.as_millis()
+                        ))
+                    })?,
+                    None => fetch.await,
                 }
             })
         }
