@@ -283,6 +283,52 @@ fn resolve_root_sid_from_binding(
     }
 }
 
+/// Per-call dependencies shared across every solution row's scoped formatter
+/// build.
+///
+/// Bundles the four ingredients [`HydrationFormatter::new`] needs that don't
+/// change across rows — only `source_ledger` varies. Pulled into a struct so
+/// `format_hydration_column` (called once per solution row per hydration
+/// column) takes a single deps reference instead of four loose parameters.
+///
+/// Zero runtime cost: the struct holds references and copies of small enums.
+/// Constructed once per `format_async` invocation; per-row work is a single
+/// [`Self::scoped`] call that resolves a `(db, compactor)` pair from `ctx`
+/// and inits a [`HydrationFormatter`] — no allocations beyond one
+/// `Arc::clone` on `source_ledger`.
+struct RowFormatterDeps<'a> {
+    ctx: &'a LedgerFormatContext<'a>,
+    config: &'a FormatterConfig,
+    policy: Option<&'a PolicyContext>,
+    tracker: Option<&'a Tracker>,
+}
+
+impl<'a> RowFormatterDeps<'a> {
+    /// Build a [`HydrationFormatter`] scoped to the row's source ledger.
+    ///
+    /// In `LedgerFormatContext::Single` mode (the common case) `db_for` and
+    /// `compactor_for` are direct field reads — no HashMap lookup. In
+    /// `Multi` mode they're a HashMap lookup on a small map (one entry per
+    /// unique queried ledger). Per-row construction adds well under a
+    /// microsecond either way and is dominated by the [`Arc`] clone on
+    /// `source_ledger`.
+    fn scoped(&self, source_ledger: Option<Arc<str>>) -> HydrationFormatter<'a> {
+        let db = match self.tracker {
+            Some(t) => self.ctx.db_for(source_ledger.as_ref()).with_tracker(t),
+            None => self.ctx.db_for(source_ledger.as_ref()),
+        };
+        let compactor = self.ctx.compactor_for(source_ledger.as_ref());
+        HydrationFormatter::new(
+            db,
+            compactor,
+            source_ledger,
+            self.config,
+            self.policy,
+            self.tracker,
+        )
+    }
+}
+
 /// Format one hydration column for one solution row.
 ///
 /// Resolves the column's root (variable or IRI constant) into a `Sid` and
@@ -292,14 +338,10 @@ fn resolve_root_sid_from_binding(
 ///
 /// For multi-ledger queries the binding may carry an `IriMatch.ledger_alias`
 /// that scopes property lookups + IRI compaction to the originating ledger;
-/// `build_row_formatter` constructs a transient [`HydrationFormatter`] for
-/// that row using the right entry from `ctx`.
-#[allow(clippy::too_many_arguments)] // mirror HydrationFormatter::new's plumbing
-async fn format_hydration_column<'a>(
-    ctx: &'a LedgerFormatContext<'a>,
-    config: &FormatterConfig,
-    policy: Option<&'a PolicyContext>,
-    tracker: Option<&'a Tracker>,
+/// [`RowFormatterDeps::scoped`] constructs a transient [`HydrationFormatter`]
+/// for that row using the right entry from `deps.ctx`.
+async fn format_hydration_column(
+    deps: &RowFormatterDeps<'_>,
     spec: &HydrationSpec,
     result: &QueryResult,
     batch: &fluree_db_query::Batch,
@@ -318,19 +360,7 @@ async fn format_hydration_column<'a>(
         }
     };
 
-    let scoped_db = match tracker {
-        Some(t) => ctx.db_for(source_ledger.as_ref()).with_tracker(t),
-        None => ctx.db_for(source_ledger.as_ref()),
-    };
-    let scoped_compactor = ctx.compactor_for(source_ledger.as_ref());
-    let scoped_formatter = HydrationFormatter::new(
-        scoped_db,
-        scoped_compactor,
-        source_ledger,
-        config,
-        policy,
-        tracker,
-    );
+    let scoped_formatter = deps.scoped(source_ledger);
 
     let mut visited = HashSet::new();
     scoped_formatter
@@ -386,6 +416,15 @@ pub async fn format_async(
     let formatter =
         HydrationFormatter::new(primary_db, primary_compactor, None, config, policy, tracker);
 
+    // Per-call dependency bundle for the per-row scoped formatter builds.
+    // Built once; passed by reference to every `format_hydration_column`.
+    let row_deps = RowFormatterDeps {
+        ctx,
+        config,
+        policy,
+        tracker,
+    };
+
     // Shared cache across all rows and all hydration columns. The cache key
     // includes a hash of the current `NestedSelectSpec`, so columns with
     // structurally identical levels share entries; columns with different
@@ -436,10 +475,8 @@ pub async fn format_async(
                         None => JsonValue::Null,
                     },
                     Column::Hydration(spec) => {
-                        format_hydration_column(
-                            ctx, config, policy, tracker, spec, result, batch, row_idx, &mut cache,
-                        )
-                        .await?
+                        format_hydration_column(&row_deps, spec, result, batch, row_idx, &mut cache)
+                            .await?
                     }
                 };
                 row_values.push(value);
