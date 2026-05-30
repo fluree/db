@@ -39,7 +39,6 @@ pub(crate) mod fast_exists_join_count_distinct_object;
 pub(crate) mod fast_group_count_firsts;
 pub(crate) mod fast_label_regex_type;
 pub(crate) mod fast_min_max_string;
-pub(crate) mod fast_optional_chain_head_count_all;
 pub(crate) mod fast_path_common;
 pub(crate) mod fast_path_plus_count_all;
 pub(crate) mod fast_predicate_scalar_agg;

@@ -22,7 +22,6 @@ use crate::fast_group_count_firsts::{
 };
 use crate::fast_label_regex_type::label_regex_type_operator;
 use crate::fast_min_max_string::{predicate_min_max_string_operator, MinMaxMode};
-use crate::fast_optional_chain_head_count_all::predicate_optional_chain_head_count_all;
 use crate::fast_path_plus_count_all::{
     property_path_plus_count_all_operator, transitive_path_plus_count_all_operator,
 };
@@ -81,26 +80,6 @@ pub(crate) fn validate_simple_triple(tp: &TriplePattern) -> Option<(VarId, Ref, 
         return None;
     }
     Some((*sv, pred, *ov))
-}
-
-/// Find a 2-hop chain pattern `?a <p1> ?b . ?b <p2> ?c` in two triples (trying both orderings).
-///
-/// Returns `(a_var, pred1, b_var, pred2, c_var)` or `None` if neither ordering forms a chain.
-/// Both triples must be simple (var subject, bound pred, var object, no dtc).
-fn find_two_hop_chain(
-    t1: &TriplePattern,
-    t2: &TriplePattern,
-) -> Option<(VarId, Ref, VarId, Ref, VarId)> {
-    let try_order =
-        |x: &TriplePattern, y: &TriplePattern| -> Option<(VarId, Ref, VarId, Ref, VarId)> {
-            let (a, p1, b1) = validate_simple_triple(x)?;
-            let (b2, p2, c) = validate_simple_triple(y)?;
-            if b1 != b2 {
-                return None;
-            }
-            Some((a, p1, b1, p2, c))
-        };
-    try_order(t1, t2).or_else(|| try_order(t2, t1))
 }
 
 #[derive(Clone)]
@@ -1618,51 +1597,6 @@ fn detect_count_triples(query: &Query) -> Option<VarId> {
     Some(out_var)
 }
 
-fn detect_optional_chain_head_join_count_all(query: &Query) -> Option<(Ref, Ref, Ref, VarId)> {
-    let out_var = detect_count_all_aggregate(query)?;
-
-    // Pattern shape: one required triple + OPTIONAL with two triples (order-independent).
-    if query.patterns.len() != 2 {
-        return None;
-    }
-
-    let mut req: Option<&crate::ir::triple::TriplePattern> = None;
-    let mut inner: Option<&[Pattern]> = None;
-    for p in &query.patterns {
-        match p {
-            Pattern::Triple(tp) => req = Some(tp),
-            Pattern::Optional(v) => inner = Some(v),
-            _ => return None,
-        }
-    }
-    let req = req?;
-    let inner = inner?;
-    if inner.len() != 2 {
-        return None;
-    }
-    let (t1, t2) = match (&inner[0], &inner[1]) {
-        (Pattern::Triple(a), Pattern::Triple(b)) => (a, b),
-        _ => return None,
-    };
-
-    // Required: ?a <p1> ?b
-    let (_a, p1, b_var) = validate_simple_triple(req)?;
-
-    // Optional must be a 2-hop chain starting at ?b: ?b <p2> ?c . ?c <p3> ?d (either order).
-    let (b1, p2, _c, p3, _d) = find_two_hop_chain(t1, t2)?;
-    if b1 != b_var {
-        return None;
-    }
-
-    tracing::debug!(
-        "detected optional chain-head COUNT(*) fast-path (p1={:?}, p2={:?}, p3={:?})",
-        p1,
-        p2,
-        p3
-    );
-    Some((p1, p2, p3, out_var))
-}
-
 fn detect_transitive_path_plus_count_all(query: &Query) -> Option<(Ref, Ref, VarId)> {
     let out_var = detect_count_all_aggregate(query)?;
     if query.patterns.len() != 2 {
@@ -2087,20 +2021,8 @@ fn build_operator_tree_inner(
         }
     }
 
-    // Fast-path: `SELECT (COUNT(*) AS ?c) WHERE { ?a <p1> ?b . OPTIONAL { ?b <p2> ?c . ?c <p3> ?d } }`
-    // answered by streaming group counts and an `n3(c)` map.
-    if enable_fused_fast_paths {
-        if let Some((p1, p2, p3, out_var)) = detect_optional_chain_head_join_count_all(query) {
-            let fallback = build_operator_tree_inner(query, stats.clone(), false, planning)?;
-            return Ok(Box::new(predicate_optional_chain_head_count_all(
-                p1,
-                p2,
-                p3,
-                out_var,
-                Some(fallback),
-            )));
-        }
-    }
+    // `?a <p1> ?b . OPTIONAL { ?b <p2> ?c . ?c <p3> ?d }` COUNT(*) is now handled
+    // by the generic count planner above (CountPlanRoot::OptionalChainHead).
 
     // Fast-path: `SELECT (COUNT(*) AS ?c) WHERE { <S> <p>+ ?o }`
     // Avoids repeated range scans by building adjacency once and traversing.

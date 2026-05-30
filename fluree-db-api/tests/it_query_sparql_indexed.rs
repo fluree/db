@@ -2631,6 +2631,127 @@ async fn indexed_overlay_chain_tail_minus_count_reflects_overlay() {
         .await;
 }
 
+/// Regression: optional chain-head `COUNT(*)`
+/// (`?a p1 ?b . OPTIONAL { ?b p2 ?c . ?c p3 ?d }`). This shape was a standalone
+/// fast path (now folded into `count_plan` as `OptionalChainHead`). Phase 1
+/// (indexed, no overlay) exercises the metadata lane; phases 2-3 exercise the
+/// new overlay lane (the old operator bailed on overlay).
+/// Count = Σ over p1 edges of max(1, Σ_{c ∈ p2(b)} count_p3(c)).
+#[tokio::test]
+async fn indexed_overlay_optional_chain_head_count_reflects_overlay() {
+    assert_index_defaults();
+    let fluree = FlureeBuilder::memory()
+        .with_ledger_cache_config(LedgerManagerConfig::default())
+        .build_memory();
+    let ledger_id = "it/overlay-opt-chain-head:main";
+
+    let (local, handle) = start_background_indexer_local(
+        fluree.backend().clone(),
+        Arc::new(fluree.nameservice_mode().clone()),
+        fluree_db_indexer::IndexerConfig::small(),
+    );
+
+    local
+        .run_until(async move {
+            let index_cfg = IndexConfig {
+                reindex_min_bytes: 0,
+                reindex_max_bytes: 10_000_000,
+            };
+
+            // a follows {b,e}; b likes {c,f}; e likes {}; c rates {x,y}; f rates {z}.
+            // comp2(b)=rates(c)+rates(f)=2+1=3 → (a,b)→max(1,3)=3; comp2(e)=0 → (a,e)→1. Total 4.
+            let ledger0 = genesis_ledger_for_fluree(&fluree, ledger_id);
+            let baseline = json!({
+                "@context": { "ex": "http://example.org/ns/" },
+                "@graph": [
+                    {"@id": "ex:a", "ex:follows": [{"@id": "ex:b"}, {"@id": "ex:e"}]},
+                    {"@id": "ex:b", "ex:likes": [{"@id": "ex:c"}, {"@id": "ex:f"}]},
+                    {"@id": "ex:c", "ex:rates": [{"@id": "ex:x"}, {"@id": "ex:y"}]},
+                    {"@id": "ex:f", "ex:rates": {"@id": "ex:z"}}
+                ]
+            });
+            let ledger1 = fluree
+                .insert_with_opts(
+                    ledger0,
+                    &baseline,
+                    TxnOpts::default(),
+                    CommitOpts::default(),
+                    &index_cfg,
+                )
+                .await
+                .expect("baseline insert")
+                .ledger;
+
+            let outcome = trigger_index_and_wait_outcome(&handle, ledger_id, ledger1.t()).await;
+            if let fluree_db_api::IndexOutcome::Completed { index_t, .. } = outcome {
+                assert_eq!(index_t, 1, "should index to t=1");
+            }
+
+            let query = r"
+                PREFIX ex: <http://example.org/ns/>
+                SELECT (COUNT(*) AS ?cnt)
+                WHERE { ?a ex:follows ?b . OPTIONAL { ?b ex:likes ?c . ?c ex:rates ?d } }
+            ";
+
+            let run = |t| {
+                let fluree = &fluree;
+                async move {
+                    let view = fluree.db_at_t(ledger_id, t).await.expect("load view");
+                    let result = fluree
+                        .query(&view, QueryInput::Sparql(query))
+                        .await
+                        .expect("count");
+                    result.to_jsonld(&view.snapshot).expect("to_jsonld")
+                }
+            };
+
+            // Phase 1: metadata lane (no overlay).
+            assert_eq!(
+                normalize_rows(&run(ledger1.t()).await),
+                normalize_rows(&json!([[4]])),
+                "indexed-only optional chain-head count should be 4 (3 + 1)"
+            );
+
+            // Phase 2: e gains a like of c in novelty → comp2(e)=rates(c)=2 → (a,e)→2 → total 5.
+            let ledger2 = fluree
+                .insert(
+                    ledger1,
+                    &json!({
+                        "@context": { "ex": "http://example.org/ns/" },
+                        "@graph": [ {"@id": "ex:e", "ex:likes": {"@id": "ex:c"}} ]
+                    }),
+                )
+                .await
+                .expect("assert")
+                .ledger;
+            assert_eq!(
+                normalize_rows(&run(ledger2.t()).await),
+                normalize_rows(&json!([[5]])),
+                "optional chain-head count should reflect e liking c (3 + 2)"
+            );
+
+            // Phase 3: retract one of c's rates → rates(c)=1.
+            // comp2(b)=1+1=2 → (a,b)→2; comp2(e)=1 → (a,e)→1. Total 3.
+            let ledger3 = fluree
+                .update(
+                    ledger2,
+                    &json!({
+                        "@context": { "ex": "http://example.org/ns/" },
+                        "delete": [ {"@id": "ex:c", "ex:rates": {"@id": "ex:x"}} ]
+                    }),
+                )
+                .await
+                .expect("retract")
+                .ledger;
+            assert_eq!(
+                normalize_rows(&run(ledger3.t()).await),
+                normalize_rows(&json!([[3]])),
+                "optional chain-head count should reflect c losing a rating (2 + 1)"
+            );
+        })
+        .await;
+}
+
 /// Regression: the `<S> <p>+ ?o` COUNT(*) fast path must incorporate novelty.
 ///
 /// Property-path+ COUNT used to gate on `fast_path_store`, which bails the

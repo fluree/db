@@ -125,6 +125,13 @@ fn execute_plan(root: &CountPlanRoot, ec: &ExecCtx<'_, '_>) -> Result<Option<u64
                 execute_chain(chain, ec.store, ec.g_id)
             }
         }
+        CountPlanRoot::OptionalChainHead { p1, p2, p3 } => {
+            if ec.overlay {
+                execute_optional_chain_head_overlay(ec, p1, p2, p3)
+            } else {
+                execute_optional_chain_head(ec, p1, p2, p3)
+            }
+        }
     }
 }
 
@@ -142,9 +149,9 @@ fn execute_plan(root: &CountPlanRoot, ec: &ExecCtx<'_, '_>) -> Result<Option<u64
 fn plan_overlay_supported(root: &CountPlanRoot) -> bool {
     match root {
         CountPlanRoot::Scalar(s) => scalar_overlay_supported(s),
-        // execute_chain_overlay handles any chain shape (it bails at runtime on
-        // an absent predicate under novelty).
-        CountPlanRoot::Chain(_) => true,
+        // execute_chain_overlay / execute_optional_chain_head_overlay handle any
+        // shape (they bail at runtime on an absent predicate under novelty).
+        CountPlanRoot::Chain(_) | CountPlanRoot::OptionalChainHead { .. } => true,
     }
 }
 
@@ -1507,6 +1514,12 @@ enum ChainWeight<'a> {
         weights: &'a FxHashMap<u64, u64>,
         default: u64,
     },
+    /// `max(1, weights.get(o))` for ref objects, `0` for non-ref — the
+    /// OPTIONAL-chain head multiplier (`?b` keeps a solution even with no inner
+    /// chain, but only node-valued objects can extend the chain).
+    LookupMaxOne {
+        weights: &'a FxHashMap<u64, u64>,
+    },
     InSet {
         set: &'a FxHashSet<u64>,
     },
@@ -1526,6 +1539,13 @@ impl ChainWeight<'_> {
                     weights.get(&o_key).copied().unwrap_or(*default)
                 } else {
                     *default
+                }
+            }
+            ChainWeight::LookupMaxOne { weights } => {
+                if is_iri {
+                    weights.get(&o_key).copied().unwrap_or(0).max(1)
+                } else {
+                    0
                 }
             }
             ChainWeight::InSet { set } => u64::from(is_iri && set.contains(&o_key)),
@@ -1740,6 +1760,123 @@ fn execute_chain_overlay(chain: &ChainFold, ec: &ExecCtx<'_, '_>) -> Result<Opti
         default: 0,
     };
     psot_weighted_total(ec, &p_sids[0], p_ids[0], &head_mode)
+}
+
+// ---------------------------------------------------------------------------
+// Optional chain-head: `?a <p1> ?b . OPTIONAL { ?b <p2> ?c . ?c <p3> ?d }`
+// total = Σ_b count_p1(b) × max(1, Σ_{c ∈ p2(b)} count_p3(c))
+// ---------------------------------------------------------------------------
+
+/// Metadata lane — moved verbatim from the former `fast_optional_chain_head_count_all`
+/// (which this consolidates), parameterized over `ExecCtx`. Runs only when
+/// `!ec.overlay`, so behavior is byte-identical to the old standalone operator.
+fn execute_optional_chain_head(
+    ec: &ExecCtx<'_, '_>,
+    p1: &Ref,
+    p2: &Ref,
+    p3: &Ref,
+) -> Result<Option<u64>> {
+    let store = ec.store;
+    let g_id = ec.g_id;
+    let sid1 = normalize_pred_sid(store, p1)?;
+    let sid2 = normalize_pred_sid(store, p2)?;
+    let sid3 = normalize_pred_sid(store, p3)?;
+
+    let Some(p1_id) = store.sid_to_p_id(&sid1) else {
+        return Ok(Some(0));
+    };
+    let Some(p2_id) = store.sid_to_p_id(&sid2) else {
+        return Ok(Some(0));
+    };
+    let Some(p3_id) = store.sid_to_p_id(&sid3) else {
+        // Optional chain can never match => multiplier is 1 for all b.
+        let mut it1 = PostObjectGroupCountIter::new(store, g_id, p1_id)?.ok_or(
+            QueryError::Internal("optional chain-head: POST iterator unavailable".into()),
+        )?;
+        let mut total = 0u64;
+        while let Some((_b, w)) = it1.next_group()? {
+            total += w;
+        }
+        return Ok(Some(total));
+    };
+
+    // Precompute n3(c) = count_{p3}(c).
+    let mut n3: FxHashMap<u64, u64> = FxHashMap::default();
+    let mut it3 = PsotSubjectCountIter::new(store, g_id, p3_id)?;
+    while let Some((c, n)) = it3.next_group()? {
+        n3.insert(c, n);
+    }
+
+    let mut it1 = PostObjectGroupCountIter::new(store, g_id, p1_id)?.ok_or(
+        QueryError::Internal("optional chain-head: POST iterator unavailable".into()),
+    )?;
+    // default_weight=0: objects not in n3 contribute nothing to the sum
+    let mut it2 = PsotSubjectWeightedSumIter::new(store, g_id, p2_id, &n3, 0)?.ok_or(
+        QueryError::Internal("optional chain-head: PSOT iterator unavailable".into()),
+    )?;
+
+    let mut p2_cur = it2.next_group()?;
+    let mut total = 0u64;
+
+    while let Some((b, w)) = it1.next_group()? {
+        while let Some((b2, _)) = p2_cur {
+            if b2 < b {
+                p2_cur = it2.next_group()?;
+                continue;
+            }
+            break;
+        }
+        let sum_n3 = match p2_cur {
+            Some((b2, n)) if b2 == b => {
+                p2_cur = it2.next_group()?;
+                n
+            }
+            _ => 0u64,
+        };
+        let mult = if sum_n3 == 0 { 1 } else { sum_n3 };
+        total = total.saturating_add(w.saturating_mul(mult));
+    }
+
+    Ok(Some(total))
+}
+
+/// Overlay lane — reuses the chain weight-map primitives. `n3[c] = count_p3(c)`;
+/// `comp2[b] = Σ_{c ∈ p2(b)} n3[c]`; total = Σ over p1 edges of `max(1, comp2[b])`
+/// (the `LookupMaxOne` head). An absent predicate under novelty bails.
+fn execute_optional_chain_head_overlay(
+    ec: &ExecCtx<'_, '_>,
+    p1: &Ref,
+    p2: &Ref,
+    p3: &Ref,
+) -> Result<Option<u64>> {
+    let s1 = normalize_pred_sid(ec.store, p1)?;
+    let Some(id1) = ec.store.sid_to_p_id(&s1) else {
+        return Ok(None);
+    };
+    let s2 = normalize_pred_sid(ec.store, p2)?;
+    let Some(id2) = ec.store.sid_to_p_id(&s2) else {
+        return Ok(None);
+    };
+    let s3 = normalize_pred_sid(ec.store, p3)?;
+    let Some(id3) = ec.store.sid_to_p_id(&s3) else {
+        return Ok(None);
+    };
+
+    let Some(n3) = psot_weighted_subject_sums(ec, &s3, id3, &ChainWeight::CountEdges)? else {
+        return Ok(None);
+    };
+    let comp2 = {
+        let mode = ChainWeight::Lookup {
+            weights: &n3,
+            default: 0,
+        };
+        match psot_weighted_subject_sums(ec, &s2, id2, &mode)? {
+            Some(m) => m,
+            None => return Ok(None),
+        }
+    };
+    let head = ChainWeight::LookupMaxOne { weights: &comp2 };
+    psot_weighted_total(ec, &s1, id1, &head)
 }
 
 // ---------------------------------------------------------------------------

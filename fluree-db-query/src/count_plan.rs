@@ -167,6 +167,10 @@ pub(crate) enum CountPlanRoot {
     Scalar(ScalarNode),
     /// Chain fold (its own algorithm, produces scalar).
     Chain(ChainFold),
+    /// `?a <p1> ?b . OPTIONAL { ?b <p2> ?c . ?c <p3> ?d }` — a required head
+    /// triple plus an OPTIONAL 2-hop chain rooted at the head's object.
+    /// `total = Σ_b count_p1(b) × max(1, Σ_{c ∈ p2(b)} count_p3(c))`.
+    OptionalChainHead { p1: Ref, p2: Ref, p3: Ref },
 }
 
 /// A complete count-only plan.
@@ -196,6 +200,13 @@ pub(crate) fn try_build_count_plan(query: &Query) -> Option<CountPlan> {
     // `classify_patterns` rejects because the object var repeats). Handle it here
     // before classification.
     if let Some(root) = try_build_multicolumn_join(&query.patterns) {
+        return Some(CountPlan { root, out_var });
+    }
+
+    // `?a <p1> ?b . OPTIONAL { ?b <p2> ?c . ?c <p3> ?d }`. The OPTIONAL wraps a
+    // chain (different subjects), which `classify_optional_block` rejects, so
+    // handle it here before classification.
+    if let Some(root) = try_build_optional_chain_head(&query.patterns) {
         return Some(CountPlan { root, out_var });
     }
 
@@ -251,6 +262,57 @@ fn try_build_multicolumn_join(patterns: &[Pattern]) -> Option<CountPlanRoot> {
         pred1: p1,
         pred2: p2,
     }))
+}
+
+/// Detect `?a <p1> ?b . OPTIONAL { ?b <p2> ?c . ?c <p3> ?d }`: a required head
+/// triple plus an OPTIONAL 2-hop chain rooted at the head's object var.
+///
+/// Returns a [`CountPlanRoot::OptionalChainHead`]; the executor computes
+/// `Σ_b count_p1(b) × max(1, Σ_{c ∈ p2(b)} count_p3(c))`.
+fn try_build_optional_chain_head(patterns: &[Pattern]) -> Option<CountPlanRoot> {
+    if patterns.len() != 2 {
+        return None;
+    }
+    let mut req: Option<&crate::ir::triple::TriplePattern> = None;
+    let mut inner: Option<&[Pattern]> = None;
+    for p in patterns {
+        match p {
+            Pattern::Triple(tp) => req = Some(tp),
+            Pattern::Optional(v) => inner = Some(v),
+            _ => return None,
+        }
+    }
+    let (_a, p1, b_var) = validate_simple_triple(req?)?;
+
+    // OPTIONAL must be a 2-triple linear chain rooted at ?b.
+    let inner = inner?;
+    if inner.len() != 2 {
+        return None;
+    }
+    let mut basics: Vec<BasicTriple> = Vec::with_capacity(2);
+    for pat in inner {
+        let Pattern::Triple(tp) = pat else {
+            return None;
+        };
+        let (s, pred, o) = validate_simple_triple(tp)?;
+        if s == o {
+            return None;
+        }
+        basics.push(BasicTriple {
+            subject_var: s,
+            pred,
+            object_var: o,
+        });
+    }
+    let (preds, vars) = detect_chain(&basics)?;
+    if preds.len() != 2 || *vars.first()? != b_var {
+        return None;
+    }
+    Some(CountPlanRoot::OptionalChainHead {
+        p1,
+        p2: preds[0].clone(),
+        p3: preds[1].clone(),
+    })
 }
 
 // ---------------------------------------------------------------------------
