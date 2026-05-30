@@ -177,13 +177,13 @@ fn stream_overlay_supported(node: &StreamNode) -> bool {
     }
 }
 
-/// Subject-keyed keysets have an overlay lane; the object-keyed
-/// `SubjectsWithObjectIn` does not (yet).
+/// All keyset node types have an overlay lane (the object-keyed
+/// `SubjectsWithObjectIn` is supported when its inner object set is).
 fn keyset_overlay_supported(node: &KeySetNode) -> bool {
     match node {
         KeySetNode::SubjectSet { .. } | KeySetNode::SubjectsSorted { .. } => true,
         KeySetNode::IntersectSorted { children } => children.iter().all(keyset_overlay_supported),
-        KeySetNode::SubjectsWithObjectIn { .. } => false,
+        KeySetNode::SubjectsWithObjectIn { object_set, .. } => keyset_overlay_supported(object_set),
     }
 }
 
@@ -427,6 +427,69 @@ fn post_object_filtered_sum(
         }
     }
     Ok(Some(total))
+}
+
+/// Subjects of `pred` that have at least one IRI_REF object in `object_set`
+/// (sorted ascending, distinct) — metadata leaflet scan (no overlay) or the
+/// overlay-merging PSOT cursor. Both lanes bail on any non-IRI_REF object,
+/// matching the metadata path. `Ok(None)` bails the plan.
+fn subjects_with_object_in(
+    ec: &ExecCtx<'_, '_>,
+    pred: &Ref,
+    object_set: &FxHashSet<u64>,
+) -> Result<Option<Vec<u64>>> {
+    let sid = normalize_pred_sid(ec.store, pred)?;
+    let Some(p_id) = ec.store.sid_to_p_id(&sid) else {
+        return Ok(if ec.overlay { None } else { Some(Vec::new()) });
+    };
+    if !ec.overlay {
+        return collect_subjects_with_object_in_set(ec.store, ec.g_id, p_id, object_set);
+    }
+
+    let Some(mut cursor) = build_psot_cursor_for_predicate(
+        ec.ctx,
+        ec.store,
+        ec.g_id,
+        sid,
+        p_id,
+        cursor_projection_sid_otype_okey(),
+    )?
+    else {
+        return Ok(None);
+    };
+    let iri_ref = OType::IRI_REF.as_u16();
+    let mut out: Vec<u64> = Vec::new();
+    let mut cur_s: Option<u64> = None;
+    let mut cur_ok = false;
+    while let Some(batch) = cursor
+        .next_batch()
+        .map_err(|e| QueryError::Internal(format!("count-plan cursor batch: {e}")))?
+    {
+        for row in 0..batch.row_count {
+            if batch.o_type.get(row) != iri_ref {
+                return Ok(None);
+            }
+            let s = batch.s_id.get(row);
+            if cur_s != Some(s) {
+                if let Some(cs) = cur_s {
+                    if cur_ok {
+                        out.push(cs);
+                    }
+                }
+                cur_s = Some(s);
+                cur_ok = false;
+            }
+            if object_set.contains(&batch.o_key.get(row)) {
+                cur_ok = true;
+            }
+        }
+    }
+    if let Some(cs) = cur_s {
+        if cur_ok {
+            out.push(cs);
+        }
+    }
+    Ok(Some(out))
 }
 
 // ---------------------------------------------------------------------------
@@ -902,31 +965,17 @@ fn sum_optional_join(
 ///
 /// All callers in Phase B use sorted lists for streaming merge-skip/merge-keep.
 fn execute_keyset_as_sorted(node: &KeySetNode, ec: &ExecCtx<'_, '_>) -> Result<Option<Vec<u64>>> {
-    let store = ec.store;
-    let g_id = ec.g_id;
     match node {
         KeySetNode::SubjectsSorted { pred } | KeySetNode::SubjectSet { pred } => {
             subject_keys_sorted(ec, pred)
         }
         KeySetNode::SubjectsWithObjectIn { pred, object_set } => {
-            // Object-keyed; no overlay lane yet (rejected up-front by
-            // `keyset_overlay_supported`, so this only runs in the metadata lane).
-            if ec.overlay {
-                return Ok(None);
-            }
             // Need a hash set for the object filter, then sort the result.
-            let obj_set = execute_keyset_as_hash_set(object_set, ec)?;
-            let obj_set = match obj_set {
+            let obj_set = match execute_keyset_as_hash_set(object_set, ec)? {
                 Some(s) => s,
                 None => return Ok(None),
             };
-            let sid = normalize_pred_sid(store, pred)?;
-            let Some(p_id) = store.sid_to_p_id(&sid) else {
-                return Ok(Some(Vec::new()));
-            };
-            let Some(mut subjects) =
-                collect_subjects_with_object_in_set(store, g_id, p_id, &obj_set)?
-            else {
+            let Some(mut subjects) = subjects_with_object_in(ec, pred, &obj_set)? else {
                 return Ok(None);
             };
             subjects.sort_unstable();

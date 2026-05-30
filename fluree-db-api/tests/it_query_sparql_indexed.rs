@@ -2039,6 +2039,142 @@ async fn indexed_overlay_object_minus_count_reflects_overlay() {
         .await;
 }
 
+/// Regression: an object-chain `FILTER EXISTS` `COUNT(*)`
+/// (`?s p ?o . FILTER EXISTS { ?o q ?m . ?m r ?t }`) must track novelty. The
+/// EXISTS block is a 2-hop chain, so `count_plan` lowers it to
+/// `PostObjectFilteredSum { p, SubjectsWithObjectIn { q, SubjectSet(r) } }`.
+/// This exercises the overlay lane for BOTH the POST-object filtered sum and the
+/// object-chain `subjects_with_object_in` keyset.
+#[tokio::test]
+async fn indexed_overlay_object_chain_exists_count_reflects_overlay() {
+    assert_index_defaults();
+    let fluree = FlureeBuilder::memory()
+        .with_ledger_cache_config(LedgerManagerConfig::default())
+        .build_memory();
+    let ledger_id = "it/overlay-object-chain:main";
+
+    let (local, handle) = start_background_indexer_local(
+        fluree.backend().clone(),
+        Arc::new(fluree.nameservice_mode().clone()),
+        fluree_db_indexer::IndexerConfig::small(),
+    );
+
+    local
+        .run_until(async move {
+            let index_cfg = IndexConfig {
+                reindex_min_bytes: 0,
+                reindex_max_bytes: 10_000_000,
+            };
+
+            // a knows {x,y,z}; x,z like m; y likes n; m tasty.
+            // Qualifying objects (like something tasty): x, z. Edges (a,x),(a,z) => 2.
+            let ledger0 = genesis_ledger_for_fluree(&fluree, ledger_id);
+            let baseline = json!({
+                "@context": { "ex": "http://example.org/ns/" },
+                "@graph": [
+                    {"@id": "ex:a", "ex:knows": [{"@id": "ex:x"}, {"@id": "ex:y"}, {"@id": "ex:z"}]},
+                    {"@id": "ex:x", "ex:likes": {"@id": "ex:m"}},
+                    {"@id": "ex:y", "ex:likes": {"@id": "ex:n"}},
+                    {"@id": "ex:z", "ex:likes": {"@id": "ex:m"}},
+                    {"@id": "ex:m", "ex:tasty": true}
+                ]
+            });
+            let ledger1 = fluree
+                .insert_with_opts(
+                    ledger0,
+                    &baseline,
+                    TxnOpts::default(),
+                    CommitOpts::default(),
+                    &index_cfg,
+                )
+                .await
+                .expect("baseline insert")
+                .ledger;
+
+            let outcome = trigger_index_and_wait_outcome(&handle, ledger_id, ledger1.t()).await;
+            if let fluree_db_api::IndexOutcome::Completed { index_t, .. } = outcome {
+                assert_eq!(index_t, 1, "should index to t=1");
+            }
+
+            let query = r"
+                PREFIX ex: <http://example.org/ns/>
+                SELECT (COUNT(*) AS ?cnt)
+                WHERE {
+                  ?s ex:knows ?o .
+                  FILTER EXISTS { ?o ex:likes ?m . ?m ex:tasty ?t }
+                }
+            ";
+
+            let view1 = fluree
+                .db_at_t(ledger_id, ledger1.t())
+                .await
+                .expect("load view at t=1");
+            let result = fluree
+                .query(&view1, QueryInput::Sparql(query))
+                .await
+                .expect("count at t=1");
+            let jsonld = result.to_jsonld(&view1.snapshot).expect("to_jsonld");
+            assert_eq!(
+                normalize_rows(&jsonld),
+                normalize_rows(&json!([[2]])),
+                "indexed-only object-chain EXISTS count should be 2 ((a,x),(a,z))"
+            );
+
+            // n becomes tasty in novelty → y qualifies → (a,y) → 3.
+            let assert = json!({
+                "@context": { "ex": "http://example.org/ns/" },
+                "@graph": [ {"@id": "ex:n", "ex:tasty": true} ]
+            });
+            let ledger2 = fluree
+                .insert(ledger1, &assert)
+                .await
+                .expect("assert in novelty")
+                .ledger;
+
+            let view2 = fluree
+                .db_at_t(ledger_id, ledger2.t())
+                .await
+                .expect("load view at t=2");
+            let result = fluree
+                .query(&view2, QueryInput::Sparql(query))
+                .await
+                .expect("count at t=2");
+            let jsonld = result.to_jsonld(&view2.snapshot).expect("to_jsonld");
+            assert_eq!(
+                normalize_rows(&jsonld),
+                normalize_rows(&json!([[3]])),
+                "object-chain EXISTS count should reflect n becoming tasty (a,x),(a,y),(a,z)"
+            );
+
+            // m loses tasty in novelty → x,z drop, only y qualifies → (a,y) → 1.
+            let retract = json!({
+                "@context": { "ex": "http://example.org/ns/" },
+                "delete": [ {"@id": "ex:m", "ex:tasty": true} ]
+            });
+            let ledger3 = fluree
+                .update(ledger2, &retract)
+                .await
+                .expect("retract in novelty")
+                .ledger;
+
+            let view3 = fluree
+                .db_at_t(ledger_id, ledger3.t())
+                .await
+                .expect("load view at t=3");
+            let result = fluree
+                .query(&view3, QueryInput::Sparql(query))
+                .await
+                .expect("count at t=3");
+            let jsonld = result.to_jsonld(&view3.snapshot).expect("to_jsonld");
+            assert_eq!(
+                normalize_rows(&jsonld),
+                normalize_rows(&json!([[1]])),
+                "object-chain EXISTS count should reflect m losing tasty ((a,y))"
+            );
+        })
+        .await;
+}
+
 /// Regression: the `<S> <p>+ ?o` COUNT(*) fast path must incorporate novelty.
 ///
 /// Property-path+ COUNT used to gate on `fast_path_store`, which bails the
