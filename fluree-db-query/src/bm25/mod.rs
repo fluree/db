@@ -7,13 +7,11 @@
 //!
 //! - [`index`]: Core BM25 index data structures (`Bm25Index`, `DocKey`, `PostingList`)
 //! - [`scoring`]: BM25 scoring algorithm (`Bm25Scorer`, IDF calculation)
-//! - [`analyzer`]: Text analysis pipeline (`Analyzer`, tokenizers, filters)
 //! - [`text`]: Text extraction from JSON-LD values (`extract_text`)
 //! - [`builder`]: Index building from query results (`Bm25IndexBuilder`)
 //!
 //! Build an index with `Bm25IndexBuilder`, then query it using `Bm25Scorer` with analyzed search terms.
 
-pub mod analyzer;
 pub mod builder;
 pub mod index;
 pub mod manifest;
@@ -22,13 +20,14 @@ pub mod scoring;
 pub mod serialize;
 pub mod text;
 
-// Re-export commonly used types
-pub use analyzer::{
-    Analyzer, DefaultEnglishTokenizer, SnowballStemmerFilter, StopwordFilter, Token,
-};
+// Re-export commonly used types. The text-analysis pipeline lives in
+// `fluree-db-binary-index`; re-exported here for BM25 consumers' convenience.
 pub use builder::{
     Bm25IndexBuilder, BuilderError, IncrementalUpdateResult, IncrementalUpdater,
     MultiBm25IndexBuilder,
+};
+pub use fluree_db_binary_index::analyzer::{
+    Analyzer, DefaultEnglishTokenizer, SnowballStemmerFilter, StopwordFilter, Token,
 };
 pub use index::{
     Bm25Config, Bm25Index, Bm25Stats, CompiledPropertyDeps, DocKey, DocMeta, GraphSourceWatermark,
