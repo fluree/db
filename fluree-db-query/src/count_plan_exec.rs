@@ -18,9 +18,10 @@ use crate::count_plan::{
 };
 use crate::error::{QueryError, Result};
 use crate::fast_path_common::{
-    allow_cursor_fast_path, build_count_batch, build_psot_cursor_for_predicate,
-    collect_subjects_for_predicate_set, collect_subjects_for_predicate_sorted,
-    collect_subjects_with_object_in_set, count_rows_for_predicate_psot, cursor_projection_sid_only,
+    allow_cursor_fast_path, build_count_batch, build_post_cursor_for_predicate,
+    build_psot_cursor_for_predicate, collect_subjects_for_predicate_set,
+    collect_subjects_for_predicate_sorted, collect_subjects_with_object_in_set,
+    count_rows_for_predicate_psot, cursor_projection_otype_okey, cursor_projection_sid_only,
     cursor_projection_sid_otype_okey, intersect_many_sorted, leaf_entries_for_predicate,
     normalize_pred_sid, projection_sid_otype_okey, sum_post_object_counts_filtered,
     FastPathOperator, ObjectFilterMode, PostObjectGroupCountIter, PsotObjectFilterCountIter,
@@ -29,6 +30,7 @@ use crate::fast_path_common::{
 use crate::ir::triple::Ref;
 use crate::operator::BoxedOperator;
 use fluree_db_binary_index::{BinaryCursor, BinaryIndexStore, RunSortOrder};
+use fluree_db_core::o_type::OType;
 use fluree_db_core::GraphId;
 use rustc_hash::{FxHashMap, FxHashSet};
 use std::cmp::Ordering;
@@ -142,10 +144,14 @@ fn scalar_overlay_supported(node: &ScalarNode) -> bool {
     match node {
         ScalarNode::TotalRowCount { .. } | ScalarNode::CompositeJoinPairCount { .. } => true,
         ScalarNode::Sum { source } => stream_overlay_supported(source),
-        ScalarNode::SumExcluding { .. }
-        | ScalarNode::SumFiltered { .. }
-        | ScalarNode::PostObjectFilteredSum { .. }
-        | ScalarNode::TotalMinusPostObjectFilteredSum { .. } => false,
+        ScalarNode::PostObjectFilteredSum { object_filter, .. } => {
+            keyset_overlay_supported(object_filter)
+        }
+        ScalarNode::TotalMinusPostObjectFilteredSum {
+            excluded_objects, ..
+        } => keyset_overlay_supported(excluded_objects),
+        // Dead variants (never built by the planner); keep bailing.
+        ScalarNode::SumExcluding { .. } | ScalarNode::SumFiltered { .. } => false,
     }
 }
 
@@ -367,15 +373,67 @@ fn total_row_count(ec: &ExecCtx<'_, '_>, pred: &Ref) -> Result<Option<u64>> {
     }
 }
 
+/// Sum of POST(`pred`) rows whose IRI_REF object key is in `allowed_sorted` —
+/// metadata leaflet scan (no overlay) or the overlay-merging POST cursor.
+///
+/// Both lanes bail (`Ok(None)`) the instant a non-`IRI_REF` object is seen: this
+/// fast path only applies when `pred`'s objects are all node references (the
+/// object-var EXISTS/MINUS join requires `?o` to be a node). Mixed-type
+/// predicates fall back to the generic pipeline, which skips literal objects.
+fn post_object_filtered_sum(
+    ec: &ExecCtx<'_, '_>,
+    pred: &Ref,
+    allowed_sorted: &[u64],
+) -> Result<Option<u64>> {
+    let sid = normalize_pred_sid(ec.store, pred)?;
+    let Some(p_id) = ec.store.sid_to_p_id(&sid) else {
+        return Ok(if ec.overlay { None } else { Some(0) });
+    };
+    if !ec.overlay {
+        return sum_post_object_counts_filtered(ec.store, ec.g_id, p_id, allowed_sorted);
+    }
+
+    let Some(mut cursor) = build_post_cursor_for_predicate(
+        ec.ctx,
+        ec.store,
+        ec.g_id,
+        sid,
+        p_id,
+        cursor_projection_otype_okey(),
+    )?
+    else {
+        return Ok(None);
+    };
+    // POST order over a ref-only predicate is `(o_key, …)` ascending, so a single
+    // monotonic pointer into the sorted filter is O(rows + |filter|).
+    let iri_ref = OType::IRI_REF.as_u16();
+    let mut allowed_idx: usize = 0;
+    let mut total: u64 = 0;
+    while let Some(batch) = cursor
+        .next_batch()
+        .map_err(|e| QueryError::Internal(format!("count-plan cursor batch: {e}")))?
+    {
+        for row in 0..batch.row_count {
+            if batch.o_type.get(row) != iri_ref {
+                return Ok(None);
+            }
+            let o_key = batch.o_key.get(row);
+            while allowed_idx < allowed_sorted.len() && allowed_sorted[allowed_idx] < o_key {
+                allowed_idx += 1;
+            }
+            if allowed_idx < allowed_sorted.len() && allowed_sorted[allowed_idx] == o_key {
+                total = total.saturating_add(1);
+            }
+        }
+    }
+    Ok(Some(total))
+}
+
 // ---------------------------------------------------------------------------
 // Scalar evaluation
 // ---------------------------------------------------------------------------
 
 fn execute_scalar(node: &ScalarNode, ec: &ExecCtx<'_, '_>) -> Result<Option<u64>> {
-    // Metadata-only sub-paths read `store`/`g_id` directly; they only run when
-    // `ec.overlay` is false (otherwise rejected by `plan_overlay_supported`).
-    let store = ec.store;
-    let g_id = ec.g_id;
     match node {
         ScalarNode::TotalRowCount { pred } => total_row_count(ec, pred),
 
@@ -407,41 +465,31 @@ fn execute_scalar(node: &ScalarNode, ec: &ExecCtx<'_, '_>) -> Result<Option<u64>
             pred,
             object_filter,
         } => {
-            let sid = normalize_pred_sid(store, pred)?;
-            let Some(p_id) = store.sid_to_p_id(&sid) else {
-                return Ok(Some(0));
-            };
-            let filter_sorted = execute_keyset_as_sorted(object_filter, ec)?;
-            let filter_sorted = match filter_sorted {
+            let filter_sorted = match execute_keyset_as_sorted(object_filter, ec)? {
                 Some(s) => s,
                 None => return Ok(None),
             };
             if filter_sorted.is_empty() {
                 return Ok(Some(0));
             }
-            sum_post_object_counts_filtered(store, g_id, p_id, &filter_sorted)
+            post_object_filtered_sum(ec, pred, &filter_sorted)
         }
 
         ScalarNode::TotalMinusPostObjectFilteredSum {
             pred,
             excluded_objects,
         } => {
-            let sid = normalize_pred_sid(store, pred)?;
-            let Some(p_id) = store.sid_to_p_id(&sid) else {
-                return Ok(Some(0));
+            let Some(total) = total_row_count(ec, pred)? else {
+                return Ok(None);
             };
-            let total = count_rows_for_predicate_psot(store, g_id, p_id)?;
-            let excluded_sorted = execute_keyset_as_sorted(excluded_objects, ec)?;
-            let excluded_sorted = match excluded_sorted {
+            let excluded_sorted = match execute_keyset_as_sorted(excluded_objects, ec)? {
                 Some(s) => s,
                 None => return Ok(None),
             };
             if excluded_sorted.is_empty() {
                 return Ok(Some(total));
             }
-            let Some(in_set) =
-                sum_post_object_counts_filtered(store, g_id, p_id, &excluded_sorted)?
-            else {
+            let Some(in_set) = post_object_filtered_sum(ec, pred, &excluded_sorted)? else {
                 return Ok(None);
             };
             Ok(Some(total.saturating_sub(in_set)))

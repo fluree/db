@@ -1783,6 +1783,262 @@ async fn indexed_overlay_composite_join_count_reflects_overlay() {
         .await;
 }
 
+/// Regression: an object-var `FILTER EXISTS` `COUNT(*)`
+/// (`?s p ?o . FILTER EXISTS { ?o q ?x }`) must track novelty. `count_plan`
+/// lowers this to `PostObjectFilteredSum { pred, object_filter }`; the overlay
+/// lane streams POST(`p`) from the overlay-merging POST cursor and matches each
+/// ref object against the (overlay-aware) subject keyset of `q`.
+#[tokio::test]
+async fn indexed_overlay_object_exists_count_reflects_overlay() {
+    assert_index_defaults();
+    let fluree = FlureeBuilder::memory()
+        .with_ledger_cache_config(LedgerManagerConfig::default())
+        .build_memory();
+    let ledger_id = "it/overlay-object-exists:main";
+
+    let (local, handle) = start_background_indexer_local(
+        fluree.backend().clone(),
+        Arc::new(fluree.nameservice_mode().clone()),
+        fluree_db_indexer::IndexerConfig::small(),
+    );
+
+    local
+        .run_until(async move {
+            let index_cfg = IndexConfig {
+                reindex_min_bytes: 0,
+                reindex_max_bytes: 10_000_000,
+            };
+
+            // a knows {b,c,d}; b,c active. EXISTS active on object => (a,b),(a,c) = 2.
+            let ledger0 = genesis_ledger_for_fluree(&fluree, ledger_id);
+            let baseline = json!({
+                "@context": { "ex": "http://example.org/ns/" },
+                "@graph": [
+                    {"@id": "ex:a", "ex:knows": [{"@id": "ex:b"}, {"@id": "ex:c"}, {"@id": "ex:d"}]},
+                    {"@id": "ex:b", "ex:active": true},
+                    {"@id": "ex:c", "ex:active": true}
+                ]
+            });
+            let ledger1 = fluree
+                .insert_with_opts(
+                    ledger0,
+                    &baseline,
+                    TxnOpts::default(),
+                    CommitOpts::default(),
+                    &index_cfg,
+                )
+                .await
+                .expect("baseline insert")
+                .ledger;
+
+            let outcome = trigger_index_and_wait_outcome(&handle, ledger_id, ledger1.t()).await;
+            if let fluree_db_api::IndexOutcome::Completed { index_t, .. } = outcome {
+                assert_eq!(index_t, 1, "should index to t=1");
+            }
+
+            let query = r"
+                PREFIX ex: <http://example.org/ns/>
+                SELECT (COUNT(*) AS ?cnt)
+                WHERE { ?s ex:knows ?o . FILTER EXISTS { ?o ex:active ?x } }
+            ";
+
+            let view1 = fluree
+                .db_at_t(ledger_id, ledger1.t())
+                .await
+                .expect("load view at t=1");
+            let result = fluree
+                .query(&view1, QueryInput::Sparql(query))
+                .await
+                .expect("count at t=1");
+            let jsonld = result.to_jsonld(&view1.snapshot).expect("to_jsonld");
+            assert_eq!(
+                normalize_rows(&jsonld),
+                normalize_rows(&json!([[2]])),
+                "indexed-only object-EXISTS count should be 2 ((a,b),(a,c))"
+            );
+
+            // d becomes active in novelty → (a,d) qualifies → 3.
+            let assert = json!({
+                "@context": { "ex": "http://example.org/ns/" },
+                "@graph": [ {"@id": "ex:d", "ex:active": true} ]
+            });
+            let ledger2 = fluree
+                .insert(ledger1, &assert)
+                .await
+                .expect("assert in novelty")
+                .ledger;
+
+            let view2 = fluree
+                .db_at_t(ledger_id, ledger2.t())
+                .await
+                .expect("load view at t=2");
+            let result = fluree
+                .query(&view2, QueryInput::Sparql(query))
+                .await
+                .expect("count at t=2");
+            let jsonld = result.to_jsonld(&view2.snapshot).expect("to_jsonld");
+            assert_eq!(
+                normalize_rows(&jsonld),
+                normalize_rows(&json!([[3]])),
+                "object-EXISTS count should reflect d becoming active"
+            );
+
+            // b loses active in novelty → (a,b) drops → 2.
+            let retract = json!({
+                "@context": { "ex": "http://example.org/ns/" },
+                "delete": [ {"@id": "ex:b", "ex:active": true} ]
+            });
+            let ledger3 = fluree
+                .update(ledger2, &retract)
+                .await
+                .expect("retract in novelty")
+                .ledger;
+
+            let view3 = fluree
+                .db_at_t(ledger_id, ledger3.t())
+                .await
+                .expect("load view at t=3");
+            let result = fluree
+                .query(&view3, QueryInput::Sparql(query))
+                .await
+                .expect("count at t=3");
+            let jsonld = result.to_jsonld(&view3.snapshot).expect("to_jsonld");
+            assert_eq!(
+                normalize_rows(&jsonld),
+                normalize_rows(&json!([[2]])),
+                "object-EXISTS count should reflect b losing active ((a,c),(a,d))"
+            );
+        })
+        .await;
+}
+
+/// Regression: an object-var `MINUS` `COUNT(*)`
+/// (`?s p ?o . MINUS { ?o q ?x }`) must track novelty. `count_plan` lowers this
+/// to `TotalMinusPostObjectFilteredSum`: `count(p) - postObjectFilteredSum(p, subjects(q))`.
+/// The overlay lane uses the cursor for both the total and the filtered sum.
+#[tokio::test]
+async fn indexed_overlay_object_minus_count_reflects_overlay() {
+    assert_index_defaults();
+    let fluree = FlureeBuilder::memory()
+        .with_ledger_cache_config(LedgerManagerConfig::default())
+        .build_memory();
+    let ledger_id = "it/overlay-object-minus:main";
+
+    let (local, handle) = start_background_indexer_local(
+        fluree.backend().clone(),
+        Arc::new(fluree.nameservice_mode().clone()),
+        fluree_db_indexer::IndexerConfig::small(),
+    );
+
+    local
+        .run_until(async move {
+            let index_cfg = IndexConfig {
+                reindex_min_bytes: 0,
+                reindex_max_bytes: 10_000_000,
+            };
+
+            // a knows {b,c,d} (3 edges); b active. MINUS active object => not-active = c,d = 2.
+            let ledger0 = genesis_ledger_for_fluree(&fluree, ledger_id);
+            let baseline = json!({
+                "@context": { "ex": "http://example.org/ns/" },
+                "@graph": [
+                    {"@id": "ex:a", "ex:knows": [{"@id": "ex:b"}, {"@id": "ex:c"}, {"@id": "ex:d"}]},
+                    {"@id": "ex:b", "ex:active": true}
+                ]
+            });
+            let ledger1 = fluree
+                .insert_with_opts(
+                    ledger0,
+                    &baseline,
+                    TxnOpts::default(),
+                    CommitOpts::default(),
+                    &index_cfg,
+                )
+                .await
+                .expect("baseline insert")
+                .ledger;
+
+            let outcome = trigger_index_and_wait_outcome(&handle, ledger_id, ledger1.t()).await;
+            if let fluree_db_api::IndexOutcome::Completed { index_t, .. } = outcome {
+                assert_eq!(index_t, 1, "should index to t=1");
+            }
+
+            let query = r"
+                PREFIX ex: <http://example.org/ns/>
+                SELECT (COUNT(*) AS ?cnt)
+                WHERE { ?s ex:knows ?o . MINUS { ?o ex:active ?x } }
+            ";
+
+            let view1 = fluree
+                .db_at_t(ledger_id, ledger1.t())
+                .await
+                .expect("load view at t=1");
+            let result = fluree
+                .query(&view1, QueryInput::Sparql(query))
+                .await
+                .expect("count at t=1");
+            let jsonld = result.to_jsonld(&view1.snapshot).expect("to_jsonld");
+            assert_eq!(
+                normalize_rows(&jsonld),
+                normalize_rows(&json!([[2]])),
+                "indexed-only object-MINUS count should be 2 (3 - 1)"
+            );
+
+            // c becomes active in novelty → in_set = {b,c} → 3 - 2 = 1.
+            let assert = json!({
+                "@context": { "ex": "http://example.org/ns/" },
+                "@graph": [ {"@id": "ex:c", "ex:active": true} ]
+            });
+            let ledger2 = fluree
+                .insert(ledger1, &assert)
+                .await
+                .expect("assert in novelty")
+                .ledger;
+
+            let view2 = fluree
+                .db_at_t(ledger_id, ledger2.t())
+                .await
+                .expect("load view at t=2");
+            let result = fluree
+                .query(&view2, QueryInput::Sparql(query))
+                .await
+                .expect("count at t=2");
+            let jsonld = result.to_jsonld(&view2.snapshot).expect("to_jsonld");
+            assert_eq!(
+                normalize_rows(&jsonld),
+                normalize_rows(&json!([[1]])),
+                "object-MINUS count should reflect c becoming active (3 - 2)"
+            );
+
+            // b loses active in novelty → in_set = {c} → 3 - 1 = 2.
+            let retract = json!({
+                "@context": { "ex": "http://example.org/ns/" },
+                "delete": [ {"@id": "ex:b", "ex:active": true} ]
+            });
+            let ledger3 = fluree
+                .update(ledger2, &retract)
+                .await
+                .expect("retract in novelty")
+                .ledger;
+
+            let view3 = fluree
+                .db_at_t(ledger_id, ledger3.t())
+                .await
+                .expect("load view at t=3");
+            let result = fluree
+                .query(&view3, QueryInput::Sparql(query))
+                .await
+                .expect("count at t=3");
+            let jsonld = result.to_jsonld(&view3.snapshot).expect("to_jsonld");
+            assert_eq!(
+                normalize_rows(&jsonld),
+                normalize_rows(&json!([[2]])),
+                "object-MINUS count should reflect b losing active (3 - 1)"
+            );
+        })
+        .await;
+}
+
 /// Regression: the `<S> <p>+ ?o` COUNT(*) fast path must incorporate novelty.
 ///
 /// Property-path+ COUNT used to gate on `fast_path_store`, which bails the
