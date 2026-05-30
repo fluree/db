@@ -638,6 +638,93 @@ async fn indexed_multicolumn_join_shared_object_var_executes() {
         .await;
 }
 
+/// Regression: the multicolumn `?s p1 ?o . ?s p2 ?o` COUNT(*) must count matching
+/// `(s,o)` PAIRS (composite-key intersection), not the product of per-subject
+/// object counts. With a subject carrying several objects under each predicate,
+/// a subject-keyed star join would multiply (e.g. 3×3=9) — the composite-key
+/// merge must instead intersect on `(s,o)`.
+#[tokio::test]
+async fn indexed_multicolumn_join_counts_pairs_not_product() {
+    assert_index_defaults();
+    let fluree = FlureeBuilder::memory()
+        .with_ledger_cache_config(LedgerManagerConfig::default())
+        .build_memory();
+    let ledger_id = "it/indexed-multicolumn-pairs:main";
+
+    let (local, handle) = start_background_indexer_local(
+        fluree.backend().clone(),
+        Arc::new(fluree.nameservice_mode().clone()),
+        fluree_db_indexer::IndexerConfig::small(),
+    );
+
+    local
+        .run_until(async move {
+            let index_cfg = IndexConfig {
+                reindex_min_bytes: 0,
+                reindex_max_bytes: 10_000_000,
+            };
+
+            let ledger0 = genesis_ledger_for_fluree(&fluree, ledger_id);
+            // s1: p1 -> {o1,o2,o3}, p2 -> {o1,o2,o4}  → shared pairs (s1,o1),(s1,o2) = 2
+            // s2: p1 -> {o5},        p2 -> {o5}        → shared pair  (s2,o5)         = 1
+            // Total matching (s,o) pairs = 3.
+            // A subject-keyed star multiply would give s1: 3×3=9, s2: 1×1=1 → 10.
+            let insert = json!({
+                "@context": { "ex": "http://example.org/ns/" },
+                "@graph": [
+                    {
+                        "@id": "ex:s1",
+                        "ex:p1": [{"@id": "ex:o1"}, {"@id": "ex:o2"}, {"@id": "ex:o3"}],
+                        "ex:p2": [{"@id": "ex:o1"}, {"@id": "ex:o2"}, {"@id": "ex:o4"}]
+                    },
+                    {
+                        "@id": "ex:s2",
+                        "ex:p1": {"@id": "ex:o5"},
+                        "ex:p2": {"@id": "ex:o5"}
+                    }
+                ]
+            });
+            let ledger1 = fluree
+                .insert_with_opts(
+                    ledger0,
+                    &insert,
+                    TxnOpts::default(),
+                    CommitOpts::default(),
+                    &index_cfg,
+                )
+                .await
+                .expect("seed insert")
+                .ledger;
+
+            let outcome = trigger_index_and_wait_outcome(&handle, ledger_id, ledger1.t()).await;
+            if let fluree_db_api::IndexOutcome::Completed { index_t, .. } = outcome {
+                assert_eq!(index_t, 1, "should index to t=1");
+            }
+
+            let view = fluree
+                .db_at_t(ledger_id, ledger1.t())
+                .await
+                .expect("load indexed view");
+
+            let q = r"
+                PREFIX ex: <http://example.org/ns/>
+                SELECT (COUNT(*) AS ?count)
+                WHERE { ?s ex:p1 ?o . ?s ex:p2 ?o . }
+            ";
+            let r = fluree
+                .query(&view, QueryInput::Sparql(q))
+                .await
+                .expect("multicolumn join query should succeed");
+            let jsonld = r.to_jsonld(&view.snapshot).expect("to_jsonld");
+            assert_eq!(
+                normalize_rows(&jsonld),
+                normalize_rows(&json!([[3]])),
+                "expected three matching (s,o) pairs, not the per-subject product"
+            );
+        })
+        .await;
+}
+
 // =============================================================================
 // Overlay correctness: COUNT fast paths must incorporate novelty
 // =============================================================================

@@ -22,7 +22,6 @@ use crate::fast_group_count_firsts::{
 };
 use crate::fast_label_regex_type::label_regex_type_operator;
 use crate::fast_min_max_string::{predicate_min_max_string_operator, MinMaxMode};
-use crate::fast_multicolumn_join_count_all::multicolumn_join_count_all_operator;
 use crate::fast_optional_chain_head_count_all::predicate_optional_chain_head_count_all;
 use crate::fast_path_plus_count_all::{
     property_path_plus_count_all_operator, transitive_path_plus_count_all_operator,
@@ -1481,36 +1480,6 @@ fn detect_exists_join_count_distinct_object(query: &Query) -> Option<(Ref, Ref, 
     }
 }
 
-fn detect_multicolumn_join_count_all(query: &Query) -> Option<(Ref, Ref, VarId)> {
-    let out_var = detect_count_all_aggregate(query)?;
-
-    // WHERE must be exactly two triple patterns and nothing else.
-    if query.patterns.len() != 2 {
-        return None;
-    }
-    let Pattern::Triple(t1) = &query.patterns[0] else {
-        return None;
-    };
-    let Pattern::Triple(t2) = &query.patterns[1] else {
-        return None;
-    };
-
-    // Must be ?s p1 ?o . ?s p2 ?o (same subject var, same object var).
-    let (s1, p1, o1) = validate_simple_triple(t1)?;
-    let (s2, p2, o2) = validate_simple_triple(t2)?;
-    if s1 != s2 {
-        return None;
-    }
-    if o1 != o2 {
-        return None;
-    }
-    if o1 == s1 {
-        return None;
-    }
-
-    Some((p1, p2, out_var))
-}
-
 fn detect_count_blank_node_subjects(query: &Query) -> Option<VarId> {
     let (input_var, out_var) = detect_count_aggregate(query)?;
 
@@ -2050,18 +2019,8 @@ fn build_operator_tree_inner(
         }
     }
 
-    // Fast-path: `COUNT(*)` for a 2-pattern multicolumn join `?s p1 ?o . ?s p2 ?o`.
-    if enable_fused_fast_paths {
-        if let Some((p1, p2, out_var)) = detect_multicolumn_join_count_all(query) {
-            let fallback = build_operator_tree_inner(query, stats.clone(), false, planning)?;
-            return Ok(Box::new(multicolumn_join_count_all_operator(
-                p1,
-                p2,
-                out_var,
-                Some(fallback),
-            )));
-        }
-    }
+    // (The 2-pattern multicolumn join `?s p1 ?o . ?s p2 ?o` COUNT(*) is now handled
+    // by the generic count planner above — see `count_plan::try_build_multicolumn_join`.)
 
     // Fast-path: `COUNT(DISTINCT ?o1)` with an existence-only same-subject join.
     if enable_fused_fast_paths {

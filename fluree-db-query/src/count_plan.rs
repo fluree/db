@@ -38,6 +38,13 @@ pub(crate) enum ScalarNode {
     /// Maps to: `count_rows_for_predicate_psot`
     TotalRowCount { pred: Ref },
 
+    /// Count of `(s, o)` pairs present in BOTH predicate relations — the
+    /// multicolumn join `?s <pred1> ?o . ?s <pred2> ?o`. A composite-key
+    /// merge-intersection on `(s_id, o_type, o_key)`, NOT a subject-keyed star
+    /// (which would multiply per-subject counts).
+    /// Maps to: `count_composite_join_pairs`
+    CompositeJoinPairCount { pred1: Ref, pred2: Ref },
+
     /// Reduce a stream to its total: `Σ_k count(k)`.
     Sum { source: StreamNode },
 
@@ -203,6 +210,15 @@ pub(crate) struct CountPlan {
 pub(crate) fn try_build_count_plan(query: &Query) -> Option<CountPlan> {
     let out_var = detect_count_all_aggregate(query)?;
 
+    // Multicolumn (s,o)-join: `?s <p1> ?o . ?s <p2> ?o`. Both the subject and
+    // object var are shared across exactly two triples, so this counts matching
+    // (s,o) pairs — a composite-key intersection, not a subject-keyed star (which
+    // `classify_patterns` rejects because the object var repeats). Handle it here
+    // before classification.
+    if let Some(root) = try_build_multicolumn_join(&query.patterns) {
+        return Some(CountPlan { root, out_var });
+    }
+
     // Classify all patterns in the WHERE clause.
     let classified = classify_patterns(&query.patterns)?;
 
@@ -229,6 +245,32 @@ pub(crate) fn try_build_count_plan(query: &Query) -> Option<CountPlan> {
     };
 
     Some(CountPlan { root, out_var })
+}
+
+/// Detect the multicolumn (s,o)-join shape `?s <p1> ?o . ?s <p2> ?o` — exactly
+/// two simple triples sharing the same subject var AND object var (and `s != o`).
+/// Returns a [`ScalarNode::CompositeJoinPairCount`] root; the executor merge-joins
+/// the two predicate relations on the composite key `(s_id, o_type, o_key)`.
+fn try_build_multicolumn_join(patterns: &[Pattern]) -> Option<CountPlanRoot> {
+    if patterns.len() != 2 {
+        return None;
+    }
+    let Pattern::Triple(t1) = &patterns[0] else {
+        return None;
+    };
+    let Pattern::Triple(t2) = &patterns[1] else {
+        return None;
+    };
+    let (s1, p1, o1) = validate_simple_triple(t1)?;
+    let (s2, p2, o2) = validate_simple_triple(t2)?;
+    // Same subject var, same object var, and not a self-loop.
+    if s1 != s2 || o1 != o2 || o1 == s1 {
+        return None;
+    }
+    Some(CountPlanRoot::Scalar(ScalarNode::CompositeJoinPairCount {
+        pred1: p1,
+        pred2: p2,
+    }))
 }
 
 // ---------------------------------------------------------------------------

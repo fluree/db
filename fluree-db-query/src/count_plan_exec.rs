@@ -16,13 +16,16 @@ use crate::fast_path_common::{
     build_count_batch, collect_subjects_for_predicate_set, collect_subjects_for_predicate_sorted,
     collect_subjects_with_object_in_set, count_rows_for_predicate_psot, fast_path_store,
     intersect_many_sorted, leaf_entries_for_predicate, normalize_pred_sid,
-    sum_post_object_counts_filtered, FastPathOperator, ObjectFilterMode, PostObjectGroupCountIter,
-    PsotObjectFilterCountIter, PsotSubjectCountIter, PsotSubjectWeightedSumIter,
+    projection_sid_otype_okey, sum_post_object_counts_filtered, FastPathOperator, ObjectFilterMode,
+    PostObjectGroupCountIter, PsotObjectFilterCountIter, PsotSubjectCountIter,
+    PsotSubjectWeightedSumIter,
 };
+use crate::ir::triple::Ref;
 use crate::operator::BoxedOperator;
 use fluree_db_binary_index::{BinaryIndexStore, RunSortOrder};
 use fluree_db_core::GraphId;
 use rustc_hash::{FxHashMap, FxHashSet};
+use std::cmp::Ordering;
 use std::sync::Arc;
 
 /// Create a `FastPathOperator` that executes a `CountPlan`.
@@ -84,6 +87,10 @@ fn execute_scalar(
                 return Ok(Some(0));
             };
             Ok(Some(count_rows_for_predicate_psot(store, g_id, p_id)?))
+        }
+
+        ScalarNode::CompositeJoinPairCount { pred1, pred2 } => {
+            Ok(Some(count_composite_join_pairs(store, g_id, pred1, pred2)?))
         }
 
         ScalarNode::Sum { source } => {
@@ -1172,4 +1179,166 @@ fn execute_chain(
     }
 
     Ok(Some(total))
+}
+
+// ---------------------------------------------------------------------------
+// Multicolumn (s,o)-join pair count: `?s <p1> ?o . ?s <p2> ?o`
+// ---------------------------------------------------------------------------
+
+/// Composite key `(s_id, o_type, o_key)` for the multicolumn merge-join.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct SoKey {
+    s: u64,
+    o_type: u16,
+    o_key: u64,
+}
+
+impl Ord for SoKey {
+    fn cmp(&self, other: &Self) -> Ordering {
+        self.s
+            .cmp(&other.s)
+            .then_with(|| self.o_type.cmp(&other.o_type))
+            .then_with(|| self.o_key.cmp(&other.o_key))
+    }
+}
+
+impl PartialOrd for SoKey {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+/// Streams a predicate's rows as `(s_id, o_type, o_key)` in PSOT order, which is
+/// exactly ascending `SoKey` order for a fixed predicate.
+struct PsotSoIter<'a> {
+    store: &'a BinaryIndexStore,
+    p_id: u32,
+    leaf_entries: &'a [fluree_db_binary_index::format::branch::LeafEntry],
+    leaf_pos: usize,
+    leaflet_idx: usize,
+    row: usize,
+    handle: Option<Box<dyn fluree_db_binary_index::read::leaf_access::LeafHandle>>,
+    batch: Option<fluree_db_binary_index::ColumnBatch>,
+    projection: fluree_db_binary_index::ColumnProjection,
+}
+
+impl<'a> PsotSoIter<'a> {
+    fn new(store: &'a BinaryIndexStore, g_id: GraphId, p_id: u32) -> Self {
+        let leaves = leaf_entries_for_predicate(store, g_id, RunSortOrder::Psot, p_id);
+        Self {
+            store,
+            p_id,
+            leaf_entries: leaves,
+            leaf_pos: 0,
+            leaflet_idx: 0,
+            row: 0,
+            handle: None,
+            batch: None,
+            projection: projection_sid_otype_okey(),
+        }
+    }
+
+    fn load_next_batch(&mut self) -> Result<Option<()>> {
+        loop {
+            if self.handle.is_none() {
+                if self.leaf_pos >= self.leaf_entries.len() {
+                    return Ok(None);
+                }
+                let leaf_entry = &self.leaf_entries[self.leaf_pos];
+                self.leaf_pos += 1;
+                self.leaflet_idx = 0;
+                self.row = 0;
+                self.batch = None;
+                self.handle = Some(
+                    self.store
+                        .open_leaf_handle(
+                            &leaf_entry.leaf_cid,
+                            leaf_entry.sidecar_cid.as_ref(),
+                            false,
+                        )
+                        .map_err(|e| QueryError::Internal(format!("leaf open: {e}")))?,
+                );
+            }
+
+            let handle = self.handle.as_ref().unwrap();
+            let dir = handle.dir();
+            while self.leaflet_idx < dir.entries.len() {
+                let entry = &dir.entries[self.leaflet_idx];
+                let idx = self.leaflet_idx;
+                self.leaflet_idx += 1;
+                if entry.row_count == 0 || entry.p_const != Some(self.p_id) {
+                    continue;
+                }
+                let batch = handle
+                    .load_columns(idx, &self.projection, RunSortOrder::Psot)
+                    .map_err(|e| QueryError::Internal(format!("load columns: {e}")))?;
+                self.row = 0;
+                self.batch = Some(batch);
+                return Ok(Some(()));
+            }
+
+            self.handle = None;
+        }
+    }
+
+    fn next_row(&mut self) -> Result<Option<SoKey>> {
+        loop {
+            if self.batch.is_none() && self.load_next_batch()?.is_none() {
+                return Ok(None);
+            }
+            let batch = self.batch.as_ref().unwrap();
+            if self.row >= batch.row_count {
+                self.batch = None;
+                continue;
+            }
+            let key = SoKey {
+                s: batch.s_id.get(self.row),
+                o_type: batch.o_type.get(self.row),
+                o_key: batch.o_key.get(self.row),
+            };
+            self.row += 1;
+            return Ok(Some(key));
+        }
+    }
+}
+
+/// Count `(s, o)` pairs present in BOTH predicate relations via a streaming
+/// merge-join on the composite `(s_id, o_type, o_key)` key. Each shared pair is
+/// counted once (intersection cardinality), NOT the product of per-subject counts.
+fn count_composite_join_pairs(
+    store: &Arc<BinaryIndexStore>,
+    g_id: GraphId,
+    p1: &Ref,
+    p2: &Ref,
+) -> Result<u64> {
+    let p1_sid = normalize_pred_sid(store, p1)?;
+    let p2_sid = normalize_pred_sid(store, p2)?;
+
+    let Some(p1_id) = store.sid_to_p_id(&p1_sid) else {
+        return Ok(0);
+    };
+    let Some(p2_id) = store.sid_to_p_id(&p2_sid) else {
+        return Ok(0);
+    };
+
+    let mut it1 = PsotSoIter::new(store, g_id, p1_id);
+    let mut it2 = PsotSoIter::new(store, g_id, p2_id);
+
+    let mut a = it1.next_row()?;
+    let mut b = it2.next_row()?;
+    let mut count: u64 = 0;
+
+    while let (Some(ka), Some(kb)) = (a, b) {
+        match ka.cmp(&kb) {
+            Ordering::Less => a = it1.next_row()?,
+            Ordering::Greater => b = it2.next_row()?,
+            Ordering::Equal => {
+                count = count.saturating_add(1);
+                a = it1.next_row()?;
+                b = it2.next_row()?;
+            }
+        }
+    }
+
+    Ok(count)
 }
