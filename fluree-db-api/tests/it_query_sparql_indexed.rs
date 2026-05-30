@@ -2175,6 +2175,462 @@ async fn indexed_overlay_object_chain_exists_count_reflects_overlay() {
         .await;
 }
 
+/// Regression: a 2-hop chain `COUNT(*)` (`?a p1 ?b . ?b p2 ?c`) must track
+/// novelty. `count_plan` lowers this to a `ChainFold`; the overlay lane folds
+/// per-hop weight maps over the overlay-merging PSOT cursor (no seek cursor).
+/// Count = Σ over p1 edges of out-degree(b in p2).
+#[tokio::test]
+async fn indexed_overlay_chain2_count_reflects_overlay() {
+    assert_index_defaults();
+    let fluree = FlureeBuilder::memory()
+        .with_ledger_cache_config(LedgerManagerConfig::default())
+        .build_memory();
+    let ledger_id = "it/overlay-chain2:main";
+
+    let (local, handle) = start_background_indexer_local(
+        fluree.backend().clone(),
+        Arc::new(fluree.nameservice_mode().clone()),
+        fluree_db_indexer::IndexerConfig::small(),
+    );
+
+    local
+        .run_until(async move {
+            let index_cfg = IndexConfig {
+                reindex_min_bytes: 0,
+                reindex_max_bytes: 10_000_000,
+            };
+
+            // a p1 {b,e}; b p2 {c,d}; e p2 {f}. Paths = od(b)+od(e) = 2+1 = 3.
+            let ledger0 = genesis_ledger_for_fluree(&fluree, ledger_id);
+            let baseline = json!({
+                "@context": { "ex": "http://example.org/ns/" },
+                "@graph": [
+                    {"@id": "ex:a", "ex:p1": [{"@id": "ex:b"}, {"@id": "ex:e"}]},
+                    {"@id": "ex:b", "ex:p2": [{"@id": "ex:c"}, {"@id": "ex:d"}]},
+                    {"@id": "ex:e", "ex:p2": {"@id": "ex:f"}}
+                ]
+            });
+            let ledger1 = fluree
+                .insert_with_opts(
+                    ledger0,
+                    &baseline,
+                    TxnOpts::default(),
+                    CommitOpts::default(),
+                    &index_cfg,
+                )
+                .await
+                .expect("baseline insert")
+                .ledger;
+
+            let outcome = trigger_index_and_wait_outcome(&handle, ledger_id, ledger1.t()).await;
+            if let fluree_db_api::IndexOutcome::Completed { index_t, .. } = outcome {
+                assert_eq!(index_t, 1, "should index to t=1");
+            }
+
+            let query = r"
+                PREFIX ex: <http://example.org/ns/>
+                SELECT (COUNT(*) AS ?cnt)
+                WHERE { ?a ex:p1 ?b . ?b ex:p2 ?c }
+            ";
+
+            let run = |t| {
+                let fluree = &fluree;
+                async move {
+                    let view = fluree.db_at_t(ledger_id, t).await.expect("load view");
+                    let result = fluree
+                        .query(&view, QueryInput::Sparql(query))
+                        .await
+                        .expect("count");
+                    result.to_jsonld(&view.snapshot).expect("to_jsonld")
+                }
+            };
+
+            assert_eq!(
+                normalize_rows(&run(ledger1.t()).await),
+                normalize_rows(&json!([[3]])),
+                "indexed-only 2-hop chain count should be 3"
+            );
+
+            // b gains a p2 object in novelty → od(b)=3 → total = 3+1 = 4.
+            let ledger2 = fluree
+                .insert(
+                    ledger1,
+                    &json!({
+                        "@context": { "ex": "http://example.org/ns/" },
+                        "@graph": [ {"@id": "ex:b", "ex:p2": {"@id": "ex:g"}} ]
+                    }),
+                )
+                .await
+                .expect("assert")
+                .ledger;
+            assert_eq!(
+                normalize_rows(&run(ledger2.t()).await),
+                normalize_rows(&json!([[4]])),
+                "chain count should reflect b gaining a p2 object"
+            );
+
+            // retract e's only p2 object → od(e)=0 → total = 3+0 = 3.
+            let ledger3 = fluree
+                .update(
+                    ledger2,
+                    &json!({
+                        "@context": { "ex": "http://example.org/ns/" },
+                        "delete": [ {"@id": "ex:e", "ex:p2": {"@id": "ex:f"}} ]
+                    }),
+                )
+                .await
+                .expect("retract")
+                .ledger;
+            assert_eq!(
+                normalize_rows(&run(ledger3.t()).await),
+                normalize_rows(&json!([[3]])),
+                "chain count should reflect e losing its p2 object"
+            );
+        })
+        .await;
+}
+
+/// Regression: a 3-hop chain `COUNT(*)` (`?a p1 ?b . ?b p2 ?c . ?c p3 ?d`) must
+/// track novelty. Exercises the overlay chain fold (right-to-left through p2).
+#[tokio::test]
+async fn indexed_overlay_chain3_count_reflects_overlay() {
+    assert_index_defaults();
+    let fluree = FlureeBuilder::memory()
+        .with_ledger_cache_config(LedgerManagerConfig::default())
+        .build_memory();
+    let ledger_id = "it/overlay-chain3:main";
+
+    let (local, handle) = start_background_indexer_local(
+        fluree.backend().clone(),
+        Arc::new(fluree.nameservice_mode().clone()),
+        fluree_db_indexer::IndexerConfig::small(),
+    );
+
+    local
+        .run_until(async move {
+            let index_cfg = IndexConfig {
+                reindex_min_bytes: 0,
+                reindex_max_bytes: 10_000_000,
+            };
+
+            // a p1 b; b p2 {c,x}; c p3 {d,e}; x p3 {}. Paths = comp2[b] = od(c)+od(x) = 2+0 = 2.
+            let ledger0 = genesis_ledger_for_fluree(&fluree, ledger_id);
+            let baseline = json!({
+                "@context": { "ex": "http://example.org/ns/" },
+                "@graph": [
+                    {"@id": "ex:a", "ex:p1": {"@id": "ex:b"}},
+                    {"@id": "ex:b", "ex:p2": [{"@id": "ex:c"}, {"@id": "ex:x"}]},
+                    {"@id": "ex:c", "ex:p3": [{"@id": "ex:d"}, {"@id": "ex:e"}]}
+                ]
+            });
+            let ledger1 = fluree
+                .insert_with_opts(
+                    ledger0,
+                    &baseline,
+                    TxnOpts::default(),
+                    CommitOpts::default(),
+                    &index_cfg,
+                )
+                .await
+                .expect("baseline insert")
+                .ledger;
+
+            let outcome = trigger_index_and_wait_outcome(&handle, ledger_id, ledger1.t()).await;
+            if let fluree_db_api::IndexOutcome::Completed { index_t, .. } = outcome {
+                assert_eq!(index_t, 1, "should index to t=1");
+            }
+
+            let query = r"
+                PREFIX ex: <http://example.org/ns/>
+                SELECT (COUNT(*) AS ?cnt)
+                WHERE { ?a ex:p1 ?b . ?b ex:p2 ?c . ?c ex:p3 ?d }
+            ";
+
+            let run = |t| {
+                let fluree = &fluree;
+                async move {
+                    let view = fluree.db_at_t(ledger_id, t).await.expect("load view");
+                    let result = fluree
+                        .query(&view, QueryInput::Sparql(query))
+                        .await
+                        .expect("count");
+                    result.to_jsonld(&view.snapshot).expect("to_jsonld")
+                }
+            };
+
+            assert_eq!(
+                normalize_rows(&run(ledger1.t()).await),
+                normalize_rows(&json!([[2]])),
+                "indexed-only 3-hop chain count should be 2"
+            );
+
+            // x gains a p3 object in novelty → comp2[b] = od(c)+od(x) = 2+1 = 3.
+            let ledger2 = fluree
+                .insert(
+                    ledger1,
+                    &json!({
+                        "@context": { "ex": "http://example.org/ns/" },
+                        "@graph": [ {"@id": "ex:x", "ex:p3": {"@id": "ex:y"}} ]
+                    }),
+                )
+                .await
+                .expect("assert")
+                .ledger;
+            assert_eq!(
+                normalize_rows(&run(ledger2.t()).await),
+                normalize_rows(&json!([[3]])),
+                "3-hop chain count should reflect x gaining a p3 object"
+            );
+
+            // retract one of c's p3 objects → od(c)=1 → comp2[b] = 1+1 = 2.
+            let ledger3 = fluree
+                .update(
+                    ledger2,
+                    &json!({
+                        "@context": { "ex": "http://example.org/ns/" },
+                        "delete": [ {"@id": "ex:c", "ex:p3": {"@id": "ex:d"}} ]
+                    }),
+                )
+                .await
+                .expect("retract")
+                .ledger;
+            assert_eq!(
+                normalize_rows(&run(ledger3.t()).await),
+                normalize_rows(&json!([[2]])),
+                "3-hop chain count should reflect c losing a p3 object"
+            );
+        })
+        .await;
+}
+
+/// Regression: a chain with a tail `FILTER EXISTS` modifier
+/// (`?a p1 ?b . ?b p2 ?c . FILTER EXISTS { ?c p3 ?d }`) must track novelty.
+/// Exercises the overlay `ChainWeight::InSet` rightmost build.
+#[tokio::test]
+async fn indexed_overlay_chain_tail_exists_count_reflects_overlay() {
+    assert_index_defaults();
+    let fluree = FlureeBuilder::memory()
+        .with_ledger_cache_config(LedgerManagerConfig::default())
+        .build_memory();
+    let ledger_id = "it/overlay-chain-tail-exists:main";
+
+    let (local, handle) = start_background_indexer_local(
+        fluree.backend().clone(),
+        Arc::new(fluree.nameservice_mode().clone()),
+        fluree_db_indexer::IndexerConfig::small(),
+    );
+
+    local
+        .run_until(async move {
+            let index_cfg = IndexConfig {
+                reindex_min_bytes: 0,
+                reindex_max_bytes: 10_000_000,
+            };
+
+            // a p1 b; b p2 {c,x}; c p3 d. Tail EXISTS p3 → only c qualifies → 1.
+            let ledger0 = genesis_ledger_for_fluree(&fluree, ledger_id);
+            let baseline = json!({
+                "@context": { "ex": "http://example.org/ns/" },
+                "@graph": [
+                    {"@id": "ex:a", "ex:p1": {"@id": "ex:b"}},
+                    {"@id": "ex:b", "ex:p2": [{"@id": "ex:c"}, {"@id": "ex:x"}]},
+                    {"@id": "ex:c", "ex:p3": {"@id": "ex:d"}}
+                ]
+            });
+            let ledger1 = fluree
+                .insert_with_opts(
+                    ledger0,
+                    &baseline,
+                    TxnOpts::default(),
+                    CommitOpts::default(),
+                    &index_cfg,
+                )
+                .await
+                .expect("baseline insert")
+                .ledger;
+
+            let outcome = trigger_index_and_wait_outcome(&handle, ledger_id, ledger1.t()).await;
+            if let fluree_db_api::IndexOutcome::Completed { index_t, .. } = outcome {
+                assert_eq!(index_t, 1, "should index to t=1");
+            }
+
+            let query = r"
+                PREFIX ex: <http://example.org/ns/>
+                SELECT (COUNT(*) AS ?cnt)
+                WHERE { ?a ex:p1 ?b . ?b ex:p2 ?c . FILTER EXISTS { ?c ex:p3 ?d } }
+            ";
+
+            let run = |t| {
+                let fluree = &fluree;
+                async move {
+                    let view = fluree.db_at_t(ledger_id, t).await.expect("load view");
+                    let result = fluree
+                        .query(&view, QueryInput::Sparql(query))
+                        .await
+                        .expect("count");
+                    result.to_jsonld(&view.snapshot).expect("to_jsonld")
+                }
+            };
+
+            assert_eq!(
+                normalize_rows(&run(ledger1.t()).await),
+                normalize_rows(&json!([[1]])),
+                "indexed-only tail-EXISTS chain count should be 1 (only c has p3)"
+            );
+
+            // x gains p3 in novelty → both c,x qualify → 2.
+            let ledger2 = fluree
+                .insert(
+                    ledger1,
+                    &json!({
+                        "@context": { "ex": "http://example.org/ns/" },
+                        "@graph": [ {"@id": "ex:x", "ex:p3": {"@id": "ex:e"}} ]
+                    }),
+                )
+                .await
+                .expect("assert")
+                .ledger;
+            assert_eq!(
+                normalize_rows(&run(ledger2.t()).await),
+                normalize_rows(&json!([[2]])),
+                "tail-EXISTS chain count should reflect x gaining p3"
+            );
+
+            // retract c's p3 → only x qualifies → 1.
+            let ledger3 = fluree
+                .update(
+                    ledger2,
+                    &json!({
+                        "@context": { "ex": "http://example.org/ns/" },
+                        "delete": [ {"@id": "ex:c", "ex:p3": {"@id": "ex:d"}} ]
+                    }),
+                )
+                .await
+                .expect("retract")
+                .ledger;
+            assert_eq!(
+                normalize_rows(&run(ledger3.t()).await),
+                normalize_rows(&json!([[1]])),
+                "tail-EXISTS chain count should reflect c losing p3"
+            );
+        })
+        .await;
+}
+
+/// Regression: a chain with a tail `MINUS` modifier
+/// (`?a p1 ?b . ?b p2 ?c . MINUS { ?c p3 ?d }`) must track novelty. Exercises
+/// the overlay `ChainWeight::NotInSet` rightmost build.
+#[tokio::test]
+async fn indexed_overlay_chain_tail_minus_count_reflects_overlay() {
+    assert_index_defaults();
+    let fluree = FlureeBuilder::memory()
+        .with_ledger_cache_config(LedgerManagerConfig::default())
+        .build_memory();
+    let ledger_id = "it/overlay-chain-tail-minus:main";
+
+    let (local, handle) = start_background_indexer_local(
+        fluree.backend().clone(),
+        Arc::new(fluree.nameservice_mode().clone()),
+        fluree_db_indexer::IndexerConfig::small(),
+    );
+
+    local
+        .run_until(async move {
+            let index_cfg = IndexConfig {
+                reindex_min_bytes: 0,
+                reindex_max_bytes: 10_000_000,
+            };
+
+            // a p1 b; b p2 {c,x}; c p3 d. Tail MINUS p3 → only x (no p3) qualifies → 1.
+            let ledger0 = genesis_ledger_for_fluree(&fluree, ledger_id);
+            let baseline = json!({
+                "@context": { "ex": "http://example.org/ns/" },
+                "@graph": [
+                    {"@id": "ex:a", "ex:p1": {"@id": "ex:b"}},
+                    {"@id": "ex:b", "ex:p2": [{"@id": "ex:c"}, {"@id": "ex:x"}]},
+                    {"@id": "ex:c", "ex:p3": {"@id": "ex:d"}}
+                ]
+            });
+            let ledger1 = fluree
+                .insert_with_opts(
+                    ledger0,
+                    &baseline,
+                    TxnOpts::default(),
+                    CommitOpts::default(),
+                    &index_cfg,
+                )
+                .await
+                .expect("baseline insert")
+                .ledger;
+
+            let outcome = trigger_index_and_wait_outcome(&handle, ledger_id, ledger1.t()).await;
+            if let fluree_db_api::IndexOutcome::Completed { index_t, .. } = outcome {
+                assert_eq!(index_t, 1, "should index to t=1");
+            }
+
+            let query = r"
+                PREFIX ex: <http://example.org/ns/>
+                SELECT (COUNT(*) AS ?cnt)
+                WHERE { ?a ex:p1 ?b . ?b ex:p2 ?c . MINUS { ?c ex:p3 ?d } }
+            ";
+
+            let run = |t| {
+                let fluree = &fluree;
+                async move {
+                    let view = fluree.db_at_t(ledger_id, t).await.expect("load view");
+                    let result = fluree
+                        .query(&view, QueryInput::Sparql(query))
+                        .await
+                        .expect("count");
+                    result.to_jsonld(&view.snapshot).expect("to_jsonld")
+                }
+            };
+
+            assert_eq!(
+                normalize_rows(&run(ledger1.t()).await),
+                normalize_rows(&json!([[1]])),
+                "indexed-only tail-MINUS chain count should be 1 (only x lacks p3)"
+            );
+
+            // x gains p3 in novelty → neither qualifies → 0.
+            let ledger2 = fluree
+                .insert(
+                    ledger1,
+                    &json!({
+                        "@context": { "ex": "http://example.org/ns/" },
+                        "@graph": [ {"@id": "ex:x", "ex:p3": {"@id": "ex:e"}} ]
+                    }),
+                )
+                .await
+                .expect("assert")
+                .ledger;
+            assert_eq!(
+                normalize_rows(&run(ledger2.t()).await),
+                normalize_rows(&json!([[0]])),
+                "tail-MINUS chain count should reflect x gaining p3"
+            );
+
+            // retract c's p3 → c qualifies again (x still has p3) → 1.
+            let ledger3 = fluree
+                .update(
+                    ledger2,
+                    &json!({
+                        "@context": { "ex": "http://example.org/ns/" },
+                        "delete": [ {"@id": "ex:c", "ex:p3": {"@id": "ex:d"}} ]
+                    }),
+                )
+                .await
+                .expect("retract")
+                .ledger;
+            assert_eq!(
+                normalize_rows(&run(ledger3.t()).await),
+                normalize_rows(&json!([[1]])),
+                "tail-MINUS chain count should reflect c losing p3 (only c qualifies)"
+            );
+        })
+        .await;
+}
+
 /// Regression: the `<S> <p>+ ?o` COUNT(*) fast path must incorporate novelty.
 ///
 /// Property-path+ COUNT used to gate on `fast_path_store`, which bails the

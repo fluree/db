@@ -31,7 +31,7 @@ use crate::ir::triple::Ref;
 use crate::operator::BoxedOperator;
 use fluree_db_binary_index::{BinaryCursor, BinaryIndexStore, RunSortOrder};
 use fluree_db_core::o_type::OType;
-use fluree_db_core::GraphId;
+use fluree_db_core::{GraphId, Sid};
 use rustc_hash::{FxHashMap, FxHashSet};
 use std::cmp::Ordering;
 use std::sync::Arc;
@@ -118,8 +118,13 @@ pub(crate) fn count_plan_operator(
 fn execute_plan(root: &CountPlanRoot, ec: &ExecCtx<'_, '_>) -> Result<Option<u64>> {
     match root {
         CountPlanRoot::Scalar(scalar) => execute_scalar(scalar, ec),
-        // Chain is metadata-only (rejected under overlay by plan_overlay_supported).
-        CountPlanRoot::Chain(chain) => execute_chain(chain, ec.store, ec.g_id),
+        CountPlanRoot::Chain(chain) => {
+            if ec.overlay {
+                execute_chain_overlay(chain, ec)
+            } else {
+                execute_chain(chain, ec.store, ec.g_id)
+            }
+        }
     }
 }
 
@@ -131,12 +136,15 @@ fn execute_plan(root: &CountPlanRoot, ec: &ExecCtx<'_, '_>) -> Result<Option<u64
 ///
 /// When false and an overlay/time-travel lane is required, the executor bails
 /// to the generic fallback (correct, just not metadata-fast) rather than
-/// reading stale base-only counts. So far only the subject-keyed scalar/star
-/// shapes are covered; object/POST/chain shapes are added incrementally.
+/// reading stale base-only counts. All `CountPlan` node types now have an
+/// overlay lane; the dead `SumExcluding`/`SumFiltered` scalar variants (never
+/// built by the planner) are the only structural holdouts.
 fn plan_overlay_supported(root: &CountPlanRoot) -> bool {
     match root {
         CountPlanRoot::Scalar(s) => scalar_overlay_supported(s),
-        CountPlanRoot::Chain(_) => false,
+        // execute_chain_overlay handles any chain shape (it bails at runtime on
+        // an absent predicate under novelty).
+        CountPlanRoot::Chain(_) => true,
     }
 }
 
@@ -1564,6 +1572,258 @@ fn execute_chain(
     }
 
     Ok(Some(total))
+}
+
+// ---------------------------------------------------------------------------
+// Chain evaluation — overlay lane
+// ---------------------------------------------------------------------------
+
+/// Per-object weight for one chain hop. Mirrors the metadata `P2WeightMode`
+/// semantics exactly (verified against `PsotSubjectCountIter`,
+/// `PsotSubjectWeightedSumIter`, and `PsotObjectFilterCountIter`):
+/// - `CountEdges`: every edge weighs 1 (rightmost `TailWeight::None`).
+/// - `Lookup`: ref object → `weights.get(o_key).unwrap_or(default)`; non-ref → `default`.
+/// - `InSet`: ref object in set → 1, else 0; non-ref → 0 (EXISTS tail).
+/// - `NotInSet`: ref object not in set → 1, else 0; non-ref → 1 (MINUS tail).
+enum ChainWeight<'a> {
+    CountEdges,
+    Lookup {
+        weights: &'a FxHashMap<u64, u64>,
+        default: u64,
+    },
+    InSet {
+        set: &'a FxHashSet<u64>,
+    },
+    NotInSet {
+        set: &'a FxHashSet<u64>,
+    },
+}
+
+impl ChainWeight<'_> {
+    #[inline]
+    fn weight(&self, o_type: u16, o_key: u64) -> u64 {
+        let is_iri = o_type == OType::IRI_REF.as_u16();
+        match self {
+            ChainWeight::CountEdges => 1,
+            ChainWeight::Lookup { weights, default } => {
+                if is_iri {
+                    weights.get(&o_key).copied().unwrap_or(*default)
+                } else {
+                    *default
+                }
+            }
+            ChainWeight::InSet { set } => u64::from(is_iri && set.contains(&o_key)),
+            ChainWeight::NotInSet { set } => {
+                if is_iri {
+                    u64::from(!set.contains(&o_key))
+                } else {
+                    1
+                }
+            }
+        }
+    }
+}
+
+/// Stream PSOT(`pred`) from the overlay-merging cursor and return a map
+/// `subject_id -> Σ weight(o)` (non-zero only). `Ok(None)` bails the plan.
+fn psot_weighted_subject_sums(
+    ec: &ExecCtx<'_, '_>,
+    pred_sid: &Sid,
+    p_id: u32,
+    weight: &ChainWeight<'_>,
+) -> Result<Option<FxHashMap<u64, u64>>> {
+    let Some(mut cursor) = build_psot_cursor_for_predicate(
+        ec.ctx,
+        ec.store,
+        ec.g_id,
+        pred_sid.clone(),
+        p_id,
+        cursor_projection_sid_otype_okey(),
+    )?
+    else {
+        return Ok(None);
+    };
+    let mut out: FxHashMap<u64, u64> = FxHashMap::default();
+    let mut cur_s: Option<u64> = None;
+    let mut cur_sum: u64 = 0;
+    let overflow = || QueryError::execution("COUNT(*) overflow in chain join");
+    while let Some(batch) = cursor
+        .next_batch()
+        .map_err(|e| QueryError::Internal(format!("count-plan cursor batch: {e}")))?
+    {
+        for row in 0..batch.row_count {
+            let s = batch.s_id.get(row);
+            let w = weight.weight(batch.o_type.get(row), batch.o_key.get(row));
+            if cur_s == Some(s) {
+                cur_sum = cur_sum.checked_add(w).ok_or_else(overflow)?;
+            } else {
+                if let Some(cs) = cur_s {
+                    if cur_sum > 0 {
+                        out.insert(cs, cur_sum);
+                    }
+                }
+                cur_s = Some(s);
+                cur_sum = w;
+            }
+        }
+    }
+    if let Some(cs) = cur_s {
+        if cur_sum > 0 {
+            out.insert(cs, cur_sum);
+        }
+    }
+    Ok(Some(out))
+}
+
+/// Stream PSOT(`pred`) from the overlay-merging cursor and return `Σ weight(o)`
+/// over all rows (ungrouped). `Ok(None)` bails the plan.
+fn psot_weighted_total(
+    ec: &ExecCtx<'_, '_>,
+    pred_sid: &Sid,
+    p_id: u32,
+    weight: &ChainWeight<'_>,
+) -> Result<Option<u64>> {
+    let Some(mut cursor) = build_psot_cursor_for_predicate(
+        ec.ctx,
+        ec.store,
+        ec.g_id,
+        pred_sid.clone(),
+        p_id,
+        cursor_projection_sid_otype_okey(),
+    )?
+    else {
+        return Ok(None);
+    };
+    let mut total: u64 = 0;
+    while let Some(batch) = cursor
+        .next_batch()
+        .map_err(|e| QueryError::Internal(format!("count-plan cursor batch: {e}")))?
+    {
+        for row in 0..batch.row_count {
+            let w = weight.weight(batch.o_type.get(row), batch.o_key.get(row));
+            total = total
+                .checked_add(w)
+                .ok_or_else(|| QueryError::execution("COUNT(*) overflow in chain join"))?;
+        }
+    }
+    Ok(Some(total))
+}
+
+/// Overlay set of subjects for a predicate. `Ok(None)` bails the plan.
+fn subject_set(ec: &ExecCtx<'_, '_>, pred: &Ref) -> Result<Option<FxHashSet<u64>>> {
+    match subject_keys_sorted(ec, pred)? {
+        Some(v) => Ok(Some(v.into_iter().collect())),
+        None => Ok(None),
+    }
+}
+
+/// Build the rightmost chain weights (keyed by subjects of `pN`) under overlay,
+/// applying the tail modifier. `Ok(None)` bails the plan.
+fn build_chain_rightmost_overlay(
+    ec: &ExecCtx<'_, '_>,
+    tail: &TailWeight,
+    pn_sid: &Sid,
+    pn_id: u32,
+) -> Result<Option<FxHashMap<u64, u64>>> {
+    match tail {
+        TailWeight::None => psot_weighted_subject_sums(ec, pn_sid, pn_id, &ChainWeight::CountEdges),
+        TailWeight::Optional { tail_pred } => {
+            // mult_map[c] = max(1, count_tail(c)); objects with no tail edge → 1.
+            let Some(mut groups) = subject_groups(ec, tail_pred)? else {
+                return Ok(None);
+            };
+            let mut mult: FxHashMap<u64, u64> = FxHashMap::default();
+            while let Some((c, count)) = groups.next_group()? {
+                mult.insert(c, count.max(1));
+            }
+            psot_weighted_subject_sums(
+                ec,
+                pn_sid,
+                pn_id,
+                &ChainWeight::Lookup {
+                    weights: &mult,
+                    default: 1,
+                },
+            )
+        }
+        TailWeight::Minus { tail_pred } => {
+            let Some(set) = subject_set(ec, tail_pred)? else {
+                return Ok(None);
+            };
+            psot_weighted_subject_sums(ec, pn_sid, pn_id, &ChainWeight::NotInSet { set: &set })
+        }
+        TailWeight::Exists { tail_pred } => {
+            let Some(set) = subject_set(ec, tail_pred)? else {
+                return Ok(None);
+            };
+            if set.is_empty() {
+                return Ok(Some(FxHashMap::default()));
+            }
+            psot_weighted_subject_sums(ec, pn_sid, pn_id, &ChainWeight::InSet { set: &set })
+        }
+    }
+}
+
+/// Overlay lane for a chain fold. Equivalent to the metadata `execute_chain`
+/// but built on overlay-merging PSOT cursors: a uniform right-to-left fold of
+/// per-hop weight maps (no `PsotSeekSumCursor`).
+///
+/// `comp[v_k]` = number of chain completions from `v_k` through `p_{k+1}..pN`
+/// (+ tail). Built rightmost-first, folded through `p_{N-1}..p2`, then summed
+/// over `p1`'s edges. `Ok(None)` bails to the generic fallback (a predicate is
+/// absent from the base index while novelty is present, or an overlay flake
+/// failed to translate).
+fn execute_chain_overlay(chain: &ChainFold, ec: &ExecCtx<'_, '_>) -> Result<Option<u64>> {
+    let n = chain.predicates.len();
+    debug_assert!(n >= 2, "chain must have at least 2 predicates");
+
+    // Resolve predicates. An absent predicate may carry overlay-only rows a
+    // p_id cursor can't reach, so bail rather than undercount.
+    let mut p_sids: Vec<Sid> = Vec::with_capacity(n);
+    let mut p_ids: Vec<u32> = Vec::with_capacity(n);
+    for pred in &chain.predicates {
+        let sid = normalize_pred_sid(ec.store, pred)?;
+        let Some(p_id) = ec.store.sid_to_p_id(&sid) else {
+            return Ok(None);
+        };
+        p_sids.push(sid);
+        p_ids.push(p_id);
+    }
+
+    // Rightmost weights keyed by subjects of pN (= v_{N-1}).
+    let Some(mut comp) =
+        build_chain_rightmost_overlay(ec, &chain.tail_weight, &p_sids[n - 1], p_ids[n - 1])?
+    else {
+        return Ok(None);
+    };
+    if comp.is_empty() {
+        return Ok(Some(0));
+    }
+
+    // Fold p_{N-1} … p2 (indices n-2 … 1). Empty range for n == 2.
+    for idx in (1..=n.saturating_sub(2)).rev() {
+        let new_comp = {
+            let mode = ChainWeight::Lookup {
+                weights: &comp,
+                default: 0,
+            };
+            match psot_weighted_subject_sums(ec, &p_sids[idx], p_ids[idx], &mode)? {
+                Some(m) => m,
+                None => return Ok(None),
+            }
+        };
+        comp = new_comp;
+        if comp.is_empty() {
+            return Ok(Some(0));
+        }
+    }
+
+    // Head: Σ over p1 edges of comp[object].
+    let head_mode = ChainWeight::Lookup {
+        weights: &comp,
+        default: 0,
+    };
+    psot_weighted_total(ec, &p_sids[0], p_ids[0], &head_mode)
 }
 
 // ---------------------------------------------------------------------------
