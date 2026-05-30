@@ -48,26 +48,6 @@ pub(crate) enum ScalarNode {
     /// Reduce a stream to its total: `Σ_k count(k)`.
     Sum { source: StreamNode },
 
-    // Kept for: potential optimization — fuse exclusion into the scalar sum traversal
-    // instead of building a separate AntiJoin stream node.
-    #[expect(dead_code)]
-    /// Reduce a stream with exclusion: `Σ_{k ∉ excluded} count(k)`.
-    /// `source` and `excluded` must share the same key domain.
-    SumExcluding {
-        source: StreamNode,
-        excluded: KeySetNode,
-    },
-
-    // Kept for: potential optimization — fuse inclusion into the scalar sum traversal
-    // instead of building a separate SemiJoin stream node.
-    #[expect(dead_code)]
-    /// Reduce a stream with inclusion: `Σ_{k ∈ filter} count(k)`.
-    /// `source` and `filter` must share the same key domain.
-    SumFiltered {
-        source: StreamNode,
-        filter: KeySetNode,
-    },
-
     /// Count rows from POST(pred) grouped by object, summing only objects in the filter set.
     /// Maps to: `sum_post_object_counts_filtered`
     /// Used for: EXISTS on outer triple's object variable.

@@ -24,8 +24,8 @@ use crate::fast_path_common::{
     count_rows_for_predicate_psot, cursor_projection_otype_okey, cursor_projection_sid_only,
     cursor_projection_sid_otype_okey, intersect_many_sorted, leaf_entries_for_predicate,
     normalize_pred_sid, projection_sid_otype_okey, sum_post_object_counts_filtered,
-    FastPathOperator, ObjectFilterMode, PostObjectGroupCountIter, PsotObjectFilterCountIter,
-    PsotSubjectCountIter, PsotSubjectWeightedSumIter,
+    CursorSubjectCountStream, FastPathOperator, ObjectFilterMode, PostObjectGroupCountIter,
+    PsotObjectFilterCountIter, PsotSubjectCountIter, PsotSubjectWeightedSumIter,
 };
 use crate::ir::triple::Ref;
 use crate::operator::BoxedOperator;
@@ -136,9 +136,9 @@ fn execute_plan(root: &CountPlanRoot, ec: &ExecCtx<'_, '_>) -> Result<Option<u64
 ///
 /// When false and an overlay/time-travel lane is required, the executor bails
 /// to the generic fallback (correct, just not metadata-fast) rather than
-/// reading stale base-only counts. All `CountPlan` node types now have an
-/// overlay lane; the dead `SumExcluding`/`SumFiltered` scalar variants (never
-/// built by the planner) are the only structural holdouts.
+/// reading stale base-only counts. Every `CountPlan` node type has an overlay
+/// lane, so this only returns false when a nested keyset is object-keyed in a
+/// way not yet covered — currently never, in practice.
 fn plan_overlay_supported(root: &CountPlanRoot) -> bool {
     match root {
         CountPlanRoot::Scalar(s) => scalar_overlay_supported(s),
@@ -158,8 +158,6 @@ fn scalar_overlay_supported(node: &ScalarNode) -> bool {
         ScalarNode::TotalMinusPostObjectFilteredSum {
             excluded_objects, ..
         } => keyset_overlay_supported(excluded_objects),
-        // Dead variants (never built by the planner); keep bailing.
-        ScalarNode::SumExcluding { .. } | ScalarNode::SumFiltered { .. } => false,
     }
 }
 
@@ -201,8 +199,8 @@ enum SubjectGroups<'a> {
     Empty,
     /// Base-leaflet metadata lane.
     Meta(PsotSubjectCountIter<'a>),
-    /// Overlay-merging PSOT cursor lane.
-    Cursor(CursorSubjectGroups),
+    /// Overlay-merging PSOT cursor lane (shared `CursorSubjectCountStream`).
+    Cursor(CursorSubjectCountStream),
 }
 
 impl SubjectGroups<'_> {
@@ -211,70 +209,6 @@ impl SubjectGroups<'_> {
             SubjectGroups::Empty => Ok(None),
             SubjectGroups::Meta(it) => it.next_group(),
             SubjectGroups::Cursor(c) => c.next_group(),
-        }
-    }
-}
-
-/// Streams `(s_id, edge_count)` groups from an overlay-merged PSOT cursor.
-///
-/// Mirrors `SubjectCountStreamV6` in `fast_union_star_count_all`; kept local to
-/// the count-plan overlay lane. The cursor yields rows in PSOT order, so a
-/// running group-by on `s_id` produces the same `(subject, count)` pairs that
-/// `PsotSubjectCountIter` derives from leaflet metadata — but over the
-/// novelty-merged row stream.
-struct CursorSubjectGroups {
-    cursor: BinaryCursor,
-    current: Option<fluree_db_binary_index::ColumnBatch>,
-    row: usize,
-    cur_s: Option<u64>,
-    cur_count: u64,
-}
-
-impl CursorSubjectGroups {
-    fn new(cursor: BinaryCursor) -> Self {
-        Self {
-            cursor,
-            current: None,
-            row: 0,
-            cur_s: None,
-            cur_count: 0,
-        }
-    }
-
-    fn next_group(&mut self) -> Result<Option<(u64, u64)>> {
-        loop {
-            if self.current.is_none() {
-                self.current = self
-                    .cursor
-                    .next_batch()
-                    .map_err(|e| QueryError::Internal(format!("count-plan cursor batch: {e}")))?;
-                self.row = 0;
-                if self.current.is_none() {
-                    if let Some(s) = self.cur_s.take() {
-                        let n = std::mem::take(&mut self.cur_count);
-                        return Ok(Some((s, n)));
-                    }
-                    return Ok(None);
-                }
-            }
-
-            let batch = self.current.as_ref().unwrap();
-            if self.row >= batch.row_count {
-                self.current = None;
-                continue;
-            }
-            let s = batch.s_id.get(self.row);
-            if self.cur_s.is_none() {
-                self.cur_s = Some(s);
-                self.cur_count = 0;
-            } else if self.cur_s != Some(s) {
-                let out_s = self.cur_s.replace(s).unwrap();
-                let out_n = std::mem::replace(&mut self.cur_count, 0);
-                // Don't advance row; reprocess it into the new group.
-                return Ok(Some((out_s, out_n)));
-            }
-            self.cur_count += 1;
-            self.row += 1;
         }
     }
 }
@@ -309,7 +243,7 @@ fn subject_groups<'a>(ec: &ExecCtx<'a, '_>, pred: &Ref) -> Result<Option<Subject
         else {
             return Ok(None);
         };
-        Ok(Some(SubjectGroups::Cursor(CursorSubjectGroups::new(
+        Ok(Some(SubjectGroups::Cursor(CursorSubjectCountStream::new(
             cursor,
         ))))
     } else {
@@ -513,24 +447,6 @@ fn execute_scalar(node: &ScalarNode, ec: &ExecCtx<'_, '_>) -> Result<Option<u64>
         }
 
         ScalarNode::Sum { source } => sum_stream(source, ec, None, None),
-
-        ScalarNode::SumExcluding { source, excluded } => {
-            let exclude_sorted = execute_keyset_as_sorted(excluded, ec)?;
-            let exclude_sorted = match exclude_sorted {
-                Some(s) => s,
-                None => return Ok(None),
-            };
-            sum_stream(source, ec, Some(&exclude_sorted), None)
-        }
-
-        ScalarNode::SumFiltered { source, filter } => {
-            let filter_sorted = execute_keyset_as_sorted(filter, ec)?;
-            let filter_sorted = match filter_sorted {
-                Some(s) => s,
-                None => return Ok(None),
-            };
-            sum_stream(source, ec, None, Some(&filter_sorted))
-        }
 
         ScalarNode::PostObjectFilteredSum {
             pred,

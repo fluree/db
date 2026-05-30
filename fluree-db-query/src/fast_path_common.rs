@@ -1569,6 +1569,74 @@ pub fn build_post_cursor_for_predicate(
     )
 }
 
+/// Streams `(s_id, edge_count)` groups from an overlay-merging PSOT cursor.
+///
+/// The cursor yields rows in PSOT order, so a running group-by on `s_id`
+/// produces the same `(subject, count)` pairs that the metadata
+/// [`PsotSubjectCountIter`] derives from leaflet headers — but over the
+/// novelty-merged row stream. Shared by `fast_union_star_count_all` and the
+/// `count_plan_exec` overlay lane.
+///
+/// Use `cursor_projection_sid_only()` (or any projection that includes `s_id`)
+/// when building the cursor.
+pub struct CursorSubjectCountStream {
+    cursor: BinaryCursor,
+    current: Option<ColumnBatch>,
+    row: usize,
+    cur_s: Option<u64>,
+    cur_count: u64,
+}
+
+impl CursorSubjectCountStream {
+    pub fn new(cursor: BinaryCursor) -> Self {
+        Self {
+            cursor,
+            current: None,
+            row: 0,
+            cur_s: None,
+            cur_count: 0,
+        }
+    }
+
+    /// Next `(subject_id, row_count)` group, or `None` when exhausted.
+    pub fn next_group(&mut self) -> Result<Option<(u64, u64)>> {
+        loop {
+            if self.current.is_none() {
+                self.current = self
+                    .cursor
+                    .next_batch()
+                    .map_err(|e| QueryError::Internal(format!("cursor batch: {e}")))?;
+                self.row = 0;
+                if self.current.is_none() {
+                    if let Some(s) = self.cur_s.take() {
+                        let n = std::mem::take(&mut self.cur_count);
+                        return Ok(Some((s, n)));
+                    }
+                    return Ok(None);
+                }
+            }
+
+            let batch = self.current.as_ref().unwrap();
+            if self.row >= batch.row_count {
+                self.current = None;
+                continue;
+            }
+            let s = batch.s_id.get(self.row);
+            if self.cur_s.is_none() {
+                self.cur_s = Some(s);
+                self.cur_count = 0;
+            } else if self.cur_s != Some(s) {
+                let out_s = self.cur_s.replace(s).unwrap();
+                let out_n = std::mem::replace(&mut self.cur_count, 0);
+                // Don't advance row; reprocess it into the new group.
+                return Ok(Some((out_s, out_n)));
+            }
+            self.cur_count += 1;
+            self.row += 1;
+        }
+    }
+}
+
 /// Resolve a bound `Ref` (Iri or Sid) to its internal `s_id` (u64).
 ///
 /// Returns `Ok(None)` for `Ref::Var` or if the subject is not found in the store.
