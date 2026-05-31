@@ -39,6 +39,7 @@ impl<'a> Lexer<'a> {
     /// Returns an error immediately on the first invalid token, providing
     /// a clear error message with line/column and source context.
     pub fn tokenize(self) -> Result<Vec<Token>> {
+        crate::error::check_input_len(self.input.len())?;
         let mut tokens = Vec::new();
         let mut input = LocatingSlice::new(self.input);
 

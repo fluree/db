@@ -1465,3 +1465,55 @@ async fn import_gzipped_ttl_streaming_split() {
     assert!(objs.contains(&"name-0".to_string()));
     assert!(objs.contains(&"name-39999".to_string()));
 }
+
+#[tokio::test]
+async fn import_nt_streaming_split() {
+    // Force a large *plain* `.nt` file through the streaming-split path (the
+    // path that overflowed u32 token offsets on >4 GiB inputs). We can't write
+    // 4 GiB in a test, but a chunk_size_mb(1) threshold over a multi-MB file
+    // exercises the same StreamingTurtleReader chunking and per-chunk parse the
+    // big file uses, with every offset relative to a small per-chunk string.
+    let db_dir = tempfile::tempdir().expect("db tmpdir");
+    let data_dir = tempfile::tempdir().expect("data tmpdir");
+
+    // ~5 MB of N-Triples: full IRIs, one triple per line, no prelude.
+    let mut nt = String::new();
+    for i in 0..40_000 {
+        use std::fmt::Write as _;
+        writeln!(
+            nt,
+            "<http://example.org/ns/s{i}> <http://schema.org/name> \"name-{i}\" ."
+        )
+        .unwrap();
+    }
+    let nt_path = write_data(data_dir.path(), "big.nt", &nt);
+
+    let fluree = FlureeBuilder::file(db_dir.path().to_string_lossy().to_string())
+        .build()
+        .expect("build");
+
+    let result = fluree
+        .create("test/nt-stream:main")
+        .import(&nt_path)
+        .threads(2)
+        .chunk_size_mb(1)
+        .memory_budget_mb(256)
+        .cleanup(false)
+        .execute()
+        .await
+        .expect("streaming .nt import should succeed");
+    assert!(result.flake_count as usize >= 40_000);
+
+    let ledger = fluree.ledger("test/nt-stream:main").await.expect("load");
+    let qr = support::query_jsonld(
+        &fluree,
+        &ledger,
+        &json!({"select": ["?s", "?p", "?o"], "where": {"@id": "?s", "?p": "?o"}}),
+    )
+    .await
+    .expect("query");
+    let objs = extract_nth_column(&qr.to_jsonld(&ledger.snapshot).unwrap(), 2);
+    // Boundary values across the chunk splits must all be queryable post-index.
+    assert!(objs.contains(&"name-0".to_string()));
+    assert!(objs.contains(&"name-39999".to_string()));
+}
