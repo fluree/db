@@ -207,8 +207,10 @@ pub enum Commands {
         ledger: String,
 
         /// Import data from a file or directory.
-        /// Accepts a single .ttl, .nt, .json, or .jsonld file, or a directory of
-        /// .ttl/.nt/.trig or .jsonld files (bulk import, bypasses novelty).
+        /// Accepts a single .ttl, .nt, .nq, .json, or .jsonld file, or a directory
+        /// of .ttl/.nt/.nq/.trig or .jsonld files (bulk import, bypasses novelty).
+        /// Any of these may carry a `.gz` or `.zst` suffix and is decoded
+        /// transparently (e.g. `data.ttl.gz`, `dump.nq.zst`).
         /// Files in a directory are processed in lexicographic order.
         #[arg(long)]
         from: Option<PathBuf>,

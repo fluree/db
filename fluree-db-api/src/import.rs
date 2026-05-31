@@ -515,6 +515,7 @@ pub(crate) enum ImportSource {
 pub(crate) enum RemoteFormat {
     Ttl,
     Trig,
+    Nquads,
     JsonLd,
 }
 
@@ -610,7 +611,9 @@ impl ChunkSource {
     /// Panics if called on `Streaming`/`Remote` — use `recv_next` instead.
     pub fn read_chunk(&self, index: usize) -> std::io::Result<String> {
         match self {
-            Self::Files(files) => std::fs::read_to_string(&files[index]),
+            // Transparently decodes `.gz` / `.zst` wrappers; plain files use
+            // the original `read_to_string` fast path inside `read_decoded_to_string`.
+            Self::Files(files) => read_decoded_to_string(&files[index]),
             Self::Streaming(_) | Self::Remote(_) => {
                 panic!("read_chunk not supported for channel-fed source; use recv_next")
             }
@@ -648,27 +651,55 @@ impl ChunkSource {
         }
     }
 
-    /// Whether chunk at `index` is a TriG file (case-insensitive).
+    /// Whether chunk at `index` is a TriG file (case-insensitive), including
+    /// compressed variants (`.trig.gz`, `.trig.zst`).
     pub fn is_trig(&self, index: usize) -> bool {
         match self {
             Self::Files(files) => files
                 .get(index)
-                .and_then(|p| p.extension())
-                .and_then(|ext| ext.to_str())
-                .is_some_and(|ext| ext.eq_ignore_ascii_case("trig")),
+                .is_some_and(|p| effective_extension(p).0.as_deref() == Some("trig")),
             Self::Streaming(_) => false, // Streaming is Turtle only.
             Self::Remote(producer) => matches!(producer.format_at(index), Some(RemoteFormat::Trig)),
         }
     }
 
-    /// Whether chunk at `index` is a JSON-LD file (case-insensitive `.jsonld`).
+    /// Whether chunk at `index` is an N-Quads file (`.nq`, also compressed).
+    ///
+    /// N-Quads is converted to TriG and dispatched through the same serial
+    /// `import_trig_commit` path, so it is handled wherever `is_trig` is.
+    pub fn is_nquads(&self, index: usize) -> bool {
+        match self {
+            Self::Files(files) => files
+                .get(index)
+                .is_some_and(|p| effective_extension(p).0.as_deref() == Some("nq")),
+            Self::Streaming(_) => false, // Streaming is Turtle only.
+            Self::Remote(producer) => {
+                matches!(producer.format_at(index), Some(RemoteFormat::Nquads))
+            }
+        }
+    }
+
+    /// Whether any chunk is N-Quads. Used to force serial import — the parallel
+    /// pipeline only handles plain Turtle.
+    pub fn has_nquads(&self) -> bool {
+        match self {
+            Self::Files(files) => files
+                .iter()
+                .any(|p| effective_extension(p).0.as_deref() == Some("nq")),
+            Self::Streaming(_) => false,
+            Self::Remote(producer) => producer
+                .per_chunk_format
+                .iter()
+                .any(|f| matches!(f, RemoteFormat::Nquads)),
+        }
+    }
+
+    /// Whether chunk at `index` is a JSON-LD file (`.jsonld`, also compressed).
     pub fn is_jsonld(&self, index: usize) -> bool {
         match self {
             Self::Files(files) => files
                 .get(index)
-                .and_then(|p| p.extension())
-                .and_then(|ext| ext.to_str())
-                .is_some_and(|ext| ext.eq_ignore_ascii_case("jsonld")),
+                .is_some_and(|p| effective_extension(p).0.as_deref() == Some("jsonld")),
             Self::Streaming(_) => false,
             Self::Remote(producer) => {
                 matches!(producer.format_at(index), Some(RemoteFormat::JsonLd))
@@ -681,22 +712,101 @@ impl ChunkSource {
     /// Used to force serial import — the parallel pipeline only handles Turtle.
     pub fn has_jsonld(&self) -> bool {
         match self {
-            Self::Files(files) => files.iter().any(|p| {
-                p.extension()
-                    .and_then(|ext| ext.to_str())
-                    .is_some_and(|ext| ext.eq_ignore_ascii_case("jsonld"))
-            }),
+            Self::Files(files) => files
+                .iter()
+                .any(|p| effective_extension(p).0.as_deref() == Some("jsonld")),
             Self::Streaming(_) => false,
             Self::Remote(producer) => producer.has_jsonld(),
         }
     }
 }
 
+// ============================================================================
+// Compression: transparent gzip / zstd support for any RDF input format
+// ============================================================================
+
+/// Optional outer-extension compression layer detected on an input file.
+///
+/// `data.ttl.gz` → `Gzip`; `data.nq.zst` → `Zstd`; `data.ttl` → `None`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Compression {
+    None,
+    Gzip,
+    Zstd,
+}
+
+/// Return the underlying RDF extension (lowercased) after stripping any
+/// outer `.gz`/`.zst`/`.zstd`, along with the detected compression layer.
+///
+/// Examples:
+/// - `foo.ttl.gz`  → `(Some("ttl"), Gzip)`
+/// - `foo.nq.zst`  → `(Some("nq"),  Zstd)`
+/// - `foo.ttl`     → `(Some("ttl"), None)`
+/// - `foo.gz`      → `(None,        Gzip)` (caller will reject — no RDF ext)
+/// - `foo`         → `(None,        None)`
+pub(crate) fn effective_extension(path: &Path) -> (Option<String>, Compression) {
+    let outer = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(str::to_ascii_lowercase);
+    let comp = match outer.as_deref() {
+        Some("gz") => Compression::Gzip,
+        Some("zst" | "zstd") => Compression::Zstd,
+        _ => return (outer, Compression::None),
+    };
+    let inner = path
+        .file_stem()
+        .map(Path::new)
+        .and_then(|p| p.extension())
+        .and_then(|e| e.to_str())
+        .map(str::to_ascii_lowercase);
+    (inner, comp)
+}
+
+/// Open `path` as a buffered byte stream, transparently decoding `.gz` / `.zst`.
+///
+/// Gzip uses `MultiGzDecoder` (handles concatenated streams from `pigz` /
+/// `bgzip`). The outer `BufReader` is sized to match the splitter's scan
+/// buffer for cache-friendly chunked reads.
+fn open_decoded(path: &Path) -> std::io::Result<Box<dyn std::io::BufRead + Send>> {
+    let file = std::fs::File::open(path)?;
+    let (_, comp) = effective_extension(path);
+    const BUF: usize = 256 * 1024;
+    let reader: Box<dyn std::io::BufRead + Send> = match comp {
+        Compression::None => Box::new(std::io::BufReader::with_capacity(BUF, file)),
+        Compression::Gzip => Box::new(std::io::BufReader::with_capacity(
+            BUF,
+            flate2::read::MultiGzDecoder::new(file),
+        )),
+        Compression::Zstd => Box::new(std::io::BufReader::with_capacity(
+            BUF,
+            zstd::stream::read::Decoder::new(file)?,
+        )),
+    };
+    Ok(reader)
+}
+
+/// Read the entire (possibly-compressed) file into a `String`.
+///
+/// Used by the small-file `Files` path. For plain inputs this is just
+/// `std::fs::read_to_string`; compressed inputs stream through the decoder.
+fn read_decoded_to_string(path: &Path) -> std::io::Result<String> {
+    let (_, comp) = effective_extension(path);
+    if matches!(comp, Compression::None) {
+        return std::fs::read_to_string(path);
+    }
+    let mut reader = open_decoded(path)?;
+    let mut s = String::new();
+    std::io::Read::read_to_string(&mut reader, &mut s)?;
+    Ok(s)
+}
+
 /// Resolve the import path into a `ChunkSource`.
 ///
-/// - If `path` is a directory: discover `.ttl`/`.nt`/`.trig`/`.jsonld` files (sorted lexicographically).
+/// - If `path` is a directory: discover `.ttl`/`.nt`/`.nq`/`.trig`/`.jsonld` files (sorted lexicographically).
 /// - If `path` is a single large `.ttl` file: auto-split using `TurtleChunkReader`.
-/// - If `path` is a single small `.ttl`/`.nt`/`.trig`/`.jsonld` file: treat as a single-element `Files` source.
+/// - If `path` is a single small `.ttl`/`.nt`/`.nq`/`.trig`/`.jsonld` file: treat as a single-element `Files` source.
+/// - All extensions above also accept `.gz` and `.zst` suffixes (e.g. `data.ttl.gz`).
 fn resolve_chunk_source(
     path: &Path,
     config: &ImportConfig,
@@ -714,15 +824,20 @@ fn resolve_chunk_source(
     }
 
     // Single file — decide whether to auto-split based on size.
+    //
+    // For a compressed file, `metadata().len()` reports the *compressed* size,
+    // which is what we want for the parallel-split threshold (a 200 MB .gz
+    // expanding to 2 GB still warrants streaming). The uncompressed size is
+    // unknown ahead of time; the streaming reader treats `0` as "unknown" for
+    // its progress denominator.
     let file_size = std::fs::metadata(path)?.len();
     let chunk_size_bytes = config.effective_chunk_size_mb() as u64 * 1024 * 1024;
 
     // `.nt` (N-Triples) is a strict subset of Turtle, so it streams/splits
-    // through the same triple-boundary reader as `.ttl`.
-    let is_ttl = path
-        .extension()
-        .and_then(|ext| ext.to_str())
-        .is_some_and(|ext| ext.eq_ignore_ascii_case("ttl") || ext.eq_ignore_ascii_case("nt"));
+    // through the same triple-boundary reader as `.ttl`. `.ttl.gz` / `.nt.gz`
+    // and the `.zst` variants stream too — via the new factory constructor.
+    let (inner_ext, compression) = effective_extension(path);
+    let is_ttl = matches!(inner_ext.as_deref(), Some("ttl" | "nt"));
 
     if is_ttl && file_size > chunk_size_bytes {
         // Large file: stream chunks via background reader thread.
@@ -747,22 +862,42 @@ fn resolve_chunk_source(
                 f
             });
 
-        let reader = fluree_graph_turtle::splitter::StreamingTurtleReader::new(
-            path,
-            chunk_size_bytes,
-            reader_channel_capacity,
-            scan_progress,
-        )
-        .map_err(|e| ImportError::NoChunks(format!("turtle file split failed: {e}")))?;
+        let reader = if matches!(compression, Compression::None) {
+            // Plain file: original seek-backed fast path.
+            fluree_graph_turtle::splitter::StreamingTurtleReader::new(
+                path,
+                chunk_size_bytes,
+                reader_channel_capacity,
+                scan_progress,
+            )
+            .map_err(|e| ImportError::NoChunks(format!("turtle file split failed: {e}")))?
+        } else {
+            // Compressed file: hand the splitter a factory that opens a fresh
+            // decoder on demand. Uncompressed size is unknown — pass 0 so
+            // the splitter omits a percentage denominator (estimated_chunks
+            // will be 0, which is fine for serial-equivalent throughput).
+            let path_owned = path.to_path_buf();
+            let factory = move || open_decoded(&path_owned);
+            fluree_graph_turtle::splitter::StreamingTurtleReader::new_from_factory(
+                factory,
+                0,
+                chunk_size_bytes,
+                reader_channel_capacity,
+                scan_progress,
+            )
+            .map_err(|e| ImportError::NoChunks(format!("compressed turtle split failed: {e}")))?
+        };
         tracing::info!(
             estimated_chunks = reader.estimated_chunk_count(),
             chunk_size_mb = config.effective_chunk_size_mb(),
             file_size_mb = file_size / (1024 * 1024),
+            compression = ?compression,
             "streaming large Turtle file (no pre-scan)"
         );
         Ok(ChunkSource::Streaming(reader))
     } else {
-        // Small file or non-TTL: treat as a single-element source.
+        // Small file or non-TTL: treat as a single-element source. The Files
+        // variant's `read_chunk` transparently decodes `.gz` / `.zst`.
         Ok(ChunkSource::Files(vec![path.to_path_buf()]))
     }
 }
@@ -825,6 +960,12 @@ async fn resolve_remote_objects(
                 accepted.push(obj);
                 extensions.push(RemoteFormat::Trig);
             }
+            // N-Quads → converted to TriG and dispatched via the serial path.
+            Some("nq") => {
+                has_trig = true;
+                accepted.push(obj);
+                extensions.push(RemoteFormat::Nquads);
+            }
             Some("jsonld") => {
                 has_jsonld = true;
                 accepted.push(obj);
@@ -847,26 +988,15 @@ async fn resolve_remote_objects(
 
     if accepted.is_empty() {
         return Err(ImportError::NoChunks(
-            "remote source contains no .ttl/.nt/.trig/.jsonld objects".into(),
+            "remote source contains no .ttl/.nt/.nq/.trig/.jsonld objects".into(),
         ));
     }
 
-    // `.trig` import is wired through the same serial path the local
-    // `.import(dir)` uses, but that path has a documented upstream limitation
-    // in `import_trig_commit` (fluree-db-transact/src/import.rs): the Tier 2
-    // spool/index pipeline does not fully capture TriG content. Imported TriG
-    // data may not become queryable. Fail loud rather than silently producing
-    // a half-imported ledger.
-    if has_trig {
-        return Err(ImportError::NoChunks(
-            "remote .trig import is not currently supported: the Tier 2 import \
-             pipeline does not fully capture named-graph or default-graph TriG \
-             content, so imported data may not become queryable. Convert TriG \
-             to .ttl or .jsonld before import. See `import_trig_commit` in \
-             fluree-db-transact/src/import.rs for context."
-                .into(),
-        ));
-    }
+    // `.trig` import (including named GRAPH blocks) is fully supported: it runs
+    // through the same serial `import_trig_commit` path the local `.import(dir)`
+    // uses. Default-graph and named-graph flakes are both spooled and indexed,
+    // and named graphs are queryable via the `#<graph-iri>` fragment. See the
+    // named-graph spool wiring in `import_trig_commit` (fluree-db-transact).
 
     Ok((accepted, extensions))
 }
@@ -1146,7 +1276,7 @@ impl<'a> CreateBuilder<'a> {
 
     /// Attach a bulk import to this create operation.
     ///
-    /// `path` can be a directory containing `.ttl`/`.nt`/`.trig`/`.jsonld` files
+    /// `path` can be a directory containing `.ttl`/`.nt`/`.nq`/`.trig`/`.jsonld` files
     /// (sorted lexicographically), or a single `.ttl`/`.jsonld` file.
     pub fn import(self, path: impl AsRef<Path>) -> ImportBuilder<'a> {
         ImportBuilder::new(self.fluree, self.ledger_id, path.as_ref().to_path_buf())
@@ -1189,7 +1319,7 @@ impl<'a> CreateBuilder<'a> {
 /// What kind of data files a directory contains.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DirectoryFormat {
-    /// Only `.ttl` / `.nt` / `.trig` files found.
+    /// Only `.ttl` / `.nt` / `.nq` / `.trig` files found.
     Turtle,
     /// Only `.jsonld` files found.
     JsonLd,
@@ -1197,7 +1327,7 @@ pub enum DirectoryFormat {
 
 /// Scan a directory and determine its data format.
 ///
-/// Returns [`DirectoryFormat::Turtle`] if all supported files are `.ttl`/`.nt`/`.trig`,
+/// Returns [`DirectoryFormat::Turtle`] if all supported files are `.ttl`/`.nt`/`.nq`/`.trig`,
 /// [`DirectoryFormat::JsonLd`] if all are `.jsonld`.
 /// Returns [`ImportError::MixedFormats`] on mixed formats,
 /// [`ImportError::NoChunks`] on empty directories or directories with no supported files.
@@ -1213,12 +1343,13 @@ pub fn scan_directory_format(dir: &Path) -> std::result::Result<DirectoryFormat,
         if !entry.file_type().is_ok_and(|ft| ft.is_file()) {
             continue;
         }
-        if let Some(ext) = entry.path().extension().and_then(|e| e.to_str()) {
-            match ext.to_ascii_lowercase().as_str() {
-                "ttl" | "trig" | "nt" => has_turtle = true,
-                "jsonld" => has_jsonld = true,
-                _ => {}
-            }
+        // `effective_extension` strips an outer `.gz`/`.zst` so compressed
+        // RDF files (`foo.ttl.gz`, `foo.nq.zst`, …) classify identically.
+        let inner = effective_extension(&entry.path()).0;
+        match inner.as_deref() {
+            Some("ttl" | "trig" | "nt" | "nq") => has_turtle = true,
+            Some("jsonld") => has_jsonld = true,
+            _ => {}
         }
     }
 
@@ -1231,7 +1362,7 @@ pub fn scan_directory_format(dir: &Path) -> std::result::Result<DirectoryFormat,
         (true, false) => Ok(DirectoryFormat::Turtle),
         (false, true) => Ok(DirectoryFormat::JsonLd),
         (false, false) => Err(ImportError::NoChunks(format!(
-            "no supported data files (.ttl, .nt, .trig, .jsonld) found in {}",
+            "no supported data files (.ttl, .nt, .nq, .trig, .jsonld) found in {}",
             dir.display()
         ))),
     }
@@ -1241,7 +1372,7 @@ pub fn scan_directory_format(dir: &Path) -> std::result::Result<DirectoryFormat,
 // Chunk discovery
 // ============================================================================
 
-/// Discover and sort `.ttl`, `.nt`, `.trig`, or `.jsonld` files from a directory (case-insensitive).
+/// Discover and sort `.ttl`, `.nt`, `.nq`, `.trig`, or `.jsonld` files from a directory (case-insensitive).
 ///
 /// Returns an error if the directory contains a mix of Turtle (`.ttl`/`.trig`) and
 /// JSON-LD (`.jsonld`) files — all files must be the same format family.
@@ -1264,15 +1395,13 @@ fn discover_chunks(dir: &Path) -> std::result::Result<Vec<PathBuf>, ImportError>
         .filter_map(std::result::Result::ok)
         .filter(|e| e.file_type().is_ok_and(|ft| ft.is_file()))
         .map(|e| e.path())
+        // `effective_extension` strips compression suffixes, so `.ttl.gz`,
+        // `.nq.zst`, etc. are accepted alongside their plain counterparts.
         .filter(|p| {
-            p.extension()
-                .and_then(|ext| ext.to_str())
-                .is_some_and(|ext| {
-                    ext.eq_ignore_ascii_case("ttl")
-                        || ext.eq_ignore_ascii_case("nt")
-                        || ext.eq_ignore_ascii_case("trig")
-                        || ext.eq_ignore_ascii_case("jsonld")
-                })
+            matches!(
+                effective_extension(p).0.as_deref(),
+                Some("ttl" | "nt" | "trig" | "nq" | "jsonld")
+            )
         })
         .collect();
 
@@ -1519,6 +1648,9 @@ struct IndexBuildInput<'a> {
     collect_id_stats: bool,
     /// Turtle @prefix IRI → short prefix name, for IRI compaction in display.
     prefix_map: &'a HashMap<String, String>,
+    /// User-defined named graph g_ids (>= 2) to build index segments for.
+    /// Empty for single-graph imports.
+    named_g_ids: Vec<u16>,
 }
 
 /// Run phases 2-6: import chunks, build indexes, upload to CAS, write V4 root, publish.
@@ -1576,6 +1708,7 @@ where
             rdf_type_p_id: import_result.rdf_type_p_id,
             collect_id_stats: config.collect_id_stats,
             prefix_map: &import_result.prefix_map,
+            named_g_ids: import_result.named_g_ids,
         };
         let index_result = build_and_upload(
             storage,
@@ -1680,6 +1813,9 @@ struct ChunkImportResult {
     dt_width: u8,
     /// Predicate ID for rdf:type (for inline class stats during SPOT merge).
     rdf_type_p_id: u32,
+    /// User-defined named graph g_ids (>= 2) to build index segments for.
+    /// Empty for single-graph imports.
+    named_g_ids: Vec<u16>,
 }
 
 /// Import all TTL chunks: parallel parse + serial commit + streaming runs.
@@ -2471,10 +2607,19 @@ where
                 .map_err(|e| ImportError::Transact(format!("chunk {idx} invalid UTF-8: {e}")))?;
             let t = (idx + 1) as i64;
 
-            let result = if chunk_source.is_trig(idx) {
+            let result = if chunk_source.is_trig(idx) || chunk_source.is_nquads(idx) {
+                // N-Quads is converted to TriG up front; TriG passes through.
+                let nq_converted;
+                let trig_content: &str = if chunk_source.is_nquads(idx) {
+                    nq_converted = fluree_db_transact::parse::nquads_to_trig(&content)
+                        .map_err(|e| ImportError::Transact(e.to_string()))?;
+                    &nq_converted
+                } else {
+                    &content
+                };
                 let r = import_trig_commit(
                     &mut state,
-                    &content,
+                    trig_content,
                     storage,
                     alias,
                     compress,
@@ -2587,9 +2732,11 @@ where
         );
     } else {
         // File-based path: index-based access to chunk files.
+        // TriG and N-Quads (converted to TriG) both use the serial path.
         let has_trig = (0..estimated_total).any(|i| chunk_source.is_trig(i));
+        let has_nquads = chunk_source.has_nquads();
         let has_jsonld = chunk_source.has_jsonld();
-        if estimated_total > 0 && num_threads > 0 && !has_trig && !has_jsonld {
+        if estimated_total > 0 && num_threads > 0 && !has_trig && !has_nquads && !has_jsonld {
             let ledger = alias.to_string();
 
             let next_chunk = Arc::new(AtomicUsize::new(0));
@@ -2697,13 +2844,22 @@ where
                 let content = chunk_source.read_chunk(i)?;
                 let t = (i + 1) as i64;
 
-                let result = if chunk_source.is_trig(i) {
-                    // TriG uses its own commit function (named graph handling).
-                    // It allocates codes in state.ns_registry; sync them to
-                    // shared_alloc afterward for subsequent chunks' spool writes.
+                let result = if chunk_source.is_trig(i) || chunk_source.is_nquads(i) {
+                    // TriG (and N-Quads, converted to TriG) use the dedicated
+                    // commit function for named-graph handling. It allocates
+                    // codes in state.ns_registry; sync them to shared_alloc
+                    // afterward for subsequent chunks' spool writes.
+                    let nq_converted;
+                    let trig_content: &str = if chunk_source.is_nquads(i) {
+                        nq_converted = fluree_db_transact::parse::nquads_to_trig(&content)
+                            .map_err(|e| ImportError::Transact(e.to_string()))?;
+                        &nq_converted
+                    } else {
+                        &content
+                    };
                     let r = import_trig_commit(
                         &mut state,
-                        &content,
+                        trig_content,
                         storage,
                         alias,
                         compress,
@@ -3249,6 +3405,21 @@ where
         write_predicate_dict(&run_dir.join("datatypes.dict"), &datatypes_dict)?;
     }
 
+    // User-defined named graphs to build index segments for. Allocator
+    // convention is `graph dict_id + 1 = g_id`; the graph allocator is always
+    // seeded with txn-meta (g_id 1) and config (g_id 2), so user graphs occupy
+    // g_ids `FIRST_USER_GRAPH_ID..=graph_count` (g_id 3+). This is EMPTY for
+    // single-graph imports (graph_count == 2), so the named-graph build loop is
+    // skipped entirely and the optimized default-graph path pays nothing. g_id 1
+    // (txn-meta) is built separately; g_id 2 (config) is not populated by bulk
+    // RDF import.
+    let v3_named_g_ids: Vec<u16> = {
+        let graph_count = spool_config.graph_alloc.len();
+        (u32::from(fluree_db_core::graph_registry::FIRST_USER_GRAPH_ID)..=graph_count)
+            .map(|g| g as u16)
+            .collect()
+    };
+
     // Persist namespaces.json from shared allocator.
     persist_namespaces(namespace_codes.as_ref(), run_dir)?;
 
@@ -3377,6 +3548,7 @@ where
         p_width,
         dt_width,
         rdf_type_p_id,
+        named_g_ids: v3_named_g_ids,
     })
 }
 
@@ -3484,6 +3656,7 @@ where
         let v3_remap_counter = remap_counter.clone();
         let v3_build_counter = build_counter.clone();
         let v3_stage_marker = stage_marker.clone();
+        let v3_named_g_ids = input.named_g_ids;
 
         config.emit_progress(ImportPhase::PreparingIndex {
             stage: "Generating per-order runs",
@@ -3591,7 +3764,7 @@ where
                 let g1_result = if let Some(meta_commit) = commits.last() {
                     let cfg_g1 = fluree_db_indexer::BuildConfig {
                         run_dir: v3_runs_g1,
-                        index_dir: v3_index_dir,
+                        index_dir: v3_index_dir.clone(),
                         g_id: 1,
                         leaflet_target_rows: v3_leaflet_target_rows,
                         leaf_target_rows: v3_leaf_target_rows,
@@ -3616,6 +3789,39 @@ where
                 } else {
                     None
                 };
+
+                // Build index segments for each user-defined named graph
+                // (g_id >= 2). Each is a separate pass over the commit blobs
+                // filtered to its g_id, mirroring the g_id=1 (txn-meta) build.
+                // Empty for single-graph imports — zero cost on that hot path.
+                // Done before stats finalize so named-graph flakes contribute
+                // to the shared IdStatsHook (per-graph stats).
+                let mut v3_named_results: Vec<fluree_db_indexer::BuildResult> = Vec::new();
+                for &ng_id in &v3_named_g_ids {
+                    let cfg_ng = fluree_db_indexer::BuildConfig {
+                        run_dir: v3_run_dir.join(format!("v3_runs_g{ng_id}")),
+                        index_dir: v3_index_dir.clone(),
+                        g_id: ng_id,
+                        leaflet_target_rows: v3_leaflet_target_rows,
+                        leaf_target_rows: v3_leaf_target_rows,
+                        zstd_level: 1,
+                        run_budget_bytes: v3_run_budget,
+                        worker_count: 1,
+                        remap_progress: None,
+                        build_progress: None,
+                        stage_marker: None,
+                    };
+                    std::fs::create_dir_all(&cfg_ng.run_dir)
+                        .map_err(|e| ImportError::IndexBuild(e.to_string()))?;
+
+                    let (ng_result, _) = fluree_db_indexer::build_indexes_from_commits(
+                        &commits,
+                        &cfg_ng,
+                        stats_hook.as_mut(),
+                    )
+                    .map_err(|e| ImportError::IndexBuild(e.to_string()))?;
+                    v3_named_results.push(ng_result);
+                }
 
                 let stats_output = stats_hook.map(|h| {
                     let stats_finalize_start = Instant::now();
@@ -3649,6 +3855,25 @@ where
                             existing.total_rows += g1_order.total_rows;
                         } else {
                             order_results.push((order, g1_order));
+                        }
+                    }
+                }
+
+                // Merge each user-defined named graph's results (same pattern).
+                for ng in v3_named_results {
+                    total_rows += ng.total_rows;
+                    total_remapped += ng.total_remapped;
+                    remap_elapsed += ng.remap_elapsed;
+                    build_elapsed += ng.build_elapsed;
+
+                    for (order, ng_order) in ng.order_results {
+                        if let Some((_, existing)) =
+                            order_results.iter_mut().find(|(o, _)| *o == order)
+                        {
+                            existing.graphs.extend(ng_order.graphs);
+                            existing.total_rows += ng_order.total_rows;
+                        } else {
+                            order_results.push((order, ng_order));
                         }
                     }
                 }

@@ -130,9 +130,8 @@ mod inner {
         // Shared global allocators (no remap needed)
         predicates: DictWorkerCache,
         datatypes: DictWorkerCache,
-        // Kept for: TriG named graph support in parallel import.
-        // Use when: T2.13 orchestration enables TriG parallel parsing.
-        #[expect(dead_code)]
+        // Graph IRI → dict_id allocator (shared). Used by `graph_g_id_for_iri`
+        // to assign named-graph g_ids consistently with the index `graphs.dict`.
         graphs: DictWorkerCache,
         // Shared global pools (no remap needed)
         numbig_pool: Arc<SharedNumBigPool>,
@@ -438,6 +437,43 @@ mod inner {
             };
 
             self.records.push(record);
+        }
+
+        /// Allocate (or look up) the `g_id` for a named-graph IRI via the shared
+        /// graph allocator.
+        ///
+        /// Applies the allocator convention `dict_id + 1 = g_id` (default graph
+        /// is g_id 0 and not in the dict; txn-meta is dict_id 0 → g_id 1) so the
+        /// returned g_id matches the index's `graphs.dict` and the query-time
+        /// graph registry. Used by the TriG/N-Quads import path so the commit
+        /// envelope's `graph_delta` and the index agree on the same g_id.
+        pub fn graph_g_id_for_iri(&mut self, iri: &str) -> GraphId {
+            let dict_id = self.graphs.get_or_insert(iri);
+            (dict_id + 1) as GraphId
+        }
+
+        /// Spool one flake belonging to an explicit named graph (`g_id`).
+        ///
+        /// The default-graph fast path writes records under the per-chunk `g_id`
+        /// fixed at construction; named `GRAPH`-block flakes go through here so
+        /// they enter the Tier-2 index (and the `named_graphs` routing) exactly
+        /// like default-graph triples. Only invoked when an import contains named
+        /// graphs — the single-graph hot path never touches this.
+        #[allow(clippy::too_many_arguments)]
+        pub fn push_named_graph_record(
+            &mut self,
+            g_id: GraphId,
+            s: &Sid,
+            p: &Sid,
+            o: &FlakeValue,
+            dt: &Sid,
+            lang: Option<&str>,
+            t: i64,
+        ) {
+            let saved = self.g_id;
+            self.g_id = g_id;
+            self.write_record(s, p, o, dt, lang, None, t);
+            self.g_id = saved;
         }
     }
 

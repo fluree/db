@@ -20,7 +20,7 @@
 //!    document.
 
 use std::fs::File;
-use std::io::{self, BufReader, Read, Seek, SeekFrom};
+use std::io::{self, BufRead, BufReader, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -131,10 +131,36 @@ pub fn extract_prefix_block(path: &Path) -> Result<(String, u64), SplitError> {
     let mut buf = vec![0u8; scan_size];
     let mut reader = BufReader::new(file);
     reader.read_exact(&mut buf)?;
+    extract_prefix_block_from_bytes(&buf)
+}
 
+/// Variant of [`extract_prefix_block`] that reads from any `Read` source.
+///
+/// Used for compressed inputs (gzip, zstd) where the path-based variant can't
+/// `metadata()` for the uncompressed size and can't seek back. Reads up to
+/// `PREFIX_SCAN_SIZE` bytes from `reader` (consuming them) and returns the
+/// `(prefix_text, data_start_byte)` pair.
+pub fn extract_prefix_block_from_reader<R: Read>(
+    reader: &mut R,
+) -> Result<(String, u64), SplitError> {
+    let mut buf = vec![0u8; PREFIX_SCAN_SIZE];
+    let mut filled = 0;
+    while filled < buf.len() {
+        match reader.read(&mut buf[filled..])? {
+            0 => break,
+            n => filled += n,
+        }
+    }
+    buf.truncate(filled);
+    extract_prefix_block_from_bytes(&buf)
+}
+
+/// Shared scan logic — extract the prefix/base directive block from a buffer
+/// of leading bytes. Returns `(prefix_text, data_start_byte_within_buf)`.
+fn extract_prefix_block_from_bytes(buf: &[u8]) -> Result<(String, u64), SplitError> {
     // Tokenize the header region. If it ends mid-token, tokenize() may error;
     // we try to find a safe truncation point by scanning backwards for a newline.
-    let header_str = find_safe_header(&buf);
+    let header_str = find_safe_header(buf);
 
     let tokens = tokenize(header_str).map_err(|e| SplitError::Tokenize(e.to_string()))?;
 
@@ -1009,6 +1035,92 @@ impl StreamingTurtleReader {
         })
     }
 
+    /// Create a streaming reader from a non-seekable source (e.g. a streaming
+    /// decompressor over a `.ttl.gz` / `.ttl.zst` file).
+    ///
+    /// `open_reader` is called twice: once on the calling thread to extract the
+    /// prelude, and once on the spawned reader thread to stream the body. Each
+    /// call must return a freshly-positioned reader at byte 0. This avoids any
+    /// seek requirement on the underlying source.
+    ///
+    /// `total_bytes_hint` is the best-effort *uncompressed* size used only for
+    /// progress denominators. Pass `0` if unknown (gzip's footer is only
+    /// reliable for files under 4 GiB uncompressed); in that case
+    /// `estimated_chunks` is computed from the hint and may be 0.
+    ///
+    /// All other parameters match [`new`](Self::new).
+    pub fn new_from_factory<F>(
+        open_reader: F,
+        total_bytes_hint: u64,
+        chunk_size_bytes: u64,
+        channel_capacity: usize,
+        progress: Option<ScanProgressFn>,
+    ) -> Result<Self, SplitError>
+    where
+        F: Fn() -> io::Result<Box<dyn BufRead + Send>> + Send + Sync + 'static,
+    {
+        // Pass 1: open a reader, extract prelude (consumes the prelude bytes).
+        let mut prelude_reader = open_reader()?;
+        let (prefix_block, data_start) = extract_prefix_block_from_reader(&mut prelude_reader)?;
+        drop(prelude_reader);
+        let prelude = parse_prelude(&prefix_block)?;
+
+        // `file_size` here is the uncompressed total. For compressed sources
+        // the caller may not know it cheaply — in that case 0 means "unknown"
+        // and progress callbacks will receive 0 as the denominator.
+        let file_size = total_bytes_hint;
+        let data_len = file_size.saturating_sub(data_start);
+        let estimated_chunks = if data_len == 0 || chunk_size_bytes == 0 {
+            0
+        } else {
+            data_len.div_ceil(chunk_size_bytes) as usize
+        };
+
+        tracing::info!(
+            file_size_mb = file_size / (1024 * 1024),
+            chunk_size_mb = chunk_size_bytes / (1024 * 1024),
+            prefix_bytes = prefix_block.len(),
+            data_start,
+            estimated_chunks,
+            "streaming reader (factory): prefix extracted, spawning reader thread"
+        );
+
+        let (tx, rx) = std::sync::mpsc::sync_channel(channel_capacity);
+        let ns_preflight: std::sync::Arc<std::sync::OnceLock<NamespacePreflight>> =
+            std::sync::Arc::new(std::sync::OnceLock::new());
+        let ns_preflight_thread = std::sync::Arc::clone(&ns_preflight);
+        let reader_handle = std::thread::Builder::new()
+            .name("ttl-reader".into())
+            .spawn(move || -> Result<usize, SplitError> {
+                // Pass 2: open a fresh reader, advance past the prelude, stream.
+                let body_reader = open_reader()?;
+                reader_thread_from_source(
+                    body_reader,
+                    data_start,
+                    file_size,
+                    chunk_size_bytes,
+                    tx,
+                    progress,
+                    ns_preflight_thread,
+                )
+            })
+            .map_err(|e| {
+                SplitError::Io(io::Error::other(format!(
+                    "failed to spawn reader thread: {e}"
+                )))
+            })?;
+
+        Ok(Self {
+            prefix_block,
+            prelude,
+            file_size,
+            estimated_chunks,
+            ns_preflight,
+            rx: Arc::new(std::sync::Mutex::new(rx)),
+            reader_handle: Some(reader_handle),
+        })
+    }
+
     /// Receive the next chunk from the reader thread.
     ///
     /// Returns `Ok(Some((index, raw_bytes)))` for each chunk, or `Ok(None)`
@@ -1100,8 +1212,40 @@ fn reader_thread(
     ns_preflight: std::sync::Arc<std::sync::OnceLock<NamespacePreflight>>,
 ) -> Result<usize, SplitError> {
     let file = File::open(path)?;
-    let mut reader = BufReader::with_capacity(SCAN_BUF_SIZE, file);
-    reader.seek(SeekFrom::Start(data_start))?;
+    let reader: Box<dyn BufRead + Send> = Box::new(BufReader::with_capacity(SCAN_BUF_SIZE, file));
+    reader_thread_from_source(
+        reader,
+        data_start,
+        file_size,
+        chunk_size_bytes,
+        tx,
+        progress,
+        ns_preflight,
+    )
+}
+
+/// Reader-thread variant that takes an already-opened `BufRead` source.
+///
+/// Used by [`StreamingTurtleReader::new_from_factory`] for compressed inputs
+/// (gzip, zstd) and other non-seekable sources. Advances the reader past
+/// `data_start` bytes via read-and-discard, then runs the shared chunk
+/// emission loop. `file_size` is the best-effort uncompressed total
+/// (0 means unknown — used only as the denominator in `progress` callbacks).
+fn reader_thread_from_source(
+    mut reader: Box<dyn BufRead + Send>,
+    data_start: u64,
+    file_size: u64,
+    chunk_size_bytes: u64,
+    tx: std::sync::mpsc::SyncSender<ChunkPayload>,
+    progress: Option<ScanProgressFn>,
+    ns_preflight: std::sync::Arc<std::sync::OnceLock<NamespacePreflight>>,
+) -> Result<usize, SplitError> {
+    // Advance past the prelude bytes without a seek (works for any reader).
+    // For seekable File readers the cost is one buffered read of the prelude,
+    // which is small (< 256 KiB by convention) — negligible vs the chunk loop.
+    if data_start > 0 {
+        io::copy(&mut reader.by_ref().take(data_start), &mut io::sink())?;
+    }
 
     let mut buf = vec![0u8; SCAN_BUF_SIZE];
 

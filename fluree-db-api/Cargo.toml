@@ -59,6 +59,8 @@ fluree-search-protocol = { path = "../fluree-search-protocol" }
 fluree-graph-ir = { path = "../fluree-graph-ir" }
 fluree-graph-format = { path = "../fluree-graph-format" }
 fluree-graph-turtle = { path = "../fluree-graph-turtle" }
+flate2 = { workspace = true }
+zstd = { workspace = true }
 fluree-db-credential = { path = "../fluree-db-credential", optional = true }
 fluree-db-shacl = { path = "../fluree-db-shacl", optional = true }
 fluree-vocab = { path = "../fluree-vocab" }
@@ -103,6 +105,9 @@ tracing-subscriber.workspace = true
 tempfile = "3.19"
 mimalloc.workspace = true
 fs2 = "0.4"
+# Used by import tests to produce .gz / .zst fixtures inline.
+flate2 = { workspace = true }
+zstd = { workspace = true }
 # Numeric types used by datatype tests
 num-bigint = "0.4"
 num-bigdecimal = { package = "bigdecimal", version = "0.4" }
