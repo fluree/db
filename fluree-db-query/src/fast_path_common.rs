@@ -122,6 +122,25 @@ pub fn projection_sid_okey() -> ColumnProjection {
     }
 }
 
+/// Projection that loads SId + OKey + OI columns (internal, not output).
+///
+/// `OI` (the value/list index) is part of the V3 fact identity
+/// `(s_id, p_id, o_type, o_key, o_i)`, so paths that dedup or retract by fact
+/// identity (e.g. the overlay-merge tail scan) must carry it.
+#[inline]
+pub fn projection_sid_okey_oi() -> ColumnProjection {
+    ColumnProjection {
+        output: ColumnSet::EMPTY,
+        internal: {
+            let mut s = ColumnSet::EMPTY;
+            s.insert(ColumnId::SId);
+            s.insert(ColumnId::OKey);
+            s.insert(ColumnId::OI);
+            s
+        },
+    }
+}
+
 /// Projection that loads SId + OType + OKey columns (internal, not output).
 #[inline]
 pub fn projection_sid_otype_okey() -> ColumnProjection {
@@ -211,6 +230,32 @@ pub fn cursor_projection_otype_okey() -> ColumnProjection {
         },
         internal: ColumnSet::EMPTY,
     }
+}
+
+/// True when an object `o_type` is **order-preserving in `o_key`**: the raw
+/// `u64` `o_key` byte order equals the value's semantic order, so a scan of a
+/// single such `o_type` yields rows in value order.
+///
+/// This is the gate for the reverse-POST `ORDER BY DESC(?o) LIMIT k` fast path
+/// (see [`crate::fast_post_order_limit`]). It admits the embedded numeric,
+/// temporal, and boolean types whose encodings are documented order-preserving
+/// in `fluree_db_core::value_id`, and EXCLUDES:
+/// - dict-backed strings/IRIs (`LEX_ID`/`IRI_REF`, tag `10`): ids are assigned
+///   by insertion order, not lexicographic value order;
+/// - lang strings (tag `11`);
+/// - `GEO_POINT` (packed lat/long — not a linear value order) and `BLANK_NODE`;
+/// - overflow big numerics / JSON / vector arena handles (equality-only).
+///
+/// Within one `o_type`, this equals the SPARQL `ORDER BY` order; mixing
+/// `o_type`s under one predicate is rejected by the operator at runtime.
+#[inline]
+pub const fn is_post_desc_orderable(o_type: u16) -> bool {
+    let ot = OType::from_u16(o_type);
+    // XSD_BOOLEAN (0x0002), the signed/unsigned/constrained integers and floats
+    // (is_numeric: 0x0003..=0x0012), and the temporal + duration range
+    // (is_temporal: XSD_DATE 0x0013..=XSD_DURATION 0x001D). Excludes GEO_POINT
+    // (0x001E), BLANK_NODE (0x001F), and every dict-backed/lang/arena type.
+    o_type == OType::XSD_BOOLEAN.as_u16() || ot.is_numeric() || ot.is_temporal()
 }
 
 // ---------------------------------------------------------------------------
@@ -1387,7 +1432,7 @@ pub fn build_range_cursor(
 /// any flake fails to translate — in which case the caller must disable the
 /// fast path for correctness. Only meaningful when an overlay carrying novelty
 /// is present (`epoch != 0`).
-fn collect_resolved_overlay_ops(
+pub fn collect_resolved_overlay_ops(
     ctx: &ExecutionContext<'_>,
     store: &Arc<BinaryIndexStore>,
     g_id: GraphId,
