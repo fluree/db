@@ -1514,9 +1514,10 @@ enum ChainWeight<'a> {
         weights: &'a FxHashMap<u64, u64>,
         default: u64,
     },
-    /// `max(1, weights.get(o))` for ref objects, `0` for non-ref — the
-    /// OPTIONAL-chain head multiplier (`?b` keeps a solution even with no inner
-    /// chain, but only node-valued objects can extend the chain).
+    /// `max(1, weights.get(o))` for ref objects, `1` for non-ref — the
+    /// OPTIONAL-chain head multiplier. `?b` keeps its solution even with no
+    /// inner chain; a non-node `?b` (literal) can never be a `p2` subject, so
+    /// its inner chain has 0 completions ⇒ OPTIONAL multiplier 1 (not 0).
     LookupMaxOne {
         weights: &'a FxHashMap<u64, u64>,
     },
@@ -1545,7 +1546,9 @@ impl ChainWeight<'_> {
                 if is_iri {
                     weights.get(&o_key).copied().unwrap_or(0).max(1)
                 } else {
-                    0
+                    // Non-node `?b` can't extend the chain, but the OPTIONAL
+                    // still keeps its `?a p1 ?b` solution: multiplier 1.
+                    1
                 }
             }
             ChainWeight::InSet { set } => u64::from(is_iri && set.contains(&o_key)),
@@ -1767,9 +1770,34 @@ fn execute_chain_overlay(chain: &ChainFold, ec: &ExecCtx<'_, '_>) -> Result<Opti
 // total = Σ_b count_p1(b) × max(1, Σ_{c ∈ p2(b)} count_p3(c))
 // ---------------------------------------------------------------------------
 
-/// Metadata lane — moved verbatim from the former `fast_optional_chain_head_count_all`
-/// (which this consolidates), parameterized over `ExecCtx`. Runs only when
-/// `!ec.overlay`, so behavior is byte-identical to the old standalone operator.
+/// True iff every stored object of predicate `p_id` is an IRI reference.
+///
+/// Cheap directory prepass (no row decode): inspects each POST leaflet's
+/// `o_type_const`. A `None` (mixed leaflet) or any non-`IRI_REF` homogeneous
+/// type disqualifies. An empty predicate is vacuously all-IRI (count 0).
+fn predicate_objects_all_iri(store: &BinaryIndexStore, g_id: GraphId, p_id: u32) -> Result<bool> {
+    let iri_ref = OType::IRI_REF.as_u16();
+    for leaf_entry in leaf_entries_for_predicate(store, g_id, RunSortOrder::Post, p_id) {
+        let handle = store
+            .open_leaf_handle(&leaf_entry.leaf_cid, leaf_entry.sidecar_cid.as_ref(), false)
+            .map_err(|e| QueryError::Internal(format!("leaf open: {e}")))?;
+        for entry in &handle.dir().entries {
+            if entry.row_count == 0 || entry.p_const != Some(p_id) {
+                continue;
+            }
+            if entry.o_type_const != Some(iri_ref) {
+                return Ok(false);
+            }
+        }
+    }
+    Ok(true)
+}
+
+/// Metadata lane — consolidates the former `fast_optional_chain_head_count_all`,
+/// parameterized over `ExecCtx`. Runs only when `!ec.overlay`. Differs from the
+/// old standalone operator by (a) deferring non-all-IRI `p1` to the generic
+/// pipeline and (b) treating an absent `p2` (not just `p3`) as "inner chain
+/// never matches ⇒ multiplier 1".
 fn execute_optional_chain_head(
     ec: &ExecCtx<'_, '_>,
     p1: &Ref,
@@ -1783,13 +1811,25 @@ fn execute_optional_chain_head(
     let sid3 = normalize_pred_sid(store, p3)?;
 
     let Some(p1_id) = store.sid_to_p_id(&sid1) else {
+        // No `p1` data at all ⇒ no `?a p1 ?b` solutions.
         return Ok(Some(0));
     };
-    let Some(p2_id) = store.sid_to_p_id(&sid2) else {
-        return Ok(Some(0));
-    };
-    let Some(p3_id) = store.sid_to_p_id(&sid3) else {
-        // Optional chain can never match => multiplier is 1 for all b.
+
+    // This lane drives the IRI-only `PostObjectGroupCountIter`, which terminates
+    // on a homogeneous non-IRI leaflet (and POST orders such leaflets before
+    // `IRI_REF`). A literal-valued `?b` still survives the OPTIONAL with
+    // multiplier 1, so rather than undercount we defer any non-all-IRI `p1` to
+    // the generic pipeline.
+    if !predicate_objects_all_iri(store, g_id, p1_id)? {
+        return Ok(None);
+    }
+
+    let p2_id = store.sid_to_p_id(&sid2);
+    let p3_id = store.sid_to_p_id(&sid3);
+
+    // If either inner predicate is absent, the OPTIONAL chain can never match,
+    // so every `?a p1 ?b` row contributes exactly 1 (multiplier 1 for all b).
+    let (Some(p2_id), Some(p3_id)) = (p2_id, p3_id) else {
         let mut it1 = PostObjectGroupCountIter::new(store, g_id, p1_id)?.ok_or(
             QueryError::Internal("optional chain-head: POST iterator unavailable".into()),
         )?;

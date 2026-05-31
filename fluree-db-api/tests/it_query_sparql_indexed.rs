@@ -2752,6 +2752,163 @@ async fn indexed_overlay_optional_chain_head_count_reflects_overlay() {
         .await;
 }
 
+/// Regression (OPTIONAL chain-head, non-IRI `p1` object): a literal `?b` object
+/// of the head predicate still contributes 1 to the count — the OPTIONAL keeps
+/// the `?a p1 ?b` solution even though a literal can't be a `p2` subject. The
+/// metadata lane (no overlay) must defer mixed-type `p1` to the generic
+/// pipeline (its IRI-only POST iterator would otherwise drop/terminate); the
+/// overlay lane must count non-ref `?b` with multiplier 1.
+#[tokio::test]
+async fn indexed_optional_chain_head_literal_p1_object_counts_once() {
+    assert_index_defaults();
+    let fluree = FlureeBuilder::memory()
+        .with_ledger_cache_config(LedgerManagerConfig::default())
+        .build_memory();
+    let ledger_id = "it/opt-chain-literal-p1:main";
+    let (local, handle) = start_background_indexer_local(
+        fluree.backend().clone(),
+        Arc::new(fluree.nameservice_mode().clone()),
+        fluree_db_indexer::IndexerConfig::small(),
+    );
+    local
+        .run_until(async move {
+            let index_cfg = IndexConfig {
+                reindex_min_bytes: 0,
+                reindex_max_bytes: 10_000_000,
+            };
+            // a follows {b (IRI), "lit1", "lit2"}; b likes c; c rates {x,y}.
+            // comp2(b) = rates(c) = 2 → (a,b) → max(1,2) = 2; each literal → 1. Total 4.
+            let ledger0 = genesis_ledger_for_fluree(&fluree, ledger_id);
+            let baseline = json!({
+                "@context": { "ex": "http://example.org/ns/" },
+                "@graph": [
+                    {"@id": "ex:a", "ex:follows": [{"@id": "ex:b"}, "lit1", "lit2"]},
+                    {"@id": "ex:b", "ex:likes": {"@id": "ex:c"}},
+                    {"@id": "ex:c", "ex:rates": [{"@id": "ex:x"}, {"@id": "ex:y"}]}
+                ]
+            });
+            let ledger1 = fluree
+                .insert_with_opts(
+                    ledger0,
+                    &baseline,
+                    TxnOpts::default(),
+                    CommitOpts::default(),
+                    &index_cfg,
+                )
+                .await
+                .expect("baseline insert")
+                .ledger;
+            let _ = trigger_index_and_wait_outcome(&handle, ledger_id, ledger1.t()).await;
+
+            let query = r"
+                PREFIX ex: <http://example.org/ns/>
+                SELECT (COUNT(*) AS ?cnt)
+                WHERE { ?a ex:follows ?b . OPTIONAL { ?b ex:likes ?c . ?c ex:rates ?d } }
+            ";
+            let run = |t| {
+                let fluree = &fluree;
+                async move {
+                    let view = fluree.db_at_t(ledger_id, t).await.expect("load view");
+                    let result = fluree
+                        .query(&view, QueryInput::Sparql(query))
+                        .await
+                        .expect("count");
+                    result.to_jsonld(&view.snapshot).expect("to_jsonld")
+                }
+            };
+
+            // Indexed, no overlay → metadata lane defers mixed-type p1 to generic.
+            assert_eq!(
+                normalize_rows(&run(ledger1.t()).await),
+                normalize_rows(&json!([[4]])),
+                "literal follows-objects each count once (2 + 1 + 1)"
+            );
+
+            // Novelty adds `a follows \"lit3\"` → overlay lane; non-ref ?b ⇒ +1 ⇒ 5.
+            let ledger2 = fluree
+                .insert(
+                    ledger1,
+                    &json!({
+                        "@context": { "ex": "http://example.org/ns/" },
+                        "@graph": [ {"@id": "ex:a", "ex:follows": "lit3"} ]
+                    }),
+                )
+                .await
+                .expect("assert")
+                .ledger;
+            assert_eq!(
+                normalize_rows(&run(ledger2.t()).await),
+                normalize_rows(&json!([[5]])),
+                "overlay lane counts non-ref ?b with multiplier 1 (2 + 1 + 1 + 1)"
+            );
+        })
+        .await;
+}
+
+/// Regression (OPTIONAL chain-head, absent `p2`): when the first inner-chain
+/// predicate has no data, the OPTIONAL can never match, so every `?a p1 ?b`
+/// row contributes exactly 1. The metadata lane previously returned 0 here.
+#[tokio::test]
+async fn indexed_optional_chain_head_absent_p2_counts_all_p1_rows() {
+    assert_index_defaults();
+    let fluree = FlureeBuilder::memory()
+        .with_ledger_cache_config(LedgerManagerConfig::default())
+        .build_memory();
+    let ledger_id = "it/opt-chain-absent-p2:main";
+    let (local, handle) = start_background_indexer_local(
+        fluree.backend().clone(),
+        Arc::new(fluree.nameservice_mode().clone()),
+        fluree_db_indexer::IndexerConfig::small(),
+    );
+    local
+        .run_until(async move {
+            let index_cfg = IndexConfig {
+                reindex_min_bytes: 0,
+                reindex_max_bytes: 10_000_000,
+            };
+            // a follows {b, e} (IRI). `ex:rates` exists so p3 resolves; `ex:missing`
+            // is never used so p2 is absent. Inner chain can never match ⇒ count 2.
+            let ledger0 = genesis_ledger_for_fluree(&fluree, ledger_id);
+            let baseline = json!({
+                "@context": { "ex": "http://example.org/ns/" },
+                "@graph": [
+                    {"@id": "ex:a", "ex:follows": [{"@id": "ex:b"}, {"@id": "ex:e"}]},
+                    {"@id": "ex:c", "ex:rates": {"@id": "ex:x"}}
+                ]
+            });
+            let ledger1 = fluree
+                .insert_with_opts(
+                    ledger0,
+                    &baseline,
+                    TxnOpts::default(),
+                    CommitOpts::default(),
+                    &index_cfg,
+                )
+                .await
+                .expect("baseline insert")
+                .ledger;
+            let _ = trigger_index_and_wait_outcome(&handle, ledger_id, ledger1.t()).await;
+
+            let query = r"
+                PREFIX ex: <http://example.org/ns/>
+                SELECT (COUNT(*) AS ?cnt)
+                WHERE { ?a ex:follows ?b . OPTIONAL { ?b ex:missing ?c . ?c ex:rates ?d } }
+            ";
+            let view = fluree.db_at_t(ledger_id, ledger1.t()).await.expect("view");
+            let result = fluree
+                .query(&view, QueryInput::Sparql(query))
+                .await
+                .expect("count");
+            let jsonld = result.to_jsonld(&view.snapshot).expect("to_jsonld");
+            assert_eq!(
+                normalize_rows(&jsonld),
+                normalize_rows(&json!([[2]])),
+                "absent p2 ⇒ every p1 row counts once (was incorrectly 0)"
+            );
+        })
+        .await;
+}
+
 /// Regression: the `<S> <p>+ ?o` COUNT(*) fast path must incorporate novelty.
 ///
 /// Property-path+ COUNT used to gate on `fast_path_store`, which bails the
