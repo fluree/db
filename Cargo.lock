@@ -2314,6 +2314,7 @@ dependencies = [
  "criterion",
  "dirs 5.0.1",
  "ed25519-dalek",
+ "flate2",
  "fluree-bench-support",
  "fluree-db-binary-index",
  "fluree-db-connection",
@@ -2363,6 +2364,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "xxhash-rust",
+ "zstd",
 ]
 
 [[package]]
@@ -2410,6 +2412,7 @@ dependencies = [
  "colored",
  "comfy-table",
  "dirs 5.0.1",
+ "flate2",
  "fluree-db-api",
  "fluree-db-binary-index",
  "fluree-db-core",
@@ -2449,6 +2452,7 @@ dependencies = [
  "tracing-opentelemetry",
  "tracing-subscriber",
  "urlencoding",
+ "zstd",
 ]
 
 [[package]]

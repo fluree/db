@@ -65,9 +65,13 @@ fn mime_type_matches(content_type: &str, base: &str, x_prefix: Option<&str>) -> 
     false
 }
 
-/// Check if content-type indicates Turtle format
+/// Check if content-type indicates Turtle format.
+///
+/// N-Triples (`application/n-triples`) is a strict subset of Turtle and is
+/// parsed by the same Turtle parser, so it is accepted here as Turtle.
 fn is_turtle_content_type(content_type: &str) -> bool {
     mime_type_matches(content_type, "text/turtle", Some("application/x-turtle"))
+        || mime_type_matches(content_type, "application/n-triples", None)
 }
 
 /// Check if content-type indicates TriG format
@@ -401,6 +405,12 @@ mod tests {
 
         // Vendor extension
         assert!(is_turtle_content_type("application/x-turtle"));
+
+        // N-Triples is a Turtle subset — accepted as Turtle
+        assert!(is_turtle_content_type("application/n-triples"));
+        assert!(is_turtle_content_type(
+            "application/n-triples; charset=utf-8"
+        ));
 
         // Should not match
         assert!(!is_turtle_content_type("application/json"));

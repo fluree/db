@@ -144,6 +144,7 @@ wiremock = "0.6"
 
 # Compression
 zstd = "0.13"
+flate2 = "1"
 
 # Iceberg format support (manifest Avro, data Parquet)
 apache-avro = "0.21.0"

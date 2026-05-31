@@ -198,6 +198,7 @@ POST /insert/{ledger-id}
 **Supported Content Types:**
 - `application/json` - JSON-LD
 - `text/turtle` - Turtle (fast direct flake path)
+- `application/n-triples` - N-Triples (parsed as Turtle)
 
 **Note:** TriG (`application/trig`) is **not supported** on the insert endpoint. Named graph ingestion via GRAPH blocks requires the upsert path. Use `/upsert` for TriG data.
 
@@ -232,6 +233,7 @@ POST /upsert/{ledger-id}
 **Supported Content Types:**
 - `application/json` - JSON-LD
 - `text/turtle` - Turtle
+- `application/n-triples` - N-Triples (parsed as Turtle)
 - `application/trig` - TriG with named graphs
 
 **Example (JSON-LD):**

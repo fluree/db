@@ -651,6 +651,122 @@ fn create_from_file() {
         .stdout(predicate::str::contains("flakes"));
 }
 
+#[test]
+fn create_from_nt_file() {
+    let tmp = TempDir::new().unwrap();
+    fluree_cmd(&tmp).arg("init").assert().success();
+
+    let nt_path = tmp.path().join("seed.nt");
+    std::fs::write(
+        &nt_path,
+        "<http://example.org/seed> <http://example.org/val> \"seeded\" .\n",
+    )
+    .unwrap();
+
+    fluree_cmd(&tmp)
+        .args(["create", "ntdb", "--from", nt_path.to_str().unwrap()])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("About ledger 'ntdb'"))
+        .stdout(predicate::str::contains("flakes"));
+}
+
+#[test]
+fn create_from_nquads_file() {
+    let tmp = TempDir::new().unwrap();
+    fluree_cmd(&tmp).arg("init").assert().success();
+
+    let nq_path = tmp.path().join("seed.nq");
+    std::fs::write(
+        &nq_path,
+        "<http://example.org/seed> <http://example.org/val> \"seeded\" .\n",
+    )
+    .unwrap();
+
+    fluree_cmd(&tmp)
+        .args(["create", "nqdb", "--from", nq_path.to_str().unwrap()])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("About ledger 'nqdb'"))
+        .stdout(predicate::str::contains("flakes"));
+}
+
+/// Regression: `fluree create --from data.nt.gz` was failing with "stream did
+/// not contain valid UTF-8" because the CLI's `is_import_path` gate didn't
+/// recognize compressed RDF extensions and silently routed them through a
+/// fallback that did raw `fs::read_to_string`.
+#[test]
+fn create_from_gzipped_nt_file() {
+    use flate2::write::GzEncoder;
+    use flate2::Compression;
+    use std::io::Write;
+
+    let tmp = TempDir::new().unwrap();
+    fluree_cmd(&tmp).arg("init").assert().success();
+
+    let gz_path = tmp.path().join("seed.nt.gz");
+    let f = std::fs::File::create(&gz_path).unwrap();
+    let mut enc = GzEncoder::new(f, Compression::default());
+    enc.write_all(b"<http://example.org/seed> <http://example.org/val> \"seeded\" .\n")
+        .unwrap();
+    enc.finish().unwrap();
+
+    fluree_cmd(&tmp)
+        .args(["create", "ntgzdb", "--from", gz_path.to_str().unwrap()])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("About ledger 'ntgzdb'"))
+        .stdout(predicate::str::contains("flakes"));
+}
+
+#[test]
+fn create_from_gzipped_ttl_file() {
+    use flate2::write::GzEncoder;
+    use flate2::Compression;
+    use std::io::Write;
+
+    let tmp = TempDir::new().unwrap();
+    fluree_cmd(&tmp).arg("init").assert().success();
+
+    let gz_path = tmp.path().join("seed.ttl.gz");
+    let f = std::fs::File::create(&gz_path).unwrap();
+    let mut enc = GzEncoder::new(f, Compression::default());
+    enc.write_all(
+        b"@prefix ex: <http://example.org/> .\nex:seed a ex:Thing ; ex:val \"seeded\" .\n",
+    )
+    .unwrap();
+    enc.finish().unwrap();
+
+    fluree_cmd(&tmp)
+        .args(["create", "ttlgzdb", "--from", gz_path.to_str().unwrap()])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("About ledger 'ttlgzdb'"))
+        .stdout(predicate::str::contains("flakes"));
+}
+
+#[test]
+fn create_from_zstd_ttl_file() {
+    let tmp = TempDir::new().unwrap();
+    fluree_cmd(&tmp).arg("init").assert().success();
+
+    let zst_path = tmp.path().join("seed.ttl.zst");
+    let mut f = std::fs::File::create(&zst_path).unwrap();
+    zstd::stream::copy_encode(
+        &b"@prefix ex: <http://example.org/> .\nex:seed a ex:Thing ; ex:val \"seeded\" .\n"[..],
+        &mut f,
+        3,
+    )
+    .unwrap();
+
+    fluree_cmd(&tmp)
+        .args(["create", "ttlzstdb", "--from", zst_path.to_str().unwrap()])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("About ledger 'ttlzstdb'"))
+        .stdout(predicate::str::contains("flakes"));
+}
+
 // ============================================================================
 // v1.1 — Upsert tests
 // ============================================================================
