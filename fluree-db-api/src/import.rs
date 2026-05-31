@@ -4143,9 +4143,11 @@ where
 
             (class_counts, class_ref_targets)
         } else {
-            // Clone — the uncapped id_hook_class_ref_targets is also used
-            // below as the authoritative source for class stats ref_classes.
-            (id_hook_class_counts, id_hook_class_ref_targets.clone())
+            // No SPOT class stats (no rdf:type data) — fall back to the id-hook
+            // maps. These are empty in the import path now that worker hooks no
+            // longer build per-subject maps, which is correct: no classes ⇒ no
+            // class ref-targets.
+            (id_hook_class_counts, id_hook_class_ref_targets)
         };
 
         let stats_v6: Option<fluree_db_core::IndexStats> = id_stats_result.map(|id_stats| {
@@ -4207,10 +4209,11 @@ where
                     cs,
                     &predicate_sids_v6,
                     &uploaded_dicts.language_tags,
-                    // Use the uncapped per-class ref-targets from IdStatsHook
-                    // instead of `cs.class_prop_refs` (which is populated via
-                    // the 64-class-capped ClassBitsetTable).
-                    Some(&id_hook_class_ref_targets),
+                    // `cs.class_prop_refs` is now uncapped (ClassMembership
+                    // promotes past 64 classes to a sparse map), so it is the
+                    // authoritative source. The import no longer builds the
+                    // expensive per-subject IdStatsHook maps for ref-targets.
+                    None,
                     input.run_dir,
                     input.namespace_codes,
                 )

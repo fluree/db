@@ -794,7 +794,7 @@ where
 
             // ---- Pass 2: Streaming class stats via k-way merge ----
             //
-            // Build ClassBitsetTable from .types sidecars (global IDs), then
+            // Build ClassMembership from .types sidecars (global IDs), then
             // k-way merge .fsc files in cmp_v2_g_spot order with dedup. Feed
             // deduped winning assertions to SpotClassStatsCollector.
 
@@ -802,8 +802,8 @@ where
                 .iter()
                 .filter_map(|info| info.types_map_path.clone())
                 .collect();
-            let class_bitset =
-                crate::run_index::build::ClassBitsetTable::build_from_global_types(&types_paths)
+            let class_membership =
+                crate::run_index::build::ClassMembership::build_from_global_types(&types_paths)
                     .map_err(|e| IndexerError::StorageWrite(e.to_string()))?;
 
             let spot_class_stats = {
@@ -811,7 +811,7 @@ where
                 use crate::run_index::runs::spool::V1SpoolMergeAdapter;
                 use fluree_db_binary_index::format::run_record_v2::cmp_v2_g_spot;
 
-                let mut collector = SpotClassStatsCollector::new(rdf_type_p_id, class_bitset);
+                let mut collector = SpotClassStatsCollector::new(rdf_type_p_id, class_membership);
 
                 // Open V1 spool merge adapters for all .fsc files.
                 let registry = std::sync::Arc::new(registry);
@@ -883,7 +883,7 @@ where
                     &spot_class_stats,
                     &predicate_sids,
                     &language_tags,
-                    None, // rebuild path still uses cs.class_prop_refs (64-capped); separate follow-up.
+                    None, // uncapped: cs.class_prop_refs now uses ClassMembership (no 64-class cap).
                     &run_dir,
                     &shared.ns_prefixes,
                 )
