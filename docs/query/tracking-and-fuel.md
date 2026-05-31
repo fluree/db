@@ -77,6 +77,22 @@ Cheap operations (comparisons, arithmetic, type checks, simple string ops, datet
 
 The **query floor** guarantees every fuel-tracked query reports at least `1.000` fuel: a query touching no persisted data still costs the floor, and a query that errors during parsing/planning still reports it. I/O "touches" cost `0.010` each, so a scan-dominated query reports roughly `1.000 + 0.010 × (leaflet/dict touches)`. The fuel schedule above is defined in one place — `fluree-db-core/src/tracking.rs` (`tracking::schedule`).
 
+#### Graph-crawl projection: materialization fuel scales with selected predicates
+
+When a JSON-LD query's projection lists explicit forward predicates (e.g. `select: {"?x": ["@id", "ex:a", "ex:b"]}`), the range provider receives a predicate allow-list via `RangeOptions::predicate_filter` and drops base flakes for non-listed predicates **before** decoding the object value, resolving the subject Sid, or charging dict-touch fuel.
+
+What this changes:
+- **Per-flake (`0.001`), subject-resolve, object-decode, and dict-touch (`0.010`) fuel** all scale with the number of selected predicates rather than the subject's total predicate count.
+
+What this does **not** change:
+- **Index leaflet touches (`0.010` each)** still scale with the cursor's scanned subject range. For K ≥ 2 the cursor opens `SPOT(s,*,*)` and pays one `INDEX_TOUCH` per leaflet batch returned, the same as a full crawl over the subject — the filter narrows which rows get *materialized*, not how many leaflets get *read*. For K = 1 the cursor opens `SPOT(s,p,*)` directly via `RangeMatch::subject_predicate`, which narrows the leaflet key-range to the `(s, p)` prefix — same `INDEX_TOUCH` count for small subjects (one batch either way), strictly fewer touches for subjects whose flakes span multiple batches.
+
+Wildcard projections (`select: {"?x": ["*"]}`) take the unchanged decode-everything path — every flake on the subject is materialized and charged. Refinements on a wildcard level (e.g. `{"ex:friend": ["*"]}` inside a `["*", ...]` selection) keep the parent level wildcard; only the explicit-list form opts into the filter.
+
+Explicit projections with no forward predicates (e.g. `["@id"]` or reverse-only) skip the forward SPOT scan entirely — no cursor, no `INDEX_TOUCH`. `@id` is derived from the subject Sid and reverse properties go through a dedicated POST scan.
+
+The overlay path also honors the filter, so per-subject hydration over a ledger with uncommitted novelty pays only for retracts / asserts on predicates the projection cares about. Novelty-only predicates (no persisted p_id yet) are honored too: the row-loop allow-set is extended with ephemeral p_ids the overlay translator assigned for any selected predicate Sid.
+
 ### Indexing Fuel
 
 Indexer CAS writes are billed through a `MeteredContentStore` wrapper that the build entry points install around the caller-supplied content store. Every successful `ContentStore::put` / `put_with_id` charges the base **1.000 fuel** rate — including index leaves, branch manifests, root manifests, dict packs / reverse-tree nodes, history sidecars, garbage records, stats sketches, and (incremental) spatial / fulltext arenas. The lower-level `Storage::content_write_bytes` is **not** currently wrapped; the only indexer code path that uses it is the dead-code spatial rebuild helper. If that path is wired up, add a storage-level wrapper first (or migrate it to `ContentStore::put`).
