@@ -721,23 +721,35 @@ fn is_import_path(path: &Path) -> CliResult<bool> {
     let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
     let name_lower = name.to_ascii_lowercase();
 
-    // Reject compressed Turtle with a clear message.
-    if name_lower.ends_with(".ttl.gz")
-        || name_lower.ends_with(".ttl.zst")
-        || name_lower.ends_with(".ttl.bz2")
-    {
+    // Bulk import handles every supported RDF format. Each may carry an outer
+    // `.gz` or `.zst` suffix — the bulk pipeline decompresses transparently
+    // (see `fluree-db-api::import::effective_extension`). `.bz2` is rejected
+    // explicitly because the import pipeline doesn't link a bzip2 decoder.
+    if name_lower.ends_with(".bz2") {
         return Err(CliError::Input(format!(
-            "compressed Turtle files are not yet supported; decompress first: {}",
+            "bzip2-compressed files are not supported; use .gz or .zst, or \
+             decompress first: {}",
             path.display()
         )));
     }
-
-    // Case-insensitive .ttl / .jsonld check.
-    if name_lower.ends_with(".ttl") || name_lower.ends_with(".jsonld") {
-        return Ok(true);
-    }
-
-    Ok(false)
+    const SUPPORTED: &[&str] = &[
+        ".ttl",
+        ".ttl.gz",
+        ".ttl.zst",
+        ".nt",
+        ".nt.gz",
+        ".nt.zst",
+        ".nq",
+        ".nq.gz",
+        ".nq.zst",
+        ".trig",
+        ".trig.gz",
+        ".trig.zst",
+        ".jsonld",
+        ".jsonld.gz",
+        ".jsonld.zst",
+    ];
+    Ok(SUPPORTED.iter().any(|suffix| name_lower.ends_with(suffix)))
 }
 
 /// Replace non-alphanumeric characters with underscores for safe filenames.

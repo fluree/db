@@ -2411,6 +2411,7 @@ dependencies = [
  "colored",
  "comfy-table",
  "dirs 5.0.1",
+ "flate2",
  "fluree-db-api",
  "fluree-db-binary-index",
  "fluree-db-core",
@@ -2450,6 +2451,7 @@ dependencies = [
  "tracing-opentelemetry",
  "tracing-subscriber",
  "urlencoding",
+ "zstd",
 ]
 
 [[package]]

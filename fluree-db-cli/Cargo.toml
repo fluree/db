@@ -107,6 +107,9 @@ parking_lot = "0.12"
 assert_cmd = "2"
 predicates = "3"
 tempfile = "3"
+# Used by `create --from` integration tests to produce .gz / .zst fixtures inline.
+flate2 = { workspace = true }
+zstd = { workspace = true }
 
 [lints]
 workspace = true
