@@ -1300,9 +1300,17 @@ fn reader_thread_from_source(
         }
 
         // Report progress periodically.
+        //
+        // `file_size` may be 0 when the caller has no cheap way to know the
+        // uncompressed total (e.g. a gzip source). Use `saturating_sub` so the
+        // denominator stays 0 (the UI's contract for "unknown total") instead
+        // of underflowing u64 to a huge bogus value.
         if abs_pos >= next_progress {
             if let Some(ref cb) = progress {
-                cb(abs_pos - data_start, file_size - data_start);
+                cb(
+                    abs_pos.saturating_sub(data_start),
+                    file_size.saturating_sub(data_start),
+                );
             }
             next_progress = abs_pos + progress_interval;
         }
@@ -1404,9 +1412,14 @@ fn reader_thread_from_source(
         }
     }
 
-    // Final progress report.
+    // Final progress report. Skip when `file_size` is 0 (unknown total) —
+    // emitting (0, 0) would tell the UI "0 of 0 read" which it can't
+    // distinguish from a reset. The CLI handles unknown-total finalization
+    // from the next `Committing` phase event instead.
     if let Some(ref cb) = progress {
-        cb(file_size - data_start, file_size - data_start);
+        if file_size > 0 {
+            cb(file_size - data_start, file_size - data_start);
+        }
     }
 
     // If we never emitted chunk 0 (small file) or finished scanning windows late, publish now.

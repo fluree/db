@@ -339,13 +339,25 @@ async fn run_bulk_import(
                 total_bytes,
             } => {
                 is_streaming_scan.store(true, std::sync::atomic::Ordering::Relaxed);
-                sb.set_length(total_bytes);
-                sb.set_position(bytes_read);
                 let gb_read = bytes_read as f64 / (1024.0 * 1024.0 * 1024.0);
-                let gb_total = total_bytes as f64 / (1024.0 * 1024.0 * 1024.0);
-                sb.set_message(format!("{gb_read:.1} / {gb_total:.1} GB"));
-                if bytes_read >= total_bytes {
-                    sb.finish_with_message(format!("{gb_total:.1} GB"));
+                if total_bytes > 0 {
+                    // Known total — normal percentage bar.
+                    sb.set_length(total_bytes);
+                    sb.set_position(bytes_read);
+                    let gb_total = total_bytes as f64 / (1024.0 * 1024.0 * 1024.0);
+                    sb.set_message(format!("{gb_read:.1} / {gb_total:.1} GB"));
+                    if bytes_read >= total_bytes {
+                        sb.finish_with_message(format!("{gb_total:.1} GB"));
+                    }
+                } else {
+                    // Unknown total (compressed source — uncompressed size
+                    // not known ahead of time). Show running bytes only; the
+                    // bar's length is left at a sentinel so it never renders
+                    // as complete, and the Committing handler will clear it
+                    // when reading is genuinely done.
+                    sb.set_length(u64::MAX);
+                    sb.set_position(bytes_read);
+                    sb.set_message(format!("{gb_read:.2} GB read"));
                 }
             }
             ImportPhase::Committing {
@@ -377,6 +389,13 @@ async fn run_bulk_import(
             }
             ImportPhase::PreparingIndex { stage } => {
                 cb.finish();
+                // Unknown-total streaming scan (compressed input) leaves the
+                // scan bar without a natural finish event from the reader.
+                // By PreparingIndex, parsing is fully done so reading must be
+                // too — lock the bar at its last reported byte count.
+                if !sb.is_finished() {
+                    sb.finish();
+                }
                 // Show activity immediately (avoid "Indexing 0%" during merge/remap).
                 ib.set_length(100);
                 ib.set_position(1);
