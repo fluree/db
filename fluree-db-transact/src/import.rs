@@ -515,7 +515,18 @@ mod inner {
                     // Spool the named-graph flake under its g_id (so it enters
                     // the index), then encode it into the commit blob.
                     if let Some(sc) = spool_ctx.as_mut() {
-                        sc.push_named_graph_record(g_id, &s, &p, &o, &dt, lang.as_deref(), new_t);
+                        sc.push_named_graph_record(
+                            g_id,
+                            crate::import_sink::FlakeRecord {
+                                s: &s,
+                                p: &p,
+                                o: &o,
+                                dt: &dt,
+                                lang: lang.as_deref(),
+                                list_index: None,
+                                t: new_t,
+                            },
+                        );
                     }
 
                     let meta = lang.as_deref().map(FlakeMeta::with_lang);

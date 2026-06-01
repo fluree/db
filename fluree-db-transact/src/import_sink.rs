@@ -58,6 +58,19 @@ mod inner {
         },
     }
 
+    /// The per-flake fields a spool [`RunRecord`] is built from, bundled so the
+    /// write path takes one argument instead of seven (keeps it readable and off
+    /// clippy's `too_many_arguments` list). All fields borrow the source data.
+    pub struct FlakeRecord<'a> {
+        pub s: &'a Sid,
+        pub p: &'a Sid,
+        pub o: &'a FlakeValue,
+        pub dt: &'a Sid,
+        pub lang: Option<&'a str>,
+        pub list_index: Option<i32>,
+        pub t: i64,
+    }
+
     // -----------------------------------------------------------------------
     // SpoolContext — per-chunk context for writing spool records (Phase B)
     // -----------------------------------------------------------------------
@@ -279,7 +292,6 @@ mod inner {
         /// Uses the same encoders as `CommitResolver` in the indexer for inline
         /// types. For subjects and strings, assigns chunk-local IDs (remapped
         /// during merge). For BigInt/Decimal/Vector, uses shared global pools.
-        #[allow(clippy::too_many_arguments)]
         fn resolve_object_value(&mut self, value: &FlakeValue, p_id: u32) -> Option<(u8, u64)> {
             Some(match value {
                 FlakeValue::Ref(sid) => {
@@ -398,17 +410,16 @@ mod inner {
         }
 
         /// Write a spool record for one flake.
-        #[allow(clippy::too_many_arguments)]
-        fn write_record(
-            &mut self,
-            s: &Sid,
-            p: &Sid,
-            o: &FlakeValue,
-            dt: &Sid,
-            lang: Option<&str>,
-            list_index: Option<i32>,
-            t: i64,
-        ) {
+        fn write_record(&mut self, rec: FlakeRecord) {
+            let FlakeRecord {
+                s,
+                p,
+                o,
+                dt,
+                lang,
+                list_index,
+                t,
+            } = rec;
             let s_id = self.assign_subject_id(s);
             let p_id = self.assign_predicate_id(p);
             let dt_id = self.assign_datatype_id(dt);
@@ -459,20 +470,10 @@ mod inner {
         /// they enter the Tier-2 index (and the `named_graphs` routing) exactly
         /// like default-graph triples. Only invoked when an import contains named
         /// graphs — the single-graph hot path never touches this.
-        #[allow(clippy::too_many_arguments)]
-        pub fn push_named_graph_record(
-            &mut self,
-            g_id: GraphId,
-            s: &Sid,
-            p: &Sid,
-            o: &FlakeValue,
-            dt: &Sid,
-            lang: Option<&str>,
-            t: i64,
-        ) {
+        pub fn push_named_graph_record(&mut self, g_id: GraphId, rec: FlakeRecord) {
             let saved = self.g_id;
             self.g_id = g_id;
-            self.write_record(s, p, o, dt, lang, None, t);
+            self.write_record(rec);
             self.g_id = saved;
         }
     }
@@ -676,7 +677,15 @@ mod inner {
 
             // Write spool record only after commit encoding succeeded
             if let Some(ctx) = &mut self.spool_ctx {
-                ctx.write_record(&s, &p, &o, &dt, lang.as_deref(), list_index, self.t);
+                ctx.write_record(FlakeRecord {
+                    s: &s,
+                    p: &p,
+                    o: &o,
+                    dt: &dt,
+                    lang: lang.as_deref(),
+                    list_index,
+                    t: self.t,
+                });
             }
         }
     }
@@ -1105,6 +1114,7 @@ mod inner {
 }
 
 pub use inner::BufferedSpoolResult;
+pub use inner::FlakeRecord;
 pub use inner::ImportSink;
 pub use inner::SpoolConfig;
 pub use inner::SpoolContext;
