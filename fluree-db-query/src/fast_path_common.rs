@@ -745,10 +745,20 @@ impl<'a> PsotSubjectSeek<'a> {
                 continue;
             }
             if !found {
-                // Advance to the first row with s_id >= target_s.
-                while self.row < batch.row_count && batch.s_id.get(self.row) < target_s {
-                    self.row += 1;
+                // Advance to the first row with s_id >= target_s. Within a leaflet
+                // s_id is sorted, so binary-search the unconsumed suffix instead of
+                // skipping row-by-row — cheap when the target is far in, e.g. when a
+                // sparse driver seeks past a high-multiplicity subject's run.
+                let (mut lo, mut hi) = (self.row, batch.row_count);
+                while lo < hi {
+                    let mid = lo + (hi - lo) / 2;
+                    if batch.s_id.get(mid) < target_s {
+                        lo = mid + 1;
+                    } else {
+                        hi = mid;
+                    }
                 }
+                self.row = lo;
                 if self.row >= batch.row_count {
                     self.batch = None;
                     continue;
