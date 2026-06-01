@@ -986,7 +986,9 @@ fn execute_chain(
     store: &Arc<BinaryIndexStore>,
     g_id: GraphId,
 ) -> Result<Option<u64>> {
-    assert!(
+    // Matches the overlay twin `execute_chain_overlay`: a malformed chain is a
+    // planner bug, not a runtime condition — never panic a release query path.
+    debug_assert!(
         chain.predicates.len() >= 2,
         "chain must have at least 2 predicates"
     );

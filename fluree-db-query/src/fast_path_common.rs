@@ -1534,6 +1534,26 @@ pub fn build_overlay_cursor_for_predicate(
          (Psot or Post); got {order:?}"
     );
 
+    // When an overlay merge can run, `merge_overlay_into_batch` needs the full
+    // V3 identity (s_id, p_id, o_type, o_key, o_i) on every base row. Narrow
+    // count projections (SId-only, OType+OKey) omit some, which would read as
+    // `AbsentDefault` and corrupt the identity compare. Force the identity
+    // columns into `internal` so they're loaded for the merge but dropped before
+    // the returned batch — the output shape the count operators see is
+    // unchanged. (Production masks this via the cache's `all()` load; a
+    // cache-less store would miscount. See `BinaryCursor::set_overlay_ops`.)
+    let overlay_active = ctx.overlay.is_some() && ctx.overlay().epoch() != 0;
+    let projection = if overlay_active {
+        let identity = ColumnSet::CORE.union(ColumnSet::single(ColumnId::OI));
+        ColumnProjection {
+            output: projection.output,
+            // Don't duplicate columns already materialized in `output`.
+            internal: ColumnSet(projection.internal.union(identity).0 & !projection.output.0),
+        }
+    } else {
+        projection
+    };
+
     let (min_key, max_key) = predicate_range_keys(p_id, g_id);
     let filter = BinaryFilter {
         p_id: Some(p_id),

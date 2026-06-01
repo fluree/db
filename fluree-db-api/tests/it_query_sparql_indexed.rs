@@ -4577,3 +4577,106 @@ async fn indexed_overlay_scalar_agg_reflects_assert_and_retract() {
         })
         .await;
 }
+
+/// Regression for MEDIUM-1: overlay COUNT projection invariant on a **cache-less**
+/// store.
+///
+/// The count-plan overlay cursors project NARROW column subsets (here SId+OType+
+/// OKey via `cursor_projection_sid_otype_okey` → `ColumnSet(13)`), but
+/// `merge_overlay_into_batch` compares each base row against the overlay ops on
+/// the FULL V3 identity (s_id, p_id, o_type, o_key, o_i). With
+/// `LedgerManagerConfig::default()` the store has **no leaflet cache**
+/// (`leaflet_cache: None`), so the narrow projection is what actually loads — a
+/// missing identity column would read as `AbsentDefault` (p_id→0, o_i→u32::MAX)
+/// and corrupt the merge, mis-counting under overlay. (Production is masked only
+/// because an injected cache always loads `ColumnProjection::all()`.)
+///
+/// `build_overlay_cursor_for_predicate` now forces the identity columns into the
+/// projection's `internal` set, and `BinaryCursor::set_overlay_ops` debug-asserts
+/// their presence. Without the fix this exact query panics that assert (and would
+/// mis-count in release). This test locks the end-to-end count on a no-cache store.
+#[tokio::test]
+async fn indexed_overlay_count_no_cache_projection_invariant() {
+    assert_index_defaults();
+    let fluree = FlureeBuilder::memory()
+        .with_ledger_cache_config(LedgerManagerConfig::default())
+        .build_memory();
+    let ledger_id = "it/overlay-count-projection-invariant:main";
+
+    let (local, handle) = start_background_indexer_local(
+        fluree.backend().clone(),
+        Arc::new(fluree.nameservice_mode().clone()),
+        fluree_db_indexer::IndexerConfig::small(),
+    );
+
+    local
+        .run_until(async move {
+            let index_cfg = IndexConfig {
+                reindex_min_bytes: 0,
+                reindex_max_bytes: 10_000_000,
+            };
+
+            // Baseline: a,c active; all four have age. EXISTS(active) over the
+            // age subjects drives a subject-count fold through the narrow overlay
+            // cursor. Indexed-only => {a, c} = 2.
+            let ledger0 = genesis_ledger_for_fluree(&fluree, ledger_id);
+            let baseline = json!({
+                "@context": { "ex": "http://example.org/ns/" },
+                "@graph": [
+                    {"@id": "ex:a", "ex:age": 30, "ex:active": true},
+                    {"@id": "ex:b", "ex:age": 40},
+                    {"@id": "ex:c", "ex:age": 50, "ex:active": true},
+                    {"@id": "ex:d", "ex:age": 60}
+                ]
+            });
+            let ledger1 = fluree
+                .insert_with_opts(
+                    ledger0,
+                    &baseline,
+                    TxnOpts::default(),
+                    CommitOpts::default(),
+                    &index_cfg,
+                )
+                .await
+                .expect("baseline insert")
+                .ledger;
+            let _ = trigger_index_and_wait_outcome(&handle, ledger_id, ledger1.t()).await;
+
+            let query = r"
+                PREFIX ex: <http://example.org/ns/>
+                SELECT (COUNT(*) AS ?cnt)
+                WHERE { ?s ex:age ?a . FILTER EXISTS { ?s ex:active ?x } }
+            ";
+
+            // Novelty assert: b becomes active → overlay-merged count = {a,b,c} = 3.
+            // This is the case that miscounts if the narrow projection drops the
+            // identity columns the overlay merge needs.
+            let ledger2 = fluree
+                .insert(
+                    ledger1,
+                    &json!({
+                        "@context": { "ex": "http://example.org/ns/" },
+                        "@graph": [ {"@id": "ex:b", "ex:active": true} ]
+                    }),
+                )
+                .await
+                .expect("assert in novelty")
+                .ledger;
+
+            let view2 = fluree
+                .db_at_t(ledger_id, ledger2.t())
+                .await
+                .expect("load view at t=2");
+            let result = fluree
+                .query(&view2, QueryInput::Sparql(query))
+                .await
+                .expect("overlay count");
+            let jsonld = result.to_jsonld(&view2.snapshot).expect("to_jsonld");
+            assert_eq!(
+                normalize_rows(&jsonld),
+                normalize_rows(&json!([[3]])),
+                "no-cache overlay EXISTS count must be 3 (a, b, c) with b asserted in novelty"
+            );
+        })
+        .await;
+}
