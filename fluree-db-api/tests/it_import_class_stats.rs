@@ -235,3 +235,106 @@ ex:bob a ex:Person ;
         txn_meta_entry.flakes
     );
 }
+
+// =============================================================================
+// Test 3: per-class stats for user-defined NAMED graphs
+// =============================================================================
+
+/// Regression: a TriG bulk import must populate per-class stats for
+/// user-defined named graphs (g_id >= FIRST_USER_GRAPH_ID), not just the
+/// default graph.
+///
+/// Before the SpotClassStats merge, each named-graph build pass computed its
+/// class stats and then discarded them (`let (ng_result, _) = …`), so
+/// `stats.graphs[named].classes` was `None`. This test imports a named graph
+/// with two classes and a same-graph reference and asserts the class stats —
+/// including the resolved ref-target class — land on the named graph's entry.
+#[tokio::test]
+async fn bulk_import_populates_named_graph_class_stats() {
+    use fluree_db_core::graph_registry::FIRST_USER_GRAPH_ID;
+
+    let db_dir = tempfile::tempdir().expect("db tmpdir");
+    let data_dir = tempfile::tempdir().expect("data tmpdir");
+
+    // Default graph: one Person. Named graph <…/g/hr>: an Employee that
+    // `worksAt` a Company (a same-graph ref → must resolve to a target class).
+    let trig = "\
+@prefix ex: <http://example.org/> .
+
+ex:alice a ex:Person ;
+    ex:name \"Alice\" .
+
+GRAPH <http://example.org/g/hr> {
+    ex:bob a ex:Employee ;
+        ex:name \"Bob\" ;
+        ex:worksAt ex:acme .
+    ex:acme a ex:Company ;
+        ex:name \"Acme\" .
+}
+";
+    let trig_path = write_file(data_dir.path(), "named.trig", trig);
+
+    let fluree = FlureeBuilder::file(db_dir.path().to_string_lossy().to_string())
+        .build()
+        .expect("build fluree");
+
+    fluree
+        .create("test/named-class-stats:main")
+        .import(&trig_path)
+        .threads(1)
+        .memory_budget_mb(256)
+        .collect_id_stats(true)
+        .cleanup(false)
+        .execute()
+        .await
+        .expect("import");
+
+    let ledger = fluree
+        .ledger("test/named-class-stats:main")
+        .await
+        .expect("load");
+    let stats = ledger.snapshot.stats.as_ref().expect("stats present");
+    let graphs = stats.graphs.as_ref().expect("graphs present");
+
+    // Default graph keeps exactly its own class (Person), unaffected.
+    let g0 = graphs.iter().find(|g| g.g_id == 0).expect("default graph");
+    let g0_classes = g0.classes.as_ref().expect("default graph has classes");
+    assert_eq!(
+        g0_classes.len(),
+        1,
+        "default graph should have 1 class (Person)"
+    );
+
+    // The user-defined named graph must now carry its own class stats.
+    let named = graphs
+        .iter()
+        .find(|g| g.g_id >= FIRST_USER_GRAPH_ID)
+        .expect("a user-defined named graph entry should exist");
+    let named_classes = named
+        .classes
+        .as_ref()
+        .expect("named graph should have class stats (was None before the merge)");
+    assert_eq!(
+        named_classes.len(),
+        2,
+        "named graph should have 2 classes (Employee, Company); got {named_classes:?}"
+    );
+
+    // The same-graph ref (Employee ex:worksAt → Company) must resolve to a
+    // target class exactly once. Exactly one class (Employee) has a property
+    // with a non-empty ref-class rollup.
+    let ref_rollup: Vec<&fluree_db_core::ClassRefCount> = named_classes
+        .iter()
+        .flat_map(|c| c.properties.iter())
+        .flat_map(|p| p.ref_classes.iter())
+        .collect();
+    assert_eq!(
+        ref_rollup.len(),
+        1,
+        "exactly one same-graph ref-target class (Employee.worksAt → Company); got {ref_rollup:?}"
+    );
+    assert_eq!(
+        ref_rollup[0].count, 1,
+        "worksAt → Company should be counted once"
+    );
+}

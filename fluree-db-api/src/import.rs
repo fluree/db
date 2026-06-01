@@ -4171,12 +4171,13 @@ where
                 std::fs::create_dir_all(&cfg_g0.run_dir)
                     .map_err(|e| ImportError::IndexBuild(e.to_string()))?;
 
-                let (g0_result, spot_class_stats) = fluree_db_indexer::build_indexes_from_commits(
-                    &commits,
-                    &cfg_g0,
-                    stats_hook.as_mut(),
-                )
-                .map_err(|e| ImportError::IndexBuild(e.to_string()))?;
+                let (g0_result, mut spot_class_stats) =
+                    fluree_db_indexer::build_indexes_from_commits(
+                        &commits,
+                        &cfg_g0,
+                        stats_hook.as_mut(),
+                    )
+                    .map_err(|e| ImportError::IndexBuild(e.to_string()))?;
 
                 // Meta chunk is always the last chunk when present. We build
                 // it BEFORE stats finalize and share the IdStatsHook so the
@@ -4236,19 +4237,26 @@ where
                     std::fs::create_dir_all(&cfg_ng.run_dir)
                         .map_err(|e| ImportError::IndexBuild(e.to_string()))?;
 
-                    // The `SpotClassStats` (per-(class,property) counts) are
-                    // intentionally dropped for named graphs: per-class stats are
-                    // collected for the default graph only (see the g0 build,
-                    // which keeps them). Named-graph per-property stats still flow
-                    // through the shared `IdStatsHook`; only the class-keyed
-                    // breakdown is default-graph-only for now. Merging named-graph
-                    // class stats into `stats.graphs[ng].classes` is a follow-up.
-                    let (ng_result, _) = fluree_db_indexer::build_indexes_from_commits(
+                    // Fold this named graph's per-class SPOT stats into the
+                    // default-graph accumulator. All `SpotClassStats` maps are
+                    // keyed by `(g_id, class_sid)` over the same global id space
+                    // (assigned once at spool, shared across passes), and the
+                    // g_ids are disjoint, so the merge is a key-wise union.
+                    // Ref-targets whose class this pass couldn't resolve (e.g. a
+                    // ref into another graph) stay counted as `@id` flakes and
+                    // simply don't contribute a target-class entry.
+                    let (ng_result, ng_spot) = fluree_db_indexer::build_indexes_from_commits(
                         &commits,
                         &cfg_ng,
                         stats_hook.as_mut(),
                     )
                     .map_err(|e| ImportError::IndexBuild(e.to_string()))?;
+                    if let Some(ng) = ng_spot {
+                        match &mut spot_class_stats {
+                            Some(acc) => acc.merge(ng),
+                            slot => *slot = Some(ng),
+                        }
+                    }
                     v3_named_results.push(ng_result);
                 }
 
@@ -4270,6 +4278,8 @@ where
                 let mut remap_elapsed = g0_result.remap_elapsed;
                 let mut build_elapsed = g0_result.build_elapsed;
 
+                // g1 (txn-meta) is a system graph; its per-class SPOT stats are
+                // intentionally not merged into the user-facing class stats.
                 if let Some((g1, _)) = g1_result {
                     total_rows += g1.total_rows;
                     total_remapped += g1.total_remapped;
