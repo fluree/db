@@ -74,6 +74,10 @@ use std::sync::Arc;
 /// Maximum POST rows the bounded tail scan may inspect before giving up and
 /// deferring to the generic top-k. Bounds worst-case wasted work when a class
 /// filter is far more selective than the ordering predicate is broad.
+///
+/// Checked *per leaf* (after each leaf's rows are scanned), so the bound is
+/// one-leaf-granular, not exact: a single large leaf — up to `leaf_target_rows`
+/// (default 250k, larger than this budget) — is fully scanned before the bail.
 const SCAN_BUDGET: usize = 200_000;
 
 /// A collected result row: `(o_type, o_key, s_id)` in descending value order.

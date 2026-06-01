@@ -4212,8 +4212,9 @@ where
                 };
 
                 // Build index segments for each user-defined named graph
-                // (g_id >= 2). Each is a separate pass over the commit blobs
-                // filtered to its g_id, mirroring the g_id=1 (txn-meta) build.
+                // (g_id >= FIRST_USER_GRAPH_ID, i.e. 3+). Each is a separate
+                // pass over the commit blobs filtered to its g_id, mirroring the
+                // g_id=1 (txn-meta) build.
                 // Empty for single-graph imports — zero cost on that hot path.
                 // Done before stats finalize so named-graph flakes contribute
                 // to the shared IdStatsHook (per-graph stats).
@@ -4235,6 +4236,13 @@ where
                     std::fs::create_dir_all(&cfg_ng.run_dir)
                         .map_err(|e| ImportError::IndexBuild(e.to_string()))?;
 
+                    // The `SpotClassStats` (per-(class,property) counts) are
+                    // intentionally dropped for named graphs: per-class stats are
+                    // collected for the default graph only (see the g0 build,
+                    // which keeps them). Named-graph per-property stats still flow
+                    // through the shared `IdStatsHook`; only the class-keyed
+                    // breakdown is default-graph-only for now. Merging named-graph
+                    // class stats into `stats.graphs[ng].classes` is a follow-up.
                     let (ng_result, _) = fluree_db_indexer::build_indexes_from_commits(
                         &commits,
                         &cfg_ng,

@@ -267,7 +267,9 @@ fn pin_object_entry(obj: &mut JsonMap<String, JsonValue>, ledgers: &HashMap<Stri
     obj.insert("t".to_string(), JsonValue::Number(t.into()));
 }
 
-/// Does this identifier string carry a `@t:`/`@iso:`/`@commit:` suffix?
+/// Does this identifier string carry a Fluree temporal marker
+/// (`@t:`/`@iso:`/`@commit:`)? Used to skip snapshot rewrite on already-pinned
+/// IRIs. Fragment suffixes (`#named-graph`) are not temporal and do not match.
 fn string_has_explicit_pin(s: &str) -> bool {
     ["@t:", "@iso:", "@commit:"].iter().any(|m| s.contains(m))
 }
@@ -282,13 +284,6 @@ fn bare_ledger_id(s: &str) -> &str {
         }
     }
     bare
-}
-
-/// Does this identifier string carry a Fluree temporal marker (`@t:`,
-/// `@iso:`, `@commit:`)? Used to skip rewrite on already-pinned IRIs.
-/// Fragment suffixes (`#named-graph`) are not temporal and do not match.
-fn has_temporal_marker(s: &str) -> bool {
-    ["@t:", "@iso:", "@commit:"].iter().any(|m| s.contains(m))
 }
 
 /// Apply the envelope snapshot to a SPARQL sub-query, returning a new query
@@ -333,7 +328,7 @@ pub fn apply_snapshot_to_sparql(sparql: &str, snapshot: &EnvelopeSnapshot) -> St
                 // temporal pin. Validation rejects collisions when
                 // envelope asOf is set, so this only fires in the
                 // no-asOf path where an inner pin should win.
-                if has_temporal_marker(value_str) {
+                if string_has_explicit_pin(value_str) {
                     continue;
                 }
                 // Splice `@t:N` BEFORE any `#fragment` so named-graph

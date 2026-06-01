@@ -1138,6 +1138,13 @@ impl LedgerManager {
                         // state/binary_store window on cancellation, and readers
                         // blocked on `state` never observe a half-applied swap).
                         let mut write_guard = handle.lock_for_write().await;
+                        // Compare total `t()` (novelty included), not `index_t()`:
+                        // this is deliberately novelty-protective. If the reloaded
+                        // state carries a newer persisted index but an older total
+                        // `t` than the in-memory state, we skip the swap and keep
+                        // the fresher novelty — transiently forgoing the newer
+                        // index, which the next reload picks up. Never clobber a
+                        // newer in-memory commit to adopt a newer index.
                         if new_state.t() >= write_guard.state().t() {
                             let mut bs_guard = handle.inner.binary_store.lock().await;
                             write_guard.replace(new_state);
