@@ -211,6 +211,39 @@ independent of `t` — the value of `--at --explain` is in honoring the
 contract and consistency with the query path, not in producing
 materially different plans.
 
+### `fluree multi-query`
+
+- `POST {api_base_url}/multi-query`
+
+Bundles N JSON-LD and/or SPARQL sub-queries into a single envelope that
+the server runs in parallel against one resolved snapshot moment. The
+CLI reads the envelope JSON (file / stdin / `-e` inline) and POSTs it
+to the connection-scoped `/multi-query` endpoint — each sub-query
+declares its own `from`, so there is no ledger-scoped variant.
+
+`fluree multi-query` resolves its transport in the same priority as `fluree query`:
+
+- **`--remote <name>`** — explicit; routes through the named remote's configured `base_url`. OIDC token refresh is persisted back to `config.toml` after a successful round-trip (same code path `fluree query --remote` uses via [`context::persist_refreshed_tokens`]).
+- **Auto-route to a locally running `fluree server`** — used when `--remote` is omitted and `server.meta.json` reports a live pid; bypassed by `--direct`. No token persistence on this branch (the local server doesn't require auth).
+- **In-process local** — when neither of the above applies (no remote, no running server, or `--direct` with no remote), the CLI calls `Fluree::multi_query()` directly against the storage tree configured for this `.fluree/` directory. Same code path the server handler ultimately invokes; the only thing that changes is the boundary at which the request enters the api crate. No HTTP, no auth, no impersonation gate — the caller already has direct authority over the local storage.
+
+**Authentication** uses the same `MaybeCredential` + `MaybeDataBearer`
+extractor stack as `/query` — Bearer tokens (JWT/JWS) and signed
+requests (JWS/VC) both work. **Bearer ledger-scope is enforced on
+every distinct ledger referenced in the envelope**: any out-of-scope
+ledger triggers a 404 on the whole envelope (existence-leak avoidance
+matching `/query`'s behavior), *not* a per-alias error.
+
+**Envelope-resident knobs replace some single-query CLI flags.** Multi-query doesn't take `--at` (use envelope-level `asOf`) or `--track-*` / `--max-fuel` (use envelope-level `opts.meta` and per-sub-query `opts.max-fuel`). It **does** accept the full `--policy*` flag bundle (`--as`, `--policy-class`, `--policy`, `--policy-file`, `--policy-values`, `--policy-values-file`, `--default-allow`) — the same surface `fluree query` exposes. The headers ride through the transport identically; each sub-query carries its own `from`, so policy applies per-ledger via the standard server-side policy path. See [Multi-query envelope](../api/multi-query.md) for the full envelope contract, response shape, merge rules, bounds, and current limitations (history queries rejected, envelope `max-fuel` rejected, response cap enforced at assembly, SPARQL policy parity gap).
+
+**Output formatting** uses two independent CLI flags:
+
+- `--format json|typed-json` selects the per-alias result shape (server-side formatter applied to each alias's entry inside `results`). Mirrors the `--format` flag on `fluree query`.
+- `--normalize-arrays` wraps single-valued JSON-LD properties in arrays. Composes with `--format` on JSON-LD aliases; on SPARQL aliases it is a no-op (SPARQL Results JSON has its own binding shape).
+- `--output json|pretty|aliases` controls how the CLI prints the response **envelope** on the terminal; it doesn't affect alias results.
+
+On the wire, `--format` / `--normalize-arrays` ride as `Fluree-Output-Format` / `Fluree-Normalize-Arrays` headers when going through `--remote` or auto-route; the in-process path wires them straight into the api crate's `MultiQueryBuilder::format(...)`. The server reads them with precedence `Fluree-Output-Format > Fluree-Normalize-Arrays alone > Accept-header content negotiation`. Unknown `Fluree-Output-Format` values return **400 Bad Request**; `Accept` values that produce byte/string payloads (TSV / CSV / SPARQL XML / RDF XML) return **406 Not Acceptable** when no explicit `Fluree-Output-Format` is set. `--format typed-json` is cross-language (applied to every alias); `--format json` (the default) keeps SPARQL aliases on SPARQL Results JSON. See [Multi-query envelope → Output formatting](../api/multi-query.md#output-formatting) for the full table.
+
 ### `fluree branch list` (read-only)
 
 - `GET {api_base_url}/branch/{ledger}` — note **singular** `branch`, ledger is a
@@ -309,6 +342,17 @@ should treat header values as defaults that body values override.
 For SPARQL requests (`Content-Type: application/sparql-query`,
 `application/sparql-update`), headers are the only transport — the SPARQL body
 has no opts block.
+
+For `POST /multi-query`, the CLI **does not** inject policy fields into the
+envelope body — it sends headers only. The server folds the headers into the
+envelope's top-level `opts` **before validation** (so envelope-level
+rejections like `max-fuel` apply to header-supplied values too), and the
+standard envelope → sub-query opts merge then carries them into every alias.
+
+**Per-language effect:**
+
+- **JSON-LD sub-queries** consume the merged `opts.identity` / `opts.policy-class` / `opts.policy` / `opts.policy-values` / `opts.default-allow` via `apply_auth_identity_to_opts` and the regular connection-scoped JSON-LD dispatch path — same code path `POST /query` uses for single queries.
+- **SPARQL sub-queries** match the single-query connection-scoped SPARQL behaviour of `POST /query` with `Content-Type: application/sparql-query` and an inline `FROM`: bearer-scope reads apply, but identity threading via `QueryConnectionOptions` (`opts.identity`, `opts.policy-class`, etc.) is not currently consumed by that path. The headers still ride through the transport, and the envelope-level fold still happens, but the SPARQL dispatcher (`query_from().sparql()`) does not act on policy opts. This gap is the same one documented for connection-scoped SPARQL today. See [Multi-query envelope → Limitations](../api/multi-query.md#limitations) for the canonical list.
 
 ### Required server behavior
 

@@ -137,6 +137,20 @@ pub struct ImportConfig {
     /// Maximum number of chunk texts materialized in memory simultaneously.
     /// 0 = derive from budget.
     pub max_inflight_chunks: usize,
+    /// When importing a directory of many small Turtle/N-Triples files, coalesce
+    /// consecutive sub-`chunk_size` files into ~`chunk_size` work items once the
+    /// directory holds more than this many small files. This bounds the number of
+    /// import chunks `k` (and therefore commit objects + sorted run files) so that
+    /// a directory of N tiny files does not behave like N separate imports.
+    ///
+    /// Coalescing is conservative: a file that contains a labeled blank node
+    /// (`_:`) or an `@base` directive is never merged with others (it would
+    /// change RDF document scope) — such files pass through as their own chunk.
+    ///
+    /// Files larger than `chunk_size` are always sub-split regardless of this
+    /// setting. `0` disables coalescing entirely (every file is its own chunk,
+    /// the legacy behavior). Default: 64.
+    pub coalesce_small_files_threshold: usize,
     /// Number of records per leaflet in the index. Default: 25_000.
     /// Larger values produce fewer, bigger leaflets (less I/O, more memory per read).
     pub leaflet_rows: usize,
@@ -185,6 +199,7 @@ impl Default for ImportConfig {
             chunk_size_mb: 0,
             chunk_max_flakes: 20_000_000,
             max_inflight_chunks: 0,
+            coalesce_small_files_threshold: 64,
             leaflet_rows: 25_000,
             leaflets_per_leaf: 10,
             leaf_target_rows: 250_000,
@@ -267,6 +282,18 @@ impl ImportConfig {
         } else {
             2
         }
+    }
+
+    /// Effective coalesce threshold (number of small files above which the local
+    /// directory rechunk producer merges sub-`chunk_size` files into larger work
+    /// items). Overridable via `FLUREE_IMPORT_COALESCE_THRESHOLD`; `0` disables.
+    pub fn effective_coalesce_threshold(&self) -> usize {
+        if let Ok(v) = std::env::var("FLUREE_IMPORT_COALESCE_THRESHOLD") {
+            if let Ok(n) = v.parse::<usize>() {
+                return n;
+            }
+        }
+        self.coalesce_small_files_threshold
     }
 
     /// Effective chunk size in MB (derived from budget if 0).
@@ -515,6 +542,7 @@ pub(crate) enum ImportSource {
 pub(crate) enum RemoteFormat {
     Ttl,
     Trig,
+    Nquads,
     JsonLd,
 }
 
@@ -541,6 +569,36 @@ pub struct RemoteChunkProducer {
     /// Per-object format, indexed by chunk_idx. Chunks arrive in the producer's
     /// input order, so chunk_idx == position in this vec.
     pub(crate) per_chunk_format: Vec<RemoteFormat>,
+}
+
+/// Channel-fed producer for **local directory** imports of Turtle/N-Triples files.
+///
+/// Walks a sorted list of `.ttl`/`.nt` files (incl. `.gz`/`.zst`) on a background
+/// thread and emits ~`chunk_size`-sized, self-contained TTL payloads to the parse
+/// workers — the same worker shape as [`RemoteChunkProducer`]. This decouples the
+/// number of import chunks `k` from the number of input files:
+///
+/// - **Large files** (effective uncompressed size > `chunk_size`) are sub-split at
+///   statement boundaries via [`StreamingTurtleReader`], with the file's prefix
+///   block prepended to each emitted chunk so every chunk is self-contained.
+/// - **Small files** are read whole and, when coalescing is enabled, concatenated
+///   up to ~`chunk_size` into a single chunk. A file containing a labeled blank
+///   node (`_:`) or an `@base`/`BASE` directive is never coalesced (doing so would
+///   change RDF document scope) — it passes through as its own chunk.
+///
+/// Because workers pull directly from `rx` (one mutex-guarded receiver shared
+/// across workers), this path keeps **all** parse threads busy — unlike the
+/// legacy file-by-index path, which throttled to `max_inflight` (2–3) concurrent
+/// chunks regardless of thread count.
+///
+/// **EOF semantics:** identical to [`RemoteChunkProducer`] — `rx` closing alone is
+/// not "success"; the driver must await `error_rx` after parsers exit.
+pub struct LocalChunkProducer {
+    pub(crate) rx: RemoteChunkRx,
+    pub(crate) error_rx:
+        std::sync::Mutex<Option<tokio::sync::oneshot::Receiver<Option<ImportError>>>>,
+    pub(crate) producer_handle: std::sync::Mutex<Option<std::thread::JoinHandle<()>>>,
+    pub(crate) estimated_count: usize,
 }
 
 impl RemoteChunkProducer {
@@ -581,6 +639,10 @@ pub enum ChunkSource {
     /// Remote-fetched whole objects (one chunk per object). Each object's
     /// prelude is auto-extracted at parse time, mirroring the local `Files` path.
     Remote(RemoteChunkProducer),
+    /// Local directory of Turtle/N-Triples files, rechunked into ~`chunk_size`
+    /// self-contained payloads by a background producer thread (splits large
+    /// files, coalesces small ones). Channel-fed, like `Remote`.
+    LocalRechunk(LocalChunkProducer),
 }
 
 impl ChunkSource {
@@ -592,6 +654,7 @@ impl ChunkSource {
             Self::Files(files) => files.len(),
             Self::Streaming(reader) => reader.estimated_chunk_count(),
             Self::Remote(producer) => producer.estimated_count,
+            Self::LocalRechunk(producer) => producer.estimated_count,
         }
     }
 
@@ -605,13 +668,20 @@ impl ChunkSource {
         matches!(self, Self::Remote(_))
     }
 
+    /// Whether this is the local-directory channel-fed rechunk source.
+    pub fn is_local_rechunk(&self) -> bool {
+        matches!(self, Self::LocalRechunk(_))
+    }
+
     /// Read chunk at `index` as a String (only for `Files` variant).
     ///
     /// Panics if called on `Streaming`/`Remote` — use `recv_next` instead.
     pub fn read_chunk(&self, index: usize) -> std::io::Result<String> {
         match self {
-            Self::Files(files) => std::fs::read_to_string(&files[index]),
-            Self::Streaming(_) | Self::Remote(_) => {
+            // Transparently decodes `.gz` / `.zst` wrappers; plain files use
+            // the original `read_to_string` fast path inside `read_decoded_to_string`.
+            Self::Files(files) => read_decoded_to_string(&files[index]),
+            Self::Streaming(_) | Self::Remote(_) | Self::LocalRechunk(_) => {
                 panic!("read_chunk not supported for channel-fed source; use recv_next")
             }
         }
@@ -642,34 +712,64 @@ impl ChunkSource {
                     None => Ok(None),
                 }
             }
-            Self::Files(_) | Self::Remote(_) => {
+            Self::Files(_) | Self::Remote(_) | Self::LocalRechunk(_) => {
                 panic!("recv_next not supported for this source variant")
             }
         }
     }
 
-    /// Whether chunk at `index` is a TriG file (case-insensitive).
+    /// Whether chunk at `index` is a TriG file (case-insensitive), including
+    /// compressed variants (`.trig.gz`, `.trig.zst`).
     pub fn is_trig(&self, index: usize) -> bool {
         match self {
             Self::Files(files) => files
                 .get(index)
-                .and_then(|p| p.extension())
-                .and_then(|ext| ext.to_str())
-                .is_some_and(|ext| ext.eq_ignore_ascii_case("trig")),
-            Self::Streaming(_) => false, // Streaming is Turtle only.
+                .is_some_and(|p| effective_extension(p).0.as_deref() == Some("trig")),
+            // Streaming and local rechunk are Turtle/N-Triples only.
+            Self::Streaming(_) | Self::LocalRechunk(_) => false,
             Self::Remote(producer) => matches!(producer.format_at(index), Some(RemoteFormat::Trig)),
         }
     }
 
-    /// Whether chunk at `index` is a JSON-LD file (case-insensitive `.jsonld`).
+    /// Whether chunk at `index` is an N-Quads file (`.nq`, also compressed).
+    ///
+    /// N-Quads is converted to TriG and dispatched through the same serial
+    /// `import_trig_commit` path, so it is handled wherever `is_trig` is.
+    pub fn is_nquads(&self, index: usize) -> bool {
+        match self {
+            Self::Files(files) => files
+                .get(index)
+                .is_some_and(|p| effective_extension(p).0.as_deref() == Some("nq")),
+            // Streaming and local rechunk are Turtle/N-Triples only.
+            Self::Streaming(_) | Self::LocalRechunk(_) => false,
+            Self::Remote(producer) => {
+                matches!(producer.format_at(index), Some(RemoteFormat::Nquads))
+            }
+        }
+    }
+
+    /// Whether any chunk is N-Quads. Used to force serial import — the parallel
+    /// pipeline only handles plain Turtle.
+    pub fn has_nquads(&self) -> bool {
+        match self {
+            Self::Files(files) => files
+                .iter()
+                .any(|p| effective_extension(p).0.as_deref() == Some("nq")),
+            Self::Streaming(_) | Self::LocalRechunk(_) => false,
+            Self::Remote(producer) => producer
+                .per_chunk_format
+                .iter()
+                .any(|f| matches!(f, RemoteFormat::Nquads)),
+        }
+    }
+
+    /// Whether chunk at `index` is a JSON-LD file (`.jsonld`, also compressed).
     pub fn is_jsonld(&self, index: usize) -> bool {
         match self {
             Self::Files(files) => files
                 .get(index)
-                .and_then(|p| p.extension())
-                .and_then(|ext| ext.to_str())
-                .is_some_and(|ext| ext.eq_ignore_ascii_case("jsonld")),
-            Self::Streaming(_) => false,
+                .is_some_and(|p| effective_extension(p).0.as_deref() == Some("jsonld")),
+            Self::Streaming(_) | Self::LocalRechunk(_) => false,
             Self::Remote(producer) => {
                 matches!(producer.format_at(index), Some(RemoteFormat::JsonLd))
             }
@@ -681,28 +781,133 @@ impl ChunkSource {
     /// Used to force serial import — the parallel pipeline only handles Turtle.
     pub fn has_jsonld(&self) -> bool {
         match self {
-            Self::Files(files) => files.iter().any(|p| {
-                p.extension()
-                    .and_then(|ext| ext.to_str())
-                    .is_some_and(|ext| ext.eq_ignore_ascii_case("jsonld"))
-            }),
-            Self::Streaming(_) => false,
+            Self::Files(files) => files
+                .iter()
+                .any(|p| effective_extension(p).0.as_deref() == Some("jsonld")),
+            Self::Streaming(_) | Self::LocalRechunk(_) => false,
             Self::Remote(producer) => producer.has_jsonld(),
         }
     }
 }
 
+// ============================================================================
+// Compression: transparent gzip / zstd support for any RDF input format
+// ============================================================================
+
+/// Optional outer-extension compression layer detected on an input file.
+///
+/// `data.ttl.gz` → `Gzip`; `data.nq.zst` → `Zstd`; `data.ttl` → `None`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Compression {
+    None,
+    Gzip,
+    Zstd,
+}
+
+/// Return the underlying RDF extension (lowercased) after stripping any
+/// outer `.gz`/`.zst`/`.zstd`, along with the detected compression layer.
+///
+/// Examples:
+/// - `foo.ttl.gz`  → `(Some("ttl"), Gzip)`
+/// - `foo.nq.zst`  → `(Some("nq"),  Zstd)`
+/// - `foo.ttl`     → `(Some("ttl"), None)`
+/// - `foo.gz`      → `(None,        Gzip)` (caller will reject — no RDF ext)
+/// - `foo`         → `(None,        None)`
+pub(crate) fn effective_extension(path: &Path) -> (Option<String>, Compression) {
+    let outer = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(str::to_ascii_lowercase);
+    let comp = match outer.as_deref() {
+        Some("gz") => Compression::Gzip,
+        Some("zst" | "zstd") => Compression::Zstd,
+        _ => return (outer, Compression::None),
+    };
+    let inner = path
+        .file_stem()
+        .map(Path::new)
+        .and_then(|p| p.extension())
+        .and_then(|e| e.to_str())
+        .map(str::to_ascii_lowercase);
+    (inner, comp)
+}
+
+/// Open `path` as a buffered byte stream, transparently decoding `.gz` / `.zst`.
+///
+/// Gzip uses `MultiGzDecoder` (handles concatenated streams from `pigz` /
+/// `bgzip`). The outer `BufReader` is sized to match the splitter's scan
+/// buffer for cache-friendly chunked reads.
+fn open_decoded(path: &Path) -> std::io::Result<Box<dyn std::io::BufRead + Send>> {
+    let file = std::fs::File::open(path)?;
+    let (_, comp) = effective_extension(path);
+    const BUF: usize = 256 * 1024;
+    let reader: Box<dyn std::io::BufRead + Send> = match comp {
+        Compression::None => Box::new(std::io::BufReader::with_capacity(BUF, file)),
+        Compression::Gzip => Box::new(std::io::BufReader::with_capacity(
+            BUF,
+            flate2::read::MultiGzDecoder::new(file),
+        )),
+        Compression::Zstd => Box::new(std::io::BufReader::with_capacity(
+            BUF,
+            zstd::stream::read::Decoder::new(file)?,
+        )),
+    };
+    Ok(reader)
+}
+
+/// Read the entire (possibly-compressed) file into a `String`.
+///
+/// Used by the small-file `Files` path. For plain inputs this is just
+/// `std::fs::read_to_string`; compressed inputs stream through the decoder.
+fn read_decoded_to_string(path: &Path) -> std::io::Result<String> {
+    let (_, comp) = effective_extension(path);
+    if matches!(comp, Compression::None) {
+        return std::fs::read_to_string(path);
+    }
+    let mut reader = open_decoded(path)?;
+    let mut s = String::new();
+    std::io::Read::read_to_string(&mut reader, &mut s)?;
+    Ok(s)
+}
+
 /// Resolve the import path into a `ChunkSource`.
 ///
-/// - If `path` is a directory: discover `.ttl`/`.trig`/`.jsonld` files (sorted lexicographically).
-/// - If `path` is a single large `.ttl` file: auto-split using `TurtleChunkReader`.
-/// - If `path` is a single small `.ttl`/`.trig`/`.jsonld` file: treat as a single-element `Files` source.
+/// - If `path` is a directory of only `.ttl`/`.nt` files: rechunk via the
+///   channel-fed [`LocalChunkProducer`] (splits large files, coalesces small
+///   ones) so the chunk count tracks total bytes, not file count.
+/// - If `path` is a directory containing any `.trig`/`.nq`/`.jsonld`: use the
+///   index-based `Files` source (the serial named-graph/JSON-LD path).
+/// - If `path` is a single large `.ttl` file: auto-split using `StreamingTurtleReader`.
+/// - If `path` is a single small `.ttl`/`.nt`/`.nq`/`.trig`/`.jsonld` file: treat as a single-element `Files` source.
+/// - All extensions above also accept `.gz` and `.zst` suffixes (e.g. `data.ttl.gz`).
 fn resolve_chunk_source(
     path: &Path,
     config: &ImportConfig,
 ) -> std::result::Result<ChunkSource, ImportError> {
     if path.is_dir() {
         let files = discover_chunks(path)?;
+
+        // A directory of purely Turtle/N-Triples files can be rechunked through
+        // the channel-fed producer (true N-wide parsing + bounded chunk count).
+        // Any TriG/N-Quads/JSON-LD file forces the index-based `Files` path,
+        // which routes those formats through their dedicated serial parsers.
+        let all_turtle = files
+            .iter()
+            .all(|p| matches!(effective_extension(p).0.as_deref(), Some("ttl" | "nt")));
+
+        if all_turtle && !files.is_empty() {
+            let chunk_size_bytes = config.effective_chunk_size_mb() as u64 * 1024 * 1024;
+            let channel_capacity = config.effective_max_inflight();
+            let coalesce_threshold = config.effective_coalesce_threshold();
+            let producer = spawn_local_producer(
+                files,
+                chunk_size_bytes,
+                channel_capacity,
+                coalesce_threshold,
+            );
+            return Ok(ChunkSource::LocalRechunk(producer));
+        }
+
         return Ok(ChunkSource::Files(files));
     }
 
@@ -714,13 +919,20 @@ fn resolve_chunk_source(
     }
 
     // Single file — decide whether to auto-split based on size.
+    //
+    // For a compressed file, `metadata().len()` reports the *compressed* size,
+    // which is what we want for the parallel-split threshold (a 200 MB .gz
+    // expanding to 2 GB still warrants streaming). The uncompressed size is
+    // unknown ahead of time; the streaming reader treats `0` as "unknown" for
+    // its progress denominator.
     let file_size = std::fs::metadata(path)?.len();
     let chunk_size_bytes = config.effective_chunk_size_mb() as u64 * 1024 * 1024;
 
-    let is_ttl = path
-        .extension()
-        .and_then(|ext| ext.to_str())
-        .is_some_and(|ext| ext.eq_ignore_ascii_case("ttl"));
+    // `.nt` (N-Triples) is a strict subset of Turtle, so it streams/splits
+    // through the same triple-boundary reader as `.ttl`. `.ttl.gz` / `.nt.gz`
+    // and the `.zst` variants stream too — via the new factory constructor.
+    let (inner_ext, compression) = effective_extension(path);
+    let is_ttl = matches!(inner_ext.as_deref(), Some("ttl" | "nt"));
 
     if is_ttl && file_size > chunk_size_bytes {
         // Large file: stream chunks via background reader thread.
@@ -745,22 +957,42 @@ fn resolve_chunk_source(
                 f
             });
 
-        let reader = fluree_graph_turtle::splitter::StreamingTurtleReader::new(
-            path,
-            chunk_size_bytes,
-            reader_channel_capacity,
-            scan_progress,
-        )
-        .map_err(|e| ImportError::NoChunks(format!("turtle file split failed: {e}")))?;
+        let reader = if matches!(compression, Compression::None) {
+            // Plain file: original seek-backed fast path.
+            fluree_graph_turtle::splitter::StreamingTurtleReader::new(
+                path,
+                chunk_size_bytes,
+                reader_channel_capacity,
+                scan_progress,
+            )
+            .map_err(|e| ImportError::NoChunks(format!("turtle file split failed: {e}")))?
+        } else {
+            // Compressed file: hand the splitter a factory that opens a fresh
+            // decoder on demand. Uncompressed size is unknown — pass 0 so
+            // the splitter omits a percentage denominator (estimated_chunks
+            // will be 0, which is fine for serial-equivalent throughput).
+            let path_owned = path.to_path_buf();
+            let factory = move || open_decoded(&path_owned);
+            fluree_graph_turtle::splitter::StreamingTurtleReader::new_from_factory(
+                factory,
+                0,
+                chunk_size_bytes,
+                reader_channel_capacity,
+                scan_progress,
+            )
+            .map_err(|e| ImportError::NoChunks(format!("compressed turtle split failed: {e}")))?
+        };
         tracing::info!(
             estimated_chunks = reader.estimated_chunk_count(),
             chunk_size_mb = config.effective_chunk_size_mb(),
             file_size_mb = file_size / (1024 * 1024),
+            compression = ?compression,
             "streaming large Turtle file (no pre-scan)"
         );
         Ok(ChunkSource::Streaming(reader))
     } else {
-        // Small file or non-TTL: treat as a single-element source.
+        // Small file or non-TTL: treat as a single-element source. The Files
+        // variant's `read_chunk` transparently decodes `.gz` / `.zst`.
         Ok(ChunkSource::Files(vec![path.to_path_buf()]))
     }
 }
@@ -812,7 +1044,8 @@ async fn resolve_remote_objects(
             .and_then(|e| e.to_str())
             .map(str::to_ascii_lowercase);
         match ext.as_deref() {
-            Some("ttl") => {
+            // `.nt` (N-Triples) is a Turtle subset — parse it as Turtle.
+            Some("ttl" | "nt") => {
                 has_ttl = true;
                 accepted.push(obj);
                 extensions.push(RemoteFormat::Ttl);
@@ -821,6 +1054,12 @@ async fn resolve_remote_objects(
                 has_trig = true;
                 accepted.push(obj);
                 extensions.push(RemoteFormat::Trig);
+            }
+            // N-Quads → converted to TriG and dispatched via the serial path.
+            Some("nq") => {
+                has_trig = true;
+                accepted.push(obj);
+                extensions.push(RemoteFormat::Nquads);
             }
             Some("jsonld") => {
                 has_jsonld = true;
@@ -844,26 +1083,15 @@ async fn resolve_remote_objects(
 
     if accepted.is_empty() {
         return Err(ImportError::NoChunks(
-            "remote source contains no .ttl/.trig/.jsonld objects".into(),
+            "remote source contains no .ttl/.nt/.nq/.trig/.jsonld objects".into(),
         ));
     }
 
-    // `.trig` import is wired through the same serial path the local
-    // `.import(dir)` uses, but that path has a documented upstream limitation
-    // in `import_trig_commit` (fluree-db-transact/src/import.rs): the Tier 2
-    // spool/index pipeline does not fully capture TriG content. Imported TriG
-    // data may not become queryable. Fail loud rather than silently producing
-    // a half-imported ledger.
-    if has_trig {
-        return Err(ImportError::NoChunks(
-            "remote .trig import is not currently supported: the Tier 2 import \
-             pipeline does not fully capture named-graph or default-graph TriG \
-             content, so imported data may not become queryable. Convert TriG \
-             to .ttl or .jsonld before import. See `import_trig_commit` in \
-             fluree-db-transact/src/import.rs for context."
-                .into(),
-        ));
-    }
+    // `.trig` import (including named GRAPH blocks) is fully supported: it runs
+    // through the same serial `import_trig_commit` path the local `.import(dir)`
+    // uses. Default-graph and named-graph flakes are both spooled and indexed,
+    // and named graphs are queryable via the `#<graph-iri>` fragment. See the
+    // named-graph spool wiring in `import_trig_commit` (fluree-db-transact).
 
     Ok((accepted, extensions))
 }
@@ -949,6 +1177,298 @@ fn spawn_remote_producer(
 }
 
 // ============================================================================
+// Local directory rechunk producer
+// ============================================================================
+
+/// Find the first occurrence of `needle` in `haystack`.
+fn find_subsequence(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    if needle.is_empty() || haystack.len() < needle.len() {
+        return None;
+    }
+    haystack.windows(needle.len()).position(|w| w == needle)
+}
+
+/// Detect a Turtle/SPARQL **base** directive: a case-insensitive `base`
+/// keyword (left-bounded by start-of-input or a non-alphanumeric byte, so
+/// `database` does not match) immediately followed — after optional ASCII
+/// whitespace — by `<`. Matches both `@base <…>` and SPARQL-style `BASE <…>`.
+fn contains_base_directive(bytes: &[u8]) -> bool {
+    let n = bytes.len();
+    if n < 5 {
+        return false;
+    }
+    let mut i = 0;
+    while i + 4 <= n {
+        if bytes[i].eq_ignore_ascii_case(&b'b')
+            && bytes[i + 1].eq_ignore_ascii_case(&b'a')
+            && bytes[i + 2].eq_ignore_ascii_case(&b's')
+            && bytes[i + 3].eq_ignore_ascii_case(&b'e')
+        {
+            let left_ok = i == 0 || !bytes[i - 1].is_ascii_alphanumeric();
+            if left_ok {
+                let mut j = i + 4;
+                while j < n && bytes[j].is_ascii_whitespace() {
+                    j += 1;
+                }
+                if j < n && bytes[j] == b'<' {
+                    return true;
+                }
+            }
+        }
+        i += 1;
+    }
+    false
+}
+
+/// Conservative check: is it unsafe to **coalesce** this file's text with other
+/// files into a single parse chunk?
+///
+/// Coalescing concatenates whole files into one chunk parsed as a single Turtle
+/// document, which changes RDF document scope. Two constructs make that unsafe:
+/// - **Labeled blank nodes** (`_:`): blank-node labels are document-scoped, so
+///   `_:b1` in file A and `_:b1` in file B are distinct nodes. Merging the files
+///   into one parse would unify them — wrong.
+/// - **Base directives** (`@base` / `BASE`): a set base leaks forward into a
+///   following concatenated file that relies on the document base for relative
+///   IRI resolution.
+///
+/// False positives only force the file to be emitted as its own chunk (still
+/// correct — just slightly more chunks), so the scan errs toward "unsafe".
+fn coalesce_unsafe(bytes: &[u8]) -> bool {
+    find_subsequence(bytes, b"_:").is_some() || contains_base_directive(bytes)
+}
+
+/// Conservative lower bound on the decompression ratio of a compressed RDF file.
+///
+/// Used to decide whether a *compressed* small-on-disk file might decode to more
+/// than `chunk_size` and should therefore be streamed/split rather than read
+/// whole. Turtle/N-Triples compress very well (often 8–12×); a conservative 6×
+/// errs toward splitting, which is always safe (the splitter handles small
+/// inputs as a single chunk). Underestimating only risks reading whole; the
+/// real-world risk we are guarding against (e.g. a 438 MB `.ttl.gz` decoding to
+/// ~4 GB) is caught comfortably.
+const COMPRESSED_DECODE_RATIO: u64 = 6;
+
+/// Should this file be routed to the streaming **split** path (vs. read whole)?
+///
+/// - Plain files: split when the on-disk size exceeds `chunk_size`.
+/// - Compressed files: split when the *estimated decoded* size
+///   (`on_disk × COMPRESSED_DECODE_RATIO`) exceeds `chunk_size`, so a small
+///   compressed file that explodes on decode is sub-split instead of
+///   materialized whole.
+fn should_stream_split(path: &Path, on_disk: u64, chunk_size_bytes: u64) -> bool {
+    let (_inner, comp) = effective_extension(path);
+    let est_decoded = match comp {
+        Compression::None => on_disk,
+        _ => on_disk.saturating_mul(COMPRESSED_DECODE_RATIO),
+    };
+    est_decoded > chunk_size_bytes
+}
+
+/// Background rechunk loop for a local directory of plain Turtle/N-Triples
+/// files. Walks `files` in order, emitting contiguous `(idx, bytes)` chunks:
+/// large files are sub-split at statement boundaries; small files are read
+/// whole and (when `coalesce_enabled`) concatenated up to ~`chunk_size`.
+///
+/// Returns `Ok(())` on completion **or** on a closed receiver (consumer aborted
+/// upstream — not this producer's error). Returns `Err` only for an actual
+/// read/split failure.
+fn local_rechunk_loop(
+    files: &[PathBuf],
+    sizes: &[u64],
+    chunk_size_bytes: u64,
+    coalesce_enabled: bool,
+    tx: &std::sync::mpsc::SyncSender<(usize, Vec<u8>)>,
+) -> std::result::Result<(), ImportError> {
+    let mut next_idx = 0usize;
+    // Accumulated self-contained TTL text for coalesced small files.
+    let mut buf: Vec<u8> = Vec::new();
+
+    macro_rules! emit {
+        ($payload:expr) => {{
+            if tx.send((next_idx, $payload)).is_err() {
+                // Consumer dropped the receiver — pipeline aborted upstream.
+                return Ok(());
+            }
+            next_idx += 1;
+        }};
+    }
+
+    for (fi, path) in files.iter().enumerate() {
+        let on_disk = sizes[fi];
+        let (_inner_ext, comp) = effective_extension(path);
+
+        if should_stream_split(path, on_disk, chunk_size_bytes) {
+            // ---- Large file (or compressed file that decodes large): sub-split
+            // at statement boundaries. ----
+            // Flush any pending coalesce buffer first to preserve ordering.
+            if !buf.is_empty() {
+                emit!(std::mem::take(&mut buf));
+            }
+
+            let mut reader = if matches!(comp, Compression::None) {
+                fluree_graph_turtle::splitter::StreamingTurtleReader::new(
+                    path,
+                    chunk_size_bytes,
+                    2,
+                    None,
+                )
+                .map_err(|e| {
+                    ImportError::NoChunks(format!(
+                        "turtle split failed for {}: {e}",
+                        path.display()
+                    ))
+                })?
+            } else {
+                let path_owned = path.to_path_buf();
+                let factory = move || open_decoded(&path_owned);
+                fluree_graph_turtle::splitter::StreamingTurtleReader::new_from_factory(
+                    factory,
+                    0,
+                    chunk_size_bytes,
+                    2,
+                    None,
+                )
+                .map_err(|e| {
+                    ImportError::NoChunks(format!(
+                        "compressed turtle split failed for {}: {e}",
+                        path.display()
+                    ))
+                })?
+            };
+
+            // The splitter strips the prefix block from each chunk's bytes;
+            // prepend it so every emitted chunk is a self-contained document
+            // parseable with `prelude: None`.
+            let prefix = reader.prefix_block().as_bytes().to_vec();
+            loop {
+                match reader.recv_chunk() {
+                    Ok(Some((_sub_idx, raw))) => {
+                        let mut payload = Vec::with_capacity(prefix.len() + 1 + raw.len());
+                        payload.extend_from_slice(&prefix);
+                        payload.push(b'\n');
+                        payload.extend_from_slice(&raw);
+                        emit!(payload);
+                    }
+                    Ok(None) => break,
+                    Err(e) => {
+                        return Err(ImportError::NoChunks(format!(
+                            "streaming read failed for {}: {e}",
+                            path.display()
+                        )));
+                    }
+                }
+            }
+            // Join the reader thread to surface any error it hit (a reader
+            // failure also closes the channel, which `recv_chunk` reports as a
+            // benign `Ok(None)` — so without this join the error is lost).
+            reader.join().map_err(|e| {
+                ImportError::NoChunks(format!(
+                    "turtle reader thread failed for {}: {e}",
+                    path.display()
+                ))
+            })?;
+        } else {
+            // ---- Small file: read whole (decodes .gz/.zst). ----
+            let text = read_decoded_to_string(path).map_err(|e| {
+                ImportError::NoChunks(format!("failed to read {}: {e}", path.display()))
+            })?;
+            let bytes = text.into_bytes();
+
+            if !coalesce_enabled || coalesce_unsafe(&bytes) {
+                // Emit standalone (flush any pending buffer first).
+                if !buf.is_empty() {
+                    emit!(std::mem::take(&mut buf));
+                }
+                emit!(bytes);
+            } else {
+                // Coalesce: flush first if adding would overflow the target.
+                if !buf.is_empty() && (buf.len() + 1 + bytes.len()) as u64 > chunk_size_bytes {
+                    emit!(std::mem::take(&mut buf));
+                }
+                if !buf.is_empty() {
+                    buf.push(b'\n');
+                }
+                buf.extend_from_slice(&bytes);
+                if buf.len() as u64 >= chunk_size_bytes {
+                    emit!(std::mem::take(&mut buf));
+                }
+            }
+        }
+    }
+
+    // Final flush — send directly (no index advance needed after the last chunk).
+    if !buf.is_empty() && tx.send((next_idx, buf)).is_err() {
+        // Consumer dropped the receiver — pipeline aborted upstream.
+        return Ok(());
+    }
+    Ok(())
+}
+
+/// Spawn the local-directory rechunk producer (see [`LocalChunkProducer`]).
+///
+/// `files` must be the sorted list of plain `.ttl`/`.nt` files (incl. `.gz`/
+/// `.zst`). `channel_capacity` bounds in-flight buffered chunks (memory knob,
+/// like the streaming reader's channel). Coalescing of small files engages only
+/// when the directory holds more than `coalesce_threshold` sub-`chunk_size`
+/// files (`0` disables it).
+fn spawn_local_producer(
+    files: Vec<PathBuf>,
+    chunk_size_bytes: u64,
+    channel_capacity: usize,
+    coalesce_threshold: usize,
+) -> LocalChunkProducer {
+    let estimated_count = files.len();
+    let channel_capacity = channel_capacity.max(1);
+
+    // Stat every file once: drives both the coalesce gate and the per-file
+    // split-vs-read decision in the loop.
+    let sizes: Vec<u64> = files
+        .iter()
+        .map(|p| std::fs::metadata(p).map(|m| m.len()).unwrap_or(0))
+        .collect();
+    // "Small" = read-whole candidate (not routed to the splitter). A compressed
+    // file that decodes large is a split candidate, not a small file.
+    let small_count = files
+        .iter()
+        .zip(&sizes)
+        .filter(|(p, &sz)| !should_stream_split(p, sz, chunk_size_bytes))
+        .count();
+    let coalesce_enabled = coalesce_threshold > 0 && small_count > coalesce_threshold;
+
+    tracing::info!(
+        files = files.len(),
+        small_files = small_count,
+        coalesce_threshold,
+        coalesce_enabled,
+        chunk_size_mb = chunk_size_bytes / (1024 * 1024),
+        channel_capacity,
+        "local directory rechunk producer"
+    );
+
+    let (tx, rx) = std::sync::mpsc::sync_channel::<(usize, Vec<u8>)>(channel_capacity);
+    let (error_tx, error_rx) = tokio::sync::oneshot::channel::<Option<ImportError>>();
+
+    let producer_handle = std::thread::Builder::new()
+        .name("ttl-local-rechunk".into())
+        .spawn(move || {
+            let result =
+                local_rechunk_loop(&files, &sizes, chunk_size_bytes, coalesce_enabled, &tx);
+            // Drop tx so workers see EOF, then signal success/failure.
+            drop(tx);
+            let _ = error_tx.send(result.err());
+        })
+        .expect("spawn local rechunk producer thread");
+
+    LocalChunkProducer {
+        rx: Arc::new(std::sync::Mutex::new(rx)),
+        error_rx: std::sync::Mutex::new(Some(error_rx)),
+        producer_handle: std::sync::Mutex::new(Some(producer_handle)),
+        estimated_count,
+    }
+}
+
+// ============================================================================
 // Builder
 // ============================================================================
 
@@ -1017,6 +1537,15 @@ impl<'a> ImportBuilder<'a> {
     /// Set the maximum flakes per chunk. 0 = no limit. Default: 20_000_000.
     pub fn chunk_max_flakes(mut self, n: usize) -> Self {
         self.config.chunk_max_flakes = n;
+        self
+    }
+
+    /// Set the small-file coalesce threshold for directory imports. When a
+    /// directory holds more than `n` sub-`chunk_size` files, consecutive small
+    /// files are merged into ~`chunk_size` work items to bound the chunk count.
+    /// `0` disables coalescing (every file is its own chunk). Default: 64.
+    pub fn coalesce_small_files_threshold(mut self, n: usize) -> Self {
+        self.config.coalesce_small_files_threshold = n;
         self
     }
 
@@ -1143,7 +1672,7 @@ impl<'a> CreateBuilder<'a> {
 
     /// Attach a bulk import to this create operation.
     ///
-    /// `path` can be a directory containing `.ttl`/`.trig`/`.jsonld` files
+    /// `path` can be a directory containing `.ttl`/`.nt`/`.nq`/`.trig`/`.jsonld` files
     /// (sorted lexicographically), or a single `.ttl`/`.jsonld` file.
     pub fn import(self, path: impl AsRef<Path>) -> ImportBuilder<'a> {
         ImportBuilder::new(self.fluree, self.ledger_id, path.as_ref().to_path_buf())
@@ -1186,7 +1715,7 @@ impl<'a> CreateBuilder<'a> {
 /// What kind of data files a directory contains.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DirectoryFormat {
-    /// Only `.ttl` / `.trig` files found.
+    /// Only `.ttl` / `.nt` / `.nq` / `.trig` files found.
     Turtle,
     /// Only `.jsonld` files found.
     JsonLd,
@@ -1194,7 +1723,7 @@ pub enum DirectoryFormat {
 
 /// Scan a directory and determine its data format.
 ///
-/// Returns [`DirectoryFormat::Turtle`] if all supported files are `.ttl`/`.trig`,
+/// Returns [`DirectoryFormat::Turtle`] if all supported files are `.ttl`/`.nt`/`.nq`/`.trig`,
 /// [`DirectoryFormat::JsonLd`] if all are `.jsonld`.
 /// Returns [`ImportError::MixedFormats`] on mixed formats,
 /// [`ImportError::NoChunks`] on empty directories or directories with no supported files.
@@ -1210,12 +1739,13 @@ pub fn scan_directory_format(dir: &Path) -> std::result::Result<DirectoryFormat,
         if !entry.file_type().is_ok_and(|ft| ft.is_file()) {
             continue;
         }
-        if let Some(ext) = entry.path().extension().and_then(|e| e.to_str()) {
-            match ext.to_ascii_lowercase().as_str() {
-                "ttl" | "trig" => has_turtle = true,
-                "jsonld" => has_jsonld = true,
-                _ => {}
-            }
+        // `effective_extension` strips an outer `.gz`/`.zst` so compressed
+        // RDF files (`foo.ttl.gz`, `foo.nq.zst`, …) classify identically.
+        let inner = effective_extension(&entry.path()).0;
+        match inner.as_deref() {
+            Some("ttl" | "trig" | "nt" | "nq") => has_turtle = true,
+            Some("jsonld") => has_jsonld = true,
+            _ => {}
         }
     }
 
@@ -1228,7 +1758,7 @@ pub fn scan_directory_format(dir: &Path) -> std::result::Result<DirectoryFormat,
         (true, false) => Ok(DirectoryFormat::Turtle),
         (false, true) => Ok(DirectoryFormat::JsonLd),
         (false, false) => Err(ImportError::NoChunks(format!(
-            "no supported data files (.ttl, .trig, .jsonld) found in {}",
+            "no supported data files (.ttl, .nt, .nq, .trig, .jsonld) found in {}",
             dir.display()
         ))),
     }
@@ -1238,7 +1768,7 @@ pub fn scan_directory_format(dir: &Path) -> std::result::Result<DirectoryFormat,
 // Chunk discovery
 // ============================================================================
 
-/// Discover and sort `.ttl`, `.trig`, or `.jsonld` files from a directory (case-insensitive).
+/// Discover and sort `.ttl`, `.nt`, `.nq`, `.trig`, or `.jsonld` files from a directory (case-insensitive).
 ///
 /// Returns an error if the directory contains a mix of Turtle (`.ttl`/`.trig`) and
 /// JSON-LD (`.jsonld`) files — all files must be the same format family.
@@ -1261,14 +1791,13 @@ fn discover_chunks(dir: &Path) -> std::result::Result<Vec<PathBuf>, ImportError>
         .filter_map(std::result::Result::ok)
         .filter(|e| e.file_type().is_ok_and(|ft| ft.is_file()))
         .map(|e| e.path())
+        // `effective_extension` strips compression suffixes, so `.ttl.gz`,
+        // `.nq.zst`, etc. are accepted alongside their plain counterparts.
         .filter(|p| {
-            p.extension()
-                .and_then(|ext| ext.to_str())
-                .is_some_and(|ext| {
-                    ext.eq_ignore_ascii_case("ttl")
-                        || ext.eq_ignore_ascii_case("trig")
-                        || ext.eq_ignore_ascii_case("jsonld")
-                })
+            matches!(
+                effective_extension(p).0.as_deref(),
+                Some("ttl" | "nt" | "trig" | "nq" | "jsonld")
+            )
         })
         .collect();
 
@@ -1515,6 +2044,9 @@ struct IndexBuildInput<'a> {
     collect_id_stats: bool,
     /// Turtle @prefix IRI → short prefix name, for IRI compaction in display.
     prefix_map: &'a HashMap<String, String>,
+    /// User-defined named graph g_ids (>= 2) to build index segments for.
+    /// Empty for single-graph imports.
+    named_g_ids: Vec<u16>,
 }
 
 /// Run phases 2-6: import chunks, build indexes, upload to CAS, write V4 root, publish.
@@ -1572,6 +2104,7 @@ where
             rdf_type_p_id: import_result.rdf_type_p_id,
             collect_id_stats: config.collect_id_stats,
             prefix_map: &import_result.prefix_map,
+            named_g_ids: import_result.named_g_ids,
         };
         let index_result = build_and_upload(
             storage,
@@ -1676,6 +2209,9 @@ struct ChunkImportResult {
     dt_width: u8,
     /// Predicate ID for rdf:type (for inline class stats during SPOT merge).
     rdf_type_p_id: u32,
+    /// User-defined named graph g_ids (>= 2) to build index segments for.
+    /// Empty for single-graph imports.
+    named_g_ids: Vec<u16>,
 }
 
 /// Import all TTL chunks: parallel parse + serial commit + streaming runs.
@@ -1914,7 +2450,8 @@ where
     };
     let is_remote_parallel = is_remote && remote_all_ttl;
     let is_remote_serial = is_remote && !remote_all_ttl;
-    let is_channel_fed = is_streaming || is_remote_parallel;
+    let is_local_rechunk = chunk_source.is_local_rechunk();
+    let is_channel_fed = is_streaming || is_remote_parallel || is_local_rechunk;
     let estimated_total = chunk_source.estimated_len();
     let compress = config.compress_commits;
     let num_threads = config.parse_threads;
@@ -2305,20 +2842,28 @@ where
             committed_chunks = next_expected,
             "streaming import phase complete"
         );
-    } else if is_remote_parallel {
-        // Remote parallel path (all-`.ttl` remote): workers receive whole-object
-        // payloads from a producer task (async tokio fetch) bridged into a sync
-        // channel by a small forwarder thread. Workers parse with auto-extracted
-        // per-chunk prelude (each remote object is a self-contained file with
-        // its own header) — same parser semantics as the local `Files` path,
-        // but bytes arrive via channel instead of disk read.
+    } else if is_remote_parallel || is_local_rechunk {
+        // Channel-fed parallel path. Two sources share this arm:
         //
-        // The remote arm always uses at least one parser worker — zero workers
-        // would mean the bridge thread blocks forever sending into an unread
-        // channel.
+        // - **Remote, all-`.ttl`**: workers receive whole-object payloads from an
+        //   async tokio fetch task, bridged into a sync channel.
+        // - **Local directory rechunk**: workers receive ~`chunk_size`,
+        //   self-contained TTL payloads from the local producer thread (large
+        //   files split, small files coalesced).
+        //
+        // In both cases the payload is a self-contained Turtle document parsed
+        // with an auto-extracted per-chunk prelude (`prelude: None`) — identical
+        // parser semantics to the local `Files` path, but bytes arrive via a
+        // shared channel that keeps every parse worker busy (no `max_inflight`
+        // throttle). At least one worker is always used — zero would deadlock the
+        // producer sending into an unread channel.
         let num_threads = num_threads.max(1);
         let ledger = alias.to_string();
 
+        // Both producers expose `(rx, error_rx, join_handle)` with identical EOF
+        // semantics: the channel closing is not "success" on its own — we must
+        // await `error_rx` after parsers drain to distinguish clean completion
+        // from a producer error.
         let (remote_rx, error_rx, bridge_handle) = match &**chunk_source {
             ChunkSource::Remote(producer) => {
                 let error_rx = producer.error_rx.lock().unwrap().take().ok_or_else(|| {
@@ -2329,7 +2874,16 @@ where
                 let bridge = producer.bridge_handle.lock().unwrap().take();
                 (Arc::clone(&producer.rx), error_rx, bridge)
             }
-            _ => unreachable!("is_remote guard"),
+            ChunkSource::LocalRechunk(producer) => {
+                let error_rx = producer.error_rx.lock().unwrap().take().ok_or_else(|| {
+                    ImportError::Transact(
+                        "local rechunk producer error_rx already taken (import re-entered?)".into(),
+                    )
+                })?;
+                let producer_handle = producer.producer_handle.lock().unwrap().take();
+                (Arc::clone(&producer.rx), error_rx, producer_handle)
+            }
+            _ => unreachable!("is_remote_parallel || is_local_rechunk guard"),
         };
 
         // One slot per worker is sufficient (same logic as streaming arm).
@@ -2410,8 +2964,10 @@ where
         for handle in parse_handles {
             handle.join().expect("parse thread panicked");
         }
-        if let Some(bridge) = bridge_handle {
-            bridge.join().expect("remote bridge thread panicked");
+        if let Some(producer_thread) = bridge_handle {
+            producer_thread
+                .join()
+                .expect("channel-fed producer thread panicked");
         }
 
         // CRITICAL: distinguish clean EOF from producer failure.
@@ -2424,14 +2980,19 @@ where
             Ok(Some(err)) => return Err(err),
             Err(_) => {
                 return Err(ImportError::Storage(
-                    "remote producer task dropped without signaling completion".into(),
+                    "channel-fed producer dropped without signaling completion".into(),
                 ));
             }
         }
 
         tracing::info!(
             committed_chunks = next_expected,
-            "remote import phase complete"
+            source = if is_local_rechunk {
+                "local-rechunk"
+            } else {
+                "remote"
+            },
+            "channel-fed import phase complete"
         );
     } else if is_remote_serial {
         // Remote serial path: producer fetches each object whole; we drain
@@ -2467,10 +3028,19 @@ where
                 .map_err(|e| ImportError::Transact(format!("chunk {idx} invalid UTF-8: {e}")))?;
             let t = (idx + 1) as i64;
 
-            let result = if chunk_source.is_trig(idx) {
+            let result = if chunk_source.is_trig(idx) || chunk_source.is_nquads(idx) {
+                // N-Quads is converted to TriG up front; TriG passes through.
+                let nq_converted;
+                let trig_content: &str = if chunk_source.is_nquads(idx) {
+                    nq_converted = fluree_db_transact::parse::nquads_to_trig(&content)
+                        .map_err(|e| ImportError::Transact(e.to_string()))?;
+                    &nq_converted
+                } else {
+                    &content
+                };
                 let r = import_trig_commit(
                     &mut state,
-                    &content,
+                    trig_content,
                     storage,
                     alias,
                     compress,
@@ -2583,9 +3153,11 @@ where
         );
     } else {
         // File-based path: index-based access to chunk files.
+        // TriG and N-Quads (converted to TriG) both use the serial path.
         let has_trig = (0..estimated_total).any(|i| chunk_source.is_trig(i));
+        let has_nquads = chunk_source.has_nquads();
         let has_jsonld = chunk_source.has_jsonld();
-        if estimated_total > 0 && num_threads > 0 && !has_trig && !has_jsonld {
+        if estimated_total > 0 && num_threads > 0 && !has_trig && !has_nquads && !has_jsonld {
             let ledger = alias.to_string();
 
             let next_chunk = Arc::new(AtomicUsize::new(0));
@@ -2693,13 +3265,22 @@ where
                 let content = chunk_source.read_chunk(i)?;
                 let t = (i + 1) as i64;
 
-                let result = if chunk_source.is_trig(i) {
-                    // TriG uses its own commit function (named graph handling).
-                    // It allocates codes in state.ns_registry; sync them to
-                    // shared_alloc afterward for subsequent chunks' spool writes.
+                let result = if chunk_source.is_trig(i) || chunk_source.is_nquads(i) {
+                    // TriG (and N-Quads, converted to TriG) use the dedicated
+                    // commit function for named-graph handling. It allocates
+                    // codes in state.ns_registry; sync them to shared_alloc
+                    // afterward for subsequent chunks' spool writes.
+                    let nq_converted;
+                    let trig_content: &str = if chunk_source.is_nquads(i) {
+                        nq_converted = fluree_db_transact::parse::nquads_to_trig(&content)
+                            .map_err(|e| ImportError::Transact(e.to_string()))?;
+                        &nq_converted
+                    } else {
+                        &content
+                    };
                     let r = import_trig_commit(
                         &mut state,
-                        &content,
+                        trig_content,
                         storage,
                         alias,
                         compress,
@@ -3245,6 +3826,21 @@ where
         write_predicate_dict(&run_dir.join("datatypes.dict"), &datatypes_dict)?;
     }
 
+    // User-defined named graphs to build index segments for. Allocator
+    // convention is `graph dict_id + 1 = g_id`; the graph allocator is always
+    // seeded with txn-meta (g_id 1) and config (g_id 2), so user graphs occupy
+    // g_ids `FIRST_USER_GRAPH_ID..=graph_count` (g_id 3+). This is EMPTY for
+    // single-graph imports (graph_count == 2), so the named-graph build loop is
+    // skipped entirely and the optimized default-graph path pays nothing. g_id 1
+    // (txn-meta) is built separately; g_id 2 (config) is not populated by bulk
+    // RDF import.
+    let v3_named_g_ids: Vec<u16> = {
+        let graph_count = spool_config.graph_alloc.len();
+        (u32::from(fluree_db_core::graph_registry::FIRST_USER_GRAPH_ID)..=graph_count)
+            .map(|g| g as u16)
+            .collect()
+    };
+
     // Persist namespaces.json from shared allocator.
     persist_namespaces(namespace_codes.as_ref(), run_dir)?;
 
@@ -3373,6 +3969,7 @@ where
         p_width,
         dt_width,
         rdf_type_p_id,
+        named_g_ids: v3_named_g_ids,
     })
 }
 
@@ -3480,6 +4077,7 @@ where
         let v3_remap_counter = remap_counter.clone();
         let v3_build_counter = build_counter.clone();
         let v3_stage_marker = stage_marker.clone();
+        let v3_named_g_ids = input.named_g_ids;
 
         config.emit_progress(ImportPhase::PreparingIndex {
             stage: "Generating per-order runs",
@@ -3573,12 +4171,13 @@ where
                 std::fs::create_dir_all(&cfg_g0.run_dir)
                     .map_err(|e| ImportError::IndexBuild(e.to_string()))?;
 
-                let (g0_result, spot_class_stats) = fluree_db_indexer::build_indexes_from_commits(
-                    &commits,
-                    &cfg_g0,
-                    stats_hook.as_mut(),
-                )
-                .map_err(|e| ImportError::IndexBuild(e.to_string()))?;
+                let (g0_result, mut spot_class_stats) =
+                    fluree_db_indexer::build_indexes_from_commits(
+                        &commits,
+                        &cfg_g0,
+                        stats_hook.as_mut(),
+                    )
+                    .map_err(|e| ImportError::IndexBuild(e.to_string()))?;
 
                 // Meta chunk is always the last chunk when present. We build
                 // it BEFORE stats finalize and share the IdStatsHook so the
@@ -3587,7 +4186,7 @@ where
                 let g1_result = if let Some(meta_commit) = commits.last() {
                     let cfg_g1 = fluree_db_indexer::BuildConfig {
                         run_dir: v3_runs_g1,
-                        index_dir: v3_index_dir,
+                        index_dir: v3_index_dir.clone(),
                         g_id: 1,
                         leaflet_target_rows: v3_leaflet_target_rows,
                         leaf_target_rows: v3_leaf_target_rows,
@@ -3613,6 +4212,54 @@ where
                     None
                 };
 
+                // Build index segments for each user-defined named graph
+                // (g_id >= FIRST_USER_GRAPH_ID, i.e. 3+). Each is a separate
+                // pass over the commit blobs filtered to its g_id, mirroring the
+                // g_id=1 (txn-meta) build.
+                // Empty for single-graph imports — zero cost on that hot path.
+                // Done before stats finalize so named-graph flakes contribute
+                // to the shared IdStatsHook (per-graph stats).
+                let mut v3_named_results: Vec<fluree_db_indexer::BuildResult> = Vec::new();
+                for &ng_id in &v3_named_g_ids {
+                    let cfg_ng = fluree_db_indexer::BuildConfig {
+                        run_dir: v3_run_dir.join(format!("v3_runs_g{ng_id}")),
+                        index_dir: v3_index_dir.clone(),
+                        g_id: ng_id,
+                        leaflet_target_rows: v3_leaflet_target_rows,
+                        leaf_target_rows: v3_leaf_target_rows,
+                        zstd_level: 1,
+                        run_budget_bytes: v3_run_budget,
+                        worker_count: 1,
+                        remap_progress: None,
+                        build_progress: None,
+                        stage_marker: None,
+                    };
+                    std::fs::create_dir_all(&cfg_ng.run_dir)
+                        .map_err(|e| ImportError::IndexBuild(e.to_string()))?;
+
+                    // Fold this named graph's per-class SPOT stats into the
+                    // default-graph accumulator. All `SpotClassStats` maps are
+                    // keyed by `(g_id, class_sid)` over the same global id space
+                    // (assigned once at spool, shared across passes), and the
+                    // g_ids are disjoint, so the merge is a key-wise union.
+                    // Ref-targets whose class this pass couldn't resolve (e.g. a
+                    // ref into another graph) stay counted as `@id` flakes and
+                    // simply don't contribute a target-class entry.
+                    let (ng_result, ng_spot) = fluree_db_indexer::build_indexes_from_commits(
+                        &commits,
+                        &cfg_ng,
+                        stats_hook.as_mut(),
+                    )
+                    .map_err(|e| ImportError::IndexBuild(e.to_string()))?;
+                    if let Some(ng) = ng_spot {
+                        match &mut spot_class_stats {
+                            Some(acc) => acc.merge(ng),
+                            slot => *slot = Some(ng),
+                        }
+                    }
+                    v3_named_results.push(ng_result);
+                }
+
                 let stats_output = stats_hook.map(|h| {
                     let stats_finalize_start = Instant::now();
                     tracing::info!("finalizing import id stats");
@@ -3631,6 +4278,8 @@ where
                 let mut remap_elapsed = g0_result.remap_elapsed;
                 let mut build_elapsed = g0_result.build_elapsed;
 
+                // g1 (txn-meta) is a system graph; its per-class SPOT stats are
+                // intentionally not merged into the user-facing class stats.
                 if let Some((g1, _)) = g1_result {
                     total_rows += g1.total_rows;
                     total_remapped += g1.total_remapped;
@@ -3645,6 +4294,25 @@ where
                             existing.total_rows += g1_order.total_rows;
                         } else {
                             order_results.push((order, g1_order));
+                        }
+                    }
+                }
+
+                // Merge each user-defined named graph's results (same pattern).
+                for ng in v3_named_results {
+                    total_rows += ng.total_rows;
+                    total_remapped += ng.total_remapped;
+                    remap_elapsed += ng.remap_elapsed;
+                    build_elapsed += ng.build_elapsed;
+
+                    for (order, ng_order) in ng.order_results {
+                        if let Some((_, existing)) =
+                            order_results.iter_mut().find(|(o, _)| *o == order)
+                        {
+                            existing.graphs.extend(ng_order.graphs);
+                            existing.total_rows += ng_order.total_rows;
+                        } else {
+                            order_results.push((order, ng_order));
                         }
                     }
                 }
@@ -3914,9 +4582,11 @@ where
 
             (class_counts, class_ref_targets)
         } else {
-            // Clone — the uncapped id_hook_class_ref_targets is also used
-            // below as the authoritative source for class stats ref_classes.
-            (id_hook_class_counts, id_hook_class_ref_targets.clone())
+            // No SPOT class stats (no rdf:type data) — fall back to the id-hook
+            // maps. These are empty in the import path now that worker hooks no
+            // longer build per-subject maps, which is correct: no classes ⇒ no
+            // class ref-targets.
+            (id_hook_class_counts, id_hook_class_ref_targets)
         };
 
         let stats_v6: Option<fluree_db_core::IndexStats> = id_stats_result.map(|id_stats| {
@@ -3978,10 +4648,11 @@ where
                     cs,
                     &predicate_sids_v6,
                     &uploaded_dicts.language_tags,
-                    // Use the uncapped per-class ref-targets from IdStatsHook
-                    // instead of `cs.class_prop_refs` (which is populated via
-                    // the 64-class-capped ClassBitsetTable).
-                    Some(&id_hook_class_ref_targets),
+                    // `cs.class_prop_refs` is now uncapped (ClassMembership
+                    // promotes past 64 classes to a sparse map), so it is the
+                    // authoritative source. The import no longer builds the
+                    // expensive per-subject IdStatsHook maps for ref-targets.
+                    None,
                     input.run_dir,
                     input.namespace_codes,
                 )

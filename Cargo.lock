@@ -2314,6 +2314,7 @@ dependencies = [
  "criterion",
  "dirs 5.0.1",
  "ed25519-dalek",
+ "flate2",
  "fluree-bench-support",
  "fluree-db-binary-index",
  "fluree-db-connection",
@@ -2344,6 +2345,7 @@ dependencies = [
  "fs2",
  "futures",
  "hex",
+ "indexmap 2.13.0",
  "itoa",
  "mimalloc",
  "moka",
@@ -2362,6 +2364,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "xxhash-rust",
+ "zstd",
 ]
 
 [[package]]
@@ -2409,6 +2412,7 @@ dependencies = [
  "colored",
  "comfy-table",
  "dirs 5.0.1",
+ "flate2",
  "fluree-db-api",
  "fluree-db-binary-index",
  "fluree-db-core",
@@ -2448,6 +2452,7 @@ dependencies = [
  "tracing-opentelemetry",
  "tracing-subscriber",
  "urlencoding",
+ "zstd",
 ]
 
 [[package]]
@@ -2856,6 +2861,7 @@ dependencies = [
  "hex",
  "http 1.4.0",
  "http-body-util",
+ "indexmap 2.13.0",
  "jsonwebtoken",
  "opentelemetry",
  "opentelemetry-otlp",

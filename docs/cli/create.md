@@ -18,10 +18,10 @@ fluree create <LEDGER> [OPTIONS]
 
 | Option | Description |
 |--------|-------------|
-| `--from <PATH>` | Import data from a file (Turtle or JSON-LD) |
+| `--from <PATH>` | Import data from a file (Turtle, N-Triples, N-Quads, TriG, or JSON-LD), optionally `.gz`- or `.zst`-compressed. N-Triples (`.nt`) parses as Turtle; N-Quads (`.nq`) converts to TriG (named graphs supported). |
 | `--memory [PATH]` | Import memory history from a git-tracked `.fluree-memory/` directory. Defaults to the current repo if no path is given. Mutually exclusive with `--from`. |
 | `--no-user` | Exclude user-scoped memories (`.local/user.ttl`) from `--memory` import |
-| `--chunk-size-mb <MB>` | Chunk size in MB for splitting large Turtle files (0 = derive from memory budget). Only used when `--from` points to a `.ttl` file. |
+| `--chunk-size-mb <MB>` | Chunk size in MB for splitting large Turtle files (0 = derive from memory budget). Only used when `--from` points to a `.ttl` or `.nt` file. |
 | `--leaflet-rows <N>` | Rows per leaflet in the binary index (default: 25000). Larger values produce fewer, bigger leaflets — less I/O per scan, more memory per read. |
 | `--leaflets-per-leaf <N>` | Leaflets per leaf file (default: 10). Larger values produce fewer leaf files — shallower tree, bigger reads. |
 
@@ -34,7 +34,9 @@ fluree create <LEDGER> [OPTIONS]
 
 Creates a new empty ledger with the given name and sets it as the active ledger. The ledger is stored in `.fluree/storage/`.
 
-Use `--from` to create a ledger pre-populated with data from a Turtle or JSON-LD file. For large Turtle files, the CLI splits work into chunks and runs parallel parse threads; tune with `--memory-budget-mb` and `--parallelism` if needed.
+Use `--from` to create a ledger pre-populated with data from a Turtle, N-Triples, N-Quads, TriG, or JSON-LD file (or a directory of same-format files). Any input may be gzip- or zstd-compressed and is decoded transparently (`data.ttl.gz`, `dump.nq.zst`, mixed directories — the underlying RDF extension classifies the file). N-Triples (`.nt`) is a strict subset of Turtle and is parsed by the same parser. N-Quads (`.nq`) and TriG (`.trig`) support named graphs — queryable after import via the `#<graph-iri>` fragment. For large Turtle/N-Triples files (including `.ttl.gz`/`.nt.gz`), the CLI splits work into chunks and runs parallel parse threads — though compressed inputs decode single-threaded; TriG/N-Quads/JSON-LD use a serial path. Tune with `--memory-budget-mb` and `--parallelism` if needed.
+
+**Directory imports (`.ttl`/`.nt`)** are *rechunked by bytes* rather than one-chunk-per-file: large files are sub-split at statement boundaries and many small files are coalesced into `~chunk_size` work items. This keeps the import fully parallel and bounds the number of commits and sorted index runs regardless of how the data is packaged — so a directory of one big file, or of hundreds of tiny shards, both import at full speed. Coalescing engages automatically once a directory holds more than 64 sub-`chunk_size` files; a file containing a labeled blank node (`_:`) or an `@base` directive is never coalesced (it would change RDF document scope) and is imported as its own chunk. Set `FLUREE_IMPORT_COALESCE_THRESHOLD=<n>` to change the gate (`0` disables coalescing — every file becomes its own commit, the legacy behavior). Directories containing any `.trig`/`.nq`/`.jsonld` continue to use the per-file serial path.
 
 Use `--memory` to import your project's developer memory history into a time-travel-capable Fluree ledger. Each git commit that touched `.fluree-memory/repo.ttl` (and `.local/user.ttl` unless `--no-user` is set) becomes a Fluree transaction. The git commit message, SHA, and author date are stored as transaction metadata, so you can correlate Fluree `t` values with git history.
 

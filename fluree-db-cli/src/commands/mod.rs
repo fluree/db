@@ -17,6 +17,7 @@ pub mod list;
 pub mod log;
 pub mod mcp_serve;
 pub mod memory;
+pub mod multi_query;
 pub mod prefix;
 pub mod query;
 pub mod remote;

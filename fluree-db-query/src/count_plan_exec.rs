@@ -1,29 +1,56 @@
 //! Count-only plan executor — evaluates a `CountPlan` against a `BinaryIndexStore`.
 //!
 //! The executor wraps as a `FastPathOperator` closure. During `open()`:
-//! 1. Call `fast_path_store(ctx)` — return `Ok(None)` if not binary-index (triggers fallback)
+//! 1. Gate on `allow_cursor_fast_path(ctx)` + a binary-index store — `Ok(None)`
+//!    (triggers fallback) otherwise. Unlike `fast_path_store`, this does NOT
+//!    bail on overlay/`to_t`: an overlay/time-travel lane reads the
+//!    novelty-merged PSOT cursor instead of base-leaflet metadata.
 //! 2. Resolve all `Ref` predicates to `p_id`s
-//! 3. Recursively evaluate the plan tree using existing iterator primitives
+//! 3. Recursively evaluate the plan tree. Nodes without an overlay lane are
+//!    rejected by `plan_overlay_supported` so they fall back under overlay.
 //! 4. Return single count batch
 //!
 //! See `count_plan.rs` for the IR definition and planner.
 
+use crate::context::ExecutionContext;
 use crate::count_plan::{
     ChainFold, CountPlan, CountPlanRoot, KeySetNode, ScalarNode, StreamNode, TailWeight,
 };
 use crate::error::{QueryError, Result};
 use crate::fast_path_common::{
-    build_count_batch, collect_subjects_for_predicate_set, collect_subjects_for_predicate_sorted,
-    collect_subjects_with_object_in_set, count_rows_for_predicate_psot, fast_path_store,
-    intersect_many_sorted, leaf_entries_for_predicate, normalize_pred_sid,
-    sum_post_object_counts_filtered, FastPathOperator, ObjectFilterMode, PostObjectGroupCountIter,
+    allow_cursor_fast_path, build_count_batch, build_post_cursor_for_predicate,
+    build_psot_cursor_for_predicate, collect_subjects_for_predicate_set,
+    collect_subjects_for_predicate_sorted, collect_subjects_with_object_in_set,
+    count_rows_for_predicate_psot, cursor_projection_otype_okey, cursor_projection_sid_only,
+    cursor_projection_sid_otype_okey, intersect_many_sorted, leaf_entries_for_predicate,
+    normalize_pred_sid, projection_sid_otype_okey, sum_post_object_counts_filtered,
+    CursorSubjectCountStream, FastPathOperator, ObjectFilterMode, PostObjectGroupCountIter,
     PsotObjectFilterCountIter, PsotSubjectCountIter, PsotSubjectWeightedSumIter,
 };
+use crate::ir::triple::Ref;
 use crate::operator::BoxedOperator;
-use fluree_db_binary_index::{BinaryIndexStore, RunSortOrder};
-use fluree_db_core::GraphId;
+use fluree_db_binary_index::{BinaryCursor, BinaryIndexStore, RunSortOrder};
+use fluree_db_core::o_type::OType;
+use fluree_db_core::{GraphId, Sid};
 use rustc_hash::{FxHashMap, FxHashSet};
+use std::cmp::Ordering;
 use std::sync::Arc;
+
+/// Per-execution bundle threaded through the plan evaluator.
+///
+/// Carries the store + graph plus whether an **overlay lane** is required:
+/// novelty is present (`overlay.epoch() != 0`) or the query is time-travel
+/// (`to_t < max_t`). When `overlay` is false the metadata (base-leaflet)
+/// primitives are exact and used as before; when true the subject-keyed nodes
+/// route through the overlay-merging PSOT cursor instead. Nodes not yet
+/// overlay-aware are rejected up-front by [`plan_overlay_supported`], so the
+/// `overlay` lane is only entered for shapes that support it.
+struct ExecCtx<'a, 'c> {
+    ctx: &'a ExecutionContext<'c>,
+    store: &'a Arc<BinaryIndexStore>,
+    g_id: GraphId,
+    overlay: bool,
+}
 
 /// Create a `FastPathOperator` that executes a `CountPlan`.
 pub(crate) fn count_plan_operator(
@@ -34,12 +61,43 @@ pub(crate) fn count_plan_operator(
     Box::new(FastPathOperator::new(
         out_var,
         move |ctx| {
-            let Some(store) = fast_path_store(ctx) else {
+            // Strategy (b) gate: the subject-keyed shapes route through the
+            // overlay-merging cursor, so we no longer bail on overlay/`to_t`
+            // here (unlike `fast_path_store`). Multi-ledger / `from_t` / non-root
+            // policy still bail.
+            if !allow_cursor_fast_path(ctx) {
+                return Ok(None);
+            }
+            let Some(store) = ctx.binary_store.as_ref() else {
                 return Ok(None);
             };
             let g_id = ctx.binary_g_id;
 
-            match execute_plan(&plan.root, store, g_id)? {
+            // Overlay lane needed when novelty is present or the query is
+            // time-travel (`to_t < max_t`) — in both cases the base-leaflet
+            // metadata primitives are not exact.
+            let overlay = ctx
+                .overlay
+                .map(fluree_db_core::OverlayProvider::epoch)
+                .unwrap_or(0)
+                != 0
+                || ctx.to_t != store.max_t();
+
+            // Only some node types have an overlay lane so far; any other node
+            // under overlay must bail to the (correct, slower) generic fallback
+            // rather than read stale base-only counts.
+            if overlay && !plan_overlay_supported(&plan.root) {
+                return Ok(None);
+            }
+
+            let ec = ExecCtx {
+                ctx,
+                store,
+                g_id,
+                overlay,
+            };
+
+            match execute_plan(&plan.root, &ec)? {
                 Some(count) => {
                     let count_i64 = i64::try_from(count)
                         .map_err(|_| QueryError::execution("COUNT(*) exceeds i64 in count plan"))?;
@@ -57,99 +115,375 @@ pub(crate) fn count_plan_operator(
 // Plan evaluation
 // ===========================================================================
 
-fn execute_plan(
-    root: &CountPlanRoot,
-    store: &Arc<BinaryIndexStore>,
-    g_id: GraphId,
-) -> Result<Option<u64>> {
+fn execute_plan(root: &CountPlanRoot, ec: &ExecCtx<'_, '_>) -> Result<Option<u64>> {
     match root {
-        CountPlanRoot::Scalar(scalar) => execute_scalar(scalar, store, g_id),
-        CountPlanRoot::Chain(chain) => execute_chain(chain, store, g_id),
+        CountPlanRoot::Scalar(scalar) => execute_scalar(scalar, ec),
+        CountPlanRoot::Chain(chain) => {
+            if ec.overlay {
+                execute_chain_overlay(chain, ec)
+            } else {
+                execute_chain(chain, ec.store, ec.g_id)
+            }
+        }
+        CountPlanRoot::OptionalChainHead { p1, p2, p3 } => {
+            if ec.overlay {
+                execute_optional_chain_head_overlay(ec, p1, p2, p3)
+            } else {
+                execute_optional_chain_head(ec, p1, p2, p3)
+            }
+        }
     }
+}
+
+// ---------------------------------------------------------------------------
+// Overlay-lane support
+// ---------------------------------------------------------------------------
+
+/// Whether every node in the plan has an overlay-aware execution lane.
+///
+/// When false and an overlay/time-travel lane is required, the executor bails
+/// to the generic fallback (correct, just not metadata-fast) rather than
+/// reading stale base-only counts. Every `CountPlan` node type has an overlay
+/// lane, so this only returns false when a nested keyset is object-keyed in a
+/// way not yet covered — currently never, in practice.
+fn plan_overlay_supported(root: &CountPlanRoot) -> bool {
+    match root {
+        CountPlanRoot::Scalar(s) => scalar_overlay_supported(s),
+        // execute_chain_overlay / execute_optional_chain_head_overlay handle any
+        // shape (they bail at runtime on an absent predicate under novelty).
+        CountPlanRoot::Chain(_) | CountPlanRoot::OptionalChainHead { .. } => true,
+    }
+}
+
+fn scalar_overlay_supported(node: &ScalarNode) -> bool {
+    match node {
+        ScalarNode::TotalRowCount { .. } | ScalarNode::CompositeJoinPairCount { .. } => true,
+        ScalarNode::Sum { source } => stream_overlay_supported(source),
+        ScalarNode::PostObjectFilteredSum { object_filter, .. } => {
+            keyset_overlay_supported(object_filter)
+        }
+        ScalarNode::TotalMinusPostObjectFilteredSum {
+            excluded_objects, ..
+        } => keyset_overlay_supported(excluded_objects),
+    }
+}
+
+fn stream_overlay_supported(node: &StreamNode) -> bool {
+    match node {
+        StreamNode::SubjectCountScan { .. } => true,
+        StreamNode::StarJoin { children } => children.iter().all(stream_overlay_supported),
+        StreamNode::AntiJoin { source, excluded } => {
+            stream_overlay_supported(source) && keyset_overlay_supported(excluded)
+        }
+        StreamNode::SemiJoin { source, filter } => {
+            stream_overlay_supported(source) && keyset_overlay_supported(filter)
+        }
+        StreamNode::OptionalJoin {
+            required,
+            optional_groups,
+        } => {
+            stream_overlay_supported(required)
+                && optional_groups
+                    .iter()
+                    .all(|grp| grp.iter().all(stream_overlay_supported))
+        }
+    }
+}
+
+/// All keyset node types have an overlay lane (the object-keyed
+/// `SubjectsWithObjectIn` is supported when its inner object set is).
+fn keyset_overlay_supported(node: &KeySetNode) -> bool {
+    match node {
+        KeySetNode::SubjectSet { .. } | KeySetNode::SubjectsSorted { .. } => true,
+        KeySetNode::IntersectSorted { children } => children.iter().all(keyset_overlay_supported),
+        KeySetNode::SubjectsWithObjectIn { object_set, .. } => keyset_overlay_supported(object_set),
+    }
+}
+
+/// A subject-keyed `(s_id, count)` group stream — metadata or overlay lane.
+enum SubjectGroups<'a> {
+    /// Genuinely empty (predicate absent from the base index, no overlay).
+    Empty,
+    /// Base-leaflet metadata lane.
+    Meta(PsotSubjectCountIter<'a>),
+    /// Overlay-merging PSOT cursor lane (shared `CursorSubjectCountStream`).
+    Cursor(CursorSubjectCountStream),
+}
+
+impl SubjectGroups<'_> {
+    fn next_group(&mut self) -> Result<Option<(u64, u64)>> {
+        match self {
+            SubjectGroups::Empty => Ok(None),
+            SubjectGroups::Meta(it) => it.next_group(),
+            SubjectGroups::Cursor(c) => c.next_group(),
+        }
+    }
+}
+
+/// Build a subject-count group stream for `pred`, choosing the metadata lane
+/// (base leaflets) when no overlay/time-travel is in effect, else the
+/// overlay-merging PSOT cursor lane.
+///
+/// `Ok(None)` signals the whole plan must bail to the fallback: the predicate
+/// is absent from the base index while novelty is present (it may carry
+/// overlay-only rows a `p_id` cursor cannot reach), or an overlay flake failed
+/// to translate. `Ok(Some(Empty))` is a genuinely empty stream.
+fn subject_groups<'a>(ec: &ExecCtx<'a, '_>, pred: &Ref) -> Result<Option<SubjectGroups<'a>>> {
+    let store: &'a Arc<BinaryIndexStore> = ec.store;
+    let sid = normalize_pred_sid(store, pred)?;
+    let Some(p_id) = store.sid_to_p_id(&sid) else {
+        return Ok(if ec.overlay {
+            None
+        } else {
+            Some(SubjectGroups::Empty)
+        });
+    };
+    if ec.overlay {
+        let Some(cursor) = build_psot_cursor_for_predicate(
+            ec.ctx,
+            store,
+            ec.g_id,
+            sid,
+            p_id,
+            cursor_projection_sid_only(),
+        )?
+        else {
+            return Ok(None);
+        };
+        Ok(Some(SubjectGroups::Cursor(CursorSubjectCountStream::new(
+            cursor,
+        ))))
+    } else {
+        Ok(Some(SubjectGroups::Meta(PsotSubjectCountIter::new(
+            store, ec.g_id, p_id,
+        )?)))
+    }
+}
+
+/// Distinct subjects for `pred`, ascending — metadata (no overlay) or the
+/// overlay-merged PSOT cursor. The PSOT cursor yields rows in `(p, s, …)` order,
+/// so consecutive-subject grouping produces distinct subjects already sorted.
+/// `Ok(None)` bails the plan.
+fn subject_keys_sorted(ec: &ExecCtx<'_, '_>, pred: &Ref) -> Result<Option<Vec<u64>>> {
+    if ec.overlay {
+        let Some(mut groups) = subject_groups(ec, pred)? else {
+            return Ok(None);
+        };
+        let mut out: Vec<u64> = Vec::new();
+        while let Some((s, _)) = groups.next_group()? {
+            // One group per distinct subject, emitted in ascending order.
+            out.push(s);
+        }
+        Ok(Some(out))
+    } else {
+        let sid = normalize_pred_sid(ec.store, pred)?;
+        let Some(p_id) = ec.store.sid_to_p_id(&sid) else {
+            return Ok(Some(Vec::new()));
+        };
+        Ok(Some(collect_subjects_for_predicate_sorted(
+            ec.store, ec.g_id, p_id,
+        )?))
+    }
+}
+
+/// Total row count for a predicate — metadata leaflet sum (no overlay) or a
+/// row count over the overlay-merged PSOT cursor. `Ok(None)` bails the plan.
+fn total_row_count(ec: &ExecCtx<'_, '_>, pred: &Ref) -> Result<Option<u64>> {
+    let sid = normalize_pred_sid(ec.store, pred)?;
+    let Some(p_id) = ec.store.sid_to_p_id(&sid) else {
+        return Ok(if ec.overlay { None } else { Some(0) });
+    };
+    if ec.overlay {
+        let Some(mut cursor) = build_psot_cursor_for_predicate(
+            ec.ctx,
+            ec.store,
+            ec.g_id,
+            sid,
+            p_id,
+            cursor_projection_sid_only(),
+        )?
+        else {
+            return Ok(None);
+        };
+        let mut total: u64 = 0;
+        while let Some(batch) = cursor
+            .next_batch()
+            .map_err(|e| QueryError::Internal(format!("count-plan cursor batch: {e}")))?
+        {
+            total = total
+                .checked_add(batch.row_count as u64)
+                .ok_or_else(|| QueryError::execution("COUNT(*) overflow in count plan"))?;
+        }
+        Ok(Some(total))
+    } else {
+        Ok(Some(count_rows_for_predicate_psot(
+            ec.store, ec.g_id, p_id,
+        )?))
+    }
+}
+
+/// Sum of POST(`pred`) rows whose IRI_REF object key is in `allowed_sorted` —
+/// metadata leaflet scan (no overlay) or the overlay-merging POST cursor.
+///
+/// Both lanes bail (`Ok(None)`) the instant a non-`IRI_REF` object is seen: this
+/// fast path only applies when `pred`'s objects are all node references (the
+/// object-var EXISTS/MINUS join requires `?o` to be a node). Mixed-type
+/// predicates fall back to the generic pipeline, which skips literal objects.
+fn post_object_filtered_sum(
+    ec: &ExecCtx<'_, '_>,
+    pred: &Ref,
+    allowed_sorted: &[u64],
+) -> Result<Option<u64>> {
+    let sid = normalize_pred_sid(ec.store, pred)?;
+    let Some(p_id) = ec.store.sid_to_p_id(&sid) else {
+        return Ok(if ec.overlay { None } else { Some(0) });
+    };
+    if !ec.overlay {
+        return sum_post_object_counts_filtered(ec.store, ec.g_id, p_id, allowed_sorted);
+    }
+
+    let Some(mut cursor) = build_post_cursor_for_predicate(
+        ec.ctx,
+        ec.store,
+        ec.g_id,
+        sid,
+        p_id,
+        cursor_projection_otype_okey(),
+    )?
+    else {
+        return Ok(None);
+    };
+    // POST order over a ref-only predicate is `(o_key, …)` ascending, so a single
+    // monotonic pointer into the sorted filter is O(rows + |filter|).
+    let iri_ref = OType::IRI_REF.as_u16();
+    let mut allowed_idx: usize = 0;
+    let mut total: u64 = 0;
+    while let Some(batch) = cursor
+        .next_batch()
+        .map_err(|e| QueryError::Internal(format!("count-plan cursor batch: {e}")))?
+    {
+        for row in 0..batch.row_count {
+            if batch.o_type.get(row) != iri_ref {
+                return Ok(None);
+            }
+            let o_key = batch.o_key.get(row);
+            while allowed_idx < allowed_sorted.len() && allowed_sorted[allowed_idx] < o_key {
+                allowed_idx += 1;
+            }
+            if allowed_idx < allowed_sorted.len() && allowed_sorted[allowed_idx] == o_key {
+                total = total.saturating_add(1);
+            }
+        }
+    }
+    Ok(Some(total))
+}
+
+/// Subjects of `pred` that have at least one IRI_REF object in `object_set`
+/// (sorted ascending, distinct) — metadata leaflet scan (no overlay) or the
+/// overlay-merging PSOT cursor. Both lanes bail on any non-IRI_REF object,
+/// matching the metadata path. `Ok(None)` bails the plan.
+fn subjects_with_object_in(
+    ec: &ExecCtx<'_, '_>,
+    pred: &Ref,
+    object_set: &FxHashSet<u64>,
+) -> Result<Option<Vec<u64>>> {
+    let sid = normalize_pred_sid(ec.store, pred)?;
+    let Some(p_id) = ec.store.sid_to_p_id(&sid) else {
+        return Ok(if ec.overlay { None } else { Some(Vec::new()) });
+    };
+    if !ec.overlay {
+        return collect_subjects_with_object_in_set(ec.store, ec.g_id, p_id, object_set);
+    }
+
+    let Some(mut cursor) = build_psot_cursor_for_predicate(
+        ec.ctx,
+        ec.store,
+        ec.g_id,
+        sid,
+        p_id,
+        cursor_projection_sid_otype_okey(),
+    )?
+    else {
+        return Ok(None);
+    };
+    let iri_ref = OType::IRI_REF.as_u16();
+    let mut out: Vec<u64> = Vec::new();
+    let mut cur_s: Option<u64> = None;
+    let mut cur_ok = false;
+    while let Some(batch) = cursor
+        .next_batch()
+        .map_err(|e| QueryError::Internal(format!("count-plan cursor batch: {e}")))?
+    {
+        for row in 0..batch.row_count {
+            if batch.o_type.get(row) != iri_ref {
+                return Ok(None);
+            }
+            let s = batch.s_id.get(row);
+            if cur_s != Some(s) {
+                if let Some(cs) = cur_s {
+                    if cur_ok {
+                        out.push(cs);
+                    }
+                }
+                cur_s = Some(s);
+                cur_ok = false;
+            }
+            if object_set.contains(&batch.o_key.get(row)) {
+                cur_ok = true;
+            }
+        }
+    }
+    if let Some(cs) = cur_s {
+        if cur_ok {
+            out.push(cs);
+        }
+    }
+    Ok(Some(out))
 }
 
 // ---------------------------------------------------------------------------
 // Scalar evaluation
 // ---------------------------------------------------------------------------
 
-fn execute_scalar(
-    node: &ScalarNode,
-    store: &Arc<BinaryIndexStore>,
-    g_id: GraphId,
-) -> Result<Option<u64>> {
+fn execute_scalar(node: &ScalarNode, ec: &ExecCtx<'_, '_>) -> Result<Option<u64>> {
     match node {
-        ScalarNode::TotalRowCount { pred } => {
-            let sid = normalize_pred_sid(store, pred)?;
-            let Some(p_id) = store.sid_to_p_id(&sid) else {
-                return Ok(Some(0));
-            };
-            Ok(Some(count_rows_for_predicate_psot(store, g_id, p_id)?))
+        ScalarNode::TotalRowCount { pred } => total_row_count(ec, pred),
+
+        ScalarNode::CompositeJoinPairCount { pred1, pred2 } => {
+            count_composite_join_pairs(ec, pred1, pred2)
         }
 
-        ScalarNode::Sum { source } => {
-            let total = sum_stream(source, store, g_id, None, None)?;
-            Ok(total)
-        }
-
-        ScalarNode::SumExcluding { source, excluded } => {
-            let exclude_sorted = execute_keyset_as_sorted(excluded, store, g_id)?;
-            let exclude_sorted = match exclude_sorted {
-                Some(s) => s,
-                None => return Ok(None),
-            };
-            let total = sum_stream(source, store, g_id, Some(&exclude_sorted), None)?;
-            Ok(total)
-        }
-
-        ScalarNode::SumFiltered { source, filter } => {
-            let filter_sorted = execute_keyset_as_sorted(filter, store, g_id)?;
-            let filter_sorted = match filter_sorted {
-                Some(s) => s,
-                None => return Ok(None),
-            };
-            let total = sum_stream(source, store, g_id, None, Some(&filter_sorted))?;
-            Ok(total)
-        }
+        ScalarNode::Sum { source } => sum_stream(source, ec, None, None),
 
         ScalarNode::PostObjectFilteredSum {
             pred,
             object_filter,
         } => {
-            let sid = normalize_pred_sid(store, pred)?;
-            let Some(p_id) = store.sid_to_p_id(&sid) else {
-                return Ok(Some(0));
-            };
-            let filter_sorted = execute_keyset_as_sorted(object_filter, store, g_id)?;
-            let filter_sorted = match filter_sorted {
+            let filter_sorted = match execute_keyset_as_sorted(object_filter, ec)? {
                 Some(s) => s,
                 None => return Ok(None),
             };
             if filter_sorted.is_empty() {
                 return Ok(Some(0));
             }
-            sum_post_object_counts_filtered(store, g_id, p_id, &filter_sorted)
+            post_object_filtered_sum(ec, pred, &filter_sorted)
         }
 
         ScalarNode::TotalMinusPostObjectFilteredSum {
             pred,
             excluded_objects,
         } => {
-            let sid = normalize_pred_sid(store, pred)?;
-            let Some(p_id) = store.sid_to_p_id(&sid) else {
-                return Ok(Some(0));
+            let Some(total) = total_row_count(ec, pred)? else {
+                return Ok(None);
             };
-            let total = count_rows_for_predicate_psot(store, g_id, p_id)?;
-            let excluded_sorted = execute_keyset_as_sorted(excluded_objects, store, g_id)?;
-            let excluded_sorted = match excluded_sorted {
+            let excluded_sorted = match execute_keyset_as_sorted(excluded_objects, ec)? {
                 Some(s) => s,
                 None => return Ok(None),
             };
             if excluded_sorted.is_empty() {
                 return Ok(Some(total));
             }
-            let Some(in_set) =
-                sum_post_object_counts_filtered(store, g_id, p_id, &excluded_sorted)?
-            else {
+            let Some(in_set) = post_object_filtered_sum(ec, pred, &excluded_sorted)? else {
                 return Ok(None);
             };
             Ok(Some(total.saturating_sub(in_set)))
@@ -168,22 +502,19 @@ fn execute_scalar(
 /// per-subject filtering (matching `fast_minus_count_all.rs` and `fast_exists_count_all.rs`).
 fn sum_stream(
     node: &StreamNode,
-    store: &Arc<BinaryIndexStore>,
-    g_id: GraphId,
+    ec: &ExecCtx<'_, '_>,
     exclude_sorted: Option<&[u64]>,
     include_sorted: Option<&[u64]>,
 ) -> Result<Option<u64>> {
     match node {
         StreamNode::SubjectCountScan { pred } => {
-            let sid = normalize_pred_sid(store, pred)?;
-            let Some(p_id) = store.sid_to_p_id(&sid) else {
-                return Ok(Some(0));
+            let Some(mut groups) = subject_groups(ec, pred)? else {
+                return Ok(None); // overlay bail
             };
-            let mut iter = PsotSubjectCountIter::new(store, g_id, p_id)?;
             let mut excl_idx: usize = 0;
             let mut incl_idx: usize = 0;
             let mut total: u128 = 0;
-            while let Some((s, count)) = iter.next_group()? {
+            while let Some((s, count)) = groups.next_group()? {
                 if is_excluded(s, exclude_sorted, &mut excl_idx) {
                     continue;
                 }
@@ -196,7 +527,7 @@ fn sum_stream(
         }
 
         StreamNode::StarJoin { children } => {
-            sum_star_join(children, store, g_id, exclude_sorted, include_sorted)
+            sum_star_join(children, ec, exclude_sorted, include_sorted)
         }
 
         StreamNode::OptionalJoin {
@@ -205,25 +536,24 @@ fn sum_stream(
         } => sum_optional_join(
             required,
             optional_groups,
-            store,
-            g_id,
+            ec,
             exclude_sorted,
             include_sorted,
         ),
 
         StreamNode::AntiJoin { source, excluded } => {
-            let exclude_list = execute_keyset_as_sorted(excluded, store, g_id)?;
+            let exclude_list = execute_keyset_as_sorted(excluded, ec)?;
             let exclude_list = match exclude_list {
                 Some(s) => s,
                 None => return Ok(None),
             };
             // Merge with any existing sorted exclusion list.
             let merged = merge_sorted_lists(exclude_sorted, &exclude_list);
-            sum_stream(source, store, g_id, Some(&merged), include_sorted)
+            sum_stream(source, ec, Some(&merged), include_sorted)
         }
 
         StreamNode::SemiJoin { source, filter } => {
-            let filter_list = execute_keyset_as_sorted(filter, store, g_id)?;
+            let filter_list = execute_keyset_as_sorted(filter, ec)?;
             let filter_list = match filter_list {
                 Some(s) => s,
                 None => return Ok(None),
@@ -233,7 +563,7 @@ fn sum_stream(
                 Some(existing) => intersect_sorted_pair(existing, &filter_list),
                 None => filter_list,
             };
-            sum_stream(source, store, g_id, exclude_sorted, Some(&merged))
+            sum_stream(source, ec, exclude_sorted, Some(&merged))
         }
     }
 }
@@ -314,22 +644,22 @@ fn intersect_sorted_pair(a: &[u64], b: &[u64]) -> Vec<u64> {
 /// Formula: `Σ_{s in all, not excluded, included} Π_i count_i(s)`
 fn sum_star_join(
     children: &[StreamNode],
-    store: &Arc<BinaryIndexStore>,
-    g_id: GraphId,
+    ec: &ExecCtx<'_, '_>,
     exclude_sorted: Option<&[u64]>,
     include_sorted: Option<&[u64]>,
 ) -> Result<Option<u64>> {
     // All children must be SubjectCountScan for the streaming N-way merge.
-    let mut iters: Vec<PsotSubjectCountIter<'_>> = Vec::with_capacity(children.len());
+    let mut iters: Vec<SubjectGroups<'_>> = Vec::with_capacity(children.len());
     for child in children {
         let StreamNode::SubjectCountScan { pred } = child else {
             return Ok(None);
         };
-        let sid = normalize_pred_sid(store, pred)?;
-        let Some(p_id) = store.sid_to_p_id(&sid) else {
-            return Ok(Some(0));
+        // Absent predicate (no overlay) yields an empty stream → the N-way
+        // intersection is empty → total 0; absent under overlay bails (None).
+        let Some(groups) = subject_groups(ec, pred)? else {
+            return Ok(None);
         };
-        iters.push(PsotSubjectCountIter::new(store, g_id, p_id)?);
+        iters.push(groups);
     }
 
     let mut curr: Vec<Option<(u64, u64)>> = Vec::with_capacity(iters.len());
@@ -384,31 +714,30 @@ fn sum_star_join(
 fn sum_optional_join(
     required: &StreamNode,
     optional_groups: &[Vec<StreamNode>],
-    store: &Arc<BinaryIndexStore>,
-    g_id: GraphId,
+    ec: &ExecCtx<'_, '_>,
     exclude_sorted: Option<&[u64]>,
     include_sorted: Option<&[u64]>,
 ) -> Result<Option<u64>> {
-    // Collect required iterators (single scan or star join children).
-    let mut req_iters: Vec<PsotSubjectCountIter<'_>> = Vec::new();
+    // Collect required iterators (single scan or star join children). An absent
+    // required predicate yields an `Empty` stream (no overlay) → no subjects →
+    // total 0; absent under overlay bails (`None`).
+    let mut req_iters: Vec<SubjectGroups<'_>> = Vec::new();
     match required {
         StreamNode::SubjectCountScan { pred } => {
-            let sid = normalize_pred_sid(store, pred)?;
-            let Some(p_id) = store.sid_to_p_id(&sid) else {
-                return Ok(Some(0));
+            let Some(groups) = subject_groups(ec, pred)? else {
+                return Ok(None);
             };
-            req_iters.push(PsotSubjectCountIter::new(store, g_id, p_id)?);
+            req_iters.push(groups);
         }
         StreamNode::StarJoin { children } => {
             for child in children {
                 let StreamNode::SubjectCountScan { pred } = child else {
                     return Ok(None);
                 };
-                let sid = normalize_pred_sid(store, pred)?;
-                let Some(p_id) = store.sid_to_p_id(&sid) else {
-                    return Ok(Some(0));
+                let Some(groups) = subject_groups(ec, pred)? else {
+                    return Ok(None);
                 };
-                req_iters.push(PsotSubjectCountIter::new(store, g_id, p_id)?);
+                req_iters.push(groups);
             }
         }
         _ => return Ok(None),
@@ -418,26 +747,30 @@ fn sum_optional_join(
     // An optional predicate that is absent in the store makes the entire group `always_one`.
     struct OptGroup<'a> {
         always_one: bool,
-        iters: Vec<PsotSubjectCountIter<'a>>,
+        iters: Vec<SubjectGroups<'a>>,
         cur: Vec<Option<(u64, u64)>>,
     }
 
     let mut opt_groups: Vec<OptGroup<'_>> = Vec::with_capacity(optional_groups.len());
     for grp in optional_groups {
         let mut always_one = false;
-        let mut iters: Vec<PsotSubjectCountIter<'_>> = Vec::with_capacity(grp.len());
+        let mut iters: Vec<SubjectGroups<'_>> = Vec::with_capacity(grp.len());
         for node in grp {
             let StreamNode::SubjectCountScan { pred } = node else {
                 return Ok(None);
             };
-            let sid = normalize_pred_sid(store, pred)?;
-            let Some(p_id) = store.sid_to_p_id(&sid) else {
-                // Absent optional predicate => group never matches => multiplier 1.
+            let Some(groups) = subject_groups(ec, pred)? else {
+                return Ok(None);
+            };
+            if matches!(groups, SubjectGroups::Empty) {
+                // Absent optional predicate (no overlay) => group never matches
+                // => multiplier 1. (Under overlay an absent predicate bails
+                // above instead, since it may carry overlay-only rows.)
                 always_one = true;
                 iters.clear();
                 break;
-            };
-            iters.push(PsotSubjectCountIter::new(store, g_id, p_id)?);
+            }
+            iters.push(groups);
         }
         let mut cur: Vec<Option<(u64, u64)>> = Vec::with_capacity(iters.len());
         for it in &mut iters {
@@ -562,35 +895,18 @@ fn sum_optional_join(
 /// Primary keyset evaluator: returns a sorted `Vec<u64>`.
 ///
 /// All callers in Phase B use sorted lists for streaming merge-skip/merge-keep.
-fn execute_keyset_as_sorted(
-    node: &KeySetNode,
-    store: &Arc<BinaryIndexStore>,
-    g_id: GraphId,
-) -> Result<Option<Vec<u64>>> {
+fn execute_keyset_as_sorted(node: &KeySetNode, ec: &ExecCtx<'_, '_>) -> Result<Option<Vec<u64>>> {
     match node {
         KeySetNode::SubjectsSorted { pred } | KeySetNode::SubjectSet { pred } => {
-            let sid = normalize_pred_sid(store, pred)?;
-            let Some(p_id) = store.sid_to_p_id(&sid) else {
-                return Ok(Some(Vec::new()));
-            };
-            Ok(Some(collect_subjects_for_predicate_sorted(
-                store, g_id, p_id,
-            )?))
+            subject_keys_sorted(ec, pred)
         }
         KeySetNode::SubjectsWithObjectIn { pred, object_set } => {
             // Need a hash set for the object filter, then sort the result.
-            let obj_set = execute_keyset_as_hash_set(object_set, store, g_id)?;
-            let obj_set = match obj_set {
+            let obj_set = match execute_keyset_as_hash_set(object_set, ec)? {
                 Some(s) => s,
                 None => return Ok(None),
             };
-            let sid = normalize_pred_sid(store, pred)?;
-            let Some(p_id) = store.sid_to_p_id(&sid) else {
-                return Ok(Some(Vec::new()));
-            };
-            let Some(mut subjects) =
-                collect_subjects_with_object_in_set(store, g_id, p_id, &obj_set)?
-            else {
+            let Some(mut subjects) = subjects_with_object_in(ec, pred, &obj_set)? else {
                 return Ok(None);
             };
             subjects.sort_unstable();
@@ -600,7 +916,7 @@ fn execute_keyset_as_sorted(
         KeySetNode::IntersectSorted { children } => {
             let mut lists: Vec<Vec<u64>> = Vec::with_capacity(children.len());
             for child in children {
-                let sorted = execute_keyset_as_sorted(child, store, g_id)?;
+                let sorted = execute_keyset_as_sorted(child, ec)?;
                 let sorted = match sorted {
                     Some(s) => s,
                     None => return Ok(None),
@@ -616,20 +932,27 @@ fn execute_keyset_as_sorted(
 /// needs `collect_subjects_with_object_in_set(&FxHashSet)`.
 fn execute_keyset_as_hash_set(
     node: &KeySetNode,
-    store: &Arc<BinaryIndexStore>,
-    g_id: GraphId,
+    ec: &ExecCtx<'_, '_>,
 ) -> Result<Option<FxHashSet<u64>>> {
     match node {
         KeySetNode::SubjectSet { pred } => {
-            let sid = normalize_pred_sid(store, pred)?;
-            let Some(p_id) = store.sid_to_p_id(&sid) else {
+            if ec.overlay {
+                let Some(v) = subject_keys_sorted(ec, pred)? else {
+                    return Ok(None);
+                };
+                return Ok(Some(v.into_iter().collect()));
+            }
+            let sid = normalize_pred_sid(ec.store, pred)?;
+            let Some(p_id) = ec.store.sid_to_p_id(&sid) else {
                 return Ok(Some(FxHashSet::default()));
             };
-            Ok(Some(collect_subjects_for_predicate_set(store, g_id, p_id)?))
+            Ok(Some(collect_subjects_for_predicate_set(
+                ec.store, ec.g_id, p_id,
+            )?))
         }
         _ => {
             // Fall back: get sorted, convert to set.
-            let sorted = execute_keyset_as_sorted(node, store, g_id)?;
+            let sorted = execute_keyset_as_sorted(node, ec)?;
             match sorted {
                 Some(v) => Ok(Some(v.into_iter().collect())),
                 None => Ok(None),
@@ -663,7 +986,9 @@ fn execute_chain(
     store: &Arc<BinaryIndexStore>,
     g_id: GraphId,
 ) -> Result<Option<u64>> {
-    assert!(
+    // Matches the overlay twin `execute_chain_overlay`: a malformed chain is a
+    // planner bug, not a runtime condition — never panic a release query path.
+    debug_assert!(
         chain.predicates.len() >= 2,
         "chain must have at least 2 predicates"
     );
@@ -1172,4 +1497,672 @@ fn execute_chain(
     }
 
     Ok(Some(total))
+}
+
+// ---------------------------------------------------------------------------
+// Chain evaluation — overlay lane
+// ---------------------------------------------------------------------------
+
+/// Per-object weight for one chain hop. Mirrors the metadata `P2WeightMode`
+/// semantics exactly (verified against `PsotSubjectCountIter`,
+/// `PsotSubjectWeightedSumIter`, and `PsotObjectFilterCountIter`):
+/// - `CountEdges`: every edge weighs 1 (rightmost `TailWeight::None`).
+/// - `Lookup`: ref object → `weights.get(o_key).unwrap_or(default)`; non-ref → `default`.
+/// - `InSet`: ref object in set → 1, else 0; non-ref → 0 (EXISTS tail).
+/// - `NotInSet`: ref object not in set → 1, else 0; non-ref → 1 (MINUS tail).
+enum ChainWeight<'a> {
+    CountEdges,
+    Lookup {
+        weights: &'a FxHashMap<u64, u64>,
+        default: u64,
+    },
+    /// `max(1, weights.get(o))` for ref objects, `1` for non-ref — the
+    /// OPTIONAL-chain head multiplier. `?b` keeps its solution even with no
+    /// inner chain; a non-node `?b` (literal) can never be a `p2` subject, so
+    /// its inner chain has 0 completions ⇒ OPTIONAL multiplier 1 (not 0).
+    LookupMaxOne {
+        weights: &'a FxHashMap<u64, u64>,
+    },
+    InSet {
+        set: &'a FxHashSet<u64>,
+    },
+    NotInSet {
+        set: &'a FxHashSet<u64>,
+    },
+}
+
+impl ChainWeight<'_> {
+    #[inline]
+    fn weight(&self, o_type: u16, o_key: u64) -> u64 {
+        let is_iri = o_type == OType::IRI_REF.as_u16();
+        match self {
+            ChainWeight::CountEdges => 1,
+            ChainWeight::Lookup { weights, default } => {
+                if is_iri {
+                    weights.get(&o_key).copied().unwrap_or(*default)
+                } else {
+                    *default
+                }
+            }
+            ChainWeight::LookupMaxOne { weights } => {
+                if is_iri {
+                    weights.get(&o_key).copied().unwrap_or(0).max(1)
+                } else {
+                    // Non-node `?b` can't extend the chain, but the OPTIONAL
+                    // still keeps its `?a p1 ?b` solution: multiplier 1.
+                    1
+                }
+            }
+            ChainWeight::InSet { set } => u64::from(is_iri && set.contains(&o_key)),
+            ChainWeight::NotInSet { set } => {
+                if is_iri {
+                    u64::from(!set.contains(&o_key))
+                } else {
+                    1
+                }
+            }
+        }
+    }
+}
+
+/// Stream PSOT(`pred`) from the overlay-merging cursor and return a map
+/// `subject_id -> Σ weight(o)` (non-zero only). `Ok(None)` bails the plan.
+fn psot_weighted_subject_sums(
+    ec: &ExecCtx<'_, '_>,
+    pred_sid: &Sid,
+    p_id: u32,
+    weight: &ChainWeight<'_>,
+) -> Result<Option<FxHashMap<u64, u64>>> {
+    let Some(mut cursor) = build_psot_cursor_for_predicate(
+        ec.ctx,
+        ec.store,
+        ec.g_id,
+        pred_sid.clone(),
+        p_id,
+        cursor_projection_sid_otype_okey(),
+    )?
+    else {
+        return Ok(None);
+    };
+    let mut out: FxHashMap<u64, u64> = FxHashMap::default();
+    let mut cur_s: Option<u64> = None;
+    let mut cur_sum: u64 = 0;
+    let overflow = || QueryError::execution("COUNT(*) overflow in chain join");
+    while let Some(batch) = cursor
+        .next_batch()
+        .map_err(|e| QueryError::Internal(format!("count-plan cursor batch: {e}")))?
+    {
+        for row in 0..batch.row_count {
+            let s = batch.s_id.get(row);
+            let w = weight.weight(batch.o_type.get(row), batch.o_key.get(row));
+            if cur_s == Some(s) {
+                cur_sum = cur_sum.checked_add(w).ok_or_else(overflow)?;
+            } else {
+                if let Some(cs) = cur_s {
+                    if cur_sum > 0 {
+                        out.insert(cs, cur_sum);
+                    }
+                }
+                cur_s = Some(s);
+                cur_sum = w;
+            }
+        }
+    }
+    if let Some(cs) = cur_s {
+        if cur_sum > 0 {
+            out.insert(cs, cur_sum);
+        }
+    }
+    Ok(Some(out))
+}
+
+/// Stream PSOT(`pred`) from the overlay-merging cursor and return `Σ weight(o)`
+/// over all rows (ungrouped). `Ok(None)` bails the plan.
+fn psot_weighted_total(
+    ec: &ExecCtx<'_, '_>,
+    pred_sid: &Sid,
+    p_id: u32,
+    weight: &ChainWeight<'_>,
+) -> Result<Option<u64>> {
+    let Some(mut cursor) = build_psot_cursor_for_predicate(
+        ec.ctx,
+        ec.store,
+        ec.g_id,
+        pred_sid.clone(),
+        p_id,
+        cursor_projection_sid_otype_okey(),
+    )?
+    else {
+        return Ok(None);
+    };
+    let mut total: u64 = 0;
+    while let Some(batch) = cursor
+        .next_batch()
+        .map_err(|e| QueryError::Internal(format!("count-plan cursor batch: {e}")))?
+    {
+        for row in 0..batch.row_count {
+            let w = weight.weight(batch.o_type.get(row), batch.o_key.get(row));
+            total = total
+                .checked_add(w)
+                .ok_or_else(|| QueryError::execution("COUNT(*) overflow in chain join"))?;
+        }
+    }
+    Ok(Some(total))
+}
+
+/// Overlay set of subjects for a predicate. `Ok(None)` bails the plan.
+fn subject_set(ec: &ExecCtx<'_, '_>, pred: &Ref) -> Result<Option<FxHashSet<u64>>> {
+    match subject_keys_sorted(ec, pred)? {
+        Some(v) => Ok(Some(v.into_iter().collect())),
+        None => Ok(None),
+    }
+}
+
+/// Build the rightmost chain weights (keyed by subjects of `pN`) under overlay,
+/// applying the tail modifier. `Ok(None)` bails the plan.
+fn build_chain_rightmost_overlay(
+    ec: &ExecCtx<'_, '_>,
+    tail: &TailWeight,
+    pn_sid: &Sid,
+    pn_id: u32,
+) -> Result<Option<FxHashMap<u64, u64>>> {
+    match tail {
+        TailWeight::None => psot_weighted_subject_sums(ec, pn_sid, pn_id, &ChainWeight::CountEdges),
+        TailWeight::Optional { tail_pred } => {
+            // mult_map[c] = max(1, count_tail(c)); objects with no tail edge → 1.
+            let Some(mut groups) = subject_groups(ec, tail_pred)? else {
+                return Ok(None);
+            };
+            let mut mult: FxHashMap<u64, u64> = FxHashMap::default();
+            while let Some((c, count)) = groups.next_group()? {
+                mult.insert(c, count.max(1));
+            }
+            psot_weighted_subject_sums(
+                ec,
+                pn_sid,
+                pn_id,
+                &ChainWeight::Lookup {
+                    weights: &mult,
+                    default: 1,
+                },
+            )
+        }
+        TailWeight::Minus { tail_pred } => {
+            let Some(set) = subject_set(ec, tail_pred)? else {
+                return Ok(None);
+            };
+            psot_weighted_subject_sums(ec, pn_sid, pn_id, &ChainWeight::NotInSet { set: &set })
+        }
+        TailWeight::Exists { tail_pred } => {
+            let Some(set) = subject_set(ec, tail_pred)? else {
+                return Ok(None);
+            };
+            if set.is_empty() {
+                return Ok(Some(FxHashMap::default()));
+            }
+            psot_weighted_subject_sums(ec, pn_sid, pn_id, &ChainWeight::InSet { set: &set })
+        }
+    }
+}
+
+/// Overlay lane for a chain fold. Equivalent to the metadata `execute_chain`
+/// but built on overlay-merging PSOT cursors: a uniform right-to-left fold of
+/// per-hop weight maps (no `PsotSeekSumCursor`).
+///
+/// `comp[v_k]` = number of chain completions from `v_k` through `p_{k+1}..pN`
+/// (+ tail). Built rightmost-first, folded through `p_{N-1}..p2`, then summed
+/// over `p1`'s edges. `Ok(None)` bails to the generic fallback (a predicate is
+/// absent from the base index while novelty is present, or an overlay flake
+/// failed to translate).
+fn execute_chain_overlay(chain: &ChainFold, ec: &ExecCtx<'_, '_>) -> Result<Option<u64>> {
+    let n = chain.predicates.len();
+    debug_assert!(n >= 2, "chain must have at least 2 predicates");
+
+    // Resolve predicates. An absent predicate may carry overlay-only rows a
+    // p_id cursor can't reach, so bail rather than undercount.
+    let mut p_sids: Vec<Sid> = Vec::with_capacity(n);
+    let mut p_ids: Vec<u32> = Vec::with_capacity(n);
+    for pred in &chain.predicates {
+        let sid = normalize_pred_sid(ec.store, pred)?;
+        let Some(p_id) = ec.store.sid_to_p_id(&sid) else {
+            return Ok(None);
+        };
+        p_sids.push(sid);
+        p_ids.push(p_id);
+    }
+
+    // Rightmost weights keyed by subjects of pN (= v_{N-1}).
+    let Some(mut comp) =
+        build_chain_rightmost_overlay(ec, &chain.tail_weight, &p_sids[n - 1], p_ids[n - 1])?
+    else {
+        return Ok(None);
+    };
+    if comp.is_empty() {
+        return Ok(Some(0));
+    }
+
+    // Fold p_{N-1} … p2 (indices n-2 … 1). Empty range for n == 2.
+    for idx in (1..=n.saturating_sub(2)).rev() {
+        let new_comp = {
+            let mode = ChainWeight::Lookup {
+                weights: &comp,
+                default: 0,
+            };
+            match psot_weighted_subject_sums(ec, &p_sids[idx], p_ids[idx], &mode)? {
+                Some(m) => m,
+                None => return Ok(None),
+            }
+        };
+        comp = new_comp;
+        if comp.is_empty() {
+            return Ok(Some(0));
+        }
+    }
+
+    // Head: Σ over p1 edges of comp[object].
+    let head_mode = ChainWeight::Lookup {
+        weights: &comp,
+        default: 0,
+    };
+    psot_weighted_total(ec, &p_sids[0], p_ids[0], &head_mode)
+}
+
+// ---------------------------------------------------------------------------
+// Optional chain-head: `?a <p1> ?b . OPTIONAL { ?b <p2> ?c . ?c <p3> ?d }`
+// total = Σ_b count_p1(b) × max(1, Σ_{c ∈ p2(b)} count_p3(c))
+// ---------------------------------------------------------------------------
+
+/// True iff every stored object of predicate `p_id` is an IRI reference.
+///
+/// Cheap directory prepass (no row decode): inspects each POST leaflet's
+/// `o_type_const`. A `None` (mixed leaflet) or any non-`IRI_REF` homogeneous
+/// type disqualifies. An empty predicate is vacuously all-IRI (count 0).
+fn predicate_objects_all_iri(store: &BinaryIndexStore, g_id: GraphId, p_id: u32) -> Result<bool> {
+    let iri_ref = OType::IRI_REF.as_u16();
+    for leaf_entry in leaf_entries_for_predicate(store, g_id, RunSortOrder::Post, p_id) {
+        let handle = store
+            .open_leaf_handle(&leaf_entry.leaf_cid, leaf_entry.sidecar_cid.as_ref(), false)
+            .map_err(|e| QueryError::Internal(format!("leaf open: {e}")))?;
+        for entry in &handle.dir().entries {
+            if entry.row_count == 0 || entry.p_const != Some(p_id) {
+                continue;
+            }
+            if entry.o_type_const != Some(iri_ref) {
+                return Ok(false);
+            }
+        }
+    }
+    Ok(true)
+}
+
+/// Metadata lane — consolidates the former `fast_optional_chain_head_count_all`,
+/// parameterized over `ExecCtx`. Runs only when `!ec.overlay`. Differs from the
+/// old standalone operator by (a) deferring non-all-IRI `p1` to the generic
+/// pipeline and (b) treating an absent `p2` (not just `p3`) as "inner chain
+/// never matches ⇒ multiplier 1".
+fn execute_optional_chain_head(
+    ec: &ExecCtx<'_, '_>,
+    p1: &Ref,
+    p2: &Ref,
+    p3: &Ref,
+) -> Result<Option<u64>> {
+    let store = ec.store;
+    let g_id = ec.g_id;
+    let sid1 = normalize_pred_sid(store, p1)?;
+    let sid2 = normalize_pred_sid(store, p2)?;
+    let sid3 = normalize_pred_sid(store, p3)?;
+
+    let Some(p1_id) = store.sid_to_p_id(&sid1) else {
+        // No `p1` data at all ⇒ no `?a p1 ?b` solutions.
+        return Ok(Some(0));
+    };
+
+    // This lane drives the IRI-only `PostObjectGroupCountIter`, which terminates
+    // on a homogeneous non-IRI leaflet (and POST orders such leaflets before
+    // `IRI_REF`). A literal-valued `?b` still survives the OPTIONAL with
+    // multiplier 1, so rather than undercount we defer any non-all-IRI `p1` to
+    // the generic pipeline.
+    if !predicate_objects_all_iri(store, g_id, p1_id)? {
+        return Ok(None);
+    }
+
+    let p2_id = store.sid_to_p_id(&sid2);
+    let p3_id = store.sid_to_p_id(&sid3);
+
+    // If either inner predicate is absent, the OPTIONAL chain can never match,
+    // so every `?a p1 ?b` row contributes exactly 1 (multiplier 1 for all b).
+    let (Some(p2_id), Some(p3_id)) = (p2_id, p3_id) else {
+        let mut it1 = PostObjectGroupCountIter::new(store, g_id, p1_id)?.ok_or(
+            QueryError::Internal("optional chain-head: POST iterator unavailable".into()),
+        )?;
+        let mut total = 0u64;
+        while let Some((_b, w)) = it1.next_group()? {
+            total += w;
+        }
+        return Ok(Some(total));
+    };
+
+    // Precompute n3(c) = count_{p3}(c).
+    let mut n3: FxHashMap<u64, u64> = FxHashMap::default();
+    let mut it3 = PsotSubjectCountIter::new(store, g_id, p3_id)?;
+    while let Some((c, n)) = it3.next_group()? {
+        n3.insert(c, n);
+    }
+
+    let mut it1 = PostObjectGroupCountIter::new(store, g_id, p1_id)?.ok_or(
+        QueryError::Internal("optional chain-head: POST iterator unavailable".into()),
+    )?;
+    // default_weight=0: objects not in n3 contribute nothing to the sum
+    let mut it2 = PsotSubjectWeightedSumIter::new(store, g_id, p2_id, &n3, 0)?.ok_or(
+        QueryError::Internal("optional chain-head: PSOT iterator unavailable".into()),
+    )?;
+
+    let mut p2_cur = it2.next_group()?;
+    let mut total = 0u64;
+
+    while let Some((b, w)) = it1.next_group()? {
+        while let Some((b2, _)) = p2_cur {
+            if b2 < b {
+                p2_cur = it2.next_group()?;
+                continue;
+            }
+            break;
+        }
+        let sum_n3 = match p2_cur {
+            Some((b2, n)) if b2 == b => {
+                p2_cur = it2.next_group()?;
+                n
+            }
+            _ => 0u64,
+        };
+        let mult = if sum_n3 == 0 { 1 } else { sum_n3 };
+        total = total.saturating_add(w.saturating_mul(mult));
+    }
+
+    Ok(Some(total))
+}
+
+/// Overlay lane — reuses the chain weight-map primitives. `n3[c] = count_p3(c)`;
+/// `comp2[b] = Σ_{c ∈ p2(b)} n3[c]`; total = Σ over p1 edges of `max(1, comp2[b])`
+/// (the `LookupMaxOne` head). An absent predicate under novelty bails.
+fn execute_optional_chain_head_overlay(
+    ec: &ExecCtx<'_, '_>,
+    p1: &Ref,
+    p2: &Ref,
+    p3: &Ref,
+) -> Result<Option<u64>> {
+    let s1 = normalize_pred_sid(ec.store, p1)?;
+    let Some(id1) = ec.store.sid_to_p_id(&s1) else {
+        return Ok(None);
+    };
+    let s2 = normalize_pred_sid(ec.store, p2)?;
+    let Some(id2) = ec.store.sid_to_p_id(&s2) else {
+        return Ok(None);
+    };
+    let s3 = normalize_pred_sid(ec.store, p3)?;
+    let Some(id3) = ec.store.sid_to_p_id(&s3) else {
+        return Ok(None);
+    };
+
+    let Some(n3) = psot_weighted_subject_sums(ec, &s3, id3, &ChainWeight::CountEdges)? else {
+        return Ok(None);
+    };
+    let comp2 = {
+        let mode = ChainWeight::Lookup {
+            weights: &n3,
+            default: 0,
+        };
+        match psot_weighted_subject_sums(ec, &s2, id2, &mode)? {
+            Some(m) => m,
+            None => return Ok(None),
+        }
+    };
+    let head = ChainWeight::LookupMaxOne { weights: &comp2 };
+    psot_weighted_total(ec, &s1, id1, &head)
+}
+
+// ---------------------------------------------------------------------------
+// Multicolumn (s,o)-join pair count: `?s <p1> ?o . ?s <p2> ?o`
+// ---------------------------------------------------------------------------
+
+/// Composite key `(s_id, o_type, o_key)` for the multicolumn merge-join.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct SoKey {
+    s: u64,
+    o_type: u16,
+    o_key: u64,
+}
+
+impl Ord for SoKey {
+    fn cmp(&self, other: &Self) -> Ordering {
+        self.s
+            .cmp(&other.s)
+            .then_with(|| self.o_type.cmp(&other.o_type))
+            .then_with(|| self.o_key.cmp(&other.o_key))
+    }
+}
+
+impl PartialOrd for SoKey {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+/// Streams a predicate's rows as `(s_id, o_type, o_key)` in PSOT order, which is
+/// exactly ascending `SoKey` order for a fixed predicate.
+struct PsotSoIter<'a> {
+    store: &'a BinaryIndexStore,
+    p_id: u32,
+    leaf_entries: &'a [fluree_db_binary_index::format::branch::LeafEntry],
+    leaf_pos: usize,
+    leaflet_idx: usize,
+    row: usize,
+    handle: Option<Box<dyn fluree_db_binary_index::read::leaf_access::LeafHandle>>,
+    batch: Option<fluree_db_binary_index::ColumnBatch>,
+    projection: fluree_db_binary_index::ColumnProjection,
+}
+
+impl<'a> PsotSoIter<'a> {
+    fn new(store: &'a BinaryIndexStore, g_id: GraphId, p_id: u32) -> Self {
+        let leaves = leaf_entries_for_predicate(store, g_id, RunSortOrder::Psot, p_id);
+        Self {
+            store,
+            p_id,
+            leaf_entries: leaves,
+            leaf_pos: 0,
+            leaflet_idx: 0,
+            row: 0,
+            handle: None,
+            batch: None,
+            projection: projection_sid_otype_okey(),
+        }
+    }
+
+    fn load_next_batch(&mut self) -> Result<Option<()>> {
+        loop {
+            if self.handle.is_none() {
+                if self.leaf_pos >= self.leaf_entries.len() {
+                    return Ok(None);
+                }
+                let leaf_entry = &self.leaf_entries[self.leaf_pos];
+                self.leaf_pos += 1;
+                self.leaflet_idx = 0;
+                self.row = 0;
+                self.batch = None;
+                self.handle = Some(
+                    self.store
+                        .open_leaf_handle(
+                            &leaf_entry.leaf_cid,
+                            leaf_entry.sidecar_cid.as_ref(),
+                            false,
+                        )
+                        .map_err(|e| QueryError::Internal(format!("leaf open: {e}")))?,
+                );
+            }
+
+            let handle = self.handle.as_ref().unwrap();
+            let dir = handle.dir();
+            while self.leaflet_idx < dir.entries.len() {
+                let entry = &dir.entries[self.leaflet_idx];
+                let idx = self.leaflet_idx;
+                self.leaflet_idx += 1;
+                if entry.row_count == 0 || entry.p_const != Some(self.p_id) {
+                    continue;
+                }
+                let batch = handle
+                    .load_columns(idx, &self.projection, RunSortOrder::Psot)
+                    .map_err(|e| QueryError::Internal(format!("load columns: {e}")))?;
+                self.row = 0;
+                self.batch = Some(batch);
+                return Ok(Some(()));
+            }
+
+            self.handle = None;
+        }
+    }
+
+    fn next_row(&mut self) -> Result<Option<SoKey>> {
+        loop {
+            if self.batch.is_none() && self.load_next_batch()?.is_none() {
+                return Ok(None);
+            }
+            let batch = self.batch.as_ref().unwrap();
+            if self.row >= batch.row_count {
+                self.batch = None;
+                continue;
+            }
+            let key = SoKey {
+                s: batch.s_id.get(self.row),
+                o_type: batch.o_type.get(self.row),
+                o_key: batch.o_key.get(self.row),
+            };
+            self.row += 1;
+            return Ok(Some(key));
+        }
+    }
+}
+
+/// Streams `SoKey { s, o_type, o_key }` rows from an overlay-merged PSOT cursor,
+/// in `(s, o_type, o_key)` order (matching `SoKey`'s ordering and `PsotSoIter`).
+struct CursorSoIter {
+    cursor: BinaryCursor,
+    current: Option<fluree_db_binary_index::ColumnBatch>,
+    row: usize,
+}
+
+impl CursorSoIter {
+    fn new(cursor: BinaryCursor) -> Self {
+        Self {
+            cursor,
+            current: None,
+            row: 0,
+        }
+    }
+
+    fn next_row(&mut self) -> Result<Option<SoKey>> {
+        loop {
+            if self.current.is_none() {
+                self.current = self
+                    .cursor
+                    .next_batch()
+                    .map_err(|e| QueryError::Internal(format!("count-plan cursor batch: {e}")))?;
+                self.row = 0;
+                if self.current.is_none() {
+                    return Ok(None);
+                }
+            }
+            let batch = self.current.as_ref().unwrap();
+            if self.row >= batch.row_count {
+                self.current = None;
+                continue;
+            }
+            let key = SoKey {
+                s: batch.s_id.get(self.row),
+                o_type: batch.o_type.get(self.row),
+                o_key: batch.o_key.get(self.row),
+            };
+            self.row += 1;
+            return Ok(Some(key));
+        }
+    }
+}
+
+/// A `(s, o_type, o_key)` row stream — metadata or overlay lane.
+enum SoRows<'a> {
+    /// Genuinely empty (predicate absent from the base index, no overlay).
+    Empty,
+    Meta(PsotSoIter<'a>),
+    Cursor(CursorSoIter),
+}
+
+impl SoRows<'_> {
+    fn next_row(&mut self) -> Result<Option<SoKey>> {
+        match self {
+            SoRows::Empty => Ok(None),
+            SoRows::Meta(it) => it.next_row(),
+            SoRows::Cursor(c) => c.next_row(),
+        }
+    }
+}
+
+/// Build an `(s, o_type, o_key)` row stream for `pred` — metadata leaflet scan
+/// (no overlay) or the overlay-merging PSOT cursor. `Ok(None)` bails the plan.
+fn so_rows<'a>(ec: &ExecCtx<'a, '_>, pred: &Ref) -> Result<Option<SoRows<'a>>> {
+    let store: &'a Arc<BinaryIndexStore> = ec.store;
+    let sid = normalize_pred_sid(store, pred)?;
+    let Some(p_id) = store.sid_to_p_id(&sid) else {
+        return Ok(if ec.overlay {
+            None
+        } else {
+            Some(SoRows::Empty)
+        });
+    };
+    if ec.overlay {
+        let Some(cursor) = build_psot_cursor_for_predicate(
+            ec.ctx,
+            store,
+            ec.g_id,
+            sid,
+            p_id,
+            cursor_projection_sid_otype_okey(),
+        )?
+        else {
+            return Ok(None);
+        };
+        Ok(Some(SoRows::Cursor(CursorSoIter::new(cursor))))
+    } else {
+        Ok(Some(SoRows::Meta(PsotSoIter::new(store, ec.g_id, p_id))))
+    }
+}
+
+/// Count `(s, o)` pairs present in BOTH predicate relations via a streaming
+/// merge-join on the composite `(s_id, o_type, o_key)` key. Each shared pair is
+/// counted once (intersection cardinality), NOT the product of per-subject counts.
+/// `Ok(None)` bails the plan (overlay present but a predicate is absent from the
+/// base index, or an overlay flake failed to translate).
+fn count_composite_join_pairs(ec: &ExecCtx<'_, '_>, p1: &Ref, p2: &Ref) -> Result<Option<u64>> {
+    let Some(mut it1) = so_rows(ec, p1)? else {
+        return Ok(None);
+    };
+    let Some(mut it2) = so_rows(ec, p2)? else {
+        return Ok(None);
+    };
+
+    let mut a = it1.next_row()?;
+    let mut b = it2.next_row()?;
+    let mut count: u64 = 0;
+
+    while let (Some(ka), Some(kb)) = (a, b) {
+        match ka.cmp(&kb) {
+            Ordering::Less => a = it1.next_row()?,
+            Ordering::Greater => b = it2.next_row()?,
+            Ordering::Equal => {
+                count = count.saturating_add(1);
+                a = it1.next_row()?;
+                b = it2.next_row()?;
+            }
+        }
+    }
+
+    Ok(Some(count))
 }

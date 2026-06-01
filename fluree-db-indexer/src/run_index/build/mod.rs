@@ -1,5 +1,5 @@
 pub mod build_from_commits;
-pub use build_from_commits::{ClassBitsetTable, SpotClassStatsCollector};
+pub use build_from_commits::{ClassMembership, SpotClassStatsCollector};
 pub mod incremental_branch;
 pub mod incremental_leaf;
 pub mod incremental_resolve;

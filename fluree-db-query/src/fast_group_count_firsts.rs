@@ -1,7 +1,10 @@
 use crate::binding::Binding;
 use crate::context::{ExecutionContext, WellKnownDatatypes};
 use crate::error::{QueryError, Result};
-use crate::fast_path_common::{fast_path_store, normalize_pred_sid, subject_ref_to_s_id};
+use crate::fast_path_common::{
+    allow_cursor_fast_path, build_psot_cursor_for_predicate, fast_path_store, normalize_pred_sid,
+    subject_ref_to_s_id,
+};
 use crate::ir::triple::{Ref, Term};
 use crate::operator::BoxedOperator;
 use crate::operator::{Operator, OperatorState};
@@ -18,8 +21,8 @@ use fluree_db_binary_index::read::column_loader::{
     load_leaflet_columns, load_leaflet_columns_cached,
 };
 use fluree_db_binary_index::{
-    BinaryCursor, BinaryFilter, BinaryGraphView, BinaryIndexStore, ColumnBatch, ColumnProjection,
-    ColumnSet, RunSortOrder,
+    BinaryCursor, BinaryGraphView, BinaryIndexStore, ColumnBatch, ColumnProjection, ColumnSet,
+    RunSortOrder,
 };
 use fluree_db_core::o_type::OType;
 use fluree_db_core::subject_id::SubjectId;
@@ -36,16 +39,6 @@ use std::sync::Arc;
 #[inline]
 fn should_fallback(ctx: &ExecutionContext<'_>) -> bool {
     fast_path_store(ctx).is_none()
-}
-
-#[inline]
-fn allow_cursor_fast_path(ctx: &ExecutionContext<'_>) -> bool {
-    // History mode is filtered at the planner — see
-    // `execute::operator_tree::build_operator_tree_inner` — so this gate
-    // doesn't duplicate that check.
-    !ctx.is_multi_ledger()
-        && ctx.from_t.is_none()
-        && ctx.policy_enforcer.as_ref().is_none_or(|p| p.is_root())
 }
 
 // ---------------------------------------------------------------------------
@@ -1126,123 +1119,6 @@ impl Operator for GroupByObjectStarTopKOperator {
     }
 }
 
-fn build_psot_cursor_for_predicate_group(
-    ctx: &ExecutionContext<'_>,
-    store: &Arc<BinaryIndexStore>,
-    g_id: GraphId,
-    pred_sid: Sid,
-    p_id: u32,
-    projection: ColumnProjection,
-) -> Result<Option<BinaryCursor>> {
-    let Some(branch) = store.branch_for_order(g_id, RunSortOrder::Psot) else {
-        return Ok(None);
-    };
-    let branch = Arc::clone(branch);
-
-    let min_key = RunRecordV2 {
-        s_id: SubjectId(0),
-        o_key: 0,
-        p_id,
-        t: 0,
-        o_i: 0,
-        o_type: 0,
-        g_id,
-    };
-    let max_key = RunRecordV2 {
-        s_id: SubjectId(u64::MAX),
-        o_key: u64::MAX,
-        p_id,
-        t: 0,
-        o_i: u32::MAX,
-        o_type: u16::MAX,
-        g_id,
-    };
-
-    let filter = BinaryFilter {
-        p_id: Some(p_id),
-        ..Default::default()
-    };
-
-    let mut cursor = BinaryCursor::new(
-        Arc::clone(store),
-        RunSortOrder::Psot,
-        branch,
-        &min_key,
-        &max_key,
-        filter,
-        projection,
-    );
-    cursor.set_to_t(ctx.to_t);
-
-    // Overlay merge — pre-filter by predicate.
-    if ctx.overlay.is_some() {
-        use std::collections::HashMap as StdHashMap;
-        let dn = ctx.dict_novelty.clone().unwrap_or_else(|| {
-            Arc::new(fluree_db_core::dict_novelty::DictNovelty::new_uninitialized())
-        });
-        let mut ephemeral_preds: StdHashMap<fluree_db_core::Sid, u32> = StdHashMap::new();
-        let mut next_ep = store.predicate_count();
-        let mut ops = Vec::new();
-        let mut translate_failed = false;
-        let mut translate_fail_count: u32 = 0;
-
-        ctx.overlay().for_each_overlay_flake(
-            g_id,
-            fluree_db_core::IndexType::Psot,
-            None,
-            None,
-            true,
-            ctx.to_t,
-            &mut |flake| {
-                if flake.p != pred_sid {
-                    return;
-                }
-                match crate::binary_scan::translate_one_flake_v3_pub(
-                    flake,
-                    store,
-                    Some(&dn),
-                    ctx.runtime_small_dicts,
-                    &mut ephemeral_preds,
-                    &mut next_ep,
-                    g_id,
-                ) {
-                    Ok(op) => ops.push(op),
-                    Err(e) => {
-                        translate_failed = true;
-                        translate_fail_count = translate_fail_count.saturating_add(1);
-                        if translate_fail_count == 1 {
-                            tracing::warn!(
-                                error = %e,
-                                s = %flake.s,
-                                p = %flake.p,
-                                t = flake.t,
-                                op = flake.op,
-                                "group-by-object star: overlay flake translation failed; disabling fast path for correctness"
-                            );
-                        }
-                    }
-                }
-            },
-        );
-        if translate_failed {
-            tracing::debug!(
-                failures = translate_fail_count,
-                "group-by-object star: falling back due to overlay translation failures"
-            );
-            return Ok(None);
-        }
-
-        if !ops.is_empty() {
-            fluree_db_binary_index::read::types::sort_overlay_ops(&mut ops, RunSortOrder::Psot);
-            fluree_db_binary_index::read::types::resolve_overlay_ops(&mut ops);
-            cursor.set_overlay_ops(ops);
-        }
-        cursor.set_epoch(ctx.overlay().epoch());
-    }
-
-    Ok(Some(cursor))
-}
-
 fn collect_subject_set_for_predicate_group(
     store: &Arc<BinaryIndexStore>,
     ctx: &ExecutionContext<'_>,
@@ -1270,7 +1146,7 @@ fn collect_subject_set_for_predicate_group(
         internal: ColumnSet::EMPTY,
     };
     let Some(mut cursor) =
-        build_psot_cursor_for_predicate_group(ctx, store, g_id, sid, p_id, projection)?
+        build_psot_cursor_for_predicate(ctx, store, g_id, sid, p_id, projection)?
     else {
         return Ok(None);
     };
@@ -1336,7 +1212,7 @@ fn compute_group_by_object_star_topk(
         internal: ColumnSet::EMPTY,
     };
     let Some(mut cursor) =
-        build_psot_cursor_for_predicate_group(ctx, store, g_id, sid, p_id, projection)?
+        build_psot_cursor_for_predicate(ctx, store, g_id, sid, p_id, projection)?
     else {
         return Ok(None);
     };
@@ -1365,7 +1241,7 @@ fn compute_group_by_object_star_topk(
             internal: ColumnSet::EMPTY,
         };
         let Some(mut fcur) =
-            build_psot_cursor_for_predicate_group(ctx, store, g_id, fp_sid, fp_id, fp_proj)?
+            build_psot_cursor_for_predicate(ctx, store, g_id, fp_sid, fp_id, fp_proj)?
         else {
             return Ok(None);
         };

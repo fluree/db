@@ -483,6 +483,27 @@ impl IdStatsHook {
             for (key, props) in other.subject_props {
                 self.subject_props.entry(key).or_default().extend(props);
             }
+            // Merge per-subject, per-property datatype/language deltas. (These
+            // were previously dropped here, leaving class→property→datatype/lang
+            // attribution empty after any multi-worker accumulation.)
+            for (key, per_prop) in other.subject_prop_dts {
+                let entry = self.subject_prop_dts.entry(key).or_default();
+                for (p_id, dts) in per_prop {
+                    let dt_entry = entry.entry(p_id).or_default();
+                    for (dt, delta) in dts {
+                        *dt_entry.entry(dt).or_insert(0) += delta;
+                    }
+                }
+            }
+            for (key, per_prop) in other.subject_prop_langs {
+                let entry = self.subject_prop_langs.entry(key).or_default();
+                for (p_id, langs) in per_prop {
+                    let lang_entry = entry.entry(p_id).or_default();
+                    for (lang, delta) in langs {
+                        *lang_entry.entry(lang).or_insert(0) += delta;
+                    }
+                }
+            }
         }
         // Merge per-subject ref history.
         if self.track_ref_targets && !self.hll_only {

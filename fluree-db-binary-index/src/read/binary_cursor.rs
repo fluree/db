@@ -24,6 +24,7 @@ use super::binary_index_store::BinaryIndexStore;
 use super::column_loader::load_columns_cached_via_handle;
 use super::column_types::{BinaryFilter, ColumnBatch, ColumnData, ColumnProjection};
 use super::replay::{batch_has_rows_above_t, replay_leaflet};
+use crate::format::column_block::ColumnId;
 
 // ============================================================================
 // BinaryCursor
@@ -150,6 +151,26 @@ impl BinaryCursor {
             ops.windows(2).all(|w| w[0].fact_key() != w[1].fact_key()),
             "overlay ops contain duplicate fact keys — caller must resolve \
              assert/retract lifecycles via resolve_overlay_ops() before set_overlay_ops()"
+        );
+        // `merge_overlay_into_batch` compares each base row against overlay ops
+        // on the FULL V3 identity (s_id, p_id, o_type, o_key, o_i). If the
+        // projection omits any of these, the base column reads as `AbsentDefault`
+        // (p_id→0, o_type→0, o_i→u32::MAX), corrupting the sort/identity compare
+        // and over/under-counting. Production masks this because the leaflet
+        // cache always loads `ColumnProjection::all()`, but a cache-less store
+        // would miscount — so require the identity columns explicitly here.
+        debug_assert!(
+            ops.is_empty() || {
+                let eff = self.projection.effective();
+                eff.contains(ColumnId::SId)
+                    && eff.contains(ColumnId::PId)
+                    && eff.contains(ColumnId::OType)
+                    && eff.contains(ColumnId::OKey)
+                    && eff.contains(ColumnId::OI)
+            },
+            "overlay merge requires the full V3 identity (SId, PId, OType, OKey, OI) \
+             in the cursor projection; got {:?}",
+            self.projection
         );
         let len = ops.len();
         self.overlay_ops = ops;

@@ -1496,3 +1496,105 @@ async fn sparql_update_under_employee_bearer_denied() {
         "expected exMessage in error; got: {err_msg}"
     );
 }
+
+// ── multi-query SPARQL alias policy enforcement ───────────────────────────────
+//
+// Regression for the review finding (CRITICAL-2): SPARQL aliases inside a
+// multi-query envelope must be policy-enforced the same as JSON-LD aliases and
+// the same as single-query SPARQL. Before the fix, the per-alias gate ran only
+// for JSON-LD and the SPARQL execution path had no channel for identity/policy,
+// so a restricted identity saw the FULL ledger through a SPARQL alias.
+
+async fn post_envelope(
+    app: axum::Router,
+    envelope: &JsonValue,
+    token: Option<&str>,
+) -> (StatusCode, JsonValue) {
+    let mut req = Request::builder()
+        .method("POST")
+        .uri("/v1/fluree/multi-query")
+        .header("content-type", "application/json");
+    if let Some(tok) = token {
+        req = req.header("authorization", format!("Bearer {tok}"));
+    }
+    let resp = app
+        .oneshot(req.body(Body::from(envelope.to_string())).unwrap())
+        .await
+        .unwrap();
+    json_body(resp).await
+}
+
+/// A restricted identity (public-user → PublicClass) must see ONLY the public
+/// document through a SPARQL alias — the secret/internal docs must not leak.
+#[tokio::test]
+async fn multi_query_sparql_alias_enforces_policy_for_restricted_identity() {
+    let (_tmp, state) = policy_test_state().await;
+    let app = setup_policy_ledger(build_router(state), "spol:main").await;
+
+    let signing_key = SigningKey::from_bytes(&[71u8; 32]);
+    let token = identity_token(&signing_key, "http://example.org/public-user", "spol:main");
+
+    let envelope = serde_json::json!({
+        "queries": {
+            "sparql_docs": {
+                "language": "sparql",
+                "query": "PREFIX ex: <http://example.org/> \
+                          PREFIX schema: <http://schema.org/> \
+                          SELECT ?name FROM <spol:main> \
+                          WHERE { ?doc a ex:Document ; schema:name ?name }"
+            }
+        }
+    });
+    let (status, body) = post_envelope(app, &envelope, Some(&token)).await;
+    assert_eq!(status, StatusCode::OK, "envelope status; body: {body}");
+    assert_eq!(body["status"], "ok", "body: {body}");
+
+    let alias = serde_json::to_string(&body["results"]["sparql_docs"]).unwrap();
+    assert!(
+        alias.contains("Public Post"),
+        "restricted identity must still see the public doc; got: {alias}"
+    );
+    assert!(
+        !alias.contains("Internal Memo") && !alias.contains("Executive Salaries"),
+        "SPARQL alias leaked restricted docs to a public-only identity; got: {alias}"
+    );
+}
+
+/// A manager identity (ManagerClass → f:allow true) sees ALL documents through a
+/// SPARQL alias. Proves the restriction above is genuine policy filtering, not a
+/// blanket block, and that the policy-enforced SPARQL path works end to end.
+#[tokio::test]
+async fn multi_query_sparql_alias_policy_manager_sees_all() {
+    let (_tmp, state) = policy_test_state().await;
+    let app = setup_policy_ledger(build_router(state), "spol2:main").await;
+
+    let signing_key = SigningKey::from_bytes(&[72u8; 32]);
+    let token = identity_token(
+        &signing_key,
+        "http://example.org/manager-user",
+        "spol2:main",
+    );
+
+    let envelope = serde_json::json!({
+        "queries": {
+            "sparql_docs": {
+                "language": "sparql",
+                "query": "PREFIX ex: <http://example.org/> \
+                          PREFIX schema: <http://schema.org/> \
+                          SELECT ?name FROM <spol2:main> \
+                          WHERE { ?doc a ex:Document ; schema:name ?name }"
+            }
+        }
+    });
+    let (status, body) = post_envelope(app, &envelope, Some(&token)).await;
+    assert_eq!(status, StatusCode::OK, "envelope status; body: {body}");
+    assert_eq!(body["status"], "ok", "body: {body}");
+
+    let alias = serde_json::to_string(&body["results"]["sparql_docs"]).unwrap();
+    assert!(
+        alias.contains("Public Post")
+            && alias.contains("Internal Memo")
+            && alias.contains("Executive Salaries"),
+        "manager identity must see all docs through the SPARQL alias; got: {alias}"
+    );
+}

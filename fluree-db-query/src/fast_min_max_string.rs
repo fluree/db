@@ -1,20 +1,21 @@
-//! Fast-path: scalar `MIN(?o)` / `MAX(?o)` / `AVG(?o)` for a single triple `?s <p> ?o`.
+//! Fast-path: scalar `MIN(?o)` / `MAX(?o)` for a single triple `?s <p> ?o`.
 //!
-//! QLever answers these kinds of aggregates by exploiting permutation order and metadata
-//! to avoid scanning all rows. For Fluree's V3 index, we can do something similar:
+//! These aggregates can be answered by exploiting permutation order and metadata
+//! to avoid scanning all rows. For Fluree's V3 index, we do this as follows:
 //! - for homogeneous numeric predicates, use each POST leaflet's first/last key as the
-//!   MIN/MAX candidate and scan only `o_key` for AVG
+//!   MIN/MAX candidate
 //! - for homogeneous string-dict predicates, use each leaflet's first/last key as the
 //!   MIN/MAX candidate and compare string dictionary values lexicographically
 //!
-//! This reduces work from O(rows) decode/materialization to O(leaflets) for MIN/MAX and
-//! O(rows) over `o_key` only for AVG.
+//! This reduces work from O(rows) decode/materialization to O(leaflets) — only leaflet
+//! directory keys are read. The row-scanning aggregates (`SUM`/`AVG`/`COUNT(DISTINCT)`)
+//! live in [`crate::fast_predicate_scalar_agg`]; routing MIN/MAX through that per-row
+//! cursor would regress them to O(rows).
 
 use crate::binding::{Batch, Binding};
 use crate::error::{QueryError, Result};
 use crate::fast_path_common::{
-    fast_path_store, leaf_entries_for_predicate, normalize_pred_sid, projection_okey_only,
-    FastPathOperator,
+    fast_path_store, leaf_entries_for_predicate, normalize_pred_sid, FastPathOperator,
 };
 use crate::ir::triple::Ref;
 use crate::operator::BoxedOperator;
@@ -74,41 +75,6 @@ pub fn predicate_min_max_string_operator(
         },
         fallback,
         "MIN/MAX string",
-    )
-}
-
-/// Create a fused operator that outputs a single-row batch containing AVG(?o).
-pub fn predicate_avg_numeric_operator(
-    predicate: Ref,
-    out_var: VarId,
-    fallback: Option<BoxedOperator>,
-) -> FastPathOperator {
-    FastPathOperator::new(
-        out_var,
-        move |ctx| {
-            let Some(store) = fast_path_store(ctx) else {
-                return Ok(None);
-            };
-            let pred_sid = normalize_pred_sid(store, &predicate)?;
-            let Some(p_id) = store.sid_to_p_id(&pred_sid) else {
-                let batch = Batch::single_row(
-                    Arc::from(vec![out_var].into_boxed_slice()),
-                    vec![Binding::Unbound],
-                )
-                .map_err(|e| QueryError::execution(format!("avg batch build: {e}")))?;
-                return Ok(Some(batch));
-            };
-
-            if let Some(b) = avg_numeric_post(store, ctx.binary_g_id, p_id)? {
-                let batch = Batch::single_row(Arc::from(vec![out_var].into_boxed_slice()), vec![b])
-                    .map_err(|e| QueryError::execution(format!("avg batch build: {e}")))?;
-                return Ok(Some(batch));
-            }
-
-            Ok(None)
-        },
-        fallback,
-        "AVG numeric",
     )
 }
 
@@ -267,71 +233,6 @@ fn minmax_numeric_post(
     Ok(best.map(|(o_type, o_key)| numeric_binding_from_otype_okey(store, o_type, o_key)))
 }
 
-/// Compute AVG(?o) over a numeric predicate by scanning POST leaflets.
-///
-/// # Precision
-///
-/// Uses Kahan compensated summation to reduce floating-point rounding error when
-/// accumulating many values. Naive `sum += x` can lose low-order bits as the
-/// accumulator grows large; Kahan summation maintains a separate compensation
-/// term `c` that captures the lost low-order bits each iteration, keeping
-/// relative error near machine epsilon rather than growing with row count.
-fn avg_numeric_post(store: &BinaryIndexStore, g_id: GraphId, p_id: u32) -> Result<Option<Binding>> {
-    let leaves = leaf_entries_for_predicate(store, g_id, RunSortOrder::Post, p_id);
-    let projection = projection_okey_only();
-    let mut required_otype: Option<u16> = None;
-    // Kahan compensated summation state
-    let mut sum = 0.0f64;
-    let mut compensation = 0.0f64;
-    let mut count: u64 = 0;
-
-    for leaf_entry in leaves {
-        let handle = store
-            .open_leaf_handle(&leaf_entry.leaf_cid, leaf_entry.sidecar_cid.as_ref(), false)
-            .map_err(|e| QueryError::Internal(format!("leaf open: {e}")))?;
-        let dir = handle.dir();
-
-        for (leaflet_idx, entry) in dir.entries.iter().enumerate() {
-            if entry.row_count == 0 || entry.p_const != Some(p_id) {
-                continue;
-            }
-            let Some(o_type) = entry.o_type_const else {
-                return Ok(None);
-            };
-            let ot = OType::from_u16(o_type);
-            if !ot.is_numeric() {
-                return Ok(None);
-            }
-            match required_otype {
-                None => required_otype = Some(o_type),
-                Some(existing) if existing != o_type => return Ok(None),
-                Some(_) => {}
-            }
-
-            let batch = handle
-                .load_columns(leaflet_idx, &projection, RunSortOrder::Post)
-                .map_err(|e| QueryError::Internal(format!("load columns: {e}")))?;
-            for row in 0..batch.row_count {
-                let val = decode_numeric_as_f64(o_type, batch.o_key.get(row))?;
-                // Kahan summation: compensate for lost low-order bits
-                let y = val - compensation;
-                let t = sum + y;
-                compensation = (t - sum) - y;
-                sum = t;
-            }
-            count = count.saturating_add(batch.row_count as u64);
-        }
-    }
-
-    if count == 0 {
-        return Ok(Some(Binding::Unbound));
-    }
-    Ok(Some(Binding::lit(
-        FlakeValue::Double(sum / count as f64),
-        Sid::xsd_double(),
-    )))
-}
-
 fn numeric_binding_from_otype_okey(store: &BinaryIndexStore, o_type: u16, o_key: u64) -> Binding {
     let ot = OType::from_u16(o_type);
     let dt = store
@@ -343,17 +244,5 @@ fn numeric_binding_from_otype_okey(store: &BinaryIndexStore, o_type: u16, o_key:
             Binding::lit(FlakeValue::Double(ObjKey::from_u64(o_key).decode_f64()), dt)
         }
         _ => Binding::Unbound,
-    }
-}
-
-fn decode_numeric_as_f64(o_type: u16, o_key: u64) -> Result<f64> {
-    let ot = OType::from_u16(o_type);
-    let key = ObjKey::from_u64(o_key);
-    match ot.decode_kind() {
-        DecodeKind::I64 => Ok(key.decode_i64() as f64),
-        DecodeKind::F64 => Ok(key.decode_f64()),
-        _ => Err(QueryError::execution(format!(
-            "unsupported numeric decode kind for AVG fast-path: {ot:?}"
-        ))),
     }
 }

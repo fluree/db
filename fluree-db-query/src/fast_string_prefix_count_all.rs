@@ -13,8 +13,8 @@
 use crate::context::ExecutionContext;
 use crate::error::{QueryError, Result};
 use crate::fast_path_common::{
-    build_count_batch, build_i64_singleton_batch, contiguous_id_range, fast_path_store,
-    ref_to_p_id, FastPathOperator,
+    build_count_batch, build_i64_singleton_batch, build_range_cursor, contiguous_id_range,
+    fast_path_store, ref_to_p_id, FastPathOperator,
 };
 use crate::ir::triple::Ref;
 use crate::operator::BoxedOperator;
@@ -22,7 +22,7 @@ use crate::var_registry::VarId;
 use fluree_db_binary_index::format::column_block::ColumnId;
 use fluree_db_binary_index::format::run_record::RunSortOrder;
 use fluree_db_binary_index::format::run_record_v2::RunRecordV2;
-use fluree_db_binary_index::{BinaryCursor, BinaryFilter, ColumnProjection, ColumnSet};
+use fluree_db_binary_index::{BinaryFilter, ColumnProjection, ColumnSet};
 use fluree_db_core::o_type::OType;
 use fluree_db_core::subject_id::SubjectId;
 use fluree_db_core::GraphId;
@@ -115,10 +115,6 @@ fn count_prefix_rows_opst(
     id_ranges: &[(u32, u32)],
     to_t: i64,
 ) -> Result<u64> {
-    let Some(branch) = store.branch_for_order(g_id, RunSortOrder::Opst) else {
-        return Ok(0);
-    };
-    let branch = Arc::clone(branch);
     let projection = ColumnProjection {
         output: ColumnSet::EMPTY,
         internal: ColumnSet::single(ColumnId::OKey),
@@ -156,15 +152,17 @@ fn count_prefix_rows_opst(
                 o_type: Some(o_type),
                 ..Default::default()
             };
-            let mut cursor = BinaryCursor::new(
-                Arc::clone(store),
+            let Some(mut cursor) = build_range_cursor(
+                store,
+                g_id,
                 RunSortOrder::Opst,
-                Arc::clone(&branch),
                 &min_key,
                 &max_key,
                 filter,
                 projection,
-            );
+            ) else {
+                return Ok(total);
+            };
             cursor.set_to_t(to_t);
 
             while let Some(batch) = cursor

@@ -296,6 +296,22 @@ fn sid_to_iri_match(
     ))
 }
 
+/// Count a single member to exhaustion, preferring its `drain_count`
+/// (count-only, no binding materialization) and falling back to a streaming
+/// `next_batch` row count when the member declines count-only mode.
+async fn count_member(op: &mut BoxedOperator, ctx: &ExecutionContext<'_>) -> Result<u64> {
+    if let Some(n) = op.drain_count(ctx).await? {
+        return Ok(n);
+    }
+    let mut n: u64 = 0;
+    while let Some(batch) = op.next_batch(ctx).await? {
+        n = n
+            .checked_add(batch.len() as u64)
+            .ok_or_else(|| QueryError::execution("COUNT(*) overflow in dataset drain_count"))?;
+    }
+    Ok(n)
+}
+
 #[async_trait]
 impl Operator for DatasetOperator {
     fn schema(&self) -> &[VarId] {
@@ -412,6 +428,54 @@ impl Operator for DatasetOperator {
         // All members exhausted.
         self.state = OperatorState::Exhausted;
         Ok(None)
+    }
+
+    /// Count-only drain across all member graphs.
+    ///
+    /// Counts are invariant under provenance stamping (it rewrites binding
+    /// values, never row counts), so this skips stamping entirely and sums each
+    /// member's count. Each member is counted independently via its own
+    /// `drain_count` (or a streaming fallback), so mixed count-only support
+    /// across graphs is fine. `COUNT(*)` over a multi-graph dataset is the bag
+    /// union of per-graph row counts.
+    async fn drain_count(&mut self, ctx: &ExecutionContext<'_>) -> Result<Option<u64>> {
+        if !self.state.can_next() {
+            if self.state == OperatorState::Created {
+                return Err(QueryError::OperatorNotOpened);
+            }
+            return Ok(None);
+        }
+
+        let graphs = ctx.active_graphs();
+
+        debug_assert!(
+            match &graphs {
+                ActiveGraphs::Many(g) => g.len() == self.members.len(),
+                ActiveGraphs::Single => self.members.len() == 1,
+            },
+            "active_graphs() returned a different number of graphs than open() saw"
+        );
+
+        let mut total: u64 = 0;
+        while self.current_member < self.members.len() {
+            let n = match &graphs {
+                ActiveGraphs::Many(g) => {
+                    let graph_ctx = ctx.with_graph_ref(g[self.current_member]);
+                    count_member(&mut self.members[self.current_member].operator, &graph_ctx)
+                        .await?
+                }
+                ActiveGraphs::Single => {
+                    count_member(&mut self.members[self.current_member].operator, ctx).await?
+                }
+            };
+            total = total
+                .checked_add(n)
+                .ok_or_else(|| QueryError::execution("COUNT(*) overflow in dataset drain_count"))?;
+            self.current_member += 1;
+        }
+
+        self.state = OperatorState::Exhausted;
+        Ok(Some(total))
     }
 
     fn close(&mut self) {

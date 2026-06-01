@@ -17,6 +17,11 @@ pub type ClassRefTargets = HashMap<(GraphId, u64), HashMap<u32, HashMap<u64, i64
 /// FxHashMap-keyed variant used internally to match `SpotClassStats.class_prop_refs`.
 type ClassRefTargetsFx = FxHashMap<(GraphId, u64), FxHashMap<u32, FxHashMap<u64, u64>>>;
 
+/// `(g_id, class) → p_id → inner_key → count` — the shape shared by
+/// `SpotClassStats`'s datatype/lang maps (`K = u16`) and ref-target map
+/// (`K = u64`). Used by [`merge_class_prop_map`].
+type ClassPropCountMap<K> = FxHashMap<(GraphId, u64), FxHashMap<u32, FxHashMap<K, u64>>>;
+
 /// Sentinel datatype value used in [`SpotClassStats`] for object-reference
 /// properties (`ObjKind::REF_ID`). Displayed as `@id` in stats output.
 pub const DT_REF_ID: u16 = u16::MAX;
@@ -43,6 +48,46 @@ pub struct SpotClassStats {
     pub class_prop_langs: FxHashMap<(GraphId, u64), FxHashMap<u32, FxHashMap<u16, u64>>>,
     /// (g_id, class_sid64) → p_id → target_class sid64 → count
     pub class_prop_refs: FxHashMap<(GraphId, u64), FxHashMap<u32, FxHashMap<u64, u64>>>,
+}
+
+impl SpotClassStats {
+    /// Merge another `SpotClassStats` into `self` by key-wise union, summing
+    /// counts on any colliding key.
+    ///
+    /// Used by the import pipeline to fold each named-graph build's class stats
+    /// into the default-graph accumulator. All maps are keyed by
+    /// `(g_id, class_sid)` and the per-graph builds use disjoint `g_id`s, so in
+    /// practice there are no top-level collisions — but summing keeps the merge
+    /// correct regardless of key overlap. Ref-target classes that a build could
+    /// not resolve (e.g. a ref into another graph) are simply absent from
+    /// `other.class_prop_refs`; they remain counted as `@id` flakes in
+    /// `class_prop_dts` under [`DT_REF_ID`].
+    pub fn merge(&mut self, other: SpotClassStats) {
+        for (k, v) in other.class_counts {
+            *self.class_counts.entry(k).or_insert(0) += v;
+        }
+        merge_class_prop_map(&mut self.class_prop_dts, other.class_prop_dts);
+        merge_class_prop_map(&mut self.class_prop_langs, other.class_prop_langs);
+        merge_class_prop_map(&mut self.class_prop_refs, other.class_prop_refs);
+    }
+}
+
+/// Union one `(g_id, class) → p_id → inner_key → count` map into another,
+/// summing counts on colliding leaves. Generic over the innermost key (`u16`
+/// for datatype/lang maps, `u64` for ref target-class maps).
+fn merge_class_prop_map<K: std::hash::Hash + Eq>(
+    dst: &mut ClassPropCountMap<K>,
+    src: ClassPropCountMap<K>,
+) {
+    for (class_key, prop_map) in src {
+        let dst_props = dst.entry(class_key).or_default();
+        for (p_id, inner) in prop_map {
+            let dst_inner = dst_props.entry(p_id).or_default();
+            for (inner_key, count) in inner {
+                *dst_inner.entry(inner_key).or_insert(0) += count;
+            }
+        }
+    }
 }
 
 /// Build JSON array for class→property→datatype stats from SPOT merge results.

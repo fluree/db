@@ -198,6 +198,7 @@ POST /insert/{ledger-id}
 **Supported Content Types:**
 - `application/json` - JSON-LD
 - `text/turtle` - Turtle (fast direct flake path)
+- `application/n-triples` - N-Triples (parsed as Turtle)
 
 **Note:** TriG (`application/trig`) is **not supported** on the insert endpoint. Named graph ingestion via GRAPH blocks requires the upsert path. Use `/upsert` for TriG data.
 
@@ -232,6 +233,7 @@ POST /upsert/{ledger-id}
 **Supported Content Types:**
 - `application/json` - JSON-LD
 - `text/turtle` - Turtle
+- `application/n-triples` - N-Triples (parsed as Turtle)
 - `application/trig` - TriG with named graphs
 
 **Example (JSON-LD):**
@@ -1096,6 +1098,67 @@ WHERE {
 }
 ORDER BY ?t'
 ```
+
+### POST /multi-query
+
+Execute a bundle of independent JSON-LD and/or SPARQL queries in parallel against a single shared snapshot moment, with envelope-level `@context` / `opts` defaults that lift into each sub-query.
+
+**URL:**
+```
+POST /multi-query
+```
+
+**Request Headers:**
+```http
+Content-Type: application/json
+```
+
+**Request Body (envelope):**
+
+```json
+{
+  "@context": { "ex": "http://example.org/" },
+  "asOf":     "2024-01-01T12:00:00Z",
+  "opts":     { "meta": true, "timeoutMs": 30000, "maxConcurrency": 8 },
+  "queries": {
+    "alice": {
+      "language": "jsonld",
+      "query": {
+        "from":   "myledger:main",
+        "select": ["?name"],
+        "where":  { "@id": "?p", "ex:name": "?name" }
+      }
+    },
+    "bob": {
+      "language": "sparql",
+      "query":    "SELECT ?name FROM <other:main> WHERE { ?p ex:name ?name }"
+    }
+  }
+}
+```
+
+**Response:**
+
+```json
+{
+  "status":  "ok",
+  "snapshot": {
+    "asOf":    "2024-01-01T12:00:00Z",
+    "ledgers": { "myledger:main": 1042, "other:main": 87 }
+  },
+  "results": { "alice": [...], "bob": {...} }
+}
+```
+
+(`errors` is omitted when no sub-query failed; `meta` is omitted when `opts.meta` is unset.) Clients branch on `body.status` (`"ok"` | `"partial"` | `"all_failed"`) rather than HTTP code for the aggregate outcome; per-alias errors and timeouts live inside `errors` when present.
+
+**Status Codes:**
+- `200 OK` — envelope parsed and executed; body's `status` reports the per-alias aggregate (including `all_failed`).
+- `400 Bad Request` — envelope validation failed (bounds, `asOf` collision, missing `from`, history query, envelope `max-fuel`, `maxConcurrency: 0`, malformed body).
+- `401 Unauthorized` — authentication required and missing.
+- `500 Internal Server Error` — envelope infra failed (snapshot resolution couldn't load a ledger; response exceeds the size cap during assembly).
+
+**Full reference:** see [Multi-query envelope](multi-query.md) for the complete envelope contract, merge rules, snapshot semantics, bounds table, examples, and the explicit list of current limitations (history queries, envelope-level fuel budget, response cap enforcement, SPARQL policy gap).
 
 ### GET/POST /explain
 

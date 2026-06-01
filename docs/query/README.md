@@ -215,8 +215,13 @@ Fluree's query engine is optimized for:
 4. **Graph Source Selection**: Choose appropriate graph sources for query patterns
 5. **Policy Awareness**: Understand how policies affect query results
 
+## Bundling queries
+
+When you have multiple independent queries that should all see the same data — or that you'd otherwise issue as N concurrent HTTP requests — use the [Multi-query envelope](../api/multi-query.md). It runs N JSON-LD and/or SPARQL queries in parallel against a single resolved snapshot, with shared `@context` / `opts` defaults and per-alias result assembly.
+
 ## Related Documentation
 
 - [Concepts](../concepts/README.md): Core concepts including time travel, graph sources, and policy
 - [Transactions](../transactions/README.md): Writing data to Fluree
 - [Security and Policy](../security/README.md): Policy configuration and management
+- [Multi-query envelope](../api/multi-query.md): Bundle multiple queries against a shared snapshot

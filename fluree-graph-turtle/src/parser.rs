@@ -58,6 +58,7 @@ pub struct Parser<'a, 'input, S> {
 impl<'a, 'input, S: GraphSink> Parser<'a, 'input, S> {
     /// Create a new parser.
     pub fn new(input: &'input str, sink: &'a mut S) -> Result<Self> {
+        crate::error::check_input_len(input.len())?;
         let mut lexer = StreamingLexer::new(input);
         let current_token = lexer.next_token()?;
 

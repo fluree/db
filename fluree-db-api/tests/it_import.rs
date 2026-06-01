@@ -41,6 +41,20 @@ fn extract_sorted_strings(v: &serde_json::Value) -> Vec<String> {
     out
 }
 
+/// Extract column `n` (0-based) from each row of a multi-column JSON-LD result,
+/// keeping only string values, sorted.
+fn extract_nth_column(v: &serde_json::Value, n: usize) -> Vec<String> {
+    let mut out: Vec<String> = v
+        .as_array()
+        .expect("expected array")
+        .iter()
+        .filter_map(|row| row.as_array().and_then(|cols| cols.get(n)))
+        .filter_map(|c| c.as_str().map(str::to_string))
+        .collect();
+    out.sort();
+    out
+}
+
 // ============================================================================
 // Single-file import (streaming split)
 // ============================================================================
@@ -962,4 +976,859 @@ async fn import_single_malformed_jsonld_file_errors() {
             || msg.contains("json"),
         "expected a parse/transact error for malformed JSON-LD, got: {msg}"
     );
+}
+
+// ============================================================================
+// N-Triples (.nt) import tests
+//
+// N-Triples is a strict subset of Turtle, so `.nt` files dispatch to the same
+// Turtle parser. These verify the import pipeline discovers and parses `.nt`
+// for both single-file and directory imports.
+// ============================================================================
+
+/// Write a string to a temp file with the given name and return the path.
+fn write_data(dir: &std::path::Path, name: &str, content: &str) -> std::path::PathBuf {
+    let path = dir.join(name);
+    let mut f = std::fs::File::create(&path).expect("create data file");
+    f.write_all(content.as_bytes()).expect("write data");
+    path
+}
+
+#[tokio::test]
+async fn import_single_nt_file_then_query() {
+    let db_dir = tempfile::tempdir().expect("db tmpdir");
+    let data_dir = tempfile::tempdir().expect("data tmpdir");
+
+    // N-Triples: full IRIs, one triple per line.
+    let nt = "\
+<http://example.org/ns/alice> <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> <http://example.org/ns/User> .
+<http://example.org/ns/alice> <http://schema.org/name> \"Alice\" .
+<http://example.org/ns/bob> <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> <http://example.org/ns/User> .
+<http://example.org/ns/bob> <http://schema.org/name> \"Bob\" .
+";
+
+    let nt_path = write_data(data_dir.path(), "people.nt", nt);
+
+    let fluree = FlureeBuilder::file(db_dir.path().to_string_lossy().to_string())
+        .build()
+        .expect("build file-backed Fluree");
+
+    let result = fluree
+        .create("test/import-nt-single:main")
+        .import(&nt_path)
+        .threads(2)
+        .memory_budget_mb(256)
+        .cleanup(false)
+        .execute()
+        .await
+        .expect("single .nt import should succeed");
+
+    assert!(result.flake_count > 0, "should have flakes");
+    assert!(result.root_id.is_some(), "index should have been built");
+
+    let ledger = fluree
+        .ledger("test/import-nt-single:main")
+        .await
+        .expect("load ledger after .nt import");
+
+    let query = json!({
+        "@context": { "schema": "http://schema.org/" },
+        "select": ["?name"],
+        "where": { "schema:name": "?name" }
+    });
+
+    let qr = support::query_jsonld(&fluree, &ledger, &query)
+        .await
+        .expect("query after .nt import");
+    let json = qr.to_jsonld(&ledger.snapshot).expect("format jsonld");
+    let names = extract_sorted_strings(&json);
+
+    assert_eq!(names, vec!["Alice", "Bob"]);
+}
+
+#[tokio::test]
+async fn import_nt_directory_then_query() {
+    let db_dir = tempfile::tempdir().expect("db tmpdir");
+    let data_dir = tempfile::tempdir().expect("data tmpdir");
+
+    // Two .nt files with disjoint subjects. Directory discovery must recognize
+    // the `.nt` extension (previously only .ttl/.trig/.jsonld were discovered).
+    write_data(
+        data_dir.path(),
+        "a_people.nt",
+        "<http://example.org/ns/alice> <http://schema.org/name> \"Alice\" .\n",
+    );
+    write_data(
+        data_dir.path(),
+        "b_people.nt",
+        "<http://example.org/ns/bob> <http://schema.org/name> \"Bob\" .\n",
+    );
+
+    let fluree = FlureeBuilder::file(db_dir.path().to_string_lossy().to_string())
+        .build()
+        .expect("build file-backed Fluree");
+
+    let result = fluree
+        .create("test/import-nt-dir:main")
+        .import(data_dir.path())
+        .threads(2)
+        .memory_budget_mb(256)
+        .cleanup(false)
+        .execute()
+        .await
+        .expect("directory .nt import should succeed");
+
+    assert_eq!(result.t, 2, "two .nt files => t=2");
+    assert!(result.flake_count > 0);
+
+    let ledger = fluree
+        .ledger("test/import-nt-dir:main")
+        .await
+        .expect("load ledger");
+
+    let query = json!({
+        "@context": { "schema": "http://schema.org/" },
+        "select": ["?name"],
+        "where": { "schema:name": "?name" }
+    });
+
+    let qr = support::query_jsonld(&fluree, &ledger, &query)
+        .await
+        .expect("query after .nt directory import");
+    let json = qr.to_jsonld(&ledger.snapshot).expect("format jsonld");
+    let names = extract_sorted_strings(&json);
+
+    assert_eq!(names, vec!["Alice", "Bob"]);
+}
+
+// ============================================================================
+// TriG named-graph bulk import
+//
+// Verifies that named-graph (GRAPH block) data imported via the *bulk* path
+// (create().import(.trig)) is spooled into the Tier-2 index and is queryable
+// via the `#<graph-iri>` fragment — not just default-graph triples.
+// ============================================================================
+
+#[tokio::test]
+async fn import_trig_named_graph_is_queryable() {
+    let db_dir = tempfile::tempdir().expect("db tmpdir");
+    let data_dir = tempfile::tempdir().expect("data tmpdir");
+
+    let trig = r#"@prefix ex: <http://example.org/> .
+@prefix schema: <http://schema.org/> .
+
+ex:alice schema:name "Alice" .
+
+GRAPH <http://example.org/graphs/audit> {
+    ex:event1 schema:description "User login" .
+    ex:event2 schema:description "User logout" .
+}
+"#;
+
+    let path = data_dir.path().join("data.trig");
+    {
+        let mut f = std::fs::File::create(&path).expect("create trig");
+        f.write_all(trig.as_bytes()).expect("write trig");
+    }
+
+    let fluree = FlureeBuilder::file(db_dir.path().to_string_lossy().to_string())
+        .build()
+        .expect("build file-backed Fluree");
+
+    let result = fluree
+        .create("test/trig-named:main")
+        .import(&path)
+        .threads(1)
+        .memory_budget_mb(256)
+        .cleanup(false)
+        .execute()
+        .await
+        .expect("trig import should succeed");
+    assert!(result.flake_count >= 3, "default + 2 named-graph flakes");
+
+    let ledger = fluree
+        .ledger("test/trig-named:main")
+        .await
+        .expect("load ledger");
+
+    // Default graph: broad triple scan must include Alice's name.
+    let q_default = json!({
+        "select": ["?s", "?p", "?o"],
+        "where": {"@id": "?s", "?p": "?o"}
+    });
+    let qr = support::query_jsonld(&fluree, &ledger, &q_default)
+        .await
+        .expect("default-graph query");
+    let json_default = qr.to_jsonld(&ledger.snapshot).expect("jsonld");
+    let default_objs = extract_nth_column(&json_default, 2);
+    assert!(
+        default_objs.contains(&"Alice".to_string()),
+        "default graph must contain Alice; got {json_default}"
+    );
+
+    // Named graph: the audit events are queryable via the #<iri> fragment.
+    // This is the behavior the fix enables — previously this errored with
+    // "Unknown named graph" because named-graph flakes never reached the index.
+    let named_alias = "test/trig-named:main#http://example.org/graphs/audit";
+    let q_named = json!({
+        "from": named_alias,
+        "select": ["?s", "?p", "?o"],
+        "where": {"@id": "?s", "?p": "?o"}
+    });
+    let qr = fluree
+        .query_connection(&q_named)
+        .await
+        .expect("named-graph query should resolve and return data");
+    let json_named = qr.to_jsonld(&ledger.snapshot).expect("jsonld");
+    let named_objs = extract_nth_column(&json_named, 2);
+    assert_eq!(
+        named_objs,
+        vec!["User login", "User logout"],
+        "named-graph data must be indexed and queryable after bulk import; got {json_named}"
+    );
+}
+
+// ============================================================================
+// N-Quads (.nq) import
+//
+// N-Quads is converted to TriG and dispatched through the named-graph-aware
+// TriG path. Default-graph quads and named-graph (4th-term) quads must both
+// import and be queryable.
+// ============================================================================
+
+#[tokio::test]
+async fn import_nquads_default_and_named_graph() {
+    let db_dir = tempfile::tempdir().expect("db tmpdir");
+    let data_dir = tempfile::tempdir().expect("data tmpdir");
+
+    // N-Quads: 3-term lines = default graph; 4-term lines = named graph.
+    let nq = "\
+<http://example.org/alice> <http://schema.org/name> \"Alice\" .
+<http://example.org/event1> <http://schema.org/description> \"User login\" <http://example.org/graphs/audit> .
+<http://example.org/event2> <http://schema.org/description> \"User logout\" <http://example.org/graphs/audit> .
+";
+
+    let nq_path = write_data(data_dir.path(), "data.nq", nq);
+
+    let fluree = FlureeBuilder::file(db_dir.path().to_string_lossy().to_string())
+        .build()
+        .expect("build file-backed Fluree");
+
+    let result = fluree
+        .create("test/nq:main")
+        .import(&nq_path)
+        .threads(1)
+        .memory_budget_mb(256)
+        .cleanup(false)
+        .execute()
+        .await
+        .expect("single .nq import should succeed");
+    assert!(result.flake_count >= 3, "1 default + 2 named-graph quads");
+
+    let ledger = fluree.ledger("test/nq:main").await.expect("load ledger");
+
+    // Default graph contains Alice.
+    let q_default = json!({
+        "select": ["?s", "?p", "?o"],
+        "where": {"@id": "?s", "?p": "?o"}
+    });
+    let qr = support::query_jsonld(&fluree, &ledger, &q_default)
+        .await
+        .expect("default-graph query");
+    assert!(
+        extract_nth_column(&qr.to_jsonld(&ledger.snapshot).unwrap(), 2)
+            .contains(&"Alice".to_string()),
+        "default graph must contain Alice"
+    );
+
+    // Named graph (the 4th-term graph label) is queryable via the #<iri> fragment.
+    let named_alias = "test/nq:main#http://example.org/graphs/audit";
+    let q_named = json!({
+        "from": named_alias,
+        "select": ["?s", "?p", "?o"],
+        "where": {"@id": "?s", "?p": "?o"}
+    });
+    let qr = fluree
+        .query_connection(&q_named)
+        .await
+        .expect("named-graph query should resolve and return data");
+    assert_eq!(
+        extract_nth_column(&qr.to_jsonld(&ledger.snapshot).unwrap(), 2),
+        vec!["User login", "User logout"],
+        "N-Quads named-graph data must be indexed and queryable"
+    );
+}
+
+// ============================================================================
+// Compressed inputs (.gz / .zst)
+//
+// Transparent decompression for `.ttl.gz`, `.nt.gz`, `.nq.gz`, `.ttl.zst`, etc.
+// The streaming-split path is exercised by the large-file test; small files
+// run through the `Files` single-chunk path.
+// ============================================================================
+
+fn write_gzipped(dir: &std::path::Path, name: &str, content: &[u8]) -> std::path::PathBuf {
+    use flate2::write::GzEncoder;
+    use flate2::Compression;
+    let path = dir.join(name);
+    let f = std::fs::File::create(&path).expect("create gz file");
+    let mut enc = GzEncoder::new(f, Compression::default());
+    std::io::Write::write_all(&mut enc, content).expect("gz encode");
+    enc.finish().expect("gz finish");
+    path
+}
+
+fn write_zstd(dir: &std::path::Path, name: &str, content: &[u8]) -> std::path::PathBuf {
+    let path = dir.join(name);
+    let mut f = std::fs::File::create(&path).expect("create zst file");
+    zstd::stream::copy_encode(content, &mut f, 3).expect("zstd encode");
+    path
+}
+
+#[tokio::test]
+async fn import_gzipped_ttl_small_file() {
+    let db_dir = tempfile::tempdir().expect("db tmpdir");
+    let data_dir = tempfile::tempdir().expect("data tmpdir");
+
+    let ttl = b"@prefix ex: <http://example.org/ns/> .\n\
+                @prefix schema: <http://schema.org/> .\n\
+                ex:alice schema:name \"Alice\" .\n\
+                ex:bob schema:name \"Bob\" .\n";
+
+    let gz_path = write_gzipped(data_dir.path(), "people.ttl.gz", ttl);
+
+    let fluree = FlureeBuilder::file(db_dir.path().to_string_lossy().to_string())
+        .build()
+        .expect("build file-backed Fluree");
+
+    let result = fluree
+        .create("test/ttl-gz:main")
+        .import(&gz_path)
+        .threads(1)
+        .memory_budget_mb(256)
+        .cleanup(false)
+        .execute()
+        .await
+        .expect(".ttl.gz import should succeed");
+    assert!(result.flake_count >= 2);
+
+    let ledger = fluree
+        .ledger("test/ttl-gz:main")
+        .await
+        .expect("load ledger");
+    let qr = support::query_jsonld(
+        &fluree,
+        &ledger,
+        &json!({"select": ["?s", "?p", "?o"], "where": {"@id": "?s", "?p": "?o"}}),
+    )
+    .await
+    .expect("query");
+    let objs = extract_nth_column(&qr.to_jsonld(&ledger.snapshot).unwrap(), 2);
+    assert!(objs.contains(&"Alice".to_string()));
+    assert!(objs.contains(&"Bob".to_string()));
+}
+
+#[tokio::test]
+async fn import_gzipped_nt_directory() {
+    let db_dir = tempfile::tempdir().expect("db tmpdir");
+    let data_dir = tempfile::tempdir().expect("data tmpdir");
+
+    // Directory of `.nt.gz` files — discovery must accept the compressed
+    // extension via `effective_extension`.
+    write_gzipped(
+        data_dir.path(),
+        "a.nt.gz",
+        b"<http://example.org/alice> <http://schema.org/name> \"Alice\" .\n",
+    );
+    write_gzipped(
+        data_dir.path(),
+        "b.nt.gz",
+        b"<http://example.org/bob> <http://schema.org/name> \"Bob\" .\n",
+    );
+
+    let fluree = FlureeBuilder::file(db_dir.path().to_string_lossy().to_string())
+        .build()
+        .expect("build");
+
+    let result = fluree
+        .create("test/nt-gz-dir:main")
+        .import(data_dir.path())
+        .threads(2)
+        .memory_budget_mb(256)
+        .cleanup(false)
+        .execute()
+        .await
+        .expect("directory .nt.gz import should succeed");
+    assert_eq!(result.t, 2, "two .nt.gz files => t=2");
+
+    let ledger = fluree
+        .ledger("test/nt-gz-dir:main")
+        .await
+        .expect("load ledger");
+    let qr = support::query_jsonld(
+        &fluree,
+        &ledger,
+        &json!({"select": ["?s", "?p", "?o"], "where": {"@id": "?s", "?p": "?o"}}),
+    )
+    .await
+    .expect("query");
+    let objs = extract_nth_column(&qr.to_jsonld(&ledger.snapshot).unwrap(), 2);
+    assert!(objs.contains(&"Alice".to_string()) && objs.contains(&"Bob".to_string()));
+}
+
+#[tokio::test]
+async fn import_zstd_ttl_small_file() {
+    let db_dir = tempfile::tempdir().expect("db tmpdir");
+    let data_dir = tempfile::tempdir().expect("data tmpdir");
+
+    let ttl = b"@prefix ex: <http://example.org/ns/> .\n\
+                @prefix schema: <http://schema.org/> .\n\
+                ex:carol schema:name \"Carol\" .\n";
+
+    let zst_path = write_zstd(data_dir.path(), "people.ttl.zst", ttl);
+
+    let fluree = FlureeBuilder::file(db_dir.path().to_string_lossy().to_string())
+        .build()
+        .expect("build");
+
+    let result = fluree
+        .create("test/ttl-zst:main")
+        .import(&zst_path)
+        .threads(1)
+        .memory_budget_mb(256)
+        .cleanup(false)
+        .execute()
+        .await
+        .expect(".ttl.zst import should succeed");
+    assert!(result.flake_count >= 1);
+
+    let ledger = fluree.ledger("test/ttl-zst:main").await.expect("load");
+    let qr = support::query_jsonld(
+        &fluree,
+        &ledger,
+        &json!({"select": ["?s", "?p", "?o"], "where": {"@id": "?s", "?p": "?o"}}),
+    )
+    .await
+    .expect("query");
+    let objs = extract_nth_column(&qr.to_jsonld(&ledger.snapshot).unwrap(), 2);
+    assert!(objs.contains(&"Carol".to_string()));
+}
+
+#[tokio::test]
+async fn import_gzipped_ttl_streaming_split() {
+    // Force the streaming (large-file) path: write enough TTL that the
+    // compressed file exceeds the chunk threshold so the splitter activates.
+    let db_dir = tempfile::tempdir().expect("db tmpdir");
+    let data_dir = tempfile::tempdir().expect("data tmpdir");
+
+    let mut ttl = String::from(
+        "@prefix ex: <http://example.org/ns/> .\n\
+         @prefix schema: <http://schema.org/> .\n",
+    );
+    // ~5 MB of synthetic triples — comfortably above the 1 MB chunk threshold
+    // we configure below, even after compression.
+    for i in 0..40_000 {
+        use std::fmt::Write as _;
+        writeln!(ttl, "ex:s{i} schema:name \"name-{i}\" .").unwrap();
+    }
+    let gz_path = write_gzipped(data_dir.path(), "big.ttl.gz", ttl.as_bytes());
+
+    let fluree = FlureeBuilder::file(db_dir.path().to_string_lossy().to_string())
+        .build()
+        .expect("build");
+
+    let result = fluree
+        .create("test/ttl-gz-stream:main")
+        .import(&gz_path)
+        .threads(2)
+        .chunk_size_mb(1)
+        .memory_budget_mb(256)
+        .cleanup(false)
+        .execute()
+        .await
+        .expect("streaming .ttl.gz import should succeed");
+    assert!(result.flake_count as usize >= 40_000);
+
+    let ledger = fluree
+        .ledger("test/ttl-gz-stream:main")
+        .await
+        .expect("load");
+    let qr = support::query_jsonld(
+        &fluree,
+        &ledger,
+        &json!({"select": ["?s", "?p", "?o"], "where": {"@id": "?s", "?p": "?o"}}),
+    )
+    .await
+    .expect("query");
+    let objs = extract_nth_column(&qr.to_jsonld(&ledger.snapshot).unwrap(), 2);
+    // Spot-check a handful of values are queryable post-index.
+    assert!(objs.contains(&"name-0".to_string()));
+    assert!(objs.contains(&"name-39999".to_string()));
+}
+
+#[tokio::test]
+async fn import_nt_streaming_split() {
+    // Force a large *plain* `.nt` file through the streaming-split path (the
+    // path that overflowed u32 token offsets on >4 GiB inputs). We can't write
+    // 4 GiB in a test, but a chunk_size_mb(1) threshold over a multi-MB file
+    // exercises the same StreamingTurtleReader chunking and per-chunk parse the
+    // big file uses, with every offset relative to a small per-chunk string.
+    let db_dir = tempfile::tempdir().expect("db tmpdir");
+    let data_dir = tempfile::tempdir().expect("data tmpdir");
+
+    // ~5 MB of N-Triples: full IRIs, one triple per line, no prelude.
+    let mut nt = String::new();
+    for i in 0..40_000 {
+        use std::fmt::Write as _;
+        writeln!(
+            nt,
+            "<http://example.org/ns/s{i}> <http://schema.org/name> \"name-{i}\" ."
+        )
+        .unwrap();
+    }
+    let nt_path = write_data(data_dir.path(), "big.nt", &nt);
+
+    let fluree = FlureeBuilder::file(db_dir.path().to_string_lossy().to_string())
+        .build()
+        .expect("build");
+
+    let result = fluree
+        .create("test/nt-stream:main")
+        .import(&nt_path)
+        .threads(2)
+        .chunk_size_mb(1)
+        .memory_budget_mb(256)
+        .cleanup(false)
+        .execute()
+        .await
+        .expect("streaming .nt import should succeed");
+    assert!(result.flake_count as usize >= 40_000);
+
+    let ledger = fluree.ledger("test/nt-stream:main").await.expect("load");
+    let qr = support::query_jsonld(
+        &fluree,
+        &ledger,
+        &json!({"select": ["?s", "?p", "?o"], "where": {"@id": "?s", "?p": "?o"}}),
+    )
+    .await
+    .expect("query");
+    let objs = extract_nth_column(&qr.to_jsonld(&ledger.snapshot).unwrap(), 2);
+    // Boundary values across the chunk splits must all be queryable post-index.
+    assert!(objs.contains(&"name-0".to_string()));
+    assert!(objs.contains(&"name-39999".to_string()));
+}
+
+// ============================================================================
+// Local directory rechunk producer (split large + coalesce small)
+// ============================================================================
+
+/// A directory of many tiny `.ttl` files should be COALESCED into far fewer
+/// chunks (bounding `t` / commit count / run files), while every triple
+/// remains queryable. Without coalescing this would produce one commit per
+/// file (t == file count).
+#[tokio::test]
+async fn import_directory_coalesces_small_files() {
+    let db_dir = tempfile::tempdir().expect("db tmpdir");
+    let data_dir = tempfile::tempdir().expect("data tmpdir");
+
+    // 120 tiny files, each its own self-contained Turtle doc (with @prefix).
+    // 120 > the default coalesce threshold (64), so coalescing engages.
+    const N: usize = 120;
+    for i in 0..N {
+        let ttl = format!(
+            "@prefix ex: <http://example.org/ns/> .\n\
+             @prefix schema: <http://schema.org/> .\n\
+             ex:s{i} a ex:Thing ; schema:name \"name-{i}\" .\n"
+        );
+        // Zero-padded names so lexicographic discovery order is stable.
+        write_ttl(data_dir.path(), &format!("part_{i:04}.ttl"), &ttl);
+    }
+
+    let fluree = FlureeBuilder::file(db_dir.path().to_string_lossy().to_string())
+        .build()
+        .expect("build");
+
+    let result = fluree
+        .create("test/coalesce:main")
+        .import(data_dir.path())
+        .threads(4)
+        // Large chunk target so all 120 tiny files collapse into a single chunk.
+        .memory_budget_mb(256)
+        .cleanup(false)
+        .execute()
+        .await
+        .expect("coalesced directory import should succeed");
+
+    // Coalescing must bound the chunk count well below the file count.
+    assert!(
+        result.t < N as i64,
+        "coalescing should produce fewer commits than files: t={} files={N}",
+        result.t
+    );
+    assert!(result.flake_count as usize >= N, "all triples imported");
+
+    // Every file's data must be queryable.
+    let ledger = fluree.ledger("test/coalesce:main").await.expect("load");
+    let qr = support::query_jsonld(
+        &fluree,
+        &ledger,
+        &json!({
+            "@context": {"schema": "http://schema.org/"},
+            "select": ["?name"],
+            "where": {"schema:name": "?name"}
+        }),
+    )
+    .await
+    .expect("query names");
+    let names = extract_sorted_strings(&qr.to_jsonld(&ledger.snapshot).unwrap());
+    assert_eq!(names.len(), N, "all {N} names queryable");
+    assert!(names.contains(&"name-0".to_string()));
+    assert!(names.contains(&"name-119".to_string()));
+}
+
+/// A directory containing one large file (over chunk_size) must be SUB-SPLIT
+/// at statement boundaries — producing multiple commits from a single file —
+/// not read whole. Boundary triples must survive the splits.
+#[tokio::test]
+async fn import_directory_splits_large_file() {
+    let db_dir = tempfile::tempdir().expect("db tmpdir");
+    let data_dir = tempfile::tempdir().expect("data tmpdir");
+
+    // One ~5 MB file plus a couple of tiny ones in the same directory.
+    let mut big = String::from("@prefix ex: <http://example.org/ns/> .\n");
+    {
+        use std::fmt::Write as _;
+        for i in 0..40_000 {
+            writeln!(big, "ex:s{i} <http://schema.org/name> \"name-{i}\" .").unwrap();
+        }
+    }
+    write_ttl(data_dir.path(), "big.ttl", &big);
+    write_ttl(
+        data_dir.path(),
+        "small.ttl",
+        "@prefix ex: <http://example.org/ns/> .\n\
+         ex:extra <http://schema.org/name> \"extra\" .\n",
+    );
+
+    let fluree = FlureeBuilder::file(db_dir.path().to_string_lossy().to_string())
+        .build()
+        .expect("build");
+
+    let result = fluree
+        .create("test/split-dir:main")
+        .import(data_dir.path())
+        .threads(2)
+        // 1 MB chunk over a ~5 MB file forces several sub-chunks.
+        .chunk_size_mb(1)
+        .memory_budget_mb(256)
+        .cleanup(false)
+        .execute()
+        .await
+        .expect("directory with large file should import");
+
+    // The big file alone must split into multiple chunks → t > 1.
+    assert!(
+        result.t > 1,
+        "large file in directory should sub-split: t={}",
+        result.t
+    );
+    assert!(result.flake_count as usize >= 40_001);
+
+    let ledger = fluree.ledger("test/split-dir:main").await.expect("load");
+    let qr = support::query_jsonld(
+        &fluree,
+        &ledger,
+        &json!({"select": ["?o"], "where": {"@id": "?s", "http://schema.org/name": "?o"}}),
+    )
+    .await
+    .expect("query");
+    let objs = extract_nth_column(&qr.to_jsonld(&ledger.snapshot).unwrap(), 0);
+    assert!(objs.contains(&"name-0".to_string()));
+    assert!(objs.contains(&"name-39999".to_string()));
+    assert!(
+        objs.contains(&"extra".to_string()),
+        "small file also imported"
+    );
+}
+
+/// Files containing labeled blank nodes must NOT be coalesced — each file is a
+/// distinct RDF document scope, so `_:b` in different files are different nodes.
+/// They pass through as their own chunks and must not be merged into one node.
+#[tokio::test]
+async fn import_directory_blank_nodes_not_coalesced() {
+    let db_dir = tempfile::tempdir().expect("db tmpdir");
+    let data_dir = tempfile::tempdir().expect("data tmpdir");
+
+    // Many small files, each using the SAME blank-node label `_:b1` for a
+    // distinct subject. If coalescing merged these into one parse, the `_:b1`s
+    // would collapse into one node and one of the names would be lost.
+    const N: usize = 80; // > default threshold (64) so coalescing would engage if allowed.
+    for i in 0..N {
+        let ttl = format!(
+            "@prefix schema: <http://schema.org/> .\n\
+             _:b1 schema:name \"blank-{i}\" .\n"
+        );
+        write_ttl(data_dir.path(), &format!("bn_{i:04}.ttl"), &ttl);
+    }
+
+    let fluree = FlureeBuilder::file(db_dir.path().to_string_lossy().to_string())
+        .build()
+        .expect("build");
+
+    let result = fluree
+        .create("test/bn-passthrough:main")
+        .import(data_dir.path())
+        .threads(4)
+        .memory_budget_mb(256)
+        .cleanup(false)
+        .execute()
+        .await
+        .expect("blank-node directory import should succeed");
+
+    assert!(result.flake_count as usize >= N);
+
+    // Each file's blank node must remain distinct → all N names present.
+    let ledger = fluree
+        .ledger("test/bn-passthrough:main")
+        .await
+        .expect("load");
+    let qr = support::query_jsonld(
+        &fluree,
+        &ledger,
+        &json!({
+            "@context": {"schema": "http://schema.org/"},
+            "select": ["?name"],
+            "where": {"schema:name": "?name"}
+        }),
+    )
+    .await
+    .expect("query names");
+    let names = extract_sorted_strings(&qr.to_jsonld(&ledger.snapshot).unwrap());
+    assert_eq!(
+        names.len(),
+        N,
+        "every file's blank node must stay distinct (no cross-file merge)"
+    );
+    assert!(names.contains(&"blank-0".to_string()));
+    assert!(names.contains(&"blank-79".to_string()));
+}
+
+/// `coalesce_small_files_threshold(0)` disables coalescing: every small file
+/// becomes its own chunk (legacy behavior), so t == file count.
+#[tokio::test]
+async fn import_directory_coalesce_disabled() {
+    let db_dir = tempfile::tempdir().expect("db tmpdir");
+    let data_dir = tempfile::tempdir().expect("data tmpdir");
+
+    const N: usize = 5;
+    for i in 0..N {
+        let ttl = format!(
+            "@prefix ex: <http://example.org/ns/> .\n\
+             @prefix schema: <http://schema.org/> .\n\
+             ex:s{i} schema:name \"name-{i}\" .\n"
+        );
+        write_ttl(data_dir.path(), &format!("part_{i:04}.ttl"), &ttl);
+    }
+
+    let fluree = FlureeBuilder::file(db_dir.path().to_string_lossy().to_string())
+        .build()
+        .expect("build");
+
+    let result = fluree
+        .create("test/coalesce-off:main")
+        .import(data_dir.path())
+        .threads(2)
+        .memory_budget_mb(256)
+        .coalesce_small_files_threshold(0)
+        .cleanup(false)
+        .execute()
+        .await
+        .expect("import with coalescing disabled should succeed");
+
+    assert_eq!(
+        result.t, N as i64,
+        "with coalescing disabled, each file is its own commit"
+    );
+    assert!(result.flake_count as usize >= N);
+
+    let ledger = fluree.ledger("test/coalesce-off:main").await.expect("load");
+    let qr = support::query_jsonld(
+        &fluree,
+        &ledger,
+        &json!({
+            "@context": {"schema": "http://schema.org/"},
+            "select": ["?name"],
+            "where": {"schema:name": "?name"}
+        }),
+    )
+    .await
+    .expect("query");
+    let names = extract_sorted_strings(&qr.to_jsonld(&ledger.snapshot).unwrap());
+    assert_eq!(names.len(), N);
+}
+
+/// A small-on-disk compressed file in a directory whose DECODED size exceeds
+/// chunk_size must be sub-split (not materialized whole) — guarding against the
+/// `omid_url.ttl.gz` (438 MB → ~4 GB) memory blowup. Highly-compressible text
+/// keeps the on-disk size well under chunk_size while the decoded size is over.
+#[tokio::test]
+async fn import_directory_splits_large_compressed_file() {
+    let db_dir = tempfile::tempdir().expect("db tmpdir");
+    let data_dir = tempfile::tempdir().expect("data tmpdir");
+
+    // ~5 MB of decoded N-Triples; gzip of this repetitive text is well under
+    // 1 MB on disk, so on-disk < chunk_size(1 MB) but decoded > chunk_size.
+    let mut nt = String::new();
+    {
+        use std::fmt::Write as _;
+        for i in 0..40_000 {
+            writeln!(
+                nt,
+                "<http://example.org/ns/s{i}> <http://schema.org/name> \"name-{i}\" ."
+            )
+            .unwrap();
+        }
+    }
+    let gz_path = write_gzipped(data_dir.path(), "big.nt.gz", nt.as_bytes());
+    let on_disk = std::fs::metadata(&gz_path).unwrap().len();
+    assert!(
+        on_disk < 1024 * 1024,
+        "compressed file should be < 1 MB on disk (got {on_disk}) so the \
+         split decision must come from the decoded-size estimate"
+    );
+
+    let fluree = FlureeBuilder::file(db_dir.path().to_string_lossy().to_string())
+        .build()
+        .expect("build");
+
+    let result = fluree
+        .create("test/split-gz-dir:main")
+        .import(data_dir.path())
+        .threads(2)
+        .chunk_size_mb(1)
+        .memory_budget_mb(256)
+        .cleanup(false)
+        .execute()
+        .await
+        .expect("directory with large compressed file should import");
+
+    // Decoded ~5 MB over a 1 MB chunk target → must sub-split into > 1 chunk.
+    assert!(
+        result.t > 1,
+        "compressed file decoding above chunk_size should sub-split: t={}",
+        result.t
+    );
+    assert!(result.flake_count as usize >= 40_000);
+
+    let ledger = fluree.ledger("test/split-gz-dir:main").await.expect("load");
+    let qr = support::query_jsonld(
+        &fluree,
+        &ledger,
+        &json!({"select": ["?o"], "where": {"@id": "?s", "http://schema.org/name": "?o"}}),
+    )
+    .await
+    .expect("query");
+    let objs = extract_nth_column(&qr.to_jsonld(&ledger.snapshot).unwrap(), 0);
+    assert!(objs.contains(&"name-0".to_string()));
+    assert!(objs.contains(&"name-39999".to_string()));
 }

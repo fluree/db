@@ -30,7 +30,7 @@ use crate::context::ExecutionContext;
 use crate::error::{QueryError, Result};
 use crate::fast_path_common::{
     build_count_batch, build_psot_cursor_for_predicate, count_to_i64, cursor_projection_sid_only,
-    cursor_projection_sid_otype_okey, normalize_pred_sid,
+    cursor_projection_sid_otype_okey, normalize_pred_sid, CursorSubjectCountStream,
 };
 use crate::ir::triple::Ref;
 use crate::operator::{BoxedOperator, Operator, OperatorState};
@@ -172,64 +172,6 @@ impl Operator for UnionStarCountAllOperator {
     }
 }
 
-/// Stream of `(s_id, count)` groups from PSOT for a single predicate.
-struct SubjectCountStreamV6 {
-    cursor: BinaryCursor,
-    current: Option<fluree_db_binary_index::ColumnBatch>,
-    row: usize,
-    cur_s: Option<u64>,
-    cur_count: u64,
-}
-
-impl SubjectCountStreamV6 {
-    fn new(cursor: BinaryCursor) -> Self {
-        Self {
-            cursor,
-            current: None,
-            row: 0,
-            cur_s: None,
-            cur_count: 0,
-        }
-    }
-
-    fn next_group(&mut self) -> Result<Option<(u64, u64)>> {
-        loop {
-            if self.current.is_none() {
-                self.current = self
-                    .cursor
-                    .next_batch()
-                    .map_err(|e| QueryError::Internal(format!("cursor batch: {e}")))?;
-                self.row = 0;
-                if self.current.is_none() {
-                    if let Some(s) = self.cur_s.take() {
-                        let n = std::mem::take(&mut self.cur_count);
-                        return Ok(Some((s, n)));
-                    }
-                    return Ok(None);
-                }
-            }
-
-            let batch = self.current.as_ref().unwrap();
-            if self.row >= batch.row_count {
-                self.current = None;
-                continue;
-            }
-            let s = batch.s_id.get(self.row);
-            if self.cur_s.is_none() {
-                self.cur_s = Some(s);
-                self.cur_count = 0;
-            } else if self.cur_s != Some(s) {
-                let out_s = self.cur_s.replace(s).unwrap();
-                let out_n = std::mem::replace(&mut self.cur_count, 0);
-                // don't advance row; let loop consume this row into new group
-                return Ok(Some((out_s, out_n)));
-            }
-            self.cur_count += 1;
-            self.row += 1;
-        }
-    }
-}
-
 /// Stream of `(s_id, count_self_loops)` for a predicate, where self-loop means ref-only `s_id == o_key`.
 struct SubjectSelfLoopCountStreamV6 {
     cursor: BinaryCursor,
@@ -319,7 +261,7 @@ fn count_union_star(
     }
 
     // Build union streams.
-    let mut union_streams_all: Vec<SubjectCountStreamV6> = Vec::new();
+    let mut union_streams_all: Vec<CursorSubjectCountStream> = Vec::new();
     let mut union_streams_eq: Vec<SubjectSelfLoopCountStreamV6> = Vec::new();
 
     for p in union_preds {
@@ -342,7 +284,9 @@ fn count_union_star(
             return Ok(None);
         };
         match mode {
-            UnionCountMode::AllRows => union_streams_all.push(SubjectCountStreamV6::new(cursor)),
+            UnionCountMode::AllRows => {
+                union_streams_all.push(CursorSubjectCountStream::new(cursor));
+            }
             UnionCountMode::SubjectEqObject => {
                 union_streams_eq.push(SubjectSelfLoopCountStreamV6::new(cursor));
             }
@@ -428,7 +372,7 @@ fn count_union_star(
     }
 
     // Build extra streams (per-subject counts).
-    let mut extra_streams: Vec<SubjectCountStreamV6> = Vec::new();
+    let mut extra_streams: Vec<CursorSubjectCountStream> = Vec::new();
     for p in extra_preds {
         let sid = normalize_pred_sid(store, p)?;
         let Some(p_id) = store.sid_to_p_id(&sid) else {
@@ -450,7 +394,7 @@ fn count_union_star(
         else {
             return Ok(None);
         };
-        extra_streams.push(SubjectCountStreamV6::new(cursor));
+        extra_streams.push(CursorSubjectCountStream::new(cursor));
     }
     let mut extra_curr: Vec<Option<(u64, u64)>> = Vec::with_capacity(extra_streams.len());
     for s in &mut extra_streams {

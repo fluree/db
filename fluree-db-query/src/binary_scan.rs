@@ -75,6 +75,20 @@ pub fn index_type_to_sort_order(index: IndexType) -> RunSortOrder {
     }
 }
 
+/// Convert `RunSortOrder` (binary-index-layer) to `IndexType` (query-layer).
+///
+/// Inverse of [`index_type_to_sort_order`]. Used when building a per-predicate
+/// overlay cursor in a given order to select the matching novelty overlay index
+/// for `OverlayProvider::for_each_overlay_flake`.
+pub fn sort_order_to_index_type(order: RunSortOrder) -> IndexType {
+    match order {
+        RunSortOrder::Spot => IndexType::Spot,
+        RunSortOrder::Psot => IndexType::Psot,
+        RunSortOrder::Post => IndexType::Post,
+        RunSortOrder::Opst => IndexType::Opst,
+    }
+}
+
 /// Build a schema vector from a triple pattern, respecting `EmitMask` pruning.
 ///
 /// Returns `(schema, s_var_pos, p_var_pos, o_var_pos)` where positions are
@@ -1116,6 +1130,38 @@ impl BinaryScanOperator {
         }
     }
 
+    /// Whether `drain_count` can count rows straight off the cursor without
+    /// materializing any bindings.
+    ///
+    /// This is sound only when **no** per-row predicate in `batch_to_bindings`
+    /// can drop or transform a row after the cursor yields it, and there are no
+    /// overlay-only fallback rows. Each clause below maps to exactly one
+    /// `continue`/drop site in `batch_to_bindings`:
+    /// - bound predicate (`!p_is_var`) → `is_internal_predicate` never skips
+    /// - no encoded pre-filters, datatype constraint, repeated-var checks,
+    ///   bound object, object bounds, or unresolved-bound-subject IRI check
+    /// - no inline ops (which may carry FILTER/BIND that drop rows)
+    /// - no `range_iter` (untranslatable overlay-only flakes counted separately)
+    /// - `Current` mode only (history rows carry retract/op semantics).
+    ///
+    /// When all hold, `next_batch` emits exactly `Σ cursor.row_count` rows, so a
+    /// cursor-only count equals the streamed count. Otherwise `drain_count`
+    /// returns `Ok(None)` and the caller falls back to the streaming drain.
+    fn count_only_eligible(&self) -> bool {
+        matches!(self.mode, crate::temporal_mode::TemporalMode::Current)
+            && !self.p_is_var
+            && self.inline_ops.is_empty()
+            && self.encoded_pre_filters.is_empty()
+            && self.object_bounds.is_none()
+            && self.bound_o.is_none()
+            && self.unresolved_bound_subject_iri.is_none()
+            && self.pattern.dtc.is_none()
+            && !self.check_s_eq_o
+            && !self.check_s_eq_p
+            && !self.check_p_eq_o
+            && self.range_iter.is_none()
+    }
+
     /// Convert a ColumnBatch into columnar Bindings.
     fn batch_to_bindings(
         &mut self,
@@ -2043,6 +2089,44 @@ impl Operator for BinaryScanOperator {
         }
 
         self.finalize_columns(columns, produced)
+    }
+
+    /// Count-only drain: when `count_only_eligible`, sums the overlay-merged
+    /// cursor's row counts without decoding any bindings. This revives
+    /// `GroupAggregateOperator`'s ungrouped `COUNT(*)` pushdown for scan
+    /// children and is overlay-correct — the cursor already folds novelty and
+    /// applies `to_t`, so it serves `COUNT(*)` under overlay (where the metadata
+    /// `count_plan`/`count_rows` paths bail). When any per-row predicate is
+    /// present, returns `Ok(None)` so the caller falls back to the streaming
+    /// drain (which is where such rows are filtered).
+    async fn drain_count(&mut self, _ctx: &ExecutionContext<'_>) -> Result<Option<u64>> {
+        if self.state != OperatorState::Open {
+            return Ok(None);
+        }
+        if !self.count_only_eligible() {
+            return Ok(None);
+        }
+
+        let mut count: u64 = 0;
+        while let Some(cursor) = self.cursor.as_mut() {
+            match cursor.next_batch() {
+                Ok(Some(batch)) => {
+                    count = count.checked_add(batch.row_count as u64).ok_or_else(|| {
+                        QueryError::execution("COUNT(*) overflow in binary scan drain_count")
+                    })?;
+                }
+                Ok(None) => {
+                    self.cursor = None;
+                    break;
+                }
+                Err(e) => {
+                    return Err(QueryError::from_io("V3 cursor", e));
+                }
+            }
+        }
+
+        self.state = OperatorState::Exhausted;
+        Ok(Some(count))
     }
 
     fn close(&mut self) {
