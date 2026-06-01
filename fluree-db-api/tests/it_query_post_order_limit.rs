@@ -369,7 +369,7 @@ async fn overlay_post_order_desc_multi_predicate_leaf_window() {
             &json!({
                 "@context": ctx,
                 "@graph": [
-                    {"@id": "ex:anchor", "ex:aaa": 1000000},
+                    {"@id": "ex:anchor", "ex:aaa": 1_000_000},
                     {"@id": "ex:s1", "ex:score": 10},
                     {"@id": "ex:s2", "ex:score": 20},
                     {"@id": "ex:s3", "ex:score": 30},
