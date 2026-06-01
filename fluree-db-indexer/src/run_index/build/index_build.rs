@@ -413,23 +413,42 @@ pub struct BuildAllConfig {
     /// Graph ID — builds are graph-scoped (run files don't carry g_id).
     pub g_id: u16,
     pub progress: Option<Arc<AtomicU64>>,
+    /// Max number of orders to build concurrently. Each order is an independent
+    /// single-threaded k-way merge + leaf-encode pipeline over disjoint input
+    /// and output directories, so running them in parallel turns the per-order
+    /// build times from additive into `max()`. `0`/`1` preserves the legacy
+    /// serial build; callers size this from the effective import core budget.
+    pub max_concurrency: usize,
 }
 
 /// Build V2 indexes for all four orders from a base run directory.
 ///
 /// Expects per-order subdirectories: `base_run_dir/{spot,psot,post,opst}/`.
 /// Each subdirectory contains V2 run files sorted in that order.
+///
+/// Orders whose run directory exists are built concurrently, up to
+/// `config.max_concurrency` at a time (work-stealing). Each order is fully
+/// independent — disjoint run dirs in, disjoint `graph_{g}/{order}` dirs out,
+/// independent results — so the only shared state is the atomic progress
+/// counter. The import path drives SPOT separately on its own thread (its run
+/// dir does not exist here), so in practice this parallelizes PSOT/POST/OPST.
 pub fn build_all_indexes(
     config: &BuildAllConfig,
 ) -> Result<Vec<(RunSortOrder, IndexBuildResult)>, IndexBuildError> {
-    let orders = RunSortOrder::all_build_orders();
-    let mut results = Vec::with_capacity(orders.len());
+    // Collect the orders that actually have run files to build.
+    let buildable: Vec<RunSortOrder> = RunSortOrder::all_build_orders()
+        .iter()
+        .copied()
+        .filter(|order| config.base_run_dir.join(order.dir_name()).exists())
+        .collect();
 
-    for &order in orders {
+    if buildable.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    // Build one order: k-way merge its run files into FLI3/FBR3 artifacts.
+    let build_one = |order: RunSortOrder| -> Result<IndexBuildResult, IndexBuildError> {
         let run_dir = config.base_run_dir.join(order.dir_name());
-        if !run_dir.exists() {
-            continue;
-        }
         let order_start = Instant::now();
         let run_count = discover_run_files_v2(&run_dir)?.len();
         tracing::info!(
@@ -438,10 +457,6 @@ pub fn build_all_indexes(
             run_dir = %run_dir.display(),
             "starting order index build"
         );
-
-        // Import progress wants to reflect all order builds, not just a single
-        // representative order, so attach the shared counter to every build.
-        let order_progress = config.progress.clone();
 
         let order_config = IndexBuildConfig {
             run_dir,
@@ -453,7 +468,9 @@ pub fn build_all_indexes(
             skip_dedup: config.skip_dedup,
             skip_history: config.skip_history,
             g_id: config.g_id,
-            progress: order_progress,
+            // Import progress reflects all order builds, not just one
+            // representative order, so attach the shared counter to each.
+            progress: config.progress.clone(),
         };
 
         let result = build_index(&order_config)?;
@@ -464,9 +481,77 @@ pub fn build_all_indexes(
             elapsed_ms = order_start.elapsed().as_millis(),
             "completed order index build"
         );
-        results.push((order, result));
+        Ok(result)
+    };
+
+    let concurrency = config.max_concurrency.max(1).min(buildable.len());
+
+    // Serial fast path (single order, or concurrency disabled): no thread spawn.
+    if concurrency == 1 {
+        let mut results = Vec::with_capacity(buildable.len());
+        for order in buildable {
+            results.push((order, build_one(order)?));
+        }
+        return Ok(results);
     }
 
+    // Parallel path: work-stealing over the buildable orders, bounded to
+    // `concurrency` threads. Mirrors the secondary-run-generation pool in
+    // build_from_commits.rs. Workers push in completion order; we re-sort into
+    // canonical `all_build_orders()` order before returning so the result is
+    // deterministic regardless of thread scheduling. (The FIR6 encoder already
+    // sorts orders by wire-id before serializing, so the root CID does not
+    // depend on this — but a deterministic return contract avoids surprising
+    // any future consumer that iterates results positionally.)
+    let next = std::sync::atomic::AtomicUsize::new(0);
+    let collected: std::sync::Mutex<Vec<(RunSortOrder, IndexBuildResult)>> =
+        std::sync::Mutex::new(Vec::with_capacity(buildable.len()));
+
+    std::thread::scope(|scope| -> Result<(), IndexBuildError> {
+        let mut handles = Vec::with_capacity(concurrency);
+        for _ in 0..concurrency {
+            let next = &next;
+            let collected = &collected;
+            let buildable = &buildable;
+            let build_one = &build_one;
+            handles.push(scope.spawn(move || -> Result<(), IndexBuildError> {
+                loop {
+                    let i = next.fetch_add(1, Ordering::Relaxed);
+                    if i >= buildable.len() {
+                        break;
+                    }
+                    let order = buildable[i];
+                    let result = build_one(order)?;
+                    collected.lock().unwrap().push((order, result));
+                }
+                Ok(())
+            }));
+        }
+        // Propagate the first worker error (others finish their current order).
+        let mut first_err = None;
+        for handle in handles {
+            match handle.join() {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) if first_err.is_none() => first_err = Some(e),
+                Ok(Err(_)) => {}
+                Err(_) => {
+                    if first_err.is_none() {
+                        first_err = Some(IndexBuildError::Io(io::Error::other(
+                            "order index build thread panicked",
+                        )));
+                    }
+                }
+            }
+        }
+        match first_err {
+            Some(e) => Err(e),
+            None => Ok(()),
+        }
+    })?;
+
+    let mut results = collected.into_inner().unwrap();
+    // Deterministic order, independent of which thread finished first.
+    results.sort_by_key(|(order, _)| order.to_wire_id());
     Ok(results)
 }
 

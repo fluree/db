@@ -742,6 +742,11 @@ pub fn build_indexes_from_commits(
         skip_history: true, // Append-only: no time-travel data.
         g_id: config.g_id,
         progress: config.build_progress.clone(),
+        // Build the secondary orders (PSOT/POST/OPST) concurrently, bounded by
+        // the import core budget. SPOT already builds on its own thread above,
+        // so total concurrent build threads are ~1 (SPOT) + max_concurrency.
+        // build_all_indexes clamps this to the number of buildable orders.
+        max_concurrency: config.worker_count,
     };
 
     let mut order_results = build_all_indexes(&build_config).map_err(io::Error::other)?;
@@ -961,6 +966,9 @@ pub fn build_indexes_from_remapped_commits(
         skip_history: false, // Produce history sidecars for time-travel.
         g_id: config.g_id,
         progress: config.build_progress.clone(),
+        // Rebuild path builds all 4 orders here (no separate SPOT thread), so
+        // concurrency can cover all of them, bounded by the core budget.
+        max_concurrency: config.worker_count,
     };
 
     let order_results = build_all_indexes(&build_config).map_err(io::Error::other)?;
