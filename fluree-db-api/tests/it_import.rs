@@ -1517,3 +1517,318 @@ async fn import_nt_streaming_split() {
     assert!(objs.contains(&"name-0".to_string()));
     assert!(objs.contains(&"name-39999".to_string()));
 }
+
+// ============================================================================
+// Local directory rechunk producer (Phase 1: split large + coalesce small)
+// ============================================================================
+
+/// A directory of many tiny `.ttl` files should be COALESCED into far fewer
+/// chunks (bounding `t` / commit count / run files), while every triple
+/// remains queryable. Without coalescing this would produce one commit per
+/// file (t == file count).
+#[tokio::test]
+async fn import_directory_coalesces_small_files() {
+    let db_dir = tempfile::tempdir().expect("db tmpdir");
+    let data_dir = tempfile::tempdir().expect("data tmpdir");
+
+    // 120 tiny files, each its own self-contained Turtle doc (with @prefix).
+    // 120 > the default coalesce threshold (64), so coalescing engages.
+    const N: usize = 120;
+    for i in 0..N {
+        let ttl = format!(
+            "@prefix ex: <http://example.org/ns/> .\n\
+             @prefix schema: <http://schema.org/> .\n\
+             ex:s{i} a ex:Thing ; schema:name \"name-{i}\" .\n"
+        );
+        // Zero-padded names so lexicographic discovery order is stable.
+        write_ttl(data_dir.path(), &format!("part_{i:04}.ttl"), &ttl);
+    }
+
+    let fluree = FlureeBuilder::file(db_dir.path().to_string_lossy().to_string())
+        .build()
+        .expect("build");
+
+    let result = fluree
+        .create("test/coalesce:main")
+        .import(data_dir.path())
+        .threads(4)
+        // Large chunk target so all 120 tiny files collapse into a single chunk.
+        .memory_budget_mb(256)
+        .cleanup(false)
+        .execute()
+        .await
+        .expect("coalesced directory import should succeed");
+
+    // Coalescing must bound the chunk count well below the file count.
+    assert!(
+        result.t < N as i64,
+        "coalescing should produce fewer commits than files: t={} files={N}",
+        result.t
+    );
+    assert!(result.flake_count as usize >= N, "all triples imported");
+
+    // Every file's data must be queryable.
+    let ledger = fluree.ledger("test/coalesce:main").await.expect("load");
+    let qr = support::query_jsonld(
+        &fluree,
+        &ledger,
+        &json!({
+            "@context": {"schema": "http://schema.org/"},
+            "select": ["?name"],
+            "where": {"schema:name": "?name"}
+        }),
+    )
+    .await
+    .expect("query names");
+    let names = extract_sorted_strings(&qr.to_jsonld(&ledger.snapshot).unwrap());
+    assert_eq!(names.len(), N, "all {N} names queryable");
+    assert!(names.contains(&"name-0".to_string()));
+    assert!(names.contains(&"name-119".to_string()));
+}
+
+/// A directory containing one large file (over chunk_size) must be SUB-SPLIT
+/// at statement boundaries — producing multiple commits from a single file —
+/// not read whole. Boundary triples must survive the splits.
+#[tokio::test]
+async fn import_directory_splits_large_file() {
+    let db_dir = tempfile::tempdir().expect("db tmpdir");
+    let data_dir = tempfile::tempdir().expect("data tmpdir");
+
+    // One ~5 MB file plus a couple of tiny ones in the same directory.
+    let mut big = String::from("@prefix ex: <http://example.org/ns/> .\n");
+    {
+        use std::fmt::Write as _;
+        for i in 0..40_000 {
+            writeln!(big, "ex:s{i} <http://schema.org/name> \"name-{i}\" .").unwrap();
+        }
+    }
+    write_ttl(data_dir.path(), "big.ttl", &big);
+    write_ttl(
+        data_dir.path(),
+        "small.ttl",
+        "@prefix ex: <http://example.org/ns/> .\n\
+         ex:extra <http://schema.org/name> \"extra\" .\n",
+    );
+
+    let fluree = FlureeBuilder::file(db_dir.path().to_string_lossy().to_string())
+        .build()
+        .expect("build");
+
+    let result = fluree
+        .create("test/split-dir:main")
+        .import(data_dir.path())
+        .threads(2)
+        // 1 MB chunk over a ~5 MB file forces several sub-chunks.
+        .chunk_size_mb(1)
+        .memory_budget_mb(256)
+        .cleanup(false)
+        .execute()
+        .await
+        .expect("directory with large file should import");
+
+    // The big file alone must split into multiple chunks → t > 1.
+    assert!(
+        result.t > 1,
+        "large file in directory should sub-split: t={}",
+        result.t
+    );
+    assert!(result.flake_count as usize >= 40_001);
+
+    let ledger = fluree.ledger("test/split-dir:main").await.expect("load");
+    let qr = support::query_jsonld(
+        &fluree,
+        &ledger,
+        &json!({"select": ["?o"], "where": {"@id": "?s", "http://schema.org/name": "?o"}}),
+    )
+    .await
+    .expect("query");
+    let objs = extract_nth_column(&qr.to_jsonld(&ledger.snapshot).unwrap(), 0);
+    assert!(objs.contains(&"name-0".to_string()));
+    assert!(objs.contains(&"name-39999".to_string()));
+    assert!(
+        objs.contains(&"extra".to_string()),
+        "small file also imported"
+    );
+}
+
+/// Files containing labeled blank nodes must NOT be coalesced — each file is a
+/// distinct RDF document scope, so `_:b` in different files are different nodes.
+/// They pass through as their own chunks and must not be merged into one node.
+#[tokio::test]
+async fn import_directory_blank_nodes_not_coalesced() {
+    let db_dir = tempfile::tempdir().expect("db tmpdir");
+    let data_dir = tempfile::tempdir().expect("data tmpdir");
+
+    // Many small files, each using the SAME blank-node label `_:b1` for a
+    // distinct subject. If coalescing merged these into one parse, the `_:b1`s
+    // would collapse into one node and one of the names would be lost.
+    const N: usize = 80; // > default threshold (64) so coalescing would engage if allowed.
+    for i in 0..N {
+        let ttl = format!(
+            "@prefix schema: <http://schema.org/> .\n\
+             _:b1 schema:name \"blank-{i}\" .\n"
+        );
+        write_ttl(data_dir.path(), &format!("bn_{i:04}.ttl"), &ttl);
+    }
+
+    let fluree = FlureeBuilder::file(db_dir.path().to_string_lossy().to_string())
+        .build()
+        .expect("build");
+
+    let result = fluree
+        .create("test/bn-passthrough:main")
+        .import(data_dir.path())
+        .threads(4)
+        .memory_budget_mb(256)
+        .cleanup(false)
+        .execute()
+        .await
+        .expect("blank-node directory import should succeed");
+
+    assert!(result.flake_count as usize >= N);
+
+    // Each file's blank node must remain distinct → all N names present.
+    let ledger = fluree
+        .ledger("test/bn-passthrough:main")
+        .await
+        .expect("load");
+    let qr = support::query_jsonld(
+        &fluree,
+        &ledger,
+        &json!({
+            "@context": {"schema": "http://schema.org/"},
+            "select": ["?name"],
+            "where": {"schema:name": "?name"}
+        }),
+    )
+    .await
+    .expect("query names");
+    let names = extract_sorted_strings(&qr.to_jsonld(&ledger.snapshot).unwrap());
+    assert_eq!(
+        names.len(),
+        N,
+        "every file's blank node must stay distinct (no cross-file merge)"
+    );
+    assert!(names.contains(&"blank-0".to_string()));
+    assert!(names.contains(&"blank-79".to_string()));
+}
+
+/// `coalesce_small_files_threshold(0)` disables coalescing: every small file
+/// becomes its own chunk (legacy behavior), so t == file count.
+#[tokio::test]
+async fn import_directory_coalesce_disabled() {
+    let db_dir = tempfile::tempdir().expect("db tmpdir");
+    let data_dir = tempfile::tempdir().expect("data tmpdir");
+
+    const N: usize = 5;
+    for i in 0..N {
+        let ttl = format!(
+            "@prefix ex: <http://example.org/ns/> .\n\
+             @prefix schema: <http://schema.org/> .\n\
+             ex:s{i} schema:name \"name-{i}\" .\n"
+        );
+        write_ttl(data_dir.path(), &format!("part_{i:04}.ttl"), &ttl);
+    }
+
+    let fluree = FlureeBuilder::file(db_dir.path().to_string_lossy().to_string())
+        .build()
+        .expect("build");
+
+    let result = fluree
+        .create("test/coalesce-off:main")
+        .import(data_dir.path())
+        .threads(2)
+        .memory_budget_mb(256)
+        .coalesce_small_files_threshold(0)
+        .cleanup(false)
+        .execute()
+        .await
+        .expect("import with coalescing disabled should succeed");
+
+    assert_eq!(
+        result.t, N as i64,
+        "with coalescing disabled, each file is its own commit"
+    );
+    assert!(result.flake_count as usize >= N);
+
+    let ledger = fluree.ledger("test/coalesce-off:main").await.expect("load");
+    let qr = support::query_jsonld(
+        &fluree,
+        &ledger,
+        &json!({
+            "@context": {"schema": "http://schema.org/"},
+            "select": ["?name"],
+            "where": {"schema:name": "?name"}
+        }),
+    )
+    .await
+    .expect("query");
+    let names = extract_sorted_strings(&qr.to_jsonld(&ledger.snapshot).unwrap());
+    assert_eq!(names.len(), N);
+}
+
+/// A small-on-disk compressed file in a directory whose DECODED size exceeds
+/// chunk_size must be sub-split (not materialized whole) — guarding against the
+/// `omid_url.ttl.gz` (438 MB → ~4 GB) memory blowup. Highly-compressible text
+/// keeps the on-disk size well under chunk_size while the decoded size is over.
+#[tokio::test]
+async fn import_directory_splits_large_compressed_file() {
+    let db_dir = tempfile::tempdir().expect("db tmpdir");
+    let data_dir = tempfile::tempdir().expect("data tmpdir");
+
+    // ~5 MB of decoded N-Triples; gzip of this repetitive text is well under
+    // 1 MB on disk, so on-disk < chunk_size(1 MB) but decoded > chunk_size.
+    let mut nt = String::new();
+    {
+        use std::fmt::Write as _;
+        for i in 0..40_000 {
+            writeln!(
+                nt,
+                "<http://example.org/ns/s{i}> <http://schema.org/name> \"name-{i}\" ."
+            )
+            .unwrap();
+        }
+    }
+    let gz_path = write_gzipped(data_dir.path(), "big.nt.gz", nt.as_bytes());
+    let on_disk = std::fs::metadata(&gz_path).unwrap().len();
+    assert!(
+        on_disk < 1024 * 1024,
+        "compressed file should be < 1 MB on disk (got {on_disk}) so the \
+         split decision must come from the decoded-size estimate"
+    );
+
+    let fluree = FlureeBuilder::file(db_dir.path().to_string_lossy().to_string())
+        .build()
+        .expect("build");
+
+    let result = fluree
+        .create("test/split-gz-dir:main")
+        .import(data_dir.path())
+        .threads(2)
+        .chunk_size_mb(1)
+        .memory_budget_mb(256)
+        .cleanup(false)
+        .execute()
+        .await
+        .expect("directory with large compressed file should import");
+
+    // Decoded ~5 MB over a 1 MB chunk target → must sub-split into > 1 chunk.
+    assert!(
+        result.t > 1,
+        "compressed file decoding above chunk_size should sub-split: t={}",
+        result.t
+    );
+    assert!(result.flake_count as usize >= 40_000);
+
+    let ledger = fluree.ledger("test/split-gz-dir:main").await.expect("load");
+    let qr = support::query_jsonld(
+        &fluree,
+        &ledger,
+        &json!({"select": ["?o"], "where": {"@id": "?s", "http://schema.org/name": "?o"}}),
+    )
+    .await
+    .expect("query");
+    let objs = extract_nth_column(&qr.to_jsonld(&ledger.snapshot).unwrap(), 0);
+    assert!(objs.contains(&"name-0".to_string()));
+    assert!(objs.contains(&"name-39999".to_string()));
+}
