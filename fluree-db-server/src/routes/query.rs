@@ -2501,7 +2501,7 @@ async fn execute_dataset_query(
     // the same path the multi-query dispatcher uses for each sub-query alias.
     let tracked = has_tracking_opts(&query);
     let outcome =
-        fluree_db_api::query::multi_run::run_jsonld_subquery(state.fluree.as_ref(), &query, None)
+        fluree_db_api::query::multi::run_jsonld_subquery(state.fluree.as_ref(), &query, None)
             .await
             .map_err(|e| {
                 let server_error = ServerError::Api(e);
@@ -2548,11 +2548,11 @@ async fn execute_dataset_query(
 // Multi-query envelope handler
 // =============================================================================
 
+use fluree_db_api::query::multi::MultiQueryError;
 use fluree_db_api::query::multi::{
     MultiQueryBounds, MultiQueryRequest, MultiQuerySubquery, MultiQueryValidationError,
     SubqueryLanguage,
 };
-use fluree_db_api::query::multi_dispatch::MultiQueryError;
 
 /// `POST /v1/fluree/multi-query`
 ///

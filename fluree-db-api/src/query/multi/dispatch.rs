@@ -20,7 +20,7 @@
 //! envelope snapshot (rewriting `from` to pin per-ledger `t`), then
 //! calls into the language-specific helpers
 //! ([`run_jsonld_subquery`], [`run_sparql_subquery`] in
-//! [`crate::query::multi_run`]). The connection-level ledger cache means
+//! [`crate::query::multi::run`]). The connection-level ledger cache means
 //! parallel sub-queries against the same ledger share a snapshot load.
 //!
 //! # Public entry point
@@ -63,16 +63,16 @@ use tokio::sync::Semaphore;
 use tokio::task::JoinSet;
 use tracing::Instrument;
 
+use super::response::{assemble_response, ResponseAssemblyError};
+use super::run::{run_jsonld_subquery, run_sparql_subquery, SubqueryOutput};
+use super::snapshot::{
+    apply_snapshot_to_jsonld, apply_snapshot_to_sparql, resolve_envelope_snapshot, EnvelopeSnapshot,
+};
 use crate::format::{FormatterConfig, OutputFormat};
 use crate::query::multi::{
     apply_sparql_context, merged_context, merged_opts, validate_envelope, MultiQueryBounds,
     MultiQueryRequest, MultiQueryResponse, MultiQuerySubquery, MultiQueryValidationError,
     SparqlContextDirectives, SubqueryLanguage,
-};
-use crate::query::multi_response::{assemble_response, ResponseAssemblyError};
-use crate::query::multi_run::{run_jsonld_subquery, run_sparql_subquery, SubqueryOutput};
-use crate::query::multi_snapshot::{
-    apply_snapshot_to_jsonld, apply_snapshot_to_sparql, resolve_envelope_snapshot, EnvelopeSnapshot,
 };
 use crate::{ApiError, Fluree, QueryConnectionOptions, TrackingOptions, TrackingTally};
 
@@ -137,7 +137,7 @@ fn is_json_output_format(format: OutputFormat) -> bool {
 // =============================================================================
 
 /// Per-alias outcome assembled by the dispatcher and consumed by
-/// [`crate::query::multi_response::assemble_response`].
+/// [`super::response::assemble_response`].
 ///
 /// Crate-internal — callers reach the per-alias outcomes via the
 /// [`MultiQueryResponse`] returned by the builder; the raw outcome

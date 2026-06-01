@@ -29,6 +29,24 @@
 //! resolve to "the latest commit on each ledger at or before this moment." This
 //! is **shared time resolution, not distributed atomicity** — multi-ledger
 //! envelopes do not have a single global commit clock.
+//!
+//! ## Module layout
+//!
+//! This module holds the envelope types and validation; the execution pieces
+//! live in submodules and their headline bindings are re-exported here so the
+//! whole multi-query API is reachable from `crate::query::multi`:
+//! - [`dispatch`] — parallel envelope dispatcher + builder ([`MultiQueryBuilder`]).
+//! - [`run`] — per-sub-query execution helpers.
+//! - [`response`] — per-alias response assembly.
+//! - [`snapshot`] — envelope snapshot (`asOf`) resolution.
+
+pub mod dispatch;
+pub mod response;
+pub mod run;
+pub mod snapshot;
+
+pub use dispatch::{MultiQueryBuilder, MultiQueryError};
+pub use run::{run_jsonld_subquery, run_sparql_subquery, SubqueryOutput};
 
 use indexmap::IndexMap;
 use serde::{Deserialize, Serialize};

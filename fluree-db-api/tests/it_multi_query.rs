@@ -23,8 +23,8 @@ mod support;
 
 use std::sync::Arc;
 
+use fluree_db_api::query::multi::MultiQueryError;
 use fluree_db_api::query::multi::{MultiQueryBounds, MultiQueryRequest, MultiQueryStatus};
-use fluree_db_api::query::multi_dispatch::MultiQueryError;
 use fluree_db_api::{FlureeBuilder, FormatterConfig};
 use serde_json::json;
 use support::{genesis_ledger, MemoryFluree, MemoryLedger};

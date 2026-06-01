@@ -6,10 +6,6 @@ mod credential;
 mod graph_source;
 pub(crate) mod helpers;
 pub mod multi;
-pub mod multi_dispatch;
-pub mod multi_response;
-pub mod multi_run;
-pub mod multi_snapshot;
 pub mod nameservice_builder;
 
 use serde_json::Value as JsonValue;

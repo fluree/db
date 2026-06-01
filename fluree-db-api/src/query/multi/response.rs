@@ -15,11 +15,11 @@
 use indexmap::IndexMap;
 use serde_json::{Map as JsonMap, Value as JsonValue};
 
+use super::dispatch::{AliasOutcome, AliasOutcomeKind};
+use super::snapshot::EnvelopeSnapshot;
 use crate::query::multi::{
     MultiQueryBounds, MultiQueryMeta, MultiQueryResponse, MultiQueryStatus, SnapshotInfo,
 };
-use crate::query::multi_dispatch::{AliasOutcome, AliasOutcomeKind};
-use crate::query::multi_snapshot::EnvelopeSnapshot;
 use crate::TrackingTally;
 
 /// Envelope-level failure during response assembly. Maps to a 5xx HTTP
