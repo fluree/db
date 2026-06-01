@@ -125,7 +125,14 @@ fn group_terms(stmt: &[&Token]) -> Result<Vec<(usize, usize)>> {
     while i < stmt.len() {
         let start = stmt[i].start as usize;
         let mut end = stmt[i].end as usize;
-        let is_string = matches!(stmt[i].kind, TokenKind::String | TokenKind::LongString);
+        // `StringEscaped` is the lexer's slow-path string token (literals
+        // containing `\` escapes); it must fold a following `^^<dt>` / `@lang`
+        // into the term exactly like plain `String`/`LongString`. Omitting it
+        // mis-groups escaped literals that carry a datatype or language tag.
+        let is_string = matches!(
+            stmt[i].kind,
+            TokenKind::String | TokenKind::LongString | TokenKind::StringEscaped(_)
+        );
         i += 1;
         if is_string && i < stmt.len() {
             match stmt[i].kind {
@@ -186,6 +193,27 @@ mod tests {
         assert!(trig.contains("\"42\"^^<http://www.w3.org/2001/XMLSchema#integer> ."));
         assert!(trig.contains("\"hi\"@en ."));
         assert!(trig.contains("GRAPH <http://ex/g> {"));
+    }
+
+    #[test]
+    fn escaped_string_literals_keep_datatype_and_lang() {
+        // Literals containing `\` escapes lex as `TokenKind::StringEscaped`
+        // (the lexer slow path), NOT `String`. They must still fold a trailing
+        // `^^<dt>` / `@lang` into the term. Regression: `group_terms` previously
+        // omitted `StringEscaped`, so an escaped literal carrying a datatype or
+        // language tag mis-grouped (the suffix split into a separate term).
+        let nq = "<http://ex/a> <http://ex/note> \"line1\\nline2\"^^<http://www.w3.org/2001/XMLSchema#string> <http://ex/g> .\n\
+                  <http://ex/a> <http://ex/label> \"caf\\u00e9\"@fr <http://ex/g> .\n";
+        let trig = nquads_to_trig(nq).unwrap();
+        assert!(trig.contains("GRAPH <http://ex/g> {"));
+        assert!(
+            trig.contains("^^<http://www.w3.org/2001/XMLSchema#string> ."),
+            "escaped string must keep its datatype suffix; got: {trig}"
+        );
+        assert!(
+            trig.contains("@fr ."),
+            "escaped string must keep its language tag; got: {trig}"
+        );
     }
 
     #[test]
