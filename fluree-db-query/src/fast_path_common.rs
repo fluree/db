@@ -428,14 +428,21 @@ pub fn intersect_many_sorted(mut lists: Vec<Vec<u64>>) -> Vec<u64> {
 // 6. Merge-count
 // ---------------------------------------------------------------------------
 
-/// Count total rows for a predicate by summing PSOT leaflet directory `row_count`.
+/// Count total rows for a predicate from the PSOT branch manifest.
 ///
 /// This is the fastest possible implementation of:
 /// `SELECT (COUNT(*) AS ?c) WHERE { ?s <p> ?o }`
 /// (and also `COUNT(?s)` / `COUNT(?o)` for the same single-triple pattern),
 /// because every solution binding has all vars bound.
 ///
-/// Assumes PSOT leaflets have `p_const` set (so we can filter without loading columns).
+/// A leaf whose `first_key` and `last_key` both belong to `p_id` is *interior* to
+/// the predicate: PSOT order (p_id, s_id, …) means every row in it is `p_id`, so
+/// `LeafEntry.row_count` (the manifest's latest-state row count, which equals the
+/// sum of that leaf's leaflet `row_count`s) IS the predicate's contribution — no
+/// leaf open. Only the at-most-two *boundary* leaves (where the predicate range
+/// starts or ends mid-leaf, mixing predicates) need a directory walk. For a large
+/// predicate (e.g. `rdf:type`, thousands of leaves) this turns thousands of leaf
+/// opens into ~two.
 pub fn count_rows_for_predicate_psot(
     store: &BinaryIndexStore,
     g_id: GraphId,
@@ -445,6 +452,12 @@ pub fn count_rows_for_predicate_psot(
     let mut total: u64 = 0;
 
     for leaf_entry in leaves {
+        // Interior leaf: entirely this predicate → use the manifest count, no open.
+        if leaf_entry.first_key.p_id == p_id && leaf_entry.last_key.p_id == p_id {
+            total += leaf_entry.row_count;
+            continue;
+        }
+        // Boundary leaf: may mix predicates → open and sum the matching leaflets.
         let handle = store
             .open_leaf_handle(&leaf_entry.leaf_cid, leaf_entry.sidecar_cid.as_ref(), false)
             .map_err(|e| QueryError::Internal(format!("leaf open: {e}")))?;

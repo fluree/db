@@ -919,6 +919,85 @@ async fn indexed_sum_compare_empty_predicate_matches_general() {
         .await;
 }
 
+/// `count_rows_for_predicate_psot` reads interior-leaf counts from the branch
+/// manifest (`LeafEntry.row_count`). That count must reflect **latest state** —
+/// indexed retractions must be excluded, matching the per-leaflet directory sum.
+/// Insert 2000 rows of one predicate (enough to span whole/interior leaves),
+/// index, delete 800, re-index, then COUNT(*) at HEAD must be 1200.
+#[tokio::test]
+async fn indexed_predicate_count_excludes_indexed_retractions() {
+    assert_index_defaults();
+    let fluree = FlureeBuilder::memory()
+        .with_ledger_cache_config(LedgerManagerConfig::default())
+        .build_memory();
+    let ledger_id = "it/indexed-retract-count:main";
+
+    let (local, handle) = start_background_indexer_local(
+        fluree.backend().clone(),
+        Arc::new(fluree.nameservice_mode().clone()),
+        fluree_db_indexer::IndexerConfig::small(),
+    );
+
+    local
+        .run_until(async move {
+            let index_cfg = IndexConfig {
+                reindex_min_bytes: 0,
+                reindex_max_bytes: 50_000_000,
+            };
+            let ledger0 = genesis_ledger_for_fluree(&fluree, ledger_id);
+            let nodes: Vec<serde_json::Value> = (0..2000)
+                .map(|i| json!({"@id": format!("ex:s{i}"), "ex:p": i}))
+                .collect();
+            let ledger1 = fluree
+                .insert_with_opts(
+                    ledger0,
+                    &json!({ "@context": { "ex": "http://example.org/ns/" }, "@graph": nodes }),
+                    TxnOpts::default(),
+                    CommitOpts::default(),
+                    &index_cfg,
+                )
+                .await
+                .expect("seed insert")
+                .ledger;
+            let _ = trigger_index_and_wait_outcome(&handle, ledger_id, ledger1.t()).await;
+
+            // Delete 2000 of the rows, then index so the retractions land in the base.
+            let dels: Vec<serde_json::Value> = (0..800)
+                .map(|i| json!({"@id": format!("ex:s{i}"), "ex:p": i}))
+                .collect();
+            let ledger2 = fluree
+                .update(
+                    ledger1,
+                    &json!({ "@context": { "ex": "http://example.org/ns/" }, "delete": dels }),
+                )
+                .await
+                .expect("delete")
+                .ledger;
+            let _ = trigger_index_and_wait_outcome(&handle, ledger_id, ledger2.t()).await;
+
+            let view = fluree
+                .db_at_t(ledger_id, ledger2.t())
+                .await
+                .expect("load indexed view");
+            let q = r"
+                PREFIX ex: <http://example.org/ns/>
+                SELECT (COUNT(*) AS ?count) WHERE { ?s ex:p ?o }
+            ";
+            let jsonld = fluree
+                .query(&view, QueryInput::Sparql(q))
+                .await
+                .expect("count query")
+                .to_jsonld(&view.snapshot)
+                .expect("to_jsonld");
+            assert_eq!(
+                normalize_rows(&jsonld),
+                normalize_rows(&json!([[1200]])),
+                "manifest interior-leaf count must exclude indexed retractions (2000-800)"
+            );
+        })
+        .await;
+}
+
 // =============================================================================
 // Asymmetric (leapfrog) seek strategy for skewed inner-star count joins
 // =============================================================================
