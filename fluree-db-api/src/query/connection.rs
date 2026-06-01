@@ -567,6 +567,32 @@ impl Fluree {
         self.query_dataset(&dataset, sparql).await
     }
 
+    /// Execute a SPARQL connection query applying policy derived from
+    /// [`QueryConnectionOptions`] (identity / policy-class / inline policy).
+    ///
+    /// SPARQL bodies carry no `opts` block, so the multi-query dispatcher
+    /// passes the merged envelope/sub opts here explicitly. This mirrors
+    /// `query_connection`'s opts→policy behaviour for JSON-LD: when the opts
+    /// carry any policy input the dataset is built with policy
+    /// (`build_dataset_view_with_policy`), otherwise it is the plain view.
+    pub(crate) async fn query_connection_sparql_with_opts(
+        &self,
+        sparql: &str,
+        qc_opts: &QueryConnectionOptions,
+    ) -> Result<QueryResult> {
+        let ast = parse_and_validate_sparql(sparql)?;
+        let spec = extract_sparql_dataset_spec(&ast)?;
+
+        if spec.is_empty() {
+            return Err(ApiError::query(
+                "Missing dataset specification in SPARQL connection query (no FROM / FROM NAMED)",
+            ));
+        }
+
+        let dataset = self.build_dataset_for_connection(&spec, qc_opts).await?;
+        self.query_dataset(&dataset, sparql).await
+    }
+
     pub(crate) async fn query_connection_sparql_with_policy_and_r2rml(
         &self,
         sparql: &str,
@@ -713,6 +739,46 @@ impl Fluree {
             .await
             .map_err(|e| crate::query::TrackedErrorResponse::new(500, e.to_string(), None))?;
         let dataset = apply_policy_to_dataset(dataset, policy);
+
+        self.query_dataset_tracked(&dataset, sparql, format_config, tracking_override)
+            .await
+    }
+
+    /// Tracked SPARQL connection query applying policy derived from
+    /// [`QueryConnectionOptions`]. Opts→policy twin of
+    /// [`Self::query_connection_sparql_tracked`], used by the multi-query
+    /// dispatcher for policy-enforced SPARQL aliases under tracking.
+    pub(crate) async fn query_connection_sparql_tracked_with_opts(
+        &self,
+        sparql: &str,
+        qc_opts: &QueryConnectionOptions,
+        format_config: Option<FormatterConfig>,
+        tracking_override: Option<TrackingOptions>,
+    ) -> std::result::Result<crate::query::TrackedQueryResponse, crate::query::TrackedErrorResponse>
+    {
+        // See `query_connection_jsonld_tracked` for the up-front floor enforcement.
+        let input = QueryInput::Sparql(sparql);
+        let floor = tracked_query_tracker(&input, &tracking_override);
+        charge_query_floor(&floor)
+            .map_err(|e| crate::query::TrackedErrorResponse::fuel_exceeded(&e, floor.tally()))?;
+        let ast = parse_and_validate_sparql(sparql).map_err(|e| {
+            crate::query::TrackedErrorResponse::new(400, e.to_string(), floor.tally())
+        })?;
+        let spec = extract_sparql_dataset_spec(&ast).map_err(|e| {
+            crate::query::TrackedErrorResponse::new(400, e.to_string(), floor.tally())
+        })?;
+
+        if spec.is_empty() {
+            return Err(crate::query::TrackedErrorResponse::new(
+                400,
+                "Missing dataset specification in SPARQL connection query (no FROM / FROM NAMED)",
+                floor.tally(),
+            ));
+        }
+
+        let dataset = self
+            .build_dataset_for_connection_tracked(&spec, qc_opts)
+            .await?;
 
         self.query_dataset_tracked(&dataset, sparql, format_config, tracking_override)
             .await

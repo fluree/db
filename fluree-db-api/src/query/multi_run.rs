@@ -11,7 +11,7 @@
 //! envelope dispatcher.
 
 use crate::format::FormatterConfig;
-use crate::{ApiError, Fluree, Result, TrackingOptions, TrackingTally};
+use crate::{ApiError, Fluree, QueryConnectionOptions, Result, TrackingOptions, TrackingTally};
 use serde_json::Value as JsonValue;
 
 /// Output of a single sub-query execution.
@@ -93,16 +93,32 @@ pub async fn run_jsonld_subquery(
 /// `meta` flags, `max_fuel`). `None` runs the non-tracked builder path;
 /// `Some(opts)` runs the tracked path with those options applied.
 ///
+/// `policy` carries the per-alias policy inputs (identity / policy-class /
+/// inline policy) the dispatcher resolved from the merged envelope/sub opts.
+/// SPARQL bodies have no `opts` block, so this is the only channel that can
+/// enforce per-identity policy on a SPARQL alias. When it carries any policy
+/// input, execution routes through the opts-aware connection path
+/// (`query_connection_sparql_with_opts`); otherwise it's the plain path.
+///
 /// `format` overrides the default per-language output format when set.
 /// `None` preserves the original SPARQL Results JSON default.
 pub async fn run_sparql_subquery(
     fluree: &Fluree,
     sparql: &str,
+    policy: Option<QueryConnectionOptions>,
     tracking: Option<TrackingOptions>,
     format: Option<FormatterConfig>,
 ) -> Result<SubqueryOutput> {
+    // Only attach the policy channel when there's an actual policy input —
+    // an empty `QueryConnectionOptions` would needlessly divert from the
+    // plain path (and `connection_opts` takes precedence over it).
+    let policy = policy.filter(QueryConnectionOptions::has_any_policy_inputs);
+
     if let Some(opts) = tracking {
         let mut builder = fluree.query_from().sparql(sparql).tracking(opts);
+        if let Some(qc) = policy {
+            builder = builder.connection_opts(qc);
+        }
         if let Some(cfg) = format {
             builder = builder.format(cfg);
         }
@@ -121,6 +137,9 @@ pub async fn run_sparql_subquery(
         })
     } else {
         let mut builder = fluree.query_from().sparql(sparql);
+        if let Some(qc) = policy {
+            builder = builder.connection_opts(qc);
+        }
         if let Some(cfg) = format {
             builder = builder.format(cfg);
         }

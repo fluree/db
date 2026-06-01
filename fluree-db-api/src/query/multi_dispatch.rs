@@ -74,7 +74,7 @@ use crate::query::multi_run::{run_jsonld_subquery, run_sparql_subquery, Subquery
 use crate::query::multi_snapshot::{
     apply_snapshot_to_jsonld, apply_snapshot_to_sparql, resolve_envelope_snapshot, EnvelopeSnapshot,
 };
-use crate::{ApiError, Fluree, TrackingOptions, TrackingTally};
+use crate::{ApiError, Fluree, QueryConnectionOptions, TrackingOptions, TrackingTally};
 
 // =============================================================================
 // Public error type
@@ -726,7 +726,30 @@ async fn execute_subquery(
             let sparql_format = envelope_format
                 .filter(|cfg| !matches!(cfg.format, OutputFormat::JsonLd))
                 .cloned();
-            run_sparql_subquery(fluree, &with_snapshot, tracking, sparql_format).await
+
+            // Policy enforcement for SPARQL aliases. SPARQL bodies carry no
+            // `opts` block, so identity / policy-class / inline policy can only
+            // reach execution through the merged envelope/sub opts assembled
+            // above. Parse them into `QueryConnectionOptions` and thread them
+            // down; `run_sparql_subquery` only diverts to the policy path when
+            // an actual policy input is present. The identity here is whatever
+            // the caller (HTTP handler) resolved through its impersonation gate
+            // — this layer stays authn/authz-agnostic, mirroring JSON-LD.
+            let policy_opts = match &merged_opts_val {
+                Some(opts) => {
+                    QueryConnectionOptions::from_json(&serde_json::json!({ "opts": opts }))
+                        .map_err(|e| ApiError::query(format!("invalid sub-query opts: {e}")))?
+                }
+                None => QueryConnectionOptions::default(),
+            };
+            run_sparql_subquery(
+                fluree,
+                &with_snapshot,
+                Some(policy_opts),
+                tracking,
+                sparql_format,
+            )
+            .await
         }
     }
 }

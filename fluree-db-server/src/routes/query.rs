@@ -2710,6 +2710,21 @@ pub async fn multi_query(
                     default_policy_class.as_deref(),
                 )
                 .await;
+            } else if matches!(sub.language, SubqueryLanguage::Sparql) {
+                // SPARQL aliases are policy-enforced too: resolve identity /
+                // policy-class through the same impersonation gate and stash the
+                // decision in `sub.opts`, which the api crate's SPARQL path reads
+                // (`run_sparql_subquery` → `connection_opts`). Without this a
+                // SPARQL alias would run unrestricted while its JSON-LD twin is
+                // gated.
+                apply_envelope_sparql_auth(
+                    &state,
+                    sub,
+                    envelope_opts_owned.as_ref(),
+                    effective_id.as_deref(),
+                    default_policy_class.as_deref(),
+                )
+                .await;
             }
         }
 
@@ -2922,6 +2937,56 @@ async fn apply_envelope_subquery_auth(
         default_policy_class,
     )
     .await;
+}
+
+/// Run the impersonation gate for a **SPARQL** sub-query alias.
+///
+/// SPARQL bodies carry no `opts` block, so identity / policy inputs ride on the
+/// envelope `opts` (header-injected) and the per-alias `sub.opts` override —
+/// never on the query string. We reuse the **exact** JSON-LD gate
+/// ([`apply_auth_identity_to_opts`]) by feeding it a synthetic
+/// `{ "opts": <merged envelope ⊕ sub opts> }` object, then store the gated opts
+/// back as `sub.opts`. For SPARQL the api dispatcher merges `envelope ⊕ sub.opts`
+/// (there is no body layer), so a forced bearer identity in `sub.opts` wins and
+/// cannot be clobbered by a user-supplied envelope/sub `identity`. The
+/// per-ledger impersonation check uses the alias's first `FROM` ledger.
+///
+/// Reusing the JSON-LD gate (rather than re-deriving the decision) keeps SPARQL
+/// and JSON-LD aliases on identical impersonation semantics by construction.
+async fn apply_envelope_sparql_auth(
+    state: &AppState,
+    sub: &mut MultiQuerySubquery,
+    envelope_opts: Option<&JsonValue>,
+    bearer_identity: Option<&str>,
+    default_policy_class: Option<&str>,
+) {
+    if bearer_identity.is_none() && default_policy_class.is_none() {
+        return;
+    }
+    let sparql = sub.query.as_str().unwrap_or_default();
+    let ledger = fluree_db_api::sparql_dataset_ledger_ids(sparql)
+        .ok()
+        .and_then(|ids| ids.into_iter().next())
+        .unwrap_or_default();
+
+    // Wrap the merged opts as a synthetic query body so the JSON-LD gate can
+    // inspect/force identity & policy-class exactly as it does for JSON-LD.
+    let merged = fluree_db_api::query::multi::merged_opts(envelope_opts, sub.opts.as_ref());
+    let mut synthetic = JsonValue::Object(serde_json::Map::new());
+    if let Some(opts) = merged {
+        if let Some(obj) = synthetic.as_object_mut() {
+            obj.insert("opts".to_string(), opts);
+        }
+    }
+    crate::routes::policy_auth::apply_auth_identity_to_opts(
+        state,
+        &ledger,
+        &mut synthetic,
+        bearer_identity,
+        default_policy_class,
+    )
+    .await;
+    sub.opts = synthetic.get("opts").cloned();
 }
 
 /// Pre-merge envelope-level `opts` and sub-query `opts` override into

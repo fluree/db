@@ -21,8 +21,8 @@ use crate::format::FormatterConfig;
 use crate::query::helpers::parse_dataset_spec;
 use crate::view::{DataSetDb, GraphDb, QueryInput};
 use crate::{
-    ApiError, Fluree, PolicyContext, QueryResult, Result, TrackedErrorResponse,
-    TrackedQueryResponse, TrackingOptions,
+    ApiError, Fluree, PolicyContext, QueryConnectionOptions, QueryResult, Result,
+    TrackedErrorResponse, TrackedQueryResponse, TrackingOptions,
 };
 
 use fluree_db_query::r2rml::{R2rmlProvider, R2rmlTableProvider};
@@ -685,6 +685,7 @@ pub struct FromQueryBuilder<'a> {
     fluree: &'a Fluree,
     core: QueryCore<'a>,
     policy: Option<Arc<PolicyContext>>,
+    connection_opts: Option<QueryConnectionOptions>,
 }
 
 impl<'a> FromQueryBuilder<'a> {
@@ -694,6 +695,7 @@ impl<'a> FromQueryBuilder<'a> {
             fluree,
             core: QueryCore::new(),
             policy: None,
+            connection_opts: None,
         }
     }
 
@@ -757,6 +759,22 @@ impl<'a> FromQueryBuilder<'a> {
         self
     }
 
+    /// Set connection options carrying policy inputs (identity / policy-class
+    /// / inline policy) that should be resolved into a `PolicyContext`
+    /// *internally*, against the query's own resolved dataset.
+    ///
+    /// This is the policy channel for **SPARQL** sub-queries, which have no
+    /// body `opts` block to carry identity/policy the way JSON-LD does. When
+    /// set and the input is SPARQL, execution routes through
+    /// `query_connection_sparql_with_opts` (mirroring JSON-LD's
+    /// `query_connection` opts→policy path). For JSON-LD input it is a no-op
+    /// — JSON-LD carries its opts in the body. Takes precedence over
+    /// [`Self::policy`] when both are set.
+    pub fn connection_opts(mut self, opts: QueryConnectionOptions) -> Self {
+        self.connection_opts = Some(opts);
+        self
+    }
+
     // --- Terminal operations ---
 
     /// Validate builder configuration without executing.
@@ -782,6 +800,16 @@ impl<'a> FromQueryBuilder<'a> {
         let mut core = self.core;
         let r2rml = core.r2rml.take();
         let input = core.input.take().unwrap();
+        // SPARQL policy via connection opts (multi-query aliases): SPARQL has
+        // no body opts, so the merged envelope/sub opts arrive here. Takes
+        // precedence over `.policy()`; for JSON-LD input it's a no-op.
+        if let (Some(qc_opts), QueryInput::Sparql(sparql)) = (self.connection_opts.as_ref(), input)
+        {
+            return self
+                .fluree
+                .query_connection_sparql_with_opts(sparql, qc_opts)
+                .await;
+        }
         match input {
             QueryInput::JsonLd(json) => match &self.policy {
                 Some(policy) => match r2rml.as_ref() {
@@ -861,6 +889,25 @@ impl<'a> FromQueryBuilder<'a> {
             .take()
             .unwrap_or_else(|| self.core.default_format());
         let input = self.core.input.take().unwrap();
+        // SPARQL policy via connection opts (multi-query aliases) — see
+        // `connection_opts`. Resolves & applies policy from the merged opts.
+        if let (Some(qc_opts), QueryInput::Sparql(sparql)) = (self.connection_opts.as_ref(), input)
+        {
+            let result = self
+                .fluree
+                .query_connection_sparql_with_opts(sparql, qc_opts)
+                .await?;
+            let ast = crate::query::helpers::parse_and_validate_sparql(sparql)?;
+            let spec = crate::query::helpers::extract_sparql_dataset_spec(&ast)?;
+            return if let Some(alias) = spec.default_graphs.first() {
+                let view = self.fluree.db(alias.identifier.as_str()).await?;
+                Ok(result
+                    .format_async(view.as_graph_db_ref(), &format_config)
+                    .await?)
+            } else {
+                Err(ApiError::query("No default graph for formatting"))
+            };
+        }
         match input {
             QueryInput::JsonLd(json) => {
                 let result = match &self.policy {
@@ -968,6 +1015,31 @@ impl<'a> FromQueryBuilder<'a> {
             .take()
             .unwrap_or_else(|| self.core.default_format());
         let input = self.core.input.take().unwrap();
+        // SPARQL policy via connection opts (multi-query aliases) — see
+        // `connection_opts`. Resolves & applies policy from the merged opts.
+        if let (Some(qc_opts), QueryInput::Sparql(sparql)) = (self.connection_opts.as_ref(), input)
+        {
+            let result = self
+                .fluree
+                .query_connection_sparql_with_opts(sparql, qc_opts)
+                .await?;
+            let ast = crate::query::helpers::parse_and_validate_sparql(sparql)?;
+            let spec = crate::query::helpers::extract_sparql_dataset_spec(&ast)?;
+            return if let Some(alias) = spec.default_graphs.first() {
+                let view = self.fluree.db(alias.identifier.as_str()).await?;
+                crate::format::format_results_string_async(
+                    &result,
+                    &result.context,
+                    view.as_graph_db_ref(),
+                    &format_config,
+                    None,
+                )
+                .await
+                .map_err(ApiError::from)
+            } else {
+                Err(ApiError::query("No default graph for formatting"))
+            };
+        }
         match input {
             QueryInput::JsonLd(json) => {
                 let result = match &self.policy {
@@ -1088,6 +1160,15 @@ impl<'a> FromQueryBuilder<'a> {
         let format_config = self.core.format.take();
         let tracking = self.core.tracking.take();
         let input = self.core.input.take().unwrap();
+        // SPARQL policy via connection opts (multi-query aliases) — see
+        // `connection_opts`. Resolves & applies policy from the merged opts.
+        if let (Some(qc_opts), QueryInput::Sparql(sparql)) = (self.connection_opts.as_ref(), input)
+        {
+            return self
+                .fluree
+                .query_connection_sparql_tracked_with_opts(sparql, qc_opts, format_config, tracking)
+                .await;
+        }
         match input {
             QueryInput::JsonLd(json) => match &self.policy {
                 Some(policy) => match r2rml.as_ref() {
