@@ -919,6 +919,77 @@ async fn indexed_sum_compare_empty_predicate_matches_general() {
         .await;
 }
 
+/// GROUP BY ?object COUNT(?subject) ORDER BY DESC LIMIT via the indexed POST
+/// path (`group_count_v6`, run-length + top-K). A high-multiplicity object's run
+/// (2000 rows) spans multiple leaflets, exercising the boundary-equality /
+/// cross-leaflet run accumulation; LIMIT 3 must keep the three highest counts in
+/// descending order.
+#[tokio::test]
+async fn indexed_group_by_object_count_topk_run_spanning() {
+    assert_index_defaults();
+    let fluree = FlureeBuilder::memory()
+        .with_ledger_cache_config(LedgerManagerConfig::default())
+        .build_memory();
+    let ledger_id = "it/indexed-groupby-topk:main";
+
+    let (local, handle) = start_background_indexer_local(
+        fluree.backend().clone(),
+        Arc::new(fluree.nameservice_mode().clone()),
+        fluree_db_indexer::IndexerConfig::small(),
+    );
+
+    local
+        .run_until(async move {
+            let index_cfg = IndexConfig {
+                reindex_min_bytes: 0,
+                reindex_max_bytes: 50_000_000,
+            };
+            let ledger0 = genesis_ledger_for_fluree(&fluree, ledger_id);
+            // object 10 -> 2000 subjects, 20 -> 400, 30 -> 80, 40 -> 20.
+            let mut nodes: Vec<serde_json::Value> = Vec::new();
+            for (val, n) in [(10, 2000), (20, 400), (30, 80), (40, 20)] {
+                for i in 0..n {
+                    nodes.push(json!({"@id": format!("ex:s{val}_{i}"), "ex:p": val}));
+                }
+            }
+            let ledger1 = fluree
+                .insert_with_opts(
+                    ledger0,
+                    &json!({ "@context": { "ex": "http://example.org/ns/" }, "@graph": nodes }),
+                    TxnOpts::default(),
+                    CommitOpts::default(),
+                    &index_cfg,
+                )
+                .await
+                .expect("seed insert")
+                .ledger;
+            let _ = trigger_index_and_wait_outcome(&handle, ledger_id, ledger1.t()).await;
+            let view = fluree
+                .db_at_t(ledger_id, ledger1.t())
+                .await
+                .expect("load indexed view");
+
+            let q = r"
+                PREFIX ex: <http://example.org/ns/>
+                SELECT ?o (COUNT(?s) AS ?c)
+                WHERE { ?s ex:p ?o }
+                GROUP BY ?o ORDER BY DESC(?c) LIMIT 3
+            ";
+            let jsonld = fluree
+                .query(&view, QueryInput::Sparql(q))
+                .await
+                .expect("group-by topk query")
+                .to_jsonld(&view.snapshot)
+                .expect("to_jsonld");
+            assert_eq!(
+                normalize_rows(&jsonld),
+                normalize_rows(&json!([[10, 2000], [20, 400], [30, 80]])),
+                "top-3 object groups by count desc; the 2000-row run spans leaflets"
+            );
+        })
+        .await;
+}
+
 /// `count_rows_for_predicate_psot` reads interior-leaf counts from the branch
 /// manifest (`LeafEntry.row_count`). That count must reflect **latest state** —
 /// indexed retractions must be excluded, matching the per-leaflet directory sum.
