@@ -332,3 +332,84 @@ async fn overlay_post_order_desc_reflects_novelty() {
         "overlay supersession: c2 now 08 (08, 06, 04)"
     );
 }
+
+/// Regression for the overlay leaf-walk window bound (CRITICAL-1).
+///
+/// Leaves are NOT predicate-homogeneous — a leaf flushes on row count, not on a
+/// `p_id` change — so a single leaf can hold multiple predicates. The overlay
+/// lane previously bounded each leaf's assert window with `leaf.first_key.o_key`,
+/// the leaf's GLOBAL minimum, which belongs to the lowest-`p_id` predicate in the
+/// leaf — not necessarily the queried one. When that foreign predicate's `o_key`
+/// is larger than the queried predicate's novelty asserts, those asserts were
+/// excluded from the window and emitted last (or dropped past LIMIT) — wrong
+/// `ORDER BY DESC(?o) LIMIT k` order and a wrong top-k set.
+///
+/// Construction makes this deterministic: predicate `p_id`s are assigned in
+/// UTF-8 byte-lex order of the IRI (`chunk_dict::sort_and_write_sorted_vocab`),
+/// so `ex:aaa` < `ex:score` ⇒ `aaa` gets the lower `p_id`. `ex:aaa` carries a
+/// huge integer (`1_000_000`), so the shared leaf's `first_key` is that row and
+/// `leaf.first_key.o_key` ≫ every `ex:score` encoding. The novelty assert
+/// `ex:score = 35` then falls below the (buggy) window bound. With the fix the
+/// window is bounded by THIS predicate's own minimum `o_key` in the leaf, so 35
+/// merges into the correct rank.
+#[tokio::test]
+async fn overlay_post_order_desc_multi_predicate_leaf_window() {
+    let fluree = FlureeBuilder::memory()
+        .with_ledger_cache_config(LedgerManagerConfig::default())
+        .build_memory();
+    let ledger_id = "it/post-order-overlay-shared-leaf:main";
+    let ctx = json!({"ex": "http://example.org/"});
+
+    // Base: a foreign predicate `ex:aaa` (lower p_id, huge value) shares one leaf
+    // with `ex:score` (10..50). Default leaf size keeps it all in a single leaf.
+    let ledger0 = genesis_ledger_for_fluree(&fluree, ledger_id);
+    let ledger1 = fluree
+        .insert(
+            ledger0,
+            &json!({
+                "@context": ctx,
+                "@graph": [
+                    {"@id": "ex:anchor", "ex:aaa": 1000000},
+                    {"@id": "ex:s1", "ex:score": 10},
+                    {"@id": "ex:s2", "ex:score": 20},
+                    {"@id": "ex:s3", "ex:score": 30},
+                    {"@id": "ex:s4", "ex:score": 40},
+                    {"@id": "ex:s5", "ex:score": 50}
+                ]
+            }),
+        )
+        .await
+        .expect("seed")
+        .ledger;
+    rebuild_and_publish_index(&fluree, ledger_id).await;
+
+    // Novelty: ex:s6 score 35 — must rank between 40 and 30.
+    let ledger2 = fluree
+        .insert(
+            ledger1,
+            &json!({"@context": ctx, "@graph": [{"@id": "ex:s6", "ex:score": 35}]}),
+        )
+        .await
+        .expect("assert s6")
+        .ledger;
+    let t2 = ledger2.t();
+
+    let sparql = r"
+        PREFIX ex: <http://example.org/>
+        SELECT ?s ?v
+        WHERE { ?s ex:score ?v . }
+        ORDER BY DESC(?v) LIMIT 3
+    ";
+    let view = fluree.db_at_t(ledger_id, t2).await.expect("view");
+    let res = fluree
+        .query(&view, QueryInput::Sparql(sparql))
+        .await
+        .expect("query");
+    let jsonld = res.to_jsonld(&view.snapshot).expect("to_jsonld");
+    assert_eq!(
+        col0(&jsonld),
+        vec!["ex:s5", "ex:s4", "ex:s6"],
+        "novelty score 35 must rank 3rd (50, 40, 35) despite a foreign \
+         lower-p_id predicate with a larger o_key sharing the leaf"
+    );
+}

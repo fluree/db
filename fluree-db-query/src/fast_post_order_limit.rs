@@ -575,7 +575,6 @@ fn collect_post_desc_topk_overlay(
     // `upper` is the exclusive high bound (the previous, higher leaf's low value).
     let mut upper: Option<u64> = None;
     for leaf in leaves.iter().rev() {
-        let leaf_lo = leaf.first_key.o_key;
         let handle = store
             .open_leaf_handle(&leaf.leaf_cid, leaf.sidecar_cid.as_ref(), false)
             .map_err(|e| QueryError::Internal(format!("leaf open: {e}")))?;
@@ -604,6 +603,18 @@ fn collect_post_desc_topk_overlay(
                 });
             }
         }
+
+        // Leaves are NOT predicate-homogeneous: a leaf flushes on row count, not
+        // on a `p_id` change (only leaflets flush on `p_id`), so `leaf.first_key`
+        // can belong to a lower predicate sharing this leaf — its `o_key` lives in
+        // an unrelated value/type space. Bound the assert window by THIS
+        // predicate's actual minimum `o_key` in the leaf instead. `leaf_base` is
+        // DESC by `(o_key, o_i, s_id)`, so its last element is that minimum. Skip
+        // leaves with no rows for this predicate: they neither contribute base
+        // rows nor bound the window (`upper` carries through to the next leaf).
+        let Some(leaf_lo) = leaf_base.last().map(|r| r.o_key) else {
+            continue;
+        };
 
         // Asserts in this leaf's value window: o_key in [leaf_lo, upper). Because
         // we descend leaf-by-leaf and asserts are sorted DESC, the next
