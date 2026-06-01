@@ -13,7 +13,7 @@ use crate::fast_count::{
     count_blank_node_subjects_operator, count_distinct_position_operator,
     count_literal_objects_operator, count_rows_lang_filter_operator,
     count_rows_numeric_compare_operator, count_rows_operator, count_triples_operator,
-    DistinctPosition, NumericCompareOp,
+    sum_compare_as_count_operator, DistinctPosition, NumericCompareOp,
 };
 use crate::fast_exists_join_count_distinct_object::exists_join_count_distinct_object_operator;
 use crate::fast_group_count_firsts::{
@@ -1605,6 +1605,43 @@ fn detect_fused_scan_sum_i64(query: &Query) -> Option<(Ref, SumExprI64, VarId)> 
     }
 }
 
+/// Detect `SELECT (SUM(?o <cmp> K) AS ?sum) WHERE { ?s <p> ?o }`, lowered as
+/// `Triple + Bind(Gt/Ge/Lt/Le(?o, const)) + SUM(synthetic_var, List)`.
+///
+/// `SUM` of a boolean comparison is `COUNT` of the matching rows, which the
+/// directory-skipping numeric-compare count answers far faster than the general
+/// decode+eval+materialize aggregate pipeline. Restricted to `InputSemantics::List`
+/// (non-DISTINCT) because `SUM(DISTINCT ?o>0)` sums the distinct set {0,1}, not a
+/// row count. Empty-input (`SUM`=Unbound vs `COUNT`=0) is handled by the operator,
+/// which defers to the fallback when the predicate feeds no rows.
+fn detect_sum_numeric_compare_as_count(
+    query: &Query,
+) -> Option<(Ref, NumericCompareOp, fluree_db_core::FlakeValue, VarId)> {
+    let agg = implicit_single_aggregate(query)?;
+    let select_vars = query.output.projected_vars()?;
+    if select_vars.len() != 1 || select_vars[0] != agg.output_var {
+        return None;
+    }
+    let AggregateFn::Sum(sum_input, InputSemantics::List) = agg.function else {
+        return None;
+    };
+    let [Pattern::Triple(tp), Pattern::Bind { var, expr }] = query.patterns.as_slice() else {
+        return None;
+    };
+    if sum_input != *var {
+        return None;
+    }
+    let pred = extract_bound_predicate(&tp.p)?;
+    let Term::Var(o_var) = &tp.o else {
+        return None;
+    };
+    let (cmp_var, op, threshold) = extract_simple_numeric_compare_threshold(expr)?;
+    if cmp_var != *o_var {
+        return None;
+    }
+    Some((pred, op, threshold, agg.output_var))
+}
+
 fn detect_exists_join_count_distinct_object(query: &Query) -> Option<(Ref, Ref, VarId)> {
     let (in_var, out_var) = detect_count_distinct_aggregate(query)?;
 
@@ -1959,6 +1996,27 @@ fn build_operator_tree_inner(
             grouping = ?query.grouping,
             "operator_tree: considering fused fast paths"
         );
+    }
+
+    // Fast-path: `SELECT (SUM(?o <cmp> K) AS ?sum) WHERE { ?s <p> ?o }`.
+    //
+    // SUM of a boolean comparison == COUNT of matching rows, answered by the
+    // directory-skipping numeric-compare count instead of the general
+    // decode+eval+materialize aggregate pipeline. Placed before the generic
+    // SUM-i64 fast path (which declines the comparison shape).
+    if enable_fused_fast_paths {
+        if let Some((pred, compare, threshold, out_var)) =
+            detect_sum_numeric_compare_as_count(query)
+        {
+            let fallback = build_operator_tree_inner(query, stats.clone(), false, planning)?;
+            return Ok(Box::new(sum_compare_as_count_operator(
+                pred,
+                compare,
+                threshold,
+                out_var,
+                Some(fallback),
+            )));
+        }
     }
 
     // Fast-path: `SELECT (SUM(DAY(?o)) AS ?sum) WHERE { ?s <p> ?o }` and friends.
@@ -3069,6 +3127,63 @@ mod tests {
             detect_exists_join_count_distinct_object(&reversed),
             Some((count_pred, exists_pred, out))
         );
+    }
+
+    #[test]
+    fn test_detect_sum_numeric_compare_as_count() {
+        let s = VarId(0);
+        let o = VarId(1);
+        let synth = VarId(2);
+        let out = VarId(3);
+        let pred = Ref::Sid(Sid::new(100, "numberOfCreators"));
+
+        // SELECT (SUM(?synth) AS ?out) WHERE { ?s <pred> ?o . BIND(?o > 0 AS ?synth) }
+        let make_query = |function: AggregateFn| Query {
+            context: ParsedContext::default(),
+            orig_context: None,
+            output: QueryOutput::select_all(vec![out]),
+            patterns: vec![
+                Pattern::Triple(TriplePattern::new(Ref::Var(s), pred.clone(), Term::Var(o))),
+                Pattern::Bind {
+                    var: synth,
+                    expr: crate::ir::Expression::gt(
+                        crate::ir::Expression::Var(o),
+                        crate::ir::Expression::Const(crate::ir::FlakeValue::Long(0)),
+                    ),
+                },
+            ],
+            reasoning: ReasoningConfig::default(),
+            grouping: Some(Grouping::Implicit {
+                aggregation: Aggregation {
+                    aggregates: fluree_db_core::NonEmpty::try_from_vec(vec![crate::ir::AggregateSpec {
+                        function,
+                        output_var: out,
+                    }])
+                    .unwrap(),
+                    binds: Vec::new(),
+                },
+                having: None,
+            }),
+            ordering: Vec::new(),
+            limit: None,
+            offset: None,
+            post_values: None,
+        };
+
+        // SUM (List / non-DISTINCT) over the comparison synth var => detected as Gt/threshold 0.
+        let q = make_query(AggregateFn::Sum(synth, InputSemantics::List));
+        assert_eq!(
+            detect_sum_numeric_compare_as_count(&q),
+            Some((pred.clone(), NumericCompareOp::Gt, fluree_db_core::FlakeValue::Long(0), out))
+        );
+
+        // SUM(DISTINCT ...) must be rejected: SUM(DISTINCT bool) is not a row count.
+        let q_distinct = make_query(AggregateFn::Sum(synth, InputSemantics::Set));
+        assert_eq!(detect_sum_numeric_compare_as_count(&q_distinct), None);
+
+        // A non-SUM aggregate over the same shape must be rejected.
+        let q_count = make_query(AggregateFn::Count(synth));
+        assert_eq!(detect_sum_numeric_compare_as_count(&q_count), None);
     }
 
     #[test]

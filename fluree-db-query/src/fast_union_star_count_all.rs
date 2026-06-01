@@ -29,8 +29,9 @@ use crate::binding::Batch;
 use crate::context::ExecutionContext;
 use crate::error::{QueryError, Result};
 use crate::fast_path_common::{
-    build_count_batch, build_psot_cursor_for_predicate, count_to_i64, cursor_projection_sid_only,
-    cursor_projection_sid_otype_okey, normalize_pred_sid, CursorSubjectCountStream,
+    build_count_batch, build_psot_cursor_for_predicate, count_rows_for_predicate_psot, count_to_i64,
+    cursor_projection_sid_only, cursor_projection_sid_otype_okey, normalize_pred_sid,
+    CursorSubjectCountStream,
 };
 use crate::ir::triple::Ref;
 use crate::operator::{BoxedOperator, Operator, OperatorState};
@@ -258,6 +259,34 @@ fn count_union_star(
         != 0;
     if union_preds.is_empty() {
         return Ok(Some(0));
+    }
+
+    // Metadata fast lane: `{ ?s p1 ?o } UNION { ?s p2 ?o }` under COUNT(*) with no
+    // extra constraint reduces, under bag semantics, to `Σ_p count_rows(p)` — a sum
+    // of leaflet-directory row counts with NO row decode. (count(p1)+count(p2)
+    // double-counts subjects present under both predicates, which is exactly correct
+    // for UNION bag semantics.) Only valid at HEAD with no overlay/time-travel, where
+    // base-leaflet directory counts are exact; otherwise fall through to the
+    // overlay-merging cursor path below.
+    //
+    // Gate matches `count_plan_exec`: epoch != 0 OR to_t != max_t.
+    let time_travel = ctx.to_t != store.max_t();
+    if matches!(mode, UnionCountMode::AllRows)
+        && extra_preds.is_empty()
+        && !overlay_has_rows
+        && !time_travel
+    {
+        let mut total: u64 = 0;
+        for p in union_preds {
+            let sid = normalize_pred_sid(store, p)?;
+            // Absent predicate contributes 0. Safe here: no overlay means there are
+            // no overlay-only rows a missing `p_id` could hide.
+            let Some(p_id) = store.sid_to_p_id(&sid) else {
+                continue;
+            };
+            total = total.saturating_add(count_rows_for_predicate_psot(store, g_id, p_id)?);
+        }
+        return Ok(Some(total));
     }
 
     // Build union streams.

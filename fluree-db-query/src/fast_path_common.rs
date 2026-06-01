@@ -606,6 +606,184 @@ impl<'a> PsotSubjectCountIter<'a> {
 }
 
 // ---------------------------------------------------------------------------
+// 7a-seek. Forward-only per-subject PSOT seek (asymmetric-join probe)
+// ---------------------------------------------------------------------------
+
+/// Forward-only monotonic per-subject seek over a predicate's PSOT leaves.
+///
+/// Given **strictly non-decreasing** target subjects, returns the row count for
+/// each (any object datatype) — the probe side of an asymmetric subject join
+/// (drive from the small predicate, seek into the large one). Cost is driven
+/// sub-linear in the probe predicate two ways:
+/// - **leaf leapfrog**: a binary search over the predicate's leaf slice skips
+///   whole leaves — and their blob reads — that cannot contain the target;
+/// - **leaflet skip**: leaflets whose `last_key` subject is below the target are
+///   skipped without decoding their columns.
+///
+/// Subjects whose rows span leaflet/leaf boundaries are handled. Because the
+/// cursor only ever advances, the total work across an ascending target sequence
+/// is one monotonic pass.
+///
+/// PRECONDITION: targets must be non-decreasing across calls (the cursor never
+/// rewinds). BASE index only — callers MUST gate to HEAD (no overlay,
+/// `to_t == max_t`); novelty / time-travel are not merged here.
+pub struct PsotSubjectSeek<'a> {
+    store: &'a BinaryIndexStore,
+    p_id: u32,
+    leaves: &'a [LeafEntry],
+    leaf_pos: usize,
+    leaflet_idx: usize,
+    row: usize,
+    handle: Option<Box<dyn fluree_db_binary_index::read::leaf_access::LeafHandle>>,
+    batch: Option<ColumnBatch>,
+}
+
+impl<'a> PsotSubjectSeek<'a> {
+    pub fn new(store: &'a BinaryIndexStore, g_id: GraphId, p_id: u32) -> Self {
+        let leaves = leaf_entries_for_predicate(store, g_id, RunSortOrder::Psot, p_id);
+        Self {
+            store,
+            p_id,
+            leaves,
+            leaf_pos: 0,
+            leaflet_idx: 0,
+            row: 0,
+            handle: None,
+            batch: None,
+        }
+    }
+
+    fn load_next_batch(&mut self, target_s: u64) -> Result<Option<()>> {
+        use fluree_db_binary_index::format::run_record_v2::read_ordered_key_v2;
+        loop {
+            if self.handle.is_none() {
+                // Leaf leapfrog: skip leaves that provably cannot contain target_s.
+                //
+                // A leaf is skippable only when its `last_key` belongs to THIS
+                // predicate AND its subject is below the target. At the predicate's
+                // upper boundary a leaf's `last_key` may belong to a higher predicate
+                // (our rows are a prefix of that leaf); such a leaf must NOT be
+                // skipped by its foreign subject. `leaf_entries_for_predicate`
+                // guarantees `last_key.p_id >= self.p_id`, so the skip predicate is
+                // a monotone leading run and `partition_point` is valid.
+                let skip = self.leaves[self.leaf_pos..].partition_point(|e| {
+                    e.last_key.p_id == self.p_id && e.last_key.s_id.as_u64() < target_s
+                });
+                self.leaf_pos += skip;
+                if self.leaf_pos >= self.leaves.len() {
+                    return Ok(None);
+                }
+                let leaf_entry = &self.leaves[self.leaf_pos];
+                self.leaf_pos += 1;
+                self.leaflet_idx = 0;
+                self.row = 0;
+                self.batch = None;
+                self.handle = Some(
+                    self.store
+                        .open_leaf_handle(
+                            &leaf_entry.leaf_cid,
+                            leaf_entry.sidecar_cid.as_ref(),
+                            false,
+                        )
+                        .map_err(|e| QueryError::Internal(format!("leaf open: {e}")))?,
+                );
+            }
+
+            let handle = self.handle.as_ref().unwrap();
+            let dir = handle.dir();
+            while self.leaflet_idx < dir.entries.len() {
+                let entry = &dir.entries[self.leaflet_idx];
+                let idx = self.leaflet_idx;
+                self.leaflet_idx += 1;
+                if entry.row_count == 0 || entry.p_const != Some(self.p_id) {
+                    continue;
+                }
+                // Leaflet skip: cannot contain target_s if its last subject is below it.
+                let last = read_ordered_key_v2(RunSortOrder::Psot, &entry.last_key);
+                if last.s_id.as_u64() < target_s {
+                    continue;
+                }
+                let projection = projection_sid_only();
+                let batch = if let Some(cache) = self.store.leaflet_cache() {
+                    let idx_u32: u32 = idx.try_into().map_err(|_| {
+                        QueryError::Internal("leaflet idx exceeds u32".to_string())
+                    })?;
+                    load_columns_cached_via_handle(
+                        handle.as_ref(),
+                        idx,
+                        RunSortOrder::Psot,
+                        cache,
+                        handle.leaf_id(),
+                        idx_u32,
+                    )
+                    .map_err(|e| QueryError::Internal(format!("load columns: {e}")))?
+                } else {
+                    handle
+                        .load_columns(idx, &projection, RunSortOrder::Psot)
+                        .map_err(|e| QueryError::Internal(format!("load columns: {e}")))?
+                };
+                self.row = 0;
+                self.batch = Some(batch);
+                return Ok(Some(()));
+            }
+            self.handle = None;
+        }
+    }
+
+    /// Row count for `target_s` (any object datatype), or `None` if the subject is
+    /// absent. Targets MUST be non-decreasing across calls.
+    pub fn count_for_subject(&mut self, target_s: u64) -> Result<Option<u64>> {
+        let mut found = false;
+        let mut count: u64 = 0;
+        loop {
+            if self.batch.is_none() && self.load_next_batch(target_s)?.is_none() {
+                return Ok(found.then_some(count));
+            }
+            let batch = self.batch.as_ref().unwrap();
+            if self.row >= batch.row_count {
+                self.batch = None;
+                continue;
+            }
+            if !found {
+                // Advance to the first row with s_id >= target_s.
+                while self.row < batch.row_count && batch.s_id.get(self.row) < target_s {
+                    self.row += 1;
+                }
+                if self.row >= batch.row_count {
+                    self.batch = None;
+                    continue;
+                }
+                if batch.s_id.get(self.row) > target_s {
+                    // Cursor is now parked at the first subject above target_s, ready
+                    // for the next (larger) target. Subject is absent.
+                    return Ok(None);
+                }
+                found = true;
+            } else if batch.s_id.get(self.row) > target_s {
+                return Ok(Some(count));
+            }
+            // At target_s: count its rows (the group may span batches).
+            while self.row < batch.row_count && batch.s_id.get(self.row) == target_s {
+                count = count
+                    .checked_add(1)
+                    .ok_or_else(|| QueryError::execution("COUNT(*) overflow in subject seek"))?;
+                self.row += 1;
+            }
+            if self.row < batch.row_count {
+                return Ok(Some(count));
+            }
+            // Subject group may continue into the next leaflet/leaf.
+            self.batch = None;
+        }
+    }
+
+    /// Whether `target_s` has any row. Targets MUST be non-decreasing across calls.
+    pub fn subject_present(&mut self, target_s: u64) -> Result<bool> {
+        Ok(self.count_for_subject(target_s)?.is_some())
+    }
+}
+
+// ---------------------------------------------------------------------------
 // 7b. Streaming POST object-group-count iterator
 // ---------------------------------------------------------------------------
 

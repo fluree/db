@@ -103,6 +103,62 @@ pub fn count_rows_numeric_compare_operator(
     )
 }
 
+/// Fast-path: `SUM(?o <cmp> K)` over a single triple `?s <p> ?o`.
+///
+/// `SUM` of a boolean comparison is algebraically `COUNT` of the rows where the
+/// comparison holds (true→1, false→0), so this reuses the directory-skipping
+/// numeric-compare count.
+///
+/// SEMANTICS GUARD: `SUM` over an empty multiset is **Unbound** (SPARQL), whereas
+/// `COUNT` would be `0`. The two diverge only when the predicate feeds the
+/// aggregate *no rows at all* (absent predicate, or every row retracted). In that
+/// case we return `Ok(None)` to defer to the general aggregate pipeline, which
+/// emits the correct Unbound result. When at least one row exists, `SUM(?o cmp K)`
+/// == `COUNT(rows where ?o cmp K)` exactly (a non-empty input with zero matches
+/// sums to bound `0`, which `COUNT` also yields).
+pub fn sum_compare_as_count_operator(
+    predicate: Ref,
+    compare: NumericCompareOp,
+    threshold: FlakeValue,
+    out_var: VarId,
+    fallback: Option<BoxedOperator>,
+) -> FastPathOperator {
+    FastPathOperator::new(
+        out_var,
+        move |ctx| {
+            let Some(store) = fast_path_store(ctx) else {
+                return Ok(None);
+            };
+            let pred_sid = normalize_pred_sid(store, &predicate)?;
+            let Some(p_id) = store.sid_to_p_id(&pred_sid) else {
+                // Absent predicate => empty input => SUM is Unbound (not 0).
+                return Ok(None);
+            };
+            // Empty input (all rows retracted) => SUM is Unbound; defer to fallback.
+            let total = count_rows_for_predicate_psot(store, ctx.binary_g_id, p_id)?;
+            if total == 0 {
+                return Ok(None);
+            }
+            let count = count_rows_for_predicate_numeric_compare_post(
+                store,
+                ctx.binary_g_id,
+                p_id,
+                compare,
+                &threshold,
+            )?;
+            match count {
+                Some(count) => Ok(Some(build_count_batch(
+                    out_var,
+                    count_to_i64(count, "SUM(compare) as count")?,
+                )?)),
+                None => Ok(None),
+            }
+        },
+        fallback,
+        "SUM(compare) as count",
+    )
+}
+
 fn count_rows_for_predicate_numeric_compare_post(
     store: &BinaryIndexStore,
     g_id: GraphId,

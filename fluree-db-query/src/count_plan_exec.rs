@@ -25,7 +25,7 @@ use crate::fast_path_common::{
     cursor_projection_sid_otype_okey, intersect_many_sorted, leaf_entries_for_predicate,
     normalize_pred_sid, projection_sid_otype_okey, sum_post_object_counts_filtered,
     CursorSubjectCountStream, FastPathOperator, ObjectFilterMode, PostObjectGroupCountIter,
-    PsotObjectFilterCountIter, PsotSubjectCountIter, PsotSubjectWeightedSumIter,
+    PsotObjectFilterCountIter, PsotSubjectCountIter, PsotSubjectSeek, PsotSubjectWeightedSumIter,
 };
 use crate::ir::triple::Ref;
 use crate::operator::BoxedOperator;
@@ -542,6 +542,14 @@ fn sum_stream(
         ),
 
         StreamNode::AntiJoin { source, excluded } => {
+            // Asymmetric seek (HEAD, outermost modifier only): drive from the
+            // smaller of outer/inner and seek the other, avoiding a full scan or
+            // keyset-build of the large side.
+            if !ec.overlay && exclude_sorted.is_none() && include_sorted.is_none() {
+                if let Some(n) = try_modifier_seek(source, excluded, true, ec)? {
+                    return Ok(Some(n));
+                }
+            }
             let exclude_list = execute_keyset_as_sorted(excluded, ec)?;
             let exclude_list = match exclude_list {
                 Some(s) => s,
@@ -553,6 +561,11 @@ fn sum_stream(
         }
 
         StreamNode::SemiJoin { source, filter } => {
+            if !ec.overlay && exclude_sorted.is_none() && include_sorted.is_none() {
+                if let Some(n) = try_modifier_seek(source, filter, false, ec)? {
+                    return Ok(Some(n));
+                }
+            }
             let filter_list = execute_keyset_as_sorted(filter, ec)?;
             let filter_list = match filter_list {
                 Some(s) => s,
@@ -566,6 +579,93 @@ fn sum_stream(
             sum_stream(source, ec, exclude_sorted, Some(&merged))
         }
     }
+}
+
+/// Asymmetric seek strategy for a single-predicate EXISTS/MINUS over a
+/// single-predicate outer: `?s A ?o1 {FILTER EXISTS | MINUS} { ?s B ?o2 }`.
+///
+/// Drives from whichever of A/B has fewer rows and seeks into the other, avoiding
+/// a full scan or keyset-build of the large side:
+/// - EXISTS  = `Σ_{s ∈ A ∧ s ∈ B} count_A(s)`
+/// - MINUS   = `Σ_{s ∈ A ∧ s ∉ B} count_A(s)` = `total(A) − Σ_{s ∈ A ∩ B} count_A(s)`
+///
+/// (`is_anti` = true for MINUS / NOT EXISTS, false for EXISTS.) Returns `Ok(None)`
+/// to defer to the keyset+scan path when the shape is not single-predicate on both
+/// sides, or the sides are not skewed enough for the seek to win. BASE index only:
+/// the caller must ensure `!ec.overlay` and that no outer exclude/include filter is
+/// already active.
+fn try_modifier_seek(
+    source: &StreamNode,
+    keyset: &KeySetNode,
+    is_anti: bool,
+    ec: &ExecCtx<'_, '_>,
+) -> Result<Option<u64>> {
+    let StreamNode::SubjectCountScan { pred: pred_a } = source else {
+        return Ok(None);
+    };
+    let pred_b = match keyset {
+        KeySetNode::SubjectSet { pred } | KeySetNode::SubjectsSorted { pred } => pred,
+        _ => return Ok(None),
+    };
+
+    let sid_a = normalize_pred_sid(ec.store, pred_a)?;
+    let sid_b = normalize_pred_sid(ec.store, pred_b)?;
+
+    // Absent-predicate semantics:
+    // - A absent  => outer empty => 0 for both EXISTS and MINUS.
+    // - B absent  => EXISTS: 0 (no subject has B); MINUS: total(A) (nothing excluded).
+    let Some(p_a) = ec.store.sid_to_p_id(&sid_a) else {
+        return Ok(Some(0));
+    };
+    let rows_a = count_rows_for_predicate_psot(ec.store, ec.g_id, p_a)?;
+    let Some(p_b) = ec.store.sid_to_p_id(&sid_b) else {
+        return Ok(Some(if is_anti { rows_a } else { 0 }));
+    };
+    let rows_b = count_rows_for_predicate_psot(ec.store, ec.g_id, p_b)?;
+
+    // Only worthwhile when one side is much smaller than the other; otherwise the
+    // existing keyset+scan path is competitive — defer to it.
+    let (min_rows, max_rows) = (rows_a.min(rows_b), rows_a.max(rows_b));
+    if min_rows.saturating_mul(SEEK_STAR_DRIVER_FACTOR) >= max_rows {
+        return Ok(None);
+    }
+
+    let total: u128 = if rows_a <= rows_b {
+        // Drive from A (smaller): iterate (s, count_A) and probe B for existence.
+        let Some(mut a_groups) = subject_groups(ec, pred_a)? else {
+            return Ok(None);
+        };
+        let mut b_seek = PsotSubjectSeek::new(ec.store, ec.g_id, p_b);
+        let mut acc: u128 = 0;
+        while let Some((s, count_a)) = a_groups.next_group()? {
+            let present = b_seek.subject_present(s)?;
+            // EXISTS keeps present subjects; MINUS keeps absent ones.
+            if present != is_anti {
+                acc = acc.saturating_add(count_a as u128);
+            }
+        }
+        acc
+    } else {
+        // Drive from B (smaller): iterate B's distinct subjects, seek A's count.
+        // `matched` = Σ_{s ∈ A ∩ B} count_A(s) (absent-in-A subjects seek to None).
+        let Some(mut b_groups) = subject_groups(ec, pred_b)? else {
+            return Ok(None);
+        };
+        let mut a_seek = PsotSubjectSeek::new(ec.store, ec.g_id, p_a);
+        let mut matched: u128 = 0;
+        while let Some((s, _)) = b_groups.next_group()? {
+            if let Some(count_a) = a_seek.count_for_subject(s)? {
+                matched = matched.saturating_add(count_a as u128);
+            }
+        }
+        if is_anti {
+            (rows_a as u128).saturating_sub(matched)
+        } else {
+            matched
+        }
+    };
+
+    Ok(Some(total.min(u64::MAX as u128) as u64))
 }
 
 /// Check if `key` is in the sorted exclusion list, advancing the index pointer.
@@ -642,12 +742,33 @@ fn intersect_sorted_pair(a: &[u64], b: &[u64]) -> Vec<u64> {
 /// amortized per-subject filtering (matching `fast_minus_count_all::count_property_join_all`).
 ///
 /// Formula: `Σ_{s in all, not excluded, included} Π_i count_i(s)`
+/// Driver/probe cost heuristic for the asymmetric seek strategy: a rough
+/// rows-per-leaflet proxy. The seek strategy is chosen only when the smallest
+/// child's row count times this factor is still below the largest child's row
+/// count — i.e. the driver is small enough that probing it into the large side
+/// (≈ one leaf-leapfrog pass) is cheaper than decoding the large side in full.
+/// A wrong choice only affects speed, never the count, so an overestimate keeps
+/// the strategy conservative (no regression vs the symmetric merge).
+const SEEK_STAR_DRIVER_FACTOR: u64 = 8192;
+
 fn sum_star_join(
     children: &[StreamNode],
     ec: &ExecCtx<'_, '_>,
     exclude_sorted: Option<&[u64]>,
     include_sorted: Option<&[u64]>,
 ) -> Result<Option<u64>> {
+    // Asymmetric (leapfrog) strategy: when one predicate is much smaller than the
+    // others, drive from it and SEEK per-subject into the large side instead of a
+    // full symmetric scan of every predicate. BASE index only, so HEAD-gated;
+    // under overlay the cursor-merge path below stays correct.
+    if !ec.overlay {
+        if let Some(total) =
+            try_sum_star_join_seek(children, ec, exclude_sorted, include_sorted)?
+        {
+            return Ok(Some(total));
+        }
+    }
+
     // All children must be SubjectCountScan for the streaming N-way merge.
     let mut iters: Vec<SubjectGroups<'_>> = Vec::with_capacity(children.len());
     for child in children {
@@ -704,6 +825,189 @@ fn sum_star_join(
     Ok(Some(total.min(u64::MAX as u128) as u64))
 }
 
+/// Asymmetric (leapfrog) seek strategy for an inner subject-star count join.
+///
+/// Returns `Ok(None)` to defer to the symmetric merge when: fewer than two
+/// children, a child is not a plain `SubjectCountScan`, a predicate is absent, or
+/// the driver is not small enough to beat a full scan. Otherwise computes
+/// `Σ_s driver_count(s) × Π_probe count_probe(s)` over the (ascending) driver
+/// subjects that pass the exclude/include filters and exist in every probe —
+/// driving from the smallest predicate and seeking into the others.
+///
+/// BASE index only: the caller must ensure `!ec.overlay`.
+fn try_sum_star_join_seek(
+    children: &[StreamNode],
+    ec: &ExecCtx<'_, '_>,
+    exclude_sorted: Option<&[u64]>,
+    include_sorted: Option<&[u64]>,
+) -> Result<Option<u64>> {
+    if children.len() < 2 {
+        return Ok(None);
+    }
+
+    // Resolve each child to (p_id, row_count). Bail to the merge if any child is
+    // not a plain SubjectCountScan or its predicate is absent — the merge path
+    // already handles those cases correctly.
+    let mut child_pids: Vec<u32> = Vec::with_capacity(children.len());
+    let mut child_rows: Vec<u64> = Vec::with_capacity(children.len());
+    for child in children {
+        let StreamNode::SubjectCountScan { pred } = child else {
+            return Ok(None);
+        };
+        let sid = normalize_pred_sid(ec.store, pred)?;
+        let Some(p_id) = ec.store.sid_to_p_id(&sid) else {
+            return Ok(None);
+        };
+        child_pids.push(p_id);
+        child_rows.push(count_rows_for_predicate_psot(ec.store, ec.g_id, p_id)?);
+    }
+
+    // Driver = smallest by row count; probes = the rest.
+    let driver_idx = child_rows
+        .iter()
+        .enumerate()
+        .min_by_key(|(_, r)| **r)
+        .map(|(i, _)| i)
+        .expect("children non-empty");
+    let driver_rows = child_rows[driver_idx];
+    let max_probe_rows = child_rows
+        .iter()
+        .enumerate()
+        .filter(|(i, _)| *i != driver_idx)
+        .map(|(_, r)| *r)
+        .max()
+        .unwrap_or(0);
+
+    // Only seek when the driver is much smaller than the largest probe; otherwise
+    // a full symmetric scan is competitive (or cheaper) — defer to the merge.
+    if driver_rows.saturating_mul(SEEK_STAR_DRIVER_FACTOR) >= max_probe_rows {
+        return Ok(None);
+    }
+    if driver_rows == 0 {
+        // Empty driver => empty inner join.
+        return Ok(Some(0));
+    }
+
+    // Driver subject→count groups (ascending; Meta lane since `!ec.overlay`), and
+    // one forward-only seek cursor per probe predicate.
+    let StreamNode::SubjectCountScan { pred: driver_pred } = &children[driver_idx] else {
+        return Ok(None);
+    };
+    let Some(mut driver) = subject_groups(ec, driver_pred)? else {
+        return Ok(None);
+    };
+    let mut probes: Vec<PsotSubjectSeek<'_>> = child_pids
+        .iter()
+        .enumerate()
+        .filter(|(i, _)| *i != driver_idx)
+        .map(|(_, &p_id)| PsotSubjectSeek::new(ec.store, ec.g_id, p_id))
+        .collect();
+
+    let mut excl_idx: usize = 0;
+    let mut incl_idx: usize = 0;
+    let mut total: u128 = 0;
+
+    while let Some((s, driver_count)) = driver.next_group()? {
+        if is_excluded(s, exclude_sorted, &mut excl_idx)
+            || !is_included(s, include_sorted, &mut incl_idx)
+        {
+            continue;
+        }
+        let mut product: u128 = driver_count as u128;
+        for probe in &mut probes {
+            match probe.count_for_subject(s)? {
+                Some(c) => product = product.saturating_mul(c as u128),
+                None => {
+                    // Subject absent from this probe => not in the inner join.
+                    product = 0;
+                    break;
+                }
+            }
+        }
+        total = total.saturating_add(product);
+    }
+
+    Ok(Some(total.min(u64::MAX as u128) as u64))
+}
+
+/// Asymmetric seek strategy for `?s A ?o1 OPTIONAL { ?s B ?o2 }` COUNT(*):
+///
+/// `Σ_s count_A(s) × max(1, count_B(s))` = `total(A) + Σ_{s ∈ A ∩ B} count_A(s)·(count_B(s) − 1)`.
+///
+/// Drives from the smaller of required-A / optional-B and seeks the other. When B
+/// is the smaller side, `total(A)` is a directory sum and only the (few) B subjects
+/// seek into A — avoiding a full scan of the large required side. Returns `Ok(None)`
+/// to defer to the streaming merge for any other shape (multi-predicate required,
+/// multiple/multi-triple optional groups) or when the sides are not skewed enough.
+/// BASE index only: caller ensures `!ec.overlay` and no active exclude/include.
+fn try_optional_seek(
+    required: &StreamNode,
+    optional_groups: &[Vec<StreamNode>],
+    ec: &ExecCtx<'_, '_>,
+) -> Result<Option<u64>> {
+    let StreamNode::SubjectCountScan { pred: pred_a } = required else {
+        return Ok(None);
+    };
+    if optional_groups.len() != 1 || optional_groups[0].len() != 1 {
+        return Ok(None);
+    }
+    let StreamNode::SubjectCountScan { pred: pred_b } = &optional_groups[0][0] else {
+        return Ok(None);
+    };
+
+    let sid_a = normalize_pred_sid(ec.store, pred_a)?;
+    let Some(p_a) = ec.store.sid_to_p_id(&sid_a) else {
+        // Required absent => no rows.
+        return Ok(Some(0));
+    };
+    let rows_a = count_rows_for_predicate_psot(ec.store, ec.g_id, p_a)?;
+    let sid_b = normalize_pred_sid(ec.store, pred_b)?;
+    let Some(p_b) = ec.store.sid_to_p_id(&sid_b) else {
+        // Optional absent => every required row contributes factor 1 => total(A).
+        return Ok(Some(rows_a));
+    };
+    let rows_b = count_rows_for_predicate_psot(ec.store, ec.g_id, p_b)?;
+
+    let (min_rows, max_rows) = (rows_a.min(rows_b), rows_a.max(rows_b));
+    if min_rows.saturating_mul(SEEK_STAR_DRIVER_FACTOR) >= max_rows {
+        return Ok(None);
+    }
+
+    let total: u128 = if rows_a <= rows_b {
+        // Drive required A (smaller): Σ count_A(s) × max(1, count_B(s)).
+        let Some(mut a_groups) = subject_groups(ec, pred_a)? else {
+            return Ok(None);
+        };
+        let mut b_seek = PsotSubjectSeek::new(ec.store, ec.g_id, p_b);
+        let mut acc: u128 = 0;
+        while let Some((s, count_a)) = a_groups.next_group()? {
+            let mult = b_seek.count_for_subject(s)?.unwrap_or(0).max(1);
+            acc = acc.saturating_add((count_a as u128).saturating_mul(mult as u128));
+        }
+        acc
+    } else {
+        // Drive optional B (smaller): total(A) + Σ_{s ∈ B} count_A(s)·(count_B(s) − 1).
+        let Some(mut b_groups) = subject_groups(ec, pred_b)? else {
+            return Ok(None);
+        };
+        let mut a_seek = PsotSubjectSeek::new(ec.store, ec.g_id, p_a);
+        let mut bonus: u128 = 0;
+        while let Some((s, count_b)) = b_groups.next_group()? {
+            // count_B == 1 yields no bonus; skip the seek (targets stay ascending).
+            if count_b <= 1 {
+                continue;
+            }
+            if let Some(count_a) = a_seek.count_for_subject(s)? {
+                bonus = bonus
+                    .saturating_add((count_a as u128).saturating_mul((count_b - 1) as u128));
+            }
+        }
+        (rows_a as u128).saturating_add(bonus)
+    };
+
+    Ok(Some(total.min(u64::MAX as u128) as u64))
+}
+
 /// Fully streaming merge-join with OPTIONAL semantics.
 ///
 /// Interleaves optional group cursor advancement with the required N-way merge,
@@ -718,6 +1022,15 @@ fn sum_optional_join(
     exclude_sorted: Option<&[u64]>,
     include_sorted: Option<&[u64]>,
 ) -> Result<Option<u64>> {
+    // Asymmetric seek (HEAD, outermost modifier only): for the single-required +
+    // single-optional-predicate shape, drive from the smaller side and seek the
+    // other instead of scanning both in full.
+    if !ec.overlay && exclude_sorted.is_none() && include_sorted.is_none() {
+        if let Some(n) = try_optional_seek(required, optional_groups, ec)? {
+            return Ok(Some(n));
+        }
+    }
+
     // Collect required iterators (single scan or star join children). An absent
     // required predicate yields an `Empty` stream (no overlay) → no subjects →
     // total 0; absent under overlay bails (`None`).
