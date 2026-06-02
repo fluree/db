@@ -919,6 +919,101 @@ async fn indexed_sum_compare_empty_predicate_matches_general() {
         .await;
 }
 
+/// GATE check: on a regular (non-bulk) index, `lex_sorted_string_ids` is false, so
+/// the rdf:type-star metadata fold is disabled and the join uses the MERGE — which
+/// reads current-state leaflets, not the (incrementally-stale) class-property
+/// stats. ?s rdf:type ?o1 . ?s ex:p ?o2: initially 2*3 + 1 = 7; after retracting
+/// one of ex:a's p values and re-indexing, 2*2 + 1 = 5. (The class-property fold
+/// would wrongly stay 7 here — see bulk_import_rdf_type_star_count_from_class_stats
+/// for the fold path, which only fires on bulk imports where the stats are exact.)
+#[tokio::test]
+async fn indexed_rdf_type_star_count_uses_merge_not_stale_stats() {
+    assert_index_defaults();
+    let fluree = FlureeBuilder::memory()
+        .with_ledger_cache_config(LedgerManagerConfig::default())
+        .build_memory();
+    let ledger_id = "it/indexed-typestar:main";
+    let (local, handle) = start_background_indexer_local(
+        fluree.backend().clone(),
+        Arc::new(fluree.nameservice_mode().clone()),
+        fluree_db_indexer::IndexerConfig::small(),
+    );
+    local
+        .run_until(async move {
+            let index_cfg = IndexConfig {
+                reindex_min_bytes: 0,
+                reindex_max_bytes: 10_000_000,
+            };
+            let ledger1 = fluree
+                .insert_with_opts(
+                    genesis_ledger_for_fluree(&fluree, ledger_id),
+                    &json!({
+                        "@context": { "ex": "http://example.org/ns/" },
+                        "@graph": [
+                            {"@id": "ex:a", "@type": ["ex:C1", "ex:C2"], "ex:p": [1, 2, 3]},
+                            {"@id": "ex:b", "@type": "ex:C1", "ex:p": [4]},
+                            {"@id": "ex:c", "@type": "ex:C2"},
+                            {"@id": "ex:d", "ex:p": [5]}
+                        ]
+                    }),
+                    TxnOpts::default(),
+                    CommitOpts::default(),
+                    &index_cfg,
+                )
+                .await
+                .expect("seed insert")
+                .ledger;
+            let _ = trigger_index_and_wait_outcome(&handle, ledger_id, ledger1.t()).await;
+
+            let q = r"
+                PREFIX ex: <http://example.org/ns/>
+                PREFIX rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#>
+                SELECT (COUNT(*) AS ?count) WHERE { ?s rdf:type ?o1 . ?s ex:p ?o2 }
+            ";
+            let view1 = fluree.db_at_t(ledger_id, ledger1.t()).await.expect("view1");
+            assert_eq!(
+                normalize_rows(
+                    &fluree
+                        .query(&view1, QueryInput::Sparql(q))
+                        .await
+                        .expect("typestar q1")
+                        .to_jsonld(&view1.snapshot)
+                        .expect("to_jsonld")
+                ),
+                normalize_rows(&json!([[7]])),
+                "Σ_C count(C, ex:p) = C1:(3+1) + C2:(3) = 7"
+            );
+
+            // Retract one of ex:a's p values, re-index: 2*2 + 1 = 5.
+            let ledger2 = fluree
+                .update(
+                    ledger1,
+                    &json!({
+                        "@context": { "ex": "http://example.org/ns/" },
+                        "delete": [{"@id": "ex:a", "ex:p": 1}]
+                    }),
+                )
+                .await
+                .expect("delete")
+                .ledger;
+            let _ = trigger_index_and_wait_outcome(&handle, ledger_id, ledger2.t()).await;
+            let view2 = fluree.db_at_t(ledger_id, ledger2.t()).await.expect("view2");
+            assert_eq!(
+                normalize_rows(
+                    &fluree
+                        .query(&view2, QueryInput::Sparql(q))
+                        .await
+                        .expect("typestar q2")
+                        .to_jsonld(&view2.snapshot)
+                        .expect("to_jsonld")
+                ),
+                normalize_rows(&json!([[5]])),
+                "after retracting ex:a ex:p 1: C1:(2+1) + C2:(2) = 5 (current-state, not history)"
+            );
+        })
+        .await;
+}
+
 /// `number-of-predicates` (`COUNT(DISTINCT ?p) WHERE { ?s ?p ?o }`) served from
 /// the per-graph index stats (count of properties with positive current count),
 /// no leaf scan. Asserts the indexed (stats) result equals the memory

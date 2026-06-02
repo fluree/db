@@ -338,3 +338,52 @@ GRAPH <http://example.org/g/hr> {
         "worksAt → Company should be counted once"
     );
 }
+
+// =============================================================================
+// Test 3: rdf:type inner-star COUNT(*) served from per-(class,property) stats
+// =============================================================================
+
+/// Bulk import sets `lex_sorted_string_ids`, which gates the metadata fold for
+/// `?s rdf:type ?o1 . ?s P ?o2` COUNT(*) = Σ_C Σ_dt classStat[C][P].count.
+/// ex:a types {C1,C2} p={1,2,3} => 2*3=6 ; ex:b type {C1} p={4} => 1 ;
+/// ex:c type {C2} no p => 0 ; ex:d p={5} no type => 0  => 7.
+#[tokio::test]
+async fn bulk_import_rdf_type_star_count_from_class_stats() {
+    let db_dir = tempfile::tempdir().expect("db tmpdir");
+    let data_dir = tempfile::tempdir().expect("data tmpdir");
+    let ttl = "@prefix ex: <http://example.org/> .\n\
+               @prefix rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#> .\n\
+               ex:a a ex:C1, ex:C2 ; ex:p 1, 2, 3 .\n\
+               ex:b a ex:C1 ; ex:p 4 .\n\
+               ex:c a ex:C2 .\n\
+               ex:d ex:p 5 .\n";
+    let ttl_path = write_file(data_dir.path(), "typestar.ttl", ttl);
+
+    let fluree = FlureeBuilder::file(db_dir.path().to_string_lossy().to_string())
+        .build()
+        .expect("build fluree");
+    fluree
+        .create("test/typestar:main")
+        .import(&ttl_path)
+        .threads(1)
+        .memory_budget_mb(256)
+        .collect_id_stats(true)
+        .cleanup(false)
+        .execute()
+        .await
+        .expect("import");
+    let ledger = fluree.ledger("test/typestar:main").await.expect("load");
+
+    let q = "PREFIX ex: <http://example.org/>\n\
+             PREFIX rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#>\n\
+             SELECT (COUNT(*) AS ?count) WHERE { ?s rdf:type ?o1 . ?s ex:p ?o2 }";
+    let result = support::query_sparql(&fluree, &ledger, q)
+        .await
+        .expect("typestar query");
+    let jsonld = result.to_jsonld(&ledger.snapshot).expect("to_jsonld");
+    assert_eq!(
+        support::normalize_rows(&jsonld),
+        support::normalize_rows(&serde_json::json!([[7]])),
+        "Σ_C count(C, ex:p) = C1:(3+1) + C2:(3) = 7"
+    );
+}
