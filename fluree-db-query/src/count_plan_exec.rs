@@ -1826,22 +1826,18 @@ fn try_modifier_intersect_overlay_parallel(
 /// `Σ_{s typed} count_rdftype(s)·count_P(s)` — exactly the join's product-sum.
 /// Reads the per-graph class stats straight from the snapshot (no index scan).
 ///
-/// CORRECTNESS GATE: the per-(class,property) counts are current-state-exact only
-/// for a pure bulk import (full build). The incremental build path drops a
-/// retraction-only class delta (a known limitation: `subject_props` presence is
-/// assert-only, so the class merge never revisits the class to apply the
-/// `class_prop_dts` decrement). Bulk import is the only path that sets
-/// `lex_sorted_string_ids`, and any incremental refresh clears it — so it is a
-/// reliable proxy for "class stats untouched by incremental drift". When false we
-/// defer to the merge, which is always correct.
+/// The per-(class,property) DATATYPE counts this fold sums are current-state-exact
+/// on BOTH the bulk-import and incremental paths: the incremental class-stat merge
+/// applies retraction and re-type deltas via base-vs-net attribution plus a
+/// base-index re-scan of re-typed subjects (issue #1266). So the fold runs for any
+/// index, not just bulk imports — there is no longer a `lex_sorted_string_ids`
+/// gate here. (Ref-class edge counts are not consumed by this fold.)
 ///
-/// Returns `Ok(None)` to defer to the merge when: not a bulk-import index, the
-/// shape isn't exactly one rdf:type leg plus one non-type leg, the graph class
-/// stats are absent, or the fold is 0 (a genuinely-empty join — the merge handles
-/// it).
+/// Returns `Ok(None)` to defer to the merge when: the shape isn't exactly one
+/// rdf:type leg plus one non-type leg, the graph class stats are absent, or the
+/// fold is 0 (a genuinely-empty join — the merge handles it).
 fn try_type_star_pred_fold(children: &[StreamNode], ec: &ExecCtx<'_, '_>) -> Result<Option<u64>> {
-    // Only trust the class-property stats when the index is a pure bulk import.
-    if !ec.store.lex_sorted_string_ids() || children.len() != 2 {
+    if children.len() != 2 {
         return Ok(None);
     }
     let mut sids = Vec::with_capacity(2);
@@ -1900,9 +1896,10 @@ fn sum_star_join(
     include_sorted: Option<&[u64]>,
 ) -> Result<Option<u64>> {
     // rdf:type inner-star (?s rdf:type ?o1 . ?s P ?o2) COUNT(*): answer from the
-    // per-(class,property) flake counts in the index stats — zero scan, instant.
-    // Only fires for bulk-import indexes (where the class stats are exact); any
-    // incremental refresh defers to the merge below.
+    // per-(class,property) datatype counts in the index stats — zero scan, instant.
+    // The counts are current-state-exact on both bulk-import and incremental
+    // indexes (issue #1266), so this runs for any base-index read; overlay reads
+    // still defer to the merge below.
     if !ec.overlay && exclude_sorted.is_none() && include_sorted.is_none() {
         if let Some(total) = try_type_star_pred_fold(children, ec)? {
             return Ok(Some(total));

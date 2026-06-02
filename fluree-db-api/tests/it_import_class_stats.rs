@@ -343,8 +343,9 @@ GRAPH <http://example.org/g/hr> {
 // Test 3: rdf:type inner-star COUNT(*) served from per-(class,property) stats
 // =============================================================================
 
-/// Bulk import sets `lex_sorted_string_ids`, which gates the metadata fold for
-/// `?s rdf:type ?o1 . ?s P ?o2` COUNT(*) = Σ_C Σ_dt classStat[C][P].count.
+/// The rdf:type-star metadata fold serves `?s rdf:type ?o1 . ?s P ?o2` COUNT(*) =
+/// Σ_C Σ_dt classStat[C][P].count directly from the per-(class,property) datatype
+/// stats (no scan). Bulk import produces exact stats here.
 /// ex:a types {C1,C2} p={1,2,3} => 2*3=6 ; ex:b type {C1} p={4} => 1 ;
 /// ex:c type {C2} no p => 0 ; ex:d p={5} no type => 0  => 7.
 #[tokio::test]

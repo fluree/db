@@ -919,15 +919,16 @@ async fn indexed_sum_compare_empty_predicate_matches_general() {
         .await;
 }
 
-/// GATE check: on a regular (non-bulk) index, `lex_sorted_string_ids` is false, so
-/// the rdf:type-star metadata fold is disabled and the join uses the MERGE — which
-/// reads current-state leaflets, not the (incrementally-stale) class-property
-/// stats. ?s rdf:type ?o1 . ?s ex:p ?o2: initially 2*3 + 1 = 7; after retracting
-/// one of ex:a's p values and re-indexing, 2*2 + 1 = 5. (The class-property fold
-/// would wrongly stay 7 here — see bulk_import_rdf_type_star_count_from_class_stats
-/// for the fold path, which only fires on bulk imports where the stats are exact.)
+/// Regression guard for issue #1266: the rdf:type-star metadata fold
+/// (`Σ_C Σ_dt classStat[C][ex:p].datatypes`) must stay current-state-exact after
+/// an INCREMENTAL retraction. `?s rdf:type ?o1 . ?s ex:p ?o2`: initially
+/// 2*3 + 1 = 7; after retracting one of ex:a's p values and re-indexing,
+/// 2*2 + 1 = 5. Before the fix the incremental class-property stats stayed stale
+/// (the fold was gated off via `lex_sorted_string_ids` to avoid serving the wrong
+/// count); now the incremental merge decrements correctly, so the fold runs on
+/// this incremental index and still returns 5.
 #[tokio::test]
-async fn indexed_rdf_type_star_count_uses_merge_not_stale_stats() {
+async fn indexed_rdf_type_star_count_exact_after_incremental_retraction() {
     assert_index_defaults();
     let fluree = FlureeBuilder::memory()
         .with_ledger_cache_config(LedgerManagerConfig::default())

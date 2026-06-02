@@ -217,6 +217,109 @@ pub fn batched_lookup_predicate_refs(
     Ok(out)
 }
 
+/// Per-subject live property flakes from a base-index scan: each subject's
+/// sid64 maps to a list of `(p_id, o_type, o_key)` for its current assertions.
+pub type SubjectPropertyFlakes = HashMap<u64, Vec<(u32, u16, u64)>>;
+
+/// Batched SPOT lookup of all live property flakes for a set of subjects from
+/// the persisted index at `to_t`.
+///
+/// Returns the current (non-history) property assertions for each requested
+/// subject. No overlay/novelty merge; the caller applies novelty deltas
+/// separately.
+///
+/// Used by the incremental class-stat merge to re-attribute the existing
+/// properties of a subject whose class membership changed this batch (re-type,
+/// add/remove a type, or delete) from the classes it left onto the classes it
+/// joined (issue #1266). Mirrors [`batched_lookup_predicate_refs`] but scans
+/// SPOT (subject-major) across all predicates instead of one PSOT predicate.
+pub fn batched_lookup_subject_properties(
+    store: &Arc<BinaryIndexStore>,
+    g_id: GraphId,
+    subjects: &[u64],
+    to_t: i64,
+) -> io::Result<SubjectPropertyFlakes> {
+    let mut out: HashMap<u64, Vec<(u32, u16, u64)>> = HashMap::new();
+    if subjects.is_empty() {
+        return Ok(out);
+    }
+
+    let mut sorted_subjects = subjects.to_vec();
+    sorted_subjects.sort_unstable();
+    sorted_subjects.dedup();
+    let s_id_set: HashSet<u64> = sorted_subjects.iter().copied().collect();
+
+    let Some(branch) = store.branch_for_order(g_id, RunSortOrder::Spot) else {
+        return Ok(out);
+    };
+    let branch = Arc::clone(branch);
+
+    const MAX_SPAN: u64 = 100_000;
+    const MAX_CHUNK: usize = 1000;
+    let chunks = chunk_subjects(&sorted_subjects, MAX_SPAN, MAX_CHUNK);
+
+    // Need s_id (to filter), p_id, o_type, o_key (to reconstruct datatype/lang/ref).
+    let mut needed = ColumnSet::EMPTY;
+    needed.insert(ColumnId::SId);
+    needed.insert(ColumnId::PId);
+    needed.insert(ColumnId::OType);
+    needed.insert(ColumnId::OKey);
+    let projection = ColumnProjection {
+        output: needed,
+        internal: ColumnSet::EMPTY,
+    };
+
+    for chunk in &chunks {
+        let min_s = chunk[0];
+        let max_s = *chunk.last().unwrap();
+
+        let min_key = RunRecordV2 {
+            s_id: SubjectId::from_u64(min_s),
+            o_key: 0,
+            p_id: 0,
+            t: 0,
+            o_i: 0,
+            o_type: 0,
+            g_id,
+        };
+        let max_key = RunRecordV2 {
+            s_id: SubjectId::from_u64(max_s),
+            o_key: u64::MAX,
+            p_id: u32::MAX,
+            t: 0,
+            o_i: u32::MAX,
+            o_type: u16::MAX,
+            g_id,
+        };
+
+        let mut cursor = BinaryCursor::new(
+            Arc::clone(store),
+            RunSortOrder::Spot,
+            Arc::clone(&branch),
+            &min_key,
+            &max_key,
+            BinaryFilter::default(),
+            projection,
+        );
+        cursor.set_to_t(to_t);
+
+        while let Some(batch) = cursor.next_batch()? {
+            for i in 0..batch.row_count {
+                let s_id = batch.s_id.get(i);
+                if !s_id_set.contains(&s_id) {
+                    continue;
+                }
+                let p_id = batch.p_id.get_or(i, 0);
+                let o_type = batch.o_type.get_or(i, 0);
+                let o_key = batch.o_key.get(i);
+                out.entry(s_id).or_default().push((p_id, o_type, o_key));
+            }
+        }
+    }
+
+    Ok(out)
+}
+
 /// Break sorted subjects into chunks where each chunk spans at most
 /// `max_span` IDs and contains at most `max_chunk` subjects.
 fn chunk_subjects(sorted: &[u64], max_span: u64, max_chunk: usize) -> Vec<&[u64]> {
