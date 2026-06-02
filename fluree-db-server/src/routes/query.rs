@@ -149,13 +149,41 @@ fn has_policy_opts(query_json: &JsonValue) -> bool {
         || opts.get("policy").is_some()
 }
 
+/// Extract a representative ledger identifier from a `from` / `fromNamed`
+/// value of any supported shape.
+///
+/// Shapes handled (see `requires_dataset_features` and `parse_dataset_spec`):
+/// - string: `"ledger:main"` (optionally with an `@t:` / `#graph` suffix)
+/// - array: `["a:main", "b:main"]` or `[{"@id": "a"}, ...]` — first element
+/// - object `from`: `{"@id": "ledger:main@t:5", ...}` — the `@id`
+/// - object `fromNamed`: `{"alias": <source>, ...}` — first map value
+///
+/// Returns the first concrete ledger string found, or `None` if the value
+/// carries no resolvable identifier. This is used only to pick a ledger for
+/// auth scoping and span recording; the full multi-graph dataset is resolved
+/// later by `parse_dataset_spec` in the dataset execution path.
+fn first_ledger_identifier(value: &JsonValue) -> Option<String> {
+    match value {
+        JsonValue::String(s) => Some(s.clone()),
+        JsonValue::Array(items) => items.iter().find_map(first_ledger_identifier),
+        JsonValue::Object(map) => map
+            .get("@id")
+            .and_then(JsonValue::as_str)
+            .map(str::to_string)
+            // `fromNamed` map form: { alias -> source }. No `@id`, so fall
+            // back to the first source value that yields an identifier.
+            .or_else(|| map.values().find_map(first_ledger_identifier)),
+        _ => None,
+    }
+}
+
 /// Helper to extract ledger ID from request (for JSON-LD queries)
 fn get_ledger_id(
     path_ledger: Option<&str>,
     headers: &FlureeHeaders,
     body: &JsonValue,
 ) -> Result<String> {
-    // Priority: path > header > body.from
+    // Priority: path > header > body.from > body.fromNamed
     if let Some(ledger) = path_ledger {
         return Ok(ledger.to_string());
     }
@@ -164,8 +192,25 @@ fn get_ledger_id(
         return Ok(ledger.clone());
     }
 
-    if let Some(from) = body.get("from").and_then(|v| v.as_str()) {
-        return Ok(from.to_string());
+    // Accept every `from` shape the engine supports — string, array of
+    // sources (multi-default-graph union), or structured object (time travel
+    // / graph fragment). Earlier this only matched a bare string, so array /
+    // object `from` (and `fromNamed`-only) queries were rejected with
+    // `MissingLedger` before the dataset path could run (issue #1259).
+    //
+    // The extracted id is used only for the conservative bearer scope check
+    // and span recording; per-ledger policy and routing are applied later in
+    // `execute_dataset_query` via `parse_dataset_spec`, which sees the full
+    // dataset spec. Strip any `@t:` / `#graph` suffix so auth scopes to the
+    // base ledger.
+    let from_id = body.get("from").and_then(first_ledger_identifier);
+    let named_id = || {
+        body.get("fromNamed")
+            .or_else(|| body.get("from-named"))
+            .and_then(first_ledger_identifier)
+    };
+    if let Some(raw) = from_id.or_else(named_id) {
+        return base_ledger_id(&raw);
     }
 
     Err(ServerError::MissingLedger)

@@ -893,6 +893,18 @@ Accept: application/sparql-results+json
 }
 ```
 
+**Multi-ledger / dataset queries:** The connection-scoped `/query` route (no
+`{ledger}` in the path) accepts the full dataset `from` surface, not just a
+single ledger string:
+
+- `"from": ["a:main", "b:main"]` — union the listed ledgers as the default graph.
+- `"from": { "@id": "a:main@t:5" }` — a single source with time-travel / graph selectors.
+- `"fromNamed": { "alias": { "@id": "b:main" } }` — named graphs addressed by a
+  GRAPH pattern in the `where` (a query may use `fromNamed` with no `from`).
+
+The query is authorized against the first resolvable source for the bearer
+scope; per-ledger policy is then applied to each source during execution.
+
 **Request Body (SPARQL):**
 
 ```sparql
