@@ -899,13 +899,17 @@ impl<'a> FromQueryBuilder<'a> {
                 .await?;
             let ast = crate::query::helpers::parse_and_validate_sparql(sparql)?;
             let spec = crate::query::helpers::extract_sparql_dataset_spec(&ast)?;
-            return if let Some(alias) = spec.default_graphs.first() {
+            return if let Some(alias) = spec
+                .default_graphs
+                .first()
+                .or_else(|| spec.named_graphs.first())
+            {
                 let view = self.fluree.db(alias.identifier.as_str()).await?;
                 Ok(result
                     .format_async(view.as_graph_db_ref(), &format_config)
                     .await?)
             } else {
-                Err(ApiError::query("No default graph for formatting"))
+                Err(ApiError::query("No graph specified for formatting"))
             };
         }
         match input {
@@ -942,13 +946,17 @@ impl<'a> FromQueryBuilder<'a> {
                     },
                 };
                 let (spec, _) = parse_dataset_spec(json)?;
-                if let Some(alias) = spec.default_graphs.first() {
+                if let Some(alias) = spec
+                    .default_graphs
+                    .first()
+                    .or_else(|| spec.named_graphs.first())
+                {
                     let view = self.fluree.db(alias.identifier.as_str()).await?;
                     Ok(result
                         .format_async(view.as_graph_db_ref(), &format_config)
                         .await?)
                 } else {
-                    Err(ApiError::query("No default graph for formatting"))
+                    Err(ApiError::query("No graph specified for formatting"))
                 }
             }
             QueryInput::Sparql(sparql) => {
@@ -985,13 +993,17 @@ impl<'a> FromQueryBuilder<'a> {
                 };
                 let ast = crate::query::helpers::parse_and_validate_sparql(sparql)?;
                 let spec = crate::query::helpers::extract_sparql_dataset_spec(&ast)?;
-                if let Some(alias) = spec.default_graphs.first() {
+                if let Some(alias) = spec
+                    .default_graphs
+                    .first()
+                    .or_else(|| spec.named_graphs.first())
+                {
                     let view = self.fluree.db(alias.identifier.as_str()).await?;
                     Ok(result
                         .format_async(view.as_graph_db_ref(), &format_config)
                         .await?)
                 } else {
-                    Err(ApiError::query("No default graph for formatting"))
+                    Err(ApiError::query("No graph specified for formatting"))
                 }
             }
         }
@@ -1025,7 +1037,11 @@ impl<'a> FromQueryBuilder<'a> {
                 .await?;
             let ast = crate::query::helpers::parse_and_validate_sparql(sparql)?;
             let spec = crate::query::helpers::extract_sparql_dataset_spec(&ast)?;
-            return if let Some(alias) = spec.default_graphs.first() {
+            return if let Some(alias) = spec
+                .default_graphs
+                .first()
+                .or_else(|| spec.named_graphs.first())
+            {
                 let view = self.fluree.db(alias.identifier.as_str()).await?;
                 crate::format::format_results_string_async(
                     &result,
@@ -1037,7 +1053,7 @@ impl<'a> FromQueryBuilder<'a> {
                 .await
                 .map_err(ApiError::from)
             } else {
-                Err(ApiError::query("No default graph for formatting"))
+                Err(ApiError::query("No graph specified for formatting"))
             };
         }
         match input {
@@ -1074,7 +1090,11 @@ impl<'a> FromQueryBuilder<'a> {
                     },
                 };
                 let (spec, _) = parse_dataset_spec(json)?;
-                if let Some(alias) = spec.default_graphs.first() {
+                if let Some(alias) = spec
+                    .default_graphs
+                    .first()
+                    .or_else(|| spec.named_graphs.first())
+                {
                     let view = self.fluree.db(alias.identifier.as_str()).await?;
                     crate::format::format_results_string_async(
                         &result,
@@ -1086,7 +1106,7 @@ impl<'a> FromQueryBuilder<'a> {
                     .await
                     .map_err(ApiError::from)
                 } else {
-                    Err(ApiError::query("No default graph for formatting"))
+                    Err(ApiError::query("No graph specified for formatting"))
                 }
             }
             QueryInput::Sparql(sparql) => {
@@ -1123,7 +1143,11 @@ impl<'a> FromQueryBuilder<'a> {
                 };
                 let ast = crate::query::helpers::parse_and_validate_sparql(sparql)?;
                 let spec = crate::query::helpers::extract_sparql_dataset_spec(&ast)?;
-                if let Some(alias) = spec.default_graphs.first() {
+                if let Some(alias) = spec
+                    .default_graphs
+                    .first()
+                    .or_else(|| spec.named_graphs.first())
+                {
                     let view = self.fluree.db(alias.identifier.as_str()).await?;
                     crate::format::format_results_string_async(
                         &result,
@@ -1135,7 +1159,7 @@ impl<'a> FromQueryBuilder<'a> {
                     .await
                     .map_err(ApiError::from)
                 } else {
-                    Err(ApiError::query("No default graph for formatting"))
+                    Err(ApiError::query("No graph specified for formatting"))
                 }
             }
         }

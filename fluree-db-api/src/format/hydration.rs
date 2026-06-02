@@ -61,15 +61,21 @@ use serde_json::{json, Value as JsonValue};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
 
-/// Cache key: (Sid, local_spec_hash, depth_remaining)
+/// Cache key: `(Sid, local_spec_hash, depth_remaining, root_canonical_iri)`.
 ///
-/// The local_spec_hash is computed from the current `NestedSelectSpec`,
+/// The `local_spec_hash` is computed from the current `NestedSelectSpec`,
 /// NOT any top-level spec. This serves two purposes:
 /// - Different nested hydrations of the same Sid produce different entries.
 /// - Multiple top-level hydration columns share entries when they land on
 ///   the same Sid with structurally identical levels, and stay separated
 ///   when their levels differ.
-type CacheKey = (Sid, u64, usize);
+///
+/// The trailing `Option<Arc<str>>` is the root subject's canonical IRI (present
+/// only for multi-ledger `IriMatch` roots). It participates in the key because
+/// two different ledgers can mint the same `(namespace_code, name)` SID for
+/// *different* IRIs — without it, a cross-ledger query could serve one ledger's
+/// rendering for another ledger's subject (issue #1259).
+type CacheKey = (Sid, u64, usize, Option<Arc<str>>);
 
 /// Depth bookkeeping for one hydration call.
 ///
@@ -232,7 +238,16 @@ fn hash_reverse<H: std::hash::Hasher>(
     }
 }
 
-/// Resolve a hydration root variable's binding into a `Sid` for a single row.
+/// Resolve a hydration root variable's binding into a `Sid` plus its canonical
+/// IRI (when known) for a single row.
+///
+/// The optional `Arc<str>` is the canonical IRI carried by a multi-ledger
+/// `Binding::IriMatch`. It MUST be preferred over decoding the returned SID
+/// against the formatter's single-snapshot namespace dict: the SID is encoded
+/// in its *originating* ledger, which may differ from the ledger backing the
+/// formatter, so decoding it here would silently produce the wrong IRI
+/// (issue #1259). Single-ledger bindings (`Binding::Sid`) carry no canonical
+/// IRI and are decoded normally.
 ///
 /// Returns `Ok(None)` when the binding is unbound, poisoned, missing, or not
 /// subject-shaped (literals, IRIs that didn't match a known subject, etc.).
@@ -240,18 +255,22 @@ fn hash_reverse<H: std::hash::Hasher>(
 fn resolve_root_sid_from_binding(
     result: &QueryResult,
     binding: Option<&Binding>,
-) -> Result<Option<Sid>> {
+) -> Result<Option<(Sid, Option<Arc<str>>)>> {
     match binding {
         Some(b) if b.is_encoded() => {
             let materialized = super::materialize::materialize_binding(result, b)?;
             Ok(match materialized {
-                Binding::Sid { sid, .. } => Some(sid),
-                Binding::IriMatch { primary_sid, .. } => Some(primary_sid),
+                Binding::Sid { sid, .. } => Some((sid, None)),
+                Binding::IriMatch {
+                    primary_sid, iri, ..
+                } => Some((primary_sid, Some(iri))),
                 _ => None,
             })
         }
-        Some(Binding::Sid { sid, .. }) => Ok(Some(sid.clone())),
-        Some(Binding::IriMatch { primary_sid, .. }) => Ok(Some(primary_sid.clone())),
+        Some(Binding::Sid { sid, .. }) => Ok(Some((sid.clone(), None))),
+        Some(Binding::IriMatch {
+            primary_sid, iri, ..
+        }) => Ok(Some((primary_sid.clone(), Some(iri.clone())))),
         Some(Binding::Unbound | Binding::Poisoned) | None => Ok(None),
         Some(
             Binding::Lit { .. }
@@ -278,14 +297,19 @@ async fn format_hydration_column(
     row_idx: usize,
     cache: &mut HashMap<CacheKey, JsonValue>,
 ) -> Result<JsonValue> {
-    let root_sid: Sid = match &spec.root {
-        Root::Sid(sid) => sid.clone(),
+    // `root_iri` is the canonical IRI when the root came from a multi-ledger
+    // `IriMatch` binding; it lets `format_subject` emit the root `@id` from the
+    // ledger-correct IRI instead of decoding a foreign SID against the
+    // formatter's single-snapshot dict (issue #1259).
+    let (root_sid, root_iri): (Sid, Option<Arc<str>>) = match &spec.root {
+        Root::Sid(sid) => (sid.clone(), None),
         Root::Var(var_id) => {
-            let Some(sid) = resolve_root_sid_from_binding(result, batch.get(row_idx, *var_id))?
+            let Some(resolved) =
+                resolve_root_sid_from_binding(result, batch.get(row_idx, *var_id))?
             else {
                 return Ok(JsonValue::Null);
             };
-            sid
+            resolved
         }
     };
 
@@ -293,6 +317,7 @@ async fn format_hydration_column(
     formatter
         .format_subject(
             &root_sid,
+            root_iri,
             &spec.level,
             DepthBudget::root(spec.depth),
             &mut visited,
@@ -455,22 +480,43 @@ impl<'a> HydrationFormatter<'a> {
     fn format_subject<'b>(
         &'b self,
         sid: &'b Sid,
+        root_iri: Option<Arc<str>>,
         level: &'b NestedSelectSpec,
         depth: DepthBudget,
         visited: &'b mut HashSet<Sid>,
         cache: &'b mut HashMap<CacheKey, JsonValue>,
     ) -> BoxFuture<'b, Result<JsonValue>> {
         async move {
-            let cache_key = (sid.clone(), compute_level_hash(level), depth.remaining());
+            let cache_key = (
+                sid.clone(),
+                compute_level_hash(level),
+                depth.remaining(),
+                root_iri.clone(),
+            );
 
             // Check cache first (same Sid + spec + depth = same result)
             if let Some(cached) = cache.get(&cache_key) {
                 return Ok(cached.clone());
             }
 
+            // The `@id` of THIS subject: prefer the canonical IRI from a
+            // multi-ledger `IriMatch` root over decoding the SID against this
+            // formatter's single-snapshot dict, which would mis-decode a SID
+            // that originated in a different ledger (issue #1259). `compact_iri`
+            // is a pure context operation, independent of the namespace dict.
+            // `root_iri` is only ever set for the root subject; nested refs
+            // (recursive calls below) pass `None` and decode their SID against
+            // the ledger whose flakes produced them.
+            let id_json = |compactor: &IriCompactor| -> Result<JsonValue> {
+                Ok(json!(match root_iri.as_deref() {
+                    Some(iri) => compactor.compact_iri(iri)?,
+                    None => compactor.compact_sid(sid)?,
+                }))
+            };
+
             // Cycle detection - if already in current path, return just @id
             if !visited.insert(sid.clone()) {
-                return Ok(json!({ "@id": self.compactor.compact_sid(sid)? }));
+                return Ok(json!({ "@id": id_json(self.compactor)? }));
             }
 
             // Build object with sorted keys for determinism (BTreeMap)
@@ -480,7 +526,7 @@ impl<'a> HydrationFormatter<'a> {
             // - Always include for nested hydrations (identity of an expanded ref)
             // - Otherwise include when wildcard or explicit @id selection
             if depth.current > 0 || level.includes_id() {
-                obj.insert("@id".to_string(), json!(self.compactor.compact_sid(sid)?));
+                obj.insert("@id".to_string(), id_json(self.compactor)?);
             }
 
             // Fetch forward properties. For Explicit projections we hand the
@@ -661,6 +707,7 @@ impl<'a> HydrationFormatter<'a> {
                             values.push(
                                 self.format_subject(
                                     ref_sid,
+                                    None,
                                     nested,
                                     depth.descend(),
                                     visited,
@@ -672,6 +719,7 @@ impl<'a> HydrationFormatter<'a> {
                             values.push(
                                 self.format_subject(
                                     ref_sid,
+                                    None,
                                     parent_level,
                                     depth.descend(),
                                     visited,
@@ -717,14 +765,21 @@ impl<'a> HydrationFormatter<'a> {
 
             if let Some(nested) = nested_spec {
                 values.push(
-                    self.format_subject(subject_sid, nested, depth.descend(), visited, cache)
+                    self.format_subject(subject_sid, None, nested, depth.descend(), visited, cache)
                         .await?,
                 );
             } else if depth.can_expand() {
                 // Auto-expand reverse refs with FULL parent level
                 values.push(
-                    self.format_subject(subject_sid, parent_level, depth.descend(), visited, cache)
-                        .await?,
+                    self.format_subject(
+                        subject_sid,
+                        None,
+                        parent_level,
+                        depth.descend(),
+                        visited,
+                        cache,
+                    )
+                    .await?,
                 );
             } else {
                 // No expansion - just @id
@@ -1236,14 +1291,19 @@ mod tests {
         let sid = Sid::new(100, "alice");
         let spec_hash = 12345u64;
 
-        let key1: CacheKey = (sid.clone(), spec_hash, 0);
-        let key2: CacheKey = (sid.clone(), spec_hash, 1);
-        let key3: CacheKey = (sid, spec_hash, 0);
+        let key1: CacheKey = (sid.clone(), spec_hash, 0, None);
+        let key2: CacheKey = (sid.clone(), spec_hash, 1, None);
+        let key3: CacheKey = (sid.clone(), spec_hash, 0, None);
+        // Same SID + spec + depth but a different canonical IRI (cross-ledger
+        // collision) must NOT share a cache entry.
+        let key4: CacheKey = (sid, spec_hash, 0, Some(Arc::from("http://other.example/x")));
 
         // Different depths should produce different keys
         assert_ne!(key1, key2);
         // Same Sid + spec + depth should be equal
         assert_eq!(key1, key3);
+        // Different canonical IRI → different key
+        assert_ne!(key1, key4);
     }
 
     fn explicit(forward: Vec<ForwardItem>) -> NestedSelectSpec {
