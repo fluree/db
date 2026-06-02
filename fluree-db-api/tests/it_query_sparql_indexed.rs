@@ -1192,6 +1192,89 @@ async fn indexed_parallel_star_join_count_matches_serial() {
         .await;
 }
 
+/// Parallel partitioned OPTIONAL COUNT(*): `?s p1 ?o1 OPTIONAL { ?s p2 ?o2 }` =
+/// Σ_s count_p1(s)·max(1, count_p2(s)). Seeds >50k rows (the parallel threshold)
+/// with varying optional multiplicity (incl. subjects with NO p2, factor 1) so the
+/// count is sensitive to any partition-boundary or optional-multiplier bug; the
+/// result must equal the serially-computed expected sum exactly.
+#[tokio::test]
+async fn indexed_parallel_optional_join_count_matches_serial() {
+    assert_index_defaults();
+    let fluree = FlureeBuilder::memory()
+        .with_ledger_cache_config(LedgerManagerConfig::default())
+        .build_memory();
+    let ledger_id = "it/indexed-parallel-optional:main";
+    // Tiny leaflets so the data spans many leaves and the partitioner engages.
+    let mut idx_config = fluree_db_indexer::IndexerConfig::small();
+    idx_config.leaflet_rows = 100;
+    idx_config.leaf_target_bytes = 8_000;
+    idx_config.leaf_max_bytes = 16_000;
+    let (local, handle) = start_background_indexer_local(
+        fluree.backend().clone(),
+        Arc::new(fluree.nameservice_mode().clone()),
+        idx_config,
+    );
+
+    local
+        .run_until(async move {
+            let index_cfg = IndexConfig {
+                reindex_min_bytes: 0,
+                reindex_max_bytes: 80_000_000,
+            };
+            // subject i: required p1 has 2 values; optional p2 has (i%3) values
+            // (0 => no p2 => multiplier 1). total rows ~ 2N + Σ(i%3) ~ 3N;
+            // N=20000 => ~60k > 50k threshold.
+            let n: i64 = 20_000;
+            let mut expected: i64 = 0;
+            let mut nodes: Vec<serde_json::Value> = Vec::with_capacity(n as usize);
+            for i in 0..n {
+                let c2 = i % 3; // 0, 1, or 2 optional values
+                expected += 2 * c2.max(1);
+                let mut node = json!({"@id": format!("ex:s{i}"), "ex:p1": [i * 10, i * 10 + 1]});
+                if c2 > 0 {
+                    let p2: Vec<serde_json::Value> =
+                        (0..c2).map(|j| json!(i * 10 + 5 + j)).collect();
+                    node["ex:p2"] = json!(p2);
+                }
+                nodes.push(node);
+            }
+            let ledger1 = fluree
+                .insert_with_opts(
+                    genesis_ledger_for_fluree(&fluree, ledger_id),
+                    &json!({ "@context": { "ex": "http://example.org/ns/" }, "@graph": nodes }),
+                    TxnOpts::default(),
+                    CommitOpts::default(),
+                    &index_cfg,
+                )
+                .await
+                .expect("seed insert")
+                .ledger;
+            let _ = trigger_index_and_wait_outcome(&handle, ledger_id, ledger1.t()).await;
+            let view = fluree
+                .db_at_t(ledger_id, ledger1.t())
+                .await
+                .expect("load indexed view");
+
+            let q = r"
+                PREFIX ex: <http://example.org/ns/>
+                SELECT (COUNT(*) AS ?count)
+                WHERE { ?s ex:p1 ?o1 OPTIONAL { ?s ex:p2 ?o2 } }
+            ";
+            let jsonld = fluree
+                .query(&view, QueryInput::Sparql(q))
+                .await
+                .expect("parallel optional join query")
+                .to_jsonld(&view.snapshot)
+                .expect("to_jsonld");
+            assert_eq!(
+                normalize_rows(&jsonld),
+                normalize_rows(&json!([[expected]])),
+                "parallel optional count must equal Σ_s count_p1(s)*max(1,count_p2(s)) = {expected}"
+            );
+        })
+        .await;
+}
+
 /// GROUP BY ?object COUNT(?subject) ORDER BY DESC LIMIT via the indexed POST
 /// path (`group_count_v6`, run-length + top-K). A high-multiplicity object's run
 /// (2000 rows) spans multiple leaflets, exercising the boundary-equality /

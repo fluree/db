@@ -801,6 +801,120 @@ fn merge_count_range(
     Ok(total)
 }
 
+/// Per-partition partial for `?s REQ… OPTIONAL { ?s OPT… } …` over `[lo, hi)`:
+/// `Σ_{s ∈ [lo,hi), s in all REQ} req_product(s) × Π_g max(1, Π_i opt_gi(s))`.
+///
+/// `opt_groups` lists each optional group's present predicate ids; an empty group
+/// is `always_one` (multiplier 1 — an absent optional predicate). BASE index only
+/// (no overlay), no exclude/include (the caller gates that).
+fn merge_optional_count_range(
+    store: &BinaryIndexStore,
+    g_id: fluree_db_core::GraphId,
+    req_pids: &[u32],
+    opt_groups: &[Vec<u32>],
+    lo: u64,
+    hi: u64,
+) -> Result<u128> {
+    let mut req_iters: Vec<PsotSubjectCountIter<'_>> = Vec::with_capacity(req_pids.len());
+    for &p in req_pids {
+        req_iters.push(PsotSubjectCountIter::new_bounded(store, g_id, p, lo, hi)?);
+    }
+
+    struct OptG<'a> {
+        always_one: bool,
+        iters: Vec<PsotSubjectCountIter<'a>>,
+        cur: Vec<Option<(u64, u64)>>,
+    }
+    let mut opt: Vec<OptG<'_>> = Vec::with_capacity(opt_groups.len());
+    for grp in opt_groups {
+        if grp.is_empty() {
+            opt.push(OptG {
+                always_one: true,
+                iters: Vec::new(),
+                cur: Vec::new(),
+            });
+            continue;
+        }
+        let mut iters: Vec<PsotSubjectCountIter<'_>> = Vec::with_capacity(grp.len());
+        for &p in grp {
+            iters.push(PsotSubjectCountIter::new_bounded(store, g_id, p, lo, hi)?);
+        }
+        let mut cur: Vec<Option<(u64, u64)>> = Vec::with_capacity(iters.len());
+        for it in &mut iters {
+            cur.push(it.next_group()?);
+        }
+        opt.push(OptG {
+            always_one: false,
+            iters,
+            cur,
+        });
+    }
+
+    let mut req_cur: Vec<Option<(u64, u64)>> = Vec::with_capacity(req_iters.len());
+    for it in &mut req_iters {
+        req_cur.push(it.next_group()?);
+    }
+    let mut total: u128 = 0;
+    loop {
+        if req_cur.iter().any(std::option::Option::is_none) {
+            break;
+        }
+        let max_s = req_cur
+            .iter()
+            .filter_map(|c| c.map(|(s, _)| s))
+            .max()
+            .unwrap();
+        if req_cur.iter().all(|c| c.map(|(s, _)| s) == Some(max_s)) {
+            // Required inner-join product at this subject.
+            let mut product: u128 = req_cur.iter().map(|c| c.unwrap().1 as u128).product();
+            // Multiply each optional group's max(1, Π count) factor (streaming;
+            // cursors lazily catch up to max_s).
+            for g in &mut opt {
+                if g.always_one {
+                    continue;
+                }
+                let mut g_prod: u128 = 1;
+                for i in 0..g.iters.len() {
+                    while let Some((sid2, _)) = g.cur[i] {
+                        if sid2 < max_s {
+                            g.cur[i] = g.iters[i].next_group()?;
+                            continue;
+                        }
+                        break;
+                    }
+                    let c = match g.cur[i] {
+                        Some((sid2, c)) if sid2 == max_s => {
+                            g.cur[i] = g.iters[i].next_group()?;
+                            c
+                        }
+                        _ => 0u64,
+                    };
+                    if c == 0 {
+                        g_prod = 0;
+                        break;
+                    }
+                    g_prod = g_prod.saturating_mul(c as u128);
+                }
+                let mult = if g_prod == 0 { 1u128 } else { g_prod };
+                product = product.saturating_mul(mult);
+            }
+            total = total.saturating_add(product);
+            for (i, it) in req_iters.iter_mut().enumerate() {
+                req_cur[i] = it.next_group()?;
+            }
+        } else {
+            for (i, it) in req_iters.iter_mut().enumerate() {
+                if let Some((s_id, _)) = req_cur[i] {
+                    if s_id < max_s {
+                        req_cur[i] = it.next_group()?;
+                    }
+                }
+            }
+        }
+    }
+    Ok(total)
+}
+
 /// Ascending candidate subject boundaries for partitioning a predicate's scan.
 ///
 /// When the predicate has at least `k` leaves, returns each leaf's first subject
@@ -847,25 +961,26 @@ fn driver_subject_boundaries(
 /// to defer to the serial merge when not applicable (not all `SubjectCountScan`,
 /// a predicate absent, too few rows/leaves, or a single core). BASE index only:
 /// caller ensures `!ec.overlay` and no exclude/include filter.
-fn sum_star_join_parallel(children: &[StreamNode], ec: &ExecCtx<'_, '_>) -> Result<Option<u64>> {
-    if children.len() < 2 {
-        return Ok(None);
-    }
-    let mut p_ids: Vec<u32> = Vec::with_capacity(children.len());
-    let mut total_rows: u64 = 0;
-    for child in children {
-        let StreamNode::SubjectCountScan { pred } = child else {
-            return Ok(None);
-        };
-        let sid = normalize_pred_sid(ec.store, pred)?;
-        let Some(p_id) = ec.store.sid_to_p_id(&sid) else {
-            return Ok(None);
-        };
-        p_ids.push(p_id);
-        total_rows =
-            total_rows.saturating_add(count_rows_for_predicate_psot(ec.store, ec.g_id, p_id)?);
-    }
-
+/// Generic parallel-partitioned count harness.
+///
+/// Partitions the subject space into K contiguous ranges at `driver_p`'s
+/// leaf/leaflet boundaries and runs `reducer(lo, hi)` per range on its own thread,
+/// summing the partials. The reducer computes the per-partition partial count for
+/// whatever per-subject aggregation is being parallelized (inner star, optional,
+/// union, …). Because partition boundaries are subject VALUES and every subject's
+/// rows are contiguous within a predicate, each subject lands in exactly one
+/// partition — the partials sum exactly. Returns `Ok(None)` to defer to the serial
+/// path when there aren't enough rows/leaves/cores to be worth parallelizing.
+/// BASE index only: the caller must ensure `!ec.overlay`.
+fn parallel_partition_count<F>(
+    ec: &ExecCtx<'_, '_>,
+    driver_p: u32,
+    total_rows: u64,
+    reducer: F,
+) -> Result<Option<u64>>
+where
+    F: Fn(u64, u64) -> Result<u128> + Sync,
+{
     let ncpu = std::thread::available_parallelism()
         .map(std::num::NonZeroUsize::get)
         .unwrap_or(1);
@@ -873,17 +988,11 @@ fn sum_star_join_parallel(children: &[StreamNode], ec: &ExecCtx<'_, '_>) -> Resu
         return Ok(None);
     }
 
-    // Partition driver = the predicate with the most leaves (finest boundaries).
-    let driver_p = *p_ids
-        .iter()
-        .max_by_key(|&&p| leaf_entries_for_predicate(ec.store, ec.g_id, RunSortOrder::Psot, p).len())
-        .unwrap();
-
     let k = ncpu.min(PARALLEL_STAR_MAX_PARTITIONS);
     // Candidate ascending subject boundaries from the driver: leaf first-subjects
     // when there are enough leaves (manifest only, no leaf opens — the huge-
     // predicate case), else leaflet first-subjects (opens the few driver leaves,
-    // which the merge scans anyway — the medium single-leaf-many-leaflet case).
+    // which the reducer scans anyway — the medium single-leaf-many-leaflet case).
     let candidates = driver_subject_boundaries(ec.store, ec.g_id, driver_p, k)?;
     if candidates.len() < 2 {
         return Ok(None);
@@ -905,15 +1014,11 @@ fn sum_star_join_parallel(children: &[StreamNode], ec: &ExecCtx<'_, '_>) -> Resu
     tracing::debug!(
         partitions = ranges.len(),
         total_rows,
-        predicates = p_ids.len(),
-        "count-plan: parallel partitioned star-join"
+        "count-plan: parallel partitioned count"
     );
 
-    let store: &BinaryIndexStore = ec.store;
-    let g_id = ec.g_id;
-    let p_ids_ref = &p_ids;
+    let reducer = &reducer;
     let span = tracing::Span::current();
-
     let partials: Vec<Result<u128>> = std::thread::scope(|scope| {
         let handles: Vec<_> = ranges
             .iter()
@@ -921,7 +1026,7 @@ fn sum_star_join_parallel(children: &[StreamNode], ec: &ExecCtx<'_, '_>) -> Resu
                 let span = span.clone();
                 scope.spawn(move || {
                     let _guard = span.enter();
-                    merge_count_range(store, g_id, p_ids_ref, lo, hi)
+                    reducer(lo, hi)
                 })
             })
             .collect();
@@ -929,7 +1034,7 @@ fn sum_star_join_parallel(children: &[StreamNode], ec: &ExecCtx<'_, '_>) -> Resu
             .into_iter()
             .map(|h| {
                 h.join().unwrap_or_else(|_| {
-                    Err(QueryError::execution("parallel star-join worker panicked"))
+                    Err(QueryError::execution("parallel count worker panicked"))
                 })
             })
             .collect()
@@ -940,6 +1045,106 @@ fn sum_star_join_parallel(children: &[StreamNode], ec: &ExecCtx<'_, '_>) -> Resu
         total = total.saturating_add(partial?);
     }
     Ok(Some(total.min(u64::MAX as u128) as u64))
+}
+
+fn sum_star_join_parallel(children: &[StreamNode], ec: &ExecCtx<'_, '_>) -> Result<Option<u64>> {
+    if children.len() < 2 {
+        return Ok(None);
+    }
+    let mut p_ids: Vec<u32> = Vec::with_capacity(children.len());
+    let mut total_rows: u64 = 0;
+    for child in children {
+        let StreamNode::SubjectCountScan { pred } = child else {
+            return Ok(None);
+        };
+        let sid = normalize_pred_sid(ec.store, pred)?;
+        let Some(p_id) = ec.store.sid_to_p_id(&sid) else {
+            return Ok(None);
+        };
+        p_ids.push(p_id);
+        total_rows =
+            total_rows.saturating_add(count_rows_for_predicate_psot(ec.store, ec.g_id, p_id)?);
+    }
+
+    // Partition driver = the predicate with the most leaves (finest boundaries).
+    let driver_p = *p_ids
+        .iter()
+        .max_by_key(|&&p| leaf_entries_for_predicate(ec.store, ec.g_id, RunSortOrder::Psot, p).len())
+        .unwrap();
+
+    parallel_partition_count(ec, driver_p, total_rows, |lo, hi| {
+        merge_count_range(ec.store, ec.g_id, &p_ids, lo, hi)
+    })
+}
+
+/// Parallel partitioned variant of `sum_optional_join` for the all-present-
+/// predicate shape (single/star required + optional groups of `SubjectCountScan`s).
+/// Partitions by the required side and runs the optional merge per range. Returns
+/// `Ok(None)` to defer to the serial merge for any other shape, an absent required
+/// predicate, or too few rows. BASE index only: caller ensures `!ec.overlay` and no
+/// exclude/include.
+fn sum_optional_join_parallel(
+    required: &StreamNode,
+    optional_groups: &[Vec<StreamNode>],
+    ec: &ExecCtx<'_, '_>,
+) -> Result<Option<u64>> {
+    let req_preds: &[StreamNode] = match required {
+        StreamNode::SubjectCountScan { .. } => std::slice::from_ref(required),
+        StreamNode::StarJoin { children } => children,
+        _ => return Ok(None),
+    };
+    let mut req_pids: Vec<u32> = Vec::with_capacity(req_preds.len());
+    let mut total_rows: u64 = 0;
+    for node in req_preds {
+        let StreamNode::SubjectCountScan { pred } = node else {
+            return Ok(None);
+        };
+        let sid = normalize_pred_sid(ec.store, pred)?;
+        // Absent required predicate => empty inner join; let the serial path
+        // produce the (correct) 0.
+        let Some(p_id) = ec.store.sid_to_p_id(&sid) else {
+            return Ok(None);
+        };
+        req_pids.push(p_id);
+        total_rows =
+            total_rows.saturating_add(count_rows_for_predicate_psot(ec.store, ec.g_id, p_id)?);
+    }
+
+    // Resolve optional groups; an absent optional predicate makes its group
+    // `always_one` (multiplier 1), represented as an empty id list.
+    let mut opt_groups: Vec<Vec<u32>> = Vec::with_capacity(optional_groups.len());
+    for grp in optional_groups {
+        let mut pids: Vec<u32> = Vec::with_capacity(grp.len());
+        let mut absent = false;
+        for node in grp {
+            let StreamNode::SubjectCountScan { pred } = node else {
+                return Ok(None);
+            };
+            let sid = normalize_pred_sid(ec.store, pred)?;
+            match ec.store.sid_to_p_id(&sid) {
+                Some(p_id) => {
+                    pids.push(p_id);
+                    total_rows = total_rows
+                        .saturating_add(count_rows_for_predicate_psot(ec.store, ec.g_id, p_id)?);
+                }
+                None => {
+                    absent = true;
+                    break;
+                }
+            }
+        }
+        opt_groups.push(if absent { Vec::new() } else { pids });
+    }
+
+    // Drive partitioning from the required predicate with the most leaves.
+    let driver_p = *req_pids
+        .iter()
+        .max_by_key(|&&p| leaf_entries_for_predicate(ec.store, ec.g_id, RunSortOrder::Psot, p).len())
+        .unwrap();
+
+    parallel_partition_count(ec, driver_p, total_rows, |lo, hi| {
+        merge_optional_count_range(ec.store, ec.g_id, &req_pids, &opt_groups, lo, hi)
+    })
 }
 
 /// Metadata-only fold for the rdf:type inner-star count:
@@ -1311,6 +1516,11 @@ fn sum_optional_join(
     // other instead of scanning both in full.
     if !ec.overlay && exclude_sorted.is_none() && include_sorted.is_none() {
         if let Some(n) = try_optional_seek(required, optional_groups, ec)? {
+            return Ok(Some(n));
+        }
+        // Both-large optional (no modifiers): partition the subject space and run
+        // the optional merge across cores.
+        if let Some(n) = sum_optional_join_parallel(required, optional_groups, ec)? {
             return Ok(Some(n));
         }
     }
