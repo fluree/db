@@ -70,12 +70,13 @@ use std::sync::Arc;
 ///   the same Sid with structurally identical levels, and stay separated
 ///   when their levels differ.
 ///
-/// The trailing `Option<Arc<str>>` is the root subject's canonical IRI (present
-/// only for multi-ledger `IriMatch` roots). It participates in the key because
-/// two different ledgers can mint the same `(namespace_code, name)` SID for
-/// *different* IRIs — without it, a cross-ledger query could serve one ledger's
-/// rendering for another ledger's subject (issue #1259).
-type CacheKey = (Sid, u64, usize, Option<Arc<str>>);
+/// The leading `Arc<str>` is the active ledger (the view the `Sid` was scanned
+/// in): a `Sid` is view-local, so the same bytes can name different subjects
+/// across ledgers. The trailing `Option<Arc<str>>` is the root subject's
+/// canonical IRI (present only for multi-ledger `IriMatch` roots). Both
+/// participate so a cross-ledger query can never serve one ledger's rendering
+/// for another ledger's subject (issue #1259).
+type CacheKey = (Arc<str>, Sid, u64, usize, Option<Arc<str>>);
 
 /// Depth bookkeeping for one hydration call.
 ///
@@ -255,22 +256,30 @@ fn hash_reverse<H: std::hash::Hasher>(
 fn resolve_root_sid_from_binding(
     result: &QueryResult,
     binding: Option<&Binding>,
-) -> Result<Option<(Sid, Option<Arc<str>>)>> {
+) -> Result<Option<RootRef>> {
     match binding {
         Some(b) if b.is_encoded() => {
             let materialized = super::materialize::materialize_binding(result, b)?;
             Ok(match materialized {
-                Binding::Sid { sid, .. } => Some((sid, None)),
+                Binding::Sid { sid, .. } => Some(RootRef::local(sid)),
                 Binding::IriMatch {
-                    primary_sid, iri, ..
-                } => Some((primary_sid, Some(iri))),
+                    primary_sid,
+                    iri,
+                    ledger_alias,
+                } => Some(RootRef::cross_ledger(primary_sid, iri, ledger_alias)),
                 _ => None,
             })
         }
-        Some(Binding::Sid { sid, .. }) => Ok(Some((sid.clone(), None))),
+        Some(Binding::Sid { sid, .. }) => Ok(Some(RootRef::local(sid.clone()))),
         Some(Binding::IriMatch {
-            primary_sid, iri, ..
-        }) => Ok(Some((primary_sid.clone(), Some(iri.clone())))),
+            primary_sid,
+            iri,
+            ledger_alias,
+        }) => Ok(Some(RootRef::cross_ledger(
+            primary_sid.clone(),
+            iri.clone(),
+            ledger_alias.clone(),
+        ))),
         Some(Binding::Unbound | Binding::Poisoned) | None => Ok(None),
         Some(
             Binding::Lit { .. }
@@ -283,6 +292,37 @@ fn resolve_root_sid_from_binding(
     }
 }
 
+/// A resolved hydration-root reference.
+///
+/// `sid` is the subject's SID in its originating ledger. For multi-ledger
+/// (`IriMatch`) roots, `iri` is the canonical IRI (used for the `@id` and to
+/// re-resolve the subject in its home ledger) and `ledger_alias` names that
+/// home ledger so the formatter can route expansion to the correct view
+/// (issue #1259). Single-ledger (`Sid`) roots carry neither.
+struct RootRef {
+    sid: Sid,
+    iri: Option<Arc<str>>,
+    ledger_alias: Option<Arc<str>>,
+}
+
+impl RootRef {
+    fn local(sid: Sid) -> Self {
+        Self {
+            sid,
+            iri: None,
+            ledger_alias: None,
+        }
+    }
+
+    fn cross_ledger(sid: Sid, iri: Arc<str>, ledger_alias: Arc<str>) -> Self {
+        Self {
+            sid,
+            iri: Some(iri),
+            ledger_alias: Some(ledger_alias),
+        }
+    }
+}
+
 /// Format one hydration column for one solution row.
 ///
 /// Resolves the column's root (variable or IRI constant) into a `Sid` and
@@ -290,19 +330,19 @@ fn resolve_root_sid_from_binding(
 /// own level and depth budget. A variable root that's unbound for this row
 /// renders as `null` rather than skipping the row entirely.
 async fn format_hydration_column(
-    formatter: &HydrationFormatter<'_>,
+    set: &FormatterSet<'_>,
     spec: &HydrationSpec,
     result: &QueryResult,
     batch: &fluree_db_query::Batch,
     row_idx: usize,
     cache: &mut HashMap<CacheKey, JsonValue>,
 ) -> Result<JsonValue> {
-    // `root_iri` is the canonical IRI when the root came from a multi-ledger
-    // `IriMatch` binding; it lets `format_subject` emit the root `@id` from the
-    // ledger-correct IRI instead of decoding a foreign SID against the
-    // formatter's single-snapshot dict (issue #1259).
-    let (root_sid, root_iri): (Sid, Option<Arc<str>>) = match &spec.root {
-        Root::Sid(sid) => (sid.clone(), None),
+    // Resolve the root. For an `IriMatch` root, `iri` is the ledger-correct
+    // canonical IRI (used for the `@id`) and `ledger_alias` names its home
+    // ledger so we route expansion to that view rather than decoding/scanning
+    // a foreign SID against the primary view (issue #1259).
+    let root = match &spec.root {
+        Root::Sid(sid) => RootRef::local(sid.clone()),
         Root::Var(var_id) => {
             let Some(resolved) =
                 resolve_root_sid_from_binding(result, batch.get(row_idx, *var_id))?
@@ -313,11 +353,12 @@ async fn format_hydration_column(
         }
     };
 
+    let formatter = set.pick(root.ledger_alias.as_ref());
     let mut visited = HashSet::new();
     formatter
         .format_subject(
-            &root_sid,
-            root_iri,
+            &root.sid,
+            root.iri,
             &spec.level,
             DepthBudget::root(spec.depth),
             &mut visited,
@@ -348,10 +389,6 @@ pub async fn format_async(
             "Hydration format called without any hydration columns".into(),
         ));
     }
-    let columns = result.output.columns().ok_or_else(|| {
-        FormatError::InvalidBinding("Hydration format called on non-Select output".into())
-    })?;
-
     // Attach the tracker to the GraphDbRef so db.range calls inside the
     // formatter charge per-leaflet + per-dict-touch fuel through the
     // BinaryGraphView/BinaryCursor wiring (not just the per-flake baseline).
@@ -360,12 +397,146 @@ pub async fn format_async(
         None => db,
     };
 
-    let formatter = HydrationFormatter::new(db, compactor, config, policy, tracker);
+    // Single-view (single-ledger) hydration: one formatter, no cross-ledger
+    // routing. `FormatterSet::pick` always falls back to this primary.
+    let active_ledger: Arc<str> = Arc::from(db.snapshot.ledger_id.as_str());
+    let formatter = HydrationFormatter::new(db, compactor, active_ledger, config, policy, tracker);
+    let set = FormatterSet {
+        formatters: vec![formatter],
+        by_ledger: HashMap::new(),
+        primary: 0,
+    };
+    run_hydration_rows(&set, result).await
+}
+
+/// Dataset-aware hydration entry point (multi-ledger).
+///
+/// Unlike [`format_async`], each ledger in the dataset gets its own
+/// `(GraphDbRef, IriCompactor, policy)` view, and a hydration column's root is
+/// routed to its **home** ledger (via the `IriMatch` provenance carried on the
+/// root binding) so the subject's properties and `@id` decode against the
+/// ledger that actually stores them — not the primary view's namespace dict
+/// (issue #1259).
+///
+/// Per-ledger policy is preserved: a foreign subject is read under *its own*
+/// view's policy enforcer, never the primary's.
+///
+/// NOTE (staged): this slice routes the **root** subject. Nested cross-ledger
+/// refs still expand within the root's view (correct only when the two ledgers
+/// allocated matching namespace codes) until the union-resolution slice lands.
+pub async fn format_async_dataset(
+    result: &QueryResult,
+    dataset: &crate::view::DataSetDb,
+    context: &crate::ParsedContext,
+    config: &FormatterConfig,
+    tracker: Option<&Tracker>,
+) -> Result<JsonValue> {
+    if !result.output.has_hydration() {
+        return Err(FormatError::InvalidBinding(
+            "Hydration format called without any hydration columns".into(),
+        ));
+    }
+
+    // All dataset views — default graphs first, then named. Owned per-view
+    // compactors / policies live in parallel vecs that outlive the
+    // borrowed-state formatters.
+    let graph_views: Vec<&crate::view::GraphDb> = dataset
+        .default
+        .iter()
+        .chain(dataset.named.values())
+        .collect();
+    let compactors: Vec<IriCompactor> = graph_views
+        .iter()
+        .map(|g| IriCompactor::new(g.snapshot.namespaces(), context))
+        .collect();
+    let policies: Vec<Option<PolicyContext>> =
+        graph_views.iter().map(|g| g.policy().cloned()).collect();
+
+    let mut formatters: Vec<HydrationFormatter> = Vec::with_capacity(graph_views.len());
+    // Keyed by `GraphDb::ledger_id`, which is exactly what `IriMatch.ledger_alias`
+    // carries (set from the runtime `GraphRef.ledger_id`) — so root routing
+    // looks up the correct view.
+    let mut by_ledger: HashMap<Arc<str>, usize> = HashMap::new();
+    for (i, g) in graph_views.iter().enumerate() {
+        let mut view_db = g.as_graph_db_ref();
+        if let Some(t) = tracker {
+            view_db = view_db.with_tracker(t);
+        }
+        let formatter = HydrationFormatter::new(
+            view_db,
+            &compactors[i],
+            Arc::clone(&g.ledger_id),
+            config,
+            policies[i].as_ref(),
+            tracker,
+        );
+        // First occurrence wins (a ledger may appear as both default and named).
+        by_ledger.entry(Arc::clone(&g.ledger_id)).or_insert(i);
+        formatters.push(formatter);
+    }
+
+    // Primary = the dataset's primary view (first default, else first named),
+    // used for flat columns and as the fallback for unrouted roots.
+    let primary = dataset
+        .primary()
+        .and_then(|p| by_ledger.get(&p.ledger_id).copied())
+        .unwrap_or(0);
+
+    let set = FormatterSet {
+        formatters,
+        by_ledger,
+        primary,
+    };
+    run_hydration_rows(&set, result).await
+}
+
+/// A collection of per-ledger hydration formatters with root-routing.
+///
+/// In single-ledger mode this holds exactly one formatter and every lookup
+/// falls back to it. In dataset mode it holds one formatter per ledger view,
+/// and [`FormatterSet::pick`] routes a hydration root to its home ledger.
+struct FormatterSet<'a> {
+    formatters: Vec<HydrationFormatter<'a>>,
+    /// `GraphDb::ledger_id` → index into `formatters`.
+    by_ledger: HashMap<Arc<str>, usize>,
+    /// Index of the primary formatter (flat columns + unrouted-root fallback).
+    primary: usize,
+}
+
+impl<'a> FormatterSet<'a> {
+    fn primary(&self) -> &HydrationFormatter<'a> {
+        &self.formatters[self.primary]
+    }
+
+    /// Select the formatter for a root's home ledger, falling back to the
+    /// primary when there is no provenance (single-ledger `Sid` roots,
+    /// constant-IRI roots) or the ledger isn't in the dataset.
+    fn pick(&self, ledger_alias: Option<&Arc<str>>) -> &HydrationFormatter<'a> {
+        ledger_alias
+            .and_then(|a| self.by_ledger.get(a))
+            .map(|&i| &self.formatters[i])
+            .unwrap_or_else(|| self.primary())
+    }
+}
+
+/// Shared row loop for single-view and dataset hydration.
+///
+/// Flat (`Column::Var`) columns are formatted with the primary view's
+/// compactor — they carry `IriMatch.iri` for cross-ledger references, so the
+/// dict is irrelevant. Hydration columns route to their home-ledger formatter.
+async fn run_hydration_rows(set: &FormatterSet<'_>, result: &QueryResult) -> Result<JsonValue> {
+    let columns = result.output.columns().ok_or_else(|| {
+        FormatError::InvalidBinding("Hydration format called on non-Select output".into())
+    })?;
+
+    let primary = set.primary();
+    let primary_compactor = primary.compactor;
+    let typed = primary.typed;
 
     // Shared cache across all rows and all hydration columns. The cache key
-    // includes a hash of the current `NestedSelectSpec`, so columns with
-    // structurally identical levels share entries; columns with different
-    // levels do not collide.
+    // includes the active ledger + a hash of the current `NestedSelectSpec`, so
+    // columns with structurally identical levels share entries while different
+    // levels (and different ledgers) stay separate.
     let mut cache: HashMap<CacheKey, JsonValue> = HashMap::new();
     let mut rows: Vec<JsonValue> = Vec::new();
 
@@ -397,19 +568,21 @@ pub async fn format_async(
             for column in columns {
                 let value = match column {
                     Column::Var(v) => match batch.get(row_idx, *v) {
-                        Some(binding) if formatter.typed => {
-                            super::typed::format_binding_with_result(result, binding, compactor)?
-                        }
-                        Some(binding) => {
-                            super::jsonld::format_binding_with_result(result, binding, compactor)?
-                        }
+                        Some(binding) if typed => super::typed::format_binding_with_result(
+                            result,
+                            binding,
+                            primary_compactor,
+                        )?,
+                        Some(binding) => super::jsonld::format_binding_with_result(
+                            result,
+                            binding,
+                            primary_compactor,
+                        )?,
                         None => JsonValue::Null,
                     },
                     Column::Hydration(spec) => {
-                        format_hydration_column(
-                            &formatter, spec, result, batch, row_idx, &mut cache,
-                        )
-                        .await?
+                        format_hydration_column(set, spec, result, batch, row_idx, &mut cache)
+                            .await?
                     }
                 };
                 row_values.push(value);
@@ -438,6 +611,14 @@ pub async fn format_async(
 struct HydrationFormatter<'a> {
     db: GraphDbRef<'a>,
     compactor: &'a IriCompactor,
+    /// Ledger this formatter's view belongs to.
+    ///
+    /// Distinguishes per-ledger entries in the shared expansion cache: a
+    /// `Sid`'s `(namespace_code, name)` is view-local, so the same bytes can
+    /// name different subjects across ledgers. Including the ledger in the
+    /// cache key prevents one ledger's hydration from being served for
+    /// another's (issue #1259, multi-ledger formatting).
+    active_ledger: Arc<str>,
     /// Whether to emit typed JSON (`{"@value": ..., "@type": ...}`) for all literals.
     typed: bool,
     /// Whether to always wrap property values in arrays (even single-valued).
@@ -453,6 +634,7 @@ impl<'a> HydrationFormatter<'a> {
     fn new(
         db: GraphDbRef<'a>,
         compactor: &'a IriCompactor,
+        active_ledger: Arc<str>,
         config: &FormatterConfig,
         policy: Option<&'a PolicyContext>,
         tracker: Option<&'a Tracker>,
@@ -460,6 +642,7 @@ impl<'a> HydrationFormatter<'a> {
         Self {
             db,
             compactor,
+            active_ledger,
             typed: config.format == OutputFormat::TypedJson,
             normalize_arrays: config.normalize_arrays,
             policy,
@@ -488,6 +671,7 @@ impl<'a> HydrationFormatter<'a> {
     ) -> BoxFuture<'b, Result<JsonValue>> {
         async move {
             let cache_key = (
+                Arc::clone(&self.active_ledger),
                 sid.clone(),
                 compute_level_hash(level),
                 depth.remaining(),
@@ -1290,13 +1474,22 @@ mod tests {
     fn test_cache_key_different_depths() {
         let sid = Sid::new(100, "alice");
         let spec_hash = 12345u64;
+        let ledger: Arc<str> = Arc::from("a:main");
 
-        let key1: CacheKey = (sid.clone(), spec_hash, 0, None);
-        let key2: CacheKey = (sid.clone(), spec_hash, 1, None);
-        let key3: CacheKey = (sid.clone(), spec_hash, 0, None);
+        let key1: CacheKey = (Arc::clone(&ledger), sid.clone(), spec_hash, 0, None);
+        let key2: CacheKey = (Arc::clone(&ledger), sid.clone(), spec_hash, 1, None);
+        let key3: CacheKey = (Arc::clone(&ledger), sid.clone(), spec_hash, 0, None);
         // Same SID + spec + depth but a different canonical IRI (cross-ledger
         // collision) must NOT share a cache entry.
-        let key4: CacheKey = (sid, spec_hash, 0, Some(Arc::from("http://other.example/x")));
+        let key4: CacheKey = (
+            Arc::clone(&ledger),
+            sid.clone(),
+            spec_hash,
+            0,
+            Some(Arc::from("http://other.example/x")),
+        );
+        // Same SID + spec + depth in a DIFFERENT ledger must NOT share an entry.
+        let key5: CacheKey = (Arc::from("b:main"), sid, spec_hash, 0, None);
 
         // Different depths should produce different keys
         assert_ne!(key1, key2);
@@ -1304,6 +1497,8 @@ mod tests {
         assert_eq!(key1, key3);
         // Different canonical IRI → different key
         assert_ne!(key1, key4);
+        // Different active ledger → different key
+        assert_ne!(key1, key5);
     }
 
     fn explicit(forward: Vec<ForwardItem>) -> NestedSelectSpec {

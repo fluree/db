@@ -251,6 +251,100 @@ async fn flat_select_cross_graph_iri_decode() {
     );
 }
 
+/// Seed a primary "catalog" ledger and a "people" ledger whose person uses a
+/// divergent *predicate* vocabulary (`p:` = http://people.example/). The
+/// shared `schema:` type lets the BGP match across both; the divergent
+/// `p:fullName` predicate is what exercises home-ledger decoding.
+async fn seed_divergent_predicate_ledgers(fluree: &MemoryFluree) {
+    fluree
+        .insert(
+            genesis_ledger(fluree, "test/catalog:main"),
+            &json!({
+                "@context": {
+                    "schema": "http://schema.org/",
+                    "cat": "http://catalog.example/",
+                    "id": "@id",
+                    "type": "@type",
+                },
+                "@graph": [
+                    {"@id": "cat:item1", "@type": "schema:Product", "cat:sku": "X-1"}
+                ]
+            }),
+        )
+        .await
+        .expect("insert catalog");
+
+    fluree
+        .insert(
+            genesis_ledger(fluree, "test/people:main"),
+            &json!({
+                "@context": {
+                    "schema": "http://schema.org/",
+                    "p": "http://people.example/",
+                    "id": "@id",
+                    "type": "@type",
+                },
+                "@graph": [
+                    {"@id": "p:ada", "@type": "schema:Person", "p:fullName": "Ada"}
+                ]
+            }),
+        )
+        .await
+        .expect("insert people");
+}
+
+/// Commit 1 — a hydration root that lives in a NON-primary ledger must have its
+/// own properties decoded against its HOME ledger's namespace dict.
+///
+/// `catalog` is the primary (first default graph). The matching `schema:Person`
+/// lives in `people` and carries `p:fullName` (the `people` ledger's own
+/// vocabulary). Before the dataset-aware fix the property predicate was decoded
+/// against the catalog dict — where the colliding code maps to `cat:`, silently
+/// renaming `p:fullName` to `cat:fullName`. Routing the root to its home ledger
+/// fixes it.
+#[tokio::test]
+async fn cross_graph_root_properties_decode_in_home_ledger() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    seed_divergent_predicate_ledgers(&fluree).await;
+
+    let q = json!({
+        "@context": {
+            "schema": "http://schema.org/",
+            "cat": "http://catalog.example/",
+            "p": "http://people.example/",
+            "id": "@id",
+            "type": "@type",
+        },
+        "from": ["test/catalog:main", "test/people:main"],
+        "select": { "?person": ["*"] },
+        "where": { "@id": "?person", "type": "schema:Person" }
+    });
+
+    let value = fluree
+        .query_from()
+        .jsonld(&q)
+        .execute_formatted()
+        .await
+        .expect("execute_formatted should not error");
+
+    let person = value
+        .as_array()
+        .and_then(|a| a.first())
+        .expect("one person");
+    assert_eq!(person.get("@id").and_then(|v| v.as_str()), Some("p:ada"));
+    // The property MUST be decoded against the people ledger's dict.
+    assert_eq!(
+        person.get("p:fullName").and_then(|v| v.as_str()),
+        Some("Ada"),
+        "root property decoded against the wrong ledger's dict: {value:#}"
+    );
+    // And must NOT have been mis-decoded under the catalog vocabulary.
+    assert!(
+        person.get("cat:fullName").is_none(),
+        "property mis-decoded against the primary (catalog) dict: {value:#}"
+    );
+}
+
 /// KNOWN LIMITATION (out of scope for issue #1259) — cross-ledger hydration
 /// *expansion* with divergent vocabularies.
 ///
