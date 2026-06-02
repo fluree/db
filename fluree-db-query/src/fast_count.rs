@@ -5,9 +5,9 @@
 //! when `fast_path_store(ctx)` is available, otherwise they fall back to a planned
 //! operator tree for correctness.
 
+use crate::binary_scan::{compile_encoded_pre_filters_and_prune_inline_ops, EncodedPreFilter};
 use crate::context::ExecutionContext;
 use crate::error::{QueryError, Result};
-use crate::binary_scan::{compile_encoded_pre_filters_and_prune_inline_ops, EncodedPreFilter};
 use crate::fast_path_common::{
     allow_cursor_fast_path, build_count_batch, count_predicate_overlay_delta,
     count_rows_for_predicate_psot, count_to_i64, fast_path_store, leaf_entries_for_predicate,
@@ -15,12 +15,11 @@ use crate::fast_path_common::{
     projection_okey_only, projection_otype_only, projection_sid_only, projection_sid_otype_okey,
     FastPathOperator,
 };
-use std::sync::Arc;
-use fluree_db_binary_index::format::branch::LeafEntry;
 use crate::ir::triple::{Ref, TriplePattern};
 use crate::operator::inline::InlineOperator;
 use crate::operator::BoxedOperator;
 use crate::var_registry::VarId;
+use fluree_db_binary_index::format::branch::LeafEntry;
 use fluree_db_binary_index::format::run_record::RunSortOrder;
 use fluree_db_binary_index::format::run_record_v2::{
     cmp_v2_for_order, read_ordered_key_v2, RunRecordV2,
@@ -31,6 +30,7 @@ use fluree_db_core::subject_id::SubjectId;
 use fluree_db_core::value_id::ObjKey;
 use fluree_db_core::{FlakeValue, GraphId};
 use fluree_vocab::namespaces;
+use std::sync::Arc;
 
 // ---------------------------------------------------------------------------
 // 1) COUNT(*) / COUNT(?x) for single predicate `?s <p> ?o`
@@ -69,9 +69,13 @@ pub fn count_rows_operator(
                         let Some(p_id) = store.sid_to_p_id(&pred_sid) else {
                             return Ok(None); // novelty-only predicate => defer
                         };
-                        if let Some(count) =
-                            count_predicate_overlay_delta(ctx, store, ctx.binary_g_id, pred_sid, p_id)?
-                        {
+                        if let Some(count) = count_predicate_overlay_delta(
+                            ctx,
+                            store,
+                            ctx.binary_g_id,
+                            pred_sid,
+                            p_id,
+                        )? {
                             return Ok(Some(build_count_batch(
                                 out_var,
                                 count_to_i64(count, "COUNT rows")?,
@@ -356,7 +360,11 @@ fn boundary_leaf_pid_extent(
         if entry.row_count == 0 || entry.p_const != Some(p_id) {
             continue;
         }
-        let raw = if last { &entry.last_key } else { &entry.first_key };
+        let raw = if last {
+            &entry.last_key
+        } else {
+            &entry.first_key
+        };
         let key = read_ordered_key_v2(RunSortOrder::Post, raw);
         return Ok(Some((key.o_type, key.o_key)));
     }

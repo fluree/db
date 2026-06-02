@@ -616,7 +616,8 @@ impl<'a> PsotSubjectCountIter<'a> {
         // Leaf leapfrog to `lo`: skip leaves whose last subject (for THIS predicate)
         // is below `lo`. Guarded by `last_key.p_id == p_id` because a boundary
         // leaf's `last_key` can belong to a higher predicate (see PsotSubjectSeek).
-        let leaf_pos = leaves.partition_point(|e| e.last_key.p_id == p_id && e.last_key.s_id.as_u64() < lo);
+        let leaf_pos =
+            leaves.partition_point(|e| e.last_key.p_id == p_id && e.last_key.s_id.as_u64() < lo);
         Ok(Self {
             store,
             p_id,
@@ -856,9 +857,9 @@ impl<'a> PsotSubjectSeek<'a> {
                 }
                 let projection = projection_sid_only();
                 let batch = if let Some(cache) = self.store.leaflet_cache() {
-                    let idx_u32: u32 = idx.try_into().map_err(|_| {
-                        QueryError::Internal("leaflet idx exceeds u32".to_string())
-                    })?;
+                    let idx_u32: u32 = idx
+                        .try_into()
+                        .map_err(|_| QueryError::Internal("leaflet idx exceeds u32".to_string()))?;
                     load_columns_cached_via_handle(
                         handle.as_ref(),
                         idx,
@@ -2024,8 +2025,15 @@ pub fn build_overlay_cursor_for_subject_range(
         p_id: Some(p_id),
         ..Default::default()
     };
-    let mut cursor =
-        build_range_cursor(store, g_id, RunSortOrder::Psot, &min_key, &max_key, filter, projection)?;
+    let mut cursor = build_range_cursor(
+        store,
+        g_id,
+        RunSortOrder::Psot,
+        &min_key,
+        &max_key,
+        filter,
+        projection,
+    )?;
     cursor.set_to_t(to_t);
     if overlay_active {
         if !sliced_ops.is_empty() {
@@ -2198,11 +2206,7 @@ where
         None => return Ok(None),
     };
     let to_t = ctx.to_t;
-    let epoch = ctx
-        .overlay
-        .as_ref()
-        .map(|o| o.epoch())
-        .unwrap_or(0);
+    let epoch = ctx.overlay.as_ref().map(|o| o.epoch()).unwrap_or(0);
     let total_rows = count_rows_for_predicate_psot(store, g_id, p_id)?;
 
     let ops_ref = &ops;

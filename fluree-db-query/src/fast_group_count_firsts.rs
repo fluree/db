@@ -1594,7 +1594,15 @@ mod topk_tests {
     fn topk(items: &[(i64, u16, u64)], limit: usize) -> Vec<(u16, u64, i64)> {
         let mut heap: BinaryHeap<GroupTopK> = BinaryHeap::new();
         for &(count, o_type, o_key) in items {
-            offer_topk(&mut heap, limit, GroupTopK { count, o_type, o_key });
+            offer_topk(
+                &mut heap,
+                limit,
+                GroupTopK {
+                    count,
+                    o_type,
+                    o_key,
+                },
+            );
         }
         heap.into_sorted_vec()
             .into_iter()

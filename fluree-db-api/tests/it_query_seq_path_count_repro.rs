@@ -179,7 +179,13 @@ async fn seq_path_count_unit_novelty_vs_indexed() {
         println!("reach+({subj}) = {set:?}  (expected {expect})");
     }
 
-    run_all("NOVELTY (in-memory generic path)", &fluree, &db, &ledger.snapshot).await;
+    run_all(
+        "NOVELTY (in-memory generic path)",
+        &fluree,
+        &db,
+        &ledger.snapshot,
+    )
+    .await;
 
     // ---------- 2) Indexed / binary path (fast-path operators) ----------
     let fluree2 = FlureeBuilder::memory()

@@ -3165,10 +3165,12 @@ mod tests {
             reasoning: ReasoningConfig::default(),
             grouping: Some(Grouping::Implicit {
                 aggregation: Aggregation {
-                    aggregates: fluree_db_core::NonEmpty::try_from_vec(vec![crate::ir::AggregateSpec {
-                        function,
-                        output_var: out,
-                    }])
+                    aggregates: fluree_db_core::NonEmpty::try_from_vec(vec![
+                        crate::ir::AggregateSpec {
+                            function,
+                            output_var: out,
+                        },
+                    ])
                     .unwrap(),
                     binds: Vec::new(),
                 },
@@ -3184,7 +3186,12 @@ mod tests {
         let q = make_query(AggregateFn::Sum(synth, InputSemantics::List));
         assert_eq!(
             detect_sum_numeric_compare_as_count(&q),
-            Some((pred.clone(), NumericCompareOp::Gt, fluree_db_core::FlakeValue::Long(0), out))
+            Some((
+                pred.clone(),
+                NumericCompareOp::Gt,
+                fluree_db_core::FlakeValue::Long(0),
+                out
+            ))
         );
 
         // SUM(DISTINCT ...) must be rejected: SUM(DISTINCT bool) is not a row count.

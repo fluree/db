@@ -21,12 +21,12 @@ use crate::fast_path_common::{
     allow_cursor_fast_path, build_count_batch, build_overlay_cursor_for_subject_range,
     build_post_cursor_for_predicate, build_psot_cursor_for_predicate, collect_resolved_overlay_ops,
     collect_subjects_for_predicate_set, collect_subjects_for_predicate_sorted,
-    collect_subjects_with_object_in_set, count_rows_for_predicate_psot, cursor_projection_otype_okey,
-    cursor_projection_sid_only, cursor_projection_sid_otype_okey, intersect_many_sorted,
-    leaf_entries_for_predicate, normalize_pred_sid, projection_sid_otype_okey,
-    slice_overlay_ops_by_subject, sum_post_object_counts_filtered, CursorSubjectCountStream,
-    FastPathOperator, ObjectFilterMode, PostObjectGroupCountIter, PsotObjectFilterCountIter,
-    PsotSubjectCountIter, PsotSubjectSeek, PsotSubjectWeightedSumIter,
+    collect_subjects_with_object_in_set, count_rows_for_predicate_psot,
+    cursor_projection_otype_okey, cursor_projection_sid_only, cursor_projection_sid_otype_okey,
+    intersect_many_sorted, leaf_entries_for_predicate, normalize_pred_sid,
+    projection_sid_otype_okey, slice_overlay_ops_by_subject, sum_post_object_counts_filtered,
+    CursorSubjectCountStream, FastPathOperator, ObjectFilterMode, PostObjectGroupCountIter,
+    PsotObjectFilterCountIter, PsotSubjectCountIter, PsotSubjectSeek, PsotSubjectWeightedSumIter,
 };
 use crate::ir::triple::Ref;
 use crate::operator::BoxedOperator;
@@ -559,7 +559,8 @@ fn sum_stream(
             // Overlay/time-travel: parallelize the base scan + fold novelty per
             // partition; falls through to the serial keyset path otherwise.
             if ec.overlay && exclude_sorted.is_none() && include_sorted.is_none() {
-                if let Some(n) = try_modifier_intersect_overlay_parallel(source, excluded, true, ec)?
+                if let Some(n) =
+                    try_modifier_intersect_overlay_parallel(source, excluded, true, ec)?
                 {
                     return Ok(Some(n));
                 }
@@ -588,7 +589,8 @@ fn sum_stream(
             // Overlay/time-travel: parallelize the base scan + fold novelty per
             // partition; falls through to the serial keyset path otherwise.
             if ec.overlay && exclude_sorted.is_none() && include_sorted.is_none() {
-                if let Some(n) = try_modifier_intersect_overlay_parallel(source, filter, false, ec)? {
+                if let Some(n) = try_modifier_intersect_overlay_parallel(source, filter, false, ec)?
+                {
                     return Ok(Some(n));
                 }
             }
@@ -796,7 +798,9 @@ fn merge_count_range(
 ) -> Result<u128> {
     let mut iters: Vec<PsotSubjectCountIter<'_>> = Vec::with_capacity(p_ids.len());
     for &p_id in p_ids {
-        iters.push(PsotSubjectCountIter::new_bounded(store, g_id, p_id, lo, hi)?);
+        iters.push(PsotSubjectCountIter::new_bounded(
+            store, g_id, p_id, lo, hi,
+        )?);
     }
     let mut curr: Vec<Option<(u64, u64)>> = Vec::with_capacity(iters.len());
     for it in &mut iters {
@@ -1078,7 +1082,9 @@ fn sum_star_join_parallel(children: &[StreamNode], ec: &ExecCtx<'_, '_>) -> Resu
     // Partition driver = the predicate with the most leaves (finest boundaries).
     let driver_p = *p_ids
         .iter()
-        .max_by_key(|&&p| leaf_entries_for_predicate(ec.store, ec.g_id, RunSortOrder::Psot, p).len())
+        .max_by_key(|&&p| {
+            leaf_entries_for_predicate(ec.store, ec.g_id, RunSortOrder::Psot, p).len()
+        })
         .unwrap();
 
     parallel_partition_count(ec.store, ec.g_id, driver_p, total_rows, |lo, hi| {
@@ -1198,7 +1204,9 @@ fn sum_star_join_overlay_parallel(
 
     let driver_p = *p_ids
         .iter()
-        .max_by_key(|&&p| leaf_entries_for_predicate(ec.store, ec.g_id, RunSortOrder::Psot, p).len())
+        .max_by_key(|&&p| {
+            leaf_entries_for_predicate(ec.store, ec.g_id, RunSortOrder::Psot, p).len()
+        })
         .unwrap();
 
     let store = ec.store;
@@ -1272,7 +1280,9 @@ fn sum_optional_join_parallel(
     // Drive partitioning from the required predicate with the most leaves.
     let driver_p = *req_pids
         .iter()
-        .max_by_key(|&&p| leaf_entries_for_predicate(ec.store, ec.g_id, RunSortOrder::Psot, p).len())
+        .max_by_key(|&&p| {
+            leaf_entries_for_predicate(ec.store, ec.g_id, RunSortOrder::Psot, p).len()
+        })
         .unwrap();
 
     parallel_partition_count(ec.store, ec.g_id, driver_p, total_rows, |lo, hi| {
@@ -1459,9 +1469,10 @@ fn sum_optional_join_overlay_parallel(
         opt_sids.push(sids);
     }
 
-    let collect = |sid: &Sid| -> Result<Option<Vec<fluree_db_binary_index::read::types::OverlayOp>>> {
-        collect_resolved_overlay_ops(ec.ctx, ec.store, ec.g_id, RunSortOrder::Psot, sid)
-    };
+    let collect =
+        |sid: &Sid| -> Result<Option<Vec<fluree_db_binary_index::read::types::OverlayOp>>> {
+            collect_resolved_overlay_ops(ec.ctx, ec.store, ec.g_id, RunSortOrder::Psot, sid)
+        };
     let mut req_ops = Vec::with_capacity(req_sids.len());
     for sid in &req_sids {
         let Some(ops) = collect(sid)? else {
@@ -1486,7 +1497,9 @@ fn sum_optional_join_overlay_parallel(
     let epoch = ec.ctx.overlay.as_ref().map(|o| o.epoch()).unwrap_or(0);
     let driver_p = *req_pids
         .iter()
-        .max_by_key(|&&p| leaf_entries_for_predicate(ec.store, ec.g_id, RunSortOrder::Psot, p).len())
+        .max_by_key(|&&p| {
+            leaf_entries_for_predicate(ec.store, ec.g_id, RunSortOrder::Psot, p).len()
+        })
         .unwrap();
 
     let store = ec.store;
@@ -1911,9 +1924,7 @@ fn sum_star_join(
     // full symmetric scan of every predicate. BASE index only, so HEAD-gated;
     // under overlay the cursor-merge path below stays correct.
     if !ec.overlay {
-        if let Some(total) =
-            try_sum_star_join_seek(children, ec, exclude_sorted, include_sorted)?
-        {
+        if let Some(total) = try_sum_star_join_seek(children, ec, exclude_sorted, include_sorted)? {
             return Ok(Some(total));
         }
         // Both-large plain star (no modifiers): partition the subject space and
@@ -2163,8 +2174,8 @@ fn try_optional_seek(
                 continue;
             }
             if let Some(count_a) = a_seek.count_for_subject(s)? {
-                bonus = bonus
-                    .saturating_add((count_a as u128).saturating_mul((count_b - 1) as u128));
+                bonus =
+                    bonus.saturating_add((count_a as u128).saturating_mul((count_b - 1) as u128));
             }
         }
         (rows_a as u128).saturating_add(bonus)

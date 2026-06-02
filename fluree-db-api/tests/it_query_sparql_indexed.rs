@@ -1152,8 +1152,7 @@ async fn indexed_parallel_star_join_count_matches_serial() {
                 let c2 = (i % 2) + 1;
                 expected += c1 * c2;
                 let p1: Vec<serde_json::Value> = (0..c1).map(|j| json!(i * 100 + j)).collect();
-                let p2: Vec<serde_json::Value> =
-                    (0..c2).map(|j| json!(i * 100 + 50 + j)).collect();
+                let p2: Vec<serde_json::Value> = (0..c2).map(|j| json!(i * 100 + 50 + j)).collect();
                 nodes.push(json!({"@id": format!("ex:s{i}"), "ex:p1": p1, "ex:p2": p2}));
             }
             let ledger1 = fluree
@@ -1924,7 +1923,10 @@ async fn overlay_numeric_compare_sum_folds_novelty() {
                 .await
                 .expect("novelty insert");
 
-            let view = fluree.db(ledger_id).await.expect("load HEAD view w/ novelty");
+            let view = fluree
+                .db(ledger_id)
+                .await
+                .expect("load HEAD view w/ novelty");
             let q = r"
                 PREFIX ex: <http://example.org/ns/>
                 SELECT (SUM(?o > 0) AS ?sum) WHERE { ?s ex:num ?o }
@@ -2006,7 +2008,10 @@ async fn overlay_parallel_encoded_filter_count_folds_novelty() {
                 .await
                 .expect("novelty insert");
 
-            let view = fluree.db(ledger_id).await.expect("load HEAD view w/ novelty");
+            let view = fluree
+                .db(ledger_id)
+                .await
+                .expect("load HEAD view w/ novelty");
             let q = r"
                 PREFIX rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#>
                 SELECT (COUNT(?s) AS ?count)
@@ -2091,7 +2096,10 @@ async fn overlay_parallel_numeric_compare_sum_folds_novelty() {
                 .await
                 .expect("novelty insert");
 
-            let view = fluree.db(ledger_id).await.expect("load HEAD view w/ novelty");
+            let view = fluree
+                .db(ledger_id)
+                .await
+                .expect("load HEAD view w/ novelty");
             let q = r"
                 PREFIX ex: <http://example.org/ns/>
                 SELECT (SUM(?o > 0) AS ?sum) WHERE { ?s ex:num ?o }
@@ -2176,7 +2184,10 @@ async fn overlay_parallel_star_join_count_folds_novelty() {
                 .await
                 .expect("novelty insert");
 
-            let view = fluree.db(ledger_id).await.expect("load HEAD view w/ novelty");
+            let view = fluree
+                .db(ledger_id)
+                .await
+                .expect("load HEAD view w/ novelty");
             let q = r"
                 PREFIX ex: <http://example.org/ns/>
                 SELECT (COUNT(*) AS ?count)
@@ -2253,7 +2264,9 @@ async fn overlay_parallel_optional_join_count_folds_novelty() {
             // Novelty: 50 subjects with p1 + 2x p2 -> multiplier 2 each -> +100.
             let mut nov: Vec<serde_json::Value> = Vec::new();
             for j in 0..50 {
-                nov.push(json!({"@id": format!("ex:n{j}"), "ex:p1": j, "ex:p2": [j * 10, j * 10 + 1]}));
+                nov.push(
+                    json!({"@id": format!("ex:n{j}"), "ex:p1": j, "ex:p2": [j * 10, j * 10 + 1]}),
+                );
                 expected += 2;
             }
             let _ = fluree
@@ -2264,7 +2277,10 @@ async fn overlay_parallel_optional_join_count_folds_novelty() {
                 .await
                 .expect("novelty insert");
 
-            let view = fluree.db(ledger_id).await.expect("load HEAD view w/ novelty");
+            let view = fluree
+                .db(ledger_id)
+                .await
+                .expect("load HEAD view w/ novelty");
             let q = r"
                 PREFIX ex: <http://example.org/ns/>
                 SELECT (COUNT(*) AS ?count)
@@ -2556,8 +2572,9 @@ async fn overlay_delta_single_predicate_count_folds_novelty() {
                 .expect("novelty assert")
                 .ledger;
             // Novelty retract: remove ex:p of 10 base subjects.
-            let del: Vec<serde_json::Value> =
-                (0..10).map(|i| json!({"@id": format!("ex:s{i}"), "ex:p": i})).collect();
+            let del: Vec<serde_json::Value> = (0..10)
+                .map(|i| json!({"@id": format!("ex:s{i}"), "ex:p": i}))
+                .collect();
             let _ = fluree
                 .update(
                     ledger,
@@ -2566,7 +2583,10 @@ async fn overlay_delta_single_predicate_count_folds_novelty() {
                 .await
                 .expect("novelty retract");
 
-            let view = fluree.db(ledger_id).await.expect("load HEAD view w/ novelty");
+            let view = fluree
+                .db(ledger_id)
+                .await
+                .expect("load HEAD view w/ novelty");
             let q = r"
                 PREFIX ex: <http://example.org/ns/>
                 SELECT (COUNT(*) AS ?count) WHERE { ?s ex:p ?o }
@@ -2648,8 +2668,9 @@ async fn overlay_delta_union_count_folds_novelty() {
                 .await
                 .expect("novelty assert")
                 .ledger;
-            let del: Vec<serde_json::Value> =
-                (0..5).map(|i| json!({"@id": format!("ex:s{i}"), "ex:p1": i})).collect();
+            let del: Vec<serde_json::Value> = (0..5)
+                .map(|i| json!({"@id": format!("ex:s{i}"), "ex:p1": i}))
+                .collect();
             let _ = fluree
                 .update(
                     ledger,
@@ -2658,7 +2679,10 @@ async fn overlay_delta_union_count_folds_novelty() {
                 .await
                 .expect("novelty retract");
 
-            let view = fluree.db(ledger_id).await.expect("load HEAD view w/ novelty");
+            let view = fluree
+                .db(ledger_id)
+                .await
+                .expect("load HEAD view w/ novelty");
             let q = r"
                 PREFIX ex: <http://example.org/ns/>
                 SELECT (COUNT(*) AS ?count) WHERE { { ?s ex:p1 ?o } UNION { ?s ex:p2 ?o } }
@@ -2800,7 +2824,10 @@ async fn overlay_encoded_filter_count_folds_novelty() {
                 .await
                 .expect("novelty insert");
 
-            let view = fluree.db(ledger_id).await.expect("load HEAD view w/ novelty");
+            let view = fluree
+                .db(ledger_id)
+                .await
+                .expect("load HEAD view w/ novelty");
             let q = r"
                 PREFIX rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#>
                 SELECT (COUNT(?s) AS ?count)
@@ -3004,8 +3031,7 @@ async fn indexed_star_join_seek_strategy_counts_correctly() {
             let ledger0 = genesis_ledger_for_fluree(&fluree, ledger_id);
             // Driver p1 rows = 3 (ex:a:2, ex:c:1). Probe p2 rows = 3 + 24_600 filler
             // = 24_603 > 3 * 8192 = 24_576, so the seek strategy fires.
-            let filler: Vec<serde_json::Value> =
-                (0..24_600).map(|n| json!(n)).collect();
+            let filler: Vec<serde_json::Value> = (0..24_600).map(|n| json!(n)).collect();
             let insert = json!({
                 "@context": { "ex": "http://example.org/ns/" },
                 "@graph": [

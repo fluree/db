@@ -158,7 +158,9 @@ async fn class_property_datatype_decrements_after_delete_non_last_instance() {
     let tmp = tempfile::TempDir::new().expect("tempdir");
     let path = tmp.path().to_string_lossy().to_string();
 
-    let mut fluree = FlureeBuilder::file(path).build().expect("build file fluree");
+    let mut fluree = FlureeBuilder::file(path)
+        .build()
+        .expect("build file fluree");
 
     let (local, handle) = start_background_indexer_local(
         fluree.backend().clone(),
@@ -280,7 +282,9 @@ async fn class_property_reattributed_after_retype() {
     let tmp = tempfile::TempDir::new().expect("tempdir");
     let path = tmp.path().to_string_lossy().to_string();
 
-    let mut fluree = FlureeBuilder::file(path).build().expect("build file fluree");
+    let mut fluree = FlureeBuilder::file(path)
+        .build()
+        .expect("build file fluree");
 
     let (local, handle) = start_background_indexer_local(
         fluree.backend().clone(),
@@ -449,7 +453,9 @@ fn ref_class_total(
 async fn ref_class_reattributed_after_subject_retype() {
     let tmp = tempfile::TempDir::new().expect("tempdir");
     let path = tmp.path().to_string_lossy().to_string();
-    let mut fluree = FlureeBuilder::file(path).build().expect("build file fluree");
+    let mut fluree = FlureeBuilder::file(path)
+        .build()
+        .expect("build file fluree");
     let (local, handle) = start_background_indexer_local(
         fluree.backend().clone(),
         Arc::new(fluree.nameservice_mode().clone()),
@@ -478,10 +484,17 @@ async fn ref_class_reattributed_after_subject_retype() {
                 ]
             });
             let r1 = fluree
-                .insert_with_opts(ledger0, &txn1, TxnOpts::default(), CommitOpts::default(), &index_cfg)
+                .insert_with_opts(
+                    ledger0,
+                    &txn1,
+                    TxnOpts::default(),
+                    CommitOpts::default(),
+                    &index_cfg,
+                )
                 .await
                 .expect("insert txn1");
-            let o1 = trigger_index_and_wait_outcome(&handle, r1.ledger.ledger_id(), r1.receipt.t).await;
+            let o1 =
+                trigger_index_and_wait_outcome(&handle, r1.ledger.ledger_id(), r1.receipt.t).await;
             let fluree_db_api::IndexOutcome::Completed { root_id, .. } = o1 else {
                 unreachable!("helper only returns Completed")
             };
@@ -489,7 +502,12 @@ async fn ref_class_reattributed_after_subject_retype() {
                 .await
                 .expect("load snapshot 1");
             assert_eq!(
-                ref_class_total(&loaded1, "http://example.org/Person", "http://example.org/worksFor", "http://example.org/Organization"),
+                ref_class_total(
+                    &loaded1,
+                    "http://example.org/Person",
+                    "http://example.org/worksFor",
+                    "http://example.org/Organization"
+                ),
                 Some(1),
                 "first index: Person.worksFor -> Organization == 1"
             );
@@ -502,10 +520,17 @@ async fn ref_class_reattributed_after_subject_retype() {
                 "insert": {"@id":"ex:alice","@type":"ex:Employee"}
             });
             let r2 = fluree
-                .update_with_opts(r1.ledger, &retype, TxnOpts::default(), CommitOpts::default(), &index_cfg)
+                .update_with_opts(
+                    r1.ledger,
+                    &retype,
+                    TxnOpts::default(),
+                    CommitOpts::default(),
+                    &index_cfg,
+                )
                 .await
                 .expect("retype alice");
-            let o2 = trigger_index_and_wait_outcome(&handle, r2.ledger.ledger_id(), r2.receipt.t).await;
+            let o2 =
+                trigger_index_and_wait_outcome(&handle, r2.ledger.ledger_id(), r2.receipt.t).await;
             let fluree_db_api::IndexOutcome::Completed { root_id, .. } = o2 else {
                 unreachable!("helper only returns Completed")
             };
@@ -513,12 +538,22 @@ async fn ref_class_reattributed_after_subject_retype() {
                 .await
                 .expect("load snapshot 2");
             assert_eq!(
-                ref_class_total(&loaded2, "http://example.org/Person", "http://example.org/worksFor", "http://example.org/Organization"),
+                ref_class_total(
+                    &loaded2,
+                    "http://example.org/Person",
+                    "http://example.org/worksFor",
+                    "http://example.org/Organization"
+                ),
                 None,
                 "Person.worksFor edge must be gone after alice re-typed away"
             );
             assert_eq!(
-                ref_class_total(&loaded2, "http://example.org/Employee", "http://example.org/worksFor", "http://example.org/Organization"),
+                ref_class_total(
+                    &loaded2,
+                    "http://example.org/Employee",
+                    "http://example.org/worksFor",
+                    "http://example.org/Organization"
+                ),
                 Some(1),
                 "Employee.worksFor -> Organization == 1 after re-type"
             );
@@ -532,7 +567,9 @@ async fn ref_class_reattributed_after_subject_retype() {
 async fn ref_class_reattributed_after_object_retype() {
     let tmp = tempfile::TempDir::new().expect("tempdir");
     let path = tmp.path().to_string_lossy().to_string();
-    let mut fluree = FlureeBuilder::file(path).build().expect("build file fluree");
+    let mut fluree = FlureeBuilder::file(path)
+        .build()
+        .expect("build file fluree");
     let (local, handle) = start_background_indexer_local(
         fluree.backend().clone(),
         Arc::new(fluree.nameservice_mode().clone()),
@@ -561,10 +598,17 @@ async fn ref_class_reattributed_after_object_retype() {
                 ]
             });
             let r1 = fluree
-                .insert_with_opts(ledger0, &txn1, TxnOpts::default(), CommitOpts::default(), &index_cfg)
+                .insert_with_opts(
+                    ledger0,
+                    &txn1,
+                    TxnOpts::default(),
+                    CommitOpts::default(),
+                    &index_cfg,
+                )
                 .await
                 .expect("insert txn1");
-            let o1 = trigger_index_and_wait_outcome(&handle, r1.ledger.ledger_id(), r1.receipt.t).await;
+            let o1 =
+                trigger_index_and_wait_outcome(&handle, r1.ledger.ledger_id(), r1.receipt.t).await;
             let fluree_db_api::IndexOutcome::Completed { root_id, .. } = o1 else {
                 unreachable!("helper only returns Completed")
             };
@@ -572,7 +616,12 @@ async fn ref_class_reattributed_after_object_retype() {
                 .await
                 .expect("load snapshot 1");
             assert_eq!(
-                ref_class_total(&loaded1, "http://example.org/Employee", "http://example.org/worksFor", "http://example.org/Organization"),
+                ref_class_total(
+                    &loaded1,
+                    "http://example.org/Employee",
+                    "http://example.org/worksFor",
+                    "http://example.org/Organization"
+                ),
                 Some(1),
                 "first index: Employee.worksFor -> Organization == 1"
             );
@@ -585,10 +634,17 @@ async fn ref_class_reattributed_after_object_retype() {
                 "insert": {"@id":"ex:org1","@type":"ex:Company"}
             });
             let r2 = fluree
-                .update_with_opts(r1.ledger, &retype, TxnOpts::default(), CommitOpts::default(), &index_cfg)
+                .update_with_opts(
+                    r1.ledger,
+                    &retype,
+                    TxnOpts::default(),
+                    CommitOpts::default(),
+                    &index_cfg,
+                )
                 .await
                 .expect("retype org1");
-            let o2 = trigger_index_and_wait_outcome(&handle, r2.ledger.ledger_id(), r2.receipt.t).await;
+            let o2 =
+                trigger_index_and_wait_outcome(&handle, r2.ledger.ledger_id(), r2.receipt.t).await;
             let fluree_db_api::IndexOutcome::Completed { root_id, .. } = o2 else {
                 unreachable!("helper only returns Completed")
             };
@@ -596,12 +652,22 @@ async fn ref_class_reattributed_after_object_retype() {
                 .await
                 .expect("load snapshot 2");
             assert_eq!(
-                ref_class_total(&loaded2, "http://example.org/Employee", "http://example.org/worksFor", "http://example.org/Organization"),
+                ref_class_total(
+                    &loaded2,
+                    "http://example.org/Employee",
+                    "http://example.org/worksFor",
+                    "http://example.org/Organization"
+                ),
                 None,
                 "old object-class bucket must be gone after org1 re-typed"
             );
             assert_eq!(
-                ref_class_total(&loaded2, "http://example.org/Employee", "http://example.org/worksFor", "http://example.org/Company"),
+                ref_class_total(
+                    &loaded2,
+                    "http://example.org/Employee",
+                    "http://example.org/worksFor",
+                    "http://example.org/Company"
+                ),
                 Some(1),
                 "Employee.worksFor -> Company == 1 after object re-type"
             );
@@ -616,7 +682,9 @@ async fn ref_class_reattributed_after_object_retype() {
 async fn ref_class_reattributed_after_both_endpoints_retype() {
     let tmp = tempfile::TempDir::new().expect("tempdir");
     let path = tmp.path().to_string_lossy().to_string();
-    let mut fluree = FlureeBuilder::file(path).build().expect("build file fluree");
+    let mut fluree = FlureeBuilder::file(path)
+        .build()
+        .expect("build file fluree");
     let (local, handle) = start_background_indexer_local(
         fluree.backend().clone(),
         Arc::new(fluree.nameservice_mode().clone()),
@@ -645,10 +713,17 @@ async fn ref_class_reattributed_after_both_endpoints_retype() {
                 ]
             });
             let r1 = fluree
-                .insert_with_opts(ledger0, &txn1, TxnOpts::default(), CommitOpts::default(), &index_cfg)
+                .insert_with_opts(
+                    ledger0,
+                    &txn1,
+                    TxnOpts::default(),
+                    CommitOpts::default(),
+                    &index_cfg,
+                )
                 .await
                 .expect("insert txn1");
-            let _ = trigger_index_and_wait_outcome(&handle, r1.ledger.ledger_id(), r1.receipt.t).await;
+            let _ =
+                trigger_index_and_wait_outcome(&handle, r1.ledger.ledger_id(), r1.receipt.t).await;
 
             // Re-type BOTH alice (Person->Employee) and org1 (Organization->Company);
             // worksFor edge untouched.
@@ -664,10 +739,17 @@ async fn ref_class_reattributed_after_both_endpoints_retype() {
                 ]
             });
             let r2 = fluree
-                .update_with_opts(r1.ledger, &retype, TxnOpts::default(), CommitOpts::default(), &index_cfg)
+                .update_with_opts(
+                    r1.ledger,
+                    &retype,
+                    TxnOpts::default(),
+                    CommitOpts::default(),
+                    &index_cfg,
+                )
                 .await
                 .expect("retype both");
-            let o2 = trigger_index_and_wait_outcome(&handle, r2.ledger.ledger_id(), r2.receipt.t).await;
+            let o2 =
+                trigger_index_and_wait_outcome(&handle, r2.ledger.ledger_id(), r2.receipt.t).await;
             let fluree_db_api::IndexOutcome::Completed { root_id, .. } = o2 else {
                 unreachable!("helper only returns Completed")
             };
@@ -675,18 +757,33 @@ async fn ref_class_reattributed_after_both_endpoints_retype() {
                 .await
                 .expect("load snapshot 2");
             assert_eq!(
-                ref_class_total(&loaded2, "http://example.org/Person", "http://example.org/worksFor", "http://example.org/Organization"),
+                ref_class_total(
+                    &loaded2,
+                    "http://example.org/Person",
+                    "http://example.org/worksFor",
+                    "http://example.org/Organization"
+                ),
                 None,
                 "old (Person, worksFor, Organization) bucket gone"
             );
             assert_eq!(
-                ref_class_total(&loaded2, "http://example.org/Employee", "http://example.org/worksFor", "http://example.org/Company"),
+                ref_class_total(
+                    &loaded2,
+                    "http://example.org/Employee",
+                    "http://example.org/worksFor",
+                    "http://example.org/Company"
+                ),
                 Some(1),
                 "new (Employee, worksFor, Company) bucket == 1 (moved exactly once)"
             );
             // No double-count: the only worksFor->Company edge is the single one.
             assert_eq!(
-                ref_class_total(&loaded2, "http://example.org/Employee", "http://example.org/worksFor", "http://example.org/Organization"),
+                ref_class_total(
+                    &loaded2,
+                    "http://example.org/Employee",
+                    "http://example.org/worksFor",
+                    "http://example.org/Organization"
+                ),
                 None,
                 "no stale Employee.worksFor -> Organization"
             );
@@ -701,7 +798,9 @@ async fn ref_class_reattributed_after_both_endpoints_retype() {
 async fn large_retype_batch_defers_to_rebuild_and_stays_correct() {
     let tmp = tempfile::TempDir::new().expect("tempdir");
     let path = tmp.path().to_string_lossy().to_string();
-    let mut fluree = FlureeBuilder::file(path).build().expect("build file fluree");
+    let mut fluree = FlureeBuilder::file(path)
+        .build()
+        .expect("build file fluree");
     // Threshold of 1: re-typing 2+ existing subjects forces the rebuild fallback.
     let (local, handle) = start_background_indexer_local(
         fluree.backend().clone(),
@@ -733,10 +832,17 @@ async fn large_retype_batch_defers_to_rebuild_and_stays_correct() {
                 ]
             });
             let r1 = fluree
-                .insert_with_opts(ledger0, &txn1, TxnOpts::default(), CommitOpts::default(), &index_cfg)
+                .insert_with_opts(
+                    ledger0,
+                    &txn1,
+                    TxnOpts::default(),
+                    CommitOpts::default(),
+                    &index_cfg,
+                )
                 .await
                 .expect("insert txn1");
-            let _ = trigger_index_and_wait_outcome(&handle, r1.ledger.ledger_id(), r1.receipt.t).await;
+            let _ =
+                trigger_index_and_wait_outcome(&handle, r1.ledger.ledger_id(), r1.receipt.t).await;
 
             // Re-type alice and bob (2 existing subjects > threshold 1) -> rebuild path.
             let retype = json!({
@@ -751,10 +857,17 @@ async fn large_retype_batch_defers_to_rebuild_and_stays_correct() {
                 ]
             });
             let r2 = fluree
-                .update_with_opts(r1.ledger, &retype, TxnOpts::default(), CommitOpts::default(), &index_cfg)
+                .update_with_opts(
+                    r1.ledger,
+                    &retype,
+                    TxnOpts::default(),
+                    CommitOpts::default(),
+                    &index_cfg,
+                )
                 .await
                 .expect("retype alice+bob");
-            let o2 = trigger_index_and_wait_outcome(&handle, r2.ledger.ledger_id(), r2.receipt.t).await;
+            let o2 =
+                trigger_index_and_wait_outcome(&handle, r2.ledger.ledger_id(), r2.receipt.t).await;
             let fluree_db_api::IndexOutcome::Completed { root_id, .. } = o2 else {
                 unreachable!("helper only returns Completed")
             };
@@ -763,15 +876,33 @@ async fn large_retype_batch_defers_to_rebuild_and_stays_correct() {
                 .expect("load snapshot 2");
 
             // Rebuild must produce correct current-state stats.
-            assert_eq!(class_count(&loaded2, "http://example.org/Person"), Some(1), "Person == 1 (carol)");
-            assert_eq!(class_count(&loaded2, "http://example.org/Employee"), Some(2), "Employee == 2 (alice, bob)");
             assert_eq!(
-                ref_class_total(&loaded2, "http://example.org/Person", "http://example.org/worksFor", "http://example.org/Organization"),
+                class_count(&loaded2, "http://example.org/Person"),
+                Some(1),
+                "Person == 1 (carol)"
+            );
+            assert_eq!(
+                class_count(&loaded2, "http://example.org/Employee"),
+                Some(2),
+                "Employee == 2 (alice, bob)"
+            );
+            assert_eq!(
+                ref_class_total(
+                    &loaded2,
+                    "http://example.org/Person",
+                    "http://example.org/worksFor",
+                    "http://example.org/Organization"
+                ),
                 Some(1),
                 "carol still Person.worksFor -> Organization"
             );
             assert_eq!(
-                ref_class_total(&loaded2, "http://example.org/Employee", "http://example.org/worksFor", "http://example.org/Organization"),
+                ref_class_total(
+                    &loaded2,
+                    "http://example.org/Employee",
+                    "http://example.org/worksFor",
+                    "http://example.org/Organization"
+                ),
                 Some(2),
                 "alice+bob now Employee.worksFor -> Organization"
             );

@@ -159,10 +159,10 @@ mod tests {
 
         // (expr, expect_is_iri, expect_is_blank) — isLiteral must be false for all (node refs).
         let cases = [
-            (Expression::Var(VarId(0)), true, false),  // IRI as Sid
-            (Expression::Var(VarId(1)), false, true),  // bnode as Sid (ns_code branch)
-            (Expression::Var(VarId(2)), true, false),  // IRI as Iri string
-            (Expression::Var(VarId(3)), false, true),  // bnode as "_:" Iri (prefix branch)
+            (Expression::Var(VarId(0)), true, false), // IRI as Sid
+            (Expression::Var(VarId(1)), false, true), // bnode as Sid (ns_code branch)
+            (Expression::Var(VarId(2)), true, false), // IRI as Iri string
+            (Expression::Var(VarId(3)), false, true), // bnode as "_:" Iri (prefix branch)
         ];
 
         for (expr, want_iri, want_blank) in cases {

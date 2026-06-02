@@ -568,11 +568,17 @@ fn try_union_constraint_overlay_parallel(
 
     let (union_pids, union_ops, extra_pids, extra_ops) =
         (&union_pids, &union_ops, &extra_pids, &extra_ops);
-    crate::count_plan_exec::parallel_partition_count(store, g_id, driver_p, total_rows, move |lo, hi| {
-        merge_union_constraint_count_range_overlay(
-            store, g_id, union_pids, union_ops, extra_pids, extra_ops, to_t, epoch, lo, hi,
-        )
-    })
+    crate::count_plan_exec::parallel_partition_count(
+        store,
+        g_id,
+        driver_p,
+        total_rows,
+        move |lo, hi| {
+            merge_union_constraint_count_range_overlay(
+                store, g_id, union_pids, union_ops, extra_pids, extra_ops, to_t, epoch, lo, hi,
+            )
+        },
+    )
 }
 
 fn count_union_star(
@@ -656,7 +662,11 @@ fn count_union_star(
     // Parallel partitioned merge for the constrained `AllRows` case:
     // `{ ?s p1 ?o } UNION { ?s p2 ?o } . ?s e1 ?o2 …` COUNT(*) over large
     // predicates. HEAD-only (no overlay/time-travel); else the cursor merge below.
-    if matches!(mode, UnionCountMode::AllRows) && !extra_preds.is_empty() && !overlay_has_rows && !time_travel {
+    if matches!(mode, UnionCountMode::AllRows)
+        && !extra_preds.is_empty()
+        && !overlay_has_rows
+        && !time_travel
+    {
         if let Some(total) = try_union_constraint_parallel(store, g_id, union_preds, extra_preds)? {
             return Ok(Some(total));
         }

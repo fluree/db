@@ -2060,9 +2060,7 @@ pub async fn incremental_index(
                 let changed_membership: std::collections::HashSet<(u16, u64)> =
                     novelty_subject_class_deltas
                         .keys()
-                        .filter(|key| {
-                            base_subject_classes.get(*key) != subject_classes.get(*key)
-                        })
+                        .filter(|key| base_subject_classes.get(*key) != subject_classes.get(*key))
                         .copied()
                         .collect();
 
@@ -2348,7 +2346,8 @@ pub async fn incremental_index(
                                         }
                                     }
                                 }
-                                if let Some(s_langs) = novelty_subject_prop_langs.get(&(g_id, s_id)) {
+                                if let Some(s_langs) = novelty_subject_prop_langs.get(&(g_id, s_id))
+                                {
                                     for (&pid, lang_map) in s_langs {
                                         for (&lid, &cnt) in lang_map {
                                             combined_langs
@@ -2509,8 +2508,7 @@ pub async fn incremental_index(
                                         .unwrap_or_default();
                                     (base, net)
                                 } else {
-                                    let cls =
-                                        external_base.get(&sid).cloned().unwrap_or_default();
+                                    let cls = external_base.get(&sid).cloned().unwrap_or_default();
                                     (cls.clone(), cls)
                                 }
                             };
@@ -2678,15 +2676,20 @@ pub async fn incremental_index(
                 delta_class_keys.extend(class_prop_lang_deltas.keys().copied());
                 delta_class_keys.extend(ref_edges.keys().copied());
                 for (g_id, class_sid64) in delta_class_keys {
-                    entries_by_key.entry((g_id, class_sid64)).or_insert_with(|| {
-                        let class_sid =
-                            resolve_class_sid(class_sid64, store_opt.as_deref(), &new_subject_suffix);
-                        is::ClassStatEntry {
-                            class_sid,
-                            count: 0,
-                            properties: Vec::new(),
-                        }
-                    });
+                    entries_by_key
+                        .entry((g_id, class_sid64))
+                        .or_insert_with(|| {
+                            let class_sid = resolve_class_sid(
+                                class_sid64,
+                                store_opt.as_deref(),
+                                &new_subject_suffix,
+                            );
+                            is::ClassStatEntry {
+                                class_sid,
+                                count: 0,
+                                properties: Vec::new(),
+                            }
+                        });
                 }
 
                 // Build property attribution for each class entry.
