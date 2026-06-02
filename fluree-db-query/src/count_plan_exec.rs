@@ -18,14 +18,15 @@ use crate::count_plan::{
 };
 use crate::error::{QueryError, Result};
 use crate::fast_path_common::{
-    allow_cursor_fast_path, build_count_batch, build_post_cursor_for_predicate,
-    build_psot_cursor_for_predicate, collect_subjects_for_predicate_set,
-    collect_subjects_for_predicate_sorted, collect_subjects_with_object_in_set,
-    count_rows_for_predicate_psot, cursor_projection_otype_okey, cursor_projection_sid_only,
-    cursor_projection_sid_otype_okey, intersect_many_sorted, leaf_entries_for_predicate,
-    normalize_pred_sid, projection_sid_otype_okey, sum_post_object_counts_filtered,
-    CursorSubjectCountStream, FastPathOperator, ObjectFilterMode, PostObjectGroupCountIter,
-    PsotObjectFilterCountIter, PsotSubjectCountIter, PsotSubjectSeek, PsotSubjectWeightedSumIter,
+    allow_cursor_fast_path, build_count_batch, build_overlay_cursor_for_subject_range,
+    build_post_cursor_for_predicate, build_psot_cursor_for_predicate, collect_resolved_overlay_ops,
+    collect_subjects_for_predicate_set, collect_subjects_for_predicate_sorted,
+    collect_subjects_with_object_in_set, count_rows_for_predicate_psot, cursor_projection_otype_okey,
+    cursor_projection_sid_only, cursor_projection_sid_otype_okey, intersect_many_sorted,
+    leaf_entries_for_predicate, normalize_pred_sid, projection_sid_otype_okey,
+    slice_overlay_ops_by_subject, sum_post_object_counts_filtered, CursorSubjectCountStream,
+    FastPathOperator, ObjectFilterMode, PostObjectGroupCountIter, PsotObjectFilterCountIter,
+    PsotSubjectCountIter, PsotSubjectSeek, PsotSubjectWeightedSumIter,
 };
 use crate::ir::triple::Ref;
 use crate::operator::BoxedOperator;
@@ -1070,6 +1071,130 @@ fn sum_star_join_parallel(children: &[StreamNode], ec: &ExecCtx<'_, '_>) -> Resu
     })
 }
 
+/// Overlay/time-travel variant of `merge_count_range` for one subject partition:
+/// the N-way inner-star merge over `[lo, hi)`, but each predicate is read through a
+/// *bounded overlay cursor* (its leaves in `[lo, hi)` plus its novelty ops sliced to
+/// that range) rather than a base-only iterator, so novelty is folded in. A
+/// `max_s ∈ [lo, hi)` guard keeps subjects in boundary leaves (shared with an
+/// adjacent partition) counted by exactly one partition. `ops_per_pred[i]` are the
+/// resolved overlay ops for `p_ids[i]`, collected once by the caller.
+#[allow(clippy::too_many_arguments)]
+fn merge_count_range_overlay(
+    store: &Arc<BinaryIndexStore>,
+    g_id: fluree_db_core::GraphId,
+    p_ids: &[u32],
+    ops_per_pred: &[Vec<fluree_db_binary_index::read::types::OverlayOp>],
+    to_t: i64,
+    epoch: u64,
+    lo: u64,
+    hi: u64,
+) -> Result<u128> {
+    let mut streams: Vec<CursorSubjectCountStream> = Vec::with_capacity(p_ids.len());
+    for (i, &p_id) in p_ids.iter().enumerate() {
+        let sliced = slice_overlay_ops_by_subject(&ops_per_pred[i], lo, hi);
+        let Some(cursor) = build_overlay_cursor_for_subject_range(
+            store,
+            g_id,
+            p_id,
+            cursor_projection_sid_only(),
+            lo,
+            hi,
+            sliced,
+            to_t,
+            epoch,
+        ) else {
+            return Ok(0); // PSOT branch absent => empty intersection
+        };
+        streams.push(CursorSubjectCountStream::new(cursor));
+    }
+
+    let mut curr: Vec<Option<(u64, u64)>> = Vec::with_capacity(streams.len());
+    for s in &mut streams {
+        curr.push(s.next_group()?);
+    }
+    let mut total: u128 = 0;
+    loop {
+        if curr.iter().any(std::option::Option::is_none) {
+            break;
+        }
+        let max_s = curr.iter().filter_map(|c| c.map(|(s, _)| s)).max().unwrap();
+        if curr.iter().all(|c| c.map(|(s, _)| s) == Some(max_s)) {
+            if max_s >= lo && max_s < hi {
+                let product: u128 = curr.iter().map(|c| c.unwrap().1 as u128).product();
+                total = total.saturating_add(product);
+            }
+            for (i, s) in streams.iter_mut().enumerate() {
+                curr[i] = s.next_group()?;
+            }
+        } else {
+            for (i, s) in streams.iter_mut().enumerate() {
+                if let Some((s_id, _)) = curr[i] {
+                    if s_id < max_s {
+                        curr[i] = s.next_group()?;
+                    }
+                }
+            }
+        }
+    }
+    Ok(total)
+}
+
+/// Overlay/time-travel parallel inner-star `COUNT(*)`: like `sum_star_join_parallel`
+/// but folds novelty. Collects each predicate's resolved overlay ops once, then runs
+/// the bounded-overlay N-way merge per subject partition on the shared pool. Returns
+/// `Ok(None)` to defer to the serial cursor merge for any non-plain shape, an absent
+/// predicate (novelty-only or missing — serial/general handles it), an
+/// overlay-translation failure, or too few rows.
+fn sum_star_join_overlay_parallel(
+    children: &[StreamNode],
+    ec: &ExecCtx<'_, '_>,
+) -> Result<Option<u64>> {
+    if children.len() < 2 {
+        return Ok(None);
+    }
+    let mut p_ids: Vec<u32> = Vec::with_capacity(children.len());
+    let mut sids = Vec::with_capacity(children.len());
+    let mut total_rows: u64 = 0;
+    for child in children {
+        let StreamNode::SubjectCountScan { pred } = child else {
+            return Ok(None);
+        };
+        let sid = normalize_pred_sid(ec.store, pred)?;
+        let Some(p_id) = ec.store.sid_to_p_id(&sid) else {
+            return Ok(None); // absent in base => defer (serial bails to general)
+        };
+        total_rows =
+            total_rows.saturating_add(count_rows_for_predicate_psot(ec.store, ec.g_id, p_id)?);
+        p_ids.push(p_id);
+        sids.push(sid);
+    }
+
+    // Collect + resolve each predicate's overlay ops once (serial; novelty is small).
+    let mut ops_per_pred: Vec<Vec<fluree_db_binary_index::read::types::OverlayOp>> =
+        Vec::with_capacity(sids.len());
+    for sid in &sids {
+        match collect_resolved_overlay_ops(ec.ctx, ec.store, ec.g_id, RunSortOrder::Psot, sid)? {
+            Some(ops) => ops_per_pred.push(ops),
+            None => return Ok(None),
+        }
+    }
+    let to_t = ec.ctx.to_t;
+    let epoch = ec.ctx.overlay.as_ref().map(|o| o.epoch()).unwrap_or(0);
+
+    let driver_p = *p_ids
+        .iter()
+        .max_by_key(|&&p| leaf_entries_for_predicate(ec.store, ec.g_id, RunSortOrder::Psot, p).len())
+        .unwrap();
+
+    let store = ec.store;
+    let g_id = ec.g_id;
+    let p_ids_ref = &p_ids;
+    let ops_ref = &ops_per_pred;
+    parallel_partition_count(store, g_id, driver_p, total_rows, move |lo, hi| {
+        merge_count_range_overlay(store, g_id, p_ids_ref, ops_ref, to_t, epoch, lo, hi)
+    })
+}
+
 /// Parallel partitioned variant of `sum_optional_join` for the all-present-
 /// predicate shape (single/star required + optional groups of `SubjectCountScan`s).
 /// Partitions by the required side and runs the optional merge per range. Returns
@@ -1388,6 +1513,15 @@ fn sum_star_join(
             if let Some(total) = sum_star_join_parallel(children, ec)? {
                 return Ok(Some(total));
             }
+        }
+    }
+
+    // Overlay/time-travel plain star: parallelize the base scan and fold novelty
+    // per partition (bounded overlay cursors). Falls through to the serial cursor
+    // merge below for small inputs, absent predicates, or translation failures.
+    if ec.overlay && exclude_sorted.is_none() && include_sorted.is_none() {
+        if let Some(total) = sum_star_join_overlay_parallel(children, ec)? {
+            return Ok(Some(total));
         }
     }
 

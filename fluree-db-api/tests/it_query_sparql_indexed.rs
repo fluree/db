@@ -2111,6 +2111,92 @@ async fn overlay_parallel_numeric_compare_sum_folds_novelty() {
         .await;
 }
 
+/// PARALLEL overlay lane for the inner-star COUNT(*) join `{ ?s p1 ?o1 . ?s p2 ?o2 }`:
+/// >50k indexed base rows + novelty, queried at HEAD. The base scan partitions across
+/// cores and each partition folds its novelty via bounded overlay cursors. Subjects
+/// with only one predicate (base + novelty) must be excluded from the intersection.
+#[tokio::test]
+async fn overlay_parallel_star_join_count_folds_novelty() {
+    assert_index_defaults();
+    let fluree = FlureeBuilder::memory()
+        .with_ledger_cache_config(LedgerManagerConfig::default())
+        .build_memory();
+    let ledger_id = "it/overlay-parallel-star:main";
+    let mut idx_config = fluree_db_indexer::IndexerConfig::small();
+    idx_config.leaflet_rows = 100;
+    idx_config.leaf_target_bytes = 8_000;
+    idx_config.leaf_max_bytes = 16_000;
+    let (local, handle) = start_background_indexer_local(
+        fluree.backend().clone(),
+        Arc::new(fluree.nameservice_mode().clone()),
+        idx_config,
+    );
+
+    local
+        .run_until(async move {
+            let index_cfg = IndexConfig {
+                reindex_min_bytes: 0,
+                reindex_max_bytes: 80_000_000,
+            };
+            // 60k subjects with BOTH p1 and p2 (in the join) + 100 with only p1.
+            let n: i64 = 60_000;
+            let mut nodes: Vec<serde_json::Value> = Vec::with_capacity((n + 100) as usize);
+            for i in 0..n {
+                nodes.push(json!({"@id": format!("ex:s{i}"), "ex:p1": i, "ex:p2": i}));
+            }
+            for i in 0..100 {
+                nodes.push(json!({"@id": format!("ex:only{i}"), "ex:p1": i})); // no p2
+            }
+            let ledger = fluree
+                .insert_with_opts(
+                    genesis_ledger_for_fluree(&fluree, ledger_id),
+                    &json!({ "@context": { "ex": "http://example.org/ns/" }, "@graph": nodes }),
+                    TxnOpts::default(),
+                    CommitOpts::default(),
+                    &index_cfg,
+                )
+                .await
+                .expect("baseline insert")
+                .ledger;
+            let _ = trigger_index_and_wait_outcome(&handle, ledger_id, ledger.t()).await;
+            // Novelty: 50 with both (in join) + 10 with only p1 (excluded).
+            let mut nov: Vec<serde_json::Value> = Vec::new();
+            for j in 0..50 {
+                nov.push(json!({"@id": format!("ex:n{j}"), "ex:p1": j, "ex:p2": j}));
+            }
+            for j in 0..10 {
+                nov.push(json!({"@id": format!("ex:novonly{j}"), "ex:p1": j}));
+            }
+            let _ = fluree
+                .insert(
+                    ledger,
+                    &json!({ "@context": { "ex": "http://example.org/ns/" }, "@graph": nov }),
+                )
+                .await
+                .expect("novelty insert");
+
+            let view = fluree.db(ledger_id).await.expect("load HEAD view w/ novelty");
+            let q = r"
+                PREFIX ex: <http://example.org/ns/>
+                SELECT (COUNT(*) AS ?count)
+                WHERE { ?s ex:p1 ?o1 . ?s ex:p2 ?o2 }
+            ";
+            let jsonld = fluree
+                .query(&view, QueryInput::Sparql(q))
+                .await
+                .expect("parallel overlay star query")
+                .to_jsonld(&view.snapshot)
+                .expect("to_jsonld");
+            // subjects with both p1 AND p2: base 60000 + novelty 50 = 60050.
+            assert_eq!(
+                normalize_rows(&jsonld),
+                normalize_rows(&json!([[60_050]])),
+                "parallel overlay star count must fold novelty (both preds): 60000 + 50 = 60050"
+            );
+        })
+        .await;
+}
+
 /// Overlay/novelty lane for the LANG-filter COUNT fast path.
 #[tokio::test]
 async fn overlay_lang_filter_count_folds_novelty() {
