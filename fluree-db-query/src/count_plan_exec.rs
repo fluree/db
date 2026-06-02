@@ -556,6 +556,14 @@ fn sum_stream(
                     return Ok(Some(n));
                 }
             }
+            // Overlay/time-travel: parallelize the base scan + fold novelty per
+            // partition; falls through to the serial keyset path otherwise.
+            if ec.overlay && exclude_sorted.is_none() && include_sorted.is_none() {
+                if let Some(n) = try_modifier_intersect_overlay_parallel(source, excluded, true, ec)?
+                {
+                    return Ok(Some(n));
+                }
+            }
             let exclude_list = execute_keyset_as_sorted(excluded, ec)?;
             let exclude_list = match exclude_list {
                 Some(s) => s,
@@ -574,6 +582,13 @@ fn sum_stream(
                 // Both-large (and multi-predicate inner): parallelize the keyset
                 // build + outer scan instead of building the keyset serially.
                 if let Some(n) = try_modifier_intersect_parallel(source, filter, false, ec)? {
+                    return Ok(Some(n));
+                }
+            }
+            // Overlay/time-travel: parallelize the base scan + fold novelty per
+            // partition; falls through to the serial keyset path otherwise.
+            if ec.overlay && exclude_sorted.is_none() && include_sorted.is_none() {
+                if let Some(n) = try_modifier_intersect_overlay_parallel(source, filter, false, ec)? {
                     return Ok(Some(n));
                 }
             }
@@ -1265,6 +1280,225 @@ fn sum_optional_join_parallel(
     })
 }
 
+/// Overlay/time-travel variant of `merge_optional_count_range` for one subject
+/// partition: `Σ_{s ∈ [lo,hi), s in all REQ} req_product(s) × Π_g max(1, Π opt)`,
+/// every predicate read through a bounded overlay cursor (its `[lo,hi)` leaves + its
+/// novelty ops sliced to that range). `req_ops`/`opt_ops` mirror `req_pids`/
+/// `opt_groups`. A `max_s ∈ [lo,hi)` guard counts boundary subjects once; unlike the
+/// base path there are no `always_one` groups — the caller bails when any predicate
+/// is absent in base (it could be novelty-only), so all groups are present here.
+#[allow(clippy::too_many_arguments)]
+fn merge_optional_count_range_overlay(
+    store: &Arc<BinaryIndexStore>,
+    g_id: fluree_db_core::GraphId,
+    req_pids: &[u32],
+    req_ops: &[Vec<fluree_db_binary_index::read::types::OverlayOp>],
+    opt_groups: &[Vec<u32>],
+    opt_ops: &[Vec<Vec<fluree_db_binary_index::read::types::OverlayOp>>],
+    to_t: i64,
+    epoch: u64,
+    lo: u64,
+    hi: u64,
+) -> Result<u128> {
+    let build = |p_id: u32, ops: &[fluree_db_binary_index::read::types::OverlayOp]| {
+        let sliced = slice_overlay_ops_by_subject(ops, lo, hi);
+        build_overlay_cursor_for_subject_range(
+            store,
+            g_id,
+            p_id,
+            cursor_projection_sid_only(),
+            lo,
+            hi,
+            sliced,
+            to_t,
+            epoch,
+        )
+        .map(CursorSubjectCountStream::new)
+    };
+
+    let mut req_streams: Vec<CursorSubjectCountStream> = Vec::with_capacity(req_pids.len());
+    for (i, &p) in req_pids.iter().enumerate() {
+        let Some(s) = build(p, &req_ops[i]) else {
+            return Ok(0);
+        };
+        req_streams.push(s);
+    }
+
+    struct OptG {
+        streams: Vec<CursorSubjectCountStream>,
+        cur: Vec<Option<(u64, u64)>>,
+    }
+    let mut opt: Vec<OptG> = Vec::with_capacity(opt_groups.len());
+    for (gi, grp) in opt_groups.iter().enumerate() {
+        let mut streams: Vec<CursorSubjectCountStream> = Vec::with_capacity(grp.len());
+        for (i, &p) in grp.iter().enumerate() {
+            let Some(s) = build(p, &opt_ops[gi][i]) else {
+                return Ok(0);
+            };
+            streams.push(s);
+        }
+        let mut cur: Vec<Option<(u64, u64)>> = Vec::with_capacity(streams.len());
+        for s in &mut streams {
+            cur.push(s.next_group()?);
+        }
+        opt.push(OptG { streams, cur });
+    }
+
+    let mut req_cur: Vec<Option<(u64, u64)>> = Vec::with_capacity(req_streams.len());
+    for s in &mut req_streams {
+        req_cur.push(s.next_group()?);
+    }
+    let mut total: u128 = 0;
+    loop {
+        if req_cur.iter().any(std::option::Option::is_none) {
+            break;
+        }
+        let max_s = req_cur
+            .iter()
+            .filter_map(|c| c.map(|(s, _)| s))
+            .max()
+            .unwrap();
+        if req_cur.iter().all(|c| c.map(|(s, _)| s) == Some(max_s)) {
+            if max_s >= lo && max_s < hi {
+                let mut product: u128 = req_cur.iter().map(|c| c.unwrap().1 as u128).product();
+                for g in &mut opt {
+                    let mut g_prod: u128 = 1;
+                    for i in 0..g.streams.len() {
+                        while let Some((sid2, _)) = g.cur[i] {
+                            if sid2 < max_s {
+                                g.cur[i] = g.streams[i].next_group()?;
+                                continue;
+                            }
+                            break;
+                        }
+                        let c = match g.cur[i] {
+                            Some((sid2, c)) if sid2 == max_s => {
+                                g.cur[i] = g.streams[i].next_group()?;
+                                c
+                            }
+                            _ => 0u64,
+                        };
+                        if c == 0 {
+                            g_prod = 0;
+                            break;
+                        }
+                        g_prod = g_prod.saturating_mul(c as u128);
+                    }
+                    let mult = if g_prod == 0 { 1u128 } else { g_prod };
+                    product = product.saturating_mul(mult);
+                }
+                total = total.saturating_add(product);
+            }
+            for (i, s) in req_streams.iter_mut().enumerate() {
+                req_cur[i] = s.next_group()?;
+            }
+        } else {
+            for (i, s) in req_streams.iter_mut().enumerate() {
+                if let Some((s_id, _)) = req_cur[i] {
+                    if s_id < max_s {
+                        req_cur[i] = s.next_group()?;
+                    }
+                }
+            }
+        }
+    }
+    Ok(total)
+}
+
+/// Overlay/time-travel parallel `OPTIONAL` join COUNT(*): like
+/// `sum_optional_join_parallel` but folds novelty per partition. Bails (defers to
+/// the serial cursor merge) if any required or optional predicate is absent in base
+/// — under overlay it could be novelty-only, which the serial/general path handles.
+fn sum_optional_join_overlay_parallel(
+    required: &StreamNode,
+    optional_groups: &[Vec<StreamNode>],
+    ec: &ExecCtx<'_, '_>,
+) -> Result<Option<u64>> {
+    let req_preds: &[StreamNode] = match required {
+        StreamNode::SubjectCountScan { .. } => std::slice::from_ref(required),
+        StreamNode::StarJoin { children } => children,
+        _ => return Ok(None),
+    };
+    let resolve = |node: &StreamNode| -> Result<Option<(u32, Sid)>> {
+        let StreamNode::SubjectCountScan { pred } = node else {
+            return Ok(None);
+        };
+        let sid = normalize_pred_sid(ec.store, pred)?;
+        Ok(ec.store.sid_to_p_id(&sid).map(|p| (p, sid)))
+    };
+
+    let mut req_pids: Vec<u32> = Vec::with_capacity(req_preds.len());
+    let mut req_sids: Vec<Sid> = Vec::with_capacity(req_preds.len());
+    let mut total_rows: u64 = 0;
+    for node in req_preds {
+        let Some((p_id, sid)) = resolve(node)? else {
+            return Ok(None);
+        };
+        total_rows =
+            total_rows.saturating_add(count_rows_for_predicate_psot(ec.store, ec.g_id, p_id)?);
+        req_pids.push(p_id);
+        req_sids.push(sid);
+    }
+
+    let mut opt_groups: Vec<Vec<u32>> = Vec::with_capacity(optional_groups.len());
+    let mut opt_sids: Vec<Vec<Sid>> = Vec::with_capacity(optional_groups.len());
+    for grp in optional_groups {
+        let mut pids: Vec<u32> = Vec::with_capacity(grp.len());
+        let mut sids: Vec<Sid> = Vec::with_capacity(grp.len());
+        for node in grp {
+            // Absent optional predicate under overlay may be novelty-only — bail.
+            let Some((p_id, sid)) = resolve(node)? else {
+                return Ok(None);
+            };
+            total_rows =
+                total_rows.saturating_add(count_rows_for_predicate_psot(ec.store, ec.g_id, p_id)?);
+            pids.push(p_id);
+            sids.push(sid);
+        }
+        opt_groups.push(pids);
+        opt_sids.push(sids);
+    }
+
+    let collect = |sid: &Sid| -> Result<Option<Vec<fluree_db_binary_index::read::types::OverlayOp>>> {
+        collect_resolved_overlay_ops(ec.ctx, ec.store, ec.g_id, RunSortOrder::Psot, sid)
+    };
+    let mut req_ops = Vec::with_capacity(req_sids.len());
+    for sid in &req_sids {
+        let Some(ops) = collect(sid)? else {
+            return Ok(None);
+        };
+        req_ops.push(ops);
+    }
+    let mut opt_ops: Vec<Vec<Vec<fluree_db_binary_index::read::types::OverlayOp>>> =
+        Vec::with_capacity(opt_sids.len());
+    for grp in &opt_sids {
+        let mut group_ops = Vec::with_capacity(grp.len());
+        for sid in grp {
+            let Some(ops) = collect(sid)? else {
+                return Ok(None);
+            };
+            group_ops.push(ops);
+        }
+        opt_ops.push(group_ops);
+    }
+
+    let to_t = ec.ctx.to_t;
+    let epoch = ec.ctx.overlay.as_ref().map(|o| o.epoch()).unwrap_or(0);
+    let driver_p = *req_pids
+        .iter()
+        .max_by_key(|&&p| leaf_entries_for_predicate(ec.store, ec.g_id, RunSortOrder::Psot, p).len())
+        .unwrap();
+
+    let store = ec.store;
+    let g_id = ec.g_id;
+    let (req_pids, opt_groups, req_ops, opt_ops) = (&req_pids, &opt_groups, &req_ops, &opt_ops);
+    parallel_partition_count(store, g_id, driver_p, total_rows, move |lo, hi| {
+        merge_optional_count_range_overlay(
+            store, g_id, req_pids, req_ops, opt_groups, opt_ops, to_t, epoch, lo, hi,
+        )
+    })
+}
+
 /// Per-partition partial for a MINUS/EXISTS whose inner block is an inner-join of
 /// one or more single-predicate subject sets, over a single-predicate outer:
 /// `?s OUTER ?o {MINUS | FILTER EXISTS} { ?s IN1 ?a . ?s IN2 ?b . … }`.
@@ -1402,6 +1636,184 @@ fn try_modifier_intersect_parallel(
 
     parallel_partition_count(ec.store, ec.g_id, driver_p, total_rows, |lo, hi| {
         merge_modifier_intersect_range(ec.store, ec.g_id, outer_pid, &inner_pids, is_anti, lo, hi)
+    })
+}
+
+/// Like [`resolve_keyset_pids`] but also returns each inner predicate's `Sid`, so the
+/// overlay-parallel path can collect that predicate's novelty ops.
+fn resolve_keyset_pids_sids(
+    keyset: &KeySetNode,
+    ec: &ExecCtx<'_, '_>,
+) -> Result<Option<Vec<(u32, Sid)>>> {
+    fn one(node: &KeySetNode, ec: &ExecCtx<'_, '_>) -> Result<Option<(u32, Sid)>> {
+        let pred = match node {
+            KeySetNode::SubjectSet { pred } | KeySetNode::SubjectsSorted { pred } => pred,
+            _ => return Ok(None),
+        };
+        let sid = normalize_pred_sid(ec.store, pred)?;
+        Ok(ec.store.sid_to_p_id(&sid).map(|p| (p, sid)))
+    }
+    match keyset {
+        KeySetNode::SubjectSet { .. } | KeySetNode::SubjectsSorted { .. } => {
+            Ok(one(keyset, ec)?.map(|x| vec![x]))
+        }
+        KeySetNode::IntersectSorted { children } => {
+            let mut out = Vec::with_capacity(children.len());
+            for child in children {
+                match one(child, ec)? {
+                    Some(x) => out.push(x),
+                    None => return Ok(None),
+                }
+            }
+            if out.is_empty() {
+                return Ok(None);
+            }
+            Ok(Some(out))
+        }
+        _ => Ok(None),
+    }
+}
+
+/// Overlay/time-travel variant of `merge_modifier_intersect_range` for one subject
+/// partition: drives the outer through a bounded overlay cursor and tests each outer
+/// subject for membership in the inner intersection (each inner predicate also a
+/// bounded overlay cursor) — MINUS keeps absent, EXISTS keeps present. Novelty is
+/// folded per predicate; an outer subject outside `[lo, hi)` (boundary leaf) is
+/// skipped so each is counted by exactly one partition.
+#[allow(clippy::too_many_arguments)]
+fn merge_modifier_intersect_range_overlay(
+    store: &Arc<BinaryIndexStore>,
+    g_id: fluree_db_core::GraphId,
+    outer_pid: u32,
+    outer_ops: &[fluree_db_binary_index::read::types::OverlayOp],
+    inner_pids: &[u32],
+    inner_ops: &[Vec<fluree_db_binary_index::read::types::OverlayOp>],
+    is_anti: bool,
+    to_t: i64,
+    epoch: u64,
+    lo: u64,
+    hi: u64,
+) -> Result<u128> {
+    let build = |p_id: u32, ops: &[fluree_db_binary_index::read::types::OverlayOp]| {
+        let sliced = slice_overlay_ops_by_subject(ops, lo, hi);
+        build_overlay_cursor_for_subject_range(
+            store,
+            g_id,
+            p_id,
+            cursor_projection_sid_only(),
+            lo,
+            hi,
+            sliced,
+            to_t,
+            epoch,
+        )
+        .map(CursorSubjectCountStream::new)
+    };
+
+    let Some(mut outer) = build(outer_pid, outer_ops) else {
+        return Ok(0);
+    };
+    let mut inner: Vec<CursorSubjectCountStream> = Vec::with_capacity(inner_pids.len());
+    for (i, &p) in inner_pids.iter().enumerate() {
+        let Some(s) = build(p, &inner_ops[i]) else {
+            return Ok(0);
+        };
+        inner.push(s);
+    }
+    let mut i_cur: Vec<Option<(u64, u64)>> = Vec::with_capacity(inner.len());
+    for s in &mut inner {
+        i_cur.push(s.next_group()?);
+    }
+
+    let mut total: u128 = 0;
+    while let Some((os, ocount)) = outer.next_group()? {
+        if os < lo {
+            continue; // boundary subject below the partition; owned by a lower one
+        }
+        if os >= hi {
+            break; // ascending => the rest are all out of range
+        }
+        let mut in_inner = true;
+        for (k, s) in inner.iter_mut().enumerate() {
+            while let Some((is_, _)) = i_cur[k] {
+                if is_ < os {
+                    i_cur[k] = s.next_group()?;
+                } else {
+                    break;
+                }
+            }
+            if !matches!(i_cur[k], Some((is_, _)) if is_ == os) {
+                in_inner = false;
+                break;
+            }
+        }
+        let keep = if is_anti { !in_inner } else { in_inner };
+        if keep {
+            total = total.saturating_add(ocount as u128);
+        }
+    }
+    Ok(total)
+}
+
+/// Overlay/time-travel parallel MINUS/EXISTS: like `try_modifier_intersect_parallel`
+/// but folds novelty per partition (bounded overlay cursors). Collects the outer and
+/// inner predicates' resolved ops once. Returns `Ok(None)` to defer to the serial
+/// keyset path for a non-plain shape, an absent predicate, a translation failure, or
+/// too few rows.
+fn try_modifier_intersect_overlay_parallel(
+    source: &StreamNode,
+    keyset: &KeySetNode,
+    is_anti: bool,
+    ec: &ExecCtx<'_, '_>,
+) -> Result<Option<u64>> {
+    let StreamNode::SubjectCountScan { pred: outer_pred } = source else {
+        return Ok(None);
+    };
+    let outer_sid = normalize_pred_sid(ec.store, outer_pred)?;
+    let Some(outer_pid) = ec.store.sid_to_p_id(&outer_sid) else {
+        return Ok(None);
+    };
+    let Some(inner) = resolve_keyset_pids_sids(keyset, ec)? else {
+        return Ok(None);
+    };
+    let inner_pids: Vec<u32> = inner.iter().map(|(p, _)| *p).collect();
+
+    let mut total_rows = count_rows_for_predicate_psot(ec.store, ec.g_id, outer_pid)?;
+    for &p in &inner_pids {
+        total_rows =
+            total_rows.saturating_add(count_rows_for_predicate_psot(ec.store, ec.g_id, p)?);
+    }
+
+    let Some(outer_ops) =
+        collect_resolved_overlay_ops(ec.ctx, ec.store, ec.g_id, RunSortOrder::Psot, &outer_sid)?
+    else {
+        return Ok(None);
+    };
+    let mut inner_ops: Vec<Vec<fluree_db_binary_index::read::types::OverlayOp>> =
+        Vec::with_capacity(inner.len());
+    for (_, sid) in &inner {
+        let Some(ops) =
+            collect_resolved_overlay_ops(ec.ctx, ec.store, ec.g_id, RunSortOrder::Psot, sid)?
+        else {
+            return Ok(None);
+        };
+        inner_ops.push(ops);
+    }
+
+    let to_t = ec.ctx.to_t;
+    let epoch = ec.ctx.overlay.as_ref().map(|o| o.epoch()).unwrap_or(0);
+    let driver_p = std::iter::once(outer_pid)
+        .chain(inner_pids.iter().copied())
+        .max_by_key(|&p| leaf_entries_for_predicate(ec.store, ec.g_id, RunSortOrder::Psot, p).len())
+        .unwrap();
+
+    let store = ec.store;
+    let g_id = ec.g_id;
+    let (inner_pids, inner_ops, outer_ops) = (&inner_pids, &inner_ops, &outer_ops);
+    parallel_partition_count(store, g_id, driver_p, total_rows, move |lo, hi| {
+        merge_modifier_intersect_range_overlay(
+            store, g_id, outer_pid, outer_ops, inner_pids, inner_ops, is_anti, to_t, epoch, lo, hi,
+        )
     })
 }
 
@@ -1788,6 +2200,15 @@ fn sum_optional_join(
         // Both-large optional (no modifiers): partition the subject space and run
         // the optional merge across cores.
         if let Some(n) = sum_optional_join_parallel(required, optional_groups, ec)? {
+            return Ok(Some(n));
+        }
+    }
+
+    // Overlay/time-travel optional: parallelize the base scan and fold novelty per
+    // partition (bounded overlay cursors). Falls through to the serial cursor merge
+    // for small inputs, absent predicates, or translation failures.
+    if ec.overlay && exclude_sorted.is_none() && include_sorted.is_none() {
+        if let Some(n) = sum_optional_join_overlay_parallel(required, optional_groups, ec)? {
             return Ok(Some(n));
         }
     }

@@ -29,9 +29,10 @@ use crate::binding::Batch;
 use crate::context::ExecutionContext;
 use crate::error::{QueryError, Result};
 use crate::fast_path_common::{
-    build_count_batch, build_psot_cursor_for_predicate, count_rows_for_predicate_psot, count_to_i64,
+    build_count_batch, build_overlay_cursor_for_subject_range, build_psot_cursor_for_predicate,
+    collect_resolved_overlay_ops, count_rows_for_predicate_psot, count_to_i64,
     cursor_projection_sid_only, cursor_projection_sid_otype_okey, leaf_entries_for_predicate,
-    normalize_pred_sid, CursorSubjectCountStream, PsotSubjectCountIter,
+    normalize_pred_sid, slice_overlay_ops_by_subject, CursorSubjectCountStream, PsotSubjectCountIter,
 };
 use crate::ir::triple::Ref;
 use crate::operator::{BoxedOperator, Operator, OperatorState};
@@ -244,11 +245,30 @@ impl SubjectSelfLoopCountStreamV6 {
     }
 }
 
+/// A `(subject, count)` group stream in ascending subject order — either the base
+/// metadata iterator (HEAD) or the overlay-merging cursor stream (novelty/time
+/// travel). Lets the union/extra merge helpers serve both lanes.
+trait SubjectCountGroups {
+    fn next_subject_group(&mut self) -> Result<Option<(u64, u64)>>;
+}
+impl SubjectCountGroups for PsotSubjectCountIter<'_> {
+    #[inline]
+    fn next_subject_group(&mut self) -> Result<Option<(u64, u64)>> {
+        self.next_group()
+    }
+}
+impl SubjectCountGroups for CursorSubjectCountStream {
+    #[inline]
+    fn next_subject_group(&mut self) -> Result<Option<(u64, u64)>> {
+        self.next_group()
+    }
+}
+
 /// Min-merge over union-branch iterators: returns `(s_min, Σ counts at s_min)` and
 /// advances the iterators at `s_min`. Bag semantics — a subject under multiple
 /// branches sums their counts.
-fn next_union_group(
-    iters: &mut [PsotSubjectCountIter<'_>],
+fn next_union_group<T: SubjectCountGroups>(
+    iters: &mut [T],
     cur: &mut [Option<(u64, u64)>],
 ) -> Result<Option<(u64, u64)>> {
     if cur.iter().all(std::option::Option::is_none) {
@@ -260,7 +280,7 @@ fn next_union_group(
         if let Some((s, n)) = cur[i] {
             if s == s_min {
                 sum = sum.saturating_add(n);
-                cur[i] = it.next_group()?;
+                cur[i] = it.next_subject_group()?;
             }
         }
     }
@@ -270,8 +290,8 @@ fn next_union_group(
 /// Max-merge over the constraint (extra) iterators: returns the next subject present
 /// in ALL of them with the product of their counts; subjects missing from any
 /// constraint predicate are skipped.
-fn next_extra_product_group(
-    iters: &mut [PsotSubjectCountIter<'_>],
+fn next_extra_product_group<T: SubjectCountGroups>(
+    iters: &mut [T],
     cur: &mut [Option<(u64, u64)>],
 ) -> Result<Option<(u64, u64)>> {
     loop {
@@ -283,7 +303,7 @@ fn next_extra_product_group(
         for (i, it) in iters.iter_mut().enumerate() {
             while let Some((s, _)) = cur[i] {
                 if s < target {
-                    cur[i] = it.next_group()?;
+                    cur[i] = it.next_subject_group()?;
                     advanced = true;
                     if cur[i].is_none() {
                         return Ok(None);
@@ -301,7 +321,7 @@ fn next_extra_product_group(
             prod = prod.saturating_mul(c.unwrap().1);
         }
         for (i, it) in iters.iter_mut().enumerate() {
-            cur[i] = it.next_group()?;
+            cur[i] = it.next_subject_group()?;
         }
         return Ok(Some((target, prod)));
     }
@@ -401,6 +421,159 @@ fn try_union_constraint_parallel(
     })
 }
 
+/// Overlay/time-travel variant of `merge_union_constraint_count_range` for one
+/// subject partition: `Σ_s (Σ_b count_b(s)) × (Π_e count_e(s))`, every predicate read
+/// through a bounded overlay cursor (its `[lo,hi)` leaves + its novelty ops sliced to
+/// that range). `union_ops`/`extra_ops` mirror `union_pids`/`extra_pids`. A
+/// `s ∈ [lo,hi)` guard on the matched subject counts boundary subjects once.
+#[allow(clippy::too_many_arguments)]
+fn merge_union_constraint_count_range_overlay(
+    store: &Arc<fluree_db_binary_index::BinaryIndexStore>,
+    g_id: fluree_db_core::GraphId,
+    union_pids: &[u32],
+    union_ops: &[Vec<fluree_db_binary_index::read::types::OverlayOp>],
+    extra_pids: &[u32],
+    extra_ops: &[Vec<fluree_db_binary_index::read::types::OverlayOp>],
+    to_t: i64,
+    epoch: u64,
+    lo: u64,
+    hi: u64,
+) -> Result<u128> {
+    let build = |p_id: u32, ops: &[fluree_db_binary_index::read::types::OverlayOp]| {
+        let sliced = slice_overlay_ops_by_subject(ops, lo, hi);
+        build_overlay_cursor_for_subject_range(
+            store,
+            g_id,
+            p_id,
+            cursor_projection_sid_only(),
+            lo,
+            hi,
+            sliced,
+            to_t,
+            epoch,
+        )
+        .map(CursorSubjectCountStream::new)
+    };
+
+    let mut u_streams: Vec<CursorSubjectCountStream> = Vec::with_capacity(union_pids.len());
+    for (i, &p) in union_pids.iter().enumerate() {
+        let Some(s) = build(p, &union_ops[i]) else {
+            return Ok(0);
+        };
+        u_streams.push(s);
+    }
+    let mut u_cur: Vec<Option<(u64, u64)>> = Vec::with_capacity(u_streams.len());
+    for s in &mut u_streams {
+        u_cur.push(s.next_group()?);
+    }
+    let mut e_streams: Vec<CursorSubjectCountStream> = Vec::with_capacity(extra_pids.len());
+    for (i, &p) in extra_pids.iter().enumerate() {
+        let Some(s) = build(p, &extra_ops[i]) else {
+            return Ok(0);
+        };
+        e_streams.push(s);
+    }
+    let mut e_cur: Vec<Option<(u64, u64)>> = Vec::with_capacity(e_streams.len());
+    for s in &mut e_streams {
+        e_cur.push(s.next_group()?);
+    }
+
+    let mut u = next_union_group(&mut u_streams, &mut u_cur)?;
+    let mut e = next_extra_product_group(&mut e_streams, &mut e_cur)?;
+    let mut total: u128 = 0;
+    while let (Some((us, usum)), Some((es, eprod))) = (u, e) {
+        if us < es {
+            u = next_union_group(&mut u_streams, &mut u_cur)?;
+            continue;
+        }
+        if es < us {
+            e = next_extra_product_group(&mut e_streams, &mut e_cur)?;
+            continue;
+        }
+        if us >= lo && us < hi {
+            total = total.saturating_add((usum as u128).saturating_mul(eprod as u128));
+        }
+        u = next_union_group(&mut u_streams, &mut u_cur)?;
+        e = next_extra_product_group(&mut e_streams, &mut e_cur)?;
+    }
+    Ok(total)
+}
+
+/// Overlay/time-travel parallel constrained-union count: like
+/// `try_union_constraint_parallel` but folds novelty per partition (bounded overlay
+/// cursors). Collects each predicate's resolved ops once. Returns `Ok(None)` to defer
+/// to the serial cursor merge for an absent predicate, a translation failure, or too
+/// few rows.
+fn try_union_constraint_overlay_parallel(
+    store: &Arc<fluree_db_binary_index::BinaryIndexStore>,
+    ctx: &ExecutionContext<'_>,
+    g_id: fluree_db_core::GraphId,
+    union_preds: &[Ref],
+    extra_preds: &[Ref],
+) -> Result<Option<u64>> {
+    type ResolvedPreds = (Vec<u32>, Vec<fluree_db_core::Sid>, u64);
+    let resolve = |preds: &[Ref]| -> Result<Option<ResolvedPreds>> {
+        let mut pids = Vec::with_capacity(preds.len());
+        let mut sids = Vec::with_capacity(preds.len());
+        let mut rows = 0u64;
+        for p in preds {
+            let sid = normalize_pred_sid(store, p)?;
+            let Some(p_id) = store.sid_to_p_id(&sid) else {
+                return Ok(None);
+            };
+            rows = rows.saturating_add(count_rows_for_predicate_psot(store, g_id, p_id)?);
+            pids.push(p_id);
+            sids.push(sid);
+        }
+        Ok(Some((pids, sids, rows)))
+    };
+    let Some((union_pids, union_sids, ur)) = resolve(union_preds)? else {
+        return Ok(None);
+    };
+    let Some((extra_pids, extra_sids, er)) = resolve(extra_preds)? else {
+        return Ok(None);
+    };
+    if union_pids.is_empty() || extra_pids.is_empty() {
+        return Ok(None);
+    }
+    let total_rows = ur.saturating_add(er);
+
+    let collect = |sids: &[fluree_db_core::Sid]| -> Result<Option<Vec<Vec<fluree_db_binary_index::read::types::OverlayOp>>>> {
+        let mut out = Vec::with_capacity(sids.len());
+        for sid in sids {
+            let Some(ops) = collect_resolved_overlay_ops(ctx, store, g_id, RunSortOrder::Psot, sid)?
+            else {
+                return Ok(None);
+            };
+            out.push(ops);
+        }
+        Ok(Some(out))
+    };
+    let Some(union_ops) = collect(&union_sids)? else {
+        return Ok(None);
+    };
+    let Some(extra_ops) = collect(&extra_sids)? else {
+        return Ok(None);
+    };
+
+    let to_t = ctx.to_t;
+    let epoch = ctx.overlay.as_ref().map(|o| o.epoch()).unwrap_or(0);
+    let driver_p = union_pids
+        .iter()
+        .chain(extra_pids.iter())
+        .copied()
+        .max_by_key(|&p| leaf_entries_for_predicate(store, g_id, RunSortOrder::Psot, p).len())
+        .unwrap();
+
+    let (union_pids, union_ops, extra_pids, extra_ops) =
+        (&union_pids, &union_ops, &extra_pids, &extra_ops);
+    crate::count_plan_exec::parallel_partition_count(store, g_id, driver_p, total_rows, move |lo, hi| {
+        merge_union_constraint_count_range_overlay(
+            store, g_id, union_pids, union_ops, extra_pids, extra_ops, to_t, epoch, lo, hi,
+        )
+    })
+}
+
 fn count_union_star(
     store: &Arc<fluree_db_binary_index::BinaryIndexStore>,
     ctx: &ExecutionContext<'_>,
@@ -451,6 +624,20 @@ fn count_union_star(
     // predicates. HEAD-only (no overlay/time-travel); else the cursor merge below.
     if matches!(mode, UnionCountMode::AllRows) && !extra_preds.is_empty() && !overlay_has_rows && !time_travel {
         if let Some(total) = try_union_constraint_parallel(store, g_id, union_preds, extra_preds)? {
+            return Ok(Some(total));
+        }
+    }
+
+    // Overlay/time-travel constrained-UNION: parallelize the base scan and fold
+    // novelty per partition. Falls through to the serial cursor merge below for
+    // absent predicates, translation failures, or too few rows.
+    if matches!(mode, UnionCountMode::AllRows)
+        && !extra_preds.is_empty()
+        && (overlay_has_rows || time_travel)
+    {
+        if let Some(total) =
+            try_union_constraint_overlay_parallel(store, ctx, g_id, union_preds, extra_preds)?
+        {
             return Ok(Some(total));
         }
     }
