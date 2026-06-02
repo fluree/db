@@ -7,12 +7,15 @@
 
 use crate::context::ExecutionContext;
 use crate::error::{QueryError, Result};
+use crate::binary_scan::{compile_encoded_pre_filters_and_prune_inline_ops, EncodedPreFilter};
 use crate::fast_path_common::{
     build_count_batch, count_rows_for_predicate_psot, count_to_i64, fast_path_store,
-    leaf_entries_for_predicate, normalize_pred_sid, projection_okey_only, projection_otype_only,
-    projection_sid_only, FastPathOperator,
+    leaf_entries_for_predicate, normalize_pred_sid, parallel_leaf_chunk_count, projection_okey_only,
+    projection_otype_only, projection_sid_only, projection_sid_otype_okey, FastPathOperator,
 };
-use crate::ir::triple::Ref;
+use fluree_db_binary_index::format::branch::LeafEntry;
+use crate::ir::triple::{Ref, TriplePattern};
+use crate::operator::inline::InlineOperator;
 use crate::operator::BoxedOperator;
 use crate::var_registry::VarId;
 use fluree_db_binary_index::format::run_record::RunSortOrder;
@@ -168,10 +171,33 @@ fn count_rows_for_predicate_numeric_compare_post(
     threshold: &FlakeValue,
 ) -> Result<Option<u64>> {
     let leaves = leaf_entries_for_predicate(store, g_id, RunSortOrder::Post, p_id);
+    // Each POST leaflet is type-homogeneous and counted independently, so the leaf
+    // slice can be split across cores (the per-leaflet reducer is stateless). The
+    // partition decision uses the predicate's total row count.
+    let total_rows = count_rows_for_predicate_psot(store, g_id, p_id)?;
+    parallel_leaf_chunk_count(leaves, total_rows, |chunk| {
+        count_numeric_compare_in_leaf_slice(store, p_id, compare, threshold, chunk)
+    })
+}
+
+/// Count rows of `p_id` matching `?o <compare> threshold` over one contiguous slice
+/// of POST leaves. Each leaflet is type-homogeneous (`o_type_const`), so the
+/// threshold is encoded per-leaflet for that leaflet's numeric otype — this both
+/// removes the cross-leaflet shared state (making the slice safe to run on its own
+/// thread) and correctly handles a predicate carrying both XSD_INTEGER and
+/// XSD_DOUBLE objects (POST sorts by o_type, so int and double leaflets are
+/// disjoint and each is counted against its own encoded threshold). Returns
+/// `Ok(None)` if any leaflet is non-numeric or the threshold can't be encoded for
+/// its otype — deferring the whole count to the general aggregate pipeline.
+fn count_numeric_compare_in_leaf_slice(
+    store: &BinaryIndexStore,
+    p_id: u32,
+    compare: NumericCompareOp,
+    threshold: &FlakeValue,
+    leaves: &[LeafEntry],
+) -> Result<Option<u64>> {
     let projection = projection_okey_only();
     let mut total: u64 = 0;
-    let mut required_otype: Option<OType> = None;
-    let mut threshold_key: Option<u64> = None;
 
     for leaf_entry in leaves {
         let handle = store
@@ -191,22 +217,11 @@ fn count_rows_for_predicate_numeric_compare_post(
             if !matches!(otype, OType::XSD_INTEGER | OType::XSD_DOUBLE) {
                 return Ok(None);
             }
+            let threshold_key = match encode_numeric_threshold_for_otype(otype, threshold)? {
+                Some(key) => key,
+                None => return Ok(None),
+            };
 
-            match required_otype {
-                Some(existing) if existing != otype => return Ok(None),
-                Some(_) => {}
-                None => {
-                    required_otype = Some(otype);
-                    threshold_key = Some(
-                        match encode_numeric_threshold_for_otype(otype, threshold)? {
-                            Some(key) => key,
-                            None => return Ok(None),
-                        },
-                    );
-                }
-            }
-
-            let threshold_key = threshold_key.expect("set with required_otype");
             let first = read_ordered_key_v2(RunSortOrder::Post, &entry.first_key);
             let last = read_ordered_key_v2(RunSortOrder::Post, &entry.last_key);
 
@@ -314,6 +329,102 @@ fn upper_bound_okey(batch: &fluree_db_binary_index::ColumnBatch, threshold: u64)
         }
     }
     lo
+}
+
+/// Fast-path: parallel `COUNT(?s)` / `COUNT(*)` for a single predicate `?s <p> ?o`
+/// with FILTERs that compile to encoded pre-filters (no value decoding), e.g.
+/// `FILTER(?s != ?o)`, `FILTER(?s = ?o)`, `FILTER(ISBLANK(?o))`,
+/// `FILTER(LANG(?o) = "en")`.
+///
+/// At HEAD (via [`fast_path_store`]) the predicate's PSOT leaves are split across
+/// cores and each chunk counts the rows passing *every* encoded pre-filter — reading
+/// only the (s_id, o_type, o_key) columns and bypassing the serial
+/// `BinaryScanOperator` row materialization entirely. Returns `Ok(None)` — deferring
+/// to `fallback` (the serial scan-count) — when not at HEAD, the predicate is absent
+/// already handled as 0, or any filter can't be pushed down to encoded columns
+/// (it would need value decoding).
+pub fn count_rows_encoded_filters_operator(
+    pattern: TriplePattern,
+    inline_ops: Vec<InlineOperator>,
+    out_var: VarId,
+    fallback: Option<BoxedOperator>,
+) -> FastPathOperator {
+    FastPathOperator::new(
+        out_var,
+        move |ctx| {
+            let Some(store) = fast_path_store(ctx) else {
+                return Ok(None);
+            };
+            let g_id = ctx.binary_g_id;
+            let pred_sid = normalize_pred_sid(store, &pattern.p)?;
+            let Some(p_id) = store.sid_to_p_id(&pred_sid) else {
+                // Absent predicate => no rows => COUNT is 0.
+                return Ok(Some(build_count_batch(out_var, 0)?));
+            };
+            // Compile the FILTERs to encoded pre-filters. If any can't be pushed
+            // down (needs value decoding), defer to the serial scan-count fallback.
+            let (encoded, pruned) = compile_encoded_pre_filters_and_prune_inline_ops(
+                &inline_ops,
+                &pattern,
+                store,
+                true,
+            );
+            if !pruned.is_empty() || encoded.is_empty() {
+                return Ok(None);
+            }
+            let total_rows = count_rows_for_predicate_psot(store, g_id, p_id)?;
+            let leaves = leaf_entries_for_predicate(store, g_id, RunSortOrder::Psot, p_id);
+            let count = parallel_leaf_chunk_count(leaves, total_rows, |chunk| {
+                count_rows_matching_encoded_filters_in_leaf_slice(store, p_id, &encoded, chunk)
+            })?;
+            match count {
+                Some(c) => Ok(Some(build_count_batch(
+                    out_var,
+                    count_to_i64(c, "COUNT rows encoded filters")?,
+                )?)),
+                None => Ok(None),
+            }
+        },
+        fallback,
+        "COUNT rows encoded filters (parallel)",
+    )
+}
+
+/// Count rows of `p_id` passing every encoded pre-filter over one contiguous slice
+/// of PSOT leaves. Loads (s_id, o_type, o_key) per leaflet and applies the filters
+/// on the encoded columns — no term decoding, no binding materialization. Always
+/// returns `Ok(Some(_))` (the encoded filters are total functions on every row).
+fn count_rows_matching_encoded_filters_in_leaf_slice(
+    store: &BinaryIndexStore,
+    p_id: u32,
+    filters: &[EncodedPreFilter],
+    leaves: &[LeafEntry],
+) -> Result<Option<u64>> {
+    let projection = projection_sid_otype_okey();
+    let mut total: u64 = 0;
+    for leaf_entry in leaves {
+        let handle = store
+            .open_leaf_handle(&leaf_entry.leaf_cid, leaf_entry.sidecar_cid.as_ref(), false)
+            .map_err(|e| QueryError::Internal(format!("leaf open: {e}")))?;
+        let dir = handle.dir();
+        for (leaflet_idx, entry) in dir.entries.iter().enumerate() {
+            if entry.row_count == 0 || entry.p_const != Some(p_id) {
+                continue;
+            }
+            let batch = handle
+                .load_columns(leaflet_idx, &projection, RunSortOrder::Psot)
+                .map_err(|e| QueryError::Internal(format!("load columns: {e}")))?;
+            for r in 0..batch.row_count {
+                let s_id = batch.s_id.get(r);
+                let o_type = batch.o_type.get(r);
+                let o_key = batch.o_key.get(r);
+                if filters.iter().all(|f| f.eval_row(s_id, o_type, o_key)) {
+                    total = total.saturating_add(1);
+                }
+            }
+        }
+    }
+    Ok(Some(total))
 }
 
 /// Fast-path: `COUNT(*)` / `COUNT(?x)` for a single triple `?s <p> ?o`

@@ -304,6 +304,89 @@ pub fn leaf_entries_for_predicate(
     &branch.leaves[leaf_range]
 }
 
+/// Minimum total predicate rows before a parallel leaf-chunk scan is worth its
+/// thread-spawn overhead; below this the reducer runs serially on the whole slice.
+const PARALLEL_LEAF_SCAN_MIN_ROWS: u64 = 50_000;
+/// Cap on leaf-chunk worker count regardless of core count.
+const PARALLEL_LEAF_SCAN_MAX_CHUNKS: usize = 16;
+
+/// Partition a predicate's `leaves` into up to `PARALLEL_LEAF_SCAN_MAX_CHUNKS`
+/// contiguous chunks (~one per core) and run `reducer(chunk)` per chunk on a
+/// `std::thread::scope` worker, summing the partial row counts.
+///
+/// Every row lives in exactly one leaflet of one leaf, so counting rows per chunk
+/// and summing is exact for ANY index order — unlike the per-subject
+/// [`crate::count_plan_exec::parallel_partition_count`] (which must partition on
+/// subject boundaries because a subject's rows span leaves), this counts
+/// independent rows and so can split purely on leaf index. `reducer` returns
+/// `Ok(None)` to signal the whole count must defer to the general pipeline (an
+/// unsupported shape, e.g. a non-numeric leaflet); any `None` short-circuits the
+/// result to `Ok(None)`.
+///
+/// When there aren't enough rows/leaves/cores to be worth parallelizing, runs
+/// `reducer` once on the whole slice (identical to a serial scan). BASE index only:
+/// the caller must reach here via [`fast_path_store`] (HEAD, no overlay), so the
+/// base leaflets already reflect current state.
+pub fn parallel_leaf_chunk_count<F>(
+    leaves: &[LeafEntry],
+    total_rows: u64,
+    reducer: F,
+) -> Result<Option<u64>>
+where
+    F: Fn(&[LeafEntry]) -> Result<Option<u64>> + Sync,
+{
+    let ncpu = std::thread::available_parallelism()
+        .map(std::num::NonZeroUsize::get)
+        .unwrap_or(1);
+    let k = ncpu.min(PARALLEL_LEAF_SCAN_MAX_CHUNKS).min(leaves.len());
+    if ncpu < 2 || total_rows < PARALLEL_LEAF_SCAN_MIN_ROWS || k < 2 {
+        // Not worth parallelizing: run the reducer serially over the whole slice.
+        return reducer(leaves);
+    }
+
+    // Contiguous, near-equal leaf chunks (`chunks()` yields ceil(len/per) slices).
+    let per = leaves.len().div_ceil(k);
+    let chunks: Vec<&[LeafEntry]> = leaves.chunks(per).collect();
+    tracing::debug!(
+        chunks = chunks.len(),
+        leaves = leaves.len(),
+        total_rows,
+        "fast-path: parallel leaf-chunk scan"
+    );
+
+    let reducer = &reducer;
+    let span = tracing::Span::current();
+    let partials: Vec<Result<Option<u64>>> = std::thread::scope(|scope| {
+        let handles: Vec<_> = chunks
+            .iter()
+            .map(|chunk| {
+                let span = span.clone();
+                scope.spawn(move || {
+                    let _guard = span.enter();
+                    reducer(chunk)
+                })
+            })
+            .collect();
+        handles
+            .into_iter()
+            .map(|h| {
+                h.join().unwrap_or_else(|_| {
+                    Err(QueryError::execution("parallel leaf-scan worker panicked"))
+                })
+            })
+            .collect()
+    });
+
+    let mut total: u64 = 0;
+    for partial in partials {
+        match partial? {
+            Some(n) => total = total.saturating_add(n),
+            None => return Ok(None),
+        }
+    }
+    Ok(Some(total))
+}
+
 // ---------------------------------------------------------------------------
 // 4. Subject collection
 // ---------------------------------------------------------------------------

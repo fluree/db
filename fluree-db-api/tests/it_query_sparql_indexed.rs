@@ -1544,6 +1544,238 @@ async fn indexed_parallel_exists_intersect_count_matches_serial() {
         .await;
 }
 
+/// Parallel encoded-filter row count: `COUNT(?s) { ?s rdf:type ?o FILTER(?s != ?o) }`.
+/// The `?s != ?o` filter compiles to a `SubjectNeObjectRef` encoded pre-filter, so
+/// at HEAD the rows are counted in parallel across leaf chunks (no binding
+/// materialization). Seeds >50k typed subjects (s != o) plus a few self-typed nodes
+/// (`ex:self_k a ex:self_k`, s == o) which the filter must exclude.
+#[tokio::test]
+async fn indexed_parallel_encoded_filter_count_matches_serial() {
+    assert_index_defaults();
+    let fluree = FlureeBuilder::memory()
+        .with_ledger_cache_config(LedgerManagerConfig::default())
+        .build_memory();
+    let ledger_id = "it/indexed-parallel-encoded-filter:main";
+    let mut idx_config = fluree_db_indexer::IndexerConfig::small();
+    idx_config.leaflet_rows = 100;
+    idx_config.leaf_target_bytes = 8_000;
+    idx_config.leaf_max_bytes = 16_000;
+    let (local, handle) = start_background_indexer_local(
+        fluree.backend().clone(),
+        Arc::new(fluree.nameservice_mode().clone()),
+        idx_config,
+    );
+
+    local
+        .run_until(async move {
+            let index_cfg = IndexConfig {
+                reindex_min_bytes: 0,
+                reindex_max_bytes: 80_000_000,
+            };
+            // N normal typed subjects (s != o) + M self-typed (s == o, excluded).
+            let n: i64 = 60_000;
+            let m: i64 = 50;
+            let mut nodes: Vec<serde_json::Value> = Vec::with_capacity((n + m) as usize);
+            for i in 0..n {
+                nodes.push(json!({"@id": format!("ex:s{i}"), "@type": format!("ex:C{}", i % 50)}));
+            }
+            for j in 0..m {
+                // A node typed as itself => (s == o) row, excluded by FILTER(?s != ?o).
+                nodes.push(json!({"@id": format!("ex:self{j}"), "@type": format!("ex:self{j}")}));
+            }
+            let expected = n; // self-typed rows excluded
+            let ledger1 = fluree
+                .insert_with_opts(
+                    genesis_ledger_for_fluree(&fluree, ledger_id),
+                    &json!({ "@context": { "ex": "http://example.org/ns/" }, "@graph": nodes }),
+                    TxnOpts::default(),
+                    CommitOpts::default(),
+                    &index_cfg,
+                )
+                .await
+                .expect("seed insert")
+                .ledger;
+            let _ = trigger_index_and_wait_outcome(&handle, ledger_id, ledger1.t()).await;
+            let view = fluree
+                .db_at_t(ledger_id, ledger1.t())
+                .await
+                .expect("load indexed view");
+
+            let q = r"
+                PREFIX rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#>
+                SELECT (COUNT(?s) AS ?count)
+                WHERE { ?s rdf:type ?o . FILTER (?s != ?o) }
+            ";
+            let jsonld = fluree
+                .query(&view, QueryInput::Sparql(q))
+                .await
+                .expect("parallel encoded-filter query")
+                .to_jsonld(&view.snapshot)
+                .expect("to_jsonld");
+            assert_eq!(
+                normalize_rows(&jsonld),
+                normalize_rows(&json!([[expected]])),
+                "parallel encoded-filter count must exclude (s == o) rows = {expected}"
+            );
+        })
+        .await;
+}
+
+/// Parallel numeric-compare count: `SUM(?o > 0) { ?s ex:num ?o }` over >50k integer
+/// rows. The POST leaf slice is split across cores; per chunk, fully-matching /
+/// fully-excluded leaflets short-circuit and boundary leaflets binary-search.
+#[tokio::test]
+async fn indexed_parallel_numeric_compare_count_matches_serial() {
+    assert_index_defaults();
+    let fluree = FlureeBuilder::memory()
+        .with_ledger_cache_config(LedgerManagerConfig::default())
+        .build_memory();
+    let ledger_id = "it/indexed-parallel-numeric-compare:main";
+    let mut idx_config = fluree_db_indexer::IndexerConfig::small();
+    idx_config.leaflet_rows = 100;
+    idx_config.leaf_target_bytes = 8_000;
+    idx_config.leaf_max_bytes = 16_000;
+    let (local, handle) = start_background_indexer_local(
+        fluree.backend().clone(),
+        Arc::new(fluree.nameservice_mode().clone()),
+        idx_config,
+    );
+
+    local
+        .run_until(async move {
+            let index_cfg = IndexConfig {
+                reindex_min_bytes: 0,
+                reindex_max_bytes: 80_000_000,
+            };
+            // value = (i%5) - 2 in {-2,-1,0,1,2}; > 0 iff (i%5) in {3,4} => 2/5.
+            let n: i64 = 60_000;
+            let mut expected: i64 = 0;
+            let mut nodes: Vec<serde_json::Value> = Vec::with_capacity(n as usize);
+            for i in 0..n {
+                let v = (i % 5) - 2;
+                if v > 0 {
+                    expected += 1;
+                }
+                nodes.push(json!({"@id": format!("ex:s{i}"), "ex:num": v}));
+            }
+            let ledger1 = fluree
+                .insert_with_opts(
+                    genesis_ledger_for_fluree(&fluree, ledger_id),
+                    &json!({ "@context": { "ex": "http://example.org/ns/" }, "@graph": nodes }),
+                    TxnOpts::default(),
+                    CommitOpts::default(),
+                    &index_cfg,
+                )
+                .await
+                .expect("seed insert")
+                .ledger;
+            let _ = trigger_index_and_wait_outcome(&handle, ledger_id, ledger1.t()).await;
+            let view = fluree
+                .db_at_t(ledger_id, ledger1.t())
+                .await
+                .expect("load indexed view");
+
+            let q = r"
+                PREFIX ex: <http://example.org/ns/>
+                SELECT (SUM(?o > 0) AS ?sum)
+                WHERE { ?s ex:num ?o }
+            ";
+            let jsonld = fluree
+                .query(&view, QueryInput::Sparql(q))
+                .await
+                .expect("parallel numeric-compare query")
+                .to_jsonld(&view.snapshot)
+                .expect("to_jsonld");
+            assert_eq!(
+                normalize_rows(&jsonld),
+                normalize_rows(&json!([[expected]])),
+                "parallel numeric-compare count must equal #rows with ?o > 0 = {expected}"
+            );
+        })
+        .await;
+}
+
+/// Mixed XSD_INTEGER + XSD_DOUBLE objects under one predicate: the per-leaflet
+/// threshold encoding must count each numeric otype against its own encoded
+/// threshold (POST sorts by o_type, so int and double leaflets are disjoint). This
+/// locks the behavior change from the prior "bail on mixed otype" path.
+#[tokio::test]
+async fn indexed_numeric_compare_mixed_int_double_counts_correctly() {
+    assert_index_defaults();
+    let fluree = FlureeBuilder::memory()
+        .with_ledger_cache_config(LedgerManagerConfig::default())
+        .build_memory();
+    let ledger_id = "it/indexed-numeric-compare-mixed:main";
+    let mut idx_config = fluree_db_indexer::IndexerConfig::small();
+    idx_config.leaflet_rows = 100;
+    let (local, handle) = start_background_indexer_local(
+        fluree.backend().clone(),
+        Arc::new(fluree.nameservice_mode().clone()),
+        idx_config,
+    );
+
+    local
+        .run_until(async move {
+            let index_cfg = IndexConfig {
+                reindex_min_bytes: 0,
+                reindex_max_bytes: 80_000_000,
+            };
+            // Even i: integer (i%5)-2; odd i: double (i%5) as f64 - 1.5.
+            let n: i64 = 600;
+            let mut expected: i64 = 0;
+            let mut nodes: Vec<serde_json::Value> = Vec::with_capacity(n as usize);
+            for i in 0..n {
+                if i % 2 == 0 {
+                    let v = (i % 5) - 2; // {-2,-1,0,1,2}, >0 => {1,2}
+                    if v > 0 {
+                        expected += 1;
+                    }
+                    nodes.push(json!({"@id": format!("ex:s{i}"), "ex:num": v}));
+                } else {
+                    let v = (i % 5) as f64 - 1.5; // {-1.5,-0.5,0.5,1.5,2.5}, >0 => last three
+                    if v > 0.0 {
+                        expected += 1;
+                    }
+                    nodes.push(json!({"@id": format!("ex:s{i}"), "ex:num": v}));
+                }
+            }
+            let ledger1 = fluree
+                .insert_with_opts(
+                    genesis_ledger_for_fluree(&fluree, ledger_id),
+                    &json!({ "@context": { "ex": "http://example.org/ns/" }, "@graph": nodes }),
+                    TxnOpts::default(),
+                    CommitOpts::default(),
+                    &index_cfg,
+                )
+                .await
+                .expect("seed insert")
+                .ledger;
+            let _ = trigger_index_and_wait_outcome(&handle, ledger_id, ledger1.t()).await;
+            let view = fluree
+                .db_at_t(ledger_id, ledger1.t())
+                .await
+                .expect("load indexed view");
+
+            let q = r"
+                PREFIX ex: <http://example.org/ns/>
+                SELECT (SUM(?o > 0) AS ?sum)
+                WHERE { ?s ex:num ?o }
+            ";
+            let jsonld = fluree
+                .query(&view, QueryInput::Sparql(q))
+                .await
+                .expect("mixed numeric-compare query")
+                .to_jsonld(&view.snapshot)
+                .expect("to_jsonld");
+            assert_eq!(
+                normalize_rows(&jsonld),
+                normalize_rows(&json!([[expected]])),
+                "mixed int/double compare count must equal #rows with ?o > 0 = {expected}"
+            );
+        })
+        .await;
+}
+
 /// GROUP BY ?object COUNT(?subject) ORDER BY DESC LIMIT via the indexed POST
 /// path (`group_count_v6`, run-length + top-K). A high-multiplicity object's run
 /// (2000 rows) spans multiple leaflets, exercising the boundary-equality /

@@ -213,7 +213,7 @@ pub struct BinaryScanOperator {
 
 /// A filter that can be evaluated on encoded index columns (no term decoding).
 #[derive(Clone, Debug)]
-enum EncodedPreFilter {
+pub(crate) enum EncodedPreFilter {
     /// `FILTER(LANG(?o) = "<tag>")` for the object var `?o` in this scan.
     LangEqualsOType { required_otype: u16 },
     /// `FILTER(ISBLANK(?o))` for the object var `?o` in this scan.
@@ -232,7 +232,7 @@ enum EncodedPreFilter {
 
 impl EncodedPreFilter {
     #[inline]
-    fn eval_row(&self, s_id: u64, o_type: u16, o_key: u64) -> bool {
+    pub(crate) fn eval_row(&self, s_id: u64, o_type: u16, o_key: u64) -> bool {
         match self {
             EncodedPreFilter::LangEqualsOType { required_otype } => o_type == *required_otype,
             EncodedPreFilter::ObjectIsBlankNode => {
@@ -266,7 +266,7 @@ impl EncodedPreFilter {
     }
 }
 
-fn compile_encoded_pre_filters_and_prune_inline_ops(
+pub(crate) fn compile_encoded_pre_filters_and_prune_inline_ops(
     inline_ops: &[InlineOperator],
     pattern: &TriplePattern,
     store: &BinaryIndexStore,

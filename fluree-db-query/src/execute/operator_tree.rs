@@ -2152,18 +2152,28 @@ fn build_operator_tree_inner(
                 o: false,
             };
             let scan: BoxedOperator = Box::new(crate::dataset_operator::DatasetOperator::scan(
-                tp,
+                tp.clone(),
                 None,
-                inline_ops,
+                inline_ops.clone(),
                 emit,
                 None,
                 planning.mode(),
             ));
-            return Ok(Box::new(CountRowsOperator::new(
-                scan,
-                out_var,
-                Some(fallback),
-            )));
+            // Serial scan-count → general aggregate pipeline (the correct path for
+            // overlay/time-travel/policy). This is the fast path's fallback.
+            let scan_count: BoxedOperator =
+                Box::new(CountRowsOperator::new(scan, out_var, Some(fallback)));
+            // At HEAD, count the rows passing the encoded pre-filters in parallel
+            // across leaf chunks (no per-row binding materialization); otherwise, or
+            // if a filter can't be pushed to encoded columns, fall back to the scan.
+            return Ok(Box::new(
+                crate::fast_count::count_rows_encoded_filters_operator(
+                    tp,
+                    inline_ops,
+                    out_var,
+                    Some(scan_count),
+                ),
+            ));
         }
     }
 
