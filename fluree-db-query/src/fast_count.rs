@@ -140,11 +140,7 @@ pub fn class_property_count_operator(
             let total: u64 = classes
                 .iter()
                 .find(|c| c.class_sid == class_sid)
-                .and_then(|c| {
-                    c.properties
-                        .iter()
-                        .find(|p| p.property_sid == property_sid)
-                })
+                .and_then(|c| c.properties.iter().find(|p| p.property_sid == property_sid))
                 .map(|p| p.datatypes.iter().map(|&(_dt, c)| c).sum())
                 .unwrap_or(0);
             if total == 0 {

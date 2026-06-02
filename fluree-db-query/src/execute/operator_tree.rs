@@ -1071,7 +1071,8 @@ fn detect_class_property_count(query: &Query) -> Option<(Ref, Ref, Ref, VarId)> 
     if query.patterns.len() != 2 {
         return None;
     }
-    let (Pattern::Triple(t0), Pattern::Triple(t1)) = (&query.patterns[0], &query.patterns[1]) else {
+    let (Pattern::Triple(t0), Pattern::Triple(t1)) = (&query.patterns[0], &query.patterns[1])
+    else {
         return None;
     };
     for (cls_tp, prop_tp) in [(t0, t1), (t1, t0)] {
