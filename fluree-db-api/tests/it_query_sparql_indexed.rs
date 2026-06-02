@@ -1015,6 +1015,145 @@ async fn indexed_rdf_type_star_count_exact_after_incremental_retraction() {
         .await;
 }
 
+/// Cumulative-drift guard (#1266): the rdf:type-star fold must stay
+/// current-state-exact across SUCCESSIVE incremental builds, where each build
+/// seeds from the previous (possibly-drifted) root. Exercises all three
+/// incremental class-stat mutation kinds in sequence, re-indexing incrementally
+/// after each and asserting the fold equals the ground-truth join count:
+///   seed (full build): ex:a{C1,C2}×p{1,2,3}=6, ex:b{C1}×p{4}=1            => 7
+///   r1 retract `ex:a a ex:C2` (re-type shrink; p untouched): ex:a{C1}×3=3 => 4
+///   r2 retract `ex:a ex:p 1`  (property retraction):         ex:a{C1}×2=2 => 3
+///   r3 assert  `ex:b a ex:C2` (type-gainer; p untouched):    ex:b{C1,C2}×1=2 => 4
+/// Pre-#1266, r1/r3 would under-count (props not re-attributed to the joined/left
+/// class) and r2 would over-count (retraction delta dropped); the fold would drift.
+#[tokio::test]
+async fn indexed_rdf_type_star_count_exact_across_incremental_builds() {
+    assert_index_defaults();
+    let fluree = FlureeBuilder::memory()
+        .with_ledger_cache_config(LedgerManagerConfig::default())
+        .build_memory();
+    let ledger_id = "it/indexed-typestar-multi:main";
+    let (local, handle) = start_background_indexer_local(
+        fluree.backend().clone(),
+        Arc::new(fluree.nameservice_mode().clone()),
+        fluree_db_indexer::IndexerConfig::small(),
+    );
+    local
+        .run_until(async move {
+            let index_cfg = IndexConfig {
+                reindex_min_bytes: 0,
+                reindex_max_bytes: 10_000_000,
+            };
+            let q = r"
+                PREFIX ex: <http://example.org/ns/>
+                PREFIX rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#>
+                SELECT (COUNT(*) AS ?count) WHERE { ?s rdf:type ?o1 . ?s ex:p ?o2 }
+            ";
+
+            // Run the fold query at transaction `t` (HEAD == indexed, no overlay)
+            // and return its normalized rows.
+            macro_rules! fold_rows {
+                ($t:expr) => {{
+                    let view = fluree.db_at_t(ledger_id, $t).await.expect("view");
+                    normalize_rows(
+                        &fluree
+                            .query(&view, QueryInput::Sparql(q))
+                            .await
+                            .expect("fold query")
+                            .to_jsonld(&view.snapshot)
+                            .expect("to_jsonld"),
+                    )
+                }};
+            }
+
+            // Seed (full build).
+            let ledger1 = fluree
+                .insert_with_opts(
+                    genesis_ledger_for_fluree(&fluree, ledger_id),
+                    &json!({
+                        "@context": { "ex": "http://example.org/ns/" },
+                        "@graph": [
+                            {"@id": "ex:a", "@type": ["ex:C1", "ex:C2"], "ex:p": [1, 2, 3]},
+                            {"@id": "ex:b", "@type": "ex:C1", "ex:p": [4]}
+                        ]
+                    }),
+                    TxnOpts::default(),
+                    CommitOpts::default(),
+                    &index_cfg,
+                )
+                .await
+                .expect("seed insert")
+                .ledger;
+            let _ = trigger_index_and_wait_outcome(&handle, ledger_id, ledger1.t()).await;
+            assert_eq!(
+                fold_rows!(ledger1.t()),
+                normalize_rows(&json!([[7]])),
+                "seed: ex:a{{C1,C2}}*3 + ex:b{{C1}}*1 = 7"
+            );
+
+            // r1 — re-type shrink: drop ex:a's ex:C2 type, leave its ex:p untouched.
+            let ledger2 = fluree
+                .update(
+                    ledger1,
+                    &json!({
+                        "@context": { "ex": "http://example.org/ns/" },
+                        "delete": [{"@id": "ex:a", "@type": "ex:C2"}]
+                    }),
+                )
+                .await
+                .expect("retract type C2")
+                .ledger;
+            let _ = trigger_index_and_wait_outcome(&handle, ledger_id, ledger2.t()).await;
+            assert_eq!(
+                fold_rows!(ledger2.t()),
+                normalize_rows(&json!([[4]])),
+                "after dropping ex:a a ex:C2: ex:a{{C1}}*3 + ex:b*1 = 4 (C2 dropped ex:a's 3 p)"
+            );
+
+            // r2 — property retraction.
+            let ledger3 = fluree
+                .update(
+                    ledger2,
+                    &json!({
+                        "@context": { "ex": "http://example.org/ns/" },
+                        "delete": [{"@id": "ex:a", "ex:p": 1}]
+                    }),
+                )
+                .await
+                .expect("retract p 1")
+                .ledger;
+            let _ = trigger_index_and_wait_outcome(&handle, ledger_id, ledger3.t()).await;
+            assert_eq!(
+                fold_rows!(ledger3.t()),
+                normalize_rows(&json!([[3]])),
+                "after retracting ex:a ex:p 1: ex:a{{C1}}*2 + ex:b*1 = 3"
+            );
+
+            // r3 — type-gainer: add ex:C2 to ex:b (additive), ex:p untouched.
+            let ledger4 = fluree
+                .insert_with_opts(
+                    ledger3,
+                    &json!({
+                        "@context": { "ex": "http://example.org/ns/" },
+                        "@graph": [{"@id": "ex:b", "@type": "ex:C2"}]
+                    }),
+                    TxnOpts::default(),
+                    CommitOpts::default(),
+                    &index_cfg,
+                )
+                .await
+                .expect("add type C2 to ex:b")
+                .ledger;
+            let _ = trigger_index_and_wait_outcome(&handle, ledger_id, ledger4.t()).await;
+            assert_eq!(
+                fold_rows!(ledger4.t()),
+                normalize_rows(&json!([[4]])),
+                "after adding ex:b a ex:C2: ex:a{{C1}}*2 + ex:b{{C1,C2}}*1 = 4 (b's p re-attributed to C2)"
+            );
+        })
+        .await;
+}
+
 /// `number-of-predicates` (`COUNT(DISTINCT ?p) WHERE { ?s ?p ?o }`) served from
 /// the per-graph index stats (count of properties with positive current count),
 /// no leaf scan. Asserts the indexed (stats) result equals the memory

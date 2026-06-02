@@ -1905,8 +1905,17 @@ pub async fn incremental_index(
                     {
                         Ok(s) => Some(Arc::new(s)),
                         Err(e) => {
-                            tracing::warn!(error = %e, "V6 store load for class attribution failed");
-                            None
+                            // We need the base store to seed base class entries and to
+                            // re-attribute re-typed subjects. Without it, base entries
+                            // resolve to sid64==0 and get dropped, publishing novelty-only
+                            // (wrong) class-property stats — which the rdf:type-star COUNT
+                            // fold then serves verbatim at HEAD. Abort to a full rebuild
+                            // (which loads its own data and recomputes class stats exactly),
+                            // mirroring the spatial-snapshot and re-type-workload gates above.
+                            return Err(IndexerError::IncrementalAbort(format!(
+                                "V6 store load for class attribution failed: {e}; \
+                                 falling back to full rebuild for correct class stats"
+                            )));
                         }
                     }
                 } else {
