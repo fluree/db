@@ -2027,6 +2027,90 @@ async fn overlay_parallel_encoded_filter_count_folds_novelty() {
         .await;
 }
 
+/// PARALLEL overlay lane for the numeric-compare SUM: >50k indexed base rows + novelty,
+/// queried at HEAD. The numeric compare runs per-row over the subject-partitioned
+/// overlay scan (PSOT), folding novelty.
+#[tokio::test]
+async fn overlay_parallel_numeric_compare_sum_folds_novelty() {
+    assert_index_defaults();
+    let fluree = FlureeBuilder::memory()
+        .with_ledger_cache_config(LedgerManagerConfig::default())
+        .build_memory();
+    let ledger_id = "it/overlay-parallel-numeric:main";
+    let mut idx_config = fluree_db_indexer::IndexerConfig::small();
+    idx_config.leaflet_rows = 100;
+    idx_config.leaf_target_bytes = 8_000;
+    idx_config.leaf_max_bytes = 16_000;
+    let (local, handle) = start_background_indexer_local(
+        fluree.backend().clone(),
+        Arc::new(fluree.nameservice_mode().clone()),
+        idx_config,
+    );
+
+    local
+        .run_until(async move {
+            let index_cfg = IndexConfig {
+                reindex_min_bytes: 0,
+                reindex_max_bytes: 80_000_000,
+            };
+            // value = (i%5)-2 in {-2,-1,0,1,2}; > 0 iff i%5 in {3,4} => 2/5.
+            let n: i64 = 60_000;
+            let mut expected: i64 = 0;
+            let mut nodes: Vec<serde_json::Value> = Vec::with_capacity(n as usize);
+            for i in 0..n {
+                let v = (i % 5) - 2;
+                if v > 0 {
+                    expected += 1;
+                }
+                nodes.push(json!({"@id": format!("ex:s{i}"), "ex:num": v}));
+            }
+            let ledger = fluree
+                .insert_with_opts(
+                    genesis_ledger_for_fluree(&fluree, ledger_id),
+                    &json!({ "@context": { "ex": "http://example.org/ns/" }, "@graph": nodes }),
+                    TxnOpts::default(),
+                    CommitOpts::default(),
+                    &index_cfg,
+                )
+                .await
+                .expect("baseline insert")
+                .ledger;
+            let _ = trigger_index_and_wait_outcome(&handle, ledger_id, ledger.t()).await;
+            // Novelty: 50 subjects with value 5 (> 0).
+            let mut nov: Vec<serde_json::Value> = Vec::new();
+            for j in 0..50 {
+                nov.push(json!({"@id": format!("ex:n{j}"), "ex:num": 5}));
+                expected += 1;
+            }
+            let _ = fluree
+                .insert(
+                    ledger,
+                    &json!({ "@context": { "ex": "http://example.org/ns/" }, "@graph": nov }),
+                )
+                .await
+                .expect("novelty insert");
+
+            let view = fluree.db(ledger_id).await.expect("load HEAD view w/ novelty");
+            let q = r"
+                PREFIX ex: <http://example.org/ns/>
+                SELECT (SUM(?o > 0) AS ?sum) WHERE { ?s ex:num ?o }
+            ";
+            let jsonld = fluree
+                .query(&view, QueryInput::Sparql(q))
+                .await
+                .expect("parallel overlay numeric query")
+                .to_jsonld(&view.snapshot)
+                .expect("to_jsonld");
+            // base 24000 + novelty 50 = 24050.
+            assert_eq!(
+                normalize_rows(&jsonld),
+                normalize_rows(&json!([[expected]])),
+                "parallel overlay numeric SUM(?o > 0) must fold novelty = {expected}"
+            );
+        })
+        .await;
+}
+
 /// Overlay/novelty lane for the LANG-filter COUNT fast path.
 #[tokio::test]
 async fn overlay_lang_filter_count_folds_novelty() {

@@ -9,11 +9,10 @@ use crate::context::ExecutionContext;
 use crate::error::{QueryError, Result};
 use crate::binary_scan::{compile_encoded_pre_filters_and_prune_inline_ops, EncodedPreFilter};
 use crate::fast_path_common::{
-    allow_cursor_fast_path, build_count_batch, count_rows_for_predicate_psot,
-    count_rows_via_overlay_cursor, count_to_i64, fast_path_store, leaf_entries_for_predicate,
-    normalize_pred_sid, parallel_leaf_chunk_count, parallel_overlay_psot_filter_count,
-    projection_okey_only, projection_otype_only, projection_sid_only, projection_sid_otype_okey,
-    FastPathOperator,
+    allow_cursor_fast_path, build_count_batch, count_rows_for_predicate_psot, count_to_i64,
+    fast_path_store, leaf_entries_for_predicate, normalize_pred_sid, parallel_leaf_chunk_count,
+    parallel_overlay_psot_filter_count, projection_okey_only, projection_otype_only,
+    projection_sid_only, projection_sid_otype_okey, FastPathOperator,
 };
 use std::sync::Arc;
 use fluree_db_binary_index::format::branch::LeafEntry;
@@ -113,7 +112,7 @@ pub fn count_rows_numeric_compare_operator(
                     let Some(p_id) = store.sid_to_p_id(&pred_sid) else {
                         return Ok(None);
                     };
-                    if let Some((matches, _total)) = count_numeric_compare_via_overlay_cursor(
+                    if let Some(matches) = count_numeric_compare_overlay_parallel(
                         ctx,
                         store,
                         ctx.binary_g_id,
@@ -195,7 +194,7 @@ pub fn sum_compare_as_count_operator(
                     let Some(p_id) = store.sid_to_p_id(&pred_sid) else {
                         return Ok(None);
                     };
-                    if let Some((matches, total)) = count_numeric_compare_via_overlay_cursor(
+                    if let Some(matches) = count_numeric_compare_overlay_parallel(
                         ctx,
                         store,
                         ctx.binary_g_id,
@@ -204,13 +203,16 @@ pub fn sum_compare_as_count_operator(
                         compare,
                         &threshold,
                     )? {
-                        if total == 0 {
-                            return Ok(None);
+                        // matches > 0 ⇒ the input is non-empty ⇒ SUM is the bound
+                        // count. matches == 0 can't distinguish empty (Unbound) from
+                        // non-empty-with-no-matches (bound 0), so defer to the
+                        // fallback, which resolves the SPARQL semantics correctly.
+                        if matches > 0 {
+                            return Ok(Some(build_count_batch(
+                                out_var,
+                                count_to_i64(matches, "SUM(compare) as count")?,
+                            )?));
                         }
-                        return Ok(Some(build_count_batch(
-                            out_var,
-                            count_to_i64(matches, "SUM(compare) as count")?,
-                        )?));
                     }
                 }
             }
@@ -499,14 +501,18 @@ fn okey_matches(compare: NumericCompareOp, o_key: u64, threshold: u64) -> bool {
     }
 }
 
-/// Overlay/time-travel lane for the numeric-compare count: count the rows of `p_id`
-/// matching `?o <compare> threshold` through an overlay-folding cursor, returning
-/// `(matches, total_rows_scanned)`. `total_rows` lets the SUM caller apply the
-/// empty-input→Unbound rule. The thresholds for the two numeric otypes are encoded
-/// once up front; a non-numeric (or non-encodable) object row bails the whole count
-/// to `Ok(None)`, matching the base path's mixed/non-numeric bail. BASE+novelty:
-/// caller gates on [`allow_cursor_fast_path`].
-fn count_numeric_compare_via_overlay_cursor(
+/// Overlay/time-travel lane for the numeric-compare count: counts rows of `p_id`
+/// matching `?o <compare> threshold` over the novelty-merged stream, parallelized
+/// across the subject space (PSOT) just like the HEAD path.
+///
+/// The comparison is per-row and order-independent, so PSOT order is fine — the POST
+/// directory shortcut + binary search only apply to the base scan. A non-numeric (or
+/// non-encodable) object is treated as a non-match: `?o <cmp> K` on a non-number
+/// would error and so contributes nothing, which equals what the general aggregate
+/// pipeline counts (and avoids the base path's whole-query bail on mixed types).
+/// Returns the match count, or `Ok(None)` to defer (overlay flake failed to
+/// translate). BASE+novelty: caller gates on [`allow_cursor_fast_path`].
+fn count_numeric_compare_overlay_parallel(
     ctx: &crate::context::ExecutionContext<'_>,
     store: &Arc<BinaryIndexStore>,
     g_id: GraphId,
@@ -514,28 +520,27 @@ fn count_numeric_compare_via_overlay_cursor(
     p_id: u32,
     compare: NumericCompareOp,
     threshold: &FlakeValue,
-) -> Result<Option<(u64, u64)>> {
+) -> Result<Option<u64>> {
     let tk_int = encode_numeric_threshold_for_otype(OType::XSD_INTEGER, threshold)?;
     let tk_dbl = encode_numeric_threshold_for_otype(OType::XSD_DOUBLE, threshold)?;
-    let mut total: u64 = 0;
-    let matches = count_rows_via_overlay_cursor(
+    parallel_overlay_psot_filter_count(
         ctx,
         store,
         g_id,
-        RunSortOrder::Post,
         pred_sid,
         p_id,
-        |_s, o_type, o_key| {
-            total = total.saturating_add(1);
+        move |_s, o_type, o_key| {
             let tk = match OType::from_u16(o_type) {
                 OType::XSD_INTEGER => tk_int,
                 OType::XSD_DOUBLE => tk_dbl,
-                _ => return None, // non-numeric object: bail to the general pipeline
+                _ => return false, // non-numeric object: comparison errors => not a match
             };
-            tk.map(|tk| okey_matches(compare, o_key, tk))
+            match tk {
+                Some(tk) => okey_matches(compare, o_key, tk),
+                None => false,
+            }
         },
-    )?;
-    Ok(matches.map(|m| (m, total)))
+    )
 }
 
 /// Fast-path: parallel `COUNT(?s)` / `COUNT(*)` for a single predicate `?s <p> ?o`
