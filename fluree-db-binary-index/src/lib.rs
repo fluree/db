@@ -17,7 +17,7 @@ pub mod read;
 
 // ── Read-side types ─────────────────────────────────────────────────────────
 pub use read::batched_lookup::{
-    batched_lookup_predicate_refs, batched_lookup_subject_properties,
+    batched_lookup_inbound_refs, batched_lookup_predicate_refs, batched_lookup_subject_properties,
 };
 pub use read::binary_cursor::BinaryCursor;
 pub use read::binary_index_store::{BinaryGraphView, BinaryIndexStore};

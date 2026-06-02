@@ -320,6 +320,114 @@ pub fn batched_lookup_subject_properties(
     Ok(out)
 }
 
+/// Batched OPST lookup: all inbound `IRI_REF` edges pointing at each requested
+/// object, from the persisted index at `to_t`. No overlay/novelty merge.
+///
+/// Returns `HashMap<object_sid64, Vec<(p_id, subject_sid64)>>`.
+///
+/// Mirrors [`batched_lookup_predicate_refs`] but scans `RunSortOrder::Opst`
+/// (object-major: `(o_type, o_key, o_i, p_id, s_id)`). The scan range pins
+/// `o_type = IRI_REF`, so every yielded row is a reference edge — no per-row
+/// o_type check is required. Used by the incremental class-stat merge to move a
+/// re-typed object's inbound ref-class edges from its old class bucket to its
+/// new one (issue #1266).
+pub fn batched_lookup_inbound_refs(
+    store: &Arc<BinaryIndexStore>,
+    g_id: GraphId,
+    objects: &[u64],
+    to_t: i64,
+) -> io::Result<HashMap<u64, Vec<(u32, u64)>>> {
+    let mut out: HashMap<u64, Vec<(u32, u64)>> = HashMap::new();
+    if objects.is_empty() {
+        return Ok(out);
+    }
+
+    let mut sorted = objects.to_vec();
+    sorted.sort_unstable();
+    sorted.dedup();
+    let obj_set: HashSet<u64> = sorted.iter().copied().collect();
+
+    let Some(branch) = store.branch_for_order(g_id, RunSortOrder::Opst) else {
+        return Ok(out);
+    };
+    let branch = Arc::clone(branch);
+    let iri_ref = OType::IRI_REF.as_u16();
+
+    const MAX_SPAN: u64 = 100_000;
+    const MAX_CHUNK: usize = 1000;
+    // chunk_subjects operates on a sorted &[u64] span — identical logic applies
+    // to object o_key spans, so reuse it verbatim.
+    let chunks = chunk_subjects(&sorted, MAX_SPAN, MAX_CHUNK);
+
+    // Need s_id (inbound subject), p_id, o_key (filter to set), o_type (ref check).
+    let mut needed = ColumnSet::EMPTY;
+    needed.insert(ColumnId::SId);
+    needed.insert(ColumnId::PId);
+    needed.insert(ColumnId::OType);
+    needed.insert(ColumnId::OKey);
+    let projection = ColumnProjection {
+        output: needed,
+        internal: ColumnSet::EMPTY,
+    };
+
+    for chunk in &chunks {
+        let min_o = chunk[0];
+        let max_o = *chunk.last().unwrap();
+
+        // OPST order = (o_type, o_key, o_i, p_id, s_id); pin o_type = IRI_REF.
+        let min_key = RunRecordV2 {
+            s_id: SubjectId::from_u64(0),
+            o_key: min_o,
+            p_id: 0,
+            t: 0,
+            o_i: 0,
+            o_type: iri_ref,
+            g_id,
+        };
+        let max_key = RunRecordV2 {
+            s_id: SubjectId::from_u64(u64::MAX),
+            o_key: max_o,
+            p_id: u32::MAX,
+            t: 0,
+            o_i: u32::MAX,
+            o_type: iri_ref,
+            g_id,
+        };
+
+        let mut cursor = BinaryCursor::new(
+            Arc::clone(store),
+            RunSortOrder::Opst,
+            Arc::clone(&branch),
+            &min_key,
+            &max_key,
+            BinaryFilter::default(),
+            projection,
+        );
+        cursor.set_to_t(to_t);
+
+        while let Some(batch) = cursor.next_batch()? {
+            for i in 0..batch.row_count {
+                if batch.o_type.get_or(i, 0) != iri_ref {
+                    continue;
+                }
+                let o_key = batch.o_key.get(i);
+                if !obj_set.contains(&o_key) {
+                    continue;
+                }
+                out.entry(o_key)
+                    .or_default()
+                    .push((batch.p_id.get_or(i, 0), batch.s_id.get(i)));
+            }
+        }
+    }
+
+    for v in out.values_mut() {
+        v.sort_unstable();
+        v.dedup();
+    }
+    Ok(out)
+}
+
 /// Break sorted subjects into chunks where each chunk spans at most
 /// `max_span` IDs and contains at most `max_chunk` subjects.
 fn chunk_subjects(sorted: &[u64], max_span: u64, max_chunk: usize) -> Vec<&[u64]> {

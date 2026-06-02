@@ -2066,6 +2066,32 @@ pub async fn incremental_index(
                         .copied()
                         .collect();
 
+                // Rebuild gate (issue #1266): re-typing/deleting an EXISTING subject
+                // forces a base-index re-scan to move its class-scoped datatype/lang/ref
+                // stats. Above a threshold, recomputing class stats from scratch via the
+                // full-rebuild SPOT pass is cheaper and simpler, so abort incremental and
+                // let the caller fall back to rebuild. Only count subjects that existed in
+                // the base index (those drive the re-scan work); brand-new typed subjects
+                // are free. An IncrementalAbort is caught in lib.rs and routed to rebuild.
+                let retype_workload = changed_membership
+                    .iter()
+                    .filter(|key| base_subject_classes.contains_key(*key))
+                    .count();
+                if retype_workload > config.incremental_retype_max_subjects {
+                    tracing::warn!(
+                        retype_workload,
+                        threshold = config.incremental_retype_max_subjects,
+                        "Phase 3b: existing-subject rdf:type changes exceed threshold; \
+                         aborting incremental for full rebuild (class stats recomputed \
+                         from the SPOT pass)"
+                    );
+                    return Err(IndexerError::IncrementalAbort(format!(
+                        "re-type workload {retype_workload} exceeds threshold {} \
+                         (deferring class-stat recompute to full rebuild)",
+                        config.incremental_retype_max_subjects
+                    )));
+                }
+
                 // Build class→properties, class→prop→dts, class→prop→langs, ref_edges.
                 let attribution_maps_started = Instant::now();
                 let mut class_properties: std::collections::HashMap<
@@ -2211,12 +2237,20 @@ pub async fn incremental_index(
                 //   - class in N \ B (joined):     apply  new
                 //   - class in B ∩ N (kept):       apply  delta
                 //
-                // NOTE: ref-class edges for re-typed subjects are NOT moved here yet;
-                // that needs target-class resolution (and a reverse OPST pass for
-                // re-typed objects) and is tracked separately. Datatype and language
-                // distributions — which the COUNT(*) fast path consumes — are exact.
+                // This block handles datatype + language distributions. Ref-class
+                // edges (which depend on BOTH endpoints' classes) are re-attributed in
+                // the dedicated ref pass further below — Case A (re-typed subjects'
+                // outgoing edges, collected here from the same base scan) and Case B
+                // (re-typed objects' inbound edges via reverse OPST).
                 if let Some(ref store) = store_opt {
                     if !changed_membership.is_empty() {
+                        let iri_ref_otype = fluree_db_core::o_type::OType::IRI_REF.as_u16();
+                        // Outgoing ref edges (g_id, subject, p_id, object) of re-typed
+                        // subjects, collected from the same base scan used for datatype
+                        // re-attribution (Case A). Combined with re-typed objects' inbound
+                        // edges (Case B, reverse OPST) below to move ref-class stats across
+                        // the type change (issue #1266).
+                        let mut outgoing_ref_edges: Vec<(u16, u64, u32, u64)> = Vec::new();
                         let mut changed_by_graph: std::collections::HashMap<u16, Vec<u64>> =
                             std::collections::HashMap::new();
                         for &(g_id, s_id) in &changed_membership {
@@ -2264,6 +2298,11 @@ pub async fn incremental_index(
                                     for &(p_id, o_type, o_key) in flakes {
                                         if p_id == rdf_type_p_id {
                                             continue;
+                                        }
+                                        // Collect this subject's existing ref edges for
+                                        // Case A ref-class re-attribution (o_key = target sid).
+                                        if o_type == iri_ref_otype {
+                                            outgoing_ref_edges.push((g_id, s_id, p_id, o_key));
                                         }
                                         let rec =
                                             fluree_db_binary_index::format::run_record_v2::RunRecordV2 {
@@ -2376,6 +2415,130 @@ pub async fn incremental_index(
                                                     .insert(pid);
                                             }
                                         }
+                                    }
+                                }
+                            }
+                        }
+
+                        // Ref-class edge re-attribution (issue #1266): move the ref-class
+                        // edges of re-typed subjects/objects from their old (subject_class,
+                        // p, object_class) buckets to their new ones. Only UNTOUCHED edges
+                        // (present in the base index, not asserted/retracted this batch) —
+                        // edges touched this batch are owned by the forward
+                        // subject_ref_history pass above, so we skip them here.
+                        for (&g_id, sids) in &changed_by_graph {
+                            let mut edges: std::collections::HashSet<(u64, u32, u64)> =
+                                std::collections::HashSet::new();
+                            // Case A: outgoing edges of re-typed subjects (from the base scan).
+                            for &(eg, s, p, o) in &outgoing_ref_edges {
+                                if eg == g_id {
+                                    edges.insert((s, p, o));
+                                }
+                            }
+                            // Case B: inbound edges of re-typed objects (reverse OPST). Skip
+                            // edges whose subject also changed — Case A already owns those.
+                            match fluree_db_binary_index::batched_lookup_inbound_refs(
+                                store,
+                                g_id,
+                                sids,
+                                base_root.index_t,
+                            ) {
+                                Ok(inbound) => {
+                                    for (&obj, ins) in &inbound {
+                                        for &(p, subj) in ins {
+                                            if changed_membership.contains(&(g_id, subj)) {
+                                                continue;
+                                            }
+                                            edges.insert((subj, p, obj));
+                                        }
+                                    }
+                                }
+                                Err(e) => {
+                                    tracing::warn!(
+                                        g_id, error = %e,
+                                        "Phase 3b: inbound ref scan failed; re-typed objects \
+                                         may keep stale ref-class stats"
+                                    );
+                                }
+                            }
+                            // Drop edges touched this batch — the forward pass owns them.
+                            edges.retain(|&(s, p, o)| {
+                                !subject_ref_history
+                                    .get(&(g_id, s))
+                                    .and_then(|per_prop| per_prop.get(&p))
+                                    .map(|objs| objs.contains_key(&o))
+                                    .unwrap_or(false)
+                            });
+                            if edges.is_empty() {
+                                continue;
+                            }
+                            // Resolve classes for endpoints not already known from this batch
+                            // (stable base entities) via one batched rdf:type lookup; endpoints
+                            // in base_subject_classes (re-typed / novelty) use those maps.
+                            let mut external_sids: Vec<u64> = Vec::new();
+                            for &(s, _p, o) in &edges {
+                                if !base_subject_classes.contains_key(&(g_id, s)) {
+                                    external_sids.push(s);
+                                }
+                                if !base_subject_classes.contains_key(&(g_id, o)) {
+                                    external_sids.push(o);
+                                }
+                            }
+                            external_sids.sort_unstable();
+                            external_sids.dedup();
+                            let external_base = if external_sids.is_empty() {
+                                std::collections::HashMap::new()
+                            } else {
+                                fluree_db_binary_index::batched_lookup_predicate_refs(
+                                    store,
+                                    g_id,
+                                    rdf_type_p_id,
+                                    &external_sids,
+                                    base_root.index_t,
+                                )
+                                .unwrap_or_default()
+                            };
+                            // (base_classes, net_classes) for an endpoint. A stable base
+                            // entity has base == net (its type did not change this batch).
+                            let resolve = |sid: u64| -> (Vec<u64>, Vec<u64>) {
+                                if let Some(b) = base_subject_classes.get(&(g_id, sid)) {
+                                    let base: Vec<u64> = b.iter().copied().collect();
+                                    let net: Vec<u64> = subject_classes
+                                        .get(&(g_id, sid))
+                                        .map(|s| s.iter().copied().collect())
+                                        .unwrap_or_default();
+                                    (base, net)
+                                } else {
+                                    let cls =
+                                        external_base.get(&sid).cloned().unwrap_or_default();
+                                    (cls.clone(), cls)
+                                }
+                            };
+                            // Per affected edge: -1 at every (base_subj_class, p, base_obj_class),
+                            // +1 at every (net_subj_class, p, net_obj_class).
+                            for &(s, p, o) in &edges {
+                                let (bs, ns) = resolve(s);
+                                let (bo, no) = resolve(o);
+                                for &sc in &bs {
+                                    for &oc in &bo {
+                                        *ref_edges
+                                            .entry((g_id, sc))
+                                            .or_default()
+                                            .entry(p)
+                                            .or_default()
+                                            .entry(oc)
+                                            .or_insert(0) -= 1;
+                                    }
+                                }
+                                for &sc in &ns {
+                                    for &oc in &no {
+                                        *ref_edges
+                                            .entry((g_id, sc))
+                                            .or_default()
+                                            .entry(p)
+                                            .or_default()
+                                            .entry(oc)
+                                            .or_insert(0) += 1;
                                     }
                                 }
                             }

@@ -174,6 +174,16 @@ pub struct IndexerConfig {
     /// `None` means no limit (backwards-compatible default).
     pub incremental_max_commit_bytes: Option<usize>,
 
+    /// Maximum number of *existing* subjects whose `rdf:type` set may change in
+    /// a single incremental batch before incremental indexing aborts and defers
+    /// to a full rebuild. Re-typing (or deleting) an existing subject forces a
+    /// base-index re-scan to move its class-scoped property/ref stats (issue
+    /// #1266); above this count, recomputing class stats from scratch via the
+    /// rebuild SPOT pass is cheaper and simpler. Counts only subjects that
+    /// existed in the base index (new-subject inserts are free). Default
+    /// [`DEFAULT_INCREMENTAL_RETYPE_MAX_SUBJECTS`].
+    pub incremental_retype_max_subjects: usize,
+
     /// Configured full-text properties for this indexing run.
     ///
     /// Caller-computed (typically by `fluree-db-api` resolving the ledger's
@@ -208,6 +218,10 @@ pub const DEFAULT_INCREMENTAL_MAX_COMMITS: usize = 10_000;
 /// Default max concurrency for incremental branch updates.
 pub const DEFAULT_INCREMENTAL_MAX_CONCURRENCY: usize = 4;
 
+/// Default cap on existing-subject `rdf:type` changes per incremental batch
+/// before deferring to full rebuild (issue #1266 ref/class-stat re-attribution).
+pub const DEFAULT_INCREMENTAL_RETYPE_MAX_SUBJECTS: usize = 100_000;
+
 impl Default for IndexerConfig {
     fn default() -> Self {
         Self {
@@ -225,6 +239,7 @@ impl Default for IndexerConfig {
             leaflet_rows: 25_000,
             leaflets_per_leaf: 10,
             incremental_max_commit_bytes: None,
+            incremental_retype_max_subjects: DEFAULT_INCREMENTAL_RETYPE_MAX_SUBJECTS,
             fulltext_configured_properties: Vec::new(),
             fulltext_config_provider: None,
         }
@@ -254,6 +269,7 @@ impl IndexerConfig {
             leaflet_rows: 25_000,
             leaflets_per_leaf: 10,
             incremental_max_commit_bytes: None,
+            incremental_retype_max_subjects: DEFAULT_INCREMENTAL_RETYPE_MAX_SUBJECTS,
             fulltext_configured_properties: Vec::new(),
             fulltext_config_provider: None,
         }
@@ -276,6 +292,7 @@ impl IndexerConfig {
             leaflet_rows: 25_000,
             leaflets_per_leaf: 10,
             incremental_max_commit_bytes: None,
+            incremental_retype_max_subjects: DEFAULT_INCREMENTAL_RETYPE_MAX_SUBJECTS,
             fulltext_configured_properties: Vec::new(),
             fulltext_config_provider: None,
         }
@@ -298,6 +315,7 @@ impl IndexerConfig {
             leaflet_rows: 25_000,
             leaflets_per_leaf: 10,
             incremental_max_commit_bytes: None,
+            incremental_retype_max_subjects: DEFAULT_INCREMENTAL_RETYPE_MAX_SUBJECTS,
             fulltext_configured_properties: Vec::new(),
             fulltext_config_provider: None,
         }
@@ -369,6 +387,13 @@ impl IndexerConfig {
     /// Builder method to set the maximum concurrency for incremental branch updates
     pub fn with_incremental_max_concurrency(mut self, max_concurrency: usize) -> Self {
         self.incremental_max_concurrency = max_concurrency.max(1);
+        self
+    }
+
+    /// Builder method to set the per-batch cap on existing-subject `rdf:type`
+    /// changes before incremental indexing defers to a full rebuild (#1266).
+    pub fn with_incremental_retype_max_subjects(mut self, max_subjects: usize) -> Self {
+        self.incremental_retype_max_subjects = max_subjects;
         self
     }
 }
