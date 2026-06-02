@@ -1973,6 +1973,82 @@ pub fn build_post_cursor_for_predicate(
     )
 }
 
+/// Build an overlay-folding PSOT cursor bounded to the subject range `[lo, hi)`,
+/// using `sliced_ops` (the predicate's resolved overlay ops already restricted to
+/// `[lo, hi)`) rather than re-collecting them. This is the per-partition primitive
+/// for parallelizing an overlay count: the partition harness hands each worker a
+/// subject range, and each worker scans only its leaves and merges only its ops.
+///
+/// Takes `to_t`/`epoch` as values (not `&ExecutionContext`) so the caller can hoist
+/// them out of the parallel region and keep the reducer `Sync`. The cursor's leaf
+/// range is bounded by the keys, but rows are filtered only by `p_id`, so a boundary
+/// leaf shared with an adjacent partition still emits its out-of-range subjects — the
+/// caller MUST drop rows with `s_id < lo || s_id >= hi` so each subject is counted by
+/// exactly one partition. Returns `None` if the PSOT branch is absent.
+#[allow(clippy::too_many_arguments)]
+pub fn build_overlay_cursor_for_subject_range(
+    store: &Arc<BinaryIndexStore>,
+    g_id: GraphId,
+    p_id: u32,
+    projection: ColumnProjection,
+    lo: u64,
+    hi: u64,
+    sliced_ops: Vec<fluree_db_binary_index::read::types::OverlayOp>,
+    to_t: i64,
+    epoch: u64,
+) -> Option<BinaryCursor> {
+    let overlay_active = epoch != 0;
+    // Identity columns must be present for merge_overlay_into_batch (see
+    // build_overlay_cursor_for_predicate / set_overlay_ops).
+    let projection = if overlay_active {
+        let identity = ColumnSet::CORE.union(ColumnSet::single(ColumnId::OI));
+        ColumnProjection {
+            output: projection.output,
+            internal: ColumnSet(projection.internal.union(identity).0 & !projection.output.0),
+        }
+    } else {
+        projection
+    };
+
+    let (mut min_key, mut max_key) = predicate_range_keys(p_id, g_id);
+    min_key.s_id = SubjectId(lo);
+    // Upper bound: smallest key at subject `hi` (exclusive `hi` is enforced by the
+    // caller's per-row filter; this only narrows the scanned leaf range).
+    max_key.s_id = SubjectId(hi);
+    max_key.o_key = 0;
+    max_key.o_type = 0;
+    max_key.o_i = 0;
+    max_key.t = 0;
+
+    let filter = BinaryFilter {
+        p_id: Some(p_id),
+        ..Default::default()
+    };
+    let mut cursor =
+        build_range_cursor(store, g_id, RunSortOrder::Psot, &min_key, &max_key, filter, projection)?;
+    cursor.set_to_t(to_t);
+    if overlay_active {
+        if !sliced_ops.is_empty() {
+            cursor.set_overlay_ops(sliced_ops);
+        }
+        cursor.set_epoch(epoch);
+    }
+    Some(cursor)
+}
+
+/// Slice a predicate's resolved overlay ops (sorted in PSOT order, i.e. by
+/// `(p_id, s_id, …)` for a single predicate) to those with `s_id ∈ [lo, hi)`.
+/// Since the ops are sorted by `s_id`, this is two binary searches.
+pub fn slice_overlay_ops_by_subject(
+    ops: &[fluree_db_binary_index::read::types::OverlayOp],
+    lo: u64,
+    hi: u64,
+) -> Vec<fluree_db_binary_index::read::types::OverlayOp> {
+    let start = ops.partition_point(|o| o.s_id < lo);
+    let end = ops.partition_point(|o| o.s_id < hi);
+    ops[start..end].to_vec()
+}
+
 /// Streams `(s_id, edge_count)` groups from an overlay-merging PSOT cursor.
 ///
 /// The cursor yields rows in PSOT order, so a running group-by on `s_id`
@@ -2091,6 +2167,98 @@ where
         }
     }
     Ok(Some(total))
+}
+
+/// Parallel overlay/time-travel COUNT of rows of `p_id` (PSOT) matching
+/// `per_row(s_id, o_type, o_key)`, folding novelty correctly.
+///
+/// Partitions the subject space with the shared [`crate::count_plan_exec::parallel_partition_count`]
+/// harness (so the base scan runs across the global rayon pool, like the HEAD path),
+/// and gives each partition a *bounded overlay cursor* — its leaf range plus the
+/// novelty ops sliced to its subject range — reusing `merge_overlay_into_batch`. A
+/// per-row `[lo, hi)` filter keeps boundary subjects (shared leaves) counted once.
+/// The overlay ops are collected once up front and only sliced per partition (cheap;
+/// novelty is small). Below the parallel threshold, falls back to the serial
+/// whole-predicate overlay cursor. Returns `Ok(None)` to defer (an overlay flake
+/// failed to translate).
+pub fn parallel_overlay_psot_filter_count<P>(
+    ctx: &ExecutionContext<'_>,
+    store: &Arc<BinaryIndexStore>,
+    g_id: GraphId,
+    pred_sid: Sid,
+    p_id: u32,
+    per_row: P,
+) -> Result<Option<u64>>
+where
+    P: Fn(u64, u16, u64) -> bool + Sync + Send,
+{
+    // Collect + resolve the predicate's overlay ops once (serial; novelty is small).
+    let ops = match collect_resolved_overlay_ops(ctx, store, g_id, RunSortOrder::Psot, &pred_sid)? {
+        Some(o) => o,
+        None => return Ok(None),
+    };
+    let to_t = ctx.to_t;
+    let epoch = ctx
+        .overlay
+        .as_ref()
+        .map(|o| o.epoch())
+        .unwrap_or(0);
+    let total_rows = count_rows_for_predicate_psot(store, g_id, p_id)?;
+
+    let ops_ref = &ops;
+    let per_row_ref = &per_row;
+    let parallel = crate::count_plan_exec::parallel_partition_count(
+        store,
+        g_id,
+        p_id,
+        total_rows,
+        move |lo, hi| {
+            let sliced = slice_overlay_ops_by_subject(ops_ref, lo, hi);
+            let Some(mut cursor) = build_overlay_cursor_for_subject_range(
+                store,
+                g_id,
+                p_id,
+                cursor_projection_sid_otype_okey(),
+                lo,
+                hi,
+                sliced,
+                to_t,
+                epoch,
+            ) else {
+                return Ok(0u128);
+            };
+            let mut total: u128 = 0;
+            while let Some(batch) = cursor
+                .next_batch()
+                .map_err(|e| QueryError::Internal(format!("cursor batch: {e}")))?
+            {
+                for r in 0..batch.row_count {
+                    let s = batch.s_id.get(r);
+                    if s < lo || s >= hi {
+                        continue; // boundary leaf shared with an adjacent partition
+                    }
+                    if per_row_ref(s, batch.o_type.get(r), batch.o_key.get(r)) {
+                        total = total.saturating_add(1);
+                    }
+                }
+            }
+            Ok(total)
+        },
+    )?;
+
+    match parallel {
+        Some(n) => Ok(Some(n)),
+        // Below the parallel threshold: serial whole-predicate overlay cursor.
+        None => count_rows_via_overlay_cursor(
+            ctx,
+            store,
+            g_id,
+            RunSortOrder::Psot,
+            pred_sid,
+            p_id,
+            |s, ot, ok| Some(per_row(s, ot, ok)),
+        ),
+    }
 }
 
 /// Resolve a bound `Ref` (Iri or Sid) to its internal `s_id` (u64).

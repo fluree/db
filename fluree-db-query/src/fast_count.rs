@@ -11,8 +11,9 @@ use crate::binary_scan::{compile_encoded_pre_filters_and_prune_inline_ops, Encod
 use crate::fast_path_common::{
     allow_cursor_fast_path, build_count_batch, count_rows_for_predicate_psot,
     count_rows_via_overlay_cursor, count_to_i64, fast_path_store, leaf_entries_for_predicate,
-    normalize_pred_sid, parallel_leaf_chunk_count, projection_okey_only, projection_otype_only,
-    projection_sid_only, projection_sid_otype_okey, FastPathOperator,
+    normalize_pred_sid, parallel_leaf_chunk_count, parallel_overlay_psot_filter_count,
+    projection_okey_only, projection_otype_only, projection_sid_only, projection_sid_otype_okey,
+    FastPathOperator,
 };
 use std::sync::Arc;
 use fluree_db_binary_index::format::branch::LeafEntry;
@@ -607,15 +608,14 @@ pub fn count_rows_encoded_filters_operator(
                     if !pruned.is_empty() || encoded.is_empty() {
                         return Ok(None);
                     }
-                    if let Some(count) = count_rows_via_overlay_cursor(
+                    if let Some(count) = parallel_overlay_psot_filter_count(
                         ctx,
                         store,
                         g_id,
-                        RunSortOrder::Psot,
                         pred_sid,
                         p_id,
-                        |s_id, o_type, o_key| {
-                            Some(encoded.iter().all(|f| f.eval_row(s_id, o_type, o_key)))
+                        move |s_id, o_type, o_key| {
+                            encoded.iter().all(|f| f.eval_row(s_id, o_type, o_key))
                         },
                     )? {
                         return Ok(Some(build_count_batch(
@@ -714,14 +714,13 @@ pub fn count_rows_lang_filter_operator(
                         return Ok(None);
                     };
                     let required_otype = OType::lang_string(lang_id).as_u16();
-                    if let Some(count) = count_rows_via_overlay_cursor(
+                    if let Some(count) = parallel_overlay_psot_filter_count(
                         ctx,
                         store,
                         ctx.binary_g_id,
-                        RunSortOrder::Psot,
                         pred_sid,
                         p_id,
-                        |_s, o_type, _o_key| Some(o_type == required_otype),
+                        move |_s, o_type, _o_key| o_type == required_otype,
                     )? {
                         return Ok(Some(build_count_batch(
                             out_var,
