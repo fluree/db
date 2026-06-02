@@ -323,6 +323,54 @@ impl RootRef {
     }
 }
 
+/// Merge two JSON-LD objects describing the **same subject** seen through
+/// different default-graph ledgers (RDF merge of the union). Predicates present
+/// in only one are kept; predicates in both have their values unioned and
+/// de-duplicated (so identical triples, including `@id` / `@type`, collapse).
+fn merge_subject_objects(a: JsonValue, b: JsonValue) -> JsonValue {
+    let (JsonValue::Object(mut am), JsonValue::Object(bm)) = (a, b) else {
+        // Both are always objects in practice; if not, prefer the first.
+        return JsonValue::Null;
+    };
+    for (k, bv) in bm {
+        match am.remove(&k) {
+            None => {
+                am.insert(k, bv);
+            }
+            Some(av) => {
+                am.insert(k, merge_values(av, bv));
+            }
+        }
+    }
+    JsonValue::Object(am)
+}
+
+/// Union two property values into a de-duplicated value: a single survivor is
+/// returned bare, multiple as an array. Arrays on either side are flattened.
+fn merge_values(a: JsonValue, b: JsonValue) -> JsonValue {
+    let mut items: Vec<JsonValue> = Vec::new();
+    collect_values(a, &mut items);
+    collect_values(b, &mut items);
+    let mut out: Vec<JsonValue> = Vec::with_capacity(items.len());
+    for it in items {
+        if !out.contains(&it) {
+            out.push(it);
+        }
+    }
+    if out.len() == 1 {
+        out.into_iter().next().unwrap()
+    } else {
+        JsonValue::Array(out)
+    }
+}
+
+fn collect_values(v: JsonValue, out: &mut Vec<JsonValue>) {
+    match v {
+        JsonValue::Array(arr) => out.extend(arr),
+        other => out.push(other),
+    }
+}
+
 /// Format one hydration column for one solution row.
 ///
 /// Resolves the column's root (variable or IRI constant) into a `Sid` and
@@ -437,57 +485,111 @@ pub async fn format_async_dataset(
         ));
     }
 
-    // All dataset views — default graphs first, then named. Owned per-view
-    // compactors / policies live in parallel vecs that outlive the
-    // borrowed-state formatters.
-    let graph_views: Vec<&crate::view::GraphDb> = dataset
-        .default
-        .iter()
-        .chain(dataset.named.values())
-        .collect();
-    let compactors: Vec<IriCompactor> = graph_views
-        .iter()
-        .map(|g| IriCompactor::new(g.snapshot.namespaces(), context))
-        .collect();
-    let policies: Vec<Option<PolicyContext>> =
-        graph_views.iter().map(|g| g.policy().cloned()).collect();
-
-    let mut formatters: Vec<HydrationFormatter> = Vec::with_capacity(graph_views.len());
-    // Keyed by `GraphDb::ledger_id`, which is exactly what `IriMatch.ledger_alias`
-    // carries (set from the runtime `GraphRef.ledger_id`) — so root routing
-    // looks up the correct view.
-    let mut by_ledger: HashMap<Arc<str>, usize> = HashMap::new();
-    for (i, g) in graph_views.iter().enumerate() {
-        let mut view_db = g.as_graph_db_ref();
-        if let Some(t) = tracker {
-            view_db = view_db.with_tracker(t);
-        }
-        let formatter = HydrationFormatter::new(
-            view_db,
-            &compactors[i],
-            Arc::clone(&g.ledger_id),
-            config,
-            policies[i].as_ref(),
-            tracker,
-        );
-        // First occurrence wins (a ledger may appear as both default and named).
-        by_ledger.entry(Arc::clone(&g.ledger_id)).or_insert(i);
-        formatters.push(formatter);
-    }
-
-    // Primary = the dataset's primary view (first default, else first named),
-    // used for flat columns and as the fallback for unrouted roots.
-    let primary = dataset
-        .primary()
-        .and_then(|p| by_ledger.get(&p.ledger_id).copied())
-        .unwrap_or(0);
-
+    let ctx = DatasetCtx::build(dataset, context, config, tracker);
+    let formatters: Vec<HydrationFormatter> =
+        (0..ctx.views.len()).map(|i| ctx.formatter_for(i)).collect();
     let set = FormatterSet {
         formatters,
-        by_ledger,
-        primary,
+        by_ledger: ctx.by_ledger.clone(),
+        primary: ctx.primary,
     };
     run_hydration_rows(&set, result).await
+}
+
+/// One ledger's hydration view: its db, namespace-aware compactor, policy, and
+/// ledger id. Owned by [`DatasetCtx`]; formatters borrow from it.
+struct LedgerView<'a> {
+    db: GraphDbRef<'a>,
+    compactor: IriCompactor,
+    policy: Option<PolicyContext>,
+    ledger_id: Arc<str>,
+}
+
+/// Owns every dataset ledger's [`LedgerView`] and the routing metadata that
+/// cross-ledger hydration needs: which views back the default-graph union and
+/// which ledger maps to which view. Formatters borrow from this; it must
+/// outlive them.
+struct DatasetCtx<'a> {
+    views: Vec<LedgerView<'a>>,
+    /// `GraphDb::ledger_id` → index into `views` (matches `IriMatch.ledger_alias`).
+    by_ledger: HashMap<Arc<str>, usize>,
+    /// Indices of the default-graph views — the union scope for default-graph refs.
+    default_indices: Vec<usize>,
+    /// Primary view index (flat columns + unrouted-root fallback).
+    primary: usize,
+    typed: bool,
+    normalize_arrays: bool,
+    tracker: Option<&'a Tracker>,
+}
+
+impl<'a> DatasetCtx<'a> {
+    fn build(
+        dataset: &'a crate::view::DataSetDb,
+        context: &crate::ParsedContext,
+        config: &FormatterConfig,
+        tracker: Option<&'a Tracker>,
+    ) -> Self {
+        // Default graphs first (their indices form the union scope), then named.
+        let graph_views: Vec<&crate::view::GraphDb> = dataset
+            .default
+            .iter()
+            .chain(dataset.named.values())
+            .collect();
+        let default_count = dataset.default.len();
+
+        let mut views: Vec<LedgerView<'a>> = Vec::with_capacity(graph_views.len());
+        let mut by_ledger: HashMap<Arc<str>, usize> = HashMap::new();
+        let mut default_indices: Vec<usize> = Vec::with_capacity(default_count);
+        for (i, g) in graph_views.iter().enumerate() {
+            let mut view_db = g.as_graph_db_ref();
+            if let Some(t) = tracker {
+                view_db = view_db.with_tracker(t);
+            }
+            views.push(LedgerView {
+                db: view_db,
+                compactor: IriCompactor::new(g.snapshot.namespaces(), context),
+                policy: g.policy().cloned(),
+                ledger_id: Arc::clone(&g.ledger_id),
+            });
+            // First occurrence wins (a ledger may appear as both default and named).
+            by_ledger.entry(Arc::clone(&g.ledger_id)).or_insert(i);
+            if i < default_count {
+                default_indices.push(i);
+            }
+        }
+
+        let primary = dataset
+            .primary()
+            .and_then(|p| by_ledger.get(&p.ledger_id).copied())
+            .unwrap_or(0);
+
+        DatasetCtx {
+            views,
+            by_ledger,
+            default_indices,
+            primary,
+            typed: config.format == OutputFormat::TypedJson,
+            normalize_arrays: config.normalize_arrays,
+            tracker,
+        }
+    }
+
+    /// Build a formatter bound to one view, wired back to this context so it can
+    /// resolve cross-ledger refs.
+    fn formatter_for(&'a self, idx: usize) -> HydrationFormatter<'a> {
+        let view = &self.views[idx];
+        HydrationFormatter {
+            db: view.db,
+            compactor: &view.compactor,
+            active_ledger: Arc::clone(&view.ledger_id),
+            typed: self.typed,
+            normalize_arrays: self.normalize_arrays,
+            policy: view.policy.as_ref(),
+            tracker: self.tracker,
+            dataset: Some(self),
+            active_idx: idx,
+        }
+    }
 }
 
 /// A collection of per-ledger hydration formatters with root-routing.
@@ -628,6 +730,15 @@ struct HydrationFormatter<'a> {
     policy: Option<&'a PolicyContext>,
     /// Optional execution tracker for fuel/policy tracking.
     tracker: Option<&'a Tracker>,
+    /// Dataset context for cross-ledger reference resolution.
+    ///
+    /// `None` in single-ledger mode (refs stay within `db`). `Some` in dataset
+    /// mode: when expansion follows a ref into another ledger, the ref's SID is
+    /// decoded to its canonical IRI here, then re-encoded and expanded in the
+    /// target ledger's view (issue #1259).
+    dataset: Option<&'a DatasetCtx<'a>>,
+    /// This formatter's index into [`DatasetCtx::views`] (0 in single-ledger mode).
+    active_idx: usize,
 }
 
 impl<'a> HydrationFormatter<'a> {
@@ -647,6 +758,8 @@ impl<'a> HydrationFormatter<'a> {
             normalize_arrays: config.normalize_arrays,
             policy,
             tracker,
+            dataset: None,
+            active_idx: 0,
         }
     }
 
@@ -833,6 +946,72 @@ impl<'a> HydrationFormatter<'a> {
         .boxed()
     }
 
+    /// Expand a referenced subject, routing across ledgers when needed.
+    ///
+    /// In single-ledger mode this is just `format_subject` against the current
+    /// view. In dataset mode the ref's SID is decoded (via the current view) to
+    /// its canonical IRI, then re-encoded and expanded in the target ledger(s):
+    /// a ref inside a default-graph view resolves across the **whole
+    /// default-graph union** (merging each contributing ledger's view of the
+    /// subject under that ledger's own policy); a ref inside a named graph stays
+    /// in that graph. This is what makes a ref that points into another ledger
+    /// hydrate its properties instead of rendering as a bare `{"@id": ...}`
+    /// (issue #1259).
+    fn expand_ref<'b>(
+        &'b self,
+        ref_sid: &'b Sid,
+        level: &'b NestedSelectSpec,
+        depth: DepthBudget,
+        visited: &'b mut HashSet<Sid>,
+        cache: &'b mut HashMap<CacheKey, JsonValue>,
+    ) -> BoxFuture<'b, Result<JsonValue>> {
+        async move {
+            let Some(ctx) = self.dataset else {
+                // Single-ledger: stay in the current view.
+                return self
+                    .format_subject(ref_sid, None, level, depth, visited, cache)
+                    .await;
+            };
+
+            // Decode against the CURRENT view (where the flake lives) to recover
+            // the canonical IRI, then resolve it in the target ledger(s).
+            let iri: Arc<str> = Arc::from(self.compactor.decode_sid(ref_sid)?.as_str());
+
+            // Scope: default-graph refs resolve across the default-graph union;
+            // a named-graph ref stays within its graph.
+            let targets: Vec<usize> = if ctx.default_indices.contains(&self.active_idx) {
+                ctx.default_indices.clone()
+            } else {
+                vec![self.active_idx]
+            };
+
+            let mut merged: Option<JsonValue> = None;
+            for tidx in targets {
+                let tview = &ctx.views[tidx];
+                // Only a view whose namespace dict can encode the IRI can hold
+                // the subject — skip the rest (no scan, no error).
+                let Some(tsid) = tview.db.snapshot.encode_iri_strict(&iri) else {
+                    continue;
+                };
+                let tfmt = ctx.formatter_for(tidx);
+                let obj = tfmt
+                    .format_subject(&tsid, Some(Arc::clone(&iri)), level, depth, visited, cache)
+                    .await?;
+                merged = Some(match merged {
+                    None => obj,
+                    Some(acc) => merge_subject_objects(acc, obj),
+                });
+            }
+
+            // No view could resolve the subject → bare canonical @id.
+            match merged {
+                Some(v) => Ok(v),
+                None => Ok(json!({ "@id": self.compactor.compact_iri(&iri)? })),
+            }
+        }
+        .boxed()
+    }
+
     /// Whether this compact key should always be represented as an array.
     ///
     /// JSON-LD `@container` semantics:
@@ -887,33 +1066,17 @@ impl<'a> HydrationFormatter<'a> {
                         // 1. If explicit sub-selection exists → expand with that spec
                         // 2. Else if budget permits → auto-expand with FULL parent level
                         // 3. Else → just return {"@id": ...}
-                        if let Some(nested) = pred_ctx.explicit_sub_spec {
-                            values.push(
-                                self.format_subject(
-                                    ref_sid,
-                                    None,
-                                    nested,
-                                    depth.descend(),
-                                    visited,
-                                    cache,
-                                )
-                                .await?,
-                            );
-                        } else if depth.can_expand() {
-                            values.push(
-                                self.format_subject(
-                                    ref_sid,
-                                    None,
-                                    parent_level,
-                                    depth.descend(),
-                                    visited,
-                                    cache,
-                                )
-                                .await?,
-                            );
-                        } else {
-                            // Max depth reached, just @id
-                            values.push(json!({ "@id": self.compactor.compact_sid(ref_sid)? }));
+                        let sub_level = pred_ctx
+                            .explicit_sub_spec
+                            .or_else(|| depth.can_expand().then_some(parent_level));
+                        match sub_level {
+                            Some(level) => values.push(
+                                self.expand_ref(ref_sid, level, depth.descend(), visited, cache)
+                                    .await?,
+                            ),
+                            None => {
+                                values.push(json!({ "@id": self.compactor.compact_sid(ref_sid)? }));
+                            }
                         }
                     }
                 }
@@ -947,27 +1110,16 @@ impl<'a> HydrationFormatter<'a> {
             // For reverse lookup, subject is the entity that points to our object
             let subject_sid = &flake.s;
 
-            if let Some(nested) = nested_spec {
-                values.push(
-                    self.format_subject(subject_sid, None, nested, depth.descend(), visited, cache)
+            let sub_level = nested_spec.or_else(|| depth.can_expand().then_some(parent_level));
+            match sub_level {
+                Some(level) => values.push(
+                    self.expand_ref(subject_sid, level, depth.descend(), visited, cache)
                         .await?,
-                );
-            } else if depth.can_expand() {
-                // Auto-expand reverse refs with FULL parent level
-                values.push(
-                    self.format_subject(
-                        subject_sid,
-                        None,
-                        parent_level,
-                        depth.descend(),
-                        visited,
-                        cache,
-                    )
-                    .await?,
-                );
-            } else {
-                // No expansion - just @id
-                values.push(json!({ "@id": self.compactor.compact_sid(subject_sid)? }));
+                ),
+                None => {
+                    // No expansion - just @id
+                    values.push(json!({ "@id": self.compactor.compact_sid(subject_sid)? }));
+                }
             }
         }
         Ok(values)

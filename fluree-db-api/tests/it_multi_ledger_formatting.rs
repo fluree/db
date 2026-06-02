@@ -345,27 +345,16 @@ async fn cross_graph_root_properties_decode_in_home_ledger() {
     );
 }
 
-/// KNOWN LIMITATION (out of scope for issue #1259) — cross-ledger hydration
-/// *expansion* with divergent vocabularies.
+/// Cross-ledger hydration *expansion* with divergent vocabularies.
 ///
-/// The #1259 fix makes the cross-graph `@id` correct, but it does NOT make a
-/// foreign subject's *properties* expand when ledgers encode the shared IRIs
-/// under different namespace codes. Hydration follows a ref by its ledger-local
-/// SID and looks it up in the composite overlay, which is keyed by raw
-/// `(namespace_code, name)`. A ref minted in the movies ledger (movies' code for
-/// `http://book.example/`) cannot find the book subject stored under the books
-/// ledger's divergent code, so `isBasedOn` renders as a bare `{"@id": ...}`
-/// instead of a nested object.
-///
-/// The existing `query_connection_from_combined_datasets_selecting_subgraphs_depth_3`
-/// test only passes because its ledgers share schema.org/wikidata.org codes.
-///
-/// Fixing this requires SID re-encoding at ledger boundaries during hydration
-/// (decode under the source ledger, re-encode under the target snapshot) or a
-/// provenance-carrying composite overlay. Tracked as a follow-up. This test is
-/// `#[ignore]`d until then; when it starts passing, the limitation is resolved.
+/// `movie → isBasedOn → book → author` spans three ledgers, each using its own
+/// entity prefix (so the shared-vocab coincidence the older
+/// `query_connection_from_combined_datasets_selecting_subgraphs_depth_3` test
+/// relies on does NOT apply). Each ref is decoded to its canonical IRI in the
+/// source ledger, then re-encoded and expanded in the ledger that actually
+/// stores the subject — so the nested objects hydrate fully instead of
+/// collapsing to bare `{"@id": ...}` (issue #1259, dataset-aware hydration).
 #[tokio::test]
-#[ignore = "cross-ledger hydration expansion under divergent vocab — follow-up to #1259"]
 async fn cross_graph_hydration_expansion_divergent_vocab() {
     let fluree = FlureeBuilder::memory().build_memory();
     seed_divergent_ledgers(&fluree).await;
@@ -393,12 +382,34 @@ async fn cross_graph_hydration_expansion_divergent_vocab() {
         .expect("execute_formatted should not error");
 
     let movie = value.as_array().and_then(|a| a.first()).expect("one movie");
+    assert_eq!(movie.get("@id").and_then(|v| v.as_str()), Some("movie:m1"));
+
+    // Hop 1: movie (movies ledger) → isBasedOn → book (books ledger).
     let book = movie.get("schema:isBasedOn").expect("isBasedOn present");
-    // The book ref must expand into a nested object with its real properties.
-    assert_eq!(book.get("@id").and_then(|v| v.as_str()), Some("book:b1"));
+    assert_eq!(
+        book.get("@id").and_then(|v| v.as_str()),
+        Some("book:b1"),
+        "isBasedOn should hydrate, not collapse to a bare @id: {value:#}"
+    );
     assert_eq!(
         book.get("schema:name").and_then(|v| v.as_str()),
         Some("Gone with the Wind"),
-        "cross-ledger ref should hydrate its properties: {value:#}"
+        "book (foreign ledger) properties must hydrate: {value:#}"
+    );
+    assert_eq!(
+        book.get("schema:isbn").and_then(|v| v.as_str()),
+        Some("0-582-41805-4")
+    );
+
+    // Hop 2: book (books ledger) → author → person (authors ledger), at depth 3.
+    let author = book.get("schema:author").expect("author present");
+    assert_eq!(
+        author.get("@id").and_then(|v| v.as_str()),
+        Some("author:a1")
+    );
+    assert_eq!(
+        author.get("schema:name").and_then(|v| v.as_str()),
+        Some("Margaret Mitchell"),
+        "second cross-ledger hop (author) must hydrate too: {value:#}"
     );
 }
