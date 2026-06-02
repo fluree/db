@@ -1027,28 +1027,11 @@ where
         "count-plan: parallel partitioned count"
     );
 
-    let reducer = &reducer;
-    let span = tracing::Span::current();
-    let partials: Vec<Result<u128>> = std::thread::scope(|scope| {
-        let handles: Vec<_> = ranges
-            .iter()
-            .map(|&(lo, hi)| {
-                let span = span.clone();
-                scope.spawn(move || {
-                    let _guard = span.enter();
-                    reducer(lo, hi)
-                })
-            })
-            .collect();
-        handles
-            .into_iter()
-            .map(|h| {
-                h.join().unwrap_or_else(|_| {
-                    Err(QueryError::execution("parallel count worker panicked"))
-                })
-            })
-            .collect()
-    });
+    // Run partitions on the shared global rayon pool (not a per-query
+    // `thread::scope`), so concurrent queries don't each spawn a fresh fan-out of
+    // worker threads. See `fast_path_common::parallel_map_pooled`.
+    let partials: Vec<Result<u128>> =
+        crate::fast_path_common::parallel_map_pooled(ranges, |(lo, hi)| reducer(lo, hi));
 
     let mut total: u128 = 0;
     for partial in partials {

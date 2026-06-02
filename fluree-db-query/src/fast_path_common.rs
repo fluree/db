@@ -310,9 +310,43 @@ const PARALLEL_LEAF_SCAN_MIN_ROWS: u64 = 50_000;
 /// Cap on leaf-chunk worker count regardless of core count.
 const PARALLEL_LEAF_SCAN_MAX_CHUNKS: usize = 16;
 
+/// Run `f` over `items` on the shared global rayon thread pool, preserving order and
+/// the current tracing span, returning each item's result.
+///
+/// This is the multi-tenant-safe replacement for a per-call `std::thread::scope`.
+/// A `scope` spawns fresh OS threads on every invocation, so under concurrent query
+/// load N queries each running a partitioned count/scan spawn up to N×K worker
+/// threads — thrashing a multi-tenant server's scheduler and memory. The global
+/// rayon pool is sized once (≈ logical cores) and shared across every query, so the
+/// total worker-thread count stays bounded no matter how many queries run at once
+/// (matching the pool `fluree-db-novelty` already uses). Like `thread::scope` — and
+/// unlike `thread::spawn` / `spawn_blocking` — rayon's parallel iterator is fully
+/// structured: it blocks until every task finishes, so `f` may borrow non-`'static`
+/// data (the store, the reducer) exactly as the old scoped threads did. A panic in a
+/// worker is converted to an error for that item instead of unwinding the query.
+pub(crate) fn parallel_map_pooled<T, R, F>(items: Vec<T>, f: F) -> Vec<Result<R>>
+where
+    T: Send,
+    R: Send,
+    F: Fn(T) -> Result<R> + Sync + Send,
+{
+    use rayon::prelude::*;
+    let span = tracing::Span::current();
+    items
+        .into_par_iter()
+        .map(|item| {
+            let _guard = span.enter();
+            match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| f(item))) {
+                Ok(result) => result,
+                Err(_) => Err(QueryError::execution("parallel worker panicked")),
+            }
+        })
+        .collect()
+}
+
 /// Partition a predicate's `leaves` into up to `PARALLEL_LEAF_SCAN_MAX_CHUNKS`
-/// contiguous chunks (~one per core) and run `reducer(chunk)` per chunk on a
-/// `std::thread::scope` worker, summing the partial row counts.
+/// contiguous chunks (~one per core) and run `reducer(chunk)` per chunk on the
+/// shared global rayon pool (via [`parallel_map_pooled`]), summing the partials.
 ///
 /// Every row lives in exactly one leaflet of one leaf, so counting rows per chunk
 /// and summing is exact for ANY index order — unlike the per-subject
@@ -333,7 +367,7 @@ pub fn parallel_leaf_chunk_count<F>(
     reducer: F,
 ) -> Result<Option<u64>>
 where
-    F: Fn(&[LeafEntry]) -> Result<Option<u64>> + Sync,
+    F: Fn(&[LeafEntry]) -> Result<Option<u64>> + Sync + Send,
 {
     let ncpu = std::thread::available_parallelism()
         .map(std::num::NonZeroUsize::get)
@@ -354,28 +388,7 @@ where
         "fast-path: parallel leaf-chunk scan"
     );
 
-    let reducer = &reducer;
-    let span = tracing::Span::current();
-    let partials: Vec<Result<Option<u64>>> = std::thread::scope(|scope| {
-        let handles: Vec<_> = chunks
-            .iter()
-            .map(|chunk| {
-                let span = span.clone();
-                scope.spawn(move || {
-                    let _guard = span.enter();
-                    reducer(chunk)
-                })
-            })
-            .collect();
-        handles
-            .into_iter()
-            .map(|h| {
-                h.join().unwrap_or_else(|_| {
-                    Err(QueryError::execution("parallel leaf-scan worker panicked"))
-                })
-            })
-            .collect()
-    });
+    let partials: Vec<Result<Option<u64>>> = parallel_map_pooled(chunks, reducer);
 
     let mut total: u64 = 0;
     for partial in partials {

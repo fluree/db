@@ -2781,6 +2781,7 @@ dependencies = [
  "percent-encoding",
  "postcard",
  "rand 0.8.5",
+ "rayon",
  "regex",
  "rustc-hash",
  "serde",
