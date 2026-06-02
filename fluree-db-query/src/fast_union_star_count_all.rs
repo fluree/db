@@ -30,9 +30,10 @@ use crate::context::ExecutionContext;
 use crate::error::{QueryError, Result};
 use crate::fast_path_common::{
     build_count_batch, build_overlay_cursor_for_subject_range, build_psot_cursor_for_predicate,
-    collect_resolved_overlay_ops, count_rows_for_predicate_psot, count_to_i64,
-    cursor_projection_sid_only, cursor_projection_sid_otype_okey, leaf_entries_for_predicate,
-    normalize_pred_sid, slice_overlay_ops_by_subject, CursorSubjectCountStream, PsotSubjectCountIter,
+    collect_resolved_overlay_ops, count_predicate_overlay_delta, count_rows_for_predicate_psot,
+    count_to_i64, cursor_projection_sid_only, cursor_projection_sid_otype_okey,
+    leaf_entries_for_predicate, normalize_pred_sid, slice_overlay_ops_by_subject,
+    CursorSubjectCountStream, PsotSubjectCountIter,
 };
 use crate::ir::triple::Ref;
 use crate::operator::{BoxedOperator, Operator, OperatorState};
@@ -617,6 +618,39 @@ fn count_union_star(
             total = total.saturating_add(count_rows_for_predicate_psot(store, g_id, p_id)?);
         }
         return Ok(Some(total));
+    }
+
+    // Novelty at HEAD (no time-travel), no-constraint UNION: bag-semantics sum of
+    // each branch's metadata base count + a novelty delta over only the touched
+    // leaves, instead of a full cursor scan of every branch.
+    if matches!(mode, UnionCountMode::AllRows)
+        && extra_preds.is_empty()
+        && overlay_has_rows
+        && ctx.to_t >= store.max_t()
+    {
+        let mut total: u64 = 0;
+        let mut all_ok = true;
+        for p in union_preds {
+            let sid = normalize_pred_sid(store, p)?;
+            // A union branch present only in novelty (no base id), or a translation
+            // failure, defers the whole count to the cursor merge below.
+            match store.sid_to_p_id(&sid) {
+                Some(p_id) => match count_predicate_overlay_delta(ctx, store, g_id, sid, p_id)? {
+                    Some(n) => total = total.saturating_add(n),
+                    None => {
+                        all_ok = false;
+                        break;
+                    }
+                },
+                None => {
+                    all_ok = false;
+                    break;
+                }
+            }
+        }
+        if all_ok {
+            return Ok(Some(total));
+        }
     }
 
     // Parallel partitioned merge for the constrained `AllRows` case:

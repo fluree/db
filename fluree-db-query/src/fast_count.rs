@@ -9,10 +9,11 @@ use crate::context::ExecutionContext;
 use crate::error::{QueryError, Result};
 use crate::binary_scan::{compile_encoded_pre_filters_and_prune_inline_ops, EncodedPreFilter};
 use crate::fast_path_common::{
-    allow_cursor_fast_path, build_count_batch, count_rows_for_predicate_psot, count_to_i64,
-    fast_path_store, leaf_entries_for_predicate, normalize_pred_sid, parallel_leaf_chunk_count,
-    parallel_overlay_psot_filter_count, projection_okey_only, projection_otype_only,
-    projection_sid_only, projection_sid_otype_okey, FastPathOperator,
+    allow_cursor_fast_path, build_count_batch, count_predicate_overlay_delta,
+    count_rows_for_predicate_psot, count_to_i64, fast_path_store, leaf_entries_for_predicate,
+    normalize_pred_sid, parallel_leaf_chunk_count, parallel_overlay_psot_filter_count,
+    projection_okey_only, projection_otype_only, projection_sid_only, projection_sid_otype_okey,
+    FastPathOperator,
 };
 use std::sync::Arc;
 use fluree_db_binary_index::format::branch::LeafEntry;
@@ -44,18 +45,42 @@ pub fn count_rows_operator(
     FastPathOperator::new(
         out_var,
         move |ctx| {
-            let Some(store) = fast_path_store(ctx) else {
-                return Ok(None);
-            };
-            let pred_sid = normalize_pred_sid(store, &predicate)?;
-            let Some(p_id) = store.sid_to_p_id(&pred_sid) else {
-                return Ok(Some(build_count_batch(out_var, 0)?));
-            };
-            let count = count_rows_for_predicate_psot(store, ctx.binary_g_id, p_id)?;
-            Ok(Some(build_count_batch(
-                out_var,
-                count_to_i64(count, "COUNT rows")?,
-            )?))
+            // HEAD: metadata-only predicate row count (instant).
+            if let Some(store) = fast_path_store(ctx) {
+                let pred_sid = normalize_pred_sid(store, &predicate)?;
+                let Some(p_id) = store.sid_to_p_id(&pred_sid) else {
+                    return Ok(Some(build_count_batch(out_var, 0)?));
+                };
+                let count = count_rows_for_predicate_psot(store, ctx.binary_g_id, p_id)?;
+                return Ok(Some(build_count_batch(
+                    out_var,
+                    count_to_i64(count, "COUNT rows")?,
+                )?));
+            }
+            // Novelty at HEAD (no time-travel): metadata base count + a novelty delta
+            // that rescans only the leaves novelty touches, instead of the whole
+            // predicate. Time-travel (to_t < max_t) needs base replay — defer.
+            if allow_cursor_fast_path(ctx) {
+                if let Some(store) = ctx.binary_store.as_ref() {
+                    // to_t >= max_t: at-or-above the indexed head (novelty folds on
+                    // top). Time-travel BELOW max_t needs base replay — defer.
+                    if ctx.to_t >= store.max_t() {
+                        let pred_sid = normalize_pred_sid(store, &predicate)?;
+                        let Some(p_id) = store.sid_to_p_id(&pred_sid) else {
+                            return Ok(None); // novelty-only predicate => defer
+                        };
+                        if let Some(count) =
+                            count_predicate_overlay_delta(ctx, store, ctx.binary_g_id, pred_sid, p_id)?
+                        {
+                            return Ok(Some(build_count_batch(
+                                out_var,
+                                count_to_i64(count, "COUNT rows")?,
+                            )?));
+                        }
+                    }
+                }
+            }
+            Ok(None)
         },
         fallback,
         "COUNT rows",

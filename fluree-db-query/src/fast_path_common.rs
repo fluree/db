@@ -2261,6 +2261,119 @@ where
     }
 }
 
+/// Overlay COUNT(*) of a predicate via a **novelty-delta**, for the common
+/// live-write case (`epoch != 0`, HEAD): `base_total − base(touched) + merged(touched)`.
+///
+/// At HEAD the predicate count is metadata-only (instant). Under novelty the cursor
+/// path would rescan the whole predicate to fold a few uncommitted rows. Instead:
+/// only the per-leaf subject ranges that novelty actually touches are rescanned
+/// (base via the bounded iterator, merged via the bounded overlay cursor — the
+/// proven `merge_overlay_into_batch`); every untouched leaf keeps its instant
+/// manifest count (`base_total − base(touched)`). So the work is proportional to the
+/// novelty's footprint, not the predicate size.
+///
+/// CALLER GATE: only valid for `to_t == max_t` (no time-travel replay) and
+/// `epoch != 0`; the base manifest count is the current-state base count only then.
+/// Returns `Ok(None)` to defer (overlay flake failed to translate). Returns the
+/// plain manifest count when there is no novelty for the predicate.
+pub fn count_predicate_overlay_delta(
+    ctx: &ExecutionContext<'_>,
+    store: &Arc<BinaryIndexStore>,
+    g_id: GraphId,
+    pred_sid: Sid,
+    p_id: u32,
+) -> Result<Option<u64>> {
+    let ops = match collect_resolved_overlay_ops(ctx, store, g_id, RunSortOrder::Psot, &pred_sid)? {
+        Some(o) => o,
+        None => return Ok(None),
+    };
+    let base_total = count_rows_for_predicate_psot(store, g_id, p_id)?;
+    if ops.is_empty() {
+        return Ok(Some(base_total));
+    }
+    let to_t = ctx.to_t;
+    let epoch = ctx.overlay.as_ref().map(|o| o.epoch()).unwrap_or(0);
+    let leaves = leaf_entries_for_predicate(store, g_id, RunSortOrder::Psot, p_id);
+
+    // Per-leaf subject ranges [lo, hi); the last extends to MAX so novelty subjects
+    // beyond the base's last leaf land in (and are scanned by) the final range.
+    let mut base_touched: u64 = 0;
+    let mut merged_touched: u64 = 0;
+    let mut op_idx = 0usize;
+    let n = leaves.len();
+    for i in 0..n {
+        let lo = leaves[i].first_key.s_id.as_u64();
+        let hi = if i + 1 < n {
+            leaves[i + 1].first_key.s_id.as_u64()
+        } else {
+            u64::MAX
+        };
+        // Ops with s_id in [lo, hi). Ops are sorted by s_id; advance the cursor.
+        while op_idx < ops.len() && ops[op_idx].s_id < lo {
+            op_idx += 1;
+        }
+        let start = op_idx;
+        let mut end = op_idx;
+        while end < ops.len() && ops[end].s_id < hi {
+            end += 1;
+        }
+        if end == start {
+            continue; // untouched leaf — its rows are covered by base_total
+        }
+        op_idx = end;
+
+        // Base count of this touched leaf: the manifest `row_count` for an interior
+        // leaf (no open); a boundary leaf (shared with an adjacent predicate) opens
+        // and sums its p_id leaflets. Only the merged pass below opens the leaf, so
+        // the worst case (novelty touching every leaf) is one full scan, not two.
+        let leaf = &leaves[i];
+        if leaf.first_key.p_id == p_id && leaf.last_key.p_id == p_id {
+            base_touched = base_touched.saturating_add(leaf.row_count);
+        } else {
+            let handle = store
+                .open_leaf_handle(&leaf.leaf_cid, leaf.sidecar_cid.as_ref(), false)
+                .map_err(|e| QueryError::Internal(format!("leaf open: {e}")))?;
+            for entry in &handle.dir().entries {
+                if entry.row_count != 0 && entry.p_const == Some(p_id) {
+                    base_touched = base_touched.saturating_add(entry.row_count as u64);
+                }
+            }
+        }
+
+        // Merged count of this range (base + this range's novelty ops).
+        let sliced = ops[start..end].to_vec();
+        if let Some(mut cursor) = build_overlay_cursor_for_subject_range(
+            store,
+            g_id,
+            p_id,
+            cursor_projection_sid_only(),
+            lo,
+            hi,
+            sliced,
+            to_t,
+            epoch,
+        ) {
+            while let Some(batch) = cursor
+                .next_batch()
+                .map_err(|e| QueryError::Internal(format!("cursor batch: {e}")))?
+            {
+                for r in 0..batch.row_count {
+                    let s = batch.s_id.get(r);
+                    if s >= lo && s < hi {
+                        merged_touched = merged_touched.saturating_add(1);
+                    }
+                }
+            }
+        }
+    }
+
+    // base_total − base(touched) = base(untouched); + merged(touched) = grand total.
+    let total = base_total
+        .saturating_sub(base_touched)
+        .saturating_add(merged_touched);
+    Ok(Some(total))
+}
+
 /// Resolve a bound `Ref` (Iri or Sid) to its internal `s_id` (u64).
 ///
 /// Returns `Ok(None)` for `Ref::Var` or if the subject is not found in the store.

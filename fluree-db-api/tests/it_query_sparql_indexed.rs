@@ -2499,6 +2499,186 @@ async fn overlay_parallel_minus_exists_intersect_count_folds_novelty() {
         .await;
 }
 
+/// Overlay novelty-DELTA for single-predicate COUNT(*): base count from the manifest
+/// plus a delta over only the leaves novelty touches. Exercises asserts (new subjects
+/// beyond the base's last leaf), retracts, and the metadata base for untouched leaves.
+#[tokio::test]
+async fn overlay_delta_single_predicate_count_folds_novelty() {
+    assert_index_defaults();
+    let fluree = FlureeBuilder::memory()
+        .with_ledger_cache_config(LedgerManagerConfig::default())
+        .build_memory();
+    let ledger_id = "it/overlay-delta-single:main";
+    let mut idx_config = fluree_db_indexer::IndexerConfig::small();
+    idx_config.leaflet_rows = 100;
+    idx_config.leaf_target_bytes = 8_000;
+    idx_config.leaf_max_bytes = 16_000;
+    let (local, handle) = start_background_indexer_local(
+        fluree.backend().clone(),
+        Arc::new(fluree.nameservice_mode().clone()),
+        idx_config,
+    );
+
+    local
+        .run_until(async move {
+            let index_cfg = IndexConfig {
+                reindex_min_bytes: 0,
+                reindex_max_bytes: 80_000_000,
+            };
+            let n: i64 = 20_000;
+            let mut nodes: Vec<serde_json::Value> = Vec::with_capacity(n as usize);
+            for i in 0..n {
+                nodes.push(json!({"@id": format!("ex:s{i}"), "ex:p": i}));
+            }
+            let ledger = fluree
+                .insert_with_opts(
+                    genesis_ledger_for_fluree(&fluree, ledger_id),
+                    &json!({ "@context": { "ex": "http://example.org/ns/" }, "@graph": nodes }),
+                    TxnOpts::default(),
+                    CommitOpts::default(),
+                    &index_cfg,
+                )
+                .await
+                .expect("baseline insert")
+                .ledger;
+            let _ = trigger_index_and_wait_outcome(&handle, ledger_id, ledger.t()).await;
+            // Novelty assert: 50 NEW subjects (ids beyond the base's last leaf).
+            let mut nov: Vec<serde_json::Value> = Vec::new();
+            for j in 0..50 {
+                nov.push(json!({"@id": format!("ex:nn{j}"), "ex:p": 1000 + j}));
+            }
+            let ledger = fluree
+                .insert(
+                    ledger,
+                    &json!({ "@context": { "ex": "http://example.org/ns/" }, "@graph": nov }),
+                )
+                .await
+                .expect("novelty assert")
+                .ledger;
+            // Novelty retract: remove ex:p of 10 base subjects.
+            let del: Vec<serde_json::Value> =
+                (0..10).map(|i| json!({"@id": format!("ex:s{i}"), "ex:p": i})).collect();
+            let _ = fluree
+                .update(
+                    ledger,
+                    &json!({ "@context": { "ex": "http://example.org/ns/" }, "delete": del }),
+                )
+                .await
+                .expect("novelty retract");
+
+            let view = fluree.db(ledger_id).await.expect("load HEAD view w/ novelty");
+            let q = r"
+                PREFIX ex: <http://example.org/ns/>
+                SELECT (COUNT(*) AS ?count) WHERE { ?s ex:p ?o }
+            ";
+            let jsonld = fluree
+                .query(&view, QueryInput::Sparql(q))
+                .await
+                .expect("overlay delta single-pred query")
+                .to_jsonld(&view.snapshot)
+                .expect("to_jsonld");
+            // 20000 base + 50 assert − 10 retract = 20040.
+            assert_eq!(
+                normalize_rows(&jsonld),
+                normalize_rows(&json!([[20_040]])),
+                "single-pred COUNT(*) overlay delta: 20000 + 50 − 10 = 20040"
+            );
+        })
+        .await;
+}
+
+/// Overlay novelty-DELTA for no-constraint UNION COUNT(*) (bag semantics = Σ per
+/// branch of base + delta).
+#[tokio::test]
+async fn overlay_delta_union_count_folds_novelty() {
+    assert_index_defaults();
+    let fluree = FlureeBuilder::memory()
+        .with_ledger_cache_config(LedgerManagerConfig::default())
+        .build_memory();
+    let ledger_id = "it/overlay-delta-union:main";
+    let mut idx_config = fluree_db_indexer::IndexerConfig::small();
+    idx_config.leaflet_rows = 100;
+    let (local, handle) = start_background_indexer_local(
+        fluree.backend().clone(),
+        Arc::new(fluree.nameservice_mode().clone()),
+        idx_config,
+    );
+
+    local
+        .run_until(async move {
+            let index_cfg = IndexConfig {
+                reindex_min_bytes: 0,
+                reindex_max_bytes: 80_000_000,
+            };
+            // 10000 subjects with p1; first 5000 also with p2. bag base = 10000+5000.
+            let n: i64 = 10_000;
+            let mut nodes: Vec<serde_json::Value> = Vec::with_capacity(n as usize);
+            for i in 0..n {
+                let mut node = json!({"@id": format!("ex:s{i}"), "ex:p1": i});
+                if i < 5000 {
+                    node["ex:p2"] = json!(i);
+                }
+                nodes.push(node);
+            }
+            let ledger = fluree
+                .insert_with_opts(
+                    genesis_ledger_for_fluree(&fluree, ledger_id),
+                    &json!({ "@context": { "ex": "http://example.org/ns/" }, "@graph": nodes }),
+                    TxnOpts::default(),
+                    CommitOpts::default(),
+                    &index_cfg,
+                )
+                .await
+                .expect("baseline insert")
+                .ledger;
+            let _ = trigger_index_and_wait_outcome(&handle, ledger_id, ledger.t()).await;
+            // Novelty: +30 p1 (new), +20 p2 (new), −5 p1 (retract base).
+            let mut nov: Vec<serde_json::Value> = Vec::new();
+            for j in 0..30 {
+                nov.push(json!({"@id": format!("ex:np{j}"), "ex:p1": 9000 + j}));
+            }
+            for j in 0..20 {
+                nov.push(json!({"@id": format!("ex:nq{j}"), "ex:p2": 9000 + j}));
+            }
+            let ledger = fluree
+                .insert(
+                    ledger,
+                    &json!({ "@context": { "ex": "http://example.org/ns/" }, "@graph": nov }),
+                )
+                .await
+                .expect("novelty assert")
+                .ledger;
+            let del: Vec<serde_json::Value> =
+                (0..5).map(|i| json!({"@id": format!("ex:s{i}"), "ex:p1": i})).collect();
+            let _ = fluree
+                .update(
+                    ledger,
+                    &json!({ "@context": { "ex": "http://example.org/ns/" }, "delete": del }),
+                )
+                .await
+                .expect("novelty retract");
+
+            let view = fluree.db(ledger_id).await.expect("load HEAD view w/ novelty");
+            let q = r"
+                PREFIX ex: <http://example.org/ns/>
+                SELECT (COUNT(*) AS ?count) WHERE { { ?s ex:p1 ?o } UNION { ?s ex:p2 ?o } }
+            ";
+            let jsonld = fluree
+                .query(&view, QueryInput::Sparql(q))
+                .await
+                .expect("overlay delta union query")
+                .to_jsonld(&view.snapshot)
+                .expect("to_jsonld");
+            // p1: 10000+30−5 = 10025; p2: 5000+20 = 5020; bag sum = 15045.
+            assert_eq!(
+                normalize_rows(&jsonld),
+                normalize_rows(&json!([[15_045]])),
+                "no-constraint UNION COUNT(*) overlay delta = 15045"
+            );
+        })
+        .await;
+}
+
 /// Overlay/novelty lane for the LANG-filter COUNT fast path.
 #[tokio::test]
 async fn overlay_lang_filter_count_folds_novelty() {
