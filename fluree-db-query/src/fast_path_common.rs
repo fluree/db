@@ -2041,6 +2041,58 @@ impl CursorSubjectCountStream {
     }
 }
 
+/// Count rows of `p_id` (scanned in `order`) for which `per_row(s_id, o_type, o_key)`
+/// returns `Some(true)`, reading through an overlay-folding cursor so the count
+/// includes novelty asserts, excludes retracts, and honors `to_t`.
+///
+/// This is the overlay/time-travel lane for the single-predicate filter-COUNT fast
+/// paths: the caller gates on [`allow_cursor_fast_path`] and uses this when there is
+/// novelty or `to_t < max_t`; the HEAD lane keeps its faster base-leaflet scan and
+/// metadata shortcuts. `per_row` returning `None` aborts and yields `Ok(None)`, so a
+/// row the predicate can't classify (e.g. a non-numeric object under a numeric
+/// compare) defers to the operator's fallback — matching the base path's bail. Also
+/// returns `Ok(None)` when the cursor can't be built (branch absent for `order`, or
+/// an overlay flake fails to translate).
+pub fn count_rows_via_overlay_cursor<P>(
+    ctx: &ExecutionContext<'_>,
+    store: &Arc<BinaryIndexStore>,
+    g_id: GraphId,
+    order: RunSortOrder,
+    pred_sid: Sid,
+    p_id: u32,
+    mut per_row: P,
+) -> Result<Option<u64>>
+where
+    P: FnMut(u64, u16, u64) -> Option<bool>,
+{
+    let Some(mut cursor) = build_overlay_cursor_for_predicate(
+        ctx,
+        store,
+        g_id,
+        order,
+        pred_sid,
+        p_id,
+        cursor_projection_sid_otype_okey(),
+    )?
+    else {
+        return Ok(None);
+    };
+    let mut total: u64 = 0;
+    while let Some(batch) = cursor
+        .next_batch()
+        .map_err(|e| QueryError::Internal(format!("cursor batch: {e}")))?
+    {
+        for r in 0..batch.row_count {
+            match per_row(batch.s_id.get(r), batch.o_type.get(r), batch.o_key.get(r)) {
+                Some(true) => total = total.saturating_add(1),
+                Some(false) => {}
+                None => return Ok(None),
+            }
+        }
+    }
+    Ok(Some(total))
+}
+
 /// Resolve a bound `Ref` (Iri or Sid) to its internal `s_id` (u64).
 ///
 /// Returns `Ok(None)` for `Ref::Var` or if the subject is not found in the store.

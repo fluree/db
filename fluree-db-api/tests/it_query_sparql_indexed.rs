@@ -1871,6 +1871,222 @@ async fn indexed_numeric_compare_global_shortcut_counts_correctly() {
         .await;
 }
 
+/// Overlay/novelty lane for the numeric-compare SUM fast path: base data is indexed,
+/// then more rows are inserted as novelty (un-indexed). At HEAD the count must fold
+/// the novelty in via the overlay cursor (`count_rows_via_overlay_cursor`), not the
+/// base-only POST scan.
+#[tokio::test]
+async fn overlay_numeric_compare_sum_folds_novelty() {
+    assert_index_defaults();
+    let fluree = FlureeBuilder::memory()
+        .with_ledger_cache_config(LedgerManagerConfig::default())
+        .build_memory();
+    let ledger_id = "it/overlay-numeric-compare:main";
+    let (local, handle) = start_background_indexer_local(
+        fluree.backend().clone(),
+        Arc::new(fluree.nameservice_mode().clone()),
+        fluree_db_indexer::IndexerConfig::small(),
+    );
+
+    local
+        .run_until(async move {
+            let index_cfg = IndexConfig {
+                reindex_min_bytes: 0,
+                reindex_max_bytes: 10_000_000,
+            };
+            // Baseline: s0=1, s1=2, s2=-1 (two > 0). Index it.
+            let ledger = fluree
+                .insert_with_opts(
+                    genesis_ledger_for_fluree(&fluree, ledger_id),
+                    &json!({ "@context": { "ex": "http://example.org/ns/" }, "@graph": [
+                        {"@id": "ex:s0", "ex:num": 1},
+                        {"@id": "ex:s1", "ex:num": 2},
+                        {"@id": "ex:s2", "ex:num": -1}
+                    ]}),
+                    TxnOpts::default(),
+                    CommitOpts::default(),
+                    &index_cfg,
+                )
+                .await
+                .expect("baseline insert")
+                .ledger;
+            let _ = trigger_index_and_wait_outcome(&handle, ledger_id, ledger.t()).await;
+            // Novelty (un-indexed): s3=3 (> 0), s4=-2.
+            let _ = fluree
+                .insert(
+                    ledger,
+                    &json!({ "@context": { "ex": "http://example.org/ns/" }, "@graph": [
+                        {"@id": "ex:s3", "ex:num": 3},
+                        {"@id": "ex:s4", "ex:num": -2}
+                    ]}),
+                )
+                .await
+                .expect("novelty insert");
+
+            let view = fluree.db(ledger_id).await.expect("load HEAD view w/ novelty");
+            let q = r"
+                PREFIX ex: <http://example.org/ns/>
+                SELECT (SUM(?o > 0) AS ?sum) WHERE { ?s ex:num ?o }
+            ";
+            let jsonld = fluree
+                .query(&view, QueryInput::Sparql(q))
+                .await
+                .expect("overlay numeric-compare query")
+                .to_jsonld(&view.snapshot)
+                .expect("to_jsonld");
+            // base {1,2,-1} + novelty {3,-2}; > 0 => {1,2,3} = 3.
+            assert_eq!(
+                normalize_rows(&jsonld),
+                normalize_rows(&json!([[3]])),
+                "SUM(?o > 0) must fold novelty: base 2 + novelty 1 = 3"
+            );
+        })
+        .await;
+}
+
+/// Overlay/novelty lane for the LANG-filter COUNT fast path.
+#[tokio::test]
+async fn overlay_lang_filter_count_folds_novelty() {
+    assert_index_defaults();
+    let fluree = FlureeBuilder::memory()
+        .with_ledger_cache_config(LedgerManagerConfig::default())
+        .build_memory();
+    let ledger_id = "it/overlay-lang-filter:main";
+    let (local, handle) = start_background_indexer_local(
+        fluree.backend().clone(),
+        Arc::new(fluree.nameservice_mode().clone()),
+        fluree_db_indexer::IndexerConfig::small(),
+    );
+
+    local
+        .run_until(async move {
+            let index_cfg = IndexConfig {
+                reindex_min_bytes: 0,
+                reindex_max_bytes: 10_000_000,
+            };
+            let en = |id: &str, v: &str| {
+                json!({"@id": id, "ex:label": {"@value": v, "@language": "en"}})
+            };
+            let fr = |id: &str, v: &str| {
+                json!({"@id": id, "ex:label": {"@value": v, "@language": "fr"}})
+            };
+            // Baseline: 2 en + 1 fr. Index it.
+            let ledger = fluree
+                .insert_with_opts(
+                    genesis_ledger_for_fluree(&fluree, ledger_id),
+                    &json!({ "@context": { "ex": "http://example.org/ns/" },
+                        "@graph": [en("ex:a", "A"), en("ex:c", "C"), fr("ex:b", "B")]}),
+                    TxnOpts::default(),
+                    CommitOpts::default(),
+                    &index_cfg,
+                )
+                .await
+                .expect("baseline insert")
+                .ledger;
+            let _ = trigger_index_and_wait_outcome(&handle, ledger_id, ledger.t()).await;
+            // Novelty: 1 en + 1 fr.
+            let _ = fluree
+                .insert(
+                    ledger,
+                    &json!({ "@context": { "ex": "http://example.org/ns/" },
+                        "@graph": [en("ex:d", "D"), fr("ex:e", "E")]}),
+                )
+                .await
+                .expect("novelty insert");
+
+            let view = fluree.db(ledger_id).await.expect("load HEAD view w/ novelty");
+            let q = r#"
+                PREFIX ex: <http://example.org/ns/>
+                SELECT (COUNT(?s) AS ?count)
+                WHERE { ?s ex:label ?o . FILTER(LANG(?o) = "en") }
+            "#;
+            let jsonld = fluree
+                .query(&view, QueryInput::Sparql(q))
+                .await
+                .expect("overlay lang-filter query")
+                .to_jsonld(&view.snapshot)
+                .expect("to_jsonld");
+            // en: base {a,c} + novelty {d} = 3.
+            assert_eq!(
+                normalize_rows(&jsonld),
+                normalize_rows(&json!([[3]])),
+                "COUNT lang=en must fold novelty: base 2 + novelty 1 = 3"
+            );
+        })
+        .await;
+}
+
+/// Overlay/novelty lane for the encoded-filter COUNT fast path (`?s != ?o`).
+#[tokio::test]
+async fn overlay_encoded_filter_count_folds_novelty() {
+    assert_index_defaults();
+    let fluree = FlureeBuilder::memory()
+        .with_ledger_cache_config(LedgerManagerConfig::default())
+        .build_memory();
+    let ledger_id = "it/overlay-encoded-filter:main";
+    let (local, handle) = start_background_indexer_local(
+        fluree.backend().clone(),
+        Arc::new(fluree.nameservice_mode().clone()),
+        fluree_db_indexer::IndexerConfig::small(),
+    );
+
+    local
+        .run_until(async move {
+            let index_cfg = IndexConfig {
+                reindex_min_bytes: 0,
+                reindex_max_bytes: 10_000_000,
+            };
+            // Baseline: s0, s1 typed ex:C (s != o); self0 typed itself (s == o, excluded).
+            let ledger = fluree
+                .insert_with_opts(
+                    genesis_ledger_for_fluree(&fluree, ledger_id),
+                    &json!({ "@context": { "ex": "http://example.org/ns/" }, "@graph": [
+                        {"@id": "ex:s0", "@type": "ex:C"},
+                        {"@id": "ex:s1", "@type": "ex:C"},
+                        {"@id": "ex:self0", "@type": "ex:self0"}
+                    ]}),
+                    TxnOpts::default(),
+                    CommitOpts::default(),
+                    &index_cfg,
+                )
+                .await
+                .expect("baseline insert")
+                .ledger;
+            let _ = trigger_index_and_wait_outcome(&handle, ledger_id, ledger.t()).await;
+            // Novelty: s2 typed ex:C (s != o); self1 typed itself (excluded).
+            let _ = fluree
+                .insert(
+                    ledger,
+                    &json!({ "@context": { "ex": "http://example.org/ns/" }, "@graph": [
+                        {"@id": "ex:s2", "@type": "ex:C"},
+                        {"@id": "ex:self1", "@type": "ex:self1"}
+                    ]}),
+                )
+                .await
+                .expect("novelty insert");
+
+            let view = fluree.db(ledger_id).await.expect("load HEAD view w/ novelty");
+            let q = r"
+                PREFIX rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#>
+                SELECT (COUNT(?s) AS ?count)
+                WHERE { ?s rdf:type ?o . FILTER(?s != ?o) }
+            ";
+            let jsonld = fluree
+                .query(&view, QueryInput::Sparql(q))
+                .await
+                .expect("overlay encoded-filter query")
+                .to_jsonld(&view.snapshot)
+                .expect("to_jsonld");
+            // s != o: base {s0,s1} + novelty {s2} = 3 (self-typed excluded).
+            assert_eq!(
+                normalize_rows(&jsonld),
+                normalize_rows(&json!([[3]])),
+                "COUNT(?s != ?o) must fold novelty: base 2 + novelty 1 = 3"
+            );
+        })
+        .await;
+}
+
 /// GROUP BY ?object COUNT(?subject) ORDER BY DESC LIMIT via the indexed POST
 /// path (`group_count_v6`, run-length + top-K). A high-multiplicity object's run
 /// (2000 rows) spans multiple leaflets, exercising the boundary-equality /

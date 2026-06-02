@@ -9,10 +9,12 @@ use crate::context::ExecutionContext;
 use crate::error::{QueryError, Result};
 use crate::binary_scan::{compile_encoded_pre_filters_and_prune_inline_ops, EncodedPreFilter};
 use crate::fast_path_common::{
-    build_count_batch, count_rows_for_predicate_psot, count_to_i64, fast_path_store,
-    leaf_entries_for_predicate, normalize_pred_sid, parallel_leaf_chunk_count, projection_okey_only,
-    projection_otype_only, projection_sid_only, projection_sid_otype_okey, FastPathOperator,
+    allow_cursor_fast_path, build_count_batch, count_rows_for_predicate_psot,
+    count_rows_via_overlay_cursor, count_to_i64, fast_path_store, leaf_entries_for_predicate,
+    normalize_pred_sid, parallel_leaf_chunk_count, projection_okey_only, projection_otype_only,
+    projection_sid_only, projection_sid_otype_okey, FastPathOperator,
 };
+use std::sync::Arc;
 use fluree_db_binary_index::format::branch::LeafEntry;
 use crate::ir::triple::{Ref, TriplePattern};
 use crate::operator::inline::InlineOperator;
@@ -80,27 +82,53 @@ pub fn count_rows_numeric_compare_operator(
     FastPathOperator::new(
         out_var,
         move |ctx| {
-            let Some(store) = fast_path_store(ctx) else {
-                return Ok(None);
-            };
-            let pred_sid = normalize_pred_sid(store, &predicate)?;
-            let Some(p_id) = store.sid_to_p_id(&pred_sid) else {
-                return Ok(Some(build_count_batch(out_var, 0)?));
-            };
-            let count = count_rows_for_predicate_numeric_compare_post(
-                store,
-                ctx.binary_g_id,
-                p_id,
-                compare,
-                &threshold,
-            )?;
-            match count {
-                Some(count) => Ok(Some(build_count_batch(
-                    out_var,
-                    count_to_i64(count, "COUNT rows numeric compare")?,
-                )?)),
-                None => Ok(None),
+            // HEAD lane: directory shortcut + binary-search over base POST leaflets.
+            if let Some(store) = fast_path_store(ctx) {
+                let pred_sid = normalize_pred_sid(store, &predicate)?;
+                let Some(p_id) = store.sid_to_p_id(&pred_sid) else {
+                    return Ok(Some(build_count_batch(out_var, 0)?));
+                };
+                let count = count_rows_for_predicate_numeric_compare_post(
+                    store,
+                    ctx.binary_g_id,
+                    p_id,
+                    compare,
+                    &threshold,
+                )?;
+                return match count {
+                    Some(count) => Ok(Some(build_count_batch(
+                        out_var,
+                        count_to_i64(count, "COUNT rows numeric compare")?,
+                    )?)),
+                    None => Ok(None),
+                };
             }
+            // Overlay / time-travel lane: per-row compare over the merged cursor.
+            if allow_cursor_fast_path(ctx) {
+                if let Some(store) = ctx.binary_store.as_ref() {
+                    let pred_sid = normalize_pred_sid(store, &predicate)?;
+                    // Absent in base => COUNT is 0 only if also absent in novelty; a
+                    // novelty-only predicate has no base id, so defer to the fallback.
+                    let Some(p_id) = store.sid_to_p_id(&pred_sid) else {
+                        return Ok(None);
+                    };
+                    if let Some((matches, _total)) = count_numeric_compare_via_overlay_cursor(
+                        ctx,
+                        store,
+                        ctx.binary_g_id,
+                        pred_sid,
+                        p_id,
+                        compare,
+                        &threshold,
+                    )? {
+                        return Ok(Some(build_count_batch(
+                            out_var,
+                            count_to_i64(matches, "COUNT rows numeric compare")?,
+                        )?));
+                    }
+                }
+            }
+            Ok(None)
         },
         fallback,
         "COUNT rows numeric compare",
@@ -130,33 +158,62 @@ pub fn sum_compare_as_count_operator(
     FastPathOperator::new(
         out_var,
         move |ctx| {
-            let Some(store) = fast_path_store(ctx) else {
-                return Ok(None);
-            };
-            let pred_sid = normalize_pred_sid(store, &predicate)?;
-            let Some(p_id) = store.sid_to_p_id(&pred_sid) else {
-                // Absent predicate => empty input => SUM is Unbound (not 0).
-                return Ok(None);
-            };
-            // Empty input (all rows retracted) => SUM is Unbound; defer to fallback.
-            let total = count_rows_for_predicate_psot(store, ctx.binary_g_id, p_id)?;
-            if total == 0 {
-                return Ok(None);
+            // HEAD lane.
+            if let Some(store) = fast_path_store(ctx) {
+                let pred_sid = normalize_pred_sid(store, &predicate)?;
+                let Some(p_id) = store.sid_to_p_id(&pred_sid) else {
+                    // Absent predicate => empty input => SUM is Unbound (not 0).
+                    return Ok(None);
+                };
+                // Empty input (all rows retracted) => SUM is Unbound; defer to fallback.
+                let total = count_rows_for_predicate_psot(store, ctx.binary_g_id, p_id)?;
+                if total == 0 {
+                    return Ok(None);
+                }
+                let count = count_rows_for_predicate_numeric_compare_post(
+                    store,
+                    ctx.binary_g_id,
+                    p_id,
+                    compare,
+                    &threshold,
+                )?;
+                return match count {
+                    Some(count) => Ok(Some(build_count_batch(
+                        out_var,
+                        count_to_i64(count, "SUM(compare) as count")?,
+                    )?)),
+                    None => Ok(None),
+                };
             }
-            let count = count_rows_for_predicate_numeric_compare_post(
-                store,
-                ctx.binary_g_id,
-                p_id,
-                compare,
-                &threshold,
-            )?;
-            match count {
-                Some(count) => Ok(Some(build_count_batch(
-                    out_var,
-                    count_to_i64(count, "SUM(compare) as count")?,
-                )?)),
-                None => Ok(None),
+            // Overlay / time-travel lane: the merged cursor count gives both the
+            // matches and the total rows; an empty (base+novelty) input is SUM
+            // Unbound, so defer to the fallback which emits Unbound.
+            if allow_cursor_fast_path(ctx) {
+                if let Some(store) = ctx.binary_store.as_ref() {
+                    let pred_sid = normalize_pred_sid(store, &predicate)?;
+                    let Some(p_id) = store.sid_to_p_id(&pred_sid) else {
+                        return Ok(None);
+                    };
+                    if let Some((matches, total)) = count_numeric_compare_via_overlay_cursor(
+                        ctx,
+                        store,
+                        ctx.binary_g_id,
+                        pred_sid,
+                        p_id,
+                        compare,
+                        &threshold,
+                    )? {
+                        if total == 0 {
+                            return Ok(None);
+                        }
+                        return Ok(Some(build_count_batch(
+                            out_var,
+                            count_to_i64(matches, "SUM(compare) as count")?,
+                        )?));
+                    }
+                }
             }
+            Ok(None)
         },
         fallback,
         "SUM(compare) as count",
@@ -429,6 +486,57 @@ fn upper_bound_okey(batch: &fluree_db_binary_index::ColumnBatch, threshold: u64)
     lo
 }
 
+/// Scalar form of the numeric comparison on the order-preserving `o_key` encoding
+/// (the same encoding the binary-search bounds rely on).
+#[inline]
+fn okey_matches(compare: NumericCompareOp, o_key: u64, threshold: u64) -> bool {
+    match compare {
+        NumericCompareOp::Gt => o_key > threshold,
+        NumericCompareOp::Ge => o_key >= threshold,
+        NumericCompareOp::Lt => o_key < threshold,
+        NumericCompareOp::Le => o_key <= threshold,
+    }
+}
+
+/// Overlay/time-travel lane for the numeric-compare count: count the rows of `p_id`
+/// matching `?o <compare> threshold` through an overlay-folding cursor, returning
+/// `(matches, total_rows_scanned)`. `total_rows` lets the SUM caller apply the
+/// empty-input→Unbound rule. The thresholds for the two numeric otypes are encoded
+/// once up front; a non-numeric (or non-encodable) object row bails the whole count
+/// to `Ok(None)`, matching the base path's mixed/non-numeric bail. BASE+novelty:
+/// caller gates on [`allow_cursor_fast_path`].
+fn count_numeric_compare_via_overlay_cursor(
+    ctx: &crate::context::ExecutionContext<'_>,
+    store: &Arc<BinaryIndexStore>,
+    g_id: GraphId,
+    pred_sid: fluree_db_core::Sid,
+    p_id: u32,
+    compare: NumericCompareOp,
+    threshold: &FlakeValue,
+) -> Result<Option<(u64, u64)>> {
+    let tk_int = encode_numeric_threshold_for_otype(OType::XSD_INTEGER, threshold)?;
+    let tk_dbl = encode_numeric_threshold_for_otype(OType::XSD_DOUBLE, threshold)?;
+    let mut total: u64 = 0;
+    let matches = count_rows_via_overlay_cursor(
+        ctx,
+        store,
+        g_id,
+        RunSortOrder::Post,
+        pred_sid,
+        p_id,
+        |_s, o_type, o_key| {
+            total = total.saturating_add(1);
+            let tk = match OType::from_u16(o_type) {
+                OType::XSD_INTEGER => tk_int,
+                OType::XSD_DOUBLE => tk_dbl,
+                _ => return None, // non-numeric object: bail to the general pipeline
+            };
+            tk.map(|tk| okey_matches(compare, o_key, tk))
+        },
+    )?;
+    Ok(matches.map(|m| (m, total)))
+}
+
 /// Fast-path: parallel `COUNT(?s)` / `COUNT(*)` for a single predicate `?s <p> ?o`
 /// with FILTERs that compile to encoded pre-filters (no value decoding), e.g.
 /// `FILTER(?s != ?o)`, `FILTER(?s = ?o)`, `FILTER(ISBLANK(?o))`,
@@ -450,38 +558,74 @@ pub fn count_rows_encoded_filters_operator(
     FastPathOperator::new(
         out_var,
         move |ctx| {
-            let Some(store) = fast_path_store(ctx) else {
-                return Ok(None);
-            };
             let g_id = ctx.binary_g_id;
-            let pred_sid = normalize_pred_sid(store, &pattern.p)?;
-            let Some(p_id) = store.sid_to_p_id(&pred_sid) else {
-                // Absent predicate => no rows => COUNT is 0.
-                return Ok(Some(build_count_batch(out_var, 0)?));
-            };
-            // Compile the FILTERs to encoded pre-filters. If any can't be pushed
-            // down (needs value decoding), defer to the serial scan-count fallback.
-            let (encoded, pruned) = compile_encoded_pre_filters_and_prune_inline_ops(
-                &inline_ops,
-                &pattern,
-                store,
-                true,
-            );
-            if !pruned.is_empty() || encoded.is_empty() {
-                return Ok(None);
+            // HEAD lane: parallel base-leaflet scan applying the encoded filters.
+            if let Some(store) = fast_path_store(ctx) {
+                let pred_sid = normalize_pred_sid(store, &pattern.p)?;
+                let Some(p_id) = store.sid_to_p_id(&pred_sid) else {
+                    // Absent predicate => no rows => COUNT is 0.
+                    return Ok(Some(build_count_batch(out_var, 0)?));
+                };
+                // Compile the FILTERs to encoded pre-filters. If any can't be pushed
+                // down (needs value decoding), defer to the serial scan-count fallback.
+                let (encoded, pruned) = compile_encoded_pre_filters_and_prune_inline_ops(
+                    &inline_ops,
+                    &pattern,
+                    store,
+                    true,
+                );
+                if !pruned.is_empty() || encoded.is_empty() {
+                    return Ok(None);
+                }
+                let total_rows = count_rows_for_predicate_psot(store, g_id, p_id)?;
+                let leaves = leaf_entries_for_predicate(store, g_id, RunSortOrder::Psot, p_id);
+                let count = parallel_leaf_chunk_count(leaves, total_rows, |chunk| {
+                    count_rows_matching_encoded_filters_in_leaf_slice(store, p_id, &encoded, chunk)
+                })?;
+                return match count {
+                    Some(c) => Ok(Some(build_count_batch(
+                        out_var,
+                        count_to_i64(c, "COUNT rows encoded filters")?,
+                    )?)),
+                    None => Ok(None),
+                };
             }
-            let total_rows = count_rows_for_predicate_psot(store, g_id, p_id)?;
-            let leaves = leaf_entries_for_predicate(store, g_id, RunSortOrder::Psot, p_id);
-            let count = parallel_leaf_chunk_count(leaves, total_rows, |chunk| {
-                count_rows_matching_encoded_filters_in_leaf_slice(store, p_id, &encoded, chunk)
-            })?;
-            match count {
-                Some(c) => Ok(Some(build_count_batch(
-                    out_var,
-                    count_to_i64(c, "COUNT rows encoded filters")?,
-                )?)),
-                None => Ok(None),
+            // Overlay / time-travel lane: apply the same encoded filters per row over
+            // the merged cursor. A novelty-only predicate has no base id => defer.
+            if allow_cursor_fast_path(ctx) {
+                if let Some(store) = ctx.binary_store.as_ref() {
+                    let pred_sid = normalize_pred_sid(store, &pattern.p)?;
+                    let Some(p_id) = store.sid_to_p_id(&pred_sid) else {
+                        return Ok(None);
+                    };
+                    let (encoded, pruned) = compile_encoded_pre_filters_and_prune_inline_ops(
+                        &inline_ops,
+                        &pattern,
+                        store,
+                        true,
+                    );
+                    if !pruned.is_empty() || encoded.is_empty() {
+                        return Ok(None);
+                    }
+                    if let Some(count) = count_rows_via_overlay_cursor(
+                        ctx,
+                        store,
+                        g_id,
+                        RunSortOrder::Psot,
+                        pred_sid,
+                        p_id,
+                        |s_id, o_type, o_key| {
+                            Some(encoded.iter().all(|f| f.eval_row(s_id, o_type, o_key)))
+                        },
+                    )? {
+                        return Ok(Some(build_count_batch(
+                            out_var,
+                            count_to_i64(count, "COUNT rows encoded filters")?,
+                        )?));
+                    }
+                }
             }
+            Ok(None)
         },
         fallback,
         "COUNT rows encoded filters (parallel)",
@@ -536,23 +680,57 @@ pub fn count_rows_lang_filter_operator(
     FastPathOperator::new(
         out_var,
         move |ctx| {
-            let Some(store) = fast_path_store(ctx) else {
-                return Ok(None);
-            };
-            let pred_sid = normalize_pred_sid(store, &predicate)?;
-            let Some(p_id) = store.sid_to_p_id(&pred_sid) else {
-                return Ok(Some(build_count_batch(out_var, 0)?));
-            };
-            let Some(lang_id) = store.resolve_lang_id(&lang_tag) else {
-                return Ok(Some(build_count_batch(out_var, 0)?));
-            };
-            let required_otype = OType::lang_string(lang_id).as_u16();
-            let count =
-                count_rows_for_predicate_lang_psot(store, ctx.binary_g_id, p_id, required_otype)?;
-            Ok(Some(build_count_batch(
-                out_var,
-                count_to_i64(count, "COUNT rows lang filter")?,
-            )?))
+            // HEAD lane: base-leaflet scan with the per-leaflet o_type_const shortcut.
+            if let Some(store) = fast_path_store(ctx) {
+                let pred_sid = normalize_pred_sid(store, &predicate)?;
+                let Some(p_id) = store.sid_to_p_id(&pred_sid) else {
+                    return Ok(Some(build_count_batch(out_var, 0)?));
+                };
+                let Some(lang_id) = store.resolve_lang_id(&lang_tag) else {
+                    return Ok(Some(build_count_batch(out_var, 0)?));
+                };
+                let required_otype = OType::lang_string(lang_id).as_u16();
+                let count = count_rows_for_predicate_lang_psot(
+                    store,
+                    ctx.binary_g_id,
+                    p_id,
+                    required_otype,
+                )?;
+                return Ok(Some(build_count_batch(
+                    out_var,
+                    count_to_i64(count, "COUNT rows lang filter")?,
+                )?));
+            }
+            // Overlay / time-travel lane: count merged rows whose o_type is the
+            // lang-string type. A predicate or lang present only in novelty has no
+            // base id, so defer to the fallback (it handles novelty-only terms).
+            if allow_cursor_fast_path(ctx) {
+                if let Some(store) = ctx.binary_store.as_ref() {
+                    let pred_sid = normalize_pred_sid(store, &predicate)?;
+                    let (Some(p_id), Some(lang_id)) = (
+                        store.sid_to_p_id(&pred_sid),
+                        store.resolve_lang_id(&lang_tag),
+                    ) else {
+                        return Ok(None);
+                    };
+                    let required_otype = OType::lang_string(lang_id).as_u16();
+                    if let Some(count) = count_rows_via_overlay_cursor(
+                        ctx,
+                        store,
+                        ctx.binary_g_id,
+                        RunSortOrder::Psot,
+                        pred_sid,
+                        p_id,
+                        |_s, o_type, _o_key| Some(o_type == required_otype),
+                    )? {
+                        return Ok(Some(build_count_batch(
+                            out_var,
+                            count_to_i64(count, "COUNT rows lang filter")?,
+                        )?));
+                    }
+                }
+            }
+            Ok(None)
         },
         fallback,
         "COUNT rows lang filter",
