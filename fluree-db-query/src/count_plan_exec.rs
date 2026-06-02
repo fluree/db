@@ -967,7 +967,7 @@ fn driver_subject_boundaries(
 /// Because partition boundaries are subject VALUES and every subject's rows are
 /// contiguous within a predicate, each subject lands in exactly one partition —
 /// so the partials sum exactly. Parallelizes both leaflet decompression AND the
-/// merge (one step past QLever, which keeps the merge serial). Returns `Ok(None)`
+/// merge itself, rather than keeping the merge serial. Returns `Ok(None)`
 /// to defer to the serial merge when not applicable (not all `SubjectCountScan`,
 /// a predicate absent, too few rows/leaves, or a single core). BASE index only:
 /// Generic parallel-partitioned count harness.

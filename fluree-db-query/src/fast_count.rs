@@ -171,13 +171,111 @@ fn count_rows_for_predicate_numeric_compare_post(
     threshold: &FlakeValue,
 ) -> Result<Option<u64>> {
     let leaves = leaf_entries_for_predicate(store, g_id, RunSortOrder::Post, p_id);
-    // Each POST leaflet is type-homogeneous and counted independently, so the leaf
-    // slice can be split across cores (the per-leaflet reducer is stateless). The
-    // partition decision uses the predicate's total row count.
+
+    // Global metadata shortcut: POST sorts by (p_id, o_type, o_key), so the
+    // predicate's whole o_key extent is [global_min, global_max]. If that extent
+    // lies entirely on one side of the threshold, the answer is `total` (all match)
+    // or `0` (all excluded) with no per-leaflet scan — opening at most the ≤2
+    // boundary leaves whose manifest key belongs to an adjacent predicate. For
+    // `?o > 0` over an all-positive predicate this collapses the whole scan to a
+    // manifest read.
+    if let Some((min_ot, min_ok, max_ot, max_ok)) =
+        predicate_post_global_extent(store, p_id, leaves)?
+    {
+        // Same o_type at both ends ⇒ uniform o_type (POST sorts o_type before o_key).
+        if min_ot == max_ot {
+            let otype = OType::from_u16(min_ot);
+            if matches!(otype, OType::XSD_INTEGER | OType::XSD_DOUBLE) {
+                if let Some(threshold_key) = encode_numeric_threshold_for_otype(otype, threshold)? {
+                    if leaflet_fully_excluded(compare, min_ok, max_ok, threshold_key) {
+                        return Ok(Some(0));
+                    }
+                    if leaflet_fully_matches(compare, min_ok, max_ok, threshold_key) {
+                        return Ok(Some(count_rows_for_predicate_psot(store, g_id, p_id)?));
+                    }
+                }
+            }
+        }
+    }
+
+    // Partial overlap (or mixed/non-numeric o_type): each POST leaflet is
+    // type-homogeneous and counted independently, so the leaf slice is split across
+    // cores (the per-leaflet reducer is stateless). The partition decision uses the
+    // predicate's total row count.
     let total_rows = count_rows_for_predicate_psot(store, g_id, p_id)?;
     parallel_leaf_chunk_count(leaves, total_rows, |chunk| {
         count_numeric_compare_in_leaf_slice(store, p_id, compare, threshold, chunk)
     })
+}
+
+/// The predicate's global `(min_o_type, min_o_key, max_o_type, max_o_key)` in POST
+/// order — the extent of its rows. Read straight from the branch manifest
+/// (`LeafEntry.first_key`/`last_key` are decoded `RunRecordV2`), opening only the
+/// ≤2 boundary leaves whose manifest key belongs to an adjacent predicate (so their
+/// per-leaflet directory must be consulted for this predicate's first/last key).
+/// Returns `None` if there are no leaves (an empty predicate — the caller's total is
+/// 0) or, defensively, if a boundary leaf yields no matching leaflet.
+fn predicate_post_global_extent(
+    store: &BinaryIndexStore,
+    p_id: u32,
+    leaves: &[LeafEntry],
+) -> Result<Option<(u16, u64, u16, u64)>> {
+    let (Some(first_leaf), Some(last_leaf)) = (leaves.first(), leaves.last()) else {
+        return Ok(None);
+    };
+
+    // Global minimum: the first p_id row in POST order. When the first leaf already
+    // starts at this predicate the manifest key is it; otherwise the leaf opens with
+    // an earlier predicate and we read its first p_id leaflet's first key.
+    let (min_ot, min_ok) = if first_leaf.first_key.p_id == p_id {
+        (first_leaf.first_key.o_type, first_leaf.first_key.o_key)
+    } else {
+        match boundary_leaf_pid_extent(store, p_id, first_leaf, false)? {
+            Some(v) => v,
+            None => return Ok(None),
+        }
+    };
+
+    // Global maximum: the last p_id row in POST order.
+    let (max_ot, max_ok) = if last_leaf.last_key.p_id == p_id {
+        (last_leaf.last_key.o_type, last_leaf.last_key.o_key)
+    } else {
+        match boundary_leaf_pid_extent(store, p_id, last_leaf, true)? {
+            Some(v) => v,
+            None => return Ok(None),
+        }
+    };
+
+    Ok(Some((min_ot, min_ok, max_ot, max_ok)))
+}
+
+/// Open a boundary leaf and read the `(o_type, o_key)` of this predicate's first
+/// (`last = false`) or last (`last = true`) row, from the matching leaflet directory
+/// entry. Returns `None` if no leaflet in the leaf belongs to `p_id`.
+fn boundary_leaf_pid_extent(
+    store: &BinaryIndexStore,
+    p_id: u32,
+    leaf: &LeafEntry,
+    last: bool,
+) -> Result<Option<(u16, u64)>> {
+    let handle = store
+        .open_leaf_handle(&leaf.leaf_cid, leaf.sidecar_cid.as_ref(), false)
+        .map_err(|e| QueryError::Internal(format!("leaf open: {e}")))?;
+    let entries = &handle.dir().entries;
+    let mut indices = (0..entries.len()).collect::<Vec<_>>();
+    if last {
+        indices.reverse();
+    }
+    for i in indices {
+        let entry = &entries[i];
+        if entry.row_count == 0 || entry.p_const != Some(p_id) {
+            continue;
+        }
+        let raw = if last { &entry.last_key } else { &entry.first_key };
+        let key = read_ordered_key_v2(RunSortOrder::Post, raw);
+        return Ok(Some((key.o_type, key.o_key)));
+    }
+    Ok(None)
 }
 
 /// Count rows of `p_id` matching `?o <compare> threshold` over one contiguous slice

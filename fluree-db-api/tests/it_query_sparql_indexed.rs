@@ -1776,6 +1776,101 @@ async fn indexed_numeric_compare_mixed_int_double_counts_correctly() {
         .await;
 }
 
+/// Numeric-compare global metadata shortcut: when the predicate's whole o_key
+/// extent is on one side of the threshold, the count is answered from the manifest
+/// (no per-leaflet scan). Seeds an all-positive `ex:num` predicate alongside a
+/// second `ex:label` predicate so `ex:num` has boundary leaves (exercising the
+/// boundary-leaf extent lookup). `SUM(?o > 0)` => all match => total; `> 100` =>
+/// all excluded => 0.
+#[tokio::test]
+async fn indexed_numeric_compare_global_shortcut_counts_correctly() {
+    assert_index_defaults();
+    let fluree = FlureeBuilder::memory()
+        .with_ledger_cache_config(LedgerManagerConfig::default())
+        .build_memory();
+    let ledger_id = "it/indexed-numeric-compare-shortcut:main";
+    let mut idx_config = fluree_db_indexer::IndexerConfig::small();
+    idx_config.leaflet_rows = 100;
+    idx_config.leaf_target_bytes = 8_000;
+    idx_config.leaf_max_bytes = 16_000;
+    let (local, handle) = start_background_indexer_local(
+        fluree.backend().clone(),
+        Arc::new(fluree.nameservice_mode().clone()),
+        idx_config,
+    );
+
+    local
+        .run_until(async move {
+            let index_cfg = IndexConfig {
+                reindex_min_bytes: 0,
+                reindex_max_bytes: 80_000_000,
+            };
+            // All ex:num values in 1..=10 (strictly positive); ex:label gives a
+            // neighboring predicate so ex:num's leaf range has boundary leaves.
+            let n: i64 = 4_000;
+            let mut nodes: Vec<serde_json::Value> = Vec::with_capacity(n as usize);
+            for i in 0..n {
+                nodes.push(json!({
+                    "@id": format!("ex:s{i}"),
+                    "ex:num": (i % 10) + 1,
+                    "ex:label": format!("label-{}", i % 7),
+                }));
+            }
+            let ledger1 = fluree
+                .insert_with_opts(
+                    genesis_ledger_for_fluree(&fluree, ledger_id),
+                    &json!({ "@context": { "ex": "http://example.org/ns/" }, "@graph": nodes }),
+                    TxnOpts::default(),
+                    CommitOpts::default(),
+                    &index_cfg,
+                )
+                .await
+                .expect("seed insert")
+                .ledger;
+            let _ = trigger_index_and_wait_outcome(&handle, ledger_id, ledger1.t()).await;
+            let view = fluree
+                .db_at_t(ledger_id, ledger1.t())
+                .await
+                .expect("load indexed view");
+
+            // All positive => fully match => total = n.
+            let q_all = r"
+                PREFIX ex: <http://example.org/ns/>
+                SELECT (SUM(?o > 0) AS ?sum) WHERE { ?s ex:num ?o }
+            ";
+            let jsonld = fluree
+                .query(&view, QueryInput::Sparql(q_all))
+                .await
+                .expect("shortcut all-match query")
+                .to_jsonld(&view.snapshot)
+                .expect("to_jsonld");
+            assert_eq!(
+                normalize_rows(&jsonld),
+                normalize_rows(&json!([[n]])),
+                "all-positive ?o > 0 must equal total = {n}"
+            );
+
+            // Max value is 10 => `> 100` excludes everything => 0.
+            let q_none = r"
+                PREFIX ex: <http://example.org/ns/>
+                SELECT (SUM(?o > 100) AS ?sum) WHERE { ?s ex:num ?o }
+            ";
+            let jsonld_none = fluree
+                .query(&view, QueryInput::Sparql(q_none))
+                .await
+                .expect("shortcut all-excluded query")
+                .to_jsonld(&view.snapshot)
+                .expect("to_jsonld");
+            // SUM over a non-empty input with zero matches is bound 0.
+            assert_eq!(
+                normalize_rows(&jsonld_none),
+                normalize_rows(&json!([[0]])),
+                "?o > 100 with max 10 must be 0"
+            );
+        })
+        .await;
+}
+
 /// GROUP BY ?object COUNT(?subject) ORDER BY DESC LIMIT via the indexed POST
 /// path (`group_count_v6`, run-length + top-K). A high-multiplicity object's run
 /// (2000 rows) spans multiple leaflets, exercising the boundary-equality /
