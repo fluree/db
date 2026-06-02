@@ -494,22 +494,46 @@ pub struct PsotSubjectCountIter<'a> {
     /// Accumulated subject for a group that may span leaflet boundaries.
     cur_s: Option<u64>,
     cur_count: u64,
+    /// Half-open subject range `[lo, hi)` this iterator emits. Subjects below
+    /// `lo` are skipped; the first subject `>= hi` ends the stream. Used to
+    /// partition one predicate's subjects across parallel workers.
+    lo: u64,
+    hi: u64,
 }
 
 impl<'a> PsotSubjectCountIter<'a> {
     pub fn new(store: &'a BinaryIndexStore, g_id: GraphId, p_id: u32) -> Result<Self> {
+        Self::new_bounded(store, g_id, p_id, 0, u64::MAX)
+    }
+
+    /// Iterate only the subjects in `[lo, hi)`. Leaves entirely below `lo` are
+    /// skipped via a binary search on the predicate's leaf slice (so a partition
+    /// only opens its own leaves), and iteration ends at the first subject `>= hi`.
+    pub fn new_bounded(
+        store: &'a BinaryIndexStore,
+        g_id: GraphId,
+        p_id: u32,
+        lo: u64,
+        hi: u64,
+    ) -> Result<Self> {
         let leaves = leaf_entries_for_predicate(store, g_id, RunSortOrder::Psot, p_id);
+        // Leaf leapfrog to `lo`: skip leaves whose last subject (for THIS predicate)
+        // is below `lo`. Guarded by `last_key.p_id == p_id` because a boundary
+        // leaf's `last_key` can belong to a higher predicate (see PsotSubjectSeek).
+        let leaf_pos = leaves.partition_point(|e| e.last_key.p_id == p_id && e.last_key.s_id.as_u64() < lo);
         Ok(Self {
             store,
             p_id,
             leaf_entries: leaves,
-            leaf_pos: 0,
+            leaf_pos,
             leaflet_idx: 0,
             row: 0,
             handle: None,
             batch: None,
             cur_s: None,
             cur_count: 0,
+            lo,
+            hi,
         })
     }
 
@@ -596,6 +620,24 @@ impl<'a> PsotSubjectCountIter<'a> {
             }
 
             let sid = batch.s_id.get(self.row);
+
+            // Below the partition's range: skip whole sub-`lo` subjects. Only
+            // possible before the first in-range subject (rows are subject-sorted),
+            // so `cur_s` is None here.
+            if sid < self.lo {
+                self.row += 1;
+                continue;
+            }
+            // At/above the partition's end: no more in-range subjects (sorted), so
+            // flush any accumulated group and end the stream. The `>= hi` row is
+            // left unconsumed (it belongs to the next partition).
+            if sid >= self.hi {
+                if let Some(s) = self.cur_s.take() {
+                    let n = std::mem::take(&mut self.cur_count);
+                    return Ok(Some((s, n)));
+                }
+                return Ok(None);
+            }
 
             match self.cur_s {
                 None => {

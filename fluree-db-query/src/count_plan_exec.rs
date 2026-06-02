@@ -751,6 +751,197 @@ fn intersect_sorted_pair(a: &[u64], b: &[u64]) -> Vec<u64> {
 /// the strategy conservative (no regression vs the symmetric merge).
 const SEEK_STAR_DRIVER_FACTOR: u64 = 8192;
 
+/// Minimum total rows across the star's predicates before the parallel
+/// partitioned merge is worth its thread-spawn overhead. Below this the serial
+/// merge is used. (A wrong choice only affects speed, never the count.)
+const PARALLEL_STAR_MIN_ROWS: u64 = 50_000;
+/// Cap on partitions regardless of core count.
+const PARALLEL_STAR_MAX_PARTITIONS: usize = 16;
+
+/// N-way merge-join COUNT over the subject range `[lo, hi)` of `p_ids`, using
+/// bounded base-leaflet iterators. Returns `Σ_{s ∈ [lo,hi)} Π_i count_i(s)` —
+/// the partial count for one partition. BASE index only (no overlay).
+fn merge_count_range(
+    store: &BinaryIndexStore,
+    g_id: fluree_db_core::GraphId,
+    p_ids: &[u32],
+    lo: u64,
+    hi: u64,
+) -> Result<u128> {
+    let mut iters: Vec<PsotSubjectCountIter<'_>> = Vec::with_capacity(p_ids.len());
+    for &p_id in p_ids {
+        iters.push(PsotSubjectCountIter::new_bounded(store, g_id, p_id, lo, hi)?);
+    }
+    let mut curr: Vec<Option<(u64, u64)>> = Vec::with_capacity(iters.len());
+    for it in &mut iters {
+        curr.push(it.next_group()?);
+    }
+    let mut total: u128 = 0;
+    loop {
+        if curr.iter().any(std::option::Option::is_none) {
+            break;
+        }
+        let max_s = curr.iter().filter_map(|c| c.map(|(s, _)| s)).max().unwrap();
+        if curr.iter().all(|c| c.map(|(s, _)| s) == Some(max_s)) {
+            let product: u128 = curr.iter().map(|c| c.unwrap().1 as u128).product();
+            total = total.saturating_add(product);
+            for (i, it) in iters.iter_mut().enumerate() {
+                curr[i] = it.next_group()?;
+            }
+        } else {
+            for (i, it) in iters.iter_mut().enumerate() {
+                if let Some((s_id, _)) = curr[i] {
+                    if s_id < max_s {
+                        curr[i] = it.next_group()?;
+                    }
+                }
+            }
+        }
+    }
+    Ok(total)
+}
+
+/// Ascending candidate subject boundaries for partitioning a predicate's scan.
+///
+/// When the predicate has at least `k` leaves, returns each leaf's first subject
+/// straight from the in-memory manifest (no leaf opens) — the huge-predicate case
+/// (e.g. `rdf:type`, thousands of leaves). Otherwise opens the few leaves and
+/// returns each matching leaflet's first subject, giving finer boundaries for a
+/// predicate that fits in one/few leaves but many leaflets. The returned values
+/// are non-decreasing (leaves and leaflets are subject-sorted).
+fn driver_subject_boundaries(
+    store: &BinaryIndexStore,
+    g_id: fluree_db_core::GraphId,
+    p_id: u32,
+    k: usize,
+) -> Result<Vec<u64>> {
+    let leaves = leaf_entries_for_predicate(store, g_id, RunSortOrder::Psot, p_id);
+    if leaves.len() >= k {
+        return Ok(leaves.iter().map(|e| e.first_key.s_id.as_u64()).collect());
+    }
+    use fluree_db_binary_index::format::run_record_v2::read_ordered_key_v2;
+    let mut bounds: Vec<u64> = Vec::new();
+    for leaf in leaves {
+        let handle = store
+            .open_leaf_handle(&leaf.leaf_cid, leaf.sidecar_cid.as_ref(), false)
+            .map_err(|e| QueryError::Internal(format!("leaf open: {e}")))?;
+        for entry in &handle.dir().entries {
+            if entry.row_count == 0 || entry.p_const != Some(p_id) {
+                continue;
+            }
+            let first = read_ordered_key_v2(RunSortOrder::Psot, &entry.first_key);
+            bounds.push(first.s_id.as_u64());
+        }
+    }
+    Ok(bounds)
+}
+
+/// Parallel partitioned variant of the inner-star count merge.
+///
+/// Partitions the subject space into K contiguous ranges at leaf boundaries and
+/// runs the N-way merge per range on its own thread, then sums the partials.
+/// Because partition boundaries are subject VALUES and every subject's rows are
+/// contiguous within a predicate, each subject lands in exactly one partition —
+/// so the partials sum exactly. Parallelizes both leaflet decompression AND the
+/// merge (one step past QLever, which keeps the merge serial). Returns `Ok(None)`
+/// to defer to the serial merge when not applicable (not all `SubjectCountScan`,
+/// a predicate absent, too few rows/leaves, or a single core). BASE index only:
+/// caller ensures `!ec.overlay` and no exclude/include filter.
+fn sum_star_join_parallel(children: &[StreamNode], ec: &ExecCtx<'_, '_>) -> Result<Option<u64>> {
+    if children.len() < 2 {
+        return Ok(None);
+    }
+    let mut p_ids: Vec<u32> = Vec::with_capacity(children.len());
+    let mut total_rows: u64 = 0;
+    for child in children {
+        let StreamNode::SubjectCountScan { pred } = child else {
+            return Ok(None);
+        };
+        let sid = normalize_pred_sid(ec.store, pred)?;
+        let Some(p_id) = ec.store.sid_to_p_id(&sid) else {
+            return Ok(None);
+        };
+        p_ids.push(p_id);
+        total_rows =
+            total_rows.saturating_add(count_rows_for_predicate_psot(ec.store, ec.g_id, p_id)?);
+    }
+
+    let ncpu = std::thread::available_parallelism()
+        .map(std::num::NonZeroUsize::get)
+        .unwrap_or(1);
+    if ncpu < 2 || total_rows < PARALLEL_STAR_MIN_ROWS {
+        return Ok(None);
+    }
+
+    // Partition driver = the predicate with the most leaves (finest boundaries).
+    let driver_p = *p_ids
+        .iter()
+        .max_by_key(|&&p| leaf_entries_for_predicate(ec.store, ec.g_id, RunSortOrder::Psot, p).len())
+        .unwrap();
+
+    let k = ncpu.min(PARALLEL_STAR_MAX_PARTITIONS);
+    // Candidate ascending subject boundaries from the driver: leaf first-subjects
+    // when there are enough leaves (manifest only, no leaf opens — the huge-
+    // predicate case), else leaflet first-subjects (opens the few driver leaves,
+    // which the merge scans anyway — the medium single-leaf-many-leaflet case).
+    let candidates = driver_subject_boundaries(ec.store, ec.g_id, driver_p, k)?;
+    if candidates.len() < 2 {
+        return Ok(None);
+    }
+    // Subsample to ~K strictly-increasing boundaries: 0 = b_0 < … < b_K = MAX.
+    let mut bounds: Vec<u64> = vec![0];
+    for j in 1..k {
+        let b = candidates[j * candidates.len() / k];
+        if b > *bounds.last().unwrap() {
+            bounds.push(b);
+        }
+    }
+    bounds.push(u64::MAX);
+    if bounds.len() < 3 {
+        // Fewer than two real partitions — not worth parallelizing.
+        return Ok(None);
+    }
+    let ranges: Vec<(u64, u64)> = bounds.windows(2).map(|w| (w[0], w[1])).collect();
+    tracing::debug!(
+        partitions = ranges.len(),
+        total_rows,
+        predicates = p_ids.len(),
+        "count-plan: parallel partitioned star-join"
+    );
+
+    let store: &BinaryIndexStore = ec.store;
+    let g_id = ec.g_id;
+    let p_ids_ref = &p_ids;
+    let span = tracing::Span::current();
+
+    let partials: Vec<Result<u128>> = std::thread::scope(|scope| {
+        let handles: Vec<_> = ranges
+            .iter()
+            .map(|&(lo, hi)| {
+                let span = span.clone();
+                scope.spawn(move || {
+                    let _guard = span.enter();
+                    merge_count_range(store, g_id, p_ids_ref, lo, hi)
+                })
+            })
+            .collect();
+        handles
+            .into_iter()
+            .map(|h| {
+                h.join().unwrap_or_else(|_| {
+                    Err(QueryError::execution("parallel star-join worker panicked"))
+                })
+            })
+            .collect()
+    });
+
+    let mut total: u128 = 0;
+    for partial in partials {
+        total = total.saturating_add(partial?);
+    }
+    Ok(Some(total.min(u64::MAX as u128) as u64))
+}
+
 fn sum_star_join(
     children: &[StreamNode],
     ec: &ExecCtx<'_, '_>,
@@ -766,6 +957,13 @@ fn sum_star_join(
             try_sum_star_join_seek(children, ec, exclude_sorted, include_sorted)?
         {
             return Ok(Some(total));
+        }
+        // Both-large plain star (no modifiers): partition the subject space and
+        // run the merge across cores. Parallelizes decompression + merge.
+        if exclude_sorted.is_none() && include_sorted.is_none() {
+            if let Some(total) = sum_star_join_parallel(children, ec)? {
+                return Ok(Some(total));
+            }
         }
     }
 

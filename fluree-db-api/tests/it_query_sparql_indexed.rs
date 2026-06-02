@@ -919,6 +919,87 @@ async fn indexed_sum_compare_empty_predicate_matches_general() {
         .await;
 }
 
+/// Parallel partitioned inner-star COUNT(*): seed enough rows (>50k, the parallel
+/// threshold) with VARYING per-subject multiplicity so the count is sensitive to
+/// any partition-boundary bug (a misattributed subject changes the product sum).
+/// The result must equal the serially-computed expected sum exactly.
+#[tokio::test]
+async fn indexed_parallel_star_join_count_matches_serial() {
+    assert_index_defaults();
+    let fluree = FlureeBuilder::memory()
+        .with_ledger_cache_config(LedgerManagerConfig::default())
+        .build_memory();
+    let ledger_id = "it/indexed-parallel-star:main";
+
+    // Tiny leaflets/leaves so the modest test data spans many leaves (the real
+    // benchmark predicate has thousands) and the parallel partitioner engages.
+    let mut idx_config = fluree_db_indexer::IndexerConfig::small();
+    idx_config.leaflet_rows = 100;
+    idx_config.leaf_target_bytes = 8_000;
+    idx_config.leaf_max_bytes = 16_000;
+    let (local, handle) = start_background_indexer_local(
+        fluree.backend().clone(),
+        Arc::new(fluree.nameservice_mode().clone()),
+        idx_config,
+    );
+
+    local
+        .run_until(async move {
+            let index_cfg = IndexConfig {
+                reindex_min_bytes: 0,
+                reindex_max_bytes: 80_000_000,
+            };
+            // subject i: p1 has (i%3)+1 values, p2 has (i%2)+1 values.
+            // total rows ~ 3.5*N; N=16000 => ~56k rows > 50k parallel threshold.
+            let n: i64 = 16_000;
+            let mut expected: i64 = 0;
+            let mut nodes: Vec<serde_json::Value> = Vec::with_capacity(n as usize);
+            for i in 0..n {
+                let c1 = (i % 3) + 1;
+                let c2 = (i % 2) + 1;
+                expected += c1 * c2;
+                let p1: Vec<serde_json::Value> = (0..c1).map(|j| json!(i * 100 + j)).collect();
+                let p2: Vec<serde_json::Value> =
+                    (0..c2).map(|j| json!(i * 100 + 50 + j)).collect();
+                nodes.push(json!({"@id": format!("ex:s{i}"), "ex:p1": p1, "ex:p2": p2}));
+            }
+            let ledger1 = fluree
+                .insert_with_opts(
+                    genesis_ledger_for_fluree(&fluree, ledger_id),
+                    &json!({ "@context": { "ex": "http://example.org/ns/" }, "@graph": nodes }),
+                    TxnOpts::default(),
+                    CommitOpts::default(),
+                    &index_cfg,
+                )
+                .await
+                .expect("seed insert")
+                .ledger;
+            let _ = trigger_index_and_wait_outcome(&handle, ledger_id, ledger1.t()).await;
+            let view = fluree
+                .db_at_t(ledger_id, ledger1.t())
+                .await
+                .expect("load indexed view");
+
+            let q = r"
+                PREFIX ex: <http://example.org/ns/>
+                SELECT (COUNT(*) AS ?count)
+                WHERE { ?s ex:p1 ?o1 . ?s ex:p2 ?o2 }
+            ";
+            let jsonld = fluree
+                .query(&view, QueryInput::Sparql(q))
+                .await
+                .expect("parallel star join query")
+                .to_jsonld(&view.snapshot)
+                .expect("to_jsonld");
+            assert_eq!(
+                normalize_rows(&jsonld),
+                normalize_rows(&json!([[expected]])),
+                "parallel partitioned star-join count must equal Σ_s c1(s)*c2(s) = {expected}"
+            );
+        })
+        .await;
+}
+
 /// GROUP BY ?object COUNT(?subject) ORDER BY DESC LIMIT via the indexed POST
 /// path (`group_count_v6`, run-length + top-K). A high-multiplicity object's run
 /// (2000 rows) spans multiple leaflets, exercising the boundary-equality /
