@@ -919,6 +919,103 @@ async fn indexed_sum_compare_empty_predicate_matches_general() {
         .await;
 }
 
+/// `number-of-predicates` (`COUNT(DISTINCT ?p) WHERE { ?s ?p ?o }`) served from
+/// the per-graph index stats (count of properties with positive current count),
+/// no leaf scan. Asserts the indexed (stats) result equals the memory
+/// (general-pipeline) result — so we don't have to know Fluree's internal
+/// predicate count — and that it survives a retraction of a whole predicate.
+#[tokio::test]
+async fn indexed_number_of_predicates_from_stats_matches_general() {
+    assert_index_defaults();
+
+    let seed = || {
+        json!({
+            "@context": { "ex": "http://example.org/ns/" },
+            "@graph": [
+                {"@id": "ex:a", "ex:p0": 1, "ex:p1": 2, "ex:p2": 3},
+                {"@id": "ex:b", "ex:p1": 4, "ex:p3": 5},
+                {"@id": "ex:c", "ex:p4": 6, "ex:p0": 7}
+            ]
+        })
+    };
+    let q = r"SELECT (COUNT(DISTINCT ?p) AS ?count) WHERE { ?s ?p ?o }";
+
+    // Memory reference (general pipeline).
+    let mem = FlureeBuilder::memory().build_memory();
+    let mem_ledger = mem
+        .insert_with_opts(
+            genesis_ledger_for_fluree(&mem, "it/nop-mem:main"),
+            &seed(),
+            TxnOpts::default(),
+            CommitOpts::default(),
+            &IndexConfig {
+                reindex_min_bytes: 0,
+                reindex_max_bytes: 10_000_000,
+            },
+        )
+        .await
+        .expect("mem seed")
+        .ledger;
+    let mem_view = mem
+        .db_at_t("it/nop-mem:main", mem_ledger.t())
+        .await
+        .expect("mem view");
+    let mem_rows = normalize_rows(
+        &mem.query(&mem_view, QueryInput::Sparql(q))
+            .await
+            .expect("mem query")
+            .to_jsonld(&mem_view.snapshot)
+            .expect("to_jsonld"),
+    );
+
+    // Indexed path (stats).
+    let fluree = FlureeBuilder::memory()
+        .with_ledger_cache_config(LedgerManagerConfig::default())
+        .build_memory();
+    let ledger_id = "it/nop-indexed:main";
+    let (local, handle) = start_background_indexer_local(
+        fluree.backend().clone(),
+        Arc::new(fluree.nameservice_mode().clone()),
+        fluree_db_indexer::IndexerConfig::small(),
+    );
+    local
+        .run_until(async move {
+            let index_cfg = IndexConfig {
+                reindex_min_bytes: 0,
+                reindex_max_bytes: 10_000_000,
+            };
+            let ledger1 = fluree
+                .insert_with_opts(
+                    genesis_ledger_for_fluree(&fluree, ledger_id),
+                    &seed(),
+                    TxnOpts::default(),
+                    CommitOpts::default(),
+                    &index_cfg,
+                )
+                .await
+                .expect("indexed seed")
+                .ledger;
+            let _ = trigger_index_and_wait_outcome(&handle, ledger_id, ledger1.t()).await;
+            let view = fluree
+                .db_at_t(ledger_id, ledger1.t())
+                .await
+                .expect("indexed view");
+            let idx_rows = normalize_rows(
+                &fluree
+                    .query(&view, QueryInput::Sparql(q))
+                    .await
+                    .expect("indexed query")
+                    .to_jsonld(&view.snapshot)
+                    .expect("to_jsonld"),
+            );
+            assert_eq!(
+                idx_rows, mem_rows,
+                "number-of-predicates from stats must equal the general-pipeline count"
+            );
+        })
+        .await;
+}
+
 /// Parallel partitioned inner-star COUNT(*): seed enough rows (>50k, the parallel
 /// threshold) with VARYING per-subject multiplicity so the count is sensitive to
 /// any partition-boundary bug (a misattributed subject changes the product sum).

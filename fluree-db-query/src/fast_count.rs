@@ -5,6 +5,7 @@
 //! when `fast_path_store(ctx)` is available, otherwise they fall back to a planned
 //! operator tree for correctness.
 
+use crate::context::ExecutionContext;
 use crate::error::{QueryError, Result};
 use crate::fast_path_common::{
     build_count_batch, count_rows_for_predicate_psot, count_to_i64, fast_path_store,
@@ -470,7 +471,14 @@ pub fn count_distinct_position_operator(
                     "COUNT(DISTINCT) subjects",
                 ),
                 DistinctPosition::Predicates => (
-                    count_distinct_predicates_psot(store, ctx.binary_g_id)?,
+                    // Prefer the in-memory per-graph stats (number of predicates
+                    // with a positive current count) — O(#predicates), no leaf
+                    // opens. Falls back to the PSOT `p_const` scan when the graph
+                    // stats are unavailable.
+                    match distinct_predicates_from_graph_stats(ctx) {
+                        Some(c) => c,
+                        None => count_distinct_predicates_psot(store, ctx.binary_g_id)?,
+                    },
                     "COUNT(DISTINCT) predicates",
                 ),
                 // OPST key layout: o_type(2) + o_key(8) + o_i(4) + p_id(4) + s_id(8).
@@ -486,6 +494,21 @@ pub fn count_distinct_position_operator(
         fallback,
         label,
     )
+}
+
+/// Current-state distinct-predicate count from the per-graph index stats: the
+/// number of properties with a positive current flake count.
+///
+/// `GraphPropertyStatEntry.count` is "after dedup; retractions decrement", so a
+/// predicate has a current PSOT leaflet iff its count is `> 0` — this matches
+/// `count_distinct_predicates_psot` exactly but reads the in-memory stats instead
+/// of opening every leaf. Returns `None` when the graph stats are unavailable
+/// (older index / not computed). Only correct at HEAD with no overlay; the caller
+/// gates that via `fast_path_store`.
+fn distinct_predicates_from_graph_stats(ctx: &ExecutionContext<'_>) -> Option<u64> {
+    let graphs = ctx.active_snapshot.stats.as_ref()?.graphs.as_ref()?;
+    let g = graphs.iter().find(|g| g.g_id == ctx.binary_g_id)?;
+    Some(g.properties.iter().filter(|p| p.count > 0).count() as u64)
 }
 
 /// Count distinct lead groups across all leaflets in a given sort order.
