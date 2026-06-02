@@ -30,14 +30,14 @@ use crate::context::ExecutionContext;
 use crate::error::{QueryError, Result};
 use crate::fast_path_common::{
     build_count_batch, build_psot_cursor_for_predicate, count_rows_for_predicate_psot, count_to_i64,
-    cursor_projection_sid_only, cursor_projection_sid_otype_okey, normalize_pred_sid,
-    CursorSubjectCountStream,
+    cursor_projection_sid_only, cursor_projection_sid_otype_okey, leaf_entries_for_predicate,
+    normalize_pred_sid, CursorSubjectCountStream, PsotSubjectCountIter,
 };
 use crate::ir::triple::Ref;
 use crate::operator::{BoxedOperator, Operator, OperatorState};
 use crate::var_registry::VarId;
 use async_trait::async_trait;
-use fluree_db_binary_index::BinaryCursor;
+use fluree_db_binary_index::{BinaryCursor, RunSortOrder};
 use fluree_db_core::o_type::OType;
 use std::sync::Arc;
 
@@ -244,6 +244,163 @@ impl SubjectSelfLoopCountStreamV6 {
     }
 }
 
+/// Min-merge over union-branch iterators: returns `(s_min, Σ counts at s_min)` and
+/// advances the iterators at `s_min`. Bag semantics — a subject under multiple
+/// branches sums their counts.
+fn next_union_group(
+    iters: &mut [PsotSubjectCountIter<'_>],
+    cur: &mut [Option<(u64, u64)>],
+) -> Result<Option<(u64, u64)>> {
+    if cur.iter().all(std::option::Option::is_none) {
+        return Ok(None);
+    }
+    let s_min = cur.iter().filter_map(|c| c.map(|(s, _)| s)).min().unwrap();
+    let mut sum: u64 = 0;
+    for (i, it) in iters.iter_mut().enumerate() {
+        if let Some((s, n)) = cur[i] {
+            if s == s_min {
+                sum = sum.saturating_add(n);
+                cur[i] = it.next_group()?;
+            }
+        }
+    }
+    Ok(Some((s_min, sum)))
+}
+
+/// Max-merge over the constraint (extra) iterators: returns the next subject present
+/// in ALL of them with the product of their counts; subjects missing from any
+/// constraint predicate are skipped.
+fn next_extra_product_group(
+    iters: &mut [PsotSubjectCountIter<'_>],
+    cur: &mut [Option<(u64, u64)>],
+) -> Result<Option<(u64, u64)>> {
+    loop {
+        if cur.iter().any(std::option::Option::is_none) {
+            return Ok(None);
+        }
+        let target = cur.iter().filter_map(|c| c.map(|(s, _)| s)).max().unwrap();
+        let mut advanced = false;
+        for (i, it) in iters.iter_mut().enumerate() {
+            while let Some((s, _)) = cur[i] {
+                if s < target {
+                    cur[i] = it.next_group()?;
+                    advanced = true;
+                    if cur[i].is_none() {
+                        return Ok(None);
+                    }
+                } else {
+                    break;
+                }
+            }
+        }
+        if advanced {
+            continue;
+        }
+        let mut prod: u64 = 1;
+        for c in cur.iter() {
+            prod = prod.saturating_mul(c.unwrap().1);
+        }
+        for (i, it) in iters.iter_mut().enumerate() {
+            cur[i] = it.next_group()?;
+        }
+        return Ok(Some((target, prod)));
+    }
+}
+
+/// Per-partition partial for `(UNION of union_pids) ⋈ (AND of extra_pids)` COUNT(*)
+/// over `[lo, hi)`: `Σ_s (Σ_b count_b(s)) × (Π_e count_e(s))` for subjects in any
+/// union branch AND all extra predicates. BASE index only.
+fn merge_union_constraint_count_range(
+    store: &fluree_db_binary_index::BinaryIndexStore,
+    g_id: fluree_db_core::GraphId,
+    union_pids: &[u32],
+    extra_pids: &[u32],
+    lo: u64,
+    hi: u64,
+) -> Result<u128> {
+    let mut u_iters: Vec<PsotSubjectCountIter<'_>> = Vec::with_capacity(union_pids.len());
+    for &p in union_pids {
+        u_iters.push(PsotSubjectCountIter::new_bounded(store, g_id, p, lo, hi)?);
+    }
+    let mut u_cur: Vec<Option<(u64, u64)>> = Vec::with_capacity(u_iters.len());
+    for it in &mut u_iters {
+        u_cur.push(it.next_group()?);
+    }
+    let mut e_iters: Vec<PsotSubjectCountIter<'_>> = Vec::with_capacity(extra_pids.len());
+    for &p in extra_pids {
+        e_iters.push(PsotSubjectCountIter::new_bounded(store, g_id, p, lo, hi)?);
+    }
+    let mut e_cur: Vec<Option<(u64, u64)>> = Vec::with_capacity(e_iters.len());
+    for it in &mut e_iters {
+        e_cur.push(it.next_group()?);
+    }
+
+    let mut u = next_union_group(&mut u_iters, &mut u_cur)?;
+    let mut e = next_extra_product_group(&mut e_iters, &mut e_cur)?;
+    let mut total: u128 = 0;
+    while let (Some((us, usum)), Some((es, eprod))) = (u, e) {
+        if us < es {
+            u = next_union_group(&mut u_iters, &mut u_cur)?;
+            continue;
+        }
+        if es < us {
+            e = next_extra_product_group(&mut e_iters, &mut e_cur)?;
+            continue;
+        }
+        total = total.saturating_add((usum as u128).saturating_mul(eprod as u128));
+        u = next_union_group(&mut u_iters, &mut u_cur)?;
+        e = next_extra_product_group(&mut e_iters, &mut e_cur)?;
+    }
+    Ok(total)
+}
+
+/// Parallel partitioned constrained-union count. Resolves predicate ids, picks the
+/// partition driver, and dispatches to the shared harness. Returns `Ok(None)` to
+/// defer to the cursor merge when a predicate is absent or there are too few rows.
+/// Caller ensures `AllRows`, non-empty `extra_preds`, and HEAD (no overlay/time-travel).
+fn try_union_constraint_parallel(
+    store: &Arc<fluree_db_binary_index::BinaryIndexStore>,
+    g_id: fluree_db_core::GraphId,
+    union_preds: &[Ref],
+    extra_preds: &[Ref],
+) -> Result<Option<u64>> {
+    let mut union_pids: Vec<u32> = Vec::with_capacity(union_preds.len());
+    let mut extra_pids: Vec<u32> = Vec::with_capacity(extra_preds.len());
+    let mut total_rows: u64 = 0;
+    // Absent predicate (union or extra) => defer to the cursor merge, which handles
+    // the empty-union / empty-join semantics.
+    for p in union_preds {
+        let sid = normalize_pred_sid(store, p)?;
+        let Some(p_id) = store.sid_to_p_id(&sid) else {
+            return Ok(None);
+        };
+        union_pids.push(p_id);
+        total_rows = total_rows.saturating_add(count_rows_for_predicate_psot(store, g_id, p_id)?);
+    }
+    for p in extra_preds {
+        let sid = normalize_pred_sid(store, p)?;
+        let Some(p_id) = store.sid_to_p_id(&sid) else {
+            return Ok(None);
+        };
+        extra_pids.push(p_id);
+        total_rows = total_rows.saturating_add(count_rows_for_predicate_psot(store, g_id, p_id)?);
+    }
+    if union_pids.is_empty() || extra_pids.is_empty() {
+        return Ok(None);
+    }
+    // Partition driver = the predicate (union or extra) with the most leaves.
+    let driver_p = union_pids
+        .iter()
+        .chain(extra_pids.iter())
+        .copied()
+        .max_by_key(|&p| leaf_entries_for_predicate(store, g_id, RunSortOrder::Psot, p).len())
+        .unwrap();
+
+    crate::count_plan_exec::parallel_partition_count(store, g_id, driver_p, total_rows, |lo, hi| {
+        merge_union_constraint_count_range(store, g_id, &union_pids, &extra_pids, lo, hi)
+    })
+}
+
 fn count_union_star(
     store: &Arc<fluree_db_binary_index::BinaryIndexStore>,
     ctx: &ExecutionContext<'_>,
@@ -287,6 +444,15 @@ fn count_union_star(
             total = total.saturating_add(count_rows_for_predicate_psot(store, g_id, p_id)?);
         }
         return Ok(Some(total));
+    }
+
+    // Parallel partitioned merge for the constrained `AllRows` case:
+    // `{ ?s p1 ?o } UNION { ?s p2 ?o } . ?s e1 ?o2 …` COUNT(*) over large
+    // predicates. HEAD-only (no overlay/time-travel); else the cursor merge below.
+    if matches!(mode, UnionCountMode::AllRows) && !extra_preds.is_empty() && !overlay_has_rows && !time_travel {
+        if let Some(total) = try_union_constraint_parallel(store, g_id, union_preds, extra_preds)? {
+            return Ok(Some(total));
+        }
     }
 
     // Build union streams.

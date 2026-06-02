@@ -1275,6 +1275,94 @@ async fn indexed_parallel_optional_join_count_matches_serial() {
         .await;
 }
 
+/// Parallel partitioned constrained-UNION COUNT(*):
+///   { ?s p1 ?o } UNION { ?s p2 ?o } . ?s e ?o2
+///   = Σ_s (count_p1(s)+count_p2(s))·count_e(s) for s with e AND (p1 OR p2).
+/// Seeds >50k rows with varying multiplicity plus union-only and constraint-only
+/// subjects (which must contribute 0), so the result is sensitive to both the
+/// union OR-sum, the constraint AND-join, and partition boundaries.
+#[tokio::test]
+async fn indexed_parallel_union_constraint_count_matches_serial() {
+    assert_index_defaults();
+    let fluree = FlureeBuilder::memory()
+        .with_ledger_cache_config(LedgerManagerConfig::default())
+        .build_memory();
+    let ledger_id = "it/indexed-parallel-union-constraint:main";
+    let mut idx_config = fluree_db_indexer::IndexerConfig::small();
+    idx_config.leaflet_rows = 100;
+    idx_config.leaf_target_bytes = 8_000;
+    idx_config.leaf_max_bytes = 16_000;
+    let (local, handle) = start_background_indexer_local(
+        fluree.backend().clone(),
+        Arc::new(fluree.nameservice_mode().clone()),
+        idx_config,
+    );
+
+    local
+        .run_until(async move {
+            let index_cfg = IndexConfig {
+                reindex_min_bytes: 0,
+                reindex_max_bytes: 80_000_000,
+            };
+            // subject i: p1 = (i%2)+1 values, e = 1 value, p2 = (i%3) values.
+            // contributes (count_p1 + count_p2) * count_e = ((i%2+1)+(i%3))*1.
+            let n: i64 = 16_000;
+            let mut expected: i64 = 0;
+            let mut nodes: Vec<serde_json::Value> = Vec::new();
+            for i in 0..n {
+                let c1 = (i % 2) + 1;
+                let cp2 = i % 3;
+                expected += c1 + cp2;
+                let mut node = json!({"@id": format!("ex:s{i}"), "ex:e": 1});
+                node["ex:p1"] = json!((0..c1).map(|j| json!(i * 10 + j)).collect::<Vec<_>>());
+                if cp2 > 0 {
+                    node["ex:p2"] =
+                        json!((0..cp2).map(|j| json!(i * 10 + 5 + j)).collect::<Vec<_>>());
+                }
+                nodes.push(node);
+            }
+            // union-only (no constraint e) and constraint-only (no union) => contribute 0.
+            for i in 0..500 {
+                nodes.push(json!({"@id": format!("ex:u{i}"), "ex:p1": [i]}));
+                nodes.push(json!({"@id": format!("ex:c{i}"), "ex:e": 2}));
+            }
+            let ledger1 = fluree
+                .insert_with_opts(
+                    genesis_ledger_for_fluree(&fluree, ledger_id),
+                    &json!({ "@context": { "ex": "http://example.org/ns/" }, "@graph": nodes }),
+                    TxnOpts::default(),
+                    CommitOpts::default(),
+                    &index_cfg,
+                )
+                .await
+                .expect("seed insert")
+                .ledger;
+            let _ = trigger_index_and_wait_outcome(&handle, ledger_id, ledger1.t()).await;
+            let view = fluree
+                .db_at_t(ledger_id, ledger1.t())
+                .await
+                .expect("load indexed view");
+
+            let q = r"
+                PREFIX ex: <http://example.org/ns/>
+                SELECT (COUNT(*) AS ?count)
+                WHERE { { ?s ex:p1 ?o } UNION { ?s ex:p2 ?o } ?s ex:e ?o2 }
+            ";
+            let jsonld = fluree
+                .query(&view, QueryInput::Sparql(q))
+                .await
+                .expect("parallel union-constraint query")
+                .to_jsonld(&view.snapshot)
+                .expect("to_jsonld");
+            assert_eq!(
+                normalize_rows(&jsonld),
+                normalize_rows(&json!([[expected]])),
+                "parallel union-constraint count must equal Σ_s (c_p1+c_p2)·c_e = {expected}"
+            );
+        })
+        .await;
+}
+
 /// GROUP BY ?object COUNT(?subject) ORDER BY DESC LIMIT via the indexed POST
 /// path (`group_count_v6`, run-length + top-K). A high-multiplicity object's run
 /// (2000 rows) spans multiple leaflets, exercising the boundary-equality /

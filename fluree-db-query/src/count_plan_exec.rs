@@ -960,7 +960,6 @@ fn driver_subject_boundaries(
 /// merge (one step past QLever, which keeps the merge serial). Returns `Ok(None)`
 /// to defer to the serial merge when not applicable (not all `SubjectCountScan`,
 /// a predicate absent, too few rows/leaves, or a single core). BASE index only:
-/// caller ensures `!ec.overlay` and no exclude/include filter.
 /// Generic parallel-partitioned count harness.
 ///
 /// Partitions the subject space into K contiguous ranges at `driver_p`'s
@@ -971,9 +970,10 @@ fn driver_subject_boundaries(
 /// rows are contiguous within a predicate, each subject lands in exactly one
 /// partition — the partials sum exactly. Returns `Ok(None)` to defer to the serial
 /// path when there aren't enough rows/leaves/cores to be worth parallelizing.
-/// BASE index only: the caller must ensure `!ec.overlay`.
-fn parallel_partition_count<F>(
-    ec: &ExecCtx<'_, '_>,
+/// BASE index only: the caller must ensure no overlay/time-travel.
+pub(crate) fn parallel_partition_count<F>(
+    store: &BinaryIndexStore,
+    g_id: fluree_db_core::GraphId,
     driver_p: u32,
     total_rows: u64,
     reducer: F,
@@ -993,7 +993,7 @@ where
     // when there are enough leaves (manifest only, no leaf opens — the huge-
     // predicate case), else leaflet first-subjects (opens the few driver leaves,
     // which the reducer scans anyway — the medium single-leaf-many-leaflet case).
-    let candidates = driver_subject_boundaries(ec.store, ec.g_id, driver_p, k)?;
+    let candidates = driver_subject_boundaries(store, g_id, driver_p, k)?;
     if candidates.len() < 2 {
         return Ok(None);
     }
@@ -1072,7 +1072,7 @@ fn sum_star_join_parallel(children: &[StreamNode], ec: &ExecCtx<'_, '_>) -> Resu
         .max_by_key(|&&p| leaf_entries_for_predicate(ec.store, ec.g_id, RunSortOrder::Psot, p).len())
         .unwrap();
 
-    parallel_partition_count(ec, driver_p, total_rows, |lo, hi| {
+    parallel_partition_count(ec.store, ec.g_id, driver_p, total_rows, |lo, hi| {
         merge_count_range(ec.store, ec.g_id, &p_ids, lo, hi)
     })
 }
@@ -1142,7 +1142,7 @@ fn sum_optional_join_parallel(
         .max_by_key(|&&p| leaf_entries_for_predicate(ec.store, ec.g_id, RunSortOrder::Psot, p).len())
         .unwrap();
 
-    parallel_partition_count(ec, driver_p, total_rows, |lo, hi| {
+    parallel_partition_count(ec.store, ec.g_id, driver_p, total_rows, |lo, hi| {
         merge_optional_count_range(ec.store, ec.g_id, &req_pids, &opt_groups, lo, hi)
     })
 }
