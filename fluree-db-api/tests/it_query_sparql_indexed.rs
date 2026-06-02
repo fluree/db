@@ -1363,6 +1363,187 @@ async fn indexed_parallel_union_constraint_count_matches_serial() {
         .await;
 }
 
+/// Parallel partitioned MINUS over a multi-predicate inner block (the "3-star"
+/// shape): `?s outer ?o1 MINUS { ?s in1 ?a . ?s in2 ?b }`
+///   = Σ_s count_outer(s) for s with outer AND s ∉ (in1 ∩ in2).
+/// The inner block compiles to `IntersectSorted([in1, in2])`, so the asymmetric
+/// seek bails and `try_modifier_intersect_parallel` drives the keyset build +
+/// outer scan in parallel. >50k total rows with varying outer multiplicity and an
+/// inner intersection (`i%6==0`) that is a strict subset of the outer subjects, so
+/// the result is sensitive to both the intersection and the partition boundaries.
+#[tokio::test]
+async fn indexed_parallel_minus_intersect_count_matches_serial() {
+    assert_index_defaults();
+    let fluree = FlureeBuilder::memory()
+        .with_ledger_cache_config(LedgerManagerConfig::default())
+        .build_memory();
+    let ledger_id = "it/indexed-parallel-minus-intersect:main";
+    let mut idx_config = fluree_db_indexer::IndexerConfig::small();
+    idx_config.leaflet_rows = 100;
+    idx_config.leaf_target_bytes = 8_000;
+    idx_config.leaf_max_bytes = 16_000;
+    let (local, handle) = start_background_indexer_local(
+        fluree.backend().clone(),
+        Arc::new(fluree.nameservice_mode().clone()),
+        idx_config,
+    );
+
+    local
+        .run_until(async move {
+            let index_cfg = IndexConfig {
+                reindex_min_bytes: 0,
+                reindex_max_bytes: 80_000_000,
+            };
+            // subject i: outer = (i%2)+1 values; in1 present iff i%2==0; in2 iff
+            // i%3==0. inner intersection (in1 AND in2) = i%6==0. total rows ~ 1.5N
+            // + 0.5N + 0.33N; N=24000 => ~56k > 50k threshold.
+            let n: i64 = 24_000;
+            let mut expected_minus: i64 = 0;
+            let mut expected_exists: i64 = 0;
+            let mut nodes: Vec<serde_json::Value> = Vec::with_capacity(n as usize);
+            for i in 0..n {
+                let c_outer = (i % 2) + 1;
+                let in1 = i % 2 == 0;
+                let in2 = i % 3 == 0;
+                if in1 && in2 {
+                    expected_exists += c_outer;
+                } else {
+                    expected_minus += c_outer;
+                }
+                let mut node = json!({"@id": format!("ex:s{i}")});
+                node["ex:outer"] =
+                    json!((0..c_outer).map(|j| json!(i * 10 + j)).collect::<Vec<_>>());
+                if in1 {
+                    node["ex:in1"] = json!(i * 10 + 100);
+                }
+                if in2 {
+                    node["ex:in2"] = json!(i * 10 + 200);
+                }
+                nodes.push(node);
+            }
+            let _ = expected_exists;
+            let ledger1 = fluree
+                .insert_with_opts(
+                    genesis_ledger_for_fluree(&fluree, ledger_id),
+                    &json!({ "@context": { "ex": "http://example.org/ns/" }, "@graph": nodes }),
+                    TxnOpts::default(),
+                    CommitOpts::default(),
+                    &index_cfg,
+                )
+                .await
+                .expect("seed insert")
+                .ledger;
+            let _ = trigger_index_and_wait_outcome(&handle, ledger_id, ledger1.t()).await;
+            let view = fluree
+                .db_at_t(ledger_id, ledger1.t())
+                .await
+                .expect("load indexed view");
+
+            let q = r"
+                PREFIX ex: <http://example.org/ns/>
+                SELECT (COUNT(*) AS ?count)
+                WHERE { ?s ex:outer ?o1 MINUS { ?s ex:in1 ?a . ?s ex:in2 ?b } }
+            ";
+            let jsonld = fluree
+                .query(&view, QueryInput::Sparql(q))
+                .await
+                .expect("parallel minus-intersect query")
+                .to_jsonld(&view.snapshot)
+                .expect("to_jsonld");
+            assert_eq!(
+                normalize_rows(&jsonld),
+                normalize_rows(&json!([[expected_minus]])),
+                "parallel minus-intersect count must equal Σ_s∉(in1∩in2) count_outer(s) = {expected_minus}"
+            );
+        })
+        .await;
+}
+
+/// Parallel partitioned FILTER EXISTS over a multi-predicate inner block (the
+/// "3-star" shape): `?s outer ?o1 FILTER EXISTS { ?s in1 ?a . ?s in2 ?b }`
+///   = Σ_s count_outer(s) for s with outer AND s ∈ (in1 ∩ in2).
+/// Same data as the MINUS test; EXISTS is its complement over the outer subjects.
+#[tokio::test]
+async fn indexed_parallel_exists_intersect_count_matches_serial() {
+    assert_index_defaults();
+    let fluree = FlureeBuilder::memory()
+        .with_ledger_cache_config(LedgerManagerConfig::default())
+        .build_memory();
+    let ledger_id = "it/indexed-parallel-exists-intersect:main";
+    let mut idx_config = fluree_db_indexer::IndexerConfig::small();
+    idx_config.leaflet_rows = 100;
+    idx_config.leaf_target_bytes = 8_000;
+    idx_config.leaf_max_bytes = 16_000;
+    let (local, handle) = start_background_indexer_local(
+        fluree.backend().clone(),
+        Arc::new(fluree.nameservice_mode().clone()),
+        idx_config,
+    );
+
+    local
+        .run_until(async move {
+            let index_cfg = IndexConfig {
+                reindex_min_bytes: 0,
+                reindex_max_bytes: 80_000_000,
+            };
+            let n: i64 = 24_000;
+            let mut expected_exists: i64 = 0;
+            let mut nodes: Vec<serde_json::Value> = Vec::with_capacity(n as usize);
+            for i in 0..n {
+                let c_outer = (i % 2) + 1;
+                let in1 = i % 2 == 0;
+                let in2 = i % 3 == 0;
+                if in1 && in2 {
+                    expected_exists += c_outer;
+                }
+                let mut node = json!({"@id": format!("ex:s{i}")});
+                node["ex:outer"] =
+                    json!((0..c_outer).map(|j| json!(i * 10 + j)).collect::<Vec<_>>());
+                if in1 {
+                    node["ex:in1"] = json!(i * 10 + 100);
+                }
+                if in2 {
+                    node["ex:in2"] = json!(i * 10 + 200);
+                }
+                nodes.push(node);
+            }
+            let ledger1 = fluree
+                .insert_with_opts(
+                    genesis_ledger_for_fluree(&fluree, ledger_id),
+                    &json!({ "@context": { "ex": "http://example.org/ns/" }, "@graph": nodes }),
+                    TxnOpts::default(),
+                    CommitOpts::default(),
+                    &index_cfg,
+                )
+                .await
+                .expect("seed insert")
+                .ledger;
+            let _ = trigger_index_and_wait_outcome(&handle, ledger_id, ledger1.t()).await;
+            let view = fluree
+                .db_at_t(ledger_id, ledger1.t())
+                .await
+                .expect("load indexed view");
+
+            let q = r"
+                PREFIX ex: <http://example.org/ns/>
+                SELECT (COUNT(*) AS ?count)
+                WHERE { ?s ex:outer ?o1 FILTER EXISTS { ?s ex:in1 ?a . ?s ex:in2 ?b } }
+            ";
+            let jsonld = fluree
+                .query(&view, QueryInput::Sparql(q))
+                .await
+                .expect("parallel exists-intersect query")
+                .to_jsonld(&view.snapshot)
+                .expect("to_jsonld");
+            assert_eq!(
+                normalize_rows(&jsonld),
+                normalize_rows(&json!([[expected_exists]])),
+                "parallel exists-intersect count must equal Σ_s∈(in1∩in2) count_outer(s) = {expected_exists}"
+            );
+        })
+        .await;
+}
+
 /// GROUP BY ?object COUNT(?subject) ORDER BY DESC LIMIT via the indexed POST
 /// path (`group_count_v6`, run-length + top-K). A high-multiplicity object's run
 /// (2000 rows) spans multiple leaflets, exercising the boundary-equality /

@@ -549,6 +549,11 @@ fn sum_stream(
                 if let Some(n) = try_modifier_seek(source, excluded, true, ec)? {
                     return Ok(Some(n));
                 }
+                // Both-large (and multi-predicate inner): parallelize the keyset
+                // build + outer scan instead of building the keyset serially.
+                if let Some(n) = try_modifier_intersect_parallel(source, excluded, true, ec)? {
+                    return Ok(Some(n));
+                }
             }
             let exclude_list = execute_keyset_as_sorted(excluded, ec)?;
             let exclude_list = match exclude_list {
@@ -563,6 +568,11 @@ fn sum_stream(
         StreamNode::SemiJoin { source, filter } => {
             if !ec.overlay && exclude_sorted.is_none() && include_sorted.is_none() {
                 if let Some(n) = try_modifier_seek(source, filter, false, ec)? {
+                    return Ok(Some(n));
+                }
+                // Both-large (and multi-predicate inner): parallelize the keyset
+                // build + outer scan instead of building the keyset serially.
+                if let Some(n) = try_modifier_intersect_parallel(source, filter, false, ec)? {
                     return Ok(Some(n));
                 }
             }
@@ -1144,6 +1154,146 @@ fn sum_optional_join_parallel(
 
     parallel_partition_count(ec.store, ec.g_id, driver_p, total_rows, |lo, hi| {
         merge_optional_count_range(ec.store, ec.g_id, &req_pids, &opt_groups, lo, hi)
+    })
+}
+
+/// Per-partition partial for a MINUS/EXISTS whose inner block is an inner-join of
+/// one or more single-predicate subject sets, over a single-predicate outer:
+/// `?s OUTER ?o {MINUS | FILTER EXISTS} { ?s IN1 ?a . ?s IN2 ?b . … }`.
+///
+/// Streams the outer iterator and every inner predicate's bounded subject iterator
+/// together (all ascending) and, per outer subject, tests membership in the inner
+/// intersection (present in *every* inner predicate). MINUS keeps subjects absent
+/// from the intersection; EXISTS keeps those present:
+///
+/// `Σ_{s ∈ OUTER ∩ [lo,hi)} [keep(s)] · count_OUTER(s)` where
+/// `keep(s) = is_anti ? s ∉ ⋂_i IN_i : s ∈ ⋂_i IN_i`.
+///
+/// O(1) memory — no keyset is materialized; the streaming merge parallelizes the
+/// decompression of the outer *and* every inner predicate across partitions (the
+/// inner keyset build is the dominant cost for a multi-predicate inner). BASE index
+/// only (no overlay), no exclude/include (the caller gates that).
+fn merge_modifier_intersect_range(
+    store: &BinaryIndexStore,
+    g_id: fluree_db_core::GraphId,
+    outer_pid: u32,
+    inner_pids: &[u32],
+    is_anti: bool,
+    lo: u64,
+    hi: u64,
+) -> Result<u128> {
+    let mut outer = PsotSubjectCountIter::new_bounded(store, g_id, outer_pid, lo, hi)?;
+    let mut inner: Vec<PsotSubjectCountIter<'_>> = Vec::with_capacity(inner_pids.len());
+    for &p in inner_pids {
+        inner.push(PsotSubjectCountIter::new_bounded(store, g_id, p, lo, hi)?);
+    }
+    let mut i_cur: Vec<Option<(u64, u64)>> = Vec::with_capacity(inner.len());
+    for it in &mut inner {
+        i_cur.push(it.next_group()?);
+    }
+
+    let mut total: u128 = 0;
+    while let Some((os, ocount)) = outer.next_group()? {
+        // In the inner intersection iff present in every inner predicate. Each
+        // inner cursor advances monotonically to the first subject >= os; since os
+        // is non-decreasing, cursors skipped by an early break catch up lazily.
+        let mut in_inner = true;
+        for (k, it) in inner.iter_mut().enumerate() {
+            while let Some((is_, _)) = i_cur[k] {
+                if is_ < os {
+                    i_cur[k] = it.next_group()?;
+                } else {
+                    break;
+                }
+            }
+            if !matches!(i_cur[k], Some((is_, _)) if is_ == os) {
+                in_inner = false;
+                break;
+            }
+        }
+        let keep = if is_anti { !in_inner } else { in_inner };
+        if keep {
+            total = total.saturating_add(ocount as u128);
+        }
+    }
+    Ok(total)
+}
+
+/// Resolve a MINUS/EXISTS keyset into the `p_id`s of its inner predicates for the
+/// parallel modifier-intersect path. Handles a single-predicate set
+/// (`SubjectSet`/`SubjectsSorted`) and an inner-join intersection of such sets
+/// (`IntersectSorted`). Returns `Ok(None)` to defer to the serial keyset path for
+/// any other shape (e.g. object-chain `SubjectsWithObjectIn`) or if any predicate
+/// is absent — the serial path applies the correct absent-predicate semantics.
+fn resolve_keyset_pids(keyset: &KeySetNode, ec: &ExecCtx<'_, '_>) -> Result<Option<Vec<u32>>> {
+    fn single_pid(node: &KeySetNode, ec: &ExecCtx<'_, '_>) -> Result<Option<u32>> {
+        let pred = match node {
+            KeySetNode::SubjectSet { pred } | KeySetNode::SubjectsSorted { pred } => pred,
+            _ => return Ok(None),
+        };
+        let sid = normalize_pred_sid(ec.store, pred)?;
+        Ok(ec.store.sid_to_p_id(&sid))
+    }
+    match keyset {
+        KeySetNode::SubjectSet { .. } | KeySetNode::SubjectsSorted { .. } => {
+            Ok(single_pid(keyset, ec)?.map(|p| vec![p]))
+        }
+        KeySetNode::IntersectSorted { children } => {
+            let mut pids = Vec::with_capacity(children.len());
+            for child in children {
+                match single_pid(child, ec)? {
+                    Some(p) => pids.push(p),
+                    None => return Ok(None),
+                }
+            }
+            if pids.is_empty() {
+                return Ok(None);
+            }
+            Ok(Some(pids))
+        }
+        _ => Ok(None),
+    }
+}
+
+/// Parallel-partitioned MINUS/EXISTS over a single-predicate outer and an inner
+/// block that is a single predicate or an inner-join of predicates. Partitions the
+/// subject space and runs `merge_modifier_intersect_range` per range, parallelizing
+/// the inner keyset build (the dominant cost for a multi-predicate inner) together
+/// with the outer scan. Returns `Ok(None)` to defer to the serial keyset+scan path
+/// for any other shape, an absent predicate, or too few rows. BASE index only:
+/// caller ensures `!ec.overlay` and no active exclude/include.
+fn try_modifier_intersect_parallel(
+    source: &StreamNode,
+    keyset: &KeySetNode,
+    is_anti: bool,
+    ec: &ExecCtx<'_, '_>,
+) -> Result<Option<u64>> {
+    let StreamNode::SubjectCountScan { pred: outer_pred } = source else {
+        return Ok(None);
+    };
+    let outer_sid = normalize_pred_sid(ec.store, outer_pred)?;
+    // Absent outer => empty outer => 0; let the serial path produce it.
+    let Some(outer_pid) = ec.store.sid_to_p_id(&outer_sid) else {
+        return Ok(None);
+    };
+    let Some(inner_pids) = resolve_keyset_pids(keyset, ec)? else {
+        return Ok(None);
+    };
+
+    let mut total_rows = count_rows_for_predicate_psot(ec.store, ec.g_id, outer_pid)?;
+    for &p in &inner_pids {
+        total_rows =
+            total_rows.saturating_add(count_rows_for_predicate_psot(ec.store, ec.g_id, p)?);
+    }
+
+    // Partition driver = the predicate (outer or inner) with the most leaves.
+    let driver_p = std::iter::once(outer_pid)
+        .chain(inner_pids.iter().copied())
+        .max_by_key(|&p| leaf_entries_for_predicate(ec.store, ec.g_id, RunSortOrder::Psot, p).len())
+        .unwrap();
+
+    parallel_partition_count(ec.store, ec.g_id, driver_p, total_rows, |lo, hi| {
+        merge_modifier_intersect_range(ec.store, ec.g_id, outer_pid, &inner_pids, is_anti, lo, hi)
     })
 }
 
