@@ -1,4 +1,4 @@
-//! Synthetic reproduction for the Fluree-vs-QLever COUNT(*) divergence on
+//! Synthetic reproduction for the Fluree-vs-Others COUNT(*) divergence on
 //! sequence paths `?s p1/p2+ ?o`  (DBLP-KG: subStream/relatedStream+).
 //!
 //! Goal: isolate whether Fluree counts DISTINCT (?s,?o) pairs vs. the full
