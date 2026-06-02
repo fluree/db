@@ -1059,6 +1059,55 @@ fn detect_predicate_count_rows(query: &Query) -> Option<(Ref, VarId)> {
     Some((pred, out_var))
 }
 
+/// Detect `COUNT(*)` / `COUNT(?s|?o)` of `?s rdf:type <Class> . ?s P ?o` — one leg
+/// with a constant (class) object, the other a same-subject property with a variable
+/// object. Returns `(type_pred, class_obj, property, out_var)`; the operator verifies
+/// the constant-object leg is rdf:type and does the class-stat lookup. Exactly one
+/// constant-object leg and one variable-object leg are required, so the variable-class
+/// star (`?s rdf:type ?o1 . ?s P ?o2`) and pure-constant joins don't match.
+/// `COUNT(DISTINCT …)` is rejected by `detect_count_aggregate`.
+fn detect_class_property_count(query: &Query) -> Option<(Ref, Ref, Ref, VarId)> {
+    let (input_var, out_var) = detect_count_aggregate(query)?;
+    if query.patterns.len() != 2 {
+        return None;
+    }
+    let (Pattern::Triple(t0), Pattern::Triple(t1)) = (&query.patterns[0], &query.patterns[1]) else {
+        return None;
+    };
+    for (cls_tp, prop_tp) in [(t0, t1), (t1, t0)] {
+        // Class leg: ?s <type_pred> <ConstClass> (constant ref object).
+        let Ref::Var(cs) = &cls_tp.s else { continue };
+        if cls_tp.dtc.is_some() {
+            continue;
+        }
+        let Some(type_pred) = extract_bound_predicate(&cls_tp.p) else {
+            continue;
+        };
+        let class_obj = match &cls_tp.o {
+            Term::Iri(i) => Ref::Iri(i.clone()),
+            Term::Sid(s) => Ref::Sid(s.clone()),
+            _ => continue, // not a constant class object
+        };
+        // Property leg: same subject, bound predicate, variable object.
+        let Ref::Var(ps) = &prop_tp.s else { continue };
+        if cs != ps || prop_tp.dtc.is_some() {
+            continue;
+        }
+        let Some(property) = extract_bound_predicate(&prop_tp.p) else {
+            continue;
+        };
+        let Term::Var(po) = &prop_tp.o else { continue };
+        // COUNT(?v): v must be the subject or the property's object (both bound).
+        if let Some(v) = input_var {
+            if v != *cs && v != *po {
+                continue;
+            }
+        }
+        return Some((type_pred, class_obj, property, out_var));
+    }
+    None
+}
+
 fn detect_predicate_count_rows_lang_filter(query: &Query) -> Option<(Ref, String, VarId)> {
     let (input_var, out_var) = detect_count_aggregate(query)?;
 
@@ -2183,6 +2232,23 @@ fn build_operator_tree_inner(
         if let Some((pred, out_var)) = detect_predicate_count_rows(query) {
             let fallback = build_operator_tree_inner(query, stats.clone(), false, planning)?;
             return Ok(Box::new(count_rows_operator(pred, out_var, Some(fallback))));
+        }
+    }
+
+    // Fast-path: `COUNT(*)` of `?s rdf:type <Class> . ?s P ?o` — the P-flake count on
+    // instances of one bound class, from per-(class,property) stats. Before the count
+    // planner, which would otherwise run it as a real class-instances ⋈ P join.
+    if enable_fused_fast_paths {
+        if let Some((type_pred, class_obj, property, out_var)) = detect_class_property_count(query)
+        {
+            let fallback = build_operator_tree_inner(query, stats.clone(), false, planning)?;
+            return Ok(Box::new(crate::fast_count::class_property_count_operator(
+                type_pred,
+                class_obj,
+                property,
+                out_var,
+                Some(fallback),
+            )));
         }
     }
 

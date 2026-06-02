@@ -2703,6 +2703,81 @@ async fn overlay_delta_union_count_folds_novelty() {
         .await;
 }
 
+/// Bound-class property COUNT(*): `?s a <Class> . ?s P ?o` answered from
+/// per-(class,property) stats (classStat[Class][P]), for both a datatype property and
+/// a reference property (refs counted via the JSON_LD_ID datatype total).
+#[tokio::test]
+async fn indexed_bound_class_property_count_from_class_stats() {
+    assert_index_defaults();
+    let fluree = FlureeBuilder::memory()
+        .with_ledger_cache_config(LedgerManagerConfig::default())
+        .build_memory();
+    let ledger_id = "it/indexed-bound-class-prop:main";
+    let (local, handle) = start_background_indexer_local(
+        fluree.backend().clone(),
+        Arc::new(fluree.nameservice_mode().clone()),
+        fluree_db_indexer::IndexerConfig::small(),
+    );
+    local
+        .run_until(async move {
+            let index_cfg = IndexConfig {
+                reindex_min_bytes: 0,
+                reindex_max_bytes: 10_000_000,
+            };
+            let ledger1 = fluree
+                .insert_with_opts(
+                    genesis_ledger_for_fluree(&fluree, ledger_id),
+                    &json!({
+                        "@context": { "ex": "http://example.org/ns/" },
+                        "@graph": [
+                            {"@id": "ex:a", "@type": ["ex:Person", "ex:Author"],
+                             "ex:name": ["A1", "A2"], "ex:knows": [{"@id": "ex:b"}, {"@id": "ex:c"}]},
+                            {"@id": "ex:b", "@type": "ex:Person", "ex:name": "B1",
+                             "ex:knows": {"@id": "ex:c"}},
+                            {"@id": "ex:c", "@type": "ex:Author"},
+                            {"@id": "ex:d", "ex:name": "D1"}
+                        ]
+                    }),
+                    TxnOpts::default(),
+                    CommitOpts::default(),
+                    &index_cfg,
+                )
+                .await
+                .expect("seed insert")
+                .ledger;
+            let _ = trigger_index_and_wait_outcome(&handle, ledger_id, ledger1.t()).await;
+            let view = fluree.db_at_t(ledger_id, ledger1.t()).await.expect("view");
+
+            let count = |class: &str, prop: &str| {
+                let q = format!(
+                    "PREFIX ex: <http://example.org/ns/>
+                     SELECT (COUNT(*) AS ?c) WHERE {{ ?s a ex:{class} . ?s ex:{prop} ?o }}"
+                );
+                let fluree = &fluree;
+                let view = &view;
+                async move {
+                    let j = fluree
+                        .query(view, QueryInput::Sparql(&q))
+                        .await
+                        .expect("bound-class query")
+                        .to_jsonld(&view.snapshot)
+                        .expect("to_jsonld");
+                    normalize_rows(&j)
+                }
+            };
+
+            // Person instances = {a, b}: name flakes 2 + 1 = 3; knows refs 2 + 1 = 3.
+            assert_eq!(count("Person", "name").await, normalize_rows(&json!([[3]])),
+                "name on Person = 3");
+            assert_eq!(count("Person", "knows").await, normalize_rows(&json!([[3]])),
+                "knows (ref) on Person = 3");
+            // Author instances = {a, c}: name flakes 2 + 0 = 2.
+            assert_eq!(count("Author", "name").await, normalize_rows(&json!([[2]])),
+                "name on Author = 2");
+        })
+        .await;
+}
+
 /// Overlay/novelty lane for the LANG-filter COUNT fast path.
 #[tokio::test]
 async fn overlay_lang_filter_count_folds_novelty() {

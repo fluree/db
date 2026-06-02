@@ -91,6 +91,76 @@ pub fn count_rows_operator(
     )
 }
 
+/// Fast-path: `COUNT(*)` of `?s rdf:type <Class> . ?s P ?o` — the number of `P`
+/// flakes on instances of a single bound class. Answered from the per-(class,
+/// property) stats: `classStat[g][Class][P]` = Σ of its datatype counts (which
+/// already include the reference total via the `JSON_LD_ID` tag). One metadata
+/// lookup, no scan/join.
+///
+/// The per-class datatype stats are current-state-exact on any base index (#1266),
+/// so this runs on bulk and incremental indexes alike. HEAD-only (via
+/// [`fast_path_store`]); under overlay it defers to the fallback (stats exclude
+/// uncommitted novelty). `COUNT(DISTINCT …)` is a different statistic (distinct
+/// subjects/objects, not the flake count) and is excluded by the detector. Returns
+/// `Ok(None)` to defer when the bound-object leg isn't rdf:type, stats are absent,
+/// or the count is 0 (a genuinely-empty join the general path confirms cheaply).
+pub fn class_property_count_operator(
+    type_pred: Ref,
+    class_obj: Ref,
+    property: Ref,
+    out_var: VarId,
+    fallback: Option<BoxedOperator>,
+) -> FastPathOperator {
+    FastPathOperator::new(
+        out_var,
+        move |ctx| {
+            let Some(store) = fast_path_store(ctx) else {
+                return Ok(None);
+            };
+            // The bound-object leg must be rdf:type for the class stats to apply.
+            let type_sid = normalize_pred_sid(store, &type_pred)?;
+            if !fluree_db_core::is_rdf_type(&type_sid) {
+                return Ok(None);
+            }
+            let class_sid = normalize_pred_sid(store, &class_obj)?;
+            let property_sid = normalize_pred_sid(store, &property)?;
+
+            let Some(stats) = ctx.active_snapshot.stats.as_ref() else {
+                return Ok(None);
+            };
+            let Some(graphs) = stats.graphs.as_ref() else {
+                return Ok(None);
+            };
+            let Some(graph) = graphs.iter().find(|g| g.g_id == ctx.binary_g_id) else {
+                return Ok(None);
+            };
+            let Some(classes) = graph.classes.as_ref() else {
+                return Ok(None);
+            };
+            let total: u64 = classes
+                .iter()
+                .find(|c| c.class_sid == class_sid)
+                .and_then(|c| {
+                    c.properties
+                        .iter()
+                        .find(|p| p.property_sid == property_sid)
+                })
+                .map(|p| p.datatypes.iter().map(|&(_dt, c)| c).sum())
+                .unwrap_or(0);
+            if total == 0 {
+                // Genuinely-empty (or stats-incomplete) — let the general path confirm.
+                return Ok(None);
+            }
+            Ok(Some(build_count_batch(
+                out_var,
+                count_to_i64(total, "COUNT class-property")?,
+            )?))
+        },
+        fallback,
+        "COUNT class-property",
+    )
+}
+
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum NumericCompareOp {
     Gt,
