@@ -115,8 +115,8 @@ pub use commit_transfer::{
     PushCommitsRequest, PushCommitsResponse,
 };
 pub use dataset::{
-    sparql_dataset_ledger_ids, sparql_from_count, DatasetParseError, DatasetSpec, GraphSource,
-    QueryConnectionOptions, TimeSpec,
+    sparql_dataset_ledger_ids, DatasetParseError, DatasetSpec, GraphSource, QueryConnectionOptions,
+    TimeSpec,
 };
 pub use error::{ApiError, BuilderError, BuilderErrors, Result};
 pub use fluree_db_core::ContentId;

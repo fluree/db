@@ -1294,30 +1294,6 @@ pub fn sparql_dataset_ledger_ids(sparql: &str) -> Result<Vec<String>, DatasetPar
     Ok(ledger_ids)
 }
 
-/// Count the default-graph (`FROM <…>`, non-`NAMED`) clauses in a SPARQL query.
-///
-/// Used to populate [`AgentJsonContext::from_count`](crate::AgentJsonContext), which the
-/// AgentJson formatter uses to decide single- vs multi-ledger handling (whether to include
-/// `t` and whether a single-`FROM` resume query can be generated).
-///
-/// Returns `0` when the query fails to parse or carries no dataset clause — e.g. ledger-scoped
-/// queries that specify the ledger out-of-band rather than via `FROM`.
-pub fn sparql_from_count(sparql: &str) -> usize {
-    let parsed = fluree_db_sparql::parse_sparql(sparql);
-    parsed
-        .ast
-        .as_ref()
-        .and_then(|ast| match &ast.body {
-            fluree_db_sparql::ast::QueryBody::Select(q) => q.dataset.as_ref(),
-            fluree_db_sparql::ast::QueryBody::Construct(q) => q.dataset.as_ref(),
-            fluree_db_sparql::ast::QueryBody::Ask(q) => q.dataset.as_ref(),
-            fluree_db_sparql::ast::QueryBody::Describe(q) => q.dataset.as_ref(),
-            fluree_db_sparql::ast::QueryBody::Update(_) => None,
-        })
-        .map(|d| d.default_graphs.len())
-        .unwrap_or(0)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2574,40 +2550,5 @@ mod tests {
     fn test_sparql_dataset_ledger_ids_parse_error() {
         let result = sparql_dataset_ledger_ids("NOT VALID SPARQL }{}{");
         assert!(result.is_err());
-    }
-
-    #[test]
-    fn test_sparql_from_count_none() {
-        assert_eq!(sparql_from_count("SELECT ?s WHERE { ?s ?p ?o }"), 0);
-    }
-
-    #[test]
-    fn test_sparql_from_count_single() {
-        assert_eq!(
-            sparql_from_count("SELECT ?s FROM <mydb:main> WHERE { ?s ?p ?o }"),
-            1
-        );
-    }
-
-    #[test]
-    fn test_sparql_from_count_multiple() {
-        assert_eq!(
-            sparql_from_count("SELECT ?s FROM <db1:main> FROM <db2:main> WHERE { ?s ?p ?o }"),
-            2
-        );
-    }
-
-    #[test]
-    fn test_sparql_from_count_named_not_counted() {
-        // FROM NAMED clauses are named graphs, not default graphs.
-        assert_eq!(
-            sparql_from_count("SELECT ?s FROM NAMED <db:main> WHERE { ?s ?p ?o }"),
-            0
-        );
-    }
-
-    #[test]
-    fn test_sparql_from_count_parse_error() {
-        assert_eq!(sparql_from_count("NOT VALID SPARQL }{}{"), 0);
     }
 }
