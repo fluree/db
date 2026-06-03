@@ -1353,6 +1353,22 @@ fn drain_ready_deferred(
 /// produced by some OTHER pattern in the enclosing group. These must be bound
 /// before the subquery runs, so the planner defers it until they are. An empty
 /// result means the subquery is uncorrelated (safe to place early).
+///
+/// A shared variable that the subquery **produces itself** (binds in its own
+/// WHERE — e.g. a `GROUP BY` key) is a JOIN key, not a correlation input:
+/// seeding it per outer row is equivalent to evaluating the subquery once and
+/// filtering its output to that value, so it can run once and be hash-joined.
+///
+/// Two safety conditions on this declassification:
+/// 1. **No inner slice.** With `LIMIT`/`OFFSET`, the per-row restriction changes
+///    which rows survive the slice (e.g. `ORDER BY DESC(?x) LIMIT 1` means "top
+///    row per outer binding"), so such a subquery stays genuinely correlated.
+/// 2. **Unconditionally bound.** The variable must be bound in *every* subquery
+///    solution — produced by a top-level required pattern (a triple or property
+///    path), NOT inside a `UNION` branch or `OPTIONAL`. A conditionally-bound
+///    var can be Unbound in some output rows; evaluating once and joining would
+///    then differ from per-row seeding (an Unbound join key would scan rather
+///    than filter). We only count always-bound producers.
 fn subquery_correlation_vars(
     sq: &SubqueryPattern,
     siblings: &[Pattern],
@@ -1362,13 +1378,26 @@ fn subquery_correlation_vars(
     if select.is_empty() {
         return HashSet::new();
     }
+    // Variables the subquery binds in EVERY solution on its own — but only when
+    // no inner slice makes per-row seeding result-sensitive. Restricted to
+    // top-level required producers (triples / property paths) so a var that is
+    // only conditionally bound (UNION branch, OPTIONAL) is NOT declassified.
+    let self_produced: HashSet<VarId> = if sq.limit.is_none() && sq.offset.is_none() {
+        sq.patterns
+            .iter()
+            .filter(|p| matches!(p, Pattern::Triple(_) | Pattern::PropertyPath(_)))
+            .flat_map(Pattern::produced_vars)
+            .collect()
+    } else {
+        HashSet::new()
+    };
     let mut corr = HashSet::new();
     for (j, p) in siblings.iter().enumerate() {
         if j == self_idx {
             continue;
         }
         for v in p.produced_vars() {
-            if select.contains(&v) {
+            if select.contains(&v) && !self_produced.contains(&v) {
                 corr.insert(v);
             }
         }
