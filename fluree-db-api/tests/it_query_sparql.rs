@@ -635,6 +635,110 @@ async fn sparql_order_by_expression_dedup_only_group_by() {
 }
 
 #[tokio::test]
+async fn sparql_order_by_inline_aggregate_shared_with_select_alias() {
+    // `ORDER BY DESC(COUNT(?x))` with an explicit GROUP BY. The inline aggregate
+    // is hoisted and deduped against the SELECT alias `?c`, so it sorts by the
+    // same count without recomputing it.
+    assert_index_defaults();
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger = seed_people(&fluree, "people:main").await;
+
+    let query = r"
+        PREFIX person: <http://example.org/Person#>
+        SELECT ?handle (COUNT(?favNum) AS ?c)
+        WHERE {
+          ?person person:handle ?handle ;
+                  person:favNums ?favNum .
+        }
+        GROUP BY ?handle
+        ORDER BY DESC(COUNT(?favNum))
+        LIMIT 10
+    ";
+
+    let result = support::query_sparql(&fluree, &ledger, query)
+        .await
+        .unwrap();
+    let jsonld = result.to_jsonld(&ledger.snapshot).expect("to_jsonld");
+    assert_eq!(jsonld, json!([["jbob", 7], ["jdoe", 4], ["bbob", 1]]));
+}
+
+#[tokio::test]
+async fn sparql_order_by_inline_aggregate_not_selected() {
+    // `ORDER BY DESC(COUNT(?favNum))` where the aggregate is NOT in the SELECT.
+    // It must be hoisted into the grouping with its own synthetic output var so
+    // the rows order by a count that never appears in the output.
+    assert_index_defaults();
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger = seed_people(&fluree, "people:main").await;
+
+    let query = r"
+        PREFIX person: <http://example.org/Person#>
+        SELECT ?handle
+        WHERE {
+          ?person person:handle ?handle ;
+                  person:favNums ?favNum .
+        }
+        GROUP BY ?handle
+        ORDER BY DESC(COUNT(?favNum))
+    ";
+
+    let result = support::query_sparql(&fluree, &ledger, query)
+        .await
+        .unwrap();
+    let jsonld = result.to_jsonld(&ledger.snapshot).expect("to_jsonld");
+    // Counts: jbob 7, jdoe 4, bbob 1 → handles in that order, count not projected.
+    assert_eq!(jsonld, json!([["jbob"], ["jdoe"], ["bbob"]]));
+}
+
+#[tokio::test]
+async fn sparql_order_by_inline_aggregate_implicit_single_group() {
+    // No explicit GROUP BY: the aggregate in ORDER BY triggers implicit
+    // single-group aggregation (must not error).
+    assert_index_defaults();
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger = seed_people(&fluree, "people:main").await;
+
+    let query = r"
+        PREFIX person: <http://example.org/Person#>
+        SELECT (COUNT(?favNum) AS ?c)
+        WHERE { ?person person:favNums ?favNum }
+        ORDER BY DESC(COUNT(?favNum))
+    ";
+
+    let result = support::query_sparql(&fluree, &ledger, query)
+        .await
+        .unwrap();
+    let jsonld = result.to_jsonld(&ledger.snapshot).expect("to_jsonld");
+    // Total favNums across all people = 4 + 1 + 7 = 12 (single group).
+    assert_eq!(jsonld, json!([[12]]));
+}
+
+#[tokio::test]
+async fn sparql_order_by_inline_aggregate_in_compound_expression() {
+    // Aggregate nested inside a compound order expression: `DESC(COUNT(?x) * 2)`.
+    assert_index_defaults();
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger = seed_people(&fluree, "people:main").await;
+
+    let query = r"
+        PREFIX person: <http://example.org/Person#>
+        SELECT ?handle (COUNT(?favNum) AS ?c)
+        WHERE {
+          ?person person:handle ?handle ;
+                  person:favNums ?favNum .
+        }
+        GROUP BY ?handle
+        ORDER BY DESC(COUNT(?favNum) * 2)
+    ";
+
+    let result = support::query_sparql(&fluree, &ledger, query)
+        .await
+        .unwrap();
+    let jsonld = result.to_jsonld(&ledger.snapshot).expect("to_jsonld");
+    assert_eq!(jsonld, json!([["jbob", 7], ["jdoe", 4], ["bbob", 1]]));
+}
+
+#[tokio::test]
 async fn sparql_order_by_expression_count_by_predicate_not_dropped() {
     // Regression: the `?s ?p ?o` / GROUP BY ?p / COUNT(?s) shape can match the
     // stats (and predicate-object) count fast paths, which sort on

@@ -17,7 +17,7 @@ use fluree_db_query::parse::encode::IriEncoder;
 use fluree_db_query::sort::{SortDirection, SortSpec};
 use fluree_db_query::var_registry::VarId;
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use super::{LowerError, LoweringContext, Result};
@@ -37,12 +37,18 @@ pub(super) struct BaseModifiers {
     pub limit: Option<usize>,
     pub offset: Option<usize>,
     pub ordering: Vec<SortSpec>,
-    /// Synthetic `(var, expr)` binds produced by expression-based ORDER BY
-    /// conditions (e.g. `ORDER BY DESC(?a / ?b)`). Each `SortSpec` in
-    /// `ordering` that came from an expression references the matching
-    /// synthetic var here. The caller decides where the bind is evaluated
-    /// (pre-WHERE vs. post-aggregation); ASK discards them entirely.
+    /// Synthetic `(var, expr)` binds produced by aggregate-free expression
+    /// ORDER BY conditions (e.g. `ORDER BY DESC(?a / ?b)`), lowered eagerly.
+    /// Each `SortSpec` in `ordering` that came from an expression references the
+    /// matching synthetic var here (or in `deferred_order_exprs`).
     pub order_binds: Vec<(VarId, Expression)>,
+    /// Expression ORDER BY conditions that contain an inline aggregate
+    /// (e.g. `ORDER BY DESC(COUNT(?x))`). They cannot be lowered until aggregate
+    /// hoisting has produced the alias map, so `lower_base_modifiers` stashes the
+    /// synthetic sort var + raw AST expression here. `lower_solution_modifiers`
+    /// (SELECT) hoists their aggregates and lowers them into `order_binds`;
+    /// CONSTRUCT/DESCRIBE reject a non-empty list (no aggregation stage there).
+    pub deferred_order_exprs: Vec<(VarId, AstExpression)>,
 }
 
 /// Result of lowering solution modifiers.
@@ -155,8 +161,10 @@ impl<E: IriEncoder> LoweringContext<'_, E> {
         let mut having: Option<Expression> = None;
         let mut pre_group_binds = Vec::new();
 
-        // LIMIT, OFFSET, ORDER BY
-        let base = self.lower_base_modifiers(modifiers)?;
+        // LIMIT, OFFSET, ORDER BY. Aggregate-bearing ORDER BY expressions are
+        // stashed in `base.deferred_order_exprs` and lowered below, after the
+        // aggregate alias map exists.
+        let mut base = self.lower_base_modifiers(modifiers)?;
 
         // GROUP BY — supports both variables and expressions.
         // Expression GROUP BY like `GROUP BY (expr AS ?alias)` desugars to
@@ -173,20 +181,31 @@ impl<E: IriEncoder> LoweringContext<'_, E> {
             group_by = group_vars;
         }
 
+        // Aggregate-alias map shared by HAVING and aggregate-bearing ORDER BY
+        // hoisting. Seeded with SELECT aggregate aliases so both reuse them, and
+        // so the synthetic `?__inline_agg_N` names stay unique across both (the
+        // names are keyed off the shared map's length).
+        let needs_alias_map = modifiers.having.is_some() || !base.deferred_order_exprs.is_empty();
+        let mut aggregate_aliases: HashMap<String, VarId> = if needs_alias_map {
+            self.build_aggregate_aliases(select)?
+        } else {
+            HashMap::new()
+        };
+        // Aggregates hoisted out of HAVING and/or ORDER BY expressions.
+        let mut hoisted_aggregates: Vec<AggregateSpec> = Vec::new();
+
         // HAVING (may reference aggregate expressions)
-        let mut having_aggregates: Vec<AggregateSpec> = Vec::new();
         if let Some(ref having_clause) = modifiers.having {
-            let mut aggregate_aliases = self.build_aggregate_aliases(select)?;
             let mut having_pre_binds: Vec<Pattern> = Vec::new();
             for cond in &having_clause.conditions {
-                self.collect_having_aggregates(
+                self.collect_inline_aggregates(
                     cond,
                     &mut aggregate_aliases,
-                    &mut having_aggregates,
+                    &mut hoisted_aggregates,
                     &mut having_pre_binds,
                 )?;
             }
-            self.aggregate_aliases = Some(aggregate_aliases);
+            self.aggregate_aliases = Some(aggregate_aliases.clone());
             // Combine all HAVING conditions with AND
             let filter = self.lower_having_conditions(&having_clause.conditions)?;
             having = Some(filter);
@@ -194,11 +213,36 @@ impl<E: IriEncoder> LoweringContext<'_, E> {
             pre_group_binds.extend(having_pre_binds);
         }
 
+        // Deferred ORDER BY expressions containing inline aggregates
+        // (e.g. `ORDER BY DESC(COUNT(?x))`). Hoist their aggregates into the same
+        // map, then lower the expression with the alias map in scope so the
+        // inline aggregate resolves to its synthetic output var. The resulting
+        // order bind is applied by the operator tree's post-grouping stage.
+        if !base.deferred_order_exprs.is_empty() {
+            let deferred = std::mem::take(&mut base.deferred_order_exprs);
+            let mut order_pre_binds: Vec<Pattern> = Vec::new();
+            for (_, ast_expr) in &deferred {
+                self.collect_inline_aggregates(
+                    ast_expr,
+                    &mut aggregate_aliases,
+                    &mut hoisted_aggregates,
+                    &mut order_pre_binds,
+                )?;
+            }
+            self.aggregate_aliases = Some(aggregate_aliases.clone());
+            for (var_id, ast_expr) in &deferred {
+                let lowered = self.lower_expression(ast_expr)?;
+                base.order_binds.push((*var_id, lowered));
+            }
+            self.aggregate_aliases = None;
+            pre_group_binds.extend(order_pre_binds);
+        }
+
         // Extract aggregates from SELECT clause, then append any aggregates
-        // lifted out of HAVING.
+        // lifted out of HAVING / ORDER BY.
         let (mut aggregates, select_agg_binds) = self.extract_aggregates(select)?;
         pre_group_binds.extend(select_agg_binds);
-        aggregates.extend(having_aggregates);
+        aggregates.extend(hoisted_aggregates);
 
         // Auto-populate GROUP BY when aggregates present but no explicit GROUP BY
         // Per SPARQL semantics, all non-aggregated SELECT variables must be in GROUP BY
@@ -228,11 +272,14 @@ impl<E: IriEncoder> LoweringContext<'_, E> {
             .as_ref()
             .map(|clause| clause.value as usize);
         let mut order_binds: Vec<(VarId, Expression)> = Vec::new();
+        let mut deferred_order_exprs: Vec<(VarId, AstExpression)> = Vec::new();
         let ordering = match &modifiers.order_by {
             Some(order_by) => order_by
                 .conditions
                 .iter()
-                .map(|cond| self.lower_order_condition(cond, &mut order_binds))
+                .map(|cond| {
+                    self.lower_order_condition(cond, &mut order_binds, &mut deferred_order_exprs)
+                })
                 .collect::<Result<Vec<_>>>()?,
             None => Vec::new(),
         };
@@ -242,6 +289,7 @@ impl<E: IriEncoder> LoweringContext<'_, E> {
             offset,
             ordering,
             order_binds,
+            deferred_order_exprs,
         })
     }
 
@@ -251,13 +299,18 @@ impl<E: IriEncoder> LoweringContext<'_, E> {
     /// that variable. A non-trivial expression (`ORDER BY DESC(?a / ?b)`) is
     /// desugared to a synthetic `BIND(expr AS ?__order_by_N)`: the expression is
     /// evaluated once per solution into the synthetic var, which becomes the
-    /// sort key. The `(var, expr)` pair is pushed onto `order_binds` for the
-    /// caller to place in the pipeline (sorting an expression more than once —
-    /// e.g. inside the comparator — would re-evaluate it O(n log n) times).
+    /// sort key (sorting an expression inside the comparator would re-evaluate it
+    /// O(n log n) times).
+    ///
+    /// An expression that contains an inline aggregate (`ORDER BY DESC(COUNT(?x))`)
+    /// cannot be lowered yet — the aggregate alias map does not exist until
+    /// hoisting runs — so it is stashed in `deferred_order_exprs` and lowered
+    /// later by [`Self::lower_solution_modifiers`].
     fn lower_order_condition(
         &mut self,
         cond: &OrderCondition,
         order_binds: &mut Vec<(VarId, Expression)>,
+        deferred_order_exprs: &mut Vec<(VarId, AstExpression)>,
     ) -> Result<SortSpec> {
         let direction = match cond.direction {
             OrderDirection::Asc => SortDirection::Ascending,
@@ -283,13 +336,18 @@ impl<E: IriEncoder> LoweringContext<'_, E> {
                     })
                 }
                 _ => {
-                    // Expression-based ORDER BY: desugar to a synthetic BIND and
-                    // sort on its output variable.
-                    let lowered = self.lower_expression(expr)?;
+                    // Expression-based ORDER BY: sort on a synthetic var bound to
+                    // the expression.
                     let name = format!("?__order_by_{}", self.order_counter);
                     self.order_counter += 1;
                     let var_id = self.vars.get_or_insert(&name);
-                    order_binds.push((var_id, lowered));
+                    if self.expr_contains_aggregate(expr) {
+                        // Defer: needs aggregate hoisting before it can be lowered.
+                        deferred_order_exprs.push((var_id, expr.clone()));
+                    } else {
+                        let lowered = self.lower_expression(expr)?;
+                        order_binds.push((var_id, lowered));
+                    }
                     Ok(SortSpec {
                         var: var_id,
                         direction,

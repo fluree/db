@@ -234,6 +234,9 @@ impl<'a, E: IriEncoder> LoweringContext<'a, E> {
                     offset,
                     ordering,
                     order_binds,
+                    // Consumed in `lower_solution_modifiers` (lowered into
+                    // `order_binds` after aggregate hoisting); empty here.
+                    deferred_order_exprs: _,
                 } = lowered_modifiers.base;
                 let distinct = lowered_modifiers.distinct;
 
@@ -1459,6 +1462,47 @@ mod tests {
             !grouping.binds().any(|(var, _)| *var == sort_var),
             "order bind must not be merged into the aggregation post-binds"
         );
+    }
+
+    #[test]
+    fn test_order_by_inline_aggregate_dedups_with_select_alias() {
+        // `ORDER BY DESC(COUNT(?s))` reuses the SELECT alias's aggregate, so
+        // exactly one aggregate is computed and the order bind references it.
+        let (query, _vars) = lower_query_with_vars(
+            "PREFIX ex: <http://example.org/>
+             SELECT ?type (COUNT(?s) AS ?c) WHERE { ?s ex:type ?type }
+             GROUP BY ?type ORDER BY DESC(COUNT(?s))",
+        )
+        .unwrap();
+
+        assert_eq!(
+            aggregates_of(&query).len(),
+            1,
+            "COUNT(?s) must not be computed twice"
+        );
+        assert_eq!(query.order_binds.len(), 1, "expected one ORDER BY bind");
+        assert_eq!(query.ordering.len(), 1);
+        let (bind_var, _) = &query.order_binds[0];
+        assert_eq!(query.ordering[0].var, *bind_var);
+    }
+
+    #[test]
+    fn test_order_by_inline_aggregate_hoisted_when_not_selected() {
+        // `ORDER BY DESC(COUNT(?s))` with no aggregate in SELECT hoists a new
+        // aggregate into the grouping phase with a synthetic output var.
+        let (query, vars) = lower_query_with_vars(
+            "PREFIX ex: <http://example.org/>
+             SELECT ?type WHERE { ?s ex:type ?type }
+             GROUP BY ?type ORDER BY DESC(COUNT(?s))",
+        )
+        .unwrap();
+
+        let aggs = aggregates_of(&query);
+        assert_eq!(aggs.len(), 1, "expected one hoisted aggregate");
+        assert!(vars.name(aggs[0].output_var).starts_with("?__inline_agg_"));
+        assert_eq!(query.order_binds.len(), 1);
+        let (bind_var, _) = &query.order_binds[0];
+        assert_eq!(query.ordering[0].var, *bind_var);
     }
 
     #[test]

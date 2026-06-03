@@ -197,11 +197,13 @@ impl<E: IriEncoder> LoweringContext<'_, E> {
             offset,
             ordering,
             order_binds,
+            deferred_order_exprs,
         } = self.lower_base_modifiers(modifiers)?;
 
         // DESCRIBE restricts ORDER BY to target variables (see below); an
-        // expression-based ORDER BY would sort on a synthetic, non-target var.
-        if !order_binds.is_empty() {
+        // expression-based ORDER BY (aggregate-free or aggregate-bearing) would
+        // sort on a synthetic, non-target var.
+        if !order_binds.is_empty() || !deferred_order_exprs.is_empty() {
             return Err(LowerError::unsupported_form(
                 "DESCRIBE ORDER BY by expression",
                 span,
