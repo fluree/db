@@ -5,7 +5,7 @@
 
 use super::expr::Expression;
 use super::path::PropertyPath;
-use super::query::{GroupByClause, SelectVariables};
+use super::query::{SelectVariables, SolutionModifiers};
 use super::term::{Iri, ObjectTerm, PredicateTerm, SubjectTerm, Term, Var};
 use crate::span::SourceSpan;
 
@@ -254,31 +254,14 @@ pub struct SubSelect {
     pub variables: SelectVariables,
     /// The WHERE clause pattern
     pub pattern: Box<GraphPattern>,
-    /// GROUP BY clause (for aggregation)
-    pub group_by: Option<GroupByClause>,
-    /// ORDER BY variables (simplified - just variable names for now)
-    pub order_by: Vec<SubSelectOrderBy>,
-    /// True when the subquery's ORDER BY contained a non-trivial expression
-    /// (e.g. `ORDER BY (0 - ?x)`). Subquery expression ORDER BY is not yet
-    /// wired through the subquery operator, so lowering rejects it rather than
-    /// silently mis-sorting on a grabbed variable. Bare/bracketed variables
-    /// leave this `false`.
-    pub order_by_unsupported_expr: bool,
-    /// LIMIT value
-    pub limit: Option<u64>,
-    /// OFFSET value
-    pub offset: Option<u64>,
+    /// Solution modifiers (GROUP BY, HAVING, ORDER BY, LIMIT, OFFSET), parsed
+    /// with the same machinery as a top-level SELECT (`parse_solution_modifiers`)
+    /// and lowered through the same `lower_solution_modifiers` path, so a
+    /// subquery inherits HAVING, post-aggregation SELECT binds, and
+    /// expression/aggregate ORDER BY identically.
+    pub modifiers: SolutionModifiers,
     /// Source span
     pub span: SourceSpan,
-}
-
-/// Order by specification for subqueries.
-#[derive(Clone, Debug, PartialEq)]
-pub struct SubSelectOrderBy {
-    /// The variable to order by
-    pub var: Var,
-    /// True for descending, false for ascending
-    pub descending: bool,
 }
 
 #[cfg(test)]

@@ -394,7 +394,7 @@ fn test_subquery_with_limit() {
     let ast = assert_parses("SELECT * WHERE { { SELECT ?x WHERE { ?x ?p ?o } LIMIT 10 } }");
     if let QueryBody::Select(q) = &ast.body {
         if let GraphPattern::SubSelect { query, .. } = &q.where_clause.pattern {
-            assert_eq!(query.limit, Some(10));
+            assert_eq!(query.modifiers.limit.as_ref().map(|l| l.value), Some(10));
         } else {
             panic!("Expected SubSelect pattern");
         }
@@ -406,9 +406,17 @@ fn test_subquery_with_order_by() {
     let ast = assert_parses("SELECT * WHERE { { SELECT ?x WHERE { ?x ?p ?o } ORDER BY ?x } }");
     if let QueryBody::Select(q) = &ast.body {
         if let GraphPattern::SubSelect { query, .. } = &q.where_clause.pattern {
-            assert_eq!(query.order_by.len(), 1);
-            assert_eq!(query.order_by[0].var.name.as_ref(), "x");
-            assert!(!query.order_by[0].descending);
+            let order = query
+                .modifiers
+                .order_by
+                .as_ref()
+                .expect("Expected ORDER BY");
+            assert_eq!(order.conditions.len(), 1);
+            assert_eq!(order.conditions[0].direction, OrderDirection::Asc);
+            match &order.conditions[0].expr {
+                OrderExpr::Var(v) => assert_eq!(v.name.as_ref(), "x"),
+                other => panic!("Expected bare variable ORDER BY, got {other:?}"),
+            }
         } else {
             panic!("Expected SubSelect pattern");
         }
@@ -421,8 +429,13 @@ fn test_subquery_with_order_by_desc() {
         assert_parses("SELECT * WHERE { { SELECT ?x WHERE { ?x ?p ?o } ORDER BY DESC(?x) } }");
     if let QueryBody::Select(q) = &ast.body {
         if let GraphPattern::SubSelect { query, .. } = &q.where_clause.pattern {
-            assert_eq!(query.order_by.len(), 1);
-            assert!(query.order_by[0].descending);
+            let order = query
+                .modifiers
+                .order_by
+                .as_ref()
+                .expect("Expected ORDER BY");
+            assert_eq!(order.conditions.len(), 1);
+            assert_eq!(order.conditions[0].direction, OrderDirection::Desc);
         } else {
             panic!("Expected SubSelect pattern");
         }

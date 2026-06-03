@@ -20,23 +20,15 @@
 //! - If `?s` is bound in the parent, the subquery filters to only those `?s` values
 //! - Results are merged back to the parent solution
 
-use crate::aggregate::AggregateOperator;
 use crate::binding::{Batch, Binding};
 use crate::context::ExecutionContext;
-use crate::distinct::DistinctOperator;
 use crate::error::{QueryError, Result};
 use crate::execute::build_where_operators_seeded;
-use crate::groupby::GroupByOperator;
-use crate::having::HavingOperator;
 use crate::ir::SubqueryPattern;
-use crate::limit::LimitOperator;
-use crate::offset::OffsetOperator;
 use crate::operator::{
     compute_trimmed_vars, effective_schema, trim_batch, BoxedOperator, Operator, OperatorState,
 };
-use crate::project::ProjectOperator;
 use crate::seed::{EmptyOperator, SeedOperator};
-use crate::sort::SortOperator;
 use crate::temporal_mode::PlanningContext;
 use crate::var_registry::VarId;
 use async_trait::async_trait;
@@ -301,7 +293,7 @@ impl SubqueryOperator {
         };
 
         // Build full operator tree for subquery patterns (supports filters, optionals, union, etc.)
-        let mut operator: BoxedOperator = build_where_operators_seeded(
+        let where_op: BoxedOperator = build_where_operators_seeded(
             Some(seed),
             &self.subquery.patterns,
             self.stats.clone(),
@@ -309,38 +301,29 @@ impl SubqueryOperator {
             &self.planning,
         )?;
 
-        // Apply GROUP BY / aggregates / HAVING for subqueries that use them.
-        if let Some(grouping) = &self.subquery.grouping {
-            let group_by: Vec<_> = grouping.group_by_vars().collect();
-            let aggregates: Vec<_> = grouping.aggregates().cloned().collect();
-            operator = Box::new(GroupByOperator::new(operator, group_by));
-            if !aggregates.is_empty() {
-                operator = Box::new(AggregateOperator::new(operator, aggregates));
-            }
-            if let Some(having) = grouping.having().cloned() {
-                operator = Box::new(HavingOperator::new(operator, having));
-            }
-        }
-
-        // Project to subquery select list before DISTINCT/ORDER BY/OFFSET/LIMIT so those modifiers
-        // apply to the intended output shape.
-        if !self.subquery.select.is_empty() {
-            operator = Box::new(ProjectOperator::new(operator, self.subquery.select.clone()));
-        }
-
-        // Apply modifiers (distinct, orderBy, offset, limit) to the projected shape.
-        if self.subquery.distinct {
-            operator = Box::new(DistinctOperator::new(operator));
-        }
-        if !self.subquery.ordering.is_empty() {
-            operator = Box::new(SortOperator::new(operator, self.subquery.ordering.clone()));
-        }
-        if let Some(offset) = self.subquery.offset {
-            operator = Box::new(OffsetOperator::new(operator, offset));
-        }
-        if let Some(limit) = self.subquery.limit {
-            operator = Box::new(LimitOperator::new(operator, limit));
-        }
+        // Apply the shared solution-modifier tail — GROUP BY + aggregation,
+        // HAVING, post-aggregation binds, expression/aggregate ORDER-BY binds,
+        // sort-var validation, ORDER BY (sort *before* project, with safe top-k),
+        // PROJECT, DISTINCT, OFFSET, LIMIT — so a subquery inherits identical
+        // modifier semantics to a top-level SELECT (same code path).
+        //
+        // Projection trimming (`variable_deps`) and the streaming-group
+        // partition hint are skipped: the subquery runs once per correlated
+        // parent row, and its full select list flows back into the merge.
+        let select_vars: Option<&[VarId]> = (!self.subquery.select.is_empty())
+            .then_some(self.subquery.select.as_slice());
+        let mut operator = crate::execute::operator_tree::apply_solution_modifiers(
+            where_op,
+            self.subquery.grouping.as_ref(),
+            &self.subquery.order_binds,
+            &self.subquery.ordering,
+            select_vars,
+            self.subquery.distinct,
+            self.subquery.offset,
+            self.subquery.limit,
+            false,
+            None,
+        )?;
 
         // Execute and collect results
         operator.open(ctx).await?;

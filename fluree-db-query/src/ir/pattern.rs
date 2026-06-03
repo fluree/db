@@ -35,6 +35,13 @@ pub struct SubqueryPattern {
     pub distinct: bool,
     /// ORDER BY specs. Empty when the subquery is unordered.
     pub ordering: Vec<SortSpec>,
+    /// Expression-based ORDER BY binds (e.g. `ORDER BY DESC(?a / ?b)` or
+    /// `ORDER BY DESC(COUNT(?o))`). Mirrors [`crate::ir::Query::order_binds`]:
+    /// each `(var, expr)` is evaluated once per solution as a dedicated stage
+    /// after grouping/aggregation/HAVING/post-binds and before the sort, and
+    /// the matching [`SortSpec`] in `ordering` references the synthetic `var`.
+    /// Empty for JSON-LD subqueries (no expression-ORDER-BY surface syntax).
+    pub order_binds: Vec<(VarId, Expression)>,
     /// Optional aggregation phase (GROUP BY / aggregates / HAVING).
     pub grouping: Option<Grouping>,
 }
@@ -49,6 +56,7 @@ impl SubqueryPattern {
             offset: None,
             distinct: false,
             ordering: Vec::new(),
+            order_binds: Vec::new(),
             grouping: None,
         }
     }
@@ -74,6 +82,12 @@ impl SubqueryPattern {
     /// Set ORDER BY specs.
     pub fn with_ordering(mut self, specs: Vec<SortSpec>) -> Self {
         self.ordering = specs;
+        self
+    }
+
+    /// Set the expression-based ORDER BY binds (see [`Self::order_binds`]).
+    pub fn with_order_binds(mut self, order_binds: Vec<(VarId, Expression)>) -> Self {
+        self.order_binds = order_binds;
         self
     }
 

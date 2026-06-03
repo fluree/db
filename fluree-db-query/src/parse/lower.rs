@@ -1064,9 +1064,10 @@ enum SelectExprPlacement {
 ///     in via `post_bind_aliases` so the caller can chain dependencies).
 ///   - `Pre` otherwise.
 ///
-/// Both `lower_query` and `lower_subquery` call this. `lower_query` routes
-/// the result by placement; `lower_subquery` errors on `Post` because
-/// [`SubqueryPattern`] has no `post_binds` field.
+/// Both `lower_query` and `lower_subquery` call this and route the result by
+/// placement: `Pre` binds append to WHERE, `Post` binds ride inside the
+/// grouping's aggregation stage (applied by the shared `apply_solution_modifiers`
+/// tail).
 fn lower_select_expr_bind<E: IriEncoder>(
     expr: &UnresolvedExpression,
     alias: &Arc<str>,
@@ -1141,17 +1142,20 @@ fn lower_subquery<E: IriEncoder>(
     // Lower WHERE patterns, then append select-expression BINDs.
     let mut patterns = lower_unresolved_patterns(&subquery.patterns, encoder, vars, pp_counter)?;
 
-    // Subqueries do not currently expose post-aggregation binds, so we use
-    // the shared `lower_select_expr_bind` helper but reject any column it
-    // classifies as `Post`. This mirrors the limitation of `SubqueryPattern`
-    // (no `post_binds` field).
+    // SELECT-expression binds split into pre-aggregation (appended to WHERE)
+    // and post-aggregation (referencing an aggregate output or an earlier
+    // post-bind). Post-binds ride inside the grouping's aggregation stage and
+    // are applied by the shared `apply_solution_modifiers` tail — the same
+    // channel the top-level SELECT uses, so subquery post-aggregation binds
+    // now work identically.
     let aggregate_output_vars: std::collections::HashSet<VarId> = subquery
         .options
         .aggregates
         .iter()
         .map(|spec| vars.get_or_insert(&spec.output_var))
         .collect();
-    let empty_post_binds: std::collections::HashSet<VarId> = std::collections::HashSet::new();
+    let mut post_binds: Vec<(VarId, Expression)> = Vec::new();
+    let mut post_bind_aliases: std::collections::HashSet<VarId> = std::collections::HashSet::new();
     for column in columns {
         if let UnresolvedColumn::Computation { expr, alias } = column {
             let (placement, alias_var, lowered_expr) = lower_select_expr_bind(
@@ -1161,14 +1165,12 @@ fn lower_subquery<E: IriEncoder>(
                 vars,
                 pp_counter,
                 &aggregate_output_vars,
-                &empty_post_binds,
+                &post_bind_aliases,
             )?;
             match placement {
                 SelectExprPlacement::Post => {
-                    return Err(ParseError::InvalidSelect(format!(
-                        "select expression '{alias}' references an aggregate output; \
-                         post-aggregation BINDs are not supported inside subqueries"
-                    )));
+                    post_binds.push((alias_var, lowered_expr));
+                    post_bind_aliases.insert(alias_var);
                 }
                 SelectExprPlacement::Pre => {
                     patterns.push(Pattern::Bind {
@@ -1202,10 +1204,10 @@ fn lower_subquery<E: IriEncoder>(
         sq = sq.with_ordering(sort_specs);
     }
 
-    // GROUP BY / aggregates / HAVING (needed for subqueries used in filters/unions).
-    // Subqueries have no post-aggregation bind channel; the loop above
-    // already rejects any SELECT computation classified as `Post`.
-    sq.grouping = lower_grouping(&subquery.options, vars, Vec::new())?;
+    // GROUP BY / aggregates / HAVING / post-aggregation binds (needed for
+    // subqueries used in filters/unions). Post-binds collected above ride inside
+    // the grouping's aggregation stage.
+    sq.grouping = lower_grouping(&subquery.options, vars, post_binds)?;
 
     Ok(sq)
 }
@@ -1730,9 +1732,8 @@ fn lower_ordering(opts: &UnresolvedOptions, vars: &mut VarRegistry) -> Vec<SortS
 /// post-aggregation binds).
 ///
 /// `post_binds` are derived bindings that fire after every aggregate has
-/// been computed; they ride inside the resulting `Aggregation`. Subquery
-/// callers pass `Vec::new()` because [`SubqueryPattern`] has no post-bind
-/// channel.
+/// been computed; they ride inside the resulting `Aggregation`. Both top-level
+/// and subquery callers populate them from post-aggregation SELECT expressions.
 fn lower_grouping(
     opts: &UnresolvedOptions,
     vars: &mut VarRegistry,

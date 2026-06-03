@@ -1,7 +1,6 @@
 //! Graph pattern parsing: WHERE, OPTIONAL, UNION, MINUS, FILTER, BIND, VALUES, subqueries.
 
-use crate::ast::expr::Expression;
-use crate::ast::pattern::{GraphName, ServiceEndpoint, SubSelect, SubSelectOrderBy};
+use crate::ast::pattern::{GraphName, ServiceEndpoint, SubSelect};
 use crate::ast::query::SelectVariables;
 use crate::ast::{GraphPattern, Term, Var, WhereClause};
 use crate::diag::{DiagCode, Diagnostic};
@@ -641,9 +640,11 @@ impl super::Parser<'_> {
 
         let pattern = self.parse_group_graph_pattern()?;
 
-        // Parse solution modifiers (GROUP BY, ORDER BY, LIMIT, OFFSET)
-        let (group_by, order_by, limit, offset, order_by_unsupported_expr) =
-            self.parse_subquery_modifiers();
+        // Parse solution modifiers (GROUP BY, HAVING, ORDER BY, LIMIT, OFFSET)
+        // with the same machinery as a top-level SELECT, so subqueries inherit
+        // HAVING and expression/aggregate ORDER BY. `parse_solution_modifiers`
+        // stops at the first non-modifier token (here, the closing `}`).
+        let modifiers = self.parse_solution_modifiers();
 
         // Expect closing brace for the subquery
         if !self.stream.match_token(&TokenKind::RBrace) {
@@ -658,11 +659,7 @@ impl super::Parser<'_> {
             reduced,
             variables,
             pattern: Box::new(pattern),
-            group_by,
-            order_by,
-            order_by_unsupported_expr,
-            limit,
-            offset,
+            modifiers,
             span,
         };
 
@@ -670,121 +667,5 @@ impl super::Parser<'_> {
             query: Box::new(subquery),
             span,
         })
-    }
-
-    /// Parse solution modifiers for a subquery (GROUP BY, ORDER BY, LIMIT, OFFSET).
-    ///
-    /// Returns (group_by, order_by, limit, offset).
-    pub(super) fn parse_subquery_modifiers(
-        &mut self,
-    ) -> (
-        Option<crate::ast::query::GroupByClause>,
-        Vec<SubSelectOrderBy>,
-        Option<u64>,
-        Option<u64>,
-        bool,
-    ) {
-        let mut order_by = Vec::new();
-        let mut limit = None;
-        let mut offset = None;
-        // Set when a subquery ORDER BY contains a non-trivial expression, which
-        // lowering rejects (see `SubSelect::order_by_unsupported_expr`).
-        let mut order_by_unsupported_expr = false;
-
-        // GROUP BY
-        let group_by = if self.stream.check_keyword(TokenKind::KwGroupBy) {
-            self.parse_group_by()
-        } else {
-            None
-        };
-
-        // HAVING — not yet supported in subqueries; emit error instead of silently skipping.
-        if self.stream.check_keyword(TokenKind::KwHaving) {
-            self.stream
-                .error_at_current("HAVING is not yet supported in subqueries");
-            self.stream.advance();
-            self.skip_parenthesized_content();
-        }
-
-        // ORDER BY
-        if self.stream.check_keyword(TokenKind::KwOrderBy) {
-            self.stream.advance(); // consume ORDER
-            self.stream.match_keyword(TokenKind::KwBy); // consume BY
-
-            // Parse order conditions (simplified: just variables)
-            loop {
-                let descending = if self.stream.match_keyword(TokenKind::KwDesc) {
-                    true
-                } else {
-                    self.stream.match_keyword(TokenKind::KwAsc);
-                    false
-                };
-
-                // Parenthesized order condition. Parse the full expression so a
-                // bracketed bare variable `(?v)` keeps working, but reject a
-                // genuine expression `(0 - ?v)` instead of silently grabbing its
-                // first variable and mis-sorting (subquery ORDER BY desugaring
-                // is not yet wired through the subquery operator).
-                if self.stream.check(&TokenKind::LParen) {
-                    let expr_start = self.stream.current_span();
-                    self.stream.advance(); // consume (
-                    match parse_expression(self.stream) {
-                        Ok(e) => {
-                            if !self.stream.match_token(&TokenKind::RParen) {
-                                self.stream.error_at_current("expected ')'");
-                            }
-                            match e.unwrap_bracketed() {
-                                Expression::Var(v) => order_by.push(SubSelectOrderBy {
-                                    var: v.clone(),
-                                    descending,
-                                }),
-                                _ => {
-                                    // Flag for lowering to reject (a parser
-                                    // diagnostic alone is swallowed once an AST
-                                    // is recovered). Also record a diagnostic for
-                                    // tooling/IDE feedback.
-                                    order_by_unsupported_expr = true;
-                                    self.stream.error_at(
-                                        "Expression-based ORDER BY is not yet supported in subqueries; \
-                                         alias the expression in the inner SELECT and ORDER BY the alias",
-                                        expr_start.union(self.stream.previous_span()),
-                                    );
-                                }
-                            }
-                        }
-                        Err(msg) => {
-                            self.stream.error_at_current(&msg);
-                        }
-                    }
-                } else if let Some((name, span)) = self.stream.consume_var() {
-                    order_by.push(SubSelectOrderBy {
-                        var: Var::new(name.as_ref(), span),
-                        descending,
-                    });
-                } else {
-                    break;
-                }
-            }
-        }
-
-        // LIMIT
-        if self.stream.match_keyword(TokenKind::KwLimit) {
-            if let Some((n, _)) = self.stream.consume_integer() {
-                if n >= 0 {
-                    limit = Some(n as u64);
-                }
-            }
-        }
-
-        // OFFSET
-        if self.stream.match_keyword(TokenKind::KwOffset) {
-            if let Some((n, _)) = self.stream.consume_integer() {
-                if n >= 0 {
-                    offset = Some(n as u64);
-                }
-            }
-        }
-
-        (group_by, order_by, limit, offset, order_by_unsupported_expr)
     }
 }

@@ -20,7 +20,7 @@ use fluree_db_query::var_registry::VarId;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
-use super::{LowerError, LoweringContext, Result};
+use super::{LoweringContext, Result};
 
 /// Result of lowering SELECT expression binds.
 pub(super) struct SelectBinds {
@@ -416,28 +416,26 @@ impl<E: IriEncoder> LoweringContext<'_, E> {
 
     /// Lower a SPARQL subquery (SubSelect) to the IR.
     ///
-    /// Subqueries have the form: `{ SELECT ?vars WHERE { ... } GROUP BY ?v LIMIT n }`
-    /// Supports aggregate expressions like `(COUNT(?x) AS ?count)` in the SELECT clause.
+    /// Subqueries have the form: `{ SELECT ?vars WHERE { ... } GROUP BY ?v
+    /// HAVING (..) ORDER BY (..) LIMIT n }`. This mirrors the top-level SELECT
+    /// lowering — SELECT-expression binds, GROUP BY / aggregates / HAVING, and
+    /// expression/aggregate ORDER BY all go through the same shared helpers
+    /// (`lower_select_expression_binds`, `lower_solution_modifiers`) — so a
+    /// subquery inherits exactly the same modifier semantics as a top-level
+    /// query. The resulting `SubqueryPattern` is executed per correlated parent
+    /// row by `SubqueryOperator`, which applies the shared solution-modifier
+    /// tail (`apply_solution_modifiers`).
     pub(super) fn lower_subselect(
         &mut self,
         subselect: &SubSelect,
         _span: SourceSpan,
     ) -> Result<Vec<Pattern>> {
-        // Expression-based ORDER BY inside a subquery is not yet supported
-        // (the subquery operator sorts the projected output, with no stage to
-        // evaluate a synthetic key). Reject rather than silently mis-sort.
-        if subselect.order_by_unsupported_expr {
-            return Err(LowerError::unsupported_form(
-                "expression-based ORDER BY in a subquery",
-                subselect.span,
-            ));
-        }
-
-        // Lower WHERE patterns (mut: expression GROUP BY may append pre-group BINDs)
+        // Lower WHERE patterns (mut: SELECT-expression / GROUP BY / aggregate-
+        // input BINDs are appended below, just as in the top-level pipeline).
         let mut patterns = self.lower_graph_pattern(&subselect.pattern)?;
 
-        // Build a temporary SelectClause so we can reuse extract_aggregates /
-        // collect_non_aggregate_select_vars which operate on SelectClause.
+        // Build a SelectClause so the shared SELECT/modifier lowering applies.
+        // REDUCED is treated as DISTINCT (handled when assembling the pattern).
         let select_clause = SelectClause {
             modifier: if subselect.distinct {
                 Some(SelectModifier::Distinct)
@@ -450,13 +448,12 @@ impl<E: IriEncoder> LoweringContext<'_, E> {
             span: subselect.span,
         };
 
-        // Lower SELECT variables
+        // Projected variable list.
         //
-        // IMPORTANT: In the query engine, an empty select list does NOT mean "SELECT *".
-        // It means "select no variables", which yields no output schema and therefore no rows.
-        //
-        // For SPARQL `SELECT *`, we approximate the spec by selecting all variables referenced
-        // by the subquery's WHERE patterns (in stable encounter order).
+        // IMPORTANT: In the query engine, an empty select list does NOT mean
+        // "SELECT *" — it means "select no variables". For SPARQL `SELECT *` we
+        // approximate the spec by selecting all variables produced by the
+        // (just-lowered) WHERE patterns, in stable encounter order.
         let select: Vec<VarId> = match &subselect.variables {
             SelectVariables::Star => {
                 let mut seen: HashSet<VarId> = HashSet::new();
@@ -474,90 +471,62 @@ impl<E: IriEncoder> LoweringContext<'_, E> {
                 let mut result = Vec::with_capacity(vars.len());
                 for var in vars {
                     match var {
-                        SelectVariable::Var(v) => {
-                            result.push(self.register_var(v));
-                        }
-                        SelectVariable::Expr { alias, .. } => {
-                            result.push(self.register_var(alias));
-                        }
+                        SelectVariable::Var(v) => result.push(self.register_var(v)),
+                        SelectVariable::Expr { alias, .. } => result.push(self.register_var(alias)),
                     }
                 }
                 result
             }
         };
 
-        // Extract aggregates from SELECT clause (e.g. COUNT(?x) AS ?count)
-        let (aggregates, agg_binds) = self.extract_aggregates(&select_clause)?;
+        // SELECT-expression binds: pre-aggregation ones append to WHERE; post-
+        // aggregation ones (referencing an aggregate alias) ride in the grouping.
+        let aggregate_aliases = self.collect_aggregate_alias_names(&select_clause);
+        let select_binds = self.lower_select_expression_binds(&select_clause, &aggregate_aliases)?;
+        patterns.extend(select_binds.pre);
 
-        // Lower GROUP BY (expression GROUP BY produces pre-group BINDs)
-        let mut group_vars = Vec::new();
-        if let Some(ref group_by) = subselect.group_by {
-            for cond in &group_by.conditions {
-                let (var_id, bind_pattern) = self.lower_group_condition(cond)?;
-                group_vars.push(var_id);
-                if let Some(pattern) = bind_pattern {
-                    patterns.push(pattern);
-                }
-            }
-        }
+        // Solution modifiers (GROUP BY / HAVING / ORDER BY / LIMIT / OFFSET /
+        // aggregates) through the same path as a top-level SELECT. This lowers
+        // HAVING, hoists inline aggregates from HAVING / ORDER BY, and produces
+        // expression-ORDER-BY binds — all previously dropped or rejected here.
+        let lowered = self.lower_solution_modifiers(&subselect.modifiers, &select_clause)?;
+        patterns.extend(lowered.pre_group_binds);
+        let BaseModifiers {
+            limit,
+            offset,
+            ordering,
+            order_binds,
+            // Consumed by `lower_solution_modifiers` (lowered into `order_binds`
+            // after aggregate hoisting); always empty here.
+            deferred_order_exprs: _,
+        } = lowered.base;
 
-        // Aggregate expression inputs (e.g. SUM(YEAR(?o))) are desugared to
-        // pre-aggregation BIND patterns + aggregate over the synthetic var.
-        patterns.extend(agg_binds);
-
-        // Build SubqueryPattern (after injecting any pre-group BINDs into patterns)
+        // Assemble the SubqueryPattern. Post-aggregation SELECT binds ride inside
+        // the grouping's aggregation stage; expression/aggregate ORDER BY binds
+        // ride on `order_binds` (a dedicated post-grouping stage in the shared
+        // modifier tail) so they evaluate uniformly with or without grouping.
         let mut sq = SubqueryPattern::new(select, patterns);
-
-        // Auto-populate GROUP BY when aggregates present but no explicit GROUP BY.
-        // Per SPARQL semantics, all non-aggregated SELECT variables must be grouped.
-        if !aggregates.is_empty() && group_vars.is_empty() {
-            group_vars = self.collect_non_aggregate_select_vars(&select_clause);
-        }
-
-        // Lift GROUP BY / aggregates into the SubqueryPattern's grouping
-        // phase. Subselect HAVING isn't lowered here (its surface syntax is
-        // captured upstream and would require its own lowering); same for
-        // post-aggregation binds.
-        if let Some(grouping) = Grouping::assemble(group_vars, aggregates, Vec::new(), None) {
+        if let Some(grouping) = Grouping::assemble(
+            lowered.group_by,
+            lowered.aggregates,
+            select_binds.post,
+            lowered.having,
+        ) {
             sq = sq.with_grouping(grouping);
         }
-
-        // Apply LIMIT
-        if let Some(limit) = subselect.limit {
-            sq = sq.with_limit(limit as usize);
+        sq = sq.with_order_binds(order_binds);
+        if !ordering.is_empty() {
+            sq = sq.with_ordering(ordering);
         }
-
-        // Apply OFFSET
-        if let Some(offset) = subselect.offset {
-            sq = sq.with_offset(offset as usize);
+        if let Some(limit) = limit {
+            sq = sq.with_limit(limit);
         }
-
-        // Apply DISTINCT
-        if subselect.distinct {
+        if let Some(offset) = offset {
+            sq = sq.with_offset(offset);
+        }
+        // DISTINCT (REDUCED is treated as DISTINCT).
+        if lowered.distinct || subselect.reduced {
             sq = sq.with_distinct();
-        }
-
-        // Note: REDUCED is treated as DISTINCT for simplicity
-        if subselect.reduced {
-            sq = sq.with_distinct();
-        }
-
-        // Apply ORDER BY
-        if !subselect.order_by.is_empty() {
-            let mut sort_specs = Vec::with_capacity(subselect.order_by.len());
-            for order in &subselect.order_by {
-                let var_id = self.register_var(&order.var);
-                let direction = if order.descending {
-                    SortDirection::Descending
-                } else {
-                    SortDirection::Ascending
-                };
-                sort_specs.push(SortSpec {
-                    var: var_id,
-                    direction,
-                });
-            }
-            sq = sq.with_ordering(sort_specs);
         }
 
         Ok(vec![Pattern::Subquery(sq)])
