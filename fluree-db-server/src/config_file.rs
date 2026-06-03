@@ -156,6 +156,8 @@ pub struct PeerReconnectFileConfig {
 pub struct McpFileConfig {
     pub enabled: Option<bool>,
     pub auth_trusted_issuers: Option<Vec<String>>,
+    /// Byte budget for the MCP `sparql_query` Agent JSON envelope.
+    pub agent_json_max_bytes: Option<usize>,
 }
 
 #[derive(Debug, Default, Clone, Deserialize, Serialize)]
@@ -399,6 +401,7 @@ pub const CONFIG_FILE_ARG_IDS: &[&str] = &[
     "peer_reconnect_multiplier",
     "mcp_enabled",
     "mcp_auth_trusted_issuers",
+    "mcp_agent_json_max_bytes",
     "storage_proxy_enabled",
     "storage_proxy_trusted_issuers",
     "storage_proxy_default_identity",
@@ -701,6 +704,11 @@ pub fn apply_to_server_config(
         if is_default("mcp_auth_trusted_issuers") {
             if let Some(ref v) = mcp.auth_trusted_issuers {
                 config.mcp_auth_trusted_issuers = v.clone();
+            }
+        }
+        if is_default("mcp_agent_json_max_bytes") {
+            if let Some(v) = mcp.agent_json_max_bytes {
+                config.mcp_agent_json_max_bytes = v;
             }
         }
     }

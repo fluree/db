@@ -78,6 +78,13 @@ pub const DEFAULT_JWKS_CACHE_TTL: u64 = 300;
 
 pub const DEFAULT_MCP_ENABLED: bool = false;
 
+/// Byte budget for the MCP `sparql_query` Agent JSON envelope (32 KB).
+///
+/// MCP tool calls carry no per-request headers (unlike the HTTP `Fluree-Max-Bytes`
+/// header), so the budget is server-configured. Results exceeding it are truncated
+/// with `hasMore: true`.
+pub const DEFAULT_MCP_AGENT_JSON_MAX_BYTES: usize = 32_768;
+
 // ── Peer ────────────────────────────────────────────────────────────
 
 pub const DEFAULT_PEER_ROLE: &str = "transaction";

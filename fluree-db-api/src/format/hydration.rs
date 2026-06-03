@@ -794,15 +794,20 @@ impl<'a> HydrationFormatter<'a> {
             // The `@id` of THIS subject: prefer the canonical IRI from a
             // multi-ledger `IriMatch` root over decoding the SID against this
             // formatter's single-snapshot dict, which would mis-decode a SID
-            // that originated in a different ledger (issue #1259). `compact_iri`
+            // that originated in a different ledger (issue #1259). The compaction
             // is a pure context operation, independent of the namespace dict.
             // `root_iri` is only ever set for the root subject; nested refs
             // (recursive calls below) pass `None` and decode their SID against
             // the ledger whose flakes produced them.
+            //
+            // `@id` is a node-identifier position, so compaction must go through
+            // the `compact_id_*` path (`@base` + explicit prefixes only); using
+            // the `@vocab`-applying path would non-conformantly shorten the IRI
+            // to a bare term when it falls under `@vocab` (issue #1280).
             let id_json = |compactor: &IriCompactor| -> Result<JsonValue> {
                 Ok(json!(match root_iri.as_deref() {
-                    Some(iri) => compactor.compact_iri(iri)?,
-                    None => compactor.compact_sid(sid)?,
+                    Some(iri) => compactor.compact_id_iri(iri),
+                    None => compactor.compact_id_sid(sid)?,
                 }))
             };
 
@@ -1001,7 +1006,7 @@ impl<'a> HydrationFormatter<'a> {
             // No view could resolve the subject → bare canonical @id.
             match merged {
                 Some(v) => Ok(v),
-                None => Ok(json!({ "@id": self.compactor.compact_iri(&iri)? })),
+                None => Ok(json!({ "@id": self.compactor.compact_id_iri(&iri) })),
             }
         }
         .boxed()
@@ -1100,7 +1105,9 @@ impl<'a> HydrationFormatter<'a> {
                                 .await?,
                             ),
                             None => {
-                                values.push(json!({ "@id": self.compactor.compact_sid(ref_sid)? }));
+                                values.push(
+                                    json!({ "@id": self.compactor.compact_id_sid(ref_sid)? }),
+                                );
                             }
                         }
                     }
@@ -1143,7 +1150,7 @@ impl<'a> HydrationFormatter<'a> {
                 ),
                 None => {
                     // No expansion - just @id
-                    values.push(json!({ "@id": self.compactor.compact_sid(subject_sid)? }));
+                    values.push(json!({ "@id": self.compactor.compact_id_sid(subject_sid)? }));
                 }
             }
         }
@@ -1212,7 +1219,7 @@ impl<'a> HydrationFormatter<'a> {
                 FlakeValue::Null => Ok(JsonValue::Null),
                 FlakeValue::Ref(sid) => {
                     // This shouldn't happen for literals, but handle gracefully
-                    Ok(json!({ "@id": self.compactor.compact_sid(sid)? }))
+                    Ok(json!({ "@id": self.compactor.compact_id_sid(sid)? }))
                 }
                 // Extended numeric types - serialize as string
                 FlakeValue::BigInt(n) => Ok(JsonValue::String(n.to_string())),
@@ -1256,7 +1263,7 @@ impl<'a> HydrationFormatter<'a> {
             FlakeValue::Json(json_str) => JsonValue::String(json_str.clone()), // Fallback for non-@json context
             FlakeValue::Null => return Ok(JsonValue::Null),
             FlakeValue::Ref(sid) => {
-                return Ok(json!({ "@id": self.compactor.compact_sid(sid)? }));
+                return Ok(json!({ "@id": self.compactor.compact_id_sid(sid)? }));
             }
             // Extended numeric types - serialize as string with @type
             FlakeValue::BigInt(n) => JsonValue::String(n.to_string()),
@@ -1355,7 +1362,9 @@ impl<'a> HydrationFormatter<'a> {
                 serde_json::from_str::<JsonValue>(s).unwrap_or_else(|_| json!(s))
             }
             FlakeValue::Null => return Ok(JsonValue::Null),
-            FlakeValue::Ref(sid) => return Ok(json!({ "@id": self.compactor.compact_sid(sid)? })),
+            FlakeValue::Ref(sid) => {
+                return Ok(json!({ "@id": self.compactor.compact_id_sid(sid)? }))
+            }
             FlakeValue::BigInt(n) => json!(n.to_string()),
             FlakeValue::Decimal(d) => json!(d.to_string()),
             FlakeValue::DateTime(dt) => json!(dt.to_string()),
@@ -1470,7 +1479,7 @@ impl<'a> HydrationFormatter<'a> {
                 "@json should have been handled above".to_string(),
             )),
             FlakeValue::Null => Ok(JsonValue::Null),
-            FlakeValue::Ref(sid) => Ok(json!({ "@id": self.compactor.compact_sid(sid)? })),
+            FlakeValue::Ref(sid) => Ok(json!({ "@id": self.compactor.compact_id_sid(sid)? })),
             FlakeValue::BigInt(n) => Ok(JsonValue::String(n.to_string())),
             FlakeValue::Decimal(d) => Ok(JsonValue::String(d.to_string())),
             FlakeValue::DateTime(dt) => Ok(JsonValue::String(dt.to_string())),
