@@ -90,6 +90,12 @@ pub fn fold_equijoin_filters(query: &mut Query, stats: Option<&StatsView>) {
                 }
                 expr.substitute_var(drop, keep);
             }
+            // The post-query VALUES clause lives outside `patterns`; it must be
+            // unified too, or a `VALUES ?y { … }` on the dropped side would be
+            // left referencing a variable the join no longer produces.
+            if let Some(post_values) = &mut query.post_values {
+                post_values.substitute_var(drop, keep);
+            }
         }
     }
 
@@ -424,6 +430,54 @@ mod tests {
         let mut query = shared_feature_query(Function::Eq);
         fold_equijoin_filters(&mut query, None);
         assert_eq!(query.patterns.len(), 3);
+    }
+
+    #[test]
+    fn rewrites_post_values_on_dropped_var() {
+        // `{ ?s1 feature ?x . ?s2 feature ?y . FILTER(?x = ?y) } VALUES ?y { … }`
+        // with `?x` projected. Folding drops `?y` (renamed to `?x`); the
+        // post-query VALUES must follow, or it would constrain a variable the
+        // unified join no longer produces.
+        let s1 = VarId(0);
+        let s2 = VarId(1);
+        let x = VarId(2);
+        let y = VarId(3);
+        let feat = feature_pred();
+        let patterns = vec![
+            Pattern::Triple(TriplePattern::new(
+                Ref::Var(s1),
+                Ref::Sid(feat.clone()),
+                Term::Var(x),
+            )),
+            Pattern::Triple(TriplePattern::new(Ref::Var(s2), Ref::Sid(feat), Term::Var(y))),
+            Pattern::Filter(Expression::Call {
+                func: Function::Eq,
+                args: vec![Expression::Var(x), Expression::Var(y)],
+            }),
+        ];
+        let mut query = Query {
+            context: ParsedContext::default(),
+            orig_context: None,
+            output: QueryOutput::select_all(vec![x]),
+            patterns,
+            reasoning: ReasoningConfig::default(),
+            grouping: None,
+            ordering: Vec::new(),
+            order_binds: Vec::new(),
+            limit: None,
+            offset: None,
+            post_values: Some(Pattern::Values {
+                vars: vec![y],
+                rows: Vec::new(),
+            }),
+        };
+        fold_equijoin_filters(&mut query, Some(&stats_with_feature_ref_only(true)));
+
+        assert_eq!(query.patterns.len(), 2);
+        match &query.post_values {
+            Some(Pattern::Values { vars, .. }) => assert_eq!(vars, &vec![x]),
+            other => panic!("expected post-query VALUES, got {other:?}"),
+        }
     }
 
     #[test]
