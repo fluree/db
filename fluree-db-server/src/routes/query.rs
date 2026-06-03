@@ -149,13 +149,119 @@ fn has_policy_opts(query_json: &JsonValue) -> bool {
         || opts.get("policy").is_some()
 }
 
+/// Extract a representative ledger identifier from a `from` / `fromNamed`
+/// value of any supported shape.
+///
+/// Shapes handled (see `requires_dataset_features` and `parse_dataset_spec`):
+/// - string: `"ledger:main"` (optionally with an `@t:` / `#graph` suffix)
+/// - array: `["a:main", "b:main"]` or `[{"@id": "a"}, ...]` — first element
+/// - object `from`: `{"@id": "ledger:main@t:5", ...}` — the `@id`
+/// - object `fromNamed`: `{"alias": <source>, ...}` — first map value
+///
+/// Returns the first concrete ledger string found, or `None` if the value
+/// carries no resolvable identifier. This is used only to pick a ledger for
+/// auth scoping and span recording; the full multi-graph dataset is resolved
+/// later by `parse_dataset_spec` in the dataset execution path.
+fn first_ledger_identifier(value: &JsonValue) -> Option<String> {
+    match value {
+        JsonValue::String(s) => Some(s.clone()),
+        JsonValue::Array(items) => items.iter().find_map(first_ledger_identifier),
+        JsonValue::Object(map) => map
+            .get("@id")
+            .and_then(JsonValue::as_str)
+            .map(str::to_string)
+            // `fromNamed` map form: { alias -> source }. No `@id`, so fall
+            // back to the first source value that yields an identifier.
+            .or_else(|| map.values().find_map(first_ledger_identifier)),
+        _ => None,
+    }
+}
+
+/// Collect **every** concrete ledger identifier a `from` / `fromNamed` value
+/// references, across all supported shapes.
+///
+/// Unlike [`first_ledger_identifier`] (which returns a single representative
+/// id for span recording), this enumerates all of them so the bearer
+/// ledger-scope check can authorize every ledger a multi-default-graph or
+/// named-graph query will actually read — not just the first. Mirrors the
+/// shape handling of `first_ledger_identifier`: an object with `@id` is a
+/// single source; otherwise its values are sources (`fromNamed` map form).
+fn collect_ledger_identifiers(value: &JsonValue, out: &mut Vec<String>) {
+    match value {
+        JsonValue::String(s) => out.push(s.clone()),
+        JsonValue::Array(items) => {
+            for item in items {
+                collect_ledger_identifiers(item, out);
+            }
+        }
+        JsonValue::Object(map) => {
+            if let Some(id) = map.get("@id").and_then(JsonValue::as_str) {
+                out.push(id.to_string());
+            } else {
+                for v in map.values() {
+                    collect_ledger_identifiers(v, out);
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Enforce bearer ledger-scope over **all** ledgers a query's `from` /
+/// `fromNamed` references, not just the representative one.
+///
+/// Unsigned bearer tokens may be scoped to a subset of ledgers. A
+/// multi-default-graph (`from: ["a","b"]`) or named-graph (`fromNamed`) query
+/// must be rejected if it touches any ledger outside that scope — otherwise a
+/// token scoped to `a` could read `b` by piggy-backing it onto the dataset.
+/// Rejected with 404 (not 403) to avoid leaking ledger existence, matching the
+/// single-query and multi-query-envelope responses.
+///
+/// No-op for signed requests and unauthenticated (no-bearer) requests; those
+/// are handled by the surrounding data-auth gate and per-ledger policy.
+fn enforce_bearer_dataset_scope(
+    query_json: &JsonValue,
+    bearer: &MaybeDataBearer,
+    is_signed: bool,
+    span: &tracing::Span,
+) -> Result<()> {
+    let Some(principal) = bearer.0.as_ref() else {
+        return Ok(());
+    };
+    if is_signed {
+        return Ok(());
+    }
+
+    let mut ids: Vec<String> = Vec::new();
+    if let Some(from) = query_json.get("from") {
+        collect_ledger_identifiers(from, &mut ids);
+    }
+    if let Some(named) = query_json
+        .get("fromNamed")
+        .or_else(|| query_json.get("from-named"))
+    {
+        collect_ledger_identifiers(named, &mut ids);
+    }
+
+    for raw in ids {
+        // Strip any `@t:` / `#graph` suffix so a scoped read token still
+        // authorizes time-travel / graph-fragment reads of an in-scope ledger.
+        let base = base_ledger_id(&raw)?;
+        if !principal.can_read(&base) {
+            set_span_error_code(span, "error:Forbidden");
+            return Err(ServerError::not_found("Ledger not found"));
+        }
+    }
+    Ok(())
+}
+
 /// Helper to extract ledger ID from request (for JSON-LD queries)
 fn get_ledger_id(
     path_ledger: Option<&str>,
     headers: &FlureeHeaders,
     body: &JsonValue,
 ) -> Result<String> {
-    // Priority: path > header > body.from
+    // Priority: path > header > body.from > body.fromNamed
     if let Some(ledger) = path_ledger {
         return Ok(ledger.to_string());
     }
@@ -164,8 +270,25 @@ fn get_ledger_id(
         return Ok(ledger.clone());
     }
 
-    if let Some(from) = body.get("from").and_then(|v| v.as_str()) {
-        return Ok(from.to_string());
+    // Accept every `from` shape the engine supports — string, array of
+    // sources (multi-default-graph union), or structured object (time travel
+    // / graph fragment). Earlier this only matched a bare string, so array /
+    // object `from` (and `fromNamed`-only) queries were rejected with
+    // `MissingLedger` before the dataset path could run (issue #1259).
+    //
+    // The extracted id is used only for the conservative bearer scope check
+    // and span recording; per-ledger policy and routing are applied later in
+    // `execute_dataset_query` via `parse_dataset_spec`, which sees the full
+    // dataset spec. Strip any `@t:` / `#graph` suffix so auth scopes to the
+    // base ledger.
+    let from_id = body.get("from").and_then(first_ledger_identifier);
+    let named_id = || {
+        body.get("fromNamed")
+            .or_else(|| body.get("from-named"))
+            .and_then(first_ledger_identifier)
+    };
+    if let Some(raw) = from_id.or_else(named_id) {
+        return base_ledger_id(&raw);
     }
 
     Err(ServerError::MissingLedger)
@@ -500,6 +623,10 @@ pub async fn query(
                 return Err(ServerError::not_found("Ledger not found"));
             }
         }
+        // ...and over every additional ledger a multi-default-graph / named-graph
+        // `from`/`fromNamed` references (the single check above only covers the
+        // representative id). Parity with the multi-query envelope path.
+        enforce_bearer_dataset_scope(&query_json, &bearer, credential.is_signed(), &span)?;
 
         // Apply bearer identity + server-default policy-class to opts, honoring
         // the root-identity impersonation semantic (see routes::policy_auth).
@@ -666,6 +793,10 @@ pub async fn query_ledger(
             return Err(ServerError::not_found("Ledger not found"));
         }
     }
+    // ...and over every additional ledger a `fromNamed` (or normalized `from`)
+    // references — a scoped token must not reach an out-of-scope ledger via a
+    // named graph even on the ledger-scoped endpoint.
+    enforce_bearer_dataset_scope(&query_json, &bearer, credential.is_signed(), &span)?;
 
     // Apply bearer identity + server-default policy-class to opts, honoring
     // the root-identity impersonation semantic (see routes::policy_auth).

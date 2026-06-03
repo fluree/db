@@ -337,6 +337,67 @@ pub async fn format_results_async(
     }
 }
 
+/// Dataset-aware async formatting (multi-ledger).
+///
+/// Like [`format_results_async`], but for queries that span multiple ledgers:
+/// **hydration** expansion routes each subject to its home-ledger view so
+/// properties and `@id`s decode against the ledger that stores them, under that
+/// ledger's own policy (issue #1259). Non-hydration output (flat SELECT,
+/// CONSTRUCT, ASK) is dict-independent for cross-ledger IRIs — those carry
+/// `IriMatch.iri` — so it formats against the dataset's primary view exactly as
+/// before.
+pub async fn format_results_async_dataset(
+    result: &QueryResult,
+    context: &ParsedContext,
+    dataset: &crate::view::DataSetDb,
+    config: &FormatterConfig,
+    tracker: Option<&Tracker>,
+) -> Result<JsonValue> {
+    if matches!(config.format, OutputFormat::Tsv | OutputFormat::Csv) {
+        return Err(FormatError::InvalidBinding(format!(
+            "{:?} format produces bytes/String, not JsonValue. \
+             Use format_results_string() or QueryResult::to_tsv()/to_csv() instead.",
+            config.format
+        )));
+    }
+
+    if result.output.has_hydration() {
+        if !matches!(
+            config.format,
+            OutputFormat::JsonLd | OutputFormat::TypedJson
+        ) {
+            return Err(FormatError::InvalidBinding(
+                "Hydration only supports JSON-LD and TypedJson output formats".to_string(),
+            ));
+        }
+        let v = hydration::format_async_dataset(result, dataset, context, config, tracker).await?;
+        return if result.output.is_select_one() {
+            match v {
+                JsonValue::Array(mut rows) => Ok(rows.drain(..).next().unwrap_or(JsonValue::Null)),
+                other => Ok(other),
+            }
+        } else {
+            Ok(v)
+        };
+    }
+
+    // Non-hydration: format against the primary view. Cross-ledger subject/ref
+    // IRIs in flat SELECT / CONSTRUCT come from `IriMatch.iri` (dict-independent),
+    // so the single primary dict is sufficient.
+    let primary = dataset.primary().ok_or_else(|| {
+        FormatError::InvalidBinding("dataset has no graphs for formatting".to_string())
+    })?;
+    format_results_async(
+        result,
+        context,
+        primary.as_graph_db_ref(),
+        config,
+        None,
+        tracker,
+    )
+    .await
+}
+
 /// Format query results to a JSON string using async database access
 ///
 /// Async convenience function that formats and serializes in one step.
@@ -371,6 +432,45 @@ pub async fn format_results_string_async(
     }
 
     let value = format_results_async(result, context, db, config, policy, None).await?;
+
+    if config.pretty {
+        Ok(serde_json::to_string_pretty(&value)?)
+    } else {
+        Ok(serde_json::to_string(&value)?)
+    }
+}
+
+/// Dataset-aware string formatting (multi-ledger), mirroring
+/// [`format_results_string_async`]. Delimited / XML output is dict-independent
+/// for cross-ledger IRIs (carried as `IriMatch.iri`), so it formats against the
+/// primary view; JSON output (incl. hydration) goes through the dataset-aware
+/// path so cross-ledger subjects decode against their home ledger (issue #1259).
+pub async fn format_results_string_async_dataset(
+    result: &QueryResult,
+    context: &ParsedContext,
+    dataset: &crate::view::DataSetDb,
+    config: &FormatterConfig,
+    tracker: Option<&Tracker>,
+) -> Result<String> {
+    let primary = dataset.primary().ok_or_else(|| {
+        FormatError::InvalidBinding("dataset has no graphs for formatting".to_string())
+    })?;
+    let primary_db = primary.as_graph_db_ref();
+    match config.format {
+        OutputFormat::Tsv => return delimited::format_tsv(result, primary_db.snapshot),
+        OutputFormat::Csv => return delimited::format_csv(result, primary_db.snapshot),
+        OutputFormat::SparqlXml => {
+            let compactor = IriCompactor::new(primary_db.snapshot.namespaces(), context);
+            return sparql_xml::format(result, &compactor, config);
+        }
+        OutputFormat::RdfXml => {
+            let compactor = IriCompactor::new(primary_db.snapshot.namespaces(), context);
+            return rdf_xml::format(result, &compactor, config);
+        }
+        _ => {}
+    }
+
+    let value = format_results_async_dataset(result, context, dataset, config, tracker).await?;
 
     if config.pretty {
         Ok(serde_json::to_string_pretty(&value)?)
