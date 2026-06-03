@@ -27,8 +27,8 @@ fluree create <LEDGER> [OPTIONS]
 
 **Global flags** that affect bulk import when using `--from` (see [CLI README](README.md#global-options)):
 
-- `--memory-budget-mb <MB>` — Memory budget in MB (0 = auto: 75% of system RAM). Drives chunk size, concurrency, and indexer run budget.
-- `--parallelism <N>` — Number of parallel parse threads (0 = auto: system cores, cap 6).
+- `--memory-budget-mb <MB>` — Memory budget in MB (0 = auto: 60% of system RAM). Drives chunk size, concurrency, and indexer run budget. Set this to cap how much memory the import uses; auto-detected thread count shrinks to fit it.
+- `--parallelism <N>` — Number of parallel parse threads (0 = auto: most logical cores, capped to fit the memory budget; explicit values honored as-is, floored at 1).
 
 ## Description
 

@@ -96,7 +96,10 @@ pub type ProgressFn = Arc<dyn Fn(ImportPhase) + Send + Sync>;
 /// Configuration for the bulk import pipeline.
 #[derive(Clone)]
 pub struct ImportConfig {
-    /// Number of parallel TTL parse threads. Default: available parallelism (capped at 6).
+    /// Number of parallel TTL parse threads. `0` = auto: the machine's logical
+    /// cores, capped so peak parse memory fits the budget (see
+    /// [`effective_parse_threads`](Self::effective_parse_threads)). Explicit
+    /// values are honored as-is (uncapped), with a hard floor of 1.
     pub parse_threads: usize,
     /// Whether to build multi-order indexes after runs. Default: true.
     pub build_index: bool,
@@ -184,11 +187,10 @@ impl std::fmt::Debug for ImportConfig {
 
 impl Default for ImportConfig {
     fn default() -> Self {
-        let threads = std::thread::available_parallelism()
-            .map(|n| n.get().min(6))
-            .unwrap_or(4);
         Self {
-            parse_threads: threads,
+            // 0 = auto: resolved by `effective_parse_threads()` to (most of) the
+            // machine's cores, memory-capped. Explicit values bypass the cap.
+            parse_threads: 0,
             build_index: true,
             publish: true,
             cleanup_local_files: true,
@@ -311,11 +313,48 @@ impl ImportConfig {
         raw.clamp(128, 768)
     }
 
+    /// Effective parse/worker thread count.
+    ///
+    /// Resolution order:
+    /// 1. `FLUREE_IMPORT_THREADS=<n>` env override (trusted, only floored at 1).
+    /// 2. Explicit `parse_threads > 0` from the builder/CLI (trusted, floored at 1).
+    /// 3. Auto (`parse_threads == 0`): use the machine's logical cores, then cap
+    ///    so the pipeline's peak memory stays within budget.
+    ///
+    /// The memory cap matters because each parse worker holds an in-flight chunk
+    /// plus its parse expansion, and each heavy/remap worker holds a run buffer
+    /// (`effective_run_budget_mb / workers`). Auto-detect therefore never returns
+    /// more threads than the memory budget can feed — but an explicit value is
+    /// honored as-is (the operator owns the trade-off), with a hard floor of 1 so
+    /// imports still run on a 1–2 core box (just slower).
+    pub fn effective_parse_threads(&self) -> usize {
+        if let Ok(v) = std::env::var("FLUREE_IMPORT_THREADS") {
+            if let Ok(n) = v.parse::<usize>() {
+                return n.max(1);
+            }
+        }
+        if self.parse_threads > 0 {
+            return self.parse_threads;
+        }
+        // Auto: start from logical cores.
+        let cores = std::thread::available_parallelism()
+            .map(std::num::NonZero::get)
+            .unwrap_or(4);
+        // Memory guard: peak parse-side memory ≈ threads × chunk_size × ~2.5
+        // (raw chunk + token/parse expansion). Keep that under ~half the budget
+        // so dict merge, run buffers, and OS cache have room. This bounds auto
+        // detection on small-RAM boxes without penalizing big ones.
+        let budget_mb = self.effective_memory_budget_mb();
+        let chunk_mb = self.effective_chunk_size_mb().max(1);
+        let mem_cap = ((budget_mb / 2) as f64 / (chunk_mb as f64 * 2.5)).floor() as usize;
+        cores.min(mem_cap.max(1)).max(1)
+    }
+
     /// Effective run budget in MB (always auto-derived from budget and parallelism).
     pub fn effective_run_budget_mb(&self) -> usize {
         let budget_mb = self.effective_memory_budget_mb();
         let chunk_size = self.effective_chunk_size_mb();
-        let threads = self.parse_threads.max(1);
+        let threads = self.effective_parse_threads();
         // IMPORTANT: In Tier 2, we have N independent run writers (one per remap worker),
         // so the *total* run budget must scale with parallelism. Otherwise each writer
         // gets a tiny slice and flushes many small run files, exploding disk I/O.
@@ -333,8 +372,9 @@ impl ImportConfig {
     /// These workers remap sorted-commit artifacts to per-order run files and
     /// then merge those runs into final index artifacts.
     /// Memory per worker is bounded by `per_thread_budget_bytes` (derived from
-    /// `effective_run_budget_mb() / worker_count`), so we can safely run as many workers as
-    /// we have parse threads (which is already capped at CPU count, max 6).
+    /// `effective_run_budget_mb() / worker_count`), so we can safely run as many
+    /// workers as we have parse threads. This count also bounds concurrent
+    /// secondary-order index builds (`BuildAllConfig::max_concurrency`).
     ///
     /// Override with `FLUREE_IMPORT_HEAVY_WORKERS=<n>`.
     pub fn effective_heavy_workers(&self) -> usize {
@@ -343,7 +383,7 @@ impl ImportConfig {
                 return n.max(1);
             }
         }
-        self.parse_threads.max(1)
+        self.effective_parse_threads()
     }
 
     /// Log all computed import settings.
@@ -352,7 +392,7 @@ impl ImportConfig {
         let chunk_size = self.effective_chunk_size_mb();
         let max_inflight = self.effective_max_inflight();
         let run_budget = self.effective_run_budget_mb();
-        let parallelism = self.parse_threads;
+        let parallelism = self.effective_parse_threads();
 
         tracing::info!(
             memory_budget_mb = budget,
@@ -369,7 +409,7 @@ impl ImportConfig {
     pub fn effective_import_settings(&self) -> EffectiveImportSettings {
         EffectiveImportSettings {
             memory_budget_mb: self.effective_memory_budget_mb(),
-            parallelism: self.parse_threads,
+            parallelism: self.effective_parse_threads(),
             chunk_size_mb: self.effective_chunk_size_mb(),
             max_inflight_chunks: self.effective_max_inflight(),
         }
@@ -389,7 +429,7 @@ impl ImportConfig {
 pub struct EffectiveImportSettings {
     /// Memory budget in MB (60% of system RAM when not set).
     pub memory_budget_mb: usize,
-    /// Number of parallel parse threads (system cores capped at 6 when not set).
+    /// Number of parallel parse threads (auto: logical cores, memory-capped, when not set).
     pub parallelism: usize,
     /// Chunk size in MB for large-file splitting (derived from budget when not set).
     pub chunk_size_mb: usize,
@@ -1516,7 +1556,9 @@ impl<'a> ImportBuilder<'a> {
         }
     }
 
-    /// Set the number of parallel TTL parse threads.
+    /// Set the number of parallel TTL parse threads. `0` = auto (use the
+    /// machine's logical cores, memory-capped). Explicit values are honored
+    /// as-is (not capped to core count) with a hard floor of 1.
     pub fn threads(mut self, n: usize) -> Self {
         self.config.parse_threads = n;
         self
@@ -1549,7 +1591,7 @@ impl<'a> ImportBuilder<'a> {
         self
     }
 
-    /// Set the parallelism (alias for `.threads()`).
+    /// Set the parallelism (alias for [`threads`](Self::threads)). `0` = auto.
     pub fn parallelism(mut self, n: usize) -> Self {
         self.config.parse_threads = n;
         self
@@ -2454,7 +2496,7 @@ where
     let is_channel_fed = is_streaming || is_remote_parallel || is_local_rechunk;
     let estimated_total = chunk_source.estimated_len();
     let compress = config.compress_commits;
-    let num_threads = config.parse_threads;
+    let num_threads = config.effective_parse_threads();
     let mut state = ImportState::new();
     let run_start = Instant::now();
 
@@ -5080,4 +5122,127 @@ where
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod resource_model_tests {
+    use super::*;
+
+    /// Serializes env mutation across these tests (process-global env is shared
+    /// by all test threads) and guarantees the import override vars are unset for
+    /// the body — so a developer/CI environment that exports
+    /// `FLUREE_IMPORT_THREADS` / `FLUREE_IMPORT_HEAVY_WORKERS` cannot perturb the
+    /// resolution logic under test. Vars are restored on drop.
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    struct EnvGuard {
+        _lock: std::sync::MutexGuard<'static, ()>,
+        saved: Vec<(&'static str, Option<String>)>,
+    }
+
+    impl EnvGuard {
+        fn clear_overrides() -> Self {
+            let lock = ENV_LOCK
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let vars = ["FLUREE_IMPORT_THREADS", "FLUREE_IMPORT_HEAVY_WORKERS"];
+            let saved = vars
+                .iter()
+                .map(|&k| (k, std::env::var(k).ok()))
+                .collect::<Vec<_>>();
+            for (k, _) in &saved {
+                std::env::remove_var(k);
+            }
+            Self { _lock: lock, saved }
+        }
+    }
+
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            for (k, v) in &self.saved {
+                match v {
+                    Some(val) => std::env::set_var(k, val),
+                    None => std::env::remove_var(k),
+                }
+            }
+        }
+    }
+
+    /// Build a config with an explicit memory budget + chunk size so the
+    /// memory-cap arithmetic in `effective_parse_threads` is deterministic
+    /// (independent of the host's RAM and core count for the explicit cases).
+    fn cfg(memory_budget_mb: usize, chunk_size_mb: usize, parse_threads: usize) -> ImportConfig {
+        ImportConfig {
+            parse_threads,
+            memory_budget_mb,
+            chunk_size_mb,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn explicit_thread_count_is_honored_uncapped() {
+        let _env = EnvGuard::clear_overrides();
+        // Explicit value must NOT be clamped to core count or the memory cap —
+        // the operator owns the trade-off.
+        let c = cfg(8192, 256, 64);
+        assert_eq!(c.effective_parse_threads(), 64);
+        // ...and heavy workers follow it.
+        assert_eq!(c.effective_heavy_workers(), 64);
+    }
+
+    #[test]
+    fn explicit_thread_count_floored_at_one() {
+        let _env = EnvGuard::clear_overrides();
+        // A 0 means "auto", but the floor guarantees auto never yields 0 either.
+        // An explicit 1 stays 1 (serial-ish, works on a 1-CPU box).
+        let c = cfg(8192, 256, 1);
+        assert_eq!(c.effective_parse_threads(), 1);
+    }
+
+    #[test]
+    fn auto_is_memory_capped_on_tiny_budget() {
+        let _env = EnvGuard::clear_overrides();
+        // Auto (parse_threads = 0) with a deliberately tiny budget must shrink
+        // to (near) 1 so a small-RAM box does not oversubscribe memory.
+        // budget/2 = 768 MB; chunk 512 MB * 2.5 = 1280 MB/thread => cap = 0 -> floored to 1.
+        let c = cfg(1536, 512, 0);
+        assert_eq!(
+            c.effective_parse_threads(),
+            1,
+            "tiny budget must cap auto threads to 1"
+        );
+        // A slightly larger budget allows exactly 2 (sanity on the cap formula):
+        // budget/2 = 1536 MB; chunk 256 * 2.5 = 640 => cap = 2.
+        let c2 = cfg(3072, 256, 0);
+        let cap2 = ((3072 / 2) as f64 / (256.0 * 2.5)).floor() as usize;
+        assert_eq!(cap2, 2);
+        assert!(c2.effective_parse_threads() <= 2);
+    }
+
+    #[test]
+    fn auto_never_returns_zero() {
+        let _env = EnvGuard::clear_overrides();
+        // Even with a budget so small the cap arithmetic floors out, the hard
+        // floor of 1 keeps the import runnable (just slow).
+        let c = cfg(1, 768, 0);
+        assert!(c.effective_parse_threads() >= 1);
+    }
+
+    #[test]
+    fn auto_allows_many_threads_on_large_budget() {
+        let _env = EnvGuard::clear_overrides();
+        // Large budget + small chunk: the memory cap should be generous enough
+        // that auto is bounded by cores, not memory. We can't assert the exact
+        // core count, but the cap must be well above a typical core count.
+        let c = cfg(256 * 1024, 128, 0);
+        let cap = ((256 * 1024 / 2) as f64 / (128.0 * 2.5)).floor() as usize;
+        assert!(
+            cap >= 64,
+            "large-budget memory cap should not bind below cores"
+        );
+        // Auto result is min(cores, cap); it must be >= 1 and <= cap.
+        let t = c.effective_parse_threads();
+        assert!((1..=cap).contains(&t));
+    }
 }
