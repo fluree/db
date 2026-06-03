@@ -2748,13 +2748,43 @@ pub(crate) fn apply_solution_modifiers(
         .unwrap_or_default();
     let having_expr: Option<&Expression> = grouping.and_then(Grouping::having);
 
-    // Get the schema after WHERE (before grouping)
-    let where_schema: Arc<[VarId]> = Arc::from(operator.schema().to_vec().into_boxed_slice());
+    let needs_grouping = !group_by_vec.is_empty() || !aggregates_vec.is_empty();
+
+    // SPARQL 1.1 §11.4 (GROUP BY) / §18.5: a GROUP BY variable — or, in an
+    // ungrouped query, a SELECT variable — that the WHERE never binds is legal.
+    // It is simply unbound: every solution shares the same unbound value, so
+    // they collapse into one group on that key, and the variable is reported
+    // unbound. Materialize such variables as Unbound columns (an identity
+    // `BIND(?v AS ?v)` over the absent var evaluates to Unbound) so grouping and
+    // projection treat them as unbound instead of failing the schema lookup.
+    // Aggregate INPUT variables are intentionally NOT padded here — a missing
+    // aggregate input stays an error.
+    let mut where_schema_vec: Vec<VarId> = operator.schema().to_vec();
+    {
+        let mut want: Vec<VarId> = group_by_vec.clone();
+        if !needs_grouping {
+            if let Some(sv) = select_vars {
+                want.extend_from_slice(sv);
+            }
+        }
+        for v in want {
+            if !where_schema_vec.contains(&v) {
+                operator = Box::new(crate::bind::BindOperator::new(
+                    operator,
+                    v,
+                    Expression::Var(v),
+                    Vec::new(),
+                ));
+                where_schema_vec.push(v);
+            }
+        }
+    }
+    // Get the schema after WHERE (before grouping), including any unbound pads.
+    let where_schema: Arc<[VarId]> = Arc::from(where_schema_vec.into_boxed_slice());
 
     // GROUP BY + Aggregates
     // We use streaming GroupAggregateOperator when all aggregates are streamable
     // (COUNT, SUM, AVG, MIN, MAX). This is O(groups) memory instead of O(rows).
-    let needs_grouping = !group_by_vec.is_empty() || !aggregates_vec.is_empty();
     if needs_grouping {
         // Validate group vars exist in where schema
         for var in &group_by_vec {
@@ -3249,7 +3279,10 @@ mod tests {
     }
 
     #[test]
-    fn test_build_operator_tree_validates_select_vars() {
+    fn test_build_operator_tree_allows_unbound_select_var() {
+        // SPARQL 1.1 §18.5: selecting a variable not bound by the pattern is
+        // legal — it is reported unbound, not an error. The tree pads it as an
+        // Unbound column rather than failing the schema lookup.
         let query = Query {
             context: ParsedContext::default(),
             orig_context: None,
@@ -3269,10 +3302,10 @@ mod tests {
             None,
             &crate::temporal_mode::PlanningContext::current(),
         );
-        match result {
-            Err(e) => assert!(e.to_string().contains("not found")),
-            Ok(_) => panic!("Expected error for invalid select var"),
-        }
+        assert!(
+            result.is_ok(),
+            "selecting an unbound variable should succeed (reported unbound)"
+        );
     }
 
     #[test]

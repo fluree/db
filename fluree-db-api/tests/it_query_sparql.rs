@@ -1256,6 +1256,72 @@ async fn sparql_aggregate_over_expression_in_joined_subqueries() {
 }
 
 #[tokio::test]
+async fn sparql_group_by_unbound_variable() {
+    // SPARQL 1.1 §11.4 / §18.5 (benchmark-db bug #5, BSBM BI-4): GROUP BY (and
+    // SELECT) of a variable the pattern never binds is legal — the variable is
+    // unbound, so all solutions share it and collapse to one group per the bound
+    // keys. Previously this failed at plan time ("GROUP BY variable not found in
+    // query schema").
+    assert_index_defaults();
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger = seed_people(&fluree, "people:main").await;
+
+    // ?country is never bound in the WHERE.
+    let query = r"
+        PREFIX person: <http://example.org/Person#>
+        SELECT ?country ?handle (COUNT(?favNum) AS ?c)
+        WHERE { ?p person:handle ?handle ; person:favNums ?favNum }
+        GROUP BY ?country ?handle
+    ";
+
+    let jsonld = support::query_sparql(&fluree, &ledger, query)
+        .await
+        .expect("GROUP BY an unbound variable is legal")
+        .to_jsonld(&ledger.snapshot)
+        .expect("to_jsonld");
+    // ?country unbound (null) for every group; counts: jdoe 4, bbob 1, jbob 7.
+    assert_eq!(
+        normalize_rows(&jsonld),
+        normalize_rows(&json!([
+            [null, "jdoe", 4],
+            [null, "bbob", 1],
+            [null, "jbob", 7]
+        ]))
+    );
+}
+
+#[tokio::test]
+async fn sparql_select_unbound_variable_no_grouping() {
+    // Companion to the GROUP BY case: selecting a never-bound variable in an
+    // ungrouped query reports it unbound rather than erroring.
+    assert_index_defaults();
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger = seed_people(&fluree, "people:main").await;
+
+    let query = r"
+        PREFIX person: <http://example.org/Person#>
+        SELECT ?handle ?missing
+        WHERE { ?p person:handle ?handle }
+    ";
+
+    let jsonld = support::query_sparql(&fluree, &ledger, query)
+        .await
+        .expect("selecting an unbound variable is legal")
+        .to_jsonld(&ledger.snapshot)
+        .expect("to_jsonld");
+    // Each handle (column order ?handle ?missing) with ?missing unbound (null).
+    assert_eq!(
+        normalize_rows(&jsonld),
+        normalize_rows(&json!([
+            ["jdoe", null],
+            ["bbob", null],
+            ["jbob", null],
+            ["dankeshön", null]
+        ]))
+    );
+}
+
+#[tokio::test]
 async fn sparql_delete_data_removes_specified_triples() {
     assert_index_defaults();
     let fluree = FlureeBuilder::memory().build_memory();
