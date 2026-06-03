@@ -899,56 +899,51 @@ impl<'a> FromQueryBuilder<'a> {
                 .await?;
             let ast = crate::query::helpers::parse_and_validate_sparql(sparql)?;
             let spec = crate::query::helpers::extract_sparql_dataset_spec(&ast)?;
-            return if let Some(alias) = spec.default_graphs.first() {
+            return if let Some(alias) = spec
+                .default_graphs
+                .first()
+                .or_else(|| spec.named_graphs.first())
+            {
                 let view = self.fluree.db(alias.identifier.as_str()).await?;
                 Ok(result
                     .format_async(view.as_graph_db_ref(), &format_config)
                     .await?)
             } else {
-                Err(ApiError::query("No default graph for formatting"))
+                Err(ApiError::query("No graph specified for formatting"))
             };
         }
         match input {
             QueryInput::JsonLd(json) => {
-                let result = match &self.policy {
-                    Some(policy) => match r2rml.as_ref() {
-                        Some((provider, table_provider)) => {
-                            self.fluree
-                                .query_connection_with_policy_and_r2rml(
-                                    json,
-                                    policy,
-                                    provider.as_ref(),
-                                    table_provider.as_ref(),
-                                )
-                                .await?
-                        }
-                        None => {
-                            self.fluree
-                                .query_connection_with_policy(json, policy)
-                                .await?
-                        }
-                    },
-                    None => match r2rml.as_ref() {
-                        Some((provider, table_provider)) => {
-                            self.fluree
-                                .query_connection_jsonld_with_r2rml(
-                                    json,
-                                    provider.as_ref(),
-                                    table_provider.as_ref(),
-                                )
-                                .await?
-                        }
-                        None => self.fluree.query_connection(json).await?,
-                    },
-                };
-                let (spec, _) = parse_dataset_spec(json)?;
-                if let Some(alias) = spec.default_graphs.first() {
-                    let view = self.fluree.db(alias.identifier.as_str()).await?;
-                    Ok(result
-                        .format_async(view.as_graph_db_ref(), &format_config)
-                        .await?)
-                } else {
-                    Err(ApiError::query("No default graph for formatting"))
+                let policy = self.policy.as_deref();
+                let r2rml_pair = r2rml.as_ref().map(|(p, t)| (p.as_ref(), t.as_ref()));
+                let (result, dataset) = self
+                    .fluree
+                    .query_connection_jsonld_returning_dataset(json, policy, r2rml_pair)
+                    .await?;
+                match dataset {
+                    // Multi-ledger: format hydration per home-ledger view so
+                    // cross-graph IRIs/properties decode correctly (issue #1259).
+                    Some(dataset) => Ok(crate::format::format_results_async_dataset(
+                        &result,
+                        &result.context,
+                        &dataset,
+                        &format_config,
+                        None,
+                    )
+                    .await?),
+                    // Single-ledger: format against the sole view (today's path).
+                    None => {
+                        let (spec, _) = parse_dataset_spec(json)?;
+                        let alias = spec
+                            .default_graphs
+                            .first()
+                            .or_else(|| spec.named_graphs.first())
+                            .ok_or_else(|| ApiError::query("No graph specified for formatting"))?;
+                        let view = self.fluree.db(alias.identifier.as_str()).await?;
+                        Ok(result
+                            .format_async(view.as_graph_db_ref(), &format_config)
+                            .await?)
+                    }
                 }
             }
             QueryInput::Sparql(sparql) => {
@@ -985,13 +980,17 @@ impl<'a> FromQueryBuilder<'a> {
                 };
                 let ast = crate::query::helpers::parse_and_validate_sparql(sparql)?;
                 let spec = crate::query::helpers::extract_sparql_dataset_spec(&ast)?;
-                if let Some(alias) = spec.default_graphs.first() {
+                if let Some(alias) = spec
+                    .default_graphs
+                    .first()
+                    .or_else(|| spec.named_graphs.first())
+                {
                     let view = self.fluree.db(alias.identifier.as_str()).await?;
                     Ok(result
                         .format_async(view.as_graph_db_ref(), &format_config)
                         .await?)
                 } else {
-                    Err(ApiError::query("No default graph for formatting"))
+                    Err(ApiError::query("No graph specified for formatting"))
                 }
             }
         }
@@ -1025,7 +1024,11 @@ impl<'a> FromQueryBuilder<'a> {
                 .await?;
             let ast = crate::query::helpers::parse_and_validate_sparql(sparql)?;
             let spec = crate::query::helpers::extract_sparql_dataset_spec(&ast)?;
-            return if let Some(alias) = spec.default_graphs.first() {
+            return if let Some(alias) = spec
+                .default_graphs
+                .first()
+                .or_else(|| spec.named_graphs.first())
+            {
                 let view = self.fluree.db(alias.identifier.as_str()).await?;
                 crate::format::format_results_string_async(
                     &result,
@@ -1037,56 +1040,47 @@ impl<'a> FromQueryBuilder<'a> {
                 .await
                 .map_err(ApiError::from)
             } else {
-                Err(ApiError::query("No default graph for formatting"))
+                Err(ApiError::query("No graph specified for formatting"))
             };
         }
         match input {
             QueryInput::JsonLd(json) => {
-                let result = match &self.policy {
-                    Some(policy) => match r2rml.as_ref() {
-                        Some((provider, table_provider)) => {
-                            self.fluree
-                                .query_connection_with_policy_and_r2rml(
-                                    json,
-                                    policy,
-                                    provider.as_ref(),
-                                    table_provider.as_ref(),
-                                )
-                                .await?
-                        }
-                        None => {
-                            self.fluree
-                                .query_connection_with_policy(json, policy)
-                                .await?
-                        }
-                    },
-                    None => match r2rml.as_ref() {
-                        Some((provider, table_provider)) => {
-                            self.fluree
-                                .query_connection_jsonld_with_r2rml(
-                                    json,
-                                    provider.as_ref(),
-                                    table_provider.as_ref(),
-                                )
-                                .await?
-                        }
-                        None => self.fluree.query_connection(json).await?,
-                    },
-                };
-                let (spec, _) = parse_dataset_spec(json)?;
-                if let Some(alias) = spec.default_graphs.first() {
-                    let view = self.fluree.db(alias.identifier.as_str()).await?;
-                    crate::format::format_results_string_async(
+                let policy = self.policy.as_deref();
+                let r2rml_pair = r2rml.as_ref().map(|(p, t)| (p.as_ref(), t.as_ref()));
+                let (result, dataset) = self
+                    .fluree
+                    .query_connection_jsonld_returning_dataset(json, policy, r2rml_pair)
+                    .await?;
+                match dataset {
+                    // Multi-ledger: dataset-aware string formatting (issue #1259).
+                    Some(dataset) => crate::format::format_results_string_async_dataset(
                         &result,
                         &result.context,
-                        view.as_graph_db_ref(),
+                        &dataset,
                         &format_config,
                         None,
                     )
                     .await
-                    .map_err(ApiError::from)
-                } else {
-                    Err(ApiError::query("No default graph for formatting"))
+                    .map_err(ApiError::from),
+                    // Single-ledger: format against the sole view (today's path).
+                    None => {
+                        let (spec, _) = parse_dataset_spec(json)?;
+                        let alias = spec
+                            .default_graphs
+                            .first()
+                            .or_else(|| spec.named_graphs.first())
+                            .ok_or_else(|| ApiError::query("No graph specified for formatting"))?;
+                        let view = self.fluree.db(alias.identifier.as_str()).await?;
+                        crate::format::format_results_string_async(
+                            &result,
+                            &result.context,
+                            view.as_graph_db_ref(),
+                            &format_config,
+                            None,
+                        )
+                        .await
+                        .map_err(ApiError::from)
+                    }
                 }
             }
             QueryInput::Sparql(sparql) => {
@@ -1123,7 +1117,11 @@ impl<'a> FromQueryBuilder<'a> {
                 };
                 let ast = crate::query::helpers::parse_and_validate_sparql(sparql)?;
                 let spec = crate::query::helpers::extract_sparql_dataset_spec(&ast)?;
-                if let Some(alias) = spec.default_graphs.first() {
+                if let Some(alias) = spec
+                    .default_graphs
+                    .first()
+                    .or_else(|| spec.named_graphs.first())
+                {
                     let view = self.fluree.db(alias.identifier.as_str()).await?;
                     crate::format::format_results_string_async(
                         &result,
@@ -1135,7 +1133,7 @@ impl<'a> FromQueryBuilder<'a> {
                     .await
                     .map_err(ApiError::from)
                 } else {
-                    Err(ApiError::query("No default graph for formatting"))
+                    Err(ApiError::query("No graph specified for formatting"))
                 }
             }
         }

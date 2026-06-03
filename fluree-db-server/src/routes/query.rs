@@ -149,13 +149,119 @@ fn has_policy_opts(query_json: &JsonValue) -> bool {
         || opts.get("policy").is_some()
 }
 
+/// Extract a representative ledger identifier from a `from` / `fromNamed`
+/// value of any supported shape.
+///
+/// Shapes handled (see `requires_dataset_features` and `parse_dataset_spec`):
+/// - string: `"ledger:main"` (optionally with an `@t:` / `#graph` suffix)
+/// - array: `["a:main", "b:main"]` or `[{"@id": "a"}, ...]` — first element
+/// - object `from`: `{"@id": "ledger:main@t:5", ...}` — the `@id`
+/// - object `fromNamed`: `{"alias": <source>, ...}` — first map value
+///
+/// Returns the first concrete ledger string found, or `None` if the value
+/// carries no resolvable identifier. This is used only to pick a ledger for
+/// auth scoping and span recording; the full multi-graph dataset is resolved
+/// later by `parse_dataset_spec` in the dataset execution path.
+fn first_ledger_identifier(value: &JsonValue) -> Option<String> {
+    match value {
+        JsonValue::String(s) => Some(s.clone()),
+        JsonValue::Array(items) => items.iter().find_map(first_ledger_identifier),
+        JsonValue::Object(map) => map
+            .get("@id")
+            .and_then(JsonValue::as_str)
+            .map(str::to_string)
+            // `fromNamed` map form: { alias -> source }. No `@id`, so fall
+            // back to the first source value that yields an identifier.
+            .or_else(|| map.values().find_map(first_ledger_identifier)),
+        _ => None,
+    }
+}
+
+/// Collect **every** concrete ledger identifier a `from` / `fromNamed` value
+/// references, across all supported shapes.
+///
+/// Unlike [`first_ledger_identifier`] (which returns a single representative
+/// id for span recording), this enumerates all of them so the bearer
+/// ledger-scope check can authorize every ledger a multi-default-graph or
+/// named-graph query will actually read — not just the first. Mirrors the
+/// shape handling of `first_ledger_identifier`: an object with `@id` is a
+/// single source; otherwise its values are sources (`fromNamed` map form).
+fn collect_ledger_identifiers(value: &JsonValue, out: &mut Vec<String>) {
+    match value {
+        JsonValue::String(s) => out.push(s.clone()),
+        JsonValue::Array(items) => {
+            for item in items {
+                collect_ledger_identifiers(item, out);
+            }
+        }
+        JsonValue::Object(map) => {
+            if let Some(id) = map.get("@id").and_then(JsonValue::as_str) {
+                out.push(id.to_string());
+            } else {
+                for v in map.values() {
+                    collect_ledger_identifiers(v, out);
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Enforce bearer ledger-scope over **all** ledgers a query's `from` /
+/// `fromNamed` references, not just the representative one.
+///
+/// Unsigned bearer tokens may be scoped to a subset of ledgers. A
+/// multi-default-graph (`from: ["a","b"]`) or named-graph (`fromNamed`) query
+/// must be rejected if it touches any ledger outside that scope — otherwise a
+/// token scoped to `a` could read `b` by piggy-backing it onto the dataset.
+/// Rejected with 404 (not 403) to avoid leaking ledger existence, matching the
+/// single-query and multi-query-envelope responses.
+///
+/// No-op for signed requests and unauthenticated (no-bearer) requests; those
+/// are handled by the surrounding data-auth gate and per-ledger policy.
+fn enforce_bearer_dataset_scope(
+    query_json: &JsonValue,
+    bearer: &MaybeDataBearer,
+    is_signed: bool,
+    span: &tracing::Span,
+) -> Result<()> {
+    let Some(principal) = bearer.0.as_ref() else {
+        return Ok(());
+    };
+    if is_signed {
+        return Ok(());
+    }
+
+    let mut ids: Vec<String> = Vec::new();
+    if let Some(from) = query_json.get("from") {
+        collect_ledger_identifiers(from, &mut ids);
+    }
+    if let Some(named) = query_json
+        .get("fromNamed")
+        .or_else(|| query_json.get("from-named"))
+    {
+        collect_ledger_identifiers(named, &mut ids);
+    }
+
+    for raw in ids {
+        // Strip any `@t:` / `#graph` suffix so a scoped read token still
+        // authorizes time-travel / graph-fragment reads of an in-scope ledger.
+        let base = base_ledger_id(&raw)?;
+        if !principal.can_read(&base) {
+            set_span_error_code(span, "error:Forbidden");
+            return Err(ServerError::not_found("Ledger not found"));
+        }
+    }
+    Ok(())
+}
+
 /// Helper to extract ledger ID from request (for JSON-LD queries)
 fn get_ledger_id(
     path_ledger: Option<&str>,
     headers: &FlureeHeaders,
     body: &JsonValue,
 ) -> Result<String> {
-    // Priority: path > header > body.from
+    // Priority: path > header > body.from > body.fromNamed
     if let Some(ledger) = path_ledger {
         return Ok(ledger.to_string());
     }
@@ -164,8 +270,25 @@ fn get_ledger_id(
         return Ok(ledger.clone());
     }
 
-    if let Some(from) = body.get("from").and_then(|v| v.as_str()) {
-        return Ok(from.to_string());
+    // Accept every `from` shape the engine supports — string, array of
+    // sources (multi-default-graph union), or structured object (time travel
+    // / graph fragment). Earlier this only matched a bare string, so array /
+    // object `from` (and `fromNamed`-only) queries were rejected with
+    // `MissingLedger` before the dataset path could run (issue #1259).
+    //
+    // The extracted id is used only for the conservative bearer scope check
+    // and span recording; per-ledger policy and routing are applied later in
+    // `execute_dataset_query` via `parse_dataset_spec`, which sees the full
+    // dataset spec. Strip any `@t:` / `#graph` suffix so auth scopes to the
+    // base ledger.
+    let from_id = body.get("from").and_then(first_ledger_identifier);
+    let named_id = || {
+        body.get("fromNamed")
+            .or_else(|| body.get("from-named"))
+            .and_then(first_ledger_identifier)
+    };
+    if let Some(raw) = from_id.or_else(named_id) {
+        return base_ledger_id(&raw);
     }
 
     Err(ServerError::MissingLedger)
@@ -295,13 +418,30 @@ pub async fn query(
 
     // Handle SPARQL query
     if is_sparql_request(&headers, &credential, &params) {
-        // Connection-scoped SPARQL returns pre-formatted JSON — delimited not supported
+        // Connection-scoped SPARQL returns pre-formatted JSON only. The byte
+        // formats (delimited, RDF/XML, SPARQL-results XML) are not negotiated on
+        // this route — reject with 406 rather than silently downgrading to JSON,
+        // and point callers at the ledger-scoped route which does serve them.
         if let Some(fmt) = delimited {
             return Err(ServerError::not_acceptable(format!(
                 "{} format not supported for connection-scoped SPARQL queries. \
                      Use the /:ledger/query endpoint instead.",
                 fmt.name().to_uppercase()
             )));
+        }
+        if headers.wants_rdf_xml() {
+            return Err(ServerError::not_acceptable(
+                "RDF/XML is not supported for connection-scoped SPARQL queries. \
+                 Use the /:ledger/query endpoint instead."
+                    .to_string(),
+            ));
+        }
+        if headers.wants_sparql_results_xml() {
+            return Err(ServerError::not_acceptable(
+                "SPARQL Results XML is not supported for connection-scoped SPARQL queries. \
+                 Use the /:ledger/query endpoint instead."
+                    .to_string(),
+            ));
         }
 
         let sparql = resolve_sparql_text(&params, &credential)?;
@@ -332,6 +472,16 @@ pub async fn query(
         // AgentJson: connection-scoped SPARQL with agent-optimized envelope
         if headers.wants_agent_json() {
             let parsed = fluree_db_sparql::parse_sparql(&sparql);
+            // AgentJson is a solution-table envelope; a CONSTRUCT/DESCRIBE graph
+            // has no such form, so reject rather than mislabel a JSON-LD graph
+            // as AgentJson (issue #1274).
+            if is_graph_query(parsed.ast.as_ref()) {
+                return Err(ServerError::not_acceptable(
+                    "AgentJson is not available for SPARQL CONSTRUCT/DESCRIBE queries; \
+                     use the default (JSON-LD) or Accept: application/rdf+xml"
+                        .to_string(),
+                ));
+            }
             let from_count = parsed.ast.as_ref()
                 .and_then(|ast| match &ast.body {
                     fluree_db_sparql::ast::QueryBody::Select(q) => q.dataset.as_ref(),
@@ -449,14 +599,17 @@ pub async fn query(
             return Ok((resp_headers, Json(response)).into_response());
         }
 
-        match state.fluree.query_from().sparql(&sparql).execute_formatted().await {
+        let parsed = fluree_db_sparql::parse_sparql(&sparql);
+        let (fmt_config, content_type) =
+            sparql_json_response_format(parsed.ast.as_ref(), &headers);
+        match state.fluree.query_from().sparql(&sparql).format(fmt_config).execute_formatted().await {
             Ok(result) => {
                 tracing::info!(
                     status = "success",
                     query_kind = "sparql",
                     result_count = result.as_array().map(std::vec::Vec::len).unwrap_or(0)
                 );
-                Ok((HeaderMap::new(), Json(result)).into_response())
+                Ok(([(axum::http::header::CONTENT_TYPE, content_type)], Json(result)).into_response())
             }
             Err(e) => {
                 let server_error = ServerError::Api(e);
@@ -500,6 +653,10 @@ pub async fn query(
                 return Err(ServerError::not_found("Ledger not found"));
             }
         }
+        // ...and over every additional ledger a multi-default-graph / named-graph
+        // `from`/`fromNamed` references (the single check above only covers the
+        // representative id). Parity with the multi-query envelope path.
+        enforce_bearer_dataset_scope(&query_json, &bearer, credential.is_signed(), &span)?;
 
         // Apply bearer identity + server-default policy-class to opts, honoring
         // the root-identity impersonation semantic (see routes::policy_auth).
@@ -666,6 +823,10 @@ pub async fn query_ledger(
             return Err(ServerError::not_found("Ledger not found"));
         }
     }
+    // ...and over every additional ledger a `fromNamed` (or normalized `from`)
+    // references — a scoped token must not reach an out-of-scope ledger via a
+    // named graph even on the ledger-scoped endpoint.
+    enforce_bearer_dataset_scope(&query_json, &bearer, credential.is_signed(), &span)?;
 
     // Apply bearer identity + server-default policy-class to opts, honoring
     // the root-identity impersonation semantic (see routes::policy_auth).
@@ -1022,6 +1183,48 @@ fn iri_to_string(iri: &fluree_db_sparql::ast::Iri) -> String {
                 format!("{prefix}:{local}")
             }
         }
+    }
+}
+
+/// Whether a parsed SPARQL query is a graph query (CONSTRUCT / DESCRIBE), whose
+/// result is an RDF graph rather than a solution/binding table. Graph queries
+/// have no SPARQL-results-JSON / SPARQL-results-XML / AgentJson rendering; their
+/// only serializations are JSON-LD (default) and RDF/XML.
+fn is_graph_query(ast: Option<&fluree_db_sparql::ast::SparqlAst>) -> bool {
+    matches!(
+        ast.map(|a| &a.body),
+        Some(
+            fluree_db_sparql::ast::QueryBody::Construct(_)
+                | fluree_db_sparql::ast::QueryBody::Describe(_)
+        )
+    )
+}
+
+/// Pick the formatter config and response `Content-Type` for a SPARQL query that
+/// returns a JSON body (i.e. not RDF/XML, SPARQL-results XML, delimited, or
+/// AgentJson — those are negotiated on their own paths).
+///
+/// - CONSTRUCT / DESCRIBE produce a graph, which only has a JSON-LD rendering, so
+///   they are always formatted as JSON-LD and labelled `application/ld+json`. The
+///   formatter coerces graph results to JSON-LD regardless (issue #1274); forcing
+///   the config here keeps the chosen format and the `Content-Type` in agreement.
+/// - SELECT / ASK keep the SPARQL-results-JSON default unless the client opts into
+///   JSON-LD with `Accept: application/ld+json` (see [`FlureeHeaders::wants_jsonld`]).
+fn sparql_json_response_format(
+    ast: Option<&fluree_db_sparql::ast::SparqlAst>,
+    headers: &FlureeHeaders,
+) -> (fluree_db_api::FormatterConfig, &'static str) {
+    if is_graph_query(ast) || headers.wants_jsonld() {
+        (
+            fluree_db_api::FormatterConfig::jsonld(),
+            "application/ld+json; charset=utf-8",
+        )
+    } else {
+        // SPARQL-results JSON: the builder default for a SPARQL query.
+        (
+            fluree_db_api::FormatterConfig::sparql_json(),
+            "application/json",
+        )
     }
 }
 
@@ -1492,6 +1695,13 @@ async fn execute_sparql_ledger(
             ));
         }
 
+        // Formatter config + Content-Type for the JSON response paths below.
+        // CONSTRUCT/DESCRIBE always render as JSON-LD; SELECT/ASK opt in via
+        // `Accept: application/ld+json` (issue #1274). XML / delimited / AgentJson
+        // are negotiated separately on their own branches and ignore this.
+        let (json_fmt_config, json_content_type) =
+            sparql_json_response_format(parsed.ast.as_ref(), headers);
+
         // In proxy mode, use the unified Fluree method (returns pre-formatted JSON)
         if state.config.is_proxy_storage_mode() && !has_dataset_clause {
             if wants_sparql_xml {
@@ -1518,6 +1728,7 @@ async fn execute_sparql_ledger(
                         .await?;
                 view.query(state.fluree.as_ref())
                     .sparql(sparql)
+                    .format(json_fmt_config.clone())
                     .execute_formatted()
                     .await
                     .inspect_err(|_| { set_span_error_code(&span, "error:QueryFailed"); })?
@@ -1532,13 +1743,18 @@ async fn execute_sparql_ledger(
                 })?;
                 view.query(state.fluree.as_ref())
                     .sparql(sparql)
+                    .format(json_fmt_config.clone())
                     .execute_formatted()
                     .await
                     .inspect_err(|_| {
                         set_span_error_code(&span, "error:QueryFailed");
                     })?
             };
-            return Ok((HeaderMap::new(), Json(result)).into_response());
+            return Ok((
+                [(axum::http::header::CONTENT_TYPE, json_content_type)],
+                Json(result),
+            )
+                .into_response());
         }
 
         // Policy-scoped queries (identity or explicit policy inputs) without a
@@ -1569,12 +1785,17 @@ async fn execute_sparql_ledger(
                 .await?;
             let result = view.query(state.fluree.as_ref())
                 .sparql(sparql)
+                .format(json_fmt_config.clone())
                 .execute_formatted()
                 .await
                 .inspect_err(|_| {
                     set_span_error_code(&span, "error:QueryFailed");
                 })?;
-            return Ok((HeaderMap::new(), Json(result)).into_response());
+            return Ok((
+                [(axum::http::header::CONTENT_TYPE, json_content_type)],
+                Json(result),
+            )
+                .into_response());
         }
 
         // Ledger-scoped SPARQL with dataset clauses (FROM/FROM NAMED): build a dataset
@@ -1752,6 +1973,17 @@ async fn execute_sparql_ledger(
 
             // SPARQL Results XML: execute and format as XML string (SELECT/ASK only)
             if wants_sparql_xml {
+                // SPARQL Results XML serializes a solution table, not a graph;
+                // reject CONSTRUCT/DESCRIBE here (406) instead of executing and
+                // surfacing the formatter's 400 (issue #1274).
+                if is_graph_query(parsed.ast.as_ref()) {
+                    return Err(ServerError::not_acceptable(
+                        "SPARQL Results XML is only available for SPARQL SELECT/ASK queries; \
+                         CONSTRUCT/DESCRIBE return a graph (use the default JSON-LD or \
+                         Accept: application/rdf+xml)"
+                            .to_string(),
+                    ));
+                }
                 let dataset = if qc_opts.has_any_policy_inputs() {
                     state.fluree.build_dataset_view_with_policy(&spec, &qc_opts).await
                 } else {
@@ -1775,12 +2007,7 @@ async fn execute_sparql_ledger(
 
             // RDF/XML: execute and format graph results (CONSTRUCT/DESCRIBE only)
             if wants_rdf_xml {
-                let is_graph_query = matches!(
-                    parsed.ast.as_ref().map(|a| &a.body),
-                    Some(fluree_db_sparql::ast::QueryBody::Construct(_) |
-fluree_db_sparql::ast::QueryBody::Describe(_))
-                );
-                if !is_graph_query {
+                if !is_graph_query(parsed.ast.as_ref()) {
                     return Err(ServerError::not_acceptable(
                         "RDF/XML is only available for SPARQL CONSTRUCT/DESCRIBE queries"
                             .to_string(),
@@ -1810,6 +2037,13 @@ fluree_db_sparql::ast::QueryBody::Describe(_))
 
             // AgentJson: dataset query with agent-optimized envelope
             if headers.wants_agent_json() {
+                if is_graph_query(parsed.ast.as_ref()) {
+                    return Err(ServerError::not_acceptable(
+                        "AgentJson is not available for SPARQL CONSTRUCT/DESCRIBE queries; \
+                         use the default (JSON-LD) or Accept: application/rdf+xml"
+                            .to_string(),
+                    ));
+                }
                 let from_count = dc.default_graphs.len();
                 let agent_ctx = fluree_db_api::AgentJsonContext {
                     sparql_text: Some(sparql.to_string()),
@@ -1852,11 +2086,16 @@ fluree_db_sparql::ast::QueryBody::Describe(_))
             let result = dataset
                 .query(state.fluree.as_ref())
                 .sparql(sparql)
+                .format(json_fmt_config.clone())
                 .execute_formatted()
                 .await
                 .map_err(ServerError::Api)?;
 
-            return Ok((HeaderMap::new(), Json(result)).into_response());
+            return Ok((
+                [(axum::http::header::CONTENT_TYPE, json_content_type)],
+                Json(result),
+            )
+                .into_response());
         }
 
         // Shared storage mode: use load_ledger_for_query with freshness checking
@@ -1932,6 +2171,17 @@ fluree_db_sparql::ast::QueryBody::Describe(_))
 
         // Delimited fast path: execute raw query and format as TSV/CSV bytes
         if let Some(fmt) = delimited {
+            // CSV/TSV serialize a solution table; a CONSTRUCT/DESCRIBE graph has
+            // no such form, so reject with 406 rather than producing malformed
+            // rows or a 500 (issue #1274).
+            if is_graph_query(parsed.ast.as_ref()) {
+                return Err(ServerError::not_acceptable(format!(
+                    "{} is only available for SPARQL SELECT/ASK queries; \
+                     CONSTRUCT/DESCRIBE return a graph (use the default JSON-LD or \
+                     Accept: application/rdf+xml)",
+                    fmt.name().to_uppercase()
+                )));
+            }
             let result = graph
                 .query(fluree.as_ref())
                 .sparql(sparql)
@@ -1962,6 +2212,16 @@ fluree_db_sparql::ast::QueryBody::Describe(_))
 
         // SPARQL Results XML: execute and format as XML string (SELECT/ASK only)
         if wants_sparql_xml {
+            // Graph queries have no solution-table XML form — reject with 406
+            // rather than executing into the formatter's 400 (issue #1274).
+            if is_graph_query(parsed.ast.as_ref()) {
+                return Err(ServerError::not_acceptable(
+                    "SPARQL Results XML is only available for SPARQL SELECT/ASK queries; \
+                     CONSTRUCT/DESCRIBE return a graph (use the default JSON-LD or \
+                     Accept: application/rdf+xml)"
+                        .to_string(),
+                ));
+            }
             let xml = graph
                 .query(fluree.as_ref())
                 .sparql(sparql)
@@ -1982,12 +2242,7 @@ fluree_db_sparql::ast::QueryBody::Describe(_))
 
         // RDF/XML: execute and format graph results (CONSTRUCT/DESCRIBE only)
         if wants_rdf_xml {
-            let is_graph_query = matches!(
-                parsed.ast.as_ref().map(|a| &a.body),
-                Some(fluree_db_sparql::ast::QueryBody::Construct(_) |
-fluree_db_sparql::ast::QueryBody::Describe(_))
-            );
-            if !is_graph_query {
+            if !is_graph_query(parsed.ast.as_ref()) {
                 return Err(ServerError::not_acceptable(
                     "RDF/XML is only available for SPARQL CONSTRUCT/DESCRIBE queries".to_string(),
                 ));
@@ -2013,6 +2268,13 @@ fluree_db_sparql::ast::QueryBody::Describe(_))
 
         // AgentJson: execute with agent-optimized envelope format
         if headers.wants_agent_json() {
+            if is_graph_query(parsed.ast.as_ref()) {
+                return Err(ServerError::not_acceptable(
+                    "AgentJson is not available for SPARQL CONSTRUCT/DESCRIBE queries; \
+                     use the default (JSON-LD) or Accept: application/rdf+xml"
+                        .to_string(),
+                ));
+            }
             let from_count = dataset_clause
                 .map(|d| d.default_graphs.len())
                 .unwrap_or(0);
@@ -2048,12 +2310,17 @@ fluree_db_sparql::ast::QueryBody::Describe(_))
         let result = graph
             .query(fluree.as_ref())
             .sparql(sparql)
+            .format(json_fmt_config)
             .execute_formatted()
             .await
             .inspect_err(|_| {
                 set_span_error_code(&span, "error:QueryFailed");
             })?;
-        Ok((HeaderMap::new(), Json(result)).into_response())
+        Ok((
+            [(axum::http::header::CONTENT_TYPE, json_content_type)],
+            Json(result),
+        )
+            .into_response())
     }
     .instrument(span)
     .await

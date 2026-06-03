@@ -2306,7 +2306,16 @@ pub fn count_predicate_overlay_delta(
     let mut op_idx = 0usize;
     let n = leaves.len();
     for i in 0..n {
-        let lo = leaves[i].first_key.s_id.as_u64();
+        // The first leaf's range starts at 0 (mirroring `parallel_partition_count`'s
+        // `bounds[0] == 0`) so novelty ops below the predicate's first indexed subject
+        // — a low-id subject newly gaining this predicate — fall into leaf 0's range
+        // and are merged in, rather than being skipped by the op-cursor advance below
+        // and silently undercounted.
+        let lo = if i == 0 {
+            0
+        } else {
+            leaves[i].first_key.s_id.as_u64()
+        };
         let hi = if i + 1 < n {
             leaves[i + 1].first_key.s_id.as_u64()
         } else {
