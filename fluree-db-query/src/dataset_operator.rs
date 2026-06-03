@@ -209,7 +209,7 @@ impl DatasetOperator {
 /// - `Binding::IriMatch` → passed through unchanged (supports nested
 ///   `DatasetOperator` composition).
 /// - All other binding types → unchanged.
-fn stamp_provenance(
+pub(crate) fn stamp_provenance(
     batch: Batch,
     ledger_id: &Arc<str>,
     ctx: &ExecutionContext<'_>,

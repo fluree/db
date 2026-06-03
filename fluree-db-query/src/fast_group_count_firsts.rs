@@ -29,7 +29,7 @@ use fluree_db_core::subject_id::SubjectId;
 use fluree_db_core::{FlakeValue, GraphId, LedgerSnapshot, Sid};
 use rustc_hash::{FxHashMap, FxHashSet};
 use std::cmp::Ordering;
-use std::collections::HashMap;
+use std::collections::BinaryHeap;
 use std::sync::Arc;
 
 // ---------------------------------------------------------------------------
@@ -748,6 +748,54 @@ fn count_bound_object_v6(
 /// V6 fast-path: GROUP BY ?o COUNT(?s) for a predicate.
 ///
 /// Returns `Vec<(o_type, o_key, count)>` sorted by count descending, truncated to `limit`.
+/// One `(o_type, o_key)` group's count, ordered so a `BinaryHeap` (max-heap)
+/// keeps the *worst* element on top for O(log K) eviction.
+///
+/// "Worse" = the element the final sort would place LATER: lower count, then
+/// higher `o_type`, then higher `o_key` (the reverse of the keep order, which is
+/// count DESC, `o_type` ASC, `o_key` ASC). `into_sorted_vec()` then yields the
+/// kept groups in keep order (best first) directly.
+#[derive(PartialEq, Eq)]
+struct GroupTopK {
+    count: i64,
+    o_type: u16,
+    o_key: u64,
+}
+
+impl Ord for GroupTopK {
+    fn cmp(&self, other: &Self) -> Ordering {
+        // Larger == worse.
+        other
+            .count
+            .cmp(&self.count)
+            .then(self.o_type.cmp(&other.o_type))
+            .then(self.o_key.cmp(&other.o_key))
+    }
+}
+
+impl PartialOrd for GroupTopK {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+/// Offer a completed group's run to the bounded top-K heap, keeping only the
+/// `limit` best by (count DESC, o_type ASC, o_key ASC). No-op for empty runs.
+fn offer_topk(heap: &mut BinaryHeap<GroupTopK>, limit: usize, cand: GroupTopK) {
+    if limit == 0 || cand.count <= 0 {
+        return;
+    }
+    if heap.len() < limit {
+        heap.push(cand);
+    } else if let Some(worst) = heap.peek() {
+        // cand < worst means cand is better than the current worst kept element.
+        if cand.cmp(worst) == Ordering::Less {
+            heap.pop();
+            heap.push(cand);
+        }
+    }
+}
+
 fn group_count_v6(
     store: &BinaryIndexStore,
     g_id: GraphId,
@@ -781,7 +829,14 @@ fn group_count_v6(
     };
     let leaf_range = branch.find_leaves_in_range(&min_key, &max_key, cmp);
 
-    let mut counts: HashMap<(u16, u64), i64> = HashMap::new();
+    // Streaming run-length: POST order (p_id, o_type, o_key, …) makes every
+    // object's rows physically contiguous, so COUNT(?subject) per object is the
+    // length of its run — a single counter that persists across leaflet/leaf
+    // boundaries, no per-row hashing. Completed runs feed a bounded top-K heap, so
+    // there is no full sort of all distinct objects either.
+    let mut heap: BinaryHeap<GroupTopK> = BinaryHeap::with_capacity(limit + 1);
+    let mut cur: Option<(u16, u64)> = None;
+    let mut run: i64 = 0;
     let cache = store.leaflet_cache();
 
     for leaf_idx in leaf_range.clone() {
@@ -834,7 +889,23 @@ fn group_count_v6(
             // same `(o_type, o_key)` first row as the next leaflet but still
             // contain rows for *other* predicates that must be excluded.
             if next_prefix == Some(prefix) && entry.p_const == Some(p_id) {
-                *counts.entry(prefix).or_insert(0) += entry.row_count as i64;
+                // Whole leaflet is one object that continues into the next leaflet:
+                // extend the current run (or start one), no per-row decode.
+                if cur == Some(prefix) {
+                    run += entry.row_count as i64;
+                } else {
+                    offer_topk(
+                        &mut heap,
+                        limit,
+                        GroupTopK {
+                            count: run,
+                            o_type: cur.map_or(0, |c| c.0),
+                            o_key: cur.map_or(0, |c| c.1),
+                        },
+                    );
+                    cur = Some(prefix);
+                    run = entry.row_count as i64;
+                }
                 continue;
             }
 
@@ -865,18 +936,43 @@ fn group_count_v6(
                     .o_type_const
                     .unwrap_or_else(|| batch.o_type.get_or(row, 0));
                 let ok = batch.o_key.get(row);
-                *counts.entry((ot, ok)).or_insert(0) += 1;
+                // Contiguous run: extend if the object is unchanged, else flush the
+                // completed run and start a new one.
+                if cur == Some((ot, ok)) {
+                    run += 1;
+                } else {
+                    offer_topk(
+                        &mut heap,
+                        limit,
+                        GroupTopK {
+                            count: run,
+                            o_type: cur.map_or(0, |c| c.0),
+                            o_key: cur.map_or(0, |c| c.1),
+                        },
+                    );
+                    cur = Some((ot, ok));
+                    run = 1;
+                }
             }
         }
     }
 
-    // Sort by count desc, truncate.
-    let mut rows: Vec<(u16, u64, i64)> = counts
+    // Flush the final run, then emit the kept groups in keep order (best first):
+    // count DESC, o_type ASC, o_key ASC — identical to the prior sort+truncate.
+    offer_topk(
+        &mut heap,
+        limit,
+        GroupTopK {
+            count: run,
+            o_type: cur.map_or(0, |c| c.0),
+            o_key: cur.map_or(0, |c| c.1),
+        },
+    );
+    let rows: Vec<(u16, u64, i64)> = heap
+        .into_sorted_vec()
         .into_iter()
-        .map(|((ot, ok), c)| (ot, ok, c))
+        .map(|g| (g.o_type, g.o_key, g.count))
         .collect();
-    rows.sort_unstable_by(|a, b| b.2.cmp(&a.2).then(a.0.cmp(&b.0)).then(a.1.cmp(&b.1)));
-    rows.truncate(limit);
 
     Ok(rows)
 }
@@ -1486,4 +1582,66 @@ fn compute_group_by_object_star_topk(
     Ok(Some(crate::binding::Batch::new(schema, cols).map_err(
         |e| QueryError::execution(format!("batch build: {e}")),
     )?))
+}
+
+#[cfg(test)]
+mod topk_tests {
+    use super::{offer_topk, GroupTopK};
+    use std::collections::BinaryHeap;
+
+    /// Feed `(count, o_type, o_key)` groups through the bounded heap and return
+    /// the kept groups in emit order `(o_type, o_key, count)`.
+    fn topk(items: &[(i64, u16, u64)], limit: usize) -> Vec<(u16, u64, i64)> {
+        let mut heap: BinaryHeap<GroupTopK> = BinaryHeap::new();
+        for &(count, o_type, o_key) in items {
+            offer_topk(
+                &mut heap,
+                limit,
+                GroupTopK {
+                    count,
+                    o_type,
+                    o_key,
+                },
+            );
+        }
+        heap.into_sorted_vec()
+            .into_iter()
+            .map(|g| (g.o_type, g.o_key, g.count))
+            .collect()
+    }
+
+    #[test]
+    fn orders_by_count_desc() {
+        let r = topk(&[(2, 0, 0), (5, 0, 0), (3, 0, 0), (1, 0, 0)], 3);
+        assert_eq!(r, vec![(0, 0, 5), (0, 0, 3), (0, 0, 2)]);
+    }
+
+    #[test]
+    fn tie_break_is_otype_then_okey_ascending() {
+        // All count 3: keep order is lower o_type first, then lower o_key.
+        let r = topk(&[(3, 2, 9), (3, 1, 5), (3, 1, 2), (3, 0, 100)], 3);
+        assert_eq!(r, vec![(0, 100, 3), (1, 2, 3), (1, 5, 3)]);
+    }
+
+    #[test]
+    fn evicts_worst_and_respects_limit() {
+        assert_eq!(
+            topk(&[(1, 0, 0), (2, 0, 0), (3, 0, 0), (4, 0, 0), (5, 0, 0)], 2),
+            vec![(0, 0, 5), (0, 0, 4)]
+        );
+        assert!(topk(&[], 3).is_empty());
+        assert!(topk(&[(5, 0, 0)], 0).is_empty(), "limit 0 keeps nothing");
+        assert!(
+            topk(&[(0, 0, 0), (-1, 0, 0)], 3).is_empty(),
+            "non-positive runs are not emitted"
+        );
+    }
+
+    #[test]
+    fn count_dominates_tie_break() {
+        // A lower-count group must never outrank a higher-count one regardless of
+        // o_type/o_key.
+        let r = topk(&[(10, 9, 9), (3, 0, 0), (5, 1, 1)], 2);
+        assert_eq!(r, vec![(9, 9, 10), (1, 1, 5)]);
+    }
 }

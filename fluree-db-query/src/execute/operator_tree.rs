@@ -13,7 +13,7 @@ use crate::fast_count::{
     count_blank_node_subjects_operator, count_distinct_position_operator,
     count_literal_objects_operator, count_rows_lang_filter_operator,
     count_rows_numeric_compare_operator, count_rows_operator, count_triples_operator,
-    DistinctPosition, NumericCompareOp,
+    sum_compare_as_count_operator, DistinctPosition, NumericCompareOp,
 };
 use crate::fast_exists_join_count_distinct_object::exists_join_count_distinct_object_operator;
 use crate::fast_group_count_firsts::{
@@ -1007,6 +1007,11 @@ fn detect_sum_strlen_group_concat_subquery(query: &Query) -> Option<(Ref, Arc<st
 fn detect_predicate_object_count(
     query: &Query,
 ) -> Option<(Ref, VarId, crate::ir::triple::Term, VarId)> {
+    // Expression ORDER BY needs the generic pipeline's order-bind stage; this
+    // fast path sorts on `query.ordering` directly, so decline it.
+    if !query.order_binds.is_empty() {
+        return None;
+    }
     let (input_var, out_var) = detect_count_aggregate(query)?;
 
     if query.patterns.len() != 1 {
@@ -1057,6 +1062,56 @@ fn detect_predicate_count_rows(query: &Query) -> Option<(Ref, VarId)> {
     }
 
     Some((pred, out_var))
+}
+
+/// Detect `COUNT(*)` / `COUNT(?s|?o)` of `?s rdf:type <Class> . ?s P ?o` — one leg
+/// with a constant (class) object, the other a same-subject property with a variable
+/// object. Returns `(type_pred, class_obj, property, out_var)`; the operator verifies
+/// the constant-object leg is rdf:type and does the class-stat lookup. Exactly one
+/// constant-object leg and one variable-object leg are required, so the variable-class
+/// star (`?s rdf:type ?o1 . ?s P ?o2`) and pure-constant joins don't match.
+/// `COUNT(DISTINCT …)` is rejected by `detect_count_aggregate`.
+fn detect_class_property_count(query: &Query) -> Option<(Ref, Ref, Ref, VarId)> {
+    let (input_var, out_var) = detect_count_aggregate(query)?;
+    if query.patterns.len() != 2 {
+        return None;
+    }
+    let (Pattern::Triple(t0), Pattern::Triple(t1)) = (&query.patterns[0], &query.patterns[1])
+    else {
+        return None;
+    };
+    for (cls_tp, prop_tp) in [(t0, t1), (t1, t0)] {
+        // Class leg: ?s <type_pred> <ConstClass> (constant ref object).
+        let Ref::Var(cs) = &cls_tp.s else { continue };
+        if cls_tp.dtc.is_some() {
+            continue;
+        }
+        let Some(type_pred) = extract_bound_predicate(&cls_tp.p) else {
+            continue;
+        };
+        let class_obj = match &cls_tp.o {
+            Term::Iri(i) => Ref::Iri(i.clone()),
+            Term::Sid(s) => Ref::Sid(s.clone()),
+            _ => continue, // not a constant class object
+        };
+        // Property leg: same subject, bound predicate, variable object.
+        let Ref::Var(ps) = &prop_tp.s else { continue };
+        if cs != ps || prop_tp.dtc.is_some() {
+            continue;
+        }
+        let Some(property) = extract_bound_predicate(&prop_tp.p) else {
+            continue;
+        };
+        let Term::Var(po) = &prop_tp.o else { continue };
+        // COUNT(?v): v must be the subject or the property's object (both bound).
+        if let Some(v) = input_var {
+            if v != *cs && v != *po {
+                continue;
+            }
+        }
+        return Some((type_pred, class_obj, property, out_var));
+    }
+    None
 }
 
 fn detect_predicate_count_rows_lang_filter(query: &Query) -> Option<(Ref, String, VarId)> {
@@ -1470,6 +1525,12 @@ fn anchored_literal_regex_prefix(pattern: &str) -> Option<Arc<str>> {
 ///
 /// Returns `Some((predicate_var, count_output_var))` if the query matches the pattern.
 fn detect_stats_count_by_predicate(query: &Query) -> Option<(VarId, VarId)> {
+    // Expression ORDER BY needs the generic pipeline's order-bind stage; this
+    // fast path sorts on `query.ordering` directly (a synthetic, unbound sort
+    // var would be silently dropped), so decline it.
+    if !query.order_binds.is_empty() {
+        return None;
+    }
     // Must have stats available (checked by caller)
     // Must have exactly one triple pattern with all variables
     if query.patterns.len() != 1 {
@@ -1603,6 +1664,43 @@ fn detect_fused_scan_sum_i64(query: &Query) -> Option<(Ref, SumExprI64, VarId)> 
         }
         _ => None,
     }
+}
+
+/// Detect `SELECT (SUM(?o <cmp> K) AS ?sum) WHERE { ?s <p> ?o }`, lowered as
+/// `Triple + Bind(Gt/Ge/Lt/Le(?o, const)) + SUM(synthetic_var, List)`.
+///
+/// `SUM` of a boolean comparison is `COUNT` of the matching rows, which the
+/// directory-skipping numeric-compare count answers far faster than the general
+/// decode+eval+materialize aggregate pipeline. Restricted to `InputSemantics::List`
+/// (non-DISTINCT) because `SUM(DISTINCT ?o>0)` sums the distinct set {0,1}, not a
+/// row count. Empty-input (`SUM`=Unbound vs `COUNT`=0) is handled by the operator,
+/// which defers to the fallback when the predicate feeds no rows.
+fn detect_sum_numeric_compare_as_count(
+    query: &Query,
+) -> Option<(Ref, NumericCompareOp, fluree_db_core::FlakeValue, VarId)> {
+    let agg = implicit_single_aggregate(query)?;
+    let select_vars = query.output.projected_vars()?;
+    if select_vars.len() != 1 || select_vars[0] != agg.output_var {
+        return None;
+    }
+    let AggregateFn::Sum(sum_input, InputSemantics::List) = agg.function else {
+        return None;
+    };
+    let [Pattern::Triple(tp), Pattern::Bind { var, expr }] = query.patterns.as_slice() else {
+        return None;
+    };
+    if sum_input != *var {
+        return None;
+    }
+    let pred = extract_bound_predicate(&tp.p)?;
+    let Term::Var(o_var) = &tp.o else {
+        return None;
+    };
+    let (cmp_var, op, threshold) = extract_simple_numeric_compare_threshold(expr)?;
+    if cmp_var != *o_var {
+        return None;
+    }
+    Some((pred, op, threshold, agg.output_var))
 }
 
 fn detect_exists_join_count_distinct_object(query: &Query) -> Option<(Ref, Ref, VarId)> {
@@ -1953,12 +2051,42 @@ fn build_operator_tree_inner(
     // single planner-time decision.
     let enable_fused_fast_paths = enable_fused_fast_paths && !planning.is_history();
 
+    // Expression-based ORDER BY (`query.order_binds`) is materialized only by the
+    // generic pipeline's dedicated post-grouping bind stage. No fast path runs
+    // that stage, so any fast path that returns early would sort on a synthetic
+    // ORDER BY variable that was never bound (silently dropping the sort). Force
+    // the generic path whenever order binds are present. (The history-gated
+    // count fast paths below are guarded inside their detectors for the same
+    // reason.)
+    let enable_fused_fast_paths = enable_fused_fast_paths && query.order_binds.is_empty();
+
     if enable_fused_fast_paths {
         tracing::debug!(
             patterns = ?query.patterns,
             grouping = ?query.grouping,
             "operator_tree: considering fused fast paths"
         );
+    }
+
+    // Fast-path: `SELECT (SUM(?o <cmp> K) AS ?sum) WHERE { ?s <p> ?o }`.
+    //
+    // SUM of a boolean comparison == COUNT of matching rows, answered by the
+    // directory-skipping numeric-compare count instead of the general
+    // decode+eval+materialize aggregate pipeline. Placed before the generic
+    // SUM-i64 fast path (which declines the comparison shape).
+    if enable_fused_fast_paths {
+        if let Some((pred, compare, threshold, out_var)) =
+            detect_sum_numeric_compare_as_count(query)
+        {
+            let fallback = build_operator_tree_inner(query, stats.clone(), false, planning)?;
+            return Ok(Box::new(sum_compare_as_count_operator(
+                pred,
+                compare,
+                threshold,
+                out_var,
+                Some(fallback),
+            )));
+        }
     }
 
     // Fast-path: `SELECT (SUM(DAY(?o)) AS ?sum) WHERE { ?s <p> ?o }` and friends.
@@ -2094,18 +2222,28 @@ fn build_operator_tree_inner(
                 o: false,
             };
             let scan: BoxedOperator = Box::new(crate::dataset_operator::DatasetOperator::scan(
-                tp,
+                tp.clone(),
                 None,
-                inline_ops,
+                inline_ops.clone(),
                 emit,
                 None,
                 planning.mode(),
             ));
-            return Ok(Box::new(CountRowsOperator::new(
-                scan,
-                out_var,
-                Some(fallback),
-            )));
+            // Serial scan-count → general aggregate pipeline (the correct path for
+            // overlay/time-travel/policy). This is the fast path's fallback.
+            let scan_count: BoxedOperator =
+                Box::new(CountRowsOperator::new(scan, out_var, Some(fallback)));
+            // At HEAD, count the rows passing the encoded pre-filters in parallel
+            // across leaf chunks (no per-row binding materialization); otherwise, or
+            // if a filter can't be pushed to encoded columns, fall back to the scan.
+            return Ok(Box::new(
+                crate::fast_count::count_rows_encoded_filters_operator(
+                    tp,
+                    inline_ops,
+                    out_var,
+                    Some(scan_count),
+                ),
+            ));
         }
     }
 
@@ -2115,6 +2253,23 @@ fn build_operator_tree_inner(
         if let Some((pred, out_var)) = detect_predicate_count_rows(query) {
             let fallback = build_operator_tree_inner(query, stats.clone(), false, planning)?;
             return Ok(Box::new(count_rows_operator(pred, out_var, Some(fallback))));
+        }
+    }
+
+    // Fast-path: `COUNT(*)` of `?s rdf:type <Class> . ?s P ?o` — the P-flake count on
+    // instances of one bound class, from per-(class,property) stats. Before the count
+    // planner, which would otherwise run it as a real class-instances ⋈ P join.
+    if enable_fused_fast_paths {
+        if let Some((type_pred, class_obj, property, out_var)) = detect_class_property_count(query)
+        {
+            let fallback = build_operator_tree_inner(query, stats.clone(), false, planning)?;
+            return Ok(Box::new(crate::fast_count::class_property_count_operator(
+                type_pred,
+                class_obj,
+                property,
+                out_var,
+                Some(fallback),
+            )));
         }
     }
 
@@ -2684,6 +2839,50 @@ fn build_operator_tree_inner(
         }
     }
 
+    // Expression-based ORDER BY binds (e.g. `ORDER BY DESC(?a / ?b)`).
+    //
+    // Evaluated once per solution as a dedicated stage AFTER
+    // grouping/aggregation/HAVING/post-binds and BEFORE the sort, so the sort
+    // keys can reference GROUP BY keys, aggregate outputs, and SELECT post-binds.
+    // For ungrouped queries this is simply a post-WHERE stage. This placement is
+    // what makes expression ORDER BY work uniformly across no-grouping,
+    // dedup-only GROUP BY (no aggregation stage), and aggregating queries.
+    if !query.order_binds.is_empty() {
+        // Under grouping, an order-key expression may only read GROUP BY keys,
+        // aggregate outputs, and post-aggregation bind outputs. Referencing any
+        // other variable means it is `Binding::Grouped` here — reject cleanly
+        // rather than evaluating the bind over a grouped binding (which panics
+        // in `eval`), matching how bare `ORDER BY ?groupedVar` is rejected.
+        if needs_grouping {
+            let mut allowed: HashSet<VarId> = group_by_vec.iter().copied().collect();
+            for spec in &aggregates_vec {
+                allowed.insert(spec.output_var);
+            }
+            for (var, _) in &post_binds_vec {
+                allowed.insert(*var);
+            }
+            for (out_var, expr) in &query.order_binds {
+                for v in expr.referenced_vars() {
+                    if !allowed.contains(&v) {
+                        return Err(QueryError::InvalidQuery(format!(
+                            "ORDER BY expression references variable {v:?}, which is not a GROUP BY key or aggregate result"
+                        )));
+                    }
+                }
+                // A later order bind may legitimately reference an earlier one.
+                allowed.insert(*out_var);
+            }
+        }
+        for (var, expr) in &query.order_binds {
+            operator = Box::new(crate::bind::BindOperator::new(
+                operator,
+                *var,
+                expr.clone(),
+                vec![],
+            ));
+        }
+    }
+
     // Get the schema after grouping/aggregation/binds (for validation)
     let post_group_schema: Arc<[VarId]> = Arc::from(operator.schema().to_vec().into_boxed_slice());
 
@@ -2728,6 +2927,17 @@ fn build_operator_tree_inner(
             }
             for spec in &aggregates_vec {
                 allowed.insert(spec.output_var);
+            }
+            // Post-aggregation binds (SELECT expressions like `(CEIL(?avg) AS
+            // ?c)`) are per-group scalars computed after aggregation — they are
+            // valid sort keys.
+            for (var, _) in &post_binds_vec {
+                allowed.insert(*var);
+            }
+            // Desugared expression-ORDER-BY keys run as a post-grouping stage
+            // and are validated above to read only allowed vars.
+            for (var, _) in &query.order_binds {
+                allowed.insert(*var);
             }
             allowed_sort_vars = Some(allowed);
         }
@@ -2861,10 +3071,60 @@ mod tests {
             reasoning: ReasoningConfig::default(),
             grouping: None,
             ordering: Vec::new(),
+            order_binds: Vec::new(),
             limit: None,
             offset: None,
             post_values: None,
         }
+    }
+
+    #[test]
+    fn detect_stats_count_by_predicate_declines_expression_order_by() {
+        // The count-by-predicate fast path sorts on `query.ordering` directly,
+        // so it must decline when `order_binds` are present (the synthetic sort
+        // var is only bound by the generic pipeline's order-bind stage).
+        let s = VarId(0);
+        let p = VarId(1);
+        let o = VarId(2);
+        let c = VarId(3);
+        let order_key = VarId(4);
+
+        let make = |order_binds: Vec<(VarId, Expression)>, ordering: Vec<SortSpec>| Query {
+            context: ParsedContext::default(),
+            orig_context: None,
+            output: QueryOutput::select_all(vec![p, c]),
+            patterns: vec![Pattern::Triple(TriplePattern::new(
+                Ref::Var(s),
+                Ref::Var(p),
+                Term::Var(o),
+            ))],
+            reasoning: ReasoningConfig::default(),
+            grouping: Grouping::assemble(
+                vec![p],
+                vec![AggregateSpec {
+                    function: AggregateFn::Count(s),
+                    output_var: c,
+                }],
+                vec![],
+                None,
+            ),
+            ordering,
+            order_binds,
+            limit: None,
+            offset: None,
+            post_values: None,
+        };
+
+        // Bare-variable ORDER BY (no order binds): fast path applies.
+        let plain = make(Vec::new(), vec![SortSpec::asc(c)]);
+        assert_eq!(detect_stats_count_by_predicate(&plain), Some((p, c)));
+
+        // Expression ORDER BY (order binds present): must decline.
+        let with_expr = make(
+            vec![(order_key, Expression::Const(crate::ir::FlakeValue::Long(0)))],
+            vec![SortSpec::asc(order_key)],
+        );
+        assert!(detect_stats_count_by_predicate(&with_expr).is_none());
     }
 
     #[test]
@@ -2909,6 +3169,7 @@ mod tests {
             reasoning: ReasoningConfig::default(),
             grouping: None,
             ordering: vec![SortSpec::asc(label)],
+            order_binds: Vec::new(),
             limit: Some(10),
             offset: None,
             post_values: None,
@@ -2934,6 +3195,7 @@ mod tests {
             reasoning: ReasoningConfig::default(),
             grouping: None,
             ordering: Vec::new(),
+            order_binds: Vec::new(),
             limit: None,
             offset: None,
             post_values: None,
@@ -2960,6 +3222,7 @@ mod tests {
             reasoning: ReasoningConfig::default(),
             grouping: None,
             ordering: vec![SortSpec::asc(VarId(99))], // Invalid var
+            order_binds: Vec::new(),
             limit: None,
             offset: None,
             post_values: None,
@@ -3034,6 +3297,7 @@ mod tests {
             reasoning: ReasoningConfig::default(),
             grouping: make_grouping(),
             ordering: Vec::new(),
+            order_binds: Vec::new(),
             limit: None,
             offset: None,
             post_values: None,
@@ -3057,6 +3321,7 @@ mod tests {
             reasoning: ReasoningConfig::default(),
             grouping: make_grouping(),
             ordering: Vec::new(),
+            order_binds: Vec::new(),
             limit: None,
             offset: None,
             post_values: None,
@@ -3069,6 +3334,71 @@ mod tests {
             detect_exists_join_count_distinct_object(&reversed),
             Some((count_pred, exists_pred, out))
         );
+    }
+
+    #[test]
+    fn test_detect_sum_numeric_compare_as_count() {
+        let s = VarId(0);
+        let o = VarId(1);
+        let synth = VarId(2);
+        let out = VarId(3);
+        let pred = Ref::Sid(Sid::new(100, "numberOfCreators"));
+
+        // SELECT (SUM(?synth) AS ?out) WHERE { ?s <pred> ?o . BIND(?o > 0 AS ?synth) }
+        let make_query = |function: AggregateFn| Query {
+            context: ParsedContext::default(),
+            orig_context: None,
+            output: QueryOutput::select_all(vec![out]),
+            patterns: vec![
+                Pattern::Triple(TriplePattern::new(Ref::Var(s), pred.clone(), Term::Var(o))),
+                Pattern::Bind {
+                    var: synth,
+                    expr: crate::ir::Expression::gt(
+                        crate::ir::Expression::Var(o),
+                        crate::ir::Expression::Const(crate::ir::FlakeValue::Long(0)),
+                    ),
+                },
+            ],
+            reasoning: ReasoningConfig::default(),
+            grouping: Some(Grouping::Implicit {
+                aggregation: Aggregation {
+                    aggregates: fluree_db_core::NonEmpty::try_from_vec(vec![
+                        crate::ir::AggregateSpec {
+                            function,
+                            output_var: out,
+                        },
+                    ])
+                    .unwrap(),
+                    binds: Vec::new(),
+                },
+                having: None,
+            }),
+            ordering: Vec::new(),
+            order_binds: Vec::new(),
+            limit: None,
+            offset: None,
+            post_values: None,
+        };
+
+        // SUM (List / non-DISTINCT) over the comparison synth var => detected as Gt/threshold 0.
+        let q = make_query(AggregateFn::Sum(synth, InputSemantics::List));
+        assert_eq!(
+            detect_sum_numeric_compare_as_count(&q),
+            Some((
+                pred.clone(),
+                NumericCompareOp::Gt,
+                fluree_db_core::FlakeValue::Long(0),
+                out
+            ))
+        );
+
+        // SUM(DISTINCT ...) must be rejected: SUM(DISTINCT bool) is not a row count.
+        let q_distinct = make_query(AggregateFn::Sum(synth, InputSemantics::Set));
+        assert_eq!(detect_sum_numeric_compare_as_count(&q_distinct), None);
+
+        // A non-SUM aggregate over the same shape must be rejected.
+        let q_count = make_query(AggregateFn::Count(synth));
+        assert_eq!(detect_sum_numeric_compare_as_count(&q_count), None);
     }
 
     #[test]
@@ -3094,6 +3424,7 @@ mod tests {
             reasoning: ReasoningConfig::default(),
             grouping: None,
             ordering,
+            order_binds: Vec::new(),
             limit,
             offset,
             post_values: None,

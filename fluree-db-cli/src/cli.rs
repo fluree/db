@@ -178,7 +178,8 @@ pub struct Cli {
     pub memory_budget_mb: usize,
 
     /// Number of parallel parse threads for bulk import.
-    /// 0 = auto (system cores, default cap 6). Explicit values are not capped.
+    /// 0 = auto (most logical cores, capped to fit the memory budget).
+    /// Explicit values are honored as-is (not capped), floored at 1.
     #[arg(long, global = true, default_value_t = 0)]
     pub parallelism: usize,
 
@@ -237,7 +238,8 @@ pub enum Commands {
         memory_budget_mb: usize,
 
         /// Number of parallel parse threads for bulk import.
-        /// 0 = auto (system cores, default cap 6). Explicit values are not capped.
+        /// 0 = auto (most logical cores, capped to fit the memory budget).
+        /// Explicit values are honored as-is (not capped), floored at 1.
         #[arg(long, default_value_t = 0)]
         parallelism: usize,
 

@@ -8,7 +8,7 @@
 //! module consumes those artifacts without a bulk-import-only V1 → V2 pass.
 
 use crate::run_index::build::index_build::{
-    build_all_indexes, finish_graph_v2, BuildAllConfig, IndexBuildResult,
+    build_all_indexes, BuildAllConfig, IndexBuildResult, PersistingLeafWriter,
 };
 use crate::run_index::build::merge::KWayMerge;
 use crate::run_index::runs::run_writer::{
@@ -19,7 +19,6 @@ use crate::run_index::runs::spool::{
     MmapStringRemap, MmapSubjectRemap, SortedCommitMergeReaderV2, SubjectRemap,
 };
 use crate::stats::{stats_record_from_v2, SpotClassStats, DT_REF_ID};
-use fluree_db_binary_index::format::leaf::LeafWriter;
 use fluree_db_binary_index::format::run_record::RunSortOrder;
 use fluree_db_binary_index::format::run_record_v2::cmp_v2_spot;
 use fluree_db_core::o_type::OType;
@@ -742,6 +741,11 @@ pub fn build_indexes_from_commits(
         skip_history: true, // Append-only: no time-travel data.
         g_id: config.g_id,
         progress: config.build_progress.clone(),
+        // Build the secondary orders (PSOT/POST/OPST) concurrently, bounded by
+        // the import core budget. SPOT already builds on its own thread above,
+        // so total concurrent build threads are ~1 (SPOT) + max_concurrency.
+        // build_all_indexes clamps this to the number of buildable orders.
+        max_concurrency: config.worker_count,
     };
 
     let mut order_results = build_all_indexes(&build_config).map_err(io::Error::other)?;
@@ -831,10 +835,18 @@ fn build_spot_index_from_commits(
 
     let mut merge = KWayMerge::new(streams, cmp_v2_spot)?;
     let order = RunSortOrder::Spot;
-    let order_name = order.dir_name();
-    std::fs::create_dir_all(index_dir.join(format!("graph_{g_id}/{order_name}")))?;
 
-    let mut writer = LeafWriter::new(order, leaflet_target_rows, leaf_target_rows, zstd_level);
+    // Streams each completed leaf to disk as produced (see PersistingLeafWriter)
+    // so the SPOT build — which overlaps the parallel secondary-order builds —
+    // does not retain its whole compressed leaf set in RAM.
+    let mut writer = PersistingLeafWriter::new(
+        g_id,
+        order,
+        index_dir,
+        leaflet_target_rows,
+        leaf_target_rows,
+        zstd_level,
+    )?;
     writer.set_skip_history(true);
 
     let mut total_rows = 0u64;
@@ -864,7 +876,7 @@ fn build_spot_index_from_commits(
         }
     }
 
-    let result = finish_graph_v2(g_id, order, writer, index_dir, order_name)?;
+    let result = writer.finish()?;
     tracing::info!(
         g_id,
         total_rows,
@@ -961,6 +973,9 @@ pub fn build_indexes_from_remapped_commits(
         skip_history: false, // Produce history sidecars for time-travel.
         g_id: config.g_id,
         progress: config.build_progress.clone(),
+        // Rebuild path builds all 4 orders here (no separate SPOT thread), so
+        // concurrency can cover all of them, bounded by the core budget.
+        max_concurrency: config.worker_count,
     };
 
     let order_results = build_all_indexes(&build_config).map_err(io::Error::other)?;

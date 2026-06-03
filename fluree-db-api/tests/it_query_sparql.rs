@@ -495,6 +495,340 @@ async fn sparql_count_distinct_with_group_by_and_order_by() {
 }
 
 #[tokio::test]
+async fn sparql_order_by_expression_no_aggregation() {
+    // Bug 1: expression-based ORDER BY (no aggregation). `(0 - ?favNum)`
+    // ascending must produce DESCENDING ?favNum, proving the expression is
+    // evaluated per-solution (a bare `ORDER BY ?favNum` would yield the
+    // opposite order).
+    assert_index_defaults();
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger = seed_people(&fluree, "people:main").await;
+
+    let query = r"
+        PREFIX ex: <http://example.org/ns/>
+        PREFIX person: <http://example.org/Person#>
+        SELECT ?favNum
+        WHERE { ex:jdoe person:favNums ?favNum }
+        ORDER BY (0 - ?favNum)
+    ";
+
+    let result = support::query_sparql(&fluree, &ledger, query)
+        .await
+        .unwrap();
+    let jsonld = result.to_jsonld(&ledger.snapshot).expect("to_jsonld");
+    // jdoe favNums [3,7,42,99]; ascending by (0 - favNum) => 99,42,7,3.
+    assert_eq!(jsonld, json!([[99], [42], [7], [3]]));
+}
+
+#[tokio::test]
+async fn sparql_order_by_expression_over_aggregate_with_limit() {
+    // Bug 1 + top-k: expression ORDER BY over an aggregate output is evaluated
+    // AFTER grouping (dedicated post-grouping stage). `(0 - ?c)` ascending =>
+    // descending count; LIMIT exercises top-k on the synthetic sort key.
+    assert_index_defaults();
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger = seed_people(&fluree, "people:main").await;
+
+    let query = r"
+        PREFIX person: <http://example.org/Person#>
+        SELECT ?handle (COUNT(?favNum) AS ?c)
+        WHERE {
+          ?person person:handle ?handle ;
+                  person:favNums ?favNum .
+        }
+        GROUP BY ?handle
+        ORDER BY (0 - ?c)
+        LIMIT 2
+    ";
+
+    let result = support::query_sparql(&fluree, &ledger, query)
+        .await
+        .unwrap();
+    let jsonld = result.to_jsonld(&ledger.snapshot).expect("to_jsonld");
+    // Counts: jbob 7, jdoe 4, bbob 1; descending by count, top 2.
+    assert_eq!(jsonld, json!([["jbob", 7], ["jdoe", 4]]));
+}
+
+#[tokio::test]
+async fn sparql_order_by_desc_expression_with_tiebreak() {
+    // BSBM-shaped `ORDER BY DESC(expr) ?tiebreak`: descending computed key then
+    // a bare variable tiebreaker, with LIMIT.
+    assert_index_defaults();
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger = seed_people(&fluree, "people:main").await;
+
+    let query = r"
+        PREFIX person: <http://example.org/Person#>
+        SELECT ?handle ?favNum
+        WHERE {
+          ?person person:handle ?handle ;
+                  person:favNums ?favNum .
+        }
+        ORDER BY DESC(?favNum * 1) ?handle
+        LIMIT 3
+    ";
+
+    let result = support::query_sparql(&fluree, &ledger, query)
+        .await
+        .unwrap();
+    let jsonld = result.to_jsonld(&ledger.snapshot).expect("to_jsonld");
+    // Highest favNums: 99 (jdoe), 42 (jdoe), 23 (bbob).
+    assert_eq!(jsonld, json!([["jdoe", 99], ["jdoe", 42], ["bbob", 23]]));
+}
+
+#[tokio::test]
+async fn sparql_order_by_float_ratio_expression() {
+    // BSBM BI Q5 shape: `ORDER BY DESC(xsd:float(?count) / N)`. Exercises
+    // expression ORDER BY (Bug 1) together with mixed float/int arithmetic in
+    // the sort key. Must neither reject at parse/lowering nor error at eval.
+    assert_index_defaults();
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger = seed_people(&fluree, "people:main").await;
+
+    let query = r"
+        PREFIX xsd: <http://www.w3.org/2001/XMLSchema#>
+        PREFIX person: <http://example.org/Person#>
+        SELECT ?handle (COUNT(?favNum) AS ?c)
+        WHERE {
+          ?person person:handle ?handle ;
+                  person:favNums ?favNum .
+        }
+        GROUP BY ?handle
+        ORDER BY DESC(xsd:float(?c) / 2)
+        LIMIT 10
+    ";
+
+    let result = support::query_sparql(&fluree, &ledger, query)
+        .await
+        .unwrap();
+    let jsonld = result.to_jsonld(&ledger.snapshot).expect("to_jsonld");
+    // xsd:float(count)/2: jbob 3.5, jdoe 2.0, bbob 0.5 => descending.
+    assert_eq!(jsonld, json!([["jbob", 7], ["jdoe", 4], ["bbob", 1]]));
+}
+
+#[tokio::test]
+async fn sparql_order_by_expression_dedup_only_group_by() {
+    // Regression (P1a): expression ORDER BY over a *dedup-only* GROUP BY (no
+    // aggregates) must work. The order key is computed by the dedicated
+    // post-grouping stage; the group key ?favNum survives grouping as a scalar.
+    assert_index_defaults();
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger = seed_people(&fluree, "people:main").await;
+
+    let query = r"
+        PREFIX person: <http://example.org/Person#>
+        SELECT ?favNum
+        WHERE { ?person person:favNums ?favNum }
+        GROUP BY ?favNum
+        ORDER BY (0 - ?favNum)
+    ";
+
+    let result = support::query_sparql(&fluree, &ledger, query)
+        .await
+        .unwrap();
+    let jsonld = result.to_jsonld(&ledger.snapshot).expect("to_jsonld");
+    // Distinct favNums across all people, descending.
+    assert_eq!(
+        jsonld,
+        json!([[99], [42], [23], [9], [8], [7], [6], [5], [3], [0]])
+    );
+}
+
+#[tokio::test]
+async fn sparql_order_by_inline_aggregate_shared_with_select_alias() {
+    // `ORDER BY DESC(COUNT(?x))` with an explicit GROUP BY. The inline aggregate
+    // is hoisted and deduped against the SELECT alias `?c`, so it sorts by the
+    // same count without recomputing it.
+    assert_index_defaults();
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger = seed_people(&fluree, "people:main").await;
+
+    let query = r"
+        PREFIX person: <http://example.org/Person#>
+        SELECT ?handle (COUNT(?favNum) AS ?c)
+        WHERE {
+          ?person person:handle ?handle ;
+                  person:favNums ?favNum .
+        }
+        GROUP BY ?handle
+        ORDER BY DESC(COUNT(?favNum))
+        LIMIT 10
+    ";
+
+    let result = support::query_sparql(&fluree, &ledger, query)
+        .await
+        .unwrap();
+    let jsonld = result.to_jsonld(&ledger.snapshot).expect("to_jsonld");
+    assert_eq!(jsonld, json!([["jbob", 7], ["jdoe", 4], ["bbob", 1]]));
+}
+
+#[tokio::test]
+async fn sparql_order_by_inline_aggregate_not_selected() {
+    // `ORDER BY DESC(COUNT(?favNum))` where the aggregate is NOT in the SELECT.
+    // It must be hoisted into the grouping with its own synthetic output var so
+    // the rows order by a count that never appears in the output.
+    assert_index_defaults();
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger = seed_people(&fluree, "people:main").await;
+
+    let query = r"
+        PREFIX person: <http://example.org/Person#>
+        SELECT ?handle
+        WHERE {
+          ?person person:handle ?handle ;
+                  person:favNums ?favNum .
+        }
+        GROUP BY ?handle
+        ORDER BY DESC(COUNT(?favNum))
+    ";
+
+    let result = support::query_sparql(&fluree, &ledger, query)
+        .await
+        .unwrap();
+    let jsonld = result.to_jsonld(&ledger.snapshot).expect("to_jsonld");
+    // Counts: jbob 7, jdoe 4, bbob 1 → handles in that order, count not projected.
+    assert_eq!(jsonld, json!([["jbob"], ["jdoe"], ["bbob"]]));
+}
+
+#[tokio::test]
+async fn sparql_order_by_inline_aggregate_implicit_single_group() {
+    // No explicit GROUP BY: the aggregate in ORDER BY triggers implicit
+    // single-group aggregation (must not error).
+    assert_index_defaults();
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger = seed_people(&fluree, "people:main").await;
+
+    let query = r"
+        PREFIX person: <http://example.org/Person#>
+        SELECT (COUNT(?favNum) AS ?c)
+        WHERE { ?person person:favNums ?favNum }
+        ORDER BY DESC(COUNT(?favNum))
+    ";
+
+    let result = support::query_sparql(&fluree, &ledger, query)
+        .await
+        .unwrap();
+    let jsonld = result.to_jsonld(&ledger.snapshot).expect("to_jsonld");
+    // Total favNums across all people = 4 + 1 + 7 = 12 (single group).
+    assert_eq!(jsonld, json!([[12]]));
+}
+
+#[tokio::test]
+async fn sparql_order_by_inline_aggregate_in_compound_expression() {
+    // Aggregate nested inside a compound order expression: `DESC(COUNT(?x) * 2)`.
+    assert_index_defaults();
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger = seed_people(&fluree, "people:main").await;
+
+    let query = r"
+        PREFIX person: <http://example.org/Person#>
+        SELECT ?handle (COUNT(?favNum) AS ?c)
+        WHERE {
+          ?person person:handle ?handle ;
+                  person:favNums ?favNum .
+        }
+        GROUP BY ?handle
+        ORDER BY DESC(COUNT(?favNum) * 2)
+    ";
+
+    let result = support::query_sparql(&fluree, &ledger, query)
+        .await
+        .unwrap();
+    let jsonld = result.to_jsonld(&ledger.snapshot).expect("to_jsonld");
+    assert_eq!(jsonld, json!([["jbob", 7], ["jdoe", 4], ["bbob", 1]]));
+}
+
+#[tokio::test]
+async fn sparql_order_by_expression_count_by_predicate_not_dropped() {
+    // Regression: the `?s ?p ?o` / GROUP BY ?p / COUNT(?s) shape can match the
+    // stats (and predicate-object) count fast paths, which sort on
+    // `query.ordering` directly. With an expression ORDER BY the sort var is
+    // synthetic, so a fast path that skips the order-bind stage would silently
+    // drop the sort. The result counts must come back strictly grouped and
+    // descending here.
+    assert_index_defaults();
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger = seed_people(&fluree, "people:main").await;
+
+    let query = r"
+        SELECT ?p (COUNT(?s) AS ?c)
+        WHERE { ?s ?p ?o }
+        GROUP BY ?p
+        ORDER BY (0 - ?c)
+    ";
+
+    let result = support::query_sparql(&fluree, &ledger, query)
+        .await
+        .unwrap();
+    let jsonld = result.to_jsonld(&ledger.snapshot).expect("to_jsonld");
+    let rows = jsonld.as_array().expect("array of rows");
+    let counts: Vec<i64> = rows
+        .iter()
+        .map(|row| row[1].as_i64().expect("count is an integer"))
+        .collect();
+    assert!(
+        counts.len() >= 2,
+        "expected multiple predicate groups, got: {counts:?}"
+    );
+    assert!(
+        counts.windows(2).all(|w| w[0] >= w[1]),
+        "ORDER BY (0 - ?c) must yield descending counts, got: {counts:?}"
+    );
+}
+
+#[tokio::test]
+async fn sparql_order_by_expression_over_grouped_var_errors_cleanly() {
+    // Regression (P1b): an aggregating query whose ORDER BY expression reads a
+    // variable that is neither a GROUP BY key nor an aggregate output must be
+    // rejected with a clean error — NOT panic on a Grouped binding.
+    assert_index_defaults();
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger = seed_people(&fluree, "people:main").await;
+
+    let query = r"
+        PREFIX person: <http://example.org/Person#>
+        SELECT ?handle (COUNT(?favNum) AS ?c)
+        WHERE {
+          ?person person:handle ?handle ;
+                  person:favNums ?favNum .
+        }
+        GROUP BY ?handle
+        ORDER BY (?favNum + 1)
+    ";
+
+    let result = support::query_sparql(&fluree, &ledger, query).await;
+    assert!(
+        result.is_err(),
+        "ORDER BY over a non-grouped variable should error, got: {result:?}"
+    );
+}
+
+#[tokio::test]
+async fn sparql_subquery_expression_order_by_errors_cleanly() {
+    // Regression (P2): expression ORDER BY inside a subquery must be rejected
+    // rather than silently mis-sorting by a grabbed variable. (Bare-variable
+    // subquery ORDER BY still works.)
+    assert_index_defaults();
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger = seed_people(&fluree, "people:main").await;
+
+    let query = r"
+        PREFIX person: <http://example.org/Person#>
+        SELECT ?favNum
+        WHERE {
+          { SELECT ?favNum WHERE { ?person person:favNums ?favNum }
+            ORDER BY (0 - ?favNum) }
+        }
+    ";
+
+    let result = support::query_sparql(&fluree, &ledger, query).await;
+    assert!(
+        result.is_err(),
+        "expression ORDER BY in a subquery should error, got: {result:?}"
+    );
+}
+
+#[tokio::test]
 async fn sparql_delete_data_removes_specified_triples() {
     assert_index_defaults();
     let fluree = FlureeBuilder::memory().build_memory();
@@ -2998,6 +3332,49 @@ async fn sparql_xsd_cast_double_from_integer() {
         .expect("xsd:double cast query");
     let jsonld = result.to_jsonld(&ledger.snapshot).expect("to_jsonld");
     assert_eq!(jsonld, json!([[42.0]]));
+}
+
+#[tokio::test]
+async fn sparql_integer_division_yields_decimal() {
+    // Per XPath op:numeric-divide, xsd:integer / xsd:integer yields xsd:decimal:
+    // 10 / 4 = 2.5, NOT a truncated integer 2.
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger = seed_builtin_fn_data(&fluree, "arith:int-div").await;
+
+    let query = r"
+        PREFIX ex: <http://example.org/ns/>
+        SELECT (10 / 4 AS ?r)
+        WHERE { ex:sushi ex:label ?label }
+    ";
+
+    let result = support::query_sparql(&fluree, &ledger, query)
+        .await
+        .expect("integer division query");
+    let jsonld = result.to_jsonld(&ledger.snapshot).expect("to_jsonld");
+    // xsd:decimal renders as a string to preserve exactness (see the
+    // xsd:double note elsewhere in this file); the value is 2.5, not 2.
+    assert_eq!(jsonld, json!([["2.5"]]));
+}
+
+#[tokio::test]
+async fn sparql_float_divided_by_integer_promotes() {
+    // Mixed numeric arithmetic: xsd:float(...) / xsd:integer must promote (not
+    // error with a type mismatch). 10.0 / 4 = 2.5.
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger = seed_builtin_fn_data(&fluree, "arith:float-div-int").await;
+
+    let query = r"
+        PREFIX xsd: <http://www.w3.org/2001/XMLSchema#>
+        PREFIX ex: <http://example.org/ns/>
+        SELECT (xsd:float(10) / 4 AS ?r)
+        WHERE { ex:sushi ex:label ?label }
+    ";
+
+    let result = support::query_sparql(&fluree, &ledger, query)
+        .await
+        .expect("float / integer query");
+    let jsonld = result.to_jsonld(&ledger.snapshot).expect("to_jsonld");
+    assert_eq!(jsonld, json!([[2.5]]));
 }
 
 #[tokio::test]

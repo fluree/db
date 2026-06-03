@@ -109,6 +109,807 @@ fn class_count(snapshot: &LedgerSnapshot, iri: &str) -> Option<u64> {
     None
 }
 
+/// Sum the per-(class, property) datatype flake counts across all graphs in the
+/// persisted index stats. This is exactly the quantity the COUNT(*) fast path
+/// folds (`Σ_dt classStat[C][P].datatypes`) and the value that issue #1266
+/// reports as stale after an incremental retraction / type change.
+///
+/// Returns `None` when no `(class, property)` entry is present at all (the class
+/// or property was purged), `Some(total)` otherwise.
+fn class_prop_datatype_total(
+    snapshot: &LedgerSnapshot,
+    class_iri: &str,
+    prop_iri: &str,
+) -> Option<u64> {
+    let stats = snapshot.stats.as_ref()?;
+    let graphs = stats.graphs.as_ref()?;
+    let mut found = false;
+    let mut total: u64 = 0;
+    for g in graphs {
+        let Some(classes) = g.classes.as_ref() else {
+            continue;
+        };
+        for c in classes {
+            if snapshot.decode_sid(&c.class_sid).as_deref() != Some(class_iri) {
+                continue;
+            }
+            for p in &c.properties {
+                if snapshot.decode_sid(&p.property_sid).as_deref() != Some(prop_iri) {
+                    continue;
+                }
+                found = true;
+                total += p.datatypes.iter().map(|(_, n)| *n).sum::<u64>();
+            }
+        }
+    }
+    found.then_some(total)
+}
+
+/// #1266 — case 3: deleting a NON-last instance of a class must decrement that
+/// class's per-property datatype counts.
+///
+/// Reproduction baseline: this test asserts the current-state-correct values and
+/// is expected to FAIL on the pre-fix incremental path (the per-(class,property)
+/// datatype count stays at 3 because the retraction is attributed to the
+/// subject's NET class membership, which is emptied when its rdf:type is
+/// retracted in the same batch).
+#[tokio::test]
+async fn class_property_datatype_decrements_after_delete_non_last_instance() {
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let path = tmp.path().to_string_lossy().to_string();
+
+    let mut fluree = FlureeBuilder::file(path)
+        .build()
+        .expect("build file fluree");
+
+    let (local, handle) = start_background_indexer_local(
+        fluree.backend().clone(),
+        Arc::new(fluree.nameservice_mode().clone()),
+        fluree_db_indexer::IndexerConfig::small(),
+    );
+    fluree.set_indexing_mode(fluree_db_api::tx::IndexingMode::Background(handle.clone()));
+
+    local
+        .run_until(async move {
+            let ledger_id = "it/stats-classprop-delete:main";
+            let ledger0 = genesis_ledger_for_fluree(&fluree, ledger_id);
+
+            let index_cfg = IndexConfig {
+                reindex_min_bytes: 0,
+                reindex_max_bytes: 10_000_000,
+            };
+
+            let storage = fluree
+                .backend()
+                .admin_storage_cloned()
+                .expect("test uses managed backend");
+
+            // Three Person instances, each with an integer ex:age.
+            let txn1 = json!({
+                "@context": { "ex": "http://example.org/" },
+                "@graph": [
+                    {"@id":"ex:alice","@type":"ex:Person","ex:age":30},
+                    {"@id":"ex:bob","@type":"ex:Person","ex:age":25},
+                    {"@id":"ex:carol","@type":"ex:Person","ex:age":35}
+                ]
+            });
+            let r1 = fluree
+                .insert_with_opts(
+                    ledger0,
+                    &txn1,
+                    TxnOpts::default(),
+                    CommitOpts::default(),
+                    &index_cfg,
+                )
+                .await
+                .expect("insert txn1");
+            let o1 =
+                trigger_index_and_wait_outcome(&handle, r1.ledger.ledger_id(), r1.receipt.t).await;
+            let fluree_db_api::IndexOutcome::Completed { root_id, .. } = o1 else {
+                unreachable!("helper only returns Completed")
+            };
+            let root1 = root_id.expect("expected root_id after first index");
+            let loaded1 = load_ledger_snapshot(&storage, &root1, ledger_id)
+                .await
+                .expect("load snapshot 1");
+
+            // Sanity: first index attributes all three ages to Person.
+            assert_eq!(
+                class_prop_datatype_total(
+                    &loaded1,
+                    "http://example.org/Person",
+                    "http://example.org/age"
+                ),
+                Some(3),
+                "first index should attribute 3 ages to Person"
+            );
+
+            // Delete bob entirely (retracts his rdf:type AND his ex:age in one txn).
+            let del = json!({
+                "@context": { "ex": "http://example.org/" },
+                "where": {"@id":"ex:bob","@type":"ex:Person","ex:age":25},
+                "delete": {"@id":"ex:bob","@type":"ex:Person","ex:age":25}
+            });
+            let r2 = fluree
+                .update_with_opts(
+                    r1.ledger,
+                    &del,
+                    TxnOpts::default(),
+                    CommitOpts::default(),
+                    &index_cfg,
+                )
+                .await
+                .expect("delete bob");
+            let o2 =
+                trigger_index_and_wait_outcome(&handle, r2.ledger.ledger_id(), r2.receipt.t).await;
+            let fluree_db_api::IndexOutcome::Completed { root_id, .. } = o2 else {
+                unreachable!("helper only returns Completed")
+            };
+            let root2 = root_id.expect("expected root_id after incremental refresh");
+            let loaded2 = load_ledger_snapshot(&storage, &root2, ledger_id)
+                .await
+                .expect("load snapshot 2");
+
+            // The class instance count path is already correct.
+            assert_eq!(
+                class_count(&loaded2, "http://example.org/Person"),
+                Some(2),
+                "Person instance count should drop to 2 after deleting bob"
+            );
+
+            // #1266: the per-(class, property) datatype count must also drop to 2.
+            assert_eq!(
+                class_prop_datatype_total(
+                    &loaded2,
+                    "http://example.org/Person",
+                    "http://example.org/age"
+                ),
+                Some(2),
+                "Person.age datatype count must decrement to 2 after deleting bob (stale at 3 today)"
+            );
+        })
+        .await;
+}
+
+/// #1266 — case 4: re-typing a subject (retract type A, assert type B) without
+/// re-touching its properties must move the property datatype counts from the
+/// old class to the new class.
+///
+/// Reproduction baseline: asserts current-state-correct values; expected to FAIL
+/// pre-fix (Person.age stays 2, Employee.age never gets attributed).
+#[tokio::test]
+async fn class_property_reattributed_after_retype() {
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let path = tmp.path().to_string_lossy().to_string();
+
+    let mut fluree = FlureeBuilder::file(path)
+        .build()
+        .expect("build file fluree");
+
+    let (local, handle) = start_background_indexer_local(
+        fluree.backend().clone(),
+        Arc::new(fluree.nameservice_mode().clone()),
+        fluree_db_indexer::IndexerConfig::small(),
+    );
+    fluree.set_indexing_mode(fluree_db_api::tx::IndexingMode::Background(handle.clone()));
+
+    local
+        .run_until(async move {
+            let ledger_id = "it/stats-classprop-retype:main";
+            let ledger0 = genesis_ledger_for_fluree(&fluree, ledger_id);
+
+            let index_cfg = IndexConfig {
+                reindex_min_bytes: 0,
+                reindex_max_bytes: 10_000_000,
+            };
+
+            let storage = fluree
+                .backend()
+                .admin_storage_cloned()
+                .expect("test uses managed backend");
+
+            // Two Person instances with integer ex:age. bob stays a Person so the
+            // Person class survives (we want to observe its stale property count).
+            let txn1 = json!({
+                "@context": { "ex": "http://example.org/" },
+                "@graph": [
+                    {"@id":"ex:alice","@type":"ex:Person","ex:age":30},
+                    {"@id":"ex:bob","@type":"ex:Person","ex:age":25}
+                ]
+            });
+            let r1 = fluree
+                .insert_with_opts(
+                    ledger0,
+                    &txn1,
+                    TxnOpts::default(),
+                    CommitOpts::default(),
+                    &index_cfg,
+                )
+                .await
+                .expect("insert txn1");
+            let o1 =
+                trigger_index_and_wait_outcome(&handle, r1.ledger.ledger_id(), r1.receipt.t).await;
+            let fluree_db_api::IndexOutcome::Completed { root_id, .. } = o1 else {
+                unreachable!("helper only returns Completed")
+            };
+            let root1 = root_id.expect("expected root_id after first index");
+            let loaded1 = load_ledger_snapshot(&storage, &root1, ledger_id)
+                .await
+                .expect("load snapshot 1");
+
+            assert_eq!(
+                class_prop_datatype_total(
+                    &loaded1,
+                    "http://example.org/Person",
+                    "http://example.org/age"
+                ),
+                Some(2),
+                "first index should attribute 2 ages to Person"
+            );
+
+            // Re-type alice: Person -> Employee. Her ex:age flake is NOT touched.
+            let retype = json!({
+                "@context": { "ex": "http://example.org/" },
+                "where": {"@id":"ex:alice","@type":"ex:Person"},
+                "delete": {"@id":"ex:alice","@type":"ex:Person"},
+                "insert": {"@id":"ex:alice","@type":"ex:Employee"}
+            });
+            let r2 = fluree
+                .update_with_opts(
+                    r1.ledger,
+                    &retype,
+                    TxnOpts::default(),
+                    CommitOpts::default(),
+                    &index_cfg,
+                )
+                .await
+                .expect("retype alice");
+            let o2 =
+                trigger_index_and_wait_outcome(&handle, r2.ledger.ledger_id(), r2.receipt.t).await;
+            let fluree_db_api::IndexOutcome::Completed { root_id, .. } = o2 else {
+                unreachable!("helper only returns Completed")
+            };
+            let root2 = root_id.expect("expected root_id after incremental refresh");
+            let loaded2 = load_ledger_snapshot(&storage, &root2, ledger_id)
+                .await
+                .expect("load snapshot 2");
+
+            // Class instance counts (already correct).
+            assert_eq!(
+                class_count(&loaded2, "http://example.org/Person"),
+                Some(1),
+                "Person count should be 1 (bob) after retyping alice"
+            );
+            assert_eq!(
+                class_count(&loaded2, "http://example.org/Employee"),
+                Some(1),
+                "Employee count should be 1 (alice) after retype"
+            );
+
+            // #1266: alice's age must move from Person to Employee.
+            assert_eq!(
+                class_prop_datatype_total(
+                    &loaded2,
+                    "http://example.org/Person",
+                    "http://example.org/age"
+                ),
+                Some(1),
+                "Person.age must drop to 1 (bob only) after retyping alice (stale at 2 today)"
+            );
+            assert_eq!(
+                class_prop_datatype_total(
+                    &loaded2,
+                    "http://example.org/Employee",
+                    "http://example.org/age"
+                ),
+                Some(1),
+                "Employee.age must be 1 (alice) after retype (missing today)"
+            );
+        })
+        .await;
+}
+
+/// Sum the per-(subject_class, property, object_class) ref-edge counts in the
+/// persisted index stats. This is the `ref_classes` distribution #1266 must keep
+/// current-state-exact when an endpoint of a reference is re-typed.
+fn ref_class_total(
+    snapshot: &LedgerSnapshot,
+    subj_class_iri: &str,
+    prop_iri: &str,
+    obj_class_iri: &str,
+) -> Option<u64> {
+    let stats = snapshot.stats.as_ref()?;
+    let graphs = stats.graphs.as_ref()?;
+    let mut found = false;
+    let mut total: u64 = 0;
+    for g in graphs {
+        let Some(classes) = g.classes.as_ref() else {
+            continue;
+        };
+        for c in classes {
+            if snapshot.decode_sid(&c.class_sid).as_deref() != Some(subj_class_iri) {
+                continue;
+            }
+            for p in &c.properties {
+                if snapshot.decode_sid(&p.property_sid).as_deref() != Some(prop_iri) {
+                    continue;
+                }
+                for rc in &p.ref_classes {
+                    if snapshot.decode_sid(&rc.class_sid).as_deref() == Some(obj_class_iri) {
+                        found = true;
+                        total += rc.count;
+                    }
+                }
+            }
+        }
+    }
+    found.then_some(total)
+}
+
+/// #1266 — Case A: re-typing a SUBJECT must move its existing outgoing ref-class
+/// edges from the old subject-class bucket to the new one. (The `worksFor` edge
+/// is NOT touched in the re-type batch.)
+#[tokio::test]
+async fn ref_class_reattributed_after_subject_retype() {
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let path = tmp.path().to_string_lossy().to_string();
+    let mut fluree = FlureeBuilder::file(path)
+        .build()
+        .expect("build file fluree");
+    let (local, handle) = start_background_indexer_local(
+        fluree.backend().clone(),
+        Arc::new(fluree.nameservice_mode().clone()),
+        fluree_db_indexer::IndexerConfig::small(),
+    );
+    fluree.set_indexing_mode(fluree_db_api::tx::IndexingMode::Background(handle.clone()));
+
+    local
+        .run_until(async move {
+            let ledger_id = "it/ref-subject-retype:main";
+            let ledger0 = genesis_ledger_for_fluree(&fluree, ledger_id);
+            let index_cfg = IndexConfig {
+                reindex_min_bytes: 0,
+                reindex_max_bytes: 10_000_000,
+            };
+            let storage = fluree
+                .backend()
+                .admin_storage_cloned()
+                .expect("test uses managed backend");
+
+            let txn1 = json!({
+                "@context": { "ex": "http://example.org/" },
+                "@graph": [
+                    {"@id":"ex:alice","@type":"ex:Person","ex:worksFor":{"@id":"ex:org1"}},
+                    {"@id":"ex:org1","@type":"ex:Organization"}
+                ]
+            });
+            let r1 = fluree
+                .insert_with_opts(
+                    ledger0,
+                    &txn1,
+                    TxnOpts::default(),
+                    CommitOpts::default(),
+                    &index_cfg,
+                )
+                .await
+                .expect("insert txn1");
+            let o1 =
+                trigger_index_and_wait_outcome(&handle, r1.ledger.ledger_id(), r1.receipt.t).await;
+            let fluree_db_api::IndexOutcome::Completed { root_id, .. } = o1 else {
+                unreachable!("helper only returns Completed")
+            };
+            let loaded1 = load_ledger_snapshot(&storage, &root_id.expect("root1"), ledger_id)
+                .await
+                .expect("load snapshot 1");
+            assert_eq!(
+                ref_class_total(
+                    &loaded1,
+                    "http://example.org/Person",
+                    "http://example.org/worksFor",
+                    "http://example.org/Organization"
+                ),
+                Some(1),
+                "first index: Person.worksFor -> Organization == 1"
+            );
+
+            // Re-type alice Person -> Employee; do NOT touch worksFor.
+            let retype = json!({
+                "@context": { "ex": "http://example.org/" },
+                "where": {"@id":"ex:alice","@type":"ex:Person"},
+                "delete": {"@id":"ex:alice","@type":"ex:Person"},
+                "insert": {"@id":"ex:alice","@type":"ex:Employee"}
+            });
+            let r2 = fluree
+                .update_with_opts(
+                    r1.ledger,
+                    &retype,
+                    TxnOpts::default(),
+                    CommitOpts::default(),
+                    &index_cfg,
+                )
+                .await
+                .expect("retype alice");
+            let o2 =
+                trigger_index_and_wait_outcome(&handle, r2.ledger.ledger_id(), r2.receipt.t).await;
+            let fluree_db_api::IndexOutcome::Completed { root_id, .. } = o2 else {
+                unreachable!("helper only returns Completed")
+            };
+            let loaded2 = load_ledger_snapshot(&storage, &root_id.expect("root2"), ledger_id)
+                .await
+                .expect("load snapshot 2");
+            assert_eq!(
+                ref_class_total(
+                    &loaded2,
+                    "http://example.org/Person",
+                    "http://example.org/worksFor",
+                    "http://example.org/Organization"
+                ),
+                None,
+                "Person.worksFor edge must be gone after alice re-typed away"
+            );
+            assert_eq!(
+                ref_class_total(
+                    &loaded2,
+                    "http://example.org/Employee",
+                    "http://example.org/worksFor",
+                    "http://example.org/Organization"
+                ),
+                Some(1),
+                "Employee.worksFor -> Organization == 1 after re-type"
+            );
+        })
+        .await;
+}
+
+/// #1266 — Case B: re-typing an OBJECT (a reference target) must move every
+/// inbound edge's object-class bucket. Requires the reverse OPST pass.
+#[tokio::test]
+async fn ref_class_reattributed_after_object_retype() {
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let path = tmp.path().to_string_lossy().to_string();
+    let mut fluree = FlureeBuilder::file(path)
+        .build()
+        .expect("build file fluree");
+    let (local, handle) = start_background_indexer_local(
+        fluree.backend().clone(),
+        Arc::new(fluree.nameservice_mode().clone()),
+        fluree_db_indexer::IndexerConfig::small(),
+    );
+    fluree.set_indexing_mode(fluree_db_api::tx::IndexingMode::Background(handle.clone()));
+
+    local
+        .run_until(async move {
+            let ledger_id = "it/ref-object-retype:main";
+            let ledger0 = genesis_ledger_for_fluree(&fluree, ledger_id);
+            let index_cfg = IndexConfig {
+                reindex_min_bytes: 0,
+                reindex_max_bytes: 10_000_000,
+            };
+            let storage = fluree
+                .backend()
+                .admin_storage_cloned()
+                .expect("test uses managed backend");
+
+            let txn1 = json!({
+                "@context": { "ex": "http://example.org/" },
+                "@graph": [
+                    {"@id":"ex:alice","@type":"ex:Employee","ex:worksFor":{"@id":"ex:org1"}},
+                    {"@id":"ex:org1","@type":"ex:Organization"}
+                ]
+            });
+            let r1 = fluree
+                .insert_with_opts(
+                    ledger0,
+                    &txn1,
+                    TxnOpts::default(),
+                    CommitOpts::default(),
+                    &index_cfg,
+                )
+                .await
+                .expect("insert txn1");
+            let o1 =
+                trigger_index_and_wait_outcome(&handle, r1.ledger.ledger_id(), r1.receipt.t).await;
+            let fluree_db_api::IndexOutcome::Completed { root_id, .. } = o1 else {
+                unreachable!("helper only returns Completed")
+            };
+            let loaded1 = load_ledger_snapshot(&storage, &root_id.expect("root1"), ledger_id)
+                .await
+                .expect("load snapshot 1");
+            assert_eq!(
+                ref_class_total(
+                    &loaded1,
+                    "http://example.org/Employee",
+                    "http://example.org/worksFor",
+                    "http://example.org/Organization"
+                ),
+                Some(1),
+                "first index: Employee.worksFor -> Organization == 1"
+            );
+
+            // Re-type org1 Organization -> Company; do NOT touch alice or the edge.
+            let retype = json!({
+                "@context": { "ex": "http://example.org/" },
+                "where": {"@id":"ex:org1","@type":"ex:Organization"},
+                "delete": {"@id":"ex:org1","@type":"ex:Organization"},
+                "insert": {"@id":"ex:org1","@type":"ex:Company"}
+            });
+            let r2 = fluree
+                .update_with_opts(
+                    r1.ledger,
+                    &retype,
+                    TxnOpts::default(),
+                    CommitOpts::default(),
+                    &index_cfg,
+                )
+                .await
+                .expect("retype org1");
+            let o2 =
+                trigger_index_and_wait_outcome(&handle, r2.ledger.ledger_id(), r2.receipt.t).await;
+            let fluree_db_api::IndexOutcome::Completed { root_id, .. } = o2 else {
+                unreachable!("helper only returns Completed")
+            };
+            let loaded2 = load_ledger_snapshot(&storage, &root_id.expect("root2"), ledger_id)
+                .await
+                .expect("load snapshot 2");
+            assert_eq!(
+                ref_class_total(
+                    &loaded2,
+                    "http://example.org/Employee",
+                    "http://example.org/worksFor",
+                    "http://example.org/Organization"
+                ),
+                None,
+                "old object-class bucket must be gone after org1 re-typed"
+            );
+            assert_eq!(
+                ref_class_total(
+                    &loaded2,
+                    "http://example.org/Employee",
+                    "http://example.org/worksFor",
+                    "http://example.org/Company"
+                ),
+                Some(1),
+                "Employee.worksFor -> Company == 1 after object re-type"
+            );
+        })
+        .await;
+}
+
+/// #1266 — both endpoints re-typed in one batch, edge untouched. Case A owns it;
+/// must move (Person, worksFor, Organization) -> (Employee, worksFor, Company)
+/// exactly once (no double-count).
+#[tokio::test]
+async fn ref_class_reattributed_after_both_endpoints_retype() {
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let path = tmp.path().to_string_lossy().to_string();
+    let mut fluree = FlureeBuilder::file(path)
+        .build()
+        .expect("build file fluree");
+    let (local, handle) = start_background_indexer_local(
+        fluree.backend().clone(),
+        Arc::new(fluree.nameservice_mode().clone()),
+        fluree_db_indexer::IndexerConfig::small(),
+    );
+    fluree.set_indexing_mode(fluree_db_api::tx::IndexingMode::Background(handle.clone()));
+
+    local
+        .run_until(async move {
+            let ledger_id = "it/ref-both-retype:main";
+            let ledger0 = genesis_ledger_for_fluree(&fluree, ledger_id);
+            let index_cfg = IndexConfig {
+                reindex_min_bytes: 0,
+                reindex_max_bytes: 10_000_000,
+            };
+            let storage = fluree
+                .backend()
+                .admin_storage_cloned()
+                .expect("test uses managed backend");
+
+            let txn1 = json!({
+                "@context": { "ex": "http://example.org/" },
+                "@graph": [
+                    {"@id":"ex:alice","@type":"ex:Person","ex:worksFor":{"@id":"ex:org1"}},
+                    {"@id":"ex:org1","@type":"ex:Organization"}
+                ]
+            });
+            let r1 = fluree
+                .insert_with_opts(
+                    ledger0,
+                    &txn1,
+                    TxnOpts::default(),
+                    CommitOpts::default(),
+                    &index_cfg,
+                )
+                .await
+                .expect("insert txn1");
+            let _ =
+                trigger_index_and_wait_outcome(&handle, r1.ledger.ledger_id(), r1.receipt.t).await;
+
+            // Re-type BOTH alice (Person->Employee) and org1 (Organization->Company);
+            // worksFor edge untouched.
+            let retype = json!({
+                "@context": { "ex": "http://example.org/" },
+                "delete": [
+                    {"@id":"ex:alice","@type":"ex:Person"},
+                    {"@id":"ex:org1","@type":"ex:Organization"}
+                ],
+                "insert": [
+                    {"@id":"ex:alice","@type":"ex:Employee"},
+                    {"@id":"ex:org1","@type":"ex:Company"}
+                ]
+            });
+            let r2 = fluree
+                .update_with_opts(
+                    r1.ledger,
+                    &retype,
+                    TxnOpts::default(),
+                    CommitOpts::default(),
+                    &index_cfg,
+                )
+                .await
+                .expect("retype both");
+            let o2 =
+                trigger_index_and_wait_outcome(&handle, r2.ledger.ledger_id(), r2.receipt.t).await;
+            let fluree_db_api::IndexOutcome::Completed { root_id, .. } = o2 else {
+                unreachable!("helper only returns Completed")
+            };
+            let loaded2 = load_ledger_snapshot(&storage, &root_id.expect("root2"), ledger_id)
+                .await
+                .expect("load snapshot 2");
+            assert_eq!(
+                ref_class_total(
+                    &loaded2,
+                    "http://example.org/Person",
+                    "http://example.org/worksFor",
+                    "http://example.org/Organization"
+                ),
+                None,
+                "old (Person, worksFor, Organization) bucket gone"
+            );
+            assert_eq!(
+                ref_class_total(
+                    &loaded2,
+                    "http://example.org/Employee",
+                    "http://example.org/worksFor",
+                    "http://example.org/Company"
+                ),
+                Some(1),
+                "new (Employee, worksFor, Company) bucket == 1 (moved exactly once)"
+            );
+            // No double-count: the only worksFor->Company edge is the single one.
+            assert_eq!(
+                ref_class_total(
+                    &loaded2,
+                    "http://example.org/Employee",
+                    "http://example.org/worksFor",
+                    "http://example.org/Organization"
+                ),
+                None,
+                "no stale Employee.worksFor -> Organization"
+            );
+        })
+        .await;
+}
+
+/// #1266 — rebuild gate: a re-type batch above the threshold aborts incremental
+/// and the caller falls back to a full rebuild, which recomputes class/ref stats
+/// from scratch (so the result is still current-state-correct).
+#[tokio::test]
+async fn large_retype_batch_defers_to_rebuild_and_stays_correct() {
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let path = tmp.path().to_string_lossy().to_string();
+    let mut fluree = FlureeBuilder::file(path)
+        .build()
+        .expect("build file fluree");
+    // Threshold of 1: re-typing 2+ existing subjects forces the rebuild fallback.
+    let (local, handle) = start_background_indexer_local(
+        fluree.backend().clone(),
+        Arc::new(fluree.nameservice_mode().clone()),
+        fluree_db_indexer::IndexerConfig::small().with_incremental_retype_max_subjects(1),
+    );
+    fluree.set_indexing_mode(fluree_db_api::tx::IndexingMode::Background(handle.clone()));
+
+    local
+        .run_until(async move {
+            let ledger_id = "it/large-retype-gate:main";
+            let ledger0 = genesis_ledger_for_fluree(&fluree, ledger_id);
+            let index_cfg = IndexConfig {
+                reindex_min_bytes: 0,
+                reindex_max_bytes: 10_000_000,
+            };
+            let storage = fluree
+                .backend()
+                .admin_storage_cloned()
+                .expect("test uses managed backend");
+
+            let txn1 = json!({
+                "@context": { "ex": "http://example.org/" },
+                "@graph": [
+                    {"@id":"ex:alice","@type":"ex:Person","ex:worksFor":{"@id":"ex:org1"}},
+                    {"@id":"ex:bob","@type":"ex:Person","ex:worksFor":{"@id":"ex:org1"}},
+                    {"@id":"ex:carol","@type":"ex:Person","ex:worksFor":{"@id":"ex:org1"}},
+                    {"@id":"ex:org1","@type":"ex:Organization"}
+                ]
+            });
+            let r1 = fluree
+                .insert_with_opts(
+                    ledger0,
+                    &txn1,
+                    TxnOpts::default(),
+                    CommitOpts::default(),
+                    &index_cfg,
+                )
+                .await
+                .expect("insert txn1");
+            let _ =
+                trigger_index_and_wait_outcome(&handle, r1.ledger.ledger_id(), r1.receipt.t).await;
+
+            // Re-type alice and bob (2 existing subjects > threshold 1) -> rebuild path.
+            let retype = json!({
+                "@context": { "ex": "http://example.org/" },
+                "delete": [
+                    {"@id":"ex:alice","@type":"ex:Person"},
+                    {"@id":"ex:bob","@type":"ex:Person"}
+                ],
+                "insert": [
+                    {"@id":"ex:alice","@type":"ex:Employee"},
+                    {"@id":"ex:bob","@type":"ex:Employee"}
+                ]
+            });
+            let r2 = fluree
+                .update_with_opts(
+                    r1.ledger,
+                    &retype,
+                    TxnOpts::default(),
+                    CommitOpts::default(),
+                    &index_cfg,
+                )
+                .await
+                .expect("retype alice+bob");
+            let o2 =
+                trigger_index_and_wait_outcome(&handle, r2.ledger.ledger_id(), r2.receipt.t).await;
+            let fluree_db_api::IndexOutcome::Completed { root_id, .. } = o2 else {
+                unreachable!("helper only returns Completed")
+            };
+            let loaded2 = load_ledger_snapshot(&storage, &root_id.expect("root2"), ledger_id)
+                .await
+                .expect("load snapshot 2");
+
+            // Rebuild must produce correct current-state stats.
+            assert_eq!(
+                class_count(&loaded2, "http://example.org/Person"),
+                Some(1),
+                "Person == 1 (carol)"
+            );
+            assert_eq!(
+                class_count(&loaded2, "http://example.org/Employee"),
+                Some(2),
+                "Employee == 2 (alice, bob)"
+            );
+            assert_eq!(
+                ref_class_total(
+                    &loaded2,
+                    "http://example.org/Person",
+                    "http://example.org/worksFor",
+                    "http://example.org/Organization"
+                ),
+                Some(1),
+                "carol still Person.worksFor -> Organization"
+            );
+            assert_eq!(
+                ref_class_total(
+                    &loaded2,
+                    "http://example.org/Employee",
+                    "http://example.org/worksFor",
+                    "http://example.org/Organization"
+                ),
+                Some(2),
+                "alice+bob now Employee.worksFor -> Organization"
+            );
+        })
+        .await;
+}
+
 #[tokio::test]
 async fn property_and_class_statistics_persist_in_db_root() {
     let tmp = tempfile::TempDir::new().expect("tempdir");

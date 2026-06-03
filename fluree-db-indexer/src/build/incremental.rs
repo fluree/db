@@ -1905,8 +1905,17 @@ pub async fn incremental_index(
                     {
                         Ok(s) => Some(Arc::new(s)),
                         Err(e) => {
-                            tracing::warn!(error = %e, "V6 store load for class attribution failed");
-                            None
+                            // We need the base store to seed base class entries and to
+                            // re-attribute re-typed subjects. Without it, base entries
+                            // resolve to sid64==0 and get dropped, publishing novelty-only
+                            // (wrong) class-property stats — which the rdf:type-star COUNT
+                            // fold then serves verbatim at HEAD. Abort to a full rebuild
+                            // (which loads its own data and recomputes class stats exactly),
+                            // mirroring the spatial-snapshot and re-type-workload gates above.
+                            return Err(IndexerError::IncrementalAbort(format!(
+                                "V6 store load for class attribution failed: {e}; \
+                                 falling back to full rebuild for correct class stats"
+                            )));
                         }
                     }
                 } else {
@@ -2010,14 +2019,27 @@ pub async fn incremental_index(
                                 }
                             }
                             Err(e) => {
-                                tracing::warn!(
-                                    g_id = scan_g_id, error = %e,
-                                    "batched PSOT class lookup failed for graph"
-                                );
+                                // Loads the base class membership that all re-attribution
+                                // (datatype/lang AND ref-class) is computed against. A
+                                // failure here makes every downstream class delta unsound,
+                                // so abort to a full rebuild rather than warn-and-continue.
+                                return Err(IndexerError::IncrementalAbort(format!(
+                                    "Phase 3b base PSOT class lookup failed for graph \
+                                     {scan_g_id}: {e} (deferring class-stat recompute to \
+                                     full rebuild)"
+                                )));
                             }
                         }
                     }
                 }
+
+                // Snapshot BASE (pre-batch) class membership before applying this
+                // batch's rdf:type deltas. Property *retractions* must be attributed
+                // to the class set the subject had in the base index (where the base
+                // stats counted them), while *assertions* attribute to the NET set.
+                // When a subject's type is unchanged, base == net and this is a no-op
+                // distinction. See issue #1266.
+                let base_subject_classes = subject_classes.clone();
 
                 // Apply novelty rdf:type deltas on top of base memberships.
                 let subject_classes_started = Instant::now();
@@ -2043,6 +2065,45 @@ pub async fn incremental_index(
                     "Phase 3b: subject class membership ready"
                 );
 
+                // Subjects whose class membership CHANGED this batch (re-type, add or
+                // remove a type, or full delete). Their existing-property attribution
+                // can't be derived from in-batch deltas alone, so the routing loop
+                // below skips them and the base-index re-scan (Stage 2) handles them.
+                // A no-op rdf:type assertion (same type) leaves base == net and is not
+                // considered changed. See issue #1266.
+                let changed_membership: std::collections::HashSet<(u16, u64)> =
+                    novelty_subject_class_deltas
+                        .keys()
+                        .filter(|key| base_subject_classes.get(*key) != subject_classes.get(*key))
+                        .copied()
+                        .collect();
+
+                // Rebuild gate (issue #1266): re-typing/deleting an EXISTING subject
+                // forces a base-index re-scan to move its class-scoped datatype/lang/ref
+                // stats. Above a threshold, recomputing class stats from scratch via the
+                // full-rebuild SPOT pass is cheaper and simpler, so abort incremental and
+                // let the caller fall back to rebuild. Only count subjects that existed in
+                // the base index (those drive the re-scan work); brand-new typed subjects
+                // are free. An IncrementalAbort is caught in lib.rs and routed to rebuild.
+                let retype_workload = changed_membership
+                    .iter()
+                    .filter(|key| base_subject_classes.contains_key(*key))
+                    .count();
+                if retype_workload > config.incremental_retype_max_subjects {
+                    tracing::warn!(
+                        retype_workload,
+                        threshold = config.incremental_retype_max_subjects,
+                        "Phase 3b: existing-subject rdf:type changes exceed threshold; \
+                         aborting incremental for full rebuild (class stats recomputed \
+                         from the SPOT pass)"
+                    );
+                    return Err(IndexerError::IncrementalAbort(format!(
+                        "re-type workload {retype_workload} exceeds threshold {} \
+                         (deferring class-stat recompute to full rebuild)",
+                        config.incremental_retype_max_subjects
+                    )));
+                }
+
                 // Build class→properties, class→prop→dts, class→prop→langs, ref_edges.
                 let attribution_maps_started = Instant::now();
                 let mut class_properties: std::collections::HashMap<
@@ -2062,34 +2123,72 @@ pub async fn incremental_index(
                     std::collections::HashMap<u32, std::collections::HashMap<u64, i64>>,
                 > = std::collections::HashMap::new();
 
-                for (&(g_id, s_id), props) in &novelty_subject_props {
-                    if let Some(classes) = subject_classes.get(&(g_id, s_id)) {
-                        for &class_sid64 in classes {
-                            class_properties
-                                .entry((g_id, class_sid64))
-                                .or_default()
-                                .extend(props);
-                            if let Some(s_dts) = novelty_subject_prop_dts.get(&(g_id, s_id)) {
-                                for (&pid, dt_map) in s_dts {
-                                    let cp = class_prop_dts
-                                        .entry((g_id, class_sid64))
-                                        .or_default()
-                                        .entry(pid)
-                                        .or_default();
-                                    for (&dt, &cnt) in dt_map {
-                                        *cp.entry(dt).or_insert(0) += cnt;
+                // Attribute per-subject property deltas to classes with base-vs-net
+                // routing (issue #1266): an assertion (positive delta) is attributed
+                // to the subject's NET class set; a retraction (negative delta) to its
+                // BASE class set (where the base stats counted it). When the subject's
+                // type is unchanged base == net, so this matches the prior behavior.
+                // Routing retractions to base makes a delete (type + props retracted in
+                // one batch) decrement the right class instead of an emptied net set.
+                //
+                // NOTE: a subject re-typed WITHOUT touching its properties has no entry
+                // in `novelty_subject_props` and is handled by the base-index re-scan
+                // below, not here.
+                for &(g_id, s_id) in novelty_subject_props.keys() {
+                    if changed_membership.contains(&(g_id, s_id)) {
+                        // Handled by the base-index re-scan below (Stage 2); skipping
+                        // here avoids double-counting its in-batch deltas.
+                        continue;
+                    }
+                    let net_cls = subject_classes.get(&(g_id, s_id));
+                    let base_cls = base_subject_classes.get(&(g_id, s_id));
+                    let mut classes_touched: std::collections::HashSet<u64> =
+                        std::collections::HashSet::new();
+                    if let Some(c) = net_cls {
+                        classes_touched.extend(c.iter().copied());
+                    }
+                    if let Some(c) = base_cls {
+                        classes_touched.extend(c.iter().copied());
+                    }
+                    let s_dts = novelty_subject_prop_dts.get(&(g_id, s_id));
+                    let s_langs = novelty_subject_prop_langs.get(&(g_id, s_id));
+                    for &class_sid64 in &classes_touched {
+                        let in_net = net_cls.is_some_and(|c| c.contains(&class_sid64));
+                        let in_base = base_cls.is_some_and(|c| c.contains(&class_sid64));
+                        if let Some(s_dts) = s_dts {
+                            for (&pid, dt_map) in s_dts {
+                                for (&dt, &cnt) in dt_map {
+                                    if (cnt > 0 && in_net) || (cnt < 0 && in_base) {
+                                        *class_prop_dts
+                                            .entry((g_id, class_sid64))
+                                            .or_default()
+                                            .entry(pid)
+                                            .or_default()
+                                            .entry(dt)
+                                            .or_insert(0) += cnt;
+                                        class_properties
+                                            .entry((g_id, class_sid64))
+                                            .or_default()
+                                            .insert(pid);
                                     }
                                 }
                             }
-                            if let Some(s_langs) = novelty_subject_prop_langs.get(&(g_id, s_id)) {
-                                for (&pid, lang_map) in s_langs {
-                                    let cl = class_prop_lang_deltas
-                                        .entry((g_id, class_sid64))
-                                        .or_default()
-                                        .entry(pid)
-                                        .or_default();
-                                    for (&lid, &cnt) in lang_map {
-                                        *cl.entry(lid).or_insert(0) += cnt;
+                        }
+                        if let Some(s_langs) = s_langs {
+                            for (&pid, lang_map) in s_langs {
+                                for (&lid, &cnt) in lang_map {
+                                    if (cnt > 0 && in_net) || (cnt < 0 && in_base) {
+                                        *class_prop_lang_deltas
+                                            .entry((g_id, class_sid64))
+                                            .or_default()
+                                            .entry(pid)
+                                            .or_default()
+                                            .entry(lid)
+                                            .or_insert(0) += cnt;
+                                        class_properties
+                                            .entry((g_id, class_sid64))
+                                            .or_default()
+                                            .insert(pid);
                                     }
                                 }
                             }
@@ -2097,9 +2196,16 @@ pub async fn incremental_index(
                     }
                 }
                 for (&(g_id, subj), per_prop) in &subject_ref_history {
-                    let Some(subj_classes) = subject_classes.get(&(g_id, subj)) else {
-                        continue;
-                    };
+                    let net_subj = subject_classes.get(&(g_id, subj));
+                    let base_subj = base_subject_classes.get(&(g_id, subj));
+                    let mut subj_classes_touched: std::collections::HashSet<u64> =
+                        std::collections::HashSet::new();
+                    if let Some(c) = net_subj {
+                        subj_classes_touched.extend(c.iter().copied());
+                    }
+                    if let Some(c) = base_subj {
+                        subj_classes_touched.extend(c.iter().copied());
+                    }
                     for (&pid, objs) in per_prop {
                         for (&obj, &delta) in objs {
                             if delta == 0 {
@@ -2108,7 +2214,15 @@ pub async fn incremental_index(
                             let Some(obj_classes) = subject_classes.get(&(g_id, obj)) else {
                                 continue;
                             };
-                            for &sc in subj_classes {
+                            // Route the edge by sign on the subject side (issue #1266):
+                            // an asserted edge attributes to the subject's NET class set,
+                            // a retracted edge to its BASE class set.
+                            for &sc in &subj_classes_touched {
+                                let in_net = net_subj.is_some_and(|c| c.contains(&sc));
+                                let in_base = base_subj.is_some_and(|c| c.contains(&sc));
+                                if !((delta > 0 && in_net) || (delta < 0 && in_base)) {
+                                    continue;
+                                }
                                 for &oc in obj_classes {
                                     *ref_edges
                                         .entry((g_id, sc))
@@ -2122,6 +2236,351 @@ pub async fn incremental_index(
                         }
                     }
                 }
+                // Stage 2 (issue #1266): re-attribute the EXISTING properties of
+                // subjects whose class membership changed this batch. The routing loop
+                // above skipped these subjects; here we read their live property set
+                // from the base index and move per-(property, datatype/lang) counts off
+                // the classes they left and onto the classes they joined.
+                //
+                // For each changed subject S with base class set `B` and net set `N`,
+                // and per-(p, dt) base count `old` plus in-batch delta `delta`
+                // (`new = old + delta`):
+                //   - class in B \ N (left):       apply -old
+                //   - class in N \ B (joined):     apply  new
+                //   - class in B ∩ N (kept):       apply  delta
+                //
+                // This block handles datatype + language distributions. Ref-class
+                // edges (which depend on BOTH endpoints' classes) are re-attributed in
+                // the dedicated ref pass further below — Case A (re-typed subjects'
+                // outgoing edges, collected here from the same base scan) and Case B
+                // (re-typed objects' inbound edges via reverse OPST).
+                if let Some(ref store) = store_opt {
+                    if !changed_membership.is_empty() {
+                        let iri_ref_otype = fluree_db_core::o_type::OType::IRI_REF.as_u16();
+                        // Outgoing ref edges (g_id, subject, p_id, object) of re-typed
+                        // subjects, collected from the same base scan used for datatype
+                        // re-attribution (Case A). Combined with re-typed objects' inbound
+                        // edges (Case B, reverse OPST) below to move ref-class stats across
+                        // the type change (issue #1266).
+                        let mut outgoing_ref_edges: Vec<(u16, u64, u32, u64)> = Vec::new();
+                        let mut changed_by_graph: std::collections::HashMap<u16, Vec<u64>> =
+                            std::collections::HashMap::new();
+                        for &(g_id, s_id) in &changed_membership {
+                            changed_by_graph.entry(g_id).or_default().push(s_id);
+                        }
+                        for (&g_id, sids) in &changed_by_graph {
+                            let base_props =
+                                match fluree_db_binary_index::batched_lookup_subject_properties(
+                                    store,
+                                    g_id,
+                                    sids,
+                                    base_root.index_t,
+                                ) {
+                                    Ok(m) => m,
+                                    Err(e) => {
+                                        // This scan drives the datatype/language
+                                        // re-attribution that makes the now-ungated
+                                        // class-stat folds current-state-exact. A
+                                        // warn-and-continue here would silently leave
+                                        // re-typed subjects with stale per-(class,
+                                        // property) stats, so abort to a full rebuild
+                                        // (which recomputes class stats from the SPOT
+                                        // pass). Caught in lib.rs and routed to rebuild.
+                                        return Err(IndexerError::IncrementalAbort(format!(
+                                            "Phase 3b base subject-property scan failed \
+                                             for graph {g_id}: {e} (deferring class-stat \
+                                             recompute to full rebuild)"
+                                        )));
+                                    }
+                                };
+                            for &s_id in sids {
+                                let base_cls = base_subject_classes
+                                    .get(&(g_id, s_id))
+                                    .cloned()
+                                    .unwrap_or_default();
+                                let net_cls = subject_classes
+                                    .get(&(g_id, s_id))
+                                    .cloned()
+                                    .unwrap_or_default();
+
+                                // combined[p][dt] = (old_count_from_base, in_batch_delta)
+                                let mut combined_dts: std::collections::HashMap<
+                                    u32,
+                                    std::collections::HashMap<u8, (i64, i64)>,
+                                > = std::collections::HashMap::new();
+                                let mut combined_langs: std::collections::HashMap<
+                                    u32,
+                                    std::collections::HashMap<u16, (i64, i64)>,
+                                > = std::collections::HashMap::new();
+
+                                if let Some(flakes) = base_props.get(&s_id) {
+                                    for &(p_id, o_type, o_key) in flakes {
+                                        if p_id == rdf_type_p_id {
+                                            continue;
+                                        }
+                                        // Collect this subject's existing ref edges for
+                                        // Case A ref-class re-attribution (o_key = target sid).
+                                        if o_type == iri_ref_otype {
+                                            outgoing_ref_edges.push((g_id, s_id, p_id, o_key));
+                                        }
+                                        let rec =
+                                            fluree_db_binary_index::format::run_record_v2::RunRecordV2 {
+                                                s_id: fluree_db_core::subject_id::SubjectId::from_u64(
+                                                    s_id,
+                                                ),
+                                                o_key,
+                                                p_id,
+                                                t: 0,
+                                                o_i: 0,
+                                                o_type,
+                                                g_id,
+                                            };
+                                        let sr = crate::stats::stats_record_from_v2(&rec, 1);
+                                        combined_dts
+                                            .entry(p_id)
+                                            .or_default()
+                                            .entry(sr.dt.as_u8())
+                                            .or_insert((0, 0))
+                                            .0 += 1;
+                                        if sr.lang_id != 0
+                                            && sr.dt
+                                                == fluree_db_core::value_id::ValueTypeTag::LANG_STRING
+                                        {
+                                            combined_langs
+                                                .entry(p_id)
+                                                .or_default()
+                                                .entry(sr.lang_id)
+                                                .or_insert((0, 0))
+                                                .0 += 1;
+                                        }
+                                    }
+                                }
+                                if let Some(s_dts) = novelty_subject_prop_dts.get(&(g_id, s_id)) {
+                                    for (&pid, dt_map) in s_dts {
+                                        for (&dt, &cnt) in dt_map {
+                                            combined_dts
+                                                .entry(pid)
+                                                .or_default()
+                                                .entry(dt)
+                                                .or_insert((0, 0))
+                                                .1 += cnt;
+                                        }
+                                    }
+                                }
+                                if let Some(s_langs) = novelty_subject_prop_langs.get(&(g_id, s_id))
+                                {
+                                    for (&pid, lang_map) in s_langs {
+                                        for (&lid, &cnt) in lang_map {
+                                            combined_langs
+                                                .entry(pid)
+                                                .or_default()
+                                                .entry(lid)
+                                                .or_insert((0, 0))
+                                                .1 += cnt;
+                                        }
+                                    }
+                                }
+
+                                let mut classes_all: std::collections::HashSet<u64> =
+                                    std::collections::HashSet::new();
+                                classes_all.extend(base_cls.iter().copied());
+                                classes_all.extend(net_cls.iter().copied());
+                                for &c in &classes_all {
+                                    let in_base = base_cls.contains(&c);
+                                    let in_net = net_cls.contains(&c);
+                                    for (&pid, dt_map) in &combined_dts {
+                                        for (&dt, &(old, delta)) in dt_map {
+                                            let amt = if in_net && in_base {
+                                                delta
+                                            } else if in_net {
+                                                old + delta
+                                            } else {
+                                                -old
+                                            };
+                                            if amt != 0 {
+                                                *class_prop_dts
+                                                    .entry((g_id, c))
+                                                    .or_default()
+                                                    .entry(pid)
+                                                    .or_default()
+                                                    .entry(dt)
+                                                    .or_insert(0) += amt;
+                                                class_properties
+                                                    .entry((g_id, c))
+                                                    .or_default()
+                                                    .insert(pid);
+                                            }
+                                        }
+                                    }
+                                    for (&pid, lang_map) in &combined_langs {
+                                        for (&lid, &(old, delta)) in lang_map {
+                                            let amt = if in_net && in_base {
+                                                delta
+                                            } else if in_net {
+                                                old + delta
+                                            } else {
+                                                -old
+                                            };
+                                            if amt != 0 {
+                                                *class_prop_lang_deltas
+                                                    .entry((g_id, c))
+                                                    .or_default()
+                                                    .entry(pid)
+                                                    .or_default()
+                                                    .entry(lid)
+                                                    .or_insert(0) += amt;
+                                                class_properties
+                                                    .entry((g_id, c))
+                                                    .or_default()
+                                                    .insert(pid);
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+
+                        // Ref-class edge re-attribution (issue #1266): move the ref-class
+                        // edges of re-typed subjects/objects from their old (subject_class,
+                        // p, object_class) buckets to their new ones. Only UNTOUCHED edges
+                        // (present in the base index, not asserted/retracted this batch) —
+                        // edges touched this batch are owned by the forward
+                        // subject_ref_history pass above, so we skip them here.
+                        for (&g_id, sids) in &changed_by_graph {
+                            let mut edges: std::collections::HashSet<(u64, u32, u64)> =
+                                std::collections::HashSet::new();
+                            // Case A: outgoing edges of re-typed subjects (from the base scan).
+                            for &(eg, s, p, o) in &outgoing_ref_edges {
+                                if eg == g_id {
+                                    edges.insert((s, p, o));
+                                }
+                            }
+                            // Case B: inbound edges of re-typed objects (reverse OPST). Skip
+                            // edges whose subject also changed — Case A already owns those.
+                            match fluree_db_binary_index::batched_lookup_inbound_refs(
+                                store,
+                                g_id,
+                                sids,
+                                base_root.index_t,
+                            ) {
+                                Ok(inbound) => {
+                                    for (&obj, ins) in &inbound {
+                                        for &(p, subj) in ins {
+                                            if changed_membership.contains(&(g_id, subj)) {
+                                                continue;
+                                            }
+                                            edges.insert((subj, p, obj));
+                                        }
+                                    }
+                                }
+                                Err(e) => {
+                                    // Case B inbound edges of re-typed objects. A miss here
+                                    // would silently leave stale ref-class edge stats; abort
+                                    // to a full rebuild for consistency with the other base
+                                    // re-attribution scans (the rebuild recomputes ref_classes
+                                    // exactly). Cheap insurance for the #1270 fold to come.
+                                    return Err(IndexerError::IncrementalAbort(format!(
+                                        "Phase 3b inbound ref scan failed for graph {g_id}: \
+                                         {e} (deferring class-stat recompute to full rebuild)"
+                                    )));
+                                }
+                            }
+                            // Drop edges touched this batch — the forward pass owns them.
+                            edges.retain(|&(s, p, o)| {
+                                !subject_ref_history
+                                    .get(&(g_id, s))
+                                    .and_then(|per_prop| per_prop.get(&p))
+                                    .map(|objs| objs.contains_key(&o))
+                                    .unwrap_or(false)
+                            });
+                            if edges.is_empty() {
+                                continue;
+                            }
+                            // Resolve classes for endpoints not already known from this batch
+                            // (stable base entities) via one batched rdf:type lookup; endpoints
+                            // in base_subject_classes (re-typed / novelty) use those maps.
+                            let mut external_sids: Vec<u64> = Vec::new();
+                            for &(s, _p, o) in &edges {
+                                if !base_subject_classes.contains_key(&(g_id, s)) {
+                                    external_sids.push(s);
+                                }
+                                if !base_subject_classes.contains_key(&(g_id, o)) {
+                                    external_sids.push(o);
+                                }
+                            }
+                            external_sids.sort_unstable();
+                            external_sids.dedup();
+                            let external_base = if external_sids.is_empty() {
+                                std::collections::HashMap::new()
+                            } else {
+                                // Resolves classes for stable ref-edge endpoints. A failure
+                                // would mis-attribute (or drop) ref-class edges; abort to a
+                                // full rebuild rather than `unwrap_or_default()` (which would
+                                // silently treat every endpoint as class-less).
+                                match fluree_db_binary_index::batched_lookup_predicate_refs(
+                                    store,
+                                    g_id,
+                                    rdf_type_p_id,
+                                    &external_sids,
+                                    base_root.index_t,
+                                ) {
+                                    Ok(m) => m,
+                                    Err(e) => {
+                                        return Err(IndexerError::IncrementalAbort(format!(
+                                            "Phase 3b external ref-endpoint class lookup failed \
+                                             for graph {g_id}: {e} (deferring class-stat \
+                                             recompute to full rebuild)"
+                                        )));
+                                    }
+                                }
+                            };
+                            // (base_classes, net_classes) for an endpoint. A stable base
+                            // entity has base == net (its type did not change this batch).
+                            let resolve = |sid: u64| -> (Vec<u64>, Vec<u64>) {
+                                if let Some(b) = base_subject_classes.get(&(g_id, sid)) {
+                                    let base: Vec<u64> = b.iter().copied().collect();
+                                    let net: Vec<u64> = subject_classes
+                                        .get(&(g_id, sid))
+                                        .map(|s| s.iter().copied().collect())
+                                        .unwrap_or_default();
+                                    (base, net)
+                                } else {
+                                    let cls = external_base.get(&sid).cloned().unwrap_or_default();
+                                    (cls.clone(), cls)
+                                }
+                            };
+                            // Per affected edge: -1 at every (base_subj_class, p, base_obj_class),
+                            // +1 at every (net_subj_class, p, net_obj_class).
+                            for &(s, p, o) in &edges {
+                                let (bs, ns) = resolve(s);
+                                let (bo, no) = resolve(o);
+                                for &sc in &bs {
+                                    for &oc in &bo {
+                                        *ref_edges
+                                            .entry((g_id, sc))
+                                            .or_default()
+                                            .entry(p)
+                                            .or_default()
+                                            .entry(oc)
+                                            .or_insert(0) -= 1;
+                                    }
+                                }
+                                for &sc in &ns {
+                                    for &oc in &no {
+                                        *ref_edges
+                                            .entry((g_id, sc))
+                                            .or_default()
+                                            .entry(p)
+                                            .or_default()
+                                            .entry(oc)
+                                            .or_insert(0) += 1;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+
                 let class_property_count: usize = class_properties
                     .values()
                     .map(std::collections::HashSet::len)
@@ -2242,6 +2701,34 @@ pub async fn incremental_index(
                     "Phase 3b: cached class Sid values for property attribution merge"
                 );
 
+                // Ensure every class touched by a property/lang/ref delta this batch
+                // has an entry, even if it has no instance-count delta and is absent
+                // from the base stats (issue #1266: a class that only lost a property
+                // via retraction, or gained one via re-typing, must be revisited so its
+                // decrement/move is applied rather than dropped).
+                let mut delta_class_keys: std::collections::HashSet<(u16, u64)> =
+                    std::collections::HashSet::new();
+                delta_class_keys.extend(class_properties.keys().copied());
+                delta_class_keys.extend(class_prop_dts.keys().copied());
+                delta_class_keys.extend(class_prop_lang_deltas.keys().copied());
+                delta_class_keys.extend(ref_edges.keys().copied());
+                for (g_id, class_sid64) in delta_class_keys {
+                    entries_by_key
+                        .entry((g_id, class_sid64))
+                        .or_insert_with(|| {
+                            let class_sid = resolve_class_sid(
+                                class_sid64,
+                                store_opt.as_deref(),
+                                &new_subject_suffix,
+                            );
+                            is::ClassStatEntry {
+                                class_sid,
+                                count: 0,
+                                properties: Vec::new(),
+                            }
+                        });
+                }
+
                 // Build property attribution for each class entry.
                 let property_merge_started = Instant::now();
                 tracing::debug!(
@@ -2261,13 +2748,25 @@ pub async fn incremental_index(
                 let mut next_merged_class_progress = 500usize;
                 for (&(g_id, class_sid64), entry) in &mut entries_by_key {
                     visited_class_entries += 1;
-                    if let Some(props) = class_properties.get(&(g_id, class_sid64)) {
+                    let class_dts = class_prop_dts.get(&(g_id, class_sid64));
+                    let class_refs = ref_edges.get(&(g_id, class_sid64));
+                    let class_langs = class_prop_lang_deltas.get(&(g_id, class_sid64));
+                    let class_props_present = class_properties.get(&(g_id, class_sid64));
+                    // Revisit a class if it was touched by ANY delta this batch. The
+                    // prior gate used only the assert-only presence set, so a class
+                    // whose sole change was a retraction (or a re-type moving a
+                    // property away) was never revisited and its decrement was dropped
+                    // (issue #1266). Untouched base classes still skip the body and
+                    // keep their existing property usage unchanged.
+                    if class_dts.is_some()
+                        || class_refs.is_some()
+                        || class_langs.is_some()
+                        || class_props_present.is_some()
+                    {
                         let class_merge_started = Instant::now();
                         let existing_property_count = entry.properties.len();
-                        let novelty_property_count = props.len();
-                        let class_dts = class_prop_dts.get(&(g_id, class_sid64));
-                        let class_refs = ref_edges.get(&(g_id, class_sid64));
-                        let class_langs = class_prop_lang_deltas.get(&(g_id, class_sid64));
+                        let novelty_property_count =
+                            class_props_present.map_or(0, std::collections::HashSet::len);
 
                         // Merge novelty properties with existing properties.
                         let mut prop_set: std::collections::HashSet<u32> = entry
@@ -2286,7 +2785,18 @@ pub async fn incremental_index(
                                 ))
                             })
                             .collect();
-                        prop_set.extend(props);
+                        if let Some(props) = class_props_present {
+                            prop_set.extend(props);
+                        }
+                        if let Some(m) = class_dts {
+                            prop_set.extend(m.keys().copied());
+                        }
+                        if let Some(m) = class_langs {
+                            prop_set.extend(m.keys().copied());
+                        }
+                        if let Some(m) = class_refs {
+                            prop_set.extend(m.keys().copied());
+                        }
 
                         // Index base property usage by p_id for merging.
                         let base_prop_by_pid: std::collections::HashMap<
