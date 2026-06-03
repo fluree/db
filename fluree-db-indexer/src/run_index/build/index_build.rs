@@ -12,9 +12,10 @@
 use super::merge::KWayMerge;
 use crate::run_index::runs::streaming_reader::StreamingRunReader;
 use fluree_db_binary_index::format::branch::{build_branch_bytes, LeafEntry};
+use fluree_db_binary_index::format::history_sidecar::HistEntryV2;
 use fluree_db_binary_index::format::leaf::{LeafInfo, LeafWriter};
 use fluree_db_binary_index::format::run_record::RunSortOrder;
-use fluree_db_binary_index::format::run_record_v2::cmp_v2_for_order;
+use fluree_db_binary_index::format::run_record_v2::{cmp_v2_for_order, RunRecordV2};
 use fluree_db_core::ContentId;
 use fluree_db_core::GraphId;
 use std::io;
@@ -138,19 +139,22 @@ pub fn build_index(config: &IndexBuildConfig) -> Result<IndexBuildResult, IndexB
     let mut merge = KWayMerge::new(streams, cmp)?;
 
     let order = config.sort_order;
-    let order_name = order.dir_name();
 
     // V2 builds are graph-scoped: all records in the run directory belong
     // to config.g_id. No graph transition detection needed.
     let g_id = config.g_id;
-    create_graph_dir(&config.index_dir, g_id, order_name)?;
 
-    let mut writer = LeafWriter::new(
+    // Streams each completed leaf to disk as it is produced, so the build holds
+    // only the active leaf's working set plus O(#leaves) branch metadata in RAM
+    // — never the whole order's compressed FLI3/FHS1 blobs.
+    let mut writer = PersistingLeafWriter::new(
+        g_id,
         order,
+        &config.index_dir,
         config.leaflet_target_rows,
         config.leaf_target_rows,
         config.zstd_level,
-    );
+    )?;
     writer.set_skip_history(config.skip_history);
 
     let mut total_rows: u64 = 0;
@@ -238,7 +242,7 @@ pub fn build_index(config: &IndexBuildConfig) -> Result<IndexBuildResult, IndexB
         }
     }
 
-    let result = finish_graph_v2(g_id, order, writer, &config.index_dir, order_name)?;
+    let result = writer.finish()?;
     let graph_results = vec![result];
 
     Ok(IndexBuildResult {
@@ -259,65 +263,63 @@ fn create_graph_dir(index_dir: &Path, g_id: u16, order_name: &str) -> io::Result
     Ok(graph_dir)
 }
 
-pub(crate) fn finish_graph_v2(
+/// Persist a single completed leaf (and its history sidecar, if any) to disk
+/// as content-addressed files, returning only the metadata + paths. Dropping
+/// `leaf_bytes`/`sidecar_bytes` here is what keeps the build from retaining
+/// every compressed FLI3/FHS1 blob for the whole order.
+fn persist_leaf(graph_dir: &Path, info: LeafInfo) -> io::Result<PersistedLeafInfo> {
+    let LeafInfo {
+        leaf_cid,
+        leaf_bytes,
+        sidecar_cid,
+        sidecar_bytes,
+        total_rows,
+        first_key,
+        last_key,
+        re_encoded_leaflet_count,
+    } = info;
+
+    let leaf_path = graph_dir.join(leaf_cid.to_string());
+    std::fs::write(&leaf_path, &leaf_bytes)?;
+
+    let sidecar_path = match (&sidecar_cid, sidecar_bytes.as_ref()) {
+        (Some(sc_cid), Some(sc_bytes)) => {
+            let sc_path = graph_dir.join(sc_cid.to_string());
+            std::fs::write(&sc_path, sc_bytes)?;
+            Some(sc_path)
+        }
+        (None, None) => None,
+        (Some(_), None) | (None, Some(_)) => {
+            return Err(io::Error::other(
+                "leaf sidecar CID/bytes mismatch while persisting index artifact",
+            ));
+        }
+    };
+
+    Ok(PersistedLeafInfo {
+        leaf_cid,
+        leaf_path,
+        sidecar_cid,
+        sidecar_path,
+        total_rows,
+        first_key,
+        last_key,
+        re_encoded_leaflet_count,
+    })
+}
+
+/// Assemble the FBR3 branch manifest from the (already disk-persisted) leaf
+/// metadata and write it. Branch entries must stay in leaf-flush order — i.e.
+/// sorted by key range — so callers must preserve the order in which leaves
+/// were produced; only the blob writes (in `persist_leaf`) are order-independent.
+fn build_graph_index_result(
     g_id: GraphId,
     order: RunSortOrder,
-    writer: LeafWriter,
-    index_dir: &Path,
-    order_name: &str,
+    graph_dir: PathBuf,
+    persisted_leaf_infos: Vec<PersistedLeafInfo>,
 ) -> io::Result<GraphIndexResult> {
-    let graph_dir = index_dir.join(format!("graph_{g_id}/{order_name}"));
-    let leaf_infos = writer.finish()?;
+    let total_rows: u64 = persisted_leaf_infos.iter().map(|l| l.total_rows).sum();
 
-    let total_rows: u64 = leaf_infos.iter().map(|l| l.total_rows).sum();
-
-    // Write leaf + sidecar blobs to disk (content-addressed), then retain only
-    // metadata + paths so the import build doesn't keep all FLI3/FHS1 bytes in RAM.
-    let persisted_leaf_infos: Vec<PersistedLeafInfo> = leaf_infos
-        .into_iter()
-        .map(|info| -> io::Result<PersistedLeafInfo> {
-            let LeafInfo {
-                leaf_cid,
-                leaf_bytes,
-                sidecar_cid,
-                sidecar_bytes,
-                total_rows,
-                first_key,
-                last_key,
-                re_encoded_leaflet_count,
-            } = info;
-
-            let leaf_path = graph_dir.join(leaf_cid.to_string());
-            std::fs::write(&leaf_path, &leaf_bytes)?;
-
-            let sidecar_path = match (&sidecar_cid, sidecar_bytes.as_ref()) {
-                (Some(sc_cid), Some(sc_bytes)) => {
-                    let sc_path = graph_dir.join(sc_cid.to_string());
-                    std::fs::write(&sc_path, sc_bytes)?;
-                    Some(sc_path)
-                }
-                (None, None) => None,
-                (Some(_), None) | (None, Some(_)) => {
-                    return Err(io::Error::other(
-                        "leaf sidecar CID/bytes mismatch while persisting index artifact",
-                    ));
-                }
-            };
-
-            Ok(PersistedLeafInfo {
-                leaf_cid,
-                leaf_path,
-                sidecar_cid,
-                sidecar_path,
-                total_rows,
-                first_key,
-                last_key,
-                re_encoded_leaflet_count,
-            })
-        })
-        .collect::<io::Result<Vec<_>>>()?;
-
-    // Build branch manifest entries.
     let leaf_entries: Vec<LeafEntry> = persisted_leaf_infos
         .iter()
         .map(|info| LeafEntry {
@@ -350,6 +352,77 @@ pub(crate) fn finish_graph_v2(
         leaf_entries,
         graph_dir,
     })
+}
+
+/// Indexer-side wrapper around the pure [`LeafWriter`] that streams each
+/// completed leaf to disk as it is produced.
+///
+/// `LeafWriter` itself accumulates every completed leaf's compressed bytes in
+/// memory until `finish()`. For a full-order build that is the entire order's
+/// index — and the parallel secondary-order build can have several orders in
+/// flight at once. This wrapper drains the writer after every `push_record`
+/// and persists each completed leaf immediately, so retained memory is bounded
+/// by the active leaf's working set plus the O(#leaves) branch metadata
+/// (~100 bytes/leaf), not the order's full FLI3/FHS1 blob set.
+///
+/// Crate boundary: the `binary-index` crate stays pure (its `LeafWriter` still
+/// returns in-memory `LeafInfo`, as the incremental paths require); only this
+/// indexer-side wrapper touches the filesystem.
+pub(crate) struct PersistingLeafWriter {
+    inner: LeafWriter,
+    g_id: GraphId,
+    order: RunSortOrder,
+    graph_dir: PathBuf,
+    persisted: Vec<PersistedLeafInfo>,
+}
+
+impl PersistingLeafWriter {
+    pub(crate) fn new(
+        g_id: GraphId,
+        order: RunSortOrder,
+        index_dir: &Path,
+        leaflet_target_rows: usize,
+        leaf_target_rows: usize,
+        zstd_level: i32,
+    ) -> io::Result<Self> {
+        let graph_dir = create_graph_dir(index_dir, g_id, order.dir_name())?;
+        let inner = LeafWriter::new(order, leaflet_target_rows, leaf_target_rows, zstd_level);
+        Ok(Self {
+            inner,
+            g_id,
+            order,
+            graph_dir,
+            persisted: Vec::new(),
+        })
+    }
+
+    pub(crate) fn set_skip_history(&mut self, skip: bool) {
+        self.inner.set_skip_history(skip);
+    }
+
+    pub(crate) fn push_record(&mut self, record: RunRecordV2) -> io::Result<()> {
+        self.inner.push_record(record)?;
+        // A single push completes at most one leaf; drain + persist it now so
+        // its blob bytes are not retained for the rest of the order.
+        for info in self.inner.drain_completed_leaves() {
+            self.persisted.push(persist_leaf(&self.graph_dir, info)?);
+        }
+        Ok(())
+    }
+
+    pub(crate) fn push_history_entry(&mut self, entry: HistEntryV2) {
+        self.inner.push_history_entry(entry);
+    }
+
+    pub(crate) fn finish(mut self) -> io::Result<GraphIndexResult> {
+        // `finish()` flushes the trailing leaf into the completed-leaves buffer;
+        // persist that final batch (everything prior was drained per-push).
+        let final_batch = self.inner.finish()?;
+        for info in final_batch {
+            self.persisted.push(persist_leaf(&self.graph_dir, info)?);
+        }
+        build_graph_index_result(self.g_id, self.order, self.graph_dir, self.persisted)
+    }
 }
 
 /// Discover V2 run files in a directory (sorted by name).
