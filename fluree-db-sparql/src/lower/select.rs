@@ -430,6 +430,16 @@ impl<E: IriEncoder> LoweringContext<'_, E> {
         subselect: &SubSelect,
         _span: SourceSpan,
     ) -> Result<Vec<Pattern>> {
+        // Aggregate-input-expression CSE (`agg_expr_binds`) is scoped to a single
+        // WHERE clause. A subquery is its own execution scope, so the synthetic
+        // `?__agg_expr_N` bind for an aggregate over an expression (e.g.
+        // `AVG(xsd:float(?n))`) must live in THIS subquery's patterns. Without
+        // resetting the cache, two sibling subqueries sharing the same aggregate
+        // input expression would dedup to one synthetic var that is bound only in
+        // the first subquery's scope, leaving the second's aggregate input
+        // unbound (benchmark-db bug #4). Save here, restore before returning.
+        let saved_agg_expr_binds = std::mem::take(&mut self.agg_expr_binds);
+
         // Lower WHERE patterns (mut: SELECT-expression / GROUP BY / aggregate-
         // input BINDs are appended below, just as in the top-level pipeline).
         let mut patterns = self.lower_graph_pattern(&subselect.pattern)?;
@@ -528,6 +538,10 @@ impl<E: IriEncoder> LoweringContext<'_, E> {
         if lowered.distinct || subselect.reduced {
             sq = sq.with_distinct();
         }
+
+        // Restore the enclosing scope's aggregate-expression CSE cache (an early
+        // `?` error abandons the whole lowering, so success-path restore is enough).
+        self.agg_expr_binds = saved_agg_expr_binds;
 
         Ok(vec![Pattern::Subquery(sq)])
     }

@@ -1213,6 +1213,43 @@ async fn sparql_subquery_group_concat_sum_respects_inner_offset() {
 }
 
 #[tokio::test]
+async fn sparql_aggregate_over_expression_in_joined_subqueries() {
+    // Regression (benchmark-db bug #4, BSBM BI-5): an aggregate over a COMPUTED
+    // EXPRESSION (`AVG(xsd:float(?n))`) inside a grouped sub-SELECT used to fail
+    // when two such sub-SELECTs are joined — the shared aggregate-input
+    // expression was CSE-deduplicated across subquery scopes, leaving the second
+    // subquery's synthetic input var unbound. Each subquery must get its own.
+    assert_index_defaults();
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger = seed_people(&fluree, "people:main").await;
+
+    let query = r"
+        PREFIX person: <http://example.org/Person#>
+        PREFIX xsd: <http://www.w3.org/2001/XMLSchema#>
+        SELECT ?handle {
+          { SELECT ?handle (AVG(xsd:float(?favNum)) AS ?x)
+            WHERE { ?p person:handle ?handle ; person:favNums ?favNum }
+            GROUP BY ?handle }
+          { SELECT ?handle (AVG(xsd:float(?favNum)) AS ?y)
+            WHERE { ?p2 person:handle ?handle ; person:favNums ?favNum }
+            GROUP BY ?handle }
+        }
+    ";
+
+    let jsonld = support::query_sparql(&fluree, &ledger, query)
+        .await
+        .expect("aggregate-over-expression in joined sub-SELECTs should not error")
+        .to_jsonld(&ledger.snapshot)
+        .expect("to_jsonld");
+    // The two grouped sub-SELECTs join on ?handle; handles with favNums are
+    // jdoe, bbob, jbob (dankeshön has none).
+    assert_eq!(
+        normalize_rows(&jsonld),
+        normalize_rows(&json!([["jdoe"], ["bbob"], ["jbob"]]))
+    );
+}
+
+#[tokio::test]
 async fn sparql_delete_data_removes_specified_triples() {
     assert_index_defaults();
     let fluree = FlureeBuilder::memory().build_memory();
