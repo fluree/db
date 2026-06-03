@@ -418,13 +418,30 @@ pub async fn query(
 
     // Handle SPARQL query
     if is_sparql_request(&headers, &credential, &params) {
-        // Connection-scoped SPARQL returns pre-formatted JSON — delimited not supported
+        // Connection-scoped SPARQL returns pre-formatted JSON only. The byte
+        // formats (delimited, RDF/XML, SPARQL-results XML) are not negotiated on
+        // this route — reject with 406 rather than silently downgrading to JSON,
+        // and point callers at the ledger-scoped route which does serve them.
         if let Some(fmt) = delimited {
             return Err(ServerError::not_acceptable(format!(
                 "{} format not supported for connection-scoped SPARQL queries. \
                      Use the /:ledger/query endpoint instead.",
                 fmt.name().to_uppercase()
             )));
+        }
+        if headers.wants_rdf_xml() {
+            return Err(ServerError::not_acceptable(
+                "RDF/XML is not supported for connection-scoped SPARQL queries. \
+                 Use the /:ledger/query endpoint instead."
+                    .to_string(),
+            ));
+        }
+        if headers.wants_sparql_results_xml() {
+            return Err(ServerError::not_acceptable(
+                "SPARQL Results XML is not supported for connection-scoped SPARQL queries. \
+                 Use the /:ledger/query endpoint instead."
+                    .to_string(),
+            ));
         }
 
         let sparql = resolve_sparql_text(&params, &credential)?;
@@ -455,6 +472,16 @@ pub async fn query(
         // AgentJson: connection-scoped SPARQL with agent-optimized envelope
         if headers.wants_agent_json() {
             let parsed = fluree_db_sparql::parse_sparql(&sparql);
+            // AgentJson is a solution-table envelope; a CONSTRUCT/DESCRIBE graph
+            // has no such form, so reject rather than mislabel a JSON-LD graph
+            // as AgentJson (issue #1274).
+            if is_graph_query(parsed.ast.as_ref()) {
+                return Err(ServerError::not_acceptable(
+                    "AgentJson is not available for SPARQL CONSTRUCT/DESCRIBE queries; \
+                     use the default (JSON-LD) or Accept: application/rdf+xml"
+                        .to_string(),
+                ));
+            }
             let from_count = parsed.ast.as_ref()
                 .and_then(|ast| match &ast.body {
                     fluree_db_sparql::ast::QueryBody::Select(q) => q.dataset.as_ref(),
@@ -572,14 +599,17 @@ pub async fn query(
             return Ok((resp_headers, Json(response)).into_response());
         }
 
-        match state.fluree.query_from().sparql(&sparql).execute_formatted().await {
+        let parsed = fluree_db_sparql::parse_sparql(&sparql);
+        let (fmt_config, content_type) =
+            sparql_json_response_format(parsed.ast.as_ref(), &headers);
+        match state.fluree.query_from().sparql(&sparql).format(fmt_config).execute_formatted().await {
             Ok(result) => {
                 tracing::info!(
                     status = "success",
                     query_kind = "sparql",
                     result_count = result.as_array().map(std::vec::Vec::len).unwrap_or(0)
                 );
-                Ok((HeaderMap::new(), Json(result)).into_response())
+                Ok(([(axum::http::header::CONTENT_TYPE, content_type)], Json(result)).into_response())
             }
             Err(e) => {
                 let server_error = ServerError::Api(e);
@@ -1156,6 +1186,48 @@ fn iri_to_string(iri: &fluree_db_sparql::ast::Iri) -> String {
     }
 }
 
+/// Whether a parsed SPARQL query is a graph query (CONSTRUCT / DESCRIBE), whose
+/// result is an RDF graph rather than a solution/binding table. Graph queries
+/// have no SPARQL-results-JSON / SPARQL-results-XML / AgentJson rendering; their
+/// only serializations are JSON-LD (default) and RDF/XML.
+fn is_graph_query(ast: Option<&fluree_db_sparql::ast::SparqlAst>) -> bool {
+    matches!(
+        ast.map(|a| &a.body),
+        Some(
+            fluree_db_sparql::ast::QueryBody::Construct(_)
+                | fluree_db_sparql::ast::QueryBody::Describe(_)
+        )
+    )
+}
+
+/// Pick the formatter config and response `Content-Type` for a SPARQL query that
+/// returns a JSON body (i.e. not RDF/XML, SPARQL-results XML, delimited, or
+/// AgentJson — those are negotiated on their own paths).
+///
+/// - CONSTRUCT / DESCRIBE produce a graph, which only has a JSON-LD rendering, so
+///   they are always formatted as JSON-LD and labelled `application/ld+json`. The
+///   formatter coerces graph results to JSON-LD regardless (issue #1274); forcing
+///   the config here keeps the chosen format and the `Content-Type` in agreement.
+/// - SELECT / ASK keep the SPARQL-results-JSON default unless the client opts into
+///   JSON-LD with `Accept: application/ld+json` (see [`FlureeHeaders::wants_jsonld`]).
+fn sparql_json_response_format(
+    ast: Option<&fluree_db_sparql::ast::SparqlAst>,
+    headers: &FlureeHeaders,
+) -> (fluree_db_api::FormatterConfig, &'static str) {
+    if is_graph_query(ast) || headers.wants_jsonld() {
+        (
+            fluree_db_api::FormatterConfig::jsonld(),
+            "application/ld+json; charset=utf-8",
+        )
+    } else {
+        // SPARQL-results JSON: the builder default for a SPARQL query.
+        (
+            fluree_db_api::FormatterConfig::sparql_json(),
+            "application/json",
+        )
+    }
+}
+
 fn split_graph_fragment(s: &str) -> (&str, Option<&str>) {
     match s.split_once('#') {
         Some((base, frag)) => (base, Some(frag)),
@@ -1623,6 +1695,13 @@ async fn execute_sparql_ledger(
             ));
         }
 
+        // Formatter config + Content-Type for the JSON response paths below.
+        // CONSTRUCT/DESCRIBE always render as JSON-LD; SELECT/ASK opt in via
+        // `Accept: application/ld+json` (issue #1274). XML / delimited / AgentJson
+        // are negotiated separately on their own branches and ignore this.
+        let (json_fmt_config, json_content_type) =
+            sparql_json_response_format(parsed.ast.as_ref(), headers);
+
         // In proxy mode, use the unified Fluree method (returns pre-formatted JSON)
         if state.config.is_proxy_storage_mode() && !has_dataset_clause {
             if wants_sparql_xml {
@@ -1649,6 +1728,7 @@ async fn execute_sparql_ledger(
                         .await?;
                 view.query(state.fluree.as_ref())
                     .sparql(sparql)
+                    .format(json_fmt_config.clone())
                     .execute_formatted()
                     .await
                     .inspect_err(|_| { set_span_error_code(&span, "error:QueryFailed"); })?
@@ -1663,13 +1743,18 @@ async fn execute_sparql_ledger(
                 })?;
                 view.query(state.fluree.as_ref())
                     .sparql(sparql)
+                    .format(json_fmt_config.clone())
                     .execute_formatted()
                     .await
                     .inspect_err(|_| {
                         set_span_error_code(&span, "error:QueryFailed");
                     })?
             };
-            return Ok((HeaderMap::new(), Json(result)).into_response());
+            return Ok((
+                [(axum::http::header::CONTENT_TYPE, json_content_type)],
+                Json(result),
+            )
+                .into_response());
         }
 
         // Policy-scoped queries (identity or explicit policy inputs) without a
@@ -1700,12 +1785,17 @@ async fn execute_sparql_ledger(
                 .await?;
             let result = view.query(state.fluree.as_ref())
                 .sparql(sparql)
+                .format(json_fmt_config.clone())
                 .execute_formatted()
                 .await
                 .inspect_err(|_| {
                     set_span_error_code(&span, "error:QueryFailed");
                 })?;
-            return Ok((HeaderMap::new(), Json(result)).into_response());
+            return Ok((
+                [(axum::http::header::CONTENT_TYPE, json_content_type)],
+                Json(result),
+            )
+                .into_response());
         }
 
         // Ledger-scoped SPARQL with dataset clauses (FROM/FROM NAMED): build a dataset
@@ -1883,6 +1973,17 @@ async fn execute_sparql_ledger(
 
             // SPARQL Results XML: execute and format as XML string (SELECT/ASK only)
             if wants_sparql_xml {
+                // SPARQL Results XML serializes a solution table, not a graph;
+                // reject CONSTRUCT/DESCRIBE here (406) instead of executing and
+                // surfacing the formatter's 400 (issue #1274).
+                if is_graph_query(parsed.ast.as_ref()) {
+                    return Err(ServerError::not_acceptable(
+                        "SPARQL Results XML is only available for SPARQL SELECT/ASK queries; \
+                         CONSTRUCT/DESCRIBE return a graph (use the default JSON-LD or \
+                         Accept: application/rdf+xml)"
+                            .to_string(),
+                    ));
+                }
                 let dataset = if qc_opts.has_any_policy_inputs() {
                     state.fluree.build_dataset_view_with_policy(&spec, &qc_opts).await
                 } else {
@@ -1906,12 +2007,7 @@ async fn execute_sparql_ledger(
 
             // RDF/XML: execute and format graph results (CONSTRUCT/DESCRIBE only)
             if wants_rdf_xml {
-                let is_graph_query = matches!(
-                    parsed.ast.as_ref().map(|a| &a.body),
-                    Some(fluree_db_sparql::ast::QueryBody::Construct(_) |
-fluree_db_sparql::ast::QueryBody::Describe(_))
-                );
-                if !is_graph_query {
+                if !is_graph_query(parsed.ast.as_ref()) {
                     return Err(ServerError::not_acceptable(
                         "RDF/XML is only available for SPARQL CONSTRUCT/DESCRIBE queries"
                             .to_string(),
@@ -1941,6 +2037,13 @@ fluree_db_sparql::ast::QueryBody::Describe(_))
 
             // AgentJson: dataset query with agent-optimized envelope
             if headers.wants_agent_json() {
+                if is_graph_query(parsed.ast.as_ref()) {
+                    return Err(ServerError::not_acceptable(
+                        "AgentJson is not available for SPARQL CONSTRUCT/DESCRIBE queries; \
+                         use the default (JSON-LD) or Accept: application/rdf+xml"
+                            .to_string(),
+                    ));
+                }
                 let from_count = dc.default_graphs.len();
                 let agent_ctx = fluree_db_api::AgentJsonContext {
                     sparql_text: Some(sparql.to_string()),
@@ -1983,11 +2086,16 @@ fluree_db_sparql::ast::QueryBody::Describe(_))
             let result = dataset
                 .query(state.fluree.as_ref())
                 .sparql(sparql)
+                .format(json_fmt_config.clone())
                 .execute_formatted()
                 .await
                 .map_err(ServerError::Api)?;
 
-            return Ok((HeaderMap::new(), Json(result)).into_response());
+            return Ok((
+                [(axum::http::header::CONTENT_TYPE, json_content_type)],
+                Json(result),
+            )
+                .into_response());
         }
 
         // Shared storage mode: use load_ledger_for_query with freshness checking
@@ -2063,6 +2171,17 @@ fluree_db_sparql::ast::QueryBody::Describe(_))
 
         // Delimited fast path: execute raw query and format as TSV/CSV bytes
         if let Some(fmt) = delimited {
+            // CSV/TSV serialize a solution table; a CONSTRUCT/DESCRIBE graph has
+            // no such form, so reject with 406 rather than producing malformed
+            // rows or a 500 (issue #1274).
+            if is_graph_query(parsed.ast.as_ref()) {
+                return Err(ServerError::not_acceptable(format!(
+                    "{} is only available for SPARQL SELECT/ASK queries; \
+                     CONSTRUCT/DESCRIBE return a graph (use the default JSON-LD or \
+                     Accept: application/rdf+xml)",
+                    fmt.name().to_uppercase()
+                )));
+            }
             let result = graph
                 .query(fluree.as_ref())
                 .sparql(sparql)
@@ -2093,6 +2212,16 @@ fluree_db_sparql::ast::QueryBody::Describe(_))
 
         // SPARQL Results XML: execute and format as XML string (SELECT/ASK only)
         if wants_sparql_xml {
+            // Graph queries have no solution-table XML form — reject with 406
+            // rather than executing into the formatter's 400 (issue #1274).
+            if is_graph_query(parsed.ast.as_ref()) {
+                return Err(ServerError::not_acceptable(
+                    "SPARQL Results XML is only available for SPARQL SELECT/ASK queries; \
+                     CONSTRUCT/DESCRIBE return a graph (use the default JSON-LD or \
+                     Accept: application/rdf+xml)"
+                        .to_string(),
+                ));
+            }
             let xml = graph
                 .query(fluree.as_ref())
                 .sparql(sparql)
@@ -2113,12 +2242,7 @@ fluree_db_sparql::ast::QueryBody::Describe(_))
 
         // RDF/XML: execute and format graph results (CONSTRUCT/DESCRIBE only)
         if wants_rdf_xml {
-            let is_graph_query = matches!(
-                parsed.ast.as_ref().map(|a| &a.body),
-                Some(fluree_db_sparql::ast::QueryBody::Construct(_) |
-fluree_db_sparql::ast::QueryBody::Describe(_))
-            );
-            if !is_graph_query {
+            if !is_graph_query(parsed.ast.as_ref()) {
                 return Err(ServerError::not_acceptable(
                     "RDF/XML is only available for SPARQL CONSTRUCT/DESCRIBE queries".to_string(),
                 ));
@@ -2144,6 +2268,13 @@ fluree_db_sparql::ast::QueryBody::Describe(_))
 
         // AgentJson: execute with agent-optimized envelope format
         if headers.wants_agent_json() {
+            if is_graph_query(parsed.ast.as_ref()) {
+                return Err(ServerError::not_acceptable(
+                    "AgentJson is not available for SPARQL CONSTRUCT/DESCRIBE queries; \
+                     use the default (JSON-LD) or Accept: application/rdf+xml"
+                        .to_string(),
+                ));
+            }
             let from_count = dataset_clause
                 .map(|d| d.default_graphs.len())
                 .unwrap_or(0);
@@ -2179,12 +2310,17 @@ fluree_db_sparql::ast::QueryBody::Describe(_))
         let result = graph
             .query(fluree.as_ref())
             .sparql(sparql)
+            .format(json_fmt_config)
             .execute_formatted()
             .await
             .inspect_err(|_| {
                 set_span_error_code(&span, "error:QueryFailed");
             })?;
-        Ok((HeaderMap::new(), Json(result)).into_response())
+        Ok((
+            [(axum::http::header::CONTENT_TYPE, json_content_type)],
+            Json(result),
+        )
+            .into_response())
     }
     .instrument(span)
     .await

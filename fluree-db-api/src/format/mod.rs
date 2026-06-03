@@ -121,14 +121,13 @@ pub fn format_results(
 
     let compactor = IriCompactor::new(snapshot.namespaces(), context);
 
-    // CONSTRUCT queries have dedicated output format
+    // CONSTRUCT / DESCRIBE produce a graph, not a binding table, so the only
+    // sensible JSON rendering is JSON-LD. Any JSON-producing format request
+    // (including the SPARQL default `SparqlJson`) is coerced to JSON-LD rather
+    // than rejected — a graph has no SPARQL-results-JSON / TypedJson / AgentJson
+    // form. RDF/XML and the delimited formats never reach here: they are bytes
+    // formats handled (or rejected) earlier on the string path. See issue #1274.
     if result.output.construct_template().is_some() {
-        // Only JSON-LD makes sense for CONSTRUCT
-        if config.format != OutputFormat::JsonLd {
-            return Err(FormatError::InvalidBinding(
-                "CONSTRUCT queries only support JSON-LD output format".to_string(),
-            ));
-        }
         return construct::format(result, &compactor);
     }
 
@@ -265,13 +264,11 @@ pub async fn format_results_async(
 
     let compactor = IriCompactor::new(db.snapshot.namespaces(), context);
 
-    // CONSTRUCT queries have dedicated output format (sync, no DB access needed)
+    // CONSTRUCT / DESCRIBE produce a graph (sync, no DB access needed); coerce
+    // any JSON-producing format to JSON-LD rather than rejecting it. RDF/XML and
+    // delimited formats are handled on the string/bytes path and never reach
+    // here. See the sync `format_results` above and issue #1274.
     if result.output.construct_template().is_some() {
-        if config.format != OutputFormat::JsonLd {
-            return Err(FormatError::InvalidBinding(
-                "CONSTRUCT queries only support JSON-LD output format".to_string(),
-            ));
-        }
         return construct::format(result, &compactor);
     }
 
