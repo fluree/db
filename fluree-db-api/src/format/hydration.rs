@@ -1138,14 +1138,8 @@ impl<'a> HydrationFormatter<'a> {
             let sub_level = nested_spec.or_else(|| depth.can_expand().then_some(parent_level));
             match sub_level {
                 Some(level) => values.push(
-                    self.expand_or_format_ref(
-                        subject_sid,
-                        level,
-                        depth.descend(),
-                        visited,
-                        cache,
-                    )
-                    .await?,
+                    self.expand_or_format_ref(subject_sid, level, depth.descend(), visited, cache)
+                        .await?,
                 ),
                 None => {
                     // No expansion - just @id

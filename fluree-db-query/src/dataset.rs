@@ -253,11 +253,7 @@ impl<'a> DataSet<'a> {
     /// SIDs against the correct namespace table.
     pub fn spans_multiple_ledgers(&self) -> bool {
         let mut first: Option<&str> = None;
-        for graph in self
-            .default_graphs
-            .iter()
-            .chain(self.named_graphs.values())
-        {
+        for graph in self.default_graphs.iter().chain(self.named_graphs.values()) {
             match first {
                 None => first = Some(graph.ledger_id.as_ref()),
                 Some(f) if f != graph.ledger_id.as_ref() => return true,

@@ -199,7 +199,11 @@ async fn connection_from_array_inside_scope_succeeds() {
         "where":  { "@id": "?s", "ex:name": "?name" }
     });
     let (status, body) = post_query(&app, &query, &read_both).await;
-    assert_eq!(status, StatusCode::OK, "in-scope union should succeed: {body}");
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "in-scope union should succeed: {body}"
+    );
 }
 
 /// Same gap via a `fromNamed` map: the out-of-scope ledger is reachable only

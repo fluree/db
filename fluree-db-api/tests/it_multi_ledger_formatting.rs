@@ -477,10 +477,7 @@ async fn dataset_nested_projection_cross_graph_iri_resolution_via_connection() {
         .await
         .expect("nested cross-graph projection should succeed");
 
-    let list = result
-        .as_array()
-        .and_then(|a| a.first())
-        .expect("one list");
+    let list = result.as_array().and_then(|a| a.first()).expect("one list");
 
     // The list lives in the named (lists) ledger; its @id must decode against
     // that ledger's namespace dict, not the primary (catalog) view's.
