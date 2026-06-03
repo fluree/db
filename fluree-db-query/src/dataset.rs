@@ -241,6 +241,32 @@ impl<'a> DataSet<'a> {
         self.named_graphs.iter()
     }
 
+    /// True when the dataset's graphs (default + named) span more than one
+    /// distinct ledger ID.
+    ///
+    /// Used to decide whether GRAPH-pattern results need cross-ledger
+    /// provenance stamping: inside a `GRAPH <iri> { .. }` scope only one
+    /// graph is active, so the per-scan multi-ledger check (which compares
+    /// the *active* graphs) is always false even when the surrounding
+    /// dataset is multi-ledger. This dataset-wide check lets `GraphOperator`
+    /// stamp inner results with their home ledger so the formatter decodes
+    /// SIDs against the correct namespace table.
+    pub fn spans_multiple_ledgers(&self) -> bool {
+        let mut first: Option<&str> = None;
+        for graph in self
+            .default_graphs
+            .iter()
+            .chain(self.named_graphs.values())
+        {
+            match first {
+                None => first = Some(graph.ledger_id.as_ref()),
+                Some(f) if f != graph.ledger_id.as_ref() => return true,
+                _ => {}
+            }
+        }
+        false
+    }
+
     /// Find a graph by ledger ID (searching both default and named graphs)
     ///
     /// Returns the first graph whose `ledger_id` matches the given address.

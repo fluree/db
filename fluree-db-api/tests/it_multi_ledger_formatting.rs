@@ -413,3 +413,86 @@ async fn cross_graph_hydration_expansion_divergent_vocab() {
         "second cross-ledger hop (author) must hydrate too: {value:#}"
     );
 }
+
+/// Repro for the open issue on PR #1267 (Jack's comment): the canonical
+/// documented multi-ledger shape `fromNamed: {alias: {"@id": ...}}` +
+/// `["graph", "<alias>", ...]`. The inner GRAPH scope runs against a single
+/// active graph, so no provenance is stamped, bindings are plain `Binding::Sid`,
+/// and the formatter falls back to the primary (catalog) view — decoding the
+/// `lists` SID against catalog's namespace dict.
+#[tokio::test]
+async fn dataset_nested_projection_cross_graph_iri_resolution_via_connection() {
+    let fluree = FlureeBuilder::memory().build_memory();
+
+    fluree
+        .insert(
+            genesis_ledger(&fluree, "catalog:main"),
+            &json!({
+                "@context": {"@vocab": "http://example.org/catalog/"},
+                "@graph": [
+                    {"@id": "http://example.org/items/q1", "@type": "Item",
+                     "name": "Item One", "isbn": "0001"}
+                ]
+            }),
+        )
+        .await
+        .expect("insert catalog");
+
+    fluree
+        .insert(
+            genesis_ledger(&fluree, "lists:main"),
+            &json!({
+                "@context": {"@vocab": "http://example.org/lists/"},
+                "@graph": [
+                    {"@id": "http://example.org/lists/summer", "@type": "List",
+                     "name": "Summer",
+                     "contains": [{"@id": "http://example.org/items/q1"}]}
+                ]
+            }),
+        )
+        .await
+        .expect("insert lists");
+
+    // Explicit prefixes (no `@vocab`) so the cross-graph @id compacts to
+    // `lists:summer` — unambiguously proving it decoded against the lists
+    // namespace, not catalog's (whose colliding code maps to
+    // `http://example.org/items/`, the pre-fix symptom).
+    let query = json!({
+        "from": "catalog:main",
+        "fromNamed": { "lists_g": { "@id": "lists:main" } },
+        "@context": {
+            "lists": "http://example.org/lists/",
+            "catalog": "http://example.org/catalog/"
+        },
+        "select": {"?list": ["@id", "lists:name",
+            {"lists:contains": ["@id", "catalog:name", "catalog:isbn"]}
+        ]},
+        "where": [["graph", "lists_g", {"@id": "?list", "@type": "lists:List"}]]
+    });
+
+    let result = fluree
+        .query_from()
+        .jsonld(&query)
+        .execute_formatted()
+        .await
+        .expect("nested cross-graph projection should succeed");
+
+    let list = result
+        .as_array()
+        .and_then(|a| a.first())
+        .expect("one list");
+
+    // The list lives in the named (lists) ledger; its @id must decode against
+    // that ledger's namespace dict, not the primary (catalog) view's.
+    assert_eq!(
+        list.get("@id").and_then(|v| v.as_str()),
+        Some("lists:summer"),
+        "cross-graph @id decoded against the wrong ledger's namespace dict: {result:#}"
+    );
+
+    let s = result.to_string();
+    assert!(
+        !s.contains("http://example.org/items/summer") && !s.contains("catalog:summer"),
+        "the mis-decoded (catalog-namespace) @id must not appear: {s}"
+    );
+}
