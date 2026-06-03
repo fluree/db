@@ -37,6 +37,16 @@ pub struct SparqlQueryRequest {
     /// The SPARQL query to execute
     #[schemars(description = "The SPARQL query to execute. Must be a valid SPARQL SELECT query.")]
     pub query: String,
+
+    /// Optional transaction time (`t`) to pin the query to a specific snapshot.
+    #[serde(default)]
+    #[schemars(
+        description = "Optional transaction time `t` to pin the query to a specific historical \
+        snapshot. Pass the `t` value returned in a previous result's envelope to paginate \
+        deterministically across calls (same `t` plus an increased SPARQL OFFSET/LIMIT). Omit to \
+        query the latest snapshot."
+    )]
+    pub t: Option<i64>,
 }
 
 /// Request parameters for get_data_model tool
@@ -72,17 +82,19 @@ impl FlureeToolService {
 
     /// Execute a SPARQL query against a Fluree ledger
     #[tool(
-        description = "Execute a SPARQL query against a Fluree ledger. Returns JSON results as tuples matching SELECT variable order. Use get_data_model first to understand the schema before querying."
+        description = "Execute a SPARQL SELECT query against a Fluree ledger. Returns a compact \
+        Agent JSON envelope: `schema` (per-variable datatypes, declared once), `rows` (objects \
+        with native JSON values), `rowCount`, `t` (the snapshot's transaction time), `iso` (the \
+        snapshot timestamp), and `hasMore`. When `hasMore` is true the result was truncated to a \
+        byte budget — fetch the next page by re-running this tool with the SAME `t` value (for a \
+        consistent snapshot) plus an increased SPARQL OFFSET/LIMIT. Use get_data_model first to \
+        understand the schema before querying."
     )]
     async fn sparql_query(
         &self,
         Parameters(req): Parameters<SparqlQueryRequest>,
         context: rmcp::service::RequestContext<RoleServer>,
     ) -> Result<CallToolResult, rmcp::ErrorData> {
-        // Result truncation limits to avoid overloading LLM context
-        const MAX_ROWS: usize = 100;
-        const MAX_CHARS: usize = 50000;
-
         let start = std::time::Instant::now();
 
         // Extract identity from MCP principal for policy enforcement
@@ -93,42 +105,17 @@ impl FlureeToolService {
             ledger = %req.ledger,
             query_len = req.query.len(),
             identity = ?identity,
+            t = ?req.t,
             "MCP sparql_query tool invoked"
         );
 
-        // Execute SPARQL query with identity-based policy (if identity is present)
-        let to_err =
-            |e: fluree_db_api::ApiError| rmcp::ErrorData::internal_error(e.to_string(), None);
-        let result = match identity {
-            Some(id) => {
-                let opts = fluree_db_api::QueryConnectionOptions {
-                    identity: Some(id.to_string()),
-                    ..Default::default()
-                };
-                let view = self
-                    .state
-                    .fluree
-                    .db_with_policy(&req.ledger, &opts)
-                    .await
-                    .map_err(to_err)?;
-                view.query(self.state.fluree.as_ref())
-                    .sparql(&req.query)
-                    .execute_formatted()
-                    .await
-            }
-            None => {
-                self.state
-                    .fluree
-                    .graph(&req.ledger)
-                    .query()
-                    .sparql(&req.query)
-                    .execute_formatted()
-                    .await
-            }
-        };
+        let max_bytes = self.state.config.mcp_agent_json_max_bytes;
+        let result = self
+            .execute_sparql_agent_json(&req.ledger, &req.query, identity, req.t, max_bytes)
+            .await;
 
         match result {
-            Ok(json_result) => {
+            Ok(envelope) => {
                 let elapsed = start.elapsed();
                 tracing::info!(
                     ledger = %req.ledger,
@@ -136,54 +123,10 @@ impl FlureeToolService {
                     "MCP sparql_query succeeded"
                 );
 
-                // Apply truncation if result is an array
-                let (output, truncated, total_rows, returned_rows) =
-                    if let Some(arr) = json_result.as_array() {
-                        let total = arr.len();
-                        let row_truncated = total > MAX_ROWS;
-                        let limited: Vec<_> = arr.iter().take(MAX_ROWS).collect();
-                        let limited_len = limited.len();
-
-                        // Check character limit and reduce further if needed
-                        let mut result_json =
-                            serde_json::to_string_pretty(&limited).unwrap_or_default();
-                        let mut final_slice = limited;
-
-                        while result_json.len() > MAX_CHARS && final_slice.len() > 1 {
-                            let new_len = (final_slice.len() as f64 * 0.8) as usize;
-                            final_slice = final_slice.into_iter().take(new_len).collect();
-                            result_json =
-                                serde_json::to_string_pretty(&final_slice).unwrap_or_default();
-                        }
-
-                        let char_truncated = final_slice.len() < limited_len;
-
-                        (
-                            result_json,
-                            row_truncated || char_truncated,
-                            total,
-                            final_slice.len(),
-                        )
-                    } else {
-                        (
-                            serde_json::to_string_pretty(&json_result)
-                                .unwrap_or_else(|_| json_result.to_string()),
-                            false,
-                            0,
-                            0,
-                        )
-                    };
-
-                // Add truncation notice if results were limited
-                let text = if truncated {
-                    format!(
-                        "{output}\n\n---\nNote: Results truncated. Showing {returned_rows} of {total_rows} total rows. \
-                         Use SPARQL LIMIT and OFFSET clauses to paginate through results."
-                    )
-                } else {
-                    output
-                };
-
+                // Compact serialization — the formatter already applied the byte budget,
+                // so pretty-printing here would only inflate the token cost.
+                let text =
+                    serde_json::to_string(&envelope).unwrap_or_else(|_| envelope.to_string());
                 Ok(CallToolResult::success(vec![Content::text(text)]))
             }
             Err(e) => {
@@ -199,6 +142,78 @@ impl FlureeToolService {
                 Ok(CallToolResult::error(vec![Content::text(format!(
                     "SPARQL query error: {e}"
                 ))]))
+            }
+        }
+    }
+
+    /// Execute a SPARQL query and format the result as an Agent JSON envelope.
+    ///
+    /// Extracted from [`sparql_query`](Self::sparql_query) so it can be exercised in tests
+    /// without an rmcp `RequestContext`.
+    ///
+    /// - `identity` — when `Some`, the query runs under that identity's policy.
+    /// - `t` — when `Some`, the query runs against that historical snapshot, which is how
+    ///   callers paginate deterministically (re-run with the previous result's `t`).
+    /// - `max_bytes` — byte budget; rows beyond it are dropped and the envelope reports
+    ///   `hasMore: true`.
+    pub async fn execute_sparql_agent_json(
+        &self,
+        ledger: &str,
+        query: &str,
+        identity: Option<&str>,
+        t: Option<i64>,
+        max_bytes: usize,
+    ) -> Result<serde_json::Value, fluree_db_api::ApiError> {
+        let agent_ctx = fluree_db_api::AgentJsonContext {
+            // Leave `sparql_text` unset: the formatter's resume query targets the
+            // connection-scoped `FROM <ledger@t:N>` path, which does not round-trip through
+            // this ledger-scoped tool. MCP pagination uses the `t` request field instead.
+            sparql_text: None,
+            from_count: fluree_db_api::sparql_from_count(query),
+            iso_timestamp: Some(
+                chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+            ),
+            ..Default::default()
+        };
+        let config = fluree_db_api::FormatterConfig::agent_json()
+            .with_max_bytes(max_bytes)
+            .with_agent_json_context(agent_ctx);
+
+        match identity {
+            Some(id) => {
+                let opts = fluree_db_api::QueryConnectionOptions {
+                    identity: Some(id.to_string()),
+                    ..Default::default()
+                };
+                let view = match t {
+                    Some(t) => {
+                        self.state
+                            .fluree
+                            .db_at_t_with_policy(ledger, t, &opts)
+                            .await?
+                    }
+                    None => self.state.fluree.db_with_policy(ledger, &opts).await?,
+                };
+                view.query(self.state.fluree.as_ref())
+                    .sparql(query)
+                    .format(config)
+                    .execute_formatted()
+                    .await
+            }
+            None => {
+                let graph = match t {
+                    Some(t) => self
+                        .state
+                        .fluree
+                        .graph_at(ledger, fluree_db_api::TimeSpec::AtT(t)),
+                    None => self.state.fluree.graph(ledger),
+                };
+                graph
+                    .query()
+                    .sparql(query)
+                    .format(config)
+                    .execute_formatted()
+                    .await
             }
         }
     }
@@ -263,8 +278,9 @@ impl ServerHandler for FlureeToolService {
                 "Fluree DB MCP server. Available tools:\n\
                  - get_data_model: Get the schema (classes, properties, counts) for a ledger. \
                    Use this FIRST to understand what data exists.\n\
-                 - sparql_query: Execute a SPARQL SELECT query against a ledger. \
-                   Returns JSON-LD results."
+                 - sparql_query: Execute a SPARQL SELECT query against a ledger. Returns a \
+                   compact Agent JSON envelope (schema, rows, rowCount, t, hasMore). When hasMore \
+                   is true, paginate by re-running with the same `t` and an increased OFFSET/LIMIT."
                     .to_string(),
             ),
         }

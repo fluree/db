@@ -1350,6 +1350,24 @@ mem:constraint-01ksa8r11bg19hsb6wqnd9h8kp a mem:Constraint ;
     mem:branch "main" ;
     mem:createdAt "2026-05-23T11:15:22.795697+00:00"^^xsd:dateTime .
 
+mem:constraint-01kt77z8dfhaj2sn0wkbrfvjrk a mem:Constraint ;
+    mem:content "SPARQL time-travel via the `@t:`/`@iso:` suffix on a ledger IRI is parsed ONLY on the FROM/dataset path (connection-scoped `query_from()` → `dataset.rs::parse_ledger_id_time_travel`). The ledger-scoped `graph(ledger).query()` path passes the raw ledger string to `load_graph_db(ledger)` with `TimeSpec::Latest` and does NOT parse a `@t:` suffix — `graph(\"mydb:main@t:5\")` looks for a ledger literally named that and fails. For ledger-scoped time travel use `graph_at(ledger, TimeSpec::AtT(t))` or `db_at_t_with_policy(ledger, t, opts)`. This is why the MCP `sparql_query` tool paginates deterministically via an explicit `t` request field (not a FROM-rewritten resume query)." ;
+    mem:tag "dataset" ;
+    mem:tag "graph-api" ;
+    mem:tag "mcp" ;
+    mem:tag "pagination" ;
+    mem:tag "sparql" ;
+    mem:tag "time-travel" ;
+    mem:scope mem:repo ;
+    mem:severity "should" ;
+    mem:artifactRef "fluree-db-api/src/dataset.rs" ;
+    mem:artifactRef "fluree-db-api/src/graph.rs" ;
+    mem:artifactRef "fluree-db-api/src/view/fluree_ext.rs" ;
+    mem:artifactRef "fluree-db-server/src/mcp/tools.rs" ;
+    mem:branch "main" ;
+    mem:createdAt "2026-06-03T17:19:49.679936+00:00"^^xsd:dateTime ;
+    mem:rationale "Non-obvious: the same @t: syntax works in a FROM clause but is silently wrong as a graph(ledger) argument. Cost real time when wiring snapshot pinning into any ledger-scoped (non-FROM) execution path." .
+
 mem:decision-01ksj0awgy3h55453a7p40tw30 a mem:Decision ;
     mem:content "Fuel charging is now per-flake without schema exclusion. stage.rs previously skipped schema flakes via is_schema_flake with a misleading comment claiming it 'mirrors query-side fuel'; query-side scans actually charge per-flake unconditionally. Removed the filter and applied the same 100 fuel baseline + 1 micro-fuel/flake formula to bulk imports (per-chunk). ImportBuilder::tracker(Tracker) attaches an external tracker; ImportResult.tally returns the final TrackingTally; mid-import limit exhaustion surfaces as ImportError::FuelExceeded." ;
     mem:tag "fuel" ;

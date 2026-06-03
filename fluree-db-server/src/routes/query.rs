@@ -331,17 +331,7 @@ pub async fn query(
 
         // AgentJson: connection-scoped SPARQL with agent-optimized envelope
         if headers.wants_agent_json() {
-            let parsed = fluree_db_sparql::parse_sparql(&sparql);
-            let from_count = parsed.ast.as_ref()
-                .and_then(|ast| match &ast.body {
-                    fluree_db_sparql::ast::QueryBody::Select(q) => q.dataset.as_ref(),
-                    fluree_db_sparql::ast::QueryBody::Construct(q) => q.dataset.as_ref(),
-                    fluree_db_sparql::ast::QueryBody::Ask(q) => q.dataset.as_ref(),
-                    fluree_db_sparql::ast::QueryBody::Describe(q) => q.dataset.as_ref(),
-                    fluree_db_sparql::ast::QueryBody::Update(_) => None,
-                })
-                .map(|d| d.default_graphs.len())
-                .unwrap_or(0);
+            let from_count = fluree_db_api::sparql_from_count(&sparql);
             let agent_ctx = fluree_db_api::AgentJsonContext {
                 sparql_text: Some(sparql.to_string()),
                 from_count,
