@@ -117,6 +117,9 @@ async fn agent_json_envelope_shape() {
     );
     // The ledger-scoped MCP path never emits the FROM-rewritten resume query.
     assert!(env.get("resume").is_none(), "no resume key for MCP");
+    // `iso` is intentionally dropped: it would be wall-clock query time, not the snapshot's
+    // timestamp, and pagination keys on `t` — so a misleading field is simply omitted.
+    assert!(env.get("iso").is_none(), "no iso key for MCP");
 }
 
 #[tokio::test]
@@ -224,4 +227,114 @@ async fn agent_json_identity_branch_shape() {
         .get("hasMore")
         .map(JsonValue::is_boolean)
         .unwrap_or(false));
+}
+
+#[tokio::test]
+async fn agent_json_truncation_message_explains_pagination() {
+    let (_tmp, state) = test_state().await;
+    create_ledger(&state, "test:msg").await;
+    insert(&state, "test:msg", rows_graph(20)).await;
+
+    let svc = FlureeToolService::new(state.clone());
+    // Force truncation so the pagination guidance is appended to `message`.
+    let env = svc
+        .execute_sparql_agent_json("test:msg", QUERY, None, None, 64)
+        .await
+        .expect("query ok");
+
+    assert_eq!(env.get("hasMore"), Some(&JsonValue::Bool(true)));
+    let t = env.get("t").and_then(JsonValue::as_i64).expect("t present");
+    let msg = env
+        .get("message")
+        .and_then(JsonValue::as_str)
+        .expect("message present");
+    assert!(
+        msg.contains(&format!("t={t}")),
+        "message should reference the snapshot t: {msg}"
+    );
+    assert!(
+        msg.contains("ORDER BY"),
+        "message should recommend ORDER BY: {msg}"
+    );
+    assert!(
+        msg.contains("OFFSET"),
+        "message should mention OFFSET: {msg}"
+    );
+}
+
+/// `SELECT ?s ?name … ORDER BY ?s` with optional `LIMIT n OFFSET m`.
+fn paging_query(limit_offset: Option<(usize, usize)>) -> String {
+    let base = "PREFIX ex: <http://example.org/>\n\
+                SELECT ?s ?name WHERE { ?s ex:name ?name } ORDER BY ?s";
+    match limit_offset {
+        Some((limit, offset)) => format!("{base} LIMIT {limit} OFFSET {offset}"),
+        None => base.to_string(),
+    }
+}
+
+fn s_values(env: &JsonValue) -> Vec<String> {
+    env.get("rows")
+        .and_then(JsonValue::as_array)
+        .map(|rows| {
+            rows.iter()
+                .filter_map(|r| r.get("?s").and_then(JsonValue::as_str).map(String::from))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+#[tokio::test]
+async fn agent_json_pinned_paging_is_disjoint_and_complete() {
+    let (_tmp, state) = test_state().await;
+    create_ledger(&state, "test:page").await;
+    insert(&state, "test:page", rows_graph(4)).await;
+
+    let svc = FlureeToolService::new(state.clone());
+
+    // Pin the snapshot, then page it with ORDER BY so the contract — disjoint, complete pages —
+    // is exercised end to end (snapshot fixity alone doesn't prove stable scan order).
+    let base = svc
+        .execute_sparql_agent_json("test:page", &paging_query(None), None, None, 32_768)
+        .await
+        .expect("latest ok");
+    let t = base
+        .get("t")
+        .and_then(JsonValue::as_i64)
+        .expect("t present");
+    assert_eq!(base.get("rowCount").and_then(JsonValue::as_u64), Some(4));
+
+    let page1 = svc
+        .execute_sparql_agent_json(
+            "test:page",
+            &paging_query(Some((2, 0))),
+            None,
+            Some(t),
+            32_768,
+        )
+        .await
+        .expect("page1 ok");
+    let page2 = svc
+        .execute_sparql_agent_json(
+            "test:page",
+            &paging_query(Some((2, 2))),
+            None,
+            Some(t),
+            32_768,
+        )
+        .await
+        .expect("page2 ok");
+
+    let s1 = s_values(&page1);
+    let s2 = s_values(&page2);
+    assert_eq!(s1.len(), 2, "page 1 returns 2 rows: {page1}");
+    assert_eq!(s2.len(), 2, "page 2 returns 2 rows: {page2}");
+
+    let mut union: Vec<String> = s1.iter().chain(s2.iter()).cloned().collect();
+    union.sort();
+    union.dedup();
+    assert_eq!(
+        union.len(),
+        4,
+        "pages are disjoint and together cover all 4 rows: {s1:?} {s2:?}"
+    );
 }

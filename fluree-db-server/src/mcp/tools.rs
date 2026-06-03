@@ -43,8 +43,8 @@ pub struct SparqlQueryRequest {
     #[schemars(
         description = "Optional transaction time `t` to pin the query to a specific historical \
         snapshot. Pass the `t` value returned in a previous result's envelope to paginate \
-        deterministically across calls (same `t` plus an increased SPARQL OFFSET/LIMIT). Omit to \
-        query the latest snapshot."
+        deterministically across calls: re-run with the same `t`, an ORDER BY clause, and a \
+        larger OFFSET. Omit to query the latest snapshot."
     )]
     pub t: Option<i64>,
 }
@@ -82,13 +82,14 @@ impl FlureeToolService {
 
     /// Execute a SPARQL query against a Fluree ledger
     #[tool(
-        description = "Execute a SPARQL SELECT query against a Fluree ledger. Returns a compact \
-        Agent JSON envelope: `schema` (per-variable datatypes, declared once), `rows` (objects \
-        with native JSON values), `rowCount`, `t` (the snapshot's transaction time), `iso` (the \
-        snapshot timestamp), and `hasMore`. When `hasMore` is true the result was truncated to a \
-        byte budget — fetch the next page by re-running this tool with the SAME `t` value (for a \
-        consistent snapshot) plus an increased SPARQL OFFSET/LIMIT. Use get_data_model first to \
-        understand the schema before querying."
+        description = "Execute a SPARQL SELECT query against a Fluree ledger (the ledger is set by \
+        the `ledger` parameter, not a FROM clause). Returns a compact Agent JSON envelope: \
+        `schema` (per-variable datatypes, declared once), `rows` (objects with native JSON \
+        values), `rowCount`, `t` (the snapshot's transaction time), and `hasMore`. When `hasMore` \
+        is true the result was truncated to a byte budget — fetch the next page by re-running this \
+        tool with the SAME `t` (to stay on one snapshot) and your query extended with ORDER BY \
+        (for stable page boundaries) plus a larger OFFSET. Use get_data_model first to understand \
+        the schema before querying."
     )]
     async fn sparql_query(
         &self,
@@ -164,22 +165,13 @@ impl FlureeToolService {
         t: Option<i64>,
         max_bytes: usize,
     ) -> Result<serde_json::Value, fluree_db_api::ApiError> {
-        let agent_ctx = fluree_db_api::AgentJsonContext {
-            // Leave `sparql_text` unset: the formatter's resume query targets the
-            // connection-scoped `FROM <ledger@t:N>` path, which does not round-trip through
-            // this ledger-scoped tool. MCP pagination uses the `t` request field instead.
-            sparql_text: None,
-            from_count: fluree_db_api::sparql_from_count(query),
-            iso_timestamp: Some(
-                chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
-            ),
-            ..Default::default()
-        };
-        let config = fluree_db_api::FormatterConfig::agent_json()
-            .with_max_bytes(max_bytes)
-            .with_agent_json_context(agent_ctx);
+        // No AgentJsonContext: the ledger (and optional `t`) fully scope a single-ledger query,
+        // so `t` is always included and the formatter's FROM-based resume / multi-ledger advice
+        // — which target the connection-scoped path and don't round-trip through this
+        // ledger-scoped tool — never apply. Pagination guidance is added by `annotate_pagination`.
+        let config = fluree_db_api::FormatterConfig::agent_json().with_max_bytes(max_bytes);
 
-        match identity {
+        let mut envelope = match identity {
             Some(id) => {
                 let opts = fluree_db_api::QueryConnectionOptions {
                     identity: Some(id.to_string()),
@@ -198,7 +190,7 @@ impl FlureeToolService {
                     .sparql(query)
                     .format(config)
                     .execute_formatted()
-                    .await
+                    .await?
             }
             None => {
                 let graph = match t {
@@ -213,9 +205,42 @@ impl FlureeToolService {
                     .sparql(query)
                     .format(config)
                     .execute_formatted()
-                    .await
+                    .await?
             }
+        };
+
+        Self::annotate_pagination(&mut envelope);
+        Ok(envelope)
+    }
+
+    /// When the envelope was truncated, append this tool's pagination protocol to its `message`.
+    ///
+    /// The shared formatter only emits a generic "truncated to N bytes" notice; the
+    /// `t` + `ORDER BY` + `OFFSET` protocol is specific to this ledger-scoped tool, so without
+    /// this it would live only in the tool description and not in the result itself — exactly
+    /// where an agent looks when it sees `hasMore`.
+    fn annotate_pagination(envelope: &mut serde_json::Value) {
+        if envelope.get("hasMore").and_then(serde_json::Value::as_bool) != Some(true) {
+            return;
         }
+        // Read `t` before taking the mutable borrow below.
+        let pin = match envelope.get("t").and_then(serde_json::Value::as_i64) {
+            Some(t) => format!("t={t}"),
+            None => "the same `t`".to_string(),
+        };
+        let guidance = format!(
+            " To page through the remaining rows deterministically, re-run sparql_query with \
+             {pin} and extend your query with ORDER BY (for stable page boundaries) and a larger \
+             OFFSET."
+        );
+        let Some(obj) = envelope.as_object_mut() else {
+            return;
+        };
+        let message = match obj.get("message").and_then(serde_json::Value::as_str) {
+            Some(existing) => format!("{existing}{guidance}"),
+            None => guidance.trim_start().to_string(),
+        };
+        obj.insert("message".to_string(), serde_json::Value::String(message));
     }
 
     /// Get the data model (schema) for a Fluree ledger
@@ -280,7 +305,8 @@ impl ServerHandler for FlureeToolService {
                    Use this FIRST to understand what data exists.\n\
                  - sparql_query: Execute a SPARQL SELECT query against a ledger. Returns a \
                    compact Agent JSON envelope (schema, rows, rowCount, t, hasMore). When hasMore \
-                   is true, paginate by re-running with the same `t` and an increased OFFSET/LIMIT."
+                   is true, paginate by re-running with the same `t`, an ORDER BY, and a larger \
+                   OFFSET."
                     .to_string(),
             ),
         }
