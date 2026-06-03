@@ -125,6 +125,19 @@ impl IriCompactor {
         self.compactor.compact_id(iri)
     }
 
+    /// Decode a Sid and compact it for an `@id` position.
+    ///
+    /// The `@id` counterpart to [`compact_sid`](Self::compact_sid): it decodes
+    /// the SID to a full IRI and then compacts via `@base` + explicit
+    /// prefixes/terms only — never `@vocab`. Per JSON-LD 1.1, `@vocab` governs
+    /// predicates and `@type` values, but must NOT shorten node identifiers, so
+    /// every `@id` / node-reference output site uses this instead of
+    /// `compact_sid`.
+    pub fn compact_id_sid(&self, sid: &Sid) -> Result<String> {
+        let iri = self.decode_sid(sid)?;
+        Ok(self.compact_id_iri(&iri))
+    }
+
     /// Compact an IRI for **display purposes** (CLI table/CSV output).
     ///
     /// Like `compact_vocab_iri`, but also tries auto-derived fallback prefixes
@@ -580,6 +593,96 @@ mod tests {
         assert!(a.ends_with(":bar"), "expected prefix:bar, got {a}");
         assert!(b.ends_with(":bar"), "expected prefix:bar, got {b}");
         assert_ne!(a, b, "should have different prefixes");
+    }
+
+    /// Regression for #1280: `@vocab` governs predicate / `@type` compaction,
+    /// but must NOT shorten `@id` node identifiers. An `@id` IRI that falls
+    /// under `@vocab` keeps its full IRI; explicit prefixes and `@base` still
+    /// apply to `@id`.
+    #[test]
+    fn test_compact_id_does_not_apply_vocab() {
+        let mut namespaces = HashMap::new();
+        namespaces.insert(100, "http://example.org/lists/".to_string());
+        namespaces.insert(101, "http://example.org/items/".to_string());
+        namespaces.insert(102, "http://base.example/".to_string());
+        let context = ParsedContext::parse(
+            None,
+            &json!({
+                "@vocab": "http://example.org/lists/",
+                "@base": "http://base.example/",
+                "items": "http://example.org/items/"
+            }),
+        )
+        .unwrap();
+        let compactor = IriCompactor::new(&namespaces, &context);
+
+        // SID under @vocab: the @id path must NOT collapse it to the bare term.
+        let summer = Sid::new(100, "summer"); // http://example.org/lists/summer
+        assert_eq!(
+            compactor.compact_id_sid(&summer).unwrap(),
+            "http://example.org/lists/summer"
+        );
+        // Predicate / @type path: @vocab DOES shorten it (unchanged behavior).
+        assert_eq!(compactor.compact_sid(&summer).unwrap(), "summer");
+
+        // @id still honors explicit prefixes.
+        let q1 = Sid::new(101, "q1"); // http://example.org/items/q1
+        assert_eq!(compactor.compact_id_sid(&q1).unwrap(), "items:q1");
+
+        // @id still honors @base (relative form).
+        let thing = Sid::new(102, "thing"); // http://base.example/thing
+        assert_eq!(compactor.compact_id_sid(&thing).unwrap(), "thing");
+
+        // The IRI-string variant matches the SID variant for @id positions.
+        assert_eq!(
+            compactor.compact_id_iri("http://example.org/lists/summer"),
+            "http://example.org/lists/summer"
+        );
+    }
+
+    /// With BOTH `@base` and `@vocab` set to distinct namespaces, each governs
+    /// only its own position: `@base` shortens `@id` node identifiers, `@vocab`
+    /// shortens predicate / `@type` values, and neither bleeds into the other's
+    /// position.
+    ///
+    /// NOTE: `@base` *also* participates in vocab compaction as Fluree's
+    /// fallback vocabulary — a bare `@type`/predicate in an `@base`-only context
+    /// (no `@vocab`) is expanded against `@base` on insert and must round-trip
+    /// back through `@base` on output. So a predicate IRI that happens to fall
+    /// under `@base` does compact to a relative term; that is intentional and is
+    /// exercised end-to-end by `it_query_misc::base_context_parity`. The
+    /// asymmetry that matters for #1280 is the reverse: `@vocab` must NEVER
+    /// shorten an `@id`.
+    #[test]
+    fn test_base_and_vocab_govern_their_own_positions() {
+        let mut namespaces = HashMap::new();
+        namespaces.insert(100, "https://flur.ee/base/".to_string());
+        namespaces.insert(101, "https://flur.ee/vocab/".to_string());
+        let context = ParsedContext::parse(
+            None,
+            &json!({
+                "@base": "https://flur.ee/base/",
+                "@vocab": "https://flur.ee/vocab/"
+            }),
+        )
+        .unwrap();
+        let compactor = IriCompactor::new(&namespaces, &context);
+
+        let under_base = Sid::new(100, "alice"); // https://flur.ee/base/alice
+        let under_vocab = Sid::new(101, "bob"); //  https://flur.ee/vocab/bob
+
+        // @id position: @base applies (relative form); @vocab must NOT.
+        assert_eq!(compactor.compact_id_sid(&under_base).unwrap(), "alice");
+        assert_eq!(
+            compactor.compact_id_sid(&under_vocab).unwrap(),
+            "https://flur.ee/vocab/bob",
+            "#1280: @vocab must not shorten an @id node identifier"
+        );
+
+        // Predicate / @type position: @vocab applies (bare term).
+        assert_eq!(compactor.compact_sid(&under_vocab).unwrap(), "bob");
+        // ...and @base acts as the vocab fallback here (intentional, see note).
+        assert_eq!(compactor.compact_sid(&under_base).unwrap(), "alice");
     }
 
     #[test]

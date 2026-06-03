@@ -135,7 +135,9 @@ fn format_binding(
         // Reference (IRI or blank node)
         Binding::Sid { sid, .. } => {
             // SPARQL JSON output uses compact IRIs where possible (not full IRIs).
-            let iri = compactor.compact_sid(sid)?;
+            // A `uri` value names a node, so it's an `@id`-position identifier:
+            // compact via `@base` + explicit prefixes, never `@vocab` (issue #1280).
+            let iri = compactor.compact_id_sid(sid)?;
             // Check if it's a blank node (starts with _:)
             if iri.starts_with("_:") {
                 Ok(Some(json!({
@@ -152,7 +154,7 @@ fn format_binding(
 
         // IriMatch: use canonical IRI, then compact (multi-ledger mode)
         Binding::IriMatch { iri, .. } => {
-            let compacted = compactor.compact_iri(iri)?;
+            let compacted = compactor.compact_id_iri(iri);
             if compacted.starts_with("_:") {
                 Ok(Some(json!({
                     "type": "bnode",

@@ -139,6 +139,26 @@ Fluree includes many standard prefixes by default:
 }
 ```
 
+### How `@vocab` and `@base` compact results
+
+When a query `@context` sets `@vocab` and/or `@base`, Fluree follows JSON-LD 1.1
+about *which* IRIs each keyword may shorten:
+
+- **`@vocab`** governs **property names, `@type` values, and `@type: @vocab`
+  term values** only. A predicate or class IRI that falls under `@vocab` is
+  emitted as a bare term (e.g. `name`, `Person`).
+- **`@base`** governs **node identifiers** — `@id` and reference values. An
+  `@id` that falls under `@base` is emitted as a base-relative reference.
+- **`@id` is never shortened by `@vocab`.** A node identifier whose IRI falls
+  under the `@vocab` namespace keeps its full IRI (or an explicit-prefix /
+  `@base`-relative form) — it is *not* collapsed to a bare term, because a
+  compliant JSON-LD processor would re-resolve a bare `@id` against `@base`,
+  not `@vocab`.
+
+Explicit prefix/term mappings apply in both positions. As a special case,
+setting `@vocab: ""` maps the vocabulary to `@base`, so bare terms and
+base-relative identifiers share the same namespace.
+
 ## IRI Resolution Rules
 
 Fluree follows strict IRI resolution rules:
