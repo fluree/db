@@ -15,10 +15,10 @@
 //! adds no operation-pipeline work of its own.
 
 use crate::{
-    Committer, IdempotencyKey, LocalCommitter, MergeReceipt, MergeRequest, OperationReceipt,
-    PushReceipt, PushRequest, RebaseReceipt, RebaseRequest, RevertReceipt, RevertRequest,
-    RevertSelection, SubmissionError, SubmissionLookup, SubmissionState, TransactionBody,
-    TransactionReceipt, TransactionRequest,
+    Committer, IdempotencyCacheKey, IdempotencyKey, LocalCommitter, MergeReceipt, MergeRequest,
+    OperationReceipt, PushReceipt, PushRequest, RebaseReceipt, RebaseRequest, RevertReceipt,
+    RevertRequest, RevertSelection, SubmissionError, SubmissionLookup, SubmissionState,
+    TransactionBody, TransactionReceipt, TransactionRequest,
 };
 use async_trait::async_trait;
 use fluree_db_api::{CommitRef, Fluree};
@@ -46,10 +46,6 @@ const IDEMPOTENCY_CACHE_CAPACITY: u64 = 100_000;
 /// limit under sustained load.
 pub const DEFAULT_PENDING_LIMIT: usize = 1024;
 
-/// Composite cache key: `(ledger_id, idempotency_key)`. Submissions on
-/// different ledgers with the same key are independent.
-type SubmissionCacheKey = (String, IdempotencyKey);
-
 /// Cached state for a submission plus the hash of the body it carried.
 /// The hash enables detecting the misuse case where the same idempotency
 /// key is reused with a different transaction body.
@@ -66,7 +62,7 @@ struct CachedSubmission {
 /// anyway.
 pub struct CachingCommitter<C: Committer = LocalCommitter> {
     executor: C,
-    cache: Cache<SubmissionCacheKey, CachedSubmission>,
+    cache: Cache<IdempotencyCacheKey, CachedSubmission>,
     admission: Arc<Semaphore>,
 }
 
@@ -173,7 +169,7 @@ impl<C: Committer> CachingCommitter<C> {
     /// when another caller's execution is still running.
     async fn try_claim_slot(
         &self,
-        cache_key: SubmissionCacheKey,
+        cache_key: IdempotencyCacheKey,
         body_hash: [u8; 32],
     ) -> Result<Option<OperationReceipt>, SubmissionError> {
         // `or_insert_with_if` writes a fresh `InFlight` marker when the key
@@ -217,7 +213,7 @@ impl<C: Committer> CachingCommitter<C> {
     /// kinds.
     async fn record_outcome<R, F>(
         &self,
-        cache_key: SubmissionCacheKey,
+        cache_key: IdempotencyCacheKey,
         body_hash: [u8; 32],
         outcome: &Result<R, SubmissionError>,
         wrap: F,
@@ -349,7 +345,7 @@ impl<C: Committer> Committer for CachingCommitter<C> {
             return self.executor.transact(request).await;
         };
 
-        let cache_key = (request.ledger_id.clone(), idempotency_key);
+        let cache_key = IdempotencyCacheKey::new(request.ledger_id.clone(), idempotency_key);
         let body_hash = Self::hash_request_body(&request);
 
         if let Some(receipt) = self.try_claim_slot(cache_key.clone(), body_hash).await? {
@@ -380,7 +376,7 @@ impl<C: Committer> Committer for CachingCommitter<C> {
         // Cache key uses the same `ledger:branch` form as `transact` so a
         // single status-lookup endpoint works uniformly across op kinds.
         let ledger_id = fluree_db_api::format_ledger_id(&request.ledger_name, &request.branch);
-        let cache_key = (ledger_id, idempotency_key);
+        let cache_key = IdempotencyCacheKey::new(ledger_id, idempotency_key);
         let body_hash = Self::hash_revert_body(&request);
 
         if let Some(receipt) = self.try_claim_slot(cache_key.clone(), body_hash).await? {
@@ -408,7 +404,7 @@ impl<C: Committer> Committer for CachingCommitter<C> {
         // front, no need to pre-resolve the target.
         let ledger_id =
             fluree_db_api::format_ledger_id(&request.ledger_name, &request.source_branch);
-        let cache_key = (ledger_id, idempotency_key);
+        let cache_key = IdempotencyCacheKey::new(ledger_id, idempotency_key);
         let body_hash = Self::hash_merge_body(&request);
 
         if let Some(receipt) = self.try_claim_slot(cache_key.clone(), body_hash).await? {
@@ -435,7 +431,7 @@ impl<C: Committer> Committer for CachingCommitter<C> {
         // rebased — natural client identifier and matches the URL they'd
         // use to check status.
         let ledger_id = fluree_db_api::format_ledger_id(&request.ledger_name, &request.branch);
-        let cache_key = (ledger_id, idempotency_key);
+        let cache_key = IdempotencyCacheKey::new(ledger_id, idempotency_key);
         let body_hash = Self::hash_rebase_body(&request);
 
         if let Some(receipt) = self.try_claim_slot(cache_key.clone(), body_hash).await? {
@@ -460,7 +456,7 @@ impl<C: Committer> Committer for CachingCommitter<C> {
 
         // Push targets a fully-qualified `ledger:branch` directly, so the
         // cache key matches `transact` namespacing.
-        let cache_key = (request.ledger_id.clone(), idempotency_key);
+        let cache_key = IdempotencyCacheKey::new(request.ledger_id.clone(), idempotency_key);
         let body_hash = Self::hash_push_body(&request);
 
         if let Some(receipt) = self.try_claim_slot(cache_key.clone(), body_hash).await? {
@@ -480,7 +476,7 @@ impl<C: Committer> Committer for CachingCommitter<C> {
 #[async_trait]
 impl<C: Committer> SubmissionLookup for CachingCommitter<C> {
     async fn status(&self, ledger_id: &str, key: &IdempotencyKey) -> SubmissionState {
-        let cache_key = (ledger_id.to_string(), key.clone());
+        let cache_key = IdempotencyCacheKey::new(ledger_id, key.clone());
         match self.cache.get(&cache_key).await {
             Some(entry) => entry.state,
             None => SubmissionState::Unknown,

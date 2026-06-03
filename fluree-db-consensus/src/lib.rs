@@ -24,11 +24,13 @@
 
 pub mod caching;
 pub mod local;
-pub mod monolithic;
+#[cfg(feature = "raft")]
+pub mod raft;
 
 pub use caching::{CachingCommitter, DEFAULT_IDEMPOTENCY_TTL};
 pub use local::LocalCommitter;
-pub use monolithic::{MonolithicCommitter, DEFAULT_IDEMPOTENCY_TTL};
+#[cfg(feature = "raft")]
+pub use raft::{Command, NodeId, RaftCommitter, Response, TypeConfig};
 
 use async_trait::async_trait;
 use fluree_db_api::{
@@ -75,6 +77,28 @@ impl From<String> for IdempotencyKey {
 impl From<&str> for IdempotencyKey {
     fn from(value: &str) -> Self {
         Self(value.to_string())
+    }
+}
+
+/// Composite lookup key for idempotency caches: an [`IdempotencyKey`]
+/// scoped to a particular ledger. Submissions on different ledgers
+/// with the same key are independent.
+///
+/// Used by both the in-process [`CachingCommitter`] and the
+/// replicated Raft state machine so the two layers agree on cache
+/// identity without owning parallel definitions.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct IdempotencyCacheKey {
+    pub ledger_id: String,
+    pub key: IdempotencyKey,
+}
+
+impl IdempotencyCacheKey {
+    pub fn new(ledger_id: impl Into<String>, key: IdempotencyKey) -> Self {
+        Self {
+            ledger_id: ledger_id.into(),
+            key,
+        }
     }
 }
 
