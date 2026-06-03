@@ -3001,6 +3001,49 @@ async fn sparql_xsd_cast_double_from_integer() {
 }
 
 #[tokio::test]
+async fn sparql_integer_division_yields_decimal() {
+    // Per XPath op:numeric-divide, xsd:integer / xsd:integer yields xsd:decimal:
+    // 10 / 4 = 2.5, NOT a truncated integer 2.
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger = seed_builtin_fn_data(&fluree, "arith:int-div").await;
+
+    let query = r"
+        PREFIX ex: <http://example.org/ns/>
+        SELECT (10 / 4 AS ?r)
+        WHERE { ex:sushi ex:label ?label }
+    ";
+
+    let result = support::query_sparql(&fluree, &ledger, query)
+        .await
+        .expect("integer division query");
+    let jsonld = result.to_jsonld(&ledger.snapshot).expect("to_jsonld");
+    // xsd:decimal renders as a string to preserve exactness (see the
+    // xsd:double note elsewhere in this file); the value is 2.5, not 2.
+    assert_eq!(jsonld, json!([["2.5"]]));
+}
+
+#[tokio::test]
+async fn sparql_float_divided_by_integer_promotes() {
+    // Mixed numeric arithmetic: xsd:float(...) / xsd:integer must promote (not
+    // error with a type mismatch). 10.0 / 4 = 2.5.
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger = seed_builtin_fn_data(&fluree, "arith:float-div-int").await;
+
+    let query = r"
+        PREFIX xsd: <http://www.w3.org/2001/XMLSchema#>
+        PREFIX ex: <http://example.org/ns/>
+        SELECT (xsd:float(10) / 4 AS ?r)
+        WHERE { ex:sushi ex:label ?label }
+    ";
+
+    let result = support::query_sparql(&fluree, &ledger, query)
+        .await
+        .expect("float / integer query");
+    let jsonld = result.to_jsonld(&ledger.snapshot).expect("to_jsonld");
+    assert_eq!(jsonld, json!([[2.5]]));
+}
+
+#[tokio::test]
 async fn sparql_xsd_cast_string_from_integer() {
     // xsd:string(42) should return "42"
     let fluree = FlureeBuilder::memory().build_memory();
