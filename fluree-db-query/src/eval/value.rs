@@ -11,7 +11,7 @@ use bigdecimal::BigDecimal;
 use fluree_db_core::temporal::{
     Date as FlureeDate, DateTime as FlureeDateTime, Time as FlureeTime,
 };
-use fluree_db_core::{FlakeValue, GeoPointBits};
+use fluree_db_core::{coerce_value, FlakeValue, GeoPointBits};
 use num_bigint::BigInt;
 use num_traits::Zero;
 use std::sync::Arc;
@@ -317,22 +317,25 @@ impl ComparableValue {
             FlakeValue::BigInt(n) => ComparableValue::BigInt(n),
             FlakeValue::Decimal(d) => ComparableValue::Decimal(d),
             FlakeValue::String(s) => {
-                use fluree_vocab::xsd;
-                let dt = match &dtc {
-                    Some(UnresolvedDatatypeConstraint::Explicit(iri)) => iri.as_ref(),
-                    _ => "",
-                };
-                if dt == xsd::FLOAT || dt == xsd::DOUBLE {
-                    if let Ok(d) = s.parse::<f64>() {
-                        return ComparableValue::Double(d);
-                    }
-                } else if dt == xsd::DECIMAL {
-                    if let Ok(d) = s.parse::<BigDecimal>() {
-                        return ComparableValue::Decimal(Box::new(d));
-                    }
-                } else if dt == xsd::INTEGER || dt == xsd::LONG || dt == xsd::INT {
-                    if let Ok(n) = s.parse::<i64>() {
-                        return ComparableValue::Long(n);
+                // Delegate string→numeric parsing to the canonical coercion
+                // layer (`fluree_db_core::coerce_value`), which covers the full
+                // XSD numeric lattice: the integer family (with BigInt overflow
+                // and per-type range validation), xsd:decimal, and
+                // xsd:float/double including the INF/-INF/NaN lexicals. Only a
+                // numeric result is adopted; non-numeric datatypes and parse
+                // failures keep the literal as-is so it still falls to a
+                // TypeMismatch in `apply`.
+                if let Some(UnresolvedDatatypeConstraint::Explicit(iri)) = &dtc {
+                    if let Ok(coerced) = coerce_value(FlakeValue::String(s.clone()), iri.as_ref()) {
+                        if let Ok(
+                            cv @ (ComparableValue::Long(_)
+                            | ComparableValue::Double(_)
+                            | ComparableValue::BigInt(_)
+                            | ComparableValue::Decimal(_)),
+                        ) = ComparableValue::try_from(coerced)
+                        {
+                            return cv;
+                        }
                     }
                 }
                 ComparableValue::TypedLiteral {
@@ -750,6 +753,48 @@ mod tests {
         assert_eq!(
             ArithmeticOp::Div.apply(float_ten, ComparableValue::Long(4)),
             Ok(ComparableValue::Double(2.5))
+        );
+    }
+
+    #[test]
+    fn test_arithmetic_typed_literal_coercion_covers_full_xsd_lattice() {
+        // xsd:short carried as a typed literal coerces for arithmetic.
+        let short_five = ComparableValue::TypedLiteral {
+            val: FlakeValue::String("5".to_string()),
+            dtc: Some(UnresolvedDatatypeConstraint::Explicit(Arc::from(
+                fluree_vocab::xsd::SHORT,
+            ))),
+        };
+        assert_eq!(
+            ArithmeticOp::Mul.apply(short_five, ComparableValue::Long(2)),
+            Ok(ComparableValue::Long(10))
+        );
+
+        // A large xsd:integer beyond i64 coerces to BigInt rather than failing.
+        let big = "99999999999999999999999999999"; // > i64::MAX
+        let big_lit = ComparableValue::TypedLiteral {
+            val: FlakeValue::String(big.to_string()),
+            dtc: Some(UnresolvedDatatypeConstraint::Explicit(Arc::from(
+                fluree_vocab::xsd::INTEGER,
+            ))),
+        };
+        assert_eq!(
+            ArithmeticOp::Add.apply(big_lit, ComparableValue::Long(1)),
+            Ok(ComparableValue::BigInt(Box::new(
+                big.parse::<BigInt>().unwrap() + 1
+            )))
+        );
+
+        // The xsd:float INF lexical coerces to an infinite double.
+        let inf = ComparableValue::TypedLiteral {
+            val: FlakeValue::String("INF".to_string()),
+            dtc: Some(UnresolvedDatatypeConstraint::Explicit(Arc::from(
+                fluree_vocab::xsd::FLOAT,
+            ))),
+        };
+        assert_eq!(
+            ArithmeticOp::Mul.apply(inf, ComparableValue::Long(2)),
+            Ok(ComparableValue::Double(f64::INFINITY))
         );
     }
 
