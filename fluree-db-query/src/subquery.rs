@@ -310,8 +310,8 @@ impl SubqueryOperator {
         // Projection trimming (`variable_deps`) and the streaming-group
         // partition hint are skipped: the subquery runs once per correlated
         // parent row, and its full select list flows back into the merge.
-        let select_vars: Option<&[VarId]> = (!self.subquery.select.is_empty())
-            .then_some(self.subquery.select.as_slice());
+        let select_vars: Option<&[VarId]> =
+            (!self.subquery.select.is_empty()).then_some(self.subquery.select.as_slice());
         let mut operator = crate::execute::operator_tree::apply_solution_modifiers(
             where_op,
             self.subquery.grouping.as_ref(),

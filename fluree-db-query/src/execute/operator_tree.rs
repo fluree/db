@@ -2963,9 +2963,8 @@ pub(crate) fn apply_solution_modifiers(
     // them before sorting does not change the ordered set of unique solutions.
     let can_project_distinct_before_sort = distinct
         && !ordering.is_empty()
-        && select_vars.is_some_and(|vars| {
-            !vars.is_empty() && ordering.iter().all(|s| vars.contains(&s.var))
-        });
+        && select_vars
+            .is_some_and(|vars| !vars.is_empty() && ordering.iter().all(|s| vars.contains(&s.var)));
 
     // Validate SELECT vars (when present) exist in the post-group schema.
     if let Some(vars) = select_vars {

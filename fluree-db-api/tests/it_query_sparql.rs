@@ -864,7 +864,10 @@ async fn sparql_subquery_aggregate_order_by_with_limit() {
         .unwrap();
     let jsonld = result.to_jsonld(&ledger.snapshot).expect("to_jsonld");
     // Counts: jbob 7, jdoe 4, bbob 1; DESC top-1 = jbob.
-    assert_eq!(normalize_rows(&jsonld), normalize_rows(&json!([["jbob", 7]])));
+    assert_eq!(
+        normalize_rows(&jsonld),
+        normalize_rows(&json!([["jbob", 7]]))
+    );
 }
 
 #[tokio::test]
@@ -918,7 +921,10 @@ async fn sparql_subquery_having() {
         .unwrap();
     let jsonld = result.to_jsonld(&ledger.snapshot).expect("to_jsonld");
     // Counts: jbob 7 (>5), jdoe 4, bbob 1 → only jbob survives HAVING.
-    assert_eq!(normalize_rows(&jsonld), normalize_rows(&json!([["jbob", 7]])));
+    assert_eq!(
+        normalize_rows(&jsonld),
+        normalize_rows(&json!([["jbob", 7]]))
+    );
 }
 
 #[tokio::test]

@@ -492,7 +492,8 @@ impl<E: IriEncoder> LoweringContext<'_, E> {
         // SELECT-expression binds: pre-aggregation ones append to WHERE; post-
         // aggregation ones (referencing an aggregate alias) ride in the grouping.
         let aggregate_aliases = self.collect_aggregate_alias_names(&select_clause);
-        let select_binds = self.lower_select_expression_binds(&select_clause, &aggregate_aliases)?;
+        let select_binds =
+            self.lower_select_expression_binds(&select_clause, &aggregate_aliases)?;
         patterns.extend(select_binds.pre);
 
         // Solution modifiers (GROUP BY / HAVING / ORDER BY / LIMIT / OFFSET /
