@@ -786,6 +786,20 @@ const PARALLEL_STAR_MIN_ROWS: u64 = 50_000;
 /// Cap on partitions regardless of core count.
 const PARALLEL_STAR_MAX_PARTITIONS: usize = 16;
 
+/// Cheap pre-gate for the partitioned-merge fast paths: true only when there are
+/// enough cores and rows to make parallelism worthwhile. The overlay-parallel
+/// wrappers call this *before* collecting/resolving novelty ops, so that small or
+/// single-core inputs skip that walk entirely and fall straight through to the
+/// serial cursor-merge (which would otherwise redo the same overlay collection).
+/// `parallel_partition_count` re-checks the identical condition, so the two never
+/// disagree.
+pub(crate) fn parallel_count_gate_open(total_rows: u64) -> bool {
+    let ncpu = std::thread::available_parallelism()
+        .map(std::num::NonZeroUsize::get)
+        .unwrap_or(1);
+    ncpu >= 2 && total_rows >= PARALLEL_STAR_MIN_ROWS
+}
+
 /// N-way merge-join COUNT over the subject range `[lo, hi)` of `p_ids`, using
 /// bounded base-leaflet iterators. Returns `Σ_{s ∈ [lo,hi)} Π_i count_i(s)` —
 /// the partial count for one partition. BASE index only (no overlay).
@@ -1011,12 +1025,12 @@ pub(crate) fn parallel_partition_count<F>(
 where
     F: Fn(u64, u64) -> Result<u128> + Sync,
 {
+    if !parallel_count_gate_open(total_rows) {
+        return Ok(None);
+    }
     let ncpu = std::thread::available_parallelism()
         .map(std::num::NonZeroUsize::get)
         .unwrap_or(1);
-    if ncpu < 2 || total_rows < PARALLEL_STAR_MIN_ROWS {
-        return Ok(None);
-    }
 
     let k = ncpu.min(PARALLEL_STAR_MAX_PARTITIONS);
     // Candidate ascending subject boundaries from the driver: leaf first-subjects
@@ -1188,6 +1202,13 @@ fn sum_star_join_overlay_parallel(
             total_rows.saturating_add(count_rows_for_predicate_psot(ec.store, ec.g_id, p_id)?);
         p_ids.push(p_id);
         sids.push(sid);
+    }
+
+    // Pre-gate: if the partitioned merge wouldn't fire anyway (too few rows/cores),
+    // bail before walking novelty — the serial cursor-merge fallback re-collects the
+    // same overlay ops, so doing it here would be pure double work (a regression).
+    if !parallel_count_gate_open(total_rows) {
+        return Ok(None);
     }
 
     // Collect + resolve each predicate's overlay ops once (serial; novelty is small).
@@ -1467,6 +1488,12 @@ fn sum_optional_join_overlay_parallel(
         }
         opt_groups.push(pids);
         opt_sids.push(sids);
+    }
+
+    // Pre-gate before walking novelty: the serial fallback re-collects these ops, so
+    // collecting them here only to fail the parallel gate would be double work.
+    if !parallel_count_gate_open(total_rows) {
+        return Ok(None);
     }
 
     let collect =
@@ -1795,6 +1822,12 @@ fn try_modifier_intersect_overlay_parallel(
     for &p in &inner_pids {
         total_rows =
             total_rows.saturating_add(count_rows_for_predicate_psot(ec.store, ec.g_id, p)?);
+    }
+
+    // Pre-gate before walking novelty: the serial keyset fallback re-collects these
+    // ops, so collecting them here only to fail the parallel gate is double work.
+    if !parallel_count_gate_open(total_rows) {
+        return Ok(None);
     }
 
     let Some(outer_ops) =

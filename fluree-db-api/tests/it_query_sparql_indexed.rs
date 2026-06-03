@@ -2746,6 +2746,112 @@ async fn overlay_delta_single_predicate_count_folds_novelty() {
         .await;
 }
 
+/// Overlay novelty-DELTA regression: a novelty assert on a subject whose id is BELOW
+/// the predicate's first indexed subject (a low-id subject that existed in the base
+/// under a different predicate and only now gains `ex:p`). The delta path partitions
+/// by per-leaf subject ranges; leaf 0's range must start at 0 (not its `first_key`)
+/// or this op falls below every range and is silently dropped — undercounting by 1.
+#[tokio::test]
+async fn overlay_delta_count_folds_novelty_below_first_leaf() {
+    assert_index_defaults();
+    let fluree = FlureeBuilder::memory()
+        .with_ledger_cache_config(LedgerManagerConfig::default())
+        .build_memory();
+    let ledger_id = "it/overlay-delta-low-id:main";
+    let mut idx_config = fluree_db_indexer::IndexerConfig::small();
+    idx_config.leaflet_rows = 100;
+    idx_config.leaf_target_bytes = 8_000;
+    idx_config.leaf_max_bytes = 16_000;
+    let (local, handle) = start_background_indexer_local(
+        fluree.backend().clone(),
+        Arc::new(fluree.nameservice_mode().clone()),
+        idx_config,
+    );
+
+    local
+        .run_until(async move {
+            let index_cfg = IndexConfig {
+                reindex_min_bytes: 0,
+                reindex_max_bytes: 80_000_000,
+            };
+            // Commit #1: many subjects under a DIFFERENT predicate `ex:aaa`. Subject and
+            // predicate ids are monotonic across commits, so `ex:aaa` < `ex:p` in PSOT
+            // order and `ex:low` (lexically smallest here) gets the minimum subject id.
+            // These `ex:aaa` flakes fill several whole leaves AHEAD of `ex:p`, so `ex:p`'s
+            // first indexed leaf has a `first_key` strictly above `ex:low`'s id — exactly
+            // the shape that makes leaf 0's `lo` non-zero and would drop the low-id op.
+            let m: i64 = 2_000;
+            let mut anchors: Vec<serde_json::Value> = Vec::with_capacity(m as usize + 1);
+            anchors.push(json!({"@id": "ex:low", "ex:aaa": 0}));
+            for i in 0..m {
+                anchors.push(json!({"@id": format!("ex:m{i}"), "ex:aaa": i}));
+            }
+            let ledger = fluree
+                .insert_with_opts(
+                    genesis_ledger_for_fluree(&fluree, ledger_id),
+                    &json!({
+                        "@context": { "ex": "http://example.org/ns/" },
+                        "@graph": anchors
+                    }),
+                    TxnOpts::default(),
+                    CommitOpts::default(),
+                    &index_cfg,
+                )
+                .await
+                .expect("commit #1 (low-id anchors)")
+                .ledger;
+            // Commit #2: the bulk of `ex:p` subjects, all with ids above `ex:low`.
+            let n: i64 = 5_000;
+            let mut nodes: Vec<serde_json::Value> = Vec::with_capacity(n as usize);
+            for i in 0..n {
+                nodes.push(json!({"@id": format!("ex:s{i}"), "ex:p": i}));
+            }
+            let ledger = fluree
+                .insert(
+                    ledger,
+                    &json!({ "@context": { "ex": "http://example.org/ns/" }, "@graph": nodes }),
+                )
+                .await
+                .expect("commit #2 (ex:p bulk)")
+                .ledger;
+            let _ = trigger_index_and_wait_outcome(&handle, ledger_id, ledger.t()).await;
+
+            // Novelty: the low-id subject gains `ex:p` — below the predicate's first leaf.
+            let _ = fluree
+                .insert(
+                    ledger,
+                    &json!({
+                        "@context": { "ex": "http://example.org/ns/" },
+                        "@id": "ex:low", "ex:p": 999
+                    }),
+                )
+                .await
+                .expect("novelty assert on low-id subject");
+
+            let view = fluree
+                .db(ledger_id)
+                .await
+                .expect("load HEAD view w/ novelty");
+            let q = r"
+                PREFIX ex: <http://example.org/ns/>
+                SELECT (COUNT(*) AS ?count) WHERE { ?s ex:p ?o }
+            ";
+            let jsonld = fluree
+                .query(&view, QueryInput::Sparql(q))
+                .await
+                .expect("overlay delta low-id query")
+                .to_jsonld(&view.snapshot)
+                .expect("to_jsonld");
+            // 5000 base + 1 low-id assert = 5001. Pre-fix this returned 5000.
+            assert_eq!(
+                normalize_rows(&jsonld),
+                normalize_rows(&json!([[5_001]])),
+                "low-id novelty below the first leaf must be counted: 5000 + 1 = 5001"
+            );
+        })
+        .await;
+}
+
 /// Overlay novelty-DELTA for no-constraint UNION COUNT(*) (bag semantics = Σ per
 /// branch of base + delta).
 #[tokio::test]

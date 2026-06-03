@@ -539,6 +539,12 @@ fn try_union_constraint_overlay_parallel(
     }
     let total_rows = ur.saturating_add(er);
 
+    // Pre-gate before walking novelty: the serial cursor-merge fallback re-collects
+    // these ops, so collecting them here only to fail the parallel gate is double work.
+    if !crate::count_plan_exec::parallel_count_gate_open(total_rows) {
+        return Ok(None);
+    }
+
     let collect = |sids: &[fluree_db_core::Sid]| -> Result<Option<Vec<Vec<fluree_db_binary_index::read::types::OverlayOp>>>> {
         let mut out = Vec::with_capacity(sids.len());
         for sid in sids {

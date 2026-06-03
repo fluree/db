@@ -2019,10 +2019,15 @@ pub async fn incremental_index(
                                 }
                             }
                             Err(e) => {
-                                tracing::warn!(
-                                    g_id = scan_g_id, error = %e,
-                                    "batched PSOT class lookup failed for graph"
-                                );
+                                // Loads the base class membership that all re-attribution
+                                // (datatype/lang AND ref-class) is computed against. A
+                                // failure here makes every downstream class delta unsound,
+                                // so abort to a full rebuild rather than warn-and-continue.
+                                return Err(IndexerError::IncrementalAbort(format!(
+                                    "Phase 3b base PSOT class lookup failed for graph \
+                                     {scan_g_id}: {e} (deferring class-stat recompute to \
+                                     full rebuild)"
+                                )));
                             }
                         }
                     }
@@ -2273,12 +2278,19 @@ pub async fn incremental_index(
                                 ) {
                                     Ok(m) => m,
                                     Err(e) => {
-                                        tracing::warn!(
-                                            g_id, error = %e,
-                                            "Phase 3b: base subject-property scan failed; \
-                                             re-typed subjects may keep stale class stats"
-                                        );
-                                        continue;
+                                        // This scan drives the datatype/language
+                                        // re-attribution that makes the now-ungated
+                                        // class-stat folds current-state-exact. A
+                                        // warn-and-continue here would silently leave
+                                        // re-typed subjects with stale per-(class,
+                                        // property) stats, so abort to a full rebuild
+                                        // (which recomputes class stats from the SPOT
+                                        // pass). Caught in lib.rs and routed to rebuild.
+                                        return Err(IndexerError::IncrementalAbort(format!(
+                                            "Phase 3b base subject-property scan failed \
+                                             for graph {g_id}: {e} (deferring class-stat \
+                                             recompute to full rebuild)"
+                                        )));
                                     }
                                 };
                             for &s_id in sids {
@@ -2462,11 +2474,15 @@ pub async fn incremental_index(
                                     }
                                 }
                                 Err(e) => {
-                                    tracing::warn!(
-                                        g_id, error = %e,
-                                        "Phase 3b: inbound ref scan failed; re-typed objects \
-                                         may keep stale ref-class stats"
-                                    );
+                                    // Case B inbound edges of re-typed objects. A miss here
+                                    // would silently leave stale ref-class edge stats; abort
+                                    // to a full rebuild for consistency with the other base
+                                    // re-attribution scans (the rebuild recomputes ref_classes
+                                    // exactly). Cheap insurance for the #1270 fold to come.
+                                    return Err(IndexerError::IncrementalAbort(format!(
+                                        "Phase 3b inbound ref scan failed for graph {g_id}: \
+                                         {e} (deferring class-stat recompute to full rebuild)"
+                                    )));
                                 }
                             }
                             // Drop edges touched this batch — the forward pass owns them.
@@ -2497,14 +2513,26 @@ pub async fn incremental_index(
                             let external_base = if external_sids.is_empty() {
                                 std::collections::HashMap::new()
                             } else {
-                                fluree_db_binary_index::batched_lookup_predicate_refs(
+                                // Resolves classes for stable ref-edge endpoints. A failure
+                                // would mis-attribute (or drop) ref-class edges; abort to a
+                                // full rebuild rather than `unwrap_or_default()` (which would
+                                // silently treat every endpoint as class-less).
+                                match fluree_db_binary_index::batched_lookup_predicate_refs(
                                     store,
                                     g_id,
                                     rdf_type_p_id,
                                     &external_sids,
                                     base_root.index_t,
-                                )
-                                .unwrap_or_default()
+                                ) {
+                                    Ok(m) => m,
+                                    Err(e) => {
+                                        return Err(IndexerError::IncrementalAbort(format!(
+                                            "Phase 3b external ref-endpoint class lookup failed \
+                                             for graph {g_id}: {e} (deferring class-stat \
+                                             recompute to full rebuild)"
+                                        )));
+                                    }
+                                }
                             };
                             // (base_classes, net_classes) for an endpoint. A stable base
                             // entity has base == net (its type did not change this batch).
