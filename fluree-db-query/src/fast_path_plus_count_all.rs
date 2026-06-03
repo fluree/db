@@ -248,57 +248,41 @@ fn count_p1_then_p2_plus(
         return Ok(None);
     };
 
+    // SPARQL COUNT(*) over `?s p1 ?mid . ?mid p2+ ?o` counts the solution multiset
+    // (?s, ?mid, ?o). The sequence `p1/p2+` lowers to a Join over the fresh,
+    // path-internal variable ?mid (SPARQL 1.1 §18.2.2.4); the ALP sub-path makes
+    // each (?mid, ?o) endpoint distinct (§9.4), but the outer Join over ?mid
+    // PRESERVES multiplicity, and COUNT(*) counts solutions before projection — so
+    // an ?o reachable from one ?s via two different ?mid is counted TWICE. Hence we
+    // must NOT dedup intermediates per subject nor union endpoints across them: the
+    // correct count is `Σ over each p1-edge (s, mid) of |reach⁺(mid)|`. (The prior
+    // per-subject dedup + cross-mid endpoint union computed COUNT(DISTINCT ?s ?o),
+    // systematically under-counting.) PSOT(p1) rows are unique (s, p1, o) triples,
+    // so iterating every IRI-ref row visits each (s, mid) edge exactly once; no
+    // subject grouping is needed. `|reach⁺(mid)|` is memoized per distinct mid.
     let iri_ref = OType::IRI_REF.as_u16();
     let mut memo: FxHashMap<u64, u64> = FxHashMap::default();
     let mut total: u64 = 0;
-
-    let mut cur_s: Option<u64> = None;
-    let mut cur_starts: Vec<u64> = Vec::new();
-
-    let mut flush_group = |starts: &mut Vec<u64>| -> u64 {
-        match starts.len() {
-            0 => 0,
-            1 => {
-                let x = starts[0];
-                if let Some(&v) = memo.get(&x) {
-                    v
-                } else {
-                    let v = reach_count_plus(&adj, x);
-                    memo.insert(x, v);
-                    v
-                }
-            }
-            _ => reach_count_plus_multi(&adj, starts),
-        }
-    };
 
     while let Some(batch) = cursor1
         .next_batch()
         .map_err(|e| QueryError::Internal(format!("cursor batch: {e}")))?
     {
         for i in 0..batch.row_count {
-            let s = batch.s_id.get(i);
-            if cur_s != Some(s) {
-                if cur_s.is_some() {
-                    let add = flush_group(&mut cur_starts);
-                    total = total.saturating_add(add);
-                }
-                cur_s = Some(s);
-                cur_starts.clear();
-            }
             if batch.o_type.get(i) != iri_ref {
                 continue;
             }
-            let x = batch.o_key.get(i);
-            if !cur_starts.contains(&x) {
-                cur_starts.push(x);
-            }
+            let mid = batch.o_key.get(i);
+            let c = match memo.get(&mid) {
+                Some(&v) => v,
+                None => {
+                    let v = reach_count_plus(&adj, mid);
+                    memo.insert(mid, v);
+                    v
+                }
+            };
+            total = total.saturating_add(c);
         }
-    }
-
-    if cur_s.is_some() {
-        let add = flush_group(&mut cur_starts);
-        total = total.saturating_add(add);
     }
 
     Ok(Some(total))

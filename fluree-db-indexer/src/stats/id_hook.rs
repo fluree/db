@@ -392,8 +392,13 @@ impl IdStatsHook {
                         .entry(rec.o_key)
                         .or_insert(0) += delta;
                 }
-            } else if !self.hll_only && rec.op {
-                // Non-rdf:type property assertion: track per-subject and per-class
+            } else if !self.hll_only {
+                // Non-rdf:type property flake: track per-subject property presence on
+                // BOTH assertions and retractions. Recording retractions here (issue
+                // #1266) lets the incremental class-stat merge revisit a class whose
+                // only change this batch is a retraction, so its datatype/lang/ref
+                // decrement is applied instead of silently dropped. The set is now
+                // "properties touched this batch", not "asserted this batch".
                 self.subject_props
                     .entry((rec.g_id, rec.s_id))
                     .or_default()
