@@ -606,7 +606,10 @@ fn build_class_data(indexed: &IndexStats) -> HashMap<Sid, ClassDataMut> {
 /// whose current-state count is zero. Keeps the aggregate `datatypes` breakdown
 /// current-state-exact so a predicate that gains/loses literal values via
 /// novelty is reflected (used by the equijoin-filter fold's node-only guard).
-fn merge_property_datatypes(index: &[(u8, u64)], deltas: Option<&HashMap<u8, i64>>) -> Vec<(u8, u64)> {
+fn merge_property_datatypes(
+    index: &[(u8, u64)],
+    deltas: Option<&HashMap<u8, i64>>,
+) -> Vec<(u8, u64)> {
     let mut merged: HashMap<u8, i64> = index.iter().map(|&(t, c)| (t, c as i64)).collect();
     if let Some(deltas) = deltas {
         for (&tag, &d) in deltas {

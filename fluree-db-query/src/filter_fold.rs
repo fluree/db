@@ -40,10 +40,9 @@ pub fn has_equijoin_filter(query: &Query) -> bool {
 fn patterns_have_equijoin_filter(patterns: &[Pattern]) -> bool {
     patterns.iter().any(|p| match p {
         Pattern::Filter(e) => equality_vars(e).is_some(),
-        Pattern::Optional(i)
-        | Pattern::Minus(i)
-        | Pattern::Exists(i)
-        | Pattern::NotExists(i) => patterns_have_equijoin_filter(i),
+        Pattern::Optional(i) | Pattern::Minus(i) | Pattern::Exists(i) | Pattern::NotExists(i) => {
+            patterns_have_equijoin_filter(i)
+        }
         Pattern::Union(branches) => branches.iter().any(|b| patterns_have_equijoin_filter(b)),
         Pattern::Graph { patterns, .. } => patterns_have_equijoin_filter(patterns),
         Pattern::Service(sp) => patterns_have_equijoin_filter(&sp.patterns),
@@ -449,7 +448,11 @@ mod tests {
                 Ref::Sid(feat.clone()),
                 Term::Var(x),
             )),
-            Pattern::Triple(TriplePattern::new(Ref::Var(s2), Ref::Sid(feat), Term::Var(y))),
+            Pattern::Triple(TriplePattern::new(
+                Ref::Var(s2),
+                Ref::Sid(feat),
+                Term::Var(y),
+            )),
             Pattern::Filter(Expression::Call {
                 func: Function::Eq,
                 args: vec![Expression::Var(x), Expression::Var(y)],
