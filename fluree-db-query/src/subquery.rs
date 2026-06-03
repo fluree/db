@@ -62,6 +62,14 @@ pub struct SubqueryOperator {
     planning: PlanningContext,
     /// Variables required by downstream operators; if set, output is trimmed.
     out_schema: Option<Arc<[VarId]>>,
+    /// Cached result rows for an UNCORRELATED subquery (`correlation_vars`
+    /// empty). Such a subquery shares no variables with the parent, so its seed
+    /// is always the empty solution (see `execute_subquery_for_row`) and it
+    /// yields the identical result for every parent row. We execute it once,
+    /// cache the rows here, and broadcast them to every parent row (and across
+    /// batches) instead of rebuilding and re-running the subquery operator tree
+    /// per row. Mirrors `FilterOperator::pre_resolve_uncorrelated` for EXISTS.
+    uncorrelated_cache: Option<Vec<Vec<Binding>>>,
 }
 
 impl SubqueryOperator {
@@ -120,6 +128,7 @@ impl SubqueryOperator {
             stats,
             planning,
             out_schema: None,
+            uncorrelated_cache: None,
         }
     }
 
@@ -146,6 +155,7 @@ impl Operator for SubqueryOperator {
 
         self.child.open(ctx).await?;
         self.state = OperatorState::Open;
+        self.uncorrelated_cache = None;
         Ok(())
     }
 
@@ -172,11 +182,29 @@ impl Operator for SubqueryOperator {
         self.result_buffer.clear();
         self.buffer_pos = 0;
 
+        let uncorrelated = self.correlation_vars.is_empty();
         for row_idx in 0..parent_batch.len() {
-            // Execute subquery for this parent row
-            let subquery_results = self
-                .execute_subquery_for_row(ctx, &parent_batch, row_idx)
-                .await?;
+            // Execute the subquery for this parent row.
+            //
+            // UNCORRELATED subqueries (no variables shared with the parent)
+            // produce the identical result for every parent row — their seed is
+            // always the empty solution. Execute once, cache, and reuse for all
+            // rows and all subsequent batches. This collapses an
+            // O(parent_rows) re-execution — each rebuilding and re-running the
+            // full subquery operator tree — into a single run. The clone is of
+            // the (typically single-row) cached result, not of any scan work.
+            let subquery_results = if uncorrelated {
+                if self.uncorrelated_cache.is_none() {
+                    let rows = self
+                        .execute_subquery_for_row(ctx, &parent_batch, row_idx)
+                        .await?;
+                    self.uncorrelated_cache = Some(rows);
+                }
+                self.uncorrelated_cache.as_ref().unwrap().clone()
+            } else {
+                self.execute_subquery_for_row(ctx, &parent_batch, row_idx)
+                    .await?
+            };
 
             // Merge results with parent row
             for subquery_row in subquery_results {

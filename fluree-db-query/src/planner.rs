@@ -8,7 +8,7 @@
 //! `build_where_operators_seeded` in `execute/where_plan.rs`.
 
 use crate::ir::triple::{Ref, Term, TriplePattern};
-use crate::ir::{CompareOp, Function, Pattern};
+use crate::ir::{CompareOp, Function, Grouping, Pattern, SubqueryPattern};
 use crate::var_registry::VarId;
 use fluree_db_core::{FlakeValue, PropertyStatData, StatsView};
 use std::collections::{HashMap, HashSet};
@@ -780,9 +780,28 @@ pub fn estimate_pattern(
             }
         }
 
-        Pattern::Subquery(sq) => PatternEstimate::Source {
-            row_count: estimate_branch_cardinality(&sq.patterns, stats),
-        },
+        Pattern::Subquery(sq) => {
+            // Join ordering cares about a subquery's OUTPUT cardinality, not the
+            // size of its internal scan. A scalar aggregate (no `GROUP BY`) emits
+            // exactly one row. Estimating it by the (large) body cardinality
+            // wrongly ranks the subquery as a huge source and pushes it to the
+            // END of the join order — precisely where, if it is uncorrelated, it
+            // gets re-executed once per parent row (see `SubqueryOperator`'s
+            // uncorrelated fast-path). Treat a scalar-aggregate subquery as a
+            // single row so the planner places it early.
+            let rows = match &sq.grouping {
+                Some(Grouping::Implicit { .. }) => HIGHLY_SELECTIVE,
+                // `Explicit` GROUP BY emits one row per distinct key combination
+                // and `None` emits one row per solution; absent per-key NDV we
+                // keep the body estimate (an upper bound) for these.
+                _ => estimate_branch_cardinality(&sq.patterns, stats),
+            };
+            // A LIMIT caps the output regardless of grouping.
+            let rows = sq.limit.map_or(rows, |l| rows.min(l as f64));
+            PatternEstimate::Source {
+                row_count: rows.max(HIGHLY_SELECTIVE),
+            }
+        }
 
         Pattern::Optional(_) => PatternEstimate::Expander { multiplier: 1.0 },
 
@@ -1042,6 +1061,29 @@ pub fn reorder_patterns(
                 pattern: pattern.clone(),
             });
             continue;
+        }
+
+        // A CORRELATED subquery — one whose SELECT list shares variables with
+        // other patterns in this group — must execute AFTER those variables are
+        // bound. `SubqueryOperator` derives its correlation set from the
+        // variables its child (the patterns placed before it) provides; if the
+        // subquery were hoisted ahead of them, that set would be empty and it
+        // would compute a single global result instead of a per-row correlated
+        // one. Defer it on its correlation variables, exactly like MINUS/EXISTS.
+        //
+        // UNCORRELATED subqueries are intentionally NOT deferred: they fall
+        // through to source classification, so a scalar-aggregate subquery is
+        // still placed early via its (now accurate) single-row estimate.
+        if let Pattern::Subquery(sq) = pattern {
+            let corr = subquery_correlation_vars(sq, patterns, i);
+            if !corr.is_empty() {
+                deferred.push(DeferredPattern {
+                    orig_index: i,
+                    required_vars: corr,
+                    pattern: pattern.clone(),
+                });
+                continue;
+            }
         }
 
         match estimate_pattern(pattern, &bound_vars, stats) {
@@ -1306,6 +1348,34 @@ fn drain_ready_deferred(
 ///
 /// - FILTER: all referenced variables
 /// - BIND: the expression's variables (not the target variable)
+///
+/// Variables a subquery correlates on: its SELECT-list variables that are also
+/// produced by some OTHER pattern in the enclosing group. These must be bound
+/// before the subquery runs, so the planner defers it until they are. An empty
+/// result means the subquery is uncorrelated (safe to place early).
+fn subquery_correlation_vars(
+    sq: &SubqueryPattern,
+    siblings: &[Pattern],
+    self_idx: usize,
+) -> HashSet<VarId> {
+    let select: HashSet<VarId> = sq.select.iter().copied().collect();
+    if select.is_empty() {
+        return HashSet::new();
+    }
+    let mut corr = HashSet::new();
+    for (j, p) in siblings.iter().enumerate() {
+        if j == self_idx {
+            continue;
+        }
+        for v in p.produced_vars() {
+            if select.contains(&v) {
+                corr.insert(v);
+            }
+        }
+    }
+    corr
+}
+
 fn deferred_required_vars(pattern: &Pattern) -> Vec<VarId> {
     match pattern {
         Pattern::Filter(expr) => expr.referenced_vars(),
