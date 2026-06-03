@@ -151,6 +151,8 @@ struct LoweringContext<'a, E> {
     agg_counter: u32,
     /// Monotonic counter for generating intermediate property-path join variables (`?__pp0`, `?__pp1`, …).
     pp_counter: u32,
+    /// Monotonic counter for generating expression-based ORDER BY bind variables (`?__order_by_0`, …).
+    order_counter: u32,
     /// Original SPARQL source text (for extracting SERVICE body text).
     source_text: Option<&'a str>,
 }
@@ -181,6 +183,7 @@ impl<'a, E: IriEncoder> LoweringContext<'a, E> {
             agg_expr_binds: HashMap::new(),
             agg_counter: 0,
             pp_counter: 0,
+            order_counter: 0,
             source_text,
         }
     }
@@ -230,12 +233,17 @@ impl<'a, E: IriEncoder> LoweringContext<'a, E> {
                     limit,
                     offset,
                     ordering,
+                    order_binds,
                 } = lowered_modifiers.base;
                 let distinct = lowered_modifiers.distinct;
 
                 // Assemble the grouping phase from the lowered components.
-                // Post-aggregation binds (`select_binds.post`) ride inside the
-                // aggregation stage when one exists.
+                // SELECT post-binds (`select_binds.post`) ride inside the
+                // aggregation stage. Expression-based ORDER BY binds ride on
+                // `Query.order_binds` (a dedicated post-grouping stage in the
+                // operator tree) so they evaluate uniformly with or without
+                // grouping — including dedup-only GROUP BY, which has no
+                // aggregation stage to carry binds.
                 let grouping = Grouping::assemble(
                     lowered_modifiers.group_by,
                     lowered_modifiers.aggregates,
@@ -267,6 +275,7 @@ impl<'a, E: IriEncoder> LoweringContext<'a, E> {
                     patterns,
                     grouping,
                     ordering,
+                    order_binds,
                     limit,
                     offset,
                     reasoning: ReasoningConfig::default(),
@@ -1365,16 +1374,91 @@ mod tests {
     }
 
     #[test]
-    fn test_order_by_expr_unsupported() {
-        let result = lower_query(
+    fn test_order_by_expression_desugars_to_order_bind() {
+        // `ORDER BY (?o + 1)` desugars to a synthetic `(?__order_by_N, expr)`
+        // carried on `query.order_binds` and sorts on that synthetic var.
+        let (query, vars) = lower_query_with_vars(
             "PREFIX ex: <http://example.org/>
              SELECT ?s ?o WHERE { ?s ex:p ?o } ORDER BY (?o + 1)",
-        );
+        )
+        .unwrap();
 
-        assert!(matches!(
-            result,
-            Err(LowerError::UnsupportedOrderByExpression { .. })
-        ));
+        assert_eq!(query.ordering.len(), 1);
+        let sort_var = query.ordering[0].var;
+        assert!(
+            vars.name(sort_var).starts_with("?__order_by_"),
+            "expected synthetic ORDER BY var, got: {}",
+            vars.name(sort_var)
+        );
+        // The desugared bind rides on `order_binds`, never in WHERE patterns.
+        assert!(
+            query.order_binds.iter().any(|(var, _)| *var == sort_var),
+            "expected an order bind for the ORDER BY expression"
+        );
+        assert!(
+            !query
+                .patterns
+                .iter()
+                .any(|p| matches!(p, Pattern::Bind { var, .. } if *var == sort_var)),
+            "ORDER BY bind must not leak into WHERE patterns"
+        );
+        assert!(
+            query.grouping.is_none(),
+            "no aggregation expected for this query"
+        );
+    }
+
+    #[test]
+    fn test_order_by_desc_expression() {
+        // The BSBM ratio shape: ORDER BY DESC(expr) , ?var.
+        let (query, vars) = lower_query_with_vars(
+            "PREFIX ex: <http://example.org/>
+             SELECT ?s ?a ?b WHERE { ?s ex:a ?a . ?s ex:b ?b }
+             ORDER BY DESC(?a / ?b) ?s",
+        )
+        .unwrap();
+
+        assert_eq!(query.ordering.len(), 2);
+        assert_eq!(query.ordering[0].direction, SortDirection::Descending);
+        // First key is the synthetic expression var, second is the bare ?s.
+        assert!(vars.name(query.ordering[0].var).starts_with("?__order_by_"));
+        assert_eq!(vars.name(query.ordering[1].var), "?s");
+    }
+
+    #[test]
+    fn test_order_by_expression_over_aggregate_uses_order_bind() {
+        // `ORDER BY DESC(?c * 2)` over an aggregate output is carried on
+        // `order_binds` (a dedicated post-grouping stage), not in WHERE patterns
+        // and not in the aggregation stage's own post-binds.
+        let (query, vars) = lower_query_with_vars(
+            "PREFIX ex: <http://example.org/>
+             SELECT ?type (COUNT(?s) AS ?c) WHERE { ?s ex:type ?type }
+             GROUP BY ?type ORDER BY DESC(?c * 2)",
+        )
+        .unwrap();
+
+        assert_eq!(query.ordering.len(), 1);
+        let sort_var = query.ordering[0].var;
+        assert!(vars.name(sort_var).starts_with("?__order_by_"));
+
+        // Carried on order_binds.
+        assert!(
+            query.order_binds.iter().any(|(var, _)| *var == sort_var),
+            "expected the aggregate-referencing ORDER BY to be an order bind"
+        );
+        // Not a WHERE bind, and not in the grouping phase's post-binds.
+        assert!(
+            !query
+                .patterns
+                .iter()
+                .any(|p| matches!(p, Pattern::Bind { var, .. } if *var == sort_var)),
+            "order bind must not be a pre-WHERE bind"
+        );
+        let grouping = query.grouping.as_ref().expect("aggregation expected");
+        assert!(
+            !grouping.binds().any(|(var, _)| *var == sort_var),
+            "order bind must not be merged into the aggregation post-binds"
+        );
     }
 
     #[test]

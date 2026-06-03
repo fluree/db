@@ -106,6 +106,7 @@ mod tests {
             reasoning: ReasoningConfig::default(),
             grouping: None,
             ordering: Vec::new(),
+            order_binds: Vec::new(),
             limit: None,
             offset: None,
             post_values: None,
@@ -131,6 +132,7 @@ mod tests {
             reasoning: ReasoningConfig::default(),
             grouping: None,
             ordering: Vec::new(),
+            order_binds: Vec::new(),
             limit: None,
             offset: None,
             post_values: None,
@@ -157,6 +159,7 @@ mod tests {
             reasoning: ReasoningConfig::default(),
             grouping: None,
             ordering: vec![SortSpec::asc(VarId(99))], // Invalid var
+            order_binds: Vec::new(),
             limit: None,
             offset: None,
             post_values: None,

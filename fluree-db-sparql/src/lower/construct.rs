@@ -42,6 +42,7 @@ impl<E: IriEncoder> LoweringContext<'_, E> {
             limit,
             offset,
             ordering,
+            order_binds,
         } = self.lower_base_modifiers(&construct.modifiers)?;
 
         let ctx = self.build_jsonld_context()?;
@@ -55,6 +56,7 @@ impl<E: IriEncoder> LoweringContext<'_, E> {
             reasoning: ReasoningConfig::default(),
             grouping: None,
             ordering,
+            order_binds,
             limit,
             offset,
             post_values: None,

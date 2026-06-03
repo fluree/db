@@ -258,6 +258,12 @@ pub struct SubSelect {
     pub group_by: Option<GroupByClause>,
     /// ORDER BY variables (simplified - just variable names for now)
     pub order_by: Vec<SubSelectOrderBy>,
+    /// True when the subquery's ORDER BY contained a non-trivial expression
+    /// (e.g. `ORDER BY (0 - ?x)`). Subquery expression ORDER BY is not yet
+    /// wired through the subquery operator, so lowering rejects it rather than
+    /// silently mis-sorting on a grabbed variable. Bare/bracketed variables
+    /// leave this `false`.
+    pub order_by_unsupported_expr: bool,
     /// LIMIT value
     pub limit: Option<u64>,
     /// OFFSET value

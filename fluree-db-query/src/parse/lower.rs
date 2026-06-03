@@ -175,6 +175,8 @@ pub(crate) fn lower_query<E: IriEncoder>(
         patterns,
         grouping,
         ordering,
+        // JSON-LD query syntax has no expression-based ORDER BY form.
+        order_binds: Vec::new(),
         limit,
         offset,
         reasoning,

@@ -1058,6 +1058,7 @@ mod tests {
             patterns,
             grouping,
             ordering: Vec::new(),
+            order_binds: Vec::new(),
             limit: None,
             offset: None,
             reasoning: ReasoningConfig::default(),

@@ -49,6 +49,16 @@ pub fn compute_variable_deps(query: &Query) -> Option<VariableDeps> {
     }
     let required_sort_vars: Vec<VarId> = deps.iter().copied().collect();
 
+    // Expression-based ORDER BY binds run as a dedicated stage AFTER the
+    // post-aggregation binds, so they are traced FIRST in this backward walk:
+    // tracing their expression inputs keeps the referenced GROUP BY keys,
+    // aggregate outputs, and post-binds alive through grouping/trimming.
+    for (var, expr) in query.order_binds.iter().rev() {
+        if deps.remove(var) {
+            deps.extend(expr.referenced_vars());
+        }
+    }
+
     // Post-aggregation binds (reverse order): trace expression inputs.
     // Record deps BEFORE processing each bind backward, since that
     // represents what the bind's output must contain for downstream.
@@ -141,6 +151,7 @@ mod tests {
             reasoning: ReasoningConfig::default(),
             grouping: None,
             ordering: Vec::new(),
+            order_binds: Vec::new(),
             limit: None,
             offset: None,
             post_values: None,
@@ -156,6 +167,7 @@ mod tests {
             reasoning: ReasoningConfig::default(),
             grouping: None,
             ordering: Vec::new(),
+            order_binds: Vec::new(),
             limit: None,
             offset: None,
             post_values: None,
@@ -296,6 +308,7 @@ mod tests {
             reasoning: ReasoningConfig::default(),
             grouping: None,
             ordering: Vec::new(),
+            order_binds: Vec::new(),
             limit: None,
             offset: None,
             post_values: None,
@@ -320,6 +333,7 @@ mod tests {
             reasoning: ReasoningConfig::default(),
             grouping: None,
             ordering: Vec::new(),
+            order_binds: Vec::new(),
             limit: None,
             offset: None,
             post_values: None,

@@ -37,6 +37,12 @@ pub(super) struct BaseModifiers {
     pub limit: Option<usize>,
     pub offset: Option<usize>,
     pub ordering: Vec<SortSpec>,
+    /// Synthetic `(var, expr)` binds produced by expression-based ORDER BY
+    /// conditions (e.g. `ORDER BY DESC(?a / ?b)`). Each `SortSpec` in
+    /// `ordering` that came from an expression references the matching
+    /// synthetic var here. The caller decides where the bind is evaluated
+    /// (pre-WHERE vs. post-aggregation); ASK discards them entirely.
+    pub order_binds: Vec<(VarId, Expression)>,
 }
 
 /// Result of lowering solution modifiers.
@@ -221,11 +227,12 @@ impl<E: IriEncoder> LoweringContext<'_, E> {
             .offset
             .as_ref()
             .map(|clause| clause.value as usize);
+        let mut order_binds: Vec<(VarId, Expression)> = Vec::new();
         let ordering = match &modifiers.order_by {
             Some(order_by) => order_by
                 .conditions
                 .iter()
-                .map(|cond| self.lower_order_condition(cond))
+                .map(|cond| self.lower_order_condition(cond, &mut order_binds))
                 .collect::<Result<Vec<_>>>()?,
             None => Vec::new(),
         };
@@ -234,11 +241,24 @@ impl<E: IriEncoder> LoweringContext<'_, E> {
             limit,
             offset,
             ordering,
+            order_binds,
         })
     }
 
-    /// Lower an ORDER BY condition (vars-only MVP)
-    fn lower_order_condition(&mut self, cond: &OrderCondition) -> Result<SortSpec> {
+    /// Lower an ORDER BY condition to a [`SortSpec`].
+    ///
+    /// Bare variables (including `ASC(?var)` / `DESC((?var))`) sort directly on
+    /// that variable. A non-trivial expression (`ORDER BY DESC(?a / ?b)`) is
+    /// desugared to a synthetic `BIND(expr AS ?__order_by_N)`: the expression is
+    /// evaluated once per solution into the synthetic var, which becomes the
+    /// sort key. The `(var, expr)` pair is pushed onto `order_binds` for the
+    /// caller to place in the pipeline (sorting an expression more than once —
+    /// e.g. inside the comparator — would re-evaluate it O(n log n) times).
+    fn lower_order_condition(
+        &mut self,
+        cond: &OrderCondition,
+        order_binds: &mut Vec<(VarId, Expression)>,
+    ) -> Result<SortSpec> {
         let direction = match cond.direction {
             OrderDirection::Asc => SortDirection::Ascending,
             OrderDirection::Desc => SortDirection::Descending,
@@ -263,8 +283,17 @@ impl<E: IriEncoder> LoweringContext<'_, E> {
                     })
                 }
                 _ => {
-                    // Complex expression-based ORDER BY not yet supported
-                    Err(LowerError::unsupported_order_by_expr(cond.span))
+                    // Expression-based ORDER BY: desugar to a synthetic BIND and
+                    // sort on its output variable.
+                    let lowered = self.lower_expression(expr)?;
+                    let name = format!("?__order_by_{}", self.order_counter);
+                    self.order_counter += 1;
+                    let var_id = self.vars.get_or_insert(&name);
+                    order_binds.push((var_id, lowered));
+                    Ok(SortSpec {
+                        var: var_id,
+                        direction,
+                    })
                 }
             },
         }
@@ -336,6 +365,16 @@ impl<E: IriEncoder> LoweringContext<'_, E> {
         subselect: &SubSelect,
         _span: SourceSpan,
     ) -> Result<Vec<Pattern>> {
+        // Expression-based ORDER BY inside a subquery is not yet supported
+        // (the subquery operator sorts the projected output, with no stage to
+        // evaluate a synthetic key). Reject rather than silently mis-sort.
+        if subselect.order_by_unsupported_expr {
+            return Err(LowerError::unsupported_form(
+                "expression-based ORDER BY in a subquery",
+                subselect.span,
+            ));
+        }
+
         // Lower WHERE patterns (mut: expression GROUP BY may append pre-group BINDs)
         let mut patterns = self.lower_graph_pattern(&subselect.pattern)?;
 

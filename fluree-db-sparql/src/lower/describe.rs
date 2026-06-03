@@ -144,6 +144,7 @@ impl<E: IriEncoder> LoweringContext<'_, E> {
             reasoning: ReasoningConfig::default(),
             grouping: None,
             ordering: Vec::new(),
+            order_binds: Vec::new(),
             limit: None,
             offset: None,
             post_values: None,
@@ -195,7 +196,17 @@ impl<E: IriEncoder> LoweringContext<'_, E> {
             limit,
             offset,
             ordering,
+            order_binds,
         } = self.lower_base_modifiers(modifiers)?;
+
+        // DESCRIBE restricts ORDER BY to target variables (see below); an
+        // expression-based ORDER BY would sort on a synthetic, non-target var.
+        if !order_binds.is_empty() {
+            return Err(LowerError::unsupported_form(
+                "DESCRIBE ORDER BY by expression",
+                span,
+            ));
+        }
 
         // For simplicity and predictable performance, require ORDER BY vars to be part of the subquery select list.
         for spec in &ordering {
