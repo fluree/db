@@ -70,13 +70,16 @@ use std::sync::Arc;
 ///   the same Sid with structurally identical levels, and stay separated
 ///   when their levels differ.
 ///
-/// The leading `Arc<str>` is the active ledger (the view the `Sid` was scanned
-/// in): a `Sid` is view-local, so the same bytes can name different subjects
-/// across ledgers. The trailing `Option<Arc<str>>` is the root subject's
-/// canonical IRI (present only for multi-ledger `IriMatch` roots). Both
-/// participate so a cross-ledger query can never serve one ledger's rendering
-/// for another ledger's subject (issue #1259).
-type CacheKey = (Arc<str>, Sid, u64, usize, Option<Arc<str>>);
+/// The leading `usize` is the active view index (`HydrationFormatter::active_idx`):
+/// a `Sid` is view-local, so the same bytes can name different subjects across
+/// ledgers, and the index uniquely identifies the view within a single
+/// hydration's shared cache. It replaces the active ledger `Arc<str>` to avoid
+/// hashing and `Arc`-cloning a string on every `format_subject` call. The
+/// trailing `Option<Arc<str>>` is the root subject's canonical IRI (present
+/// only for multi-ledger `IriMatch` roots). Both participate so a cross-ledger
+/// query can never serve one ledger's rendering for another ledger's subject
+/// (issue #1259).
+type CacheKey = (usize, Sid, u64, usize, Option<Arc<str>>);
 
 /// Depth bookkeeping for one hydration call.
 ///
@@ -447,8 +450,7 @@ pub async fn format_async(
 
     // Single-view (single-ledger) hydration: one formatter, no cross-ledger
     // routing. `FormatterSet::pick` always falls back to this primary.
-    let active_ledger: Arc<str> = Arc::from(db.snapshot.ledger_id.as_str());
-    let formatter = HydrationFormatter::new(db, compactor, active_ledger, config, policy, tracker);
+    let formatter = HydrationFormatter::new(db, compactor, config, policy, tracker);
     let set = FormatterSet {
         formatters: vec![formatter],
         by_ledger: HashMap::new(),
@@ -496,13 +498,13 @@ pub async fn format_async_dataset(
     run_hydration_rows(&set, result).await
 }
 
-/// One ledger's hydration view: its db, namespace-aware compactor, policy, and
-/// ledger id. Owned by [`DatasetCtx`]; formatters borrow from it.
+/// One ledger's hydration view: its db, namespace-aware compactor, and policy.
+/// Owned by [`DatasetCtx`]; formatters borrow from it. (Ledger identity is
+/// tracked by view index via [`DatasetCtx::by_ledger`], not stored per view.)
 struct LedgerView<'a> {
     db: GraphDbRef<'a>,
     compactor: IriCompactor,
     policy: Option<PolicyContext>,
-    ledger_id: Arc<str>,
 }
 
 /// Owns every dataset ledger's [`LedgerView`] and the routing metadata that
@@ -549,7 +551,6 @@ impl<'a> DatasetCtx<'a> {
                 db: view_db,
                 compactor: IriCompactor::new(g.snapshot.namespaces(), context),
                 policy: g.policy().cloned(),
-                ledger_id: Arc::clone(&g.ledger_id),
             });
             // First occurrence wins (a ledger may appear as both default and named).
             by_ledger.entry(Arc::clone(&g.ledger_id)).or_insert(i);
@@ -581,7 +582,6 @@ impl<'a> DatasetCtx<'a> {
         HydrationFormatter {
             db: view.db,
             compactor: &view.compactor,
-            active_ledger: Arc::clone(&view.ledger_id),
             typed: self.typed,
             normalize_arrays: self.normalize_arrays,
             policy: view.policy.as_ref(),
@@ -713,14 +713,6 @@ async fn run_hydration_rows(set: &FormatterSet<'_>, result: &QueryResult) -> Res
 struct HydrationFormatter<'a> {
     db: GraphDbRef<'a>,
     compactor: &'a IriCompactor,
-    /// Ledger this formatter's view belongs to.
-    ///
-    /// Distinguishes per-ledger entries in the shared expansion cache: a
-    /// `Sid`'s `(namespace_code, name)` is view-local, so the same bytes can
-    /// name different subjects across ledgers. Including the ledger in the
-    /// cache key prevents one ledger's hydration from being served for
-    /// another's (issue #1259, multi-ledger formatting).
-    active_ledger: Arc<str>,
     /// Whether to emit typed JSON (`{"@value": ..., "@type": ...}`) for all literals.
     typed: bool,
     /// Whether to always wrap property values in arrays (even single-valued).
@@ -738,6 +730,11 @@ struct HydrationFormatter<'a> {
     /// target ledger's view (issue #1259).
     dataset: Option<&'a DatasetCtx<'a>>,
     /// This formatter's index into [`DatasetCtx::views`] (0 in single-ledger mode).
+    ///
+    /// Also the leading component of [`CacheKey`]: a `Sid` is view-local, so the
+    /// same bytes can name different subjects across ledgers. The index uniquely
+    /// identifies the view within a hydration's shared cache, so one ledger's
+    /// rendering is never served for another's (issue #1259).
     active_idx: usize,
 }
 
@@ -745,7 +742,6 @@ impl<'a> HydrationFormatter<'a> {
     fn new(
         db: GraphDbRef<'a>,
         compactor: &'a IriCompactor,
-        active_ledger: Arc<str>,
         config: &FormatterConfig,
         policy: Option<&'a PolicyContext>,
         tracker: Option<&'a Tracker>,
@@ -753,7 +749,6 @@ impl<'a> HydrationFormatter<'a> {
         Self {
             db,
             compactor,
-            active_ledger,
             typed: config.format == OutputFormat::TypedJson,
             normalize_arrays: config.normalize_arrays,
             policy,
@@ -784,7 +779,7 @@ impl<'a> HydrationFormatter<'a> {
     ) -> BoxFuture<'b, Result<JsonValue>> {
         async move {
             let cache_key = (
-                Arc::clone(&self.active_ledger),
+                self.active_idx,
                 sid.clone(),
                 compute_level_hash(level),
                 depth.remaining(),
@@ -1012,6 +1007,30 @@ impl<'a> HydrationFormatter<'a> {
         .boxed()
     }
 
+    /// Hydrate a referenced subject, dispatching cross-ledger only when needed.
+    ///
+    /// `expand_ref` is the cross-ledger path: it returns its own boxed future
+    /// and then awaits `format_subject`'s boxed future, so a single-ledger ref
+    /// crawl would allocate two boxed futures per ref. Single-ledger refs stay
+    /// in the current view, so route them straight to `format_subject` (one
+    /// boxed future). This helper is a plain `async fn`, so it folds into the
+    /// caller's state machine and adds no allocation of its own.
+    async fn expand_or_format_ref<'b>(
+        &'b self,
+        ref_sid: &'b Sid,
+        level: &'b NestedSelectSpec,
+        depth: DepthBudget,
+        visited: &'b mut HashSet<Sid>,
+        cache: &'b mut HashMap<CacheKey, JsonValue>,
+    ) -> Result<JsonValue> {
+        if self.dataset.is_some() {
+            self.expand_ref(ref_sid, level, depth, visited, cache).await
+        } else {
+            self.format_subject(ref_sid, None, level, depth, visited, cache)
+                .await
+        }
+    }
+
     /// Whether this compact key should always be represented as an array.
     ///
     /// JSON-LD `@container` semantics:
@@ -1071,8 +1090,14 @@ impl<'a> HydrationFormatter<'a> {
                             .or_else(|| depth.can_expand().then_some(parent_level));
                         match sub_level {
                             Some(level) => values.push(
-                                self.expand_ref(ref_sid, level, depth.descend(), visited, cache)
-                                    .await?,
+                                self.expand_or_format_ref(
+                                    ref_sid,
+                                    level,
+                                    depth.descend(),
+                                    visited,
+                                    cache,
+                                )
+                                .await?,
                             ),
                             None => {
                                 values.push(json!({ "@id": self.compactor.compact_sid(ref_sid)? }));
@@ -1113,8 +1138,14 @@ impl<'a> HydrationFormatter<'a> {
             let sub_level = nested_spec.or_else(|| depth.can_expand().then_some(parent_level));
             match sub_level {
                 Some(level) => values.push(
-                    self.expand_ref(subject_sid, level, depth.descend(), visited, cache)
-                        .await?,
+                    self.expand_or_format_ref(
+                        subject_sid,
+                        level,
+                        depth.descend(),
+                        visited,
+                        cache,
+                    )
+                    .await?,
                 ),
                 None => {
                     // No expansion - just @id
@@ -1626,22 +1657,22 @@ mod tests {
     fn test_cache_key_different_depths() {
         let sid = Sid::new(100, "alice");
         let spec_hash = 12345u64;
-        let ledger: Arc<str> = Arc::from("a:main");
+        let view_a = 0usize;
 
-        let key1: CacheKey = (Arc::clone(&ledger), sid.clone(), spec_hash, 0, None);
-        let key2: CacheKey = (Arc::clone(&ledger), sid.clone(), spec_hash, 1, None);
-        let key3: CacheKey = (Arc::clone(&ledger), sid.clone(), spec_hash, 0, None);
+        let key1: CacheKey = (view_a, sid.clone(), spec_hash, 0, None);
+        let key2: CacheKey = (view_a, sid.clone(), spec_hash, 1, None);
+        let key3: CacheKey = (view_a, sid.clone(), spec_hash, 0, None);
         // Same SID + spec + depth but a different canonical IRI (cross-ledger
         // collision) must NOT share a cache entry.
         let key4: CacheKey = (
-            Arc::clone(&ledger),
+            view_a,
             sid.clone(),
             spec_hash,
             0,
             Some(Arc::from("http://other.example/x")),
         );
-        // Same SID + spec + depth in a DIFFERENT ledger must NOT share an entry.
-        let key5: CacheKey = (Arc::from("b:main"), sid, spec_hash, 0, None);
+        // Same SID + spec + depth in a DIFFERENT view (ledger) must NOT share an entry.
+        let key5: CacheKey = (1usize, sid, spec_hash, 0, None);
 
         // Different depths should produce different keys
         assert_ne!(key1, key2);
@@ -1649,7 +1680,7 @@ mod tests {
         assert_eq!(key1, key3);
         // Different canonical IRI → different key
         assert_ne!(key1, key4);
-        // Different active ledger → different key
+        // Different active view → different key
         assert_ne!(key1, key5);
     }
 
