@@ -528,7 +528,7 @@ Protect and tune the `/mcp` Model Context Protocol endpoint:
 `--mcp-agent-json-max-bytes` (config file: `[server.mcp] agent_json_max_bytes`) is the byte
 budget for the MCP `sparql_query` tool's Agent JSON result. Results larger than this are
 truncated and the envelope sets `hasMore: true`; an agent paginates by re-running with the
-returned `t`, an `ORDER BY`, and a larger `OFFSET`.
+returned `t`, an `ORDER BY`, and `OFFSET` advanced by the returned `rowCount`.
 
 ```bash
 fluree-server \

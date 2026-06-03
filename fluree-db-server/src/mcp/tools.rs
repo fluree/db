@@ -43,8 +43,8 @@ pub struct SparqlQueryRequest {
     #[schemars(
         description = "Optional transaction time `t` to pin the query to a specific historical \
         snapshot. Pass the `t` value returned in a previous result's envelope to paginate \
-        deterministically across calls: re-run with the same `t`, an ORDER BY clause, and a \
-        larger OFFSET. Omit to query the latest snapshot."
+        deterministically across calls: re-run with the same `t`, an ORDER BY clause, and OFFSET \
+        advanced by the previous result's `rowCount`. Omit to query the latest snapshot."
     )]
     pub t: Option<i64>,
 }
@@ -83,13 +83,14 @@ impl FlureeToolService {
     /// Execute a SPARQL query against a Fluree ledger
     #[tool(
         description = "Execute a SPARQL SELECT query against a Fluree ledger (the ledger is set by \
-        the `ledger` parameter, not a FROM clause). Returns a compact Agent JSON envelope: \
-        `schema` (per-variable datatypes, declared once), `rows` (objects with native JSON \
-        values), `rowCount`, `t` (the snapshot's transaction time), and `hasMore`. When `hasMore` \
-        is true the result was truncated to a byte budget — fetch the next page by re-running this \
-        tool with the SAME `t` (to stay on one snapshot) and your query extended with ORDER BY \
-        (for stable page boundaries) plus a larger OFFSET. Use get_data_model first to understand \
-        the schema before querying."
+        the `ledger` parameter, not a FROM clause; only SELECT is supported). Returns a compact \
+        Agent JSON envelope: `schema` (per-variable datatypes inferred from the rows on this page), \
+        `rows` (objects with native JSON values), `rowCount`, `t` (the snapshot's transaction \
+        time), and `hasMore`. When `hasMore` is true the result was truncated to a byte budget — \
+        fetch the next page by re-running this tool with the SAME `t` (to stay on one snapshot), \
+        keeping your ORDER BY (for stable page boundaries), and advancing OFFSET by the returned \
+        `rowCount` (the byte budget can return fewer rows than `LIMIT`). Use get_data_model first \
+        to understand the schema before querying."
     )]
     async fn sparql_query(
         &self,
@@ -165,6 +166,21 @@ impl FlureeToolService {
         t: Option<i64>,
         max_bytes: usize,
     ) -> Result<serde_json::Value, fluree_db_api::ApiError> {
+        // The Agent JSON envelope (and its byte budget) assume a SELECT solution table. ASK
+        // returns a bare boolean, and CONSTRUCT/DESCRIBE return a JSON-LD graph that bypasses
+        // `max_bytes` entirely — both contradict the advertised contract, so reject non-SELECT up
+        // front. A genuine parse error (`ast` is None) falls through to execution, which surfaces
+        // it as a normal query error.
+        if let Some(ast) = fluree_db_sparql::parse_sparql(query).ast {
+            if !matches!(ast.body, fluree_db_sparql::ast::QueryBody::Select(_)) {
+                return Err(fluree_db_api::ApiError::http(
+                    400,
+                    "sparql_query supports SELECT queries only; ASK, CONSTRUCT, DESCRIBE, and \
+                     UPDATE are not supported by this tool",
+                ));
+            }
+        }
+
         // No AgentJsonContext: the ledger (and optional `t`) fully scope a single-ledger query,
         // so `t` is always included and the formatter's FROM-based resume / multi-ledger advice
         // — which target the connection-scoped path and don't round-trip through this
@@ -223,15 +239,22 @@ impl FlureeToolService {
         if envelope.get("hasMore").and_then(serde_json::Value::as_bool) != Some(true) {
             return;
         }
-        // Read `t` before taking the mutable borrow below.
+        // Read `t` / `rowCount` before taking the mutable borrow below.
         let pin = match envelope.get("t").and_then(serde_json::Value::as_i64) {
             Some(t) => format!("t={t}"),
             None => "the same `t`".to_string(),
         };
+        // Advance by the returned rowCount, not by LIMIT: the byte budget can trip before the
+        // query's LIMIT, leaving rowCount < LIMIT, so advancing by LIMIT would skip dropped rows.
+        let advance = match envelope.get("rowCount").and_then(serde_json::Value::as_u64) {
+            Some(n) => format!("the {n} rows returned here"),
+            None => "the rows returned here".to_string(),
+        };
         let guidance = format!(
             " To page through the remaining rows deterministically, re-run sparql_query with \
-             {pin} and extend your query with ORDER BY (for stable page boundaries) and a larger \
-             OFFSET."
+             {pin} and the same ORDER BY (for stable page boundaries), then add {advance} to your \
+             current OFFSET (advance OFFSET by rowCount, not by LIMIT, since the byte budget can \
+             return fewer rows than requested)."
         );
         let Some(obj) = envelope.as_object_mut() else {
             return;
@@ -305,8 +328,8 @@ impl ServerHandler for FlureeToolService {
                    Use this FIRST to understand what data exists.\n\
                  - sparql_query: Execute a SPARQL SELECT query against a ledger. Returns a \
                    compact Agent JSON envelope (schema, rows, rowCount, t, hasMore). When hasMore \
-                   is true, paginate by re-running with the same `t`, an ORDER BY, and a larger \
-                   OFFSET."
+                   is true, paginate by re-running with the same `t`, an ORDER BY, and OFFSET \
+                   advanced by the returned rowCount."
                     .to_string(),
             ),
         }

@@ -244,6 +244,10 @@ async fn agent_json_truncation_message_explains_pagination() {
 
     assert_eq!(env.get("hasMore"), Some(&JsonValue::Bool(true)));
     let t = env.get("t").and_then(JsonValue::as_i64).expect("t present");
+    let row_count = env
+        .get("rowCount")
+        .and_then(JsonValue::as_u64)
+        .expect("rowCount present");
     let msg = env
         .get("message")
         .and_then(JsonValue::as_str)
@@ -256,10 +260,39 @@ async fn agent_json_truncation_message_explains_pagination() {
         msg.contains("ORDER BY"),
         "message should recommend ORDER BY: {msg}"
     );
+    // Cumulative pagination: advance OFFSET by the returned rowCount, not by LIMIT.
     assert!(
-        msg.contains("OFFSET"),
-        "message should mention OFFSET: {msg}"
+        msg.contains("current OFFSET"),
+        "message should tell the agent to advance its current OFFSET: {msg}"
     );
+    assert!(
+        msg.contains(&format!("{row_count} rows returned here")),
+        "message should reference the returned rowCount as the OFFSET advance: {msg}"
+    );
+}
+
+#[tokio::test]
+async fn agent_json_rejects_non_select() {
+    let (_tmp, state) = test_state().await;
+    create_ledger(&state, "test:kind").await;
+    insert(&state, "test:kind", rows_graph(2)).await;
+
+    let svc = FlureeToolService::new(state.clone());
+    // The envelope (and byte budget) only make sense for a SELECT solution table; ASK and
+    // CONSTRUCT/DESCRIBE must be rejected rather than return a contradictory shape.
+    for q in [
+        "PREFIX ex: <http://example.org/> ASK { ?s ex:name ?o }",
+        "PREFIX ex: <http://example.org/> CONSTRUCT { ?s ex:name ?o } WHERE { ?s ex:name ?o }",
+    ] {
+        let err = svc
+            .execute_sparql_agent_json("test:kind", q, None, None, 32_768)
+            .await
+            .expect_err("non-SELECT should be rejected");
+        assert!(
+            err.to_string().contains("SELECT"),
+            "error should explain SELECT-only: {err}"
+        );
+    }
 }
 
 /// `SELECT ?s ?name … ORDER BY ?s` with optional `LIMIT n OFFSET m`.
