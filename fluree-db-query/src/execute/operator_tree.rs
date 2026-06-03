@@ -1007,6 +1007,11 @@ fn detect_sum_strlen_group_concat_subquery(query: &Query) -> Option<(Ref, Arc<st
 fn detect_predicate_object_count(
     query: &Query,
 ) -> Option<(Ref, VarId, crate::ir::triple::Term, VarId)> {
+    // Expression ORDER BY needs the generic pipeline's order-bind stage; this
+    // fast path sorts on `query.ordering` directly, so decline it.
+    if !query.order_binds.is_empty() {
+        return None;
+    }
     let (input_var, out_var) = detect_count_aggregate(query)?;
 
     if query.patterns.len() != 1 {
@@ -1520,6 +1525,12 @@ fn anchored_literal_regex_prefix(pattern: &str) -> Option<Arc<str>> {
 ///
 /// Returns `Some((predicate_var, count_output_var))` if the query matches the pattern.
 fn detect_stats_count_by_predicate(query: &Query) -> Option<(VarId, VarId)> {
+    // Expression ORDER BY needs the generic pipeline's order-bind stage; this
+    // fast path sorts on `query.ordering` directly (a synthetic, unbound sort
+    // var would be silently dropped), so decline it.
+    if !query.order_binds.is_empty() {
+        return None;
+    }
     // Must have stats available (checked by caller)
     // Must have exactly one triple pattern with all variables
     if query.patterns.len() != 1 {
@@ -2039,6 +2050,15 @@ fn build_operator_tree_inner(
     // optimistic-then-fallback pattern in each operator's `open()` into a
     // single planner-time decision.
     let enable_fused_fast_paths = enable_fused_fast_paths && !planning.is_history();
+
+    // Expression-based ORDER BY (`query.order_binds`) is materialized only by the
+    // generic pipeline's dedicated post-grouping bind stage. No fast path runs
+    // that stage, so any fast path that returns early would sort on a synthetic
+    // ORDER BY variable that was never bound (silently dropping the sort). Force
+    // the generic path whenever order binds are present. (The history-gated
+    // count fast paths below are guarded inside their detectors for the same
+    // reason.)
+    let enable_fused_fast_paths = enable_fused_fast_paths && query.order_binds.is_empty();
 
     if enable_fused_fast_paths {
         tracing::debug!(
@@ -2819,6 +2839,50 @@ fn build_operator_tree_inner(
         }
     }
 
+    // Expression-based ORDER BY binds (e.g. `ORDER BY DESC(?a / ?b)`).
+    //
+    // Evaluated once per solution as a dedicated stage AFTER
+    // grouping/aggregation/HAVING/post-binds and BEFORE the sort, so the sort
+    // keys can reference GROUP BY keys, aggregate outputs, and SELECT post-binds.
+    // For ungrouped queries this is simply a post-WHERE stage. This placement is
+    // what makes expression ORDER BY work uniformly across no-grouping,
+    // dedup-only GROUP BY (no aggregation stage), and aggregating queries.
+    if !query.order_binds.is_empty() {
+        // Under grouping, an order-key expression may only read GROUP BY keys,
+        // aggregate outputs, and post-aggregation bind outputs. Referencing any
+        // other variable means it is `Binding::Grouped` here — reject cleanly
+        // rather than evaluating the bind over a grouped binding (which panics
+        // in `eval`), matching how bare `ORDER BY ?groupedVar` is rejected.
+        if needs_grouping {
+            let mut allowed: HashSet<VarId> = group_by_vec.iter().copied().collect();
+            for spec in &aggregates_vec {
+                allowed.insert(spec.output_var);
+            }
+            for (var, _) in &post_binds_vec {
+                allowed.insert(*var);
+            }
+            for (out_var, expr) in &query.order_binds {
+                for v in expr.referenced_vars() {
+                    if !allowed.contains(&v) {
+                        return Err(QueryError::InvalidQuery(format!(
+                            "ORDER BY expression references variable {v:?}, which is not a GROUP BY key or aggregate result"
+                        )));
+                    }
+                }
+                // A later order bind may legitimately reference an earlier one.
+                allowed.insert(*out_var);
+            }
+        }
+        for (var, expr) in &query.order_binds {
+            operator = Box::new(crate::bind::BindOperator::new(
+                operator,
+                *var,
+                expr.clone(),
+                vec![],
+            ));
+        }
+    }
+
     // Get the schema after grouping/aggregation/binds (for validation)
     let post_group_schema: Arc<[VarId]> = Arc::from(operator.schema().to_vec().into_boxed_slice());
 
@@ -2863,6 +2927,17 @@ fn build_operator_tree_inner(
             }
             for spec in &aggregates_vec {
                 allowed.insert(spec.output_var);
+            }
+            // Post-aggregation binds (SELECT expressions like `(CEIL(?avg) AS
+            // ?c)`) are per-group scalars computed after aggregation — they are
+            // valid sort keys.
+            for (var, _) in &post_binds_vec {
+                allowed.insert(*var);
+            }
+            // Desugared expression-ORDER-BY keys run as a post-grouping stage
+            // and are validated above to read only allowed vars.
+            for (var, _) in &query.order_binds {
+                allowed.insert(*var);
             }
             allowed_sort_vars = Some(allowed);
         }
@@ -2996,10 +3071,60 @@ mod tests {
             reasoning: ReasoningConfig::default(),
             grouping: None,
             ordering: Vec::new(),
+            order_binds: Vec::new(),
             limit: None,
             offset: None,
             post_values: None,
         }
+    }
+
+    #[test]
+    fn detect_stats_count_by_predicate_declines_expression_order_by() {
+        // The count-by-predicate fast path sorts on `query.ordering` directly,
+        // so it must decline when `order_binds` are present (the synthetic sort
+        // var is only bound by the generic pipeline's order-bind stage).
+        let s = VarId(0);
+        let p = VarId(1);
+        let o = VarId(2);
+        let c = VarId(3);
+        let order_key = VarId(4);
+
+        let make = |order_binds: Vec<(VarId, Expression)>, ordering: Vec<SortSpec>| Query {
+            context: ParsedContext::default(),
+            orig_context: None,
+            output: QueryOutput::select_all(vec![p, c]),
+            patterns: vec![Pattern::Triple(TriplePattern::new(
+                Ref::Var(s),
+                Ref::Var(p),
+                Term::Var(o),
+            ))],
+            reasoning: ReasoningConfig::default(),
+            grouping: Grouping::assemble(
+                vec![p],
+                vec![AggregateSpec {
+                    function: AggregateFn::Count(s),
+                    output_var: c,
+                }],
+                vec![],
+                None,
+            ),
+            ordering,
+            order_binds,
+            limit: None,
+            offset: None,
+            post_values: None,
+        };
+
+        // Bare-variable ORDER BY (no order binds): fast path applies.
+        let plain = make(Vec::new(), vec![SortSpec::asc(c)]);
+        assert_eq!(detect_stats_count_by_predicate(&plain), Some((p, c)));
+
+        // Expression ORDER BY (order binds present): must decline.
+        let with_expr = make(
+            vec![(order_key, Expression::Const(crate::ir::FlakeValue::Long(0)))],
+            vec![SortSpec::asc(order_key)],
+        );
+        assert!(detect_stats_count_by_predicate(&with_expr).is_none());
     }
 
     #[test]
@@ -3044,6 +3169,7 @@ mod tests {
             reasoning: ReasoningConfig::default(),
             grouping: None,
             ordering: vec![SortSpec::asc(label)],
+            order_binds: Vec::new(),
             limit: Some(10),
             offset: None,
             post_values: None,
@@ -3069,6 +3195,7 @@ mod tests {
             reasoning: ReasoningConfig::default(),
             grouping: None,
             ordering: Vec::new(),
+            order_binds: Vec::new(),
             limit: None,
             offset: None,
             post_values: None,
@@ -3095,6 +3222,7 @@ mod tests {
             reasoning: ReasoningConfig::default(),
             grouping: None,
             ordering: vec![SortSpec::asc(VarId(99))], // Invalid var
+            order_binds: Vec::new(),
             limit: None,
             offset: None,
             post_values: None,
@@ -3169,6 +3297,7 @@ mod tests {
             reasoning: ReasoningConfig::default(),
             grouping: make_grouping(),
             ordering: Vec::new(),
+            order_binds: Vec::new(),
             limit: None,
             offset: None,
             post_values: None,
@@ -3192,6 +3321,7 @@ mod tests {
             reasoning: ReasoningConfig::default(),
             grouping: make_grouping(),
             ordering: Vec::new(),
+            order_binds: Vec::new(),
             limit: None,
             offset: None,
             post_values: None,
@@ -3244,6 +3374,7 @@ mod tests {
                 having: None,
             }),
             ordering: Vec::new(),
+            order_binds: Vec::new(),
             limit: None,
             offset: None,
             post_values: None,
@@ -3293,6 +3424,7 @@ mod tests {
             reasoning: ReasoningConfig::default(),
             grouping: None,
             ordering,
+            order_binds: Vec::new(),
             limit,
             offset,
             post_values: None,

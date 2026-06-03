@@ -762,10 +762,13 @@ async fn batch_conditional_salary_raise() {
     let emp2 = query_entity(&fluree, &updated.ledger, "ex:emp2").await;
     let emp3 = query_entity(&fluree, &updated.ledger, "ex:emp3").await;
 
-    // Engineering employees get 10% raise: 100→110, 200→220
-    assert_eq!(emp1.get("ex:salary"), Some(&json!(110)));
-    assert_eq!(emp2.get("ex:salary"), Some(&json!(220)));
-    // Sales employee unchanged
+    // Engineering employees get 10% raise: 100→110, 200→220.
+    // `?sal / 10` is xsd:integer / xsd:integer, which yields xsd:decimal per
+    // XPath op:numeric-divide, so the summed salary is a decimal — rendered as
+    // a string to preserve exactness (the value is exactly 110 / 220).
+    assert_eq!(emp1.get("ex:salary"), Some(&json!("110")));
+    assert_eq!(emp2.get("ex:salary"), Some(&json!("220")));
+    // Sales employee unchanged — no arithmetic, so still an integer.
     assert_eq!(emp3.get("ex:salary"), Some(&json!(150)));
 }
 

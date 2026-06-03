@@ -32,6 +32,7 @@ impl<E: IriEncoder> LoweringContext<'_, E> {
             reasoning: ReasoningConfig::default(),
             grouping: None,
             ordering: Vec::new(),
+            order_binds: Vec::new(),
             limit: Some(1),
             offset: None,
             post_values: None,

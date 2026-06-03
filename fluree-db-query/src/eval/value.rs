@@ -11,7 +11,7 @@ use bigdecimal::BigDecimal;
 use fluree_db_core::temporal::{
     Date as FlureeDate, DateTime as FlureeDateTime, Time as FlureeTime,
 };
-use fluree_db_core::{FlakeValue, GeoPointBits};
+use fluree_db_core::{coerce_value, FlakeValue, GeoPointBits};
 use num_bigint::BigInt;
 use num_traits::Zero;
 use std::sync::Arc;
@@ -53,6 +53,19 @@ pub enum ComparisonError {
 #[error("cannot convert null value")]
 pub struct NullValueError;
 
+/// Significant-digit cap for the `xsd:integer / xsd:integer` → `xsd:decimal`
+/// result. `BigDecimal::div` otherwise expands recurring quotients to its
+/// default 100-digit precision (e.g. 1 / 3 = 0.3333…). 34 digits matches
+/// IEEE-754 decimal128 — well past xsd:double precision but bounded. Mirrors
+/// `AVG_DECIMAL_PRECISION` in `aggregate.rs`, which applies the same XPath rule.
+const DIVISION_DECIMAL_PRECISION: u64 = 34;
+
+/// Divide two decimals with bounded precision and a canonical (normalized)
+/// scale, for the integer-division case where the result is an `xsd:decimal`.
+fn integer_divide(a: BigDecimal, b: BigDecimal) -> BigDecimal {
+    (a / b).with_prec(DIVISION_DECIMAL_PRECISION).normalized()
+}
+
 impl ArithmeticOp {
     /// Apply this arithmetic operation to two ComparableValue operands.
     ///
@@ -69,22 +82,37 @@ impl ArithmeticOp {
     ) -> Result<ComparableValue, ArithmeticError> {
         use num_traits::ToPrimitive;
 
+        // Normalize numeric values carried as a `TypedLiteral` (e.g. xsd:float,
+        // whose value is stored as a String) into their primitive numeric
+        // variant so the type-promotion arms below apply. Non-numeric typed
+        // literals pass through unchanged and fall to the TypeMismatch arm.
+        let left = left.coerce_numeric_operand();
+        let right = right.coerce_numeric_operand();
+
         match (left, right) {
-            // Long + Long = Long
-            (ComparableValue::Long(a), ComparableValue::Long(b)) => {
-                let result = match self {
-                    ArithmeticOp::Add => a.checked_add(b).ok_or(ArithmeticError::Overflow)?,
-                    ArithmeticOp::Sub => a.checked_sub(b).ok_or(ArithmeticError::Overflow)?,
-                    ArithmeticOp::Mul => a.checked_mul(b).ok_or(ArithmeticError::Overflow)?,
-                    ArithmeticOp::Div => {
-                        if b == 0 {
-                            return Err(ArithmeticError::DivideByZero);
-                        }
-                        a.checked_div(b).ok_or(ArithmeticError::Overflow)?
+            // Long <op> Long
+            (ComparableValue::Long(a), ComparableValue::Long(b)) => match self {
+                ArithmeticOp::Add => Ok(ComparableValue::Long(
+                    a.checked_add(b).ok_or(ArithmeticError::Overflow)?,
+                )),
+                ArithmeticOp::Sub => Ok(ComparableValue::Long(
+                    a.checked_sub(b).ok_or(ArithmeticError::Overflow)?,
+                )),
+                ArithmeticOp::Mul => Ok(ComparableValue::Long(
+                    a.checked_mul(b).ok_or(ArithmeticError::Overflow)?,
+                )),
+                // Per XPath op:numeric-divide, xsd:integer / xsd:integer yields
+                // xsd:decimal (e.g. 10 / 4 = 2.5), not a truncated integer.
+                ArithmeticOp::Div => {
+                    if b == 0 {
+                        return Err(ArithmeticError::DivideByZero);
                     }
-                };
-                Ok(ComparableValue::Long(result))
-            }
+                    Ok(ComparableValue::Decimal(Box::new(integer_divide(
+                        BigDecimal::from(a),
+                        BigDecimal::from(b),
+                    ))))
+                }
+            },
             // Double + Double = Double
             (ComparableValue::Double(a), ComparableValue::Double(b)) => {
                 let result = match self {
@@ -100,21 +128,22 @@ impl ArithmeticOp {
                 };
                 Ok(ComparableValue::Double(result))
             }
-            // BigInt + BigInt = BigInt
-            (ComparableValue::BigInt(a), ComparableValue::BigInt(b)) => {
-                let result = match self {
-                    ArithmeticOp::Add => *a + &*b,
-                    ArithmeticOp::Sub => *a - &*b,
-                    ArithmeticOp::Mul => *a * &*b,
-                    ArithmeticOp::Div => {
-                        if b.is_zero() {
-                            return Err(ArithmeticError::DivideByZero);
-                        }
-                        *a / &*b
+            // BigInt <op> BigInt
+            (ComparableValue::BigInt(a), ComparableValue::BigInt(b)) => match self {
+                ArithmeticOp::Add => Ok(ComparableValue::BigInt(Box::new(*a + &*b))),
+                ArithmeticOp::Sub => Ok(ComparableValue::BigInt(Box::new(*a - &*b))),
+                ArithmeticOp::Mul => Ok(ComparableValue::BigInt(Box::new(*a * &*b))),
+                // integer / integer → xsd:decimal (see the Long/Long arm).
+                ArithmeticOp::Div => {
+                    if b.is_zero() {
+                        return Err(ArithmeticError::DivideByZero);
                     }
-                };
-                Ok(ComparableValue::BigInt(Box::new(result)))
-            }
+                    Ok(ComparableValue::Decimal(Box::new(integer_divide(
+                        BigDecimal::from(*a),
+                        BigDecimal::from(*b),
+                    ))))
+                }
+            },
             // Decimal + Decimal = Decimal
             (ComparableValue::Decimal(a), ComparableValue::Decimal(b)) => {
                 let result = match self {
@@ -265,6 +294,56 @@ impl ComparableValue {
             ComparableValue::GeoPoint(_) => "geoPoint",
             ComparableValue::Iri(_) => "iri",
             ComparableValue::TypedLiteral { .. } => "typedLiteral",
+        }
+    }
+
+    /// Normalize a numeric value carried as a [`ComparableValue::TypedLiteral`]
+    /// into its primitive numeric variant, so arithmetic type promotion can
+    /// apply.
+    ///
+    /// `xsd:float` casts store their value as a String (to avoid f32→f64 display
+    /// artifacts — see `eval/cast.rs`), and other numeric XSD literals may arrive
+    /// wrapped as a `TypedLiteral`. Arithmetic needs the numeric value, so the
+    /// inner value is unwrapped (or parsed, for the string-encoded cases) here.
+    /// Non-numeric typed literals — and all other variants — are returned
+    /// unchanged, so they still fall to a `TypeMismatch` in [`ArithmeticOp::apply`].
+    fn coerce_numeric_operand(self) -> ComparableValue {
+        let ComparableValue::TypedLiteral { val, dtc } = self else {
+            return self;
+        };
+        match val {
+            FlakeValue::Long(n) => ComparableValue::Long(n),
+            FlakeValue::Double(d) => ComparableValue::Double(d),
+            FlakeValue::BigInt(n) => ComparableValue::BigInt(n),
+            FlakeValue::Decimal(d) => ComparableValue::Decimal(d),
+            FlakeValue::String(s) => {
+                // Delegate string→numeric parsing to the canonical coercion
+                // layer (`fluree_db_core::coerce_value`), which covers the full
+                // XSD numeric lattice: the integer family (with BigInt overflow
+                // and per-type range validation), xsd:decimal, and
+                // xsd:float/double including the INF/-INF/NaN lexicals. Only a
+                // numeric result is adopted; non-numeric datatypes and parse
+                // failures keep the literal as-is so it still falls to a
+                // TypeMismatch in `apply`.
+                if let Some(UnresolvedDatatypeConstraint::Explicit(iri)) = &dtc {
+                    if let Ok(coerced) = coerce_value(FlakeValue::String(s.clone()), iri.as_ref()) {
+                        if let Ok(
+                            cv @ (ComparableValue::Long(_)
+                            | ComparableValue::Double(_)
+                            | ComparableValue::BigInt(_)
+                            | ComparableValue::Decimal(_)),
+                        ) = ComparableValue::try_from(coerced)
+                        {
+                            return cv;
+                        }
+                    }
+                }
+                ComparableValue::TypedLiteral {
+                    val: FlakeValue::String(s),
+                    dtc,
+                }
+            }
+            other => ComparableValue::TypedLiteral { val: other, dtc },
         }
     }
 
@@ -636,7 +715,87 @@ mod tests {
             ArithmeticOp::Mul.apply(a.clone(), b.clone()),
             Ok(ComparableValue::Long(30))
         );
-        assert_eq!(ArithmeticOp::Div.apply(a, b), Ok(ComparableValue::Long(3)));
+        // Per XPath op:numeric-divide, integer / integer yields xsd:decimal,
+        // not a truncated integer.
+        assert_eq!(
+            ArithmeticOp::Div.apply(a, b),
+            Ok(ComparableValue::Decimal(Box::new(integer_divide(
+                BigDecimal::from(10),
+                BigDecimal::from(3)
+            ))))
+        );
+    }
+
+    #[test]
+    fn test_arithmetic_int_div_is_decimal() {
+        // 10 / 4 = 2.5 (xsd:decimal), not 2 (truncated xsd:integer).
+        assert_eq!(
+            ArithmeticOp::Div.apply(ComparableValue::Long(10), ComparableValue::Long(4)),
+            Ok(ComparableValue::Decimal(Box::new("2.5".parse().unwrap())))
+        );
+        // Exact integer quotient still yields a decimal (canonical form "5").
+        assert_eq!(
+            ArithmeticOp::Div.apply(ComparableValue::Long(10), ComparableValue::Long(2)),
+            Ok(ComparableValue::Decimal(Box::new("5".parse().unwrap())))
+        );
+    }
+
+    #[test]
+    fn test_arithmetic_float_typed_literal_promotes() {
+        // Bug repro: xsd:float(?a) is carried as a String-backed TypedLiteral.
+        // Dividing it by an integer must promote, not error with TypeMismatch.
+        let float_ten = ComparableValue::TypedLiteral {
+            val: FlakeValue::String("10".to_string()),
+            dtc: Some(UnresolvedDatatypeConstraint::Explicit(Arc::from(
+                fluree_vocab::xsd::FLOAT,
+            ))),
+        };
+        assert_eq!(
+            ArithmeticOp::Div.apply(float_ten, ComparableValue::Long(4)),
+            Ok(ComparableValue::Double(2.5))
+        );
+    }
+
+    #[test]
+    fn test_arithmetic_typed_literal_coercion_covers_full_xsd_lattice() {
+        // xsd:short carried as a typed literal coerces for arithmetic.
+        let short_five = ComparableValue::TypedLiteral {
+            val: FlakeValue::String("5".to_string()),
+            dtc: Some(UnresolvedDatatypeConstraint::Explicit(Arc::from(
+                fluree_vocab::xsd::SHORT,
+            ))),
+        };
+        assert_eq!(
+            ArithmeticOp::Mul.apply(short_five, ComparableValue::Long(2)),
+            Ok(ComparableValue::Long(10))
+        );
+
+        // A large xsd:integer beyond i64 coerces to BigInt rather than failing.
+        let big = "99999999999999999999999999999"; // > i64::MAX
+        let big_lit = ComparableValue::TypedLiteral {
+            val: FlakeValue::String(big.to_string()),
+            dtc: Some(UnresolvedDatatypeConstraint::Explicit(Arc::from(
+                fluree_vocab::xsd::INTEGER,
+            ))),
+        };
+        assert_eq!(
+            ArithmeticOp::Add.apply(big_lit, ComparableValue::Long(1)),
+            Ok(ComparableValue::BigInt(Box::new(
+                big.parse::<BigInt>().unwrap() + 1
+            )))
+        );
+
+        // The xsd:float INF lexical coerces to an infinite double.
+        let inf = ComparableValue::TypedLiteral {
+            val: FlakeValue::String("INF".to_string()),
+            dtc: Some(UnresolvedDatatypeConstraint::Explicit(Arc::from(
+                fluree_vocab::xsd::FLOAT,
+            ))),
+        };
+        assert_eq!(
+            ArithmeticOp::Mul.apply(inf, ComparableValue::Long(2)),
+            Ok(ComparableValue::Double(f64::INFINITY))
+        );
     }
 
     #[test]
