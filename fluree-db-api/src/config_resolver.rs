@@ -35,7 +35,7 @@ use fluree_vocab::rdf::TYPE as RDF_TYPE_IRI;
 
 use crate::error::Result;
 use crate::view::ReasoningModePrecedence;
-use crate::QueryConnectionOptions;
+use crate::GovernanceOptions;
 
 // ============================================================================
 // Public: Privileged config read
@@ -281,9 +281,9 @@ pub fn configured_fulltext_properties_for_indexer(
 /// 3. No query policy → apply config defaults
 pub fn merge_policy_opts(
     resolved: &ResolvedConfig,
-    opts: &QueryConnectionOptions,
+    opts: &GovernanceOptions,
     server_identity: Option<&str>,
-) -> QueryConnectionOptions {
+) -> GovernanceOptions {
     let policy = match &resolved.policy {
         Some(p) => p,
         None => return opts.clone(),
@@ -1931,7 +1931,7 @@ mod tests {
     #[test]
     fn no_config_policy_returns_opts_unchanged() {
         let resolved = ResolvedConfig::default();
-        let opts = QueryConnectionOptions {
+        let opts = GovernanceOptions {
             identity: Some("did:key:alice".into()),
             ..Default::default()
         };
@@ -1949,7 +1949,7 @@ mod tests {
             }),
             ..Default::default()
         };
-        let opts = QueryConnectionOptions::default();
+        let opts = GovernanceOptions::default();
         let merged = merge_policy_opts(&resolved, &opts, None);
         assert!(!merged.default_allow);
         assert_eq!(
@@ -1968,7 +1968,7 @@ mod tests {
             }),
             ..Default::default()
         };
-        let opts = QueryConnectionOptions {
+        let opts = GovernanceOptions {
             identity: Some("did:key:alice".into()),
             ..Default::default()
         };
@@ -1988,7 +1988,7 @@ mod tests {
             }),
             ..Default::default()
         };
-        let opts = QueryConnectionOptions {
+        let opts = GovernanceOptions {
             identity: Some("did:key:alice".into()),
             ..Default::default()
         };
@@ -2013,7 +2013,7 @@ mod tests {
             }),
             ..Default::default()
         };
-        let opts = QueryConnectionOptions {
+        let opts = GovernanceOptions {
             identity: Some("did:key:user".into()),
             ..Default::default()
         };
@@ -2035,7 +2035,7 @@ mod tests {
             }),
             ..Default::default()
         };
-        let opts = QueryConnectionOptions {
+        let opts = GovernanceOptions {
             identity: Some("did:key:user".into()),
             ..Default::default()
         };

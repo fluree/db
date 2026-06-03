@@ -13,7 +13,7 @@ use std::sync::Arc;
 mod support;
 
 use fluree_db_api::policy_builder;
-use fluree_db_api::{FlureeBuilder, IndexConfig, QueryConnectionOptions};
+use fluree_db_api::{FlureeBuilder, GovernanceOptions, IndexConfig};
 use fluree_db_transact::{CommitOpts, TxnOpts};
 use serde_json::json;
 use support::{start_background_indexer_local, trigger_index_and_wait_outcome};
@@ -110,7 +110,7 @@ async fn policy_class_survives_indexing() {
                 .await
                 .unwrap();
 
-            let alice_opts = QueryConnectionOptions {
+            let alice_opts = GovernanceOptions {
                 identity: Some("http://example.org/ns/aliceIdentity".to_string()),
                 default_allow: false,
                 ..Default::default()

@@ -7,9 +7,9 @@ use fluree_db_core::{collect_dag_cids, load_commit_envelope_by_id, CommitId};
 use fluree_db_nameservice::{NameServiceError, NsRecord};
 
 impl Fluree {
-    /// Attach a binary index store and range provider to an already-loaded
+    /// Attach the binary index store and range provider to an already-loaded
     /// ledger state when its nameservice record points at a binary index root.
-    pub(crate) async fn attach_binary_index_store(&self, state: &mut LedgerState) -> Result<()> {
+    pub(crate) async fn attach_index(&self, state: &mut LedgerState) -> Result<()> {
         crate::ledger_manager::load_and_attach_binary_store(
             self.backend(),
             self.nameservice(),
@@ -18,6 +18,17 @@ impl Fluree {
             Some(Arc::clone(self.leaflet_cache())),
         )
         .await?;
+        Ok(())
+    }
+
+    /// Reattach the binary index store when the snapshot has namespaces the
+    /// store wasn't built with. Intended for use after a commit that may
+    /// have introduced new namespaces; a no-op when the store already
+    /// covers every namespace in the snapshot.
+    pub(crate) async fn refresh_index(&self, state: &mut LedgerState) -> Result<()> {
+        if crate::ns_helpers::binary_store_missing_snapshot_namespaces(state) {
+            self.attach_index(state).await?;
+        }
         Ok(())
     }
 
@@ -33,7 +44,7 @@ impl Fluree {
         C: ContentStore + Clone + 'static,
     {
         let mut state = LedgerState::load_with_store(store, record).await?;
-        self.attach_binary_index_store(&mut state).await?;
+        self.attach_index(&mut state).await?;
         Ok(state)
     }
 
@@ -44,7 +55,7 @@ impl Fluree {
     pub async fn ledger(&self, ledger_id: &str) -> Result<LedgerState> {
         let mut state =
             LedgerState::load(&self.nameservice_mode, ledger_id, self.backend()).await?;
-        self.attach_binary_index_store(&mut state).await?;
+        self.attach_index(&mut state).await?;
         // Default context is not loaded here. Opt-in callers route through
         // `Fluree::db_with_default_context` / `db_at_with_default_context`,
         // which fetch and attach the context onto the returned `GraphDb`.

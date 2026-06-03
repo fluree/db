@@ -7,9 +7,7 @@ use std::sync::Arc;
 use chrono::DateTime;
 
 use crate::view::{GraphDb, ReasoningModePrecedence};
-use crate::{
-    config_resolver, time_resolve, ApiError, Fluree, QueryConnectionOptions, Result, TimeSpec,
-};
+use crate::{config_resolver, time_resolve, ApiError, Fluree, GovernanceOptions, Result, TimeSpec};
 use fluree_db_binary_index::BinaryIndexStore;
 use fluree_db_core::ids::GraphId;
 use fluree_db_core::{ContentStore, DictNovelty, IndexType, DEFAULT_GRAPH_ID, TXN_META_GRAPH_ID};
@@ -608,7 +606,7 @@ impl Fluree {
     ///
     /// ```ignore
     /// let view = fluree.db("mydb:main").await?;
-    /// let opts = QueryConnectionOptions {
+    /// let opts = GovernanceOptions {
     ///     identity: Some("did:example:user".into()),
     ///     ..Default::default()
     /// };
@@ -617,7 +615,7 @@ impl Fluree {
     pub async fn wrap_policy(
         &self,
         view: GraphDb,
-        opts: &QueryConnectionOptions,
+        opts: &GovernanceOptions,
         server_identity: Option<&str>,
     ) -> Result<GraphDb> {
         let effective_opts = if let Some(ref resolved) = view.resolved_config {
@@ -769,7 +767,7 @@ impl Fluree {
     pub async fn db_with_policy(
         &self,
         ledger_id: &str,
-        opts: &QueryConnectionOptions,
+        opts: &GovernanceOptions,
     ) -> Result<GraphDb> {
         let view = self.db(ledger_id).await?;
         self.wrap_policy(view, opts, None).await
@@ -782,7 +780,7 @@ impl Fluree {
         &self,
         ledger_id: &str,
         target_t: i64,
-        opts: &QueryConnectionOptions,
+        opts: &GovernanceOptions,
     ) -> Result<GraphDb> {
         let view = self.db_at_t(ledger_id, target_t).await?;
         self.wrap_policy(view, opts, None).await

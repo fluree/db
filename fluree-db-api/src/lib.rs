@@ -112,19 +112,20 @@ pub use block_fetch::{
 };
 pub use commit_transfer::{
     Base64Bytes, BulkImportResult, CommitImportResult, ExportCommitsRequest, ExportCommitsResponse,
-    PushCommitsRequest, PushCommitsResponse,
+    PushCommitsRequest, PushCommitsResponse, PushedHead,
 };
 pub use dataset::{
-    sparql_dataset_ledger_ids, DatasetParseError, DatasetSpec, GraphSource, QueryConnectionOptions,
+    sparql_dataset_ledger_ids, DatasetParseError, DatasetSpec, GovernanceOptions, GraphSource,
     TimeSpec,
 };
 pub use error::{ApiError, BuilderError, BuilderErrors, Result};
-pub use fluree_db_core::ContentId;
+pub use fluree_db_core::ledger_id::format_ledger_id;
 pub use fluree_db_core::RemoteObject;
 pub use fluree_db_core::{
     commit_to_summary, find_common_ancestor, walk_commit_summaries, CommitSummary, CommonAncestor,
     ConflictKey,
 };
+pub use fluree_db_core::{CommitId, ContentId};
 pub use format::{AgentJsonContext, FormatError, FormatterConfig, OutputFormat, QueryOutput};
 pub use graph::Graph;
 pub use graph_commit_builder::{CommitBuilder, CommitDetail, ResolvedFlake, ResolvedValue};
@@ -166,7 +167,7 @@ pub use query::builder::{
 pub use query::nameservice_builder::NameserviceQueryBuilder;
 pub use query::{QueryResult, TrackedErrorResponse, TrackedQueryResponse};
 pub use rebase::{ConflictStrategy, RebaseConflict, RebaseFailure, RebaseReport};
-pub use revert::RevertReport;
+pub use revert::{RevertReport, RevertSelection};
 pub use revert_preview::{RevertConflictSummary, RevertPreview, RevertPreviewOpts};
 pub use tx::{
     IndexingMode, IndexingStatus, StageResult, TrackedTransactionInput, TransactResult,

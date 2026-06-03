@@ -10,7 +10,7 @@
 
 mod support;
 
-use fluree_db_api::{FlureeBuilder, QueryConnectionOptions};
+use fluree_db_api::{FlureeBuilder, GovernanceOptions};
 use serde_json::json;
 use support::genesis_ledger;
 
@@ -104,7 +104,7 @@ async fn data_ledger_query_enforces_model_ledger_deny_policy() {
         .expect("seed D cross-ledger config");
 
     // --- query D under cross-ledger policy
-    let opts = QueryConnectionOptions::default();
+    let opts = GovernanceOptions::default();
     let wrapped = fluree
         .db_with_policy(data_id, &opts)
         .await
@@ -251,7 +251,7 @@ async fn custom_class_policy_enforced_when_data_ledger_includes_class() {
         .expect("seed D config including ex:OrgPolicy");
 
     let wrapped = fluree
-        .db_with_policy(data_id, &QueryConnectionOptions::default())
+        .db_with_policy(data_id, &GovernanceOptions::default())
         .await
         .expect("db_with_policy");
 
@@ -353,7 +353,7 @@ async fn custom_class_policy_skipped_when_data_ledger_omits_class() {
         .expect("seed D config naming f:AccessPolicy");
 
     let wrapped = fluree
-        .db_with_policy(data_id, &QueryConnectionOptions::default())
+        .db_with_policy(data_id, &GovernanceOptions::default())
         .await
         .expect("db_with_policy");
 
@@ -457,7 +457,7 @@ async fn baseline_access_policy_class_enforced() {
         .expect("seed D config with f:AccessPolicy class");
 
     let wrapped = fluree
-        .db_with_policy(data_id, &QueryConnectionOptions::default())
+        .db_with_policy(data_id, &GovernanceOptions::default())
         .await
         .expect("db_with_policy");
 
@@ -569,7 +569,7 @@ async fn omitted_policy_class_defaults_to_access_policy_only() {
         .expect("seed D config (no policy_class)");
 
     let wrapped = fluree
-        .db_with_policy(data_id, &QueryConnectionOptions::default())
+        .db_with_policy(data_id, &GovernanceOptions::default())
         .await
         .expect("db_with_policy");
 
@@ -673,7 +673,7 @@ async fn cross_ledger_plus_identity_mode_fails_closed() {
         .await
         .expect("seed D config");
 
-    let opts = QueryConnectionOptions {
+    let opts = GovernanceOptions {
         identity: Some("http://example.org/users/alice".into()),
         ..Default::default()
     };

@@ -26,7 +26,7 @@
 //! API. Internal metadata (GC records, stats sketches) and graph source
 //! snapshots are rejected before any storage I/O occurs.
 
-use crate::dataset::QueryConnectionOptions;
+use crate::dataset::GovernanceOptions;
 use crate::policy_builder;
 use fluree_db_binary_index::format::leaf::{decode_leaf_dir_v3_with_base, decode_leaf_header_v3};
 use fluree_db_binary_index::read::column_loader::load_leaflet_columns;
@@ -373,7 +373,7 @@ pub async fn apply_policy_filter(
         return Ok((flakes, false));
     }
 
-    let opts = QueryConnectionOptions {
+    let opts = GovernanceOptions {
         identity: identity.map(std::string::ToString::to_string),
         policy_class: policy_class.map(|c| vec![c.to_string()]),
         ..Default::default()

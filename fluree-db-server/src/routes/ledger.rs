@@ -3,6 +3,7 @@
 use crate::config::ServerRole;
 use crate::error::{Result, ServerError};
 use crate::extract::{FlureeHeaders, MaybeDataBearer};
+use crate::routes::transact::{extract_idempotency_key, submission_error_to_server_error};
 use crate::state::AppState;
 use crate::telemetry::{
     create_request_span, extract_request_id, extract_trace_id, set_span_error_code,
@@ -15,6 +16,7 @@ use fluree_db_api::wire::{ReindexRequest, ReindexResponse};
 use fluree_db_api::{
     ApiError, BranchDropReport, DropMode, DropNamedGraphReport, DropReport, DropStatus,
 };
+use fluree_db_consensus::Committer;
 use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
 use sha2::{Digest, Sha256};
@@ -1373,6 +1375,7 @@ pub async fn rebase(State(state): State<Arc<AppState>>, request: Request) -> Res
 async fn rebase_local(state: Arc<AppState>, request: Request) -> Result<impl IntoResponse> {
     let (parts, body) = request.into_parts();
     let headers = FlureeHeaders::from_headers(&parts.headers)?;
+    let idempotency_key = extract_idempotency_key(&parts.headers);
 
     let body_bytes = axum::body::to_bytes(body, 50 * 1024 * 1024)
         .await
@@ -1407,37 +1410,39 @@ async fn rebase_local(state: Arc<AppState>, request: Request) -> Result<impl Int
             "branch rebase requested"
         );
 
-        let report = match state
-            .fluree
-            .rebase_branch(&req.ledger, &req.branch, strategy)
-            .await
-        {
-            Ok(report) => report,
-            Err(e) => {
-                let server_error = ServerError::Api(e);
+        let ledger_id = fluree_db_core::ledger_id::format_ledger_id(&req.ledger, &req.branch);
+        let req = fluree_db_consensus::RebaseRequest {
+            idempotency_key,
+            ledger_name: req.ledger,
+            branch: req.branch,
+            strategy,
+        };
+
+        let receipt = match state.consensus.rebase(req).await {
+            Ok(receipt) => receipt,
+            Err(err) => {
                 set_span_error_code(&span, "error:BranchRebaseFailed");
-                tracing::error!(error = %server_error, "branch rebase failed");
-                return Err(server_error);
+                tracing::error!(error = %err, "branch rebase failed");
+                return Err(submission_error_to_server_error(err));
             }
         };
 
-        let ledger_id = fluree_db_core::ledger_id::format_ledger_id(&req.ledger, &req.branch);
         let response = RebaseBranchResponse {
             ledger_id,
-            branch: req.branch,
-            fast_forward: report.fast_forward,
-            replayed: report.replayed,
-            skipped: report.skipped,
-            conflicts: report.conflicts.len(),
-            failures: report.failures.len(),
-            total_commits: report.total_commits,
-            source_head_t: report.source_head_t,
+            branch: receipt.branch,
+            fast_forward: receipt.fast_forward,
+            replayed: receipt.replayed,
+            skipped: receipt.skipped,
+            conflicts: receipt.conflicts,
+            failures: receipt.failures,
+            total_commits: receipt.total_commits,
+            source_head_t: receipt.source_head_t,
         };
 
         tracing::info!(
             status = "success",
-            fast_forward = report.fast_forward,
-            replayed = report.replayed,
+            fast_forward = response.fast_forward,
+            replayed = response.replayed,
             "branch rebased"
         );
         Ok((StatusCode::OK, Json(response)))
@@ -1506,6 +1511,7 @@ pub async fn merge(State(state): State<Arc<AppState>>, request: Request) -> Resp
 async fn merge_local(state: Arc<AppState>, request: Request) -> Result<impl IntoResponse> {
     let (parts, body) = request.into_parts();
     let headers = FlureeHeaders::from_headers(&parts.headers)?;
+    let idempotency_key = extract_idempotency_key(&parts.headers);
 
     let body_bytes = axum::body::to_bytes(body, 50 * 1024 * 1024)
         .await
@@ -1542,35 +1548,44 @@ async fn merge_local(state: Arc<AppState>, request: Request) -> Result<impl Into
             "branch merge requested"
         );
 
-        let report = match state
-            .fluree
-            .merge_branch(&req.ledger, &req.source, req.target.as_deref(), strategy)
-            .await
-        {
-            Ok(report) => report,
-            Err(e) => {
-                let server_error = ServerError::Api(e);
+        // Keep the bare ledger name accessible after the consensus call —
+        // `format_ledger_id` below needs it with the receipt's resolved target.
+        let ledger_name = req.ledger.clone();
+        let req = fluree_db_consensus::MergeRequest {
+            idempotency_key,
+            ledger_name: req.ledger,
+            source_branch: req.source,
+            target_branch: req.target,
+            strategy,
+        };
+
+        let receipt = match state.consensus.merge(req).await {
+            Ok(receipt) => receipt,
+            Err(err) => {
                 set_span_error_code(&span, "error:BranchMergeFailed");
-                tracing::error!(error = %server_error, "branch merge failed");
-                return Err(server_error);
+                tracing::error!(error = %err, "branch merge failed");
+                return Err(submission_error_to_server_error(err));
             }
         };
 
-        let ledger_id = fluree_db_core::ledger_id::format_ledger_id(&req.ledger, &report.target);
+        let ledger_id = fluree_db_core::ledger_id::format_ledger_id(&ledger_name, &receipt.target);
+        // Fast-forward merges don't apply a conflict strategy — match the
+        // prior wire shape by omitting the field in that case.
+        let strategy_out = (!receipt.fast_forward).then(|| receipt.strategy.as_str().to_string());
         let response = MergeBranchResponse {
             ledger_id,
-            target: report.target,
-            source: report.source,
-            fast_forward: report.fast_forward,
-            new_head_t: report.new_head_t,
-            commits_copied: report.commits_copied,
-            conflict_count: report.conflict_count,
-            strategy: report.strategy,
+            target: receipt.target,
+            source: receipt.source,
+            fast_forward: receipt.fast_forward,
+            new_head_t: receipt.new_head_t,
+            commits_copied: receipt.commits_copied,
+            conflict_count: receipt.conflict_count,
+            strategy: strategy_out,
         };
 
         tracing::info!(
             status = "success",
-            fast_forward = report.fast_forward,
+            fast_forward = response.fast_forward,
             "branch merged"
         );
         Ok((StatusCode::OK, Json(response)))
@@ -1655,6 +1670,7 @@ pub async fn revert(State(state): State<Arc<AppState>>, request: Request) -> Res
 async fn revert_local(state: Arc<AppState>, request: Request) -> Result<impl IntoResponse> {
     let (parts, body) = request.into_parts();
     let headers = FlureeHeaders::from_headers(&parts.headers)?;
+    let idempotency_key = extract_idempotency_key(&parts.headers);
 
     let body_bytes = axum::body::to_bytes(body, 50 * 1024 * 1024)
         .await
@@ -1697,18 +1713,14 @@ async fn revert_local(state: Arc<AppState>, request: Request) -> Result<impl Int
             ));
         }
 
-        let report = if let Some(commit) = req.commit {
-            let commit_ref = parse_commit_ref(&commit)?;
+        let selection = if let Some(commit) = req.commit {
             tracing::info!(
                 status = "start",
                 branch = %req.branch,
                 strategy = strategy.as_str(),
                 "branch revert (single) requested"
             );
-            state
-                .fluree
-                .revert_commit(&req.ledger, &req.branch, commit_ref, strategy)
-                .await
+            fluree_db_api::RevertSelection::single(parse_commit_ref(&commit)?)
         } else if let Some(commits) = req.commits {
             let parsed: std::result::Result<Vec<_>, _> =
                 commits.iter().map(|s| parse_commit_ref(s)).collect();
@@ -1720,10 +1732,9 @@ async fn revert_local(state: Arc<AppState>, request: Request) -> Result<impl Int
                 strategy = strategy.as_str(),
                 "branch revert (set) requested"
             );
-            state
-                .fluree
-                .revert_commits(&req.ledger, &req.branch, parsed, strategy)
-                .await
+            fluree_db_api::RevertSelection::try_set(parsed).ok_or_else(|| {
+                ServerError::bad_request("Revert requires at least one commit".to_string())
+            })?
         } else if let Some(range) = req.range {
             let from = parse_commit_ref(&range.from)?;
             let to = parse_commit_ref(&range.to)?;
@@ -1733,33 +1744,37 @@ async fn revert_local(state: Arc<AppState>, request: Request) -> Result<impl Int
                 strategy = strategy.as_str(),
                 "branch revert (range) requested"
             );
-            state
-                .fluree
-                .revert_range(&req.ledger, &req.branch, from, to, strategy)
-                .await
+            fluree_db_api::RevertSelection::range(from, to)
         } else {
             unreachable!("validated above");
         };
 
-        let report = match report {
-            Ok(report) => report,
-            Err(e) => {
-                let server_error = ServerError::Api(e);
+        let ledger_id = fluree_db_core::ledger_id::format_ledger_id(&req.ledger, &req.branch);
+        let req = fluree_db_consensus::RevertRequest {
+            idempotency_key,
+            ledger_name: req.ledger,
+            branch: req.branch,
+            selection,
+            strategy,
+        };
+
+        let receipt = match state.consensus.revert(req).await {
+            Ok(receipt) => receipt,
+            Err(err) => {
                 set_span_error_code(&span, "error:BranchRevertFailed");
-                tracing::error!(error = %server_error, "branch revert failed");
-                return Err(server_error);
+                tracing::error!(error = %err, "branch revert failed");
+                return Err(submission_error_to_server_error(err));
             }
         };
 
-        let ledger_id = fluree_db_core::ledger_id::format_ledger_id(&req.ledger, &report.branch);
         let response = RevertResponse {
             ledger_id,
-            branch: report.branch,
-            reverted_commits: report.reverted_commits,
-            conflict_count: report.conflict_count,
-            strategy: report.strategy,
-            new_head_t: report.new_head_t,
-            new_head_id: report.new_head_id,
+            branch: receipt.branch,
+            reverted_commits: receipt.reverted_commits,
+            conflict_count: receipt.conflict_count,
+            strategy: receipt.strategy.as_str().to_string(),
+            new_head_t: receipt.new_head_t,
+            new_head_id: receipt.new_head_id,
         };
 
         tracing::info!(
