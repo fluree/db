@@ -2050,6 +2050,15 @@ pub fn build_operator_tree(
     stats: Option<Arc<StatsView>>,
     planning: &PlanningContext,
 ) -> Result<BoxedOperator> {
+    // Fold `FILTER(?x = ?y)` equijoins into variable unification before planning,
+    // so the rewrite feeds the stats-driven reorder, count planner, and index
+    // fast paths (rather than running as a cross-product + filter). Only clone
+    // the IR when there is actually something to fold. Recurses into subqueries.
+    if stats.is_some() && crate::filter_fold::has_equijoin_filter(query) {
+        let mut folded = query.clone();
+        crate::filter_fold::fold_equijoin_filters(&mut folded, stats.as_deref());
+        return build_operator_tree_inner(&folded, stats, true, planning);
+    }
     build_operator_tree_inner(query, stats, true, planning)
 }
 

@@ -209,6 +209,10 @@ fn assemble_fast_stats_inner(
     }
 
     let mut property_counts = build_property_counts(indexed);
+    // Per-predicate (Sid) datatype deltas from novelty, so the aggregate
+    // `PropertyStatEntry.datatypes` stays current-state-exact (not index-only).
+    // Consumed by the equijoin-filter fold's node-only soundness guard.
+    let mut property_datatype_deltas: HashMap<(u16, String), HashMap<u8, i64>> = HashMap::new();
     let mut class_data = build_class_data(indexed);
     let mut graphs = indexed.graphs.clone().unwrap_or_default();
     let mut graph_index: HashMap<GraphId, usize> = graphs
@@ -258,7 +262,12 @@ fn assemble_fast_stats_inner(
         }
 
         let sid_key = (flake.p.namespace_code, flake.p.name.to_string());
-        *property_counts.entry(sid_key).or_insert(0) += delta;
+        *property_counts.entry(sid_key.clone()).or_insert(0) += delta;
+        *property_datatype_deltas
+            .entry(sid_key)
+            .or_default()
+            .entry(runtime_datatype_tag(flake))
+            .or_insert(0) += delta;
 
         if let Some(stats_lookup) = lookup {
             if let Some(p_id) = stats_lookup.runtime_predicate_id_for_sid(&flake.p) {
@@ -285,7 +294,12 @@ fn assemble_fast_stats_inner(
         }
     }
 
-    let mut stats = finalize_stats(indexed, property_counts, class_data);
+    let mut stats = finalize_stats(
+        indexed,
+        property_counts,
+        property_datatype_deltas,
+        class_data,
+    );
     stats.flakes = (indexed.flakes as i64 + flakes_delta).max(0) as u64;
     stats.size = indexed.size + novelty.size as u64;
     if !graphs.is_empty() {
@@ -588,9 +602,30 @@ fn build_class_data(indexed: &IndexStats) -> HashMap<Sid, ClassDataMut> {
     class_data
 }
 
+/// Merge index per-datatype counts with novelty deltas, dropping any datatype
+/// whose current-state count is zero. Keeps the aggregate `datatypes` breakdown
+/// current-state-exact so a predicate that gains/loses literal values via
+/// novelty is reflected (used by the equijoin-filter fold's node-only guard).
+fn merge_property_datatypes(index: &[(u8, u64)], deltas: Option<&HashMap<u8, i64>>) -> Vec<(u8, u64)> {
+    let mut merged: HashMap<u8, i64> = index.iter().map(|&(t, c)| (t, c as i64)).collect();
+    if let Some(deltas) = deltas {
+        for (&tag, &d) in deltas {
+            *merged.entry(tag).or_insert(0) += d;
+        }
+    }
+    let mut out: Vec<(u8, u64)> = merged
+        .into_iter()
+        .filter(|&(_, c)| c > 0)
+        .map(|(t, c)| (t, c as u64))
+        .collect();
+    out.sort_by_key(|&(t, _)| t);
+    out
+}
+
 fn finalize_stats(
     indexed: &IndexStats,
     property_counts: PropertyCountMap,
+    property_datatype_deltas: HashMap<(u16, String), HashMap<u8, i64>>,
     class_data: HashMap<Sid, ClassDataMut>,
 ) -> IndexStats {
     let properties = if property_counts.is_empty() {
@@ -609,15 +644,17 @@ fn finalize_stats(
             .filter(|(_, count)| *count > 0)
             .map(|(sid, count)| {
                 let indexed_entry = indexed_props.get(&sid);
+                let datatypes = merge_property_datatypes(
+                    indexed_entry.map(|e| e.datatypes.as_slice()).unwrap_or(&[]),
+                    property_datatype_deltas.get(&sid),
+                );
                 PropertyStatEntry {
                     sid,
                     count: count.max(0) as u64,
                     ndv_values: indexed_entry.map(|e| e.ndv_values).unwrap_or(0),
                     ndv_subjects: indexed_entry.map(|e| e.ndv_subjects).unwrap_or(0),
                     last_modified_t: indexed_entry.map(|e| e.last_modified_t).unwrap_or(0),
-                    datatypes: indexed_entry
-                        .map(|e| e.datatypes.clone())
-                        .unwrap_or_default(),
+                    datatypes,
                 }
             })
             .collect();

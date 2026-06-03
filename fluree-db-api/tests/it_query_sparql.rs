@@ -1322,6 +1322,100 @@ async fn sparql_select_unbound_variable_no_grouping() {
 }
 
 #[tokio::test]
+async fn sparql_filter_equality_equijoin_results_preserved() {
+    // Performance optimization (benchmark-db perf #1, BSBM BI-2): FILTER(?x = ?y)
+    // between two ref-valued triple objects folds into an equijoin (var unify).
+    // This verifies the rewrite preserves results — the shared-feature count per
+    // product, the BI-2 shape.
+    assert_index_defaults();
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger0 = genesis_ledger(&fluree, "features:main");
+    let insert = json!({
+        "@context": { "ex": "http://example.org/ns/" },
+        "@graph": [
+            {"@id":"ex:p1","ex:feature":[{"@id":"ex:fa"},{"@id":"ex:fb"},{"@id":"ex:fc"}]},
+            {"@id":"ex:p2","ex:feature":[{"@id":"ex:fa"},{"@id":"ex:fb"}]},
+            {"@id":"ex:p3","ex:feature":[{"@id":"ex:fc"},{"@id":"ex:fd"}]},
+            {"@id":"ex:p4","ex:feature":[{"@id":"ex:fx"}]}
+        ]
+    });
+    let ledger = fluree
+        .insert(ledger0, &insert)
+        .await
+        .expect("insert+commit should succeed")
+        .ledger;
+
+    let query = r"
+        PREFIX ex: <http://example.org/ns/>
+        SELECT ?other (COUNT(?f2) AS ?shared)
+        WHERE {
+          ex:p1 ex:feature ?f1 .
+          ?other ex:feature ?f2 .
+          FILTER(?f1 = ?f2)
+        }
+        GROUP BY ?other
+    ";
+
+    let jsonld = support::query_sparql(&fluree, &ledger, query)
+        .await
+        .unwrap()
+        .to_jsonld(&ledger.snapshot)
+        .expect("to_jsonld");
+    // Shared features with p1's {fa,fb,fc}: p1 itself 3, p2 {fa,fb}=2, p3 {fc}=1;
+    // p4 ({fx}) shares none, so it never binds ?f2 and is absent.
+    assert_eq!(
+        normalize_rows(&jsonld),
+        normalize_rows(&json!([["ex:p1", 3], ["ex:p2", 2], ["ex:p3", 1]]))
+    );
+}
+
+#[tokio::test]
+async fn sparql_filter_equality_equijoin_inside_subquery() {
+    // The exact BSBM BI-2 shape: the FILTER(?f1 = ?f2) equijoin lives inside a
+    // grouped sub-SELECT. The fold must recurse into the subquery scope and
+    // preserve results (the aggregate COUNT(?f2) follows the unified variable).
+    assert_index_defaults();
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger0 = genesis_ledger(&fluree, "features:sub");
+    let insert = json!({
+        "@context": { "ex": "http://example.org/ns/" },
+        "@graph": [
+            {"@id":"ex:p1","ex:feature":[{"@id":"ex:fa"},{"@id":"ex:fb"},{"@id":"ex:fc"}]},
+            {"@id":"ex:p2","ex:feature":[{"@id":"ex:fa"},{"@id":"ex:fb"}]},
+            {"@id":"ex:p3","ex:feature":[{"@id":"ex:fc"},{"@id":"ex:fd"}]}
+        ]
+    });
+    let ledger = fluree
+        .insert(ledger0, &insert)
+        .await
+        .expect("insert+commit should succeed")
+        .ledger;
+
+    let query = r"
+        PREFIX ex: <http://example.org/ns/>
+        SELECT ?other ?shared {
+          { SELECT ?other (COUNT(?f2) AS ?shared)
+            {
+              ex:p1 ex:feature ?f1 .
+              ?other ex:feature ?f2 .
+              FILTER(?f1 = ?f2)
+            }
+            GROUP BY ?other }
+        }
+    ";
+
+    let jsonld = support::query_sparql(&fluree, &ledger, query)
+        .await
+        .unwrap()
+        .to_jsonld(&ledger.snapshot)
+        .expect("to_jsonld");
+    assert_eq!(
+        normalize_rows(&jsonld),
+        normalize_rows(&json!([["ex:p1", 3], ["ex:p2", 2], ["ex:p3", 1]]))
+    );
+}
+
+#[tokio::test]
 async fn sparql_delete_data_removes_specified_triples() {
     assert_index_defaults();
     let fluree = FlureeBuilder::memory().build_memory();

@@ -37,6 +37,29 @@ pub enum Expression {
 }
 
 impl Expression {
+    /// Rename every occurrence of variable `old` to `new` (recursively through
+    /// call arguments and EXISTS sub-patterns). Used by the equijoin-filter fold.
+    pub fn substitute_var(&mut self, old: VarId, new: VarId) {
+        match self {
+            Expression::Var(v) => {
+                if *v == old {
+                    *v = new;
+                }
+            }
+            Expression::Const(_) => {}
+            Expression::Call { args, .. } => {
+                for arg in args {
+                    arg.substitute_var(old, new);
+                }
+            }
+            Expression::Exists { patterns, .. } => {
+                for p in patterns {
+                    p.substitute_var(old, new);
+                }
+            }
+        }
+    }
+
     /// True if this expression (or any sub-expression / sub-pattern it
     /// contains) calls the given built-in function.
     ///
