@@ -799,6 +799,7 @@ mod tests {
             properties_by_iri: HashMap::new(),
             classes_by_iri: HashMap::new(),
             graph_properties: HashMap::new(),
+            ..Default::default()
         };
 
         let p1 = make_pattern(VarId(0), "name", VarId(1));
@@ -828,6 +829,7 @@ mod tests {
             properties_by_iri: HashMap::new(),
             classes_by_iri: HashMap::new(),
             graph_properties: HashMap::new(),
+            ..Default::default()
         };
 
         let patterns = vec![make_pattern(VarId(0), "name", VarId(1))];
@@ -912,6 +914,7 @@ mod tests {
             properties_by_iri: HashMap::new(),
             classes_by_iri: HashMap::new(),
             graph_properties: HashMap::new(),
+            ..Default::default()
         };
 
         let pattern = make_pattern(VarId(0), "name", VarId(1));

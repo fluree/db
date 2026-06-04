@@ -81,15 +81,17 @@ pub(crate) fn format_binding(
     match binding {
         Binding::Unbound | Binding::Poisoned => Ok(JsonValue::Null),
 
-        // Reference - use @id notation
+        // Reference - use @id notation. An `@id` is a node identifier, so it
+        // compacts via `@base` + explicit prefixes only, never `@vocab`
+        // (issue #1280).
         Binding::Sid { sid, .. } => {
-            let iri = compactor.compact_sid(sid)?;
+            let iri = compactor.compact_id_sid(sid)?;
             Ok(json!({"@id": iri}))
         }
 
         // IriMatch: use canonical IRI, then compact (multi-ledger mode)
         Binding::IriMatch { iri, .. } => {
-            let compacted = compactor.compact_iri(iri)?;
+            let compacted = compactor.compact_id_iri(iri);
             Ok(json!({"@id": compacted}))
         }
 
@@ -319,6 +321,7 @@ fn format_row_wildcard(
 mod tests {
     use super::*;
     use fluree_db_core::Sid;
+    use fluree_graph_json_ld::ParsedContext;
     use std::collections::HashMap;
 
     fn make_test_compactor() -> IriCompactor {
@@ -327,6 +330,30 @@ mod tests {
         namespaces.insert(3, "http://www.w3.org/1999/02/22-rdf-syntax-ns#".to_string());
         namespaces.insert(100, "http://example.org/".to_string());
         IriCompactor::from_namespaces(&namespaces)
+    }
+
+    /// A compactor whose context sets `@vocab` to the same namespace as the
+    /// `lists` subject, so the `@vocab`-vs-`@id` distinction is observable.
+    fn make_vocab_compactor() -> IriCompactor {
+        let mut namespaces = HashMap::new();
+        namespaces.insert(100, "http://example.org/lists/".to_string());
+        let context = ParsedContext::parse(
+            None,
+            &serde_json::json!({"@vocab": "http://example.org/lists/"}),
+        )
+        .unwrap();
+        IriCompactor::new(&namespaces, &context)
+    }
+
+    /// Regression for #1280: the `@id` of a reference must not be compacted
+    /// against `@vocab`, even when its IRI falls under the vocab namespace.
+    #[test]
+    fn test_format_binding_sid_id_not_vocab_compacted() {
+        let compactor = make_vocab_compactor();
+        let result = make_test_result();
+        let binding = Binding::sid(Sid::new(100, "summer")); // http://example.org/lists/summer
+        let formatted = format_binding(&result, &binding, &compactor).unwrap();
+        assert_eq!(formatted, json!({"@id": "http://example.org/lists/summer"}));
     }
 
     /// Create a minimal QueryResult for tests that don't need binary_store.

@@ -35,6 +35,14 @@ pub struct StatsView {
     /// property lookups with datatype breakdown. The aggregate Sid-keyed
     /// `properties` map remains the primary source for the query planner.
     pub graph_properties: HashMap<GraphId, HashMap<RuntimePredicateId, GraphPropertyStatData>>,
+    /// Property SID -> whether every object of this property is a node/IRI ref
+    /// (all datatype tags are [`ValueTypeTag::JSON_LD_ID`]). Derived from the
+    /// current-state (novelty-merged) per-datatype breakdown. Used by the
+    /// equijoin-filter fold to soundly rewrite `FILTER(?x = ?y)` into a join
+    /// only when value-equality coincides with term-equality (true for nodes).
+    pub property_ref_only: HashMap<Sid, bool>,
+    /// Property IRI -> ref-only flag (see [`Self::property_ref_only`]).
+    pub property_ref_only_by_iri: HashMap<Arc<str>, bool>,
 }
 
 /// Per-property statistics within a graph, keyed by numeric IDs.
@@ -121,13 +129,21 @@ impl StatsView {
                 // entry.sid is (namespace_code, name) - directly usable
                 let sid = Sid::new(entry.sid.0, &entry.sid.1);
                 view.properties.insert(
-                    sid,
+                    sid.clone(),
                     PropertyStatData {
                         count: entry.count,
                         ndv_values: entry.ndv_values,
                         ndv_subjects: entry.ndv_subjects,
                     },
                 );
+                // Ref-only iff every observed object datatype is a node/IRI ref.
+                // Empty datatypes (unknown) => not provably ref-only.
+                let ref_only = !entry.datatypes.is_empty()
+                    && entry
+                        .datatypes
+                        .iter()
+                        .all(|&(dt, _)| dt == ValueTypeTag::JSON_LD_ID.as_u8());
+                view.property_ref_only.insert(sid, ref_only);
             }
         }
 
@@ -190,7 +206,27 @@ impl StatsView {
             }
         }
 
+        // Derive IRI-keyed ref-only flags.
+        for (sid, ref_only) in &view.property_ref_only {
+            if let Some(prefix) = namespace_codes.get(&sid.namespace_code) {
+                let iri: Arc<str> = Arc::from(format!("{}{}", prefix, sid.name));
+                view.property_ref_only_by_iri.insert(iri, *ref_only);
+            }
+        }
+
         view
+    }
+
+    /// Whether every object of this property (by SID) is a node/IRI ref —
+    /// i.e. value-equality coincides with term-equality. `None` when the
+    /// property is unknown to stats. See [`Self::property_ref_only`].
+    pub fn is_property_ref_only(&self, sid: &Sid) -> Option<bool> {
+        self.property_ref_only.get(sid).copied()
+    }
+
+    /// Whether every object of this property (by IRI) is a node/IRI ref.
+    pub fn is_property_ref_only_by_iri(&self, iri: &str) -> Option<bool> {
+        self.property_ref_only_by_iri.get(iri).copied()
     }
 
     /// Get property statistics by SID.

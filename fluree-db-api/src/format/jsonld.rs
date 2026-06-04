@@ -76,11 +76,13 @@ pub(crate) fn format_binding(binding: &Binding, compactor: &IriCompactor) -> Res
     match binding {
         Binding::Unbound | Binding::Poisoned => Ok(JsonValue::Null),
 
-        // Reference (IRI or blank node) - compact using @context
-        Binding::Sid { sid, .. } => Ok(JsonValue::String(compactor.compact_sid(sid)?)),
+        // Reference (IRI or blank node) - compact using @context.
+        // A reference binding names a node, so it's an `@id`-position value:
+        // compact via `@base` + explicit prefixes, never `@vocab` (issue #1280).
+        Binding::Sid { sid, .. } => Ok(JsonValue::String(compactor.compact_id_sid(sid)?)),
 
         // IriMatch: use canonical IRI, then compact (multi-ledger mode)
-        Binding::IriMatch { iri, .. } => Ok(JsonValue::String(compactor.compact_iri(iri)?)),
+        Binding::IriMatch { iri, .. } => Ok(JsonValue::String(compactor.compact_id_iri(iri))),
 
         // Raw IRI string (from graph source, not in namespace table)
         // Output as-is without compaction (no namespace mapping available)
@@ -334,6 +336,7 @@ fn format_row_wildcard(
 mod tests {
     use super::*;
     use fluree_db_core::Sid;
+    use fluree_graph_json_ld::ParsedContext;
     use std::collections::HashMap;
 
     fn make_test_compactor() -> IriCompactor {
@@ -342,6 +345,35 @@ mod tests {
         namespaces.insert(3, "http://www.w3.org/1999/02/22-rdf-syntax-ns#".to_string());
         namespaces.insert(100, "http://example.org/".to_string());
         IriCompactor::from_namespaces(&namespaces)
+    }
+
+    /// A compactor whose context sets `@vocab` to the same namespace as the
+    /// `lists` subject, so the `@vocab`-vs-`@id` distinction is observable.
+    fn make_vocab_compactor() -> IriCompactor {
+        let mut namespaces = HashMap::new();
+        namespaces.insert(100, "http://example.org/lists/".to_string());
+        let context = ParsedContext::parse(
+            None,
+            &serde_json::json!({"@vocab": "http://example.org/lists/"}),
+        )
+        .unwrap();
+        IriCompactor::new(&namespaces, &context)
+    }
+
+    /// Regression for #1280: a reference binding is a node identifier (`@id`
+    /// position). Even when its IRI falls under `@vocab`, the flat JSON-LD
+    /// formatter must emit the full IRI, not the bare `@vocab` term.
+    #[test]
+    fn test_format_binding_sid_id_not_vocab_compacted() {
+        let compactor = make_vocab_compactor();
+        let binding = Binding::sid(Sid::new(100, "summer")); // http://example.org/lists/summer
+        let result = format_binding(&binding, &compactor).unwrap();
+        assert_eq!(result, json!("http://example.org/lists/summer"));
+        assert_ne!(
+            result,
+            json!("summer"),
+            "an @id under @vocab must not collapse to a bare term"
+        );
     }
 
     #[test]

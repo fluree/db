@@ -617,6 +617,18 @@ pub struct ServerConfig {
     #[arg(long, env = "FLUREE_MCP_AUTH_INSECURE", hide = true)]
     pub mcp_auth_insecure_accept_any_issuer: bool,
 
+    /// Byte budget for the MCP `sparql_query` Agent JSON envelope.
+    ///
+    /// Results are truncated once their serialized size exceeds this limit and the envelope
+    /// sets `hasMore: true`. MCP tool calls carry no per-request headers (unlike the HTTP
+    /// `Fluree-Max-Bytes` header), so the budget is server-configured.
+    #[arg(
+        long,
+        env = "FLUREE_MCP_AGENT_JSON_MAX_BYTES",
+        default_value_t = server_defaults::DEFAULT_MCP_AGENT_JSON_MAX_BYTES
+    )]
+    pub mcp_agent_json_max_bytes: usize,
+
     // === Admin endpoint authentication options ===
     /// Authentication mode for admin endpoints (/fluree/create, /fluree/drop)
     #[arg(
@@ -696,6 +708,7 @@ impl Default for ServerConfig {
             mcp_enabled: false,
             mcp_auth_trusted_issuers: Vec::new(),
             mcp_auth_insecure_accept_any_issuer: false,
+            mcp_agent_json_max_bytes: server_defaults::DEFAULT_MCP_AGENT_JSON_MAX_BYTES,
             // Admin auth defaults
             admin_auth_mode: AdminAuthMode::None,
             admin_auth_trusted_issuers: Vec::new(),

@@ -509,6 +509,7 @@ impl PropertyPathOperator {
         // Note: lowering may produce `Ref::Iri` constants to support cross-ledger joins.
         // For property paths we must traverse SIDs, so we opportunistically encode IRIs
         // against the selected active graph's namespace table.
+        let binary_store = ctx.binary_store.as_ref();
         let resolve_sid = |term: &Ref, binding: Option<&Binding>| -> Option<Sid> {
             match term {
                 Ref::Sid(s) => Some(s.clone()),
@@ -517,6 +518,17 @@ impl PropertyPathOperator {
                     Binding::Sid { sid: s, .. } => Some(s.clone()),
                     Binding::IriMatch { iri, .. } => db_for_encode.encode_iri(iri),
                     Binding::Iri(iri) => db_for_encode.encode_iri(iri),
+                    // Indexed BinaryScan emits late-materialized EncodedSid for a
+                    // correlated path endpoint (e.g. the ?mid of `?s p1 ?mid . ?mid p2+ ?o`
+                    // with a bound subject). Resolve its raw s_id (only meaningful within
+                    // this single ledger, which property paths already require) to its IRI
+                    // via the active graph's store, then re-encode against the same graph —
+                    // matching the `IriMatch`/`Iri` arms above. Without this arm the binding
+                    // resolved to None and fell into the full-closure branch, pairing the
+                    // row with the entire p2 closure.
+                    Binding::EncodedSid { s_id, .. } => binary_store
+                        .and_then(|st| st.resolve_subject_iri(*s_id).ok())
+                        .and_then(|iri| db_for_encode.encode_iri(&iri)),
                     _ => None,
                 }),
             }

@@ -18,14 +18,15 @@ use crate::count_plan::{
 };
 use crate::error::{QueryError, Result};
 use crate::fast_path_common::{
-    allow_cursor_fast_path, build_count_batch, build_post_cursor_for_predicate,
-    build_psot_cursor_for_predicate, collect_subjects_for_predicate_set,
-    collect_subjects_for_predicate_sorted, collect_subjects_with_object_in_set,
-    count_rows_for_predicate_psot, cursor_projection_otype_okey, cursor_projection_sid_only,
-    cursor_projection_sid_otype_okey, intersect_many_sorted, leaf_entries_for_predicate,
-    normalize_pred_sid, projection_sid_otype_okey, sum_post_object_counts_filtered,
+    allow_cursor_fast_path, build_count_batch, build_overlay_cursor_for_subject_range,
+    build_post_cursor_for_predicate, build_psot_cursor_for_predicate, collect_resolved_overlay_ops,
+    collect_subjects_for_predicate_set, collect_subjects_for_predicate_sorted,
+    collect_subjects_with_object_in_set, count_rows_for_predicate_psot,
+    cursor_projection_otype_okey, cursor_projection_sid_only, cursor_projection_sid_otype_okey,
+    intersect_many_sorted, leaf_entries_for_predicate, normalize_pred_sid,
+    projection_sid_otype_okey, slice_overlay_ops_by_subject, sum_post_object_counts_filtered,
     CursorSubjectCountStream, FastPathOperator, ObjectFilterMode, PostObjectGroupCountIter,
-    PsotObjectFilterCountIter, PsotSubjectCountIter, PsotSubjectWeightedSumIter,
+    PsotObjectFilterCountIter, PsotSubjectCountIter, PsotSubjectSeek, PsotSubjectWeightedSumIter,
 };
 use crate::ir::triple::Ref;
 use crate::operator::BoxedOperator;
@@ -542,6 +543,28 @@ fn sum_stream(
         ),
 
         StreamNode::AntiJoin { source, excluded } => {
+            // Asymmetric seek (HEAD, outermost modifier only): drive from the
+            // smaller of outer/inner and seek the other, avoiding a full scan or
+            // keyset-build of the large side.
+            if !ec.overlay && exclude_sorted.is_none() && include_sorted.is_none() {
+                if let Some(n) = try_modifier_seek(source, excluded, true, ec)? {
+                    return Ok(Some(n));
+                }
+                // Both-large (and multi-predicate inner): parallelize the keyset
+                // build + outer scan instead of building the keyset serially.
+                if let Some(n) = try_modifier_intersect_parallel(source, excluded, true, ec)? {
+                    return Ok(Some(n));
+                }
+            }
+            // Overlay/time-travel: parallelize the base scan + fold novelty per
+            // partition; falls through to the serial keyset path otherwise.
+            if ec.overlay && exclude_sorted.is_none() && include_sorted.is_none() {
+                if let Some(n) =
+                    try_modifier_intersect_overlay_parallel(source, excluded, true, ec)?
+                {
+                    return Ok(Some(n));
+                }
+            }
             let exclude_list = execute_keyset_as_sorted(excluded, ec)?;
             let exclude_list = match exclude_list {
                 Some(s) => s,
@@ -553,6 +576,24 @@ fn sum_stream(
         }
 
         StreamNode::SemiJoin { source, filter } => {
+            if !ec.overlay && exclude_sorted.is_none() && include_sorted.is_none() {
+                if let Some(n) = try_modifier_seek(source, filter, false, ec)? {
+                    return Ok(Some(n));
+                }
+                // Both-large (and multi-predicate inner): parallelize the keyset
+                // build + outer scan instead of building the keyset serially.
+                if let Some(n) = try_modifier_intersect_parallel(source, filter, false, ec)? {
+                    return Ok(Some(n));
+                }
+            }
+            // Overlay/time-travel: parallelize the base scan + fold novelty per
+            // partition; falls through to the serial keyset path otherwise.
+            if ec.overlay && exclude_sorted.is_none() && include_sorted.is_none() {
+                if let Some(n) = try_modifier_intersect_overlay_parallel(source, filter, false, ec)?
+                {
+                    return Ok(Some(n));
+                }
+            }
             let filter_list = execute_keyset_as_sorted(filter, ec)?;
             let filter_list = match filter_list {
                 Some(s) => s,
@@ -566,6 +607,93 @@ fn sum_stream(
             sum_stream(source, ec, exclude_sorted, Some(&merged))
         }
     }
+}
+
+/// Asymmetric seek strategy for a single-predicate EXISTS/MINUS over a
+/// single-predicate outer: `?s A ?o1 {FILTER EXISTS | MINUS} { ?s B ?o2 }`.
+///
+/// Drives from whichever of A/B has fewer rows and seeks into the other, avoiding
+/// a full scan or keyset-build of the large side:
+/// - EXISTS  = `Σ_{s ∈ A ∧ s ∈ B} count_A(s)`
+/// - MINUS   = `Σ_{s ∈ A ∧ s ∉ B} count_A(s)` = `total(A) − Σ_{s ∈ A ∩ B} count_A(s)`
+///
+/// (`is_anti` = true for MINUS / NOT EXISTS, false for EXISTS.) Returns `Ok(None)`
+/// to defer to the keyset+scan path when the shape is not single-predicate on both
+/// sides, or the sides are not skewed enough for the seek to win. BASE index only:
+/// the caller must ensure `!ec.overlay` and that no outer exclude/include filter is
+/// already active.
+fn try_modifier_seek(
+    source: &StreamNode,
+    keyset: &KeySetNode,
+    is_anti: bool,
+    ec: &ExecCtx<'_, '_>,
+) -> Result<Option<u64>> {
+    let StreamNode::SubjectCountScan { pred: pred_a } = source else {
+        return Ok(None);
+    };
+    let pred_b = match keyset {
+        KeySetNode::SubjectSet { pred } | KeySetNode::SubjectsSorted { pred } => pred,
+        _ => return Ok(None),
+    };
+
+    let sid_a = normalize_pred_sid(ec.store, pred_a)?;
+    let sid_b = normalize_pred_sid(ec.store, pred_b)?;
+
+    // Absent-predicate semantics:
+    // - A absent  => outer empty => 0 for both EXISTS and MINUS.
+    // - B absent  => EXISTS: 0 (no subject has B); MINUS: total(A) (nothing excluded).
+    let Some(p_a) = ec.store.sid_to_p_id(&sid_a) else {
+        return Ok(Some(0));
+    };
+    let rows_a = count_rows_for_predicate_psot(ec.store, ec.g_id, p_a)?;
+    let Some(p_b) = ec.store.sid_to_p_id(&sid_b) else {
+        return Ok(Some(if is_anti { rows_a } else { 0 }));
+    };
+    let rows_b = count_rows_for_predicate_psot(ec.store, ec.g_id, p_b)?;
+
+    // Only worthwhile when one side is much smaller than the other; otherwise the
+    // existing keyset+scan path is competitive — defer to it.
+    let (min_rows, max_rows) = (rows_a.min(rows_b), rows_a.max(rows_b));
+    if min_rows.saturating_mul(SEEK_STAR_DRIVER_FACTOR) >= max_rows {
+        return Ok(None);
+    }
+
+    let total: u128 = if rows_a <= rows_b {
+        // Drive from A (smaller): iterate (s, count_A) and probe B for existence.
+        let Some(mut a_groups) = subject_groups(ec, pred_a)? else {
+            return Ok(None);
+        };
+        let mut b_seek = PsotSubjectSeek::new(ec.store, ec.g_id, p_b);
+        let mut acc: u128 = 0;
+        while let Some((s, count_a)) = a_groups.next_group()? {
+            let present = b_seek.subject_present(s)?;
+            // EXISTS keeps present subjects; MINUS keeps absent ones.
+            if present != is_anti {
+                acc = acc.saturating_add(count_a as u128);
+            }
+        }
+        acc
+    } else {
+        // Drive from B (smaller): iterate B's distinct subjects, seek A's count.
+        // `matched` = Σ_{s ∈ A ∩ B} count_A(s) (absent-in-A subjects seek to None).
+        let Some(mut b_groups) = subject_groups(ec, pred_b)? else {
+            return Ok(None);
+        };
+        let mut a_seek = PsotSubjectSeek::new(ec.store, ec.g_id, p_a);
+        let mut matched: u128 = 0;
+        while let Some((s, _)) = b_groups.next_group()? {
+            if let Some(count_a) = a_seek.count_for_subject(s)? {
+                matched = matched.saturating_add(count_a as u128);
+            }
+        }
+        if is_anti {
+            (rows_a as u128).saturating_sub(matched)
+        } else {
+            matched
+        }
+    };
+
+    Ok(Some(total.min(u64::MAX as u128) as u64))
 }
 
 /// Check if `key` is in the sorted exclusion list, advancing the index pointer.
@@ -642,12 +770,1214 @@ fn intersect_sorted_pair(a: &[u64], b: &[u64]) -> Vec<u64> {
 /// amortized per-subject filtering (matching `fast_minus_count_all::count_property_join_all`).
 ///
 /// Formula: `Σ_{s in all, not excluded, included} Π_i count_i(s)`
+/// Driver/probe cost heuristic for the asymmetric seek strategy: a rough
+/// rows-per-leaflet proxy. The seek strategy is chosen only when the smallest
+/// child's row count times this factor is still below the largest child's row
+/// count — i.e. the driver is small enough that probing it into the large side
+/// (≈ one leaf-leapfrog pass) is cheaper than decoding the large side in full.
+/// A wrong choice only affects speed, never the count, so an overestimate keeps
+/// the strategy conservative (no regression vs the symmetric merge).
+const SEEK_STAR_DRIVER_FACTOR: u64 = 8192;
+
+/// Minimum total rows across the star's predicates before the parallel
+/// partitioned merge is worth its thread-spawn overhead. Below this the serial
+/// merge is used. (A wrong choice only affects speed, never the count.)
+const PARALLEL_STAR_MIN_ROWS: u64 = 50_000;
+/// Cap on partitions regardless of core count.
+const PARALLEL_STAR_MAX_PARTITIONS: usize = 16;
+
+/// Cheap pre-gate for the partitioned-merge fast paths: true only when there are
+/// enough cores and rows to make parallelism worthwhile. The overlay-parallel
+/// wrappers call this *before* collecting/resolving novelty ops, so that small or
+/// single-core inputs skip that walk entirely and fall straight through to the
+/// serial cursor-merge (which would otherwise redo the same overlay collection).
+/// `parallel_partition_count` re-checks the identical condition, so the two never
+/// disagree.
+pub(crate) fn parallel_count_gate_open(total_rows: u64) -> bool {
+    let ncpu = std::thread::available_parallelism()
+        .map(std::num::NonZeroUsize::get)
+        .unwrap_or(1);
+    ncpu >= 2 && total_rows >= PARALLEL_STAR_MIN_ROWS
+}
+
+/// N-way merge-join COUNT over the subject range `[lo, hi)` of `p_ids`, using
+/// bounded base-leaflet iterators. Returns `Σ_{s ∈ [lo,hi)} Π_i count_i(s)` —
+/// the partial count for one partition. BASE index only (no overlay).
+fn merge_count_range(
+    store: &BinaryIndexStore,
+    g_id: fluree_db_core::GraphId,
+    p_ids: &[u32],
+    lo: u64,
+    hi: u64,
+) -> Result<u128> {
+    let mut iters: Vec<PsotSubjectCountIter<'_>> = Vec::with_capacity(p_ids.len());
+    for &p_id in p_ids {
+        iters.push(PsotSubjectCountIter::new_bounded(
+            store, g_id, p_id, lo, hi,
+        )?);
+    }
+    let mut curr: Vec<Option<(u64, u64)>> = Vec::with_capacity(iters.len());
+    for it in &mut iters {
+        curr.push(it.next_group()?);
+    }
+    let mut total: u128 = 0;
+    loop {
+        if curr.iter().any(std::option::Option::is_none) {
+            break;
+        }
+        let max_s = curr.iter().filter_map(|c| c.map(|(s, _)| s)).max().unwrap();
+        if curr.iter().all(|c| c.map(|(s, _)| s) == Some(max_s)) {
+            let product: u128 = curr.iter().map(|c| c.unwrap().1 as u128).product();
+            total = total.saturating_add(product);
+            for (i, it) in iters.iter_mut().enumerate() {
+                curr[i] = it.next_group()?;
+            }
+        } else {
+            for (i, it) in iters.iter_mut().enumerate() {
+                if let Some((s_id, _)) = curr[i] {
+                    if s_id < max_s {
+                        curr[i] = it.next_group()?;
+                    }
+                }
+            }
+        }
+    }
+    Ok(total)
+}
+
+/// Per-partition partial for `?s REQ… OPTIONAL { ?s OPT… } …` over `[lo, hi)`:
+/// `Σ_{s ∈ [lo,hi), s in all REQ} req_product(s) × Π_g max(1, Π_i opt_gi(s))`.
+///
+/// `opt_groups` lists each optional group's present predicate ids; an empty group
+/// is `always_one` (multiplier 1 — an absent optional predicate). BASE index only
+/// (no overlay), no exclude/include (the caller gates that).
+fn merge_optional_count_range(
+    store: &BinaryIndexStore,
+    g_id: fluree_db_core::GraphId,
+    req_pids: &[u32],
+    opt_groups: &[Vec<u32>],
+    lo: u64,
+    hi: u64,
+) -> Result<u128> {
+    let mut req_iters: Vec<PsotSubjectCountIter<'_>> = Vec::with_capacity(req_pids.len());
+    for &p in req_pids {
+        req_iters.push(PsotSubjectCountIter::new_bounded(store, g_id, p, lo, hi)?);
+    }
+
+    struct OptG<'a> {
+        always_one: bool,
+        iters: Vec<PsotSubjectCountIter<'a>>,
+        cur: Vec<Option<(u64, u64)>>,
+    }
+    let mut opt: Vec<OptG<'_>> = Vec::with_capacity(opt_groups.len());
+    for grp in opt_groups {
+        if grp.is_empty() {
+            opt.push(OptG {
+                always_one: true,
+                iters: Vec::new(),
+                cur: Vec::new(),
+            });
+            continue;
+        }
+        let mut iters: Vec<PsotSubjectCountIter<'_>> = Vec::with_capacity(grp.len());
+        for &p in grp {
+            iters.push(PsotSubjectCountIter::new_bounded(store, g_id, p, lo, hi)?);
+        }
+        let mut cur: Vec<Option<(u64, u64)>> = Vec::with_capacity(iters.len());
+        for it in &mut iters {
+            cur.push(it.next_group()?);
+        }
+        opt.push(OptG {
+            always_one: false,
+            iters,
+            cur,
+        });
+    }
+
+    let mut req_cur: Vec<Option<(u64, u64)>> = Vec::with_capacity(req_iters.len());
+    for it in &mut req_iters {
+        req_cur.push(it.next_group()?);
+    }
+    let mut total: u128 = 0;
+    loop {
+        if req_cur.iter().any(std::option::Option::is_none) {
+            break;
+        }
+        let max_s = req_cur
+            .iter()
+            .filter_map(|c| c.map(|(s, _)| s))
+            .max()
+            .unwrap();
+        if req_cur.iter().all(|c| c.map(|(s, _)| s) == Some(max_s)) {
+            // Required inner-join product at this subject.
+            let mut product: u128 = req_cur.iter().map(|c| c.unwrap().1 as u128).product();
+            // Multiply each optional group's max(1, Π count) factor (streaming;
+            // cursors lazily catch up to max_s).
+            for g in &mut opt {
+                if g.always_one {
+                    continue;
+                }
+                let mut g_prod: u128 = 1;
+                for i in 0..g.iters.len() {
+                    while let Some((sid2, _)) = g.cur[i] {
+                        if sid2 < max_s {
+                            g.cur[i] = g.iters[i].next_group()?;
+                            continue;
+                        }
+                        break;
+                    }
+                    let c = match g.cur[i] {
+                        Some((sid2, c)) if sid2 == max_s => {
+                            g.cur[i] = g.iters[i].next_group()?;
+                            c
+                        }
+                        _ => 0u64,
+                    };
+                    if c == 0 {
+                        g_prod = 0;
+                        break;
+                    }
+                    g_prod = g_prod.saturating_mul(c as u128);
+                }
+                let mult = if g_prod == 0 { 1u128 } else { g_prod };
+                product = product.saturating_mul(mult);
+            }
+            total = total.saturating_add(product);
+            for (i, it) in req_iters.iter_mut().enumerate() {
+                req_cur[i] = it.next_group()?;
+            }
+        } else {
+            for (i, it) in req_iters.iter_mut().enumerate() {
+                if let Some((s_id, _)) = req_cur[i] {
+                    if s_id < max_s {
+                        req_cur[i] = it.next_group()?;
+                    }
+                }
+            }
+        }
+    }
+    Ok(total)
+}
+
+/// Ascending candidate subject boundaries for partitioning a predicate's scan.
+///
+/// When the predicate has at least `k` leaves, returns each leaf's first subject
+/// straight from the in-memory manifest (no leaf opens) — the huge-predicate case
+/// (e.g. `rdf:type`, thousands of leaves). Otherwise opens the few leaves and
+/// returns each matching leaflet's first subject, giving finer boundaries for a
+/// predicate that fits in one/few leaves but many leaflets. The returned values
+/// are non-decreasing (leaves and leaflets are subject-sorted).
+fn driver_subject_boundaries(
+    store: &BinaryIndexStore,
+    g_id: fluree_db_core::GraphId,
+    p_id: u32,
+    k: usize,
+) -> Result<Vec<u64>> {
+    let leaves = leaf_entries_for_predicate(store, g_id, RunSortOrder::Psot, p_id);
+    if leaves.len() >= k {
+        return Ok(leaves.iter().map(|e| e.first_key.s_id.as_u64()).collect());
+    }
+    use fluree_db_binary_index::format::run_record_v2::read_ordered_key_v2;
+    let mut bounds: Vec<u64> = Vec::new();
+    for leaf in leaves {
+        let handle = store
+            .open_leaf_handle(&leaf.leaf_cid, leaf.sidecar_cid.as_ref(), false)
+            .map_err(|e| QueryError::Internal(format!("leaf open: {e}")))?;
+        for entry in &handle.dir().entries {
+            if entry.row_count == 0 || entry.p_const != Some(p_id) {
+                continue;
+            }
+            let first = read_ordered_key_v2(RunSortOrder::Psot, &entry.first_key);
+            bounds.push(first.s_id.as_u64());
+        }
+    }
+    Ok(bounds)
+}
+
+/// Parallel partitioned variant of the inner-star count merge.
+///
+/// Partitions the subject space into K contiguous ranges at leaf boundaries and
+/// runs the N-way merge per range on its own thread, then sums the partials.
+/// Because partition boundaries are subject VALUES and every subject's rows are
+/// contiguous within a predicate, each subject lands in exactly one partition —
+/// so the partials sum exactly. Parallelizes both leaflet decompression AND the
+/// merge itself, rather than keeping the merge serial. Returns `Ok(None)`
+/// to defer to the serial merge when not applicable (not all `SubjectCountScan`,
+/// a predicate absent, too few rows/leaves, or a single core). BASE index only:
+/// Generic parallel-partitioned count harness.
+///
+/// Partitions the subject space into K contiguous ranges at `driver_p`'s
+/// leaf/leaflet boundaries and runs `reducer(lo, hi)` per range on its own thread,
+/// summing the partials. The reducer computes the per-partition partial count for
+/// whatever per-subject aggregation is being parallelized (inner star, optional,
+/// union, …). Because partition boundaries are subject VALUES and every subject's
+/// rows are contiguous within a predicate, each subject lands in exactly one
+/// partition — the partials sum exactly. Returns `Ok(None)` to defer to the serial
+/// path when there aren't enough rows/leaves/cores to be worth parallelizing.
+/// BASE index only: the caller must ensure no overlay/time-travel.
+pub(crate) fn parallel_partition_count<F>(
+    store: &BinaryIndexStore,
+    g_id: fluree_db_core::GraphId,
+    driver_p: u32,
+    total_rows: u64,
+    reducer: F,
+) -> Result<Option<u64>>
+where
+    F: Fn(u64, u64) -> Result<u128> + Sync,
+{
+    if !parallel_count_gate_open(total_rows) {
+        return Ok(None);
+    }
+    let ncpu = std::thread::available_parallelism()
+        .map(std::num::NonZeroUsize::get)
+        .unwrap_or(1);
+
+    let k = ncpu.min(PARALLEL_STAR_MAX_PARTITIONS);
+    // Candidate ascending subject boundaries from the driver: leaf first-subjects
+    // when there are enough leaves (manifest only, no leaf opens — the huge-
+    // predicate case), else leaflet first-subjects (opens the few driver leaves,
+    // which the reducer scans anyway — the medium single-leaf-many-leaflet case).
+    let candidates = driver_subject_boundaries(store, g_id, driver_p, k)?;
+    if candidates.len() < 2 {
+        return Ok(None);
+    }
+    // Subsample to ~K strictly-increasing boundaries: 0 = b_0 < … < b_K = MAX.
+    let mut bounds: Vec<u64> = vec![0];
+    for j in 1..k {
+        let b = candidates[j * candidates.len() / k];
+        if b > *bounds.last().unwrap() {
+            bounds.push(b);
+        }
+    }
+    bounds.push(u64::MAX);
+    if bounds.len() < 3 {
+        // Fewer than two real partitions — not worth parallelizing.
+        return Ok(None);
+    }
+    let ranges: Vec<(u64, u64)> = bounds.windows(2).map(|w| (w[0], w[1])).collect();
+    tracing::debug!(
+        partitions = ranges.len(),
+        total_rows,
+        "count-plan: parallel partitioned count"
+    );
+
+    // Run partitions on the shared global rayon pool (not a per-query
+    // `thread::scope`), so concurrent queries don't each spawn a fresh fan-out of
+    // worker threads. See `fast_path_common::parallel_map_pooled`.
+    let partials: Vec<Result<u128>> =
+        crate::fast_path_common::parallel_map_pooled(ranges, |(lo, hi)| reducer(lo, hi));
+
+    let mut total: u128 = 0;
+    for partial in partials {
+        total = total.saturating_add(partial?);
+    }
+    Ok(Some(total.min(u64::MAX as u128) as u64))
+}
+
+fn sum_star_join_parallel(children: &[StreamNode], ec: &ExecCtx<'_, '_>) -> Result<Option<u64>> {
+    if children.len() < 2 {
+        return Ok(None);
+    }
+    let mut p_ids: Vec<u32> = Vec::with_capacity(children.len());
+    let mut total_rows: u64 = 0;
+    for child in children {
+        let StreamNode::SubjectCountScan { pred } = child else {
+            return Ok(None);
+        };
+        let sid = normalize_pred_sid(ec.store, pred)?;
+        let Some(p_id) = ec.store.sid_to_p_id(&sid) else {
+            return Ok(None);
+        };
+        p_ids.push(p_id);
+        total_rows =
+            total_rows.saturating_add(count_rows_for_predicate_psot(ec.store, ec.g_id, p_id)?);
+    }
+
+    // Partition driver = the predicate with the most leaves (finest boundaries).
+    let driver_p = *p_ids
+        .iter()
+        .max_by_key(|&&p| {
+            leaf_entries_for_predicate(ec.store, ec.g_id, RunSortOrder::Psot, p).len()
+        })
+        .unwrap();
+
+    parallel_partition_count(ec.store, ec.g_id, driver_p, total_rows, |lo, hi| {
+        merge_count_range(ec.store, ec.g_id, &p_ids, lo, hi)
+    })
+}
+
+/// Overlay/time-travel variant of `merge_count_range` for one subject partition:
+/// the N-way inner-star merge over `[lo, hi)`, but each predicate is read through a
+/// *bounded overlay cursor* (its leaves in `[lo, hi)` plus its novelty ops sliced to
+/// that range) rather than a base-only iterator, so novelty is folded in. A
+/// `max_s ∈ [lo, hi)` guard keeps subjects in boundary leaves (shared with an
+/// adjacent partition) counted by exactly one partition. `ops_per_pred[i]` are the
+/// resolved overlay ops for `p_ids[i]`, collected once by the caller.
+#[allow(clippy::too_many_arguments)]
+fn merge_count_range_overlay(
+    store: &Arc<BinaryIndexStore>,
+    g_id: fluree_db_core::GraphId,
+    p_ids: &[u32],
+    ops_per_pred: &[Vec<fluree_db_binary_index::read::types::OverlayOp>],
+    to_t: i64,
+    epoch: u64,
+    lo: u64,
+    hi: u64,
+) -> Result<u128> {
+    let mut streams: Vec<CursorSubjectCountStream> = Vec::with_capacity(p_ids.len());
+    for (i, &p_id) in p_ids.iter().enumerate() {
+        let sliced = slice_overlay_ops_by_subject(&ops_per_pred[i], lo, hi);
+        let Some(cursor) = build_overlay_cursor_for_subject_range(
+            store,
+            g_id,
+            p_id,
+            cursor_projection_sid_only(),
+            lo,
+            hi,
+            sliced,
+            to_t,
+            epoch,
+        ) else {
+            return Ok(0); // PSOT branch absent => empty intersection
+        };
+        streams.push(CursorSubjectCountStream::new(cursor));
+    }
+
+    let mut curr: Vec<Option<(u64, u64)>> = Vec::with_capacity(streams.len());
+    for s in &mut streams {
+        curr.push(s.next_group()?);
+    }
+    let mut total: u128 = 0;
+    loop {
+        if curr.iter().any(std::option::Option::is_none) {
+            break;
+        }
+        let max_s = curr.iter().filter_map(|c| c.map(|(s, _)| s)).max().unwrap();
+        if curr.iter().all(|c| c.map(|(s, _)| s) == Some(max_s)) {
+            if max_s >= lo && max_s < hi {
+                let product: u128 = curr.iter().map(|c| c.unwrap().1 as u128).product();
+                total = total.saturating_add(product);
+            }
+            for (i, s) in streams.iter_mut().enumerate() {
+                curr[i] = s.next_group()?;
+            }
+        } else {
+            for (i, s) in streams.iter_mut().enumerate() {
+                if let Some((s_id, _)) = curr[i] {
+                    if s_id < max_s {
+                        curr[i] = s.next_group()?;
+                    }
+                }
+            }
+        }
+    }
+    Ok(total)
+}
+
+/// Overlay/time-travel parallel inner-star `COUNT(*)`: like `sum_star_join_parallel`
+/// but folds novelty. Collects each predicate's resolved overlay ops once, then runs
+/// the bounded-overlay N-way merge per subject partition on the shared pool. Returns
+/// `Ok(None)` to defer to the serial cursor merge for any non-plain shape, an absent
+/// predicate (novelty-only or missing — serial/general handles it), an
+/// overlay-translation failure, or too few rows.
+fn sum_star_join_overlay_parallel(
+    children: &[StreamNode],
+    ec: &ExecCtx<'_, '_>,
+) -> Result<Option<u64>> {
+    if children.len() < 2 {
+        return Ok(None);
+    }
+    let mut p_ids: Vec<u32> = Vec::with_capacity(children.len());
+    let mut sids = Vec::with_capacity(children.len());
+    let mut total_rows: u64 = 0;
+    for child in children {
+        let StreamNode::SubjectCountScan { pred } = child else {
+            return Ok(None);
+        };
+        let sid = normalize_pred_sid(ec.store, pred)?;
+        let Some(p_id) = ec.store.sid_to_p_id(&sid) else {
+            return Ok(None); // absent in base => defer (serial bails to general)
+        };
+        total_rows =
+            total_rows.saturating_add(count_rows_for_predicate_psot(ec.store, ec.g_id, p_id)?);
+        p_ids.push(p_id);
+        sids.push(sid);
+    }
+
+    // Pre-gate: if the partitioned merge wouldn't fire anyway (too few rows/cores),
+    // bail before walking novelty — the serial cursor-merge fallback re-collects the
+    // same overlay ops, so doing it here would be pure double work (a regression).
+    if !parallel_count_gate_open(total_rows) {
+        return Ok(None);
+    }
+
+    // Collect + resolve each predicate's overlay ops once (serial; novelty is small).
+    let mut ops_per_pred: Vec<Vec<fluree_db_binary_index::read::types::OverlayOp>> =
+        Vec::with_capacity(sids.len());
+    for sid in &sids {
+        match collect_resolved_overlay_ops(ec.ctx, ec.store, ec.g_id, RunSortOrder::Psot, sid)? {
+            Some(ops) => ops_per_pred.push(ops),
+            None => return Ok(None),
+        }
+    }
+    let to_t = ec.ctx.to_t;
+    let epoch = ec.ctx.overlay.as_ref().map(|o| o.epoch()).unwrap_or(0);
+
+    let driver_p = *p_ids
+        .iter()
+        .max_by_key(|&&p| {
+            leaf_entries_for_predicate(ec.store, ec.g_id, RunSortOrder::Psot, p).len()
+        })
+        .unwrap();
+
+    let store = ec.store;
+    let g_id = ec.g_id;
+    let p_ids_ref = &p_ids;
+    let ops_ref = &ops_per_pred;
+    parallel_partition_count(store, g_id, driver_p, total_rows, move |lo, hi| {
+        merge_count_range_overlay(store, g_id, p_ids_ref, ops_ref, to_t, epoch, lo, hi)
+    })
+}
+
+/// Parallel partitioned variant of `sum_optional_join` for the all-present-
+/// predicate shape (single/star required + optional groups of `SubjectCountScan`s).
+/// Partitions by the required side and runs the optional merge per range. Returns
+/// `Ok(None)` to defer to the serial merge for any other shape, an absent required
+/// predicate, or too few rows. BASE index only: caller ensures `!ec.overlay` and no
+/// exclude/include.
+fn sum_optional_join_parallel(
+    required: &StreamNode,
+    optional_groups: &[Vec<StreamNode>],
+    ec: &ExecCtx<'_, '_>,
+) -> Result<Option<u64>> {
+    let req_preds: &[StreamNode] = match required {
+        StreamNode::SubjectCountScan { .. } => std::slice::from_ref(required),
+        StreamNode::StarJoin { children } => children,
+        _ => return Ok(None),
+    };
+    let mut req_pids: Vec<u32> = Vec::with_capacity(req_preds.len());
+    let mut total_rows: u64 = 0;
+    for node in req_preds {
+        let StreamNode::SubjectCountScan { pred } = node else {
+            return Ok(None);
+        };
+        let sid = normalize_pred_sid(ec.store, pred)?;
+        // Absent required predicate => empty inner join; let the serial path
+        // produce the (correct) 0.
+        let Some(p_id) = ec.store.sid_to_p_id(&sid) else {
+            return Ok(None);
+        };
+        req_pids.push(p_id);
+        total_rows =
+            total_rows.saturating_add(count_rows_for_predicate_psot(ec.store, ec.g_id, p_id)?);
+    }
+
+    // Resolve optional groups; an absent optional predicate makes its group
+    // `always_one` (multiplier 1), represented as an empty id list.
+    let mut opt_groups: Vec<Vec<u32>> = Vec::with_capacity(optional_groups.len());
+    for grp in optional_groups {
+        let mut pids: Vec<u32> = Vec::with_capacity(grp.len());
+        let mut absent = false;
+        for node in grp {
+            let StreamNode::SubjectCountScan { pred } = node else {
+                return Ok(None);
+            };
+            let sid = normalize_pred_sid(ec.store, pred)?;
+            match ec.store.sid_to_p_id(&sid) {
+                Some(p_id) => {
+                    pids.push(p_id);
+                    total_rows = total_rows
+                        .saturating_add(count_rows_for_predicate_psot(ec.store, ec.g_id, p_id)?);
+                }
+                None => {
+                    absent = true;
+                    break;
+                }
+            }
+        }
+        opt_groups.push(if absent { Vec::new() } else { pids });
+    }
+
+    // Drive partitioning from the required predicate with the most leaves.
+    let driver_p = *req_pids
+        .iter()
+        .max_by_key(|&&p| {
+            leaf_entries_for_predicate(ec.store, ec.g_id, RunSortOrder::Psot, p).len()
+        })
+        .unwrap();
+
+    parallel_partition_count(ec.store, ec.g_id, driver_p, total_rows, |lo, hi| {
+        merge_optional_count_range(ec.store, ec.g_id, &req_pids, &opt_groups, lo, hi)
+    })
+}
+
+/// Overlay/time-travel variant of `merge_optional_count_range` for one subject
+/// partition: `Σ_{s ∈ [lo,hi), s in all REQ} req_product(s) × Π_g max(1, Π opt)`,
+/// every predicate read through a bounded overlay cursor (its `[lo,hi)` leaves + its
+/// novelty ops sliced to that range). `req_ops`/`opt_ops` mirror `req_pids`/
+/// `opt_groups`. A `max_s ∈ [lo,hi)` guard counts boundary subjects once; unlike the
+/// base path there are no `always_one` groups — the caller bails when any predicate
+/// is absent in base (it could be novelty-only), so all groups are present here.
+#[allow(clippy::too_many_arguments)]
+fn merge_optional_count_range_overlay(
+    store: &Arc<BinaryIndexStore>,
+    g_id: fluree_db_core::GraphId,
+    req_pids: &[u32],
+    req_ops: &[Vec<fluree_db_binary_index::read::types::OverlayOp>],
+    opt_groups: &[Vec<u32>],
+    opt_ops: &[Vec<Vec<fluree_db_binary_index::read::types::OverlayOp>>],
+    to_t: i64,
+    epoch: u64,
+    lo: u64,
+    hi: u64,
+) -> Result<u128> {
+    let build = |p_id: u32, ops: &[fluree_db_binary_index::read::types::OverlayOp]| {
+        let sliced = slice_overlay_ops_by_subject(ops, lo, hi);
+        build_overlay_cursor_for_subject_range(
+            store,
+            g_id,
+            p_id,
+            cursor_projection_sid_only(),
+            lo,
+            hi,
+            sliced,
+            to_t,
+            epoch,
+        )
+        .map(CursorSubjectCountStream::new)
+    };
+
+    let mut req_streams: Vec<CursorSubjectCountStream> = Vec::with_capacity(req_pids.len());
+    for (i, &p) in req_pids.iter().enumerate() {
+        let Some(s) = build(p, &req_ops[i]) else {
+            return Ok(0);
+        };
+        req_streams.push(s);
+    }
+
+    struct OptG {
+        streams: Vec<CursorSubjectCountStream>,
+        cur: Vec<Option<(u64, u64)>>,
+    }
+    let mut opt: Vec<OptG> = Vec::with_capacity(opt_groups.len());
+    for (gi, grp) in opt_groups.iter().enumerate() {
+        let mut streams: Vec<CursorSubjectCountStream> = Vec::with_capacity(grp.len());
+        for (i, &p) in grp.iter().enumerate() {
+            let Some(s) = build(p, &opt_ops[gi][i]) else {
+                return Ok(0);
+            };
+            streams.push(s);
+        }
+        let mut cur: Vec<Option<(u64, u64)>> = Vec::with_capacity(streams.len());
+        for s in &mut streams {
+            cur.push(s.next_group()?);
+        }
+        opt.push(OptG { streams, cur });
+    }
+
+    let mut req_cur: Vec<Option<(u64, u64)>> = Vec::with_capacity(req_streams.len());
+    for s in &mut req_streams {
+        req_cur.push(s.next_group()?);
+    }
+    let mut total: u128 = 0;
+    loop {
+        if req_cur.iter().any(std::option::Option::is_none) {
+            break;
+        }
+        let max_s = req_cur
+            .iter()
+            .filter_map(|c| c.map(|(s, _)| s))
+            .max()
+            .unwrap();
+        if req_cur.iter().all(|c| c.map(|(s, _)| s) == Some(max_s)) {
+            if max_s >= lo && max_s < hi {
+                let mut product: u128 = req_cur.iter().map(|c| c.unwrap().1 as u128).product();
+                for g in &mut opt {
+                    let mut g_prod: u128 = 1;
+                    for i in 0..g.streams.len() {
+                        while let Some((sid2, _)) = g.cur[i] {
+                            if sid2 < max_s {
+                                g.cur[i] = g.streams[i].next_group()?;
+                                continue;
+                            }
+                            break;
+                        }
+                        let c = match g.cur[i] {
+                            Some((sid2, c)) if sid2 == max_s => {
+                                g.cur[i] = g.streams[i].next_group()?;
+                                c
+                            }
+                            _ => 0u64,
+                        };
+                        if c == 0 {
+                            g_prod = 0;
+                            break;
+                        }
+                        g_prod = g_prod.saturating_mul(c as u128);
+                    }
+                    let mult = if g_prod == 0 { 1u128 } else { g_prod };
+                    product = product.saturating_mul(mult);
+                }
+                total = total.saturating_add(product);
+            }
+            for (i, s) in req_streams.iter_mut().enumerate() {
+                req_cur[i] = s.next_group()?;
+            }
+        } else {
+            for (i, s) in req_streams.iter_mut().enumerate() {
+                if let Some((s_id, _)) = req_cur[i] {
+                    if s_id < max_s {
+                        req_cur[i] = s.next_group()?;
+                    }
+                }
+            }
+        }
+    }
+    Ok(total)
+}
+
+/// Overlay/time-travel parallel `OPTIONAL` join COUNT(*): like
+/// `sum_optional_join_parallel` but folds novelty per partition. Bails (defers to
+/// the serial cursor merge) if any required or optional predicate is absent in base
+/// — under overlay it could be novelty-only, which the serial/general path handles.
+fn sum_optional_join_overlay_parallel(
+    required: &StreamNode,
+    optional_groups: &[Vec<StreamNode>],
+    ec: &ExecCtx<'_, '_>,
+) -> Result<Option<u64>> {
+    let req_preds: &[StreamNode] = match required {
+        StreamNode::SubjectCountScan { .. } => std::slice::from_ref(required),
+        StreamNode::StarJoin { children } => children,
+        _ => return Ok(None),
+    };
+    let resolve = |node: &StreamNode| -> Result<Option<(u32, Sid)>> {
+        let StreamNode::SubjectCountScan { pred } = node else {
+            return Ok(None);
+        };
+        let sid = normalize_pred_sid(ec.store, pred)?;
+        Ok(ec.store.sid_to_p_id(&sid).map(|p| (p, sid)))
+    };
+
+    let mut req_pids: Vec<u32> = Vec::with_capacity(req_preds.len());
+    let mut req_sids: Vec<Sid> = Vec::with_capacity(req_preds.len());
+    let mut total_rows: u64 = 0;
+    for node in req_preds {
+        let Some((p_id, sid)) = resolve(node)? else {
+            return Ok(None);
+        };
+        total_rows =
+            total_rows.saturating_add(count_rows_for_predicate_psot(ec.store, ec.g_id, p_id)?);
+        req_pids.push(p_id);
+        req_sids.push(sid);
+    }
+
+    let mut opt_groups: Vec<Vec<u32>> = Vec::with_capacity(optional_groups.len());
+    let mut opt_sids: Vec<Vec<Sid>> = Vec::with_capacity(optional_groups.len());
+    for grp in optional_groups {
+        let mut pids: Vec<u32> = Vec::with_capacity(grp.len());
+        let mut sids: Vec<Sid> = Vec::with_capacity(grp.len());
+        for node in grp {
+            // Absent optional predicate under overlay may be novelty-only — bail.
+            let Some((p_id, sid)) = resolve(node)? else {
+                return Ok(None);
+            };
+            total_rows =
+                total_rows.saturating_add(count_rows_for_predicate_psot(ec.store, ec.g_id, p_id)?);
+            pids.push(p_id);
+            sids.push(sid);
+        }
+        opt_groups.push(pids);
+        opt_sids.push(sids);
+    }
+
+    // Pre-gate before walking novelty: the serial fallback re-collects these ops, so
+    // collecting them here only to fail the parallel gate would be double work.
+    if !parallel_count_gate_open(total_rows) {
+        return Ok(None);
+    }
+
+    let collect =
+        |sid: &Sid| -> Result<Option<Vec<fluree_db_binary_index::read::types::OverlayOp>>> {
+            collect_resolved_overlay_ops(ec.ctx, ec.store, ec.g_id, RunSortOrder::Psot, sid)
+        };
+    let mut req_ops = Vec::with_capacity(req_sids.len());
+    for sid in &req_sids {
+        let Some(ops) = collect(sid)? else {
+            return Ok(None);
+        };
+        req_ops.push(ops);
+    }
+    let mut opt_ops: Vec<Vec<Vec<fluree_db_binary_index::read::types::OverlayOp>>> =
+        Vec::with_capacity(opt_sids.len());
+    for grp in &opt_sids {
+        let mut group_ops = Vec::with_capacity(grp.len());
+        for sid in grp {
+            let Some(ops) = collect(sid)? else {
+                return Ok(None);
+            };
+            group_ops.push(ops);
+        }
+        opt_ops.push(group_ops);
+    }
+
+    let to_t = ec.ctx.to_t;
+    let epoch = ec.ctx.overlay.as_ref().map(|o| o.epoch()).unwrap_or(0);
+    let driver_p = *req_pids
+        .iter()
+        .max_by_key(|&&p| {
+            leaf_entries_for_predicate(ec.store, ec.g_id, RunSortOrder::Psot, p).len()
+        })
+        .unwrap();
+
+    let store = ec.store;
+    let g_id = ec.g_id;
+    let (req_pids, opt_groups, req_ops, opt_ops) = (&req_pids, &opt_groups, &req_ops, &opt_ops);
+    parallel_partition_count(store, g_id, driver_p, total_rows, move |lo, hi| {
+        merge_optional_count_range_overlay(
+            store, g_id, req_pids, req_ops, opt_groups, opt_ops, to_t, epoch, lo, hi,
+        )
+    })
+}
+
+/// Per-partition partial for a MINUS/EXISTS whose inner block is an inner-join of
+/// one or more single-predicate subject sets, over a single-predicate outer:
+/// `?s OUTER ?o {MINUS | FILTER EXISTS} { ?s IN1 ?a . ?s IN2 ?b . … }`.
+///
+/// Streams the outer iterator and every inner predicate's bounded subject iterator
+/// together (all ascending) and, per outer subject, tests membership in the inner
+/// intersection (present in *every* inner predicate). MINUS keeps subjects absent
+/// from the intersection; EXISTS keeps those present:
+///
+/// `Σ_{s ∈ OUTER ∩ [lo,hi)} [keep(s)] · count_OUTER(s)` where
+/// `keep(s) = is_anti ? s ∉ ⋂_i IN_i : s ∈ ⋂_i IN_i`.
+///
+/// O(1) memory — no keyset is materialized; the streaming merge parallelizes the
+/// decompression of the outer *and* every inner predicate across partitions (the
+/// inner keyset build is the dominant cost for a multi-predicate inner). BASE index
+/// only (no overlay), no exclude/include (the caller gates that).
+fn merge_modifier_intersect_range(
+    store: &BinaryIndexStore,
+    g_id: fluree_db_core::GraphId,
+    outer_pid: u32,
+    inner_pids: &[u32],
+    is_anti: bool,
+    lo: u64,
+    hi: u64,
+) -> Result<u128> {
+    let mut outer = PsotSubjectCountIter::new_bounded(store, g_id, outer_pid, lo, hi)?;
+    let mut inner: Vec<PsotSubjectCountIter<'_>> = Vec::with_capacity(inner_pids.len());
+    for &p in inner_pids {
+        inner.push(PsotSubjectCountIter::new_bounded(store, g_id, p, lo, hi)?);
+    }
+    let mut i_cur: Vec<Option<(u64, u64)>> = Vec::with_capacity(inner.len());
+    for it in &mut inner {
+        i_cur.push(it.next_group()?);
+    }
+
+    let mut total: u128 = 0;
+    while let Some((os, ocount)) = outer.next_group()? {
+        // In the inner intersection iff present in every inner predicate. Each
+        // inner cursor advances monotonically to the first subject >= os; since os
+        // is non-decreasing, cursors skipped by an early break catch up lazily.
+        let mut in_inner = true;
+        for (k, it) in inner.iter_mut().enumerate() {
+            while let Some((is_, _)) = i_cur[k] {
+                if is_ < os {
+                    i_cur[k] = it.next_group()?;
+                } else {
+                    break;
+                }
+            }
+            if !matches!(i_cur[k], Some((is_, _)) if is_ == os) {
+                in_inner = false;
+                break;
+            }
+        }
+        let keep = if is_anti { !in_inner } else { in_inner };
+        if keep {
+            total = total.saturating_add(ocount as u128);
+        }
+    }
+    Ok(total)
+}
+
+/// Resolve a MINUS/EXISTS keyset into the `p_id`s of its inner predicates for the
+/// parallel modifier-intersect path. Handles a single-predicate set
+/// (`SubjectSet`/`SubjectsSorted`) and an inner-join intersection of such sets
+/// (`IntersectSorted`). Returns `Ok(None)` to defer to the serial keyset path for
+/// any other shape (e.g. object-chain `SubjectsWithObjectIn`) or if any predicate
+/// is absent — the serial path applies the correct absent-predicate semantics.
+fn resolve_keyset_pids(keyset: &KeySetNode, ec: &ExecCtx<'_, '_>) -> Result<Option<Vec<u32>>> {
+    fn single_pid(node: &KeySetNode, ec: &ExecCtx<'_, '_>) -> Result<Option<u32>> {
+        let pred = match node {
+            KeySetNode::SubjectSet { pred } | KeySetNode::SubjectsSorted { pred } => pred,
+            _ => return Ok(None),
+        };
+        let sid = normalize_pred_sid(ec.store, pred)?;
+        Ok(ec.store.sid_to_p_id(&sid))
+    }
+    match keyset {
+        KeySetNode::SubjectSet { .. } | KeySetNode::SubjectsSorted { .. } => {
+            Ok(single_pid(keyset, ec)?.map(|p| vec![p]))
+        }
+        KeySetNode::IntersectSorted { children } => {
+            let mut pids = Vec::with_capacity(children.len());
+            for child in children {
+                match single_pid(child, ec)? {
+                    Some(p) => pids.push(p),
+                    None => return Ok(None),
+                }
+            }
+            if pids.is_empty() {
+                return Ok(None);
+            }
+            Ok(Some(pids))
+        }
+        _ => Ok(None),
+    }
+}
+
+/// Parallel-partitioned MINUS/EXISTS over a single-predicate outer and an inner
+/// block that is a single predicate or an inner-join of predicates. Partitions the
+/// subject space and runs `merge_modifier_intersect_range` per range, parallelizing
+/// the inner keyset build (the dominant cost for a multi-predicate inner) together
+/// with the outer scan. Returns `Ok(None)` to defer to the serial keyset+scan path
+/// for any other shape, an absent predicate, or too few rows. BASE index only:
+/// caller ensures `!ec.overlay` and no active exclude/include.
+fn try_modifier_intersect_parallel(
+    source: &StreamNode,
+    keyset: &KeySetNode,
+    is_anti: bool,
+    ec: &ExecCtx<'_, '_>,
+) -> Result<Option<u64>> {
+    let StreamNode::SubjectCountScan { pred: outer_pred } = source else {
+        return Ok(None);
+    };
+    let outer_sid = normalize_pred_sid(ec.store, outer_pred)?;
+    // Absent outer => empty outer => 0; let the serial path produce it.
+    let Some(outer_pid) = ec.store.sid_to_p_id(&outer_sid) else {
+        return Ok(None);
+    };
+    let Some(inner_pids) = resolve_keyset_pids(keyset, ec)? else {
+        return Ok(None);
+    };
+
+    let mut total_rows = count_rows_for_predicate_psot(ec.store, ec.g_id, outer_pid)?;
+    for &p in &inner_pids {
+        total_rows =
+            total_rows.saturating_add(count_rows_for_predicate_psot(ec.store, ec.g_id, p)?);
+    }
+
+    // Partition driver = the predicate (outer or inner) with the most leaves.
+    let driver_p = std::iter::once(outer_pid)
+        .chain(inner_pids.iter().copied())
+        .max_by_key(|&p| leaf_entries_for_predicate(ec.store, ec.g_id, RunSortOrder::Psot, p).len())
+        .unwrap();
+
+    parallel_partition_count(ec.store, ec.g_id, driver_p, total_rows, |lo, hi| {
+        merge_modifier_intersect_range(ec.store, ec.g_id, outer_pid, &inner_pids, is_anti, lo, hi)
+    })
+}
+
+/// Like [`resolve_keyset_pids`] but also returns each inner predicate's `Sid`, so the
+/// overlay-parallel path can collect that predicate's novelty ops.
+fn resolve_keyset_pids_sids(
+    keyset: &KeySetNode,
+    ec: &ExecCtx<'_, '_>,
+) -> Result<Option<Vec<(u32, Sid)>>> {
+    fn one(node: &KeySetNode, ec: &ExecCtx<'_, '_>) -> Result<Option<(u32, Sid)>> {
+        let pred = match node {
+            KeySetNode::SubjectSet { pred } | KeySetNode::SubjectsSorted { pred } => pred,
+            _ => return Ok(None),
+        };
+        let sid = normalize_pred_sid(ec.store, pred)?;
+        Ok(ec.store.sid_to_p_id(&sid).map(|p| (p, sid)))
+    }
+    match keyset {
+        KeySetNode::SubjectSet { .. } | KeySetNode::SubjectsSorted { .. } => {
+            Ok(one(keyset, ec)?.map(|x| vec![x]))
+        }
+        KeySetNode::IntersectSorted { children } => {
+            let mut out = Vec::with_capacity(children.len());
+            for child in children {
+                match one(child, ec)? {
+                    Some(x) => out.push(x),
+                    None => return Ok(None),
+                }
+            }
+            if out.is_empty() {
+                return Ok(None);
+            }
+            Ok(Some(out))
+        }
+        _ => Ok(None),
+    }
+}
+
+/// Overlay/time-travel variant of `merge_modifier_intersect_range` for one subject
+/// partition: drives the outer through a bounded overlay cursor and tests each outer
+/// subject for membership in the inner intersection (each inner predicate also a
+/// bounded overlay cursor) — MINUS keeps absent, EXISTS keeps present. Novelty is
+/// folded per predicate; an outer subject outside `[lo, hi)` (boundary leaf) is
+/// skipped so each is counted by exactly one partition.
+#[allow(clippy::too_many_arguments)]
+fn merge_modifier_intersect_range_overlay(
+    store: &Arc<BinaryIndexStore>,
+    g_id: fluree_db_core::GraphId,
+    outer_pid: u32,
+    outer_ops: &[fluree_db_binary_index::read::types::OverlayOp],
+    inner_pids: &[u32],
+    inner_ops: &[Vec<fluree_db_binary_index::read::types::OverlayOp>],
+    is_anti: bool,
+    to_t: i64,
+    epoch: u64,
+    lo: u64,
+    hi: u64,
+) -> Result<u128> {
+    let build = |p_id: u32, ops: &[fluree_db_binary_index::read::types::OverlayOp]| {
+        let sliced = slice_overlay_ops_by_subject(ops, lo, hi);
+        build_overlay_cursor_for_subject_range(
+            store,
+            g_id,
+            p_id,
+            cursor_projection_sid_only(),
+            lo,
+            hi,
+            sliced,
+            to_t,
+            epoch,
+        )
+        .map(CursorSubjectCountStream::new)
+    };
+
+    let Some(mut outer) = build(outer_pid, outer_ops) else {
+        return Ok(0);
+    };
+    let mut inner: Vec<CursorSubjectCountStream> = Vec::with_capacity(inner_pids.len());
+    for (i, &p) in inner_pids.iter().enumerate() {
+        let Some(s) = build(p, &inner_ops[i]) else {
+            return Ok(0);
+        };
+        inner.push(s);
+    }
+    let mut i_cur: Vec<Option<(u64, u64)>> = Vec::with_capacity(inner.len());
+    for s in &mut inner {
+        i_cur.push(s.next_group()?);
+    }
+
+    let mut total: u128 = 0;
+    while let Some((os, ocount)) = outer.next_group()? {
+        if os < lo {
+            continue; // boundary subject below the partition; owned by a lower one
+        }
+        if os >= hi {
+            break; // ascending => the rest are all out of range
+        }
+        let mut in_inner = true;
+        for (k, s) in inner.iter_mut().enumerate() {
+            while let Some((is_, _)) = i_cur[k] {
+                if is_ < os {
+                    i_cur[k] = s.next_group()?;
+                } else {
+                    break;
+                }
+            }
+            if !matches!(i_cur[k], Some((is_, _)) if is_ == os) {
+                in_inner = false;
+                break;
+            }
+        }
+        let keep = if is_anti { !in_inner } else { in_inner };
+        if keep {
+            total = total.saturating_add(ocount as u128);
+        }
+    }
+    Ok(total)
+}
+
+/// Overlay/time-travel parallel MINUS/EXISTS: like `try_modifier_intersect_parallel`
+/// but folds novelty per partition (bounded overlay cursors). Collects the outer and
+/// inner predicates' resolved ops once. Returns `Ok(None)` to defer to the serial
+/// keyset path for a non-plain shape, an absent predicate, a translation failure, or
+/// too few rows.
+fn try_modifier_intersect_overlay_parallel(
+    source: &StreamNode,
+    keyset: &KeySetNode,
+    is_anti: bool,
+    ec: &ExecCtx<'_, '_>,
+) -> Result<Option<u64>> {
+    let StreamNode::SubjectCountScan { pred: outer_pred } = source else {
+        return Ok(None);
+    };
+    let outer_sid = normalize_pred_sid(ec.store, outer_pred)?;
+    let Some(outer_pid) = ec.store.sid_to_p_id(&outer_sid) else {
+        return Ok(None);
+    };
+    let Some(inner) = resolve_keyset_pids_sids(keyset, ec)? else {
+        return Ok(None);
+    };
+    let inner_pids: Vec<u32> = inner.iter().map(|(p, _)| *p).collect();
+
+    let mut total_rows = count_rows_for_predicate_psot(ec.store, ec.g_id, outer_pid)?;
+    for &p in &inner_pids {
+        total_rows =
+            total_rows.saturating_add(count_rows_for_predicate_psot(ec.store, ec.g_id, p)?);
+    }
+
+    // Pre-gate before walking novelty: the serial keyset fallback re-collects these
+    // ops, so collecting them here only to fail the parallel gate is double work.
+    if !parallel_count_gate_open(total_rows) {
+        return Ok(None);
+    }
+
+    let Some(outer_ops) =
+        collect_resolved_overlay_ops(ec.ctx, ec.store, ec.g_id, RunSortOrder::Psot, &outer_sid)?
+    else {
+        return Ok(None);
+    };
+    let mut inner_ops: Vec<Vec<fluree_db_binary_index::read::types::OverlayOp>> =
+        Vec::with_capacity(inner.len());
+    for (_, sid) in &inner {
+        let Some(ops) =
+            collect_resolved_overlay_ops(ec.ctx, ec.store, ec.g_id, RunSortOrder::Psot, sid)?
+        else {
+            return Ok(None);
+        };
+        inner_ops.push(ops);
+    }
+
+    let to_t = ec.ctx.to_t;
+    let epoch = ec.ctx.overlay.as_ref().map(|o| o.epoch()).unwrap_or(0);
+    let driver_p = std::iter::once(outer_pid)
+        .chain(inner_pids.iter().copied())
+        .max_by_key(|&p| leaf_entries_for_predicate(ec.store, ec.g_id, RunSortOrder::Psot, p).len())
+        .unwrap();
+
+    let store = ec.store;
+    let g_id = ec.g_id;
+    let (inner_pids, inner_ops, outer_ops) = (&inner_pids, &inner_ops, &outer_ops);
+    parallel_partition_count(store, g_id, driver_p, total_rows, move |lo, hi| {
+        merge_modifier_intersect_range_overlay(
+            store, g_id, outer_pid, outer_ops, inner_pids, inner_ops, is_anti, to_t, epoch, lo, hi,
+        )
+    })
+}
+
+/// Metadata-only fold for the rdf:type inner-star count:
+///
+/// `COUNT(*)` of `?s rdf:type ?o1 . ?s P ?o2` = `Σ_C Σ_dt classStat[C][P].count`.
+///
+/// The per-`(class, property)` flake count attributes each `P`-flake on a
+/// `k`-typed subject once per class, so summing over all classes yields
+/// `Σ_{s typed} count_rdftype(s)·count_P(s)` — exactly the join's product-sum.
+/// Reads the per-graph class stats straight from the snapshot (no index scan).
+///
+/// The per-(class,property) DATATYPE counts this fold sums are current-state-exact
+/// on BOTH the bulk-import and incremental paths: the incremental class-stat merge
+/// applies retraction and re-type deltas via base-vs-net attribution plus a
+/// base-index re-scan of re-typed subjects (issue #1266). So the fold runs for any
+/// index, not just bulk imports — there is no longer a `lex_sorted_string_ids`
+/// gate here. (Ref-class edge counts are not consumed by this fold.)
+///
+/// Returns `Ok(None)` to defer to the merge when: the shape isn't exactly one
+/// rdf:type leg plus one non-type leg, the graph class stats are absent, or the
+/// fold is 0 (a genuinely-empty join — the merge handles it).
+fn try_type_star_pred_fold(children: &[StreamNode], ec: &ExecCtx<'_, '_>) -> Result<Option<u64>> {
+    if children.len() != 2 {
+        return Ok(None);
+    }
+    let mut sids = Vec::with_capacity(2);
+    for child in children {
+        let StreamNode::SubjectCountScan { pred } = child else {
+            return Ok(None);
+        };
+        sids.push(normalize_pred_sid(ec.store, pred)?);
+    }
+    // Exactly one rdf:type leg; the other is the value predicate P.
+    let value_sid = match (
+        fluree_db_core::is_rdf_type(&sids[0]),
+        fluree_db_core::is_rdf_type(&sids[1]),
+    ) {
+        (true, false) => &sids[1],
+        (false, true) => &sids[0],
+        _ => return Ok(None),
+    };
+
+    let Some(stats) = ec.ctx.active_snapshot.stats.as_ref() else {
+        return Ok(None);
+    };
+    let Some(graphs) = stats.graphs.as_ref() else {
+        return Ok(None);
+    };
+    let Some(graph) = graphs.iter().find(|g| g.g_id == ec.g_id) else {
+        return Ok(None);
+    };
+    let Some(classes) = graph.classes.as_ref() else {
+        return Ok(None);
+    };
+
+    let mut total: u128 = 0;
+    for class in classes {
+        if let Some(prop) = class
+            .properties
+            .iter()
+            .find(|p| &p.property_sid == value_sid)
+        {
+            for &(_dt, count) in &prop.datatypes {
+                total = total.saturating_add(count as u128);
+            }
+        }
+    }
+    if total == 0 {
+        // Genuinely-empty join: let the merge confirm it.
+        return Ok(None);
+    }
+    Ok(Some(total.min(u64::MAX as u128) as u64))
+}
+
 fn sum_star_join(
     children: &[StreamNode],
     ec: &ExecCtx<'_, '_>,
     exclude_sorted: Option<&[u64]>,
     include_sorted: Option<&[u64]>,
 ) -> Result<Option<u64>> {
+    // rdf:type inner-star (?s rdf:type ?o1 . ?s P ?o2) COUNT(*): answer from the
+    // per-(class,property) datatype counts in the index stats — zero scan, instant.
+    // The counts are current-state-exact on both bulk-import and incremental
+    // indexes (issue #1266), so this runs for any base-index read; overlay reads
+    // still defer to the merge below.
+    if !ec.overlay && exclude_sorted.is_none() && include_sorted.is_none() {
+        if let Some(total) = try_type_star_pred_fold(children, ec)? {
+            return Ok(Some(total));
+        }
+    }
+
+    // Asymmetric (leapfrog) strategy: when one predicate is much smaller than the
+    // others, drive from it and SEEK per-subject into the large side instead of a
+    // full symmetric scan of every predicate. BASE index only, so HEAD-gated;
+    // under overlay the cursor-merge path below stays correct.
+    if !ec.overlay {
+        if let Some(total) = try_sum_star_join_seek(children, ec, exclude_sorted, include_sorted)? {
+            return Ok(Some(total));
+        }
+        // Both-large plain star (no modifiers): partition the subject space and
+        // run the merge across cores. Parallelizes decompression + merge.
+        if exclude_sorted.is_none() && include_sorted.is_none() {
+            if let Some(total) = sum_star_join_parallel(children, ec)? {
+                return Ok(Some(total));
+            }
+        }
+    }
+
+    // Overlay/time-travel plain star: parallelize the base scan and fold novelty
+    // per partition (bounded overlay cursors). Falls through to the serial cursor
+    // merge below for small inputs, absent predicates, or translation failures.
+    if ec.overlay && exclude_sorted.is_none() && include_sorted.is_none() {
+        if let Some(total) = sum_star_join_overlay_parallel(children, ec)? {
+            return Ok(Some(total));
+        }
+    }
+
     // All children must be SubjectCountScan for the streaming N-way merge.
     let mut iters: Vec<SubjectGroups<'_>> = Vec::with_capacity(children.len());
     for child in children {
@@ -704,6 +2034,189 @@ fn sum_star_join(
     Ok(Some(total.min(u64::MAX as u128) as u64))
 }
 
+/// Asymmetric (leapfrog) seek strategy for an inner subject-star count join.
+///
+/// Returns `Ok(None)` to defer to the symmetric merge when: fewer than two
+/// children, a child is not a plain `SubjectCountScan`, a predicate is absent, or
+/// the driver is not small enough to beat a full scan. Otherwise computes
+/// `Σ_s driver_count(s) × Π_probe count_probe(s)` over the (ascending) driver
+/// subjects that pass the exclude/include filters and exist in every probe —
+/// driving from the smallest predicate and seeking into the others.
+///
+/// BASE index only: the caller must ensure `!ec.overlay`.
+fn try_sum_star_join_seek(
+    children: &[StreamNode],
+    ec: &ExecCtx<'_, '_>,
+    exclude_sorted: Option<&[u64]>,
+    include_sorted: Option<&[u64]>,
+) -> Result<Option<u64>> {
+    if children.len() < 2 {
+        return Ok(None);
+    }
+
+    // Resolve each child to (p_id, row_count). Bail to the merge if any child is
+    // not a plain SubjectCountScan or its predicate is absent — the merge path
+    // already handles those cases correctly.
+    let mut child_pids: Vec<u32> = Vec::with_capacity(children.len());
+    let mut child_rows: Vec<u64> = Vec::with_capacity(children.len());
+    for child in children {
+        let StreamNode::SubjectCountScan { pred } = child else {
+            return Ok(None);
+        };
+        let sid = normalize_pred_sid(ec.store, pred)?;
+        let Some(p_id) = ec.store.sid_to_p_id(&sid) else {
+            return Ok(None);
+        };
+        child_pids.push(p_id);
+        child_rows.push(count_rows_for_predicate_psot(ec.store, ec.g_id, p_id)?);
+    }
+
+    // Driver = smallest by row count; probes = the rest.
+    let driver_idx = child_rows
+        .iter()
+        .enumerate()
+        .min_by_key(|(_, r)| **r)
+        .map(|(i, _)| i)
+        .expect("children non-empty");
+    let driver_rows = child_rows[driver_idx];
+    let max_probe_rows = child_rows
+        .iter()
+        .enumerate()
+        .filter(|(i, _)| *i != driver_idx)
+        .map(|(_, r)| *r)
+        .max()
+        .unwrap_or(0);
+
+    // Only seek when the driver is much smaller than the largest probe; otherwise
+    // a full symmetric scan is competitive (or cheaper) — defer to the merge.
+    if driver_rows.saturating_mul(SEEK_STAR_DRIVER_FACTOR) >= max_probe_rows {
+        return Ok(None);
+    }
+    if driver_rows == 0 {
+        // Empty driver => empty inner join.
+        return Ok(Some(0));
+    }
+
+    // Driver subject→count groups (ascending; Meta lane since `!ec.overlay`), and
+    // one forward-only seek cursor per probe predicate.
+    let StreamNode::SubjectCountScan { pred: driver_pred } = &children[driver_idx] else {
+        return Ok(None);
+    };
+    let Some(mut driver) = subject_groups(ec, driver_pred)? else {
+        return Ok(None);
+    };
+    let mut probes: Vec<PsotSubjectSeek<'_>> = child_pids
+        .iter()
+        .enumerate()
+        .filter(|(i, _)| *i != driver_idx)
+        .map(|(_, &p_id)| PsotSubjectSeek::new(ec.store, ec.g_id, p_id))
+        .collect();
+
+    let mut excl_idx: usize = 0;
+    let mut incl_idx: usize = 0;
+    let mut total: u128 = 0;
+
+    while let Some((s, driver_count)) = driver.next_group()? {
+        if is_excluded(s, exclude_sorted, &mut excl_idx)
+            || !is_included(s, include_sorted, &mut incl_idx)
+        {
+            continue;
+        }
+        let mut product: u128 = driver_count as u128;
+        for probe in &mut probes {
+            match probe.count_for_subject(s)? {
+                Some(c) => product = product.saturating_mul(c as u128),
+                None => {
+                    // Subject absent from this probe => not in the inner join.
+                    product = 0;
+                    break;
+                }
+            }
+        }
+        total = total.saturating_add(product);
+    }
+
+    Ok(Some(total.min(u64::MAX as u128) as u64))
+}
+
+/// Asymmetric seek strategy for `?s A ?o1 OPTIONAL { ?s B ?o2 }` COUNT(*):
+///
+/// `Σ_s count_A(s) × max(1, count_B(s))` = `total(A) + Σ_{s ∈ A ∩ B} count_A(s)·(count_B(s) − 1)`.
+///
+/// Drives from the smaller of required-A / optional-B and seeks the other. When B
+/// is the smaller side, `total(A)` is a directory sum and only the (few) B subjects
+/// seek into A — avoiding a full scan of the large required side. Returns `Ok(None)`
+/// to defer to the streaming merge for any other shape (multi-predicate required,
+/// multiple/multi-triple optional groups) or when the sides are not skewed enough.
+/// BASE index only: caller ensures `!ec.overlay` and no active exclude/include.
+fn try_optional_seek(
+    required: &StreamNode,
+    optional_groups: &[Vec<StreamNode>],
+    ec: &ExecCtx<'_, '_>,
+) -> Result<Option<u64>> {
+    let StreamNode::SubjectCountScan { pred: pred_a } = required else {
+        return Ok(None);
+    };
+    if optional_groups.len() != 1 || optional_groups[0].len() != 1 {
+        return Ok(None);
+    }
+    let StreamNode::SubjectCountScan { pred: pred_b } = &optional_groups[0][0] else {
+        return Ok(None);
+    };
+
+    let sid_a = normalize_pred_sid(ec.store, pred_a)?;
+    let Some(p_a) = ec.store.sid_to_p_id(&sid_a) else {
+        // Required absent => no rows.
+        return Ok(Some(0));
+    };
+    let rows_a = count_rows_for_predicate_psot(ec.store, ec.g_id, p_a)?;
+    let sid_b = normalize_pred_sid(ec.store, pred_b)?;
+    let Some(p_b) = ec.store.sid_to_p_id(&sid_b) else {
+        // Optional absent => every required row contributes factor 1 => total(A).
+        return Ok(Some(rows_a));
+    };
+    let rows_b = count_rows_for_predicate_psot(ec.store, ec.g_id, p_b)?;
+
+    let (min_rows, max_rows) = (rows_a.min(rows_b), rows_a.max(rows_b));
+    if min_rows.saturating_mul(SEEK_STAR_DRIVER_FACTOR) >= max_rows {
+        return Ok(None);
+    }
+
+    let total: u128 = if rows_a <= rows_b {
+        // Drive required A (smaller): Σ count_A(s) × max(1, count_B(s)).
+        let Some(mut a_groups) = subject_groups(ec, pred_a)? else {
+            return Ok(None);
+        };
+        let mut b_seek = PsotSubjectSeek::new(ec.store, ec.g_id, p_b);
+        let mut acc: u128 = 0;
+        while let Some((s, count_a)) = a_groups.next_group()? {
+            let mult = b_seek.count_for_subject(s)?.unwrap_or(0).max(1);
+            acc = acc.saturating_add((count_a as u128).saturating_mul(mult as u128));
+        }
+        acc
+    } else {
+        // Drive optional B (smaller): total(A) + Σ_{s ∈ B} count_A(s)·(count_B(s) − 1).
+        let Some(mut b_groups) = subject_groups(ec, pred_b)? else {
+            return Ok(None);
+        };
+        let mut a_seek = PsotSubjectSeek::new(ec.store, ec.g_id, p_a);
+        let mut bonus: u128 = 0;
+        while let Some((s, count_b)) = b_groups.next_group()? {
+            // count_B == 1 yields no bonus; skip the seek (targets stay ascending).
+            if count_b <= 1 {
+                continue;
+            }
+            if let Some(count_a) = a_seek.count_for_subject(s)? {
+                bonus =
+                    bonus.saturating_add((count_a as u128).saturating_mul((count_b - 1) as u128));
+            }
+        }
+        (rows_a as u128).saturating_add(bonus)
+    };
+
+    Ok(Some(total.min(u64::MAX as u128) as u64))
+}
+
 /// Fully streaming merge-join with OPTIONAL semantics.
 ///
 /// Interleaves optional group cursor advancement with the required N-way merge,
@@ -718,6 +2231,29 @@ fn sum_optional_join(
     exclude_sorted: Option<&[u64]>,
     include_sorted: Option<&[u64]>,
 ) -> Result<Option<u64>> {
+    // Asymmetric seek (HEAD, outermost modifier only): for the single-required +
+    // single-optional-predicate shape, drive from the smaller side and seek the
+    // other instead of scanning both in full.
+    if !ec.overlay && exclude_sorted.is_none() && include_sorted.is_none() {
+        if let Some(n) = try_optional_seek(required, optional_groups, ec)? {
+            return Ok(Some(n));
+        }
+        // Both-large optional (no modifiers): partition the subject space and run
+        // the optional merge across cores.
+        if let Some(n) = sum_optional_join_parallel(required, optional_groups, ec)? {
+            return Ok(Some(n));
+        }
+    }
+
+    // Overlay/time-travel optional: parallelize the base scan and fold novelty per
+    // partition (bounded overlay cursors). Falls through to the serial cursor merge
+    // for small inputs, absent predicates, or translation failures.
+    if ec.overlay && exclude_sorted.is_none() && include_sorted.is_none() {
+        if let Some(n) = sum_optional_join_overlay_parallel(required, optional_groups, ec)? {
+            return Ok(Some(n));
+        }
+    }
+
     // Collect required iterators (single scan or star join children). An absent
     // required predicate yields an `Empty` stream (no overlay) → no subjects →
     // total 0; absent under overlay bails (`None`).

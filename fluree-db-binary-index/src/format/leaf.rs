@@ -212,6 +212,21 @@ impl LeafWriter {
         self.sidecar_builder.push_entry(entry);
     }
 
+    /// Drain the leaves completed so far, transferring ownership to the caller
+    /// while preserving the internal buffer's allocation (so repeated draining
+    /// does not reallocate).
+    ///
+    /// A leaf is "completed" the moment `flush_leaf()` runs — i.e. when the
+    /// leaf-level row threshold is crossed during `push_record`. Callers that
+    /// want to bound memory (e.g. the indexer's `PersistingLeafWriter`) drain
+    /// after every `push_record` and stream each completed leaf's blob to disk,
+    /// instead of retaining every compressed leaf for the whole order. The
+    /// trailing leaf is only flushed by `finish()`, so a final drain of its
+    /// return value is still required.
+    pub fn drain_completed_leaves(&mut self) -> std::vec::Drain<'_, LeafInfo> {
+        self.completed_leaves.drain(..)
+    }
+
     /// Consume the writer, flushing any remaining data, and return all
     /// produced leaves.
     pub fn finish(mut self) -> io::Result<Vec<LeafInfo>> {

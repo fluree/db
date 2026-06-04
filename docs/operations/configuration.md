@@ -515,14 +515,20 @@ fluree-server \
 
 If no admin-specific issuers are configured, falls back to `--events-auth-trusted-issuer`.
 
-### MCP Endpoint Authentication
+### MCP Endpoint
 
-Protect the `/mcp` Model Context Protocol endpoint:
+Protect and tune the `/mcp` Model Context Protocol endpoint:
 
-| Flag                        | Env Var                           | Default |
-| --------------------------- | --------------------------------- | ------- |
-| `--mcp-enabled`             | `FLUREE_MCP_ENABLED`              | `false` |
-| `--mcp-auth-trusted-issuer` | `FLUREE_MCP_AUTH_TRUSTED_ISSUERS` | None    |
+| Flag                         | Env Var                           | Default |
+| ---------------------------- | --------------------------------- | ------- |
+| `--mcp-enabled`              | `FLUREE_MCP_ENABLED`              | `false` |
+| `--mcp-auth-trusted-issuer`  | `FLUREE_MCP_AUTH_TRUSTED_ISSUERS` | None    |
+| `--mcp-agent-json-max-bytes` | `FLUREE_MCP_AGENT_JSON_MAX_BYTES` | `32768` |
+
+`--mcp-agent-json-max-bytes` (config file: `[server.mcp] agent_json_max_bytes`) is the byte
+budget for the MCP `sparql_query` tool's Agent JSON result. Results larger than this are
+truncated and the envelope sets `hasMore: true`; an agent paginates by re-running with the
+returned `t`, an `ORDER BY`, and `OFFSET` advanced by the returned `rowCount`.
 
 ```bash
 fluree-server \
@@ -764,6 +770,7 @@ fluree server run \
 | `FLUREE_ADMIN_AUTH_TRUSTED_ISSUERS`     | Admin trusted issuers                           | None                                                                    |
 | `FLUREE_MCP_ENABLED`                    | Enable MCP endpoint                             | `false`                                                                 |
 | `FLUREE_MCP_AUTH_TRUSTED_ISSUERS`       | MCP trusted issuers                             | None                                                                    |
+| `FLUREE_MCP_AGENT_JSON_MAX_BYTES`       | MCP `sparql_query` Agent JSON byte budget       | `32768`                                                                 |
 | `FLUREE_STORAGE_ACCESS_MODE`            | Peer storage mode                               | `shared`                                                                |
 | `FLUREE_STORAGE_PROXY_ENABLED`          | Enable storage proxy                            | `false`                                                                 |
 

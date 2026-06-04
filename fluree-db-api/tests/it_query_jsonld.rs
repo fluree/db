@@ -1882,6 +1882,77 @@ async fn jsonld_bind_arithmetic_in_select() {
     );
 }
 
+/// JSON-LD parity for SPARQL `sparql_integer_division_yields_decimal`.
+/// Per XPath op:numeric-divide, xsd:integer / xsd:integer yields xsd:decimal
+/// (10 / 4 = 2.5), not a truncated integer.
+#[tokio::test]
+async fn jsonld_integer_division_yields_decimal() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger0 = genesis_ledger(&fluree, "parity/int-div:main");
+    let ctx = context_ex_schema();
+
+    let insert = json!({
+        "@context": ctx,
+        "@graph": [{"@id": "ex:s1", "ex:p": 1}]
+    });
+    let ledger = fluree
+        .insert(ledger0, &insert)
+        .await
+        .expect("insert")
+        .ledger;
+
+    let query = json!({
+        "@context": ctx,
+        "select": "?r",
+        "where": [
+            {"@id": "?s", "ex:p": "?o"},
+            ["bind", "?r", ["expr", ["/", 10, 4]]]
+        ]
+    });
+
+    let result = support::query_jsonld(&fluree, &ledger, &query)
+        .await
+        .expect("query");
+    let json_rows = result.to_jsonld(&ledger.snapshot).expect("jsonld");
+    // xsd:decimal renders as a string to preserve exactness; value is 2.5, not 2.
+    assert_eq!(normalize_rows(&json_rows), normalize_rows(&json!(["2.5"])));
+}
+
+/// JSON-LD parity for SPARQL `sparql_float_divided_by_integer_promotes`.
+/// Mixed numeric arithmetic xsd:float(...) / xsd:integer must promote (not error).
+#[tokio::test]
+async fn jsonld_float_divided_by_integer_promotes() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger0 = genesis_ledger(&fluree, "parity/float-div-int:main");
+    let ctx = context_ex_schema();
+
+    let insert = json!({
+        "@context": ctx,
+        "@graph": [{"@id": "ex:s1", "ex:p": 1}]
+    });
+    let ledger = fluree
+        .insert(ledger0, &insert)
+        .await
+        .expect("insert")
+        .ledger;
+
+    let query = json!({
+        "@context": ctx,
+        "select": "?r",
+        "where": [
+            {"@id": "?s", "ex:p": "?o"},
+            ["bind", "?r", ["expr", ["/", ["xsd:float", 10], 4]]]
+        ]
+    });
+
+    let result = support::query_jsonld(&fluree, &ledger, &query)
+        .await
+        .expect("query");
+    let json_rows = result.to_jsonld(&ledger.snapshot).expect("jsonld");
+    // xsd:double renders as a JSON number: 10.0 / 4 = 2.5.
+    assert_eq!(normalize_rows(&json_rows), normalize_rows(&json!([2.5])));
+}
+
 /// Parity for W3C bind02: chained BINDs.
 /// SPARQL: SELECT ?o ?z ?z2 WHERE { ?s ex:p ?o . BIND(?o+10 AS ?z) BIND(?o+100 AS ?z2) }
 #[tokio::test]

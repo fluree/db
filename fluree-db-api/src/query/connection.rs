@@ -123,6 +123,68 @@ impl Fluree {
         self.query_dataset(&dataset, query_json).await
     }
 
+    /// Execute a JSON-LD connection query and, for the multi-ledger case,
+    /// return the `DataSetDb` alongside the result so the caller can format
+    /// hydration output against each ledger's own view (issue #1259).
+    ///
+    /// Mirrors the policy/r2rml combinations of [`Self::query_connection`],
+    /// [`Self::query_connection_with_policy`],
+    /// [`Self::query_connection_jsonld_with_r2rml`], and
+    /// [`Self::query_connection_with_policy_and_r2rml`] in one place. Returns
+    /// `None` for the single-ledger fast path (formatting is correct against
+    /// the sole view) and `Some(dataset)` for genuine multi-ledger queries.
+    pub(crate) async fn query_connection_jsonld_returning_dataset(
+        &self,
+        query_json: &JsonValue,
+        policy: Option<&PolicyContext>,
+        r2rml: Option<(&dyn R2rmlProvider, &dyn R2rmlTableProvider)>,
+    ) -> Result<(QueryResult, Option<DataSetDb>)> {
+        let (spec, qc_opts) = parse_dataset_spec(query_json)?;
+
+        if spec.is_empty() {
+            return Err(ApiError::query(
+                "Missing ledger specification in connection query",
+            ));
+        }
+
+        // Single-ledger fast path — no dataset needed for formatting.
+        let single = match policy {
+            Some(p) => {
+                self.prepare_single_view_for_connection_with_policy(&spec, p)
+                    .await?
+            }
+            None => {
+                self.prepare_single_view_for_connection(&spec, &qc_opts)
+                    .await?
+            }
+        };
+        if let Some(view) = single {
+            let result = match r2rml {
+                Some((rp, rtp)) => {
+                    self.query_view_with_r2rml(&view, query_json, rp, rtp)
+                        .await?
+                }
+                None => self.query(&view, query_json).await?,
+            };
+            return Ok((result, None));
+        }
+
+        // Multi-ledger: build the DataSetDb (with per-view policy) and keep it
+        // alive so the formatter can route hydration per ledger.
+        let dataset = match policy {
+            Some(p) => apply_policy_to_dataset(self.build_dataset_view(&spec).await?, p),
+            None => self.build_dataset_for_connection(&spec, &qc_opts).await?,
+        };
+        let result = match r2rml {
+            Some((rp, rtp)) => {
+                self.query_dataset_with_r2rml(&dataset, query_json, rp, rtp)
+                    .await?
+            }
+            None => self.query_dataset(&dataset, query_json).await?,
+        };
+        Ok((result, Some(dataset)))
+    }
+
     /// Execute a JSON-LD connection query with explicit R2RML providers.
     ///
     /// Uses graph source fallback for alias resolution: if a source in the

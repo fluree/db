@@ -238,6 +238,36 @@ impl ForwardPackReader {
         self.packs.len()
     }
 
+    /// Pre-warm forward-dict pack pages into the OS page cache, up to
+    /// `budget_bytes` total across this reader's packs. Returns the number of
+    /// bytes touched.
+    ///
+    /// Locally-mmapped packs fault their pages in lazily (on first query); this
+    /// touches one byte per page so the first dictionary lookups after startup
+    /// don't pay that cold-fault I/O. Lazy (remote, not-yet-fetched) packs are
+    /// fetched + cached + mmapped first. A pack larger than the remaining budget
+    /// is partially warmed; warming stops once the budget is exhausted.
+    ///
+    /// This blocks on page faults / sequential reads — call it from a blocking
+    /// context (e.g. `tokio::task::spawn_blocking`), never on the hot async path.
+    /// Warming is best-effort: a pack that fails to load is skipped, never fatal.
+    pub fn prewarm(&self, budget_bytes: u64) -> u64 {
+        let mut warmed: u64 = 0;
+        for pack in &self.packs {
+            if warmed >= budget_bytes {
+                break;
+            }
+            let bytes = match pack.ensure_loaded(self.load_ctx.as_ref()) {
+                Ok((_meta, bytes)) => bytes,
+                Err(_) => continue,
+            };
+            let remaining = budget_bytes - warmed;
+            let take = (bytes.len() as u64).min(remaining) as usize;
+            warmed += touch_pages(&bytes[..take]);
+        }
+        warmed
+    }
+
     /// Hot-path: append value bytes to `out`. Returns `true` if the ID was found.
     ///
     /// Zero-alloc steady state: uses pre-parsed page directory for binary search,
@@ -489,6 +519,29 @@ fn mmap_file(path: &Path) -> io::Result<memmap2::Mmap> {
     unsafe { memmap2::Mmap::map(&file) }
 }
 
+/// Page size used to stride `touch_pages`. 4 KiB is the smallest common page
+/// size; reading one byte per 4 KiB faults every page on hosts with larger
+/// pages too (just with redundant in-page reads), so warming stays correct
+/// without querying the OS page size.
+const WARM_PAGE_STRIDE: usize = 4096;
+
+/// Fault `bytes` resident by reading one byte per page, returning the number of
+/// bytes covered (i.e. `bytes.len()`).
+///
+/// For an mmap-backed slice this pulls each page into the OS page cache; for an
+/// already-resident in-memory slice it is a cheap strided read. The accumulator
+/// is fed to [`std::hint::black_box`] so the reads are not optimized away.
+fn touch_pages(bytes: &[u8]) -> u64 {
+    let mut acc: u8 = 0;
+    let mut i = 0;
+    while i < bytes.len() {
+        acc ^= bytes[i];
+        i += WARM_PAGE_STRIDE;
+    }
+    std::hint::black_box(acc);
+    bytes.len() as u64
+}
+
 /// Write bytes to a cache file atomically (temp file + rename).
 ///
 /// Ensures the parent directory exists so lazy fetches succeed even if the
@@ -641,6 +694,43 @@ mod tests {
             reader.forward_lookup_str(250).unwrap(),
             Some("val_250".to_string())
         );
+    }
+
+    #[test]
+    fn test_prewarm_respects_budget() {
+        let p1 = make_pack_bytes(0, 100);
+        let p2 = make_pack_bytes(100, 100);
+        let len1 = p1.len() as u64;
+        let len2 = p2.len() as u64;
+        let total = len1 + len2;
+        assert!(
+            len1 > 2,
+            "pack must be large enough to exercise partial warming"
+        );
+
+        let reader = ForwardPackReader::from_memory(vec![
+            Arc::from(p1.into_boxed_slice()),
+            Arc::from(p2.into_boxed_slice()),
+        ])
+        .unwrap();
+
+        // Unbounded budget warms every pack fully.
+        assert_eq!(reader.prewarm(u64::MAX), total);
+
+        // Zero budget warms nothing (and never touches a pack).
+        assert_eq!(reader.prewarm(0), 0);
+
+        // Budget below the first pack partially warms just it.
+        let partial = len1 / 2;
+        assert_eq!(reader.prewarm(partial), partial);
+
+        // Budget exactly the first pack warms only the first pack (the loop
+        // breaks before the second since `warmed >= budget`).
+        assert_eq!(reader.prewarm(len1), len1);
+
+        // Budget spanning pack1 + part of pack2 stops mid-second-pack.
+        let mid = len1 + len2 / 2;
+        assert_eq!(reader.prewarm(mid), mid);
     }
 
     #[test]
