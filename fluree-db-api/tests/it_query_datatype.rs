@@ -419,6 +419,203 @@ async fn language_binding_value_object_language_variable() {
     );
 }
 
+/// Issue #1273: a subject with several language-tagged values where two
+/// variants share the same `@value` but differ in `@language` ("animal"@en vs
+/// "animal"@fr) must keep all variants. Exercises the genesis / overlay-only
+/// read path (`range::remove_stale_flakes`), whose fact key must include the
+/// language tag.
+#[tokio::test]
+async fn langstring_same_value_different_tags_novelty() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger0 = genesis_ledger(&fluree, "langbug:main");
+    let ctx = ctx_datatype();
+
+    let insert = json!({
+        "@context": ctx,
+        "@id": "ex:animal", "@type": "ex:Concept",
+        "ex:prefLabel": [
+            {"@language":"en","@value":"animal"},
+            {"@language":"es","@value":"animales"},
+            {"@language":"fr","@value":"animal"}
+        ]
+    });
+    let ledger = fluree.insert(ledger0, &insert).await.unwrap().ledger;
+
+    let q = json!({
+        "@context": ctx,
+        "select": ["?val","?lang"],
+        "where": [
+            {"@id":"ex:animal","ex:prefLabel":"?val"},
+            ["bind","?lang",["expr",["lang","?val"]]]
+        ]
+    });
+
+    let rows = support::query_jsonld(&fluree, &ledger, &q)
+        .await
+        .unwrap()
+        .to_jsonld(&ledger.snapshot)
+        .unwrap();
+    let langs: std::collections::BTreeSet<String> = rows
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|r| r.as_array().unwrap()[1].as_str().unwrap().to_string())
+        .collect();
+    assert_eq!(
+        langs,
+        std::collections::BTreeSet::from([
+            "en".to_string(),
+            "es".to_string(),
+            "fr".to_string()
+        ]),
+        "expected en/es/fr to all survive, got {langs:?}"
+    );
+}
+
+/// Issue #1273, indexed variant: the same scenario but with the langStrings
+/// landing in novelty *over a persisted binary index* whose language dict does
+/// not yet contain the new tags. Exercises the binary-overlay encode path
+/// (`value_to_otype_okey`), which must not collapse novelty-only tags to a
+/// single fallback lang_id.
+#[tokio::test]
+async fn langstring_same_value_different_tags_indexed_overlay() {
+    use fluree_db_api::ReindexOptions;
+    use fluree_db_transact::{CommitOpts, TxnOpts};
+
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger_id = "langbug:indexed";
+    let ledger0 = genesis_ledger(&fluree, ledger_id);
+    let ctx = ctx_datatype();
+
+    // Base insert with an indexed langString (populates persisted lang dict with "de").
+    let base = json!({
+        "@context": ctx,
+        "@id": "ex:base", "ex:prefLabel": {"@language":"de","@value":"Tier"}
+    });
+    let _l1 = fluree.insert(ledger0, &base).await.unwrap().ledger;
+    fluree
+        .reindex(ledger_id, ReindexOptions::default())
+        .await
+        .expect("reindex");
+    let indexed = fluree.ledger(ledger_id).await.expect("load indexed");
+    assert!(indexed.snapshot.range_provider.is_some());
+
+    // Novelty insert mixing a PERSISTED tag ("de", already indexed → encoded
+    // overlay path) with BRAND-NEW tags (en/fr/es not yet in persisted dict →
+    // raw-flake path) on the same subject/predicate, stressing the merge of
+    // encoded ops and raw flakes. en and fr share the value "animal".
+    let novelty = json!({
+        "@context": ctx,
+        "@id": "ex:animal",
+        "ex:prefLabel": [
+            {"@language":"de","@value":"Tier"},
+            {"@language":"en","@value":"animal"},
+            {"@language":"es","@value":"animales"},
+            {"@language":"fr","@value":"animal"}
+        ]
+    });
+    let ledger2 = fluree
+        .insert_with_opts(
+            indexed,
+            &novelty,
+            TxnOpts::default(),
+            CommitOpts::default(),
+            &fluree_db_api::IndexConfig {
+                reindex_min_bytes: 1_000_000_000,
+                reindex_max_bytes: 1_000_000_000,
+            },
+        )
+        .await
+        .unwrap()
+        .ledger;
+
+    let q = json!({
+        "@context": ctx,
+        "select": ["?val","?lang"],
+        "where": [
+            {"@id":"ex:animal","ex:prefLabel":"?val"},
+            ["bind","?lang",["expr",["lang","?val"]]]
+        ]
+    });
+    let rows = support::query_jsonld(&fluree, &ledger2, &q)
+        .await
+        .unwrap()
+        .to_jsonld_async(ledger2.as_graph_db_ref(0))
+        .await
+        .unwrap();
+    let langs: std::collections::BTreeSet<String> = rows
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|r| r.as_array().unwrap()[1].as_str().unwrap().to_string())
+        .collect();
+    assert_eq!(
+        langs,
+        std::collections::BTreeSet::from([
+            "de".to_string(),
+            "en".to_string(),
+            "es".to_string(),
+            "fr".to_string()
+        ]),
+        "indexed-overlay: expected de/en/es/fr to all survive, got {langs:?}"
+    );
+}
+
+/// Issue #1273 follow-up: deleting one language variant must retract exactly
+/// that variant and leave the others — confirming the retraction flake carries
+/// the language tag in `m` and that `remove_stale_flakes`' `m`-aware fact key
+/// scopes cancellation per language tag.
+#[tokio::test]
+async fn langstring_delete_one_variant_keeps_others() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger0 = genesis_ledger(&fluree, "langbug:delete");
+    let ctx = ctx_datatype();
+
+    let insert = json!({
+        "@context": ctx,
+        "@id": "ex:animal",
+        "ex:prefLabel": [
+            {"@language":"en","@value":"animal"},
+            {"@language":"fr","@value":"animal"},
+            {"@language":"es","@value":"animales"}
+        ]
+    });
+    let ledger = fluree.insert(ledger0, &insert).await.unwrap().ledger;
+
+    // Delete only the en variant (same value "animal" as fr).
+    let delete = json!({
+        "@context": ctx,
+        "delete": {"@id":"ex:animal","ex:prefLabel":{"@language":"en","@value":"animal"}},
+        "where": {"@id":"ex:animal","ex:prefLabel":{"@language":"en","@value":"animal"}}
+    });
+    let ledger = fluree.update(ledger, &delete).await.unwrap().ledger;
+
+    let q = json!({
+        "@context": ctx,
+        "select": ["?val","?lang"],
+        "where": [
+            {"@id":"ex:animal","ex:prefLabel":"?val"},
+            ["bind","?lang",["expr",["lang","?val"]]]
+        ]
+    });
+    let rows = support::query_jsonld(&fluree, &ledger, &q)
+        .await
+        .unwrap()
+        .to_jsonld(&ledger.snapshot)
+        .unwrap();
+    let langs: std::collections::BTreeSet<String> = rows
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|r| r.as_array().unwrap()[1].as_str().unwrap().to_string())
+        .collect();
+    assert_eq!(
+        langs,
+        std::collections::BTreeSet::from(["es".to_string(), "fr".to_string()]),
+        "deleting @en must leave @fr (same value) and @es, got {langs:?}"
+    );
+}
+
 #[tokio::test]
 async fn language_binding_rejects_type_and_language_conflict() {
     // Per JSON-LD §9.5 / RDF 1.1, a value object cannot have both @type (non-langString)
