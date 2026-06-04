@@ -55,6 +55,7 @@ pub mod geo_search;
 pub mod graph;
 pub mod group_aggregate;
 pub mod groupby;
+pub mod hash_join;
 pub mod having;
 pub mod ir;
 pub mod join;

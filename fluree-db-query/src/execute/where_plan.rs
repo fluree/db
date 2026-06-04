@@ -853,6 +853,8 @@ fn build_single_pattern(
             emit_mask_for_triple(tp, var_counts, protected_vars),
             group_by,
             planning,
+            None,
+            None,
         )),
         _ => operator,
     }
@@ -1049,6 +1051,7 @@ fn build_sequential_join_block(
     group_by: &[VarId],
     distinct_query: bool,
     planning: &PlanningContext,
+    stats: Option<&StatsView>,
 ) -> Result<Option<BoxedOperator>> {
     let mut operator = operator;
 
@@ -1065,7 +1068,17 @@ fn build_sequential_join_block(
     let base_vars: Option<HashSet<VarId>> =
         required_where_vars.map(|rwv| rwv.iter().copied().collect());
 
+    // Running cardinality of the driving (left) chain built so far — the product of
+    // per-triple estimates for triples[0..k] against the live bound set. This is the
+    // hash-join cost model's `driving_est`. The snapshot is taken BEFORE multiplying
+    // in the current `tp`: the probe `tp` has its object bound from the left, so
+    // estimating it would classify as BoundObject and give the wrong number.
+    let mut driving_est: f64 = 1.0;
     for (k, tp) in triples.iter().enumerate() {
+        let driving_est_for_step = stats.map(|_| driving_est);
+        if stats.is_some() {
+            driving_est *= crate::planner::estimate_triple_row_count(tp, &bound, stats);
+        }
         let mut vars_after: HashSet<VarId> = bound.clone();
         for v in tp.produced_vars() {
             vars_after.insert(v);
@@ -1125,6 +1138,8 @@ fn build_sequential_join_block(
             emit,
             group_by,
             planning,
+            stats,
+            driving_est_for_step,
         );
         bound.extend(op.schema().iter().copied());
         operator = Some(op);
@@ -1450,6 +1465,7 @@ pub fn build_where_operators_seeded_with_needed(
                         group_by,
                         distinct_query,
                         planning,
+                        stats.as_deref(),
                     )?;
                     if values_after_triples {
                         built = apply_values(Some(built), block.values)
@@ -1618,6 +1634,7 @@ pub fn build_where_operators_seeded_with_needed(
                         group_by,
                         distinct_query,
                         planning,
+                        stats.as_deref(),
                     )?;
                 }
             }
@@ -1920,6 +1937,77 @@ fn make_first_scan(
     ))
 }
 
+/// Force-override for the cost-based object→subject hash-join decision.
+///
+/// `FLUREE_HASH_JOIN` is a force-override only: unset/other => `Auto` (the cost
+/// model decides), `1`/`true` => `On` (force the hash join whenever the shape
+/// matches, ignoring cost — preserves force-on on stats-less ledgers), `0`/`false`
+/// => `Off` (never hash-join).
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum HashJoinForce {
+    Auto,
+    On,
+    Off,
+}
+
+pub(crate) fn hash_join_force() -> HashJoinForce {
+    match std::env::var("FLUREE_HASH_JOIN") {
+        Ok(v) if v == "1" || v.eq_ignore_ascii_case("true") => HashJoinForce::On,
+        Ok(v) if v == "0" || v.eq_ignore_ascii_case("false") => HashJoinForce::Off,
+        _ => HashJoinForce::Auto,
+    }
+}
+
+/// Probe-predicate floor: below this, scattered OPST object seeks stay cheap and
+/// the hash join is a wash (the BSBM crossover is between 55.7k @1M and 560k @10M).
+pub(crate) const HASH_JOIN_PROBE_MIN: u64 = 250_000;
+/// Don't scan a probe predicate more than this many times the driving-set size
+/// (tiny-driving guard; keeps the 100M case at ratio ~46x inside the cap).
+pub(crate) const HASH_JOIN_MAX_SCAN_RATIO: f64 = 64.0;
+
+/// The hash join wins when the probe predicate is large enough that scattered OPST
+/// seeks dominate, but not so large relative to the driving set that the single
+/// contiguous scan is wasteful. `false` when probe stats are absent (=> the safe
+/// `NestedLoopJoinOperator` default). Constants tuned to BSBM 1M/10M/100M; heuristic.
+pub(crate) fn hash_join_cost_wins(probe_count: Option<u64>, driving_est: Option<f64>) -> bool {
+    let Some(pc) = probe_count else { return false };
+    let drive = driving_est.unwrap_or(0.0).max(1.0);
+    pc >= HASH_JOIN_PROBE_MIN && (pc as f64) <= drive * HASH_JOIN_MAX_SCAN_RATIO
+}
+
+/// Eligibility for the object→subject hash join. The right pattern `tp` must be a
+/// single fixed-predicate scan whose OBJECT is the (only) variable shared with the
+/// left side (the join key), whose SUBJECT is a new variable, with no object bounds,
+/// no datatype constraint, and no inline ops. Returns the shared join variable.
+///
+/// This is exactly the shape that `NestedLoopJoinOperator` would otherwise run via
+/// the batched-OBJECT (OPST) path — the slow case the hash join replaces.
+fn hash_join_object_join_var(
+    left_schema: &[VarId],
+    tp: &TriplePattern,
+    has_bounds: bool,
+    inline_ops_empty: bool,
+) -> Option<VarId> {
+    if has_bounds || !inline_ops_empty || tp.dtc.is_some() {
+        return None;
+    }
+    // Predicate must be a fixed SID (so the probe scans one contiguous partition).
+    if !tp.p.is_sid() {
+        return None;
+    }
+    // Object must be a var already bound from the left (the join key).
+    let o_var = tp.o.as_var()?;
+    if !left_schema.contains(&o_var) {
+        return None;
+    }
+    // Subject must be a brand-new var (not shared with the left).
+    let s_var = tp.s.as_var()?;
+    if left_schema.contains(&s_var) {
+        return None;
+    }
+    Some(o_var)
+}
+
 /// Build a single scan or join operator for a triple pattern
 ///
 /// This is the extracted helper that eliminates the duplication between
@@ -1941,6 +2029,8 @@ pub fn build_scan_or_join(
     emit: EmitMask,
     group_by: &[VarId],
     planning: &PlanningContext,
+    stats: Option<&StatsView>,
+    driving_est: Option<f64>,
 ) -> BoxedOperator {
     match left {
         None => make_first_scan(tp, object_bounds, inline_ops, emit, group_by, planning),
@@ -1950,6 +2040,54 @@ pub fn build_scan_or_join(
 
             // Extract object bounds if available for this pattern's object variable
             let bounds = tp.o.as_var().and_then(|v| object_bounds.get(&v).cloned());
+
+            // For object→subject "path" joins, build a hash table from the small
+            // (left/driving) side and probe a single contiguous scan of the large
+            // predicate, instead of the per-driving-row OPST object seek that degrades
+            // superlinearly at scale. A cost model decides; FLUREE_HASH_JOIN is a
+            // force-override only (see hash_join_force).
+            let force = hash_join_force();
+            if force != HashJoinForce::Off {
+                if let Some(join_var) = hash_join_object_join_var(
+                    &left_schema,
+                    tp,
+                    bounds.is_some(),
+                    inline_ops.is_empty(),
+                ) {
+                    let use_hash = match force {
+                        HashJoinForce::On => true,
+                        HashJoinForce::Off => false,
+                        HashJoinForce::Auto => {
+                            let probe_count =
+                                tp.p.as_sid()
+                                    .and_then(|sid| stats.and_then(|s| s.get_property(sid)))
+                                    .map(|p| p.count);
+                            hash_join_cost_wins(probe_count, driving_est)
+                        }
+                    };
+                    if use_hash {
+                        let index_hint = scan_index_hint_for_triple(tp, group_by, &[]);
+                        let probe: BoxedOperator =
+                            Box::new(crate::dataset_operator::DatasetOperator::scan(
+                                tp.clone(),
+                                None,
+                                Vec::new(),
+                                EmitMask::ALL,
+                                index_hint,
+                                planning.mode(),
+                            ));
+                        return Box::new(crate::hash_join::HashJoinOperator::new(
+                            left,
+                            probe,
+                            join_var,
+                            downstream_vars,
+                            tp.clone(),
+                            bounds.clone(),
+                            planning.mode(),
+                        ));
+                    }
+                }
+            }
 
             Box::new(
                 NestedLoopJoinOperator::new(
@@ -2050,6 +2188,7 @@ pub fn build_triple_operators(
     group_by: &[VarId],
     distinct_query: bool,
     planning: &PlanningContext,
+    stats: Option<&StatsView>,
 ) -> Result<BoxedOperator> {
     if triples.is_empty() {
         return existing
@@ -2092,8 +2231,15 @@ pub fn build_triple_operators(
     // Build chain of scan/join operators using the shared helper
     let rwv_set: Option<HashSet<VarId>> = required_where_vars.map(|v| v.iter().copied().collect());
 
+    // Running cardinality of the driving (left) chain — see build_sequential_join_block.
+    // The snapshot is taken against `seen_vars` BEFORE the current pattern is folded in.
     let mut seen_vars: HashSet<VarId> = HashSet::new();
+    let mut driving_est: f64 = 1.0;
     for (k, pattern) in triples_for_exec.iter().enumerate() {
+        let driving_est_for_step = stats.map(|_| driving_est);
+        if stats.is_some() {
+            driving_est *= crate::planner::estimate_triple_row_count(pattern, &seen_vars, stats);
+        }
         seen_vars.extend(pattern.produced_vars());
         // Compute live vars: required_where_vars ∪ vars from subsequent triples
         let live_vars = rwv_set.as_ref().map(|base| {
@@ -2114,6 +2260,8 @@ pub fn build_triple_operators(
             emit,
             group_by,
             planning,
+            stats,
+            driving_est_for_step,
         ));
 
         // DISTINCT query optimization: if any variables seen so far are no longer live,
@@ -2198,6 +2346,7 @@ mod tests {
             &[],
             false,
             &crate::temporal_mode::PlanningContext::current(),
+            None,
         )
     }
 
@@ -2605,6 +2754,8 @@ mod tests {
             EmitMask::ALL,
             &[],
             &crate::temporal_mode::PlanningContext::current(),
+            None,
+            None,
         );
 
         assert_eq!(op.schema(), &[VarId(0), VarId(1)]);
@@ -2625,6 +2776,8 @@ mod tests {
             EmitMask::ALL,
             &[],
             &crate::temporal_mode::PlanningContext::current(),
+            None,
+            None,
         );
         let second = build_scan_or_join(
             Some(first),
@@ -2635,6 +2788,8 @@ mod tests {
             EmitMask::ALL,
             &[],
             &crate::temporal_mode::PlanningContext::current(),
+            None,
+            None,
         );
 
         // Schema should include all vars from both patterns
