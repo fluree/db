@@ -107,6 +107,88 @@ async fn test_trig_named_graph_basic() {
 }
 
 #[tokio::test]
+async fn test_trig_compact_named_graph_block() {
+    // Issue #1278: the W3C-compliant compact graph block form `<iri> { ... }`
+    // (no `GRAPH` keyword) must be accepted and behave identically to the
+    // keyword form. Stock RDF tooling (rdflib, Jena, RDF4J) emits this form.
+    let fluree = FlureeBuilder::memory()
+        .with_ledger_cache_config(LedgerManagerConfig::default())
+        .build_memory();
+    let ledger_id = "it/trig-compact-graph:main";
+
+    let (local, handle) = start_background_indexer_local(
+        fluree.backend().clone(),
+        Arc::new(fluree.nameservice_mode().clone()),
+        fluree_db_indexer::IndexerConfig::small(),
+    );
+
+    local
+        .run_until(async move {
+            let ledger = genesis_ledger(&fluree, ledger_id);
+
+            // Compact form: graph label `<urn:graph:test>` with NO GRAPH keyword,
+            // plus a default-graph triple. This is exactly the payload from the
+            // issue's reproducer that rdflib/Jena/RDF4J emit by default.
+            let trig = r#"
+                @prefix ex: <http://example.org/> .
+
+                ex:alice ex:name "Alice" .
+
+                <urn:graph:test> {
+                    ex:event1 ex:description "User login" .
+                }
+            "#;
+
+            let result = fluree
+                .stage_owned(ledger)
+                .upsert_turtle(trig)
+                .execute()
+                .await
+                .expect("compact-form TriG should be accepted");
+            assert_eq!(result.receipt.t, 1);
+
+            trigger_index_and_wait(&handle, ledger_id, result.receipt.t).await;
+
+            // Default graph triple landed.
+            let query = json!({
+                "@context": {"ex": "http://example.org/"},
+                "from": ledger_id,
+                "select": "?name",
+                "where": {"@id": "ex:alice", "ex:name": "?name"}
+            });
+            let results = fluree
+                .query_connection(&query)
+                .await
+                .expect("query default");
+            let ledger = fluree.ledger(ledger_id).await.expect("load ledger");
+            let results = results.to_jsonld(&ledger.snapshot).expect("to_jsonld");
+            let arr = results.as_array().expect("array");
+            assert_eq!(arr[0], "Alice", "default-graph triple should be present");
+
+            // Named graph triple landed under the compact label.
+            let named_graph_alias = format!("{ledger_id}#urn:graph:test");
+            let query = json!({
+                "@context": {"ex": "http://example.org/"},
+                "from": &named_graph_alias,
+                "select": "?desc",
+                "where": {"@id": "ex:event1", "ex:description": "?desc"}
+            });
+            let results = fluree
+                .query_connection(&query)
+                .await
+                .expect("query named graph");
+            let results = results.to_jsonld(&ledger.snapshot).expect("to_jsonld");
+            let arr = results.as_array().expect("array");
+            assert!(
+                !arr.is_empty(),
+                "compact-form named graph should be queryable"
+            );
+            assert_eq!(arr[0], "User login");
+        })
+        .await;
+}
+
+#[tokio::test]
 async fn test_trig_named_graph_typed_literal_without_prefix_errors() {
     let fluree = FlureeBuilder::memory()
         .with_ledger_cache_config(LedgerManagerConfig::default())
