@@ -345,7 +345,7 @@ mod tests {
         let mut namespaces = HashMap::new();
         namespaces.insert(100, "http://example.org/".to_string());
         namespaces.insert(2, "http://www.w3.org/2001/XMLSchema#".to_string());
-        IriCompactor::from_namespaces(&namespaces)
+        IriCompactor::from_namespaces(std::sync::Arc::new(namespaces))
     }
 
     fn make_test_result() -> QueryResult {

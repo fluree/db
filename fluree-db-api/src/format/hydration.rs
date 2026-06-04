@@ -549,7 +549,7 @@ impl<'a> DatasetCtx<'a> {
             }
             views.push(LedgerView {
                 db: view_db,
-                compactor: IriCompactor::new(g.snapshot.namespaces(), context),
+                compactor: IriCompactor::new(g.snapshot.namespaces_arc(), context),
                 policy: g.policy().cloned(),
             });
             // First occurrence wins (a ledger may appear as both default and named).

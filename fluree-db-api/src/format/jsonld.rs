@@ -344,7 +344,7 @@ mod tests {
         namespaces.insert(2, "http://www.w3.org/2001/XMLSchema#".to_string());
         namespaces.insert(3, "http://www.w3.org/1999/02/22-rdf-syntax-ns#".to_string());
         namespaces.insert(100, "http://example.org/".to_string());
-        IriCompactor::from_namespaces(&namespaces)
+        IriCompactor::from_namespaces(std::sync::Arc::new(namespaces))
     }
 
     /// A compactor whose context sets `@vocab` to the same namespace as the
@@ -357,7 +357,7 @@ mod tests {
             &serde_json::json!({"@vocab": "http://example.org/lists/"}),
         )
         .unwrap();
-        IriCompactor::new(&namespaces, &context)
+        IriCompactor::new(std::sync::Arc::new(namespaces), &context)
     }
 
     /// Regression for #1280: a reference binding is a node identifier (`@id`

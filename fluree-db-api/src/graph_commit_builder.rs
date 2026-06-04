@@ -239,7 +239,7 @@ impl<'a, 'g> CommitBuilder<'a, 'g> {
             .ledger_cached(&self.graph.ledger_id)
             .await?;
         let snapshot = handle.snapshot().await;
-        let namespace_codes = snapshot.snapshot.namespaces();
+        let namespace_codes = snapshot.snapshot.namespaces_arc();
 
         // 2. Resolve commit reference to a full CID
         let commit_id = snapshot.resolve_commit(self.commit_ref).await?;
