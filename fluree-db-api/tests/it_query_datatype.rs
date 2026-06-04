@@ -651,6 +651,78 @@ async fn langstring_novelty_only_tag_exported() {
     );
 }
 
+/// Guards the export path against the namespace edge raised in review: when
+/// novelty introduces a BRAND-NEW namespace (never persisted at index time),
+/// export must still resolve its subject/predicate IRIs. This works because
+/// `fluree.ledger()` loads a store synced with the snapshot's commit-chain
+/// namespaces (`sync_store_and_snapshot_ns`) before export — covering both the
+/// encoded cursor path (integer) and the raw-flake path (novelty-only langString).
+#[tokio::test]
+async fn langstring_brand_new_namespace_exported() {
+    use fluree_db_api::export::ExportFormat;
+    use fluree_db_api::ReindexOptions;
+    use fluree_db_transact::{CommitOpts, TxnOpts};
+
+    let tmp = tempfile::TempDir::new().unwrap();
+    let fluree = FlureeBuilder::file(tmp.path().to_str().unwrap())
+        .build()
+        .expect("build file fluree");
+    let ledger_id = "langbug/newns:main";
+    let ledger0 = fluree.create_ledger(ledger_id).await.unwrap();
+
+    // Index a base under the `ex:` namespace only.
+    let base = json!({
+        "@context": {"ex": "http://example.org/ns/"},
+        "@id": "ex:base", "ex:name": "Base"
+    });
+    let _l1 = fluree.insert(ledger0, &base).await.unwrap().ledger;
+    fluree
+        .reindex(ledger_id, ReindexOptions::default())
+        .await
+        .expect("reindex");
+    let indexed = fluree.ledger(ledger_id).await.expect("load indexed");
+
+    // Novelty under a BRAND-NEW namespace `zz:` covering both export paths:
+    // a novelty-only langString (raw path) and a plain integer (encoded path).
+    let novelty = json!({
+        "@context": {"zz": "http://zz.example/ns/"},
+        "@id": "zz:thing",
+        "zz:label": {"@language":"qq","@value":"hello"},
+        "zz:count": 5
+    });
+    fluree
+        .insert_with_opts(
+            indexed,
+            &novelty,
+            TxnOpts::default(),
+            CommitOpts::default(),
+            &fluree_db_api::IndexConfig {
+                reindex_min_bytes: 1_000_000_000,
+                reindex_max_bytes: 1_000_000_000,
+            },
+        )
+        .await
+        .unwrap();
+
+    let mut buf: Vec<u8> = Vec::new();
+    fluree
+        .export(ledger_id)
+        .format(ExportFormat::NTriples)
+        .write_to(&mut buf)
+        .await
+        .expect("export ntriples");
+    let out = String::from_utf8(buf).unwrap();
+    // Raw path (langString) and encoded path (integer) under the new namespace.
+    assert!(
+        out.contains("\"hello\"@qq"),
+        "export must contain the brand-new-namespace langString (raw path); got:\n{out}"
+    );
+    assert!(
+        out.contains("zz.example/ns/count"),
+        "export must contain the brand-new-namespace integer (encoded path); got:\n{out}"
+    );
+}
+
 /// Issue #1273 follow-up: deleting one language variant must retract exactly
 /// that variant and leave the others — confirming the retraction flake carries
 /// the language tag in `m` and that `remove_stale_flakes`' `m`-aware fact key
