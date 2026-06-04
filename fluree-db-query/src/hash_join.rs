@@ -39,21 +39,23 @@
 //!
 //! ## Selection
 //!
-//! `where_plan::build_scan_or_join` chooses this operator with a cost model
-//! (`hash_join_cost_wins`): the shape must match (single shared var = the bound
-//! object, fixed predicate, new subject var, no object bounds/inline ops) AND the
-//! probe predicate must be large enough that scattered seeks dominate. `FLUREE_HASH_JOIN`
-//! is a force-override only (`On`/`Off`). At `open()`, if the query is a true
-//! multi-graph dataset (ledger-local key normalisation would be wrong), it falls back
-//! to a `NestedLoopJoinOperator` over the same inputs.
+//! [`HashJoinPlanner`] (below) chooses this operator with a cost model: the shape
+//! must match (single shared var = the bound object, fixed predicate, new subject
+//! var, no object bounds/inline ops) AND the probe predicate must be large enough
+//! that scattered seeks dominate. `FLUREE_HASH_JOIN` is a force-override only
+//! (`On`/`Off`). `where_plan` threads one planner through a join block; at `open()`,
+//! if the query is a true multi-graph dataset (ledger-local key normalisation would
+//! be wrong), the operator falls back to a `NestedLoopJoinOperator` over the same
+//! inputs.
 
+use std::collections::HashSet;
 use std::sync::Arc;
 
 use async_trait::async_trait;
 use fluree_db_binary_index::BinaryIndexStore;
 use rustc_hash::FxHashMap;
 
-use fluree_db_core::ObjectBounds;
+use fluree_db_core::{ObjectBounds, StatsView};
 
 use crate::binary_scan::EmitMask;
 use crate::binding::{Batch, Binding};
@@ -71,6 +73,155 @@ use crate::var_registry::VarId;
 
 /// Target number of output rows per produced batch.
 const OUTPUT_BATCH_TARGET: usize = 4096;
+
+// ── Planning: when to use the hash join ──────────────────────────────────────
+//
+// `HashJoinPlanner` is threaded through a WHERE join block by `where_plan`. It owns
+// the force mode, the `StatsView`, and the running cardinality of the driving chain,
+// and decides per pattern whether the object→subject join should use this operator.
+
+/// Force-override for the cost-based object→subject hash-join decision.
+///
+/// `FLUREE_HASH_JOIN`: unset/other => `Auto` (the cost model decides), `1`/`true`
+/// => `On` (force the hash join whenever the shape matches, ignoring cost — keeps
+/// force-on usable on stats-less ledgers), `0`/`false` => `Off` (never hash-join).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum HashJoinForce {
+    Auto,
+    On,
+    Off,
+}
+
+fn hash_join_force() -> HashJoinForce {
+    match std::env::var("FLUREE_HASH_JOIN") {
+        Ok(v) if v == "1" || v.eq_ignore_ascii_case("true") => HashJoinForce::On,
+        Ok(v) if v == "0" || v.eq_ignore_ascii_case("false") => HashJoinForce::Off,
+        _ => HashJoinForce::Auto,
+    }
+}
+
+/// Probe-predicate floor: below this, scattered OPST object seeks stay cheap and the
+/// hash join is a wash (the BSBM crossover is between 55.7k @1M and 560k @10M).
+const HASH_JOIN_PROBE_MIN: u64 = 250_000;
+/// Don't scan a probe predicate more than this many times the driving-set size
+/// (tiny-driving guard; keeps the 100M case at ratio ~46x inside the cap).
+const HASH_JOIN_MAX_SCAN_RATIO: f64 = 64.0;
+
+/// The hash join wins when the probe predicate is large enough that scattered OPST
+/// seeks dominate, but not so large relative to the driving set that the single
+/// contiguous scan is wasteful. `false` when probe stats are absent (=> the safe
+/// `NestedLoopJoinOperator` default). Constants tuned to BSBM 1M/10M/100M; heuristic.
+fn hash_join_cost_wins(probe_count: Option<u64>, driving_est: Option<f64>) -> bool {
+    let Some(pc) = probe_count else { return false };
+    let drive = driving_est.unwrap_or(0.0).max(1.0);
+    pc >= HASH_JOIN_PROBE_MIN && (pc as f64) <= drive * HASH_JOIN_MAX_SCAN_RATIO
+}
+
+/// Eligibility for the object→subject hash join. The right pattern `tp` must be a
+/// single fixed-predicate scan whose OBJECT is the (only) variable shared with the
+/// left side (the join key), whose SUBJECT is a new variable, with no object bounds,
+/// no datatype constraint, and no inline ops. Returns the shared join variable.
+///
+/// This is exactly the shape that `NestedLoopJoinOperator` would otherwise run via
+/// the batched-OBJECT (OPST) path — the slow case the hash join replaces.
+fn hash_join_object_join_var(
+    left_schema: &[VarId],
+    tp: &TriplePattern,
+    has_bounds: bool,
+    inline_ops_empty: bool,
+) -> Option<VarId> {
+    if has_bounds || !inline_ops_empty || tp.dtc.is_some() {
+        return None;
+    }
+    // Predicate must be a fixed SID (so the probe scans one contiguous partition).
+    if !tp.p.is_sid() {
+        return None;
+    }
+    // Object must be a var already bound from the left (the join key).
+    let o_var = tp.o.as_var()?;
+    if !left_schema.contains(&o_var) {
+        return None;
+    }
+    // Subject must be a brand-new var (not shared with the left).
+    let s_var = tp.s.as_var()?;
+    if left_schema.contains(&s_var) {
+        return None;
+    }
+    Some(o_var)
+}
+
+/// Per-WHERE-block planning state for the object→subject hash join.
+///
+/// One instance is threaded through a join block so `build_triple_operators` and
+/// `build_sequential_join_block` share the same cost state — the running driving-set
+/// cardinality, the resolved force mode, and stats — instead of each re-deriving it
+/// and widening every helper signature.
+pub(crate) struct HashJoinPlanner<'a> {
+    stats: Option<&'a StatsView>,
+    force: HashJoinForce,
+    /// Running product of per-pattern estimates for the chain built so far.
+    driving_est: f64,
+    /// `driving_est` snapshot from the most recent [`before_step`](Self::before_step)
+    /// — the driving-set size the next probe is weighed against. `None` until
+    /// `before_step` runs with stats present, so single-pattern / stats-less callers
+    /// never auto-fire (force-`On` still does).
+    step_est: Option<f64>,
+}
+
+impl<'a> HashJoinPlanner<'a> {
+    pub(crate) fn new(stats: Option<&'a StatsView>) -> Self {
+        Self {
+            stats,
+            force: hash_join_force(),
+            driving_est: 1.0,
+            step_est: None,
+        }
+    }
+
+    /// Advance the running driving cardinality past one pattern. Call once per
+    /// pattern, in chain order, BEFORE building its operator. Snapshots the product
+    /// of the patterns to the LEFT of `tp` (this becomes `step_est`, the size the
+    /// probe is weighed against), then folds `tp`'s own estimate in for later steps.
+    /// The snapshot excludes `tp` on purpose: as a probe its object is bound from the
+    /// left, so estimating it would misclassify as a selective BoundObject scan.
+    /// `bound` is the set of variables bound by the chain to the left of `tp`.
+    pub(crate) fn before_step(&mut self, tp: &TriplePattern, bound: &HashSet<VarId>) {
+        self.step_est = self.stats.map(|stats| {
+            let snapshot = self.driving_est;
+            self.driving_est *= crate::planner::estimate_triple_row_count(tp, bound, Some(stats));
+            snapshot
+        });
+    }
+
+    /// Decide whether the join for the current pattern should use the object→subject
+    /// hash join, returning the shared join variable when it should (and `None` to
+    /// keep the `NestedLoopJoinOperator` default). Honors the force mode; under `Auto`
+    /// it weighs the probe predicate's size against the latest `before_step` snapshot.
+    pub(crate) fn choose_object_hash_join(
+        &self,
+        left_schema: &[VarId],
+        tp: &TriplePattern,
+        has_bounds: bool,
+        inline_ops_empty: bool,
+    ) -> Option<VarId> {
+        if self.force == HashJoinForce::Off {
+            return None;
+        }
+        let join_var = hash_join_object_join_var(left_schema, tp, has_bounds, inline_ops_empty)?;
+        let use_hash = match self.force {
+            HashJoinForce::On => true,
+            HashJoinForce::Off => false,
+            HashJoinForce::Auto => {
+                let probe_count =
+                    tp.p.as_sid()
+                        .and_then(|sid| self.stats.and_then(|s| s.get_property(sid)))
+                        .map(|p| p.count);
+                hash_join_cost_wins(probe_count, self.step_est)
+            }
+        };
+        use_hash.then_some(join_var)
+    }
+}
 
 /// A join key that is comparable across build/probe sides regardless of whether a
 /// ref was delivered as `EncodedSid` or materialised `Sid`.
