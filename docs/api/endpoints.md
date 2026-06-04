@@ -150,8 +150,19 @@ WHERE {
 - `401 Unauthorized` - Authentication required
 - `403 Forbidden` - Not authorized for this ledger
 - `404 Not Found` - Ledger not found
+- `409 Conflict` - Optimistic-concurrency conflict that survived the server's
+  bounded reconcile-and-retry (rare; safe to retry the request)
 - `413 Payload Too Large` - Transaction exceeds size limit
 - `500 Internal Server Error` - Server error
+
+**Concurrency:** Writes to a single ledger are serialized by a per-ledger write
+lock (concurrent writes to *different* ledgers proceed in parallel). When a
+transaction is lowered/sequenced against a snapshot that is no longer the head
+by commit time — two writers racing on a first-time namespace code, or a cached
+writer state that fell behind the durable head — the server reconciles the
+cached state to the current head and re-tries (bounded, up to 16 attempts). A
+`409 Conflict` is returned only if the retry budget is exhausted; clients should
+treat it as retryable (distinct from a `400` bad request).
 
 **Examples:**
 
