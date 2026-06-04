@@ -103,9 +103,17 @@ fn hash_join_force() -> HashJoinForce {
 /// Probe-predicate floor: below this, scattered OPST object seeks stay cheap and the
 /// hash join is a wash (the BSBM crossover is between 55.7k @1M and 560k @10M).
 const HASH_JOIN_PROBE_MIN: u64 = 250_000;
-/// Don't scan a probe predicate more than this many times the driving-set size
-/// (tiny-driving guard; keeps the 100M case at ratio ~46x inside the cap).
-const HASH_JOIN_MAX_SCAN_RATIO: f64 = 64.0;
+/// Don't scan a probe predicate more than this many times the driving-set size —
+/// a guard against the pathological "scan a huge predicate for a handful of driving
+/// rows" case. It is deliberately loose: the alternative we replace is the scattered
+/// OPST object seek, measured at ~760 µs/seek (47 s / 61.8K driving rows at 100M)
+/// versus ~26 ns per sequential probe row, so the *true* break-even ratio is ≈29,000×.
+/// We sit far below that (room for the build-side hash + memory), but well above the
+/// estimate error from skewed objects: `driving_est` for a bound object is the AVERAGE
+/// object size (`count/ndv`), which undershoots a popular value like BSBM `country=US`
+/// (avg ~28K vs actual ~61.8K), so a tight cap (the old 64×) wrongly rejected the very
+/// join this operator exists for. See the BI-1 case in `hash_join_cost_wins` tests.
+const HASH_JOIN_MAX_SCAN_RATIO: f64 = 1024.0;
 
 /// The hash join wins when the probe predicate is large enough that scattered OPST
 /// seeks dominate, but not so large relative to the driving set that the single
@@ -587,5 +595,32 @@ impl Operator for HashJoinOperator {
             return f.estimated_rows();
         }
         self.probe.as_ref().and_then(|p| p.estimated_rows())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cost_gate_fires_for_skewed_bound_object_bi1() {
+        // BSBM BI-1: probe rev:reviewer (2.85M rows) vs a driving `country=US` set.
+        // The cost model estimates the driving side as the AVERAGE country size
+        // (count/ndv ≈ 28k), not US's actual 61.8k. The 1024× cap must accept this
+        // (28k×1024 = 28.6M ≥ 2.85M); the old 64× cap rejected it (28k×64 = 1.79M <
+        // 2.85M), which is the regression this fixes.
+        assert!(hash_join_cost_wins(Some(2_848_260), Some(28_000.0)));
+        // Also passes against US's true (un-averaged) selectivity.
+        assert!(hash_join_cost_wins(Some(2_848_260), Some(61_847.0)));
+    }
+
+    #[test]
+    fn cost_gate_still_guards_pathological_and_small_probes() {
+        // Huge probe for a handful of driving rows is still rejected (ratio ≫ 1024×).
+        assert!(!hash_join_cost_wins(Some(2_848_260), Some(100.0)));
+        // Probe below the floor never qualifies, regardless of ratio.
+        assert!(!hash_join_cost_wins(Some(100_000), Some(10.0)));
+        // No probe stats => fall back to the safe nested-loop default.
+        assert!(!hash_join_cost_wins(None, Some(1_000_000.0)));
     }
 }
