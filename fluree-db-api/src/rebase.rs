@@ -318,7 +318,7 @@ impl crate::Fluree {
         // Replay stages commits as writes to the branch. Start from the
         // source's queryable state, but relabel the snapshot before staging so
         // commit conflict checks and nameservice updates target the branch.
-        current_state.snapshot.ledger_id = ctx.branch_id.to_string();
+        std::sync::Arc::make_mut(&mut current_state.snapshot).ledger_id = ctx.branch_id.to_string();
 
         let mut report = RebaseReport {
             replayed: 0,

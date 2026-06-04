@@ -200,8 +200,7 @@ impl Fluree {
 
             // ns_split_mode immutability: locked once user namespaces are allocated.
             if let Some(mode) = c.commit.ns_split_mode {
-                base_state
-                    .snapshot
+                std::sync::Arc::make_mut(&mut base_state.snapshot)
                     .set_ns_split_mode(mode, c.commit.t)
                     .map_err(|e| PushError::Invalid(e.to_string()).into_api_error())?;
             }
@@ -879,12 +878,12 @@ fn apply_pushed_commits_to_state(
             }
             // Apply ns_split_mode (immutable after user namespace allocation).
             if let Some(mode) = c.commit.ns_split_mode {
-                base.snapshot
+                std::sync::Arc::make_mut(&mut base.snapshot)
                     .set_ns_split_mode(mode, c.commit.t)
                     .map_err(|e| PushError::Internal(e.to_string()))?;
             }
         }
-        base.snapshot
+        std::sync::Arc::make_mut(&mut base.snapshot)
             .apply_envelope_deltas(&merged_ns_delta, &all_graph_iris)
             .map_err(|e| PushError::Internal(format!("apply_envelope_deltas failed: {e}")))?;
     }
