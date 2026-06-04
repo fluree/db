@@ -1966,32 +1966,41 @@ pub(crate) fn build_scan_or_join(
             // For object→subject "path" joins, build a hash table from the small
             // (left/driving) side and probe a single contiguous scan of the large
             // predicate, instead of the per-driving-row OPST object seek that degrades
-            // superlinearly at scale. The planner owns the shape + cost decision.
-            if let Some(join_var) = hash_planner.choose_object_hash_join(
+            // superlinearly at scale. The planner owns the shape + cost decision; we
+            // compute the annotated decision once, apply `chosen`, and stash it on the
+            // chosen operator so EXPLAIN can report why.
+            let decision = hash_planner.explain_object_hash_join(
                 &left_schema,
                 tp,
                 bounds.is_some(),
                 inline_ops.is_empty(),
-            ) {
-                let index_hint = scan_index_hint_for_triple(tp, group_by, &[]);
-                let probe: BoxedOperator =
-                    Box::new(crate::dataset_operator::DatasetOperator::scan(
-                        tp.clone(),
-                        None,
-                        Vec::new(),
-                        EmitMask::ALL,
-                        index_hint,
-                        planning.mode(),
-                    ));
-                return Box::new(crate::hash_join::HashJoinOperator::new(
-                    left,
-                    probe,
-                    join_var,
-                    downstream_vars,
-                    tp.clone(),
-                    bounds.clone(),
-                    planning.mode(),
-                ));
+            );
+
+            if let Some(d) = decision {
+                if d.chosen {
+                    let index_hint = scan_index_hint_for_triple(tp, group_by, &[]);
+                    let probe: BoxedOperator =
+                        Box::new(crate::dataset_operator::DatasetOperator::scan(
+                            tp.clone(),
+                            None,
+                            Vec::new(),
+                            EmitMask::ALL,
+                            index_hint,
+                            planning.mode(),
+                        ));
+                    return Box::new(
+                        crate::hash_join::HashJoinOperator::new(
+                            left,
+                            probe,
+                            d.join_var,
+                            downstream_vars,
+                            tp.clone(),
+                            bounds.clone(),
+                            planning.mode(),
+                        )
+                        .with_hash_join_decision(d),
+                    );
+                }
             }
 
             Box::new(
@@ -2004,7 +2013,10 @@ pub(crate) fn build_scan_or_join(
                     EmitMask::ALL,
                     planning.mode(),
                 )
-                .with_out_schema(downstream_vars),
+                .with_out_schema(downstream_vars)
+                // A shape-eligible-but-rejected hash join attaches its reason; a
+                // non-candidate (subject chain, bounds, etc.) attaches nothing.
+                .with_hash_join_decision(decision),
             )
         }
     }

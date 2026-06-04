@@ -129,13 +129,80 @@ async fn explain_physical_plan_present_and_concretely_named() {
 /// Recursively search a `plan.physical` node (and its `children[].node`) for an
 /// operator whose `op` equals `name`.
 fn physical_contains_op(node: &serde_json::Value, name: &str) -> bool {
+    physical_find_op(node, name).is_some()
+}
+
+/// Recursively find the first `plan.physical` node whose `op` equals `name`.
+fn physical_find_op<'a>(
+    node: &'a serde_json::Value,
+    name: &str,
+) -> Option<&'a serde_json::Value> {
     if node["op"] == name {
-        return true;
+        return Some(node);
     }
-    node["children"]
-        .as_array()
-        .map(|cs| cs.iter().any(|e| physical_contains_op(&e["node"], name)))
-        .unwrap_or(false)
+    node["children"].as_array().and_then(|cs| {
+        cs.iter()
+            .find_map(|e| physical_find_op(&e["node"], name))
+    })
+}
+
+#[tokio::test]
+async fn explain_physical_object_subject_join_shows_hash_join_decision() {
+    // 2-pattern object→subject join: `?b ex:knows ?x` with `?x` bound from
+    // `?a ex:knows ?x`. This is the exact shape the object→subject hash join
+    // targets. Default (no stats): the planner keeps the NestedLoop and records
+    // the rejected hash-join reason. FLUREE_HASH_JOIN=1: the hash join is chosen.
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger0 = genesis_ledger(&fluree, "physical-join:main");
+    let ledger = fluree
+        .insert(
+            ledger0,
+            &json!({
+                "@context": {"ex":"http://example.org/"},
+                "@id":"ex:alice",
+                "ex:knows": {"@id":"ex:bob"}
+            }),
+        )
+        .await
+        .expect("seed")
+        .ledger;
+
+    let sparql =
+        "PREFIX ex: <http://example.org/>\nSELECT ?a ?b WHERE { ?a ex:knows ?x . ?b ex:knows ?x }";
+    let db = graphdb_from_ledger(&ledger);
+
+    // Default: nested-loop join, hash join evaluated and rejected.
+    std::env::remove_var("FLUREE_HASH_JOIN");
+    let resp = fluree
+        .explain_sparql(&db, sparql)
+        .await
+        .expect("explain_sparql");
+    let physical = &resp["plan"]["physical"];
+    eprintln!("PHYSICAL(nl) = {}", serde_json::to_string_pretty(physical).unwrap());
+    let nl = physical_find_op(physical, "NestedLoopJoinOperator")
+        .expect("expected a NestedLoopJoinOperator in physical plan");
+    assert_eq!(
+        nl["details"]["hash-join-chosen"], false,
+        "nested loop should record the rejected hash join"
+    );
+    assert!(
+        nl["details"]["hash-join-reason"].is_string(),
+        "nested loop should carry a hash-join reason"
+    );
+
+    // Forced: the object→subject hash join is selected.
+    std::env::set_var("FLUREE_HASH_JOIN", "1");
+    let resp_forced = fluree.explain_sparql(&db, sparql).await.expect("explain_sparql");
+    std::env::remove_var("FLUREE_HASH_JOIN");
+    let physical_forced = &resp_forced["plan"]["physical"];
+    eprintln!(
+        "PHYSICAL(hash) = {}",
+        serde_json::to_string_pretty(physical_forced).unwrap()
+    );
+    let hj = physical_find_op(physical_forced, "HashJoinOperator")
+        .expect("expected a HashJoinOperator under FLUREE_HASH_JOIN=1");
+    assert_eq!(hj["details"]["hash-join-chosen"], true);
+    assert_eq!(hj["details"]["hash-join-reason"], "forced-on");
 }
 
 #[tokio::test]

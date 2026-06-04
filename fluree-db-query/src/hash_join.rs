@@ -125,6 +125,69 @@ fn hash_join_cost_wins(probe_count: Option<u64>, driving_est: Option<f64>) -> bo
     pc >= HASH_JOIN_PROBE_MIN && (pc as f64) <= drive * HASH_JOIN_MAX_SCAN_RATIO
 }
 
+/// Why the object→subject hash join was (or was not) chosen. Mirrors the
+/// `FallbackReason` pattern in `explain.rs` — surfaced by `EXPLAIN` so a
+/// `HashJoin` vs `NestedLoop` choice carries its rationale.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum HashJoinReason {
+    /// `FLUREE_HASH_JOIN=1` forced the hash join.
+    ForcedOn,
+    /// `FLUREE_HASH_JOIN=0` forced the nested-loop default.
+    ForcedOff,
+    /// Auto mode: probe is large enough and the scan ratio is within bounds.
+    CostWins,
+    /// Probe predicate count below [`HASH_JOIN_PROBE_MIN`] — scattered seeks stay cheap.
+    ProbeTooSmall,
+    /// Probe is more than [`HASH_JOIN_MAX_SCAN_RATIO`]× the driving set — scan too wasteful.
+    ScanRatioTooHigh,
+    /// No probe-predicate stats, so the cost model can't justify the hash join.
+    NoProbeStats,
+}
+
+impl HashJoinReason {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            HashJoinReason::ForcedOn => "forced-on",
+            HashJoinReason::ForcedOff => "forced-off",
+            HashJoinReason::CostWins => "cost-wins",
+            HashJoinReason::ProbeTooSmall => "probe-too-small",
+            HashJoinReason::ScanRatioTooHigh => "scan-ratio-too-high",
+            HashJoinReason::NoProbeStats => "no-probe-stats",
+        }
+    }
+}
+
+/// The annotated object→subject hash-join decision for one probe pattern: the
+/// cost inputs the planner weighed and the outcome. Computed at plan time and
+/// stashed on the chosen operator so `EXPLAIN` can render *why* without
+/// re-deriving (the driving-set estimate depends on per-block chain order).
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct HashJoinDecision {
+    pub(crate) join_var: VarId,
+    pub(crate) probe_count: Option<u64>,
+    pub(crate) driving_est: Option<f64>,
+    pub(crate) scan_ratio: Option<f64>,
+    pub(crate) chosen: bool,
+    pub(crate) reason: HashJoinReason,
+}
+
+impl HashJoinDecision {
+    /// Render the decision into an `EXPLAIN` plan-node detail map.
+    pub(crate) fn write_details(&self, m: &mut serde_json::Map<String, serde_json::Value>) {
+        m.insert("hash-join-chosen".into(), self.chosen.into());
+        m.insert("hash-join-reason".into(), self.reason.as_str().into());
+        if let Some(pc) = self.probe_count {
+            m.insert("probe-count".into(), pc.into());
+        }
+        if let Some(d) = self.driving_est {
+            m.insert("driving-est".into(), (d.round() as i64).into());
+        }
+        if let Some(r) = self.scan_ratio {
+            m.insert("scan-ratio".into(), format!("{r:.1}").into());
+        }
+    }
+}
+
 /// Probe-predicate row count from stats, keyed by SID or — for the un-encoded IRI
 /// predicates that non-reasoning queries carry — by IRI. Mirrors the planner's
 /// `property_stats` fallback so the cost model sees the same numbers reorder did.
@@ -217,30 +280,77 @@ impl<'a> HashJoinPlanner<'a> {
         });
     }
 
-    /// Decide whether the join for the current pattern should use the object→subject
-    /// hash join, returning the shared join variable when it should (and `None` to
-    /// keep the `NestedLoopJoinOperator` default). Honors the force mode; under `Auto`
-    /// it weighs the probe predicate's size against the latest `before_step` snapshot.
-    pub(crate) fn choose_object_hash_join(
+    /// Compute the annotated object→subject hash-join decision for the current
+    /// probe pattern: the shared join var (when the shape is eligible), the cost
+    /// inputs weighed, and the chosen/why outcome. Returns `None` only when the
+    /// pattern is not an object→subject shape (no hash join was ever a candidate).
+    /// Honors the force mode; under `Auto` it weighs the probe predicate's size
+    /// against the latest `before_step` snapshot.
+    ///
+    /// `build_scan_or_join` applies `chosen` to pick the operator and stashes the
+    /// decision so `EXPLAIN` can render it. The hot path reads only `chosen`.
+    pub(crate) fn explain_object_hash_join(
         &self,
         left_schema: &[VarId],
         tp: &TriplePattern,
         has_bounds: bool,
         inline_ops_empty: bool,
-    ) -> Option<VarId> {
-        if self.force == HashJoinForce::Off {
-            return None;
-        }
+    ) -> Option<HashJoinDecision> {
         let join_var = hash_join_object_join_var(left_schema, tp, has_bounds, inline_ops_empty)?;
-        let use_hash = match self.force {
-            HashJoinForce::On => true,
-            HashJoinForce::Off => false,
-            HashJoinForce::Auto => {
-                let probe_count = self.stats.and_then(|s| predicate_count(s, &tp.p));
-                hash_join_cost_wins(probe_count, self.step_est)
-            }
+        let driving_est = self.step_est;
+
+        if self.force == HashJoinForce::Off {
+            return Some(HashJoinDecision {
+                join_var,
+                probe_count: None,
+                driving_est,
+                scan_ratio: None,
+                chosen: false,
+                reason: HashJoinReason::ForcedOff,
+            });
+        }
+
+        let probe_count = self.stats.and_then(|s| predicate_count(s, &tp.p));
+        let scan_ratio = match (probe_count, driving_est) {
+            (Some(pc), Some(d)) => Some(pc as f64 / d.max(1.0)),
+            _ => None,
         };
-        use_hash.then_some(join_var)
+
+        let (chosen, reason) = match self.force {
+            HashJoinForce::On => (true, HashJoinReason::ForcedOn),
+            HashJoinForce::Off => unreachable!("handled above"),
+            HashJoinForce::Auto => match probe_count {
+                None => (false, HashJoinReason::NoProbeStats),
+                Some(pc) if pc < HASH_JOIN_PROBE_MIN => (false, HashJoinReason::ProbeTooSmall),
+                Some(pc) => {
+                    let drive = driving_est.unwrap_or(0.0).max(1.0);
+                    if (pc as f64) <= drive * HASH_JOIN_MAX_SCAN_RATIO {
+                        (true, HashJoinReason::CostWins)
+                    } else {
+                        (false, HashJoinReason::ScanRatioTooHigh)
+                    }
+                }
+            },
+        };
+
+        debug_assert_eq!(
+            chosen,
+            self.force != HashJoinForce::Off
+                && match self.force {
+                    HashJoinForce::On => true,
+                    _ => hash_join_cost_wins(probe_count, self.step_est),
+                },
+            "explain_object_hash_join must agree with the cost gate"
+        );
+
+        Some(HashJoinDecision {
+            join_var,
+            probe_count,
+            driving_est,
+            scan_ratio,
+            chosen,
+            reason,
+        })
     }
 }
 
@@ -328,6 +438,8 @@ pub struct HashJoinOperator {
     cur_probe: Option<Batch>,
     cur_probe_row: usize,
     state: OperatorState,
+    /// The planner's annotated decision, for `EXPLAIN`. Never read on the hot path.
+    hj_decision: Option<HashJoinDecision>,
 }
 
 impl HashJoinOperator {
@@ -390,7 +502,15 @@ impl HashJoinOperator {
             cur_probe: None,
             cur_probe_row: 0,
             state: OperatorState::Created,
+            hj_decision: None,
         }
+    }
+
+    /// Attach the planner's object→subject hash-join decision for `EXPLAIN`.
+    /// Plan-only — does not affect execution.
+    pub(crate) fn with_hash_join_decision(mut self, decision: HashJoinDecision) -> Self {
+        self.hj_decision = Some(decision);
+        self
     }
 
     /// Drain `build` into the hash table. Called once in `open()` on the hash path.
@@ -437,6 +557,9 @@ impl Operator for HashJoinOperator {
             "probe".into(),
             crate::explain::format_pattern(&self.right_pattern).into(),
         );
+        if let Some(d) = &self.hj_decision {
+            d.write_details(&mut m);
+        }
         m
     }
     fn schema(&self) -> &[VarId] {

@@ -242,9 +242,19 @@ Each node has:
   `PropertyJoinOperator`, `NestedLoopJoinOperator`, `DatasetOperator`, a count
   or other fast-path operator).
 - `est-rows`: build-time cardinality estimate, when the operator exposes one.
-- `details`: operator-specific attributes (e.g. a nested-loop join's `right`
-  probe pattern).
+- `details`: operator-specific attributes (e.g. a scan's `pattern` and planned
+  `index-hint`; a `PropertyJoinOperator`'s fused `predicates`).
 - `children`: child edges, each `{ "rel": ..., "node": { ... } }`.
+
+For an object→subject join, the node carries the planner's hash-join decision,
+so you can see **whether** a hash join was chosen and **why**:
+
+- `hash-join-chosen`: `true` on a `HashJoinOperator`, `false` on a
+  `NestedLoopJoinOperator` that was a hash-join candidate but lost.
+- `hash-join-reason`: `forced-on` / `forced-off` (the `FLUREE_HASH_JOIN` env),
+  `cost-wins`, `probe-too-small`, `scan-ratio-too-high`, or `no-probe-stats`.
+- `probe-count`, `driving-est`, `scan-ratio`: the cost inputs the planner
+  weighed (present when statistics are available).
 
 The edge `rel` distinguishes a real input from an alternative:
 

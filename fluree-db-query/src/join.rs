@@ -411,6 +411,10 @@ pub struct NestedLoopJoinOperator {
     logged_runtime_mode: bool,
     /// Temporal mode captured at planner-time for the late per-row right scan.
     mode: crate::temporal_mode::TemporalMode,
+    /// The object→subject hash-join decision that was evaluated and *lost* for
+    /// this join (shape-eligible but rejected by cost/force), for `EXPLAIN`.
+    /// `None` when no hash join was ever a candidate. Never read on the hot path.
+    hj_decision: Option<crate::hash_join::HashJoinDecision>,
 }
 
 impl NestedLoopJoinOperator {
@@ -672,12 +676,23 @@ impl NestedLoopJoinOperator {
             out_schema: None,
             logged_runtime_mode: false,
             mode,
+            hj_decision: None,
         }
     }
 
     /// Trim output to only the specified downstream variables.
     pub fn with_out_schema(mut self, downstream_vars: Option<&[VarId]>) -> Self {
         self.out_schema = compute_trimmed_vars(&self.combined_schema, downstream_vars);
+        self
+    }
+
+    /// Attach the object→subject hash-join decision that lost to this nested-loop
+    /// join, for `EXPLAIN`. Plan-only — does not affect execution.
+    pub(crate) fn with_hash_join_decision(
+        mut self,
+        decision: Option<crate::hash_join::HashJoinDecision>,
+    ) -> Self {
+        self.hj_decision = decision;
         self
     }
 
@@ -992,6 +1007,9 @@ impl Operator for NestedLoopJoinOperator {
             "right".into(),
             crate::explain::format_pattern(&self.right_pattern).into(),
         );
+        if let Some(d) = &self.hj_decision {
+            d.write_details(&mut m);
+        }
         m
     }
     fn schema(&self) -> &[VarId] {
