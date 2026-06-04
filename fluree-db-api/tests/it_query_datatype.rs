@@ -463,11 +463,7 @@ async fn langstring_same_value_different_tags_novelty() {
         .collect();
     assert_eq!(
         langs,
-        std::collections::BTreeSet::from([
-            "en".to_string(),
-            "es".to_string(),
-            "fr".to_string()
-        ]),
+        std::collections::BTreeSet::from(["en".to_string(), "es".to_string(), "fr".to_string()]),
         "expected en/es/fr to all survive, got {langs:?}"
     );
 }
@@ -558,6 +554,100 @@ async fn langstring_same_value_different_tags_indexed_overlay() {
             "fr".to_string()
         ]),
         "indexed-overlay: expected de/en/es/fr to all survive, got {langs:?}"
+    );
+}
+
+/// Issue #1273, export variant: a langString that lives in novelty over an
+/// indexed ledger (its BCP-47 tag not yet persisted) is encoded via the
+/// raw-flake path; the RDF export must still emit it (and its language tag),
+/// not silently drop it.
+#[tokio::test]
+async fn langstring_novelty_only_tag_exported() {
+    use fluree_db_api::export::ExportFormat;
+    use fluree_db_api::ReindexOptions;
+    use fluree_db_transact::{CommitOpts, TxnOpts};
+
+    // File-backed (production-like: leaflet cache loads full column projection,
+    // matching how export runs in deployment).
+    let tmp = tempfile::TempDir::new().unwrap();
+    let fluree = FlureeBuilder::file(tmp.path().to_str().unwrap())
+        .build()
+        .expect("build file fluree");
+    let ledger_id = "langbug/export:main";
+    let ledger0 = fluree.create_ledger(ledger_id).await.unwrap();
+    let ctx = ctx_datatype();
+
+    // Index a plain-string base so the ledger is indexed (export requires it).
+    let base = json!({
+        "@context": ctx,
+        "@id": "ex:base", "ex:name": "Base"
+    });
+    let _l1 = fluree.insert(ledger0, &base).await.unwrap().ledger;
+    fluree
+        .reindex(ledger_id, ReindexOptions::default())
+        .await
+        .expect("reindex");
+    let indexed = fluree.ledger(ledger_id).await.expect("load indexed");
+
+    // Novelty langStrings with brand-new tags fr/es (share value "animal").
+    // Neither tag is in the persisted lang dict, so both route through the
+    // raw-flake overlay path.
+    let novelty = json!({
+        "@context": ctx,
+        "@id": "ex:animal",
+        "ex:prefLabel": [
+            {"@language":"fr","@value":"animal"},
+            {"@language":"es","@value":"animal"}
+        ]
+    });
+    fluree
+        .insert_with_opts(
+            indexed,
+            &novelty,
+            TxnOpts::default(),
+            CommitOpts::default(),
+            &fluree_db_api::IndexConfig {
+                reindex_min_bytes: 1_000_000_000,
+                reindex_max_bytes: 1_000_000_000,
+            },
+        )
+        .await
+        .unwrap();
+
+    // N-Triples / Turtle: language tag in `"value"@lang` syntax.
+    for fmt in [ExportFormat::NTriples, ExportFormat::Turtle] {
+        let mut buf: Vec<u8> = Vec::new();
+        fluree
+            .export(ledger_id)
+            .format(fmt)
+            .write_to(&mut buf)
+            .await
+            .unwrap_or_else(|e| panic!("export {fmt:?} failed: {e}"));
+        let out = String::from_utf8(buf).unwrap();
+        assert!(
+            out.contains("\"animal\"@fr"),
+            "{fmt:?} export must contain @fr langString; got:\n{out}"
+        );
+        assert!(
+            out.contains("\"animal\"@es"),
+            "{fmt:?} export must contain @es langString; got:\n{out}"
+        );
+    }
+
+    // JSON-LD: language tag in a value object.
+    let mut buf: Vec<u8> = Vec::new();
+    fluree
+        .export(ledger_id)
+        .format(ExportFormat::JsonLd)
+        .write_to(&mut buf)
+        .await
+        .expect("export jsonld");
+    let out = String::from_utf8(buf).unwrap();
+    let parsed: JsonValue = serde_json::from_str(&out).expect("valid JSON-LD");
+    let blob = parsed.to_string();
+    assert!(
+        blob.contains("\"@language\":\"fr\"") && blob.contains("\"@language\":\"es\""),
+        "JSON-LD export must contain @fr and @es language tags; got:\n{out}"
     );
 }
 

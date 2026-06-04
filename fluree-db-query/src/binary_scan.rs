@@ -2203,7 +2203,7 @@ pub fn translate_overlay_flakes(
 /// The `ephemeral_preds` map contains predicate IRI → ephemeral p_id for predicates that
 /// don't exist in the persisted index dictionary. Callers must use this to extend their
 /// p_id → Sid lookup tables so that novelty-only predicates can be resolved during decode.
-fn translate_overlay_flakes_with_untranslated(
+pub fn translate_overlay_flakes_with_untranslated(
     overlay: &dyn OverlayProvider,
     store: &Arc<BinaryIndexStore>,
     dict_novelty: Option<&Arc<fluree_db_core::dict_novelty::DictNovelty>>,
