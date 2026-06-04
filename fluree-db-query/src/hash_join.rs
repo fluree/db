@@ -421,6 +421,24 @@ impl HashJoinOperator {
 
 #[async_trait]
 impl Operator for HashJoinOperator {
+    fn plan_children(&self) -> Vec<crate::plan_node::PlanChild<'_>> {
+        let mut v = Vec::new();
+        if let Some(b) = self.build.as_deref() {
+            v.push(crate::plan_node::PlanChild::child(b));
+        }
+        if let Some(p) = self.probe.as_deref() {
+            v.push(crate::plan_node::PlanChild::child(p));
+        }
+        v
+    }
+    fn plan_details(&self) -> serde_json::Map<String, serde_json::Value> {
+        let mut m = serde_json::Map::new();
+        m.insert(
+            "probe".into(),
+            crate::explain::format_pattern(&self.right_pattern).into(),
+        );
+        m
+    }
     fn schema(&self) -> &[VarId] {
         effective_schema(&self.out_schema, &self.full_schema)
     }

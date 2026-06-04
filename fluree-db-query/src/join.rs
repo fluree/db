@@ -983,6 +983,17 @@ impl NestedLoopJoinOperator {
 
 #[async_trait]
 impl Operator for NestedLoopJoinOperator {
+    fn plan_children(&self) -> Vec<crate::plan_node::PlanChild<'_>> {
+        vec![crate::plan_node::PlanChild::child(self.left.as_ref())]
+    }
+    fn plan_details(&self) -> serde_json::Map<String, serde_json::Value> {
+        let mut m = serde_json::Map::new();
+        m.insert(
+            "right".into(),
+            crate::explain::format_pattern(&self.right_pattern).into(),
+        );
+        m
+    }
     fn schema(&self) -> &[VarId] {
         effective_schema(&self.out_schema, &self.combined_schema)
     }

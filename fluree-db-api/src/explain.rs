@@ -453,12 +453,29 @@ fn explain_from_parsed(
         )
     };
 
+    // Planned physical plan: build the REAL operator tree (pure — no `open()`,
+    // no I/O) and walk it via `Operator::describe`. This reflects fast-path /
+    // count-planner / fold selection that the pattern-level views cannot show.
+    // It is built from `parsed`; the reasoning/geo rewrites the executor applies
+    // in `prepare` *before* building are not yet reflected here. Best-effort: a
+    // build error (e.g. an unbound select var the executor would reject) is
+    // surfaced in-band rather than failing the whole explain.
+    let physical_value = {
+        let planning = fluree_db_query::PlanningContext::current();
+        let stats_arc = stats_view.clone().map(std::sync::Arc::new);
+        match fluree_db_query::build_operator_tree(parsed, stats_arc, &planning) {
+            Ok(op) => serde_json::to_value(op.describe()).unwrap_or(JsonValue::Null),
+            Err(e) => json!({ "error": e.to_string() }),
+        }
+    };
+
     if !stats_available {
         let mut plan = serde_json::Map::new();
         plan.insert("optimization".into(), json!("none"));
         plan.insert("reason".into(), json!("No statistics available"));
         plan.insert("execution-hints".into(), json!(execution_hints));
         plan.insert("logical".into(), logical_value);
+        plan.insert("physical".into(), physical_value);
         if let Some(wc) = where_clause {
             plan.insert("where-clause".into(), wc);
         }
@@ -486,6 +503,7 @@ fn explain_from_parsed(
             "statistics": statistics,
             "execution-hints": execution_hints,
             "logical": logical_value,
+            "physical": physical_value,
             "original": original,
             "optimized": optimized
         }

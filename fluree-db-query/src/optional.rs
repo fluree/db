@@ -1298,6 +1298,9 @@ impl OptionalOperator {
 
 #[async_trait]
 impl Operator for OptionalOperator {
+    fn plan_children(&self) -> Vec<crate::plan_node::PlanChild<'_>> {
+        vec![crate::plan_node::PlanChild::child(self.required.as_ref())]
+    }
     fn schema(&self) -> &[VarId] {
         effective_schema(&self.out_schema, &self.combined_schema)
     }

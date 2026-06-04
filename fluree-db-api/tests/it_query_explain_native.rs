@@ -172,6 +172,18 @@ async fn explain_reorders_bound_object_email_first() {
             assert_eq!(logical[0]["pattern"]["property"], "ex:email");
             assert_eq!(logical[0]["category"], "source");
 
+            // The physical plan is built from the real operator tree (no exec).
+            let physical = &resp["plan"]["physical"];
+            eprintln!(
+                "PHYSICAL(star) = {}",
+                serde_json::to_string_pretty(physical).unwrap()
+            );
+            assert!(
+                physical.get("error").is_none(),
+                "physical build errored: {physical}"
+            );
+            assert!(physical["op"].as_str().is_some_and(|s| !s.is_empty()));
+
             // SPARQL equivalent
             let sparql = "PREFIX ex: <http://example.org/>\nSELECT ?person WHERE { ?person a ex:Person . ?person ex:email \"rare@example.org\" }";
             let resp_s = fluree

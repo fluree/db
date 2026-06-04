@@ -77,6 +77,53 @@ pub trait Operator: Send + Sync {
     async fn drain_count(&mut self, _ctx: &ExecutionContext<'_>) -> Result<Option<u64>> {
         Ok(None)
     }
+
+    // ------------------------------------------------------------------
+    // EXPLAIN introspection (never called on the hot path)
+    // ------------------------------------------------------------------
+    //
+    // `describe()` renders the *planned* physical plan from the built (but not
+    // opened) operator tree. Composite operators override `plan_children()` to
+    // expose their inputs so the tree connects; leaves can add `plan_details()`.
+    // Decisions finalized at `open()` (multi-graph hash→nested-loop downgrade,
+    // fast-path-vs-fallback, the actual index permutation) are NOT reflected
+    // here — that is `EXPLAIN ANALYZE` territory. See `docs`/the plan note.
+
+    /// Operator display name. Defaults to the bare Rust type name.
+    fn op_name(&self) -> String {
+        crate::plan_node::short_type_name(std::any::type_name_of_val(self)).to_string()
+    }
+
+    /// Operator-specific attributes for the plan node (join var, predicate,
+    /// chosen index hint, …). Default: none.
+    fn plan_details(&self) -> serde_json::Map<String, serde_json::Value> {
+        serde_json::Map::new()
+    }
+
+    /// Child operators this node will consume, tagged with their edge kind.
+    /// Override on every operator that owns inputs, or the rendered plan tree
+    /// truncates at this node. Default: none (leaf).
+    fn plan_children(&self) -> Vec<crate::plan_node::PlanChild<'_>> {
+        Vec::new()
+    }
+
+    /// Render this operator (and, recursively, its children) as a [`PlanNode`].
+    /// Provided — operators customize via `op_name`/`plan_details`/`plan_children`.
+    fn describe(&self) -> crate::plan_node::PlanNode {
+        crate::plan_node::PlanNode {
+            op: self.op_name(),
+            est_rows: self.estimated_rows(),
+            details: self.plan_details(),
+            children: self
+                .plan_children()
+                .into_iter()
+                .map(|c| crate::plan_node::PlanEdge {
+                    rel: c.rel,
+                    node: c.op.describe(),
+                })
+                .collect(),
+        }
+    }
 }
 
 /// Boxed operator for dynamic dispatch

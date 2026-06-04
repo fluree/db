@@ -166,6 +166,7 @@ Explain returns a JSON object `{ "query": <echo>, "plan": { ... } }`. The
 | `statistics-available` | whether HLL statistics were available for cost estimation |
 | `statistics`           | summary stats (e.g. `total-flakes`) |
 | `logical`              | the **compound-aware** join order the planner produces (see below) |
+| `physical`             | the **planned physical operator tree** the executor will build (see below) |
 | `original`             | the query's triple patterns in original order, with selectivity inputs |
 | `optimized`            | the same triples in the planner's chosen order |
 | `execution-hints`      | specialized execution strategies the executor will use (see [Execution Hints](#execution-hints)) |
@@ -225,6 +226,51 @@ Key things to look for:
   reordering is skipped for the `original`/`optimized` arrays. The `logical`
   view still shows the planner's heuristic order. Run at least one indexing
   cycle to enable statistics-based optimization.
+
+### The `physical` plan
+
+`physical` is the operator tree the executor will actually build — the
+"join plan". It is produced by building the **real** operator tree (the same
+`build_operator_tree` execution uses) and walking it; the query is **not
+executed** (no scans, no joins run). Because the fast-path / count-planner /
+fold selection happens at build time, `physical` shows what `logical` cannot:
+the chosen physical operators.
+
+Each node has:
+
+- `op`: the operator (e.g. `ProjectOperator`, `HashJoinOperator`,
+  `PropertyJoinOperator`, `NestedLoopJoinOperator`, `DatasetOperator`, a count
+  or other fast-path operator).
+- `est-rows`: build-time cardinality estimate, when the operator exposes one.
+- `details`: operator-specific attributes (e.g. a nested-loop join's `right`
+  probe pattern).
+- `children`: child edges, each `{ "rel": ..., "node": { ... } }`.
+
+The edge `rel` distinguishes a real input from an alternative:
+
+| `rel`         | Meaning |
+| ------------- | ------- |
+| `child`       | a real input the operator consumes |
+| `fallback`    | a correctness fallback run *instead* of the fast path when it bails at open (overlay/history/policy/multi-graph). Only one of the two executes. |
+| `conditional` | a path chosen at runtime |
+
+Example — a same-subject star collapses to a single fused operator:
+
+```jsonc
+"physical": {
+  "op": "ProjectOperator",
+  "children": [
+    { "rel": "child", "node": { "op": "PropertyJoinOperator" } }
+  ]
+}
+```
+
+**Planned vs. actual.** `physical` is the *planned* tree. A few decisions are
+finalized only at execution `open()` and are **not** reflected here: the
+multi-graph hash-join → nested-loop downgrade, whether a fast path takes its
+fallback, and the exact index permutation (SPOT/POST/OPST/PSOT) a scan chooses.
+Surfacing those requires actually running the query (a future `EXPLAIN ANALYZE`
+mode), which `EXPLAIN` deliberately does not do.
 
 ### Execution Hints
 

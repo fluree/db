@@ -76,6 +76,69 @@ async fn explain_sparql_no_stats_reports_none_and_reason() {
 }
 
 #[tokio::test]
+async fn explain_physical_plan_present_and_concretely_named() {
+    // plan.physical is built from the REAL operator tree (build-only, no exec).
+    // Validate it is present and operators resolve to concrete names (the
+    // default op_name() must see through dyn dispatch, not report "dyn Operator").
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger0 = genesis_ledger(&fluree, "physical-names:main");
+
+    let ledger = fluree
+        .insert(
+            ledger0,
+            &json!({
+                "@context": {"ex":"http://example.org/"},
+                "@id":"ex:alice",
+                "ex:name":"Alice"
+            }),
+        )
+        .await
+        .expect("seed")
+        .ledger;
+
+    let sparql = "PREFIX ex: <http://example.org/>\nSELECT ?person ?name WHERE { ?person ex:name ?name }";
+
+    let db = graphdb_from_ledger(&ledger);
+    let resp = fluree
+        .explain_sparql(&db, sparql)
+        .await
+        .expect("explain_sparql");
+
+    let physical = &resp["plan"]["physical"];
+    eprintln!(
+        "PHYSICAL = {}",
+        serde_json::to_string_pretty(physical).unwrap()
+    );
+    assert!(
+        physical.get("error").is_none(),
+        "physical build errored: {physical}"
+    );
+    let op = physical["op"].as_str().expect("physical.op is a string");
+    assert!(!op.is_empty());
+    assert!(
+        !op.contains("dyn Operator"),
+        "operator name should be concrete, got {op:?}"
+    );
+    // The tree is connected (not truncated at the root): the scan leaf is reachable.
+    assert!(
+        physical_contains_op(physical, "DatasetOperator"),
+        "expected a DatasetOperator scan leaf in the physical tree: {physical}"
+    );
+}
+
+/// Recursively search a `plan.physical` node (and its `children[].node`) for an
+/// operator whose `op` equals `name`.
+fn physical_contains_op(node: &serde_json::Value, name: &str) -> bool {
+    if node["op"] == name {
+        return true;
+    }
+    node["children"]
+        .as_array()
+        .map(|cs| cs.iter().any(|e| physical_contains_op(&e["node"], name)))
+        .unwrap_or(false)
+}
+
+#[tokio::test]
 async fn explain_logical_plan_preserves_compound_structure() {
     // The `logical` plan view is the compound-aware reorder_patterns order,
     // available even without stats. Verify a triple + OPTIONAL render as a

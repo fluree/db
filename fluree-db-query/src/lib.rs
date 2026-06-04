@@ -67,6 +67,7 @@ pub mod offset;
 pub mod operator;
 pub mod optional;
 pub mod parse;
+pub mod plan_node;
 pub mod planner;
 pub mod policy;
 pub mod project;
@@ -113,6 +114,7 @@ pub use explain::{
     OptimizationStatus, PatternDisplay, SelectivityInputs,
 };
 pub use filter::FilterOperator;
+pub use plan_node::{PlanEdge, PlanEdgeRel, PlanNode};
 pub use geo_rewrite::rewrite_geo_patterns;
 pub use graph::GraphOperator;
 pub use group_aggregate::{GroupAggregateOperator, StreamingAggSpec};
