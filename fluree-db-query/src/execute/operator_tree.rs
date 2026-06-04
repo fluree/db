@@ -50,6 +50,7 @@ use crate::operator::BoxedOperator;
 use crate::project::ProjectOperator;
 use crate::sort::SortDirection;
 use crate::sort::SortOperator;
+use crate::sort::SortSpec;
 use crate::stats_query::StatsCountByPredicateOperator;
 use crate::temporal_mode::PlanningContext;
 use crate::var_registry::VarId;
@@ -57,7 +58,7 @@ use fluree_db_core::StatsView;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
-use super::dependency::compute_variable_deps;
+use super::dependency::{compute_variable_deps, VariableDeps};
 use super::where_plan::build_where_operators_with_needed;
 use super::where_plan::collect_var_stats;
 
@@ -924,6 +925,21 @@ fn detect_sum_strlen_group_concat_subquery(query: &Query) -> Option<(Ref, Arc<st
     let (Some(sq), Some((bind_var, bind_expr))) = (subq, bind) else {
         return None;
     };
+    // The fused operator sums STRLEN(GROUP_CONCAT(..)) over EVERY group directly
+    // and ignores the inner subquery's slice / distinct / ordering modifiers.
+    // Only fire for the exact unmodified inner shape; otherwise an inner
+    // DISTINCT (collapsing duplicate concatenations) or LIMIT/OFFSET (summing a
+    // subset of groups) would change the answer. Falling back to the generic
+    // pipeline keeps those modifiers honored. ORDER BY alone is sum-invariant,
+    // but is declined too so the matched shape stays exact.
+    if sq.distinct
+        || sq.limit.is_some()
+        || sq.offset.is_some()
+        || !sq.ordering.is_empty()
+        || !sq.order_binds.is_empty()
+    {
+        return None;
+    }
     if bind_var != strlen_var {
         return None;
     }
@@ -2034,6 +2050,23 @@ pub fn build_operator_tree(
     stats: Option<Arc<StatsView>>,
     planning: &PlanningContext,
 ) -> Result<BoxedOperator> {
+    // Fold `FILTER(?x = ?y)` equijoins into variable unification before planning,
+    // so the rewrite feeds the stats-driven reorder, count planner, and index
+    // fast paths (rather than running as a cross-product + filter). Only clone
+    // the IR when there is actually something to fold. Recurses into subqueries.
+    if stats.is_some() && crate::filter_fold::has_equijoin_filter(query) {
+        let mut folded = query.clone();
+        crate::filter_fold::fold_equijoin_filters(&mut folded, stats.as_deref());
+        return build_operator_tree_inner(&folded, stats, true, planning);
+    }
+    // Rewrite `avg` over an anti-join complement into a difference of aggregates
+    // (universe total minus the per-key WITH aggregate), eliminating the
+    // feature x product cross-product. Clone only when a candidate is present.
+    if crate::aggregate_complement_fold::has_aggregate_complement_candidate(query) {
+        let mut rewritten = query.clone();
+        crate::aggregate_complement_fold::fold_aggregate_complements(&mut rewritten);
+        return build_operator_tree_inner(&rewritten, stats, true, planning);
+    }
     build_operator_tree_inner(query, stats, true, planning)
 }
 
@@ -2639,27 +2672,14 @@ fn build_operator_tree_inner(
         needed_where_vars = vars;
     }
 
-    // Flatten the grouping phase's data for consumption below. The variant
-    // distinction has already done its structural work at the IR boundary;
-    // the operator-tree builder treats both variants uniformly. Cloning is
-    // cheap here — both vectors are short (typically a handful of items)
-    // and this is one-shot setup, not per-row work.
+    // The WHERE planner takes the GROUP BY keys as a hint (it can stream-group
+    // a sorted scan). The remainder of the grouping phase (aggregates, HAVING,
+    // post-binds) is consumed by the shared `apply_solution_modifiers` tail.
     let group_by_vec: Vec<VarId> = query
         .grouping
         .iter()
         .flat_map(Grouping::group_by_vars)
         .collect();
-    let aggregates_vec: Vec<AggregateSpec> = query
-        .grouping
-        .as_ref()
-        .map(|g| g.aggregates().cloned().collect())
-        .unwrap_or_default();
-    let post_binds_vec: Vec<(VarId, Expression)> = query
-        .grouping
-        .as_ref()
-        .map(|g| g.binds().cloned().collect())
-        .unwrap_or_default();
-    let having_expr: Option<&Expression> = query.grouping.as_ref().and_then(Grouping::having);
 
     let mut operator = build_where_operators_with_needed(
         &query.patterns,
@@ -2682,13 +2702,106 @@ fn build_operator_tree_inner(
         ));
     }
 
-    // Get the schema after WHERE (before grouping)
-    let where_schema: Arc<[VarId]> = Arc::from(operator.schema().to_vec().into_boxed_slice());
+    // The solution-modifier tail (grouping → HAVING → post-binds → order-binds
+    // → sort/validate → PROJECT → DISTINCT → OFFSET → LIMIT) is shared with the
+    // per-row correlated-subquery pipeline (`SubqueryOperator`) via
+    // `apply_solution_modifiers`, so both inherit identical modifier semantics.
+    // Only the WHERE build and outermost-only concerns (post-VALUES) stay here.
+    let projected = query.output.projected_vars();
+    apply_solution_modifiers(
+        operator,
+        query.grouping.as_ref(),
+        &query.order_binds,
+        &query.ordering,
+        projected.as_deref(),
+        query.output.is_distinct(),
+        query.offset,
+        query.limit,
+        detect_partitioned_group_by(query),
+        variable_deps.as_ref(),
+    )
+}
+
+/// Apply the SPARQL solution-modifier tail to an already-built WHERE operator.
+///
+/// Shared by the top-level query pipeline (`build_operator_tree_inner`) and the
+/// per-row correlated-subquery pipeline (`SubqueryOperator`). Runs, in order:
+/// GROUP BY + aggregation, HAVING, post-aggregation binds, expression/aggregate
+/// ORDER-BY binds, sort-var validation, ORDER BY (with safe top-k and the
+/// project-distinct-before-sort optimization), PROJECT, DISTINCT, OFFSET, LIMIT.
+///
+/// `operator` is the WHERE output (seeded or not). `select_vars` is the plain
+/// projected-variable list (`None` = no projection, e.g. wildcard). Outermost-
+/// only concerns (output formatting, CONSTRUCT/ASK, post-VALUES) stay in the
+/// caller. `variable_deps` drives projection trimming; pass `None` to skip it.
+/// `partitioned` is the streaming-GroupAggregate partition hint (callers that
+/// don't benefit pass `false`).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn apply_solution_modifiers(
+    mut operator: BoxedOperator,
+    grouping: Option<&Grouping>,
+    order_binds: &[(VarId, Expression)],
+    ordering: &[SortSpec],
+    select_vars: Option<&[VarId]>,
+    distinct: bool,
+    offset: Option<usize>,
+    limit: Option<usize>,
+    partitioned: bool,
+    variable_deps: Option<&VariableDeps>,
+) -> Result<BoxedOperator> {
+    // Flatten the grouping phase's data for consumption below. The variant
+    // distinction has already done its structural work at the IR boundary; the
+    // tail treats both variants uniformly. Cloning is cheap — both vectors are
+    // short and this is one-shot setup, not per-row work.
+    let group_by_vec: Vec<VarId> = grouping
+        .into_iter()
+        .flat_map(Grouping::group_by_vars)
+        .collect();
+    let aggregates_vec: Vec<AggregateSpec> = grouping
+        .map(|g| g.aggregates().cloned().collect())
+        .unwrap_or_default();
+    let post_binds_vec: Vec<(VarId, Expression)> = grouping
+        .map(|g| g.binds().cloned().collect())
+        .unwrap_or_default();
+    let having_expr: Option<&Expression> = grouping.and_then(Grouping::having);
+
+    let needs_grouping = !group_by_vec.is_empty() || !aggregates_vec.is_empty();
+
+    // SPARQL 1.1 §11.4 (GROUP BY) / §18.5: a GROUP BY variable — or, in an
+    // ungrouped query, a SELECT variable — that the WHERE never binds is legal.
+    // It is simply unbound: every solution shares the same unbound value, so
+    // they collapse into one group on that key, and the variable is reported
+    // unbound. Materialize such variables as Unbound columns (an identity
+    // `BIND(?v AS ?v)` over the absent var evaluates to Unbound) so grouping and
+    // projection treat them as unbound instead of failing the schema lookup.
+    // Aggregate INPUT variables are intentionally NOT padded here — a missing
+    // aggregate input stays an error.
+    let mut where_schema_vec: Vec<VarId> = operator.schema().to_vec();
+    {
+        let mut want: Vec<VarId> = group_by_vec.clone();
+        if !needs_grouping {
+            if let Some(sv) = select_vars {
+                want.extend_from_slice(sv);
+            }
+        }
+        for v in want {
+            if !where_schema_vec.contains(&v) {
+                operator = Box::new(crate::bind::BindOperator::new(
+                    operator,
+                    v,
+                    Expression::Var(v),
+                    Vec::new(),
+                ));
+                where_schema_vec.push(v);
+            }
+        }
+    }
+    // Get the schema after WHERE (before grouping), including any unbound pads.
+    let where_schema: Arc<[VarId]> = Arc::from(where_schema_vec.into_boxed_slice());
 
     // GROUP BY + Aggregates
     // We use streaming GroupAggregateOperator when all aggregates are streamable
     // (COUNT, SUM, AVG, MIN, MAX). This is O(groups) memory instead of O(rows).
-    let needs_grouping = !group_by_vec.is_empty() || !aggregates_vec.is_empty();
     if needs_grouping {
         // Validate group vars exist in where schema
         for var in &group_by_vec {
@@ -2757,7 +2870,7 @@ fn build_operator_tree_inner(
         // If the SELECT projects any *grouped* variables (non-key, non-aggregate),
         // we must use the traditional GroupByOperator path so those vars become
         // `Binding::Grouped(Vec<Binding>)` and remain selectable.
-        let select_needs_grouped_vars = query.output.projected_vars().is_some_and(|vars| {
+        let select_needs_grouped_vars = select_vars.is_some_and(|vars| {
             vars.iter().any(|v| {
                 !group_by_vec.contains(v) && !aggregates_vec.iter().any(|a| a.output_var == *v)
             })
@@ -2769,7 +2882,6 @@ fn build_operator_tree_inner(
 
         if use_streaming {
             // Streaming path: O(groups) memory
-            let partitioned = detect_partitioned_group_by(query);
             tracing::debug!(
                 group_by_count = group_by_vec.len(),
                 agg_count = streaming_specs.len(),
@@ -2847,7 +2959,7 @@ fn build_operator_tree_inner(
     // For ungrouped queries this is simply a post-WHERE stage. This placement is
     // what makes expression ORDER BY work uniformly across no-grouping,
     // dedup-only GROUP BY (no aggregation stage), and aggregating queries.
-    if !query.order_binds.is_empty() {
+    if !order_binds.is_empty() {
         // Under grouping, an order-key expression may only read GROUP BY keys,
         // aggregate outputs, and post-aggregation bind outputs. Referencing any
         // other variable means it is `Binding::Grouped` here — reject cleanly
@@ -2861,7 +2973,7 @@ fn build_operator_tree_inner(
             for (var, _) in &post_binds_vec {
                 allowed.insert(*var);
             }
-            for (out_var, expr) in &query.order_binds {
+            for (out_var, expr) in order_binds {
                 for v in expr.referenced_vars() {
                     if !allowed.contains(&v) {
                         return Err(QueryError::InvalidQuery(format!(
@@ -2873,7 +2985,7 @@ fn build_operator_tree_inner(
                 allowed.insert(*out_var);
             }
         }
-        for (var, expr) in &query.order_binds {
+        for (var, expr) in order_binds {
             operator = Box::new(crate::bind::BindOperator::new(
                 operator,
                 *var,
@@ -2896,15 +3008,13 @@ fn build_operator_tree_inner(
     // size (and allow top-k truncation) while preserving semantics:
     // duplicates eliminated by DISTINCT have identical sort keys, so removing
     // them before sorting does not change the ordered set of unique solutions.
-    let select_vars_opt: Option<Vec<VarId>> = query.output.projected_vars();
-    let can_project_distinct_before_sort = query.output.is_distinct()
-        && !query.ordering.is_empty()
-        && select_vars_opt.as_ref().is_some_and(|vars| {
-            !vars.is_empty() && query.ordering.iter().all(|s| vars.contains(&s.var))
-        });
+    let can_project_distinct_before_sort = distinct
+        && !ordering.is_empty()
+        && select_vars
+            .is_some_and(|vars| !vars.is_empty() && ordering.iter().all(|s| vars.contains(&s.var)));
 
     // Validate SELECT vars (when present) exist in the post-group schema.
-    if let Some(vars) = &select_vars_opt {
+    if let Some(vars) = select_vars {
         if !vars.is_empty() {
             for var in vars {
                 if !post_group_schema.contains(var) {
@@ -2917,7 +3027,7 @@ fn build_operator_tree_inner(
     }
 
     // Validate ORDER BY vars exist in the post-group schema and are allowed under grouping.
-    if !query.ordering.is_empty() {
+    if !ordering.is_empty() {
         // Disallow sorting on Grouped variables (non-key, non-aggregated) because comparison is undefined.
         let mut allowed_sort_vars: Option<HashSet<VarId>> = None;
         if needs_grouping {
@@ -2936,12 +3046,12 @@ fn build_operator_tree_inner(
             }
             // Desugared expression-ORDER-BY keys run as a post-grouping stage
             // and are validated above to read only allowed vars.
-            for (var, _) in &query.order_binds {
+            for (var, _) in order_binds {
                 allowed.insert(*var);
             }
             allowed_sort_vars = Some(allowed);
         }
-        for spec in &query.ordering {
+        for spec in ordering {
             if !post_group_schema.contains(&spec.var) {
                 return Err(QueryError::VariableNotFound(format!(
                     "Sort variable {:?} not found in query schema",
@@ -2961,23 +3071,23 @@ fn build_operator_tree_inner(
 
     if can_project_distinct_before_sort {
         // PROJECT
-        if let Some(vars) = select_vars_opt {
+        if let Some(vars) = select_vars {
             operator = Box::new(ProjectOperator::new(operator, vars.to_vec()));
         }
         // DISTINCT (pre-sort)
         operator = Box::new(DistinctOperator::new(operator));
 
         // ORDER BY (post-distinct, projected vars only)
-        let k = match (query.limit, query.offset) {
+        let k = match (limit, offset) {
             (Some(limit), Some(offset)) => limit.saturating_add(offset),
             (Some(limit), None) => limit,
             _ => 0,
         };
-        let can_topk = query.limit.is_some();
+        let can_topk = limit.is_some();
         let mut sort_op = if can_topk {
-            SortOperator::new_topk(operator, query.ordering.clone(), k)
+            SortOperator::new_topk(operator, ordering.to_vec(), k)
         } else {
-            SortOperator::new(operator, query.ordering.clone())
+            SortOperator::new(operator, ordering.to_vec())
         };
         sort_op = sort_op.with_out_schema(
             variable_deps
@@ -2987,20 +3097,20 @@ fn build_operator_tree_inner(
         operator = Box::new(sort_op);
     } else {
         // ORDER BY (before projection - may reference vars not in SELECT)
-        if !query.ordering.is_empty() {
+        if !ordering.is_empty() {
             // Safe top-k: ORDER BY + (OFFSET o) + LIMIT l can keep only (o + l) rows.
             //
             // This is safe when DISTINCT is not in play because slicing happens after sorting.
-            let can_topk = query.limit.is_some() && !query.output.is_distinct();
-            let k = match (query.limit, query.offset) {
+            let can_topk = limit.is_some() && !distinct;
+            let k = match (limit, offset) {
                 (Some(limit), Some(offset)) => limit.saturating_add(offset),
                 (Some(limit), None) => limit,
                 _ => 0,
             };
             let mut sort_op = if can_topk {
-                SortOperator::new_topk(operator, query.ordering.clone(), k)
+                SortOperator::new_topk(operator, ordering.to_vec(), k)
             } else {
-                SortOperator::new(operator, query.ordering.clone())
+                SortOperator::new(operator, ordering.to_vec())
             };
             sort_op = sort_op.with_out_schema(
                 variable_deps
@@ -3011,27 +3121,27 @@ fn build_operator_tree_inner(
         }
 
         // PROJECT
-        if let Some(vars) = select_vars_opt {
+        if let Some(vars) = select_vars {
             if !vars.is_empty() {
                 operator = Box::new(ProjectOperator::new(operator, vars.to_vec()));
             }
         }
 
         // DISTINCT (after projection)
-        if query.output.is_distinct() {
+        if distinct {
             operator = Box::new(DistinctOperator::new(operator));
         }
     }
 
     // OFFSET
-    if let Some(offset) = query.offset {
+    if let Some(offset) = offset {
         if offset > 0 {
             operator = Box::new(OffsetOperator::new(operator, offset));
         }
     }
 
     // LIMIT
-    if let Some(limit) = query.limit {
+    if let Some(limit) = limit {
         operator = Box::new(LimitOperator::new(operator, limit));
     }
 
@@ -3186,7 +3296,10 @@ mod tests {
     }
 
     #[test]
-    fn test_build_operator_tree_validates_select_vars() {
+    fn test_build_operator_tree_allows_unbound_select_var() {
+        // SPARQL 1.1 §18.5: selecting a variable not bound by the pattern is
+        // legal — it is reported unbound, not an error. The tree pads it as an
+        // Unbound column rather than failing the schema lookup.
         let query = Query {
             context: ParsedContext::default(),
             orig_context: None,
@@ -3206,10 +3319,10 @@ mod tests {
             None,
             &crate::temporal_mode::PlanningContext::current(),
         );
-        match result {
-            Err(e) => assert!(e.to_string().contains("not found")),
-            Ok(_) => panic!("Expected error for invalid select var"),
-        }
+        assert!(
+            result.is_ok(),
+            "selecting an unbound variable should succeed (reported unbound)"
+        );
     }
 
     #[test]

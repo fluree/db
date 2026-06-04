@@ -1577,7 +1577,35 @@ impl BinaryIndexStore {
         // The V3 format uses ForwardPack readers (already mmap'd) for forward dicts
         // and CoW trees for reverse dicts. Reverse-tree leaf preloading can be
         // added when cold-start latency is observed in production.
+        //
+        // Forward-dict page warming is implemented separately in
+        // [`Self::prewarm_forward_dicts`], which the server's background warmer
+        // calls at startup.
         Ok(0)
+    }
+
+    /// Pre-warm forward-dictionary pages (string + subject packs) into the OS
+    /// page cache, up to `budget_bytes` total across all packs. Returns the
+    /// number of bytes touched.
+    ///
+    /// The index root and reverse-dict tree readers are already resident after
+    /// [`load_from_root_v6`](Self::load_from_root_v6); this targets the forward
+    /// packs, which are mmapped lazily and otherwise fault in on the first query
+    /// that resolves an IRI/string ID. String packs are warmed first (broadest
+    /// query impact), then per-namespace subject packs. Warming stops once the
+    /// budget is exhausted.
+    ///
+    /// Blocking (page faults / sequential reads) — call from a blocking context
+    /// such as `tokio::task::spawn_blocking`, never on the hot async path.
+    pub fn prewarm_forward_dicts(&self, budget_bytes: u64) -> u64 {
+        let mut warmed = self.dicts.string_forward_packs.prewarm(budget_bytes);
+        for reader in self.dicts.subject_forward_packs.values() {
+            if warmed >= budget_bytes {
+                break;
+            }
+            warmed += reader.prewarm(budget_bytes - warmed);
+        }
+        warmed
     }
 
     /// Create a `BinaryGraphView` for a specific graph (no novelty).

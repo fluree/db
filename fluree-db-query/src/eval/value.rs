@@ -307,7 +307,7 @@ impl ComparableValue {
     /// inner value is unwrapped (or parsed, for the string-encoded cases) here.
     /// Non-numeric typed literals — and all other variants — are returned
     /// unchanged, so they still fall to a `TypeMismatch` in [`ArithmeticOp::apply`].
-    fn coerce_numeric_operand(self) -> ComparableValue {
+    pub(crate) fn coerce_numeric_operand(self) -> ComparableValue {
         let ComparableValue::TypedLiteral { val, dtc } = self else {
             return self;
         };

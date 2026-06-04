@@ -259,6 +259,21 @@ impl CompareOp {
 /// Returns `None` for type mismatches (incomparable types).
 /// Delegates to FlakeValue's comparison methods for numeric and temporal types.
 fn cmp_values(left: &ComparableValue, right: &ComparableValue) -> Option<Ordering> {
+    // Normalize numeric values carried as a `TypedLiteral` (e.g. xsd:float, whose
+    // value is stored string-backed) into their primitive numeric variant so the
+    // numeric comparison below applies — mirroring arithmetic's operand coercion.
+    // Only clone when a typed literal is actually present (the uncommon case).
+    let (lc, rc);
+    let (left, right) = if matches!(left, ComparableValue::TypedLiteral { .. })
+        || matches!(right, ComparableValue::TypedLiteral { .. })
+    {
+        lc = left.clone().coerce_numeric_operand();
+        rc = right.clone().coerce_numeric_operand();
+        (&lc, &rc)
+    } else {
+        (left, right)
+    };
+
     let left_fv: FlakeValue = left.into();
     let right_fv: FlakeValue = right.into();
 
