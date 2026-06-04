@@ -142,6 +142,10 @@ pub(crate) enum HashJoinReason {
     ScanRatioTooHigh,
     /// No probe-predicate stats, so the cost model can't justify the hash join.
     NoProbeStats,
+    /// The subject (not the object) is bound from the left, so this is a forward
+    /// join the object→subject hash can't replace. Reordering to drive the other
+    /// end is what helps (the BSBM-BI bowtie case).
+    SubjectDriven,
 }
 
 impl HashJoinReason {
@@ -153,6 +157,7 @@ impl HashJoinReason {
             HashJoinReason::ProbeTooSmall => "probe-too-small",
             HashJoinReason::ScanRatioTooHigh => "scan-ratio-too-high",
             HashJoinReason::NoProbeStats => "no-probe-stats",
+            HashJoinReason::SubjectDriven => "subject-driven-forward-join",
         }
     }
 }
@@ -163,7 +168,9 @@ impl HashJoinReason {
 /// re-deriving (the driving-set estimate depends on per-block chain order).
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct HashJoinDecision {
-    pub(crate) join_var: VarId,
+    /// The shared join var when the hash join was chosen; `None` for a rejected or
+    /// non-object→subject (forward) join, which carries only a reason.
+    pub(crate) join_var: Option<VarId>,
     pub(crate) probe_count: Option<u64>,
     pub(crate) driving_est: Option<f64>,
     pub(crate) scan_ratio: Option<f64>,
@@ -201,40 +208,60 @@ fn predicate_count(stats: &StatsView, pred: &crate::ir::triple::Ref) -> Option<u
     None
 }
 
-/// Eligibility for the object→subject hash join. The right pattern `tp` must be a
-/// single fixed-predicate scan whose OBJECT is the (only) variable shared with the
-/// left side (the join key), whose SUBJECT is a new variable, with no object bounds,
-/// no datatype constraint, and no inline ops. Returns the shared join variable.
-///
-/// This is exactly the shape that `NestedLoopJoinOperator` would otherwise run via
-/// the batched-OBJECT (OPST) path — the slow case the hash join replaces.
+/// Classification of a join pattern relative to the object→subject hash join.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ObjectHashShape {
+    /// Fixed predicate, object bound from the left (the join key), subject new —
+    /// the exact shape the hash join replaces (else the batched-OBJECT OPST path).
+    Eligible(VarId),
+    /// Fixed predicate, but the SUBJECT is bound from the left and the OBJECT is
+    /// new: a forward (subject-driven) join. The object→subject hash can't help —
+    /// reordering to drive the other end is the fix. Surfaced in EXPLAIN.
+    SubjectDriven,
+    /// Not an object→subject candidate at all (var predicate, object bounds, a
+    /// datatype constraint, inline ops, or both endpoints already bound).
+    NotCandidate,
+}
+
+/// Classify the right pattern `tp` for the object→subject hash join. A fixed
+/// predicate may be a SID or an IRI: non-reasoning SPARQL/JSON-LD queries reach
+/// planning with IRI predicates (only reasoning queries are pre-encoded to SIDs in
+/// runner.rs), so a SID-only check would silently exclude the exact BSBM joins this
+/// operator targets.
+fn object_hash_shape(
+    left_schema: &[VarId],
+    tp: &TriplePattern,
+    has_bounds: bool,
+    inline_ops_empty: bool,
+) -> ObjectHashShape {
+    if has_bounds || !inline_ops_empty || tp.dtc.is_some() || tp.p.as_var().is_some() {
+        return ObjectHashShape::NotCandidate;
+    }
+    let (Some(o_var), Some(s_var)) = (tp.o.as_var(), tp.s.as_var()) else {
+        return ObjectHashShape::NotCandidate;
+    };
+    let o_bound = left_schema.contains(&o_var);
+    let s_bound = left_schema.contains(&s_var);
+    match (o_bound, s_bound) {
+        // Object bound from the left, subject new: the hash-join shape.
+        (true, false) => ObjectHashShape::Eligible(o_var),
+        // Subject bound, object new: a forward join the hash join can't replace.
+        (false, true) => ObjectHashShape::SubjectDriven,
+        _ => ObjectHashShape::NotCandidate,
+    }
+}
+
+#[cfg(test)]
 fn hash_join_object_join_var(
     left_schema: &[VarId],
     tp: &TriplePattern,
     has_bounds: bool,
     inline_ops_empty: bool,
 ) -> Option<VarId> {
-    if has_bounds || !inline_ops_empty || tp.dtc.is_some() {
-        return None;
+    match object_hash_shape(left_schema, tp, has_bounds, inline_ops_empty) {
+        ObjectHashShape::Eligible(v) => Some(v),
+        _ => None,
     }
-    // Predicate must be fixed — a SID or an IRI — so the probe scans one contiguous
-    // partition. Non-reasoning SPARQL/JSON-LD queries reach planning with IRI
-    // predicates (only reasoning queries are pre-encoded to SIDs in runner.rs), so a
-    // SID-only check here silently excluded the exact BSBM joins this operator targets.
-    if tp.p.as_var().is_some() {
-        return None;
-    }
-    // Object must be a var already bound from the left (the join key).
-    let o_var = tp.o.as_var()?;
-    if !left_schema.contains(&o_var) {
-        return None;
-    }
-    // Subject must be a brand-new var (not shared with the left).
-    let s_var = tp.s.as_var()?;
-    if left_schema.contains(&s_var) {
-        return None;
-    }
-    Some(o_var)
 }
 
 /// Per-WHERE-block planning state for the object→subject hash join.
@@ -283,9 +310,10 @@ impl<'a> HashJoinPlanner<'a> {
     /// Compute the annotated object→subject hash-join decision for the current
     /// probe pattern: the shared join var (when the shape is eligible), the cost
     /// inputs weighed, and the chosen/why outcome. Returns `None` only when the
-    /// pattern is not an object→subject shape (no hash join was ever a candidate).
-    /// Honors the force mode; under `Auto` it weighs the probe predicate's size
-    /// against the latest `before_step` snapshot.
+    /// pattern is not even a fixed-predicate two-var join (no decision to explain);
+    /// a subject-driven forward join returns a decision carrying its reason + the
+    /// driving-set size. Honors the force mode; under `Auto` it weighs the probe
+    /// predicate's size against the latest `before_step` snapshot.
     ///
     /// `build_scan_or_join` applies `chosen` to pick the operator and stashes the
     /// decision so `EXPLAIN` can render it. The hot path reads only `chosen`.
@@ -296,12 +324,27 @@ impl<'a> HashJoinPlanner<'a> {
         has_bounds: bool,
         inline_ops_empty: bool,
     ) -> Option<HashJoinDecision> {
-        let join_var = hash_join_object_join_var(left_schema, tp, has_bounds, inline_ops_empty)?;
         let driving_est = self.step_est;
+        let join_var = match object_hash_shape(left_schema, tp, has_bounds, inline_ops_empty) {
+            ObjectHashShape::Eligible(v) => v,
+            // Forward join: surface why the NestedLoop was chosen + the driving size
+            // (reordering to drive the other end is the fix), but no cost gate runs.
+            ObjectHashShape::SubjectDriven => {
+                return Some(HashJoinDecision {
+                    join_var: None,
+                    probe_count: self.stats.and_then(|s| predicate_count(s, &tp.p)),
+                    driving_est,
+                    scan_ratio: None,
+                    chosen: false,
+                    reason: HashJoinReason::SubjectDriven,
+                });
+            }
+            ObjectHashShape::NotCandidate => return None,
+        };
 
         if self.force == HashJoinForce::Off {
             return Some(HashJoinDecision {
-                join_var,
+                join_var: Some(join_var),
                 probe_count: None,
                 driving_est,
                 scan_ratio: None,
@@ -344,7 +387,7 @@ impl<'a> HashJoinPlanner<'a> {
         );
 
         Some(HashJoinDecision {
-            join_var,
+            join_var: Some(join_var),
             probe_count,
             driving_est,
             scan_ratio,
@@ -756,6 +799,39 @@ impl Operator for HashJoinOperator {
 mod tests {
     use super::*;
     use crate::ir::triple::{Ref, Term};
+    use fluree_db_core::{PropertyStatData, Sid};
+
+    #[test]
+    fn explains_subject_driven_forward_join() {
+        // `?review rev:reviewer ?reviewer` with ?review bound from the left and
+        // ?reviewer new is a forward (subject-driven) join — not an object→subject
+        // hash candidate. The decision must still surface a reason + the driving-set
+        // size so EXPLAIN's NestedLoop isn't opaque (this was the BSBM-BI F2 case).
+        let review = VarId(0);
+        let reviewer = VarId(1);
+        let left_schema = [review]; // subject bound, object new
+        let tp = TriplePattern::new(
+            Ref::Var(review),
+            Ref::Sid(Sid::new(1, "reviewer")),
+            Term::Var(reviewer),
+        );
+        let mut stats = StatsView::default();
+        stats.properties.insert(
+            Sid::new(1, "reviewer"),
+            PropertyStatData {
+                count: 2_848_260,
+                ndv_values: 570_000,
+                ndv_subjects: 2_848_260,
+            },
+        );
+        let d = HashJoinPlanner::new(Some(&stats))
+            .explain_object_hash_join(&left_schema, &tp, false, true)
+            .expect("a subject-driven join still yields a decision to explain");
+        assert!(!d.chosen);
+        assert_eq!(d.join_var, None);
+        assert_eq!(d.reason, HashJoinReason::SubjectDriven);
+        assert_eq!(d.probe_count, Some(2_848_260));
+    }
 
     #[test]
     fn iri_predicate_is_eligible_like_a_sid() {

@@ -1992,7 +1992,8 @@ pub(crate) fn build_scan_or_join(
                         crate::hash_join::HashJoinOperator::new(
                             left,
                             probe,
-                            d.join_var,
+                            d.join_var
+                                .expect("a chosen object→subject hash join has a join var"),
                             downstream_vars,
                             tp.clone(),
                             bounds.clone(),
