@@ -2059,6 +2059,14 @@ pub fn build_operator_tree(
         crate::filter_fold::fold_equijoin_filters(&mut folded, stats.as_deref());
         return build_operator_tree_inner(&folded, stats, true, planning);
     }
+    // Rewrite `avg` over an anti-join complement into a difference of aggregates
+    // (universe total minus the per-key WITH aggregate), eliminating the
+    // feature x product cross-product. Clone only when a candidate is present.
+    if crate::aggregate_complement_fold::has_aggregate_complement_candidate(query) {
+        let mut rewritten = query.clone();
+        crate::aggregate_complement_fold::fold_aggregate_complements(&mut rewritten);
+        return build_operator_tree_inner(&rewritten, stats, true, planning);
+    }
     build_operator_tree_inner(query, stats, true, planning)
 }
 

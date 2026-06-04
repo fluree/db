@@ -14,6 +14,7 @@
 //! Build a `TriplePattern` with a `VarRegistry`, then call `execute_pattern` with a `GraphDbRef` to get result batches.
 
 pub mod aggregate;
+pub(crate) mod aggregate_complement_fold;
 pub mod binary_history;
 pub mod binary_range;
 pub mod binary_scan;
