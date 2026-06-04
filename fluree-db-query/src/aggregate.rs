@@ -501,7 +501,9 @@ fn integer_binding_from_bigdecimal(sum: BigDecimal) -> Binding {
 pub(crate) fn binding_to_numeric(binding: &Binding) -> Option<NumericValue> {
     use fluree_db_core::value_id::{ObjKey, ObjKind};
     match binding {
-        Binding::Lit { val, .. } => flake_value_to_numeric(val),
+        Binding::Lit { val, dtc, .. } => {
+            flake_value_to_numeric(val).or_else(|| string_lit_to_numeric(val, dtc))
+        }
         Binding::EncodedLit { o_kind, o_key, .. } => {
             if *o_kind == ObjKind::NUM_INT.as_u8() {
                 Some(NumericValue::Long(ObjKey::from_u64(*o_key).decode_i64()))
@@ -535,6 +537,54 @@ pub(crate) fn flake_value_to_numeric(val: &FlakeValue) -> Option<NumericValue> {
         FlakeValue::Decimal(d) => Some(NumericValue::Decimal((**d).clone())),
         _ => None,
     }
+}
+
+/// Coerce a numeric value that is stored as a `FlakeValue::String` to a number.
+///
+/// The query-time `xsd:float(?x)` cast is kept string-backed (to preserve f32
+/// precision — see `eval/cast.rs`), so SUM/AVG/etc. would otherwise silently
+/// drop it (`flake_value_to_numeric` has no `String` arm) and return unbound.
+/// Parse the string when the literal's datatype is a numeric XSD type. Yields
+/// `Double` (f64 is exact for f32-sourced values); NaN is dropped like other
+/// non-finite aggregate inputs.
+fn string_lit_to_numeric(
+    val: &FlakeValue,
+    dtc: &fluree_db_core::DatatypeConstraint,
+) -> Option<NumericValue> {
+    let FlakeValue::String(s) = val else {
+        return None;
+    };
+    if !is_numeric_xsd_datatype(dtc.datatype()) {
+        return None;
+    }
+    let d = s.parse::<f64>().ok()?;
+    (!d.is_nan()).then_some(NumericValue::Double(d))
+}
+
+/// Whether `sid` is a numeric XSD datatype (the family that should accumulate
+/// in SUM/AVG even when carried as a string-backed literal).
+fn is_numeric_xsd_datatype(sid: &Sid) -> bool {
+    use fluree_vocab::{namespaces, xsd_names};
+    sid.namespace_code == namespaces::XSD
+        && matches!(
+            sid.name.as_ref(),
+            xsd_names::FLOAT
+                | xsd_names::DOUBLE
+                | xsd_names::DECIMAL
+                | xsd_names::INTEGER
+                | xsd_names::LONG
+                | xsd_names::INT
+                | xsd_names::SHORT
+                | xsd_names::BYTE
+                | xsd_names::UNSIGNED_LONG
+                | xsd_names::UNSIGNED_INT
+                | xsd_names::UNSIGNED_SHORT
+                | xsd_names::UNSIGNED_BYTE
+                | xsd_names::NON_NEGATIVE_INTEGER
+                | xsd_names::POSITIVE_INTEGER
+                | xsd_names::NON_POSITIVE_INTEGER
+                | xsd_names::NEGATIVE_INTEGER
+        )
 }
 
 /// COUNT - count non-Unbound values
