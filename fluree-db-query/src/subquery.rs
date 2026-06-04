@@ -24,7 +24,8 @@ use crate::binding::{Batch, Binding};
 use crate::context::ExecutionContext;
 use crate::error::{QueryError, Result};
 use crate::execute::build_where_operators_seeded;
-use crate::ir::SubqueryPattern;
+use crate::group_aggregate::{binding_to_group_key_owned, GroupKeyOwned};
+use crate::ir::{Pattern, SubqueryPattern};
 use crate::operator::{
     compute_trimmed_vars, effective_schema, trim_batch, BoxedOperator, Operator, OperatorState,
 };
@@ -62,14 +63,37 @@ pub struct SubqueryOperator {
     planning: PlanningContext,
     /// Variables required by downstream operators; if set, output is trimmed.
     out_schema: Option<Arc<[VarId]>>,
-    /// Cached result rows for an UNCORRELATED subquery (`correlation_vars`
-    /// empty). Such a subquery shares no variables with the parent, so its seed
-    /// is always the empty solution (see `execute_subquery_for_row`) and it
-    /// yields the identical result for every parent row. We execute it once,
-    /// cache the rows here, and broadcast them to every parent row (and across
-    /// batches) instead of rebuilding and re-running the subquery operator tree
-    /// per row. Mirrors `FilterOperator::pre_resolve_uncorrelated` for EXISTS.
-    uncorrelated_cache: Option<Vec<Vec<Binding>>>,
+    /// The subset of `correlation_vars` used as the hash-join key in join-mode:
+    /// the variables the subquery PRODUCES itself (bound by a top-level required
+    /// triple / property path). Seeding such a variable per parent row only
+    /// filters the subquery's output to that value, so it is equivalent to
+    /// evaluating the subquery once and joining on the variable. A correlation
+    /// variable that the subquery does NOT bind (e.g. a `GROUP BY` key never
+    /// constrained in the body — the BSBM BI-5 quirk) is a pass-through: it is
+    /// omitted from the key and flows from the parent, matching SPARQL join
+    /// semantics (the subquery's unbound value joins with the parent's bound
+    /// value). Empty when there is no correlation (broadcast).
+    join_keys: Vec<VarId>,
+    /// Whether the subquery is evaluated ONCE and hash-joined (on `join_keys`)
+    /// rather than re-executed per parent row. Requires no inner `LIMIT`/`OFFSET`
+    /// and that every non-key correlation variable is an unreferenced
+    /// pass-through. Gated by a parent-cardinality check so we only materialize
+    /// when it beats per-row seeding; an uncorrelated subquery always
+    /// materializes. Mirrors `SemijoinOperator`'s hash probe.
+    join_mode: bool,
+    /// Lazily materialized subquery result (built once when `join_mode`): all
+    /// result rows plus a hash index from the correlation-variable values to the
+    /// rows carrying them. Reused across every parent row and batch.
+    materialized: Option<MaterializedSubquery>,
+}
+
+/// A once-evaluated subquery result, indexed for hash-join probing.
+struct MaterializedSubquery {
+    /// All subquery result rows (projected to the subquery SELECT list).
+    rows: Vec<Vec<Binding>>,
+    /// Correlation-variable values -> indices into `rows`. An empty key vector
+    /// (no correlation) maps every row under a single bucket (broadcast).
+    index: HashMap<Vec<GroupKeyOwned>, Vec<usize>>,
 }
 
 impl SubqueryOperator {
@@ -115,6 +139,39 @@ impl SubqueryOperator {
         schema_vec.extend(&new_vars);
         let schema = Arc::from(schema_vec.into_boxed_slice());
 
+        // Partition correlation vars: a JOIN KEY is one the subquery binds in
+        // every solution itself (a top-level required triple / property path);
+        // seeding it only filters the output, so it can be a hash key.
+        let produced = self_produced_vars(&subquery.patterns);
+        let join_keys: Vec<VarId> = correlation_vars
+            .iter()
+            .copied()
+            .filter(|v| produced.contains(v))
+            .collect();
+
+        // Eligible for evaluate-once + hash-join when there is no inner slice and
+        // every NON-key correlation var is an unreferenced pass-through (it
+        // appears only in the SELECT, never constraining the body). Omitting such
+        // a var from the join key matches SPARQL join semantics. A correlation
+        // var that is referenced but not produced is a genuine per-row input.
+        let body_referenced = referenced_vars_set(&subquery.patterns);
+        let pass_through_ok = correlation_vars
+            .iter()
+            .all(|v| produced.contains(v) || !body_referenced.contains(v));
+        let eligible = subquery.limit.is_none() && subquery.offset.is_none() && pass_through_ok;
+
+        // Cardinality guard: evaluating once + hash-join removes the per-row
+        // operator-rebuild overhead, which pays off when the parent drives many
+        // rows; for a small parent, per-row seeding (with its pruning seed) can
+        // be cheaper, so fall back to it (the pre-existing behavior — this guard
+        // never regresses below it). An uncorrelated subquery has no shared key
+        // and MUST be evaluated once regardless (per-row recomputes identically).
+        let join_mode = eligible
+            && (correlation_vars.is_empty()
+                || child
+                    .estimated_rows()
+                    .is_none_or(|n| n >= SUBQUERY_MATERIALIZE_MIN_PARENT_ROWS));
+
         Self {
             child,
             subquery,
@@ -128,7 +185,9 @@ impl SubqueryOperator {
             stats,
             planning,
             out_schema: None,
-            uncorrelated_cache: None,
+            join_keys,
+            join_mode,
+            materialized: None,
         }
     }
 
@@ -155,7 +214,7 @@ impl Operator for SubqueryOperator {
 
         self.child.open(ctx).await?;
         self.state = OperatorState::Open;
-        self.uncorrelated_cache = None;
+        self.materialized = None;
         Ok(())
     }
 
@@ -182,25 +241,38 @@ impl Operator for SubqueryOperator {
         self.result_buffer.clear();
         self.buffer_pos = 0;
 
-        let uncorrelated = self.correlation_vars.is_empty();
         for row_idx in 0..parent_batch.len() {
-            // Execute the subquery for this parent row.
+            // Produce this parent row's matching subquery rows.
             //
-            // UNCORRELATED subqueries (no variables shared with the parent)
-            // produce the identical result for every parent row — their seed is
-            // always the empty solution. Execute once, cache, and reuse for all
-            // rows and all subsequent batches. This collapses an
-            // O(parent_rows) re-execution — each rebuilding and re-running the
-            // full subquery operator tree — into a single run. The clone is of
-            // the (typically single-row) cached result, not of any scan work.
-            let subquery_results = if uncorrelated {
-                if self.uncorrelated_cache.is_none() {
-                    let rows = self
-                        .execute_subquery_for_row(ctx, &parent_batch, row_idx)
-                        .await?;
-                    self.uncorrelated_cache = Some(rows);
+            // JOIN MODE: evaluate the subquery ONCE (empty seed), index it by
+            // the correlation-variable values, and for each parent row take only
+            // the subquery rows whose join key matches — equivalent to seeding
+            // per row but without rebuilding/re-running the subquery N times.
+            // An empty correlation set indexes every row under one bucket, so
+            // the match is a broadcast (the uncorrelated case).
+            //
+            // Otherwise (a genuine per-row correlation, or an inner slice that
+            // makes seeding result-sensitive), fall back to per-row seeding.
+            let subquery_results: Vec<Vec<Binding>> = if self.join_mode {
+                if self.materialized.is_none() {
+                    let m = self.materialize(ctx).await?;
+                    self.materialized = Some(m);
                 }
-                self.uncorrelated_cache.as_ref().unwrap().clone()
+                let mat = self.materialized.as_ref().unwrap();
+                let parent_key: Vec<GroupKeyOwned> = self
+                    .join_keys
+                    .iter()
+                    .map(|v| {
+                        parent_batch
+                            .get(row_idx, *v)
+                            .map(binding_to_group_key_owned)
+                            .unwrap_or(GroupKeyOwned::Absent)
+                    })
+                    .collect();
+                match mat.index.get(&parent_key) {
+                    Some(idxs) => idxs.iter().map(|&i| mat.rows[i].clone()).collect(),
+                    None => Vec::new(),
+                }
             } else {
                 self.execute_subquery_for_row(ctx, &parent_batch, row_idx)
                     .await?
@@ -320,6 +392,42 @@ impl SubqueryOperator {
             Box::new(SeedOperator::from_row(schema, seed_row))
         };
 
+        self.run_subquery_with_seed(ctx, seed).await
+    }
+
+    /// Evaluate the subquery ONCE with an empty seed and index its result rows
+    /// by their correlation-variable values, for hash-join probing in join-mode.
+    /// An empty correlation set produces a single bucket (broadcast).
+    async fn materialize(&self, ctx: &ExecutionContext<'_>) -> Result<MaterializedSubquery> {
+        let rows = self
+            .run_subquery_with_seed(ctx, Box::new(EmptyOperator::new()))
+            .await?;
+        let mut index: HashMap<Vec<GroupKeyOwned>, Vec<usize>> = HashMap::new();
+        for (i, row) in rows.iter().enumerate() {
+            let key: Vec<GroupKeyOwned> = self
+                .join_keys
+                .iter()
+                .map(|v| {
+                    self.select_index
+                        .get(v)
+                        .and_then(|&si| row.get(si))
+                        .map(binding_to_group_key_owned)
+                        .unwrap_or(GroupKeyOwned::Absent)
+                })
+                .collect();
+            index.entry(key).or_default().push(i);
+        }
+        Ok(MaterializedSubquery { rows, index })
+    }
+
+    /// Build and run the subquery's operator tree from `seed`, returning rows
+    /// projected to the subquery SELECT list. Shared by the per-row (correlated)
+    /// and once (join-mode) execution paths.
+    async fn run_subquery_with_seed(
+        &self,
+        ctx: &ExecutionContext<'_>,
+        seed: BoxedOperator,
+    ) -> Result<Vec<Vec<Binding>>> {
         // Build full operator tree for subquery patterns (supports filters, optionals, union, etc.)
         let where_op: BoxedOperator = build_where_operators_seeded(
             Some(seed),
@@ -336,8 +444,8 @@ impl SubqueryOperator {
         // modifier semantics to a top-level SELECT (same code path).
         //
         // Projection trimming (`variable_deps`) and the streaming-group
-        // partition hint are skipped: the subquery runs once per correlated
-        // parent row, and its full select list flows back into the merge.
+        // partition hint are skipped: the subquery's full select list flows
+        // back into the merge.
         let select_vars: Option<&[VarId]> =
             (!self.subquery.select.is_empty()).then_some(self.subquery.select.as_slice());
         let mut operator = crate::execute::operator_tree::apply_solution_modifiers(
@@ -378,6 +486,47 @@ impl SubqueryOperator {
         operator.close();
         Ok(results)
     }
+}
+
+/// Minimum estimated parent (driving) rows above which evaluating a self-keyed
+/// subquery once + hash-join beats per-row seeding. Below this the per-row path
+/// (with its pruning seed) can be cheaper, so it is kept — the pre-existing
+/// behavior, which this never regresses below. An unknown parent size defaults
+/// to materialize: the per-row operator-rebuild overhead, paid once per parent
+/// row, is the larger risk.
+const SUBQUERY_MATERIALIZE_MIN_PARENT_ROWS: usize = 8;
+
+/// Variables bound in *every* solution of `patterns` — produced by a top-level
+/// required pattern (triple / property path), or exported by a slice-free nested
+/// sub-SELECT whose own body always-binds them. NOT vars bound only inside a
+/// `UNION` branch or `OPTIONAL` (conditional), nor a sub-SELECT's pass-throughs.
+/// These are the only correlation variables safe to use as evaluate-once
+/// hash-join keys.
+fn self_produced_vars(patterns: &[Pattern]) -> HashSet<VarId> {
+    let mut produced: HashSet<VarId> = HashSet::new();
+    for p in patterns {
+        match p {
+            Pattern::Triple(_) | Pattern::PropertyPath(_) => {
+                produced.extend(p.produced_vars());
+            }
+            // A nested sub-SELECT binds the SELECT vars its own body always
+            // binds, so those are always-bound here too. A slice would make
+            // per-row seeding of such a var result-sensitive, so skip it then.
+            Pattern::Subquery(sq) if sq.limit.is_none() && sq.offset.is_none() => {
+                let inner = self_produced_vars(&sq.patterns);
+                produced.extend(sq.select.iter().copied().filter(|v| inner.contains(v)));
+            }
+            _ => {}
+        }
+    }
+    produced
+}
+
+/// All variables referenced anywhere in `patterns` (filters, binds, unions,
+/// optionals, nested subquery bodies). A correlation variable that is referenced
+/// but not produced is a genuine per-row input, not an omittable pass-through.
+fn referenced_vars_set(patterns: &[Pattern]) -> HashSet<VarId> {
+    patterns.iter().flat_map(Pattern::referenced_vars).collect()
 }
 
 #[cfg(test)]
