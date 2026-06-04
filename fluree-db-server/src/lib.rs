@@ -88,22 +88,34 @@ impl FlureeServer {
             }
         }
 
-        // Pre-load all ledgers into the LRU cache so the first query
-        // against each ledger doesn't pay the cold-start penalty (loading
-        // the binary index root from CAS, deserializing dicts, etc.).
-        Self::preload_all_ledgers(&state).await;
+        // NOTE: ledger preloading + forward-dict warming is deliberately NOT
+        // done here. It runs as a background task spawned in `run()` AFTER the
+        // listener binds, so the server accepts requests immediately instead of
+        // blocking startup until every (potentially large) ledger is loaded.
+        // Preload is a pure latency optimization — a ledger not yet warmed is
+        // still served correctly via an on-demand cold load on first access.
 
         let router = routes::build_router(state.clone());
 
         Ok(Self { state, router })
     }
 
-    /// Pre-load all non-retracted ledgers into the LRU cache.
+    /// Pre-load non-retracted ledgers into the LRU cache and warm their
+    /// forward-dictionary pages into the OS page cache.
     ///
-    /// This warms the binary index store cache for every ledger so that the
-    /// first query doesn't pay a cold-start penalty. Errors are logged but
-    /// do not prevent the server from starting.
-    async fn preload_all_ledgers(state: &Arc<AppState>) {
+    /// Runs in the background (spawned from [`run`](Self::run) after the
+    /// listener binds) so it never delays the server accepting requests. Each
+    /// ledger is structurally loaded (index root + dict readers + arenas), then
+    /// its forward-dict pack pages are touched into the page cache so the first
+    /// queries don't pay cold page-fault I/O resolving IRIs/strings.
+    ///
+    /// Forward-dict warming is capped at [`warm_budget_bytes`] (~2/3 of system
+    /// RAM): beyond that, touching more pages would evict pages we just warmed,
+    /// so the warming (not the structural load) stops and remaining ledgers warm
+    /// lazily on first query. Errors are logged, never fatal.
+    ///
+    /// [`warm_budget_bytes`]: fluree_db_api::server_defaults::warm_budget_bytes
+    async fn preload_all_ledgers(state: Arc<AppState>) {
         let start = std::time::Instant::now();
 
         let records = match state.fluree.nameservice().all_records().await {
@@ -120,38 +132,44 @@ impl FlureeServer {
         }
 
         let total = active.len();
+        let warm_budget = fluree_db_api::server_defaults::warm_budget_bytes();
         let mut loaded = 0usize;
+        let mut warmed_ledgers = 0usize;
+        let mut warmed_bytes: u64 = 0;
 
         for record in &active {
-            let handle = state.fluree.ledger_cached(&record.ledger_id).await;
-
-            match handle {
+            match state.fluree.ledger_cached(&record.ledger_id).await {
                 Ok(handle) => {
                     loaded += 1;
 
-                    // Warm dict tree leaves into the LeafletCache so the first
-                    // query doesn't pay cold-start disk I/O for IRI/string resolution.
-                    let snap = handle.snapshot().await;
-                    if let Some(store) = &snap.binary_store {
-                        match store.preload_dict_leaves() {
-                            Ok(leaf_count) => {
-                                tracing::debug!(
-                                    ledger = %record.ledger_id,
-                                    leaf_count,
-                                    "Preloaded ledger + dict leaves"
-                                );
-                            }
-                            Err(e) => {
-                                tracing::warn!(
-                                    ledger = %record.ledger_id,
-                                    error = %e,
-                                    "Preloaded ledger but dict leaf warming failed"
-                                );
-                            }
-                        }
-                    } else {
-                        tracing::debug!(ledger = %record.ledger_id, "Preloaded ledger (no binary index)");
+                    // Warm forward-dict pages until the budget is reached. The
+                    // structural load above still runs for every ledger; only
+                    // the (dominant, file-touching) page warming is capped, so
+                    // we never evict pages we just warmed.
+                    if warmed_bytes >= warm_budget {
+                        continue;
                     }
+                    // Take just the binary store; the rest of the snapshot is
+                    // dropped here so no view is held across the blocking warm.
+                    let Some(store) = handle.snapshot().await.binary_store else {
+                        tracing::debug!(ledger = %record.ledger_id, "Preloaded ledger (no binary index)");
+                        continue;
+                    };
+                    let remaining = warm_budget - warmed_bytes;
+                    // Page-touching blocks (faults) — keep it off the async workers.
+                    let n =
+                        tokio::task::spawn_blocking(move || store.prewarm_forward_dicts(remaining))
+                            .await
+                            .unwrap_or(0);
+                    if n > 0 {
+                        warmed_bytes += n;
+                        warmed_ledgers += 1;
+                    }
+                    tracing::debug!(
+                        ledger = %record.ledger_id,
+                        warmed_bytes = n,
+                        "Preloaded ledger + warmed forward dicts"
+                    );
                 }
                 Err(e) => {
                     tracing::warn!(
@@ -164,11 +182,16 @@ impl FlureeServer {
         }
 
         let elapsed = start.elapsed();
+        let budget_reached = warmed_bytes >= warm_budget && loaded > warmed_ledgers;
         info!(
             loaded,
             total,
+            warmed_ledgers,
+            warmed_mb = warmed_bytes / (1024 * 1024),
+            warm_budget_mb = warm_budget / (1024 * 1024),
+            budget_reached,
             elapsed_ms = elapsed.as_millis() as u64,
-            "Ledger preload complete"
+            "Background ledger preload + forward-dict warming complete"
         );
     }
 
@@ -223,6 +246,14 @@ impl FlureeServer {
         // Start ledger manager maintenance task for idle eviction
         let ledger_maintenance_task = self.state.fluree.spawn_maintenance();
 
+        // Warm ledger caches + forward-dict pages in the BACKGROUND, after the
+        // listener is bound, so the server accepts requests immediately rather
+        // than blocking startup until every (potentially large) ledger loads.
+        // Safe to race with on-demand request loads: `get_or_load` is
+        // single-flight (concurrent loads of the same ledger coalesce), and the
+        // leaflet cache is concurrency-safe. Aborted on shutdown.
+        let warm_task = tokio::spawn(Self::preload_all_ledgers(Arc::clone(&self.state)));
+
         info!(
             addr = %addr,
             storage = %self.state.config.storage_type_str(),
@@ -235,7 +266,8 @@ impl FlureeServer {
         // Run server
         let result = axum::serve(listener, self.router).await;
 
-        // Cancel maintenance tasks on shutdown
+        // Cancel background tasks on shutdown
+        warm_task.abort();
         if let Some(task) = subscription_task {
             task.abort();
         }
