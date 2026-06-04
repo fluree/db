@@ -366,6 +366,233 @@ async fn test_sparql_delete_data_named_graph() {
 }
 
 #[tokio::test]
+async fn test_insert_data_same_triple_default_and_named_one_txn() {
+    // Graph-scoping regression: the SAME (s,p,o) asserted in both the default
+    // graph and a named graph within ONE transaction must produce TWO distinct
+    // flakes. Previously the graph-blind FlakeAccumulator collapsed them.
+    let fluree = FlureeBuilder::memory()
+        .with_ledger_cache_config(LedgerManagerConfig::default())
+        .build_memory();
+    let ledger_id = "it/repro-same-triple-one-txn:main";
+
+    let (local, handle) = start_background_indexer_local(
+        fluree.backend().clone(),
+        Arc::new(fluree.nameservice_mode().clone()),
+        fluree_db_indexer::IndexerConfig::small(),
+    );
+
+    local
+        .run_until(async move {
+            let ledger = genesis_ledger(&fluree, ledger_id);
+            let sparql = r#"
+                INSERT DATA {
+                    <https://example.org/s/1> <https://example.org/p> "v" .
+                    GRAPH <https://example.org/g/1> {
+                        <https://example.org/s/1> <https://example.org/p> "v" .
+                    }
+                }
+            "#;
+            let r = run_sparql_update(&fluree, ledger, sparql).await;
+            trigger_index_and_wait(&handle, ledger_id, r.receipt.t).await;
+            let ledger = fluree.ledger(ledger_id).await.expect("load ledger");
+
+            let q_default = json!({
+                "from": ledger_id,
+                "select": "?o",
+                "where": {"@id": "https://example.org/s/1", "https://example.org/p": "?o"}
+            });
+            let d = fluree
+                .query_connection(&q_default)
+                .await
+                .expect("q default");
+            let d = d.to_jsonld(&ledger.snapshot).expect("jsonld");
+            let d = d.as_array().expect("array");
+
+            let named_alias = format!("{ledger_id}#https://example.org/g/1");
+            let q_named = json!({
+                "from": &named_alias,
+                "select": "?o",
+                "where": {"@id": "https://example.org/s/1", "https://example.org/p": "?o"}
+            });
+            let n = fluree.query_connection(&q_named).await.expect("q named");
+            let n = n.to_jsonld(&ledger.snapshot).expect("jsonld");
+            let n = n.as_array().expect("array");
+
+            assert_eq!(
+                d.first(),
+                Some(&json!("v")),
+                "default-graph copy must exist"
+            );
+            assert_eq!(n.first(), Some(&json!("v")), "named-graph copy must exist");
+        })
+        .await;
+}
+
+#[tokio::test]
+async fn test_delete_data_graph_scoped_with_indexed_default_copy() {
+    // Graph-scoping regression (across transactions): default copy and named
+    // copy committed+indexed separately; DELETE DATA { GRAPH <g> { .. } } must
+    // remove ONLY the named copy.
+    let fluree = FlureeBuilder::memory()
+        .with_ledger_cache_config(LedgerManagerConfig::default())
+        .build_memory();
+    let ledger_id = "it/repro-delete-indexed-default:main";
+
+    let (local, handle) = start_background_indexer_local(
+        fluree.backend().clone(),
+        Arc::new(fluree.nameservice_mode().clone()),
+        fluree_db_indexer::IndexerConfig::small(),
+    );
+
+    local
+        .run_until(async move {
+            let ledger = genesis_ledger(&fluree, ledger_id);
+
+            // txn1: default copy
+            let r1 = run_sparql_update(
+                &fluree,
+                ledger,
+                r#"INSERT DATA { <https://example.org/s/1> <https://example.org/p> "v" }"#,
+            )
+            .await;
+            trigger_index_and_wait(&handle, ledger_id, r1.receipt.t).await;
+
+            // txn2: named copy
+            let ledger = fluree.ledger(ledger_id).await.expect("reload");
+            let r2 = run_sparql_update(
+                &fluree,
+                ledger,
+                r#"INSERT DATA { GRAPH <https://example.org/g/1> { <https://example.org/s/1> <https://example.org/p> "v" } }"#,
+            )
+            .await;
+            trigger_index_and_wait(&handle, ledger_id, r2.receipt.t).await;
+
+            // txn3: delete only the named copy
+            let ledger = fluree.ledger(ledger_id).await.expect("reload");
+            let r3 = run_sparql_update(
+                &fluree,
+                ledger,
+                r#"DELETE DATA { GRAPH <https://example.org/g/1> { <https://example.org/s/1> <https://example.org/p> "v" } }"#,
+            )
+            .await;
+            trigger_index_and_wait(&handle, ledger_id, r3.receipt.t).await;
+
+            let ledger = fluree.ledger(ledger_id).await.expect("reload");
+            let named_alias = format!("{ledger_id}#https://example.org/g/1");
+            let n = fluree
+                .query_connection(&json!({
+                    "from": &named_alias,
+                    "select": "?o",
+                    "where": {"@id": "https://example.org/s/1", "https://example.org/p": "?o"}
+                }))
+                .await
+                .expect("q named");
+            let n = n.to_jsonld(&ledger.snapshot).expect("jsonld");
+            let n = n.as_array().expect("array");
+
+            let d = fluree
+                .query_connection(&json!({
+                    "from": ledger_id,
+                    "select": "?o",
+                    "where": {"@id": "https://example.org/s/1", "https://example.org/p": "?o"}
+                }))
+                .await
+                .expect("q default");
+            let d = d.to_jsonld(&ledger.snapshot).expect("jsonld");
+            let d = d.as_array().expect("array");
+
+            assert!(n.is_empty(), "named-graph copy must be deleted, got {n:?}");
+            assert_eq!(d.first(), Some(&json!("v")), "default-graph copy must survive");
+        })
+        .await;
+}
+
+#[tokio::test]
+async fn test_delete_data_same_triple_two_graphs_one_txn() {
+    // Graph-scoping regression (DELETE side, within one transaction): a single
+    // DELETE DATA retracting the SAME (s,p,o) from both the default graph and a
+    // named graph must remove BOTH. Previously the two retractions collapsed in
+    // the graph-blind FlakeAccumulator and only one graph was retracted.
+    let fluree = FlureeBuilder::memory()
+        .with_ledger_cache_config(LedgerManagerConfig::default())
+        .build_memory();
+    let ledger_id = "it/delete-same-triple-two-graphs:main";
+
+    let (local, handle) = start_background_indexer_local(
+        fluree.backend().clone(),
+        Arc::new(fluree.nameservice_mode().clone()),
+        fluree_db_indexer::IndexerConfig::small(),
+    );
+
+    local
+        .run_until(async move {
+            let ledger = genesis_ledger(&fluree, ledger_id);
+
+            // Seed the same triple in both graphs (one txn; relies on the
+            // INSERT-side fix to keep both copies).
+            let r1 = run_sparql_update(
+                &fluree,
+                ledger,
+                r#"INSERT DATA {
+                    <https://example.org/s/1> <https://example.org/p> "v" .
+                    GRAPH <https://example.org/g/1> {
+                        <https://example.org/s/1> <https://example.org/p> "v" .
+                    }
+                }"#,
+            )
+            .await;
+            trigger_index_and_wait(&handle, ledger_id, r1.receipt.t).await;
+
+            // One DELETE DATA retracting the triple from BOTH graphs.
+            let ledger = fluree.ledger(ledger_id).await.expect("reload");
+            let r2 = run_sparql_update(
+                &fluree,
+                ledger,
+                r#"DELETE DATA {
+                    <https://example.org/s/1> <https://example.org/p> "v" .
+                    GRAPH <https://example.org/g/1> {
+                        <https://example.org/s/1> <https://example.org/p> "v" .
+                    }
+                }"#,
+            )
+            .await;
+            trigger_index_and_wait(&handle, ledger_id, r2.receipt.t).await;
+
+            let ledger = fluree.ledger(ledger_id).await.expect("reload");
+
+            let d = fluree
+                .query_connection(&json!({
+                    "from": ledger_id,
+                    "select": "?o",
+                    "where": {"@id": "https://example.org/s/1", "https://example.org/p": "?o"}
+                }))
+                .await
+                .expect("q default");
+            let d = d.to_jsonld(&ledger.snapshot).expect("jsonld");
+            let d = d.as_array().expect("array");
+
+            let named_alias = format!("{ledger_id}#https://example.org/g/1");
+            let n = fluree
+                .query_connection(&json!({
+                    "from": &named_alias,
+                    "select": "?o",
+                    "where": {"@id": "https://example.org/s/1", "https://example.org/p": "?o"}
+                }))
+                .await
+                .expect("q named");
+            let n = n.to_jsonld(&ledger.snapshot).expect("jsonld");
+            let n = n.as_array().expect("array");
+
+            assert!(
+                d.is_empty(),
+                "default-graph copy must be deleted, got {d:?}"
+            );
+            assert!(n.is_empty(), "named-graph copy must be deleted, got {n:?}");
+        })
+        .await;
+}
+
+#[tokio::test]
 async fn test_trig_named_graph_typed_literal_without_prefix_errors() {
     let fluree = FlureeBuilder::memory()
         .with_ledger_cache_config(LedgerManagerConfig::default())
