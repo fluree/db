@@ -131,6 +131,23 @@ WHERE {
 }
 ```
 
+`INSERT DATA` and `DELETE DATA` accept named-graph blocks per SPARQL 1.1 Update
+§3.1.1 (`QuadData`). A `GRAPH <iri> { ... }` block routes its (ground) triples
+into the named graph; this is what RDF4J's `SPARQLConnection.add(stmts, context)`
+emits:
+
+```sparql
+INSERT DATA {
+  GRAPH <https://example.org/g/1> {
+    <https://example.org/s/1> <https://example.org/p> "v" .
+  }
+}
+```
+
+The graph name must be a fixed IRI — a variable graph name (`GRAPH ?g { ... }`)
+is rejected, since DATA must be ground. Use DELETE/INSERT … WHERE for variable
+graph targets.
+
 **Response:**
 
 ```json
