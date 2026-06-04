@@ -157,45 +157,74 @@ last among sources, minimizing data sent to the remote endpoint.
 
 ## Reading Explain Output
 
-The explain plan shows two sections: the original pattern order and the
-optimized order. Each pattern is annotated with its category and estimate.
+Explain returns a JSON object `{ "query": <echo>, "plan": { ... } }`. The
+`plan` object contains:
 
-Example output for a multi-pattern query:
+| Field                  | Meaning |
+| ---------------------- | ------- |
+| `optimization`         | `"reordered"`, `"unchanged"`, or `"none"` (no statistics) |
+| `statistics-available` | whether HLL statistics were available for cost estimation |
+| `statistics`           | summary stats (e.g. `total-flakes`) |
+| `logical`              | the **compound-aware** join order the planner produces (see below) |
+| `original`             | the query's triple patterns in original order, with selectivity inputs |
+| `optimized`            | the same triples in the planner's chosen order |
+| `execution-hints`      | specialized execution strategies the executor will use (see [Execution Hints](#execution-hints)) |
 
-```
-=== Query Optimization Explain (Generalized) ===
+The `original` and `optimized` arrays are a flattened, triple-level view. The
+`optimized` order is produced by the **same** `reorder_patterns` routine the
+executor uses, so the order shown is the order that runs — there is no separate
+explain-only ordering algorithm.
 
-Statistics available: yes
-Optimization: patterns reordered
+### The `logical` plan
 
---- Original Pattern Order ---
-  [1] ?s :age ?age | category=Source row_count=5000
-  [2] ?s :name ?name | category=Source row_count=10000
-  [3] FILTER((> ?age 25)) | category=Deferred
-  [4] OPTIONAL { ?s :email ?email } | category=Expander multiplier=1.00
+`logical` is the recommended view. Unlike `original`/`optimized` (which flatten
+all triples into one list), it preserves compound structure — `OPTIONAL`,
+`UNION`, `MINUS`, `EXISTS`, subqueries — and shows each node in the planner's
+chosen execution order. It is present even when statistics are unavailable
+(the planner falls back to heuristic estimates). Each node carries:
 
---- Optimized Pattern Order ---
-  [1] ?s :age ?age | category=Source row_count=5000
-  [2] FILTER((> ?age 25)) | category=Deferred
-  [3] ?s :name ?name | category=Source row_count=10000
-  [4] OPTIONAL { ?s :email ?email } | category=Expander multiplier=1.00
+- `kind`: `triple`, `optional`, `union`, `minus`, `exists`, `not-exists`,
+  `subquery`, `filter`, `bind`, `values`, `property-path`, `graph`, `service`,
+  or a search kind.
+- `category`: `source` (produces rows), `reducer` (shrinks), `expander`
+  (grows — e.g. `OPTIONAL`), or `deferred` (`FILTER`/`BIND`).
+- `estimate`: `{ "row-count": N }` for sources, `{ "multiplier": M }` for
+  reducers/expanders.
+- For triples, a `pattern` object (`subject`/`property`/`object`); for compound
+  nodes, a `patterns` array (or `branches` for `UNION`) of child nodes.
+
+Example (`?person :name ?name . OPTIONAL { ?person :email ?email }`):
+
+```jsonc
+"logical": [
+  { "kind": "triple",   "category": "source",
+    "estimate": { "row-count": 50 },
+    "pattern": { "subject": "?person", "property": "ex:name", "object": "?name" } },
+  { "kind": "optional", "category": "expander",
+    "estimate": { "multiplier": 1.0 },
+    "patterns": [
+      { "kind": "triple", "category": "source",
+        "estimate": { "row-count": 50 },
+        "pattern": { "subject": "?person", "property": "ex:email", "object": "?email" } }
+    ] }
+]
 ```
 
 Key things to look for:
 
-- **Source row_count**: Lower values are placed first. If a pattern with a
-  high row count appears early, it may indicate missing statistics or an
-  inherently broad pattern.
-- **Reducer multiplier**: Values below 1.0 indicate the fraction of rows
-  that survive. A MINUS with multiplier 0.90 removes ~10% of rows.
+- **Source `row-count`**: Lower values are placed first. A high row count early
+  in the plan may indicate missing statistics or an inherently broad pattern.
+- **Reducer `multiplier`**: Values below 1.0 indicate the fraction of rows that
+  survive. A MINUS with multiplier 0.90 removes ~10% of rows.
 - **Deferred placement**: FILTERs and BINDs appear immediately after all of
   their input variables become bound. BIND outputs cascade — a BIND placed
   early can enable subsequent FILTERs or BINDs that depend on its target
   variable. If a FILTER appears late, check whether its variables could be
   bound sooner.
-- **Statistics available: no**: Without statistics, the planner uses
-  conservative heuristics. Run at least one indexing cycle to enable
-  statistics-based optimization.
+- **`optimization: "none"`**: No statistics were available, so cost-based
+  reordering is skipped for the `original`/`optimized` arrays. The `logical`
+  view still shows the planner's heuristic order. Run at least one indexing
+  cycle to enable statistics-based optimization.
 
 ### Execution Hints
 

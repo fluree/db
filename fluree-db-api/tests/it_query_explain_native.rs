@@ -163,6 +163,15 @@ async fn explain_reorders_bound_object_email_first() {
             assert_eq!(resp["plan"]["optimization"], "reordered");
             assert_eq!(resp["plan"]["optimized"][0]["pattern"]["property"], "ex:email");
 
+            // The compound-aware `logical` view reflects the same reorder: the
+            // selective bound-object email triple is placed first.
+            let logical = resp["plan"]["logical"]
+                .as_array()
+                .expect("plan.logical array");
+            assert_eq!(logical[0]["kind"], "triple");
+            assert_eq!(logical[0]["pattern"]["property"], "ex:email");
+            assert_eq!(logical[0]["category"], "source");
+
             // SPARQL equivalent
             let sparql = "PREFIX ex: <http://example.org/>\nSELECT ?person WHERE { ?person a ex:Person . ?person ex:email \"rare@example.org\" }";
             let resp_s = fluree
@@ -287,6 +296,10 @@ async fn explain_includes_inputs_fields_and_flags() {
 
             assert!(original.iter().all(|p| p.get("inputs").is_some()));
             assert!(optimized.iter().all(|p| p.get("inputs").is_some()));
+
+            // execution-hints and the compound-aware logical view are always present.
+            assert!(resp["plan"]["execution-hints"].is_array());
+            assert!(resp["plan"]["logical"].is_array());
 
             // Bound object pattern should have used-values-ndv? + clamped-to-one? flags.
             let email_pat = original
