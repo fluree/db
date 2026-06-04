@@ -1187,6 +1187,47 @@ fn try_place_reducer(
     }
 }
 
+/// Tie-break signal for join ordering: if the candidate source is placed (binding
+/// its produced vars), the largest probe-predicate count that would become an
+/// object→subject hash join — a remaining triple `?s <p> ?o` whose object `?o` the
+/// candidate binds while the subject `?s` stays new. Driving from such a start keeps
+/// that high-cardinality predicate a single contiguous hash-probe scan instead of a
+/// forward join over a large intermediate, so among equally-selective starts we
+/// prefer the one unlocking the biggest such scan. Returns `0` when nothing is
+/// unlocked or stats are absent, so it only ever breaks exact row-count ties.
+fn unlocked_object_hash_scan(
+    candidate: usize,
+    remaining: &[RankedPattern],
+    bound_vars: &HashSet<VarId>,
+    stats: Option<&StatsView>,
+) -> u64 {
+    let Some(stats) = stats else { return 0 };
+    let produced: HashSet<VarId> = remaining[candidate]
+        .pattern
+        .produced_vars()
+        .into_iter()
+        .collect();
+    remaining
+        .iter()
+        .enumerate()
+        .filter(|(k, _)| *k != candidate)
+        .filter_map(|(_, rp)| {
+            let Pattern::Triple(tp) = &rp.pattern else {
+                return None;
+            };
+            let o = tp.o.as_var()?;
+            let s = tp.s.as_var()?;
+            // Object newly bound by the candidate; subject still new (the probe shape).
+            if produced.contains(&o) && !produced.contains(&s) && !bound_vars.contains(&s) {
+                property_stats(stats, &tp.p).map(|p| p.count)
+            } else {
+                None
+            }
+        })
+        .max()
+        .unwrap_or(0)
+}
+
 /// Try to place the best source. Returns true if one was placed.
 fn try_place_source(
     remaining: &mut Vec<RankedPattern>,
@@ -1236,6 +1277,17 @@ fn try_place_source(
             ci.row_count()
                 .partial_cmp(&cj.row_count())
                 .unwrap_or(std::cmp::Ordering::Equal)
+        })
+        // Before falling back to original index: among equally-selective starts,
+        // prefer the one that turns the LARGER predicate into an object→subject
+        // hash join rather than a forward join over a big intermediate. This flips
+        // a BSBM-BI bowtie (two equally-selective country filters, written
+        // producer/DE-first) onto the side whose chain keeps the 2.85M-row
+        // predicate hash-able — 46x on BI-1's F2.
+        .then_with(|| {
+            let bi = unlocked_object_hash_scan(i, &remaining[..], bound_vars, stats);
+            let bj = unlocked_object_hash_scan(j, &remaining[..], bound_vars, stats);
+            bj.cmp(&bi)
         })
         .then_with(|| remaining[i].orig_index.cmp(&remaining[j].orig_index))
     });
@@ -1544,6 +1596,73 @@ mod tests {
         assert!(
             first.produced_vars().contains(&s),
             "expected first pattern to join with seeded bound vars"
+        );
+    }
+
+    #[test]
+    fn reorder_bowtie_drives_the_side_that_unlocks_the_bigger_hash_join() {
+        // BSBM-BI F2 shape, written producer/DE-first:
+        //   ?product producer ?producer . ?producer country DE .
+        //   ?review reviewFor ?product . ?review reviewer ?reviewer . ?reviewer country US .
+        // Both country filters tie on estimate (same predicate). The tie-break must
+        // drive from the US side, because that makes the 2.85M-row rev:reviewer join
+        // an object→subject hash join; DE-first only unlocks the 285K producer join
+        // and leaves the reviewer chain as forward joins (the 110s→2.38s case).
+        let product = VarId(0);
+        let producer = VarId(1);
+        let review = VarId(2);
+        let reviewer = VarId(3);
+        let pat = |s: VarId, p: &str, o: Term| {
+            Pattern::Triple(TriplePattern::new(Ref::Var(s), Ref::Sid(Sid::new(1, p)), o))
+        };
+        let patterns = vec![
+            pat(product, "producer", Term::Var(producer)),
+            pat(producer, "country", Term::Sid(Sid::new(9, "DE"))),
+            pat(review, "reviewFor", Term::Var(product)),
+            pat(review, "reviewer", Term::Var(reviewer)),
+            pat(reviewer, "country", Term::Sid(Sid::new(9, "US"))),
+        ];
+
+        let mut stats = StatsView::default();
+        let mut put = |name: &str, count: u64, ndv_values: u64| {
+            stats.properties.insert(
+                Sid::new(1, name),
+                PropertyStatData {
+                    count,
+                    ndv_values,
+                    ndv_subjects: count,
+                },
+            );
+        };
+        put("producer", 284_826, 5_600);
+        put("country", 386_525, 25); // count/ndv = 15,461 — both filters tie here
+        put("reviewFor", 2_848_260, 280_000);
+        put("reviewer", 2_848_260, 570_000);
+
+        let ordered = reorder_patterns(&patterns, Some(&stats), &HashSet::new());
+        let first = match &ordered[0] {
+            Pattern::Triple(tp) => tp,
+            _ => panic!("expected Triple first"),
+        };
+        // Drives from the US country filter (binds ?reviewer), not the DE one.
+        assert_eq!(first.p.as_sid().map(|s| &*s.name), Some("country"));
+        assert_eq!(
+            first.o.as_sid().map(|s| &*s.name),
+            Some("US"),
+            "tie-break should drive the side that unlocks the 2.85M rev:reviewer hash join, got {ordered:?}"
+        );
+        // ...and rev:reviewer is placed before producer (US chain first).
+        let pred_order: Vec<&str> = ordered
+            .iter()
+            .filter_map(|p| match p {
+                Pattern::Triple(tp) => tp.p.as_sid().map(|s| &*s.name),
+                _ => None,
+            })
+            .collect();
+        let pos = |name: &str| pred_order.iter().position(|p| *p == name).unwrap();
+        assert!(
+            pos("reviewer") < pos("producer"),
+            "reviewer chain should precede producer chain: {pred_order:?}"
         );
     }
 
