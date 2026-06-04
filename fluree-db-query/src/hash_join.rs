@@ -125,6 +125,19 @@ fn hash_join_cost_wins(probe_count: Option<u64>, driving_est: Option<f64>) -> bo
     pc >= HASH_JOIN_PROBE_MIN && (pc as f64) <= drive * HASH_JOIN_MAX_SCAN_RATIO
 }
 
+/// Probe-predicate row count from stats, keyed by SID or — for the un-encoded IRI
+/// predicates that non-reasoning queries carry — by IRI. Mirrors the planner's
+/// `property_stats` fallback so the cost model sees the same numbers reorder did.
+fn predicate_count(stats: &StatsView, pred: &crate::ir::triple::Ref) -> Option<u64> {
+    if let Some(sid) = pred.as_sid() {
+        return stats.get_property(sid).map(|p| p.count);
+    }
+    if let Some(iri) = pred.as_iri() {
+        return stats.get_property_by_iri(iri).map(|p| p.count);
+    }
+    None
+}
+
 /// Eligibility for the object→subject hash join. The right pattern `tp` must be a
 /// single fixed-predicate scan whose OBJECT is the (only) variable shared with the
 /// left side (the join key), whose SUBJECT is a new variable, with no object bounds,
@@ -141,8 +154,11 @@ fn hash_join_object_join_var(
     if has_bounds || !inline_ops_empty || tp.dtc.is_some() {
         return None;
     }
-    // Predicate must be a fixed SID (so the probe scans one contiguous partition).
-    if !tp.p.is_sid() {
+    // Predicate must be fixed — a SID or an IRI — so the probe scans one contiguous
+    // partition. Non-reasoning SPARQL/JSON-LD queries reach planning with IRI
+    // predicates (only reasoning queries are pre-encoded to SIDs in runner.rs), so a
+    // SID-only check here silently excluded the exact BSBM joins this operator targets.
+    if tp.p.as_var().is_some() {
         return None;
     }
     // Object must be a var already bound from the left (the join key).
@@ -220,10 +236,7 @@ impl<'a> HashJoinPlanner<'a> {
             HashJoinForce::On => true,
             HashJoinForce::Off => false,
             HashJoinForce::Auto => {
-                let probe_count =
-                    tp.p.as_sid()
-                        .and_then(|sid| self.stats.and_then(|s| s.get_property(sid)))
-                        .map(|p| p.count);
+                let probe_count = self.stats.and_then(|s| predicate_count(s, &tp.p));
                 hash_join_cost_wins(probe_count, self.step_est)
             }
         };
@@ -601,6 +614,36 @@ impl Operator for HashJoinOperator {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ir::triple::{Ref, Term};
+
+    #[test]
+    fn iri_predicate_is_eligible_like_a_sid() {
+        // Non-reasoning SPARQL keeps predicates as IRIs (not pre-encoded to SIDs).
+        // The probe `?review <rev:reviewer> ?reviewer` with ?reviewer bound from the
+        // left must be eligible — a SID-only check here was why the BSBM BI-1 join
+        // never reached the cost gate.
+        let review = VarId(0);
+        let reviewer = VarId(1);
+        let left_schema = [reviewer];
+        let iri_tp = TriplePattern::new(
+            Ref::Var(review),
+            Ref::Iri(Arc::from("http://purl.org/stuff/rev#reviewer")),
+            Term::Var(reviewer),
+        );
+        assert_eq!(
+            hash_join_object_join_var(&left_schema, &iri_tp, false, true),
+            Some(reviewer),
+            "IRI-predicate probe must be eligible for the object→subject hash join"
+        );
+
+        // A variable predicate is still rejected (can't scan one contiguous partition).
+        let var_pred_tp =
+            TriplePattern::new(Ref::Var(review), Ref::Var(VarId(2)), Term::Var(reviewer));
+        assert_eq!(
+            hash_join_object_join_var(&left_schema, &var_pred_tp, false, true),
+            None
+        );
+    }
 
     #[test]
     fn cost_gate_fires_for_skewed_bound_object_bi1() {
