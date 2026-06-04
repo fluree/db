@@ -139,6 +139,48 @@ fn physical_contains_op(node: &serde_json::Value, name: &str) -> bool {
 }
 
 #[tokio::test]
+async fn explain_physical_plan_surfaces_fast_path() {
+    // A COUNT(*) over a predicate is answered by a metadata fast path. The
+    // planner selects it at build time, so plan.physical names the fast-path
+    // operator (label-tagged) — the signal the pattern-level views cannot give.
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger0 = genesis_ledger(&fluree, "physical-fastpath:main");
+
+    let ledger = fluree
+        .insert(
+            ledger0,
+            &json!({
+                "@context": {"ex":"http://example.org/"},
+                "@id":"ex:alice",
+                "ex:name":"Alice"
+            }),
+        )
+        .await
+        .expect("seed")
+        .ledger;
+
+    let sparql =
+        "PREFIX ex: <http://example.org/>\nSELECT (COUNT(?o) AS ?c) WHERE { ?s ex:name ?o }";
+
+    let db = graphdb_from_ledger(&ledger);
+    let resp = fluree
+        .explain_sparql(&db, sparql)
+        .await
+        .expect("explain_sparql");
+
+    let physical = &resp["plan"]["physical"];
+    eprintln!(
+        "PHYSICAL(count) = {}",
+        serde_json::to_string_pretty(physical).unwrap()
+    );
+    let s = serde_json::to_string(physical).unwrap();
+    assert!(
+        s.contains("FastPath"),
+        "expected a fast-path operator in physical plan: {s}"
+    );
+}
+
+#[tokio::test]
 async fn explain_logical_plan_preserves_compound_structure() {
     // The `logical` plan view is the compound-aware reorder_patterns order,
     // available even without stats. Verify a triple + OPTIONAL render as a

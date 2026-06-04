@@ -56,6 +56,12 @@ pub trait DatasetBuilder: Send + Sync {
 
     /// Output schema. Must be stable across all `build()` calls.
     fn schema(&self) -> &[VarId];
+
+    /// Plan-introspection details for `EXPLAIN` (e.g. predicate, planned index
+    /// hint). Default: none. Scan builders override to expose the access path.
+    fn plan_details(&self) -> serde_json::Map<String, serde_json::Value> {
+        serde_json::Map::new()
+    }
 }
 
 // =============================================================================
@@ -110,6 +116,21 @@ impl ScanDatasetBuilder {
 }
 
 impl DatasetBuilder for ScanDatasetBuilder {
+    fn plan_details(&self) -> serde_json::Map<String, serde_json::Value> {
+        let mut m = serde_json::Map::new();
+        m.insert(
+            "pattern".into(),
+            crate::explain::format_pattern(&self.pattern).into(),
+        );
+        if let Some(idx) = self.index_hint {
+            m.insert("index-hint".into(), format!("{idx:?}").into());
+        }
+        if self.object_bounds.is_some() {
+            m.insert("object-bounds".into(), true.into());
+        }
+        m
+    }
+
     fn build(&self) -> Result<BoxedOperator> {
         match self.mode {
             TemporalMode::History => Ok(Box::new(
@@ -316,6 +337,10 @@ async fn count_member(op: &mut BoxedOperator, ctx: &ExecutionContext<'_>) -> Res
 impl Operator for DatasetOperator {
     fn schema(&self) -> &[VarId] {
         self.builder.schema()
+    }
+
+    fn plan_details(&self) -> serde_json::Map<String, serde_json::Value> {
+        self.builder.plan_details()
     }
 
     async fn open(&mut self, ctx: &ExecutionContext<'_>) -> Result<()> {
