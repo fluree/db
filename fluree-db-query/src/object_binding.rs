@@ -14,6 +14,50 @@ fn encoded_i_val(o_i: u32) -> i32 {
     }
 }
 
+/// Encoded representation for an inline numeric o_type, or `None` if the type
+/// has no well-known `dt_id` and must stay on the materialized path.
+///
+/// Returns `(o_kind, dt_id)` for `EncodedLit`. The `dt_id` is the well-known
+/// `DatatypeDictId` whose registry slot maps back to exactly this o_type
+/// (`resolve(o_kind, dt_id, 0) == o_type`), so `DATATYPE()` and terminal
+/// materialization reconstruct the correct datatype. Restricted to the four
+/// numeric types with reserved dict ids — xsd:int / xsd:short / etc. have no
+/// well-known id and fall through to materialization unchanged.
+fn inline_numeric_encoding(o_type: u16) -> Option<(u8, u16)> {
+    let ot = OType::from_u16(o_type);
+    if ot == OType::XSD_INTEGER {
+        Some((ObjKind::NUM_INT.as_u8(), DatatypeDictId::INTEGER.as_u16()))
+    } else if ot == OType::XSD_LONG {
+        Some((ObjKind::NUM_INT.as_u8(), DatatypeDictId::LONG.as_u16()))
+    } else if ot == OType::XSD_DOUBLE {
+        Some((ObjKind::NUM_F64.as_u8(), DatatypeDictId::DOUBLE.as_u16()))
+    } else if ot == OType::XSD_FLOAT {
+        Some((ObjKind::NUM_F64.as_u8(), DatatypeDictId::FLOAT.as_u16()))
+    } else {
+        None
+    }
+}
+
+/// Build an `EncodedLit` for an inline numeric, or `None` for types that must
+/// stay materialized (see [`inline_numeric_encoding`]).
+pub(crate) fn inline_numeric_encoded_lit(
+    o_type: u16,
+    o_key: u64,
+    p_id: u32,
+    o_i: u32,
+    t: i64,
+) -> Option<Binding> {
+    inline_numeric_encoding(o_type).map(|(o_kind, dt_id)| Binding::EncodedLit {
+        o_kind,
+        o_key,
+        p_id,
+        dt_id,
+        lang_id: 0,
+        i_val: encoded_i_val(o_i),
+        t,
+    })
+}
+
 /// Build a late-materialized object binding for the binary scan path.
 ///
 /// `op` is `Some(true|false)` only in history mode (assert/retract) — it
@@ -85,6 +129,14 @@ pub(crate) fn late_materialized_object_binding(
             i_val: encoded_i_val(o_i),
             t,
         }),
+        // Inline integer/float values whose datatype has a reserved dict id:
+        // keep them encoded so they hash/compare/clone as cheap ints through
+        // DISTINCT and joins, with materialization deferred to projection. Other
+        // inline kinds (and unsupported numeric subtypes) fall through to `None`,
+        // and the caller materializes them as before.
+        DecodeKind::I64 | DecodeKind::F64 => {
+            inline_numeric_encoded_lit(o_type, o_key, p_id, o_i, t)
+        }
         _ => None,
     }
 }

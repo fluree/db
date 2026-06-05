@@ -1871,65 +1871,82 @@ impl NestedLoopJoinOperator {
                                     }
                                 }
                                 _ => {
-                                    // Fallback: decode eagerly, using DictOverlay for
-                                    // novelty-aware resolution of string/subject IDs.
-                                    use fluree_db_core::o_type::{DecodeKind, OType as OT};
-                                    let ot = OT::from_u16(o_type_val);
-                                    let val: fluree_db_core::FlakeValue =
-                                        match (ot.decode_kind(), dict_overlay.as_ref()) {
-                                            (DecodeKind::IriRef, Some(ov)) => {
-                                                let iri = ov
-                                                    .resolve_subject_iri(o_key_val)
+                                    // Inline numerics with a reserved dict id stay encoded
+                                    // (cheap through DISTINCT/joins, materialized at projection);
+                                    // everything else decodes eagerly via DictOverlay.
+                                    if let Some(encoded) =
+                                        crate::object_binding::inline_numeric_encoded_lit(
+                                            o_type_val, o_key_val, p_id, o_i, t,
+                                        )
+                                    {
+                                        encoded
+                                    } else {
+                                        // Fallback: decode eagerly, using DictOverlay for
+                                        // novelty-aware resolution of string/subject IDs.
+                                        use fluree_db_core::o_type::{DecodeKind, OType as OT};
+                                        let ot = OT::from_u16(o_type_val);
+                                        let val: fluree_db_core::FlakeValue =
+                                            match (ot.decode_kind(), dict_overlay.as_ref()) {
+                                                (DecodeKind::IriRef, Some(ov)) => {
+                                                    let iri = ov
+                                                        .resolve_subject_iri(o_key_val)
+                                                        .map_err(|e| {
+                                                            crate::error::QueryError::Internal(
+                                                                format!(
+                                                        "resolve_subject_iri (batched join): {e}"
+                                                    ),
+                                                            )
+                                                        })?;
+                                                    fluree_db_core::FlakeValue::Ref(
+                                                        store.encode_iri(&iri),
+                                                    )
+                                                }
+                                                (DecodeKind::StringDict, Some(ov)) => {
+                                                    let s = ov
+                                                        .resolve_string_value(o_key_val as u32)
+                                                        .map_err(|e| {
+                                                            crate::error::QueryError::Internal(
+                                                                format!(
+                                                        "resolve_string_value (batched join): {e}"
+                                                    ),
+                                                            )
+                                                        })?;
+                                                    fluree_db_core::FlakeValue::String(s)
+                                                }
+                                                (DecodeKind::JsonArena, Some(ov)) => {
+                                                    let s = ov
+                                                        .resolve_string_value(o_key_val as u32)
+                                                        .map_err(|e| {
+                                                            crate::error::QueryError::Internal(
+                                                                format!(
+                                                    "resolve_string_value (batched join json): {e}"
+                                                ),
+                                                            )
+                                                        })?;
+                                                    fluree_db_core::FlakeValue::Json(s)
+                                                }
+                                                _ => store
+                                                    .decode_value_v3(
+                                                        o_type_val,
+                                                        o_key_val,
+                                                        p_id,
+                                                        ctx.binary_g_id,
+                                                    )
                                                     .map_err(|e| {
                                                         crate::error::QueryError::Internal(format!(
-                                                        "resolve_subject_iri (batched join): {e}"
-                                                    ))
-                                                    })?;
-                                                fluree_db_core::FlakeValue::Ref(
-                                                    store.encode_iri(&iri),
-                                                )
-                                            }
-                                            (DecodeKind::StringDict, Some(ov)) => {
-                                                let s = ov
-                                                    .resolve_string_value(o_key_val as u32)
-                                                    .map_err(|e| {
-                                                    crate::error::QueryError::Internal(format!(
-                                                        "resolve_string_value (batched join): {e}"
-                                                    ))
-                                                })?;
-                                                fluree_db_core::FlakeValue::String(s)
-                                            }
-                                            (DecodeKind::JsonArena, Some(ov)) => {
-                                                let s = ov
-                                                    .resolve_string_value(o_key_val as u32)
-                                                    .map_err(|e| {
-                                                    crate::error::QueryError::Internal(format!(
-                                                    "resolve_string_value (batched join json): {e}"
-                                                ))
-                                                })?;
-                                                fluree_db_core::FlakeValue::Json(s)
-                                            }
-                                            _ => store
-                                                .decode_value_v3(
-                                                    o_type_val,
-                                                    o_key_val,
-                                                    p_id,
-                                                    ctx.binary_g_id,
-                                                )
-                                                .map_err(|e| {
-                                                    crate::error::QueryError::Internal(format!(
-                                                        "decode_value_v3 (batched join): {e}"
-                                                    ))
-                                                })?,
-                                        };
-                                    materialized_object_binding(
-                                        store,
-                                        o_type_val,
-                                        p_id,
-                                        val,
-                                        Some(t),
-                                        None,
-                                    )
+                                                            "decode_value_v3 (batched join): {e}"
+                                                        ))
+                                                    })?,
+                                            };
+                                        materialized_object_binding(
+                                            store,
+                                            o_type_val,
+                                            p_id,
+                                            val,
+                                            Some(t),
+                                            None,
+                                        )
+                                    }
                                 }
                             }
                         };
