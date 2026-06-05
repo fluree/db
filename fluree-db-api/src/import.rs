@@ -2089,6 +2089,8 @@ struct IndexBuildInput<'a> {
     /// User-defined named graph g_ids (>= 2) to build index segments for.
     /// Empty for single-graph imports.
     named_g_ids: Vec<u16>,
+    /// Actual split mode the import used; written into the root and predicate sids.
+    ns_split_mode: fluree_db_core::ns_encoding::NsSplitMode,
 }
 
 /// Run phases 2-6: import chunks, build indexes, upload to CAS, write V4 root, publish.
@@ -2147,6 +2149,7 @@ where
             collect_id_stats: config.collect_id_stats,
             prefix_map: &import_result.prefix_map,
             named_g_ids: import_result.named_g_ids,
+            ns_split_mode: import_result.ns_split_mode,
         };
         let index_result = build_and_upload(
             storage,
@@ -2254,6 +2257,10 @@ struct ChunkImportResult {
     /// User-defined named graph g_ids (>= 2) to build index segments for.
     /// Empty for single-graph imports.
     named_g_ids: Vec<u16>,
+    /// Split mode the allocator actually used (the ns preflight may coarsen it to
+    /// `HostPlusN`). Recorded into the root, predicate sids, and genesis commit so
+    /// reads split IRIs the same way the dictionary was keyed.
+    ns_split_mode: fluree_db_core::ns_encoding::NsSplitMode,
 }
 
 /// Import all TTL chunks: parallel parse + serial commit + streaming runs.
@@ -2365,6 +2372,9 @@ where
         vocab_dir: &'a Path,
         spool_dir: &'a Path,
         datatype_alloc: &'a Arc<fluree_db_indexer::run_index::global_dict::SharedDictAllocator>,
+        /// Allocator whose actual split mode is mirrored into the genesis commit
+        /// (so a later reindex agrees with the index root).
+        shared_alloc: &'a Arc<fluree_db_transact::SharedNamespaceAllocator>,
         rdf_type_p_id: u32,
         import_time_epoch_ms: Option<i64>,
     }
@@ -2405,6 +2415,14 @@ where
 
                 // Capture previous commit hex BEFORE finalize advances state.
                 let previous_commit_hex = commit_metas.last().map(|m| m.commit_hash_hex.clone());
+
+                // The genesis commit records the registry's split mode, but the
+                // preflight flips only the allocator — mirror it so reindex agrees.
+                if state.parent.is_none() {
+                    state
+                        .ns_registry
+                        .set_split_mode(env.shared_alloc.split_mode());
+                }
 
                 let result = finalize_parsed_chunk(state, parsed, ns_delta, env.storage, env.alias)
                     .await
@@ -2715,6 +2733,7 @@ where
         vocab_dir: &vocab_dir,
         spool_dir: &spool_dir,
         datatype_alloc: &spool_config.datatype_alloc,
+        shared_alloc: &shared_alloc,
         rdf_type_p_id,
         import_time_epoch_ms,
     };
@@ -4012,6 +4031,8 @@ where
         dt_width,
         rdf_type_p_id,
         named_g_ids: v3_named_g_ids,
+        // Forwarder thread joined above, so this reflects any preflight coarsening.
+        ns_split_mode: shared_alloc.split_mode(),
     })
 }
 
@@ -4560,10 +4581,8 @@ where
             by_id
                 .iter()
                 .map(|iri| {
-                    let (prefix, suffix) = fluree_db_core::canonical_split(
-                        iri,
-                        fluree_db_core::NsSplitMode::default(),
-                    );
+                    let (prefix, suffix) =
+                        fluree_db_core::canonical_split(iri, input.ns_split_mode);
                     match ns_reverse_v6.get(prefix) {
                         Some(&code) => (code, suffix.to_string()),
                         None => (0u16, iri.clone()),
@@ -4782,7 +4801,7 @@ where
             prev_index: None,
             garbage: None,
             sketch_ref: None,
-            ns_split_mode: fluree_db_core::ns_encoding::NsSplitMode::default(),
+            ns_split_mode: input.ns_split_mode,
         };
 
         // Encode and upload FIR6 root.
