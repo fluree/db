@@ -408,34 +408,42 @@ enum JoinKey {
     Other(GroupKeyOwned),
 }
 
-/// Build a comparable join key for a binding, normalising refs to a `u64` s_id when
-/// a store is available. Returns `None` for Unbound/Poisoned (cannot participate in
-/// an inner join).
-fn join_key(binding: &Binding, store: Option<&BinaryIndexStore>) -> Option<JoinKey> {
+/// How a binding's join-var value participates in the join.
+enum JoinKeyClass {
+    /// A comparable key — matches probe rows carrying the same value.
+    Keyed(JoinKey),
+    /// Unbound join var: unconstrained from the left, so it matches EVERY probe row
+    /// (the right side fills it — the nested-loop "take the right value" semantics).
+    Wildcard,
+    /// Poisoned join var: a failed OPTIONAL/required binding *blocks* matching (see
+    /// `optional.rs` — Poisoned yields no matches, not "match anything"), so the row
+    /// produces no output and is dropped. Collapsing this into `Wildcard` would fan a
+    /// failed OPTIONAL out to every probe row instead of producing no match.
+    Dead,
+}
+
+/// Classify a binding's join key, normalising refs to a `u64` s_id when a store is
+/// available. Unbound → wildcard; Poisoned → dead (drop); everything else → keyed.
+fn join_key(binding: &Binding, store: Option<&BinaryIndexStore>) -> JoinKeyClass {
+    let keyed_ref_or_group = |sid: &fluree_db_core::Sid| {
+        store
+            .and_then(|s| {
+                s.find_subject_id_by_parts(sid.namespace_code, &sid.name)
+                    .ok()
+                    .flatten()
+            })
+            .map(JoinKey::Ref)
+            .unwrap_or_else(|| JoinKey::Other(binding_to_group_key_owned(binding)))
+    };
     match binding {
-        Binding::EncodedSid { s_id, .. } => Some(JoinKey::Ref(*s_id)),
-        Binding::Sid { sid, .. } => Some(
-            store
-                .and_then(|s| {
-                    s.find_subject_id_by_parts(sid.namespace_code, &sid.name)
-                        .ok()
-                        .flatten()
-                })
-                .map(JoinKey::Ref)
-                .unwrap_or_else(|| JoinKey::Other(binding_to_group_key_owned(binding))),
-        ),
-        Binding::IriMatch { primary_sid, .. } => Some(
-            store
-                .and_then(|s| {
-                    s.find_subject_id_by_parts(primary_sid.namespace_code, &primary_sid.name)
-                        .ok()
-                        .flatten()
-                })
-                .map(JoinKey::Ref)
-                .unwrap_or_else(|| JoinKey::Other(binding_to_group_key_owned(binding))),
-        ),
-        Binding::Unbound | Binding::Poisoned => None,
-        other => Some(JoinKey::Other(binding_to_group_key_owned(other))),
+        Binding::EncodedSid { s_id, .. } => JoinKeyClass::Keyed(JoinKey::Ref(*s_id)),
+        Binding::Sid { sid, .. } => JoinKeyClass::Keyed(keyed_ref_or_group(sid)),
+        Binding::IriMatch { primary_sid, .. } => {
+            JoinKeyClass::Keyed(keyed_ref_or_group(primary_sid))
+        }
+        Binding::Unbound => JoinKeyClass::Wildcard,
+        Binding::Poisoned => JoinKeyClass::Dead,
+        other => JoinKeyClass::Keyed(JoinKey::Other(binding_to_group_key_owned(other))),
     }
 }
 
@@ -571,9 +579,11 @@ impl HashJoinOperator {
                     .map(|c| batch.get_by_col(row, c).clone())
                     .collect();
                 match join_key(batch.get_by_col(row, self.build_key_col), store) {
-                    Some(key) => self.table.entry(key).or_default().push(row_vals),
-                    // Unbound/Poisoned join var: unconstrained, matches every probe row.
-                    None => self.wildcard_rows.push(row_vals),
+                    JoinKeyClass::Keyed(key) => self.table.entry(key).or_default().push(row_vals),
+                    // Unbound join var: unconstrained, matches every probe row.
+                    JoinKeyClass::Wildcard => self.wildcard_rows.push(row_vals),
+                    // Poisoned join var: blocks matching — drop the row (no output).
+                    JoinKeyClass::Dead => {}
                 }
             }
         }
@@ -683,7 +693,11 @@ impl Operator for HashJoinOperator {
                 let row = self.cur_probe_row;
                 self.cur_probe_row += 1;
 
-                let Some(key) = join_key(pb.get_by_col(row, self.probe_key_col), store) else {
+                // The probe scan always binds the join var, so a non-keyed probe row
+                // (unbound/poisoned) cannot match — skip it.
+                let JoinKeyClass::Keyed(key) =
+                    join_key(pb.get_by_col(row, self.probe_key_col), store)
+                else {
                     continue;
                 };
                 if let Some(matches) = self.table.get(&key) {
@@ -764,7 +778,8 @@ impl Operator for HashJoinOperator {
             match probe.next_batch(ctx).await? {
                 Some(batch) if !batch.is_empty() => {
                     for row in 0..batch.len() {
-                        let Some(key) = join_key(batch.get_by_col(row, self.probe_key_col), store)
+                        let JoinKeyClass::Keyed(key) =
+                            join_key(batch.get_by_col(row, self.probe_key_col), store)
                         else {
                             continue;
                         };
@@ -800,6 +815,122 @@ mod tests {
     use super::*;
     use crate::ir::triple::{Ref, Term};
     use fluree_db_core::{PropertyStatData, Sid};
+
+    #[test]
+    fn join_key_class_unbound_wildcard_poisoned_dead() {
+        // Unbound => matches every probe row; Poisoned => blocks matching (drop).
+        // Collapsing both to one class is the bug this guards against.
+        assert!(matches!(
+            join_key(&Binding::Unbound, None),
+            JoinKeyClass::Wildcard
+        ));
+        assert!(matches!(
+            join_key(&Binding::Poisoned, None),
+            JoinKeyClass::Dead
+        ));
+        assert!(matches!(
+            join_key(
+                &Binding::lit(fluree_db_core::FlakeValue::Long(1), Sid::new(2, "long")),
+                None
+            ),
+            JoinKeyClass::Keyed(_)
+        ));
+    }
+
+    /// Emits one fixed batch then EOF — a stand-in build/probe input.
+    struct OnceOp {
+        schema: Arc<[VarId]>,
+        batch: Option<Batch>,
+    }
+
+    #[async_trait]
+    impl Operator for OnceOp {
+        fn schema(&self) -> &[VarId] {
+            &self.schema
+        }
+        async fn open(&mut self, _: &ExecutionContext<'_>) -> Result<()> {
+            Ok(())
+        }
+        async fn next_batch(&mut self, _: &ExecutionContext<'_>) -> Result<Option<Batch>> {
+            Ok(self.batch.take())
+        }
+        fn close(&mut self) {}
+    }
+
+    #[tokio::test]
+    async fn poisoned_build_key_blocks_matching_not_wildcard() {
+        // BSBM/SKOS shape: OPTIONAL { ... ?x } . ?s :p ?x — a failed OPTIONAL leaves
+        // ?x Poisoned on the driving side. The object→subject hash join must produce
+        // NO match for that row (Poisoned blocks), not fan it out to every probe row.
+        use crate::context::ExecutionContext;
+        use crate::var_registry::VarRegistry;
+        use fluree_db_core::{FlakeValue, LedgerSnapshot};
+
+        let snapshot = LedgerSnapshot::genesis("test/main");
+        let mut vars = VarRegistry::new();
+        let x = vars.get_or_insert("?x"); // join var (bound object)
+        let driver = vars.get_or_insert("?driver");
+        let s = vars.get_or_insert("?s");
+        let ctx = ExecutionContext::new(&snapshot, &vars);
+
+        let key = || Binding::lit(FlakeValue::Long(1), Sid::new(2, "long"));
+        let d_ok = Binding::lit(FlakeValue::Long(10), Sid::new(2, "long"));
+        let d_poisoned = Binding::lit(FlakeValue::Long(20), Sid::new(2, "long"));
+
+        // Build (driving) side, columns [?x, ?driver]: row0 has a POISONED ?x, row1 keyed.
+        let build_schema: Arc<[VarId]> = Arc::from(vec![x, driver].into_boxed_slice());
+        let build_batch = Batch::new(
+            build_schema.clone(),
+            vec![
+                vec![Binding::Poisoned, key()], // ?x column
+                vec![d_poisoned, d_ok],         // ?driver column
+            ],
+        )
+        .unwrap();
+
+        // Probe side, columns [?x, ?s]: two rows, both ?x = key.
+        let probe_schema: Arc<[VarId]> = Arc::from(vec![x, s].into_boxed_slice());
+        let probe_batch = Batch::new(
+            probe_schema.clone(),
+            vec![
+                vec![key(), key()], // ?x column
+                vec![
+                    Binding::lit(FlakeValue::Long(100), Sid::new(2, "long")),
+                    Binding::lit(FlakeValue::Long(200), Sid::new(2, "long")),
+                ], // ?s column
+            ],
+        )
+        .unwrap();
+
+        let right_pattern =
+            TriplePattern::new(Ref::Var(s), Ref::Sid(Sid::new(1, "p")), Term::Var(x));
+        let mut hj = HashJoinOperator::new(
+            Box::new(OnceOp {
+                schema: build_schema,
+                batch: Some(build_batch),
+            }),
+            Box::new(OnceOp {
+                schema: probe_schema,
+                batch: Some(probe_batch),
+            }),
+            x,
+            None,
+            right_pattern,
+            None,
+            crate::temporal_mode::PlanningContext::current().mode(),
+        );
+        hj.open(&ctx).await.unwrap();
+        let mut rows = 0;
+        while let Some(b) = hj.next_batch(&ctx).await.unwrap() {
+            rows += b.len();
+        }
+        // Only the keyed build row joins (× 2 probe rows). The Poisoned row is dropped;
+        // the old wildcard behaviour would have produced 4 rows.
+        assert_eq!(
+            rows, 2,
+            "Poisoned build row must not fan out to every probe row"
+        );
+    }
 
     #[test]
     fn explains_subject_driven_forward_join() {

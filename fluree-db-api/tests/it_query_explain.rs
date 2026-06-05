@@ -6,10 +6,50 @@ mod support;
 
 use fluree_db_api::FlureeBuilder;
 use serde_json::json;
+use std::sync::{Mutex, MutexGuard, OnceLock};
 use support::{genesis_ledger, graphdb_from_ledger};
+
+/// Serializes `FLUREE_HASH_JOIN` access across this file's tests and restores the
+/// prior value on drop. `HashJoinPlanner` reads this var at plan time, so a test
+/// that forces the hash join must not run while another builds a plan, and must not
+/// leak the override on panic. Every plan-building test holds one for its duration;
+/// `acquire()` starts each test in the default (AUTO) mode.
+struct HashJoinEnv {
+    _guard: MutexGuard<'static, ()>,
+    prev: Option<String>,
+}
+
+impl HashJoinEnv {
+    fn acquire() -> Self {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        let guard = LOCK
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let prev = std::env::var("FLUREE_HASH_JOIN").ok();
+        std::env::remove_var("FLUREE_HASH_JOIN");
+        Self {
+            _guard: guard,
+            prev,
+        }
+    }
+    fn force_on(&self) {
+        std::env::set_var("FLUREE_HASH_JOIN", "1");
+    }
+}
+
+impl Drop for HashJoinEnv {
+    fn drop(&mut self) {
+        match &self.prev {
+            Some(v) => std::env::set_var("FLUREE_HASH_JOIN", v),
+            None => std::env::remove_var("FLUREE_HASH_JOIN"),
+        }
+    }
+}
 
 #[tokio::test]
 async fn explain_no_stats_reports_none_and_reason() {
+    let _env = HashJoinEnv::acquire();
     // Scenario: explain-no-stats-test
     let fluree = FlureeBuilder::memory().build_memory();
     let ledger0 = genesis_ledger(&fluree, "no-stats:main");
@@ -45,6 +85,7 @@ async fn explain_no_stats_reports_none_and_reason() {
 
 #[tokio::test]
 async fn explain_sparql_no_stats_reports_none_and_reason() {
+    let _env = HashJoinEnv::acquire();
     let fluree = FlureeBuilder::memory().build_memory();
     let ledger0 = genesis_ledger(&fluree, "no-stats-sparql:main");
 
@@ -77,6 +118,7 @@ async fn explain_sparql_no_stats_reports_none_and_reason() {
 
 #[tokio::test]
 async fn explain_physical_plan_present_and_concretely_named() {
+    let _env = HashJoinEnv::acquire();
     // plan.physical is built from the REAL operator tree (build-only, no exec).
     // Validate it is present and operators resolve to concrete names (the
     // default op_name() must see through dyn dispatch, not report "dyn Operator").
@@ -149,6 +191,7 @@ async fn explain_physical_object_subject_join_shows_hash_join_decision() {
     // `?a ex:knows ?x`. This is the exact shape the object→subject hash join
     // targets. Default (no stats): the planner keeps the NestedLoop and records
     // the rejected hash-join reason. FLUREE_HASH_JOIN=1: the hash join is chosen.
+    let env = HashJoinEnv::acquire(); // AUTO mode; restored (and serialized) via guard
     let fluree = FlureeBuilder::memory().build_memory();
     let ledger0 = genesis_ledger(&fluree, "physical-join:main");
     let ledger = fluree
@@ -168,8 +211,7 @@ async fn explain_physical_object_subject_join_shows_hash_join_decision() {
         "PREFIX ex: <http://example.org/>\nSELECT ?a ?b WHERE { ?a ex:knows ?x . ?b ex:knows ?x }";
     let db = graphdb_from_ledger(&ledger);
 
-    // Default: nested-loop join, hash join evaluated and rejected.
-    std::env::remove_var("FLUREE_HASH_JOIN");
+    // Default (AUTO): nested-loop join, hash join evaluated and rejected.
     let resp = fluree
         .explain_sparql(&db, sparql)
         .await
@@ -191,12 +233,11 @@ async fn explain_physical_object_subject_join_shows_hash_join_decision() {
     );
 
     // Forced: the object→subject hash join is selected.
-    std::env::set_var("FLUREE_HASH_JOIN", "1");
+    env.force_on();
     let resp_forced = fluree
         .explain_sparql(&db, sparql)
         .await
         .expect("explain_sparql");
-    std::env::remove_var("FLUREE_HASH_JOIN");
     let physical_forced = &resp_forced["plan"]["physical"];
     eprintln!(
         "PHYSICAL(hash) = {}",
@@ -209,7 +250,49 @@ async fn explain_physical_object_subject_join_shows_hash_join_decision() {
 }
 
 #[tokio::test]
+async fn explain_logical_estimates_are_bound_var_aware() {
+    let _env = HashJoinEnv::acquire();
+    // `?s ex:p ?o . ?o ex:q ?x`: the second triple's subject ?o is bound by the
+    // first, so its logical estimate must be the (selective) bound-subject estimate,
+    // not a full predicate scan as if no earlier variable were bound. Even without
+    // stats the defaults differ (bound-subject vs property-scan), so this catches a
+    // node rendered with an empty bound set.
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger0 = genesis_ledger(&fluree, "logical-bound:main");
+    let ledger = fluree
+        .insert(
+            ledger0,
+            &json!({
+                "@context": {"ex":"http://example.org/"},
+                "@id":"ex:a",
+                "ex:p": {"@id":"ex:b", "ex:q": {"@id":"ex:c"}}
+            }),
+        )
+        .await
+        .expect("seed")
+        .ledger;
+    let db = graphdb_from_ledger(&ledger);
+    let sparql = "PREFIX ex: <http://example.org/>\nSELECT ?s ?x WHERE { ?s ex:p ?o . ?o ex:q ?x }";
+    let resp = fluree
+        .explain_sparql(&db, sparql)
+        .await
+        .expect("explain_sparql");
+    let logical = resp["plan"]["logical"]
+        .as_array()
+        .expect("logical plan array");
+    assert_eq!(logical.len(), 2, "two triples expected: {logical:?}");
+    let row_count = |n: &serde_json::Value| n["estimate"]["row-count"].as_i64();
+    let first = row_count(&logical[0]).expect("first row-count");
+    let second = row_count(&logical[1]).expect("second row-count");
+    assert!(
+        second < first,
+        "bound-subject second triple must estimate below the first full scan: {first} then {second}"
+    );
+}
+
+#[tokio::test]
 async fn explain_physical_plan_surfaces_fast_path() {
+    let _env = HashJoinEnv::acquire();
     // A COUNT(*) over a predicate is answered by a metadata fast path. The
     // planner selects it at build time, so plan.physical names the fast-path
     // operator (label-tagged) — the signal the pattern-level views cannot give.
@@ -252,6 +335,7 @@ async fn explain_physical_plan_surfaces_fast_path() {
 
 #[tokio::test]
 async fn explain_physical_expands_subquery_inner_plan() {
+    let _env = HashJoinEnv::acquire();
     // BSBM-BI queries are subquery-based; the inner joins are where the time is.
     // The SubqueryOperator builds its subplan lazily, so explain rebuilds it
     // (build-only) and exposes it under a `SubqueryBody` node.
@@ -306,6 +390,7 @@ async fn explain_physical_expands_subquery_inner_plan() {
 
 #[tokio::test]
 async fn explain_logical_plan_preserves_compound_structure() {
+    let _env = HashJoinEnv::acquire();
     // The `logical` plan view is the compound-aware reorder_patterns order,
     // available even without stats. Verify a triple + OPTIONAL render as a
     // `triple` node and an `optional` node containing its inner triple.

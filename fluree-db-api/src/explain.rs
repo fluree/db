@@ -9,7 +9,7 @@ use crate::query::helpers::{parse_jsonld_query, parse_sparql_to_ir};
 use fluree_db_core::{is_rdf_type, StatsView};
 use fluree_db_query::{
     explain_execution_hints, parse_query, ExplainPlan, OptimizationStatus, Pattern, Query, Ref,
-    Term, TriplePattern, VarRegistry,
+    Term, TriplePattern, VarId, VarRegistry,
 };
 use serde_json::{json, Map, Value as JsonValue};
 use std::collections::HashSet;
@@ -120,11 +120,12 @@ fn logical_node(
     vars: &VarRegistry,
     compactor: &IriCompactor,
     stats: Option<&StatsView>,
+    bound_vars: &HashSet<VarId>,
 ) -> JsonValue {
     use fluree_db_query::planner::{estimate_pattern, PatternEstimate};
 
     let mut node = Map::new();
-    let category = match estimate_pattern(p, &HashSet::new(), stats) {
+    let category = match estimate_pattern(p, bound_vars, stats) {
         PatternEstimate::Source { row_count } => {
             node.insert(
                 "estimate".into(),
@@ -144,10 +145,18 @@ fn logical_node(
     };
     node.insert("category".into(), json!(category));
 
+    // Inner pattern lists bind progressively against the set entering this node, so
+    // a nested node's estimate reflects what earlier siblings bound (as execution
+    // sees it). A fresh local per list means UNION branches each start from `bound_vars`.
     let children = |ps: &[Pattern]| -> JsonValue {
+        let mut local = bound_vars.clone();
         JsonValue::Array(
             ps.iter()
-                .map(|c| logical_node(c, vars, compactor, stats))
+                .map(|c| {
+                    let n = logical_node(c, vars, compactor, stats, &local);
+                    local.extend(c.produced_vars());
+                    n
+                })
                 .collect(),
         )
     };
@@ -448,10 +457,17 @@ fn explain_from_parsed(
             stats_view.as_ref(),
             &HashSet::new(),
         );
+        // Thread the evolving bound-var set through the ordered plan so each node's
+        // estimate is context-aware (a bound-subject scan, not a full predicate scan).
+        let mut bound: HashSet<VarId> = HashSet::new();
         JsonValue::Array(
             ordered
                 .iter()
-                .map(|p| logical_node(p, vars, &compactor, stats_view.as_ref()))
+                .map(|p| {
+                    let n = logical_node(p, vars, &compactor, stats_view.as_ref(), &bound);
+                    bound.extend(p.produced_vars());
+                    n
+                })
                 .collect(),
         )
     };
