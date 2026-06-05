@@ -6,9 +6,26 @@
 
 mod support;
 
-use fluree_db_api::FlureeBuilder;
+use fluree_db_api::{FlureeBuilder, QueryInput};
 use serde_json::json;
-use support::{genesis_ledger, normalize_rows};
+use support::{genesis_ledger, normalize_rows, rebuild_and_publish_index};
+
+/// Insert `data`, build+publish the binary index, then run `q` against the
+/// reloaded indexed view (binary store attached — the path that diverged from
+/// in-memory novelty in the LUBM retest).
+async fn run_indexed(ledger_id: &str, data: &serde_json::Value, q: &serde_json::Value) -> Vec<serde_json::Value> {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger0 = genesis_ledger(&fluree, ledger_id);
+    let canonical = fluree.insert(ledger0, data).await.unwrap().ledger;
+    let lid = canonical.snapshot.ledger_id.to_string();
+    rebuild_and_publish_index(&fluree, &lid).await;
+    let view = fluree.db(&lid).await.expect("load indexed view");
+    let res = fluree
+        .query(&view, QueryInput::JsonLd(q))
+        .await
+        .expect("indexed query");
+    normalize_rows(&res.to_jsonld(&view.snapshot).expect("to_jsonld"))
+}
 
 /// LUBM-shaped fixture: GraduateStudent ⊑ Student ⊑ Person.
 /// `ex:g` is an asserted GraduateStudent, inferred Student and Person.
@@ -150,6 +167,217 @@ async fn case11_var_subject_var_ref_object() {
     });
     let r = run(&fluree, &ledger, &q).await;
     assert!(r.contains(&json!("ex:g")), "var subject + var ref object should include ex:g, got {r:?}");
+}
+
+// ===================== DEEPER VARIANT (3+ pattern chains, derived property) =====================
+
+/// LUBM q07/q09-shaped: 3-pattern chain whose FIRST pattern's type is derived.
+/// GraduateStudent ⊑ Student; ex:g a GraduateStudent (=> derived Student);
+/// ex:g memberOf ex:d0 ; ex:d0 a Department (base).
+async fn chain_fixture() -> (support::MemoryFluree, support::MemoryLedger) {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger0 = genesis_ledger(&fluree, "reasoning/chain-repro");
+    let data = json!({
+        "@context": {
+            "ex": "http://example.org/",
+            "owl": "http://www.w3.org/2002/07/owl#",
+            "rdfs": "http://www.w3.org/2000/01/rdf-schema#"
+        },
+        "@graph": [
+            {"@id": "ex:GraduateStudent", "@type": "owl:Class", "rdfs:subClassOf": {"@id": "ex:Student"}},
+            {"@id": "ex:d0", "@type": "ex:Department"},
+            {"@id": "ex:ug", "@type": "ex:UndergraduateStudent", "ex:memberOf": {"@id": "ex:d0"}},
+            {"@id": "ex:g", "@type": "ex:GraduateStudent", "ex:memberOf": {"@id": "ex:d0"}}
+        ]
+    });
+    let ledger = fluree.insert(ledger0, &data).await.unwrap().ledger;
+    (fluree, ledger)
+}
+
+// CONTROL: 3-pattern chain, BASE type in first pattern. Expected to work.
+#[tokio::test]
+async fn chain_base_type_three_pattern() {
+    let (fluree, ledger) = chain_fixture().await;
+    let q = json!({
+        "@context": {"ex": "http://example.org/"},
+        "selectDistinct": "?x",
+        "where": [
+            {"@id": "?x", "@type": "ex:UndergraduateStudent"},
+            {"@id": "?x", "ex:memberOf": "?d"},
+            {"@id": "?d", "@type": "ex:Department"}
+        ],
+        "reasoning": "owl2rl"
+    });
+    let r = run(&fluree, &ledger, &q).await;
+    assert_eq!(r, vec![json!("ex:ug")], "3-pattern base-type chain: {r:?}");
+}
+
+// BUG: same 3-pattern chain but FIRST pattern's type (Student) is derived.
+#[tokio::test]
+async fn chain_derived_type_three_pattern() {
+    let (fluree, ledger) = chain_fixture().await;
+    let q = json!({
+        "@context": {"ex": "http://example.org/"},
+        "selectDistinct": "?x",
+        "where": [
+            {"@id": "?x", "@type": "ex:Student"},
+            {"@id": "?x", "ex:memberOf": "?d"},
+            {"@id": "?d", "@type": "ex:Department"}
+        ],
+        "reasoning": "owl2rl"
+    });
+    let mut r = run(&fluree, &ledger, &q).await;
+    r.sort_by_key(|v| v.to_string());
+    // ex:g is a derived Student; ex:ug is also a Student? No — ug is Undergraduate,
+    // not a subclass of Student here. Only ex:g is a (derived) Student.
+    assert_eq!(r, vec![json!("ex:g")], "3-pattern derived-type chain (BUG): {r:?}");
+}
+
+// CONTROL: 2-pattern derived-type chain (no 3rd pattern) — known to work post-fix.
+#[tokio::test]
+async fn chain_derived_type_two_pattern() {
+    let (fluree, ledger) = chain_fixture().await;
+    let q = json!({
+        "@context": {"ex": "http://example.org/"},
+        "selectDistinct": "?x",
+        "where": [
+            {"@id": "?x", "@type": "ex:Student"},
+            {"@id": "?x", "ex:memberOf": "?d"}
+        ],
+        "reasoning": "owl2rl"
+    });
+    let r = run(&fluree, &ledger, &q).await;
+    assert_eq!(r, vec![json!("ex:g")], "2-pattern derived-type chain: {r:?}");
+}
+
+/// q11-shaped: join where the matched fact is a DERIVED property fact.
+/// subOrgOf transitive: ex:rg0 subOrgOf ex:d0 ; ex:d0 subOrgOf ex:u0
+/// => derived ex:rg0 subOrgOf ex:u0. ex:rg0 a ResearchGroup (base).
+async fn transitive_fixture() -> (support::MemoryFluree, support::MemoryLedger) {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger0 = genesis_ledger(&fluree, "reasoning/transitive-repro");
+    let data = json!({
+        "@context": {
+            "ex": "http://example.org/",
+            "owl": "http://www.w3.org/2002/07/owl#"
+        },
+        "@graph": [
+            {"@id": "ex:subOrgOf", "@type": "owl:TransitiveProperty"},
+            {"@id": "ex:rg0", "@type": "ex:ResearchGroup", "ex:subOrgOf": {"@id": "ex:d0"}},
+            {"@id": "ex:d0", "@type": "ex:Department", "ex:subOrgOf": {"@id": "ex:u0"}},
+            {"@id": "ex:u0", "@type": "ex:University"}
+        ]
+    });
+    let ledger = fluree.insert(ledger0, &data).await.unwrap().ledger;
+    (fluree, ledger)
+}
+
+// CONTROL: the derived transitive edge is visible on its own.
+#[tokio::test]
+async fn transitive_edge_single_pattern() {
+    let (fluree, ledger) = transitive_fixture().await;
+    let q = json!({
+        "@context": {"ex": "http://example.org/"},
+        "selectDistinct": "?x",
+        "where": {"@id": "?x", "ex:subOrgOf": {"@id": "ex:u0"}},
+        "reasoning": "owl2rl"
+    });
+    let r = run(&fluree, &ledger, &q).await;
+    // rg0 (derived, transitively) and d0 (base) are both subOrgOf u0.
+    assert!(r.contains(&json!("ex:rg0")), "derived transitive edge rg0->u0 should be visible: {r:?}");
+}
+
+// BUG: join base-type pattern with the DERIVED transitive-property fact.
+#[tokio::test]
+async fn transitive_join_derived_property() {
+    let (fluree, ledger) = transitive_fixture().await;
+    let q = json!({
+        "@context": {"ex": "http://example.org/"},
+        "selectDistinct": "?x",
+        "where": [
+            {"@id": "?x", "@type": "ex:ResearchGroup"},
+            {"@id": "?x", "ex:subOrgOf": {"@id": "ex:u0"}}
+        ],
+        "reasoning": "owl2rl"
+    });
+    let r = run(&fluree, &ledger, &q).await;
+    assert_eq!(r, vec![json!("ex:rg0")], "join on derived transitive property (BUG): {r:?}");
+}
+
+// ----- INDEXED (binary-store) variants of the deeper bug -----
+
+fn chain_data() -> serde_json::Value {
+    json!({
+        "@context": {
+            "ex": "http://example.org/",
+            "owl": "http://www.w3.org/2002/07/owl#",
+            "rdfs": "http://www.w3.org/2000/01/rdf-schema#"
+        },
+        "@graph": [
+            {"@id": "ex:GraduateStudent", "@type": "owl:Class", "rdfs:subClassOf": {"@id": "ex:Student"}},
+            {"@id": "ex:d0", "@type": "ex:Department"},
+            {"@id": "ex:ug", "@type": "ex:UndergraduateStudent", "ex:memberOf": {"@id": "ex:d0"}},
+            {"@id": "ex:g", "@type": "ex:GraduateStudent", "ex:memberOf": {"@id": "ex:d0"}}
+        ]
+    })
+}
+
+#[tokio::test]
+async fn idx_chain_derived_type_three_pattern() {
+    let q = json!({
+        "@context": {"ex": "http://example.org/"},
+        "selectDistinct": "?x",
+        "where": [
+            {"@id": "?x", "@type": "ex:Student"},
+            {"@id": "?x", "ex:memberOf": "?d"},
+            {"@id": "?d", "@type": "ex:Department"}
+        ],
+        "reasoning": "owl2rl"
+    });
+    let r = run_indexed("reasoning/idx-chain", &chain_data(), &q).await;
+    assert_eq!(r, vec![json!("ex:g")], "INDEXED 3-pattern derived-type chain: {r:?}");
+}
+
+fn transitive_data() -> serde_json::Value {
+    json!({
+        "@context": {
+            "ex": "http://example.org/",
+            "owl": "http://www.w3.org/2002/07/owl#"
+        },
+        "@graph": [
+            {"@id": "ex:subOrgOf", "@type": "owl:TransitiveProperty"},
+            {"@id": "ex:rg0", "@type": "ex:ResearchGroup", "ex:subOrgOf": {"@id": "ex:d0"}},
+            {"@id": "ex:d0", "@type": "ex:Department", "ex:subOrgOf": {"@id": "ex:u0"}},
+            {"@id": "ex:u0", "@type": "ex:University"}
+        ]
+    })
+}
+
+#[tokio::test]
+async fn idx_transitive_edge_single_pattern() {
+    let q = json!({
+        "@context": {"ex": "http://example.org/"},
+        "selectDistinct": "?x",
+        "where": {"@id": "?x", "ex:subOrgOf": {"@id": "ex:u0"}},
+        "reasoning": "owl2rl"
+    });
+    let r = run_indexed("reasoning/idx-trans-1", &transitive_data(), &q).await;
+    assert!(r.contains(&json!("ex:rg0")), "INDEXED derived transitive edge: {r:?}");
+}
+
+#[tokio::test]
+async fn idx_transitive_join_derived_property() {
+    let q = json!({
+        "@context": {"ex": "http://example.org/"},
+        "selectDistinct": "?x",
+        "where": [
+            {"@id": "?x", "@type": "ex:ResearchGroup"},
+            {"@id": "?x", "ex:subOrgOf": {"@id": "ex:u0"}}
+        ],
+        "reasoning": "owl2rl"
+    });
+    let r = run_indexed("reasoning/idx-trans-2", &transitive_data(), &q).await;
+    assert_eq!(r, vec![json!("ex:rg0")], "INDEXED join on derived transitive property: {r:?}");
 }
 
 // ===================== ISOLATION EXPERIMENTS =====================

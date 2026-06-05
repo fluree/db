@@ -630,7 +630,18 @@ pub async fn execute_prepared<'a, 'b>(
     {
         ctx = ctx.with_runtime_small_dicts(runtime_small_dicts);
     }
-    if db.eager {
+    // Reasoning derived facts live in the overlay as decoded `Binding::Sid`
+    // (they have no binary-store `s_id`). A binary scan otherwise late-
+    // materializes base rows to `Binding::EncodedSid` whenever it believes the
+    // store is authoritative for decoding — which it does when the effective
+    // overlay reports epoch 0 (e.g. a fully-indexed ledger with no novelty, so
+    // the base overlay epoch is 0 and the combined reasoning epoch is too).
+    // `EncodedSid` and `Sid` are defined to never compare equal, so a join
+    // between a base row and a derived fact about the same entity silently
+    // yields nothing. Force eager materialization whenever reasoning produced
+    // derived facts so every scan emits decoded `Sid`, keeping base and derived
+    // bindings comparable on join keys.
+    if db.eager || prepared.derived_overlay.is_some() {
         ctx = ctx.with_eager_materialization();
     }
 
