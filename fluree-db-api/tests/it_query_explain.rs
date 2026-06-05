@@ -96,7 +96,8 @@ async fn explain_physical_plan_present_and_concretely_named() {
         .expect("seed")
         .ledger;
 
-    let sparql = "PREFIX ex: <http://example.org/>\nSELECT ?person ?name WHERE { ?person ex:name ?name }";
+    let sparql =
+        "PREFIX ex: <http://example.org/>\nSELECT ?person ?name WHERE { ?person ex:name ?name }";
 
     let db = graphdb_from_ledger(&ledger);
     let resp = fluree
@@ -133,17 +134,13 @@ fn physical_contains_op(node: &serde_json::Value, name: &str) -> bool {
 }
 
 /// Recursively find the first `plan.physical` node whose `op` equals `name`.
-fn physical_find_op<'a>(
-    node: &'a serde_json::Value,
-    name: &str,
-) -> Option<&'a serde_json::Value> {
+fn physical_find_op<'a>(node: &'a serde_json::Value, name: &str) -> Option<&'a serde_json::Value> {
     if node["op"] == name {
         return Some(node);
     }
-    node["children"].as_array().and_then(|cs| {
-        cs.iter()
-            .find_map(|e| physical_find_op(&e["node"], name))
-    })
+    node["children"]
+        .as_array()
+        .and_then(|cs| cs.iter().find_map(|e| physical_find_op(&e["node"], name)))
 }
 
 #[tokio::test]
@@ -178,7 +175,10 @@ async fn explain_physical_object_subject_join_shows_hash_join_decision() {
         .await
         .expect("explain_sparql");
     let physical = &resp["plan"]["physical"];
-    eprintln!("PHYSICAL(nl) = {}", serde_json::to_string_pretty(physical).unwrap());
+    eprintln!(
+        "PHYSICAL(nl) = {}",
+        serde_json::to_string_pretty(physical).unwrap()
+    );
     let nl = physical_find_op(physical, "NestedLoopJoinOperator")
         .expect("expected a NestedLoopJoinOperator in physical plan");
     assert_eq!(
@@ -192,7 +192,10 @@ async fn explain_physical_object_subject_join_shows_hash_join_decision() {
 
     // Forced: the object→subject hash join is selected.
     std::env::set_var("FLUREE_HASH_JOIN", "1");
-    let resp_forced = fluree.explain_sparql(&db, sparql).await.expect("explain_sparql");
+    let resp_forced = fluree
+        .explain_sparql(&db, sparql)
+        .await
+        .expect("explain_sparql");
     std::env::remove_var("FLUREE_HASH_JOIN");
     let physical_forced = &resp_forced["plan"]["physical"];
     eprintln!(
@@ -291,9 +294,7 @@ async fn explain_physical_expands_subquery_inner_plan() {
         .expect("subquery inner plan should be expanded under SubqueryBody");
     // The inner operator tree is visible (a real operator under the body).
     assert!(
-        body["children"]
-            .as_array()
-            .is_some_and(|cs| !cs.is_empty()),
+        body["children"].as_array().is_some_and(|cs| !cs.is_empty()),
         "SubqueryBody should contain the inner operator tree"
     );
     // The inner aggregation (the GROUP BY / COUNT) is no longer opaque.

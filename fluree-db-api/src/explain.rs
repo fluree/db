@@ -126,7 +126,10 @@ fn logical_node(
     let mut node = Map::new();
     let category = match estimate_pattern(p, &HashSet::new(), stats) {
         PatternEstimate::Source { row_count } => {
-            node.insert("estimate".into(), json!({ "row-count": row_count.round() as i64 }));
+            node.insert(
+                "estimate".into(),
+                json!({ "row-count": row_count.round() as i64 }),
+            );
             "source"
         }
         PatternEstimate::Reducer { multiplier } => {
