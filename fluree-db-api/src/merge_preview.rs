@@ -467,8 +467,8 @@ async fn build_conflict_details(
     target_state: &LedgerState,
     strategy: &ConflictStrategy,
 ) -> Result<Vec<ConflictDetail>> {
-    let source_compactor = IriCompactor::from_namespaces(source_state.snapshot.namespaces_arc());
-    let target_compactor = IriCompactor::from_namespaces(target_state.snapshot.namespaces_arc());
+    let source_compactor = IriCompactor::from_namespaces(source_state.snapshot.shared_namespaces());
+    let target_compactor = IriCompactor::from_namespaces(target_state.snapshot.shared_namespaces());
     let resolution = resolution_for_strategy(strategy);
 
     stream::iter(keys.iter().cloned())

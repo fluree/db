@@ -361,7 +361,7 @@ impl LedgerSnapshot {
     /// Returns an `Arc` clone (refcount bump, no copy) so per-query consumers
     /// such as the result-formatting `IriCompactor` can hold the stable table
     /// without deep-cloning it on every request.
-    pub fn namespaces_arc(&self) -> Arc<HashMap<u16, String>> {
+    pub fn shared_namespaces(&self) -> Arc<HashMap<u16, String>> {
         Arc::clone(&self.namespace_codes)
     }
 
