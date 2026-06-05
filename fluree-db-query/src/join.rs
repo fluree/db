@@ -20,7 +20,8 @@ use async_trait::async_trait;
 use fluree_db_binary_index::{BinaryGraphView, BinaryIndexStore};
 use fluree_db_core::subject_id::SubjectId;
 use fluree_db_core::{GraphId, IndexType, ObjectBounds, Sid, BATCHED_JOIN_SIZE};
-use std::collections::{HashMap, HashSet, VecDeque};
+use rustc_hash::{FxBuildHasher, FxHashMap};
+use std::collections::{HashSet, VecDeque};
 use std::sync::Arc;
 use std::time::Instant;
 use tracing::Instrument;
@@ -1486,9 +1487,13 @@ impl NestedLoopJoinOperator {
     ///
     /// Returns `(s_id → accumulator indices, sorted unique s_ids)`.
     /// The s_ids are already stored as raw u64 in the accumulator — no dictionary lookup needed.
-    fn group_accumulator_by_subject(&self) -> (HashMap<u64, Vec<usize>>, Vec<u64>) {
-        let mut s_id_to_accum: HashMap<u64, Vec<usize>> = HashMap::new();
-        let mut unique_s_ids: Vec<u64> = Vec::new();
+    fn group_accumulator_by_subject(&self) -> (FxHashMap<u64, Vec<usize>>, Vec<u64>) {
+        // Keyed on raw u64 subject IDs and rebuilt every flush, so use a fast
+        // integer hash and pre-size to the accumulator length to avoid SipHash
+        // and repeated rehash growth (a top self-time cost on star-join workloads).
+        let mut s_id_to_accum: FxHashMap<u64, Vec<usize>> =
+            FxHashMap::with_capacity_and_hasher(self.batched_accumulator.len(), FxBuildHasher);
+        let mut unique_s_ids: Vec<u64> = Vec::with_capacity(self.batched_accumulator.len());
         for (accum_idx, (_, _, s_id)) in self.batched_accumulator.iter().enumerate() {
             s_id_to_accum.entry(*s_id).or_default().push(accum_idx);
             unique_s_ids.push(*s_id);
@@ -1501,8 +1506,9 @@ impl NestedLoopJoinOperator {
     /// Group accumulator entries by object ID.
     ///
     /// Returns `(o_s_id → accumulator indices, (min_o, max_o))`.
-    fn group_accumulator_by_object(&self) -> (HashMap<u64, Vec<usize>>, u64, u64) {
-        let mut o_to_accum: HashMap<u64, Vec<usize>> = HashMap::new();
+    fn group_accumulator_by_object(&self) -> (FxHashMap<u64, Vec<usize>>, u64, u64) {
+        let mut o_to_accum: FxHashMap<u64, Vec<usize>> =
+            FxHashMap::with_capacity_and_hasher(self.batched_accumulator.len(), FxBuildHasher);
         let mut min_o: u64 = u64::MAX;
         let mut max_o: u64 = 0;
         for (accum_idx, (_, _, o_s_id)) in self.batched_accumulator.iter().enumerate() {
@@ -1569,7 +1575,7 @@ impl NestedLoopJoinOperator {
         leaf_range: std::ops::Range<usize>,
         p_id: u32,
         unique_s_ids: &[u64],
-        s_id_to_accum: &HashMap<u64, Vec<usize>>,
+        s_id_to_accum: &FxHashMap<u64, Vec<usize>>,
         scatter: &mut [Vec<Vec<Binding>>],
         dict_overlay: &Option<crate::dict_overlay::DictOverlay>,
     ) -> Result<()> {
@@ -2798,7 +2804,8 @@ pub(crate) fn batched_subject_star_spot(
         return Ok(Vec::new());
     }
 
-    let mut predicates_by_id: HashMap<u32, &SpotStarPredicateParams<'_>> = HashMap::new();
+    let mut predicates_by_id: FxHashMap<u32, &SpotStarPredicateParams<'_>> =
+        FxHashMap::with_capacity_and_hasher(predicates.len(), FxBuildHasher);
     for predicate in predicates {
         let Some(p_id) = store.sid_to_p_id(&predicate.pred_sid) else {
             continue;
