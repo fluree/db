@@ -79,7 +79,12 @@ pub struct LedgerSnapshot {
     ///
     /// Private to enforce bimap invariant with `namespace_reverse`.
     /// Use `namespaces()` for read access, `insert_namespace_code()` for mutation.
-    namespace_codes: HashMap<u16, String>,
+    ///
+    /// `Arc`-wrapped so per-query consumers (notably the result-formatting
+    /// `IriCompactor`) can share the table by refcount bump instead of deep-
+    /// cloning the whole map on every request. Mutations go through
+    /// `Arc::make_mut` (copy-on-write); writers are rare and serialized.
+    namespace_codes: Arc<HashMap<u16, String>>,
 
     /// Reverse: IRI prefix -> namespace code (for O(1) canonical encode lookup).
     /// Kept in sync with `namespace_codes` by all mutation paths.
@@ -185,7 +190,7 @@ impl LedgerSnapshot {
             t: 0,
             base_t: 0,
             version: 3,
-            namespace_codes,
+            namespace_codes: Arc::new(namespace_codes),
             namespace_reverse,
             ns_split_mode: NsSplitMode::default(),
             stats: None,
@@ -220,7 +225,7 @@ impl LedgerSnapshot {
             t: meta.t,
             base_t: meta.base_t,
             version: 3,
-            namespace_codes: meta.namespace_codes,
+            namespace_codes: Arc::new(meta.namespace_codes),
             namespace_reverse,
             ns_split_mode: meta.ns_split_mode,
             stats: meta.stats,
@@ -351,6 +356,15 @@ impl LedgerSnapshot {
         &self.namespace_codes
     }
 
+    /// Get a cheap, shareable handle to the namespace table.
+    ///
+    /// Returns an `Arc` clone (refcount bump, no copy) so per-query consumers
+    /// such as the result-formatting `IriCompactor` can hold the stable table
+    /// without deep-cloning it on every request.
+    pub fn shared_namespaces(&self) -> Arc<HashMap<u16, String>> {
+        Arc::clone(&self.namespace_codes)
+    }
+
     /// Get the reverse namespace map (prefix → code) for conflict checking.
     pub fn namespace_reverse(&self) -> &HashMap<String, u16> {
         &self.namespace_reverse
@@ -405,7 +419,7 @@ impl LedgerSnapshot {
             return Ok(false);
         }
         self.namespace_reverse.insert(prefix.clone(), code);
-        self.namespace_codes.insert(code, prefix);
+        Arc::make_mut(&mut self.namespace_codes).insert(code, prefix);
         Ok(true)
     }
 
@@ -449,7 +463,7 @@ impl LedgerSnapshot {
                 continue;
             }
             // New mapping — insert into both maps.
-            self.namespace_codes.insert(code, prefix.clone());
+            Arc::make_mut(&mut self.namespace_codes).insert(code, prefix.clone());
             self.namespace_reverse.insert(prefix.clone(), code);
         }
         self.graph_registry.apply_delta(graph_iris);

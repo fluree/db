@@ -57,7 +57,7 @@ pub fn format_sparql_table_from_result(
 
     // Grouped bindings require cartesian disaggregation (SPARQL formatter logic).
     // Rather than re-implement that here, fall back to the existing SPARQL JSON formatter.
-    let compactor = IriCompactor::new(snapshot.namespaces(), &result.context);
+    let compactor = IriCompactor::new(snapshot.shared_namespaces(), &result.context);
     let gv = result.binary_graph.as_ref();
 
     let head_var_ids: Vec<fluree_db_query::VarId> = if result.output.is_wildcard() {
