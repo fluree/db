@@ -2763,6 +2763,15 @@ impl FastPathOperator {
 
 #[async_trait]
 impl Operator for FastPathOperator {
+    fn op_name(&self) -> String {
+        format!("FastPath:{}", self.label)
+    }
+    fn plan_children(&self) -> Vec<crate::plan_node::PlanChild<'_>> {
+        self.fallback
+            .as_deref()
+            .map(|fb| vec![crate::plan_node::PlanChild::fallback(fb)])
+            .unwrap_or_default()
+    }
     fn schema(&self) -> &[VarId] {
         match &self.schema {
             FastPathSchema::Single(v) => std::slice::from_ref(v),

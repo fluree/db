@@ -276,7 +276,9 @@ impl GraphDb {
     pub fn from_ledger_state(ledger: &LedgerState) -> Self {
         let novelty = ledger.novelty.clone();
         let mut gdb = Self::new(
-            Arc::new(ledger.snapshot.clone()),
+            // `ledger.snapshot` is already `Arc<LedgerSnapshot>`; share it
+            // (refcount bump) rather than deep-cloning the snapshot.
+            Arc::clone(&ledger.snapshot),
             novelty.clone() as Arc<dyn OverlayProvider>,
             Some(novelty),
             ledger.t(),
@@ -354,7 +356,9 @@ impl GraphDb {
         let mut snapshot = base.snapshot.clone();
         let has_deltas = staged.ns_registry.has_delta() || !staged.graph_delta.is_empty();
         if has_deltas {
-            snapshot
+            // Copy-on-write: staging mutates the snapshot to register new
+            // namespace/graph codes for preview queries.
+            Arc::make_mut(&mut snapshot)
                 .apply_envelope_deltas(
                     staged.ns_registry.delta(),
                     staged.graph_delta.values().map(std::string::String::as_str),
@@ -384,7 +388,7 @@ impl GraphDb {
         let combined = Arc::new(combined);
 
         let mut gdb = Self::new(
-            Arc::new(snapshot),
+            snapshot,
             combined.clone() as Arc<dyn OverlayProvider>,
             Some(combined),
             staged_t,
@@ -417,7 +421,7 @@ impl GraphDb {
         let base = staged.view.base();
         let novelty = base.novelty.clone();
         let mut gdb = Self::new(
-            Arc::new(base.snapshot.clone()),
+            Arc::clone(&base.snapshot),
             novelty.clone() as Arc<dyn OverlayProvider>,
             Some(novelty),
             base.t(),

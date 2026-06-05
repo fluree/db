@@ -241,7 +241,7 @@ impl crate::Fluree {
     ) -> Result<Vec<JsonValue>> {
         // Parse the query
         let mut vars = VarRegistry::new();
-        let parsed = parse_query(query_json, &ledger.snapshot, &mut vars, None)?;
+        let parsed = parse_query(query_json, ledger.snapshot.as_ref(), &mut vars, None)?;
 
         // Execute with a wildcard select so the operator pipeline does not project away
         // bindings we need for indexing (Wildcard naturally drops any hydration).

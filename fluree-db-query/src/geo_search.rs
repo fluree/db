@@ -319,6 +319,9 @@ impl GeoSearchOperator {
 
 #[async_trait]
 impl Operator for GeoSearchOperator {
+    fn plan_children(&self) -> Vec<crate::plan_node::PlanChild<'_>> {
+        vec![crate::plan_node::PlanChild::child(self.child.as_ref())]
+    }
     fn schema(&self) -> &[VarId] {
         effective_schema(&self.out_schema, &self.in_schema)
     }

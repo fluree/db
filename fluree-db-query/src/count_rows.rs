@@ -53,6 +53,13 @@ impl CountRowsOperator {
 
 #[async_trait]
 impl Operator for CountRowsOperator {
+    fn plan_children(&self) -> Vec<crate::plan_node::PlanChild<'_>> {
+        let mut v = vec![crate::plan_node::PlanChild::child(self.fast_child.as_ref())];
+        if let Some(fb) = self.fallback.as_deref() {
+            v.push(crate::plan_node::PlanChild::fallback(fb));
+        }
+        v
+    }
     fn schema(&self) -> &[VarId] {
         std::slice::from_ref(&self.out_var)
     }

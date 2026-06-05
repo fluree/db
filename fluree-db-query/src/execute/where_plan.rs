@@ -17,6 +17,7 @@ use crate::error::{QueryError, Result};
 use crate::eval::PreparedBoolExpression;
 use crate::exists::ExistsOperator;
 use crate::filter::{contains_exists, FilterOperator};
+use crate::hash_join::HashJoinPlanner;
 use crate::ir::triple::{Ref, Term, TriplePattern};
 use crate::ir::{Expression, Pattern};
 use crate::join::NestedLoopJoinOperator;
@@ -853,6 +854,8 @@ fn build_single_pattern(
             emit_mask_for_triple(tp, var_counts, protected_vars),
             group_by,
             planning,
+            // No chain context here: only a force-`On` override can fire the hash join.
+            &HashJoinPlanner::new(None),
         )),
         _ => operator,
     }
@@ -1049,6 +1052,7 @@ fn build_sequential_join_block(
     group_by: &[VarId],
     distinct_query: bool,
     planning: &PlanningContext,
+    stats: Option<&StatsView>,
 ) -> Result<Option<BoxedOperator>> {
     let mut operator = operator;
 
@@ -1065,7 +1069,11 @@ fn build_sequential_join_block(
     let base_vars: Option<HashSet<VarId>> =
         required_where_vars.map(|rwv| rwv.iter().copied().collect());
 
+    // Tracks the running driving-chain cardinality across steps for the hash-join
+    // cost model; `before_step` snapshots it against the live `bound` set per pattern.
+    let mut hash_planner = HashJoinPlanner::new(stats);
     for (k, tp) in triples.iter().enumerate() {
+        hash_planner.before_step(tp, &bound);
         let mut vars_after: HashSet<VarId> = bound.clone();
         for v in tp.produced_vars() {
             vars_after.insert(v);
@@ -1125,6 +1133,7 @@ fn build_sequential_join_block(
             emit,
             group_by,
             planning,
+            &hash_planner,
         );
         bound.extend(op.schema().iter().copied());
         operator = Some(op);
@@ -1450,6 +1459,7 @@ pub fn build_where_operators_seeded_with_needed(
                         group_by,
                         distinct_query,
                         planning,
+                        stats.as_deref(),
                     )?;
                     if values_after_triples {
                         built = apply_values(Some(built), block.values)
@@ -1618,6 +1628,7 @@ pub fn build_where_operators_seeded_with_needed(
                         group_by,
                         distinct_query,
                         planning,
+                        stats.as_deref(),
                     )?;
                 }
             }
@@ -1932,7 +1943,7 @@ fn make_first_scan(
 /// The `inline_ops` are evaluated inline on the operator: baked into the scan
 /// for the first pattern, or evaluated per combined row in `NestedLoopJoinOperator` for joins.
 #[allow(clippy::too_many_arguments)]
-pub fn build_scan_or_join(
+pub(crate) fn build_scan_or_join(
     left: Option<BoxedOperator>,
     tp: &TriplePattern,
     object_bounds: &HashMap<VarId, ObjectBounds>,
@@ -1941,6 +1952,7 @@ pub fn build_scan_or_join(
     emit: EmitMask,
     group_by: &[VarId],
     planning: &PlanningContext,
+    hash_planner: &HashJoinPlanner,
 ) -> BoxedOperator {
     match left {
         None => make_first_scan(tp, object_bounds, inline_ops, emit, group_by, planning),
@@ -1950,6 +1962,47 @@ pub fn build_scan_or_join(
 
             // Extract object bounds if available for this pattern's object variable
             let bounds = tp.o.as_var().and_then(|v| object_bounds.get(&v).cloned());
+
+            // For object→subject "path" joins, build a hash table from the small
+            // (left/driving) side and probe a single contiguous scan of the large
+            // predicate, instead of the per-driving-row OPST object seek that degrades
+            // superlinearly at scale. The planner owns the shape + cost decision; we
+            // compute the annotated decision once, apply `chosen`, and stash it on the
+            // chosen operator so EXPLAIN can report why.
+            let decision = hash_planner.explain_object_hash_join(
+                &left_schema,
+                tp,
+                bounds.is_some(),
+                inline_ops.is_empty(),
+            );
+
+            if let Some(d) = decision {
+                if d.chosen {
+                    let index_hint = scan_index_hint_for_triple(tp, group_by, &[]);
+                    let probe: BoxedOperator =
+                        Box::new(crate::dataset_operator::DatasetOperator::scan(
+                            tp.clone(),
+                            None,
+                            Vec::new(),
+                            EmitMask::ALL,
+                            index_hint,
+                            planning.mode(),
+                        ));
+                    return Box::new(
+                        crate::hash_join::HashJoinOperator::new(
+                            left,
+                            probe,
+                            d.join_var
+                                .expect("a chosen object→subject hash join has a join var"),
+                            downstream_vars,
+                            tp.clone(),
+                            bounds.clone(),
+                            planning.mode(),
+                        )
+                        .with_hash_join_decision(d),
+                    );
+                }
+            }
 
             Box::new(
                 NestedLoopJoinOperator::new(
@@ -1961,7 +2014,10 @@ pub fn build_scan_or_join(
                     EmitMask::ALL,
                     planning.mode(),
                 )
-                .with_out_schema(downstream_vars),
+                .with_out_schema(downstream_vars)
+                // A shape-eligible-but-rejected hash join attaches its reason; a
+                // non-candidate (subject chain, bounds, etc.) attaches nothing.
+                .with_hash_join_decision(decision),
             )
         }
     }
@@ -2050,6 +2106,7 @@ pub fn build_triple_operators(
     group_by: &[VarId],
     distinct_query: bool,
     planning: &PlanningContext,
+    stats: Option<&StatsView>,
 ) -> Result<BoxedOperator> {
     if triples.is_empty() {
         return existing
@@ -2092,8 +2149,12 @@ pub fn build_triple_operators(
     // Build chain of scan/join operators using the shared helper
     let rwv_set: Option<HashSet<VarId>> = required_where_vars.map(|v| v.iter().copied().collect());
 
+    // Drives the hash-join cost model; snapshots cardinality against `seen_vars`
+    // (the chain bound so far) before each pattern — see build_sequential_join_block.
     let mut seen_vars: HashSet<VarId> = HashSet::new();
+    let mut hash_planner = HashJoinPlanner::new(stats);
     for (k, pattern) in triples_for_exec.iter().enumerate() {
+        hash_planner.before_step(pattern, &seen_vars);
         seen_vars.extend(pattern.produced_vars());
         // Compute live vars: required_where_vars ∪ vars from subsequent triples
         let live_vars = rwv_set.as_ref().map(|base| {
@@ -2114,6 +2175,7 @@ pub fn build_triple_operators(
             emit,
             group_by,
             planning,
+            &hash_planner,
         ));
 
         // DISTINCT query optimization: if any variables seen so far are no longer live,
@@ -2198,6 +2260,7 @@ mod tests {
             &[],
             false,
             &crate::temporal_mode::PlanningContext::current(),
+            None,
         )
     }
 
@@ -2605,6 +2668,7 @@ mod tests {
             EmitMask::ALL,
             &[],
             &crate::temporal_mode::PlanningContext::current(),
+            &HashJoinPlanner::new(None),
         );
 
         assert_eq!(op.schema(), &[VarId(0), VarId(1)]);
@@ -2625,6 +2689,7 @@ mod tests {
             EmitMask::ALL,
             &[],
             &crate::temporal_mode::PlanningContext::current(),
+            &HashJoinPlanner::new(None),
         );
         let second = build_scan_or_join(
             Some(first),
@@ -2635,6 +2700,7 @@ mod tests {
             EmitMask::ALL,
             &[],
             &crate::temporal_mode::PlanningContext::current(),
+            &HashJoinPlanner::new(None),
         );
 
         // Schema should include all vars from both patterns

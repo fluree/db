@@ -50,6 +50,13 @@ const DEFAULT_BOUND_OBJECT_SELECTIVITY: f64 = 1_000.0;
 /// With no statistics, assume these are relatively large so we avoid placing
 /// them before bound-object constraints.
 const DEFAULT_PROPERTY_SCAN_SELECTIVITY: f64 = 1_000_000.0;
+/// Output estimate for a transitive path (`<s> <p>+ ?o`, etc.) anchored at a bound
+/// endpoint: a constant subject/object, or a variable already bound by an earlier
+/// pattern. Such a path enumerates the reachable set from that fixed node — a small
+/// bounded closure, not a world scan — so it should drive a join (the planner then
+/// probes the joined predicate by the produced var) instead of letting a
+/// high-cardinality predicate scan run first. See issue #1287.
+const ANCHORED_PROPERTY_PATH_SELECTIVITY: f64 = 100.0;
 /// Full scan - all variables unbound
 const FULL_SCAN: f64 = 1e12;
 
@@ -833,9 +840,21 @@ pub fn estimate_pattern(
             row_count: estimate_branch_cardinality(patterns, stats),
         },
 
-        Pattern::PropertyPath(_) => PatternEstimate::Source {
-            row_count: DEFAULT_PROPERTY_SCAN_SELECTIVITY,
-        },
+        Pattern::PropertyPath(pp) => {
+            // Anchored at a bound endpoint => a bounded closure from a fixed node,
+            // not a full predicate scan. Estimating it as a world scan made reorder
+            // drive a high-cardinality join predicate first (issue #1287).
+            let anchored = |r: &Ref| match r {
+                Ref::Var(v) => bound_vars.contains(v),
+                _ => true, // constant Sid/Iri endpoint
+            };
+            let row_count = if anchored(&pp.subject) || anchored(&pp.object) {
+                ANCHORED_PROPERTY_PATH_SELECTIVITY
+            } else {
+                DEFAULT_PROPERTY_SCAN_SELECTIVITY
+            };
+            PatternEstimate::Source { row_count }
+        }
 
         Pattern::R2rml(_) => PatternEstimate::Source {
             row_count: DEFAULT_PROPERTY_SCAN_SELECTIVITY,
@@ -1187,6 +1206,47 @@ fn try_place_reducer(
     }
 }
 
+/// Tie-break signal for join ordering: if the candidate source is placed (binding
+/// its produced vars), the largest probe-predicate count that would become an
+/// object→subject hash join — a remaining triple `?s <p> ?o` whose object `?o` the
+/// candidate binds while the subject `?s` stays new. Driving from such a start keeps
+/// that high-cardinality predicate a single contiguous hash-probe scan instead of a
+/// forward join over a large intermediate, so among equally-selective starts we
+/// prefer the one unlocking the biggest such scan. Returns `0` when nothing is
+/// unlocked or stats are absent, so it only ever breaks exact row-count ties.
+fn unlocked_object_hash_scan(
+    candidate: usize,
+    remaining: &[RankedPattern],
+    bound_vars: &HashSet<VarId>,
+    stats: Option<&StatsView>,
+) -> u64 {
+    let Some(stats) = stats else { return 0 };
+    let produced: HashSet<VarId> = remaining[candidate]
+        .pattern
+        .produced_vars()
+        .into_iter()
+        .collect();
+    remaining
+        .iter()
+        .enumerate()
+        .filter(|(k, _)| *k != candidate)
+        .filter_map(|(_, rp)| {
+            let Pattern::Triple(tp) = &rp.pattern else {
+                return None;
+            };
+            let o = tp.o.as_var()?;
+            let s = tp.s.as_var()?;
+            // Object newly bound by the candidate; subject still new (the probe shape).
+            if produced.contains(&o) && !produced.contains(&s) && !bound_vars.contains(&s) {
+                property_stats(stats, &tp.p).map(|p| p.count)
+            } else {
+                None
+            }
+        })
+        .max()
+        .unwrap_or(0)
+}
+
 /// Try to place the best source. Returns true if one was placed.
 fn try_place_source(
     remaining: &mut Vec<RankedPattern>,
@@ -1236,6 +1296,17 @@ fn try_place_source(
             ci.row_count()
                 .partial_cmp(&cj.row_count())
                 .unwrap_or(std::cmp::Ordering::Equal)
+        })
+        // Before falling back to original index: among equally-selective starts,
+        // prefer the one that turns the LARGER predicate into an object→subject
+        // hash join rather than a forward join over a big intermediate. This flips
+        // a BSBM-BI bowtie (two equally-selective country filters, written
+        // producer/DE-first) onto the side whose chain keeps the 2.85M-row
+        // predicate hash-able — 46x on BI-1's F2.
+        .then_with(|| {
+            let bi = unlocked_object_hash_scan(i, &remaining[..], bound_vars, stats);
+            let bj = unlocked_object_hash_scan(j, &remaining[..], bound_vars, stats);
+            bj.cmp(&bi)
         })
         .then_with(|| remaining[i].orig_index.cmp(&remaining[j].orig_index))
     });
@@ -1427,6 +1498,61 @@ mod tests {
         TriplePattern::new(Ref::Var(s), Ref::Sid(Sid::new(100, p_name)), Term::Var(o))
     }
 
+    #[test]
+    fn anchored_property_path_is_selective_and_drives_the_join() {
+        // Issue #1287: <c912> skos:broader+ ?b . ?b skos:prefLabel ?lbl
+        use crate::ir::path::{PathModifier, PropertyPathPattern};
+        let b = VarId(0);
+        let lbl = VarId(1);
+        let bound = HashSet::new();
+
+        // Anchored at a constant subject => bounded closure (selective).
+        let anchored = Pattern::PropertyPath(PropertyPathPattern::new(
+            Ref::Sid(Sid::new(9, "c912")),
+            Sid::new(1, "broader"),
+            PathModifier::OneOrMore,
+            Ref::Var(b),
+        ));
+        assert_eq!(
+            estimate_pattern(&anchored, &bound, None).row_count(),
+            ANCHORED_PROPERTY_PATH_SELECTIVITY
+        );
+
+        // Both endpoints free => genuinely unbounded, keep the world-scan estimate.
+        let unanchored = Pattern::PropertyPath(PropertyPathPattern::new(
+            Ref::Var(VarId(2)),
+            Sid::new(1, "broader"),
+            PathModifier::OneOrMore,
+            Ref::Var(b),
+        ));
+        assert_eq!(
+            estimate_pattern(&unanchored, &bound, None).row_count(),
+            DEFAULT_PROPERTY_SCAN_SELECTIVITY
+        );
+
+        // End to end: the anchored path drives ahead of a 150k prefLabel scan even
+        // when written after it — otherwise the planner full-scans prefLabel (88s).
+        let pref = Pattern::Triple(TriplePattern::new(
+            Ref::Var(b),
+            Ref::Sid(Sid::new(2, "prefLabel")),
+            Term::Var(lbl),
+        ));
+        let mut stats = StatsView::default();
+        stats.properties.insert(
+            Sid::new(2, "prefLabel"),
+            PropertyStatData {
+                count: 150_000,
+                ndv_values: 150_000,
+                ndv_subjects: 6_000,
+            },
+        );
+        let ordered = reorder_patterns(&[pref, anchored], Some(&stats), &HashSet::new());
+        assert!(
+            matches!(&ordered[0], Pattern::PropertyPath(_)),
+            "anchored path must drive before the high-cardinality scan: {ordered:?}"
+        );
+    }
+
     /// Count top-level patterns matching a predicate.
     fn count_patterns(patterns: &[Pattern], pred: fn(&Pattern) -> bool) -> usize {
         patterns.iter().filter(|p| pred(p)).count()
@@ -1544,6 +1670,73 @@ mod tests {
         assert!(
             first.produced_vars().contains(&s),
             "expected first pattern to join with seeded bound vars"
+        );
+    }
+
+    #[test]
+    fn reorder_bowtie_drives_the_side_that_unlocks_the_bigger_hash_join() {
+        // BSBM-BI F2 shape, written producer/DE-first:
+        //   ?product producer ?producer . ?producer country DE .
+        //   ?review reviewFor ?product . ?review reviewer ?reviewer . ?reviewer country US .
+        // Both country filters tie on estimate (same predicate). The tie-break must
+        // drive from the US side, because that makes the 2.85M-row rev:reviewer join
+        // an object→subject hash join; DE-first only unlocks the 285K producer join
+        // and leaves the reviewer chain as forward joins (the 110s→2.38s case).
+        let product = VarId(0);
+        let producer = VarId(1);
+        let review = VarId(2);
+        let reviewer = VarId(3);
+        let pat = |s: VarId, p: &str, o: Term| {
+            Pattern::Triple(TriplePattern::new(Ref::Var(s), Ref::Sid(Sid::new(1, p)), o))
+        };
+        let patterns = vec![
+            pat(product, "producer", Term::Var(producer)),
+            pat(producer, "country", Term::Sid(Sid::new(9, "DE"))),
+            pat(review, "reviewFor", Term::Var(product)),
+            pat(review, "reviewer", Term::Var(reviewer)),
+            pat(reviewer, "country", Term::Sid(Sid::new(9, "US"))),
+        ];
+
+        let mut stats = StatsView::default();
+        let mut put = |name: &str, count: u64, ndv_values: u64| {
+            stats.properties.insert(
+                Sid::new(1, name),
+                PropertyStatData {
+                    count,
+                    ndv_values,
+                    ndv_subjects: count,
+                },
+            );
+        };
+        put("producer", 284_826, 5_600);
+        put("country", 386_525, 25); // count/ndv = 15,461 — both filters tie here
+        put("reviewFor", 2_848_260, 280_000);
+        put("reviewer", 2_848_260, 570_000);
+
+        let ordered = reorder_patterns(&patterns, Some(&stats), &HashSet::new());
+        let first = match &ordered[0] {
+            Pattern::Triple(tp) => tp,
+            _ => panic!("expected Triple first"),
+        };
+        // Drives from the US country filter (binds ?reviewer), not the DE one.
+        assert_eq!(first.p.as_sid().map(|s| &*s.name), Some("country"));
+        assert_eq!(
+            first.o.as_sid().map(|s| &*s.name),
+            Some("US"),
+            "tie-break should drive the side that unlocks the 2.85M rev:reviewer hash join, got {ordered:?}"
+        );
+        // ...and rev:reviewer is placed before producer (US chain first).
+        let pred_order: Vec<&str> = ordered
+            .iter()
+            .filter_map(|p| match p {
+                Pattern::Triple(tp) => tp.p.as_sid().map(|s| &*s.name),
+                _ => None,
+            })
+            .collect();
+        let pos = |name: &str| pred_order.iter().position(|p| *p == name).unwrap();
+        assert!(
+            pos("reviewer") < pos("producer"),
+            "reviewer chain should precede producer chain: {pred_order:?}"
         );
     }
 
