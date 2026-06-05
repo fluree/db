@@ -38,6 +38,14 @@ pub enum ConstSidKey {
     Iri(Box<str>),
     /// A constant SID: namespace code + name.
     Sid(u16, Box<str>),
+    /// Identity (address) of a variable-free operand expression, so its s_id can
+    /// be resolved once and reused without re-evaluating/re-encoding it per row.
+    ///
+    /// Safe as a key only because this memo lives exactly as long as the query
+    /// (and the expression tree it points into): the pointer is stable across
+    /// rows and the memo is dropped before any expression could be freed, so a
+    /// stale/reused address can never be observed.
+    ExprPtr(usize),
 }
 
 /// Per-query memo for constant subject-id resolution (see [`ConstSidKey`]).

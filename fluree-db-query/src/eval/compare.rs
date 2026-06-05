@@ -75,18 +75,17 @@ fn fast_eq_ne_for_iri_bindings<R: RowAccess>(
             return Ok(Some(false));
         };
 
-        // Single-ledger fast path: when both sides are subjects encoded by the
-        // binary index, their internal `s_id`s are directly comparable within a
-        // single ledger — so compare the ids and skip resolving EITHER side to
-        // an IRI string (and skip materializing the other side at all). This is
-        // the dominant cost of this fn (`resolve_subject_iri`). Cross-ledger
-        // `s_id`s are NOT comparable, so it is gated on `!is_multi_ledger`; all
-        // other shapes fall through to the IRI-string path below unchanged.
+        // Single-ledger fast path: when the bound side is a subject encoded by
+        // the binary index, its internal `s_id` is directly comparable to the
+        // other side's `s_id` within a single ledger — so compare ids and skip
+        // resolving to IRI strings. Cross-ledger `s_id`s are NOT comparable, so
+        // gated on `!is_multi_ledger`; everything else falls through unchanged.
         if !ctx.is_multi_ledger() {
-            if let Binding::EncodedSid { s_id: lhs_s_id, .. } = binding {
+            if let Binding::EncodedSid { s_id, .. } = binding {
+                // var = var: both sides EncodedSid → compare raw s_ids directly.
                 if let Expression::Var(ov) = other_expr {
                     if let Some(Binding::EncodedSid { s_id: rhs_s_id, .. }) = row.get(*ov) {
-                        let eq = lhs_s_id == rhs_s_id;
+                        let eq = s_id == rhs_s_id;
                         let out = match op {
                             CompareOp::Eq => eq,
                             CompareOp::Ne => !eq,
@@ -96,6 +95,55 @@ fn fast_eq_ne_for_iri_bindings<R: RowAccess>(
                         return Ok(Some(out));
                     }
                 }
+
+                // var = const: a variable-free operand resolves to the same s_id
+                // on every row, so resolve it once and memoize by the operand
+                // expression's identity — skipping the per-row eval_to_comparable
+                // and IRI re-encode (`canonical_split` / namespace lookup). The
+                // memo is consulted by pointer first, so the (cheap) variable-free
+                // check only runs on the first row for each operand.
+                let key =
+                    crate::context::ConstSidKey::ExprPtr(other_expr as *const Expression as usize);
+                let resolved: Option<Option<u64>> = {
+                    let cached = ctx
+                        .const_sid_cache
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .get(&key)
+                        .copied();
+                    match cached {
+                        Some(v) => Some(v),
+                        None if other_expr.referenced_vars().is_empty() => {
+                            let v = match other_expr.eval_to_comparable(row, Some(ctx))? {
+                                Some(ComparableValue::Sid(sid)) => {
+                                    subject_ref_to_s_id(ctx.active_snapshot, store, &Ref::Sid(sid))?
+                                }
+                                Some(ComparableValue::Iri(iri)) => {
+                                    subject_ref_to_s_id(ctx.active_snapshot, store, &Ref::Iri(iri))?
+                                }
+                                _ => None,
+                            };
+                            ctx.const_sid_cache
+                                .lock()
+                                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                                .insert(key, v);
+                            Some(v)
+                        }
+                        None => None,
+                    }
+                };
+                if let Some(Some(rhs_s_id)) = resolved {
+                    let eq = *s_id == rhs_s_id;
+                    let out = match op {
+                        CompareOp::Eq => eq,
+                        CompareOp::Ne => !eq,
+                        _ => unreachable!(),
+                    };
+                    log_fastpath_hit_once("EncodedSid-const");
+                    return Ok(Some(out));
+                }
+                // `Some(None)` (constant not an indexed subject) or `None`
+                // (operand has variables) both fall through to the paths below.
             }
         }
 
