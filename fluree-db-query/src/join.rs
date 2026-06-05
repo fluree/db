@@ -1084,8 +1084,7 @@ impl Operator for NestedLoopJoinOperator {
         // Historical snapshots (`to_t < store.max_t()`) are handled inside each
         // batched flush helper via `replay_leaflet_at_t`, which reconstructs
         // leaflet state at `to_t` from the history sidecar.
-        let use_batched =
-            (self.batched_eligible || self.batched_object_eligible || self.batched_exists_eligible)
+        let use_batched = (self.batched_eligible || self.batched_object_eligible || self.batched_exists_eligible)
                 && ctx.binary_store.is_some()
                 // The batched path reads binary leaves directly and works in
                 // `EncodedSid` space (it even emits `EncodedSid` for newly-bound

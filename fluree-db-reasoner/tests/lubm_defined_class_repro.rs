@@ -167,21 +167,14 @@ async fn lubm_grad_student_and_chair_defined_classes() {
 
     // Collect derived rdf:type facts.
     let mut derived: Vec<(Sid, Sid)> = Vec::new(); // (subject, class)
-    res.overlay.for_each_overlay_flake(
-        0,
-        IndexType::Spot,
-        None,
-        None,
-        true,
-        i64::MAX,
-        &mut |fl| {
+    res.overlay
+        .for_each_overlay_flake(0, IndexType::Spot, None, None, true, i64::MAX, &mut |fl| {
             if fl.p == rdf("type") {
                 if let FlakeValue::Ref(c) = &fl.o {
                     derived.push((fl.s.clone(), c.clone()));
                 }
             }
-        },
-    );
+        });
     let has = |s: &str, c: &str| derived.iter().any(|(x, k)| *x == ex(s) && *k == ex(c));
 
     eprintln!("rules_fired: {:?}", res.diagnostics.rules_fired);
