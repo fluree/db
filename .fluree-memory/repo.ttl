@@ -1763,3 +1763,50 @@ mem:fact-01kpm3sz8pxzakzcj4r8xx687v a mem:Fact ;
     mem:branch "misc/fixes" ;
     mem:createdAt "2026-04-20T00:14:22.486023+00:00"^^xsd:dateTime ;
     mem:rationale "This is a subtle semi-naive reasoning invariant; future restriction or chain work could easily reintroduce the bug by splitting lookups across delta and derived." .
+
+mem:fact-01ktcfc4gmhn2zh6xn29rskte8 a mem:Fact ;
+    mem:content "Query top-k is real but never truncates the upstream scan. apply_solution_modifiers (operator_tree.rs:2740) uses SortOperator::new_topk for ORDER BY+LIMIT, and even under DISTINCT does project-distinct-before-sort+top-k when ORDER BY refs only projected vars (can_project_distinct_before_sort :3011). But SortOperator is blocking: it drains the FULL child stream, building a per-row Vec<Binding> for every input row (sort.rs:589-622); only the final select_nth/heap is k-bounded. So rows_per_returned≫LIMIT is expected. BSBM Explore query1 also has a dedicated bypass: detect_star_const_numeric_label_order_limit→star_const_ordered_limit_operator (operator_tree.rs:280, :2440), tried before the generic tree." ;
+    mem:tag "bsbm" ;
+    mem:tag "distinct" ;
+    mem:tag "limit" ;
+    mem:tag "performance" ;
+    mem:tag "query" ;
+    mem:tag "sort" ;
+    mem:scope mem:repo ;
+    mem:artifactRef "/Users/bplatz/fluree/db/fluree-db-query/src/execute/operator_tree.rs" ;
+    mem:artifactRef "/Users/bplatz/fluree/db/fluree-db-query/src/sort.rs" ;
+    mem:branch "refactor/column-caching" ;
+    mem:createdAt "2026-06-05T18:05:23.860294+00:00"^^xsd:dateTime ;
+    mem:rationale "Future perf sessions evaluating LIMIT pushdown must know top-k exists but doesn't truncate upstream scan, and query1 may bypass the generic path." .
+
+mem:fact-01ktcfd1te1wg10c1gxgmrk98c a mem:Fact ;
+    mem:content "Per-query IRI/Sid materialization is ALREADY cached. `Materializer` (one per query, materializer.rs:264-268) holds iri_cache: HashMap<u64,Arc<str>>, sid_cache, pid_cache; resolve_iri/resolve_sid/resolve_pid memoize on raw u64/u32 s_id/p_id so repeated subjects in star queries pay forward_pack lookup_str (allocating String per miss, forward_pack.rs:299) only ONCE per distinct id. BinaryGraphView::resolve_subject_sid/iri (binary_index_store.rs:1933/1979) are NOT cached — callers must cache. BinaryScanOperator also has its own sid_cache (binary_scan.rs:176) used only by resolve_s_id for repeated-var checks." ;
+    mem:tag "binding" ;
+    mem:tag "bsbm" ;
+    mem:tag "materialization" ;
+    mem:tag "performance" ;
+    mem:tag "query" ;
+    mem:scope mem:repo ;
+    mem:artifactRef "fluree-db-binary-index/src/dict/forward_pack.rs" ;
+    mem:artifactRef "fluree-db-binary-index/src/read/binary_index_store.rs" ;
+    mem:artifactRef "fluree-db-query/src/binary_scan.rs" ;
+    mem:artifactRef "fluree-db-query/src/materializer.rs" ;
+    mem:branch "refactor/column-caching" ;
+    mem:createdAt "2026-06-05T18:05:53.870677+00:00"^^xsd:dateTime ;
+    mem:rationale "Candidate 4 (IRI/dict materialization) is largely solved; the lever is reducing residual lookups not adding a cache." .
+
+mem:fact-01ktcfdrpyfq8btp10mf75cmp5 a mem:Fact ;
+    mem:content "Batched star-join hot path already keys on raw u64, not full Binding: join.rs group_accumulator_by_subject/by_object (1490/1509) build FxHashMap<u64,Vec<usize>> from accumulator tuples (_,_,s_id) where s_id is the raw u64 extracted from EncodedSid at accumulate time. So eq/hash/clone ~6% is NOT join grouping (and NOT DISTINCT, which uses hashbrown raw-entry and only materializes a signature for genuinely-new rows). Residual binding overhead = scatter Vec<Vec<Vec<Binding>>> row assembly (join.rs:2049) + SortOperator per-row Vec<Binding> sort key. EncodedSid/EncodedLit late-materialization IS end-to-end (binary_scan.rs:1201)." ;
+    mem:tag "binding" ;
+    mem:tag "bsbm" ;
+    mem:tag "distinct" ;
+    mem:tag "join" ;
+    mem:tag "performance" ;
+    mem:tag "query" ;
+    mem:scope mem:repo ;
+    mem:artifactRef "fluree-db-query/src/binary_scan.rs" ;
+    mem:artifactRef "fluree-db-query/src/binding.rs" ;
+    mem:artifactRef "fluree-db-query/src/join.rs" ;
+    mem:branch "refactor/column-caching" ;
+    mem:createdAt "2026-06-05T18:06:17.310296+00:00"^^xsd:dateTime ;
+    mem:rationale "Candidate 3 lever is scatter/sort assembly, not join grouping or DISTINCT which are already optimized." .

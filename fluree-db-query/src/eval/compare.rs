@@ -74,6 +74,30 @@ fn fast_eq_ne_for_iri_bindings<R: RowAccess>(
             return Ok(Some(false));
         };
 
+        // Single-ledger fast path: when both sides are subjects encoded by the
+        // binary index, their internal `s_id`s are directly comparable within a
+        // single ledger — so compare the ids and skip resolving EITHER side to
+        // an IRI string (and skip materializing the other side at all). This is
+        // the dominant cost of this fn (`resolve_subject_iri`). Cross-ledger
+        // `s_id`s are NOT comparable, so it is gated on `!is_multi_ledger`; all
+        // other shapes fall through to the IRI-string path below unchanged.
+        if !ctx.is_multi_ledger() {
+            if let Binding::EncodedSid { s_id: lhs_s_id, .. } = binding {
+                if let Expression::Var(ov) = other_expr {
+                    if let Some(Binding::EncodedSid { s_id: rhs_s_id, .. }) = row.get(*ov) {
+                        let eq = lhs_s_id == rhs_s_id;
+                        let out = match op {
+                            CompareOp::Eq => eq,
+                            CompareOp::Ne => !eq,
+                            _ => unreachable!(),
+                        };
+                        log_fastpath_hit_once("EncodedSid-id");
+                        return Ok(Some(out));
+                    }
+                }
+            }
+        }
+
         let Some(other) = other_expr.eval_to_comparable(row, Some(ctx))? else {
             return Ok(Some(false));
         };
