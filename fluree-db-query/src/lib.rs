@@ -55,6 +55,7 @@ pub mod geo_search;
 pub mod graph;
 pub mod group_aggregate;
 pub mod groupby;
+pub mod hash_join;
 pub mod having;
 pub mod ir;
 pub mod join;
@@ -66,6 +67,7 @@ pub mod offset;
 pub mod operator;
 pub mod optional;
 pub mod parse;
+pub mod plan_node;
 pub mod planner;
 pub mod policy;
 pub mod project;
@@ -130,6 +132,7 @@ pub use minus::MinusOperator;
 pub use offset::OffsetOperator;
 pub use operator::{BoxedOperator, Operator, OperatorState};
 pub use optional::OptionalOperator;
+pub use plan_node::{PlanEdge, PlanEdgeRel, PlanNode};
 pub use planner::{
     extract_object_bounds_for_var, extract_range_constraints, is_property_join, PatternType,
     RangeConstraint, RangeValue,

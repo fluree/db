@@ -85,6 +85,12 @@ impl UnionStarCountAllOperator {
 
 #[async_trait]
 impl Operator for UnionStarCountAllOperator {
+    fn plan_children(&self) -> Vec<crate::plan_node::PlanChild<'_>> {
+        self.fallback
+            .as_deref()
+            .map(|fb| vec![crate::plan_node::PlanChild::fallback(fb)])
+            .unwrap_or_default()
+    }
     fn schema(&self) -> &[VarId] {
         std::slice::from_ref(&self.out_var)
     }

@@ -158,6 +158,12 @@ impl PredicateGroupCountFirstsOperator {
 
 #[async_trait]
 impl Operator for PredicateGroupCountFirstsOperator {
+    fn plan_children(&self) -> Vec<crate::plan_node::PlanChild<'_>> {
+        self.fallback
+            .as_deref()
+            .map(|fb| vec![crate::plan_node::PlanChild::fallback(fb)])
+            .unwrap_or_default()
+    }
     fn schema(&self) -> &[VarId] {
         &self.schema
     }
@@ -397,6 +403,12 @@ impl PredicateObjectCountFirstsOperator {
 
 #[async_trait]
 impl Operator for PredicateObjectCountFirstsOperator {
+    fn plan_children(&self) -> Vec<crate::plan_node::PlanChild<'_>> {
+        self.fallback
+            .as_deref()
+            .map(|fb| vec![crate::plan_node::PlanChild::fallback(fb)])
+            .unwrap_or_default()
+    }
     fn schema(&self) -> &[VarId] {
         &self.schema
     }
@@ -1126,6 +1138,12 @@ impl GroupByObjectStarTopKOperator {
 
 #[async_trait]
 impl Operator for GroupByObjectStarTopKOperator {
+    fn plan_children(&self) -> Vec<crate::plan_node::PlanChild<'_>> {
+        self.fallback
+            .as_deref()
+            .map(|fb| vec![crate::plan_node::PlanChild::fallback(fb)])
+            .unwrap_or_default()
+    }
     fn schema(&self) -> &[VarId] {
         &self.schema
     }

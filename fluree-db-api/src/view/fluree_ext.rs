@@ -213,7 +213,10 @@ impl Fluree {
                 .map_err(|e| ApiError::internal(format!("load binary index: {e}")))?;
 
                 // Sync namespace codes between store and snapshot (bimap validation).
-                crate::ns_helpers::sync_store_and_snapshot_ns(&mut store, &mut snapshot.snapshot)?;
+                crate::ns_helpers::sync_store_and_snapshot_ns(
+                    &mut store,
+                    Arc::make_mut(&mut snapshot.snapshot),
+                )?;
 
                 let arc_store = Arc::new(store);
                 let dn = snapshot.dict_novelty.clone();
@@ -228,7 +231,7 @@ impl Fluree {
                     Arc::clone(&runtime_small_dicts),
                     ns_fallback,
                 );
-                snapshot.snapshot.range_provider = Some(Arc::new(provider));
+                Arc::make_mut(&mut snapshot.snapshot).range_provider = Some(Arc::new(provider));
                 snapshot.binary_store = Some(arc_store);
                 snapshot.runtime_small_dicts = runtime_small_dicts;
             }

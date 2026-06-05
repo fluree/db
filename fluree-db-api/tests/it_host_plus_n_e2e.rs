@@ -64,8 +64,7 @@ async fn host_plus_n_insert_index_reload_query() {
         .run_until(async {
             // Create ledger and set HostPlusN(1) split mode on genesis snapshot.
             let mut ledger0 = fluree.create_ledger(ledger_id).await.unwrap();
-            ledger0
-                .snapshot
+            std::sync::Arc::make_mut(&mut ledger0.snapshot)
                 .set_ns_split_mode(NsSplitMode::HostPlusN(1), 0)
                 .expect("set HostPlusN(1) on genesis");
 

@@ -33,7 +33,7 @@ use fluree_db_core::trace_commits_by_id;
 use fluree_db_core::{ledger_id::normalize_ledger_id, ContentId, ContentStore, StorageBackend};
 use fluree_db_ledger::{LedgerState, TypeErasedStore};
 use fluree_db_nameservice::NsRecord;
-use tokio::sync::{oneshot, Mutex, RwLock};
+use tokio::sync::{oneshot, RwLock};
 
 use crate::error::{ApiError, Result};
 use crate::ledger_view::LedgerView;
@@ -66,7 +66,7 @@ fn monotonic_secs() -> u64 {
 /// Transactions hold this guard across stage+commit to serialize writes
 /// to the same ledger.
 pub struct LedgerWriteGuard<'a> {
-    guard: tokio::sync::MutexGuard<'a, LedgerState>,
+    guard: tokio::sync::RwLockWriteGuard<'a, LedgerState>,
 }
 
 impl LedgerWriteGuard<'_> {
@@ -117,8 +117,11 @@ impl Clone for LedgerHandle {
 /// All paths that touch both locks (snapshot, apply_index_v2, reload)
 /// follow this order to prevent deadlock and ensure coherence.
 struct LedgerHandleInner {
-    /// Single mutex for all access (queries clone snapshot, txns hold for duration)
-    state: Mutex<LedgerState>,
+    /// Guards all access to the ledger state. A `RwLock` so concurrent reads
+    /// (every query takes a brief shared `read()` to clone a cheap, Arc-backed
+    /// snapshot) run in parallel instead of serializing; transactions take an
+    /// exclusive `write()` for the stage+commit duration.
+    state: RwLock<LedgerState>,
     /// Ledger ID (e.g., "mydb:main")
     ledger_id: String,
     /// Last access time (monotonic secs since process start)
@@ -127,7 +130,7 @@ struct LedgerHandleInner {
     ///
     /// Always coherent with `state.snapshot.range_provider` — writers hold
     /// the `state` lock while updating this.
-    binary_store: Mutex<Option<Arc<BinaryIndexStore>>>,
+    binary_store: RwLock<Option<Arc<BinaryIndexStore>>>,
 }
 
 impl LedgerHandle {
@@ -139,10 +142,10 @@ impl LedgerHandle {
     ) -> Self {
         Self {
             inner: Arc::new(LedgerHandleInner {
-                state: Mutex::new(state),
+                state: RwLock::new(state),
                 ledger_id,
                 last_access: AtomicU64::new(monotonic_secs()),
-                binary_store: Mutex::new(binary_store),
+                binary_store: RwLock::new(binary_store),
             }),
         }
     }
@@ -161,8 +164,8 @@ impl LedgerHandle {
     /// The snapshot is a cheap clone; the lock is released immediately after.
     pub async fn snapshot(&self) -> LedgerView {
         self.touch();
-        let state = self.inner.state.lock().await;
-        let binary_store = self.inner.binary_store.lock().await.clone();
+        let state = self.inner.state.read().await;
+        let binary_store = self.inner.binary_store.read().await.clone();
         let mut snap = LedgerView::from_state(&state);
         snap.binary_store = binary_store;
         debug_assert!(
@@ -177,7 +180,7 @@ impl LedgerHandle {
     pub async fn lock_for_write(&self) -> LedgerWriteGuard<'_> {
         self.touch();
         LedgerWriteGuard {
-            guard: self.inner.state.lock().await,
+            guard: self.inner.state.write().await,
         }
     }
 
@@ -194,7 +197,7 @@ impl LedgerHandle {
                 .downcast::<BinaryIndexStore>()
                 .ok()
         });
-        *self.inner.binary_store.lock().await = binary_store;
+        *self.inner.binary_store.write().await = binary_store;
     }
 
     /// Update last access time
@@ -216,7 +219,7 @@ impl LedgerHandle {
 
     /// Check if currently locked (for eviction - skip if in use)
     pub fn is_locked(&self) -> bool {
-        self.inner.state.try_lock().is_err()
+        self.inner.state.try_write().is_err()
     }
 
     /// Get current index_t (brief lock to read)
@@ -224,7 +227,7 @@ impl LedgerHandle {
     /// This returns the indexed DB's t value, NOT including novelty.
     /// For freshness checking against remote watermarks, use this method.
     pub async fn index_t(&self) -> i64 {
-        let state = self.inner.state.lock().await;
+        let state = self.inner.state.read().await;
         state.index_t()
     }
 
@@ -233,7 +236,7 @@ impl LedgerHandle {
     /// This returns the ledger's current t including any unindexed novelty.
     /// Use this for comparing against nameservice commit_t to detect staleness.
     pub async fn t(&self) -> i64 {
-        let state = self.inner.state.lock().await;
+        let state = self.inner.state.read().await;
         state.t()
     }
 
@@ -241,7 +244,7 @@ impl LedgerHandle {
     ///
     /// Returns (t, index_t, index_head_id) needed for UpdatePlan::plan()
     pub async fn state_metrics(&self) -> (i64, i64, Option<ContentId>) {
-        let state = self.inner.state.lock().await;
+        let state = self.inner.state.read().await;
         (
             state.t(),
             state.index_t(),
@@ -317,7 +320,7 @@ impl LedgerHandle {
         // then wire up range_provider with the correct dict_novelty.
         // Lock ordering: state → binary_store (same as snapshot()).
         {
-            let mut state = self.inner.state.lock().await;
+            let mut state = self.inner.state.write().await;
 
             // apply_loaded_db: validates, trims novelty, rebuilds dict_novelty
             state
@@ -325,7 +328,10 @@ impl LedgerHandle {
                 .map_err(|e| ApiError::internal(format!("apply_loaded_db failed: {e}")))?;
 
             // Sync namespace codes between store and snapshot (bimap validation).
-            crate::ns_helpers::sync_store_and_snapshot_ns(&mut store, &mut state.snapshot)?;
+            crate::ns_helpers::sync_store_and_snapshot_ns(
+                &mut store,
+                Arc::make_mut(&mut state.snapshot),
+            )?;
 
             let arc_store = Arc::new(store);
             crate::runtime_dicts::reseed_runtime_small_dicts(&mut state, &arc_store);
@@ -338,11 +344,11 @@ impl LedgerHandle {
                 Arc::clone(&state.runtime_small_dicts),
                 ns_fallback,
             );
-            state.snapshot.range_provider = Some(Arc::new(provider));
+            Arc::make_mut(&mut state.snapshot).range_provider = Some(Arc::new(provider));
 
             let te_store: Arc<dyn std::any::Any + Send + Sync> = arc_store.clone();
             state.binary_store = Some(TypeErasedStore(te_store));
-            *self.inner.binary_store.lock().await = Some(arc_store);
+            *self.inner.binary_store.write().await = Some(arc_store);
         }
 
         Ok(())
@@ -633,15 +639,18 @@ pub(crate) async fn load_and_attach_binary_store(
     // DictNovelty/DictOverlay correctness (especially bound-object filters and overlay merges).
     let root = fluree_db_binary_index::IndexRoot::decode(&bytes)
         .map_err(|e| ApiError::internal(format!("failed to decode FIR6 root: {e}")))?;
-    state.snapshot.subject_watermarks = root.subject_watermarks;
-    state.snapshot.string_watermark = root.string_watermark;
-    if root.stats.is_some() && state.snapshot.stats.is_none() {
-        state.snapshot.stats = root.stats;
-        tracing::debug!("loaded stats from FIR6 root");
-    }
-    if root.schema.is_some() && state.snapshot.schema.is_none() {
-        state.snapshot.schema = root.schema;
-        tracing::debug!("loaded schema from FIR6 root");
+    {
+        let snap = Arc::make_mut(&mut state.snapshot);
+        snap.subject_watermarks = root.subject_watermarks;
+        snap.string_watermark = root.string_watermark;
+        if root.stats.is_some() && snap.stats.is_none() {
+            snap.stats = root.stats;
+            tracing::debug!("loaded stats from FIR6 root");
+        }
+        if root.schema.is_some() && snap.schema.is_none() {
+            snap.schema = root.schema;
+            tracing::debug!("loaded schema from FIR6 root");
+        }
     }
     state.dict_novelty = Arc::new(DictNovelty::with_watermarks(
         state.snapshot.subject_watermarks.clone(),
@@ -654,7 +663,7 @@ pub(crate) async fn load_and_attach_binary_store(
             .map_err(|e| ApiError::internal(format!("failed to load binary index: {e}")))?;
 
     // Sync namespace codes between store and snapshot (bimap validation).
-    crate::ns_helpers::sync_store_and_snapshot_ns(&mut store, &mut state.snapshot)?;
+    crate::ns_helpers::sync_store_and_snapshot_ns(&mut store, Arc::make_mut(&mut state.snapshot))?;
 
     // Re-populate DictNovelty from already-loaded novelty flakes, but *only* for
     // entries not present in the persisted dictionaries (canonical IDs must win).
@@ -684,7 +693,7 @@ pub(crate) async fn load_and_attach_binary_store(
     );
     // Always rebuild the provider here so it is coherent with the freshly
     // loaded BinaryIndexStore, DictNovelty, and runtime dictionary state.
-    state.snapshot.range_provider = Some(Arc::new(provider));
+    Arc::make_mut(&mut state.snapshot).range_provider = Some(Arc::new(provider));
     // Also attach the type-erased store to the state so transaction staging
     // (which clones LedgerState under the write lock) can construct
     // graph-scoped BinaryRangeProviders (needed for named-graph upsert deletions).
@@ -1146,7 +1155,7 @@ impl LedgerManager {
                         // index, which the next reload picks up. Never clobber a
                         // newer in-memory commit to adopt a newer index.
                         if new_state.t() >= write_guard.state().t() {
-                            let mut bs_guard = handle.inner.binary_store.lock().await;
+                            let mut bs_guard = handle.inner.binary_store.write().await;
                             write_guard.replace(new_state);
                             *bs_guard = new_binary_store;
                         } else {
@@ -1664,7 +1673,7 @@ impl LedgerManager {
                                 Arc::clone(&write_guard.state().runtime_small_dicts);
                             let ns_fallback =
                                 Some(write_guard.state().snapshot.shared_namespaces());
-                            write_guard.state_mut().snapshot.range_provider =
+                            Arc::make_mut(&mut write_guard.state_mut().snapshot).range_provider =
                                 Some(Arc::new(BinaryRangeProvider::new(
                                     store,
                                     dn,

@@ -79,8 +79,14 @@ pub struct IndexConfig {
 /// - In-memory uncommitted changes (Novelty)
 #[derive(Debug, Clone)]
 pub struct LedgerState {
-    /// The indexed snapshot
-    pub snapshot: LedgerSnapshot,
+    /// The indexed snapshot.
+    ///
+    /// `Arc`-wrapped so cloning a `LedgerState` (and deriving read views /
+    /// query snapshots from it — the per-query hot path) is a cheap refcount
+    /// bump rather than a deep copy of the namespace maps, stats, schema, and
+    /// graph registry. Mutations go through `Arc::make_mut` (copy-on-write),
+    /// which is fine because writers are rare and already serialized.
+    pub snapshot: Arc<LedgerSnapshot>,
     /// In-memory overlay of uncommitted transactions
     pub novelty: Arc<Novelty>,
     /// Dictionary novelty layer for subjects and strings.
@@ -219,7 +225,7 @@ impl LedgerState {
                         .map(|id| novelty_overlay.get_flake(id)),
                 );
                 return Ok(Self {
-                    snapshot,
+                    snapshot: Arc::new(snapshot),
                     novelty: Arc::new(novelty_overlay),
                     dict_novelty: Arc::new(dict_novelty),
                     runtime_small_dicts: Arc::new(runtime_small_dicts),
@@ -236,7 +242,7 @@ impl LedgerState {
         let head_index_id = record.index_head_id.clone();
         let novelty_t = snapshot.t;
         Ok(Self {
-            snapshot,
+            snapshot: Arc::new(snapshot),
             novelty: Arc::new(Novelty::new(novelty_t)),
             dict_novelty: Arc::new(dict_novelty),
             runtime_small_dicts: Arc::new(RuntimeSmallDicts::new()),
@@ -367,7 +373,7 @@ impl LedgerState {
                 .map(|id| novelty.get_flake(id)),
         );
         Self {
-            snapshot,
+            snapshot: Arc::new(snapshot),
             novelty: Arc::new(novelty),
             dict_novelty: Arc::new(dict_novelty),
             runtime_small_dicts: Arc::new(runtime_small_dicts),
@@ -511,7 +517,7 @@ impl LedgerState {
         }
 
         // Update state
-        self.snapshot = new_snapshot;
+        self.snapshot = Arc::new(new_snapshot);
         self.novelty = Arc::new(new_novelty);
         self.dict_novelty = Arc::new(new_dict_novelty);
         self.runtime_small_dicts = Arc::new(new_runtime_small_dicts);
@@ -613,7 +619,7 @@ impl LedgerState {
         }
 
         // Update state
-        self.snapshot = merged_snapshot;
+        self.snapshot = Arc::new(merged_snapshot);
         self.novelty = Arc::new(new_novelty);
         self.dict_novelty = Arc::new(new_dict_novelty);
         self.runtime_small_dicts = Arc::new(new_runtime_small_dicts);
@@ -664,11 +670,11 @@ impl LedgerState {
         // declaring a non-default mode doesn't fail the immutability check
         // when its namespace codes are inserted under the wrong mode.
         if let Some(mode) = commit.ns_split_mode {
-            self.snapshot.set_ns_split_mode(mode, commit_t)?;
+            Arc::make_mut(&mut self.snapshot).set_ns_split_mode(mode, commit_t)?;
         }
 
         // Apply namespace + graph deltas to snapshot
-        self.snapshot
+        Arc::make_mut(&mut self.snapshot)
             .apply_envelope_deltas(&commit.namespace_delta, &graph_iris)?;
 
         // Generate commit metadata flakes
@@ -1452,8 +1458,7 @@ mod tests {
         let mut state = LedgerState::new(snapshot, Novelty::new(0));
 
         // Simulate commit t=1: add namespace code + flake
-        state
-            .snapshot
+        Arc::make_mut(&mut state.snapshot)
             .insert_namespace_code(100, "http://example.org/ns/".to_string())
             .unwrap();
         let reverse_graph = state.snapshot.build_reverse_graph().unwrap_or_default();
@@ -1505,8 +1510,7 @@ mod tests {
 
         // Register a custom graph in the old snapshot (simulating commit t=1)
         let graph_iri = "http://example.org/graph/test";
-        state
-            .snapshot
+        Arc::make_mut(&mut state.snapshot)
             .graph_registry
             .apply_delta(&[graph_iri.to_string()]);
 
@@ -1561,8 +1565,7 @@ mod tests {
         let mut state = LedgerState::new(snapshot, Novelty::new(0));
 
         // Add custom namespace to old snapshot
-        state
-            .snapshot
+        Arc::make_mut(&mut state.snapshot)
             .insert_namespace_code(200, "http://old.example.org/".to_string())
             .unwrap();
 
