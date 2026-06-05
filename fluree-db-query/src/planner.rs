@@ -50,6 +50,13 @@ const DEFAULT_BOUND_OBJECT_SELECTIVITY: f64 = 1_000.0;
 /// With no statistics, assume these are relatively large so we avoid placing
 /// them before bound-object constraints.
 const DEFAULT_PROPERTY_SCAN_SELECTIVITY: f64 = 1_000_000.0;
+/// Output estimate for a transitive path (`<s> <p>+ ?o`, etc.) anchored at a bound
+/// endpoint: a constant subject/object, or a variable already bound by an earlier
+/// pattern. Such a path enumerates the reachable set from that fixed node — a small
+/// bounded closure, not a world scan — so it should drive a join (the planner then
+/// probes the joined predicate by the produced var) instead of letting a
+/// high-cardinality predicate scan run first. See issue #1287.
+const ANCHORED_PROPERTY_PATH_SELECTIVITY: f64 = 100.0;
 /// Full scan - all variables unbound
 const FULL_SCAN: f64 = 1e12;
 
@@ -833,9 +840,21 @@ pub fn estimate_pattern(
             row_count: estimate_branch_cardinality(patterns, stats),
         },
 
-        Pattern::PropertyPath(_) => PatternEstimate::Source {
-            row_count: DEFAULT_PROPERTY_SCAN_SELECTIVITY,
-        },
+        Pattern::PropertyPath(pp) => {
+            // Anchored at a bound endpoint => a bounded closure from a fixed node,
+            // not a full predicate scan. Estimating it as a world scan made reorder
+            // drive a high-cardinality join predicate first (issue #1287).
+            let anchored = |r: &Ref| match r {
+                Ref::Var(v) => bound_vars.contains(v),
+                _ => true, // constant Sid/Iri endpoint
+            };
+            let row_count = if anchored(&pp.subject) || anchored(&pp.object) {
+                ANCHORED_PROPERTY_PATH_SELECTIVITY
+            } else {
+                DEFAULT_PROPERTY_SCAN_SELECTIVITY
+            };
+            PatternEstimate::Source { row_count }
+        }
 
         Pattern::R2rml(_) => PatternEstimate::Source {
             row_count: DEFAULT_PROPERTY_SCAN_SELECTIVITY,
@@ -1477,6 +1496,61 @@ mod tests {
 
     fn make_pattern(s: VarId, p_name: &str, o: VarId) -> TriplePattern {
         TriplePattern::new(Ref::Var(s), Ref::Sid(Sid::new(100, p_name)), Term::Var(o))
+    }
+
+    #[test]
+    fn anchored_property_path_is_selective_and_drives_the_join() {
+        // Issue #1287: <c912> skos:broader+ ?b . ?b skos:prefLabel ?lbl
+        use crate::ir::path::{PathModifier, PropertyPathPattern};
+        let b = VarId(0);
+        let lbl = VarId(1);
+        let bound = HashSet::new();
+
+        // Anchored at a constant subject => bounded closure (selective).
+        let anchored = Pattern::PropertyPath(PropertyPathPattern::new(
+            Ref::Sid(Sid::new(9, "c912")),
+            Sid::new(1, "broader"),
+            PathModifier::OneOrMore,
+            Ref::Var(b),
+        ));
+        assert_eq!(
+            estimate_pattern(&anchored, &bound, None).row_count(),
+            ANCHORED_PROPERTY_PATH_SELECTIVITY
+        );
+
+        // Both endpoints free => genuinely unbounded, keep the world-scan estimate.
+        let unanchored = Pattern::PropertyPath(PropertyPathPattern::new(
+            Ref::Var(VarId(2)),
+            Sid::new(1, "broader"),
+            PathModifier::OneOrMore,
+            Ref::Var(b),
+        ));
+        assert_eq!(
+            estimate_pattern(&unanchored, &bound, None).row_count(),
+            DEFAULT_PROPERTY_SCAN_SELECTIVITY
+        );
+
+        // End to end: the anchored path drives ahead of a 150k prefLabel scan even
+        // when written after it — otherwise the planner full-scans prefLabel (88s).
+        let pref = Pattern::Triple(TriplePattern::new(
+            Ref::Var(b),
+            Ref::Sid(Sid::new(2, "prefLabel")),
+            Term::Var(lbl),
+        ));
+        let mut stats = StatsView::default();
+        stats.properties.insert(
+            Sid::new(2, "prefLabel"),
+            PropertyStatData {
+                count: 150_000,
+                ndv_values: 150_000,
+                ndv_subjects: 6_000,
+            },
+        );
+        let ordered = reorder_patterns(&[pref, anchored], Some(&stats), &HashSet::new());
+        assert!(
+            matches!(&ordered[0], Pattern::PropertyPath(_)),
+            "anchored path must drive before the high-cardinality scan: {ordered:?}"
+        );
     }
 
     /// Count top-level patterns matching a predicate.
