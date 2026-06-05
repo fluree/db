@@ -138,6 +138,17 @@ pub fn builtin_prefix_trie() -> &'static PrefixTrie {
 /// However, `@`-prefixed strings (JSON-LD keywords like `@type`, `@id`) always
 /// check built-ins because they have no standard IRI delimiters.
 pub fn canonical_split(iri: &str, mode: NsSplitMode) -> (&str, &str) {
+    // Blank nodes always use the well-known `_:` prefix. Split it off first and
+    // unconditionally: the skolemized local part can contain colons (e.g.
+    // `_:fdb-<ledger>:<branch>-...`), which would otherwise make the generic
+    // opaque-IRI splitter cut at an embedded colon and drop the `_:` prefix,
+    // re-encoding the blank node into the EMPTY namespace (code 0). That breaks
+    // round-tripping: a blank node written via the dedicated blank-node code (10)
+    // would read back as a different Sid, so subject-bounded index lookups miss.
+    if let Some(rest) = iri.strip_prefix("_:") {
+        return (&iri[..2], rest);
+    }
+
     // Always check built-in prefixes for @-prefixed strings (JSON-LD keywords).
     // These have no `/`, `#`, or `:` delimiters, so normal splitting would
     // produce ("", "@type") → EMPTY fallback, losing the JSON_LD (code 1) prefix.
@@ -954,6 +965,23 @@ mod tests {
         let (p, s) = canonical_split("_:fdb-abc123", NsSplitMode::MostGranular);
         assert_eq!(p, "_:");
         assert_eq!(s, "fdb-abc123");
+    }
+
+    #[test]
+    fn blank_node_with_embedded_colons() {
+        // Skolemized blank node locals embed `<ledger>:<branch>` (colons). The
+        // `_:` prefix must still be split off as the namespace — otherwise the
+        // generic opaque splitter cuts at an embedded colon and the blank node
+        // re-encodes into the EMPTY namespace, breaking index round-tripping.
+        for mode in [
+            NsSplitMode::MostGranular,
+            NsSplitMode::HostPlusN(0),
+            NsSplitMode::HostPlusN(1),
+        ] {
+            let (p, s) = canonical_split("_:fdb-lubm:main-1-genid10", mode);
+            assert_eq!(p, "_:", "prefix for mode {mode:?}");
+            assert_eq!(s, "fdb-lubm:main-1-genid10", "suffix for mode {mode:?}");
+        }
     }
 
     #[test]
