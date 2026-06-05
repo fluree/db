@@ -120,8 +120,36 @@ fn fast_eq_ne_for_iri_bindings<R: RowAccess>(
                         _ => None,
                     };
                     if let Some(r) = other_ref {
-                        if let Some(rhs_s_id) = subject_ref_to_s_id(ctx.active_snapshot, store, &r)?
-                        {
+                        // The constant operand resolves to the same `s_id` on
+                        // every row, so memoize it per query instead of doing a
+                        // dictionary reverse-lookup (`find_subject_id_by_parts`)
+                        // per row — the dominant cost of this filter at scale.
+                        let key = match &r {
+                            Ref::Iri(iri) => crate::context::ConstSidKey::Iri(iri.as_ref().into()),
+                            Ref::Sid(sid) => crate::context::ConstSidKey::Sid(
+                                sid.namespace_code,
+                                sid.name.as_ref().into(),
+                            ),
+                            Ref::Var(_) => unreachable!("other_ref is never a Var"),
+                        };
+                        let cached = ctx
+                            .const_sid_cache
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner)
+                            .get(&key)
+                            .copied();
+                        let rhs = match cached {
+                            Some(v) => v,
+                            None => {
+                                let v = subject_ref_to_s_id(ctx.active_snapshot, store, &r)?;
+                                ctx.const_sid_cache
+                                    .lock()
+                                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                                    .insert(key, v);
+                                v
+                            }
+                        };
+                        if let Some(rhs_s_id) = rhs {
                             let eq = *s_id == rhs_s_id;
                             let out = match op {
                                 CompareOp::Eq => eq,

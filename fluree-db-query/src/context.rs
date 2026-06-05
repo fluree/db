@@ -22,8 +22,30 @@ use crate::binary_range::BinaryRangeProvider;
 use fluree_db_spatial::SpatialIndexProvider;
 use fluree_vocab::namespaces::{FLUREE_DB, JSON_LD, OGC_GEO, RDF, XSD};
 use fluree_vocab::{geo_names, xsd_names};
+use rustc_hash::FxHashMap;
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
+
+/// Key for the per-query constant→`s_id` memo.
+///
+/// A FILTER like `<iri> != ?var` (or `sid != ?var`) resolves the constant side
+/// to an internal subject id via a dictionary reverse-lookup. That result is
+/// invariant across rows, so it is memoized once per query rather than redone
+/// per row (a dominant cost on selective-filter workloads such as BSBM Explore).
+#[derive(Clone, PartialEq, Eq, Hash)]
+pub enum ConstSidKey {
+    /// A constant full IRI.
+    Iri(Box<str>),
+    /// A constant SID: namespace code + name.
+    Sid(u16, Box<str>),
+}
+
+/// Per-query memo for constant subject-id resolution (see [`ConstSidKey`]).
+///
+/// Owned by the [`ExecutionContext`], which holds exactly one store/snapshot, so
+/// the memo is correctly scoped — no cross-ledger aliasing. `Arc<Mutex<…>>` so
+/// derived per-graph contexts can share it and the context stays `Send + Sync`.
+pub type ConstSidCache = Arc<Mutex<FxHashMap<ConstSidKey, Option<u64>>>>;
 
 /// Map from `(graph_id, predicate_id, lang_id)` to fulltext BoW arenas used
 /// by `fulltext()` BM25 scoring.
@@ -162,6 +184,9 @@ pub struct ExecutionContext<'a> {
     /// SIDs — encoded in the original namespace space — can be decoded
     /// correctly (see `reencode_sid` in `build_match_val_for_snapshot`).
     pub original_snapshot: &'a LedgerSnapshot,
+    /// Per-query memo: constant filter operands → internal subject id, so a
+    /// `<const> != ?var` FILTER resolves the constant once, not per row.
+    pub const_sid_cache: ConstSidCache,
 }
 
 impl<'a> ExecutionContext<'a> {
@@ -197,6 +222,7 @@ impl<'a> ExecutionContext<'a> {
             multi_ledger: false,
             eager_materialization: false,
             original_snapshot: snapshot,
+            const_sid_cache: ConstSidCache::default(),
         }
     }
 
@@ -244,6 +270,7 @@ impl<'a> ExecutionContext<'a> {
             multi_ledger: false,
             eager_materialization: db.eager,
             original_snapshot: db.snapshot,
+            const_sid_cache: ConstSidCache::default(),
         }
     }
 
@@ -295,6 +322,7 @@ impl<'a> ExecutionContext<'a> {
             multi_ledger: false,
             eager_materialization: db.eager,
             original_snapshot: db.snapshot,
+            const_sid_cache: ConstSidCache::default(),
         }
     }
 
@@ -335,6 +363,7 @@ impl<'a> ExecutionContext<'a> {
             multi_ledger: false,
             eager_materialization: false,
             original_snapshot: snapshot,
+            const_sid_cache: ConstSidCache::default(),
         }
     }
 
@@ -374,6 +403,7 @@ impl<'a> ExecutionContext<'a> {
             multi_ledger: false,
             eager_materialization: false,
             original_snapshot: snapshot,
+            const_sid_cache: ConstSidCache::default(),
         }
     }
 
@@ -415,6 +445,7 @@ impl<'a> ExecutionContext<'a> {
             multi_ledger: false,
             eager_materialization: false,
             original_snapshot: snapshot,
+            const_sid_cache: ConstSidCache::default(),
         }
     }
 
@@ -782,6 +813,7 @@ impl<'a> ExecutionContext<'a> {
             multi_ledger,
             eager_materialization: self.eager_materialization,
             original_snapshot: self.original_snapshot,
+            const_sid_cache: self.const_sid_cache.clone(),
         }
     }
 
@@ -832,6 +864,7 @@ impl<'a> ExecutionContext<'a> {
             multi_ledger: Self::compute_multi_ledger(self.dataset, &ActiveGraph::Default),
             eager_materialization: self.eager_materialization,
             original_snapshot: self.original_snapshot,
+            const_sid_cache: self.const_sid_cache.clone(),
         }
     }
 
@@ -878,6 +911,7 @@ impl<'a> ExecutionContext<'a> {
             multi_ledger: false,
             eager_materialization: self.eager_materialization,
             original_snapshot: self.original_snapshot,
+            const_sid_cache: self.const_sid_cache.clone(),
         }
     }
 
