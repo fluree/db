@@ -24,7 +24,7 @@ use crate::comparator::IndexType;
 use crate::db::LedgerSnapshot;
 use crate::dt_compatible;
 use crate::error::Result;
-use crate::flake::Flake;
+use crate::flake::{Flake, FlakeMeta};
 use crate::ids::GraphId;
 use crate::overlay::{NoOverlay, OverlayProvider};
 use crate::sid::Sid;
@@ -327,6 +327,13 @@ fn collect_overlay_only<O: OverlayProvider + ?Sized>(
 ///
 /// Iterates in reverse (newest first for identical facts), keeps only the
 /// first occurrence of each fact key, and drops retractions.
+///
+/// The fact key includes the flake metadata `m` (language tag and list
+/// index), not just `(s, p, o, dt)`. Two flakes that share a subject,
+/// predicate, object value, and datatype but differ in their language tag
+/// (e.g. `"animal"@en` vs `"animal"@fr`) or list position are **distinct
+/// RDF facts** and must both survive — omitting `m` here silently collapses
+/// language variants on insert (issue #1273).
 fn remove_stale_flakes(flakes: Vec<Flake>) -> Vec<Flake> {
     use std::collections::HashSet;
 
@@ -336,6 +343,7 @@ fn remove_stale_flakes(flakes: Vec<Flake>) -> Vec<Flake> {
         p: &'a Sid,
         o: &'a FlakeValue,
         dt: &'a Sid,
+        m: &'a Option<FlakeMeta>,
     }
 
     let mut seen: HashSet<FactKeyRef<'_>> = HashSet::new();
@@ -347,6 +355,7 @@ fn remove_stale_flakes(flakes: Vec<Flake>) -> Vec<Flake> {
             p: &f.p,
             o: &f.o,
             dt: &f.dt,
+            m: &f.m,
         };
         if !seen.insert(key) {
             continue;

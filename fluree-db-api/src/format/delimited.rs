@@ -131,7 +131,7 @@ fn format_delimited_bytes(
 ) -> Result<Vec<u8>> {
     reject_non_tabular(result, delimiter)?;
 
-    let compactor = IriCompactor::new(snapshot.namespaces_arc(), &result.context);
+    let compactor = IriCompactor::new(snapshot.shared_namespaces(), &result.context);
     let gv = result.binary_graph.as_ref();
     let select_vars = resolve_select_vars(result);
 
@@ -183,7 +183,7 @@ fn format_delimited_bytes_limited(
 ) -> Result<(Vec<u8>, usize)> {
     reject_non_tabular(result, delimiter)?;
 
-    let compactor = IriCompactor::new(snapshot.namespaces_arc(), &result.context);
+    let compactor = IriCompactor::new(snapshot.shared_namespaces(), &result.context);
     let gv = result.binary_graph.as_ref();
     let select_vars = resolve_select_vars(result);
     let total = result.row_count();

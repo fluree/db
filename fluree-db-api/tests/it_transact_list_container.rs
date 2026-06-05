@@ -141,6 +141,98 @@ async fn list_container_multiple_values_test() {
     );
 }
 
+/// A `@list` may legitimately repeat the same value at different positions
+/// (`["a", "b", "a"]`). Those members share `(s, p, o, dt)` but differ in their
+/// list index `i`, so they are **distinct** facts and must all survive. This is
+/// the list-index counterpart to the language-tag case in issue #1273: the
+/// overlay-only read path's fact key must include the full flake metadata `m`
+/// (`{lang, i}`), matching the canonical `Flake` identity. Run against an
+/// in-memory genesis ledger so it exercises `range::remove_stale_flakes`.
+#[tokio::test]
+async fn list_container_duplicate_values_at_distinct_positions_preserved() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger0 = support::genesis_ledger(&fluree, "test/lists:dups");
+
+    let txn = json!({
+        "@context": [
+            support::default_context(),
+            {
+                "ex": "http://example.org/ns/",
+                "ex:orderedItems": {"@container": "@list"}
+            }
+        ],
+        "insert": {
+            "@id": "ex:thing1",
+            "ex:orderedItems": ["a", "b", "a"]
+        }
+    });
+    let ledger = fluree.update(ledger0, &txn).await.unwrap().ledger;
+
+    let query = json!({
+        "@context": [
+            support::default_context(),
+            {"ex": "http://example.org/ns/"}
+        ],
+        "select": {"ex:thing1": ["*"]}
+    });
+    let jsonld = support::query_jsonld(&fluree, &ledger, &query)
+        .await
+        .unwrap()
+        .to_jsonld_async(ledger.as_graph_db_ref(0))
+        .await
+        .unwrap();
+    let thing = &jsonld.as_array().unwrap()[0];
+    assert_eq!(
+        thing["ex:orderedItems"],
+        json!(["a", "b", "a"]),
+        "duplicate list members at distinct positions must all survive in order"
+    );
+}
+
+/// Counterpart to the list-duplicate test: a plain JSON-LD array is a SET, so
+/// repeated scalar values (no list index) ARE the same fact and collapse to one.
+/// Confirms the `m`-aware fact key does not over-distinguish set values.
+#[tokio::test]
+async fn set_container_duplicate_scalar_values_collapse() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger0 = support::genesis_ledger(&fluree, "test/lists:set-dups");
+
+    let txn = json!({
+        "@context": [
+            support::default_context(),
+            {"ex": "http://example.org/ns/"}
+        ],
+        // Plain array (no @container:@list) → set semantics.
+        "insert": {"@id": "ex:thing1", "ex:tags": ["x", "x", "y"]}
+    });
+    let ledger = fluree.update(ledger0, &txn).await.unwrap().ledger;
+
+    let query = json!({
+        "@context": [
+            support::default_context(),
+            {"ex": "http://example.org/ns/"}
+        ],
+        "select": {"ex:thing1": ["*"]}
+    });
+    let jsonld = support::query_jsonld(&fluree, &ledger, &query)
+        .await
+        .unwrap()
+        .to_jsonld_async(ledger.as_graph_db_ref(0))
+        .await
+        .unwrap();
+    let thing = &jsonld.as_array().unwrap()[0];
+    let mut tags: Vec<String> = thing["ex:tags"]
+        .as_array()
+        .map(|a| a.iter().map(|v| v.as_str().unwrap().to_string()).collect())
+        .unwrap_or_else(|| vec![thing["ex:tags"].as_str().unwrap().to_string()]);
+    tags.sort();
+    assert_eq!(
+        tags,
+        vec!["x".to_string(), "y".to_string()],
+        "set duplicates must collapse to distinct values"
+    );
+}
+
 #[tokio::test]
 async fn list_container_with_objects_test() {
     // Create a temporary directory for file-backed storage

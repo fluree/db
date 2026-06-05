@@ -696,7 +696,7 @@ where
                     .as_any()
                     .downcast_ref::<BinaryRangeProvider>()
                     .map(|brp| {
-                        let ns_fallback = Some(Arc::new(snapshot.namespaces().clone()));
+                        let ns_fallback = Some(snapshot.shared_namespaces());
                         Arc::new(BinaryRangeProvider::new(
                             Arc::clone(brp.store()),
                             Arc::clone(&dict_novelty),

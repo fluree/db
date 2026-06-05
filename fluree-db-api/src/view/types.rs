@@ -514,11 +514,11 @@ impl GraphDb {
     /// Returns `None` if no binary store is attached.
     pub fn binary_graph(&self) -> Option<BinaryGraphView> {
         self.binary_store.as_ref().map(|store| {
-            // `namespaces_arc()` is a refcount bump on the snapshot's already-Arc
+            // `shared_namespaces()` is a refcount bump on the snapshot's already-Arc
             // namespace table; `namespaces().clone()` would deep-copy the whole map
             // on every query (a dominant per-query cost on large ledgers).
             BinaryGraphView::new(store.clone(), self.graph_id)
-                .with_namespace_codes_fallback(Some(self.snapshot.namespaces_arc()))
+                .with_namespace_codes_fallback(Some(self.snapshot.shared_namespaces()))
         })
     }
 }
