@@ -478,13 +478,23 @@ impl SubqueryOperator {
 
     /// Build the subquery's inner operator tree for `EXPLAIN` (build-only — no
     /// `open()`/exec). Mirrors [`run_subquery_with_seed`](Self::run_subquery_with_seed)'s
-    /// construction, but with a schema-only seed carrying the correlation vars
-    /// (so the inner reorder sees the same initial bound set) and no execution.
+    /// construction with no execution.
+    ///
+    /// The seed must match the path that actually runs, because the seed's schema
+    /// is the inner `reorder_patterns`' initial bound set AND the child every nested
+    /// subquery sees (a `SeedOperator`'s 1-row estimate flips their cardinality-guard
+    /// `join_mode` to per-row). `join_mode` evaluates the body ONCE with an empty
+    /// seed (`materialize`); per-row seeds the correlation vars
+    /// (`execute_subquery_for_row`). An uncorrelated subquery has no seed either way.
     fn build_inner_plan_for_explain(&self) -> Result<BoxedOperator> {
-        let seed_schema: Arc<[VarId]> =
-            Arc::from(self.correlation_vars.clone().into_boxed_slice());
-        let seed_row = vec![Binding::Unbound; self.correlation_vars.len()];
-        let seed: BoxedOperator = Box::new(crate::seed::SeedOperator::from_row(seed_schema, seed_row));
+        let seed: BoxedOperator = if self.join_mode || self.correlation_vars.is_empty() {
+            Box::new(EmptyOperator::new())
+        } else {
+            let seed_schema: Arc<[VarId]> =
+                Arc::from(self.correlation_vars.clone().into_boxed_slice());
+            let seed_row = vec![Binding::Unbound; self.correlation_vars.len()];
+            Box::new(SeedOperator::from_row(seed_schema, seed_row))
+        };
 
         let where_op = build_where_operators_seeded(
             Some(seed),
