@@ -202,6 +202,11 @@ pub struct V3BatchCacheKey {
     pub leaf_id: u128,
     /// Leaflet slot within the leaf (0..leaflet_count).
     pub leaflet_idx: u32,
+    /// `ColumnSet` bitmask of the columns decoded into this cached batch.
+    /// Projection-aware: a narrow batch (e.g. one decoded without the `t`
+    /// column for a current-time scan) caches under a different key than a full
+    /// decode, so it is never served to a query that needs the omitted column.
+    pub columns: u16,
 }
 
 // ============================================================================
@@ -327,6 +332,10 @@ impl CachedEntry {
 /// `CacheKey` variants, so inserting R1 never evicts or implies R2.
 pub struct LeafletCache {
     inner: Cache<CacheKey, CachedEntry>,
+    /// V3 batch cache hit / miss counters (process-cumulative) for diagnosing
+    /// scan-bound workloads — is the scan thrashing the leaflet cache?
+    v3_hits: std::sync::atomic::AtomicU64,
+    v3_misses: std::sync::atomic::AtomicU64,
 }
 
 /// Run a moka single-flight call (`get_with`/`try_get_with`) under a Tokio
@@ -412,7 +421,20 @@ impl LeafletCache {
             .max_capacity(max_bytes)
             .build();
 
-        Self { inner }
+        Self {
+            inner,
+            v3_hits: std::sync::atomic::AtomicU64::new(0),
+            v3_misses: std::sync::atomic::AtomicU64::new(0),
+        }
+    }
+
+    /// V3 batch cache `(hits, misses)` since process start. Hit rate =
+    /// `hits / (hits + misses)`; a low rate on a scan workload means the
+    /// working set exceeds the cache (thrashing) — decode cost is then a
+    /// capacity problem, not a per-decode one.
+    pub fn v3_hit_miss(&self) -> (u64, u64) {
+        use std::sync::atomic::Ordering::Relaxed;
+        (self.v3_hits.load(Relaxed), self.v3_misses.load(Relaxed))
     }
 
     /// Create a new cache with the given maximum megabyte budget.
@@ -636,11 +658,29 @@ impl LeafletCache {
     where
         F: FnOnce() -> io::Result<super::column_types::ColumnBatch>,
     {
+        use std::sync::atomic::Ordering::Relaxed;
         // Fast path: a plain hit must not pay the block_in_place cost.
         if let Some(batch) = self.get_v3_batch(&key) {
+            self.v3_hits.fetch_add(1, Relaxed);
             return Ok(batch);
         }
-        // Miss: run the single-flight wait/init in a blocking region so a
+        // Miss. (Counts lookups, not decodes: concurrent waiters on the same key
+        // single-flight one decode but each records a miss — fine for hit rate.)
+        let misses = self.v3_misses.fetch_add(1, Relaxed) + 1;
+        if misses.is_multiple_of(1_000_000) {
+            let hits = self.v3_hits.load(Relaxed);
+            let total = hits + misses;
+            tracing::info!(
+                target: "fluree_db_binary_index::leaflet_cache",
+                v3_hits = hits,
+                v3_misses = misses,
+                hit_rate_pct = 100.0 * hits as f64 / total as f64,
+                entries = self.inner.entry_count(),
+                weighted_bytes = self.inner.weighted_size(),
+                "leaflet v3 batch cache stats"
+            );
+        }
+        // Run the single-flight wait/init in a blocking region so a
         // waiter promotes a replacement worker (see in_blocking_region).
         let result = in_blocking_region(|| {
             self.inner.try_get_with(CacheKey::V3Batch(key), || {

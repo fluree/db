@@ -1627,12 +1627,15 @@ impl NestedLoopJoinOperator {
                         &leaf_bytes,
                         entry,
                         dir.payload_base,
-                        header.order,
                         c,
-                        leaf_id,
-                        u32::try_from(leaflet_idx).map_err(|_| {
-                            QueryError::Internal("leaflet idx exceeds u32".to_string())
-                        })?,
+                        fluree_db_binary_index::read::column_loader::LeafletDecodeSpec {
+                            leaf_id,
+                            leaflet_idx: u32::try_from(leaflet_idx).map_err(|_| {
+                                QueryError::Internal("leaflet idx exceeds u32".to_string())
+                            })?,
+                            order: header.order,
+                            decode_set: fluree_db_binary_index::ColumnSet::ALL,
+                        },
                     )
                     .map_err(|e| QueryError::Internal(format!("load columns: {e}")))?
                 } else {
@@ -2217,24 +2220,24 @@ impl NestedLoopJoinOperator {
                 let batch = if entry.row_count == 0 {
                     fluree_db_binary_index::ColumnBatch::empty()
                 } else if let Some(c) = &cache {
-                    let key = fluree_db_binary_index::read::leaflet_cache::V3BatchCacheKey {
-                        leaf_id,
-                        leaflet_idx: u32::try_from(leaflet_idx).map_err(|_| {
-                            QueryError::Internal("leaflet idx exceeds u32".to_string())
-                        })?,
-                    };
-                    if let Some(cached) = c.get_v3_batch(&key) {
-                        cached
-                    } else {
-                        load_leaflet_columns(
-                            &leaf_bytes,
-                            entry,
-                            dir.payload_base,
-                            &proj,
-                            header.order,
-                        )
-                        .map_err(|e| QueryError::Internal(format!("load columns: {e}")))?
-                    }
+                    let leaflet_idx_u32 = u32::try_from(leaflet_idx)
+                        .map_err(|_| QueryError::Internal("leaflet idx exceeds u32".to_string()))?;
+                    // Projection-aware + inserting: caches under the decoded
+                    // column set (CORE, or ALL for replay) so repeat probes hit
+                    // instead of re-decoding, and never collides with a wider entry.
+                    fluree_db_binary_index::read::column_loader::load_leaflet_columns_cached(
+                        &leaf_bytes,
+                        entry,
+                        dir.payload_base,
+                        c,
+                        fluree_db_binary_index::read::column_loader::LeafletDecodeSpec {
+                            leaf_id,
+                            leaflet_idx: leaflet_idx_u32,
+                            order: header.order,
+                            decode_set: proj.effective(),
+                        },
+                    )
+                    .map_err(|e| QueryError::Internal(format!("load columns: {e}")))?
                 } else {
                     load_leaflet_columns(&leaf_bytes, entry, dir.payload_base, &proj, header.order)
                         .map_err(|e| QueryError::Internal(format!("load columns: {e}")))?
@@ -2672,11 +2675,15 @@ pub(crate) fn batched_subject_probe_binary(
                     &leaf_bytes,
                     entry,
                     dir.payload_base,
-                    header.order,
                     c,
-                    leaf_id,
-                    u32::try_from(leaflet_idx)
-                        .map_err(|_| QueryError::Internal("leaflet idx exceeds u32".to_string()))?,
+                    fluree_db_binary_index::read::column_loader::LeafletDecodeSpec {
+                        leaf_id,
+                        leaflet_idx: u32::try_from(leaflet_idx).map_err(|_| {
+                            QueryError::Internal("leaflet idx exceeds u32".to_string())
+                        })?,
+                        order: header.order,
+                        decode_set: fluree_db_binary_index::ColumnSet::ALL,
+                    },
                 )
                 .map_err(|e| QueryError::Internal(format!("load columns: {e}")))?
             } else {
@@ -2876,11 +2883,15 @@ pub(crate) fn batched_subject_star_spot(
                     &leaf_bytes,
                     entry,
                     dir.payload_base,
-                    header.order,
                     c,
-                    leaf_id,
-                    u32::try_from(leaflet_idx)
-                        .map_err(|_| QueryError::Internal("leaflet idx exceeds u32".to_string()))?,
+                    fluree_db_binary_index::read::column_loader::LeafletDecodeSpec {
+                        leaf_id,
+                        leaflet_idx: u32::try_from(leaflet_idx).map_err(|_| {
+                            QueryError::Internal("leaflet idx exceeds u32".to_string())
+                        })?,
+                        order: header.order,
+                        decode_set: fluree_db_binary_index::ColumnSet::ALL,
+                    },
                 )
                 .map_err(|e| QueryError::Internal(format!("load columns: {e}")))?
             } else {

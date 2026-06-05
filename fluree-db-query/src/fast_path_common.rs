@@ -672,11 +672,13 @@ impl<'a> PsotSubjectCountIter<'a> {
                         .map_err(|_| QueryError::Internal("leaflet idx exceeds u32".to_string()))?;
                     load_columns_cached_via_handle(
                         handle.as_ref(),
-                        idx,
-                        RunSortOrder::Psot,
                         cache,
-                        handle.leaf_id(),
-                        idx_u32,
+                        fluree_db_binary_index::read::column_loader::LeafletDecodeSpec {
+                            leaf_id: handle.leaf_id(),
+                            leaflet_idx: idx_u32,
+                            order: RunSortOrder::Psot,
+                            decode_set: ColumnSet::ALL,
+                        },
                     )
                     .map_err(|e| QueryError::Internal(format!("load columns: {e}")))?
                 } else {
@@ -862,11 +864,13 @@ impl<'a> PsotSubjectSeek<'a> {
                         .map_err(|_| QueryError::Internal("leaflet idx exceeds u32".to_string()))?;
                     load_columns_cached_via_handle(
                         handle.as_ref(),
-                        idx,
-                        RunSortOrder::Psot,
                         cache,
-                        handle.leaf_id(),
-                        idx_u32,
+                        fluree_db_binary_index::read::column_loader::LeafletDecodeSpec {
+                            leaf_id: handle.leaf_id(),
+                            leaflet_idx: idx_u32,
+                            order: RunSortOrder::Psot,
+                            decode_set: ColumnSet::ALL,
+                        },
                     )
                     .map_err(|e| QueryError::Internal(format!("load columns: {e}")))?
                 } else {
@@ -1024,11 +1028,13 @@ impl<'a> PostObjectGroupCountIter<'a> {
                         .map_err(|_| QueryError::Internal("leaflet idx exceeds u32".to_string()))?;
                     load_columns_cached_via_handle(
                         handle.as_ref(),
-                        idx,
-                        RunSortOrder::Post,
                         cache,
-                        handle.leaf_id(),
-                        idx_u32,
+                        fluree_db_binary_index::read::column_loader::LeafletDecodeSpec {
+                            leaf_id: handle.leaf_id(),
+                            leaflet_idx: idx_u32,
+                            order: RunSortOrder::Post,
+                            decode_set: ColumnSet::ALL,
+                        },
                     )
                     .map_err(|e| QueryError::Internal(format!("load columns: {e}")))?
                 } else {
@@ -1249,11 +1255,13 @@ impl<'a> PsotSubjectWeightedSumIter<'a> {
                         .map_err(|_| QueryError::Internal("leaflet idx exceeds u32".to_string()))?;
                     load_columns_cached_via_handle(
                         handle.as_ref(),
-                        idx,
-                        RunSortOrder::Psot,
                         cache,
-                        handle.leaf_id(),
-                        idx_u32,
+                        fluree_db_binary_index::read::column_loader::LeafletDecodeSpec {
+                            leaf_id: handle.leaf_id(),
+                            leaflet_idx: idx_u32,
+                            order: RunSortOrder::Psot,
+                            decode_set: ColumnSet::ALL,
+                        },
                     )
                     .map_err(|e| QueryError::Internal(format!("load columns: {e}")))?
                 } else {

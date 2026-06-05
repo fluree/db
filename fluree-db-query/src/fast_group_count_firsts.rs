@@ -545,10 +545,13 @@ fn load_v6_batch(
             leaf_bytes,
             entry,
             payload_base,
-            order,
             c,
-            leaf_id,
-            leaflet_idx,
+            fluree_db_binary_index::read::column_loader::LeafletDecodeSpec {
+                leaf_id,
+                leaflet_idx,
+                order,
+                decode_set: ColumnSet::ALL,
+            },
         )
         .map_err(|e| QueryError::Internal(format!("load columns: {e}")))
     } else {
