@@ -511,7 +511,7 @@ impl GraphDb {
     pub fn binary_graph(&self) -> Option<BinaryGraphView> {
         self.binary_store.as_ref().map(|store| {
             BinaryGraphView::new(store.clone(), self.graph_id)
-                .with_namespace_codes_fallback(Some(Arc::new(self.snapshot.namespaces().clone())))
+                .with_namespace_codes_fallback(Some(self.snapshot.shared_namespaces()))
         })
     }
 }
