@@ -2203,7 +2203,7 @@ pub fn translate_overlay_flakes(
 /// The `ephemeral_preds` map contains predicate IRI → ephemeral p_id for predicates that
 /// don't exist in the persisted index dictionary. Callers must use this to extend their
 /// p_id → Sid lookup tables so that novelty-only predicates can be resolved during decode.
-fn translate_overlay_flakes_with_untranslated(
+pub fn translate_overlay_flakes_with_untranslated(
     overlay: &dyn OverlayProvider,
     store: &Arc<BinaryIndexStore>,
     dict_novelty: Option<&Arc<fluree_db_core::dict_novelty::DictNovelty>>,
@@ -2443,13 +2443,22 @@ fn value_to_otype_okey(
             store,
             dict_novelty,
         )?;
-        let lang_id = store.resolve_lang_id(lang_tag).unwrap_or_else(|| {
-            tracing::warn!(
-                tag = lang_tag,
-                "language tag not found in persisted dict, using 1"
-            );
-            1
-        });
+        // Resolve the BCP-47 tag to a persisted lang_id. A novelty-introduced
+        // tag that has never been indexed has no persisted lang_id; encoding it
+        // as a fixed fallback (e.g. lang_id=1) would collapse every such tag to
+        // one OType, silently dropping distinct language variants that share a
+        // string value ("animal"@en vs "animal"@fr) and mis-decoding their tags
+        // (issue #1273). Instead, decline the encoded fast path with Unsupported
+        // so the caller merges this flake via the raw-flake path, which carries
+        // the real `FlakeMeta` lang tag and dedups on full identity. This mirrors
+        // how a novelty-only custom datatype is handled below (unresolvable
+        // `dt_otype` → Unsupported → raw fallback).
+        let lang_id = store.resolve_lang_id(lang_tag).ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "language tag not in persisted dict (novelty-only); use raw flake path",
+            )
+        })?;
         return Ok((OType::lang_string(lang_id), str_id as u64));
     }
 

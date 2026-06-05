@@ -93,7 +93,7 @@ impl Fluree {
             let runtime_small_dicts = view.runtime_small_dicts.clone().unwrap_or_else(|| {
                 crate::runtime_dicts::build_runtime_small_dicts(&store, view.novelty.as_ref())
             });
-            let ns_fallback = Some(Arc::new(view.snapshot.namespaces().clone()));
+            let ns_fallback = Some(view.snapshot.shared_namespaces());
             let provider =
                 BinaryRangeProvider::new(store, dict_novelty, runtime_small_dicts, ns_fallback);
             let mut db = (*view.snapshot).clone();
@@ -224,7 +224,7 @@ impl Fluree {
                     &arc_store,
                     Some(&snapshot.novelty),
                 );
-                let ns_fallback = Some(Arc::new(snapshot.snapshot.namespaces().clone()));
+                let ns_fallback = Some(snapshot.snapshot.shared_namespaces());
                 let provider = BinaryRangeProvider::new(
                     Arc::clone(&arc_store),
                     dn,
@@ -388,7 +388,7 @@ impl Fluree {
                                     view.novelty.as_ref(),
                                 )
                             });
-                        let ns_fallback = Some(Arc::new(view.snapshot.namespaces().clone()));
+                        let ns_fallback = Some(view.snapshot.shared_namespaces());
                         let provider = BinaryRangeProvider::new(
                             Arc::clone(&store),
                             dict_novelty,

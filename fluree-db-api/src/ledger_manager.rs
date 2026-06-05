@@ -337,7 +337,7 @@ impl LedgerHandle {
             crate::runtime_dicts::reseed_runtime_small_dicts(&mut state, &arc_store);
 
             // Build range_provider with the real dict_novelty (rebuilt by apply_loaded_db)
-            let ns_fallback = Some(Arc::new(state.snapshot.namespaces().clone()));
+            let ns_fallback = Some(state.snapshot.shared_namespaces());
             let provider = BinaryRangeProvider::new(
                 Arc::clone(&arc_store),
                 Arc::clone(&state.dict_novelty),
@@ -684,7 +684,7 @@ pub(crate) async fn load_and_attach_binary_store(
 
     let arc_store = Arc::new(store);
     crate::runtime_dicts::reseed_runtime_small_dicts(state, &arc_store);
-    let ns_fallback = Some(Arc::new(state.snapshot.namespaces().clone()));
+    let ns_fallback = Some(state.snapshot.shared_namespaces());
     let provider = BinaryRangeProvider::new(
         Arc::clone(&arc_store),
         Arc::clone(&state.dict_novelty),
@@ -1672,7 +1672,7 @@ impl LedgerManager {
                             let runtime_small_dicts =
                                 Arc::clone(&write_guard.state().runtime_small_dicts);
                             let ns_fallback =
-                                Some(Arc::new(write_guard.state().snapshot.namespaces().clone()));
+                                Some(write_guard.state().snapshot.shared_namespaces());
                             Arc::make_mut(&mut write_guard.state_mut().snapshot).range_provider =
                                 Some(Arc::new(BinaryRangeProvider::new(
                                     store,
