@@ -911,7 +911,14 @@ impl<'a> ExecutionContext<'a> {
             multi_ledger: false,
             eager_materialization: self.eager_materialization,
             original_snapshot: self.original_snapshot,
-            const_sid_cache: self.const_sid_cache.clone(),
+            // This per-graph context switches to `graph`'s own store/snapshot
+            // (see `binary_store`/`active_snapshot` above) while clearing
+            // `multi_ledger`, so the single-ledger const→s_id fast path DOES run
+            // here — against a different store than the parent. A fresh memo is
+            // mandatory: sharing the parent's would alias an s_id resolved in one
+            // graph/store into another. (`with_active_graph`/`with_default_graph`
+            // keep the same store, so they correctly share the parent's memo.)
+            const_sid_cache: ConstSidCache::default(),
         }
     }
 
