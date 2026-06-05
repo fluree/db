@@ -200,9 +200,62 @@ impl SubqueryOperator {
 
 #[async_trait]
 impl Operator for SubqueryOperator {
-    fn plan_children(&self) -> Vec<crate::plan_node::PlanChild<'_>> {
-        vec![crate::plan_node::PlanChild::child(self.child.as_ref())]
+    fn plan_details(&self) -> serde_json::Map<String, serde_json::Value> {
+        let mut m = serde_json::Map::new();
+        m.insert("join-mode".into(), self.join_mode.into());
+        if !self.correlation_vars.is_empty() {
+            m.insert(
+                "correlation-vars".into(),
+                serde_json::Value::Array(
+                    self.correlation_vars
+                        .iter()
+                        .map(|v| serde_json::Value::String(format!("?v{}", v.0)))
+                        .collect(),
+                ),
+            );
+        }
+        m
     }
+
+    /// The subquery's inner operator tree is built lazily at runtime (it is not
+    /// held as a field), so the default `plan_children` walk can't reach it.
+    /// Rebuild it here — build-only, no `open()`/exec — from the stored IR +
+    /// stats + planning, and attach it under a `SubqueryBody` node so the inner
+    /// joins (where BSBM-BI time lives) are visible. The first child is the outer
+    /// input the subquery correlates against.
+    fn describe(&self) -> crate::plan_node::PlanNode {
+        use crate::plan_node::{PlanEdge, PlanEdgeRel, PlanNode};
+
+        let mut children = vec![PlanEdge {
+            rel: PlanEdgeRel::Child,
+            node: self.child.describe(),
+        }];
+
+        let body = match self.build_inner_plan_for_explain() {
+            Ok(inner) => PlanNode {
+                op: "SubqueryBody".into(),
+                est_rows: None,
+                details: serde_json::Map::new(),
+                children: vec![PlanEdge {
+                    rel: PlanEdgeRel::Child,
+                    node: inner.describe(),
+                }],
+            },
+            Err(e) => PlanNode::leaf(format!("SubqueryBody <error: {e}>"), None),
+        };
+        children.push(PlanEdge {
+            rel: PlanEdgeRel::Child,
+            node: body,
+        });
+
+        PlanNode {
+            op: self.op_name(),
+            est_rows: self.estimated_rows(),
+            details: self.plan_details(),
+            children,
+        }
+    }
+
     fn schema(&self) -> &[VarId] {
         effective_schema(&self.out_schema, &self.in_schema)
     }
@@ -421,6 +474,40 @@ impl SubqueryOperator {
             index.entry(key).or_default().push(i);
         }
         Ok(MaterializedSubquery { rows, index })
+    }
+
+    /// Build the subquery's inner operator tree for `EXPLAIN` (build-only — no
+    /// `open()`/exec). Mirrors [`run_subquery_with_seed`](Self::run_subquery_with_seed)'s
+    /// construction, but with a schema-only seed carrying the correlation vars
+    /// (so the inner reorder sees the same initial bound set) and no execution.
+    fn build_inner_plan_for_explain(&self) -> Result<BoxedOperator> {
+        let seed_schema: Arc<[VarId]> =
+            Arc::from(self.correlation_vars.clone().into_boxed_slice());
+        let seed_row = vec![Binding::Unbound; self.correlation_vars.len()];
+        let seed: BoxedOperator = Box::new(crate::seed::SeedOperator::from_row(seed_schema, seed_row));
+
+        let where_op = build_where_operators_seeded(
+            Some(seed),
+            &self.subquery.patterns,
+            self.stats.clone(),
+            None,
+            &self.planning,
+        )?;
+
+        let select_vars: Option<&[VarId]> =
+            (!self.subquery.select.is_empty()).then_some(self.subquery.select.as_slice());
+        crate::execute::operator_tree::apply_solution_modifiers(
+            where_op,
+            self.subquery.grouping.as_ref(),
+            &self.subquery.order_binds,
+            &self.subquery.ordering,
+            select_vars,
+            self.subquery.distinct,
+            self.subquery.offset,
+            self.subquery.limit,
+            false,
+            None,
+        )
     }
 
     /// Build and run the subquery's operator tree from `seed`, returning rows

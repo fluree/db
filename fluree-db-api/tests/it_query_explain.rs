@@ -248,6 +248,62 @@ async fn explain_physical_plan_surfaces_fast_path() {
 }
 
 #[tokio::test]
+async fn explain_physical_expands_subquery_inner_plan() {
+    // BSBM-BI queries are subquery-based; the inner joins are where the time is.
+    // The SubqueryOperator builds its subplan lazily, so explain rebuilds it
+    // (build-only) and exposes it under a `SubqueryBody` node.
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger0 = genesis_ledger(&fluree, "physical-subquery:main");
+    let ledger = fluree
+        .insert(
+            ledger0,
+            &json!({
+                "@context": {"ex":"http://example.org/"},
+                "@id":"ex:alice",
+                "ex:name":"Alice",
+                "ex:knows": {"@id":"ex:bob"}
+            }),
+        )
+        .await
+        .expect("seed")
+        .ledger;
+
+    let sparql = "PREFIX ex: <http://example.org/>\n\
+        SELECT ?a ?c WHERE { \
+          ?a ex:name ?n . \
+          { SELECT ?a (COUNT(?x) AS ?c) WHERE { ?a ex:knows ?x } GROUP BY ?a } \
+        }";
+    let db = graphdb_from_ledger(&ledger);
+    let resp = fluree
+        .explain_sparql(&db, sparql)
+        .await
+        .expect("explain_sparql");
+    let physical = &resp["plan"]["physical"];
+    eprintln!(
+        "PHYSICAL(subquery) = {}",
+        serde_json::to_string_pretty(physical).unwrap()
+    );
+
+    let sub = physical_find_op(physical, "SubqueryOperator")
+        .expect("expected a SubqueryOperator in physical plan");
+    // The inner plan is expanded under a SubqueryBody node, not opaque.
+    let body = physical_find_op(sub, "SubqueryBody")
+        .expect("subquery inner plan should be expanded under SubqueryBody");
+    // The inner operator tree is visible (a real operator under the body).
+    assert!(
+        body["children"]
+            .as_array()
+            .is_some_and(|cs| !cs.is_empty()),
+        "SubqueryBody should contain the inner operator tree"
+    );
+    // The inner aggregation (the GROUP BY / COUNT) is no longer opaque.
+    assert!(
+        physical_find_op(body, "GroupAggregateOperator").is_some(),
+        "inner subquery aggregation should be visible: {body}"
+    );
+}
+
+#[tokio::test]
 async fn explain_logical_plan_preserves_compound_structure() {
     // The `logical` plan view is the compound-aware reorder_patterns order,
     // available even without stats. Verify a triple + OPTIONAL render as a

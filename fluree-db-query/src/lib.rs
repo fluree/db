@@ -114,7 +114,6 @@ pub use explain::{
     OptimizationStatus, PatternDisplay, SelectivityInputs,
 };
 pub use filter::FilterOperator;
-pub use plan_node::{PlanEdge, PlanEdgeRel, PlanNode};
 pub use geo_rewrite::rewrite_geo_patterns;
 pub use graph::GraphOperator;
 pub use group_aggregate::{GroupAggregateOperator, StreamingAggSpec};
@@ -133,6 +132,7 @@ pub use minus::MinusOperator;
 pub use offset::OffsetOperator;
 pub use operator::{BoxedOperator, Operator, OperatorState};
 pub use optional::OptionalOperator;
+pub use plan_node::{PlanEdge, PlanEdgeRel, PlanNode};
 pub use planner::{
     extract_object_bounds_for_var, extract_range_constraints, is_property_join, PatternType,
     RangeConstraint, RangeValue,
