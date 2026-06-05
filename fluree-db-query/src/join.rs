@@ -1731,9 +1731,6 @@ impl NestedLoopJoinOperator {
 
                 let row_count = batch.row_count;
 
-                // Collect matching row indices using PSOT's `(p_id, s_id, ...)` ordering.
-                let mut matches: Vec<(usize, u64)> = Vec::with_capacity(64);
-
                 // For PSOT, leaflets are sorted by p_id then s_id.
                 // Find the contiguous segment for our p_id.
                 let p_start = (0..row_count)
@@ -1755,192 +1752,188 @@ impl NestedLoopJoinOperator {
                     continue;
                 }
 
+                // Stream matched rows straight into the object-decode + on_match
+                // path in PSOT `(p_id, s_id, ...)` order — no per-leaflet `matches`
+                // Vec to allocate, grow, and replay.
                 for &s_id in &unique_s_ids[subj_start..subj_end] {
-                    if !s_id_to_accum.contains_key(&s_id) {
+                    let Some(accum_indices) = s_id_to_accum.get(&s_id) else {
                         continue;
-                    }
+                    };
                     let row_start = lower_bound_s_id(&batch, p_start, p_end, s_id);
                     let row_end = upper_bound_s_id(&batch, p_start, p_end, s_id);
                     if row_start == row_end {
                         continue;
                     }
                     for row in row_start..row_end {
-                        matches.push((row, s_id));
-                    }
-                }
+                        matched_rows += 1;
+                        let o_type_val = entry
+                            .o_type_const
+                            .unwrap_or_else(|| batch.o_type.get_or(row, 0));
+                        let o_key_val = batch.o_key.get(row);
+                        if !self.batched_row_matches_object_bounds(
+                            store,
+                            ctx.binary_g_id,
+                            p_id,
+                            o_type_val,
+                            o_key_val,
+                        )? {
+                            continue;
+                        }
 
-                if matches.is_empty() {
-                    continue;
-                }
-                matched_rows += matches.len() as u64;
+                        let obj_binding = if o_type_val == OType::IRI_REF.as_u16()
+                            || o_type_val == OType::BLANK_NODE.as_u16()
+                        {
+                            Binding::encoded_sid(o_key_val)
+                        } else {
+                            let p_id = entry.p_const.unwrap_or_else(|| batch.p_id.get_or(row, 0));
+                            let o_i = batch.o_i.get_or(row, u32::MAX);
+                            let t = batch.t.get_or(row, 0) as i64;
+                            let ot = OType::from_u16(o_type_val);
 
-                for (row, s_id) in matches {
-                    let o_type_val = entry
-                        .o_type_const
-                        .unwrap_or_else(|| batch.o_type.get_or(row, 0));
-                    let o_key_val = batch.o_key.get(row);
-                    if !self.batched_row_matches_object_bounds(
-                        store,
-                        ctx.binary_g_id,
-                        p_id,
-                        o_type_val,
-                        o_key_val,
-                    )? {
-                        continue;
-                    }
+                            // Prefer a stable EncodedLit representation when possible so that
+                            // formatters can materialize using the root's canonical datatype table.
+                            match ot.decode_kind() {
+                                fluree_db_core::o_type::DecodeKind::StringDict => {
+                                    use fluree_db_core::ids::DatatypeDictId;
+                                    use fluree_db_core::value_id::ObjKind;
 
-                    let obj_binding = if o_type_val == OType::IRI_REF.as_u16()
-                        || o_type_val == OType::BLANK_NODE.as_u16()
-                    {
-                        Binding::encoded_sid(o_key_val)
-                    } else {
-                        let p_id = entry.p_const.unwrap_or_else(|| batch.p_id.get_or(row, 0));
-                        let o_i = batch.o_i.get_or(row, u32::MAX);
-                        let t = batch.t.get_or(row, 0) as i64;
-                        let ot = OType::from_u16(o_type_val);
-
-                        // Prefer a stable EncodedLit representation when possible so that
-                        // formatters can materialize using the root's canonical datatype table.
-                        match ot.decode_kind() {
-                            fluree_db_core::o_type::DecodeKind::StringDict => {
-                                use fluree_db_core::ids::DatatypeDictId;
-                                use fluree_db_core::value_id::ObjKind;
-
-                                let (dt_id, lang_id) = if ot.is_lang_string() {
-                                    (DatatypeDictId::LANG_STRING.as_u16(), ot.payload())
-                                } else if o_type_val == OType::FULLTEXT.as_u16() {
-                                    (DatatypeDictId::FULL_TEXT.as_u16(), 0)
-                                } else {
-                                    (DatatypeDictId::STRING.as_u16(), 0)
-                                };
-
-                                Binding::EncodedLit {
-                                    o_kind: ObjKind::LEX_ID.as_u8(),
-                                    o_key: o_key_val,
-                                    p_id,
-                                    dt_id,
-                                    lang_id,
-                                    i_val: if o_i == u32::MAX {
-                                        i32::MIN
+                                    let (dt_id, lang_id) = if ot.is_lang_string() {
+                                        (DatatypeDictId::LANG_STRING.as_u16(), ot.payload())
+                                    } else if o_type_val == OType::FULLTEXT.as_u16() {
+                                        (DatatypeDictId::FULL_TEXT.as_u16(), 0)
                                     } else {
-                                        o_i as i32
-                                    },
-                                    t,
+                                        (DatatypeDictId::STRING.as_u16(), 0)
+                                    };
+
+                                    Binding::EncodedLit {
+                                        o_kind: ObjKind::LEX_ID.as_u8(),
+                                        o_key: o_key_val,
+                                        p_id,
+                                        dt_id,
+                                        lang_id,
+                                        i_val: if o_i == u32::MAX {
+                                            i32::MIN
+                                        } else {
+                                            o_i as i32
+                                        },
+                                        t,
+                                    }
                                 }
-                            }
-                            fluree_db_core::o_type::DecodeKind::JsonArena => {
-                                use fluree_db_core::ids::DatatypeDictId;
-                                use fluree_db_core::value_id::ObjKind;
-                                Binding::EncodedLit {
-                                    o_kind: ObjKind::JSON_ID.as_u8(),
-                                    o_key: o_key_val,
-                                    p_id,
-                                    dt_id: DatatypeDictId::JSON.as_u16(),
-                                    lang_id: 0,
-                                    i_val: if o_i == u32::MAX {
-                                        i32::MIN
-                                    } else {
-                                        o_i as i32
-                                    },
-                                    t,
+                                fluree_db_core::o_type::DecodeKind::JsonArena => {
+                                    use fluree_db_core::ids::DatatypeDictId;
+                                    use fluree_db_core::value_id::ObjKind;
+                                    Binding::EncodedLit {
+                                        o_kind: ObjKind::JSON_ID.as_u8(),
+                                        o_key: o_key_val,
+                                        p_id,
+                                        dt_id: DatatypeDictId::JSON.as_u16(),
+                                        lang_id: 0,
+                                        i_val: if o_i == u32::MAX {
+                                            i32::MIN
+                                        } else {
+                                            o_i as i32
+                                        },
+                                        t,
+                                    }
                                 }
-                            }
-                            fluree_db_core::o_type::DecodeKind::VectorArena => {
-                                use fluree_db_core::ids::DatatypeDictId;
-                                use fluree_db_core::value_id::ObjKind;
-                                Binding::EncodedLit {
-                                    o_kind: ObjKind::VECTOR_ID.as_u8(),
-                                    o_key: o_key_val,
-                                    p_id,
-                                    dt_id: DatatypeDictId::VECTOR.as_u16(),
-                                    lang_id: 0,
-                                    i_val: if o_i == u32::MAX {
-                                        i32::MIN
-                                    } else {
-                                        o_i as i32
-                                    },
-                                    t,
+                                fluree_db_core::o_type::DecodeKind::VectorArena => {
+                                    use fluree_db_core::ids::DatatypeDictId;
+                                    use fluree_db_core::value_id::ObjKind;
+                                    Binding::EncodedLit {
+                                        o_kind: ObjKind::VECTOR_ID.as_u8(),
+                                        o_key: o_key_val,
+                                        p_id,
+                                        dt_id: DatatypeDictId::VECTOR.as_u16(),
+                                        lang_id: 0,
+                                        i_val: if o_i == u32::MAX {
+                                            i32::MIN
+                                        } else {
+                                            o_i as i32
+                                        },
+                                        t,
+                                    }
                                 }
-                            }
-                            fluree_db_core::o_type::DecodeKind::NumBigArena => {
-                                use fluree_db_core::ids::DatatypeDictId;
-                                use fluree_db_core::value_id::ObjKind;
-                                Binding::EncodedLit {
-                                    o_kind: ObjKind::NUM_BIG.as_u8(),
-                                    o_key: o_key_val,
-                                    p_id,
-                                    dt_id: DatatypeDictId::DECIMAL.as_u16(),
-                                    lang_id: 0,
-                                    i_val: if o_i == u32::MAX {
-                                        i32::MIN
-                                    } else {
-                                        o_i as i32
-                                    },
-                                    t,
+                                fluree_db_core::o_type::DecodeKind::NumBigArena => {
+                                    use fluree_db_core::ids::DatatypeDictId;
+                                    use fluree_db_core::value_id::ObjKind;
+                                    Binding::EncodedLit {
+                                        o_kind: ObjKind::NUM_BIG.as_u8(),
+                                        o_key: o_key_val,
+                                        p_id,
+                                        dt_id: DatatypeDictId::DECIMAL.as_u16(),
+                                        lang_id: 0,
+                                        i_val: if o_i == u32::MAX {
+                                            i32::MIN
+                                        } else {
+                                            o_i as i32
+                                        },
+                                        t,
+                                    }
                                 }
-                            }
-                            _ => {
-                                // Fallback: decode eagerly, using DictOverlay for
-                                // novelty-aware resolution of string/subject IDs.
-                                use fluree_db_core::o_type::{DecodeKind, OType as OT};
-                                let ot = OT::from_u16(o_type_val);
-                                let val: fluree_db_core::FlakeValue =
-                                    match (ot.decode_kind(), dict_overlay.as_ref()) {
-                                        (DecodeKind::IriRef, Some(ov)) => {
-                                            let iri =
-                                                ov.resolve_subject_iri(o_key_val).map_err(|e| {
-                                                    crate::error::QueryError::Internal(format!(
+                                _ => {
+                                    // Fallback: decode eagerly, using DictOverlay for
+                                    // novelty-aware resolution of string/subject IDs.
+                                    use fluree_db_core::o_type::{DecodeKind, OType as OT};
+                                    let ot = OT::from_u16(o_type_val);
+                                    let val: fluree_db_core::FlakeValue =
+                                        match (ot.decode_kind(), dict_overlay.as_ref()) {
+                                            (DecodeKind::IriRef, Some(ov)) => {
+                                                let iri = ov
+                                                    .resolve_subject_iri(o_key_val)
+                                                    .map_err(|e| {
+                                                        crate::error::QueryError::Internal(format!(
                                                         "resolve_subject_iri (batched join): {e}"
                                                     ))
-                                                })?;
-                                            fluree_db_core::FlakeValue::Ref(store.encode_iri(&iri))
-                                        }
-                                        (DecodeKind::StringDict, Some(ov)) => {
-                                            let s = ov
-                                                .resolve_string_value(o_key_val as u32)
-                                                .map_err(|e| {
+                                                    })?;
+                                                fluree_db_core::FlakeValue::Ref(
+                                                    store.encode_iri(&iri),
+                                                )
+                                            }
+                                            (DecodeKind::StringDict, Some(ov)) => {
+                                                let s = ov
+                                                    .resolve_string_value(o_key_val as u32)
+                                                    .map_err(|e| {
                                                     crate::error::QueryError::Internal(format!(
                                                         "resolve_string_value (batched join): {e}"
                                                     ))
                                                 })?;
-                                            fluree_db_core::FlakeValue::String(s)
-                                        }
-                                        (DecodeKind::JsonArena, Some(ov)) => {
-                                            let s = ov
-                                                .resolve_string_value(o_key_val as u32)
-                                                .map_err(|e| {
+                                                fluree_db_core::FlakeValue::String(s)
+                                            }
+                                            (DecodeKind::JsonArena, Some(ov)) => {
+                                                let s = ov
+                                                    .resolve_string_value(o_key_val as u32)
+                                                    .map_err(|e| {
                                                     crate::error::QueryError::Internal(format!(
                                                     "resolve_string_value (batched join json): {e}"
                                                 ))
                                                 })?;
-                                            fluree_db_core::FlakeValue::Json(s)
-                                        }
-                                        _ => store
-                                            .decode_value_v3(
-                                                o_type_val,
-                                                o_key_val,
-                                                p_id,
-                                                ctx.binary_g_id,
-                                            )
-                                            .map_err(|e| {
-                                                crate::error::QueryError::Internal(format!(
-                                                    "decode_value_v3 (batched join): {e}"
-                                                ))
-                                            })?,
-                                    };
-                                materialized_object_binding(
-                                    store,
-                                    o_type_val,
-                                    p_id,
-                                    val,
-                                    Some(t),
-                                    None,
-                                )
+                                                fluree_db_core::FlakeValue::Json(s)
+                                            }
+                                            _ => store
+                                                .decode_value_v3(
+                                                    o_type_val,
+                                                    o_key_val,
+                                                    p_id,
+                                                    ctx.binary_g_id,
+                                                )
+                                                .map_err(|e| {
+                                                    crate::error::QueryError::Internal(format!(
+                                                        "decode_value_v3 (batched join): {e}"
+                                                    ))
+                                                })?,
+                                        };
+                                    materialized_object_binding(
+                                        store,
+                                        o_type_val,
+                                        p_id,
+                                        val,
+                                        Some(t),
+                                        None,
+                                    )
+                                }
                             }
-                        }
-                    };
+                        };
 
-                    if let Some(accum_indices) = s_id_to_accum.get(&s_id) {
                         on_match(accum_indices, &obj_binding)?;
                     }
                 }
