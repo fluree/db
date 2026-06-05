@@ -375,6 +375,23 @@ impl BinaryCursor {
                         continue;
                     }
 
+                    // Key-range pre-skip: drop leaflets whose [first_key, last_key]
+                    // provably cannot contain a row matching the filter's bound
+                    // order-leading prefix, before paying any decode + per-row
+                    // filter. Same safety guards as the metadata skip above
+                    // (no overlay merge; no time-travel history replay).
+                    if !has_ov
+                        && !needs_history_replay
+                        && self.filter.leaflet_out_of_range(
+                            self.order,
+                            &entry.first_key,
+                            &entry.last_key,
+                        )
+                    {
+                        scan_stats::SKIPPED.fetch_add(1, Relaxed);
+                        continue;
+                    }
+
                     // Load columns via LeafHandle (cached when LeafletCache is available).
                     let mut batch = if entry.row_count > 0 {
                         let leaflet_idx = self.current_leaflet_idx - 1;
