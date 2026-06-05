@@ -52,7 +52,9 @@ pub mod scan_stats {
 
     /// Reset all counters (e.g. before measuring a specific workload).
     pub fn reset() {
-        for c in [&CALLS, &VISITED, &SKIPPED, &EMPTY, &RETURNED, &ROWS, &FILTERED] {
+        for c in [
+            &CALLS, &VISITED, &SKIPPED, &EMPTY, &RETURNED, &ROWS, &FILTERED,
+        ] {
             c.store(0, Relaxed);
         }
         NEXT_LOG_AT.store(1 << 18, Relaxed);

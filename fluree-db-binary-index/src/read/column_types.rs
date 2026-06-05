@@ -335,10 +335,30 @@ impl BinaryFilter {
         // Sort-column sequence per order (`o_type` precedes `o_key`; `t` and the
         // identity tiebreaks are never bound, so they are not consulted).
         let fields: &[SortField] = match order {
-            RunSortOrder::Spot => &[SortField::S, SortField::P, SortField::OType, SortField::OKey],
-            RunSortOrder::Psot => &[SortField::P, SortField::S, SortField::OType, SortField::OKey],
-            RunSortOrder::Post => &[SortField::P, SortField::OType, SortField::OKey, SortField::S],
-            RunSortOrder::Opst => &[SortField::OType, SortField::OKey, SortField::P, SortField::S],
+            RunSortOrder::Spot => &[
+                SortField::S,
+                SortField::P,
+                SortField::OType,
+                SortField::OKey,
+            ],
+            RunSortOrder::Psot => &[
+                SortField::P,
+                SortField::S,
+                SortField::OType,
+                SortField::OKey,
+            ],
+            RunSortOrder::Post => &[
+                SortField::P,
+                SortField::OType,
+                SortField::OKey,
+                SortField::S,
+            ],
+            RunSortOrder::Opst => &[
+                SortField::OType,
+                SortField::OKey,
+                SortField::P,
+                SortField::S,
+            ],
         };
         // Cheap bail before decoding the keys: nothing to prune if the leading
         // sort column is unbound.

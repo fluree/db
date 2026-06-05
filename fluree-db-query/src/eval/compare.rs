@@ -120,7 +120,8 @@ fn fast_eq_ne_for_iri_bindings<R: RowAccess>(
                         _ => None,
                     };
                     if let Some(r) = other_ref {
-                        if let Some(rhs_s_id) = subject_ref_to_s_id(ctx.active_snapshot, store, &r)? {
+                        if let Some(rhs_s_id) = subject_ref_to_s_id(ctx.active_snapshot, store, &r)?
+                        {
                             let eq = *s_id == rhs_s_id;
                             let out = match op {
                                 CompareOp::Eq => eq,
