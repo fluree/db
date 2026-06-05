@@ -6,8 +6,8 @@
 use crate::ir::ReasoningModes;
 use crate::reasoning::{global_reasoning_cache, reason_owl2rl, ReasoningOverlay};
 use fluree_db_core::{
-    is_rdfs_subclass_of, is_rdfs_subproperty_of, overlay::OverlayProvider, GraphDbRef, GraphId,
-    IndexSchema, LedgerSnapshot, SchemaHierarchy, SchemaPredicateInfo,
+    overlay::OverlayProvider, GraphDbRef, GraphId, IndexSchema, LedgerSnapshot, SchemaHierarchy,
+    SchemaPredicateInfo,
 };
 use fluree_db_reasoner::{
     DerivedFactsBuilder, DerivedFactsOverlay, FrozenSameAs, ReasoningOptions,
@@ -17,48 +17,72 @@ use std::sync::Arc;
 
 /// Build schema hierarchy from database and overlay
 ///
-/// Merges overlay rdfs:subClassOf and rdfs:subPropertyOf assertions
-/// with the existing database schema to create a unified hierarchy view.
-pub fn schema_hierarchy_with_overlay(
+/// Reads `rdfs:subClassOf` and `rdfs:subPropertyOf` assertions from the full
+/// snapshot (indexed root *and* committed-but-unindexed novelty) plus the
+/// overlay, and merges them with the existing database schema to create a
+/// unified hierarchy view.
+///
+/// Reading via the range provider (rather than only `overlay` flakes) is
+/// essential: right after `fluree create`/import, the ontology axioms live in
+/// committed-but-not-yet-background-indexed data. Those flakes are invisible to
+/// both an overlay scan and `snapshot.schema` (the last indexed root), so an
+/// overlay-only scan returned an empty hierarchy and silently disabled RDFS
+/// query rewriting until background indexing happened to run. OWL2-QL already
+/// read its axioms through the range provider (`Ontology::from_db`); this brings
+/// RDFS in line so subclass/subproperty expansion works on a freshly imported
+/// ledger.
+pub async fn schema_hierarchy_with_overlay(
     snapshot: &LedgerSnapshot,
     overlay: &dyn fluree_db_core::OverlayProvider,
     to_t: i64,
 ) -> Option<SchemaHierarchy> {
     use fluree_db_core::value::FlakeValue;
+    use fluree_db_core::{IndexType, RangeMatch, RangeTest, Sid};
+    use fluree_vocab::namespaces::RDFS;
 
-    // Build child -> parents from overlay rdfs:subClassOf assertions.
+    // Build child -> parents from rdfs:subClassOf assertions.
     let mut subclass_of: HashMap<fluree_db_core::Sid, Vec<fluree_db_core::Sid>> = HashMap::new();
-    // Build child -> parents from overlay rdfs:subPropertyOf assertions.
+    // Build child -> parents from rdfs:subPropertyOf assertions.
     let mut subproperty_of: HashMap<fluree_db_core::Sid, Vec<fluree_db_core::Sid>> = HashMap::new();
-    overlay.for_each_overlay_flake(
-        0, // default graph — schema hierarchy is default-graph only
-        fluree_db_core::IndexType::Psot,
-        None,
-        None,
-        true,
-        to_t,
-        &mut |flake| {
-            if !is_rdfs_subclass_of(&flake.p) {
-                // fall through for subPropertyOf
-            } else if let FlakeValue::Ref(parent) = &flake.o {
-                subclass_of
-                    .entry(flake.s.clone())
-                    .or_default()
-                    .push(parent.clone());
-                return;
-            }
 
-            if !is_rdfs_subproperty_of(&flake.p) {
-                return;
+    // Scan the full default-graph state (indexed + unindexed commits + overlay).
+    let db = GraphDbRef::new(snapshot, 0, overlay, to_t);
+
+    if let Ok(flakes) = db
+        .range(
+            IndexType::Psot,
+            RangeTest::Eq,
+            RangeMatch::predicate(Sid::new(RDFS, "subClassOf")),
+        )
+        .await
+    {
+        for flake in flakes {
+            if !flake.op {
+                continue;
             }
-            if let FlakeValue::Ref(parent) = &flake.o {
-                subproperty_of
-                    .entry(flake.s.clone())
-                    .or_default()
-                    .push(parent.clone());
+            if let FlakeValue::Ref(parent) = flake.o {
+                subclass_of.entry(flake.s).or_default().push(parent);
             }
-        },
-    );
+        }
+    }
+
+    if let Ok(flakes) = db
+        .range(
+            IndexType::Psot,
+            RangeTest::Eq,
+            RangeMatch::predicate(Sid::new(RDFS, "subPropertyOf")),
+        )
+        .await
+    {
+        for flake in flakes {
+            if !flake.op {
+                continue;
+            }
+            if let FlakeValue::Ref(parent) = flake.o {
+                subproperty_of.entry(flake.s).or_default().push(parent);
+            }
+        }
+    }
 
     // Merge overlay edges into the LedgerSnapshot's existing schema (if any).
     //

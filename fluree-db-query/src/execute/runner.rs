@@ -234,7 +234,8 @@ pub async fn prepare_execution_with_config(
             .unwrap_or(db.overlay);
         let (hierarchy, reasoning, derived_overlay, ontology) = async {
             // Step 1: Compute schema hierarchy from overlay
-            let hierarchy = schema_hierarchy_with_overlay(db.snapshot, effective_overlay, db.t);
+            let hierarchy =
+                schema_hierarchy_with_overlay(db.snapshot, effective_overlay, db.t).await;
 
             // Step 2: Determine effective reasoning modes
             let reasoning = effective_reasoning_modes(&query.reasoning.modes, hierarchy.is_some());
