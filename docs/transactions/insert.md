@@ -253,6 +253,11 @@ Add language-tagged strings:
 }
 ```
 
+The language tag is part of a value's identity. Two language-tagged values
+that share the same string but differ in their `@language` (for example
+`"animal"@en` and `"animal"@fr`) are **distinct** facts and are both retained;
+they are not deduplicated against each other.
+
 ## Blank Nodes
 
 Create entities without explicit IRIs:
@@ -329,6 +334,14 @@ Inserting the same triple again is a no-op:
 t=1: INSERT { ex:alice schema:name "Alice" }
 t=2: INSERT { ex:alice schema:name "Alice" }
      (No change—triple already exists)
+```
+
+A triple's identity includes its datatype and language tag, so values that
+differ only by language tag are not duplicates:
+
+```text
+INSERT { ex:alice schema:name "Alice"@en, "Alice"@fr }
+     Result: ex:alice has TWO name values (one per language tag)
 ```
 
 ### Multi-Value Handling
