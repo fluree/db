@@ -17,7 +17,8 @@ use crate::binding::Binding;
 use crate::binding::RowAccess;
 use crate::context::ExecutionContext;
 use crate::error::{QueryError, Result};
-use crate::ir::{CompareOp, Expression};
+use crate::fast_path_common::subject_ref_to_s_id;
+use crate::ir::{CompareOp, Expression, Ref};
 use fluree_db_core::FlakeValue;
 use std::cmp::Ordering;
 
@@ -104,6 +105,34 @@ fn fast_eq_ne_for_iri_bindings<R: RowAccess>(
 
         match binding {
             Binding::EncodedSid { s_id, .. } => {
+                // Single-ledger fast path for `?var = <const IRI>` / `?var = Sid`
+                // (e.g. BSBM's `FILTER (<product> != ?p)`): reduce the constant
+                // side to its internal `s_id` and compare u64s, skipping the
+                // costly `resolve_subject_iri` string materialization of the
+                // bound side. Cross-ledger `s_id`s aren't comparable, so gate on
+                // `!is_multi_ledger`. A `None` reduction (subject not indexed, or
+                // an IRI-normalization mismatch) falls through to the IRI-string
+                // path below, which stays conservative.
+                if !ctx.is_multi_ledger() {
+                    let other_ref = match &other {
+                        ComparableValue::Sid(sid) => Some(Ref::Sid(sid.clone())),
+                        ComparableValue::Iri(iri) => Some(Ref::Iri(iri.clone())),
+                        _ => None,
+                    };
+                    if let Some(r) = other_ref {
+                        if let Some(rhs_s_id) = subject_ref_to_s_id(ctx.active_snapshot, store, &r)? {
+                            let eq = *s_id == rhs_s_id;
+                            let out = match op {
+                                CompareOp::Eq => eq,
+                                CompareOp::Ne => !eq,
+                                _ => unreachable!(),
+                            };
+                            log_fastpath_hit_once("EncodedSid-id");
+                            return Ok(Some(out));
+                        }
+                    }
+                }
+
                 let Some(lhs_iri) = ctx
                     .resolve_subject_iri(*s_id)
                     .transpose()
