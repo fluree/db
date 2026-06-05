@@ -749,6 +749,25 @@ impl<'a> ExecutionContext<'a> {
         dt_id: u16,
         lang_id: u16,
     ) -> Option<std::io::Result<fluree_db_core::FlakeValue>> {
+        use fluree_db_core::ids::DatatypeDictId;
+        use fluree_db_core::value_id::{ObjKey, ObjKind};
+        use fluree_db_core::FlakeValue;
+        // Inline numerics are self-contained in `o_key` — decode them directly
+        // rather than building a fresh BinaryGraphView per call (a per-row cost
+        // when filters/arithmetic touch encoded numeric literals). Gated on the
+        // standard integer/double dt_ids; other shapes (e.g. an integer-valued
+        // double stored as NUM_INT by novelty) fall through to the view path.
+        let okind = ObjKind::from_u8(o_kind);
+        if okind == ObjKind::NUM_INT
+            && (dt_id == DatatypeDictId::INTEGER.as_u16() || dt_id == DatatypeDictId::LONG.as_u16())
+        {
+            return Some(Ok(FlakeValue::Long(ObjKey::from_u64(o_key).decode_i64())));
+        }
+        if okind == ObjKind::NUM_F64
+            && (dt_id == DatatypeDictId::DOUBLE.as_u16() || dt_id == DatatypeDictId::FLOAT.as_u16())
+        {
+            return Some(Ok(FlakeValue::Double(ObjKey::from_u64(o_key).decode_f64())));
+        }
         let gv = self.graph_view()?;
         Some(gv.decode_value_from_kind(o_kind, o_key, p_id, dt_id, lang_id))
     }
