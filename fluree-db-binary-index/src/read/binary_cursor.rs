@@ -48,7 +48,15 @@ pub mod scan_stats {
     pub static RETURNED: AtomicU64 = AtomicU64::new(0);
     pub static ROWS: AtomicU64 = AtomicU64::new(0);
     pub static FILTERED: AtomicU64 = AtomicU64::new(0);
-    static NEXT_LOG_AT: AtomicU64 = AtomicU64::new(1 << 26);
+    static NEXT_LOG_AT: AtomicU64 = AtomicU64::new(1 << 18);
+
+    /// Reset all counters (e.g. before measuring a specific workload).
+    pub fn reset() {
+        for c in [&CALLS, &VISITED, &SKIPPED, &EMPTY, &RETURNED, &ROWS, &FILTERED] {
+            c.store(0, Relaxed);
+        }
+        NEXT_LOG_AT.store(1 << 18, Relaxed);
+    }
 
     /// `(calls, visited, returned, rows, skipped, empty, filtered)`.
     pub fn snapshot() -> (u64, u64, u64, u64, u64, u64, u64) {

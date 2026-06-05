@@ -32,6 +32,64 @@ pub async fn health() -> Json<HealthResponse> {
     })
 }
 
+/// Binary-scan leaflet-loop diagnostic counters (see
+/// `fluree_db_binary_index::read::binary_cursor::scan_stats`).
+#[derive(Serialize)]
+pub struct ScanStatsResponse {
+    pub calls: u64,
+    pub visited: u64,
+    pub returned: u64,
+    pub rows: u64,
+    pub skipped: u64,
+    pub empty: u64,
+    pub filtered: u64,
+    /// Leaflet breadth: leaflets examined per leaflet returned (≫1 ⇒ over-scan).
+    pub visited_per_returned: f64,
+    /// Row volume per returned leaflet (small ⇒ per-leaflet/per-call overhead).
+    pub rows_per_returned: f64,
+    /// How often the per-row filter runs (per returned leaflet).
+    pub filtered_per_returned: f64,
+    /// Leaflets yielded per `next_batch` call.
+    pub returned_per_call: f64,
+}
+
+#[derive(serde::Deserialize, Default)]
+pub struct ScanStatsQuery {
+    /// `?reset=true` zeroes the counters after reading (to scope a workload).
+    #[serde(default)]
+    pub reset: bool,
+}
+
+/// Binary-scan leaflet-loop counters endpoint.
+///
+/// GET /debug/scan-stats[?reset=true]
+///
+/// On-demand readout of the per-leaflet scan loop counters so the Explore
+/// `next_batch` hotspot can be localized without waiting for the periodic log.
+pub async fn scan_stats(
+    axum::extract::Query(q): axum::extract::Query<ScanStatsQuery>,
+) -> Json<ScanStatsResponse> {
+    use fluree_db_binary_index::read::binary_cursor::scan_stats as s;
+    let (calls, visited, returned, rows, skipped, empty, filtered) = s::snapshot();
+    if q.reset {
+        s::reset();
+    }
+    let r = |a: u64, b: u64| if b == 0 { 0.0 } else { a as f64 / b as f64 };
+    Json(ScanStatsResponse {
+        calls,
+        visited,
+        returned,
+        rows,
+        skipped,
+        empty,
+        filtered,
+        visited_per_returned: r(visited, returned),
+        rows_per_returned: r(rows, returned),
+        filtered_per_returned: r(filtered, returned),
+        returned_per_call: r(returned, calls),
+    })
+}
+
 /// Server statistics response
 #[derive(Serialize)]
 pub struct StatsResponse {
