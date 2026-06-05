@@ -209,7 +209,7 @@ impl<'a> ExecutionContext<'a> {
         let dict_novelty = Self::extract_dict_novelty(db.snapshot);
         let namespace_codes_fallback = binary_store
             .as_ref()
-            .map(|_| Arc::new(db.snapshot.namespaces().clone()));
+            .map(|_| db.snapshot.shared_namespaces());
         let runtime_small_dicts = db
             .runtime_small_dicts
             .or_else(|| Self::extract_runtime_small_dicts(db.snapshot));
@@ -260,7 +260,7 @@ impl<'a> ExecutionContext<'a> {
         let dict_novelty = Self::extract_dict_novelty(db.snapshot);
         let namespace_codes_fallback = binary_store
             .as_ref()
-            .map(|_| Arc::new(db.snapshot.namespaces().clone()));
+            .map(|_| db.snapshot.shared_namespaces());
         let runtime_small_dicts = db
             .runtime_small_dicts
             .or_else(|| Self::extract_runtime_small_dicts(db.snapshot));

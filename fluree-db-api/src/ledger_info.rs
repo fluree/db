@@ -196,7 +196,7 @@ pub async fn build_ledger_info_with_options<S: Storage + Clone>(
     let parsed_context = context
         .map(|c| ParsedContext::parse(None, c).unwrap_or_default())
         .unwrap_or_default();
-    let compactor = IriCompactor::new(ledger.snapshot.namespaces(), &parsed_context);
+    let compactor = IriCompactor::new(ledger.snapshot.shared_namespaces(), &parsed_context);
 
     // Build schema index for hierarchy lookups
     let schema_index = ledger

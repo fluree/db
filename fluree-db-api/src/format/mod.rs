@@ -119,7 +119,7 @@ pub fn format_results(
         )));
     }
 
-    let compactor = IriCompactor::new(snapshot.namespaces(), context);
+    let compactor = IriCompactor::new(snapshot.shared_namespaces(), context);
 
     // CONSTRUCT / DESCRIBE produce a graph, not a binding table, so the only
     // sensible JSON rendering is JSON-LD. Any JSON-producing format request
@@ -182,11 +182,11 @@ pub fn format_results_string(
         OutputFormat::Tsv => return delimited::format_tsv(result, snapshot),
         OutputFormat::Csv => return delimited::format_csv(result, snapshot),
         OutputFormat::SparqlXml => {
-            let compactor = IriCompactor::new(snapshot.namespaces(), context);
+            let compactor = IriCompactor::new(snapshot.shared_namespaces(), context);
             return sparql_xml::format(result, &compactor, config);
         }
         OutputFormat::RdfXml => {
-            let compactor = IriCompactor::new(snapshot.namespaces(), context);
+            let compactor = IriCompactor::new(snapshot.shared_namespaces(), context);
             return rdf_xml::format(result, &compactor, config);
         }
         _ => {}
@@ -262,7 +262,7 @@ pub async fn format_results_async(
         )));
     }
 
-    let compactor = IriCompactor::new(db.snapshot.namespaces(), context);
+    let compactor = IriCompactor::new(db.snapshot.shared_namespaces(), context);
 
     // CONSTRUCT / DESCRIBE produce a graph (sync, no DB access needed); coerce
     // any JSON-producing format to JSON-LD rather than rejecting it. RDF/XML and
@@ -418,11 +418,11 @@ pub async fn format_results_string_async(
         OutputFormat::Tsv => return delimited::format_tsv(result, db.snapshot),
         OutputFormat::Csv => return delimited::format_csv(result, db.snapshot),
         OutputFormat::SparqlXml => {
-            let compactor = IriCompactor::new(db.snapshot.namespaces(), context);
+            let compactor = IriCompactor::new(db.snapshot.shared_namespaces(), context);
             return sparql_xml::format(result, &compactor, config);
         }
         OutputFormat::RdfXml => {
-            let compactor = IriCompactor::new(db.snapshot.namespaces(), context);
+            let compactor = IriCompactor::new(db.snapshot.shared_namespaces(), context);
             return rdf_xml::format(result, &compactor, config);
         }
         _ => {}
@@ -457,11 +457,11 @@ pub async fn format_results_string_async_dataset(
         OutputFormat::Tsv => return delimited::format_tsv(result, primary_db.snapshot),
         OutputFormat::Csv => return delimited::format_csv(result, primary_db.snapshot),
         OutputFormat::SparqlXml => {
-            let compactor = IriCompactor::new(primary_db.snapshot.namespaces(), context);
+            let compactor = IriCompactor::new(primary_db.snapshot.shared_namespaces(), context);
             return sparql_xml::format(result, &compactor, config);
         }
         OutputFormat::RdfXml => {
-            let compactor = IriCompactor::new(primary_db.snapshot.namespaces(), context);
+            let compactor = IriCompactor::new(primary_db.snapshot.shared_namespaces(), context);
             return rdf_xml::format(result, &compactor, config);
         }
         _ => {}

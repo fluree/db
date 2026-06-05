@@ -453,7 +453,7 @@ mod tests {
         namespaces.insert(2, "http://www.w3.org/2001/XMLSchema#".to_string());
         namespaces.insert(3, "http://www.w3.org/1999/02/22-rdf-syntax-ns#".to_string());
         namespaces.insert(100, "http://example.org/".to_string());
-        IriCompactor::from_namespaces(&namespaces)
+        IriCompactor::from_namespaces(std::sync::Arc::new(namespaces))
     }
 
     /// Create a minimal QueryResult for tests that don't need binary_store.

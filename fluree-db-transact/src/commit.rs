@@ -690,7 +690,7 @@ where
         let mut snapshot = base.snapshot;
         if let Some(provider) = snapshot.range_provider.as_ref() {
             if let Some(brp) = provider.as_any().downcast_ref::<BinaryRangeProvider>() {
-                let ns_fallback = Some(Arc::new(snapshot.namespaces().clone()));
+                let ns_fallback = Some(snapshot.shared_namespaces());
                 snapshot.range_provider = Some(Arc::new(BinaryRangeProvider::new(
                     Arc::clone(brp.store()),
                     Arc::clone(&dict_novelty),

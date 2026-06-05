@@ -11,6 +11,7 @@ use fluree_db_core::Sid;
 use fluree_graph_json_ld::{ContextCompactor, ParsedContext};
 use fluree_vocab::namespaces;
 use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 
 use super::{FormatError, Result};
 
@@ -31,7 +32,10 @@ pub struct IriCompactor {
     /// Namespace code -> IRI prefix (from Db.namespaces())
     ///
     /// Example: `2 -> "http://www.w3.org/2001/XMLSchema#"`
-    namespace_codes: HashMap<u16, String>,
+    ///
+    /// Shared (not cloned) from the snapshot so building a compactor per query
+    /// is a refcount bump, not a deep copy of the whole namespace table.
+    namespace_codes: Arc<HashMap<u16, String>>,
 
     /// Parsed @context from the query (for advanced access / @reverse lookups)
     context: ParsedContext,
@@ -56,12 +60,12 @@ impl IriCompactor {
     ///
     /// For namespaces in `namespace_codes` that have no matching prefix in
     /// the context, a short prefix is auto-derived from the namespace URI.
-    pub fn new(namespace_codes: &HashMap<u16, String>, context: &ParsedContext) -> Self {
+    pub fn new(namespace_codes: Arc<HashMap<u16, String>>, context: &ParsedContext) -> Self {
         let compactor = ContextCompactor::new(context);
         let reverse_terms = build_reverse_terms(context);
-        let fallback_prefixes = build_fallback_prefixes(namespace_codes, context);
+        let fallback_prefixes = build_fallback_prefixes(&namespace_codes, context);
         Self {
-            namespace_codes: namespace_codes.clone(),
+            namespace_codes,
             context: context.clone(),
             compactor,
             reverse_terms,
@@ -73,11 +77,11 @@ impl IriCompactor {
     ///
     /// No fallback prefixes are generated — IRIs come through uncompacted.
     /// Use `new()` with a `ParsedContext` to enable compaction.
-    pub fn from_namespaces(namespace_codes: &HashMap<u16, String>) -> Self {
+    pub fn from_namespaces(namespace_codes: Arc<HashMap<u16, String>>) -> Self {
         let default_ctx = ParsedContext::default();
         let compactor = ContextCompactor::new(&default_ctx);
         Self {
-            namespace_codes: namespace_codes.clone(),
+            namespace_codes,
             context: default_ctx,
             compactor,
             reverse_terms: HashMap::new(),
@@ -207,7 +211,7 @@ impl IriCompactor {
     pub fn try_encode_iri(&self, iri: &str) -> Option<Sid> {
         // Try each namespace prefix (longest match wins)
         let mut best: Option<(u16, &str, usize)> = None;
-        for (&code, prefix) in &self.namespace_codes {
+        for (&code, prefix) in self.namespace_codes.iter() {
             if iri.starts_with(prefix.as_str()) && prefix.len() > best.map_or(0, |b| b.2) {
                 let local = &iri[prefix.len()..];
                 best = Some((code, local, prefix.len()));
@@ -457,7 +461,7 @@ mod tests {
 
     #[test]
     fn test_decode_sid() {
-        let compactor = IriCompactor::from_namespaces(&make_test_namespaces());
+        let compactor = IriCompactor::from_namespaces(Arc::new(make_test_namespaces()));
 
         let sid = Sid::new(2, "string");
         assert_eq!(
@@ -481,7 +485,7 @@ mod tests {
 
     #[test]
     fn test_compact_iri_with_context() {
-        let compactor = IriCompactor::new(&make_test_namespaces(), &make_test_context());
+        let compactor = IriCompactor::new(Arc::new(make_test_namespaces()), &make_test_context());
 
         // Prefix matches via @context
         assert_eq!(compactor.compact_vocab_iri(xsd::STRING), "xsd:string");
@@ -501,7 +505,7 @@ mod tests {
 
     #[test]
     fn test_compact_iri_no_match() {
-        let compactor = IriCompactor::new(&make_test_namespaces(), &make_test_context());
+        let compactor = IriCompactor::new(Arc::new(make_test_namespaces()), &make_test_context());
 
         // No matching prefix - returns full IRI
         assert_eq!(
@@ -512,7 +516,7 @@ mod tests {
 
     #[test]
     fn test_compact_sid() {
-        let compactor = IriCompactor::new(&make_test_namespaces(), &make_test_context());
+        let compactor = IriCompactor::new(Arc::new(make_test_namespaces()), &make_test_context());
 
         // Known namespace with @context prefix
         let sid = Sid::new(2, "string");
@@ -524,7 +528,7 @@ mod tests {
 
     #[test]
     fn test_compact_without_context() {
-        let compactor = IriCompactor::from_namespaces(&make_test_namespaces());
+        let compactor = IriCompactor::from_namespaces(Arc::new(make_test_namespaces()));
 
         // No @context and no fallback — IRIs come through uncompacted
         let sid = Sid::new(2, "string");
@@ -550,7 +554,7 @@ mod tests {
         )
         .unwrap();
 
-        let compactor = IriCompactor::new(&namespaces, &context);
+        let compactor = IriCompactor::new(Arc::new(namespaces), &context);
 
         // Context prefix works via standard method
         assert_eq!(
@@ -584,7 +588,7 @@ mod tests {
 
         // Need a non-empty context to trigger fallback generation
         let context = ParsedContext::parse(None, &json!({"ex": "http://example.org/"})).unwrap();
-        let compactor = IriCompactor::new(&namespaces, &context);
+        let compactor = IriCompactor::new(Arc::new(namespaces), &context);
 
         // Both derive "foo", but one should get "foo" and the other "foo2"
         let a = compactor.compact_for_display("http://a.org/foo/bar");
@@ -614,7 +618,7 @@ mod tests {
             }),
         )
         .unwrap();
-        let compactor = IriCompactor::new(&namespaces, &context);
+        let compactor = IriCompactor::new(Arc::new(namespaces), &context);
 
         // SID under @vocab: the @id path must NOT collapse it to the bare term.
         let summer = Sid::new(100, "summer"); // http://example.org/lists/summer
@@ -666,7 +670,7 @@ mod tests {
             }),
         )
         .unwrap();
-        let compactor = IriCompactor::new(&namespaces, &context);
+        let compactor = IriCompactor::new(Arc::new(namespaces), &context);
 
         let under_base = Sid::new(100, "alice"); // https://flur.ee/base/alice
         let under_vocab = Sid::new(101, "bob"); //  https://flur.ee/vocab/bob
