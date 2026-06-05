@@ -133,6 +133,11 @@ impl IriCompactor {
     /// allocation. Returns `Ok(None)` for the EMPTY / OVERFLOW namespaces, where
     /// `sid.name` is itself the verbatim IRI (and may be a `_:` blank-node
     /// label). Errors on an unregistered namespace code, exactly as `decode_sid`.
+    ///
+    /// Blank-node caveat: the `BLANK_NODE` namespace is registered with the
+    /// `"_:"` prefix, so a blank node returns `Some("_:")` — NOT `None`. A
+    /// consumer that frames `Some(prefix)` as a `<uri>` / `@id` must special-case
+    /// the `"_:"` prefix (or `sid.namespace_code == namespaces::BLANK_NODE`).
     pub fn namespace_prefix(&self, sid: &Sid) -> Result<Option<&str>> {
         if sid.namespace_code == namespaces::EMPTY || sid.namespace_code == namespaces::OVERFLOW {
             return Ok(None);
