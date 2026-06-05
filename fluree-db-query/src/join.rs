@@ -5,7 +5,7 @@
 //! vars between left and right must match exactly.
 
 use crate::binary_scan::EmitMask;
-use crate::binding::{Batch, Binding};
+use crate::binding::{Batch, Binding, RowAccess};
 use crate::context::ExecutionContext;
 use crate::dataset::ActiveGraphs;
 use crate::error::{QueryError, Result};
@@ -32,7 +32,7 @@ const BATCHED_EXISTS_DEBUG_MIN_ACCUM: usize = 8;
 const BATCHED_EXISTS_DEBUG_MIN_MS: u64 = 10;
 
 /// Prepared per-leaf inputs shared by every batched-probe path
-/// (`scan_leaves_into_scatter`, `flush_batched_object_accumulator_binary`,
+/// (`scan_matches`, `flush_batched_object_accumulator_binary`,
 /// `batched_subject_probe_binary`, `batched_subject_star_spot`). Owns the
 /// leaf blob, decoded header/dir, the leaf-id hash, and the optional
 /// sidecar bytes — the leaflet loop body destructures this and proceeds
@@ -46,6 +46,62 @@ struct LeafScan {
     /// leaflet alone is authoritative); always fetched when `need_replay`
     /// is true so `replay_leaflet_at_t` can reconstruct historical state.
     sidecar_bytes: Option<Vec<u8>>,
+}
+
+/// Read-only view of a single joined row — a stored left-batch row plus the
+/// right-scan tail bindings — addressed through `combined_schema`. Lets the
+/// batched-join fast path evaluate inline FILTERs without materializing a
+/// `combined: Vec<Binding>` per match.
+///
+/// Column layout matches `combined_schema = left_schema ++ right_new_vars`:
+/// positions `< left_len` resolve against the left batch (whose schema is
+/// exactly `left_schema`, so a combined position is also the left column index);
+/// positions `>= left_len` index into the right tail.
+struct CombinedRowView<'a> {
+    left_batch: &'a Batch,
+    left_row: usize,
+    left_len: usize,
+    right: &'a [Binding],
+    schema: &'a [VarId],
+}
+
+impl RowAccess for CombinedRowView<'_> {
+    fn get(&self, var: VarId) -> Option<&Binding> {
+        let pos = self.schema.iter().position(|&v| v == var)?;
+        if pos < self.left_len {
+            Some(self.left_batch.get_by_col(self.left_row, pos))
+        } else {
+            self.right.get(pos - self.left_len)
+        }
+    }
+}
+
+/// Apply inline FILTER operators against a joined row view.
+///
+/// Only valid when `ops` contains no `Bind` — the batched-join fast path is
+/// gated on that, since a Bind would need to append/clobber a column on a
+/// materialized row.
+fn apply_inline_filters_view<R: RowAccess>(
+    ops: &[InlineOperator],
+    row: &R,
+    ctx: &ExecutionContext<'_>,
+) -> Result<bool> {
+    for op in ops {
+        match op {
+            InlineOperator::Filter(expr) => {
+                if !expr.eval_to_bool_non_strict(row, Some(ctx))? {
+                    return Ok(false);
+                }
+            }
+            InlineOperator::Bind { .. } => {
+                return Err(QueryError::Internal(
+                    "apply_inline_filters_view: Bind not supported on the batched-join fast path"
+                        .into(),
+                ));
+            }
+        }
+    }
+    Ok(true)
 }
 
 fn prepare_leaf_for_scan(
@@ -1561,13 +1617,16 @@ impl NestedLoopJoinOperator {
         branch.find_leaves_in_range(&min_key, &max_key, cmp)
     }
 
-    /// Phase 4: Scan PSOT leaves, matching accumulated subjects and scattering results.
+    /// Phase 4: Scan PSOT leaves, matching accumulated subjects and invoking
+    /// `on_match` per matched (left-row group, object) pair.
     ///
     /// Uses V3 column-based leaf loading via `get_leaf_bytes_sync` + `load_leaflet_columns_cached`,
-    /// binary-searches for matching subjects within each leaflet's p_id segment, builds
-    /// late-materialized bindings, and scatters them to accumulator positions.
+    /// binary-searches for matching subjects within each leaflet's p_id segment, and builds the
+    /// late-materialized object binding. The decoded object plus the accumulator indices that
+    /// share the matched subject are handed to `on_match`, which owns the scatter representation
+    /// (full combined rows for the Bind path, right-only tails for the fast path).
     #[allow(clippy::too_many_arguments)]
-    fn scan_leaves_into_scatter(
+    fn scan_matches(
         &self,
         ctx: &ExecutionContext<'_>,
         store: &BinaryIndexStore,
@@ -1576,8 +1635,8 @@ impl NestedLoopJoinOperator {
         p_id: u32,
         unique_s_ids: &[u64],
         s_id_to_accum: &FxHashMap<u64, Vec<usize>>,
-        scatter: &mut [Vec<Vec<Binding>>],
         dict_overlay: &Option<crate::dict_overlay::DictOverlay>,
+        on_match: &mut dyn FnMut(&[usize], &Binding) -> Result<()>,
     ) -> Result<()> {
         use fluree_db_binary_index::read::column_loader::load_leaflet_columns_cached;
         use fluree_db_core::o_type::OType;
@@ -1882,34 +1941,7 @@ impl NestedLoopJoinOperator {
                     };
 
                     if let Some(accum_indices) = s_id_to_accum.get(&s_id) {
-                        for &accum_idx in accum_indices {
-                            let (batch_idx, row_idx, _) = &self.batched_accumulator[accum_idx];
-                            let left_batch = &self.stored_left_batches[*batch_idx];
-                            let mut right_bindings = Vec::with_capacity(self.right_new_vars.len());
-                            for _ in &self.right_new_vars {
-                                right_bindings.push(obj_binding.clone());
-                            }
-                            if !self.apply_right_scan_inline_ops(ctx, &mut right_bindings)? {
-                                continue;
-                            }
-
-                            let mut combined = Vec::with_capacity(self.combined_schema.len());
-                            for col in 0..self.left_schema.len() {
-                                combined.push(left_batch.get_by_col(*row_idx, col).clone());
-                            }
-                            combined.extend(right_bindings);
-
-                            if !apply_inline(
-                                &self.inline_ops,
-                                &self.combined_schema,
-                                &mut combined,
-                                Some(ctx),
-                            )? {
-                                continue;
-                            }
-
-                            scatter[accum_idx].push(combined);
-                        }
+                        on_match(accum_indices, &obj_binding)?;
                     }
                 }
             }
@@ -1995,6 +2027,77 @@ impl NestedLoopJoinOperator {
         Ok(())
     }
 
+    /// Whether any inline operator is a `Bind` (which appends or clobbers a
+    /// column and therefore requires a materialized combined row).
+    fn inline_has_bind(&self) -> bool {
+        self.inline_ops
+            .iter()
+            .any(|op| matches!(op, InlineOperator::Bind { .. }))
+    }
+
+    /// Phase 5 (fast path): assemble a right-only flat scatter into output
+    /// batches in left-row order.
+    ///
+    /// `scatter[accum_idx]` holds the right-side tails of every match for that
+    /// accumulator slot, concatenated (each tail is `right_width` bindings). The
+    /// left columns are reconstructed from the stored left batch via the
+    /// accumulator's `(batch_idx, row_idx)` and written directly into the output
+    /// columns — no per-match `combined` Vec and no transpose. Only used when
+    /// `right_width >= 1`, so `combined_schema` is never empty here.
+    fn emit_right_scatter_to_output(
+        &mut self,
+        scatter: Vec<Vec<Binding>>,
+        right_width: usize,
+        batch_size: usize,
+    ) -> Result<()> {
+        let num_cols = self.combined_schema.len();
+        let left_len = self.left_schema.len();
+        let mut output_columns: Vec<Vec<Binding>> = (0..num_cols)
+            .map(|_| Vec::with_capacity(batch_size))
+            .collect();
+        let mut rows_added = 0usize;
+
+        for (accum_idx, tails) in scatter.into_iter().enumerate() {
+            if tails.is_empty() {
+                continue;
+            }
+            let (batch_idx, row_idx, _) = self.batched_accumulator[accum_idx];
+            let n_matches = tails.len() / right_width;
+            let mut tail_iter = tails.into_iter();
+            for _ in 0..n_matches {
+                for (col, out_col) in output_columns.iter_mut().enumerate().take(left_len) {
+                    out_col.push(
+                        self.stored_left_batches[batch_idx]
+                            .get_by_col(row_idx, col)
+                            .clone(),
+                    );
+                }
+                for off in 0..right_width {
+                    // `tails.len()` is a multiple of `right_width` by construction.
+                    output_columns[left_len + off].push(tail_iter.next().unwrap());
+                }
+                rows_added += 1;
+
+                if rows_added >= batch_size {
+                    let batch = Batch::new(self.combined_schema.clone(), output_columns)?;
+                    self.batched_output.push_back(batch);
+                    output_columns = (0..num_cols)
+                        .map(|_| Vec::with_capacity(batch_size))
+                        .collect();
+                    rows_added = 0;
+                }
+            }
+        }
+
+        if rows_added > 0 {
+            let batch = Batch::new(self.combined_schema.clone(), output_columns)?;
+            self.batched_output.push_back(batch);
+        }
+
+        self.clear_batched_state();
+        Ok(())
+    }
+
     /// Binary-index batched scan orchestrator.
     ///
     /// Implements a true batched scan over PSOT leaf files:
@@ -2045,22 +2148,114 @@ impl NestedLoopJoinOperator {
             *unique_s_ids.last().unwrap(),
         );
 
-        // Phase 4: Scan leaves → scatter buffer
-        let mut scatter: Vec<Vec<Vec<Binding>>> = vec![Vec::new(); self.batched_accumulator.len()];
-        self.scan_leaves_into_scatter(
-            ctx,
-            &store,
-            branch,
-            leaf_range,
-            p_id,
-            &unique_s_ids,
-            &s_id_to_accum,
-            &mut scatter,
-            &dict_overlay,
-        )?;
+        // Phase 4+5: Scan leaves, scatter matches by accumulator position, emit
+        // output batches in left-row order. Two scatter representations:
+        //
+        //  * Fast path (`right_width >= 1` and no `Bind` inline ops): a right-only
+        //    flat scatter (`Vec<Vec<Binding>>`, the right-side tails concatenated
+        //    per accumulator slot). Inline FILTERs run against a `CombinedRowView`
+        //    over the stored left row + right tail — no per-match `combined` Vec.
+        //    `emit_right_scatter_to_output` writes left columns (cloned once) and
+        //    right tails directly into the output columns.
+        //  * Bind/general path: full combined rows scattered into
+        //    `Vec<Vec<Vec<Binding>>>`, then transposed by `emit_scatter_to_output`.
+        //    Binds may append or clobber columns, so the row must be materialized.
+        let right_width = self.combined_schema.len() - self.left_schema.len();
+        if right_width >= 1 && !self.inline_has_bind() {
+            let left_len = self.left_schema.len();
+            let combined_schema = self.combined_schema.clone();
+            let mut scatter: Vec<Vec<Binding>> = vec![Vec::new(); self.batched_accumulator.len()];
+            {
+                let mut on_match = |accum_indices: &[usize], obj: &Binding| -> Result<()> {
+                    // Right-side tail (object + any right-scan inline outputs) is
+                    // independent of the left row, so build it once per match.
+                    let mut right_bindings = Vec::with_capacity(self.right_new_vars.len());
+                    for _ in 0..self.right_new_vars.len() {
+                        right_bindings.push(obj.clone());
+                    }
+                    if !self.apply_right_scan_inline_ops(ctx, &mut right_bindings)? {
+                        return Ok(());
+                    }
+                    for &accum_idx in accum_indices {
+                        let (batch_idx, row_idx, _) = self.batched_accumulator[accum_idx];
+                        if !self.inline_ops.is_empty() {
+                            let view = CombinedRowView {
+                                left_batch: &self.stored_left_batches[batch_idx],
+                                left_row: row_idx,
+                                left_len,
+                                right: &right_bindings,
+                                schema: &combined_schema,
+                            };
+                            if !apply_inline_filters_view(&self.inline_ops, &view, ctx)? {
+                                continue;
+                            }
+                        }
+                        scatter[accum_idx].extend(right_bindings.iter().cloned());
+                    }
+                    Ok(())
+                };
+                self.scan_matches(
+                    ctx,
+                    &store,
+                    branch,
+                    leaf_range,
+                    p_id,
+                    &unique_s_ids,
+                    &s_id_to_accum,
+                    &dict_overlay,
+                    &mut on_match,
+                )?;
+            }
+            self.emit_right_scatter_to_output(scatter, right_width, ctx.batch_size)?;
+        } else {
+            let mut scatter: Vec<Vec<Vec<Binding>>> =
+                vec![Vec::new(); self.batched_accumulator.len()];
+            {
+                let mut on_match = |accum_indices: &[usize], obj: &Binding| -> Result<()> {
+                    for &accum_idx in accum_indices {
+                        let (batch_idx, row_idx, _) = &self.batched_accumulator[accum_idx];
+                        let left_batch = &self.stored_left_batches[*batch_idx];
+                        let mut right_bindings = Vec::with_capacity(self.right_new_vars.len());
+                        for _ in &self.right_new_vars {
+                            right_bindings.push(obj.clone());
+                        }
+                        if !self.apply_right_scan_inline_ops(ctx, &mut right_bindings)? {
+                            continue;
+                        }
 
-        // Phase 5: Emit output batches
-        self.emit_scatter_to_output(scatter, ctx.batch_size)?;
+                        let mut combined = Vec::with_capacity(self.combined_schema.len());
+                        for col in 0..self.left_schema.len() {
+                            combined.push(left_batch.get_by_col(*row_idx, col).clone());
+                        }
+                        combined.extend(right_bindings);
+
+                        if !apply_inline(
+                            &self.inline_ops,
+                            &self.combined_schema,
+                            &mut combined,
+                            Some(ctx),
+                        )? {
+                            continue;
+                        }
+
+                        scatter[accum_idx].push(combined);
+                    }
+                    Ok(())
+                };
+                self.scan_matches(
+                    ctx,
+                    &store,
+                    branch,
+                    leaf_range,
+                    p_id,
+                    &unique_s_ids,
+                    &s_id_to_accum,
+                    &dict_overlay,
+                    &mut on_match,
+                )?;
+            }
+            self.emit_scatter_to_output(scatter, ctx.batch_size)?;
+        }
 
         tracing::debug!(
             total_ms = (overall_start.elapsed().as_secs_f64() * 1000.0) as u64,
