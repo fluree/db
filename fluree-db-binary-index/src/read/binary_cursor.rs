@@ -27,84 +27,6 @@ use super::replay::{batch_has_rows_above_t, replay_leaflet};
 use crate::format::column_block::ColumnId;
 
 // ============================================================================
-// Scan loop diagnostics
-// ============================================================================
-
-/// Process-cumulative counters for the per-leaflet scan loop ([`BinaryCursor::next_batch`]).
-///
-/// `next_batch`'s flamegraph self-time dominates Explore but has no informative
-/// child frames, so inference can't say whether it's leaflet **breadth**
-/// (visited ≫ returned), row **volume** (rows/returned), **filtering**, or
-/// per-call **overhead** (returned/calls). These ratios disambiguate it directly.
-/// Relaxed atomics; logged on a doubling `visited` schedule so it surfaces a
-/// handful of times per run without spamming.
-pub mod scan_stats {
-    use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
-
-    pub static CALLS: AtomicU64 = AtomicU64::new(0);
-    pub static VISITED: AtomicU64 = AtomicU64::new(0);
-    pub static SKIPPED: AtomicU64 = AtomicU64::new(0);
-    pub static EMPTY: AtomicU64 = AtomicU64::new(0);
-    pub static RETURNED: AtomicU64 = AtomicU64::new(0);
-    pub static ROWS: AtomicU64 = AtomicU64::new(0);
-    pub static FILTERED: AtomicU64 = AtomicU64::new(0);
-    static NEXT_LOG_AT: AtomicU64 = AtomicU64::new(1 << 18);
-
-    /// Reset all counters (e.g. before measuring a specific workload).
-    pub fn reset() {
-        for c in [
-            &CALLS, &VISITED, &SKIPPED, &EMPTY, &RETURNED, &ROWS, &FILTERED,
-        ] {
-            c.store(0, Relaxed);
-        }
-        NEXT_LOG_AT.store(1 << 18, Relaxed);
-    }
-
-    /// `(calls, visited, returned, rows, skipped, empty, filtered)`.
-    pub fn snapshot() -> (u64, u64, u64, u64, u64, u64, u64) {
-        (
-            CALLS.load(Relaxed),
-            VISITED.load(Relaxed),
-            RETURNED.load(Relaxed),
-            ROWS.load(Relaxed),
-            SKIPPED.load(Relaxed),
-            EMPTY.load(Relaxed),
-            FILTERED.load(Relaxed),
-        )
-    }
-
-    /// Log the ratios once `visited` crosses the next doubling threshold.
-    #[inline]
-    pub(super) fn maybe_log() {
-        let visited = VISITED.load(Relaxed);
-        let at = NEXT_LOG_AT.load(Relaxed);
-        if visited < at
-            || NEXT_LOG_AT
-                .compare_exchange(at, at.saturating_mul(2), Relaxed, Relaxed)
-                .is_err()
-        {
-            return;
-        }
-        let (calls, _v, ret, rows, skip, empty, filt) = snapshot();
-        let r = |a: u64, b: u64| if b == 0 { 0.0 } else { a as f64 / b as f64 };
-        tracing::info!(
-            target: "fluree_db_binary_index::scan",
-            calls,
-            visited,
-            returned = ret,
-            rows,
-            skipped = skip,
-            empty,
-            filtered = filt,
-            visited_per_returned = r(visited, ret),
-            rows_per_returned = r(rows, ret),
-            returned_per_call = r(ret, calls),
-            "binary scan leaflet-loop stats"
-        );
-    }
-}
-
-// ============================================================================
 // BinaryCursor
 // ============================================================================
 
@@ -342,8 +264,6 @@ impl BinaryCursor {
     /// Returns `None` when all leaflets in all leaves are exhausted
     /// (and overlay-only ops have been emitted).
     pub fn next_batch(&mut self) -> io::Result<Option<ColumnBatch>> {
-        use std::sync::atomic::Ordering::Relaxed;
-        scan_stats::CALLS.fetch_add(1, Relaxed);
         loop {
             if self.exhausted {
                 return Ok(None);
@@ -355,13 +275,11 @@ impl BinaryCursor {
                 while self.current_leaflet_idx < leaf.handle.dir().entries.len() {
                     let entry = &leaf.handle.dir().entries[self.current_leaflet_idx];
                     self.current_leaflet_idx += 1;
-                    scan_stats::VISITED.fetch_add(1, Relaxed);
 
                     // Pre-skip by directory metadata (only when no overlay —
                     // overlay merge may add rows to otherwise-skippable leaflets).
                     let has_ov = self.has_overlay();
                     if !has_ov && self.filter.skip_leaflet(entry.p_const, entry.o_type_const) {
-                        scan_stats::SKIPPED.fetch_add(1, Relaxed);
                         continue;
                     }
                     // An empty-after-retract leaflet (`row_count == 0`) is preserved
@@ -373,7 +291,6 @@ impl BinaryCursor {
                         && entry.history_len > 0
                         && entry.history_max_t > to_t_u32;
                     if entry.row_count == 0 && !has_ov && !needs_history_replay {
-                        scan_stats::EMPTY.fetch_add(1, Relaxed);
                         continue;
                     }
 
@@ -390,7 +307,6 @@ impl BinaryCursor {
                             &entry.last_key,
                         )
                     {
-                        scan_stats::SKIPPED.fetch_add(1, Relaxed);
                         continue;
                     }
 
@@ -458,7 +374,6 @@ impl BinaryCursor {
                     let batch = if self.filter.is_empty() || batch.is_empty() {
                         batch
                     } else {
-                        scan_stats::FILTERED.fetch_add(1, Relaxed);
                         filter_batch(&self.filter, &batch)
                     };
 
@@ -475,7 +390,6 @@ impl BinaryCursor {
                     };
 
                     if batch.is_empty() {
-                        scan_stats::EMPTY.fetch_add(1, Relaxed);
                         continue;
                     }
 
@@ -491,9 +405,6 @@ impl BinaryCursor {
                     }
 
                     // Put the leaf back before returning.
-                    scan_stats::RETURNED.fetch_add(1, Relaxed);
-                    scan_stats::ROWS.fetch_add(batch.row_count as u64, Relaxed);
-                    scan_stats::maybe_log();
                     self.current_leaf = Some(leaf);
                     return Ok(Some(batch));
                 }

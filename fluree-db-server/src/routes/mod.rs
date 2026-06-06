@@ -140,7 +140,6 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         // Health check
         .route("/health", get(admin::health))
         // Diagnostic: binary-scan leaflet-loop counters (GET, ?reset=true to zero)
-        .route("/debug/scan-stats", get(admin::scan_stats))
         // Auth discovery (CLI auto-configuration)
         .route("/.well-known/fluree.json", get(admin::discovery))
         // Versioned API

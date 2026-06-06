@@ -55,7 +55,6 @@ fluree-db-nameservice = { path = "../fluree-db-nameservice" }
 fluree-db-nameservice-sync = { path = "../fluree-db-nameservice-sync" }
 fluree-db-peer = { path = "../fluree-db-peer" }
 fluree-db-query = { path = "../fluree-db-query" }
-fluree-db-binary-index = { path = "../fluree-db-binary-index" }
 fluree-db-sparql = { path = "../fluree-db-sparql" }
 fluree-sse = { path = "../fluree-sse" }
 fluree-vocab = { path = "../fluree-vocab" }

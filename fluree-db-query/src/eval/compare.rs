@@ -25,19 +25,6 @@ use std::cmp::Ordering;
 use super::helpers::check_min_arity;
 use super::value::{ComparableValue, ComparisonError};
 
-fn log_fastpath_hit_once(kind: &'static str) {
-    if !tracing::enabled!(tracing::Level::DEBUG) {
-        return;
-    }
-    static HIT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-    if !HIT.swap(true, std::sync::atomic::Ordering::Relaxed) {
-        tracing::debug!(
-            kind,
-            "FILTER: used encoded-id equality fast path (logged once)"
-        );
-    }
-}
-
 fn fast_eq_ne_for_iri_bindings<R: RowAccess>(
     op: CompareOp,
     args: &[Expression],
@@ -91,7 +78,6 @@ fn fast_eq_ne_for_iri_bindings<R: RowAccess>(
                             CompareOp::Ne => !eq,
                             _ => unreachable!(),
                         };
-                        log_fastpath_hit_once("EncodedSid-id");
                         return Ok(Some(out));
                     }
                 }
@@ -139,7 +125,6 @@ fn fast_eq_ne_for_iri_bindings<R: RowAccess>(
                         CompareOp::Ne => !eq,
                         _ => unreachable!(),
                     };
-                    log_fastpath_hit_once("EncodedSid-const");
                     return Ok(Some(out));
                 }
                 // `Some(None)` (constant not an indexed subject) or `None`
@@ -204,7 +189,6 @@ fn fast_eq_ne_for_iri_bindings<R: RowAccess>(
                                 CompareOp::Ne => !eq,
                                 _ => unreachable!(),
                             };
-                            log_fastpath_hit_once("EncodedSid-id");
                             return Ok(Some(out));
                         }
                     }
@@ -227,7 +211,6 @@ fn fast_eq_ne_for_iri_bindings<R: RowAccess>(
                     CompareOp::Ne => !eq,
                     _ => unreachable!(),
                 };
-                log_fastpath_hit_once("EncodedSid");
                 Ok(Some(out))
             }
             Binding::Sid { sid, .. } => {
@@ -257,7 +240,6 @@ fn fast_eq_ne_for_iri_bindings<R: RowAccess>(
                     CompareOp::Ne => !eq,
                     _ => unreachable!(),
                 };
-                log_fastpath_hit_once("Sid");
                 Ok(Some(out))
             }
             Binding::Iri(iri) | Binding::IriMatch { iri, .. } => {
@@ -276,7 +258,6 @@ fn fast_eq_ne_for_iri_bindings<R: RowAccess>(
                     CompareOp::Ne => !eq,
                     _ => unreachable!(),
                 };
-                log_fastpath_hit_once("Iri");
                 Ok(Some(out))
             }
             Binding::EncodedPid { p_id } => {
@@ -292,7 +273,6 @@ fn fast_eq_ne_for_iri_bindings<R: RowAccess>(
                     CompareOp::Ne => !eq,
                     _ => unreachable!(),
                 };
-                log_fastpath_hit_once("EncodedPid");
                 Ok(Some(out))
             }
             _ => Ok(None),
