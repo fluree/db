@@ -59,6 +59,25 @@ pub struct BranchUpdateResult {
     pub branch_cid: ContentId,
 }
 
+/// Branch-assembly metadata from a streaming update — everything the caller
+/// needs for root/branch assembly *except* the leaf/sidecar byte buffers,
+/// which are handed off to the sink as they are produced (see
+/// [`update_branch_streaming`]) so they never accumulate in RAM.
+pub struct BranchUpdateMeta {
+    /// Updated leaf entries for the new branch manifest.
+    pub leaf_entries: Vec<LeafEntry>,
+    /// CIDs of replaced leaves (for GC).
+    pub replaced_leaf_cids: Vec<ContentId>,
+    /// CIDs of replaced sidecars (for GC).
+    pub replaced_sidecar_cids: Vec<ContentId>,
+    /// Encoded FBR3 branch manifest bytes.
+    pub branch_bytes: Vec<u8>,
+    /// CID of the new branch manifest.
+    pub branch_cid: ContentId,
+    /// Number of new leaf blobs emitted to the sink.
+    pub new_leaf_count: usize,
+}
+
 // ============================================================================
 // Main entry point
 // ============================================================================
@@ -82,6 +101,55 @@ where
     F: Fn(&ContentId) -> io::Result<Vec<u8>>,
     G: Fn(&ContentId) -> io::Result<Option<Vec<u8>>>,
 {
+    // Non-streaming convenience wrapper: collect the emitted blobs into a Vec.
+    // The byte-for-byte output is identical to the streaming core, so CIDs and
+    // branch assembly are unchanged. Used by direct callers/tests that want the
+    // whole result in memory; the production pipeline uses the streaming core.
+    let mut new_blobs: Vec<NewLeafBlob> = Vec::new();
+    let meta = update_branch_streaming(
+        existing_branch_bytes,
+        novelty,
+        novelty_ops,
+        config,
+        fetch_leaf,
+        fetch_sidecar,
+        &mut |blob| {
+            new_blobs.push(blob);
+            Ok(())
+        },
+    )?;
+    Ok(BranchUpdateResult {
+        leaf_entries: meta.leaf_entries,
+        new_leaf_blobs: new_blobs,
+        replaced_leaf_cids: meta.replaced_leaf_cids,
+        replaced_sidecar_cids: meta.replaced_sidecar_cids,
+        branch_bytes: meta.branch_bytes,
+        branch_cid: meta.branch_cid,
+    })
+}
+
+/// Streaming variant of [`update_branch`]: each produced [`NewLeafBlob`] is
+/// handed to `sink` as soon as its branch-entry metadata has been read, so the
+/// leaf/sidecar byte buffers never accumulate. Returns only the small
+/// branch-assembly metadata ([`BranchUpdateMeta`]).
+///
+/// The leaf *encoding* is identical to [`update_branch`] — only when bytes are
+/// released differs — so the resulting branch/root CIDs are bit-identical.
+#[allow(clippy::too_many_arguments)]
+pub fn update_branch_streaming<F, G, S>(
+    existing_branch_bytes: &[u8],
+    novelty: &[RunRecordV2],
+    novelty_ops: &[u8],
+    config: &BranchUpdateConfig,
+    fetch_leaf: &F,
+    fetch_sidecar: &G,
+    sink: &mut S,
+) -> io::Result<BranchUpdateMeta>
+where
+    F: Fn(&ContentId) -> io::Result<Vec<u8>>,
+    G: Fn(&ContentId) -> io::Result<Option<Vec<u8>>>,
+    S: FnMut(NewLeafBlob) -> io::Result<()>,
+{
     let order = config.order;
     let g_id = config.g_id;
 
@@ -100,9 +168,9 @@ where
     let novelty_slices = slice_novelty_to_leaves(novelty, novelty_ops, &manifest, cmp);
 
     let mut leaf_entries: Vec<LeafEntry> = Vec::with_capacity(manifest.leaves.len() + 4);
-    let mut new_blobs: Vec<NewLeafBlob> = Vec::new();
     let mut replaced_leaf_cids: Vec<ContentId> = Vec::new();
     let mut replaced_sidecar_cids: Vec<ContentId> = Vec::new();
+    let mut new_leaf_count = 0usize;
 
     for (i, (nov_slice, ops_slice)) in novelty_slices.iter().enumerate() {
         let existing = &manifest.leaves[i];
@@ -151,7 +219,8 @@ where
             replaced_sidecar_cids.push(sc_cid.clone());
         }
 
-        // Add new leaf entries.
+        // Add new leaf entries, then hand each blob off to the sink so its
+        // bytes can be uploaded + freed without accumulating.
         for new_leaf in output.leaves {
             // Read the actual first/last keys from the new leaf header.
             let header = decode_leaf_header_v3(&new_leaf.info.leaf_bytes)?;
@@ -166,7 +235,8 @@ where
                 sidecar_cid: new_leaf.info.sidecar_cid.clone(),
             });
 
-            new_blobs.push(new_leaf);
+            new_leaf_count += 1;
+            sink(new_leaf)?;
         }
     }
 
@@ -174,13 +244,13 @@ where
     let branch_bytes = build_branch_bytes(order, g_id, &leaf_entries);
     let branch_cid = compute_branch_cid(&branch_bytes);
 
-    Ok(BranchUpdateResult {
+    Ok(BranchUpdateMeta {
         leaf_entries,
-        new_leaf_blobs: new_blobs,
         replaced_leaf_cids,
         replaced_sidecar_cids,
         branch_bytes,
         branch_cid,
+        new_leaf_count,
     })
 }
 

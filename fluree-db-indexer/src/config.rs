@@ -150,6 +150,19 @@ pub struct IndexerConfig {
     /// Default: 4 (one per sort order in a single-graph workload)
     pub incremental_max_concurrency: usize,
 
+    /// Global budget of concurrent leaf/sidecar CAS uploads during incremental
+    /// Phase 2, shared across ALL (graph, order) branch-update tasks.
+    ///
+    /// Unlike [`incremental_max_concurrency`](Self::incremental_max_concurrency),
+    /// which bounds how many branch-update tasks run at once, this bounds the
+    /// total number of in-flight `put`s for new leaf/sidecar blobs across the
+    /// whole fold. A single semaphore enforces it so a skewed workload (most
+    /// leaves landing in one order-task) still parallelizes its uploads without
+    /// multiplying outer×inner concurrency.
+    ///
+    /// Default: 16.
+    pub incremental_leaf_upload_concurrency: usize,
+
     /// Target rows per leaflet (FLI3).
     ///
     /// This is primarily a build-format tuning knob. Smaller values produce
@@ -234,6 +247,10 @@ pub const DEFAULT_INCREMENTAL_MAX_COMMITS: usize = 10_000;
 /// Default max concurrency for incremental branch updates.
 pub const DEFAULT_INCREMENTAL_MAX_CONCURRENCY: usize = 4;
 
+/// Default global budget of concurrent leaf/sidecar uploads in incremental
+/// Phase 2.
+pub const DEFAULT_INCREMENTAL_LEAF_UPLOAD_CONCURRENCY: usize = 16;
+
 /// Default cap on existing-subject `rdf:type` changes per incremental batch
 /// before deferring to full rebuild (issue #1266 ref/class-stat re-attribution).
 pub const DEFAULT_INCREMENTAL_RETYPE_MAX_SUBJECTS: usize = 100_000;
@@ -252,6 +269,7 @@ impl Default for IndexerConfig {
             incremental_enabled: true,
             incremental_max_commits: DEFAULT_INCREMENTAL_MAX_COMMITS,
             incremental_max_concurrency: DEFAULT_INCREMENTAL_MAX_CONCURRENCY,
+            incremental_leaf_upload_concurrency: DEFAULT_INCREMENTAL_LEAF_UPLOAD_CONCURRENCY,
             leaflet_rows: 25_000,
             leaflets_per_leaf: 10,
             incremental_max_commit_bytes: None,
@@ -284,6 +302,7 @@ impl IndexerConfig {
             incremental_enabled: true,
             incremental_max_commits: DEFAULT_INCREMENTAL_MAX_COMMITS,
             incremental_max_concurrency: DEFAULT_INCREMENTAL_MAX_CONCURRENCY,
+            incremental_leaf_upload_concurrency: DEFAULT_INCREMENTAL_LEAF_UPLOAD_CONCURRENCY,
             leaflet_rows: 25_000,
             leaflets_per_leaf: 10,
             incremental_max_commit_bytes: None,
@@ -309,6 +328,7 @@ impl IndexerConfig {
             incremental_enabled: true,
             incremental_max_commits: DEFAULT_INCREMENTAL_MAX_COMMITS,
             incremental_max_concurrency: DEFAULT_INCREMENTAL_MAX_CONCURRENCY,
+            incremental_leaf_upload_concurrency: DEFAULT_INCREMENTAL_LEAF_UPLOAD_CONCURRENCY,
             leaflet_rows: 25_000,
             leaflets_per_leaf: 10,
             incremental_max_commit_bytes: None,
@@ -334,6 +354,7 @@ impl IndexerConfig {
             incremental_enabled: true,
             incremental_max_commits: DEFAULT_INCREMENTAL_MAX_COMMITS,
             incremental_max_concurrency: DEFAULT_INCREMENTAL_MAX_CONCURRENCY,
+            incremental_leaf_upload_concurrency: DEFAULT_INCREMENTAL_LEAF_UPLOAD_CONCURRENCY,
             leaflet_rows: 25_000,
             leaflets_per_leaf: 10,
             incremental_max_commit_bytes: None,
@@ -411,6 +432,13 @@ impl IndexerConfig {
     /// Builder method to set the maximum concurrency for incremental branch updates
     pub fn with_incremental_max_concurrency(mut self, max_concurrency: usize) -> Self {
         self.incremental_max_concurrency = max_concurrency.max(1);
+        self
+    }
+
+    /// Builder method to set the global leaf/sidecar upload concurrency budget
+    /// for incremental Phase 2.
+    pub fn with_incremental_leaf_upload_concurrency(mut self, budget: usize) -> Self {
+        self.incremental_leaf_upload_concurrency = budget.max(1);
         self
     }
 

@@ -23,6 +23,15 @@
 //! - `fold` — open `$FOLD_DB_DIR` and run ONE incremental fold, timed. Does not
 //!   publish, so re-running folds the same backlog again.
 //! - `all` — prepare into a tempdir, then fold once. Quick local sanity check.
+//! - `import` — bulk-import a real RDF file (`$FOLD_IMPORT_PATH`) into
+//!   `$FOLD_LEDGER`, building the base index. Run once before `scatter-prepare`.
+//!   Targets the s3dynamo backend (DBLP many-leaves test) but also works on file.
+//! - `scatter-prepare` — on an ALREADY-IMPORTED ledger, sample existing subject
+//!   IRIs spread across the subject-id keyspace, then apply `$FOLD_DELTA_COMMITS`
+//!   update commits that each stamp a marker triple on a partition of those
+//!   subjects. The scattered novelty forces MANY SPOT leaves to be rewritten on
+//!   the subsequent `FOLD_MODE=fold`. Auto-indexing stays disabled so the
+//!   backlog piles above the base index.
 //!
 //! ## Config (env vars)
 //! | Var | Default | Meaning |
@@ -34,6 +43,24 @@
 //! | `FOLD_DELTA_COMMITS` | `1000` | commits of novelty above the index |
 //! | `FOLD_NODES_PER_COMMIT` | `10` | nodes per delta commit |
 //! | `FOLD_REPEAT` | `1` | fold timings to take (warm after the 1st) |
+//!
+//! ### `import` mode
+//! | Var | Default | Meaning |
+//! |---|---|---|
+//! | `FOLD_IMPORT_PATH` | (required) | `.nt.gz` / `.ttl` / … file to import |
+//! | `FOLD_IMPORT_PARALLELISM` | (builder default) | parse threads |
+//! | `FOLD_IMPORT_MEM_MB` | (builder default) | memory budget MB |
+//! | `FOLD_IMPORT_CHUNK_MB` | (builder default) | chunk size MB |
+//! | `FOLD_IMPORT_LEAFLET_ROWS` | (builder default) | rows per leaflet |
+//!
+//! ### `scatter-prepare` mode
+//! | Var | Default | Meaning |
+//! |---|---|---|
+//! | `FOLD_SAMPLE_LIMIT` | `5000000` | LIMIT on the subject-scan query |
+//! | `FOLD_SCATTER_TOTAL` | `20000` | target distinct subjects to touch |
+//! | `FOLD_DELTA_COMMITS` | `1000` | update commits to spread them across |
+//! | `FOLD_SCATTER_PER_COMMIT` | total/commits | subjects per commit |
+//! | `FOLD_MARKER_PRED` | `http://example.org/fold#touched` | marker predicate IRI |
 //!
 //! Set `FLUREE_BENCH_TRACING=1 RUST_LOG=fluree_db_indexer=info` to see the
 //! `attempting incremental index` / `starting full rebuild path` log lines and
@@ -49,6 +76,23 @@
 //!   cargo run --release --example incremental_fold_profile -p fluree-db-api
 //! FOLD_DB_DIR=/mnt/ebs/folddb FOLD_MODE=fold \
 //!   cargo flamegraph --example incremental_fold_profile -p fluree-db-api
+//!
+//! # DBLP many-leaves test on S3 + DynamoDB (built with --features aws):
+//! #   1) import the base dataset (builds the base index in S3)
+//! FOLD_BACKEND=s3dynamo FOLD_LEDGER=dblp \
+//!   FOLD_S3_BUCKET=my-bucket FOLD_S3_PREFIX=fold FOLD_DYNAMO_TABLE=fold-ns AWS_REGION=us-east-1 \
+//!   FOLD_MODE=import FOLD_IMPORT_PATH=/data/dblp.nt.gz FOLD_IMPORT_PARALLELISM=9 \
+//!   cargo run --release --example incremental_fold_profile -p fluree-db-api --features aws
+//! #   2) scatter 1000 update commits across existing subjects (the fold backlog)
+//! FOLD_BACKEND=s3dynamo FOLD_LEDGER=dblp \
+//!   FOLD_S3_BUCKET=my-bucket FOLD_S3_PREFIX=fold FOLD_DYNAMO_TABLE=fold-ns AWS_REGION=us-east-1 \
+//!   FOLD_MODE=scatter-prepare FOLD_SCATTER_TOTAL=20000 FOLD_DELTA_COMMITS=1000 \
+//!   cargo run --release --example incremental_fold_profile -p fluree-db-api --features aws
+//! #   3) fold the scattered backlog (times the many-leaf rewrite)
+//! FOLD_BACKEND=s3dynamo FOLD_LEDGER=dblp \
+//!   FOLD_S3_BUCKET=my-bucket FOLD_S3_PREFIX=fold FOLD_DYNAMO_TABLE=fold-ns AWS_REGION=us-east-1 \
+//!   FOLD_MODE=fold FOLD_FETCH_CONCURRENCY=16 \
+//!   cargo run --release --example incremental_fold_profile -p fluree-db-api --features aws
 //! ```
 
 use std::sync::Arc;
@@ -78,6 +122,15 @@ fn env_usize(key: &str, default: usize) -> usize {
         .unwrap_or(default)
 }
 
+/// Parse an optional usize env var. `None` when unset/empty so the caller can
+/// leave a builder default in place rather than overriding it.
+fn env_opt_usize(key: &str) -> Option<usize> {
+    std::env::var(key)
+        .ok()
+        .filter(|v| !v.is_empty())
+        .and_then(|v| v.parse().ok())
+}
+
 async fn insert_commit(fluree: &Fluree, ledger: LedgerState, turtle: &str) -> LedgerState {
     let index_config = IndexConfig {
         reindex_min_bytes: DISABLE_AUTOINDEX_BYTES,
@@ -105,7 +158,10 @@ async fn prepare(fluree: &Fluree, ledger_id: &str, base_nodes: usize, delta: usi
         std::process::exit(1);
     }
 
-    let mut ledger = fluree.create_ledger(ledger_id).await.expect("create_ledger");
+    let mut ledger = fluree
+        .create_ledger(ledger_id)
+        .await
+        .expect("create_ledger");
 
     eprintln!("[prepare] base population: {base_nodes} nodes in one commit ...");
     let base = txn_data_to_turtle(&generate_txn_data(0, base_nodes));
@@ -141,6 +197,184 @@ async fn prepare(fluree: &Fluree, ledger_id: &str, base_nodes: usize, delta: usi
     );
 }
 
+/// `FOLD_MODE=import`: bulk-import a real RDF file, building the base index.
+///
+/// Mirrors the CLI's `run_bulk_import` (`fluree-db-cli/src/commands/create.rs`):
+/// `fluree.create(ledger).import(path)`, optional tuning setters, terminal
+/// `.execute()`. Tuning is applied only when its env var is set.
+async fn run_import(fluree: &Fluree, ledger_id: &str) {
+    if fluree.ledger_exists(ledger_id).await.unwrap_or(false) {
+        eprintln!(
+            "[import] ledger '{ledger_id}' already exists. Use a fresh FOLD_LEDGER / prefix \
+             (or drop the existing ledger) so the base index is built from scratch."
+        );
+        std::process::exit(1);
+    }
+
+    let path = env_str("FOLD_IMPORT_PATH", "");
+    if path.is_empty() {
+        eprintln!("[import] FOLD_IMPORT_PATH is required (the .nt.gz / .ttl file to import).");
+        std::process::exit(2);
+    }
+
+    let mut builder = fluree.create(ledger_id).import(&path);
+    if let Some(p) = env_opt_usize("FOLD_IMPORT_PARALLELISM") {
+        builder = builder.parallelism(p);
+    }
+    if let Some(m) = env_opt_usize("FOLD_IMPORT_MEM_MB") {
+        builder = builder.memory_budget_mb(m);
+    }
+    if let Some(c) = env_opt_usize("FOLD_IMPORT_CHUNK_MB") {
+        builder = builder.chunk_size_mb(c);
+    }
+    if let Some(r) = env_opt_usize("FOLD_IMPORT_LEAFLET_ROWS") {
+        builder = builder.leaflet_rows(r);
+    }
+
+    let settings = builder.effective_import_settings();
+    eprintln!(
+        "[import] importing {path} -> ledger '{ledger_id}' \
+         (memory={} MB, parallelism={}, chunk={} MB)",
+        settings.memory_budget_mb, settings.parallelism, settings.chunk_size_mb,
+    );
+
+    let t0 = Instant::now();
+    let result = builder.execute().await.expect("bulk import");
+    let secs = t0.elapsed().as_secs_f64();
+    eprintln!(
+        "[import] DONE in {secs:.1}s: {:.1}M flakes, commit_t={} index_t={} \
+         (base index built; ledger ready for scatter-prepare).",
+        result.flake_count as f64 / 1_000_000.0,
+        result.t,
+        result.index_t,
+    );
+}
+
+/// `FOLD_MODE=scatter-prepare`: apply scattered update commits to EXISTING
+/// subjects spread across the subject-id keyspace.
+///
+/// Step 1 samples subject IRIs in subject-id order (an unordered triple scan)
+/// and strides them for spread; step 2 partitions them across
+/// `FOLD_DELTA_COMMITS` update commits that each stamp a marker triple, with
+/// auto-indexing disabled so the novelty piles above the base index.
+async fn scatter_prepare(fluree: &Fluree, ledger_id: &str, delta_commits: usize) {
+    if !fluree.ledger_exists(ledger_id).await.unwrap_or(false) {
+        eprintln!(
+            "[scatter] ledger '{ledger_id}' does not exist. Run FOLD_MODE=import first to \
+             build the base index, then scatter-prepare."
+        );
+        std::process::exit(1);
+    }
+    if delta_commits == 0 {
+        eprintln!("[scatter] FOLD_DELTA_COMMITS must be > 0");
+        std::process::exit(2);
+    }
+
+    let sample_limit = env_usize("FOLD_SAMPLE_LIMIT", 5_000_000);
+    let scatter_total = env_usize("FOLD_SCATTER_TOTAL", 20_000);
+    let per_commit = env_opt_usize("FOLD_SCATTER_PER_COMMIT")
+        .unwrap_or_else(|| scatter_total.div_ceil(delta_commits))
+        .max(1);
+    let marker_pred = env_str("FOLD_MARKER_PRED", "http://example.org/fold#touched");
+
+    let subjects = sample_subjects(fluree, ledger_id, sample_limit, scatter_total).await;
+    if subjects.is_empty() {
+        eprintln!("[scatter] sampled 0 subjects — is the ledger populated?");
+        std::process::exit(1);
+    }
+    eprintln!(
+        "[scatter] sampled {} distinct subjects (limit={sample_limit}, target≈{scatter_total}); \
+         min={} max={}",
+        subjects.len(),
+        subjects.first().map(String::as_str).unwrap_or(""),
+        subjects.last().map(String::as_str).unwrap_or(""),
+    );
+
+    let mut ledger = fluree.ledger(ledger_id).await.expect("reload ledger");
+    let mut touched = 0usize;
+    let mut commits = 0usize;
+    for chunk in subjects.chunks(per_commit) {
+        if commits >= delta_commits {
+            break;
+        }
+        let mut turtle = String::with_capacity(chunk.len() * 96);
+        for s in chunk {
+            // Full <iri> form is parser-safe for an existing subject; the marker
+            // object carries the running sequence so re-runs assert fresh values.
+            turtle.push('<');
+            turtle.push_str(s);
+            turtle.push_str("> <");
+            turtle.push_str(&marker_pred);
+            turtle.push_str("> \"");
+            turtle.push_str(&touched.to_string());
+            turtle.push_str("\" .\n");
+            touched += 1;
+        }
+        ledger = insert_commit(fluree, ledger, &turtle).await;
+        commits += 1;
+    }
+
+    let commit_t = ledger.t();
+    let index_t = ledger.index_t();
+    eprintln!(
+        "[scatter] DONE: {commits} update commits touched {touched} subjects; \
+         index_t={index_t} commit_t={commit_t} commit_gap={}. Backlog ready to fold.",
+        commit_t - index_t,
+    );
+}
+
+/// Scan subjects in subject-id order via an unordered triple pattern, LIMIT
+/// `sample_limit`, then stride the result down to ~`target` distinct subjects
+/// spread across the scanned range.
+///
+/// Uses the SPARQL JSON path (`execute_formatted`): default format for a SPARQL
+/// query is W3C SPARQL JSON, so subject IRIs arrive as full `uri` values under
+/// `results.bindings[].s.value`.
+async fn sample_subjects(
+    fluree: &Fluree,
+    ledger_id: &str,
+    sample_limit: usize,
+    target: usize,
+) -> Vec<String> {
+    let query = format!("SELECT ?s WHERE {{ ?s ?p ?o }} LIMIT {sample_limit}");
+    let formatted = fluree
+        .graph(ledger_id)
+        .query()
+        .sparql(&query)
+        .execute_formatted()
+        .await
+        .expect("subject-scan query");
+
+    let bindings = formatted
+        .get("results")
+        .and_then(|r| r.get("bindings"))
+        .and_then(|b| b.as_array())
+        .cloned()
+        .unwrap_or_default();
+
+    // Stride so we keep ~`target` distinct subjects spread across the scan.
+    let stride = (bindings.len() / target.max(1)).max(1);
+    let mut out = Vec::with_capacity(target);
+    let mut last: Option<String> = None;
+    for (i, row) in bindings.iter().enumerate() {
+        if !i.is_multiple_of(stride) {
+            continue;
+        }
+        if let Some(iri) = row
+            .get("s")
+            .and_then(|s| s.get("value"))
+            .and_then(|v| v.as_str())
+        {
+            // Adjacent same-subject rows are common in a triple scan; skip dups.
+            if last.as_deref() != Some(iri) {
+                out.push(iri.to_string());
+                last = Some(iri.to_string());
+            }
+        }
+    }
+    out
+}
+
 async fn fold_once(fluree: &Fluree, ledger_id: &str) -> (Duration, i64) {
     let cs: Arc<dyn ContentStore> = fluree
         .branched_content_store(ledger_id)
@@ -155,6 +389,15 @@ async fn fold_once(fluree: &Fluree, ledger_id: &str) -> (Duration, i64) {
         .and_then(|v| v.parse::<usize>().ok())
     {
         config.incremental_max_concurrency = k;
+    }
+    // FOLD_LEAF_UPLOAD_CONCURRENCY overrides the global Phase 2 leaf/sidecar
+    // upload budget (default 16) shared across all order-tasks. Higher k
+    // surfaces the parallel-upload win when leaves skew into one order-task.
+    if let Some(k) = std::env::var("FOLD_LEAF_UPLOAD_CONCURRENCY")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+    {
+        config.incremental_leaf_upload_concurrency = k;
     }
     // FOLD_FORCE_SERIAL_WALK=1 measures the BASELINE: skip the commit-CID index
     // fast path and discover the chain via the serial DAG walk on the same
@@ -328,8 +571,31 @@ fn main() {
                 }
                 summarize(&durations);
             }
+            "import" => {
+                let dir = env_str("FOLD_DB_DIR", "");
+                if is_file_backend && dir.is_empty() {
+                    eprintln!("[import] FOLD_DB_DIR is required for import mode (file backend).");
+                    std::process::exit(2);
+                }
+                let fluree = build_backend(&dir).await;
+                run_import(&fluree, &ledger_id).await;
+            }
+            "scatter-prepare" => {
+                let dir = env_str("FOLD_DB_DIR", "");
+                if is_file_backend && dir.is_empty() {
+                    eprintln!(
+                        "[scatter] FOLD_DB_DIR is required for scatter-prepare mode (file backend)."
+                    );
+                    std::process::exit(2);
+                }
+                let fluree = build_backend(&dir).await;
+                scatter_prepare(&fluree, &ledger_id, delta).await;
+            }
             other => {
-                eprintln!("[error] unknown FOLD_MODE='{other}' (want prepare|fold|all)");
+                eprintln!(
+                    "[error] unknown FOLD_MODE='{other}' \
+                     (want prepare|fold|all|import|scatter-prepare)"
+                );
                 std::process::exit(2);
             }
         }

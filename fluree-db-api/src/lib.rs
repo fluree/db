@@ -2142,14 +2142,13 @@ impl FlureeBuilder {
         use fluree_db_connection::config::S3StorageConfig;
         use fluree_db_storage_aws::{DynamoDbConfig, DynamoDbNameService, S3Config, S3Storage};
 
-        let s3_cfg: &S3StorageConfig = match &self.config.index_storage.storage_type {
-            StorageType::S3(s3) => s3,
-            _ => {
-                return Err(ApiError::config(
+        let s3_cfg: &S3StorageConfig =
+            match &self.config.index_storage.storage_type {
+                StorageType::S3(s3) => s3,
+                _ => return Err(ApiError::config(
                     "build_s3_dynamo requires FlureeBuilder::s3(...) or an S3 indexStorage config",
-                ))
-            }
-        };
+                )),
+            };
 
         let timeout_ms = s3_cfg
             .read_timeout_ms

@@ -884,7 +884,9 @@ async fn fetch_commit_bytes(
             fluree_db_binary_index::read::artifact_cache::fetch_cached_bytes_cid(cs, cid, cache_dir)
                 .await
                 .map_err(|e| {
-                    IncrementalResolveError::CommitChain(format!("failed to load commit {cid}: {e}"))
+                    IncrementalResolveError::CommitChain(format!(
+                        "failed to load commit {cid}: {e}"
+                    ))
                 })
         }
         None => cs.get(cid).await.map_err(|e| {
