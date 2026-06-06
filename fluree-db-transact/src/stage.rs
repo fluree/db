@@ -66,15 +66,13 @@ use fluree_db_shacl::{ShaclCache, ShaclEngine, ValidationReport};
 /// named-graph annotations would be orphaned by mismatched-graph
 /// retracts.
 ///
-/// **Performance:** every retract flake pays one POST point lookup
-/// against the binary index. The lookup returns empty quickly when
-/// nothing matches, so per-retract cost is bounded by the binary
-/// index's empty-range cost — but it's no longer zero. The prior
-/// `has_annotations()` fast-path on the novelty overlay was
-/// incorrect post-reindex (the overlay drains when novelty rolls
-/// into base) and was removed; restoring a correct fast-path needs
-/// a "ledger has any annotations ever" flag at the `IndexRoot`
-/// level, which belongs with the binary-arena work.
+/// **Performance:** a ledger that has never observed a `f:reifies*`
+/// flake pays zero — the dual-gate fast-path below returns immediately
+/// (see the gate on `snapshot.has_annotations` + `novelty.attachments
+/// .has_annotations()`). Once a ledger does carry annotations, each
+/// retract flake pays one POST point lookup against the binary index;
+/// the lookup returns empty quickly when nothing matches, so the
+/// per-retract cost is bounded by the binary index's empty-range cost.
 ///
 /// **Cleanup scope:** retracts the `f:reifies*` bundle only.
 /// Anonymous-annotation metadata cleanup (RDF mode default) and

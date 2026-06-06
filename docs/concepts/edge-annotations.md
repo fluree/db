@@ -474,7 +474,8 @@ These produce a clear error with a span pointing at the offending construct:
 - **Multi-triple reifiers.** One reifier identifier reifying more than one triple term in the same scope is rejected. A reifier corresponds to one edge occurrence.
 - **Annotation on a property-path triple.** `?s ex:p1/ex:p2 ?o {| ... |}` is rejected — the grammar only attaches annotations to simple-predicate triples.
 - **SPARQL `CONSTRUCT` template projecting annotation metadata.** Until the Turtle-star vs RDF 1.2 reifier output decision lands, a CONSTRUCT template containing an annotation tail or `rdf:reifies` returns `UnsupportedFeature`. CONSTRUCT *without* annotation in the template still works even when the WHERE pattern uses annotations to filter.
-- **Annotation on a literal-valued object in SPARQL UPDATE.** Use the JSON-LD path for annotated literals (see *Annotating literal-valued edges* above) until the SPARQL surface picks up parity.
+
+Annotations on literal-valued objects (plain, typed, and language-tagged) are supported on **both** the JSON-LD and SPARQL UPDATE write surfaces — the SPARQL path emits `f:reifiesLang` for language-tagged objects so the stored reifier matches the base edge.
 
 ### Legacy Fluree-specific `<< s p ?o >>` syntax
 
@@ -501,6 +502,9 @@ Today's surface covers the common LPG / RDF-star use cases. The following are no
 - **Reifiers for multiple triples.** One annotation subject corresponds to one edge. Reifying several unrelated triples from a single annotation isn't allowed.
 - **Triple terms as object values.** `ex:doc ex:mentions << ex:s ex:p ex:o >>` is not yet a representable value. Use a separate annotation subject.
 - **Non-JSON-LD output.** v1 emits annotations in JSON-LD output. Turtle, TriG, N-Quads, and SPARQL CONSTRUCT need a separate surface-form decision (Turtle-star vs RDF 1.2 reifier vs other) and currently return `UnsupportedFeature` when a CONSTRUCT against those targets projects annotation metadata.
+- **SPARQL 1.2 triple-term functions and constructor.** `TRIPLE`, `SUBJECT`, `PREDICATE`, `OBJECT`, `isTRIPLE`, and the `BIND(<<( ?s ?p ?o )>> AS ?t)` triple-term constructor are deferred — they presuppose triple terms as first-class values, which v1's LPG model does not represent. The compact reifier delimiter `<< s p o ~ r >>` is also deferred (it collides with the legacy `f:t`/`f:op` extraction form above); use the supported `s p o ~ r {| ... |}` annotation tail instead.
+
+The mandated SPARQL 1.2 `VERSION "1.2"` prologue declaration is **accepted** (lex-and-skipped): the RDF 1.2 surface runs ungated, so a conformant 1.2 client that emits the declaration parses normally.
 
 ## Storage and indexing — the short version
 

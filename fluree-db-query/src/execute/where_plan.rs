@@ -78,6 +78,37 @@ pub fn expand_edge_annotation_patterns(patterns: &[Pattern]) -> Vec<Pattern> {
     out
 }
 
+/// Cheap, allocation-free check for any `Pattern::EdgeAnnotation` /
+/// `Pattern::AnnotationTarget` anywhere in the tree. Lets the WHERE
+/// planner skip the `expand_edge_annotation_patterns` clone+rebuild on
+/// the common non-RDF-1.2 path. Exhaustive over `Pattern` so a new
+/// container variant forces a decision here rather than silently hiding
+/// an annotation from expansion.
+pub(crate) fn pattern_tree_has_edge_annotation(patterns: &[Pattern]) -> bool {
+    patterns.iter().any(|p| match p {
+        Pattern::EdgeAnnotation { .. } | Pattern::AnnotationTarget { .. } => true,
+        Pattern::Optional(inner)
+        | Pattern::Minus(inner)
+        | Pattern::Exists(inner)
+        | Pattern::NotExists(inner) => pattern_tree_has_edge_annotation(inner),
+        Pattern::Union(branches) => branches.iter().any(|b| pattern_tree_has_edge_annotation(b)),
+        Pattern::Graph { patterns, .. } => pattern_tree_has_edge_annotation(patterns),
+        Pattern::Service(sp) => pattern_tree_has_edge_annotation(&sp.patterns),
+        Pattern::Subquery(sq) => pattern_tree_has_edge_annotation(&sq.patterns),
+        Pattern::DefaultGraphSource { patterns } => pattern_tree_has_edge_annotation(patterns),
+        Pattern::Triple(_)
+        | Pattern::PropertyPath(_)
+        | Pattern::Filter(_)
+        | Pattern::Bind { .. }
+        | Pattern::Values { .. }
+        | Pattern::IndexSearch(_)
+        | Pattern::VectorSearch(_)
+        | Pattern::R2rml(_)
+        | Pattern::GeoSearch(_)
+        | Pattern::S2Search(_) => false,
+    })
+}
+
 fn expand_one_into(pattern: Pattern, out: &mut Vec<Pattern>, inside_graph: bool) {
     match pattern {
         Pattern::EdgeAnnotation {
@@ -132,18 +163,11 @@ fn expand_one_into(pattern: Pattern, out: &mut Vec<Pattern>, inside_graph: bool)
             // both flakes carry `dt=rdf:langString,
             // m.lang=Some(<tag>)`), so the LangTag dtc filter in
             // `binary_scan` should pick exactly one annotation per
-            // language.
-            //
-            // **Known executor gap.** Despite the IR shape being
-            // correct, the integration repro (`#[ignore]`d) still
-            // returns both annotations. The bug is somewhere
-            // downstream of the IR — candidates: the OPST exact-
-            // match path skipping the lang-tag filter applied in the
-            // range fallback (`binary_scan.rs:753-763`), or the
-            // planner selecting a scan path that doesn't honor
-            // `dtc`. No additional IR-level constraint is needed; what
-            // is needed is to make the executor honor what's already
-            // here.
+            // language. This per-language disambiguation is exercised
+            // and green via `it_edge_annotations::
+            // cross_language_annotation_does_not_cross_match` (the
+            // executor honors the `dtc` LangTag filter; the earlier
+            // `#[ignore]`d gap was fixed in commit c3117574e).
             chain.push(Pattern::Triple(TriplePattern {
                 s: ann_ref,
                 p: reifies_object_ref(),
@@ -1591,7 +1615,17 @@ pub fn build_where_operators_seeded_with_needed(
     // visibility check for free: the base edge must be currently
     // asserted under the snapshot's normal policy/visibility rules,
     // or no row survives the join.
-    let expanded_storage = expand_edge_annotation_patterns(patterns);
+    // Skip the clone+rebuild entirely when the block has no edge-annotation
+    // patterns (the overwhelmingly common, non-RDF-1.2 case): borrow the
+    // original slice instead of allocating an expanded copy. The presence
+    // check is allocation-free and exhaustive, so behavior is identical
+    // whenever annotations are actually present.
+    let expanded_storage: std::borrow::Cow<'_, [Pattern]> =
+        if pattern_tree_has_edge_annotation(patterns) {
+            std::borrow::Cow::Owned(expand_edge_annotation_patterns(patterns))
+        } else {
+            std::borrow::Cow::Borrowed(patterns)
+        };
     let patterns: &[Pattern] = &expanded_storage;
 
     // Apply generalized pattern reordering upfront for all pattern lists.
