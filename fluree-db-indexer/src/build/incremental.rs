@@ -3248,7 +3248,11 @@ pub async fn incremental_index(
                     job_t
                 );
             }
-            root_builder.set_annotation_index(result.new_index, result.replaced_leaf_cids);
+            root_builder.set_annotation_index(
+                result.new_index,
+                result.replaced_leaf_cids,
+                result.new_leaf_cids,
+            );
         }
         Some(AttachmentEventCoverage::Augment(mut events)) => {
             events.retain(|(_, _, t, _)| *t <= job_t);
@@ -3280,7 +3284,7 @@ pub async fn incremental_index(
                      3h's resolver-side collection) will seal an \
                      authoritative arena."
                 );
-                root_builder.set_annotation_index(None, Vec::new());
+                root_builder.set_annotation_index(None, Vec::new(), Vec::new());
             } else {
                 let prev_events: Vec<_> = if let Some(prev) = prev_arena {
                     let reader =
@@ -3319,7 +3323,11 @@ pub async fn incremental_index(
                         job_t
                     );
                 }
-                root_builder.set_annotation_index(result.new_index, result.replaced_leaf_cids);
+                root_builder.set_annotation_index(
+                    result.new_index,
+                    result.replaced_leaf_cids,
+                    result.new_leaf_cids,
+                );
             }
         }
         Some(AttachmentEventCoverage::Unknown) | None => {
@@ -3343,7 +3351,7 @@ pub async fn incremental_index(
                      state. Hydration falls back to scan path until the next \
                      reindex pass supplies events."
                 );
-                root_builder.set_annotation_index(None, prev_leaf_cids);
+                root_builder.set_annotation_index(None, prev_leaf_cids, Vec::new());
             }
             // Else: non-annotation ledger fast path, or already in
             // scan-fallback state. Nothing to do.

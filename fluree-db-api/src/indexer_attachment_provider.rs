@@ -211,11 +211,6 @@ async fn scan_base_index_for_attachment_events(
         "scan_base_index_for_attachment_events"
     );
 
-    let f_reifies_subject = Sid::new(
-        fluree_vocab::namespaces::FLUREE_DB,
-        fluree_vocab::db::REIFIES_SUBJECT,
-    );
-
     // Annotation flakes may live in the default graph (g_id=0) or
     // any named graph. Always include g_id=0 — `GraphRegistry::iter_entries`
     // explicitly skips the default graph slot — and add every named
@@ -231,7 +226,7 @@ async fn scan_base_index_for_attachment_events(
     let to_t = view.t.max(view.snapshot.t);
 
     let mut events: Vec<(EdgeKey, Sid, i64, bool)> = Vec::new();
-    let mut seen: HashSet<(fluree_db_core::GraphId, Sid)> = HashSet::new();
+    let mut seen: HashSet<(fluree_db_core::GraphId, Sid, i64)> = HashSet::new();
 
     for g_id in graph_ids {
         // Collect every `f:reifies*` flake in this graph by walking
@@ -239,7 +234,12 @@ async fn scan_base_index_for_attachment_events(
         // memory by annotation SID, which sidesteps a SPOT-scan
         // quirk where a constant blank-node subject (namespace_code
         // = 0) doesn't return rows reliably across all backends.
-        let mut by_ann: BTreeMap<Sid, Vec<fluree_db_core::Flake>> = BTreeMap::new();
+        // Key by (annotation SID, t) so each transaction's bundle stays
+        // separate — an annotation asserted across multiple commits
+        // (distinct t per chunk on the multi-commit bulk-import path)
+        // must decode as one bundle per t, not a merged slice that
+        // trips `from_reifies_facts`'s Duplicate check and gets dropped.
+        let mut by_ann: BTreeMap<(Sid, i64), Vec<fluree_db_core::Flake>> = BTreeMap::new();
         for p_iri in fluree_vocab::reifies_iris::ALL {
             let Some(p_sid) = view.snapshot.encode_iri(p_iri) else {
                 // Predicate IRI never observed on this ledger — skip.
@@ -281,42 +281,27 @@ async fn scan_base_index_for_attachment_events(
                     // only cares about currently-live bundles.
                     continue;
                 }
-                by_ann.entry(f.s.clone()).or_default().push(f);
+                by_ann.entry((f.s.clone(), f.t)).or_default().push(f);
             }
         }
 
-        for (ann_sid, bundle) in by_ann {
-            if !seen.insert((g_id, ann_sid.clone())) {
+        for ((ann_sid, group_t), bundle) in by_ann {
+            if !seen.insert((g_id, ann_sid.clone(), group_t)) {
                 continue;
             }
             // Decode → EdgeKey. Malformed bundles are skipped
             // (consistent with `AttachmentNovelty::observe_flakes`).
+            // Every flake in this group shares `group_t`, and a
+            // successful decode guarantees the group carried a valid
+            // `f:reifiesSubject` row (the decoder returns `Missing`
+            // otherwise), so `group_t` is the bundle's assertion time —
+            // trustworthy on the arena's `t` axis without a separate
+            // f:reifiesSubject lookup. The arena builder applies
+            // (t, op) latest-wins across the emitted events.
             let Ok(edge_key) = EdgeKey::from_reifies_facts(&bundle) else {
                 continue;
             };
-            // Assertion time from the f:reifiesSubject flake. The
-            // decode above only succeeds when the bundle carries a
-            // valid `f:reifiesSubject` row (the decoder returns
-            // `Missing` otherwise), so the find below should always
-            // hit. We treat a missing row as malformed — skip
-            // rather than fall back to `t=0`, which would seal a
-            // misdated row in the arena. If `EdgeKey::from_reifies_facts`
-            // ever loosens its `f:reifiesSubject` requirement, this
-            // gate keeps the arena's `t` axis trustworthy.
-            let Some(t) = bundle
-                .iter()
-                .find(|f| f.p == f_reifies_subject)
-                .map(|f| f.t)
-            else {
-                tracing::warn!(
-                    ?ann_sid,
-                    ?g_id,
-                    "f:reifiesSubject flake absent from decoded bundle; \
-                     skipping (would have produced a t=0 arena row)"
-                );
-                continue;
-            };
-            events.push((edge_key, ann_sid, t, /* op = */ true));
+            events.push((edge_key, ann_sid, group_t, /* op = */ true));
         }
     }
 

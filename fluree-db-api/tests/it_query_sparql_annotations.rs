@@ -772,3 +772,158 @@ async fn sparql_update_quoted_triple_with_annotation_tail_does_not_panic() {
         "expected UnsupportedFeature on quoted-triple + tail, got: {msg}"
     );
 }
+
+#[tokio::test]
+async fn sparql_values_bound_reifies_predicate_does_not_leak() {
+    // READ-1 regression: the read-side firewall rejects f:reifies* as a
+    // predicate KEY, but a user can also smuggle the IRI in as VALUES
+    // *data* bound to a predicate variable, then scan `?s ?p ?o`.
+    // Without the firewall covering VALUES data this leaks the internal
+    // f:reifiesSubject bundle as ordinary RDF. The query must either be
+    // rejected or return zero f:reifies* rows (no includeSystemFacts).
+    let (fluree, ledger) = seed_alice_engineer("it/sparql-ann/values-pred-leak").await;
+    let sparql = r"
+        SELECT ?s ?o WHERE {
+          VALUES ?p { <https://ns.flur.ee/db#reifiesSubject> }
+          ?s ?p ?o .
+        }
+    ";
+    let result = support::query_sparql(&fluree, &ledger, sparql).await;
+    match result {
+        Err(_) => { /* rejected by the firewall — correct */ }
+        Ok(r) => {
+            let bindings = r.to_sparql_json(&ledger.snapshot).expect("sparql json")["results"]
+                ["bindings"]
+                .as_array()
+                .expect("bindings array")
+                .clone();
+            assert!(
+                bindings.is_empty(),
+                "VALUES-bound f:reifiesSubject predicate must not leak \
+                 system facts; got {bindings:#?}"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn jsonld_values_bound_reifies_predicate_does_not_leak() {
+    // READ-1 regression (JSON-LD): same leak as the SPARQL case but via
+    // a JSON-LD `values` clause binding a variable predicate to the
+    // f:reifiesSubject IRI. The key-only firewall misses the IRI in
+    // VALUES data. Must be rejected or return zero f:reifies* rows.
+    let (fluree, ledger) = seed_alice_engineer("it/jsonld-ann/values-pred-leak").await;
+    let query = json!({
+        "@context": { "ex": "http://example.org/", "f": "https://ns.flur.ee/db#" },
+        "select": ["?s", "?o"],
+        "where": { "@id": "?s", "?p": "?o" },
+        "values": ["?p", [{ "@id": "f:reifiesSubject" }]]
+    });
+    match support::query_jsonld(&fluree, &ledger, &query).await {
+        Err(_) => { /* rejected by the firewall — correct */ }
+        Ok(r) => {
+            let bindings = r.to_sparql_json(&ledger.snapshot).expect("sparql json")["results"]
+                ["bindings"]
+                .as_array()
+                .cloned()
+                .unwrap_or_default();
+            // Any row binding ?o to ex:alice means the f:reifiesSubject
+            // bundle leaked.
+            let leaked = bindings.iter().any(|row| {
+                row.get("o")
+                    .and_then(|v| v.get("value"))
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.contains("alice"))
+                    .unwrap_or(false)
+            });
+            assert!(
+                !leaked,
+                "JSON-LD VALUES-bound f:reifiesSubject must not leak system facts; got {bindings:#?}"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn sparql_update_langstring_annotation_hydrates_via_jsonld() {
+    // WRIT-1 regression: a SPARQL UPDATE annotation on a language-tagged
+    // literal object must emit f:reifiesLang so the stored EdgeKey
+    // carries lang=Some — matching the base edge's EdgeKey. Without it
+    // the decoded EdgeKey diverges (lang=None) and the annotation
+    // silently vanishes from JSON-LD @annotation hydration. SPARQL
+    // {| |} read-back reads the same flakes so it can't catch this;
+    // JSON-LD hydration is the path that breaks.
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger0 = genesis_ledger(&fluree, "it/sparql-ann-update/langstring-hydrate");
+
+    let update = r#"
+        PREFIX ex: <http://example.org/>
+        INSERT DATA {
+          ex:alice ex:label "chat"@fr {| ex:source "lexicon" |} .
+        }
+    "#;
+    let txn = lower_update(&ledger0, update);
+    let ledger = fluree
+        .stage_owned(ledger0)
+        .txn(txn)
+        .execute()
+        .await
+        .expect("INSERT DATA with langString annotation")
+        .ledger;
+
+    let query = json!({
+        "@context": ctx(),
+        "select": {"?s": ["*"]},
+        "where": {"@id": "?s", "ex:label": "?o"}
+    });
+    let rows = support::query_jsonld_formatted(&fluree, &ledger, &query)
+        .await
+        .expect("hydrate alice");
+    let arr = rows.as_array().expect("array");
+    assert_eq!(arr.len(), 1, "one subject row: {arr:#?}");
+
+    let label = arr[0]
+        .as_object()
+        .and_then(|o| {
+            o.get("ex:label")
+                .or_else(|| o.get("http://example.org/label"))
+        })
+        .expect("ex:label present");
+    let value_obj = label
+        .as_object()
+        .or_else(|| {
+            label
+                .as_array()
+                .and_then(|a| a.first().and_then(|v| v.as_object()))
+        })
+        .expect("ex:label literal value object");
+
+    assert_eq!(
+        value_obj.get("@value").and_then(|v| v.as_str()),
+        Some("chat"),
+        "value object must carry the literal: {value_obj:#?}"
+    );
+    assert_eq!(
+        value_obj.get("@language").and_then(|v| v.as_str()),
+        Some("fr"),
+        "value object must carry the language tag: {value_obj:#?}"
+    );
+    let ann = value_obj
+        .get("@annotation")
+        .expect("@annotation must hydrate on the langString edge (WRIT-1)");
+    let ann_obj = ann
+        .as_object()
+        .or_else(|| {
+            ann.as_array()
+                .and_then(|a| a.first().and_then(|v| v.as_object()))
+        })
+        .expect("@annotation body object");
+    assert_eq!(
+        ann_obj
+            .get("ex:source")
+            .or_else(|| ann_obj.get("http://example.org/source"))
+            .and_then(|v| v.as_str()),
+        Some("lexicon"),
+        "annotation body must surface ex:source: {ann_obj:#?}"
+    );
+}

@@ -433,7 +433,13 @@ where
         latest
             .entry(other)
             .and_modify(|cur| {
-                if t >= cur.0 {
+                // Tie-break on `op` at equal `t` so an assert (op = true)
+                // deterministically wins over a retract (op = false; false <
+                // true), matching the arena builder's `(t, op)` sort
+                // semantics. Without this, a novelty-only read and an
+                // arena-merged read could disagree when an edge is both
+                // asserted and retracted at the same `t`.
+                if (t, op) >= (cur.0, cur.1) {
                     *cur = (t, op);
                 }
             })
@@ -449,6 +455,41 @@ mod tests {
     use super::*;
     use fluree_db_core::edge::EdgeKey;
     use fluree_db_core::{FlakeMeta, FlakeValue, Sid};
+
+    #[test]
+    fn latest_assertions_tie_breaks_assert_over_retract_at_equal_t() {
+        // STOR-2/BUGS-3: at equal t an assert (op=true) must win over a
+        // retract (op=false; false < true), matching the arena builder's
+        // (t, op) latest-wins sort, so novelty-only reads agree with
+        // arena-merged reads regardless of insertion order.
+        let target = Sid::new(13, "x");
+        // assert then retract, both at t=5 — the discriminating case
+        // (pre-fix `t >= cur.0` let the trailing retract overwrite).
+        let rows = [
+            (target.clone(), 5_i64, true),
+            (target.clone(), 5_i64, false),
+        ];
+        let live: Vec<&Sid> =
+            latest_assertions_at(rows.iter(), |r| (&r.0, r.1, r.2), 100).collect();
+        assert_eq!(
+            live,
+            vec![&target],
+            "assert must win at equal t (assert-then-retract)"
+        );
+
+        // retract then assert — same answer.
+        let rows2 = [
+            (target.clone(), 5_i64, false),
+            (target.clone(), 5_i64, true),
+        ];
+        let live2: Vec<&Sid> =
+            latest_assertions_at(rows2.iter(), |r| (&r.0, r.1, r.2), 100).collect();
+        assert_eq!(
+            live2,
+            vec![&target],
+            "assert must win at equal t (retract-then-assert)"
+        );
+    }
 
     fn sample_edge() -> EdgeKey {
         EdgeKey::from_flake(&Flake::new(

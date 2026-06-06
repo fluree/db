@@ -168,6 +168,24 @@ fn scan_query_for_reifies_iris(
                 scan_query_for_reifies_iris(item, context)?;
             }
         }
+        JsonValue::String(s) => {
+            // Reject `f:reifies*` IRIs appearing as a VALUE — `values`
+            // data, an `@id` reference, or a tuple-form predicate
+            // string — not just as an object KEY. Without this a user
+            // can bind a predicate variable to `f:reifiesSubject` via
+            // `values` and leak the internal bundle through a
+            // `?s ?p ?o` scan (the key-only check sees only the bare
+            // variable `?p`). A legitimate query value never resolves
+            // to one of the seven reserved IRIs, so this cannot reject
+            // real input.
+            let expanded = fluree_graph_json_ld::expand_iri(s, context);
+            if reifies_iris::ALL.iter().any(|iri| *iri == expanded) {
+                return Err(ParseError::InvalidWhere(format!(
+                    "value '{s}' resolves to a system-controlled predicate '{expanded}'; \
+                     use @annotation or @reifies in queries instead"
+                )));
+            }
+        }
         _ => {}
     }
     Ok(())

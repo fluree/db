@@ -185,13 +185,23 @@ impl EdgeKey {
         ));
 
         // f:reifiesObject — required. Preserves the original object's
-        // datatype on the flake so typed-equality lookups round-trip.
-        facts.push(make(
+        // datatype on the flake so typed-equality lookups round-trip,
+        // and its language tag / list index in `FlakeMeta` so this
+        // flake is the structural inverse of the base edge's object.
+        // The JSON-LD writer expands a language-tagged value object to
+        // a flake carrying `m.lang`, so a cascade retract built here
+        // must match it (same `(s, p, o, dt, m)`) — otherwise the
+        // retract cancels nothing and leaves a durable orphan
+        // f:reifiesObject flake. `from_reifies_facts` ignores object
+        // `m` on decode, so this is transparent to the round-trip.
+        let mut object_flake = make(
             ann.clone(),
             reifies_object_sid().clone(),
             self.o.clone(),
             self.dt.clone(),
-        ));
+        );
+        object_flake.m = edge_key_to_flake_meta(self.lang.as_deref(), self.list_i);
+        facts.push(object_flake);
 
         // f:reifiesDatatype — required. Names the dt SID itself so
         // queries can filter on the original object's datatype without
@@ -603,6 +613,46 @@ mod tests {
         assert_eq!(bundle.len(), 6, "graph + S + P + O + Dt + lang");
         let decoded = EdgeKey::from_reifies_facts(&bundle).expect("decode succeeds");
         assert_eq!(decoded, key);
+    }
+
+    #[test]
+    fn reifies_object_flake_carries_lang_meta_for_cascade_symmetry() {
+        // BUGS-2: the f:reifiesObject flake must carry the language tag
+        // in its FlakeMeta so a cascade retract built from the EdgeKey
+        // is the structural inverse of the JSON-LD-asserted flake (which
+        // carries m.lang). Otherwise the retract cancels nothing and the
+        // f:reifiesObject flake survives as a durable orphan.
+        let mut f = sample_flake();
+        f.o = FlakeValue::String("chat".into());
+        f.dt = Sid::new(2, "string"); // stand-in for rdf:langString
+        f.m = Some(FlakeMeta {
+            lang: Some("fr".into()),
+            i: None,
+        });
+        let key = EdgeKey::from_flake(&f);
+        let ann = Sid::new(13, "ann_lang");
+
+        let assertion = key.to_reifies_facts(&ann, 5, true);
+        let obj = assertion
+            .iter()
+            .find(|fl| is_reifies_object(&fl.p))
+            .expect("f:reifiesObject flake present");
+        assert_eq!(
+            obj.m.as_ref().and_then(|m| m.lang.as_deref()),
+            Some("fr"),
+            "f:reifiesObject flake must carry m.lang"
+        );
+
+        // The retract bundle must match the assertion flake-for-flake
+        // (same o/dt/m) so the cascade actually cancels it.
+        let retract = key.to_reifies_facts(&ann, 7, false);
+        let obj_r = retract
+            .iter()
+            .find(|fl| is_reifies_object(&fl.p))
+            .expect("f:reifiesObject flake present in retract");
+        assert_eq!(obj.m, obj_r.m, "object flake meta must match on retract");
+        assert_eq!(obj.o, obj_r.o);
+        assert_eq!(obj.dt, obj_r.dt);
     }
 
     #[test]

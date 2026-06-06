@@ -348,7 +348,7 @@ async fn cascade_attachment_retracts(
                 .iter()
                 .map(identity)
                 .filter(|id| !retracted_ids.contains(id))
-                .chain(asserted_ids.into_iter())
+                .chain(asserted_ids)
                 .collect();
             if !post_metadata.is_empty() {
                 continue;

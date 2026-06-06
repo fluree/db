@@ -301,10 +301,11 @@ fn expand_annotated_triples(
             span,
         ));
 
-        // f:reifies* bundle: SUBJECT, PREDICATE, OBJECT.
-        // f:reifiesGraph is omitted (default graph only).
-        // f:reifiesDatatype / f:reifiesLang / f:reifiesListIndex are
-        // derived at flake time per the JSON-LD path's convention.
+        // f:reifies* bundle: SUBJECT, PREDICATE, OBJECT, and (for a
+        // language-tagged object) LANG. f:reifiesGraph is omitted
+        // (default graph only). f:reifiesDatatype rides on the
+        // f:reifiesObject flake's flake-level dt (the decoder derives
+        // it), and f:reifiesListIndex is deferred (v1).
         let pred_iri =
             |s: &'static str| -> PredicateTerm { PredicateTerm::Iri(Iri::full(s, span)) };
         out.push(TriplePattern::new(
@@ -325,6 +326,26 @@ fn expand_annotated_triples(
             tp.object.clone(),
             span,
         ));
+
+        // f:reifiesLang — required for a language-tagged object.
+        // `EdgeKey::from_reifies_facts` reads `lang` from a dedicated
+        // f:reifiesLang flake, NOT from the f:reifiesObject flake's
+        // `m.lang`. Without this triple the decoded EdgeKey carries
+        // `lang = None` while the base edge's EdgeKey carries
+        // `lang = Some(tag)`, so the forward-map lookup misses: the
+        // annotation silently vanishes from `@annotation` hydration
+        // and the bundle is never cascaded on base-edge retract.
+        // Mirrors the JSON-LD writer (`build_annotation_sibling`).
+        if let Term::Literal(lit) = &tp.object {
+            if let SparqlLiteralValue::LangTagged { lang, .. } = &lit.value {
+                out.push(TriplePattern::new(
+                    reifier.clone(),
+                    pred_iri(reifies_iris::LANG),
+                    Term::Literal(Literal::string(lang.as_ref(), span)),
+                    span,
+                ));
+            }
+        }
 
         // Body entries become (reifier, ann_pred, ann_obj) triples.
         if let Some(block) = annotation.block.as_ref() {

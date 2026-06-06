@@ -175,6 +175,28 @@ fn reject_direct_reifies_in_patterns(patterns: &[Pattern]) -> Result<()> {
         )
     }
 
+    // A VALUES row binding that resolves to an `f:reifies*` IRI: the
+    // user is trying to smuggle a system-controlled predicate in as
+    // data (e.g. `VALUES ?p { f:reifiesSubject } . ?s ?p ?o`) so a
+    // later variable-predicate scan binds it to a constant and leaks
+    // the internal bundle. Returns the offending IRI for the message.
+    fn reifies_values_binding(b: &fluree_db_query::Binding) -> Option<String> {
+        use fluree_db_query::Binding;
+        match b {
+            Binding::Sid { sid, .. } if fluree_db_core::is_reserved_reifies_predicate(sid) => {
+                Some(format!("{sid}"))
+            }
+            Binding::IriMatch {
+                primary_sid, iri, ..
+            } if fluree_db_core::is_reserved_reifies_predicate(primary_sid)
+                || reifies_iris::ALL.iter().any(|known| *known == iri.as_ref()) =>
+            {
+                Some(iri.to_string())
+            }
+            _ => None,
+        }
+    }
+
     // Exhaustive over `Pattern` so adding a new variant forces a
     // firewall decision rather than silently slipping through. The
     // previous wildcard arm let `PropertyPath` (which carries a
@@ -215,12 +237,24 @@ fn reject_direct_reifies_in_patterns(patterns: &[Pattern]) -> Result<()> {
                     walk(body)?;
                 }
                 Pattern::DefaultGraphSource { patterns } => walk(patterns)?,
+                // VALUES carries no predicate slot, but its row DATA can
+                // bind a variable to an `f:reifies*` IRI which a later
+                // `?s ?p ?o` scan then resolves to a constant predicate,
+                // leaking the internal bundle. Reject the IRI here.
+                Pattern::Values { rows, .. } => {
+                    for row in rows {
+                        for binding in row {
+                            if let Some(iri) = reifies_values_binding(binding) {
+                                return Err(reject_predicate_string(iri));
+                            }
+                        }
+                    }
+                }
                 // Pattern types that don't carry an arbitrary triple
                 // predicate — adapters / search calls / leaf nodes.
                 // f:reifies* predicates can't appear inside them.
                 Pattern::Filter(_)
                 | Pattern::Bind { .. }
-                | Pattern::Values { .. }
                 | Pattern::IndexSearch(_)
                 | Pattern::VectorSearch(_)
                 | Pattern::R2rml(_)

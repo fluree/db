@@ -40,17 +40,21 @@ use crate::error::{IndexerError, Result};
 /// Output of [`build_and_persist_annotation_arena`].
 ///
 /// `replaced_leaf_cids` enumerates every leaf CID referenced by the
-/// previous arena (if any). Pass it directly to
-/// `IncrementalRootBuilder::set_annotation_index` so GC can reclaim
-/// the old leaves once the new root supersedes the chain. The
-/// previous branch CIDs are recorded automatically by
-/// `set_annotation_index` from `root.annotation_index`, so this list
-/// covers only the leaves.
+/// previous arena (if any). `new_leaf_cids` enumerates every leaf CID
+/// referenced by the arena just sealed. Pass BOTH to
+/// `IncrementalRootBuilder::set_annotation_index` so it can record
+/// only the old CIDs the new arena no longer references as garbage —
+/// content-addressed storage means a re-sealed unchanged arena
+/// produces identical CIDs, and GC must not delete leaves/branches the
+/// new root still points at. The previous and new branch CIDs are
+/// reconciled inside `set_annotation_index` (old from
+/// `root.annotation_index`, new from the passed `new_index`).
 ///
 #[derive(Debug, Default)]
 pub struct PersistedArenaResult {
     pub new_index: Option<AnnotationIndexRoot>,
     pub replaced_leaf_cids: Vec<fluree_db_core::ContentId>,
+    pub new_leaf_cids: Vec<fluree_db_core::ContentId>,
 }
 
 /// Build and persist an annotation arena from a complete event set.
@@ -132,6 +136,16 @@ pub async fn build_and_persist_annotation_arena(
         .await
         .map_err(|e| IndexerError::StorageWrite(e.to_string()))?;
 
+    // Leaf CIDs the new arena references — handed to
+    // `set_annotation_index` so it can exclude any that the previous
+    // arena also referenced (identical re-sealed leaves) from the
+    // garbage manifest.
+    let new_leaf_cids: Vec<fluree_db_core::ContentId> = fwd_pairs
+        .iter()
+        .map(|(_, cid)| cid.clone())
+        .chain(rev_pairs.iter().map(|(_, cid)| cid.clone()))
+        .collect();
+
     Ok(PersistedArenaResult {
         new_index: Some(AnnotationIndexRoot {
             version: 1,
@@ -141,6 +155,7 @@ pub async fn build_and_persist_annotation_arena(
             stats: out.stats,
         }),
         replaced_leaf_cids,
+        new_leaf_cids,
     })
 }
 
