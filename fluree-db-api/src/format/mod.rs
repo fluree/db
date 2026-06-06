@@ -46,6 +46,7 @@ pub mod datatype;
 pub mod delimited;
 mod hydration;
 pub mod iri;
+mod json_write;
 mod jsonld;
 mod materialize;
 mod rdf_xml;
@@ -165,6 +166,50 @@ pub fn format_results(
     }
 }
 
+/// True when the JSON **string** output for this result can be produced by the
+/// allocation-light streaming serializers instead of building (and then
+/// re-serializing) a `serde_json::Value` DOM.
+///
+/// The DOM path handles every excluded case identically and remains the
+/// reference implementation:
+/// - `pretty` — uses serde's pretty-printer
+/// - `select_one` — single-row output; per-format shaping quirks, and the win
+///   from streaming is negligible for one row
+/// - ASK — tiny boolean envelope
+/// - CONSTRUCT/DESCRIBE — coerced to a JSON-LD graph (`construct::format`)
+/// - hydration — async DB expansion during formatting
+fn json_stream_eligible(result: &QueryResult, config: &FormatterConfig) -> bool {
+    !config.pretty
+        && matches!(
+            config.format,
+            OutputFormat::JsonLd
+                | OutputFormat::SparqlJson
+                | OutputFormat::TypedJson
+                | OutputFormat::AgentJson
+        )
+        && !result.output.is_select_one()
+        && !result.output.is_ask()
+        && result.output.construct_template().is_none()
+        && !result.output.has_hydration()
+}
+
+/// Dispatch a stream-eligible result to the matching streaming JSON serializer.
+/// Each `format_string` is parity-tested to be byte-identical to
+/// `serde_json::to_string(&<dom format>(...))`.
+fn stream_json(
+    result: &QueryResult,
+    compactor: &IriCompactor,
+    config: &FormatterConfig,
+) -> Result<String> {
+    match config.format {
+        OutputFormat::JsonLd => jsonld::format_string(result, compactor, config),
+        OutputFormat::SparqlJson => sparql::format_string(result, compactor, config),
+        OutputFormat::TypedJson => typed::format_string(result, compactor, config),
+        OutputFormat::AgentJson => agent_json::format_string(result, compactor, config),
+        _ => unreachable!("stream_json only called for JSON formats (see json_stream_eligible)"),
+    }
+}
+
 /// Format query results to a JSON string
 ///
 /// Convenience function that formats and serializes in one step.
@@ -190,6 +235,13 @@ pub fn format_results_string(
             return rdf_xml::format(result, &compactor, config);
         }
         _ => {}
+    }
+
+    // Stream JSON straight to a String for the common SELECT case, skipping the
+    // serde_json::Value DOM and its second serialization pass.
+    if json_stream_eligible(result, config) {
+        let compactor = IriCompactor::new(snapshot.shared_namespaces(), context);
+        return stream_json(result, &compactor, config);
     }
 
     let value = format_results(result, context, snapshot, config)?;
@@ -428,6 +480,13 @@ pub async fn format_results_string_async(
         _ => {}
     }
 
+    // Stream JSON straight to a String for the common SELECT case (mirrors the
+    // compactor that `format_results_async` would build internally).
+    if json_stream_eligible(result, config) {
+        let compactor = IriCompactor::new(db.snapshot.shared_namespaces(), context);
+        return stream_json(result, &compactor, config);
+    }
+
     let value = format_results_async(result, context, db, config, policy, None).await?;
 
     if config.pretty {
@@ -465,6 +524,14 @@ pub async fn format_results_string_async_dataset(
             return rdf_xml::format(result, &compactor, config);
         }
         _ => {}
+    }
+
+    // Non-hydration JSON formats against the primary view, exactly as the DOM
+    // dataset path does — so the streaming compactor matches. Hydration is not
+    // stream-eligible and continues through the dataset-aware DOM path below.
+    if json_stream_eligible(result, config) {
+        let compactor = IriCompactor::new(primary_db.snapshot.shared_namespaces(), context);
+        return stream_json(result, &compactor, config);
     }
 
     let value = format_results_async_dataset(result, context, dataset, config, tracker).await?;
@@ -541,5 +608,214 @@ mod tests {
         let config = FormatterConfig::jsonld();
         let output = format_ask(&result, &config).unwrap().unwrap();
         assert_eq!(output, JsonValue::Bool(false));
+    }
+
+    // ====================================================================
+    // Manual perf harness: streaming `format_string` vs DOM `format` +
+    // `serde_json::to_string`, for each JSON format across number-heavy,
+    // string-heavy, and mixed result sets.
+    //
+    // Ignored by default (it's a benchmark, not an assertion). Run in RELEASE
+    // for meaningful numbers:
+    //
+    //   cargo test -p fluree-db-api --release --lib \
+    //     format::tests::bench_stream_vs_dom -- --ignored --nocapture
+    //
+    // It also asserts byte-identity at 10k rows, so it doubles as a
+    // large-scale parity check.
+    // ====================================================================
+
+    use fluree_db_core::{FlakeValue, Sid};
+    use fluree_db_query::binding::{Batch, Binding};
+    use std::hint::black_box;
+    use std::sync::Arc;
+    use std::time::Instant;
+
+    fn bench_compactor() -> IriCompactor {
+        let mut ns = std::collections::HashMap::new();
+        ns.insert(2u16, "http://www.w3.org/2001/XMLSchema#".to_string());
+        ns.insert(100u16, "http://example.org/".to_string());
+        IriCompactor::from_namespaces(Arc::new(ns))
+    }
+
+    /// Build an `n`-row `QueryResult` for one of the data shapes.
+    fn bench_result(shape: &str, n: usize) -> QueryResult {
+        let mut vars = VarRegistry::new();
+        let xsd_long = Sid::new(2, "long");
+        let xsd_double = Sid::new(2, "double");
+        let xsd_string = Sid::new(2, "string");
+        let xsd_bool = Sid::new(2, "boolean");
+
+        let (names, cols): (Vec<&str>, Vec<Vec<Binding>>) = match shape {
+            // All numeric literals (Long + Double).
+            "numbers" => {
+                let names = vec!["?a", "?b", "?c"];
+                let a = (0..n)
+                    .map(|i| Binding::lit(FlakeValue::Long(i as i64), xsd_long.clone()))
+                    .collect();
+                let b = (0..n)
+                    .map(|i| Binding::lit(FlakeValue::Double(i as f64 * 1.5), xsd_double.clone()))
+                    .collect();
+                let c = (0..n)
+                    .map(|i| Binding::lit(FlakeValue::Long((i as i64) * 7 - 3), xsd_long.clone()))
+                    .collect();
+                (names, vec![a, b, c])
+            }
+            // An IRI ref + two string literals (short + longer).
+            "strings" => {
+                let names = vec!["?id", "?name", "?desc"];
+                let id = (0..n)
+                    .map(|i| Binding::sid(Sid::new(100, format!("item{i}"))))
+                    .collect();
+                let name = (0..n)
+                    .map(|i| {
+                        Binding::lit(FlakeValue::String(format!("Name {i}")), xsd_string.clone())
+                    })
+                    .collect();
+                let desc = (0..n)
+                    .map(|i| {
+                        Binding::lit(
+                            FlakeValue::String(format!(
+                                "A reasonably descriptive sentence for record number {i}."
+                            )),
+                            xsd_string.clone(),
+                        )
+                    })
+                    .collect();
+                (names, vec![id, name, desc])
+            }
+            // Mixed: ref + string + long + double + boolean.
+            _mixed => {
+                let names = vec!["?id", "?name", "?age", "?score", "?active"];
+                let id = (0..n)
+                    .map(|i| Binding::sid(Sid::new(100, format!("person{i}"))))
+                    .collect();
+                let name = (0..n)
+                    .map(|i| {
+                        Binding::lit(
+                            FlakeValue::String(format!("Person {i}")),
+                            xsd_string.clone(),
+                        )
+                    })
+                    .collect();
+                let age = (0..n)
+                    .map(|i| Binding::lit(FlakeValue::Long((i % 90) as i64), xsd_long.clone()))
+                    .collect();
+                let score = (0..n)
+                    .map(|i| Binding::lit(FlakeValue::Double((i as f64) / 3.0), xsd_double.clone()))
+                    .collect();
+                let active = (0..n)
+                    .map(|i| Binding::lit(FlakeValue::Boolean(i % 2 == 0), xsd_bool.clone()))
+                    .collect();
+                (names, vec![id, name, age, score, active])
+            }
+        };
+
+        let var_ids: Vec<fluree_db_query::VarId> =
+            names.iter().map(|&nm| vars.get_or_insert(nm)).collect();
+        let batch = Batch::new(Arc::from(var_ids.clone().into_boxed_slice()), cols).unwrap();
+        QueryResult {
+            vars,
+            t: Some(1),
+            novelty: None,
+            context: fluree_graph_json_ld::ParsedContext::default(),
+            orig_context: None,
+            output: QueryOutput::select_all(var_ids),
+            batches: vec![batch],
+            binary_graph: None,
+        }
+    }
+
+    #[test]
+    #[ignore = "perf benchmark; run with --release --ignored --nocapture"]
+    fn bench_stream_vs_dom() {
+        type DomFn = fn(&QueryResult, &IriCompactor, &FormatterConfig) -> Result<JsonValue>;
+        type StreamFn = fn(&QueryResult, &IriCompactor, &FormatterConfig) -> Result<String>;
+
+        const ROWS: usize = 10_000;
+        const ITERS: usize = 100;
+
+        let compactor = bench_compactor();
+        let formats: [(&str, DomFn, StreamFn, FormatterConfig); 4] = [
+            (
+                "sparql_json",
+                sparql::format,
+                sparql::format_string,
+                FormatterConfig::sparql_json(),
+            ),
+            (
+                "typed_json",
+                typed::format,
+                typed::format_string,
+                FormatterConfig::typed_json(),
+            ),
+            (
+                "jsonld",
+                jsonld::format,
+                jsonld::format_string,
+                FormatterConfig::jsonld(),
+            ),
+            (
+                "agent_json",
+                agent_json::format,
+                agent_json::format_string,
+                FormatterConfig::agent_json(),
+            ),
+        ];
+
+        println!(
+            "\n{ROWS} rows, {ITERS} iters/measurement  (DOM = format + serde_json::to_string, STREAM = format_string)\n"
+        );
+        println!(
+            "{:<8} {:<12} {:>10} {:>11} {:>11} {:>9} {:>11}",
+            "shape", "format", "bytes", "dom µs/it", "strm µs/it", "speedup", "MB/s strm"
+        );
+        println!("{}", "-".repeat(80));
+
+        for shape in ["numbers", "strings", "mixed"] {
+            let result = bench_result(shape, ROWS);
+            for (name, dom, stream, cfg) in &formats {
+                // Correctness at scale: streaming must equal DOM-then-serialize.
+                let dom_once =
+                    serde_json::to_string(&dom(&result, &compactor, cfg).unwrap()).unwrap();
+                let stream_once = stream(&result, &compactor, cfg).unwrap();
+                assert_eq!(
+                    dom_once, stream_once,
+                    "parity mismatch at {ROWS} rows: shape={shape} format={name}"
+                );
+                let bytes = stream_once.len();
+
+                // Warm up.
+                for _ in 0..3 {
+                    black_box(
+                        serde_json::to_string(&dom(&result, &compactor, cfg).unwrap()).unwrap(),
+                    );
+                    black_box(stream(&result, &compactor, cfg).unwrap());
+                }
+
+                let t0 = Instant::now();
+                for _ in 0..ITERS {
+                    let v = dom(&result, &compactor, cfg).unwrap();
+                    black_box(serde_json::to_string(&v).unwrap().len());
+                }
+                let dom_elapsed = t0.elapsed();
+
+                let t1 = Instant::now();
+                for _ in 0..ITERS {
+                    black_box(stream(&result, &compactor, cfg).unwrap().len());
+                }
+                let stream_elapsed = t1.elapsed();
+
+                let dom_us = dom_elapsed.as_secs_f64() * 1e6 / ITERS as f64;
+                let strm_us = stream_elapsed.as_secs_f64() * 1e6 / ITERS as f64;
+                let speedup = dom_us / strm_us;
+                let mbps = (bytes as f64) / (strm_us / 1e6) / (1024.0 * 1024.0);
+
+                println!(
+                    "{shape:<8} {name:<12} {bytes:>10} {dom_us:>11.1} {strm_us:>11.1} {speedup:>8.2}x {mbps:>10.0}"
+                );
+            }
+        }
+        println!();
     }
 }
