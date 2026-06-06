@@ -495,6 +495,927 @@ async fn sparql_count_distinct_with_group_by_and_order_by() {
 }
 
 #[tokio::test]
+async fn sparql_order_by_expression_no_aggregation() {
+    // Bug 1: expression-based ORDER BY (no aggregation). `(0 - ?favNum)`
+    // ascending must produce DESCENDING ?favNum, proving the expression is
+    // evaluated per-solution (a bare `ORDER BY ?favNum` would yield the
+    // opposite order).
+    assert_index_defaults();
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger = seed_people(&fluree, "people:main").await;
+
+    let query = r"
+        PREFIX ex: <http://example.org/ns/>
+        PREFIX person: <http://example.org/Person#>
+        SELECT ?favNum
+        WHERE { ex:jdoe person:favNums ?favNum }
+        ORDER BY (0 - ?favNum)
+    ";
+
+    let result = support::query_sparql(&fluree, &ledger, query)
+        .await
+        .unwrap();
+    let jsonld = result.to_jsonld(&ledger.snapshot).expect("to_jsonld");
+    // jdoe favNums [3,7,42,99]; ascending by (0 - favNum) => 99,42,7,3.
+    assert_eq!(jsonld, json!([[99], [42], [7], [3]]));
+}
+
+#[tokio::test]
+async fn sparql_order_by_expression_over_aggregate_with_limit() {
+    // Bug 1 + top-k: expression ORDER BY over an aggregate output is evaluated
+    // AFTER grouping (dedicated post-grouping stage). `(0 - ?c)` ascending =>
+    // descending count; LIMIT exercises top-k on the synthetic sort key.
+    assert_index_defaults();
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger = seed_people(&fluree, "people:main").await;
+
+    let query = r"
+        PREFIX person: <http://example.org/Person#>
+        SELECT ?handle (COUNT(?favNum) AS ?c)
+        WHERE {
+          ?person person:handle ?handle ;
+                  person:favNums ?favNum .
+        }
+        GROUP BY ?handle
+        ORDER BY (0 - ?c)
+        LIMIT 2
+    ";
+
+    let result = support::query_sparql(&fluree, &ledger, query)
+        .await
+        .unwrap();
+    let jsonld = result.to_jsonld(&ledger.snapshot).expect("to_jsonld");
+    // Counts: jbob 7, jdoe 4, bbob 1; descending by count, top 2.
+    assert_eq!(jsonld, json!([["jbob", 7], ["jdoe", 4]]));
+}
+
+#[tokio::test]
+async fn sparql_order_by_desc_expression_with_tiebreak() {
+    // BSBM-shaped `ORDER BY DESC(expr) ?tiebreak`: descending computed key then
+    // a bare variable tiebreaker, with LIMIT.
+    assert_index_defaults();
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger = seed_people(&fluree, "people:main").await;
+
+    let query = r"
+        PREFIX person: <http://example.org/Person#>
+        SELECT ?handle ?favNum
+        WHERE {
+          ?person person:handle ?handle ;
+                  person:favNums ?favNum .
+        }
+        ORDER BY DESC(?favNum * 1) ?handle
+        LIMIT 3
+    ";
+
+    let result = support::query_sparql(&fluree, &ledger, query)
+        .await
+        .unwrap();
+    let jsonld = result.to_jsonld(&ledger.snapshot).expect("to_jsonld");
+    // Highest favNums: 99 (jdoe), 42 (jdoe), 23 (bbob).
+    assert_eq!(jsonld, json!([["jdoe", 99], ["jdoe", 42], ["bbob", 23]]));
+}
+
+#[tokio::test]
+async fn sparql_order_by_float_ratio_expression() {
+    // BSBM BI Q5 shape: `ORDER BY DESC(xsd:float(?count) / N)`. Exercises
+    // expression ORDER BY (Bug 1) together with mixed float/int arithmetic in
+    // the sort key. Must neither reject at parse/lowering nor error at eval.
+    assert_index_defaults();
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger = seed_people(&fluree, "people:main").await;
+
+    let query = r"
+        PREFIX xsd: <http://www.w3.org/2001/XMLSchema#>
+        PREFIX person: <http://example.org/Person#>
+        SELECT ?handle (COUNT(?favNum) AS ?c)
+        WHERE {
+          ?person person:handle ?handle ;
+                  person:favNums ?favNum .
+        }
+        GROUP BY ?handle
+        ORDER BY DESC(xsd:float(?c) / 2)
+        LIMIT 10
+    ";
+
+    let result = support::query_sparql(&fluree, &ledger, query)
+        .await
+        .unwrap();
+    let jsonld = result.to_jsonld(&ledger.snapshot).expect("to_jsonld");
+    // xsd:float(count)/2: jbob 3.5, jdoe 2.0, bbob 0.5 => descending.
+    assert_eq!(jsonld, json!([["jbob", 7], ["jdoe", 4], ["bbob", 1]]));
+}
+
+#[tokio::test]
+async fn sparql_order_by_expression_dedup_only_group_by() {
+    // Regression (P1a): expression ORDER BY over a *dedup-only* GROUP BY (no
+    // aggregates) must work. The order key is computed by the dedicated
+    // post-grouping stage; the group key ?favNum survives grouping as a scalar.
+    assert_index_defaults();
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger = seed_people(&fluree, "people:main").await;
+
+    let query = r"
+        PREFIX person: <http://example.org/Person#>
+        SELECT ?favNum
+        WHERE { ?person person:favNums ?favNum }
+        GROUP BY ?favNum
+        ORDER BY (0 - ?favNum)
+    ";
+
+    let result = support::query_sparql(&fluree, &ledger, query)
+        .await
+        .unwrap();
+    let jsonld = result.to_jsonld(&ledger.snapshot).expect("to_jsonld");
+    // Distinct favNums across all people, descending.
+    assert_eq!(
+        jsonld,
+        json!([[99], [42], [23], [9], [8], [7], [6], [5], [3], [0]])
+    );
+}
+
+#[tokio::test]
+async fn sparql_order_by_inline_aggregate_shared_with_select_alias() {
+    // `ORDER BY DESC(COUNT(?x))` with an explicit GROUP BY. The inline aggregate
+    // is hoisted and deduped against the SELECT alias `?c`, so it sorts by the
+    // same count without recomputing it.
+    assert_index_defaults();
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger = seed_people(&fluree, "people:main").await;
+
+    let query = r"
+        PREFIX person: <http://example.org/Person#>
+        SELECT ?handle (COUNT(?favNum) AS ?c)
+        WHERE {
+          ?person person:handle ?handle ;
+                  person:favNums ?favNum .
+        }
+        GROUP BY ?handle
+        ORDER BY DESC(COUNT(?favNum))
+        LIMIT 10
+    ";
+
+    let result = support::query_sparql(&fluree, &ledger, query)
+        .await
+        .unwrap();
+    let jsonld = result.to_jsonld(&ledger.snapshot).expect("to_jsonld");
+    assert_eq!(jsonld, json!([["jbob", 7], ["jdoe", 4], ["bbob", 1]]));
+}
+
+#[tokio::test]
+async fn sparql_order_by_inline_aggregate_not_selected() {
+    // `ORDER BY DESC(COUNT(?favNum))` where the aggregate is NOT in the SELECT.
+    // It must be hoisted into the grouping with its own synthetic output var so
+    // the rows order by a count that never appears in the output.
+    assert_index_defaults();
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger = seed_people(&fluree, "people:main").await;
+
+    let query = r"
+        PREFIX person: <http://example.org/Person#>
+        SELECT ?handle
+        WHERE {
+          ?person person:handle ?handle ;
+                  person:favNums ?favNum .
+        }
+        GROUP BY ?handle
+        ORDER BY DESC(COUNT(?favNum))
+    ";
+
+    let result = support::query_sparql(&fluree, &ledger, query)
+        .await
+        .unwrap();
+    let jsonld = result.to_jsonld(&ledger.snapshot).expect("to_jsonld");
+    // Counts: jbob 7, jdoe 4, bbob 1 → handles in that order, count not projected.
+    assert_eq!(jsonld, json!([["jbob"], ["jdoe"], ["bbob"]]));
+}
+
+#[tokio::test]
+async fn sparql_order_by_inline_aggregate_implicit_single_group() {
+    // No explicit GROUP BY: the aggregate in ORDER BY triggers implicit
+    // single-group aggregation (must not error).
+    assert_index_defaults();
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger = seed_people(&fluree, "people:main").await;
+
+    let query = r"
+        PREFIX person: <http://example.org/Person#>
+        SELECT (COUNT(?favNum) AS ?c)
+        WHERE { ?person person:favNums ?favNum }
+        ORDER BY DESC(COUNT(?favNum))
+    ";
+
+    let result = support::query_sparql(&fluree, &ledger, query)
+        .await
+        .unwrap();
+    let jsonld = result.to_jsonld(&ledger.snapshot).expect("to_jsonld");
+    // Total favNums across all people = 4 + 1 + 7 = 12 (single group).
+    assert_eq!(jsonld, json!([[12]]));
+}
+
+#[tokio::test]
+async fn sparql_order_by_inline_aggregate_in_compound_expression() {
+    // Aggregate nested inside a compound order expression: `DESC(COUNT(?x) * 2)`.
+    assert_index_defaults();
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger = seed_people(&fluree, "people:main").await;
+
+    let query = r"
+        PREFIX person: <http://example.org/Person#>
+        SELECT ?handle (COUNT(?favNum) AS ?c)
+        WHERE {
+          ?person person:handle ?handle ;
+                  person:favNums ?favNum .
+        }
+        GROUP BY ?handle
+        ORDER BY DESC(COUNT(?favNum) * 2)
+    ";
+
+    let result = support::query_sparql(&fluree, &ledger, query)
+        .await
+        .unwrap();
+    let jsonld = result.to_jsonld(&ledger.snapshot).expect("to_jsonld");
+    assert_eq!(jsonld, json!([["jbob", 7], ["jdoe", 4], ["bbob", 1]]));
+}
+
+#[tokio::test]
+async fn sparql_order_by_expression_count_by_predicate_not_dropped() {
+    // Regression: the `?s ?p ?o` / GROUP BY ?p / COUNT(?s) shape can match the
+    // stats (and predicate-object) count fast paths, which sort on
+    // `query.ordering` directly. With an expression ORDER BY the sort var is
+    // synthetic, so a fast path that skips the order-bind stage would silently
+    // drop the sort. The result counts must come back strictly grouped and
+    // descending here.
+    assert_index_defaults();
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger = seed_people(&fluree, "people:main").await;
+
+    let query = r"
+        SELECT ?p (COUNT(?s) AS ?c)
+        WHERE { ?s ?p ?o }
+        GROUP BY ?p
+        ORDER BY (0 - ?c)
+    ";
+
+    let result = support::query_sparql(&fluree, &ledger, query)
+        .await
+        .unwrap();
+    let jsonld = result.to_jsonld(&ledger.snapshot).expect("to_jsonld");
+    let rows = jsonld.as_array().expect("array of rows");
+    let counts: Vec<i64> = rows
+        .iter()
+        .map(|row| row[1].as_i64().expect("count is an integer"))
+        .collect();
+    assert!(
+        counts.len() >= 2,
+        "expected multiple predicate groups, got: {counts:?}"
+    );
+    assert!(
+        counts.windows(2).all(|w| w[0] >= w[1]),
+        "ORDER BY (0 - ?c) must yield descending counts, got: {counts:?}"
+    );
+}
+
+#[tokio::test]
+async fn sparql_order_by_expression_over_grouped_var_errors_cleanly() {
+    // Regression (P1b): an aggregating query whose ORDER BY expression reads a
+    // variable that is neither a GROUP BY key nor an aggregate output must be
+    // rejected with a clean error — NOT panic on a Grouped binding.
+    assert_index_defaults();
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger = seed_people(&fluree, "people:main").await;
+
+    let query = r"
+        PREFIX person: <http://example.org/Person#>
+        SELECT ?handle (COUNT(?favNum) AS ?c)
+        WHERE {
+          ?person person:handle ?handle ;
+                  person:favNums ?favNum .
+        }
+        GROUP BY ?handle
+        ORDER BY (?favNum + 1)
+    ";
+
+    let result = support::query_sparql(&fluree, &ledger, query).await;
+    assert!(
+        result.is_err(),
+        "ORDER BY over a non-grouped variable should error, got: {result:?}"
+    );
+}
+
+// =============================================================================
+// Subquery / top-level modifier unification (subquery-unification proposal).
+//
+// After unification, a `{ SELECT … }` subquery inherits the full top-level
+// solution-modifier tail (HAVING, post-aggregation binds, expression/aggregate
+// ORDER BY, ORDER-BY-before-PROJECT, sort-var validation) via the shared
+// `apply_solution_modifiers`. These mirror the top-level ORDER BY / aggregate
+// tests above. LIMIT inside the subquery makes the returned *set* reflect the
+// inner ordering, so `normalize_rows` (set comparison) stays order-robust.
+// =============================================================================
+
+#[tokio::test]
+async fn sparql_subquery_expression_order_by_with_limit() {
+    // Pattern 1: expression ORDER BY inside a subquery — previously REJECTED at
+    // lowering, now works. `(0 - ?favNum)` ascending = ?favNum descending; the
+    // synthetic order-bind key is evaluated and sorted before project/merge.
+    assert_index_defaults();
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger = seed_people(&fluree, "people:main").await;
+
+    let query = r"
+        PREFIX person: <http://example.org/Person#>
+        SELECT ?favNum
+        WHERE {
+          { SELECT ?favNum WHERE { ?person person:favNums ?favNum }
+            ORDER BY (0 - ?favNum) LIMIT 1 }
+        }
+    ";
+
+    let result = support::query_sparql(&fluree, &ledger, query)
+        .await
+        .unwrap();
+    let jsonld = result.to_jsonld(&ledger.snapshot).expect("to_jsonld");
+    // Max favNum across all people is 99 (jdoe); LIMIT 1 keeps the largest.
+    assert_eq!(normalize_rows(&jsonld), normalize_rows(&json!([[99]])));
+}
+
+#[tokio::test]
+async fn sparql_subquery_aggregate_order_by_with_limit() {
+    // Pattern 2: aggregate ORDER BY `DESC(COUNT(?favNum))` inside a subquery.
+    assert_index_defaults();
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger = seed_people(&fluree, "people:main").await;
+
+    let query = r"
+        PREFIX person: <http://example.org/Person#>
+        SELECT ?handle ?c
+        WHERE {
+          { SELECT ?handle (COUNT(?favNum) AS ?c)
+            WHERE { ?person person:handle ?handle ; person:favNums ?favNum . }
+            GROUP BY ?handle
+            ORDER BY DESC(COUNT(?favNum))
+            LIMIT 1 }
+        }
+    ";
+
+    let result = support::query_sparql(&fluree, &ledger, query)
+        .await
+        .unwrap();
+    let jsonld = result.to_jsonld(&ledger.snapshot).expect("to_jsonld");
+    // Counts: jbob 7, jdoe 4, bbob 1; DESC top-1 = jbob.
+    assert_eq!(
+        normalize_rows(&jsonld),
+        normalize_rows(&json!([["jbob", 7]]))
+    );
+}
+
+#[tokio::test]
+async fn sparql_subquery_aggregate_order_by_not_selected() {
+    // Pattern 3: aggregate ORDER BY where the aggregate is NOT in the SELECT.
+    assert_index_defaults();
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger = seed_people(&fluree, "people:main").await;
+
+    let query = r"
+        PREFIX person: <http://example.org/Person#>
+        SELECT ?handle
+        WHERE {
+          { SELECT ?handle
+            WHERE { ?person person:handle ?handle ; person:favNums ?favNum . }
+            GROUP BY ?handle
+            ORDER BY DESC(COUNT(?favNum))
+            LIMIT 1 }
+        }
+    ";
+
+    let result = support::query_sparql(&fluree, &ledger, query)
+        .await
+        .unwrap();
+    let jsonld = result.to_jsonld(&ledger.snapshot).expect("to_jsonld");
+    // Sorted by an aggregate not projected; top-1 by count = jbob.
+    assert_eq!(normalize_rows(&jsonld), normalize_rows(&json!([["jbob"]])));
+}
+
+#[tokio::test]
+async fn sparql_subquery_having() {
+    // Pattern 4: HAVING inside a subquery — previously a parse error, then a
+    // dropped clause. Now lowered and applied.
+    assert_index_defaults();
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger = seed_people(&fluree, "people:main").await;
+
+    let query = r"
+        PREFIX person: <http://example.org/Person#>
+        SELECT ?handle ?c
+        WHERE {
+          { SELECT ?handle (COUNT(?favNum) AS ?c)
+            WHERE { ?person person:handle ?handle ; person:favNums ?favNum . }
+            GROUP BY ?handle
+            HAVING (COUNT(?favNum) > 5) }
+        }
+    ";
+
+    let result = support::query_sparql(&fluree, &ledger, query)
+        .await
+        .unwrap();
+    let jsonld = result.to_jsonld(&ledger.snapshot).expect("to_jsonld");
+    // Counts: jbob 7 (>5), jdoe 4, bbob 1 → only jbob survives HAVING.
+    assert_eq!(
+        normalize_rows(&jsonld),
+        normalize_rows(&json!([["jbob", 7]]))
+    );
+}
+
+#[tokio::test]
+async fn sparql_subquery_post_aggregation_bind() {
+    // Pattern 5: post-aggregation SELECT expression inside a subquery —
+    // previously silently dropped. `(?c + 100 AS ?bumped)` references the
+    // aggregate alias `?c`, so it rides as a post-aggregation bind.
+    assert_index_defaults();
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger = seed_people(&fluree, "people:main").await;
+
+    let query = r"
+        PREFIX person: <http://example.org/Person#>
+        SELECT ?handle ?bumped
+        WHERE {
+          { SELECT ?handle (COUNT(?favNum) AS ?c) (?c + 100 AS ?bumped)
+            WHERE { ?person person:handle ?handle ; person:favNums ?favNum . }
+            GROUP BY ?handle }
+        }
+    ";
+
+    let result = support::query_sparql(&fluree, &ledger, query)
+        .await
+        .unwrap();
+    let jsonld = result.to_jsonld(&ledger.snapshot).expect("to_jsonld");
+    // Counts jbob 7, jdoe 4, bbob 1 → bumped = count + 100.
+    assert_eq!(
+        normalize_rows(&jsonld),
+        normalize_rows(&json!([["jbob", 107], ["jdoe", 104], ["bbob", 101]]))
+    );
+}
+
+#[tokio::test]
+async fn sparql_subquery_order_by_non_projected_var() {
+    // Pattern 6: ORDER BY a variable NOT in the subquery SELECT — previously
+    // silently unordered (sort ran after project, so the key was gone). Now the
+    // sort runs before project, so LIMIT 1 picks the max-?favNum row.
+    assert_index_defaults();
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger = seed_people(&fluree, "people:main").await;
+
+    let query = r"
+        PREFIX person: <http://example.org/Person#>
+        SELECT ?handle
+        WHERE {
+          { SELECT ?handle
+            WHERE { ?person person:handle ?handle ; person:favNums ?favNum . }
+            ORDER BY DESC(?favNum) LIMIT 1 }
+        }
+    ";
+
+    let result = support::query_sparql(&fluree, &ledger, query)
+        .await
+        .unwrap();
+    let jsonld = result.to_jsonld(&ledger.snapshot).expect("to_jsonld");
+    // Max favNum is 99 (jdoe); sort-before-project makes LIMIT 1 deterministic.
+    assert_eq!(normalize_rows(&jsonld), normalize_rows(&json!([["jdoe"]])));
+}
+
+#[tokio::test]
+async fn sparql_subquery_order_by_select_alias_expression() {
+    // Pattern 7: ORDER BY a select-expression alias inside a subquery.
+    assert_index_defaults();
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger = seed_people(&fluree, "people:main").await;
+
+    let query = r"
+        PREFIX person: <http://example.org/Person#>
+        SELECT ?handle ?s
+        WHERE {
+          { SELECT ?handle (?favNum + 1000 AS ?s)
+            WHERE { ?person person:handle ?handle ; person:favNums ?favNum . }
+            ORDER BY DESC(?s) LIMIT 1 }
+        }
+    ";
+
+    let result = support::query_sparql(&fluree, &ledger, query)
+        .await
+        .unwrap();
+    let jsonld = result.to_jsonld(&ledger.snapshot).expect("to_jsonld");
+    // ?s = favNum + 1000; max favNum 99 (jdoe) → s = 1099.
+    assert_eq!(
+        normalize_rows(&jsonld),
+        normalize_rows(&json!([["jdoe", 1099]]))
+    );
+}
+
+#[tokio::test]
+async fn sparql_subquery_full_modifier_stack() {
+    // Pattern 8: GROUP BY + HAVING + aggregate ORDER BY + LIMIT in one subquery.
+    assert_index_defaults();
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger = seed_people(&fluree, "people:main").await;
+
+    let query = r"
+        PREFIX person: <http://example.org/Person#>
+        SELECT ?handle ?c
+        WHERE {
+          { SELECT ?handle (COUNT(?favNum) AS ?c)
+            WHERE { ?person person:handle ?handle ; person:favNums ?favNum . }
+            GROUP BY ?handle
+            HAVING (COUNT(?favNum) > 0)
+            ORDER BY DESC(COUNT(?favNum))
+            LIMIT 2 }
+        }
+    ";
+
+    let result = support::query_sparql(&fluree, &ledger, query)
+        .await
+        .unwrap();
+    let jsonld = result.to_jsonld(&ledger.snapshot).expect("to_jsonld");
+    // Counts jbob 7, jdoe 4, bbob 1; HAVING>0 keeps all; DESC top-2 = jbob, jdoe.
+    assert_eq!(
+        normalize_rows(&jsonld),
+        normalize_rows(&json!([["jbob", 7], ["jdoe", 4]]))
+    );
+}
+
+#[tokio::test]
+async fn sparql_correlated_subquery_group_by_aggregate_order_by() {
+    // Pattern 9: correlated subquery + GROUP BY + aggregate ORDER BY, with the
+    // per-row correlation preserved. The outer binds ?handle; the subquery
+    // correlates on ?handle (it appears in the subquery SELECT) and counts that
+    // person's favNums.
+    assert_index_defaults();
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger = seed_people(&fluree, "people:main").await;
+
+    let query = r"
+        PREFIX person: <http://example.org/Person#>
+        SELECT ?handle ?c
+        WHERE {
+          ?person person:handle ?handle .
+          { SELECT ?handle (COUNT(?favNum) AS ?c)
+            WHERE { ?p2 person:handle ?handle ; person:favNums ?favNum . }
+            GROUP BY ?handle
+            ORDER BY DESC(COUNT(?favNum)) }
+        }
+    ";
+
+    let result = support::query_sparql(&fluree, &ledger, query)
+        .await
+        .unwrap();
+    let jsonld = result.to_jsonld(&ledger.snapshot).expect("to_jsonld");
+    // Each handle with its own favNum count; dankeshön (no favNums) drops out.
+    assert_eq!(
+        normalize_rows(&jsonld),
+        normalize_rows(&json!([["jbob", 7], ["jdoe", 4], ["bbob", 1]]))
+    );
+}
+
+#[tokio::test]
+async fn sparql_subquery_distinct_order_by_limit_reorder() {
+    // Pipeline-reorder safety: `SELECT DISTINCT ?x … ORDER BY DESC(?x) LIMIT k`
+    // (ORDER BY references only projected vars) takes the project-distinct-
+    // before-sort path. It must still yield the top-k distinct values.
+    assert_index_defaults();
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger = seed_people(&fluree, "people:main").await;
+
+    let query = r"
+        PREFIX person: <http://example.org/Person#>
+        SELECT ?favNum
+        WHERE {
+          { SELECT DISTINCT ?favNum
+            WHERE { ?person person:favNums ?favNum }
+            ORDER BY DESC(?favNum) LIMIT 3 }
+        }
+    ";
+
+    let result = support::query_sparql(&fluree, &ledger, query)
+        .await
+        .unwrap();
+    let jsonld = result.to_jsonld(&ledger.snapshot).expect("to_jsonld");
+    // Distinct favNums {0,3,5,6,7,8,9,23,42,99}; DESC top-3 = 99, 42, 23.
+    assert_eq!(
+        normalize_rows(&jsonld),
+        normalize_rows(&json!([[99], [42], [23]]))
+    );
+}
+
+#[tokio::test]
+async fn sparql_subquery_having_eliminates_all_groups() {
+    // HAVING inside a subquery that NO group satisfies must yield an empty
+    // result — proving the clause actually filters rather than passing through.
+    assert_index_defaults();
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger = seed_people(&fluree, "people:main").await;
+
+    let query = r"
+        PREFIX person: <http://example.org/Person#>
+        SELECT ?handle ?c
+        WHERE {
+          { SELECT ?handle (COUNT(?favNum) AS ?c)
+            WHERE { ?person person:handle ?handle ; person:favNums ?favNum . }
+            GROUP BY ?handle
+            HAVING (COUNT(?favNum) > 100) }
+        }
+    ";
+
+    let result = support::query_sparql(&fluree, &ledger, query)
+        .await
+        .unwrap();
+    let jsonld = result.to_jsonld(&ledger.snapshot).expect("to_jsonld");
+    // Max count is 7 (jbob); none exceed 100 → every group removed.
+    assert_eq!(normalize_rows(&jsonld), normalize_rows(&json!([])));
+}
+
+#[tokio::test]
+async fn sparql_correlated_subquery_order_by_limit_per_row() {
+    // Correlated subquery where the inner ORDER BY + LIMIT genuinely matter:
+    // for each outer ?person, pick that person's MAX favNum via
+    // `ORDER BY DESC(?top) LIMIT 1`. Proves per-row correlation seeding is
+    // preserved AND the inner sort/limit run before the merge-back.
+    assert_index_defaults();
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger = seed_people(&fluree, "people:main").await;
+
+    let query = r"
+        PREFIX person: <http://example.org/Person#>
+        SELECT ?handle ?top
+        WHERE {
+          ?person person:handle ?handle .
+          { SELECT ?person ?top
+            WHERE { ?person person:favNums ?top }
+            ORDER BY DESC(?top)
+            LIMIT 1 }
+        }
+    ";
+
+    let result = support::query_sparql(&fluree, &ledger, query)
+        .await
+        .unwrap();
+    let jsonld = result.to_jsonld(&ledger.snapshot).expect("to_jsonld");
+    // Per-person max favNum: jdoe 99, bbob 23, jbob 9; dankeshön (no favNums) drops.
+    assert_eq!(
+        normalize_rows(&jsonld),
+        normalize_rows(&json!([["jdoe", 99], ["bbob", 23], ["jbob", 9]]))
+    );
+}
+
+#[tokio::test]
+async fn sparql_subquery_group_concat_sum_respects_inner_offset() {
+    // Regression: the fused SUM(STRLEN(GROUP_CONCAT(..))) fast path sums over
+    // EVERY group and ignores the inner subquery's slice/distinct modifiers, so
+    // it must decline when any are present. Here OFFSET skips all groups, so the
+    // correct answer is the empty/zero sum — NOT the all-groups sum the fast path
+    // would otherwise return.
+    assert_index_defaults();
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger = seed_people(&fluree, "people:main").await;
+
+    // Baseline: no inner modifier → SUM of STRLEN(GROUP_CONCAT) over all groups.
+    // Per-group lengths (separator=""): jdoe "374299"=6, bbob "23"=2,
+    // jbob "8675309"=7 → 15 (STRLEN is order-invariant).
+    let all = r#"
+        PREFIX person: <http://example.org/Person#>
+        SELECT (SUM(STRLEN(?cat)) AS ?total)
+        WHERE {
+          { SELECT ?person (GROUP_CONCAT(?favNum; SEPARATOR="") AS ?cat)
+            WHERE { ?person person:favNums ?favNum }
+            GROUP BY ?person }
+        }
+    "#;
+    let all_rows = support::query_sparql(&fluree, &ledger, all)
+        .await
+        .unwrap()
+        .to_jsonld(&ledger.snapshot)
+        .expect("to_jsonld");
+    assert_eq!(all_rows, json!([[15]]));
+
+    // Inner OFFSET past every group → empty subquery → sum over nothing (0).
+    let offset = r#"
+        PREFIX person: <http://example.org/Person#>
+        SELECT (SUM(STRLEN(?cat)) AS ?total)
+        WHERE {
+          { SELECT ?person (GROUP_CONCAT(?favNum; SEPARATOR="") AS ?cat)
+            WHERE { ?person person:favNums ?favNum }
+            GROUP BY ?person
+            OFFSET 100 }
+        }
+    "#;
+    let offset_rows = support::query_sparql(&fluree, &ledger, offset)
+        .await
+        .unwrap()
+        .to_jsonld(&ledger.snapshot)
+        .expect("to_jsonld");
+    // With the guard, the fast path declines and the generic pipeline honors the
+    // OFFSET: the subquery is empty, so SUM has nothing to add (unbound). Without
+    // the guard this would wrongly equal the all-groups sum (15).
+    assert_eq!(offset_rows, json!([[null]]));
+}
+
+#[tokio::test]
+async fn sparql_aggregate_over_expression_in_joined_subqueries() {
+    // Regression (benchmark-db bug #4, BSBM BI-5): an aggregate over a COMPUTED
+    // EXPRESSION (`AVG(xsd:float(?n))`) inside a grouped sub-SELECT used to fail
+    // when two such sub-SELECTs are joined — the shared aggregate-input
+    // expression was CSE-deduplicated across subquery scopes, leaving the second
+    // subquery's synthetic input var unbound. Each subquery must get its own.
+    assert_index_defaults();
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger = seed_people(&fluree, "people:main").await;
+
+    let query = r"
+        PREFIX person: <http://example.org/Person#>
+        PREFIX xsd: <http://www.w3.org/2001/XMLSchema#>
+        SELECT ?handle {
+          { SELECT ?handle (AVG(xsd:float(?favNum)) AS ?x)
+            WHERE { ?p person:handle ?handle ; person:favNums ?favNum }
+            GROUP BY ?handle }
+          { SELECT ?handle (AVG(xsd:float(?favNum)) AS ?y)
+            WHERE { ?p2 person:handle ?handle ; person:favNums ?favNum }
+            GROUP BY ?handle }
+        }
+    ";
+
+    let jsonld = support::query_sparql(&fluree, &ledger, query)
+        .await
+        .expect("aggregate-over-expression in joined sub-SELECTs should not error")
+        .to_jsonld(&ledger.snapshot)
+        .expect("to_jsonld");
+    // The two grouped sub-SELECTs join on ?handle; handles with favNums are
+    // jdoe, bbob, jbob (dankeshön has none).
+    assert_eq!(
+        normalize_rows(&jsonld),
+        normalize_rows(&json!([["jdoe"], ["bbob"], ["jbob"]]))
+    );
+}
+
+#[tokio::test]
+async fn sparql_group_by_unbound_variable() {
+    // SPARQL 1.1 §11.4 / §18.5 (benchmark-db bug #5, BSBM BI-4): GROUP BY (and
+    // SELECT) of a variable the pattern never binds is legal — the variable is
+    // unbound, so all solutions share it and collapse to one group per the bound
+    // keys. Previously this failed at plan time ("GROUP BY variable not found in
+    // query schema").
+    assert_index_defaults();
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger = seed_people(&fluree, "people:main").await;
+
+    // ?country is never bound in the WHERE.
+    let query = r"
+        PREFIX person: <http://example.org/Person#>
+        SELECT ?country ?handle (COUNT(?favNum) AS ?c)
+        WHERE { ?p person:handle ?handle ; person:favNums ?favNum }
+        GROUP BY ?country ?handle
+    ";
+
+    let jsonld = support::query_sparql(&fluree, &ledger, query)
+        .await
+        .expect("GROUP BY an unbound variable is legal")
+        .to_jsonld(&ledger.snapshot)
+        .expect("to_jsonld");
+    // ?country unbound (null) for every group; counts: jdoe 4, bbob 1, jbob 7.
+    assert_eq!(
+        normalize_rows(&jsonld),
+        normalize_rows(&json!([
+            [null, "jdoe", 4],
+            [null, "bbob", 1],
+            [null, "jbob", 7]
+        ]))
+    );
+}
+
+#[tokio::test]
+async fn sparql_select_unbound_variable_no_grouping() {
+    // Companion to the GROUP BY case: selecting a never-bound variable in an
+    // ungrouped query reports it unbound rather than erroring.
+    assert_index_defaults();
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger = seed_people(&fluree, "people:main").await;
+
+    let query = r"
+        PREFIX person: <http://example.org/Person#>
+        SELECT ?handle ?missing
+        WHERE { ?p person:handle ?handle }
+    ";
+
+    let jsonld = support::query_sparql(&fluree, &ledger, query)
+        .await
+        .expect("selecting an unbound variable is legal")
+        .to_jsonld(&ledger.snapshot)
+        .expect("to_jsonld");
+    // Each handle (column order ?handle ?missing) with ?missing unbound (null).
+    assert_eq!(
+        normalize_rows(&jsonld),
+        normalize_rows(&json!([
+            ["jdoe", null],
+            ["bbob", null],
+            ["jbob", null],
+            ["dankeshön", null]
+        ]))
+    );
+}
+
+#[tokio::test]
+async fn sparql_filter_equality_equijoin_results_preserved() {
+    // Performance optimization (benchmark-db perf #1, BSBM BI-2): FILTER(?x = ?y)
+    // between two ref-valued triple objects folds into an equijoin (var unify).
+    // This verifies the rewrite preserves results — the shared-feature count per
+    // product, the BI-2 shape.
+    assert_index_defaults();
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger0 = genesis_ledger(&fluree, "features:main");
+    let insert = json!({
+        "@context": { "ex": "http://example.org/ns/" },
+        "@graph": [
+            {"@id":"ex:p1","ex:feature":[{"@id":"ex:fa"},{"@id":"ex:fb"},{"@id":"ex:fc"}]},
+            {"@id":"ex:p2","ex:feature":[{"@id":"ex:fa"},{"@id":"ex:fb"}]},
+            {"@id":"ex:p3","ex:feature":[{"@id":"ex:fc"},{"@id":"ex:fd"}]},
+            {"@id":"ex:p4","ex:feature":[{"@id":"ex:fx"}]}
+        ]
+    });
+    let ledger = fluree
+        .insert(ledger0, &insert)
+        .await
+        .expect("insert+commit should succeed")
+        .ledger;
+
+    let query = r"
+        PREFIX ex: <http://example.org/ns/>
+        SELECT ?other (COUNT(?f2) AS ?shared)
+        WHERE {
+          ex:p1 ex:feature ?f1 .
+          ?other ex:feature ?f2 .
+          FILTER(?f1 = ?f2)
+        }
+        GROUP BY ?other
+    ";
+
+    let jsonld = support::query_sparql(&fluree, &ledger, query)
+        .await
+        .unwrap()
+        .to_jsonld(&ledger.snapshot)
+        .expect("to_jsonld");
+    // Shared features with p1's {fa,fb,fc}: p1 itself 3, p2 {fa,fb}=2, p3 {fc}=1;
+    // p4 ({fx}) shares none, so it never binds ?f2 and is absent.
+    assert_eq!(
+        normalize_rows(&jsonld),
+        normalize_rows(&json!([["ex:p1", 3], ["ex:p2", 2], ["ex:p3", 1]]))
+    );
+}
+
+#[tokio::test]
+async fn sparql_filter_equality_equijoin_inside_subquery() {
+    // The exact BSBM BI-2 shape: the FILTER(?f1 = ?f2) equijoin lives inside a
+    // grouped sub-SELECT. The fold must recurse into the subquery scope and
+    // preserve results (the aggregate COUNT(?f2) follows the unified variable).
+    assert_index_defaults();
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger0 = genesis_ledger(&fluree, "features:sub");
+    let insert = json!({
+        "@context": { "ex": "http://example.org/ns/" },
+        "@graph": [
+            {"@id":"ex:p1","ex:feature":[{"@id":"ex:fa"},{"@id":"ex:fb"},{"@id":"ex:fc"}]},
+            {"@id":"ex:p2","ex:feature":[{"@id":"ex:fa"},{"@id":"ex:fb"}]},
+            {"@id":"ex:p3","ex:feature":[{"@id":"ex:fc"},{"@id":"ex:fd"}]}
+        ]
+    });
+    let ledger = fluree
+        .insert(ledger0, &insert)
+        .await
+        .expect("insert+commit should succeed")
+        .ledger;
+
+    let query = r"
+        PREFIX ex: <http://example.org/ns/>
+        SELECT ?other ?shared {
+          { SELECT ?other (COUNT(?f2) AS ?shared)
+            {
+              ex:p1 ex:feature ?f1 .
+              ?other ex:feature ?f2 .
+              FILTER(?f1 = ?f2)
+            }
+            GROUP BY ?other }
+        }
+    ";
+
+    let jsonld = support::query_sparql(&fluree, &ledger, query)
+        .await
+        .unwrap()
+        .to_jsonld(&ledger.snapshot)
+        .expect("to_jsonld");
+    assert_eq!(
+        normalize_rows(&jsonld),
+        normalize_rows(&json!([["ex:p1", 3], ["ex:p2", 2], ["ex:p3", 1]]))
+    );
+}
+
+#[tokio::test]
 async fn sparql_delete_data_removes_specified_triples() {
     assert_index_defaults();
     let fluree = FlureeBuilder::memory().build_memory();
@@ -810,13 +1731,20 @@ async fn sparql_aggregate_avg_over_values() {
         .unwrap();
     let jsonld = result.to_jsonld(&ledger.snapshot).expect("to_jsonld");
 
-    let avg = jsonld
+    // Per W3C, AVG of integers yields xsd:decimal — JSON-LD renders decimals
+    // as strings to preserve exactness (vs. xsd:double which renders as a
+    // number). Parse the string and check the numeric value.
+    let avg_cell = jsonld
         .as_array()
         .and_then(|arr| arr.first())
         .and_then(|row| row.as_array())
         .and_then(|row| row.first())
-        .and_then(serde_json::Value::as_f64)
-        .expect("avg result");
+        .expect("avg cell");
+    let avg: f64 = avg_cell
+        .as_str()
+        .expect("avg rendered as decimal string")
+        .parse()
+        .expect("decimal parses as number");
     assert!((avg - 17.666_666_666_666_67).abs() < 1e-12);
 }
 
@@ -840,12 +1768,19 @@ async fn sparql_group_by_having_filters_groups() {
         .unwrap();
     let jsonld = result.to_jsonld(&ledger.snapshot).expect("to_jsonld");
 
+    // Per W3C, AVG of integers yields xsd:decimal — JSON-LD serializes
+    // decimals as strings to preserve precision.
     let mut values: Vec<f64> = jsonld
         .as_array()
         .expect("avg rows array")
         .iter()
         .flat_map(|row| row.as_array().expect("row array").iter())
-        .filter_map(serde_json::Value::as_f64)
+        .map(|cell| {
+            cell.as_str()
+                .expect("avg cell rendered as decimal string")
+                .parse::<f64>()
+                .expect("parses as number")
+        })
         .collect();
     values.sort_by(|a, b| a.partial_cmp(b).unwrap());
 
@@ -923,8 +1858,18 @@ async fn sparql_multiple_select_expressions_with_aggregate_alias() {
 
     let rows = normalize_rows(&jsonld);
     assert_eq!(rows.len(), 1);
-    let avg = rows[0][0].as_f64().expect("avg");
-    let ceil = rows[0][1].as_f64().expect("ceil");
+    // Per W3C, AVG of integers yields xsd:decimal (JSON-LD: string);
+    // CEIL of an xsd:decimal yields xsd:decimal too.
+    let avg: f64 = rows[0][0]
+        .as_str()
+        .expect("avg as decimal string")
+        .parse()
+        .expect("parses");
+    let ceil: f64 = rows[0][1]
+        .as_str()
+        .expect("ceil as decimal string")
+        .parse()
+        .expect("parses");
     assert!((avg - 17.666_666_666_666_67).abs() < 1e-12);
     assert!((ceil - 18.0).abs() < 1e-12);
 }
@@ -1018,7 +1963,12 @@ async fn sparql_mix_of_grouped_values_and_aggregates() {
                 .iter()
                 .map(|v| v.as_i64().expect("favNum"))
                 .collect::<Vec<_>>();
-            let avg = row[1].as_f64().expect("avg");
+            // AVG of integers → xsd:decimal (JSON string).
+            let avg: f64 = row[1]
+                .as_str()
+                .expect("avg as decimal string")
+                .parse()
+                .expect("parses");
             let person = row[2].as_str().expect("person").to_string();
             let handle = row[3].as_str().expect("handle").to_string();
             let max = row[4].as_i64().expect("max");
@@ -2800,6 +3750,53 @@ async fn sparql_isnumeric_decimal() {
 }
 
 #[tokio::test]
+async fn sparql_sum_avg_over_xsd_decimal_repro() {
+    // Repro for reported bug: SUM(?x) over xsd:decimal returns 0,
+    // AVG(?x) returns unbound. SUM(xsd:integer) and MIN/MAX over the same
+    // decimals work, so the bug is specific to arithmetic aggregates +
+    // xsd:decimal.
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger = seed_builtin_fn_data(&fluree, "agg:decimal-sum").await;
+
+    let query = r"
+        PREFIX ex: <http://example.org/ns/>
+        SELECT
+          (SUM(?price) AS ?total)
+          (AVG(?price) AS ?avg)
+          (MIN(?price) AS ?lo)
+          (MAX(?price) AS ?hi)
+          (COUNT(?price) AS ?n)
+        WHERE { ?x ex:price ?price }
+    ";
+
+    let result = support::query_sparql(&fluree, &ledger, query)
+        .await
+        .expect("aggregate over decimal");
+    let sparql_json = result
+        .to_sparql_json(&ledger.snapshot)
+        .expect("to_sparql_json");
+    let bindings = normalize_sparql_bindings(&sparql_json);
+    assert_eq!(bindings.len(), 1);
+    let row = &bindings[0];
+
+    // 12.50 + 7.99 = 20.49 — exact xsd:decimal arithmetic, not lossy f64.
+    let total = row.get("total").expect("total bound");
+    assert_eq!(total["value"].as_str().unwrap(), "20.49");
+    assert_eq!(
+        total["datatype"].as_str().unwrap(),
+        "http://www.w3.org/2001/XMLSchema#decimal",
+        "SUM(xsd:decimal) must yield xsd:decimal per W3C arithmetic promotion"
+    );
+
+    let avg = row.get("avg").expect("avg bound (not Unbound)");
+    assert_eq!(avg["value"].as_str().unwrap(), "10.245");
+    assert_eq!(
+        avg["datatype"].as_str().unwrap(),
+        "http://www.w3.org/2001/XMLSchema#decimal"
+    );
+}
+
+#[tokio::test]
 async fn sparql_ucase_preserves_language_tag() {
     // W3C: UCASE must preserve language tags from the input.
     // SPARQL JSON output should include xml:lang on the result.
@@ -2922,6 +3919,49 @@ async fn sparql_xsd_cast_double_from_integer() {
         .expect("xsd:double cast query");
     let jsonld = result.to_jsonld(&ledger.snapshot).expect("to_jsonld");
     assert_eq!(jsonld, json!([[42.0]]));
+}
+
+#[tokio::test]
+async fn sparql_integer_division_yields_decimal() {
+    // Per XPath op:numeric-divide, xsd:integer / xsd:integer yields xsd:decimal:
+    // 10 / 4 = 2.5, NOT a truncated integer 2.
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger = seed_builtin_fn_data(&fluree, "arith:int-div").await;
+
+    let query = r"
+        PREFIX ex: <http://example.org/ns/>
+        SELECT (10 / 4 AS ?r)
+        WHERE { ex:sushi ex:label ?label }
+    ";
+
+    let result = support::query_sparql(&fluree, &ledger, query)
+        .await
+        .expect("integer division query");
+    let jsonld = result.to_jsonld(&ledger.snapshot).expect("to_jsonld");
+    // xsd:decimal renders as a string to preserve exactness (see the
+    // xsd:double note elsewhere in this file); the value is 2.5, not 2.
+    assert_eq!(jsonld, json!([["2.5"]]));
+}
+
+#[tokio::test]
+async fn sparql_float_divided_by_integer_promotes() {
+    // Mixed numeric arithmetic: xsd:float(...) / xsd:integer must promote (not
+    // error with a type mismatch). 10.0 / 4 = 2.5.
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger = seed_builtin_fn_data(&fluree, "arith:float-div-int").await;
+
+    let query = r"
+        PREFIX xsd: <http://www.w3.org/2001/XMLSchema#>
+        PREFIX ex: <http://example.org/ns/>
+        SELECT (xsd:float(10) / 4 AS ?r)
+        WHERE { ex:sushi ex:label ?label }
+    ";
+
+    let result = support::query_sparql(&fluree, &ledger, query)
+        .await
+        .expect("float / integer query");
+    let jsonld = result.to_jsonld(&ledger.snapshot).expect("to_jsonld");
+    assert_eq!(jsonld, json!([[2.5]]));
 }
 
 #[tokio::test]

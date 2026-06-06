@@ -374,12 +374,60 @@ impl PropertyPathOperator {
         start: &Sid,
         target: &Sid,
     ) -> Result<bool> {
-        // Use the same traversal semantics as forward execution and check membership.
-        //
-        // This avoids duplicating BFS logic and ensures cycle/self reachability behavior
-        // matches the variable-binding mode.
-        let reachable = self.traverse_forward(ctx, start).await?;
-        Ok(reachable.iter().any(|sid| sid == target))
+        // ZeroOrMore includes the zero-length path.
+        if self.pattern.modifier == PathModifier::ZeroOrMore && start == target {
+            return Ok(true);
+        }
+
+        let mut visited: HashSet<Sid> = HashSet::new();
+        let mut queue: VecDeque<Sid> = VecDeque::new();
+
+        queue.push_back(start.clone());
+        visited.insert(start.clone());
+
+        while let Some(current) = queue.pop_front() {
+            if visited.len() >= self.max_visited {
+                return Err(QueryError::ResourceLimit(format!(
+                    "Property path exceeded max visited nodes ({})",
+                    self.max_visited
+                )));
+            }
+
+            let range_match = RangeMatch::new()
+                .with_subject(current.clone())
+                .with_predicate(self.pattern.predicate.clone());
+            let (db, overlay, to_t) = ctx.require_single_graph()?;
+            let opts = RangeOptions::new().with_to_t(to_t);
+
+            let flakes = range_with_overlay(
+                db,
+                ctx.binary_g_id,
+                overlay,
+                IndexType::Spot,
+                RangeTest::Eq,
+                range_match,
+                opts,
+            )
+            .await?;
+
+            for flake in flakes {
+                let FlakeValue::Ref(obj_sid) = flake.o else {
+                    continue;
+                };
+
+                // This is a non-zero-length path, so it satisfies OneOrMore
+                // even when the target is the start node reached via a cycle.
+                if &obj_sid == target {
+                    return Ok(true);
+                }
+
+                if visited.insert(obj_sid.clone()) {
+                    queue.push_back(obj_sid);
+                }
+            }
+        }
+
+        Ok(false)
     }
 
     /// Execute unseeded mode (no child operator)
@@ -461,6 +509,7 @@ impl PropertyPathOperator {
         // Note: lowering may produce `Ref::Iri` constants to support cross-ledger joins.
         // For property paths we must traverse SIDs, so we opportunistically encode IRIs
         // against the selected active graph's namespace table.
+        let binary_store = ctx.binary_store.as_ref();
         let resolve_sid = |term: &Ref, binding: Option<&Binding>| -> Option<Sid> {
             match term {
                 Ref::Sid(s) => Some(s.clone()),
@@ -469,6 +518,17 @@ impl PropertyPathOperator {
                     Binding::Sid { sid: s, .. } => Some(s.clone()),
                     Binding::IriMatch { iri, .. } => db_for_encode.encode_iri(iri),
                     Binding::Iri(iri) => db_for_encode.encode_iri(iri),
+                    // Indexed BinaryScan emits late-materialized EncodedSid for a
+                    // correlated path endpoint (e.g. the ?mid of `?s p1 ?mid . ?mid p2+ ?o`
+                    // with a bound subject). Resolve its raw s_id (only meaningful within
+                    // this single ledger, which property paths already require) to its IRI
+                    // via the active graph's store, then re-encode against the same graph —
+                    // matching the `IriMatch`/`Iri` arms above. Without this arm the binding
+                    // resolved to None and fell into the full-closure branch, pairing the
+                    // row with the entire p2 closure.
+                    Binding::EncodedSid { s_id, .. } => binary_store
+                        .and_then(|st| st.resolve_subject_iri(*s_id).ok())
+                        .and_then(|iri| db_for_encode.encode_iri(&iri)),
                     _ => None,
                 }),
             }
@@ -572,6 +632,12 @@ impl PropertyPathOperator {
 
 #[async_trait]
 impl Operator for PropertyPathOperator {
+    fn plan_children(&self) -> Vec<crate::plan_node::PlanChild<'_>> {
+        self.child
+            .as_deref()
+            .map(|c| vec![crate::plan_node::PlanChild::child(c)])
+            .unwrap_or_default()
+    }
     fn schema(&self) -> &[VarId] {
         effective_schema(&self.out_schema, &self.in_schema)
     }

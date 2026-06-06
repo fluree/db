@@ -455,6 +455,7 @@ async fn drop_branch_leaf() {
         .unwrap();
     let report = fluree.drop_branch("mydb", "dev").await.unwrap();
 
+    assert_eq!(report.status, fluree_db_api::DropStatus::Dropped);
     assert!(!report.deferred, "leaf branch should not be deferred");
     assert_eq!(report.ledger_id, "mydb:dev");
 
@@ -464,7 +465,51 @@ async fn drop_branch_leaf() {
     assert_eq!(names, vec!["main"]);
 }
 
-/// Cannot drop the main branch.
+/// A second `drop_branch` on the same branch must report
+/// `DropStatus::AlreadyRetracted` (not silently re-report `Dropped`).
+/// The CLI relies on this to render a "no-op" message instead of
+/// claiming a successful drop the second time.
+#[tokio::test]
+async fn drop_branch_is_idempotent_already_retracted() {
+    let fluree = FlureeBuilder::memory().build_memory();
+
+    let ledger = fluree.create_ledger("mydb").await.unwrap();
+    let txn = json!({
+        "@context": {"ex": "http://example.org/ns/"},
+        "@graph": [{"@id": "ex:seed", "ex:val": 1}]
+    });
+    fluree.insert(ledger, &txn).await.unwrap();
+
+    // Create a child off "dev" so the first drop on "dev" is forced into
+    // the deferred / soft-retract path. That preserves the nameservice
+    // record (retracted = true) and lets a second drop_branch observe it.
+    fluree
+        .create_branch("mydb", "dev", None, None)
+        .await
+        .unwrap();
+    fluree
+        .create_branch("mydb", "feature", Some("dev"), None)
+        .await
+        .unwrap();
+
+    let first = fluree.drop_branch("mydb", "dev").await.unwrap();
+    assert_eq!(first.status, fluree_db_api::DropStatus::Dropped);
+    assert!(
+        first.deferred,
+        "drop with children must defer (record kept, retracted = true)"
+    );
+
+    let second = fluree.drop_branch("mydb", "dev").await.unwrap();
+    assert_eq!(
+        second.status,
+        fluree_db_api::DropStatus::AlreadyRetracted,
+        "second drop must observe the retracted record and report AlreadyRetracted",
+    );
+}
+
+/// Cannot drop the root branch. "main" is the default, so dropping it on a
+/// freshly-created ledger is refused — but the refusal is record-based
+/// (source_branch.is_none()), not name-based.
 #[tokio::test]
 async fn drop_main_refused() {
     let fluree = FlureeBuilder::memory().build_memory();
@@ -475,9 +520,49 @@ async fn drop_main_refused() {
         .await
         .expect_err("dropping main should fail");
     assert!(
-        err.to_string().contains("main"),
-        "error should mention main: {err}"
+        err.to_string().contains("root"),
+        "error should mention root: {err}"
     );
+}
+
+/// The root-branch refusal is structural — a ledger whose initial branch is
+/// "trunk" (not the default "main") has `trunk` as its root, and
+/// `drop_branch` must refuse `trunk` regardless of its name.
+#[tokio::test]
+async fn drop_branch_refuses_non_main_root() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    fluree.create_ledger("mydb:trunk").await.unwrap();
+
+    let err = fluree
+        .drop_branch("mydb", "trunk")
+        .await
+        .expect_err("dropping the root (named trunk) should fail");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("root") && msg.contains("trunk"),
+        "error should mention root and trunk: {msg}"
+    );
+}
+
+/// Conversely, a non-root branch named "main" is droppable — the refusal
+/// triggers on the record's source_branch, not on the literal string "main".
+#[tokio::test]
+async fn drop_branch_allows_non_root_named_main() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let trunk = fluree.create_ledger("mydb:trunk").await.unwrap();
+    let txn = json!({
+        "@context": {"ex": "http://example.org/ns/"},
+        "@graph": [{"@id": "ex:seed", "ex:val": 1}]
+    });
+    fluree.insert(trunk, &txn).await.unwrap();
+
+    fluree
+        .create_branch("mydb", "main", Some("trunk"), None)
+        .await
+        .unwrap();
+
+    let report = fluree.drop_branch("mydb", "main").await.unwrap();
+    assert_eq!(report.status, fluree_db_api::DropStatus::Dropped);
 }
 
 /// branches count is incremented on create and decremented on drop.

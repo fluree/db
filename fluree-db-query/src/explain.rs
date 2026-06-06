@@ -112,8 +112,22 @@ pub fn explain_patterns(patterns: &[TriplePattern], stats: Option<&StatsView>) -
         .map(|p| build_pattern_display(p, stats))
         .collect();
 
-    // Reorder patterns using the same algorithm as planner
-    let optimized = reorder_for_explain(patterns.to_vec(), stats);
+    // Reorder using the SAME planner the executor uses, so the explained order
+    // matches execution. Triples are wrapped as `Pattern::Triple`, reordered via
+    // `planner::reorder_patterns`, then unwrapped — no separate explain-only
+    // ordering algorithm that could drift.
+    let optimized: Vec<TriplePattern> = if patterns.len() <= 1 {
+        patterns.to_vec()
+    } else {
+        let wrapped: Vec<Pattern> = patterns.iter().cloned().map(Pattern::Triple).collect();
+        reorder_patterns(&wrapped, stats, &HashSet::new())
+            .into_iter()
+            .filter_map(|p| match p {
+                Pattern::Triple(tp) => Some(tp),
+                _ => None,
+            })
+            .collect()
+    };
     let optimized_patterns: Vec<PatternDisplay> = optimized
         .iter()
         .map(|p| build_pattern_display(p, stats))
@@ -333,87 +347,6 @@ fn format_term(term: &Term) -> String {
         Term::Iri(iri) => format!("<{iri}>"),
         Term::Value(val) => format!("{val:?}"),
     }
-}
-
-/// Reorder patterns for explain (reuses planner's algorithm via shared helpers)
-fn reorder_for_explain(
-    patterns: Vec<TriplePattern>,
-    stats: Option<&StatsView>,
-) -> Vec<TriplePattern> {
-    if patterns.len() <= 1 {
-        return patterns;
-    }
-
-    // If *all* patterns are using fallback scoring (no relevant stats),
-    // don't reorder (optimization would be arbitrary/noisy).
-    let all_fallback = patterns.iter().all(|p| {
-        let ty = classify_pattern(p, &HashSet::new());
-        let inputs = capture_selectivity_inputs(p, ty, stats);
-        inputs.fallback.is_some()
-    });
-    if all_fallback {
-        return patterns;
-    }
-
-    // If all patterns have identical selectivity, don't reorder (no benefit).
-    let mut first_score: Option<i64> = None;
-    let mut all_equal = true;
-    for p in &patterns {
-        let s = estimate_triple_row_count(p, &HashSet::new(), stats) as i64;
-        match first_score {
-            None => first_score = Some(s),
-            Some(fs) if fs == s => {}
-            Some(_) => all_equal = false,
-        }
-    }
-    if all_equal {
-        return patterns;
-    }
-
-    let mut remaining: Vec<_> = patterns.into_iter().collect();
-    let mut ordered = Vec::with_capacity(remaining.len());
-    let mut bound_vars: HashSet<VarId> = HashSet::new();
-
-    while !remaining.is_empty() {
-        let has_bound = !bound_vars.is_empty();
-        let candidates: Vec<usize> = remaining
-            .iter()
-            .enumerate()
-            .filter(|(_, p)| {
-                if !has_bound {
-                    true
-                } else {
-                    p.produced_vars().iter().any(|v| bound_vars.contains(v))
-                }
-            })
-            .map(|(i, _)| i)
-            .collect();
-
-        let pool: Vec<usize> = if candidates.is_empty() {
-            (0..remaining.len()).collect()
-        } else {
-            candidates
-        };
-
-        let best_idx = pool
-            .into_iter()
-            .min_by(|&i, &j| {
-                let score_i =
-                    estimate_triple_row_count(&remaining[i], &HashSet::new(), stats) as i64;
-                let score_j =
-                    estimate_triple_row_count(&remaining[j], &HashSet::new(), stats) as i64;
-                score_i.cmp(&score_j).then_with(|| i.cmp(&j))
-            })
-            .unwrap();
-
-        let chosen = remaining.remove(best_idx);
-        for var in chosen.produced_vars() {
-            bound_vars.insert(var);
-        }
-        ordered.push(chosen);
-    }
-
-    ordered
 }
 
 impl fmt::Display for ExplainPlan {
@@ -773,18 +706,20 @@ mod tests {
 
     #[test]
     fn test_explain_reordering() {
-        // Pattern with higher selectivity should be reordered to come first
-        // p1: ?s :name ?name (PropertyScan, score=1000)
-        // p2: ex:person1 :age ?age (BoundSubject, score=10)
+        // The more selective pattern is reordered to come first.
+        // p1: ?s :name ?name (PropertyScan, fallback score=1000)
+        // p2: ex:person1 :age ?age (BoundSubject, fallback score=10)
         let p1 = make_pattern(VarId(0), "name", VarId(1));
         let p2 = make_bound_subject_pattern(Sid::new(50, "person1"), "age", VarId(2));
 
         let patterns = vec![p1, p2];
         let explain = explain_patterns(&patterns, None);
 
-        // When *all* patterns are using fallback scoring (no relevant stats),
-        // we don't reorder to avoid noisy/unstable explain output.
-        assert_eq!(explain.optimization, OptimizationStatus::Unchanged);
+        // Explain now delegates to the real planner (`planner::reorder_patterns`),
+        // which orders by estimated cardinality even without stats — the cheaper
+        // BoundSubject pattern is placed ahead of the broad property scan.
+        assert_eq!(explain.optimization, OptimizationStatus::Reordered);
+        assert!(explain.optimized_patterns[0].pattern.contains("age"));
     }
 
     #[test]
@@ -816,6 +751,7 @@ mod tests {
             properties_by_iri: HashMap::new(),
             classes_by_iri: HashMap::new(),
             graph_properties: HashMap::new(),
+            ..Default::default()
         };
 
         let p1 = make_pattern(VarId(0), "name", VarId(1));
@@ -845,6 +781,7 @@ mod tests {
             properties_by_iri: HashMap::new(),
             classes_by_iri: HashMap::new(),
             graph_properties: HashMap::new(),
+            ..Default::default()
         };
 
         let patterns = vec![make_pattern(VarId(0), "name", VarId(1))];
@@ -929,6 +866,7 @@ mod tests {
             properties_by_iri: HashMap::new(),
             classes_by_iri: HashMap::new(),
             graph_properties: HashMap::new(),
+            ..Default::default()
         };
 
         let pattern = make_pattern(VarId(0), "name", VarId(1));

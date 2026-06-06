@@ -24,7 +24,10 @@ use crate::operator::{
 };
 use crate::var_registry::VarId;
 use async_trait::async_trait;
+use bigdecimal::{BigDecimal, ToPrimitive};
 use fluree_db_core::{FlakeValue, Sid};
+use num_bigint::BigInt;
+use num_traits::{Signed, Zero};
 use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Instant;
@@ -79,7 +82,7 @@ impl AggregateOperator {
         let mut group_size_col: Option<usize> = None;
 
         for (agg_idx, spec) in aggregates.iter().enumerate() {
-            match spec.input_var {
+            match spec.function.input_var() {
                 Some(input_var) => {
                     // Regular aggregate with input variable
                     if let Some(col_idx) = child_schema.iter().position(|v| *v == input_var) {
@@ -142,6 +145,9 @@ impl AggregateOperator {
 
 #[async_trait]
 impl Operator for AggregateOperator {
+    fn plan_children(&self) -> Vec<crate::plan_node::PlanChild<'_>> {
+        vec![crate::plan_node::PlanChild::child(self.child.as_ref())]
+    }
     fn schema(&self) -> &[VarId] {
         effective_schema(&self.out_schema, &self.in_schema)
     }
@@ -195,7 +201,7 @@ impl Operator for AggregateOperator {
                         Some(agg_idx) => {
                             // This column needs aggregation
                             let spec = &self.aggregates[agg_idx];
-                            apply_aggregate(&spec.function, input_binding, spec.distinct)
+                            spec.function.apply(input_binding)
                         }
                         None => {
                             // Pass through unchanged
@@ -218,7 +224,7 @@ impl Operator for AggregateOperator {
                         Some(col_idx) => (0..batch.len())
                             .map(|row_idx| {
                                 let input_binding = batch.get_by_col(row_idx, *col_idx);
-                                apply_aggregate(&spec.function, input_binding, spec.distinct)
+                                spec.function.apply(input_binding)
                             })
                             .collect(),
                         None => {
@@ -271,43 +277,54 @@ impl Operator for AggregateOperator {
     }
 }
 
-/// Apply an aggregate function to a binding
-///
-/// If the binding is `Grouped(values)`, compute the aggregate.
-/// Otherwise, pass through unchanged (shouldn't happen in normal usage).
-/// When `distinct` is true, deduplicates values before aggregation.
-pub fn apply_aggregate(func: &AggregateFn, binding: &Binding, distinct: bool) -> Binding {
-    match binding {
-        Binding::Grouped(values) => {
-            if distinct {
-                let mut seen = HashSet::with_capacity(values.len());
-                let deduped: Vec<Binding> =
-                    values.iter().filter(|b| seen.insert(*b)).cloned().collect();
-                compute_aggregate(func, &deduped)
-            } else {
-                compute_aggregate(func, values)
-            }
+impl AggregateFn {
+    /// Apply this aggregate function to a binding.
+    ///
+    /// If the binding is `Grouped(values)`, compute the aggregate;
+    /// non-grouped values pass through (e.g. group-key columns).
+    /// Variants that need an upstream dedup pass (see
+    /// [`Self::needs_input_dedup`]) get one before being handed to
+    /// [`Self::compute`].
+    pub fn apply(&self, binding: &Binding) -> Binding {
+        let Binding::Grouped(values) = binding else {
+            return binding.clone();
+        };
+        if self.needs_input_dedup() {
+            let mut seen = HashSet::with_capacity(values.len());
+            let deduped: Vec<Binding> =
+                values.iter().filter(|b| seen.insert(*b)).cloned().collect();
+            self.compute(&deduped)
+        } else {
+            self.compute(values)
         }
-        // Non-grouped values pass through (e.g., group key columns)
-        other => other.clone(),
     }
-}
 
-/// Compute aggregate over a list of bindings
-fn compute_aggregate(func: &AggregateFn, values: &[Binding]) -> Binding {
-    match func {
-        AggregateFn::Count => agg_count(values),
-        AggregateFn::CountAll => agg_count_all(values),
-        AggregateFn::CountDistinct => agg_count_distinct(values),
-        AggregateFn::Sum => agg_sum(values),
-        AggregateFn::Avg => agg_avg(values),
-        AggregateFn::Min => agg_min(values),
-        AggregateFn::Max => agg_max(values),
-        AggregateFn::Median => agg_median(values),
-        AggregateFn::Variance => agg_variance(values),
-        AggregateFn::Stddev => agg_stddev(values),
-        AggregateFn::GroupConcat { separator } => agg_group_concat(values, separator),
-        AggregateFn::Sample => agg_sample(values),
+    /// Whether [`Self::apply`] must deduplicate input values before
+    /// reducing. True for variants whose [`InputSemantics`] is
+    /// [`InputSemantics::Set`]; false for everything else, including
+    /// [`Self::CountDistinct`] — its streaming state is already a
+    /// `HashSet`, so an additional dedup pass would be redundant.
+    fn needs_input_dedup(&self) -> bool {
+        self.is_distinct() && !matches!(self, AggregateFn::CountDistinct(_))
+    }
+
+    /// Compute the aggregate result over an already-prepared list of
+    /// bindings (deduplicated upstream by [`Self::apply`] if needed).
+    fn compute(&self, values: &[Binding]) -> Binding {
+        match self {
+            Self::Count(_) => agg_count(values),
+            Self::CountAll => agg_count_all(values),
+            Self::CountDistinct(_) => agg_count_distinct(values),
+            Self::Sum { .. } => agg_sum(values),
+            Self::Avg { .. } => agg_avg(values),
+            Self::Min(_) => agg_min(values),
+            Self::Max(_) => agg_max(values),
+            Self::Median { .. } => agg_median(values),
+            Self::Variance { .. } => agg_variance(values),
+            Self::Stddev { .. } => agg_stddev(values),
+            Self::GroupConcat { separator, .. } => agg_group_concat(values, separator),
+            Self::Sample(_) => agg_sample(values),
+        }
     }
 }
 
@@ -319,8 +336,258 @@ fn xsd_double() -> Sid {
     Sid::xsd_double()
 }
 
+fn xsd_decimal() -> Sid {
+    Sid::xsd_decimal()
+}
+
 fn xsd_string() -> Sid {
     Sid::xsd_string()
+}
+
+/// Numeric inputs for aggregate accumulators, preserving original XSD class.
+pub(crate) enum NumericValue {
+    Long(i64),
+    BigInt(BigInt),
+    Decimal(BigDecimal),
+    Double(f64),
+}
+
+/// SUM/AVG accumulator with XSD numeric type promotion.
+///
+/// Promotion lattice (sticky upward):
+///   Integer → Decimal → Double
+///
+/// While in the `Integer`/`Decimal` states we accumulate exactly as `BigDecimal`.
+/// Once any `Double` input is seen we collapse to `f64` (per W3C XPath numeric
+/// promotion: xsd:double absorbs all other numeric types).
+#[derive(Debug)]
+pub(crate) struct NumericAcc {
+    kind: NumKind,
+    big_sum: BigDecimal,
+    dbl_sum: f64,
+    count: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NumKind {
+    Integer,
+    Decimal,
+    Double,
+}
+
+impl NumericAcc {
+    pub(crate) fn new() -> Self {
+        Self {
+            kind: NumKind::Integer,
+            big_sum: BigDecimal::zero(),
+            dbl_sum: 0.0,
+            count: 0,
+        }
+    }
+
+    pub(crate) fn add(&mut self, v: NumericValue) {
+        self.count += 1;
+        match v {
+            NumericValue::Long(n) => match self.kind {
+                NumKind::Double => self.dbl_sum += n as f64,
+                _ => self.big_sum += BigDecimal::from(n),
+            },
+            NumericValue::BigInt(b) => match self.kind {
+                NumKind::Double => self.dbl_sum += bigint_to_f64(&b),
+                _ => self.big_sum += BigDecimal::from(b),
+            },
+            NumericValue::Decimal(d) => match self.kind {
+                NumKind::Double => self.dbl_sum += d.to_f64().unwrap_or(0.0),
+                NumKind::Integer => {
+                    self.kind = NumKind::Decimal;
+                    self.big_sum += d;
+                }
+                NumKind::Decimal => self.big_sum += d,
+            },
+            NumericValue::Double(f) => {
+                if self.kind != NumKind::Double {
+                    // Collapse exact accumulator into f64 once a double appears.
+                    self.dbl_sum = self.big_sum.to_f64().unwrap_or(0.0);
+                    self.big_sum = BigDecimal::zero();
+                    self.kind = NumKind::Double;
+                }
+                self.dbl_sum += f;
+            }
+        }
+    }
+
+    /// Finalize as SPARQL SUM. Empty group returns `Unbound`.
+    ///
+    /// Result datatype follows the W3C arithmetic promotion lattice:
+    ///   all integer  → xsd:integer (Long if it fits, else BigInt)
+    ///   any decimal  → xsd:decimal
+    ///   any double   → xsd:double
+    pub(crate) fn finalize_sum(self) -> Binding {
+        if self.count == 0 {
+            return Binding::Unbound;
+        }
+        match self.kind {
+            NumKind::Integer => integer_binding_from_bigdecimal(self.big_sum),
+            NumKind::Decimal => {
+                Binding::lit(FlakeValue::Decimal(Box::new(self.big_sum)), xsd_decimal())
+            }
+            NumKind::Double => Binding::lit(FlakeValue::Double(self.dbl_sum), xsd_double()),
+        }
+    }
+
+    /// Finalize as SPARQL AVG. Empty group returns `Unbound`.
+    ///
+    /// AVG promotes xsd:integer inputs to xsd:decimal output (matches XPath
+    /// `op:numeric-divide` of integers, which yields xsd:decimal).
+    ///
+    /// The division precision is capped at `AVG_DECIMAL_PRECISION` significant
+    /// digits to keep output bounded — `BigDecimal::div` would otherwise expand
+    /// recurring decimals to its default 100-digit precision, producing values
+    /// like `0.33333...` with 100 trailing digits.
+    pub(crate) fn finalize_avg(self) -> Binding {
+        if self.count == 0 {
+            return Binding::Unbound;
+        }
+        match self.kind {
+            NumKind::Integer | NumKind::Decimal => {
+                let count_bd = BigDecimal::from(self.count as i64);
+                let avg = (self.big_sum / count_bd)
+                    .with_prec(AVG_DECIMAL_PRECISION)
+                    .normalized();
+                Binding::lit(FlakeValue::Decimal(Box::new(avg)), xsd_decimal())
+            }
+            NumKind::Double => Binding::lit(
+                FlakeValue::Double(self.dbl_sum / self.count as f64),
+                xsd_double(),
+            ),
+        }
+    }
+}
+
+/// Significant-digit cap for the result of AVG over xsd:decimal/xsd:integer
+/// inputs. Matches IEEE-754 decimal128 precision (34 digits) — well past
+/// xsd:double's ~17 digits of precision but small enough to keep output
+/// compact for typical financial / scientific aggregates.
+const AVG_DECIMAL_PRECISION: u64 = 34;
+
+/// Best-effort `BigInt → f64`. Saturates at infinity for out-of-range values.
+fn bigint_to_f64(b: &BigInt) -> f64 {
+    b.to_f64().unwrap_or_else(|| {
+        if b.is_negative() {
+            f64::NEG_INFINITY
+        } else {
+            f64::INFINITY
+        }
+    })
+}
+
+/// Produce an xsd:integer binding from an integer-valued `BigDecimal`.
+/// Returns `Long` when the value fits in `i64`, else `BigInt`.
+fn integer_binding_from_bigdecimal(sum: BigDecimal) -> Binding {
+    // For NumKind::Integer the accumulator only ever received integer inputs,
+    // so the BigDecimal has zero fractional scale; conversion to BigInt is exact.
+    let (digits, _scale) = sum.into_bigint_and_exponent();
+    if let Some(n) = digits.to_i64() {
+        Binding::lit(FlakeValue::Long(n), xsd_integer())
+    } else {
+        Binding::lit(FlakeValue::BigInt(Box::new(digits)), xsd_integer())
+    }
+}
+
+/// Extract a numeric value from a binding, recognizing all XSD numeric kinds
+/// that Fluree can store: xsd:integer (Long/BigInt), xsd:decimal (BigDecimal),
+/// xsd:double, and xsd:boolean (treated as 0/1).
+///
+/// `EncodedLit` is decoded via `decode_encoded_lit_numeric` (only the inline
+/// kinds NUM_INT and NUM_F64; NUM_BIG arena handles require a graph view and
+/// are handled by the streaming aggregate path that has access to one).
+pub(crate) fn binding_to_numeric(binding: &Binding) -> Option<NumericValue> {
+    use fluree_db_core::value_id::{ObjKey, ObjKind};
+    match binding {
+        Binding::Lit { val, dtc, .. } => {
+            flake_value_to_numeric(val).or_else(|| string_lit_to_numeric(val, dtc))
+        }
+        Binding::EncodedLit { o_kind, o_key, .. } => {
+            if *o_kind == ObjKind::NUM_INT.as_u8() {
+                Some(NumericValue::Long(ObjKey::from_u64(*o_key).decode_i64()))
+            } else if *o_kind == ObjKind::NUM_F64.as_u8() {
+                let d = ObjKey::from_u64(*o_key).decode_f64();
+                if d.is_nan() {
+                    None
+                } else {
+                    Some(NumericValue::Double(d))
+                }
+            } else {
+                None
+            }
+        }
+        _ => None,
+    }
+}
+
+pub(crate) fn flake_value_to_numeric(val: &FlakeValue) -> Option<NumericValue> {
+    match val {
+        FlakeValue::Long(n) => Some(NumericValue::Long(*n)),
+        FlakeValue::Boolean(b) => Some(NumericValue::Long(i64::from(*b))),
+        FlakeValue::Double(d) => {
+            if d.is_nan() {
+                None
+            } else {
+                Some(NumericValue::Double(*d))
+            }
+        }
+        FlakeValue::BigInt(b) => Some(NumericValue::BigInt((**b).clone())),
+        FlakeValue::Decimal(d) => Some(NumericValue::Decimal((**d).clone())),
+        _ => None,
+    }
+}
+
+/// Coerce a numeric value that is stored as a `FlakeValue::String` to a number.
+///
+/// The query-time `xsd:float(?x)` cast is kept string-backed (to preserve f32
+/// precision — see `eval/cast.rs`), so SUM/AVG/etc. would otherwise silently
+/// drop it (`flake_value_to_numeric` has no `String` arm) and return unbound.
+/// Parse the string when the literal's datatype is a numeric XSD type. Yields
+/// `Double` (f64 is exact for f32-sourced values); NaN is dropped like other
+/// non-finite aggregate inputs.
+fn string_lit_to_numeric(
+    val: &FlakeValue,
+    dtc: &fluree_db_core::DatatypeConstraint,
+) -> Option<NumericValue> {
+    let FlakeValue::String(s) = val else {
+        return None;
+    };
+    if !is_numeric_xsd_datatype(dtc.datatype()) {
+        return None;
+    }
+    let d = s.parse::<f64>().ok()?;
+    (!d.is_nan()).then_some(NumericValue::Double(d))
+}
+
+/// Whether `sid` is a numeric XSD datatype (the family that should accumulate
+/// in SUM/AVG even when carried as a string-backed literal).
+fn is_numeric_xsd_datatype(sid: &Sid) -> bool {
+    use fluree_vocab::{namespaces, xsd_names};
+    sid.namespace_code == namespaces::XSD
+        && matches!(
+            sid.name.as_ref(),
+            xsd_names::FLOAT
+                | xsd_names::DOUBLE
+                | xsd_names::DECIMAL
+                | xsd_names::INTEGER
+                | xsd_names::LONG
+                | xsd_names::INT
+                | xsd_names::SHORT
+                | xsd_names::BYTE
+                | xsd_names::UNSIGNED_LONG
+                | xsd_names::UNSIGNED_INT
+                | xsd_names::UNSIGNED_SHORT
+                | xsd_names::UNSIGNED_BYTE
+                | xsd_names::NON_NEGATIVE_INTEGER
+                | xsd_names::POSITIVE_INTEGER
+                | xsd_names::NON_POSITIVE_INTEGER
+                | xsd_names::NEGATIVE_INTEGER
+        )
 }
 
 /// COUNT - count non-Unbound values
@@ -348,79 +615,28 @@ fn agg_count_distinct(values: &[Binding]) -> Binding {
 
 /// SUM - numeric sum
 ///
-/// Uses separate `i128` and `f64` accumulators to avoid precision loss when all
-/// values are integers. The `i128` accumulator prevents overflow that would occur
-/// with `i64`, and the final `i64::try_from` safely detects if the result exceeds
-/// `i64` range (falling back to `f64` in that case).
+/// Accumulates exactly via `BigDecimal` for xsd:integer and xsd:decimal inputs
+/// (preserving monetary precision), and falls back to `f64` once any xsd:double
+/// is encountered. Result datatype follows XPath numeric promotion.
 fn agg_sum(values: &[Binding]) -> Binding {
-    let typed = extract_typed_numbers(values);
-    if typed.is_empty() {
-        return Binding::Unbound;
+    let mut acc = NumericAcc::new();
+    for v in values.iter().filter_map(binding_to_numeric) {
+        acc.add(v);
     }
-
-    let mut all_int = true;
-    let mut int_sum: i128 = 0;
-    let mut float_sum: f64 = 0.0;
-
-    for num in &typed {
-        match num {
-            TypedNumber::Int(v) => {
-                int_sum += *v as i128;
-                float_sum += *v as f64;
-            }
-            TypedNumber::Float(v) => {
-                all_int = false;
-                float_sum += *v;
-            }
-        }
-    }
-
-    if all_int {
-        // Return as Long if the result fits in i64, otherwise fall back to f64.
-        match i64::try_from(int_sum) {
-            Ok(v) => Binding::lit(FlakeValue::Long(v), xsd_integer()),
-            Err(_) => Binding::lit(FlakeValue::Double(int_sum as f64), xsd_double()),
-        }
-    } else {
-        Binding::lit(FlakeValue::Double(float_sum), xsd_double())
-    }
+    acc.finalize_sum()
 }
 
 /// AVG - numeric average
 ///
-/// Uses an `i128` accumulator for integer-only groups to preserve precision
-/// when summing large `i64` values. Falls back to `f64` for mixed types.
+/// Accumulates the sum exactly in `BigDecimal` for integer/decimal inputs and
+/// divides by the count at finalize time, yielding an xsd:decimal result.
+/// xsd:double inputs collapse the accumulator to f64 and yield xsd:double.
 fn agg_avg(values: &[Binding]) -> Binding {
-    let typed = extract_typed_numbers(values);
-    if typed.is_empty() {
-        return Binding::Unbound;
+    let mut acc = NumericAcc::new();
+    for v in values.iter().filter_map(binding_to_numeric) {
+        acc.add(v);
     }
-
-    let count = typed.len() as f64;
-    let mut all_int = true;
-    let mut int_sum: i128 = 0;
-    let mut float_sum: f64 = 0.0;
-
-    for num in &typed {
-        match num {
-            TypedNumber::Int(v) => {
-                int_sum += *v as i128;
-                float_sum += *v as f64;
-            }
-            TypedNumber::Float(v) => {
-                all_int = false;
-                float_sum += *v;
-            }
-        }
-    }
-
-    let avg = if all_int {
-        // Compute from i128 to avoid f64 precision loss on large integer sums.
-        (int_sum as f64) / count
-    } else {
-        float_sum / count
-    };
-    Binding::lit(FlakeValue::Double(avg), xsd_double())
+    acc.finalize_avg()
 }
 
 /// MIN - minimum value
@@ -535,55 +751,28 @@ fn agg_sample(values: &[Binding]) -> Binding {
         .unwrap_or(Binding::Unbound)
 }
 
-/// A numeric value preserving its original type (integer vs float).
-enum TypedNumber {
-    Int(i64),
-    Float(f64),
-}
-
-/// Extract numeric values preserving their original type.
+/// Extract numeric values as f64 from bindings.
 ///
-/// This allows callers to use an `i128` accumulator for integer-only groups,
-/// avoiding precision loss that occurs when large `i64` values are cast to `f64`.
-fn extract_typed_numbers(values: &[Binding]) -> Vec<TypedNumber> {
-    values
-        .iter()
-        .filter_map(|b| match b {
-            Binding::Lit { val, .. } => match val {
-                FlakeValue::Long(n) => Some(TypedNumber::Int(*n)),
-                FlakeValue::Boolean(b) => Some(TypedNumber::Int(i64::from(*b))),
-                FlakeValue::Double(n) => {
-                    if n.is_nan() {
-                        None
-                    } else {
-                        Some(TypedNumber::Float(*n))
-                    }
-                }
-                _ => None,
-            },
-            _ => None,
-        })
-        .collect()
-}
-
-/// Extract numeric values as f64 from bindings
+/// Used by MEDIAN / VARIANCE / STDDEV which intrinsically operate in f64.
+/// Mirrors `binding_to_numeric` but collapses every numeric class to f64
+/// (xsd:integer / xsd:decimal / xsd:double / xsd:boolean), losing precision
+/// for large BigInt and exact-precision Decimal values — acceptable because
+/// these statistical aggregates have no exact-arithmetic semantics in SPARQL.
 fn extract_numbers(values: &[Binding]) -> Vec<f64> {
     values
         .iter()
-        .filter_map(|b| match b {
-            Binding::Lit { val, .. } => match val {
-                FlakeValue::Long(n) => Some(*n as f64),
-                FlakeValue::Boolean(b) => Some(i64::from(*b) as f64),
-                FlakeValue::Double(n) => {
-                    if n.is_nan() {
-                        None
-                    } else {
-                        Some(*n)
-                    }
+        .filter_map(binding_to_numeric)
+        .filter_map(|n| match n {
+            NumericValue::Long(v) => Some(v as f64),
+            NumericValue::BigInt(b) => Some(bigint_to_f64(&b)),
+            NumericValue::Decimal(d) => d.to_f64(),
+            NumericValue::Double(d) => {
+                if d.is_nan() {
+                    None
+                } else {
+                    Some(d)
                 }
-                _ => None,
-            },
-            _ => None,
+            }
         })
         .collect()
 }
@@ -591,6 +780,7 @@ fn extract_numbers(values: &[Binding]) -> Vec<f64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ir::InputSemantics;
 
     #[test]
     fn test_agg_count() {
@@ -718,8 +908,55 @@ mod tests {
         ];
 
         let result = agg_avg(&values);
+        let (val, dtc) = result.as_lit().unwrap();
+        // Per W3C: AVG of integers yields xsd:decimal (op:numeric-divide on
+        // integers returns xsd:decimal).
+        assert_eq!(*val, FlakeValue::Decimal(Box::new(BigDecimal::from(20))));
+        assert!(format!("{dtc:?}").contains("decimal"));
+    }
+
+    #[test]
+    fn test_agg_sum_over_decimal() {
+        // Bug repro: SUM over xsd:decimal must return an exact xsd:decimal,
+        // not the additive identity 0 nor a lossy xsd:double.
+        let values = vec![
+            Binding::lit(
+                FlakeValue::Decimal(Box::new("12.50".parse().unwrap())),
+                Sid::xsd_decimal(),
+            ),
+            Binding::lit(
+                FlakeValue::Decimal(Box::new("7.99".parse().unwrap())),
+                Sid::xsd_decimal(),
+            ),
+        ];
+
+        let result = agg_sum(&values);
         let (val, _) = result.as_lit().unwrap();
-        assert_eq!(*val, FlakeValue::Double(20.0));
+        assert_eq!(
+            *val,
+            FlakeValue::Decimal(Box::new("20.49".parse().unwrap()))
+        );
+    }
+
+    #[test]
+    fn test_agg_avg_over_decimal() {
+        let values = vec![
+            Binding::lit(
+                FlakeValue::Decimal(Box::new("12.50".parse().unwrap())),
+                Sid::xsd_decimal(),
+            ),
+            Binding::lit(
+                FlakeValue::Decimal(Box::new("7.99".parse().unwrap())),
+                Sid::xsd_decimal(),
+            ),
+        ];
+
+        let result = agg_avg(&values);
+        let (val, _) = result.as_lit().unwrap();
+        assert_eq!(
+            *val,
+            FlakeValue::Decimal(Box::new("10.245".parse().unwrap()))
+        );
     }
 
     #[test]
@@ -849,11 +1086,20 @@ mod tests {
         assert!(matches!(result, Binding::Unbound));
     }
 
+    fn sum_of(input: VarId, distinct: bool) -> AggregateFn {
+        let semantics = if distinct {
+            InputSemantics::Set
+        } else {
+            InputSemantics::List
+        };
+        AggregateFn::Sum(input, semantics)
+    }
+
     #[test]
     fn test_apply_aggregate_non_grouped() {
         // Non-grouped values pass through unchanged
         let binding = Binding::lit(FlakeValue::Long(42), xsd_integer());
-        let result = apply_aggregate(&AggregateFn::Sum, &binding, false);
+        let result = sum_of(VarId(0), false).apply(&binding);
         assert_eq!(result, binding);
     }
 
@@ -865,7 +1111,7 @@ mod tests {
             Binding::lit(FlakeValue::Long(3), xsd_integer()),
         ]);
 
-        let result = apply_aggregate(&AggregateFn::Sum, &grouped, false);
+        let result = sum_of(VarId(0), false).apply(&grouped);
         let (val, _) = result.as_lit().unwrap();
         assert_eq!(*val, FlakeValue::Long(6));
     }
@@ -881,7 +1127,7 @@ mod tests {
             Binding::lit(FlakeValue::Long(2), xsd_integer()), // duplicate
         ]);
 
-        let result = apply_aggregate(&AggregateFn::Sum, &grouped, true);
+        let result = sum_of(VarId(0), true).apply(&grouped);
         let (val, _) = result.as_lit().unwrap();
         assert_eq!(*val, FlakeValue::Long(6)); // 1+2+3 = 6, not 1+2+1+3+2 = 9
     }

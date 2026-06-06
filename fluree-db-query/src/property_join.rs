@@ -611,6 +611,25 @@ impl PropertyJoinOperator {
 
 #[async_trait]
 impl Operator for PropertyJoinOperator {
+    fn plan_details(&self) -> serde_json::Map<String, serde_json::Value> {
+        let mut m = serde_json::Map::new();
+        m.insert("subject".into(), format!("?v{}", self.subject_var.0).into());
+        let preds: Vec<serde_json::Value> = self
+            .predicates
+            .iter()
+            .map(|p| {
+                let name = match &p.pred_ref {
+                    Ref::Sid(sid) => format!("{}:{}", sid.namespace_code, sid.name),
+                    Ref::Iri(iri) => iri.to_string(),
+                    Ref::Var(v) => format!("?v{}", v.0),
+                };
+                serde_json::Value::String(name)
+            })
+            .collect();
+        m.insert("predicates".into(), serde_json::Value::Array(preds));
+        m
+    }
+
     fn schema(&self) -> &[VarId] {
         &self.output_schema
     }

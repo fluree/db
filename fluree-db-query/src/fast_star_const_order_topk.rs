@@ -13,7 +13,8 @@
 use crate::binding::{Batch, Binding};
 use crate::error::{QueryError, Result};
 use crate::fast_path_common::{
-    empty_batch, fast_path_store, intersect_many_sorted, ref_to_p_id, term_to_ref_s_id,
+    build_range_cursor, empty_batch, fast_path_store, intersect_many_sorted, ref_to_p_id,
+    term_to_ref_s_id,
 };
 use crate::ir::triple::{Ref, Term};
 use crate::operator::BoxedOperator;
@@ -22,7 +23,7 @@ use fluree_db_binary_index::format::column_block::ColumnId;
 use fluree_db_binary_index::format::run_record::RunSortOrder;
 use fluree_db_binary_index::format::run_record_v2::RunRecordV2;
 use fluree_db_binary_index::read::column_types::{BinaryFilter, ColumnProjection, ColumnSet};
-use fluree_db_binary_index::{BinaryCursor, BinaryIndexStore};
+use fluree_db_binary_index::{BinaryIndexStore, ColumnBatch};
 use fluree_db_core::o_type::OType;
 use fluree_db_core::subject_id::SubjectId;
 use fluree_db_core::{FlakeValue, GraphId};
@@ -153,11 +154,6 @@ fn collect_subjects_for_predicate_object_ref_opst(
     p_id: u32,
     o_s_id: u64,
 ) -> Result<Vec<u64>> {
-    let Some(branch) = store.branch_for_order(g_id, RunSortOrder::Opst) else {
-        return Ok(Vec::new());
-    };
-    let branch = Arc::clone(branch);
-
     // Cursor range: fixed (o_type, o_key, p_id), all o_i and s_id.
     let min_key = RunRecordV2 {
         s_id: SubjectId(0),
@@ -198,15 +194,18 @@ fn collect_subjects_for_predicate_object_ref_opst(
         ..Default::default()
     };
 
-    let mut cursor = BinaryCursor::new(
-        Arc::clone(store),
+    // HEAD-only path (gated by `fast_path_store` ⇒ `to_t == max_t`), so no `set_to_t`.
+    let Some(mut cursor) = build_range_cursor(
+        store,
+        g_id,
         RunSortOrder::Opst,
-        branch,
         &min_key,
         &max_key,
         filter,
         projection,
-    );
+    ) else {
+        return Ok(Vec::new());
+    };
 
     let mut out: Vec<u64> = Vec::new();
     while let Some(batch) = cursor
@@ -241,36 +240,29 @@ fn chunk_subjects(sorted: &[u64], max_span: u64, max_chunk: usize) -> Vec<&[u64]
     chunks
 }
 
-fn filter_subjects_by_numeric_gt(
-    store: &Arc<fluree_db_binary_index::BinaryIndexStore>,
+/// Run a chunked PSOT(`p_id`) scan over `subjects_sorted` (sorted + deduped) and
+/// invoke `on_row` for each indexed row whose subject is in the set.
+///
+/// Shared scaffolding for the numeric-filter and label-collection passes: it
+/// owns the subject chunking, per-chunk cursor construction, and `s_id`-set
+/// membership test, so each caller supplies only its per-row body. PSOT key
+/// comparison excludes `t`, so the `t: 0` upper bound spans all transactions.
+fn for_each_subject_row_psot<F>(
+    store: &Arc<BinaryIndexStore>,
     g_id: GraphId,
     p_id: u32,
     subjects_sorted: &[u64],
     to_t: i64,
-    threshold: &FlakeValue,
-) -> Result<Vec<u64>> {
+    mut on_row: F,
+) -> Result<()>
+where
+    F: FnMut(u64, &ColumnBatch, usize) -> Result<()>,
+{
     if subjects_sorted.is_empty() {
-        return Ok(Vec::new());
+        return Ok(());
     }
-    // Only support numeric thresholds used in benchmark filters.
-    let (thr_i, thr_d) = match threshold {
-        FlakeValue::Long(n) => (*n, *n as f64),
-        FlakeValue::Double(d) => (*d as i64, *d),
-        _ => return Ok(Vec::new()),
-    };
-    let thr_i_key = fluree_db_core::value_id::ObjKey::encode_i64(thr_i).as_u64();
-    let thr_d_key = fluree_db_core::value_id::ObjKey::encode_f64(thr_d)
-        .map_err(|_| QueryError::execution("cannot encode f64 threshold".to_string()))?
-        .as_u64();
-
     // Caller provides sorted, deduplicated subjects (from intersect_many_sorted).
     let s_id_set: FxHashSet<u64> = subjects_sorted.iter().copied().collect();
-    let mut keep: FxHashSet<u64> = FxHashSet::default();
-
-    let Some(branch) = store.branch_for_order(g_id, RunSortOrder::Psot) else {
-        return Ok(Vec::new());
-    };
-    let branch = Arc::clone(branch);
 
     let mut needed = ColumnSet::EMPTY;
     needed.insert(ColumnId::SId);
@@ -283,8 +275,7 @@ fn filter_subjects_by_numeric_gt(
 
     const MAX_SPAN: u64 = 100_000;
     const MAX_CHUNK: usize = 1000;
-    let chunks = chunk_subjects(subjects_sorted, MAX_SPAN, MAX_CHUNK);
-    for chunk in chunks {
+    for chunk in chunk_subjects(subjects_sorted, MAX_SPAN, MAX_CHUNK) {
         let min_s = chunk[0];
         let max_s = *chunk.last().unwrap_or(&min_s);
         let min_key = RunRecordV2 {
@@ -309,15 +300,17 @@ fn filter_subjects_by_numeric_gt(
             p_id: Some(p_id),
             ..Default::default()
         };
-        let mut cursor = BinaryCursor::new(
-            Arc::clone(store),
+        let Some(mut cursor) = build_range_cursor(
+            store,
+            g_id,
             RunSortOrder::Psot,
-            Arc::clone(&branch),
             &min_key,
             &max_key,
             filter,
             projection,
-        );
+        ) else {
+            return Ok(());
+        };
         cursor.set_to_t(to_t);
 
         while let Some(batch) = cursor
@@ -329,19 +322,52 @@ fn filter_subjects_by_numeric_gt(
                 if !s_id_set.contains(&s_id) {
                     continue;
                 }
-                let ot_u16 = batch.o_type.get_or(i, 0);
-                let ot = OType::from_u16(ot_u16);
-                let ok = match ot {
-                    OType::XSD_INTEGER => batch.o_key.get(i) > thr_i_key,
-                    OType::XSD_DOUBLE => batch.o_key.get(i) > thr_d_key,
-                    _ => false,
-                };
-                if ok {
-                    keep.insert(s_id);
-                }
+                on_row(s_id, &batch, i)?;
             }
         }
     }
+    Ok(())
+}
+
+fn filter_subjects_by_numeric_gt(
+    store: &Arc<fluree_db_binary_index::BinaryIndexStore>,
+    g_id: GraphId,
+    p_id: u32,
+    subjects_sorted: &[u64],
+    to_t: i64,
+    threshold: &FlakeValue,
+) -> Result<Vec<u64>> {
+    // Only support numeric thresholds used in benchmark filters.
+    let (thr_i, thr_d) = match threshold {
+        FlakeValue::Long(n) => (*n, *n as f64),
+        FlakeValue::Double(d) => (*d as i64, *d),
+        _ => return Ok(Vec::new()),
+    };
+    let thr_i_key = fluree_db_core::value_id::ObjKey::encode_i64(thr_i).as_u64();
+    let thr_d_key = fluree_db_core::value_id::ObjKey::encode_f64(thr_d)
+        .map_err(|_| QueryError::execution("cannot encode f64 threshold".to_string()))?
+        .as_u64();
+
+    let mut keep: FxHashSet<u64> = FxHashSet::default();
+    for_each_subject_row_psot(
+        store,
+        g_id,
+        p_id,
+        subjects_sorted,
+        to_t,
+        |s_id, batch, i| {
+            let ot = OType::from_u16(batch.o_type.get_or(i, 0));
+            let over_threshold = match ot {
+                OType::XSD_INTEGER => batch.o_key.get(i) > thr_i_key,
+                OType::XSD_DOUBLE => batch.o_key.get(i) > thr_d_key,
+                _ => false,
+            };
+            if over_threshold {
+                keep.insert(s_id);
+            }
+            Ok(())
+        },
+    )?;
 
     let mut out: Vec<u64> = keep.into_iter().collect();
     out.sort_unstable();
@@ -356,116 +382,54 @@ fn collect_label_pairs(
     to_t: i64,
     dict_novelty: Option<&Arc<fluree_db_core::dict_novelty::DictNovelty>>,
 ) -> Result<Vec<(u64, String, Option<String>)>> {
-    if subjects_sorted.is_empty() {
-        return Ok(Vec::new());
-    }
-    // Caller provides sorted, deduplicated subjects (from intersect_many_sorted).
-    let s_id_set: FxHashSet<u64> = subjects_sorted.iter().copied().collect();
-
-    let Some(branch) = store.branch_for_order(g_id, RunSortOrder::Psot) else {
-        return Ok(Vec::new());
-    };
-    let branch = Arc::clone(branch);
-
-    let mut needed = ColumnSet::EMPTY;
-    needed.insert(ColumnId::SId);
-    needed.insert(ColumnId::OType);
-    needed.insert(ColumnId::OKey);
-    let projection = ColumnProjection {
-        output: needed,
-        internal: ColumnSet::EMPTY,
-    };
-
-    const MAX_SPAN: u64 = 100_000;
-    const MAX_CHUNK: usize = 1000;
-    let chunks = chunk_subjects(subjects_sorted, MAX_SPAN, MAX_CHUNK);
     let mut out: Vec<(u64, String, Option<String>)> = Vec::new();
-
-    for chunk in chunks {
-        let min_s = chunk[0];
-        let max_s = *chunk.last().unwrap_or(&min_s);
-        let min_key = RunRecordV2 {
-            s_id: SubjectId::from_u64(min_s),
-            o_key: 0,
-            p_id,
-            t: 0,
-            o_i: 0,
-            o_type: 0,
-            g_id,
-        };
-        let max_key = RunRecordV2 {
-            s_id: SubjectId::from_u64(max_s),
-            o_key: u64::MAX,
-            p_id,
-            t: 0,
-            o_i: u32::MAX,
-            o_type: u16::MAX,
-            g_id,
-        };
-        let filter = BinaryFilter {
-            p_id: Some(p_id),
-            ..Default::default()
-        };
-        let mut cursor = BinaryCursor::new(
-            Arc::clone(store),
-            RunSortOrder::Psot,
-            Arc::clone(&branch),
-            &min_key,
-            &max_key,
-            filter,
-            projection,
-        );
-        cursor.set_to_t(to_t);
-
-        while let Some(batch) = cursor
-            .next_batch()
-            .map_err(|e| QueryError::Internal(format!("binary cursor: {e}")))?
-        {
-            for i in 0..batch.row_count {
-                let s_id = batch.s_id.get(i);
-                if !s_id_set.contains(&s_id) {
-                    continue;
-                }
-                let ot_u16 = batch.o_type.get_or(i, 0);
-                let ot = OType::from_u16(ot_u16);
-                if !matches!(ot, OType::XSD_STRING) && !ot.is_lang_string() {
-                    return Err(QueryError::execution(
-                        "label fast-path encountered non-string object".to_string(),
-                    ));
-                }
-                let str_id = batch.o_key.get(i) as u32;
-                // Watermark-based routing: novel IDs (above watermark) resolve
-                // from DictNovelty; persisted IDs delegate to the store.
-                let s = if let Some(dn) = dict_novelty.filter(|dn| dn.is_initialized()) {
-                    if str_id > dn.strings.watermark() {
-                        dn.strings
-                            .resolve_string(str_id)
-                            .map(std::string::ToString::to_string)
-                            .ok_or_else(|| {
-                                QueryError::Internal(format!(
-                                    "resolve_string_value: string id {str_id} not found in DictNovelty"
-                                ))
-                            })?
-                    } else {
-                        store.resolve_string_value(str_id).map_err(|e| {
-                            QueryError::Internal(format!("resolve_string_value: {e}"))
+    for_each_subject_row_psot(
+        store,
+        g_id,
+        p_id,
+        subjects_sorted,
+        to_t,
+        |s_id, batch, i| {
+            let ot_u16 = batch.o_type.get_or(i, 0);
+            let ot = OType::from_u16(ot_u16);
+            if !matches!(ot, OType::XSD_STRING) && !ot.is_lang_string() {
+                return Err(QueryError::execution(
+                    "label fast-path encountered non-string object".to_string(),
+                ));
+            }
+            let str_id = batch.o_key.get(i) as u32;
+            // Watermark-based routing: novel IDs (above watermark) resolve from
+            // DictNovelty; persisted IDs delegate to the store.
+            let s = if let Some(dn) = dict_novelty.filter(|dn| dn.is_initialized()) {
+                if str_id > dn.strings.watermark() {
+                    dn.strings
+                        .resolve_string(str_id)
+                        .map(std::string::ToString::to_string)
+                        .ok_or_else(|| {
+                            QueryError::Internal(format!(
+                                "resolve_string_value: string id {str_id} not found in DictNovelty"
+                            ))
                         })?
-                    }
                 } else {
                     store
                         .resolve_string_value(str_id)
                         .map_err(|e| QueryError::Internal(format!("resolve_string_value: {e}")))?
-                };
-                let lang = if ot.is_lang_string() {
-                    store
-                        .resolve_lang_tag(ot_u16)
-                        .map(std::string::ToString::to_string)
-                } else {
-                    None
-                };
-                out.push((s_id, s, lang));
-            }
-        }
-    }
+                }
+            } else {
+                store
+                    .resolve_string_value(str_id)
+                    .map_err(|e| QueryError::Internal(format!("resolve_string_value: {e}")))?
+            };
+            let lang = if ot.is_lang_string() {
+                store
+                    .resolve_lang_tag(ot_u16)
+                    .map(std::string::ToString::to_string)
+            } else {
+                None
+            };
+            out.push((s_id, s, lang));
+            Ok(())
+        },
+    )?;
     Ok(out)
 }

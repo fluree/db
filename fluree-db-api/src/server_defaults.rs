@@ -57,6 +57,46 @@ pub fn default_reindex_max_bytes() -> usize {
     DEFAULT_REINDEX_MAX_BYTES_FALLBACK
 }
 
+/// Fraction of system RAM used as the startup index-warming budget.
+///
+/// Warming touches forward-dictionary file pages into the OS page cache.
+/// Beyond this fraction, touching new pages would evict pages we just warmed
+/// (the page cache is finite), so warming stops once cumulative touched bytes
+/// reach this budget. Page-cache pages are clean and reclaimable, so two-thirds
+/// is a soft target that still leaves the OS room to back the heap, the leaflet
+/// cache, and in-flight requests.
+const WARM_BUDGET_NUMERATOR: u64 = 2;
+const WARM_BUDGET_DENOMINATOR: u64 = 3;
+
+/// Fallback warming budget when RAM detection is unavailable (WASM, sandbox).
+pub const DEFAULT_WARM_BUDGET_BYTES_FALLBACK: u64 = 2 * 1024 * 1024 * 1024; // 2 GiB
+
+/// Startup index-warming byte budget: ~2/3 of detected system RAM.
+///
+/// Returns [`DEFAULT_WARM_BUDGET_BYTES_FALLBACK`] when RAM detection is
+/// unavailable. Used to cap how many forward-dictionary bytes the background
+/// warmer touches so it never evicts the pages it just warmed.
+#[cfg(feature = "native")]
+pub fn warm_budget_bytes() -> u64 {
+    use sysinfo::{MemoryRefreshKind, System};
+
+    let mut sys = System::new();
+    sys.refresh_memory_specifics(MemoryRefreshKind::everything());
+
+    let total_memory_bytes = sys.total_memory();
+    if total_memory_bytes == 0 {
+        return DEFAULT_WARM_BUDGET_BYTES_FALLBACK;
+    }
+
+    (total_memory_bytes / WARM_BUDGET_DENOMINATOR).saturating_mul(WARM_BUDGET_NUMERATOR)
+}
+
+/// Startup index-warming byte budget (WASM/non-native fallback).
+#[cfg(not(feature = "native"))]
+pub fn warm_budget_bytes() -> u64 {
+    DEFAULT_WARM_BUDGET_BYTES_FALLBACK
+}
+
 /// Canonical default `IndexConfig` for API-layer callers.
 ///
 /// Combines [`DEFAULT_REINDEX_MIN_BYTES`] with [`default_reindex_max_bytes`]
@@ -77,6 +117,13 @@ pub const DEFAULT_JWKS_CACHE_TTL: u64 = 300;
 // ── MCP ─────────────────────────────────────────────────────────────
 
 pub const DEFAULT_MCP_ENABLED: bool = false;
+
+/// Byte budget for the MCP `sparql_query` Agent JSON envelope (32 KB).
+///
+/// MCP tool calls carry no per-request headers (unlike the HTTP `Fluree-Max-Bytes`
+/// header), so the budget is server-configured. Results exceeding it are truncated
+/// with `hasMore: true`.
+pub const DEFAULT_MCP_AGENT_JSON_MAX_BYTES: usize = 32_768;
 
 // ── Peer ────────────────────────────────────────────────────────────
 

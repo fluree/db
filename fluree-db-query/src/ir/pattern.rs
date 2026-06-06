@@ -35,6 +35,13 @@ pub struct SubqueryPattern {
     pub distinct: bool,
     /// ORDER BY specs. Empty when the subquery is unordered.
     pub ordering: Vec<SortSpec>,
+    /// Expression-based ORDER BY binds (e.g. `ORDER BY DESC(?a / ?b)` or
+    /// `ORDER BY DESC(COUNT(?o))`). Mirrors [`crate::ir::Query::order_binds`]:
+    /// each `(var, expr)` is evaluated once per solution as a dedicated stage
+    /// after grouping/aggregation/HAVING/post-binds and before the sort, and
+    /// the matching [`SortSpec`] in `ordering` references the synthetic `var`.
+    /// Empty for JSON-LD subqueries (no expression-ORDER-BY surface syntax).
+    pub order_binds: Vec<(VarId, Expression)>,
     /// Optional aggregation phase (GROUP BY / aggregates / HAVING).
     pub grouping: Option<Grouping>,
 }
@@ -49,6 +56,7 @@ impl SubqueryPattern {
             offset: None,
             distinct: false,
             ordering: Vec::new(),
+            order_binds: Vec::new(),
             grouping: None,
         }
     }
@@ -77,6 +85,12 @@ impl SubqueryPattern {
         self
     }
 
+    /// Set the expression-based ORDER BY binds (see [`Self::order_binds`]).
+    pub fn with_order_binds(mut self, order_binds: Vec<(VarId, Expression)>) -> Self {
+        self.order_binds = order_binds;
+        self
+    }
+
     /// Set the aggregation phase (GROUP BY / aggregates / HAVING).
     pub fn with_grouping(mut self, grouping: Grouping) -> Self {
         self.grouping = Some(grouping);
@@ -86,6 +100,34 @@ impl SubqueryPattern {
     /// Variables the subquery exposes to its enclosing scope (its SELECT list).
     pub fn produced_vars(&self) -> Vec<VarId> {
         self.select.clone()
+    }
+
+    /// Rename every occurrence of variable `old` to `new` across the whole
+    /// subquery scope: SELECT list, WHERE patterns, grouping, ORDER BY, and
+    /// expression-ORDER-BY binds. Used by the equijoin-filter fold.
+    pub fn substitute_var(&mut self, old: VarId, new: VarId) {
+        for v in &mut self.select {
+            if *v == old {
+                *v = new;
+            }
+        }
+        for p in &mut self.patterns {
+            p.substitute_var(old, new);
+        }
+        if let Some(g) = &mut self.grouping {
+            g.substitute_var(old, new);
+        }
+        for spec in &mut self.ordering {
+            if spec.var == old {
+                spec.var = new;
+            }
+        }
+        for (v, expr) in &mut self.order_binds {
+            if *v == old {
+                *v = new;
+            }
+            expr.substitute_var(old, new);
+        }
     }
 
     /// Variables mentioned anywhere in the subquery, including inside its
@@ -465,6 +507,103 @@ impl Pattern {
                 patterns: f(patterns),
             },
             other => other,
+        }
+    }
+
+    /// Rename every occurrence of variable `old` to `new` within this pattern,
+    /// recursively. Used by the equijoin-filter fold ([`crate::filter_fold`])
+    /// after it proves `old` and `new` are equal. The fold's eligibility check
+    /// guarantees the renamed variable never appears in a property-path or
+    /// search-adapter pattern, so those arms are debug-asserted no-ops.
+    pub fn substitute_var(&mut self, old: VarId, new: VarId) {
+        const UNHANDLED: &str =
+            "filter_fold: substitute_var reached an unhandled pattern containing the renamed var";
+        let rename = |v: &mut VarId| {
+            if *v == old {
+                *v = new;
+            }
+        };
+        match self {
+            Pattern::Triple(tp) => tp.substitute_var(old, new),
+            Pattern::Filter(expr) => expr.substitute_var(old, new),
+            Pattern::Bind { var, expr } => {
+                rename(var);
+                expr.substitute_var(old, new);
+            }
+            Pattern::Values { vars, .. } => vars.iter_mut().for_each(rename),
+            Pattern::Optional(inner)
+            | Pattern::Minus(inner)
+            | Pattern::Exists(inner)
+            | Pattern::NotExists(inner) => {
+                for p in inner {
+                    p.substitute_var(old, new);
+                }
+            }
+            Pattern::Union(branches) => {
+                for branch in branches {
+                    for p in branch {
+                        p.substitute_var(old, new);
+                    }
+                }
+            }
+            Pattern::Subquery(sq) => sq.substitute_var(old, new),
+            Pattern::Graph { name, patterns } => {
+                if let GraphName::Var(v) = name {
+                    rename(v);
+                }
+                for p in patterns {
+                    p.substitute_var(old, new);
+                }
+            }
+            Pattern::Service(sp) => {
+                if let ServiceEndpoint::Var(v) = &mut sp.endpoint {
+                    rename(v);
+                }
+                for p in &mut sp.patterns {
+                    p.substitute_var(old, new);
+                }
+            }
+            Pattern::PropertyPath(pp) => {
+                debug_assert!(!pp.referenced_vars().contains(&old), "{UNHANDLED}");
+            }
+            Pattern::IndexSearch(p) => {
+                debug_assert!(!p.referenced_vars().contains(&old), "{UNHANDLED}");
+            }
+            Pattern::VectorSearch(p) => {
+                debug_assert!(!p.referenced_vars().contains(&old), "{UNHANDLED}");
+            }
+            Pattern::R2rml(p) => {
+                debug_assert!(!p.referenced_vars().contains(&old), "{UNHANDLED}");
+            }
+            Pattern::GeoSearch(p) => {
+                debug_assert!(!p.referenced_vars().contains(&old), "{UNHANDLED}");
+            }
+            Pattern::S2Search(p) => {
+                debug_assert!(!p.referenced_vars().contains(&old), "{UNHANDLED}");
+            }
+            Pattern::EdgeAnnotation {
+                edge,
+                annotation,
+                body,
+            }
+            | Pattern::AnnotationTarget {
+                annotation,
+                edge,
+                body,
+            } => {
+                edge.substitute_var(old, new);
+                if let Ref::Var(v) = annotation {
+                    rename(v);
+                }
+                for p in body {
+                    p.substitute_var(old, new);
+                }
+            }
+            Pattern::DefaultGraphSource { patterns } => {
+                for p in patterns {
+                    p.substitute_var(old, new);
+                }
+            }
         }
     }
 

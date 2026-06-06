@@ -1182,6 +1182,26 @@ mem:fact-01krb618x0axad5mj8jev4ej0s a mem:Fact ;
     mem:branch "feature/edge-annotations" ;
     mem:createdAt "2026-05-11T09:31:32.640122+00:00"^^xsd:dateTime .
 
+mem:decision-01krvht9hdmca3m5j1rz761g46 a mem:Decision ;
+    mem:content "`Fluree::drop_named_graph(ledger_id, graph_iri)` is a **transactional, history-preserving, per-branch** retract: it stages a SPARQL `DELETE { GRAPH <iri> { ?s ?p ?o } } WHERE { GRAPH <iri> { ?s ?p ?o } }` through `stage(&handle).txn(...)` and produces one normal commit. System graphs (default, txn-meta g_id=1, config g_id=2) are rejected with 400; unknown graph IRIs return 404 *before* staging so the registry isn't silently extended. `graph_iri` must be an absolute IRI per `validate_absolute_iri` (no whitespace, no C0/DEL controls, no RFC 3987-excluded chars, `<scheme>:<rest>` head). Idempotent: re-dropping an empty graph reports `committed=false`, `retracted=0` without creating a commit. Wire endpoint: `POST /drop-graph` admin-protected; CLI: `fluree graph drop <iri> --ledger <id> [--remote]`; companion read-only `fluree graph list` reads `named-graphs` from `/info`." ;
+    mem:tag "admin" ;
+    mem:tag "api-design" ;
+    mem:tag "drop" ;
+    mem:tag "named-graph" ;
+    mem:tag "transactional" ;
+    mem:scope mem:repo ;
+    mem:artifactRef "docs/api/endpoints.md" ;
+    mem:artifactRef "docs/cli/graph.md" ;
+    mem:artifactRef "docs/cli/server-integration.md" ;
+    mem:artifactRef "fluree-db-api/src/admin.rs" ;
+    mem:artifactRef "fluree-db-api/tests/it_drop_named_graph.rs" ;
+    mem:artifactRef "fluree-db-cli/src/commands/graph.rs" ;
+    mem:artifactRef "fluree-db-server/src/routes/ledger.rs" ;
+    mem:branch "feature/drop-branch" ;
+    mem:createdAt "2026-05-17T18:05:17.741794+00:00"^^xsd:dateTime ;
+    mem:rationale "Named-graph data is interleaved in the same index/leaves/dicts as the rest of the ledger — there is no storage prefix to wipe the way drop_branch/drop_ledger do. A transactional retract is the only approach that composes cleanly with branches, rebases, replication, and Fluree's immutable history model. Alternative: structural drop + reindex (rejected as a needless rewrite of history)." ;
+    mem:alternatives "structural drop with graph_registry mark + reindex skip; soft/hard mode like drop_ledger" .
+
 mem:fact-01kjg3zmevnz6mdn53wkqn08p0 a mem:Fact ;
     mem:content "Fluree uses CIDv1 for all content-addressed blobs. Implementation in fluree-db-core/src/content_id.rs wrapping `cid` crate.\n\nFormat: CIDv1 = version(1) + multicodec + multihash(SHA2-256, 32 bytes). Multicodec values in private-use range 0x300000+: Commit(0x300001), Txn(0x300002), IndexRoot(0x300003), IndexBranch/Leaf, DictBlob, Garbage, LedgerConfig, StatsSketch, GraphSourceSnapshot, SpatialIndex.\n\nKey APIs: ContentId::new(kind, bytes) hashes with SHA-256; verify(bytes) re-hashes and compares (NOT valid for commit-v2 which excludes trailing hash+sig); digest_hex() returns 64-char hex; Display uses base32-lower multibase." ;
     mem:tag "CIDv1" ;
@@ -1283,6 +1303,35 @@ mem:fact-01kj8k5nzpe59p5vp7zrehbrr9 a mem:Fact ;
     mem:branch "feature/memory" ;
     mem:createdAt "2026-02-24T19:49:14.358637+00:00"^^xsd:dateTime .
 
+mem:fact-01kta2t986nsjneban0hgbwzq7 a mem:Fact ;
+    mem:content "RDF term/fact identity in Fluree is (s, p, o, dt, m) where m=FlakeMeta{lang, i} — matching Flake::eq/hash. Any dedup/stale-removal key that omits m collapses distinct facts: langString variants sharing a value (\"animal\"@en vs @fr), and @list members repeating a value at different indices. Issue #1273 was range::remove_stale_flakes (overlay-only/genesis read path) keying on (s,p,o,dt) only; the binary-scan stale-removal (binary_scan.rs FactKeyRef) already included m. Including m also correctly scopes retraction cancellation per variant." ;
+    mem:tag "dedup" ;
+    mem:tag "flake-identity" ;
+    mem:tag "issue-1273" ;
+    mem:tag "langstring" ;
+    mem:tag "range" ;
+    mem:scope mem:repo ;
+    mem:artifactRef "fluree-db-core/src/flake.rs" ;
+    mem:artifactRef "fluree-db-core/src/range.rs" ;
+    mem:artifactRef "fluree-db-query/src/binary_scan.rs" ;
+    mem:branch "fix/langstring-novelty-dedup-1273" ;
+    mem:createdAt "2026-06-04T19:47:27.110421+00:00"^^xsd:dateTime ;
+    mem:rationale "Recurring class of bug: parallel dedup implementations diverging on whether the key includes FlakeMeta. Recall before touching any flake-dedup/stale-removal code." .
+
+mem:fact-01kta3264pg54aabvt97spk5qt a mem:Fact ;
+    mem:content "RDF export raw-flake emitters (write_raw_flake_ntriples/turtle, flake_to_jsonld_raw) for untranslated novelty overlay flakes correctly use store.sid_to_iri(&flake.s/.p), NOT ExportResolver.resolve_subject_iri/resolve_predicate_iri. The resolver methods take integer IDs (u64 s_id / u32 p_id) and exist to recover a Sid from an ID via DictNovelty/ephemeral maps. Raw flakes already carry the full Sid (ns_code+name), so sid_to_iri is correct+complete. Both paths bottom out at the same namespace_codes map for the prefix, so the resolver gives ZERO fallback advantage for novelty-only subjects/predicates. DictNovelty never invents namespace codes (only local IDs within an existing ns_code)." ;
+    mem:tag "binary-index" ;
+    mem:tag "export" ;
+    mem:tag "novelty" ;
+    mem:tag "overlay" ;
+    mem:tag "rdf" ;
+    mem:scope mem:repo ;
+    mem:artifactRef "fluree-db-api/src/export.rs" ;
+    mem:artifactRef "fluree-db-binary-index/src/read/binary_index_store.rs" ;
+    mem:branch "fix/langstring-novelty-dedup-1273" ;
+    mem:createdAt "2026-06-04T19:51:46.070663+00:00"^^xsd:dateTime ;
+    mem:rationale "A reviewer flagged \"use resolver fallback instead of sid_to_iri for novelty subjects\" as a major data-loss bug; it is a false positive due to the Sid-vs-integer-ID distinction." .
+
 mem:fact-01kqfy6r0w86fcsd9km0707xzg a mem:Fact ;
     mem:content "v3 commit envelope reader at `legacy_v3.rs:305-309` deliberately stubs `graph_delta = HashMap::new()` since v3 never encoded the field. Envelope-only walkers (`first_t_where_graph_registered`) therefore return `None` on any chain that includes v3 commits, regardless of whether the named graph was actually registered. Callers that rely on the result for short-circuiting must either fall through to a full load on `None`, detect v3 envelopes and signal \"inconclusive\", or accept silent correctness regressions on legacy chains." ;
     mem:tag "commit-envelope" ;
@@ -1333,6 +1382,52 @@ mem:constraint-01kjte29y3cp8mae56xy6yfv2n a mem:Constraint ;
     mem:branch "main" ;
     mem:createdAt "2026-03-03T18:06:20.611062+00:00"^^xsd:dateTime .
 
+mem:constraint-01ksa8r11bg19hsb6wqnd9h8kp a mem:Constraint ;
+    mem:content "History scan persisted pass must skip when a literal-bound pattern component (subject Ref::Iri/Ref::Sid or predicate) fails to resolve to a store id. BinaryFilter currently only constrains s_id/p_id (object filtering is not applied in the persisted scan), so leaving them None walks every leaflet and emits every base row whose t falls in range — surfacing as \"non-matching @id returns all genesis facts\". Novelty still runs because flake_matches_range_eq is keyed on the snapshot-space s_sid/p_sid and short-circuits to empty correctly.</content>\n<severity>must</severity>\n<refs>[\"fluree-db-query/src/binary_history.rs\", \"fluree-db-api/tests/it_query_history_range.rs\"]</refs>\n</invoke>" ;
+    mem:tag "binary-scan" ;
+    mem:tag "filter" ;
+    mem:tag "gotcha" ;
+    mem:tag "history" ;
+    mem:tag "query" ;
+    mem:scope mem:repo ;
+    mem:branch "main" ;
+    mem:createdAt "2026-05-23T11:15:22.795697+00:00"^^xsd:dateTime .
+
+mem:constraint-01kt77z8dfhaj2sn0wkbrfvjrk a mem:Constraint ;
+    mem:content "SPARQL time-travel via the `@t:`/`@iso:` suffix on a ledger IRI is parsed ONLY on the FROM/dataset path (connection-scoped `query_from()` → `dataset.rs::parse_ledger_id_time_travel`). The ledger-scoped `graph(ledger).query()` path passes the raw ledger string to `load_graph_db(ledger)` with `TimeSpec::Latest` and does NOT parse a `@t:` suffix — `graph(\"mydb:main@t:5\")` looks for a ledger literally named that and fails. For ledger-scoped time travel use `graph_at(ledger, TimeSpec::AtT(t))` or `db_at_t_with_policy(ledger, t, opts)`. This is why the MCP `sparql_query` tool paginates deterministically via an explicit `t` request field (not a FROM-rewritten resume query)." ;
+    mem:tag "dataset" ;
+    mem:tag "graph-api" ;
+    mem:tag "mcp" ;
+    mem:tag "pagination" ;
+    mem:tag "sparql" ;
+    mem:tag "time-travel" ;
+    mem:scope mem:repo ;
+    mem:severity "should" ;
+    mem:artifactRef "fluree-db-api/src/dataset.rs" ;
+    mem:artifactRef "fluree-db-api/src/graph.rs" ;
+    mem:artifactRef "fluree-db-api/src/view/fluree_ext.rs" ;
+    mem:artifactRef "fluree-db-server/src/mcp/tools.rs" ;
+    mem:branch "main" ;
+    mem:createdAt "2026-06-03T17:19:49.679936+00:00"^^xsd:dateTime ;
+    mem:rationale "Non-obvious: the same @t: syntax works in a FROM clause but is silently wrong as a graph(ledger) argument. Cost real time when wiring snapshot pinning into any ledger-scoped (non-FROM) execution path." .
+
+mem:decision-01ksj0awgy3h55453a7p40tw30 a mem:Decision ;
+    mem:content "Fuel charging is now per-flake without schema exclusion. stage.rs previously skipped schema flakes via is_schema_flake with a misleading comment claiming it 'mirrors query-side fuel'; query-side scans actually charge per-flake unconditionally. Removed the filter and applied the same 100 fuel baseline + 1 micro-fuel/flake formula to bulk imports (per-chunk). ImportBuilder::tracker(Tracker) attaches an external tracker; ImportResult.tally returns the final TrackingTally; mid-import limit exhaustion surfaces as ImportError::FuelExceeded." ;
+    mem:tag "fuel" ;
+    mem:tag "import" ;
+    mem:tag "stage" ;
+    mem:tag "tracking" ;
+    mem:tag "transact" ;
+    mem:scope mem:repo ;
+    mem:artifactRef "docs/query/tracking-and-fuel.md" ;
+    mem:artifactRef "fluree-db-api/src/import.rs" ;
+    mem:artifactRef "fluree-db-core/src/tracking.rs" ;
+    mem:artifactRef "fluree-db-transact/src/stage.rs" ;
+    mem:branch "main" ;
+    mem:createdAt "2026-05-26T11:22:19.038786+00:00"^^xsd:dateTime ;
+    mem:rationale "Consistent fuel semantics across stage, query, and import. Schema-flake exclusion was undocumented and under-charged schema-heavy work; also dropped a hot-path dependency on fluree-db-policy." ;
+    mem:alternatives "Keep schema exclusion in stage and add a matching filter to import; charge import on a per-flake basis without a per-chunk baseline." .
+
 mem:fact-01kjte0r70p5ppv4cjkfyyedpe a mem:Fact ;
     mem:content "SPARQL Testsuite critical gotchas:\n- MUST `cd testsuite-sparql/` first — excluded from workspace, `cargo test -p testsuite-sparql` from root FAILS\n- Syntax tests run by default; eval tests need `--include-ignored`\n- Each test runs in subprocess with 5s/10s timeouts — panics show as \"Subprocess error\"\n- W3C data in git submodule `rdf-tests/`; URL→local: strip `https://w3c.github.io/rdf-tests/`, prepend `testsuite-sparql/rdf-tests/`\n- `make investigate` only searches syntax report — use `make investigate-eval` for eval failures\n- Key commands: `make count-eval`, `make test-eval-cat CAT=functions`, `make summary`, `make classify`" ;
     mem:tag "commands" ;
@@ -1367,6 +1462,21 @@ mem:fact-01kjte1yw4jyrqvnpq27mr2m9v a mem:Fact ;
     mem:artifactRef "fluree-db-sparql/src/lower/" ;
     mem:branch "main" ;
     mem:createdAt "2026-03-03T18:06:09.284115+00:00"^^xsd:dateTime .
+
+mem:fact-01ks1m2nn2exrjt7tjkmzgqtg2 a mem:Fact ;
+    mem:content "SUM/AVG aggregates use a shared `NumericAcc` in fluree-db-query/src/aggregate.rs that handles xsd:integer/decimal/double + BigInt with W3C type promotion (Integer→Decimal→Double, sticky upward). Inputs flow through `binding_to_numeric` (Lit + inline-encoded NUM_INT/NUM_F64) or `extract_numeric_with_gv` in group_aggregate.rs (also decodes NUM_BIG via BinaryGraphView). AVG of integer/decimal inputs yields xsd:decimal (W3C op:numeric-divide), with division precision capped at AVG_DECIMAL_PRECISION=34 (decimal128) to bound output. Both streaming (group_aggregate.rs AggState::Sum/Avg) and non-streaming (aggregate.rs agg_sum/agg_avg) paths share the accumulator." ;
+    mem:tag "aggregate" ;
+    mem:tag "avg" ;
+    mem:tag "decimal" ;
+    mem:tag "numeric-promotion" ;
+    mem:tag "sparql" ;
+    mem:tag "sum" ;
+    mem:scope mem:repo ;
+    mem:artifactRef "fluree-db-query/src/aggregate.rs" ;
+    mem:artifactRef "fluree-db-query/src/group_aggregate.rs" ;
+    mem:branch "main" ;
+    mem:createdAt "2026-05-20T02:40:16.034976+00:00"^^xsd:dateTime ;
+    mem:rationale "Pre-fix the extractors only handled Long/Double/Boolean and silently dropped FlakeValue::Decimal, causing SUM(decimal)=0 and AVG(decimal)=Unbound. The shared NumericAcc keeps the streaming and non-streaming paths in sync and prevents future drift between them." .
 
 mem:constraint-01kp8yczz09ndt54ztchbheeyb a mem:Constraint ;
     mem:content "JSON-LD transaction parsing does NOT auto-promote bare string values to IRI references. User data becomes an IRI only when wrapped in `{\"@id\": \"...\"}` or when the property has `@type: \"@id\"` in `@context`. The former `looks_like_iri` heuristic (three sites in parse/jsonld.rs) was removed — it silently promoted strings starting with `http://`/`https://`/`did:`/`fluree:`/`urn:` to IRIs, which violated the JSON-LD spec (especially for `{\"@value\": \"...\"}`, explicitly a literal)." ;
@@ -1696,3 +1806,50 @@ mem:fact-01kpm3sz8pxzakzcj4r8xx687v a mem:Fact ;
     mem:branch "misc/fixes" ;
     mem:createdAt "2026-04-20T00:14:22.486023+00:00"^^xsd:dateTime ;
     mem:rationale "This is a subtle semi-naive reasoning invariant; future restriction or chain work could easily reintroduce the bug by splitting lookups across delta and derived." .
+
+mem:fact-01ktcfc4gmhn2zh6xn29rskte8 a mem:Fact ;
+    mem:content "Query top-k is real but never truncates the upstream scan. apply_solution_modifiers (operator_tree.rs:2740) uses SortOperator::new_topk for ORDER BY+LIMIT, and even under DISTINCT does project-distinct-before-sort+top-k when ORDER BY refs only projected vars (can_project_distinct_before_sort :3011). But SortOperator is blocking: it drains the FULL child stream, building a per-row Vec<Binding> for every input row (sort.rs:589-622); only the final select_nth/heap is k-bounded. So rows_per_returned≫LIMIT is expected. BSBM Explore query1 also has a dedicated bypass: detect_star_const_numeric_label_order_limit→star_const_ordered_limit_operator (operator_tree.rs:280, :2440), tried before the generic tree." ;
+    mem:tag "bsbm" ;
+    mem:tag "distinct" ;
+    mem:tag "limit" ;
+    mem:tag "performance" ;
+    mem:tag "query" ;
+    mem:tag "sort" ;
+    mem:scope mem:repo ;
+    mem:artifactRef "/Users/bplatz/fluree/db/fluree-db-query/src/execute/operator_tree.rs" ;
+    mem:artifactRef "/Users/bplatz/fluree/db/fluree-db-query/src/sort.rs" ;
+    mem:branch "refactor/column-caching" ;
+    mem:createdAt "2026-06-05T18:05:23.860294+00:00"^^xsd:dateTime ;
+    mem:rationale "Future perf sessions evaluating LIMIT pushdown must know top-k exists but doesn't truncate upstream scan, and query1 may bypass the generic path." .
+
+mem:fact-01ktcfd1te1wg10c1gxgmrk98c a mem:Fact ;
+    mem:content "Per-query IRI/Sid materialization is ALREADY cached. `Materializer` (one per query, materializer.rs:264-268) holds iri_cache: HashMap<u64,Arc<str>>, sid_cache, pid_cache; resolve_iri/resolve_sid/resolve_pid memoize on raw u64/u32 s_id/p_id so repeated subjects in star queries pay forward_pack lookup_str (allocating String per miss, forward_pack.rs:299) only ONCE per distinct id. BinaryGraphView::resolve_subject_sid/iri (binary_index_store.rs:1933/1979) are NOT cached — callers must cache. BinaryScanOperator also has its own sid_cache (binary_scan.rs:176) used only by resolve_s_id for repeated-var checks." ;
+    mem:tag "binding" ;
+    mem:tag "bsbm" ;
+    mem:tag "materialization" ;
+    mem:tag "performance" ;
+    mem:tag "query" ;
+    mem:scope mem:repo ;
+    mem:artifactRef "fluree-db-binary-index/src/dict/forward_pack.rs" ;
+    mem:artifactRef "fluree-db-binary-index/src/read/binary_index_store.rs" ;
+    mem:artifactRef "fluree-db-query/src/binary_scan.rs" ;
+    mem:artifactRef "fluree-db-query/src/materializer.rs" ;
+    mem:branch "refactor/column-caching" ;
+    mem:createdAt "2026-06-05T18:05:53.870677+00:00"^^xsd:dateTime ;
+    mem:rationale "Candidate 4 (IRI/dict materialization) is largely solved; the lever is reducing residual lookups not adding a cache." .
+
+mem:fact-01ktcfdrpyfq8btp10mf75cmp5 a mem:Fact ;
+    mem:content "Batched star-join hot path already keys on raw u64, not full Binding: join.rs group_accumulator_by_subject/by_object (1490/1509) build FxHashMap<u64,Vec<usize>> from accumulator tuples (_,_,s_id) where s_id is the raw u64 extracted from EncodedSid at accumulate time. So eq/hash/clone ~6% is NOT join grouping (and NOT DISTINCT, which uses hashbrown raw-entry and only materializes a signature for genuinely-new rows). Residual binding overhead = scatter Vec<Vec<Vec<Binding>>> row assembly (join.rs:2049) + SortOperator per-row Vec<Binding> sort key. EncodedSid/EncodedLit late-materialization IS end-to-end (binary_scan.rs:1201)." ;
+    mem:tag "binding" ;
+    mem:tag "bsbm" ;
+    mem:tag "distinct" ;
+    mem:tag "join" ;
+    mem:tag "performance" ;
+    mem:tag "query" ;
+    mem:scope mem:repo ;
+    mem:artifactRef "fluree-db-query/src/binary_scan.rs" ;
+    mem:artifactRef "fluree-db-query/src/binding.rs" ;
+    mem:artifactRef "fluree-db-query/src/join.rs" ;
+    mem:branch "refactor/column-caching" ;
+    mem:createdAt "2026-06-05T18:06:17.310296+00:00"^^xsd:dateTime ;
+    mem:rationale "Candidate 3 lever is scatter/sort assembly, not join grouping or DISTINCT which are already optimized." .

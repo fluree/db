@@ -419,10 +419,11 @@ fluree query --format typed-json --normalize-arrays '{"select": {"ex:alice": ["*
 
 ## Performance Considerations
 
+- **JSON string output is streamed** — when emitting a JSON **string** (the `format_results_string*` entry points used by the HTTP server), JSON-LD, SPARQL JSON, Typed JSON, and Agent JSON serialize directly into the output buffer, skipping the intermediate `serde_json::Value` DOM and its second serialization pass. Output is byte-identical to the DOM path (enforced by parity tests). The DOM path (`serde_json::Value`-returning `format_results*`) is still used for the programmatic `Value` API, for `pretty` output, and as the parity reference; `selectOne`, ASK, CONSTRUCT/DESCRIBE, and hydration also fall back to it.
 - **JSON-LD** is the most efficient format — inferable types skip the `@value`/`@type` wrapper
-- **Typed JSON** adds a constant-factor overhead per literal value (one extra JSON object allocation). Query execution is unaffected — only the formatting phase is slower.
+- **Typed JSON** adds a constant-factor overhead per literal value (the `@value`/`@type` wrapper). Query execution is unaffected — only the formatting phase is slower.
 - **normalize_arrays** adds zero overhead when disabled (default). When enabled, it skips the `len() == 1` check — no additional allocations beyond the array wrapper.
-- **TSV/CSV** bypass JSON DOM construction entirely for maximum throughput
+- **TSV/CSV** bypass JSON construction entirely for maximum throughput
 
 ## Best Practices
 

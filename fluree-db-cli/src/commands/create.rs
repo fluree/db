@@ -15,6 +15,29 @@ pub struct ImportOpts {
     pub leaflets_per_leaf: usize,
 }
 
+/// `fluree create <ledger> --remote <name>` — create an empty ledger on the
+/// remote server. Only the empty-create case is supported; bulk imports
+/// (`--from`, `--memory`) require local data ingestion and are dispatched
+/// before this is reached. Active-ledger pointer is **not** touched —
+/// remote storage is separate from local.
+pub async fn run_remote(ledger: &str, remote_name: &str, dirs: &FlureeDir) -> CliResult<()> {
+    let client = context::build_remote_client(remote_name, dirs).await?;
+    let ledger_id = context::to_ledger_id(ledger);
+    let response = client.create_ledger(&ledger_id).await.map_err(|e| {
+        CliError::Remote(format!(
+            "failed to create '{ledger}' on remote '{remote_name}': {e}"
+        ))
+    })?;
+    context::persist_refreshed_tokens(&client, remote_name, dirs).await;
+
+    let resolved = response
+        .get("ledger")
+        .and_then(|v| v.as_str())
+        .unwrap_or(&ledger_id);
+    println!("Created ledger '{resolved}' on remote '{remote_name}'");
+    Ok(())
+}
+
 pub async fn run(
     ledger: &str,
     from: Option<&Path>,
@@ -316,13 +339,25 @@ async fn run_bulk_import(
                 total_bytes,
             } => {
                 is_streaming_scan.store(true, std::sync::atomic::Ordering::Relaxed);
-                sb.set_length(total_bytes);
-                sb.set_position(bytes_read);
                 let gb_read = bytes_read as f64 / (1024.0 * 1024.0 * 1024.0);
-                let gb_total = total_bytes as f64 / (1024.0 * 1024.0 * 1024.0);
-                sb.set_message(format!("{gb_read:.1} / {gb_total:.1} GB"));
-                if bytes_read >= total_bytes {
-                    sb.finish_with_message(format!("{gb_total:.1} GB"));
+                if total_bytes > 0 {
+                    // Known total — normal percentage bar.
+                    sb.set_length(total_bytes);
+                    sb.set_position(bytes_read);
+                    let gb_total = total_bytes as f64 / (1024.0 * 1024.0 * 1024.0);
+                    sb.set_message(format!("{gb_read:.1} / {gb_total:.1} GB"));
+                    if bytes_read >= total_bytes {
+                        sb.finish_with_message(format!("{gb_total:.1} GB"));
+                    }
+                } else {
+                    // Unknown total (compressed source — uncompressed size
+                    // not known ahead of time). Show running bytes only; the
+                    // bar's length is left at a sentinel so it never renders
+                    // as complete, and the Committing handler will clear it
+                    // when reading is genuinely done.
+                    sb.set_length(u64::MAX);
+                    sb.set_position(bytes_read);
+                    sb.set_message(format!("{gb_read:.2} GB read"));
                 }
             }
             ImportPhase::Committing {
@@ -354,6 +389,13 @@ async fn run_bulk_import(
             }
             ImportPhase::PreparingIndex { stage } => {
                 cb.finish();
+                // Unknown-total streaming scan (compressed input) leaves the
+                // scan bar without a natural finish event from the reader.
+                // By PreparingIndex, parsing is fully done so reading must be
+                // too — lock the bar at its last reported byte count.
+                if !sb.is_finished() {
+                    sb.finish();
+                }
                 // Show activity immediately (avoid "Indexing 0%" during merge/remap).
                 ib.set_length(100);
                 ib.set_position(1);
@@ -739,23 +781,35 @@ fn is_import_path(path: &Path) -> CliResult<bool> {
     let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
     let name_lower = name.to_ascii_lowercase();
 
-    // Reject compressed Turtle with a clear message.
-    if name_lower.ends_with(".ttl.gz")
-        || name_lower.ends_with(".ttl.zst")
-        || name_lower.ends_with(".ttl.bz2")
-    {
+    // Bulk import handles every supported RDF format. Each may carry an outer
+    // `.gz` or `.zst` suffix — the bulk pipeline decompresses transparently
+    // (see `fluree-db-api::import::effective_extension`). `.bz2` is rejected
+    // explicitly because the import pipeline doesn't link a bzip2 decoder.
+    if name_lower.ends_with(".bz2") {
         return Err(CliError::Input(format!(
-            "compressed Turtle files are not yet supported; decompress first: {}",
+            "bzip2-compressed files are not supported; use .gz or .zst, or \
+             decompress first: {}",
             path.display()
         )));
     }
-
-    // Case-insensitive .ttl / .jsonld check.
-    if name_lower.ends_with(".ttl") || name_lower.ends_with(".jsonld") {
-        return Ok(true);
-    }
-
-    Ok(false)
+    const SUPPORTED: &[&str] = &[
+        ".ttl",
+        ".ttl.gz",
+        ".ttl.zst",
+        ".nt",
+        ".nt.gz",
+        ".nt.zst",
+        ".nq",
+        ".nq.gz",
+        ".nq.zst",
+        ".trig",
+        ".trig.gz",
+        ".trig.zst",
+        ".jsonld",
+        ".jsonld.gz",
+        ".jsonld.zst",
+    ];
+    Ok(SUPPORTED.iter().any(|suffix| name_lower.ends_with(suffix)))
 }
 
 /// Replace non-alphanumeric characters with underscores for safe filenames.

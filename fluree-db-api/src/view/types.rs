@@ -166,6 +166,27 @@ pub struct GraphDb {
     pub(crate) query_time_rules_allowed: bool,
     /// Whether the query can override datalog config settings. Default: `true`.
     pub(crate) datalog_override_allowed: bool,
+    /// Pre-resolved graph id from `f:rulesSource.graphSelector` on
+    /// the local ledger. When `Some(g)`, the datalog rule extractor
+    /// scans graph `g` for `f:rule` flakes instead of the default
+    /// graph. `None` keeps the legacy behaviour (rules read from
+    /// the same graph as the query, defaulting to `g_id=0`).
+    /// Cross-ledger rules surface separately on `rules_source_iri`.
+    pub(crate) rules_source_g_id: Option<fluree_db_core::GraphId>,
+
+    /// Per-request governance-context capture carried across
+    /// cross-ledger entry points within the same logical request.
+    ///
+    /// `wrap_policy` and `query` are separate Rust API calls but
+    /// model a single HTTP request; if both touch the same model
+    /// ledger M, they must observe the same `resolved_t` for M.
+    /// Carrying this map on the view lets `wrap_policy` capture
+    /// M's head-t and the subsequent `query` reuse that capture
+    /// when building its own `ResolveCtx`.
+    ///
+    /// Empty by default. Cloned via `Arc` so policy-wrap doesn't
+    /// inflate the cached `GraphDb` cost.
+    pub(crate) cross_ledger_resolved_ts: Arc<std::collections::HashMap<String, i64>>,
 
     // ========================================================================
     // Graph source context (optional — set when view is created from a graph source)
@@ -236,6 +257,8 @@ impl GraphDb {
             datalog_enabled: true,
             query_time_rules_allowed: true,
             datalog_override_allowed: true,
+            rules_source_g_id: None,
+            cross_ledger_resolved_ts: Arc::new(std::collections::HashMap::new()),
             graph_source_id: None,
         }
     }
@@ -253,7 +276,9 @@ impl GraphDb {
     pub fn from_ledger_state(ledger: &LedgerState) -> Self {
         let novelty = ledger.novelty.clone();
         let mut gdb = Self::new(
-            Arc::new(ledger.snapshot.clone()),
+            // `ledger.snapshot` is already `Arc<LedgerSnapshot>`; share it
+            // (refcount bump) rather than deep-cloning the snapshot.
+            Arc::clone(&ledger.snapshot),
             novelty.clone() as Arc<dyn OverlayProvider>,
             Some(novelty),
             ledger.t(),
@@ -331,7 +356,9 @@ impl GraphDb {
         let mut snapshot = base.snapshot.clone();
         let has_deltas = staged.ns_registry.has_delta() || !staged.graph_delta.is_empty();
         if has_deltas {
-            snapshot
+            // Copy-on-write: staging mutates the snapshot to register new
+            // namespace/graph codes for preview queries.
+            Arc::make_mut(&mut snapshot)
                 .apply_envelope_deltas(
                     staged.ns_registry.delta(),
                     staged.graph_delta.values().map(std::string::String::as_str),
@@ -361,7 +388,7 @@ impl GraphDb {
         let combined = Arc::new(combined);
 
         let mut gdb = Self::new(
-            Arc::new(snapshot),
+            snapshot,
             combined.clone() as Arc<dyn OverlayProvider>,
             Some(combined),
             staged_t,
@@ -394,7 +421,7 @@ impl GraphDb {
         let base = staged.view.base();
         let novelty = base.novelty.clone();
         let mut gdb = Self::new(
-            Arc::new(base.snapshot.clone()),
+            Arc::clone(&base.snapshot),
             novelty.clone() as Arc<dyn OverlayProvider>,
             Some(novelty),
             base.t(),
@@ -487,8 +514,11 @@ impl GraphDb {
     /// Returns `None` if no binary store is attached.
     pub fn binary_graph(&self) -> Option<BinaryGraphView> {
         self.binary_store.as_ref().map(|store| {
+            // `shared_namespaces()` is a refcount bump on the snapshot's already-Arc
+            // namespace table; `namespaces().clone()` would deep-copy the whole map
+            // on every query (a dominant per-query cost on large ledgers).
             BinaryGraphView::new(store.clone(), self.graph_id)
-                .with_namespace_codes_fallback(Some(Arc::new(self.snapshot.namespaces().clone())))
+                .with_namespace_codes_fallback(Some(self.snapshot.shared_namespaces()))
         })
     }
 }
@@ -557,6 +587,35 @@ impl GraphDb {
     /// Check if queries can override datalog config settings.
     pub fn datalog_override_allowed(&self) -> bool {
         self.datalog_override_allowed
+    }
+
+    /// Set the local graph id that the datalog rule extractor should
+    /// scan for `f:rule` flakes (resolved from `f:rulesSource`).
+    pub fn with_rules_source_g_id(mut self, g_id: Option<fluree_db_core::GraphId>) -> Self {
+        self.rules_source_g_id = g_id;
+        self
+    }
+
+    /// Get the local graph id that the datalog rule extractor should
+    /// scan. `None` keeps the legacy behaviour (rules read from the
+    /// query graph).
+    pub fn rules_source_g_id(&self) -> Option<fluree_db_core::GraphId> {
+        self.rules_source_g_id
+    }
+
+    /// Replace the carried governance-context capture (per-ledger
+    /// `resolved_t`s seen so far in this logical request).
+    pub fn with_cross_ledger_resolved_ts(
+        mut self,
+        ts: Arc<std::collections::HashMap<String, i64>>,
+    ) -> Self {
+        self.cross_ledger_resolved_ts = ts;
+        self
+    }
+
+    /// Read the carried governance-context capture.
+    pub fn cross_ledger_resolved_ts(&self) -> &Arc<std::collections::HashMap<String, i64>> {
+        &self.cross_ledger_resolved_ts
     }
 }
 

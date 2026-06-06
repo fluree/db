@@ -55,9 +55,11 @@ mod inner {
         /// Import start time (reused for all commits to avoid per-chunk Utc::now).
         pub import_time: String,
         /// Named graph IRI → g_id mapping (stable across chunks).
-        /// g_id 0 = default graph, g_id 1 = txn-meta, g_id 2+ = user-defined.
+        /// g_id 0 = default graph, 1 = txn-meta, 2 = config, 3+ = user-defined.
         pub graph_ids: HashMap<String, u16>,
-        /// Next available g_id for user-defined named graphs.
+        /// Next available g_id for user-defined named graphs. Only used by the
+        /// non-spooling fallback; the spooling path allocates from the shared
+        /// graph allocator instead (see `import_trig_commit`).
         pub next_gid: u16,
         /// Accumulated turtle @prefix short names: IRI → short prefix.
         /// Captured from `on_prefix()` calls across all chunks.
@@ -77,7 +79,10 @@ mod inner {
                 cumulative_flakes: 0,
                 import_time: chrono::Utc::now().to_rfc3339(),
                 graph_ids: HashMap::new(),
-                next_gid: 2, // 0=default, 1=txn-meta
+                // 0=default, 1=txn-meta, 2=config (reserved); user graphs start
+                // at FIRST_USER_GRAPH_ID. Matches the shared graph allocator's
+                // dict_id+1 convention so spooled and fallback g_ids agree.
+                next_gid: fluree_db_core::graph_registry::FIRST_USER_GRAPH_ID,
                 prefix_map: HashMap::new(),
             }
         }
@@ -448,15 +453,17 @@ mod inner {
         fluree_graph_turtle::parse(&phase1.turtle, &mut sink)
             .map_err(|e| TransactError::Parse(e.to_string()))?;
 
-        // 3. Retrieve writer for named graph flakes
-        // Note: spool only captures default-graph triples parsed above.
-        // Named graph flakes (pushed below) are NOT spooled — TriG import
-        // falls back to the serial resolver path for index generation.
-        let (mut writer, chunk_prefix_map, spool_ctx) = sink
+        // 3. Retrieve writer + spool context for named graph flakes.
+        //
+        // Default-graph triples were parsed (and spooled) above. Named-graph
+        // flakes are pushed below to BOTH the commit blob (`writer`) and the
+        // spool (`spool_ctx`), so they reach the Tier-2 index and the index
+        // root's `named_graphs` routing exactly like default-graph triples.
+        // The spool is finished only after the named-graph loop completes.
+        let (mut writer, chunk_prefix_map, mut spool_ctx) = sink
             .finish()
             .map_err(|e| TransactError::Parse(format!("flake encode error: {e}")))?;
         state.prefix_map.extend(chunk_prefix_map);
-        let spool_result = spool_ctx.map(crate::import_sink::SpoolContext::finish_buffered);
         let mut op_count = writer.op_count();
 
         // 4. Process named graphs
@@ -465,13 +472,25 @@ mod inner {
         let mut graph_delta: HashMap<u16, String> = HashMap::new();
 
         for block in &phase1.named_graphs {
-            // Allocate or reuse g_id for this graph IRI from session state
+            // Allocate or reuse g_id for this graph IRI.
+            //
+            // When spooling (index build) is active, allocate from the shared
+            // graph allocator so the commit's `graph_delta` and the index's
+            // `graphs.dict` / query graph registry agree on the same g_id
+            // (allocator convention: dict_id + 1 = g_id). Without spooling
+            // (commit-only paths), fall back to the session counter.
             let g_id = if let Some(&existing) = state.graph_ids.get(&block.iri) {
                 existing
             } else {
-                // New graph IRI in this session — allocate and record in delta
-                let id = state.next_gid;
-                state.next_gid += 1;
+                // New graph IRI in this session — allocate and record in delta.
+                let id = match spool_ctx.as_mut() {
+                    Some(sc) => sc.graph_g_id_for_iri(&block.iri),
+                    None => {
+                        let id = state.next_gid;
+                        state.next_gid += 1;
+                        id
+                    }
+                };
                 state.graph_ids.insert(block.iri.clone(), id);
                 graph_delta.insert(id, block.iri.clone());
                 id
@@ -493,7 +512,24 @@ mod inner {
                     let (o, dt, lang) =
                         expand_object(obj, &block.prefixes, &mut state.ns_registry)?;
 
-                    let meta = lang.map(|l| FlakeMeta::with_lang(&l));
+                    // Spool the named-graph flake under its g_id (so it enters
+                    // the index), then encode it into the commit blob.
+                    if let Some(sc) = spool_ctx.as_mut() {
+                        sc.push_named_graph_record(
+                            g_id,
+                            crate::import_sink::FlakeRecord {
+                                s: &s,
+                                p: &p,
+                                o: &o,
+                                dt: &dt,
+                                lang: lang.as_deref(),
+                                list_index: None,
+                                t: new_t,
+                            },
+                        );
+                    }
+
+                    let meta = lang.as_deref().map(FlakeMeta::with_lang);
                     let flake = Flake::new_in_graph(
                         graph_sid.clone(),
                         s.clone(),
@@ -511,10 +547,10 @@ mod inner {
                     op_count += 1;
                 }
             }
-
-            // Suppress unused variable warning - g_id is used for stability tracking
-            let _ = g_id;
         }
+
+        // Named-graph flakes are now in the spool; finish it for the index.
+        let spool_result = spool_ctx.map(crate::import_sink::SpoolContext::finish_buffered);
         drop(_parse_span);
 
         // 5. Resolve txn-meta if present

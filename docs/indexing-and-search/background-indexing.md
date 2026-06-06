@@ -198,6 +198,14 @@ is optional and should generally be chosen by the caller. Leave
 explicitly for bounded environments such as Lambda jobs, HTTP gateways, or
 other workers with a fixed maximum runtime.
 
+`TriggerIndexResult` carries `fuel: Option<f64>` — the total fuel charged for
+the build that satisfied the trigger. The background indexer always meters
+each build, so callers see `Some(N)` for a real build, `Some(0.0)` when the
+requested t was already indexed (no work was needed), and the same value for
+all coalesced trigger callers satisfied by a single underlying build. See
+[Tracking and Fuel](../query/tracking-and-fuel.md#indexing-fuel) for the
+cost-ladder and rate semantics.
+
 ### Health Indicators
 
 **Healthy:**

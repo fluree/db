@@ -17,10 +17,15 @@ High-level introduction to the Fluree HTTP API, including:
 Complete reference for all HTTP endpoints:
 - `POST /update` - Submit update transactions (WHERE/DELETE/INSERT or SPARQL UPDATE)
 - `POST /query` - Execute queries
+- `POST /multi-query` - Bundle multiple queries against a shared snapshot ([dedicated doc](multi-query.md))
 - `GET /v1/fluree/ledgers` - List ledgers
 - `GET /health` - Health checks
 - `GET /v1/fluree/stats` - Server status
 - And more...
+
+### [Multi-query envelope](multi-query.md)
+
+Bundle multiple JSON-LD and/or SPARQL queries into a single request that runs against one shared snapshot moment, with envelope-level `@context` / `opts` defaults and per-alias result assembly.
 
 ### [Headers, Content Types, and Request Sizing](headers.md)
 

@@ -247,7 +247,12 @@ WHERE {
 
 Create an entity only if it doesn't already exist. Useful for preventing duplicate records.
 
-This pattern uses OPTIONAL + FILTER to check for absence.
+This pattern uses OPTIONAL + FILTER to check for absence. For query-only
+absence tests, `["not-exists", { ... }]` is the canonical form (see
+[Negation Patterns](../query/jsonld-query.md#negation-patterns)). The
+OPTIONAL/BOUND form below is shown here because the example also keeps
+`?existing` available to subsequent BIND/DELETE templates when bob does
+exist — `not-exists` filters rows out and exposes nothing.
 
 ### JSON-LD
 
@@ -469,7 +474,14 @@ After the update, the product has both its new price and a record of the previou
 
 3. **Use BIND for all computed values.** The `["bind", "?var", "(expression)"]` form keeps computation inside the transaction, ensuring atomicity.
 
-4. **Use OPTIONAL + FILTER for absence checks.** The `["optional", ...], ["filter", "(not (bound ?var))"]` pattern is the idiomatic way to test for non-existence.
+4. **Test for absence with the form that fits the update.** Two idioms are
+   supported. `["optional", ...]` followed by `["filter", "(not (bound ?var))"]`
+   leaves the optional variables in scope for downstream BIND/DELETE/INSERT
+   templates — pick this when the update needs the absent variable. For pure
+   "does this exist?" guards where no downstream template needs the variable,
+   `["not-exists", { ... }]` is the canonical query form (see
+   [Negation Patterns](../query/jsonld-query.md#negation-patterns)). Both
+   lower to the same planner strategy chooser.
 
 5. **Leverage Fluree's immutability.** Every transaction creates an immutable commit. Even without explicit audit trail patterns, you can always query previous states using time travel. Use the audit trail pattern when you want the old value readily accessible in the current state.
 

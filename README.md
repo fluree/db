@@ -266,6 +266,7 @@ Full documentation also lives in [`docs/`](docs/README.md):
 - [HTTP API](docs/api/README.md) — Server endpoints and authentication
 - [Operations](docs/operations/README.md) — Configuration, deployment, telemetry
 - [Contributing](docs/contributing/README.md) — Build from source, run tests, PR workflow
+- [Benchmarking](BENCHMARKING.md) — Run, understand, and add performance benchmarks
 
 ## License
 

@@ -940,7 +940,7 @@ async fn explain_tags_annotation_role_and_uses_arena_stats() {
                 arena_only.snapshot.stats.is_some(),
                 "preconditions: post-reindex snapshot has IndexStats"
             );
-            arena_only.snapshot.stats = None;
+            std::sync::Arc::make_mut(&mut arena_only.snapshot).stats = None;
             let db_arena_only = graphdb_from_ledger(&arena_only);
             let resp_arena_only = fluree
                 .explain(&db_arena_only, &query)

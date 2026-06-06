@@ -13,7 +13,7 @@ use fluree_db_query::ir::{
 use fluree_db_query::parse::encode::IriEncoder;
 
 use super::select::BaseModifiers;
-use super::{LoweringContext, Result};
+use super::{LowerError, LoweringContext, Result};
 
 impl<E: IriEncoder> LoweringContext<'_, E> {
     /// Lower a CONSTRUCT query to a Query.
@@ -42,7 +42,18 @@ impl<E: IriEncoder> LoweringContext<'_, E> {
             limit,
             offset,
             ordering,
+            order_binds,
+            deferred_order_exprs,
         } = self.lower_base_modifiers(&construct.modifiers)?;
+
+        // CONSTRUCT has no aggregation stage here, so an inline-aggregate ORDER BY
+        // (e.g. `ORDER BY DESC(COUNT(?x))`) cannot be hoisted/lowered.
+        if !deferred_order_exprs.is_empty() {
+            return Err(LowerError::unsupported_form(
+                "aggregate ORDER BY in CONSTRUCT",
+                construct.span,
+            ));
+        }
 
         let ctx = self.build_jsonld_context()?;
         let ctx_val = self.build_jsonld_context_value();
@@ -55,6 +66,7 @@ impl<E: IriEncoder> LoweringContext<'_, E> {
             reasoning: ReasoningConfig::default(),
             grouping: None,
             ordering,
+            order_binds,
             limit,
             offset,
             post_values: None,

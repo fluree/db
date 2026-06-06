@@ -3,6 +3,8 @@
 //! These types define the query interface (what to match, how to compare,
 //! query options) and are independent of the underlying index implementation.
 
+use std::sync::Arc;
+
 use crate::sid::Sid;
 use crate::temporal;
 use crate::value::FlakeValue;
@@ -306,6 +308,20 @@ pub struct RangeOptions {
     /// Set to 0 to disable prefetch. Default is 3.
     /// Prefetch overlaps I/O with processing to reduce cold query latency.
     pub prefetch_n: Option<usize>,
+    /// Optional forward-predicate allow-list (by `Sid`).
+    ///
+    /// When set, the range provider drops rows whose predicate is not in the
+    /// list **before** decoding the object value, resolving the subject Sid,
+    /// or charging dict-touch fuel — i.e., it converts a single SPOT(s,*,*)
+    /// scan into a selective subject crawl without forcing per-predicate
+    /// probes. None preserves the previous behavior (decode every row).
+    ///
+    /// Hint to providers; cursor work is unchanged (one bounded scan over
+    /// the subject's range). Used by graph-crawl hydration when the
+    /// projection lists explicit forward predicates (non-wildcard).
+    /// Use `Arc<[Sid]>` so the same allow-list is shared cheaply across the
+    /// N per-subject range calls a single hydration emits.
+    pub predicate_filter: Option<Arc<[Sid]>>,
 }
 
 impl RangeOptions {
@@ -389,6 +405,17 @@ impl RangeOptions {
     /// Disable prefetch
     pub fn without_prefetch(mut self) -> Self {
         self.prefetch_n = Some(0);
+        self
+    }
+
+    /// Set the forward-predicate allow-list.
+    ///
+    /// See [`RangeOptions::predicate_filter`] for semantics. Callers should
+    /// keep the slice small (typical hydration projections: <16 entries) and
+    /// share the `Arc<[Sid]>` across all the range calls a single subject
+    /// crawl emits.
+    pub fn with_predicate_filter(mut self, preds: Arc<[Sid]>) -> Self {
+        self.predicate_filter = Some(preds);
         self
     }
 }

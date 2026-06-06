@@ -375,6 +375,9 @@ impl ServiceOperator {
 
 #[async_trait]
 impl Operator for ServiceOperator {
+    fn plan_children(&self) -> Vec<crate::plan_node::PlanChild<'_>> {
+        vec![crate::plan_node::PlanChild::child(self.child.as_ref())]
+    }
     fn schema(&self) -> &[VarId] {
         &self.schema
     }

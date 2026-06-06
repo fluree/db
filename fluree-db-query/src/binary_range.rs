@@ -360,6 +360,23 @@ fn binary_range_eq_v3(
         }
     };
 
+    // Resolve the optional projection-predicate allow-list once.
+    //
+    // `predicate_filter_p_ids` is the row-loop's allow-set of `u32` p_ids.
+    // We seed it with persisted-dict resolutions here; novelty-only
+    // predicates (no persisted p_id yet) get appended below after overlay
+    // translation surfaces their ephemeral p_ids via `ephemeral_p_id_to_sid`.
+    // Without that extension, an overlay assert on a novelty-only selected
+    // predicate would survive the overlay translator's Sid filter, land in
+    // the cursor stream with an ephemeral p_id, and then get silently
+    // dropped here.
+    let mut predicate_filter_p_ids: Option<Vec<u32>> =
+        opts.predicate_filter.as_deref().map(|sids| {
+            sids.iter()
+                .filter_map(|s| store.sid_to_p_id(s))
+                .collect::<Vec<u32>>()
+        });
+
     // Create cursor: use range-narrowed scan when any filter field is bound,
     // matching the pattern in BinaryScanOperator::open. For novelty-only subjects
     // this yields an empty leaf_range, so the cursor drains overlay ops directly
@@ -410,7 +427,12 @@ fn binary_range_eq_v3(
     let effective_to_t = opts.to_t.unwrap_or_else(|| store.max_t());
     cursor.set_to_t(effective_to_t);
 
-    // Overlay translation.
+    // Overlay translation. When the caller supplied a projection-predicate
+    // allow-list, filter overlay flakes by `flake.p` before translation —
+    // this both skips work on discarded overlay rows and ensures the
+    // untranslated raw-fallback set doesn't smuggle non-selected predicates
+    // back in. Sid match (vs persisted p_id) so novel predicates still pass.
+    let predicate_filter_sids = opts.predicate_filter.clone();
     let OverlayTranslateV3Result {
         mut ops,
         raw: untranslated,
@@ -424,7 +446,10 @@ fn binary_range_eq_v3(
         store,
         dict_novelty,
         runtime_small_dicts,
-        |_| true,
+        move |flake| match &predicate_filter_sids {
+            Some(allow) => allow.iter().any(|p| p == &flake.p),
+            None => true,
+        },
         "V3 range",
     );
 
@@ -436,6 +461,25 @@ fn binary_range_eq_v3(
         cursor.set_epoch(epoch);
     }
 
+    // Extend the row-loop allow-set with ephemeral p_ids whose mapped Sid is
+    // in the caller's allow-list — these are novelty-only predicates that
+    // have no persisted p_id yet, so they were not captured during the
+    // initial Sid-to-p_id resolution. The overlay translator already let
+    // them through via Sid match; without this step the row loop would
+    // drop them under their cursor-side ephemeral p_id.
+    if let (Some(allow_sids), Some(allow_ids)) = (
+        opts.predicate_filter.as_deref(),
+        predicate_filter_p_ids.as_mut(),
+    ) {
+        for (eph_p_id, sid) in &ephemeral_p_id_to_sid {
+            if allow_sids.iter().any(|s| s == sid) {
+                allow_ids.push(*eph_p_id);
+            }
+        }
+        allow_ids.sort_unstable();
+        allow_ids.dedup();
+    }
+
     // Iterate and decode to Flakes.
     let has_untranslated = !untranslated.is_empty();
     let limit = opts.flake_limit.or(opts.limit).unwrap_or(usize::MAX);
@@ -445,15 +489,31 @@ fn binary_range_eq_v3(
 
     while let Some(batch) = cursor.next_batch()? {
         for i in 0..batch.row_count {
-            let s_id = batch.s_id.get(i);
             let p_id = batch.p_id.get_or(i, 0);
+
+            // Projection-predicate gate. Skip discarded predicates before any
+            // dict touch (subject resolve, predicate IRI, object decode,
+            // datatype/lang lookups) — purely an integer probe.
+            if let Some(allow) = &predicate_filter_p_ids {
+                if allow.binary_search(&p_id).is_err() {
+                    continue;
+                }
+            }
+
+            let s_id = batch.s_id.get(i);
             let o_type = batch.o_type.get_or(i, 0);
             let o_key = batch.o_key.get(i);
             let t = batch.t.get_or(i, 0) as i64;
             let o_i = batch.o_i.get_or(i, u32::MAX);
 
-            // Resolve subject.
-            let s_sid = resolve_sid(s_id, &view)?;
+            // Resolve subject. Reuse the caller-supplied Sid when present —
+            // the bound `match_val.s` IS the subject for every base row this
+            // scan returns, so the per-row `resolve_subject_sid` (a dict
+            // touch on the persisted path) is redundant.
+            let s_sid = match &match_val.s {
+                Some(sid) => sid.clone(),
+                None => resolve_sid(s_id, &view)?,
+            };
             // Resolve predicate: persisted dict first, then ephemeral overlay map.
             let p_sid = match store.resolve_predicate_iri(p_id) {
                 Some(iri) => store.encode_iri(iri),
@@ -1293,6 +1353,16 @@ fn overlay_only_flakes(
             }
             if let Some(ref o_val) = match_val.o {
                 if flake.o != *o_val {
+                    return;
+                }
+            }
+
+            // Projection-predicate allow-list (parity with the indexed path).
+            // Applied here for novelty-only subjects that bypass the cursor
+            // loop above (subject/predicate/object Sid unresolvable in the
+            // persisted dict, or no branch manifest for this order).
+            if let Some(ref allow) = opts.predicate_filter {
+                if !allow.iter().any(|p| p == &flake.p) {
                     return;
                 }
             }

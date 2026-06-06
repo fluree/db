@@ -28,32 +28,12 @@
 //   cargo bench -p fluree-db-api --bench fulltext_query -- --test
 
 use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
+use fluree_bench_support::gen::corpora::random_paragraph;
+use fluree_bench_support::{bench_runtime, current_profile, init_tracing_for_bench};
+use fluree_db_api::admin::ReindexOptions;
 use fluree_db_api::{CommitOpts, FlureeBuilder, IndexConfig, TxnOpts};
 use rand::prelude::*;
 use serde_json::{json, Value as JsonValue};
-use tokio::runtime::Runtime;
-
-use fluree_db_api::admin::ReindexOptions;
-
-fn init_tracing_for_bench() {
-    use std::sync::OnceLock;
-    static INIT: OnceLock<()> = OnceLock::new();
-    INIT.get_or_init(|| {
-        if std::env::var("FLUREE_BENCH_TRACING").ok().as_deref() != Some("1") {
-            return;
-        }
-        if std::env::var("RUST_LOG").is_err() {
-            std::env::set_var("RUST_LOG", "info");
-        }
-        let filter = tracing_subscriber::EnvFilter::from_default_env();
-        tracing_subscriber::fmt()
-            .with_env_filter(filter)
-            .with_target(true)
-            .with_level(true)
-            .try_init()
-            .ok();
-    });
-}
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -63,122 +43,31 @@ fn init_tracing_for_bench() {
 const BATCH_SIZE: usize = 200;
 
 /// Dataset sizes to benchmark.
-const DATASET_SIZES: &[usize] = &[1_000, 5_000, 10_000, 50_000];
+const DATASET_SIZES_FULL: &[usize] = &[1_000, 5_000, 10_000, 50_000];
+
+/// Scale-driven slice of `DATASET_SIZES_FULL`. Tiny only runs the
+/// smallest size so the CI bench-gate stays under its wall-clock
+/// budget; nightly (`Full` profile, scale=Large) runs the whole curve.
+fn dataset_sizes() -> &'static [usize] {
+    use fluree_bench_support::BenchScale;
+    match fluree_bench_support::current_scale() {
+        BenchScale::Tiny => &DATASET_SIZES_FULL[..1],
+        BenchScale::Small => &DATASET_SIZES_FULL[..2],
+        BenchScale::Medium => &DATASET_SIZES_FULL[..3],
+        BenchScale::Large => DATASET_SIZES_FULL,
+    }
+}
 
 /// Categories for filtered queries — ~25% pass rate per category.
 const CATEGORIES: &[&str] = &["science", "technology", "history", "culture"];
 
 // ---------------------------------------------------------------------------
-// Paragraph corpus — realistic short paragraphs (~30-60 words each)
+// Paragraph corpus
 // ---------------------------------------------------------------------------
-
-/// Paragraph templates with domain vocabulary. Each has placeholders that get
-/// filled with random terms to create unique documents.
-const PARAGRAPH_TEMPLATES: &[&str] = &[
-    "The rapid advancement of distributed database systems has fundamentally \
-     transformed how organizations manage and query large-scale data. Modern \
-     approaches leverage columnar storage, immutable ledgers, and semantic \
-     graph models to achieve both performance and correctness guarantees \
-     that were previously unattainable.",
-    "Machine learning algorithms continue to reshape scientific research \
-     across multiple disciplines. From protein folding predictions to climate \
-     modeling, neural networks provide powerful tools for pattern recognition \
-     in complex datasets that defy traditional analytical methods.",
-    "Sustainable energy infrastructure requires careful integration of \
-     renewable sources with existing power grids. Battery storage technology, \
-     smart grid management, and demand response systems form the backbone \
-     of modern energy transition strategies in urban environments.",
-    "The evolution of programming languages reflects changing priorities \
-     in software engineering. Memory safety, concurrency primitives, and \
-     type system expressiveness have become critical design considerations \
-     as systems grow more complex and security threats intensify.",
-    "Quantum computing research has reached an inflection point where \
-     practical applications begin to emerge alongside theoretical advances. \
-     Error correction techniques and hybrid classical-quantum algorithms \
-     show promise for optimization problems in logistics and cryptography.",
-    "Urban planning in the twenty-first century must balance population \
-     growth with environmental sustainability. Mixed-use development, \
-     public transit investment, and green infrastructure provide frameworks \
-     for creating resilient cities that serve diverse communities.",
-    "Genomic medicine is revolutionizing healthcare through personalized \
-     treatment protocols based on individual genetic profiles. Advances in \
-     sequencing technology and bioinformatics tools enable clinicians to \
-     identify disease markers and therapeutic targets with unprecedented precision.",
-    "The intersection of artificial intelligence and natural language \
-     processing has produced remarkable advances in text understanding. \
-     Large language models demonstrate emergent capabilities in reasoning, \
-     summarization, and knowledge synthesis across diverse domains.",
-    "Ocean conservation efforts increasingly rely on satellite monitoring \
-     and underwater sensor networks to track marine ecosystem health. \
-     Real-time data collection enables rapid response to pollution events \
-     and supports evidence-based fishery management policies.",
-    "Cybersecurity frameworks must evolve continuously to address emerging \
-     threat vectors in cloud-native architectures. Zero trust principles, \
-     supply chain verification, and automated incident response form the \
-     foundation of modern defensive security postures.",
-    "Archaeological discoveries continue to reshape our understanding of \
-     ancient civilizations and their technological achievements. Advanced \
-     imaging techniques and isotope analysis reveal migration patterns, \
-     trade networks, and cultural exchanges spanning millennia.",
-    "The global semiconductor industry faces unprecedented demand driven \
-     by artificial intelligence workloads and Internet of Things devices. \
-     Advanced fabrication processes at nanometer scales push the boundaries \
-     of materials science and precision manufacturing.",
-    "Blockchain technology extends beyond cryptocurrency to enable verifiable \
-     credentials, supply chain transparency, and decentralized governance. \
-     Immutable ledger architectures provide audit trails and trust frameworks \
-     for multi-party transactions without centralized intermediaries.",
-    "Climate science models integrate atmospheric, oceanic, and terrestrial \
-     data to project future environmental conditions with increasing accuracy. \
-     Ensemble methods and high-resolution simulations help policymakers \
-     understand risks and plan adaptation strategies.",
-    "Robotic systems in healthcare settings assist surgeons with precision \
-     procedures and support rehabilitation through adaptive therapy programs. \
-     Advances in haptic feedback and computer vision enable safer and more \
-     effective human-robot collaboration in clinical environments.",
-    "Digital humanities scholarship applies computational methods to literary, \
-     historical, and cultural analysis. Text mining, network visualization, \
-     and geospatial mapping tools reveal patterns in archives and collections \
-     that would be impossible to identify through manual review alone.",
-];
-
-/// Extra vocabulary injected randomly to ensure document uniqueness.
-const EXTRA_VOCAB: &[&str] = &[
-    "performance",
-    "optimization",
-    "distributed",
-    "concurrent",
-    "scalable",
-    "efficient",
-    "robust",
-    "innovative",
-    "comprehensive",
-    "fundamental",
-    "architecture",
-    "infrastructure",
-    "methodology",
-    "implementation",
-    "evaluation",
-    "framework",
-    "algorithm",
-    "protocol",
-    "specification",
-    "integration",
-    "verification",
-    "validation",
-    "deployment",
-    "monitoring",
-    "analysis",
-    "synthesis",
-    "transformation",
-    "processing",
-    "computation",
-    "visualization",
-    "simulation",
-    "approximation",
-    "calibration",
-    "aggregation",
-];
+//
+// `PARAGRAPH_TEMPLATES`, `EXTRA_VOCAB`, and `random_paragraph` were lifted to
+// `fluree_bench_support::gen::corpora` so other text-shaped benches can reuse
+// the same deterministic corpus. They're re-imported at module top.
 
 // ---------------------------------------------------------------------------
 // Type aliases
@@ -190,17 +79,9 @@ type BenchLedger = fluree_db_api::LedgerState;
 // ---------------------------------------------------------------------------
 // Data generation
 // ---------------------------------------------------------------------------
-
-/// Generate a unique paragraph by combining a template with random extra words.
-fn random_paragraph(rng: &mut impl Rng) -> String {
-    let template = PARAGRAPH_TEMPLATES[rng.gen_range(0..PARAGRAPH_TEMPLATES.len())];
-    // Append 2-4 random vocabulary words to make each doc unique
-    let n_extra = rng.gen_range(2..=4);
-    let extras: Vec<&str> = (0..n_extra)
-        .map(|_| EXTRA_VOCAB[rng.gen_range(0..EXTRA_VOCAB.len())])
-        .collect();
-    format!("{} Keywords: {}.", template, extras.join(", "))
-}
+//
+// `random_paragraph` is `fluree_bench_support::gen::corpora::random_paragraph`
+// (re-imported at module top).
 
 /// Create Fluree instance, insert `n_docs` @fulltext documents, return
 /// everything needed to run benchmark queries.
@@ -325,11 +206,11 @@ async fn setup_dataset_indexed(
 
 fn bench_fulltext_scan_all(c: &mut Criterion) {
     init_tracing_for_bench();
-    let rt = Runtime::new().unwrap();
+    let rt = bench_runtime();
     let mut group = c.benchmark_group("fulltext_scan_all");
-    group.sample_size(10);
+    group.sample_size(current_profile().sample_size());
 
-    for &n in DATASET_SIZES {
+    for &n in dataset_sizes() {
         eprintln!("  [setup] Inserting {n} @fulltext docs...");
         let (fluree, ledger, query, _, _) = rt.block_on(setup_dataset(n));
         let db = fluree_db_api::GraphDb::from_ledger_state(&ledger);
@@ -349,11 +230,11 @@ fn bench_fulltext_scan_all(c: &mut Criterion) {
 
 fn bench_fulltext_scan_all_indexed(c: &mut Criterion) {
     init_tracing_for_bench();
-    let rt = Runtime::new().unwrap();
+    let rt = bench_runtime();
     let mut group = c.benchmark_group("fulltext_scan_all_indexed");
-    group.sample_size(10);
+    group.sample_size(current_profile().sample_size());
 
-    for &n in DATASET_SIZES {
+    for &n in dataset_sizes() {
         eprintln!("  [setup] Inserting {n} @fulltext docs + building index...");
         let (_fluree, snapshot, query, _, _) = rt.block_on(setup_dataset_indexed(n));
 
@@ -374,11 +255,11 @@ fn bench_fulltext_scan_all_indexed(c: &mut Criterion) {
 
 fn bench_fulltext_scan_filtered(c: &mut Criterion) {
     init_tracing_for_bench();
-    let rt = Runtime::new().unwrap();
+    let rt = bench_runtime();
     let mut group = c.benchmark_group("fulltext_scan_filtered");
-    group.sample_size(10);
+    group.sample_size(current_profile().sample_size());
 
-    for &n in DATASET_SIZES {
+    for &n in dataset_sizes() {
         eprintln!("  [setup] Inserting {n} @fulltext docs...");
         let (fluree, ledger, _, query, n_science) = rt.block_on(setup_dataset(n));
         let db = fluree_db_api::GraphDb::from_ledger_state(&ledger);
@@ -410,11 +291,11 @@ fn bench_fulltext_scan_filtered(c: &mut Criterion) {
 
 fn bench_fulltext_scan_filtered_indexed(c: &mut Criterion) {
     init_tracing_for_bench();
-    let rt = Runtime::new().unwrap();
+    let rt = bench_runtime();
     let mut group = c.benchmark_group("fulltext_scan_filtered_indexed");
-    group.sample_size(10);
+    group.sample_size(current_profile().sample_size());
 
-    for &n in DATASET_SIZES {
+    for &n in dataset_sizes() {
         eprintln!("  [setup] Inserting {n} @fulltext docs + building index...");
         let (_fluree, snapshot, _, query, n_science) = rt.block_on(setup_dataset_indexed(n));
         eprintln!(

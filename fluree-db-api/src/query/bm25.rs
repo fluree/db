@@ -1,6 +1,6 @@
 use serde_json::Value as JsonValue;
 
-use crate::query::helpers::{parse_dataset_spec, tracker_for_limits};
+use crate::query::helpers::{charge_query_floor, parse_dataset_spec, tracker_for_limits};
 use crate::{
     ApiError, DataSetDb, ExecutableQuery, Fluree, FlureeIndexProvider, QueryResult, Result,
     VarRegistry,
@@ -23,6 +23,13 @@ impl Fluree {
         let primary = dataset
             .primary()
             .ok_or_else(|| ApiError::query("Dataset has no graphs for query execution"))?;
+
+        // Tracker (fuel limits only). Charge the floor before parsing so a
+        // sub-floor `max-fuel` is rejected up front; no-op when fuel isn't
+        // tracked.
+        let tracker = tracker_for_limits(query_json);
+        charge_query_floor(&tracker).map_err(fluree_db_query::QueryError::from)?;
+
         // Parse the query using the primary ledger's DB for IRI encoding
         let mut vars = VarRegistry::new();
         let parsed = parse_query(query_json, primary.snapshot.as_ref(), &mut vars, None)?;
@@ -40,7 +47,6 @@ impl Fluree {
         //
         // Vector provider support is feature-gated. When disabled,
         // f:queryVector patterns are not available and we run the BM25-only path.
-        let tracker = tracker_for_limits(query_json);
         let db = primary.as_graph_db_ref();
         let tracker_ref = if tracker.is_enabled() {
             Some(&tracker)

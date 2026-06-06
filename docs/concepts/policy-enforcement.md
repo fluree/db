@@ -144,5 +144,6 @@ For deeper architectural detail see [Policy model and inputs](../security/policy
 - [Policy in queries](../security/policy-in-queries.md) — query-time behavior
 - [Policy in transactions](../security/policy-in-transactions.md) — transaction-time behavior
 - [Programmatic policy API (Rust)](../security/programmatic-policy.md) — building policy contexts in code
+- [Cross-ledger policy](../security/cross-ledger-policy.md) — govern many data ledgers from one model ledger
 - [Authentication](../security/authentication.md) — identity, JWTs, and bearer tokens
 - [Configuration](../operations/configuration.md) — server-side policy defaults (`data_auth_default_policy_class`, etc.)

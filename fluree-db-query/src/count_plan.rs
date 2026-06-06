@@ -38,28 +38,15 @@ pub(crate) enum ScalarNode {
     /// Maps to: `count_rows_for_predicate_psot`
     TotalRowCount { pred: Ref },
 
+    /// Count of `(s, o)` pairs present in BOTH predicate relations — the
+    /// multicolumn join `?s <pred1> ?o . ?s <pred2> ?o`. A composite-key
+    /// merge-intersection on `(s_id, o_type, o_key)`, NOT a subject-keyed star
+    /// (which would multiply per-subject counts).
+    /// Maps to: `count_composite_join_pairs`
+    CompositeJoinPairCount { pred1: Ref, pred2: Ref },
+
     /// Reduce a stream to its total: `Σ_k count(k)`.
     Sum { source: StreamNode },
-
-    // Kept for: potential optimization — fuse exclusion into the scalar sum traversal
-    // instead of building a separate AntiJoin stream node.
-    #[expect(dead_code)]
-    /// Reduce a stream with exclusion: `Σ_{k ∉ excluded} count(k)`.
-    /// `source` and `excluded` must share the same key domain.
-    SumExcluding {
-        source: StreamNode,
-        excluded: KeySetNode,
-    },
-
-    // Kept for: potential optimization — fuse inclusion into the scalar sum traversal
-    // instead of building a separate SemiJoin stream node.
-    #[expect(dead_code)]
-    /// Reduce a stream with inclusion: `Σ_{k ∈ filter} count(k)`.
-    /// `source` and `filter` must share the same key domain.
-    SumFiltered {
-        source: StreamNode,
-        filter: KeySetNode,
-    },
 
     /// Count rows from POST(pred) grouped by object, summing only objects in the filter set.
     /// Maps to: `sum_post_object_counts_filtered`
@@ -180,6 +167,10 @@ pub(crate) enum CountPlanRoot {
     Scalar(ScalarNode),
     /// Chain fold (its own algorithm, produces scalar).
     Chain(ChainFold),
+    /// `?a <p1> ?b . OPTIONAL { ?b <p2> ?c . ?c <p3> ?d }` — a required head
+    /// triple plus an OPTIONAL 2-hop chain rooted at the head's object.
+    /// `total = Σ_b count_p1(b) × max(1, Σ_{c ∈ p2(b)} count_p3(c))`.
+    OptionalChainHead { p1: Ref, p2: Ref, p3: Ref },
 }
 
 /// A complete count-only plan.
@@ -202,6 +193,22 @@ pub(crate) struct CountPlan {
 /// Runtime gating (binary-index store, HEAD query, root policy) happens in the executor.
 pub(crate) fn try_build_count_plan(query: &Query) -> Option<CountPlan> {
     let out_var = detect_count_all_aggregate(query)?;
+
+    // Multicolumn (s,o)-join: `?s <p1> ?o . ?s <p2> ?o`. Both the subject and
+    // object var are shared across exactly two triples, so this counts matching
+    // (s,o) pairs — a composite-key intersection, not a subject-keyed star (which
+    // `classify_patterns` rejects because the object var repeats). Handle it here
+    // before classification.
+    if let Some(root) = try_build_multicolumn_join(&query.patterns) {
+        return Some(CountPlan { root, out_var });
+    }
+
+    // `?a <p1> ?b . OPTIONAL { ?b <p2> ?c . ?c <p3> ?d }`. The OPTIONAL wraps a
+    // chain (different subjects), which `classify_optional_block` rejects, so
+    // handle it here before classification.
+    if let Some(root) = try_build_optional_chain_head(&query.patterns) {
+        return Some(CountPlan { root, out_var });
+    }
 
     // Classify all patterns in the WHERE clause.
     let classified = classify_patterns(&query.patterns)?;
@@ -229,6 +236,83 @@ pub(crate) fn try_build_count_plan(query: &Query) -> Option<CountPlan> {
     };
 
     Some(CountPlan { root, out_var })
+}
+
+/// Detect the multicolumn (s,o)-join shape `?s <p1> ?o . ?s <p2> ?o` — exactly
+/// two simple triples sharing the same subject var AND object var (and `s != o`).
+/// Returns a [`ScalarNode::CompositeJoinPairCount`] root; the executor merge-joins
+/// the two predicate relations on the composite key `(s_id, o_type, o_key)`.
+fn try_build_multicolumn_join(patterns: &[Pattern]) -> Option<CountPlanRoot> {
+    if patterns.len() != 2 {
+        return None;
+    }
+    let Pattern::Triple(t1) = &patterns[0] else {
+        return None;
+    };
+    let Pattern::Triple(t2) = &patterns[1] else {
+        return None;
+    };
+    let (s1, p1, o1) = validate_simple_triple(t1)?;
+    let (s2, p2, o2) = validate_simple_triple(t2)?;
+    // Same subject var, same object var, and not a self-loop.
+    if s1 != s2 || o1 != o2 || o1 == s1 {
+        return None;
+    }
+    Some(CountPlanRoot::Scalar(ScalarNode::CompositeJoinPairCount {
+        pred1: p1,
+        pred2: p2,
+    }))
+}
+
+/// Detect `?a <p1> ?b . OPTIONAL { ?b <p2> ?c . ?c <p3> ?d }`: a required head
+/// triple plus an OPTIONAL 2-hop chain rooted at the head's object var.
+///
+/// Returns a [`CountPlanRoot::OptionalChainHead`]; the executor computes
+/// `Σ_b count_p1(b) × max(1, Σ_{c ∈ p2(b)} count_p3(c))`.
+fn try_build_optional_chain_head(patterns: &[Pattern]) -> Option<CountPlanRoot> {
+    if patterns.len() != 2 {
+        return None;
+    }
+    let mut req: Option<&crate::ir::triple::TriplePattern> = None;
+    let mut inner: Option<&[Pattern]> = None;
+    for p in patterns {
+        match p {
+            Pattern::Triple(tp) => req = Some(tp),
+            Pattern::Optional(v) => inner = Some(v),
+            _ => return None,
+        }
+    }
+    let (_a, p1, b_var) = validate_simple_triple(req?)?;
+
+    // OPTIONAL must be a 2-triple linear chain rooted at ?b.
+    let inner = inner?;
+    if inner.len() != 2 {
+        return None;
+    }
+    let mut basics: Vec<BasicTriple> = Vec::with_capacity(2);
+    for pat in inner {
+        let Pattern::Triple(tp) = pat else {
+            return None;
+        };
+        let (s, pred, o) = validate_simple_triple(tp)?;
+        if s == o {
+            return None;
+        }
+        basics.push(BasicTriple {
+            subject_var: s,
+            pred,
+            object_var: o,
+        });
+    }
+    let (preds, vars) = detect_chain(&basics)?;
+    if preds.len() != 2 || *vars.first()? != b_var {
+        return None;
+    }
+    Some(CountPlanRoot::OptionalChainHead {
+        p1,
+        p2: preds[0].clone(),
+        p3: preds[1].clone(),
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -958,9 +1042,7 @@ mod tests {
                 aggregates: fluree_db_core::NonEmpty::try_from_vec(vec![
                     crate::ir::AggregateSpec {
                         function: AggregateFn::CountAll,
-                        input_var: None,
                         output_var: out_var,
-                        distinct: false,
                     },
                 ])
                 .expect("non-empty"),
@@ -968,6 +1050,7 @@ mod tests {
             },
             having: None,
         });
+
         Query {
             context: ParsedContext::default(),
             orig_context: None,
@@ -975,6 +1058,7 @@ mod tests {
             patterns,
             grouping,
             ordering: Vec::new(),
+            order_binds: Vec::new(),
             limit: None,
             offset: None,
             reasoning: ReasoningConfig::default(),

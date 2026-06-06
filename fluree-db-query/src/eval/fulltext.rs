@@ -24,7 +24,6 @@ use std::sync::Arc;
 use once_cell::sync::Lazy;
 
 use crate::binding::RowAccess;
-use crate::bm25::analyzer::Analyzer;
 use crate::context::ExecutionContext;
 use crate::error::Result;
 use crate::ir::Expression;
@@ -32,7 +31,7 @@ use crate::ir::Expression;
 use super::helpers::check_arity;
 use super::value::ComparableValue;
 
-use fluree_db_binary_index::analyzer::Language;
+use fluree_db_binary_index::analyzer::{Analyzer, Language};
 use fluree_db_binary_index::arena::fulltext::DocBoW;
 use fluree_db_binary_index::FulltextArena;
 use fluree_db_core::comparator::IndexType;

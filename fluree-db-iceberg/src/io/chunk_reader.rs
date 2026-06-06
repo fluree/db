@@ -15,9 +15,16 @@
 //!
 //! # Sync/Async Bridge
 //!
-//! The parquet `ChunkReader` trait is synchronous, but our storage is async. We use
-//! `Handle::block_on` which is safe when called from a blocking context. Callers
-//! should use `tokio::task::spawn_blocking` or similar when processing large files.
+//! The parquet `ChunkReader` trait is synchronous, but our storage is async. The
+//! bridge (`block_on_storage_fetch`) is flavor-aware: on a multi-thread runtime
+//! it blocks via `block_in_place(handle.block_on(..))` so the calling worker is
+//! released and a replacement keeps driving the IO reactor (correct on both
+//! worker and `spawn_blocking` threads); on a current-thread runtime it drives
+//! the future on a self-contained helper runtime in a separate thread to avoid
+//! panicking or deadlocking the single thread; with no ambient runtime it blocks
+//! on the handle captured at construction. Callers should still prefer
+//! `tokio::task::spawn_blocking` for large files so the whole decode does not
+//! occupy a worker for its full duration.
 //!
 //! # Cache Strategy
 //!
@@ -36,7 +43,7 @@ use std::sync::{Arc, Mutex};
 
 use bytes::Bytes;
 use parquet::file::reader::{ChunkReader, Length};
-use tokio::runtime::Handle;
+use tokio::runtime::{Handle, RuntimeFlavor};
 
 use crate::io::SendIcebergStorage;
 
@@ -106,6 +113,56 @@ impl<S: SendIcebergStorage + 'static> std::fmt::Debug for RangeBackedChunkReader
             )
             .finish()
     }
+}
+
+/// Drive a storage future to completion from parquet's synchronous
+/// `ChunkReader` context, choosing a strategy that is safe for the current
+/// runtime flavor. Mirrors the canonical `run_sync_on_runtime` bridge in
+/// fluree-db-binary-index.
+///
+/// - **Multi-thread runtime:** `block_in_place(handle.block_on(..))` so the
+///   calling worker is released and Tokio keeps a thread driving the IO reactor
+///   while we block. Correct on both worker threads (a future direct caller)
+///   and `spawn_blocking` threads (today's sole caller, where `block_in_place`
+///   is a harmless no-op).
+/// - **Current-thread / unknown runtime:** `block_in_place` would panic and
+///   `block_on` would deadlock the single thread, so the future is driven on a
+///   self-contained current-thread runtime in a helper OS thread.
+/// - **No ambient runtime:** block on the caller-provided fallback handle.
+fn block_on_storage_fetch<F>(fallback: &Handle, fut: F) -> F::Output
+where
+    F: std::future::Future + Send + 'static,
+    F::Output: Send + 'static,
+{
+    match Handle::try_current() {
+        Ok(handle) => match handle.runtime_flavor() {
+            RuntimeFlavor::MultiThread => tokio::task::block_in_place(|| handle.block_on(fut)),
+            // CurrentThread or any future/unknown flavor.
+            _ => run_on_helper_runtime(fut),
+        },
+        Err(_) => fallback.block_on(fut),
+    }
+}
+
+/// Run `fut` to completion on a dedicated current-thread runtime in a freshly
+/// spawned OS thread, returning its output. Bridges sync→async from a
+/// current-thread runtime without blocking that runtime's only thread on its
+/// own progress.
+fn run_on_helper_runtime<F>(fut: F) -> F::Output
+where
+    F: std::future::Future + Send + 'static,
+    F::Output: Send + 'static,
+{
+    let (tx, rx) = std::sync::mpsc::sync_channel(1);
+    std::thread::spawn(move || {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("failed to build helper runtime for iceberg chunk read");
+        let _ = tx.send(rt.block_on(fut));
+    });
+    rx.recv()
+        .expect("iceberg chunk-read helper runtime thread panicked")
 }
 
 impl<S: SendIcebergStorage + 'static> RangeBackedChunkReader<S> {
@@ -183,18 +240,17 @@ impl<S: SendIcebergStorage + 'static> RangeBackedChunkReader<S> {
 
         let range = aligned_start..aligned_end;
 
-        // Block on async read_range
+        // Bridge parquet's sync ChunkReader to our async storage with a
+        // flavor-aware blocking strategy (see `block_on_storage_fetch`).
         let storage = Arc::clone(&self.storage);
         let path_for_fetch = self.path.clone();
         let path_for_err = self.path.clone();
-        let data = self
-            .runtime
-            .block_on(async move { storage.read_range(&path_for_fetch, range).await })
-            .map_err(|e| {
-                parquet::errors::ParquetError::General(format!(
-                    "Failed to read range [{aligned_start}, {aligned_end}) from {path_for_err}: {e}"
-                ))
-            })?;
+        let fetch = async move { storage.read_range(&path_for_fetch, range).await };
+        let data = block_on_storage_fetch(&self.runtime, fetch).map_err(|e| {
+            parquet::errors::ParquetError::General(format!(
+                "Failed to read range [{aligned_start}, {aligned_end}) from {path_for_err}: {e}"
+            ))
+        })?;
 
         // Cache the aligned result
         {
@@ -338,6 +394,29 @@ mod tests {
         .unwrap();
 
         assert_eq!(result, "ok");
+    }
+
+    /// The sync ChunkReader called *directly* from a current-thread runtime
+    /// (no `spawn_blocking`) must not panic or deadlock: the bridge drives the
+    /// fetch on a helper runtime instead of blocking the single runtime thread
+    /// on its own progress. Default `#[tokio::test]` is a current-thread runtime.
+    #[tokio::test]
+    async fn test_chunk_reader_current_thread_runtime_does_not_panic() {
+        let data = Bytes::from(vec![7u8; 1000]);
+        let storage = Arc::new(MockStorage { data });
+        let handle = Handle::current();
+        let reader = RangeBackedChunkReader::new(storage, "test.parquet".to_string(), 1000, handle);
+
+        // Direct call on the current-thread runtime thread.
+        let bytes = reader
+            .get_bytes(100, 200)
+            .expect("current-thread bridge should read without panicking");
+        assert_eq!(bytes.len(), 200);
+        assert!(bytes.iter().all(|&b| b == 7));
+
+        // Cache hit path (no second fetch) still works.
+        let bytes2 = reader.get_bytes(150, 50).expect("cache-hit read");
+        assert_eq!(bytes2.len(), 50);
     }
 
     #[tokio::test(flavor = "multi_thread")]

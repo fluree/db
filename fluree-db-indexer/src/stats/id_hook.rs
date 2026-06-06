@@ -179,12 +179,22 @@ fn otype_to_value_type_tag(ot: fluree_db_core::o_type::OType) -> ValueTypeTag {
         OType::XSD_DOUBLE => ValueTypeTag::DOUBLE,
         OType::XSD_FLOAT => ValueTypeTag::FLOAT,
         OType::XSD_DECIMAL => ValueTypeTag::DECIMAL,
+        // NUM_BIG_OVERFLOW is intentionally NOT mapped here: it carries both
+        // `FlakeValue::Decimal` (arbitrary-precision xsd:decimal) and
+        // `FlakeValue::BigInt` (xsd:integer overflow > i64) — they share
+        // `ObjKind::NUM_BIG`. Disambiguating requires inspecting the NumBig
+        // arena entry (`StoredBigValue::BigDec` vs `BigInt`), which is not
+        // available here. Falling through to UNKNOWN is the honest answer
+        // until the collector is plumbed with arena access or the semantic
+        // dt tag is preserved alongside the o_type byte.
         OType::XSD_DATE => ValueTypeTag::DATE,
         OType::XSD_TIME => ValueTypeTag::TIME,
         OType::XSD_DATE_TIME => ValueTypeTag::DATE_TIME,
         OType::XSD_G_YEAR => ValueTypeTag::G_YEAR,
+        OType::XSD_G_YEAR_MONTH => ValueTypeTag::G_YEAR_MONTH,
         OType::XSD_G_MONTH => ValueTypeTag::G_MONTH,
         OType::XSD_G_DAY => ValueTypeTag::G_DAY,
+        OType::XSD_G_MONTH_DAY => ValueTypeTag::G_MONTH_DAY,
         OType::XSD_STRING => ValueTypeTag::STRING,
         OType::XSD_ANY_URI => ValueTypeTag::ANY_URI,
         OType::XSD_NORMALIZED_STRING => ValueTypeTag::NORMALIZED_STRING,
@@ -382,8 +392,13 @@ impl IdStatsHook {
                         .entry(rec.o_key)
                         .or_insert(0) += delta;
                 }
-            } else if !self.hll_only && rec.op {
-                // Non-rdf:type property assertion: track per-subject and per-class
+            } else if !self.hll_only {
+                // Non-rdf:type property flake: track per-subject property presence on
+                // BOTH assertions and retractions. Recording retractions here (issue
+                // #1266) lets the incremental class-stat merge revisit a class whose
+                // only change this batch is a retraction, so its datatype/lang/ref
+                // decrement is applied instead of silently dropped. The set is now
+                // "properties touched this batch", not "asserted this batch".
                 self.subject_props
                     .entry((rec.g_id, rec.s_id))
                     .or_default()
@@ -472,6 +487,27 @@ impl IdStatsHook {
             }
             for (key, props) in other.subject_props {
                 self.subject_props.entry(key).or_default().extend(props);
+            }
+            // Merge per-subject, per-property datatype/language deltas. (These
+            // were previously dropped here, leaving class→property→datatype/lang
+            // attribution empty after any multi-worker accumulation.)
+            for (key, per_prop) in other.subject_prop_dts {
+                let entry = self.subject_prop_dts.entry(key).or_default();
+                for (p_id, dts) in per_prop {
+                    let dt_entry = entry.entry(p_id).or_default();
+                    for (dt, delta) in dts {
+                        *dt_entry.entry(dt).or_insert(0) += delta;
+                    }
+                }
+            }
+            for (key, per_prop) in other.subject_prop_langs {
+                let entry = self.subject_prop_langs.entry(key).or_default();
+                for (p_id, langs) in per_prop {
+                    let lang_entry = entry.entry(p_id).or_default();
+                    for (lang, delta) in langs {
+                        *lang_entry.entry(lang).or_insert(0) += delta;
+                    }
+                }
             }
         }
         // Merge per-subject ref history.

@@ -12,17 +12,15 @@
 use crate::binding::{Batch, Binding};
 use crate::error::{QueryError, Result};
 use crate::fast_path_common::{
-    empty_batch, fast_path_store, ref_to_p_id, term_to_ref_s_id, FastPathOperator,
+    build_psot_cursor_for_predicate, empty_batch, fast_path_store, normalize_pred_sid, ref_to_p_id,
+    term_to_ref_s_id, FastPathOperator,
 };
 use crate::ir::triple::{Ref, Term};
 use crate::var_registry::VarId;
+use fluree_db_binary_index::batched_lookup_predicate_refs;
 use fluree_db_binary_index::format::column_block::ColumnId;
-use fluree_db_binary_index::format::run_record::RunSortOrder;
-use fluree_db_binary_index::format::run_record_v2::RunRecordV2;
-use fluree_db_binary_index::read::column_types::{BinaryFilter, ColumnProjection, ColumnSet};
-use fluree_db_binary_index::{batched_lookup_predicate_refs, BinaryCursor};
+use fluree_db_binary_index::read::column_types::{ColumnProjection, ColumnSet};
 use fluree_db_core::o_type::OType;
-use fluree_db_core::subject_id::SubjectId;
 use fluree_db_core::{FlakeValue, GraphId};
 use fluree_vocab::xsd;
 use regex::{Regex, RegexBuilder};
@@ -92,44 +90,20 @@ pub fn label_regex_type_operator(
                 internal: ColumnSet::EMPTY,
             };
 
-            let Some(branch) = store.branch_for_order(g_id, RunSortOrder::Psot) else {
+            // Stream the full predicate range in PSOT (overlay-folding cursor;
+            // gated by `fast_path_store` ⇒ no novelty, `to_t == max_t`).
+            let label_pred_sid = normalize_pred_sid(store.as_ref(), &label_pred)?;
+            let Some(mut cursor) = build_psot_cursor_for_predicate(
+                ctx,
+                store,
+                g_id,
+                label_pred_sid,
+                label_p_id,
+                projection,
+            )?
+            else {
                 return Ok(Some(empty_batch(schema.clone())?));
             };
-            let branch = Arc::clone(branch);
-
-            // Full predicate range in PSOT.
-            let min_key = RunRecordV2 {
-                s_id: SubjectId(0),
-                o_key: 0,
-                p_id: label_p_id,
-                t: 0,
-                o_i: 0,
-                o_type: 0,
-                g_id,
-            };
-            let max_key = RunRecordV2 {
-                s_id: SubjectId(u64::MAX),
-                o_key: u64::MAX,
-                p_id: label_p_id,
-                t: u32::MAX,
-                o_i: u32::MAX,
-                o_type: u16::MAX,
-                g_id,
-            };
-            let filter = BinaryFilter {
-                p_id: Some(label_p_id),
-                ..Default::default()
-            };
-            let mut cursor = BinaryCursor::new(
-                Arc::clone(store),
-                RunSortOrder::Psot,
-                branch,
-                &min_key,
-                &max_key,
-                filter,
-                projection,
-            );
-            cursor.set_to_t(ctx.to_t);
 
             // Collect matches (expected to be small for typical regex filters).
             const MAX_HITS: usize = 200_000;

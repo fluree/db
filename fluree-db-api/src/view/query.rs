@@ -4,9 +4,9 @@
 //! a GraphDb, respecting policy and reasoning wrappers.
 
 use crate::query::helpers::{
-    build_query_result, parse_and_validate_sparql, parse_jsonld_query, parse_sparql_to_ir,
-    prepare_for_execution, status_for_query_error, tracker_for_limits,
-    tracker_for_tracked_endpoint,
+    build_query_result, charge_query_floor, parse_and_validate_sparql, parse_jsonld_query,
+    parse_sparql_to_ir, prepare_for_execution, status_for_query_error, tracked_query_tracker,
+    tracker_for_limits,
 };
 use crate::view::{GraphDb, QueryInput};
 use crate::{ApiError, ExecutableQuery, Fluree, QueryResult, Result, Tracker, TrackingOptions};
@@ -72,6 +72,15 @@ impl Fluree {
     pub async fn query(&self, db: &GraphDb, q: impl Into<QueryInput<'_>>) -> Result<QueryResult> {
         let input = q.into();
 
+        // 0. Tracker for fuel limits only (no tracking overhead for non-tracked
+        // calls). Charge the floor up front so a sub-floor `max-fuel` is
+        // rejected before we spend parse/plan work; no-op when fuel isn't tracked.
+        let tracker = match &input {
+            QueryInput::JsonLd(json) => tracker_for_limits(json),
+            QueryInput::Sparql(_) => Tracker::disabled(),
+        };
+        charge_query_floor(&tracker).map_err(fluree_db_query::QueryError::from)?;
+
         // 1. Parse to common IR
         let parse_start = std::time::Instant::now();
         let (vars, mut parsed) = match &input {
@@ -93,12 +102,6 @@ impl Fluree {
         let plan_start = std::time::Instant::now();
         let executable = self.build_executable_for_view(db, &parsed).await?;
         let plan_ms = plan_start.elapsed().as_secs_f64() * 1000.0;
-
-        // 3. Get tracker for fuel limits only (no tracking overhead for non-tracked calls)
-        let tracker = match &input {
-            QueryInput::JsonLd(json) => tracker_for_limits(json),
-            QueryInput::Sparql(_) => Tracker::disabled(),
-        };
 
         // 4. Execute
         let exec_start = std::time::Instant::now();
@@ -139,6 +142,14 @@ impl Fluree {
     ) -> Result<QueryResult> {
         let input = q.into();
 
+        // 0. Tracker (fuel limits only). Charge the floor up front so a
+        // sub-floor `max-fuel` is rejected before parse/plan; no-op untracked.
+        let tracker = match &input {
+            QueryInput::JsonLd(json) => tracker_for_limits(json),
+            QueryInput::Sparql(_) => Tracker::disabled(),
+        };
+        charge_query_floor(&tracker).map_err(fluree_db_query::QueryError::from)?;
+
         // 1. Parse to common IR
         let (vars, mut parsed) = match &input {
             QueryInput::JsonLd(json) => {
@@ -156,12 +167,6 @@ impl Fluree {
 
         // 2. Build executable with optional reasoning override
         let executable = self.build_executable_for_view(db, &parsed).await?;
-
-        // 3. Tracker (fuel limits only)
-        let tracker = match &input {
-            QueryInput::JsonLd(json) => tracker_for_limits(json),
-            QueryInput::Sparql(_) => Tracker::disabled(),
-        };
 
         // 4. Execute
         let batches = self
@@ -223,16 +228,13 @@ impl Fluree {
     {
         let input = q.into();
 
-        // Get tracker: use caller-provided options if given, otherwise fall back
-        // to defaults (all-enabled for SPARQL, opts-derived for JSON-LD).
-        let tracker = if let Some(opts) = tracking_override {
-            Tracker::new(opts)
-        } else {
-            match &input {
-                QueryInput::JsonLd(json) => tracker_for_tracked_endpoint(json),
-                QueryInput::Sparql(_) => Tracker::new(TrackingOptions::all_enabled()),
-            }
-        };
+        // Tracker: caller-provided options if given, else per-input defaults.
+        let tracker = tracked_query_tracker(&input, &tracking_override);
+
+        // Charge the one-time query floor before parsing so a parse/plan error
+        // still reports it and a sub-floor max-fuel is rejected up front.
+        charge_query_floor(&tracker)
+            .map_err(|e| crate::query::TrackedErrorResponse::fuel_exceeded(&e, tracker.tally()))?;
 
         // Determine output format: caller override > input-type default
         let default_format = match &input {
@@ -338,14 +340,11 @@ impl Fluree {
     {
         let input = q.into();
 
-        let tracker = if let Some(opts) = tracking_override {
-            Tracker::new(opts)
-        } else {
-            match &input {
-                QueryInput::JsonLd(json) => tracker_for_tracked_endpoint(json),
-                QueryInput::Sparql(_) => Tracker::new(TrackingOptions::all_enabled()),
-            }
-        };
+        let tracker = tracked_query_tracker(&input, &tracking_override);
+
+        // Charge the one-time query floor before parsing (see `query_tracked`).
+        charge_query_floor(&tracker)
+            .map_err(|e| crate::query::TrackedErrorResponse::fuel_exceeded(&e, tracker.tally()))?;
 
         let default_format = match &input {
             QueryInput::Sparql(_) => crate::format::FormatterConfig::sparql_json(),
@@ -508,10 +507,104 @@ impl Fluree {
             }
         }
 
+        // Carry the pre-resolved `f:rulesSource` graph id (if any)
+        // into the executable so `compute_derived_facts` extracts
+        // datalog rules from the configured graph instead of the
+        // query graph.
+        executable.reasoning.rules_source_g_id = db.rules_source_g_id();
+
+        // Build a single per-request `ResolveCtx` so every
+        // cross-ledger artifact (rules, schema, …) captured by this
+        // query observes a coherent head-t per model ledger. Two
+        // separate contexts would each lazy-capture a head-t and
+        // could disagree if M advances between awaits — that breaks
+        // the resolver's per-request consistency contract.
+        //
+        // Seeded from `db.cross_ledger_resolved_ts` so a preceding
+        // `wrap_policy` call's captures carry forward: policy and
+        // reasoning/rules on the same M must agree on which
+        // version of M they're enforcing, even though they enter
+        // through separate Rust API calls.
+        let mut ctx = crate::cross_ledger::ResolveCtx::with_resolved_ts(
+            db.as_graph_db_ref().snapshot.ledger_id.as_str(),
+            self,
+            (**db.cross_ledger_resolved_ts()).clone(),
+        );
+
+        // Cross-ledger `f:rulesSource`: when M is referenced via
+        // `f:ledger`, resolve M's rules graph through the
+        // cross-ledger resolver and merge the JSON rule bodies into
+        // `executable.reasoning.rules` so they pass through the
+        // existing query-time rule code path. Same-ledger references
+        // are handled above via `rules_source_g_id`.
+        self.attach_cross_ledger_rules(db, &mut executable, &mut ctx)
+            .await?;
+
         // Resolve `f:schemaSource` + `owl:imports` closure, if configured.
-        self.attach_schema_bundle(db, &mut executable).await?;
+        self.attach_schema_bundle(db, &mut executable, &mut ctx)
+            .await?;
 
         Ok(executable)
+    }
+
+    /// If the resolved datalog config carries a cross-ledger
+    /// `f:rulesSource`, dispatch through the cross-ledger resolver
+    /// and append the parsed JSON rules to
+    /// `executable.reasoning.rules`. Short-circuits when:
+    /// - the view has no resolved config,
+    /// - no `f:rulesSource` is configured,
+    /// - `f:rulesSource` is purely local (`f:ledger` unset — handled
+    ///   by the `rules_source_g_id` pre-resolution path),
+    /// - datalog reasoning is not enabled on the executable (no point
+    ///   pulling rules we won't run).
+    ///
+    /// Errors propagate as `ApiError::CrossLedger`; the server maps
+    /// those to HTTP 502.
+    async fn attach_cross_ledger_rules(
+        &self,
+        db: &GraphDb,
+        executable: &mut ExecutableQuery,
+        ctx: &mut crate::cross_ledger::ResolveCtx<'_>,
+    ) -> Result<()> {
+        if !executable.reasoning.modes.datalog {
+            return Ok(());
+        }
+        let Some(resolved) = db.resolved_config() else {
+            return Ok(());
+        };
+        let Some(datalog) = resolved.datalog.as_ref() else {
+            return Ok(());
+        };
+        let Some(source) = datalog.rules_source.as_ref() else {
+            return Ok(());
+        };
+        if source.ledger.is_none() {
+            return Ok(());
+        }
+
+        let resolved = crate::cross_ledger::resolve_graph_ref(
+            source,
+            crate::cross_ledger::ArtifactKind::Rules,
+            ctx,
+        )
+        .await?;
+        let crate::cross_ledger::GovernanceArtifact::Rules(wire) = &resolved.artifact else {
+            return Err(crate::error::ApiError::CrossLedger(
+                crate::cross_ledger::CrossLedgerError::TranslationFailed {
+                    ledger_id: resolved.model_ledger_id.clone(),
+                    graph_iri: resolved.graph_iri.clone(),
+                    detail: "resolver returned a non-Rules artifact for a Rules request; \
+                             resolver dispatch bug"
+                        .into(),
+                },
+            ));
+        };
+        executable
+            .reasoning
+            .modes
+            .rules
+            .extend(wire.parsed_rules()?);
+        Ok(())
     }
 
     /// Resolve the schema bundle from the ledger's reasoning config and attach
@@ -532,21 +625,97 @@ impl Fluree {
         &self,
         db: &GraphDb,
         executable: &mut ExecutableQuery,
+        ctx: &mut crate::cross_ledger::ResolveCtx<'_>,
     ) -> Result<()> {
         if executable.reasoning.modes.is_disabled() {
             return Ok(());
         }
-        let Some(resolved) = db.resolved_config() else {
-            return Ok(());
-        };
-        let Some(reasoning) = resolved.reasoning.as_ref() else {
-            return Ok(());
-        };
-        if reasoning.schema_source.is_none() {
-            return Ok(());
-        }
 
         let db_ref = db.as_graph_db_ref();
+
+        // 1. Resolve the configured `f:schemaSource` (if any) into a
+        //    bundle. Either branch — cross-ledger or local — may yield
+        //    None when the field isn't configured.
+        let configured_bundle = self
+            .resolve_configured_schema_bundle(db, &db_ref, ctx)
+            .await?;
+
+        // 2. Parse inline `opts.ontology` axioms (if any) into a
+        //    bundle. Layered on top of `configured_bundle` so a
+        //    query can extend the ledger's reasoning with per-request
+        //    axioms without persisting them.
+        //
+        //    `take()` so the (potentially large) raw JSON-LD doesn't
+        //    ride along on `ReasoningModes.ontology` for the rest of
+        //    query preparation — `Query::with_patterns` clones the
+        //    reasoning config downstream, and only the compiled
+        //    `SchemaBundleFlakes` overlay is needed past this point.
+        let inline_bundle = match executable.reasoning.modes.ontology.take() {
+            Some(json) => {
+                crate::inline_ontology::parse_inline_ontology_to_bundle(&json, db_ref.snapshot)?
+            }
+            None => None,
+        };
+
+        // 3. Merge.
+        executable.reasoning.schema_bundle = match (configured_bundle, inline_bundle) {
+            (None, None) => None,
+            (Some(b), None) | (None, Some(b)) => Some(b),
+            (Some(a), Some(b)) => Some(crate::inline_ontology::merge_bundles(a, b)?),
+        };
+        Ok(())
+    }
+
+    /// Resolve the configured `f:schemaSource` (same- or cross-ledger)
+    /// into a [`SchemaBundleFlakes`]. Returns `Ok(None)` when no
+    /// `f:schemaSource` is configured. Extracted so
+    /// [`attach_schema_bundle`] can layer the inline ontology on top
+    /// regardless of which configured branch ran (or whether either
+    /// ran).
+    async fn resolve_configured_schema_bundle(
+        &self,
+        db: &GraphDb,
+        db_ref: &fluree_db_core::GraphDbRef<'_>,
+        ctx: &mut crate::cross_ledger::ResolveCtx<'_>,
+    ) -> Result<Option<std::sync::Arc<fluree_db_query::schema_bundle::SchemaBundleFlakes>>> {
+        let Some(resolved) = db.resolved_config() else {
+            return Ok(None);
+        };
+        let Some(reasoning) = resolved.reasoning.as_ref() else {
+            return Ok(None);
+        };
+        let Some(schema_source) = reasoning.schema_source.as_ref() else {
+            return Ok(None);
+        };
+
+        // Cross-ledger detection: if the source carries `f:ledger`,
+        // dispatch through the cross-ledger resolver and translate
+        // the resulting `SchemaArtifactWire` into a SchemaBundleFlakes
+        // against D's snapshot.
+        if schema_source.ledger.is_some() {
+            let resolved = crate::cross_ledger::resolve_graph_ref(
+                schema_source,
+                crate::cross_ledger::ArtifactKind::SchemaClosure,
+                ctx,
+            )
+            .await?;
+            let crate::cross_ledger::GovernanceArtifact::SchemaClosure(wire) = &resolved.artifact
+            else {
+                return Err(crate::error::ApiError::CrossLedger(
+                    crate::cross_ledger::CrossLedgerError::TranslationFailed {
+                        ledger_id: resolved.model_ledger_id.clone(),
+                        graph_iri: resolved.graph_iri.clone(),
+                        detail: "resolver returned a non-SchemaClosure artifact for a \
+                                SchemaClosure request; resolver dispatch bug"
+                            .into(),
+                    },
+                ));
+            };
+            return Ok(Some(
+                wire.translate_to_schema_bundle_flakes(db_ref.snapshot)?,
+            ));
+        }
+
         let Some(bundle) = crate::ontology_imports::resolve_schema_bundle(
             db_ref.snapshot,
             db_ref.overlay,
@@ -555,7 +724,7 @@ impl Fluree {
         )
         .await?
         else {
-            return Ok(());
+            return Ok(None);
         };
 
         let flakes = crate::ontology_imports::get_or_build_schema_bundle_flakes(
@@ -564,9 +733,7 @@ impl Fluree {
             &bundle,
         )
         .await?;
-
-        executable.reasoning.schema_bundle = Some(flakes);
-        Ok(())
+        Ok(Some(flakes))
     }
 
     /// Execute against a GraphDb with policy awareness.

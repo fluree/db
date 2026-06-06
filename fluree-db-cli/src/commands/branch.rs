@@ -4,6 +4,7 @@ use crate::error::{CliError, CliResult};
 use crate::remote_client::RevertPayload;
 use comfy_table::{ContentArrangement, Table};
 use fluree_db_api::server_defaults::FlureeDir;
+use fluree_db_api::DropStatus;
 use fluree_db_core::ledger_id::split_ledger_id;
 
 pub async fn run(action: BranchAction, dirs: &FlureeDir, direct: bool) -> CliResult<()> {
@@ -379,10 +380,23 @@ async fn run_drop(
             let (ledger_name, _) = split_ledger_id(&alias)?;
             let report = fluree.drop_branch(&ledger_name, name).await?;
 
-            if report.deferred {
-                println!("Branch '{name}' retracted (has children, storage preserved).");
-            } else {
-                println!("Dropped branch '{name}'.");
+            match report.status {
+                DropStatus::AlreadyRetracted => {
+                    println!("Branch '{name}' was already retracted (no-op).");
+                }
+                DropStatus::NotFound => {
+                    // `drop_branch` surfaces a missing branch as
+                    // `ApiError::NotFound`, so this arm shouldn't normally fire,
+                    // but be defensive in case that contract changes.
+                    println!("Branch '{name}' not found.");
+                }
+                DropStatus::Dropped => {
+                    if report.deferred {
+                        println!("Branch '{name}' retracted (has children, storage preserved).");
+                    } else {
+                        println!("Dropped branch '{name}'.");
+                    }
+                }
             }
             if report.artifacts_deleted > 0 {
                 println!("  Artifacts deleted: {}", report.artifacts_deleted);
@@ -947,21 +961,41 @@ fn print_revert_result(result: &serde_json::Value) -> CliResult<()> {
     Ok(())
 }
 
-fn print_branch_dropped(result: &serde_json::Value) -> CliResult<()> {
+/// Pick the headline message for a drop-branch response. The `status`
+/// field is authoritative: a second drop on an already-retracted branch
+/// reports `"already_retracted"` and must not be re-rendered as a
+/// successful drop.
+fn format_drop_branch_headline(result: &serde_json::Value) -> String {
     let ledger_id = result
         .get("ledger_id")
         .and_then(|v| v.as_str())
         .unwrap_or("(unknown)");
+    let status = result
+        .get("status")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("dropped");
     let deferred = result
         .get("deferred")
         .and_then(serde_json::Value::as_bool)
         .unwrap_or(false);
 
-    if deferred {
-        println!("Branch retracted (has children, storage preserved): {ledger_id}");
-    } else {
-        println!("Dropped branch: {ledger_id}");
+    match status {
+        "already_retracted" => format!("Branch was already retracted (no-op): {ledger_id}"),
+        "not_found" => format!("Branch not found: {ledger_id}"),
+        _ => {
+            // "dropped" (and any unknown status falls back to the success
+            // message rather than silently swallowing the response).
+            if deferred {
+                format!("Branch retracted (has children, storage preserved): {ledger_id}")
+            } else {
+                format!("Dropped branch: {ledger_id}")
+            }
+        }
     }
+}
+
+fn print_branch_dropped(result: &serde_json::Value) -> CliResult<()> {
+    println!("{}", format_drop_branch_headline(result));
 
     if let Some(artifacts) = result
         .get("files_deleted")
@@ -1349,5 +1383,91 @@ fn print_delta_json(label: &str, d: &serde_json::Value) {
                 println!("  t={t} +{asserts}/-{retracts} {time} {id} | {msg}");
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::format_drop_branch_headline;
+    use serde_json::json;
+
+    #[test]
+    fn drop_branch_headline_already_retracted() {
+        let resp = json!({
+            "ledger_id": "mydb:dev",
+            "status": "already_retracted",
+            "deferred": false,
+        });
+        assert_eq!(
+            format_drop_branch_headline(&resp),
+            "Branch was already retracted (no-op): mydb:dev",
+        );
+    }
+
+    #[test]
+    fn drop_branch_headline_already_retracted_with_stale_deferred_flag() {
+        // Even if a server happens to send `deferred: true` alongside
+        // `status: "already_retracted"`, the status field is
+        // authoritative — we must not render the deferred success
+        // message in that case.
+        let resp = json!({
+            "ledger_id": "mydb:dev",
+            "status": "already_retracted",
+            "deferred": true,
+        });
+        assert_eq!(
+            format_drop_branch_headline(&resp),
+            "Branch was already retracted (no-op): mydb:dev",
+        );
+    }
+
+    #[test]
+    fn drop_branch_headline_dropped_leaf() {
+        let resp = json!({
+            "ledger_id": "mydb:dev",
+            "status": "dropped",
+            "deferred": false,
+        });
+        assert_eq!(
+            format_drop_branch_headline(&resp),
+            "Dropped branch: mydb:dev",
+        );
+    }
+
+    #[test]
+    fn drop_branch_headline_dropped_deferred() {
+        let resp = json!({
+            "ledger_id": "mydb:dev",
+            "status": "dropped",
+            "deferred": true,
+        });
+        assert_eq!(
+            format_drop_branch_headline(&resp),
+            "Branch retracted (has children, storage preserved): mydb:dev",
+        );
+    }
+
+    #[test]
+    fn drop_branch_headline_not_found() {
+        let resp = json!({
+            "ledger_id": "mydb:does-not-exist",
+            "status": "not_found",
+            "deferred": false,
+        });
+        assert_eq!(
+            format_drop_branch_headline(&resp),
+            "Branch not found: mydb:does-not-exist",
+        );
+    }
+
+    #[test]
+    fn drop_branch_headline_missing_fields_falls_back_to_dropped() {
+        // No `status` and no `deferred` — should still render the
+        // legacy success message rather than swallowing the response.
+        let resp = json!({ "ledger_id": "mydb:dev" });
+        assert_eq!(
+            format_drop_branch_headline(&resp),
+            "Dropped branch: mydb:dev",
+        );
     }
 }

@@ -89,7 +89,7 @@ use crate::binary_scan::{BinaryScanOperator, EmitMask};
 use crate::binding::Batch;
 use crate::context::ExecutionContext;
 use crate::error::{QueryError, Result};
-use crate::ir::triple::TriplePattern;
+use crate::ir::triple::{Ref, TriplePattern};
 use crate::operator::inline::InlineOperator;
 use crate::operator::Operator;
 use crate::var_registry::VarId;
@@ -211,8 +211,29 @@ impl BinaryHistoryScanOperator {
                     &p_sid,
                 )
                 .map_err(|e| QueryError::Internal(format!("history scan: build_filter: {e}")))?;
+
+                // If a literal-bound pattern component (subject or predicate)
+                // failed to resolve to a store id, the persisted index cannot
+                // contain a match. Skipping is essential — `BinaryFilter`
+                // currently constrains only s_id/p_id, so leaving them `None`
+                // here would walk every leaflet and emit every base row whose
+                // `t` falls in range (i.e. all genesis facts for a `from:t:1,
+                // to:t:1` history query). Novelty still runs, since the
+                // subject/predicate may exist in unindexed data and the
+                // novelty walk's `flake_matches_range_eq` filter is keyed on
+                // `s_sid`/`p_sid` (snapshot space) and short-circuits to
+                // empty when the literal doesn't appear there either.
+                let s_literal_unresolvable =
+                    matches!(self.pattern.s, Ref::Iri(_) | Ref::Sid(_)) && filter.s_id.is_none();
+                let p_literal_unresolvable =
+                    matches!(self.pattern.p, Ref::Iri(_) | Ref::Sid(_)) && filter.p_id.is_none();
+                let skip_persisted = s_literal_unresolvable || p_literal_unresolvable;
+
                 let order = self.pick_order(&filter);
-                if let Some(branch) = store.branch_for_order(g_id, order) {
+                if let Some(branch) = store
+                    .branch_for_order(g_id, order)
+                    .filter(|_| !skip_persisted)
+                {
                     let leaf_indices = leaf_index_range(branch, &filter, order);
                     let view = BinaryGraphView::with_novelty(
                         Arc::clone(store),
@@ -253,7 +274,7 @@ impl BinaryHistoryScanOperator {
                             };
                             let base_rows = leaflet.row_count as u64;
                             ctx.tracker.consume_fuel(
-                                1000u64
+                                fluree_db_core::tracking::schedule::HISTORY_LEAF_TOUCH_MICRO_FUEL
                                     .saturating_add(sidecar_rows)
                                     .saturating_add(base_rows),
                             )?;
@@ -386,7 +407,10 @@ impl BinaryHistoryScanOperator {
                             return;
                         }
                     }
-                    if let Err(e) = ctx.tracker.consume_fuel(1) {
+                    if let Err(e) = ctx
+                        .tracker
+                        .consume_fuel(fluree_db_core::tracking::schedule::PER_ROW_MICRO_FUEL)
+                    {
                         fuel_err = Some(e);
                         return;
                     }

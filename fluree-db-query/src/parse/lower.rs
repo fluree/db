@@ -17,7 +17,7 @@ use crate::binding::Binding;
 use crate::context::WellKnownDatatypes;
 use crate::ir::triple::{Ref, Term, TriplePattern};
 use crate::ir::ReasoningConfig;
-use crate::ir::{AggregateFn, AggregateSpec};
+use crate::ir::{AggregateFn, AggregateSpec, InputSemantics};
 use crate::ir::{
     Column, ConstructTemplate, ForwardItem, Grouping, HydrationSpec, NestedSelectSpec, Projection,
     Query, QueryOutput, Restriction, Root,
@@ -175,6 +175,8 @@ pub(crate) fn lower_query<E: IriEncoder>(
         patterns,
         grouping,
         ordering,
+        // JSON-LD query syntax has no expression-based ORDER BY form.
+        order_binds: Vec::new(),
         limit,
         offset,
         reasoning,
@@ -1091,9 +1093,10 @@ enum SelectExprPlacement {
 ///     in via `post_bind_aliases` so the caller can chain dependencies).
 ///   - `Pre` otherwise.
 ///
-/// Both `lower_query` and `lower_subquery` call this. `lower_query` routes
-/// the result by placement; `lower_subquery` errors on `Post` because
-/// [`SubqueryPattern`] has no `post_binds` field.
+/// Both `lower_query` and `lower_subquery` call this and route the result by
+/// placement: `Pre` binds append to WHERE, `Post` binds ride inside the
+/// grouping's aggregation stage (applied by the shared `apply_solution_modifiers`
+/// tail).
 fn lower_select_expr_bind<E: IriEncoder>(
     expr: &UnresolvedExpression,
     alias: &Arc<str>,
@@ -1168,17 +1171,20 @@ fn lower_subquery<E: IriEncoder>(
     // Lower WHERE patterns, then append select-expression BINDs.
     let mut patterns = lower_unresolved_patterns(&subquery.patterns, encoder, vars, pp_counter)?;
 
-    // Subqueries do not currently expose post-aggregation binds, so we use
-    // the shared `lower_select_expr_bind` helper but reject any column it
-    // classifies as `Post`. This mirrors the limitation of `SubqueryPattern`
-    // (no `post_binds` field).
+    // SELECT-expression binds split into pre-aggregation (appended to WHERE)
+    // and post-aggregation (referencing an aggregate output or an earlier
+    // post-bind). Post-binds ride inside the grouping's aggregation stage and
+    // are applied by the shared `apply_solution_modifiers` tail — the same
+    // channel the top-level SELECT uses, so subquery post-aggregation binds
+    // now work identically.
     let aggregate_output_vars: std::collections::HashSet<VarId> = subquery
         .options
         .aggregates
         .iter()
         .map(|spec| vars.get_or_insert(&spec.output_var))
         .collect();
-    let empty_post_binds: std::collections::HashSet<VarId> = std::collections::HashSet::new();
+    let mut post_binds: Vec<(VarId, Expression)> = Vec::new();
+    let mut post_bind_aliases: std::collections::HashSet<VarId> = std::collections::HashSet::new();
     for column in columns {
         if let UnresolvedColumn::Computation { expr, alias } = column {
             let (placement, alias_var, lowered_expr) = lower_select_expr_bind(
@@ -1188,14 +1194,12 @@ fn lower_subquery<E: IriEncoder>(
                 vars,
                 pp_counter,
                 &aggregate_output_vars,
-                &empty_post_binds,
+                &post_bind_aliases,
             )?;
             match placement {
                 SelectExprPlacement::Post => {
-                    return Err(ParseError::InvalidSelect(format!(
-                        "select expression '{alias}' references an aggregate output; \
-                         post-aggregation BINDs are not supported inside subqueries"
-                    )));
+                    post_binds.push((alias_var, lowered_expr));
+                    post_bind_aliases.insert(alias_var);
                 }
                 SelectExprPlacement::Pre => {
                     patterns.push(Pattern::Bind {
@@ -1229,10 +1233,10 @@ fn lower_subquery<E: IriEncoder>(
         sq = sq.with_ordering(sort_specs);
     }
 
-    // GROUP BY / aggregates / HAVING (needed for subqueries used in filters/unions).
-    // Subqueries have no post-aggregation bind channel; the loop above
-    // already rejects any SELECT computation classified as `Post`.
-    sq.grouping = lower_grouping(&subquery.options, vars, Vec::new())?;
+    // GROUP BY / aggregates / HAVING / post-aggregation binds (needed for
+    // subqueries used in filters/unions). Post-binds collected above ride inside
+    // the grouping's aggregation stage.
+    sq.grouping = lower_grouping(&subquery.options, vars, post_binds)?;
 
     Ok(sq)
 }
@@ -1458,7 +1462,8 @@ fn lower_filter_expr_inner<E: IriEncoder>(
             let func_name = lower_function_name(func);
             if let Function::Custom(unknown) = &func_name {
                 return Err(ParseError::InvalidFilter(format!(
-                    "Unknown function: {unknown}"
+                    "Unknown function: {unknown}{}",
+                    unknown_function_hint(unknown),
                 )));
             }
             Ok(Expression::Call {
@@ -1586,6 +1591,30 @@ fn lower_function_name(name: &str) -> Function {
     }
 }
 
+/// Format an actionable hint to append to an "Unknown function" parse error.
+///
+/// Two cases worth catching:
+///
+/// 1. Tokens that *imply* an unbound-variable test (`!bound`, `nil?`,
+///    `not-bound`, …) — point at the supported `bound` function or the
+///    `["not-exists", …]` pattern operator.
+///
+/// 2. Tokens starting with `!` (including a bare `!`) — point at the
+///    s-expression spelling of logical negation, `not`. Bare `!` is *not*
+///    treated as an unbound-test hint because the most common user attempt
+///    is plain negation like `(! (= ?age 18))`, not `(! (bound ?p))`.
+fn unknown_function_hint(name: &str) -> &'static str {
+    let lower = name.to_lowercase();
+    match lower.as_str() {
+        "!bound" | "nil?" | "not-bound" | "notbound" | "unbound" | "missing?" => {
+            " — to test for an unbound variable use `(not (bound ?v))` or the \
+             `[\"not-exists\", {...}]` pattern operator"
+        }
+        _ if lower.starts_with('!') => " — logical negation is spelled `not`, e.g. `(not (...))`",
+        _ => "",
+    }
+}
+
 /// Lower an unresolved term to a resolved Term
 fn lower_term<E: IriEncoder>(
     term: &UnresolvedTerm,
@@ -1662,44 +1691,49 @@ fn lower_sort_spec(spec: &UnresolvedSortSpec, vars: &mut VarRegistry) -> SortSpe
     SortSpec { var, direction }
 }
 
-/// Lower an unresolved aggregate function to a resolved AggregateFn
-fn lower_aggregate_fn(f: &UnresolvedAggregateFn) -> AggregateFn {
-    match f {
-        UnresolvedAggregateFn::Count => AggregateFn::Count,
-        UnresolvedAggregateFn::CountDistinct => AggregateFn::CountDistinct,
-        UnresolvedAggregateFn::Sum => AggregateFn::Sum,
-        UnresolvedAggregateFn::Avg => AggregateFn::Avg,
-        UnresolvedAggregateFn::Min => AggregateFn::Min,
-        UnresolvedAggregateFn::Max => AggregateFn::Max,
-        UnresolvedAggregateFn::Median => AggregateFn::Median,
-        UnresolvedAggregateFn::Variance => AggregateFn::Variance,
-        UnresolvedAggregateFn::Stddev => AggregateFn::Stddev,
+/// Lower an unresolved aggregate spec to a resolved [`AggregateSpec`].
+///
+/// `spec.input_var == "*"` is the COUNT(*) form and maps to
+/// [`AggregateFn::CountAll`]. Every other form binds the input variable
+/// inside the matching `AggregateFn` variant. JSON-LD has no surface
+/// `DISTINCT` modifier today, so every variant that carries
+/// [`InputSemantics`] is built with [`InputSemantics::List`];
+/// `UnresolvedAggregateFn::CountDistinct` targets the dedicated
+/// [`AggregateFn::CountDistinct`] variant instead.
+fn lower_aggregate_spec(spec: &UnresolvedAggregateSpec, vars: &mut VarRegistry) -> AggregateSpec {
+    let output_var = vars.get_or_insert(&spec.output_var);
+
+    // COUNT(*) — input="*" means count rows regardless of values.
+    if spec.input_var.as_ref() == "*" {
+        return AggregateSpec {
+            function: AggregateFn::CountAll,
+            output_var,
+        };
+    }
+
+    let input = vars.get_or_insert(&spec.input_var);
+    let list = InputSemantics::List;
+    let function = match &spec.function {
+        UnresolvedAggregateFn::Count => AggregateFn::Count(input),
+        UnresolvedAggregateFn::CountDistinct => AggregateFn::CountDistinct(input),
+        UnresolvedAggregateFn::Sum => AggregateFn::Sum(input, list),
+        UnresolvedAggregateFn::Avg => AggregateFn::Avg(input, list),
+        UnresolvedAggregateFn::Min => AggregateFn::Min(input),
+        UnresolvedAggregateFn::Max => AggregateFn::Max(input),
+        UnresolvedAggregateFn::Median => AggregateFn::Median(input, list),
+        UnresolvedAggregateFn::Variance => AggregateFn::Variance(input, list),
+        UnresolvedAggregateFn::Stddev => AggregateFn::Stddev(input, list),
         UnresolvedAggregateFn::GroupConcat { separator } => AggregateFn::GroupConcat {
+            input,
+            semantics: list,
             separator: separator.clone(),
         },
-        UnresolvedAggregateFn::Sample => AggregateFn::Sample,
-    }
-}
+        UnresolvedAggregateFn::Sample => AggregateFn::Sample(input),
+    };
 
-/// Lower an unresolved aggregate spec to a resolved AggregateSpec
-fn lower_aggregate_spec(spec: &UnresolvedAggregateSpec, vars: &mut VarRegistry) -> AggregateSpec {
-    // Handle COUNT(*) - input="*" means count all rows
-    if spec.input_var.as_ref() == "*" {
-        // COUNT(*) uses CountAll function and has no input variable
-        AggregateSpec {
-            function: AggregateFn::CountAll,
-            input_var: None,
-            output_var: vars.get_or_insert(&spec.output_var),
-            distinct: false,
-        }
-    } else {
-        // Regular aggregate with input variable
-        AggregateSpec {
-            function: lower_aggregate_fn(&spec.function),
-            input_var: Some(vars.get_or_insert(&spec.input_var)),
-            output_var: vars.get_or_insert(&spec.output_var),
-            distinct: false,
-        }
+    AggregateSpec {
+        function,
+        output_var,
     }
 }
 
@@ -1708,6 +1742,7 @@ fn lower_options(opts: &UnresolvedOptions) -> ReasoningConfig {
     ReasoningConfig {
         modes: opts.reasoning.clone().unwrap_or_default(),
         schema_bundle: None,
+        rules_source_g_id: None,
     }
 }
 
@@ -1726,9 +1761,8 @@ fn lower_ordering(opts: &UnresolvedOptions, vars: &mut VarRegistry) -> Vec<SortS
 /// post-aggregation binds).
 ///
 /// `post_binds` are derived bindings that fire after every aggregate has
-/// been computed; they ride inside the resulting `Aggregation`. Subquery
-/// callers pass `Vec::new()` because [`SubqueryPattern`] has no post-bind
-/// channel.
+/// been computed; they ride inside the resulting `Aggregation`. Both top-level
+/// and subquery callers populate them from post-aggregation SELECT expressions.
 fn lower_grouping(
     opts: &UnresolvedOptions,
     vars: &mut VarRegistry,
@@ -3107,5 +3141,56 @@ mod tests {
         } else {
             panic!("Expected Union, got {:?}", results[0]);
         }
+    }
+
+    #[test]
+    fn unknown_function_hints_point_at_bound() {
+        for name in [
+            "!bound",
+            "nil?",
+            "not-bound",
+            "notbound",
+            "unbound",
+            "missing?",
+        ] {
+            let hint = unknown_function_hint(name);
+            assert!(
+                hint.contains("bound") && hint.contains("not-exists"),
+                "expected hint for {name:?} to mention `bound` and `not-exists`, got: {hint:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn unknown_function_hint_for_bang_prefix_points_at_not() {
+        // Bare `!` and arbitrary `!something` both fall through to the
+        // generic logical-negation hint — `!` is the natural typo for
+        // SPARQL `!`-style negation like `(! (= ?age 18))`, NOT a typo for
+        // `(! (bound ?p))`, so we don't push users toward an unbound-test
+        // they didn't ask for.
+        for name in ["!", "!foo", "!(= ?x 1)"] {
+            let hint = unknown_function_hint(name);
+            assert!(
+                hint.contains("not") && !hint.contains("bound"),
+                "expected {name:?} hint to mention `not` (no `bound`), got: {hint:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn unknown_function_hint_for_explicit_bound_attempts() {
+        // Tokens that *imply* an unbound test should get the bound/not-exists
+        // hint, not the generic negation hint.
+        let hint = unknown_function_hint("!bound");
+        assert!(
+            hint.contains("bound") && hint.contains("not-exists"),
+            "expected !bound hint to mention bound + not-exists, got: {hint:?}"
+        );
+    }
+
+    #[test]
+    fn unknown_function_hint_empty_for_unrelated_names() {
+        assert_eq!(unknown_function_hint("frobnicate"), "");
+        assert_eq!(unknown_function_hint("strlen2"), "");
     }
 }

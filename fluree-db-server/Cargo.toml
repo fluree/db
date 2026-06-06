@@ -153,6 +153,7 @@ http-body-util = { workspace = true }
 tower = { workspace = true, features = ["util"] }
 tempfile = "3"
 wiremock = { workspace = true }
+indexmap = { workspace = true }
 fluree-db-binary-index = { path = "../fluree-db-binary-index" }
 fluree-db-novelty = { path = "../fluree-db-novelty" }
 

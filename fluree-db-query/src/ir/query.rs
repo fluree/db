@@ -248,6 +248,14 @@ pub struct Query {
     /// ORDER BY specs applied after grouping. Empty when the query is
     /// unordered.
     pub ordering: Vec<SortSpec>,
+    /// Synthetic `(var, expr)` binds for expression-based ORDER BY
+    /// (e.g. `ORDER BY DESC(?a / ?b)`). Evaluated once per solution as a
+    /// dedicated stage AFTER grouping/aggregation/HAVING/post-binds and BEFORE
+    /// the sort, so the keys can reference GROUP BY keys, aggregate outputs, and
+    /// SELECT post-binds. The matching `SortSpec` in `ordering` references the
+    /// synthetic var; these vars are never projected to the output. Empty for
+    /// var-only ORDER BY.
+    pub order_binds: Vec<(VarId, super::Expression)>,
     /// Maximum rows to return (applied last). `None` is unbounded;
     /// `Some(0)` is a legitimate "return nothing" some fast-paths bail on.
     pub limit: Option<usize>,
@@ -285,6 +293,7 @@ impl Query {
             patterns: Vec::new(),
             grouping: None,
             ordering: Vec::new(),
+            order_binds: Vec::new(),
             limit: None,
             offset: None,
             reasoning: ReasoningConfig::default(),
@@ -305,6 +314,7 @@ impl Query {
             patterns,
             grouping: self.grouping.clone(),
             ordering: self.ordering.clone(),
+            order_binds: self.order_binds.clone(),
             limit: self.limit,
             offset: self.offset,
             reasoning: self.reasoning.clone(),

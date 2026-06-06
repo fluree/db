@@ -49,7 +49,7 @@ pub use adapters::{
 };
 pub use expression::{ArithmeticOp, CompareOp, Expression, Function};
 pub use fluree_db_core::value::FlakeValue;
-pub use grouping::{AggregateFn, AggregateSpec, Aggregation, Grouping};
+pub use grouping::{AggregateFn, AggregateSpec, Aggregation, Grouping, InputSemantics};
 pub use path::{PathModifier, PropertyPathPattern};
 pub use pattern::{GraphName, Pattern, ServiceEndpoint, ServicePattern, SubqueryPattern};
 pub use projection::{Column, ForwardItem, HydrationSpec, NestedSelectSpec, Projection, Root};

@@ -8,7 +8,7 @@ use crate::ast::expr::{AggregateFunction, Expression};
 use crate::ast::query::{SelectClause, SelectVariable, SelectVariables};
 
 use fluree_db_query::ir::Pattern;
-use fluree_db_query::ir::{AggregateFn, AggregateSpec};
+use fluree_db_query::ir::{AggregateFn, AggregateSpec, InputSemantics};
 use fluree_db_query::parse::encode::IriEncoder;
 use fluree_db_query::var_registry::VarId;
 
@@ -219,34 +219,96 @@ impl<E: IriEncoder> LoweringContext<'_, E> {
         };
 
         let input_var = self.lower_aggregate_input_var(expr, pre_binds)?;
-        let agg_fn = match expr {
-            Some(_) => self.map_aggregate_function(
-                function,
-                *distinct,
-                separator.as_ref().map(std::convert::AsRef::as_ref),
-            ),
-            None => AggregateFn::CountAll,
+        let semantics = if *distinct {
+            InputSemantics::Set
+        } else {
+            InputSemantics::List
+        };
+        let function = match (function, input_var) {
+            // COUNT(*) — DISTINCT * is not meaningful for COUNT.
+            (AggregateFunction::Count, None) => {
+                if *distinct {
+                    return Err(LowerError::not_implemented("COUNT(DISTINCT *)", *span));
+                }
+                AggregateFn::CountAll
+            }
+            // Every non-COUNT aggregate needs an input variable. The caller
+            // is responsible for ensuring `expr` is `Some(_)`; reaching this
+            // arm with `None` means a malformed AST.
+            (_, None) => {
+                return Err(LowerError::not_implemented(
+                    "aggregate without input expression (only COUNT(*) supports that)",
+                    *span,
+                ));
+            }
+            (AggregateFunction::Count, Some(v)) => {
+                if *distinct {
+                    AggregateFn::CountDistinct(v)
+                } else {
+                    AggregateFn::Count(v)
+                }
+            }
+            (AggregateFunction::Sum, Some(v)) => AggregateFn::Sum(v, semantics),
+            (AggregateFunction::Avg, Some(v)) => AggregateFn::Avg(v, semantics),
+            // DISTINCT is a semantic no-op for Min/Max/Sample; drop it at
+            // the IR boundary so the variant invariant holds.
+            (AggregateFunction::Min, Some(v)) => AggregateFn::Min(v),
+            (AggregateFunction::Max, Some(v)) => AggregateFn::Max(v),
+            (AggregateFunction::Sample, Some(v)) => AggregateFn::Sample(v),
+            (AggregateFunction::GroupConcat, Some(v)) => AggregateFn::GroupConcat {
+                input: v,
+                semantics,
+                separator: separator.as_deref().unwrap_or(" ").to_string(),
+            },
         };
 
-        if matches!(agg_fn, AggregateFn::CountAll) && *distinct {
-            return Err(LowerError::not_implemented("COUNT(DISTINCT *)", *span));
-        }
-
-        // COUNT(DISTINCT) is represented as a dedicated AggregateFn::CountDistinct
-        // variant (with its own streaming HashSet state), so clear the distinct flag
-        // to avoid a redundant double-dedup in AggregateOperator. All other functions
-        // (SUM, AVG, MIN, MAX, etc.) use the flag for dedup at execution time.
-        let distinct = *distinct && !matches!(agg_fn, AggregateFn::CountDistinct);
-
         Ok(AggregateSpec {
-            function: agg_fn,
-            input_var,
+            function,
             output_var,
-            distinct,
         })
     }
 
-    pub(super) fn collect_having_aggregates(
+    /// Returns `true` if `expr` contains an inline aggregate call anywhere
+    /// (e.g. `COUNT(?x)` inside `DESC(COUNT(?x) / 2)`). Used to decide whether an
+    /// ORDER BY expression must be deferred until aggregate hoisting has run.
+    pub(super) fn expr_contains_aggregate(&self, expr: &Expression) -> bool {
+        match expr.unwrap_bracketed() {
+            Expression::Aggregate { .. } => true,
+            Expression::Unary { operand, .. } => self.expr_contains_aggregate(operand),
+            Expression::Binary { left, right, .. } => {
+                self.expr_contains_aggregate(left) || self.expr_contains_aggregate(right)
+            }
+            Expression::FunctionCall { args, .. } | Expression::Coalesce { args, .. } => {
+                args.iter().any(|a| self.expr_contains_aggregate(a))
+            }
+            Expression::If {
+                condition,
+                then_expr,
+                else_expr,
+                ..
+            } => {
+                self.expr_contains_aggregate(condition)
+                    || self.expr_contains_aggregate(then_expr)
+                    || self.expr_contains_aggregate(else_expr)
+            }
+            Expression::In { expr, list, .. } => {
+                self.expr_contains_aggregate(expr)
+                    || list.iter().any(|a| self.expr_contains_aggregate(a))
+            }
+            Expression::Var(_)
+            | Expression::Literal(_)
+            | Expression::Iri(_)
+            | Expression::Exists { .. }
+            | Expression::NotExists { .. }
+            | Expression::Bracketed { .. } => false,
+        }
+    }
+
+    /// Collect (hoist) every inline aggregate found anywhere in `expr` into
+    /// `aggregates` + the `aliases` map (deduped by aggregate key), rewriting is
+    /// left to [`Self::lower_expression`] once `self.aggregate_aliases` is set.
+    /// Shared by HAVING and expression-based ORDER BY lowering.
+    pub(super) fn collect_inline_aggregates(
         &mut self,
         expr: &Expression,
         aliases: &mut HashMap<String, VarId>,
@@ -259,7 +321,7 @@ impl<E: IriEncoder> LoweringContext<'_, E> {
                 if !aliases.contains_key(&key) {
                     let output_var = self
                         .vars
-                        .get_or_insert(&format!("?__having_agg_{}", aliases.len()));
+                        .get_or_insert(&format!("?__inline_agg_{}", aliases.len()));
                     let spec = self.aggregate_spec_from_expr(agg, output_var, pre_binds)?;
                     aliases.insert(key, output_var);
                     aggregates.push(spec);
@@ -267,16 +329,16 @@ impl<E: IriEncoder> LoweringContext<'_, E> {
                 Ok(())
             }
             Expression::Binary { left, right, .. } => {
-                self.collect_having_aggregates(left, aliases, aggregates, pre_binds)?;
-                self.collect_having_aggregates(right, aliases, aggregates, pre_binds)?;
+                self.collect_inline_aggregates(left, aliases, aggregates, pre_binds)?;
+                self.collect_inline_aggregates(right, aliases, aggregates, pre_binds)?;
                 Ok(())
             }
             Expression::Unary { operand, .. } => {
-                self.collect_having_aggregates(operand, aliases, aggregates, pre_binds)
+                self.collect_inline_aggregates(operand, aliases, aggregates, pre_binds)
             }
             Expression::FunctionCall { args, .. } => {
                 for arg in args {
-                    self.collect_having_aggregates(arg, aliases, aggregates, pre_binds)?;
+                    self.collect_inline_aggregates(arg, aliases, aggregates, pre_binds)?;
                 }
                 Ok(())
             }
@@ -286,20 +348,20 @@ impl<E: IriEncoder> LoweringContext<'_, E> {
                 else_expr,
                 ..
             } => {
-                self.collect_having_aggregates(condition, aliases, aggregates, pre_binds)?;
-                self.collect_having_aggregates(then_expr, aliases, aggregates, pre_binds)?;
-                self.collect_having_aggregates(else_expr, aliases, aggregates, pre_binds)
+                self.collect_inline_aggregates(condition, aliases, aggregates, pre_binds)?;
+                self.collect_inline_aggregates(then_expr, aliases, aggregates, pre_binds)?;
+                self.collect_inline_aggregates(else_expr, aliases, aggregates, pre_binds)
             }
             Expression::Coalesce { args, .. } => {
                 for arg in args {
-                    self.collect_having_aggregates(arg, aliases, aggregates, pre_binds)?;
+                    self.collect_inline_aggregates(arg, aliases, aggregates, pre_binds)?;
                 }
                 Ok(())
             }
             Expression::In { expr, list, .. } => {
-                self.collect_having_aggregates(expr, aliases, aggregates, pre_binds)?;
+                self.collect_inline_aggregates(expr, aliases, aggregates, pre_binds)?;
                 for arg in list {
-                    self.collect_having_aggregates(arg, aliases, aggregates, pre_binds)?;
+                    self.collect_inline_aggregates(arg, aliases, aggregates, pre_binds)?;
                 }
                 Ok(())
             }
@@ -371,32 +433,6 @@ impl<E: IriEncoder> LoweringContext<'_, E> {
         }
 
         Ok((aggregates, pre_binds))
-    }
-
-    /// Map SPARQL AggregateFunction to engine AggregateFn.
-    fn map_aggregate_function(
-        &self,
-        function: &AggregateFunction,
-        distinct: bool,
-        separator: Option<&str>,
-    ) -> AggregateFn {
-        match function {
-            AggregateFunction::Count => {
-                if distinct {
-                    AggregateFn::CountDistinct
-                } else {
-                    AggregateFn::Count
-                }
-            }
-            AggregateFunction::Sum => AggregateFn::Sum,
-            AggregateFunction::Avg => AggregateFn::Avg,
-            AggregateFunction::Min => AggregateFn::Min,
-            AggregateFunction::Max => AggregateFn::Max,
-            AggregateFunction::GroupConcat => AggregateFn::GroupConcat {
-                separator: separator.unwrap_or(" ").to_string(),
-            },
-            AggregateFunction::Sample => AggregateFn::Sample,
-        }
     }
 
     /// Collect non-aggregate SELECT variables for implicit GROUP BY.

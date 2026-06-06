@@ -37,8 +37,8 @@ fluree query 'SELECT ?name WHERE { ?s <http://example.org/name> ?name }'
 | `-q, --quiet` | Suppress non-essential output |
 | `--no-color` | Disable colored output (also respects `NO_COLOR` env var) |
 | `--config <PATH>` | Path to config file |
-| `--memory-budget-mb <MB>` | Memory budget in MB for bulk import (0 = auto: 75% of system RAM). Affects chunk size, concurrency, and run budget when creating a ledger with `--from`. |
-| `--parallelism <N>` | Number of parallel parse threads for bulk import (0 = auto: system cores, default cap 6). Used when creating a ledger with `--from`. |
+| `--memory-budget-mb <MB>` | Memory budget in MB for bulk import (0 = auto: 60% of system RAM). Affects chunk size, concurrency, and run budget when creating a ledger with `--from`. Set this to cap memory use; auto-detected thread count shrinks to fit it. |
+| `--parallelism <N>` | Number of parallel parse threads for bulk import (0 = auto: most logical cores, capped to fit the memory budget; explicit values honored as-is, floored at 1). Used when creating a ledger with `--from`. |
 | `-h, --help` | Print help |
 | `-V, --version` | Print version |
 
@@ -54,6 +54,7 @@ fluree query 'SELECT ?name WHERE { ?s <http://example.org/name> ?name }'
 | [`list`](list.md) | List all ledgers |
 | [`info`](info.md) | Show detailed information about a ledger |
 | [`drop`](drop.md) | Drop (delete) a ledger |
+| [`graph`](graph.md) | Manage named graphs within a ledger (list, drop) |
 | [`insert`](insert.md) | Insert data into a ledger |
 | [`upsert`](upsert.md) | Upsert data (insert or update existing) |
 | [`update`](update.md) | Update with WHERE/DELETE/INSERT patterns |

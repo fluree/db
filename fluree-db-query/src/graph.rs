@@ -144,7 +144,33 @@ impl GraphOperator {
         bind_graph_var: Option<VarId>,
     ) -> Result<()> {
         // Switch to the named graph context
-        let graph_ctx = ctx.with_active_graph(graph_iri.clone());
+        let mut graph_ctx = ctx.with_active_graph(graph_iri.clone());
+
+        // Cross-ledger provenance for GRAPH patterns.
+        //
+        // Inside a `GRAPH <iri> { .. }` scope only one graph is active, so the
+        // inner `DatasetOperator`'s multi-ledger check (which compares the
+        // *active* graphs) is always false and it never stamps. The inner scan
+        // therefore emits plain `Binding::Sid` values encoded against this
+        // graph's namespace table. If the surrounding dataset spans multiple
+        // ledgers, those SIDs would later be decoded against the formatter's
+        // primary view (a different ledger), silently mis-decoding the IRI.
+        //
+        // When the dataset is multi-ledger, stamp inner results with this
+        // graph's home ledger so they carry `Binding::IriMatch` provenance —
+        // matching what `DatasetOperator` produces for the union (non-GRAPH)
+        // path. Forcing eager materialization makes the inner scan resolve
+        // `Binding::Sid` rather than late-materialized `Binding::EncodedSid`,
+        // which `stamp_provenance` cannot decode without the binary store.
+        let stamp_ledger_id: Option<Arc<str>> = match &ctx.dataset {
+            Some(ds) if ds.spans_multiple_ledgers() => ds
+                .named_graph(graph_iri.as_ref())
+                .map(|g| Arc::clone(&g.ledger_id)),
+            _ => None,
+        };
+        if stamp_ledger_id.is_some() {
+            graph_ctx.eager_materialization = true;
+        }
 
         // Check if this graph is backed by an R2RML mapping.
         // Prefer the precomputed set (populated in runner.rs for dataset queries),
@@ -197,6 +223,15 @@ impl GraphOperator {
         inner.open(&graph_ctx).await?;
 
         while let Some(batch) = inner.next_batch(&graph_ctx).await? {
+            // Stamp cross-ledger provenance before merging so the formatter
+            // decodes SIDs against this graph's home ledger (see above).
+            let batch = match &stamp_ledger_id {
+                Some(ledger_id) => {
+                    crate::dataset_operator::stamp_provenance(batch, ledger_id, &graph_ctx)?
+                }
+                None => batch,
+            };
+
             // Merge each inner result with parent row
             for inner_row_idx in 0..batch.len() {
                 let mut merged_row = Vec::with_capacity(self.schema.len());
@@ -272,6 +307,9 @@ impl GraphOperator {
 
 #[async_trait]
 impl Operator for GraphOperator {
+    fn plan_children(&self) -> Vec<crate::plan_node::PlanChild<'_>> {
+        vec![crate::plan_node::PlanChild::child(self.child.as_ref())]
+    }
     fn schema(&self) -> &[VarId] {
         &self.schema
     }

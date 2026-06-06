@@ -25,36 +25,12 @@
 //   cargo bench -p fluree-db-api --bench vector_query -- --test
 
 use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
+use fluree_bench_support::gen::vectors::rng_one as random_vector;
+use fluree_bench_support::{bench_runtime, current_profile, init_tracing_for_bench};
+use fluree_db_api::admin::ReindexOptions;
 use fluree_db_api::{CommitOpts, FlureeBuilder, IndexConfig, TxnOpts};
 use rand::prelude::*;
 use serde_json::{json, Value as JsonValue};
-use tokio::runtime::Runtime;
-
-use fluree_db_api::admin::ReindexOptions;
-
-fn init_tracing_for_bench() {
-    use std::sync::OnceLock;
-    static INIT: OnceLock<()> = OnceLock::new();
-    INIT.get_or_init(|| {
-        // Opt-in only: enable by setting FLUREE_BENCH_TRACING=1.
-        if std::env::var("FLUREE_BENCH_TRACING").ok().as_deref() != Some("1") {
-            return;
-        }
-
-        // Default to info if RUST_LOG not provided.
-        if std::env::var("RUST_LOG").is_err() {
-            std::env::set_var("RUST_LOG", "info");
-        }
-
-        let filter = tracing_subscriber::EnvFilter::from_default_env();
-        tracing_subscriber::fmt()
-            .with_env_filter(filter)
-            .with_target(true)
-            .with_level(true)
-            .try_init()
-            .ok();
-    });
-}
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -67,7 +43,18 @@ const VECTOR_DIM: usize = 768;
 const BATCH_SIZE: usize = 100;
 
 /// Dataset sizes to benchmark (keep small for sub-1s query target).
-const DATASET_SIZES: &[usize] = &[1_000, 5_000];
+const DATASET_SIZES_FULL: &[usize] = &[1_000, 5_000];
+
+/// Scale-driven slice of `DATASET_SIZES_FULL`. Tiny only runs the
+/// smallest size so the CI bench-gate stays under its wall-clock
+/// budget; nightly runs the whole curve.
+fn dataset_sizes() -> &'static [usize] {
+    use fluree_bench_support::BenchScale;
+    match fluree_bench_support::current_scale() {
+        BenchScale::Tiny => &DATASET_SIZES_FULL[..1],
+        _ => DATASET_SIZES_FULL,
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Type aliases (matches test support pattern)
@@ -79,13 +66,10 @@ type BenchLedger = fluree_db_api::LedgerState;
 // ---------------------------------------------------------------------------
 // Data generation
 // ---------------------------------------------------------------------------
-
-/// Generate a random f32-quantized vector (mirrors the @vector ingest path).
-fn random_vector(rng: &mut impl Rng, dim: usize) -> Vec<f64> {
-    (0..dim)
-        .map(|_| rng.gen_range(-1.0f32..1.0f32) as f64)
-        .collect()
-}
+//
+// `random_vector` is `fluree_bench_support::gen::vectors::rng_one` (re-imported
+// at module top). Same `(rng, dim) -> Vec<f64>` signature, byte-identical
+// output for the same RNG seed chain.
 
 /// Create Fluree instance, insert `n_articles` articles with vectors + dates,
 /// and return everything needed to run the two benchmark queries.
@@ -165,9 +149,12 @@ async fn setup_dataset(
     let query_all = json!({
         "@context": ctx,
         "select": ["?article", "?score"],
+        // Query VALUES clauses require the full IRI for embedding vector
+        // typed literals; the `@vector` alias is INSERT-only. See
+        // it_vector_flatrank.rs for the canonical pattern.
         "values": [
             ["?queryVec"],
-            [{"@value": query_vec.clone(), "@type": "@vector"}]
+            [{"@value": query_vec.clone(), "@type": "https://ns.flur.ee/db#embeddingVector"}]
         ],
         "where": [
             {"@id": "?article", "ex:articleSummaryVec": "?vec"},
@@ -185,7 +172,7 @@ async fn setup_dataset(
         "select": ["?article", "?score"],
         "values": [
             ["?queryVec"],
-            [{"@value": query_vec, "@type": "@vector"}]
+            [{"@value": query_vec, "@type": "https://ns.flur.ee/db#embeddingVector"}]
         ],
         "where": [
             {"@id": "?article", "ex:publishedDate": "?date", "ex:articleSummaryVec": "?vec"},
@@ -236,11 +223,11 @@ async fn setup_dataset_indexed(
 
 fn bench_vector_scan_all(c: &mut Criterion) {
     init_tracing_for_bench();
-    let rt = Runtime::new().unwrap();
+    let rt = bench_runtime();
     let mut group = c.benchmark_group("vector_scan_all");
-    group.sample_size(10);
+    group.sample_size(current_profile().sample_size());
 
-    for &n in DATASET_SIZES {
+    for &n in dataset_sizes() {
         eprintln!("  [setup] Inserting {n} articles with {VECTOR_DIM}-dim vectors...");
         let (fluree, ledger, query, _, _) = rt.block_on(setup_dataset(n));
         let db = fluree_db_api::GraphDb::from_ledger_state(&ledger);
@@ -260,11 +247,11 @@ fn bench_vector_scan_all(c: &mut Criterion) {
 
 fn bench_vector_scan_all_indexed(c: &mut Criterion) {
     init_tracing_for_bench();
-    let rt = Runtime::new().unwrap();
+    let rt = bench_runtime();
     let mut group = c.benchmark_group("vector_scan_all_indexed");
-    group.sample_size(10);
+    group.sample_size(current_profile().sample_size());
 
-    for &n in DATASET_SIZES {
+    for &n in dataset_sizes() {
         eprintln!(
             "  [setup] Inserting {n} articles with {VECTOR_DIM}-dim vectors + building index..."
         );
@@ -287,11 +274,11 @@ fn bench_vector_scan_all_indexed(c: &mut Criterion) {
 
 fn bench_vector_scan_filtered(c: &mut Criterion) {
     init_tracing_for_bench();
-    let rt = Runtime::new().unwrap();
+    let rt = bench_runtime();
     let mut group = c.benchmark_group("vector_scan_filtered");
-    group.sample_size(10);
+    group.sample_size(current_profile().sample_size());
 
-    for &n in DATASET_SIZES {
+    for &n in dataset_sizes() {
         eprintln!("  [setup] Inserting {n} articles with {VECTOR_DIM}-dim vectors...");
         let (fluree, ledger, _, query, n_recent) = rt.block_on(setup_dataset(n));
         let db = fluree_db_api::GraphDb::from_ledger_state(&ledger);
@@ -324,11 +311,11 @@ fn bench_vector_scan_filtered(c: &mut Criterion) {
 
 fn bench_vector_scan_filtered_indexed(c: &mut Criterion) {
     init_tracing_for_bench();
-    let rt = Runtime::new().unwrap();
+    let rt = bench_runtime();
     let mut group = c.benchmark_group("vector_scan_filtered_indexed");
-    group.sample_size(10);
+    group.sample_size(current_profile().sample_size());
 
-    for &n in DATASET_SIZES {
+    for &n in dataset_sizes() {
         eprintln!(
             "  [setup] Inserting {n} articles with {VECTOR_DIM}-dim vectors + building index..."
         );

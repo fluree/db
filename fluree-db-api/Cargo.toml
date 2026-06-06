@@ -59,6 +59,8 @@ fluree-search-protocol = { path = "../fluree-search-protocol" }
 fluree-graph-ir = { path = "../fluree-graph-ir" }
 fluree-graph-format = { path = "../fluree-graph-format" }
 fluree-graph-turtle = { path = "../fluree-graph-turtle" }
+flate2 = { workspace = true }
+zstd = { workspace = true }
 fluree-db-credential = { path = "../fluree-db-credential", optional = true }
 fluree-db-shacl = { path = "../fluree-db-shacl", optional = true }
 fluree-vocab = { path = "../fluree-vocab" }
@@ -67,6 +69,7 @@ fluree-graph-json-ld = { path = "../fluree-graph-json-ld" }
 async-trait.workspace = true
 chrono.workspace = true
 futures.workspace = true
+indexmap.workspace = true
 moka.workspace = true
 rustc-hash = "2"
 thiserror.workspace = true
@@ -103,6 +106,9 @@ tracing-subscriber.workspace = true
 tempfile = "3.19"
 mimalloc.workspace = true
 fs2 = "0.4"
+# Used by import tests to produce .gz / .zst fixtures inline.
+flate2 = { workspace = true }
+zstd = { workspace = true }
 # Numeric types used by datatype tests
 num-bigint = "0.4"
 num-bigdecimal = { package = "bigdecimal", version = "0.4" }
@@ -112,6 +118,7 @@ num-bigdecimal = { package = "bigdecimal", version = "0.4" }
 # and its full dep tree when the feature is off.
 ed25519-dalek = "2.1"
 criterion = { version = "0.5", features = ["async_tokio"] }
+fluree-bench-support = { path = "../fluree-bench-support" }
 rand = { workspace = true }
 fluree-db-nameservice-sync = { path = "../fluree-db-nameservice-sync" }
 
@@ -145,6 +152,34 @@ harness = false
 
 [[bench]]
 name = "insert_formats"
+harness = false
+
+[[bench]]
+name = "import_bulk"
+harness = false
+
+[[bench]]
+name = "transact_commit"
+harness = false
+
+[[bench]]
+name = "query_cold_reload"
+harness = false
+
+[[bench]]
+name = "reindex_full"
+harness = false
+
+[[bench]]
+name = "reindex_incremental"
+harness = false
+
+[[bench]]
+name = "novelty_replay"
+harness = false
+
+[[bench]]
+name = "query_hot_bsbm"
 harness = false
 
 [lints]

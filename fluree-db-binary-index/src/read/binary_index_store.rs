@@ -67,14 +67,36 @@ pub(crate) struct DictionarySet {
     pub(crate) dt_sids: Vec<Sid>,
 }
 
-fn cas_sync_timeout() -> Option<Duration> {
+/// Optional per-fetch ceiling for CAS reads bridged from sync code, from
+/// `FLUREE_CAS_SYNC_TIMEOUT_MS`. `None` (the default) means no ceiling beyond
+/// the storage backend's own request timeout (e.g. S3's 35s send_timeout).
+/// Applied by the leaf, dict, and pack read bridges so a stalled fetch becomes
+/// a bounded error instead of an unbounded block.
+pub(crate) fn cas_sync_timeout() -> Option<Duration> {
     std::env::var("FLUREE_CAS_SYNC_TIMEOUT_MS")
         .ok()
         .and_then(|v| v.parse::<u64>().ok())
         .map(Duration::from_millis)
 }
 
-fn run_sync_on_runtime<T, Fut>(fut: Fut) -> io::Result<T>
+/// Drive an async future to completion from synchronous code, safely on any
+/// Tokio runtime flavor.
+///
+/// On a **multi-thread** runtime this uses `block_in_place(handle.block_on)`:
+/// the calling worker is converted to a blocking thread and Tokio promotes a
+/// replacement that keeps driving the IO reactor / timer, so the awaited
+/// future (e.g. an S3 `get`) makes progress even while this thread blocks.
+/// On a **current-thread** (or unknown / absent) runtime it runs the future on
+/// a self-contained helper runtime so it never deadlocks the single thread.
+///
+/// This is the canonical sync→async bridge for the index read path. All
+/// CAS-backed reads (leaf bytes, dict-tree leaves, forward packs) must go
+/// through it. A hand-rolled bridge that spawns a thread, calls
+/// `Handle::block_on` on the outer runtime, and waits on `rx.recv()` instead
+/// re-injects the fetch onto the outer runtime with no `block_in_place`; on a
+/// small (e.g. 2-worker) runtime every worker can then park in `recv` with no
+/// thread left to drive the reactor, so the fetch never completes — a hard wedge.
+pub(crate) fn run_sync_on_runtime<T, Fut>(fut: Fut) -> io::Result<T>
 where
     T: Send + 'static,
     Fut: std::future::Future<Output = io::Result<T>> + Send + 'static,
@@ -1555,7 +1577,35 @@ impl BinaryIndexStore {
         // The V3 format uses ForwardPack readers (already mmap'd) for forward dicts
         // and CoW trees for reverse dicts. Reverse-tree leaf preloading can be
         // added when cold-start latency is observed in production.
+        //
+        // Forward-dict page warming is implemented separately in
+        // [`Self::prewarm_forward_dicts`], which the server's background warmer
+        // calls at startup.
         Ok(0)
+    }
+
+    /// Pre-warm forward-dictionary pages (string + subject packs) into the OS
+    /// page cache, up to `budget_bytes` total across all packs. Returns the
+    /// number of bytes touched.
+    ///
+    /// The index root and reverse-dict tree readers are already resident after
+    /// [`load_from_root_v6`](Self::load_from_root_v6); this targets the forward
+    /// packs, which are mmapped lazily and otherwise fault in on the first query
+    /// that resolves an IRI/string ID. String packs are warmed first (broadest
+    /// query impact), then per-namespace subject packs. Warming stops once the
+    /// budget is exhausted.
+    ///
+    /// Blocking (page faults / sequential reads) — call from a blocking context
+    /// such as `tokio::task::spawn_blocking`, never on the hot async path.
+    pub fn prewarm_forward_dicts(&self, budget_bytes: u64) -> u64 {
+        let mut warmed = self.dicts.string_forward_packs.prewarm(budget_bytes);
+        for reader in self.dicts.subject_forward_packs.values() {
+            if warmed >= budget_bytes {
+                break;
+            }
+            warmed += reader.prewarm(budget_bytes - warmed);
+        }
+        warmed
     }
 
     /// Create a `BinaryGraphView` for a specific graph (no novelty).
@@ -1749,7 +1799,7 @@ impl BinaryGraphView {
 
     /// Attach a fuel tracker. When set, each forward-pack dict touch (a call
     /// into the persisted dict that didn't short-circuit through novelty)
-    /// charges 1 fuel.
+    /// charges one dict touch (`schedule::DICT_TOUCH_MICRO_FUEL`).
     pub fn with_tracker(mut self, tracker: fluree_db_core::Tracker) -> Self {
         if tracker.is_enabled() {
             self.tracker = Some(tracker);
@@ -1760,7 +1810,8 @@ impl BinaryGraphView {
     #[inline]
     fn charge_dict_touch(&self) -> io::Result<()> {
         if let Some(t) = &self.tracker {
-            t.consume_fuel(1000).map_err(io::Error::other)?;
+            t.consume_fuel(fluree_db_core::tracking::schedule::DICT_TOUCH_MICRO_FUEL)
+                .map_err(io::Error::other)?;
         }
         Ok(())
     }
@@ -2733,5 +2784,128 @@ mod tests {
             )
             .unwrap();
         assert_eq!(val, FlakeValue::Long(1_350_000));
+    }
+
+    /// Regression guard: `LeafletCache` single-flight must not starve a small
+    /// runtime. N callers contending on the same cold dict-leaf key (1 leader
+    /// runs the load under `block_in_place`, the rest wait) must all complete
+    /// on a 2-worker runtime. Before the fix the waiters parked both workers
+    /// synchronously with no `block_in_place`, so nothing drove the reactor and
+    /// the leader's `block_on` never completed — a hard, container-burning wedge
+    /// (the residual after the dict/pack bridge fix). Watchdog'd so a regression
+    /// fails instead of hanging.
+    #[test]
+    fn leaflet_cache_single_flight_frees_workers_under_contention() {
+        use crate::read::leaflet_cache::LeafletCache;
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        let (tx, rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            let rt = tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(2)
+                .enable_all()
+                .build()
+                .unwrap();
+            let done = rt.block_on(async {
+                let cache = std::sync::Arc::new(LeafletCache::with_max_mb(64));
+                let handle = tokio::runtime::Handle::current();
+                let mut tasks = Vec::new();
+                for _ in 0..8 {
+                    let c = std::sync::Arc::clone(&cache);
+                    let h = handle.clone();
+                    tasks.push(tokio::spawn(async move {
+                        // All 8 contend on the SAME cold key: 1 leader, 7 waiters.
+                        c.try_get_or_load_dict_leaf(0xABCD_u128, || {
+                            // Leader load bridges to async S3, like the dict path.
+                            tokio::task::block_in_place(|| {
+                                h.block_on(async {
+                                    tokio::time::sleep(Duration::from_millis(50)).await;
+                                });
+                            });
+                            Ok::<_, std::io::Error>(std::sync::Arc::from(
+                                vec![1u8, 2, 3].into_boxed_slice(),
+                            ))
+                        })
+                    }));
+                }
+                let mut ok = 0usize;
+                for t in tasks {
+                    if matches!(t.await, Ok(Ok(_))) {
+                        ok += 1;
+                    }
+                }
+                ok
+            });
+            let _ = tx.send(done);
+        });
+
+        match rx.recv_timeout(Duration::from_secs(8)) {
+            Ok(n) => assert_eq!(
+                n, 8,
+                "all single-flight callers must complete on a 2-worker runtime"
+            ),
+            Err(_) => panic!(
+                "LeafletCache single-flight wedged a 2-worker runtime under contention (regression)"
+            ),
+        }
+    }
+
+    /// Regression guard for the multi-query worker-starvation wedge.
+    ///
+    /// `run_sync_on_runtime` is the sync→async bridge for all CAS-backed index
+    /// reads (leaf bytes, dict-tree leaves, forward packs). It must free the
+    /// runtime's workers under fan-out so N > `worker_threads` concurrent
+    /// bridges all complete. The pre-fix dict/pack bridges hand-rolled
+    /// `thread::spawn` + outer-`Handle::block_on` + `recv`/`join` with no
+    /// `block_in_place`, so on a small (2-worker) runtime every worker parked
+    /// in `recv` with nothing left to drive the reactor — a hard deadlock.
+    ///
+    /// Driven on a child thread with a `recv_timeout` watchdog so a regression
+    /// fails the test instead of hanging the suite.
+    #[test]
+    fn run_sync_on_runtime_frees_workers_under_fanout() {
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        let (tx, rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            let rt = tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(2)
+                .enable_all()
+                .build()
+                .unwrap();
+            let done = rt.block_on(async {
+                let mut tasks = Vec::new();
+                for _ in 0..32 {
+                    tasks.push(tokio::spawn(async {
+                        // Bridge a simulated async CAS read from sync code, just
+                        // like the dict/pack/leaf read paths do.
+                        run_sync_on_runtime(async {
+                            tokio::time::sleep(Duration::from_millis(50)).await;
+                            Ok::<(), std::io::Error>(())
+                        })
+                    }));
+                }
+                let mut ok = 0usize;
+                for t in tasks {
+                    if matches!(t.await, Ok(Ok(()))) {
+                        ok += 1;
+                    }
+                }
+                ok
+            });
+            let _ = tx.send(done);
+        });
+
+        match rx.recv_timeout(Duration::from_secs(8)) {
+            Ok(done) => assert_eq!(
+                done, 32,
+                "all bridged fetches must complete on a 2-worker runtime"
+            ),
+            Err(_) => {
+                panic!("run_sync_on_runtime wedged a 2-worker runtime under fan-out (regression)")
+            }
+        }
     }
 }

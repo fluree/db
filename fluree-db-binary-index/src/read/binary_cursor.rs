@@ -22,8 +22,9 @@ use crate::read::types::{cmp_row_vs_overlay, OverlayOp};
 
 use super::binary_index_store::BinaryIndexStore;
 use super::column_loader::load_columns_cached_via_handle;
-use super::column_types::{BinaryFilter, ColumnBatch, ColumnData, ColumnProjection};
+use super::column_types::{BinaryFilter, ColumnBatch, ColumnData, ColumnProjection, ColumnSet};
 use super::replay::{batch_has_rows_above_t, replay_leaflet};
+use crate::format::column_block::ColumnId;
 
 // ============================================================================
 // BinaryCursor
@@ -57,7 +58,7 @@ pub struct BinaryCursor {
     epoch: u64,
     /// Time bound for overlay ops (only emit ops with t <= to_t).
     to_t: i64,
-    /// Optional fuel tracker. When set, charges 1 fuel per leaflet returned.
+    /// Optional fuel tracker. When set, charges one index touch per leaflet returned.
     tracker: Option<Tracker>,
 }
 
@@ -130,8 +131,9 @@ impl BinaryCursor {
         }
     }
 
-    /// Attach a fuel tracker. Charges 1 fuel (1000 micro-fuel) per leaflet
-    /// returned by `next_batch` (regardless of cache hit/miss).
+    /// Attach a fuel tracker. Charges one index touch
+    /// (`schedule::INDEX_TOUCH_MICRO_FUEL`) per leaflet returned by
+    /// `next_batch` (regardless of cache hit/miss).
     pub fn with_tracker(mut self, tracker: Tracker) -> Self {
         if tracker.is_enabled() {
             self.tracker = Some(tracker);
@@ -149,6 +151,26 @@ impl BinaryCursor {
             ops.windows(2).all(|w| w[0].fact_key() != w[1].fact_key()),
             "overlay ops contain duplicate fact keys — caller must resolve \
              assert/retract lifecycles via resolve_overlay_ops() before set_overlay_ops()"
+        );
+        // `merge_overlay_into_batch` compares each base row against overlay ops
+        // on the FULL V3 identity (s_id, p_id, o_type, o_key, o_i). If the
+        // projection omits any of these, the base column reads as `AbsentDefault`
+        // (p_id→0, o_type→0, o_i→u32::MAX), corrupting the sort/identity compare
+        // and over/under-counting. Production masks this because the leaflet
+        // cache always loads `ColumnProjection::all()`, but a cache-less store
+        // would miscount — so require the identity columns explicitly here.
+        debug_assert!(
+            ops.is_empty() || {
+                let eff = self.projection.effective();
+                eff.contains(ColumnId::SId)
+                    && eff.contains(ColumnId::PId)
+                    && eff.contains(ColumnId::OType)
+                    && eff.contains(ColumnId::OKey)
+                    && eff.contains(ColumnId::OI)
+            },
+            "overlay merge requires the full V3 identity (SId, PId, OType, OKey, OI) \
+             in the cursor projection; got {:?}",
+            self.projection
         );
         let len = ops.len();
         self.overlay_ops = ops;
@@ -174,6 +196,38 @@ impl BinaryCursor {
     /// Whether time-travel replay is needed (to_t < index_t).
     fn need_replay(&self) -> bool {
         self.to_t < self.store.max_t()
+    }
+
+    /// Columns to decode for the current leaflet (projection-aware).
+    ///
+    /// Trusts the cursor's `projection` (which already carries output + internal
+    /// filter/order columns, exactly as the no-cache decode path consumes it),
+    /// but widens it defensively so a narrowed decode can never starve a
+    /// downstream read:
+    /// - `has_ov`: the overlay merge reads every base column → decode ALL.
+    /// - non-empty filter: `filter_batch` reads s/p/o_type/o_key/o_i (mostly
+    ///   `Const`/absent, so free to include).
+    /// - `need_replay`: leaflet replay reads `t`.
+    ///
+    /// For a plain current-time scan this drops `t` (and any other unprojected
+    /// column), so its `Block` is neither decoded nor allocated. The leaflet
+    /// cache keys on this set, keeping narrow and full batches distinct.
+    fn leaflet_decode_set(&self, has_ov: bool) -> ColumnSet {
+        if has_ov {
+            return ColumnSet::ALL;
+        }
+        let mut set = self.projection.effective();
+        if !self.filter.is_empty() {
+            set.insert(ColumnId::SId);
+            set.insert(ColumnId::OKey);
+            set.insert(ColumnId::PId);
+            set.insert(ColumnId::OType);
+            set.insert(ColumnId::OI);
+        }
+        if self.need_replay() {
+            set.insert(ColumnId::T);
+        }
+        set
     }
 
     /// Whether any overlay ops remain globally (for overlay-only path).
@@ -240,25 +294,47 @@ impl BinaryCursor {
                         continue;
                     }
 
+                    // Key-range pre-skip: drop leaflets whose [first_key, last_key]
+                    // provably cannot contain a row matching the filter's bound
+                    // order-leading prefix, before paying any decode + per-row
+                    // filter. Same safety guards as the metadata skip above
+                    // (no overlay merge; no time-travel history replay).
+                    if !has_ov
+                        && !needs_history_replay
+                        && self.filter.leaflet_out_of_range(
+                            self.order,
+                            &entry.first_key,
+                            &entry.last_key,
+                        )
+                    {
+                        continue;
+                    }
+
                     // Load columns via LeafHandle (cached when LeafletCache is available).
                     let mut batch = if entry.row_count > 0 {
                         let leaflet_idx = self.current_leaflet_idx - 1;
+                        let decode_set = self.leaflet_decode_set(has_ov);
                         if let Some(cache) = self.store.leaflet_cache() {
                             load_columns_cached_via_handle(
                                 leaf.handle.as_ref(),
-                                leaflet_idx,
-                                self.order,
                                 cache,
-                                leaf.handle.leaf_id(),
-                                u32::try_from(leaflet_idx).map_err(|_| {
-                                    std::io::Error::other(format!(
-                                        "leaflet index {leaflet_idx} exceeds u32::MAX"
-                                    ))
-                                })?,
+                                super::column_loader::LeafletDecodeSpec {
+                                    leaf_id: leaf.handle.leaf_id(),
+                                    leaflet_idx: u32::try_from(leaflet_idx).map_err(|_| {
+                                        std::io::Error::other(format!(
+                                            "leaflet index {leaflet_idx} exceeds u32::MAX"
+                                        ))
+                                    })?,
+                                    order: self.order,
+                                    decode_set,
+                                },
                             )?
                         } else {
-                            leaf.handle
-                                .load_columns(leaflet_idx, &self.projection, self.order)?
+                            let proj = ColumnProjection {
+                                output: decode_set,
+                                internal: ColumnSet::EMPTY,
+                            };
+                            leaf.handle.load_columns(leaflet_idx, &proj, self.order)?
                         }
                     } else {
                         ColumnBatch::empty()
@@ -317,11 +393,13 @@ impl BinaryCursor {
                         continue;
                     }
 
-                    // Charge 1 fuel per leaflet returned (per-touch, regardless
-                    // of cache state). Caller can downcast the io::Error to
-                    // recover the original FuelExceededError.
+                    // Charge one index touch per leaflet returned (per-touch,
+                    // regardless of cache state). Caller can downcast the
+                    // io::Error to recover the original FuelExceededError.
                     if let Some(tracker) = &self.tracker {
-                        if let Err(e) = tracker.consume_fuel(1000) {
+                        if let Err(e) = tracker.consume_fuel(
+                            fluree_db_core::tracking::schedule::INDEX_TOUCH_MICRO_FUEL,
+                        ) {
                             return Err(io::Error::other(e));
                         }
                     }

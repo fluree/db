@@ -49,6 +49,8 @@ The request succeeded.
 }
 ```
 
+**Multi-query envelope (`POST /multi-query`) returns 200 even when individual sub-queries fail.** The aggregate outcome is reported in the response body's `status` field (`"ok"` | `"partial"` | `"all_failed"`), with per-alias failures in `errors`. Clients should branch on `body.status` for the aggregate; HTTP 4xx / 5xx are reserved for envelope-level failures (validation, snapshot resolution, response-size cap). See [Multi-query envelope](multi-query.md#http-status-mapping) for the full mapping.
+
 #### 201 Created
 
 A new resource was created.

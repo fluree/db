@@ -49,6 +49,16 @@ pub fn compute_variable_deps(query: &Query) -> Option<VariableDeps> {
     }
     let required_sort_vars: Vec<VarId> = deps.iter().copied().collect();
 
+    // Expression-based ORDER BY binds run as a dedicated stage AFTER the
+    // post-aggregation binds, so they are traced FIRST in this backward walk:
+    // tracing their expression inputs keeps the referenced GROUP BY keys,
+    // aggregate outputs, and post-binds alive through grouping/trimming.
+    for (var, expr) in query.order_binds.iter().rev() {
+        if deps.remove(var) {
+            deps.extend(expr.referenced_vars());
+        }
+    }
+
     // Post-aggregation binds (reverse order): trace expression inputs.
     // Record deps BEFORE processing each bind backward, since that
     // represents what the bind's output must contain for downstream.
@@ -85,7 +95,7 @@ pub fn compute_variable_deps(query: &Query) -> Option<VariableDeps> {
     // Aggregates: replace output vars with input vars.
     for spec in query.grouping.iter().flat_map(Grouping::aggregates) {
         if deps.remove(&spec.output_var) {
-            if let Some(input_var) = spec.input_var {
+            if let Some(input_var) = spec.function.input_var() {
                 deps.insert(input_var);
             }
         }
@@ -118,7 +128,7 @@ mod tests {
     use crate::ir::triple::{Ref, Term, TriplePattern};
     use crate::ir::{
         AggregateFn, AggregateSpec, Aggregation, ConstructTemplate, Expression, FlakeValue,
-        Pattern, Query, QueryOutput, ReasoningConfig,
+        InputSemantics, Pattern, Query, QueryOutput, ReasoningConfig,
     };
     use crate::parse::SelectMode;
     use crate::sort::SortSpec;
@@ -141,6 +151,7 @@ mod tests {
             reasoning: ReasoningConfig::default(),
             grouping: None,
             ordering: Vec::new(),
+            order_binds: Vec::new(),
             limit: None,
             offset: None,
             post_values: None,
@@ -157,6 +168,7 @@ mod tests {
             reasoning: ReasoningConfig::default(),
             grouping: None,
             ordering: Vec::new(),
+            order_binds: Vec::new(),
             limit: None,
             offset: None,
             post_values: None,
@@ -217,10 +229,8 @@ mod tests {
             group_by: fluree_db_core::NonEmpty::try_from_vec(vec![VarId(2)]).unwrap(),
             aggregation: Some(Aggregation {
                 aggregates: fluree_db_core::NonEmpty::try_from_vec(vec![AggregateSpec {
-                    function: AggregateFn::Avg,
-                    input_var: Some(VarId(1)),
+                    function: AggregateFn::Avg(VarId(1), InputSemantics::List),
                     output_var: VarId(3),
-                    distinct: false,
                 }])
                 .unwrap(),
                 binds: Vec::new(),
@@ -246,10 +256,8 @@ mod tests {
             group_by: fluree_db_core::NonEmpty::try_from_vec(vec![VarId(0)]).unwrap(),
             aggregation: Some(Aggregation {
                 aggregates: fluree_db_core::NonEmpty::try_from_vec(vec![AggregateSpec {
-                    function: AggregateFn::Avg,
-                    input_var: Some(VarId(1)),
+                    function: AggregateFn::Avg(VarId(1), InputSemantics::List),
                     output_var: VarId(2),
-                    distinct: false,
                 }])
                 .unwrap(),
                 binds: vec![(
@@ -302,6 +310,7 @@ mod tests {
             reasoning: ReasoningConfig::default(),
             grouping: None,
             ordering: Vec::new(),
+            order_binds: Vec::new(),
             limit: None,
             offset: None,
             post_values: None,
@@ -327,6 +336,7 @@ mod tests {
             reasoning: ReasoningConfig::default(),
             grouping: None,
             ordering: Vec::new(),
+            order_binds: Vec::new(),
             limit: None,
             offset: None,
             post_values: None,
@@ -446,10 +456,8 @@ mod tests {
             group_by: fluree_db_core::NonEmpty::try_from_vec(vec![VarId(0)]).unwrap(),
             aggregation: Some(Aggregation {
                 aggregates: fluree_db_core::NonEmpty::try_from_vec(vec![AggregateSpec {
-                    function: AggregateFn::Avg,
-                    input_var: Some(VarId(1)),
+                    function: AggregateFn::Avg(VarId(1), InputSemantics::List),
                     output_var: VarId(2),
-                    distinct: false,
                 }])
                 .unwrap(),
                 binds: Vec::new(),
@@ -484,10 +492,8 @@ mod tests {
             group_by: fluree_db_core::NonEmpty::try_from_vec(vec![VarId(0)]).unwrap(),
             aggregation: Some(Aggregation {
                 aggregates: fluree_db_core::NonEmpty::try_from_vec(vec![AggregateSpec {
-                    function: AggregateFn::Avg,
-                    input_var: Some(VarId(1)),
+                    function: AggregateFn::Avg(VarId(1), InputSemantics::List),
                     output_var: VarId(2),
-                    distinct: false,
                 }])
                 .unwrap(),
                 binds: vec![(
@@ -530,10 +536,8 @@ mod tests {
             group_by: fluree_db_core::NonEmpty::try_from_vec(vec![VarId(0)]).unwrap(),
             aggregation: Some(Aggregation {
                 aggregates: fluree_db_core::NonEmpty::try_from_vec(vec![AggregateSpec {
-                    function: AggregateFn::Count,
-                    input_var: Some(VarId(1)),
+                    function: AggregateFn::Count(VarId(1)),
                     output_var: VarId(2),
-                    distinct: false,
                 }])
                 .unwrap(),
                 binds: Vec::new(),

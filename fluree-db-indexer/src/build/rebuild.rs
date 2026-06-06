@@ -15,6 +15,30 @@ use super::upload_dicts::upload_dicts_from_disk;
 
 use tracing::Instrument;
 
+/// Dedicated multi-thread runtime used to drive the full-rebuild's `block_on`.
+///
+/// The rebuild pipeline runs on a `spawn_blocking` thread (it holds non-Send
+/// dictionaries across awaits) and `block_on`s its S3 reads/writes. Driving
+/// that `block_on` with the *main* runtime's handle means its IO reactor is
+/// only advanced when a main worker is free — on a small-worker runtime under
+/// concurrent load the rebuild's S3 IO can stall (the same starvation class as
+/// the read-path bridges, just lower-exposure since a rebuild is rare). Driving
+/// it on a small dedicated runtime gives the rebuild its own reactor/workers,
+/// independent of main-runtime pressure. Lazily built; ~2 workers is plenty to
+/// drive epoll (the rebuild's CPU parallelism uses its own thread pools, not
+/// tokio workers).
+fn dedicated_rebuild_runtime() -> &'static tokio::runtime::Runtime {
+    static RT: std::sync::OnceLock<tokio::runtime::Runtime> = std::sync::OnceLock::new();
+    RT.get_or_init(|| {
+        tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .thread_name("fluree-index-rebuild")
+            .build()
+            .expect("build dedicated index-rebuild runtime")
+    })
+}
+
 ///
 /// Unlike `build_index_for_ledger`, this skips the nameservice lookup and
 /// the "already current" early-return check. Use this when you already have
@@ -33,11 +57,12 @@ use tracing::Instrument;
 /// 6. Upload artifacts to CAS and write BinaryIndexRoot
 pub async fn rebuild_index_from_commits(
     content_store: std::sync::Arc<dyn ContentStore>,
+    tracker: fluree_db_core::tracking::Tracker,
     ledger_id: &str,
     record: &fluree_db_nameservice::NsRecord,
     config: IndexerConfig,
 ) -> Result<IndexResult> {
-    rebuild_index_from_commits_with_store(content_store, ledger_id, record, config).await
+    rebuild_index_from_commits_with_store(content_store, tracker, ledger_id, record, config).await
 }
 
 /// Like [`rebuild_index_from_commits`], but accepts a caller-provided
@@ -46,6 +71,7 @@ pub async fn rebuild_index_from_commits(
 /// chain falls through to parent namespaces via `BranchedContentStore`).
 pub async fn rebuild_index_from_commits_with_store<C>(
     commit_store: C,
+    tracker: fluree_db_core::tracking::Tracker,
     ledger_id: &str,
     record: &fluree_db_nameservice::NsRecord,
     config: IndexerConfig,
@@ -86,7 +112,36 @@ where
     let ledger_id = ledger_id.to_string();
     let _prev_root_id = record.index_head_id.clone();
     let commit_t = record.commit_t;
-    let handle = tokio::runtime::Handle::current();
+    // Drive the rebuild's `block_on` on a dedicated runtime so the future, its
+    // timers, and any tasks it spawns are advanced by dedicated workers rather
+    // than the (possibly starved) main runtime.
+    //
+    // Isolation boundary — what this DOES and does NOT cover:
+    //   * Covered: the rebuild future itself, sleeps/timeouts, `tokio::spawn`ed
+    //     work, and any S3 connection *opened during the rebuild* (its socket
+    //     and hyper connection-driver task register on this dedicated runtime,
+    //     because `block_on` enters its context, so `Handle::current()` inside
+    //     the future resolves here).
+    //   * NOT covered: a connection *reused from the AWS SDK's shared pool*.
+    //     The S3 client is built once from a cached `SdkConfig` on the main
+    //     runtime and cloned everywhere, so its hyper pool is process-wide; a
+    //     pooled connection keeps its driver task and registered socket on
+    //     whichever runtime first established it (typically the main one). If
+    //     that runtime is fully starved, a reused connection can still stall —
+    //     this dedicated runtime cannot re-home an existing socket's reactor.
+    //
+    // That residual gap is acceptable here: (1) full rebuilds are rare and
+    // admin-triggered (the hot incremental path in incremental.rs prefetches
+    // and never `block_on`s under `spawn_blocking`); (2) under the load that
+    // starves the main runtime the pool is busy, so the rebuild tends to open
+    // its own (covered) connections; and (3) the de-starvation fixes on the
+    // read/bridge paths (block_in_place at the sync bridges + moka
+    // single-flight) keep the main reactor live, so even reused connections are
+    // driven. A hard boundary
+    // would require a dedicated S3 client/HTTP connector for the rebuild, which
+    // would break the storage-agnostic `ContentStore` abstraction this fn is
+    // written against — not justified for this path.
+    let handle = dedicated_rebuild_runtime().handle().clone();
     let parent_span = tracing::Span::current();
 
     tokio::task::spawn_blocking(move || {
@@ -792,7 +847,7 @@ where
 
             // ---- Pass 2: Streaming class stats via k-way merge ----
             //
-            // Build ClassBitsetTable from .types sidecars (global IDs), then
+            // Build ClassMembership from .types sidecars (global IDs), then
             // k-way merge .fsc files in cmp_v2_g_spot order with dedup. Feed
             // deduped winning assertions to SpotClassStatsCollector.
 
@@ -800,8 +855,8 @@ where
                 .iter()
                 .filter_map(|info| info.types_map_path.clone())
                 .collect();
-            let class_bitset =
-                crate::run_index::build::ClassBitsetTable::build_from_global_types(&types_paths)
+            let class_membership =
+                crate::run_index::build::ClassMembership::build_from_global_types(&types_paths)
                     .map_err(|e| IndexerError::StorageWrite(e.to_string()))?;
 
             let spot_class_stats = {
@@ -809,7 +864,7 @@ where
                 use crate::run_index::runs::spool::V1SpoolMergeAdapter;
                 use fluree_db_binary_index::format::run_record_v2::cmp_v2_g_spot;
 
-                let mut collector = SpotClassStatsCollector::new(rdf_type_p_id, class_bitset);
+                let mut collector = SpotClassStatsCollector::new(rdf_type_p_id, class_membership);
 
                 // Open V1 spool merge adapters for all .fsc files.
                 let registry = std::sync::Arc::new(registry);
@@ -880,8 +935,8 @@ where
                 let mut per_graph_classes = crate::stats::build_class_stat_entries(
                     &spot_class_stats,
                     &predicate_sids,
-                    &shared.dt_tags,
                     &language_tags,
+                    None, // uncapped: cs.class_prop_refs now uses ClassMembership (no 64-class cap).
                     &run_dir,
                     &shared.ns_prefixes,
                 )
@@ -916,9 +971,10 @@ where
             );
 
             // Phase E-V3: Upload V3 artifacts to CAS.
-            let v3_uploaded = super::upload::upload_indexes_to_cas(&content_store, &v3_result)
-                .instrument(tracing::debug_span!("upload_v3_indexes"))
-                .await?;
+            let v3_uploaded =
+                super::upload::upload_indexes_to_cas(&content_store, &tracker, &v3_result)
+                    .instrument(tracing::debug_span!("upload_v3_indexes"))
+                    .await?;
 
             // Phase F-V3: Upload dicts + assemble FIR6 root.
             let uploaded_dicts =

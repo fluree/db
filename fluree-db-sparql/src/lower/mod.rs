@@ -257,6 +257,8 @@ struct LoweringContext<'a, E> {
     agg_counter: u32,
     /// Monotonic counter for generating intermediate property-path join variables (`?__pp0`, `?__pp1`, …).
     pp_counter: u32,
+    /// Monotonic counter for generating expression-based ORDER BY bind variables (`?__order_by_0`, …).
+    order_counter: u32,
     /// Original SPARQL source text (for extracting SERVICE body text).
     source_text: Option<&'a str>,
 }
@@ -287,6 +289,7 @@ impl<'a, E: IriEncoder> LoweringContext<'a, E> {
             agg_expr_binds: HashMap::new(),
             agg_counter: 0,
             pp_counter: 0,
+            order_counter: 0,
             source_text,
         }
     }
@@ -336,12 +339,20 @@ impl<'a, E: IriEncoder> LoweringContext<'a, E> {
                     limit,
                     offset,
                     ordering,
+                    order_binds,
+                    // Consumed in `lower_solution_modifiers` (lowered into
+                    // `order_binds` after aggregate hoisting); empty here.
+                    deferred_order_exprs: _,
                 } = lowered_modifiers.base;
                 let distinct = lowered_modifiers.distinct;
 
                 // Assemble the grouping phase from the lowered components.
-                // Post-aggregation binds (`select_binds.post`) ride inside the
-                // aggregation stage when one exists.
+                // SELECT post-binds (`select_binds.post`) ride inside the
+                // aggregation stage. Expression-based ORDER BY binds ride on
+                // `Query.order_binds` (a dedicated post-grouping stage in the
+                // operator tree) so they evaluate uniformly with or without
+                // grouping — including dedup-only GROUP BY, which has no
+                // aggregation stage to carry binds.
                 let grouping = Grouping::assemble(
                     lowered_modifiers.group_by,
                     lowered_modifiers.aggregates,
@@ -373,6 +384,7 @@ impl<'a, E: IriEncoder> LoweringContext<'a, E> {
                     patterns,
                     grouping,
                     ordering,
+                    order_binds,
                     limit,
                     offset,
                     reasoning: ReasoningConfig::default(),
@@ -437,7 +449,7 @@ mod tests {
     use super::*;
     use crate::parse::parse_sparql;
     use fluree_db_query::ir::triple::{Ref, Term};
-    use fluree_db_query::ir::{AggregateFn, AggregateSpec};
+    use fluree_db_query::ir::{AggregateFn, AggregateSpec, InputSemantics};
     use fluree_db_query::ir::{Expression, Grouping, PathModifier, Pattern};
     use fluree_db_query::parse::encode::MemoryEncoder;
     use fluree_db_query::sort::SortDirection;
@@ -1507,16 +1519,132 @@ mod tests {
     }
 
     #[test]
-    fn test_order_by_expr_unsupported() {
-        let result = lower_query(
+    fn test_order_by_expression_desugars_to_order_bind() {
+        // `ORDER BY (?o + 1)` desugars to a synthetic `(?__order_by_N, expr)`
+        // carried on `query.order_binds` and sorts on that synthetic var.
+        let (query, vars) = lower_query_with_vars(
             "PREFIX ex: <http://example.org/>
              SELECT ?s ?o WHERE { ?s ex:p ?o } ORDER BY (?o + 1)",
-        );
+        )
+        .unwrap();
 
-        assert!(matches!(
-            result,
-            Err(LowerError::UnsupportedOrderByExpression { .. })
-        ));
+        assert_eq!(query.ordering.len(), 1);
+        let sort_var = query.ordering[0].var;
+        assert!(
+            vars.name(sort_var).starts_with("?__order_by_"),
+            "expected synthetic ORDER BY var, got: {}",
+            vars.name(sort_var)
+        );
+        // The desugared bind rides on `order_binds`, never in WHERE patterns.
+        assert!(
+            query.order_binds.iter().any(|(var, _)| *var == sort_var),
+            "expected an order bind for the ORDER BY expression"
+        );
+        assert!(
+            !query
+                .patterns
+                .iter()
+                .any(|p| matches!(p, Pattern::Bind { var, .. } if *var == sort_var)),
+            "ORDER BY bind must not leak into WHERE patterns"
+        );
+        assert!(
+            query.grouping.is_none(),
+            "no aggregation expected for this query"
+        );
+    }
+
+    #[test]
+    fn test_order_by_desc_expression() {
+        // The BSBM ratio shape: ORDER BY DESC(expr) , ?var.
+        let (query, vars) = lower_query_with_vars(
+            "PREFIX ex: <http://example.org/>
+             SELECT ?s ?a ?b WHERE { ?s ex:a ?a . ?s ex:b ?b }
+             ORDER BY DESC(?a / ?b) ?s",
+        )
+        .unwrap();
+
+        assert_eq!(query.ordering.len(), 2);
+        assert_eq!(query.ordering[0].direction, SortDirection::Descending);
+        // First key is the synthetic expression var, second is the bare ?s.
+        assert!(vars.name(query.ordering[0].var).starts_with("?__order_by_"));
+        assert_eq!(vars.name(query.ordering[1].var), "?s");
+    }
+
+    #[test]
+    fn test_order_by_expression_over_aggregate_uses_order_bind() {
+        // `ORDER BY DESC(?c * 2)` over an aggregate output is carried on
+        // `order_binds` (a dedicated post-grouping stage), not in WHERE patterns
+        // and not in the aggregation stage's own post-binds.
+        let (query, vars) = lower_query_with_vars(
+            "PREFIX ex: <http://example.org/>
+             SELECT ?type (COUNT(?s) AS ?c) WHERE { ?s ex:type ?type }
+             GROUP BY ?type ORDER BY DESC(?c * 2)",
+        )
+        .unwrap();
+
+        assert_eq!(query.ordering.len(), 1);
+        let sort_var = query.ordering[0].var;
+        assert!(vars.name(sort_var).starts_with("?__order_by_"));
+
+        // Carried on order_binds.
+        assert!(
+            query.order_binds.iter().any(|(var, _)| *var == sort_var),
+            "expected the aggregate-referencing ORDER BY to be an order bind"
+        );
+        // Not a WHERE bind, and not in the grouping phase's post-binds.
+        assert!(
+            !query
+                .patterns
+                .iter()
+                .any(|p| matches!(p, Pattern::Bind { var, .. } if *var == sort_var)),
+            "order bind must not be a pre-WHERE bind"
+        );
+        let grouping = query.grouping.as_ref().expect("aggregation expected");
+        assert!(
+            !grouping.binds().any(|(var, _)| *var == sort_var),
+            "order bind must not be merged into the aggregation post-binds"
+        );
+    }
+
+    #[test]
+    fn test_order_by_inline_aggregate_dedups_with_select_alias() {
+        // `ORDER BY DESC(COUNT(?s))` reuses the SELECT alias's aggregate, so
+        // exactly one aggregate is computed and the order bind references it.
+        let (query, _vars) = lower_query_with_vars(
+            "PREFIX ex: <http://example.org/>
+             SELECT ?type (COUNT(?s) AS ?c) WHERE { ?s ex:type ?type }
+             GROUP BY ?type ORDER BY DESC(COUNT(?s))",
+        )
+        .unwrap();
+
+        assert_eq!(
+            aggregates_of(&query).len(),
+            1,
+            "COUNT(?s) must not be computed twice"
+        );
+        assert_eq!(query.order_binds.len(), 1, "expected one ORDER BY bind");
+        assert_eq!(query.ordering.len(), 1);
+        let (bind_var, _) = &query.order_binds[0];
+        assert_eq!(query.ordering[0].var, *bind_var);
+    }
+
+    #[test]
+    fn test_order_by_inline_aggregate_hoisted_when_not_selected() {
+        // `ORDER BY DESC(COUNT(?s))` with no aggregate in SELECT hoists a new
+        // aggregate into the grouping phase with a synthetic output var.
+        let (query, vars) = lower_query_with_vars(
+            "PREFIX ex: <http://example.org/>
+             SELECT ?type WHERE { ?s ex:type ?type }
+             GROUP BY ?type ORDER BY DESC(COUNT(?s))",
+        )
+        .unwrap();
+
+        let aggs = aggregates_of(&query);
+        assert_eq!(aggs.len(), 1, "expected one hoisted aggregate");
+        assert!(vars.name(aggs[0].output_var).starts_with("?__inline_agg_"));
+        assert_eq!(query.order_binds.len(), 1);
+        let (bind_var, _) = &query.order_binds[0];
+        assert_eq!(query.ordering[0].var, *bind_var);
     }
 
     #[test]
@@ -1660,7 +1788,7 @@ mod tests {
 
         assert_eq!(aggregates_of(&query).len(), 1);
         let agg = aggregates_of(&query)[0];
-        assert!(matches!(agg.function, AggregateFn::Count));
+        assert!(matches!(agg.function, AggregateFn::Count(_)));
     }
 
     #[test]
@@ -1673,7 +1801,7 @@ mod tests {
 
         assert_eq!(aggregates_of(&query).len(), 1);
         let agg = aggregates_of(&query)[0];
-        assert!(matches!(agg.function, AggregateFn::CountDistinct));
+        assert!(matches!(agg.function, AggregateFn::CountDistinct(_)));
     }
 
     #[test]
@@ -1688,8 +1816,8 @@ mod tests {
 
         assert_eq!(aggregates_of(&query).len(), 1);
         let agg = aggregates_of(&query)[0];
-        assert!(matches!(agg.function, AggregateFn::CountDistinct));
-        assert!(agg.input_var.is_some()); // Should have resolved the variable
+        assert!(matches!(agg.function, AggregateFn::CountDistinct(_)));
+        assert!(agg.function.input_var().is_some()); // Should have resolved the variable
     }
 
     #[test]
@@ -1704,16 +1832,17 @@ mod tests {
 
         assert_eq!(aggregates_of(&query).len(), 1);
         let agg = aggregates_of(&query)[0];
-        assert!(matches!(agg.function, AggregateFn::CountDistinct));
-        assert!(agg.input_var.is_some());
+        assert!(matches!(agg.function, AggregateFn::CountDistinct(_)));
+        assert!(agg.function.input_var().is_some());
     }
 
     #[test]
     fn test_distinct_flag_count_vs_sum() {
-        // COUNT(DISTINCT) uses a dedicated AggregateFn::CountDistinct variant
-        // with distinct=false (dedup is built into the variant's HashSet state).
-        // SUM(DISTINCT) keeps AggregateFn::Sum with distinct=true (dedup happens
-        // at execution time via HashSet filtering in apply_aggregate).
+        // COUNT(DISTINCT) lowers to the dedicated AggregateFn::CountDistinct
+        // variant (its streaming state uses a HashSet rather than a counter).
+        // SUM(DISTINCT) lowers to AggregateFn::Sum with `distinct: true` —
+        // dedup happens at execution time via HashSet filtering in
+        // apply_aggregate.
         let query = lower_query(
             "PREFIX ex: <http://example.org/>
              SELECT (COUNT(DISTINCT ?s) AS ?c) (SUM(DISTINCT ?v) AS ?t)
@@ -1724,15 +1853,13 @@ mod tests {
         assert_eq!(aggregates_of(&query).len(), 2);
 
         let count_agg = aggregates_of(&query)[0];
-        assert!(matches!(count_agg.function, AggregateFn::CountDistinct));
-        assert!(
-            !count_agg.distinct,
-            "CountDistinct variant should clear the distinct flag"
-        );
+        assert!(matches!(count_agg.function, AggregateFn::CountDistinct(_)));
 
         let sum_agg = aggregates_of(&query)[1];
-        assert!(matches!(sum_agg.function, AggregateFn::Sum));
-        assert!(sum_agg.distinct, "SUM(DISTINCT) should set distinct=true");
+        assert!(matches!(
+            sum_agg.function,
+            AggregateFn::Sum(_, InputSemantics::Set)
+        ));
     }
 
     #[test]
@@ -1747,9 +1874,9 @@ mod tests {
         assert_eq!(aggregates_of(&query).len(), 1);
         assert!(matches!(
             aggregates_of(&query)[0].function,
-            AggregateFn::Sum
+            AggregateFn::Sum(..)
         ));
-        assert!(aggregates_of(&query)[0].input_var.is_some());
+        assert!(aggregates_of(&query)[0].function.input_var().is_some());
     }
 
     #[test]
@@ -1763,7 +1890,7 @@ mod tests {
         assert_eq!(aggregates_of(&query).len(), 1);
         assert!(matches!(
             aggregates_of(&query)[0].function,
-            AggregateFn::Sum
+            AggregateFn::Sum(..)
         ));
     }
 
@@ -1777,9 +1904,12 @@ mod tests {
 
         assert_eq!(aggregates_of(&query).len(), 1);
         let agg = aggregates_of(&query)[0];
-        assert!(matches!(agg.function, AggregateFn::Sum));
+        assert!(matches!(agg.function, AggregateFn::Sum(..)));
 
-        let input_var = agg.input_var.expect("expected aggregate input var");
+        let input_var = agg
+            .function
+            .input_var()
+            .expect("expected aggregate input var");
         let input_name = vars.name(input_var);
         assert!(
             input_name.starts_with("?__agg_expr_"),
@@ -1807,7 +1937,7 @@ mod tests {
         assert_eq!(aggregates_of(&query).len(), 1);
         assert!(matches!(
             aggregates_of(&query)[0].function,
-            AggregateFn::Avg
+            AggregateFn::Avg(..)
         ));
     }
 
@@ -1822,11 +1952,11 @@ mod tests {
         assert_eq!(aggregates_of(&query).len(), 2);
         assert!(matches!(
             aggregates_of(&query)[0].function,
-            AggregateFn::Min
+            AggregateFn::Min(_)
         ));
         assert!(matches!(
             aggregates_of(&query)[1].function,
-            AggregateFn::Max
+            AggregateFn::Max(_)
         ));
     }
 
@@ -1841,7 +1971,7 @@ mod tests {
         let aggs = aggregates_of(&query);
         assert_eq!(aggs.len(), 1);
         match &aggs[0].function {
-            AggregateFn::GroupConcat { separator } => {
+            AggregateFn::GroupConcat { separator, .. } => {
                 assert_eq!(separator, ", ");
             }
             _ => panic!("Expected GroupConcat"),
@@ -1859,7 +1989,7 @@ mod tests {
         assert_eq!(aggregates_of(&query).len(), 1);
         assert!(matches!(
             aggregates_of(&query)[0].function,
-            AggregateFn::Sample
+            AggregateFn::Sample(_)
         ));
     }
 
@@ -1875,7 +2005,10 @@ mod tests {
         assert_eq!(aggregates_of(&query).len(), 1);
         let agg = aggregates_of(&query)[0];
         assert!(matches!(agg.function, AggregateFn::CountAll));
-        assert!(agg.input_var.is_none(), "COUNT(*) should have no input var");
+        assert!(
+            agg.function.input_var().is_none(),
+            "COUNT(*) should have no input var"
+        );
     }
 
     #[test]

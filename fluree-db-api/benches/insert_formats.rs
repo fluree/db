@@ -25,219 +25,61 @@
 //   cargo bench -p fluree-db-api --bench insert_formats -- --test
 
 use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
+use fluree_bench_support::gen::people::{
+    generate_txn_data, txn_data_to_jsonld, txn_data_to_turtle,
+};
+use fluree_bench_support::{
+    bench_runtime, current_profile, init_tracing_for_bench, next_ledger_alias,
+};
 use fluree_db_api::{CommitOpts, FlureeBuilder, IndexConfig, TxnOpts};
-use serde_json::{json, Value as JsonValue};
-use std::sync::atomic::{AtomicU64, Ordering};
+use serde_json::Value as JsonValue;
 use tokio::runtime::Runtime;
-
-fn init_tracing_for_bench() {
-    use std::sync::OnceLock;
-    static INIT: OnceLock<()> = OnceLock::new();
-    INIT.get_or_init(|| {
-        if std::env::var("FLUREE_BENCH_TRACING").ok().as_deref() != Some("1") {
-            return;
-        }
-        if std::env::var("RUST_LOG").is_err() {
-            std::env::set_var("RUST_LOG", "info");
-        }
-        let filter = tracing_subscriber::EnvFilter::from_default_env();
-        tracing_subscriber::fmt()
-            .with_env_filter(filter)
-            .with_target(true)
-            .with_level(true)
-            .try_init()
-            .ok();
-    });
-}
 
 // ---------------------------------------------------------------------------
 // Constants
 // ---------------------------------------------------------------------------
 
 /// Transaction counts to benchmark.
-const TXN_COUNTS: &[usize] = &[10, 100];
+const TXN_COUNTS_FULL: &[usize] = &[10, 100];
 
 /// Nodes per transaction to benchmark.
-const NODES_PER_TXN: &[usize] = &[10, 100, 1_000];
+const NODES_PER_TXN_FULL: &[usize] = &[10, 100, 1_000];
 
-/// Unique ledger alias counter (each Criterion iteration needs a fresh ledger).
-static LEDGER_COUNTER: AtomicU64 = AtomicU64::new(0);
+/// Scale-driven slices. Tiny runs only the smallest matrix cell so the
+/// CI bench-gate stays under its wall-clock budget; nightly runs the
+/// full matrix (6 scenarios at the largest dimensions).
+fn matrix() -> (&'static [usize], &'static [usize]) {
+    use fluree_bench_support::BenchScale;
+    match fluree_bench_support::current_scale() {
+        BenchScale::Tiny => (&TXN_COUNTS_FULL[..1], &NODES_PER_TXN_FULL[..1]),
+        BenchScale::Small => (&TXN_COUNTS_FULL[..1], &NODES_PER_TXN_FULL[..2]),
+        BenchScale::Medium => (TXN_COUNTS_FULL, &NODES_PER_TXN_FULL[..2]),
+        BenchScale::Large => (TXN_COUNTS_FULL, NODES_PER_TXN_FULL),
+    }
+}
 
 // ---------------------------------------------------------------------------
-// Type aliases (matches vector_query.rs pattern)
+// Type aliases
 // ---------------------------------------------------------------------------
 
 type BenchFluree = fluree_db_api::Fluree;
 type BenchLedger = fluree_db_api::LedgerState;
 
 // ---------------------------------------------------------------------------
-// Data model
+// Pre-generated bench data
 // ---------------------------------------------------------------------------
-
-struct PersonData {
-    id: String,
-    name: String,
-    email: String,
-    age: u32,
-}
-
-struct CompanyData {
-    id: String,
-    name: String,
-    founded: String,
-    employee_ids: Vec<String>,
-    customer_ids: Vec<String>,
-}
-
-struct TxnData {
-    persons: Vec<PersonData>,
-    companies: Vec<CompanyData>,
-}
+//
+// `TxnData`, `PersonData`, `CompanyData`, `generate_txn_data`,
+// `txn_data_to_jsonld`, and `txn_data_to_turtle` were lifted into
+// `fluree_bench_support::gen::people` so other benches can reuse them.
+// `PregenData` is bench-specific (couples Fluree-side calibration) and
+// stays here.
 
 struct PregenData {
     jsonld_txns: Vec<JsonValue>,
     turtle_txns: Vec<String>,
     /// Total flakes produced by inserting all transactions (calibrated once).
     total_flakes: u64,
-}
-
-// ---------------------------------------------------------------------------
-// Deterministic data generation
-// ---------------------------------------------------------------------------
-
-fn generate_txn_data(txn_idx: usize, nodes_per_txn: usize) -> TxnData {
-    let n_companies = std::cmp::max(1, nodes_per_txn / 10);
-    let n_persons = nodes_per_txn - n_companies;
-
-    let global_base = txn_idx * nodes_per_txn;
-
-    let persons: Vec<PersonData> = (0..n_persons)
-        .map(|i| {
-            let gid = global_base + n_companies + i;
-            PersonData {
-                id: format!("ex:person-{gid:06}"),
-                name: format!("Person {gid:06}"),
-                email: format!("person{gid}@example.org"),
-                age: 18 + (gid % 48) as u32,
-            }
-        })
-        .collect();
-
-    let companies: Vec<CompanyData> = (0..n_companies)
-        .map(|i| {
-            let gid = global_base + i;
-
-            // Distribute persons across companies for refs
-            let chunk = n_persons / n_companies;
-            let start = i * chunk;
-            let end = if i == n_companies - 1 {
-                n_persons
-            } else {
-                start + chunk
-            };
-            let mid = start + (end - start) / 2;
-
-            let employee_ids: Vec<String> = (start..mid).map(|p| persons[p].id.clone()).collect();
-            let customer_ids: Vec<String> = (mid..end).map(|p| persons[p].id.clone()).collect();
-
-            // Deterministic date: 2000-01-01 + (gid * 17 % 9000) days
-            let base_date = chrono::NaiveDate::from_ymd_opt(2000, 1, 1).unwrap();
-            let days_offset = (gid * 17 % 9000) as i64;
-            let founded = base_date + chrono::Duration::days(days_offset);
-
-            CompanyData {
-                id: format!("ex:company-{gid:06}"),
-                name: format!("Company {gid:06}"),
-                founded: founded.format("%Y-%m-%d").to_string(),
-                employee_ids,
-                customer_ids,
-            }
-        })
-        .collect();
-
-    TxnData { persons, companies }
-}
-
-fn txn_data_to_jsonld(data: &TxnData) -> JsonValue {
-    let mut graph = Vec::with_capacity(data.persons.len() + data.companies.len());
-
-    for p in &data.persons {
-        graph.push(json!({
-            "@id": p.id,
-            "@type": "ex:Person",
-            "ex:name": p.name,
-            "ex:email": p.email,
-            "ex:age": {"@value": p.age, "@type": "xsd:integer"}
-        }));
-    }
-
-    for c in &data.companies {
-        let employees: Vec<JsonValue> =
-            c.employee_ids.iter().map(|id| json!({"@id": id})).collect();
-        let customers: Vec<JsonValue> =
-            c.customer_ids.iter().map(|id| json!({"@id": id})).collect();
-        graph.push(json!({
-            "@id": c.id,
-            "@type": "ex:Company",
-            "ex:name": c.name,
-            "ex:founded": {"@value": c.founded, "@type": "xsd:date"},
-            "ex:employees": employees,
-            "ex:customers": customers
-        }));
-    }
-
-    json!({
-        "@context": {
-            "ex": "http://example.org/ns/",
-            "xsd": "http://www.w3.org/2001/XMLSchema#"
-        },
-        "@graph": graph
-    })
-}
-
-fn txn_data_to_turtle(data: &TxnData) -> String {
-    let mut buf = String::with_capacity(data.persons.len() * 200 + data.companies.len() * 400);
-    buf.push_str("@prefix ex: <http://example.org/ns/> .\n");
-    buf.push_str("@prefix xsd: <http://www.w3.org/2001/XMLSchema#> .\n\n");
-
-    for p in &data.persons {
-        buf.push_str(&p.id);
-        buf.push_str(" a ex:Person ;\n");
-        buf.push_str(&format!("    ex:name \"{}\" ;\n", p.name));
-        buf.push_str(&format!("    ex:email \"{}\" ;\n", p.email));
-        buf.push_str(&format!("    ex:age \"{}\"^^xsd:integer .\n\n", p.age));
-    }
-
-    for c in &data.companies {
-        buf.push_str(&c.id);
-        buf.push_str(" a ex:Company ;\n");
-        buf.push_str(&format!("    ex:name \"{}\" ;\n", c.name));
-        buf.push_str(&format!("    ex:founded \"{}\"^^xsd:date", c.founded));
-
-        if !c.employee_ids.is_empty() {
-            buf.push_str(" ;\n    ex:employees ");
-            for (j, eid) in c.employee_ids.iter().enumerate() {
-                if j > 0 {
-                    buf.push_str(", ");
-                }
-                buf.push_str(eid);
-            }
-        }
-
-        if !c.customer_ids.is_empty() {
-            buf.push_str(" ;\n    ex:customers ");
-            for (j, cid) in c.customer_ids.iter().enumerate() {
-                if j > 0 {
-                    buf.push_str(", ");
-                }
-                buf.push_str(cid);
-            }
-        }
-
-        buf.push_str(" .\n\n");
-    }
-
-    buf
 }
 
 /// Pre-generate all transaction data and do one calibration insert pass to
@@ -261,8 +103,7 @@ fn pregen(
 
     // Calibration: insert all txns once via Turtle (cheapest path) to count flakes.
     let total_flakes = rt.block_on(async {
-        let id = LEDGER_COUNTER.fetch_add(1, Ordering::Relaxed);
-        let alias = format!("bench/cal-{id}:main");
+        let alias = next_ledger_alias("cal");
         let mut ledger = fluree.create_ledger(&alias).await.unwrap();
         let mut flakes = 0u64;
         for txn in &turtle_txns {
@@ -407,8 +248,7 @@ fn time_jsonld_run(
     index_config: &IndexConfig,
 ) -> f64 {
     rt.block_on(async {
-        let id = LEDGER_COUNTER.fetch_add(1, Ordering::Relaxed);
-        let alias = format!("bench/sum-jld-{id}:main");
+        let alias = next_ledger_alias("sum-jld");
         let ledger = fluree.create_ledger(&alias).await.unwrap();
         let start = std::time::Instant::now();
         let _ = run_jsonld_inserts(fluree, ledger, txns, index_config).await;
@@ -423,8 +263,7 @@ fn time_turtle_run(
     index_config: &IndexConfig,
 ) -> f64 {
     rt.block_on(async {
-        let id = LEDGER_COUNTER.fetch_add(1, Ordering::Relaxed);
-        let alias = format!("bench/sum-ttl-{id}:main");
+        let alias = next_ledger_alias("sum-ttl");
         let ledger = fluree.create_ledger(&alias).await.unwrap();
         let start = std::time::Instant::now();
         let _ = run_turtle_inserts(fluree, ledger, txns, index_config).await;
@@ -435,7 +274,7 @@ fn time_turtle_run(
 fn bench_insert_formats(c: &mut Criterion) {
     init_tracing_for_bench();
 
-    let rt = Runtime::new().unwrap();
+    let rt = bench_runtime();
     let fluree = FlureeBuilder::memory().build_memory();
 
     let index_config = IndexConfig {
@@ -444,12 +283,13 @@ fn bench_insert_formats(c: &mut Criterion) {
     };
 
     let mut group = c.benchmark_group("insert_formats");
-    group.sample_size(10);
+    group.sample_size(current_profile().sample_size());
 
     let mut summary: Vec<ScenarioResult> = Vec::new();
 
-    for &txn_count in TXN_COUNTS {
-        for &nodes_per_txn in NODES_PER_TXN {
+    let (txn_counts, nodes_per_txn_arr) = matrix();
+    for &txn_count in txn_counts {
+        for &nodes_per_txn in nodes_per_txn_arr {
             let total_nodes = txn_count * nodes_per_txn;
 
             eprintln!(
@@ -474,8 +314,7 @@ fn bench_insert_formats(c: &mut Criterion) {
                 &data,
                 |b, data| {
                     b.iter(|| {
-                        let id = LEDGER_COUNTER.fetch_add(1, Ordering::Relaxed);
-                        let alias = format!("bench/jld-{id}:main");
+                        let alias = next_ledger_alias("jld");
                         rt.block_on(async {
                             let ledger = fluree.create_ledger(&alias).await.unwrap();
                             black_box(
@@ -498,8 +337,7 @@ fn bench_insert_formats(c: &mut Criterion) {
                 &data,
                 |b, data| {
                     b.iter(|| {
-                        let id = LEDGER_COUNTER.fetch_add(1, Ordering::Relaxed);
-                        let alias = format!("bench/ttl-{id}:main");
+                        let alias = next_ledger_alias("ttl");
                         rt.block_on(async {
                             let ledger = fluree.create_ledger(&alias).await.unwrap();
                             black_box(

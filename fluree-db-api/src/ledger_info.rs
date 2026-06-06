@@ -196,7 +196,7 @@ pub async fn build_ledger_info_with_options<S: Storage + Clone>(
     let parsed_context = context
         .map(|c| ParsedContext::parse(None, c).unwrap_or_default())
         .unwrap_or_default();
-    let compactor = IriCompactor::new(ledger.snapshot.namespaces(), &parsed_context);
+    let compactor = IriCompactor::new(ledger.snapshot.shared_namespaces(), &parsed_context);
 
     // Build schema index for hierarchy lookups
     let schema_index = ledger
@@ -268,10 +268,7 @@ pub async fn build_ledger_info_with_options<S: Storage + Clone>(
     let mut result = Map::new();
 
     // 1. Ledger block (ledger-wide metadata)
-    result.insert(
-        "ledger".to_string(),
-        build_ledger_block(ledger, &stats, binary_store.as_deref()),
-    );
+    result.insert("ledger".to_string(), build_ledger_block(ledger, &stats));
 
     // 2. Graph name
     result.insert("graph".to_string(), json!(graph_name));
@@ -408,11 +405,7 @@ fn graph_display_name(g_id: GraphId, store: Option<&BinaryIndexStore>) -> String
 // ============================================================================
 
 /// Build the `ledger` block with ledger-wide metadata.
-fn build_ledger_block(
-    ledger: &LedgerState,
-    stats: &IndexStats,
-    store: Option<&BinaryIndexStore>,
-) -> JsonValue {
+fn build_ledger_block(ledger: &LedgerState, stats: &IndexStats) -> JsonValue {
     let index_t = ledger
         .ns_record
         .as_ref()
@@ -434,10 +427,18 @@ fn build_ledger_block(
             .unwrap_or((0, 0))
     };
 
-    // Build named-graphs list (include per-graph flakes/size when available).
-    // The "iri" is the full graph IRI, usable directly in FROM / FROM NAMED clauses.
+    // Build the `named-graphs` list from the **live** `GraphRegistry` on the
+    // snapshot, not from the binary index store. The registry is updated at
+    // commit-apply time, so it includes graphs registered since the last
+    // index build (and stays correct for ledgers with no index at all).
+    // `flakes` / `size` still come from `IndexStats.graphs` when available
+    // and fall back to `0` when no per-graph stats are present.
+    //
+    // The `"iri"` value is the full graph IRI, usable directly in
+    // FROM / FROM NAMED clauses.
     let mut named_graphs = Vec::new();
-    // Always include default graph
+    // Always include the default graph (g_id=0). The registry does not
+    // store an IRI for it, so we synthesize `urn:default` here.
     let (default_flakes, default_size) = graph_totals(0);
     named_graphs.push(json!({
         "iri": "urn:default",
@@ -445,17 +446,17 @@ fn build_ledger_block(
         "flakes": default_flakes,
         "size": default_size,
     }));
-    // Add named graphs from binary store (including txn-meta and config)
-    if let Some(store) = store {
-        for (g_id, iri) in store.graph_entries() {
-            let (flakes, size) = graph_totals(g_id);
-            named_graphs.push(json!({
-                "iri": iri,
-                "g-id": g_id,
-                "flakes": flakes,
-                "size": size,
-            }));
-        }
+    // Then every registered graph (txn-meta at g_id=1, config at g_id=2,
+    // user-defined at g_id>=3). `iter_entries` is dense and ordered by
+    // g_id, so the response is deterministic.
+    for (g_id, iri) in ledger.snapshot.graph_registry.iter_entries() {
+        let (flakes, size) = graph_totals(g_id);
+        named_graphs.push(json!({
+            "iri": iri,
+            "g-id": g_id,
+            "flakes": flakes,
+            "size": size,
+        }));
     }
 
     json!({

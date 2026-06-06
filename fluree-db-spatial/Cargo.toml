@@ -65,6 +65,7 @@ prost = { version = "0.13", optional = true }
 [dev-dependencies]
 tokio.workspace = true
 criterion = "0.5"
+fluree-bench-support = { path = "../fluree-bench-support" }
 
 [[bench]]
 name = "spatial_bench"

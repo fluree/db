@@ -33,7 +33,7 @@ use fluree_db_core::trace_commits_by_id;
 use fluree_db_core::{ledger_id::normalize_ledger_id, ContentId, ContentStore, StorageBackend};
 use fluree_db_ledger::{LedgerState, TypeErasedStore};
 use fluree_db_nameservice::NsRecord;
-use tokio::sync::{oneshot, Mutex, RwLock};
+use tokio::sync::{oneshot, RwLock};
 
 use crate::error::{ApiError, Result};
 use crate::ledger_view::LedgerView;
@@ -66,7 +66,7 @@ fn monotonic_secs() -> u64 {
 /// Transactions hold this guard across stage+commit to serialize writes
 /// to the same ledger.
 pub struct LedgerWriteGuard<'a> {
-    guard: tokio::sync::MutexGuard<'a, LedgerState>,
+    guard: tokio::sync::RwLockWriteGuard<'a, LedgerState>,
 }
 
 impl LedgerWriteGuard<'_> {
@@ -117,8 +117,11 @@ impl Clone for LedgerHandle {
 /// All paths that touch both locks (snapshot, apply_index_v2, reload)
 /// follow this order to prevent deadlock and ensure coherence.
 struct LedgerHandleInner {
-    /// Single mutex for all access (queries clone snapshot, txns hold for duration)
-    state: Mutex<LedgerState>,
+    /// Guards all access to the ledger state. A `RwLock` so concurrent reads
+    /// (every query takes a brief shared `read()` to clone a cheap, Arc-backed
+    /// snapshot) run in parallel instead of serializing; transactions take an
+    /// exclusive `write()` for the stage+commit duration.
+    state: RwLock<LedgerState>,
     /// Ledger ID (e.g., "mydb:main")
     ledger_id: String,
     /// Last access time (monotonic secs since process start)
@@ -127,7 +130,7 @@ struct LedgerHandleInner {
     ///
     /// Always coherent with `state.snapshot.range_provider` — writers hold
     /// the `state` lock while updating this.
-    binary_store: Mutex<Option<Arc<BinaryIndexStore>>>,
+    binary_store: RwLock<Option<Arc<BinaryIndexStore>>>,
 }
 
 impl LedgerHandle {
@@ -139,10 +142,10 @@ impl LedgerHandle {
     ) -> Self {
         Self {
             inner: Arc::new(LedgerHandleInner {
-                state: Mutex::new(state),
+                state: RwLock::new(state),
                 ledger_id,
                 last_access: AtomicU64::new(monotonic_secs()),
-                binary_store: Mutex::new(binary_store),
+                binary_store: RwLock::new(binary_store),
             }),
         }
     }
@@ -161,8 +164,8 @@ impl LedgerHandle {
     /// The snapshot is a cheap clone; the lock is released immediately after.
     pub async fn snapshot(&self) -> LedgerView {
         self.touch();
-        let state = self.inner.state.lock().await;
-        let binary_store = self.inner.binary_store.lock().await.clone();
+        let state = self.inner.state.read().await;
+        let binary_store = self.inner.binary_store.read().await.clone();
         let mut snap = LedgerView::from_state(&state);
         snap.binary_store = binary_store;
         debug_assert!(
@@ -177,7 +180,7 @@ impl LedgerHandle {
     pub async fn lock_for_write(&self) -> LedgerWriteGuard<'_> {
         self.touch();
         LedgerWriteGuard {
-            guard: self.inner.state.lock().await,
+            guard: self.inner.state.write().await,
         }
     }
 
@@ -194,7 +197,7 @@ impl LedgerHandle {
                 .downcast::<BinaryIndexStore>()
                 .ok()
         });
-        *self.inner.binary_store.lock().await = binary_store;
+        *self.inner.binary_store.write().await = binary_store;
     }
 
     /// Update last access time
@@ -216,7 +219,7 @@ impl LedgerHandle {
 
     /// Check if currently locked (for eviction - skip if in use)
     pub fn is_locked(&self) -> bool {
-        self.inner.state.try_lock().is_err()
+        self.inner.state.try_write().is_err()
     }
 
     /// Get current index_t (brief lock to read)
@@ -224,7 +227,7 @@ impl LedgerHandle {
     /// This returns the indexed DB's t value, NOT including novelty.
     /// For freshness checking against remote watermarks, use this method.
     pub async fn index_t(&self) -> i64 {
-        let state = self.inner.state.lock().await;
+        let state = self.inner.state.read().await;
         state.index_t()
     }
 
@@ -233,7 +236,7 @@ impl LedgerHandle {
     /// This returns the ledger's current t including any unindexed novelty.
     /// Use this for comparing against nameservice commit_t to detect staleness.
     pub async fn t(&self) -> i64 {
-        let state = self.inner.state.lock().await;
+        let state = self.inner.state.read().await;
         state.t()
     }
 
@@ -241,7 +244,7 @@ impl LedgerHandle {
     ///
     /// Returns (t, index_t, index_head_id) needed for UpdatePlan::plan()
     pub async fn state_metrics(&self) -> (i64, i64, Option<ContentId>) {
-        let state = self.inner.state.lock().await;
+        let state = self.inner.state.read().await;
         (
             state.t(),
             state.index_t(),
@@ -320,7 +323,7 @@ impl LedgerHandle {
         // then wire up range_provider with the correct dict_novelty.
         // Lock ordering: state → binary_store (same as snapshot()).
         {
-            let mut state = self.inner.state.lock().await;
+            let mut state = self.inner.state.write().await;
 
             // apply_loaded_db: validates, trims novelty, rebuilds dict_novelty
             state
@@ -328,30 +331,34 @@ impl LedgerHandle {
                 .map_err(|e| ApiError::internal(format!("apply_loaded_db failed: {e}")))?;
 
             // Sync namespace codes between store and snapshot (bimap validation).
-            crate::ns_helpers::sync_store_and_snapshot_ns(&mut store, &mut state.snapshot)?;
+            crate::ns_helpers::sync_store_and_snapshot_ns(
+                &mut store,
+                Arc::make_mut(&mut state.snapshot),
+            )?;
 
             let arc_store = Arc::new(store);
             crate::runtime_dicts::reseed_runtime_small_dicts(&mut state, &arc_store);
 
             // Build range_provider with the real dict_novelty (rebuilt by apply_loaded_db)
-            let ns_fallback = Some(Arc::new(state.snapshot.namespaces().clone()));
+            let ns_fallback = Some(state.snapshot.shared_namespaces());
             let provider = BinaryRangeProvider::new(
                 Arc::clone(&arc_store),
                 Arc::clone(&state.dict_novelty),
                 Arc::clone(&state.runtime_small_dicts),
                 ns_fallback,
             );
-            state.snapshot.range_provider = Some(Arc::new(provider));
+            let snap = Arc::make_mut(&mut state.snapshot);
+            snap.range_provider = Some(Arc::new(provider));
             // Plumb the CAS handle so arena-backed annotation reads can
             // resolve `AnnotationIndexRoot.{forward,reverse}_branch_cid`.
             // Without this, `LedgerSnapshot::has_arena_reader()` always
             // returns false and the formatter / cascade falls back to
             // the M2a scan path even on snapshots with on-disk arenas.
-            state.snapshot.content_store = Some(Arc::clone(&cs));
+            snap.content_store = Some(Arc::clone(&cs));
 
             let te_store: Arc<dyn std::any::Any + Send + Sync> = arc_store.clone();
             state.binary_store = Some(TypeErasedStore(te_store));
-            *self.inner.binary_store.lock().await = Some(arc_store);
+            *self.inner.binary_store.write().await = Some(arc_store);
         }
 
         Ok(())
@@ -403,15 +410,150 @@ pub enum FreshnessCheck {
 /// Note: Loading sends `Result<LedgerHandle>` to waiters (they need the handle).
 ///       Reloading sends `Result<()>` to waiters (handle already obtained).
 enum LoadState {
-    /// Initial load in progress - waiters receive handle on success
-    Loading(Vec<oneshot::Sender<std::result::Result<LedgerHandle, Arc<ApiError>>>>),
+    /// Initial load in progress - waiters receive handle on success.
+    ///
+    /// `generation` is a per-slot token allocated from
+    /// [`LedgerManager::load_generation`] when the leader inserts this entry.
+    /// A [`LoadingLeaderGuard`]'s detached cleanup removes the slot only if the
+    /// current `Loading` carries the same generation, so a stale guard can
+    /// never clobber a *new* leader's slot that was inserted after the original
+    /// orphan was cleared (e.g. by `disconnect`).
+    Loading {
+        generation: u64,
+        waiters: Vec<oneshot::Sender<std::result::Result<LedgerHandle, Arc<ApiError>>>>,
+    },
     /// Loaded and cached
     Ready(LedgerHandle),
-    /// Reload in progress - handle stays valid, waiters receive () on success
+    /// Reload in progress - handle stays valid, waiters receive () on success.
+    ///
+    /// `generation` is a per-slot token (same source as `Loading`) so a
+    /// [`ReloadLeaderGuard`]'s cleanup only reclaims its own orphaned slot.
     Reloading {
+        generation: u64,
         handle: LedgerHandle,
         waiters: Vec<oneshot::Sender<std::result::Result<(), Arc<ApiError>>>>,
     },
+}
+
+// ============================================================================
+// LoadingLeaderGuard - cancellation safety for single-flight loads
+// ============================================================================
+
+/// Cancellation-safety guard for a single-flight load leader in
+/// [`LedgerManager::get_or_load`].
+///
+/// The leader inserts [`LoadState::Loading`] before awaiting load I/O and only
+/// clears it on the publish path. If the leader future is dropped (cancelled)
+/// in between — an HTTP handler future dropped on client disconnect, an
+/// aborted task, an outer `tokio::time::timeout` — the `Loading` slot would be
+/// orphaned forever: [`LedgerManager::sweep_idle`] deliberately never evicts
+/// `Loading`, so every later caller for that ledger would park on `rx.await`
+/// indefinitely (a permanent per-ledger wedge).
+///
+/// On drop-before-publish this guard reclaims the orphaned slot. Removing the
+/// entry drops the queued waiter `oneshot` senders, so parked waiters receive
+/// `RecvError` (surfaced as `ApiError::internal("load cancelled")`) and the
+/// next caller re-elects a fresh leader. The leader calls [`Self::disarm`]
+/// once it has published (success or error), making normal completion a no-op.
+struct LoadingLeaderGuard {
+    entries: Arc<RwLock<HashMap<String, LoadState>>>,
+    alias: String,
+    /// Generation of the `Loading` slot this leader inserted. Cleanup removes
+    /// the slot only when it still carries this generation (ABA protection).
+    generation: u64,
+    armed: bool,
+}
+
+impl LoadingLeaderGuard {
+    /// Mark the load as published; the subsequent drop becomes a no-op.
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for LoadingLeaderGuard {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        // Drop is synchronous but the `entries` lock is async, so hand the
+        // cleanup to a detached task. A runtime context is present whenever a
+        // leader future is dropped on a worker thread (poll-time cancellation,
+        // task abort, or outer-future drop); if there is none, there is no
+        // runtime left to wedge.
+        let Ok(rt) = tokio::runtime::Handle::try_current() else {
+            return;
+        };
+        let entries = Arc::clone(&self.entries);
+        let alias = std::mem::take(&mut self.alias);
+        let generation = self.generation;
+        rt.spawn(async move {
+            let mut entries = entries.write().await;
+            // Only reclaim OUR still-`Loading` slot. A generation mismatch means
+            // the original orphan was already cleared (e.g. by `disconnect`) and
+            // a new leader inserted a fresh slot — never clobber that, nor a
+            // `Ready`/`Reloading` entry a later leader published.
+            if matches!(
+                entries.get(&alias),
+                Some(LoadState::Loading { generation: g, .. }) if *g == generation
+            ) {
+                entries.remove(&alias);
+            }
+        });
+    }
+}
+
+/// Cancellation-safety guard for a reload leader in [`LedgerManager::reload`].
+///
+/// `reload` transitions `Ready(h) → Reloading{h, waiters}` and only clears it
+/// on the publish path. A dropped reload-leader future would otherwise orphan
+/// the `Reloading` slot forever; unlike `Loading` this does NOT wedge query
+/// reads (`get_or_load` returns the still-valid handle for `Reloading`), but it
+/// permanently stalls future `reload`s and `current_t` for that ledger.
+///
+/// On drop-before-publish this guard evicts its own orphaned slot (generation
+/// match), dropping the waiter senders so parked reloaders get `RecvError`
+/// (surfaced as `ApiError::internal("reload cancelled")`). Eviction is safe —
+/// the next query cold-loads the ledger fresh — and avoids re-inserting after a
+/// concurrent `disconnect`/shutdown. The leader calls [`Self::disarm`] once it
+/// has published.
+struct ReloadLeaderGuard {
+    entries: Arc<RwLock<HashMap<String, LoadState>>>,
+    alias: String,
+    generation: u64,
+    armed: bool,
+}
+
+impl ReloadLeaderGuard {
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for ReloadLeaderGuard {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        let Ok(rt) = tokio::runtime::Handle::try_current() else {
+            return;
+        };
+        let entries = Arc::clone(&self.entries);
+        let alias = std::mem::take(&mut self.alias);
+        let generation = self.generation;
+        rt.spawn(async move {
+            let mut entries = entries.write().await;
+            // Only reclaim OUR still-`Reloading` slot (generation match), so a
+            // stale guard never clobbers a fresh slot inserted after the orphan
+            // was cleared.
+            if matches!(
+                entries.get(&alias),
+                Some(LoadState::Reloading { generation: g, .. }) if *g == generation
+            ) {
+                entries.remove(&alias);
+            }
+        });
+    }
 }
 
 // ============================================================================
@@ -507,15 +649,18 @@ pub(crate) async fn load_and_attach_binary_store(
     // DictNovelty/DictOverlay correctness (especially bound-object filters and overlay merges).
     let root = fluree_db_binary_index::IndexRoot::decode(&bytes)
         .map_err(|e| ApiError::internal(format!("failed to decode FIR6 root: {e}")))?;
-    state.snapshot.subject_watermarks = root.subject_watermarks;
-    state.snapshot.string_watermark = root.string_watermark;
-    if root.stats.is_some() && state.snapshot.stats.is_none() {
-        state.snapshot.stats = root.stats;
-        tracing::debug!("loaded stats from FIR6 root");
-    }
-    if root.schema.is_some() && state.snapshot.schema.is_none() {
-        state.snapshot.schema = root.schema;
-        tracing::debug!("loaded schema from FIR6 root");
+    {
+        let snap = Arc::make_mut(&mut state.snapshot);
+        snap.subject_watermarks = root.subject_watermarks;
+        snap.string_watermark = root.string_watermark;
+        if root.stats.is_some() && snap.stats.is_none() {
+            snap.stats = root.stats;
+            tracing::debug!("loaded stats from FIR6 root");
+        }
+        if root.schema.is_some() && snap.schema.is_none() {
+            snap.schema = root.schema;
+            tracing::debug!("loaded schema from FIR6 root");
+        }
     }
     state.dict_novelty = Arc::new(DictNovelty::with_watermarks(
         state.snapshot.subject_watermarks.clone(),
@@ -528,7 +673,7 @@ pub(crate) async fn load_and_attach_binary_store(
             .map_err(|e| ApiError::internal(format!("failed to load binary index: {e}")))?;
 
     // Sync namespace codes between store and snapshot (bimap validation).
-    crate::ns_helpers::sync_store_and_snapshot_ns(&mut store, &mut state.snapshot)?;
+    crate::ns_helpers::sync_store_and_snapshot_ns(&mut store, Arc::make_mut(&mut state.snapshot))?;
 
     // Re-populate DictNovelty from already-loaded novelty flakes, but *only* for
     // entries not present in the persisted dictionaries (canonical IDs must win).
@@ -549,7 +694,7 @@ pub(crate) async fn load_and_attach_binary_store(
 
     let arc_store = Arc::new(store);
     crate::runtime_dicts::reseed_runtime_small_dicts(state, &arc_store);
-    let ns_fallback = Some(Arc::new(state.snapshot.namespaces().clone()));
+    let ns_fallback = Some(state.snapshot.shared_namespaces());
     let provider = BinaryRangeProvider::new(
         Arc::clone(&arc_store),
         Arc::clone(&state.dict_novelty),
@@ -558,14 +703,15 @@ pub(crate) async fn load_and_attach_binary_store(
     );
     // Always rebuild the provider here so it is coherent with the freshly
     // loaded BinaryIndexStore, DictNovelty, and runtime dictionary state.
-    state.snapshot.range_provider = Some(Arc::new(provider));
+    let snap = Arc::make_mut(&mut state.snapshot);
+    snap.range_provider = Some(Arc::new(provider));
     // Plumb the CAS handle so arena-backed annotation reads can resolve
     // `AnnotationIndexRoot.{forward,reverse}_branch_cid`. Mirror of the
     // identical line in `apply_index_v2` — fresh-load path needs the
     // same wiring as the cache-update path or `has_arena_reader()`
     // would always be false on snapshots loaded outside the
     // LedgerManager handle path.
-    state.snapshot.content_store = Some(Arc::clone(&cs));
+    snap.content_store = Some(Arc::clone(&cs));
     // Also attach the type-erased store to the state so transaction staging
     // (which clones LedgerState under the write lock) can construct
     // graph-scoped BinaryRangeProviders (needed for named-graph upsert deletions).
@@ -612,7 +758,10 @@ pub struct RunningAttachmentEvents {
 
 pub struct LedgerManager {
     /// Cached ledger handles + loading state
-    entries: RwLock<HashMap<String, LoadState>>,
+    ///
+    /// `Arc` so a [`LoadingLeaderGuard`] can reclaim an orphaned `Loading`
+    /// slot from a detached cleanup task if a load leader future is cancelled.
+    entries: Arc<RwLock<HashMap<String, LoadState>>>,
     /// Storage backend for ledger loading
     backend: StorageBackend,
     /// Shared cache for index nodes
@@ -622,6 +771,10 @@ pub struct LedgerManager {
     config: LedgerManagerConfig,
     /// Shutdown flag — prevents load/reload leaders from re-inserting after disconnect_all
     shutdown: AtomicBool,
+    /// Monotonic generation source for `LoadState::Loading` slots. Lets a
+    /// [`LoadingLeaderGuard`]'s detached cleanup distinguish its own orphaned
+    /// slot from a fresh slot inserted by a later leader (ABA protection).
+    load_generation: AtomicU64,
 }
 
 impl LedgerManager {
@@ -637,11 +790,12 @@ impl LedgerManager {
         config: LedgerManagerConfig,
     ) -> Self {
         Self {
-            entries: RwLock::new(HashMap::new()),
+            entries: Arc::new(RwLock::new(HashMap::new())),
             backend,
             nameservice_mode: nameservice,
             config,
             shutdown: AtomicBool::new(false),
+            load_generation: AtomicU64::new(0),
         }
     }
 
@@ -741,7 +895,7 @@ impl LedgerManager {
         }
 
         // Slow path: need to coordinate loading
-        let (_should_load, rx) = {
+        let (rx, generation) = {
             let mut entries = self.entries.write().await;
 
             match entries.get_mut(&canonical_alias) {
@@ -753,22 +907,33 @@ impl LedgerManager {
                     // Handle is valid even during reload
                     return Ok(handle.clone());
                 }
-                Some(LoadState::Loading(waiters)) => {
+                Some(LoadState::Loading { waiters, .. }) => {
                     // Someone else is loading - add ourselves as waiter
                     let (tx, rx) = oneshot::channel();
                     waiters.push(tx);
-                    (false, Some(rx))
+                    (Some(rx), 0)
                 }
                 None => {
-                    // We're first - mark as loading, release lock, do I/O
-                    entries.insert(canonical_alias.clone(), LoadState::Loading(Vec::new()));
-                    (true, None)
+                    // We're first - mark as loading (with a fresh generation),
+                    // release lock, do I/O.
+                    let generation = self.load_generation.fetch_add(1, Ordering::Relaxed);
+                    entries.insert(
+                        canonical_alias.clone(),
+                        LoadState::Loading {
+                            generation,
+                            waiters: Vec::new(),
+                        },
+                    );
+                    (None, generation)
                 }
             }
         };
         // Manager lock released here
 
         if let Some(rx) = rx {
+            // Phase instrumentation (debug!): a waiter parked here with
+            // no matching leader publish is the orphaned-Loading signature.
+            tracing::debug!(alias = %canonical_alias, "ledger.load.waiter.park");
             // Wait for the loader to finish
             // Note: Waiters receive an Http error (preserving status code) since
             // ApiError isn't Clone. The leader (first caller) gets the full error type.
@@ -785,18 +950,39 @@ impl LedgerManager {
                 });
         }
 
-        // We're the loader - do the I/O without holding manager lock
-        // Note: We pass the original address to nameservice (it handles resolution),
-        // but cache under the canonical address for consistent lookup
-        let result = LedgerState::load(&self.nameservice_mode, ledger_id, &self.backend)
+        // We're the loader. Arm a guard over the `Loading` slot: if this
+        // leader future is cancelled before it publishes (HTTP handler dropped
+        // on client disconnect, task abort, outer timeout), the guard reclaims
+        // the slot so waiters unblock and a fresh caller re-elects a leader —
+        // otherwise the slot orphans forever and wedges the ledger.
+        let mut leader_guard = LoadingLeaderGuard {
+            entries: Arc::clone(&self.entries),
+            alias: canonical_alias.clone(),
+            generation,
+            armed: true,
+        };
+
+        // Phase instrumentation (debug!): leader load phases localize a hang to
+        // nameservice (DDB, no default timeout) vs storage (S3, 35s/attempt) vs
+        // the binary-store attach.
+        tracing::debug!(alias = %canonical_alias, "ledger.load.leader.begin");
+
+        // Do ALL load I/O — including the binary index store attach, which
+        // performs S3 reads — WITHOUT holding the manager lock. Holding the
+        // `entries` write lock across that I/O previously turned the entire
+        // ledger cache into a global mutex for the duration of any cold load.
+        // Note: we pass the original address to nameservice (it handles
+        // resolution), but cache under the canonical address.
+        let load_result = LedgerState::load(&self.nameservice_mode, ledger_id, &self.backend)
             .await
             .map_err(ApiError::from); // Convert LedgerError to ApiError
+        tracing::debug!(
+            alias = %canonical_alias,
+            ok = load_result.is_ok(),
+            "ledger.load.state.done"
+        );
 
-        // Publish result to waiters
-        let mut entries = self.entries.write().await;
-        let shutting_down = self.is_shutdown();
-
-        match result {
+        let publish = match load_result {
             Ok(mut state) => {
                 // Attempt to load binary index store (v2 only).
                 // Non-fatal: if loading fails, log and continue without binary index.
@@ -819,19 +1005,57 @@ impl LedgerManager {
                         None
                     }
                 };
+                tracing::debug!(alias = %canonical_alias, "ledger.load.binary_store.done");
+                Ok(LedgerHandle::new(
+                    canonical_alias.clone(),
+                    state,
+                    binary_store,
+                ))
+            }
+            Err(e) => Err(e),
+        };
 
-                let handle = LedgerHandle::new(canonical_alias.clone(), state, binary_store);
+        // Phase instrumentation (debug!): leader reached publish.
+        tracing::debug!(
+            alias = %canonical_alias,
+            ok = publish.is_ok(),
+            "ledger.load.leader.publish"
+        );
 
-                // Notify waiters
-                if let Some(LoadState::Loading(waiters)) = entries.remove(&canonical_alias) {
-                    for tx in waiters {
-                        let _ = tx.send(Ok(handle.clone()));
+        // Publish under a brief lock. There is no `.await` between acquiring
+        // the lock and disarming the guard, so the leader cannot be cancelled
+        // mid-publish: either the guard already fired (we never reached here)
+        // or the publish runs to completion in this poll.
+        let mut entries = self.entries.write().await;
+        let shutting_down = self.is_shutdown();
+        leader_guard.disarm();
+
+        // We only own the slot — and may remove/notify/cache it — if it is
+        // still OUR `Loading` (generation match). If `disconnect` cleared it and
+        // a newer leader inserted a fresh `Loading`, that slot belongs to the
+        // newer leader: publishing over it would clobber it and notify its
+        // waiters with our stale result. In that case we just return our own
+        // result to the direct caller without touching the cache. (The
+        // generation also guards the detached drop cleanup.)
+        let owns_slot = matches!(
+            entries.get(&canonical_alias),
+            Some(LoadState::Loading { generation: g, .. }) if *g == generation
+        );
+
+        match publish {
+            Ok(handle) => {
+                if owns_slot {
+                    if let Some(LoadState::Loading { waiters, .. }) =
+                        entries.remove(&canonical_alias)
+                    {
+                        for tx in waiters {
+                            let _ = tx.send(Ok(handle.clone()));
+                        }
                     }
-                }
-
-                // Don't re-insert into cache if shutdown has been initiated
-                if !shutting_down {
-                    entries.insert(canonical_alias, LoadState::Ready(handle.clone()));
+                    // Don't re-insert into cache if shutdown has been initiated
+                    if !shutting_down {
+                        entries.insert(canonical_alias, LoadState::Ready(handle.clone()));
+                    }
                 }
                 Ok(handle)
             }
@@ -839,12 +1063,15 @@ impl LedgerManager {
                 // Capture error with status code for waiters before consuming the error
                 // Note: Waiters receive an Http error (preserving status code);
                 // the leader (first caller) gets the original error type preserved.
-                let error_for_waiters = Arc::new(ApiError::http(e.status_code(), e.to_string()));
-
-                // Notify waiters of failure
-                if let Some(LoadState::Loading(waiters)) = entries.remove(&canonical_alias) {
-                    for tx in waiters {
-                        let _ = tx.send(Err(Arc::clone(&error_for_waiters)));
+                if owns_slot {
+                    let error_for_waiters =
+                        Arc::new(ApiError::http(e.status_code(), e.to_string()));
+                    if let Some(LoadState::Loading { waiters, .. }) =
+                        entries.remove(&canonical_alias)
+                    {
+                        for tx in waiters {
+                            let _ = tx.send(Err(Arc::clone(&error_for_waiters)));
+                        }
                     }
                 }
 
@@ -903,7 +1130,10 @@ impl LedgerManager {
             normalize_ledger_id(ledger_id).unwrap_or_else(|_| ledger_id.to_string());
 
         enum ReloadAction {
-            BecomeLeader(LedgerHandle),
+            BecomeLeader {
+                handle: LedgerHandle,
+                generation: u64,
+            },
             WaitForReload(oneshot::Receiver<std::result::Result<(), Arc<ApiError>>>),
             WaitForInitialLoad(oneshot::Receiver<std::result::Result<LedgerHandle, Arc<ApiError>>>),
             NotLoaded,
@@ -915,14 +1145,18 @@ impl LedgerManager {
 
             match entries.get_mut(&canonical_alias) {
                 Some(LoadState::Ready(h)) => {
-                    // Transition to Reloading, become leader
+                    // Transition to Reloading, become leader. Tag the slot with
+                    // a fresh generation so a cancelled leader's guard reclaims
+                    // only its own slot.
                     let handle = h.clone();
+                    let generation = self.load_generation.fetch_add(1, Ordering::Relaxed);
                     let reloading = LoadState::Reloading {
+                        generation,
                         handle: handle.clone(),
                         waiters: Vec::new(),
                     };
                     entries.insert(canonical_alias.clone(), reloading);
-                    ReloadAction::BecomeLeader(handle)
+                    ReloadAction::BecomeLeader { handle, generation }
                 }
                 Some(LoadState::Reloading { waiters, .. }) => {
                     // Join existing reload
@@ -930,7 +1164,7 @@ impl LedgerManager {
                     waiters.push(tx);
                     ReloadAction::WaitForReload(rx)
                 }
-                Some(LoadState::Loading(waiters)) => {
+                Some(LoadState::Loading { waiters, .. }) => {
                     // Initial load in progress - wait for it, then done
                     let (tx, rx) = oneshot::channel();
                     waiters.push(tx);
@@ -973,21 +1207,30 @@ impl LedgerManager {
                     })
             }
 
-            ReloadAction::BecomeLeader(handle) => {
-                // We're the reload leader - do I/O without manager lock
-                let mut write_guard = handle.lock_for_write().await;
+            ReloadAction::BecomeLeader { handle, generation } => {
+                // Guard the Reloading slot: a cancelled reload-leader future
+                // would otherwise orphan it (stalling future reloads/current_t).
+                let mut reload_guard = ReloadLeaderGuard {
+                    entries: Arc::clone(&self.entries),
+                    alias: canonical_alias.clone(),
+                    generation,
+                    armed: true,
+                };
 
-                let result = LedgerState::load(&self.nameservice_mode, ledger_id, &self.backend)
+                // We're the reload leader. Build the replacement state + binary
+                // store WITHOUT holding the handle `state` lock, so concurrent
+                // queries (snapshot() -> state.lock()) are not blocked behind the
+                // reload's nameservice/S3/index I/O. The lock is taken only for
+                // the brief coherent swap below. The `entries` lock is likewise
+                // not held over any of this and is acquired after the swap, so
+                // the two locks never overlap (avoids the entries↔state ordering
+                // hazard with `current_t`).
+                let loaded = LedgerState::load(&self.nameservice_mode, ledger_id, &self.backend)
                     .await
-                    .map_err(ApiError::from); // Convert LedgerError to ApiError
-
-                // Publish result under lock
-                let mut entries = self.entries.write().await;
-                let shutting_down = self.is_shutdown();
-
-                match result {
+                    .map_err(ApiError::from);
+                let result = match loaded {
                     Ok(mut new_state) => {
-                        // Attempt to load binary index store (v2 only)
+                        // Attempt to load binary index store (v2 only) — still off-lock.
                         let new_binary_store = match load_and_attach_binary_store(
                             &self.backend,
                             self.nameservice_mode.reader(),
@@ -1008,19 +1251,71 @@ impl LedgerManager {
                             }
                         };
 
-                        write_guard.replace(new_state);
-                        // Update binary_store coherently with the new state
-                        *handle.inner.binary_store.lock().await = new_binary_store;
+                        // Brief coherent swap. Lock order: state -> binary_store;
+                        // acquire both before mutating so there is no `.await`
+                        // between the two assignments (no incoherent
+                        // state/binary_store window on cancellation, and readers
+                        // blocked on `state` never observe a half-applied swap).
+                        let mut write_guard = handle.lock_for_write().await;
+                        // Compare total `t()` (novelty included), not `index_t()`:
+                        // this is deliberately novelty-protective. If the reloaded
+                        // state carries a newer persisted index but an older total
+                        // `t` than the in-memory state, we skip the swap and keep
+                        // the fresher novelty — transiently forgoing the newer
+                        // index, which the next reload picks up. Never clobber a
+                        // newer in-memory commit to adopt a newer index.
+                        if new_state.t() >= write_guard.state().t() {
+                            let mut bs_guard = handle.inner.binary_store.write().await;
+                            write_guard.replace(new_state);
+                            *bs_guard = new_binary_store;
+                        } else {
+                            // A concurrent commit advanced the in-memory state
+                            // past the reloaded storage HEAD (a txn took the
+                            // still-valid handle via get_or_load's Reloading
+                            // fast path while we loaded). Keep the fresher
+                            // in-memory state rather than clobber the commit.
+                            tracing::debug!(
+                                ledger_id = %ledger_id,
+                                "reload: in-memory state newer than reloaded storage; skipping swap"
+                            );
+                        }
+                        Ok(())
+                        // state (and binary_store) guards dropped here, before `entries`.
+                    }
+                    Err(e) => Err(e),
+                };
 
+                // Publish under a brief `entries` lock — no `.await` between the
+                // lock and disarm, so the leader can't be cancelled mid-publish.
+                let mut entries = self.entries.write().await;
+                let shutting_down = self.is_shutdown();
+                reload_guard.disarm();
+
+                // Only publish if WE still own the slot (our `Reloading`
+                // generation). If `disconnect` cleared it and a newer reload
+                // inserted a fresh `Reloading`, that slot belongs to the newer
+                // leader; removing/notifying/restoring over it would deliver our
+                // stale success/error to its waiters and clobber it. In that
+                // case do nothing and return our own result to the caller.
+                let owns_slot = matches!(
+                    entries.get(&canonical_alias),
+                    Some(LoadState::Reloading { generation: g, .. }) if *g == generation
+                );
+
+                match result {
+                    Ok(()) => {
                         // Notify waiters and restore Ready state (unless shutting down)
-                        if let Some(LoadState::Reloading { handle, waiters }) =
-                            entries.remove(&canonical_alias)
-                        {
-                            for tx in waiters {
-                                let _ = tx.send(Ok(()));
-                            }
-                            if !shutting_down {
-                                entries.insert(canonical_alias, LoadState::Ready(handle));
+                        if owns_slot {
+                            if let Some(LoadState::Reloading {
+                                handle, waiters, ..
+                            }) = entries.remove(&canonical_alias)
+                            {
+                                for tx in waiters {
+                                    let _ = tx.send(Ok(()));
+                                }
+                                if !shutting_down {
+                                    entries.insert(canonical_alias, LoadState::Ready(handle));
+                                }
                             }
                         }
                         Ok(())
@@ -1028,18 +1323,20 @@ impl LedgerManager {
                     Err(e) => {
                         // Capture error with status code for waiters before consuming the error
                         // Note: Waiters receive Http error (preserving status code); leader gets original type
-                        let error_for_waiters =
-                            Arc::new(ApiError::http(e.status_code(), e.to_string()));
-
-                        // Notify waiters of failure, restore Ready (keep old data) unless shutting down
-                        if let Some(LoadState::Reloading { handle, waiters }) =
-                            entries.remove(&canonical_alias)
-                        {
-                            for tx in waiters {
-                                let _ = tx.send(Err(Arc::clone(&error_for_waiters)));
-                            }
-                            if !shutting_down {
-                                entries.insert(canonical_alias, LoadState::Ready(handle));
+                        if owns_slot {
+                            let error_for_waiters =
+                                Arc::new(ApiError::http(e.status_code(), e.to_string()));
+                            // Notify waiters of failure, restore Ready (keep old data) unless shutting down
+                            if let Some(LoadState::Reloading {
+                                handle, waiters, ..
+                            }) = entries.remove(&canonical_alias)
+                            {
+                                for tx in waiters {
+                                    let _ = tx.send(Err(Arc::clone(&error_for_waiters)));
+                                }
+                                if !shutting_down {
+                                    entries.insert(canonical_alias, LoadState::Ready(handle));
+                                }
                             }
                         }
                         // Leader returns the original error (preserves full type/variant)
@@ -1485,8 +1782,8 @@ impl LedgerManager {
                             let runtime_small_dicts =
                                 Arc::clone(&write_guard.state().runtime_small_dicts);
                             let ns_fallback =
-                                Some(Arc::new(write_guard.state().snapshot.namespaces().clone()));
-                            write_guard.state_mut().snapshot.range_provider =
+                                Some(write_guard.state().snapshot.shared_namespaces());
+                            Arc::make_mut(&mut write_guard.state_mut().snapshot).range_provider =
                                 Some(Arc::new(BinaryRangeProvider::new(
                                     store,
                                     dn,
@@ -1522,18 +1819,20 @@ impl LedgerManager {
 
     /// Returns the cached ledger's current `t`, or `None` if not cached.
     pub async fn current_t(&self, ledger_id: &str) -> Option<i64> {
-        let entries = self.entries.read().await;
-        match entries.get(ledger_id) {
-            Some(LoadState::Ready(handle)) => {
-                let (t, _, _) = handle.state_metrics().await;
-                Some(t)
+        // Clone the handle out and drop the `entries` read guard BEFORE locking
+        // the handle `state` (via state_metrics): never hold `entries` across a
+        // `state` lock, so there is no entries↔state acquisition-order pair to
+        // deadlock with writers. Mirrors `notify`.
+        let handle = {
+            let entries = self.entries.read().await;
+            match entries.get(ledger_id) {
+                Some(LoadState::Ready(handle)) => handle.clone(),
+                Some(LoadState::Reloading { handle, .. }) => handle.clone(),
+                _ => return None,
             }
-            Some(LoadState::Reloading { handle, .. }) => {
-                let (t, _, _) = handle.state_metrics().await;
-                Some(t)
-            }
-            _ => None,
-        }
+        };
+        let (t, _, _) = handle.state_metrics().await;
+        Some(t)
     }
 }
 
@@ -1830,8 +2129,20 @@ mod tests {
         // Directly insert Loading entries (simulates in-flight loads)
         {
             let mut entries = mgr.entries.write().await;
-            entries.insert("ledger_a:main".to_string(), LoadState::Loading(Vec::new()));
-            entries.insert("ledger_b:main".to_string(), LoadState::Loading(Vec::new()));
+            entries.insert(
+                "ledger_a:main".to_string(),
+                LoadState::Loading {
+                    generation: 0,
+                    waiters: Vec::new(),
+                },
+            );
+            entries.insert(
+                "ledger_b:main".to_string(),
+                LoadState::Loading {
+                    generation: 0,
+                    waiters: Vec::new(),
+                },
+            );
         }
 
         // Verify entries exist
@@ -1874,7 +2185,10 @@ mod tests {
             if !mgr.shutdown.load(Ordering::Acquire) {
                 entries.insert(
                     "should_not_appear:main".to_string(),
-                    LoadState::Loading(Vec::new()),
+                    LoadState::Loading {
+                        generation: 0,
+                        waiters: Vec::new(),
+                    },
                 );
             }
         }
@@ -1884,6 +2198,255 @@ mod tests {
             let entries = mgr.entries.read().await;
             assert_eq!(entries.len(), 0);
         }
+    }
+
+    // ========================================================================
+    // Cancellation-safety tests - LoadingLeaderGuard
+    // ========================================================================
+
+    fn make_test_manager() -> LedgerManager {
+        use fluree_db_core::MemoryStorage;
+        use fluree_db_nameservice::memory::MemoryNameService;
+        let backend = StorageBackend::Managed(Arc::new(MemoryStorage::new()));
+        let ns_mode = crate::NameServiceMode::ReadWrite(Arc::new(MemoryNameService::new()));
+        LedgerManager::new(backend, ns_mode, LedgerManagerConfig::default())
+    }
+
+    /// Regression: a leader future cancelled mid-load must NOT orphan its
+    /// `Loading` slot. Before the guard, the slot persisted forever (sweep_idle
+    /// never evicts Loading) and every later caller wedged on `rx.await`.
+    #[tokio::test]
+    async fn test_cancelled_leader_does_not_orphan_loading_slot() {
+        let mgr = make_test_manager();
+        {
+            let mut entries = mgr.entries.write().await;
+            entries.insert(
+                "x:main".to_string(),
+                LoadState::Loading {
+                    generation: 0,
+                    waiters: Vec::new(),
+                },
+            );
+        }
+        // Simulate a leader that inserted Loading then was dropped before publish.
+        {
+            let _guard = LoadingLeaderGuard {
+                entries: Arc::clone(&mgr.entries),
+                alias: "x:main".to_string(),
+                generation: 0,
+                armed: true,
+            };
+            // dropped here WITHOUT disarm() == cancelled leader
+        }
+        // Cleanup is detached; give it a few scheduler turns to run.
+        for _ in 0..20 {
+            tokio::task::yield_now().await;
+            if mgr.entries.read().await.get("x:main").is_none() {
+                break;
+            }
+        }
+        assert!(
+            mgr.entries.read().await.get("x:main").is_none(),
+            "orphaned Loading slot must be reclaimed when the leader future is dropped"
+        );
+    }
+
+    /// A waiter parked on the orphaned slot must unblock (RecvError) when the
+    /// cancelled leader's guard reclaims the slot — not hang to the 900s limit.
+    #[tokio::test]
+    async fn test_waiter_unblocks_when_leader_cancelled() {
+        let mgr = make_test_manager();
+        let (tx, rx) = oneshot::channel::<std::result::Result<LedgerHandle, Arc<ApiError>>>();
+        {
+            let mut entries = mgr.entries.write().await;
+            entries.insert(
+                "x:main".to_string(),
+                LoadState::Loading {
+                    generation: 0,
+                    waiters: vec![tx],
+                },
+            );
+        }
+        {
+            let _guard = LoadingLeaderGuard {
+                entries: Arc::clone(&mgr.entries),
+                alias: "x:main".to_string(),
+                generation: 0,
+                armed: true,
+            };
+        }
+        // Removing the slot drops the sender -> the waiter observes RecvError
+        // instead of hanging forever.
+        let res = tokio::time::timeout(Duration::from_secs(2), rx)
+            .await
+            .expect("waiter must not hang after the leader is cancelled");
+        assert!(
+            res.is_err(),
+            "waiter should receive RecvError once the orphaned slot is reclaimed"
+        );
+    }
+
+    /// A leader that publishes (disarms) must leave its slot intact — the
+    /// guard's drop is a no-op on the success path.
+    #[tokio::test]
+    async fn test_disarmed_guard_leaves_slot_intact() {
+        let mgr = make_test_manager();
+        {
+            let mut entries = mgr.entries.write().await;
+            entries.insert(
+                "x:main".to_string(),
+                LoadState::Loading {
+                    generation: 0,
+                    waiters: Vec::new(),
+                },
+            );
+        }
+        {
+            let mut guard = LoadingLeaderGuard {
+                entries: Arc::clone(&mgr.entries),
+                alias: "x:main".to_string(),
+                generation: 0,
+                armed: true,
+            };
+            guard.disarm();
+        }
+        for _ in 0..5 {
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            mgr.entries.read().await.get("x:main").is_some(),
+            "a disarmed guard must not touch the slot"
+        );
+    }
+
+    /// ABA protection: a stale guard whose original slot was already cleared
+    /// (e.g. by `disconnect`) and replaced by a NEW leader's `Loading` slot
+    /// (different generation) must NOT remove the new leader's slot.
+    #[tokio::test]
+    async fn test_stale_guard_does_not_clobber_new_leader_slot() {
+        let mgr = make_test_manager();
+        // A new leader has inserted a fresh slot with generation 7.
+        {
+            let mut entries = mgr.entries.write().await;
+            entries.insert(
+                "x:main".to_string(),
+                LoadState::Loading {
+                    generation: 7,
+                    waiters: Vec::new(),
+                },
+            );
+        }
+        // A stale guard from a previous, already-cleared load (generation 3)
+        // is dropped now.
+        {
+            let _guard = LoadingLeaderGuard {
+                entries: Arc::clone(&mgr.entries),
+                alias: "x:main".to_string(),
+                generation: 3,
+                armed: true,
+            };
+        }
+        for _ in 0..10 {
+            tokio::task::yield_now().await;
+        }
+        // The new leader's slot (gen 7) must survive the stale guard's cleanup.
+        let entries = mgr.entries.read().await;
+        assert!(
+            matches!(
+                entries.get("x:main"),
+                Some(LoadState::Loading { generation: 7, .. })
+            ),
+            "stale guard (gen 3) must not remove the new leader's slot (gen 7)"
+        );
+    }
+
+    // ========================================================================
+    // Cancellation-safety tests - ReloadLeaderGuard
+    // ========================================================================
+
+    /// Build a minimal cached handle for guard tests (genesis snapshot, empty
+    /// novelty, no binary store).
+    fn make_test_handle(alias: &str) -> LedgerHandle {
+        use fluree_db_core::db::LedgerSnapshot;
+        use fluree_db_novelty::Novelty;
+        let state = LedgerState::new(LedgerSnapshot::genesis(alias), Novelty::new(0));
+        LedgerHandle::new(alias.to_string(), state, None)
+    }
+
+    /// Regression: a reload-leader future cancelled mid-load must not orphan its
+    /// `Reloading` slot (which would stall future reloads/current_t).
+    #[tokio::test]
+    async fn test_cancelled_reload_leader_reclaims_reloading_slot() {
+        let mgr = make_test_manager();
+        let handle = make_test_handle("x:main");
+        {
+            let mut entries = mgr.entries.write().await;
+            entries.insert(
+                "x:main".to_string(),
+                LoadState::Reloading {
+                    generation: 5,
+                    handle: handle.clone(),
+                    waiters: Vec::new(),
+                },
+            );
+        }
+        {
+            let _guard = ReloadLeaderGuard {
+                entries: Arc::clone(&mgr.entries),
+                alias: "x:main".to_string(),
+                generation: 5,
+                armed: true,
+            };
+            // dropped WITHOUT disarm() == cancelled reload leader
+        }
+        for _ in 0..20 {
+            tokio::task::yield_now().await;
+            if mgr.entries.read().await.get("x:main").is_none() {
+                break;
+            }
+        }
+        assert!(
+            mgr.entries.read().await.get("x:main").is_none(),
+            "orphaned Reloading slot must be reclaimed when the reload leader is dropped"
+        );
+    }
+
+    /// ABA: a stale reload guard must not clobber a fresh slot (different
+    /// generation, or a `Loading`/`Ready` a later caller installed).
+    #[tokio::test]
+    async fn test_stale_reload_guard_does_not_clobber_new_slot() {
+        let mgr = make_test_manager();
+        let handle = make_test_handle("x:main");
+        {
+            let mut entries = mgr.entries.write().await;
+            entries.insert(
+                "x:main".to_string(),
+                LoadState::Reloading {
+                    generation: 9,
+                    handle,
+                    waiters: Vec::new(),
+                },
+            );
+        }
+        {
+            let _guard = ReloadLeaderGuard {
+                entries: Arc::clone(&mgr.entries),
+                alias: "x:main".to_string(),
+                generation: 4,
+                armed: true,
+            };
+        }
+        for _ in 0..10 {
+            tokio::task::yield_now().await;
+        }
+        let entries = mgr.entries.read().await;
+        assert!(
+            matches!(
+                entries.get("x:main"),
+                Some(LoadState::Reloading { generation: 9, .. })
+            ),
+            "stale reload guard (gen 4) must not remove the newer slot (gen 9)"
+        );
     }
 
     #[test]

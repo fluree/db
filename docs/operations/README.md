@@ -32,6 +32,21 @@ Storage backend options:
 - Storage selection criteria
 - Switching between storage modes
 
+### [Serverless Storage Choices](serverless-storage.md)
+
+Cloud/serverless storage placement guidance:
+- Standard S3 vs S3 Express One Zone for index storage
+- Why commits should normally remain on Standard S3
+- Expected transaction, query, and indexing latency ranges
+- Lambda disk cache and S3 concurrency tuning notes
+
+### [Hardware sizing: CPU vs disk (benchmark)](hardware-benchmarks.md)
+
+A worked benchmark (SPARQLoscope on ~574 M-triple DBLP) showing how hardware maps to performance:
+- Import is storage-bound — local NVMe imports faster even on slower CPUs
+- Query latency is CPU-bound — served from cache, tracks single-thread speed
+- Sizing guidance: when to prioritize disk vs core vs RAM
+
 ### [IPFS Storage](ipfs-storage.md)
 
 IPFS-specific setup and configuration:

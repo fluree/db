@@ -178,7 +178,8 @@ pub struct Cli {
     pub memory_budget_mb: usize,
 
     /// Number of parallel parse threads for bulk import.
-    /// 0 = auto (system cores, default cap 6). Explicit values are not capped.
+    /// 0 = auto (most logical cores, capped to fit the memory budget).
+    /// Explicit values are honored as-is (not capped), floored at 1.
     #[arg(long, global = true, default_value_t = 0)]
     pub parallelism: usize,
 
@@ -207,8 +208,10 @@ pub enum Commands {
         ledger: String,
 
         /// Import data from a file or directory.
-        /// Accepts a single .ttl, .json, or .jsonld file, or a directory of
-        /// .ttl/.trig or .jsonld files (bulk import, bypasses novelty).
+        /// Accepts a single .ttl, .nt, .nq, .json, or .jsonld file, or a directory
+        /// of .ttl/.nt/.nq/.trig or .jsonld files (bulk import, bypasses novelty).
+        /// Any of these may carry a `.gz` or `.zst` suffix and is decoded
+        /// transparently (e.g. `data.ttl.gz`, `dump.nq.zst`).
         /// Files in a directory are processed in lexicographic order.
         #[arg(long)]
         from: Option<PathBuf>,
@@ -235,7 +238,8 @@ pub enum Commands {
         memory_budget_mb: usize,
 
         /// Number of parallel parse threads for bulk import.
-        /// 0 = auto (system cores, default cap 6). Explicit values are not capped.
+        /// 0 = auto (most logical cores, capped to fit the memory budget).
+        /// Explicit values are honored as-is (not capped), floored at 1.
         #[arg(long, default_value_t = 0)]
         parallelism: usize,
 
@@ -248,6 +252,12 @@ pub enum Commands {
         /// Larger values produce fewer leaf files (shallower tree, bigger reads).
         #[arg(long, default_value_t = 10)]
         leaflets_per_leaf: usize,
+
+        /// Create the ledger on a remote server (by remote name, e.g., "origin").
+        /// Only valid with empty creates — incompatible with --from/--memory.
+        /// Use `fluree publish` if you also need to push local commits.
+        #[arg(long)]
+        remote: Option<String>,
     },
 
     /// Set the active ledger
@@ -285,14 +295,26 @@ pub enum Commands {
         action: BranchAction,
     },
 
-    /// Drop (delete) a ledger
+    /// Drop (delete) a ledger or graph source
     Drop {
-        /// Ledger name to drop
+        /// Ledger or graph source name to drop. The server resolves as a ledger
+        /// first, then as a graph source — `fluree iceberg drop` is the
+        /// explicit graph-source variant.
         name: String,
 
         /// Required flag to confirm deletion
         #[arg(long)]
         force: bool,
+
+        /// Execute against a remote server (by remote name, e.g., "origin")
+        #[arg(long)]
+        remote: Option<String>,
+    },
+
+    /// Manage named graphs within a ledger
+    Graph {
+        #[command(subcommand)]
+        action: GraphAction,
     },
 
     /// Insert data into a ledger
@@ -466,6 +488,83 @@ pub enum Commands {
         #[arg(long)]
         remote: Option<String>,
 
+        /// Report tracking tally (fuel + time + policy) to stderr after results.
+        /// Shorthand for `--track-fuel --track-time --track-policy`.
+        #[arg(long)]
+        track: bool,
+
+        /// Report fuel consumption to stderr after results.
+        /// Implied by --max-fuel.
+        #[arg(long)]
+        track_fuel: bool,
+
+        /// Report query execution time to stderr after results.
+        #[arg(long)]
+        track_time: bool,
+
+        /// Report per-policy executed/allowed counts to stderr after results.
+        #[arg(long)]
+        track_policy: bool,
+
+        /// Abort the query if fuel consumption exceeds this decimal limit
+        /// (e.g. `--max-fuel 1000`). Implies `--track-fuel`.
+        #[arg(long)]
+        max_fuel: Option<f64>,
+
+        #[command(flatten)]
+        policy: PolicyArgs,
+    },
+
+    /// Execute a multi-query envelope (multiple queries against a shared snapshot)
+    ///
+    /// Bundles N JSON-LD and/or SPARQL queries into a single request that
+    /// runs them in parallel against one resolved snapshot moment. Each
+    /// sub-query declares its own `from`; envelope-level `@context` /
+    /// `opts` / `asOf` lift into every sub-query as defaults.
+    ///
+    /// Examples:
+    ///   fluree multi-query envelope.json --remote origin
+    ///   cat envelope.json | fluree multi-query --remote origin
+    ///   fluree multi-query -e '{"queries":{"a":{"language":"jsonld","query":{"from":"mydb","select":["?s"],"where":{"@id":"?s"}}}}}'
+    ///
+    /// See `docs/api/multi-query.md` for the full envelope wire format.
+    #[command(name = "multi-query")]
+    MultiQuery {
+        /// Optional path to envelope JSON file. With 0 args reads from
+        /// stdin (or use -e / -f).
+        #[arg(num_args = 0..=1)]
+        args: Vec<String>,
+
+        /// Inline envelope JSON.
+        #[arg(short = 'e', long = "expr")]
+        expr: Option<String>,
+
+        /// Read envelope from a file.
+        #[arg(short = 'f', long = "file")]
+        file: Option<PathBuf>,
+
+        /// Per-alias result format (`json` or `typed-json`). Matches the
+        /// same flag on `fluree query`. Applies to every alias's result
+        /// inside the envelope's `results` map.
+        #[arg(long, default_value = "json")]
+        format: String,
+
+        /// Normalize arrays: always wrap multi-value JSON-LD properties in
+        /// arrays. Matches the same flag on `fluree query`; applies to
+        /// JSON-LD aliases.
+        #[arg(long)]
+        normalize_arrays: bool,
+
+        /// Envelope display format. `json` (default) prints the response
+        /// envelope as-is; `pretty` indents it; `aliases` prints per-alias
+        /// result sections with status/errors at the top.
+        #[arg(long, default_value = "json")]
+        output: String,
+
+        /// Execute against a remote server (by remote name, e.g., "origin").
+        #[arg(long)]
+        remote: Option<String>,
+
         #[command(flatten)]
         policy: PolicyArgs,
     },
@@ -494,6 +593,10 @@ pub enum Commands {
         /// Output format (json, table, csv, or tsv)
         #[arg(long, default_value = "table")]
         format: String,
+
+        /// Execute against a remote server (by remote name, e.g., "origin")
+        #[arg(long)]
+        remote: Option<String>,
     },
 
     /// Manage the default JSON-LD context for a ledger
@@ -502,17 +605,29 @@ pub enum Commands {
         action: ContextAction,
     },
 
-    /// Export ledger data as Turtle, N-Triples, N-Quads, TriG, or JSON-LD
+    /// Export ledger data as RDF (Turtle, N-Triples, N-Quads, TriG, JSON-LD) or as a `.flpack` archive
     Export {
         /// Ledger name (defaults to active ledger)
         ledger: Option<String>,
 
-        /// Output format: turtle (ttl), ntriples (nt), jsonld, trig, or nquads (default: turtle)
+        /// Output format: turtle (ttl), ntriples (nt), jsonld, trig, nquads,
+        /// or ledger (`.flpack` archive — full ledger including commits and
+        /// indexes, importable via `fluree create --from <file>.flpack`).
         ///
         /// Note: exporting all graphs requires a dataset-capable format
         /// (`trig` or `nquads`).
         #[arg(long, default_value = "turtle")]
         format: String,
+
+        /// Write output to FILE instead of stdout. Required for --format ledger
+        /// when stdout is a TTY (the archive is binary).
+        #[arg(long, short = 'o', value_name = "FILE")]
+        output: Option<std::path::PathBuf>,
+
+        /// For --format ledger only: skip binary index artifacts (smaller archive,
+        /// the importer will need to reindex before queries are efficient).
+        #[arg(long)]
+        no_indexes: bool,
 
         /// Export all named graphs (dataset export), including system graphs.
         ///
@@ -539,6 +654,10 @@ pub enum Commands {
         /// Query at a specific point in time
         #[arg(long)]
         at: Option<String>,
+
+        /// Execute against a remote server (by remote name, e.g., "origin")
+        #[arg(long)]
+        remote: Option<String>,
     },
 
     /// Show commit log for a ledger
@@ -553,6 +672,10 @@ pub enum Commands {
         /// Maximum number of commits to show
         #[arg(short = 'n', long)]
         count: Option<usize>,
+
+        /// Execute against a remote server (by remote name, e.g., "origin")
+        #[arg(long)]
+        remote: Option<String>,
     },
 
     /// Show the contents of a commit (decoded flakes with resolved IRIs)
@@ -743,6 +866,72 @@ pub enum Commands {
     Iceberg {
         #[command(subcommand)]
         action: IcebergAction,
+    },
+}
+
+/// Named-graph subcommands.
+#[derive(Subcommand)]
+pub enum GraphAction {
+    /// List the user-defined named graphs registered on a branch
+    ///
+    /// Reads the `named-graphs` section of the standard `info` payload
+    /// for the targeted branch and, by default, hides the default graph
+    /// and the system `txn-meta` / `config` graphs. Pass
+    /// `--include-system` to show all four kinds.
+    ///
+    /// Examples:
+    ///   fluree graph list
+    ///   fluree graph list --ledger mydb:feature-x
+    ///   fluree graph list --ledger mydb --remote origin
+    ///   fluree graph list --ledger mydb --include-system --json
+    List {
+        /// Ledger identifier (e.g. "mydb" or "mydb:feature-x").
+        /// Defaults to the active ledger.
+        #[arg(long)]
+        ledger: Option<String>,
+
+        /// List graphs on a remote server (by remote name, e.g. "origin")
+        #[arg(long)]
+        remote: Option<String>,
+
+        /// Emit the filtered `named-graphs` JSON array instead of a table.
+        /// The same `--include-system` filter applies as for the table view.
+        #[arg(long)]
+        json: bool,
+
+        /// Include the default graph and the system `txn-meta` / `config`
+        /// graphs in the output. Off by default.
+        #[arg(long)]
+        include_system: bool,
+    },
+
+    /// Drop a named graph from a single branch of a ledger
+    ///
+    /// Issues a transactional retract: every triple currently asserted
+    /// in the target graph is retracted in one new commit. History is
+    /// preserved — queries `as-of` an earlier `t` still see the graph
+    /// populated. The graph IRI remains registered so it can be
+    /// re-populated by a later insert.
+    ///
+    /// Refuses the default graph and the system `txn-meta` / `config`
+    /// graphs.
+    ///
+    /// Examples:
+    ///   fluree graph drop urn:example:org/payroll --ledger mydb
+    ///   fluree graph drop urn:example:org/payroll --ledger mydb:feature-x
+    ///   fluree graph drop urn:example:org/payroll --ledger mydb --remote origin
+    Drop {
+        /// Full IRI of the named graph to drop.
+        iri: String,
+
+        /// Ledger identifier (e.g. "mydb" or "mydb:feature-x").
+        /// Defaults to the active ledger.
+        #[arg(long)]
+        ledger: Option<String>,
+
+        /// Execute against a remote server (by remote name, e.g. "origin")
+        #[arg(long)]
+        remote: Option<String>,
     },
 }
 
@@ -1271,6 +1460,10 @@ pub enum ContextAction {
     Get {
         /// Ledger name (defaults to active ledger)
         ledger: Option<String>,
+
+        /// Read from a remote server (by remote name, e.g., "origin")
+        #[arg(long)]
+        remote: Option<String>,
     },
 
     /// Set (replace) the default JSON-LD context for a ledger
@@ -1290,6 +1483,10 @@ pub enum ContextAction {
         /// Read context from a JSON file
         #[arg(long, short = 'f')]
         file: Option<std::path::PathBuf>,
+
+        /// Write to a remote server (by remote name, e.g., "origin")
+        #[arg(long)]
+        remote: Option<String>,
     },
 }
 

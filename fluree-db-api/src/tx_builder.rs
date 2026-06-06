@@ -16,7 +16,7 @@
 use serde_json::Value as JsonValue;
 
 use crate::error::{BuilderError, BuilderErrors};
-use crate::ledger_manager::LedgerHandle;
+use crate::ledger_manager::{LedgerHandle, RefreshOpts};
 use crate::tx::{IndexingMode, IndexingStatus, StageResult, TransactResult, TransactResultRef};
 use crate::{
     ApiError, Fluree, PolicyContext, Result, TrackedErrorResponse, TrackedTransactionInput,
@@ -25,9 +25,26 @@ use crate::{
 use fluree_db_core::{ContentId, ContentKind};
 use fluree_db_ledger::{IndexConfig, LedgerState, StagedLedger};
 use fluree_db_transact::{
-    parse_trig_phase1, CommitOpts, NamedGraphBlock, NamespaceRegistry, RawTrigMeta, Txn, TxnOpts,
-    TxnType,
+    parse_trig_phase1, CommitOpts, NamedGraphBlock, NamespaceRegistry, RawTrigMeta, TransactError,
+    Txn, TxnOpts, TxnType,
 };
+
+/// Optimistic-concurrency conflicts that are resolved by reconciling the cached
+/// writer state to the current head and re-staging.
+///
+/// A `CommitConflict` / `PublishLostRace` from `commit_staged` means the cached
+/// in-memory `LedgerState` no longer matches the durable nameservice head —
+/// either another writer advanced it, or a prior commit published but a
+/// post-publish bookkeeping step stranded the cache behind the head. Both heal
+/// by `refresh()`-ing to the head and re-staging against fresh state.
+fn is_retryable_commit_conflict(e: &ApiError) -> bool {
+    matches!(
+        e,
+        ApiError::Transact(
+            TransactError::CommitConflict { .. } | TransactError::PublishLostRace { .. }
+        )
+    )
+}
 
 // ============================================================================
 // TransactOperation (private)
@@ -547,9 +564,16 @@ impl<'a> OwnedTransactBuilder<'a> {
 
         // Direct flake path for InsertTurtle
         if let TransactOperation::InsertTurtle(turtle) = op {
+            let tracker = self
+                .core
+                .tracking
+                .clone()
+                .map(Tracker::new)
+                .unwrap_or_else(Tracker::disabled);
+            let tracker_ref = tracker.is_enabled().then_some(&tracker);
             let stage_result = self
                 .fluree
-                .stage_turtle_insert(self.ledger, turtle, Some(&index_config))
+                .stage_turtle_insert(self.ledger, turtle, Some(&index_config), tracker_ref)
                 .await?;
             return Ok(Staged {
                 view: stage_result.view,
@@ -793,8 +817,9 @@ pub(crate) async fn commit_with_handle(
             // Direct flake path for InsertTurtle (bypass JSON-LD / IR)
             if let TransactOperation::InsertTurtle(turtle) = op {
                 let ledger_id = ledger_state.ledger_id().to_string();
+                let tracker_ref = tracker.is_enabled().then_some(&tracker);
                 let stage_result = fluree
-                    .stage_turtle_insert(ledger_state, turtle, Some(&index_config))
+                    .stage_turtle_insert(ledger_state, turtle, Some(&index_config), tracker_ref)
                     .await?;
                 // Spawn raw Turtle upload when explicitly opted-in — overlaps
                 // with the commit prelude (sequencing lookup, envelope apply).
@@ -881,9 +906,36 @@ pub(crate) async fn commit_with_handle(
                     base,
                 )
             } else {
-                fluree
+                match fluree
                     .commit_staged(view, ns_registry, &index_config, commit_opts)
-                    .await?
+                    .await
+                {
+                    Ok(v) => v,
+                    Err(e) => {
+                        // The fast path (pre-built Txn / policy'd staging) cannot
+                        // retry in place — its inputs are already consumed. But if
+                        // the cached writer state fell behind the durable head
+                        // (e.g. a prior commit published but a post-publish step
+                        // stranded the cache), reconcile it to the head before
+                        // returning so a subsequent request is not permanently
+                        // wedged. Release the write lock first — `refresh`
+                        // re-acquires it. (SPARQL UPDATE additionally retries at
+                        // the route layer once the cache is healed.)
+                        if is_retryable_commit_conflict(&e) {
+                            drop(write_guard);
+                            if let Err(refresh_err) = fluree
+                                .refresh(handle.ledger_id(), RefreshOpts::default())
+                                .await
+                            {
+                                tracing::warn!(
+                                    error = %refresh_err,
+                                    "refresh after fast-path commit conflict failed"
+                                );
+                            }
+                        }
+                        return Err(e);
+                    }
+                }
             };
 
         // Compute indexing status
@@ -988,7 +1040,7 @@ pub(crate) async fn commit_with_handle(
                     commit_opts_base.clone()
                 };
                 let stage_result = fluree
-                    .stage_turtle_insert(ledger_state, turtle, Some(&index_config))
+                    .stage_turtle_insert(ledger_state, turtle, Some(&index_config), tracker_ref)
                     .await?;
                 (stage_result, TxnType::Insert, commit_opts)
             }
@@ -1067,9 +1119,36 @@ pub(crate) async fn commit_with_handle(
             });
         }
 
-        let (receipt, mut new_state) = fluree
+        let (receipt, mut new_state) = match fluree
             .commit_staged(view, ns_registry, &index_config, commit_opts)
-            .await?;
+            .await
+        {
+            Ok(v) => v,
+            Err(e) if _attempt + 1 < MAX_RETRIES && is_retryable_commit_conflict(&e) => {
+                // The cached writer state no longer matches the durable head.
+                // Release the write lock, reconcile the cache to the head
+                // (`refresh` applies the missing commit(s) incrementally and
+                // re-acquires the write lock internally — hence the explicit
+                // drop here), then loop to re-stage against the fresh state.
+                drop(write_guard);
+                tracing::warn!(
+                    attempt = _attempt,
+                    error = %e,
+                    "commit conflict; reconciling cached state and retrying"
+                );
+                if let Err(refresh_err) = fluree
+                    .refresh(handle.ledger_id(), RefreshOpts::default())
+                    .await
+                {
+                    tracing::warn!(
+                        error = %refresh_err,
+                        "refresh during commit-conflict retry failed; retrying anyway"
+                    );
+                }
+                continue;
+            }
+            Err(e) => return Err(e),
+        };
 
         let indexing_status = IndexingStatus {
             enabled: fluree.indexing_mode.is_enabled(),

@@ -122,6 +122,25 @@ pub fn projection_sid_okey() -> ColumnProjection {
     }
 }
 
+/// Projection that loads SId + OKey + OI columns (internal, not output).
+///
+/// `OI` (the value/list index) is part of the V3 fact identity
+/// `(s_id, p_id, o_type, o_key, o_i)`, so paths that dedup or retract by fact
+/// identity (e.g. the overlay-merge tail scan) must carry it.
+#[inline]
+pub fn projection_sid_okey_oi() -> ColumnProjection {
+    ColumnProjection {
+        output: ColumnSet::EMPTY,
+        internal: {
+            let mut s = ColumnSet::EMPTY;
+            s.insert(ColumnId::SId);
+            s.insert(ColumnId::OKey);
+            s.insert(ColumnId::OI);
+            s
+        },
+    }
+}
+
 /// Projection that loads SId + OType + OKey columns (internal, not output).
 #[inline]
 pub fn projection_sid_otype_okey() -> ColumnProjection {
@@ -195,6 +214,50 @@ pub fn cursor_projection_sid_only() -> ColumnProjection {
     }
 }
 
+/// Projection for `BinaryCursor` that outputs OType + OKey columns.
+///
+/// Object-only counterpart of [`cursor_projection_sid_otype_okey`] for paths
+/// that fold over object values without needing the subject (e.g. POST-ordered
+/// scalar aggregates). Columns are in `output` as required by `BinaryCursor`.
+#[inline]
+pub fn cursor_projection_otype_okey() -> ColumnProjection {
+    ColumnProjection {
+        output: {
+            let mut s = ColumnSet::EMPTY;
+            s.insert(ColumnId::OType);
+            s.insert(ColumnId::OKey);
+            s
+        },
+        internal: ColumnSet::EMPTY,
+    }
+}
+
+/// True when an object `o_type` is **order-preserving in `o_key`**: the raw
+/// `u64` `o_key` byte order equals the value's semantic order, so a scan of a
+/// single such `o_type` yields rows in value order.
+///
+/// This is the gate for the reverse-POST `ORDER BY DESC(?o) LIMIT k` fast path
+/// (see [`crate::fast_post_order_limit`]). It admits the embedded numeric,
+/// temporal, and boolean types whose encodings are documented order-preserving
+/// in `fluree_db_core::value_id`, and EXCLUDES:
+/// - dict-backed strings/IRIs (`LEX_ID`/`IRI_REF`, tag `10`): ids are assigned
+///   by insertion order, not lexicographic value order;
+/// - lang strings (tag `11`);
+/// - `GEO_POINT` (packed lat/long — not a linear value order) and `BLANK_NODE`;
+/// - overflow big numerics / JSON / vector arena handles (equality-only).
+///
+/// Within one `o_type`, this equals the SPARQL `ORDER BY` order; mixing
+/// `o_type`s under one predicate is rejected by the operator at runtime.
+#[inline]
+pub const fn is_post_desc_orderable(o_type: u16) -> bool {
+    let ot = OType::from_u16(o_type);
+    // XSD_BOOLEAN (0x0002), the signed/unsigned/constrained integers and floats
+    // (is_numeric: 0x0003..=0x0012), and the temporal + duration range
+    // (is_temporal: XSD_DATE 0x0013..=XSD_DURATION 0x001D). Excludes GEO_POINT
+    // (0x001E), BLANK_NODE (0x001F), and every dict-backed/lang/arena type.
+    o_type == OType::XSD_BOOLEAN.as_u16() || ot.is_numeric() || ot.is_temporal()
+}
+
 // ---------------------------------------------------------------------------
 // 3. Leaf range scanning
 // ---------------------------------------------------------------------------
@@ -239,6 +302,102 @@ pub fn leaf_entries_for_predicate(
     let (min_key, max_key) = predicate_range_keys(p_id, g_id);
     let leaf_range = branch.find_leaves_in_range(&min_key, &max_key, cmp);
     &branch.leaves[leaf_range]
+}
+
+/// Minimum total predicate rows before a parallel leaf-chunk scan is worth its
+/// thread-spawn overhead; below this the reducer runs serially on the whole slice.
+const PARALLEL_LEAF_SCAN_MIN_ROWS: u64 = 50_000;
+/// Cap on leaf-chunk worker count regardless of core count.
+const PARALLEL_LEAF_SCAN_MAX_CHUNKS: usize = 16;
+
+/// Run `f` over `items` on the shared global rayon thread pool, preserving order and
+/// the current tracing span, returning each item's result.
+///
+/// This is the multi-tenant-safe replacement for a per-call `std::thread::scope`.
+/// A `scope` spawns fresh OS threads on every invocation, so under concurrent query
+/// load N queries each running a partitioned count/scan spawn up to N×K worker
+/// threads — thrashing a multi-tenant server's scheduler and memory. The global
+/// rayon pool is sized once (≈ logical cores) and shared across every query, so the
+/// total worker-thread count stays bounded no matter how many queries run at once
+/// (matching the pool `fluree-db-novelty` already uses). Like `thread::scope` — and
+/// unlike `thread::spawn` / `spawn_blocking` — rayon's parallel iterator is fully
+/// structured: it blocks until every task finishes, so `f` may borrow non-`'static`
+/// data (the store, the reducer) exactly as the old scoped threads did. A panic in a
+/// worker is converted to an error for that item instead of unwinding the query.
+pub(crate) fn parallel_map_pooled<T, R, F>(items: Vec<T>, f: F) -> Vec<Result<R>>
+where
+    T: Send,
+    R: Send,
+    F: Fn(T) -> Result<R> + Sync + Send,
+{
+    use rayon::prelude::*;
+    let span = tracing::Span::current();
+    items
+        .into_par_iter()
+        .map(|item| {
+            let _guard = span.enter();
+            match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| f(item))) {
+                Ok(result) => result,
+                Err(_) => Err(QueryError::execution("parallel worker panicked")),
+            }
+        })
+        .collect()
+}
+
+/// Partition a predicate's `leaves` into up to `PARALLEL_LEAF_SCAN_MAX_CHUNKS`
+/// contiguous chunks (~one per core) and run `reducer(chunk)` per chunk on the
+/// shared global rayon pool (via [`parallel_map_pooled`]), summing the partials.
+///
+/// Every row lives in exactly one leaflet of one leaf, so counting rows per chunk
+/// and summing is exact for ANY index order — unlike the per-subject
+/// [`crate::count_plan_exec::parallel_partition_count`] (which must partition on
+/// subject boundaries because a subject's rows span leaves), this counts
+/// independent rows and so can split purely on leaf index. `reducer` returns
+/// `Ok(None)` to signal the whole count must defer to the general pipeline (an
+/// unsupported shape, e.g. a non-numeric leaflet); any `None` short-circuits the
+/// result to `Ok(None)`.
+///
+/// When there aren't enough rows/leaves/cores to be worth parallelizing, runs
+/// `reducer` once on the whole slice (identical to a serial scan). BASE index only:
+/// the caller must reach here via [`fast_path_store`] (HEAD, no overlay), so the
+/// base leaflets already reflect current state.
+pub fn parallel_leaf_chunk_count<F>(
+    leaves: &[LeafEntry],
+    total_rows: u64,
+    reducer: F,
+) -> Result<Option<u64>>
+where
+    F: Fn(&[LeafEntry]) -> Result<Option<u64>> + Sync + Send,
+{
+    let ncpu = std::thread::available_parallelism()
+        .map(std::num::NonZeroUsize::get)
+        .unwrap_or(1);
+    let k = ncpu.min(PARALLEL_LEAF_SCAN_MAX_CHUNKS).min(leaves.len());
+    if ncpu < 2 || total_rows < PARALLEL_LEAF_SCAN_MIN_ROWS || k < 2 {
+        // Not worth parallelizing: run the reducer serially over the whole slice.
+        return reducer(leaves);
+    }
+
+    // Contiguous, near-equal leaf chunks (`chunks()` yields ceil(len/per) slices).
+    let per = leaves.len().div_ceil(k);
+    let chunks: Vec<&[LeafEntry]> = leaves.chunks(per).collect();
+    tracing::debug!(
+        chunks = chunks.len(),
+        leaves = leaves.len(),
+        total_rows,
+        "fast-path: parallel leaf-chunk scan"
+    );
+
+    let partials: Vec<Result<Option<u64>>> = parallel_map_pooled(chunks, reducer);
+
+    let mut total: u64 = 0;
+    for partial in partials {
+        match partial? {
+            Some(n) => total = total.saturating_add(n),
+            None => return Ok(None),
+        }
+    }
+    Ok(Some(total))
 }
 
 // ---------------------------------------------------------------------------
@@ -365,14 +524,21 @@ pub fn intersect_many_sorted(mut lists: Vec<Vec<u64>>) -> Vec<u64> {
 // 6. Merge-count
 // ---------------------------------------------------------------------------
 
-/// Count total rows for a predicate by summing PSOT leaflet directory `row_count`.
+/// Count total rows for a predicate from the PSOT branch manifest.
 ///
 /// This is the fastest possible implementation of:
 /// `SELECT (COUNT(*) AS ?c) WHERE { ?s <p> ?o }`
 /// (and also `COUNT(?s)` / `COUNT(?o)` for the same single-triple pattern),
 /// because every solution binding has all vars bound.
 ///
-/// Assumes PSOT leaflets have `p_const` set (so we can filter without loading columns).
+/// A leaf whose `first_key` and `last_key` both belong to `p_id` is *interior* to
+/// the predicate: PSOT order (p_id, s_id, …) means every row in it is `p_id`, so
+/// `LeafEntry.row_count` (the manifest's latest-state row count, which equals the
+/// sum of that leaf's leaflet `row_count`s) IS the predicate's contribution — no
+/// leaf open. Only the at-most-two *boundary* leaves (where the predicate range
+/// starts or ends mid-leaf, mixing predicates) need a directory walk. For a large
+/// predicate (e.g. `rdf:type`, thousands of leaves) this turns thousands of leaf
+/// opens into ~two.
 pub fn count_rows_for_predicate_psot(
     store: &BinaryIndexStore,
     g_id: GraphId,
@@ -382,6 +548,12 @@ pub fn count_rows_for_predicate_psot(
     let mut total: u64 = 0;
 
     for leaf_entry in leaves {
+        // Interior leaf: entirely this predicate → use the manifest count, no open.
+        if leaf_entry.first_key.p_id == p_id && leaf_entry.last_key.p_id == p_id {
+            total += leaf_entry.row_count;
+            continue;
+        }
+        // Boundary leaf: may mix predicates → open and sum the matching leaflets.
         let handle = store
             .open_leaf_handle(&leaf_entry.leaf_cid, leaf_entry.sidecar_cid.as_ref(), false)
             .map_err(|e| QueryError::Internal(format!("leaf open: {e}")))?;
@@ -418,22 +590,47 @@ pub struct PsotSubjectCountIter<'a> {
     /// Accumulated subject for a group that may span leaflet boundaries.
     cur_s: Option<u64>,
     cur_count: u64,
+    /// Half-open subject range `[lo, hi)` this iterator emits. Subjects below
+    /// `lo` are skipped; the first subject `>= hi` ends the stream. Used to
+    /// partition one predicate's subjects across parallel workers.
+    lo: u64,
+    hi: u64,
 }
 
 impl<'a> PsotSubjectCountIter<'a> {
     pub fn new(store: &'a BinaryIndexStore, g_id: GraphId, p_id: u32) -> Result<Self> {
+        Self::new_bounded(store, g_id, p_id, 0, u64::MAX)
+    }
+
+    /// Iterate only the subjects in `[lo, hi)`. Leaves entirely below `lo` are
+    /// skipped via a binary search on the predicate's leaf slice (so a partition
+    /// only opens its own leaves), and iteration ends at the first subject `>= hi`.
+    pub fn new_bounded(
+        store: &'a BinaryIndexStore,
+        g_id: GraphId,
+        p_id: u32,
+        lo: u64,
+        hi: u64,
+    ) -> Result<Self> {
         let leaves = leaf_entries_for_predicate(store, g_id, RunSortOrder::Psot, p_id);
+        // Leaf leapfrog to `lo`: skip leaves whose last subject (for THIS predicate)
+        // is below `lo`. Guarded by `last_key.p_id == p_id` because a boundary
+        // leaf's `last_key` can belong to a higher predicate (see PsotSubjectSeek).
+        let leaf_pos =
+            leaves.partition_point(|e| e.last_key.p_id == p_id && e.last_key.s_id.as_u64() < lo);
         Ok(Self {
             store,
             p_id,
             leaf_entries: leaves,
-            leaf_pos: 0,
+            leaf_pos,
             leaflet_idx: 0,
             row: 0,
             handle: None,
             batch: None,
             cur_s: None,
             cur_count: 0,
+            lo,
+            hi,
         })
     }
 
@@ -475,11 +672,13 @@ impl<'a> PsotSubjectCountIter<'a> {
                         .map_err(|_| QueryError::Internal("leaflet idx exceeds u32".to_string()))?;
                     load_columns_cached_via_handle(
                         handle.as_ref(),
-                        idx,
-                        RunSortOrder::Psot,
                         cache,
-                        handle.leaf_id(),
-                        idx_u32,
+                        fluree_db_binary_index::read::column_loader::LeafletDecodeSpec {
+                            leaf_id: handle.leaf_id(),
+                            leaflet_idx: idx_u32,
+                            order: RunSortOrder::Psot,
+                            decode_set: ColumnSet::ALL,
+                        },
                     )
                     .map_err(|e| QueryError::Internal(format!("load columns: {e}")))?
                 } else {
@@ -521,6 +720,24 @@ impl<'a> PsotSubjectCountIter<'a> {
 
             let sid = batch.s_id.get(self.row);
 
+            // Below the partition's range: skip whole sub-`lo` subjects. Only
+            // possible before the first in-range subject (rows are subject-sorted),
+            // so `cur_s` is None here.
+            if sid < self.lo {
+                self.row += 1;
+                continue;
+            }
+            // At/above the partition's end: no more in-range subjects (sorted), so
+            // flush any accumulated group and end the stream. The `>= hi` row is
+            // left unconsumed (it belongs to the next partition).
+            if sid >= self.hi {
+                if let Some(s) = self.cur_s.take() {
+                    let n = std::mem::take(&mut self.cur_count);
+                    return Ok(Some((s, n)));
+                }
+                return Ok(None);
+            }
+
             match self.cur_s {
                 None => {
                     self.cur_s = Some(sid);
@@ -539,6 +756,196 @@ impl<'a> PsotSubjectCountIter<'a> {
             self.cur_count += 1;
             self.row += 1;
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 7a-seek. Forward-only per-subject PSOT seek (asymmetric-join probe)
+// ---------------------------------------------------------------------------
+
+/// Forward-only monotonic per-subject seek over a predicate's PSOT leaves.
+///
+/// Given **strictly non-decreasing** target subjects, returns the row count for
+/// each (any object datatype) — the probe side of an asymmetric subject join
+/// (drive from the small predicate, seek into the large one). Cost is driven
+/// sub-linear in the probe predicate two ways:
+/// - **leaf leapfrog**: a binary search over the predicate's leaf slice skips
+///   whole leaves — and their blob reads — that cannot contain the target;
+/// - **leaflet skip**: leaflets whose `last_key` subject is below the target are
+///   skipped without decoding their columns.
+///
+/// Subjects whose rows span leaflet/leaf boundaries are handled. Because the
+/// cursor only ever advances, the total work across an ascending target sequence
+/// is one monotonic pass.
+///
+/// PRECONDITION: targets must be non-decreasing across calls (the cursor never
+/// rewinds). BASE index only — callers MUST gate to HEAD (no overlay,
+/// `to_t == max_t`); novelty / time-travel are not merged here.
+pub struct PsotSubjectSeek<'a> {
+    store: &'a BinaryIndexStore,
+    p_id: u32,
+    leaves: &'a [LeafEntry],
+    leaf_pos: usize,
+    leaflet_idx: usize,
+    row: usize,
+    handle: Option<Box<dyn fluree_db_binary_index::read::leaf_access::LeafHandle>>,
+    batch: Option<ColumnBatch>,
+}
+
+impl<'a> PsotSubjectSeek<'a> {
+    pub fn new(store: &'a BinaryIndexStore, g_id: GraphId, p_id: u32) -> Self {
+        let leaves = leaf_entries_for_predicate(store, g_id, RunSortOrder::Psot, p_id);
+        Self {
+            store,
+            p_id,
+            leaves,
+            leaf_pos: 0,
+            leaflet_idx: 0,
+            row: 0,
+            handle: None,
+            batch: None,
+        }
+    }
+
+    fn load_next_batch(&mut self, target_s: u64) -> Result<Option<()>> {
+        use fluree_db_binary_index::format::run_record_v2::read_ordered_key_v2;
+        loop {
+            if self.handle.is_none() {
+                // Leaf leapfrog: skip leaves that provably cannot contain target_s.
+                //
+                // A leaf is skippable only when its `last_key` belongs to THIS
+                // predicate AND its subject is below the target. At the predicate's
+                // upper boundary a leaf's `last_key` may belong to a higher predicate
+                // (our rows are a prefix of that leaf); such a leaf must NOT be
+                // skipped by its foreign subject. `leaf_entries_for_predicate`
+                // guarantees `last_key.p_id >= self.p_id`, so the skip predicate is
+                // a monotone leading run and `partition_point` is valid.
+                let skip = self.leaves[self.leaf_pos..].partition_point(|e| {
+                    e.last_key.p_id == self.p_id && e.last_key.s_id.as_u64() < target_s
+                });
+                self.leaf_pos += skip;
+                if self.leaf_pos >= self.leaves.len() {
+                    return Ok(None);
+                }
+                let leaf_entry = &self.leaves[self.leaf_pos];
+                self.leaf_pos += 1;
+                self.leaflet_idx = 0;
+                self.row = 0;
+                self.batch = None;
+                self.handle = Some(
+                    self.store
+                        .open_leaf_handle(
+                            &leaf_entry.leaf_cid,
+                            leaf_entry.sidecar_cid.as_ref(),
+                            false,
+                        )
+                        .map_err(|e| QueryError::Internal(format!("leaf open: {e}")))?,
+                );
+            }
+
+            let handle = self.handle.as_ref().unwrap();
+            let dir = handle.dir();
+            while self.leaflet_idx < dir.entries.len() {
+                let entry = &dir.entries[self.leaflet_idx];
+                let idx = self.leaflet_idx;
+                self.leaflet_idx += 1;
+                if entry.row_count == 0 || entry.p_const != Some(self.p_id) {
+                    continue;
+                }
+                // Leaflet skip: cannot contain target_s if its last subject is below it.
+                let last = read_ordered_key_v2(RunSortOrder::Psot, &entry.last_key);
+                if last.s_id.as_u64() < target_s {
+                    continue;
+                }
+                let projection = projection_sid_only();
+                let batch = if let Some(cache) = self.store.leaflet_cache() {
+                    let idx_u32: u32 = idx
+                        .try_into()
+                        .map_err(|_| QueryError::Internal("leaflet idx exceeds u32".to_string()))?;
+                    load_columns_cached_via_handle(
+                        handle.as_ref(),
+                        cache,
+                        fluree_db_binary_index::read::column_loader::LeafletDecodeSpec {
+                            leaf_id: handle.leaf_id(),
+                            leaflet_idx: idx_u32,
+                            order: RunSortOrder::Psot,
+                            decode_set: ColumnSet::ALL,
+                        },
+                    )
+                    .map_err(|e| QueryError::Internal(format!("load columns: {e}")))?
+                } else {
+                    handle
+                        .load_columns(idx, &projection, RunSortOrder::Psot)
+                        .map_err(|e| QueryError::Internal(format!("load columns: {e}")))?
+                };
+                self.row = 0;
+                self.batch = Some(batch);
+                return Ok(Some(()));
+            }
+            self.handle = None;
+        }
+    }
+
+    /// Row count for `target_s` (any object datatype), or `None` if the subject is
+    /// absent. Targets MUST be non-decreasing across calls.
+    pub fn count_for_subject(&mut self, target_s: u64) -> Result<Option<u64>> {
+        let mut found = false;
+        let mut count: u64 = 0;
+        loop {
+            if self.batch.is_none() && self.load_next_batch(target_s)?.is_none() {
+                return Ok(found.then_some(count));
+            }
+            let batch = self.batch.as_ref().unwrap();
+            if self.row >= batch.row_count {
+                self.batch = None;
+                continue;
+            }
+            if !found {
+                // Advance to the first row with s_id >= target_s. Within a leaflet
+                // s_id is sorted, so binary-search the unconsumed suffix instead of
+                // skipping row-by-row — cheap when the target is far in, e.g. when a
+                // sparse driver seeks past a high-multiplicity subject's run.
+                let (mut lo, mut hi) = (self.row, batch.row_count);
+                while lo < hi {
+                    let mid = lo + (hi - lo) / 2;
+                    if batch.s_id.get(mid) < target_s {
+                        lo = mid + 1;
+                    } else {
+                        hi = mid;
+                    }
+                }
+                self.row = lo;
+                if self.row >= batch.row_count {
+                    self.batch = None;
+                    continue;
+                }
+                if batch.s_id.get(self.row) > target_s {
+                    // Cursor is now parked at the first subject above target_s, ready
+                    // for the next (larger) target. Subject is absent.
+                    return Ok(None);
+                }
+                found = true;
+            } else if batch.s_id.get(self.row) > target_s {
+                return Ok(Some(count));
+            }
+            // At target_s: count its rows (the group may span batches).
+            while self.row < batch.row_count && batch.s_id.get(self.row) == target_s {
+                count = count
+                    .checked_add(1)
+                    .ok_or_else(|| QueryError::execution("COUNT(*) overflow in subject seek"))?;
+                self.row += 1;
+            }
+            if self.row < batch.row_count {
+                return Ok(Some(count));
+            }
+            // Subject group may continue into the next leaflet/leaf.
+            self.batch = None;
+        }
+    }
+
+    /// Whether `target_s` has any row. Targets MUST be non-decreasing across calls.
+    pub fn subject_present(&mut self, target_s: u64) -> Result<bool> {
+        Ok(self.count_for_subject(target_s)?.is_some())
     }
 }
 
@@ -621,11 +1028,13 @@ impl<'a> PostObjectGroupCountIter<'a> {
                         .map_err(|_| QueryError::Internal("leaflet idx exceeds u32".to_string()))?;
                     load_columns_cached_via_handle(
                         handle.as_ref(),
-                        idx,
-                        RunSortOrder::Post,
                         cache,
-                        handle.leaf_id(),
-                        idx_u32,
+                        fluree_db_binary_index::read::column_loader::LeafletDecodeSpec {
+                            leaf_id: handle.leaf_id(),
+                            leaflet_idx: idx_u32,
+                            order: RunSortOrder::Post,
+                            decode_set: ColumnSet::ALL,
+                        },
                     )
                     .map_err(|e| QueryError::Internal(format!("load columns: {e}")))?
                 } else {
@@ -846,11 +1255,13 @@ impl<'a> PsotSubjectWeightedSumIter<'a> {
                         .map_err(|_| QueryError::Internal("leaflet idx exceeds u32".to_string()))?;
                     load_columns_cached_via_handle(
                         handle.as_ref(),
-                        idx,
-                        RunSortOrder::Psot,
                         cache,
-                        handle.leaf_id(),
-                        idx_u32,
+                        fluree_db_binary_index::read::column_loader::LeafletDecodeSpec {
+                            leaf_id: handle.leaf_id(),
+                            leaflet_idx: idx_u32,
+                            order: RunSortOrder::Psot,
+                            decode_set: ColumnSet::ALL,
+                        },
                     )
                     .map_err(|e| QueryError::Internal(format!("load columns: {e}")))?
                 } else {
@@ -1330,13 +1741,202 @@ pub fn sum_post_object_counts_filtered(
 // 8. BinaryCursor construction
 // ---------------------------------------------------------------------------
 
-/// Build a `BinaryCursor` for a single predicate in PSOT order with overlay support.
+/// Construct a `BinaryCursor` over an explicit key range + filter in `order`,
+/// without overlay merging or `to_t` filtering.
 ///
-/// This is the cursor-based counterpart of the leaf-entry iterators in sections 7/7b.
-/// It supports overlay merging (uncommitted flakes), so it works even when
-/// `ctx.overlay` is set — unlike the raw leaf-entry scan which requires `fast_path_store`.
+/// Lowest-level shared cursor constructor: looks up the branch for `order` and,
+/// on success, builds the cursor. Callers are responsible for `set_to_t` (and
+/// any overlay wiring) afterwards. Returns `None` when the branch for `order`
+/// does not exist for `g_id`.
 ///
-/// Returns `None` if the PSOT branch does not exist for the given graph.
+/// Used directly by object-/subject-range-bounded fast paths
+/// (`fast_string_prefix_count_all`, `fast_star_const_order_topk`) and as the
+/// base of [`build_overlay_cursor_for_predicate`].
+pub fn build_range_cursor(
+    store: &Arc<BinaryIndexStore>,
+    g_id: GraphId,
+    order: RunSortOrder,
+    min_key: &RunRecordV2,
+    max_key: &RunRecordV2,
+    filter: BinaryFilter,
+    projection: ColumnProjection,
+) -> Option<BinaryCursor> {
+    let branch = Arc::clone(store.branch_for_order(g_id, order)?);
+    Some(BinaryCursor::new(
+        Arc::clone(store),
+        order,
+        branch,
+        min_key,
+        max_key,
+        filter,
+        projection,
+    ))
+}
+
+/// Collect the novelty-overlay ops for a single predicate, translated into the
+/// binary-index `OverlayOp` representation and sorted/resolved for `order`.
+///
+/// Returns `Ok(Some(ops))` on success (`ops` may be empty), or `Ok(None)` when
+/// any flake fails to translate — in which case the caller must disable the
+/// fast path for correctness. Only meaningful when an overlay carrying novelty
+/// is present (`epoch != 0`).
+pub fn collect_resolved_overlay_ops(
+    ctx: &ExecutionContext<'_>,
+    store: &Arc<BinaryIndexStore>,
+    g_id: GraphId,
+    order: RunSortOrder,
+    pred_sid: &Sid,
+) -> Result<Option<Vec<fluree_db_binary_index::read::types::OverlayOp>>> {
+    use std::collections::HashMap;
+    let dn = ctx.dict_novelty.clone().unwrap_or_else(|| {
+        Arc::new(fluree_db_core::dict_novelty::DictNovelty::new_uninitialized())
+    });
+    let mut ephemeral_preds = HashMap::new();
+    let mut next_ep = store.predicate_count();
+    let mut ops = Vec::new();
+    let mut translate_failed = false;
+    let mut translate_fail_count: u32 = 0;
+
+    ctx.overlay().for_each_overlay_flake(
+        g_id,
+        crate::binary_scan::sort_order_to_index_type(order),
+        None,
+        None,
+        true,
+        ctx.to_t,
+        &mut |flake| {
+            if flake.p != *pred_sid {
+                return;
+            }
+            match crate::binary_scan::translate_one_flake_v3_pub(
+                flake,
+                store,
+                Some(&dn),
+                ctx.runtime_small_dicts,
+                &mut ephemeral_preds,
+                &mut next_ep,
+                g_id,
+            ) {
+                Ok(op) => ops.push(op),
+                Err(e) => {
+                    translate_failed = true;
+                    translate_fail_count = translate_fail_count.saturating_add(1);
+                    if translate_fail_count == 1 {
+                        tracing::warn!(
+                            error = %e,
+                            s = %flake.s,
+                            p = %flake.p,
+                            t = flake.t,
+                            op = flake.op,
+                            "fast-path cursor: overlay flake translation failed; disabling fast path for correctness"
+                        );
+                    }
+                }
+            }
+        },
+    );
+
+    if translate_failed {
+        tracing::debug!(
+            failures = translate_fail_count,
+            "fast-path cursor: falling back due to overlay translation failures"
+        );
+        return Ok(None);
+    }
+
+    if !ops.is_empty() {
+        fluree_db_binary_index::read::types::sort_overlay_ops(&mut ops, order);
+        fluree_db_binary_index::read::types::resolve_overlay_ops(&mut ops);
+    }
+    Ok(Some(ops))
+}
+
+/// Build a per-predicate `BinaryCursor` in `order`, folding in the novelty
+/// overlay and honoring `to_t`.
+///
+/// `order` must be a *predicate-bounded* order — [`RunSortOrder::Psot`] or
+/// [`RunSortOrder::Post`] — because both place `p_id` first in their key, so
+/// [`predicate_range_keys`] bounds the scan to one predicate. `Opst` is
+/// object-keyed (its `p_id` is not a primary key component) and is intentionally
+/// unsupported here; object-ordered cursors must be range-bounded by object
+/// instead (see `fast_string_prefix_count_all::count_prefix_rows_opst`).
+///
+/// Unlike the raw leaf-entry scans, this folds uncommitted overlay flakes into
+/// the cursor, so it stays correct when `ctx.overlay` carries novelty or when
+/// `ctx.to_t < max_t` — operators using it should gate on
+/// [`allow_cursor_fast_path`], not [`fast_path_store`]. Returns `None` if the
+/// branch for `order` is absent, or if an overlay flake fails to translate (fast
+/// path disabled for correctness).
+pub fn build_overlay_cursor_for_predicate(
+    ctx: &ExecutionContext<'_>,
+    store: &Arc<BinaryIndexStore>,
+    g_id: GraphId,
+    order: RunSortOrder,
+    pred_sid: Sid,
+    p_id: u32,
+    projection: ColumnProjection,
+) -> Result<Option<BinaryCursor>> {
+    debug_assert!(
+        matches!(order, RunSortOrder::Psot | RunSortOrder::Post),
+        "build_overlay_cursor_for_predicate requires a p_id-primary order \
+         (Psot or Post); got {order:?}"
+    );
+
+    // When an overlay merge can run, `merge_overlay_into_batch` needs the full
+    // V3 identity (s_id, p_id, o_type, o_key, o_i) on every base row. Narrow
+    // count projections (SId-only, OType+OKey) omit some, which would read as
+    // `AbsentDefault` and corrupt the identity compare. Force the identity
+    // columns into `internal` so they're loaded for the merge but dropped before
+    // the returned batch — the output shape the count operators see is
+    // unchanged. (Production masks this via the cache's `all()` load; a
+    // cache-less store would miscount. See `BinaryCursor::set_overlay_ops`.)
+    let overlay_active = ctx.overlay.is_some() && ctx.overlay().epoch() != 0;
+    let projection = if overlay_active {
+        let identity = ColumnSet::CORE.union(ColumnSet::single(ColumnId::OI));
+        ColumnProjection {
+            output: projection.output,
+            // Don't duplicate columns already materialized in `output`.
+            internal: ColumnSet(projection.internal.union(identity).0 & !projection.output.0),
+        }
+    } else {
+        projection
+    };
+
+    let (min_key, max_key) = predicate_range_keys(p_id, g_id);
+    let filter = BinaryFilter {
+        p_id: Some(p_id),
+        ..Default::default()
+    };
+    let Some(mut cursor) =
+        build_range_cursor(store, g_id, order, &min_key, &max_key, filter, projection)
+    else {
+        return Ok(None);
+    };
+    cursor.set_to_t(ctx.to_t);
+
+    // Fold the novelty overlay in. Skip the walk entirely when there is no
+    // novelty (epoch 0): the persisted index alone is then exact.
+    if ctx.overlay.is_some() {
+        let epoch = ctx.overlay().epoch();
+        if epoch != 0 {
+            match collect_resolved_overlay_ops(ctx, store, g_id, order, &pred_sid)? {
+                Some(ops) => {
+                    if !ops.is_empty() {
+                        cursor.set_overlay_ops(ops);
+                    }
+                }
+                None => return Ok(None),
+            }
+        }
+        cursor.set_epoch(epoch);
+    }
+
+    Ok(Some(cursor))
+}
+
+/// Build a per-predicate PSOT overlay cursor (subject-ordered within the
+/// predicate). Thin wrapper over [`build_overlay_cursor_for_predicate`].
+#[inline]
 pub fn build_psot_cursor_for_predicate(
     ctx: &ExecutionContext<'_>,
     store: &Arc<BinaryIndexStore>,
@@ -1345,96 +1945,454 @@ pub fn build_psot_cursor_for_predicate(
     p_id: u32,
     projection: ColumnProjection,
 ) -> Result<Option<BinaryCursor>> {
-    let Some(branch) = store.branch_for_order(g_id, RunSortOrder::Psot) else {
-        return Ok(None);
-    };
-    let branch = Arc::clone(branch);
+    build_overlay_cursor_for_predicate(
+        ctx,
+        store,
+        g_id,
+        RunSortOrder::Psot,
+        pred_sid,
+        p_id,
+        projection,
+    )
+}
 
-    let (min_key, max_key) = predicate_range_keys(p_id, g_id);
+/// Build a per-predicate POST overlay cursor (object-ordered within the
+/// predicate). Thin wrapper over [`build_overlay_cursor_for_predicate`].
+///
+/// POST groups rows by `(o_type, o_key)` within the predicate, so adjacent rows
+/// share an object — the natural shape for object-folding aggregates and
+/// distinct-object counts that must stay overlay-correct.
+#[inline]
+pub fn build_post_cursor_for_predicate(
+    ctx: &ExecutionContext<'_>,
+    store: &Arc<BinaryIndexStore>,
+    g_id: GraphId,
+    pred_sid: Sid,
+    p_id: u32,
+    projection: ColumnProjection,
+) -> Result<Option<BinaryCursor>> {
+    build_overlay_cursor_for_predicate(
+        ctx,
+        store,
+        g_id,
+        RunSortOrder::Post,
+        pred_sid,
+        p_id,
+        projection,
+    )
+}
+
+/// Build an overlay-folding PSOT cursor bounded to the subject range `[lo, hi)`,
+/// using `sliced_ops` (the predicate's resolved overlay ops already restricted to
+/// `[lo, hi)`) rather than re-collecting them. This is the per-partition primitive
+/// for parallelizing an overlay count: the partition harness hands each worker a
+/// subject range, and each worker scans only its leaves and merges only its ops.
+///
+/// Takes `to_t`/`epoch` as values (not `&ExecutionContext`) so the caller can hoist
+/// them out of the parallel region and keep the reducer `Sync`. The cursor's leaf
+/// range is bounded by the keys, but rows are filtered only by `p_id`, so a boundary
+/// leaf shared with an adjacent partition still emits its out-of-range subjects — the
+/// caller MUST drop rows with `s_id < lo || s_id >= hi` so each subject is counted by
+/// exactly one partition. Returns `None` if the PSOT branch is absent.
+#[allow(clippy::too_many_arguments)]
+pub fn build_overlay_cursor_for_subject_range(
+    store: &Arc<BinaryIndexStore>,
+    g_id: GraphId,
+    p_id: u32,
+    projection: ColumnProjection,
+    lo: u64,
+    hi: u64,
+    sliced_ops: Vec<fluree_db_binary_index::read::types::OverlayOp>,
+    to_t: i64,
+    epoch: u64,
+) -> Option<BinaryCursor> {
+    let overlay_active = epoch != 0;
+    // Identity columns must be present for merge_overlay_into_batch (see
+    // build_overlay_cursor_for_predicate / set_overlay_ops).
+    let projection = if overlay_active {
+        let identity = ColumnSet::CORE.union(ColumnSet::single(ColumnId::OI));
+        ColumnProjection {
+            output: projection.output,
+            internal: ColumnSet(projection.internal.union(identity).0 & !projection.output.0),
+        }
+    } else {
+        projection
+    };
+
+    let (mut min_key, mut max_key) = predicate_range_keys(p_id, g_id);
+    min_key.s_id = SubjectId(lo);
+    // Upper bound: smallest key at subject `hi` (exclusive `hi` is enforced by the
+    // caller's per-row filter; this only narrows the scanned leaf range).
+    max_key.s_id = SubjectId(hi);
+    max_key.o_key = 0;
+    max_key.o_type = 0;
+    max_key.o_i = 0;
+    max_key.t = 0;
 
     let filter = BinaryFilter {
         p_id: Some(p_id),
         ..Default::default()
     };
-
-    let mut cursor = BinaryCursor::new(
-        Arc::clone(store),
+    let mut cursor = build_range_cursor(
+        store,
+        g_id,
         RunSortOrder::Psot,
-        branch,
         &min_key,
         &max_key,
         filter,
         projection,
-    );
-    cursor.set_to_t(ctx.to_t);
-
-    // Overlay merge — pre-filter by predicate.
-    if ctx.overlay.is_some() {
-        use std::collections::HashMap;
-        let dn = ctx.dict_novelty.clone().unwrap_or_else(|| {
-            Arc::new(fluree_db_core::dict_novelty::DictNovelty::new_uninitialized())
-        });
-        let mut ephemeral_preds = HashMap::new();
-        let mut next_ep = store.predicate_count();
-        let mut ops = Vec::new();
-        let mut translate_failed = false;
-        let mut translate_fail_count: u32 = 0;
-
-        ctx.overlay().for_each_overlay_flake(
-            g_id,
-            fluree_db_core::IndexType::Psot,
-            None,
-            None,
-            true,
-            ctx.to_t,
-            &mut |flake| {
-                if flake.p != pred_sid {
-                    return;
-                }
-                match crate::binary_scan::translate_one_flake_v3_pub(
-                    flake,
-                    store,
-                    Some(&dn),
-                    ctx.runtime_small_dicts,
-                    &mut ephemeral_preds,
-                    &mut next_ep,
-                    g_id,
-                ) {
-                    Ok(op) => ops.push(op),
-                    Err(e) => {
-                        translate_failed = true;
-                        translate_fail_count = translate_fail_count.saturating_add(1);
-                        if translate_fail_count == 1 {
-                            tracing::warn!(
-                                error = %e,
-                                s = %flake.s,
-                                p = %flake.p,
-                                t = flake.t,
-                                op = flake.op,
-                                "fast-path cursor: overlay flake translation failed; disabling fast path for correctness"
-                            );
-                        }
-                    }
-                }
-            },
-        );
-        if translate_failed {
-            tracing::debug!(
-                failures = translate_fail_count,
-                "fast-path cursor: falling back due to overlay translation failures"
-            );
-            return Ok(None);
+    )?;
+    cursor.set_to_t(to_t);
+    if overlay_active {
+        if !sliced_ops.is_empty() {
+            cursor.set_overlay_ops(sliced_ops);
         }
+        cursor.set_epoch(epoch);
+    }
+    Some(cursor)
+}
 
-        if !ops.is_empty() {
-            fluree_db_binary_index::read::types::sort_overlay_ops(&mut ops, RunSortOrder::Psot);
-            fluree_db_binary_index::read::types::resolve_overlay_ops(&mut ops);
-            cursor.set_overlay_ops(ops);
+/// Slice a predicate's resolved overlay ops (sorted in PSOT order, i.e. by
+/// `(p_id, s_id, …)` for a single predicate) to those with `s_id ∈ [lo, hi)`.
+/// Since the ops are sorted by `s_id`, this is two binary searches.
+pub fn slice_overlay_ops_by_subject(
+    ops: &[fluree_db_binary_index::read::types::OverlayOp],
+    lo: u64,
+    hi: u64,
+) -> Vec<fluree_db_binary_index::read::types::OverlayOp> {
+    let start = ops.partition_point(|o| o.s_id < lo);
+    let end = ops.partition_point(|o| o.s_id < hi);
+    ops[start..end].to_vec()
+}
+
+/// Streams `(s_id, edge_count)` groups from an overlay-merging PSOT cursor.
+///
+/// The cursor yields rows in PSOT order, so a running group-by on `s_id`
+/// produces the same `(subject, count)` pairs that the metadata
+/// [`PsotSubjectCountIter`] derives from leaflet headers — but over the
+/// novelty-merged row stream. Shared by `fast_union_star_count_all` and the
+/// `count_plan_exec` overlay lane.
+///
+/// Use `cursor_projection_sid_only()` (or any projection that includes `s_id`)
+/// when building the cursor.
+pub struct CursorSubjectCountStream {
+    cursor: BinaryCursor,
+    current: Option<ColumnBatch>,
+    row: usize,
+    cur_s: Option<u64>,
+    cur_count: u64,
+}
+
+impl CursorSubjectCountStream {
+    pub fn new(cursor: BinaryCursor) -> Self {
+        Self {
+            cursor,
+            current: None,
+            row: 0,
+            cur_s: None,
+            cur_count: 0,
         }
-        cursor.set_epoch(ctx.overlay().epoch());
     }
 
-    Ok(Some(cursor))
+    /// Next `(subject_id, row_count)` group, or `None` when exhausted.
+    pub fn next_group(&mut self) -> Result<Option<(u64, u64)>> {
+        loop {
+            if self.current.is_none() {
+                self.current = self
+                    .cursor
+                    .next_batch()
+                    .map_err(|e| QueryError::Internal(format!("cursor batch: {e}")))?;
+                self.row = 0;
+                if self.current.is_none() {
+                    if let Some(s) = self.cur_s.take() {
+                        let n = std::mem::take(&mut self.cur_count);
+                        return Ok(Some((s, n)));
+                    }
+                    return Ok(None);
+                }
+            }
+
+            let batch = self.current.as_ref().unwrap();
+            if self.row >= batch.row_count {
+                self.current = None;
+                continue;
+            }
+            let s = batch.s_id.get(self.row);
+            if self.cur_s.is_none() {
+                self.cur_s = Some(s);
+                self.cur_count = 0;
+            } else if self.cur_s != Some(s) {
+                let out_s = self.cur_s.replace(s).unwrap();
+                let out_n = std::mem::replace(&mut self.cur_count, 0);
+                // Don't advance row; reprocess it into the new group.
+                return Ok(Some((out_s, out_n)));
+            }
+            self.cur_count += 1;
+            self.row += 1;
+        }
+    }
+}
+
+/// Count rows of `p_id` (scanned in `order`) for which `per_row(s_id, o_type, o_key)`
+/// returns `Some(true)`, reading through an overlay-folding cursor so the count
+/// includes novelty asserts, excludes retracts, and honors `to_t`.
+///
+/// This is the overlay/time-travel lane for the single-predicate filter-COUNT fast
+/// paths: the caller gates on [`allow_cursor_fast_path`] and uses this when there is
+/// novelty or `to_t < max_t`; the HEAD lane keeps its faster base-leaflet scan and
+/// metadata shortcuts. `per_row` returning `None` aborts and yields `Ok(None)`, so a
+/// row the predicate can't classify (e.g. a non-numeric object under a numeric
+/// compare) defers to the operator's fallback — matching the base path's bail. Also
+/// returns `Ok(None)` when the cursor can't be built (branch absent for `order`, or
+/// an overlay flake fails to translate).
+pub fn count_rows_via_overlay_cursor<P>(
+    ctx: &ExecutionContext<'_>,
+    store: &Arc<BinaryIndexStore>,
+    g_id: GraphId,
+    order: RunSortOrder,
+    pred_sid: Sid,
+    p_id: u32,
+    mut per_row: P,
+) -> Result<Option<u64>>
+where
+    P: FnMut(u64, u16, u64) -> Option<bool>,
+{
+    let Some(mut cursor) = build_overlay_cursor_for_predicate(
+        ctx,
+        store,
+        g_id,
+        order,
+        pred_sid,
+        p_id,
+        cursor_projection_sid_otype_okey(),
+    )?
+    else {
+        return Ok(None);
+    };
+    let mut total: u64 = 0;
+    while let Some(batch) = cursor
+        .next_batch()
+        .map_err(|e| QueryError::Internal(format!("cursor batch: {e}")))?
+    {
+        for r in 0..batch.row_count {
+            match per_row(batch.s_id.get(r), batch.o_type.get(r), batch.o_key.get(r)) {
+                Some(true) => total = total.saturating_add(1),
+                Some(false) => {}
+                None => return Ok(None),
+            }
+        }
+    }
+    Ok(Some(total))
+}
+
+/// Parallel overlay/time-travel COUNT of rows of `p_id` (PSOT) matching
+/// `per_row(s_id, o_type, o_key)`, folding novelty correctly.
+///
+/// Partitions the subject space with the shared [`crate::count_plan_exec::parallel_partition_count`]
+/// harness (so the base scan runs across the global rayon pool, like the HEAD path),
+/// and gives each partition a *bounded overlay cursor* — its leaf range plus the
+/// novelty ops sliced to its subject range — reusing `merge_overlay_into_batch`. A
+/// per-row `[lo, hi)` filter keeps boundary subjects (shared leaves) counted once.
+/// The overlay ops are collected once up front and only sliced per partition (cheap;
+/// novelty is small). Below the parallel threshold, falls back to the serial
+/// whole-predicate overlay cursor. Returns `Ok(None)` to defer (an overlay flake
+/// failed to translate).
+pub fn parallel_overlay_psot_filter_count<P>(
+    ctx: &ExecutionContext<'_>,
+    store: &Arc<BinaryIndexStore>,
+    g_id: GraphId,
+    pred_sid: Sid,
+    p_id: u32,
+    per_row: P,
+) -> Result<Option<u64>>
+where
+    P: Fn(u64, u16, u64) -> bool + Sync + Send,
+{
+    // Collect + resolve the predicate's overlay ops once (serial; novelty is small).
+    let ops = match collect_resolved_overlay_ops(ctx, store, g_id, RunSortOrder::Psot, &pred_sid)? {
+        Some(o) => o,
+        None => return Ok(None),
+    };
+    let to_t = ctx.to_t;
+    let epoch = ctx.overlay.as_ref().map(|o| o.epoch()).unwrap_or(0);
+    let total_rows = count_rows_for_predicate_psot(store, g_id, p_id)?;
+
+    let ops_ref = &ops;
+    let per_row_ref = &per_row;
+    let parallel = crate::count_plan_exec::parallel_partition_count(
+        store,
+        g_id,
+        p_id,
+        total_rows,
+        move |lo, hi| {
+            let sliced = slice_overlay_ops_by_subject(ops_ref, lo, hi);
+            let Some(mut cursor) = build_overlay_cursor_for_subject_range(
+                store,
+                g_id,
+                p_id,
+                cursor_projection_sid_otype_okey(),
+                lo,
+                hi,
+                sliced,
+                to_t,
+                epoch,
+            ) else {
+                return Ok(0u128);
+            };
+            let mut total: u128 = 0;
+            while let Some(batch) = cursor
+                .next_batch()
+                .map_err(|e| QueryError::Internal(format!("cursor batch: {e}")))?
+            {
+                for r in 0..batch.row_count {
+                    let s = batch.s_id.get(r);
+                    if s < lo || s >= hi {
+                        continue; // boundary leaf shared with an adjacent partition
+                    }
+                    if per_row_ref(s, batch.o_type.get(r), batch.o_key.get(r)) {
+                        total = total.saturating_add(1);
+                    }
+                }
+            }
+            Ok(total)
+        },
+    )?;
+
+    match parallel {
+        Some(n) => Ok(Some(n)),
+        // Below the parallel threshold: serial whole-predicate overlay cursor.
+        None => count_rows_via_overlay_cursor(
+            ctx,
+            store,
+            g_id,
+            RunSortOrder::Psot,
+            pred_sid,
+            p_id,
+            |s, ot, ok| Some(per_row(s, ot, ok)),
+        ),
+    }
+}
+
+/// Overlay COUNT(*) of a predicate via a **novelty-delta**, for the common
+/// live-write case (`epoch != 0`, HEAD): `base_total − base(touched) + merged(touched)`.
+///
+/// At HEAD the predicate count is metadata-only (instant). Under novelty the cursor
+/// path would rescan the whole predicate to fold a few uncommitted rows. Instead:
+/// only the per-leaf subject ranges that novelty actually touches are rescanned
+/// (base via the bounded iterator, merged via the bounded overlay cursor — the
+/// proven `merge_overlay_into_batch`); every untouched leaf keeps its instant
+/// manifest count (`base_total − base(touched)`). So the work is proportional to the
+/// novelty's footprint, not the predicate size.
+///
+/// CALLER GATE: only valid for `to_t == max_t` (no time-travel replay) and
+/// `epoch != 0`; the base manifest count is the current-state base count only then.
+/// Returns `Ok(None)` to defer (overlay flake failed to translate). Returns the
+/// plain manifest count when there is no novelty for the predicate.
+pub fn count_predicate_overlay_delta(
+    ctx: &ExecutionContext<'_>,
+    store: &Arc<BinaryIndexStore>,
+    g_id: GraphId,
+    pred_sid: Sid,
+    p_id: u32,
+) -> Result<Option<u64>> {
+    let ops = match collect_resolved_overlay_ops(ctx, store, g_id, RunSortOrder::Psot, &pred_sid)? {
+        Some(o) => o,
+        None => return Ok(None),
+    };
+    let base_total = count_rows_for_predicate_psot(store, g_id, p_id)?;
+    if ops.is_empty() {
+        return Ok(Some(base_total));
+    }
+    let to_t = ctx.to_t;
+    let epoch = ctx.overlay.as_ref().map(|o| o.epoch()).unwrap_or(0);
+    let leaves = leaf_entries_for_predicate(store, g_id, RunSortOrder::Psot, p_id);
+
+    // Per-leaf subject ranges [lo, hi); the last extends to MAX so novelty subjects
+    // beyond the base's last leaf land in (and are scanned by) the final range.
+    let mut base_touched: u64 = 0;
+    let mut merged_touched: u64 = 0;
+    let mut op_idx = 0usize;
+    let n = leaves.len();
+    for i in 0..n {
+        // The first leaf's range starts at 0 (mirroring `parallel_partition_count`'s
+        // `bounds[0] == 0`) so novelty ops below the predicate's first indexed subject
+        // — a low-id subject newly gaining this predicate — fall into leaf 0's range
+        // and are merged in, rather than being skipped by the op-cursor advance below
+        // and silently undercounted.
+        let lo = if i == 0 {
+            0
+        } else {
+            leaves[i].first_key.s_id.as_u64()
+        };
+        let hi = if i + 1 < n {
+            leaves[i + 1].first_key.s_id.as_u64()
+        } else {
+            u64::MAX
+        };
+        // Ops with s_id in [lo, hi). Ops are sorted by s_id; advance the cursor.
+        while op_idx < ops.len() && ops[op_idx].s_id < lo {
+            op_idx += 1;
+        }
+        let start = op_idx;
+        let mut end = op_idx;
+        while end < ops.len() && ops[end].s_id < hi {
+            end += 1;
+        }
+        if end == start {
+            continue; // untouched leaf — its rows are covered by base_total
+        }
+        op_idx = end;
+
+        // Base count of this touched leaf: the manifest `row_count` for an interior
+        // leaf (no open); a boundary leaf (shared with an adjacent predicate) opens
+        // and sums its p_id leaflets. Only the merged pass below opens the leaf, so
+        // the worst case (novelty touching every leaf) is one full scan, not two.
+        let leaf = &leaves[i];
+        if leaf.first_key.p_id == p_id && leaf.last_key.p_id == p_id {
+            base_touched = base_touched.saturating_add(leaf.row_count);
+        } else {
+            let handle = store
+                .open_leaf_handle(&leaf.leaf_cid, leaf.sidecar_cid.as_ref(), false)
+                .map_err(|e| QueryError::Internal(format!("leaf open: {e}")))?;
+            for entry in &handle.dir().entries {
+                if entry.row_count != 0 && entry.p_const == Some(p_id) {
+                    base_touched = base_touched.saturating_add(entry.row_count as u64);
+                }
+            }
+        }
+
+        // Merged count of this range (base + this range's novelty ops).
+        let sliced = ops[start..end].to_vec();
+        if let Some(mut cursor) = build_overlay_cursor_for_subject_range(
+            store,
+            g_id,
+            p_id,
+            cursor_projection_sid_only(),
+            lo,
+            hi,
+            sliced,
+            to_t,
+            epoch,
+        ) {
+            while let Some(batch) = cursor
+                .next_batch()
+                .map_err(|e| QueryError::Internal(format!("cursor batch: {e}")))?
+            {
+                for r in 0..batch.row_count {
+                    let s = batch.s_id.get(r);
+                    if s >= lo && s < hi {
+                        merged_touched = merged_touched.saturating_add(1);
+                    }
+                }
+            }
+        }
+    }
+
+    // base_total − base(touched) = base(untouched); + merged(touched) = grand total.
+    let total = base_total
+        .saturating_sub(base_touched)
+        .saturating_add(merged_touched);
+    Ok(Some(total))
 }
 
 /// Resolve a bound `Ref` (Iri or Sid) to its internal `s_id` (u64).
@@ -1731,6 +2689,21 @@ pub fn fast_path_store<'a>(ctx: &'a ExecutionContext<'_>) -> Option<&'a Arc<Bina
     Some(store)
 }
 
+/// Cursor-flavored fast-path gate (strategy (b)).
+///
+/// Unlike [`allow_fast_path`], this does **not** reject uncommitted overlay or
+/// `to_t < max_t`: operators using this gate read through a [`BinaryCursor`]
+/// (built by [`build_psot_cursor_for_predicate`]) that folds the novelty overlay
+/// in and honors `to_t`, so those cases stay correct. It still requires
+/// single-ledger, no `from_t`, and root (or no) policy; History mode is filtered
+/// at the planner level.
+#[inline]
+pub fn allow_cursor_fast_path(ctx: &ExecutionContext<'_>) -> bool {
+    !ctx.is_multi_ledger()
+        && ctx.from_t.is_none()
+        && ctx.policy_enforcer.as_ref().is_none_or(|p| p.is_root())
+}
+
 // ---------------------------------------------------------------------------
 // 11. Generic fast-path operator
 // ---------------------------------------------------------------------------
@@ -1798,6 +2771,15 @@ impl FastPathOperator {
 
 #[async_trait]
 impl Operator for FastPathOperator {
+    fn op_name(&self) -> String {
+        format!("FastPath:{}", self.label)
+    }
+    fn plan_children(&self) -> Vec<crate::plan_node::PlanChild<'_>> {
+        self.fallback
+            .as_deref()
+            .map(|fb| vec![crate::plan_node::PlanChild::fallback(fb)])
+            .unwrap_or_default()
+    }
     fn schema(&self) -> &[VarId] {
         match &self.schema {
             FastPathSchema::Single(v) => std::slice::from_ref(v),

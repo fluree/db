@@ -98,6 +98,13 @@ impl ServerError {
             // Query/Transaction errors
             ServerError::Api(ApiError::Query(_)) => errors::INVALID_QUERY,
             ServerError::Api(ApiError::Batch(_)) => errors::INVALID_QUERY,
+            // Optimistic-concurrency conflicts: a distinct, retryable class so
+            // clients can branch on `@type` (and the 409 status below).
+            ServerError::Api(ApiError::Transact(
+                fluree_db_api::TransactError::CommitConflict { .. }
+                | fluree_db_api::TransactError::PublishLostRace { .. }
+                | fluree_db_api::TransactError::NamespaceConflict(_),
+            )) => errors::COMMIT_CONFLICT,
             ServerError::Api(ApiError::Transact(_)) => errors::INVALID_TRANSACTION,
 
             // API-level errors
@@ -128,6 +135,12 @@ impl ServerError {
             ServerError::Api(ApiError::Config(_)) => errors::CONFIG,
             ServerError::Api(ApiError::Format(_)) => errors::FORMAT,
 
+            // Cross-ledger model dependency failure (502). The variant
+            // is preserved in ApiError::CrossLedger so structured
+            // callers can branch on the specific failure; the `@type`
+            // surfaced here is the umbrella IRI.
+            ServerError::Api(ApiError::CrossLedger(_)) => errors::CROSS_LEDGER,
+
             // Catch any new ApiError variants as internal
             #[allow(unreachable_patterns)]
             ServerError::Api(_) => errors::INTERNAL,
@@ -147,6 +160,15 @@ impl ServerError {
 
             // 409 - Conflict
             ServerError::Api(ApiError::LedgerExists(_)) => StatusCode::CONFLICT,
+            // Optimistic-concurrency / namespace-allocation conflicts are
+            // retryable: 409 lets clients distinguish "retry" from a 400 "bad
+            // request". (After server-side reconcile-and-retry these only reach
+            // the client when the bounded retry budget is exhausted.)
+            ServerError::Api(ApiError::Transact(
+                fluree_db_api::TransactError::CommitConflict { .. }
+                | fluree_db_api::TransactError::PublishLostRace { .. }
+                | fluree_db_api::TransactError::NamespaceConflict(_),
+            )) => StatusCode::CONFLICT,
 
             // 400 - Bad Request (client errors)
             ServerError::Api(ApiError::Parse(_)) => StatusCode::BAD_REQUEST,
@@ -189,6 +211,15 @@ impl ServerError {
             ServerError::Api(ApiError::Internal(_)) => StatusCode::INTERNAL_SERVER_ERROR,
             ServerError::Api(ApiError::Drop(_)) => StatusCode::INTERNAL_SERVER_ERROR,
             ServerError::Api(ApiError::Json(_)) => StatusCode::INTERNAL_SERVER_ERROR,
+
+            // 502 - Bad Gateway. Cross-ledger model dependency failure
+            // is conceptually an upstream-dependency error, not an
+            // internal panic — operators can distinguish "your data
+            // ledger is broken" (500) from "the model ledger this
+            // data ledger depends on is broken" (502). The wrapped
+            // CrossLedgerError variant is preserved in the JSON body
+            // so callers can branch on the specific failure.
+            ServerError::Api(ApiError::CrossLedger(_)) => StatusCode::BAD_GATEWAY,
 
             // Catch any new ApiError variants as 500
             #[allow(unreachable_patterns)]

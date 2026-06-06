@@ -10,8 +10,14 @@
 //! available on read-only storage.
 
 use crate::{error::ApiError, tx::IndexingMode, Result};
-use fluree_db_core::{address_path::ledger_id_to_path_prefix, format_ledger_id, DEFAULT_BRANCH};
-use fluree_db_indexer::{clean_garbage, rebuild_index_from_commits, CleanGarbageConfig};
+use fluree_db_core::tracking::{Tracker, TrackingOptions};
+use fluree_db_core::{
+    address_path::{ledger_id_to_path_prefix, shared_prefix_for_path},
+    format_ledger_id, DEFAULT_BRANCH,
+};
+use fluree_db_indexer::{
+    clean_garbage, rebuild_index_from_commits_with_tracker, CleanGarbageConfig,
+};
 use fluree_db_nameservice::NsRecord;
 use std::time::Duration;
 use tracing::{debug, info, warn};
@@ -58,19 +64,34 @@ pub enum DropStatus {
 // Drop Report Types
 // =============================================================================
 
-/// Report of what was deleted/retracted for a ledger
+/// Report of what was deleted/retracted for a ledger.
+///
+/// `drop_ledger` operates on the **whole ledger** (every branch under a
+/// ledger name). `artifacts_deleted` is the sum across all branches plus
+/// the cross-branch `@shared/dicts/` cleanup; `branch_reports` carries the
+/// per-branch detail so partial failures can be inspected.
 #[derive(Debug, Clone, Default)]
 pub struct DropReport {
-    /// The normalized ledger ID that was dropped
+    /// The ledger name that was dropped (e.g. `"mydb"`, without `:branch`).
     pub ledger_id: String,
-    /// Status based on nameservice state at lookup time
+    /// Aggregate status across branches:
+    /// - `Dropped` if at least one branch was dropped or already retracted
+    /// - `AlreadyRetracted` if every branch was already retracted
+    /// - `NotFound` if no branches exist (or never existed)
     pub status: DropStatus,
-    /// Number of storage artifacts deleted (Hard mode only).
+    /// Number of storage artifacts deleted (Hard mode only), summed across
+    /// every branch + the `@shared/dicts/` namespace.
     ///
     /// Includes commits, transactions, index roots, leaves, branches, dicts,
     /// garbage records, config, and context blobs.
     pub artifacts_deleted: usize,
-    /// Any non-fatal errors or warnings encountered during the operation
+    /// Per-branch reports. One entry per branch we attempted to drop, in
+    /// leaf-first order. Empty when the ledger had no branches.
+    pub branch_reports: Vec<BranchDropReport>,
+    /// Any non-fatal errors or warnings encountered during the operation.
+    /// Branch-scoped warnings are also surfaced inside `branch_reports`;
+    /// top-level warnings cover whole-ledger steps (shared cleanup,
+    /// branch enumeration, etc.).
     pub warnings: Vec<String>,
 }
 
@@ -87,6 +108,36 @@ pub struct GraphSourceDropReport {
     pub files_deleted: usize,
     /// Any non-fatal errors or warnings encountered during the operation
     pub warnings: Vec<String>,
+}
+
+/// Report of a `drop_named_graph` call.
+///
+/// Named-graph drops are **transactional**: they produce a normal commit that
+/// retracts every triple currently asserted in `graph_iri` at the time the
+/// drop runs. History is preserved — queries `as-of` an earlier `t` still see
+/// the graph populated; only HEAD-time queries see it empty. The graph IRI
+/// remains registered so it can be re-populated by a later insert.
+///
+/// `retracted` and `committed` together describe the outcome:
+/// - graph existed and had data → `retracted > 0`, `committed = true`
+/// - graph existed but was already empty → `retracted = 0`, `committed = false`
+/// - graph IRI was unknown → the call returns `ApiError::NotFound` instead of
+///   producing a report.
+#[derive(Debug, Clone, Default)]
+pub struct DropNamedGraphReport {
+    /// Full `ledger:branch` identifier the drop targeted.
+    pub ledger_id: String,
+    /// Graph IRI that was dropped (echoed for clarity).
+    pub graph_iri: String,
+    /// Number of flakes retracted by the drop commit. `0` if the graph was
+    /// already empty (no commit was produced in that case).
+    pub retracted: usize,
+    /// Whether a new commit was created. `false` when there was nothing to
+    /// retract and the call was a no-op.
+    pub committed: bool,
+    /// Current commit `t` for the branch after the drop. Equal to the
+    /// pre-drop `t` when `committed = false`.
+    pub t: i64,
 }
 
 /// Report of a branch drop operation
@@ -154,6 +205,12 @@ pub struct TriggerIndexResult {
     pub index_t: i64,
     /// Content identifier of the index root (when available)
     pub root_id: Option<fluree_db_core::ContentId>,
+    /// Total fuel charged for the build that satisfied this trigger. The
+    /// background orchestrator always measures with a per-build tracker, so
+    /// this is normally `Some(N)` (or `Some(0.0)` when the requested t was
+    /// already indexed and no work was needed). Coalesced trigger callers
+    /// all receive the fuel of the single build that satisfied them.
+    pub fuel: Option<f64>,
 }
 
 /// Result of reindex operation
@@ -167,6 +224,9 @@ pub struct ReindexResult {
     pub root_id: fluree_db_core::ContentId,
     /// Build statistics
     pub stats: fluree_db_indexer::IndexStats,
+    /// Total fuel charged for this reindex (decimal). `None` only if fuel
+    /// tracking was disabled at the caller; `/reindex` always populates it.
+    pub fuel: Option<f64>,
 }
 
 /// Result of index_status query
@@ -200,37 +260,264 @@ fn normalize_ledger_id(ledger_id: &str) -> String {
     fluree_db_core::normalize_ledger_id(ledger_id).unwrap_or_else(|_| ledger_id.to_string())
 }
 
+/// Validate that `value` is an absolute IRI suitable for admin lookup.
+///
+/// This is intentionally a minimal check, not a full RFC 3987 parser. It
+/// enforces only the properties the admin path actually needs:
+///
+/// - No leading/trailing whitespace, and no whitespace anywhere in the
+///   value (preserves caller-exact identity in error messages).
+/// - None of the characters RFC 3987 excludes from an IRI
+///   (`<`, `>`, `"`, `{`, `}`, `|`, `\`, `^`, `` ` ``).
+/// - A valid `<scheme>:<rest>` head per RFC 3986 §3.1: `scheme` starts
+///   with ALPHA and contains only ALPHA / DIGIT / `+` / `-` / `.`,
+///   `rest` is non-empty.
+///
+/// Returns the error message to surface as `400` on failure.
+fn validate_absolute_iri(value: &str) -> std::result::Result<(), String> {
+    if value.is_empty() {
+        return Err("graph IRI is required and cannot be empty".to_string());
+    }
+    // RFC 3987 excludes whitespace, C0 controls (`U+0000..=U+001F`), DEL
+    // (`U+007F`), and the bracket/quote characters below. The C0 check is
+    // important because callers can otherwise sneak a ` ` past
+    // `is_whitespace` and have it surface as a SPARQL parse 500 instead
+    // of the documented 400.
+    if value.chars().any(|c| {
+        matches!(c, '<' | '>' | '"' | '{' | '}' | '|' | '\\' | '^' | '`')
+            || c.is_whitespace()
+            || c <= '\u{20}'
+            || c == '\u{7F}'
+    }) {
+        return Err(format!(
+            "Invalid graph IRI '{value}': contains whitespace, a control character, \
+             or a character not allowed in an IRI \
+             (one of `<`, `>`, `\"`, `{{`, `}}`, `|`, `\\`, `^`, `` ` ``)"
+        ));
+    }
+    // `<scheme>:<rest>` per RFC 3986 §3.1.
+    let (scheme, rest) = value.split_once(':').ok_or_else(|| {
+        format!("Invalid graph IRI '{value}': missing scheme (expected an absolute IRI like 'urn:...' or 'http://...')")
+    })?;
+    let mut sc = scheme.chars();
+    let first = sc
+        .next()
+        .ok_or_else(|| format!("Invalid graph IRI '{value}': scheme is empty"))?;
+    if !first.is_ascii_alphabetic() {
+        return Err(format!(
+            "Invalid graph IRI '{value}': scheme must start with an ASCII letter"
+        ));
+    }
+    if !sc.all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '-' | '.')) {
+        return Err(format!(
+            "Invalid graph IRI '{value}': scheme contains a character outside ALPHA / DIGIT / '+' / '-' / '.'"
+        ));
+    }
+    if rest.is_empty() {
+        return Err(format!(
+            "Invalid graph IRI '{value}': scheme is followed by an empty body"
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod validate_absolute_iri_tests {
+    use super::validate_absolute_iri;
+
+    #[test]
+    fn accepts_typical_iris() {
+        assert!(validate_absolute_iri("http://example.org/g").is_ok());
+        assert!(validate_absolute_iri("https://example.org/path?x=1").is_ok());
+        assert!(validate_absolute_iri("urn:example:org/payroll").is_ok());
+        assert!(validate_absolute_iri("urn:fluree:mydb:main#config").is_ok());
+        assert!(validate_absolute_iri("ftp://example.org").is_ok());
+    }
+
+    #[test]
+    fn rejects_empty() {
+        assert!(validate_absolute_iri("").is_err());
+    }
+
+    #[test]
+    fn rejects_relative_iri() {
+        assert!(validate_absolute_iri("payroll").is_err());
+        assert!(validate_absolute_iri("/absolute/path").is_err());
+        assert!(validate_absolute_iri("ex:").is_err());
+    }
+
+    #[test]
+    fn rejects_whitespace() {
+        assert!(validate_absolute_iri(" http://example.org").is_err());
+        assert!(validate_absolute_iri("http://example.org ").is_err());
+        assert!(validate_absolute_iri("http://example.org/with space").is_err());
+        assert!(validate_absolute_iri("http://example.org\n").is_err());
+    }
+
+    #[test]
+    fn rejects_disallowed_iri_characters() {
+        for bad in ['<', '>', '"', '{', '}', '|', '\\', '^', '`'] {
+            assert!(
+                validate_absolute_iri(&format!("http://example.org/{bad}")).is_err(),
+                "should reject {bad}"
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_c0_and_del_controls() {
+        for cp in [0u32, 0x01, 0x09, 0x0A, 0x0D, 0x1F, 0x7F] {
+            let c = char::from_u32(cp).unwrap();
+            assert!(
+                validate_absolute_iri(&format!("http://example.org/{c}")).is_err(),
+                "should reject control U+{cp:04X}"
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_bad_scheme() {
+        assert!(validate_absolute_iri("1http://example.org").is_err());
+        assert!(validate_absolute_iri("ht_tp://example.org").is_err());
+        assert!(validate_absolute_iri(":nopath").is_err());
+    }
+}
+
+/// Parse a `drop_ledger` input.
+///
+/// Accepted forms:
+/// - `"mydb"`: whole-ledger drop. Returns `"mydb"`.
+/// - Any branch-qualified id (`"mydb:main"`, `"mydb:dev"`, …) is rejected
+///   with `ApiError::Http(400)`. `:main` is not special: callers passing
+///   the suffix likely expected branch-level semantics, so they're routed
+///   to `drop_branch` with the same error shape as a non-default suffix.
+fn parse_whole_ledger_input(input: &str) -> Result<String> {
+    use fluree_db_core::ledger_id::split_ledger_id;
+
+    let bad_input = |msg: String| ApiError::Http {
+        status: 400,
+        message: msg,
+    };
+
+    if !input.contains(':') {
+        let (name, _) = split_ledger_id(input)
+            .map_err(|e| bad_input(format!("Invalid ledger name '{input}': {e}")))?;
+        return Ok(name);
+    }
+
+    let (name, branch) = split_ledger_id(input)
+        .map_err(|e| bad_input(format!("Invalid ledger id '{input}': {e}")))?;
+
+    // No branch suffix is accepted — including the default-name suffix —
+    // so callers can't be surprised by `drop_ledger("mydb:main")` quietly
+    // removing every other branch alongside main.
+    Err(bad_input(format!(
+        "drop_ledger drops the whole ledger and does not accept a branch suffix '{branch}'. \
+         Pass \"{name}\" to drop the whole ledger, or use drop_branch(\"{name}\", \"{branch}\") to drop a single branch."
+    )))
+}
+
+/// Sort branches so children come before their parents (leaf-first).
+///
+/// Used by `drop_ledger` so that if the operation aborts mid-way the
+/// surviving state is consistent: a parent may end up orphaned of
+/// children, but a child never points at a missing parent. Branches
+/// whose `source_branch` doesn't resolve to a record in `records`
+/// (orphan branches, broken pointers) are placed after their named
+/// peers — they'll be dropped after siblings, before genuine roots.
+fn sort_leaf_first(records: &mut [NsRecord]) {
+    use std::collections::{HashMap, HashSet};
+
+    // Map branch name → index. Then count descendants under each name.
+    let by_branch: HashMap<String, usize> = records
+        .iter()
+        .enumerate()
+        .map(|(i, r)| (r.branch.clone(), i))
+        .collect();
+
+    // For each record, count how many other records are descended from it
+    // (so true leaves get 0; the root gets the largest count).
+    let mut descendants: HashMap<usize, usize> = HashMap::new();
+    for (i, r) in records.iter().enumerate() {
+        let mut walker = r.source_branch.clone();
+        let mut seen: HashSet<String> = HashSet::new();
+        seen.insert(r.branch.clone());
+        while let Some(parent) = walker {
+            if !seen.insert(parent.clone()) {
+                break; // cycle guard
+            }
+            if let Some(&pi) = by_branch.get(&parent) {
+                *descendants.entry(pi).or_insert(0) += 1;
+                walker = records[pi].source_branch.clone();
+            } else {
+                break;
+            }
+        }
+        descendants.entry(i).or_insert(0);
+    }
+
+    records.sort_by(|a, b| {
+        let ai = by_branch[&a.branch];
+        let bi = by_branch[&b.branch];
+        descendants[&ai]
+            .cmp(&descendants[&bi])
+            .then_with(|| a.branch.cmp(&b.branch))
+    });
+}
+
 // =============================================================================
 // Fluree Drop Implementation
 // =============================================================================
 
 impl crate::Fluree {
-    /// Drop a ledger
-    ///
-    /// This operation:
-    /// 1. Normalizes the ledger ID (ensures branch suffix like `:main`)
-    /// 2. Cancels any pending background indexing
-    /// 3. Waits for in-progress indexing to complete
-    /// 4. In Hard mode: deletes all storage artifacts (commits + indexes)
-    /// 5. Retracts from nameservice
-    /// 6. Disconnects from ledger cache (if caching enabled)
+    /// Drop an entire ledger — every branch under the supplied name, plus
+    /// the cross-branch `@shared/dicts/` namespace in hard mode.
     ///
     /// # Arguments
     ///
-    /// * `ledger_id` - Ledger ID (e.g., "mydb" or "mydb:main")
-    /// * `mode` - `Soft` (retract only) or `Hard` (retract + delete files)
+    /// * `ledger_id` - Ledger name. See **Input forms** below for accepted shapes.
+    /// * `mode` - `Soft` (retract only) or `Hard` (retract + delete artifacts).
+    ///
+    /// # Operation
+    ///
+    /// 1. Parses the input (rejects non-default branch suffixes).
+    /// 2. Snapshots every NsRecord under the ledger name via `all_records`
+    ///    (includes retracted-but-not-purged branches). Enumeration failures
+    ///    propagate as `Err`. If no records exist, returns `NotFound` without
+    ///    touching storage — no orphan-cleanup path is built in.
+    /// 3. Sorts branches leaf-first via `source_branch` pointers so partial
+    ///    failures leave orphan parents, never dangling children.
+    /// 4. Cancels and waits for pending background indexing on each branch.
+    /// 5. For each branch (leaf-first): deletes per-branch artifacts (hard
+    ///    mode) and retracts (soft) or drops the NS record (hard) using the
+    ///    parent-aware path so surviving parents have accurate child counts.
+    /// 6. Hard mode: wipes `{ledger_name}/@shared/dicts/` after every branch
+    ///    is gone.
+    /// 7. Disconnects each branch from the ledger cache.
+    ///
+    /// # Input forms
+    ///
+    /// - `"mydb"` → drop the whole `mydb` ledger.
+    /// - `"mydb:<any-branch>"` (including `"mydb:main"`) → rejected with a
+    ///   `400`. `:main` carries no special meaning, so the caller probably
+    ///   meant `drop_branch("mydb", "<branch>")` if they passed a suffix.
     ///
     /// # Safety
     ///
-    /// - `Soft` mode is reversible (data remains, only nameservice retracted)
-    /// - `Hard` mode is **IRREVERSIBLE** - all data will be permanently deleted
+    /// - `Soft` mode is reversible (data remains, only nameservice retracted).
+    /// - `Hard` mode is **IRREVERSIBLE** — artifacts are permanently deleted.
     ///
     /// # Idempotency
     ///
     /// Safe to call multiple times:
-    /// - Returns `AlreadyRetracted` if ledger was previously dropped
-    /// - Hard mode still attempts deletion even for `NotFound`/`AlreadyRetracted`
-    ///   to enable admin cleanup scenarios
+    /// - Returns `AlreadyRetracted` when every branch was already retracted.
+    /// - Returns `NotFound` (without storage action) when no NsRecords exist
+    ///   under the ledger name. Truly orphaned storage with no NsRecord
+    ///   pointer is **not** cleaned up here; that's a separate admin
+    ///   concern.
+    /// - On a real per-branch nameservice failure, returns `ApiError::Drop`
+    ///   without touching parents or `@shared/dicts/`. Retry is safe — each
+    ///   step is idempotent under partial prior progress.
     ///
     /// # External Indexers
     ///
@@ -238,90 +525,177 @@ impl crate::Fluree {
     /// (Lambda, etc.) **MUST** check `NsRecord.retracted` before indexing
     /// and before publishing to prevent recreating files after drop.
     pub async fn drop_ledger(&self, ledger_id: &str, mode: DropMode) -> Result<DropReport> {
-        // 1. Normalize ledger_id (ensure branch suffix)
-        let ledger_id = normalize_ledger_id(ledger_id);
-        info!(ledger_id = %ledger_id, mode = ?mode, "Dropping ledger");
+        let ledger_name = parse_whole_ledger_input(ledger_id)?;
+        info!(ledger_name = %ledger_name, mode = ?mode, "Dropping whole ledger");
 
         let mut report = DropReport {
-            ledger_id: ledger_id.clone(),
+            ledger_id: ledger_name.clone(),
             ..Default::default()
         };
 
-        // 2. Lookup current state (for status reporting)
-        let record = self.nameservice().lookup(&ledger_id).await?;
-        let status = match &record {
-            None => DropStatus::NotFound,
-            Some(r) if r.retracted => DropStatus::AlreadyRetracted,
-            Some(_) => DropStatus::Dropped,
-        };
-        report.status = status;
+        // 1. Snapshot every record under this ledger name. Use `all_records`
+        // (not `list_branches`, which excludes retracted) so hard-drop cleans
+        // up retracted-but-not-purged branches too. Keep the snapshots in
+        // memory — the CID-walk fallback needs them after the records are
+        // purged from the nameservice.
+        // Enumeration failures propagate as errors: silently coercing them
+        // to `NotFound` would let the HTTP route fall through to the
+        // drop_graph_source path, potentially deleting an unrelated graph
+        // source with the same name.
+        let all = self.nameservice().all_records().await?;
+        let mut branches: Vec<NsRecord> =
+            all.into_iter().filter(|r| r.name == ledger_name).collect();
 
-        // 3. Stop background indexing (THE FLAKE FIX)
-        // NOTE: This only stops the in-process worker. External indexers must
-        // check NsRecord.retracted and refuse to index/publish if true.
-        if let IndexingMode::Background(handle) = &self.indexing_mode {
-            info!(ledger_id = %ledger_id, "Cancelling pending indexing");
-            handle.cancel(&ledger_id).await;
-            handle.wait_for_idle(&ledger_id).await;
-            info!(ledger_id = %ledger_id, "Indexing cancelled and idle");
+        if branches.is_empty() {
+            report.status = DropStatus::NotFound;
+            info!(ledger_name = %ledger_name, "No branches found for ledger");
+            return Ok(report);
         }
 
-        // 4. Delete artifacts (Hard mode)
-        // Run deletion even for NotFound/AlreadyRetracted - enables admin cleanup
+        // Aggregate status: AlreadyRetracted iff every branch was already
+        // retracted; otherwise Dropped (matches per-branch semantics).
+        report.status = if branches.iter().all(|r| r.retracted) {
+            DropStatus::AlreadyRetracted
+        } else {
+            DropStatus::Dropped
+        };
+
+        // 2. Order branches leaf-first. A branch can appear after its parent
+        // in `all_records`; sort so children always come before the branches
+        // they point at via `source_branch`.
+        sort_leaf_first(&mut branches);
+
+        // 3. Stop indexing across all branches before touching storage. This
+        // also blocks any in-flight writes from publishing artifacts after
+        // we've started deleting.
+        if let IndexingMode::Background(handle) = &self.indexing_mode {
+            for branch in &branches {
+                info!(ledger_id = %branch.ledger_id, "Cancelling pending indexing");
+                handle.cancel(&branch.ledger_id).await;
+                handle.wait_for_idle(&branch.ledger_id).await;
+            }
+        }
+
+        // 4. Drop each branch (artifacts + nameservice). `@shared/dicts/` is
+        // intentionally NOT wiped here — it lives at the ledger level and
+        // gets cleaned in the next step, once every branch is gone.
+        let publisher = self.publisher()?;
+        for branch in &branches {
+            let mut br = BranchDropReport {
+                ledger_id: branch.ledger_id.clone(),
+                status: if branch.retracted {
+                    DropStatus::AlreadyRetracted
+                } else {
+                    DropStatus::Dropped
+                },
+                ..Default::default()
+            };
+
+            if matches!(mode, DropMode::Hard) {
+                let (count, warnings) = self.drop_artifacts(&branch.ledger_id, Some(branch)).await;
+                br.artifacts_deleted += count;
+                br.warnings.extend(warnings);
+            }
+
+            // Hard mode uses `AdminPublisher::drop_branch` rather than
+            // `Publisher::purge` so the parent's `branches` count is
+            // decremented atomically with the row sweep. If we abort
+            // partway through a whole-ledger drop, surviving parent
+            // records still have an accurate child count rather than a
+            // stale one. Soft mode just retracts.
+            let ns_result = if matches!(mode, DropMode::Hard) {
+                publisher
+                    .drop_branch(&branch.ledger_id)
+                    .await
+                    .map(|_| ())
+                    .or_else(|e| {
+                        // Race: another caller already removed the meta
+                        // row. Treat as success — the row sweep inside
+                        // drop_branch ran regardless, and the other
+                        // caller already handled the parent decrement.
+                        if matches!(e, fluree_db_nameservice::NameServiceError::NotFound(_)) {
+                            Ok(())
+                        } else {
+                            Err(e)
+                        }
+                    })
+            } else {
+                publisher.retract(&branch.ledger_id).await
+            };
+            // Cache disconnect runs unconditionally — the artifact deletion
+            // and any nameservice mutation already happened above, so even
+            // on a failure-about-to-bail-out we want stale state evicted.
+            if let Some(mgr) = &self.ledger_manager {
+                mgr.disconnect(&branch.ledger_id).await;
+            }
+
+            if let Err(e) = ns_result {
+                // Real nameservice failure (already filtered out the
+                // NotFound race-as-success). Continuing would risk
+                // purging parents while children still point at them.
+                // Bail with an error; the per-branch reports for what
+                // succeeded survive in tracing logs. Idempotent retry
+                // is safe because each step (artifact deletion, NS
+                // mutation, cache disconnect) tolerates partial prior
+                // progress.
+                let msg = format!("Nameservice retract/drop: {e}");
+                warn!(ledger_id = %branch.ledger_id, error = %e, "Aborting drop_ledger on nameservice failure");
+                br.warnings.push(msg.clone());
+                report.artifacts_deleted += br.artifacts_deleted;
+                report.warnings.extend(br.warnings.iter().cloned());
+                report.branch_reports.push(br);
+                return Err(ApiError::Drop(format!(
+                    "Failed to drop branch '{}' of ledger '{}': {e}. \
+                     Stopped before touching parent branches or @shared/dicts. \
+                     Retry is safe.",
+                    branch.ledger_id, ledger_name
+                )));
+            }
+
+            report.artifacts_deleted += br.artifacts_deleted;
+            report.warnings.extend(br.warnings.iter().cloned());
+            report.branch_reports.push(br);
+        }
+
+        // 5. Hard drop only: wipe the cross-branch `@shared/dicts/` namespace.
+        // Safe at this point because every branch under this ledger name has
+        // been dropped, so nothing left to reference shared dicts.
         if matches!(mode, DropMode::Hard) {
-            let (count, warnings) = self.drop_artifacts(&ledger_id, record.as_ref()).await;
-            report.artifacts_deleted = count;
+            let (count, warnings) = self.drop_shared_artifacts(&ledger_name).await;
+            report.artifacts_deleted += count;
             report.warnings.extend(warnings);
         }
 
-        // 5. Retract or purge from nameservice
-        // Soft drop: retract (mark as retracted, alias cannot be reused)
-        // Hard drop: purge (remove record entirely, alias can be reused)
-        let publisher = self.publisher()?;
-        let ns_result = if matches!(mode, DropMode::Hard) {
-            publisher.purge(&ledger_id).await
-        } else {
-            publisher.retract(&ledger_id).await
-        };
-        if let Err(e) = ns_result {
-            // Log but don't fail - retract/purge may fail if truly not found
-            warn!(ledger_id = %ledger_id, error = %e, "Nameservice retract warning");
-            report.warnings.push(format!("Nameservice retract: {e}"));
-        }
-
-        // 6. Disconnect from ledger cache (if caching enabled)
-        // This evicts the ledger from the LedgerManager so stale state isn't served.
-        // Equivalent to releasing the ledger at the end of drop-ledger.
-        if let Some(mgr) = &self.ledger_manager {
-            info!(ledger_id = %ledger_id, "Disconnecting ledger from cache");
-            mgr.disconnect(&ledger_id).await;
-        }
-
-        info!(ledger_id = %ledger_id, status = ?report.status, "Ledger dropped");
+        info!(
+            ledger_name = %ledger_name,
+            branches = report.branch_reports.len(),
+            artifacts_deleted = report.artifacts_deleted,
+            "Ledger dropped"
+        );
         Ok(report)
     }
 
     /// Drop a branch
     ///
     /// This operation:
-    /// 1. Refuses to drop the "main" branch
+    /// 1. Refuses to drop the **root** branch (any branch whose
+    ///    `source_branch` is `None`) — use [`drop_ledger`](Self::drop_ledger)
+    ///    to remove the whole ledger including its root.
     /// 2. If the branch has children (`branches > 0`): retracts (soft-delete),
-    ///    preserving storage for children, reports as deferred
+    ///    preserving storage for children, reports as deferred.
     /// 3. If the branch is a leaf (`branches == 0`): cancels indexing, deletes
     ///    all storage artifacts, purges from nameservice, and cascades upward
-    ///    to any retracted ancestors that now have zero children
+    ///    to any retracted ancestors that now have zero children.
+    ///
+    /// "main" carries no special meaning here — it's just the default branch
+    /// name when none is supplied. A ledger created with a different initial
+    /// branch (e.g. `mydb:trunk`) has that branch as its root and is the one
+    /// `drop_branch` will refuse.
     ///
     /// # Errors
     /// - `ApiError::NotFound` if the branch does not exist
-    /// - `ApiError::InvalidInput` if attempting to drop "main"
+    /// - `ApiError::Http(400)` if attempting to drop the root
     pub async fn drop_branch(&self, ledger_name: &str, branch: &str) -> Result<BranchDropReport> {
-        if branch == "main" {
-            return Err(ApiError::Http {
-                status: 400,
-                message: "Cannot drop the main branch".to_string(),
-            });
-        }
-
         let ledger_id = format_ledger_id(ledger_name, branch);
         info!(ledger_id = %ledger_id, "Dropping branch");
 
@@ -330,12 +704,23 @@ impl crate::Fluree {
             ..Default::default()
         };
 
-        // Look up the record
+        // Look up the record first — the root check is record-based, not
+        // name-based, so we have to load before we can validate.
         let record = self
             .nameservice()
             .lookup(&ledger_id)
             .await?
             .ok_or_else(|| ApiError::NotFound(format!("Branch not found: {ledger_id}")))?;
+
+        if record.source_branch.is_none() {
+            return Err(ApiError::Http {
+                status: 400,
+                message: format!(
+                    "Cannot drop '{branch}': it is the root of ledger '{ledger_name}'. \
+                     Use drop_ledger to remove the whole ledger."
+                ),
+            });
+        }
 
         if record.retracted {
             report.status = DropStatus::AlreadyRetracted;
@@ -383,6 +768,174 @@ impl crate::Fluree {
         Ok(report)
     }
 
+    /// Drop a named graph from a single branch by retracting every triple
+    /// currently asserted under `graph_iri`.
+    ///
+    /// This is a **transactional** drop: it produces one normal commit at
+    /// `t = current_t + 1` whose flakes are all retractions of the graph's
+    /// current contents. History is preserved — a query `as-of` an earlier
+    /// `t` still sees the graph populated. The graph IRI remains registered
+    /// so it can be re-populated by a later insert.
+    ///
+    /// # Arguments
+    ///
+    /// * `ledger_id` - Full ledger identifier (`"mydb"` is normalized to
+    ///   `"mydb:main"`). The drop only affects the targeted branch.
+    /// * `graph_iri` - Full IRI of the named graph to drop (matched exactly
+    ///   against the ledger's graph registry).
+    ///
+    /// # Restrictions
+    ///
+    /// The following graph identifiers are **always** rejected with
+    /// `ApiError::Http(400)`:
+    /// - The default graph (`graph_iri` is empty or refers to g_id 0).
+    /// - The system `txn-meta` graph (`urn:fluree:{ledger_id}#txn-meta`,
+    ///   g_id 1).
+    /// - The system `config` graph (`urn:fluree:{ledger_id}#config`, g_id 2).
+    ///
+    /// An unknown user graph IRI (one that is not in the ledger's graph
+    /// registry) returns `ApiError::NotFound`.
+    ///
+    /// # Behavior
+    ///
+    /// 1. Normalizes the ledger id (`":main"` default).
+    /// 2. Resolves `graph_iri` against the snapshot's `GraphRegistry`.
+    /// 3. Builds a `DELETE { GRAPH <iri> { ?s ?p ?o } } WHERE { ... }`
+    ///    transaction and stages it through the same pipeline used by user
+    ///    SPARQL updates.
+    /// 4. If the WHERE matches zero flakes (graph already empty), no commit
+    ///    is produced and `committed = false` is reported.
+    ///
+    /// # Errors
+    ///
+    /// - `ApiError::Http(400)` — `graph_iri` is empty, malformed, or names a
+    ///   protected system graph.
+    /// - `ApiError::NotFound` — the ledger does not exist, or `graph_iri` is
+    ///   not registered in this ledger's graph registry.
+    pub async fn drop_named_graph(
+        &self,
+        ledger_id: &str,
+        graph_iri: &str,
+    ) -> Result<DropNamedGraphReport> {
+        use fluree_db_core::graph_registry::{
+            config_graph_iri, txn_meta_graph_iri, CONFIG_GRAPH_ID, DEFAULT_GRAPH_ID,
+            TXN_META_GRAPH_ID,
+        };
+        use fluree_db_transact::{NamespaceRegistry, TxnOpts};
+
+        let bad_request = |msg: String| ApiError::Http {
+            status: 400,
+            message: msg,
+        };
+
+        if graph_iri.is_empty() {
+            return Err(bad_request(
+                "graph IRI is required and cannot drop the default graph".to_string(),
+            ));
+        }
+        // The CLI / HTTP contract is "full graph IRI". We enforce that
+        // exactly here so an accidentally trimmed value or a relative
+        // reference that happens to match a registry entry can't slip
+        // through. `validate_absolute_iri` rejects whitespace, the
+        // characters RFC 3987 excludes from an IRI, and any value
+        // lacking a proper `<scheme>:<rest>` head.
+        validate_absolute_iri(graph_iri).map_err(bad_request)?;
+
+        let ledger_id = normalize_ledger_id(ledger_id);
+
+        // Reject system graphs purely by IRI shape — this catches the case
+        // even on ledgers whose registry was seeded permissively without
+        // the config graph (legacy roots).
+        if graph_iri == txn_meta_graph_iri(&ledger_id) {
+            return Err(bad_request(format!(
+                "Cannot drop the txn-meta system graph '{graph_iri}'"
+            )));
+        }
+        if graph_iri == config_graph_iri(&ledger_id) {
+            return Err(bad_request(format!(
+                "Cannot drop the config system graph '{graph_iri}'"
+            )));
+        }
+
+        info!(ledger_id = %ledger_id, graph_iri = %graph_iri, "Dropping named graph");
+
+        let handle = self.ledger_cached(&ledger_id).await?;
+        let pre_drop_t = handle.t().await;
+        let view = handle.snapshot().await;
+        let snapshot = &view.snapshot;
+
+        let g_id = snapshot
+            .graph_registry
+            .graph_id_for_iri(graph_iri)
+            .ok_or_else(|| {
+                ApiError::NotFound(format!(
+                    "Named graph '{graph_iri}' is not registered in ledger '{ledger_id}'"
+                ))
+            })?;
+
+        // Belt-and-suspenders: a registry built from a non-standard root could
+        // theoretically map a user-supplied IRI to a system slot. Refuse it.
+        if matches!(g_id, DEFAULT_GRAPH_ID | TXN_META_GRAPH_ID | CONFIG_GRAPH_ID) {
+            return Err(bad_request(format!(
+                "Cannot drop system graph '{graph_iri}' (g_id={g_id})"
+            )));
+        }
+
+        // Build and lower the SPARQL DELETE. We use the explicit
+        // `DELETE { GRAPH <g> { ... } } WHERE { GRAPH <g> { ... } }` form
+        // because `DELETE WHERE` does not yet support GRAPH blocks.
+        let sparql = format!(
+            "DELETE {{ GRAPH <{graph_iri}> {{ ?s ?p ?o }} }} \
+             WHERE {{ GRAPH <{graph_iri}> {{ ?s ?p ?o }} }}"
+        );
+        let parsed = fluree_db_sparql::parse_sparql(&sparql);
+        if parsed.has_errors() {
+            return Err(ApiError::internal(format!(
+                "drop_named_graph: SPARQL parse failed for graph IRI '{graph_iri}': {:?}",
+                parsed.diagnostics
+            )));
+        }
+        let ast = parsed.ast.ok_or_else(|| {
+            ApiError::internal("drop_named_graph: SPARQL parser returned no AST".to_string())
+        })?;
+
+        let mut ns_registry = NamespaceRegistry::from_db(snapshot);
+        let txn =
+            fluree_db_transact::lower_sparql_update_ast(&ast, &mut ns_registry, TxnOpts::default())
+                .map_err(|e| {
+                    ApiError::internal(format!(
+                        "drop_named_graph: failed to lower SPARQL update: {e}"
+                    ))
+                })?;
+        drop(view);
+
+        let result = self.stage(&handle).txn(txn).execute().await?;
+        let retracted = result.receipt.flake_count;
+        let committed = retracted > 0;
+        let new_t = if committed {
+            result.receipt.t
+        } else {
+            pre_drop_t
+        };
+
+        info!(
+            ledger_id = %ledger_id,
+            graph_iri = %graph_iri,
+            retracted,
+            committed,
+            t = new_t,
+            "Named graph dropped",
+        );
+
+        Ok(DropNamedGraphReport {
+            ledger_id,
+            graph_iri: graph_iri.to_string(),
+            retracted,
+            committed,
+            t: new_t,
+        })
+    }
+
     /// Cancel indexing, delete storage artifacts, purge nameservice record,
     /// and disconnect from cache. Returns the parent's new child count.
     async fn purge_branch(
@@ -396,6 +949,9 @@ impl crate::Fluree {
             handle.wait_for_idle(ledger_id).await;
         }
 
+        // Branch path: only the per-branch artifacts. `@shared/dicts/` is
+        // never wiped from a branch drop — sibling/parent branches may still
+        // reference them; final cleanup happens in `drop_ledger`.
         let (count, warnings) = self.drop_artifacts(ledger_id, record).await;
         report.artifacts_deleted += count;
         report.warnings.extend(warnings);
@@ -447,15 +1003,22 @@ impl crate::Fluree {
         }
     }
 
-    /// Delete all storage artifacts for a ledger.
+    /// Delete the branch-scoped storage artifacts for a single branch.
+    ///
+    /// Enumerates the per-branch subprefixes (`commit/`, `txn/`, `index/`,
+    /// `config/`). Cross-branch `@shared/dicts/` is **not** touched here —
+    /// `drop_ledger` cleans it up via [`drop_shared_artifacts`] once every
+    /// branch has been dropped.
     ///
     /// Uses a two-path strategy:
-    /// - **Fast path**: `list_prefix` on the entire ledger root — catches all
-    ///   subdirectories (commit/, txn/, index/, config/, etc.). Works for
-    ///   file, S3, and memory backends.
+    /// - **Fast path**: list each known subprefix and batch delete. Per-
+    ///   subprefix enumeration is required so that `TieredStorage` routes
+    ///   commit/txn listings to the commit tier and index/config listings
+    ///   to the index tier — a single ledger-root list misses the commit
+    ///   tier entirely in split commit/index deployments.
     /// - **Slow path**: If `list_prefix` fails (e.g., IPFS), walks the commit
-    ///   chain + index tree to collect all CIDs, derives storage addresses, and
-    ///   deletes each individually.
+    ///   chain + index tree to collect all CIDs, derives storage addresses,
+    ///   and deletes each individually.
     ///
     /// Returns `(count_deleted, warnings)`.
     async fn drop_artifacts(
@@ -476,42 +1039,89 @@ impl crate::Fluree {
         };
         let storage_method = storage.storage_method();
 
-        // Build the ledger root prefix: fluree:{method}://{ledger_path}/
-        let prefix = match ledger_id_to_path_prefix(ledger_id) {
+        // Build the per-branch path prefix (e.g. "mydb/main").
+        let branch_prefix = match ledger_id_to_path_prefix(ledger_id) {
             Ok(p) => p,
             Err(e) => {
                 warnings.push(format!("Invalid ledger ID '{ledger_id}': {e}"));
                 return (0, warnings);
             }
         };
-        let ledger_root = format!("fluree:{storage_method}://{prefix}/");
 
-        // Fast path: list everything under the ledger root and batch delete
-        match storage.list_prefix(&ledger_root).await {
-            Ok(mut files) => {
-                files.sort();
-                let mut count = 0;
-                for file in &files {
-                    if let Err(e) = storage.delete(file).await {
-                        warn!(file = %file, error = %e, "Failed to delete artifact");
-                        warnings.push(format!("Failed to delete {file}: {e}"));
-                    } else {
-                        count += 1;
+        // Enumerate explicit subprefixes. `TieredStorage` routes by substring
+        // (`/commit/`, `/txn/` → commit tier; otherwise → index tier), so we
+        // must hit each one separately. `index/` covers index roots, garbage,
+        // and all object subkinds (branches, leaves, dicts when per-branch);
+        // `config/` covers the LedgerConfig blob and the default-context blob,
+        // both stored as `ContentKind::LedgerConfig`.
+        let subprefixes = vec![
+            format!("fluree:{storage_method}://{branch_prefix}/commit/"),
+            format!("fluree:{storage_method}://{branch_prefix}/txn/"),
+            format!("fluree:{storage_method}://{branch_prefix}/index/"),
+            format!("fluree:{storage_method}://{branch_prefix}/config/"),
+        ];
+
+        let mut total = 0usize;
+        let mut any_listed = false;
+        let mut listing_errors: Vec<String> = Vec::new();
+
+        for sub in &subprefixes {
+            match storage.list_prefix(sub).await {
+                Ok(files) => {
+                    any_listed = true;
+                    let mut sorted = files;
+                    sorted.sort();
+                    for file in &sorted {
+                        if let Err(e) = storage.delete(file).await {
+                            warn!(file = %file, error = %e, "Failed to delete artifact");
+                            warnings.push(format!("Failed to delete {file}: {e}"));
+                        } else {
+                            total += 1;
+                        }
                     }
                 }
-                info!(count = count, "Fast-path artifact deletion complete");
-                (count, warnings)
-            }
-            Err(e) => {
-                // Slow path: walk CID chains (any backend without list_prefix)
-                info!(
-                    error = %e,
-                    "list_prefix unavailable, falling back to CID-walking drop"
-                );
-                self.drop_artifacts_by_cid_walk(ledger_id, record, &mut warnings)
-                    .await
+                Err(e) => {
+                    let msg = format!("list_prefix({sub}) failed: {e}");
+                    warn!(error = %e, prefix = %sub, "list_prefix failed during drop");
+                    listing_errors.push(msg);
+                }
             }
         }
+
+        // Two failure modes to handle distinctly:
+        //
+        // - No subprefix listed successfully: backend doesn't support
+        //   list_prefix at all (or every call errored). Fall back to the CID
+        //   walk so we still remove what we can address.
+        // - Some succeeded, some failed: we likely deleted a partial set of
+        //   artifacts. Run the CID walk as a cleanup pass — `release` is
+        //   idempotent on already-deleted CIDs — and record the listing
+        //   errors as warnings so callers see the partial-failure.
+        if !any_listed {
+            info!(
+                errors = ?listing_errors,
+                "list_prefix unavailable for all subprefixes, falling back to CID-walking drop"
+            );
+            return self
+                .drop_artifacts_by_cid_walk(ledger_id, record, &mut warnings)
+                .await;
+        }
+
+        if !listing_errors.is_empty() {
+            warn!(
+                errors = ?listing_errors,
+                "fast-path drop had partial listing failures; running CID walk to clean up"
+            );
+            warnings.extend(listing_errors);
+            let (extra, cid_warnings) = self
+                .drop_artifacts_by_cid_walk(ledger_id, record, &mut Vec::new())
+                .await;
+            total += extra;
+            warnings.extend(cid_warnings);
+        }
+
+        info!(count = total, "Fast-path artifact deletion complete");
+        (total, warnings)
     }
 
     /// Slow-path artifact deletion: walk commit + index chains to collect CIDs,
@@ -574,6 +1184,48 @@ impl crate::Fluree {
 
         info!(count = count, "Slow-path artifact deletion complete");
         (count, std::mem::take(warnings))
+    }
+
+    /// Delete the cross-branch `{ledger_name}/@shared/dicts/` namespace.
+    ///
+    /// Only safe once every branch under `ledger_name` has been dropped —
+    /// `drop_ledger` calls this as its final step. Branch drops never call
+    /// it, since sibling and parent branches may still reference shared
+    /// blobs. Failures are returned as warnings, not errors: orphaned
+    /// shared blobs are recoverable via a follow-up admin sweep.
+    async fn drop_shared_artifacts(&self, ledger_name: &str) -> (usize, Vec<String>) {
+        let mut warnings = Vec::new();
+        let Some(storage) = self.admin_storage() else {
+            // Permanent backends (IPFS) reach shared dicts through the CID
+            // walk path on each branch; nothing to do here.
+            return (0, warnings);
+        };
+        let storage_method = storage.storage_method();
+        let shared = shared_prefix_for_path(ledger_name);
+        let prefix = format!("fluree:{storage_method}://{shared}/dicts/");
+
+        match storage.list_prefix(&prefix).await {
+            Ok(files) => {
+                let mut sorted = files;
+                sorted.sort();
+                let mut count = 0;
+                for file in &sorted {
+                    if let Err(e) = storage.delete(file).await {
+                        warn!(file = %file, error = %e, "Failed to delete shared dict blob");
+                        warnings.push(format!("Failed to delete {file}: {e}"));
+                    } else {
+                        count += 1;
+                    }
+                }
+                info!(count, "@shared/dicts cleanup complete");
+                (count, warnings)
+            }
+            Err(e) => {
+                warn!(error = %e, prefix = %prefix, "list_prefix failed on @shared/dicts");
+                warnings.push(format!("@shared/dicts list_prefix failed: {e}"));
+                (0, warnings)
+            }
+        }
     }
 }
 
@@ -770,6 +1422,7 @@ impl crate::Fluree {
                 ledger_id,
                 index_t: 0,
                 root_id: None,
+                fuel: Some(0.0),
             });
         }
 
@@ -824,10 +1477,15 @@ impl crate::Fluree {
         macro_rules! finish_wait {
             ($outcome:expr) => {
                 match $outcome {
-                    IndexOutcome::Completed { index_t, root_id } => {
+                    IndexOutcome::Completed {
+                        index_t,
+                        root_id,
+                        fuel,
+                    } => {
                         info!(
                             ledger_id = %ledger_id,
                             index_t = index_t,
+                            fuel = ?fuel,
                             elapsed_ms = wait_started.elapsed().as_millis() as u64,
                             "Indexing completed"
                         );
@@ -835,6 +1493,7 @@ impl crate::Fluree {
                             ledger_id: ledger_id.clone(),
                             index_t,
                             root_id,
+                            fuel,
                         });
                     }
                     IndexOutcome::Failed(msg) => {
@@ -1079,8 +1738,17 @@ impl crate::Fluree {
             }
         }
 
-        let index_result = rebuild_index_from_commits(
+        // Reindex is a user-triggered API call; create a fuel-enabled,
+        // no-limit tracker per request so the response can report total fuel.
+        // Indexing never enforces a fuel limit (measurement only) — a partial
+        // index is worse than a slow one.
+        let reindex_tracker = Tracker::new(TrackingOptions {
+            track_fuel: true,
+            ..Default::default()
+        });
+        let index_result = rebuild_index_from_commits_with_tracker(
             self.content_store(&ledger_id),
+            reindex_tracker,
             &ledger_id,
             &record,
             indexer_config,
@@ -1121,30 +1789,43 @@ impl crate::Fluree {
             "Reindex completed"
         );
 
-        // 6. Spawn async garbage collection (non-blocking)
-        let gc_store = self.content_store(&ledger_id);
-        let gc_root_id = index_result.root_id.clone();
-        let gc_config = CleanGarbageConfig {
-            max_old_indexes: Some(gc_max_old_indexes),
-            min_time_garbage_mins: Some(gc_min_time_mins),
-        };
-        tokio::spawn(async move {
-            if let Err(e) = clean_garbage(gc_store.as_ref(), &gc_root_id, gc_config).await {
-                tracing::warn!(
-                    error = %e,
-                    root_id = %gc_root_id,
-                    "Background garbage collection failed (non-fatal)"
-                );
-            } else {
-                tracing::debug!(root_id = %gc_root_id, "Background garbage collection completed");
-            }
-        });
+        // 6. Spawn async garbage collection (non-blocking) only after enough
+        // published index versions can exist to exceed retention.
+        let gc_keep_count = 1_i64 + i64::from(gc_max_old_indexes);
+        if index_result.index_t <= gc_keep_count {
+            tracing::debug!(
+                root_id = %index_result.root_id,
+                index_t = index_result.index_t,
+                gc_keep_count,
+                "Skipping background garbage collection; index chain cannot exceed retention yet"
+            );
+        } else {
+            let gc_store = self.content_store(&ledger_id);
+            let gc_root_id = index_result.root_id.clone();
+            let gc_config = CleanGarbageConfig {
+                max_old_indexes: Some(gc_max_old_indexes),
+                min_time_garbage_mins: Some(gc_min_time_mins),
+                ..Default::default()
+            };
+            tokio::spawn(async move {
+                if let Err(e) = clean_garbage(gc_store.as_ref(), &gc_root_id, gc_config).await {
+                    tracing::warn!(
+                        error = %e,
+                        root_id = %gc_root_id,
+                        "Background garbage collection failed (non-fatal)"
+                    );
+                } else {
+                    tracing::debug!(root_id = %gc_root_id, "Background garbage collection completed");
+                }
+            });
+        }
 
         Ok(ReindexResult {
             ledger_id,
             index_t: index_result.index_t,
             root_id: index_result.root_id,
             stats: index_result.stats,
+            fuel: index_result.fuel,
         })
     }
 }

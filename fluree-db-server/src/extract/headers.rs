@@ -271,6 +271,23 @@ impl FlureeHeaders {
             .unwrap_or(false)
     }
 
+    /// Check if the client explicitly requests JSON-LD output via Accept header.
+    ///
+    /// Matches `application/ld+json` (case-insensitive) only. Bare
+    /// `application/json` is intentionally NOT matched: it is the most common
+    /// default Accept value, and treating it as a JSON-LD request would silently
+    /// flip every existing SELECT client from SPARQL-results-JSON to JSON-LD.
+    /// SPARQL CONSTRUCT/DESCRIBE already render as JSON-LD regardless of Accept
+    /// (the formatter coerces graph results — see issue #1274); this helper lets
+    /// a SELECT query *opt in* to JSON-LD via the unambiguous media type.
+    /// Does NOT match `*/*` — JSON-LD must be explicitly requested.
+    pub fn wants_jsonld(&self) -> bool {
+        self.accept
+            .as_ref()
+            .map(|a| a.to_ascii_lowercase().contains("application/ld+json"))
+            .unwrap_or(false)
+    }
+
     /// Check if this is a JWT/JWS based on Content-Type
     pub fn is_jwt(&self) -> bool {
         self.content_type

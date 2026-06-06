@@ -17,6 +17,7 @@ use crate::error::{QueryError, Result};
 use crate::eval::PreparedBoolExpression;
 use crate::exists::ExistsOperator;
 use crate::filter::{contains_exists, FilterOperator};
+use crate::hash_join::HashJoinPlanner;
 use crate::ir::triple::{Ref, Term, TriplePattern};
 use crate::ir::{Expression, Pattern};
 use crate::join::NestedLoopJoinOperator;
@@ -270,6 +271,131 @@ fn filter_not_bound_var(expr: &Expression) -> Option<VarId> {
 #[inline]
 fn pattern_list_contains_var(patterns: &[Pattern], v: VarId) -> bool {
     patterns.iter().any(|p| p.referenced_vars().contains(&v))
+}
+
+/// Strategy for executing an EXISTS / NOT EXISTS pattern.
+///
+/// Picked by [`choose_exists_strategy`] from the outer schema and the inner
+/// patterns alone — no operator construction, no stats, no I/O. Kept as a
+/// distinct type so unit tests can pin the decision without standing up a
+/// full operator tree.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ExistsStrategy {
+    /// Build the inner solution once into a hash set keyed by `key_vars`,
+    /// probe per outer row. Used when the inner is correlated to the outer
+    /// only via vars the inner itself produces.
+    Semijoin { key_vars: Vec<VarId> },
+    /// Rebuild and re-execute the inner per outer row. Used when the inner
+    /// is uncorrelated (no shared produced vars with outer) or references
+    /// outer-only consumed vars (e.g. `FILTER(?p = ?q)` where `?p` is
+    /// produced only by the outer).
+    Exists {
+        /// Reason recorded for tracing / debugging.
+        reason: ExistsFallbackReason,
+    },
+}
+
+/// Why a strategy fell back to per-row `Exists` rather than `Semijoin`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ExistsFallbackReason {
+    /// Inner shares no produced vars with the outer schema — fully uncorrelated.
+    Uncorrelated,
+    /// Inner references an outer var it doesn't produce, so it can't run standalone.
+    OuterOnlyConsumed,
+}
+
+/// Pure decision: pick an [`ExistsStrategy`] from the outer schema and the
+/// inner patterns. No side effects, no I/O — unit-testable in isolation.
+pub(crate) fn choose_exists_strategy(
+    outer_schema: &[VarId],
+    inner_patterns: &[Pattern],
+) -> ExistsStrategy {
+    // Vars PRODUCED by inner patterns (Triple, Bind, Values, etc.).
+    // Vars only consumed (e.g. in FILTER expressions) cannot serve as semijoin keys.
+    let inner_produced_vars: HashSet<VarId> = inner_patterns
+        .iter()
+        .flat_map(Pattern::produced_vars)
+        .collect();
+
+    // Key vars in outer schema order (stable, matches column layout).
+    let key_vars: Vec<VarId> = outer_schema
+        .iter()
+        .copied()
+        .filter(|v| inner_produced_vars.contains(v))
+        .collect();
+
+    // Inner references an outer var it doesn't produce (e.g., FILTER(?p = ?q)
+    // where ?p is outer-only): inner cannot run standalone → must seed per row.
+    let outer_set: HashSet<VarId> = outer_schema.iter().copied().collect();
+    let outer_only_consumed = inner_patterns
+        .iter()
+        .flat_map(Pattern::referenced_vars)
+        .any(|v| outer_set.contains(&v) && !inner_produced_vars.contains(&v));
+
+    if outer_only_consumed {
+        ExistsStrategy::Exists {
+            reason: ExistsFallbackReason::OuterOnlyConsumed,
+        }
+    } else if key_vars.is_empty() {
+        ExistsStrategy::Exists {
+            reason: ExistsFallbackReason::Uncorrelated,
+        }
+    } else {
+        ExistsStrategy::Semijoin { key_vars }
+    }
+}
+
+/// Build the operator for an EXISTS / NOT EXISTS using [`choose_exists_strategy`].
+///
+/// Picks `SemijoinOperator` (build-once + hash probe) when the inner pattern is
+/// correlated to the outer solely via produced vars, otherwise `ExistsOperator`
+/// (per-row correlated rebuild). Shared by the pattern-level `Pattern::Exists`
+/// / `Pattern::NotExists` dispatch and the `OPTIONAL { ... } FILTER(!bound(?v))`
+/// rewrite — the latter relied on `ExistsOperator` unconditionally before this
+/// helper existed, which timed out on large outer streams.
+fn build_exists_strategy(
+    child: BoxedOperator,
+    inner_patterns: &[Pattern],
+    negated: bool,
+    stats: Option<Arc<StatsView>>,
+    planning: PlanningContext,
+) -> BoxedOperator {
+    let strategy = choose_exists_strategy(child.schema(), inner_patterns);
+    match strategy {
+        ExistsStrategy::Semijoin { key_vars } => {
+            tracing::debug!(
+                strategy = "semijoin",
+                negated,
+                key_var_count = key_vars.len(),
+                inner_pattern_count = inner_patterns.len(),
+                "exists dispatch",
+            );
+            Box::new(SemijoinOperator::new(
+                child,
+                inner_patterns.to_vec(),
+                key_vars,
+                negated,
+                stats,
+                planning,
+            ))
+        }
+        ExistsStrategy::Exists { reason } => {
+            tracing::debug!(
+                strategy = "exists",
+                negated,
+                reason = ?reason,
+                inner_pattern_count = inner_patterns.len(),
+                "exists dispatch",
+            );
+            Box::new(ExistsOperator::new(
+                child,
+                inner_patterns.to_vec(),
+                negated,
+                stats,
+                planning,
+            ))
+        }
+    }
 }
 
 fn collect_grouped_single_triple_optionals(
@@ -725,7 +851,7 @@ pub(crate) fn analyze_property_join_plan(
     let analysis = analyze_property_join(triples_for_exec);
     let (width_score, optional_bonus) =
         property_join_width_score(triples_for_exec, &patterns[block_end_index..]);
-    let meets_width_threshold = width_score > PROPERTY_JOIN_MIN_WIDTH_SCORE;
+    let meets_width_threshold = width_score >= PROPERTY_JOIN_MIN_WIDTH_SCORE;
     let can_property_join = !has_upstream_seed && analysis.eligible() && meets_width_threshold;
     let tail = if can_property_join {
         collect_property_join_tail(patterns, block_end_index, triples_for_exec)
@@ -954,6 +1080,8 @@ fn build_single_pattern(
             emit_mask_for_triple(tp, var_counts, protected_vars),
             group_by,
             planning,
+            // No chain context here: only a force-`On` override can fire the hash join.
+            &HashJoinPlanner::new(None),
         )),
         _ => operator,
     }
@@ -1150,6 +1278,7 @@ fn build_sequential_join_block(
     group_by: &[VarId],
     distinct_query: bool,
     planning: &PlanningContext,
+    stats: Option<&StatsView>,
 ) -> Result<Option<BoxedOperator>> {
     let mut operator = operator;
 
@@ -1166,7 +1295,11 @@ fn build_sequential_join_block(
     let base_vars: Option<HashSet<VarId>> =
         required_where_vars.map(|rwv| rwv.iter().copied().collect());
 
+    // Tracks the running driving-chain cardinality across steps for the hash-join
+    // cost model; `before_step` snapshots it against the live `bound` set per pattern.
+    let mut hash_planner = HashJoinPlanner::new(stats);
     for (k, tp) in triples.iter().enumerate() {
+        hash_planner.before_step(tp, &bound);
         let mut vars_after: HashSet<VarId> = bound.clone();
         for v in tp.produced_vars() {
             vars_after.insert(v);
@@ -1226,6 +1359,7 @@ fn build_sequential_join_block(
             emit,
             group_by,
             planning,
+            &hash_planner,
         );
         bound.extend(op.schema().iter().copied());
         operator = Some(op);
@@ -1563,6 +1697,7 @@ pub fn build_where_operators_seeded_with_needed(
                         group_by,
                         distinct_query,
                         planning,
+                        stats.as_deref(),
                     )?;
                     if values_after_triples {
                         built = apply_values(Some(built), block.values)
@@ -1731,6 +1866,7 @@ pub fn build_where_operators_seeded_with_needed(
                         group_by,
                         distinct_query,
                         planning,
+                        stats.as_deref(),
                     )?;
                 }
             }
@@ -1762,24 +1898,24 @@ pub fn build_where_operators_seeded_with_needed(
                 if let Pattern::Optional(inner_patterns) = &patterns[i] {
                     // Optimization: OPTIONAL { ... binds ?v ... } FILTER(!bound(?v))
                     // behaves like NOT EXISTS { ... } for the inner conjunctive block.
-                    //
-                    // We implement this as a correlated NOT EXISTS (ExistsOperator with negation),
-                    // not as a Semijoin build/probe, because the inner-side key set can be huge
-                    // for common predicates (e.g., bsbm:productFeature), while the outer stream is
-                    // typically already selective.
+                    // Dispatch through the shared strategy helper so it picks
+                    // SemijoinOperator (build-once + hash probe) when the inner shares
+                    // produced key vars with the outer schema — the per-row
+                    // ExistsOperator path is reserved for uncorrelated / outer-only-
+                    // consumed cases the helper detects.
                     if let Some(Pattern::Filter(next_filter)) = patterns.get(i + 1) {
                         if let Some(v) = filter_not_bound_var(next_filter) {
                             let v_bound_in_outer = child.schema().contains(&v);
                             let v_appears_later = pattern_list_contains_var(&patterns[i + 2..], v);
                             let v_bound_by_inner = pattern_list_contains_var(inner_patterns, v);
                             if !v_bound_in_outer && !v_appears_later && v_bound_by_inner {
-                                operator = Some(Box::new(ExistsOperator::new(
+                                operator = Some(build_exists_strategy(
                                     child,
-                                    inner_patterns.clone(),
+                                    inner_patterns,
                                     true,
                                     stats.clone(),
                                     *planning,
-                                )));
+                                ));
                                 i += 2;
                                 continue;
                             }
@@ -1875,64 +2011,16 @@ pub fn build_where_operators_seeded_with_needed(
                 i += 1;
             }
 
-            // EXISTS / NOT EXISTS: use SemijoinOperator when correlated (shared vars
-            // between outer and inner), ExistsOperator when uncorrelated.
             Pattern::Exists(inner_patterns) | Pattern::NotExists(inner_patterns) => {
                 let child = require_child(operator, "EXISTS pattern")?;
                 let negated = matches!(&patterns[i], Pattern::NotExists(_));
-
-                // Collect only vars PRODUCED by inner patterns (Triple, Bind, Values, etc.).
-                // Vars only consumed (e.g., in FILTER expressions) require per-row seeding
-                // and cannot serve as semijoin keys.
-                let inner_produced_vars: std::collections::HashSet<VarId> = inner_patterns
-                    .iter()
-                    .flat_map(Pattern::produced_vars)
-                    .collect();
-
-                // Key vars in child schema order (stable, matches column layout).
-                let key_vars: Vec<VarId> = child
-                    .schema()
-                    .iter()
-                    .copied()
-                    .filter(|v| inner_produced_vars.contains(v))
-                    .collect();
-
-                // Check if inner patterns reference outer vars that they don't produce
-                // (e.g., FILTER(?p = ?q) where ?p is outer-only). If so, the inner
-                // patterns can't be executed standalone — fall back to ExistsOperator.
-                let inner_all_vars: std::collections::HashSet<VarId> = inner_patterns
-                    .iter()
-                    .flat_map(super::super::ir::Pattern::referenced_vars)
-                    .collect();
-                let outer_schema: std::collections::HashSet<VarId> =
-                    child.schema().iter().copied().collect();
-                let outer_only_consumed: bool = inner_all_vars
-                    .iter()
-                    .any(|v| outer_schema.contains(v) && !inner_produced_vars.contains(v));
-
-                if key_vars.is_empty() || outer_only_consumed {
-                    // Uncorrelated, or inner depends on outer-only vars (e.g., FILTER
-                    // referencing outer vars): use ExistsOperator for correct per-row
-                    // seeding of all outer bindings.
-                    operator = Some(Box::new(ExistsOperator::new(
-                        child,
-                        inner_patterns.clone(),
-                        negated,
-                        stats.clone(),
-                        *planning,
-                    )));
-                } else {
-                    // Correlated via produced vars only: SemijoinOperator builds inner
-                    // set once, probes per row.
-                    operator = Some(Box::new(SemijoinOperator::new(
-                        child,
-                        inner_patterns.clone(),
-                        key_vars,
-                        negated,
-                        stats.clone(),
-                        *planning,
-                    )));
-                }
+                operator = Some(build_exists_strategy(
+                    child,
+                    inner_patterns,
+                    negated,
+                    stats.clone(),
+                    *planning,
+                ));
                 i += 1;
             }
 
@@ -2124,7 +2212,7 @@ fn make_first_scan(
 /// The `inline_ops` are evaluated inline on the operator: baked into the scan
 /// for the first pattern, or evaluated per combined row in `NestedLoopJoinOperator` for joins.
 #[allow(clippy::too_many_arguments)]
-pub fn build_scan_or_join(
+pub(crate) fn build_scan_or_join(
     left: Option<BoxedOperator>,
     tp: &TriplePattern,
     object_bounds: &HashMap<VarId, ObjectBounds>,
@@ -2133,6 +2221,7 @@ pub fn build_scan_or_join(
     emit: EmitMask,
     group_by: &[VarId],
     planning: &PlanningContext,
+    hash_planner: &HashJoinPlanner,
 ) -> BoxedOperator {
     match left {
         None => make_first_scan(tp, object_bounds, inline_ops, emit, group_by, planning),
@@ -2142,6 +2231,47 @@ pub fn build_scan_or_join(
 
             // Extract object bounds if available for this pattern's object variable
             let bounds = tp.o.as_var().and_then(|v| object_bounds.get(&v).cloned());
+
+            // For object→subject "path" joins, build a hash table from the small
+            // (left/driving) side and probe a single contiguous scan of the large
+            // predicate, instead of the per-driving-row OPST object seek that degrades
+            // superlinearly at scale. The planner owns the shape + cost decision; we
+            // compute the annotated decision once, apply `chosen`, and stash it on the
+            // chosen operator so EXPLAIN can report why.
+            let decision = hash_planner.explain_object_hash_join(
+                &left_schema,
+                tp,
+                bounds.is_some(),
+                inline_ops.is_empty(),
+            );
+
+            if let Some(d) = decision {
+                if d.chosen {
+                    let index_hint = scan_index_hint_for_triple(tp, group_by, &[]);
+                    let probe: BoxedOperator =
+                        Box::new(crate::dataset_operator::DatasetOperator::scan(
+                            tp.clone(),
+                            None,
+                            Vec::new(),
+                            EmitMask::ALL,
+                            index_hint,
+                            planning.mode(),
+                        ));
+                    return Box::new(
+                        crate::hash_join::HashJoinOperator::new(
+                            left,
+                            probe,
+                            d.join_var
+                                .expect("a chosen object→subject hash join has a join var"),
+                            downstream_vars,
+                            tp.clone(),
+                            bounds.clone(),
+                            planning.mode(),
+                        )
+                        .with_hash_join_decision(d),
+                    );
+                }
+            }
 
             Box::new(
                 NestedLoopJoinOperator::new(
@@ -2153,7 +2283,10 @@ pub fn build_scan_or_join(
                     EmitMask::ALL,
                     planning.mode(),
                 )
-                .with_out_schema(downstream_vars),
+                .with_out_schema(downstream_vars)
+                // A shape-eligible-but-rejected hash join attaches its reason; a
+                // non-candidate (subject chain, bounds, etc.) attaches nothing.
+                .with_hash_join_decision(decision),
             )
         }
     }
@@ -2242,6 +2375,7 @@ pub fn build_triple_operators(
     group_by: &[VarId],
     distinct_query: bool,
     planning: &PlanningContext,
+    stats: Option<&StatsView>,
 ) -> Result<BoxedOperator> {
     if triples.is_empty() {
         return existing
@@ -2284,8 +2418,12 @@ pub fn build_triple_operators(
     // Build chain of scan/join operators using the shared helper
     let rwv_set: Option<HashSet<VarId>> = required_where_vars.map(|v| v.iter().copied().collect());
 
+    // Drives the hash-join cost model; snapshots cardinality against `seen_vars`
+    // (the chain bound so far) before each pattern — see build_sequential_join_block.
     let mut seen_vars: HashSet<VarId> = HashSet::new();
+    let mut hash_planner = HashJoinPlanner::new(stats);
     for (k, pattern) in triples_for_exec.iter().enumerate() {
+        hash_planner.before_step(pattern, &seen_vars);
         seen_vars.extend(pattern.produced_vars());
         // Compute live vars: required_where_vars ∪ vars from subsequent triples
         let live_vars = rwv_set.as_ref().map(|base| {
@@ -2306,6 +2444,7 @@ pub fn build_triple_operators(
             emit,
             group_by,
             planning,
+            &hash_planner,
         ));
 
         // DISTINCT query optimization: if any variables seen so far are no longer live,
@@ -2390,6 +2529,7 @@ mod tests {
             &[],
             false,
             &crate::temporal_mode::PlanningContext::current(),
+            None,
         )
     }
 
@@ -2797,6 +2937,7 @@ mod tests {
             EmitMask::ALL,
             &[],
             &crate::temporal_mode::PlanningContext::current(),
+            &HashJoinPlanner::new(None),
         );
 
         assert_eq!(op.schema(), &[VarId(0), VarId(1)]);
@@ -2817,6 +2958,7 @@ mod tests {
             EmitMask::ALL,
             &[],
             &crate::temporal_mode::PlanningContext::current(),
+            &HashJoinPlanner::new(None),
         );
         let second = build_scan_or_join(
             Some(first),
@@ -2827,6 +2969,7 @@ mod tests {
             EmitMask::ALL,
             &[],
             &crate::temporal_mode::PlanningContext::current(),
+            &HashJoinPlanner::new(None),
         );
 
         // Schema should include all vars from both patterns
@@ -3034,6 +3177,24 @@ mod tests {
         assert_eq!(optional_bonus, 1.0);
         assert_eq!(score, 4.0);
         assert!(score > PROPERTY_JOIN_MIN_WIDTH_SCORE);
+    }
+
+    #[test]
+    fn test_property_join_plan_accepts_exact_width_threshold() {
+        let s = VarId(0);
+        let triples = vec![
+            make_pattern(s, "type", VarId(1)),
+            make_pattern(s, "text", VarId(2)),
+            make_pattern(s, "vector", VarId(3)),
+        ];
+        let patterns: Vec<Pattern> = triples.iter().cloned().map(Pattern::Triple).collect();
+
+        let (decision, _tail) =
+            analyze_property_join_plan(&patterns, patterns.len(), &triples, false);
+
+        assert_eq!(decision.width_score, PROPERTY_JOIN_MIN_WIDTH_SCORE);
+        assert!(decision.meets_width_threshold);
+        assert!(decision.can_property_join);
     }
 
     #[test]
@@ -3657,5 +3818,121 @@ mod tests {
         let chain = unwrap_default_graph_source(&expanded[0]);
         let reifies_obj = find_reifies_object_triple(chain);
         assert!(reifies_obj.dtc.is_none());
+    }
+
+    // ========================================================================
+    // EXISTS / NOT EXISTS strategy decision
+    //
+    // These pin the dispatch decision independent of operator construction —
+    // a regression to per-row ExistsOperator for the root-level absence shape
+    // would silently slow real workloads (see the OPTIONAL+!bound rewrite at
+    // `Pattern::Optional` dispatch) without changing query results.
+    // ========================================================================
+
+    /// Outer triple binds `?f`; inner triple `?f <parent> ?p` shares `?f` via
+    /// a produced var and introduces fresh `?p`. This is the root-level
+    /// absence shape (`["not-exists", {"@id":"?f","storage:parent":"?p"}]`
+    /// after `{"@id":"?f","@type":"storage:File"}`) — must pick Semijoin so
+    /// the inner is built once instead of rebuilt per outer row.
+    #[test]
+    fn choose_exists_strategy_semijoin_for_root_level_absence_shape() {
+        let f = VarId(0);
+        let p = VarId(1);
+        let outer_schema = [f];
+        let inner = [Pattern::Triple(make_pattern(f, "parent", p))];
+
+        let strategy = choose_exists_strategy(&outer_schema, &inner);
+
+        assert_eq!(
+            strategy,
+            ExistsStrategy::Semijoin { key_vars: vec![f] },
+            "expected Semijoin for shared-produced-var inner, got {strategy:?}"
+        );
+    }
+
+    /// Inner references no outer var: fully uncorrelated → per-row Exists
+    /// is correct (and Semijoin would have an empty key set).
+    #[test]
+    fn choose_exists_strategy_exists_when_uncorrelated() {
+        let outer_schema = [VarId(0)];
+        let inner = [Pattern::Triple(make_pattern(VarId(10), "p", VarId(11)))];
+
+        let strategy = choose_exists_strategy(&outer_schema, &inner);
+
+        assert_eq!(
+            strategy,
+            ExistsStrategy::Exists {
+                reason: ExistsFallbackReason::Uncorrelated,
+            }
+        );
+    }
+
+    /// Inner references an outer-only var via FILTER (not via a producing
+    /// pattern): the inner cannot run standalone, so the strategy must fall
+    /// back to per-row Exists even though there is a shared produced var.
+    #[test]
+    fn choose_exists_strategy_exists_when_outer_only_consumed() {
+        let f = VarId(0);
+        let p = VarId(1);
+        let q = VarId(2); // outer-only — consumed by inner FILTER, not produced
+
+        let outer_schema = [f, q];
+        let filter_eq = Expression::call(
+            crate::ir::Function::Eq,
+            vec![Expression::Var(p), Expression::Var(q)],
+        );
+        let inner = [
+            Pattern::Triple(make_pattern(f, "parent", p)),
+            Pattern::Filter(filter_eq),
+        ];
+
+        let strategy = choose_exists_strategy(&outer_schema, &inner);
+
+        assert_eq!(
+            strategy,
+            ExistsStrategy::Exists {
+                reason: ExistsFallbackReason::OuterOnlyConsumed,
+            },
+            "outer-only consumed must dominate over the shared produced var, got {strategy:?}"
+        );
+    }
+
+    /// Empty outer schema (NotExists at root with no preceding sources) →
+    /// no key vars → per-row Exists.
+    #[test]
+    fn choose_exists_strategy_exists_when_outer_schema_empty() {
+        let outer_schema: [VarId; 0] = [];
+        let inner = [Pattern::Triple(make_pattern(VarId(0), "p", VarId(1)))];
+
+        let strategy = choose_exists_strategy(&outer_schema, &inner);
+
+        assert_eq!(
+            strategy,
+            ExistsStrategy::Exists {
+                reason: ExistsFallbackReason::Uncorrelated,
+            }
+        );
+    }
+
+    /// Key var order tracks the outer schema order (column layout), not the
+    /// order the inner happens to produce them. This is load-bearing for
+    /// `SemijoinOperator`'s column lookup at open time.
+    #[test]
+    fn choose_exists_strategy_semijoin_key_vars_follow_outer_schema_order() {
+        let a = VarId(0);
+        let b = VarId(1);
+        let outer_schema = [a, b];
+        // Inner triple is (?b <p> ?a) — produces both ?b and ?a, but in the
+        // opposite order from the outer schema.
+        let inner = [Pattern::Triple(make_pattern(b, "p", a))];
+
+        let strategy = choose_exists_strategy(&outer_schema, &inner);
+
+        assert_eq!(
+            strategy,
+            ExistsStrategy::Semijoin {
+                key_vars: vec![a, b],
+            },
+        );
     }
 }

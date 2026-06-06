@@ -717,24 +717,23 @@ impl LazyVectorArena {
                 format!("vector shard {idx} not on disk and no CID for remote fetch"),
             )
         })?;
-        // Sync→async bridge: spawn an OS thread to block_on the async fetch.
-        // Same pattern as ensure_index_leaf_cached() for index leaflets.
-        let handle = tokio::runtime::Handle::try_current()
-            .map_err(|_| io::Error::other("vector shard download requires a Tokio runtime"))?;
+        // Sync→async bridge via the shared `run_sync_on_runtime` helper, which
+        // uses `block_in_place(handle.block_on)` on a multi-thread runtime (a
+        // replacement worker keeps driving the reactor while this thread
+        // blocks) and a self-contained helper runtime on current-thread. The
+        // previous `std::thread::spawn` + outer-`Handle::block_on` + `rx.recv()`
+        // had no `block_in_place`, so on a small runtime every worker could park
+        // in `recv()` with no thread left to drive the reactor — the same wedge
+        // as the dict/pack read bridges. This runs at query time for vector
+        // search against remote (S3) stores.
         let cs = Arc::clone(cas);
         let cid = cid.clone();
         let path = source.path.clone();
-        let (tx, rx) = std::sync::mpsc::sync_channel::<Result<Vec<u8>, String>>(1);
-        std::thread::spawn(move || {
-            let res = handle
-                .block_on(async { cs.get(&cid).await })
-                .map_err(|e| e.to_string());
-            let _ = tx.send(res);
-        });
-        let bytes = rx
-            .recv()
-            .map_err(|_| io::Error::other("vector shard fetch thread died"))?
-            .map_err(io::Error::other)?;
+        let bytes = crate::read::binary_index_store::run_sync_on_runtime(async move {
+            cs.get(&cid)
+                .await
+                .map_err(|e| io::Error::other(e.to_string()))
+        })?;
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }

@@ -9,6 +9,19 @@ use fluree_db_core::value_id::ValueTypeTag;
 use fluree_db_core::GraphId;
 use rustc_hash::FxHashMap;
 
+/// Uncapped per-class ref-target counts, keyed by
+/// `(g_id, class_sid64) -> p_id -> target_class_sid64 -> delta`. Produced by
+/// [`crate::stats::IdStatsHook::finalize_with_aggregate_properties`].
+pub type ClassRefTargets = HashMap<(GraphId, u64), HashMap<u32, HashMap<u64, i64>>>;
+
+/// FxHashMap-keyed variant used internally to match `SpotClassStats.class_prop_refs`.
+type ClassRefTargetsFx = FxHashMap<(GraphId, u64), FxHashMap<u32, FxHashMap<u64, u64>>>;
+
+/// `(g_id, class) → p_id → inner_key → count` — the shape shared by
+/// `SpotClassStats`'s datatype/lang maps (`K = u16`) and ref-target map
+/// (`K = u64`). Used by [`merge_class_prop_map`].
+type ClassPropCountMap<K> = FxHashMap<(GraphId, u64), FxHashMap<u32, FxHashMap<K, u64>>>;
+
 /// Sentinel datatype value used in [`SpotClassStats`] for object-reference
 /// properties (`ObjKind::REF_ID`). Displayed as `@id` in stats output.
 pub const DT_REF_ID: u16 = u16::MAX;
@@ -21,8 +34,10 @@ pub const DT_REF_ID: u16 = u16::MAX;
 ///
 /// # Datatype keys
 ///
-/// The inner `u16` key is a `DatatypeDictId` for literal values, or
-/// [`DT_REF_ID`] (`u16::MAX`) for object references (`@id`).
+/// The inner `u16` key holds a [`ValueTypeTag`] value (`as_u8() as u16`) for
+/// literal values, or [`DT_REF_ID`] (`u16::MAX`) for object references (`@id`).
+/// Stored in the `ValueTypeTag` domain because the SPOT-merge collector only
+/// has access to the per-flake `o_type` byte, not the datatype dictionary.
 #[derive(Debug, Default)]
 pub struct SpotClassStats {
     /// (g_id, class_sid64) → instance count (number of subjects with this rdf:type)
@@ -35,6 +50,46 @@ pub struct SpotClassStats {
     pub class_prop_refs: FxHashMap<(GraphId, u64), FxHashMap<u32, FxHashMap<u64, u64>>>,
 }
 
+impl SpotClassStats {
+    /// Merge another `SpotClassStats` into `self` by key-wise union, summing
+    /// counts on any colliding key.
+    ///
+    /// Used by the import pipeline to fold each named-graph build's class stats
+    /// into the default-graph accumulator. All maps are keyed by
+    /// `(g_id, class_sid)` and the per-graph builds use disjoint `g_id`s, so in
+    /// practice there are no top-level collisions — but summing keeps the merge
+    /// correct regardless of key overlap. Ref-target classes that a build could
+    /// not resolve (e.g. a ref into another graph) are simply absent from
+    /// `other.class_prop_refs`; they remain counted as `@id` flakes in
+    /// `class_prop_dts` under [`DT_REF_ID`].
+    pub fn merge(&mut self, other: SpotClassStats) {
+        for (k, v) in other.class_counts {
+            *self.class_counts.entry(k).or_insert(0) += v;
+        }
+        merge_class_prop_map(&mut self.class_prop_dts, other.class_prop_dts);
+        merge_class_prop_map(&mut self.class_prop_langs, other.class_prop_langs);
+        merge_class_prop_map(&mut self.class_prop_refs, other.class_prop_refs);
+    }
+}
+
+/// Union one `(g_id, class) → p_id → inner_key → count` map into another,
+/// summing counts on colliding leaves. Generic over the innermost key (`u16`
+/// for datatype/lang maps, `u64` for ref target-class maps).
+fn merge_class_prop_map<K: std::hash::Hash + Eq>(
+    dst: &mut ClassPropCountMap<K>,
+    src: ClassPropCountMap<K>,
+) {
+    for (class_key, prop_map) in src {
+        let dst_props = dst.entry(class_key).or_default();
+        for (p_id, inner) in prop_map {
+            let dst_inner = dst_props.entry(p_id).or_default();
+            for (inner_key, count) in inner {
+                *dst_inner.entry(inner_key).or_insert(0) += count;
+            }
+        }
+    }
+}
+
 /// Build JSON array for class→property→datatype stats from SPOT merge results.
 ///
 /// Resolves class sid64 → (ns_code, suffix) via targeted binary search into
@@ -44,7 +99,6 @@ pub struct SpotClassStats {
 pub fn build_class_stats_json(
     cs: &SpotClassStats,
     predicate_sids: &[(u16, String)],
-    dt_tags: &[ValueTypeTag],
     run_dir: &std::path::Path,
     namespace_codes: &HashMap<u16, String>,
 ) -> std::io::Result<Vec<serde_json::Value>> {
@@ -145,10 +199,8 @@ pub fn build_class_stats_json(
                                 .map(|&(&dt, &count)| {
                                     if dt == DT_REF_ID {
                                         serde_json::json!(["@id", count])
-                                    } else if let Some(tag) = dt_tags.get(dt as usize) {
-                                        serde_json::json!([tag.as_u8(), count])
                                     } else {
-                                        serde_json::json!([dt, count])
+                                        serde_json::json!([dt as u8, count])
                                     }
                                 })
                                 .collect();
@@ -176,11 +228,18 @@ pub fn build_class_stats_json(
 ///
 /// Parallel to `build_class_stats_json` but returns typed structs suitable for
 /// binary stats encoding in `IndexRoot`.
+/// `class_ref_targets_override`: when `Some`, this uncapped
+/// `(g_id, class_sid64) -> p_id -> target_class_sid64 -> count` map (e.g. from
+/// `IdStatsHook::finalize_with_aggregate_properties`) is used to derive
+/// `ref_classes`. When `None`, the function falls back to
+/// `cs.class_prop_refs`, which is populated via the legacy 64-class-capped
+/// `ClassBitsetTable` path and yields incomplete ref-class rollups on
+/// ledgers with more than 64 distinct classes.
 pub fn build_class_stat_entries(
     cs: &SpotClassStats,
     predicate_sids: &[(u16, String)],
-    dt_tags: &[ValueTypeTag],
     language_tags: &[String],
+    class_ref_targets_override: Option<&ClassRefTargets>,
     run_dir: &std::path::Path,
     namespace_codes: &HashMap<u16, String>,
 ) -> std::io::Result<HashMap<GraphId, Vec<fluree_db_core::ClassStatEntry>>> {
@@ -228,7 +287,27 @@ pub fn build_class_stat_entries(
     let mut class_entries: Vec<(&(GraphId, u64), &u64)> = cs.class_counts.iter().collect();
     class_entries.sort_by_key(|&(key, _)| *key);
 
-    let class_refs = &cs.class_prop_refs;
+    // Adapt the override map (counts: i64 deltas, may be negative) to the
+    // FxHashMap<u64, u64> shape that `cs.class_prop_refs` uses, so the
+    // inner property loop is identical regardless of source. Non-positive
+    // deltas are filtered.
+    let override_fx: Option<ClassRefTargetsFx> = class_ref_targets_override.map(|src| {
+        src.iter()
+            .map(|(&key, prop_map)| {
+                let converted: FxHashMap<u32, FxHashMap<u64, u64>> = prop_map
+                    .iter()
+                    .map(|(&p_id, target_map)| {
+                        let targets: FxHashMap<u64, u64> = target_map
+                            .iter()
+                            .filter_map(|(&t_sid, &d)| (d > 0).then_some((t_sid, d as u64)))
+                            .collect();
+                        (p_id, targets)
+                    })
+                    .collect();
+                (key, converted)
+            })
+            .collect()
+    });
 
     let mut per_graph: HashMap<GraphId, Vec<ClassStatEntry>> = HashMap::new();
 
@@ -237,7 +316,10 @@ pub fn build_class_stat_entries(
             Some(s) => s,
             None => continue,
         };
-        let ref_map = class_refs.get(&(g_id, class_sid64));
+        let ref_map = match override_fx {
+            Some(ref m) => m.get(&(g_id, class_sid64)),
+            None => cs.class_prop_refs.get(&(g_id, class_sid64)),
+        };
 
         let properties: Vec<ClassPropertyUsage> =
             if let Some(prop_map) = cs.class_prop_dts.get(&(g_id, class_sid64)) {
@@ -250,19 +332,17 @@ pub fn build_class_stat_entries(
                         let psid_pair = predicate_sids.get(p_id as usize)?;
                         let property_sid = Sid::new(psid_pair.0, &psid_pair.1);
 
-                        // Build per-datatype counts.
+                        // Build per-datatype counts. The collector stores
+                        // `ValueTypeTag::as_u8() as u16` (or `DT_REF_ID` for
+                        // refs), so we can cast directly back to u8 — no
+                        // dictionary lookup needed.
                         let mut datatypes: Vec<(u8, u64)> = dt_map
                             .iter()
-                            .map(|(&dt_dict_id, &count)| {
-                                let tag = if dt_dict_id == DT_REF_ID {
-                                    fluree_db_core::value_id::ValueTypeTag::JSON_LD_ID.as_u8()
+                            .map(|(&dt_value, &count)| {
+                                let tag = if dt_value == DT_REF_ID {
+                                    ValueTypeTag::JSON_LD_ID.as_u8()
                                 } else {
-                                    dt_tags
-                                        .get(dt_dict_id as usize)
-                                        .map(|t| t.as_u8())
-                                        .unwrap_or(
-                                            fluree_db_core::value_id::ValueTypeTag::UNKNOWN.as_u8(),
-                                        )
+                                    dt_value as u8
                                 };
                                 (tag, count)
                             })

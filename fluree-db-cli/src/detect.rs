@@ -35,11 +35,28 @@ pub fn detect_data_format(
         };
     }
 
-    // File extension
+    // File extension. Strip an outer `.gz`/`.zst` so `.ttl.gz` / `.jsonld.zst`
+    // map to the same DataFormat as their plain counterparts (the bulk-import
+    // path decompresses transparently; the insert/upsert HTTP path does not
+    // yet, and will surface a UTF-8 error if a raw compressed file is sent).
     if let Some(p) = path {
-        if let Some(ext) = p.extension().and_then(|e| e.to_str()) {
-            return match ext.to_lowercase().as_str() {
-                "ttl" => Ok(DataFormat::Turtle),
+        let outer = p
+            .extension()
+            .and_then(|e| e.to_str())
+            .map(str::to_lowercase);
+        let inner = match outer.as_deref() {
+            Some("gz" | "zst" | "zstd") => p
+                .file_stem()
+                .map(std::path::Path::new)
+                .and_then(|s| s.extension())
+                .and_then(|e| e.to_str())
+                .map(str::to_lowercase),
+            _ => outer,
+        };
+        if let Some(ext) = inner {
+            return match ext.as_str() {
+                // `.nt` (N-Triples) is a Turtle subset — same parser.
+                "ttl" | "nt" => Ok(DataFormat::Turtle),
                 "json" | "jsonld" => Ok(DataFormat::JsonLd),
                 _ => sniff_data_format(content),
             };

@@ -154,6 +154,21 @@ impl NamespaceRegistry {
         self.codes.get_code(prefix)
     }
 
+    /// Look up the `Sid` for an IRI without allocating a fresh
+    /// namespace code if the prefix is new. Returns `None` when the
+    /// IRI's prefix is unknown to this registry.
+    ///
+    /// Use this from cross-ledger governance translation paths where
+    /// allocating a code for an IRI the data ledger has never seen
+    /// would be churn — the corresponding governance triple should
+    /// just be dropped, because the data ledger has no data of that
+    /// IRI for the governance assertion to apply against.
+    pub fn lookup_sid_for_iri(&self, iri: &str) -> Option<fluree_db_core::Sid> {
+        let (prefix, suffix) = fluree_db_core::ns_encoding::canonical_split(iri, self.split_mode());
+        let code = self.codes.get_code(prefix)?;
+        Some(fluree_db_core::Sid::new(code, suffix))
+    }
+
     /// Look up a prefix by code
     pub fn get_prefix(&self, code: u16) -> Option<&str> {
         self.codes.get_prefix(code)

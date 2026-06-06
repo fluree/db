@@ -376,9 +376,9 @@ Example: `http://schema.org/name` compacts to `schema:name`
 
 ### Fuel
 
-A measure of query/transaction execution cost. One unit of fuel is consumed for each item processed (flakes matched, items expanded during graph crawl, etc.). Used to prevent runaway queries from consuming excessive resources.
+A decimal measure of query/transaction execution cost, reported to 3 decimal places. Cost reflects actual work — dominated by I/O "touches" (an index leaflet or persisted-dict read costs `0.010` fuel each) rather than output cardinality. Every query is also charged a one-time `1.000` floor, so a fuel-tracked query never reports less than `1.000`. Used to prevent runaway queries from consuming excessive resources. See [Tracking and Fuel](../query/tracking-and-fuel.md) for the full cost ladder.
 
-Example: `"opts": {"max-fuel": 10000}` limits query to 10,000 fuel units.
+Example: `"opts": {"max-fuel": 10000}` limits a query to 10,000 fuel.
 
 ### Tracking
 

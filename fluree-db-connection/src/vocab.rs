@@ -58,6 +58,10 @@ pub const FIELD_S3_RETRY_BASE_DELAY_MS: &str = "https://ns.flur.ee/system#s3Retr
 /// S3 retry max delay (ms)
 pub const FIELD_S3_RETRY_MAX_DELAY_MS: &str = "https://ns.flur.ee/system#s3RetryMaxDelayMs";
 
+/// Maximum concurrent S3 SDK requests per storage instance.
+pub const FIELD_S3_MAX_CONCURRENT_REQUESTS: &str =
+    "https://ns.flur.ee/system#s3MaxConcurrentRequests";
+
 /// Optional address identifier for a storage backend
 ///
 /// Used in legacy configs to embed a storage identifier into Fluree addresses, e.g.

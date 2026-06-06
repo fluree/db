@@ -8,7 +8,7 @@
 //! module consumes those artifacts without a bulk-import-only V1 → V2 pass.
 
 use crate::run_index::build::index_build::{
-    build_all_indexes, finish_graph_v2, BuildAllConfig, IndexBuildResult,
+    build_all_indexes, BuildAllConfig, IndexBuildResult, PersistingLeafWriter,
 };
 use crate::run_index::build::merge::KWayMerge;
 use crate::run_index::runs::run_writer::{
@@ -19,7 +19,6 @@ use crate::run_index::runs::spool::{
     MmapStringRemap, MmapSubjectRemap, SortedCommitMergeReaderV2, SubjectRemap,
 };
 use crate::stats::{stats_record_from_v2, SpotClassStats, DT_REF_ID};
-use fluree_db_binary_index::format::leaf::LeafWriter;
 use fluree_db_binary_index::format::run_record::RunSortOrder;
 use fluree_db_binary_index::format::run_record_v2::cmp_v2_spot;
 use fluree_db_core::o_type::OType;
@@ -95,6 +94,10 @@ pub struct BuildResult {
     pub build_elapsed: std::time::Duration,
 }
 
+/// Dense 64-class subject→class-mask table: one `u64` bitmask per subject
+/// (bit *i* set ⇒ the subject is a member of `bit_to_class[i]`). Compact and
+/// cache-friendly, but limited to 64 distinct classes — used as the fast path
+/// in [`ClassMembership`] when a ledger has ≤ 64 classes.
 pub struct ClassBitsetTable {
     pub bit_to_class: Vec<u64>,
     graph_bitsets: FxHashMap<u16, FxHashMap<u16, Vec<u64>>>,
@@ -110,15 +113,76 @@ impl ClassBitsetTable {
             .and_then(|v| v.as_slice().get(local_id).copied())
             .unwrap_or(0)
     }
+}
 
+/// Sparse subject→class membership: an explicit (sorted, deduped) class list
+/// per subject. Memory is flat in the number of distinct classes (~one entry
+/// per `(subject, class)` type assertion), so it scales to arbitrarily large
+/// ontologies where the dense [`ClassBitsetTable`] would not fit. Used as the
+/// fallback in [`ClassMembership`] once a ledger exceeds 64 distinct classes.
+pub struct SparseClassMembership {
+    /// `(g_id, subject_sid64)` → sorted, deduped global class sids.
+    membership: FxHashMap<(u16, u64), Box<[u64]>>,
+    /// Number of distinct classes (diagnostics only).
+    distinct_classes: usize,
+}
+
+impl SparseClassMembership {
+    #[inline]
+    fn classes_of(&self, g_id: u16, sid: u64) -> &[u64] {
+        self.membership
+            .get(&(g_id, sid))
+            .map(|b| &b[..])
+            .unwrap_or(&[])
+    }
+}
+
+/// Subject→class membership lookup used to attribute reference *targets* to
+/// their classes when building `class_prop_refs` stats.
+///
+/// Uses the compact 64-class [`ClassBitsetTable`] for the common case
+/// (≤ 64 classes) and transparently transitions to a [`SparseClassMembership`]
+/// above that — uncapped and memory-bounded (flat in class count) for large
+/// ontologies. The previous implementation hard-capped at 64 classes and
+/// silently truncated ref-class rollups; this never truncates on class count.
+pub enum ClassMembership {
+    Bitset(ClassBitsetTable),
+    Sparse(SparseClassMembership),
+}
+
+impl ClassMembership {
+    /// Append the classes of `(g_id, sid)` into `out` (cleared first).
+    /// No allocation once `out` has capacity.
+    #[inline]
+    fn collect_classes(&self, g_id: u16, sid: u64, out: &mut Vec<u64>) {
+        out.clear();
+        match self {
+            Self::Bitset(b) => {
+                let mut bits = b.get(g_id, sid);
+                while bits != 0 {
+                    let bit_idx = bits.trailing_zeros() as usize;
+                    out.push(b.bit_to_class[bit_idx]);
+                    bits &= bits - 1;
+                }
+            }
+            Self::Sparse(s) => out.extend_from_slice(s.classes_of(g_id, sid)),
+        }
+    }
+
+    /// Number of distinct classes tracked (across both representations).
+    fn distinct_class_count(&self) -> usize {
+        match self {
+            Self::Bitset(b) => b.bit_to_class.len(),
+            Self::Sparse(s) => s.distinct_classes,
+        }
+    }
+
+    /// Build from per-chunk `.types` sidecars whose IDs are chunk-local and are
+    /// remapped to global via each commit's `MmapSubjectRemap`. Import path.
     fn build_from_commits(commits: &[CommitInput]) -> io::Result<Option<Self>> {
         use std::io::{BufReader, Read};
 
-        let mut class_to_bit: FxHashMap<u64, u8> = FxHashMap::default();
-        let mut bit_to_class: Vec<u64> = Vec::new();
-        let mut graph_bitsets: FxHashMap<u16, FxHashMap<u16, Vec<u64>>> = FxHashMap::default();
-        let mut overflow_classes: FxHashSet<u64> = FxHashSet::default();
-        let mut overflow_entries = 0u64;
+        let mut builder = ClassMembershipBuilder::new();
         let mut saw_sidecar = false;
         let mut buf = [0u8; 18];
 
@@ -139,59 +203,14 @@ impl ClassBitsetTable {
                 let c_local = u64::from_le_bytes(buf[10..18].try_into().unwrap());
                 let s_global = remap.get(s_local as usize)?;
                 let c_global = remap.get(c_local as usize)?;
-
-                let bit_idx = if let Some(&idx) = class_to_bit.get(&c_global) {
-                    idx
-                } else if bit_to_class.len() < 64 {
-                    let idx = bit_to_class.len() as u8;
-                    class_to_bit.insert(c_global, idx);
-                    bit_to_class.push(c_global);
-                    idx
-                } else {
-                    overflow_classes.insert(c_global);
-                    overflow_entries += 1;
-                    continue;
-                };
-
-                let ns_code = (s_global >> 48) as u16;
-                let local_id = (s_global & 0x0000_FFFF_FFFF_FFFF) as usize;
-                let ns_map = graph_bitsets.entry(g_id).or_default();
-                let vec = ns_map.entry(ns_code).or_default();
-                if local_id >= vec.len() {
-                    vec.resize(local_id + 1, 0);
-                }
-                vec[local_id] |= 1u64 << bit_idx;
+                builder.add(g_id, s_global, c_global);
             }
         }
 
         if !saw_sidecar {
             return Ok(None);
         }
-
-        tracing::info!(
-            classes = bit_to_class.len(),
-            graphs = graph_bitsets.len(),
-            total_subjects = graph_bitsets
-                .values()
-                .flat_map(|ns| ns.values())
-                .map(std::vec::Vec::len)
-                .sum::<usize>(),
-            "class bitset table built"
-        );
-
-        if !overflow_classes.is_empty() {
-            tracing::warn!(
-                retained_classes = bit_to_class.len(),
-                skipped_classes = overflow_classes.len(),
-                skipped_type_assertions = overflow_entries,
-                "class ref stats truncated at 64 distinct classes; stats.classes[*].properties[*].ref-classes may be incomplete"
-            );
-        }
-
-        Ok(Some(Self {
-            bit_to_class,
-            graph_bitsets,
-        }))
+        Ok(Some(builder.finish()))
     }
 
     /// Build from `.types` sidecar files that already contain **global** IDs.
@@ -203,11 +222,7 @@ impl ClassBitsetTable {
     pub fn build_from_global_types(types_paths: &[PathBuf]) -> io::Result<Option<Self>> {
         use std::io::{BufReader, Read};
 
-        let mut class_to_bit: FxHashMap<u64, u8> = FxHashMap::default();
-        let mut bit_to_class: Vec<u64> = Vec::new();
-        let mut graph_bitsets: FxHashMap<u16, FxHashMap<u16, Vec<u64>>> = FxHashMap::default();
-        let mut overflow_classes: FxHashSet<u64> = FxHashSet::default();
-        let mut overflow_entries = 0u64;
+        let mut builder = ClassMembershipBuilder::new();
         let mut saw_sidecar = false;
         let mut buf = [0u8; 18];
 
@@ -225,61 +240,150 @@ impl ClassBitsetTable {
                 let g_id = u16::from_le_bytes([buf[0], buf[1]]);
                 let s_global = u64::from_le_bytes(buf[2..10].try_into().unwrap());
                 let c_global = u64::from_le_bytes(buf[10..18].try_into().unwrap());
-
-                let bit_idx = if let Some(&idx) = class_to_bit.get(&c_global) {
-                    idx
-                } else if bit_to_class.len() < 64 {
-                    let idx = bit_to_class.len() as u8;
-                    class_to_bit.insert(c_global, idx);
-                    bit_to_class.push(c_global);
-                    idx
-                } else {
-                    overflow_classes.insert(c_global);
-                    overflow_entries += 1;
-                    continue;
-                };
-
-                let ns_code = (s_global >> 48) as u16;
-                let local_id = (s_global & 0x0000_FFFF_FFFF_FFFF) as usize;
-                let ns_map = graph_bitsets.entry(g_id).or_default();
-                let vec = ns_map.entry(ns_code).or_default();
-                if local_id >= vec.len() {
-                    vec.resize(local_id + 1, 0);
-                }
-                vec[local_id] |= 1u64 << bit_idx;
+                builder.add(g_id, s_global, c_global);
             }
         }
 
         if !saw_sidecar {
             return Ok(None);
         }
-
-        tracing::info!(
-            classes = bit_to_class.len(),
-            graphs = graph_bitsets.len(),
-            total_subjects = graph_bitsets
-                .values()
-                .flat_map(|ns| ns.values())
-                .map(std::vec::Vec::len)
-                .sum::<usize>(),
-            "class bitset table built (from global types)"
-        );
-
-        if !overflow_classes.is_empty() {
-            tracing::warn!(
-                retained_classes = bit_to_class.len(),
-                skipped_classes = overflow_classes.len(),
-                skipped_type_assertions = overflow_entries,
-                "class ref stats truncated at 64 distinct classes; stats.classes[*].properties[*].ref-classes may be incomplete"
-            );
-        }
-
-        Ok(Some(Self {
-            bit_to_class,
-            graph_bitsets,
-        }))
+        Ok(Some(builder.finish()))
     }
 }
+
+/// Accumulates subject→class membership, starting on the compact 64-class
+/// bitset and transparently promoting to a sparse per-subject representation
+/// the moment a 65th distinct class appears. The common case (≤ 64 classes)
+/// pays exactly the old dense-bitset cost; only large ontologies allocate the
+/// sparse map.
+struct ClassMembershipBuilder {
+    class_to_bit: FxHashMap<u64, u8>,
+    bit_to_class: Vec<u64>,
+    graph_bitsets: FxHashMap<u16, FxHashMap<u16, Vec<u64>>>,
+    /// `Some` once promoted to sparse mode: `(g_id, s_global)` → class list.
+    sparse: Option<FxHashMap<(u16, u64), Vec<u64>>>,
+    /// Distinct classes seen after promotion (seeded from `bit_to_class`).
+    sparse_classes: FxHashSet<u64>,
+}
+
+impl ClassMembershipBuilder {
+    fn new() -> Self {
+        Self {
+            class_to_bit: FxHashMap::default(),
+            bit_to_class: Vec::new(),
+            graph_bitsets: FxHashMap::default(),
+            sparse: None,
+            sparse_classes: FxHashSet::default(),
+        }
+    }
+
+    #[inline]
+    fn add(&mut self, g_id: u16, s_global: u64, c_global: u64) {
+        if let Some(sparse) = self.sparse.as_mut() {
+            sparse.entry((g_id, s_global)).or_default().push(c_global);
+            self.sparse_classes.insert(c_global);
+            return;
+        }
+
+        let bit_idx = if let Some(&idx) = self.class_to_bit.get(&c_global) {
+            idx
+        } else if self.bit_to_class.len() < 64 {
+            let idx = self.bit_to_class.len() as u8;
+            self.class_to_bit.insert(c_global, idx);
+            self.bit_to_class.push(c_global);
+            idx
+        } else {
+            // 65th distinct class: promote to sparse, then re-route this entry.
+            self.promote_to_sparse();
+            self.add(g_id, s_global, c_global);
+            return;
+        };
+
+        let ns_code = (s_global >> 48) as u16;
+        let local_id = (s_global & 0x0000_FFFF_FFFF_FFFF) as usize;
+        let ns_map = self.graph_bitsets.entry(g_id).or_default();
+        let vec = ns_map.entry(ns_code).or_default();
+        if local_id >= vec.len() {
+            vec.resize(local_id + 1, 0);
+        }
+        vec[local_id] |= 1u64 << bit_idx;
+    }
+
+    /// Expand the dense bitset accumulated so far into the sparse map, then
+    /// switch into sparse mode. One-time O(subjects-seen) cost, paid only on
+    /// ledgers that exceed 64 classes.
+    fn promote_to_sparse(&mut self) {
+        let mut sparse: FxHashMap<(u16, u64), Vec<u64>> = FxHashMap::default();
+        for (&g_id, ns_map) in &self.graph_bitsets {
+            for (&ns_code, vec) in ns_map {
+                for (local_id, &bits) in vec.iter().enumerate() {
+                    if bits == 0 {
+                        continue;
+                    }
+                    let s_global = ((ns_code as u64) << 48) | (local_id as u64);
+                    let entry = sparse.entry((g_id, s_global)).or_default();
+                    let mut b = bits;
+                    while b != 0 {
+                        let bit_idx = b.trailing_zeros() as usize;
+                        entry.push(self.bit_to_class[bit_idx]);
+                        b &= b - 1;
+                    }
+                }
+            }
+        }
+        self.sparse_classes = self.bit_to_class.iter().copied().collect();
+        self.graph_bitsets = FxHashMap::default();
+        self.class_to_bit = FxHashMap::default();
+        self.sparse = Some(sparse);
+    }
+
+    fn finish(self) -> ClassMembership {
+        if let Some(sparse) = self.sparse {
+            let distinct_classes = self.sparse_classes.len();
+            let mut membership: FxHashMap<(u16, u64), Box<[u64]>> = FxHashMap::default();
+            membership.reserve(sparse.len());
+            for (key, mut classes) in sparse {
+                classes.sort_unstable();
+                classes.dedup();
+                membership.insert(key, classes.into_boxed_slice());
+            }
+            tracing::info!(
+                classes = distinct_classes,
+                subjects = membership.len(),
+                "class membership promoted to sparse (uncapped, > 64 classes)"
+            );
+            ClassMembership::Sparse(SparseClassMembership {
+                membership,
+                distinct_classes,
+            })
+        } else {
+            tracing::info!(
+                classes = self.bit_to_class.len(),
+                graphs = self.graph_bitsets.len(),
+                total_subjects = self
+                    .graph_bitsets
+                    .values()
+                    .flat_map(|ns| ns.values())
+                    .map(std::vec::Vec::len)
+                    .sum::<usize>(),
+                "class bitset table built"
+            );
+            ClassMembership::Bitset(ClassBitsetTable {
+                bit_to_class: self.bit_to_class,
+                graph_bitsets: self.graph_bitsets,
+            })
+        }
+    }
+}
+
+/// Upper bound on the number of distinct `(src_class, prop, target_class)` leaf
+/// entries `class_prop_refs` may hold for a single build. Reference-target stats
+/// are worst-case `O(classes² × predicates)`; on a pathological high-class,
+/// densely-connected ontology that product can explode. Past this budget the
+/// collector stops recording *new* class pairs (existing counts keep
+/// incrementing) and emits a truncation warning — degrade at the edge, never
+/// OOM. ~64M `u64` leaves ≈ a couple GB worst case.
+const MAX_CLASS_REF_LEAF_ENTRIES: usize = 64_000_000;
 
 pub struct SpotClassStatsCollector {
     rdf_type_p_id: u32,
@@ -289,12 +393,19 @@ pub struct SpotClassStatsCollector {
     prop_dts: FxHashMap<(u32, u16), u64>,
     prop_langs: FxHashMap<(u32, u16), u64>,
     ref_targets: Vec<(u32, u64)>,
-    class_bitset: Option<ClassBitsetTable>,
+    class_membership: Option<ClassMembership>,
+    /// Reusable scratch buffer for a ref target's class list (avoids a
+    /// per-subject allocation in the ref-join inner loop).
+    target_class_buf: Vec<u64>,
+    /// Distinct `(src_class, prop, target_class)` leaves recorded so far.
+    ref_leaf_entries: usize,
+    /// Set once `class_prop_refs` hit [`MAX_CLASS_REF_LEAF_ENTRIES`].
+    ref_truncated: bool,
     result: SpotClassStats,
 }
 
 impl SpotClassStatsCollector {
-    pub fn new(rdf_type_p_id: u32, class_bitset: Option<ClassBitsetTable>) -> Self {
+    pub fn new(rdf_type_p_id: u32, class_membership: Option<ClassMembership>) -> Self {
         Self {
             rdf_type_p_id,
             current_s_id: None,
@@ -303,7 +414,10 @@ impl SpotClassStatsCollector {
             prop_dts: FxHashMap::default(),
             prop_langs: FxHashMap::default(),
             ref_targets: Vec::new(),
-            class_bitset,
+            class_membership,
+            target_class_buf: Vec::new(),
+            ref_leaf_entries: 0,
+            ref_truncated: false,
             result: SpotClassStats::default(),
         }
     }
@@ -334,7 +448,7 @@ impl SpotClassStatsCollector {
             *self.prop_langs.entry((sr.p_id, sr.lang_id)).or_insert(0) += 1;
         }
 
-        if is_ref && self.class_bitset.is_some() {
+        if is_ref && self.class_membership.is_some() {
             self.ref_targets.push((sr.p_id, sr.o_key));
         }
     }
@@ -378,10 +492,13 @@ impl SpotClassStatsCollector {
             }
         }
 
-        if let Some(ref bitset) = self.class_bitset {
+        if let Some(membership) = self.class_membership.as_ref() {
+            // Detach the scratch buffer so it does not alias `self` while the
+            // membership (also a field of `self`) is borrowed immutably below.
+            let mut tbuf = std::mem::take(&mut self.target_class_buf);
             for &(p_id, target_sid) in &self.ref_targets {
-                let target_bits = bitset.get(g_id, target_sid);
-                if target_bits == 0 {
+                membership.collect_classes(g_id, target_sid, &mut tbuf);
+                if tbuf.is_empty() {
                     continue;
                 }
                 for &src_class in &self.classes {
@@ -392,15 +509,24 @@ impl SpotClassStatsCollector {
                         .or_default()
                         .entry(p_id)
                         .or_default();
-                    let mut bits = target_bits;
-                    while bits != 0 {
-                        let bit_idx = bits.trailing_zeros() as usize;
-                        let target_class = bitset.bit_to_class[bit_idx];
-                        *ref_entry.entry(target_class).or_insert(0) += 1;
-                        bits &= bits - 1;
+                    for &target_class in &tbuf {
+                        match ref_entry.entry(target_class) {
+                            std::collections::hash_map::Entry::Occupied(mut e) => {
+                                *e.get_mut() += 1;
+                            }
+                            std::collections::hash_map::Entry::Vacant(e) => {
+                                if self.ref_leaf_entries >= MAX_CLASS_REF_LEAF_ENTRIES {
+                                    self.ref_truncated = true;
+                                } else {
+                                    e.insert(1);
+                                    self.ref_leaf_entries += 1;
+                                }
+                            }
+                        }
                     }
                 }
             }
+            self.target_class_buf = tbuf;
         }
 
         self.classes.clear();
@@ -411,6 +537,14 @@ impl SpotClassStatsCollector {
 
     pub fn finish(mut self) -> SpotClassStats {
         self.flush_subject();
+        if self.ref_truncated {
+            tracing::warn!(
+                recorded_ref_entries = self.ref_leaf_entries,
+                budget = MAX_CLASS_REF_LEAF_ENTRIES,
+                "class ref-target stats hit the per-build entry budget and were truncated; \
+                 stats.classes[*].properties[*].ref-classes may omit the rarest class pairs"
+            );
+        }
         self.result
     }
 }
@@ -446,17 +580,24 @@ pub fn build_indexes_from_commits(
     let spot_commits = commits.to_vec();
     let spot_config = config.clone();
     let spot_rdf_type_p_id = stats_hook.as_ref().and_then(|hook| hook.rdf_type_p_id());
-    let spot_class_bitset = if spot_rdf_type_p_id.is_some() {
-        ClassBitsetTable::build_from_commits(commits)?
+    let spot_class_membership = if spot_rdf_type_p_id.is_some() {
+        ClassMembership::build_from_commits(commits)?
     } else {
         None
     };
+    if let Some(ref m) = spot_class_membership {
+        tracing::debug!(
+            classes = m.distinct_class_count(),
+            sparse = matches!(m, ClassMembership::Sparse(_)),
+            "class membership built for ref-target stats"
+        );
+    }
     let spot_handle = std::thread::spawn(move || {
         build_spot_index_from_commits(
             &spot_commits,
             &spot_config,
             spot_rdf_type_p_id,
-            spot_class_bitset,
+            spot_class_membership,
         )
     });
 
@@ -482,6 +623,14 @@ pub fn build_indexes_from_commits(
             let remap_progress = config.remap_progress.clone();
             let target_g_id = config.g_id;
             let collect_stats = stats_hook.is_some();
+            // IMPORTANT: worker hooks intentionally do NOT set rdf:type p_id.
+            // Setting it makes `IdStatsHook::on_record` build per-subject class /
+            // ref / datatype maps for every distinct subject — tens of GB across
+            // workers and a >500s serial merge + finalize on large imports (and
+            // an OOM risk). Class and ref-class stats are instead produced —
+            // uncapped — by the `SpotClassStatsCollector` via `ClassMembership`.
+            // Worker hooks keep only the cheap per-property HLL / datatype /
+            // graph-flake aggregates.
 
             handles.push(scope.spawn(
                 move || -> io::Result<(u64, Option<crate::stats::IdStatsHook>)> {
@@ -592,6 +741,11 @@ pub fn build_indexes_from_commits(
         skip_history: true, // Append-only: no time-travel data.
         g_id: config.g_id,
         progress: config.build_progress.clone(),
+        // Build the secondary orders (PSOT/POST/OPST) concurrently, bounded by
+        // the import core budget. SPOT already builds on its own thread above,
+        // so total concurrent build threads are ~1 (SPOT) + max_concurrency.
+        // build_all_indexes clamps this to the number of buildable orders.
+        max_concurrency: config.worker_count,
     };
 
     let mut order_results = build_all_indexes(&build_config).map_err(io::Error::other)?;
@@ -637,7 +791,7 @@ fn build_spot_index_from_commits(
     commits: &[CommitInput],
     config: &BuildConfig,
     rdf_type_p_id: Option<u32>,
-    class_bitset: Option<ClassBitsetTable>,
+    class_membership: Option<ClassMembership>,
 ) -> io::Result<(IndexBuildResult, Option<SpotClassStats>)> {
     let g_id = config.g_id;
     let index_dir = &config.index_dir;
@@ -681,16 +835,24 @@ fn build_spot_index_from_commits(
 
     let mut merge = KWayMerge::new(streams, cmp_v2_spot)?;
     let order = RunSortOrder::Spot;
-    let order_name = order.dir_name();
-    std::fs::create_dir_all(index_dir.join(format!("graph_{g_id}/{order_name}")))?;
 
-    let mut writer = LeafWriter::new(order, leaflet_target_rows, leaf_target_rows, zstd_level);
+    // Streams each completed leaf to disk as produced (see PersistingLeafWriter)
+    // so the SPOT build — which overlaps the parallel secondary-order builds —
+    // does not retain its whole compressed leaf set in RAM.
+    let mut writer = PersistingLeafWriter::new(
+        g_id,
+        order,
+        index_dir,
+        leaflet_target_rows,
+        leaf_target_rows,
+        zstd_level,
+    )?;
     writer.set_skip_history(true);
 
     let mut total_rows = 0u64;
     let mut progress_batch = 0u64;
     let mut class_stats_collector =
-        rdf_type_p_id.map(|p_id| SpotClassStatsCollector::new(p_id, class_bitset));
+        rdf_type_p_id.map(|p_id| SpotClassStatsCollector::new(p_id, class_membership));
     while let Some((record, op)) = merge.next_record()? {
         if op == 0 {
             continue;
@@ -714,7 +876,7 @@ fn build_spot_index_from_commits(
         }
     }
 
-    let result = finish_graph_v2(g_id, order, writer, index_dir, order_name)?;
+    let result = writer.finish()?;
     tracing::info!(
         g_id,
         total_rows,
@@ -811,6 +973,9 @@ pub fn build_indexes_from_remapped_commits(
         skip_history: false, // Produce history sidecars for time-travel.
         g_id: config.g_id,
         progress: config.build_progress.clone(),
+        // Rebuild path builds all 4 orders here (no separate SPOT thread), so
+        // concurrency can cover all of them, bounded by the core budget.
+        max_concurrency: config.worker_count,
     };
 
     let order_results = build_all_indexes(&build_config).map_err(io::Error::other)?;
@@ -976,91 +1141,127 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// Helper: write `.types` sidecar entries (g_id: u16, s_id: u64, class_sid64: u64).
+    fn write_types_sidecar(path: &std::path::Path, entries: &[(u16, u64, u64)]) {
+        use std::io::Write;
+        let mut file = std::fs::File::create(path).unwrap();
+        for (g_id, s_id, c_id) in entries {
+            file.write_all(&g_id.to_le_bytes()).unwrap();
+            file.write_all(&s_id.to_le_bytes()).unwrap();
+            file.write_all(&c_id.to_le_bytes()).unwrap();
+        }
+    }
+
     #[test]
-    fn class_bitset_build_from_global_types() {
+    fn class_membership_bitset_for_few_classes() {
         let dir = tempfile::tempdir().unwrap();
         let types_path = dir.path().join("chunk_00000.types");
 
-        // Write .types sidecar entries: (g_id: u16, s_id: u64, class_sid64: u64)
-        // Subject 100 is class A (sid=1000), subject 200 is class A and class B (sid=2000).
+        // Subject 100 is class A (sid=1000); subject 200 is class A and class B (sid=2000).
         let class_a: u64 = 1000;
         let class_b: u64 = 2000;
-        let entries: Vec<(u16, u64, u64)> =
-            vec![(0, 100, class_a), (0, 200, class_a), (0, 200, class_b)];
+        write_types_sidecar(
+            &types_path,
+            &[(0, 100, class_a), (0, 200, class_a), (0, 200, class_b)],
+        );
 
-        {
-            let mut file = std::fs::File::create(&types_path).unwrap();
-            for (g_id, s_id, c_id) in &entries {
-                use std::io::Write;
-                file.write_all(&g_id.to_le_bytes()).unwrap();
-                file.write_all(&s_id.to_le_bytes()).unwrap();
-                file.write_all(&c_id.to_le_bytes()).unwrap();
-            }
-        }
-
-        let table = ClassBitsetTable::build_from_global_types(&[types_path])
+        let membership = ClassMembership::build_from_global_types(&[types_path])
             .unwrap()
-            .expect("should produce a table");
+            .expect("should produce membership");
 
-        // Both classes should be mapped.
-        assert_eq!(table.bit_to_class.len(), 2);
+        // ≤ 64 classes ⇒ dense bitset fast path.
+        let ClassMembership::Bitset(table) = &membership else {
+            panic!("expected bitset variant for ≤ 64 classes");
+        };
+        assert_eq!(membership.distinct_class_count(), 2);
         assert!(table.bit_to_class.contains(&class_a));
         assert!(table.bit_to_class.contains(&class_b));
 
+        let mut buf = Vec::new();
         // Subject 100: only class A.
-        let bits_100 = table.get(0, 100);
-        assert_ne!(bits_100, 0);
-        // Exactly one bit set.
-        assert_eq!(bits_100.count_ones(), 1);
-
-        // Subject 200: both class A and class B.
-        let bits_200 = table.get(0, 200);
-        assert_eq!(bits_200.count_ones(), 2);
-
-        // Unknown subject returns 0.
-        assert_eq!(table.get(0, 999), 0);
-        // Unknown graph returns 0.
-        assert_eq!(table.get(5, 100), 0);
+        membership.collect_classes(0, 100, &mut buf);
+        assert_eq!(buf, vec![class_a]);
+        // Subject 200: both classes (collect_classes order follows bit order).
+        membership.collect_classes(0, 200, &mut buf);
+        buf.sort_unstable();
+        assert_eq!(buf, vec![class_a, class_b]);
+        // Unknown subject / graph ⇒ empty.
+        membership.collect_classes(0, 999, &mut buf);
+        assert!(buf.is_empty());
+        membership.collect_classes(5, 100, &mut buf);
+        assert!(buf.is_empty());
     }
 
     #[test]
-    fn class_bitset_overflow_at_64_classes() {
+    fn class_membership_promotes_to_sparse_above_64() {
         let dir = tempfile::tempdir().unwrap();
         let types_path = dir.path().join("overflow.types");
 
-        // Write 65 distinct classes — the 65th should be silently dropped.
-        {
-            let mut file = std::fs::File::create(&types_path).unwrap();
-            for class_idx in 0u64..65 {
-                use std::io::Write;
-                let g_id: u16 = 0;
-                let s_id: u64 = class_idx + 1; // unique subject per class
-                let c_id: u64 = 10_000 + class_idx;
-                file.write_all(&g_id.to_le_bytes()).unwrap();
-                file.write_all(&s_id.to_le_bytes()).unwrap();
-                file.write_all(&c_id.to_le_bytes()).unwrap();
-            }
+        // 65 distinct classes, one unique subject each. The old bitset capped at
+        // 64 and dropped the 65th; the sparse promotion must retain ALL of them.
+        let mut entries: Vec<(u16, u64, u64)> = Vec::new();
+        for class_idx in 0u64..65 {
+            entries.push((0, class_idx + 1, 10_000 + class_idx));
         }
+        write_types_sidecar(&types_path, &entries);
 
-        let table = ClassBitsetTable::build_from_global_types(&[types_path])
+        let membership = ClassMembership::build_from_global_types(&[types_path])
             .unwrap()
-            .expect("should produce a table");
+            .expect("should produce membership");
 
-        // Only 64 classes should be retained.
-        assert_eq!(table.bit_to_class.len(), 64);
+        assert!(
+            matches!(membership, ClassMembership::Sparse(_)),
+            "should promote to sparse above 64 classes"
+        );
+        assert_eq!(membership.distinct_class_count(), 65);
 
-        // First 64 subjects should have a bit set.
-        for s_id in 1u64..=64 {
-            assert_ne!(table.get(0, s_id), 0, "subject {s_id} should be mapped");
+        // Every subject (including the 65th, which the old code truncated) maps
+        // to exactly its class.
+        let mut buf = Vec::new();
+        for class_idx in 0u64..65 {
+            let s_id = class_idx + 1;
+            let c_id = 10_000 + class_idx;
+            membership.collect_classes(0, s_id, &mut buf);
+            assert_eq!(buf, vec![c_id], "subject {s_id} should map to class {c_id}");
         }
-
-        // Subject 65 has the 65th class which overflowed — no bit set.
-        assert_eq!(table.get(0, 65), 0);
+        membership.collect_classes(0, 9999, &mut buf);
+        assert!(buf.is_empty());
     }
 
     #[test]
-    fn class_bitset_no_types_files_returns_none() {
-        let result = ClassBitsetTable::build_from_global_types(&[]).unwrap();
+    fn class_membership_promotion_carries_early_bitset_rows() {
+        let dir = tempfile::tempdir().unwrap();
+        let types_path = dir.path().join("carry.types");
+
+        // Subject 1 gets an early class (bitset mode), then 64 more distinct
+        // classes force promotion, then subject 1 gets another class (sparse
+        // mode). After promotion the early bitset bit must be carried over so
+        // subject 1 ends up with BOTH classes.
+        let mut entries: Vec<(u16, u64, u64)> = vec![(0, 1, 500)];
+        for class_idx in 0u64..64 {
+            entries.push((0, 1000 + class_idx, 20_000 + class_idx));
+        }
+        entries.push((0, 1, 999)); // subject 1's second class, added in sparse mode
+        write_types_sidecar(&types_path, &entries);
+
+        let membership = ClassMembership::build_from_global_types(&[types_path])
+            .unwrap()
+            .expect("should produce membership");
+        assert!(matches!(membership, ClassMembership::Sparse(_)));
+
+        let mut buf = Vec::new();
+        membership.collect_classes(0, 1, &mut buf);
+        buf.sort_unstable();
+        assert_eq!(
+            buf,
+            vec![500, 999],
+            "promotion must carry the early bitset class (500) plus the sparse-mode class (999)"
+        );
+    }
+
+    #[test]
+    fn class_membership_no_types_files_returns_none() {
+        let result = ClassMembership::build_from_global_types(&[]).unwrap();
         assert!(result.is_none());
     }
 }

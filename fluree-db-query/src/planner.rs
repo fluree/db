@@ -8,7 +8,7 @@
 //! `build_where_operators_seeded` in `execute/where_plan.rs`.
 
 use crate::ir::triple::{Ref, Term, TriplePattern};
-use crate::ir::{CompareOp, Function, Pattern};
+use crate::ir::{CompareOp, Function, Grouping, Pattern, SubqueryPattern};
 use crate::var_registry::VarId;
 use fluree_db_core::{FlakeValue, PropertyStatData, StatsView};
 use std::collections::{HashMap, HashSet};
@@ -50,6 +50,13 @@ const DEFAULT_BOUND_OBJECT_SELECTIVITY: f64 = 1_000.0;
 /// With no statistics, assume these are relatively large so we avoid placing
 /// them before bound-object constraints.
 const DEFAULT_PROPERTY_SCAN_SELECTIVITY: f64 = 1_000_000.0;
+/// Output estimate for a transitive path (`<s> <p>+ ?o`, etc.) anchored at a bound
+/// endpoint: a constant subject/object, or a variable already bound by an earlier
+/// pattern. Such a path enumerates the reachable set from that fixed node — a small
+/// bounded closure, not a world scan — so it should drive a join (the planner then
+/// probes the joined predicate by the produced var) instead of letting a
+/// high-cardinality predicate scan run first. See issue #1287.
+const ANCHORED_PROPERTY_PATH_SELECTIVITY: f64 = 100.0;
 /// Full scan - all variables unbound
 const FULL_SCAN: f64 = 1e12;
 
@@ -780,9 +787,28 @@ pub fn estimate_pattern(
             }
         }
 
-        Pattern::Subquery(sq) => PatternEstimate::Source {
-            row_count: estimate_branch_cardinality(&sq.patterns, stats),
-        },
+        Pattern::Subquery(sq) => {
+            // Join ordering cares about a subquery's OUTPUT cardinality, not the
+            // size of its internal scan. A scalar aggregate (no `GROUP BY`) emits
+            // exactly one row. Estimating it by the (large) body cardinality
+            // wrongly ranks the subquery as a huge source and pushes it to the
+            // END of the join order — precisely where, if it is uncorrelated, it
+            // gets re-executed once per parent row (see `SubqueryOperator`'s
+            // uncorrelated fast-path). Treat a scalar-aggregate subquery as a
+            // single row so the planner places it early.
+            let rows = match &sq.grouping {
+                Some(Grouping::Implicit { .. }) => HIGHLY_SELECTIVE,
+                // `Explicit` GROUP BY emits one row per distinct key combination
+                // and `None` emits one row per solution; absent per-key NDV we
+                // keep the body estimate (an upper bound) for these.
+                _ => estimate_branch_cardinality(&sq.patterns, stats),
+            };
+            // A LIMIT caps the output regardless of grouping.
+            let rows = sq.limit.map_or(rows, |l| rows.min(l as f64));
+            PatternEstimate::Source {
+                row_count: rows.max(HIGHLY_SELECTIVE),
+            }
+        }
 
         Pattern::Optional(_) => PatternEstimate::Expander { multiplier: 1.0 },
 
@@ -814,9 +840,21 @@ pub fn estimate_pattern(
             row_count: estimate_branch_cardinality(patterns, stats),
         },
 
-        Pattern::PropertyPath(_) => PatternEstimate::Source {
-            row_count: DEFAULT_PROPERTY_SCAN_SELECTIVITY,
-        },
+        Pattern::PropertyPath(pp) => {
+            // Anchored at a bound endpoint => a bounded closure from a fixed node,
+            // not a full predicate scan. Estimating it as a world scan made reorder
+            // drive a high-cardinality join predicate first (issue #1287).
+            let anchored = |r: &Ref| match r {
+                Ref::Var(v) => bound_vars.contains(v),
+                _ => true, // constant Sid/Iri endpoint
+            };
+            let row_count = if anchored(&pp.subject) || anchored(&pp.object) {
+                ANCHORED_PROPERTY_PATH_SELECTIVITY
+            } else {
+                DEFAULT_PROPERTY_SCAN_SELECTIVITY
+            };
+            PatternEstimate::Source { row_count }
+        }
 
         Pattern::R2rml(_) => PatternEstimate::Source {
             row_count: DEFAULT_PROPERTY_SCAN_SELECTIVITY,
@@ -1062,6 +1100,29 @@ pub fn reorder_patterns(
             continue;
         }
 
+        // A CORRELATED subquery — one whose SELECT list shares variables with
+        // other patterns in this group — must execute AFTER those variables are
+        // bound. `SubqueryOperator` derives its correlation set from the
+        // variables its child (the patterns placed before it) provides; if the
+        // subquery were hoisted ahead of them, that set would be empty and it
+        // would compute a single global result instead of a per-row correlated
+        // one. Defer it on its correlation variables, exactly like MINUS/EXISTS.
+        //
+        // UNCORRELATED subqueries are intentionally NOT deferred: they fall
+        // through to source classification, so a scalar-aggregate subquery is
+        // still placed early via its (now accurate) single-row estimate.
+        if let Pattern::Subquery(sq) = pattern {
+            let corr = subquery_correlation_vars(sq, patterns, i);
+            if !corr.is_empty() {
+                deferred.push(DeferredPattern {
+                    orig_index: i,
+                    required_vars: corr,
+                    pattern: pattern.clone(),
+                });
+                continue;
+            }
+        }
+
         match estimate_pattern(pattern, &bound_vars, stats) {
             PatternEstimate::Source { .. } => sources.push(RankedPattern {
                 orig_index: i,
@@ -1163,6 +1224,47 @@ fn try_place_reducer(
     }
 }
 
+/// Tie-break signal for join ordering: if the candidate source is placed (binding
+/// its produced vars), the largest probe-predicate count that would become an
+/// object→subject hash join — a remaining triple `?s <p> ?o` whose object `?o` the
+/// candidate binds while the subject `?s` stays new. Driving from such a start keeps
+/// that high-cardinality predicate a single contiguous hash-probe scan instead of a
+/// forward join over a large intermediate, so among equally-selective starts we
+/// prefer the one unlocking the biggest such scan. Returns `0` when nothing is
+/// unlocked or stats are absent, so it only ever breaks exact row-count ties.
+fn unlocked_object_hash_scan(
+    candidate: usize,
+    remaining: &[RankedPattern],
+    bound_vars: &HashSet<VarId>,
+    stats: Option<&StatsView>,
+) -> u64 {
+    let Some(stats) = stats else { return 0 };
+    let produced: HashSet<VarId> = remaining[candidate]
+        .pattern
+        .produced_vars()
+        .into_iter()
+        .collect();
+    remaining
+        .iter()
+        .enumerate()
+        .filter(|(k, _)| *k != candidate)
+        .filter_map(|(_, rp)| {
+            let Pattern::Triple(tp) = &rp.pattern else {
+                return None;
+            };
+            let o = tp.o.as_var()?;
+            let s = tp.s.as_var()?;
+            // Object newly bound by the candidate; subject still new (the probe shape).
+            if produced.contains(&o) && !produced.contains(&s) && !bound_vars.contains(&s) {
+                property_stats(stats, &tp.p).map(|p| p.count)
+            } else {
+                None
+            }
+        })
+        .max()
+        .unwrap_or(0)
+}
+
 /// Try to place the best source. Returns true if one was placed.
 fn try_place_source(
     remaining: &mut Vec<RankedPattern>,
@@ -1212,6 +1314,17 @@ fn try_place_source(
             ci.row_count()
                 .partial_cmp(&cj.row_count())
                 .unwrap_or(std::cmp::Ordering::Equal)
+        })
+        // Before falling back to original index: among equally-selective starts,
+        // prefer the one that turns the LARGER predicate into an object→subject
+        // hash join rather than a forward join over a big intermediate. This flips
+        // a BSBM-BI bowtie (two equally-selective country filters, written
+        // producer/DE-first) onto the side whose chain keeps the 2.85M-row
+        // predicate hash-able — 46x on BI-1's F2.
+        .then_with(|| {
+            let bi = unlocked_object_hash_scan(i, &remaining[..], bound_vars, stats);
+            let bj = unlocked_object_hash_scan(j, &remaining[..], bound_vars, stats);
+            bj.cmp(&bi)
         })
         .then_with(|| remaining[i].orig_index.cmp(&remaining[j].orig_index))
     });
@@ -1324,6 +1437,63 @@ fn drain_ready_deferred(
 ///
 /// - FILTER: all referenced variables
 /// - BIND: the expression's variables (not the target variable)
+///
+/// Variables a subquery correlates on: its SELECT-list variables that are also
+/// produced by some OTHER pattern in the enclosing group. These must be bound
+/// before the subquery runs, so the planner defers it until they are. An empty
+/// result means the subquery is uncorrelated (safe to place early).
+///
+/// A shared variable that the subquery **produces itself** (binds in its own
+/// WHERE — e.g. a `GROUP BY` key) is a JOIN key, not a correlation input:
+/// seeding it per outer row is equivalent to evaluating the subquery once and
+/// filtering its output to that value, so it can run once and be hash-joined.
+///
+/// Two safety conditions on this declassification:
+/// 1. **No inner slice.** With `LIMIT`/`OFFSET`, the per-row restriction changes
+///    which rows survive the slice (e.g. `ORDER BY DESC(?x) LIMIT 1` means "top
+///    row per outer binding"), so such a subquery stays genuinely correlated.
+/// 2. **Unconditionally bound.** The variable must be bound in *every* subquery
+///    solution — produced by a top-level required pattern (a triple or property
+///    path), NOT inside a `UNION` branch or `OPTIONAL`. A conditionally-bound
+///    var can be Unbound in some output rows; evaluating once and joining would
+///    then differ from per-row seeding (an Unbound join key would scan rather
+///    than filter). We only count always-bound producers.
+fn subquery_correlation_vars(
+    sq: &SubqueryPattern,
+    siblings: &[Pattern],
+    self_idx: usize,
+) -> HashSet<VarId> {
+    let select: HashSet<VarId> = sq.select.iter().copied().collect();
+    if select.is_empty() {
+        return HashSet::new();
+    }
+    // Variables the subquery binds in EVERY solution on its own — but only when
+    // no inner slice makes per-row seeding result-sensitive. Restricted to
+    // top-level required producers (triples / property paths) so a var that is
+    // only conditionally bound (UNION branch, OPTIONAL) is NOT declassified.
+    let self_produced: HashSet<VarId> = if sq.limit.is_none() && sq.offset.is_none() {
+        sq.patterns
+            .iter()
+            .filter(|p| matches!(p, Pattern::Triple(_) | Pattern::PropertyPath(_)))
+            .flat_map(Pattern::produced_vars)
+            .collect()
+    } else {
+        HashSet::new()
+    };
+    let mut corr = HashSet::new();
+    for (j, p) in siblings.iter().enumerate() {
+        if j == self_idx {
+            continue;
+        }
+        for v in p.produced_vars() {
+            if select.contains(&v) && !self_produced.contains(&v) {
+                corr.insert(v);
+            }
+        }
+    }
+    corr
+}
+
 fn deferred_required_vars(pattern: &Pattern) -> Vec<VarId> {
     match pattern {
         Pattern::Filter(expr) => expr.referenced_vars(),
@@ -1344,6 +1514,61 @@ mod tests {
 
     fn make_pattern(s: VarId, p_name: &str, o: VarId) -> TriplePattern {
         TriplePattern::new(Ref::Var(s), Ref::Sid(Sid::new(100, p_name)), Term::Var(o))
+    }
+
+    #[test]
+    fn anchored_property_path_is_selective_and_drives_the_join() {
+        // Issue #1287: <c912> skos:broader+ ?b . ?b skos:prefLabel ?lbl
+        use crate::ir::path::{PathModifier, PropertyPathPattern};
+        let b = VarId(0);
+        let lbl = VarId(1);
+        let bound = HashSet::new();
+
+        // Anchored at a constant subject => bounded closure (selective).
+        let anchored = Pattern::PropertyPath(PropertyPathPattern::new(
+            Ref::Sid(Sid::new(9, "c912")),
+            Sid::new(1, "broader"),
+            PathModifier::OneOrMore,
+            Ref::Var(b),
+        ));
+        assert_eq!(
+            estimate_pattern(&anchored, &bound, None).row_count(),
+            ANCHORED_PROPERTY_PATH_SELECTIVITY
+        );
+
+        // Both endpoints free => genuinely unbounded, keep the world-scan estimate.
+        let unanchored = Pattern::PropertyPath(PropertyPathPattern::new(
+            Ref::Var(VarId(2)),
+            Sid::new(1, "broader"),
+            PathModifier::OneOrMore,
+            Ref::Var(b),
+        ));
+        assert_eq!(
+            estimate_pattern(&unanchored, &bound, None).row_count(),
+            DEFAULT_PROPERTY_SCAN_SELECTIVITY
+        );
+
+        // End to end: the anchored path drives ahead of a 150k prefLabel scan even
+        // when written after it — otherwise the planner full-scans prefLabel (88s).
+        let pref = Pattern::Triple(TriplePattern::new(
+            Ref::Var(b),
+            Ref::Sid(Sid::new(2, "prefLabel")),
+            Term::Var(lbl),
+        ));
+        let mut stats = StatsView::default();
+        stats.properties.insert(
+            Sid::new(2, "prefLabel"),
+            PropertyStatData {
+                count: 150_000,
+                ndv_values: 150_000,
+                ndv_subjects: 6_000,
+            },
+        );
+        let ordered = reorder_patterns(&[pref, anchored], Some(&stats), &HashSet::new());
+        assert!(
+            matches!(&ordered[0], Pattern::PropertyPath(_)),
+            "anchored path must drive before the high-cardinality scan: {ordered:?}"
+        );
     }
 
     /// Count top-level patterns matching a predicate.
@@ -1463,6 +1688,73 @@ mod tests {
         assert!(
             first.produced_vars().contains(&s),
             "expected first pattern to join with seeded bound vars"
+        );
+    }
+
+    #[test]
+    fn reorder_bowtie_drives_the_side_that_unlocks_the_bigger_hash_join() {
+        // BSBM-BI F2 shape, written producer/DE-first:
+        //   ?product producer ?producer . ?producer country DE .
+        //   ?review reviewFor ?product . ?review reviewer ?reviewer . ?reviewer country US .
+        // Both country filters tie on estimate (same predicate). The tie-break must
+        // drive from the US side, because that makes the 2.85M-row rev:reviewer join
+        // an object→subject hash join; DE-first only unlocks the 285K producer join
+        // and leaves the reviewer chain as forward joins (the 110s→2.38s case).
+        let product = VarId(0);
+        let producer = VarId(1);
+        let review = VarId(2);
+        let reviewer = VarId(3);
+        let pat = |s: VarId, p: &str, o: Term| {
+            Pattern::Triple(TriplePattern::new(Ref::Var(s), Ref::Sid(Sid::new(1, p)), o))
+        };
+        let patterns = vec![
+            pat(product, "producer", Term::Var(producer)),
+            pat(producer, "country", Term::Sid(Sid::new(9, "DE"))),
+            pat(review, "reviewFor", Term::Var(product)),
+            pat(review, "reviewer", Term::Var(reviewer)),
+            pat(reviewer, "country", Term::Sid(Sid::new(9, "US"))),
+        ];
+
+        let mut stats = StatsView::default();
+        let mut put = |name: &str, count: u64, ndv_values: u64| {
+            stats.properties.insert(
+                Sid::new(1, name),
+                PropertyStatData {
+                    count,
+                    ndv_values,
+                    ndv_subjects: count,
+                },
+            );
+        };
+        put("producer", 284_826, 5_600);
+        put("country", 386_525, 25); // count/ndv = 15,461 — both filters tie here
+        put("reviewFor", 2_848_260, 280_000);
+        put("reviewer", 2_848_260, 570_000);
+
+        let ordered = reorder_patterns(&patterns, Some(&stats), &HashSet::new());
+        let first = match &ordered[0] {
+            Pattern::Triple(tp) => tp,
+            _ => panic!("expected Triple first"),
+        };
+        // Drives from the US country filter (binds ?reviewer), not the DE one.
+        assert_eq!(first.p.as_sid().map(|s| &*s.name), Some("country"));
+        assert_eq!(
+            first.o.as_sid().map(|s| &*s.name),
+            Some("US"),
+            "tie-break should drive the side that unlocks the 2.85M rev:reviewer hash join, got {ordered:?}"
+        );
+        // ...and rev:reviewer is placed before producer (US chain first).
+        let pred_order: Vec<&str> = ordered
+            .iter()
+            .filter_map(|p| match p {
+                Pattern::Triple(tp) => tp.p.as_sid().map(|s| &*s.name),
+                _ => None,
+            })
+            .collect();
+        let pos = |name: &str| pred_order.iter().position(|p| *p == name).unwrap();
+        assert!(
+            pos("reviewer") < pos("producer"),
+            "reviewer chain should precede producer chain: {pred_order:?}"
         );
     }
 

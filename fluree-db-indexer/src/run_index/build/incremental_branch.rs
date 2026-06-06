@@ -184,6 +184,35 @@ where
     })
 }
 
+/// The leaves — and their sidecars — that [`update_branch`] will fetch for the
+/// given sorted novelty: exactly the leaves whose novelty slice is non-empty.
+///
+/// The caller prefetches these (asynchronously) so `update_branch`'s
+/// `fetch_leaf`/`fetch_sidecar` closures can read them from memory instead of
+/// blocking on CAS I/O from inside a `spawn_blocking` closure — on a
+/// blocking-pool thread a `block_on(S3)` has no tokio worker to drive its
+/// reactor, which wedges under slow remote storage. Uses the same slicing as
+/// `update_branch`, so the prefetched set matches the leaves it requests
+/// exactly.
+pub fn touched_leaf_refs(
+    existing_branch_bytes: &[u8],
+    novelty: &[RunRecordV2],
+    novelty_ops: &[u8],
+    order: RunSortOrder,
+) -> io::Result<Vec<(ContentId, Option<ContentId>)>> {
+    let manifest = read_branch_from_bytes(existing_branch_bytes)?;
+    let cmp = cmp_v2_for_order(order);
+    let slices = slice_novelty_to_leaves(novelty, novelty_ops, &manifest, cmp);
+    let mut refs = Vec::new();
+    for (i, (nov_slice, _ops)) in slices.iter().enumerate() {
+        if !nov_slice.is_empty() {
+            let leaf = &manifest.leaves[i];
+            refs.push((leaf.leaf_cid.clone(), leaf.sidecar_cid.clone()));
+        }
+    }
+    Ok(refs)
+}
+
 // ============================================================================
 // Novelty slicing
 // ============================================================================

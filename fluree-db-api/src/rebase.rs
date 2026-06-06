@@ -149,12 +149,6 @@ impl crate::Fluree {
         branch: &str,
         strategy: ConflictStrategy,
     ) -> Result<RebaseReport> {
-        if branch == "main" {
-            return Err(ApiError::InvalidBranch(
-                "Cannot rebase the main branch".to_string(),
-            ));
-        }
-
         let branch_id = format_ledger_id(ledger_name, branch);
         let branch_record = self
             .nameservice()
@@ -162,8 +156,15 @@ impl crate::Fluree {
             .await?
             .ok_or_else(|| ApiError::NotFound(branch_id.clone()))?;
 
+        // Refuse the root structurally — there's nothing to rebase onto.
+        // "main" carries no special meaning here; a ledger whose root is
+        // named "trunk" will be refused on `trunk`, and a non-root branch
+        // named "main" can be rebased like any other.
         let source_name = branch_record.source_branch.as_ref().ok_or_else(|| {
-            ApiError::InvalidBranch(format!("Branch {branch_id} has no source branch"))
+            ApiError::InvalidBranch(format!(
+                "Cannot rebase '{branch}': it is the root of ledger '{ledger_name}' \
+                 (no parent to rebase onto)."
+            ))
         })?;
 
         let source_id = format_ledger_id(ledger_name, source_name);
@@ -317,7 +318,7 @@ impl crate::Fluree {
         // Replay stages commits as writes to the branch. Start from the
         // source's queryable state, but relabel the snapshot before staging so
         // commit conflict checks and nameservice updates target the branch.
-        current_state.snapshot.ledger_id = ctx.branch_id.to_string();
+        std::sync::Arc::make_mut(&mut current_state.snapshot).ledger_id = ctx.branch_id.to_string();
 
         let mut report = RebaseReport {
             replayed: 0,

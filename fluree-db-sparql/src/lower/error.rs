@@ -43,10 +43,6 @@ pub enum LowerError {
     #[error("Invalid integer literal '{value}'")]
     InvalidInteger { value: String, span: SourceSpan },
 
-    /// Unsupported ORDER BY expression (MVP only supports variables)
-    #[error("Expression-based ORDER BY is not yet supported; use a variable")]
-    UnsupportedOrderByExpression { span: SourceSpan },
-
     /// Aggregate without alias (SELECT COUNT(?x) without AS ?var)
     #[error("Aggregate expressions must have an alias (AS ?var)")]
     AggregateWithoutAlias { span: SourceSpan },
@@ -131,11 +127,6 @@ impl LowerError {
         }
     }
 
-    /// Create an unsupported ORDER BY expression error.
-    pub fn unsupported_order_by_expr(span: SourceSpan) -> Self {
-        Self::UnsupportedOrderByExpression { span }
-    }
-
     /// Create an aggregate without alias error.
     pub fn aggregate_without_alias(span: SourceSpan) -> Self {
         Self::AggregateWithoutAlias { span }
@@ -179,7 +170,6 @@ impl LowerError {
             Self::UnsupportedQueryForm { span, .. } => *span,
             Self::InvalidDecimal { span, .. } => *span,
             Self::InvalidInteger { span, .. } => *span,
-            Self::UnsupportedOrderByExpression { span } => *span,
             Self::AggregateWithoutAlias { span } => *span,
             Self::UnsupportedCountStar { span } => *span,
             Self::InvalidPropertyPath { span, .. } => *span,

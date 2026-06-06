@@ -33,7 +33,8 @@ use axum::response::{IntoResponse, Response};
 use axum::Json;
 use fluree_db_api::{
     lower_sparql_update, parse_sparql, with_index_request_correlation, CommitOpts,
-    IndexRequestCorrelation, NamespaceRegistry, SparqlQueryBody, TrackingOptions, TxnOpts, TxnType,
+    IndexRequestCorrelation, NamespaceRegistry, PolicyStats, SparqlQueryBody, TrackingOptions,
+    TrackingTally, TxnOpts, TxnType,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
@@ -67,6 +68,62 @@ pub struct TransactResponse {
     pub tx_id: String,
     /// Commit information
     pub commit: CommitInfo,
+    /// Execution time when tracking was requested
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub time: Option<String>,
+    /// Fuel consumed when tracking was requested
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fuel: Option<f64>,
+    /// Policy stats when policy tracking was requested
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub policy: Option<std::collections::HashMap<String, PolicyStats>>,
+}
+
+fn transact_response(
+    ledger_id: String,
+    t: i64,
+    tx_id: String,
+    commit_hash: String,
+    tally: Option<&TrackingTally>,
+) -> TransactResponse {
+    TransactResponse {
+        ledger_id,
+        t,
+        tx_id,
+        commit: CommitInfo { hash: commit_hash },
+        time: tally.and_then(|t| t.time.clone()),
+        fuel: tally.and_then(|t| t.fuel),
+        policy: tally.and_then(|t| t.policy.clone()),
+    }
+}
+
+fn record_tracking_on_span(span: &tracing::Span, tally: &TrackingTally) {
+    if let Some(ref time) = tally.time {
+        span.record("tracker_time", time.as_str());
+    }
+    if let Some(fuel) = tally.fuel {
+        span.record("tracker_fuel", fuel);
+    }
+}
+
+/// Optimistic-concurrency / namespace-allocation conflicts that are resolved by
+/// reconciling the cached writer state to the current head and retrying.
+///
+/// All three arise when a transaction was lowered/sequenced against a snapshot
+/// that is no longer the head by commit time: `NamespaceConflict` (two writers
+/// raced on a first-time namespace code), `CommitConflict` (cached `t` fell
+/// behind the durable head), and `PublishLostRace` (another writer won the
+/// head CAS). Re-fetching the snapshot + re-lowering after a `refresh()`
+/// resolves all three.
+fn is_retryable_txn_conflict(e: &fluree_db_api::ApiError) -> bool {
+    matches!(
+        e,
+        fluree_db_api::ApiError::Transact(
+            fluree_db_api::TransactError::CommitConflict { .. }
+                | fluree_db_api::TransactError::PublishLostRace { .. }
+                | fluree_db_api::TransactError::NamespaceConflict(_)
+        )
+    )
 }
 
 /// Compute transaction ID from request body (SHA-256 hash)
@@ -686,6 +743,7 @@ async fn insert_local(
                 TxnType::Insert,
                 &turtle,
                 &credential,
+                &headers,
                 author.as_deref(),
             )
             .await;
@@ -831,6 +889,7 @@ async fn upsert_local(
                 TxnType::Upsert,
                 &turtle,
                 &credential,
+                &headers,
                 author.as_deref(),
             )
             .await;
@@ -977,6 +1036,7 @@ async fn insert_ledger_local(
                 TxnType::Insert,
                 &turtle,
                 &credential,
+                &headers,
                 author.as_deref(),
             )
             .await;
@@ -1123,6 +1183,7 @@ async fn upsert_ledger_local(
                 TxnType::Upsert,
                 &turtle,
                 &credential,
+                &headers,
                 author.as_deref(),
             )
             .await;
@@ -1207,8 +1268,13 @@ async fn execute_transaction(
     let qc_opts = fluree_db_api::QueryConnectionOptions::from_json(body).unwrap_or_default();
 
     // Create execution span
-    let span =
-        tracing::debug_span!("transact_execute", ledger_id = ledger_id, txn_type = ?txn_type);
+    let span = tracing::debug_span!(
+        "transact_execute",
+        ledger_id = ledger_id,
+        txn_type = ?txn_type,
+        tracker_time = tracing::field::Empty,
+        tracker_fuel = tracing::field::Empty,
+    );
     async move {
         let span = tracing::Span::current();
 
@@ -1272,7 +1338,80 @@ async fn execute_transaction(
             .or_else(|| author.map(String::from));
 
         // TxnOpts: unchanged by identity; commit provenance flows through CommitOpts.
-        let txn_opts = TxnOpts::default();
+        // Pick up `opts.shapes` from the body so inline SHACL shapes
+        // reach the staging path. Other TxnOpts fields are not yet
+        // surfaced over HTTP (branch/context/etc. come from headers
+        // or query params); add them here if a use case lands.
+        let mut txn_opts = TxnOpts::default();
+        if let Some(shapes) = body.get("opts").and_then(|o| o.get("shapes")) {
+            // Validate at the boundary: `shapes` must be a JSON-LD
+            // document (object) or an array of JSON-LD documents.
+            // Letting scalars / nulls fall through to
+            // `fluree_graph_json_ld::expand` surfaces as a fuzzy
+            // internal parse error rather than the precise 400
+            // the caller deserves.
+            //
+            // For the array form, every element must itself be an
+            // object — `[42]` or `[null]` would have passed the
+            // top-level type check, then failed downstream with a
+            // confusing message that doesn't match the documented
+            // contract.
+            match shapes {
+                JsonValue::Object(_) => {}
+                JsonValue::Array(arr) => {
+                    for (idx, item) in arr.iter().enumerate() {
+                        if !item.is_object() {
+                            set_span_error_code(&span, "error:BadRequest");
+                            return Err(ServerError::bad_request(format!(
+                                "opts.shapes[{idx}] must be a JSON-LD object; got {item}"
+                            )));
+                        }
+                    }
+                }
+                _ => {
+                    set_span_error_code(&span, "error:BadRequest");
+                    return Err(ServerError::bad_request(
+                        "opts.shapes must be a JSON-LD object or array of objects",
+                    ));
+                }
+            }
+            txn_opts.shapes = Some(shapes.clone());
+        }
+        if let Some(unique_props_raw) = body.get("opts").and_then(|o| o.get("uniqueProperties")) {
+            // Must be a JSON array. A scalar (or null) is a type
+            // error, not "empty list".
+            let Some(arr) = unique_props_raw.as_array() else {
+                set_span_error_code(&span, "error:BadRequest");
+                return Err(ServerError::bad_request(
+                    "opts.uniqueProperties must be an array of property IRI strings",
+                ));
+            };
+            // Every element must be a string. `filter_map` would
+            // silently drop integers/bools/etc. — that's exactly
+            // the silent-weakening pattern this PR pulls out of
+            // the rest of the governance code.
+            let mut iris: Vec<String> = Vec::with_capacity(arr.len());
+            for (idx, v) in arr.iter().enumerate() {
+                let Some(s) = v.as_str() else {
+                    set_span_error_code(&span, "error:BadRequest");
+                    return Err(ServerError::bad_request(format!(
+                        "opts.uniqueProperties[{idx}] must be a string IRI; got {v}"
+                    )));
+                };
+                iris.push(s.to_string());
+            }
+            // Empty array (`"uniqueProperties": []`) is intentionally
+            // treated as "no inline constraints" rather than an error
+            // — operators may build the array dynamically server-side
+            // and end up with zero entries; that's a request for no
+            // constraint enforcement, not a misconfiguration. Leaving
+            // `TxnOpts.unique_properties` as `None` keeps the staging
+            // pipeline on its fast-path (skip the inline branch
+            // entirely).
+            if !iris.is_empty() {
+                txn_opts.unique_properties = Some(iris);
+            }
+        }
 
         // Build and execute the transaction via the builder API.
         // Hoisted above CommitOpts assembly so we can spawn the raw-txn upload
@@ -1334,19 +1473,21 @@ async fn execute_transaction(
             }
         };
 
-        let response_json = Json(TransactResponse {
-            ledger_id: ledger_id.to_string(),
-            t: result.receipt.t,
+        if let Some(tally) = &result.tally {
+            record_tracking_on_span(&span, tally);
+        }
+        let response_json = Json(transact_response(
+            ledger_id.to_string(),
+            result.receipt.t,
             tx_id,
-            commit: CommitInfo {
-                hash: result.receipt.commit_id.to_string(),
-            },
-        });
+            result.receipt.commit_id.to_string(),
+            result.tally.as_ref(),
+        ));
 
         // Return tracking headers when a tally is present
-        match result.tally {
+        match &result.tally {
             Some(tally) => {
-                let hdrs = tracking_headers(&tally);
+                let hdrs = tracking_headers(tally);
                 Ok((hdrs, response_json).into_response())
             }
             None => Ok(response_json.into_response()),
@@ -1393,13 +1534,21 @@ async fn execute_turtle_transaction(
     txn_type: TxnType,
     turtle: &str,
     credential: &MaybeCredential,
+    headers: &FlureeHeaders,
     author: Option<&str>,
 ) -> Result<Response> {
     let is_trig = credential.is_trig();
 
     // Create execution span
     let format = if is_trig { "trig" } else { "turtle" };
-    let span = tracing::debug_span!("transact_execute", ledger_id = ledger_id, txn_type = ?txn_type, format = format);
+    let span = tracing::debug_span!(
+        "transact_execute",
+        ledger_id = ledger_id,
+        txn_type = ?txn_type,
+        format = format,
+        tracker_time = tracing::field::Empty,
+        tracker_fuel = tracing::field::Empty,
+    );
     async move {
         let span = tracing::Span::current();
 
@@ -1465,6 +1614,9 @@ async fn execute_turtle_transaction(
         if let Some(config) = &state.index_config {
             builder = builder.index_config(config.clone());
         }
+        if headers.has_tracking() {
+            builder = builder.tracking(headers.to_tracking_options());
+        }
 
         let correlation = index_request_correlation(
             &credential.headers,
@@ -1493,18 +1645,20 @@ async fn execute_turtle_transaction(
             }
         };
 
-        let response_json = Json(TransactResponse {
-            ledger_id: ledger_id.to_string(),
-            t: result.receipt.t,
+        if let Some(tally) = &result.tally {
+            record_tracking_on_span(&span, tally);
+        }
+        let response_json = Json(transact_response(
+            ledger_id.to_string(),
+            result.receipt.t,
             tx_id,
-            commit: CommitInfo {
-                hash: result.receipt.commit_id.to_string(),
-            },
-        });
+            result.receipt.commit_id.to_string(),
+            result.tally.as_ref(),
+        ));
 
-        match result.tally {
+        match &result.tally {
             Some(tally) => {
-                let hdrs = tracking_headers(&tally);
+                let hdrs = tracking_headers(tally);
                 Ok((hdrs, response_json).into_response())
             }
             None => Ok(response_json.into_response()),
@@ -1652,22 +1806,34 @@ async fn execute_sparql_update_request(
         "sparql-update",
     );
 
-    // Bounded retry around snapshot fetch + lowering + execute.
+    // Bounded reconcile-and-retry around snapshot fetch + lowering + execute.
     //
-    // `lower_sparql_update` allocates IRIs against a `NamespaceRegistry` built
-    // from the *current* snapshot to assign Sids to template terms. Two
-    // concurrent SPARQL UPDATEs racing on a fresh namespace can both pick the
-    // same first-time code for *different* prefixes, then the second writer
-    // hits `TransactError::NamespaceConflict` at staging because the staging
-    // registry sees the first writer's commit. The fix: re-fetch the snapshot
-    // and re-lower against the latest namespace allocations. Bounded to 3
-    // attempts to avoid livelock; the conflict is rare (requires concurrent
-    // writers AND first-time-namespace contention), so 1 retry is usually
-    // enough.
-    const MAX_NS_RETRIES: usize = 3;
+    // Two distinct write-path conflicts are both resolved here by reconciling
+    // the cached writer state to the current nameservice head and re-lowering:
+    //
+    //  * Namespace-allocation race: `lower_sparql_update` allocates IRIs
+    //    against a `NamespaceRegistry` built from the *current* snapshot to
+    //    assign Sids to template terms. Two concurrent SPARQL UPDATEs racing on
+    //    a fresh namespace can both pick the same first-time code for
+    //    *different* prefixes; the loser hits `TransactError::NamespaceConflict`
+    //    at staging. Re-lowering against the latest snapshot picks a fresh,
+    //    non-colliding code.
+    //
+    //  * Commit conflict / lost publish race: if the cached in-memory
+    //    `LedgerState` has fallen behind the durable nameservice head (e.g. a
+    //    prior commit published but a post-publish bookkeeping step failed,
+    //    stranding the cache), `verify_sequencing` returns `CommitConflict`
+    //    forever. `refresh()` below reconciles the cache to the head (applying
+    //    the missing commit incrementally) so the retry targets the right `t`.
+    //
+    // On any of these conflicts we `refresh()` the ledger before retrying so
+    // the next attempt observes both the latest namespace allocations and the
+    // latest `t`. Bounded to avoid livelock; under heavy new-namespace
+    // contention a writer may need several re-lowers before its code is free.
+    const MAX_TXN_RETRIES: usize = 16;
     let mut last_error: Option<ServerError> = None;
     let mut result = None;
-    for attempt in 1..=MAX_NS_RETRIES {
+    for attempt in 1..=MAX_TXN_RETRIES {
         let cached_state = handle.snapshot().await;
         let mut ns = NamespaceRegistry::from_db(&cached_state.snapshot);
 
@@ -1731,6 +1897,9 @@ async fn execute_sparql_update_request(
         if let Some(config) = &state.index_config {
             builder = builder.index_config(config.clone());
         }
+        if headers.has_tracking() {
+            builder = builder.tracking(headers.to_tracking_options());
+        }
         if let Some(ctx) = policy_ctx {
             builder = builder.policy(ctx);
         }
@@ -1747,15 +1916,31 @@ async fn execute_sparql_update_request(
                 result = Some(r);
                 break;
             }
-            Err(fluree_db_api::ApiError::Transact(
-                fluree_db_api::TransactError::NamespaceConflict(msg),
-            )) if attempt < MAX_NS_RETRIES => {
+            Err(e) if attempt < MAX_TXN_RETRIES && is_retryable_txn_conflict(&e) => {
+                // Reconcile the cached writer state to the current nameservice
+                // head before re-lowering: this advances `t` if the cache fell
+                // behind the durable head (heals a `CommitConflict` wedge) and
+                // surfaces the latest namespace allocations (so the re-lower
+                // picks a non-colliding code). `refresh` re-acquires the
+                // per-ledger write lock internally; the prior `execute()` has
+                // already released it, so there is no deadlock.
                 tracing::warn!(
                     attempt,
-                    max_attempts = MAX_NS_RETRIES,
-                    %msg,
-                    "SPARQL UPDATE namespace conflict; re-lowering against latest snapshot"
+                    max_attempts = MAX_TXN_RETRIES,
+                    error = %e,
+                    "SPARQL UPDATE write conflict; reconciling cached state and retrying"
                 );
+                if let Err(refresh_err) = fluree
+                    .refresh(&ledger_id, fluree_db_api::RefreshOpts::default())
+                    .await
+                {
+                    tracing::warn!(
+                        attempt,
+                        error = %refresh_err,
+                        "refresh during SPARQL UPDATE conflict retry failed; retrying anyway"
+                    );
+                }
+                last_error = Some(ServerError::Api(e));
                 continue;
             }
             Err(e) => {
@@ -1776,18 +1961,20 @@ async fn execute_sparql_update_request(
         }
     };
 
-    let response_json = Json(TransactResponse {
+    if let Some(tally) = &result.tally {
+        record_tracking_on_span(parent_span, tally);
+    }
+    let response_json = Json(transact_response(
         ledger_id,
-        t: result.receipt.t,
+        result.receipt.t,
         tx_id,
-        commit: CommitInfo {
-            hash: result.receipt.commit_id.to_string(),
-        },
-    });
+        result.receipt.commit_id.to_string(),
+        result.tally.as_ref(),
+    ));
 
-    match result.tally {
+    match &result.tally {
         Some(tally) => {
-            let hdrs = tracking_headers(&tally);
+            let hdrs = tracking_headers(tally);
             Ok((hdrs, response_json).into_response())
         }
         None => Ok(response_json.into_response()),

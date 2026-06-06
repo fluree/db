@@ -12,7 +12,7 @@ use fluree_db_query::context::ExecutionContext;
 use fluree_db_query::execute::{execute, ContextConfig, ExecutableQuery};
 use fluree_db_query::groupby::GroupByOperator;
 use fluree_db_query::ir::ReasoningConfig;
-use fluree_db_query::ir::{AggregateFn, AggregateSpec};
+use fluree_db_query::ir::{AggregateFn, AggregateSpec, InputSemantics};
 use fluree_db_query::ir::{Aggregation, Expression, Grouping, Pattern};
 use fluree_db_query::ir::{Query, QueryOutput};
 use fluree_db_query::operator::Operator;
@@ -85,6 +85,7 @@ fn make_query(select: Vec<VarId>, patterns: Vec<Pattern>) -> Query {
         patterns,
         grouping: None,
         ordering: Vec::new(),
+        order_binds: Vec::new(),
         limit: None,
         offset: None,
         reasoning: ReasoningConfig::default(),
@@ -142,10 +143,8 @@ async fn test_group_by_with_count() {
     query.grouping = Some(explicit_grouping(
         vec![VarId(0)], // GROUP BY ?city
         vec![AggregateSpec {
-            function: AggregateFn::Count,
-            input_var: Some(VarId(1)), // COUNT(?person)
-            output_var: VarId(1),      // AS ?count (replaces ?person col)
-            distinct: false,
+            function: AggregateFn::Count(VarId(1)), // COUNT(?person)
+            output_var: VarId(1),                   // AS ?count (replaces ?person col)
         }],
     ));
 
@@ -219,10 +218,8 @@ async fn test_group_by_with_sum() {
     query.grouping = Some(explicit_grouping(
         vec![VarId(0)],
         vec![AggregateSpec {
-            function: AggregateFn::Sum,
-            input_var: Some(VarId(1)),
+            function: AggregateFn::Sum(VarId(1), InputSemantics::List),
             output_var: VarId(1),
-            distinct: false,
         }],
     ));
 
@@ -302,10 +299,8 @@ async fn test_group_by_with_having() {
     query.grouping = Some(explicit_grouping_having(
         vec![VarId(0)],
         vec![AggregateSpec {
-            function: AggregateFn::Count,
-            input_var: Some(VarId(1)),
+            function: AggregateFn::Count(VarId(1)),
             output_var: VarId(1),
-            distinct: false,
         }],
         Expression::gt(
             Expression::Var(VarId(1)),
@@ -353,10 +348,8 @@ async fn test_aggregates_without_group_by() {
 
     // No GROUP BY, just SUM — implicit single-group aggregation.
     query.grouping = Some(implicit_grouping(vec![AggregateSpec {
-        function: AggregateFn::Sum,
-        input_var: Some(VarId(0)),
+        function: AggregateFn::Sum(VarId(0), InputSemantics::List),
         output_var: VarId(0),
-        distinct: false,
     }]));
 
     let db = GraphDbRef::new(&snapshot, 0, &NoOverlay, snapshot.t);
@@ -497,10 +490,8 @@ async fn test_aggregate_avg() {
     query.grouping = Some(explicit_grouping(
         vec![VarId(0)],
         vec![AggregateSpec {
-            function: AggregateFn::Avg,
-            input_var: Some(VarId(1)),
+            function: AggregateFn::Avg(VarId(1), InputSemantics::List),
             output_var: VarId(1),
-            distinct: false,
         }],
     ));
 
@@ -553,16 +544,12 @@ async fn test_aggregate_min_max() {
         vec![VarId(0)],
         vec![
             AggregateSpec {
-                function: AggregateFn::Min,
-                input_var: Some(VarId(1)),
+                function: AggregateFn::Min(VarId(1)),
                 output_var: VarId(1),
-                distinct: false,
             },
             AggregateSpec {
-                function: AggregateFn::Max,
-                input_var: Some(VarId(2)),
+                function: AggregateFn::Max(VarId(2)),
                 output_var: VarId(2),
-                distinct: false,
             },
         ],
     ));
@@ -657,10 +644,8 @@ async fn test_aggregate_on_group_by_key_errors() {
     query.grouping = Some(explicit_grouping(
         vec![VarId(0)],
         vec![AggregateSpec {
-            function: AggregateFn::Count,
-            input_var: Some(VarId(0)), // key var
+            function: AggregateFn::Count(VarId(0)), // key var
             output_var: VarId(0),
-            distinct: false,
         }],
     ));
     let options = ReasoningConfig::default();
