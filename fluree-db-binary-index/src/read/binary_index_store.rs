@@ -453,6 +453,81 @@ impl BinaryIndexStore {
         );
     }
 
+    /// Best-effort concurrent prewarm of the subject reverse-tree leaves a batch
+    /// of `(ns_code, suffix)` reverse lookups will touch. Encodes keys exactly as
+    /// [`Self::find_subject_id_by_parts`] does (`subject_reverse_key` over the same
+    /// `subject_reverse_tree`), so the warmed leaves are precisely those a
+    /// subsequent serial `reverse_lookup` reads. Only warms the disk cache —
+    /// lookup results are byte-identical.
+    ///
+    /// Remote-only: skipped if there is no CAS or the reverse tree has no disk
+    /// cache dir (a local/in-memory reader is already cheap). Bounded by the
+    /// shared `budget`; per-leaf failures are logged and ignored — the serial
+    /// lookup fetches them the old way.
+    pub async fn prefetch_subject_reverse_leaves(
+        &self,
+        parts: &[(u16, String)],
+        budget: &Arc<tokio::sync::Semaphore>,
+    ) {
+        use futures::stream::StreamExt;
+
+        let Some(cs) = self.cas.as_ref() else {
+            return;
+        };
+        let Some(tree) = self.dicts.subject_reverse_tree.as_ref() else {
+            return;
+        };
+        let Some(cache_dir) = tree.disk_cache_dir().map(Path::to_path_buf) else {
+            return;
+        };
+
+        let keys: Vec<Vec<u8>> = parts
+            .iter()
+            .map(|(ns_code, suffix)| {
+                crate::dict::reverse_leaf::subject_reverse_key(*ns_code, suffix.as_bytes())
+            })
+            .collect();
+
+        let mut seen: std::collections::HashSet<ContentId> = std::collections::HashSet::new();
+        let mut targets: Vec<ContentId> = Vec::new();
+        for address in tree.touched_leaf_addresses(keys.iter().map(Vec::as_slice)) {
+            if let Some(cid) = tree.remote_leaf_cid(address) {
+                if seen.insert(cid.clone()) {
+                    targets.push(cid.clone());
+                }
+            }
+        }
+
+        if targets.is_empty() {
+            return;
+        }
+
+        let width = budget.available_permits().max(1);
+        let target_count = targets.len();
+
+        futures::stream::iter(targets)
+            .for_each_concurrent(width, |cid| {
+                let budget = Arc::clone(budget);
+                let cache_dir = cache_dir.clone();
+                let cs = Arc::clone(cs);
+                async move {
+                    let Ok(_permit) = budget.acquire().await else {
+                        return;
+                    };
+                    if let Err(e) = fetch_cached_bytes_cid(cs.as_ref(), &cid, &cache_dir).await {
+                        tracing::debug!(%cid, error = %e, "subject reverse leaf prefetch failed; continuing");
+                    }
+                }
+            })
+            .await;
+
+        tracing::debug!(
+            leaves = target_count,
+            width,
+            "subject reverse leaf prefetch complete"
+        );
+    }
+
     fn note_remote_leaf_open(&self, leaf_cid: &ContentId) -> usize {
         let mut counts = self.remote_leaf_open_counts.write();
         let count = counts.entry(leaf_cid.clone()).or_insert(0);

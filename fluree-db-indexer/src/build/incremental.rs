@@ -2799,6 +2799,35 @@ pub async fn incremental_index(
                 let mut entries_by_key: std::collections::HashMap<(u16, u64), is::ClassStatEntry> =
                     std::collections::HashMap::new();
 
+                // Prewarm the subject reverse-tree leaves the serial seed loop
+                // below will read. The loop resolves each base class Sid via
+                // find_subject_id_by_parts (a sync reverse_lookup); on a cold
+                // remote store those lookups are serial S3 fetches. The store
+                // method encodes keys identically, so this only warms the disk
+                // cache — seed results are byte-identical. Reuses the one shared
+                // upload_budget; runs in Phase 3b (after Phase 1/2), so no
+                // Phase 1 contention.
+                if let Some(store) = store_opt.as_ref() {
+                    if let Some(ref base_stats) = base_root.stats {
+                        if let Some(ref graphs) = base_stats.graphs {
+                            let parts: Vec<(u16, String)> = graphs
+                                .iter()
+                                .filter_map(|g| g.classes.as_ref())
+                                .flatten()
+                                .map(|entry| {
+                                    (
+                                        entry.class_sid.namespace_code,
+                                        entry.class_sid.name.to_string(),
+                                    )
+                                })
+                                .collect();
+                            store
+                                .prefetch_subject_reverse_leaves(&parts, &upload_budget)
+                                .await;
+                        }
+                    }
+                }
+
                 // Seed from base root per-graph class entries.
                 if let Some(ref base_stats) = base_root.stats {
                     if let Some(ref graphs) = base_stats.graphs {
