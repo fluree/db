@@ -185,6 +185,7 @@ pub struct IncrementalNovelty {
 pub async fn resolve_incremental_commits_v6(
     cs: Arc<dyn ContentStore>,
     config: IncrementalResolveConfig,
+    s3_budget: Arc<tokio::sync::Semaphore>,
 ) -> Result<IncrementalNovelty, IncrementalResolveError> {
     let t_start = Instant::now();
     tracing::debug!(
@@ -571,6 +572,20 @@ pub async fn resolve_incremental_commits_v6(
         });
     }
 
+    // 6b. Best-effort: prewarm the reverse-tree leaves the sync reconcile will
+    // touch. `reconcile_chunk_to_global` loads each touched leaf one at a time
+    // via a `block_on` S3 fetch; prefetching the distinct touched leaves
+    // concurrently (bounded by the shared S3 budget) means those sync lookups
+    // hit a warm disk cache instead. Prefetch only WARMS the cache — lookup
+    // results, remaps, and downstream encoding are unchanged. Failures are
+    // ignored: the sync path will fetch the leaf the old way.
+    let t_prefetch_ms = {
+        let t0 = Instant::now();
+        prefetch_reconcile_leaves(cs.as_ref(), &chunk, &subject_tree, &string_tree, &s3_budget)
+            .await;
+        t0.elapsed().as_millis() as u64
+    };
+
     // 7. Reconcile chunk-local IDs to global IDs (same algorithm as V5).
     let t_reconcile_start = Instant::now();
     let reconcile = reconcile_chunk_to_global(
@@ -675,6 +690,7 @@ pub async fn resolve_incremental_commits_v6(
         seed_arenas_ms = t_seed_arenas_ms,
         walk_chain_ms = t_walk_chain_ms,
         commit_resolve_ms = t_commit_resolve_ms,
+        prefetch_ms = t_prefetch_ms,
         reconcile_ms = t_reconcile_ms,
         remap_fulltext_ms = t_remap_fulltext_ms,
         remap_records_ms = t_remap_records_ms,
@@ -1060,6 +1076,106 @@ struct ReconcileResult {
     updated_string_watermark: u32,
 }
 
+/// Reverse-tree lookup keys derived from a chunk, in chunk-local-id order.
+///
+/// Returns the exact keys [`reconcile_chunk_to_global`] looks up: subject
+/// reverse keys (`ns_code` + name) and raw string value bytes (borrowed from
+/// the chunk). This is the single source of truth for the derivation so the
+/// async prefetch and the sync reconcile stay in lockstep.
+fn derive_reconcile_keys(chunk: &RebuildChunk) -> (Vec<Vec<u8>>, Vec<&[u8]>) {
+    let subject_keys: Vec<Vec<u8>> = chunk
+        .subjects
+        .forward_entries()
+        .iter()
+        .map(|(ns_code, name_bytes)| subject_reverse_key(*ns_code, name_bytes))
+        .collect();
+    let string_keys: Vec<&[u8]> = chunk
+        .strings
+        .forward_entries()
+        .iter()
+        .map(Vec::as_slice)
+        .collect();
+    (subject_keys, string_keys)
+}
+
+/// Best-effort concurrent prewarm of the reverse-tree leaves the sync reconcile
+/// will touch. Computes the distinct remote leaf CIDs (subject ∪ string) and
+/// fetches them into each reader's disk artifact cache so `load_leaf` hits a
+/// warm cache instead of a serial `block_on` S3 fetch per leaf.
+///
+/// Correctness: this only writes leaf bytes into the same disk cache dir the
+/// readers already read from. It never changes lookup results. Any per-leaf
+/// failure is ignored — the sync path fetches that leaf the old way.
+///
+/// Bounded: every fetch acquires a permit from the shared `s3_budget` (the one
+/// global in-flight S3 cap for the whole fold) and the stream width is capped at
+/// the budget, so there is no second budget and no unbounded fan-out.
+async fn prefetch_reconcile_leaves(
+    cs: &dyn ContentStore,
+    chunk: &RebuildChunk,
+    subject_tree: &DictTreeReader,
+    string_tree: &DictTreeReader,
+    s3_budget: &Arc<tokio::sync::Semaphore>,
+) {
+    let (subject_keys, string_keys) = derive_reconcile_keys(chunk);
+
+    // Distinct (cache_dir, cid) pairs to prewarm, deduped by cid string across
+    // both trees. Only remote leaves with a configured disk cache dir qualify;
+    // local/in-memory readers and readers without a disk cache are skipped
+    // (the prefetch cannot warm what `load_leaf` does not read from disk).
+    let mut seen_cids: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut targets: Vec<(std::path::PathBuf, ContentId)> = Vec::new();
+
+    let mut collect = |tree: &DictTreeReader, keys: Vec<&[u8]>| {
+        let Some(cache_dir) = tree.disk_cache_dir().map(std::path::Path::to_path_buf) else {
+            return;
+        };
+        for address in tree.touched_leaf_addresses(keys) {
+            if let Some(cid) = tree.remote_leaf_cid(address) {
+                if seen_cids.insert(cid.to_string()) {
+                    targets.push((cache_dir.clone(), cid.clone()));
+                }
+            }
+        }
+    };
+    collect(subject_tree, subject_keys.iter().map(Vec::as_slice).collect());
+    collect(string_tree, string_keys);
+
+    if targets.is_empty() {
+        return;
+    }
+
+    // Stream width capped at the shared budget; the per-fetch permit is the hard
+    // in-flight cap. `available_permits()` here equals the configured budget
+    // (the prefetch runs before any Phase 2 task takes a permit).
+    let width = s3_budget.available_permits().max(1);
+    let target_count = targets.len();
+
+    futures::stream::iter(targets)
+        .for_each_concurrent(width, |(cache_dir, cid)| {
+            let s3_budget = Arc::clone(s3_budget);
+            async move {
+                let Ok(_permit) = s3_budget.acquire().await else {
+                    return;
+                };
+                if let Err(e) = fluree_db_binary_index::read::artifact_cache::fetch_cached_bytes_cid(
+                    cs, &cid, &cache_dir,
+                )
+                .await
+                {
+                    tracing::debug!(%cid, error = %e, "reconcile leaf prefetch failed; continuing");
+                }
+            }
+        })
+        .await;
+
+    tracing::debug!(
+        leaves = target_count,
+        width,
+        "V6 incremental resolve: reconcile leaf prefetch complete"
+    );
+}
+
 fn reconcile_chunk_to_global(
     chunk: &RebuildChunk,
     subject_tree: &DictTreeReader,
@@ -1067,6 +1183,8 @@ fn reconcile_chunk_to_global(
     subject_watermarks: &[u64],
     string_watermark: u32,
 ) -> Result<ReconcileResult, IncrementalResolveError> {
+    let (subject_reverse_keys, string_keys) = derive_reconcile_keys(chunk);
+
     // Subject reconciliation.
     let subject_entries = chunk.subjects.forward_entries();
     let subject_started = Instant::now();
@@ -1097,10 +1215,6 @@ fn reconcile_chunk_to_global(
         "V6 incremental resolve: subject reconciliation starting"
     );
 
-    let subject_reverse_keys: Vec<Vec<u8>> = subject_entries
-        .iter()
-        .map(|(ns_code, name_bytes)| subject_reverse_key(*ns_code, name_bytes))
-        .collect();
     let subject_existing_ids = subject_tree
         .reverse_lookup_many(subject_reverse_keys.iter().map(Vec::as_slice))
         .map_err(IncrementalResolveError::Io)?;
@@ -1186,7 +1300,7 @@ fn reconcile_chunk_to_global(
     );
 
     let string_existing_ids = string_tree
-        .reverse_lookup_many(string_entries.iter().map(Vec::as_slice))
+        .reverse_lookup_many(string_keys.iter().copied())
         .map_err(IncrementalResolveError::Io)?;
 
     for (chunk_local_id, (value_bytes, existing_id)) in

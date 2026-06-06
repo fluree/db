@@ -610,6 +610,13 @@ pub async fn incremental_index(
     let cache_dir = artifact_cache_dir(&config);
     let _ = std::fs::create_dir_all(&cache_dir);
 
+    // Single global S3 budget shared across the whole fold: the reconcile
+    // leaf prefetch (Phase 1), and the Phase 2 leaf prefetch + leaf/sidecar
+    // uploads all acquire from this one semaphore, so total in-flight S3 reads
+    // and writes are capped here regardless of phase.
+    let upload_buffer = config.incremental_leaf_upload_concurrency.max(1);
+    let upload_budget = Arc::new(Semaphore::new(upload_buffer));
+
     // ---- Phase 1: Resolve incremental commits ----
     let resolve_config = IncrementalResolveConfig {
         base_root_id: base_root_id.clone(),
@@ -621,9 +628,13 @@ pub async fn incremental_index(
         pending_commit_cids: config.pending_commit_cids.clone(),
         commit_fetch_concurrency: config.incremental_max_concurrency.max(1),
     };
-    let mut novelty = resolve_incremental_commits_v6(content_store.clone(), resolve_config)
-        .await
-        .map_err(|e| IndexerError::StorageWrite(format!("V6 incremental resolve: {e}")))?;
+    let mut novelty = resolve_incremental_commits_v6(
+        content_store.clone(),
+        resolve_config,
+        Arc::clone(&upload_budget),
+    )
+    .await
+    .map_err(|e| IndexerError::StorageWrite(format!("V6 incremental resolve: {e}")))?;
 
     if novelty.records.is_empty() {
         tracing::debug!("no new records resolved; returning existing V6 root");
@@ -670,12 +681,6 @@ pub async fn incremental_index(
     );
 
     let concurrency = config.incremental_max_concurrency.max(1);
-    // Single global budget shared across ALL order-tasks: total in-flight
-    // leaf/sidecar puts across the whole fold is capped here regardless of how
-    // leaves skew across tasks (the win for workloads where most leaves land in
-    // one order-task whose uploads were previously serial).
-    let upload_buffer = config.incremental_leaf_upload_concurrency.max(1);
-    let upload_budget = Arc::new(Semaphore::new(upload_buffer));
     let mut graph_order: Vec<u16> = by_graph.keys().copied().collect();
     graph_order.sort_unstable_by_key(|&g_id| (u8::from(g_id == 0), g_id));
 
