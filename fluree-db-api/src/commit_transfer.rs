@@ -444,6 +444,12 @@ struct GraphRoutingResult {
     /// (unresolved) graphs are intentionally omitted — no per-graph config can
     /// exist for a graph that isn't yet known to the store, so those fall back
     /// to the ledger-wide SHACL baseline.
+    // Kept for: per-graph SHACL policy replay when the `shacl` feature is enabled.
+    // Use when: `apply_shacl_policy_to_staged_view` needs commit-transfer graph deltas.
+    #[cfg_attr(
+        not(feature = "shacl"),
+        expect(dead_code, reason = "read only by shacl-gated commit replay")
+    )]
     graph_iris: rustc_hash::FxHashMap<GraphId, String>,
 }
 

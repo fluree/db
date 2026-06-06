@@ -256,6 +256,89 @@ async fn sparql_insert_data_with_named_blank_reifier_round_trips() {
 }
 
 #[tokio::test]
+async fn sparql_insert_data_with_named_iri_reifier_round_trips() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger_id = "it/sparql-ann-update/insert-named-iri";
+    let ledger0 = genesis_ledger(&fluree, ledger_id);
+
+    let update = r#"
+        PREFIX ex: <http://example.org/>
+        INSERT DATA {
+          ex:alice ex:worksFor ex:acme ~ ex:employment {| ex:role "Engineer" |} .
+        }
+    "#;
+    let txn = lower_update(&ledger0, update);
+    let result = fluree
+        .stage_owned(ledger0)
+        .txn(txn)
+        .execute()
+        .await
+        .expect("INSERT DATA with named IRI reifier");
+    let ledger = result.ledger;
+
+    let inline = r"
+        PREFIX ex: <http://example.org/>
+        SELECT ?ann ?role WHERE {
+          ex:alice ex:worksFor ex:acme ~ ?ann {| ex:role ?role |} .
+        }
+    ";
+    let bindings = support::query_sparql(&fluree, &ledger, inline)
+        .await
+        .expect("inline query")
+        .to_sparql_json(&ledger.snapshot)
+        .expect("sparql json")["results"]["bindings"]
+        .as_array()
+        .expect("bindings")
+        .clone();
+    assert_eq!(bindings.len(), 1, "got {bindings:#?}");
+    assert_eq!(bindings[0]["role"]["value"].as_str(), Some("Engineer"));
+    assert!(
+        matches!(
+            bindings[0]["ann"]["value"].as_str(),
+            Some("ex:employment" | "http://example.org/employment")
+        ),
+        "expected explicit IRI reifier binding, got {:?}",
+        bindings[0]["ann"]
+    );
+
+    let bare_reifier = r"
+        PREFIX ex: <http://example.org/>
+        SELECT ?role WHERE {
+          ex:employment ex:role ?role .
+        }
+    ";
+    let bindings = support::query_sparql(&fluree, &ledger, bare_reifier)
+        .await
+        .expect("bare reifier query")
+        .to_sparql_json(&ledger.snapshot)
+        .expect("sparql json")["results"]["bindings"]
+        .as_array()
+        .expect("bindings")
+        .clone();
+    assert_eq!(bindings.len(), 1, "got {bindings:#?}");
+    assert_eq!(bindings[0]["role"]["value"].as_str(), Some("Engineer"));
+
+    let reifies = r"
+        PREFIX rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#>
+        PREFIX ex: <http://example.org/>
+        SELECT ?role WHERE {
+          ex:employment rdf:reifies <<( ex:alice ex:worksFor ex:acme )>> .
+          ex:employment ex:role ?role .
+        }
+    ";
+    let bindings = support::query_sparql(&fluree, &ledger, reifies)
+        .await
+        .expect("rdf:reifies query")
+        .to_sparql_json(&ledger.snapshot)
+        .expect("sparql json")["results"]["bindings"]
+        .as_array()
+        .expect("bindings")
+        .clone();
+    assert_eq!(bindings.len(), 1, "got {bindings:#?}");
+    assert_eq!(bindings[0]["role"]["value"].as_str(), Some("Engineer"));
+}
+
+#[tokio::test]
 async fn sparql_delete_data_blank_reifier_is_rejected() {
     // SPARQL §3.1.3: blank nodes are not allowed in DELETE DATA.
     let ledger0 = {

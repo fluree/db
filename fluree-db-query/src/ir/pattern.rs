@@ -409,10 +409,11 @@ pub enum Pattern {
     /// edge with two parallel annotations produces two rows. This is
     /// the multiplicity contract that supports Cypher fidelity.
     ///
-    /// # Status
+    /// # Execution
     ///
-    /// M0 / parser surface only — operator-tree assembly returns
-    /// `QueryError::UnsupportedFeature`. Storage support arrives in M1.
+    /// Planning expands this variant into the base edge plus the
+    /// corresponding `f:reifies*` lookup chain before operator-tree
+    /// assembly.
     EdgeAnnotation {
         /// The annotated edge (base triple).
         edge: TriplePattern,
@@ -434,10 +435,11 @@ pub enum Pattern {
     /// (M1 enforcement) — otherwise this operator would leak hidden
     /// edges via annotation existence.
     ///
-    /// # Status
+    /// # Execution
     ///
-    /// M0 / parser surface only — operator-tree assembly returns
-    /// `QueryError::UnsupportedFeature`. Storage support arrives in M1.
+    /// Planning expands this variant into the base edge plus the
+    /// corresponding `f:reifies*` lookup chain before operator-tree
+    /// assembly.
     AnnotationTarget {
         /// The annotation subject — variable or constant ref.
         annotation: Ref,

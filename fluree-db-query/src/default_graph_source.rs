@@ -160,6 +160,12 @@ impl DefaultGraphSourceOperator {
         }
 
         let num_cols = self.schema.len();
+        if num_cols == 0 {
+            let row_count = self.result_buffer.len() - self.buffer_pos;
+            self.buffer_pos = self.result_buffer.len();
+            return Ok((row_count > 0).then(|| Batch::empty_schema_with_len(row_count)));
+        }
+
         let mut columns: Vec<Vec<Binding>> = (0..num_cols).map(|_| Vec::new()).collect();
 
         for row in &self.result_buffer[self.buffer_pos..] {

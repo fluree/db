@@ -29,7 +29,7 @@ Rules:
 
 - **Bundle flakes share a graph.** Every `f:reifies*` flake in one bundle has the same flake-level `g`. The decoder rejects mixed-graph bundles outright (`MixedFlakeGraphs`).
 - **`f:reifiesGraph` value must match the bundle's flake-level `g`.** Named-graph edges carry `f:reifiesGraph`; default-graph edges omit it. Disagreement is `GraphMismatch`.
-- **Reserved predicates are firewalled at every write surface.** `is_reserved_reifies_predicate(sid)` rejects user-authored `f:reifies*` mention in JSON-LD insert/update/upsert/where+delete+insert, SPARQL UPDATE (all clauses), Turtle/TriG ingest, bulk import, and raw transaction upload. Defense-in-depth at the flake sink rejects any `f:reifies*` flake whose origin tag is not the internal annotation lowering.
+- **Reserved predicates are firewalled at application write surfaces.** `is_reserved_reifies_predicate(sid)` rejects user-authored `f:reifies*` mention in JSON-LD insert/update/upsert/where+delete+insert and SPARQL UPDATE (all clauses). Bulk import is an administrative bootstrap path and may ingest already-lowered `f:reifies*` bundles; import records `has_annotations=true`, and the indexer builds the arena from those durable facts.
 - **Replay validation skips malformed bundles.** A partial bundle (missing required slot), a duplicate slot, or a graph-mismatch is skipped at warmup / arena-build with a `tracing::warn!` and counted in `AttachmentNovelty::observed_malformed_bundle_count()`. The annotation's *non*-`f:reifies` metadata facts remain visible as ordinary RDF; only the attachment binding is lost.
 
 ## EdgeKey
@@ -138,7 +138,7 @@ The scan fallback (used when no arena is sealed) runs `db.range(POST, f:reifiesS
 ## Stage-time invariants
 
 - **Cascade dedup is graph-aware.** Cascade retracts are deduped against existing retracts in the staged flake set via an explicit key tuple `(Option<Sid>, Sid, Sid, FlakeValue, Sid, Option<FlakeMeta>)` — `Flake`'s `Eq`/`Hash` ignore `g`, so a plain `HashSet<Flake>` would collapse two retracts targeting the same `(s, p, o, dt, m)` in different named graphs.
-- **Single-target invariant.** An annotation SID may be attached to at most one edge at a time. A transaction that produces more than one asserted `f:reifiesSubject` flake for the same annotation SID errors with `InvariantViolation`. The legitimate re-point pattern — retract the old attachment + assert the new — passes because the retract+assert pair nets to one assertion.
+- **Single-target invariant (Fluree v1 storage contract).** RDF 1.2 allows one reifier to be related to several propositions; this implementation deliberately stores one live edge attachment per annotation SID so retract cascade, by-id cleanup, and the forward/reverse arena stay unambiguous. A transaction that produces more than one asserted `f:reifiesSubject` flake for the same annotation SID errors with `InvariantViolation`. The legitimate re-point pattern — retract the old attachment + assert the new — passes because the retract+assert pair nets to one assertion.
 - **Empty `@annotation: {}` is RDF-mode no-op.** No annotation subject is minted; no attachment row is written. In LPG mode (`opts.lpgEdgeLifecycle: true`), an empty block mints a fresh property-less annotation subject so the relationship retains identity.
 
 ## Cascade and lifecycle modes

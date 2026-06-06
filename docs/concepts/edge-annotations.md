@@ -30,7 +30,7 @@ If a fact is naturally about a *node* (Alice's birthdate, Acme's industry), put 
 | **Turtle / TriG / N-Quads file ingest** | Not natively (today) | The Turtle ingest path is RDF 1.1 + Fluree extensions; it does **not** parse RDF 1.2 annotation tails (`{\| ... \|}`) or the `~` reifier. Two routes work: (a) convert your `.ttl` to JSON-LD before ingesting, or (b) ingest the plain edges first and then add annotations with a follow-up SPARQL `INSERT DATA { :s :p :o {\| ... \|} }` transaction. Either route ends up with the same on-disk shape. |
 | **Cypher / LPG import** | Relationship-property syntax (`-[:T {p:v}]->`) | The storage primitive is in place; the full Cypher front-end (paths, `MERGE`, pattern comprehensions) is a separate workstream. Relationship properties round-trip today through the JSON-LD surface that imports emit. |
 
-The reserved-predicate firewall rejects user-authored `f:reifies*` predicates on every write surface (JSON-LD, SPARQL UPDATE, Turtle ingest, bulk import, raw transaction upload). The only way to mint an annotation is through `@annotation` / `@reifies` (JSON-LD) or the RDF 1.2 annotation tail (`~`, `{| |}`) in SPARQL — never by writing `f:reifiesSubject` triples directly.
+The reserved-predicate firewall rejects user-authored `f:reifies*` predicates on normal write surfaces (JSON-LD and SPARQL UPDATE). The way to mint annotations through application writes is `@annotation` / `@reifies` (JSON-LD) or the RDF 1.2 annotation tail (`~`, `{| |}`) in SPARQL — not direct `f:reifiesSubject` triples. Bulk import is an administrative bootstrap path: it may ingest already-lowered `f:reifies*` bundles, marks the ledger as annotation-bearing, and lets the indexer seal the annotation arena from those durable facts.
 
 ## The surface
 
