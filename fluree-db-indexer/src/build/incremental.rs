@@ -501,6 +501,8 @@ pub async fn incremental_index(
         artifact_cache_dir: Some(cache_dir.clone()),
         max_commit_bytes: config.incremental_max_commit_bytes,
         fulltext_configured_properties: config.fulltext_configured_properties.clone(),
+        pending_commit_cids: config.pending_commit_cids.clone(),
+        commit_fetch_concurrency: config.incremental_max_concurrency.max(1),
     };
     let mut novelty = resolve_incremental_commits_v6(content_store.clone(), resolve_config)
         .await

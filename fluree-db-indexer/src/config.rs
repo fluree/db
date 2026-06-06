@@ -207,6 +207,22 @@ pub struct IndexerConfig {
     /// `None` by default. The api layer wires its own resolver via
     /// [`IndexerConfig::with_fulltext_config_provider`].
     pub fulltext_config_provider: Option<Arc<dyn FulltextConfigProvider>>,
+
+    /// Pre-discovered commit CIDs (`t`, cid) with `t > index_t`, sorted
+    /// ascending by `t`, supplied by the nameservice's commit-CID index.
+    ///
+    /// Transient per-build data, not durable config: it lets incremental
+    /// indexing skip the serial commit-DAG walk and fetch bodies in parallel.
+    /// `None` means "no index available" — the indexer walks the DAG as
+    /// before. Populated only by the NS-aware entry point
+    /// (`build_index_for_ledger_with_tracker`); other entries leave it `None`.
+    pub pending_commit_cids: Option<Vec<(i64, fluree_db_core::ContentId)>>,
+
+    /// Force the serial commit-DAG walk baseline by skipping the commit-CID
+    /// index fast path. When `true`, the NS-aware entry point leaves
+    /// `pending_commit_cids` unset so discovery falls back to the serial walk.
+    /// Used to A/B the fast path against its baseline on the same backlog.
+    pub force_serial_commit_walk: bool,
 }
 
 /// Default run-sort budget: 256 MB.
@@ -242,6 +258,8 @@ impl Default for IndexerConfig {
             incremental_retype_max_subjects: DEFAULT_INCREMENTAL_RETYPE_MAX_SUBJECTS,
             fulltext_configured_properties: Vec::new(),
             fulltext_config_provider: None,
+            pending_commit_cids: None,
+            force_serial_commit_walk: false,
         }
     }
 }
@@ -272,6 +290,8 @@ impl IndexerConfig {
             incremental_retype_max_subjects: DEFAULT_INCREMENTAL_RETYPE_MAX_SUBJECTS,
             fulltext_configured_properties: Vec::new(),
             fulltext_config_provider: None,
+            pending_commit_cids: None,
+            force_serial_commit_walk: false,
         }
     }
 
@@ -295,6 +315,8 @@ impl IndexerConfig {
             incremental_retype_max_subjects: DEFAULT_INCREMENTAL_RETYPE_MAX_SUBJECTS,
             fulltext_configured_properties: Vec::new(),
             fulltext_config_provider: None,
+            pending_commit_cids: None,
+            force_serial_commit_walk: false,
         }
     }
 
@@ -318,6 +340,8 @@ impl IndexerConfig {
             incremental_retype_max_subjects: DEFAULT_INCREMENTAL_RETYPE_MAX_SUBJECTS,
             fulltext_configured_properties: Vec::new(),
             fulltext_config_provider: None,
+            pending_commit_cids: None,
+            force_serial_commit_walk: false,
         }
     }
 

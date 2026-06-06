@@ -17,6 +17,8 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::Instant;
 
+use futures::stream::StreamExt;
+
 use fluree_db_binary_index::dict::DictTreeReader;
 use fluree_db_binary_index::format::index_root::IndexRoot;
 use fluree_db_binary_index::format::run_record::{cmp_for_order, RunRecord, RunSortOrder};
@@ -118,6 +120,14 @@ pub struct IncrementalResolveConfig {
     /// hook routes configured plain-string values into BM25 arena building.
     /// Empty = only the `@fulltext` datatype path collects entries.
     pub fulltext_configured_properties: Vec<crate::config::ConfiguredFulltextProperty>,
+    /// Pre-discovered commit CIDs (`t`, cid) with `t > from_t`, sorted
+    /// ascending by `t`, from the nameservice commit-CID index. When present
+    /// and validated as gap-free coverage of `(from_t, head_t]`, the
+    /// commit-chain walk skips the serial DAG traversal and fetches bodies in
+    /// parallel. `None` (or invalid) falls back to the serial walk.
+    pub pending_commit_cids: Option<Vec<(i64, ContentId)>>,
+    /// Global bound on in-flight commit-body fetches on the fast path.
+    pub commit_fetch_concurrency: usize,
 }
 
 /// Result of V6 incremental commit resolution.
@@ -347,6 +357,8 @@ pub async fn resolve_incremental_commits_v6(
             config.from_t,
             config.max_commit_bytes,
             config.artifact_cache_dir.as_deref(),
+            config.pending_commit_cids.as_deref(),
+            config.commit_fetch_concurrency,
         )
         .await?;
         (commits, t0.elapsed().as_millis() as u64)
@@ -861,23 +873,140 @@ async fn seed_vector_fact_handles(
     Ok(())
 }
 
+/// Fetch one commit blob, honoring the optional artifact cache.
+async fn fetch_commit_bytes(
+    cs: &dyn ContentStore,
+    cid: &ContentId,
+    cache_dir: Option<&Path>,
+) -> Result<Vec<u8>, IncrementalResolveError> {
+    match cache_dir {
+        Some(cache_dir) => {
+            fluree_db_binary_index::read::artifact_cache::fetch_cached_bytes_cid(cs, cid, cache_dir)
+                .await
+                .map_err(|e| {
+                    IncrementalResolveError::CommitChain(format!("failed to load commit {cid}: {e}"))
+                })
+        }
+        None => cs.get(cid).await.map_err(|e| {
+            IncrementalResolveError::CommitChain(format!("failed to load commit {cid}: {e}"))
+        }),
+    }
+}
+
+/// Validate that `pending` is the exact, gap-free set of commits in
+/// `(from_t, head_t]` and that its tip CID is `head_id`. The pending list is
+/// already sorted ascending by `t` and deduped by the nameservice, so coverage
+/// is gap-free iff each `t` is exactly one greater than its predecessor and the
+/// first entry is `from_t + 1`. A failure here is never a correctness hazard —
+/// it just declines the fast path.
+fn pending_covers_range(pending: &[(i64, ContentId)], from_t: i64, head_id: &ContentId) -> bool {
+    let Some((_, tip_cid)) = pending.last() else {
+        return false;
+    };
+    if tip_cid != head_id {
+        return false;
+    }
+    // Contiguous from `from_t + 1` (gap-free coverage up to the tip's t).
+    (from_t + 1..)
+        .zip(pending.iter())
+        .all(|(expected, (t, _))| *t == expected)
+}
+
+#[allow(clippy::too_many_arguments)]
 async fn walk_commit_chain_since(
     cs: &dyn ContentStore,
     head_id: &ContentId,
     from_t: i64,
     max_commit_bytes: Option<usize>,
     cache_dir: Option<&Path>,
+    pending_commit_cids: Option<&[(i64, ContentId)]>,
+    fetch_concurrency: usize,
 ) -> Result<Vec<WalkedCommit>, IncrementalResolveError> {
     let walk_started = Instant::now();
 
-    // Use DAG-aware traversal to handle merge commits with multiple parents.
+    // Fast path: the nameservice commit-CID index already told us the chain.
+    // Validate coverage before trusting it; on any mismatch fall through to the
+    // serial DAG walk so correctness never depends on the index.
+    if let Some(pending) = pending_commit_cids {
+        if pending_covers_range(pending, from_t, head_id) {
+            let k = fetch_concurrency.max(1);
+            let fetch_started = Instant::now();
+            // Order-preserving `buffered(k)`: results arrive in t-ascending
+            // order, so the byte-budget check below aborts deterministically
+            // (over-reading up to k-1 in-flight before the abort is fine).
+            // Fetch via the async `cs.get` (NOT `fetch_cached_bytes_cid`): for local
+            // FileStorage the cache's `resolve_local_path` shortcut is a blocking
+            // `std::fs::read`, which serializes under `buffered` on a single task.
+            // `cs.get` is `tokio::fs::read` (local) / async network (S3) — both overlap
+            // under `buffered(k)`. Commit bodies are read once per fold then GC'd, so
+            // skipping the artifact cache here costs nothing. (cache_dir is still
+            // used by the serial fallback path below.)
+            let mut stream = futures::stream::iter(pending.iter().cloned())
+                .map(|(t, cid)| async move {
+                    let bytes = cs.get(&cid).await.map_err(|e| {
+                        IncrementalResolveError::CommitChain(format!(
+                            "failed to load commit {cid}: {e}"
+                        ))
+                    })?;
+                    Ok::<_, IncrementalResolveError>(WalkedCommit { cid, t, bytes })
+                })
+                .buffered(k);
+
+            let mut commits = Vec::with_capacity(pending.len());
+            let mut cumulative_bytes: usize = 0;
+            while let Some(walked) = stream.next().await {
+                let walked = walked?;
+                if let Some(budget) = max_commit_bytes {
+                    if cumulative_bytes >= budget {
+                        tracing::info!(
+                            cumulative_bytes,
+                            budget,
+                            commits_so_far = commits.len(),
+                            "V6 incremental resolve: commit-chain walk exceeded byte budget, aborting"
+                        );
+                        return Err(IncrementalResolveError::CommitChain(format!(
+                            "commit chain bytes ({cumulative_bytes}) exceeded budget ({budget}); \
+                             falling back to full rebuild"
+                        )));
+                    }
+                }
+                cumulative_bytes += walked.bytes.len();
+                commits.push(walked);
+            }
+
+            tracing::debug!(
+                commits = commits.len(),
+                index_cids = pending.len(),
+                cumulative_bytes,
+                from_t,
+                head = %head_id,
+                fetch_concurrency = k,
+                parallel_fetch_ms = fetch_started.elapsed().as_millis() as u64,
+                elapsed_ms = walk_started.elapsed().as_millis() as u64,
+                "V6 incremental resolve: commit-chain walk complete (fast path: commit-index)"
+            );
+            return Ok(commits);
+        }
+
+        tracing::debug!(
+            from_t,
+            head = %head_id,
+            index_cids = pending.len(),
+            "commit-index did not cover the range; falling back to serial DAG walk"
+        );
+    }
+
+    // Fallback: DAG-aware serial traversal (handles merge commits with multiple
+    // parents). One envelope round-trip per commit to chase parent pointers.
     let dag = fluree_db_core::collect_dag_cids(cs, head_id, from_t)
         .await
         .map_err(|e| IncrementalResolveError::CommitChain(e.to_string()))?;
+    let dag_collect_ms = walk_started.elapsed().as_millis() as u64;
 
     // collect_dag_cids returns (t, cid) sorted by t descending; reverse for chronological order.
     let mut commits = Vec::with_capacity(dag.len());
     let mut cumulative_bytes: usize = 0;
+    let fetch_started = Instant::now();
 
     for (t, cid) in dag.into_iter().rev() {
         // Check byte budget before loading the next commit.
@@ -896,22 +1025,7 @@ async fn walk_commit_chain_since(
             }
         }
 
-        let bytes = match cache_dir {
-            Some(cache_dir) => {
-                fluree_db_binary_index::read::artifact_cache::fetch_cached_bytes_cid(
-                    cs, &cid, cache_dir,
-                )
-                .await
-                .map_err(|e| {
-                    IncrementalResolveError::CommitChain(format!(
-                        "failed to load commit {cid}: {e}"
-                    ))
-                })?
-            }
-            None => cs.get(&cid).await.map_err(|e| {
-                IncrementalResolveError::CommitChain(format!("failed to load commit {cid}: {e}"))
-            })?,
-        };
+        let bytes = fetch_commit_bytes(cs, &cid, cache_dir).await?;
         cumulative_bytes += bytes.len();
         commits.push(WalkedCommit { cid, t, bytes });
     }
@@ -921,8 +1035,10 @@ async fn walk_commit_chain_since(
         cumulative_bytes,
         from_t,
         head = %head_id,
+        dag_collect_ms,
+        fetch_loop_ms = fetch_started.elapsed().as_millis() as u64,
         elapsed_ms = walk_started.elapsed().as_millis() as u64,
-        "V6 incremental resolve: commit-chain walk complete"
+        "V6 incremental resolve: commit-chain walk complete (fallback: serial walk)"
     );
     Ok(commits)
 }
