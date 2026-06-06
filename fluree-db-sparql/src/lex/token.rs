@@ -238,6 +238,8 @@ pub enum TokenKind {
     // Prologue
     KwBase,
     KwPrefix,
+    /// SPARQL 1.2 `VERSION "1.2"` declaration keyword.
+    KwVersion,
 
     // Update
     KwInsert,
@@ -593,6 +595,7 @@ impl TokenKind {
             TokenKind::KwStrUuid => Some("STRUUID"),
             TokenKind::KwBase => Some("BASE"),
             TokenKind::KwPrefix => Some("PREFIX"),
+            TokenKind::KwVersion => Some("VERSION"),
             TokenKind::KwInsert => Some("INSERT"),
             TokenKind::KwDelete => Some("DELETE"),
             TokenKind::KwData => Some("DATA"),
@@ -780,6 +783,7 @@ pub fn keyword_from_str(s: &str) -> Option<TokenKind> {
         }
         "BASE" => Some(TokenKind::KwBase),
         "PREFIX" => Some(TokenKind::KwPrefix),
+        "VERSION" => Some(TokenKind::KwVersion),
         "INSERT" => Some(TokenKind::KwInsert),
         "DELETE" => Some(TokenKind::KwDelete),
         "DATA" => Some(TokenKind::KwData),

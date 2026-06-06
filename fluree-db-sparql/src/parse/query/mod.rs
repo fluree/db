@@ -132,12 +132,30 @@ impl<'a> Parser<'a> {
                 if let Some(prefix) = self.parse_prefix_decl() {
                     prologue = prologue.with_prefix(prefix);
                 }
+            } else if self.stream.check_keyword(TokenKind::KwVersion) {
+                self.parse_version_decl();
             } else {
                 break;
             }
         }
 
         prologue
+    }
+
+    /// Parse and discard a SPARQL 1.2 `VERSION "1.2"` declaration.
+    ///
+    /// Fluree runs the RDF 1.2 / SPARQL 1.2 surface ungated, so the
+    /// declaration is purely informational — we lex-and-accept it so a
+    /// conformant 1.2 client that emits the mandated `VERSION "1.2"`
+    /// pragma parses instead of hard-failing. The version string is not
+    /// validated against a specific value (a future version would still
+    /// parse).
+    fn parse_version_decl(&mut self) {
+        self.stream.advance(); // consume VERSION
+        if self.stream.consume_string().is_none() {
+            self.stream
+                .error_at_current("expected a version string after VERSION (e.g. \"1.2\")");
+        }
     }
 
     /// Parse a BASE declaration.

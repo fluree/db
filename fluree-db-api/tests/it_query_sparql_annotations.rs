@@ -927,3 +927,116 @@ async fn sparql_update_langstring_annotation_hydrates_via_jsonld() {
         "annotation body must surface ex:source: {ann_obj:#?}"
     );
 }
+
+/// Count the SELECT bindings a SPARQL query returns against `ledger`.
+async fn sparql_row_count(fluree: &MemoryFluree, ledger: &MemoryLedger, sparql: &str) -> usize {
+    support::query_sparql(fluree, ledger, sparql)
+        .await
+        .expect("query")
+        .to_sparql_json(&ledger.snapshot)
+        .expect("sparql json")["results"]["bindings"]
+        .as_array()
+        .expect("bindings")
+        .len()
+}
+
+#[tokio::test]
+async fn sparql_delete_where_annotation_retracts_base_edge_and_annotation() {
+    // TEST-1: SPARQL DELETE WHERE with an annotation tail retracts the
+    // whole matched pattern — base edge, f:reifies* bundle, and body.
+    // The annotation syntax asserts the base triple too, so deleting the
+    // pattern deletes it; the bundle leaves no orphan that the
+    // {| |} read-back could still surface.
+    let (fluree, ledger) = seed_alice_engineer("it/sparql-ann/delete-where").await;
+
+    let ann_q = r"
+        PREFIX ex: <http://example.org/>
+        SELECT ?role WHERE { ex:alice ex:worksFor ex:acme {| ex:role ?role |} . }
+    ";
+    let base_q = r"
+        PREFIX ex: <http://example.org/>
+        SELECT ?o WHERE { ex:alice ex:worksFor ?o . }
+    ";
+    assert_eq!(
+        sparql_row_count(&fluree, &ledger, ann_q).await,
+        1,
+        "annotation present before delete"
+    );
+
+    let del = r"
+        PREFIX ex: <http://example.org/>
+        DELETE WHERE { ex:alice ex:worksFor ex:acme {| ex:role ?role |} . }
+    ";
+    let txn = lower_update(&ledger, del);
+    let ledger = fluree
+        .stage_owned(ledger)
+        .txn(txn)
+        .execute()
+        .await
+        .expect("DELETE WHERE annotation")
+        .ledger;
+
+    assert_eq!(
+        sparql_row_count(&fluree, &ledger, ann_q).await,
+        0,
+        "annotation (body + f:reifies* bundle) must be retracted"
+    );
+    assert_eq!(
+        sparql_row_count(&fluree, &ledger, base_q).await,
+        0,
+        "base edge is part of the matched annotation pattern, so it is retracted too"
+    );
+}
+
+#[tokio::test]
+async fn sparql_delete_template_anonymous_annotation_block_is_rejected() {
+    // TEST-1: an anonymous {| |} block in a DELETE template has no
+    // reifier to bind from the WHERE clause, so it must be rejected with
+    // a clear message pointing at the named-reifier form.
+    let ledger0 = {
+        let fluree = FlureeBuilder::memory().build_memory();
+        genesis_ledger(&fluree, "it/sparql-ann-update/delete-template-anon")
+    };
+    let update = r"
+        PREFIX ex: <http://example.org/>
+        DELETE { ex:alice ex:worksFor ex:acme {| ex:role ?r |} }
+        WHERE  { ex:alice ex:worksFor ex:acme ~ ?ann {| ex:role ?r |} }
+    ";
+    let parsed = fluree_db_sparql::parse_sparql(update);
+    assert!(
+        !parsed.has_errors(),
+        "parse should succeed: {:?}",
+        parsed.diagnostics
+    );
+    let ast = parsed.ast.unwrap();
+    let mut ns = NamespaceRegistry::from_db(&ledger0.snapshot);
+    let err = fluree_db_transact::lower_sparql_update_ast(&ast, &mut ns, TxnOpts::default())
+        .expect_err("anonymous {| |} in DELETE template must be rejected");
+    let msg = format!("{err:?} {err}");
+    assert!(
+        msg.contains("anonymous annotation block") || msg.contains("DELETE template"),
+        "expected DELETE-template anonymous-block rejection, got: {msg}"
+    );
+}
+
+#[tokio::test]
+async fn sparql_version_1_2_declaration_is_accepted() {
+    // SPAR-1: a conformant SPARQL 1.2 query may open with the mandated
+    // `VERSION "1.2"` declaration. Fluree runs the 1.2 surface ungated,
+    // so the pragma is lex-and-accepted (not validated) rather than
+    // hard-failing with per-character lexer errors. The query itself
+    // (here an annotation read-back) must still execute normally.
+    let (fluree, ledger) = seed_alice_engineer("it/sparql-ann/version-decl").await;
+    let sparql = r#"
+        VERSION "1.2"
+        PREFIX ex: <http://example.org/>
+        SELECT ?role WHERE {
+          ex:alice ex:worksFor ex:acme {| ex:role ?role |} .
+        }
+    "#;
+    assert_eq!(
+        sparql_row_count(&fluree, &ledger, sparql).await,
+        1,
+        "VERSION \"1.2\" prologue must parse and the query must run"
+    );
+}
