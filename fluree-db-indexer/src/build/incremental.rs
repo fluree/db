@@ -2121,6 +2121,46 @@ pub async fn incremental_index(
                         );
                     }
 
+                    // Prewarm the PSOT leaves the per-graph rdf:type scans will
+                    // touch. Keys are built exactly as batched_lookup_predicate_refs
+                    // derives them (p_id pinned, s_id spanning the subject range),
+                    // so the warmed leaves match the scan. Cache-only; the scan's
+                    // results are byte-identical. Reuses the one shared upload_budget.
+                    for (&scan_g_id, scan_sids) in &subjects_by_graph {
+                        if scan_sids.is_empty() {
+                            continue;
+                        }
+                        let min_s = scan_sids[0];
+                        let max_s = *scan_sids.last().unwrap_or(&min_s);
+                        let min_key = fluree_db_binary_index::format::run_record_v2::RunRecordV2 {
+                            s_id: fluree_db_core::subject_id::SubjectId::from_u64(min_s),
+                            o_key: 0,
+                            p_id: rdf_type_p_id,
+                            t: 0,
+                            o_i: 0,
+                            o_type: 0,
+                            g_id: scan_g_id,
+                        };
+                        let max_key = fluree_db_binary_index::format::run_record_v2::RunRecordV2 {
+                            s_id: fluree_db_core::subject_id::SubjectId::from_u64(max_s),
+                            o_key: u64::MAX,
+                            p_id: rdf_type_p_id,
+                            t: 0,
+                            o_i: u32::MAX,
+                            o_type: u16::MAX,
+                            g_id: scan_g_id,
+                        };
+                        store
+                            .prefetch_leaves_for_range(
+                                scan_g_id,
+                                fluree_db_binary_index::format::run_record::RunSortOrder::Psot,
+                                &min_key,
+                                &max_key,
+                                &upload_budget,
+                            )
+                            .await;
+                    }
+
                     // Batched PSOT lookup per graph.
                     for (&scan_g_id, scan_sids) in &subjects_by_graph {
                         if scan_sids.is_empty() {
