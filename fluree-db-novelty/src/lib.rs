@@ -245,11 +245,37 @@ impl Novelty {
         }
     }
 
+    /// Validate that a batch can be applied WITHOUT mutating any state.
+    ///
+    /// Checks the two conditions that make [`apply_commit`] fallible — FlakeId
+    /// capacity and graph routability. Callers that mutate a shared/live Novelty
+    /// in place (e.g. via `Arc::make_mut`) call this first to guarantee an
+    /// all-or-nothing apply: if it returns `Ok`, the subsequent `apply_commit`
+    /// cannot fail partway and leave the ledger inconsistent.
+    pub fn can_apply(
+        &self,
+        flakes: &[Flake],
+        reverse_graph: &HashMap<Sid, GraphId>,
+    ) -> Result<()> {
+        if self.store.len() + flakes.len() > MAX_FLAKE_ID as usize {
+            return Err(NoveltyError::overflow(
+                "FlakeId overflow: too many flakes in novelty, trigger reindex",
+            ));
+        }
+        for flake in flakes {
+            Self::resolve_flake_g_id(flake, reverse_graph)?;
+        }
+        Ok(())
+    }
+
     /// Apply a batch of flakes from a commit, routing each flake to its graph.
     ///
     /// Epoch bumps ONCE per call, not per flake.
     /// Each flake is routed to its graph via `reverse_graph`. Unknown graph Sids
     /// cause an error — no silent fallback to the default graph.
+    ///
+    /// Atomic: graph routing (the only fallible step) is resolved before any
+    /// mutation, so an error leaves novelty untouched.
     pub fn apply_commit(
         &mut self,
         flakes: Vec<Flake>,
@@ -268,7 +294,7 @@ impl Novelty {
         );
         let _guard = span.enter();
 
-        // Check FlakeId overflow
+        // Check FlakeId overflow (before any mutation)
         let new_count = self.store.len() + flakes.len();
         if new_count > MAX_FLAKE_ID as usize {
             return Err(NoveltyError::overflow(
@@ -276,11 +302,22 @@ impl Novelty {
             ));
         }
 
-        // Update metadata
+        // Resolve every flake's graph id FIRST. Graph routing is the only fallible
+        // step, so resolving it before any mutation makes apply_commit atomic: a
+        // routing error leaves novelty completely untouched. This matters because
+        // callers mutate a possibly cache-shared Novelty in place (Arc::make_mut),
+        // where a partial mutation would poison live state under the write lock.
+        let mut routed: Vec<(Flake, GraphId)> = Vec::with_capacity(flakes.len());
+        for flake in flakes {
+            let g_id = Self::resolve_flake_g_id(&flake, reverse_graph)?;
+            routed.push((flake, g_id));
+        }
+
+        // From here on every step is infallible.
         self.t = self.t.max(commit_t);
         self.epoch += 1; // Bump epoch once per commit
 
-        // Store flakes in arena, resolve graph IDs, and group by graph.
+        // Store flakes in arena and group by graph.
         //
         // RDF set semantics: skip assertion flakes whose fact (s, p, o, dt, m)
         // is already **currently asserted** in novelty. This prevents duplicate
@@ -294,9 +331,7 @@ impl Novelty {
         let mut per_graph: HashMap<GraphId, Vec<FlakeId>> = HashMap::new();
         let mut deduped = 0u64;
 
-        for flake in flakes {
-            let g_id = Self::resolve_flake_g_id(&flake, reverse_graph)?;
-
+        for (flake, g_id) in routed {
             // Set semantics: skip duplicate assertions
             if flake.op && self.fact_currently_asserted_in_graph(g_id, &flake) {
                 deduped += 1;
@@ -924,6 +959,41 @@ mod tests {
         assert_eq!(novelty.epoch, 0);
         assert_eq!(novelty.size, 0);
         assert!(novelty.is_empty());
+    }
+
+    /// apply_commit must be atomic: a graph-routing error part-way through a
+    /// batch must leave novelty completely untouched (t / epoch / size / arena),
+    /// so callers that mutate a cache-shared Novelty in place via Arc::make_mut
+    /// can't poison live state. Regression guard for the clone-elimination work.
+    #[test]
+    fn apply_commit_atomic_on_routing_error() {
+        let mut novelty = Novelty::new(0);
+        novelty
+            .apply_commit(vec![make_flake(1, 1, 1, 1, true)], 1, &no_graphs())
+            .expect("first commit applies");
+        let (t, epoch, size, len) = (novelty.t, novelty.epoch, novelty.size, novelty.store.len());
+
+        // Batch with a good flake followed by one referencing an unknown named
+        // graph: the old in-place code would have bumped t/epoch and pushed the
+        // good flake before erroring on the second.
+        let good = make_flake(2, 2, 2, 2, true);
+        let bad = make_graph_flake(3, 3, 3, 2, Sid::new(9, "g-unknown"));
+        let err = novelty.apply_commit(vec![good, bad], 2, &no_graphs());
+
+        assert!(err.is_err(), "unknown graph Sid must error");
+        assert_eq!(novelty.t, t, "t unchanged after failed apply");
+        assert_eq!(novelty.epoch, epoch, "epoch unchanged after failed apply");
+        assert_eq!(novelty.size, size, "size unchanged after failed apply");
+        assert_eq!(novelty.store.len(), len, "no flakes added after failed apply");
+
+        // can_apply reports the same routing failure without mutating.
+        assert!(novelty
+            .can_apply(
+                &[make_graph_flake(4, 4, 4, 3, Sid::new(9, "g-unknown"))],
+                &no_graphs()
+            )
+            .is_err());
+        assert_eq!(novelty.store.len(), len, "can_apply does not mutate");
     }
 
     #[test]
