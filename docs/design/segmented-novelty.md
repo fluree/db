@@ -136,9 +136,19 @@ relied on the borrow (see §6). Plan: provide a merge **iterator** as the primit
 thin `collect`-to-`Vec` adapter for call sites that want owned results. This keeps
 per-flake zero-copy while only the *index ordering* is merged.
 
-> Open question (4.3a): iterator-as-primitive (less alloc, borrows segment Arcs)
-> vs materialized `Vec` everywhere (simplest). Lean iterator primitive + Vec
-> adapter; measure on novelty-heavy read benches before finalizing.
+**Decision (reviewed): Hybrid — iterator primitive + packed-`FlakeId` shim.**
+- The **source-of-truth primitive** is a merge iterator `range_iter(...) -> impl
+  Iterator<Item = &Flake>` (and `iter_flakes(index) -> impl Iterator<Item = &Flake>`
+  for full scans), borrowing each segment's `Arc` payload (no flake copy).
+- `FlakeId` becomes a **newtype over `u64`** (not a raw alias) packing
+  `(g_id, seg_idx, local)`, so packed decoding stays centralized and future
+  segment-id/epoch changes are possible. It is **read-scoped only**: a transient
+  handle valid within one read, never stored durably or held across an `&mut
+  Novelty` op (compaction reshuffles `seg_idx`). Documented as such at the type.
+- `slice_for_range` stays as an **owned `Vec<FlakeId>` shim** backed by the merge
+  iterator, preserving the harness + most callers while the core changes.
+- Migrate `runtime_stats` and any full-scan callers to `iter_flakes(index)` early
+  (they want `&Flake`, not ids), shrinking the packed-id surface over time.
 
 ### 4.4 Dedup / RDF set semantics (the subtle part)
 
