@@ -6,11 +6,16 @@
 //! ## Algorithm
 //!
 //! 1. Open all sorted `.voc` files as readers (one per chunk)
-//! 2. Pre-allocate per-chunk remap files via mmap (sized from vocab headers)
+//! 2. Open a streaming (buffered, append-only) remap writer per chunk
 //! 3. Seed a min-heap with the first entry from each reader
 //! 4. Pop minimum: if same key as previous → duplicate (reuse global ID),
 //!    else → assign new global ID, write to forward dict
-//! 5. Write the global ID into the remap mmap at `remap[chunk_id][local_id]`
+//! 5. Append the global ID to that chunk's remap writer. Writes land in
+//!    ascending `local_id` order — each chunk's sorted vocab assigns dense
+//!    local ids `0..entry_count` and the merge drains each chunk in file
+//!    order — so no random-access mmap is needed. This keeps peak RSS at one
+//!    buffer per chunk instead of the dirty `Σ(chunk-local terms) × width`
+//!    pages the previous mmap writer pinned.
 //! 6. Advance the popped reader; push its next entry to the heap
 //!
 //! ## Output files
@@ -93,16 +98,16 @@ pub fn merge_subject_vocabs(
         "chunk_ids must match vocab_paths length"
     );
 
-    // Open all readers + create mmap'd remap files.
+    // Open all readers + create one sequential remap writer per chunk.
     let mut readers: Vec<SubjectVocabReader> = Vec::with_capacity(k);
-    let mut remaps: Vec<MmapRemapU64> = Vec::with_capacity(k);
+    let mut remaps: Vec<SeqRemapU64> = Vec::with_capacity(k);
 
     for (i, path) in vocab_paths.iter().enumerate() {
         let reader = SubjectVocabReader::open(path)?;
         let entry_count = reader.header().entry_count;
 
         let remap_path = remap_dir.join(format!("subjects_{:05}.rmp", chunk_ids[i]));
-        let remap = MmapRemapU64::create(&remap_path, entry_count)?;
+        let remap = SeqRemapU64::create(&remap_path, entry_count)?;
 
         readers.push(reader);
         remaps.push(remap);
@@ -186,8 +191,10 @@ pub fn merge_subject_vocabs(
     idx.finish(&run_dir.join("subjects.idx"))?;
     sids.finish(&sids_path)?;
 
-    // Drop mmaps (flushes to disk).
-    drop(remaps);
+    // Flush each remap writer and verify every chunk-local id was written.
+    for remap in remaps {
+        remap.finish()?;
+    }
 
     Ok(SubjectMergeStats {
         total_unique,
@@ -250,14 +257,14 @@ pub fn merge_string_vocabs(
     );
 
     let mut readers: Vec<StringVocabReader> = Vec::with_capacity(k);
-    let mut remaps: Vec<MmapRemapU32> = Vec::with_capacity(k);
+    let mut remaps: Vec<SeqRemapU32> = Vec::with_capacity(k);
 
     for (i, path) in vocab_paths.iter().enumerate() {
         let reader = StringVocabReader::open(path)?;
         let entry_count = reader.header().entry_count;
 
         let remap_path = remap_dir.join(format!("strings_{:05}.rmp", chunk_ids[i]));
-        let remap = MmapRemapU32::create(&remap_path, entry_count)?;
+        let remap = SeqRemapU32::create(&remap_path, entry_count)?;
 
         readers.push(reader);
         remaps.push(remap);
@@ -315,7 +322,9 @@ pub fn merge_string_vocabs(
     fwd.flush()?;
     idx.finish(&run_dir.join("strings.idx"))?;
 
-    drop(remaps);
+    for remap in remaps {
+        remap.finish()?;
+    }
 
     Ok(StringMergeStats {
         total_unique: next_global_id,
@@ -323,96 +332,79 @@ pub fn merge_string_vocabs(
 }
 
 // ============================================================================
-// Mmap remap helpers
+// Sequential remap writers
 // ============================================================================
+//
+// The merge drains each chunk's sorted vocab in file order, and that file
+// assigns dense local ids `0..entry_count`, so every `set` for a given chunk
+// arrives with a strictly increasing `local_id`. We therefore append values to
+// a `BufWriter` (output format identical to the prior mmap writer: a flat
+// little-endian `[width × entry_count]` array) instead of mapping and dirtying
+// the whole file. Peak resident memory is one write buffer per chunk rather
+// than `Σ(chunk-local terms) × width` dirty mmap pages — the dominant heap
+// term during a large bulk import's vocab merge.
 
-/// Memory-mapped remap table for u64 entries (subjects).
-///
-/// Pre-allocated to `entry_count × 8` bytes. Entries are written at
-/// `local_id × 8` offset via [`set`](MmapRemapU64::set).
-struct MmapRemapU64 {
-    mmap: memmap2::MmapMut,
+/// Sequential remap writer for u64 entries (subjects).
+struct SeqRemapU64 {
+    writer: BufWriter<std::fs::File>,
+    next: u64,
     len: u64,
 }
 
-impl MmapRemapU64 {
+impl SeqRemapU64 {
     fn create(path: &Path, entry_count: u64) -> io::Result<Self> {
-        let byte_len = entry_count.checked_mul(8).ok_or_else(|| {
-            io::Error::new(io::ErrorKind::InvalidData, "subject remap size overflow")
-        })?;
-
-        if byte_len == 0 {
-            // Empty file: create zero-length file, use empty mmap.
-            std::fs::File::create(path)?;
-            return Ok(Self {
-                mmap: memmap2::MmapMut::map_anon(0)?,
-                len: 0,
-            });
-        }
-
-        let file = std::fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .open(path)?;
-        file.set_len(byte_len)?;
-        let mmap = unsafe { memmap2::MmapMut::map_mut(&file)? };
-
+        // entry_count == 0 → an empty file (matches the prior writer); no writes follow.
         Ok(Self {
-            mmap,
+            writer: BufWriter::new(std::fs::File::create(path)?),
+            next: 0,
             len: entry_count,
         })
     }
 
     #[inline]
     fn set(&mut self, local_id: u64, value: u64) -> io::Result<()> {
-        if local_id >= self.len {
+        if local_id != self.next {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 format!(
-                    "subject remap set out of bounds: local_id={}, len={}",
-                    local_id, self.len
+                    "subject remap non-sequential write: expected local_id={}, got {}",
+                    self.next, local_id
                 ),
             ));
         }
-        let offset = (local_id as usize) * 8;
-        self.mmap[offset..offset + 8].copy_from_slice(&value.to_le_bytes());
+        self.writer.write_all(&value.to_le_bytes())?;
+        self.next += 1;
+        Ok(())
+    }
+
+    /// Flush the buffer and verify every chunk-local id was written.
+    fn finish(self) -> io::Result<()> {
+        if self.next != self.len {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "subject remap incomplete: wrote {} of {} entries",
+                    self.next, self.len
+                ),
+            ));
+        }
+        self.writer.into_inner().map_err(io::Error::from)?;
         Ok(())
     }
 }
 
-/// Memory-mapped remap table for u32 entries (strings).
-struct MmapRemapU32 {
-    mmap: memmap2::MmapMut,
+/// Sequential remap writer for u32 entries (strings).
+struct SeqRemapU32 {
+    writer: BufWriter<std::fs::File>,
+    next: u64,
     len: u64,
 }
 
-impl MmapRemapU32 {
+impl SeqRemapU32 {
     fn create(path: &Path, entry_count: u64) -> io::Result<Self> {
-        let byte_len = entry_count.checked_mul(4).ok_or_else(|| {
-            io::Error::new(io::ErrorKind::InvalidData, "string remap size overflow")
-        })?;
-
-        if byte_len == 0 {
-            std::fs::File::create(path)?;
-            return Ok(Self {
-                mmap: memmap2::MmapMut::map_anon(0)?,
-                len: 0,
-            });
-        }
-
-        let file = std::fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .open(path)?;
-        file.set_len(byte_len)?;
-        let mmap = unsafe { memmap2::MmapMut::map_mut(&file)? };
-
         Ok(Self {
-            mmap,
+            writer: BufWriter::new(std::fs::File::create(path)?),
+            next: 0,
             len: entry_count,
         })
     }
@@ -425,17 +417,31 @@ impl MmapRemapU32 {
                 format!("string remap value overflow: {value}"),
             )
         })?;
-        if local_id >= self.len {
+        if local_id != self.next {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 format!(
-                    "string remap set out of bounds: local_id={}, len={}",
-                    local_id, self.len
+                    "string remap non-sequential write: expected local_id={}, got {}",
+                    self.next, local_id
                 ),
             ));
         }
-        let offset = (local_id as usize) * 4;
-        self.mmap[offset..offset + 4].copy_from_slice(&value_u32.to_le_bytes());
+        self.writer.write_all(&value_u32.to_le_bytes())?;
+        self.next += 1;
+        Ok(())
+    }
+
+    fn finish(self) -> io::Result<()> {
+        if self.next != self.len {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "string remap incomplete: wrote {} of {} entries",
+                    self.next, self.len
+                ),
+            ));
+        }
+        self.writer.into_inner().map_err(io::Error::from)?;
         Ok(())
     }
 }
@@ -569,25 +575,31 @@ mod tests {
         dir
     }
 
-    /// Build a ChunkSubjectDict, write sorted vocab, return the path.
+    /// Build a ChunkSubjectDict and write a sorted vocab, mirroring production.
+    ///
+    /// Uses `sort_and_write_sorted_vocab` (the writer the real import pipeline
+    /// calls in `runs::spool`), which stores `local_id = sorted_position`. The
+    /// k-way merge therefore drains each chunk in `local_id` order — the
+    /// invariant the sequential remap writer relies on.
     fn make_subject_vocab(dir: &Path, chunk_id: usize, entries: &[(u16, &[u8])]) -> PathBuf {
         let mut dict = ChunkSubjectDict::new();
         for &(ns, name) in entries {
             dict.get_or_insert(ns, name);
         }
         let path = dir.join(format!("chunk_{chunk_id:05}.subjects.voc"));
-        dict.write_sorted_vocab(&path).unwrap();
+        dict.sort_and_write_sorted_vocab(&path).unwrap();
         path
     }
 
-    /// Build a ChunkStringDict, write sorted vocab, return the path.
+    /// Build a ChunkStringDict and write a sorted vocab, mirroring production
+    /// (`sort_and_write_sorted_vocab`, `local_id = sorted_position`).
     fn make_string_vocab(dir: &Path, chunk_id: usize, entries: &[&[u8]]) -> PathBuf {
         let mut dict = ChunkStringDict::new();
         for &s in entries {
             dict.get_or_insert(s);
         }
         let path = dir.join(format!("chunk_{chunk_id:05}.strings.voc"));
-        dict.write_sorted_vocab(&path).unwrap();
+        dict.sort_and_write_sorted_vocab(&path).unwrap();
         path
     }
 
@@ -800,6 +812,220 @@ mod tests {
         let remap1_path = remap_dir.join("strings_00001.rmp");
         assert!(remap1_path.exists());
         assert_eq!(std::fs::metadata(&remap1_path).unwrap().len(), 0);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // ---- Byte-level reference compatibility ----
+    //
+    // These build the expected `.rmp` bytes from an *independent* reference (not
+    // the merge internals) so the on-disk remap format is pinned regardless of
+    // the writer implementation (mmap vs sequential).
+
+    /// Reference: global string id = lexicographic rank among all distinct keys;
+    /// per-chunk `remap[local_id]` is indexed by the chunk's sorted-distinct
+    /// position, so the file is the ranks of the chunk's sorted distinct keys.
+    fn expected_string_remap_bytes(chunks: &[Vec<&[u8]>]) -> Vec<Vec<u8>> {
+        let mut all: Vec<&[u8]> = chunks.iter().flatten().copied().collect();
+        all.sort_unstable();
+        all.dedup();
+        chunks
+            .iter()
+            .map(|entries| {
+                let mut keys: Vec<&[u8]> = entries.clone();
+                keys.sort_unstable();
+                keys.dedup();
+                let mut bytes = Vec::with_capacity(keys.len() * 4);
+                for k in &keys {
+                    let rank = all.binary_search(k).unwrap() as u32;
+                    bytes.extend_from_slice(&rank.to_le_bytes());
+                }
+                bytes
+            })
+            .collect()
+    }
+
+    /// Reference: subject sid64 = `(ns << 48) | rank_of_suffix_within_ns`,
+    /// matching the merge's per-namespace counter walked in (ns, suffix) order.
+    fn expected_subject_remap_bytes(chunks: &[Vec<(u16, &[u8])>]) -> Vec<Vec<u8>> {
+        use std::collections::BTreeMap;
+        let mut per_ns: BTreeMap<u16, Vec<&[u8]>> = BTreeMap::new();
+        for (ns, suf) in chunks.iter().flatten() {
+            per_ns.entry(*ns).or_default().push(*suf);
+        }
+        for v in per_ns.values_mut() {
+            v.sort_unstable();
+            v.dedup();
+        }
+        chunks
+            .iter()
+            .map(|entries| {
+                let mut keys: Vec<(u16, &[u8])> = entries.clone();
+                keys.sort_unstable();
+                keys.dedup();
+                let mut bytes = Vec::with_capacity(keys.len() * 8);
+                for (ns, suf) in &keys {
+                    let rank = per_ns[ns].binary_search(suf).unwrap() as u64;
+                    let sid64 = ((*ns as u64) << 48) | rank;
+                    bytes.extend_from_slice(&sid64.to_le_bytes());
+                }
+                bytes
+            })
+            .collect()
+    }
+
+    #[test]
+    fn test_string_remap_bytes_match_reference() {
+        let dir = temp_dir("str_ref");
+        let remap_dir = dir.join("remap");
+        std::fs::create_dir_all(&remap_dir).unwrap();
+
+        let chunks: Vec<Vec<&[u8]>> = vec![
+            vec![b"delta".as_ref(), b"alpha", b"charlie"],
+            vec![b"alpha".as_ref(), b"echo", b"bravo"],
+            vec![b"charlie".as_ref(), b"alpha"], // heavy cross-chunk dup
+        ];
+        let vocs: Vec<PathBuf> = chunks
+            .iter()
+            .enumerate()
+            .map(|(i, e)| make_string_vocab(&dir, i, e))
+            .collect();
+        let ids: Vec<usize> = (0..chunks.len()).collect();
+
+        merge_string_vocabs(&vocs, &ids, &remap_dir, &dir).unwrap();
+
+        for (i, exp) in expected_string_remap_bytes(&chunks).iter().enumerate() {
+            let got = std::fs::read(remap_dir.join(format!("strings_{i:05}.rmp"))).unwrap();
+            assert_eq!(&got, exp, "string remap chunk {i} bytes mismatch");
+        }
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn test_subject_remap_bytes_match_reference() {
+        let dir = temp_dir("subj_ref");
+        let remap_dir = dir.join("remap");
+        std::fs::create_dir_all(&remap_dir).unwrap();
+
+        let chunks: Vec<Vec<(u16, &[u8])>> = vec![
+            vec![(1, b"Zed".as_ref()), (1, b"Amy"), (2, b"Bo")],
+            vec![(1, b"Amy".as_ref()), (2, b"Cy"), (1, b"Mia")],
+            vec![(2, b"Bo".as_ref()), (1, b"Amy")], // heavy cross-chunk dup
+        ];
+        let vocs: Vec<PathBuf> = chunks
+            .iter()
+            .enumerate()
+            .map(|(i, e)| make_subject_vocab(&dir, i, e))
+            .collect();
+        let ids: Vec<usize> = (0..chunks.len()).collect();
+        let ns = HashMap::from([(1u16, "http://a/".to_string()), (2, "http://b/".to_string())]);
+
+        merge_subject_vocabs(&vocs, &ids, &remap_dir, &dir, &ns).unwrap();
+
+        for (i, exp) in expected_subject_remap_bytes(&chunks).iter().enumerate() {
+            let got = std::fs::read(remap_dir.join(format!("subjects_{i:05}.rmp"))).unwrap();
+            assert_eq!(&got, exp, "subject remap chunk {i} bytes mismatch");
+        }
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // ---- Tier-1 memory stress (measurement / cgroup repro vehicle) ----
+
+    /// Process peak resident set in bytes (high-water mark).
+    fn peak_rss_bytes() -> u64 {
+        let mut usage: libc::rusage = unsafe { std::mem::zeroed() };
+        if unsafe { libc::getrusage(libc::RUSAGE_SELF, &mut usage) } != 0 {
+            return 0;
+        }
+        let maxrss = usage.ru_maxrss.max(0) as u64;
+        // Linux reports kibibytes; macOS reports bytes.
+        if cfg!(target_os = "macos") {
+            maxrss
+        } else {
+            maxrss * 1024
+        }
+    }
+
+    /// Many chunks × high local cardinality × heavy cross-chunk duplication —
+    /// maximizes Σ(chunk-local terms) / global-distinct, the ratio the old mmap
+    /// remap writer paid for in dirty RSS. This is the Tier-1 repro driven by
+    /// the Docker `--memory` hard-cap script; the in-process check here is a
+    /// coarse regression guard (authoritative proof is the capped run).
+    ///
+    /// Caveat: `growth` is the delta of process *high-water* RSS measured after
+    /// vocab generation. If generation already set the high watermark, the merge
+    /// delta under-reports — so this only proves the merge does not *exceed* the
+    /// generation peak, not its true standalone footprint. Treat it as a coarse
+    /// "did not regress to Σlocal-scaling" signal, not a precise measurement.
+    ///
+    /// Scale via env: `FLUREE_STRESS_CHUNKS`, `FLUREE_STRESS_LOCAL`,
+    /// `FLUREE_STRESS_POOL` (distinct global terms).
+    #[test]
+    #[ignore = "stress/measurement; run explicitly, ideally under a memory cap"]
+    fn stress_remap_memory() {
+        let env = |k: &str, d: usize| {
+            std::env::var(k)
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(d)
+        };
+        let chunks = env("FLUREE_STRESS_CHUNKS", 200);
+        let local = env("FLUREE_STRESS_LOCAL", 50_000);
+        let pool = env("FLUREE_STRESS_POOL", 100_000);
+
+        let dir = temp_dir("stress_remap");
+        let remap_dir = dir.join("remap");
+        std::fs::create_dir_all(&remap_dir).unwrap();
+        let ns = HashMap::from([(1u16, "http://ex/".to_string())]);
+
+        let mut subj_vocs = Vec::with_capacity(chunks);
+        let mut str_vocs = Vec::with_capacity(chunks);
+        for c in 0..chunks {
+            let mut sd = ChunkSubjectDict::new();
+            let mut td = ChunkStringDict::new();
+            for j in 0..local {
+                // Deterministic draw from a shared pool → heavy cross-chunk dup.
+                let term = (c
+                    .wrapping_mul(2_654_435_761)
+                    .wrapping_add(j.wrapping_mul(40_503))
+                    % pool) as u64;
+                let key = format!("t{term:08}");
+                sd.get_or_insert(1, key.as_bytes());
+                td.get_or_insert(key.as_bytes());
+            }
+            let sp = dir.join(format!("chunk_{c:05}.subjects.voc"));
+            let tp = dir.join(format!("chunk_{c:05}.strings.voc"));
+            sd.sort_and_write_sorted_vocab(&sp).unwrap();
+            td.sort_and_write_sorted_vocab(&tp).unwrap();
+            subj_vocs.push(sp);
+            str_vocs.push(tp);
+        }
+        let ids: Vec<usize> = (0..chunks).collect();
+
+        let before = peak_rss_bytes();
+        let ss = merge_subject_vocabs(&subj_vocs, &ids, &remap_dir, &dir, &ns).unwrap();
+        let strs = merge_string_vocabs(&str_vocs, &ids, &remap_dir, &dir).unwrap();
+        let after = peak_rss_bytes();
+
+        let sum_local = (chunks as u64) * (local as u64);
+        let growth = after.saturating_sub(before);
+        let old_remap_bytes = sum_local * (8 + 4); // u64 subj + u32 str remap arrays
+        eprintln!(
+            "stress: chunks={chunks} local={local} pool={pool} Σlocal={sum_local} \
+             subj_unique={} str_unique={} peak_rss_growth={}MiB \
+             (old mmap remap footprint ~{}MiB)",
+            ss.total_unique,
+            strs.total_unique,
+            growth / (1024 * 1024),
+            old_remap_bytes / (1024 * 1024),
+        );
+
+        // Regression guard: peak must NOT scale with Σ(local). Generous slack
+        // for allocator noise, but far below the old Σlocal-scaled footprint.
+        assert!(
+            growth < old_remap_bytes / 2,
+            "remap merge RSS growth {growth}B approached Σlocal footprint {old_remap_bytes}B"
+        );
 
         std::fs::remove_dir_all(&dir).ok();
     }
