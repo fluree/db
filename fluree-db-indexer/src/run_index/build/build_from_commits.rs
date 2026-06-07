@@ -36,6 +36,53 @@ pub const BUILD_STAGE_LINK_RUNS: u8 = 2;
 pub const BUILD_STAGE_MERGE: u8 = 3;
 const PROGRESS_BATCH_SIZE: u64 = 4096;
 
+#[derive(Debug, Clone, Copy)]
+struct ProcessMemorySnapshot {
+    vm_rss_mb: u64,
+    rss_anon_mb: u64,
+    rss_file_mb: u64,
+    vm_swap_mb: u64,
+}
+
+#[cfg(target_os = "linux")]
+fn process_memory_snapshot() -> Option<ProcessMemorySnapshot> {
+    fn kb_for(status: &str, key: &str) -> u64 {
+        status
+            .lines()
+            .find_map(|line| {
+                let rest = line.strip_prefix(key)?;
+                rest.split_whitespace().next()?.parse::<u64>().ok()
+            })
+            .unwrap_or(0)
+    }
+
+    let status = std::fs::read_to_string("/proc/self/status").ok()?;
+    Some(ProcessMemorySnapshot {
+        vm_rss_mb: kb_for(&status, "VmRSS:") / 1024,
+        rss_anon_mb: kb_for(&status, "RssAnon:") / 1024,
+        rss_file_mb: kb_for(&status, "RssFile:") / 1024,
+        vm_swap_mb: kb_for(&status, "VmSwap:") / 1024,
+    })
+}
+
+#[cfg(not(target_os = "linux"))]
+fn process_memory_snapshot() -> Option<ProcessMemorySnapshot> {
+    None
+}
+
+fn log_index_memory(stage: &str) {
+    if let Some(mem) = process_memory_snapshot() {
+        tracing::info!(
+            stage,
+            vm_rss_mb = mem.vm_rss_mb,
+            rss_anon_mb = mem.rss_anon_mb,
+            rss_file_mb = mem.rss_file_mb,
+            vm_swap_mb = mem.vm_swap_mb,
+            "index build memory snapshot"
+        );
+    }
+}
+
 /// Input for a single sorted commit chunk.
 #[derive(Clone)]
 pub struct CommitInput {
@@ -177,13 +224,37 @@ impl ClassMembership {
         }
     }
 
+    /// Diagnostic summary for memory attribution logs.
+    ///
+    /// `subject_entries` is dense table slots for the bitset representation and
+    /// distinct typed subjects for the sparse representation.
+    fn summary(&self) -> (&'static str, usize, usize) {
+        match self {
+            Self::Bitset(b) => {
+                let subject_slots = b
+                    .graph_bitsets
+                    .values()
+                    .flat_map(|ns| ns.values())
+                    .map(std::vec::Vec::len)
+                    .sum::<usize>();
+                ("bitset", b.bit_to_class.len(), subject_slots)
+            }
+            Self::Sparse(s) => ("sparse", s.distinct_classes, s.membership.len()),
+        }
+    }
+
     /// Build from per-chunk `.types` sidecars whose IDs are chunk-local and are
     /// remapped to global via each commit's `MmapSubjectRemap`. Import path.
     fn build_from_commits(commits: &[CommitInput]) -> io::Result<Option<Self>> {
         use std::io::{BufReader, Read};
 
+        let build_start = Instant::now();
+        log_index_memory("class_membership:start");
         let mut builder = ClassMembershipBuilder::new();
         let mut saw_sidecar = false;
+        let mut sidecar_files = 0usize;
+        let mut type_entries = 0u64;
+        let mut sidecar_bytes = 0u64;
         let mut buf = [0u8; 18];
 
         for commit in commits {
@@ -193,7 +264,11 @@ impl ClassMembership {
             saw_sidecar = true;
             let remap = MmapSubjectRemap::open(&commit.subject_remap_path)?;
             let file = std::fs::File::open(types_map_path)?;
-            let entry_count = file.metadata()?.len() / 18;
+            let file_bytes = file.metadata()?.len();
+            let entry_count = file_bytes / 18;
+            sidecar_files += 1;
+            type_entries += entry_count;
+            sidecar_bytes += file_bytes;
             let mut reader = BufReader::new(file);
 
             for _ in 0..entry_count {
@@ -210,7 +285,36 @@ impl ClassMembership {
         if !saw_sidecar {
             return Ok(None);
         }
-        Ok(Some(builder.finish()))
+        let membership = builder.finish();
+        let (representation, classes, subject_entries) = membership.summary();
+        if let Some(mem) = process_memory_snapshot() {
+            tracing::info!(
+                sidecar_files,
+                type_entries,
+                sidecar_mb = sidecar_bytes / (1024 * 1024),
+                representation,
+                classes,
+                subject_entries,
+                elapsed_ms = build_start.elapsed().as_millis(),
+                vm_rss_mb = mem.vm_rss_mb,
+                rss_anon_mb = mem.rss_anon_mb,
+                rss_file_mb = mem.rss_file_mb,
+                vm_swap_mb = mem.vm_swap_mb,
+                "class membership built from import types sidecars"
+            );
+        } else {
+            tracing::info!(
+                sidecar_files,
+                type_entries,
+                sidecar_mb = sidecar_bytes / (1024 * 1024),
+                representation,
+                classes,
+                subject_entries,
+                elapsed_ms = build_start.elapsed().as_millis(),
+                "class membership built from import types sidecars"
+            );
+        }
+        Ok(Some(membership))
     }
 
     /// Build from `.types` sidecar files that already contain **global** IDs.
@@ -537,6 +641,16 @@ impl SpotClassStatsCollector {
 
     pub fn finish(mut self) -> SpotClassStats {
         self.flush_subject();
+        tracing::info!(
+            class_count_entries = self.result.class_counts.len(),
+            class_prop_dt_classes = self.result.class_prop_dts.len(),
+            class_prop_lang_classes = self.result.class_prop_langs.len(),
+            class_prop_ref_classes = self.result.class_prop_refs.len(),
+            ref_leaf_entries = self.ref_leaf_entries,
+            ref_truncated = self.ref_truncated,
+            "SPOT class stats collector finished"
+        );
+        log_index_memory("spot_class_stats:finished");
         if self.ref_truncated {
             tracing::warn!(
                 recorded_ref_entries = self.ref_leaf_entries,
@@ -557,9 +671,10 @@ impl SpotClassStatsCollector {
 /// final FLI3/FBR3 artifacts.
 ///
 /// Steps:
-/// 1. Build SPOT directly from V2 sorted commit artifacts
-/// 2. Generate secondary-order run files in parallel
-/// 3. K-way merge secondary runs → FLI3/FBR3
+/// 1. Build SPOT directly from V2 sorted commit artifacts and produce class stats.
+/// 2. Drop SPOT's class-membership heap before secondary-order work starts.
+/// 3. Generate secondary-order run files in parallel.
+/// 4. K-way merge secondary runs → FLI3/FBR3.
 pub fn build_indexes_from_commits(
     commits: &[CommitInput],
     config: &BuildConfig,
@@ -573,12 +688,18 @@ pub fn build_indexes_from_commits(
         g_id = config.g_id,
         "starting build_indexes_from_commits"
     );
+    log_index_memory("build_indexes_from_commits:start");
     if let Some(stage) = &config.stage_marker {
-        stage.store(BUILD_STAGE_REMAP, Ordering::Relaxed);
+        stage.store(BUILD_STAGE_MERGE, Ordering::Relaxed);
     }
 
-    let spot_commits = commits.to_vec();
-    let spot_config = config.clone();
+    // Build SPOT + class-membership stats before the secondary-order phases.
+    //
+    // This is deliberately sequential. ClassMembership can be the largest heap
+    // object in a Wikidata-scale import; overlapping it with secondary run
+    // generation buffers and concurrent PSOT/POST/OPST builders pushed the 256GB
+    // import box into swap. Building SPOT first preserves required class stats
+    // while letting that membership heap drop before the secondary phases begin.
     let spot_rdf_type_p_id = stats_hook.as_ref().and_then(|hook| hook.rdf_type_p_id());
     let spot_class_membership = if spot_rdf_type_p_id.is_some() {
         ClassMembership::build_from_commits(commits)?
@@ -592,19 +713,18 @@ pub fn build_indexes_from_commits(
             "class membership built for ref-target stats"
         );
     }
-    let spot_handle = std::thread::spawn(move || {
-        build_spot_index_from_commits(
-            &spot_commits,
-            &spot_config,
-            spot_rdf_type_p_id,
-            spot_class_membership,
-        )
-    });
+    let (spot_result, spot_class_stats) =
+        build_spot_index_from_commits(commits, config, spot_rdf_type_p_id, spot_class_membership)?;
+    log_index_memory("spot_build:joined_before_secondary_phases");
 
     // Phase 1: Generate secondary-order runs in parallel.
+    if let Some(stage) = &config.stage_marker {
+        stage.store(BUILD_STAGE_REMAP, Ordering::Relaxed);
+    }
     let remap_start = Instant::now();
     let worker_count = config.worker_count.max(1).min(commits.len().max(1));
     let per_thread_budget_bytes = (config.run_budget_bytes / worker_count).max(64 * 1024 * 1024);
+    log_index_memory("secondary_run_generation:start");
     tracing::info!(
         chunks = commits.len(),
         worker_count,
@@ -691,9 +811,11 @@ pub fn build_indexes_from_commits(
         elapsed_ms = remap_elapsed.as_millis(),
         "secondary-order run generation complete"
     );
+    log_index_memory("secondary_run_generation:complete");
 
     if let Some(target_hook) = stats_hook.as_mut() {
         let stats_merge_start = Instant::now();
+        log_index_memory("worker_id_stats_merge:start");
         tracing::info!(
             worker_hooks = worker_hooks.len(),
             "merging worker-local id stats hooks"
@@ -705,12 +827,14 @@ pub fn build_indexes_from_commits(
             elapsed_ms = stats_merge_start.elapsed().as_millis(),
             "merged worker-local id stats hooks"
         );
+        log_index_memory("worker_id_stats_merge:complete");
     }
 
     // Phase 2: Build secondary indexes from run files.
     if let Some(stage) = &config.stage_marker {
         stage.store(BUILD_STAGE_LINK_RUNS, Ordering::Relaxed);
     }
+    log_index_memory("secondary_run_link:start");
     for &order in RunSortOrder::secondary_orders() {
         let link_start = Instant::now();
         let flat_dir = config.run_dir.join(order.dir_name());
@@ -725,10 +849,12 @@ pub fn build_indexes_from_commits(
             "linked secondary-order run files"
         );
     }
+    log_index_memory("secondary_run_link:complete");
     if let Some(stage) = &config.stage_marker {
         stage.store(BUILD_STAGE_MERGE, Ordering::Relaxed);
     }
     let build_start = Instant::now();
+    log_index_memory("secondary_index_merge:start");
     tracing::info!("starting secondary index merge/build");
 
     let build_config = BuildAllConfig {
@@ -742,16 +868,14 @@ pub fn build_indexes_from_commits(
         g_id: config.g_id,
         progress: config.build_progress.clone(),
         // Build the secondary orders (PSOT/POST/OPST) concurrently, bounded by
-        // the import core budget. SPOT already builds on its own thread above,
-        // so total concurrent build threads are ~1 (SPOT) + max_concurrency.
+        // the import core budget. SPOT has already completed, so this
+        // concurrency no longer overlaps with the class-membership heap.
         // build_all_indexes clamps this to the number of buildable orders.
         max_concurrency: config.worker_count,
     };
 
     let mut order_results = build_all_indexes(&build_config).map_err(io::Error::other)?;
-    let (spot_result, spot_class_stats) = spot_handle
-        .join()
-        .map_err(|_| io::Error::other("SPOT direct build thread panicked"))??;
+    log_index_memory("secondary_index_merge:complete");
     order_results.push((RunSortOrder::Spot, spot_result));
 
     let _ = build_start;
@@ -762,6 +886,7 @@ pub fn build_indexes_from_commits(
         total_elapsed_ms = overall_start.elapsed().as_millis(),
         "build_indexes_from_commits complete"
     );
+    log_index_memory("build_indexes_from_commits:complete");
 
     // Total rows from the POST result (canonical count — avoids double-counting).
     let total_rows = order_results
@@ -805,6 +930,7 @@ fn build_spot_index_from_commits(
         g_id,
         "starting direct SPOT build from sorted commits"
     );
+    log_index_memory("spot_build:start");
     let streams: Vec<SortedCommitMergeReaderV2<MmapSubjectRemap, MmapStringRemap>> = commits
         .iter()
         .map(|commit| {
@@ -883,6 +1009,7 @@ fn build_spot_index_from_commits(
         elapsed_ms = t0.elapsed().as_millis(),
         "direct SPOT build complete"
     );
+    log_index_memory("spot_build:complete_before_stats_finish");
     Ok((
         IndexBuildResult {
             graphs: vec![result],
