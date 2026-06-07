@@ -113,6 +113,15 @@ pub fn merge_subject_vocabs(
         remaps.push(remap);
     }
 
+    let total_local: u64 = readers.iter().map(|r| r.header().entry_count).sum();
+    tracing::info!(
+        chunks = k,
+        total_local_subjects = total_local,
+        projected_remap_mib = crate::mem::mib(total_local * 8),
+        rss_mib = crate::mem::current_rss_mib(),
+        "vocab merge: subject phase start"
+    );
+
     // Open forward dict output streams.
     let mut fwd = BufWriter::new(std::fs::File::create(run_dir.join("subjects.fwd"))?);
     let mut idx = ForwardIndexStream::new(run_dir, "subjects")?;
@@ -196,6 +205,12 @@ pub fn merge_subject_vocabs(
         remap.finish()?;
     }
 
+    tracing::info!(
+        unique_subjects = total_unique,
+        rss_mib = crate::mem::current_rss_mib(),
+        "vocab merge: subject phase done"
+    );
+
     Ok(SubjectMergeStats {
         total_unique,
         needs_wide,
@@ -270,6 +285,15 @@ pub fn merge_string_vocabs(
         remaps.push(remap);
     }
 
+    let total_local: u64 = readers.iter().map(|r| r.header().entry_count).sum();
+    tracing::info!(
+        chunks = k,
+        total_local_strings = total_local,
+        projected_remap_mib = crate::mem::mib(total_local * 4),
+        rss_mib = crate::mem::current_rss_mib(),
+        "vocab merge: string phase start"
+    );
+
     let mut fwd = BufWriter::new(std::fs::File::create(run_dir.join("strings.fwd"))?);
     let mut idx = ForwardIndexStream::new(run_dir, "strings")?;
 
@@ -325,6 +349,12 @@ pub fn merge_string_vocabs(
     for remap in remaps {
         remap.finish()?;
     }
+
+    tracing::info!(
+        unique_strings = next_global_id,
+        rss_mib = crate::mem::current_rss_mib(),
+        "vocab merge: string phase done"
+    );
 
     Ok(StringMergeStats {
         total_unique: next_global_id,
