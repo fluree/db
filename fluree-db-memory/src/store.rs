@@ -7,6 +7,7 @@ use chrono::Utc;
 use fluree_db_api::Fluree;
 use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
+use tokio::sync::Mutex;
 use tracing::{debug, warn};
 
 const MEM_PREFIX: &str = "mem:";
@@ -93,6 +94,13 @@ const MEMORY_LEDGER_ID: &str = "__memory:main";
 pub struct MemoryStore {
     fluree: Fluree,
     memory_dir: Option<PathBuf>,
+    /// Serializes file-backed memory mutations inside one MCP/CLI process.
+    ///
+    /// The `.ttl` files and the `__memory` ledger cache are updated as one
+    /// logical unit. Letting overlapping MCP tool calls perform that
+    /// read-modify-write sequence concurrently can leave the file watermark and
+    /// cache diverged, causing rebuild storms.
+    mutation_lock: Mutex<()>,
 }
 
 impl MemoryStore {
@@ -101,7 +109,11 @@ impl MemoryStore {
     /// Pass `memory_dir` to enable file-based sync (e.g., `.fluree-memory/`).
     /// Pass `None` for legacy behavior (ledger-only, no file sharing).
     pub fn new(fluree: Fluree, memory_dir: Option<PathBuf>) -> Self {
-        Self { fluree, memory_dir }
+        Self {
+            fluree,
+            memory_dir,
+            mutation_lock: Mutex::new(()),
+        }
     }
 
     /// The memory directory path, if file-based sync is enabled.
@@ -149,7 +161,7 @@ impl MemoryStore {
                 // an old process is still running. Fall back to a full
                 // drop-and-reinit to recover cleanly.
                 warn!("Commit conflict during init — falling back to drop_and_reinit");
-                self.drop_and_reinit().await?;
+                self.drop_and_reinit_unlocked().await?;
                 self.ensure_file_structure()?;
                 debug!("Memory ledger initialized (via drop_and_reinit fallback)");
                 return Ok(());
@@ -199,6 +211,16 @@ impl MemoryStore {
     ///
     /// Used by the rebuild pipeline to recreate the ledger from `.ttl` files.
     pub async fn drop_and_reinit(&self) -> Result<()> {
+        let _guard = self.mutation_lock.lock().await;
+        let file_lock = self.acquire_file_lock().await?;
+        let result = self.drop_and_reinit_unlocked().await;
+        drop(file_lock);
+        result
+    }
+
+    /// Drop and reinitialize the `__memory` ledger while the caller already
+    /// holds the store mutation lock.
+    pub(crate) async fn drop_and_reinit_unlocked(&self) -> Result<()> {
         // Delete the ledger if it exists
         if self.is_initialized().await? {
             debug!("Dropping __memory ledger for rebuild");
@@ -228,6 +250,7 @@ impl MemoryStore {
     /// No-op if `memory_dir` is `None`.
     pub async fn ensure_synced(&self) -> Result<()> {
         if let Some(dir) = &self.memory_dir {
+            let _guard = self.mutation_lock.lock().await;
             crate::file_sync::ensure_synced(self, dir).await?;
         }
         Ok(())
@@ -253,6 +276,8 @@ impl MemoryStore {
     /// the ledger cache commit succeeds so that any cache failure leaves a hash
     /// mismatch and triggers a rebuild on the next `ensure_synced()`.
     pub async fn add(&self, input: MemoryInput) -> Result<String> {
+        let _guard = self.mutation_lock.lock().await;
+        let file_lock = self.acquire_file_lock().await?;
         self.initialize().await?;
 
         let id = crate::id::generate_memory_id(input.kind);
@@ -307,6 +332,7 @@ impl MemoryStore {
         }
 
         debug!(id = %id, kind = %mem.kind, "Memory added");
+        drop(file_lock);
         Ok(id)
     }
 
@@ -348,6 +374,8 @@ WHERE {{\n\
     /// In file-based mode, the `.ttl` file is rewritten first (authoritative),
     /// then the ledger is updated via retract-all + re-insert.
     pub async fn update(&self, id: &str, update: MemoryUpdate) -> Result<String> {
+        let _guard = self.mutation_lock.lock().await;
+        let file_lock = self.acquire_file_lock().await?;
         self.initialize().await?;
 
         let expanded = expand_id(id);
@@ -425,6 +453,7 @@ WHERE {{\n\
         }
 
         debug!(id = %compact, "Memory updated in place");
+        drop(file_lock);
         Ok(compact)
     }
 
@@ -433,6 +462,8 @@ WHERE {{\n\
     /// In file-based mode, the `.ttl` file is rewritten first (authoritative),
     /// then the ledger cache is updated. This is the only non-append file mutation.
     pub async fn forget(&self, id: &str) -> Result<()> {
+        let _guard = self.mutation_lock.lock().await;
+        let file_lock = self.acquire_file_lock().await?;
         self.initialize().await?;
 
         let expanded = expand_id(id);
@@ -491,6 +522,7 @@ WHERE {{\n\
         }
 
         debug!(id = %id, "Memory forgotten");
+        drop(file_lock);
         Ok(())
     }
 
@@ -730,6 +762,7 @@ WHERE {{\n\
     ///
     /// Returns the number of memories imported.
     pub async fn import(&self, data: Value) -> Result<usize> {
+        let _guard = self.mutation_lock.lock().await;
         self.initialize().await?;
 
         let memories: Vec<Memory> = serde_json::from_value(data)?;
@@ -761,6 +794,13 @@ WHERE {{\n\
         }
 
         Ok(count)
+    }
+
+    async fn acquire_file_lock(&self) -> Result<Option<std::fs::File>> {
+        match &self.memory_dir {
+            Some(dir) => Ok(Some(crate::file_sync::acquire_memory_lock(dir).await?)),
+            None => Ok(None),
+        }
     }
 }
 
