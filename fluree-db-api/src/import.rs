@@ -215,14 +215,16 @@ impl Default for ImportConfig {
 // Memory budget derivation
 // ============================================================================
 
-/// Detect total system memory in MB. Falls back to 16 GB if detection fails.
+/// Detect the memory-budget basis in MB: host RAM clamped to the cgroup limit
+/// (so a container/cgroup-limited import sizes to its real limit, not host RAM).
+/// Falls back to 16 GB if detection fails.
 #[cfg(feature = "native")]
 pub fn detect_system_memory_mb() -> usize {
     use sysinfo::{MemoryRefreshKind, System};
 
     let mut sys = System::new();
     sys.refresh_memory_specifics(MemoryRefreshKind::everything());
-    let total_bytes = sys.total_memory();
+    let total_bytes = fluree_db_core::sysmem::effective_memory_limit_bytes(sys.total_memory());
 
     if total_bytes == 0 {
         tracing::warn!("could not detect system memory, falling back to 16 GB");
