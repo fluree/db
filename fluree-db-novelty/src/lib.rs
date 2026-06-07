@@ -1629,27 +1629,54 @@ mod tests {
                 for idx in [IndexType::Psot, IndexType::Post, IndexType::Opst] {
                     assert_eq!(base, canon(idx), "multiset spot vs {idx:?} g{g} (seed {seed})");
                 }
-                // Range read == filtered full scan, for random bounds on SPOT.
-                let full = eq_full(&n, g, IndexType::Spot);
-                if full.len() >= 2 {
+                // Range reads == filtered full scan, across ALL four orders, with
+                // bounded / first-only / open / empty cases. Exercises every
+                // comparator path the future k-way merge must implement.
+                for idx in ORDERS {
+                    let full = eq_full(&n, g, idx);
+                    // open-ended (leftmost, no rhs) == the full ordered scan
+                    assert_eq!(
+                        n.slice_for_range(g, idx, None, None, true).to_vec(),
+                        full,
+                        "open range != full {idx:?} g{g} (seed {seed})"
+                    );
+                    if full.len() < 2 {
+                        continue;
+                    }
                     let a = sm64(&mut rng) as usize % full.len();
                     let b = sm64(&mut rng) as usize % full.len();
                     let (lo, hi) = (a.min(b), a.max(b));
                     let first = n.get_flake(full[lo]).clone();
                     let rhs = n.get_flake(full[hi]).clone();
-                    let ranged = n
-                        .slice_for_range(g, IndexType::Spot, Some(&first), Some(&rhs), false)
-                        .to_vec();
-                    let expected: Vec<FlakeId> = full
-                        .iter()
-                        .copied()
-                        .filter(|&id| {
-                            let f = n.get_flake(id);
-                            IndexType::Spot.compare(f, &first) == Ordering::Greater
-                                && IndexType::Spot.compare(f, &rhs) != Ordering::Greater
-                        })
-                        .collect();
-                    assert_eq!(ranged, expected, "range != filtered scan g{g} (seed {seed})");
+                    let scan = |pred: &dyn Fn(&Flake) -> bool| -> Vec<FlakeId> {
+                        full.iter().copied().filter(|&id| pred(n.get_flake(id))).collect()
+                    };
+                    // bounded (first, rhs]
+                    assert_eq!(
+                        n.slice_for_range(g, idx, Some(&first), Some(&rhs), false).to_vec(),
+                        scan(&|f| {
+                            idx.compare(f, &first) == Ordering::Greater
+                                && idx.compare(f, &rhs) != Ordering::Greater
+                        }),
+                        "bounded range {idx:?} g{g} (seed {seed})"
+                    );
+                    // first-only (first, end]
+                    assert_eq!(
+                        n.slice_for_range(g, idx, Some(&first), None, false).to_vec(),
+                        scan(&|f| idx.compare(f, &first) == Ordering::Greater),
+                        "first-only range {idx:?} g{g} (seed {seed})"
+                    );
+                    // empty/degenerate: first = max, rhs = min
+                    let maxf = n.get_flake(*full.last().unwrap()).clone();
+                    let minf = n.get_flake(full[0]).clone();
+                    assert_eq!(
+                        n.slice_for_range(g, idx, Some(&maxf), Some(&minf), false).to_vec(),
+                        scan(&|f| {
+                            idx.compare(f, &maxf) == Ordering::Greater
+                                && idx.compare(f, &minf) != Ordering::Greater
+                        }),
+                        "empty range {idx:?} g{g} (seed {seed})"
+                    );
                 }
 
                 // Fold the full ordered snapshot into the contract digest.
@@ -1672,12 +1699,12 @@ mod tests {
         // reproduce these exactly. Regenerate intentionally only when novelty
         // semantics change on purpose.
         const EXPECTED: &[u64] = &[
-            4_073_509_179_802_475_162,
-            9_256_862_574_961_055_541,
-            3_574_053_021_605_482_748,
-            12_818_349_556_880_910_177,
-            2_579_581_955_341_172_080,
-            12_599_905_805_018_457_638,
+            17_085_636_203_747_601_083,
+            17_735_258_564_421_583_015,
+            10_042_115_320_558_787_806,
+            10_849_888_332_386_873_009,
+            17_714_828_874_643_605_845,
+            5_823_289_256_863_810_933,
         ];
         let mut got = Vec::new();
         for &s in &SEEDS {

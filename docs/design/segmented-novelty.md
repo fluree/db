@@ -193,6 +193,17 @@ synchronous threshold compaction under the write lock; tiered/background is a
 follow-up. Compaction produces a new `Arc<Segment>`; readers holding the old list
 are unaffected (COW).
 
+> **Critical (review): compaction is a separate, stats-aware step — keep it OFF in
+> the append-only phase.** `runtime_stats::assemble_fast_stats_inner` consumes
+> `novelty.iter_index(POST)` as a **raw +1/−1 delta log** against the indexed
+> stats. Dropping older ops during compaction breaks that: e.g. a novelty-local
+> `assert` then `retract` of a fact NOT in the persisted index is query-invisible
+> either way, but compacting to just the `retract` makes stats apply a bogus `−1`.
+> Before enabling compaction we must make stats **effective-state / base-aware**
+> (or have compaction preserve enough delta information), with regressions for
+> both (a) novelty-local assert+retract and (b) indexed-fact + novelty-retract.
+> Append-only segmentation (this phase) keeps every op, so stats are unaffected.
+
 ### 4.6 Interactions
 
 - **`clear_up_to(cutoff_t)`** (post-index novelty trim — this is what removes
@@ -231,6 +242,9 @@ fix was abandoned).
 - Query/overlay operators that consume *materialized* `&Flake`/`Flake` stay
   unchanged once the adapter is in place; only callers relying on the zero-copy
   `&[FlakeId]` borrow need touching.
+- **Stats coupling:** `runtime_stats::assemble_fast_stats_inner` reads
+  `iter_index(POST)` as a raw delta log — unaffected by append-only segmentation,
+  but a hard constraint on compaction (§4.5).
 
 ## 7. Equivalence harness (build first, per review)
 
@@ -259,10 +273,20 @@ A differential/golden harness that pins the **observable contract** of the curre
 
 ## 9. Phased plan
 
-1. Equivalence harness green against current `Novelty` (records the contract).
-2. Introduce `Segment` + segmented `Novelty` behind the harness; `apply_commit`
-   append-only; dedup via Option B; reads via range-merge.
-3. Compaction (synchronous, threshold `K`).
+1. ✅ Equivalence harness green against current `Novelty` (records the contract:
+   sortedness, multiset across all four orders, range==filtered-scan for all
+   orders + edge cases, golden digests).
+2. **Append-only segmentation (this phase, compaction OFF):** introduce `Segment`
+   + segmented `Novelty` behind the harness; `apply_commit` append-only; dedup via
+   Option B behind a `DedupIndex` seam; reads via range-merge with a
+   borrow-preserving iterator + `Vec` adapter; update external read-surface call
+   sites (`StagedLedger`, runtime stats). Harness digest must match exactly
+   (append-only preserves every flake). Re-measure slope on the box.
+3. **Compaction (separate, stats-aware):** first split the harness into a *raw*
+   contract (current) and an *effective/stats* contract; make
+   `assemble_fast_stats` effective-state-aware (or compaction base-aware) with
+   regressions for novelty-local assert+retract and indexed-fact+novelty-retract;
+   only then enable threshold-`K` compaction (preserving tombstones, §4.5).
 4. `clear_up_to` / `bulk_apply_commits` over segments.
 5. Re-measure on `m7i.xlarge`: growth slope should collapse toward flat; confirm
    cached-path clone gone (flamegraph) and read benches unregressed.
