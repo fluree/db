@@ -1522,4 +1522,173 @@ mod tests {
             "datatype is part of identity — must split"
         );
     }
+
+    // ===== Equivalence / contract harness for the segmented-novelty rewrite =====
+    // Applies random commit sequences (asserts/retracts/reasserts, same (s,p,o,dt)
+    // with different list-index meta, multiple named graphs, comparator ties) and,
+    // after every commit, checks impl-independent invariants (range reads ==
+    // filtered full scan; each order sorted; all four orders hold the same
+    // multiset) plus a golden digest of the full snapshot. The golden digests pin
+    // the exact observable contract so the segmented rewrite must reproduce it.
+    // Uses only the stable public surface (apply_commit / slice_for_range /
+    // get_flake), so it survives the internal rewrite unchanged.
+
+    fn sm64(state: &mut u64) -> u64 {
+        *state = state.wrapping_add(0x9E37_79B9_7F4A_7C15);
+        let mut z = *state;
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        z ^ (z >> 31)
+    }
+
+    fn eq_reverse_graph() -> HashMap<Sid, GraphId> {
+        let mut m = HashMap::new();
+        m.insert(Sid::new(8, "g1"), 1u16);
+        m.insert(Sid::new(8, "g2"), 2u16);
+        m
+    }
+
+    // Small value pools force collisions, reasserts, and comparator ties.
+    fn eq_make(rng: &mut u64, t: i64) -> Flake {
+        let s = sm64(rng) % 4;
+        let p = sm64(rng) % 3;
+        let o = (sm64(rng) % 4) as i64;
+        let op = !sm64(rng).is_multiple_of(3); // ~2/3 assert, 1/3 retract
+        let gsel = sm64(rng) % 3; // 0 default, 1 g1, 2 g2
+        let m = if sm64(rng).is_multiple_of(2) {
+            Some(FlakeMeta {
+                lang: None,
+                i: Some((sm64(rng) % 3) as i32),
+            })
+        } else {
+            None
+        };
+        let mut f = Flake::new(
+            Sid::new(1, format!("s{s}")),
+            Sid::new(1, format!("p{p}")),
+            FlakeValue::Long(o),
+            Sid::new(2, "long"),
+            t,
+            op,
+            m,
+        );
+        match gsel {
+            1 => f.g = Some(Sid::new(8, "g1")),
+            2 => f.g = Some(Sid::new(8, "g2")),
+            _ => {}
+        }
+        f
+    }
+
+    fn eq_full(n: &Novelty, g: GraphId, idx: IndexType) -> Vec<FlakeId> {
+        n.slice_for_range(g, idx, None, None, true).to_vec()
+    }
+
+    fn eq_run(seed: u64) -> u64 {
+        use std::collections::hash_map::DefaultHasher;
+        use std::hash::{Hash, Hasher};
+        let rg = eq_reverse_graph();
+        let mut rng = seed;
+        let mut n = Novelty::new(0);
+        let mut digest = DefaultHasher::new();
+        const ORDERS: [IndexType; 4] = [
+            IndexType::Spot,
+            IndexType::Psot,
+            IndexType::Post,
+            IndexType::Opst,
+        ];
+
+        for c in 0..40 {
+            let t = c as i64 + 1;
+            let batch_n = 1 + (sm64(&mut rng) % 6) as usize;
+            let batch: Vec<Flake> = (0..batch_n).map(|_| eq_make(&mut rng, t)).collect();
+            // Only routable graphs are used, so apply_commit cannot error here.
+            n.apply_commit(batch, t, &rg).expect("apply_commit");
+
+            for g in 0u16..=2 {
+                // Each order is sorted by its comparator.
+                for idx in ORDERS {
+                    let ids = eq_full(&n, g, idx);
+                    for w in ids.windows(2) {
+                        assert!(
+                            idx.compare(n.get_flake(w[0]), n.get_flake(w[1])) != Ordering::Greater,
+                            "order {idx:?} g{g} not sorted (seed {seed})"
+                        );
+                    }
+                }
+                // All four orders hold the same multiset of flakes.
+                let canon = |idx: IndexType| -> Vec<String> {
+                    let mut v: Vec<String> = eq_full(&n, g, idx)
+                        .iter()
+                        .map(|&id| format!("{:?}", n.get_flake(id)))
+                        .collect();
+                    v.sort();
+                    v
+                };
+                let base = canon(IndexType::Spot);
+                for idx in [IndexType::Psot, IndexType::Post, IndexType::Opst] {
+                    assert_eq!(base, canon(idx), "multiset spot vs {idx:?} g{g} (seed {seed})");
+                }
+                // Range read == filtered full scan, for random bounds on SPOT.
+                let full = eq_full(&n, g, IndexType::Spot);
+                if full.len() >= 2 {
+                    let a = sm64(&mut rng) as usize % full.len();
+                    let b = sm64(&mut rng) as usize % full.len();
+                    let (lo, hi) = (a.min(b), a.max(b));
+                    let first = n.get_flake(full[lo]).clone();
+                    let rhs = n.get_flake(full[hi]).clone();
+                    let ranged = n
+                        .slice_for_range(g, IndexType::Spot, Some(&first), Some(&rhs), false)
+                        .to_vec();
+                    let expected: Vec<FlakeId> = full
+                        .iter()
+                        .copied()
+                        .filter(|&id| {
+                            let f = n.get_flake(id);
+                            IndexType::Spot.compare(f, &first) == Ordering::Greater
+                                && IndexType::Spot.compare(f, &rhs) != Ordering::Greater
+                        })
+                        .collect();
+                    assert_eq!(ranged, expected, "range != filtered scan g{g} (seed {seed})");
+                }
+
+                // Fold the full ordered snapshot into the contract digest.
+                for idx in ORDERS {
+                    let ids = eq_full(&n, g, idx);
+                    ids.len().hash(&mut digest);
+                    for id in ids {
+                        format!("{:?}", n.get_flake(id)).hash(&mut digest);
+                    }
+                }
+            }
+        }
+        digest.finish()
+    }
+
+    #[test]
+    fn novelty_equivalence_contract() {
+        const SEEDS: [u64; 6] = [1, 2, 3, 42, 1337, 0xDEAD_BEEF];
+        // Golden digests pin the observable contract; the segmented rewrite must
+        // reproduce these exactly. Regenerate intentionally only when novelty
+        // semantics change on purpose.
+        const EXPECTED: &[u64] = &[
+            4_073_509_179_802_475_162,
+            9_256_862_574_961_055_541,
+            3_574_053_021_605_482_748,
+            12_818_349_556_880_910_177,
+            2_579_581_955_341_172_080,
+            12_599_905_805_018_457_638,
+        ];
+        let mut got = Vec::new();
+        for &s in &SEEDS {
+            let d1 = eq_run(s);
+            let d2 = eq_run(s);
+            assert_eq!(d1, d2, "novelty non-deterministic for seed {s}");
+            got.push(d1);
+        }
+        eprintln!("NOVELTY_EQUIVALENCE_DIGESTS={got:?}");
+        if !EXPECTED.is_empty() {
+            assert_eq!(got.as_slice(), EXPECTED, "novelty contract digest changed");
+        }
+    }
 }
