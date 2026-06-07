@@ -122,7 +122,7 @@ pub struct ImportConfig {
     /// Publish nameservice head every N chunks during import. Default: 50.
     /// 0 disables periodic checkpoints.
     pub publish_every: usize,
-    /// Overall memory budget in MB for the import pipeline. 0 = auto-detect (60% of RAM).
+    /// Overall memory budget in MB for the import pipeline. 0 = auto-detect (80% of RAM).
     ///
     /// Used to derive `chunk_size_mb` and `max_inflight_chunks` when those fields
     /// are left at 0.
@@ -269,9 +269,13 @@ impl ImportConfig {
         if self.memory_budget_mb > 0 {
             self.memory_budget_mb
         } else {
+            // Default: assume the import owns the box and use most of it. `ram` is
+            // already cgroup-clamped (detect_system_memory_mb), so this respects
+            // a container limit automatically; pass --memory-budget-mb to curtail
+            // for shared environments. 80% leaves headroom for OS page cache +
+            // disk-spill writeback (the pipeline spills scratch to disk).
             let ram = detect_system_memory_mb();
-            // 60% of system RAM
-            (ram as f64 * 0.60) as usize
+            (ram as f64 * 0.80) as usize
         }
     }
 
@@ -429,7 +433,7 @@ impl ImportConfig {
 /// Used to report to the user what the import pipeline will use when values are auto-detected.
 #[derive(Debug, Clone)]
 pub struct EffectiveImportSettings {
-    /// Memory budget in MB (60% of system RAM when not set).
+    /// Memory budget in MB (80% of system RAM when not set).
     pub memory_budget_mb: usize,
     /// Number of parallel parse threads (auto: logical cores, memory-capped, when not set).
     pub parallelism: usize,
@@ -1566,7 +1570,7 @@ impl<'a> ImportBuilder<'a> {
         self
     }
 
-    /// Set the overall memory budget in MB. 0 = auto-detect (60% of RAM).
+    /// Set the overall memory budget in MB. 0 = auto-detect (80% of RAM).
     pub fn memory_budget_mb(mut self, mb: usize) -> Self {
         self.config.memory_budget_mb = mb;
         self
