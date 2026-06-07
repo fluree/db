@@ -1608,4 +1608,154 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(&dir);
     }
+
+    // ---- Memory stress (cgroup hard-cap repro vehicle) ----
+
+    /// Process peak resident set in bytes (high-water mark).
+    fn peak_rss_bytes() -> u64 {
+        let mut usage: libc::rusage = unsafe { std::mem::zeroed() };
+        if unsafe { libc::getrusage(libc::RUSAGE_SELF, &mut usage) } != 0 {
+            return 0;
+        }
+        let maxrss = usage.ru_maxrss.max(0) as u64;
+        // Linux reports kibibytes; macOS reports bytes.
+        if cfg!(target_os = "macos") {
+            maxrss
+        } else {
+            maxrss * 1024
+        }
+    }
+
+    /// A content store that computes the (content-addressed) CID and discards
+    /// the bytes, so the stress measurement reflects the upload's own working
+    /// set rather than retained CAS artifacts.
+    #[derive(Debug, Default)]
+    struct DiscardingContentStore {
+        puts: std::sync::atomic::AtomicU64,
+    }
+
+    #[async_trait::async_trait]
+    impl ContentStore for DiscardingContentStore {
+        async fn has(&self, _id: &ContentId) -> fluree_db_core::error::Result<bool> {
+            Ok(false)
+        }
+        async fn get(&self, id: &ContentId) -> fluree_db_core::error::Result<Vec<u8>> {
+            Err(fluree_db_core::error::Error::not_found(id.to_string()))
+        }
+        async fn put(
+            &self,
+            kind: fluree_db_core::ContentKind,
+            bytes: &[u8],
+        ) -> fluree_db_core::error::Result<ContentId> {
+            self.puts
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            Ok(ContentId::new(kind, bytes))
+        }
+        async fn put_with_id(
+            &self,
+            _id: &ContentId,
+            _bytes: &[u8],
+        ) -> fluree_db_core::error::Result<()> {
+            Ok(())
+        }
+        async fn release(&self, _id: &ContentId) -> fluree_db_core::error::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// Build a large sorted fixture with `chunks * local` DISTINCT subjects and
+    /// strings (unique terms per chunk → no cross-chunk dedup → maximal distinct
+    /// cardinality, which is what the materialized upload path allocates for).
+    fn build_large_fixture(
+        run_dir: &Path,
+        namespace_codes: &HashMap<u16, String>,
+        chunks: usize,
+        local: usize,
+    ) {
+        use crate::run_index::resolve::global_dict::PredicateDict;
+        use crate::run_index::vocab::vocab_merge;
+
+        let remap_dir = run_dir.join("remap");
+        std::fs::create_dir_all(&remap_dir).unwrap();
+
+        let mut subj_vocs = Vec::with_capacity(chunks);
+        let mut str_vocs = Vec::with_capacity(chunks);
+        for c in 0..chunks {
+            let mut sd = ChunkSubjectDict::new();
+            let mut td = ChunkStringDict::new();
+            for j in 0..local {
+                let g = c * local + j;
+                sd.get_or_insert(5, format!("s{g:010}").as_bytes());
+                td.get_or_insert(format!("v{g:010}").as_bytes());
+            }
+            let sp = run_dir.join(format!("chunk_{c:05}.subjects.voc"));
+            let tp = run_dir.join(format!("chunk_{c:05}.strings.voc"));
+            sd.sort_and_write_sorted_vocab(&sp).unwrap();
+            td.sort_and_write_sorted_vocab(&tp).unwrap();
+            subj_vocs.push(sp);
+            str_vocs.push(tp);
+        }
+        let ids: Vec<usize> = (0..chunks).collect();
+        vocab_merge::merge_subject_vocabs(&subj_vocs, &ids, &remap_dir, run_dir, namespace_codes)
+            .unwrap();
+        vocab_merge::merge_string_vocabs(&str_vocs, &ids, &remap_dir, run_dir).unwrap();
+
+        let mut graphs = PredicateDict::new();
+        graphs.get_or_insert("https://ns.flur.ee/ledger#default");
+        run_index::dict_io::write_predicate_dict(&run_dir.join("graphs.dict"), &graphs).unwrap();
+        let mut datatypes = PredicateDict::new();
+        datatypes.get_or_insert("http://www.w3.org/2001/XMLSchema#string");
+        run_index::dict_io::write_predicate_dict(&run_dir.join("datatypes.dict"), &datatypes)
+            .unwrap();
+    }
+
+    /// Drives the cgroup hard-cap repro (`scripts/import-memory-repro.sh`).
+    ///
+    /// `FLUREE_UPLOAD_TRUST=0` exercises the materialized path (full term-sized
+    /// Vecs — the pre-fix behavior); `=1` exercises the streaming path. Under a
+    /// container `--memory` cap below the materialized footprint, `0` OOM-kills
+    /// while `1` survives. Scale via `FLUREE_UPLOAD_CHUNKS` / `FLUREE_UPLOAD_LOCAL`.
+    #[tokio::test]
+    #[ignore = "stress/repro; run explicitly, ideally under a container memory cap"]
+    async fn stress_upload_memory() {
+        let env = |k: &str, d: usize| {
+            std::env::var(k)
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(d)
+        };
+        let chunks = env("FLUREE_UPLOAD_CHUNKS", 200);
+        let local = env("FLUREE_UPLOAD_LOCAL", 50_000);
+        let trust = env("FLUREE_UPLOAD_TRUST", 1) != 0;
+        let n = chunks * local;
+
+        let ns = HashMap::from([(5u16, "http://ex.org/".to_string())]);
+        let dir = std::env::temp_dir().join("fluree_upload_stress");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        build_large_fixture(&dir, &ns, chunks, local);
+        let before = peak_rss_bytes();
+
+        let store = DiscardingContentStore::default();
+        let out = upload_dicts_from_disk(&store, &dir, &ns, trust)
+            .await
+            .unwrap();
+
+        let after = peak_rss_bytes();
+        // Rough materialized footprint: subjects ~44 B/term + strings ~36 B/term,
+        // both tasks live concurrently.
+        let materialized_bytes = (n as u64) * 80;
+        eprintln!(
+            "upload-stress: trust={trust} chunks={chunks} local={local} N={n} \
+             subjects={} strings={} peak_rss_growth={}MiB \
+             (materialized footprint ~{}MiB)",
+            out.subject_watermarks.len(),
+            out.string_watermark + 1,
+            after.saturating_sub(before) / (1024 * 1024),
+            materialized_bytes / (1024 * 1024),
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
