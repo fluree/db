@@ -41,6 +41,9 @@ use std::sync::Arc;
 use std::time::Instant;
 use tracing::Instrument;
 
+const IMPORT_PIPELINE_WAIT_LOG_THRESHOLD_MS: u128 = 50;
+const LOCAL_RECHUNK_EVENT_CHANNEL_CAPACITY: usize = 2;
+
 // ============================================================================
 // Configuration
 // ============================================================================
@@ -281,6 +284,11 @@ impl ImportConfig {
 
     /// Effective max inflight chunks (derived from budget if 0).
     pub fn effective_max_inflight(&self) -> usize {
+        if let Ok(v) = std::env::var("FLUREE_IMPORT_MAX_INFLIGHT") {
+            if let Ok(n) = v.parse::<usize>() {
+                return n.max(1);
+            }
+        }
         if self.max_inflight_chunks > 0 {
             return self.max_inflight_chunks;
         }
@@ -302,6 +310,27 @@ impl ImportConfig {
             }
         }
         self.coalesce_small_files_threshold
+    }
+
+    /// Effective local-directory rechunk worker count.
+    ///
+    /// This is intentionally not a CLI knob. The local rechunk stage only exists
+    /// to feed parser workers, so auto-size it conservatively from parser
+    /// parallelism and the existing inflight memory budget. Operators can use
+    /// `FLUREE_IMPORT_RECHUNK_THREADS=<n>` while validating large imports.
+    pub fn effective_rechunk_threads(&self) -> usize {
+        if let Ok(v) = std::env::var("FLUREE_IMPORT_RECHUNK_THREADS") {
+            if let Ok(n) = v.parse::<usize>() {
+                return n.max(1);
+            }
+        }
+        let parser_threads = self.effective_parse_threads();
+        let inflight = self.effective_max_inflight();
+        parser_threads
+            .div_ceil(4)
+            .max(1)
+            .min(inflight.saturating_mul(2).max(1))
+            .min(8)
     }
 
     /// Effective chunk size in MB (derived from budget if 0).
@@ -399,13 +428,23 @@ impl ImportConfig {
         let max_inflight = self.effective_max_inflight();
         let run_budget = self.effective_run_budget_mb();
         let parallelism = self.effective_parse_threads();
+        let rechunk_threads = self.effective_rechunk_threads();
+        let max_inflight_source = if std::env::var("FLUREE_IMPORT_MAX_INFLIGHT").is_ok() {
+            "env"
+        } else if self.max_inflight_chunks > 0 {
+            "config"
+        } else {
+            "auto"
+        };
 
         tracing::info!(
             memory_budget_mb = budget,
             chunk_size_mb = chunk_size,
             max_inflight = max_inflight,
+            max_inflight_source,
             run_budget_mb = run_budget,
             parallelism = parallelism,
+            rechunk_threads = rechunk_threads,
             "import pipeline computed settings"
         );
     }
@@ -945,11 +984,13 @@ fn resolve_chunk_source(
             let chunk_size_bytes = config.effective_chunk_size_mb() as u64 * 1024 * 1024;
             let channel_capacity = config.effective_max_inflight();
             let coalesce_threshold = config.effective_coalesce_threshold();
+            let rechunk_threads = config.effective_rechunk_threads();
             let producer = spawn_local_producer(
                 files,
                 chunk_size_bytes,
                 channel_capacity,
                 coalesce_threshold,
+                rechunk_threads,
             );
             return Ok(ChunkSource::LocalRechunk(producer));
         }
@@ -1332,10 +1373,28 @@ fn local_rechunk_loop(
 
     macro_rules! emit {
         ($payload:expr) => {{
-            if tx.send((next_idx, $payload)).is_err() {
+            let payload = $payload;
+            let payload_len = payload.len();
+            let send_start = Instant::now();
+            if tx.send((next_idx, payload)).is_err() {
                 // Consumer dropped the receiver — pipeline aborted upstream.
                 return Ok(());
             }
+            let send_wait_ms = send_start.elapsed().as_millis();
+            if send_wait_ms >= IMPORT_PIPELINE_WAIT_LOG_THRESHOLD_MS {
+                tracing::info!(
+                    chunk_idx = next_idx,
+                    payload_bytes = payload_len,
+                    send_wait_ms,
+                    "local rechunk producer waited to hand off chunk"
+                );
+            }
+            tracing::debug!(
+                chunk_idx = next_idx,
+                payload_bytes = payload_len,
+                send_wait_ms,
+                "local rechunk producer handed off chunk"
+            );
             next_idx += 1;
         }};
     }
@@ -1390,10 +1449,21 @@ fn local_rechunk_loop(
             loop {
                 match reader.recv_chunk() {
                     Ok(Some((_sub_idx, raw))) => {
+                        let payload_start = Instant::now();
                         let mut payload = Vec::with_capacity(prefix.len() + 1 + raw.len());
                         payload.extend_from_slice(&prefix);
                         payload.push(b'\n');
                         payload.extend_from_slice(&raw);
+                        let payload_build_ms = payload_start.elapsed().as_millis();
+                        if payload_build_ms >= IMPORT_PIPELINE_WAIT_LOG_THRESHOLD_MS {
+                            tracing::info!(
+                                file = %path.display(),
+                                raw_bytes = raw.len(),
+                                payload_bytes = payload.len(),
+                                payload_build_ms,
+                                "local rechunk built split-file payload"
+                            );
+                        }
                         emit!(payload);
                     }
                     Ok(None) => break,
@@ -1416,10 +1486,20 @@ fn local_rechunk_loop(
             })?;
         } else {
             // ---- Small file: read whole (decodes .gz/.zst). ----
+            let read_start = Instant::now();
             let text = read_decoded_to_string(path).map_err(|e| {
                 ImportError::NoChunks(format!("failed to read {}: {e}", path.display()))
             })?;
+            let read_ms = read_start.elapsed().as_millis();
             let bytes = text.into_bytes();
+            if read_ms >= IMPORT_PIPELINE_WAIT_LOG_THRESHOLD_MS {
+                tracing::info!(
+                    file = %path.display(),
+                    bytes = bytes.len(),
+                    read_ms,
+                    "local rechunk read/decompressed file"
+                );
+            }
 
             if !coalesce_enabled || coalesce_unsafe(&bytes) {
                 // Emit standalone (flush any pending buffer first).
@@ -1443,12 +1523,353 @@ fn local_rechunk_loop(
         }
     }
 
-    // Final flush — send directly (no index advance needed after the last chunk).
-    if !buf.is_empty() && tx.send((next_idx, buf)).is_err() {
-        // Consumer dropped the receiver — pipeline aborted upstream.
-        return Ok(());
+    // Final flush.
+    if !buf.is_empty() {
+        let payload = std::mem::take(&mut buf);
+        let payload_len = payload.len();
+        let send_start = Instant::now();
+        if tx.send((next_idx, payload)).is_err() {
+            // Consumer dropped the receiver — pipeline aborted upstream.
+            return Ok(());
+        }
+        let send_wait_ms = send_start.elapsed().as_millis();
+        if send_wait_ms >= IMPORT_PIPELINE_WAIT_LOG_THRESHOLD_MS {
+            tracing::info!(
+                chunk_idx = next_idx,
+                payload_bytes = payload_len,
+                send_wait_ms,
+                "local rechunk producer waited to hand off chunk"
+            );
+        }
+        tracing::debug!(
+            chunk_idx = next_idx,
+            payload_bytes = payload_len,
+            send_wait_ms,
+            "local rechunk producer handed off chunk"
+        );
     }
     Ok(())
+}
+
+struct LocalRechunkJob {
+    file_idx: usize,
+    path: PathBuf,
+    on_disk: u64,
+    event_tx: std::sync::mpsc::SyncSender<LocalRechunkEvent>,
+}
+
+enum LocalRechunkEvent {
+    SplitChunk(Vec<u8>),
+    SmallFile {
+        bytes: Vec<u8>,
+        unsafe_to_coalesce: bool,
+    },
+    Done,
+    Error(ImportError),
+}
+
+fn send_local_rechunk_event(
+    tx: &std::sync::mpsc::SyncSender<LocalRechunkEvent>,
+    event: LocalRechunkEvent,
+) -> bool {
+    tx.send(event).is_ok()
+}
+
+fn process_local_rechunk_job(
+    job: LocalRechunkJob,
+    chunk_size_bytes: u64,
+) -> std::result::Result<(), ImportError> {
+    let LocalRechunkJob {
+        file_idx,
+        path,
+        on_disk,
+        event_tx,
+    } = job;
+
+    let (_inner_ext, comp) = effective_extension(&path);
+    if should_stream_split(&path, on_disk, chunk_size_bytes) {
+        let mut reader = if matches!(comp, Compression::None) {
+            fluree_graph_turtle::splitter::StreamingTurtleReader::new(
+                &path,
+                chunk_size_bytes,
+                2,
+                None,
+            )
+            .map_err(|e| {
+                ImportError::NoChunks(format!("turtle split failed for {}: {e}", path.display()))
+            })?
+        } else {
+            let path_owned = path.to_path_buf();
+            let factory = move || open_decoded(&path_owned);
+            fluree_graph_turtle::splitter::StreamingTurtleReader::new_from_factory(
+                factory,
+                0,
+                chunk_size_bytes,
+                2,
+                None,
+            )
+            .map_err(|e| {
+                ImportError::NoChunks(format!(
+                    "compressed turtle split failed for {}: {e}",
+                    path.display()
+                ))
+            })?
+        };
+
+        let prefix = reader.prefix_block().as_bytes().to_vec();
+        loop {
+            match reader.recv_chunk() {
+                Ok(Some((_sub_idx, raw))) => {
+                    let payload_start = Instant::now();
+                    let mut payload = Vec::with_capacity(prefix.len() + 1 + raw.len());
+                    payload.extend_from_slice(&prefix);
+                    payload.push(b'\n');
+                    payload.extend_from_slice(&raw);
+                    let payload_build_ms = payload_start.elapsed().as_millis();
+                    if payload_build_ms >= IMPORT_PIPELINE_WAIT_LOG_THRESHOLD_MS {
+                        tracing::info!(
+                            file_idx,
+                            file = %path.display(),
+                            raw_bytes = raw.len(),
+                            payload_bytes = payload.len(),
+                            payload_build_ms,
+                            "local rechunk built split-file payload"
+                        );
+                    }
+                    if !send_local_rechunk_event(&event_tx, LocalRechunkEvent::SplitChunk(payload))
+                    {
+                        return Ok(());
+                    }
+                }
+                Ok(None) => break,
+                Err(e) => {
+                    return Err(ImportError::NoChunks(format!(
+                        "streaming read failed for {}: {e}",
+                        path.display()
+                    )));
+                }
+            }
+        }
+        reader.join().map_err(|e| {
+            ImportError::NoChunks(format!(
+                "turtle reader thread failed for {}: {e}",
+                path.display()
+            ))
+        })?;
+    } else {
+        let read_start = Instant::now();
+        let text = read_decoded_to_string(&path).map_err(|e| {
+            ImportError::NoChunks(format!("failed to read {}: {e}", path.display()))
+        })?;
+        let read_ms = read_start.elapsed().as_millis();
+        let bytes = text.into_bytes();
+        if read_ms >= IMPORT_PIPELINE_WAIT_LOG_THRESHOLD_MS {
+            tracing::info!(
+                file_idx,
+                file = %path.display(),
+                bytes = bytes.len(),
+                read_ms,
+                "local rechunk read/decompressed file"
+            );
+        }
+        let unsafe_to_coalesce = coalesce_unsafe(&bytes);
+        if !send_local_rechunk_event(
+            &event_tx,
+            LocalRechunkEvent::SmallFile {
+                bytes,
+                unsafe_to_coalesce,
+            },
+        ) {
+            return Ok(());
+        }
+    }
+
+    let _ = send_local_rechunk_event(&event_tx, LocalRechunkEvent::Done);
+    Ok(())
+}
+
+fn emit_local_rechunk_payload(
+    tx: &std::sync::mpsc::SyncSender<(usize, Vec<u8>)>,
+    next_idx: &mut usize,
+    payload: Vec<u8>,
+) -> bool {
+    let payload_len = payload.len();
+    let chunk_idx = *next_idx;
+    let send_start = Instant::now();
+    if tx.send((chunk_idx, payload)).is_err() {
+        // Consumer dropped the receiver — pipeline aborted upstream.
+        return false;
+    }
+    let send_wait_ms = send_start.elapsed().as_millis();
+    if send_wait_ms >= IMPORT_PIPELINE_WAIT_LOG_THRESHOLD_MS {
+        tracing::info!(
+            chunk_idx,
+            payload_bytes = payload_len,
+            send_wait_ms,
+            "local rechunk producer waited to hand off chunk"
+        );
+    }
+    tracing::debug!(
+        chunk_idx,
+        payload_bytes = payload_len,
+        send_wait_ms,
+        "local rechunk producer handed off chunk"
+    );
+    *next_idx += 1;
+    true
+}
+
+fn emit_ordered_local_rechunk_events(
+    event_rxs: Vec<std::sync::mpsc::Receiver<LocalRechunkEvent>>,
+    chunk_size_bytes: u64,
+    coalesce_enabled: bool,
+    tx: &std::sync::mpsc::SyncSender<(usize, Vec<u8>)>,
+) -> std::result::Result<(), ImportError> {
+    let mut next_idx = 0usize;
+    let mut buf: Vec<u8> = Vec::new();
+
+    for (file_idx, event_rx) in event_rxs.into_iter().enumerate() {
+        loop {
+            let event = event_rx.recv().map_err(|_| {
+                ImportError::NoChunks(format!(
+                    "local rechunk worker ended before completing file index {file_idx}"
+                ))
+            })?;
+            match event {
+                LocalRechunkEvent::SplitChunk(payload) => {
+                    if !buf.is_empty() {
+                        let pending = std::mem::take(&mut buf);
+                        if !emit_local_rechunk_payload(tx, &mut next_idx, pending) {
+                            return Ok(());
+                        }
+                    }
+                    if !emit_local_rechunk_payload(tx, &mut next_idx, payload) {
+                        return Ok(());
+                    }
+                }
+                LocalRechunkEvent::SmallFile {
+                    bytes,
+                    unsafe_to_coalesce,
+                } => {
+                    if !coalesce_enabled || unsafe_to_coalesce {
+                        if !buf.is_empty() {
+                            let pending = std::mem::take(&mut buf);
+                            if !emit_local_rechunk_payload(tx, &mut next_idx, pending) {
+                                return Ok(());
+                            }
+                        }
+                        if !emit_local_rechunk_payload(tx, &mut next_idx, bytes) {
+                            return Ok(());
+                        }
+                    } else {
+                        if !buf.is_empty()
+                            && (buf.len() + 1 + bytes.len()) as u64 > chunk_size_bytes
+                        {
+                            let pending = std::mem::take(&mut buf);
+                            if !emit_local_rechunk_payload(tx, &mut next_idx, pending) {
+                                return Ok(());
+                            }
+                        }
+                        if !buf.is_empty() {
+                            buf.push(b'\n');
+                        }
+                        buf.extend_from_slice(&bytes);
+                        if buf.len() as u64 >= chunk_size_bytes {
+                            let pending = std::mem::take(&mut buf);
+                            if !emit_local_rechunk_payload(tx, &mut next_idx, pending) {
+                                return Ok(());
+                            }
+                        }
+                    }
+                }
+                LocalRechunkEvent::Done => break,
+                LocalRechunkEvent::Error(err) => return Err(err),
+            }
+        }
+    }
+
+    if !buf.is_empty() {
+        let pending = std::mem::take(&mut buf);
+        if !emit_local_rechunk_payload(tx, &mut next_idx, pending) {
+            return Ok(());
+        }
+    }
+    Ok(())
+}
+
+fn local_rechunk_loop_parallel(
+    files: Vec<PathBuf>,
+    sizes: Vec<u64>,
+    chunk_size_bytes: u64,
+    coalesce_enabled: bool,
+    tx: &std::sync::mpsc::SyncSender<(usize, Vec<u8>)>,
+    rechunk_threads: usize,
+) -> std::result::Result<(), ImportError> {
+    let worker_count = rechunk_threads.min(files.len()).max(1);
+    if worker_count <= 1 {
+        return local_rechunk_loop(&files, &sizes, chunk_size_bytes, coalesce_enabled, tx);
+    }
+
+    let (job_tx, job_rx) = std::sync::mpsc::sync_channel::<LocalRechunkJob>(worker_count);
+    let job_rx = Arc::new(std::sync::Mutex::new(job_rx));
+    let mut event_rxs = Vec::with_capacity(files.len());
+    let mut jobs = Vec::with_capacity(files.len());
+
+    for (file_idx, (path, on_disk)) in files.into_iter().zip(sizes).enumerate() {
+        let (event_tx, event_rx) =
+            std::sync::mpsc::sync_channel(LOCAL_RECHUNK_EVENT_CHANNEL_CAPACITY);
+        event_rxs.push(event_rx);
+        jobs.push(LocalRechunkJob {
+            file_idx,
+            path,
+            on_disk,
+            event_tx,
+        });
+    }
+
+    let scheduler_handle = std::thread::Builder::new()
+        .name("ttl-local-rechunk-scheduler".into())
+        .spawn(move || {
+            for job in jobs {
+                if job_tx.send(job).is_err() {
+                    break;
+                }
+            }
+        })
+        .map_err(|e| ImportError::Transact(format!("spawn local rechunk scheduler: {e}")))?;
+
+    let mut worker_handles = Vec::with_capacity(worker_count);
+    for worker_idx in 0..worker_count {
+        let job_rx = Arc::clone(&job_rx);
+        let handle = std::thread::Builder::new()
+            .name(format!("ttl-local-rechunk-worker-{worker_idx}"))
+            .spawn(move || loop {
+                let job = match job_rx.lock().unwrap().recv() {
+                    Ok(job) => job,
+                    Err(_) => break,
+                };
+                let error_tx = job.event_tx.clone();
+                if let Err(err) = process_local_rechunk_job(job, chunk_size_bytes) {
+                    let _ = error_tx.send(LocalRechunkEvent::Error(err));
+                }
+            })
+            .map_err(|e| ImportError::Transact(format!("spawn local rechunk worker: {e}")))?;
+        worker_handles.push(handle);
+    }
+
+    let result =
+        emit_ordered_local_rechunk_events(event_rxs, chunk_size_bytes, coalesce_enabled, tx);
+
+    scheduler_handle
+        .join()
+        .map_err(|_| ImportError::Transact("local rechunk scheduler panicked".into()))?;
+    for handle in worker_handles {
+        handle
+            .join()
+            .map_err(|_| ImportError::Transact("local rechunk worker panicked".into()))?;
+    }
+
+    result
 }
 
 /// Spawn the local-directory rechunk producer (see [`LocalChunkProducer`]).
@@ -1463,6 +1884,7 @@ fn spawn_local_producer(
     chunk_size_bytes: u64,
     channel_capacity: usize,
     coalesce_threshold: usize,
+    rechunk_threads: usize,
 ) -> LocalChunkProducer {
     let estimated_count = files.len();
     let channel_capacity = channel_capacity.max(1);
@@ -1489,6 +1911,7 @@ fn spawn_local_producer(
         coalesce_enabled,
         chunk_size_mb = chunk_size_bytes / (1024 * 1024),
         channel_capacity,
+        rechunk_threads = rechunk_threads.min(files.len()).max(1),
         "local directory rechunk producer"
     );
 
@@ -1498,8 +1921,14 @@ fn spawn_local_producer(
     let producer_handle = std::thread::Builder::new()
         .name("ttl-local-rechunk".into())
         .spawn(move || {
-            let result =
-                local_rechunk_loop(&files, &sizes, chunk_size_bytes, coalesce_enabled, &tx);
+            let result = local_rechunk_loop_parallel(
+                files,
+                sizes,
+                chunk_size_bytes,
+                coalesce_enabled,
+                &tx,
+                rechunk_threads,
+            );
             // Drop tx so workers see EOF, then signal success/failure.
             drop(tx);
             let _ = error_tx.send(result.err());
@@ -2430,9 +2859,11 @@ where
                         .set_split_mode(env.shared_alloc.split_mode());
                 }
 
+                let finalize_start = Instant::now();
                 let result = finalize_parsed_chunk(state, parsed, ns_delta, env.storage, env.alias)
                     .await
                     .map_err(|e| ImportError::Transact(e.to_string()))?;
+                let finalize_ms = finalize_start.elapsed().as_millis();
 
                 // Fuel: 10 fuel baseline per commit + 1 micro-fuel per flake,
                 // matching the per-chunk-as-transaction model in `stage.rs`.
@@ -2448,6 +2879,8 @@ where
                     previous_commit_hex,
                 });
 
+                let sort_handoff_start = Instant::now();
+                let mut sort_handoff_ms = 0;
                 if let Some(sr) = result.spool_result {
                     spawn_sorted_commit_write(
                         sort_write_handles,
@@ -2459,6 +2892,7 @@ where
                         sr,
                     )
                     .await;
+                    sort_handoff_ms = sort_handoff_start.elapsed().as_millis();
                 }
 
                 *total_commit_size += result.blob_bytes as u64;
@@ -2469,6 +2903,9 @@ where
                     total = env.estimated_total,
                     t = result.t,
                     flakes = result.flake_count,
+                    finalize_ms,
+                    sort_handoff_ms,
+                    pending_chunks = pending.len(),
                     cumulative_flakes = state.cumulative_flakes,
                     flakes_per_sec = format!(
                         "{:.2}M",
@@ -2981,10 +3418,21 @@ where
                         spool_config: &spool_config,
                     };
                     loop {
+                        let recv_start = Instant::now();
                         let (idx, raw_bytes) = match work_rx.lock().unwrap().recv() {
                             Ok(payload) => payload,
                             Err(_) => break, // Bridge dropped — channel closed.
                         };
+                        let recv_wait_ms = recv_start.elapsed().as_millis();
+                        if recv_wait_ms >= IMPORT_PIPELINE_WAIT_LOG_THRESHOLD_MS {
+                            tracing::info!(
+                                thread_idx,
+                                chunk_idx = idx,
+                                payload_bytes = raw_bytes.len(),
+                                recv_wait_ms,
+                                "parser waited for chunk input"
+                            );
+                        }
 
                         let ttl = match String::from_utf8(raw_bytes) {
                             Ok(s) => s,
@@ -2996,11 +3444,32 @@ where
                         };
 
                         let t = (idx + 1) as i64;
+                        let parse_start = Instant::now();
                         match parse_ttl_chunk(&ttl, &ctx, t, idx) {
                             Ok(parsed) => {
+                                let parse_ms = parse_start.elapsed().as_millis();
+                                let send_start = Instant::now();
                                 if result_tx.send(Ok((idx, parsed))).is_err() {
                                     break;
                                 }
+                                let result_send_wait_ms = send_start.elapsed().as_millis();
+                                if result_send_wait_ms >= IMPORT_PIPELINE_WAIT_LOG_THRESHOLD_MS {
+                                    tracing::info!(
+                                        thread_idx,
+                                        chunk_idx = idx,
+                                        parse_ms,
+                                        result_send_wait_ms,
+                                        "parser waited to hand off parsed chunk"
+                                    );
+                                }
+                                tracing::debug!(
+                                    thread_idx,
+                                    chunk_idx = idx,
+                                    parse_ms,
+                                    recv_wait_ms,
+                                    result_send_wait_ms,
+                                    "parser completed chunk"
+                                );
                             }
                             Err(e) => {
                                 let _ =
@@ -5175,8 +5644,8 @@ mod resource_model_tests {
     /// Serializes env mutation across these tests (process-global env is shared
     /// by all test threads) and guarantees the import override vars are unset for
     /// the body — so a developer/CI environment that exports
-    /// `FLUREE_IMPORT_THREADS` / `FLUREE_IMPORT_HEAVY_WORKERS` cannot perturb the
-    /// resolution logic under test. Vars are restored on drop.
+    /// `FLUREE_IMPORT_THREADS` / related hidden import overrides cannot perturb
+    /// the resolution logic under test. Vars are restored on drop.
     static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     struct EnvGuard {
@@ -5189,7 +5658,13 @@ mod resource_model_tests {
             let lock = ENV_LOCK
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            let vars = ["FLUREE_IMPORT_THREADS", "FLUREE_IMPORT_HEAVY_WORKERS"];
+            let vars = [
+                "FLUREE_IMPORT_THREADS",
+                "FLUREE_IMPORT_HEAVY_WORKERS",
+                "FLUREE_IMPORT_MAX_INFLIGHT",
+                "FLUREE_IMPORT_RECHUNK_THREADS",
+                "FLUREE_IMPORT_COALESCE_THRESHOLD",
+            ];
             let saved = vars
                 .iter()
                 .map(|&k| (k, std::env::var(k).ok()))
@@ -5288,5 +5763,83 @@ mod resource_model_tests {
         // Auto result is min(cores, cap); it must be >= 1 and <= cap.
         let t = c.effective_parse_threads();
         assert!((1..=cap).contains(&t));
+    }
+
+    #[test]
+    fn rechunk_threads_env_override_is_hidden_escape_hatch() {
+        let _env = EnvGuard::clear_overrides();
+        std::env::set_var("FLUREE_IMPORT_RECHUNK_THREADS", "12");
+        let c = cfg(256 * 1024, 128, 32);
+        assert_eq!(c.effective_rechunk_threads(), 12);
+
+        std::env::set_var("FLUREE_IMPORT_RECHUNK_THREADS", "0");
+        assert_eq!(c.effective_rechunk_threads(), 1);
+    }
+
+    #[test]
+    fn parallel_local_rechunk_matches_serial_order_and_coalescing() {
+        let _env = EnvGuard::clear_overrides();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let inputs = [
+            (
+                "000.nt",
+                "<http://example/s0> <http://example/p> <http://example/o> .\n",
+            ),
+            (
+                "001.nt",
+                "<http://example/s1> <http://example/p> <http://example/o> .\n",
+            ),
+            ("002.nt", "_:b0 <http://example/p> <http://example/o> .\n"),
+            (
+                "003.nt",
+                "<http://example/s3> <http://example/p> <http://example/o> .\n",
+            ),
+        ];
+
+        let files: Vec<PathBuf> = inputs
+            .iter()
+            .map(|(name, contents)| {
+                let path = dir.path().join(name);
+                std::fs::write(&path, contents).expect("write fixture");
+                path
+            })
+            .collect();
+        let sizes: Vec<u64> = files
+            .iter()
+            .map(|p| std::fs::metadata(p).expect("metadata").len())
+            .collect();
+        let chunk_size_bytes = 1024;
+        let coalesce_enabled = true;
+
+        let (serial_tx, serial_rx) = std::sync::mpsc::sync_channel(16);
+        local_rechunk_loop(
+            &files,
+            &sizes,
+            chunk_size_bytes,
+            coalesce_enabled,
+            &serial_tx,
+        )
+        .expect("serial rechunk");
+        drop(serial_tx);
+        let serial: Vec<_> = serial_rx.into_iter().collect();
+
+        let (parallel_tx, parallel_rx) = std::sync::mpsc::sync_channel(16);
+        local_rechunk_loop_parallel(
+            files,
+            sizes,
+            chunk_size_bytes,
+            coalesce_enabled,
+            &parallel_tx,
+            4,
+        )
+        .expect("parallel rechunk");
+        drop(parallel_tx);
+        let parallel: Vec<_> = parallel_rx.into_iter().collect();
+
+        assert_eq!(parallel, serial);
+        assert_eq!(parallel.len(), 3, "first two files should coalesce");
+        assert_eq!(parallel[0].0, 0);
+        assert_eq!(parallel[1].0, 1);
+        assert_eq!(parallel[2].0, 2);
     }
 }
