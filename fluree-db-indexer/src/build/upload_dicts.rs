@@ -790,7 +790,9 @@ pub async fn upload_dicts_from_disk(
 
     // ---- 2. Upload subject trees, string trees, numbig, vectors in parallel ----
     tracing::info!(
-        "uploading subject trees, string trees, numbig arenas, and vector arenas in parallel"
+        streaming = trust_sorted_order_invariants,
+        rss_mib = crate::mem::current_rss_mib(),
+        "dict upload: start (subject/string trees, numbig, vectors)"
     );
     if trust_sorted_order_invariants {
         tracing::info!(
@@ -1360,7 +1362,8 @@ pub async fn upload_dicts_from_disk(
         ?subject_id_encoding,
         watermarks = subject_watermarks.len(),
         string_watermark,
-        "dictionary trees built and uploaded to CAS (from disk)"
+        rss_mib = crate::mem::current_rss_mib(),
+        "dict upload: done (dictionary trees built and uploaded to CAS)"
     );
     Ok(UploadedDicts {
         dict_refs: DictRefs {
