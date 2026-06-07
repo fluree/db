@@ -331,6 +331,10 @@ impl<'a> Validator<'a> {
             GraphPattern::Path { path, span, .. } => {
                 self.validate_property_path(path, *span);
             }
+            GraphPattern::AnnotationTarget { .. } => {
+                // No additional validation here; deferred-shape rejection
+                // happens at parse time and lowering enforces the rest.
+            }
         }
     }
 

@@ -545,6 +545,10 @@ pub struct ContextConfig<'a, 'b> {
     pub from_t: Option<i64>,
     /// When true, bind evaluation errors become query errors.
     pub strict_bind_errors: bool,
+    /// When true, scan operators bypass the variable-predicate filter
+    /// for Fluree-system predicates. Surfaced via
+    /// `opts.includeSystemFacts: true` on JSON-LD queries.
+    pub include_system_facts: bool,
     /// Binary columnar index store for `BinaryScanOperator`.
     ///
     /// This is the explicit path — separate from `LedgerSnapshot.range_provider` which
@@ -580,6 +584,7 @@ impl Default for ContextConfig<'_, '_> {
             vector_provider: None,
             from_t: None,
             strict_bind_errors: true,
+            include_system_facts: false,
             binary_store: None,
             binary_g_id: 0,
             dict_novelty: None,
@@ -653,6 +658,9 @@ pub async fn execute_prepared<'a, 'b>(
     }
     if config.strict_bind_errors {
         ctx = ctx.with_strict_bind_errors();
+    }
+    if config.include_system_facts {
+        ctx = ctx.with_include_system_facts(true);
     }
     if let Some(store) = config.binary_store {
         ctx = ctx.with_binary_store(store, config.binary_g_id);

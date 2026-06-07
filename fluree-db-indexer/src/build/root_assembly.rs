@@ -155,9 +155,13 @@ pub(crate) async fn encode_and_write_root(
     })
 }
 
-/// Compute garbage CIDs by comparing old root's CAS IDs with new root's CAS IDs.
+/// Compute garbage CIDs by diffing the previous root's reachable CAS set
+/// against the new root's reachable CAS set.
 ///
-/// Used by the full-rebuild pipeline which has access to the previous root via CAS.
+/// "Reachable" includes leaves behind named-graph and annotation branch
+/// manifests via `collect_root_cas_ids_expanded`. Diffing only the direct
+/// CAS refs (`all_cas_ids()`) would silently leak those leaves on every
+/// reindex.
 // Kept for: shared GC chain computation for both rebuild and incremental pipelines.
 // Use when: rebuild.rs Phase F.7 is refactored to use this shared helper.
 #[expect(dead_code)]
@@ -170,10 +174,17 @@ pub(crate) async fn compute_garbage_from_prev_root(
     let prev_root = IndexRoot::decode(&prev_bytes).ok()?;
 
     let prev_t = prev_root.index_t;
-    let old_ids: std::collections::HashSet<ContentId> =
-        prev_root.all_cas_ids().into_iter().collect();
-    let new_ids: std::collections::HashSet<ContentId> =
-        new_root.all_cas_ids().into_iter().collect();
+    // Strict expansion: a partial new-root set would misclassify
+    // still-reachable leaves as garbage; a partial prev-root set would
+    // leave replaced blobs unreleased. Either way silently — propagate
+    // the error so the caller can decide whether to skip publishing
+    // garbage rather than write a corrupt manifest.
+    let old_ids = fluree_db_binary_index::collect_root_cas_ids_expanded(content_store, &prev_root)
+        .await
+        .ok()?;
+    let new_ids = fluree_db_binary_index::collect_root_cas_ids_expanded(content_store, new_root)
+        .await
+        .ok()?;
     let garbage_cids: Vec<ContentId> = old_ids.difference(&new_ids).cloned().collect();
 
     Some(GarbageContext {
@@ -219,6 +230,25 @@ pub(crate) struct Fir6Inputs {
     pub db_schema: Option<fluree_db_core::IndexSchema>,
     /// CAS reference for the serialized HLL sketch blob.
     pub sketch_ref: Option<ContentId>,
+    /// Edge-annotation event coverage envelope (M2b slice 3g).
+    ///
+    /// Routed from `IndexerConfig.attachment_events` through
+    /// `rebuild.rs`. Same coverage semantics as the incremental
+    /// path, but without a base arena to merge against:
+    ///
+    /// - `Authoritative(events)` — caller guarantees full history;
+    ///   seal the arena from this set.
+    /// - `Augment(events)` / `Unknown` / `None` — we can't prove
+    ///   completeness without a base arena (the rebuild path
+    ///   doesn't yet collect events from the resolver). Stay in
+    ///   scan-fallback (`annotation_index = None`) until an
+    ///   explicitly `Authoritative` source is supplied — i.e. a
+    ///   future rebuild whose caller passes the full event set,
+    ///   or an incremental pass that can prove its overlay
+    ///   coverage is authoritative. Augment alone cannot reseal
+    ///   from this state because the indexer has no way to
+    ///   recover the missing history.
+    pub attachment_events: Option<crate::config::AttachmentEventCoverage>,
 }
 
 /// Encode an `IndexRoot` (FIR6), write to CAS, and return an `IndexResult`.
@@ -264,6 +294,16 @@ pub(crate) async fn encode_and_write_root_v6(
         .cloned()
         .collect();
 
+    // Sticky bit: `true` once any `f:reifies*` predicate has been
+    // observed in the ledger's history. Detection is cheap — if any
+    // of the seven reserved reifies SIDs appears in the indexer's
+    // accumulated predicate dictionary, annotations exist (or did).
+    // Once a predicate enters the dict it stays there across
+    // reindexes, so this naturally inherits sticky-bit semantics.
+    let has_annotations = inputs.predicate_sids.iter().any(|(ns, name)| {
+        fluree_db_core::is_reserved_reifies_predicate(&fluree_db_core::Sid::new(*ns, name.as_str()))
+    });
+
     let mut root = IndexRoot {
         ledger_id: inputs.ledger_id.clone(),
         index_t: inputs.index_t,
@@ -291,12 +331,107 @@ pub(crate) async fn encode_and_write_root_v6(
         prev_index: None,
         garbage: None,
         sketch_ref: inputs.sketch_ref,
+        has_annotations,
+        annotation_index: None,
+        // Sticky bit flipped to `true` below if the rebuild path
+        // seals an `Authoritative` arena. Rebuilds always start
+        // from scratch with no prior root, so this is the only
+        // signal carried forward — defensive-drop semantics live
+        // exclusively on the incremental path.
+        had_annotation_arena: false,
     };
 
     // `IndexStats.size` is defined as total commit data size (bytes) for the ledger.
     // The root carries this as `total_commit_size`; ensure stats reflect it.
     if let Some(stats) = root.stats.as_mut() {
         stats.distribute_total_size_by_flakes(root.total_commit_size);
+    }
+
+    // ---- Annotation arena seal (M2b slice 3g, full-rebuild path) ----
+    //
+    // Same coverage envelope as the incremental Phase 3d, but
+    // without a previous arena to merge against (full rebuild
+    // starts from scratch). Decision matrix:
+    //
+    //   Authoritative(events) → caller asserts complete history;
+    //                            seal authoritative arena.
+    //   Augment(events)       → caller has events but can't prove
+    //                            completeness; without a base arena
+    //                            to merge with, we have no way to
+    //                            recover historical attachments
+    //                            beyond the supplied events. Stay
+    //                            in scan-fallback (annotation_index
+    //                            = None) until an explicitly
+    //                            `Authoritative` source is provided
+    //                            (a future rebuild whose caller
+    //                            passes the full event set, or
+    //                            resolver-side event collection
+    //                            that lets the indexer produce its
+    //                            own complete history). Augment
+    //                            alone cannot reseal from this
+    //                            state — the indexer cannot
+    //                            reconstruct the missing history.
+    //   Unknown / None        → no caller events; no-op.
+    //
+    // Events clipped to t <= inputs.index_t for the same reason as
+    // incremental: keeps `AnnotationIndexRoot.max_t <=
+    // IndexRoot.index_t`.
+    use crate::config::AttachmentEventCoverage;
+    let job_t = inputs.index_t;
+    match inputs.attachment_events {
+        Some(AttachmentEventCoverage::Authoritative(mut events)) => {
+            events.retain(|(_, _, t, _)| *t <= job_t);
+            let result = crate::build::annotation_arena::build_and_persist_annotation_arena(
+                content_store,
+                None,
+                events,
+            )
+            .await?;
+            if let Some(ref ann) = result.new_index {
+                debug_assert!(
+                    ann.max_t <= job_t,
+                    "AnnotationIndexRoot.max_t ({}) must not exceed IndexRoot.index_t ({})",
+                    ann.max_t,
+                    job_t
+                );
+            }
+            if result.new_index.is_some() {
+                // Sticky flag: an arena was sealed at this t. Even if
+                // a later pass defensively drops it, this bit stays
+                // true so the provider's bootstrap scan-fallback is
+                // suppressed.
+                root.had_annotation_arena = true;
+            }
+            root.annotation_index = result.new_index;
+            // No previous arena → no leaves to GC; replaced_leaf_cids
+            // is empty by construction.
+            debug_assert!(result.replaced_leaf_cids.is_empty());
+        }
+        Some(AttachmentEventCoverage::Augment(_)) => {
+            tracing::warn!(
+                ledger_id = %inputs.ledger_id,
+                "full-rebuild path received Augment coverage but has no \
+                 base arena to merge with; cannot prove history \
+                 completeness. Leaving annotation_index=None — the next \
+                 incremental pass with running overlay coverage will \
+                 seal an authoritative arena."
+            );
+        }
+        Some(AttachmentEventCoverage::Unknown) | None => {
+            // Non-annotation ledger fast path or scan-fallback state.
+        }
+    }
+
+    // Sticky-bit coercion: see the canonical contract on
+    // `IndexRoot.had_annotation_arena` in
+    // `fluree-db-binary-index/src/format/index_root.rs`. Mirrors
+    // `IncrementalRootBuilder::build()` — every indexer pass on
+    // an annotation-bearing ledger represents history the indexer
+    // owns; the provider must not later reconstruct a live-only
+    // `Authoritative` arena from such a root. Bulk import is the
+    // only path that leaves the bit false.
+    if root.has_annotations {
+        root.had_annotation_arena = true;
     }
 
     // Attach garbage manifest and prev_index if provided.

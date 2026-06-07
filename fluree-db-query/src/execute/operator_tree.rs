@@ -3185,6 +3185,7 @@ mod tests {
             limit: None,
             offset: None,
             post_values: None,
+            include_system_facts: false,
         }
     }
 
@@ -3209,6 +3210,7 @@ mod tests {
                 Term::Var(o),
             ))],
             reasoning: ReasoningConfig::default(),
+            include_system_facts: false,
             grouping: Grouping::assemble(
                 vec![p],
                 vec![AggregateSpec {
@@ -3283,6 +3285,7 @@ mod tests {
             limit: Some(10),
             offset: None,
             post_values: None,
+            include_system_facts: false,
         };
 
         let spec =
@@ -3312,6 +3315,7 @@ mod tests {
             limit: None,
             offset: None,
             post_values: None,
+            include_system_facts: false,
         };
 
         let result = build_operator_tree(
@@ -3339,6 +3343,7 @@ mod tests {
             limit: None,
             offset: None,
             post_values: None,
+            include_system_facts: false,
         };
 
         let result = build_operator_tree(
@@ -3414,6 +3419,7 @@ mod tests {
             limit: None,
             offset: None,
             post_values: None,
+            include_system_facts: false,
         };
         let reversed = Query {
             context: ParsedContext::default(),
@@ -3438,6 +3444,7 @@ mod tests {
             limit: None,
             offset: None,
             post_values: None,
+            include_system_facts: false,
         };
         assert_eq!(
             detect_exists_join_count_distinct_object(&counted_first),
@@ -3473,6 +3480,7 @@ mod tests {
                 },
             ],
             reasoning: ReasoningConfig::default(),
+            include_system_facts: false,
             grouping: Some(Grouping::Implicit {
                 aggregation: Aggregation {
                     aggregates: fluree_db_core::NonEmpty::try_from_vec(vec![
@@ -3535,6 +3543,7 @@ mod tests {
             output,
             patterns,
             reasoning: ReasoningConfig::default(),
+            include_system_facts: false,
             grouping: None,
             ordering,
             order_binds: Vec::new(),

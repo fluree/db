@@ -387,7 +387,7 @@ fn format_row_with_types(
         let var_name = registry.name(var_id);
 
         // Skip internal variables
-        if var_name.starts_with("?__") {
+        if super::is_internal_var_name(var_name) {
             continue;
         }
 
@@ -461,7 +461,7 @@ fn build_schema(
 
     for (var_id, types) in entries {
         let var_name = vars.name(*var_id);
-        if var_name.starts_with("?__") {
+        if super::is_internal_var_name(var_name) {
             continue;
         }
         let type_val = if types.len() == 1 {

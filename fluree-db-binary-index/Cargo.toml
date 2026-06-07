@@ -22,6 +22,7 @@ tokio.workspace = true
 zstd.workspace = true
 memmap2 = "0.9"
 rustc-hash = "2"
+ciborium = "0.2"
 
 # Cache
 moka.workspace = true
@@ -52,6 +53,7 @@ rust-stemmers = "1.2"
 
 [dev-dependencies]
 async-trait.workspace = true
+fluree-db-novelty = { path = "../fluree-db-novelty" }
 
 [lints]
 workspace = true

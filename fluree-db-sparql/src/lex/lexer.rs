@@ -91,15 +91,28 @@ fn skip_ws_and_comments(input: &mut Input<'_>) {
 /// Parse the next token.
 fn next_token(input: &mut Input<'_>) -> ModalResult<TokenKind> {
     alt((
-        // Multi-char operators (must come before single-char)
-        parse_double_caret,
-        parse_triple_start, // RDF-star << (must come before single <)
-        parse_triple_end,   // RDF-star >> (must come before single >)
-        parse_double_pipe,
-        parse_double_amp,
-        parse_ne,
-        parse_le,
-        parse_ge,
+        // Multi-char operators (must come before single-char). Grouped into
+        // a nested alt because winnow's alt tuple has a fixed max arity.
+        alt((
+            parse_double_caret,
+            // RDF 1.2 triple-term delimiters MUST come before
+            // parse_triple_start / parse_triple_end so `<<(` and `)>>` win
+            // over `<<` / `>>`.
+            parse_triple_term_start,
+            parse_triple_term_end,
+            parse_triple_start, // RDF-star << (must come before single <)
+            parse_triple_end,   // RDF-star >> (must come before single >)
+            // RDF 1.2 annotation delimiters MUST come before
+            // parse_double_pipe / parse_punctuation so `{|` and `|}` win
+            // over `{` / `|` / `}`.
+            parse_annotation_open,
+            parse_annotation_close,
+            parse_double_pipe,
+            parse_double_amp,
+            parse_ne,
+            parse_le,
+            parse_ge,
+        )),
         // IRIs
         parse_iri_ref,
         // Blank nodes (must come before prefixed names - both can start with '_')
@@ -853,6 +866,22 @@ fn parse_triple_end(input: &mut Input<'_>) -> ModalResult<TokenKind> {
     ">>".map(|_| TokenKind::TripleEnd).parse_next(input)
 }
 
+fn parse_triple_term_start(input: &mut Input<'_>) -> ModalResult<TokenKind> {
+    "<<(".map(|_| TokenKind::TripleTermStart).parse_next(input)
+}
+
+fn parse_triple_term_end(input: &mut Input<'_>) -> ModalResult<TokenKind> {
+    ")>>".map(|_| TokenKind::TripleTermEnd).parse_next(input)
+}
+
+fn parse_annotation_open(input: &mut Input<'_>) -> ModalResult<TokenKind> {
+    "{|".map(|_| TokenKind::AnnotationOpen).parse_next(input)
+}
+
+fn parse_annotation_close(input: &mut Input<'_>) -> ModalResult<TokenKind> {
+    "|}".map(|_| TokenKind::AnnotationClose).parse_next(input)
+}
+
 fn parse_double_pipe(input: &mut Input<'_>) -> ModalResult<TokenKind> {
     "||".map(|_| TokenKind::Or).parse_next(input)
 }
@@ -897,6 +926,7 @@ fn parse_punctuation(input: &mut Input<'_>) -> ModalResult<TokenKind> {
         '?' => Some(TokenKind::Question),
         '|' => Some(TokenKind::Pipe),
         '^' => Some(TokenKind::Caret),
+        '~' => Some(TokenKind::Tilde),
         _ => None,
     })
     .parse_next(input)
@@ -1019,6 +1049,60 @@ mod tests {
         assert_eq!(tok("]"), vec![TokenKind::RBracket]);
         assert_eq!(tok("("), vec![TokenKind::LParen]);
         assert_eq!(tok(")"), vec![TokenKind::RParen]);
+    }
+
+    #[test]
+    fn test_rdf12_annotation_tokens() {
+        // Each new token in isolation
+        assert_eq!(tok("<<("), vec![TokenKind::TripleTermStart]);
+        assert_eq!(tok(")>>"), vec![TokenKind::TripleTermEnd]);
+        assert_eq!(tok("{|"), vec![TokenKind::AnnotationOpen]);
+        assert_eq!(tok("|}"), vec![TokenKind::AnnotationClose]);
+        assert_eq!(tok("~"), vec![TokenKind::Tilde]);
+
+        // Longest-match: `<<(` must NOT split into `<<` `(`,
+        // and `)>>` must NOT split into `)` `>>`.
+        assert_eq!(
+            tok("<<( )>>"),
+            vec![TokenKind::TripleTermStart, TokenKind::TripleTermEnd]
+        );
+
+        // Bare `<<` / `>>` still tokenize as RDF-star quoted-triple delimiters
+        // (preserves the legacy `<< s p ?o >> f:t ?t` shape).
+        assert_eq!(
+            tok("<< >>"),
+            vec![TokenKind::TripleStart, TokenKind::TripleEnd]
+        );
+
+        // `{|` must NOT split into `{` `|`, and `|}` must NOT split into `|` `}`.
+        assert_eq!(
+            tok("{| |}"),
+            vec![TokenKind::AnnotationOpen, TokenKind::AnnotationClose]
+        );
+
+        // Bare `{` / `}` / `|` still tokenize as before.
+        assert_eq!(
+            tok("{ } |"),
+            vec![TokenKind::LBrace, TokenKind::RBrace, TokenKind::Pipe]
+        );
+
+        // Tilde adjacent to a blank-node label tokenizes as Tilde + label,
+        // matching the `~ _:ann` named-reifier form.
+        assert_eq!(
+            tok("~ _:ann"),
+            vec![
+                TokenKind::Tilde,
+                TokenKind::BlankNodeLabel(Arc::from("ann"))
+            ]
+        );
+
+        // A complete annotated triple shape lexes cleanly end-to-end.
+        let tokens = tok(":a :p :b ~ _:r {| :role \"x\" |} .");
+        // Just spot-check the structurally important tokens; literal/IRI
+        // shape is covered elsewhere.
+        assert!(tokens.contains(&TokenKind::Tilde));
+        assert!(tokens.contains(&TokenKind::AnnotationOpen));
+        assert!(tokens.contains(&TokenKind::AnnotationClose));
     }
 
     #[test]

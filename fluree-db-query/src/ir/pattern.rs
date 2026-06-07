@@ -10,7 +10,7 @@ use super::adapters::{
 use super::expression::{Expression, Function};
 use super::grouping::Grouping;
 use super::path::PropertyPathPattern;
-use super::triple::TriplePattern;
+use super::triple::{Ref, TriplePattern};
 use crate::binding::Binding;
 use crate::sort::SortSpec;
 use crate::var_registry::VarId;
@@ -374,6 +374,80 @@ pub enum Pattern {
     /// - Results are joined with the outer query on shared variables
     /// - If `silent` is true, service errors produce empty results
     Service(ServicePattern),
+
+    /// Internal — iterate the dataset's *default* graph sources and
+    /// run `patterns` once per source.
+    ///
+    /// Distinct from [`Pattern::Graph`], which iterates **named**
+    /// graphs (SPARQL `GRAPH ?g { ... }`). This variant exists to let
+    /// the edge-annotation expansion correlate its triple chain with
+    /// a single source under multi-source default-graph queries
+    /// (`from: [g1, g2]`); without it the f:reifies* lookups fan
+    /// across all sources and produce an N×M cross-product against
+    /// each base-edge match.
+    ///
+    /// Per-source correlation comes from `with_graph_ref` switching
+    /// the execution context per iteration — no synthetic variable is
+    /// bound or exposed in the operator schema. Synthesis happens in
+    /// `expand_edge_annotation_patterns`; users cannot author this
+    /// variant directly.
+    DefaultGraphSource {
+        /// Patterns to execute once per default graph source.
+        patterns: Vec<Pattern>,
+    },
+
+    /// Edge-rooted annotation pattern.
+    ///
+    /// Lowered from JSON-LD `@annotation` (or its `@edge` alias) blocks
+    /// attached to an object position. The annotation is the subject of
+    /// the body patterns; the edge `(s, p, o)` is the reified base
+    /// triple.
+    ///
+    /// # Semantics
+    ///
+    /// One row per `(matched_edge, attached_annotation)` pair: a base
+    /// edge with two parallel annotations produces two rows. This is
+    /// the multiplicity contract that supports Cypher fidelity.
+    ///
+    /// # Execution
+    ///
+    /// Planning expands this variant into the base edge plus the
+    /// corresponding `f:reifies*` lookup chain before operator-tree
+    /// assembly.
+    EdgeAnnotation {
+        /// The annotated edge (base triple).
+        edge: TriplePattern,
+        /// The annotation subject — variable or constant ref.
+        annotation: Ref,
+        /// Patterns about the annotation subject.
+        body: Vec<Pattern>,
+    },
+
+    /// Annotation-rooted pattern — reverse direction of [`Pattern::EdgeAnnotation`].
+    ///
+    /// Lowered from JSON-LD `@reifies`. The enclosing node-map is the
+    /// annotation subject; `@reifies` names the base triple it reifies.
+    ///
+    /// # Semantics
+    ///
+    /// One row per `(annotation, base_edge)` pair. The base edge must be
+    /// **currently asserted and policy-visible** before a row is emitted
+    /// (M1 enforcement) — otherwise this operator would leak hidden
+    /// edges via annotation existence.
+    ///
+    /// # Execution
+    ///
+    /// Planning expands this variant into the base edge plus the
+    /// corresponding `f:reifies*` lookup chain before operator-tree
+    /// assembly.
+    AnnotationTarget {
+        /// The annotation subject — variable or constant ref.
+        annotation: Ref,
+        /// The base edge being reified.
+        edge: TriplePattern,
+        /// Patterns about the annotation subject.
+        body: Vec<Pattern>,
+    },
 }
 
 impl Pattern {
@@ -413,6 +487,27 @@ impl Pattern {
                 patterns: f(sp.patterns),
                 ..sp
             }),
+            Pattern::EdgeAnnotation {
+                edge,
+                annotation,
+                body,
+            } => Pattern::EdgeAnnotation {
+                edge,
+                annotation,
+                body: f(body),
+            },
+            Pattern::AnnotationTarget {
+                annotation,
+                edge,
+                body,
+            } => Pattern::AnnotationTarget {
+                annotation,
+                edge,
+                body: f(body),
+            },
+            Pattern::DefaultGraphSource { patterns } => Pattern::DefaultGraphSource {
+                patterns: f(patterns),
+            },
             other => other,
         }
     }
@@ -488,6 +583,29 @@ impl Pattern {
             Pattern::S2Search(p) => {
                 debug_assert!(!p.referenced_vars().contains(&old), "{UNHANDLED}");
             }
+            Pattern::EdgeAnnotation {
+                edge,
+                annotation,
+                body,
+            }
+            | Pattern::AnnotationTarget {
+                annotation,
+                edge,
+                body,
+            } => {
+                edge.substitute_var(old, new);
+                if let Ref::Var(v) = annotation {
+                    rename(v);
+                }
+                for p in body {
+                    p.substitute_var(old, new);
+                }
+            }
+            Pattern::DefaultGraphSource { patterns } => {
+                for p in patterns {
+                    p.substitute_var(old, new);
+                }
+            }
         }
     }
 
@@ -542,6 +660,26 @@ impl Pattern {
                 vars
             }
             Pattern::Service(sp) => sp.referenced_vars(),
+            Pattern::EdgeAnnotation {
+                edge,
+                annotation,
+                body,
+            }
+            | Pattern::AnnotationTarget {
+                annotation,
+                edge,
+                body,
+            } => {
+                let mut vars = edge.referenced_vars();
+                if let Ref::Var(v) = annotation {
+                    vars.push(*v);
+                }
+                vars.extend(body.iter().flat_map(Pattern::referenced_vars));
+                vars
+            }
+            Pattern::DefaultGraphSource { patterns } => {
+                patterns.iter().flat_map(Pattern::referenced_vars).collect()
+            }
         }
     }
 
@@ -580,6 +718,31 @@ impl Pattern {
                 vars
             }
             Pattern::Service(sp) => sp.produced_vars(),
+            Pattern::EdgeAnnotation {
+                edge,
+                annotation,
+                body,
+            }
+            | Pattern::AnnotationTarget {
+                annotation,
+                edge,
+                body,
+            } => {
+                let mut vars = edge.produced_vars();
+                if let Ref::Var(v) = annotation {
+                    vars.push(*v);
+                }
+                vars.extend(body.iter().flat_map(Pattern::produced_vars));
+                vars
+            }
+            // The wrapper itself binds no new variables — only the
+            // inner subplan produces vars, which surface unchanged
+            // to the outer schema. Per-source correlation is purely
+            // an execution-context switch (`with_graph_ref`), not a
+            // join-key binding.
+            Pattern::DefaultGraphSource { patterns } => {
+                patterns.iter().flat_map(Pattern::produced_vars).collect()
+            }
         }
     }
 
@@ -599,6 +762,12 @@ impl Pattern {
                 .any(|branch| branch.iter().any(|p| p.contains_function(target))),
             Pattern::Graph { patterns, .. } => patterns.iter().any(|p| p.contains_function(target)),
             Pattern::Subquery(sq) => sq.patterns.iter().any(|p| p.contains_function(target)),
+            Pattern::EdgeAnnotation { body, .. } | Pattern::AnnotationTarget { body, .. } => {
+                body.iter().any(|p| p.contains_function(target))
+            }
+            Pattern::DefaultGraphSource { patterns, .. } => {
+                patterns.iter().any(|p| p.contains_function(target))
+            }
             // Other pattern variants cannot contain general expressions.
             _ => false,
         }

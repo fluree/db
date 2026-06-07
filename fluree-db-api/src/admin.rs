@@ -1648,44 +1648,93 @@ impl crate::Fluree {
         let gc_max_old_indexes = indexer_config.gc_max_old_indexes;
         let gc_min_time_mins = indexer_config.gc_min_time_mins;
 
-        // Read the current ledger's `f:fullTextDefaults` so the reindex routes
-        // configured plain-string values into BM25 arena building. Best-effort:
-        // if the existing index can't be loaded (e.g. first-ever reindex of a
-        // commits-only ledger) we fall back to empty — only the `@fulltext`
-        // datatype path will contribute entries, which matches pre-config
-        // behavior.
-        match self.ledger(&ledger_id).await {
-            Ok(state) => {
-                // Use `state.t()` (= max(novelty.t, snapshot.t)) so that on a
-                // first-ever reindex (no prior index, all config in novelty)
-                // the config query isn't filtered out by
-                // `Novelty::for_each_overlay_flake`'s `flake.t <= to_t` guard.
-                let to_t = state.t();
-                let snapshot = &state.snapshot;
-                let overlay: &dyn fluree_db_core::OverlayProvider = &*state.novelty;
-                match crate::config_resolver::resolve_ledger_config(snapshot, overlay, to_t).await {
-                    Ok(Some(cfg)) => {
-                        indexer_config.fulltext_configured_properties =
-                            crate::config_resolver::configured_fulltext_properties_for_indexer(
-                                &cfg,
-                            );
-                    }
-                    Ok(None) => {
-                        // No LedgerConfig — nothing to seed.
-                    }
-                    Err(e) => {
-                        tracing::warn!(
-                            error = %e,
-                            "reindex: failed to read LedgerConfig; configured fulltext properties will be skipped"
-                        );
-                    }
-                }
-            }
+        // Resolve attachment events and read fulltext config off a single
+        // `LedgerState` load so the reindex doesn't pay for two snapshot
+        // hydrations on the non-annotation hot path.
+        //
+        // **Attachment-events resolution.** The rebuild path
+        // (`rebuild_index_from_commits`) only consumes the concrete
+        // `IndexerConfig.attachment_events` field; the `attachment_events_provider`
+        // trait is consumed only by the orchestrator's per-job dispatch
+        // loop. So we resolve here whenever no concrete envelope is set,
+        // preferring a caller-supplied provider over the API's own and
+        // falling back to the API provider when neither is supplied.
+        // (A caller-supplied **concrete** envelope is respected as-is.)
+        //
+        // **Sticky-bit gate.** We only resolve for ledgers that have
+        // actually observed a `f:reifies*` flake. On non-annotation
+        // ledgers, going through the provider has been observed to
+        // disturb novelty bookkeeping for unrelated facts
+        // (regression caught by
+        // `it_select_star_novelty_retract::expansion_applies_novelty_retractions`).
+        // The gate keeps the M2b arena-seal path intact for annotation
+        // ledgers while restoring the pre-M2b behavior elsewhere.
+        let ledger_state = match self.ledger(&ledger_id).await {
+            Ok(state) => Some(state),
             Err(e) => {
                 tracing::debug!(
                     error = %e,
                     "reindex: no loadable ledger state for config read; proceeding without fulltext config"
                 );
+                None
+            }
+        };
+
+        if indexer_config.attachment_events.is_none() {
+            let ledger_has_annotations = ledger_state
+                .as_ref()
+                .map(|st| st.snapshot.has_annotations || st.novelty.attachments.has_annotations())
+                .unwrap_or(false);
+            if ledger_has_annotations {
+                // Caller-supplied provider wins; fall back to the API's
+                // own provider. The provider trait is consumed via a
+                // ref so we don't `take()` either field — the trait
+                // implementation may itself be reusable downstream.
+                let caller_provider = indexer_config.attachment_events_provider.as_deref();
+                let api_provider = self.attachment_events_provider();
+                let chosen_caller = caller_provider;
+                let chosen_api = api_provider.as_ref().map(AsRef::as_ref);
+                let provider_ref: Option<&dyn fluree_db_indexer::AttachmentEventsProvider> =
+                    chosen_caller.or(chosen_api);
+                if let Some(provider) = provider_ref {
+                    // Pre-load via the cached path so the provider's
+                    // `try_running_attachment_events` finds the running
+                    // ledger handle even when the only LedgerState we
+                    // hold above came from a fresh-load.
+                    let _ = self.ledger_cached(&ledger_id).await;
+                    indexer_config.attachment_events = provider.attachment_events(&ledger_id).await;
+                }
+            }
+        }
+
+        // Read the current ledger's `f:fullTextDefaults` so the reindex routes
+        // configured plain-string values into BM25 arena building. Reuses the
+        // `ledger_state` we already loaded above. Best-effort: if the existing
+        // index can't be loaded (e.g. first-ever reindex of a commits-only
+        // ledger) we fall back to empty — only the `@fulltext` datatype path
+        // will contribute entries, which matches pre-config behavior.
+        if let Some(state) = ledger_state.as_ref() {
+            // Use `state.t()` (= max(novelty.t, snapshot.t)) so that on a
+            // first-ever reindex (no prior index, all config in novelty)
+            // the config query isn't filtered out by
+            // `Novelty::for_each_overlay_flake`'s `flake.t <= to_t` guard.
+            let to_t = state.t();
+            let snapshot = &state.snapshot;
+            let overlay: &dyn fluree_db_core::OverlayProvider = &*state.novelty;
+            match crate::config_resolver::resolve_ledger_config(snapshot, overlay, to_t).await {
+                Ok(Some(cfg)) => {
+                    indexer_config.fulltext_configured_properties =
+                        crate::config_resolver::configured_fulltext_properties_for_indexer(&cfg);
+                }
+                Ok(None) => {
+                    // No LedgerConfig — nothing to seed.
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        error = %e,
+                        "reindex: failed to read LedgerConfig; configured fulltext properties will be skipped"
+                    );
+                }
             }
         }
 

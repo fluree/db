@@ -258,7 +258,7 @@ fn resolve_select_vars(result: &QueryResult) -> Vec<VarId> {
                 b.schema()
                     .iter()
                     .copied()
-                    .filter(|&vid| !result.vars.name(vid).starts_with("?__"))
+                    .filter(|&vid| !super::is_internal_var_name(result.vars.name(vid)))
                     .map(|vid| {
                         let name = result
                             .vars
@@ -275,7 +275,7 @@ fn resolve_select_vars(result: &QueryResult) -> Vec<VarId> {
                 result
                     .vars
                     .iter()
-                    .filter(|(name, _)| !name.starts_with("?__"))
+                    .filter(|(name, _)| !super::is_internal_var_name(name))
                     .map(|(name, vid)| {
                         let stripped = name.strip_prefix('?').unwrap_or(name).to_string();
                         (stripped, vid)

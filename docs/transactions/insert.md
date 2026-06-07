@@ -312,6 +312,76 @@ Add properties to existing entities:
 
 After t=2, ex:alice has both name and email.
 
+## Edge Annotations
+
+Attach metadata to a specific edge via an `@annotation` block on the object node-map. The annotation reifies the `(subject, predicate, object)` triple it sits under:
+
+```json
+{
+  "@id": "ex:alice",
+  "ex:worksFor": {
+    "@id": "ex:acme",
+    "@annotation": {
+      "ex:role": "Engineer",
+      "ex:since": { "@value": "2024-01-01", "@type": "xsd:date" }
+    }
+  }
+}
+```
+
+`@edge` is a Cypher-oriented alias for `@annotation`; the two are interchangeable.
+
+The annotation subject can be left anonymous (a blank node is minted) or pinned to an explicit IRI for stable identity:
+
+```json
+"@annotation": {
+  "@id": "ex:emp/alice-acme-2024",
+  "ex:role": "Engineer"
+}
+```
+
+**Multiple parallel annotations** on the same `(s, p, o)` edge are supported — assert two `@annotation` blocks on separate copies of the edge in the same transaction (each with its own `@id` to keep them distinct):
+
+```json
+{
+  "@graph": [
+    { "@id": "ex:alice", "ex:worksFor": {
+        "@id": "ex:acme",
+        "@annotation": { "@id": "ex:emp/2020", "ex:role": "Engineer" }
+    }},
+    { "@id": "ex:alice", "ex:worksFor": {
+        "@id": "ex:acme",
+        "@annotation": { "@id": "ex:emp/2024", "ex:role": "Manager" }
+    }}
+  ]
+}
+```
+
+Inline `@annotation` queries return one row per occurrence.
+
+**Annotated literal-valued edges** are supported — write the object as a JSON-LD value object so the annotation has a sibling key to attach to:
+
+```json
+{
+  "@id": "ex:alice",
+  "ex:name": {
+    "@value": "Alice",
+    "@annotation": { "ex:source": "ex:hr-system" }
+  }
+}
+```
+
+**Deferred shapes** error with explicit messages:
+
+- Annotations on list-occurrence triples (`@list` membership).
+- Reifiers for unasserted triples (`@reifies` must point at an asserted edge).
+- Multi-triple `@reifies` (more than one predicate-object pair under `@reifies`).
+- Annotation-of-annotation (nested `@annotation` inside an annotation body).
+- `@reifies` on the insert side (use the inline `@annotation` form instead).
+- User-authored mention of `https://ns.flur.ee/db#reifies*` IRIs (compact or full form).
+
+For the full surface — including SPARQL 1.2 / RDF 1.2 annotation tails (`{| |}`), the named reifier (`~`), the cardinality / multiplicity contract, anonymous vs explicit-IRI lifecycle, and named-graph behavior — see the [Edge annotations concept doc](../concepts/edge-annotations.md). For cascade semantics when a base edge or annotation metadata is removed, see [Retractions](retractions.md).
+
 ## Insert Semantics
 
 ### Additive by Default

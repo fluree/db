@@ -685,6 +685,7 @@ version = "4.0.5"
 dependencies = [
  "bigdecimal 0.4.10",
  "chrono",
+ "ciborium",
  "fluree-db-core",
  "fluree-db-spatial",
  "fluree-vocab",

@@ -115,6 +115,15 @@ pub struct ExecutionContext<'a> {
     pub tracker: Tracker,
     /// When true, bind evaluation errors are treated as query errors.
     pub strict_bind_errors: bool,
+    /// When true, scan operators bypass the variable-predicate filter
+    /// that hides Fluree-system predicates (`f:reifies*` in every
+    /// graph; the broader `f:` namespace in the default graph) for
+    /// patterns whose predicate slot is a variable.
+    ///
+    /// Opt-in escape for debug / inspection workflows; defaults to
+    /// `false`. Surfaced through `opts.includeSystemFacts: true` on
+    /// JSON-LD queries.
+    pub include_system_facts: bool,
     /// Optional binary columnar index store for fast local-file scans.
     ///
     /// When present, scan operators use the binary cursor path for queries
@@ -217,6 +226,7 @@ impl<'a> ExecutionContext<'a> {
             active_graph: ActiveGraph::Default,
             tracker: Tracker::disabled(),
             strict_bind_errors: false,
+            include_system_facts: false,
             binary_store: None,
             binary_g_id: 0,
             dict_novelty: None,
@@ -265,6 +275,7 @@ impl<'a> ExecutionContext<'a> {
             active_graph: ActiveGraph::Default,
             tracker: Tracker::disabled(),
             strict_bind_errors: false,
+            include_system_facts: false,
             binary_store,
             binary_g_id: db.g_id,
             dict_novelty,
@@ -317,6 +328,7 @@ impl<'a> ExecutionContext<'a> {
             active_graph: ActiveGraph::Default,
             tracker: Tracker::disabled(),
             strict_bind_errors: false,
+            include_system_facts: false,
             binary_store,
             binary_g_id: db.g_id,
             dict_novelty,
@@ -358,6 +370,7 @@ impl<'a> ExecutionContext<'a> {
             active_graph: ActiveGraph::Default,
             tracker: Tracker::disabled(),
             strict_bind_errors: false,
+            include_system_facts: false,
             binary_store: None,
             binary_g_id: 0,
             dict_novelty: None,
@@ -398,6 +411,7 @@ impl<'a> ExecutionContext<'a> {
             active_graph: ActiveGraph::Default,
             tracker: Tracker::disabled(),
             strict_bind_errors: false,
+            include_system_facts: false,
             binary_store: None,
             binary_g_id: 0,
             dict_novelty: None,
@@ -440,6 +454,7 @@ impl<'a> ExecutionContext<'a> {
             active_graph: ActiveGraph::Default,
             tracker: Tracker::disabled(),
             strict_bind_errors: false,
+            include_system_facts: false,
             binary_store: None,
             binary_g_id: 0,
             dict_novelty: None,
@@ -536,6 +551,14 @@ impl<'a> ExecutionContext<'a> {
     /// Enable strict bind error handling.
     pub fn with_strict_bind_errors(mut self) -> Self {
         self.strict_bind_errors = true;
+        self
+    }
+
+    /// Bypass the variable-predicate filter that hides Fluree-system
+    /// predicates. Opt-in for debug / inspection — see
+    /// [`Self::include_system_facts`].
+    pub fn with_include_system_facts(mut self, include: bool) -> Self {
+        self.include_system_facts = include;
         self
     }
 
@@ -827,6 +850,7 @@ impl<'a> ExecutionContext<'a> {
             active_graph,
             tracker: self.tracker.clone(),
             strict_bind_errors: self.strict_bind_errors,
+            include_system_facts: self.include_system_facts,
             binary_store: self.binary_store.clone(),
             binary_g_id,
             dict_novelty: self.dict_novelty.clone(),
@@ -878,6 +902,7 @@ impl<'a> ExecutionContext<'a> {
             active_graph: ActiveGraph::Default,
             tracker: self.tracker.clone(),
             strict_bind_errors: self.strict_bind_errors,
+            include_system_facts: self.include_system_facts,
             binary_store: self.binary_store.clone(),
             binary_g_id,
             dict_novelty: self.dict_novelty.clone(),
@@ -925,6 +950,7 @@ impl<'a> ExecutionContext<'a> {
             active_graph: ActiveGraph::Default,
             tracker: self.tracker.clone(),
             strict_bind_errors: self.strict_bind_errors,
+            include_system_facts: self.include_system_facts,
             binary_store: Self::extract_binary_store(graph.snapshot),
             binary_g_id: graph.g_id,
             dict_novelty: Self::extract_dict_novelty(graph.snapshot),

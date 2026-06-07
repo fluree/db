@@ -109,8 +109,8 @@ pub(crate) fn lower_query<E: IriEncoder>(
     // accumulate post-bind aliases as we go so chained derivations
     // (`(as (+ ?cnt 1) ?adj) (as (+ ?adj 1) ?again)`) land in `post_binds`
     // in source order.
-    let mut post_binds: Vec<(VarId, Expression)> = Vec::new();
     let mut post_bind_aliases: std::collections::HashSet<VarId> = std::collections::HashSet::new();
+    let mut post_binds: Vec<(VarId, Expression)> = Vec::new();
     for column in ast.select.columns() {
         if let UnresolvedColumn::Computation { expr, alias } = column {
             let (placement, alias_var, lowered_expr) = lower_select_expr_bind(
@@ -181,6 +181,7 @@ pub(crate) fn lower_query<E: IriEncoder>(
         offset,
         reasoning,
         post_values: None,
+        include_system_facts: ast.options.include_system_facts,
     })
 }
 
@@ -378,6 +379,34 @@ pub fn lower_unresolved_pattern<E: IriEncoder>(
             Ok(vec![Pattern::Graph {
                 name: ir_name,
                 patterns: lowered_patterns,
+            }])
+        }
+        UnresolvedPattern::EdgeAnnotation {
+            edge,
+            annotation,
+            body,
+        } => {
+            let lowered_edge = lower_triple_pattern(edge, encoder, vars)?;
+            let lowered_annotation = lower_ref_term(annotation, encoder, vars)?;
+            let lowered_body = lower_unresolved_patterns(body, encoder, vars, pp_counter)?;
+            Ok(vec![Pattern::EdgeAnnotation {
+                edge: lowered_edge,
+                annotation: lowered_annotation,
+                body: lowered_body,
+            }])
+        }
+        UnresolvedPattern::AnnotationTarget {
+            annotation,
+            edge,
+            body,
+        } => {
+            let lowered_annotation = lower_ref_term(annotation, encoder, vars)?;
+            let lowered_edge = lower_triple_pattern(edge, encoder, vars)?;
+            let lowered_body = lower_unresolved_patterns(body, encoder, vars, pp_counter)?;
+            Ok(vec![Pattern::AnnotationTarget {
+                annotation: lowered_annotation,
+                edge: lowered_edge,
+                body: lowered_body,
             }])
         }
     }

@@ -458,6 +458,17 @@ pub struct ImportResult {
     pub index_t: i64,
     /// Optional summary of top classes, properties, and connections.
     pub summary: Option<ImportSummary>,
+    /// Whether the imported dataset contains at least one
+    /// `f:reifies*` flake (an edge-annotation bundle). The bulk-import
+    /// root itself writes `annotation_index: None`, so callers that
+    /// want a sealed annotation arena available immediately should
+    /// follow up with `Fluree::reindex(...)` — the api's
+    /// `ApiAttachmentEventsProvider` scans the base index for
+    /// `f:reifies*` flakes when the running overlay is empty, so
+    /// reindex produces an authoritative arena from the just-imported
+    /// data. The CLI's `fluree create --import` performs this
+    /// follow-up automatically. `false` when `build_index == false`.
+    pub has_annotations: bool,
     /// Tracking tally (fuel, time) when a tracker was supplied via
     /// `ImportBuilder::tracker(...)`. `None` when tracking was disabled.
     pub tally: Option<TrackingTally>,
@@ -2132,6 +2143,7 @@ where
     let root_id;
     let index_t;
     let summary;
+    let mut has_annotations = false;
 
     if config.build_index {
         let build_input = IndexBuildInput {
@@ -2179,6 +2191,7 @@ where
         root_id = Some(index_result.root_id);
         index_t = index_result.index_t;
         summary = index_result.summary;
+        has_annotations = index_result.has_annotations;
     } else {
         root_id = None;
         index_t = 0;
@@ -2202,6 +2215,7 @@ where
         root_id,
         index_t,
         summary,
+        has_annotations,
         tally: config.tracker.tally(),
     })
 }
@@ -4044,6 +4058,12 @@ struct IndexUploadResult {
     root_id: fluree_db_core::ContentId,
     index_t: i64,
     summary: Option<ImportSummary>,
+    /// Sticky bit: at least one `f:reifies*` predicate landed in the
+    /// imported dataset. Surfaced to `ImportResult.has_annotations`
+    /// so the CLI can auto-seal the annotation arena via a follow-up
+    /// `reindex` pass (the bulk-import root currently writes
+    /// `annotation_index: None` even when annotations are present).
+    has_annotations: bool,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -4770,6 +4790,14 @@ where
             .cloned()
             .collect();
 
+        // Sticky bit (computed before move into the struct literal).
+        let import_has_annotations = predicate_sids_v6.iter().any(|(ns, name)| {
+            fluree_db_core::is_reserved_reifies_predicate(&fluree_db_core::Sid::new(
+                *ns,
+                name.as_str(),
+            ))
+        });
+
         let root_v6 = IndexRoot {
             ledger_id: alias.to_string(),
             index_t: input.final_t,
@@ -4801,6 +4829,26 @@ where
             prev_index: None,
             garbage: None,
             sketch_ref: None,
+            // Bulk import path: detect annotations the same way the
+            // incremental indexer does — any of the seven reserved
+            // `f:reifies*` SIDs in the predicate dict means the
+            // ledger has annotations. Computed above before the
+            // dict moves into this struct literal.
+            has_annotations: import_has_annotations,
+            annotation_index: None,
+            // Sticky-bit canonical contract lives on
+            // `IndexRoot.had_annotation_arena` in
+            // `fluree-db-binary-index/src/format/index_root.rs`.
+            // Bulk import is the *only* path that leaves the bit
+            // false (it bypasses both incremental and full-rebuild
+            // root-assembly paths, which both coerce the bit on).
+            // That makes the
+            // `has_annotations=true && had_annotation_arena=false`
+            // shape the unique bootstrap-eligible state the
+            // provider's base-index scan-fallback gates on — a
+            // later defensive drop carries the sticky bit forward
+            // and stays out of the bootstrap path.
+            had_annotation_arena: false,
             ns_split_mode: input.ns_split_mode,
         };
 
@@ -4837,6 +4885,7 @@ where
             root_id: root_cid,
             index_t: input.final_t,
             summary,
+            has_annotations: import_has_annotations,
         })
     }
 }

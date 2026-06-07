@@ -193,6 +193,71 @@ pub struct IndexRoot {
     pub prev_index: Option<BinaryPrevIndexRef>,
     pub garbage: Option<BinaryGarbageRef>,
     pub sketch_ref: Option<ContentId>,
+
+    // ── Edge-annotation gate ──────────────────────────────────────
+    /// Sticky bit: `true` once any `f:reifies*` flake (assertion or
+    /// retract) has been observed in this ledger's history. Once
+    /// set, stays set across reindexes — annotations may have been
+    /// fully retracted, but the cascade pass should still scan to
+    /// catch the (now-rare) case where an in-flight retract uncovers
+    /// a previously-orphaned bundle.
+    ///
+    /// Used as a fast-path gate in
+    /// `fluree-db-transact::stage::cascade_attachment_retracts`:
+    /// non-annotation ledgers (those that have never seen an
+    /// `@annotation` / `@reifies` write) skip the per-retract POST
+    /// lookup entirely.
+    pub has_annotations: bool,
+
+    /// Inline pointer to the on-disk forward/reverse annotation
+    /// arenas (M2b). See `fluree_db_core::annotation_index` for the
+    /// truth table that pairs this field with `has_annotations`. The
+    /// hard "zero attachments" guarantee requires both
+    /// `has_annotations == false` AND `annotation_index.is_none()`.
+    ///
+    /// Pre-builder: always `None`; the cascade fast-path consults
+    /// `has_annotations` instead. Once the M2b builder lands,
+    /// downstream readers migrate to this field for arena-backed
+    /// lookups.
+    ///
+    /// Encoder invariant: `annotation_index.is_some()` implies
+    /// `FLAG_HAS_ANNOTATIONS` on the wire, so the cascade fast-path
+    /// can never desynchronize from a populated arena.
+    pub annotation_index: Option<fluree_db_core::AnnotationIndexRoot>,
+
+    /// Sticky bit governing whether the api's
+    /// `ApiAttachmentEventsProvider` is allowed to bootstrap an
+    /// `Authoritative` annotation arena from a one-time base-index
+    /// scan. Despite the historical name, the load-bearing meaning
+    /// is closer to "base-index bootstrap is **not** allowed":
+    ///
+    /// - `false` only on fresh bulk-import roots (no indexer pass
+    ///   has yet touched the annotation history). The live base
+    ///   IS the complete history, so a one-time PSOT scan can
+    ///   produce a complete `Authoritative` event set.
+    /// - `true` on any indexer-produced root with
+    ///   `has_annotations=true`, regardless of whether an arena
+    ///   was sealed by that pass. Covers:
+    ///     * arena-seal path (`set_annotation_index(Some, ..)` flips
+    ///       the bit and never clears it on subsequent
+    ///       `set_annotation_index(None, ..)` defensive drops),
+    ///     * indexer pass that processed annotation events without
+    ///       sealing (coerced in `IncrementalRootBuilder::build()`
+    ///       and `encode_and_write_root_v6` whenever
+    ///       `has_annotations=true`),
+    ///     * legacy pre-this-change roots that have
+    ///       `annotation_index=Some(_)` but `pad=0` on the wire
+    ///       (coerced in the decoder).
+    ///
+    /// Once set, never cleared by any root assembly path. Carried
+    /// in the FIR6 extended-flags byte (low byte of the
+    /// historically-zero `pad(2)` header field). Wire-compat:
+    /// - old roots with `annotation_index=None` decode to `false`
+    ///   (matches the never-touched state),
+    /// - old roots with `annotation_index=Some(_)` decode to
+    ///   `true` via the `|| annotation_index.is_some()` coercion
+    ///   (matches "indexer already sealed an arena here").
+    pub had_annotation_arena: bool,
 }
 
 impl IndexRoot {
@@ -480,12 +545,50 @@ impl IndexRoot {
     const FLAG_HAS_GARBAGE: u8 = 1 << 3;
     const FLAG_HAS_SKETCH: u8 = 1 << 4;
     const FLAG_LEX_SORTED_STRING_IDS: u8 = 1 << 5;
+    /// Sticky bit: this snapshot has at least one currently- or
+    /// previously-asserted edge-annotation `f:reifies*` flake.
+    /// Acts as a fast-path gate for the cascade scan in
+    /// `fluree-db-transact::stage` — non-annotation ledgers skip
+    /// the per-retract POST lookup entirely.
+    const FLAG_HAS_ANNOTATIONS: u8 = 1 << 6;
+    /// Optional on-disk arena pointer (`AnnotationIndexRoot`) is present
+    /// in the inline tail. Independent of `FLAG_HAS_ANNOTATIONS`: the
+    /// sticky bit may be set without the arena (pre-builder roots);
+    /// once the builder runs the bit is set whenever the section is
+    /// present.
+    const FLAG_HAS_ANNOTATION_INDEX: u8 = 1 << 7;
+
+    /// Extended-flags bit (lives in the low byte of the
+    /// historically-zero `pad(2)` header field, i.e. `data[6]`).
+    /// Gates the api's `ApiAttachmentEventsProvider` base-index
+    /// scan-fallback: `1` means the indexer owns the annotation
+    /// history and bootstrap is **not** allowed; `0` means
+    /// fresh-bulk-import bootstrap is permitted. Sticky once set.
+    /// See `IndexRoot.had_annotation_arena` for the full state
+    /// machine.
+    const FLAG_EXT_HAD_ANNOTATION_ARENA: u8 = 1 << 0;
 
     /// Encode to the binary FIR6 wire format.
     ///
     /// Determinism: namespaces sorted by ns_code, named graphs by g_id,
     /// orders by order_id, numbig/vectors/spatial/fulltext by p_id.
     pub fn encode(&self) -> Vec<u8> {
+        // Invariant guard for the sticky bit. The field doc says
+        // `had_annotation_arena` is "never cleared by any root
+        // assembly path" — a populated `annotation_index` in
+        // particular implies the bit was set on the seal that
+        // produced it. The encoder also coerces the wire bit on
+        // (below), so a forgotten in-memory flip never escapes to
+        // disk — but the in-memory invariant is still useful to
+        // pin in dev/CI so a regression in the seal/drop
+        // bookkeeping surfaces here instead of as a phantom
+        // bootstrap-eligible state on the next reindex.
+        debug_assert!(
+            self.had_annotation_arena || self.annotation_index.is_none(),
+            "had_annotation_arena=false with annotation_index=Some(_) violates the sticky-bit \
+             contract — once an arena is set, the bit must be set too. See IndexRoot field doc."
+        );
+
         let mut buf = Vec::with_capacity(8192);
 
         // ---- Header (24 bytes) ----
@@ -515,9 +618,42 @@ impl IndexRoot {
             Self::FLAG_LEX_SORTED_STRING_IDS
         } else {
             0
+        }) | (if self.has_annotations || self.annotation_index.is_some() {
+            // The cascade fast-path in `fluree-db-transact::stage` gates
+            // on `LedgerSnapshot.has_annotations`. A populated
+            // `annotation_index` without the sticky bit set would let
+            // post-reindex retracts skip cascade — so the encoder
+            // forces the two signals to agree on the wire regardless
+            // of caller bookkeeping.
+            Self::FLAG_HAS_ANNOTATIONS
+        } else {
+            0
+        }) | (if self.annotation_index.is_some() {
+            Self::FLAG_HAS_ANNOTATION_INDEX
+        } else {
+            0
         });
         buf.push(flags);
-        buf.extend_from_slice(&0u16.to_le_bytes()); // pad
+        // Extended-flags byte (low byte of historically-zero pad).
+        // High byte stays zero (reserved for future extension).
+        //
+        // Encoder invariant: a populated `annotation_index` implies
+        // `had_annotation_arena=true` on the wire — symmetric with
+        // the `FLAG_HAS_ANNOTATIONS` coercion above. Without this,
+        // a caller that constructs a root with `annotation_index =
+        // Some(_)` but forgets to flip the sticky bit would produce
+        // a wire root that, on later defensive drop, misrepresents
+        // itself as "never sealed" and re-enables the provider's
+        // bootstrap scan-fallback.
+        let had_annotation_arena_on_wire =
+            self.had_annotation_arena || self.annotation_index.is_some();
+        let flags_ext = if had_annotation_arena_on_wire {
+            Self::FLAG_EXT_HAD_ANNOTATION_ARENA
+        } else {
+            0
+        };
+        buf.push(flags_ext);
+        buf.push(0); // reserved high pad byte
         buf.extend_from_slice(&self.index_t.to_le_bytes());
         buf.extend_from_slice(&self.base_t.to_le_bytes());
 
@@ -668,6 +804,18 @@ impl IndexRoot {
             write_cid(&mut buf, sketch);
         }
 
+        // ---- Optional: annotation_index (M2b) ----
+        // CBOR-encoded inline so the index format can grow new fields
+        // (e.g. histograms in M3) without bumping FIR6 itself. Length
+        // prefix lets old readers skip the section.
+        if let Some(ref ann) = self.annotation_index {
+            let mut body = Vec::new();
+            ciborium::ser::into_writer(ann, &mut body)
+                .expect("ciborium serialization to Vec<u8> is infallible");
+            buf.extend_from_slice(&(body.len() as u32).to_le_bytes());
+            buf.extend_from_slice(&body);
+        }
+
         buf
     }
 
@@ -688,10 +836,17 @@ impl IndexRoot {
         }
 
         let flags = data[5];
-        let mut pos = 8; // skip pad(2)
+        // Extended-flags byte at data[6]; data[7] reserved.
+        // Old encoders (FIR6 with the original `pad(2)`) wrote
+        // `0u16` here, so old roots decode to all extended flags
+        // = false — matching the "never sealed an arena" state.
+        let flags_ext = data[6];
+        let mut pos = 8; // skip past flags_ext + reserved
         let index_t = read_i64_at(data, &mut pos)?;
         let base_t = read_i64_at(data, &mut pos)?;
         let lex_sorted_string_ids = (flags & Self::FLAG_LEX_SORTED_STRING_IDS) != 0;
+        let has_annotations = (flags & Self::FLAG_HAS_ANNOTATIONS) != 0;
+        let had_annotation_arena = (flags_ext & Self::FLAG_EXT_HAD_ANNOTATION_ARENA) != 0;
 
         // Ledger ID
         let ledger_id = read_string(data, &mut pos)?;
@@ -883,6 +1038,32 @@ impl IndexRoot {
             None
         };
 
+        let annotation_index = if flags & Self::FLAG_HAS_ANNOTATION_INDEX != 0 {
+            let len = read_u32_at(data, &mut pos)? as usize;
+            ensure_bytes(data, pos, len, "annotation_index section")?;
+            let ann = ciborium::de::from_reader::<fluree_db_core::AnnotationIndexRoot, _>(
+                &data[pos..pos + len],
+            )
+            .map_err(|e| io_err(&format!("annotation_index decode: {e}")))?;
+            pos += len;
+            Some(ann)
+        } else {
+            None
+        };
+
+        // All optional sections consumed. `pos` should now equal the
+        // input length — anything else means a future format added
+        // bytes after the annotation section, or the writer emitted
+        // garbage. Surfacing this here keeps decode strict and makes
+        // appending a new section a deliberate change rather than a
+        // silent compatibility break.
+        if pos != data.len() {
+            return Err(io_err(&format!(
+                "root v6: trailing bytes after annotation_index ({} unread)",
+                data.len() - pos
+            )));
+        }
+
         Ok(IndexRoot {
             ledger_id,
             index_t,
@@ -910,13 +1091,43 @@ impl IndexRoot {
             prev_index,
             garbage,
             sketch_ref,
+            has_annotations,
+            // Decode-side coercion (mirrors the encode-side
+            // coercion in `encode`): a root with a populated
+            // `annotation_index` implies `had_annotation_arena =
+            // true`, regardless of what the extended-flags byte
+            // says. This makes the contract durable across the
+            // upgrade boundary: a pre-this-change FIR6 root has
+            // `pad = 0` (so the raw bit decodes as `false`) but
+            // may already carry `annotation_index = Some(_)`. Such
+            // a root has provably sealed an arena, so the sticky
+            // semantics must apply — otherwise a later defensive
+            // drop would land at the bootstrap-eligible state and
+            // the provider would re-seal from a live-only scan,
+            // losing the dropped arena's history.
+            had_annotation_arena: had_annotation_arena || annotation_index.is_some(),
+            annotation_index,
         })
     }
-    /// Collect all CAS content-artifact CIDs referenced by this root.
+    /// Collect all CAS content-artifact CIDs referenced **directly** by this root.
     ///
-    /// Includes: dict artifacts, leaf CIDs + sidecar CIDs (default graph inline),
-    /// branch CIDs (named graphs), numbig, vectors, spatial, fulltext, sketch.
+    /// Returns CIDs that the root references inline — without reading any
+    /// branch manifests from storage. Specifically:
+    /// - Dict pack + dict tree CIDs (forward + reverse).
+    /// - Per-graph arena CIDs (numbig, vectors, spatial, fulltext).
+    /// - Default-graph inline leaf CIDs and their sidecar CIDs.
+    /// - Named-graph **branch** CIDs (the leaves they route to are NOT included).
+    /// - Annotation forward + reverse **branch** CIDs (the leaves behind those
+    ///   branches are NOT included).
+    /// - Sketch CID.
+    ///
     /// Does NOT include the root's own CID or the garbage manifest CID.
+    ///
+    /// Callers that need leaf CIDs sitting behind named-graph or annotation
+    /// branches must fetch + decode those branch manifests from storage. See
+    /// [`crate::collect_root_cas_ids_expanded`] (strict) and
+    /// [`crate::collect_root_cas_ids_expanded_tolerant`] (best-effort) for
+    /// the shared expansion helpers.
     pub fn all_cas_ids(&self) -> Vec<ContentId> {
         let mut ids = Vec::new();
 
@@ -979,6 +1190,14 @@ impl IndexRoot {
         // Sketch
         if let Some(ref sketch) = self.sketch_ref {
             ids.push(sketch.clone());
+        }
+
+        // Annotation arena: forward + reverse branch CIDs.
+        // Leaves behind these branches are NOT included here — see the
+        // doc comment above and the expanded helper.
+        if let Some(ref ann) = self.annotation_index {
+            ids.push(ann.forward_branch_cid.clone());
+            ids.push(ann.reverse_branch_cid.clone());
         }
 
         ids.sort();
@@ -1185,6 +1404,9 @@ mod tests {
             prev_index: None,
             garbage: None,
             sketch_ref: None,
+            has_annotations: false,
+            annotation_index: None,
+            had_annotation_arena: false,
             ns_split_mode: fluree_db_core::ns_encoding::NsSplitMode::default(),
         }
     }
@@ -1209,6 +1431,244 @@ mod tests {
         assert_eq!(decoded.default_graph_orders.len(), 0);
         assert_eq!(decoded.named_graphs.len(), 0);
         assert!(decoded.stats.is_none());
+        assert!(decoded.annotation_index.is_none());
+    }
+
+    #[test]
+    fn fir6_round_trip_with_annotation_index() {
+        let mut root = minimal_root_v6();
+        let dummy_cid = fluree_db_core::ContentId::from_hex_digest(
+            fluree_db_core::CODEC_FLUREE_ANNOTATION_FORWARD_BRANCH,
+            &fluree_db_core::sha256_hex(b"fwd"),
+        )
+        .unwrap();
+        let dummy_rev = fluree_db_core::ContentId::from_hex_digest(
+            fluree_db_core::CODEC_FLUREE_ANNOTATION_REVERSE_BRANCH,
+            &fluree_db_core::sha256_hex(b"rev"),
+        )
+        .unwrap();
+        root.annotation_index = Some(fluree_db_core::AnnotationIndexRoot {
+            version: 1,
+            max_t: 99,
+            forward_branch_cid: dummy_cid.clone(),
+            reverse_branch_cid: dummy_rev.clone(),
+            stats: fluree_db_core::AnnotationStats {
+                forward_rows: 100,
+                reverse_rows: 100,
+                distinct_edges: 25,
+                distinct_annotations: 75,
+                ..Default::default()
+            },
+        });
+        // Sticky-bit contract: a populated `annotation_index` implies
+        // the seal pass set `had_annotation_arena=true`. The encoder
+        // debug-asserts the in-memory pair so a regression in the
+        // seal bookkeeping surfaces here rather than as a phantom
+        // bootstrap-eligible state on the next reindex.
+        root.had_annotation_arena = true;
+
+        // `minimal_root_v6` leaves `has_annotations = false`. The
+        // encoder must coerce the sticky bit on whenever an arena is
+        // present, so the cascade fast-path can never desynchronize
+        // from a populated arena.
+        assert!(!root.has_annotations);
+        let bytes = root.encode();
+        assert_ne!(bytes[5] & IndexRoot::FLAG_HAS_ANNOTATION_INDEX, 0);
+        assert_ne!(
+            bytes[5] & IndexRoot::FLAG_HAS_ANNOTATIONS,
+            0,
+            "arena present must imply sticky bit on the wire"
+        );
+
+        let decoded = IndexRoot::decode(&bytes).unwrap();
+        assert!(
+            decoded.has_annotations,
+            "decoded sticky bit follows the encoded flag"
+        );
+        let ann = decoded
+            .annotation_index
+            .expect("annotation_index roundtrip");
+        assert_eq!(ann.version, 1);
+        assert_eq!(ann.max_t, 99);
+        assert_eq!(ann.forward_branch_cid, dummy_cid);
+        assert_eq!(ann.reverse_branch_cid, dummy_rev);
+        assert_eq!(ann.stats.forward_rows, 100);
+        assert_eq!(ann.stats.distinct_edges, 25);
+        assert_eq!(ann.stats.distinct_annotations, 75);
+
+        // Metadata-only path (`LedgerSnapshot::from_root_bytes`) must
+        // surface the same pointer — callers that only load metadata
+        // still see the section.
+        let snap = fluree_db_core::LedgerSnapshot::from_root_bytes(&bytes).unwrap();
+        assert!(snap.has_annotations, "snapshot path also sees sticky bit");
+        let snap_ann = snap.annotation_index.expect("metadata path roundtrip");
+        assert_eq!(snap_ann, ann);
+    }
+
+    #[test]
+    fn fir6_round_trip_had_annotation_arena_sticky() {
+        // The sticky bit lives in the extended-flags byte at
+        // `data[6]` (low byte of the historically-zero `pad(2)`
+        // header field). Old encoders wrote `0u16` there, so old
+        // roots decode to `had_annotation_arena = false` —
+        // matching the "never sealed" state.
+        let mut root = minimal_root_v6();
+        assert!(
+            !root.had_annotation_arena,
+            "minimal helper starts with the bit clear"
+        );
+        let bytes_clear = root.encode();
+        assert_eq!(
+            bytes_clear[6] & IndexRoot::FLAG_EXT_HAD_ANNOTATION_ARENA,
+            0,
+            "extended-flags byte (data[6]) carries the bit; clear when had_annotation_arena=false"
+        );
+        let decoded_clear = IndexRoot::decode(&bytes_clear).unwrap();
+        assert!(!decoded_clear.had_annotation_arena);
+
+        // Flip the bit, re-encode, verify byte position + decode.
+        root.had_annotation_arena = true;
+        let bytes_set = root.encode();
+        assert_ne!(
+            bytes_set[6] & IndexRoot::FLAG_EXT_HAD_ANNOTATION_ARENA,
+            0,
+            "extended-flags byte must reflect had_annotation_arena=true"
+        );
+        let decoded_set = IndexRoot::decode(&bytes_set).unwrap();
+        assert!(decoded_set.had_annotation_arena);
+
+        // Metadata-only path (`LedgerSnapshot::from_root_bytes`)
+        // must surface the same value.
+        let snap = fluree_db_core::LedgerSnapshot::from_root_bytes(&bytes_set).unwrap();
+        assert!(
+            snap.had_annotation_arena,
+            "metadata-only decode also surfaces the sticky bit"
+        );
+
+        // Backward compat 1: an artificially-zeroed extended-flags
+        // byte on a no-arena root (simulating a pre-this-change FIR6
+        // root that never sealed an arena) decodes to
+        // `had_annotation_arena = false`, NOT a panic or
+        // unsupported-version error.
+        let mut bytes_legacy = bytes_set.clone();
+        bytes_legacy[6] = 0;
+        bytes_legacy[7] = 0;
+        let decoded_legacy = IndexRoot::decode(&bytes_legacy).unwrap();
+        assert!(
+            !decoded_legacy.had_annotation_arena,
+            "old roots with pad=0 and no arena decode to bit clear \
+             (the 'never sealed' state)"
+        );
+
+        // Backward compat 2: a pre-this-change FIR6 root that
+        // *already had an arena sealed* (annotation_index =
+        // Some(_)) has `pad = 0` on the wire because the encoder
+        // didn't know about the extended-flags byte. The decoder
+        // must coerce `had_annotation_arena = true` from the
+        // presence of `annotation_index`, otherwise a later
+        // defensive drop would land in the bootstrap-eligible
+        // state and the provider's base-index scan-fallback could
+        // re-seal from a live-only scan, losing the dropped
+        // arena's history.
+        let dummy_fwd = fluree_db_core::ContentId::from_hex_digest(
+            fluree_db_core::CODEC_FLUREE_ANNOTATION_FORWARD_BRANCH,
+            &fluree_db_core::sha256_hex(b"fwd"),
+        )
+        .unwrap();
+        let dummy_rev = fluree_db_core::ContentId::from_hex_digest(
+            fluree_db_core::CODEC_FLUREE_ANNOTATION_REVERSE_BRANCH,
+            &fluree_db_core::sha256_hex(b"rev"),
+        )
+        .unwrap();
+        let mut root_with_arena = minimal_root_v6();
+        root_with_arena.annotation_index = Some(fluree_db_core::AnnotationIndexRoot {
+            version: 1,
+            max_t: 7,
+            forward_branch_cid: dummy_fwd,
+            reverse_branch_cid: dummy_rev,
+            stats: fluree_db_core::AnnotationStats::default(),
+        });
+        // Set the sticky bit true (matches the in-memory invariant
+        // enforced by `encode()`'s `debug_assert!`) so the encode
+        // call succeeds; we then forcibly zero the extended-flags
+        // bytes to simulate a pre-this-change encoder that wrote
+        // `pad = 0` on the wire even when an arena was sealed.
+        // What's actually under test here is the *decoder's*
+        // legacy-byte coercion, not the encoder.
+        root_with_arena.had_annotation_arena = true;
+        let mut bytes_legacy_with_arena = root_with_arena.encode();
+        bytes_legacy_with_arena[6] = 0;
+        bytes_legacy_with_arena[7] = 0;
+        let decoded = IndexRoot::decode(&bytes_legacy_with_arena).unwrap();
+        assert!(
+            decoded.had_annotation_arena,
+            "legacy root with annotation_index=Some + pad=0 must coerce \
+             had_annotation_arena=true on decode (otherwise a later \
+             defensive drop would silently re-enable provider bootstrap)"
+        );
+        let snap_legacy =
+            fluree_db_core::LedgerSnapshot::from_root_bytes(&bytes_legacy_with_arena).unwrap();
+        assert!(
+            snap_legacy.had_annotation_arena,
+            "metadata-only decode applies the same coercion"
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "had_annotation_arena=false with annotation_index=Some")]
+    fn fir6_encoder_debug_asserts_sticky_bit_when_arena_present() {
+        // The in-memory contract is now the source of truth: an
+        // `IndexRoot` with `annotation_index = Some(_)` must also
+        // carry `had_annotation_arena = true`. `encode()` debug-
+        // asserts the invariant so a regression in seal/drop
+        // bookkeeping fails fast in dev/CI rather than relying on
+        // the wire-format coercion to paper over it at release
+        // time.
+        //
+        // The encoder's `|| self.annotation_index.is_some()`
+        // coercion (around line 633) is retained as a release-build
+        // safety net — if `debug_assertions = false` and a caller
+        // somehow violates the invariant anyway, the wire bit is
+        // still forced on, preserving correct
+        // bootstrap-vs-defensive-drop semantics on the next
+        // reindex.
+        let dummy_fwd = fluree_db_core::ContentId::from_hex_digest(
+            fluree_db_core::CODEC_FLUREE_ANNOTATION_FORWARD_BRANCH,
+            &fluree_db_core::sha256_hex(b"fwd"),
+        )
+        .unwrap();
+        let dummy_rev = fluree_db_core::ContentId::from_hex_digest(
+            fluree_db_core::CODEC_FLUREE_ANNOTATION_REVERSE_BRANCH,
+            &fluree_db_core::sha256_hex(b"rev"),
+        )
+        .unwrap();
+        let mut root = minimal_root_v6();
+        root.annotation_index = Some(fluree_db_core::AnnotationIndexRoot {
+            version: 1,
+            max_t: 7,
+            forward_branch_cid: dummy_fwd,
+            reverse_branch_cid: dummy_rev,
+            stats: fluree_db_core::AnnotationStats::default(),
+        });
+        // Deliberately leave the sticky bit clear: the debug_assert
+        // in `encode()` must fire.
+        root.had_annotation_arena = false;
+        let _ = root.encode();
+    }
+
+    #[test]
+    fn fir6_rejects_trailing_bytes() {
+        // A future format extension that appended bytes after the
+        // annotation section must not silently load on this build.
+        // Both decode paths reject the stray byte explicitly.
+        let bytes = minimal_root_v6().encode();
+        let mut tampered = bytes.clone();
+        tampered.push(0xff);
+        let err = IndexRoot::decode(&tampered).expect_err("trailing byte must be rejected");
+        assert!(err.to_string().contains("trailing bytes"), "got: {err}");
+        let err = fluree_db_core::LedgerSnapshot::from_root_bytes(&tampered)
+            .expect_err("metadata path must reject trailing bytes too");
+        assert!(err.to_string().contains("trailing bytes"), "got: {err}");
     }
 
     #[test]
@@ -1399,6 +1859,10 @@ mod tests {
         let leaf_no_sc = ContentId::new(fluree_db_core::ContentKind::IndexLeaf, b"leaf2");
         let branch_cid = ContentId::new(fluree_db_core::ContentKind::IndexBranch, b"br1");
         let sketch_cid = ContentId::new(fluree_db_core::ContentKind::Commit, b"sketch1");
+        let ann_fwd_cid =
+            ContentId::new(fluree_db_core::ContentKind::AnnotationForwardBranch, b"af1");
+        let ann_rev_cid =
+            ContentId::new(fluree_db_core::ContentKind::AnnotationReverseBranch, b"ar1");
 
         let zero_key = RunRecordV2 {
             s_id: SubjectId::from(0u64),
@@ -1435,6 +1899,13 @@ mod tests {
             orders: vec![(RunSortOrder::Spot, branch_cid.clone())],
         }];
         root.sketch_ref = Some(sketch_cid.clone());
+        root.annotation_index = Some(fluree_db_core::AnnotationIndexRoot {
+            version: 1,
+            max_t: 0,
+            forward_branch_cid: ann_fwd_cid.clone(),
+            reverse_branch_cid: ann_rev_cid.clone(),
+            stats: fluree_db_core::AnnotationStats::default(),
+        });
 
         let ids = root.all_cas_ids();
 
@@ -1447,10 +1918,19 @@ mod tests {
         assert!(ids.contains(&branch_cid), "missing branch_cid");
         // Sketch present
         assert!(ids.contains(&sketch_cid), "missing sketch_cid");
+        // Annotation arena branch CIDs present (leaves behind them are not).
+        assert!(
+            ids.contains(&ann_fwd_cid),
+            "missing annotation forward branch CID"
+        );
+        assert!(
+            ids.contains(&ann_rev_cid),
+            "missing annotation reverse branch CID"
+        );
         // Dict CIDs present (from minimal_root_v6)
         assert!(
-            ids.len() >= 5,
-            "expected at least 5 CIDs, got {}",
+            ids.len() >= 7,
+            "expected at least 7 CIDs, got {}",
             ids.len()
         );
         // No duplicates (sorted + deduped)

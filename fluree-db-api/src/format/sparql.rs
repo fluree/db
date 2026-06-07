@@ -87,15 +87,16 @@ fn compute_head(result: &QueryResult) -> (Vec<String>, Vec<fluree_db_query::VarI
                 b.schema()
                     .iter()
                     .copied()
-                    // Skip internal variables (?__pp0, ?__s0, etc.) from wildcard output.
-                    .filter(|&vid| !result.vars.name(vid).starts_with("?__"))
+                    // Skip internal variables from wildcard output: planner/aggregate
+                    // synthetics (?__pp0, ?__s0, ...) and annotation reifier synthetics (?#...).
+                    .filter(|&vid| !is_internal_var_name(result.vars.name(vid)))
                     .collect()
             })
             .unwrap_or_else(|| {
                 result
                     .vars
                     .iter()
-                    .filter(|(name, _)| !name.starts_with("?__"))
+                    .filter(|(name, _)| !is_internal_var_name(name))
                     .map(|(_, id)| id)
                     .collect()
             })
@@ -360,6 +361,8 @@ fn scalar_lexical(val: &FlakeValue) -> String {
 fn strip_question_mark(var_name: &str) -> String {
     var_name.strip_prefix('?').unwrap_or(var_name).to_string()
 }
+
+use super::is_internal_var_name;
 
 /// Format a single binding to SPARQL JSON format
 ///

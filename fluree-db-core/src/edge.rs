@@ -1,0 +1,966 @@
+//! `EdgeKey` — a stable identifier for a base triple that has (or could
+//! have) annotations attached to it.
+//!
+//! Annotations in Fluree reify a specific edge: the `(graph, subject,
+//! predicate, object, datatype, language, list-index)` tuple of a base
+//! flake. `EdgeKey` captures exactly that tuple in a form suitable for:
+//!
+//! - keying the in-memory [`AttachmentNovelty`](../../fluree-db-novelty)
+//!   forward multimap (`EdgeKey -> Vec<ann_sid>`),
+//! - keying the on-disk forward arena once the M2 indexer lands,
+//! - encoding to a durable system-fact bundle via the seven `f:reifies*`
+//!   predicates (the M1 source of truth), and
+//! - decoding back from those facts at warmup or read time.
+//!
+//! Total ordering and serde derive cleanly from the field types.
+//!
+//! See `docs/design/edge-annotations.md` for the durable attachment
+//! encoding contract this type implements.
+
+use crate::flake::{Flake, FlakeMeta};
+use crate::namespaces::{
+    is_reifies_datatype, is_reifies_graph, is_reifies_lang, is_reifies_list_index,
+    is_reifies_object, is_reifies_predicate, is_reifies_subject, reifies_datatype_sid,
+    reifies_graph_sid, reifies_lang_sid, reifies_object_sid, reifies_predicate_sid,
+    reifies_subject_sid,
+};
+use crate::sid::Sid;
+use crate::value::FlakeValue;
+#[cfg(test)]
+use fluree_vocab::db as fluree_db_predicates;
+#[cfg(test)]
+use fluree_vocab::namespaces::FLUREE_DB;
+use fluree_vocab::namespaces::{JSON_LD, XSD};
+use fluree_vocab::xsd_names;
+use serde::{Deserialize, Serialize};
+
+/// Datatype SID for IRI-ref objects (`$id`).
+///
+/// Inlined helper rather than a `pub const` because `Sid::new` allocates an
+/// `Arc<str>`. Callers that need it on a hot path should cache the result.
+#[inline]
+pub fn id_datatype_sid() -> Sid {
+    Sid::new(JSON_LD, "id")
+}
+
+/// Datatype SID for `xsd:string` literals (used for `f:reifiesLang`).
+#[inline]
+pub fn xsd_string_datatype_sid() -> Sid {
+    Sid::new(XSD, xsd_names::STRING)
+}
+
+/// A stable identifier for a base triple eligible to carry annotations.
+///
+/// Fields mirror [`Flake`] one-for-one (minus `t`/`op`/`ann`-side bits) so
+/// the conversion from a base flake is mechanical and the round-trip
+/// encoding via `f:reifies*` system facts is lossless.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub struct EdgeKey {
+    /// Named graph the edge lives in. `None` = default graph.
+    pub g: Option<Sid>,
+    /// Subject SID.
+    pub s: Sid,
+    /// Predicate SID.
+    pub p: Sid,
+    /// Object value (any [`FlakeValue`]: refs, literals, etc.).
+    pub o: FlakeValue,
+    /// Datatype SID of the object.
+    pub dt: Sid,
+    /// Language tag for langString objects, when applicable.
+    pub lang: Option<String>,
+    /// List index for list-element flakes. v1 always `None` —
+    /// list-occurrence annotations are deferred (see decisions section).
+    pub list_i: Option<i32>,
+}
+
+impl EdgeKey {
+    /// Construct an `EdgeKey` from a base flake.
+    ///
+    /// The flake's `t` and `op` are intentionally discarded — the key is
+    /// time-agnostic; attachment lifecycle (assert / retract) is tracked
+    /// separately on the attachment row itself.
+    pub fn from_flake(flake: &Flake) -> Self {
+        let (lang, list_i) = match &flake.m {
+            Some(meta) => (meta.lang.clone(), meta.i),
+            None => (None, None),
+        };
+        Self {
+            g: flake.g.clone(),
+            s: flake.s.clone(),
+            p: flake.p.clone(),
+            o: flake.o.clone(),
+            dt: flake.dt.clone(),
+            lang,
+            list_i,
+        }
+    }
+
+    /// True iff `flake` represents the same edge as this key.
+    ///
+    /// Compares every position structurally; ignores `t` / `op` /
+    /// metadata fields that aren't part of the edge identity.
+    pub fn matches(&self, flake: &Flake) -> bool {
+        if self.g != flake.g
+            || self.s != flake.s
+            || self.p != flake.p
+            || self.dt != flake.dt
+            || self.o != flake.o
+        {
+            return false;
+        }
+        let (flake_lang, flake_list_i) = match &flake.m {
+            Some(meta) => (meta.lang.as_deref(), meta.i),
+            None => (None, None),
+        };
+        self.lang.as_deref() == flake_lang && self.list_i == flake_list_i
+    }
+
+    /// Encode this edge as the durable `f:reifies*` system-fact bundle
+    /// for annotation subject `ann` at transaction time `t`, with the
+    /// given assertion `op` (`true` = assert, `false` = retract).
+    ///
+    /// **Full bundle shape** including the optional `f:reifiesDatatype`
+    /// flake. Used by in-Rust producers that have direct knowledge of
+    /// the datatype and want the redundant-but-explicit encoding for
+    /// diagnostic clarity (e.g., direct flake construction in tests).
+    ///
+    /// Most write paths in v1 — including the JSON-LD pre-expansion
+    /// lowering and the cascade pass — must use
+    /// [`Self::to_reifies_facts_jsonld_compatible`] instead, which
+    /// omits `f:reifiesDatatype` so the inverse retract bundle is
+    /// byte-symmetric with what was originally asserted. Asserting
+    /// the full form and retracting the JSON-LD-compatible form (or
+    /// vice versa) leaves a phantom retract / orphan in the durable
+    /// log.
+    ///
+    /// Callers must not split or reorder the bundle — partial bundles
+    /// are rejected by the replay validator (see
+    /// `docs/design/edge-annotations.md`).
+    pub fn to_reifies_facts(&self, ann: &Sid, t: i64, op: bool) -> Vec<Flake> {
+        let mut facts = Vec::with_capacity(7);
+        let id_dt = id_datatype_sid();
+        let str_dt = xsd_string_datatype_sid();
+
+        // Helper: emit each f:reifies* flake **into the same graph**
+        // as the reified edge. The JSON-LD lowering places annotation
+        // siblings under `@graph: <iri>`, so the asserted flakes have
+        // `g = Some(g_sid)` for named graphs. A retract bundle that
+        // hardcoded `g = None` would not match the original assertion
+        // (different `g` = different fact identity in Fluree's flake
+        // model), leaving named-graph annotations orphaned.
+        let make = |s: Sid, p: Sid, o: FlakeValue, dt: Sid| -> Flake {
+            match &self.g {
+                Some(g) => Flake::new_in_graph(g.clone(), s, p, o, dt, t, op, None),
+                None => Flake::new(s, p, o, dt, t, op, None),
+            }
+        };
+
+        // f:reifiesGraph — present iff edge is in a named graph.
+        // Predicate SIDs are cloned from the process-wide cache in
+        // `namespaces.rs` (Arc refcount bump, no allocation) instead
+        // of `Sid::new(FLUREE_DB, "reifies…")` per-flake.
+        if let Some(g) = &self.g {
+            facts.push(make(
+                ann.clone(),
+                reifies_graph_sid().clone(),
+                FlakeValue::Ref(g.clone()),
+                id_dt.clone(),
+            ));
+        }
+
+        // f:reifiesSubject — required.
+        facts.push(make(
+            ann.clone(),
+            reifies_subject_sid().clone(),
+            FlakeValue::Ref(self.s.clone()),
+            id_dt.clone(),
+        ));
+
+        // f:reifiesPredicate — required.
+        facts.push(make(
+            ann.clone(),
+            reifies_predicate_sid().clone(),
+            FlakeValue::Ref(self.p.clone()),
+            id_dt.clone(),
+        ));
+
+        // f:reifiesObject — required. Preserves the original object's
+        // datatype on the flake so typed-equality lookups round-trip,
+        // and its language tag / list index in `FlakeMeta` so this
+        // flake is the structural inverse of the base edge's object.
+        // The JSON-LD writer expands a language-tagged value object to
+        // a flake carrying `m.lang`, so a cascade retract built here
+        // must match it (same `(s, p, o, dt, m)`) — otherwise the
+        // retract cancels nothing and leaves a durable orphan
+        // f:reifiesObject flake. `from_reifies_facts` ignores object
+        // `m` on decode, so this is transparent to the round-trip.
+        let mut object_flake = make(
+            ann.clone(),
+            reifies_object_sid().clone(),
+            self.o.clone(),
+            self.dt.clone(),
+        );
+        object_flake.m = edge_key_to_flake_meta(self.lang.as_deref(), self.list_i);
+        facts.push(object_flake);
+
+        // f:reifiesDatatype — required. Names the dt SID itself so
+        // queries can filter on the original object's datatype without
+        // inspecting the object value.
+        facts.push(make(
+            ann.clone(),
+            reifies_datatype_sid().clone(),
+            FlakeValue::Ref(self.dt.clone()),
+            id_dt,
+        ));
+
+        // f:reifiesLang — optional, only when the original object
+        // carried a language tag.
+        if let Some(lang) = &self.lang {
+            facts.push(make(
+                ann.clone(),
+                reifies_lang_sid().clone(),
+                FlakeValue::String(lang.clone()),
+                str_dt,
+            ));
+        }
+
+        // f:reifiesListIndex — deferred (v1 always omitted).
+
+        facts
+    }
+
+    /// Encode this edge as the **JSON-LD-compatible** `f:reifies*`
+    /// bundle: the same shape that
+    /// `fluree-db-transact::parse::edge_annotations` emits when
+    /// lowering an `@annotation` block before JSON-LD expansion.
+    ///
+    /// Differs from [`Self::to_reifies_facts`] by **omitting the
+    /// optional `f:reifiesDatatype` flake**. The decoder treats it as
+    /// optional and reconstructs the canonical datatype from the
+    /// flake-level `dt` of `f:reifiesObject`, so the bundle is
+    /// information-equivalent — but a *retraction* must match the
+    /// shape the original assertion produced or it leaves a phantom
+    /// retract in the flake log (a retract for a flake that was
+    /// never asserted).
+    ///
+    /// Use this variant in any path whose paired assertion shape is
+    /// the JSON-LD lowering: today that's the cascade pass in
+    /// `fluree-db-transact::stage::cascade_attachment_retracts` and
+    /// any future cleanup paths driven by `AttachmentNovelty`.
+    pub fn to_reifies_facts_jsonld_compatible(&self, ann: &Sid, t: i64, op: bool) -> Vec<Flake> {
+        // Emit the full bundle, then drop the `f:reifiesDatatype`
+        // flake. Cheaper than reimplementing the seven-flake
+        // construction inline, and avoids drift between the two
+        // builders.
+        let mut facts = self.to_reifies_facts(ann, t, op);
+        facts.retain(|f| !is_reifies_datatype(&f.p));
+        facts
+    }
+
+    /// Inverse of [`Self::to_reifies_facts`]: reconstruct an `EdgeKey`
+    /// from its bundle of `f:reifies*` flakes.
+    ///
+    /// Validates **bundle completeness**:
+    /// - exactly one each of `Subject`, `Predicate`, `Object`, `Datatype`
+    /// - at most one `Graph` (absent = default graph)
+    /// - at most one `Lang`
+    /// - never any `ListIndex` (v1)
+    /// - all flakes share the same annotation subject (caller's
+    ///   responsibility; this fn doesn't cross-validate `s` across the
+    ///   slice)
+    ///
+    /// Validates **graph consistency** across the bundle:
+    /// - every `f:reifies*` flake in the slice must share the same
+    ///   flake-level `g` (rejects `MixedFlakeGraphs` otherwise — a
+    ///   tampered or partial bundle where rows leaked across graphs).
+    /// - when `f:reifiesGraph` is present, its value SID must match
+    ///   the flake-level `g` of the bundle. When absent, the bundle's
+    ///   flake-level `g` must be `None` (default graph). Mismatch is
+    ///   `GraphMismatch`.
+    ///
+    /// Non-`f:reifies*` flakes (annotation metadata about the
+    /// annotation subject) are ignored — they describe the annotation,
+    /// not the edge, and may legitimately live in a different graph.
+    ///
+    /// Returns `Err` with a structured [`EdgeKeyDecodeError`] when the
+    /// bundle is malformed; the replay validator surfaces this through
+    /// telemetry.
+    pub fn from_reifies_facts(facts: &[Flake]) -> Result<Self, EdgeKeyDecodeError> {
+        let mut g: Option<Sid> = None;
+        let mut s_pos: Option<Sid> = None;
+        let mut p_pos: Option<Sid> = None;
+        let mut o_pos: Option<(FlakeValue, Sid)> = None;
+        let mut dt_pos: Option<Sid> = None;
+        let mut lang: Option<String> = None;
+        // Flake-level `g` shared by every `f:reifies*` flake in this
+        // bundle. `None` until the first `f:reifies*` flake is seen;
+        // `Some(None)` means "default graph"; `Some(Some(sid))` means
+        // "named graph `sid`".
+        let mut bundle_g: Option<Option<Sid>> = None;
+
+        for f in facts {
+            // Classify the predicate. Non-`f:reifies*` flakes describe
+            // the annotation subject as ordinary RDF and don't
+            // participate in the bundle's graph anchor — skip them
+            // before tracking `bundle_g` so a metadata fact in a
+            // different graph doesn't false-trigger `MixedFlakeGraphs`.
+            let is_bundle_flake = is_reifies_graph(&f.p)
+                || is_reifies_subject(&f.p)
+                || is_reifies_predicate(&f.p)
+                || is_reifies_object(&f.p)
+                || is_reifies_datatype(&f.p)
+                || is_reifies_lang(&f.p)
+                || is_reifies_list_index(&f.p);
+            if !is_bundle_flake {
+                continue;
+            }
+
+            // Bundle graph consistency: every f:reifies* flake must
+            // share the same flake-level `g`. The novelty observer
+            // and arena builder already enforce this at the caller
+            // layer by grouping, but the invariant belongs here so
+            // any future caller that doesn't pre-group can't slip a
+            // mixed-graph bundle through.
+            match &bundle_g {
+                None => bundle_g = Some(f.g.clone()),
+                Some(seen) if seen != &f.g => {
+                    return Err(EdgeKeyDecodeError::MixedFlakeGraphs);
+                }
+                _ => {}
+            }
+
+            if is_reifies_graph(&f.p) {
+                if g.is_some() {
+                    return Err(EdgeKeyDecodeError::Duplicate("f:reifiesGraph"));
+                }
+                let FlakeValue::Ref(sid) = &f.o else {
+                    return Err(EdgeKeyDecodeError::WrongType("f:reifiesGraph"));
+                };
+                g = Some(sid.clone());
+            } else if is_reifies_subject(&f.p) {
+                if s_pos.is_some() {
+                    return Err(EdgeKeyDecodeError::Duplicate("f:reifiesSubject"));
+                }
+                let FlakeValue::Ref(sid) = &f.o else {
+                    return Err(EdgeKeyDecodeError::WrongType("f:reifiesSubject"));
+                };
+                s_pos = Some(sid.clone());
+            } else if is_reifies_predicate(&f.p) {
+                if p_pos.is_some() {
+                    return Err(EdgeKeyDecodeError::Duplicate("f:reifiesPredicate"));
+                }
+                let FlakeValue::Ref(sid) = &f.o else {
+                    return Err(EdgeKeyDecodeError::WrongType("f:reifiesPredicate"));
+                };
+                p_pos = Some(sid.clone());
+            } else if is_reifies_object(&f.p) {
+                if o_pos.is_some() {
+                    return Err(EdgeKeyDecodeError::Duplicate("f:reifiesObject"));
+                }
+                o_pos = Some((f.o.clone(), f.dt.clone()));
+            } else if is_reifies_datatype(&f.p) {
+                if dt_pos.is_some() {
+                    return Err(EdgeKeyDecodeError::Duplicate("f:reifiesDatatype"));
+                }
+                let FlakeValue::Ref(sid) = &f.o else {
+                    return Err(EdgeKeyDecodeError::WrongType("f:reifiesDatatype"));
+                };
+                dt_pos = Some(sid.clone());
+            } else if is_reifies_lang(&f.p) {
+                if lang.is_some() {
+                    return Err(EdgeKeyDecodeError::Duplicate("f:reifiesLang"));
+                }
+                let FlakeValue::String(s) = &f.o else {
+                    return Err(EdgeKeyDecodeError::WrongType("f:reifiesLang"));
+                };
+                lang = Some(s.clone());
+            } else if is_reifies_list_index(&f.p) {
+                // v1 deferral: even seeing one is malformed.
+                return Err(EdgeKeyDecodeError::DeferredFeature("f:reifiesListIndex"));
+            }
+            // Non-`f:reifies*` flakes (annotation metadata) are ignored
+            // — they describe the annotation subject, not the edge.
+        }
+
+        let s = s_pos.ok_or(EdgeKeyDecodeError::Missing("f:reifiesSubject"))?;
+        let p = p_pos.ok_or(EdgeKeyDecodeError::Missing("f:reifiesPredicate"))?;
+        let (o, o_dt_from_flake) = o_pos.ok_or(EdgeKeyDecodeError::Missing("f:reifiesObject"))?;
+
+        // `f:reifiesDatatype` is optional: when present it must agree
+        // with the flake-level `dt` of the `f:reifiesObject` row (both
+        // encode the same value). When absent, the flake-level dt is
+        // canonical — the bundle is still complete because object
+        // datatype round-trips via the flake's own `dt` field. The
+        // pre-expansion JSON-LD lowering path emits the optional
+        // form; the in-Rust `to_reifies_facts` builder emits both for
+        // diagnostic clarity.
+        let dt = match dt_pos {
+            Some(separate) if separate != o_dt_from_flake => {
+                return Err(EdgeKeyDecodeError::DatatypeMismatch);
+            }
+            Some(separate) => separate,
+            None => o_dt_from_flake,
+        };
+
+        // Reconcile the decoded `f:reifiesGraph` value with the
+        // bundle's flake-level graph. They name the same thing from
+        // two angles:
+        //  - `g` (from the optional `f:reifiesGraph` flake) is the
+        //    graph the bundle *reifies* (the graph of the base edge).
+        //  - `bundle_g` is the graph the bundle *lives in* (where
+        //    the f:reifies* flakes themselves were asserted).
+        // The annotation subject lives in the same named graph as
+        // the edge it reifies (see `build_annotation_sibling` and
+        // `EdgeKey::to_reifies_facts`), so disagreement here means a
+        // tampered or buggy bundle. `bundle_g` is `Some` here because
+        // we required `f:reifiesSubject` above and that returns
+        // `Missing` otherwise.
+        let flake_level_g = bundle_g
+            .as_ref()
+            .expect("bundle_g set when at least f:reifiesSubject present")
+            .as_ref();
+        if g.as_ref() != flake_level_g {
+            return Err(EdgeKeyDecodeError::GraphMismatch);
+        }
+
+        Ok(Self {
+            g,
+            s,
+            p,
+            o,
+            dt,
+            lang,
+            // v1: always None.
+            list_i: None,
+        })
+    }
+}
+
+/// Errors decoding an [`EdgeKey`] from a bundle of `f:reifies*` flakes.
+///
+/// All variants are recoverable — the replay validator skips the
+/// malformed annotation, increments a telemetry counter, and continues.
+/// The annotation's *non*-`f:reifies` metadata facts remain visible as
+/// ordinary RDF (just without the attachment binding).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum EdgeKeyDecodeError {
+    /// A required `f:reifies*` predicate was absent from the bundle.
+    Missing(&'static str),
+    /// A required `f:reifies*` predicate appeared more than once.
+    Duplicate(&'static str),
+    /// The flake's object had the wrong [`FlakeValue`] type for the
+    /// predicate (e.g. `f:reifiesSubject` carried a literal).
+    WrongType(&'static str),
+    /// `f:reifiesObject`'s flake-level datatype did not match the
+    /// `f:reifiesDatatype` value. Indicates a tampered or buggy bundle.
+    DatatypeMismatch,
+    /// Two or more `f:reifies*` flakes in the bundle had different
+    /// flake-level `g` values. The whole bundle must live in one
+    /// graph; a split slice indicates tampering, a partial-write, or
+    /// a caller that failed to pre-group rows by graph.
+    MixedFlakeGraphs,
+    /// The optional `f:reifiesGraph` value disagrees with the bundle's
+    /// flake-level `g`. The annotation subject lives in the same
+    /// named graph as the edge it reifies, so these two views of the
+    /// graph must match — a mismatch indicates a tampered or buggy
+    /// bundle (e.g. `f:reifiesGraph` missing on a named-graph edge,
+    /// or set to the wrong graph).
+    GraphMismatch,
+    /// A predicate that v1 explicitly defers was present.
+    DeferredFeature(&'static str),
+}
+
+impl std::fmt::Display for EdgeKeyDecodeError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Missing(p) => write!(f, "missing {p}"),
+            Self::Duplicate(p) => write!(f, "duplicate {p}"),
+            Self::WrongType(p) => write!(f, "wrong object type for {p}"),
+            Self::DatatypeMismatch => {
+                write!(f, "f:reifiesObject dt mismatch with f:reifiesDatatype")
+            }
+            Self::MixedFlakeGraphs => {
+                write!(f, "f:reifies* flakes in one bundle span multiple graphs")
+            }
+            Self::GraphMismatch => write!(
+                f,
+                "f:reifiesGraph value disagrees with the bundle's flake-level graph"
+            ),
+            Self::DeferredFeature(p) => write!(f, "{p} is deferred to a future milestone"),
+        }
+    }
+}
+
+impl std::error::Error for EdgeKeyDecodeError {}
+
+/// Convert an `EdgeKey` to a fresh [`FlakeMeta`] capturing the lang/list
+/// fields, returning `None` when both fields are absent (matching the
+/// existing `Flake.m: Option<FlakeMeta>` convention).
+fn edge_key_to_flake_meta(lang: Option<&str>, list_i: Option<i32>) -> Option<FlakeMeta> {
+    if lang.is_none() && list_i.is_none() {
+        return None;
+    }
+    Some(FlakeMeta {
+        lang: lang.map(String::from),
+        i: list_i,
+    })
+}
+
+impl EdgeKey {
+    /// Reconstruct a base [`Flake`] equivalent to the one this key was
+    /// derived from. Useful for cascade-retract paths that need to emit
+    /// an inverse flake matching the original by structure.
+    ///
+    /// `t` and `op` are caller-supplied — the cascade decides whether
+    /// it is asserting or retracting.
+    pub fn to_base_flake(&self, t: i64, op: bool) -> Flake {
+        let m = edge_key_to_flake_meta(self.lang.as_deref(), self.list_i);
+        match &self.g {
+            Some(g) => Flake::new_in_graph(
+                g.clone(),
+                self.s.clone(),
+                self.p.clone(),
+                self.o.clone(),
+                self.dt.clone(),
+                t,
+                op,
+                m,
+            ),
+            None => Flake::new(
+                self.s.clone(),
+                self.p.clone(),
+                self.o.clone(),
+                self.dt.clone(),
+                t,
+                op,
+                m,
+            ),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sample_flake() -> Flake {
+        Flake::new(
+            Sid::new(13, "alice"),
+            Sid::new(13, "worksFor"),
+            FlakeValue::Ref(Sid::new(13, "acme")),
+            id_datatype_sid(),
+            42,
+            true,
+            None,
+        )
+    }
+
+    #[test]
+    fn from_flake_round_trips_through_matches() {
+        let f = sample_flake();
+        let key = EdgeKey::from_flake(&f);
+        assert!(key.matches(&f));
+    }
+
+    #[test]
+    fn matches_ignores_t_and_op() {
+        let f = sample_flake();
+        let key = EdgeKey::from_flake(&f);
+        let mut other = f.clone();
+        other.t = 99;
+        other.op = false;
+        assert!(
+            key.matches(&other),
+            "EdgeKey identity is t/op-agnostic by design"
+        );
+    }
+
+    #[test]
+    fn matches_distinguishes_graph() {
+        let mut f = sample_flake();
+        f.g = Some(Sid::new(13, "graph_a"));
+        let key = EdgeKey::from_flake(&f);
+        let mut other = sample_flake();
+        other.g = Some(Sid::new(13, "graph_b"));
+        assert!(!key.matches(&other));
+    }
+
+    #[test]
+    fn reifies_round_trip_default_graph_no_lang() {
+        let f = sample_flake();
+        let key = EdgeKey::from_flake(&f);
+        let ann = Sid::new(13, "ann1");
+        let bundle = key.to_reifies_facts(&ann, 42, true);
+        // 4 required + 0 optional = 4 facts (no graph, no lang, no list_i).
+        assert_eq!(bundle.len(), 4);
+        let decoded = EdgeKey::from_reifies_facts(&bundle).expect("decode succeeds");
+        assert_eq!(decoded, key);
+    }
+
+    #[test]
+    fn reifies_round_trip_named_graph_with_lang() {
+        let mut f = sample_flake();
+        f.g = Some(Sid::new(13, "graph_a"));
+        f.o = FlakeValue::String("Engineer".into());
+        f.dt = Sid::new(2, "string"); // xsd:string
+        f.m = Some(FlakeMeta {
+            lang: Some("fr".into()),
+            i: None,
+        });
+        let key = EdgeKey::from_flake(&f);
+        let ann = Sid::new(13, "ann_named");
+        let bundle = key.to_reifies_facts(&ann, 42, true);
+        assert_eq!(bundle.len(), 6, "graph + S + P + O + Dt + lang");
+        let decoded = EdgeKey::from_reifies_facts(&bundle).expect("decode succeeds");
+        assert_eq!(decoded, key);
+    }
+
+    #[test]
+    fn reifies_object_flake_carries_lang_meta_for_cascade_symmetry() {
+        // BUGS-2: the f:reifiesObject flake must carry the language tag
+        // in its FlakeMeta so a cascade retract built from the EdgeKey
+        // is the structural inverse of the JSON-LD-asserted flake (which
+        // carries m.lang). Otherwise the retract cancels nothing and the
+        // f:reifiesObject flake survives as a durable orphan.
+        let mut f = sample_flake();
+        f.o = FlakeValue::String("chat".into());
+        f.dt = Sid::new(2, "string"); // stand-in for rdf:langString
+        f.m = Some(FlakeMeta {
+            lang: Some("fr".into()),
+            i: None,
+        });
+        let key = EdgeKey::from_flake(&f);
+        let ann = Sid::new(13, "ann_lang");
+
+        let assertion = key.to_reifies_facts(&ann, 5, true);
+        let obj = assertion
+            .iter()
+            .find(|fl| is_reifies_object(&fl.p))
+            .expect("f:reifiesObject flake present");
+        assert_eq!(
+            obj.m.as_ref().and_then(|m| m.lang.as_deref()),
+            Some("fr"),
+            "f:reifiesObject flake must carry m.lang"
+        );
+
+        // The retract bundle must match the assertion flake-for-flake
+        // (same o/dt/m) so the cascade actually cancels it.
+        let retract = key.to_reifies_facts(&ann, 7, false);
+        let obj_r = retract
+            .iter()
+            .find(|fl| is_reifies_object(&fl.p))
+            .expect("f:reifiesObject flake present in retract");
+        assert_eq!(obj.m, obj_r.m, "object flake meta must match on retract");
+        assert_eq!(obj.o, obj_r.o);
+        assert_eq!(obj.dt, obj_r.dt);
+    }
+
+    #[test]
+    fn decode_rejects_missing_required() {
+        let f = sample_flake();
+        let key = EdgeKey::from_flake(&f);
+        let ann = Sid::new(13, "ann1");
+        let mut bundle = key.to_reifies_facts(&ann, 42, true);
+        bundle.retain(|f| !is_reifies_subject(&f.p));
+        let err = EdgeKey::from_reifies_facts(&bundle).unwrap_err();
+        assert_eq!(err, EdgeKeyDecodeError::Missing("f:reifiesSubject"));
+    }
+
+    #[test]
+    fn decode_rejects_duplicate_required() {
+        let f = sample_flake();
+        let key = EdgeKey::from_flake(&f);
+        let ann = Sid::new(13, "ann1");
+        let mut bundle = key.to_reifies_facts(&ann, 42, true);
+        let dup = bundle
+            .iter()
+            .find(|f| is_reifies_predicate(&f.p))
+            .expect("predicate flake exists")
+            .clone();
+        bundle.push(dup);
+        let err = EdgeKey::from_reifies_facts(&bundle).unwrap_err();
+        assert_eq!(err, EdgeKeyDecodeError::Duplicate("f:reifiesPredicate"));
+    }
+
+    #[test]
+    fn decode_rejects_list_index_in_v1() {
+        let f = sample_flake();
+        let key = EdgeKey::from_flake(&f);
+        let ann = Sid::new(13, "ann1");
+        let mut bundle = key.to_reifies_facts(&ann, 42, true);
+        bundle.push(Flake::new(
+            ann.clone(),
+            Sid::new(FLUREE_DB, fluree_db_predicates::REIFIES_LIST_INDEX),
+            FlakeValue::Long(0),
+            Sid::new(XSD, xsd_names::INTEGER),
+            42,
+            true,
+            None,
+        ));
+        let err = EdgeKey::from_reifies_facts(&bundle).unwrap_err();
+        assert_eq!(
+            err,
+            EdgeKeyDecodeError::DeferredFeature("f:reifiesListIndex")
+        );
+    }
+
+    #[test]
+    fn decode_ignores_unrelated_flakes() {
+        // Annotation metadata flakes (e.g. `ann ex:role "Engineer"`)
+        // share the bundle but must be passed through transparently.
+        let f = sample_flake();
+        let key = EdgeKey::from_flake(&f);
+        let ann = Sid::new(13, "ann1");
+        let mut bundle = key.to_reifies_facts(&ann, 42, true);
+        bundle.push(Flake::new(
+            ann,
+            Sid::new(13, "role"),
+            FlakeValue::String("Engineer".into()),
+            Sid::new(XSD, xsd_names::STRING),
+            42,
+            true,
+            None,
+        ));
+        let decoded = EdgeKey::from_reifies_facts(&bundle).expect("metadata is ignored");
+        assert_eq!(decoded, key);
+    }
+
+    #[test]
+    fn jsonld_compatible_bundle_omits_datatype_but_round_trips() {
+        // The JSON-LD-compatible encoding drops the redundant
+        // `f:reifiesDatatype` flake. The decoder treats it as
+        // optional and reconstructs the canonical datatype from the
+        // flake-level `dt` of `f:reifiesObject`, so round-trip is
+        // lossless.
+        let f = sample_flake();
+        let key = EdgeKey::from_flake(&f);
+        let ann = Sid::new(13, "ann1");
+
+        let full = key.to_reifies_facts(&ann, 42, true);
+        let compact = key.to_reifies_facts_jsonld_compatible(&ann, 42, true);
+
+        assert_eq!(full.len(), 4, "full default-graph bundle has 4 facts");
+        assert_eq!(
+            compact.len(),
+            3,
+            "JSON-LD-compatible bundle drops f:reifiesDatatype"
+        );
+        assert!(
+            !compact.iter().any(|f| is_reifies_datatype(&f.p)),
+            "JSON-LD-compatible bundle must not contain f:reifiesDatatype: {compact:?}"
+        );
+
+        let decoded = EdgeKey::from_reifies_facts(&compact)
+            .expect("decoder treats f:reifiesDatatype as optional");
+        assert_eq!(decoded, key);
+    }
+
+    #[test]
+    fn named_graph_bundle_emits_flakes_in_the_named_graph() {
+        // Regression: every flake in a named-graph bundle (assertion
+        // or retract) must have `g = Some(graph_sid)` matching the
+        // reified edge's graph. A `g = None` retract would not
+        // match a `g = Some(...)` assertion in Fluree's flake
+        // identity model, leaving named-graph annotations orphaned.
+        let mut f = sample_flake();
+        f.g = Some(Sid::new(13, "graph_a"));
+        f.o = FlakeValue::String("Engineer".into());
+        f.dt = Sid::new(2, "string");
+        f.m = Some(FlakeMeta {
+            lang: Some("fr".into()),
+            i: None,
+        });
+        let key = EdgeKey::from_flake(&f);
+        let ann = Sid::new(13, "ann1");
+
+        // Full bundle.
+        let full = key.to_reifies_facts(&ann, 42, true);
+        for flake in &full {
+            assert_eq!(
+                flake.g.as_ref(),
+                Some(&Sid::new(13, "graph_a")),
+                "named-graph bundle flake must carry the edge's graph: {flake:?}"
+            );
+        }
+
+        // JSON-LD-compatible (cascade) bundle.
+        let compact = key.to_reifies_facts_jsonld_compatible(&ann, 42, true);
+        for flake in &compact {
+            assert_eq!(
+                flake.g.as_ref(),
+                Some(&Sid::new(13, "graph_a")),
+                "JSON-LD-compat named-graph bundle must carry the edge's graph: {flake:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn default_graph_bundle_keeps_g_none() {
+        // Symmetric counterpart: default-graph edges produce
+        // `g = None` flakes (the absence-encodes-default convention
+        // matches the assertion side).
+        let f = sample_flake();
+        assert!(f.g.is_none(), "sample is default-graph");
+        let key = EdgeKey::from_flake(&f);
+        let ann = Sid::new(13, "ann1");
+        let bundle = key.to_reifies_facts_jsonld_compatible(&ann, 42, true);
+        for flake in &bundle {
+            assert!(
+                flake.g.is_none(),
+                "default-graph bundle must keep g=None: {flake:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn jsonld_compatible_bundle_retract_matches_assertion_shape() {
+        // The cascade contract: a retract bundle must be the
+        // structural inverse of what the write path asserted, with
+        // only `t` and `op` differing. This test pins that for the
+        // JSON-LD encoding: an assertion at t=5 + a retract at t=7
+        // produces flake pairs that share `(s, p, o, dt, m)` and
+        // differ only in `(t, op)`.
+        let f = sample_flake();
+        let key = EdgeKey::from_flake(&f);
+        let ann = Sid::new(13, "ann1");
+
+        let assertion = key.to_reifies_facts_jsonld_compatible(&ann, 5, true);
+        let retract = key.to_reifies_facts_jsonld_compatible(&ann, 7, false);
+
+        assert_eq!(
+            assertion.len(),
+            retract.len(),
+            "assertion and retract bundles must have the same size"
+        );
+        for (a, r) in assertion.iter().zip(retract.iter()) {
+            assert_eq!(a.s, r.s, "subject must match");
+            assert_eq!(a.p, r.p, "predicate must match");
+            assert_eq!(a.o, r.o, "object value must match");
+            assert_eq!(a.dt, r.dt, "datatype must match");
+            assert_eq!(a.m, r.m, "metadata must match");
+            assert!(a.op && !r.op, "ops must invert");
+            assert_ne!(a.t, r.t, "t must differ");
+        }
+    }
+
+    #[test]
+    fn to_base_flake_round_trips_with_from_flake() {
+        let f = sample_flake();
+        let key = EdgeKey::from_flake(&f);
+        let rebuilt = key.to_base_flake(f.t, f.op);
+        // EdgeKey-identity components should match.
+        assert_eq!(rebuilt.s, f.s);
+        assert_eq!(rebuilt.p, f.p);
+        assert_eq!(rebuilt.o, f.o);
+        assert_eq!(rebuilt.dt, f.dt);
+        assert_eq!(rebuilt.g, f.g);
+    }
+
+    #[test]
+    fn decode_rejects_mixed_flake_graphs() {
+        // Build a default-graph bundle, then retarget one flake's
+        // `g` to a named graph. The decoder must reject the slice
+        // outright — every `f:reifies*` flake in one bundle shares
+        // one graph. Callers that produce mixed-graph slices have
+        // a logic bug; the decoder firewalls them rather than
+        // silently decoding to a wrong-graph EdgeKey.
+        let f = sample_flake();
+        let key = EdgeKey::from_flake(&f);
+        let ann = Sid::new(13, "ann_mix");
+        let mut bundle = key.to_reifies_facts(&ann, 42, true);
+        // Pick one bundle flake and move it into a different graph.
+        let target = bundle
+            .iter_mut()
+            .find(|f| is_reifies_object(&f.p))
+            .expect("f:reifiesObject flake exists");
+        target.g = Some(Sid::new(13, "rogue_graph"));
+        let err = EdgeKey::from_reifies_facts(&bundle).unwrap_err();
+        assert_eq!(err, EdgeKeyDecodeError::MixedFlakeGraphs);
+    }
+
+    #[test]
+    fn decode_ignores_mixed_graphs_on_non_reifies_metadata() {
+        // Non-`f:reifies*` flakes describe the annotation subject,
+        // not the edge, and may legitimately live in another graph
+        // (uncommon but not malformed). The decoder skips them
+        // before tracking bundle graph, so they must NOT trigger
+        // `MixedFlakeGraphs` even when their `g` differs.
+        let f = sample_flake();
+        let key = EdgeKey::from_flake(&f);
+        let ann = Sid::new(13, "ann_meta");
+        let mut bundle = key.to_reifies_facts(&ann, 42, true);
+        bundle.push(Flake::new_in_graph(
+            Sid::new(13, "side_graph"),
+            ann,
+            Sid::new(13, "role"),
+            FlakeValue::String("Engineer".into()),
+            Sid::new(XSD, xsd_names::STRING),
+            42,
+            true,
+            None,
+        ));
+        let decoded =
+            EdgeKey::from_reifies_facts(&bundle).expect("metadata in another graph is OK");
+        assert_eq!(decoded, key);
+    }
+
+    #[test]
+    fn decode_rejects_graph_mismatch_when_named_graph_flake_missing() {
+        // A named-graph bundle (`f.g = Some(graph_a)` on every
+        // f:reifies* flake) without an `f:reifiesGraph` flake. The
+        // bundle decodes to `EdgeKey { g: None, ... }` (since no
+        // `f:reifiesGraph` was found) but its flakes live in
+        // `Some(graph_a)`. Mismatch → `GraphMismatch`.
+        let mut f = sample_flake();
+        f.g = Some(Sid::new(13, "graph_a"));
+        let key = EdgeKey::from_flake(&f);
+        let ann = Sid::new(13, "ann_g1");
+        let mut bundle = key.to_reifies_facts(&ann, 42, true);
+        bundle.retain(|f| !is_reifies_graph(&f.p));
+        let err = EdgeKey::from_reifies_facts(&bundle).unwrap_err();
+        assert_eq!(err, EdgeKeyDecodeError::GraphMismatch);
+    }
+
+    #[test]
+    fn decode_rejects_graph_mismatch_when_reifies_graph_points_elsewhere() {
+        // Symmetric counterpart: the `f:reifiesGraph` value points
+        // at a different graph SID than the one the bundle's flakes
+        // live in. A tampered or buggy writer.
+        let mut f = sample_flake();
+        f.g = Some(Sid::new(13, "graph_a"));
+        let key = EdgeKey::from_flake(&f);
+        let ann = Sid::new(13, "ann_g2");
+        let mut bundle = key.to_reifies_facts(&ann, 42, true);
+        let graph_flake = bundle
+            .iter_mut()
+            .find(|f| is_reifies_graph(&f.p))
+            .expect("f:reifiesGraph flake exists in a named-graph bundle");
+        graph_flake.o = FlakeValue::Ref(Sid::new(13, "graph_b"));
+        let err = EdgeKey::from_reifies_facts(&bundle).unwrap_err();
+        assert_eq!(err, EdgeKeyDecodeError::GraphMismatch);
+    }
+
+    #[test]
+    fn decode_rejects_graph_mismatch_when_default_graph_flake_carries_reifies_graph() {
+        // Inverse of the missing-flake case: bundle flakes are all
+        // `g = None` (default graph) but a stray `f:reifiesGraph`
+        // claims it reifies a named-graph edge. The two views of
+        // the graph disagree.
+        let f = sample_flake();
+        assert!(f.g.is_none(), "sample is default-graph");
+        let key = EdgeKey::from_flake(&f);
+        let ann = Sid::new(13, "ann_g3");
+        let mut bundle = key.to_reifies_facts(&ann, 42, true);
+        bundle.push(Flake::new(
+            ann,
+            Sid::new(FLUREE_DB, fluree_db_predicates::REIFIES_GRAPH),
+            FlakeValue::Ref(Sid::new(13, "graph_a")),
+            id_datatype_sid(),
+            42,
+            true,
+            None,
+        ));
+        let err = EdgeKey::from_reifies_facts(&bundle).unwrap_err();
+        assert_eq!(err, EdgeKeyDecodeError::GraphMismatch);
+    }
+}

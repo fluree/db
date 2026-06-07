@@ -3,6 +3,7 @@
 //! This module defines the AST for SPARQL graph patterns before lowering
 //! to the query algebra. All nodes carry source spans for diagnostics.
 
+use super::annotation::Annotation;
 use super::expr::Expression;
 use super::path::PropertyPath;
 use super::query::{SelectVariables, SolutionModifiers};
@@ -11,7 +12,8 @@ use crate::span::SourceSpan;
 
 /// A triple pattern in SPARQL.
 ///
-/// Represents `subject predicate object` in a WHERE clause.
+/// Represents `subject predicate object` in a WHERE clause, optionally
+/// followed by an RDF 1.2 annotation tail (`~ reifier? {| ... |}`).
 #[derive(Clone, Debug, PartialEq)]
 pub struct TriplePattern {
     /// The subject
@@ -20,12 +22,14 @@ pub struct TriplePattern {
     pub predicate: PredicateTerm,
     /// The object
     pub object: ObjectTerm,
-    /// Source span covering the entire pattern
+    /// Optional RDF 1.2 annotation tail. `None` for ordinary triples.
+    pub annotation: Option<Annotation>,
+    /// Source span covering the entire pattern (including annotation).
     pub span: SourceSpan,
 }
 
 impl TriplePattern {
-    /// Create a new triple pattern.
+    /// Create a new triple pattern with no annotation tail.
     pub fn new(
         subject: SubjectTerm,
         predicate: PredicateTerm,
@@ -36,6 +40,24 @@ impl TriplePattern {
             subject,
             predicate,
             object,
+            annotation: None,
+            span,
+        }
+    }
+
+    /// Create a triple pattern carrying an annotation tail.
+    pub fn with_annotation(
+        subject: SubjectTerm,
+        predicate: PredicateTerm,
+        object: ObjectTerm,
+        annotation: Annotation,
+        span: SourceSpan,
+    ) -> Self {
+        Self {
+            subject,
+            predicate,
+            object,
+            annotation: Some(annotation),
             span,
         }
     }
@@ -161,6 +183,29 @@ pub enum GraphPattern {
         /// Source span
         span: SourceSpan,
     },
+
+    /// RDF 1.2 reifier-rooted annotation pattern.
+    ///
+    /// Source form: `<reifier> rdf:reifies <<( s p o )>>`. The `reifier`
+    /// is the annotation subject; the triple term is the reified base
+    /// edge. Sibling triples about the reifier in the surrounding scope
+    /// join through the executor on the reifier's variable — this AST
+    /// node carries no body, by design (see
+    /// `docs/concepts/edge-annotations.md` "SPARQL 1.2 / RDF 1.2 surface").
+    AnnotationTarget {
+        /// The annotation subject (the LHS of the `rdf:reifies` triple).
+        reifier: SubjectTerm,
+        /// The predicate term as written. The parser recognizes both
+        /// the full IRI and the conventional `rdf:reifies` prefixed
+        /// name lexically; the lower step uses the prologue to verify
+        /// the prefix actually resolves to the standard rdf:reifies
+        /// IRI, rejecting rebound-prefix false positives.
+        predicate: super::term::PredicateTerm,
+        /// The reified base edge (`<<( s p o )>>`).
+        triple_term: super::annotation::TripleTerm,
+        /// Source span covering the entire pattern.
+        span: SourceSpan,
+    },
 }
 
 impl GraphPattern {
@@ -179,6 +224,7 @@ impl GraphPattern {
             GraphPattern::Service { span, .. } => *span,
             GraphPattern::SubSelect { span, .. } => *span,
             GraphPattern::Path { span, .. } => *span,
+            GraphPattern::AnnotationTarget { span, .. } => *span,
         }
     }
 

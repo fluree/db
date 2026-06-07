@@ -78,9 +78,27 @@ impl<E: IriEncoder> LoweringContext<'_, E> {
     pub(super) fn lower_select_clause(&mut self, clause: &SelectClause) -> Result<Vec<VarId>> {
         match &clause.variables {
             SelectVariables::Star => {
-                // SELECT * - return all variables in the WHERE clause
-                // For now, return what we have registered
-                Ok(self.vars.iter().map(|(_, id)| id).collect())
+                // SELECT * — return user-visible registered variables.
+                //
+                // Hide three categories:
+                // - `?__*` — planner / aggregate / property-path synthetics.
+                // - `?#*`  — annotation-reifier synthetics
+                //   (see `annotation::INTERNAL_VAR_PREFIX`).
+                // - `_:*`  — SPARQL blank-node variables. Per SPARQL §4.1.4
+                //   these are non-distinguished and not in SELECT scope, so
+                //   they don't appear in `SELECT *` results. Hiding them
+                //   here also covers blank-node-labelled reifiers
+                //   (`~ _:ann`, `_:ann rdf:reifies …`).
+                Ok(self
+                    .vars
+                    .iter()
+                    .filter(|(name, _)| {
+                        !name.starts_with("?__")
+                            && !name.starts_with("?#")
+                            && !name.starts_with("_:")
+                    })
+                    .map(|(_, id)| id)
+                    .collect())
             }
             SelectVariables::Explicit(vars) => {
                 let mut result = Vec::with_capacity(vars.len());
