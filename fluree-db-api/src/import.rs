@@ -1719,84 +1719,6 @@ fn emit_local_rechunk_payload(
     true
 }
 
-fn emit_ordered_local_rechunk_events(
-    event_rxs: Vec<std::sync::mpsc::Receiver<LocalRechunkEvent>>,
-    chunk_size_bytes: u64,
-    coalesce_enabled: bool,
-    tx: &std::sync::mpsc::SyncSender<(usize, Vec<u8>)>,
-) -> std::result::Result<(), ImportError> {
-    let mut next_idx = 0usize;
-    let mut buf: Vec<u8> = Vec::new();
-
-    for (file_idx, event_rx) in event_rxs.into_iter().enumerate() {
-        loop {
-            let event = event_rx.recv().map_err(|_| {
-                ImportError::NoChunks(format!(
-                    "local rechunk worker ended before completing file index {file_idx}"
-                ))
-            })?;
-            match event {
-                LocalRechunkEvent::SplitChunk(payload) => {
-                    if !buf.is_empty() {
-                        let pending = std::mem::take(&mut buf);
-                        if !emit_local_rechunk_payload(tx, &mut next_idx, pending) {
-                            return Ok(());
-                        }
-                    }
-                    if !emit_local_rechunk_payload(tx, &mut next_idx, payload) {
-                        return Ok(());
-                    }
-                }
-                LocalRechunkEvent::SmallFile {
-                    bytes,
-                    unsafe_to_coalesce,
-                } => {
-                    if !coalesce_enabled || unsafe_to_coalesce {
-                        if !buf.is_empty() {
-                            let pending = std::mem::take(&mut buf);
-                            if !emit_local_rechunk_payload(tx, &mut next_idx, pending) {
-                                return Ok(());
-                            }
-                        }
-                        if !emit_local_rechunk_payload(tx, &mut next_idx, bytes) {
-                            return Ok(());
-                        }
-                    } else {
-                        if !buf.is_empty()
-                            && (buf.len() + 1 + bytes.len()) as u64 > chunk_size_bytes
-                        {
-                            let pending = std::mem::take(&mut buf);
-                            if !emit_local_rechunk_payload(tx, &mut next_idx, pending) {
-                                return Ok(());
-                            }
-                        }
-                        if !buf.is_empty() {
-                            buf.push(b'\n');
-                        }
-                        buf.extend_from_slice(&bytes);
-                        if buf.len() as u64 >= chunk_size_bytes {
-                            let pending = std::mem::take(&mut buf);
-                            if !emit_local_rechunk_payload(tx, &mut next_idx, pending) {
-                                return Ok(());
-                            }
-                        }
-                    }
-                }
-                LocalRechunkEvent::Done => break,
-                LocalRechunkEvent::Error(err) => return Err(err),
-            }
-        }
-    }
-
-    if !buf.is_empty() {
-        let pending = std::mem::take(&mut buf);
-        if !emit_local_rechunk_payload(tx, &mut next_idx, pending) {
-            return Ok(());
-        }
-    }
-    Ok(())
-}
-
 fn local_rechunk_loop_parallel(
     files: Vec<PathBuf>,
     sizes: Vec<u64>,
@@ -1812,32 +1734,6 @@ fn local_rechunk_loop_parallel(
 
     let (job_tx, job_rx) = std::sync::mpsc::sync_channel::<LocalRechunkJob>(worker_count);
     let job_rx = Arc::new(std::sync::Mutex::new(job_rx));
-    let mut event_rxs = Vec::with_capacity(files.len());
-    let mut jobs = Vec::with_capacity(files.len());
-
-    for (file_idx, (path, on_disk)) in files.into_iter().zip(sizes).enumerate() {
-        let (event_tx, event_rx) =
-            std::sync::mpsc::sync_channel(LOCAL_RECHUNK_EVENT_CHANNEL_CAPACITY);
-        event_rxs.push(event_rx);
-        jobs.push(LocalRechunkJob {
-            file_idx,
-            path,
-            on_disk,
-            event_tx,
-        });
-    }
-
-    let scheduler_handle = std::thread::Builder::new()
-        .name("ttl-local-rechunk-scheduler".into())
-        .spawn(move || {
-            for job in jobs {
-                if job_tx.send(job).is_err() {
-                    break;
-                }
-            }
-        })
-        .map_err(|e| ImportError::Transact(format!("spawn local rechunk scheduler: {e}")))?;
-
     let mut worker_handles = Vec::with_capacity(worker_count);
     for worker_idx in 0..worker_count {
         let job_rx = Arc::clone(&job_rx);
@@ -1857,16 +1753,153 @@ fn local_rechunk_loop_parallel(
         worker_handles.push(handle);
     }
 
-    let result =
-        emit_ordered_local_rechunk_events(event_rxs, chunk_size_bytes, coalesce_enabled, tx);
+    let mut file_iter = files.into_iter().zip(sizes).enumerate();
+    let mut event_rxs: std::collections::VecDeque<(
+        usize,
+        std::sync::mpsc::Receiver<LocalRechunkEvent>,
+    )> = std::collections::VecDeque::with_capacity(worker_count);
 
-    scheduler_handle
-        .join()
-        .map_err(|_| ImportError::Transact("local rechunk scheduler panicked".into()))?;
+    let mut schedule_next = |event_rxs: &mut std::collections::VecDeque<(
+        usize,
+        std::sync::mpsc::Receiver<LocalRechunkEvent>,
+    )>|
+     -> bool {
+        let Some((file_idx, (path, on_disk))) = file_iter.next() else {
+            return false;
+        };
+        let (event_tx, event_rx) =
+            std::sync::mpsc::sync_channel(LOCAL_RECHUNK_EVENT_CHANNEL_CAPACITY);
+        let job = LocalRechunkJob {
+            file_idx,
+            path,
+            on_disk,
+            event_tx,
+        };
+        if job_tx.send(job).is_err() {
+            return false;
+        }
+        event_rxs.push_back((file_idx, event_rx));
+        true
+    };
+
+    for _ in 0..worker_count {
+        if !schedule_next(&mut event_rxs) {
+            break;
+        }
+    }
+
+    let mut result: std::result::Result<(), ImportError> = Ok(());
+    let mut output_open = true;
+    let mut next_idx = 0usize;
+    let mut buf: Vec<u8> = Vec::new();
+
+    while let Some((file_idx, event_rx)) = event_rxs.pop_front() {
+        loop {
+            let event = match event_rx.recv() {
+                Ok(event) => event,
+                Err(_) => {
+                    if result.is_ok() {
+                        result = Err(ImportError::NoChunks(format!(
+                            "local rechunk worker ended before completing file index {file_idx}"
+                        )));
+                    }
+                    output_open = false;
+                    break;
+                }
+            };
+
+            match event {
+                LocalRechunkEvent::SplitChunk(payload) => {
+                    if output_open && result.is_ok() {
+                        if !buf.is_empty() {
+                            let pending = std::mem::take(&mut buf);
+                            if !emit_local_rechunk_payload(tx, &mut next_idx, pending) {
+                                output_open = false;
+                                buf.clear();
+                            }
+                        }
+                        if output_open && !emit_local_rechunk_payload(tx, &mut next_idx, payload) {
+                            output_open = false;
+                            buf.clear();
+                        }
+                    }
+                }
+                LocalRechunkEvent::SmallFile {
+                    bytes,
+                    unsafe_to_coalesce,
+                } => {
+                    if output_open && result.is_ok() {
+                        if !coalesce_enabled || unsafe_to_coalesce {
+                            if !buf.is_empty() {
+                                let pending = std::mem::take(&mut buf);
+                                if !emit_local_rechunk_payload(tx, &mut next_idx, pending) {
+                                    output_open = false;
+                                    buf.clear();
+                                }
+                            }
+                            if output_open && !emit_local_rechunk_payload(tx, &mut next_idx, bytes)
+                            {
+                                output_open = false;
+                                buf.clear();
+                            }
+                        } else {
+                            if !buf.is_empty()
+                                && (buf.len() + 1 + bytes.len()) as u64 > chunk_size_bytes
+                            {
+                                let pending = std::mem::take(&mut buf);
+                                if !emit_local_rechunk_payload(tx, &mut next_idx, pending) {
+                                    output_open = false;
+                                    buf.clear();
+                                }
+                            }
+                            if output_open {
+                                if !buf.is_empty() {
+                                    buf.push(b'\n');
+                                }
+                                buf.extend_from_slice(&bytes);
+                                if buf.len() as u64 >= chunk_size_bytes {
+                                    let pending = std::mem::take(&mut buf);
+                                    if !emit_local_rechunk_payload(tx, &mut next_idx, pending) {
+                                        output_open = false;
+                                        buf.clear();
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                LocalRechunkEvent::Done => break,
+                LocalRechunkEvent::Error(err) => {
+                    if result.is_ok() {
+                        result = Err(err);
+                    }
+                    output_open = false;
+                    buf.clear();
+                    break;
+                }
+            }
+        }
+
+        // Sliding-window backpressure: only schedule the next file after the
+        // next ordered file has been fully drained. This bounds decoded
+        // read-ahead to `worker_count` files instead of the whole directory.
+        if output_open && result.is_ok() {
+            schedule_next(&mut event_rxs);
+        }
+    }
+
+    drop(job_tx);
     for handle in worker_handles {
         handle
             .join()
             .map_err(|_| ImportError::Transact("local rechunk worker panicked".into()))?;
+    }
+
+    if output_open && result.is_ok() && !buf.is_empty() {
+        let pending = std::mem::take(&mut buf);
+        if !emit_local_rechunk_payload(tx, &mut next_idx, pending) {
+            return Ok(());
+        }
     }
 
     result
@@ -1912,6 +1945,8 @@ fn spawn_local_producer(
         chunk_size_mb = chunk_size_bytes / (1024 * 1024),
         channel_capacity,
         rechunk_threads = rechunk_threads.min(files.len()).max(1),
+        rechunk_file_window = rechunk_threads.min(files.len()).max(1),
+        per_file_event_capacity = LOCAL_RECHUNK_EVENT_CHANNEL_CAPACITY,
         "local directory rechunk producer"
     );
 
