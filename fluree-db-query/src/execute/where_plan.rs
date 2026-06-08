@@ -12,6 +12,7 @@
 use crate::binary_scan::EmitMask;
 use crate::bind::BindOperator;
 use crate::bm25::Bm25SearchOperator;
+use crate::cyclic_bgp::{analyze_cyclic_bgp, CyclicBgpOperator};
 use crate::distinct::DistinctOperator;
 use crate::error::{QueryError, Result};
 use crate::eval::PreparedBoolExpression;
@@ -2090,13 +2091,8 @@ fn scan_index_hint_for_triple(
     }
 }
 
-/// Build operators for a sequence of triple patterns
-///
-/// Uses property join optimization when applicable.
-/// When `object_bounds` is provided, range constraints are pushed down to the scan operator
-/// for the first pattern, enabling index-level filtering.
 #[allow(clippy::too_many_arguments)]
-pub fn build_triple_operators(
+fn build_sequential_triple_chain(
     existing: Option<BoxedOperator>,
     triples: &[TriplePattern],
     object_bounds: &HashMap<VarId, ObjectBounds>,
@@ -2108,57 +2104,19 @@ pub fn build_triple_operators(
     planning: &PlanningContext,
     stats: Option<&StatsView>,
 ) -> Result<BoxedOperator> {
-    if triples.is_empty() {
-        return existing
-            .ok_or_else(|| QueryError::InvalidQuery("No triple patterns to process".to_string()));
-    }
-
     let mut operator = existing;
-    let triples_for_exec: Vec<TriplePattern> = triples.to_vec();
-
-    // Check for property join optimization
-    //
-    // PropertyJoinOperator scans each predicate independently and applies per-predicate
-    // object bounds during its scan phase, then intersects subjects. This is far cheaper
-    // than falling back to NestedLoopJoin which does correlated novelty traversals.
-    if operator.is_none() && triples_for_exec.len() >= 2 && is_property_join(&triples_for_exec) {
-        // Use PropertyJoinOperator for multi-property patterns.
-        //
-        // If an object var is not needed downstream (not in required_where_vars and not
-        // otherwise protected), treat that predicate as existence-only (semijoin) to avoid
-        // cartesian-product blowups.
-        let mut needed: HashSet<VarId> = HashSet::new();
-        if let Some(rwv) = required_where_vars {
-            needed.extend(rwv.iter().copied());
-        }
-        for (v, c) in var_counts {
-            if *c > 1 || protected_vars.contains(v) {
-                needed.insert(*v);
-            }
-        }
-
-        let pj = PropertyJoinOperator::new_with_needed_vars(
-            &triples_for_exec,
-            object_bounds.clone(),
-            Some(&needed),
-            planning.mode(),
-        )?;
-        return Ok(Box::new(pj));
-    }
-
-    // Build chain of scan/join operators using the shared helper
     let rwv_set: Option<HashSet<VarId>> = required_where_vars.map(|v| v.iter().copied().collect());
 
     // Drives the hash-join cost model; snapshots cardinality against `seen_vars`
     // (the chain bound so far) before each pattern — see build_sequential_join_block.
     let mut seen_vars: HashSet<VarId> = HashSet::new();
     let mut hash_planner = HashJoinPlanner::new(stats);
-    for (k, pattern) in triples_for_exec.iter().enumerate() {
+    for (k, pattern) in triples.iter().enumerate() {
         hash_planner.before_step(pattern, &seen_vars);
         seen_vars.extend(pattern.produced_vars());
         // Compute live vars: required_where_vars ∪ vars from subsequent triples
         let live_vars = rwv_set.as_ref().map(|base| {
-            let suffix_vars: HashSet<VarId> = triples_for_exec[k + 1..]
+            let suffix_vars: HashSet<VarId> = triples[k + 1..]
                 .iter()
                 .flat_map(crate::ir::triple::TriplePattern::referenced_vars)
                 .collect();
@@ -2198,6 +2156,98 @@ pub fn build_triple_operators(
     }
 
     Ok(operator.unwrap())
+}
+
+/// Build operators for a sequence of triple patterns
+///
+/// Uses property join optimization when applicable.
+/// When `object_bounds` is provided, range constraints are pushed down to the scan operator
+/// for the first pattern, enabling index-level filtering.
+#[allow(clippy::too_many_arguments)]
+pub fn build_triple_operators(
+    existing: Option<BoxedOperator>,
+    triples: &[TriplePattern],
+    object_bounds: &HashMap<VarId, ObjectBounds>,
+    required_where_vars: Option<&[VarId]>,
+    var_counts: &HashMap<VarId, usize>,
+    protected_vars: &HashSet<VarId>,
+    group_by: &[VarId],
+    distinct_query: bool,
+    planning: &PlanningContext,
+    stats: Option<&StatsView>,
+) -> Result<BoxedOperator> {
+    if triples.is_empty() {
+        return existing
+            .ok_or_else(|| QueryError::InvalidQuery("No triple patterns to process".to_string()));
+    }
+
+    let triples_for_exec: Vec<TriplePattern> = triples.to_vec();
+
+    // Check for property join optimization
+    //
+    // PropertyJoinOperator scans each predicate independently and applies per-predicate
+    // object bounds during its scan phase, then intersects subjects. This is far cheaper
+    // than falling back to NestedLoopJoin which does correlated novelty traversals.
+    if existing.is_none() && triples_for_exec.len() >= 2 && is_property_join(&triples_for_exec) {
+        // Use PropertyJoinOperator for multi-property patterns.
+        //
+        // If an object var is not needed downstream (not in required_where_vars and not
+        // otherwise protected), treat that predicate as existence-only (semijoin) to avoid
+        // cartesian-product blowups.
+        let mut needed: HashSet<VarId> = HashSet::new();
+        if let Some(rwv) = required_where_vars {
+            needed.extend(rwv.iter().copied());
+        }
+        for (v, c) in var_counts {
+            if *c > 1 || protected_vars.contains(v) {
+                needed.insert(*v);
+            }
+        }
+
+        let pj = PropertyJoinOperator::new_with_needed_vars(
+            &triples_for_exec,
+            object_bounds.clone(),
+            Some(&needed),
+            planning.mode(),
+        )?;
+        return Ok(Box::new(pj));
+    }
+
+    if existing.is_none() && object_bounds.is_empty() {
+        if let Some(cyclic_plan) = analyze_cyclic_bgp(&triples_for_exec, stats) {
+            let fallback = build_sequential_triple_chain(
+                None,
+                &triples_for_exec,
+                object_bounds,
+                required_where_vars,
+                var_counts,
+                protected_vars,
+                group_by,
+                distinct_query,
+                planning,
+                stats,
+            )?;
+            return Ok(Box::new(CyclicBgpOperator::new(
+                cyclic_plan,
+                required_where_vars,
+                planning.mode(),
+                fallback,
+            )));
+        }
+    }
+
+    build_sequential_triple_chain(
+        existing,
+        &triples_for_exec,
+        object_bounds,
+        required_where_vars,
+        var_counts,
+        protected_vars,
+        group_by,
+        distinct_query,
+        planning,
+        stats,
+    )
 }
 
 #[cfg(test)]
@@ -2270,6 +2320,48 @@ mod tests {
             Ref::Sid(Sid::new(100, p_name)),
             Term::Var(o_var),
         )
+    }
+
+    #[test]
+    fn cyclic_square_uses_cyclic_bgp_operator() {
+        // 4-cycle / WGPB square:
+        // ?x1 p1 ?x2 . ?x1 p2 ?x3 . ?x4 p3 ?x2 . ?x4 p4 ?x3
+        let triples = vec![
+            make_pattern(VarId(0), "p1", VarId(1)),
+            make_pattern(VarId(0), "p2", VarId(2)),
+            make_pattern(VarId(3), "p3", VarId(1)),
+            make_pattern(VarId(3), "p4", VarId(2)),
+        ];
+
+        let op = build_triple_operators(None, &triples, &HashMap::new()).unwrap();
+        let plan = op.describe();
+        assert_eq!(plan.op, "CyclicBgpOperator");
+        assert_eq!(
+            plan.details.get("strategy").and_then(|v| v.as_str()),
+            Some("cyclic_bgp_join")
+        );
+        assert_eq!(
+            plan.details.get("shape").and_then(|v| v.as_str()),
+            Some("square")
+        );
+        assert!(
+            plan.children
+                .iter()
+                .any(|child| child.rel == crate::plan_node::PlanEdgeRel::Fallback),
+            "cyclic operator should expose the sequential fallback in EXPLAIN"
+        );
+    }
+
+    #[test]
+    fn acyclic_chain_stays_on_sequential_join() {
+        let triples = vec![
+            make_pattern(VarId(0), "p1", VarId(1)),
+            make_pattern(VarId(1), "p2", VarId(2)),
+            make_pattern(VarId(2), "p3", VarId(3)),
+        ];
+
+        let op = build_triple_operators(None, &triples, &HashMap::new()).unwrap();
+        assert_ne!(op.describe().op, "CyclicBgpOperator");
     }
 
     #[test]
