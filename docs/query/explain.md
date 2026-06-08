@@ -266,11 +266,17 @@ would otherwise be planned as left-deep nested-loop joins. Its `details` include
 - `predicates`: predicates in the detected cyclic block
 - `enabled`: whether `FLUREE_CYCLIC_BGP` allows the fast path
 - `max-predicate-rows`: the per-predicate row cap used by the fast path
+- `deferred-predicate` / `deferred-est-rows`: when one edge is broad enough
+  that the operator plans to probe it by exact `(subject, predicate, object)`
+  membership instead of scanning/materializing the full predicate relation
+- `defer-threshold-rows`: the stats threshold for the broad-edge probe path
 
 Set `FLUREE_CYCLIC_BGP=0` (or `false`) to disable this operator for A/B
 testing. `FLUREE_CYCLIC_BGP_MAX_ROWS` can lower or raise the per-predicate row
-cap. The node exposes the old nested-loop plan as a `fallback` child; the
-fallback runs when the runtime mode is unsupported by the fast path.
+cap. `FLUREE_CYCLIC_BGP_DEFER_ROWS` controls when the operator defers the
+largest cycle edge and uses exact membership probes; the default is 1,000,000
+predicate rows. The node exposes the old nested-loop plan as a `fallback` child;
+the fallback runs when the runtime mode is unsupported by the fast path.
 
 The edge `rel` distinguishes a real input from an alternative:
 
