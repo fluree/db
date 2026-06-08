@@ -57,6 +57,21 @@ impl CyclicBgpShape {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CyclicJoinMode {
+    RefOnly,
+    EncodedObject,
+}
+
+impl CyclicJoinMode {
+    fn as_str(self) -> &'static str {
+        match self {
+            CyclicJoinMode::RefOnly => "iri-ref",
+            CyclicJoinMode::EncodedObject => "encoded",
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 struct CyclicEdge {
     subject: VarId,
@@ -175,6 +190,40 @@ struct RawEdgeRow {
     p_id: u32,
 }
 
+#[derive(Clone, Copy, Debug)]
+struct RefEdgeRow {
+    subject: u64,
+    object: u64,
+}
+
+struct RefRelationIndex {
+    edge: CyclicEdge,
+    rows: Vec<RefEdgeRow>,
+    by_subject: FxHashMap<u64, Vec<u64>>,
+    by_object: FxHashMap<u64, Vec<u64>>,
+    pairs: FxHashSet<(u64, u64)>,
+}
+
+impl RefRelationIndex {
+    fn new(edge: CyclicEdge, rows: Vec<RefEdgeRow>) -> Self {
+        let mut by_subject: FxHashMap<u64, Vec<u64>> = FxHashMap::default();
+        let mut by_object: FxHashMap<u64, Vec<u64>> = FxHashMap::default();
+        let mut pairs: FxHashSet<(u64, u64)> = FxHashSet::default();
+        for row in &rows {
+            by_subject.entry(row.subject).or_default().push(row.object);
+            by_object.entry(row.object).or_default().push(row.subject);
+            pairs.insert((row.subject, row.object));
+        }
+        Self {
+            edge,
+            rows,
+            by_subject,
+            by_object,
+            pairs,
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 struct EdgeRow {
     subject: u64,
@@ -217,14 +266,17 @@ impl RelationIndex {
 
 pub(crate) struct CyclicBgpOperator {
     plan: CyclicBgpPlan,
+    join_mode: CyclicJoinMode,
     schema: Arc<[VarId]>,
     schema_positions: Arc<[usize]>,
     mode: TemporalMode,
     state: OperatorState,
     fallback: Option<BoxedOperator>,
+    ref_relations: Vec<RefRelationIndex>,
     relations: Vec<RelationIndex>,
     driver_idx: usize,
     driver_pos: usize,
+    ref_pending: VecDeque<Vec<u64>>,
     pending: VecDeque<Vec<Binding>>,
     used_fast_path: bool,
 }
@@ -246,16 +298,29 @@ impl CyclicBgpOperator {
                 schema_positions.push(idx);
             }
         }
+        let join_mode = if plan.edges.iter().any(|edge| {
+            !plan
+                .edges
+                .iter()
+                .any(|candidate| candidate.subject == edge.object)
+        }) {
+            CyclicJoinMode::EncodedObject
+        } else {
+            CyclicJoinMode::RefOnly
+        };
         Self {
             plan,
+            join_mode,
             schema: Arc::from(schema.into_boxed_slice()),
             schema_positions: Arc::from(schema_positions.into_boxed_slice()),
             mode,
             state: OperatorState::Created,
             fallback: Some(fallback),
+            ref_relations: Vec::new(),
             relations: Vec::new(),
             driver_idx: 0,
             driver_pos: 0,
+            ref_pending: VecDeque::new(),
             pending: VecDeque::new(),
             used_fast_path: false,
         }
@@ -282,6 +347,52 @@ impl CyclicBgpOperator {
         } else {
             late_materialized_object_binding(raw.o_type, raw.object, raw.p_id, 0, u32::MAX, None)
         }
+    }
+
+    fn scan_ref_relation(
+        &self,
+        ctx: &ExecutionContext<'_>,
+        edge: &CyclicEdge,
+    ) -> Result<Option<Vec<RefEdgeRow>>> {
+        let Some(store) = ctx.binary_store.as_ref() else {
+            return Ok(None);
+        };
+        let pred_sid = normalize_pred_sid(store, &edge.predicate)?;
+        let Some(p_id) = store.sid_to_p_id(&pred_sid) else {
+            return Ok(Some(Vec::new()));
+        };
+        let mut cursor = match build_psot_cursor_for_predicate(
+            ctx,
+            store,
+            ctx.binary_g_id,
+            pred_sid,
+            p_id,
+            cursor_projection_sid_otype_okey(),
+        )? {
+            Some(cursor) => cursor,
+            None => return Ok(None),
+        };
+
+        let row_cap = max_predicate_rows();
+        let mut rows = Vec::new();
+        while let Some(batch) = cursor
+            .next_batch()
+            .map_err(|e| QueryError::Internal(format!("cyclic bgp ref cursor: {e}")))?
+        {
+            for row in 0..batch.row_count {
+                if batch.o_type.get(row) != OType::IRI_REF.as_u16() {
+                    return Ok(None);
+                }
+                rows.push(RefEdgeRow {
+                    subject: batch.s_id.get(row),
+                    object: batch.o_key.get(row),
+                });
+                if rows.len() as u64 > row_cap {
+                    return Ok(None);
+                }
+            }
+        }
+        Ok(Some(rows))
     }
 
     fn scan_relation(
@@ -344,6 +455,44 @@ impl CyclicBgpOperator {
             return Ok(false);
         }
 
+        match self.join_mode {
+            CyclicJoinMode::RefOnly => self.open_ref_fast_path(ctx),
+            CyclicJoinMode::EncodedObject => self.open_encoded_fast_path(ctx),
+        }
+    }
+
+    fn open_ref_fast_path(&mut self, ctx: &ExecutionContext<'_>) -> Result<bool> {
+        let mut relations = Vec::with_capacity(self.plan.edges.len());
+        for edge in self.plan.edges.iter() {
+            let Some(rows) = self.scan_ref_relation(ctx, edge)? else {
+                return Ok(false);
+            };
+            if rows.is_empty() {
+                relations.push(RefRelationIndex::new(edge.clone(), rows));
+                self.ref_relations = relations;
+                self.driver_idx = 0;
+                self.used_fast_path = true;
+                return Ok(true);
+            }
+            relations.push(RefRelationIndex::new(edge.clone(), rows));
+        }
+        self.driver_idx = relations
+            .iter()
+            .enumerate()
+            .min_by_key(|(_, rel)| {
+                (
+                    rel.edge.estimate.unwrap_or(rel.rows.len() as u64),
+                    rel.rows.len(),
+                )
+            })
+            .map(|(idx, _)| idx)
+            .unwrap_or(0);
+        self.ref_relations = relations;
+        self.used_fast_path = true;
+        Ok(true)
+    }
+
+    fn open_encoded_fast_path(&mut self, ctx: &ExecutionContext<'_>) -> Result<bool> {
         let mut relations = Vec::with_capacity(self.plan.edges.len());
         for edge in self.plan.edges.iter() {
             let Some(rows) = self.scan_relation(ctx, edge)? else {
@@ -372,6 +521,100 @@ impl CyclicBgpOperator {
         self.relations = relations;
         self.used_fast_path = true;
         Ok(true)
+    }
+
+    fn choose_next_ref_relation(&self, assigned: &[Option<u64>], used: &[bool]) -> Option<usize> {
+        self.ref_relations
+            .iter()
+            .enumerate()
+            .filter(|(idx, _)| !used[*idx])
+            .max_by_key(|(_, rel)| {
+                let s_bound = assigned[self.var_pos(rel.edge.subject)].is_some();
+                let o_bound = assigned[self.var_pos(rel.edge.object)].is_some();
+                (
+                    (s_bound as u8 + o_bound as u8),
+                    std::cmp::Reverse(rel.rows.len()),
+                )
+            })
+            .map(|(idx, _)| idx)
+    }
+
+    fn ref_relation_candidates(
+        &self,
+        rel: &RefRelationIndex,
+        assigned: &[Option<u64>],
+    ) -> Vec<RefEdgeRow> {
+        let s_pos = self.var_pos(rel.edge.subject);
+        let o_pos = self.var_pos(rel.edge.object);
+        match (assigned[s_pos], assigned[o_pos]) {
+            (Some(s), Some(o)) => rel
+                .pairs
+                .contains(&(s, o))
+                .then_some(RefEdgeRow {
+                    subject: s,
+                    object: o,
+                })
+                .into_iter()
+                .collect(),
+            (Some(s), None) => rel
+                .by_subject
+                .get(&s)
+                .into_iter()
+                .flatten()
+                .map(|&o| RefEdgeRow {
+                    subject: s,
+                    object: o,
+                })
+                .collect(),
+            (None, Some(o)) => rel
+                .by_object
+                .get(&o)
+                .into_iter()
+                .flatten()
+                .map(|&s| RefEdgeRow {
+                    subject: s,
+                    object: o,
+                })
+                .collect(),
+            (None, None) => rel.rows.clone(),
+        }
+    }
+
+    fn extend_ref_assignments(
+        &self,
+        assigned: &mut [Option<u64>],
+        used: &mut [bool],
+        out: &mut VecDeque<Vec<u64>>,
+    ) {
+        let Some(rel_idx) = self.choose_next_ref_relation(assigned, used) else {
+            out.push_back(
+                assigned
+                    .iter()
+                    .map(|v| v.expect("all cyclic vars assigned before emit"))
+                    .collect(),
+            );
+            return;
+        };
+        let rel = &self.ref_relations[rel_idx];
+        let s_pos = self.var_pos(rel.edge.subject);
+        let o_pos = self.var_pos(rel.edge.object);
+        let candidates = self.ref_relation_candidates(rel, assigned);
+        used[rel_idx] = true;
+        for candidate in candidates {
+            let old_s = assigned[s_pos];
+            let old_o = assigned[o_pos];
+            if old_s.is_some_and(|s| s != candidate.subject)
+                || old_o.is_some_and(|o| o != candidate.object)
+            {
+                continue;
+            }
+            assigned[s_pos] = Some(candidate.subject);
+            assigned[o_pos] = Some(candidate.object);
+            self.extend_ref_assignments(assigned, used, out);
+            assigned[s_pos] = old_s;
+            assigned[o_pos] = old_o;
+        }
+        used[rel_idx] = false;
     }
 
     fn choose_next_relation(&self, assigned: &[Option<Binding>], used: &[bool]) -> Option<usize> {
@@ -492,10 +735,103 @@ impl CyclicBgpOperator {
         self.pending.extend(out);
     }
 
+    fn seed_next_ref_driver(&mut self) {
+        if self.ref_relations.is_empty() {
+            return;
+        }
+        let driver = &self.ref_relations[self.driver_idx];
+        if self.driver_pos >= driver.rows.len() {
+            return;
+        }
+        let row = driver.rows[self.driver_pos];
+        self.driver_pos += 1;
+
+        let mut assigned = vec![None; self.plan.vars.len()];
+        assigned[self.var_pos(driver.edge.subject)] = Some(row.subject);
+        assigned[self.var_pos(driver.edge.object)] = Some(row.object);
+        let mut used = vec![false; self.ref_relations.len()];
+        used[self.driver_idx] = true;
+        let mut out = VecDeque::new();
+        self.extend_ref_assignments(&mut assigned, &mut used, &mut out);
+        self.ref_pending.extend(out);
+    }
+
     fn assignment_to_columns(&self, assignment: &[Binding], cols: &mut [Vec<Binding>]) {
         for (out_idx, var_idx) in self.schema_positions.iter().copied().enumerate() {
             cols[out_idx].push(assignment[var_idx].clone());
         }
+    }
+
+    fn ref_assignment_to_columns(&self, assignment: &[u64], cols: &mut [Vec<Binding>]) {
+        for (out_idx, var_idx) in self.schema_positions.iter().copied().enumerate() {
+            cols[out_idx].push(Binding::encoded_sid(assignment[var_idx]));
+        }
+    }
+
+    fn next_ref_batch(&mut self) -> Result<Option<Batch>> {
+        let mut cols: Vec<Vec<Binding>> = self.schema.iter().map(|_| Vec::new()).collect();
+        let mut produced = 0usize;
+        while produced < OUTPUT_BATCH_SIZE {
+            if let Some(assignment) = self.ref_pending.pop_front() {
+                if cols.is_empty() {
+                    produced += 1;
+                } else {
+                    self.ref_assignment_to_columns(&assignment, &mut cols);
+                    produced += 1;
+                }
+                continue;
+            }
+            if self.ref_relations.is_empty()
+                || self.driver_pos >= self.ref_relations[self.driver_idx].rows.len()
+            {
+                break;
+            }
+            self.seed_next_ref_driver();
+        }
+
+        if produced == 0 {
+            self.state = OperatorState::Exhausted;
+            return Ok(None);
+        }
+        if cols.is_empty() {
+            return Ok(Some(Batch::empty_schema_with_len(produced)));
+        }
+        Batch::new(Arc::clone(&self.schema), cols)
+            .map(Some)
+            .map_err(|e| QueryError::Internal(format!("cyclic bgp ref batch: {e}")))
+    }
+
+    fn next_encoded_batch(&mut self) -> Result<Option<Batch>> {
+        let mut cols: Vec<Vec<Binding>> = self.schema.iter().map(|_| Vec::new()).collect();
+        let mut produced = 0usize;
+        while produced < OUTPUT_BATCH_SIZE {
+            if let Some(assignment) = self.pending.pop_front() {
+                if cols.is_empty() {
+                    produced += 1;
+                } else {
+                    self.assignment_to_columns(&assignment, &mut cols);
+                    produced += 1;
+                }
+                continue;
+            }
+            if self.relations.is_empty()
+                || self.driver_pos >= self.relations[self.driver_idx].rows.len()
+            {
+                break;
+            }
+            self.seed_next_driver();
+        }
+
+        if produced == 0 {
+            self.state = OperatorState::Exhausted;
+            return Ok(None);
+        }
+        if cols.is_empty() {
+            return Ok(Some(Batch::empty_schema_with_len(produced)));
+        }
+        Batch::new(Arc::clone(&self.schema), cols)
+            .map(Some)
+            .map_err(|e| QueryError::Internal(format!("cyclic bgp batch: {e}")))
     }
 }
 
@@ -518,7 +854,7 @@ impl Operator for CyclicBgpOperator {
             serde_json::Value::Bool(cyclic_bgp_enabled()),
         );
         m.insert("max-predicate-rows".into(), max_predicate_rows().into());
-        m.insert("object-only-values".into(), "encoded".into());
+        m.insert("object-only-values".into(), self.join_mode.as_str().into());
         let predicates: Vec<serde_json::Value> = self
             .plan
             .edges
@@ -571,43 +907,19 @@ impl Operator for CyclicBgpOperator {
             };
         }
 
-        let mut cols: Vec<Vec<Binding>> = self.schema.iter().map(|_| Vec::new()).collect();
-        let mut produced = 0usize;
-        while produced < OUTPUT_BATCH_SIZE {
-            if let Some(assignment) = self.pending.pop_front() {
-                if cols.is_empty() {
-                    produced += 1;
-                } else {
-                    self.assignment_to_columns(&assignment, &mut cols);
-                    produced += 1;
-                }
-                continue;
-            }
-            if self.relations.is_empty()
-                || self.driver_pos >= self.relations[self.driver_idx].rows.len()
-            {
-                break;
-            }
-            self.seed_next_driver();
+        match self.join_mode {
+            CyclicJoinMode::RefOnly => self.next_ref_batch(),
+            CyclicJoinMode::EncodedObject => self.next_encoded_batch(),
         }
-
-        if produced == 0 {
-            self.state = OperatorState::Exhausted;
-            return Ok(None);
-        }
-        if cols.is_empty() {
-            return Ok(Some(Batch::empty_schema_with_len(produced)));
-        }
-        Batch::new(Arc::clone(&self.schema), cols)
-            .map(Some)
-            .map_err(|e| QueryError::Internal(format!("cyclic bgp batch: {e}")))
     }
 
     fn close(&mut self) {
         if let Some(fallback) = self.fallback.as_mut() {
             fallback.close();
         }
+        self.ref_relations.clear();
         self.relations.clear();
+        self.ref_pending.clear();
         self.pending.clear();
         self.state = OperatorState::Closed;
     }
@@ -647,6 +959,7 @@ mod tests {
             triple(3, "p4", 2),
         ];
         let op = operator_for(&triples);
+        assert_eq!(op.join_mode, CyclicJoinMode::EncodedObject);
         let object = op.object_binding_for_edge(
             &op.plan.edges[0],
             RawEdgeRow {
@@ -667,6 +980,7 @@ mod tests {
     fn subject_bridge_cycle_vars_still_require_ref_objects() {
         let triples = vec![triple(0, "p1", 1), triple(1, "p2", 2), triple(2, "p3", 0)];
         let op = operator_for(&triples);
+        assert_eq!(op.join_mode, CyclicJoinMode::RefOnly);
 
         let literal = op.object_binding_for_edge(
             &op.plan.edges[0],
