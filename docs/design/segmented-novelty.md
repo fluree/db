@@ -236,10 +236,14 @@ Same log-preserving (stats-safe) rule, but incremental. Each segment has a
 **size class** derived from its flake count: `size_class(count, T) =
 floor(log_T(count))` (no per-segment level stored — derived, so builds/merges
 don't thread it). The invariant: merging `T` segments of class `K` yields one of
-class `K+1`. `Novelty::tier_compact(T)` cascade-merges the lowest class holding
-`>= T` segments into one larger segment, repeating upward, preserving every
-flake. This bounds read fan-out to `~T · log_T(N)` segments while each merge
-touches only one class's flakes — no full-novelty rewrite. `needs_tier_compaction(T)`
+class `K+1`. `Novelty::tier_compact(T)` does one **bounded cascade pass**: merge
+exactly `T` segments of the lowest full class into one (class+1) and continue
+strictly upward, each class processed at most once per call. So per-call work is
+bounded to one cascade chain (`<= classes` merges of `T` segments) — even the
+first read after a long insert-only burst can't stall on a huge class-0 backlog;
+the backlog drains across subsequent reads instead. In steady state (compaction
+keeps pace with commits) it converges immediately. Every flake is preserved.
+This bounds read fan-out to `~T · log_T(N)` segments. `needs_tier_compaction(T)`
 is the cheap policy check; `DEFAULT_TIER_WIDTH = 16`.
 
 The read-side trigger (`LedgerHandle::snapshot` → `compact_if_needed`) runs
@@ -255,8 +259,10 @@ many small merges, instead of compact-all's K=128 + spikes growing 13 → 29 →
 49 ms every ~128 commits. Inherent size-tiered caveat: a level-`L` cascade merges
 `T` class-`L` segments (`≈ T · level_size` flakes), so the *largest* single merge
 grows per level — but exponentially rarer (O(log N) amortized) and bounded by the
-reindex window. A future leveled variant with partial merges could cap the worst
-single stall further if needed.
+reindex window. (Per-call work is bounded to one cascade chain, §4.5.1, so a
+backlog never stalls a single read; the worst *single merge* is one `T`-segment
+group of the highest class.) A future leveled variant with partial merges could
+cap that worst single merge further if needed.
 
 ### 4.6 Interactions
 
