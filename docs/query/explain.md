@@ -239,8 +239,8 @@ the chosen physical operators.
 Each node has:
 
 - `op`: the operator (e.g. `ProjectOperator`, `HashJoinOperator`,
-  `PropertyJoinOperator`, `NestedLoopJoinOperator`, `DatasetOperator`, a count
-  or other fast-path operator).
+  `PropertyJoinOperator`, `CyclicBgpOperator`, `NestedLoopJoinOperator`,
+  `DatasetOperator`, a count or other fast-path operator).
 - `est-rows`: build-time cardinality estimate, when the operator exposes one.
 - `details`: operator-specific attributes (e.g. a scan's `pattern` and planned
   `index-hint`; a `PropertyJoinOperator`'s fused `predicates`).
@@ -252,9 +252,25 @@ so you can see **whether** a hash join was chosen and **why**:
 - `hash-join-chosen`: `true` on a `HashJoinOperator`, `false` on a
   `NestedLoopJoinOperator` that was a hash-join candidate but lost.
 - `hash-join-reason`: `forced-on` / `forced-off` (the `FLUREE_HASH_JOIN` env),
-  `cost-wins`, `probe-too-small`, `scan-ratio-too-high`, or `no-probe-stats`.
+  `cost-wins`, `probe-too-small`, `scan-ratio-too-high`, `no-probe-stats`, or
+  `subject-driven-forward-join`.
 - `probe-count`, `driving-est`, `scan-ratio`: the cost inputs the planner
   weighed (present when statistics are available).
+
+For eligible fixed-predicate triangle/square BGPs, the physical plan may show
+`CyclicBgpOperator`. This is a conservative fast path for cyclic joins that
+would otherwise be planned as left-deep nested-loop joins. Its `details` include:
+
+- `strategy`: `cyclic_bgp_join`
+- `shape`: `triangle` or `square`
+- `predicates`: predicates in the detected cyclic block
+- `enabled`: whether `FLUREE_CYCLIC_BGP` allows the fast path
+- `max-predicate-rows`: the per-predicate row cap used by the fast path
+
+Set `FLUREE_CYCLIC_BGP=0` (or `false`) to disable this operator for A/B
+testing. `FLUREE_CYCLIC_BGP_MAX_ROWS` can lower or raise the per-predicate row
+cap. The node exposes the old nested-loop plan as a `fallback` child; the
+fallback runs when the runtime mode is unsupported by the fast path.
 
 The edge `rel` distinguishes a real input from an alternative:
 
