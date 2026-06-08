@@ -25,6 +25,7 @@ pub mod context;
 pub(crate) mod count_plan;
 pub(crate) mod count_plan_exec;
 pub(crate) mod count_rows;
+pub(crate) mod cyclic_bgp;
 pub mod datalog_rules;
 pub mod dataset;
 pub mod dataset_operator;
