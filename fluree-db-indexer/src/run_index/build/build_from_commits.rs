@@ -25,7 +25,7 @@ use fluree_db_core::o_type::OType;
 use fluree_db_core::o_type_registry::OTypeRegistry;
 use rustc_hash::{FxHashMap, FxHashSet};
 use std::io;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
 use std::sync::Arc;
@@ -184,6 +184,162 @@ impl SparseClassMembership {
     }
 }
 
+const CLASS_MEMBERSHIP_BUCKETS: usize = 256;
+const CLASS_MEMBERSHIP_ENTRY_BYTES: usize = 18;
+const CLASS_MEMBERSHIP_INDEX_BYTES: usize = 32;
+
+/// Disk-backed subject→class membership used by the import path at large scale.
+///
+/// The in-memory sparse representation is too large for Wikidata-scale imports:
+/// a `HashMap<(graph, subject), Box<[class]>>` grows with every typed subject.
+/// This representation keeps compact sorted bucket indexes mmapped from disk and
+/// binary-searches the relevant bucket for target-class lookups.
+pub struct DiskClassMembership {
+    buckets: Vec<Option<DiskClassMembershipBucket>>,
+    distinct_classes: usize,
+    subjects: usize,
+}
+
+pub struct DiskClassMembershipBucket {
+    index: memmap2::Mmap,
+    data: memmap2::Mmap,
+    entries: usize,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct TypeEntry {
+    g_id: u16,
+    subject: u64,
+    class: u64,
+}
+
+impl Ord for TypeEntry {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        (self.g_id, self.subject, self.class).cmp(&(other.g_id, other.subject, other.class))
+    }
+}
+
+impl PartialOrd for TypeEntry {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+fn class_membership_bucket(g_id: u16, sid: u64) -> usize {
+    let h = sid.wrapping_mul(11_400_714_819_323_198_485).rotate_left(17) ^ (g_id as u64);
+    (h as usize) & (CLASS_MEMBERSHIP_BUCKETS - 1)
+}
+
+fn write_type_entry<W: std::io::Write>(writer: &mut W, entry: TypeEntry) -> io::Result<()> {
+    writer.write_all(&entry.g_id.to_le_bytes())?;
+    writer.write_all(&entry.subject.to_le_bytes())?;
+    writer.write_all(&entry.class.to_le_bytes())?;
+    Ok(())
+}
+
+fn read_type_entries(path: &Path) -> io::Result<Vec<TypeEntry>> {
+    use std::io::Read;
+
+    let mut file = std::fs::File::open(path)?;
+    let len = file.metadata()?.len() as usize;
+    if len % CLASS_MEMBERSHIP_ENTRY_BYTES != 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("class membership bucket has invalid byte length: {len}"),
+        ));
+    }
+
+    let mut bytes = vec![0u8; len];
+    file.read_exact(&mut bytes)?;
+    let mut entries = Vec::with_capacity(len / CLASS_MEMBERSHIP_ENTRY_BYTES);
+    for chunk in bytes.chunks_exact(CLASS_MEMBERSHIP_ENTRY_BYTES) {
+        entries.push(TypeEntry {
+            g_id: u16::from_le_bytes(chunk[0..2].try_into().unwrap()),
+            subject: u64::from_le_bytes(chunk[2..10].try_into().unwrap()),
+            class: u64::from_le_bytes(chunk[10..18].try_into().unwrap()),
+        });
+    }
+    Ok(entries)
+}
+
+fn write_membership_index_entry<W: std::io::Write>(
+    writer: &mut W,
+    g_id: u16,
+    subject: u64,
+    offset: u64,
+    count: u32,
+) -> io::Result<()> {
+    let mut buf = [0u8; CLASS_MEMBERSHIP_INDEX_BYTES];
+    buf[0..2].copy_from_slice(&g_id.to_le_bytes());
+    buf[8..16].copy_from_slice(&subject.to_le_bytes());
+    buf[16..24].copy_from_slice(&offset.to_le_bytes());
+    buf[24..28].copy_from_slice(&count.to_le_bytes());
+    writer.write_all(&buf)
+}
+
+fn membership_index_key(index: &[u8], pos: usize) -> (u16, u64) {
+    let start = pos * CLASS_MEMBERSHIP_INDEX_BYTES;
+    (
+        u16::from_le_bytes(index[start..start + 2].try_into().unwrap()),
+        u64::from_le_bytes(index[start + 8..start + 16].try_into().unwrap()),
+    )
+}
+
+fn mmap_readonly(path: &Path) -> io::Result<memmap2::Mmap> {
+    let file = std::fs::File::open(path)?;
+    // SAFETY: class-membership files are fully written before they are mapped,
+    // then treated as immutable index-build artifacts.
+    unsafe { memmap2::Mmap::map(&file) }
+}
+
+impl DiskClassMembership {
+    fn classes_of(&self, g_id: u16, sid: u64, out: &mut Vec<u64>) {
+        out.clear();
+        let bucket_idx = class_membership_bucket(g_id, sid);
+        let Some(bucket) = self.buckets.get(bucket_idx).and_then(Option::as_ref) else {
+            return;
+        };
+
+        let mut lo = 0usize;
+        let mut hi = bucket.entries;
+        while lo < hi {
+            let mid = (lo + hi) / 2;
+            if membership_index_key(&bucket.index, mid) < (g_id, sid) {
+                lo = mid + 1;
+            } else {
+                hi = mid;
+            }
+        }
+        if lo >= bucket.entries || membership_index_key(&bucket.index, lo) != (g_id, sid) {
+            return;
+        }
+
+        let start = lo * CLASS_MEMBERSHIP_INDEX_BYTES;
+        let offset =
+            u64::from_le_bytes(bucket.index[start + 16..start + 24].try_into().unwrap()) as usize;
+        let count =
+            u32::from_le_bytes(bucket.index[start + 24..start + 28].try_into().unwrap()) as usize;
+        let byte_start = offset * 8;
+        let byte_end = byte_start + count * 8;
+        if byte_end > bucket.data.len() {
+            tracing::warn!(
+                g_id,
+                sid,
+                offset,
+                count,
+                data_bytes = bucket.data.len(),
+                "class membership bucket entry points outside data mmap"
+            );
+            return;
+        }
+
+        out.reserve(count);
+        for chunk in bucket.data[byte_start..byte_end].chunks_exact(8) {
+            out.push(u64::from_le_bytes(chunk.try_into().unwrap()));
+        }
+    }
+}
+
 /// Subject→class membership lookup used to attribute reference *targets* to
 /// their classes when building `class_prop_refs` stats.
 ///
@@ -195,6 +351,7 @@ impl SparseClassMembership {
 pub enum ClassMembership {
     Bitset(ClassBitsetTable),
     Sparse(SparseClassMembership),
+    Disk(DiskClassMembership),
 }
 
 impl ClassMembership {
@@ -213,14 +370,7 @@ impl ClassMembership {
                 }
             }
             Self::Sparse(s) => out.extend_from_slice(s.classes_of(g_id, sid)),
-        }
-    }
-
-    /// Number of distinct classes tracked (across both representations).
-    fn distinct_class_count(&self) -> usize {
-        match self {
-            Self::Bitset(b) => b.bit_to_class.len(),
-            Self::Sparse(s) => s.distinct_classes,
+            Self::Disk(d) => d.classes_of(g_id, sid, out),
         }
     }
 
@@ -240,22 +390,41 @@ impl ClassMembership {
                 ("bitset", b.bit_to_class.len(), subject_slots)
             }
             Self::Sparse(s) => ("sparse", s.distinct_classes, s.membership.len()),
+            Self::Disk(d) => ("disk", d.distinct_classes, d.subjects),
         }
     }
 
     /// Build from per-chunk `.types` sidecars whose IDs are chunk-local and are
     /// remapped to global via each commit's `MmapSubjectRemap`. Import path.
-    fn build_from_commits(commits: &[CommitInput]) -> io::Result<Option<Self>> {
-        use std::io::{BufReader, Read};
+    fn build_from_commits(commits: &[CommitInput], scratch_dir: &Path) -> io::Result<Option<Self>> {
+        use std::io::{BufReader, BufWriter, Read, Write};
 
         let build_start = Instant::now();
         log_index_memory("class_membership:start");
-        let mut builder = ClassMembershipBuilder::new();
         let mut saw_sidecar = false;
         let mut sidecar_files = 0usize;
         let mut type_entries = 0u64;
         let mut sidecar_bytes = 0u64;
+        let mut distinct_classes = FxHashSet::default();
         let mut buf = [0u8; 18];
+
+        if scratch_dir.exists() {
+            std::fs::remove_dir_all(scratch_dir)?;
+        }
+        std::fs::create_dir_all(scratch_dir)?;
+
+        let partition_dir = scratch_dir.join("partitions");
+        let index_dir = scratch_dir.join("index");
+        let data_dir = scratch_dir.join("data");
+        std::fs::create_dir_all(&partition_dir)?;
+        std::fs::create_dir_all(&index_dir)?;
+        std::fs::create_dir_all(&data_dir)?;
+
+        let mut partition_writers = Vec::with_capacity(CLASS_MEMBERSHIP_BUCKETS);
+        for bucket in 0..CLASS_MEMBERSHIP_BUCKETS {
+            let path = partition_dir.join(format!("bucket_{bucket:03}.typ"));
+            partition_writers.push(BufWriter::new(std::fs::File::create(path)?));
+        }
 
         for commit in commits {
             let Some(types_map_path) = &commit.types_map_path else {
@@ -278,14 +447,112 @@ impl ClassMembership {
                 let c_local = u64::from_le_bytes(buf[10..18].try_into().unwrap());
                 let s_global = remap.get(s_local as usize)?;
                 let c_global = remap.get(c_local as usize)?;
-                builder.add(g_id, s_global, c_global);
+                distinct_classes.insert(c_global);
+                let bucket = class_membership_bucket(g_id, s_global);
+                write_type_entry(
+                    &mut partition_writers[bucket],
+                    TypeEntry {
+                        g_id,
+                        subject: s_global,
+                        class: c_global,
+                    },
+                )?;
             }
         }
 
         if !saw_sidecar {
             return Ok(None);
         }
-        let membership = builder.finish();
+        for writer in &mut partition_writers {
+            writer.flush()?;
+        }
+        drop(partition_writers);
+
+        let mut buckets = Vec::with_capacity(CLASS_MEMBERSHIP_BUCKETS);
+        let mut subject_entries = 0usize;
+        let mut non_empty_buckets = 0usize;
+        let bucket_build_start = Instant::now();
+        for bucket in 0..CLASS_MEMBERSHIP_BUCKETS {
+            let partition_path = partition_dir.join(format!("bucket_{bucket:03}.typ"));
+            let partition_bytes = std::fs::metadata(&partition_path)?.len();
+            if partition_bytes == 0 {
+                buckets.push(None);
+                continue;
+            }
+
+            non_empty_buckets += 1;
+            let mut entries = read_type_entries(&partition_path)?;
+            entries.sort_unstable();
+
+            let index_path = index_dir.join(format!("bucket_{bucket:03}.idx"));
+            let data_path = data_dir.join(format!("bucket_{bucket:03}.dat"));
+            let mut index_writer = BufWriter::new(std::fs::File::create(&index_path)?);
+            let mut data_writer = BufWriter::new(std::fs::File::create(&data_path)?);
+
+            let mut i = 0usize;
+            let mut data_offset = 0u64;
+            let mut bucket_subjects = 0usize;
+            while i < entries.len() {
+                let g_id = entries[i].g_id;
+                let subject = entries[i].subject;
+                let start = i;
+                i += 1;
+                while i < entries.len() && entries[i].g_id == g_id && entries[i].subject == subject
+                {
+                    i += 1;
+                }
+
+                let mut last_class = None;
+                let mut count = 0u32;
+                for entry in &entries[start..i] {
+                    if last_class == Some(entry.class) {
+                        continue;
+                    }
+                    data_writer.write_all(&entry.class.to_le_bytes())?;
+                    last_class = Some(entry.class);
+                    count += 1;
+                }
+                if count > 0 {
+                    write_membership_index_entry(
+                        &mut index_writer,
+                        g_id,
+                        subject,
+                        data_offset,
+                        count,
+                    )?;
+                    data_offset += count as u64;
+                    bucket_subjects += 1;
+                }
+            }
+
+            index_writer.flush()?;
+            data_writer.flush()?;
+            subject_entries += bucket_subjects;
+
+            let index_mmap = mmap_readonly(&index_path)?;
+            let data_mmap = mmap_readonly(&data_path)?;
+            let index_entries = index_mmap.len() / CLASS_MEMBERSHIP_INDEX_BYTES;
+            buckets.push(Some(DiskClassMembershipBucket {
+                index: index_mmap,
+                data: data_mmap,
+                entries: index_entries,
+            }));
+
+            let _ = std::fs::remove_file(&partition_path);
+        }
+
+        tracing::info!(
+            buckets = non_empty_buckets,
+            subjects = subject_entries,
+            elapsed_ms = bucket_build_start.elapsed().as_millis(),
+            "disk-backed class membership buckets built"
+        );
+
+        let membership = ClassMembership::Disk(DiskClassMembership {
+            buckets,
+            distinct_classes: distinct_classes.len(),
+            subjects: subject_entries,
+        });
         let (representation, classes, subject_entries) = membership.summary();
         if let Some(mem) = process_memory_snapshot() {
             tracing::info!(
@@ -702,14 +969,16 @@ pub fn build_indexes_from_commits(
     // while letting that membership heap drop before the secondary phases begin.
     let spot_rdf_type_p_id = stats_hook.as_ref().and_then(|hook| hook.rdf_type_p_id());
     let spot_class_membership = if spot_rdf_type_p_id.is_some() {
-        ClassMembership::build_from_commits(commits)?
+        ClassMembership::build_from_commits(commits, &config.run_dir.join("class_membership"))?
     } else {
         None
     };
     if let Some(ref m) = spot_class_membership {
+        let (representation, classes, subject_entries) = m.summary();
         tracing::debug!(
-            classes = m.distinct_class_count(),
-            sparse = matches!(m, ClassMembership::Sparse(_)),
+            representation,
+            classes,
+            subject_entries,
             "class membership built for ref-target stats"
         );
     }
@@ -1279,6 +1548,74 @@ mod tests {
         }
     }
 
+    fn write_identity_subject_remap(path: &std::path::Path, len: u64) {
+        let bytes: Vec<u8> = (0..len).flat_map(u64::to_le_bytes).collect();
+        std::fs::write(path, bytes).unwrap();
+    }
+
+    fn write_identity_string_remap(path: &std::path::Path, len: u32) {
+        let bytes: Vec<u8> = (0..len).flat_map(u32::to_le_bytes).collect();
+        std::fs::write(path, bytes).unwrap();
+    }
+
+    #[test]
+    fn import_class_membership_uses_disk_backing() {
+        let dir = tempfile::tempdir().unwrap();
+        let types0 = dir.path().join("chunk_00000.types");
+        let types1 = dir.path().join("chunk_00001.types");
+        let subj0 = dir.path().join("subjects_00000.rmp");
+        let subj1 = dir.path().join("subjects_00001.rmp");
+        let str0 = dir.path().join("strings_00000.rmp");
+        let str1 = dir.path().join("strings_00001.rmp");
+
+        write_identity_subject_remap(&subj0, 6000);
+        write_identity_subject_remap(&subj1, 6000);
+        write_identity_string_remap(&str0, 1);
+        write_identity_string_remap(&str1, 1);
+
+        // Duplicate classes for subject 42 should dedupe; separate chunks should
+        // merge into the same disk-backed lookup table.
+        write_types_sidecar(&types0, &[(0, 42, 1000), (0, 42, 1000), (0, 42, 2000)]);
+        write_types_sidecar(&types1, &[(0, 77, 3000), (1, 42, 4000)]);
+
+        let commits = vec![
+            CommitInput {
+                commit_path: dir.path().join("unused0.fsv2"),
+                record_count: 0,
+                subject_remap_path: subj0,
+                string_remap_path: str0,
+                lang_remap: vec![],
+                types_map_path: Some(types0),
+            },
+            CommitInput {
+                commit_path: dir.path().join("unused1.fsv2"),
+                record_count: 0,
+                subject_remap_path: subj1,
+                string_remap_path: str1,
+                lang_remap: vec![],
+                types_map_path: Some(types1),
+            },
+        ];
+
+        let membership =
+            ClassMembership::build_from_commits(&commits, &dir.path().join("membership"))
+                .unwrap()
+                .expect("membership");
+        assert!(matches!(membership, ClassMembership::Disk(_)));
+        assert_eq!(membership.summary().1, 4);
+        assert_eq!(membership.summary().2, 3);
+
+        let mut buf = Vec::new();
+        membership.collect_classes(0, 42, &mut buf);
+        assert_eq!(buf, vec![1000, 2000]);
+        membership.collect_classes(0, 77, &mut buf);
+        assert_eq!(buf, vec![3000]);
+        membership.collect_classes(1, 42, &mut buf);
+        assert_eq!(buf, vec![4000]);
+        membership.collect_classes(0, 999, &mut buf);
+        assert!(buf.is_empty());
+    }
+
     #[test]
     fn class_membership_bitset_for_few_classes() {
         let dir = tempfile::tempdir().unwrap();
@@ -1300,7 +1637,7 @@ mod tests {
         let ClassMembership::Bitset(table) = &membership else {
             panic!("expected bitset variant for ≤ 64 classes");
         };
-        assert_eq!(membership.distinct_class_count(), 2);
+        assert_eq!(membership.summary().1, 2);
         assert!(table.bit_to_class.contains(&class_a));
         assert!(table.bit_to_class.contains(&class_b));
 
@@ -1340,7 +1677,7 @@ mod tests {
             matches!(membership, ClassMembership::Sparse(_)),
             "should promote to sparse above 64 classes"
         );
-        assert_eq!(membership.distinct_class_count(), 65);
+        assert_eq!(membership.summary().1, 65);
 
         // Every subject (including the 65th, which the old code truncated) maps
         // to exactly its class.
