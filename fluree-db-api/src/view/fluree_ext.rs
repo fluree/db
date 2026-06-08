@@ -951,9 +951,7 @@ fn populate_dict_novelty_from_view(
         fluree_db_binary_index::dict_novelty_safe::populate_dict_novelty_safe(
             dict_novelty,
             store,
-            novelty
-                .iter_index(IndexType::Spot)
-                .map(|id| novelty.get_flake(id)),
+            novelty.iter_flakes(IndexType::Spot),
         )
         .map_err(|e| ApiError::internal(format!("populate_dict_novelty_safe: {e}")))?;
     }

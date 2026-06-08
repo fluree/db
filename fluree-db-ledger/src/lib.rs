@@ -220,9 +220,7 @@ impl LedgerState {
                 let head_index_id = record.index_head_id.clone();
                 let mut runtime_small_dicts = RuntimeSmallDicts::new();
                 runtime_small_dicts.populate_from_flakes_iter(
-                    novelty_overlay
-                        .iter_index(fluree_db_core::IndexType::Post)
-                        .map(|id| novelty_overlay.get_flake(id)),
+                    novelty_overlay.iter_flakes(fluree_db_core::IndexType::Post),
                 );
                 return Ok(Self {
                     snapshot: Arc::new(snapshot),
@@ -368,9 +366,7 @@ impl LedgerState {
         );
         let mut runtime_small_dicts = RuntimeSmallDicts::new();
         runtime_small_dicts.populate_from_flakes_iter(
-            novelty
-                .iter_index(fluree_db_core::IndexType::Post)
-                .map(|id| novelty.get_flake(id)),
+            novelty.iter_flakes(fluree_db_core::IndexType::Post),
         );
         Self {
             snapshot: Arc::new(snapshot),
@@ -501,18 +497,14 @@ impl LedgerState {
         // so overlay translation can resolve newly-introduced subject/string IDs.
         if !new_novelty.is_empty() {
             new_dict_novelty.populate_from_flakes_iter(
-                new_novelty
-                    .iter_index(fluree_db_core::IndexType::Post)
-                    .map(|id| new_novelty.get_flake(id)),
+                new_novelty.iter_flakes(fluree_db_core::IndexType::Post),
             );
         }
 
         let mut new_runtime_small_dicts = RuntimeSmallDicts::new();
         if !new_novelty.is_empty() {
             new_runtime_small_dicts.populate_from_flakes_iter(
-                new_novelty
-                    .iter_index(fluree_db_core::IndexType::Post)
-                    .map(|id| new_novelty.get_flake(id)),
+                new_novelty.iter_flakes(fluree_db_core::IndexType::Post),
             );
         }
 
@@ -580,18 +572,14 @@ impl LedgerState {
         let has_remaining_novelty = new_novelty.size > 0;
         if has_remaining_novelty {
             new_dict_novelty.populate_from_flakes_iter(
-                new_novelty
-                    .iter_index(fluree_db_core::IndexType::Post)
-                    .map(|id| new_novelty.get_flake(id)),
+                new_novelty.iter_flakes(fluree_db_core::IndexType::Post),
             );
         }
 
         let mut new_runtime_small_dicts = RuntimeSmallDicts::new();
         if has_remaining_novelty {
             new_runtime_small_dicts.populate_from_flakes_iter(
-                new_novelty
-                    .iter_index(fluree_db_core::IndexType::Post)
-                    .map(|id| new_novelty.get_flake(id)),
+                new_novelty.iter_flakes(fluree_db_core::IndexType::Post),
             );
         }
 

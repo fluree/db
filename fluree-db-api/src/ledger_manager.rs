@@ -675,9 +675,7 @@ pub(crate) async fn load_and_attach_binary_store(
         fluree_db_binary_index::dict_novelty_safe::populate_dict_novelty_safe(
             dn,
             Some(&store),
-            novelty
-                .iter_index(fluree_db_core::IndexType::Post)
-                .map(|id| novelty.get_flake(id)),
+            novelty.iter_flakes(fluree_db_core::IndexType::Post),
         )
         .map_err(|e| ApiError::internal(format!("populate_dict_novelty_safe: {e}")))?;
     }
