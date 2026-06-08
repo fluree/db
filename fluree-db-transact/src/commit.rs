@@ -647,27 +647,64 @@ where
         // after a partial move we can no longer call &self methods on `base`.
         let base_ledger_id = base.ledger_id().to_string();
 
-        // 10.1 Populate DictNovelty with subjects/strings from this commit.
-        // Move the Arc out of `base` (instead of Arc::clone) so `make_mut` can
-        // mutate in place when this commit uniquely owns the prior state, and
-        // copy-on-write only when a reader/cache still holds it.
+        // Move the snapshot out of `base` up front so we can DETACH its range
+        // provider *before* mutating the dictionaries below. A `BinaryRangeProvider`
+        // owns `Arc::clone`s of `dict_novelty` / `runtime_small_dicts`; if it stays
+        // attached, the per-commit `Arc::make_mut` on those dicts sees
+        // `strong_count >= 2` and deep-clones the (growing) dictionaries on every
+        // commit once an index has been published — an O(accumulated-novelty)
+        // per-commit cost that returns right after the first reindex. Detaching
+        // first restores unique ownership so `make_mut` mutates in place; the
+        // provider is rebuilt with the updated dicts after mutation.
+        let mut snapshot = base.snapshot;
+
+        // Extract the BinaryIndexStore (needed both to dedup new dict entries
+        // against the persisted tree and to rebuild the provider) before dropping
+        // the provider; fall back to the type-erased `binary_store` on `base`.
+        let had_binary_provider = snapshot
+            .range_provider
+            .as_ref()
+            .is_some_and(|rp| rp.as_any().is::<BinaryRangeProvider>());
+        let store: Option<Arc<BinaryIndexStore>> = snapshot
+            .range_provider
+            .as_ref()
+            .and_then(|rp| rp.as_any().downcast_ref::<BinaryRangeProvider>())
+            .map(|brp| Arc::clone(brp.store()))
+            .or_else(|| {
+                base.binary_store
+                    .as_ref()
+                    .and_then(|te| Arc::clone(&te.0).downcast::<BinaryIndexStore>().ok())
+            });
+
+        // Detach the provider so its Arc clones of the dicts are released before
+        // the `make_mut` calls (rebuilt + reattached after mutation, below).
+        if snapshot.range_provider.is_some() {
+            Arc::make_mut(&mut snapshot).range_provider = None;
+        }
+
+        // Move the dict Arcs out of `base` (not `Arc::clone`) so `make_mut` mutates
+        // in place when this commit uniquely owns them.
         let mut dict_novelty = base.dict_novelty;
+        let mut runtime_small_dicts = base.runtime_small_dicts;
+
+        // Ownership probe: after detaching the provider these should be uniquely
+        // owned (`strong_count == 1`) so the `make_mut` below mutates in place. A
+        // count > 1 means another live holder (e.g. a concurrent reader's snapshot)
+        // still pins the dict and `make_mut` will deep-clone it — the O(novelty)
+        // post-reindex regression. Debug-level + dedicated target so it stays
+        // silent unless `RUST_LOG=fluree::cow_probe=debug` is set.
+        tracing::debug!(
+            target: "fluree::cow_probe",
+            dict_novelty_strong = Arc::strong_count(&dict_novelty),
+            runtime_small_dicts_strong = Arc::strong_count(&runtime_small_dicts),
+            had_binary_provider,
+            "commit_txn dict ownership before make_mut"
+        );
+
+        // 10.1 Populate DictNovelty with subjects/strings from this commit.
         {
             let span = tracing::debug_span!("commit_populate_dict_novelty");
             let _g = span.enter();
-            // Prefer pulling the BinaryIndexStore from the snapshot's range provider
-            // (this is the most reliable attachment point in the commit path).
-            let store = base
-                .snapshot
-                .range_provider
-                .as_ref()
-                .and_then(|rp| rp.as_any().downcast_ref::<BinaryRangeProvider>())
-                .map(|brp| Arc::clone(brp.store()))
-                .or_else(|| {
-                    base.binary_store
-                        .as_ref()
-                        .and_then(|te| Arc::clone(&te.0).downcast::<BinaryIndexStore>().ok())
-                });
             populate_dict_novelty(
                 Arc::make_mut(&mut dict_novelty),
                 store.as_deref(),
@@ -675,46 +712,37 @@ where
             )?;
         }
 
-        let mut runtime_small_dicts = base.runtime_small_dicts;
         Arc::make_mut(&mut runtime_small_dicts).populate_from_flakes(&all_flakes);
 
         let mut new_novelty = base.novelty;
         {
             let span = tracing::debug_span!("commit_apply_to_novelty");
             let _g = span.enter();
-            let mut reverse_graph = base.snapshot.build_reverse_graph()?;
+            let mut reverse_graph = snapshot.build_reverse_graph()?;
             // Ensure txn-meta graph is always routable for commit metadata flakes.
             let txn_meta_iri = fluree_db_core::txn_meta_graph_iri(&base_ledger_id);
-            if let Some(g_sid) = base.snapshot.encode_iri(&txn_meta_iri) {
+            if let Some(g_sid) = snapshot.encode_iri(&txn_meta_iri) {
                 reverse_graph.entry(g_sid).or_insert(TXN_META_GRAPH_ID);
             }
             Arc::make_mut(&mut new_novelty).apply_commit(all_flakes, new_t, &reverse_graph)?;
         }
 
-        // If the snapshot has an attached BinaryRangeProvider, re-attach it with the
-        // updated `dict_novelty` so overlay translation can resolve newly-introduced
-        // subject/string IDs (otherwise the provider holds a stale Arc).
-        let mut snapshot = base.snapshot;
-        // Build the re-attached provider first so the read-borrow of `snapshot`
-        // ends before the `Arc::make_mut` (copy-on-write) assignment below.
-        let new_range_provider: Option<Arc<dyn fluree_db_core::range_provider::RangeProvider>> =
-            snapshot.range_provider.as_ref().and_then(|provider| {
-                provider
-                    .as_any()
-                    .downcast_ref::<BinaryRangeProvider>()
-                    .map(|brp| {
-                        let ns_fallback = Some(snapshot.shared_namespaces());
-                        Arc::new(BinaryRangeProvider::new(
-                            Arc::clone(brp.store()),
-                            Arc::clone(&dict_novelty),
-                            Arc::clone(&runtime_small_dicts),
-                            ns_fallback,
-                        ))
-                            as Arc<dyn fluree_db_core::range_provider::RangeProvider>
-                    })
-            });
-        if let Some(rp) = new_range_provider {
-            Arc::make_mut(&mut snapshot).range_provider = Some(rp);
+        // Rebuild + reattach the provider with the UPDATED dicts so reads through
+        // the returned state resolve newly-introduced subject/string IDs. Only when
+        // a BinaryRangeProvider was attached before — preserves prior behavior that
+        // genesis / no-index states keep `range_provider == None`.
+        if had_binary_provider {
+            if let Some(store) = store {
+                let ns_fallback = Some(snapshot.shared_namespaces());
+                let provider = Arc::new(BinaryRangeProvider::new(
+                    store,
+                    Arc::clone(&dict_novelty),
+                    Arc::clone(&runtime_small_dicts),
+                    ns_fallback,
+                ))
+                    as Arc<dyn fluree_db_core::range_provider::RangeProvider>;
+                Arc::make_mut(&mut snapshot).range_provider = Some(provider);
+            }
         }
 
         let new_state = LedgerState {

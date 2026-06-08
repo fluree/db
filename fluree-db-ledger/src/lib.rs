@@ -692,6 +692,20 @@ impl LedgerState {
         // semantics the previous clone-then-swap provided — without the clone.
         self.novelty.can_apply(&all_flakes, &reverse_graph)?;
 
+        // Ownership probe: if a range provider is still attached it co-holds Arc
+        // clones of these dicts (strong_count >= 2) and the `make_mut` below
+        // deep-clones them every commit — the O(novelty) post-reindex regression.
+        // The caller (LedgerManager commit loop) detaches the provider before this
+        // runs, so the steady-state count should be 1. Debug-level + dedicated
+        // target (`RUST_LOG=fluree::cow_probe=debug`) so it stays silent otherwise.
+        tracing::debug!(
+            target: "fluree::cow_probe",
+            dict_novelty_strong = Arc::strong_count(&self.dict_novelty),
+            runtime_small_dicts_strong = Arc::strong_count(&self.runtime_small_dicts),
+            provider_attached = self.snapshot.range_provider.is_some(),
+            "apply_single_commit dict ownership before make_mut"
+        );
+
         // Extend dict_novelty / small dicts / novelty in place when this state
         // uniquely owns them (Arc::make_mut), copy-on-write only when a reader or
         // cache still holds the prior Arc. Matches the snapshot handling above and
