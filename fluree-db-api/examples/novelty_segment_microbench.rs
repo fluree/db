@@ -12,10 +12,10 @@
 //! must be synchronous, tiered, or just reindex-triggered.
 //!
 //! Read shapes mirror what the query engine issues:
-//!   - `point`  — SPOT range bounding ONE subject (~4 flakes). Result is tiny, so
-//!                latency ≈ fan-out setup (S probes). THE signal.
-//!   - `narrow` — POST range for one predicate+value (~N/48 flakes).
-//!   - `full`   — whole-graph SPOT scan (all flakes): merge throughput.
+//! - `point` — SPOT range bounding ONE subject (~4 flakes). Result is tiny, so
+//!   latency ≈ fan-out setup (S probes). THE signal.
+//! - `narrow` — POST range for one predicate+value (~N/48 flakes).
+//! - `full` — whole-graph SPOT scan (all flakes): merge throughput.
 //!
 //! Same total N across every config; only the segment count varies.
 //!

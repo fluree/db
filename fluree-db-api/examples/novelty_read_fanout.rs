@@ -209,7 +209,7 @@ async fn run() {
     let seg_list: Vec<usize> = env_str("FANOUT_SEGMENTS", "1,10,100,1000,10000,40000")
         .split(',')
         .filter_map(|s| s.trim().parse().ok())
-        .filter(|&s: &usize| s > 0 && txns % s == 0)
+        .filter(|&s: &usize| s > 0 && txns.is_multiple_of(s))
         .collect();
 
     if let Some(parent) = std::path::Path::new(&out_path).parent() {
