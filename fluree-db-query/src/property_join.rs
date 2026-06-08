@@ -59,6 +59,7 @@ const TEMP_OBJECT_VAR: VarId = VarId(u16::MAX - 1);
 
 /// Safety cap for cartesian product row generation. Prevents unbounded memory
 /// allocation when predicates have extreme cardinality (e.g. 100k × 100k).
+#[cfg(test)]
 const MAX_CARTESIAN_ROWS: usize = 10_000_000;
 
 fn make_property_join_scan(
@@ -116,6 +117,10 @@ pub struct PropertyJoinOperator {
     pending_subjects: Vec<SubjectKey>,
     /// Current index into pending_subjects
     subject_idx: usize,
+    /// Subject currently being expanded into cartesian rows across batches.
+    current_subject: Option<SubjectKey>,
+    /// Per-emitted-predicate odometer indices for `current_subject`.
+    current_indices: Vec<usize>,
     /// Optional object bounds for range filter pushdown (VarId -> ObjectBounds)
     object_bounds: HashMap<VarId, ObjectBounds>,
     /// For each predicate index, the position in `subject_values`'s values vec if emitted.
@@ -446,6 +451,8 @@ impl PropertyJoinOperator {
             subject_values: FxHashMap::default(),
             pending_subjects: Vec::new(),
             subject_idx: 0,
+            current_subject: None,
+            current_indices: Vec::new(),
             object_bounds,
             emit_positions,
             emitted_required,
@@ -527,6 +534,7 @@ impl PropertyJoinOperator {
     ///
     /// Takes the collected values for each predicate and produces
     /// all combinations. The subject_binding is cloned into each row.
+    #[cfg(test)]
     fn generate_rows(
         output_schema_len: usize,
         subject_binding: &Binding,
@@ -607,6 +615,61 @@ impl PropertyJoinOperator {
 
         rows
     }
+
+    fn has_cartesian_row(values_per_pred: &[Vec<Binding>], emitted_required: &[bool]) -> bool {
+        values_per_pred.iter().enumerate().all(|(idx, values)| {
+            !values.is_empty() || !emitted_required.get(idx).copied().unwrap_or(true)
+        })
+    }
+
+    fn build_row_at_indices(
+        output_schema_len: usize,
+        subject_binding: &Binding,
+        values_per_pred: &[Vec<Binding>],
+        emitted_required: &[bool],
+        indices: &[usize],
+    ) -> Option<Vec<Binding>> {
+        if !Self::has_cartesian_row(values_per_pred, emitted_required) {
+            return None;
+        }
+
+        let mut row = Vec::with_capacity(output_schema_len);
+        row.push(subject_binding.clone());
+        for (pred_idx, values) in values_per_pred.iter().enumerate() {
+            if values.is_empty() {
+                row.push(Binding::Poisoned);
+            } else {
+                let val_idx = indices.get(pred_idx).copied().unwrap_or(0);
+                row.push(values.get(val_idx)?.clone());
+            }
+        }
+        Some(row)
+    }
+
+    /// Advance cartesian-product odometer; returns false after the last row.
+    fn advance_indices(indices: &mut [usize], values_per_pred: &[Vec<Binding>]) -> bool {
+        if indices.is_empty() {
+            return false;
+        }
+
+        let mut carry = true;
+        for i in (0..indices.len()).rev() {
+            if carry {
+                indices[i] += 1;
+                let width = if values_per_pred[i].is_empty() {
+                    1
+                } else {
+                    values_per_pred[i].len()
+                };
+                if indices[i] >= width {
+                    indices[i] = 0;
+                } else {
+                    carry = false;
+                }
+            }
+        }
+        !carry
+    }
 }
 
 #[async_trait]
@@ -647,6 +710,8 @@ impl Operator for PropertyJoinOperator {
             self.subject_values.clear();
             self.pending_subjects.clear();
             self.subject_idx = 0;
+            self.current_subject = None;
+            self.current_indices.clear();
 
             // For each predicate, scan and collect (subject -> values) mappings.
             // Key by a join-safe subject key (encoded IDs in single-ledger mode).
@@ -991,33 +1056,67 @@ impl Operator for PropertyJoinOperator {
             return Ok(None);
         }
 
-        // Collect rows for multiple subjects up to batch size
+        // Collect rows up to batch size. Per-subject cartesian products are
+        // streamed with `current_indices` so high-fanout subjects do not
+        // allocate their full product before an outer LIMIT can stop pulling.
         let batch_size = ctx.batch_size;
         let mut all_rows: Vec<Vec<Binding>> = Vec::new();
-
         let schema_len = self.output_schema.len();
 
-        while all_rows.len() < batch_size && self.subject_idx < self.pending_subjects.len() {
-            let subject_key = &self.pending_subjects[self.subject_idx];
-            self.subject_idx += 1;
-
-            if let Some((subject_binding, values_per_pred)) = self.subject_values.get(subject_key) {
-                let rows = Self::generate_rows(
-                    schema_len,
-                    subject_binding,
-                    values_per_pred,
-                    &self.emitted_required,
-                );
-                for mut row in rows {
-                    if !apply_inline(&self.inline_ops, &self.output_schema, &mut row, Some(ctx))? {
+        while all_rows.len() < batch_size {
+            if self.current_subject.is_none() {
+                let mut found = false;
+                while self.subject_idx < self.pending_subjects.len() {
+                    let subject_key = self.pending_subjects[self.subject_idx].clone();
+                    self.subject_idx += 1;
+                    let Some((_subject_binding, values_per_pred)) =
+                        self.subject_values.get(&subject_key)
+                    else {
+                        continue;
+                    };
+                    if !Self::has_cartesian_row(values_per_pred, &self.emitted_required) {
                         continue;
                     }
-                    all_rows.push(row);
-                    if all_rows.len() >= batch_size {
-                        break;
-                    }
+                    self.current_indices = vec![0; values_per_pred.len()];
+                    self.current_subject = Some(subject_key);
+                    found = true;
+                    break;
+                }
+                if !found {
+                    break;
                 }
             }
+
+            let Some(subject_key) = self.current_subject.as_ref() else {
+                continue;
+            };
+            let Some((subject_binding, values_per_pred)) = self.subject_values.get(subject_key)
+            else {
+                self.current_subject = None;
+                self.current_indices.clear();
+                continue;
+            };
+
+            let row = Self::build_row_at_indices(
+                schema_len,
+                subject_binding,
+                values_per_pred,
+                &self.emitted_required,
+                &self.current_indices,
+            );
+            let has_next = Self::advance_indices(&mut self.current_indices, values_per_pred);
+            if !has_next {
+                self.current_subject = None;
+                self.current_indices.clear();
+            }
+
+            let Some(mut row) = row else {
+                continue;
+            };
+            if !apply_inline(&self.inline_ops, &self.output_schema, &mut row, Some(ctx))? {
+                continue;
+            }
+            all_rows.push(row);
         }
 
         if all_rows.is_empty() {
@@ -1043,6 +1142,8 @@ impl Operator for PropertyJoinOperator {
         self.subject_values.clear();
         self.pending_subjects.clear();
         self.subject_idx = 0;
+        self.current_subject = None;
+        self.current_indices.clear();
     }
 
     fn estimated_rows(&self) -> Option<usize> {
@@ -1194,6 +1295,40 @@ mod tests {
         );
         // Cartesian product: 2 * 3 = 6 rows
         assert_eq!(rows.len(), 6);
+    }
+
+    #[test]
+    fn test_streaming_cartesian_odometer() {
+        let subject_binding = Binding::sid(Sid::new(1, "alice"));
+        let values = vec![
+            vec![
+                Binding::sid(Sid::new(200, "Alice")),
+                Binding::sid(Sid::new(201, "Alicia")),
+            ],
+            vec![
+                Binding::sid(Sid::new(300, "30")),
+                Binding::sid(Sid::new(301, "31")),
+                Binding::sid(Sid::new(302, "32")),
+            ],
+        ];
+        let mut indices = vec![0; values.len()];
+        let mut rows = 0;
+        loop {
+            let row = PropertyJoinOperator::build_row_at_indices(
+                3,
+                &subject_binding,
+                &values,
+                &[true, true],
+                &indices,
+            )
+            .expect("indices should produce a row");
+            assert_eq!(row.len(), 3);
+            rows += 1;
+            if !PropertyJoinOperator::advance_indices(&mut indices, &values) {
+                break;
+            }
+        }
+        assert_eq!(rows, 6);
     }
 
     #[test]

@@ -1042,7 +1042,7 @@ fn print_resolved_config(config: &ServerConfig, dirs: &FlureeDir) {
         config
             .cache_max_mb
             .map(|v| v.to_string())
-            .unwrap_or_else(|| "(default: 30/40/50% of RAM, tiered)".into())
+            .unwrap_or_else(|| "(default: tiered by RAM: <4GB 30%, 4-8GB 40%, >=8GB 35%)".into())
     );
     eprintln!("  server_role:  {:?}", config.server_role);
     eprintln!("  pid_file:     {}", pid_path(dirs.data_dir()).display());
