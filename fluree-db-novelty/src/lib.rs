@@ -658,14 +658,18 @@ impl Novelty {
         })
     }
 
-    /// Tiered structural compaction (size-leveled): repeatedly merge the lowest
-    /// size class that holds at least `tier_width` segments into one larger
-    /// segment, cascading upward, **preserving every flake** (no dedup, no
-    /// tombstone collapse — stats-safe and observationally transparent, like
-    /// [`Self::compact_all`]). Bounds read fan-out to ~`tier_width ×
-    /// number_of_size_classes` (≈ `tier_width · log_tier_width(N)`) while each
-    /// merge touches only one class's flakes — no full-novelty rewrite, so no
-    /// growing cliff. `epoch` bumps if anything merged. Returns the merge count.
+    /// Tiered structural compaction (size-leveled): one **bounded** cascade pass —
+    /// merge `tier_width` segments of the lowest full size class into one (class+1)
+    /// and continue strictly upward, each class processed at most once per call.
+    /// **Preserves every flake** (no dedup, no tombstone collapse — stats-safe and
+    /// observationally transparent, like [`Self::compact_all`]). Per-call work is
+    /// bounded to one cascade chain (`<= classes` merges of `tier_width`
+    /// segments), so even the first read after a long insert-only burst can't
+    /// stall on a huge backlog. In steady state (compaction keeps pace with
+    /// commits) this converges immediately; a large pre-existing backlog drains
+    /// across subsequent calls. Bounds read fan-out to ~`tier_width ·
+    /// log_tier_width(N)`. `epoch` bumps if anything merged. Returns the merge
+    /// count.
     pub fn tier_compact(&mut self, tier_width: usize) -> usize {
         if tier_width < 2 {
             return 0;
@@ -681,19 +685,27 @@ impl Novelty {
         merges
     }
 
-    /// Cascade-merge full size classes for one graph. Each pass merges the lowest
-    /// class with `>= tier_width` segments into a single (higher-class) segment.
+    /// One bounded cascade pass for a graph. Starting at the lowest full size
+    /// class, merge **exactly `tier_width`** of its segments into one (yielding
+    /// class+1), then move strictly upward — each class is processed at most once
+    /// per call. This bounds per-merge AND per-call work to one cascade chain
+    /// (`<= number_of_classes` merges of `tier_width` segments), so even the first
+    /// read after a long insert-only burst can't stall on a huge class-0 backlog;
+    /// any remaining backlog drains on subsequent reads.
     fn tier_compact_graph(&mut self, g: usize, tier_width: usize) -> usize {
         let mut merges = 0;
+        let mut min_class = 0u32;
         while let Some(Some(segs)) = self.graphs.get_mut(g) {
             if segs.len() < tier_width {
                 break;
             }
+            // Lowest still-unprocessed class that holds a full group.
             let mut counts: HashMap<u32, usize> = HashMap::new();
             for seg in segs.iter() {
-                *counts
-                    .entry(size_class(seg.flakes.len(), tier_width))
-                    .or_default() += 1;
+                let class = size_class(seg.flakes.len(), tier_width);
+                if class >= min_class {
+                    *counts.entry(class).or_default() += 1;
+                }
             }
             let Some(target_class) = counts
                 .iter()
@@ -704,16 +716,23 @@ impl Novelty {
                 break;
             };
 
-            // Merge every segment in the target class into one; keep the rest.
+            // Merge exactly `tier_width` segments of the target class (the first
+            // ones in vec order); keep the rest (including any surplus of this
+            // class, which drains on a later call). `tier_width` class-K segments
+            // sum to class K+1 exactly.
             let taken = std::mem::take(segs);
             let mut keep: Vec<Arc<Segment>> = Vec::new();
             let mut flakes: Vec<Flake> = Vec::new();
+            let mut merged = 0usize;
             for seg in taken {
-                if size_class(seg.flakes.len(), tier_width) == target_class {
+                if merged < tier_width
+                    && size_class(seg.flakes.len(), tier_width) == target_class
+                {
                     match Arc::try_unwrap(seg) {
                         Ok(s) => flakes.extend(s.flakes),
                         Err(shared) => flakes.extend(shared.flakes.iter().cloned()),
                     }
+                    merged += 1;
                 } else {
                     keep.push(seg);
                 }
@@ -721,6 +740,8 @@ impl Novelty {
             keep.push(Arc::new(Segment::build(flakes, true)));
             *segs = keep;
             merges += 1;
+            // Move up so the lowest class is touched at most once per call.
+            min_class = target_class + 1;
         }
         merges
     }
@@ -2165,6 +2186,48 @@ mod tests {
             k < commits as usize,
             "tiering must reduce segment count well below commit count"
         );
+    }
+
+    /// A single `tier_compact` call does BOUNDED work even on a large backlog (the
+    /// write-burst-then-first-read case): it merges one cascade chain, not the
+    /// whole backlog, so the first read can't stall. Repeated calls converge, and
+    /// no flake is lost.
+    #[test]
+    fn tier_compact_bounds_per_call_work_on_backlog() {
+        let mut n = Novelty::new(0);
+        let rg = no_graphs();
+        let t = 4;
+        // Insert-only burst: accumulate a backlog with NO compaction.
+        for i in 0..100u16 {
+            n.apply_commit(
+                vec![make_flake(i, 1, i64::from(i), i64::from(i) + 1, true)],
+                i64::from(i) + 1,
+                &rg,
+            )
+            .unwrap();
+        }
+        assert_eq!(n.max_segment_count(), 100, "no compaction during the burst");
+
+        // First read's compaction is bounded — one cascade chain, not 100/t merges.
+        let first = n.tier_compact(t);
+        assert!((1..=8).contains(&first), "first call must be bounded; got {first}");
+        assert!(
+            n.max_segment_count() > t,
+            "one bounded call must not fully drain a 100-segment backlog"
+        );
+
+        // Repeated calls converge to a bounded K, losing nothing.
+        let mut guard = 0;
+        while n.tier_compact(t) > 0 {
+            guard += 1;
+            assert!(guard < 1000, "tier_compact must converge");
+        }
+        assert!(
+            n.max_segment_count() <= t * 4,
+            "converges to ~logarithmic K; got {}",
+            n.max_segment_count()
+        );
+        assert_eq!(n.len(), 100, "tiering must not lose flakes");
     }
 
     /// Tiered compaction is observationally transparent: identical reads across
