@@ -363,6 +363,69 @@ impl<'a> Iterator for GraphMergeIter<'a> {
     }
 }
 
+/// A novelty range read yielding `&Flake` with NO `FlakeId` packing.
+///
+/// `Single` is the K=1 fast path: one segment, so iterate its range slice
+/// directly — no heap, no id math, matching the pre-segmentation single-vector
+/// read speed. `Merge` is the K>1 k-way merge. Backs [`Novelty::iter_flakes`] and
+/// `for_each_overlay_flake` (the hot read paths).
+enum FlakeRead<'a> {
+    Done,
+    Single {
+        order: std::slice::Iter<'a, u32>,
+        flakes: &'a [Flake],
+    },
+    Merge(GraphMergeIter<'a>),
+}
+
+impl<'a> Iterator for FlakeRead<'a> {
+    type Item = &'a Flake;
+
+    fn next(&mut self) -> Option<&'a Flake> {
+        match self {
+            FlakeRead::Done => None,
+            // Slice iterator (pointer-bump, no bounds check) keeps the K=1 full
+            // scan close to the old single-vector speed.
+            FlakeRead::Single { order, flakes } => {
+                order.next().map(|&local| &flakes[local as usize])
+            }
+            FlakeRead::Merge(it) => it.next().map(|(_, f)| f),
+        }
+    }
+}
+
+/// A novelty range read yielding packed [`FlakeId`]s, for the compat id callers
+/// (`slice_for_range`, `iter_index`). `Single` is the K=1 fast path (no heap);
+/// it still packs ids because the caller asked for ids. `Merge` is the K>1
+/// k-way merge.
+enum IdRead<'a> {
+    Done,
+    Single {
+        g_id: GraphId,
+        seg_idx: usize,
+        order: std::slice::Iter<'a, u32>,
+    },
+    Merge(GraphMergeIter<'a>),
+}
+
+impl Iterator for IdRead<'_> {
+    type Item = FlakeId;
+
+    fn next(&mut self) -> Option<FlakeId> {
+        match self {
+            IdRead::Done => None,
+            IdRead::Single {
+                g_id,
+                seg_idx,
+                order,
+            } => order
+                .next()
+                .map(|&local| FlakeId::pack(*g_id, *seg_idx, local)),
+            IdRead::Merge(it) => it.next().map(|(id, _)| id),
+        }
+    }
+}
+
 /// Novelty overlay - in-memory storage for uncommitted transactions
 ///
 /// Append-only, segmented: each graph holds a `Vec` of immutable `Arc<Segment>`,
@@ -883,21 +946,78 @@ impl Novelty {
         }
     }
 
-    /// Merge across ALL graphs (g_id-ascending), each graph internally
-    /// comparator-ordered. Backs the full-scan stats/dict consumers.
-    fn iter_all(&self, index: IndexType) -> impl Iterator<Item = (FlakeId, &Flake)> + '_ {
-        let present: Vec<GraphId> = (0..self.graphs.len())
+    /// Graph ids (ascending) that currently hold at least one non-empty segment.
+    fn present_graphs(&self) -> Vec<GraphId> {
+        (0..self.graphs.len())
             .filter(|&g| self.graphs[g].as_ref().is_some_and(|s| !s.is_empty()))
             .map(|g| g as GraphId)
-            .collect();
-        present
-            .into_iter()
-            .flat_map(move |g| self.graph_merge(g, index, None, None, true))
+            .collect()
     }
 
-    /// Get the ordered flake IDs for a graph's leaf range, k-way merged across
-    /// segments. Returns an owned `Vec` — there is no single backing slice once
-    /// novelty is segmented; callers only `.iter()` it.
+    /// Range read over one graph yielding `&Flake`. K=1 takes the no-heap,
+    /// no-id-packing fast path (direct segment iteration ≈ old single-vector
+    /// speed); K>1 uses the k-way merge.
+    fn read_flakes(
+        &self,
+        g_id: GraphId,
+        index: IndexType,
+        first: Option<&Flake>,
+        rhs: Option<&Flake>,
+        leftmost: bool,
+    ) -> FlakeRead<'_> {
+        match self.graphs.get(g_id as usize).and_then(Option::as_ref) {
+            Some(segs) if segs.len() == 1 => {
+                let seg = &segs[0];
+                if seg.may_overlap(index, first, rhs, leftmost) {
+                    FlakeRead::Single {
+                        order: seg.range(index, first, rhs, leftmost).iter(),
+                        flakes: &seg.flakes,
+                    }
+                } else {
+                    FlakeRead::Done
+                }
+            }
+            Some(segs) if !segs.is_empty() => {
+                FlakeRead::Merge(self.graph_merge(g_id, index, first, rhs, leftmost))
+            }
+            _ => FlakeRead::Done,
+        }
+    }
+
+    /// Range read over one graph yielding packed [`FlakeId`]s (compat id path).
+    /// K=1 takes the no-heap fast path; K>1 uses the k-way merge.
+    fn read_ids(
+        &self,
+        g_id: GraphId,
+        index: IndexType,
+        first: Option<&Flake>,
+        rhs: Option<&Flake>,
+        leftmost: bool,
+    ) -> IdRead<'_> {
+        match self.graphs.get(g_id as usize).and_then(Option::as_ref) {
+            Some(segs) if segs.len() == 1 => {
+                let seg = &segs[0];
+                if seg.may_overlap(index, first, rhs, leftmost) {
+                    IdRead::Single {
+                        g_id,
+                        seg_idx: 0,
+                        order: seg.range(index, first, rhs, leftmost).iter(),
+                    }
+                } else {
+                    IdRead::Done
+                }
+            }
+            Some(segs) if !segs.is_empty() => {
+                IdRead::Merge(self.graph_merge(g_id, index, first, rhs, leftmost))
+            }
+            _ => IdRead::Done,
+        }
+    }
+
+    /// Get the ordered flake IDs for a graph's leaf range. Returns an owned `Vec`
+    /// — there is no single backing slice once novelty is segmented; callers only
+    /// `.iter()` it. Prefer [`Self::iter_flakes`] / `for_each_overlay_flake` for
+    /// new code so no ids are materialized.
     ///
     /// Semantics:
     /// - If leftmost=false: left boundary is EXCLUSIVE (> first)
@@ -911,9 +1031,7 @@ impl Novelty {
         rhs: Option<&Flake>,
         leftmost: bool,
     ) -> Vec<FlakeId> {
-        self.graph_merge(g_id, index, first, rhs, leftmost)
-            .map(|(id, _)| id)
-            .collect()
+        self.read_ids(g_id, index, first, rhs, leftmost).collect()
     }
 
     /// Resolve a [`FlakeId`] produced by this novelty back to its flake.
@@ -935,17 +1053,21 @@ impl Novelty {
     }
 
     /// Iterate all flake IDs for `index` across ALL graphs, comparator-ordered
-    /// per graph. IDs are read-scoped — resolve via [`Self::get_flake`] before
-    /// the next mutation. Prefer [`Self::iter_flakes`] for new code.
+    /// per graph. IDs are read-scoped — resolve via [`Self::get_flake`] before the
+    /// next mutation. Prefer [`Self::iter_flakes`] for new code (no id packing).
     pub fn iter_index(&self, index: IndexType) -> impl Iterator<Item = FlakeId> + '_ {
-        self.iter_all(index).map(|(id, _)| id)
+        self.present_graphs()
+            .into_iter()
+            .flat_map(move |g| self.read_ids(g, index, None, None, true))
     }
 
     /// Iterate all flakes for `index` across ALL graphs, comparator-ordered per
-    /// graph. Used by stats collection which needs the full picture regardless of
-    /// graph.
+    /// graph. The hot full-scan path (stats, dict rebuilds): K=1 graphs iterate
+    /// their segment directly with no heap and no id packing.
     pub fn iter_flakes(&self, index: IndexType) -> impl Iterator<Item = &Flake> + '_ {
-        self.iter_all(index).map(|(_, f)| f)
+        self.present_graphs()
+            .into_iter()
+            .flat_map(move |g| self.read_flakes(g, index, None, None, true))
     }
 }
 
@@ -989,11 +1111,30 @@ impl OverlayProvider for Novelty {
         to_t: i64,
         callback: &mut dyn FnMut(&Flake),
     ) {
-        // Zero-copy: drive the k-way merge directly, applying the to_t filter.
-        for (_, flake) in self.graph_merge(g_id, index, first, rhs, leftmost) {
-            if flake.t <= to_t {
-                callback(flake);
+        // K=1 (the common steady state) takes a raw slice loop — no iterator/
+        // enum dispatch per flake — recovering the old single-vector read speed
+        // on this query hot path. K>1 k-way merges. Applies the to_t filter.
+        match self.graphs.get(g_id as usize).and_then(Option::as_ref) {
+            Some(segs) if segs.len() == 1 => {
+                let seg = &segs[0];
+                if seg.may_overlap(index, first, rhs, leftmost) {
+                    let flakes = &seg.flakes;
+                    for &local in seg.range(index, first, rhs, leftmost) {
+                        let flake = &flakes[local as usize];
+                        if flake.t <= to_t {
+                            callback(flake);
+                        }
+                    }
+                }
             }
+            Some(segs) if !segs.is_empty() => {
+                for (_, flake) in self.graph_merge(g_id, index, first, rhs, leftmost) {
+                    if flake.t <= to_t {
+                        callback(flake);
+                    }
+                }
+            }
+            _ => {}
         }
     }
 }
