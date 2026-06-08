@@ -242,6 +242,44 @@ impl Segment {
         }
         &ids[start..end]
     }
+
+    /// Zone-map prune: can this segment's `index` order possibly contribute to
+    /// the range `(first, rhs]` (left-exclusive unless `leftmost`)? Compares only
+    /// the segment's min/max key for that order (`ids[0]` / `ids[last]`), so it's
+    /// 0–2 comparisons — far cheaper than the two `partition_point` searches in
+    /// [`Self::range`]. Lets the k-way merge skip non-overlapping segments
+    /// entirely, which collapses point/narrow fan-out when segments are mostly
+    /// disjoint by key (does nothing for full scans or heavily overlapping
+    /// ranges — there is no segment to skip).
+    fn may_overlap(
+        &self,
+        index: IndexType,
+        first: Option<&Flake>,
+        rhs: Option<&Flake>,
+        leftmost: bool,
+    ) -> bool {
+        let ids = self.order(index);
+        let (Some(&lo), Some(&hi)) = (ids.first(), ids.last()) else {
+            return false;
+        };
+        let seg_min = &self.flakes[lo as usize];
+        let seg_max = &self.flakes[hi as usize];
+        // Entirely above the inclusive upper bound?
+        if let Some(r) = rhs {
+            if index.compare(seg_min, r) == Ordering::Greater {
+                return false;
+            }
+        }
+        // Entirely at/below the exclusive lower bound?
+        if !leftmost {
+            if let Some(f) = first {
+                if index.compare(seg_max, f) != Ordering::Greater {
+                    return false;
+                }
+            }
+        }
+        true
+    }
 }
 
 /// One segment's cursor within a [`GraphMergeIter`]: a sub-range of that
@@ -813,6 +851,11 @@ impl Novelty {
         let mut heap: BinaryHeap<MergeHead<'_>> = BinaryHeap::new();
         if let Some(Some(segs)) = self.graphs.get(g_id as usize) {
             for (seg_idx, seg) in segs.iter().enumerate() {
+                // Zone-map prune: skip segments whose key range can't intersect
+                // (first, rhs] without paying for the binary search.
+                if !seg.may_overlap(index, first, rhs, leftmost) {
+                    continue;
+                }
                 let order = seg.range(index, first, rhs, leftmost);
                 if order.is_empty() {
                     continue;
