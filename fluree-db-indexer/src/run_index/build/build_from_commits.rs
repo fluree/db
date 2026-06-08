@@ -242,7 +242,7 @@ fn read_type_entries(path: &Path) -> io::Result<Vec<TypeEntry>> {
 
     let mut file = std::fs::File::open(path)?;
     let len = file.metadata()?.len() as usize;
-    if len % CLASS_MEMBERSHIP_ENTRY_BYTES != 0 {
+    if !len.is_multiple_of(CLASS_MEMBERSHIP_ENTRY_BYTES) {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             format!("class membership bucket has invalid byte length: {len}"),
@@ -303,7 +303,7 @@ impl DiskClassMembership {
         let mut lo = 0usize;
         let mut hi = bucket.entries;
         while lo < hi {
-            let mid = (lo + hi) / 2;
+            let mid = usize::midpoint(lo, hi);
             if membership_index_key(&bucket.index, mid) < (g_id, sid) {
                 lo = mid + 1;
             } else {
