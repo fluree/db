@@ -20,7 +20,7 @@
 //! - Manager lock is released during I/O (no blocking other ledgers)
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -131,6 +131,14 @@ struct LedgerHandleInner {
     /// Always coherent with `state.snapshot.range_provider` — writers hold
     /// the `state` lock while updating this.
     binary_store: RwLock<Option<Arc<BinaryIndexStore>>>,
+    /// Read-side novelty compaction trigger: if any graph exceeds this many
+    /// segments when a query snapshot is taken, novelty is compacted first so
+    /// the read avoids segment fan-out. `0` disables it. Policy: query nodes and
+    /// long-lived servers keep the default; an insert-only transactor (which
+    /// never takes a query snapshot anyway) is unaffected, and a read-heavy
+    /// transactor that wants to opt out can set `0`. Never fires on the commit
+    /// path (commits use `LedgerWriteGuard`, not `snapshot`).
+    compaction_threshold: AtomicUsize,
 }
 
 impl LedgerHandle {
@@ -146,7 +154,58 @@ impl LedgerHandle {
                 ledger_id,
                 last_access: AtomicU64::new(monotonic_secs()),
                 binary_store: RwLock::new(binary_store),
+                compaction_threshold: AtomicUsize::new(
+                    fluree_db_novelty::DEFAULT_COMPACTION_THRESHOLD,
+                ),
             }),
+        }
+    }
+
+    /// Set the read-side novelty compaction threshold (`0` disables). Policy hook:
+    /// long-lived servers / query nodes keep the default; an insert-only or
+    /// latency-sensitive transactor can disable read-triggered compaction.
+    pub fn set_compaction_threshold(&self, threshold: usize) {
+        self.inner
+            .compaction_threshold
+            .store(threshold, Ordering::Relaxed);
+    }
+
+    /// Read-side compaction trigger. If novelty has fragmented past the threshold
+    /// in any graph, consolidate it (under the write lock) before serving the
+    /// query, so this and subsequent reads avoid segment fan-out. Idempotent and
+    /// amortized over the request. Common case (`K <= threshold`) only pays a
+    /// brief shared read-lock check. Never invoked on the insert-only write path.
+    async fn compact_if_needed(&self) {
+        let threshold = self.inner.compaction_threshold.load(Ordering::Relaxed);
+        if threshold == 0 {
+            return;
+        }
+        // Cheap shared-lock check first; escalate to the write lock only when
+        // there is real work, so the steady state never serializes queries.
+        let needs = {
+            self.inner
+                .state
+                .read()
+                .await
+                .novelty
+                .needs_compaction(threshold)
+        };
+        if !needs {
+            return;
+        }
+        let mut state = self.inner.state.write().await;
+        // Re-check: another query may have compacted between the locks.
+        if state.novelty.needs_compaction(threshold) {
+            let pre = state.novelty.max_segment_count();
+            let started = Instant::now();
+            let graphs = Arc::make_mut(&mut state.novelty).compact_over(threshold);
+            tracing::debug!(
+                graphs_compacted = graphs,
+                pre_max_segments = pre,
+                threshold,
+                elapsed_ms = started.elapsed().as_millis() as u64,
+                "novelty read-triggered compaction"
+            );
         }
     }
 
@@ -164,6 +223,8 @@ impl LedgerHandle {
     /// The snapshot is a cheap clone; the lock is released immediately after.
     pub async fn snapshot(&self) -> LedgerView {
         self.touch();
+        // Read-side compaction trigger (policy: query/maintenance path only).
+        self.compact_if_needed().await;
         let state = self.inner.state.read().await;
         let binary_store = self.inner.binary_store.read().await.clone();
         let mut snap = LedgerView::from_state(&state);
@@ -1778,6 +1839,101 @@ mod tests {
         assert_eq!(NotifyResult::NotLoaded, NotifyResult::NotLoaded);
         assert_eq!(NotifyResult::Current, NotifyResult::Current);
         assert_eq!(NotifyResult::Reloaded, NotifyResult::Reloaded);
+    }
+
+    /// The read-side compaction trigger: when a long-lived handle accumulates
+    /// segments past the threshold (one per incremental commit), taking a query
+    /// `snapshot()` consolidates novelty first, keeping segment count bounded —
+    /// without losing any flake. Commit-only activity (no snapshot) would let it
+    /// grow unbounded; the trigger lives only on the read/snapshot path.
+    #[tokio::test]
+    async fn snapshot_triggers_compaction_at_threshold() {
+        use fluree_db_core::{Flake, FlakeValue, LedgerSnapshot, Sid};
+        use fluree_db_ledger::LedgerState;
+        use fluree_db_novelty::Novelty;
+
+        fn mk(s: u16, t: i64) -> Flake {
+            Flake::new(
+                Sid::new(s, format!("s{s}")),
+                Sid::new(1, "p"),
+                FlakeValue::Long(i64::from(s)),
+                Sid::new(2, "long"),
+                t,
+                true,
+                None,
+            )
+        }
+
+        let state = LedgerState::new(LedgerSnapshot::genesis("test/compact:main"), Novelty::new(0));
+        let handle = LedgerHandle::new("test/compact:main".to_string(), state, None);
+        handle.set_compaction_threshold(8);
+        let rg = std::collections::HashMap::new();
+
+        for i in 0..20u16 {
+            {
+                let mut g = handle.lock_for_write().await;
+                Arc::make_mut(&mut g.state_mut().novelty)
+                    .apply_commit(vec![mk(i + 1, i64::from(i) + 1)], i64::from(i) + 1, &rg)
+                    .expect("apply_commit");
+            }
+            // Query path: snapshot() runs compact_if_needed before serving.
+            let _view = handle.snapshot().await;
+            let k = handle
+                .lock_for_write()
+                .await
+                .state()
+                .novelty
+                .max_segment_count();
+            assert!(k <= 8, "snapshot must keep K <= threshold; got {k} after commit {i}");
+        }
+
+        let g = handle.lock_for_write().await;
+        assert_eq!(g.state().novelty.len(), 20, "compaction must not lose flakes");
+        assert!(g.state().novelty.max_segment_count() <= 8);
+    }
+
+    /// Threshold 0 disables the read-side trigger (e.g. a latency-sensitive
+    /// transactor opting out): segments accumulate unbounded across snapshots.
+    #[tokio::test]
+    async fn snapshot_compaction_disabled_when_threshold_zero() {
+        use fluree_db_core::{Flake, FlakeValue, LedgerSnapshot, Sid};
+        use fluree_db_ledger::LedgerState;
+        use fluree_db_novelty::Novelty;
+
+        let state =
+            LedgerState::new(LedgerSnapshot::genesis("test/nocompact:main"), Novelty::new(0));
+        let handle = LedgerHandle::new("test/nocompact:main".to_string(), state, None);
+        handle.set_compaction_threshold(0);
+        let rg = std::collections::HashMap::new();
+
+        for i in 0..12u16 {
+            {
+                let mut g = handle.lock_for_write().await;
+                Arc::make_mut(&mut g.state_mut().novelty)
+                    .apply_commit(
+                        vec![Flake::new(
+                            Sid::new(i + 1, format!("s{i}")),
+                            Sid::new(1, "p"),
+                            FlakeValue::Long(i64::from(i)),
+                            Sid::new(2, "long"),
+                            i64::from(i) + 1,
+                            true,
+                            None,
+                        )],
+                        i64::from(i) + 1,
+                        &rg,
+                    )
+                    .expect("apply_commit");
+            }
+            let _ = handle.snapshot().await;
+        }
+        let k = handle
+            .lock_for_write()
+            .await
+            .state()
+            .novelty
+            .max_segment_count();
+        assert_eq!(k, 12, "threshold 0 must disable read-triggered compaction");
     }
 
     // ========================================================================
