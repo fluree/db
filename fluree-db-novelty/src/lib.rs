@@ -138,6 +138,11 @@ pub const MAX_SEGMENTS: usize = FlakeId::SEG_MASK as usize + 1;
 /// only. Tuned later from compaction-cost benchmarks.
 pub const DEFAULT_COMPACTION_THRESHOLD: usize = 128;
 
+/// Default tier width for [`Novelty::tier_compact`]: merge a size class once it
+/// holds this many segments. Bounds read fan-out to ~`tier_width · log` of the
+/// novelty size with only bounded per-merge work (no full-novelty rewrite).
+pub const DEFAULT_TIER_WIDTH: usize = 16;
+
 /// An immutable, append-only batch of novelty flakes for one graph.
 ///
 /// Owns its flakes and four locally-sorted index orders (vectors of local
@@ -632,6 +637,92 @@ impl Novelty {
             flakes
         };
         self.set_graph_segments(g as GraphId, flakes, true);
+    }
+
+    /// Whether any graph holds at least `tier_width` segments in one size class —
+    /// i.e. [`Self::tier_compact`] would do work. Cheap read-path policy hook.
+    pub fn needs_tier_compaction(&self, tier_width: usize) -> bool {
+        if tier_width < 2 {
+            return false;
+        }
+        self.graphs.iter().flatten().any(|segs| {
+            segs.len() >= tier_width && {
+                let mut counts: HashMap<u32, usize> = HashMap::new();
+                for seg in segs {
+                    *counts
+                        .entry(size_class(seg.flakes.len(), tier_width))
+                        .or_default() += 1;
+                }
+                counts.values().any(|&c| c >= tier_width)
+            }
+        })
+    }
+
+    /// Tiered structural compaction (size-leveled): repeatedly merge the lowest
+    /// size class that holds at least `tier_width` segments into one larger
+    /// segment, cascading upward, **preserving every flake** (no dedup, no
+    /// tombstone collapse — stats-safe and observationally transparent, like
+    /// [`Self::compact_all`]). Bounds read fan-out to ~`tier_width ×
+    /// number_of_size_classes` (≈ `tier_width · log_tier_width(N)`) while each
+    /// merge touches only one class's flakes — no full-novelty rewrite, so no
+    /// growing cliff. `epoch` bumps if anything merged. Returns the merge count.
+    pub fn tier_compact(&mut self, tier_width: usize) -> usize {
+        if tier_width < 2 {
+            return 0;
+        }
+        let mut merges = 0;
+        for g in 0..self.graphs.len() {
+            merges += self.tier_compact_graph(g, tier_width);
+        }
+        if merges > 0 {
+            self.recompute_totals();
+            self.epoch += 1;
+        }
+        merges
+    }
+
+    /// Cascade-merge full size classes for one graph. Each pass merges the lowest
+    /// class with `>= tier_width` segments into a single (higher-class) segment.
+    fn tier_compact_graph(&mut self, g: usize, tier_width: usize) -> usize {
+        let mut merges = 0;
+        while let Some(Some(segs)) = self.graphs.get_mut(g) {
+            if segs.len() < tier_width {
+                break;
+            }
+            let mut counts: HashMap<u32, usize> = HashMap::new();
+            for seg in segs.iter() {
+                *counts
+                    .entry(size_class(seg.flakes.len(), tier_width))
+                    .or_default() += 1;
+            }
+            let Some(target_class) = counts
+                .iter()
+                .filter(|&(_, &c)| c >= tier_width)
+                .map(|(&class, _)| class)
+                .min()
+            else {
+                break;
+            };
+
+            // Merge every segment in the target class into one; keep the rest.
+            let taken = std::mem::take(segs);
+            let mut keep: Vec<Arc<Segment>> = Vec::new();
+            let mut flakes: Vec<Flake> = Vec::new();
+            for seg in taken {
+                if size_class(seg.flakes.len(), tier_width) == target_class {
+                    match Arc::try_unwrap(seg) {
+                        Ok(s) => flakes.extend(s.flakes),
+                        Err(shared) => flakes.extend(shared.flakes.iter().cloned()),
+                    }
+                } else {
+                    keep.push(seg);
+                }
+            }
+            keep.push(Arc::new(Segment::build(flakes, true)));
+            *segs = keep;
+            merges += 1;
+        }
+        merges
     }
 
     /// Validate that a batch can be applied WITHOUT mutating any state.
@@ -1253,6 +1344,27 @@ fn same_identity(a: &Flake, b: &Flake) -> bool {
         && a.p == b.p
         && cmp_object(a, b) == Ordering::Equal
         && cmp_meta(a, b) == Ordering::Equal
+}
+
+/// Size-tier class of a segment with `count` flakes: `floor(log_tier_width(count))`.
+/// Segments of comparable size share a class, and merging `tier_width` segments of
+/// class `K` yields one segment of class `K+1` — the invariant
+/// [`Novelty::tier_compact`] relies on. Derived from flake count, so no per-segment
+/// level needs to be stored or threaded through builds/merges.
+fn size_class(count: usize, tier_width: usize) -> u32 {
+    if count <= 1 || tier_width < 2 {
+        return 0;
+    }
+    let mut class = 0u32;
+    let mut bound = tier_width;
+    while count >= bound {
+        class += 1;
+        match bound.checked_mul(tier_width) {
+            Some(b) => bound = b,
+            None => break,
+        }
+    }
+    class
 }
 
 #[cfg(test)]
@@ -2006,6 +2118,107 @@ mod tests {
             1,
             "bulk/cold load must consolidate to K=1 per graph"
         );
+    }
+
+    /// `size_class` invariant: merging `tier_width` segments of class K yields one
+    /// of class K+1 (count goes c → tier_width·c → class +1). This is what makes
+    /// tiered compaction converge level by level.
+    #[test]
+    fn size_class_increments_on_tier_merge() {
+        for &t in &[2usize, 8, 16] {
+            for &c in &[1usize, 3, t, t * t] {
+                assert_eq!(
+                    size_class(c * t, t),
+                    size_class(c, t) + 1,
+                    "merging {t} class-{} segments (count {c}) must yield class {}",
+                    size_class(c, t),
+                    size_class(c, t) + 1
+                );
+            }
+        }
+    }
+
+    /// Tiered compaction keeps segment count ~logarithmic in commit count (not
+    /// linear), preserving every flake.
+    #[test]
+    fn tier_compact_bounds_segment_count() {
+        let mut n = Novelty::new(0);
+        let rg = no_graphs();
+        let t_width = 4;
+        let commits: u16 = 64;
+        for i in 0..commits {
+            n.apply_commit(
+                vec![make_flake(i, 1, i64::from(i), i64::from(i) + 1, true)],
+                i64::from(i) + 1,
+                &rg,
+            )
+            .unwrap();
+            n.tier_compact(t_width);
+        }
+        assert_eq!(n.len(), commits as usize, "tiering must preserve every flake");
+        let k = n.max_segment_count();
+        assert!(
+            k <= t_width * 4,
+            "tiered K must stay ~logarithmic; got {k} for {commits} commits"
+        );
+        assert!(
+            k < commits as usize,
+            "tiering must reduce segment count well below commit count"
+        );
+    }
+
+    /// Tiered compaction is observationally transparent: identical reads across
+    /// all orders, graphs, and time-travel bounds before vs after.
+    #[test]
+    fn tier_compaction_is_observationally_transparent() {
+        use std::collections::hash_map::DefaultHasher;
+        use std::hash::{Hash, Hasher};
+        const ORDERS: [IndexType; 4] = [
+            IndexType::Spot,
+            IndexType::Psot,
+            IndexType::Post,
+            IndexType::Opst,
+        ];
+        let rg = eq_reverse_graph();
+        let mut n = Novelty::new(0);
+        let mut rng = 0xABCD_1234u64;
+        for c in 0..80 {
+            let t = c as i64 + 1;
+            let batch_n = 1 + (sm64(&mut rng) % 5) as usize;
+            let batch: Vec<Flake> = (0..batch_n).map(|_| eq_make(&mut rng, t)).collect();
+            n.apply_commit(batch, t, &rg).expect("apply_commit");
+        }
+        let digest = |n: &Novelty| -> u64 {
+            let mut h = DefaultHasher::new();
+            for g in 0u16..=2 {
+                for idx in ORDERS {
+                    let ids = n.slice_for_range(g, idx, None, None, true);
+                    ids.len().hash(&mut h);
+                    for id in &ids {
+                        format!("{:?}", n.get_flake(*id)).hash(&mut h);
+                    }
+                    for to_t in [1i64, 20, 50, i64::MAX] {
+                        let mut seen = Vec::new();
+                        n.for_each_overlay_flake(g, idx, None, None, true, to_t, &mut |f| {
+                            seen.push(format!("{f:?}"));
+                        });
+                        seen.len().hash(&mut h);
+                        for s in seen {
+                            s.hash(&mut h);
+                        }
+                    }
+                }
+            }
+            h.finish()
+        };
+
+        let before = digest(&n);
+        let (size0, count0) = (n.size, n.len());
+        let merges = n.tier_compact(4);
+        assert!(merges > 0, "fixture should trigger at least one tier merge");
+        assert_eq!(digest(&n), before, "tier_compact changed an observable read");
+        assert_eq!(n.size, size0, "size preserved");
+        assert_eq!(n.len(), count0, "flake count preserved");
     }
 
     // ===== Equivalence / contract harness for the segmented-novelty rewrite =====

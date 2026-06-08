@@ -80,7 +80,7 @@ fn point_read_us(nov: &Novelty, lo: &Flake, hi: &Flake, repeats: usize) -> u128 
 fn main() {
     let commits = env_usize("LC_COMMITS", 400);
     let npc = env_usize("LC_SUBJECTS_PER_COMMIT", 50);
-    let threshold = env_usize("LC_THRESHOLD", 128);
+    let tier_width = env_usize("LC_TIER_WIDTH", 16);
     let read_repeats = env_usize("LC_READ_REPEATS", 20).max(1);
 
     let rg: HashMap<Sid, GraphId> = HashMap::new();
@@ -88,18 +88,16 @@ fn main() {
     // Point at a subject inserted in the first commit, so it always exists.
     let (lo, hi) = point_bounds(5.min(npc.saturating_sub(1)));
 
+    println!("compaction lifecycle (TIERED): {commits} commits x {npc} subjects, tier_width={tier_width}\n");
     println!(
-        "compaction lifecycle: {commits} commits x {npc} subjects, threshold={threshold}\n"
-    );
-    println!(
-        "{:>7}{:>7}{:>12}{:>9}{:>14}",
-        "commit", "K_pre", "read_us", "compact", "compact_ms"
+        "{:>7}{:>7}{:>12}{:>8}{:>12}",
+        "commit", "K_pre", "read_us", "merges", "compact_ms"
     );
 
-    let mut steady_reads: Vec<u128> = Vec::new();
-    let mut spike_reads: Vec<u128> = Vec::new();
-    let mut cycle_lengths: Vec<usize> = Vec::new();
-    let mut last_compact_commit: Option<usize> = None;
+    let mut read_samples: Vec<u128> = Vec::new();
+    let mut compact_samples: Vec<f64> = Vec::new();
+    let mut total_merges = 0usize;
+    let mut max_k = 0usize;
 
     for i in 0..commits {
         let t = i as i64 + 1;
@@ -110,36 +108,27 @@ fn main() {
         }
         nov.apply_commit(batch, t, &rg).expect("apply_commit");
 
-        // Read-triggered compaction policy (mirrors LedgerHandle::snapshot):
-        // consolidate before the read if the graph is over the threshold. The
-        // read that triggers it eats the compaction cost; later reads are fast.
+        // Read-triggered TIERED compaction (mirrors LedgerHandle::snapshot's
+        // compact_if_needed): bounded incremental merges of full size classes
+        // before the read — no full rewrite, so the per-read cost stays small and
+        // roughly constant instead of a growing cliff.
         let k_pre = nov.max_segment_count();
+        max_k = max_k.max(k_pre);
         let mut compact_ms = 0.0f64;
-        let compacted = nov.needs_compaction(threshold);
-        if compacted {
+        let mut merges = 0;
+        if nov.needs_tier_compaction(tier_width) {
             let t0 = Instant::now();
-            nov.compact_over(threshold);
+            merges = nov.tier_compact(tier_width);
             compact_ms = t0.elapsed().as_secs_f64() * 1000.0;
-            if let Some(prev) = last_compact_commit {
-                cycle_lengths.push(i - prev);
-            }
-            last_compact_commit = Some(i);
+            total_merges += merges;
+            compact_samples.push(compact_ms);
         }
 
         let read_us = point_read_us(&nov, &lo, &hi, read_repeats);
-        if compacted {
-            spike_reads.push(read_us);
-        } else {
-            steady_reads.push(read_us);
-        }
+        read_samples.push(read_us);
 
-        // Print every commit near a compaction boundary, else sample.
-        let near_boundary = compacted || nov.max_segment_count() >= threshold.saturating_sub(2);
-        if near_boundary || i % (commits / 20).max(1) == 0 || i == commits - 1 {
-            println!(
-                "{i:>7}{k_pre:>7}{read_us:>12}{:>9}{compact_ms:>14.1}",
-                if compacted { "YES" } else { "" }
-            );
+        if merges > 0 || i % (commits / 25).max(1) == 0 || i == commits - 1 {
+            println!("{i:>7}{k_pre:>7}{read_us:>12}{merges:>8}{compact_ms:>12.2}");
         }
     }
 
@@ -150,22 +139,16 @@ fn main() {
         v.sort_unstable();
         v[v.len() / 2]
     };
-    let avg_cycle = if cycle_lengths.is_empty() {
-        0.0
-    } else {
-        cycle_lengths.iter().sum::<usize>() as f64 / cycle_lengths.len() as f64
-    };
+    let max_f = |v: &[f64]| v.iter().copied().fold(0.0f64, f64::max);
+    let mean_f = |v: &[f64]| if v.is_empty() { 0.0 } else { v.iter().sum::<f64>() / v.len() as f64 };
 
-    println!("\n================ lifecycle summary ================");
-    println!("compactions triggered : {}", last_compact_commit.map_or(0, |_| spike_reads.len()));
-    println!("cycle length (commits between compactions): {avg_cycle:.0}  (≈ threshold {threshold})");
-    println!("point read — steady (K<threshold) median : {} us", med(steady_reads));
-    println!(
-        "point read — on the compacting commit median : {} us (includes compaction)",
-        med(spike_reads)
-    );
-    println!("===================================================");
-    println!("Reads creep up with segment count, the threshold-crossing read pays compaction");
-    println!("(the spike), then reads drop back to K=1 — repeating every ~{threshold} commits.");
-    println!("A tiered compaction would replace the spike with small incremental merges.");
+    println!("\n================ lifecycle summary (tiered) ================");
+    println!("max segment count K reached : {max_k}  (bounded ~ tier_width × levels)");
+    println!("tier merges triggered       : {total_merges}");
+    println!("per-read compaction ms — mean {:.2} / max {:.2}", mean_f(&compact_samples), max_f(&compact_samples));
+    println!("point read median           : {} us", med(read_samples));
+    println!("===========================================================");
+    println!("Tiered keeps K bounded (~log) and per-read merge cost SMALL and roughly");
+    println!("CONSTANT — no growing 0.5–3 s compact-all cliff. Compare LC vs compact-all:");
+    println!("compact-all spiked 13→29→49 ms (growing); tiered should stay low and flat.");
 }
