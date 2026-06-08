@@ -17,7 +17,9 @@
 //!   (snapshot isolation under concurrent readers / `Arc::make_mut` on the
 //!   commit path) copies only pointers — never the flakes.
 //! - **Batch commit**: Epoch bumps once per commit, not per flake.
-//! - **Set-semantics dedup**: O(1) via [`fact_state`]'s current-state map.
+//! - **Set-semantics dedup**: `O(log novelty)` per flake via [`fact_state`]'s
+//!   persistent current-state map (which itself clones in `O(1)`) — not the old
+//!   `O(total novelty)` re-merge.
 //!
 //! # Example
 //!
@@ -61,7 +63,7 @@ pub use stats::current_stats;
 use fact_state::NoveltyFactState;
 use fluree_db_core::{Flake, GraphId, IndexType, Sid};
 use std::cmp::Ordering;
-use std::collections::{BinaryHeap, HashMap};
+use std::collections::{BinaryHeap, HashMap, HashSet};
 use std::sync::Arc;
 
 /// Read-scoped handle to a flake inside the novelty overlay.
@@ -395,6 +397,26 @@ impl Novelty {
             .push(Arc::new(seg));
     }
 
+    /// Ensure appending one more segment to `g_id` won't overflow the packed
+    /// [`FlakeId`]'s segment field. Append-only growth (no compaction) makes this
+    /// a real ceiling — a reindex resets novelty well before it. The local-index
+    /// field needs no such runtime guard: per-segment flake counts are already
+    /// bounded by the `MAX_SEGMENT_FLAKES` check in `apply_commit` and by the
+    /// chunking in `set_graph_segments`.
+    fn check_segment_capacity(&self, g_id: GraphId) -> Result<()> {
+        let existing = self
+            .graphs
+            .get(g_id as usize)
+            .and_then(Option::as_ref)
+            .map_or(0, Vec::len);
+        if existing + 1 > MAX_SEGMENTS {
+            return Err(NoveltyError::overflow(
+                "novelty segment count exceeds capacity, trigger reindex",
+            ));
+        }
+        Ok(())
+    }
+
     /// Replace a graph's segment list with `segs` (chunked so no segment exceeds
     /// the local-index width). Used by the whole-graph-rebuilding paths.
     fn set_graph_segments(&mut self, g_id: GraphId, mut flakes: Vec<Flake>, parallel: bool) {
@@ -448,8 +470,14 @@ impl Novelty {
                 "commit batch exceeds max segment flakes, trigger reindex",
             ));
         }
+        // Each touched graph gains at most one segment; guard the packed FlakeId's
+        // segment field. Routing is also the only other fallible step.
+        let mut checked: HashSet<GraphId> = HashSet::new();
         for flake in flakes {
-            Self::resolve_flake_g_id(flake, reverse_graph)?;
+            let g_id = Self::resolve_flake_g_id(flake, reverse_graph)?;
+            if checked.insert(g_id) {
+                self.check_segment_capacity(g_id)?;
+            }
         }
         Ok(())
     }
@@ -498,6 +526,15 @@ impl Novelty {
         for flake in flakes {
             let g_id = Self::resolve_flake_g_id(&flake, reverse_graph)?;
             routed.push((flake, g_id));
+        }
+
+        // Each touched graph gains at most one segment; guard the packed FlakeId's
+        // segment field before any mutation so a capacity error stays atomic.
+        let mut checked: HashSet<GraphId> = HashSet::new();
+        for (_, g_id) in &routed {
+            if checked.insert(*g_id) {
+                self.check_segment_capacity(*g_id)?;
+            }
         }
 
         // From here on every step is infallible.

@@ -16,6 +16,20 @@
 //! a persistent map (`imbl::OrdMap`) so `clone` is O(1) structural sharing —
 //! preserving the novelty clone win under concurrent readers.
 //!
+//! ## Complexity
+//!
+//! `clone` is O(1), but `is_asserted` / `record` are **O(log novelty_facts)**
+//! (a balanced-tree probe plus `FactKey` cloning), *not* O(1). This is still far
+//! cheaper than the old O(total-novelty) index re-merge it replaced, and the
+//! `log` factor is dominated by the per-commit segment build. If a slope
+//! measurement ever shows residual growth attributable to dedup, the candidate
+//! is `imbl::HashMap` for amortized O(1) — but note that would switch key
+//! equality from `Ord` (matching `same_identity` / `IndexType::compare`) to
+//! `Hash`/`Eq`, and `FlakeValue`'s `Eq` treats cross-representation numerics
+//! (`Long(3) == Double(3.0) == BigInt(3)`) as equal where `Ord` may not. That is
+//! a semantic change the current equivalence harness (which only generates
+//! `Long`) would not catch, so it needs dedicated cross-type dedup tests first.
+//!
 //! ## Identity & graph scoping
 //!
 //! The key is `(s, p, o, dt, m)`; its derived `Ord` matches `same_identity`
