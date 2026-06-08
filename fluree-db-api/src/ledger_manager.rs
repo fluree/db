@@ -131,14 +131,15 @@ struct LedgerHandleInner {
     /// Always coherent with `state.snapshot.range_provider` — writers hold
     /// the `state` lock while updating this.
     binary_store: RwLock<Option<Arc<BinaryIndexStore>>>,
-    /// Read-side novelty compaction trigger: if any graph exceeds this many
-    /// segments when a query snapshot is taken, novelty is compacted first so
-    /// the read avoids segment fan-out. `0` disables it. Policy: query nodes and
-    /// long-lived servers keep the default; an insert-only transactor (which
-    /// never takes a query snapshot anyway) is unaffected, and a read-heavy
-    /// transactor that wants to opt out can set `0`. Never fires on the commit
+    /// Read-side tiered-compaction trigger (tier width). When a query snapshot is
+    /// taken, if any graph has a full size class (>= this many same-class
+    /// segments) novelty is tier-compacted first — bounded incremental merges
+    /// that cap read fan-out without a full rewrite. `0`/`1` disables. Policy:
+    /// query nodes and long-lived servers keep the default; an insert-only
+    /// transactor (which never takes a query snapshot) is unaffected; a
+    /// latency-sensitive transactor can disable it. Never fires on the commit
     /// path (commits use `LedgerWriteGuard`, not `snapshot`).
-    compaction_threshold: AtomicUsize,
+    tier_width: AtomicUsize,
 }
 
 impl LedgerHandle {
@@ -154,30 +155,27 @@ impl LedgerHandle {
                 ledger_id,
                 last_access: AtomicU64::new(monotonic_secs()),
                 binary_store: RwLock::new(binary_store),
-                compaction_threshold: AtomicUsize::new(
-                    fluree_db_novelty::DEFAULT_COMPACTION_THRESHOLD,
-                ),
+                tier_width: AtomicUsize::new(fluree_db_novelty::DEFAULT_TIER_WIDTH),
             }),
         }
     }
 
-    /// Set the read-side novelty compaction threshold (`0` disables). Policy hook:
-    /// long-lived servers / query nodes keep the default; an insert-only or
-    /// latency-sensitive transactor can disable read-triggered compaction.
-    pub fn set_compaction_threshold(&self, threshold: usize) {
-        self.inner
-            .compaction_threshold
-            .store(threshold, Ordering::Relaxed);
+    /// Set the read-side tier width (`0`/`1` disables read-triggered compaction).
+    /// Policy hook: long-lived servers / query nodes keep the default; an
+    /// insert-only or latency-sensitive transactor can disable it.
+    pub fn set_tier_width(&self, tier_width: usize) {
+        self.inner.tier_width.store(tier_width, Ordering::Relaxed);
     }
 
-    /// Read-side compaction trigger. If novelty has fragmented past the threshold
-    /// in any graph, consolidate it (under the write lock) before serving the
-    /// query, so this and subsequent reads avoid segment fan-out. Idempotent and
-    /// amortized over the request. Common case (`K <= threshold`) only pays a
-    /// brief shared read-lock check. Never invoked on the insert-only write path.
+    /// Read-side tiered-compaction trigger. If any graph has a full size class,
+    /// run bounded incremental merges (under the write lock) before serving so
+    /// this and subsequent reads avoid segment fan-out — no full rewrite, no
+    /// growing cliff. Idempotent and amortized over the request. Common case (no
+    /// full class) only pays a brief shared read-lock check. Never invoked on the
+    /// insert-only write path.
     async fn compact_if_needed(&self) {
-        let threshold = self.inner.compaction_threshold.load(Ordering::Relaxed);
-        if threshold == 0 {
+        let tier_width = self.inner.tier_width.load(Ordering::Relaxed);
+        if tier_width < 2 {
             return;
         }
         // Cheap shared-lock check first; escalate to the write lock only when
@@ -188,23 +186,24 @@ impl LedgerHandle {
                 .read()
                 .await
                 .novelty
-                .needs_compaction(threshold)
+                .needs_tier_compaction(tier_width)
         };
         if !needs {
             return;
         }
         let mut state = self.inner.state.write().await;
         // Re-check: another query may have compacted between the locks.
-        if state.novelty.needs_compaction(threshold) {
+        if state.novelty.needs_tier_compaction(tier_width) {
             let pre = state.novelty.max_segment_count();
             let started = Instant::now();
-            let graphs = Arc::make_mut(&mut state.novelty).compact_over(threshold);
+            let merges = Arc::make_mut(&mut state.novelty).tier_compact(tier_width);
             tracing::debug!(
-                graphs_compacted = graphs,
+                merges,
                 pre_max_segments = pre,
-                threshold,
+                post_max_segments = state.novelty.max_segment_count(),
+                tier_width,
                 elapsed_ms = started.elapsed().as_millis() as u64,
-                "novelty read-triggered compaction"
+                "novelty read-triggered tier compaction"
             );
         }
     }
@@ -1841,13 +1840,13 @@ mod tests {
         assert_eq!(NotifyResult::Reloaded, NotifyResult::Reloaded);
     }
 
-    /// The read-side compaction trigger: when a long-lived handle accumulates
-    /// segments past the threshold (one per incremental commit), taking a query
-    /// `snapshot()` consolidates novelty first, keeping segment count bounded —
-    /// without losing any flake. Commit-only activity (no snapshot) would let it
-    /// grow unbounded; the trigger lives only on the read/snapshot path.
+    /// The read-side tiered-compaction trigger: a long-lived handle accumulates
+    /// one segment per incremental commit; taking a query `snapshot()` runs
+    /// tiered compaction, keeping segment count ~logarithmic (not linear in
+    /// commits) without losing any flake. Commit-only activity (no snapshot)
+    /// would let it grow unbounded; the trigger lives only on the snapshot path.
     #[tokio::test]
-    async fn snapshot_triggers_compaction_at_threshold() {
+    async fn snapshot_triggers_tier_compaction() {
         use fluree_db_core::{Flake, FlakeValue, LedgerSnapshot, Sid};
         use fluree_db_ledger::LedgerState;
         use fluree_db_novelty::Novelty;
@@ -1866,17 +1865,19 @@ mod tests {
 
         let state = LedgerState::new(LedgerSnapshot::genesis("test/compact:main"), Novelty::new(0));
         let handle = LedgerHandle::new("test/compact:main".to_string(), state, None);
-        handle.set_compaction_threshold(8);
+        let tier_width = 4;
+        handle.set_tier_width(tier_width);
         let rg = std::collections::HashMap::new();
 
-        for i in 0..20u16 {
+        let commits = 50u16;
+        for i in 0..commits {
             {
                 let mut g = handle.lock_for_write().await;
                 Arc::make_mut(&mut g.state_mut().novelty)
                     .apply_commit(vec![mk(i + 1, i64::from(i) + 1)], i64::from(i) + 1, &rg)
                     .expect("apply_commit");
             }
-            // Query path: snapshot() runs compact_if_needed before serving.
+            // Query path: snapshot() runs compact_if_needed (tiered) before serving.
             let _view = handle.snapshot().await;
             let k = handle
                 .lock_for_write()
@@ -1884,18 +1885,28 @@ mod tests {
                 .state()
                 .novelty
                 .max_segment_count();
-            assert!(k <= 8, "snapshot must keep K <= threshold; got {k} after commit {i}");
+            assert!(
+                k <= tier_width * 4,
+                "tiered snapshot must keep K ~logarithmic; got {k} after commit {i}"
+            );
         }
 
         let g = handle.lock_for_write().await;
-        assert_eq!(g.state().novelty.len(), 20, "compaction must not lose flakes");
-        assert!(g.state().novelty.max_segment_count() <= 8);
+        assert_eq!(
+            g.state().novelty.len(),
+            commits as usize,
+            "tiered compaction must not lose flakes"
+        );
+        assert!(
+            g.state().novelty.max_segment_count() < commits as usize,
+            "tiering must keep K below commit count"
+        );
     }
 
-    /// Threshold 0 disables the read-side trigger (e.g. a latency-sensitive
+    /// Tier width 0 disables the read-side trigger (e.g. a latency-sensitive
     /// transactor opting out): segments accumulate unbounded across snapshots.
     #[tokio::test]
-    async fn snapshot_compaction_disabled_when_threshold_zero() {
+    async fn snapshot_tier_compaction_disabled_when_width_zero() {
         use fluree_db_core::{Flake, FlakeValue, LedgerSnapshot, Sid};
         use fluree_db_ledger::LedgerState;
         use fluree_db_novelty::Novelty;
@@ -1903,7 +1914,7 @@ mod tests {
         let state =
             LedgerState::new(LedgerSnapshot::genesis("test/nocompact:main"), Novelty::new(0));
         let handle = LedgerHandle::new("test/nocompact:main".to_string(), state, None);
-        handle.set_compaction_threshold(0);
+        handle.set_tier_width(0);
         let rg = std::collections::HashMap::new();
 
         for i in 0..12u16 {
@@ -1933,7 +1944,7 @@ mod tests {
             .state()
             .novelty
             .max_segment_count();
-        assert_eq!(k, 12, "threshold 0 must disable read-triggered compaction");
+        assert_eq!(k, 12, "tier width 0 must disable read-triggered compaction");
     }
 
     // ========================================================================
