@@ -181,38 +181,54 @@ building the segment, exactly as today.
 tombstones — otherwise newest→oldest scans get unbounded and a dropped tombstone
 would let a deleted indexed fact reappear.
 
-### 4.5 Compaction
+### 4.5 Compaction — structural compact-all (implemented)
 
-Unbounded segment growth makes reads and Option-B dedup degrade. Trigger
-compaction when a graph's segment count exceeds `K` (start `K = 16`,
-configurable): merge the segments into one new immutable `Segment`, keeping **the
-latest op per `(s,p,o,dt,m)` identity — including retractions** — and dropping only
-*older* ops for the same identity. The resulting segment carries
-`min_t = min(inputs)`, `max_t = max(inputs)`.
+Unbounded segment growth makes reads degrade **linearly in segment count** (one
+binary-search probe per segment per range read; measured ~1 µs/segment, e.g. a
+4-flake point read costs ~1 ms at 1,000 segments, ~47 ms at 40,000). The first
+compaction strategy is **structural compact-all, triggered by segment count,
+preserving every flake**:
 
-> **Critical (review):** compaction must NOT drop a fact whose latest op is a
-> retract. A latest retraction is a **tombstone** that suppresses a fact still
-> present in the *persisted index*; dropping it would make the deleted fact
-> reappear in reads until the next reindex. Tombstones are removed only by
-> `clear_up_to(index_t)` once the index has absorbed them (§4.6) — never by
-> compaction.
+- For each graph whose segment count exceeds a threshold
+  (`DEFAULT_COMPACTION_THRESHOLD = 128`), collect ALL flakes from its segments,
+  build ONE new immutable `Segment` with the same flakes (original `t/op/m/g`),
+  rebuild the four local order vectors, and swap `Vec<Arc<Segment>>` to a single
+  `Arc<Segment>` (`min_t/max_t` span the inputs).
+- **Preserve everything**: no dedup, no dropping older asserts, no collapsing
+  assert/retract pairs — only the *representation* changes.
+- `fact_state`, `size`, `t`, and the live flake multiset are unchanged; `epoch`
+  bumps (layout-scoped `FlakeId`s and epoch-keyed caches must refresh).
+- API: `compact_over(threshold)`, `compact_all()`; policy queries
+  `segment_count` / `max_segment_count` / `needs_compaction(threshold)`. It is a
+  maintenance primitive — **not auto-wired into the commit path.**
 
-This is the only place the O(N) merge survives, now **amortized O(N/K)** per commit
-and movable off the commit path (background compaction) later. First cut:
-synchronous threshold compaction under the write lock; tiered/background is a
-follow-up. Compaction produces a new `Arc<Segment>`; readers holding the old list
-are unaffected (COW).
+**Why preserve everything (supersedes the earlier "keep latest op per identity"
+sketch):** keeping the whole assert/retract log is safe for immutability and time
+travel, AND it sidesteps the stats problem entirely — because nothing is dropped,
+`runtime_stats::assemble_fast_stats`'s POST `+1/−1` delta-log and the tombstone
+semantics are unchanged. **No stats-aware / effective-state work is required for
+log-preserving compaction.** (A future *collapsing* compaction that dropped older
+ops — including a latest-retract tombstone that suppresses a still-persisted fact —
+WOULD reopen the stats-aware requirement and the tombstone hazard; we are
+explicitly not doing that. Tombstones are removed only by `clear_up_to(index_t)`
+once the index has absorbed them, §4.6 — never by compaction.)
 
-> **Critical (review): compaction is a separate, stats-aware step — keep it OFF in
-> the append-only phase.** `runtime_stats::assemble_fast_stats_inner` consumes
-> `novelty.iter_index(POST)` as a **raw +1/−1 delta log** against the indexed
-> stats. Dropping older ops during compaction breaks that: e.g. a novelty-local
-> `assert` then `retract` of a fact NOT in the persisted index is query-invisible
-> either way, but compacting to just the `retract` makes stats apply a bogus `−1`.
-> Before enabling compaction we must make stats **effective-state / base-aware**
-> (or have compaction preserve enough delta information), with regressions for
-> both (a) novelty-local assert+retract and (b) indexed-fact + novelty-retract.
-> Append-only segmentation (this phase) keeps every op, so stats are unaffected.
+**Cost (measured, m7i.xlarge):** compact-all is one full re-sort — O(total
+novelty), ~1.1–1.4 µs/flake: **525 ms @ 480k, 1.25 s @ 1M, 2.8 s @ 2M flakes.**
+Too expensive for the synchronous write path. Policy:
+
+| Context | Compaction policy |
+|---|---|
+| Cold load / query Lambda load | `bulk_apply_commits` already yields **K=1 per graph** (no replay into thousands of segments). A warm query Lambda that received incremental novelty may `compact_all` before a query — amortized over the request, competing against bad fan-out. |
+| Long-lived servers / peers | Background maintenance when `needs_compaction`; **never block insert-only commits**. |
+| Transactor Lambda | **Do NOT compact on threshold crossing** — a 0.5–3 s tail erases the write-path win. Insert-only: skip. Read-heavy txn: compact only if estimated read fan-out cost > compaction cost (a few point/narrow reads don't justify it; many broad overlapping reads might). |
+
+**Amortization caveat:** compact-all re-sorts the entire growing novelty, so
+triggering it every K commits is O(N/K) amortized per commit — a constant-factor
+(1/threshold) cut of the old O(N), **bounded by the reindex window** (novelty
+flushes at reindex). The asymptotic fix is **tiered/size-leveled structural
+compaction** (merge similarly-sized runs incrementally → O(log N) amortized, no
+0.5–3 s cliffs) — the planned follow-up, same log-preserving (stats-safe) rule.
 
 ### 4.6 Interactions
 
@@ -223,8 +239,10 @@ are unaffected (COW).
   with `t > cutoff` (re-sorting the four order vectors). Single-commit segments
   (`min_t == max_t`) always drop or keep wholesale. Replaces the current
   `retain_alive` arena scan.
-- **`bulk_apply_commits`** (first-load/catch-up): build one segment per commit (or
-  build then compact once). Keep the existing dedup contract.
+- **`bulk_apply_commits`** (first-load/catch-up): folds all commits + any existing
+  segments into **one consolidated segment per graph (K=1)** in a single dedup
+  pass, so cold/query-Lambda load starts already-compacted. Keeps the dedup
+  contract.
 - **`size`/backpressure**: maintained as sum of segment sizes; unchanged externally.
 - **`epoch`**: still bumped once per commit for cache invalidation.
 
@@ -271,33 +289,39 @@ A differential/golden harness that pins the **observable contract** of the curre
 
 ## 8. Risks / open questions
 
-- **Dedup cost (Option B)** grows with #segments → depends on compaction `K`;
-  measure before committing to A vs B.
-- **Read fan-in** (k-way merge) adds per-read overhead; bounded by `K`. Confirm no
-  regression on novelty-heavy read benches (`it_select_star_novelty*`).
+- ✅ **Dedup cost:** chose **Option A** (`NoveltyFactState`, `imbl::OrdMap`) —
+  O(log N) per flake, O(1) clone; independent of #segments. (`imbl` pulled in.)
+- ✅ **Read fan-in** (k-way merge) is **linear in segment count** (~1 µs/segment,
+  measured) — mitigated by zone-map prune + the K=1 fast path; the asymptote is
+  removed only by keeping `K` small via compaction.
 - **Comparator-tie ordering** must match today exactly — the equivalence harness is
-  the guard.
-- **Compaction under the write lock** adds occasional latency spikes; acceptable
-  first cut, background later.
-- `im` dependency only if Option A is needed.
+  the guard (golden digests unchanged through every step).
+- ✅ **Compaction cost** measured at ~1.1–1.4 µs/flake (one full re-sort) → too
+  expensive synchronous on the write path; maintenance/background/cold-load only
+  (§4.5). Tiered compaction is the cliff-free follow-up.
 
 ## 9. Phased plan
 
 1. ✅ Equivalence harness green against current `Novelty` (records the contract:
    sortedness, multiset across all four orders, range==filtered-scan for all
    orders + edge cases, golden digests).
-2. **Append-only segmentation (this phase, compaction OFF):** introduce `Segment`
-   + segmented `Novelty` behind the harness; `apply_commit` append-only; dedup via
-   Option B behind a `DedupIndex` seam; reads via range-merge with a
-   borrow-preserving iterator + `Vec` adapter; update external read-surface call
-   sites (`StagedLedger`, runtime stats). Harness digest must match exactly
-   (append-only preserves every flake). Re-measure slope on the box.
-3. **Compaction (separate, stats-aware):** first split the harness into a *raw*
-   contract (current) and an *effective/stats* contract; make
-   `assemble_fast_stats` effective-state-aware (or compaction base-aware) with
-   regressions for novelty-local assert+retract and indexed-fact+novelty-retract;
-   only then enable threshold-`K` compaction (preserving tombstones, §4.5).
-4. `clear_up_to` / `bulk_apply_commits` over segments.
-5. Re-measure on `m7i.xlarge`: growth slope should collapse toward flat; confirm
-   cached-path clone gone (flamegraph) and read benches unregressed.
-6. (Follow-up) background/tiered compaction; lazy merge iterator if needed.
+2. ✅ **Append-only segmentation:** `Segment` + segmented `Novelty`; `apply_commit`
+   append-only; dedup via **Option A** (`NoveltyFactState`, an `imbl::OrdMap`
+   current-state map — O(log N), O(1) clone), NOT Option B; reads via the k-way
+   merge iterator + `Vec` shim; external call sites migrated (`StagedLedger` got
+   its own `FlakeId=u32`; runtime stats / dict rebuilds on `iter_flakes`). Harness
+   digest unchanged. Slope collapsed 152 → 0.012 µs/1k on the box.
+3. ✅ **Read fan-out mitigations:** zone-map prune (skip non-overlapping segments,
+   18–35× on disjoint point reads) + K=1 fast path (raw slice loop, no heap/no id
+   packing — point/narrow match the old single-vector design).
+4. ✅ `clear_up_to` / `bulk_apply_commits` over segments (`bulk` → K=1 per graph).
+5. ✅ Re-measure on `m7i.xlarge`: write slope flat; read fan-out characterized
+   (linear in segment count); compaction cost measured (~1.1–1.4 µs/flake).
+6. ✅ **Compaction — structural compact-all (log-preserving):** segment-count
+   triggered, preserves every flake, so **no stats-aware work needed** (the
+   earlier "stats-aware/effective-state" prerequisite applied only to a
+   *collapsing* compaction, which we are not doing). Maintenance primitive, not on
+   the write path (§4.5 policy table).
+7. (Follow-up) **tiered/size-leveled** structural compaction — incremental
+   similarly-sized-run merges → O(log N) amortized, no 0.5–3 s cliffs; same
+   log-preserving rule. Optional later: a lazy merge iterator if K>1 reads need it.
