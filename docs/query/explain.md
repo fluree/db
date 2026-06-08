@@ -266,8 +266,9 @@ would otherwise be planned as left-deep nested-loop joins. Its `details` include
 - `predicates`: predicates in the detected cyclic block
 - `enabled`: whether `FLUREE_CYCLIC_BGP` allows the fast path
 - `max-predicate-rows`: the per-predicate row cap used by the fast path
-- `object-only-values`: `encoded` when object-only cycle variables can join on
-  late-materialized encoded object values, not just IRI references
+- `object-only-values`: `iri-ref` for the raw SID-only cycle path, or `encoded`
+  when object-only cycle variables can join on late-materialized encoded object
+  values, not just IRI references
 
 Set `FLUREE_CYCLIC_BGP=0` (or `false`) to disable this operator for A/B
 testing. `FLUREE_CYCLIC_BGP_MAX_ROWS` can lower or raise the per-predicate row
