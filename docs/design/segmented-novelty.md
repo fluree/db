@@ -226,9 +226,37 @@ Too expensive for the synchronous write path. Policy:
 **Amortization caveat:** compact-all re-sorts the entire growing novelty, so
 triggering it every K commits is O(N/K) amortized per commit — a constant-factor
 (1/threshold) cut of the old O(N), **bounded by the reindex window** (novelty
-flushes at reindex). The asymptotic fix is **tiered/size-leveled structural
-compaction** (merge similarly-sized runs incrementally → O(log N) amortized, no
-0.5–3 s cliffs) — the planned follow-up, same log-preserving (stats-safe) rule.
+flushes at reindex). That growing-cliff shape is why the read path now uses
+**tiered compaction** (§4.5.1); compact-all remains as an explicit maintenance /
+cold-consolidation primitive.
+
+#### 4.5.1 Tiered (size-leveled) compaction — implemented, read-path default
+
+Same log-preserving (stats-safe) rule, but incremental. Each segment has a
+**size class** derived from its flake count: `size_class(count, T) =
+floor(log_T(count))` (no per-segment level stored — derived, so builds/merges
+don't thread it). The invariant: merging `T` segments of class `K` yields one of
+class `K+1`. `Novelty::tier_compact(T)` cascade-merges the lowest class holding
+`>= T` segments into one larger segment, repeating upward, preserving every
+flake. This bounds read fan-out to `~T · log_T(N)` segments while each merge
+touches only one class's flakes — no full-novelty rewrite. `needs_tier_compaction(T)`
+is the cheap policy check; `DEFAULT_TIER_WIDTH = 16`.
+
+The read-side trigger (`LedgerHandle::snapshot` → `compact_if_needed`) runs
+`tier_compact(tier_width)`; the per-handle knob is `tier_width`
+(`set_tier_width`, `0`/`1` disables). Policy is unchanged (read/maintenance path
+only; insert-only commits never trigger it).
+
+**Measured (m7i.xlarge, release, 400 commits × 50 subjects, `tier_width=16`):**
+max segment count **K=31** (vs compact-all letting K reach 128), **26 merges,
+mean 3.0 ms/merge**, one level-transition cascade at 30.85 ms. So tiered keeps K
+bounded *continuously* (better reads throughout) and amortizes compaction into
+many small merges, instead of compact-all's K=128 + spikes growing 13 → 29 →
+49 ms every ~128 commits. Inherent size-tiered caveat: a level-`L` cascade merges
+`T` class-`L` segments (`≈ T · level_size` flakes), so the *largest* single merge
+grows per level — but exponentially rarer (O(log N) amortized) and bounded by the
+reindex window. A future leveled variant with partial merges could cap the worst
+single stall further if needed.
 
 ### 4.6 Interactions
 
@@ -322,6 +350,13 @@ A differential/golden harness that pins the **observable contract** of the curre
    earlier "stats-aware/effective-state" prerequisite applied only to a
    *collapsing* compaction, which we are not doing). Maintenance primitive, not on
    the write path (§4.5 policy table).
-7. (Follow-up) **tiered/size-leveled** structural compaction — incremental
-   similarly-sized-run merges → O(log N) amortized, no 0.5–3 s cliffs; same
-   log-preserving rule. Optional later: a lazy merge iterator if K>1 reads need it.
+7. ✅ **Read-side compaction trigger:** `LedgerHandle::snapshot` consolidates
+   when needed before serving (read/maintenance path only; insert-only commits
+   never trigger). Started as compact-all; now tiered.
+8. ✅ **Tiered/size-leveled** structural compaction (§4.5.1) — incremental
+   similarly-sized-run merges → ~`T·log_T(N)` segments, bounded per-merge work,
+   no growing cliff; same log-preserving (stats-safe) rule.
+9. (Follow-up) **config plumbing** — `compaction_enabled` / `tier_width` /
+   `max_segments_before_read_compact` through the builder + server config.
+   Optional later: leveled (partial-merge) variant to cap the worst single
+   cascade; lazy merge iterator if K>1 reads need it.
