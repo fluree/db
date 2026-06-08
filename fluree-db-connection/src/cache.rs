@@ -7,7 +7,7 @@
 //! Tiers (native):
 //! - `< 4 GB`    → 30% (fixed runtime/txn overhead dominates on small hosts)
 //! - `4 – 8 GB`  → 40%
-//! - `≥ 8 GB`    → 50%
+//! - `≥ 8 GB`    → 35%
 
 use tracing::info;
 
@@ -19,7 +19,7 @@ pub const DEFAULT_CACHE_MB_FALLBACK: usize = 1000;
 /// Uses a tiered fraction of total system memory:
 /// - `< 4 GB`    → 30%
 /// - `4 – 8 GB`  → 40%
-/// - `≥ 8 GB`    → 50%
+/// - `≥ 8 GB`    → 35%
 ///
 /// On WASM, returns a conservative 1000 MB default. If memory detection fails
 /// (sandboxing, permissions), falls back to [`DEFAULT_CACHE_MB_FALLBACK`].
@@ -33,7 +33,7 @@ pub fn default_cache_max_mb() -> usize {
     sys.refresh_memory_specifics(MemoryRefreshKind::everything());
 
     // Clamp to the cgroup limit so a container sizes its cache to its real
-    // limit, not the host's RAM (a 264 GB host would otherwise pick a 132 GB cache).
+    // limit, not the host's RAM.
     let total_memory_bytes =
         fluree_db_core::sysmem::effective_memory_limit_bytes(sys.total_memory());
 
@@ -51,7 +51,7 @@ pub fn default_cache_max_mb() -> usize {
     } else if total_mb < 8 * 1024 {
         (2, 5, 40)
     } else {
-        (1, 2, 50)
+        (7, 20, 35)
     };
     let cache_mb = (total_mb * numerator / denominator).max(100);
 

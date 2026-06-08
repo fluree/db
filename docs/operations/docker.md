@@ -177,7 +177,7 @@ docker run -d --name fluree \
 
 ### Tuning the LRU Cache
 
-`cache_max_mb` is the global budget for the in-memory index/flake cache. The default is a tiered fraction of system RAM (30%/40%/50% for <4GB/4–8GB/≥8GB hosts). On a container with a hard memory limit, **set this explicitly** — the auto-tier reads host RAM, not the cgroup limit, and can over-allocate.
+`cache_max_mb` is the global budget for the in-memory index/flake cache. The default is tiered by effective system memory: <4GB uses 30%, 4-8GB uses 40%, and >=8GB uses 35%. On a container with a hard memory limit, the auto-tier clamps to the cgroup limit when available; set this explicitly if you need a tighter cache budget.
 
 ```yaml
 # docker-compose.yml fragment
