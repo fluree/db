@@ -55,6 +55,9 @@ serde = { version = "1.0", features = ["derive"] }
 serde_json = { version = "1.0", features = ["preserve_order"] }
 mimalloc = { version = "0.1", default-features = false }
 thiserror = "1.0"
+# Persistent/immutable data structures (structural sharing -> O(1) clone).
+# Used by fluree-db-novelty's current-state fact index.
+imbl = "3"
 winnow = "0.7"
 indexmap = { version = "2", features = ["serde"] }
 

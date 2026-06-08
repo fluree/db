@@ -28,6 +28,7 @@ mod commit;
 mod commit_flakes;
 pub mod delta;
 mod error;
+mod fact_state;
 mod runtime_stats;
 mod stats;
 
@@ -50,6 +51,7 @@ pub use runtime_stats::{
 };
 pub use stats::current_stats;
 
+use fact_state::NoveltyFactState;
 use fluree_db_core::{Flake, GraphId, IndexType, Sid};
 use rayon::Scope;
 use std::cmp::Ordering;
@@ -209,6 +211,11 @@ pub struct Novelty {
 
     /// Epoch for cache invalidation - bumped once per commit
     pub epoch: u64,
+
+    /// Current-state fact index for RDF set-semantics dedup (latest op per
+    /// identity, per graph, within this novelty window). Persistent map, so it
+    /// clones in O(1). The dedup oracle behind the seam; see [`fact_state`].
+    fact_state: NoveltyFactState,
 }
 
 impl Novelty {
@@ -220,6 +227,7 @@ impl Novelty {
             size: 0,
             t,
             epoch: 0,
+            fact_state: NoveltyFactState::new(),
         }
     }
 
@@ -332,8 +340,11 @@ impl Novelty {
         let mut deduped = 0u64;
 
         for (flake, g_id) in routed {
-            // Set semantics: skip duplicate assertions
-            if flake.op && self.fact_currently_asserted_in_graph(g_id, &flake) {
+            // Set semantics: skip assertions already current in this graph's
+            // novelty window. `fact_state` reflects PRIOR-commit state here (it
+            // is updated only after this loop), matching the previous SPOT-vector
+            // dedup which likewise updated after the batch.
+            if flake.op && self.fact_state.is_asserted(g_id, &flake) {
                 deduped += 1;
                 continue;
             }
@@ -342,6 +353,15 @@ impl Novelty {
             self.size += size;
             let flake_id = self.store.push_with_size(flake, size);
             per_graph.entry(g_id).or_default().push(flake_id);
+        }
+
+        // Record every kept flake (assert + retract) into the current-state
+        // index, per graph in batch order so the latest op per identity wins.
+        // After the keep loop, so within-batch decisions saw only prior state.
+        for (&g_id, ids) in &per_graph {
+            for &id in ids {
+                self.fact_state.record(g_id, self.store.get(id));
+            }
         }
 
         if deduped > 0 {
@@ -578,6 +598,13 @@ impl Novelty {
                 group_start = group_end;
             }
 
+            // Maintain the current-state index so later apply_commit calls dedup
+            // against bulk-loaded facts. `kept` is in (s,p,o,dt,m,t,op) order, so
+            // the last record per identity is its highest-t (latest) op.
+            for &id in &kept {
+                self.fact_state.record(g_id, store.get(id));
+            }
+
             // Build the 4 sorted index vectors from the deduped set. Each
             // sort is independently O(N log N); kept.clone() copies only
             // the small `FlakeId` (u32) array, not the underlying flakes.
@@ -651,6 +678,17 @@ impl Novelty {
         // Update size
         self.size = new_size;
 
+        // Rebuild the current-state index from surviving flakes. SPOT order is
+        // ascending-t within an identity, so the last record per identity wins.
+        self.fact_state = NoveltyFactState::new();
+        for (g, slot) in self.graphs.iter().enumerate() {
+            if let Some(gv) = slot {
+                for &id in &gv.spot {
+                    self.fact_state.record(g as GraphId, self.store.get(id));
+                }
+            }
+        }
+
         self.epoch += 1;
     }
 
@@ -703,65 +741,6 @@ impl Novelty {
             .iter()
             .filter_map(Option::as_ref)
             .flat_map(move |graph_vecs| graph_vecs.get_index(index).iter().copied())
-    }
-
-    /// Returns true if the fact `(s, p, o, dt, m)` is **currently asserted**
-    /// in the given graph's novelty.
-    ///
-    /// Uses binary search on the SPOT index (sorted by s, p, o, dt, t, op, m)
-    /// to find the region where `(s, p, o, dt)` lives, then walks backwards
-    /// to find the latest operation for the matching `(s, p, o, dt, m)`.
-    ///
-    /// Important: we must consider the **latest** op, not "any assertion exists",
-    /// otherwise a prior assertion followed by a retraction would incorrectly
-    /// cause a later re-assertion to be dropped.
-    fn fact_currently_asserted_in_graph(&self, g_id: GraphId, flake: &Flake) -> bool {
-        let spot = match self.graphs.get(g_id as usize).and_then(Option::as_ref) {
-            Some(graph_vecs) => &graph_vecs.spot,
-            None => return false,
-        };
-
-        if spot.is_empty() {
-            return false;
-        }
-
-        // Find the (s, p, o, dt) run.
-        let start = spot.partition_point(|&id| {
-            let existing = self.store.get(id);
-            let cmp = existing
-                .s
-                .cmp(&flake.s)
-                .then_with(|| existing.p.cmp(&flake.p))
-                .then_with(|| existing.o.cmp(&flake.o))
-                .then_with(|| existing.dt.cmp(&flake.dt));
-            cmp == Ordering::Less
-        });
-
-        let end = spot.partition_point(|&id| {
-            let existing = self.store.get(id);
-            let cmp = existing
-                .s
-                .cmp(&flake.s)
-                .then_with(|| existing.p.cmp(&flake.p))
-                .then_with(|| existing.o.cmp(&flake.o))
-                .then_with(|| existing.dt.cmp(&flake.dt));
-            cmp != Ordering::Greater
-        });
-
-        if start >= end {
-            return false;
-        }
-
-        // Walk backward (latest t/op first) and find the most recent op for the
-        // exact fact identity (including metadata).
-        for &id in spot[start..end].iter().rev() {
-            let existing = self.store.get(id);
-            if existing.m == flake.m {
-                return existing.op;
-            }
-        }
-
-        false // No matching (s, p, o, dt, m) in novelty
     }
 }
 
