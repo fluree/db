@@ -1712,6 +1712,25 @@ impl LedgerManager {
                         self.reload(&input.ledger_id).await?;
                         return Ok(NotifyResult::Reloaded);
                     }
+                    // Detach the range provider before the commit loop. A
+                    // BinaryRangeProvider owns Arc clones of dict_novelty /
+                    // runtime_small_dicts; while attached, each `apply_single_commit`'s
+                    // `Arc::make_mut` on those dicts sees strong_count >= 2 and
+                    // deep-clones the (growing) dictionaries every commit — the
+                    // O(accumulated-novelty) cost that returns right after the first
+                    // reindex. Capture its store first so we can rebuild the provider
+                    // with the updated dicts afterward.
+                    let provider_store = write_guard
+                        .state()
+                        .snapshot
+                        .range_provider
+                        .as_ref()
+                        .and_then(|rp| rp.as_any().downcast_ref::<BinaryRangeProvider>())
+                        .map(|brp| Arc::clone(brp.store()));
+                    if provider_store.is_some() {
+                        Arc::make_mut(&mut write_guard.state_mut().snapshot).range_provider = None;
+                    }
+
                     for commit in commits {
                         write_guard
                             .state_mut()
@@ -1719,26 +1738,23 @@ impl LedgerManager {
                             .map_err(|e| ApiError::internal(format!("apply commit: {e}")))?;
                     }
 
-                    // If a binary range provider is attached, refresh it to point at the
-                    // updated DictNovelty. `apply_single_commit` replaces `state.dict_novelty`
-                    // with a new Arc; without re-attaching here, the provider holds a stale
-                    // Arc and overlay translation will fail for novelty-only strings/subjects.
-                    if let Some(rp) = write_guard.state().snapshot.range_provider.as_ref() {
-                        if let Some(brp) = rp.as_any().downcast_ref::<BinaryRangeProvider>() {
-                            let store = Arc::clone(brp.store());
-                            let dn = Arc::clone(&write_guard.state().dict_novelty);
-                            let runtime_small_dicts =
-                                Arc::clone(&write_guard.state().runtime_small_dicts);
-                            let ns_fallback =
-                                Some(write_guard.state().snapshot.shared_namespaces());
-                            Arc::make_mut(&mut write_guard.state_mut().snapshot).range_provider =
-                                Some(Arc::new(BinaryRangeProvider::new(
-                                    store,
-                                    dn,
-                                    runtime_small_dicts,
-                                    ns_fallback,
-                                )));
-                        }
+                    // Rebuild + reattach the provider pointing at the updated
+                    // DictNovelty / runtime dicts so overlay translation resolves
+                    // novelty-only strings/subjects introduced by these commits.
+                    // (`apply_single_commit` mutates the dicts in place now that the
+                    // provider no longer pins them.)
+                    if let Some(store) = provider_store {
+                        let dn = Arc::clone(&write_guard.state().dict_novelty);
+                        let runtime_small_dicts =
+                            Arc::clone(&write_guard.state().runtime_small_dicts);
+                        let ns_fallback = Some(write_guard.state().snapshot.shared_namespaces());
+                        Arc::make_mut(&mut write_guard.state_mut().snapshot).range_provider =
+                            Some(Arc::new(BinaryRangeProvider::new(
+                                store,
+                                dn,
+                                runtime_small_dicts,
+                                ns_fallback,
+                            )));
                     }
                 }
 
