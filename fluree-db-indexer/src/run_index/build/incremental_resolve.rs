@@ -1138,7 +1138,10 @@ async fn prefetch_reconcile_leaves(
             }
         }
     };
-    collect(subject_tree, subject_keys.iter().map(Vec::as_slice).collect());
+    collect(
+        subject_tree,
+        subject_keys.iter().map(Vec::as_slice).collect(),
+    );
     collect(string_tree, string_keys);
 
     if targets.is_empty() {
@@ -1158,10 +1161,11 @@ async fn prefetch_reconcile_leaves(
                 let Ok(_permit) = s3_budget.acquire().await else {
                     return;
                 };
-                if let Err(e) = fluree_db_binary_index::read::artifact_cache::fetch_cached_bytes_cid(
-                    cs, &cid, &cache_dir,
-                )
-                .await
+                if let Err(e) =
+                    fluree_db_binary_index::read::artifact_cache::fetch_cached_bytes_cid(
+                        cs, &cid, &cache_dir,
+                    )
+                    .await
                 {
                     tracing::debug!(%cid, error = %e, "reconcile leaf prefetch failed; continuing");
                 }

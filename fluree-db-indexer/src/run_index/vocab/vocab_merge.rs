@@ -948,7 +948,10 @@ mod tests {
             .map(|(i, e)| make_subject_vocab(&dir, i, e))
             .collect();
         let ids: Vec<usize> = (0..chunks.len()).collect();
-        let ns = HashMap::from([(1u16, "http://a/".to_string()), (2, "http://b/".to_string())]);
+        let ns = HashMap::from([
+            (1u16, "http://a/".to_string()),
+            (2, "http://b/".to_string()),
+        ]);
 
         merge_subject_vocabs(&vocs, &ids, &remap_dir, &dir, &ns).unwrap();
 

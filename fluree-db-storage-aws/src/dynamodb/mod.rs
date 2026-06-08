@@ -1042,7 +1042,9 @@ impl NameService for DynamoDbNameService {
                     builder = builder.request_items(table, batch.clone());
                 }
                 let resp = builder.send().await.map_err(|e| {
-                    NameServiceError::storage(format!("DynamoDB commit-index batch delete failed: {e}"))
+                    NameServiceError::storage(format!(
+                        "DynamoDB commit-index batch delete failed: {e}"
+                    ))
                 })?;
                 remaining = resp.unprocessed_items().cloned().unwrap_or_default();
                 if !remaining.is_empty() {
