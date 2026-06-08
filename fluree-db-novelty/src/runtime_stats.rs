@@ -77,8 +77,7 @@ pub async fn assemble_full_stats(
     let mut object_refs_by_graph: HashMap<GraphId, HashSet<Sid>> = HashMap::new();
     let mut subject_props: HashMap<(GraphId, Sid), HashMap<Sid, PropertyDelta>> = HashMap::new();
 
-    for flake_id in novelty.iter_index(IndexType::Post) {
-        let flake = novelty.get_flake(flake_id);
+    for flake in novelty.iter_flakes(IndexType::Post) {
         if !include_in_runtime_stats(flake, to_t) {
             continue;
         }
@@ -223,8 +222,7 @@ fn assemble_fast_stats_inner(
     let mut flakes_delta: i64 = 0;
     let mut graph_subject_classes: HashMap<(GraphId, Sid), HashSet<Sid>> = HashMap::new();
 
-    for flake_id in novelty.iter_index(IndexType::Post) {
-        let flake = novelty.get_flake(flake_id);
+    for flake in novelty.iter_flakes(IndexType::Post) {
         if flake.t > to_t {
             continue;
         }
@@ -783,6 +781,91 @@ mod tests {
                 })
                 .collect())
         }
+    }
+
+    /// Regression for the segmented-novelty top hazard: fast-stats reads the
+    /// POST index as a +1/-1 delta log AND builds an order-dependent
+    /// `graph_subject_classes` side table (rdf:type assert/retract per subject)
+    /// that it reads mid-pass to attribute properties. The k-way merge over
+    /// multiple segments must feed that consumer in the SAME comparator order as
+    /// a single segment — so the same flakes split per-commit (many segments) vs
+    /// bulk-loaded (one segment) must yield identical stats, including a class
+    /// asserted in one segment and retracted in a later one.
+    #[test]
+    fn fast_stats_match_across_segment_boundaries() {
+        let snapshot = LedgerSnapshot::genesis("test:main");
+        let indexed = IndexStats {
+            flakes: 0,
+            size: 0,
+            properties: None,
+            classes: None,
+            graphs: None,
+        };
+        let alice = sid(10, "alice");
+        let bob = sid(10, "bob");
+        let person = sid(10, "Person");
+        let name = sid(10, "name");
+        let mut retract_alice_type = type_flake(alice.clone(), person.clone(), 3);
+        retract_alice_type.op = false;
+        let commits = vec![
+            (
+                vec![
+                    type_flake(alice.clone(), person.clone(), 1),
+                    prop_flake(alice.clone(), name.clone(), 1, 1),
+                ],
+                1i64,
+            ),
+            (
+                vec![
+                    type_flake(bob.clone(), person.clone(), 2),
+                    prop_flake(bob.clone(), name.clone(), 2, 2),
+                ],
+                2,
+            ),
+            (vec![retract_alice_type], 3),
+        ];
+
+        // Per-commit application => three segments.
+        let mut seg_nov = Novelty::new(0);
+        for (flakes, t) in &commits {
+            seg_nov.apply_commit(flakes.clone(), *t, &HashMap::new()).unwrap();
+        }
+        // Bulk application => one consolidated segment.
+        let mut bulk_nov = Novelty::new(0);
+        bulk_nov
+            .bulk_apply_commits(commits.clone(), &HashMap::new())
+            .unwrap();
+
+        let a = assemble_fast_stats(&indexed, &snapshot, &seg_nov, 3, None);
+        let b = assemble_fast_stats(&indexed, &snapshot, &bulk_nov, 3, None);
+
+        let class_count = |s: &IndexStats, class: &Sid| {
+            s.classes
+                .as_ref()
+                .and_then(|cs| cs.iter().find(|c| &c.class_sid == class))
+                .map_or(0, |c| c.count)
+        };
+        let prop_count = |s: &IndexStats| {
+            s.properties
+                .as_ref()
+                .and_then(|ps| ps.iter().find(|p| p.sid == (10, "name".to_string())))
+                .map_or(0, |p| p.count)
+        };
+
+        assert_eq!(a.flakes, b.flakes, "flake delta differs across layouts");
+        assert_eq!(a.flakes, 3, "4 asserts - 1 retract");
+        assert_eq!(
+            class_count(&a, &person),
+            class_count(&b, &person),
+            "Person count differs across segment layout"
+        );
+        assert_eq!(
+            class_count(&a, &person),
+            1,
+            "alice un-typed (later segment), bob remains => 1 Person"
+        );
+        assert_eq!(prop_count(&a), prop_count(&b), "name count differs");
+        assert_eq!(prop_count(&a), 2, "two name assertions survive");
     }
 
     #[test]
