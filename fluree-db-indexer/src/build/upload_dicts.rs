@@ -1650,8 +1650,7 @@ mod tests {
             kind: fluree_db_core::ContentKind,
             bytes: &[u8],
         ) -> fluree_db_core::error::Result<ContentId> {
-            self.puts
-                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            self.puts.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             Ok(ContentId::new(kind, bytes))
         }
         async fn put_with_id(
