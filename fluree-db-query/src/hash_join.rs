@@ -110,6 +110,12 @@ fn hash_join_force() -> HashJoinForce {
 /// the observed BSBM lower crossover while relying on the scan-ratio cap below to
 /// reject small-driving-set pathologies.
 const HASH_JOIN_PROBE_MIN: u64 = 50_000;
+/// For small driving sets, even a below-floor probe predicate is worth scanning
+/// once. WGPB TI object-stars commonly start from a 1k-5k-row anchor and then
+/// suffer thousands of scattered OPST seeks into 3k-35k-row predicates; a compact
+/// hash build is cheaper and remains memory-bounded.
+const HASH_JOIN_SMALL_BUILD_MAX: f64 = 10_000.0;
+const HASH_JOIN_SMALL_BUILD_PROBE_MIN: u64 = 1_000;
 /// Auto hash-join only when the build side still looks like a base scan or narrow
 /// two-column stream. The operator drains the build side in `open()`, so using it
 /// later in a multiway object-star can materialize the already-expanded cross
@@ -134,7 +140,10 @@ const HASH_JOIN_MAX_SCAN_RATIO: f64 = 1024.0;
 fn hash_join_cost_wins(probe_count: Option<u64>, driving_est: Option<f64>) -> bool {
     let Some(pc) = probe_count else { return false };
     let drive = driving_est.unwrap_or(0.0).max(1.0);
-    pc >= HASH_JOIN_PROBE_MIN && (pc as f64) <= drive * HASH_JOIN_MAX_SCAN_RATIO
+    let within_scan_budget = (pc as f64) <= drive * HASH_JOIN_MAX_SCAN_RATIO;
+    within_scan_budget
+        && (pc >= HASH_JOIN_PROBE_MIN
+            || (drive <= HASH_JOIN_SMALL_BUILD_MAX && pc >= HASH_JOIN_SMALL_BUILD_PROBE_MIN))
 }
 
 /// Why the object→subject hash join was (or was not) chosen. Mirrors the
@@ -397,7 +406,15 @@ impl<'a> HashJoinPlanner<'a> {
             HashJoinForce::Off => unreachable!("handled above"),
             HashJoinForce::Auto => match probe_count {
                 None => (false, HashJoinReason::NoProbeStats),
-                Some(pc) if pc < HASH_JOIN_PROBE_MIN => (false, HashJoinReason::ProbeTooSmall),
+                Some(pc)
+                    if pc < HASH_JOIN_PROBE_MIN
+                        && driving_est.unwrap_or(f64::INFINITY) > HASH_JOIN_SMALL_BUILD_MAX =>
+                {
+                    (false, HashJoinReason::ProbeTooSmall)
+                }
+                Some(pc) if pc < HASH_JOIN_SMALL_BUILD_PROBE_MIN => {
+                    (false, HashJoinReason::ProbeTooSmall)
+                }
                 Some(pc) => {
                     let drive = driving_est.unwrap_or(0.0).max(1.0);
                     if (pc as f64) <= drive * HASH_JOIN_MAX_SCAN_RATIO {
@@ -1049,6 +1066,20 @@ mod tests {
     }
 
     #[test]
+    fn cost_gate_fires_for_small_build_wgpb_ti_anchors() {
+        // These are the first object-star joins from the slow WGPB TI plans:
+        // - TI2-35: P4544 (5,092 rows) -> P2188 (7,100 rows)
+        // - TI3-02: P2532 (2,196 rows) -> P4296 (35,246 rows)
+        // - TI4-02: P1888 (1,068 rows) -> P4854 (7,684 rows)
+        //
+        // The probe predicates are below the generic floor, but the build sides are
+        // tiny enough that a hash table is cheap and avoids thousands of OPST seeks.
+        assert!(hash_join_cost_wins(Some(7_100), Some(5_092.0)));
+        assert!(hash_join_cost_wins(Some(35_246), Some(2_196.0)));
+        assert!(hash_join_cost_wins(Some(7_684), Some(1_068.0)));
+    }
+
+    #[test]
     fn planner_chooses_hash_join_for_wgpb_ti2_shape() {
         let x = VarId(0);
         let y = VarId(1);
@@ -1116,8 +1147,10 @@ mod tests {
     fn cost_gate_still_guards_pathological_and_small_probes() {
         // Huge probe for a handful of driving rows is still rejected (ratio ≫ 1024×).
         assert!(!hash_join_cost_wins(Some(2_848_260), Some(100.0)));
-        // Probe below the floor never qualifies, regardless of ratio.
-        assert!(!hash_join_cost_wins(Some(40_000), Some(10_000.0)));
+        // Very small probe stays below the small-build exception.
+        assert!(!hash_join_cost_wins(Some(500), Some(100.0)));
+        // Below-floor probe with a non-small build still falls back to nested loop.
+        assert!(!hash_join_cost_wins(Some(40_000), Some(20_000.0)));
         // No probe stats => fall back to the safe nested-loop default.
         assert!(!hash_join_cost_wins(None, Some(1_000_000.0)));
     }
