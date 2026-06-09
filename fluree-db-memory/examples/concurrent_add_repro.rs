@@ -36,7 +36,7 @@ fn mk(kind: MemoryKind, content: &str, tags: &[&str]) -> MemoryInput {
     MemoryInput {
         kind,
         content: content.to_string(),
-        tags: tags.iter().map(|s| s.to_string()).collect(),
+        tags: tags.iter().map(std::string::ToString::to_string).collect(),
         scope: Scope::Repo,
         severity: None,
         artifact_refs: Vec::new(),
@@ -245,7 +245,7 @@ async fn run_add_stress(stores: Vec<Arc<MemoryStore>>, concurrency: usize, round
                     Ok((id, hits, total)) => {
                         let done = completed.fetch_add(1, Ordering::Relaxed) + 1;
                         let dt = op_start.elapsed();
-                        if done % 10 == 0 || dt > Duration::from_secs(1) {
+                        if done.is_multiple_of(10) || dt > Duration::from_secs(1) {
                             eprintln!(
                                 "  add done #{done}: task={task_id} round={round} id={id} \
                                  hits={hits} total={total} elapsed={dt:?}"
@@ -254,7 +254,7 @@ async fn run_add_stress(stores: Vec<Arc<MemoryStore>>, concurrency: usize, round
                     }
                     Err(e) => {
                         let n = errors.fetch_add(1, Ordering::Relaxed) + 1;
-                        if n <= 20 || n % 25 == 0 {
+                        if n <= 20 || n.is_multiple_of(25) {
                             eprintln!("  add error #{n}: task={task_id} round={round}: {e}");
                         }
                     }
