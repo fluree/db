@@ -9,6 +9,7 @@ pub mod multi;
 pub mod nameservice_builder;
 
 use serde_json::Value as JsonValue;
+use std::time::Duration;
 
 use crate::{
     format, Batch, FormatterConfig, FuelExceededError, OverlayProvider, PolicyContext, PolicyStats,
@@ -19,6 +20,31 @@ use fluree_db_binary_index::BinaryGraphView;
 use fluree_db_core::{GraphDbRef, LedgerSnapshot};
 
 use fluree_db_query::ir::QueryOutput;
+
+/// Optional execution controls for query builders and embedders.
+#[derive(Debug, Clone, Default)]
+pub struct QueryExecutionOptions {
+    /// Cooperative cancellation/deadline handle passed through to query operators.
+    pub cancellation: Option<fluree_db_core::QueryCancellation>,
+}
+
+impl QueryExecutionOptions {
+    /// Create empty execution options.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Attach a cooperative cancellation/deadline handle.
+    pub fn with_cancellation(mut self, cancellation: fluree_db_core::QueryCancellation) -> Self {
+        self.cancellation = Some(cancellation);
+        self
+    }
+
+    /// Attach a relative timeout.
+    pub fn with_timeout(self, timeout: Duration) -> Self {
+        self.with_cancellation(fluree_db_core::QueryCancellation::with_timeout(timeout))
+    }
+}
 
 /// Result of a query execution
 pub struct QueryResult {

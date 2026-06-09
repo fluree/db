@@ -61,6 +61,7 @@ pub struct ServerFileConfig {
     pub log_level: Option<String>,
     pub cors_enabled: Option<bool>,
     pub body_limit: Option<usize>,
+    pub query_timeout_ms: Option<u64>,
     pub cache_max_mb: Option<usize>,
 
     /// `[server.indexing]`
@@ -373,6 +374,7 @@ pub const CONFIG_FILE_ARG_IDS: &[&str] = &[
     "log_level",
     "cors_enabled",
     "body_limit",
+    "query_timeout_ms",
     "cache_max_mb",
     "indexing_enabled",
     "reindex_min_bytes",
@@ -474,6 +476,11 @@ pub fn apply_to_server_config(
     if is_default("body_limit") {
         if let Some(v) = file.body_limit {
             config.body_limit = v;
+        }
+    }
+    if is_default("query_timeout_ms") {
+        if let Some(v) = file.query_timeout_ms {
+            config.query_timeout_ms = v;
         }
     }
     if is_default("cache_max_mb") {

@@ -14,8 +14,8 @@ use crate::vector::VectorIndexProvider;
 use fluree_db_binary_index::{BinaryGraphView, BinaryIndexStore, FulltextArena};
 use fluree_db_core::dict_novelty::DictNovelty;
 use fluree_db_core::{
-    GraphDbRef, GraphId, LedgerSnapshot, NoOverlay, OverlayProvider, RuntimeSmallDicts, Sid,
-    Tracker,
+    GraphDbRef, GraphId, LedgerSnapshot, NoOverlay, OverlayProvider, QueryCancellation,
+    RuntimeSmallDicts, Sid, Tracker,
 };
 
 use crate::binary_range::BinaryRangeProvider;
@@ -113,6 +113,8 @@ pub struct ExecutionContext<'a> {
     pub active_graph: ActiveGraph,
     /// Optional execution tracker (time/fuel/policy)
     pub tracker: Tracker,
+    /// Optional cooperative cancellation/deadline handle.
+    pub cancellation: QueryCancellation,
     /// When true, bind evaluation errors are treated as query errors.
     pub strict_bind_errors: bool,
     /// Optional binary columnar index store for fast local-file scans.
@@ -216,6 +218,7 @@ impl<'a> ExecutionContext<'a> {
             dataset: None,
             active_graph: ActiveGraph::Default,
             tracker: Tracker::disabled(),
+            cancellation: QueryCancellation::disabled(),
             strict_bind_errors: false,
             binary_store: None,
             binary_g_id: 0,
@@ -264,6 +267,7 @@ impl<'a> ExecutionContext<'a> {
             dataset: None,
             active_graph: ActiveGraph::Default,
             tracker: Tracker::disabled(),
+            cancellation: QueryCancellation::disabled(),
             strict_bind_errors: false,
             binary_store,
             binary_g_id: db.g_id,
@@ -316,6 +320,7 @@ impl<'a> ExecutionContext<'a> {
             dataset: None,
             active_graph: ActiveGraph::Default,
             tracker: Tracker::disabled(),
+            cancellation: QueryCancellation::disabled(),
             strict_bind_errors: false,
             binary_store,
             binary_g_id: db.g_id,
@@ -357,6 +362,7 @@ impl<'a> ExecutionContext<'a> {
             dataset: None,
             active_graph: ActiveGraph::Default,
             tracker: Tracker::disabled(),
+            cancellation: QueryCancellation::disabled(),
             strict_bind_errors: false,
             binary_store: None,
             binary_g_id: 0,
@@ -397,6 +403,7 @@ impl<'a> ExecutionContext<'a> {
             dataset: None,
             active_graph: ActiveGraph::Default,
             tracker: Tracker::disabled(),
+            cancellation: QueryCancellation::disabled(),
             strict_bind_errors: false,
             binary_store: None,
             binary_g_id: 0,
@@ -439,6 +446,7 @@ impl<'a> ExecutionContext<'a> {
             dataset: None,
             active_graph: ActiveGraph::Default,
             tracker: Tracker::disabled(),
+            cancellation: QueryCancellation::disabled(),
             strict_bind_errors: false,
             binary_store: None,
             binary_g_id: 0,
@@ -531,6 +539,21 @@ impl<'a> ExecutionContext<'a> {
     pub fn with_tracker(mut self, tracker: Tracker) -> Self {
         self.tracker = tracker;
         self
+    }
+
+    /// Attach a cooperative cancellation/deadline handle to this context.
+    pub fn with_cancellation(mut self, cancellation: QueryCancellation) -> Self {
+        self.cancellation = cancellation;
+        self
+    }
+
+    /// Return an error if query execution has been cancelled or timed out.
+    #[inline]
+    pub fn check_cancelled(&self) -> Result<(), QueryError> {
+        match self.cancellation.reason() {
+            Some(reason) => Err(QueryError::Cancelled { reason }),
+            None => Ok(()),
+        }
     }
 
     /// Enable strict bind error handling.
@@ -826,6 +849,7 @@ impl<'a> ExecutionContext<'a> {
             dataset: self.dataset,
             active_graph,
             tracker: self.tracker.clone(),
+            cancellation: self.cancellation.clone(),
             strict_bind_errors: self.strict_bind_errors,
             binary_store: self.binary_store.clone(),
             binary_g_id,
@@ -877,6 +901,7 @@ impl<'a> ExecutionContext<'a> {
             dataset: self.dataset,
             active_graph: ActiveGraph::Default,
             tracker: self.tracker.clone(),
+            cancellation: self.cancellation.clone(),
             strict_bind_errors: self.strict_bind_errors,
             binary_store: self.binary_store.clone(),
             binary_g_id,
@@ -924,6 +949,7 @@ impl<'a> ExecutionContext<'a> {
             dataset: None,
             active_graph: ActiveGraph::Default,
             tracker: self.tracker.clone(),
+            cancellation: self.cancellation.clone(),
             strict_bind_errors: self.strict_bind_errors,
             binary_store: Self::extract_binary_store(graph.snapshot),
             binary_g_id: graph.g_id,

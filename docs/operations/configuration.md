@@ -37,6 +37,7 @@ Example `config.toml`:
 listen_addr = "0.0.0.0:8090"
 storage_path = "/var/lib/fluree"
 log_level = "info"
+query_timeout_ms = 900000  # 15 minutes; set to 0 to disable
 # cache_max_mb = 4096  # global cache budget (MB); default: tiered by RAM (<4GB: 30%, 4-8GB: 40%, >=8GB: 35%)
 
 [server.indexing]
@@ -287,6 +288,16 @@ Maximum request body size in bytes:
 | Flag           | Env Var             | Default           |
 | -------------- | ------------------- | ----------------- |
 | `--body-limit` | `FLUREE_BODY_LIMIT` | `52428800` (50MB) |
+
+### Query Timeout
+
+Maximum query execution time in milliseconds. The server passes this deadline
+into query execution so long-running queries are cancelled at batch boundaries.
+Set to `0` to disable the server-side timeout.
+
+| Flag                 | Env Var                    | Default                  |
+| -------------------- | -------------------------- | ------------------------ |
+| `--query-timeout-ms` | `FLUREE_QUERY_TIMEOUT_MS`  | `900000` (15 minutes)    |
 
 ### Log Level
 
@@ -757,6 +768,7 @@ fluree server run \
 | `FLUREE_REINDEX_MAX_BYTES`              | Hard reindex threshold (bytes)                  | 20% of system RAM (256 MB fallback)                                      |
 | `FLUREE_CACHE_MAX_MB`                   | Global cache budget (MB)                        | Tiered by RAM: `<4GB: 30%, 4-8GB: 40%, >=8GB: 35%`                                                     |
 | `FLUREE_BODY_LIMIT`                     | Max request body bytes                          | `52428800`                                                              |
+| `FLUREE_QUERY_TIMEOUT_MS`               | Max query execution time in milliseconds (`0` disables) | `900000`                                                     |
 | `FLUREE_LOG_LEVEL`                      | Log level                                       | `info`                                                                  |
 | `FLUREE_SERVER_ROLE`                    | Server role                                     | `transaction`                                                           |
 | `FLUREE_TX_SERVER_URL`                  | Transaction server URL                          | None                                                                    |

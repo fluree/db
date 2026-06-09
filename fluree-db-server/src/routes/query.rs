@@ -21,14 +21,22 @@ use axum::response::{IntoResponse, Response};
 use axum::Json;
 use fluree_db_api::dataset::GraphSelector;
 use fluree_db_api::{
-    DatasetSpec, FreshnessCheck, FreshnessSource, GraphDb, GraphSource, LedgerState, TimeSpec,
-    TrackingTally,
+    DatasetSpec, FreshnessCheck, FreshnessSource, GraphDb, GraphSource, LedgerState,
+    QueryExecutionOptions, TimeSpec, TrackingTally,
 };
 use serde::Deserialize;
 use serde_json::Value as JsonValue;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
+use std::time::Duration;
 use tracing::Instrument;
+
+fn query_execution_options(state: &AppState) -> QueryExecutionOptions {
+    match state.config.query_timeout_ms {
+        0 => QueryExecutionOptions::default(),
+        millis => QueryExecutionOptions::new().with_timeout(Duration::from_millis(millis)),
+    }
+}
 
 // ============================================================================
 // SPARQL Protocol query parameter support (GET ?query=...)
@@ -516,6 +524,7 @@ pub async fn query(
                     .sparql(&sparql)
                     .format(config)
                     .tracking(tracking_opts)
+                    .execution_options(query_execution_options(&state))
                     .execute_tracked()
                     .await;
                 return match response {
@@ -550,7 +559,14 @@ pub async fn query(
                 };
             }
 
-            let result = state.fluree.query_from().sparql(&sparql).format(config).execute_formatted().await;
+            let result = state
+                .fluree
+                .query_from()
+                .sparql(&sparql)
+                .format(config)
+                .execution_options(query_execution_options(&state))
+                .execute_formatted()
+                .await;
             return match result {
                 Ok(json) => {
                     tracing::info!(status = "success", query_kind = "sparql", format = "agent-json");
@@ -571,7 +587,12 @@ pub async fn query(
             let tracking_opts = headers.to_tracking_options();
             let response = state
                 .fluree
-                .query_connection_sparql_tracked(&sparql, None, Some(tracking_opts))
+                .query_connection_sparql_tracked_with_options(
+                    &sparql,
+                    None,
+                    Some(tracking_opts),
+                    query_execution_options(&state),
+                )
                 .await;
             let response = match response {
                 Ok(r) => r,
@@ -602,7 +623,15 @@ pub async fn query(
         let parsed = fluree_db_sparql::parse_sparql(&sparql);
         let (fmt_config, content_type) =
             sparql_json_response_format(parsed.ast.as_ref(), &headers);
-        match state.fluree.query_from().sparql(&sparql).format(fmt_config).execute_formatted().await {
+        match state
+            .fluree
+            .query_from()
+            .sparql(&sparql)
+            .format(fmt_config)
+            .execution_options(query_execution_options(&state))
+            .execute_formatted()
+            .await
+        {
             Ok(result) => {
                 tracing::info!(
                     status = "success",
@@ -1455,6 +1484,7 @@ async fn execute_query(
         let response = match graph
             .query(fluree.as_ref())
             .jsonld(query_json)
+            .execution_options(query_execution_options(state))
             .execute_tracked()
             .await
         {
@@ -1494,6 +1524,7 @@ async fn execute_query(
         let result = graph
             .query(fluree.as_ref())
             .jsonld(query_json)
+            .execution_options(query_execution_options(state))
             .execute()
             .await
             .map_err(|e| {
@@ -1524,6 +1555,7 @@ async fn execute_query(
     let result = match graph
         .query(fluree.as_ref())
         .jsonld(query_json)
+        .execution_options(query_execution_options(state))
         .execute_formatted()
         .await
     {
@@ -1563,6 +1595,7 @@ async fn execute_query_proxy(
             .graph(ledger_id)
             .query()
             .jsonld(query_json)
+            .execution_options(query_execution_options(state))
             .execute_tracked()
             .await
         {
@@ -1602,6 +1635,7 @@ async fn execute_query_proxy(
         .graph(ledger_id)
         .query()
         .jsonld(query_json)
+        .execution_options(query_execution_options(state))
         .execute_formatted()
         .await
     {
@@ -1729,6 +1763,7 @@ async fn execute_sparql_ledger(
                 view.query(state.fluree.as_ref())
                     .sparql(sparql)
                     .format(json_fmt_config.clone())
+                    .execution_options(query_execution_options(&state))
                     .execute_formatted()
                     .await
                     .inspect_err(|_| { set_span_error_code(&span, "error:QueryFailed"); })?
@@ -1744,6 +1779,7 @@ async fn execute_sparql_ledger(
                 view.query(state.fluree.as_ref())
                     .sparql(sparql)
                     .format(json_fmt_config.clone())
+                    .execution_options(query_execution_options(&state))
                     .execute_formatted()
                     .await
                     .inspect_err(|_| {
@@ -1786,6 +1822,7 @@ async fn execute_sparql_ledger(
             let result = view.query(state.fluree.as_ref())
                 .sparql(sparql)
                 .format(json_fmt_config.clone())
+                .execution_options(query_execution_options(&state))
                 .execute_formatted()
                 .await
                 .inspect_err(|_| {
@@ -1947,6 +1984,7 @@ async fn execute_sparql_ledger(
                     .query(state.fluree.as_ref())
                     .sparql(sparql)
                     .tracking(tracking_opts)
+                    .execution_options(query_execution_options(&state))
                     .execute_tracked()
                     .await;
                 let response = match response {
@@ -1994,6 +2032,7 @@ async fn execute_sparql_ledger(
                     .query(state.fluree.as_ref())
                     .sparql(sparql)
                     .format(fluree_db_api::FormatterConfig::sparql_xml())
+                    .execution_options(query_execution_options(&state))
                     .execute_formatted_string()
                     .await
                     .map_err(ServerError::Api)?;
@@ -2024,6 +2063,7 @@ async fn execute_sparql_ledger(
                     .query(state.fluree.as_ref())
                     .sparql(sparql)
                     .format(fluree_db_api::FormatterConfig::rdf_xml())
+                    .execution_options(query_execution_options(&state))
                     .execute_formatted_string()
                     .await
                     .map_err(ServerError::Api)?;
@@ -2066,6 +2106,7 @@ async fn execute_sparql_ledger(
                     .query(state.fluree.as_ref())
                     .sparql(sparql)
                     .format(config)
+                    .execution_options(query_execution_options(&state))
                     .execute_formatted()
                     .await
                     .map_err(ServerError::Api)?;
@@ -2087,6 +2128,7 @@ async fn execute_sparql_ledger(
                 .query(state.fluree.as_ref())
                 .sparql(sparql)
                 .format(json_fmt_config.clone())
+                .execution_options(query_execution_options(&state))
                 .execute_formatted()
                 .await
                 .map_err(ServerError::Api)?;
@@ -2137,6 +2179,7 @@ async fn execute_sparql_ledger(
                 .query(fluree.as_ref())
                 .sparql(sparql)
                 .tracking(tracking_opts)
+                .execution_options(query_execution_options(&state))
                 .execute_tracked()
                 .await
             {
@@ -2185,6 +2228,7 @@ async fn execute_sparql_ledger(
             let result = graph
                 .query(fluree.as_ref())
                 .sparql(sparql)
+                .execution_options(query_execution_options(&state))
                 .execute()
                 .await
                 .map_err(|e| {
@@ -2226,6 +2270,7 @@ async fn execute_sparql_ledger(
                 .query(fluree.as_ref())
                 .sparql(sparql)
                 .format(fluree_db_api::FormatterConfig::sparql_xml())
+                .execution_options(query_execution_options(&state))
                 .execute_formatted_string()
                 .await
                 .inspect_err(|_| {
@@ -2252,6 +2297,7 @@ async fn execute_sparql_ledger(
                 .query(fluree.as_ref())
                 .sparql(sparql)
                 .format(fluree_db_api::FormatterConfig::rdf_xml())
+                .execution_options(query_execution_options(&state))
                 .execute_formatted_string()
                 .await
                 .inspect_err(|_| {
@@ -2293,6 +2339,7 @@ async fn execute_sparql_ledger(
                 .query(fluree.as_ref())
                 .sparql(sparql)
                 .format(config)
+                .execution_options(query_execution_options(&state))
                 .execute_formatted()
                 .await
                 .inspect_err(|_| {
@@ -2311,6 +2358,7 @@ async fn execute_sparql_ledger(
             .query(fluree.as_ref())
             .sparql(sparql)
             .format(json_fmt_config)
+            .execution_options(query_execution_options(&state))
             .execute_formatted()
             .await
             .inspect_err(|_| {
@@ -2668,6 +2716,7 @@ async fn execute_history_query(
             .fluree
             .query_from()
             .jsonld(&query)
+            .execution_options(query_execution_options(state))
             .execute_tracked()
             .await
         {
@@ -2713,6 +2762,7 @@ async fn execute_history_query(
             .fluree
             .query_from()
             .jsonld(&query)
+            .execution_options(query_execution_options(state))
             .execute_formatted()
             .await
         {
@@ -2767,20 +2817,24 @@ async fn execute_dataset_query(
     // Delegate the actual execution to the connection-scoped sub-query helper —
     // the same path the multi-query dispatcher uses for each sub-query alias.
     let tracked = has_tracking_opts(&query);
-    let outcome =
-        fluree_db_api::query::multi::run_jsonld_subquery(state.fluree.as_ref(), &query, None)
-            .await
-            .map_err(|e| {
-                let server_error = ServerError::Api(e);
-                set_span_error_code(span, "error:InvalidQuery");
-                tracing::error!(
-                    error = %server_error,
-                    query_kind = "dataset",
-                    tracked,
-                    "dataset query failed"
-                );
-                server_error
-            })?;
+    let outcome = fluree_db_api::query::multi::run_jsonld_subquery(
+        state.fluree.as_ref(),
+        &query,
+        None,
+        query_execution_options(state),
+    )
+    .await
+    .map_err(|e| {
+        let server_error = ServerError::Api(e);
+        set_span_error_code(span, "error:InvalidQuery");
+        tracing::error!(
+            error = %server_error,
+            query_kind = "dataset",
+            tracked,
+            "dataset query failed"
+        );
+        server_error
+    })?;
 
     if let Some(tally) = outcome.tally {
         // Record tracker fields on the execution span (parity with prior behavior).

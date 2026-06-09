@@ -123,7 +123,7 @@ pub use fluree_db_core::ContentId;
 pub use fluree_db_core::RemoteObject;
 pub use fluree_db_core::{
     commit_to_summary, find_common_ancestor, walk_commit_summaries, CommitSummary, CommonAncestor,
-    ConflictKey,
+    ConflictKey, QueryCancellation, QueryCancellationReason,
 };
 pub use format::{AgentJsonContext, FormatError, FormatterConfig, OutputFormat, QueryOutput};
 pub use graph::Graph;
@@ -164,7 +164,7 @@ pub use query::builder::{
     DatasetQueryBuilder, FromQueryBuilder, GraphSourceMode, ViewQueryBuilder,
 };
 pub use query::nameservice_builder::NameserviceQueryBuilder;
-pub use query::{QueryResult, TrackedErrorResponse, TrackedQueryResponse};
+pub use query::{QueryExecutionOptions, QueryResult, TrackedErrorResponse, TrackedQueryResponse};
 pub use rebase::{ConflictStrategy, RebaseConflict, RebaseFailure, RebaseReport};
 pub use revert::RevertReport;
 pub use revert_preview::{RevertConflictSummary, RevertPreview, RevertPreviewOpts};

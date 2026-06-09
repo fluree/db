@@ -14,6 +14,7 @@ pub const DEFAULT_STORAGE_PATH: &str = ".fluree/storage";
 pub const DEFAULT_LOG_LEVEL: &str = "info";
 pub const DEFAULT_CORS_ENABLED: bool = true;
 pub const DEFAULT_BODY_LIMIT: usize = 52_428_800; // 50 MB
+pub const DEFAULT_QUERY_TIMEOUT_MS: u64 = 15 * 60 * 1000; // 15 minutes
 
 // ── Indexing ────────────────────────────────────────────────────────
 
@@ -354,6 +355,7 @@ pub fn generate_config_template(storage_path_override: Option<&str>) -> String {
 # log_level = "{log_level}"                 # trace, debug, info, warn, error
 # cors_enabled = {cors_enabled}
 # body_limit = {body_limit}              # 50 MB
+# query_timeout_ms = {query_timeout_ms}  # 15 minutes; set 0 to disable
 # cache_max_mb = 4096                    # global cache budget (MB); default: tiered by RAM (<4GB: 30%, 4-8GB: 40%, >=8GB: 35%)
 
 # [server.indexing]
@@ -432,6 +434,7 @@ pub fn generate_config_template(storage_path_override: Option<&str>) -> String {
         log_level = DEFAULT_LOG_LEVEL,
         cors_enabled = DEFAULT_CORS_ENABLED,
         body_limit = DEFAULT_BODY_LIMIT,
+        query_timeout_ms = DEFAULT_QUERY_TIMEOUT_MS,
         indexing_enabled = DEFAULT_INDEXING_ENABLED,
         reindex_min_bytes = DEFAULT_REINDEX_MIN_BYTES,
         reindex_min_kb = DEFAULT_REINDEX_MIN_BYTES / 1000,
@@ -469,6 +472,7 @@ pub fn generate_jsonld_config_template(storage_path_override: Option<&str>) -> S
             "log_level": DEFAULT_LOG_LEVEL,
             "cors_enabled": DEFAULT_CORS_ENABLED,
             "body_limit": DEFAULT_BODY_LIMIT,
+            "query_timeout_ms": DEFAULT_QUERY_TIMEOUT_MS,
             "indexing": {
                 "enabled": DEFAULT_INDEXING_ENABLED,
                 "reindex_min_bytes": DEFAULT_REINDEX_MIN_BYTES,

@@ -687,7 +687,13 @@ async fn execute_subquery(
 
             apply_snapshot_to_jsonld(&mut query_body, snapshot);
 
-            run_jsonld_subquery(fluree, &query_body, envelope_format.cloned()).await
+            run_jsonld_subquery(
+                fluree,
+                &query_body,
+                envelope_format.cloned(),
+                crate::QueryExecutionOptions::default(),
+            )
+            .await
         }
         SubqueryLanguage::Sparql => {
             let sparql = sub.query.as_str().unwrap_or_default();
@@ -748,6 +754,7 @@ async fn execute_subquery(
                 Some(policy_opts),
                 tracking,
                 sparql_format,
+                crate::QueryExecutionOptions::default(),
             )
             .await
         }

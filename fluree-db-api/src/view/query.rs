@@ -9,7 +9,10 @@ use crate::query::helpers::{
     tracker_for_limits,
 };
 use crate::view::{GraphDb, QueryInput};
-use crate::{ApiError, ExecutableQuery, Fluree, QueryResult, Result, Tracker, TrackingOptions};
+use crate::{
+    ApiError, ExecutableQuery, Fluree, QueryExecutionOptions, QueryResult, Result, Tracker,
+    TrackingOptions,
+};
 use fluree_db_query::execute::{
     execute_prepared, prepare_execution_with_config, ContextConfig, PrepareConfig,
 };
@@ -70,6 +73,17 @@ impl Fluree {
     /// `FROM` or `FROM NAMED` clauses will be rejected. Use
     /// `query_connection_sparql` for multi-ledger queries.
     pub async fn query(&self, db: &GraphDb, q: impl Into<QueryInput<'_>>) -> Result<QueryResult> {
+        self.query_with_options(db, q, QueryExecutionOptions::default())
+            .await
+    }
+
+    /// Execute a query against a GraphDb with explicit execution controls.
+    pub async fn query_with_options(
+        &self,
+        db: &GraphDb,
+        q: impl Into<QueryInput<'_>>,
+        options: QueryExecutionOptions,
+    ) -> Result<QueryResult> {
         let input = q.into();
 
         // 0. Tracker for fuel limits only (no tracking overhead for non-tracked
@@ -106,7 +120,7 @@ impl Fluree {
         // 4. Execute
         let exec_start = std::time::Instant::now();
         let batches = self
-            .execute_view_internal(db, &vars, &executable, &tracker)
+            .execute_view_internal(db, &vars, &executable, &tracker, &options)
             .await?;
         let exec_ms = exec_start.elapsed().as_secs_f64() * 1000.0;
 
@@ -133,12 +147,13 @@ impl Fluree {
     /// This is used by connection query paths (and builders) that need to resolve
     /// graph sources via R2RML/Iceberg while still running against a ledger-backed
     /// planning database.
-    pub(crate) async fn query_view_with_r2rml(
+    pub(crate) async fn query_view_with_r2rml_options(
         &self,
         db: &GraphDb,
         q: impl Into<QueryInput<'_>>,
         r2rml_provider: &dyn R2rmlProvider,
         r2rml_table_provider: &dyn R2rmlTableProvider,
+        options: QueryExecutionOptions,
     ) -> Result<QueryResult> {
         let input = q.into();
 
@@ -177,6 +192,7 @@ impl Fluree {
                 &tracker,
                 r2rml_provider,
                 r2rml_table_provider,
+                &options,
             )
             .await?;
 
@@ -218,12 +234,13 @@ impl Fluree {
     /// Returns a tracked response with fuel, time, and policy statistics.
     /// When `format_config` is `None`, defaults to JSON-LD for FlureeQL
     /// queries and SPARQL JSON for SPARQL queries.
-    pub(crate) async fn query_tracked(
+    pub(crate) async fn query_tracked_with_options(
         &self,
         db: &GraphDb,
         q: impl Into<QueryInput<'_>>,
         format_config: Option<crate::format::FormatterConfig>,
         tracking_override: Option<TrackingOptions>,
+        options: QueryExecutionOptions,
     ) -> std::result::Result<crate::query::TrackedQueryResponse, crate::query::TrackedErrorResponse>
     {
         let input = q.into();
@@ -277,7 +294,7 @@ impl Fluree {
 
         // Execute with tracking
         let batches = self
-            .execute_view_tracked(db, &vars, &executable, &tracker)
+            .execute_view_tracked(db, &vars, &executable, &tracker, &options)
             .await
             .map_err(|e| {
                 let status = query_error_to_status(&e);
@@ -328,7 +345,7 @@ impl Fluree {
         ))
     }
 
-    pub(crate) async fn query_tracked_with_r2rml(
+    pub(crate) async fn query_tracked_with_r2rml_options(
         &self,
         db: &GraphDb,
         q: impl Into<QueryInput<'_>>,
@@ -336,6 +353,7 @@ impl Fluree {
         tracking_override: Option<TrackingOptions>,
         r2rml_provider: &dyn R2rmlProvider,
         r2rml_table_provider: &dyn R2rmlTableProvider,
+        options: QueryExecutionOptions,
     ) -> std::result::Result<crate::query::TrackedQueryResponse, crate::query::TrackedErrorResponse>
     {
         let input = q.into();
@@ -390,6 +408,7 @@ impl Fluree {
                 &tracker,
                 r2rml_provider,
                 r2rml_table_provider,
+                &options,
             )
             .await
             .map_err(|e| {
@@ -747,9 +766,10 @@ impl Fluree {
         vars: &crate::VarRegistry,
         executable: &ExecutableQuery,
         tracker: &Tracker,
+        options: &QueryExecutionOptions,
     ) -> Result<Vec<crate::Batch>> {
         let noop = crate::NoOpR2rmlProvider::new();
-        self.execute_view_internal_with_r2rml(db, vars, executable, tracker, &noop, &noop)
+        self.execute_view_internal_with_r2rml(db, vars, executable, tracker, &noop, &noop, options)
             .await
     }
 
@@ -765,6 +785,7 @@ impl Fluree {
         tracker: &Tracker,
         r2rml_provider: &'b dyn fluree_db_query::r2rml::R2rmlProvider,
         r2rml_table_provider: &'b dyn fluree_db_query::r2rml::R2rmlTableProvider,
+        options: &QueryExecutionOptions,
     ) -> Result<Vec<crate::Batch>> {
         let db_ref = db.as_graph_db_ref();
         // Single-graph view: no dataset-level history detection — current state.
@@ -795,6 +816,7 @@ impl Fluree {
 
         let config = ContextConfig {
             tracker: Some(tracker),
+            cancellation: options.cancellation.clone(),
             policy_enforcer: db.policy_enforcer().cloned(),
             r2rml: Some((r2rml_provider, r2rml_table_provider)),
             binary_store: db.binary_store.clone(),
@@ -822,9 +844,10 @@ impl Fluree {
         vars: &crate::VarRegistry,
         executable: &ExecutableQuery,
         tracker: &Tracker,
+        options: &QueryExecutionOptions,
     ) -> std::result::Result<Vec<crate::Batch>, fluree_db_query::QueryError> {
         let noop = crate::NoOpR2rmlProvider::new();
-        self.execute_view_tracked_with_r2rml(db, vars, executable, tracker, &noop, &noop)
+        self.execute_view_tracked_with_r2rml(db, vars, executable, tracker, &noop, &noop, options)
             .await
     }
 
@@ -836,6 +859,7 @@ impl Fluree {
         tracker: &Tracker,
         r2rml_provider: &dyn R2rmlProvider,
         r2rml_table_provider: &dyn R2rmlTableProvider,
+        options: &QueryExecutionOptions,
     ) -> std::result::Result<Vec<crate::Batch>, fluree_db_query::QueryError> {
         let db_ref = db.as_graph_db_ref();
         // Single-graph view: no dataset-level history detection — current state.
@@ -864,6 +888,7 @@ impl Fluree {
 
         let config = ContextConfig {
             tracker: Some(tracker),
+            cancellation: options.cancellation.clone(),
             policy_enforcer: db.policy_enforcer().cloned(),
             r2rml: Some((r2rml_provider, r2rml_table_provider)),
             binary_store: db.binary_store.clone(),
@@ -886,7 +911,7 @@ impl Fluree {
 // ============================================================================
 
 fn query_error_to_api_error(err: fluree_db_query::QueryError) -> ApiError {
-    ApiError::query(err.to_string())
+    ApiError::Query(err)
 }
 
 /// Map QueryError to HTTP-ish status code.

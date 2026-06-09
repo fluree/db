@@ -4,6 +4,7 @@
 //! - [`GraphSnapshotQueryBuilder`] — query from a materialized snapshot or [`StagedGraph`]
 
 use serde_json::Value as JsonValue;
+use std::time::Duration;
 
 use crate::error::BuilderErrors;
 use crate::format::FormatterConfig;
@@ -11,8 +12,8 @@ use crate::graph::Graph;
 use crate::query::builder::QueryCore;
 use crate::view::GraphDb;
 use crate::{
-    ApiError, Fluree, QueryResult, Result, TrackedErrorResponse, TrackedQueryResponse,
-    TrackingOptions,
+    ApiError, Fluree, QueryExecutionOptions, QueryResult, Result, TrackedErrorResponse,
+    TrackedQueryResponse, TrackingOptions,
 };
 
 #[cfg(feature = "iceberg")]
@@ -87,6 +88,24 @@ impl<'a, 'g> GraphQueryBuilder<'a, 'g> {
     /// Set format configuration (used by `.execute_formatted()`).
     pub fn format(mut self, config: FormatterConfig) -> Self {
         self.core.set_format(config);
+        self
+    }
+
+    /// Attach a cooperative cancellation/deadline handle.
+    pub fn cancellation(mut self, cancellation: fluree_db_core::QueryCancellation) -> Self {
+        self.core.set_cancellation(cancellation);
+        self
+    }
+
+    /// Cancel query execution if it exceeds the given timeout.
+    pub fn timeout(mut self, timeout: Duration) -> Self {
+        self.core.set_timeout(timeout);
+        self
+    }
+
+    /// Set query execution controls.
+    pub fn execution_options(mut self, options: QueryExecutionOptions) -> Self {
+        self.core.set_execution_options(options);
         self
     }
 
@@ -179,15 +198,27 @@ impl<'a, 'g> GraphQueryBuilder<'a, 'g> {
 
         let view = self.load_view().await?;
         let r2rml = self.core.r2rml.take();
+        let execution = self.core.execution.clone();
         let input = self.core.input.take().unwrap();
         match r2rml.as_ref() {
             Some((provider, table_provider)) => {
                 self.graph
                     .fluree
-                    .query_view_with_r2rml(&view, input, provider.as_ref(), table_provider.as_ref())
+                    .query_view_with_r2rml_options(
+                        &view,
+                        input,
+                        provider.as_ref(),
+                        table_provider.as_ref(),
+                        execution,
+                    )
                     .await
             }
-            None => self.graph.fluree.query(&view, input).await,
+            None => {
+                self.graph
+                    .fluree
+                    .query_with_options(&view, input, execution)
+                    .await
+            }
         }
     }
 
@@ -200,6 +231,7 @@ impl<'a, 'g> GraphQueryBuilder<'a, 'g> {
 
         let view = self.load_view().await?;
         let r2rml = self.core.r2rml.take();
+        let execution = self.core.execution.clone();
         let format_config = self
             .core
             .format
@@ -210,10 +242,21 @@ impl<'a, 'g> GraphQueryBuilder<'a, 'g> {
             Some((provider, table_provider)) => {
                 self.graph
                     .fluree
-                    .query_view_with_r2rml(&view, input, provider.as_ref(), table_provider.as_ref())
+                    .query_view_with_r2rml_options(
+                        &view,
+                        input,
+                        provider.as_ref(),
+                        table_provider.as_ref(),
+                        execution,
+                    )
                     .await?
             }
-            None => self.graph.fluree.query(&view, input).await?,
+            None => {
+                self.graph
+                    .fluree
+                    .query_with_options(&view, input, execution)
+                    .await?
+            }
         };
         match view.policy() {
             Some(policy) => Ok(result
@@ -242,25 +285,27 @@ impl<'a, 'g> GraphQueryBuilder<'a, 'g> {
         let r2rml = self.core.r2rml.take();
         let format_config = self.core.format.take();
         let tracking = self.core.tracking.take();
+        let execution = self.core.execution.clone();
         let input = self.core.input.take().unwrap();
         match r2rml.as_ref() {
             Some((provider, table_provider)) => {
                 self.graph
                     .fluree
-                    .query_tracked_with_r2rml(
+                    .query_tracked_with_r2rml_options(
                         &db,
                         input,
                         format_config,
                         tracking,
                         provider.as_ref(),
                         table_provider.as_ref(),
+                        execution,
                     )
                     .await
             }
             None => {
                 self.graph
                     .fluree
-                    .query_tracked(&db, input, format_config, tracking)
+                    .query_tracked_with_options(&db, input, format_config, tracking, execution)
                     .await
             }
         }
@@ -329,6 +374,24 @@ impl<'a: 'v, 'v> GraphSnapshotQueryBuilder<'a, 'v> {
         self
     }
 
+    /// Attach a cooperative cancellation/deadline handle.
+    pub fn cancellation(mut self, cancellation: fluree_db_core::QueryCancellation) -> Self {
+        self.core.set_cancellation(cancellation);
+        self
+    }
+
+    /// Cancel query execution if it exceeds the given timeout.
+    pub fn timeout(mut self, timeout: Duration) -> Self {
+        self.core.set_timeout(timeout);
+        self
+    }
+
+    /// Set query execution controls.
+    pub fn execution_options(mut self, options: QueryExecutionOptions) -> Self {
+        self.core.set_execution_options(options);
+        self
+    }
+
     /// Enable BM25/Vector index providers for graph source queries.
     pub fn with_index_providers(mut self) -> Self {
         self.core.set_index_providers();
@@ -366,19 +429,25 @@ impl<'a: 'v, 'v> GraphSnapshotQueryBuilder<'a, 'v> {
         }
 
         let r2rml = self.core.r2rml.take();
+        let execution = self.core.execution.clone();
         let input = self.core.input.take().unwrap();
         match r2rml.as_ref() {
             Some((provider, table_provider)) => {
                 self.fluree
-                    .query_view_with_r2rml(
+                    .query_view_with_r2rml_options(
                         self.view,
                         input,
                         provider.as_ref(),
                         table_provider.as_ref(),
+                        execution,
                     )
                     .await
             }
-            None => self.fluree.query(self.view, input).await,
+            None => {
+                self.fluree
+                    .query_with_options(self.view, input, execution)
+                    .await
+            }
         }
     }
 
@@ -390,6 +459,7 @@ impl<'a: 'v, 'v> GraphSnapshotQueryBuilder<'a, 'v> {
         }
 
         let r2rml = self.core.r2rml.take();
+        let execution = self.core.execution.clone();
         let format_config = self
             .core
             .format
@@ -399,15 +469,20 @@ impl<'a: 'v, 'v> GraphSnapshotQueryBuilder<'a, 'v> {
         let result = match r2rml.as_ref() {
             Some((provider, table_provider)) => {
                 self.fluree
-                    .query_view_with_r2rml(
+                    .query_view_with_r2rml_options(
                         self.view,
                         input,
                         provider.as_ref(),
                         table_provider.as_ref(),
+                        execution,
                     )
                     .await?
             }
-            None => self.fluree.query(self.view, input).await?,
+            None => {
+                self.fluree
+                    .query_with_options(self.view, input, execution)
+                    .await?
+            }
         };
         match self.view.policy() {
             Some(policy) => Ok(result
@@ -432,23 +507,31 @@ impl<'a: 'v, 'v> GraphSnapshotQueryBuilder<'a, 'v> {
         let r2rml = self.core.r2rml.take();
         let format_config = self.core.format.take();
         let tracking = self.core.tracking.take();
+        let execution = self.core.execution.clone();
         let input = self.core.input.take().unwrap();
         match r2rml.as_ref() {
             Some((provider, table_provider)) => {
                 self.fluree
-                    .query_tracked_with_r2rml(
+                    .query_tracked_with_r2rml_options(
                         self.view,
                         input,
                         format_config,
                         tracking,
                         provider.as_ref(),
                         table_provider.as_ref(),
+                        execution,
                     )
                     .await
             }
             None => {
                 self.fluree
-                    .query_tracked(self.view, input, format_config, tracking)
+                    .query_tracked_with_options(
+                        self.view,
+                        input,
+                        format_config,
+                        tracking,
+                        execution,
+                    )
                     .await
             }
         }

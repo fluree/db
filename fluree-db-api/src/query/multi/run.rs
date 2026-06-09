@@ -11,7 +11,10 @@
 //! envelope dispatcher.
 
 use crate::format::FormatterConfig;
-use crate::{ApiError, Fluree, QueryConnectionOptions, Result, TrackingOptions, TrackingTally};
+use crate::{
+    ApiError, Fluree, QueryConnectionOptions, QueryExecutionOptions, Result, TrackingOptions,
+    TrackingTally,
+};
 use serde_json::Value as JsonValue;
 
 /// Output of a single sub-query execution.
@@ -53,9 +56,11 @@ pub async fn run_jsonld_subquery(
     fluree: &Fluree,
     query_json: &JsonValue,
     format: Option<FormatterConfig>,
+    execution: QueryExecutionOptions,
 ) -> Result<SubqueryOutput> {
     if has_tracking_opts(query_json) {
         let mut builder = fluree.query_from().jsonld(query_json);
+        builder = builder.execution_options(execution);
         if let Some(cfg) = format {
             builder = builder.format(cfg);
         }
@@ -74,6 +79,7 @@ pub async fn run_jsonld_subquery(
         })
     } else {
         let mut builder = fluree.query_from().jsonld(query_json);
+        builder = builder.execution_options(execution);
         if let Some(cfg) = format {
             builder = builder.format(cfg);
         }
@@ -108,6 +114,7 @@ pub async fn run_sparql_subquery(
     policy: Option<QueryConnectionOptions>,
     tracking: Option<TrackingOptions>,
     format: Option<FormatterConfig>,
+    execution: QueryExecutionOptions,
 ) -> Result<SubqueryOutput> {
     // Only attach the policy channel when there's an actual policy input —
     // an empty `QueryConnectionOptions` would needlessly divert from the
@@ -116,6 +123,7 @@ pub async fn run_sparql_subquery(
 
     if let Some(opts) = tracking {
         let mut builder = fluree.query_from().sparql(sparql).tracking(opts);
+        builder = builder.execution_options(execution);
         if let Some(qc) = policy {
             builder = builder.connection_opts(qc);
         }
@@ -137,6 +145,7 @@ pub async fn run_sparql_subquery(
         })
     } else {
         let mut builder = fluree.query_from().sparql(sparql);
+        builder = builder.execution_options(execution);
         if let Some(qc) = policy {
             builder = builder.connection_opts(qc);
         }
