@@ -435,9 +435,7 @@ impl BinaryIndexStore {
                     let Ok(_permit) = budget.acquire().await else {
                         return;
                     };
-                    if let Err(e) =
-                        fetch_cached_bytes_cid(cs.as_ref(), &cid, &cache_dir).await
-                    {
+                    if let Err(e) = fetch_cached_bytes_cid(cs.as_ref(), &cid, &cache_dir).await {
                         tracing::debug!(%cid, error = %e, "range leaf prefetch failed; continuing");
                     }
                 }

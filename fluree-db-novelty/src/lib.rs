@@ -260,11 +260,7 @@ impl Novelty {
     /// in place (e.g. via `Arc::make_mut`) call this first to guarantee an
     /// all-or-nothing apply: if it returns `Ok`, the subsequent `apply_commit`
     /// cannot fail partway and leave the ledger inconsistent.
-    pub fn can_apply(
-        &self,
-        flakes: &[Flake],
-        reverse_graph: &HashMap<Sid, GraphId>,
-    ) -> Result<()> {
+    pub fn can_apply(&self, flakes: &[Flake], reverse_graph: &HashMap<Sid, GraphId>) -> Result<()> {
         if self.store.len() + flakes.len() > MAX_FLAKE_ID as usize {
             return Err(NoveltyError::overflow(
                 "FlakeId overflow: too many flakes in novelty, trigger reindex",
@@ -963,7 +959,11 @@ mod tests {
         assert_eq!(novelty.t, t, "t unchanged after failed apply");
         assert_eq!(novelty.epoch, epoch, "epoch unchanged after failed apply");
         assert_eq!(novelty.size, size, "size unchanged after failed apply");
-        assert_eq!(novelty.store.len(), len, "no flakes added after failed apply");
+        assert_eq!(
+            novelty.store.len(),
+            len,
+            "no flakes added after failed apply"
+        );
 
         // can_apply reports the same routing failure without mutating.
         assert!(novelty
@@ -1606,7 +1606,11 @@ mod tests {
                 };
                 let base = canon(IndexType::Spot);
                 for idx in [IndexType::Psot, IndexType::Post, IndexType::Opst] {
-                    assert_eq!(base, canon(idx), "multiset spot vs {idx:?} g{g} (seed {seed})");
+                    assert_eq!(
+                        base,
+                        canon(idx),
+                        "multiset spot vs {idx:?} g{g} (seed {seed})"
+                    );
                 }
                 // Range reads == filtered full scan, across ALL four orders, with
                 // bounded / first-only / open / empty cases. Exercises every
@@ -1628,11 +1632,15 @@ mod tests {
                     let first = n.get_flake(full[lo]).clone();
                     let rhs = n.get_flake(full[hi]).clone();
                     let scan = |pred: &dyn Fn(&Flake) -> bool| -> Vec<FlakeId> {
-                        full.iter().copied().filter(|&id| pred(n.get_flake(id))).collect()
+                        full.iter()
+                            .copied()
+                            .filter(|&id| pred(n.get_flake(id)))
+                            .collect()
                     };
                     // bounded (first, rhs]
                     assert_eq!(
-                        n.slice_for_range(g, idx, Some(&first), Some(&rhs), false).to_vec(),
+                        n.slice_for_range(g, idx, Some(&first), Some(&rhs), false)
+                            .to_vec(),
                         scan(&|f| {
                             idx.compare(f, &first) == Ordering::Greater
                                 && idx.compare(f, &rhs) != Ordering::Greater
@@ -1641,7 +1649,8 @@ mod tests {
                     );
                     // first-only (first, end]
                     assert_eq!(
-                        n.slice_for_range(g, idx, Some(&first), None, false).to_vec(),
+                        n.slice_for_range(g, idx, Some(&first), None, false)
+                            .to_vec(),
                         scan(&|f| idx.compare(f, &first) == Ordering::Greater),
                         "first-only range {idx:?} g{g} (seed {seed})"
                     );
@@ -1649,7 +1658,8 @@ mod tests {
                     let maxf = n.get_flake(*full.last().unwrap()).clone();
                     let minf = n.get_flake(full[0]).clone();
                     assert_eq!(
-                        n.slice_for_range(g, idx, Some(&maxf), Some(&minf), false).to_vec(),
+                        n.slice_for_range(g, idx, Some(&maxf), Some(&minf), false)
+                            .to_vec(),
                         scan(&|f| {
                             idx.compare(f, &maxf) == Ordering::Greater
                                 && idx.compare(f, &minf) != Ordering::Greater

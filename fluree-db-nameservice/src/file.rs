@@ -665,7 +665,8 @@ impl NameService for FileNameService {
         };
 
         // Dedup by t (last-wins) since appends are idempotent; keep t > since_t.
-        let mut by_t: std::collections::BTreeMap<i64, ContentId> = std::collections::BTreeMap::new();
+        let mut by_t: std::collections::BTreeMap<i64, ContentId> =
+            std::collections::BTreeMap::new();
         for line in content.lines() {
             let line = line.trim();
             if line.is_empty() {
@@ -1352,12 +1353,7 @@ impl RefPublisher for FileNameService {
                     if let Some(cid) = new_clone.id.as_ref() {
                         let cid_str = cid.to_string();
                         if let Err(e) = self
-                            .append_commit_index_entry(
-                                &ledger_name,
-                                &branch,
-                                new_clone.t,
-                                &cid_str,
-                            )
+                            .append_commit_index_entry(&ledger_name, &branch, new_clone.t, &cid_str)
                             .await
                         {
                             tracing::debug!(error = %e, ledger_id, t = new_clone.t, "commit-index append failed (non-fatal)");

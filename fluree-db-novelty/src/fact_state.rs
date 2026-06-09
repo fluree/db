@@ -121,7 +121,13 @@ mod tests {
         let mut fs = NoveltyFactState::new();
         fs.record(0, &mk(1, true, Some("en")));
         assert!(fs.is_asserted(0, &mk(1, true, Some("en"))));
-        assert!(!fs.is_asserted(0, &mk(1, true, Some("fr"))), "different lang = different identity");
-        assert!(!fs.is_asserted(0, &mk(1, true, None)), "no-meta = different identity");
+        assert!(
+            !fs.is_asserted(0, &mk(1, true, Some("fr"))),
+            "different lang = different identity"
+        );
+        assert!(
+            !fs.is_asserted(0, &mk(1, true, None)),
+            "no-meta = different identity"
+        );
     }
 }
