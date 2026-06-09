@@ -27,6 +27,7 @@ use std::sync::Arc;
 
 const OUTPUT_BATCH_SIZE: usize = 1024;
 const DEFAULT_MAX_PREDICATE_ROWS: u64 = 10_000_000;
+const DEFAULT_MAX_SQUARE_WEDGE_PAIRS: usize = 5_000_000;
 
 fn cyclic_bgp_enabled() -> bool {
     !matches!(
@@ -40,6 +41,13 @@ fn max_predicate_rows() -> u64 {
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(DEFAULT_MAX_PREDICATE_ROWS)
+}
+
+fn max_square_wedge_pairs() -> usize {
+    std::env::var("FLUREE_CYCLIC_BGP_MAX_WEDGE_PAIRS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(DEFAULT_MAX_SQUARE_WEDGE_PAIRS)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -280,6 +288,41 @@ impl RelationIndex {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct WedgePairKey(Binding, Binding);
+
+#[derive(Debug, Clone)]
+struct EncodedSquareWedgePlan {
+    build_center: VarId,
+    probe_center: VarId,
+    key_a: VarId,
+    key_b: VarId,
+    build_edge_a: usize,
+    build_edge_b: usize,
+    probe_edge_a: usize,
+    probe_edge_b: usize,
+    build_pairs: usize,
+    probe_pairs: usize,
+}
+
+struct EncodedProbeWedgeCursor {
+    center: Binding,
+    values_a: Vec<Binding>,
+    values_b: Vec<Binding>,
+    a_pos: usize,
+    b_pos: usize,
+    matches: Vec<Binding>,
+    match_pos: usize,
+}
+
+struct EncodedSquareWedgeState {
+    plan: EncodedSquareWedgePlan,
+    table: FxHashMap<WedgePairKey, Vec<Binding>>,
+    probe_centers: Vec<Binding>,
+    probe_center_pos: usize,
+    current: Option<EncodedProbeWedgeCursor>,
+}
+
 pub(crate) struct CyclicBgpOperator {
     plan: CyclicBgpPlan,
     join_mode: CyclicJoinMode,
@@ -294,6 +337,7 @@ pub(crate) struct CyclicBgpOperator {
     driver_pos: usize,
     ref_pending: VecDeque<Vec<u64>>,
     pending: VecDeque<Vec<Binding>>,
+    square_wedge: Option<EncodedSquareWedgeState>,
     used_fast_path: bool,
     raw_relation_rows: usize,
     pruned_relation_rows: usize,
@@ -340,6 +384,7 @@ impl CyclicBgpOperator {
             driver_pos: 0,
             ref_pending: VecDeque::new(),
             pending: VecDeque::new(),
+            square_wedge: None,
             used_fast_path: false,
             raw_relation_rows: 0,
             pruned_relation_rows: 0,
@@ -531,6 +576,7 @@ impl CyclicBgpOperator {
         relations = self.prune_relations(relations);
         self.raw_relation_rows = raw_rows;
         self.pruned_relation_rows = relations.iter().map(|rel| rel.rows.len()).sum();
+        self.square_wedge = self.open_encoded_square_wedge(&relations);
         self.driver_idx = self.choose_driver(&relations);
         self.relations = relations;
         self.used_fast_path = true;
@@ -652,6 +698,234 @@ impl CyclicBgpOperator {
             .entry(var)
             .and_modify(|existing| existing.retain(|value| values.contains(value)))
             .or_insert(values);
+    }
+
+    fn open_encoded_square_wedge(
+        &self,
+        relations: &[RelationIndex],
+    ) -> Option<EncodedSquareWedgeState> {
+        if self.plan.shape != CyclicBgpShape::Square || relations.len() != 4 {
+            return None;
+        }
+
+        let cap = max_square_wedge_pairs();
+        let plan = self
+            .encoded_square_wedge_plans(relations)
+            .into_iter()
+            .min_by_key(|plan| (plan.build_pairs, plan.probe_pairs))?;
+        if plan.build_pairs > cap {
+            return None;
+        }
+
+        let table = self.build_encoded_wedge_table(relations, &plan, cap)?;
+        let probe_centers = self.wedge_center_intersection(
+            &relations[plan.probe_edge_a],
+            &relations[plan.probe_edge_b],
+            plan.probe_center,
+        );
+
+        Some(EncodedSquareWedgeState {
+            plan,
+            table,
+            probe_centers,
+            probe_center_pos: 0,
+            current: None,
+        })
+    }
+
+    fn encoded_square_wedge_plans(
+        &self,
+        relations: &[RelationIndex],
+    ) -> Vec<EncodedSquareWedgePlan> {
+        let vars = self.plan.vars.as_ref();
+        let mut plans = Vec::new();
+        for i in 0..vars.len() {
+            for j in (i + 1)..vars.len() {
+                let center_a = vars[i];
+                let center_b = vars[j];
+                if self.edge_between(relations, center_a, center_b).is_some() {
+                    continue;
+                }
+                let keys: Vec<VarId> = vars
+                    .iter()
+                    .copied()
+                    .filter(|v| *v != center_a && *v != center_b)
+                    .collect();
+                if keys.len() != 2 {
+                    continue;
+                }
+                let key_a = keys[0];
+                let key_b = keys[1];
+                let Some(a_edge_a) = self.edge_between(relations, center_a, key_a) else {
+                    continue;
+                };
+                let Some(a_edge_b) = self.edge_between(relations, center_a, key_b) else {
+                    continue;
+                };
+                let Some(b_edge_a) = self.edge_between(relations, center_b, key_a) else {
+                    continue;
+                };
+                let Some(b_edge_b) = self.edge_between(relations, center_b, key_b) else {
+                    continue;
+                };
+
+                let a_pairs =
+                    self.wedge_pair_count(&relations[a_edge_a], &relations[a_edge_b], center_a);
+                let b_pairs =
+                    self.wedge_pair_count(&relations[b_edge_a], &relations[b_edge_b], center_b);
+                if a_pairs <= b_pairs {
+                    plans.push(EncodedSquareWedgePlan {
+                        build_center: center_a,
+                        probe_center: center_b,
+                        key_a,
+                        key_b,
+                        build_edge_a: a_edge_a,
+                        build_edge_b: a_edge_b,
+                        probe_edge_a: b_edge_a,
+                        probe_edge_b: b_edge_b,
+                        build_pairs: a_pairs,
+                        probe_pairs: b_pairs,
+                    });
+                } else {
+                    plans.push(EncodedSquareWedgePlan {
+                        build_center: center_b,
+                        probe_center: center_a,
+                        key_a,
+                        key_b,
+                        build_edge_a: b_edge_a,
+                        build_edge_b: b_edge_b,
+                        probe_edge_a: a_edge_a,
+                        probe_edge_b: a_edge_b,
+                        build_pairs: b_pairs,
+                        probe_pairs: a_pairs,
+                    });
+                }
+            }
+        }
+        plans
+    }
+
+    fn edge_between(&self, relations: &[RelationIndex], a: VarId, b: VarId) -> Option<usize> {
+        relations.iter().position(|rel| {
+            (rel.edge.subject == a && rel.edge.object == b)
+                || (rel.edge.subject == b && rel.edge.object == a)
+        })
+    }
+
+    fn wedge_pair_count(
+        &self,
+        edge_a: &RelationIndex,
+        edge_b: &RelationIndex,
+        center: VarId,
+    ) -> usize {
+        self.wedge_center_intersection(edge_a, edge_b, center)
+            .into_iter()
+            .map(|center_value| {
+                self.relation_degree_for_center(edge_a, center, &center_value)
+                    .saturating_mul(self.relation_degree_for_center(edge_b, center, &center_value))
+            })
+            .sum()
+    }
+
+    fn wedge_center_intersection(
+        &self,
+        edge_a: &RelationIndex,
+        edge_b: &RelationIndex,
+        center: VarId,
+    ) -> Vec<Binding> {
+        let values_a = self.relation_center_values(edge_a, center);
+        let values_b = self.relation_center_values(edge_b, center);
+        values_a
+            .into_iter()
+            .filter(|value| values_b.contains(value))
+            .collect()
+    }
+
+    fn relation_center_values(&self, rel: &RelationIndex, center: VarId) -> FxHashSet<Binding> {
+        if rel.edge.subject == center {
+            rel.by_subject
+                .keys()
+                .map(|s_id| Binding::encoded_sid(*s_id))
+                .collect()
+        } else if rel.edge.object == center {
+            rel.by_object.keys().cloned().collect()
+        } else {
+            FxHashSet::default()
+        }
+    }
+
+    fn relation_degree_for_center(
+        &self,
+        rel: &RelationIndex,
+        center: VarId,
+        center_value: &Binding,
+    ) -> usize {
+        if rel.edge.subject == center {
+            center_value
+                .encoded_s_id()
+                .and_then(|s_id| rel.by_subject.get(&s_id).map(Vec::len))
+                .unwrap_or(0)
+        } else if rel.edge.object == center {
+            rel.by_object.get(center_value).map(Vec::len).unwrap_or(0)
+        } else {
+            0
+        }
+    }
+
+    fn relation_values_for_center(
+        &self,
+        rel: &RelationIndex,
+        center: VarId,
+        center_value: &Binding,
+    ) -> Vec<Binding> {
+        if rel.edge.subject == center {
+            center_value
+                .encoded_s_id()
+                .and_then(|s_id| rel.by_subject.get(&s_id).cloned())
+                .unwrap_or_default()
+        } else if rel.edge.object == center {
+            rel.by_object
+                .get(center_value)
+                .map(|subjects| {
+                    subjects
+                        .iter()
+                        .map(|s_id| Binding::encoded_sid(*s_id))
+                        .collect()
+                })
+                .unwrap_or_default()
+        } else {
+            Vec::new()
+        }
+    }
+
+    fn build_encoded_wedge_table(
+        &self,
+        relations: &[RelationIndex],
+        plan: &EncodedSquareWedgePlan,
+        cap: usize,
+    ) -> Option<FxHashMap<WedgePairKey, Vec<Binding>>> {
+        let edge_a = &relations[plan.build_edge_a];
+        let edge_b = &relations[plan.build_edge_b];
+        let centers = self.wedge_center_intersection(edge_a, edge_b, plan.build_center);
+        let mut table: FxHashMap<WedgePairKey, Vec<Binding>> = FxHashMap::default();
+        let mut total = 0usize;
+        for center in centers {
+            let values_a = self.relation_values_for_center(edge_a, plan.build_center, &center);
+            let values_b = self.relation_values_for_center(edge_b, plan.build_center, &center);
+            for value_a in &values_a {
+                for value_b in &values_b {
+                    total = total.saturating_add(1);
+                    if total > cap {
+                        return None;
+                    }
+                    table
+                        .entry(WedgePairKey(value_a.clone(), value_b.clone()))
+                        .or_default()
+                        .push(center.clone());
+                }
+            }
+        }
+        Some(table)
     }
 
     fn choose_ref_driver(&self, relations: &[RefRelationIndex]) -> usize {
@@ -1004,6 +1278,119 @@ impl CyclicBgpOperator {
         }
     }
 
+    fn next_square_wedge_match(
+        &self,
+        state: &mut EncodedSquareWedgeState,
+    ) -> Option<(Binding, Binding, Binding, Binding)> {
+        loop {
+            if state.current.is_none() {
+                while state.probe_center_pos < state.probe_centers.len() {
+                    let center = state.probe_centers[state.probe_center_pos].clone();
+                    state.probe_center_pos += 1;
+                    let values_a = self.relation_values_for_center(
+                        &self.relations[state.plan.probe_edge_a],
+                        state.plan.probe_center,
+                        &center,
+                    );
+                    let values_b = self.relation_values_for_center(
+                        &self.relations[state.plan.probe_edge_b],
+                        state.plan.probe_center,
+                        &center,
+                    );
+                    if !values_a.is_empty() && !values_b.is_empty() {
+                        state.current = Some(EncodedProbeWedgeCursor {
+                            center,
+                            values_a,
+                            values_b,
+                            a_pos: 0,
+                            b_pos: 0,
+                            matches: Vec::new(),
+                            match_pos: 0,
+                        });
+                        break;
+                    }
+                }
+                state.current.as_ref()?;
+            }
+
+            let cursor = state.current.as_mut().expect("square wedge cursor");
+            if cursor.match_pos < cursor.matches.len() {
+                let build_center = cursor.matches[cursor.match_pos].clone();
+                cursor.match_pos += 1;
+                return Some((
+                    build_center,
+                    cursor.center.clone(),
+                    cursor.values_a[cursor.a_pos].clone(),
+                    cursor.values_b[cursor.b_pos].clone(),
+                ));
+            }
+            if !cursor.matches.is_empty() {
+                advance_probe_cursor(cursor);
+            }
+
+            while cursor.a_pos < cursor.values_a.len() {
+                if cursor.b_pos >= cursor.values_b.len() {
+                    cursor.a_pos += 1;
+                    cursor.b_pos = 0;
+                    continue;
+                }
+                let key_a = cursor.values_a[cursor.a_pos].clone();
+                let key_b = cursor.values_b[cursor.b_pos].clone();
+                if let Some(matches) = state.table.get(&WedgePairKey(key_a, key_b)) {
+                    cursor.matches = matches.clone();
+                    cursor.match_pos = 0;
+                    if !cursor.matches.is_empty() {
+                        break;
+                    }
+                }
+                advance_probe_cursor(cursor);
+            }
+
+            if cursor.a_pos >= cursor.values_a.len() {
+                state.current = None;
+            }
+        }
+    }
+
+    fn next_encoded_square_wedge_batch(&mut self) -> Result<Option<Batch>> {
+        let mut state = self
+            .square_wedge
+            .take()
+            .expect("square wedge state must exist for wedge batch");
+        let mut cols: Vec<Vec<Binding>> = self.schema.iter().map(|_| Vec::new()).collect();
+        let mut produced = 0usize;
+        while produced < OUTPUT_BATCH_SIZE {
+            let Some((build_center, probe_center, key_a, key_b)) =
+                self.next_square_wedge_match(&mut state)
+            else {
+                break;
+            };
+            if cols.is_empty() {
+                produced += 1;
+                continue;
+            }
+            let mut assignment = vec![Binding::Unbound; self.plan.vars.len()];
+            assignment[self.var_pos(state.plan.build_center)] = build_center;
+            assignment[self.var_pos(state.plan.probe_center)] = probe_center;
+            assignment[self.var_pos(state.plan.key_a)] = key_a;
+            assignment[self.var_pos(state.plan.key_b)] = key_b;
+            self.assignment_to_columns(&assignment, &mut cols);
+            produced += 1;
+        }
+        self.square_wedge = Some(state);
+
+        if produced == 0 {
+            self.state = OperatorState::Exhausted;
+            return Ok(None);
+        }
+        if cols.is_empty() {
+            return Ok(Some(Batch::empty_schema_with_len(produced)));
+        }
+        Batch::new(Arc::clone(&self.schema), cols)
+            .map(Some)
+            .map_err(|e| QueryError::Internal(format!("cyclic bgp square wedge batch: {e}")))
+    }
+
     fn ref_assignment_to_columns(&self, assignment: &[u64], cols: &mut [Vec<Binding>]) {
         for (out_idx, var_idx) in self.schema_positions.iter().copied().enumerate() {
             cols[out_idx].push(Binding::encoded_sid(assignment[var_idx]));
@@ -1044,6 +1431,9 @@ impl CyclicBgpOperator {
     }
 
     fn next_encoded_batch(&mut self) -> Result<Option<Batch>> {
+        if self.square_wedge.is_some() {
+            return self.next_encoded_square_wedge_batch();
+        }
         let mut cols: Vec<Vec<Binding>> = self.schema.iter().map(|_| Vec::new()).collect();
         let mut produced = 0usize;
         while produced < OUTPUT_BATCH_SIZE {
@@ -1085,6 +1475,16 @@ fn average_bucket_size(rows: usize, distinct: usize) -> usize {
     }
 }
 
+fn advance_probe_cursor(cursor: &mut EncodedProbeWedgeCursor) {
+    cursor.matches.clear();
+    cursor.match_pos = 0;
+    cursor.b_pos += 1;
+    if cursor.b_pos >= cursor.values_b.len() {
+        cursor.a_pos += 1;
+        cursor.b_pos = 0;
+    }
+}
+
 fn predicate_display(predicate: &Ref) -> String {
     match predicate {
         Ref::Sid(sid) => format!("{}:{}", sid.namespace_code, sid.name),
@@ -1107,6 +1507,15 @@ impl Operator for CyclicBgpOperator {
         m.insert("object-only-values".into(), self.join_mode.as_str().into());
         m.insert("pruning".into(), "semi_join".into());
         m.insert("driver-selection".into(), "pruned_bound_fanout".into());
+        if let Some(state) = &self.square_wedge {
+            m.insert("square-strategy".into(), "wedge_pair_hash".into());
+            m.insert("square-build-pairs".into(), state.plan.build_pairs.into());
+            m.insert("square-probe-pairs".into(), state.plan.probe_pairs.into());
+            m.insert(
+                "square-wedge-pair-cap".into(),
+                max_square_wedge_pairs().into(),
+            );
+        }
         if self.raw_relation_rows > 0 {
             m.insert("raw-relation-rows".into(), self.raw_relation_rows.into());
             m.insert(
@@ -1190,6 +1599,7 @@ impl Operator for CyclicBgpOperator {
         self.relations.clear();
         self.ref_pending.clear();
         self.pending.clear();
+        self.square_wedge = None;
         self.state = OperatorState::Closed;
     }
 }
@@ -1216,6 +1626,18 @@ mod tests {
                 .map(|(subject, object)| RefEdgeRow {
                     subject: *subject,
                     object: *object,
+                })
+                .collect(),
+        )
+    }
+
+    fn rel(edge: &CyclicEdge, rows: &[(u64, u64)]) -> RelationIndex {
+        RelationIndex::new(
+            edge.clone(),
+            rows.iter()
+                .map(|(subject, object)| EdgeRow {
+                    subject: *subject,
+                    object: Binding::encoded_sid(*object),
                 })
                 .collect(),
         )
@@ -1331,5 +1753,65 @@ mod tests {
             .choose_next_ref_relation_with(&relations, &assigned, &used)
             .expect("one relation should be selected");
         assert_eq!(next, 1);
+    }
+
+    #[test]
+    fn encoded_square_wedge_uses_smaller_exact_pair_side() {
+        let triples = vec![
+            triple(0, "left_a", 1),
+            triple(0, "left_b", 2),
+            triple(3, "right_a", 1),
+            triple(3, "right_b", 2),
+        ];
+        let op = operator_for(&triples);
+        let relations = vec![
+            // Center ?v0 has 2 * 2 = 4 pairs.
+            rel(&op.plan.edges[0], &[(1, 10), (1, 11)]),
+            rel(&op.plan.edges[1], &[(1, 20), (1, 21)]),
+            // Center ?v3 has 1 * 1 = 1 pair, so it should be the build side.
+            rel(&op.plan.edges[2], &[(3, 10)]),
+            rel(&op.plan.edges[3], &[(3, 20)]),
+        ];
+
+        let state = op
+            .open_encoded_square_wedge(&relations)
+            .expect("square wedge should be selected");
+        assert!(matches!(state.plan.build_center, VarId(1) | VarId(3)));
+        assert_ne!(state.plan.build_center, state.plan.probe_center);
+        assert_eq!(state.plan.build_pairs, 1);
+        assert!(state.plan.probe_pairs >= state.plan.build_pairs);
+    }
+
+    #[test]
+    fn encoded_square_wedge_streams_probe_pairs_and_outputs_matches() {
+        let triples = vec![
+            triple(0, "left_a", 1),
+            triple(0, "left_b", 2),
+            triple(3, "right_a", 1),
+            triple(3, "right_b", 2),
+        ];
+        let mut op = operator_for(&triples);
+        let relations = vec![
+            rel(&op.plan.edges[0], &[(1, 10), (2, 99)]),
+            rel(&op.plan.edges[1], &[(1, 20), (2, 20)]),
+            rel(&op.plan.edges[2], &[(3, 10)]),
+            rel(&op.plan.edges[3], &[(3, 20)]),
+        ];
+        let relations = op.prune_relations(relations);
+        let state = op
+            .open_encoded_square_wedge(&relations)
+            .expect("square wedge should be selected");
+        op.relations = relations;
+        op.square_wedge = Some(state);
+
+        let batch = op
+            .next_encoded_batch()
+            .expect("square wedge batch should succeed")
+            .expect("one batch should be produced");
+        assert_eq!(batch.len(), 1);
+        assert_eq!(batch.get_by_col(0, 0), &Binding::encoded_sid(1));
+        assert_eq!(batch.get_by_col(0, 1), &Binding::encoded_sid(10));
+        assert_eq!(batch.get_by_col(0, 2), &Binding::encoded_sid(20));
+        assert_eq!(batch.get_by_col(0, 3), &Binding::encoded_sid(3));
     }
 }
