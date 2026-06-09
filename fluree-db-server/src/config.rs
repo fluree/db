@@ -633,6 +633,14 @@ pub struct ServerConfig {
     )]
     pub mcp_agent_json_max_bytes: usize,
 
+    /// Query execution timeout for MCP `sparql_query` in milliseconds (default 5 minutes, 0 disables timeout).
+    #[arg(
+        long,
+        env = "FLUREE_MCP_QUERY_TIMEOUT_MS",
+        default_value_t = server_defaults::DEFAULT_MCP_QUERY_TIMEOUT_MS
+    )]
+    pub mcp_query_timeout_ms: u64,
+
     // === Admin endpoint authentication options ===
     /// Authentication mode for admin endpoints (/fluree/create, /fluree/drop)
     #[arg(
@@ -714,6 +722,7 @@ impl Default for ServerConfig {
             mcp_auth_trusted_issuers: Vec::new(),
             mcp_auth_insecure_accept_any_issuer: false,
             mcp_agent_json_max_bytes: server_defaults::DEFAULT_MCP_AGENT_JSON_MAX_BYTES,
+            mcp_query_timeout_ms: server_defaults::DEFAULT_MCP_QUERY_TIMEOUT_MS,
             // Admin auth defaults
             admin_auth_mode: AdminAuthMode::None,
             admin_auth_trusted_issuers: Vec::new(),

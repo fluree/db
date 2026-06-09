@@ -294,7 +294,9 @@ Maximum request body size in bytes:
 Maximum query execution time in milliseconds. The server starts a timeout task
 that signals query cancellation when the limit elapses; query execution observes
 that signal at batch/leaf boundaries. Set to `0` to disable the server-side
-timeout.
+timeout. If the HTTP request is dropped because the client disconnects, the
+server drops the in-flight request future; that is separate from this
+cooperative timeout signal.
 
 | Flag                 | Env Var                    | Default                  |
 | -------------------- | -------------------------- | ------------------------ |
@@ -531,16 +533,22 @@ If no admin-specific issuers are configured, falls back to `--events-auth-truste
 
 Protect and tune the `/mcp` Model Context Protocol endpoint:
 
-| Flag                         | Env Var                           | Default |
-| ---------------------------- | --------------------------------- | ------- |
-| `--mcp-enabled`              | `FLUREE_MCP_ENABLED`              | `false` |
-| `--mcp-auth-trusted-issuer`  | `FLUREE_MCP_AUTH_TRUSTED_ISSUERS` | None    |
-| `--mcp-agent-json-max-bytes` | `FLUREE_MCP_AGENT_JSON_MAX_BYTES` | `32768` |
+| Flag                         | Env Var                           | Default                |
+| ---------------------------- | --------------------------------- | ---------------------- |
+| `--mcp-enabled`              | `FLUREE_MCP_ENABLED`              | `false`                |
+| `--mcp-auth-trusted-issuer`  | `FLUREE_MCP_AUTH_TRUSTED_ISSUERS` | None                   |
+| `--mcp-agent-json-max-bytes` | `FLUREE_MCP_AGENT_JSON_MAX_BYTES` | `32768`                |
+| `--mcp-query-timeout-ms`     | `FLUREE_MCP_QUERY_TIMEOUT_MS`     | `300000` (5 minutes)   |
 
 `--mcp-agent-json-max-bytes` (config file: `[server.mcp] agent_json_max_bytes`) is the byte
 budget for the MCP `sparql_query` tool's Agent JSON result. Results larger than this are
 truncated and the envelope sets `hasMore: true`; an agent paginates by re-running with the
 returned `t`, an `ORDER BY`, and `OFFSET` advanced by the returned `rowCount`.
+
+`--mcp-query-timeout-ms` (config file: `[server.mcp] query_timeout_ms`) is the
+server-side timeout for MCP `sparql_query` execution. It uses the same
+cooperative cancellation mechanism as HTTP queries, but defaults lower because
+MCP tool calls are usually interactive. Set to `0` to disable the MCP timeout.
 
 ```bash
 fluree-server \
@@ -784,6 +792,7 @@ fluree server run \
 | `FLUREE_MCP_ENABLED`                    | Enable MCP endpoint                             | `false`                                                                 |
 | `FLUREE_MCP_AUTH_TRUSTED_ISSUERS`       | MCP trusted issuers                             | None                                                                    |
 | `FLUREE_MCP_AGENT_JSON_MAX_BYTES`       | MCP `sparql_query` Agent JSON byte budget       | `32768`                                                                 |
+| `FLUREE_MCP_QUERY_TIMEOUT_MS`           | MCP `sparql_query` execution timeout            | `300000`                                                                |
 | `FLUREE_STORAGE_ACCESS_MODE`            | Peer storage mode                               | `shared`                                                                |
 | `FLUREE_STORAGE_PROXY_ENABLED`          | Enable storage proxy                            | `false`                                                                 |
 

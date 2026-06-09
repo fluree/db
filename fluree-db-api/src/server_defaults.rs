@@ -126,6 +126,9 @@ pub const DEFAULT_MCP_ENABLED: bool = false;
 /// with `hasMore: true`.
 pub const DEFAULT_MCP_AGENT_JSON_MAX_BYTES: usize = 32_768;
 
+/// Default timeout for MCP `sparql_query` execution (5 minutes).
+pub const DEFAULT_MCP_QUERY_TIMEOUT_MS: u64 = 5 * 60 * 1000;
+
 // ── Peer ────────────────────────────────────────────────────────────
 
 pub const DEFAULT_PEER_ROLE: &str = "transaction";

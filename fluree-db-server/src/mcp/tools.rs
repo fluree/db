@@ -205,6 +205,9 @@ impl FlureeToolService {
                 view.query(self.state.fluree.as_ref())
                     .sparql(query)
                     .format(config)
+                    .execution_options(crate::query_control::query_execution_options(
+                        self.state.config.mcp_query_timeout_ms,
+                    ))
                     .execute_formatted()
                     .await?
             }
@@ -220,6 +223,9 @@ impl FlureeToolService {
                     .query()
                     .sparql(query)
                     .format(config)
+                    .execution_options(crate::query_control::query_execution_options(
+                        self.state.config.mcp_query_timeout_ms,
+                    ))
                     .execute_formatted()
                     .await?
             }
