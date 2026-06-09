@@ -1562,9 +1562,11 @@ impl Operator for OptionalOperator {
                         // Collect all optional results
                         let mut optional_batches = Vec::new();
                         while let Some(opt_batch) = optional_op.next_batch(ctx).await? {
+                            ctx.check_cancelled()?;
                             if !opt_batch.is_empty() {
                                 optional_batches.push(opt_batch);
                             }
+                            ctx.check_cancelled()?;
                         }
                         optional_result_batches += optional_batches.len();
 

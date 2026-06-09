@@ -13,7 +13,6 @@
 //! - **Composition**: All builders share `QueryCore` for common fields.
 
 use std::sync::Arc;
-use std::time::Duration;
 
 use serde_json::Value as JsonValue;
 
@@ -119,10 +118,6 @@ impl<'a> QueryCore<'a> {
 
     pub(crate) fn set_cancellation(&mut self, cancellation: fluree_db_core::QueryCancellation) {
         self.execution.cancellation = Some(cancellation);
-    }
-
-    pub(crate) fn set_timeout(&mut self, timeout: Duration) {
-        self.set_cancellation(fluree_db_core::QueryCancellation::with_timeout(timeout));
     }
 
     pub(crate) fn set_execution_options(&mut self, options: QueryExecutionOptions) {
@@ -243,15 +238,9 @@ impl<'a> ViewQueryBuilder<'a> {
         self
     }
 
-    /// Attach a cooperative cancellation/deadline handle.
+    /// Attach a cooperative cancellation handle.
     pub fn cancellation(mut self, cancellation: fluree_db_core::QueryCancellation) -> Self {
         self.core.set_cancellation(cancellation);
-        self
-    }
-
-    /// Cancel query execution if it exceeds the given timeout.
-    pub fn timeout(mut self, timeout: Duration) -> Self {
-        self.core.set_timeout(timeout);
         self
     }
 
@@ -533,15 +522,9 @@ impl<'a> DatasetQueryBuilder<'a> {
         self
     }
 
-    /// Attach a cooperative cancellation/deadline handle.
+    /// Attach a cooperative cancellation handle.
     pub fn cancellation(mut self, cancellation: fluree_db_core::QueryCancellation) -> Self {
         self.core.set_cancellation(cancellation);
-        self
-    }
-
-    /// Cancel query execution if it exceeds the given timeout.
-    pub fn timeout(mut self, timeout: Duration) -> Self {
-        self.core.set_timeout(timeout);
         self
     }
 
@@ -834,15 +817,9 @@ impl<'a> FromQueryBuilder<'a> {
         self
     }
 
-    /// Attach a cooperative cancellation/deadline handle.
+    /// Attach a cooperative cancellation handle.
     pub fn cancellation(mut self, cancellation: fluree_db_core::QueryCancellation) -> Self {
         self.core.set_cancellation(cancellation);
-        self
-    }
-
-    /// Cancel query execution if it exceeds the given timeout.
-    pub fn timeout(mut self, timeout: Duration) -> Self {
-        self.core.set_timeout(timeout);
         self
     }
 

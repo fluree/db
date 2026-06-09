@@ -291,9 +291,10 @@ Maximum request body size in bytes:
 
 ### Query Timeout
 
-Maximum query execution time in milliseconds. The server passes this deadline
-into query execution so long-running queries are cancelled at batch boundaries.
-Set to `0` to disable the server-side timeout.
+Maximum query execution time in milliseconds. The server starts a timeout task
+that signals query cancellation when the limit elapses; query execution observes
+that signal at batch/leaf boundaries. Set to `0` to disable the server-side
+timeout.
 
 | Flag                 | Env Var                    | Default                  |
 | -------------------- | -------------------------- | ------------------------ |

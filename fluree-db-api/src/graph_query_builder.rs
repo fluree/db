@@ -4,7 +4,6 @@
 //! - [`GraphSnapshotQueryBuilder`] — query from a materialized snapshot or [`StagedGraph`]
 
 use serde_json::Value as JsonValue;
-use std::time::Duration;
 
 use crate::error::BuilderErrors;
 use crate::format::FormatterConfig;
@@ -91,15 +90,9 @@ impl<'a, 'g> GraphQueryBuilder<'a, 'g> {
         self
     }
 
-    /// Attach a cooperative cancellation/deadline handle.
+    /// Attach a cooperative cancellation handle.
     pub fn cancellation(mut self, cancellation: fluree_db_core::QueryCancellation) -> Self {
         self.core.set_cancellation(cancellation);
-        self
-    }
-
-    /// Cancel query execution if it exceeds the given timeout.
-    pub fn timeout(mut self, timeout: Duration) -> Self {
-        self.core.set_timeout(timeout);
         self
     }
 
@@ -374,15 +367,9 @@ impl<'a: 'v, 'v> GraphSnapshotQueryBuilder<'a, 'v> {
         self
     }
 
-    /// Attach a cooperative cancellation/deadline handle.
+    /// Attach a cooperative cancellation handle.
     pub fn cancellation(mut self, cancellation: fluree_db_core::QueryCancellation) -> Self {
         self.core.set_cancellation(cancellation);
-        self
-    }
-
-    /// Cancel query execution if it exceeds the given timeout.
-    pub fn timeout(mut self, timeout: Duration) -> Self {
-        self.core.set_timeout(timeout);
         self
     }
 

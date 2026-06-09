@@ -904,6 +904,7 @@ impl Operator for PropertyJoinOperator {
                 scan.open(ctx).await?;
 
                 while let Some(batch) = scan.next_batch(ctx).await? {
+                    ctx.check_cancelled()?;
                     // Schema for this scan is either:
                     // - emitted predicate: [subject_var, temp_obj_var]
                     // - existence-only:   [subject_var]
@@ -962,6 +963,7 @@ impl Operator for PropertyJoinOperator {
                             }
                         }
                     }
+                    ctx.check_cancelled()?;
                 }
 
                 scan.close();

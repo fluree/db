@@ -43,7 +43,7 @@ pub const INVALID_TRANSACTION: &str = "err:db/InvalidTransaction";
 /// Query execution error
 pub const QUERY_EXECUTION: &str = "err:db/QueryExecution";
 
-/// Query was cancelled by a deadline, caller, or disconnected client.
+/// Query was cancelled by a timeout monitor, caller, or disconnected client.
 pub const QUERY_CANCELLED: &str = "err:db/QueryCancelled";
 
 /// Transaction execution error

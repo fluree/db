@@ -1178,6 +1178,7 @@ impl Operator for NestedLoopJoinOperator {
 
         // Process until we have output or exhaust input
         loop {
+            ctx.check_cancelled()?;
             // 1. Pre-built output from batched flush
             if let Some(batch) = self.batched_output.pop_front() {
                 return Ok(trim_batch(&self.out_schema, batch));
@@ -1194,7 +1195,9 @@ impl Operator for NestedLoopJoinOperator {
 
             // 3. Resume an in-flight right scan for the current left row.
             if let Some(scan) = &mut self.active_right_scan {
+                ctx.check_cancelled()?;
                 let next = scan.next_batch(ctx).await?;
+                ctx.check_cancelled()?;
 
                 match next {
                     Some(batch) if !batch.is_empty() => {
@@ -1223,6 +1226,7 @@ impl Operator for NestedLoopJoinOperator {
 
             // 4. Need to process more left rows
             if self.current_left_batch.is_none() {
+                ctx.check_cancelled()?;
                 match self.left.next_batch(ctx).await? {
                     Some(batch) => {
                         self.current_left_batch = Some(batch);
@@ -1233,7 +1237,9 @@ impl Operator for NestedLoopJoinOperator {
                     None => {
                         // Left exhausted — flush any remaining accumulator
                         if !self.batched_accumulator.is_empty() {
+                            ctx.check_cancelled()?;
                             self.flush_batched_accumulator_for_ctx(ctx).await?;
+                            ctx.check_cancelled()?;
                             continue;
                         }
                         self.state = OperatorState::Exhausted;
@@ -1305,7 +1311,9 @@ impl Operator for NestedLoopJoinOperator {
                     let batch_idx = self.ensure_current_batch_stored();
                     self.batched_accumulator.push((batch_idx, left_row, key));
                     if self.batched_accumulator.len() >= BATCHED_JOIN_SIZE {
+                        ctx.check_cancelled()?;
                         self.flush_batched_accumulator_for_ctx(ctx).await?;
+                        ctx.check_cancelled()?;
                     }
                 } else {
                     // Fall back to per-row scan for unsupported binding types.
@@ -1650,6 +1658,7 @@ impl NestedLoopJoinOperator {
         let to_t_u32 = u32::try_from(ctx.to_t).unwrap_or(u32::MAX);
 
         for leaf_idx in leaf_range {
+            ctx.check_cancelled()?;
             let leaf_entry = &branch.leaves[leaf_idx];
             let LeafScan {
                 leaf_bytes,
@@ -1660,6 +1669,7 @@ impl NestedLoopJoinOperator {
             } = prepare_leaf_for_scan(store, leaf_entry, need_replay)?;
 
             for (leaflet_idx, entry) in dir.entries.iter().enumerate() {
+                ctx.check_cancelled()?;
                 leaflets_scanned += 1;
                 // An empty-after-retract leaflet (`row_count == 0`) is preserved
                 // by the indexer for time-travel replay. Skip only when there is
@@ -1708,6 +1718,7 @@ impl NestedLoopJoinOperator {
                     )
                     .map_err(|e| QueryError::Internal(format!("load columns: {e}")))?
                 };
+                ctx.check_cancelled()?;
 
                 // Apply time-travel replay when querying a historical snapshot.
                 // The cached `batch` reflects latest base state; `replay_leaflet_at_t`
@@ -2374,6 +2385,7 @@ impl NestedLoopJoinOperator {
         let need_replay = ctx.to_t < store.max_t();
         let to_t_u32 = u32::try_from(ctx.to_t).unwrap_or(u32::MAX);
         for leaf_idx in leaf_indices {
+            ctx.check_cancelled()?;
             let leaf_entry = &branch.leaves[leaf_idx];
             let LeafScan {
                 leaf_bytes,
@@ -2384,6 +2396,7 @@ impl NestedLoopJoinOperator {
             } = prepare_leaf_for_scan(&store, leaf_entry, need_replay)?;
 
             for (leaflet_idx, entry) in dir.entries.iter().enumerate() {
+                ctx.check_cancelled()?;
                 let needs_history_replay =
                     need_replay && entry.history_len > 0 && entry.history_max_t > to_t_u32;
                 if entry.row_count == 0 && !needs_history_replay {
@@ -2447,6 +2460,7 @@ impl NestedLoopJoinOperator {
                     load_leaflet_columns(&leaf_bytes, entry, dir.payload_base, &proj, header.order)
                         .map_err(|e| QueryError::Internal(format!("load columns: {e}")))?
                 };
+                ctx.check_cancelled()?;
 
                 // Apply time-travel replay when querying a historical snapshot.
                 let batch = if need_replay {
@@ -2465,6 +2479,7 @@ impl NestedLoopJoinOperator {
                 } else {
                     batch
                 };
+                ctx.check_cancelled()?;
 
                 // OPST leaflets are ordered by (o_type, o_key, p_id, s_id, t...).
                 // Instead of scanning every row in the leaflet, binary-search the
@@ -2854,6 +2869,7 @@ pub(crate) fn batched_subject_probe_binary(
     let mut out = Vec::new();
 
     for leaf_idx in leaf_range {
+        ctx.check_cancelled()?;
         let leaf_entry = &branch.leaves[leaf_idx];
         let LeafScan {
             leaf_bytes,
@@ -2864,6 +2880,7 @@ pub(crate) fn batched_subject_probe_binary(
         } = prepare_leaf_for_scan(store, leaf_entry, need_replay)?;
 
         for (leaflet_idx, entry) in dir.entries.iter().enumerate() {
+            ctx.check_cancelled()?;
             let needs_history_replay =
                 need_replay && entry.history_len > 0 && entry.history_max_t > to_t_u32;
             if entry.row_count == 0 && !needs_history_replay {
@@ -2902,6 +2919,7 @@ pub(crate) fn batched_subject_probe_binary(
                 )
                 .map_err(|e| QueryError::Internal(format!("load columns: {e}")))?
             };
+            ctx.check_cancelled()?;
 
             // Apply time-travel replay when querying a historical snapshot.
             let batch = if need_replay {
@@ -2920,6 +2938,7 @@ pub(crate) fn batched_subject_probe_binary(
             } else {
                 batch
             };
+            ctx.check_cancelled()?;
 
             let row_count = batch.row_count;
             let p_start = (0..row_count)

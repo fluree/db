@@ -526,7 +526,7 @@ pub async fn run_operator(
 /// This is the unified knob for all query execution paths.
 pub struct ContextConfig<'a, 'b> {
     pub tracker: Option<&'a Tracker>,
-    /// Cooperative cancellation/deadline handle for execution.
+    /// Cooperative cancellation handle for execution.
     pub cancellation: Option<QueryCancellation>,
     /// Policy enforcer for async policy evaluation with full f:query support.
     ///

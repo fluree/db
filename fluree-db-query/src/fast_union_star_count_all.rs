@@ -41,7 +41,16 @@ use crate::var_registry::VarId;
 use async_trait::async_trait;
 use fluree_db_binary_index::{BinaryCursor, RunSortOrder};
 use fluree_db_core::o_type::OType;
+use fluree_db_core::QueryCancellation;
 use std::sync::Arc;
+
+#[inline]
+fn check_cancelled(cancellation: &QueryCancellation) -> Result<()> {
+    match cancellation.reason() {
+        Some(reason) => Err(QueryError::Cancelled { reason }),
+        None => Ok(()),
+    }
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum UnionCountMode {
@@ -342,6 +351,7 @@ fn merge_union_constraint_count_range(
     g_id: fluree_db_core::GraphId,
     union_pids: &[u32],
     extra_pids: &[u32],
+    cancellation: &QueryCancellation,
     lo: u64,
     hi: u64,
 ) -> Result<u128> {
@@ -366,6 +376,7 @@ fn merge_union_constraint_count_range(
     let mut e = next_extra_product_group(&mut e_iters, &mut e_cur)?;
     let mut total: u128 = 0;
     while let (Some((us, usum)), Some((es, eprod))) = (u, e) {
+        check_cancelled(cancellation)?;
         if us < es {
             u = next_union_group(&mut u_iters, &mut u_cur)?;
             continue;
@@ -390,6 +401,7 @@ fn try_union_constraint_parallel(
     g_id: fluree_db_core::GraphId,
     union_preds: &[Ref],
     extra_preds: &[Ref],
+    cancellation: &QueryCancellation,
 ) -> Result<Option<u64>> {
     let mut union_pids: Vec<u32> = Vec::with_capacity(union_preds.len());
     let mut extra_pids: Vec<u32> = Vec::with_capacity(extra_preds.len());
@@ -424,7 +436,15 @@ fn try_union_constraint_parallel(
         .unwrap();
 
     crate::count_plan_exec::parallel_partition_count(store, g_id, driver_p, total_rows, |lo, hi| {
-        merge_union_constraint_count_range(store, g_id, &union_pids, &extra_pids, lo, hi)
+        merge_union_constraint_count_range(
+            store,
+            g_id,
+            &union_pids,
+            &extra_pids,
+            cancellation,
+            lo,
+            hi,
+        )
     })
 }
 
@@ -443,6 +463,7 @@ fn merge_union_constraint_count_range_overlay(
     extra_ops: &[Vec<fluree_db_binary_index::read::types::OverlayOp>],
     to_t: i64,
     epoch: u64,
+    cancellation: &QueryCancellation,
     lo: u64,
     hi: u64,
 ) -> Result<u128> {
@@ -489,6 +510,7 @@ fn merge_union_constraint_count_range_overlay(
     let mut e = next_extra_product_group(&mut e_streams, &mut e_cur)?;
     let mut total: u128 = 0;
     while let (Some((us, usum)), Some((es, eprod))) = (u, e) {
+        check_cancelled(cancellation)?;
         if us < es {
             u = next_union_group(&mut u_streams, &mut u_cur)?;
             continue;
@@ -587,7 +609,17 @@ fn try_union_constraint_overlay_parallel(
         total_rows,
         move |lo, hi| {
             merge_union_constraint_count_range_overlay(
-                store, g_id, union_pids, union_ops, extra_pids, extra_ops, to_t, epoch, lo, hi,
+                store,
+                g_id,
+                union_pids,
+                union_ops,
+                extra_pids,
+                extra_ops,
+                to_t,
+                epoch,
+                &ctx.cancellation,
+                lo,
+                hi,
             )
         },
     )
@@ -679,7 +711,9 @@ fn count_union_star(
         && !overlay_has_rows
         && !time_travel
     {
-        if let Some(total) = try_union_constraint_parallel(store, g_id, union_preds, extra_preds)? {
+        if let Some(total) =
+            try_union_constraint_parallel(store, g_id, union_preds, extra_preds, &ctx.cancellation)?
+        {
             return Ok(Some(total));
         }
     }
@@ -804,6 +838,7 @@ fn count_union_star(
     if extra_preds.is_empty() {
         let mut total: u64 = 0;
         while let Some((_s, u)) = next_union()? {
+            ctx.check_cancelled()?;
             total = total.saturating_add(u);
         }
         return Ok(Some(total));
@@ -880,6 +915,7 @@ fn count_union_star(
     let mut e_cur = next_extra_product()?;
     let mut total: u128 = 0;
     while let (Some((us, u)), Some((es, eprod))) = (u_cur, e_cur) {
+        ctx.check_cancelled()?;
         if us < es {
             u_cur = next_union()?;
             continue;

@@ -2061,11 +2061,14 @@ impl Operator for BinaryScanOperator {
                 break;
             };
 
+            ctx.check_cancelled()?;
             match cursor.next_batch() {
                 Ok(Some(batch)) => {
                     // Per-leaflet fuel charge happens inside cursor.next_batch.
+                    ctx.check_cancelled()?;
                     let n = self.batch_to_bindings(&batch, &mut columns, Some(ctx))?;
                     produced += n;
+                    ctx.check_cancelled()?;
                 }
                 Ok(None) => {
                     // Cursor exhausted — drop it so we can proceed to `range_iter`.
@@ -2099,7 +2102,7 @@ impl Operator for BinaryScanOperator {
     /// `count_plan`/`count_rows` paths bail). When any per-row predicate is
     /// present, returns `Ok(None)` so the caller falls back to the streaming
     /// drain (which is where such rows are filtered).
-    async fn drain_count(&mut self, _ctx: &ExecutionContext<'_>) -> Result<Option<u64>> {
+    async fn drain_count(&mut self, ctx: &ExecutionContext<'_>) -> Result<Option<u64>> {
         if self.state != OperatorState::Open {
             return Ok(None);
         }
@@ -2109,8 +2112,10 @@ impl Operator for BinaryScanOperator {
 
         let mut count: u64 = 0;
         while let Some(cursor) = self.cursor.as_mut() {
+            ctx.check_cancelled()?;
             match cursor.next_batch() {
                 Ok(Some(batch)) => {
+                    ctx.check_cancelled()?;
                     count = count.checked_add(batch.row_count as u64).ok_or_else(|| {
                         QueryError::execution("COUNT(*) overflow in binary scan drain_count")
                     })?;

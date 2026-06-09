@@ -113,7 +113,7 @@ pub struct ExecutionContext<'a> {
     pub active_graph: ActiveGraph,
     /// Optional execution tracker (time/fuel/policy)
     pub tracker: Tracker,
-    /// Optional cooperative cancellation/deadline handle.
+    /// Optional cooperative cancellation handle.
     pub cancellation: QueryCancellation,
     /// When true, bind evaluation errors are treated as query errors.
     pub strict_bind_errors: bool,
@@ -541,7 +541,7 @@ impl<'a> ExecutionContext<'a> {
         self
     }
 
-    /// Attach a cooperative cancellation/deadline handle to this context.
+    /// Attach a cooperative cancellation handle to this context.
     pub fn with_cancellation(mut self, cancellation: QueryCancellation) -> Self {
         self.cancellation = cancellation;
         self

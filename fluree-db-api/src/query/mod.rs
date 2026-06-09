@@ -9,7 +9,8 @@ pub mod multi;
 pub mod nameservice_builder;
 
 use serde_json::Value as JsonValue;
-use std::time::Duration;
+use std::fmt;
+use std::sync::Arc;
 
 use crate::{
     format, Batch, FormatterConfig, FuelExceededError, OverlayProvider, PolicyContext, PolicyStats,
@@ -22,10 +23,20 @@ use fluree_db_core::{GraphDbRef, LedgerSnapshot};
 use fluree_db_query::ir::QueryOutput;
 
 /// Optional execution controls for query builders and embedders.
-#[derive(Debug, Clone, Default)]
+#[derive(Clone, Default)]
 pub struct QueryExecutionOptions {
-    /// Cooperative cancellation/deadline handle passed through to query operators.
+    /// Cooperative cancellation handle passed through to query operators.
     pub cancellation: Option<fluree_db_core::QueryCancellation>,
+    lifecycle_guard: Option<Arc<dyn Send + Sync + 'static>>,
+}
+
+impl fmt::Debug for QueryExecutionOptions {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("QueryExecutionOptions")
+            .field("cancellation", &self.cancellation)
+            .field("has_lifecycle_guard", &self.lifecycle_guard.is_some())
+            .finish()
+    }
 }
 
 impl QueryExecutionOptions {
@@ -34,15 +45,24 @@ impl QueryExecutionOptions {
         Self::default()
     }
 
-    /// Attach a cooperative cancellation/deadline handle.
+    /// Attach a cooperative cancellation handle.
     pub fn with_cancellation(mut self, cancellation: fluree_db_core::QueryCancellation) -> Self {
         self.cancellation = Some(cancellation);
         self
     }
 
-    /// Attach a relative timeout.
-    pub fn with_timeout(self, timeout: Duration) -> Self {
-        self.with_cancellation(fluree_db_core::QueryCancellation::with_timeout(timeout))
+    /// Attach an opaque guard that lives as long as these execution options.
+    ///
+    /// This is intended for adapters that need a runtime-specific cancellation
+    /// task to stay alive while the query runs without making `fluree-db-api`
+    /// depend on that runtime.
+    #[doc(hidden)]
+    pub fn with_lifecycle_guard<G>(mut self, guard: G) -> Self
+    where
+        G: Send + Sync + 'static,
+    {
+        self.lifecycle_guard = Some(Arc::new(guard));
+        self
     }
 }
 

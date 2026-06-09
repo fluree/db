@@ -26,7 +26,7 @@ use fluree_db_binary_index::{
 };
 use fluree_db_core::o_type::OType;
 use fluree_db_core::subject_id::SubjectId;
-use fluree_db_core::{FlakeValue, GraphId, LedgerSnapshot, Sid};
+use fluree_db_core::{FlakeValue, GraphId, LedgerSnapshot, QueryCancellation, Sid};
 use rustc_hash::{FxHashMap, FxHashSet};
 use std::cmp::Ordering;
 use std::collections::BinaryHeap;
@@ -39,6 +39,14 @@ use std::sync::Arc;
 #[inline]
 fn should_fallback(ctx: &ExecutionContext<'_>) -> bool {
     fast_path_store(ctx).is_none()
+}
+
+#[inline]
+fn check_cancelled(cancellation: &QueryCancellation) -> Result<()> {
+    match cancellation.reason() {
+        Some(reason) => Err(QueryError::Cancelled { reason }),
+        None => Ok(()),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -196,6 +204,7 @@ impl Operator for PredicateGroupCountFirstsOperator {
                     ctx.binary_g_id,
                     &self.predicate,
                     self.limit,
+                    &ctx.cancellation,
                 ) {
                     Ok(v6_results) => {
                         self.results_v6 = Some(v6_results);
@@ -442,6 +451,7 @@ impl Operator for PredicateObjectCountFirstsOperator {
                     ctx.binary_g_id,
                     &self.predicate,
                     &self.object,
+                    &ctx.cancellation,
                 ) {
                     Ok(total) => {
                         self.count = total;
@@ -597,6 +607,7 @@ fn count_bound_object_v6(
     g_id: GraphId,
     predicate: &Ref,
     object: &Term,
+    cancellation: &QueryCancellation,
 ) -> Result<i64> {
     let p_id = resolve_predicate_id_v6(predicate, store)?;
 
@@ -640,6 +651,7 @@ fn count_bound_object_v6(
     let cache = store.leaflet_cache();
 
     for leaf_idx in leaf_range.clone() {
+        check_cancelled(cancellation)?;
         let leaf_entry = &branch.leaves[leaf_idx];
         let bytes = store
             .get_leaf_bytes_sync(&leaf_entry.leaf_cid)
@@ -816,6 +828,7 @@ fn group_count_v6(
     g_id: GraphId,
     predicate: &crate::ir::triple::Ref,
     limit: usize,
+    cancellation: &QueryCancellation,
 ) -> Result<Vec<(u16, u64, i64)>> {
     let p_id = resolve_predicate_id_v6(predicate, store)?;
 
@@ -855,6 +868,7 @@ fn group_count_v6(
     let cache = store.leaflet_cache();
 
     for leaf_idx in leaf_range.clone() {
+        check_cancelled(cancellation)?;
         let leaf_entry = &branch.leaves[leaf_idx];
         let bytes = store
             .get_leaf_bytes_sync(&leaf_entry.leaf_cid)
@@ -1274,6 +1288,7 @@ fn collect_subject_set_for_predicate_group(
         .next_batch()
         .map_err(|e| QueryError::Internal(format!("cursor batch: {e}")))?
     {
+        ctx.check_cancelled()?;
         for i in 0..batch.row_count {
             let s = batch.s_id.get(i);
             if last_s == Some(s) {
@@ -1416,6 +1431,7 @@ fn compute_group_by_object_star_topk(
         while let (Some(gs), Some(cur_fs)) =
             (peek_group_subject(&mut cursor, &mut g_batch, &mut g_i)?, fs)
         {
+            ctx.check_cancelled()?;
             match gs.cmp(&cur_fs) {
                 Ordering::Less => {
                     // Skip all group rows for this subject.
@@ -1423,6 +1439,7 @@ fn compute_group_by_object_star_topk(
                     while let Some(cur_gs) =
                         peek_group_subject(&mut cursor, &mut g_batch, &mut g_i)?
                     {
+                        ctx.check_cancelled()?;
                         if cur_gs != skip_s {
                             break;
                         }
@@ -1437,6 +1454,7 @@ fn compute_group_by_object_star_topk(
                     while let Some(cur_gs) =
                         peek_group_subject(&mut cursor, &mut g_batch, &mut g_i)?
                     {
+                        ctx.check_cancelled()?;
                         if cur_gs != s {
                             break;
                         }
@@ -1488,6 +1506,7 @@ fn compute_group_by_object_star_topk(
             .next_batch()
             .map_err(|e| QueryError::Internal(format!("cursor batch: {e}")))?
         {
+            ctx.check_cancelled()?;
             for i in 0..batch.row_count {
                 let s = batch.s_id.get(i);
                 if !s_set.contains(&s) {

@@ -625,7 +625,9 @@ impl HashJoinOperator {
         let store = ctx.binary_store.as_deref();
         let ncols = self.build_schema.len();
         build.open(ctx).await?;
+        ctx.check_cancelled()?;
         while let Some(batch) = build.next_batch(ctx).await? {
+            ctx.check_cancelled()?;
             for row in 0..batch.len() {
                 let row_vals: Vec<Binding> = (0..ncols)
                     .map(|c| batch.get_by_col(row, c).clone())
@@ -638,6 +640,7 @@ impl HashJoinOperator {
                     JoinKeyClass::Dead => {}
                 }
             }
+            ctx.check_cancelled()?;
         }
         build.close();
         Ok(())

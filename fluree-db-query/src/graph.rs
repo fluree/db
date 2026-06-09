@@ -223,6 +223,7 @@ impl GraphOperator {
         inner.open(&graph_ctx).await?;
 
         while let Some(batch) = inner.next_batch(&graph_ctx).await? {
+            graph_ctx.check_cancelled()?;
             // Stamp cross-ledger provenance before merging so the formatter
             // decodes SIDs against this graph's home ledger (see above).
             let batch = match &stamp_ledger_id {
@@ -271,6 +272,7 @@ impl GraphOperator {
 
                 self.result_buffer.push(merged_row);
             }
+            graph_ctx.check_cancelled()?;
         }
 
         inner.close();

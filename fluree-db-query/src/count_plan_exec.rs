@@ -32,10 +32,18 @@ use crate::ir::triple::Ref;
 use crate::operator::BoxedOperator;
 use fluree_db_binary_index::{BinaryCursor, BinaryIndexStore, RunSortOrder};
 use fluree_db_core::o_type::OType;
-use fluree_db_core::{GraphId, Sid};
+use fluree_db_core::{GraphId, QueryCancellation, Sid};
 use rustc_hash::{FxHashMap, FxHashSet};
 use std::cmp::Ordering;
 use std::sync::Arc;
+
+#[inline]
+fn check_cancelled(cancellation: &QueryCancellation) -> Result<()> {
+    match cancellation.reason() {
+        Some(reason) => Err(QueryError::Cancelled { reason }),
+        None => Ok(()),
+    }
+}
 
 /// Per-execution bundle threaded through the plan evaluator.
 ///
@@ -272,6 +280,7 @@ fn subject_keys_sorted(ec: &ExecCtx<'_, '_>, pred: &Ref) -> Result<Option<Vec<u6
         };
         let mut out: Vec<u64> = Vec::new();
         while let Some((s, _)) = groups.next_group()? {
+            ec.ctx.check_cancelled()?;
             // One group per distinct subject, emitted in ascending order.
             out.push(s);
         }
@@ -311,6 +320,7 @@ fn total_row_count(ec: &ExecCtx<'_, '_>, pred: &Ref) -> Result<Option<u64>> {
             .next_batch()
             .map_err(|e| QueryError::Internal(format!("count-plan cursor batch: {e}")))?
         {
+            ec.ctx.check_cancelled()?;
             total = total
                 .checked_add(batch.row_count as u64)
                 .ok_or_else(|| QueryError::execution("COUNT(*) overflow in count plan"))?;
@@ -363,6 +373,7 @@ fn post_object_filtered_sum(
         .next_batch()
         .map_err(|e| QueryError::Internal(format!("count-plan cursor batch: {e}")))?
     {
+        ec.ctx.check_cancelled()?;
         for row in 0..batch.row_count {
             if batch.o_type.get(row) != iri_ref {
                 return Ok(None);
@@ -415,6 +426,7 @@ fn subjects_with_object_in(
         .next_batch()
         .map_err(|e| QueryError::Internal(format!("count-plan cursor batch: {e}")))?
     {
+        ec.ctx.check_cancelled()?;
         for row in 0..batch.row_count {
             if batch.o_type.get(row) != iri_ref {
                 return Ok(None);
@@ -516,6 +528,7 @@ fn sum_stream(
             let mut incl_idx: usize = 0;
             let mut total: u128 = 0;
             while let Some((s, count)) = groups.next_group()? {
+                ec.ctx.check_cancelled()?;
                 if is_excluded(s, exclude_sorted, &mut excl_idx) {
                     continue;
                 }
@@ -666,6 +679,7 @@ fn try_modifier_seek(
         let mut b_seek = PsotSubjectSeek::new(ec.store, ec.g_id, p_b);
         let mut acc: u128 = 0;
         while let Some((s, count_a)) = a_groups.next_group()? {
+            ec.ctx.check_cancelled()?;
             let present = b_seek.subject_present(s)?;
             // EXISTS keeps present subjects; MINUS keeps absent ones.
             if present != is_anti {
@@ -682,6 +696,7 @@ fn try_modifier_seek(
         let mut a_seek = PsotSubjectSeek::new(ec.store, ec.g_id, p_a);
         let mut matched: u128 = 0;
         while let Some((s, _)) = b_groups.next_group()? {
+            ec.ctx.check_cancelled()?;
             if let Some(count_a) = a_seek.count_for_subject(s)? {
                 matched = matched.saturating_add(count_a as u128);
             }
@@ -807,6 +822,7 @@ fn merge_count_range(
     store: &BinaryIndexStore,
     g_id: fluree_db_core::GraphId,
     p_ids: &[u32],
+    cancellation: &QueryCancellation,
     lo: u64,
     hi: u64,
 ) -> Result<u128> {
@@ -822,6 +838,7 @@ fn merge_count_range(
     }
     let mut total: u128 = 0;
     loop {
+        check_cancelled(cancellation)?;
         if curr.iter().any(std::option::Option::is_none) {
             break;
         }
@@ -856,6 +873,7 @@ fn merge_optional_count_range(
     g_id: fluree_db_core::GraphId,
     req_pids: &[u32],
     opt_groups: &[Vec<u32>],
+    cancellation: &QueryCancellation,
     lo: u64,
     hi: u64,
 ) -> Result<u128> {
@@ -900,6 +918,7 @@ fn merge_optional_count_range(
     }
     let mut total: u128 = 0;
     loop {
+        check_cancelled(cancellation)?;
         if req_cur.iter().any(std::option::Option::is_none) {
             break;
         }
@@ -1102,7 +1121,7 @@ fn sum_star_join_parallel(children: &[StreamNode], ec: &ExecCtx<'_, '_>) -> Resu
         .unwrap();
 
     parallel_partition_count(ec.store, ec.g_id, driver_p, total_rows, |lo, hi| {
-        merge_count_range(ec.store, ec.g_id, &p_ids, lo, hi)
+        merge_count_range(ec.store, ec.g_id, &p_ids, &ec.ctx.cancellation, lo, hi)
     })
 }
 
@@ -1121,6 +1140,7 @@ fn merge_count_range_overlay(
     ops_per_pred: &[Vec<fluree_db_binary_index::read::types::OverlayOp>],
     to_t: i64,
     epoch: u64,
+    cancellation: &QueryCancellation,
     lo: u64,
     hi: u64,
 ) -> Result<u128> {
@@ -1149,6 +1169,7 @@ fn merge_count_range_overlay(
     }
     let mut total: u128 = 0;
     loop {
+        check_cancelled(cancellation)?;
         if curr.iter().any(std::option::Option::is_none) {
             break;
         }
@@ -1235,7 +1256,17 @@ fn sum_star_join_overlay_parallel(
     let p_ids_ref = &p_ids;
     let ops_ref = &ops_per_pred;
     parallel_partition_count(store, g_id, driver_p, total_rows, move |lo, hi| {
-        merge_count_range_overlay(store, g_id, p_ids_ref, ops_ref, to_t, epoch, lo, hi)
+        merge_count_range_overlay(
+            store,
+            g_id,
+            p_ids_ref,
+            ops_ref,
+            to_t,
+            epoch,
+            &ec.ctx.cancellation,
+            lo,
+            hi,
+        )
     })
 }
 
@@ -1307,7 +1338,15 @@ fn sum_optional_join_parallel(
         .unwrap();
 
     parallel_partition_count(ec.store, ec.g_id, driver_p, total_rows, |lo, hi| {
-        merge_optional_count_range(ec.store, ec.g_id, &req_pids, &opt_groups, lo, hi)
+        merge_optional_count_range(
+            ec.store,
+            ec.g_id,
+            &req_pids,
+            &opt_groups,
+            &ec.ctx.cancellation,
+            lo,
+            hi,
+        )
     })
 }
 
@@ -1328,6 +1367,7 @@ fn merge_optional_count_range_overlay(
     opt_ops: &[Vec<Vec<fluree_db_binary_index::read::types::OverlayOp>>],
     to_t: i64,
     epoch: u64,
+    cancellation: &QueryCancellation,
     lo: u64,
     hi: u64,
 ) -> Result<u128> {
@@ -1381,6 +1421,7 @@ fn merge_optional_count_range_overlay(
     }
     let mut total: u128 = 0;
     loop {
+        check_cancelled(cancellation)?;
         if req_cur.iter().any(std::option::Option::is_none) {
             break;
         }
@@ -1534,7 +1575,17 @@ fn sum_optional_join_overlay_parallel(
     let (req_pids, opt_groups, req_ops, opt_ops) = (&req_pids, &opt_groups, &req_ops, &opt_ops);
     parallel_partition_count(store, g_id, driver_p, total_rows, move |lo, hi| {
         merge_optional_count_range_overlay(
-            store, g_id, req_pids, req_ops, opt_groups, opt_ops, to_t, epoch, lo, hi,
+            store,
+            g_id,
+            req_pids,
+            req_ops,
+            opt_groups,
+            opt_ops,
+            to_t,
+            epoch,
+            &ec.ctx.cancellation,
+            lo,
+            hi,
         )
     })
 }
@@ -1561,6 +1612,7 @@ fn merge_modifier_intersect_range(
     outer_pid: u32,
     inner_pids: &[u32],
     is_anti: bool,
+    cancellation: &QueryCancellation,
     lo: u64,
     hi: u64,
 ) -> Result<u128> {
@@ -1576,6 +1628,7 @@ fn merge_modifier_intersect_range(
 
     let mut total: u128 = 0;
     while let Some((os, ocount)) = outer.next_group()? {
+        check_cancelled(cancellation)?;
         // In the inner intersection iff present in every inner predicate. Each
         // inner cursor advances monotonically to the first subject >= os; since os
         // is non-decreasing, cursors skipped by an early break catch up lazily.
@@ -1675,7 +1728,16 @@ fn try_modifier_intersect_parallel(
         .unwrap();
 
     parallel_partition_count(ec.store, ec.g_id, driver_p, total_rows, |lo, hi| {
-        merge_modifier_intersect_range(ec.store, ec.g_id, outer_pid, &inner_pids, is_anti, lo, hi)
+        merge_modifier_intersect_range(
+            ec.store,
+            ec.g_id,
+            outer_pid,
+            &inner_pids,
+            is_anti,
+            &ec.ctx.cancellation,
+            lo,
+            hi,
+        )
     })
 }
 
@@ -1731,6 +1793,7 @@ fn merge_modifier_intersect_range_overlay(
     is_anti: bool,
     to_t: i64,
     epoch: u64,
+    cancellation: &QueryCancellation,
     lo: u64,
     hi: u64,
 ) -> Result<u128> {
@@ -1767,6 +1830,7 @@ fn merge_modifier_intersect_range_overlay(
 
     let mut total: u128 = 0;
     while let Some((os, ocount)) = outer.next_group()? {
+        check_cancelled(cancellation)?;
         if os < lo {
             continue; // boundary subject below the partition; owned by a lower one
         }
@@ -1858,7 +1922,18 @@ fn try_modifier_intersect_overlay_parallel(
     let (inner_pids, inner_ops, outer_ops) = (&inner_pids, &inner_ops, &outer_ops);
     parallel_partition_count(store, g_id, driver_p, total_rows, move |lo, hi| {
         merge_modifier_intersect_range_overlay(
-            store, g_id, outer_pid, outer_ops, inner_pids, inner_ops, is_anti, to_t, epoch, lo, hi,
+            store,
+            g_id,
+            outer_pid,
+            outer_ops,
+            inner_pids,
+            inner_ops,
+            is_anti,
+            to_t,
+            epoch,
+            &ec.ctx.cancellation,
+            lo,
+            hi,
         )
     })
 }
@@ -2002,6 +2077,7 @@ fn sum_star_join(
     let mut total: u128 = 0;
 
     loop {
+        ec.ctx.check_cancelled()?;
         if curr.iter().any(std::option::Option::is_none) {
             break;
         }
@@ -2190,6 +2266,7 @@ fn try_optional_seek(
         let mut b_seek = PsotSubjectSeek::new(ec.store, ec.g_id, p_b);
         let mut acc: u128 = 0;
         while let Some((s, count_a)) = a_groups.next_group()? {
+            ec.ctx.check_cancelled()?;
             let mult = b_seek.count_for_subject(s)?.unwrap_or(0).max(1);
             acc = acc.saturating_add((count_a as u128).saturating_mul(mult as u128));
         }
@@ -2202,6 +2279,7 @@ fn try_optional_seek(
         let mut a_seek = PsotSubjectSeek::new(ec.store, ec.g_id, p_a);
         let mut bonus: u128 = 0;
         while let Some((s, count_b)) = b_groups.next_group()? {
+            ec.ctx.check_cancelled()?;
             // count_B == 1 yields no bonus; skip the seek (targets stay ascending).
             if count_b <= 1 {
                 continue;
@@ -2330,6 +2408,7 @@ fn sum_optional_join(
     let mut total: u128 = 0;
 
     loop {
+        ec.ctx.check_cancelled()?;
         if req_cur.iter().any(std::option::Option::is_none) {
             break;
         }
@@ -3213,6 +3292,7 @@ fn build_chain_rightmost_overlay(
             };
             let mut mult: FxHashMap<u64, u64> = FxHashMap::default();
             while let Some((c, count)) = groups.next_group()? {
+                ec.ctx.check_cancelled()?;
                 mult.insert(c, count.max(1));
             }
             psot_weighted_subject_sums(

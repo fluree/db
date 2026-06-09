@@ -168,6 +168,7 @@ impl Operator for SemijoinOperator {
         inner_op.open(ctx).await?;
 
         while let Some(batch) = inner_op.next_batch(ctx).await? {
+            ctx.check_cancelled()?;
             for row_idx in 0..batch.len() {
                 let key = inner_key_col_indices
                     .iter()
@@ -175,6 +176,7 @@ impl Operator for SemijoinOperator {
                     .collect();
                 self.key_set.insert(CompositeGroupKey(key));
             }
+            ctx.check_cancelled()?;
         }
         inner_op.close();
 

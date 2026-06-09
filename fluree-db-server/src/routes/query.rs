@@ -22,7 +22,7 @@ use axum::Json;
 use fluree_db_api::dataset::GraphSelector;
 use fluree_db_api::{
     DatasetSpec, FreshnessCheck, FreshnessSource, GraphDb, GraphSource, LedgerState,
-    QueryExecutionOptions, TimeSpec, TrackingTally,
+    QueryCancellation, QueryCancellationReason, QueryExecutionOptions, TimeSpec, TrackingTally,
 };
 use serde::Deserialize;
 use serde_json::Value as JsonValue;
@@ -31,10 +31,34 @@ use std::sync::Arc;
 use std::time::Duration;
 use tracing::Instrument;
 
+struct QueryTimeoutGuard {
+    abort: tokio::task::AbortHandle,
+}
+
+impl Drop for QueryTimeoutGuard {
+    fn drop(&mut self) {
+        self.abort.abort();
+    }
+}
+
 fn query_execution_options(state: &AppState) -> QueryExecutionOptions {
     match state.config.query_timeout_ms {
         0 => QueryExecutionOptions::default(),
-        millis => QueryExecutionOptions::new().with_timeout(Duration::from_millis(millis)),
+        millis => {
+            let cancellation = QueryCancellation::new();
+            let timer_cancellation = cancellation.clone();
+            let timeout_task = tokio::spawn(async move {
+                tokio::time::sleep(Duration::from_millis(millis)).await;
+                timer_cancellation.cancel_with(QueryCancellationReason::Timeout);
+            });
+            let timeout_guard = QueryTimeoutGuard {
+                abort: timeout_task.abort_handle(),
+            };
+
+            QueryExecutionOptions::new()
+                .with_cancellation(cancellation)
+                .with_lifecycle_guard(timeout_guard)
+        }
     }
 }
 
