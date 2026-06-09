@@ -117,6 +117,10 @@ pub fn builtin_prefix_trie() -> &'static PrefixTrie {
 // canonical_split
 // ============================================================================
 
+/// The blank-node IRI prefix. Blank-node IRIs always begin with `_:` and are
+/// split at this boundary unconditionally, before any other splitting logic.
+pub const BLANK_NODE_PREFIX: &str = "_:";
+
 /// Deterministically split an IRI into `(prefix, suffix)` based on the
 /// ledger's split mode.
 ///
@@ -145,8 +149,8 @@ pub fn canonical_split(iri: &str, mode: NsSplitMode) -> (&str, &str) {
     // re-encoding the blank node into the EMPTY namespace (code 0). That breaks
     // round-tripping: a blank node written via the dedicated blank-node code (10)
     // would read back as a different Sid, so subject-bounded index lookups miss.
-    if let Some(rest) = iri.strip_prefix("_:") {
-        return (&iri[..2], rest);
+    if let Some(rest) = iri.strip_prefix(BLANK_NODE_PREFIX) {
+        return (&iri[..BLANK_NODE_PREFIX.len()], rest);
     }
 
     // Always check built-in prefixes for @-prefixed strings (JSON-LD keywords).
@@ -963,7 +967,7 @@ mod tests {
     #[test]
     fn blank_node() {
         let (p, s) = canonical_split("_:fdb-abc123", NsSplitMode::MostGranular);
-        assert_eq!(p, "_:");
+        assert_eq!(p, BLANK_NODE_PREFIX);
         assert_eq!(s, "fdb-abc123");
     }
 
@@ -979,7 +983,7 @@ mod tests {
             NsSplitMode::HostPlusN(1),
         ] {
             let (p, s) = canonical_split("_:fdb-lubm:main-1-genid10", mode);
-            assert_eq!(p, "_:", "prefix for mode {mode:?}");
+            assert_eq!(p, BLANK_NODE_PREFIX, "prefix for mode {mode:?}");
             assert_eq!(s, "fdb-lubm:main-1-genid10", "suffix for mode {mode:?}");
         }
     }

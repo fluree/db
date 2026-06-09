@@ -1088,11 +1088,11 @@ impl Operator for NestedLoopJoinOperator {
                 && ctx.binary_store.is_some()
                 // The batched path reads binary leaves directly and works in
                 // `EncodedSid` space (it even emits `EncodedSid` for newly-bound
-                // subject vars). Eager materialization means the query needs
-                // decoded `Binding::Sid` everywhere — notably reasoning queries,
-                // whose derived facts live in the overlay as `Sid` and must join
-                // with base rows. Fall back to the per-row path, which merges the
-                // overlay and honours eager decoding.
+                // subject vars). Whenever eager materialization is required —
+                // reasoning queries (derived facts in the overlay are `Sid` and
+                // must join with base rows), federated queries, or any other
+                // caller that sets this flag — fall back to the per-row path,
+                // which merges the overlay and honours eager decoding.
                 && !ctx.eager_materialization
                 && match ctx.active_graphs() {
                     // Object-batched path currently emits `Binding::EncodedSid` for the new
