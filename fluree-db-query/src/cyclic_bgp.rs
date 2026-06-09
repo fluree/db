@@ -344,6 +344,16 @@ pub(crate) struct CyclicBgpOperator {
 }
 
 impl CyclicBgpOperator {
+    fn log_fast_path_bail(&self, reason: &'static str, edge: Option<&CyclicEdge>) {
+        tracing::debug!(
+            reason,
+            shape = self.plan.shape_name(),
+            mode = self.join_mode.as_str(),
+            predicate = edge.map(|e| predicate_display(&e.predicate)),
+            "cyclic bgp fast path bail"
+        );
+    }
+
     pub(crate) fn new(
         plan: CyclicBgpPlan,
         required_where_vars: Option<&[VarId]>,
@@ -420,6 +430,7 @@ impl CyclicBgpOperator {
         edge: &CyclicEdge,
     ) -> Result<Option<Vec<RefEdgeRow>>> {
         let Some(store) = ctx.binary_store.as_ref() else {
+            self.log_fast_path_bail("missing-binary-store", Some(edge));
             return Ok(None);
         };
         let pred_sid = normalize_pred_sid(store, &edge.predicate)?;
@@ -435,7 +446,10 @@ impl CyclicBgpOperator {
             cursor_projection_sid_otype_okey(),
         )? {
             Some(cursor) => cursor,
-            None => return Ok(None),
+            None => {
+                self.log_fast_path_bail("cursor-unavailable", Some(edge));
+                return Ok(None);
+            }
         };
 
         let row_cap = max_predicate_rows();
@@ -446,6 +460,7 @@ impl CyclicBgpOperator {
         {
             for row in 0..batch.row_count {
                 if batch.o_type.get(row) != OType::IRI_REF.as_u16() {
+                    self.log_fast_path_bail("non-ref-object-in-ref-mode", Some(edge));
                     return Ok(None);
                 }
                 rows.push(RefEdgeRow {
@@ -453,6 +468,7 @@ impl CyclicBgpOperator {
                     object: batch.o_key.get(row),
                 });
                 if rows.len() as u64 > row_cap {
+                    self.log_fast_path_bail("predicate-row-cap-exceeded", Some(edge));
                     return Ok(None);
                 }
             }
@@ -466,6 +482,7 @@ impl CyclicBgpOperator {
         edge: &CyclicEdge,
     ) -> Result<Option<Vec<EdgeRow>>> {
         let Some(store) = ctx.binary_store.as_ref() else {
+            self.log_fast_path_bail("missing-binary-store", Some(edge));
             return Ok(None);
         };
         let pred_sid = normalize_pred_sid(store, &edge.predicate)?;
@@ -481,7 +498,10 @@ impl CyclicBgpOperator {
             cursor_projection_sid_otype_okey(),
         )? {
             Some(cursor) => cursor,
-            None => return Ok(None),
+            None => {
+                self.log_fast_path_bail("cursor-unavailable", Some(edge));
+                return Ok(None);
+            }
         };
 
         let row_cap = max_predicate_rows();
@@ -498,6 +518,7 @@ impl CyclicBgpOperator {
                     p_id,
                 });
                 if raw_rows.len() as u64 > row_cap {
+                    self.log_fast_path_bail("predicate-row-cap-exceeded", Some(edge));
                     return Ok(None);
                 }
             }
@@ -505,6 +526,7 @@ impl CyclicBgpOperator {
         let mut rows = Vec::with_capacity(raw_rows.len());
         for raw in raw_rows {
             let Some(object) = self.object_binding_for_edge(edge, raw) else {
+                self.log_fast_path_bail("unsupported-object-binding", Some(edge));
                 return Ok(None);
             };
             rows.push(EdgeRow {
@@ -517,6 +539,7 @@ impl CyclicBgpOperator {
 
     fn open_fast_path(&mut self, ctx: &ExecutionContext<'_>) -> Result<bool> {
         if self.mode.is_history() || !allow_cursor_fast_path(ctx) {
+            self.log_fast_path_bail("runtime-mode-or-context-unsupported", None);
             return Ok(false);
         }
 
@@ -714,6 +737,12 @@ impl CyclicBgpOperator {
             .into_iter()
             .min_by_key(|plan| (plan.build_pairs, plan.probe_pairs))?;
         if plan.build_pairs > cap {
+            tracing::debug!(
+                build_pairs = plan.build_pairs,
+                probe_pairs = plan.probe_pairs,
+                cap,
+                "cyclic bgp square wedge bypassed: build pair cap exceeded"
+            );
             return None;
         }
 
@@ -722,6 +751,16 @@ impl CyclicBgpOperator {
             &relations[plan.probe_edge_a],
             &relations[plan.probe_edge_b],
             plan.probe_center,
+        );
+
+        tracing::debug!(
+            build_pairs = plan.build_pairs,
+            probe_pairs = plan.probe_pairs,
+            build_center = plan.build_center.0,
+            probe_center = plan.probe_center.0,
+            table_keys = table.len(),
+            probe_centers = probe_centers.len(),
+            "cyclic bgp square wedge selected"
         );
 
         Some(EncodedSquareWedgeState {
