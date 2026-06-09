@@ -5,7 +5,7 @@
 //! vars between left and right must match exactly.
 
 use crate::binary_scan::EmitMask;
-use crate::binding::{Batch, Binding};
+use crate::binding::{Batch, Binding, RowAccess};
 use crate::context::ExecutionContext;
 use crate::dataset::ActiveGraphs;
 use crate::error::{QueryError, Result};
@@ -20,7 +20,8 @@ use async_trait::async_trait;
 use fluree_db_binary_index::{BinaryGraphView, BinaryIndexStore};
 use fluree_db_core::subject_id::SubjectId;
 use fluree_db_core::{GraphId, IndexType, ObjectBounds, Sid, BATCHED_JOIN_SIZE};
-use std::collections::{HashMap, HashSet, VecDeque};
+use rustc_hash::{FxBuildHasher, FxHashMap};
+use std::collections::{HashSet, VecDeque};
 use std::sync::Arc;
 use std::time::Instant;
 use tracing::Instrument;
@@ -31,7 +32,7 @@ const BATCHED_EXISTS_DEBUG_MIN_ACCUM: usize = 8;
 const BATCHED_EXISTS_DEBUG_MIN_MS: u64 = 10;
 
 /// Prepared per-leaf inputs shared by every batched-probe path
-/// (`scan_leaves_into_scatter`, `flush_batched_object_accumulator_binary`,
+/// (`scan_matches`, `flush_batched_object_accumulator_binary`,
 /// `batched_subject_probe_binary`, `batched_subject_star_spot`). Owns the
 /// leaf blob, decoded header/dir, the leaf-id hash, and the optional
 /// sidecar bytes — the leaflet loop body destructures this and proceeds
@@ -45,6 +46,62 @@ struct LeafScan {
     /// leaflet alone is authoritative); always fetched when `need_replay`
     /// is true so `replay_leaflet_at_t` can reconstruct historical state.
     sidecar_bytes: Option<Vec<u8>>,
+}
+
+/// Read-only view of a single joined row — a stored left-batch row plus the
+/// right-scan tail bindings — addressed through `combined_schema`. Lets the
+/// batched-join fast path evaluate inline FILTERs without materializing a
+/// `combined: Vec<Binding>` per match.
+///
+/// Column layout matches `combined_schema = left_schema ++ right_new_vars`:
+/// positions `< left_len` resolve against the left batch (whose schema is
+/// exactly `left_schema`, so a combined position is also the left column index);
+/// positions `>= left_len` index into the right tail.
+struct CombinedRowView<'a> {
+    left_batch: &'a Batch,
+    left_row: usize,
+    left_len: usize,
+    right: &'a [Binding],
+    schema: &'a [VarId],
+}
+
+impl RowAccess for CombinedRowView<'_> {
+    fn get(&self, var: VarId) -> Option<&Binding> {
+        let pos = self.schema.iter().position(|&v| v == var)?;
+        if pos < self.left_len {
+            Some(self.left_batch.get_by_col(self.left_row, pos))
+        } else {
+            self.right.get(pos - self.left_len)
+        }
+    }
+}
+
+/// Apply inline FILTER operators against a joined row view.
+///
+/// Only valid when `ops` contains no `Bind` — the batched-join fast path is
+/// gated on that, since a Bind would need to append/clobber a column on a
+/// materialized row.
+fn apply_inline_filters_view<R: RowAccess>(
+    ops: &[InlineOperator],
+    row: &R,
+    ctx: &ExecutionContext<'_>,
+) -> Result<bool> {
+    for op in ops {
+        match op {
+            InlineOperator::Filter(expr) => {
+                if !expr.eval_to_bool_non_strict(row, Some(ctx))? {
+                    return Ok(false);
+                }
+            }
+            InlineOperator::Bind { .. } => {
+                return Err(QueryError::Internal(
+                    "apply_inline_filters_view: Bind not supported on the batched-join fast path"
+                        .into(),
+                ));
+            }
+        }
+    }
+    Ok(true)
 }
 
 fn prepare_leaf_for_scan(
@@ -1084,9 +1141,16 @@ impl Operator for NestedLoopJoinOperator {
         // Historical snapshots (`to_t < store.max_t()`) are handled inside each
         // batched flush helper via `replay_leaflet_at_t`, which reconstructs
         // leaflet state at `to_t` from the history sidecar.
-        let use_batched =
-            (self.batched_eligible || self.batched_object_eligible || self.batched_exists_eligible)
+        let use_batched = (self.batched_eligible || self.batched_object_eligible || self.batched_exists_eligible)
                 && ctx.binary_store.is_some()
+                // The batched path reads binary leaves directly and works in
+                // `EncodedSid` space (it even emits `EncodedSid` for newly-bound
+                // subject vars). Whenever eager materialization is required —
+                // reasoning queries (derived facts in the overlay are `Sid` and
+                // must join with base rows), federated queries, or any other
+                // caller that sets this flag — fall back to the per-row path,
+                // which merges the overlay and honours eager decoding.
+                && !ctx.eager_materialization
                 && match ctx.active_graphs() {
                     // Object-batched path currently emits `Binding::EncodedSid` for the new
                     // subject var. Keep it single-ledger only to avoid dataset-mode IriMatch
@@ -1486,9 +1550,13 @@ impl NestedLoopJoinOperator {
     ///
     /// Returns `(s_id → accumulator indices, sorted unique s_ids)`.
     /// The s_ids are already stored as raw u64 in the accumulator — no dictionary lookup needed.
-    fn group_accumulator_by_subject(&self) -> (HashMap<u64, Vec<usize>>, Vec<u64>) {
-        let mut s_id_to_accum: HashMap<u64, Vec<usize>> = HashMap::new();
-        let mut unique_s_ids: Vec<u64> = Vec::new();
+    fn group_accumulator_by_subject(&self) -> (FxHashMap<u64, Vec<usize>>, Vec<u64>) {
+        // Keyed on raw u64 subject IDs and rebuilt every flush, so use a fast
+        // integer hash and pre-size to the accumulator length to avoid SipHash
+        // and repeated rehash growth (a top self-time cost on star-join workloads).
+        let mut s_id_to_accum: FxHashMap<u64, Vec<usize>> =
+            FxHashMap::with_capacity_and_hasher(self.batched_accumulator.len(), FxBuildHasher);
+        let mut unique_s_ids: Vec<u64> = Vec::with_capacity(self.batched_accumulator.len());
         for (accum_idx, (_, _, s_id)) in self.batched_accumulator.iter().enumerate() {
             s_id_to_accum.entry(*s_id).or_default().push(accum_idx);
             unique_s_ids.push(*s_id);
@@ -1501,8 +1569,9 @@ impl NestedLoopJoinOperator {
     /// Group accumulator entries by object ID.
     ///
     /// Returns `(o_s_id → accumulator indices, (min_o, max_o))`.
-    fn group_accumulator_by_object(&self) -> (HashMap<u64, Vec<usize>>, u64, u64) {
-        let mut o_to_accum: HashMap<u64, Vec<usize>> = HashMap::new();
+    fn group_accumulator_by_object(&self) -> (FxHashMap<u64, Vec<usize>>, u64, u64) {
+        let mut o_to_accum: FxHashMap<u64, Vec<usize>> =
+            FxHashMap::with_capacity_and_hasher(self.batched_accumulator.len(), FxBuildHasher);
         let mut min_o: u64 = u64::MAX;
         let mut max_o: u64 = 0;
         for (accum_idx, (_, _, o_s_id)) in self.batched_accumulator.iter().enumerate() {
@@ -1555,13 +1624,16 @@ impl NestedLoopJoinOperator {
         branch.find_leaves_in_range(&min_key, &max_key, cmp)
     }
 
-    /// Phase 4: Scan PSOT leaves, matching accumulated subjects and scattering results.
+    /// Phase 4: Scan PSOT leaves, matching accumulated subjects and invoking
+    /// `on_match` per matched (left-row group, object) pair.
     ///
     /// Uses V3 column-based leaf loading via `get_leaf_bytes_sync` + `load_leaflet_columns_cached`,
-    /// binary-searches for matching subjects within each leaflet's p_id segment, builds
-    /// late-materialized bindings, and scatters them to accumulator positions.
+    /// binary-searches for matching subjects within each leaflet's p_id segment, and builds the
+    /// late-materialized object binding. The decoded object plus the accumulator indices that
+    /// share the matched subject are handed to `on_match`, which owns the scatter representation
+    /// (full combined rows for the Bind path, right-only tails for the fast path).
     #[allow(clippy::too_many_arguments)]
-    fn scan_leaves_into_scatter(
+    fn scan_matches(
         &self,
         ctx: &ExecutionContext<'_>,
         store: &BinaryIndexStore,
@@ -1569,9 +1641,9 @@ impl NestedLoopJoinOperator {
         leaf_range: std::ops::Range<usize>,
         p_id: u32,
         unique_s_ids: &[u64],
-        s_id_to_accum: &HashMap<u64, Vec<usize>>,
-        scatter: &mut [Vec<Vec<Binding>>],
+        s_id_to_accum: &FxHashMap<u64, Vec<usize>>,
         dict_overlay: &Option<crate::dict_overlay::DictOverlay>,
+        on_match: &mut dyn FnMut(&[usize], &Binding) -> Result<()>,
     ) -> Result<()> {
         use fluree_db_binary_index::read::column_loader::load_leaflet_columns_cached;
         use fluree_db_core::o_type::OType;
@@ -1621,12 +1693,15 @@ impl NestedLoopJoinOperator {
                         &leaf_bytes,
                         entry,
                         dir.payload_base,
-                        header.order,
                         c,
-                        leaf_id,
-                        u32::try_from(leaflet_idx).map_err(|_| {
-                            QueryError::Internal("leaflet idx exceeds u32".to_string())
-                        })?,
+                        fluree_db_binary_index::read::column_loader::LeafletDecodeSpec {
+                            leaf_id,
+                            leaflet_idx: u32::try_from(leaflet_idx).map_err(|_| {
+                                QueryError::Internal("leaflet idx exceeds u32".to_string())
+                            })?,
+                            order: header.order,
+                            decode_set: fluree_db_binary_index::ColumnSet::ALL,
+                        },
                     )
                     .map_err(|e| QueryError::Internal(format!("load columns: {e}")))?
                 } else {
@@ -1663,9 +1738,6 @@ impl NestedLoopJoinOperator {
 
                 let row_count = batch.row_count;
 
-                // Collect matching row indices using PSOT's `(p_id, s_id, ...)` ordering.
-                let mut matches: Vec<(usize, u64)> = Vec::with_capacity(64);
-
                 // For PSOT, leaflets are sorted by p_id then s_id.
                 // Find the contiguous segment for our p_id.
                 let p_start = (0..row_count)
@@ -1687,220 +1759,206 @@ impl NestedLoopJoinOperator {
                     continue;
                 }
 
+                // Stream matched rows straight into the object-decode + on_match
+                // path in PSOT `(p_id, s_id, ...)` order — no per-leaflet `matches`
+                // Vec to allocate, grow, and replay.
                 for &s_id in &unique_s_ids[subj_start..subj_end] {
-                    if !s_id_to_accum.contains_key(&s_id) {
+                    let Some(accum_indices) = s_id_to_accum.get(&s_id) else {
                         continue;
-                    }
+                    };
                     let row_start = lower_bound_s_id(&batch, p_start, p_end, s_id);
                     let row_end = upper_bound_s_id(&batch, p_start, p_end, s_id);
                     if row_start == row_end {
                         continue;
                     }
                     for row in row_start..row_end {
-                        matches.push((row, s_id));
-                    }
-                }
+                        matched_rows += 1;
+                        let o_type_val = entry
+                            .o_type_const
+                            .unwrap_or_else(|| batch.o_type.get_or(row, 0));
+                        let o_key_val = batch.o_key.get(row);
+                        if !self.batched_row_matches_object_bounds(
+                            store,
+                            ctx.binary_g_id,
+                            p_id,
+                            o_type_val,
+                            o_key_val,
+                        )? {
+                            continue;
+                        }
 
-                if matches.is_empty() {
-                    continue;
-                }
-                matched_rows += matches.len() as u64;
+                        let obj_binding = if o_type_val == OType::IRI_REF.as_u16()
+                            || o_type_val == OType::BLANK_NODE.as_u16()
+                        {
+                            Binding::encoded_sid(o_key_val)
+                        } else {
+                            let p_id = entry.p_const.unwrap_or_else(|| batch.p_id.get_or(row, 0));
+                            let o_i = batch.o_i.get_or(row, u32::MAX);
+                            let t = batch.t.get_or(row, 0) as i64;
+                            let ot = OType::from_u16(o_type_val);
 
-                for (row, s_id) in matches {
-                    let o_type_val = entry
-                        .o_type_const
-                        .unwrap_or_else(|| batch.o_type.get_or(row, 0));
-                    let o_key_val = batch.o_key.get(row);
-                    if !self.batched_row_matches_object_bounds(
-                        store,
-                        ctx.binary_g_id,
-                        p_id,
-                        o_type_val,
-                        o_key_val,
-                    )? {
-                        continue;
-                    }
+                            // Prefer a stable EncodedLit representation when possible so that
+                            // formatters can materialize using the root's canonical datatype table.
+                            match ot.decode_kind() {
+                                fluree_db_core::o_type::DecodeKind::StringDict => {
+                                    use fluree_db_core::ids::DatatypeDictId;
+                                    use fluree_db_core::value_id::ObjKind;
 
-                    let obj_binding = if o_type_val == OType::IRI_REF.as_u16()
-                        || o_type_val == OType::BLANK_NODE.as_u16()
-                    {
-                        Binding::encoded_sid(o_key_val)
-                    } else {
-                        let p_id = entry.p_const.unwrap_or_else(|| batch.p_id.get_or(row, 0));
-                        let o_i = batch.o_i.get_or(row, u32::MAX);
-                        let t = batch.t.get_or(row, 0) as i64;
-                        let ot = OType::from_u16(o_type_val);
-
-                        // Prefer a stable EncodedLit representation when possible so that
-                        // formatters can materialize using the root's canonical datatype table.
-                        match ot.decode_kind() {
-                            fluree_db_core::o_type::DecodeKind::StringDict => {
-                                use fluree_db_core::ids::DatatypeDictId;
-                                use fluree_db_core::value_id::ObjKind;
-
-                                let (dt_id, lang_id) = if ot.is_lang_string() {
-                                    (DatatypeDictId::LANG_STRING.as_u16(), ot.payload())
-                                } else if o_type_val == OType::FULLTEXT.as_u16() {
-                                    (DatatypeDictId::FULL_TEXT.as_u16(), 0)
-                                } else {
-                                    (DatatypeDictId::STRING.as_u16(), 0)
-                                };
-
-                                Binding::EncodedLit {
-                                    o_kind: ObjKind::LEX_ID.as_u8(),
-                                    o_key: o_key_val,
-                                    p_id,
-                                    dt_id,
-                                    lang_id,
-                                    i_val: if o_i == u32::MAX {
-                                        i32::MIN
+                                    let (dt_id, lang_id) = if ot.is_lang_string() {
+                                        (DatatypeDictId::LANG_STRING.as_u16(), ot.payload())
+                                    } else if o_type_val == OType::FULLTEXT.as_u16() {
+                                        (DatatypeDictId::FULL_TEXT.as_u16(), 0)
                                     } else {
-                                        o_i as i32
-                                    },
-                                    t,
-                                }
-                            }
-                            fluree_db_core::o_type::DecodeKind::JsonArena => {
-                                use fluree_db_core::ids::DatatypeDictId;
-                                use fluree_db_core::value_id::ObjKind;
-                                Binding::EncodedLit {
-                                    o_kind: ObjKind::JSON_ID.as_u8(),
-                                    o_key: o_key_val,
-                                    p_id,
-                                    dt_id: DatatypeDictId::JSON.as_u16(),
-                                    lang_id: 0,
-                                    i_val: if o_i == u32::MAX {
-                                        i32::MIN
-                                    } else {
-                                        o_i as i32
-                                    },
-                                    t,
-                                }
-                            }
-                            fluree_db_core::o_type::DecodeKind::VectorArena => {
-                                use fluree_db_core::ids::DatatypeDictId;
-                                use fluree_db_core::value_id::ObjKind;
-                                Binding::EncodedLit {
-                                    o_kind: ObjKind::VECTOR_ID.as_u8(),
-                                    o_key: o_key_val,
-                                    p_id,
-                                    dt_id: DatatypeDictId::VECTOR.as_u16(),
-                                    lang_id: 0,
-                                    i_val: if o_i == u32::MAX {
-                                        i32::MIN
-                                    } else {
-                                        o_i as i32
-                                    },
-                                    t,
-                                }
-                            }
-                            fluree_db_core::o_type::DecodeKind::NumBigArena => {
-                                use fluree_db_core::ids::DatatypeDictId;
-                                use fluree_db_core::value_id::ObjKind;
-                                Binding::EncodedLit {
-                                    o_kind: ObjKind::NUM_BIG.as_u8(),
-                                    o_key: o_key_val,
-                                    p_id,
-                                    dt_id: DatatypeDictId::DECIMAL.as_u16(),
-                                    lang_id: 0,
-                                    i_val: if o_i == u32::MAX {
-                                        i32::MIN
-                                    } else {
-                                        o_i as i32
-                                    },
-                                    t,
-                                }
-                            }
-                            _ => {
-                                // Fallback: decode eagerly, using DictOverlay for
-                                // novelty-aware resolution of string/subject IDs.
-                                use fluree_db_core::o_type::{DecodeKind, OType as OT};
-                                let ot = OT::from_u16(o_type_val);
-                                let val: fluree_db_core::FlakeValue =
-                                    match (ot.decode_kind(), dict_overlay.as_ref()) {
-                                        (DecodeKind::IriRef, Some(ov)) => {
-                                            let iri =
-                                                ov.resolve_subject_iri(o_key_val).map_err(|e| {
-                                                    crate::error::QueryError::Internal(format!(
-                                                        "resolve_subject_iri (batched join): {e}"
-                                                    ))
-                                                })?;
-                                            fluree_db_core::FlakeValue::Ref(store.encode_iri(&iri))
-                                        }
-                                        (DecodeKind::StringDict, Some(ov)) => {
-                                            let s = ov
-                                                .resolve_string_value(o_key_val as u32)
-                                                .map_err(|e| {
-                                                    crate::error::QueryError::Internal(format!(
-                                                        "resolve_string_value (batched join): {e}"
-                                                    ))
-                                                })?;
-                                            fluree_db_core::FlakeValue::String(s)
-                                        }
-                                        (DecodeKind::JsonArena, Some(ov)) => {
-                                            let s = ov
-                                                .resolve_string_value(o_key_val as u32)
-                                                .map_err(|e| {
-                                                    crate::error::QueryError::Internal(format!(
-                                                    "resolve_string_value (batched join json): {e}"
-                                                ))
-                                                })?;
-                                            fluree_db_core::FlakeValue::Json(s)
-                                        }
-                                        _ => store
-                                            .decode_value_v3(
-                                                o_type_val,
-                                                o_key_val,
-                                                p_id,
-                                                ctx.binary_g_id,
-                                            )
-                                            .map_err(|e| {
-                                                crate::error::QueryError::Internal(format!(
-                                                    "decode_value_v3 (batched join): {e}"
-                                                ))
-                                            })?,
+                                        (DatatypeDictId::STRING.as_u16(), 0)
                                     };
-                                materialized_object_binding(
-                                    store,
-                                    o_type_val,
-                                    p_id,
-                                    val,
-                                    Some(t),
-                                    None,
-                                )
-                            }
-                        }
-                    };
 
-                    if let Some(accum_indices) = s_id_to_accum.get(&s_id) {
-                        for &accum_idx in accum_indices {
-                            let (batch_idx, row_idx, _) = &self.batched_accumulator[accum_idx];
-                            let left_batch = &self.stored_left_batches[*batch_idx];
-                            let mut right_bindings = Vec::with_capacity(self.right_new_vars.len());
-                            for _ in &self.right_new_vars {
-                                right_bindings.push(obj_binding.clone());
+                                    Binding::EncodedLit {
+                                        o_kind: ObjKind::LEX_ID.as_u8(),
+                                        o_key: o_key_val,
+                                        p_id,
+                                        dt_id,
+                                        lang_id,
+                                        i_val: if o_i == u32::MAX {
+                                            i32::MIN
+                                        } else {
+                                            o_i as i32
+                                        },
+                                        t,
+                                    }
+                                }
+                                fluree_db_core::o_type::DecodeKind::JsonArena => {
+                                    use fluree_db_core::ids::DatatypeDictId;
+                                    use fluree_db_core::value_id::ObjKind;
+                                    Binding::EncodedLit {
+                                        o_kind: ObjKind::JSON_ID.as_u8(),
+                                        o_key: o_key_val,
+                                        p_id,
+                                        dt_id: DatatypeDictId::JSON.as_u16(),
+                                        lang_id: 0,
+                                        i_val: if o_i == u32::MAX {
+                                            i32::MIN
+                                        } else {
+                                            o_i as i32
+                                        },
+                                        t,
+                                    }
+                                }
+                                fluree_db_core::o_type::DecodeKind::VectorArena => {
+                                    use fluree_db_core::ids::DatatypeDictId;
+                                    use fluree_db_core::value_id::ObjKind;
+                                    Binding::EncodedLit {
+                                        o_kind: ObjKind::VECTOR_ID.as_u8(),
+                                        o_key: o_key_val,
+                                        p_id,
+                                        dt_id: DatatypeDictId::VECTOR.as_u16(),
+                                        lang_id: 0,
+                                        i_val: if o_i == u32::MAX {
+                                            i32::MIN
+                                        } else {
+                                            o_i as i32
+                                        },
+                                        t,
+                                    }
+                                }
+                                fluree_db_core::o_type::DecodeKind::NumBigArena => {
+                                    use fluree_db_core::ids::DatatypeDictId;
+                                    use fluree_db_core::value_id::ObjKind;
+                                    Binding::EncodedLit {
+                                        o_kind: ObjKind::NUM_BIG.as_u8(),
+                                        o_key: o_key_val,
+                                        p_id,
+                                        dt_id: DatatypeDictId::DECIMAL.as_u16(),
+                                        lang_id: 0,
+                                        i_val: if o_i == u32::MAX {
+                                            i32::MIN
+                                        } else {
+                                            o_i as i32
+                                        },
+                                        t,
+                                    }
+                                }
+                                _ => {
+                                    // Inline numerics with a reserved dict id stay encoded
+                                    // (cheap through DISTINCT/joins, materialized at projection);
+                                    // everything else decodes eagerly via DictOverlay.
+                                    if let Some(encoded) =
+                                        crate::object_binding::inline_numeric_encoded_lit(
+                                            o_type_val, o_key_val, p_id, o_i, t,
+                                        )
+                                    {
+                                        encoded
+                                    } else {
+                                        // Fallback: decode eagerly, using DictOverlay for
+                                        // novelty-aware resolution of string/subject IDs.
+                                        use fluree_db_core::o_type::{DecodeKind, OType as OT};
+                                        let ot = OT::from_u16(o_type_val);
+                                        let val: fluree_db_core::FlakeValue =
+                                            match (ot.decode_kind(), dict_overlay.as_ref()) {
+                                                (DecodeKind::IriRef, Some(ov)) => {
+                                                    let iri = ov
+                                                        .resolve_subject_iri(o_key_val)
+                                                        .map_err(|e| {
+                                                            crate::error::QueryError::Internal(
+                                                                format!(
+                                                        "resolve_subject_iri (batched join): {e}"
+                                                    ),
+                                                            )
+                                                        })?;
+                                                    fluree_db_core::FlakeValue::Ref(
+                                                        store.encode_iri(&iri),
+                                                    )
+                                                }
+                                                (DecodeKind::StringDict, Some(ov)) => {
+                                                    let s = ov
+                                                        .resolve_string_value(o_key_val as u32)
+                                                        .map_err(|e| {
+                                                            crate::error::QueryError::Internal(
+                                                                format!(
+                                                        "resolve_string_value (batched join): {e}"
+                                                    ),
+                                                            )
+                                                        })?;
+                                                    fluree_db_core::FlakeValue::String(s)
+                                                }
+                                                (DecodeKind::JsonArena, Some(ov)) => {
+                                                    let s = ov
+                                                        .resolve_string_value(o_key_val as u32)
+                                                        .map_err(|e| {
+                                                            crate::error::QueryError::Internal(
+                                                                format!(
+                                                    "resolve_string_value (batched join json): {e}"
+                                                ),
+                                                            )
+                                                        })?;
+                                                    fluree_db_core::FlakeValue::Json(s)
+                                                }
+                                                _ => store
+                                                    .decode_value_v3(
+                                                        o_type_val,
+                                                        o_key_val,
+                                                        p_id,
+                                                        ctx.binary_g_id,
+                                                    )
+                                                    .map_err(|e| {
+                                                        crate::error::QueryError::Internal(format!(
+                                                            "decode_value_v3 (batched join): {e}"
+                                                        ))
+                                                    })?,
+                                            };
+                                        materialized_object_binding(
+                                            store,
+                                            o_type_val,
+                                            p_id,
+                                            val,
+                                            Some(t),
+                                            None,
+                                        )
+                                    }
+                                }
                             }
-                            if !self.apply_right_scan_inline_ops(ctx, &mut right_bindings)? {
-                                continue;
-                            }
+                        };
 
-                            let mut combined = Vec::with_capacity(self.combined_schema.len());
-                            for col in 0..self.left_schema.len() {
-                                combined.push(left_batch.get_by_col(*row_idx, col).clone());
-                            }
-                            combined.extend(right_bindings);
-
-                            if !apply_inline(
-                                &self.inline_ops,
-                                &self.combined_schema,
-                                &mut combined,
-                                Some(ctx),
-                            )? {
-                                continue;
-                            }
-
-                            scatter[accum_idx].push(combined);
-                        }
+                        on_match(accum_indices, &obj_binding)?;
                     }
                 }
             }
@@ -1986,6 +2044,77 @@ impl NestedLoopJoinOperator {
         Ok(())
     }
 
+    /// Whether any inline operator is a `Bind` (which appends or clobbers a
+    /// column and therefore requires a materialized combined row).
+    fn inline_has_bind(&self) -> bool {
+        self.inline_ops
+            .iter()
+            .any(|op| matches!(op, InlineOperator::Bind { .. }))
+    }
+
+    /// Phase 5 (fast path): assemble a right-only flat scatter into output
+    /// batches in left-row order.
+    ///
+    /// `scatter[accum_idx]` holds the right-side tails of every match for that
+    /// accumulator slot, concatenated (each tail is `right_width` bindings). The
+    /// left columns are reconstructed from the stored left batch via the
+    /// accumulator's `(batch_idx, row_idx)` and written directly into the output
+    /// columns — no per-match `combined` Vec and no transpose. Only used when
+    /// `right_width >= 1`, so `combined_schema` is never empty here.
+    fn emit_right_scatter_to_output(
+        &mut self,
+        scatter: Vec<Vec<Binding>>,
+        right_width: usize,
+        batch_size: usize,
+    ) -> Result<()> {
+        let num_cols = self.combined_schema.len();
+        let left_len = self.left_schema.len();
+        let mut output_columns: Vec<Vec<Binding>> = (0..num_cols)
+            .map(|_| Vec::with_capacity(batch_size))
+            .collect();
+        let mut rows_added = 0usize;
+
+        for (accum_idx, tails) in scatter.into_iter().enumerate() {
+            if tails.is_empty() {
+                continue;
+            }
+            let (batch_idx, row_idx, _) = self.batched_accumulator[accum_idx];
+            let n_matches = tails.len() / right_width;
+            let mut tail_iter = tails.into_iter();
+            for _ in 0..n_matches {
+                for (col, out_col) in output_columns.iter_mut().enumerate().take(left_len) {
+                    out_col.push(
+                        self.stored_left_batches[batch_idx]
+                            .get_by_col(row_idx, col)
+                            .clone(),
+                    );
+                }
+                for off in 0..right_width {
+                    // `tails.len()` is a multiple of `right_width` by construction.
+                    output_columns[left_len + off].push(tail_iter.next().unwrap());
+                }
+                rows_added += 1;
+
+                if rows_added >= batch_size {
+                    let batch = Batch::new(self.combined_schema.clone(), output_columns)?;
+                    self.batched_output.push_back(batch);
+                    output_columns = (0..num_cols)
+                        .map(|_| Vec::with_capacity(batch_size))
+                        .collect();
+                    rows_added = 0;
+                }
+            }
+        }
+
+        if rows_added > 0 {
+            let batch = Batch::new(self.combined_schema.clone(), output_columns)?;
+            self.batched_output.push_back(batch);
+        }
+
+        self.clear_batched_state();
+        Ok(())
+    }
+
     /// Binary-index batched scan orchestrator.
     ///
     /// Implements a true batched scan over PSOT leaf files:
@@ -2036,22 +2165,114 @@ impl NestedLoopJoinOperator {
             *unique_s_ids.last().unwrap(),
         );
 
-        // Phase 4: Scan leaves → scatter buffer
-        let mut scatter: Vec<Vec<Vec<Binding>>> = vec![Vec::new(); self.batched_accumulator.len()];
-        self.scan_leaves_into_scatter(
-            ctx,
-            &store,
-            branch,
-            leaf_range,
-            p_id,
-            &unique_s_ids,
-            &s_id_to_accum,
-            &mut scatter,
-            &dict_overlay,
-        )?;
+        // Phase 4+5: Scan leaves, scatter matches by accumulator position, emit
+        // output batches in left-row order. Two scatter representations:
+        //
+        //  * Fast path (`right_width >= 1` and no `Bind` inline ops): a right-only
+        //    flat scatter (`Vec<Vec<Binding>>`, the right-side tails concatenated
+        //    per accumulator slot). Inline FILTERs run against a `CombinedRowView`
+        //    over the stored left row + right tail — no per-match `combined` Vec.
+        //    `emit_right_scatter_to_output` writes left columns (cloned once) and
+        //    right tails directly into the output columns.
+        //  * Bind/general path: full combined rows scattered into
+        //    `Vec<Vec<Vec<Binding>>>`, then transposed by `emit_scatter_to_output`.
+        //    Binds may append or clobber columns, so the row must be materialized.
+        let right_width = self.combined_schema.len() - self.left_schema.len();
+        if right_width >= 1 && !self.inline_has_bind() {
+            let left_len = self.left_schema.len();
+            let combined_schema = self.combined_schema.clone();
+            let mut scatter: Vec<Vec<Binding>> = vec![Vec::new(); self.batched_accumulator.len()];
+            {
+                let mut on_match = |accum_indices: &[usize], obj: &Binding| -> Result<()> {
+                    // Right-side tail (object + any right-scan inline outputs) is
+                    // independent of the left row, so build it once per match.
+                    let mut right_bindings = Vec::with_capacity(self.right_new_vars.len());
+                    for _ in 0..self.right_new_vars.len() {
+                        right_bindings.push(obj.clone());
+                    }
+                    if !self.apply_right_scan_inline_ops(ctx, &mut right_bindings)? {
+                        return Ok(());
+                    }
+                    for &accum_idx in accum_indices {
+                        let (batch_idx, row_idx, _) = self.batched_accumulator[accum_idx];
+                        if !self.inline_ops.is_empty() {
+                            let view = CombinedRowView {
+                                left_batch: &self.stored_left_batches[batch_idx],
+                                left_row: row_idx,
+                                left_len,
+                                right: &right_bindings,
+                                schema: &combined_schema,
+                            };
+                            if !apply_inline_filters_view(&self.inline_ops, &view, ctx)? {
+                                continue;
+                            }
+                        }
+                        scatter[accum_idx].extend(right_bindings.iter().cloned());
+                    }
+                    Ok(())
+                };
+                self.scan_matches(
+                    ctx,
+                    &store,
+                    branch,
+                    leaf_range,
+                    p_id,
+                    &unique_s_ids,
+                    &s_id_to_accum,
+                    &dict_overlay,
+                    &mut on_match,
+                )?;
+            }
+            self.emit_right_scatter_to_output(scatter, right_width, ctx.batch_size)?;
+        } else {
+            let mut scatter: Vec<Vec<Vec<Binding>>> =
+                vec![Vec::new(); self.batched_accumulator.len()];
+            {
+                let mut on_match = |accum_indices: &[usize], obj: &Binding| -> Result<()> {
+                    for &accum_idx in accum_indices {
+                        let (batch_idx, row_idx, _) = &self.batched_accumulator[accum_idx];
+                        let left_batch = &self.stored_left_batches[*batch_idx];
+                        let mut right_bindings = Vec::with_capacity(self.right_new_vars.len());
+                        for _ in &self.right_new_vars {
+                            right_bindings.push(obj.clone());
+                        }
+                        if !self.apply_right_scan_inline_ops(ctx, &mut right_bindings)? {
+                            continue;
+                        }
 
-        // Phase 5: Emit output batches
-        self.emit_scatter_to_output(scatter, ctx.batch_size)?;
+                        let mut combined = Vec::with_capacity(self.combined_schema.len());
+                        for col in 0..self.left_schema.len() {
+                            combined.push(left_batch.get_by_col(*row_idx, col).clone());
+                        }
+                        combined.extend(right_bindings);
+
+                        if !apply_inline(
+                            &self.inline_ops,
+                            &self.combined_schema,
+                            &mut combined,
+                            Some(ctx),
+                        )? {
+                            continue;
+                        }
+
+                        scatter[accum_idx].push(combined);
+                    }
+                    Ok(())
+                };
+                self.scan_matches(
+                    ctx,
+                    &store,
+                    branch,
+                    leaf_range,
+                    p_id,
+                    &unique_s_ids,
+                    &s_id_to_accum,
+                    &dict_overlay,
+                    &mut on_match,
+                )?;
+            }
+            self.emit_scatter_to_output(scatter, ctx.batch_size)?;
+        }
 
         tracing::debug!(
             total_ms = (overall_start.elapsed().as_secs_f64() * 1000.0) as u64,
@@ -2211,24 +2432,24 @@ impl NestedLoopJoinOperator {
                 let batch = if entry.row_count == 0 {
                     fluree_db_binary_index::ColumnBatch::empty()
                 } else if let Some(c) = &cache {
-                    let key = fluree_db_binary_index::read::leaflet_cache::V3BatchCacheKey {
-                        leaf_id,
-                        leaflet_idx: u32::try_from(leaflet_idx).map_err(|_| {
-                            QueryError::Internal("leaflet idx exceeds u32".to_string())
-                        })?,
-                    };
-                    if let Some(cached) = c.get_v3_batch(&key) {
-                        cached
-                    } else {
-                        load_leaflet_columns(
-                            &leaf_bytes,
-                            entry,
-                            dir.payload_base,
-                            &proj,
-                            header.order,
-                        )
-                        .map_err(|e| QueryError::Internal(format!("load columns: {e}")))?
-                    }
+                    let leaflet_idx_u32 = u32::try_from(leaflet_idx)
+                        .map_err(|_| QueryError::Internal("leaflet idx exceeds u32".to_string()))?;
+                    // Projection-aware + inserting: caches under the decoded
+                    // column set (CORE, or ALL for replay) so repeat probes hit
+                    // instead of re-decoding, and never collides with a wider entry.
+                    fluree_db_binary_index::read::column_loader::load_leaflet_columns_cached(
+                        &leaf_bytes,
+                        entry,
+                        dir.payload_base,
+                        c,
+                        fluree_db_binary_index::read::column_loader::LeafletDecodeSpec {
+                            leaf_id,
+                            leaflet_idx: leaflet_idx_u32,
+                            order: header.order,
+                            decode_set: proj.effective(),
+                        },
+                    )
+                    .map_err(|e| QueryError::Internal(format!("load columns: {e}")))?
                 } else {
                     load_leaflet_columns(&leaf_bytes, entry, dir.payload_base, &proj, header.order)
                         .map_err(|e| QueryError::Internal(format!("load columns: {e}")))?
@@ -2666,11 +2887,15 @@ pub(crate) fn batched_subject_probe_binary(
                     &leaf_bytes,
                     entry,
                     dir.payload_base,
-                    header.order,
                     c,
-                    leaf_id,
-                    u32::try_from(leaflet_idx)
-                        .map_err(|_| QueryError::Internal("leaflet idx exceeds u32".to_string()))?,
+                    fluree_db_binary_index::read::column_loader::LeafletDecodeSpec {
+                        leaf_id,
+                        leaflet_idx: u32::try_from(leaflet_idx).map_err(|_| {
+                            QueryError::Internal("leaflet idx exceeds u32".to_string())
+                        })?,
+                        order: header.order,
+                        decode_set: fluree_db_binary_index::ColumnSet::ALL,
+                    },
                 )
                 .map_err(|e| QueryError::Internal(format!("load columns: {e}")))?
             } else {
@@ -2798,7 +3023,8 @@ pub(crate) fn batched_subject_star_spot(
         return Ok(Vec::new());
     }
 
-    let mut predicates_by_id: HashMap<u32, &SpotStarPredicateParams<'_>> = HashMap::new();
+    let mut predicates_by_id: FxHashMap<u32, &SpotStarPredicateParams<'_>> =
+        FxHashMap::with_capacity_and_hasher(predicates.len(), FxBuildHasher);
     for predicate in predicates {
         let Some(p_id) = store.sid_to_p_id(&predicate.pred_sid) else {
             continue;
@@ -2869,11 +3095,15 @@ pub(crate) fn batched_subject_star_spot(
                     &leaf_bytes,
                     entry,
                     dir.payload_base,
-                    header.order,
                     c,
-                    leaf_id,
-                    u32::try_from(leaflet_idx)
-                        .map_err(|_| QueryError::Internal("leaflet idx exceeds u32".to_string()))?,
+                    fluree_db_binary_index::read::column_loader::LeafletDecodeSpec {
+                        leaf_id,
+                        leaflet_idx: u32::try_from(leaflet_idx).map_err(|_| {
+                            QueryError::Internal("leaflet idx exceeds u32".to_string())
+                        })?,
+                        order: header.order,
+                        decode_set: fluree_db_binary_index::ColumnSet::ALL,
+                    },
                 )
                 .map_err(|e| QueryError::Internal(format!("load columns: {e}")))?
             } else {

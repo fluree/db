@@ -22,7 +22,7 @@ use crate::read::types::{cmp_row_vs_overlay, OverlayOp};
 
 use super::binary_index_store::BinaryIndexStore;
 use super::column_loader::load_columns_cached_via_handle;
-use super::column_types::{BinaryFilter, ColumnBatch, ColumnData, ColumnProjection};
+use super::column_types::{BinaryFilter, ColumnBatch, ColumnData, ColumnProjection, ColumnSet};
 use super::replay::{batch_has_rows_above_t, replay_leaflet};
 use crate::format::column_block::ColumnId;
 
@@ -198,6 +198,38 @@ impl BinaryCursor {
         self.to_t < self.store.max_t()
     }
 
+    /// Columns to decode for the current leaflet (projection-aware).
+    ///
+    /// Trusts the cursor's `projection` (which already carries output + internal
+    /// filter/order columns, exactly as the no-cache decode path consumes it),
+    /// but widens it defensively so a narrowed decode can never starve a
+    /// downstream read:
+    /// - `has_ov`: the overlay merge reads every base column → decode ALL.
+    /// - non-empty filter: `filter_batch` reads s/p/o_type/o_key/o_i (mostly
+    ///   `Const`/absent, so free to include).
+    /// - `need_replay`: leaflet replay reads `t`.
+    ///
+    /// For a plain current-time scan this drops `t` (and any other unprojected
+    /// column), so its `Block` is neither decoded nor allocated. The leaflet
+    /// cache keys on this set, keeping narrow and full batches distinct.
+    fn leaflet_decode_set(&self, has_ov: bool) -> ColumnSet {
+        if has_ov {
+            return ColumnSet::ALL;
+        }
+        let mut set = self.projection.effective();
+        if !self.filter.is_empty() {
+            set.insert(ColumnId::SId);
+            set.insert(ColumnId::OKey);
+            set.insert(ColumnId::PId);
+            set.insert(ColumnId::OType);
+            set.insert(ColumnId::OI);
+        }
+        if self.need_replay() {
+            set.insert(ColumnId::T);
+        }
+        set
+    }
+
     /// Whether any overlay ops remain globally (for overlay-only path).
     fn has_any_overlay(&self) -> bool {
         self.overlay_pos < self.overlay_ops.len()
@@ -262,25 +294,47 @@ impl BinaryCursor {
                         continue;
                     }
 
+                    // Key-range pre-skip: drop leaflets whose [first_key, last_key]
+                    // provably cannot contain a row matching the filter's bound
+                    // order-leading prefix, before paying any decode + per-row
+                    // filter. Same safety guards as the metadata skip above
+                    // (no overlay merge; no time-travel history replay).
+                    if !has_ov
+                        && !needs_history_replay
+                        && self.filter.leaflet_out_of_range(
+                            self.order,
+                            &entry.first_key,
+                            &entry.last_key,
+                        )
+                    {
+                        continue;
+                    }
+
                     // Load columns via LeafHandle (cached when LeafletCache is available).
                     let mut batch = if entry.row_count > 0 {
                         let leaflet_idx = self.current_leaflet_idx - 1;
+                        let decode_set = self.leaflet_decode_set(has_ov);
                         if let Some(cache) = self.store.leaflet_cache() {
                             load_columns_cached_via_handle(
                                 leaf.handle.as_ref(),
-                                leaflet_idx,
-                                self.order,
                                 cache,
-                                leaf.handle.leaf_id(),
-                                u32::try_from(leaflet_idx).map_err(|_| {
-                                    std::io::Error::other(format!(
-                                        "leaflet index {leaflet_idx} exceeds u32::MAX"
-                                    ))
-                                })?,
+                                super::column_loader::LeafletDecodeSpec {
+                                    leaf_id: leaf.handle.leaf_id(),
+                                    leaflet_idx: u32::try_from(leaflet_idx).map_err(|_| {
+                                        std::io::Error::other(format!(
+                                            "leaflet index {leaflet_idx} exceeds u32::MAX"
+                                        ))
+                                    })?,
+                                    order: self.order,
+                                    decode_set,
+                                },
                             )?
                         } else {
-                            leaf.handle
-                                .load_columns(leaflet_idx, &self.projection, self.order)?
+                            let proj = ColumnProjection {
+                                output: decode_set,
+                                internal: ColumnSet::EMPTY,
+                            };
+                            leaf.handle.load_columns(leaflet_idx, &proj, self.order)?
                         }
                     } else {
                         ColumnBatch::empty()
