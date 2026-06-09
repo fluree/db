@@ -1502,7 +1502,7 @@ fn test_insert_data_simple() {
         assert_parses("INSERT DATA { <http://example.org/s> <http://example.org/p> \"value\" }");
     match &ast.body {
         QueryBody::Update(UpdateOperation::InsertData(insert)) => {
-            assert_eq!(insert.data.triples.len(), 1);
+            assert_eq!(insert.data.quads.len(), 1);
         }
         _ => panic!("Expected INSERT DATA"),
     }
@@ -1515,7 +1515,7 @@ fn test_insert_data_multiple_triples() {
     );
     match &ast.body {
         QueryBody::Update(UpdateOperation::InsertData(insert)) => {
-            assert_eq!(insert.data.triples.len(), 2);
+            assert_eq!(insert.data.quads.len(), 2);
         }
         _ => panic!("Expected INSERT DATA"),
     }
@@ -1526,7 +1526,7 @@ fn test_insert_data_prefixed() {
     let ast = assert_parses("PREFIX ex: <http://example.org/> INSERT DATA { ex:s ex:p \"value\" }");
     match &ast.body {
         QueryBody::Update(UpdateOperation::InsertData(insert)) => {
-            assert_eq!(insert.data.triples.len(), 1);
+            assert_eq!(insert.data.quads.len(), 1);
         }
         _ => panic!("Expected INSERT DATA"),
     }
@@ -1538,7 +1538,70 @@ fn test_delete_data_simple() {
         assert_parses("DELETE DATA { <http://example.org/s> <http://example.org/p> \"value\" }");
     match &ast.body {
         QueryBody::Update(UpdateOperation::DeleteData(delete)) => {
-            assert_eq!(delete.data.triples.len(), 1);
+            assert_eq!(delete.data.quads.len(), 1);
+        }
+        _ => panic!("Expected DELETE DATA"),
+    }
+}
+
+#[test]
+fn test_insert_data_graph_block() {
+    // Issue #1288: INSERT DATA { GRAPH <g> { ... } } (QuadsNotTriples).
+    use crate::ast::pattern::GraphName;
+    use crate::ast::QuadPatternElement;
+    let ast = assert_parses(
+        "INSERT DATA { GRAPH <https://example.org/g/1> { <https://example.org/s/1> <https://example.org/p> \"v\" } }"
+    );
+    match &ast.body {
+        QueryBody::Update(UpdateOperation::InsertData(insert)) => {
+            assert_eq!(insert.data.quads.len(), 1);
+            match &insert.data.quads[0] {
+                QuadPatternElement::Graph { name, triples, .. } => {
+                    assert!(matches!(name, GraphName::Iri(_)));
+                    assert_eq!(triples.len(), 1);
+                }
+                _ => panic!("Expected a GRAPH block in INSERT DATA"),
+            }
+        }
+        _ => panic!("Expected INSERT DATA"),
+    }
+}
+
+#[test]
+fn test_insert_data_mixed_default_and_graph() {
+    use crate::ast::QuadPatternElement;
+    let ast = assert_parses(
+        "PREFIX ex: <http://example.org/> INSERT DATA { ex:a ex:p \"d\" . GRAPH <urn:g> { ex:b ex:p \"n\" } }"
+    );
+    match &ast.body {
+        QueryBody::Update(UpdateOperation::InsertData(insert)) => {
+            assert_eq!(insert.data.quads.len(), 2);
+            assert!(matches!(
+                insert.data.quads[0],
+                QuadPatternElement::Triple(_)
+            ));
+            assert!(matches!(
+                insert.data.quads[1],
+                QuadPatternElement::Graph { .. }
+            ));
+        }
+        _ => panic!("Expected INSERT DATA"),
+    }
+}
+
+#[test]
+fn test_delete_data_graph_block() {
+    use crate::ast::QuadPatternElement;
+    let ast = assert_parses(
+        "DELETE DATA { GRAPH <urn:g> { <http://example.org/s> <http://example.org/p> \"v\" } }",
+    );
+    match &ast.body {
+        QueryBody::Update(UpdateOperation::DeleteData(delete)) => {
+            assert_eq!(delete.data.quads.len(), 1);
+            assert!(matches!(
+                delete.data.quads[0],
+                QuadPatternElement::Graph { .. }
+            ));
         }
         _ => panic!("Expected DELETE DATA"),
     }
