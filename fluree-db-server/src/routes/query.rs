@@ -31,7 +31,7 @@ use std::sync::Arc;
 use tracing::Instrument;
 
 fn query_execution_options(state: &AppState) -> QueryExecutionOptions {
-    crate::query_control::query_execution_options(state.config.query_timeout_ms)
+    crate::query_control::current_query_execution_options(state.config.query_timeout_ms)
 }
 
 // ============================================================================
@@ -372,7 +372,7 @@ pub async fn query(
     headers: FlureeHeaders,
     bearer: MaybeDataBearer,
     credential: MaybeCredential,
-) -> Result<impl IntoResponse> {
+) -> Result<Response> {
     // Create request span with correlation context
     let request_id = extract_request_id(&credential.headers, &state.telemetry_config);
     let trace_id = extract_trace_id(&credential.headers);
@@ -392,6 +392,7 @@ pub async fn query(
         None, // tenant_id not yet supported
         Some(input_format),
     );
+    crate::query_control::run_query_task(state.config.query_timeout_ms, move || async move {
     async move {
     let span = tracing::Span::current();
 
@@ -709,6 +710,8 @@ pub async fn query(
     }
     .instrument(span)
     .await
+    })
+    .await
 }
 
 /// Execute a query with ledger in path
@@ -728,7 +731,7 @@ pub async fn query_ledger(
     headers: FlureeHeaders,
     bearer: MaybeDataBearer,
     credential: MaybeCredential,
-) -> Result<impl IntoResponse> {
+) -> Result<Response> {
     // Create request span with correlation context
     let request_id = extract_request_id(&credential.headers, &state.telemetry_config);
     let trace_id = extract_trace_id(&credential.headers);
@@ -747,6 +750,7 @@ pub async fn query_ledger(
         None, // tenant_id not yet supported
         Some(input_format),
     );
+    crate::query_control::run_query_task(state.config.query_timeout_ms, move || async move {
     async move {
     let span = tracing::Span::current();
 
@@ -877,6 +881,8 @@ pub async fn query_ledger(
     execute_query(&state, &ledger_id, &query_json, delimited).await
     }
     .instrument(span)
+    .await
+    })
     .await
 }
 
@@ -2908,189 +2914,197 @@ pub async fn multi_query(
         Some("multi-query"),
     );
 
-    async move {
-        let span = tracing::Span::current();
-        tracing::info!(status = "start", "multi-query request received");
+    crate::query_control::run_query_task(state.config.query_timeout_ms, move || async move {
+        async move {
+            let span = tracing::Span::current();
+            tracing::info!(status = "start", "multi-query request received");
 
-        // Auth: bearer or signed credential. Mirrors single-query
-        // /fluree/query top-level handler.
-        let data_auth = state.config.data_auth();
-        if data_auth.mode == crate::config::DataAuthMode::Required
-            && !credential.is_signed()
-            && bearer.0.is_none()
-        {
-            set_span_error_code(&span, "error:Unauthorized");
-            return Err(ServerError::unauthorized(
-                "data auth required: provide a bearer token or signed request",
-            ));
-        }
-
-        // Negotiate output format from request headers. Multi-query
-        // assembles each alias's result inside a JSON envelope, so
-        // byte-/string-shaped formats (TSV/CSV/SPARQL XML/RDF/XML) are
-        // rejected with 406; unknown `Fluree-Output-Format` values are
-        // rejected with 400. Tag the span with the error class that
-        // actually fired (not a constant) so trace dashboards filter
-        // correctly.
-        let envelope_format = match negotiate_multi_query_format(&headers) {
-            Ok(f) => f,
-            Err(err) => {
-                let code = match &err {
-                    ServerError::NotAcceptable(_) => "error:NotAcceptable",
-                    ServerError::BadRequest(_) => "error:BadRequest",
-                    _ => "error:NotAcceptable",
-                };
-                set_span_error_code(&span, code);
-                return Err(err);
+            // Auth: bearer or signed credential. Mirrors single-query
+            // /fluree/query top-level handler.
+            let data_auth = state.config.data_auth();
+            if data_auth.mode == crate::config::DataAuthMode::Required
+                && !credential.is_signed()
+                && bearer.0.is_none()
+            {
+                set_span_error_code(&span, "error:Unauthorized");
+                return Err(ServerError::unauthorized(
+                    "data auth required: provide a bearer token or signed request",
+                ));
             }
-        };
 
-        // Parse envelope body via credential to honor JWS-wrapped requests.
-        let body: JsonValue = credential.body_json()?;
-        let mut envelope: MultiQueryRequest = serde_json::from_value(body).map_err(|e| {
-            set_span_error_code(&span, "error:BadRequest");
-            ServerError::bad_request(format!("invalid multi-query envelope: {e}"))
-        })?;
-
-        // Inject fluree-* headers (policy-class, policy, policy-values,
-        // max-fuel, etc.) into the envelope's top-level opts *before*
-        // validation. This way the envelope-level rejections (max-fuel
-        // unsupported, maxConcurrency bounds) catch values supplied via
-        // headers the same as they catch body opts, and the merged opts
-        // carry the headers into every sub-query as defaults — parity
-        // with single-query `inject_headers_into_query`.
-        envelope = inject_headers_into_envelope(envelope, &headers);
-
-        let bounds = MultiQueryBounds::DEFAULT;
-
-        // Validation — we re-run it inside the api crate's dispatcher,
-        // but pre-validating here gives us the distinct-ledger set we
-        // need for the bearer-scope check before any execution starts.
-        let distinct_ledgers =
-            match fluree_db_api::query::multi::validate_envelope(&envelope, &bounds) {
-                Ok(distinct) => distinct,
+            // Negotiate output format from request headers. Multi-query
+            // assembles each alias's result inside a JSON envelope, so
+            // byte-/string-shaped formats (TSV/CSV/SPARQL XML/RDF/XML) are
+            // rejected with 406; unknown `Fluree-Output-Format` values are
+            // rejected with 400. Tag the span with the error class that
+            // actually fired (not a constant) so trace dashboards filter
+            // correctly.
+            let envelope_format = match negotiate_multi_query_format(&headers) {
+                Ok(f) => f,
                 Err(err) => {
-                    set_span_error_code(&span, "error:BadRequest");
-                    return Err(validation_error_to_server(&err));
+                    let code = match &err {
+                        ServerError::NotAcceptable(_) => "error:NotAcceptable",
+                        ServerError::BadRequest(_) => "error:BadRequest",
+                        _ => "error:NotAcceptable",
+                    };
+                    set_span_error_code(&span, code);
+                    return Err(err);
                 }
             };
 
-        // Bearer ledger-scope enforcement — parity with single-query
-        // /query and /query/:ledger. Unsigned bearer tokens may carry a
-        // scope that limits which ledgers they can read; any envelope
-        // referencing a ledger outside that scope is rejected with 404
-        // (avoiding existence leak), matching the single-query response.
-        if let Some(principal) = bearer.0.as_ref() {
-            if !credential.is_signed() {
-                for ledger_id in &distinct_ledgers {
-                    if !principal.can_read(ledger_id) {
-                        set_span_error_code(&span, "error:Forbidden");
-                        return Err(ServerError::not_found("Ledger not found"));
+            // Parse envelope body via credential to honor JWS-wrapped requests.
+            let body: JsonValue = credential.body_json()?;
+            let mut envelope: MultiQueryRequest = serde_json::from_value(body).map_err(|e| {
+                set_span_error_code(&span, "error:BadRequest");
+                ServerError::bad_request(format!("invalid multi-query envelope: {e}"))
+            })?;
+
+            // Inject fluree-* headers (policy-class, policy, policy-values,
+            // max-fuel, etc.) into the envelope's top-level opts *before*
+            // validation. This way the envelope-level rejections (max-fuel
+            // unsupported, maxConcurrency bounds) catch values supplied via
+            // headers the same as they catch body opts, and the merged opts
+            // carry the headers into every sub-query as defaults — parity
+            // with single-query `inject_headers_into_query`.
+            envelope = inject_headers_into_envelope(envelope, &headers);
+
+            let bounds = MultiQueryBounds::DEFAULT;
+
+            // Validation — we re-run it inside the api crate's dispatcher,
+            // but pre-validating here gives us the distinct-ledger set we
+            // need for the bearer-scope check before any execution starts.
+            let distinct_ledgers =
+                match fluree_db_api::query::multi::validate_envelope(&envelope, &bounds) {
+                    Ok(distinct) => distinct,
+                    Err(err) => {
+                        set_span_error_code(&span, "error:BadRequest");
+                        return Err(validation_error_to_server(&err));
+                    }
+                };
+
+            // Bearer ledger-scope enforcement — parity with single-query
+            // /query and /query/:ledger. Unsigned bearer tokens may carry a
+            // scope that limits which ledgers they can read; any envelope
+            // referencing a ledger outside that scope is rejected with 404
+            // (avoiding existence leak), matching the single-query response.
+            if let Some(principal) = bearer.0.as_ref() {
+                if !credential.is_signed() {
+                    for ledger_id in &distinct_ledgers {
+                        if !principal.can_read(ledger_id) {
+                            set_span_error_code(&span, "error:Forbidden");
+                            return Err(ServerError::not_found("Ledger not found"));
+                        }
                     }
                 }
             }
-        }
 
-        // Per-sub-query identity / default-policy-class injection runs
-        // here, not inside the api crate. apply_auth_identity_to_opts
-        // depends on the server's impersonation table, which is a
-        // server concern.
-        //
-        // Two security invariants this block enforces:
-        //
-        // 1. The impersonation gate sees the **final** opts.identity
-        //    that would be in effect — including any value set at the
-        //    envelope level or in the sub.opts override. Without the
-        //    pre-merge below, an envelope-level `opts.identity` would
-        //    bypass the gate entirely because
-        //    `body_requests_impersonation` only inspects the query
-        //    body's opts.
-        //
-        // 2. The gate's decision (force bearer identity, or honour body
-        //    opts) is persisted into `sub.query["opts"]`, where the api
-        //    crate's dispatcher gives it precedence over `envelope.opts`
-        //    and `sub.opts`. The dispatcher's merge rule is
-        //    `envelope ⊕ sub.opts ⊕ body opts` with body winning, so
-        //    nothing downstream can clobber the forced identity by
-        //    setting an unrelated key like `meta` at the envelope or
-        //    sub-query level.
-        let envelope_opts_owned = envelope.opts.clone();
-        let effective_id = effective_identity(&credential, &bearer);
-        let default_policy_class = data_auth.default_policy_class.clone();
-        for sub in envelope.queries.values_mut() {
-            if matches!(sub.language, SubqueryLanguage::JsonLd) {
-                premerge_opts_into_subquery_body(envelope_opts_owned.as_ref(), sub);
-                apply_envelope_subquery_auth(
-                    &state,
-                    sub,
-                    effective_id.as_deref(),
-                    default_policy_class.as_deref(),
-                )
-                .await;
-            } else if matches!(sub.language, SubqueryLanguage::Sparql) {
-                // SPARQL aliases are policy-enforced too: resolve identity /
-                // policy-class through the same impersonation gate and stash the
-                // decision in `sub.opts`, which the api crate's SPARQL path reads
-                // (`run_sparql_subquery` → `connection_opts`). Without this a
-                // SPARQL alias would run unrestricted while its JSON-LD twin is
-                // gated.
-                apply_envelope_sparql_auth(
-                    &state,
-                    sub,
-                    envelope_opts_owned.as_ref(),
-                    effective_id.as_deref(),
-                    default_policy_class.as_deref(),
-                )
-                .await;
+            // Per-sub-query identity / default-policy-class injection runs
+            // here, not inside the api crate. apply_auth_identity_to_opts
+            // depends on the server's impersonation table, which is a
+            // server concern.
+            //
+            // Two security invariants this block enforces:
+            //
+            // 1. The impersonation gate sees the **final** opts.identity
+            //    that would be in effect — including any value set at the
+            //    envelope level or in the sub.opts override. Without the
+            //    pre-merge below, an envelope-level `opts.identity` would
+            //    bypass the gate entirely because
+            //    `body_requests_impersonation` only inspects the query
+            //    body's opts.
+            //
+            // 2. The gate's decision (force bearer identity, or honour body
+            //    opts) is persisted into `sub.query["opts"]`, where the api
+            //    crate's dispatcher gives it precedence over `envelope.opts`
+            //    and `sub.opts`. The dispatcher's merge rule is
+            //    `envelope ⊕ sub.opts ⊕ body opts` with body winning, so
+            //    nothing downstream can clobber the forced identity by
+            //    setting an unrelated key like `meta` at the envelope or
+            //    sub-query level.
+            let envelope_opts_owned = envelope.opts.clone();
+            let effective_id = effective_identity(&credential, &bearer);
+            let default_policy_class = data_auth.default_policy_class.clone();
+            for sub in envelope.queries.values_mut() {
+                if matches!(sub.language, SubqueryLanguage::JsonLd) {
+                    premerge_opts_into_subquery_body(envelope_opts_owned.as_ref(), sub);
+                    apply_envelope_subquery_auth(
+                        &state,
+                        sub,
+                        effective_id.as_deref(),
+                        default_policy_class.as_deref(),
+                    )
+                    .await;
+                } else if matches!(sub.language, SubqueryLanguage::Sparql) {
+                    // SPARQL aliases are policy-enforced too: resolve identity /
+                    // policy-class through the same impersonation gate and stash the
+                    // decision in `sub.opts`, which the api crate's SPARQL path reads
+                    // (`run_sparql_subquery` → `connection_opts`). Without this a
+                    // SPARQL alias would run unrestricted while its JSON-LD twin is
+                    // gated.
+                    apply_envelope_sparql_auth(
+                        &state,
+                        sub,
+                        envelope_opts_owned.as_ref(),
+                        effective_id.as_deref(),
+                        default_policy_class.as_deref(),
+                    )
+                    .await;
+                }
             }
-        }
 
-        // Hand off to the api crate: validate (again, cheaply) →
-        // resolve snapshot → dispatch → assemble. Per-alias outcomes
-        // are folded into the response body; only envelope-level
-        // failures bubble up as `MultiQueryError`.
-        let mut builder = state.fluree.multi_query().envelope(envelope).bounds(bounds);
-        if let Some(cfg) = envelope_format {
-            builder = builder.format(cfg);
-        }
-        let response = match builder.execute().await {
-            Ok(r) => r,
-            Err(MultiQueryError::Validation(err)) => {
-                set_span_error_code(&span, "error:BadRequest");
-                return Err(validation_error_to_server(&err));
+            // Hand off to the api crate: validate (again, cheaply) →
+            // resolve snapshot → dispatch → assemble. Per-alias outcomes
+            // are folded into the response body; only envelope-level
+            // failures bubble up as `MultiQueryError`.
+            let mut builder = state
+                .fluree
+                .multi_query()
+                .envelope(envelope)
+                .bounds(bounds)
+                .execution_options(query_execution_options(&state));
+            if let Some(cfg) = envelope_format {
+                builder = builder.format(cfg);
             }
-            Err(MultiQueryError::Snapshot(api_err)) => {
-                set_span_error_code(&span, "error:SnapshotResolutionFailed");
-                tracing::error!(error = %api_err, "multi-query snapshot resolution failed");
-                return Err(ServerError::Api(api_err));
-            }
-            Err(MultiQueryError::ResponseAssembly(err)) => {
-                set_span_error_code(&span, "error:ResponseTooLarge");
-                return Err(ServerError::internal(err.to_string()));
-            }
-            Err(MultiQueryError::EnvelopeRequired) => {
-                set_span_error_code(&span, "error:Internal");
-                return Err(ServerError::internal(
-                    "multi-query envelope was not provided to the dispatcher".to_string(),
-                ));
-            }
-            Err(MultiQueryError::UnsupportedFormat { format }) => {
-                set_span_error_code(&span, "error:NotAcceptable");
-                return Err(ServerError::not_acceptable(format!(
-                    "multi-query format {format:?} produces non-JSON output \
+            let response = match builder.execute().await {
+                Ok(r) => r,
+                Err(MultiQueryError::Validation(err)) => {
+                    set_span_error_code(&span, "error:BadRequest");
+                    return Err(validation_error_to_server(&err));
+                }
+                Err(MultiQueryError::Snapshot(api_err)) => {
+                    set_span_error_code(&span, "error:SnapshotResolutionFailed");
+                    tracing::error!(error = %api_err, "multi-query snapshot resolution failed");
+                    return Err(ServerError::Api(api_err));
+                }
+                Err(MultiQueryError::ResponseAssembly(err)) => {
+                    set_span_error_code(&span, "error:ResponseTooLarge");
+                    return Err(ServerError::internal(err.to_string()));
+                }
+                Err(MultiQueryError::EnvelopeRequired) => {
+                    set_span_error_code(&span, "error:Internal");
+                    return Err(ServerError::internal(
+                        "multi-query envelope was not provided to the dispatcher".to_string(),
+                    ));
+                }
+                Err(MultiQueryError::UnsupportedFormat { format }) => {
+                    set_span_error_code(&span, "error:NotAcceptable");
+                    return Err(ServerError::not_acceptable(format!(
+                        "multi-query format {format:?} produces non-JSON output \
                      and cannot be used inside a multi-query envelope"
-                )));
-            }
-        };
+                    )));
+                }
+            };
 
-        tracing::info!(
-            status = "success",
-            query_kind = "multi",
-            response_status = ?response.status,
-        );
-        Ok((HeaderMap::new(), Json(response)).into_response())
-    }
-    .instrument(span)
+            tracing::info!(
+                status = "success",
+                query_kind = "multi",
+                response_status = ?response.status,
+            );
+            Ok((HeaderMap::new(), Json(response)).into_response())
+        }
+        .instrument(span)
+        .await
+    })
     .await
 }
 

@@ -294,9 +294,9 @@ Maximum request body size in bytes:
 Maximum query execution time in milliseconds. The server starts a timeout task
 that signals query cancellation when the limit elapses; query execution observes
 that signal at batch/leaf boundaries. Set to `0` to disable the server-side
-timeout. If the HTTP request is dropped because the client disconnects, the
-server drops the in-flight request future; that is separate from this
-cooperative timeout signal.
+timeout. If an HTTP client disconnects while a query is still running, the
+server signals cancellation through the same cooperative handle so long-running
+operators can stop at the next checkpoint.
 
 | Flag                 | Env Var                    | Default                  |
 | -------------------- | -------------------------- | ------------------------ |
@@ -549,6 +549,8 @@ returned `t`, an `ORDER BY`, and `OFFSET` advanced by the returned `rowCount`.
 server-side timeout for MCP `sparql_query` execution. It uses the same
 cooperative cancellation mechanism as HTTP queries, but defaults lower because
 MCP tool calls are usually interactive. Set to `0` to disable the MCP timeout.
+This setting does not apply to `get_data_model`, which may perform schema/stat
+collection without this query timeout.
 
 ```bash
 fluree-server \
