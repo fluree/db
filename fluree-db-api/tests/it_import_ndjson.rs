@@ -132,3 +132,77 @@ async fn import_ndjson_without_context_full_iris() {
     let json = qr.to_jsonld(&ledger.snapshot).expect("format jsonld");
     assert_eq!(extract_sorted_strings(&json), vec!["Xavier", "Yara"]);
 }
+
+/// Remote ndjson via `import_from_storage`: two objects in `MemoryStorage`,
+/// each with its own leading `@context`, streamed (byte-range) and chained.
+/// The second object uses a *different* prefix (`s:`) for schema.org, so a
+/// correct result proves each object's own `@context` is applied (naive
+/// concatenation would mis-resolve it).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn import_from_storage_ndjson_then_query() {
+    use fluree_db_api::{RemoteObject, RemoteSource};
+    use fluree_db_core::{MemoryStorage, StorageRead, StorageWrite};
+    use std::sync::Arc;
+
+    let db_dir = tempfile::tempdir().expect("db tmpdir");
+    let storage = Arc::new(MemoryStorage::new());
+
+    let obj_a = concat!(
+        "{\"@context\":{\"ex\":\"http://example.org/ns/\",\"schema\":\"http://schema.org/\"}}\n",
+        "{\"@id\":\"ex:alice\",\"schema:name\":\"Alice\"}\n",
+        "{\"@id\":\"ex:bob\",\"schema:name\":\"Bob\"}\n",
+    );
+    let obj_b = concat!(
+        "{\"@context\":{\"s\":\"http://schema.org/\"}}\n",
+        "{\"@id\":\"http://example.org/ns/cam\",\"s:name\":\"Cam\"}\n",
+    );
+    storage
+        .write_bytes("imports/a.jsonl", obj_a.as_bytes())
+        .await
+        .unwrap();
+    storage
+        .write_bytes("imports/b.ndjson", obj_b.as_bytes())
+        .await
+        .unwrap();
+
+    let objects = vec![
+        RemoteObject {
+            address: "imports/a.jsonl".to_string(),
+            size_bytes: obj_a.len() as u64,
+        },
+        RemoteObject {
+            address: "imports/b.ndjson".to_string(),
+            size_bytes: obj_b.len() as u64,
+        },
+    ];
+
+    let fluree = FlureeBuilder::file(db_dir.path().to_string_lossy().to_string())
+        .build()
+        .expect("build file-backed Fluree");
+    let storage_dyn: Arc<dyn StorageRead> = storage.clone();
+    let result = fluree
+        .create("test/remote-ndjson:main")
+        .import_from_storage(storage_dyn, RemoteSource::OrderedObjects(objects))
+        .threads(2)
+        .memory_budget_mb(256)
+        .cleanup(false)
+        .execute()
+        .await
+        .expect("remote ndjson import should succeed");
+    assert!(result.flake_count > 0);
+
+    let ledger = fluree
+        .ledger("test/remote-ndjson:main")
+        .await
+        .expect("load ledger after import");
+    let query = json!({
+        "@context": { "schema": "http://schema.org/" },
+        "select": ["?name"],
+        "where": { "schema:name": "?name" }
+    });
+    let qr = support::query_jsonld(&fluree, &ledger, &query)
+        .await
+        .expect("query after import");
+    let json = qr.to_jsonld(&ledger.snapshot).expect("format jsonld");
+    assert_eq!(extract_sorted_strings(&json), vec!["Alice", "Bob", "Cam"]);
+}

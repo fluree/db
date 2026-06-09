@@ -591,6 +591,9 @@ pub(crate) enum RemoteFormat {
     Trig,
     Nquads,
     JsonLd,
+    /// Newline-delimited JSON-LD (`.jsonl`/`.ndjson`). Routed to the streaming
+    /// `JsonLdStream` source rather than the whole-object producer.
+    Ndjson,
 }
 
 /// `(chunk_index, raw_bytes)` payload sent from the remote producer to parser workers.
@@ -671,6 +674,16 @@ impl RemoteChunkProducer {
 // ChunkSource
 // ============================================================================
 
+/// Source backing a [`ChunkSource::JsonLdStream`]: a single local reader, or a
+/// channel-fed producer that chains one [`NdjsonReader`] per remote object (so
+/// each object's own leading `@context` is preserved — concatenation would not).
+pub enum JsonLdSource {
+    /// A single local `.jsonl`/`.ndjson` file, streamed directly.
+    Local(NdjsonReader),
+    /// Remote ndjson objects streamed (byte-range) and chained into one channel.
+    Remote(RemoteChunkProducer),
+}
+
 /// Abstraction over the source of import chunks.
 ///
 /// Three shapes:
@@ -696,7 +709,7 @@ pub enum ChunkSource {
     /// alongside the remote-serial path. Held in a take-once cell because the
     /// reader's completion error is observed via `join(&mut self)` after the
     /// `Arc<ChunkSource>` is shared.
-    JsonLdStream(std::sync::Mutex<Option<NdjsonReader>>),
+    JsonLdStream(std::sync::Mutex<Option<JsonLdSource>>),
 }
 
 impl ChunkSource {
@@ -1017,7 +1030,7 @@ fn resolve_chunk_source(
         )
         .map_err(|e| ImportError::NoChunks(format!("ndjson reader init failed: {e}")))?;
         return Ok(ChunkSource::JsonLdStream(std::sync::Mutex::new(Some(
-            reader,
+            JsonLdSource::Local(reader),
         ))));
     }
 
@@ -1125,6 +1138,7 @@ async fn resolve_remote_objects(
     let mut has_ttl = false;
     let mut has_trig = false;
     let mut has_jsonld = false;
+    let mut has_ndjson = false;
     let mut accepted: Vec<RemoteObject> = Vec::with_capacity(all_objects.len());
     let mut extensions: Vec<RemoteFormat> = Vec::with_capacity(all_objects.len());
     for obj in all_objects {
@@ -1155,6 +1169,11 @@ async fn resolve_remote_objects(
                 accepted.push(obj);
                 extensions.push(RemoteFormat::JsonLd);
             }
+            Some("jsonl" | "ndjson") => {
+                has_ndjson = true;
+                accepted.push(obj);
+                extensions.push(RemoteFormat::Ndjson);
+            }
             _ => {
                 // Skip non-data files silently (mirrors local behavior).
             }
@@ -1162,17 +1181,27 @@ async fn resolve_remote_objects(
     }
 
     let has_turtle_family = has_ttl || has_trig;
-    if has_turtle_family && has_jsonld {
+    let has_jsonld_family = has_jsonld || has_ndjson;
+    if has_turtle_family && has_jsonld_family {
         return Err(ImportError::MixedFormats(
-            "remote source contains both Turtle (.ttl/.trig) and JSON-LD (.jsonld) objects; \
-             use a single format family per import"
+            "remote source contains both Turtle (.ttl/.trig) and JSON-LD \
+             (.jsonld/.jsonl) objects; use a single format family per import"
+                .into(),
+        ));
+    }
+    // ndjson is streamed per-object; whole-object `.jsonld` takes a different
+    // path, so the two cannot be mixed in one import.
+    if has_jsonld && has_ndjson {
+        return Err(ImportError::MixedFormats(
+            "remote source mixes whole-object .jsonld with newline-delimited \
+             .jsonl/.ndjson objects; import them separately"
                 .into(),
         ));
     }
 
     if accepted.is_empty() {
         return Err(ImportError::NoChunks(
-            "remote source contains no .ttl/.nt/.nq/.trig/.jsonld objects".into(),
+            "remote source contains no .ttl/.nt/.nq/.trig/.jsonld/.jsonl objects".into(),
         ));
     }
 
@@ -1262,6 +1291,170 @@ fn spawn_remote_producer(
         bridge_handle: std::sync::Mutex::new(Some(bridge_handle)),
         estimated_count,
         per_chunk_format,
+    }
+}
+
+// ============================================================================
+// Remote ndjson streaming
+// ============================================================================
+
+/// A synchronous [`std::io::Read`] over a remote object's byte ranges, backed
+/// by an async [`StorageRead`]. Each refill pulls the next window via
+/// `read_byte_range`, `block_on`'d on the calling thread — which is the
+/// [`NdjsonReader`]'s own (non-runtime) reader thread, so blocking is safe.
+/// Reads are bounded by the object's known size, so it never depends on
+/// past-EOF range semantics.
+struct StorageRangeReader {
+    storage: Arc<dyn StorageRead>,
+    address: String,
+    size: u64,
+    offset: u64,
+    handle: tokio::runtime::Handle,
+    buf: Vec<u8>,
+    buf_pos: usize,
+    window: usize,
+}
+
+impl StorageRangeReader {
+    fn new(
+        storage: Arc<dyn StorageRead>,
+        address: String,
+        size: u64,
+        handle: tokio::runtime::Handle,
+    ) -> Self {
+        Self {
+            storage,
+            address,
+            size,
+            offset: 0,
+            handle,
+            buf: Vec::new(),
+            buf_pos: 0,
+            window: 1024 * 1024,
+        }
+    }
+}
+
+impl std::io::Read for StorageRangeReader {
+    fn read(&mut self, out: &mut [u8]) -> std::io::Result<usize> {
+        if self.buf_pos >= self.buf.len() {
+            if self.offset >= self.size {
+                return Ok(0); // EOF
+            }
+            let end = (self.offset + self.window as u64).min(self.size);
+            let bytes = self
+                .handle
+                .block_on(
+                    self.storage
+                        .read_byte_range(&self.address, self.offset..end),
+                )
+                .map_err(|e| {
+                    std::io::Error::other(format!("read_byte_range({}) failed: {e}", self.address))
+                })?;
+            if bytes.is_empty() {
+                // Defensive: storage returned nothing though offset < size.
+                return Ok(0);
+            }
+            self.offset += bytes.len() as u64;
+            self.buf = bytes;
+            self.buf_pos = 0;
+        }
+        let n = out.len().min(self.buf.len() - self.buf_pos);
+        out[..n].copy_from_slice(&self.buf[self.buf_pos..self.buf_pos + n]);
+        self.buf_pos += n;
+        Ok(n)
+    }
+}
+
+/// Spawn a producer that streams remote ndjson objects through per-object
+/// [`NdjsonReader`]s, forwarding their JSON-LD chunks into a shared channel with
+/// a global chunk index. Reuses [`RemoteChunkProducer`]'s channel + `error_rx`
+/// machinery; `per_chunk_format` is left empty because the chunks ride the
+/// [`ChunkSource::JsonLdStream`] path, which always parses them as JSON-LD.
+fn spawn_remote_ndjson_producer(
+    storage: Arc<dyn StorageRead>,
+    objects: Vec<RemoteObject>,
+    policy: FirstLineContextPolicy,
+    chunk_size_bytes: u64,
+    in_flight: usize,
+) -> RemoteChunkProducer {
+    let estimated_count = objects.len();
+    let in_flight = in_flight.max(1);
+    let handle = tokio::runtime::Handle::current();
+    let (std_tx, std_rx) = std::sync::mpsc::sync_channel::<(usize, Vec<u8>)>(in_flight);
+    let (error_tx, error_rx) = tokio::sync::oneshot::channel::<Option<ImportError>>();
+
+    // The producer runs on a dedicated std thread: each NdjsonReader spawns its
+    // own reader thread which `block_on`s byte-range reads, so this thread must
+    // NOT be a tokio worker.
+    let producer_handle = std::thread::Builder::new()
+        .name("ndjson-remote-producer".into())
+        .spawn(move || {
+            let mut global_idx = 0usize;
+            for obj in objects {
+                let range_reader = StorageRangeReader::new(
+                    Arc::clone(&storage),
+                    obj.address.clone(),
+                    obj.size_bytes,
+                    handle.clone(),
+                );
+                let buffered: Box<dyn std::io::BufRead + Send> =
+                    Box::new(std::io::BufReader::with_capacity(256 * 1024, range_reader));
+                let mut reader = match NdjsonReader::new_from_reader(
+                    buffered,
+                    chunk_size_bytes,
+                    in_flight,
+                    policy,
+                ) {
+                    Ok(r) => r,
+                    Err(e) => {
+                        let _ = error_tx.send(Some(ImportError::NoChunks(format!(
+                            "ndjson reader init for {}: {e}",
+                            obj.address
+                        ))));
+                        return;
+                    }
+                };
+                loop {
+                    match reader.recv_chunk() {
+                        Ok(Some((_local_idx, bytes))) => {
+                            if std_tx.send((global_idx, bytes)).is_err() {
+                                // Consumer aborted upstream — exit cleanly.
+                                let _ = error_tx.send(None);
+                                return;
+                            }
+                            global_idx += 1;
+                        }
+                        Ok(None) => break,
+                        Err(e) => {
+                            let _ = error_tx.send(Some(ImportError::Transact(format!(
+                                "ndjson read of {}: {e}",
+                                obj.address
+                            ))));
+                            return;
+                        }
+                    }
+                }
+                // Malformed-line errors surface here (channel close alone is
+                // not sufficient).
+                if let Err(e) = reader.join() {
+                    let _ = error_tx.send(Some(ImportError::Transact(format!(
+                        "ndjson read of {}: {e}",
+                        obj.address
+                    ))));
+                    return;
+                }
+            }
+            let _ = error_tx.send(None); // success
+        })
+        .expect("spawn ndjson remote producer thread");
+
+    RemoteChunkProducer {
+        rx: Arc::new(std::sync::Mutex::new(std_rx)),
+        error_rx: std::sync::Mutex::new(Some(error_rx)),
+        bridge_handle: std::sync::Mutex::new(Some(producer_handle)),
+        estimated_count,
+        per_chunk_format: Vec::new(),
     }
 }
 
@@ -1941,41 +2134,66 @@ where
                 let count = objects.len();
                 let total_bytes: u64 = objects.iter().map(|o| o.size_bytes).sum();
                 let in_flight = config.effective_max_inflight();
-
-                // Each remote object is fetched whole into memory by the
-                // producer (MVP does not split single objects via byte-range).
-                // Warn if any object exceeds the configured chunk size — peak
-                // memory will be `largest_object × in_flight`.
                 let chunk_size_bytes = config.effective_chunk_size_mb() as u64 * 1024 * 1024;
-                if let Some(largest) = objects.iter().max_by_key(|o| o.size_bytes) {
-                    if largest.size_bytes > chunk_size_bytes {
-                        tracing::warn!(
-                            address = %largest.address,
-                            size_mb = largest.size_bytes / (1024 * 1024),
-                            chunk_size_mb = config.effective_chunk_size_mb(),
-                            in_flight,
-                            "remote object exceeds configured chunk size; \
-                             single-object byte-range splitting is not yet \
-                             supported — object will be materialized whole. \
-                             Pre-split large objects or raise chunk_size_mb \
-                             to silence this warning."
-                        );
-                    }
-                }
 
-                let producer = spawn_remote_producer(
-                    Arc::clone(storage),
-                    objects,
-                    per_chunk_format,
-                    in_flight,
-                );
-                tracing::info!(
-                    estimated_chunks = count,
-                    total_bytes,
-                    in_flight,
-                    "resolved remote import chunks"
-                );
-                ChunkSource::Remote(producer)
+                // ndjson objects are streamed per-object via byte ranges (one
+                // source → many JSON-LD chunks), in bounded memory; other
+                // formats are fetched whole.
+                let all_ndjson = !per_chunk_format.is_empty()
+                    && per_chunk_format
+                        .iter()
+                        .all(|f| matches!(f, RemoteFormat::Ndjson));
+
+                if all_ndjson {
+                    let producer = spawn_remote_ndjson_producer(
+                        Arc::clone(storage),
+                        objects,
+                        config.ndjson_first_line_context,
+                        chunk_size_bytes,
+                        in_flight,
+                    );
+                    tracing::info!(
+                        objects = count,
+                        total_bytes,
+                        in_flight,
+                        "resolved remote ndjson import (streamed)"
+                    );
+                    ChunkSource::JsonLdStream(std::sync::Mutex::new(Some(JsonLdSource::Remote(
+                        producer,
+                    ))))
+                } else {
+                    // Each remote object is fetched whole into memory by the
+                    // producer. Warn if any object exceeds the configured chunk
+                    // size — peak memory will be `largest_object × in_flight`.
+                    if let Some(largest) = objects.iter().max_by_key(|o| o.size_bytes) {
+                        if largest.size_bytes > chunk_size_bytes {
+                            tracing::warn!(
+                                address = %largest.address,
+                                size_mb = largest.size_bytes / (1024 * 1024),
+                                chunk_size_mb = config.effective_chunk_size_mb(),
+                                in_flight,
+                                "remote object exceeds configured chunk size; \
+                                 single-object byte-range splitting is not yet \
+                                 supported — object will be materialized whole. \
+                                 Pre-split large objects or raise chunk_size_mb \
+                                 to silence this warning."
+                            );
+                        }
+                    }
+                    let producer = spawn_remote_producer(
+                        Arc::clone(storage),
+                        objects,
+                        per_chunk_format,
+                        in_flight,
+                    );
+                    tracing::info!(
+                        estimated_chunks = count,
+                        total_bytes,
+                        in_flight,
+                        "resolved remote import chunks"
+                    );
+                    ChunkSource::Remote(producer)
+                }
             }
         };
 
@@ -3149,11 +3367,36 @@ where
                 )
             }
             ChunkSource::JsonLdStream(cell) => {
-                let reader = cell.lock().unwrap().take().ok_or_else(|| {
-                    ImportError::Transact("ndjson reader already taken (import re-entered?)".into())
+                let source = cell.lock().unwrap().take().ok_or_else(|| {
+                    ImportError::Transact("ndjson source already taken (import re-entered?)".into())
                 })?;
-                let rx = reader.shared_receiver();
-                (rx, SerialCompletion::JsonLdStream(reader))
+                match source {
+                    // Local single file: drive the reader directly; its
+                    // malformed-line error surfaces from `join`.
+                    JsonLdSource::Local(reader) => {
+                        let rx = reader.shared_receiver();
+                        (rx, SerialCompletion::JsonLdStream(reader))
+                    }
+                    // Remote chained producer: same channel + `error_rx`
+                    // completion protocol as the remote producer.
+                    JsonLdSource::Remote(producer) => {
+                        let error_rx =
+                            producer.error_rx.lock().unwrap().take().ok_or_else(|| {
+                                ImportError::Transact(
+                                    "ndjson producer error_rx already taken (import re-entered?)"
+                                        .into(),
+                                )
+                            })?;
+                        let bridge_handle = producer.bridge_handle.lock().unwrap().take();
+                        (
+                            Arc::clone(&producer.rx),
+                            SerialCompletion::Remote {
+                                error_rx,
+                                bridge_handle,
+                            },
+                        )
+                    }
+                }
             }
             _ => unreachable!("is_remote_serial || is_jsonld_stream guard"),
         };
