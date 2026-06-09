@@ -1322,6 +1322,71 @@ struct RuntimeParts {
     index_config: IndexConfig,
 }
 
+fn spawn_local_cache_event_listener(
+    event_bus: Arc<fluree_db_nameservice::LedgerEventBus>,
+    ledger_manager: Arc<LedgerManager>,
+) {
+    tokio::spawn(async move {
+        let mut subscription = event_bus.subscribe(fluree_db_nameservice::SubscriptionScope::all());
+        drop(event_bus);
+
+        loop {
+            match subscription.receiver.recv().await {
+                Ok(
+                    fluree_db_nameservice::NameServiceEvent::LedgerCommitPublished {
+                        ledger_id,
+                        ..
+                    }
+                    | fluree_db_nameservice::NameServiceEvent::LedgerIndexPublished {
+                        ledger_id, ..
+                    },
+                ) => {
+                    match ledger_manager
+                        .notify(NsNotify {
+                            ledger_id: ledger_id.clone(),
+                            record: None,
+                        })
+                        .await
+                    {
+                        Ok(result) => {
+                            tracing::debug!(
+                                alias = %ledger_id,
+                                ?result,
+                                "local cache event listener reconciled ledger"
+                            );
+                        }
+                        Err(error) => {
+                            tracing::warn!(
+                                alias = %ledger_id,
+                                error = %error,
+                                "local cache event listener failed to reconcile ledger"
+                            );
+                        }
+                    }
+                }
+                Ok(fluree_db_nameservice::NameServiceEvent::LedgerRetracted { ledger_id }) => {
+                    ledger_manager.disconnect(&ledger_id).await;
+                    tracing::debug!(
+                        alias = %ledger_id,
+                        "local cache event listener disconnected retracted ledger"
+                    );
+                }
+                Ok(_) => {}
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
+                    tracing::warn!(
+                        skipped,
+                        "local cache event listener lagged behind nameservice events"
+                    );
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                    tracing::debug!("local cache event listener stopped");
+                    break;
+                }
+            }
+        }
+    });
+}
+
 impl FlureeBuilder {
     /// Create a new builder with default settings (memory storage).
     ///
@@ -2409,6 +2474,12 @@ impl FlureeBuilder {
             ))
         });
 
+        if indexing_mode.is_enabled() {
+            if let Some(manager) = &ledger_manager {
+                spawn_local_cache_event_listener(Arc::clone(&event_bus), Arc::clone(manager));
+            }
+        }
+
         Fluree {
             config,
             backend,
@@ -2570,14 +2641,15 @@ impl FlureeBuilder {
             .wrap_address_identifiers_aws(base_storage, aws_handle.config())
             .await?;
 
-        let ns_arc: Arc<dyn NameServicePublisher> = aws_handle.nameservice_arc().clone();
+        let ns_arc = aws_handle.nameservice_arc().clone();
         let event_bus = Arc::new(fluree_db_nameservice::LedgerEventBus::new(1024));
-        let ns_mode = NameServiceMode::ReadWrite(ns_arc.clone());
+        let notifying = fluree_db_nameservice::NotifyingNameService::new(ns_arc, event_bus.clone());
+        let ns_mode = NameServiceMode::ReadWrite(Arc::new(notifying.clone()));
 
         let index_config = self.derive_indexing();
         let backend = StorageBackend::Managed(storage);
         let ns_rw: Arc<dyn fluree_db_nameservice::ReadWriteNameService> =
-            aws_handle.nameservice_arc().clone();
+            Arc::new(notifying.clone());
         let indexing_mode = self.start_background_indexing_dyn(&backend, ns_rw);
         Ok(Self::finalize_with_backend(
             self.ledger_cache_config,
