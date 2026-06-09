@@ -11,9 +11,8 @@ pub(crate) fn build_runtime_small_dicts(
 ) -> Arc<RuntimeSmallDicts> {
     let mut runtime_small_dicts = store.runtime_small_dicts();
     if let Some(novelty) = novelty {
-        runtime_small_dicts.populate_from_flakes_iter(
-            novelty.iter_flakes(fluree_db_core::IndexType::Post),
-        );
+        runtime_small_dicts
+            .populate_from_flakes_iter(novelty.iter_flakes(fluree_db_core::IndexType::Post));
     }
     Arc::new(runtime_small_dicts)
 }

@@ -46,10 +46,42 @@ fn sid(name: impl Into<String>) -> Sid {
 fn person_flakes(gid: usize, t: i64) -> Vec<Flake> {
     let s = sid(format!("p{gid:08}"));
     vec![
-        Flake::new(s.clone(), sid("a_type"), FlakeValue::Ref(sid("Person")), sid("x_id"), t, true, None),
-        Flake::new(s.clone(), sid("b_name"), FlakeValue::String(format!("Name {gid}")), sid("x_str"), t, true, None),
-        Flake::new(s.clone(), sid("c_age"), FlakeValue::Long(18 + (gid % 48) as i64), sid("x_long"), t, true, None),
-        Flake::new(s, sid("d_email"), FlakeValue::String(format!("e{gid}@x")), sid("x_str"), t, true, None),
+        Flake::new(
+            s.clone(),
+            sid("a_type"),
+            FlakeValue::Ref(sid("Person")),
+            sid("x_id"),
+            t,
+            true,
+            None,
+        ),
+        Flake::new(
+            s.clone(),
+            sid("b_name"),
+            FlakeValue::String(format!("Name {gid}")),
+            sid("x_str"),
+            t,
+            true,
+            None,
+        ),
+        Flake::new(
+            s.clone(),
+            sid("c_age"),
+            FlakeValue::Long(18 + (gid % 48) as i64),
+            sid("x_long"),
+            t,
+            true,
+            None,
+        ),
+        Flake::new(
+            s,
+            sid("d_email"),
+            FlakeValue::String(format!("e{gid}@x")),
+            sid("x_str"),
+            t,
+            true,
+            None,
+        ),
     ]
 }
 
@@ -57,8 +89,24 @@ fn person_flakes(gid: usize, t: i64) -> Vec<Flake> {
 /// timed cost is dominated by fan-out, not result streaming).
 fn point_bounds(gid: usize) -> (Flake, Flake) {
     let s = sid(format!("p{gid:08}"));
-    let lo = Flake::new(s.clone(), sid(""), FlakeValue::Long(i64::MIN), sid(""), 0, true, None);
-    let hi = Flake::new(s, sid("~"), FlakeValue::Long(i64::MAX), sid("~"), i64::MAX, true, None);
+    let lo = Flake::new(
+        s.clone(),
+        sid(""),
+        FlakeValue::Long(i64::MIN),
+        sid(""),
+        0,
+        true,
+        None,
+    );
+    let hi = Flake::new(
+        s,
+        sid("~"),
+        FlakeValue::Long(i64::MAX),
+        sid("~"),
+        i64::MAX,
+        true,
+        None,
+    );
     (lo, hi)
 }
 
@@ -67,9 +115,17 @@ fn point_read_us(nov: &Novelty, lo: &Flake, hi: &Flake, repeats: usize) -> u128 
     for _ in 0..repeats {
         let t0 = Instant::now();
         let mut n = 0usize;
-        nov.for_each_overlay_flake(0, IndexType::Spot, Some(lo), Some(hi), false, i64::MAX, &mut |_f| {
-            n += 1;
-        });
+        nov.for_each_overlay_flake(
+            0,
+            IndexType::Spot,
+            Some(lo),
+            Some(hi),
+            false,
+            i64::MAX,
+            &mut |_f| {
+                n += 1;
+            },
+        );
         std::hint::black_box(n);
         samples.push(t0.elapsed().as_nanos());
     }
@@ -140,12 +196,22 @@ fn main() {
         v[v.len() / 2]
     };
     let max_f = |v: &[f64]| v.iter().copied().fold(0.0f64, f64::max);
-    let mean_f = |v: &[f64]| if v.is_empty() { 0.0 } else { v.iter().sum::<f64>() / v.len() as f64 };
+    let mean_f = |v: &[f64]| {
+        if v.is_empty() {
+            0.0
+        } else {
+            v.iter().sum::<f64>() / v.len() as f64
+        }
+    };
 
     println!("\n================ lifecycle summary (tiered) ================");
     println!("max segment count K reached : {max_k}  (bounded ~ tier_width × levels)");
     println!("tier merges triggered       : {total_merges}");
-    println!("per-read compaction ms — mean {:.2} / max {:.2}", mean_f(&compact_samples), max_f(&compact_samples));
+    println!(
+        "per-read compaction ms — mean {:.2} / max {:.2}",
+        mean_f(&compact_samples),
+        max_f(&compact_samples)
+    );
     println!("point read median           : {} us", med(read_samples));
     println!("===========================================================");
     println!("Tiered keeps K bounded (~log) and per-read merge cost SMALL and roughly");

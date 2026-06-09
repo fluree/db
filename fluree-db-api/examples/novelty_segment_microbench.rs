@@ -213,7 +213,9 @@ fn main() {
         "novelty segment microbench: {n} subjects (~{} flakes), segments {seg_list:?}",
         n * 4
     );
-    println!("(point = one-subject SPOT read; narrow = one-age POST read; full = whole SPOT scan)\n");
+    println!(
+        "(point = one-subject SPOT read; narrow = one-age POST read; full = whole SPOT scan)\n"
+    );
 
     let point_k = n / 2;
     let (plo, phi) = point_bounds(point_k);

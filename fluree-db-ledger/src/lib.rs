@@ -365,9 +365,8 @@ impl LedgerState {
             snapshot.string_watermark,
         );
         let mut runtime_small_dicts = RuntimeSmallDicts::new();
-        runtime_small_dicts.populate_from_flakes_iter(
-            novelty.iter_flakes(fluree_db_core::IndexType::Post),
-        );
+        runtime_small_dicts
+            .populate_from_flakes_iter(novelty.iter_flakes(fluree_db_core::IndexType::Post));
         Self {
             snapshot: Arc::new(snapshot),
             novelty: Arc::new(novelty),

@@ -1879,7 +1879,10 @@ mod tests {
             )
         }
 
-        let state = LedgerState::new(LedgerSnapshot::genesis("test/compact:main"), Novelty::new(0));
+        let state = LedgerState::new(
+            LedgerSnapshot::genesis("test/compact:main"),
+            Novelty::new(0),
+        );
         let handle = LedgerHandle::new("test/compact:main".to_string(), state, None);
         let tier_width = 4;
         handle.set_tier_width(tier_width);
@@ -1927,8 +1930,10 @@ mod tests {
         use fluree_db_ledger::LedgerState;
         use fluree_db_novelty::Novelty;
 
-        let state =
-            LedgerState::new(LedgerSnapshot::genesis("test/nocompact:main"), Novelty::new(0));
+        let state = LedgerState::new(
+            LedgerSnapshot::genesis("test/nocompact:main"),
+            Novelty::new(0),
+        );
         let handle = LedgerHandle::new("test/nocompact:main".to_string(), state, None);
         handle.set_tier_width(0);
         let rg = std::collections::HashMap::new();

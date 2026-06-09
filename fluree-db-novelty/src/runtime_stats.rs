@@ -828,7 +828,9 @@ mod tests {
         // Per-commit application => three segments.
         let mut seg_nov = Novelty::new(0);
         for (flakes, t) in &commits {
-            seg_nov.apply_commit(flakes.clone(), *t, &HashMap::new()).unwrap();
+            seg_nov
+                .apply_commit(flakes.clone(), *t, &HashMap::new())
+                .unwrap();
         }
         // Bulk application => one consolidated segment.
         let mut bulk_nov = Novelty::new(0);

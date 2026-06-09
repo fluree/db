@@ -95,7 +95,10 @@ async fn build_segmented(
         .build()
         .expect("build fluree");
     let ledger_id = "fanout/bench:main";
-    let mut ledger = fluree.create_ledger(ledger_id).await.expect("create_ledger");
+    let mut ledger = fluree
+        .create_ledger(ledger_id)
+        .await
+        .expect("create_ledger");
 
     let tpc = txns / segments; // transactions per commit (txns divisible by segments)
     for s in 0..segments {
@@ -253,7 +256,10 @@ async fn run() {
                 }
                 None => {
                     if ci == 0 {
-                        emit(&mut out, &format!("  {name:12} ERROR (query failed — skipping)"));
+                        emit(
+                            &mut out,
+                            &format!("  {name:12} ERROR (query failed — skipping)"),
+                        );
                     }
                     table[qi].push(None);
                 }
@@ -292,7 +298,10 @@ async fn run() {
         line.push_str(&format!("{ratio:>11.1}"));
         emit(&mut out, &line);
     }
-    emit(&mut out, "========================================================================================");
+    emit(
+        &mut out,
+        "========================================================================================",
+    );
     emit(
         &mut out,
         &format!(
@@ -301,8 +310,14 @@ async fn run() {
             seg_list.first().copied().unwrap_or(0)
         ),
     );
-    emit(&mut out, "~1x across the sweep => fan-out cheap (reindex-triggered compaction suffices).");
-    emit(&mut out, "linear in segment count => need active compaction (tiered or synchronous).");
+    emit(
+        &mut out,
+        "~1x across the sweep => fan-out cheap (reindex-triggered compaction suffices).",
+    );
+    emit(
+        &mut out,
+        "linear in segment count => need active compaction (tiered or synchronous).",
+    );
 }
 
 fn main() {

@@ -41,10 +41,42 @@ fn sid(name: impl Into<String>) -> Sid {
 fn person_flakes(i: usize, t: i64) -> Vec<Flake> {
     let s = sid(format!("p{i:08}"));
     vec![
-        Flake::new(s.clone(), sid("a_type"), FlakeValue::Ref(sid("Person")), sid("x_id"), t, true, None),
-        Flake::new(s.clone(), sid("b_name"), FlakeValue::String(format!("Name {i}")), sid("x_str"), t, true, None),
-        Flake::new(s.clone(), sid("c_age"), FlakeValue::Long(18 + (i % 48) as i64), sid("x_long"), t, true, None),
-        Flake::new(s, sid("d_email"), FlakeValue::String(format!("e{i}@x")), sid("x_str"), t, true, None),
+        Flake::new(
+            s.clone(),
+            sid("a_type"),
+            FlakeValue::Ref(sid("Person")),
+            sid("x_id"),
+            t,
+            true,
+            None,
+        ),
+        Flake::new(
+            s.clone(),
+            sid("b_name"),
+            FlakeValue::String(format!("Name {i}")),
+            sid("x_str"),
+            t,
+            true,
+            None,
+        ),
+        Flake::new(
+            s.clone(),
+            sid("c_age"),
+            FlakeValue::Long(18 + (i % 48) as i64),
+            sid("x_long"),
+            t,
+            true,
+            None,
+        ),
+        Flake::new(
+            s,
+            sid("d_email"),
+            FlakeValue::String(format!("e{i}@x")),
+            sid("x_str"),
+            t,
+            true,
+            None,
+        ),
     ]
 }
 

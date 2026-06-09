@@ -86,7 +86,10 @@ impl FlakeId {
 
     #[inline]
     fn pack(g_id: GraphId, seg: usize, local: u32) -> Self {
-        debug_assert!(seg as u64 <= Self::SEG_MASK, "novelty segment index overflow");
+        debug_assert!(
+            seg as u64 <= Self::SEG_MASK,
+            "novelty segment index overflow"
+        );
         debug_assert!(
             u64::from(local) <= Self::LOCAL_MASK,
             "novelty local index overflow"
@@ -575,13 +578,21 @@ impl Novelty {
 
     /// Largest per-graph segment count across all graphs (the read-fan-out driver).
     pub fn max_segment_count(&self) -> usize {
-        self.graphs.iter().flatten().map(Vec::len).max().unwrap_or(0)
+        self.graphs
+            .iter()
+            .flatten()
+            .map(Vec::len)
+            .max()
+            .unwrap_or(0)
     }
 
     /// Whether any graph holds more than `threshold` segments (a policy hook so
     /// callers can decide when to call [`Self::compact_over`]).
     pub fn needs_compaction(&self, threshold: usize) -> bool {
-        self.graphs.iter().flatten().any(|segs| segs.len() > threshold)
+        self.graphs
+            .iter()
+            .flatten()
+            .any(|segs| segs.len() > threshold)
     }
 
     /// Structural compaction: rewrite every graph whose segment count exceeds
@@ -725,9 +736,7 @@ impl Novelty {
             let mut flakes: Vec<Flake> = Vec::new();
             let mut merged = 0usize;
             for seg in taken {
-                if merged < tier_width
-                    && size_class(seg.flakes.len(), tier_width) == target_class
-                {
+                if merged < tier_width && size_class(seg.flakes.len(), tier_width) == target_class {
                     match Arc::try_unwrap(seg) {
                         Ok(s) => flakes.extend(s.flakes),
                         Err(shared) => flakes.extend(shared.flakes.iter().cloned()),
@@ -753,11 +762,7 @@ impl Novelty {
     /// shared/live Novelty in place (e.g. via `Arc::make_mut`) call this first to
     /// guarantee an all-or-nothing apply: if it returns `Ok`, the subsequent
     /// `apply_commit` cannot fail partway and leave the ledger inconsistent.
-    pub fn can_apply(
-        &self,
-        flakes: &[Flake],
-        reverse_graph: &HashMap<Sid, GraphId>,
-    ) -> Result<()> {
+    pub fn can_apply(&self, flakes: &[Flake], reverse_graph: &HashMap<Sid, GraphId>) -> Result<()> {
         if flakes.len() > MAX_SEGMENT_FLAKES {
             return Err(NoveltyError::overflow(
                 "commit batch exceeds max segment flakes, trigger reindex",
@@ -1059,8 +1064,12 @@ impl Novelty {
                     continue;
                 }
                 // Straddling: rebuild from survivors.
-                let survivors: Vec<Flake> =
-                    seg.flakes.iter().filter(|f| f.t > cutoff_t).cloned().collect();
+                let survivors: Vec<Flake> = seg
+                    .flakes
+                    .iter()
+                    .filter(|f| f.t > cutoff_t)
+                    .cloned()
+                    .collect();
                 if !survivors.is_empty() {
                     kept.push(Arc::new(Segment::build(survivors, false)));
                 }
@@ -2065,7 +2074,11 @@ mod tests {
         let compacted = n.compact_all();
 
         assert!(compacted >= 1, "at least one graph compacted");
-        assert_eq!(n.max_segment_count(), 1, "every graph collapses to one segment");
+        assert_eq!(
+            n.max_segment_count(),
+            1,
+            "every graph collapses to one segment"
+        );
         assert_eq!(digest(&n), before, "compaction changed an observable read");
         assert_eq!(n.size, size0, "size must be preserved");
         assert_eq!(n.len(), count0, "flake count must be preserved");
@@ -2096,7 +2109,11 @@ mod tests {
 
         n.apply_commit(vec![make_flake(3, 1, 3, 100, true)], 100, &rg)
             .unwrap();
-        assert_eq!(n.len(), before, "re-assert after compaction must still dedup");
+        assert_eq!(
+            n.len(),
+            before,
+            "re-assert after compaction must still dedup"
+        );
     }
 
     /// `compact_over` only rewrites graphs strictly above the threshold.
@@ -2176,7 +2193,11 @@ mod tests {
             .unwrap();
             n.tier_compact(t_width);
         }
-        assert_eq!(n.len(), commits as usize, "tiering must preserve every flake");
+        assert_eq!(
+            n.len(),
+            commits as usize,
+            "tiering must preserve every flake"
+        );
         let k = n.max_segment_count();
         assert!(
             k <= t_width * 4,
@@ -2210,7 +2231,10 @@ mod tests {
 
         // First read's compaction is bounded — one cascade chain, not 100/t merges.
         let first = n.tier_compact(t);
-        assert!((1..=8).contains(&first), "first call must be bounded; got {first}");
+        assert!(
+            (1..=8).contains(&first),
+            "first call must be bounded; got {first}"
+        );
         assert!(
             n.max_segment_count() > t,
             "one bounded call must not fully drain a 100-segment backlog"
@@ -2279,7 +2303,11 @@ mod tests {
         let (size0, count0) = (n.size, n.len());
         let merges = n.tier_compact(4);
         assert!(merges > 0, "fixture should trigger at least one tier merge");
-        assert_eq!(digest(&n), before, "tier_compact changed an observable read");
+        assert_eq!(
+            digest(&n),
+            before,
+            "tier_compact changed an observable read"
+        );
         assert_eq!(n.size, size0, "size preserved");
         assert_eq!(n.len(), count0, "flake count preserved");
     }
