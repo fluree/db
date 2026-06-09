@@ -114,13 +114,13 @@ const HASH_JOIN_PROBE_MIN: u64 = 50_000;
 /// once. WGPB TI object-stars commonly start from a 1k-5k-row anchor and then
 /// suffer thousands of scattered OPST seeks into 3k-35k-row predicates; a compact
 /// hash build is cheaper and remains memory-bounded.
-const HASH_JOIN_SMALL_BUILD_MAX: f64 = 10_000.0;
+const HASH_JOIN_SMALL_BUILD_MAX: f64 = 20_000.0;
 const HASH_JOIN_SMALL_BUILD_PROBE_MIN: u64 = 1_000;
-/// Auto hash-join only when the build side still looks like a base scan or narrow
-/// two-column stream. The operator drains the build side in `open()`, so using it
-/// later in a multiway object-star can materialize the already-expanded cross
-/// product before an outer LIMIT can stop execution.
-const HASH_JOIN_AUTO_MAX_BUILD_SCHEMA: usize = 2;
+/// Auto hash-join freely when the build side still looks like a base scan or
+/// narrow two-column stream. Wider intermediates are allowed only when their
+/// estimated row count is still small; the operator drains the build side in
+/// `open()`, so a wide, high-row intermediate can defeat outer LIMIT.
+const HASH_JOIN_AUTO_NARROW_BUILD_SCHEMA: usize = 2;
 /// Don't scan a probe predicate more than this many times the driving-set size —
 /// a guard against the pathological "scan a huge predicate for a handful of driving
 /// rows" case. It is deliberately loose: the alternative we replace is the scattered
@@ -378,7 +378,9 @@ impl<'a> HashJoinPlanner<'a> {
             });
         }
 
-        if self.force == HashJoinForce::Auto && left_schema.len() > HASH_JOIN_AUTO_MAX_BUILD_SCHEMA
+        if self.force == HashJoinForce::Auto
+            && left_schema.len() > HASH_JOIN_AUTO_NARROW_BUILD_SCHEMA
+            && driving_est.unwrap_or(f64::INFINITY) > HASH_JOIN_SMALL_BUILD_MAX
         {
             let probe_count = self.stats.and_then(|s| predicate_count(s, &tp.p));
             let scan_ratio = match (probe_count, driving_est) {
@@ -1144,13 +1146,48 @@ mod tests {
     }
 
     #[test]
+    fn planner_allows_hash_join_for_small_wide_ti_intermediate() {
+        // TI3-02 after the first hash join:
+        //   build-side schema is already wide (?z, ?x, ?y), but the estimated
+        //   intermediate is only ~10,980 rows and the new predicate P2895 has 3,140
+        //   rows. Hashing the intermediate avoids thousands of scattered OPST seeks.
+        let x = VarId(0);
+        let u = VarId(3);
+        let probe = TriplePattern::new(Ref::Var(u), Ref::Sid(Sid::new(658, "P2895")), Term::Var(x));
+
+        let mut stats = StatsView::default();
+        stats.properties.insert(
+            Sid::new(658, "P2895"),
+            PropertyStatData {
+                count: 3_140,
+                ndv_values: 166,
+                ndv_subjects: 3_179,
+            },
+        );
+
+        let planner = HashJoinPlanner {
+            stats: Some(&stats),
+            force: HashJoinForce::Auto,
+            driving_est: 10_980.0,
+            step_est: Some(10_980.0),
+        };
+        let d = planner
+            .explain_object_hash_join(&[VarId(2), x, VarId(1)], &probe, false, true)
+            .expect("TI3 final probe should produce a hash-join decision");
+        assert!(d.chosen);
+        assert_eq!(d.reason, HashJoinReason::CostWins);
+        assert_eq!(d.probe_count, Some(3_140));
+        assert_eq!(d.driving_est.map(|v| v.round() as u64), Some(10_980));
+    }
+
+    #[test]
     fn cost_gate_still_guards_pathological_and_small_probes() {
         // Huge probe for a handful of driving rows is still rejected (ratio ≫ 1024×).
         assert!(!hash_join_cost_wins(Some(2_848_260), Some(100.0)));
         // Very small probe stays below the small-build exception.
         assert!(!hash_join_cost_wins(Some(500), Some(100.0)));
         // Below-floor probe with a non-small build still falls back to nested loop.
-        assert!(!hash_join_cost_wins(Some(40_000), Some(20_000.0)));
+        assert!(!hash_join_cost_wins(Some(40_000), Some(25_000.0)));
         // No probe stats => fall back to the safe nested-loop default.
         assert!(!hash_join_cost_wins(None, Some(1_000_000.0)));
     }
