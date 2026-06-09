@@ -206,3 +206,61 @@ async fn import_from_storage_ndjson_then_query() {
     let json = qr.to_jsonld(&ledger.snapshot).expect("format jsonld");
     assert_eq!(extract_sorted_strings(&json), vec!["Alice", "Bob", "Cam"]);
 }
+
+/// A local DIRECTORY of `.jsonl` / `.ndjson` files, each carrying its OWN
+/// `@context` on the first line. Exercises the directory dispatch in
+/// `resolve_chunk_source` (all-ndjson dir → chained local producer) and proves
+/// per-file contexts are preserved across the chain (file `1` uses a different
+/// prefix and a fully-qualified IRI to reach the same `schema:name` property).
+#[tokio::test]
+async fn import_local_dir_of_ndjson_then_query() {
+    let db_dir = tempfile::tempdir().expect("db tmpdir");
+    let data_dir = tempfile::tempdir().expect("data tmpdir");
+
+    write_file(
+        data_dir.path(),
+        "0.jsonl",
+        concat!(
+            "{\"@context\":{\"ex\":\"http://example.org/ns/\",\"schema\":\"http://schema.org/\"}}\n",
+            "{\"@id\":\"ex:alice\",\"schema:name\":\"Alice\"}\n",
+        ),
+    );
+    write_file(
+        data_dir.path(),
+        "1.ndjson",
+        concat!(
+            "{\"@context\":{\"s\":\"http://schema.org/\"}}\n",
+            "{\"@id\":\"http://example.org/ns/bob\",\"s:name\":\"Bob\"}\n",
+        ),
+    );
+
+    let fluree = FlureeBuilder::file(db_dir.path().to_string_lossy().to_string())
+        .build()
+        .expect("build file-backed Fluree");
+
+    let result = fluree
+        .create("test/import-ndjson-dir:main")
+        .import(data_dir.path())
+        .threads(2)
+        .memory_budget_mb(256)
+        .cleanup(false)
+        .execute()
+        .await
+        .expect("directory ndjson import should succeed");
+    assert!(result.flake_count > 0);
+
+    let ledger = fluree
+        .ledger("test/import-ndjson-dir:main")
+        .await
+        .expect("load ledger after import");
+    let query = json!({
+        "@context": { "schema": "http://schema.org/" },
+        "select": ["?name"],
+        "where": { "schema:name": "?name" }
+    });
+    let qr = support::query_jsonld(&fluree, &ledger, &query)
+        .await
+        .expect("query after import");
+    let json = qr.to_jsonld(&ledger.snapshot).expect("format jsonld");
+    assert_eq!(extract_sorted_strings(&json), vec!["Alice", "Bob"]);
+}

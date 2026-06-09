@@ -969,6 +969,32 @@ fn resolve_chunk_source(
     if path.is_dir() {
         let files = discover_chunks(path)?;
 
+        // A directory of newline-delimited JSON-LD streams via chained
+        // NdjsonReaders (one file → many JSON-LD chunks). `.jsonl`/`.ndjson`
+        // cannot be parsed as whole documents, so they never take the `Files`
+        // path. `scan_directory_format` (run inside `discover_chunks`) has
+        // already rejected mixing them with other formats.
+        let all_ndjson = !files.is_empty()
+            && files.iter().all(|p| {
+                matches!(
+                    effective_extension(p).0.as_deref(),
+                    Some("jsonl" | "ndjson")
+                )
+            });
+        if all_ndjson {
+            let chunk_size_bytes = config.effective_chunk_size_mb() as u64 * 1024 * 1024;
+            let channel_capacity = config.effective_max_inflight();
+            let producer = spawn_local_ndjson_producer(
+                files,
+                config.ndjson_first_line_context,
+                chunk_size_bytes,
+                channel_capacity,
+            );
+            return Ok(ChunkSource::JsonLdStream(std::sync::Mutex::new(Some(
+                JsonLdSource::Remote(producer),
+            ))));
+        }
+
         // A directory of purely Turtle/N-Triples files can be rechunked through
         // the channel-fed producer (true N-wide parsing + bounded chunk count).
         // Any TriG/N-Quads/JSON-LD file forces the index-based `Files` path,
@@ -1371,37 +1397,48 @@ impl std::io::Read for StorageRangeReader {
 /// a global chunk index. Reuses [`RemoteChunkProducer`]'s channel + `error_rx`
 /// machinery; `per_chunk_format` is left empty because the chunks ride the
 /// [`ChunkSource::JsonLdStream`] path, which always parses them as JSON-LD.
-fn spawn_remote_ndjson_producer(
-    storage: Arc<dyn StorageRead>,
-    objects: Vec<RemoteObject>,
+/// A lazily-opened ndjson byte source: returns a fresh `BufRead` when called on
+/// the producer thread. Defers S3 range reads / file opens to that thread.
+type NdjsonSourceFactory =
+    Box<dyn FnOnce() -> std::io::Result<Box<dyn std::io::BufRead + Send>> + Send>;
+
+/// Spawn a producer that streams ndjson from a sequence of `(label, factory)`
+/// byte sources, chaining one [`NdjsonReader`] per source and forwarding their
+/// JSON-LD chunks into a shared channel with a global chunk index. The readers
+/// are independent, so each source's own leading `@context` is honored.
+/// Reuses [`RemoteChunkProducer`]'s channel + `error_rx` machinery;
+/// `per_chunk_format` is empty because the chunks ride the
+/// [`ChunkSource::JsonLdStream`] path, which always parses them as JSON-LD.
+fn spawn_chained_ndjson_producer(
+    sources: Vec<(String, NdjsonSourceFactory)>,
     policy: FirstLineContextPolicy,
     chunk_size_bytes: u64,
     in_flight: usize,
 ) -> RemoteChunkProducer {
-    let estimated_count = objects.len();
+    let estimated_count = sources.len();
     let in_flight = in_flight.max(1);
-    let handle = tokio::runtime::Handle::current();
     let (std_tx, std_rx) = std::sync::mpsc::sync_channel::<(usize, Vec<u8>)>(in_flight);
     let (error_tx, error_rx) = tokio::sync::oneshot::channel::<Option<ImportError>>();
 
-    // The producer runs on a dedicated std thread: each NdjsonReader spawns its
-    // own reader thread which `block_on`s byte-range reads, so this thread must
-    // NOT be a tokio worker.
+    // A dedicated std thread: each NdjsonReader spawns its own reader thread,
+    // and remote sources `block_on` byte-range reads, so this must NOT be a
+    // tokio worker.
     let producer_handle = std::thread::Builder::new()
-        .name("ndjson-remote-producer".into())
+        .name("ndjson-producer".into())
         .spawn(move || {
             let mut global_idx = 0usize;
-            for obj in objects {
-                let range_reader = StorageRangeReader::new(
-                    Arc::clone(&storage),
-                    obj.address.clone(),
-                    obj.size_bytes,
-                    handle.clone(),
-                );
-                let buffered: Box<dyn std::io::BufRead + Send> =
-                    Box::new(std::io::BufReader::with_capacity(256 * 1024, range_reader));
+            for (label, factory) in sources {
+                let byte_source = match factory() {
+                    Ok(r) => r,
+                    Err(e) => {
+                        let _ = error_tx.send(Some(ImportError::Storage(format!(
+                            "open ndjson source {label}: {e}"
+                        ))));
+                        return;
+                    }
+                };
                 let mut reader = match NdjsonReader::new_from_reader(
-                    buffered,
+                    byte_source,
                     chunk_size_bytes,
                     in_flight,
                     policy,
@@ -1409,8 +1446,7 @@ fn spawn_remote_ndjson_producer(
                     Ok(r) => r,
                     Err(e) => {
                         let _ = error_tx.send(Some(ImportError::NoChunks(format!(
-                            "ndjson reader init for {}: {e}",
-                            obj.address
+                            "ndjson reader init for {label}: {e}"
                         ))));
                         return;
                     }
@@ -1428,8 +1464,7 @@ fn spawn_remote_ndjson_producer(
                         Ok(None) => break,
                         Err(e) => {
                             let _ = error_tx.send(Some(ImportError::Transact(format!(
-                                "ndjson read of {}: {e}",
-                                obj.address
+                                "ndjson read of {label}: {e}"
                             ))));
                             return;
                         }
@@ -1439,15 +1474,14 @@ fn spawn_remote_ndjson_producer(
                 // not sufficient).
                 if let Err(e) = reader.join() {
                     let _ = error_tx.send(Some(ImportError::Transact(format!(
-                        "ndjson read of {}: {e}",
-                        obj.address
+                        "ndjson read of {label}: {e}"
                     ))));
                     return;
                 }
             }
             let _ = error_tx.send(None); // success
         })
-        .expect("spawn ndjson remote producer thread");
+        .expect("spawn ndjson producer thread");
 
     RemoteChunkProducer {
         rx: Arc::new(std::sync::Mutex::new(std_rx)),
@@ -1456,6 +1490,51 @@ fn spawn_remote_ndjson_producer(
         estimated_count,
         per_chunk_format: Vec::new(),
     }
+}
+
+/// Stream remote ndjson objects (S3 byte-range) through the chained producer.
+fn spawn_remote_ndjson_producer(
+    storage: Arc<dyn StorageRead>,
+    objects: Vec<RemoteObject>,
+    policy: FirstLineContextPolicy,
+    chunk_size_bytes: u64,
+    in_flight: usize,
+) -> RemoteChunkProducer {
+    let handle = tokio::runtime::Handle::current();
+    let sources: Vec<(String, NdjsonSourceFactory)> = objects
+        .into_iter()
+        .map(|obj| {
+            let storage = Arc::clone(&storage);
+            let handle = handle.clone();
+            let label = obj.address.clone();
+            let factory: NdjsonSourceFactory = Box::new(move || {
+                let r = StorageRangeReader::new(storage, obj.address, obj.size_bytes, handle);
+                Ok(Box::new(std::io::BufReader::with_capacity(256 * 1024, r))
+                    as Box<dyn std::io::BufRead + Send>)
+            });
+            (label, factory)
+        })
+        .collect();
+    spawn_chained_ndjson_producer(sources, policy, chunk_size_bytes, in_flight)
+}
+
+/// Stream a local directory of ndjson files through the chained producer.
+/// `open_decoded` handles `.gz`/`.zst` transparently.
+fn spawn_local_ndjson_producer(
+    files: Vec<PathBuf>,
+    policy: FirstLineContextPolicy,
+    chunk_size_bytes: u64,
+    in_flight: usize,
+) -> RemoteChunkProducer {
+    let sources: Vec<(String, NdjsonSourceFactory)> = files
+        .into_iter()
+        .map(|f| {
+            let label = f.display().to_string();
+            let factory: NdjsonSourceFactory = Box::new(move || open_decoded(&f));
+            (label, factory)
+        })
+        .collect();
+    spawn_chained_ndjson_producer(sources, policy, chunk_size_bytes, in_flight)
 }
 
 // ============================================================================
@@ -2022,6 +2101,7 @@ pub enum DirectoryFormat {
 pub fn scan_directory_format(dir: &Path) -> std::result::Result<DirectoryFormat, ImportError> {
     let mut has_turtle = false;
     let mut has_jsonld = false;
+    let mut has_ndjson = false;
 
     for entry in std::fs::read_dir(dir)? {
         let entry = match entry {
@@ -2037,20 +2117,36 @@ pub fn scan_directory_format(dir: &Path) -> std::result::Result<DirectoryFormat,
         match inner.as_deref() {
             Some("ttl" | "trig" | "nt" | "nq") => has_turtle = true,
             Some("jsonld") => has_jsonld = true,
+            Some("jsonl" | "ndjson") => has_ndjson = true,
             _ => {}
         }
     }
 
-    match (has_turtle, has_jsonld) {
-        (true, true) => Err(ImportError::MixedFormats(format!(
-            "directory {} contains both Turtle (.ttl/.trig) and JSON-LD (.jsonld) files; \
-             use a single format per directory",
+    let has_jsonld_family = has_jsonld || has_ndjson;
+    if has_turtle && has_jsonld_family {
+        return Err(ImportError::MixedFormats(format!(
+            "directory {} contains both Turtle (.ttl/.trig) and JSON-LD \
+             (.jsonld/.jsonl) files; use a single format per directory",
             dir.display(),
-        ))),
-        (true, false) => Ok(DirectoryFormat::Turtle),
+        )));
+    }
+    // Whole-object `.jsonld` and newline-delimited `.jsonl`/`.ndjson` take
+    // different parse paths, so a directory cannot mix them.
+    if has_jsonld && has_ndjson {
+        return Err(ImportError::MixedFormats(format!(
+            "directory {} mixes whole-object .jsonld with newline-delimited \
+             .jsonl/.ndjson files; import them separately",
+            dir.display(),
+        )));
+    }
+
+    match (has_turtle, has_jsonld_family) {
+        // All-ndjson directories also report JsonLd here (ndjson is a JSON-LD
+        // family); the resolver distinguishes them by extension.
+        (true, _) => Ok(DirectoryFormat::Turtle),
         (false, true) => Ok(DirectoryFormat::JsonLd),
         (false, false) => Err(ImportError::NoChunks(format!(
-            "no supported data files (.ttl, .nt, .nq, .trig, .jsonld) found in {}",
+            "no supported data files (.ttl, .nt, .nq, .trig, .jsonld, .jsonl) found in {}",
             dir.display()
         ))),
     }
@@ -2088,7 +2184,7 @@ fn discover_chunks(dir: &Path) -> std::result::Result<Vec<PathBuf>, ImportError>
         .filter(|p| {
             matches!(
                 effective_extension(p).0.as_deref(),
-                Some("ttl" | "nt" | "trig" | "nq" | "jsonld")
+                Some("ttl" | "nt" | "trig" | "nq" | "jsonld" | "jsonl" | "ndjson")
             )
         })
         .collect();
