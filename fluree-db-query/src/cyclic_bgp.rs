@@ -222,6 +222,14 @@ impl RefRelationIndex {
             pairs,
         }
     }
+
+    fn distinct_subjects(&self) -> usize {
+        self.by_subject.len()
+    }
+
+    fn distinct_objects(&self) -> usize {
+        self.by_object.len()
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -262,6 +270,14 @@ impl RelationIndex {
             pairs,
         }
     }
+
+    fn distinct_subjects(&self) -> usize {
+        self.by_subject.len()
+    }
+
+    fn distinct_objects(&self) -> usize {
+        self.by_object.len()
+    }
 }
 
 pub(crate) struct CyclicBgpOperator {
@@ -279,6 +295,8 @@ pub(crate) struct CyclicBgpOperator {
     ref_pending: VecDeque<Vec<u64>>,
     pending: VecDeque<Vec<Binding>>,
     used_fast_path: bool,
+    raw_relation_rows: usize,
+    pruned_relation_rows: usize,
 }
 
 impl CyclicBgpOperator {
@@ -323,6 +341,8 @@ impl CyclicBgpOperator {
             ref_pending: VecDeque::new(),
             pending: VecDeque::new(),
             used_fast_path: false,
+            raw_relation_rows: 0,
+            pruned_relation_rows: 0,
         }
     }
 
@@ -463,30 +483,27 @@ impl CyclicBgpOperator {
 
     fn open_ref_fast_path(&mut self, ctx: &ExecutionContext<'_>) -> Result<bool> {
         let mut relations = Vec::with_capacity(self.plan.edges.len());
+        let mut raw_rows = 0usize;
         for edge in self.plan.edges.iter() {
             let Some(rows) = self.scan_ref_relation(ctx, edge)? else {
                 return Ok(false);
             };
+            raw_rows += rows.len();
             if rows.is_empty() {
                 relations.push(RefRelationIndex::new(edge.clone(), rows));
                 self.ref_relations = relations;
                 self.driver_idx = 0;
+                self.raw_relation_rows = raw_rows;
+                self.pruned_relation_rows = 0;
                 self.used_fast_path = true;
                 return Ok(true);
             }
             relations.push(RefRelationIndex::new(edge.clone(), rows));
         }
-        self.driver_idx = relations
-            .iter()
-            .enumerate()
-            .min_by_key(|(_, rel)| {
-                (
-                    rel.edge.estimate.unwrap_or(rel.rows.len() as u64),
-                    rel.rows.len(),
-                )
-            })
-            .map(|(idx, _)| idx)
-            .unwrap_or(0);
+        relations = self.prune_ref_relations(relations);
+        self.raw_relation_rows = raw_rows;
+        self.pruned_relation_rows = relations.iter().map(|rel| rel.rows.len()).sum();
+        self.driver_idx = self.choose_ref_driver(&relations);
         self.ref_relations = relations;
         self.used_fast_path = true;
         Ok(true)
@@ -494,49 +511,290 @@ impl CyclicBgpOperator {
 
     fn open_encoded_fast_path(&mut self, ctx: &ExecutionContext<'_>) -> Result<bool> {
         let mut relations = Vec::with_capacity(self.plan.edges.len());
+        let mut raw_rows = 0usize;
         for edge in self.plan.edges.iter() {
             let Some(rows) = self.scan_relation(ctx, edge)? else {
                 return Ok(false);
             };
+            raw_rows += rows.len();
             if rows.is_empty() {
                 relations.push(RelationIndex::new(edge.clone(), rows));
                 self.relations = relations;
                 self.driver_idx = 0;
+                self.raw_relation_rows = raw_rows;
+                self.pruned_relation_rows = 0;
                 self.used_fast_path = true;
                 return Ok(true);
             }
             relations.push(RelationIndex::new(edge.clone(), rows));
         }
-        self.driver_idx = relations
-            .iter()
-            .enumerate()
-            .min_by_key(|(_, rel)| {
-                (
-                    rel.edge.estimate.unwrap_or(rel.rows.len() as u64),
-                    rel.rows.len(),
-                )
-            })
-            .map(|(idx, _)| idx)
-            .unwrap_or(0);
+        relations = self.prune_relations(relations);
+        self.raw_relation_rows = raw_rows;
+        self.pruned_relation_rows = relations.iter().map(|rel| rel.rows.len()).sum();
+        self.driver_idx = self.choose_driver(&relations);
         self.relations = relations;
         self.used_fast_path = true;
         Ok(true)
     }
 
-    fn choose_next_ref_relation(&self, assigned: &[Option<u64>], used: &[bool]) -> Option<usize> {
-        self.ref_relations
+    fn prune_ref_relations(&self, mut relations: Vec<RefRelationIndex>) -> Vec<RefRelationIndex> {
+        loop {
+            let before: usize = relations.iter().map(|rel| rel.rows.len()).sum();
+            let allowed = self.ref_allowed_values(&relations);
+            relations = relations
+                .into_iter()
+                .map(|rel| {
+                    let subject_allowed = allowed.get(&rel.edge.subject);
+                    let object_allowed = allowed.get(&rel.edge.object);
+                    let rows = rel
+                        .rows
+                        .into_iter()
+                        .filter(|row| {
+                            subject_allowed.is_none_or(|set| set.contains(&row.subject))
+                                && object_allowed.is_none_or(|set| set.contains(&row.object))
+                        })
+                        .collect();
+                    RefRelationIndex::new(rel.edge, rows)
+                })
+                .collect();
+            let after: usize = relations.iter().map(|rel| rel.rows.len()).sum();
+            if after == before {
+                return relations;
+            }
+        }
+    }
+
+    fn ref_allowed_values(
+        &self,
+        relations: &[RefRelationIndex],
+    ) -> FxHashMap<VarId, FxHashSet<u64>> {
+        let mut allowed: FxHashMap<VarId, FxHashSet<u64>> = FxHashMap::default();
+        for rel in relations {
+            Self::intersect_ref_allowed(
+                &mut allowed,
+                rel.edge.subject,
+                rel.rows.iter().map(|row| row.subject).collect(),
+            );
+            Self::intersect_ref_allowed(
+                &mut allowed,
+                rel.edge.object,
+                rel.rows.iter().map(|row| row.object).collect(),
+            );
+        }
+        allowed
+    }
+
+    fn intersect_ref_allowed(
+        allowed: &mut FxHashMap<VarId, FxHashSet<u64>>,
+        var: VarId,
+        values: FxHashSet<u64>,
+    ) {
+        allowed
+            .entry(var)
+            .and_modify(|existing| existing.retain(|value| values.contains(value)))
+            .or_insert(values);
+    }
+
+    fn prune_relations(&self, mut relations: Vec<RelationIndex>) -> Vec<RelationIndex> {
+        loop {
+            let before: usize = relations.iter().map(|rel| rel.rows.len()).sum();
+            let allowed = self.allowed_values(&relations);
+            relations = relations
+                .into_iter()
+                .map(|rel| {
+                    let subject_allowed = allowed.get(&rel.edge.subject);
+                    let object_allowed = allowed.get(&rel.edge.object);
+                    let rows = rel
+                        .rows
+                        .into_iter()
+                        .filter(|row| {
+                            let subject = Binding::encoded_sid(row.subject);
+                            subject_allowed.is_none_or(|set| set.contains(&subject))
+                                && object_allowed.is_none_or(|set| set.contains(&row.object))
+                        })
+                        .collect();
+                    RelationIndex::new(rel.edge, rows)
+                })
+                .collect();
+            let after: usize = relations.iter().map(|rel| rel.rows.len()).sum();
+            if after == before {
+                return relations;
+            }
+        }
+    }
+
+    fn allowed_values(&self, relations: &[RelationIndex]) -> FxHashMap<VarId, FxHashSet<Binding>> {
+        let mut allowed: FxHashMap<VarId, FxHashSet<Binding>> = FxHashMap::default();
+        for rel in relations {
+            Self::intersect_allowed(
+                &mut allowed,
+                rel.edge.subject,
+                rel.rows
+                    .iter()
+                    .map(|row| Binding::encoded_sid(row.subject))
+                    .collect(),
+            );
+            Self::intersect_allowed(
+                &mut allowed,
+                rel.edge.object,
+                rel.rows.iter().map(|row| row.object.clone()).collect(),
+            );
+        }
+        allowed
+    }
+
+    fn intersect_allowed(
+        allowed: &mut FxHashMap<VarId, FxHashSet<Binding>>,
+        var: VarId,
+        values: FxHashSet<Binding>,
+    ) {
+        allowed
+            .entry(var)
+            .and_modify(|existing| existing.retain(|value| values.contains(value)))
+            .or_insert(values);
+    }
+
+    fn choose_ref_driver(&self, relations: &[RefRelationIndex]) -> usize {
+        relations
             .iter()
             .enumerate()
-            .filter(|(idx, _)| !used[*idx])
-            .max_by_key(|(_, rel)| {
-                let s_bound = assigned[self.var_pos(rel.edge.subject)].is_some();
-                let o_bound = assigned[self.var_pos(rel.edge.object)].is_some();
+            .min_by_key(|(idx, rel)| {
+                let mut used = vec![false; relations.len()];
+                used[*idx] = true;
+                let assigned = self.ref_assigned_for_edge(&rel.edge);
                 (
-                    (s_bound as u8 + o_bound as u8),
-                    std::cmp::Reverse(rel.rows.len()),
+                    rel.rows.len().saturating_mul(
+                        self.choose_next_ref_relation_with(relations, &assigned, &used)
+                            .map(|next| {
+                                self.ref_bound_fanout_score(&relations[next], &assigned)
+                                    .max(1)
+                            })
+                            .unwrap_or(1),
+                    ),
+                    rel.rows.len(),
                 )
             })
             .map(|(idx, _)| idx)
+            .unwrap_or(0)
+    }
+
+    fn ref_assigned_for_edge(&self, edge: &CyclicEdge) -> Vec<Option<u64>> {
+        let mut assigned = vec![None; self.plan.vars.len()];
+        assigned[self.var_pos(edge.subject)] = Some(0);
+        assigned[self.var_pos(edge.object)] = Some(0);
+        assigned
+    }
+
+    fn choose_driver(&self, relations: &[RelationIndex]) -> usize {
+        relations
+            .iter()
+            .enumerate()
+            .min_by_key(|(idx, rel)| {
+                let mut used = vec![false; relations.len()];
+                used[*idx] = true;
+                let assigned = self.assigned_for_edge(&rel.edge);
+                (
+                    rel.rows.len().saturating_mul(
+                        self.choose_next_relation_with(relations, &assigned, &used)
+                            .map(|next| self.bound_fanout_score(&relations[next], &assigned).max(1))
+                            .unwrap_or(1),
+                    ),
+                    rel.rows.len(),
+                )
+            })
+            .map(|(idx, _)| idx)
+            .unwrap_or(0)
+    }
+
+    fn assigned_for_edge(&self, edge: &CyclicEdge) -> Vec<Option<Binding>> {
+        let mut assigned = vec![None; self.plan.vars.len()];
+        assigned[self.var_pos(edge.subject)] = Some(Binding::Unbound);
+        assigned[self.var_pos(edge.object)] = Some(Binding::Unbound);
+        assigned
+    }
+
+    fn choose_next_ref_relation(&self, assigned: &[Option<u64>], used: &[bool]) -> Option<usize> {
+        self.choose_next_ref_relation_with(&self.ref_relations, assigned, used)
+    }
+
+    fn choose_next_ref_relation_with(
+        &self,
+        relations: &[RefRelationIndex],
+        assigned: &[Option<u64>],
+        used: &[bool],
+    ) -> Option<usize> {
+        relations
+            .iter()
+            .enumerate()
+            .filter(|(idx, _)| !used[*idx])
+            .min_by_key(|(_, rel)| {
+                let bound_count = self.ref_bound_count(rel, assigned);
+                (
+                    std::cmp::Reverse(bound_count),
+                    self.ref_bound_fanout_score(rel, assigned),
+                    rel.rows.len(),
+                )
+            })
+            .map(|(idx, _)| idx)
+    }
+
+    fn ref_bound_count(&self, rel: &RefRelationIndex, assigned: &[Option<u64>]) -> u8 {
+        let s_bound = assigned[self.var_pos(rel.edge.subject)].is_some();
+        let o_bound = assigned[self.var_pos(rel.edge.object)].is_some();
+        s_bound as u8 + o_bound as u8
+    }
+
+    fn ref_bound_fanout_score(&self, rel: &RefRelationIndex, assigned: &[Option<u64>]) -> usize {
+        let s_bound = assigned[self.var_pos(rel.edge.subject)].is_some();
+        let o_bound = assigned[self.var_pos(rel.edge.object)].is_some();
+        match (s_bound, o_bound) {
+            (true, true) => 1,
+            (true, false) => average_bucket_size(rel.rows.len(), rel.distinct_subjects()),
+            (false, true) => average_bucket_size(rel.rows.len(), rel.distinct_objects()),
+            (false, false) => rel.rows.len(),
+        }
+    }
+
+    fn choose_next_relation(&self, assigned: &[Option<Binding>], used: &[bool]) -> Option<usize> {
+        self.choose_next_relation_with(&self.relations, assigned, used)
+    }
+
+    fn choose_next_relation_with(
+        &self,
+        relations: &[RelationIndex],
+        assigned: &[Option<Binding>],
+        used: &[bool],
+    ) -> Option<usize> {
+        relations
+            .iter()
+            .enumerate()
+            .filter(|(idx, _)| !used[*idx])
+            .min_by_key(|(_, rel)| {
+                let bound_count = self.bound_count(rel, assigned);
+                (
+                    std::cmp::Reverse(bound_count),
+                    self.bound_fanout_score(rel, assigned),
+                    rel.rows.len(),
+                )
+            })
+            .map(|(idx, _)| idx)
+    }
+
+    fn bound_count(&self, rel: &RelationIndex, assigned: &[Option<Binding>]) -> u8 {
+        let s_bound = assigned[self.var_pos(rel.edge.subject)].is_some();
+        let o_bound = assigned[self.var_pos(rel.edge.object)].is_some();
+        s_bound as u8 + o_bound as u8
+    }
+
+    fn bound_fanout_score(&self, rel: &RelationIndex, assigned: &[Option<Binding>]) -> usize {
+        let s_bound = assigned[self.var_pos(rel.edge.subject)].is_some();
+        let o_bound = assigned[self.var_pos(rel.edge.object)].is_some();
+        match (s_bound, o_bound) {
+            (true, true) => 1,
+            (true, false) => average_bucket_size(rel.rows.len(), rel.distinct_subjects()),
+            (false, true) => average_bucket_size(rel.rows.len(), rel.distinct_objects()),
+            (false, false) => rel.rows.len(),
+        }
     }
 
     fn ref_relation_candidates(
@@ -615,22 +873,6 @@ impl CyclicBgpOperator {
             assigned[o_pos] = old_o;
         }
         used[rel_idx] = false;
-    }
-
-    fn choose_next_relation(&self, assigned: &[Option<Binding>], used: &[bool]) -> Option<usize> {
-        self.relations
-            .iter()
-            .enumerate()
-            .filter(|(idx, _)| !used[*idx])
-            .max_by_key(|(_, rel)| {
-                let s_bound = assigned[self.var_pos(rel.edge.subject)].is_some();
-                let o_bound = assigned[self.var_pos(rel.edge.object)].is_some();
-                (
-                    (s_bound as u8 + o_bound as u8),
-                    std::cmp::Reverse(rel.rows.len()),
-                )
-            })
-            .map(|(idx, _)| idx)
     }
 
     fn relation_candidates(
@@ -835,6 +1077,14 @@ impl CyclicBgpOperator {
     }
 }
 
+fn average_bucket_size(rows: usize, distinct: usize) -> usize {
+    if rows == 0 {
+        0
+    } else {
+        rows.div_ceil(distinct.max(1))
+    }
+}
+
 fn predicate_display(predicate: &Ref) -> String {
     match predicate {
         Ref::Sid(sid) => format!("{}:{}", sid.namespace_code, sid.name),
@@ -855,6 +1105,15 @@ impl Operator for CyclicBgpOperator {
         );
         m.insert("max-predicate-rows".into(), max_predicate_rows().into());
         m.insert("object-only-values".into(), self.join_mode.as_str().into());
+        m.insert("pruning".into(), "semi_join".into());
+        m.insert("driver-selection".into(), "pruned_bound_fanout".into());
+        if self.raw_relation_rows > 0 {
+            m.insert("raw-relation-rows".into(), self.raw_relation_rows.into());
+            m.insert(
+                "pruned-relation-rows".into(),
+                self.pruned_relation_rows.into(),
+            );
+        }
         let predicates: Vec<serde_json::Value> = self
             .plan
             .edges
@@ -862,6 +1121,16 @@ impl Operator for CyclicBgpOperator {
             .map(|edge| predicate_display(&edge.predicate).into())
             .collect();
         m.insert("predicates".into(), serde_json::Value::Array(predicates));
+        let predicate_estimates: Vec<serde_json::Value> = self
+            .plan
+            .edges
+            .iter()
+            .map(|edge| edge.estimate.map_or(serde_json::Value::Null, Into::into))
+            .collect();
+        m.insert(
+            "predicate-row-estimates".into(),
+            serde_json::Value::Array(predicate_estimates),
+        );
         m
     }
 
@@ -940,6 +1209,18 @@ mod tests {
         )
     }
 
+    fn ref_rel(edge: &CyclicEdge, rows: &[(u64, u64)]) -> RefRelationIndex {
+        RefRelationIndex::new(
+            edge.clone(),
+            rows.iter()
+                .map(|(subject, object)| RefEdgeRow {
+                    subject: *subject,
+                    object: *object,
+                })
+                .collect(),
+        )
+    }
+
     fn operator_for(triples: &[TriplePattern]) -> CyclicBgpOperator {
         let plan = analyze_cyclic_bgp(triples, None).expect("test shape should be cyclic");
         CyclicBgpOperator::new(
@@ -1003,5 +1284,52 @@ mod tests {
             },
         );
         assert!(matches!(iri, Some(Binding::EncodedSid { s_id: 99, .. })));
+    }
+
+    #[test]
+    fn ref_pruning_keeps_only_values_supported_by_all_incident_edges() {
+        let triples = vec![triple(0, "p1", 1), triple(1, "p2", 2), triple(2, "p3", 0)];
+        let op = operator_for(&triples);
+
+        let relations = vec![
+            ref_rel(&op.plan.edges[0], &[(1, 10), (9, 90)]),
+            ref_rel(&op.plan.edges[1], &[(10, 20), (90, 99)]),
+            ref_rel(&op.plan.edges[2], &[(20, 1)]),
+        ];
+
+        let pruned = op.prune_ref_relations(relations);
+        let sizes: Vec<usize> = pruned.iter().map(|rel| rel.rows.len()).collect();
+        assert_eq!(sizes, vec![1, 1, 1]);
+        assert_eq!(pruned[0].rows[0].subject, 1);
+        assert_eq!(pruned[1].rows[0].object, 20);
+    }
+
+    #[test]
+    fn next_relation_prefers_lower_bound_endpoint_fanout_over_total_rows() {
+        let triples = vec![
+            triple(0, "driver", 1),
+            triple(0, "low_fanout", 2),
+            triple(1, "high_fanout", 3),
+            triple(3, "close", 2),
+        ];
+        let op = operator_for(&triples);
+
+        let low_fanout_rows: Vec<(u64, u64)> = (1..=100).map(|v| (v, 10_000 + v)).collect();
+        let high_fanout_rows: Vec<(u64, u64)> = (1..=50).map(|v| (1, 20_000 + v)).collect();
+        let relations = vec![
+            ref_rel(&op.plan.edges[0], &[(1, 1)]),
+            ref_rel(&op.plan.edges[1], &low_fanout_rows),
+            ref_rel(&op.plan.edges[2], &high_fanout_rows),
+            ref_rel(&op.plan.edges[3], &[(20_001, 10_001)]),
+        ];
+        let mut assigned = vec![None; op.plan.vars.len()];
+        assigned[op.var_pos(VarId(0))] = Some(1);
+        assigned[op.var_pos(VarId(1))] = Some(1);
+        let used = vec![true, false, false, false];
+
+        let next = op
+            .choose_next_ref_relation_with(&relations, &assigned, &used)
+            .expect("one relation should be selected");
+        assert_eq!(next, 1);
     }
 }

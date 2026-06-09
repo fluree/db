@@ -264,11 +264,18 @@ would otherwise be planned as left-deep nested-loop joins. Its `details` include
 - `strategy`: `cyclic_bgp_join`
 - `shape`: `triangle` or `square`
 - `predicates`: predicates in the detected cyclic block
+- `predicate-row-estimates`: per-predicate row-count estimates, aligned with
+  `predicates`; `null` when statistics are unavailable
 - `enabled`: whether `FLUREE_CYCLIC_BGP` allows the fast path
 - `max-predicate-rows`: the per-predicate row cap used by the fast path
 - `object-only-values`: `iri-ref` for the raw SID-only cycle path, or `encoded`
   when object-only cycle variables can join on late-materialized encoded object
   values, not just IRI references
+- `pruning`: `semi_join` when the runtime fast path prunes each edge to values
+  supported by the other edge incident to the same cycle variable
+- `driver-selection`: how the runtime driver edge is selected after pruning
+- `raw-relation-rows` / `pruned-relation-rows`: runtime row totals, present when
+  a plan is described after the fast path has opened
 
 Set `FLUREE_CYCLIC_BGP=0` (or `false`) to disable this operator for A/B
 testing. `FLUREE_CYCLIC_BGP_MAX_ROWS` can lower or raise the per-predicate row
