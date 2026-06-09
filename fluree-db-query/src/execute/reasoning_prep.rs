@@ -5,6 +5,7 @@
 
 use crate::ir::ReasoningModes;
 use crate::reasoning::{global_reasoning_cache, reason_owl2rl, ReasoningOverlay};
+use crate::Result;
 use fluree_db_core::{
     overlay::OverlayProvider, GraphDbRef, GraphId, IndexSchema, LedgerSnapshot, SchemaHierarchy,
     SchemaPredicateInfo,
@@ -35,7 +36,7 @@ pub async fn schema_hierarchy_with_overlay(
     snapshot: &LedgerSnapshot,
     overlay: &dyn fluree_db_core::OverlayProvider,
     to_t: i64,
-) -> Option<SchemaHierarchy> {
+) -> Result<Option<SchemaHierarchy>> {
     use fluree_db_core::value::FlakeValue;
     use fluree_db_core::{IndexType, RangeMatch, RangeTest, Sid};
     use fluree_vocab::namespaces::RDFS;
@@ -48,36 +49,30 @@ pub async fn schema_hierarchy_with_overlay(
     // Scan the full default-graph state (indexed + unindexed commits + overlay).
     let db = GraphDbRef::new(snapshot, 0, overlay, to_t);
 
-    if let Ok(flakes) = db
+    for flake in db
         .range(
             IndexType::Psot,
             RangeTest::Eq,
             RangeMatch::predicate(Sid::new(RDFS, "subClassOf")),
         )
-        .await
+        .await?
     {
-        for flake in flakes {
-            if !flake.op {
-                continue;
-            }
+        if flake.op {
             if let FlakeValue::Ref(parent) = flake.o {
                 subclass_of.entry(flake.s).or_default().push(parent);
             }
         }
     }
 
-    if let Ok(flakes) = db
+    for flake in db
         .range(
             IndexType::Psot,
             RangeTest::Eq,
             RangeMatch::predicate(Sid::new(RDFS, "subPropertyOf")),
         )
-        .await
+        .await?
     {
-        for flake in flakes {
-            if !flake.op {
-                continue;
-            }
+        if flake.op {
             if let FlakeValue::Ref(parent) = flake.o {
                 subproperty_of.entry(flake.s).or_default().push(parent);
             }
@@ -160,9 +155,9 @@ pub async fn schema_hierarchy_with_overlay(
     schema.pred.vals = vals;
 
     if schema.pred.vals.is_empty() {
-        None
+        Ok(None)
     } else {
-        Some(SchemaHierarchy::from_db_root_schema(&schema))
+        Ok(Some(SchemaHierarchy::from_db_root_schema(&schema)))
     }
 }
 
