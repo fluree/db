@@ -231,7 +231,9 @@ async fn run_update_branch(
             stats
                 .leaf_fetch_ms
                 .fetch_add(started.elapsed().as_millis() as u64, Ordering::Relaxed);
-            stats.leaf_bytes.fetch_add(bytes.len() as u64, Ordering::Relaxed);
+            stats
+                .leaf_bytes
+                .fetch_add(bytes.len() as u64, Ordering::Relaxed);
             if cached_before {
                 stats.leaf_cache_hits.fetch_add(1, Ordering::Relaxed);
             } else {
