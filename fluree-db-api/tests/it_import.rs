@@ -1188,6 +1188,70 @@ GRAPH <http://example.org/graphs/audit> {
     );
 }
 
+#[tokio::test]
+async fn import_trig_compact_named_graph_is_queryable() {
+    // Issue #1278: the compact W3C TriG form `<iri> { ... }` (no GRAPH keyword)
+    // must import through the bulk path too — `import_trig_commit` shares the
+    // same `parse_trig_phase1` parser as the upsert endpoint.
+    let db_dir = tempfile::tempdir().expect("db tmpdir");
+    let data_dir = tempfile::tempdir().expect("data tmpdir");
+
+    let trig = r#"@prefix ex: <http://example.org/> .
+@prefix schema: <http://schema.org/> .
+
+ex:alice schema:name "Alice" .
+
+<http://example.org/graphs/audit> {
+    ex:event1 schema:description "User login" .
+    ex:event2 schema:description "User logout" .
+}
+"#;
+
+    let path = data_dir.path().join("data.trig");
+    {
+        let mut f = std::fs::File::create(&path).expect("create trig");
+        f.write_all(trig.as_bytes()).expect("write trig");
+    }
+
+    let fluree = FlureeBuilder::file(db_dir.path().to_string_lossy().to_string())
+        .build()
+        .expect("build file-backed Fluree");
+
+    let result = fluree
+        .create("test/trig-compact:main")
+        .import(&path)
+        .threads(1)
+        .memory_budget_mb(256)
+        .cleanup(false)
+        .execute()
+        .await
+        .expect("compact-form trig import should succeed");
+    assert!(result.flake_count >= 3, "default + 2 named-graph flakes");
+
+    let ledger = fluree
+        .ledger("test/trig-compact:main")
+        .await
+        .expect("load ledger");
+
+    let named_alias = "test/trig-compact:main#http://example.org/graphs/audit";
+    let q_named = json!({
+        "from": named_alias,
+        "select": ["?s", "?p", "?o"],
+        "where": {"@id": "?s", "?p": "?o"}
+    });
+    let qr = fluree
+        .query_connection(&q_named)
+        .await
+        .expect("named-graph query should resolve and return data");
+    let json_named = qr.to_jsonld(&ledger.snapshot).expect("jsonld");
+    let named_objs = extract_nth_column(&json_named, 2);
+    assert_eq!(
+        named_objs,
+        vec!["User login", "User logout"],
+        "compact-form named-graph data must be indexed and queryable; got {json_named}"
+    );
+}
+
 // ============================================================================
 // N-Quads (.nq) import
 //
