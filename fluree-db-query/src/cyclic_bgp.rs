@@ -1719,6 +1719,32 @@ mod tests {
     }
 
     #[test]
+    fn object_only_cycle_vars_accept_encoded_temporal_values() {
+        let triples = vec![
+            triple(0, "p1", 1),
+            triple(0, "p2", 2),
+            triple(3, "p3", 1),
+            triple(3, "p4", 2),
+        ];
+        let op = operator_for(&triples);
+        assert_eq!(op.join_mode, CyclicJoinMode::EncodedObject);
+        let object = op.object_binding_for_edge(
+            &op.plan.edges[0],
+            RawEdgeRow {
+                subject: 10,
+                o_type: OType::XSD_DATE.as_u16(),
+                object: 12_345,
+                p_id: 7,
+            },
+        );
+
+        assert!(matches!(
+            object,
+            Some(Binding::EncodedLit { o_key: 12_345, .. })
+        ));
+    }
+
+    #[test]
     fn subject_bridge_cycle_vars_still_require_ref_objects() {
         let triples = vec![triple(0, "p1", 1), triple(1, "p2", 2), triple(2, "p3", 0)];
         let op = operator_for(&triples);
