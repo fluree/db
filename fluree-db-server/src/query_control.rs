@@ -121,8 +121,11 @@ where
 #[cfg(test)]
 mod tests {
     use super::{current_query_execution_options, run_query_task};
+    use crate::error::ServerError;
+    use fluree_db_core::QueryCancellation;
     use fluree_db_core::QueryCancellationReason;
     use tokio::sync::oneshot;
+    use tokio::time::{timeout, Duration};
 
     #[tokio::test]
     async fn dropping_waiter_signals_client_disconnect_to_query_task() {
@@ -156,5 +159,49 @@ mod tests {
                 .expect("query task should observe cancellation"),
             QueryCancellationReason::ClientDisconnected
         );
+    }
+
+    #[tokio::test]
+    async fn completed_query_does_not_signal_client_disconnect() {
+        let (handle_tx, handle_rx) = oneshot::channel();
+
+        let result: Result<(), ServerError> = run_query_task(0, || async move {
+            let cancellation = current_query_execution_options(0)
+                .cancellation
+                .expect("server query task has cancellation handle");
+            let _ = handle_tx.send(cancellation);
+            Ok(())
+        })
+        .await;
+
+        result.expect("query should complete normally");
+        let cancellation: QueryCancellation = handle_rx
+            .await
+            .expect("query should send cancellation handle");
+        assert_eq!(cancellation.reason(), None);
+    }
+
+    #[tokio::test]
+    async fn timeout_signals_timeout_to_query_task() {
+        let reason = timeout(Duration::from_secs(1), async {
+            run_query_task(1, || async move {
+                let cancellation = current_query_execution_options(0)
+                    .cancellation
+                    .expect("server query task has cancellation handle");
+
+                loop {
+                    if let Some(reason) = cancellation.reason() {
+                        return Ok(reason);
+                    }
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+        })
+        .await
+        .expect("timeout test should not hang")
+        .expect("query task should return observed reason");
+
+        assert_eq!(reason, QueryCancellationReason::Timeout);
     }
 }
