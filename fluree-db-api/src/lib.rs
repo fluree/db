@@ -1332,15 +1332,10 @@ fn spawn_local_cache_event_listener(
 
         loop {
             match subscription.receiver.recv().await {
-                Ok(
-                    fluree_db_nameservice::NameServiceEvent::LedgerCommitPublished {
-                        ledger_id,
-                        ..
-                    }
-                    | fluree_db_nameservice::NameServiceEvent::LedgerIndexPublished {
-                        ledger_id, ..
-                    },
-                ) => {
+                Ok(fluree_db_nameservice::NameServiceEvent::LedgerIndexPublished {
+                    ledger_id,
+                    ..
+                }) => {
                     match ledger_manager
                         .notify(NsNotify {
                             ledger_id: ledger_id.clone(),
