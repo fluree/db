@@ -767,8 +767,51 @@ fn is_import_path(path: &Path) -> CliResult<bool> {
         ".jsonld",
         ".jsonld.gz",
         ".jsonld.zst",
+        // Newline-delimited JSON-LD — streamed via the import pipeline's
+        // NdjsonReader (one source → many JSON-LD chunks).
+        ".jsonl",
+        ".jsonl.gz",
+        ".jsonl.zst",
+        ".ndjson",
+        ".ndjson.gz",
+        ".ndjson.zst",
     ];
     Ok(SUPPORTED.iter().any(|suffix| name_lower.ends_with(suffix)))
+}
+
+#[cfg(test)]
+mod is_import_path_tests {
+    use super::is_import_path;
+    use std::path::Path;
+
+    #[test]
+    fn ndjson_jsonl_are_import_paths() {
+        for name in [
+            "data.jsonl",
+            "data.ndjson",
+            "data.jsonl.gz",
+            "data.ndjson.zst",
+        ] {
+            assert!(
+                is_import_path(Path::new(name)).unwrap(),
+                "{name} should route to bulk import"
+            );
+        }
+    }
+
+    #[test]
+    fn rdf_formats_remain_import_paths() {
+        for name in ["x.ttl", "x.nt", "x.nq", "x.trig", "x.jsonld", "x.ttl.gz"] {
+            assert!(is_import_path(Path::new(name)).unwrap(), "{name}");
+        }
+    }
+
+    #[test]
+    fn non_bulk_inputs_are_not_import_paths() {
+        // `.json` deliberately routes to the detect/transact path, not import.
+        assert!(!is_import_path(Path::new("x.json")).unwrap());
+        assert!(!is_import_path(Path::new("x.csv")).unwrap());
+    }
 }
 
 /// Replace non-alphanumeric characters with underscores for safe filenames.
