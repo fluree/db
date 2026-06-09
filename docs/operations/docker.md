@@ -425,7 +425,7 @@ docker compose logs -f fluree
 
 **Setting `FLUREE_LOG_LEVEL` doesn't change console output.** The image's `ENV RUST_LOG=info` shadows it. Override with `-e RUST_LOG=debug` instead.
 
-**`cache_max_mb` auto-default is too large under a memory limit.** The auto-tier reads host RAM, not the cgroup. Set `FLUREE_CACHE_MAX_MB` (or `cache_max_mb` in the file) to a value sized to the container limit.
+**`cache_max_mb` auto-default is too large under a memory limit.** Current builds clamp the auto-tier to the cgroup limit when available. If logs still show an oversized cache, check for an older image/binary or an explicit `FLUREE_CACHE_MAX_MB` / `cache_max_mb` override.
 
 **Health check failing.** `curl http://localhost:8090/health` from your host. If the server is up but the healthcheck fails, the listen address is probably bound to `127.0.0.1` inside the container — set `FLUREE_LISTEN_ADDR=0.0.0.0:8090`.
 
