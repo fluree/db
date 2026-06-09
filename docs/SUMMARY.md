@@ -76,7 +76,6 @@
   - [Storage-agnostic commits and sync](design/storage-agnostic-commits-and-sync.md)
   - [ContentId and ContentStore](design/content-id-and-contentstore.md)
   - [Index format](design/index-format.md)
-  - [Segmented novelty (LSM) — proposal](design/segmented-novelty.md)
   - [Namespace allocation and fallback modes](design/namespace-allocation.md)
   - [Ontology imports (`f:schemaSource` + `owl:imports`)](design/ontology-imports.md)
   - [Cross-ledger model enforcement](design/cross-ledger-model-enforcement.md)
