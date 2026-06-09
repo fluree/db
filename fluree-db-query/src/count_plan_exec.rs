@@ -2737,11 +2737,13 @@ fn execute_chain(
                         })?;
                         load_columns_cached_via_handle(
                             handle.as_ref(),
-                            idx,
-                            RunSortOrder::Psot,
                             cache,
-                            handle.leaf_id(),
-                            idx_u32,
+                            fluree_db_binary_index::read::column_loader::LeafletDecodeSpec {
+                                leaf_id: handle.leaf_id(),
+                                leaflet_idx: idx_u32,
+                                order: RunSortOrder::Psot,
+                                decode_set: fluree_db_binary_index::ColumnSet::ALL,
+                            },
                         )
                         .map_err(|e| QueryError::Internal(format!("load columns: {e}")))?
                     } else {

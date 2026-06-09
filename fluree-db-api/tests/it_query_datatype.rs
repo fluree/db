@@ -10,7 +10,7 @@
 
 mod support;
 
-use fluree_db_api::FlureeBuilder;
+use fluree_db_api::{FlureeBuilder, QueryInput};
 use serde_json::{json, Value as JsonValue};
 use support::{genesis_ledger, normalize_rows, MemoryFluree, MemoryLedger};
 
@@ -1710,5 +1710,111 @@ async fn float_typed_integer_values_survive_indexing() {
     assert!(
         (revenue2 - 2_500_000.75).abs() < 0.01,
         "revenue2 should be 2500000.75, got {revenue2}"
+    );
+}
+
+/// Inline `xsd:integer` / `xsd:double` objects are emitted as
+/// `EncodedLit(NUM_INT/NUM_F64)` on the binary-scan path (commit 2f45f10f3),
+/// not materialized `Lit`. This test drives the INDEXED path (so the
+/// binary-scan / batched-join decode runs, not the novelty path) and checks the
+/// encoded values still round-trip through projection, DISTINCT (dedup), numeric
+/// FILTER, SUM, and DATATYPE.
+#[tokio::test]
+async fn indexed_inline_numerics_roundtrip_through_distinct_filter_sum() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger0 = genesis_ledger(&fluree, "nums:main");
+    let ctx = ctx_datatype();
+    fluree
+        .insert(
+            ledger0,
+            &json!({
+                "@context": ctx,
+                "@graph": [
+                    {"@id":"ex:a","ex:age":10,"ex:score":1.5},
+                    {"@id":"ex:b","ex:age":10,"ex:score":2.5},
+                    {"@id":"ex:c","ex:age":20,"ex:score":1.5},
+                    {"@id":"ex:d","ex:age":30,"ex:score":3.5}
+                ]
+            }),
+        )
+        .await
+        .expect("insert");
+    // Build + publish the binary index, then open the indexed view so queries
+    // take the binary-scan path rather than pure novelty.
+    support::rebuild_and_publish_index(&fluree, "nums:main").await;
+    let view = fluree.db("nums:main").await.expect("indexed view");
+
+    async fn rows(
+        fluree: &MemoryFluree,
+        view: &fluree_db_api::GraphDb,
+        sparql: &str,
+    ) -> Vec<JsonValue> {
+        let res = fluree
+            .query(view, QueryInput::Sparql(sparql))
+            .await
+            .expect("sparql query");
+        normalize_rows(&res.to_jsonld(&view.snapshot).expect("to_jsonld"))
+    }
+    const P: &str = "PREFIX ex: <http://example.org/ns/>\n";
+
+    // Projection: integer values decode correctly (with the duplicate present).
+    assert_eq!(
+        rows(
+            &fluree,
+            &view,
+            &format!("{P} SELECT ?age WHERE {{ ?s ex:age ?age }} ORDER BY ?age")
+        )
+        .await,
+        normalize_rows(&json!([[10], [10], [20], [30]]))
+    );
+    // DISTINCT dedups the duplicate integer (EncodedLit hash/eq on o_key).
+    assert_eq!(
+        rows(
+            &fluree,
+            &view,
+            &format!("{P} SELECT DISTINCT ?age WHERE {{ ?s ex:age ?age }} ORDER BY ?age")
+        )
+        .await,
+        normalize_rows(&json!([[10], [20], [30]]))
+    );
+    // Numeric FILTER over the encoded value.
+    assert_eq!(
+        rows(
+            &fluree,
+            &view,
+            &format!("{P} SELECT ?age WHERE {{ ?s ex:age ?age FILTER(?age > 15) }} ORDER BY ?age")
+        )
+        .await,
+        normalize_rows(&json!([[20], [30]]))
+    );
+    // SUM aggregate (10 + 10 + 20 + 30).
+    assert_eq!(
+        rows(
+            &fluree,
+            &view,
+            &format!("{P} SELECT (SUM(?age) AS ?t) WHERE {{ ?s ex:age ?age }}")
+        )
+        .await,
+        normalize_rows(&json!([[70]]))
+    );
+    // DATATYPE round-trips to xsd:integer (dt_id resolves back to the o_type).
+    assert_eq!(
+        rows(
+            &fluree,
+            &view,
+            &format!("{P} SELECT DISTINCT (DATATYPE(?age) AS ?dt) WHERE {{ ?s ex:age ?age }}")
+        )
+        .await,
+        normalize_rows(&json!([["xsd:integer"]]))
+    );
+    // Inline doubles encode (NUM_F64) and DISTINCT-dedup too.
+    assert_eq!(
+        rows(
+            &fluree,
+            &view,
+            &format!("{P} SELECT DISTINCT ?score WHERE {{ ?s ex:score ?score }} ORDER BY ?score")
+        )
+        .await,
+        normalize_rows(&json!([[1.5], [2.5], [3.5]]))
     );
 }

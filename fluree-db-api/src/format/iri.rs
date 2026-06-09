@@ -11,7 +11,7 @@ use fluree_db_core::Sid;
 use fluree_graph_json_ld::{ContextCompactor, ParsedContext};
 use fluree_vocab::namespaces;
 use std::collections::{HashMap, HashSet};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use super::{FormatError, Result};
 
@@ -49,7 +49,15 @@ pub struct IriCompactor {
 
     /// Auto-derived prefixes for namespaces not covered by the @context.
     /// Sorted longest-first for greedy matching (same strategy as ContextCompactor).
-    fallback_prefixes: Vec<(String, String)>,
+    ///
+    /// Built **lazily** on first display-compaction call. `build_fallback_prefixes`
+    /// iterates the entire DB namespace table (thousands of entries for datasets
+    /// like BSBM that mint a namespace per IRI path segment) and sorts it, but the
+    /// result is consumed *only* by the CLI / commit-builder display paths
+    /// (`compact_for_display`, `effective_prefixes`). The server query formatters
+    /// (SPARQL XML/JSON, TSV/CSV) never touch it, so they must not pay this
+    /// per-query construction cost — hence the `OnceLock`.
+    fallback_prefixes: OnceLock<Vec<(String, String)>>,
 }
 
 impl IriCompactor {
@@ -59,17 +67,19 @@ impl IriCompactor {
     /// `compact_vocab_iri` / `compact_id_iri` call is a pure lookup.
     ///
     /// For namespaces in `namespace_codes` that have no matching prefix in
-    /// the context, a short prefix is auto-derived from the namespace URI.
+    /// the context, a short prefix is auto-derived from the namespace URI — but
+    /// that table is built lazily on first display use (see `fallback_prefixes`),
+    /// so constructing a compactor for a query is independent of DB namespace count.
     pub fn new(namespace_codes: Arc<HashMap<u16, String>>, context: &ParsedContext) -> Self {
         let compactor = ContextCompactor::new(context);
         let reverse_terms = build_reverse_terms(context);
-        let fallback_prefixes = build_fallback_prefixes(&namespace_codes, context);
         Self {
             namespace_codes,
             context: context.clone(),
             compactor,
             reverse_terms,
-            fallback_prefixes,
+            // Lazily built on first display-compaction call — see field docs.
+            fallback_prefixes: OnceLock::new(),
         }
     }
 
@@ -85,8 +95,19 @@ impl IriCompactor {
             context: default_ctx,
             compactor,
             reverse_terms: HashMap::new(),
-            fallback_prefixes: Vec::new(),
+            // Empty default context → lazy build yields no fallbacks (unchanged behavior).
+            fallback_prefixes: OnceLock::new(),
         }
+    }
+
+    /// Lazily-built auto-derived fallback prefixes (see the `fallback_prefixes` field).
+    ///
+    /// Building this iterates the entire DB namespace table, so it is deferred
+    /// until a display-compaction path (`compact_for_display` / `effective_prefixes`)
+    /// actually needs it. The query result formatters never call this.
+    fn fallback_prefixes(&self) -> &[(String, String)] {
+        self.fallback_prefixes
+            .get_or_init(|| build_fallback_prefixes(&self.namespace_codes, &self.context))
     }
 
     /// Decode a Sid to a full IRI.
@@ -102,6 +123,29 @@ impl IriCompactor {
             .get(&sid.namespace_code)
             .ok_or(FormatError::UnknownNamespace(sid.namespace_code))?;
         Ok(format!("{}{}", prefix, sid.name))
+    }
+
+    /// Look up the namespace prefix for a Sid without allocating.
+    ///
+    /// Returns `Ok(Some(prefix))` for a registered namespace — the full IRI is
+    /// `prefix` followed by `sid.name`, which a formatter can stream directly
+    /// instead of paying [`decode_sid`](Self::decode_sid)'s `format!`
+    /// allocation. Returns `Ok(None)` for the EMPTY / OVERFLOW namespaces, where
+    /// `sid.name` is itself the verbatim IRI (and may be a `_:` blank-node
+    /// label). Errors on an unregistered namespace code, exactly as `decode_sid`.
+    ///
+    /// Blank-node caveat: the `BLANK_NODE` namespace is registered with the
+    /// `"_:"` prefix, so a blank node returns `Some("_:")` — NOT `None`. A
+    /// consumer that frames `Some(prefix)` as a `<uri>` / `@id` must special-case
+    /// the `"_:"` prefix (or `sid.namespace_code == namespaces::BLANK_NODE`).
+    pub fn namespace_prefix(&self, sid: &Sid) -> Result<Option<&str>> {
+        if sid.namespace_code == namespaces::EMPTY || sid.namespace_code == namespaces::OVERFLOW {
+            return Ok(None);
+        }
+        self.namespace_codes
+            .get(&sid.namespace_code)
+            .map(|p| Some(p.as_str()))
+            .ok_or(FormatError::UnknownNamespace(sid.namespace_code))
     }
 
     /// Compact a **forward** predicate / @type IRI using the @context (vocab rules).
@@ -255,7 +299,7 @@ impl IriCompactor {
         }
 
         // 2. Fallback prefixes (auto-derived for uncovered namespaces)
-        for (ns_iri, prefix_name) in &self.fallback_prefixes {
+        for (ns_iri, prefix_name) in self.fallback_prefixes() {
             map.entry(prefix_name.clone())
                 .or_insert_with(|| ns_iri.clone());
         }
@@ -265,7 +309,7 @@ impl IriCompactor {
 
     /// Try to compact an IRI using the auto-derived fallback prefixes.
     fn try_fallback(&self, iri: &str) -> Option<String> {
-        for (ns_iri, prefix_name) in &self.fallback_prefixes {
+        for (ns_iri, prefix_name) in self.fallback_prefixes() {
             if iri.starts_with(ns_iri.as_str()) {
                 let suffix = &iri[ns_iri.len()..];
                 return Some(format!("{prefix_name}:{suffix}"));

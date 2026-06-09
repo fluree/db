@@ -22,8 +22,38 @@ use crate::binary_range::BinaryRangeProvider;
 use fluree_db_spatial::SpatialIndexProvider;
 use fluree_vocab::namespaces::{FLUREE_DB, JSON_LD, OGC_GEO, RDF, XSD};
 use fluree_vocab::{geo_names, xsd_names};
+use rustc_hash::FxHashMap;
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
+
+/// Key for the per-query constant→`s_id` memo.
+///
+/// A FILTER like `<iri> != ?var` (or `sid != ?var`) resolves the constant side
+/// to an internal subject id via a dictionary reverse-lookup. That result is
+/// invariant across rows, so it is memoized once per query rather than redone
+/// per row (a dominant cost on selective-filter workloads such as BSBM Explore).
+#[derive(Clone, PartialEq, Eq, Hash)]
+pub enum ConstSidKey {
+    /// A constant full IRI.
+    Iri(Box<str>),
+    /// A constant SID: namespace code + name.
+    Sid(u16, Box<str>),
+    /// Identity (address) of a variable-free operand expression, so its s_id can
+    /// be resolved once and reused without re-evaluating/re-encoding it per row.
+    ///
+    /// Safe as a key only because this memo lives exactly as long as the query
+    /// (and the expression tree it points into): the pointer is stable across
+    /// rows and the memo is dropped before any expression could be freed, so a
+    /// stale/reused address can never be observed.
+    ExprPtr(usize),
+}
+
+/// Per-query memo for constant subject-id resolution (see [`ConstSidKey`]).
+///
+/// Owned by the [`ExecutionContext`], which holds exactly one store/snapshot, so
+/// the memo is correctly scoped — no cross-ledger aliasing. `Arc<Mutex<…>>` so
+/// derived per-graph contexts can share it and the context stays `Send + Sync`.
+pub type ConstSidCache = Arc<Mutex<FxHashMap<ConstSidKey, Option<u64>>>>;
 
 /// Map from `(graph_id, predicate_id, lang_id)` to fulltext BoW arenas used
 /// by `fulltext()` BM25 scoring.
@@ -162,6 +192,9 @@ pub struct ExecutionContext<'a> {
     /// SIDs — encoded in the original namespace space — can be decoded
     /// correctly (see `reencode_sid` in `build_match_val_for_snapshot`).
     pub original_snapshot: &'a LedgerSnapshot,
+    /// Per-query memo: constant filter operands → internal subject id, so a
+    /// `<const> != ?var` FILTER resolves the constant once, not per row.
+    pub const_sid_cache: ConstSidCache,
 }
 
 impl<'a> ExecutionContext<'a> {
@@ -197,6 +230,7 @@ impl<'a> ExecutionContext<'a> {
             multi_ledger: false,
             eager_materialization: false,
             original_snapshot: snapshot,
+            const_sid_cache: ConstSidCache::default(),
         }
     }
 
@@ -244,6 +278,7 @@ impl<'a> ExecutionContext<'a> {
             multi_ledger: false,
             eager_materialization: db.eager,
             original_snapshot: db.snapshot,
+            const_sid_cache: ConstSidCache::default(),
         }
     }
 
@@ -295,6 +330,7 @@ impl<'a> ExecutionContext<'a> {
             multi_ledger: false,
             eager_materialization: db.eager,
             original_snapshot: db.snapshot,
+            const_sid_cache: ConstSidCache::default(),
         }
     }
 
@@ -335,6 +371,7 @@ impl<'a> ExecutionContext<'a> {
             multi_ledger: false,
             eager_materialization: false,
             original_snapshot: snapshot,
+            const_sid_cache: ConstSidCache::default(),
         }
     }
 
@@ -374,6 +411,7 @@ impl<'a> ExecutionContext<'a> {
             multi_ledger: false,
             eager_materialization: false,
             original_snapshot: snapshot,
+            const_sid_cache: ConstSidCache::default(),
         }
     }
 
@@ -415,6 +453,7 @@ impl<'a> ExecutionContext<'a> {
             multi_ledger: false,
             eager_materialization: false,
             original_snapshot: snapshot,
+            const_sid_cache: ConstSidCache::default(),
         }
     }
 
@@ -710,6 +749,25 @@ impl<'a> ExecutionContext<'a> {
         dt_id: u16,
         lang_id: u16,
     ) -> Option<std::io::Result<fluree_db_core::FlakeValue>> {
+        use fluree_db_core::ids::DatatypeDictId;
+        use fluree_db_core::value_id::{ObjKey, ObjKind};
+        use fluree_db_core::FlakeValue;
+        // Inline numerics are self-contained in `o_key` — decode them directly
+        // rather than building a fresh BinaryGraphView per call (a per-row cost
+        // when filters/arithmetic touch encoded numeric literals). Gated on the
+        // standard integer/double dt_ids; other shapes (e.g. an integer-valued
+        // double stored as NUM_INT by novelty) fall through to the view path.
+        let okind = ObjKind::from_u8(o_kind);
+        if okind == ObjKind::NUM_INT
+            && (dt_id == DatatypeDictId::INTEGER.as_u16() || dt_id == DatatypeDictId::LONG.as_u16())
+        {
+            return Some(Ok(FlakeValue::Long(ObjKey::from_u64(o_key).decode_i64())));
+        }
+        if okind == ObjKind::NUM_F64
+            && (dt_id == DatatypeDictId::DOUBLE.as_u16() || dt_id == DatatypeDictId::FLOAT.as_u16())
+        {
+            return Some(Ok(FlakeValue::Double(ObjKey::from_u64(o_key).decode_f64())));
+        }
         let gv = self.graph_view()?;
         Some(gv.decode_value_from_kind(o_kind, o_key, p_id, dt_id, lang_id))
     }
@@ -815,6 +873,7 @@ impl<'a> ExecutionContext<'a> {
             multi_ledger,
             eager_materialization: self.eager_materialization,
             original_snapshot: self.original_snapshot,
+            const_sid_cache: self.const_sid_cache.clone(),
         }
     }
 
@@ -865,6 +924,7 @@ impl<'a> ExecutionContext<'a> {
             multi_ledger: Self::compute_multi_ledger(self.dataset, &ActiveGraph::Default),
             eager_materialization: self.eager_materialization,
             original_snapshot: self.original_snapshot,
+            const_sid_cache: self.const_sid_cache.clone(),
         }
     }
 
@@ -911,6 +971,14 @@ impl<'a> ExecutionContext<'a> {
             multi_ledger: false,
             eager_materialization: self.eager_materialization,
             original_snapshot: self.original_snapshot,
+            // This per-graph context switches to `graph`'s own store/snapshot
+            // (see `binary_store`/`active_snapshot` above) while clearing
+            // `multi_ledger`, so the single-ledger const→s_id fast path DOES run
+            // here — against a different store than the parent. A fresh memo is
+            // mandatory: sharing the parent's would alias an s_id resolved in one
+            // graph/store into another. (`with_active_graph`/`with_default_graph`
+            // keep the same store, so they correctly share the parent's memo.)
+            const_sid_cache: ConstSidCache::default(),
         }
     }
 

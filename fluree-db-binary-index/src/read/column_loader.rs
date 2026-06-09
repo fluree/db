@@ -7,7 +7,7 @@
 use std::io;
 use std::sync::Arc;
 
-use super::column_types::{ColumnBatch, ColumnData, ColumnProjection};
+use super::column_types::{ColumnBatch, ColumnData, ColumnProjection, ColumnSet};
 use crate::format::column_block::{
     decode_column_u16, decode_column_u32, decode_column_u64, ColumnBlockRef, ColumnId,
 };
@@ -192,37 +192,70 @@ pub fn load_leaflet_columns(
     })
 }
 
+/// Identity + decode policy for a cached leaflet column load.
+///
+/// Bundles the content-addressed key components (`leaf_id`, `leaflet_idx`, and
+/// the `decode_set` column bitmask), the leaf's sort order, and which columns to
+/// decode — keeping the loader signatures small. Distinct `decode_set`s cache
+/// under distinct keys, so a narrow batch is never served where a wider one is
+/// needed.
+#[derive(Clone, Copy)]
+pub struct LeafletDecodeSpec {
+    /// `xxh3_128(leaf_cid)` — content-addressed, self-invalidating.
+    pub leaf_id: u128,
+    /// Leaflet slot within the leaf.
+    pub leaflet_idx: u32,
+    /// Sort order of the leaf being decoded.
+    pub order: RunSortOrder,
+    /// Columns to decode (and the cache-key column dimension). Must cover
+    /// everything applied downstream — output projection, filter columns, `t`
+    /// for replay, and ALL when an overlay merge will run.
+    pub decode_set: ColumnSet,
+}
+
+impl LeafletDecodeSpec {
+    #[inline]
+    fn key(&self) -> super::leaflet_cache::V3BatchCacheKey {
+        super::leaflet_cache::V3BatchCacheKey {
+            leaf_id: self.leaf_id,
+            leaflet_idx: self.leaflet_idx,
+            columns: self.decode_set.0,
+        }
+    }
+
+    #[inline]
+    fn projection(&self) -> ColumnProjection {
+        ColumnProjection {
+            output: self.decode_set,
+            internal: ColumnSet::EMPTY,
+        }
+    }
+}
+
 /// Load columns from a V3 leaflet with `LeafletCache` support.
 ///
 /// On cache hit, returns the previously decoded `ColumnBatch` directly (zero
-/// decompress cost). On miss, calls `load_leaflet_columns`, inserts the result
-/// into the cache, and returns it.
-///
-/// The cache key uses `(leaf_id, leaflet_idx)` — base columns are immutable
-/// (content-addressed leaf CID), so no `to_t`/`epoch` dimension is needed.
-/// Overlay merge and time-travel replay are applied downstream.
-///
-/// **Important**: this always decodes ALL columns (projection=all) so the cached
-/// batch can serve any subsequent projection. The per-column `ColumnData::Block`
-/// values are `Arc<[T]>` and cheap to clone.
+/// decompress cost). On miss, decodes only `spec.decode_set`, inserts the
+/// result, and returns it. The per-column `ColumnData::Block` values are
+/// `Arc<[T]>` and cheap to clone. The cache key carries the column set, so a
+/// query needing more columns misses and decodes its own wider entry rather
+/// than being served a narrow batch. Overlay merge and time-travel replay are
+/// applied downstream (callers must widen `decode_set` accordingly).
 pub fn load_leaflet_columns_cached(
     leaf_bytes: &[u8],
     entry: &LeafletDirEntryV3,
     payload_base: usize,
-    order: RunSortOrder,
     cache: &super::leaflet_cache::LeafletCache,
-    leaf_id: u128,
-    leaflet_idx: u32,
+    spec: LeafletDecodeSpec,
 ) -> io::Result<ColumnBatch> {
-    let key = super::leaflet_cache::V3BatchCacheKey {
-        leaf_id,
-        leaflet_idx,
-    };
-
-    cache.try_get_or_decode_v3_batch(key, || {
-        // Cache miss: decode ALL columns so the cached batch serves any projection.
-        let all = ColumnProjection::all();
-        load_leaflet_columns(leaf_bytes, entry, payload_base, &all, order)
+    cache.try_get_or_decode_v3_batch(spec.key(), || {
+        load_leaflet_columns(
+            leaf_bytes,
+            entry,
+            payload_base,
+            &spec.projection(),
+            spec.order,
+        )
     })
 }
 
@@ -232,24 +265,15 @@ pub fn load_leaflet_columns_cached(
 /// [`LeafHandle::load_columns()`] on cache miss. This works transparently for
 /// both local (`FullBlobLeafHandle`) and remote (`RangeReadLeafHandle`) access.
 ///
-/// Always decodes ALL columns on miss so the cached batch serves any projection.
+/// Projection-aware via `spec.decode_set` (see [`LeafletDecodeSpec`]).
 pub fn load_columns_cached_via_handle(
     handle: &dyn super::leaf_access::LeafHandle,
-    leaflet_idx: usize,
-    order: RunSortOrder,
     cache: &super::leaflet_cache::LeafletCache,
-    leaf_id: u128,
-    leaflet_idx_u32: u32,
+    spec: LeafletDecodeSpec,
 ) -> io::Result<ColumnBatch> {
-    let key = super::leaflet_cache::V3BatchCacheKey {
-        leaf_id,
-        leaflet_idx: leaflet_idx_u32,
-    };
-    let batch = cache.try_get_or_decode_v3_batch(key, || {
-        let all = ColumnProjection::all();
-        handle.load_columns(leaflet_idx, &all, order)
-    })?;
-    Ok(batch)
+    cache.try_get_or_decode_v3_batch(spec.key(), || {
+        handle.load_columns(spec.leaflet_idx as usize, &spec.projection(), spec.order)
+    })
 }
 
 // Re-export for convenience: callers use decode_leaf_dir_v3_with_base to get
@@ -470,9 +494,17 @@ mod tests {
         let handle = FullBlobLeafHandle::new(leaf_bytes, None, 123).unwrap();
         let cache = LeafletCache::with_max_mb(16);
 
-        let batch =
-            load_columns_cached_via_handle(&handle, 256, RunSortOrder::Post, &cache, 123, 256)
-                .unwrap();
+        let batch = load_columns_cached_via_handle(
+            &handle,
+            &cache,
+            LeafletDecodeSpec {
+                leaf_id: 123,
+                leaflet_idx: 256,
+                order: RunSortOrder::Post,
+                decode_set: ColumnSet::ALL,
+            },
+        )
+        .unwrap();
 
         assert_eq!(batch.row_count, 1);
         assert_eq!(batch.s_id.get(0), 257);
@@ -483,6 +515,7 @@ mod tests {
             .get_v3_batch(&crate::read::leaflet_cache::V3BatchCacheKey {
                 leaf_id: 123,
                 leaflet_idx: 256,
+                columns: ColumnSet::ALL.0,
             })
             .expect("cached batch for leaflet 256");
         assert_eq!(cached.s_id.get(0), 257);

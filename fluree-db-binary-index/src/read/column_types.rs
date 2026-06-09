@@ -9,6 +9,7 @@ use std::sync::Arc;
 
 use crate::format::column_block::ColumnId;
 use crate::format::run_record::RunSortOrder;
+use crate::format::run_record_v2::{read_ordered_key_v2, RunRecordV2, ORDERED_KEY_V2_SIZE};
 
 // ============================================================================
 // ColumnData — per-column representation
@@ -305,6 +306,122 @@ impl BinaryFilter {
         }
         false
     }
+
+    /// True if a leaflet whose key range is `[first_key, last_key]` (encoded in
+    /// `order`) provably contains no row matching this filter — so it can be
+    /// skipped without decoding/loading.
+    ///
+    /// Sound pruning on the **order-leading contiguous bound prefix**: it walks
+    /// the order's sort columns and, for each *bound* column, requires the bound
+    /// value to fall within the leaflet's `[first, last]` range for that column
+    /// — but only while the higher columns are constant across the leaflet
+    /// (`first == last`), since a column is monotonic within the leaflet only
+    /// then. It stops at the first **unbound** sort column (deeper columns are
+    /// not range-bounded). This generalizes the OPST star-probe's
+    /// `first_key`/`last_key` reject to every order, and `o_type` precedes
+    /// `o_key` in all orders — so a bound `o_key` with a *wild* `o_type` (e.g.
+    /// untyped strings) prunes nothing beyond `skip_leaflet`, which is correct.
+    ///
+    /// CALLER CONTRACT: only invoke when `!has_overlay` (overlay asserts can add
+    /// rows to an otherwise-out-of-range base leaflet) and `!needs_history_replay`
+    /// (a row-count-0 leaflet's keys don't bound its time-travel rows). These are
+    /// the same guards `skip_leaflet` relies on.
+    pub fn leaflet_out_of_range(
+        &self,
+        order: RunSortOrder,
+        first_key: &[u8; ORDERED_KEY_V2_SIZE],
+        last_key: &[u8; ORDERED_KEY_V2_SIZE],
+    ) -> bool {
+        // Sort-column sequence per order (`o_type` precedes `o_key`; `t` is not
+        // part of the V3 ordered key and is never consulted).
+        let fields: &[SortField] = match order {
+            RunSortOrder::Spot => &[
+                SortField::S,
+                SortField::P,
+                SortField::OType,
+                SortField::OKey,
+                SortField::OI,
+            ],
+            RunSortOrder::Psot => &[
+                SortField::P,
+                SortField::S,
+                SortField::OType,
+                SortField::OKey,
+                SortField::OI,
+            ],
+            RunSortOrder::Post => &[
+                SortField::P,
+                SortField::OType,
+                SortField::OKey,
+                SortField::OI,
+                SortField::S,
+            ],
+            RunSortOrder::Opst => &[
+                SortField::OType,
+                SortField::OKey,
+                SortField::OI,
+                SortField::P,
+                SortField::S,
+            ],
+        };
+        // Cheap bail before decoding the keys: nothing to prune if the leading
+        // sort column is unbound.
+        if self.bound_value(fields[0]).is_none() {
+            return false;
+        }
+        let first = read_ordered_key_v2(order, first_key);
+        let last = read_ordered_key_v2(order, last_key);
+        for &f in fields {
+            let fv = field_value(&first, f);
+            let lv = field_value(&last, f);
+            let Some(v) = self.bound_value(f) else {
+                if fv != lv {
+                    return false; // unbound varying column → deeper columns not range-bounded
+                }
+                continue; // unbound but constant across this leaflet → safe to descend
+            };
+            if v < fv || v > lv {
+                return true; // bound value outside the leaflet's range for this column
+            }
+            if fv != lv {
+                return false; // column varies in the leaflet → cannot prune deeper
+            }
+            // column is constant at the bound value → descend to the next column
+        }
+        false
+    }
+
+    #[inline]
+    fn bound_value(&self, f: SortField) -> Option<u64> {
+        match f {
+            SortField::S => self.s_id,
+            SortField::P => self.p_id.map(u64::from),
+            SortField::OType => self.o_type.map(u64::from),
+            SortField::OKey => self.o_key,
+            SortField::OI => self.o_i.map(u64::from),
+        }
+    }
+}
+
+/// A V3 ordered-key sort column (`t` excluded).
+#[derive(Clone, Copy)]
+enum SortField {
+    S,
+    P,
+    OType,
+    OKey,
+    OI,
+}
+
+#[inline]
+fn field_value(rec: &RunRecordV2, f: SortField) -> u64 {
+    match f {
+        SortField::S => rec.s_id.as_u64(),
+        SortField::P => u64::from(rec.p_id),
+        SortField::OType => u64::from(rec.o_type),
+        SortField::OKey => rec.o_key,
+        SortField::OI => u64::from(rec.o_i),
+    }
 }
 
 // ============================================================================
@@ -335,6 +452,8 @@ impl ColumnProjection {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::format::run_record_v2::write_ordered_key_v2;
+    use fluree_db_core::subject_id::SubjectId;
 
     #[test]
     fn column_data_const() {
@@ -410,5 +529,85 @@ mod tests {
         assert!(filter.skip_leaflet(Some(6), None));
         // no p_const → can't skip
         assert!(!filter.skip_leaflet(None, None));
+    }
+
+    fn ordered_key(
+        order: RunSortOrder,
+        s_id: u64,
+        p_id: u32,
+        o_type: u16,
+        o_key: u64,
+        o_i: u32,
+    ) -> [u8; ORDERED_KEY_V2_SIZE] {
+        let rec = RunRecordV2 {
+            s_id: SubjectId(s_id),
+            o_key,
+            p_id,
+            t: 0,
+            o_i,
+            o_type,
+            g_id: 0,
+        };
+        let mut key = [0u8; ORDERED_KEY_V2_SIZE];
+        write_ordered_key_v2(order, &rec, &mut key);
+        key
+    }
+
+    #[test]
+    fn leaflet_range_post_stops_before_subject_when_unbound_oi_varies() {
+        let first_key = ordered_key(RunSortOrder::Post, 100, 5, 7, 11, 0);
+        let last_key = ordered_key(RunSortOrder::Post, 1, 5, 7, 11, 1);
+        let filter = BinaryFilter {
+            p_id: Some(5),
+            o_type: Some(7),
+            o_key: Some(11),
+            s_id: Some(1),
+            ..Default::default()
+        };
+
+        assert!(!filter.leaflet_out_of_range(RunSortOrder::Post, &first_key, &last_key));
+    }
+
+    #[test]
+    fn leaflet_range_opst_stops_before_predicate_when_unbound_oi_varies() {
+        let first_key = ordered_key(RunSortOrder::Opst, 100, 100, 7, 11, 0);
+        let last_key = ordered_key(RunSortOrder::Opst, 1, 1, 7, 11, 1);
+        let filter = BinaryFilter {
+            o_type: Some(7),
+            o_key: Some(11),
+            p_id: Some(1),
+            ..Default::default()
+        };
+
+        assert!(!filter.leaflet_out_of_range(RunSortOrder::Opst, &first_key, &last_key));
+    }
+
+    #[test]
+    fn leaflet_range_post_descends_past_constant_unbound_oi() {
+        let first_key = ordered_key(RunSortOrder::Post, 10, 5, 7, 11, u32::MAX);
+        let last_key = ordered_key(RunSortOrder::Post, 20, 5, 7, 11, u32::MAX);
+        let filter = BinaryFilter {
+            p_id: Some(5),
+            o_type: Some(7),
+            o_key: Some(11),
+            s_id: Some(30),
+            ..Default::default()
+        };
+
+        assert!(filter.leaflet_out_of_range(RunSortOrder::Post, &first_key, &last_key));
+    }
+
+    #[test]
+    fn leaflet_range_opst_descends_past_constant_unbound_oi() {
+        let first_key = ordered_key(RunSortOrder::Opst, 10, 10, 7, 11, u32::MAX);
+        let last_key = ordered_key(RunSortOrder::Opst, 20, 20, 7, 11, u32::MAX);
+        let filter = BinaryFilter {
+            o_type: Some(7),
+            o_key: Some(11),
+            p_id: Some(30),
+            ..Default::default()
+        };
+
+        assert!(filter.leaflet_out_of_range(RunSortOrder::Opst, &first_key, &last_key));
     }
 }
