@@ -37,6 +37,8 @@ use fluree_db_core::{
 };
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+
+use fluree_graph_json_ld::ndjson_splitter::{FirstLineContextPolicy, NdjsonReader};
 use std::sync::Arc;
 use std::time::Instant;
 use tracing::Instrument;
@@ -170,6 +172,10 @@ pub struct ImportConfig {
     /// `max_fuel` limit, the import aborts with `ImportError::FuelExceeded`
     /// as soon as the limit is exceeded. Default: `Tracker::disabled()`.
     pub tracker: Tracker,
+    /// First-line interpretation for ndjson/jsonl imports: whether line 1 is a
+    /// shared `@context` map or already the first node. No effect on other
+    /// formats. Default: [`FirstLineContextPolicy::Auto`].
+    pub ndjson_first_line_context: FirstLineContextPolicy,
 }
 
 impl std::fmt::Debug for ImportConfig {
@@ -207,6 +213,7 @@ impl Default for ImportConfig {
             leaf_target_rows: 250_000,
             progress: None,
             tracker: Tracker::disabled(),
+            ndjson_first_line_context: FirstLineContextPolicy::Auto,
         }
     }
 }
@@ -683,6 +690,13 @@ pub enum ChunkSource {
     /// self-contained payloads by a background producer thread (splits large
     /// files, coalesces small ones). Channel-fed, like `Remote`.
     LocalRechunk(LocalChunkProducer),
+    /// Newline-delimited JSON-LD (`.jsonl`/`.ndjson`) source, streamed by an
+    /// [`NdjsonReader`] that transforms each line group into a standalone
+    /// JSON-LD document. Channel-fed and parsed serially via `parse_jsonld_chunk`
+    /// alongside the remote-serial path. Held in a take-once cell because the
+    /// reader's completion error is observed via `join(&mut self)` after the
+    /// `Arc<ChunkSource>` is shared.
+    JsonLdStream(std::sync::Mutex<Option<NdjsonReader>>),
 }
 
 impl ChunkSource {
@@ -695,6 +709,8 @@ impl ChunkSource {
             Self::Streaming(reader) => reader.estimated_chunk_count(),
             Self::Remote(producer) => producer.estimated_count,
             Self::LocalRechunk(producer) => producer.estimated_count,
+            // Dynamic chunk count (one source → many chunks); unknown upfront.
+            Self::JsonLdStream(_) => 0,
         }
     }
 
@@ -713,6 +729,11 @@ impl ChunkSource {
         matches!(self, Self::LocalRechunk(_))
     }
 
+    /// Whether this is the channel-fed ndjson/jsonl streaming source.
+    pub fn is_jsonld_stream(&self) -> bool {
+        matches!(self, Self::JsonLdStream(_))
+    }
+
     /// Read chunk at `index` as a String (only for `Files` variant).
     ///
     /// Panics if called on `Streaming`/`Remote` — use `recv_next` instead.
@@ -721,7 +742,10 @@ impl ChunkSource {
             // Transparently decodes `.gz` / `.zst` wrappers; plain files use
             // the original `read_to_string` fast path inside `read_decoded_to_string`.
             Self::Files(files) => read_decoded_to_string(&files[index]),
-            Self::Streaming(_) | Self::Remote(_) | Self::LocalRechunk(_) => {
+            Self::Streaming(_)
+            | Self::Remote(_)
+            | Self::LocalRechunk(_)
+            | Self::JsonLdStream(_) => {
                 panic!("read_chunk not supported for channel-fed source; use recv_next")
             }
         }
@@ -752,7 +776,7 @@ impl ChunkSource {
                     None => Ok(None),
                 }
             }
-            Self::Files(_) | Self::Remote(_) | Self::LocalRechunk(_) => {
+            Self::Files(_) | Self::Remote(_) | Self::LocalRechunk(_) | Self::JsonLdStream(_) => {
                 panic!("recv_next not supported for this source variant")
             }
         }
@@ -768,6 +792,7 @@ impl ChunkSource {
             // Streaming and local rechunk are Turtle/N-Triples only.
             Self::Streaming(_) | Self::LocalRechunk(_) => false,
             Self::Remote(producer) => matches!(producer.format_at(index), Some(RemoteFormat::Trig)),
+            Self::JsonLdStream(_) => false,
         }
     }
 
@@ -785,6 +810,7 @@ impl ChunkSource {
             Self::Remote(producer) => {
                 matches!(producer.format_at(index), Some(RemoteFormat::Nquads))
             }
+            Self::JsonLdStream(_) => false,
         }
     }
 
@@ -800,6 +826,7 @@ impl ChunkSource {
                 .per_chunk_format
                 .iter()
                 .any(|f| matches!(f, RemoteFormat::Nquads)),
+            Self::JsonLdStream(_) => false,
         }
     }
 
@@ -813,6 +840,7 @@ impl ChunkSource {
             Self::Remote(producer) => {
                 matches!(producer.format_at(index), Some(RemoteFormat::JsonLd))
             }
+            Self::JsonLdStream(_) => true,
         }
     }
 
@@ -826,6 +854,7 @@ impl ChunkSource {
                 .any(|p| effective_extension(p).0.as_deref() == Some("jsonld")),
             Self::Streaming(_) | Self::LocalRechunk(_) => false,
             Self::Remote(producer) => producer.has_jsonld(),
+            Self::JsonLdStream(_) => true,
         }
     }
 }
@@ -972,6 +1001,26 @@ fn resolve_chunk_source(
     // through the same triple-boundary reader as `.ttl`. `.ttl.gz` / `.nt.gz`
     // and the `.zst` variants stream too — via the new factory constructor.
     let (inner_ext, compression) = effective_extension(path);
+
+    // Newline-delimited JSON-LD (`.jsonl`/`.ndjson`) streams via NdjsonReader,
+    // which transforms each line group into a standalone JSON-LD document parsed
+    // on the serial json-ld path. `open_decoded` transparently handles
+    // `.gz`/`.zst`, so one constructor covers plain and compressed inputs.
+    if matches!(inner_ext.as_deref(), Some("jsonl" | "ndjson")) {
+        let chunk_size_bytes = config.effective_chunk_size_mb() as u64 * 1024 * 1024;
+        let channel_capacity = config.effective_max_inflight();
+        let reader = NdjsonReader::new_from_reader(
+            open_decoded(path)?,
+            chunk_size_bytes,
+            channel_capacity,
+            config.ndjson_first_line_context,
+        )
+        .map_err(|e| ImportError::NoChunks(format!("ndjson reader init failed: {e}")))?;
+        return Ok(ChunkSource::JsonLdStream(std::sync::Mutex::new(Some(
+            reader,
+        ))));
+    }
+
     let is_ttl = matches!(inner_ext.as_deref(), Some("ttl" | "nt"));
 
     if is_ttl && file_size > chunk_size_bytes {
@@ -1624,6 +1673,14 @@ impl<'a> ImportBuilder<'a> {
     /// Whether to collect ID-based stats during commit resolution. Default: true.
     pub fn collect_id_stats(mut self, v: bool) -> Self {
         self.config.collect_id_stats = v;
+        self
+    }
+
+    /// First-line interpretation for ndjson/jsonl sources: whether line 1 is a
+    /// shared `@context` map or the first node. No effect on other formats.
+    /// Default: [`FirstLineContextPolicy::Auto`].
+    pub fn ndjson_first_line_context(mut self, policy: FirstLineContextPolicy) -> Self {
+        self.config.ndjson_first_line_context = policy;
         self
     }
 
@@ -2511,6 +2568,7 @@ where
     let is_remote_parallel = is_remote && remote_all_ttl;
     let is_remote_serial = is_remote && !remote_all_ttl;
     let is_local_rechunk = chunk_source.is_local_rechunk();
+    let is_jsonld_stream = chunk_source.is_jsonld_stream();
     let is_channel_fed = is_streaming || is_remote_parallel || is_local_rechunk;
     let estimated_total = chunk_source.estimated_len();
     let compress = config.compress_commits;
@@ -3055,27 +3113,49 @@ where
             },
             "channel-fed import phase complete"
         );
-    } else if is_remote_serial {
-        // Remote serial path: producer fetches each object whole; we drain
-        // the channel one chunk at a time and dispatch to the format-specific
-        // parser (`import_trig_commit` for `.trig`, `parse_jsonld_chunk` for
-        // `.jsonld`, `parse_chunk` otherwise). Mirrors the local serial
-        // fallback below — the only difference is `recv()` vs `read_chunk(i)`.
+    } else if is_remote_serial || is_jsonld_stream {
+        // Serial channel-fed path: chunks arrive one at a time on a shared
+        // channel and are dispatched to the format-specific parser
+        // (`import_trig_commit` for `.trig`, `parse_jsonld_chunk` for
+        // `.jsonld`/ndjson, `parse_chunk` otherwise). Used whenever the source
+        // contains any `.trig`/`.jsonld` objects, or is an ndjson/jsonl stream.
+        // Single-threaded by design (TriG/JSON-LD parsers do not parallelize
+        // across chunks today).
         //
-        // This path is used whenever the remote source contains any `.trig`
-        // or `.jsonld` objects. Performance is single-threaded by design
-        // (TriG/JSON-LD parsers do not parallelize across chunks today).
-        let (remote_rx, error_rx, bridge_handle) = match &**chunk_source {
+        // The remote producer and the ndjson reader expose the same
+        // `Arc<Mutex<Receiver<(usize, Vec<u8>)>>>` chunk channel; only the
+        // completion signal differs (producer `error_rx` vs reader `join`).
+        enum SerialCompletion {
+            Remote {
+                error_rx: tokio::sync::oneshot::Receiver<Option<ImportError>>,
+                bridge_handle: Option<std::thread::JoinHandle<()>>,
+            },
+            JsonLdStream(NdjsonReader),
+        }
+        let (remote_rx, completion) = match &**chunk_source {
             ChunkSource::Remote(producer) => {
                 let error_rx = producer.error_rx.lock().unwrap().take().ok_or_else(|| {
                     ImportError::Transact(
                         "remote producer error_rx already taken (import re-entered?)".into(),
                     )
                 })?;
-                let bridge = producer.bridge_handle.lock().unwrap().take();
-                (Arc::clone(&producer.rx), error_rx, bridge)
+                let bridge_handle = producer.bridge_handle.lock().unwrap().take();
+                (
+                    Arc::clone(&producer.rx),
+                    SerialCompletion::Remote {
+                        error_rx,
+                        bridge_handle,
+                    },
+                )
             }
-            _ => unreachable!("is_remote_serial guard"),
+            ChunkSource::JsonLdStream(cell) => {
+                let reader = cell.lock().unwrap().take().ok_or_else(|| {
+                    ImportError::Transact("ndjson reader already taken (import re-entered?)".into())
+                })?;
+                let rx = reader.shared_receiver();
+                (rx, SerialCompletion::JsonLdStream(reader))
+            }
+            _ => unreachable!("is_remote_serial || is_jsonld_stream guard"),
         };
 
         let mut next_expected: i64 = 0;
@@ -3193,24 +3273,37 @@ where
             }
         }
 
-        if let Some(bridge) = bridge_handle {
-            bridge.join().expect("remote bridge thread panicked");
-        }
-
-        // Producer error vs clean EOF — same protocol as the parallel arm.
-        match error_rx.await {
-            Ok(None) => {}
-            Ok(Some(err)) => return Err(err),
-            Err(_) => {
-                return Err(ImportError::Storage(
-                    "remote producer task dropped without signaling completion".into(),
-                ));
+        // Completion: producer `error_rx` (remote) vs reader `join` (ndjson).
+        // For both, the closed channel above is not sufficient to detect a
+        // producer/reader error — that signal is checked here.
+        match completion {
+            SerialCompletion::Remote {
+                error_rx,
+                bridge_handle,
+            } => {
+                if let Some(bridge) = bridge_handle {
+                    bridge.join().expect("remote bridge thread panicked");
+                }
+                match error_rx.await {
+                    Ok(None) => {}
+                    Ok(Some(err)) => return Err(err),
+                    Err(_) => {
+                        return Err(ImportError::Storage(
+                            "remote producer task dropped without signaling completion".into(),
+                        ));
+                    }
+                }
+            }
+            SerialCompletion::JsonLdStream(mut reader) => {
+                reader
+                    .join()
+                    .map_err(|e| ImportError::Transact(format!("ndjson read failed: {e}")))?;
             }
         }
 
         tracing::info!(
             committed_chunks = next_expected,
-            "remote serial import phase complete"
+            "serial import phase complete"
         );
     } else {
         // File-based path: index-based access to chunk files.
