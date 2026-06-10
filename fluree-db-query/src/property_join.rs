@@ -308,6 +308,7 @@ impl PropertyJoinOperator {
         driver_subject_ids.is_some()
             && !ctx.is_multi_ledger()
             && ctx.binary_store.is_some()
+            && ctx.overlay_free_single_graph()
             && !remaining_predicates.is_empty()
             && remaining_predicates
                 .iter()
@@ -717,11 +718,14 @@ impl Operator for PropertyJoinOperator {
                 // try a batched subject probe for this predicate.
                 // Batched probe requires binary store with batched_lookup support.
                 // Historical snapshots (`to_t < max_t`) are handled inside the
-                // probe helpers via `replay_leaflet_at_t`.
+                // probe helpers via `replay_leaflet_at_t`. Novelty overlay is
+                // NOT handled — the probe walks base leaflets directly, so an
+                // active overlay must use the per-predicate scan below instead.
                 let can_batched_probe = order_pos > 0
                     && driver_subject_ids.is_some()
                     && !ctx.is_multi_ledger()
                     && ctx.binary_store.is_some()
+                    && ctx.overlay_free_single_graph()
                     && predicate.dtc.is_none();
 
                 if can_batched_probe {

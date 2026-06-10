@@ -1141,9 +1141,14 @@ impl Operator for NestedLoopJoinOperator {
         // Historical snapshots (`to_t < store.max_t()`) are handled inside each
         // batched flush helper via `replay_leaflet_at_t`, which reconstructs
         // leaflet state at `to_t` from the history sidecar.
+        //
+        // Novelty overlay is NOT handled: the flush helpers walk base leaflets
+        // directly, so an active overlay must force the per-row scan path
+        // (whose binary cursor merges overlay ops).
         let use_batched =
             (self.batched_eligible || self.batched_object_eligible || self.batched_exists_eligible)
                 && ctx.binary_store.is_some()
+                && ctx.overlay_free_single_graph()
                 && match ctx.active_graphs() {
                     // Object-batched path currently emits `Binding::EncodedSid` for the new
                     // subject var. Keep it single-ledger only to avoid dataset-mode IriMatch

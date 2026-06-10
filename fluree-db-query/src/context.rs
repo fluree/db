@@ -700,6 +700,25 @@ impl<'a> ExecutionContext<'a> {
         }
     }
 
+    /// True when the active scope resolves to exactly one graph and that
+    /// graph carries no novelty overlay (epoch 0).
+    ///
+    /// The batched join/probe helpers (`flush_batched_*_binary`,
+    /// `batched_subject_probe_binary`, `batched_subject_star_spot`) read base
+    /// leaflets directly and never merge overlay flakes, so they silently drop
+    /// novelty asserts and resurrect novelty-retracted rows. Every batched
+    /// leaflet-probe path must check this and fall back to the per-row scan
+    /// (whose binary cursor merges the overlay) when it returns `false`.
+    pub fn overlay_free_single_graph(&self) -> bool {
+        match self.active_graphs() {
+            ActiveGraphs::Single => self.overlay().epoch() == 0,
+            ActiveGraphs::Many(graphs) => match graphs.as_slice() {
+                [g] => g.overlay.epoch() == 0,
+                _ => false,
+            },
+        }
+    }
+
     /// Check whether the binary index fast path is available.
     ///
     /// Returns `true` when a binary store is present and the query is in
