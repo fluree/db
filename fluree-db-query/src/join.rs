@@ -1149,6 +1149,14 @@ impl Operator for NestedLoopJoinOperator {
             (self.batched_eligible || self.batched_object_eligible || self.batched_exists_eligible)
                 && ctx.binary_store.is_some()
                 && ctx.overlay_free_single_graph()
+                // The batched path reads binary leaves directly and works in
+                // `EncodedSid` space (it even emits `EncodedSid` for newly-bound
+                // subject vars). Whenever eager materialization is required —
+                // reasoning queries (derived facts in the overlay are `Sid` and
+                // must join with base rows), federated queries, or any other
+                // caller that sets this flag — fall back to the per-row path,
+                // which merges the overlay and honours eager decoding.
+                && !ctx.eager_materialization
                 && match ctx.active_graphs() {
                     // Object-batched path currently emits `Binding::EncodedSid` for the new
                     // subject var. Keep it single-ledger only to avoid dataset-mode IriMatch
