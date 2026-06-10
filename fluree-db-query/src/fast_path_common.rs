@@ -2846,10 +2846,12 @@ impl Operator for FastPathOperator {
 
         if let Some(compute) = self.compute.take() {
             if let Some(batch) = compute(ctx)? {
+                tracing::debug!(label = self.label, "fast path produced result");
                 self.state = OperatorState::Open;
                 self.fallback = Some(Box::new(PrecomputedSingleBatchOperator::new(batch)));
                 return Ok(());
             }
+            tracing::debug!(label = self.label, "fast path declined; running fallback");
         }
 
         let Some(fallback) = &mut self.fallback else {
