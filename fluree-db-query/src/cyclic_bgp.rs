@@ -9,8 +9,8 @@ use crate::binding::{Batch, Binding};
 use crate::context::ExecutionContext;
 use crate::error::{QueryError, Result};
 use crate::fast_path_common::{
-    allow_cursor_fast_path, build_overlay_cursor_for_subject_range,
-    build_psot_cursor_for_predicate, cursor_projection_sid_otype_okey, normalize_pred_sid,
+    allow_cursor_fast_path, build_head_cursor_for_single_subject, build_psot_cursor_for_predicate,
+    cursor_projection_sid_otype_okey, fast_path_store, normalize_pred_sid,
 };
 use crate::ir::triple::{Ref, TriplePattern};
 use crate::object_binding::late_materialized_object_binding;
@@ -20,7 +20,7 @@ use crate::temporal_mode::TemporalMode;
 use crate::var_registry::VarId;
 use async_trait::async_trait;
 use fluree_db_core::o_type::OType;
-use fluree_db_core::{OverlayProvider, PropertyStatData, StatsView};
+use fluree_db_core::{PropertyStatData, StatsView};
 use rustc_hash::{FxHashMap, FxHashSet};
 use std::collections::{HashSet, VecDeque};
 use std::sync::Arc;
@@ -28,8 +28,8 @@ use std::sync::Arc;
 const OUTPUT_BATCH_SIZE: usize = 1024;
 const DEFAULT_MAX_PREDICATE_ROWS: u64 = 10_000_000;
 const DEFAULT_MAX_SQUARE_WEDGE_PAIRS: usize = 5_000_000;
-const DEFAULT_MAX_BOUNDED_TRIANGLE_SEED_ROWS: usize = 512;
-const DEFAULT_MAX_BOUNDED_TRIANGLE_SUBJECTS: usize = 128;
+const DEFAULT_MAX_BOUNDED_PROBE_SUBJECTS: usize = 65_536;
+const DEFAULT_BOUNDED_PROBE_SCAN_RATIO: u64 = 64;
 
 fn cyclic_bgp_enabled() -> bool {
     !matches!(
@@ -52,18 +52,30 @@ fn max_square_wedge_pairs() -> usize {
         .unwrap_or(DEFAULT_MAX_SQUARE_WEDGE_PAIRS)
 }
 
-fn max_bounded_triangle_subjects() -> usize {
+fn max_bounded_probe_subjects() -> usize {
     std::env::var("FLUREE_CYCLIC_BGP_MAX_BOUNDED_SUBJECTS")
         .ok()
         .and_then(|v| v.parse().ok())
-        .unwrap_or(DEFAULT_MAX_BOUNDED_TRIANGLE_SUBJECTS)
+        .unwrap_or(DEFAULT_MAX_BOUNDED_PROBE_SUBJECTS)
 }
 
-fn max_bounded_triangle_seed_rows() -> usize {
-    std::env::var("FLUREE_CYCLIC_BGP_MAX_BOUNDED_SEED_ROWS")
+fn bounded_probe_scan_ratio() -> u64 {
+    std::env::var("FLUREE_CYCLIC_BGP_PROBE_SCAN_RATIO")
         .ok()
         .and_then(|v| v.parse().ok())
-        .unwrap_or(DEFAULT_MAX_BOUNDED_TRIANGLE_SEED_ROWS)
+        .unwrap_or(DEFAULT_BOUNDED_PROBE_SCAN_RATIO)
+}
+
+/// Probe an edge per-subject instead of scanning its whole relation only when
+/// the frontier is small enough AND the estimated scan is at least
+/// `bounded_probe_scan_ratio()` rows per probe. A stats-absent estimate means
+/// the predicate is likely empty (populated stats omit only empty predicates),
+/// so a full scan is already trivially cheap — don't probe.
+fn should_probe_edge(frontier_len: usize, estimate: Option<u64>) -> bool {
+    frontier_len <= max_bounded_probe_subjects()
+        && estimate.is_some_and(|est| {
+            (frontier_len as u64).saturating_mul(bounded_probe_scan_ratio()) <= est
+        })
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -354,7 +366,7 @@ pub(crate) struct CyclicBgpOperator {
     ref_pending: VecDeque<Vec<u64>>,
     pending: VecDeque<Vec<Binding>>,
     square_wedge: Option<EncodedSquareWedgeState>,
-    bounded_triangle: bool,
+    probed_edges: usize,
     used_fast_path: bool,
     raw_relation_rows: usize,
     pruned_relation_rows: usize,
@@ -412,7 +424,7 @@ impl CyclicBgpOperator {
             ref_pending: VecDeque::new(),
             pending: VecDeque::new(),
             square_wedge: None,
-            bounded_triangle: false,
+            probed_edges: 0,
             used_fast_path: false,
             raw_relation_rows: 0,
             pruned_relation_rows: 0,
@@ -572,38 +584,32 @@ impl CyclicBgpOperator {
 
         let mut ordered_subjects: Vec<u64> = subjects.iter().copied().collect();
         ordered_subjects.sort_unstable();
-        ordered_subjects.dedup();
 
         let row_cap = max_predicate_rows();
         let projection = cursor_projection_sid_otype_okey();
         let mut raw_rows = Vec::new();
         for subject in ordered_subjects {
-            let Some(hi) = subject.checked_add(1) else {
-                continue;
-            };
-            let Some(mut cursor) = build_overlay_cursor_for_subject_range(
+            let Some(mut cursor) = build_head_cursor_for_single_subject(
                 store,
                 ctx.binary_g_id,
                 p_id,
                 projection,
                 subject,
-                hi,
-                Vec::new(),
                 ctx.to_t,
-                0,
             ) else {
-                continue;
+                // None means the PSOT branch is unavailable, never "subject has
+                // no rows" — decline the fast path rather than dropping rows.
+                self.log_fast_path_bail("cursor-unavailable", Some(edge));
+                return Ok(None);
             };
             while let Some(batch) = cursor
                 .next_batch()
                 .map_err(|e| QueryError::Internal(format!("cyclic bgp bounded cursor: {e}")))?
             {
                 for row in 0..batch.row_count {
-                    if batch.s_id.get(row) != subject || batch.p_id.get(row) != p_id {
-                        continue;
-                    }
+                    debug_assert_eq!(batch.s_id.get(row), subject);
                     raw_rows.push(RawEdgeRow {
-                        subject: batch.s_id.get(row),
+                        subject,
                         o_type: batch.o_type.get(row),
                         object: batch.o_key.get(row),
                         p_id,
@@ -630,90 +636,178 @@ impl CyclicBgpOperator {
         Ok(Some(rows))
     }
 
-    fn bound_subjects_from_relation(
-        &self,
-        rel: &RelationIndex,
-        var: VarId,
-    ) -> Option<FxHashSet<u64>> {
-        if rel.edge.subject == var {
-            return Some(rel.by_subject.keys().copied().collect());
-        }
-        if rel.edge.object != var {
-            return None;
-        }
-
-        let mut subjects = FxHashSet::default();
-        for object in rel.by_object.keys() {
-            let Binding::EncodedSid { s_id, .. } = object else {
-                return None;
-            };
-            subjects.insert(*s_id);
-        }
-        Some(subjects)
+    /// O(1) upper bound on the frontier size for `var`: the smallest distinct
+    /// count among scanned relations incident to it. `None` when no scanned
+    /// relation is incident. Lets the probe loop reject over-cap candidates
+    /// without materializing any value set.
+    fn frontier_size_bound(relations: &[RelationIndex], var: VarId) -> Option<usize> {
+        relations
+            .iter()
+            .filter_map(|rel| {
+                if rel.edge.subject == var {
+                    Some(rel.distinct_subjects())
+                } else if rel.edge.object == var {
+                    Some(rel.distinct_objects())
+                } else {
+                    None
+                }
+            })
+            .min()
     }
 
-    fn open_encoded_bounded_triangle(
-        &self,
-        ctx: &ExecutionContext<'_>,
-    ) -> Result<Option<(Vec<RelationIndex>, usize)>> {
-        if self.plan.shape != CyclicBgpShape::Triangle {
-            return Ok(None);
-        }
-
-        let Some(store) = ctx.binary_store.as_ref() else {
-            self.log_fast_path_bail("missing-binary-store", None);
-            return Ok(None);
-        };
-        let overlay_epoch = ctx.overlay.map(OverlayProvider::epoch).unwrap_or(0);
-        if overlay_epoch != 0 || ctx.to_t != store.max_t() {
-            return Ok(None);
-        }
-
-        let Some((seed_idx, seed_edge)) = self
-            .plan
-            .edges
+    /// Intersected subject-id frontier for `var` across every already-scanned
+    /// relation incident to it. Each new scan tightens the frontier, so probe
+    /// candidates are re-derived per cascade level. Only the smallest incident
+    /// value set is materialized; the rest intersect via O(1) lookups.
+    /// Non-sid object bindings are filtered rather than fatal: a subject var
+    /// only ever joins through `Binding::encoded_sid`, so rows binding it to a
+    /// literal can never complete an assignment. Returns `None` when no
+    /// scanned relation is incident to `var`.
+    fn frontier_for_var(&self, relations: &[RelationIndex], var: VarId) -> Option<FxHashSet<u64>> {
+        let incident: Vec<&RelationIndex> = relations
+            .iter()
+            .filter(|rel| rel.edge.subject == var || rel.edge.object == var)
+            .collect();
+        let seed_pos = incident
             .iter()
             .enumerate()
-            .min_by_key(|(_, edge)| edge.estimate.unwrap_or(u64::MAX))
-        else {
-            return Ok(None);
-        };
+            .min_by_key(|(_, rel)| {
+                if rel.edge.subject == var {
+                    rel.distinct_subjects()
+                } else {
+                    rel.distinct_objects()
+                }
+            })?
+            .0;
 
-        let Some(seed_rows) = self.scan_relation(ctx, seed_edge)? else {
-            return Ok(None);
+        let seed_rel = incident[seed_pos];
+        let mut frontier: FxHashSet<u64> = if seed_rel.edge.subject == var {
+            seed_rel.by_subject.keys().copied().collect()
+        } else {
+            seed_rel
+                .by_object
+                .keys()
+                .filter_map(Binding::encoded_s_id)
+                .collect()
         };
-        let seed_len = seed_rows.len();
-        if seed_len > max_bounded_triangle_seed_rows() {
-            return Ok(None);
-        }
-        let seed_rel = RelationIndex::new(seed_edge.clone(), seed_rows);
-        if seed_rel.rows.is_empty() {
-            return Ok(Some((vec![seed_rel], seed_len)));
-        }
-
-        let mut relations = Vec::with_capacity(self.plan.edges.len());
-        relations.push(seed_rel);
-        let mut raw_rows = seed_len;
-        let subject_cap = max_bounded_triangle_subjects();
-        for (idx, edge) in self.plan.edges.iter().enumerate() {
-            if idx == seed_idx {
+        for (pos, rel) in incident.iter().enumerate() {
+            if pos == seed_pos {
                 continue;
             }
-            let Some(subjects) = self.bound_subjects_from_relation(&relations[0], edge.subject)
-            else {
-                return Ok(None);
-            };
-            if subjects.len() > subject_cap {
-                return Ok(None);
+            if rel.edge.subject == var {
+                frontier.retain(|s| rel.by_subject.contains_key(s));
+            } else {
+                frontier.retain(|s| rel.by_object.contains_key(&Binding::encoded_sid(*s)));
             }
-            let Some(rows) = self.scan_relation_for_subjects(ctx, edge, &subjects)? else {
+        }
+        Some(frontier)
+    }
+
+    fn ref_frontier_size_bound(relations: &[RefRelationIndex], var: VarId) -> Option<usize> {
+        relations
+            .iter()
+            .filter_map(|rel| {
+                if rel.edge.subject == var {
+                    Some(rel.distinct_subjects())
+                } else if rel.edge.object == var {
+                    Some(rel.distinct_objects())
+                } else {
+                    None
+                }
+            })
+            .min()
+    }
+
+    fn ref_frontier_for_var(relations: &[RefRelationIndex], var: VarId) -> Option<FxHashSet<u64>> {
+        let incident: Vec<&RefRelationIndex> = relations
+            .iter()
+            .filter(|rel| rel.edge.subject == var || rel.edge.object == var)
+            .collect();
+        let seed_pos = incident
+            .iter()
+            .enumerate()
+            .min_by_key(|(_, rel)| {
+                if rel.edge.subject == var {
+                    rel.distinct_subjects()
+                } else {
+                    rel.distinct_objects()
+                }
+            })?
+            .0;
+
+        let seed_rel = incident[seed_pos];
+        let mut frontier: FxHashSet<u64> = if seed_rel.edge.subject == var {
+            seed_rel.by_subject.keys().copied().collect()
+        } else {
+            seed_rel.by_object.keys().copied().collect()
+        };
+        for (pos, rel) in incident.iter().enumerate() {
+            if pos == seed_pos {
+                continue;
+            }
+            if rel.edge.subject == var {
+                frontier.retain(|s| rel.by_subject.contains_key(s));
+            } else {
+                frontier.retain(|s| rel.by_object.contains_key(s));
+            }
+        }
+        Some(frontier)
+    }
+
+    fn scan_ref_relation_for_subjects(
+        &self,
+        ctx: &ExecutionContext<'_>,
+        edge: &CyclicEdge,
+        subjects: &FxHashSet<u64>,
+    ) -> Result<Option<Vec<RefEdgeRow>>> {
+        let Some(store) = ctx.binary_store.as_ref() else {
+            self.log_fast_path_bail("missing-binary-store", Some(edge));
+            return Ok(None);
+        };
+        let pred_sid = normalize_pred_sid(store, &edge.predicate)?;
+        let Some(p_id) = store.sid_to_p_id(&pred_sid) else {
+            return Ok(Some(Vec::new()));
+        };
+
+        let mut ordered_subjects: Vec<u64> = subjects.iter().copied().collect();
+        ordered_subjects.sort_unstable();
+
+        let row_cap = max_predicate_rows();
+        let projection = cursor_projection_sid_otype_okey();
+        let mut rows = Vec::new();
+        for subject in ordered_subjects {
+            let Some(mut cursor) = build_head_cursor_for_single_subject(
+                store,
+                ctx.binary_g_id,
+                p_id,
+                projection,
+                subject,
+                ctx.to_t,
+            ) else {
+                self.log_fast_path_bail("cursor-unavailable", Some(edge));
                 return Ok(None);
             };
-            raw_rows += rows.len();
-            relations.push(RelationIndex::new(edge.clone(), rows));
+            while let Some(batch) = cursor
+                .next_batch()
+                .map_err(|e| QueryError::Internal(format!("cyclic bgp bounded ref cursor: {e}")))?
+            {
+                for row in 0..batch.row_count {
+                    if batch.o_type.get(row) != OType::IRI_REF.as_u16() {
+                        self.log_fast_path_bail("non-ref-object-in-ref-mode", Some(edge));
+                        return Ok(None);
+                    }
+                    rows.push(RefEdgeRow {
+                        subject,
+                        object: batch.o_key.get(row),
+                    });
+                    if rows.len() as u64 > row_cap {
+                        self.log_fast_path_bail("predicate-row-cap-exceeded", Some(edge));
+                        return Ok(None);
+                    }
+                }
+            }
         }
-
-        Ok(Some((relations, raw_rows)))
+        Ok(Some(rows))
     }
 
     fn open_fast_path(&mut self, ctx: &ExecutionContext<'_>) -> Result<bool> {
@@ -728,28 +822,100 @@ impl CyclicBgpOperator {
         }
     }
 
+    /// Cascading relation loader shared by both join modes: scan the cheapest
+    /// edge first, then at each level either probe a remaining edge per-subject
+    /// (when an already-scanned relation bounds its subject var to a small
+    /// frontier and the probe-vs-scan gate passes) or fall back to a full scan
+    /// of the cheapest remaining edge. Probed relations are subject-restricted
+    /// semi-joins; `prune_relations` re-establishes global consistency after.
     fn open_ref_fast_path(&mut self, ctx: &ExecutionContext<'_>) -> Result<bool> {
-        let mut relations = Vec::with_capacity(self.plan.edges.len());
+        // Per-subject probes bypass the overlay, so they're only sound at HEAD.
+        let probing_allowed = fast_path_store(ctx).is_some();
+        let mut remaining: Vec<usize> = (0..self.plan.edges.len()).collect();
+        let mut relations: Vec<RefRelationIndex> = Vec::with_capacity(remaining.len());
         let mut raw_rows = 0usize;
-        for edge in self.plan.edges.iter() {
-            let Some(rows) = self.scan_ref_relation(ctx, edge)? else {
-                return Ok(false);
+        let mut probed_edges = 0usize;
+
+        while !remaining.is_empty() {
+            let mut probe: Option<(usize, FxHashSet<u64>)> = None;
+            if probing_allowed && !relations.is_empty() {
+                for (pos, &edge_idx) in remaining.iter().enumerate() {
+                    let edge = &self.plan.edges[edge_idx];
+                    // O(1) rejects before materializing any frontier set. The
+                    // size bound is an over-estimate of the intersection, so
+                    // rejecting on it is conservative (never unsound).
+                    if edge.estimate.is_none() {
+                        continue;
+                    }
+                    let Some(bound) = Self::ref_frontier_size_bound(&relations, edge.subject)
+                    else {
+                        continue;
+                    };
+                    if bound > max_bounded_probe_subjects() {
+                        continue;
+                    }
+                    let Some(frontier) = Self::ref_frontier_for_var(&relations, edge.subject)
+                    else {
+                        continue;
+                    };
+                    if !should_probe_edge(frontier.len(), edge.estimate) {
+                        continue;
+                    }
+                    if probe
+                        .as_ref()
+                        .is_none_or(|(_, best)| frontier.len() < best.len())
+                    {
+                        probe = Some((pos, frontier));
+                    }
+                }
+            }
+
+            let (pos, rows) = match probe {
+                Some((pos, frontier)) => {
+                    let edge = &self.plan.edges[remaining[pos]];
+                    let rows = if frontier.is_empty() {
+                        Vec::new()
+                    } else {
+                        match self.scan_ref_relation_for_subjects(ctx, edge, &frontier)? {
+                            Some(rows) => rows,
+                            None => return Ok(false),
+                        }
+                    };
+                    probed_edges += 1;
+                    (pos, rows)
+                }
+                None => {
+                    let pos = Self::cheapest_remaining(&self.plan.edges, &remaining);
+                    let rows =
+                        match self.scan_ref_relation(ctx, &self.plan.edges[remaining[pos]])? {
+                            Some(rows) => rows,
+                            None => return Ok(false),
+                        };
+                    (pos, rows)
+                }
             };
+            let edge_idx = remaining.swap_remove(pos);
             raw_rows += rows.len();
-            if rows.is_empty() {
-                relations.push(RefRelationIndex::new(edge.clone(), rows));
+            let empty = rows.is_empty();
+            relations.push(RefRelationIndex::new(
+                self.plan.edges[edge_idx].clone(),
+                rows,
+            ));
+            if empty {
+                self.driver_idx = relations.len() - 1;
                 self.ref_relations = relations;
-                self.driver_idx = 0;
                 self.raw_relation_rows = raw_rows;
                 self.pruned_relation_rows = 0;
+                self.probed_edges = probed_edges;
                 self.used_fast_path = true;
                 return Ok(true);
             }
-            relations.push(RefRelationIndex::new(edge.clone(), rows));
         }
+
         relations = self.prune_ref_relations(relations);
         self.raw_relation_rows = raw_rows;
         self.pruned_relation_rows = relations.iter().map(|rel| rel.rows.len()).sum();
+        self.probed_edges = probed_edges;
         self.driver_idx = self.choose_ref_driver(&relations);
         self.ref_relations = relations;
         self.used_fast_path = true;
@@ -757,45 +923,103 @@ impl CyclicBgpOperator {
     }
 
     fn open_encoded_fast_path(&mut self, ctx: &ExecutionContext<'_>) -> Result<bool> {
-        if let Some((mut relations, raw_rows)) = self.open_encoded_bounded_triangle(ctx)? {
-            relations = self.prune_relations(relations);
-            self.raw_relation_rows = raw_rows;
-            self.pruned_relation_rows = relations.iter().map(|rel| rel.rows.len()).sum();
-            self.square_wedge = None;
-            self.bounded_triangle = true;
-            self.driver_idx = self.choose_driver(&relations);
-            self.relations = relations;
-            self.used_fast_path = true;
-            return Ok(true);
-        }
-
-        let mut relations = Vec::with_capacity(self.plan.edges.len());
+        let probing_allowed = fast_path_store(ctx).is_some();
+        let mut remaining: Vec<usize> = (0..self.plan.edges.len()).collect();
+        let mut relations: Vec<RelationIndex> = Vec::with_capacity(remaining.len());
         let mut raw_rows = 0usize;
-        for edge in self.plan.edges.iter() {
-            let Some(rows) = self.scan_relation(ctx, edge)? else {
-                return Ok(false);
+        let mut probed_edges = 0usize;
+
+        while !remaining.is_empty() {
+            let mut probe: Option<(usize, FxHashSet<u64>)> = None;
+            if probing_allowed && !relations.is_empty() {
+                for (pos, &edge_idx) in remaining.iter().enumerate() {
+                    let edge = &self.plan.edges[edge_idx];
+                    // O(1) rejects before materializing any frontier set (the
+                    // size bound over-estimates the intersection, so this is
+                    // conservative).
+                    if edge.estimate.is_none() {
+                        continue;
+                    }
+                    let Some(bound) = Self::frontier_size_bound(&relations, edge.subject) else {
+                        continue;
+                    };
+                    if bound > max_bounded_probe_subjects() {
+                        continue;
+                    }
+                    let Some(frontier) = self.frontier_for_var(&relations, edge.subject) else {
+                        continue;
+                    };
+                    if !should_probe_edge(frontier.len(), edge.estimate) {
+                        continue;
+                    }
+                    if probe
+                        .as_ref()
+                        .is_none_or(|(_, best)| frontier.len() < best.len())
+                    {
+                        probe = Some((pos, frontier));
+                    }
+                }
+            }
+
+            let (pos, rows) = match probe {
+                Some((pos, frontier)) => {
+                    let edge = &self.plan.edges[remaining[pos]];
+                    let rows = if frontier.is_empty() {
+                        Vec::new()
+                    } else {
+                        match self.scan_relation_for_subjects(ctx, edge, &frontier)? {
+                            Some(rows) => rows,
+                            None => return Ok(false),
+                        }
+                    };
+                    probed_edges += 1;
+                    (pos, rows)
+                }
+                None => {
+                    let pos = Self::cheapest_remaining(&self.plan.edges, &remaining);
+                    let rows = match self.scan_relation(ctx, &self.plan.edges[remaining[pos]])? {
+                        Some(rows) => rows,
+                        None => return Ok(false),
+                    };
+                    (pos, rows)
+                }
             };
+            let edge_idx = remaining.swap_remove(pos);
             raw_rows += rows.len();
-            if rows.is_empty() {
-                relations.push(RelationIndex::new(edge.clone(), rows));
+            let empty = rows.is_empty();
+            relations.push(RelationIndex::new(self.plan.edges[edge_idx].clone(), rows));
+            if empty {
+                self.driver_idx = relations.len() - 1;
                 self.relations = relations;
-                self.driver_idx = 0;
                 self.raw_relation_rows = raw_rows;
                 self.pruned_relation_rows = 0;
+                self.probed_edges = probed_edges;
                 self.used_fast_path = true;
                 return Ok(true);
             }
-            relations.push(RelationIndex::new(edge.clone(), rows));
         }
+
         relations = self.prune_relations(relations);
         self.raw_relation_rows = raw_rows;
         self.pruned_relation_rows = relations.iter().map(|rel| rel.rows.len()).sum();
         self.square_wedge = self.open_encoded_square_wedge(&relations);
-        self.bounded_triangle = false;
+        self.probed_edges = probed_edges;
         self.driver_idx = self.choose_driver(&relations);
         self.relations = relations;
         self.used_fast_path = true;
         Ok(true)
+    }
+
+    /// Position (within `remaining`) of the cheapest edge to full-scan next.
+    /// A stats-absent estimate sorts first: with populated stats, absent means
+    /// the predicate is empty, making it the ideal early-exit scan.
+    fn cheapest_remaining(edges: &[CyclicEdge], remaining: &[usize]) -> usize {
+        remaining
+            .iter()
+            .enumerate()
+            .min_by_key(|(_, &edge_idx)| edges[edge_idx].estimate.unwrap_or(0))
+            .map(|(pos, _)| pos)
+            .expect("cheapest_remaining called with non-empty remaining")
     }
 
     fn prune_ref_relations(&self, mut relations: Vec<RefRelationIndex>) -> Vec<RefRelationIndex> {
@@ -1747,15 +1971,19 @@ impl Operator for CyclicBgpOperator {
                 max_square_wedge_pairs().into(),
             );
         }
-        if self.bounded_triangle {
-            m.insert("triangle-strategy".into(), "seeded_subject_probe".into());
+        if self.probed_edges > 0 {
             m.insert(
-                "triangle-bounded-seed-row-cap".into(),
-                max_bounded_triangle_seed_rows().into(),
+                "bounded-probe-strategy".into(),
+                "cascading_subject_probe".into(),
+            );
+            m.insert("bounded-probe-edges".into(), self.probed_edges.into());
+            m.insert(
+                "bounded-probe-subject-cap".into(),
+                max_bounded_probe_subjects().into(),
             );
             m.insert(
-                "triangle-bounded-subject-cap".into(),
-                max_bounded_triangle_subjects().into(),
+                "bounded-probe-scan-ratio".into(),
+                bounded_probe_scan_ratio().into(),
             );
         }
         if self.raw_relation_rows > 0 {
@@ -1842,7 +2070,7 @@ impl Operator for CyclicBgpOperator {
         self.ref_pending.clear();
         self.pending.clear();
         self.square_wedge = None;
-        self.bounded_triangle = false;
+        self.probed_edges = 0;
         self.state = OperatorState::Closed;
     }
 }
@@ -2045,7 +2273,7 @@ mod tests {
         let state = op
             .open_encoded_square_wedge(&relations)
             .expect("square wedge should be selected");
-        assert!(matches!(state.plan.build_center, VarId(1) | VarId(3)));
+        assert!(matches!(state.plan.build_center, VarId(1 | 3)));
         assert_ne!(state.plan.build_center, state.plan.probe_center);
         assert_eq!(state.plan.build_pairs, 1);
         assert!(state.plan.probe_pairs >= state.plan.build_pairs);
@@ -2082,5 +2310,123 @@ mod tests {
         assert_eq!(batch.get_by_col(0, 1), &Binding::encoded_sid(10));
         assert_eq!(batch.get_by_col(0, 2), &Binding::encoded_sid(20));
         assert_eq!(batch.get_by_col(0, 3), &Binding::encoded_sid(3));
+    }
+
+    #[test]
+    fn probe_gate_requires_known_estimate_and_scan_ratio() {
+        // Absent estimate means "likely empty" — full scan is already cheap.
+        assert!(!should_probe_edge(10, None));
+        // Probe only when the estimated scan is >= ratio rows per probe.
+        let ratio = bounded_probe_scan_ratio();
+        assert!(should_probe_edge(100, Some(100 * ratio)));
+        assert!(!should_probe_edge(100, Some(100 * ratio - 1)));
+        // Frontier above the subject cap never probes.
+        let over_cap = max_bounded_probe_subjects() + 1;
+        assert!(!should_probe_edge(over_cap, Some(u64::MAX)));
+        // An empty frontier trivially passes (the caller skips I/O entirely).
+        assert!(should_probe_edge(0, Some(1)));
+    }
+
+    #[test]
+    fn frontier_intersects_across_all_scanned_relations() {
+        // Directed triangle: ?0 -p1-> ?1 -p2-> ?2 -p3-> ?0 (RefOnly shape, but
+        // the encoded frontier helper sees the same edge endpoints).
+        let triples = vec![triple(0, "p1", 1), triple(1, "p2", 2), triple(2, "p3", 0)];
+        let op = operator_for(&triples);
+
+        // Var ?1 is object of edge0 and subject of edge1. With both scanned,
+        // the frontier is the intersection of edge0's objects and edge1's subjects.
+        let scanned = vec![
+            rel(&op.plan.edges[0], &[(1, 10), (2, 11), (3, 12)]),
+            rel(&op.plan.edges[1], &[(10, 20), (12, 21), (99, 22)]),
+        ];
+        let frontier = op
+            .frontier_for_var(&scanned, VarId(1))
+            .expect("frontier should be derivable");
+        let mut got: Vec<u64> = frontier.into_iter().collect();
+        got.sort_unstable();
+        assert_eq!(got, vec![10, 12]);
+
+        // A var not exposed by any scanned relation has no frontier.
+        assert!(op.frontier_for_var(&scanned[..1], VarId(2)).is_none());
+    }
+
+    #[test]
+    fn frontier_from_object_side_requires_encoded_sids() {
+        let triples = vec![
+            triple(0, "p1", 1),
+            triple(0, "p2", 2),
+            triple(3, "p3", 1),
+            triple(3, "p4", 2),
+        ];
+        let op = operator_for(&triples);
+
+        // ?1 appears only as an object; EncodedSid objects yield a frontier.
+        let scanned = vec![rel(&op.plan.edges[0], &[(1, 10), (2, 11)])];
+        let frontier = op
+            .frontier_for_var(&scanned, VarId(1))
+            .expect("encoded-sid objects should bound the var");
+        assert_eq!(frontier.len(), 2);
+
+        // Non-sid object bindings can never join a subject var, so they're
+        // filtered out of the frontier (here: down to empty, meaning the
+        // overall result is provably empty).
+        let lit = op
+            .object_binding_for_edge(
+                &op.plan.edges[0],
+                RawEdgeRow {
+                    subject: 1,
+                    o_type: OType::XSD_STRING.as_u16(),
+                    object: 42,
+                    p_id: 7,
+                },
+            )
+            .expect("object-only var accepts encoded literals");
+        let lit_rel = RelationIndex::new(
+            op.plan.edges[0].clone(),
+            vec![EdgeRow {
+                subject: 1,
+                object: lit,
+            }],
+        );
+        let frontier = op
+            .frontier_for_var(&[lit_rel], VarId(1))
+            .expect("incident relation still yields a frontier");
+        assert!(frontier.is_empty());
+    }
+
+    #[test]
+    fn ref_frontier_intersects_subject_and_object_sides() {
+        let triples = vec![triple(0, "p1", 1), triple(1, "p2", 2), triple(2, "p3", 0)];
+        let op = operator_for(&triples);
+
+        let scanned = vec![
+            ref_rel(&op.plan.edges[0], &[(1, 10), (2, 11)]),
+            ref_rel(&op.plan.edges[1], &[(10, 20), (11, 21), (50, 22)]),
+        ];
+        let frontier = CyclicBgpOperator::ref_frontier_for_var(&scanned, VarId(1))
+            .expect("frontier should be derivable");
+        let mut got: Vec<u64> = frontier.into_iter().collect();
+        got.sort_unstable();
+        assert_eq!(got, vec![10, 11]);
+    }
+
+    #[test]
+    fn cheapest_remaining_treats_absent_estimate_as_empty() {
+        let triples = vec![triple(0, "p1", 1), triple(1, "p2", 2), triple(2, "p3", 0)];
+        let op = operator_for(&triples);
+        let mut edges: Vec<CyclicEdge> = op.plan.edges.to_vec();
+        edges[0].estimate = Some(5);
+        edges[1].estimate = None;
+        edges[2].estimate = Some(1);
+
+        // Stats-absent (edge 1) sorts before every known estimate.
+        let remaining = vec![0, 1, 2];
+        let pos = CyclicBgpOperator::cheapest_remaining(&edges, &remaining);
+        assert_eq!(remaining[pos], 1);
+
+        let remaining = vec![0, 2];
+        let pos = CyclicBgpOperator::cheapest_remaining(&edges, &remaining);
+        assert_eq!(remaining[pos], 2);
     }
 }

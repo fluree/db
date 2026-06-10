@@ -2052,6 +2052,46 @@ pub fn build_overlay_cursor_for_subject_range(
     Some(cursor)
 }
 
+/// Build a PSOT cursor for a single subject's rows under one predicate, with
+/// both `p_id` and `s_id` pinned in the [`BinaryFilter`] so leaflet skipping and
+/// row filtering both engage. This is the per-probe primitive for bounded
+/// subject probing.
+///
+/// HEAD-only: overlay ops are not folded, so callers must be gated on
+/// [`fast_path_store`] (no overlay, `to_t == max_t`). Returns `None` if the
+/// PSOT branch is absent — that means "branch unavailable", never "no rows".
+pub fn build_head_cursor_for_single_subject(
+    store: &Arc<BinaryIndexStore>,
+    g_id: GraphId,
+    p_id: u32,
+    projection: ColumnProjection,
+    s_id: u64,
+    to_t: i64,
+) -> Option<BinaryCursor> {
+    let (mut min_key, mut max_key) = predicate_range_keys(p_id, g_id);
+    min_key.s_id = SubjectId(s_id);
+    // Leave max_key's object/t components at their predicate maxima so the leaf
+    // range covers all of this subject's rows (the filter does exact matching).
+    max_key.s_id = SubjectId(s_id);
+
+    let filter = BinaryFilter {
+        p_id: Some(p_id),
+        s_id: Some(s_id),
+        ..Default::default()
+    };
+    let mut cursor = build_range_cursor(
+        store,
+        g_id,
+        RunSortOrder::Psot,
+        &min_key,
+        &max_key,
+        filter,
+        projection,
+    )?;
+    cursor.set_to_t(to_t);
+    Some(cursor)
+}
+
 /// Slice a predicate's resolved overlay ops (sorted in PSOT order, i.e. by
 /// `(p_id, s_id, …)` for a single predicate) to those with `s_id ∈ [lo, hi)`.
 /// Since the ops are sorted by `s_id`, this is two binary searches.
