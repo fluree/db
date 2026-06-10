@@ -15,7 +15,7 @@ use fluree_db_binary_index::{BinaryGraphView, BinaryIndexStore, FulltextArena};
 use fluree_db_core::dict_novelty::DictNovelty;
 use fluree_db_core::{
     GraphDbRef, GraphId, LedgerSnapshot, NoOverlay, OverlayProvider, QueryCancellation,
-    RuntimeSmallDicts, Sid, Tracker,
+    RuntimeSmallDicts, Sid, Tracker, FIRST_USER_GRAPH_ID,
 };
 
 use crate::binary_range::BinaryRangeProvider;
@@ -723,6 +723,25 @@ impl<'a> ExecutionContext<'a> {
         }
     }
 
+    /// True when the active scope resolves to exactly one graph and that
+    /// graph carries no novelty overlay (epoch 0).
+    ///
+    /// The batched join/probe helpers (`flush_batched_*_binary`,
+    /// `batched_subject_probe_binary`, `batched_subject_star_spot`) read base
+    /// leaflets directly and never merge overlay flakes, so they silently drop
+    /// novelty asserts and resurrect novelty-retracted rows. Every batched
+    /// leaflet-probe path must check this and fall back to the per-row scan
+    /// (whose binary cursor merges the overlay) when it returns `false`.
+    pub fn overlay_free_single_graph(&self) -> bool {
+        match self.active_graphs() {
+            ActiveGraphs::Single => self.overlay().epoch() == 0,
+            ActiveGraphs::Many(graphs) => match graphs.as_slice() {
+                [g] => g.overlay.epoch() == 0,
+                _ => false,
+            },
+        }
+    }
+
     /// Check whether the binary index fast path is available.
     ///
     /// Returns `true` when a binary store is present and the query is in
@@ -819,17 +838,50 @@ impl<'a> ExecutionContext<'a> {
         }
     }
 
+    /// Resolve a `GRAPH <iri>` to a user-registered named graph's `g_id`, or
+    /// `None` when a dataset scopes the named set (`FROM NAMED`), the IRI is
+    /// unregistered, or it names a reserved system graph. The ledger alias is
+    /// reserved for the default graph and never resolves here, even if a
+    /// registered graph shares the ledger's IRI.
+    pub fn single_db_user_graph_id(&self, iri: &str) -> Option<GraphId> {
+        if self.dataset.is_some() || iri == self.active_snapshot.ledger_id.as_str() {
+            return None;
+        }
+        self.active_snapshot
+            .graph_registry
+            .graph_id_for_iri(iri)
+            .filter(|g| *g >= FIRST_USER_GRAPH_ID)
+    }
+
+    /// User-registered named graph IRIs of the active snapshot, for `GRAPH ?g`
+    /// discovery. Excludes the default, reserved system graphs, and any graph
+    /// colliding with the ledger alias (which addresses the default graph);
+    /// empty in dataset mode.
+    pub fn single_db_user_graph_iris(&self) -> Vec<Arc<str>> {
+        if self.dataset.is_some() {
+            return Vec::new();
+        }
+        let alias = self.active_snapshot.ledger_id.as_str();
+        self.active_snapshot
+            .graph_registry
+            .iter_entries()
+            .filter(|(g, iri)| *g >= FIRST_USER_GRAPH_ID && *iri != alias)
+            .map(|(_, iri)| Arc::from(iri))
+            .collect()
+    }
+
     /// Create a new context with a specific named graph active
     ///
     /// This is cheap: just creates a new context with a different `active_graph` enum.
     /// Used by `GraphOperator` to switch graph context during GRAPH pattern execution.
     pub fn with_active_graph(&self, iri: Arc<str>) -> Self {
-        // In dataset mode, ensure binary scans route to the active graph's g_id.
-        // Without this, `BinaryScanOperator` would continue scanning the original graph
-        // even inside a `GRAPH <iri> { ... }` pattern.
+        // Route binary scans to the active graph's g_id: an explicit FROM NAMED
+        // entry, else a registered user graph (single-db), else inherit (the
+        // ledger alias addresses the default graph).
         let binary_g_id = self
             .dataset
             .and_then(|ds| ds.named_graph(&iri).map(|g| g.g_id))
+            .or_else(|| self.single_db_user_graph_id(&iri))
             .unwrap_or(self.binary_g_id);
         let active_graph = ActiveGraph::Named(iri);
         let multi_ledger = Self::compute_multi_ledger(self.dataset, &active_graph);

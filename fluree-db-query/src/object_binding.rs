@@ -38,6 +38,24 @@ fn inline_numeric_encoding(o_type: u16) -> Option<(u8, u16)> {
     }
 }
 
+/// Encoded representation for embedded temporal `OType`s whose `o_key` is already
+/// order-preserving and whose datatype has a stable dictionary id.
+fn embedded_temporal_encoding(o_type: u16) -> Option<(u8, u16)> {
+    let ot = OType::from_u16(o_type);
+    if ot == OType::XSD_DATE {
+        Some((ObjKind::DATE.as_u8(), DatatypeDictId::DATE.as_u16()))
+    } else if ot == OType::XSD_TIME {
+        Some((ObjKind::TIME.as_u8(), DatatypeDictId::TIME.as_u16()))
+    } else if ot == OType::XSD_DATE_TIME {
+        Some((
+            ObjKind::DATE_TIME.as_u8(),
+            DatatypeDictId::DATE_TIME.as_u16(),
+        ))
+    } else {
+        None
+    }
+}
+
 /// Build an `EncodedLit` for an inline numeric, or `None` for types that must
 /// stay materialized (see [`inline_numeric_encoding`]).
 pub(crate) fn inline_numeric_encoded_lit(
@@ -131,11 +149,25 @@ pub(crate) fn late_materialized_object_binding(
         }),
         // Inline integer/float values whose datatype has a reserved dict id:
         // keep them encoded so they hash/compare/clone as cheap ints through
-        // DISTINCT and joins, with materialization deferred to projection. Other
-        // inline kinds (and unsupported numeric subtypes) fall through to `None`,
-        // and the caller materializes them as before.
+        // DISTINCT and joins, with materialization deferred to projection.
         DecodeKind::I64 | DecodeKind::F64 => {
             inline_numeric_encoded_lit(o_type, o_key, p_id, o_i, t)
+        }
+        // Embedded temporal values are also order-preserving `o_key`s. Keep them
+        // late-materialized so cyclic/path joins do not decode and re-intern them
+        // for every intermediate row. Only date/time/dateTime have reserved
+        // datatype dictionary ids today; the other temporal subtypes stay
+        // materialized until their datatype ids are represented in EncodedLit.
+        DecodeKind::Date | DecodeKind::Time | DecodeKind::DateTime => {
+            embedded_temporal_encoding(o_type).map(|(o_kind, dt_id)| Binding::EncodedLit {
+                o_kind,
+                o_key,
+                p_id,
+                dt_id,
+                lang_id: 0,
+                i_val: encoded_i_val(o_i),
+                t,
+            })
         }
         _ => None,
     }
@@ -174,5 +206,60 @@ pub(crate) fn materialized_object_binding(
                 p_id: Some(p_id),
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn late_materialized_object_binding_keeps_dates_encoded() {
+        let binding = late_materialized_object_binding(
+            OType::XSD_DATE.as_u16(),
+            12_345,
+            7,
+            0,
+            u32::MAX,
+            None,
+        )
+        .expect("xsd:date should stay encoded");
+
+        assert!(matches!(
+            binding,
+            Binding::EncodedLit {
+                o_kind,
+                o_key: 12_345,
+                p_id: 7,
+                dt_id,
+                ..
+            } if o_kind == ObjKind::DATE.as_u8()
+                && dt_id == DatatypeDictId::DATE.as_u16()
+        ));
+    }
+
+    #[test]
+    fn late_materialized_object_binding_keeps_datetime_encoded() {
+        let binding = late_materialized_object_binding(
+            OType::XSD_DATE_TIME.as_u16(),
+            98_765,
+            11,
+            0,
+            u32::MAX,
+            None,
+        )
+        .expect("xsd:dateTime should stay encoded");
+
+        assert!(matches!(
+            binding,
+            Binding::EncodedLit {
+                o_kind,
+                o_key: 98_765,
+                p_id: 11,
+                dt_id,
+                ..
+            } if o_kind == ObjKind::DATE_TIME.as_u8()
+                && dt_id == DatatypeDictId::DATE_TIME.as_u16()
+        ));
     }
 }

@@ -130,6 +130,16 @@ impl UnionOperator {
 
     /// Normalize a batch to the effective schema (pad missing vars with Unbound).
     fn normalize_batch(&self, batch: Batch) -> Result<Batch> {
+        // Variable-free solutions (e.g. an all-bound existence branch like
+        // `<s> a <C>`) carry rows but no columns. `Batch::new` infers the row
+        // count from the first column and so reports len=0 for a zero-column
+        // batch, which would silently drop those existence rows. Preserve the
+        // count explicitly — mirrors join.rs / optional.rs / seed.rs, which use
+        // `empty_schema_with_len` for the same reason.
+        if self.effective_schema.is_empty() {
+            return Ok(Batch::empty_schema_with_len(batch.len()));
+        }
+
         if batch.is_empty() {
             return Ok(Batch::empty(self.effective_schema.clone())?);
         }

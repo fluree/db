@@ -120,6 +120,7 @@ use fluree_db_core::{format_ledger_id, ContentId};
 use fluree_vocab::ns_types;
 use serde::{Deserialize, Serialize};
 use std::fmt::Debug;
+use std::sync::Arc;
 use tokio::sync::broadcast;
 
 /// Parse a default_context value.
@@ -1260,6 +1261,249 @@ impl<T> NameServicePublisher for T where
         + StatusPublisher
         + ConfigPublisher
 {
+}
+
+#[async_trait]
+impl<T> GraphSourceLookup for Arc<T>
+where
+    T: GraphSourceLookup + ?Sized,
+{
+    async fn lookup_graph_source(
+        &self,
+        graph_source_id: &str,
+    ) -> Result<Option<GraphSourceRecord>> {
+        (**self).lookup_graph_source(graph_source_id).await
+    }
+
+    async fn lookup_any(&self, resource_id: &str) -> Result<NsLookupResult> {
+        (**self).lookup_any(resource_id).await
+    }
+
+    async fn all_graph_source_records(&self) -> Result<Vec<GraphSourceRecord>> {
+        (**self).all_graph_source_records().await
+    }
+}
+
+#[async_trait]
+impl<T> RefLookup for Arc<T>
+where
+    T: RefLookup + ?Sized,
+{
+    async fn get_ref(&self, ledger_id: &str, kind: RefKind) -> Result<Option<RefValue>> {
+        (**self).get_ref(ledger_id, kind).await
+    }
+}
+
+#[async_trait]
+impl<T> StatusLookup for Arc<T>
+where
+    T: StatusLookup + ?Sized,
+{
+    async fn get_status(&self, ledger_id: &str) -> Result<Option<StatusValue>> {
+        (**self).get_status(ledger_id).await
+    }
+}
+
+#[async_trait]
+impl<T> ConfigLookup for Arc<T>
+where
+    T: ConfigLookup + ?Sized,
+{
+    async fn get_config(&self, ledger_id: &str) -> Result<Option<ConfigValue>> {
+        (**self).get_config(ledger_id).await
+    }
+}
+
+#[async_trait]
+impl<T> NameService for Arc<T>
+where
+    T: NameService + ?Sized,
+{
+    async fn lookup(&self, ledger_id: &str) -> Result<Option<NsRecord>> {
+        (**self).lookup(ledger_id).await
+    }
+
+    async fn all_records(&self) -> Result<Vec<NsRecord>> {
+        (**self).all_records().await
+    }
+
+    async fn list_branches(&self, ledger_name: &str) -> Result<Vec<NsRecord>> {
+        (**self).list_branches(ledger_name).await
+    }
+
+    async fn create_branch(
+        &self,
+        ledger_name: &str,
+        new_branch: &str,
+        source_branch: &str,
+        at_commit: Option<(ContentId, i64)>,
+    ) -> Result<()> {
+        (**self)
+            .create_branch(ledger_name, new_branch, source_branch, at_commit)
+            .await
+    }
+
+    async fn drop_branch(&self, ledger_id: &str) -> Result<Option<u32>> {
+        (**self).drop_branch(ledger_id).await
+    }
+
+    async fn reset_head(&self, ledger_id: &str, snapshot: NsRecordSnapshot) -> Result<()> {
+        (**self).reset_head(ledger_id, snapshot).await
+    }
+
+    async fn pending_commit_cids(
+        &self,
+        ledger_id: &str,
+        since_t: i64,
+    ) -> Result<Option<Vec<(i64, ContentId)>>> {
+        (**self).pending_commit_cids(ledger_id, since_t).await
+    }
+
+    async fn prune_commit_index(&self, ledger_id: &str, up_to_t: i64) -> Result<()> {
+        (**self).prune_commit_index(ledger_id, up_to_t).await
+    }
+}
+
+#[async_trait]
+impl<T> Publisher for Arc<T>
+where
+    T: Publisher + ?Sized,
+{
+    async fn publish_ledger_init(&self, ledger_id: &str) -> Result<()> {
+        (**self).publish_ledger_init(ledger_id).await
+    }
+
+    async fn publish_commit(
+        &self,
+        ledger_id: &str,
+        commit_t: i64,
+        commit_id: &ContentId,
+    ) -> Result<()> {
+        (**self)
+            .publish_commit(ledger_id, commit_t, commit_id)
+            .await
+    }
+
+    async fn publish_index(
+        &self,
+        ledger_id: &str,
+        index_t: i64,
+        index_id: &ContentId,
+    ) -> Result<()> {
+        (**self).publish_index(ledger_id, index_t, index_id).await
+    }
+
+    async fn retract(&self, ledger_id: &str) -> Result<()> {
+        (**self).retract(ledger_id).await
+    }
+
+    async fn purge(&self, ledger_id: &str) -> Result<()> {
+        (**self).purge(ledger_id).await
+    }
+
+    fn publishing_ledger_id(&self, ledger_id: &str) -> Option<String> {
+        (**self).publishing_ledger_id(ledger_id)
+    }
+}
+
+#[async_trait]
+impl<T> AdminPublisher for Arc<T>
+where
+    T: AdminPublisher + ?Sized,
+{
+    async fn publish_index_allow_equal(
+        &self,
+        ledger_id: &str,
+        index_t: i64,
+        index_id: &ContentId,
+    ) -> Result<()> {
+        (**self)
+            .publish_index_allow_equal(ledger_id, index_t, index_id)
+            .await
+    }
+}
+
+#[async_trait]
+impl<T> RefPublisher for Arc<T>
+where
+    T: RefPublisher + ?Sized,
+{
+    async fn compare_and_set_ref(
+        &self,
+        ledger_id: &str,
+        kind: RefKind,
+        expected: Option<&RefValue>,
+        new: &RefValue,
+    ) -> Result<CasResult> {
+        (**self)
+            .compare_and_set_ref(ledger_id, kind, expected, new)
+            .await
+    }
+}
+
+#[async_trait]
+impl<T> GraphSourcePublisher for Arc<T>
+where
+    T: GraphSourcePublisher + ?Sized,
+{
+    async fn publish_graph_source(
+        &self,
+        name: &str,
+        branch: &str,
+        source_type: GraphSourceType,
+        config: &str,
+        dependencies: &[String],
+    ) -> Result<()> {
+        (**self)
+            .publish_graph_source(name, branch, source_type, config, dependencies)
+            .await
+    }
+
+    async fn publish_graph_source_index(
+        &self,
+        name: &str,
+        branch: &str,
+        index_id: &ContentId,
+        index_t: i64,
+    ) -> Result<()> {
+        (**self)
+            .publish_graph_source_index(name, branch, index_id, index_t)
+            .await
+    }
+
+    async fn retract_graph_source(&self, name: &str, branch: &str) -> Result<()> {
+        (**self).retract_graph_source(name, branch).await
+    }
+}
+
+#[async_trait]
+impl<T> StatusPublisher for Arc<T>
+where
+    T: StatusPublisher + ?Sized,
+{
+    async fn push_status(
+        &self,
+        ledger_id: &str,
+        expected: Option<&StatusValue>,
+        new: &StatusValue,
+    ) -> Result<StatusCasResult> {
+        (**self).push_status(ledger_id, expected, new).await
+    }
+}
+
+#[async_trait]
+impl<T> ConfigPublisher for Arc<T>
+where
+    T: ConfigPublisher + ?Sized,
+{
+    async fn push_config(
+        &self,
+        ledger_id: &str,
+        expected: Option<&ConfigValue>,
+        new: &ConfigValue,
+    ) -> Result<ConfigCasResult> {
+        (**self).push_config(ledger_id, expected, new).await
+    }
 }
 
 #[cfg(test)]
