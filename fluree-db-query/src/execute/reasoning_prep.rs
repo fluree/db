@@ -208,7 +208,20 @@ pub async fn compute_derived_facts(
                     derived_facts = result.diagnostics.facts_derived,
                     "OWL2-RL reasoning completed"
                 );
-                // Collect flakes from the OWL2-RL overlay
+
+                // Without datalog there is nothing to combine: hand the
+                // prebuilt (cached, pre-sorted) overlay straight to
+                // execution instead of re-collecting and re-sorting its
+                // flakes on every query.
+                if !reasoning.datalog {
+                    if result.overlay.is_empty() {
+                        return None;
+                    }
+                    return Some(result.overlay.clone());
+                }
+
+                // Datalog chains off OWL entailments — collect flakes so
+                // both rule sets land in one combined overlay below.
                 result.overlay.for_each_overlay_flake(
                     0, // derived facts are default-graph only
                     fluree_db_core::IndexType::Spot,

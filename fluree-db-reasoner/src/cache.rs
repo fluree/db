@@ -176,8 +176,11 @@ impl ReasoningDiagnostics {
 /// Always returned together so callers have full visibility into what happened.
 #[derive(Debug)]
 pub struct ReasoningResult {
-    /// The derived facts overlay
-    pub overlay: DerivedFactsOverlay,
+    /// The derived facts overlay.
+    ///
+    /// `Arc` so cache hits can hand the prebuilt (pre-sorted) overlay
+    /// directly to query execution instead of rebuilding it per query.
+    pub overlay: Arc<DerivedFactsOverlay>,
     /// Diagnostics about the reasoning process
     pub diagnostics: ReasoningDiagnostics,
 }
@@ -186,7 +189,7 @@ impl ReasoningResult {
     /// Create a new result
     pub fn new(overlay: DerivedFactsOverlay, diagnostics: ReasoningDiagnostics) -> Self {
         Self {
-            overlay,
+            overlay: Arc::new(overlay),
             diagnostics,
         }
     }
@@ -278,7 +281,7 @@ mod tests {
 
     fn make_result() -> Arc<ReasoningResult> {
         Arc::new(ReasoningResult {
-            overlay: DerivedFactsOverlay::empty(),
+            overlay: Arc::new(DerivedFactsOverlay::empty()),
             diagnostics: ReasoningDiagnostics::default(),
         })
     }
