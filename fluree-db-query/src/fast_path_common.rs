@@ -790,10 +790,34 @@ pub struct PsotSubjectSeek<'a> {
     row: usize,
     handle: Option<Box<dyn fluree_db_binary_index::read::leaf_access::LeafHandle>>,
     batch: Option<ColumnBatch>,
+    projection: ColumnProjection,
 }
 
 impl<'a> PsotSubjectSeek<'a> {
     pub fn new(store: &'a BinaryIndexStore, g_id: GraphId, p_id: u32) -> Self {
+        Self::with_projection(store, g_id, p_id, projection_sid_only())
+    }
+
+    /// Row-yielding variant for [`Self::rows_for_subject`]: decodes OType +
+    /// OKey alongside SId. Returns `None` when the PSOT branch is absent —
+    /// that means "branch unavailable", never "predicate has no rows" —
+    /// so callers can decline their fast path instead of dropping rows.
+    pub fn new_with_objects(store: &'a BinaryIndexStore, g_id: GraphId, p_id: u32) -> Option<Self> {
+        store.branch_for_order(g_id, RunSortOrder::Psot)?;
+        Some(Self::with_projection(
+            store,
+            g_id,
+            p_id,
+            projection_sid_otype_okey(),
+        ))
+    }
+
+    fn with_projection(
+        store: &'a BinaryIndexStore,
+        g_id: GraphId,
+        p_id: u32,
+        projection: ColumnProjection,
+    ) -> Self {
         let leaves = leaf_entries_for_predicate(store, g_id, RunSortOrder::Psot, p_id);
         Self {
             store,
@@ -804,6 +828,7 @@ impl<'a> PsotSubjectSeek<'a> {
             row: 0,
             handle: None,
             batch: None,
+            projection,
         }
     }
 
@@ -857,7 +882,6 @@ impl<'a> PsotSubjectSeek<'a> {
                 if last.s_id.as_u64() < target_s {
                     continue;
                 }
-                let projection = projection_sid_only();
                 let batch = if let Some(cache) = self.store.leaflet_cache() {
                     let idx_u32: u32 = idx
                         .try_into()
@@ -875,7 +899,7 @@ impl<'a> PsotSubjectSeek<'a> {
                     .map_err(|e| QueryError::Internal(format!("load columns: {e}")))?
                 } else {
                     handle
-                        .load_columns(idx, &projection, RunSortOrder::Psot)
+                        .load_columns(idx, &self.projection, RunSortOrder::Psot)
                         .map_err(|e| QueryError::Internal(format!("load columns: {e}")))?
                 };
                 self.row = 0;
@@ -889,6 +913,30 @@ impl<'a> PsotSubjectSeek<'a> {
     /// Row count for `target_s` (any object datatype), or `None` if the subject is
     /// absent. Targets MUST be non-decreasing across calls.
     pub fn count_for_subject(&mut self, target_s: u64) -> Result<Option<u64>> {
+        self.visit_subject(target_s, |_, _| {})
+    }
+
+    /// Visit each of `target_s`'s rows as `(o_type, o_key)`, returning the row
+    /// count, or `None` if the subject is absent. Requires construction via
+    /// [`Self::new_with_objects`] so the object columns are decoded. Targets
+    /// MUST be non-decreasing across calls.
+    pub fn rows_for_subject(
+        &mut self,
+        target_s: u64,
+        mut on_row: impl FnMut(u16, u64),
+    ) -> Result<Option<u64>> {
+        self.visit_subject(target_s, |batch, row| {
+            on_row(batch.o_type.get(row), batch.o_key.get(row));
+        })
+    }
+
+    /// Shared seek state machine: advance to `target_s`, invoke `on_row` for
+    /// each of its rows, and return the row count (`None` = subject absent).
+    fn visit_subject(
+        &mut self,
+        target_s: u64,
+        mut on_row: impl FnMut(&ColumnBatch, usize),
+    ) -> Result<Option<u64>> {
         let mut found = false;
         let mut count: u64 = 0;
         loop {
@@ -928,8 +976,9 @@ impl<'a> PsotSubjectSeek<'a> {
             } else if batch.s_id.get(self.row) > target_s {
                 return Ok(Some(count));
             }
-            // At target_s: count its rows (the group may span batches).
+            // At target_s: visit its rows (the group may span batches).
             while self.row < batch.row_count && batch.s_id.get(self.row) == target_s {
+                on_row(batch, self.row);
                 count = count
                     .checked_add(1)
                     .ok_or_else(|| QueryError::execution("COUNT(*) overflow in subject seek"))?;
@@ -2049,46 +2098,6 @@ pub fn build_overlay_cursor_for_subject_range(
         }
         cursor.set_epoch(epoch);
     }
-    Some(cursor)
-}
-
-/// Build a PSOT cursor for a single subject's rows under one predicate, with
-/// both `p_id` and `s_id` pinned in the [`BinaryFilter`] so leaflet skipping and
-/// row filtering both engage. This is the per-probe primitive for bounded
-/// subject probing.
-///
-/// HEAD-only: overlay ops are not folded, so callers must be gated on
-/// [`fast_path_store`] (no overlay, `to_t == max_t`). Returns `None` if the
-/// PSOT branch is absent — that means "branch unavailable", never "no rows".
-pub fn build_head_cursor_for_single_subject(
-    store: &Arc<BinaryIndexStore>,
-    g_id: GraphId,
-    p_id: u32,
-    projection: ColumnProjection,
-    s_id: u64,
-    to_t: i64,
-) -> Option<BinaryCursor> {
-    let (mut min_key, mut max_key) = predicate_range_keys(p_id, g_id);
-    min_key.s_id = SubjectId(s_id);
-    // Leave max_key's object/t components at their predicate maxima so the leaf
-    // range covers all of this subject's rows (the filter does exact matching).
-    max_key.s_id = SubjectId(s_id);
-
-    let filter = BinaryFilter {
-        p_id: Some(p_id),
-        s_id: Some(s_id),
-        ..Default::default()
-    };
-    let mut cursor = build_range_cursor(
-        store,
-        g_id,
-        RunSortOrder::Psot,
-        &min_key,
-        &max_key,
-        filter,
-        projection,
-    )?;
-    cursor.set_to_t(to_t);
     Some(cursor)
 }
 

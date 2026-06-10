@@ -9,8 +9,8 @@ use crate::binding::{Batch, Binding};
 use crate::context::ExecutionContext;
 use crate::error::{QueryError, Result};
 use crate::fast_path_common::{
-    allow_cursor_fast_path, build_head_cursor_for_single_subject, build_psot_cursor_for_predicate,
-    cursor_projection_sid_otype_okey, fast_path_store, normalize_pred_sid,
+    allow_cursor_fast_path, build_psot_cursor_for_predicate, cursor_projection_sid_otype_okey,
+    fast_path_store, normalize_pred_sid, PsotSubjectSeek,
 };
 use crate::ir::triple::{Ref, TriplePattern};
 use crate::object_binding::late_materialized_object_binding;
@@ -567,6 +567,8 @@ impl CyclicBgpOperator {
         Ok(Some(rows))
     }
 
+    /// HEAD-only (callers gate on [`fast_path_store`]): the seek reads the
+    /// BASE PSOT index without overlay merge or `to_t` filtering.
     fn scan_relation_for_subjects(
         &self,
         ctx: &ExecutionContext<'_>,
@@ -585,40 +587,27 @@ impl CyclicBgpOperator {
         let mut ordered_subjects: Vec<u64> = subjects.iter().copied().collect();
         ordered_subjects.sort_unstable();
 
+        // One amortized monotonic pass over the predicate's PSOT leaves instead
+        // of a fresh cursor per subject. None means the PSOT branch is
+        // unavailable, never "no rows" — decline rather than dropping rows.
+        let Some(mut seek) = PsotSubjectSeek::new_with_objects(store, ctx.binary_g_id, p_id) else {
+            self.log_fast_path_bail("cursor-unavailable", Some(edge));
+            return Ok(None);
+        };
         let row_cap = max_predicate_rows();
-        let projection = cursor_projection_sid_otype_okey();
-        let mut raw_rows = Vec::new();
+        let mut raw_rows: Vec<RawEdgeRow> = Vec::new();
         for subject in ordered_subjects {
-            let Some(mut cursor) = build_head_cursor_for_single_subject(
-                store,
-                ctx.binary_g_id,
-                p_id,
-                projection,
-                subject,
-                ctx.to_t,
-            ) else {
-                // None means the PSOT branch is unavailable, never "subject has
-                // no rows" — decline the fast path rather than dropping rows.
-                self.log_fast_path_bail("cursor-unavailable", Some(edge));
+            seek.rows_for_subject(subject, |o_type, o_key| {
+                raw_rows.push(RawEdgeRow {
+                    subject,
+                    o_type,
+                    object: o_key,
+                    p_id,
+                });
+            })?;
+            if raw_rows.len() as u64 > row_cap {
+                self.log_fast_path_bail("predicate-row-cap-exceeded", Some(edge));
                 return Ok(None);
-            };
-            while let Some(batch) = cursor
-                .next_batch()
-                .map_err(|e| QueryError::Internal(format!("cyclic bgp bounded cursor: {e}")))?
-            {
-                for row in 0..batch.row_count {
-                    debug_assert_eq!(batch.s_id.get(row), subject);
-                    raw_rows.push(RawEdgeRow {
-                        subject,
-                        o_type: batch.o_type.get(row),
-                        object: batch.o_key.get(row),
-                        p_id,
-                    });
-                    if raw_rows.len() as u64 > row_cap {
-                        self.log_fast_path_bail("predicate-row-cap-exceeded", Some(edge));
-                        return Ok(None);
-                    }
-                }
             }
         }
 
@@ -754,6 +743,8 @@ impl CyclicBgpOperator {
         Some(frontier)
     }
 
+    /// HEAD-only (callers gate on [`fast_path_store`]): the seek reads the
+    /// BASE PSOT index without overlay merge or `to_t` filtering.
     fn scan_ref_relation_for_subjects(
         &self,
         ctx: &ExecutionContext<'_>,
@@ -772,39 +763,34 @@ impl CyclicBgpOperator {
         let mut ordered_subjects: Vec<u64> = subjects.iter().copied().collect();
         ordered_subjects.sort_unstable();
 
+        // One amortized monotonic pass over the predicate's PSOT leaves instead
+        // of a fresh cursor per subject. None means the PSOT branch is
+        // unavailable, never "no rows" — decline rather than dropping rows.
+        let Some(mut seek) = PsotSubjectSeek::new_with_objects(store, ctx.binary_g_id, p_id) else {
+            self.log_fast_path_bail("cursor-unavailable", Some(edge));
+            return Ok(None);
+        };
         let row_cap = max_predicate_rows();
-        let projection = cursor_projection_sid_otype_okey();
         let mut rows = Vec::new();
+        let mut non_ref_object = false;
         for subject in ordered_subjects {
-            let Some(mut cursor) = build_head_cursor_for_single_subject(
-                store,
-                ctx.binary_g_id,
-                p_id,
-                projection,
-                subject,
-                ctx.to_t,
-            ) else {
-                self.log_fast_path_bail("cursor-unavailable", Some(edge));
-                return Ok(None);
-            };
-            while let Some(batch) = cursor
-                .next_batch()
-                .map_err(|e| QueryError::Internal(format!("cyclic bgp bounded ref cursor: {e}")))?
-            {
-                for row in 0..batch.row_count {
-                    if batch.o_type.get(row) != OType::IRI_REF.as_u16() {
-                        self.log_fast_path_bail("non-ref-object-in-ref-mode", Some(edge));
-                        return Ok(None);
-                    }
+            seek.rows_for_subject(subject, |o_type, o_key| {
+                if o_type != OType::IRI_REF.as_u16() {
+                    non_ref_object = true;
+                } else {
                     rows.push(RefEdgeRow {
                         subject,
-                        object: batch.o_key.get(row),
+                        object: o_key,
                     });
-                    if rows.len() as u64 > row_cap {
-                        self.log_fast_path_bail("predicate-row-cap-exceeded", Some(edge));
-                        return Ok(None);
-                    }
                 }
+            })?;
+            if non_ref_object {
+                self.log_fast_path_bail("non-ref-object-in-ref-mode", Some(edge));
+                return Ok(None);
+            }
+            if rows.len() as u64 > row_cap {
+                self.log_fast_path_bail("predicate-row-cap-exceeded", Some(edge));
+                return Ok(None);
             }
         }
         Ok(Some(rows))
@@ -822,6 +808,68 @@ impl CyclicBgpOperator {
         }
     }
 
+    /// Pick the bounded-probe candidate with the smallest frontier among the
+    /// remaining edges, logging every gate decision at debug level.
+    /// `size_bound` / `materialize_frontier` abstract over the ref / encoded
+    /// relation index types.
+    fn select_bounded_probe(
+        &self,
+        remaining: &[usize],
+        size_bound: impl Fn(VarId) -> Option<usize>,
+        materialize_frontier: impl Fn(VarId) -> Option<FxHashSet<u64>>,
+    ) -> Option<(usize, FxHashSet<u64>)> {
+        let mut probe: Option<(usize, FxHashSet<u64>)> = None;
+        for (pos, &edge_idx) in remaining.iter().enumerate() {
+            let edge = &self.plan.edges[edge_idx];
+            // O(1) rejects before materializing any frontier set. The size
+            // bound is an over-estimate of the intersection, so rejecting on
+            // it is conservative (never unsound).
+            let Some(estimate) = edge.estimate else {
+                tracing::debug!(
+                    predicate = ?edge.predicate,
+                    "cyclic probe gate declined: stats-absent predicate (full scan is trivially cheap)"
+                );
+                continue;
+            };
+            let Some(bound) = size_bound(edge.subject) else {
+                tracing::debug!(
+                    predicate = ?edge.predicate,
+                    "cyclic probe gate declined: no scanned relation bounds the subject var"
+                );
+                continue;
+            };
+            if bound > max_bounded_probe_subjects() {
+                tracing::debug!(
+                    predicate = ?edge.predicate,
+                    frontier_bound = bound,
+                    cap = max_bounded_probe_subjects(),
+                    "cyclic probe gate declined: frontier bound over subject cap"
+                );
+                continue;
+            }
+            let Some(frontier) = materialize_frontier(edge.subject) else {
+                continue;
+            };
+            if !should_probe_edge(frontier.len(), Some(estimate)) {
+                tracing::debug!(
+                    predicate = ?edge.predicate,
+                    frontier = frontier.len(),
+                    estimate,
+                    scan_ratio = bounded_probe_scan_ratio(),
+                    "cyclic probe gate declined: probe-vs-scan ratio"
+                );
+                continue;
+            }
+            if probe
+                .as_ref()
+                .is_none_or(|(_, best)| frontier.len() < best.len())
+            {
+                probe = Some((pos, frontier));
+            }
+        }
+        probe
+    }
+
     /// Cascading relation loader shared by both join modes: scan the cheapest
     /// edge first, then at each level either probe a remaining edge per-subject
     /// (when an already-scanned relation bounds its subject var to a small
@@ -831,48 +879,33 @@ impl CyclicBgpOperator {
     fn open_ref_fast_path(&mut self, ctx: &ExecutionContext<'_>) -> Result<bool> {
         // Per-subject probes bypass the overlay, so they're only sound at HEAD.
         let probing_allowed = fast_path_store(ctx).is_some();
+        if !probing_allowed {
+            tracing::debug!("cyclic cascade: bounded probes disabled (off-HEAD or overlay active)");
+        }
         let mut remaining: Vec<usize> = (0..self.plan.edges.len()).collect();
         let mut relations: Vec<RefRelationIndex> = Vec::with_capacity(remaining.len());
         let mut raw_rows = 0usize;
         let mut probed_edges = 0usize;
 
         while !remaining.is_empty() {
-            let mut probe: Option<(usize, FxHashSet<u64>)> = None;
-            if probing_allowed && !relations.is_empty() {
-                for (pos, &edge_idx) in remaining.iter().enumerate() {
-                    let edge = &self.plan.edges[edge_idx];
-                    // O(1) rejects before materializing any frontier set. The
-                    // size bound is an over-estimate of the intersection, so
-                    // rejecting on it is conservative (never unsound).
-                    if edge.estimate.is_none() {
-                        continue;
-                    }
-                    let Some(bound) = Self::ref_frontier_size_bound(&relations, edge.subject)
-                    else {
-                        continue;
-                    };
-                    if bound > max_bounded_probe_subjects() {
-                        continue;
-                    }
-                    let Some(frontier) = Self::ref_frontier_for_var(&relations, edge.subject)
-                    else {
-                        continue;
-                    };
-                    if !should_probe_edge(frontier.len(), edge.estimate) {
-                        continue;
-                    }
-                    if probe
-                        .as_ref()
-                        .is_none_or(|(_, best)| frontier.len() < best.len())
-                    {
-                        probe = Some((pos, frontier));
-                    }
-                }
-            }
+            let probe = if probing_allowed && !relations.is_empty() {
+                self.select_bounded_probe(
+                    &remaining,
+                    |var| Self::ref_frontier_size_bound(&relations, var),
+                    |var| Self::ref_frontier_for_var(&relations, var),
+                )
+            } else {
+                None
+            };
 
             let (pos, rows) = match probe {
                 Some((pos, frontier)) => {
                     let edge = &self.plan.edges[remaining[pos]];
+                    tracing::debug!(
+                        predicate = ?edge.predicate,
+                        frontier = frontier.len(),
+                        "cyclic cascade: probing edge per-subject"
+                    );
                     let rows = if frontier.is_empty() {
                         Vec::new()
                     } else {
@@ -886,11 +919,16 @@ impl CyclicBgpOperator {
                 }
                 None => {
                     let pos = Self::cheapest_remaining(&self.plan.edges, &remaining);
-                    let rows =
-                        match self.scan_ref_relation(ctx, &self.plan.edges[remaining[pos]])? {
-                            Some(rows) => rows,
-                            None => return Ok(false),
-                        };
+                    let edge = &self.plan.edges[remaining[pos]];
+                    tracing::debug!(
+                        predicate = ?edge.predicate,
+                        estimate = edge.estimate.unwrap_or(0),
+                        "cyclic cascade: full-scanning edge"
+                    );
+                    let rows = match self.scan_ref_relation(ctx, edge)? {
+                        Some(rows) => rows,
+                        None => return Ok(false),
+                    };
                     (pos, rows)
                 }
             };
@@ -924,46 +962,33 @@ impl CyclicBgpOperator {
 
     fn open_encoded_fast_path(&mut self, ctx: &ExecutionContext<'_>) -> Result<bool> {
         let probing_allowed = fast_path_store(ctx).is_some();
+        if !probing_allowed {
+            tracing::debug!("cyclic cascade: bounded probes disabled (off-HEAD or overlay active)");
+        }
         let mut remaining: Vec<usize> = (0..self.plan.edges.len()).collect();
         let mut relations: Vec<RelationIndex> = Vec::with_capacity(remaining.len());
         let mut raw_rows = 0usize;
         let mut probed_edges = 0usize;
 
         while !remaining.is_empty() {
-            let mut probe: Option<(usize, FxHashSet<u64>)> = None;
-            if probing_allowed && !relations.is_empty() {
-                for (pos, &edge_idx) in remaining.iter().enumerate() {
-                    let edge = &self.plan.edges[edge_idx];
-                    // O(1) rejects before materializing any frontier set (the
-                    // size bound over-estimates the intersection, so this is
-                    // conservative).
-                    if edge.estimate.is_none() {
-                        continue;
-                    }
-                    let Some(bound) = Self::frontier_size_bound(&relations, edge.subject) else {
-                        continue;
-                    };
-                    if bound > max_bounded_probe_subjects() {
-                        continue;
-                    }
-                    let Some(frontier) = self.frontier_for_var(&relations, edge.subject) else {
-                        continue;
-                    };
-                    if !should_probe_edge(frontier.len(), edge.estimate) {
-                        continue;
-                    }
-                    if probe
-                        .as_ref()
-                        .is_none_or(|(_, best)| frontier.len() < best.len())
-                    {
-                        probe = Some((pos, frontier));
-                    }
-                }
-            }
+            let probe = if probing_allowed && !relations.is_empty() {
+                self.select_bounded_probe(
+                    &remaining,
+                    |var| Self::frontier_size_bound(&relations, var),
+                    |var| self.frontier_for_var(&relations, var),
+                )
+            } else {
+                None
+            };
 
             let (pos, rows) = match probe {
                 Some((pos, frontier)) => {
                     let edge = &self.plan.edges[remaining[pos]];
+                    tracing::debug!(
+                        predicate = ?edge.predicate,
+                        frontier = frontier.len(),
+                        "cyclic cascade: probing edge per-subject"
+                    );
                     let rows = if frontier.is_empty() {
                         Vec::new()
                     } else {
@@ -977,7 +1002,13 @@ impl CyclicBgpOperator {
                 }
                 None => {
                     let pos = Self::cheapest_remaining(&self.plan.edges, &remaining);
-                    let rows = match self.scan_relation(ctx, &self.plan.edges[remaining[pos]])? {
+                    let edge = &self.plan.edges[remaining[pos]];
+                    tracing::debug!(
+                        predicate = ?edge.predicate,
+                        estimate = edge.estimate.unwrap_or(0),
+                        "cyclic cascade: full-scanning edge"
+                    );
+                    let rows = match self.scan_relation(ctx, edge)? {
                         Some(rows) => rows,
                         None => return Ok(false),
                     };
