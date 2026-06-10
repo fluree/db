@@ -234,10 +234,16 @@ impl HashJoinDecision {
 /// `property_stats` fallback so the cost model sees the same numbers reorder did.
 fn predicate_count(stats: &StatsView, pred: &crate::ir::triple::Ref) -> Option<u64> {
     if let Some(sid) = pred.as_sid() {
-        return stats.get_property(sid).map(|p| p.count);
+        return stats
+            .get_property(sid)
+            .map(|p| p.count)
+            .or_else(|| stats.has_property_stats().then_some(0));
     }
     if let Some(iri) = pred.as_iri() {
-        return stats.get_property_by_iri(iri).map(|p| p.count);
+        return stats
+            .get_property_by_iri(iri)
+            .map(|p| p.count)
+            .or_else(|| stats.has_property_stats().then_some(0));
     }
     None
 }

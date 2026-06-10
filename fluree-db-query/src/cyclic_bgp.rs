@@ -9,8 +9,8 @@ use crate::binding::{Batch, Binding};
 use crate::context::ExecutionContext;
 use crate::error::{QueryError, Result};
 use crate::fast_path_common::{
-    allow_cursor_fast_path, build_psot_cursor_for_predicate, cursor_projection_sid_otype_okey,
-    normalize_pred_sid,
+    allow_cursor_fast_path, build_overlay_cursor_for_subject_range,
+    build_psot_cursor_for_predicate, cursor_projection_sid_otype_okey, normalize_pred_sid,
 };
 use crate::ir::triple::{Ref, TriplePattern};
 use crate::object_binding::late_materialized_object_binding;
@@ -20,7 +20,7 @@ use crate::temporal_mode::TemporalMode;
 use crate::var_registry::VarId;
 use async_trait::async_trait;
 use fluree_db_core::o_type::OType;
-use fluree_db_core::{PropertyStatData, StatsView};
+use fluree_db_core::{OverlayProvider, PropertyStatData, StatsView};
 use rustc_hash::{FxHashMap, FxHashSet};
 use std::collections::{HashSet, VecDeque};
 use std::sync::Arc;
@@ -28,6 +28,7 @@ use std::sync::Arc;
 const OUTPUT_BATCH_SIZE: usize = 1024;
 const DEFAULT_MAX_PREDICATE_ROWS: u64 = 10_000_000;
 const DEFAULT_MAX_SQUARE_WEDGE_PAIRS: usize = 5_000_000;
+const DEFAULT_MAX_BOUNDED_TRIANGLE_SUBJECTS: usize = 100_000;
 
 fn cyclic_bgp_enabled() -> bool {
     !matches!(
@@ -48,6 +49,13 @@ fn max_square_wedge_pairs() -> usize {
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(DEFAULT_MAX_SQUARE_WEDGE_PAIRS)
+}
+
+fn max_bounded_triangle_subjects() -> usize {
+    std::env::var("FLUREE_CYCLIC_BGP_MAX_BOUNDED_SUBJECTS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(DEFAULT_MAX_BOUNDED_TRIANGLE_SUBJECTS)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -338,6 +346,7 @@ pub(crate) struct CyclicBgpOperator {
     ref_pending: VecDeque<Vec<u64>>,
     pending: VecDeque<Vec<Binding>>,
     square_wedge: Option<EncodedSquareWedgeState>,
+    bounded_triangle: bool,
     used_fast_path: bool,
     raw_relation_rows: usize,
     pruned_relation_rows: usize,
@@ -395,6 +404,7 @@ impl CyclicBgpOperator {
             ref_pending: VecDeque::new(),
             pending: VecDeque::new(),
             square_wedge: None,
+            bounded_triangle: false,
             used_fast_path: false,
             raw_relation_rows: 0,
             pruned_relation_rows: 0,
@@ -537,6 +547,164 @@ impl CyclicBgpOperator {
         Ok(Some(rows))
     }
 
+    fn scan_relation_for_subjects(
+        &self,
+        ctx: &ExecutionContext<'_>,
+        edge: &CyclicEdge,
+        subjects: &FxHashSet<u64>,
+    ) -> Result<Option<Vec<EdgeRow>>> {
+        let Some(store) = ctx.binary_store.as_ref() else {
+            self.log_fast_path_bail("missing-binary-store", Some(edge));
+            return Ok(None);
+        };
+        let pred_sid = normalize_pred_sid(store, &edge.predicate)?;
+        let Some(p_id) = store.sid_to_p_id(&pred_sid) else {
+            return Ok(Some(Vec::new()));
+        };
+
+        let mut ordered_subjects: Vec<u64> = subjects.iter().copied().collect();
+        ordered_subjects.sort_unstable();
+        ordered_subjects.dedup();
+
+        let row_cap = max_predicate_rows();
+        let projection = cursor_projection_sid_otype_okey();
+        let mut raw_rows = Vec::new();
+        for subject in ordered_subjects {
+            let Some(hi) = subject.checked_add(1) else {
+                continue;
+            };
+            let Some(mut cursor) = build_overlay_cursor_for_subject_range(
+                store,
+                ctx.binary_g_id,
+                p_id,
+                projection,
+                subject,
+                hi,
+                Vec::new(),
+                ctx.to_t,
+                0,
+            ) else {
+                continue;
+            };
+            while let Some(batch) = cursor
+                .next_batch()
+                .map_err(|e| QueryError::Internal(format!("cyclic bgp bounded cursor: {e}")))?
+            {
+                for row in 0..batch.row_count {
+                    if batch.s_id.get(row) != subject || batch.p_id.get(row) != p_id {
+                        continue;
+                    }
+                    raw_rows.push(RawEdgeRow {
+                        subject: batch.s_id.get(row),
+                        o_type: batch.o_type.get(row),
+                        object: batch.o_key.get(row),
+                        p_id,
+                    });
+                    if raw_rows.len() as u64 > row_cap {
+                        self.log_fast_path_bail("predicate-row-cap-exceeded", Some(edge));
+                        return Ok(None);
+                    }
+                }
+            }
+        }
+
+        let mut rows = Vec::with_capacity(raw_rows.len());
+        for raw in raw_rows {
+            let Some(object) = self.object_binding_for_edge(edge, raw) else {
+                self.log_fast_path_bail("unsupported-object-binding", Some(edge));
+                return Ok(None);
+            };
+            rows.push(EdgeRow {
+                subject: raw.subject,
+                object,
+            });
+        }
+        Ok(Some(rows))
+    }
+
+    fn bound_subjects_from_relation(
+        &self,
+        rel: &RelationIndex,
+        var: VarId,
+    ) -> Option<FxHashSet<u64>> {
+        if rel.edge.subject == var {
+            return Some(rel.by_subject.keys().copied().collect());
+        }
+        if rel.edge.object != var {
+            return None;
+        }
+
+        let mut subjects = FxHashSet::default();
+        for object in rel.by_object.keys() {
+            let Binding::EncodedSid { s_id, .. } = object else {
+                return None;
+            };
+            subjects.insert(*s_id);
+        }
+        Some(subjects)
+    }
+
+    fn open_encoded_bounded_triangle(
+        &self,
+        ctx: &ExecutionContext<'_>,
+    ) -> Result<Option<(Vec<RelationIndex>, usize)>> {
+        if self.plan.shape != CyclicBgpShape::Triangle {
+            return Ok(None);
+        }
+
+        let Some(store) = ctx.binary_store.as_ref() else {
+            self.log_fast_path_bail("missing-binary-store", None);
+            return Ok(None);
+        };
+        let overlay_epoch = ctx.overlay.map(OverlayProvider::epoch).unwrap_or(0);
+        if overlay_epoch != 0 || ctx.to_t != store.max_t() {
+            return Ok(None);
+        }
+
+        let Some((seed_idx, seed_edge)) = self
+            .plan
+            .edges
+            .iter()
+            .enumerate()
+            .min_by_key(|(_, edge)| edge.estimate.unwrap_or(u64::MAX))
+        else {
+            return Ok(None);
+        };
+
+        let Some(seed_rows) = self.scan_relation(ctx, seed_edge)? else {
+            return Ok(None);
+        };
+        let seed_len = seed_rows.len();
+        let seed_rel = RelationIndex::new(seed_edge.clone(), seed_rows);
+        if seed_rel.rows.is_empty() {
+            return Ok(Some((vec![seed_rel], seed_len)));
+        }
+
+        let mut relations = Vec::with_capacity(self.plan.edges.len());
+        relations.push(seed_rel);
+        let mut raw_rows = seed_len;
+        let subject_cap = max_bounded_triangle_subjects();
+        for (idx, edge) in self.plan.edges.iter().enumerate() {
+            if idx == seed_idx {
+                continue;
+            }
+            let Some(subjects) = self.bound_subjects_from_relation(&relations[0], edge.subject)
+            else {
+                return Ok(None);
+            };
+            if subjects.len() > subject_cap {
+                return Ok(None);
+            }
+            let Some(rows) = self.scan_relation_for_subjects(ctx, edge, &subjects)? else {
+                return Ok(None);
+            };
+            raw_rows += rows.len();
+            relations.push(RelationIndex::new(edge.clone(), rows));
+        }
+
+        Ok(Some((relations, raw_rows)))
+    }
+
     fn open_fast_path(&mut self, ctx: &ExecutionContext<'_>) -> Result<bool> {
         if self.mode.is_history() || !allow_cursor_fast_path(ctx) {
             self.log_fast_path_bail("runtime-mode-or-context-unsupported", None);
@@ -578,6 +746,18 @@ impl CyclicBgpOperator {
     }
 
     fn open_encoded_fast_path(&mut self, ctx: &ExecutionContext<'_>) -> Result<bool> {
+        if let Some((mut relations, raw_rows)) = self.open_encoded_bounded_triangle(ctx)? {
+            relations = self.prune_relations(relations);
+            self.raw_relation_rows = raw_rows;
+            self.pruned_relation_rows = relations.iter().map(|rel| rel.rows.len()).sum();
+            self.square_wedge = None;
+            self.bounded_triangle = true;
+            self.driver_idx = self.choose_driver(&relations);
+            self.relations = relations;
+            self.used_fast_path = true;
+            return Ok(true);
+        }
+
         let mut relations = Vec::with_capacity(self.plan.edges.len());
         let mut raw_rows = 0usize;
         for edge in self.plan.edges.iter() {
@@ -600,6 +780,7 @@ impl CyclicBgpOperator {
         self.raw_relation_rows = raw_rows;
         self.pruned_relation_rows = relations.iter().map(|rel| rel.rows.len()).sum();
         self.square_wedge = self.open_encoded_square_wedge(&relations);
+        self.bounded_triangle = false;
         self.driver_idx = self.choose_driver(&relations);
         self.relations = relations;
         self.used_fast_path = true;
@@ -1555,6 +1736,13 @@ impl Operator for CyclicBgpOperator {
                 max_square_wedge_pairs().into(),
             );
         }
+        if self.bounded_triangle {
+            m.insert("triangle-strategy".into(), "seeded_subject_probe".into());
+            m.insert(
+                "triangle-bounded-subject-cap".into(),
+                max_bounded_triangle_subjects().into(),
+            );
+        }
         if self.raw_relation_rows > 0 {
             m.insert("raw-relation-rows".into(), self.raw_relation_rows.into());
             m.insert(
@@ -1639,6 +1827,7 @@ impl Operator for CyclicBgpOperator {
         self.ref_pending.clear();
         self.pending.clear();
         self.square_wedge = None;
+        self.bounded_triangle = false;
         self.state = OperatorState::Closed;
     }
 }

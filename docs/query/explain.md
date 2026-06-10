@@ -280,6 +280,11 @@ would otherwise be planned as left-deep nested-loop joins. Its `details` include
 - `square-build-pairs` / `square-probe-pairs`: exact wedge pair counts for the
   chosen square decomposition, present after the fast path has opened
 - `square-wedge-pair-cap`: the hard cap for materializing the build wedge
+- `triangle-strategy`: `seeded_subject_probe` when an encoded triangle scanned
+  the smallest edge first, then used bounded PSOT subject-range probes for the
+  remaining edges instead of full predicate scans
+- `triangle-bounded-subject-cap`: the maximum number of seed-derived subjects
+  allowed per bounded triangle probe edge
 - `raw-relation-rows` / `pruned-relation-rows`: runtime row totals, present when
   a plan is described after the fast path has opened
 
@@ -287,9 +292,12 @@ Set `FLUREE_CYCLIC_BGP=0` (or `false`) to disable this operator for A/B
 testing. `FLUREE_CYCLIC_BGP_MAX_ROWS` can lower or raise the per-predicate row
 cap. `FLUREE_CYCLIC_BGP_MAX_WEDGE_PAIRS` controls the encoded-square build-side
 wedge cap (default 5,000,000 pairs); when both exact wedge decompositions exceed
-the cap, the operator falls back to the regular cyclic enumerator. The node
-exposes the old nested-loop plan as a `fallback` child; the fallback runs when
-the runtime mode is unsupported by the fast path.
+the cap, the operator falls back to the regular cyclic enumerator.
+`FLUREE_CYCLIC_BGP_MAX_BOUNDED_SUBJECTS` controls the encoded-triangle bounded
+subject cap (default 100,000 seed-derived subjects); when a triangle orientation
+is unsupported or the cap is exceeded, the regular cyclic enumerator remains in
+use. The node exposes the old nested-loop plan as a `fallback` child; the
+fallback runs when the runtime mode is unsupported by the fast path.
 
 The edge `rel` distinguishes a real input from an alternative:
 
