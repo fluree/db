@@ -664,9 +664,13 @@ impl NameService for FileNameService {
             Err(e) => return Err(NameServiceError::storage(e.to_string())),
         };
 
-        // Dedup by t (last-wins) since appends are idempotent; keep t > since_t.
-        let mut by_t: std::collections::BTreeMap<i64, ContentId> =
-            std::collections::BTreeMap::new();
+        // Dedup by (t, cid) pair since appends are idempotent, but preserve
+        // distinct commits that share the same t (possible in merge DAGs where
+        // two branches independently increment t from the same base). Keying
+        // on t alone would silently drop one of them, letting an incomplete
+        // pending list pass the coverage check in the indexer.
+        let mut seen: std::collections::HashSet<(i64, String)> = std::collections::HashSet::new();
+        let mut out: Vec<(i64, ContentId)> = Vec::new();
         for line in content.lines() {
             let line = line.trim();
             if line.is_empty() {
@@ -684,10 +688,13 @@ impl NameService for FileNameService {
             let Ok(cid) = entry.cid.parse::<ContentId>() else {
                 return Ok(None);
             };
-            by_t.insert(entry.t, cid);
+            if seen.insert((entry.t, entry.cid)) {
+                out.push((entry.t, cid));
+            }
         }
+        out.sort_by_key(|(t, _)| *t);
 
-        Ok(Some(by_t.into_iter().collect()))
+        Ok(Some(out))
     }
 
     async fn prune_commit_index(&self, ledger_id: &str, up_to_t: i64) -> Result<()> {

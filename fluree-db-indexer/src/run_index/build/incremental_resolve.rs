@@ -352,16 +352,7 @@ pub async fn resolve_incremental_commits_v6(
     // contains any vector op before deciding to pay that cost.
     let (walked_commits, t_walk_chain_ms) = {
         let t0 = Instant::now();
-        let commits = walk_commit_chain_since(
-            cs.as_ref(),
-            &config.head_commit_id,
-            config.from_t,
-            config.max_commit_bytes,
-            config.artifact_cache_dir.as_deref(),
-            config.pending_commit_cids.as_deref(),
-            config.commit_fetch_concurrency,
-        )
-        .await?;
+        let commits = walk_commit_chain_since(cs.as_ref(), &config).await?;
         (commits, t0.elapsed().as_millis() as u64)
     };
 
@@ -930,16 +921,16 @@ fn pending_covers_range(pending: &[(i64, ContentId)], from_t: i64, head_id: &Con
         .all(|(expected, (t, _))| *t == expected)
 }
 
-#[allow(clippy::too_many_arguments)]
 async fn walk_commit_chain_since(
     cs: &dyn ContentStore,
-    head_id: &ContentId,
-    from_t: i64,
-    max_commit_bytes: Option<usize>,
-    cache_dir: Option<&Path>,
-    pending_commit_cids: Option<&[(i64, ContentId)]>,
-    fetch_concurrency: usize,
+    config: &IncrementalResolveConfig,
 ) -> Result<Vec<WalkedCommit>, IncrementalResolveError> {
+    let head_id = &config.head_commit_id;
+    let from_t = config.from_t;
+    let max_commit_bytes = config.max_commit_bytes;
+    let cache_dir = config.artifact_cache_dir.as_deref();
+    let pending_commit_cids = config.pending_commit_cids.as_deref();
+    let fetch_concurrency = config.commit_fetch_concurrency;
     let walk_started = Instant::now();
 
     // Fast path: the nameservice commit-CID index already told us the chain.

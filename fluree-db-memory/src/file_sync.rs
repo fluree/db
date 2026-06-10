@@ -9,7 +9,7 @@ use crate::store::MemoryStore;
 use crate::turtle_io;
 use sha2::{Digest, Sha256};
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use tracing::debug;
 
 /// Schema version salt included in the build hash.
@@ -131,19 +131,10 @@ pub async fn ensure_synced(store: &MemoryStore, memory_dir: &Path) -> Result<()>
         return Ok(());
     }
 
-    // Acquire exclusive lock
-    let lock_path = memory_dir.join(".local").join("rebuild.lock");
-    fs::create_dir_all(lock_path.parent().unwrap())?;
-    let lock_file = fs::OpenOptions::new()
-        .create(true)
-        .write(true)
-        .truncate(true)
-        .open(&lock_path)?;
-
-    use fs2::FileExt;
-    lock_file
-        .lock_exclusive()
-        .map_err(|e| MemoryError::FileSync(format!("failed to acquire rebuild lock: {e}")))?;
+    // Acquire the same exclusive lock used by file-backed mutations. `flock`
+    // can block indefinitely behind another process, so run it on Tokio's
+    // blocking pool rather than occupying an async worker thread.
+    let rebuild_lock = acquire_memory_lock(memory_dir).await?;
 
     // Re-check after acquiring lock (another process may have rebuilt)
     if !needs_rebuild(store, memory_dir).await? {
@@ -155,8 +146,40 @@ pub async fn ensure_synced(store: &MemoryStore, memory_dir: &Path) -> Result<()>
     debug!("Rebuilding memory ledger from files");
     let result = rebuild_from_files(store, memory_dir).await;
 
-    // Lock auto-released when lock_file is dropped
+    // Release the cross-process rebuild lock before returning.
+    drop(rebuild_lock);
     result
+}
+
+/// Acquire the process-crossing lock for file-backed memory cache updates.
+///
+/// The returned file handle is the lock guard; dropping it releases the lock.
+/// Callers may hold it across awaits because waiting for the OS lock itself is
+/// offloaded to Tokio's blocking pool.
+pub(crate) async fn acquire_memory_lock(memory_dir: &Path) -> Result<fs::File> {
+    acquire_lock_file(memory_dir.join(".local").join("rebuild.lock")).await
+}
+
+async fn acquire_lock_file(lock_path: PathBuf) -> Result<fs::File> {
+    tokio::task::spawn_blocking(move || {
+        if let Some(parent) = lock_path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        let lock_file = fs::OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .truncate(false)
+            .open(&lock_path)?;
+
+        use fs2::FileExt;
+        lock_file
+            .lock_exclusive()
+            .map_err(|e| MemoryError::FileSync(format!("failed to acquire rebuild lock: {e}")))?;
+        Ok(lock_file)
+    })
+    .await
+    .map_err(|e| MemoryError::FileSync(format!("failed to join rebuild lock task: {e}")))?
 }
 
 // ---------------------------------------------------------------------------
@@ -199,7 +222,7 @@ async fn rebuild_from_files(store: &MemoryStore, memory_dir: &Path) -> Result<()
     };
 
     // Phase 2: Drop + reinit
-    store.drop_and_reinit().await?;
+    store.drop_and_reinit_unlocked().await?;
 
     // Phase 3: Batch transact
     if let Some(repo_data) = repo_jsonld {
