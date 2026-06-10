@@ -66,14 +66,24 @@ pub use same_as::{FrozenSameAs, SameAsTracker};
 
 use fluree_db_core::GraphDbRef;
 use std::sync::Arc;
-pub use types::{ChainElement, PropertyChain, PropertyExpression, ReasoningModes};
+pub use types::{ChainElement, PropertyChain, PropertyExpression};
 
 /// Options for OWL2-RL reasoning
 #[derive(Clone, Debug, Default)]
 pub struct ReasoningOptions {
     /// Budget constraints for materialization
     pub budget: ReasoningBudget,
-    /// Which RL rules to enable (empty = all)
+    /// Which RL rules to enable (empty = all).
+    ///
+    /// Names are the W3C OWL2-RL rule identifiers used in
+    /// [`ReasoningDiagnostics::rules_fired`]: `prp-symp`, `prp-trp`, `prp-inv`,
+    /// `prp-dom`, `prp-rng`, `prp-spo1`, `prp-spo2`, `prp-fp`, `prp-ifp`,
+    /// `prp-key`, `cax-sco`, `cax-eqc`, `cls-hv1`, `cls-hv2`, `cls-svf1`,
+    /// `cls-avf`, `cls-int1`, `cls-int2`, `cls-uni`, `cls-oo`, `cls-maxc2`,
+    /// `cls-maxqc`.
+    ///
+    /// `owl:sameAs` equality processing (`eq-*`) is canonicalization
+    /// infrastructure and always runs.
     pub enabled_rules: Vec<String>,
 }
 
@@ -89,6 +99,13 @@ impl ReasoningOptions {
             budget,
             enabled_rules: Vec::new(),
         }
+    }
+
+    /// Whether a rule (by W3C OWL2-RL identifier) should run.
+    ///
+    /// An empty `enabled_rules` list enables every rule.
+    pub fn rule_enabled(&self, name: &str) -> bool {
+        self.enabled_rules.is_empty() || self.enabled_rules.iter().any(|r| r == name)
     }
 
     /// Compute a hash for cache key purposes
@@ -138,7 +155,6 @@ pub async fn reason_owl2rl(
         to_t: db.t,
         overlay_epoch: db.overlay.epoch(),
         ontology_epoch,
-        reasoning_modes: ReasoningModes::default(),
         rule_config_hash: opts.config_hash(),
     };
 
@@ -148,7 +164,7 @@ pub async fn reason_owl2rl(
     }
 
     // Run fixpoint reasoning
-    let (derived_flakes, same_as, diagnostics) = fixpoint::run_fixpoint(db, &opts.budget).await?;
+    let (derived_flakes, same_as, diagnostics) = fixpoint::run_fixpoint(db, opts).await?;
 
     // Build the derived facts overlay
     let mut builder = DerivedFactsBuilder::with_capacity(derived_flakes.len());

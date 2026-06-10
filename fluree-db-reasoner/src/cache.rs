@@ -12,7 +12,6 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use crate::overlay::DerivedFactsOverlay;
-use crate::types::ReasoningModes;
 
 /// Cache key for derived facts
 ///
@@ -30,8 +29,6 @@ pub struct ReasoningCacheKey {
     pub overlay_epoch: u64,
     /// Schema version that affects rules
     pub ontology_epoch: u64,
-    /// Which reasoning modes are enabled (rdfs, owl2ql, owl2rl, etc.)
-    pub reasoning_modes: ReasoningModes,
     /// Hash of rule-specific options
     ///
     /// INCLUDE: enabled RL rule subset, budgets (max_duration, max_facts, max_memory),
@@ -47,12 +44,6 @@ impl Hash for ReasoningCacheKey {
         self.to_t.hash(state);
         self.overlay_epoch.hash(state);
         self.ontology_epoch.hash(state);
-        // ReasoningModes fields
-        self.reasoning_modes.rdfs.hash(state);
-        self.reasoning_modes.owl2ql.hash(state);
-        self.reasoning_modes.datalog.hash(state);
-        self.reasoning_modes.owl2rl.hash(state);
-        self.reasoning_modes.explicit_none.hash(state);
         self.rule_config_hash.hash(state);
     }
 }
@@ -64,11 +55,6 @@ impl PartialEq for ReasoningCacheKey {
             && self.to_t == other.to_t
             && self.overlay_epoch == other.overlay_epoch
             && self.ontology_epoch == other.ontology_epoch
-            && self.reasoning_modes.rdfs == other.reasoning_modes.rdfs
-            && self.reasoning_modes.owl2ql == other.reasoning_modes.owl2ql
-            && self.reasoning_modes.datalog == other.reasoning_modes.datalog
-            && self.reasoning_modes.owl2rl == other.reasoning_modes.owl2rl
-            && self.reasoning_modes.explicit_none == other.reasoning_modes.explicit_none
             && self.rule_config_hash == other.rule_config_hash
     }
 }
@@ -286,7 +272,6 @@ mod tests {
             to_t: 0,
             overlay_epoch: 0,
             ontology_epoch: 0,
-            reasoning_modes: ReasoningModes::default(),
             rule_config_hash: 0,
         }
     }
