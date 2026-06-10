@@ -1,0 +1,428 @@
+//! In-process transaction throughput / commit-cost-vs-novelty profiler.
+//!
+//! Built to test one hypothesis: the per-commit cost of the write pipeline is
+//! dominated not by the size of the transaction but by the size of the
+//! *accumulated novelty* it is folded into. Two confirmed-real hot spots make
+//! that prediction (every commit, before publishing any index):
+//!   - `Novelty::merge_batch_into_index` rebuilds all four full novelty index
+//!     vectors — O(N) in total novelty, scaling with time-since-reindex; and
+//!   - the commit path deep-clones the entire growing novelty arena
+//!     (`Arc::make_mut`) before appending one batch.
+//! If that is right, per-commit latency rises ~linearly with novelty size and
+//! a flamegraph of a high-novelty commit is dominated by the merge + the clone.
+//!
+//! This harness drives the in-process `Fluree` API directly (no HTTP, no
+//! client, single-threaded by default) so a flamegraph attributes time cleanly
+//! to stage/commit/novelty rather than to tokio scheduling or HTTP framing.
+//!
+//! Auto-indexing is DISABLED (`FlureeBuilder::without_indexing`), so novelty
+//! grows monotonically and never drains underneath the measurement — the clean
+//! curve we want. There is no hard novelty ceiling on the in-process commit
+//! path, so the harness itself bounds the run; keep `GROW_COMMITS *
+//! GROW_NODES_PER_COMMIT` within the box's RAM (peak is ~2x novelty during the
+//! arena clone).
+//!
+//! ## Modes — `GROW_MODE` (default `grow`)
+//! - `grow`    — from an empty ledger, commit `GROW_COMMITS` times, threading
+//!               the ledger forward so novelty accumulates. Emits a per-commit
+//!               CSV (latency vs novelty). THIS IS THE COST-CURVE INSTRUMENT.
+//! - `prepare` — build a persistent ledger at `$GROW_DB_DIR` with `GROW_COMMITS`
+//!               commits of novelty, then exit. Not profiled. Run once.
+//! - `steady`  — open `$GROW_DB_DIR` (reload replays novelty to its prepared
+//!               size), then commit `GROW_STEADY_COMMITS` more times, timed, at
+//!               that constant high-novelty level. THIS IS THE FLAMEGRAPH
+//!               TARGET: profile this mode to see one high-novelty commit's cost
+//!               without the cheap early commits diluting the samples.
+//! - `all`     — `grow` into a tempdir; quick local sanity check.
+//!
+//! ## Config (env vars)
+//! | Var | Default | Meaning |
+//! |---|---|---|
+//! | `GROW_MODE` | `grow` | `grow` \| `prepare` \| `steady` \| `all` |
+//! | `GROW_DB_DIR` | (required for prepare/steady) | persistent storage dir |
+//! | `GROW_LEDGER` | `growth/bench:main` | ledger alias |
+//! | `GROW_COMMITS` | `20000` | commits in grow/prepare |
+//! | `GROW_NODES_PER_COMMIT` | `10` | nodes per commit (~8 flakes/node) |
+//! | `GROW_STEADY_COMMITS` | `2000` | timed commits in steady mode |
+//! | `GROW_WARMUP` | `50` | untimed warmup commits in steady mode |
+//! | `GROW_SAMPLE_EVERY` | `1` | record every Nth commit to the CSV |
+//! | `GROW_REINDEX_EVERY` | `0` | grow mode: reindex every K commits (0 = never) |
+//! | `GROW_CSV` | `target/transact-growth.csv` | per-commit CSV output path |
+//!
+//! ## Run
+//! ```bash
+//! # cost curve (writes target/transact-growth.csv):
+//! GROW_MODE=grow GROW_COMMITS=20000 cargo run --release \
+//!   --example transact_growth_profile -p fluree-db-api
+//!
+//! # flamegraph the high-novelty commit (see benchmarks/transact-growth/):
+//! GROW_DB_DIR=/dev/shm/growth GROW_COMMITS=20000 \
+//!   cargo run --release --example transact_growth_profile -p fluree-db-api  # prepare
+//! GROW_MODE=steady GROW_DB_DIR=/dev/shm/growth bash benchmarks/transact-growth/grow-flamegraph.sh
+//! ```
+
+use std::time::Instant;
+
+use fluree_db_api::{Fluree, FlureeBuilder, ReindexOptions};
+use fluree_db_ledger::LedgerState;
+use serde_json::Value as JsonValue;
+
+use fluree_bench_support::gen::people::{generate_txn_data, txn_data_to_jsonld};
+
+fn env_str(key: &str, default: &str) -> String {
+    std::env::var(key).unwrap_or_else(|_| default.to_string())
+}
+
+fn env_usize(key: &str, default: usize) -> usize {
+    std::env::var(key)
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(default)
+}
+
+/// Resident set size in KiB (Linux only; 0 elsewhere). Cheap enough to sample
+/// per commit, but we still only read it on recorded rows.
+fn rss_kb() -> u64 {
+    #[cfg(target_os = "linux")]
+    {
+        if let Ok(s) = std::fs::read_to_string("/proc/self/status") {
+            for line in s.lines() {
+                if let Some(rest) = line.strip_prefix("VmRSS:") {
+                    return rest
+                        .split_whitespace()
+                        .next()
+                        .and_then(|v| v.parse().ok())
+                        .unwrap_or(0);
+                }
+            }
+        }
+        0
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        0
+    }
+}
+
+/// One commit: insert a pre-built transaction. The JSON is generated by the
+/// caller OUTSIDE the timed region so only the commit (stage + commit + novelty
+/// apply) is measured, never benchmark input construction.
+async fn one_commit(
+    fluree: &Fluree,
+    ledger: LedgerState,
+    json: &JsonValue,
+) -> (LedgerState, usize) {
+    let res = fluree.insert(ledger, json).await.expect("insert commit");
+    (res.ledger, res.receipt.flake_count)
+}
+
+struct Row {
+    idx: usize,
+    t: i64,
+    commit_flakes: usize,
+    novelty_flakes: usize,
+    novelty_bytes: usize,
+    elapsed_us: u128,
+    rss_kb: u64,
+}
+
+fn write_csv(path: &str, rows: &[Row]) {
+    use std::fmt::Write as _;
+    let mut out = String::with_capacity(rows.len() * 48 + 64);
+    out.push_str("commit_idx,t,commit_flakes,novelty_flakes,novelty_bytes,elapsed_us,rss_kb\n");
+    for r in rows {
+        let _ = writeln!(
+            out,
+            "{},{},{},{},{},{},{}",
+            r.idx, r.t, r.commit_flakes, r.novelty_flakes, r.novelty_bytes, r.elapsed_us, r.rss_kb
+        );
+    }
+    if let Some(parent) = std::path::Path::new(path).parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    std::fs::write(path, out).expect("write csv");
+    eprintln!("[csv] wrote {} rows -> {path}", rows.len());
+}
+
+fn summarize(rows: &[Row]) {
+    if rows.is_empty() {
+        return;
+    }
+    let mut us: Vec<u128> = rows.iter().map(|r| r.elapsed_us).collect();
+    us.sort_unstable();
+    let pct = |p: f64| us[((us.len() as f64 * p) as usize).min(us.len() - 1)];
+    let total_us: u128 = us.iter().sum();
+    let total_flakes: usize = rows.iter().map(|r| r.commit_flakes).sum();
+    let n = rows.len() as u128;
+    let first = rows.first().unwrap();
+    let last = rows.last().unwrap();
+    eprintln!("\n================ transact-growth summary ================");
+    eprintln!("commits recorded : {}", rows.len());
+    eprintln!(
+        "final novelty    : {} flakes / {:.1} MiB",
+        last.novelty_flakes,
+        last.novelty_bytes as f64 / (1024.0 * 1024.0)
+    );
+    eprintln!("latency  mean    : {} us", total_us / n);
+    eprintln!(
+        "latency  p50/p95/p99 : {} / {} / {} us",
+        pct(0.50),
+        pct(0.95),
+        pct(0.99)
+    );
+    eprintln!("first-commit us  : {}", first.elapsed_us);
+    eprintln!(
+        "last-commit  us  : {}  ({:.1}x first)",
+        last.elapsed_us,
+        last.elapsed_us as f64 / first.elapsed_us.max(1) as f64
+    );
+    eprintln!(
+        "throughput       : {:.0} commits/s, {:.0} flakes/s (timed region)",
+        n as f64 * 1_000_000.0 / total_us as f64,
+        total_flakes as f64 * 1_000_000.0 / total_us as f64
+    );
+    if last.rss_kb > 0 {
+        eprintln!("RSS final        : {:.1} MiB", last.rss_kb as f64 / 1024.0);
+    }
+    eprintln!("========================================================");
+    eprintln!("(slope of elapsed_us vs novelty_bytes is the O(N)-per-commit signal; see analyze-growth.py)");
+}
+
+/// `grow` / `all`: from empty, commit `commits` times threading the ledger so
+/// novelty accumulates. Records the per-commit cost curve.
+async fn grow(
+    fluree: &Fluree,
+    ledger_id: &str,
+    commits: usize,
+    npc: usize,
+    sample_every: usize,
+    reindex_every: usize,
+) -> Vec<Row> {
+    let mut ledger = fluree
+        .create_ledger(ledger_id)
+        .await
+        .expect("create_ledger");
+    let mut rows = Vec::with_capacity(commits / sample_every.max(1) + 1);
+    let report_every = (commits / 20).max(1);
+
+    for i in 0..commits {
+        let json = txn_data_to_jsonld(&generate_txn_data(i, npc));
+        let start = Instant::now();
+        let (next, commit_flakes) = one_commit(fluree, ledger, &json).await;
+        let elapsed_us = start.elapsed().as_micros();
+        ledger = next;
+
+        if i % sample_every == 0 || i == commits - 1 {
+            rows.push(Row {
+                idx: i,
+                t: ledger.t(),
+                commit_flakes,
+                novelty_flakes: ledger.novelty().len(),
+                novelty_bytes: ledger.novelty_size(),
+                elapsed_us,
+                rss_kb: rss_kb(),
+            });
+        }
+        if i % report_every == 0 {
+            eprintln!(
+                "[grow] commit {i}/{commits}  novelty={} flakes / {:.0} MiB  last={elapsed_us}us",
+                ledger.novelty().len(),
+                ledger.novelty_size() as f64 / (1024.0 * 1024.0)
+            );
+        }
+
+        if reindex_every > 0 && i > 0 && i % reindex_every == 0 {
+            eprintln!(
+                "[grow] reindex at commit {i} (novelty {:.0} MiB) ...",
+                ledger.novelty_size() as f64 / (1024.0 * 1024.0)
+            );
+            drop(ledger);
+            fluree
+                .reindex(ledger_id, ReindexOptions::default())
+                .await
+                .expect("reindex");
+            ledger = fluree
+                .ledger(ledger_id)
+                .await
+                .expect("reload after reindex");
+        }
+    }
+    rows
+}
+
+/// `prepare`: build a persistent backlog at `$GROW_DB_DIR` and exit.
+async fn prepare(fluree: &Fluree, ledger_id: &str, commits: usize, npc: usize) {
+    if fluree.ledger_exists(ledger_id).await.unwrap_or(false) {
+        eprintln!("[prepare] ledger '{ledger_id}' already exists. Use a clean GROW_DB_DIR (rm -rf it) so the backlog is built from scratch.");
+        std::process::exit(1);
+    }
+    let mut ledger = fluree
+        .create_ledger(ledger_id)
+        .await
+        .expect("create_ledger");
+    let report_every = (commits / 20).max(1);
+    eprintln!(
+        "[prepare] building {commits} commits of novelty ({npc} nodes each) at GROW_DB_DIR ..."
+    );
+    for i in 0..commits {
+        let json = txn_data_to_jsonld(&generate_txn_data(i, npc));
+        let (next, _) = one_commit(fluree, ledger, &json).await;
+        ledger = next;
+        if i % report_every == 0 {
+            eprintln!(
+                "[prepare] commit {i}/{commits}  novelty={} flakes / {:.0} MiB",
+                ledger.novelty().len(),
+                ledger.novelty_size() as f64 / (1024.0 * 1024.0)
+            );
+        }
+    }
+    eprintln!(
+        "[prepare] DONE: t={} novelty={} flakes / {:.1} MiB. Ready for GROW_MODE=steady.",
+        ledger.t(),
+        ledger.novelty().len(),
+        ledger.novelty_size() as f64 / (1024.0 * 1024.0)
+    );
+}
+
+/// `steady`: reload the prepared backlog, then commit `steady_commits` more at
+/// that constant high-novelty level (the flamegraph target).
+async fn steady(
+    fluree: &Fluree,
+    ledger_id: &str,
+    warmup: usize,
+    steady_commits: usize,
+    sample_every: usize,
+) -> Vec<Row> {
+    let mut ledger = fluree
+        .ledger(ledger_id)
+        .await
+        .expect("reload prepared ledger (run GROW_MODE=prepare first)");
+    let base_t = ledger.t();
+    eprintln!(
+        "[steady] reloaded at t={base_t}, novelty={} flakes / {:.1} MiB",
+        ledger.novelty().len(),
+        ledger.novelty_size() as f64 / (1024.0 * 1024.0)
+    );
+
+    // txn_idx offset so steady commits never collide with prepared subjects.
+    let off = base_t as usize + 10_000_000;
+    let npc = env_usize("GROW_NODES_PER_COMMIT", 10);
+
+    eprintln!("[steady] {warmup} warmup commits ...");
+    for i in 0..warmup {
+        let json = txn_data_to_jsonld(&generate_txn_data(off + i, npc));
+        let (next, _) = one_commit(fluree, ledger, &json).await;
+        ledger = next;
+    }
+
+    eprintln!("[steady] timing {steady_commits} commits at high novelty ...");
+    let mut rows = Vec::with_capacity(steady_commits / sample_every.max(1) + 1);
+    for i in 0..steady_commits {
+        let json = txn_data_to_jsonld(&generate_txn_data(off + warmup + i, npc));
+        let start = Instant::now();
+        let (next, commit_flakes) = one_commit(fluree, ledger, &json).await;
+        let elapsed_us = start.elapsed().as_micros();
+        ledger = next;
+        if i % sample_every == 0 || i == steady_commits - 1 {
+            rows.push(Row {
+                idx: i,
+                t: ledger.t(),
+                commit_flakes,
+                novelty_flakes: ledger.novelty().len(),
+                novelty_bytes: ledger.novelty_size(),
+                elapsed_us,
+                rss_kb: rss_kb(),
+            });
+        }
+    }
+    rows
+}
+
+async fn run() {
+    let mode = env_str("GROW_MODE", "grow");
+    let ledger_id = env_str("GROW_LEDGER", "growth/bench:main");
+    let commits = env_usize("GROW_COMMITS", 20_000);
+    let npc = env_usize("GROW_NODES_PER_COMMIT", 10);
+    let sample_every = env_usize("GROW_SAMPLE_EVERY", 1).max(1);
+    let reindex_every = env_usize("GROW_REINDEX_EVERY", 0);
+    let csv = env_str("GROW_CSV", "target/transact-growth.csv");
+
+    match mode.as_str() {
+        "all" => {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let fluree = FlureeBuilder::file(dir.path().to_string_lossy().to_string())
+                .without_indexing()
+                .build()
+                .expect("build");
+            let rows = grow(
+                &fluree,
+                &ledger_id,
+                commits,
+                npc,
+                sample_every,
+                reindex_every,
+            )
+            .await;
+            write_csv(&csv, &rows);
+            summarize(&rows);
+        }
+        "grow" => {
+            // Fresh ledger each run: use a unique on-disk dir so create_ledger
+            // doesn't trip LedgerExists across repeated runs.
+            let dir = env_str("GROW_DB_DIR", "target/transact-growth-db");
+            let _ = std::fs::remove_dir_all(&dir);
+            let fluree = FlureeBuilder::file(dir)
+                .without_indexing()
+                .build()
+                .expect("build");
+            let rows = grow(
+                &fluree,
+                &ledger_id,
+                commits,
+                npc,
+                sample_every,
+                reindex_every,
+            )
+            .await;
+            write_csv(&csv, &rows);
+            summarize(&rows);
+        }
+        "prepare" => {
+            let dir = env_str("GROW_DB_DIR", "");
+            if dir.is_empty() {
+                eprintln!("[prepare] GROW_DB_DIR is required (persistent storage dir).");
+                std::process::exit(2);
+            }
+            let fluree = FlureeBuilder::file(dir)
+                .without_indexing()
+                .build()
+                .expect("build");
+            prepare(&fluree, &ledger_id, commits, npc).await;
+        }
+        "steady" => {
+            let dir = env_str("GROW_DB_DIR", "");
+            if dir.is_empty() {
+                eprintln!("[steady] GROW_DB_DIR is required (the prepared storage dir).");
+                std::process::exit(2);
+            }
+            let warmup = env_usize("GROW_WARMUP", 50);
+            let steady_commits = env_usize("GROW_STEADY_COMMITS", 2_000);
+            let fluree = FlureeBuilder::file(dir)
+                .without_indexing()
+                .build()
+                .expect("build");
+            let rows = steady(&fluree, &ledger_id, warmup, steady_commits, sample_every).await;
+            write_csv(&csv, &rows);
+            summarize(&rows);
+        }
+        other => {
+            eprintln!("unknown GROW_MODE '{other}' (expected grow|prepare|steady|all)");
+            std::process::exit(2);
+        }
+    }
+}
+
+fn main() {
+    let rt = fluree_bench_support::bench_runtime();
+    rt.block_on(run());
+}

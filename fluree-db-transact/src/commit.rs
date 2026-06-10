@@ -643,8 +643,15 @@ where
         let mut all_flakes = std::mem::take(&mut commit_record.flakes);
         all_flakes.extend(commit_metadata_flakes);
 
-        // 10.1 Populate DictNovelty with subjects/strings from this commit
-        let mut dict_novelty = base.dict_novelty.clone();
+        // Capture the ledger id before moving novelty fields out of `base`:
+        // after a partial move we can no longer call &self methods on `base`.
+        let base_ledger_id = base.ledger_id().to_string();
+
+        // 10.1 Populate DictNovelty with subjects/strings from this commit.
+        // Move the Arc out of `base` (instead of Arc::clone) so `make_mut` can
+        // mutate in place when this commit uniquely owns the prior state, and
+        // copy-on-write only when a reader/cache still holds it.
+        let mut dict_novelty = base.dict_novelty;
         {
             let span = tracing::debug_span!("commit_populate_dict_novelty");
             let _g = span.enter();
@@ -668,16 +675,16 @@ where
             )?;
         }
 
-        let mut runtime_small_dicts = Arc::clone(&base.runtime_small_dicts);
+        let mut runtime_small_dicts = base.runtime_small_dicts;
         Arc::make_mut(&mut runtime_small_dicts).populate_from_flakes(&all_flakes);
 
-        let mut new_novelty = Arc::clone(&base.novelty);
+        let mut new_novelty = base.novelty;
         {
             let span = tracing::debug_span!("commit_apply_to_novelty");
             let _g = span.enter();
             let mut reverse_graph = base.snapshot.build_reverse_graph()?;
             // Ensure txn-meta graph is always routable for commit metadata flakes.
-            let txn_meta_iri = fluree_db_core::txn_meta_graph_iri(base.ledger_id());
+            let txn_meta_iri = fluree_db_core::txn_meta_graph_iri(&base_ledger_id);
             if let Some(g_sid) = base.snapshot.encode_iri(&txn_meta_iri) {
                 reverse_graph.entry(g_sid).or_insert(TXN_META_GRAPH_ID);
             }
