@@ -560,74 +560,101 @@ pub fn apply_functional_property_rule(ontology: &OntologyRL, ctx: &mut IdentityR
     let ref_dt = ref_dt();
 
     for p in ontology.functional_properties() {
-        // Process if there are new facts in delta OR if sameAs changed
-        // (sameAs changes can create new conflicts by merging subjects)
         let delta_has_p = ctx.delta.get_by_p(p).next().is_some();
-        let derived_has_p = ctx.derived.get_by_p(p).next().is_some();
-        if !(delta_has_p || ctx.same_as_changed && derived_has_p) {
-            continue;
-        }
 
-        // Collect all (canonical_subject, canonical_object) pairs for this property
-        // Group by subject to find conflicts
-        let mut objects_by_subject: HashMap<Sid, Vec<Sid>> = HashMap::new();
-
-        // From delta
-        for flake in ctx.delta.get_by_p(p) {
-            if let FlakeValue::Ref(y) = &flake.o {
-                let x_canonical = ctx.same_as.canonical(&flake.s);
-                let y_canonical = ctx.same_as.canonical(y);
-                objects_by_subject
-                    .entry(x_canonical)
-                    .or_default()
-                    .push(y_canonical);
-            }
-        }
-
-        // From derived (need to check for conflicts with delta facts)
-        for flake in ctx.derived.get_by_p(p) {
-            if let FlakeValue::Ref(y) = &flake.o {
-                let x_canonical = ctx.same_as.canonical(&flake.s);
-                let y_canonical = ctx.same_as.canonical(y);
-                objects_by_subject
-                    .entry(x_canonical)
-                    .or_default()
-                    .push(y_canonical);
-            }
-        }
-
-        // For each subject with multiple distinct objects, derive sameAs
-        for (_x, objects) in objects_by_subject {
-            // Deduplicate objects (same canonical form = already known sameAs)
-            let unique_objects: HashSet<Sid> = objects.into_iter().collect();
-            if unique_objects.len() <= 1 {
+        if ctx.same_as_changed {
+            // Canonical forms may have shifted: the persistent grouping's
+            // keys are stale, so rebuild it from delta ∪ derived. Merged
+            // subjects collapse onto one key here, surfacing new conflicts.
+            let derived_has_p = ctx.derived.get_by_p(p).next().is_some();
+            if !(delta_has_p || derived_has_p) {
                 continue;
             }
 
-            // Derive sameAs by chaining to first element: O(k-1) instead of O(k²)
-            // Union-find will compute full transitive closure internally
-            let objects_vec: Vec<Sid> = unique_objects.into_iter().collect();
-            let first = &objects_vec[0];
-            for other in &objects_vec[1..] {
-                let same_as_flake = Flake::new(
-                    first.clone(),
-                    ctx.owl_same_as_sid.clone(),
-                    FlakeValue::Ref(other.clone()),
-                    ref_dt.clone(),
-                    ctx.t,
-                    true,
-                    None,
-                );
-
-                if !ctx
-                    .derived
-                    .contains(&same_as_flake.s, &same_as_flake.p, &same_as_flake.o)
-                {
-                    ctx.new_delta.push(same_as_flake);
-                    ctx.diagnostics.record_rule_fired("prp-fp");
+            let mut objects_by_subject: HashMap<Sid, Vec<Sid>> = HashMap::new();
+            let delta_and_derived = ctx.delta.get_by_p(p).chain(ctx.derived.get_by_p(p));
+            for flake in delta_and_derived {
+                if let FlakeValue::Ref(y) = &flake.o {
+                    let x_canonical = ctx.same_as.canonical(&flake.s);
+                    let y_canonical = ctx.same_as.canonical(y);
+                    objects_by_subject
+                        .entry(x_canonical)
+                        .or_default()
+                        .push(y_canonical);
                 }
             }
+
+            let mut rep_map: HashMap<Sid, Sid> = HashMap::new();
+            for (x, objects) in objects_by_subject {
+                // Deduplicate objects (same canonical form = already known sameAs)
+                let unique_objects: HashSet<Sid> = objects.into_iter().collect();
+                let objects_vec: Vec<Sid> = unique_objects.into_iter().collect();
+                let first = &objects_vec[0];
+                rep_map.insert(x, first.clone());
+
+                // Derive sameAs by chaining to first element: O(k-1) instead
+                // of O(k²); union-find computes the full closure internally.
+                for other in &objects_vec[1..] {
+                    derive_identity_same_as(ctx, first, other, &ref_dt, "prp-fp");
+                }
+            }
+            ctx.state.fp_rep.insert(p.clone(), rep_map);
+        } else {
+            // Canonical forms are stable: only this iteration's delta can
+            // introduce conflicts. Fold it into the persistent grouping.
+            if !delta_has_p {
+                continue;
+            }
+
+            let rep_map = ctx.state.fp_rep.entry(p.clone()).or_default();
+            let mut conflicts: Vec<(Sid, Sid)> = Vec::new();
+            for flake in ctx.delta.get_by_p(p) {
+                if let FlakeValue::Ref(y) = &flake.o {
+                    let x_canonical = ctx.same_as.canonical(&flake.s);
+                    let y_canonical = ctx.same_as.canonical(y);
+                    match rep_map.entry(x_canonical) {
+                        hashbrown::hash_map::Entry::Occupied(rep) => {
+                            if *rep.get() != y_canonical {
+                                conflicts.push((rep.get().clone(), y_canonical));
+                            }
+                        }
+                        hashbrown::hash_map::Entry::Vacant(slot) => {
+                            slot.insert(y_canonical);
+                        }
+                    }
+                }
+            }
+            for (rep, other) in conflicts {
+                derive_identity_same_as(ctx, &rep, &other, &ref_dt, "prp-fp");
+            }
         }
+    }
+}
+
+/// Push `sameAs(a, b)` into the new delta unless already derived.
+fn derive_identity_same_as(
+    ctx: &mut IdentityRuleContext<'_>,
+    a: &Sid,
+    b: &Sid,
+    ref_dt: &Sid,
+    rule: &str,
+) {
+    let same_as_flake = Flake::new(
+        a.clone(),
+        ctx.owl_same_as_sid.clone(),
+        FlakeValue::Ref(b.clone()),
+        ref_dt.clone(),
+        ctx.t,
+        true,
+        None,
+    );
+
+    if !ctx
+        .derived
+        .contains(&same_as_flake.s, &same_as_flake.p, &same_as_flake.o)
+    {
+        ctx.new_delta.push(same_as_flake);
+        ctx.diagnostics.record_rule_fired(rule);
     }
 }
 
@@ -653,72 +680,72 @@ pub fn apply_inverse_functional_property_rule(
     let ref_dt = ref_dt();
 
     for p in ontology.inverse_functional_properties() {
-        // Process if there are new facts in delta OR if sameAs changed
-        // (sameAs changes can create new conflicts by merging objects)
         let delta_has_p = ctx.delta.get_by_p(p).next().is_some();
-        let derived_has_p = ctx.derived.get_by_p(p).next().is_some();
-        if !(delta_has_p || ctx.same_as_changed && derived_has_p) {
-            continue;
-        }
 
-        // Collect all (canonical_object, canonical_subject) pairs
-        // Group by object to find conflicting subjects
-        let mut subjects_by_object: HashMap<Sid, Vec<Sid>> = HashMap::new();
-
-        // From delta
-        for flake in ctx.delta.get_by_p(p) {
-            if let FlakeValue::Ref(y) = &flake.o {
-                let x_canonical = ctx.same_as.canonical(&flake.s);
-                let y_canonical = ctx.same_as.canonical(y);
-                subjects_by_object
-                    .entry(y_canonical)
-                    .or_default()
-                    .push(x_canonical);
-            }
-        }
-
-        // From derived
-        for flake in ctx.derived.get_by_p(p) {
-            if let FlakeValue::Ref(y) = &flake.o {
-                let x_canonical = ctx.same_as.canonical(&flake.s);
-                let y_canonical = ctx.same_as.canonical(y);
-                subjects_by_object
-                    .entry(y_canonical)
-                    .or_default()
-                    .push(x_canonical);
-            }
-        }
-
-        // For each object with multiple distinct subjects, derive sameAs
-        for (_y, subjects) in subjects_by_object {
-            // Deduplicate subjects
-            let unique_subjects: HashSet<Sid> = subjects.into_iter().collect();
-            if unique_subjects.len() <= 1 {
+        if ctx.same_as_changed {
+            // Canonical forms may have shifted: rebuild the grouping from
+            // delta ∪ derived. Merged objects collapse onto one key here,
+            // surfacing new conflicts.
+            let derived_has_p = ctx.derived.get_by_p(p).next().is_some();
+            if !(delta_has_p || derived_has_p) {
                 continue;
             }
 
-            // Derive sameAs by chaining to first element: O(k-1) instead of O(k²)
-            // Union-find will compute full transitive closure internally
-            let subjects_vec: Vec<Sid> = unique_subjects.into_iter().collect();
-            let first = &subjects_vec[0];
-            for other in &subjects_vec[1..] {
-                let same_as_flake = Flake::new(
-                    first.clone(),
-                    ctx.owl_same_as_sid.clone(),
-                    FlakeValue::Ref(other.clone()),
-                    ref_dt.clone(),
-                    ctx.t,
-                    true,
-                    None,
-                );
-
-                if !ctx
-                    .derived
-                    .contains(&same_as_flake.s, &same_as_flake.p, &same_as_flake.o)
-                {
-                    ctx.new_delta.push(same_as_flake);
-                    ctx.diagnostics.record_rule_fired("prp-ifp");
+            let mut subjects_by_object: HashMap<Sid, Vec<Sid>> = HashMap::new();
+            let delta_and_derived = ctx.delta.get_by_p(p).chain(ctx.derived.get_by_p(p));
+            for flake in delta_and_derived {
+                if let FlakeValue::Ref(y) = &flake.o {
+                    let x_canonical = ctx.same_as.canonical(&flake.s);
+                    let y_canonical = ctx.same_as.canonical(y);
+                    subjects_by_object
+                        .entry(y_canonical)
+                        .or_default()
+                        .push(x_canonical);
                 }
+            }
+
+            let mut rep_map: HashMap<Sid, Sid> = HashMap::new();
+            for (y, subjects) in subjects_by_object {
+                // Deduplicate subjects (same canonical form = already known sameAs)
+                let unique_subjects: HashSet<Sid> = subjects.into_iter().collect();
+                let subjects_vec: Vec<Sid> = unique_subjects.into_iter().collect();
+                let first = &subjects_vec[0];
+                rep_map.insert(y, first.clone());
+
+                // Derive sameAs by chaining to first element: O(k-1) instead
+                // of O(k²); union-find computes the full closure internally.
+                for other in &subjects_vec[1..] {
+                    derive_identity_same_as(ctx, first, other, &ref_dt, "prp-ifp");
+                }
+            }
+            ctx.state.ifp_rep.insert(p.clone(), rep_map);
+        } else {
+            // Canonical forms are stable: only this iteration's delta can
+            // introduce conflicts. Fold it into the persistent grouping.
+            if !delta_has_p {
+                continue;
+            }
+
+            let rep_map = ctx.state.ifp_rep.entry(p.clone()).or_default();
+            let mut conflicts: Vec<(Sid, Sid)> = Vec::new();
+            for flake in ctx.delta.get_by_p(p) {
+                if let FlakeValue::Ref(y) = &flake.o {
+                    let x_canonical = ctx.same_as.canonical(&flake.s);
+                    let y_canonical = ctx.same_as.canonical(y);
+                    match rep_map.entry(y_canonical) {
+                        hashbrown::hash_map::Entry::Occupied(rep) => {
+                            if *rep.get() != x_canonical {
+                                conflicts.push((rep.get().clone(), x_canonical));
+                            }
+                        }
+                        hashbrown::hash_map::Entry::Vacant(slot) => {
+                            slot.insert(x_canonical);
+                        }
+                    }
+                }
+            }
+            for (rep, other) in conflicts {
+                derive_identity_same_as(ctx, &rep, &other, &ref_dt, "prp-ifp");
             }
         }
     }

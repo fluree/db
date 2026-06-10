@@ -21,7 +21,7 @@ use crate::execute::{
     apply_max_cardinality_rule, apply_max_qualified_cardinality_rule, apply_one_of_rule,
     apply_property_chain_rule, apply_range_rule, apply_same_as_rule, apply_some_values_from_rule,
     apply_sub_property_rule, apply_subclass_rule, apply_symmetric_rule, apply_transitive_rule,
-    apply_union_rule, DeltaSet, DerivedSet, IdentityRuleContext, RuleContext,
+    apply_union_rule, DeltaSet, DerivedSet, IdentityRuleContext, IdentityRuleState, RuleContext,
 };
 use crate::ontology_rl::{load_same_as_assertions, OntologyRL};
 use crate::owl;
@@ -115,6 +115,10 @@ pub async fn run_fixpoint(
 
     let mut iterations = 0;
 
+    // Cross-iteration grouping state for prp-fp/prp-ifp (semi-naive: each
+    // iteration folds only its delta in; rebuilt when sameAs changes).
+    let mut identity_state = IdentityRuleState::default();
+
     // Semi-naive fixpoint loop
     while !delta.is_empty() {
         // Check budget
@@ -163,6 +167,7 @@ pub async fn run_fixpoint(
                 t: reasoning_t,
                 same_as_changed,
                 diagnostics: &mut diagnostics,
+                state: &mut identity_state,
             };
 
             // B.1. Functional property rule (prp-fp):

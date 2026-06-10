@@ -24,7 +24,7 @@ pub mod util;
 // Re-export main types
 pub use delta::DeltaSet;
 pub use derived::DerivedSet;
-pub use util::{IdentityRuleContext, RuleContext};
+pub use util::{IdentityRuleContext, IdentityRuleState, RuleContext};
 
 // Re-export property rules (prp-*)
 pub use property_rules::{
