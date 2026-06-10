@@ -2379,7 +2379,7 @@ mod tests {
 
     #[test]
     fn cyclic_square_uses_cyclic_bgp_operator() {
-        // 4-cycle / WGPB square:
+        // 4-cycle square:
         // ?x1 p1 ?x2 . ?x1 p2 ?x3 . ?x4 p3 ?x2 . ?x4 p4 ?x3
         let triples = vec![
             make_pattern(VarId(0), "p1", VarId(1)),

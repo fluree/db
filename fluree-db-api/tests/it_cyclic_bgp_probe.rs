@@ -55,7 +55,7 @@ async fn cyclic_bgp_bounded_probe_matches_fallback() {
             let ledger = genesis_ledger_for_fluree(&fluree, ledger_id);
 
             // Edge data covering: two directed triangles sharing node n1/n3
-            // (multiplicity through shared vertices), a Tr2 "shortcut" triangle,
+            // (multiplicity through shared vertices), a "shortcut" triangle,
             // a mixed-direction square, and dangling edges on every predicate
             // that must not join.
             let insert = json!({
@@ -73,7 +73,7 @@ async fn cyclic_bgp_bounded_probe_matches_fallback() {
                     // n1 -p1-> n20 -p2-> n3 (closes via existing n3 -p3-> n1)
                     {"@id": "ex:n1", "ex:p1": {"@id": "ex:n20"}},
                     {"@id": "ex:n20", "ex:p2": {"@id": "ex:n3"}},
-                    // Tr2 shortcut: n1 -p4-> n3 (closes n1 -p1-> n2 -p2-> n3)
+                    // Shortcut triangle: n1 -p4-> n3 (closes n1 -p1-> n2 -p2-> n3)
                     {"@id": "ex:n1", "ex:p4": {"@id": "ex:n3"}},
                     // Mixed square: n1 -p1-> n2 -p2-> n3, n40 -p4-> n3, n1 -p5-> n40
                     {"@id": "ex:n40", "ex:p4": {"@id": "ex:n3"}},
@@ -103,7 +103,7 @@ async fn cyclic_bgp_bounded_probe_matches_fallback() {
 
             // (name, query) pairs covering both join modes and both shapes:
             // - directed 3-cycle: RefOnly mode, previously never probe-eligible
-            // - Tr2 shortcut: EncodedObject mode (object-only ?c)
+            // - shortcut triangle: EncodedObject mode (object-only ?c)
             // - mixed 4-cycle: EncodedObject square
             let queries = [
                 (
@@ -114,7 +114,7 @@ async fn cyclic_bgp_bounded_probe_matches_fallback() {
                       ORDER BY ?a ?b ?c",
                 ),
                 (
-                    "tr2-shortcut",
+                    "shortcut-triangle",
                     r"PREFIX ex: <http://example.org/ns/>
                       SELECT ?a ?b ?c
                       WHERE { ?a ex:p1 ?b . ?b ex:p2 ?c . ?a ex:p4 ?c }

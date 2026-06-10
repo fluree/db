@@ -103,23 +103,23 @@ fn hash_join_force() -> HashJoinForce {
 /// Probe-predicate floor: below this, scattered OPST object seeks stay cheap and the
 /// hash join is often a wash.
 ///
-/// The original 250k floor was tuned to BSBM-scale data and rejected WGPB TI stars
-/// like `TI2-01`, where a 69k-row driving set caused tens of thousands of scattered
-/// OPST seeks into a 136k-row probe predicate on a 21B-triple index. At Wikidata
-/// scale, scanning that predicate once is decisively cheaper, so keep the floor near
-/// the observed BSBM lower crossover while relying on the scan-ratio cap below to
-/// reject small-driving-set pathologies.
+/// The original 250k floor was tuned on smaller indexes and rejected mid-size
+/// object stars where a ~70k-row driving set caused tens of thousands of
+/// scattered OPST seeks into a ~136k-row probe predicate. On very large
+/// indexes, scanning such a predicate once is decisively cheaper, so keep the
+/// floor near the observed lower crossover while relying on the scan-ratio cap
+/// below to reject small-driving-set pathologies.
 const HASH_JOIN_PROBE_MIN: u64 = 50_000;
 /// For small driving sets, even a below-floor probe predicate is worth scanning
-/// once. WGPB TI object-stars commonly start from a 1k-5k-row anchor and then
+/// once. Deep object-star chains commonly start from a 1k-5k-row anchor and then
 /// suffer thousands of scattered OPST seeks into 3k-35k-row predicates; a compact
 /// hash build is cheaper and remains memory-bounded.
 const HASH_JOIN_SMALL_BUILD_MAX: f64 = 20_000.0;
 const HASH_JOIN_SMALL_BUILD_PROBE_MIN: u64 = 1_000;
 /// A wider intermediate is still safe to hash-build when it is in the low
 /// hundreds of thousands and the alternative is that many scattered OPST seeks
-/// into a smaller predicate. This catches WGPB path tails like P4-37 without
-/// admitting million-row cyclic intermediates such as S3-08.
+/// into a smaller predicate. This catches long path-join tails without
+/// admitting million-row cyclic intermediates.
 const HASH_JOIN_MEDIUM_BUILD_MAX: f64 = 250_000.0;
 /// Auto hash-join freely when the build side still looks like a base scan or
 /// narrow two-column stream. Wider intermediates are allowed only while their
@@ -1073,9 +1073,9 @@ mod tests {
     }
 
     #[test]
-    fn cost_gate_fires_for_wgpb_ti_object_star() {
-        // WGPB TI2-01 after reordering:
-        //   build P5097 ~69,885 rows, probe P1315 ~136,131 rows, joined on object ?x.
+    fn cost_gate_fires_for_midsize_object_star() {
+        // A mid-size object star after reordering:
+        //   build ~69,885 rows, probe ~136,131 rows, joined on object ?x.
         // The old 250k probe floor rejected this as "probe-too-small", forcing ~70k
         // scattered OPST object seeks. A single predicate scan is cheaper and allows
         // the outer LIMIT to stop after the first output batch.
@@ -1083,11 +1083,9 @@ mod tests {
     }
 
     #[test]
-    fn cost_gate_fires_for_small_build_wgpb_ti_anchors() {
-        // These are the first object-star joins from the slow WGPB TI plans:
-        // - TI2-35: P4544 (5,092 rows) -> P2188 (7,100 rows)
-        // - TI3-02: P2532 (2,196 rows) -> P4296 (35,246 rows)
-        // - TI4-02: P1888 (1,068 rows) -> P4854 (7,684 rows)
+    fn cost_gate_fires_for_small_build_star_anchors() {
+        // First object-star joins from slow deep-star plans (build -> probe rows):
+        // 5,092 -> 7,100; 2,196 -> 35,246; 1,068 -> 7,684.
         //
         // The probe predicates are below the generic floor, but the build sides are
         // tiny enough that a hash table is cheap and avoids thousands of OPST seeks.
@@ -1097,16 +1095,24 @@ mod tests {
     }
 
     #[test]
-    fn planner_chooses_hash_join_for_wgpb_ti2_shape() {
+    fn planner_chooses_hash_join_for_midsize_object_star() {
         let x = VarId(0);
         let y = VarId(1);
         let z = VarId(2);
-        let build = TriplePattern::new(Ref::Var(z), Ref::Sid(Sid::new(658, "P5097")), Term::Var(x));
-        let probe = TriplePattern::new(Ref::Var(y), Ref::Sid(Sid::new(658, "P1315")), Term::Var(x));
+        let build = TriplePattern::new(
+            Ref::Var(z),
+            Ref::Sid(Sid::new(100, "buildPred")),
+            Term::Var(x),
+        );
+        let probe = TriplePattern::new(
+            Ref::Var(y),
+            Ref::Sid(Sid::new(100, "probePred")),
+            Term::Var(x),
+        );
 
         let mut stats = StatsView::default();
         stats.properties.insert(
-            Sid::new(658, "P5097"),
+            Sid::new(100, "buildPred"),
             PropertyStatData {
                 count: 69_885,
                 ndv_values: 74_401,
@@ -1114,7 +1120,7 @@ mod tests {
             },
         );
         stats.properties.insert(
-            Sid::new(658, "P1315"),
+            Sid::new(100, "probePred"),
             PropertyStatData {
                 count: 136_131,
                 ndv_values: 135_901,
@@ -1130,7 +1136,7 @@ mod tests {
 
         let d = planner
             .explain_object_hash_join(&[z, x], &probe, false, true)
-            .expect("TI2 probe should produce a hash-join decision");
+            .expect("mid-size probe should produce a hash-join decision");
         assert!(d.chosen);
         assert_eq!(d.reason, HashJoinReason::CostWins);
         assert_eq!(d.probe_count, Some(136_131));
@@ -1138,14 +1144,18 @@ mod tests {
     }
 
     #[test]
-    fn planner_rejects_auto_hash_join_for_wide_ti_intermediate() {
+    fn planner_rejects_auto_hash_join_for_wide_intermediate() {
         let x = VarId(0);
         let w = VarId(3);
-        let probe = TriplePattern::new(Ref::Var(w), Ref::Sid(Sid::new(658, "P9999")), Term::Var(x));
+        let probe = TriplePattern::new(
+            Ref::Var(w),
+            Ref::Sid(Sid::new(100, "probePred")),
+            Term::Var(x),
+        );
 
         let mut stats = StatsView::default();
         stats.properties.insert(
-            Sid::new(658, "P9999"),
+            Sid::new(100, "probePred"),
             PropertyStatData {
                 count: 100_000,
                 ndv_values: 80_000,
@@ -1155,24 +1165,28 @@ mod tests {
 
         let d = HashJoinPlanner::new(Some(&stats))
             .explain_object_hash_join(&[VarId(2), x, VarId(1)], &probe, false, true)
-            .expect("wide TI continuation should still produce a decision");
+            .expect("wide continuation should still produce a decision");
         assert!(!d.chosen);
         assert_eq!(d.reason, HashJoinReason::BuildSideTooWide);
     }
 
     #[test]
-    fn planner_allows_hash_join_for_small_wide_ti_intermediate() {
-        // TI3-02 after the first hash join:
-        //   build-side schema is already wide (?z, ?x, ?y), but the estimated
-        //   intermediate is only ~10,980 rows and the new predicate P2895 has 3,140
-        //   rows. Hashing the intermediate avoids thousands of scattered OPST seeks.
+    fn planner_allows_hash_join_for_small_wide_intermediate() {
+        // After the first hash join in a deep star chain: the build-side schema
+        // is already wide (?z, ?x, ?y), but the estimated intermediate is only
+        // ~10,980 rows and the next predicate has 3,140 rows. Hashing the
+        // intermediate avoids thousands of scattered OPST seeks.
         let x = VarId(0);
         let u = VarId(3);
-        let probe = TriplePattern::new(Ref::Var(u), Ref::Sid(Sid::new(658, "P2895")), Term::Var(x));
+        let probe = TriplePattern::new(
+            Ref::Var(u),
+            Ref::Sid(Sid::new(100, "probePred")),
+            Term::Var(x),
+        );
 
         let mut stats = StatsView::default();
         stats.properties.insert(
-            Sid::new(658, "P2895"),
+            Sid::new(100, "probePred"),
             PropertyStatData {
                 count: 3_140,
                 ndv_values: 166,
@@ -1188,7 +1202,7 @@ mod tests {
         };
         let d = planner
             .explain_object_hash_join(&[VarId(2), x, VarId(1)], &probe, false, true)
-            .expect("TI3 final probe should produce a hash-join decision");
+            .expect("final probe should produce a hash-join decision");
         assert!(d.chosen);
         assert_eq!(d.reason, HashJoinReason::CostWins);
         assert_eq!(d.probe_count, Some(3_140));
@@ -1197,17 +1211,20 @@ mod tests {
 
     #[test]
     fn planner_allows_hash_join_for_medium_wide_path_tail() {
-        // P4-37 tail: the left path intermediate is wide, but still only ~237k
-        // rows. Scanning the 24,874-row P870 predicate once is cheaper than
-        // hundreds of thousands of scattered object seeks.
+        // Long path-join tail: the left intermediate is wide, but still only
+        // ~237k rows. Scanning the 24,874-row probe predicate once is cheaper
+        // than hundreds of thousands of scattered object seeks.
         let x2 = VarId(1);
         let x1 = VarId(0);
-        let probe =
-            TriplePattern::new(Ref::Var(x1), Ref::Sid(Sid::new(658, "P870")), Term::Var(x2));
+        let probe = TriplePattern::new(
+            Ref::Var(x1),
+            Ref::Sid(Sid::new(100, "probePred")),
+            Term::Var(x2),
+        );
 
         let mut stats = StatsView::default();
         stats.properties.insert(
-            Sid::new(658, "P870"),
+            Sid::new(100, "probePred"),
             PropertyStatData {
                 count: 24_874,
                 ndv_values: 408,
@@ -1223,7 +1240,7 @@ mod tests {
         };
         let d = planner
             .explain_object_hash_join(&[VarId(2), VarId(3), x2, VarId(4)], &probe, false, true)
-            .expect("P4 tail should produce a hash-join decision");
+            .expect("path tail should produce a hash-join decision");
         assert!(d.chosen);
         assert_eq!(d.reason, HashJoinReason::CostWins);
         assert_eq!(d.probe_count, Some(24_874));

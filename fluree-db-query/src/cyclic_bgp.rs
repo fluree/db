@@ -1,7 +1,7 @@
 //! Targeted physical operator for small cyclic fixed-predicate BGPs.
 //!
-//! This is intentionally narrower than a general leapfrog triejoin. It covers the
-//! Wikidata/WGPB stress shapes that currently fall through to left-deep nested-loop
+//! This is intentionally narrower than a general leapfrog triejoin. It covers
+//! the cyclic shapes that otherwise fall through to left-deep nested-loop
 //! joins: triangles and 4-edge cycles whose joins are all ref-valued subject/object
 //! variables. Unsupported shapes keep using the existing fallback operator tree.
 
