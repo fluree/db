@@ -1145,8 +1145,7 @@ impl Operator for NestedLoopJoinOperator {
         // Novelty overlay is NOT handled: the flush helpers walk base leaflets
         // directly, so an active overlay must force the per-row scan path
         // (whose binary cursor merges overlay ops).
-        let use_batched =
-            (self.batched_eligible || self.batched_object_eligible || self.batched_exists_eligible)
+        let use_batched = (self.batched_eligible || self.batched_object_eligible || self.batched_exists_eligible)
                 && ctx.binary_store.is_some()
                 && ctx.overlay_free_single_graph()
                 // The batched path reads binary leaves directly and works in
