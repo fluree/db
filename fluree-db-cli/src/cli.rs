@@ -172,7 +172,7 @@ pub struct Cli {
     #[arg(long, global = true)]
     pub config: Option<PathBuf>,
 
-    /// Memory budget in MB for bulk import (0 = auto: 60% of system RAM).
+    /// Memory budget in MB for bulk import (0 = auto: 80% of system RAM).
     /// Derives chunk size, concurrency limits, and run budget when not set explicitly.
     #[arg(long, global = true, default_value_t = 0)]
     pub memory_budget_mb: usize,
@@ -232,7 +232,7 @@ pub enum Commands {
         #[arg(long, default_value_t = 0)]
         chunk_size_mb: usize,
 
-        /// Memory budget in MB for bulk import (0 = auto: 60% of system RAM).
+        /// Memory budget in MB for bulk import (0 = auto: 80% of system RAM).
         /// Derives chunk size, concurrency limits, and run budget when not set explicitly.
         #[arg(long, default_value_t = 0)]
         memory_budget_mb: usize,

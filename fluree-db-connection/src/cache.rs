@@ -32,7 +32,10 @@ pub fn default_cache_max_mb() -> usize {
     let mut sys = System::new();
     sys.refresh_memory_specifics(MemoryRefreshKind::everything());
 
-    let total_memory_bytes = sys.total_memory();
+    // Clamp to the cgroup limit so a container sizes its cache to its real
+    // limit, not the host's RAM (a 264 GB host would otherwise pick a 132 GB cache).
+    let total_memory_bytes =
+        fluree_db_core::sysmem::effective_memory_limit_bytes(sys.total_memory());
 
     if total_memory_bytes == 0 {
         info!(
