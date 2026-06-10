@@ -5,7 +5,7 @@
 //! credentials.
 
 use async_trait::async_trait;
-use fluree_db_nameservice::{BranchLifecycle, NameServiceError, NsRecord, Result};
+use fluree_db_nameservice::{NameServiceError, NsRecord, Result};
 use reqwest::{Client, StatusCode};
 use serde::Deserialize;
 use std::fmt::Debug;
@@ -203,38 +203,10 @@ impl fluree_db_nameservice::NameServiceLookup for ProxyNameService {
     }
 }
 
-#[async_trait]
-impl BranchLifecycle for ProxyNameService {
-    async fn create_branch(
-        &self,
-        _ledger_name: &str,
-        _new_branch: &str,
-        _source_branch: &str,
-        _at_commit: Option<(fluree_db_core::ContentId, i64)>,
-    ) -> Result<()> {
-        // Proxy peers forward branch creation to the tx server via HTTP
-        Err(NameServiceError::storage(
-            "create_branch not supported in proxy mode".to_string(),
-        ))
-    }
-
-    async fn drop_branch(&self, _ledger_id: &str) -> Result<Option<u32>> {
-        // Proxy peers forward branch deletion to the tx server via HTTP
-        Err(NameServiceError::storage(
-            "drop_branch not supported in proxy mode".to_string(),
-        ))
-    }
-
-    async fn reset_head(
-        &self,
-        _ledger_id: &str,
-        _snapshot: fluree_db_nameservice::NsRecordSnapshot,
-    ) -> Result<()> {
-        Err(NameServiceError::storage(
-            "reset_head not supported in proxy mode".to_string(),
-        ))
-    }
-}
+// No `BranchLifecycle` impl for `ProxyNameService`: peer mode has no
+// authority to mutate the nameservice. Branch lifecycle requests are
+// served by the upstream transaction server (via its own HTTP routes,
+// not through this trait).
 
 #[async_trait]
 impl fluree_db_nameservice::GraphSourceLookup for ProxyNameService {
