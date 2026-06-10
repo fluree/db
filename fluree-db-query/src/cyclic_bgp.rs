@@ -1200,6 +1200,7 @@ impl CyclicBgpOperator {
         let mut probed_edges = 0usize;
 
         while !remaining.is_empty() {
+            ctx.check_cancelled()?;
             let probe = if probing_allowed && !relations.is_empty() {
                 self.select_bounded_probe(
                     &remaining,
@@ -1293,6 +1294,7 @@ impl CyclicBgpOperator {
         let mut probed_edges = 0usize;
 
         while !remaining.is_empty() {
+            ctx.check_cancelled()?;
             let probe = if probing_allowed && !relations.is_empty() {
                 self.select_bounded_probe(
                     &remaining,
@@ -2365,6 +2367,7 @@ impl Operator for CyclicBgpOperator {
         if !self.state.can_next() {
             return Ok(None);
         }
+        ctx.check_cancelled()?;
         if !self.used_fast_path {
             return match self.fallback.as_mut() {
                 Some(fallback) => fallback.next_batch(ctx).await,
