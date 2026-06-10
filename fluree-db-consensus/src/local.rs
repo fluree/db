@@ -257,7 +257,7 @@ pub(crate) fn execution_failure(err: ApiError) -> SubmissionError {
 /// than having the caller pre-build and pass a context, keeps the policy
 /// context bound to the executing node's state — the shape a replicated
 /// implementation needs.
-async fn build_policy_context(
+pub(crate) async fn build_policy_context(
     ledger_handle: &LedgerHandle,
     governance: &GovernanceOptions,
 ) -> Result<Option<PolicyContext>, SubmissionError> {

@@ -1755,10 +1755,7 @@ impl crate::Fluree {
         // Upload overlaps with parse/policy/flake-generation CPU work; commit()
         // awaits the handle just before writing the commit blob, so durability
         // is preserved but serial latency is eliminated on fast paths.
-        let commit_opts = if commit_opts.raw_txn.is_none()
-            && commit_opts.raw_txn_upload.is_none()
-            && store_raw_txn
-        {
+        let commit_opts = if commit_opts.raw_txn_upload.is_none() && store_raw_txn {
             let content_store = self.content_store(ledger.ledger_id());
             commit_opts.with_raw_txn_spawned(content_store, txn_json_for_commit)
         } else {
@@ -1851,10 +1848,7 @@ impl crate::Fluree {
         let store_raw_txn = txn_opts.store_raw_txn.unwrap_or(false);
 
         // Spawn raw_txn upload in parallel with staging when opted in.
-        let commit_opts = if commit_opts.raw_txn.is_none()
-            && commit_opts.raw_txn_upload.is_none()
-            && store_raw_txn
-        {
+        let commit_opts = if commit_opts.raw_txn_upload.is_none() && store_raw_txn {
             let content_store = self.content_store(ledger.ledger_id());
             commit_opts.with_raw_txn_spawned(content_store, txn_json.clone())
         } else {
@@ -1944,10 +1938,7 @@ impl crate::Fluree {
         let store_raw_txn = txn_opts.store_raw_txn.unwrap_or(false);
 
         // Spawn raw_txn upload in parallel with staging when opted in.
-        let commit_opts = if commit_opts.raw_txn.is_none()
-            && commit_opts.raw_txn_upload.is_none()
-            && store_raw_txn
-        {
+        let commit_opts = if commit_opts.raw_txn_upload.is_none() && store_raw_txn {
             let content_store = self.content_store(ledger.ledger_id());
             commit_opts.with_raw_txn_spawned(content_store, txn_json.clone())
         } else {
@@ -2044,10 +2035,7 @@ impl crate::Fluree {
         let store_raw_txn = txn_opts.store_raw_txn.unwrap_or(false);
 
         // Spawn raw_txn upload in parallel with staging when opted in.
-        let commit_opts = if commit_opts.raw_txn.is_none()
-            && commit_opts.raw_txn_upload.is_none()
-            && store_raw_txn
-        {
+        let commit_opts = if commit_opts.raw_txn_upload.is_none() && store_raw_txn {
             let content_store = self.content_store(ledger.ledger_id());
             commit_opts.with_raw_txn_spawned(content_store, txn_json.clone())
         } else {
@@ -2204,10 +2192,7 @@ impl crate::Fluree {
         let store_raw_txn = txn_opts.store_raw_txn.unwrap_or(false);
 
         // Spawn raw Turtle upload in parallel with staging when opted in.
-        let commit_opts = if commit_opts.raw_txn.is_none()
-            && commit_opts.raw_txn_upload.is_none()
-            && store_raw_txn
-        {
+        let commit_opts = if commit_opts.raw_txn_upload.is_none() && store_raw_txn {
             let content_store = self.content_store(ledger.ledger_id());
             commit_opts.with_raw_txn_spawned(content_store, JsonValue::String(turtle.to_string()))
         } else {

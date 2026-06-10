@@ -6,12 +6,21 @@ edition.workspace = true
 license.workspace = true
 repository.workspace = true
 
+[features]
+default = []
+# Enables the Raft-replicated `Committer` implementation. Off by default
+# so that monolithic users don't compile (or link) openraft and its
+# transitive dependencies.
+raft = ["dep:openraft", "dep:postcard"]
+
 [dependencies]
 fluree-db-api = { path = "../fluree-db-api" }
+fluree-db-core = { path = "../fluree-db-core" }
 fluree-db-transact = { path = "../fluree-db-transact" }
 fluree-db-ledger = { path = "../fluree-db-ledger" }
 
 async-trait = { workspace = true }
+hex = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 sha2 = { workspace = true }
@@ -19,8 +28,23 @@ thiserror = { workspace = true }
 tokio = { workspace = true }
 moka = { workspace = true, features = ["future"] }
 
+# Optional, gated behind the `raft` feature. Pinned to a current
+# release line — bumping should be tracked alongside any state-machine
+# / storage-format changes.
+openraft = { version = "0.9", optional = true, features = [
+    "serde",
+    "storage-v2",
+    "single-term-leader",
+] }
+
+# Used by Raft storage backends for compact serialization of log
+# entries, vote, and snapshot metadata. Gated behind `raft` because
+# only the storage impls reach for it.
+postcard = { workspace = true, optional = true }
+
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt", "test-util"] }
+tempfile = "3.19"
 
 [lints]
 workspace = true

@@ -1,7 +1,23 @@
 //! Transaction commit
 //!
-//! This module provides the `commit` function that persists staged changes
-//! to storage and publishes to the nameservice.
+//! Commit factors into three phases that callers can compose:
+//!
+//! - [`build_commit`] — stage flakes, build the [`Commit`] record, sign,
+//!   and serialize to bytes. Returns a [`StagedCommit`]. The commit
+//!   blob is **not** written; the nameservice is **not** published to.
+//!   Raw-txn JSON (if attached) **is** written during this phase, so
+//!   the staged commit's `txn` ContentId is durable when the function
+//!   returns.
+//! - [`StagedCommit::apply`] — take a [`StagedCommit`], write the commit
+//!   blob to the content store, publish through the nameservice (CAS or
+//!   fast-forward), and finalize the new [`LedgerState`].
+//! - [`StagedCommit::finalize_state`] — pure logic that builds the new
+//!   [`LedgerState`] from a [`StagedCommit`] without touching storage or
+//!   nameservice. Used by callers (e.g. Raft) that handle persistence
+//!   themselves and need to derive post-apply state.
+//!
+//! [`commit`] composes [`build_commit`] + [`StagedCommit::apply`] for
+//! the existing single-node transactional path.
 
 use crate::error::{Result, TransactError};
 use crate::namespace::NamespaceRegistry;
@@ -14,6 +30,7 @@ use fluree_db_nameservice::{CasResult, NameService, RefKind, RefPublisher, RefVa
 use fluree_db_novelty::{generate_commit_flakes, stamp_graph_on_commit_flakes};
 use fluree_db_novelty::{Commit, SigningKey, TxnMetaEntry, TxnMetaValue, TxnSignature};
 use fluree_db_query::BinaryRangeProvider;
+use std::collections::HashMap;
 use std::sync::Arc;
 use tracing::Instrument;
 
@@ -26,6 +43,54 @@ pub struct CommitReceipt {
     pub t: i64,
     /// Number of flakes in the commit
     pub flake_count: usize,
+}
+
+/// Output of [`build_commit`].
+///
+/// Carries everything a caller needs to either drive the commit to
+/// completion through the normal [`Self::apply`] path *or* to handle
+/// persistence themselves (e.g. a Raft-coordinated committer writes
+/// the blob and proposes the ref advancement through consensus, then
+/// calls [`Self::finalize_state`] to derive the post-apply state).
+///
+/// `commit.id` is already populated — it's the SHA-256 of
+/// `commit_bytes` tagged with `ContentKind::Commit`. Writing
+/// `commit_bytes` via `ContentStore::put_with_id(&commit.id.unwrap(), &commit_bytes)`
+/// is idempotent and round-trips to the same CID.
+pub struct StagedCommit {
+    /// The commit object. `commit.id` is set to its content id.
+    pub commit: Commit,
+    /// Canonical serialized bytes; `commit.id == ContentId::new(ContentKind::Commit, &commit_bytes)`.
+    pub commit_bytes: Vec<u8>,
+    /// Head observed during staging — the value the caller passes as
+    /// `expected_prev` for the CAS / `AdvanceRef` proposal. `None`
+    /// only on the first commit of a branch (genesis).
+    pub expected_head_ref: Option<RefValue>,
+    /// Bytes for content-addressed payloads the commit references but
+    /// that haven't been pre-uploaded by another path. Today the only
+    /// such payload (raw-txn JSON) is uploaded during `build_commit`,
+    /// so this map is empty; the field is here so future content kinds
+    /// can defer writes without changing the struct shape.
+    pub referenced_bytes: HashMap<ContentId, Vec<u8>>,
+    /// Tracking accounting from staging if `tracking` was set on the
+    /// builder.
+    pub tally: Option<fluree_db_core::TrackingTally>,
+    /// Build-time state needed by [`StagedCommit::apply`] /
+    /// [`StagedCommit::finalize_state`] to construct the post-commit
+    /// `LedgerState`. Private — callers shouldn't peek inside.
+    pub(crate) build_state: BuildState,
+}
+
+/// Internal carrier for everything `build_commit` computes that
+/// `StagedCommit::apply` / `StagedCommit::finalize_state` needs to
+/// construct the post-commit [`LedgerState`].
+pub(crate) struct BuildState {
+    base: LedgerState,
+    new_t: i64,
+    flake_count: usize,
+    /// CID of raw-txn JSON if it was uploaded during build; carried
+    /// so a publish failure can release the orphaned blob.
+    txn_id_for_release: Option<ContentId>,
 }
 
 /// Options for commit operation
@@ -49,20 +114,10 @@ pub struct CommitOpts {
     /// `f:message` and `f:author` are **not** fields here — they are user
     /// claims and flow through the transaction body as regular txn-meta.
     pub identity: Option<String>,
-    /// Original transaction JSON for storage (inline fallback path).
-    ///
-    /// When present, the raw transaction JSON is uploaded to the content store
-    /// serially from inside `commit()`. Prefer `raw_txn_upload` (populated by
-    /// [`CommitOpts::with_raw_txn_spawned`]) whenever a content store handle
-    /// is available at attach time — that variant parallelizes the upload
-    /// with staging CPU work. This inline field remains for callers (tests,
-    /// pre-built commits) that cannot spawn.
-    pub raw_txn: Option<serde_json::Value>,
     /// In-flight parallel upload of the raw transaction JSON.
     ///
-    /// Populated by [`CommitOpts::with_raw_txn_spawned`]. Takes precedence over
-    /// `raw_txn` when both are present (the spawned upload is already running).
-    /// Awaited inside `commit()` just before the commit blob is written, so the
+    /// Populated by [`CommitOpts::with_raw_txn_spawned`]. Awaited by the
+    /// caller of [`build_commit`] just before staging completes, so the
     /// upload overlaps staging CPU work on the caller's path.
     pub raw_txn_upload: Option<PendingRawTxnUpload>,
     /// Ed25519 signing key for commit signatures (opt-in).
@@ -113,7 +168,6 @@ impl std::fmt::Debug for CommitOpts {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("CommitOpts")
             .field("identity", &self.identity)
-            .field("raw_txn", &self.raw_txn.is_some())
             .field("raw_txn_upload", &self.raw_txn_upload.is_some())
             .field("signing_key", &self.signing_key.is_some())
             .field(
@@ -144,7 +198,6 @@ impl Clone for CommitOpts {
     fn clone(&self) -> Self {
         Self {
             identity: self.identity.clone(),
-            raw_txn: self.raw_txn.clone(),
             raw_txn_upload: None,
             signing_key: self.signing_key.clone(),
             txn_signature: self.txn_signature.clone(),
@@ -169,24 +222,15 @@ impl CommitOpts {
         self
     }
 
-    /// Attach the raw transaction JSON for storage (inline/fallback path).
-    ///
-    /// The upload will happen serially inside `commit()`. Prefer
-    /// [`with_raw_txn_spawned`](Self::with_raw_txn_spawned) when a content
-    /// store handle is available at attach time so the upload overlaps staging.
-    pub fn with_raw_txn(mut self, txn: serde_json::Value) -> Self {
-        self.raw_txn = Some(txn);
-        self
-    }
-
     /// Spawn a parallel upload of the raw transaction JSON to the content
     /// store and attach the handle.
     ///
-    /// The upload runs concurrently with staging CPU work. `commit()` awaits
-    /// the handle just before writing the commit blob, so durability is
-    /// preserved but the serial latency on the caller's path is reduced. On
-    /// error paths that drop `CommitOpts` without reaching `commit()`, the
-    /// pending upload's Drop guard releases any content that was stored.
+    /// The upload runs concurrently with staging CPU work. The caller of
+    /// [`build_commit`] awaits the handle just before staging completes,
+    /// so durability is preserved but the serial latency on the caller's
+    /// path is reduced. On error paths that drop `CommitOpts` without
+    /// awaiting, the pending upload's Drop guard releases any content
+    /// that was stored.
     pub fn with_raw_txn_spawned(
         mut self,
         content_store: Arc<dyn fluree_db_core::ContentStore>,
@@ -286,18 +330,14 @@ impl CommitOpts {
 /// # Returns
 ///
 /// A tuple of (CommitReceipt, new LedgerState)
-pub async fn commit<C, N>(
+pub async fn build_commit(
     view: StagedLedger,
     mut ns_registry: NamespaceRegistry,
-    content_store: &C,
-    nameservice: &N,
+    expected_head_ref: Option<RefValue>,
+    txn_id: Option<ContentId>,
     index_config: &IndexConfig,
     opts: CommitOpts,
-) -> Result<(CommitReceipt, LedgerState)>
-where
-    C: ContentStore + ?Sized,
-    N: NameService + RefPublisher + ?Sized,
-{
+) -> Result<StagedCommit> {
     // 1. Extract flakes from view
     let (mut base, flakes) = view.into_parts();
 
@@ -305,17 +345,15 @@ where
     // (e.g., txn_meta) without forcing clones, while still using other fields later.
     let CommitOpts {
         identity,
-        raw_txn,
-        raw_txn_upload,
         signing_key,
         txn_signature,
         mut txn_meta,
         graph_delta,
         namespace_delta: override_ns_delta,
         skip_backpressure,
-        skip_sequencing,
         merge_parents,
         timestamp: opt_timestamp,
+        ..
     } = opts;
 
     // For signed transactions the txn_signature.signer is the cryptographically
@@ -340,248 +378,263 @@ where
         ));
     }
 
-    let commit_span = tracing::debug_span!(
-        "txn_commit",
-        alias = base.ledger_id(),
-        base_t = base.t(),
-        flake_count = tracing::field::Empty,
-        delta_bytes = tracing::field::Empty,
-        current_novelty_bytes = tracing::field::Empty,
-        max_novelty_bytes = index_config.reindex_max_bytes,
-        has_raw_txn = raw_txn.is_some() || raw_txn_upload.is_some(),
-    );
-    async move {
-        let commit_span = tracing::Span::current();
+    // No wrapper span: the caller's ambient span (e.g. `txn_commit`
+    // from `commit()`, or whatever the Raft path opens) carries the
+    // build-time fields, so sub-spans below stay direct children of
+    // that ambient span.
+    let commit_span = tracing::Span::current();
 
-        // 2. Check for empty transaction — merge commits with no data flakes are
-        //    valid (e.g., TakeBranch strategy drops all source flakes) because
-        //    the commit still records the merge-parent relationship in the DAG.
-        if flakes.is_empty() && merge_parents.is_empty() {
-            return Err(TransactError::EmptyTransaction);
-        }
+    // 2. Check for empty transaction — merge commits with no data flakes are
+    //    valid (e.g., TakeBranch strategy drops all source flakes) because
+    //    the commit still records the merge-parent relationship in the DAG.
+    if flakes.is_empty() && merge_parents.is_empty() {
+        return Err(TransactError::EmptyTransaction);
+    }
 
-        // 3. Check backpressure - current novelty at max
-        if !skip_backpressure && base.at_max_novelty(index_config) {
-            return Err(TransactError::NoveltyAtMax);
-        }
+    // 3. Check backpressure - current novelty at max
+    if !skip_backpressure && base.at_max_novelty(index_config) {
+        return Err(TransactError::NoveltyAtMax);
+    }
 
-        // 4. Predictive sizing - would these flakes reach or exceed max?
-        let delta_bytes: usize = flakes.iter().map(fluree_db_core::Flake::size_bytes).sum();
-        let current_bytes = base.novelty_size();
-        let max_bytes = index_config.reindex_max_bytes;
-        commit_span.record("flake_count", flakes.len());
-        commit_span.record("delta_bytes", delta_bytes);
-        commit_span.record("current_novelty_bytes", current_bytes);
-        if !skip_backpressure && current_bytes + delta_bytes >= max_bytes {
-            return Err(TransactError::NoveltyWouldExceed {
-                current_bytes,
-                delta_bytes,
-                max_bytes,
-            });
-        }
+    // 4. Predictive sizing - would these flakes reach or exceed max?
+    let delta_bytes: usize = flakes.iter().map(fluree_db_core::Flake::size_bytes).sum();
+    let current_bytes = base.novelty_size();
+    let max_bytes = index_config.reindex_max_bytes;
+    commit_span.record("flake_count", flakes.len());
+    commit_span.record("delta_bytes", delta_bytes);
+    commit_span.record("current_novelty_bytes", current_bytes);
+    if !skip_backpressure && current_bytes + delta_bytes >= max_bytes {
+        return Err(TransactError::NoveltyWouldExceed {
+            current_bytes,
+            delta_bytes,
+            max_bytes,
+        });
+    }
 
-        // 5. Verify sequencing (skipped during rebase replay)
-        let expected_head_ref = if !skip_sequencing {
-            let current = nameservice
-                .lookup(base.ledger_id())
-                .instrument(tracing::debug_span!("commit_nameservice_lookup"))
+    // 5. Build commit record
+    //    (sequencing verification + nameservice lookup are the
+    //    caller's responsibility; the value to stash in
+    //    `expected_head_ref` is passed in.)
+    let new_t = base.t() + 1;
+    let flake_count = flakes.len();
+
+    // Capture namespace delta once:
+    // - write into commit record for persistence
+    // - apply to returned in-memory LedgerSnapshot so subsequent operations (e.g., SPARQL/JSON-LD queries)
+    //   can encode IRIs without requiring a reload.
+    let ns_delta = {
+        let span = tracing::debug_span!("commit_namespace_delta");
+        let _g = span.enter();
+        override_ns_delta.unwrap_or_else(|| ns_registry.take_delta())
+    };
+
+    // Apply envelope deltas (namespace + graph) to the in-memory LedgerSnapshot.
+    // This must happen before novelty apply so encode_iri() works for graph routing.
+    base.snapshot.apply_envelope_deltas(
+        &ns_delta,
+        graph_delta.values().map(std::string::String::as_str),
+    )?;
+
+    // Use caller-provided timestamp or default to wall clock.
+    let timestamp = opt_timestamp.unwrap_or_else(|| Utc::now().to_rfc3339());
+
+    // The caller is responsible for uploading the raw-txn JSON
+    // (if any) before invoking this function — the result is
+    // passed in as `txn_id`. We retain it for both the commit
+    // record (`with_txn`) and the release-on-failure path that
+    // `StagedCommit::apply` uses if publish fails.
+    let txn_id_for_release: Option<ContentId> = txn_id.clone();
+
+    let head_commit_id = base.head_commit_id.clone();
+    let ledger_id_for_publish = base.ledger_id().to_string();
+    let ns_split_mode_for_genesis = if base.head_commit_id.is_none() {
+        Some(ns_registry.split_mode())
+    } else {
+        None
+    };
+
+    // Build the commit record (still under the build phase).
+    let mut commit_record = {
+        let span = tracing::debug_span!("commit_build_record");
+        let _g = span.enter();
+        Commit::new(new_t, flakes)
+            .with_namespace_delta(ns_delta)
+            .with_time(timestamp)
+    };
+
+    if let Some(txn_cid) = txn_id {
+        commit_record = commit_record.with_txn(txn_cid);
+    }
+    if let Some(txn_sig) = txn_signature {
+        commit_record = commit_record.with_txn_signature(txn_sig);
+    }
+    if !txn_meta.is_empty() {
+        commit_record = commit_record.with_txn_meta(txn_meta);
+    }
+    if !graph_delta.is_empty() {
+        commit_record.graph_delta = graph_delta;
+    }
+    if let Some(split_mode) = ns_split_mode_for_genesis {
+        commit_record.ns_split_mode = Some(split_mode);
+    }
+    if let Some(cid) = head_commit_id.clone() {
+        commit_record = commit_record.with_parent(cid);
+    }
+    for merge_parent in &merge_parents {
+        commit_record = commit_record.with_parent(merge_parent.clone());
+    }
+
+    // 7. Sign + serialize. Computes the commit blob bytes and
+    // (locally) the CID, without writing the blob to the content
+    // store. StagedCommit::apply / RaftCommitter will write the bytes;
+    // the CID is deterministic from the bytes.
+    let signing = signing_key
+        .as_ref()
+        .map(|key| (key.as_ref(), ledger_id_for_publish.as_str()));
+    let signed = {
+        let span = tracing::debug_span!("commit_serialize_commit_blob");
+        let _g = span.enter();
+        crate::commit_v2::write_commit(&commit_record, true, signing)?
+    };
+    let commit_cid = ContentId::new(ContentKind::Commit, &signed.bytes);
+    commit_record.id = Some(commit_cid.clone());
+
+    Ok(StagedCommit {
+        commit: commit_record,
+        commit_bytes: signed.bytes,
+        expected_head_ref,
+        referenced_bytes: HashMap::new(),
+        tally: None,
+        build_state: BuildState {
+            base,
+            new_t,
+            flake_count,
+            txn_id_for_release,
+        },
+    })
+}
+
+impl StagedCommit {
+    /// Apply phase of [`commit`]. Consumes the [`StagedCommit`] from
+    /// [`build_commit`], writes the commit blob via content-addressable
+    /// `put_with_id` (idempotent), publishes the new head ref to the
+    /// nameservice, and finalizes the resulting [`LedgerState`].
+    ///
+    /// On publish failure, the raw-txn blob uploaded during
+    /// [`build_commit`] is released — that CID is no longer referenced
+    /// by any durable commit record.
+    pub async fn apply<C, N>(
+        self,
+        content_store: &C,
+        nameservice: &N,
+        skip_sequencing: bool,
+    ) -> Result<(CommitReceipt, LedgerState)>
+    where
+        C: ContentStore + ?Sized,
+        N: RefPublisher + ?Sized,
+    {
+        apply_commit_inner(self, content_store, nameservice, skip_sequencing).await
+    }
+
+    /// Pure post-publish/post-apply state finalization. Builds the
+    /// [`LedgerState`] and [`CommitReceipt`] from a [`StagedCommit`]
+    /// whose commit has been made durable through some external
+    /// mechanism (the standard nameservice publish in [`Self::apply`],
+    /// or a Raft `AdvanceRef` apply for the consensus path). No I/O —
+    /// caller is responsible for ensuring the commit is durable before
+    /// invoking.
+    pub fn finalize_state(self) -> Result<(CommitReceipt, LedgerState)> {
+        let StagedCommit {
+            commit,
+            build_state,
+            ..
+        } = self;
+        let BuildState {
+            base,
+            new_t,
+            flake_count,
+            ..
+        } = build_state;
+        let commit_cid = commit.id.clone().expect("build_commit sets commit.id");
+        finalize_state_with_base(commit, commit_cid, new_t, flake_count, base)
+    }
+}
+
+async fn apply_commit_inner<C, N>(
+    staged: StagedCommit,
+    content_store: &C,
+    nameservice: &N,
+    skip_sequencing: bool,
+) -> Result<(CommitReceipt, LedgerState)>
+where
+    C: ContentStore + ?Sized,
+    N: RefPublisher + ?Sized,
+{
+    let StagedCommit {
+        commit: commit_record,
+        commit_bytes,
+        expected_head_ref,
+        referenced_bytes,
+        tally: _,
+        build_state,
+    } = staged;
+    let BuildState {
+        base,
+        new_t,
+        flake_count,
+        txn_id_for_release,
+    } = build_state;
+
+    let commit_cid = commit_record
+        .id
+        .clone()
+        .expect("build_commit sets commit.id");
+    let ledger_id_for_publish = base.ledger_id().to_string();
+
+    // 8. Write referenced blobs the build phase deferred (today: none),
+    //    then write the commit blob via put_with_id (idempotent).
+    let write_and_publish = async {
+        for (cid, bytes) in &referenced_bytes {
+            content_store
+                .put_with_id(cid, bytes)
+                .instrument(tracing::debug_span!("commit_write_referenced_blob"))
                 .await?;
-            {
-                let span = tracing::debug_span!("commit_verify_sequencing");
-                let _g = span.enter();
-                verify_sequencing(&base, current.as_ref())?;
-            }
-            current.as_ref().map(commit_head_ref)
-        } else {
-            None
-        };
-
-        // 6. Build commit record
-        let new_t = base.t() + 1;
-        let flake_count = flakes.len();
-
-        // Capture namespace delta once:
-        // - write into commit record for persistence
-        // - apply to returned in-memory LedgerSnapshot so subsequent operations (e.g., SPARQL/JSON-LD queries)
-        //   can encode IRIs without requiring a reload.
-        let ns_delta = {
-            let span = tracing::debug_span!("commit_namespace_delta");
+        }
+        {
+            let span = tracing::debug_span!("commit_write_commit_blob");
             let _g = span.enter();
-            override_ns_delta.unwrap_or_else(|| ns_registry.take_delta())
-        };
-
-        // Apply envelope deltas (namespace + graph) to the in-memory LedgerSnapshot.
-        // This must happen before novelty apply so encode_iri() works for graph routing.
-        base.snapshot.apply_envelope_deltas(
-            &ns_delta,
-            graph_delta.values().map(std::string::String::as_str),
-        )?;
-
-        // Use caller-provided timestamp or default to wall clock.
-        let timestamp = opt_timestamp.unwrap_or_else(|| Utc::now().to_rfc3339());
-
-        // Store the original transaction JSON.
-        //
-        // Preferred path: the caller spawned the upload in parallel via
-        // `CommitOpts::with_raw_txn_spawned`, so we just await the handle here.
-        // On fast storage the upload has already completed; on slow storage
-        // (S3) the wait overlaps with staging rather than being additive.
-        //
-        // Fallback path: caller attached `raw_txn` without spawning — we
-        // upload serially.
-        let txn_id: Option<ContentId> = if let Some(pending) = raw_txn_upload {
-            let txn_cid = pending
-                .finish()
-                .instrument(tracing::debug_span!("commit_write_raw_txn"))
+            content_store
+                .put_with_id(&commit_cid, &commit_bytes)
                 .await?;
-            Some(txn_cid)
-        } else if let Some(txn_json) = &raw_txn {
-            let txn_cid = async {
-                let txn_bytes = serde_json::to_vec(txn_json)?;
-                let cid = content_store.put(ContentKind::Txn, &txn_bytes).await?;
-                tracing::info!(raw_txn_bytes = txn_bytes.len(), "raw txn stored");
-                Ok::<_, TransactError>(cid)
-            }
-            .instrument(tracing::debug_span!("commit_write_raw_txn"))
-            .await?;
-            Some(txn_cid)
-        } else {
-            None
+            tracing::info!(commit_bytes = commit_bytes.len(), "commit blob stored");
+        }
+
+        // 9. Publish to nameservice.
+        let new_head_ref = RefValue {
+            id: Some(commit_cid.clone()),
+            t: new_t,
         };
-        // Hold a clone for release-on-error. Once the commit has published
-        // successfully (nameservice CAS wins), this is dropped without
-        // releasing — the CID is referenced by the durable commit record.
-        let txn_id_for_release: Option<ContentId> = txn_id.clone();
-
-        // Build commit record, write the commit blob, and publish the new
-        // head to the nameservice. Wrapped in an inner async block so that
-        // any failure in this region releases the already-uploaded raw
-        // transaction content (see `txn_id_for_release`).
-        let head_commit_id = base.head_commit_id.clone();
-        let ledger_id_for_publish = base.ledger_id().to_string();
-        let ns_split_mode_for_genesis = if base.head_commit_id.is_none() {
-            Some(ns_registry.split_mode())
+        let publish_result = if skip_sequencing {
+            nameservice
+                .fast_forward_commit(ledger_id_for_publish.as_str(), &new_head_ref, 3)
+                .instrument(tracing::debug_span!("commit_publish_nameservice"))
+                .await?
         } else {
-            None
+            nameservice
+                .compare_and_set_ref(
+                    ledger_id_for_publish.as_str(),
+                    RefKind::CommitHead,
+                    expected_head_ref.as_ref(),
+                    &new_head_ref,
+                )
+                .instrument(tracing::debug_span!("commit_publish_nameservice"))
+                .await?
         };
-
-        let write_and_publish = async move {
-            let mut commit_record = {
-                let span = tracing::debug_span!("commit_build_record");
-                let _g = span.enter();
-                Commit::new(new_t, flakes)
-                    .with_namespace_delta(ns_delta)
-                    .with_time(timestamp)
-            };
-
-            // Add txn CID to commit record (must be before computing commit ID)
-            if let Some(txn_cid) = txn_id {
-                commit_record = commit_record.with_txn(txn_cid);
-            }
-
-            // Add txn signature if provided (audit metadata)
-            if let Some(txn_sig) = txn_signature {
-                commit_record = commit_record.with_txn_signature(txn_sig);
-            }
-
-            // Add user-provided transaction metadata
-            if !txn_meta.is_empty() {
-                commit_record = commit_record.with_txn_meta(txn_meta);
-            }
-
-            // Add named graph delta (g_id -> IRI mappings)
-            if !graph_delta.is_empty() {
-                commit_record.graph_delta = graph_delta;
-            }
-
-            // Persist the split mode in the genesis commit (first commit, no parent).
-            if let Some(split_mode) = ns_split_mode_for_genesis {
-                commit_record.ns_split_mode = Some(split_mode);
-            }
-
-            // Build previous commit reference from the head commit's ContentId.
-            if let Some(cid) = head_commit_id.clone() {
-                commit_record = commit_record.with_parent(cid);
-            }
-            // Append additional merge parent references.
-            for merge_parent in &merge_parents {
-                commit_record = commit_record.with_parent(merge_parent.clone());
-            }
-
-            // 7. Content-address + write (storage-owned)
-            //
-            // The on-disk commit blob is written *without* `id` set (to avoid
-            // self-reference). The ContentId is SHA-256 of the full blob.
-            let commit_cid = {
-                let span = tracing::debug_span!("commit_write_commit_blob");
-                let _g = span.enter();
-                let signing = signing_key
-                    .as_ref()
-                    .map(|key| (key.as_ref(), ledger_id_for_publish.as_str()));
-                let result = crate::commit_v2::write_commit(&commit_record, true, signing)?;
-                let commit_cid = content_store
-                    .put(ContentKind::Commit, &result.bytes)
-                    .await?;
-                tracing::info!(commit_bytes = result.bytes.len(), "commit blob stored");
-                commit_cid
-            };
-
-            // Update in-memory commit with its ContentId
-            commit_record.id = Some(commit_cid.clone());
-
-            // 8. Publish to nameservice through the explicit ref-CAS API so
-            // callers get a real conflict if another writer wins the race.
-            //
-            // During rebase replay (`skip_sequencing`), intermediate replays
-            // may target t values that are still behind the branch's current
-            // head (the old pre-rebase commits still populate the head until
-            // the final replay's t exceeds them). In that mode we fast-forward
-            // monotonically and treat a "stale t" conflict as a silent no-op
-            // — only the final replay whose t exceeds the existing head
-            // actually moves the branch forward, which matches the semantics
-            // of the legacy `publish_commit` (strictly-monotonic, silent on
-            // stale updates).
-            let new_head_ref = RefValue {
-                id: Some(commit_cid.clone()),
-                t: new_t,
-            };
-            let publish_result = if skip_sequencing {
-                nameservice
-                    .fast_forward_commit(ledger_id_for_publish.as_str(), &new_head_ref, 3)
-                    .instrument(tracing::debug_span!("commit_publish_nameservice"))
-                    .await?
-            } else {
-                nameservice
-                    .compare_and_set_ref(
-                        ledger_id_for_publish.as_str(),
-                        RefKind::CommitHead,
-                        expected_head_ref.as_ref(),
-                        &new_head_ref,
-                    )
-                    .instrument(tracing::debug_span!("commit_publish_nameservice"))
-                    .await?
-            };
-            match publish_result {
-                CasResult::Updated => {}
-                CasResult::Conflict { actual } if skip_sequencing => {
-                    // Stale-t conflict during rebase replay — the branch head
-                    // hasn't caught up yet. Treat as a no-op; a later replay
-                    // (whose new_t exceeds the current head) will succeed.
-                    let head_ahead = actual.as_ref().map(|r| r.t >= new_t).unwrap_or(false);
-                    if !head_ahead {
-                        return Err(TransactError::PublishLostRace {
-                            ledger_id: ledger_id_for_publish.clone(),
-                            attempted_t: new_t,
-                            attempted_commit_id: commit_cid.to_string(),
-                            published_t: actual.as_ref().map(|r| r.t).unwrap_or(0),
-                            published_commit_id: actual
-                                .and_then(|r| r.id)
-                                .map(|cid| cid.to_string())
-                                .unwrap_or_else(|| "None".to_string()),
-                        });
-                    }
-                }
-                CasResult::Conflict { actual } => {
+        match publish_result {
+            CasResult::Updated => {}
+            CasResult::Conflict { actual } if skip_sequencing => {
+                let head_ahead = actual.as_ref().map(|r| r.t >= new_t).unwrap_or(false);
+                if !head_ahead {
                     return Err(TransactError::PublishLostRace {
                         ledger_id: ledger_id_for_publish.clone(),
                         attempted_t: new_t,
@@ -594,131 +647,202 @@ where
                     });
                 }
             }
-
-            Ok::<_, TransactError>((commit_cid, commit_record))
-        };
-
-        let (commit_cid, mut commit_record) = match write_and_publish.await {
-            Ok(v) => v,
-            Err(e) => {
-                // Release the raw-txn content we uploaded earlier (parallel path)
-                // or inline-uploaded above — the commit never published, so that
-                // CID is now unreferenced by any durable commit record.
-                if let Some(cid) = &txn_id_for_release {
-                    if let Err(release_err) = content_store.release(cid).await {
-                        tracing::warn!(
-                            error = %release_err,
-                            raw_txn_cid = %cid,
-                            "failed to release raw txn after commit failure"
-                        );
-                    }
-                }
-                return Err(e);
-            }
-        };
-        // Commit published — raw_txn CID is now durably referenced by the
-        // commit record, so no release is needed. The `txn_id_for_release`
-        // Option falls out of scope normally.
-        let _ = txn_id_for_release;
-
-        // 9. Generate commit metadata flakes
-        // Note: We merge these into novelty only, not into commit_record.flakes
-        // (matching legacy behavior where metadata flakes are derived separately)
-        let commit_metadata_flakes = {
-            let span = tracing::debug_span!("commit_generate_metadata_flakes");
-            let _g = span.enter();
-            let mut flakes = generate_commit_flakes(&commit_record, base.ledger_id(), new_t);
-            let txn_meta_iri = fluree_db_core::txn_meta_graph_iri(base.ledger_id());
-            if let Some(g_sid) = base.snapshot.encode_iri(&txn_meta_iri) {
-                stamp_graph_on_commit_flakes(&mut flakes, &g_sid);
-            }
-            flakes
-        };
-        tracing::info!(
-            metadata_flakes = commit_metadata_flakes.len(),
-            "commit metadata flakes generated"
-        );
-
-        // 10. Build new state - merge commit_metadata_flakes with transaction flakes
-        let mut all_flakes = std::mem::take(&mut commit_record.flakes);
-        all_flakes.extend(commit_metadata_flakes);
-
-        // 10.1 Populate DictNovelty with subjects/strings from this commit
-        let mut dict_novelty = base.dict_novelty.clone();
-        {
-            let span = tracing::debug_span!("commit_populate_dict_novelty");
-            let _g = span.enter();
-            // Prefer pulling the BinaryIndexStore from the snapshot's range provider
-            // (this is the most reliable attachment point in the commit path).
-            let store = base
-                .snapshot
-                .range_provider
-                .as_ref()
-                .and_then(|rp| rp.as_any().downcast_ref::<BinaryRangeProvider>())
-                .map(|brp| Arc::clone(brp.store()))
-                .or_else(|| {
-                    base.binary_store
-                        .as_ref()
-                        .and_then(|te| Arc::clone(&te.0).downcast::<BinaryIndexStore>().ok())
+            CasResult::Conflict { actual } => {
+                return Err(TransactError::PublishLostRace {
+                    ledger_id: ledger_id_for_publish.clone(),
+                    attempted_t: new_t,
+                    attempted_commit_id: commit_cid.to_string(),
+                    published_t: actual.as_ref().map(|r| r.t).unwrap_or(0),
+                    published_commit_id: actual
+                        .and_then(|r| r.id)
+                        .map(|cid| cid.to_string())
+                        .unwrap_or_else(|| "None".to_string()),
                 });
-            populate_dict_novelty(
-                Arc::make_mut(&mut dict_novelty),
-                store.as_deref(),
-                &all_flakes,
-            )?;
+            }
         }
+        Ok::<_, TransactError>(())
+    };
 
-        let mut runtime_small_dicts = Arc::clone(&base.runtime_small_dicts);
-        Arc::make_mut(&mut runtime_small_dicts).populate_from_flakes(&all_flakes);
+    if let Err(e) = write_and_publish.await {
+        // Release raw-txn if its upload preceded a failed publish.
+        if let Some(cid) = &txn_id_for_release {
+            if let Err(release_err) = content_store.release(cid).await {
+                tracing::warn!(
+                    error = %release_err,
+                    raw_txn_cid = %cid,
+                    "failed to release raw txn after commit failure"
+                );
+            }
+        }
+        return Err(e);
+    }
+    // Commit published — raw_txn is durably referenced. The
+    // `txn_id_for_release` value falls out of scope.
+    let _ = txn_id_for_release;
 
-        let mut new_novelty = Arc::clone(&base.novelty);
-        {
-            let span = tracing::debug_span!("commit_apply_to_novelty");
+    finalize_state_with_base(commit_record, commit_cid, new_t, flake_count, base)
+}
+
+fn finalize_state_with_base(
+    mut commit_record: Commit,
+    commit_cid: ContentId,
+    new_t: i64,
+    flake_count: usize,
+    base: LedgerState,
+) -> Result<(CommitReceipt, LedgerState)> {
+    // 10. Generate commit metadata flakes
+    let commit_metadata_flakes = {
+        let span = tracing::debug_span!("commit_generate_metadata_flakes");
+        let _g = span.enter();
+        let mut flakes = generate_commit_flakes(&commit_record, base.ledger_id(), new_t);
+        let txn_meta_iri = fluree_db_core::txn_meta_graph_iri(base.ledger_id());
+        if let Some(g_sid) = base.snapshot.encode_iri(&txn_meta_iri) {
+            stamp_graph_on_commit_flakes(&mut flakes, &g_sid);
+        }
+        flakes
+    };
+    tracing::info!(
+        metadata_flakes = commit_metadata_flakes.len(),
+        "commit metadata flakes generated"
+    );
+
+    let mut all_flakes = std::mem::take(&mut commit_record.flakes);
+    all_flakes.extend(commit_metadata_flakes);
+
+    let mut dict_novelty = base.dict_novelty.clone();
+    {
+        let span = tracing::debug_span!("commit_populate_dict_novelty");
+        let _g = span.enter();
+        let store = base
+            .snapshot
+            .range_provider
+            .as_ref()
+            .and_then(|rp| rp.as_any().downcast_ref::<BinaryRangeProvider>())
+            .map(|brp| Arc::clone(brp.store()))
+            .or_else(|| {
+                base.binary_store
+                    .as_ref()
+                    .and_then(|te| Arc::clone(&te.0).downcast::<BinaryIndexStore>().ok())
+            });
+        populate_dict_novelty(
+            Arc::make_mut(&mut dict_novelty),
+            store.as_deref(),
+            &all_flakes,
+        )?;
+    }
+
+    let mut runtime_small_dicts = Arc::clone(&base.runtime_small_dicts);
+    Arc::make_mut(&mut runtime_small_dicts).populate_from_flakes(&all_flakes);
+
+    let mut new_novelty = Arc::clone(&base.novelty);
+    {
+        let span = tracing::debug_span!("commit_apply_to_novelty");
+        let _g = span.enter();
+        let mut reverse_graph = base.snapshot.build_reverse_graph()?;
+        let txn_meta_iri = fluree_db_core::txn_meta_graph_iri(base.ledger_id());
+        if let Some(g_sid) = base.snapshot.encode_iri(&txn_meta_iri) {
+            reverse_graph.entry(g_sid).or_insert(TXN_META_GRAPH_ID);
+        }
+        Arc::make_mut(&mut new_novelty).apply_commit(all_flakes, new_t, &reverse_graph)?;
+    }
+
+    let mut snapshot = base.snapshot;
+    if let Some(provider) = snapshot.range_provider.as_ref() {
+        if let Some(brp) = provider.as_any().downcast_ref::<BinaryRangeProvider>() {
+            let ns_fallback = Some(Arc::new(snapshot.namespaces().clone()));
+            snapshot.range_provider = Some(Arc::new(BinaryRangeProvider::new(
+                Arc::clone(brp.store()),
+                Arc::clone(&dict_novelty),
+                Arc::clone(&runtime_small_dicts),
+                ns_fallback,
+            )));
+        }
+    }
+
+    let new_state = LedgerState {
+        snapshot,
+        novelty: new_novelty,
+        dict_novelty,
+        runtime_small_dicts,
+        head_commit_id: Some(commit_cid.clone()),
+        head_index_id: base.head_index_id,
+        ns_record: base.ns_record,
+        binary_store: base.binary_store,
+        spatial_indexes: base.spatial_indexes,
+    };
+
+    let receipt = CommitReceipt {
+        commit_id: commit_cid,
+        t: new_t,
+        flake_count,
+    };
+    Ok((receipt, new_state))
+}
+
+/// Existing single-node transactional path — composes
+/// [`build_commit`] + [`StagedCommit::apply`].
+pub async fn commit<C, N>(
+    view: StagedLedger,
+    ns_registry: NamespaceRegistry,
+    content_store: &C,
+    nameservice: &N,
+    index_config: &IndexConfig,
+    mut opts: CommitOpts,
+) -> Result<(CommitReceipt, LedgerState)>
+where
+    C: ContentStore + ?Sized,
+    N: NameService + RefPublisher + ?Sized,
+{
+    let skip_sequencing = opts.skip_sequencing;
+
+    let commit_span = tracing::debug_span!(
+        "txn_commit",
+        alias = view.base().ledger_id(),
+        base_t = view.base().t(),
+        flake_count = tracing::field::Empty,
+        delta_bytes = tracing::field::Empty,
+        current_novelty_bytes = tracing::field::Empty,
+        max_novelty_bytes = index_config.reindex_max_bytes,
+        has_raw_txn = opts.raw_txn_upload.is_some(),
+    );
+
+    async move {
+        let txn_id = if let Some(pending) = opts.raw_txn_upload.take() {
+            Some(
+                pending
+                    .finish()
+                    .instrument(tracing::debug_span!("commit_write_raw_txn"))
+                    .await?,
+            )
+        } else {
+            None
+        };
+
+        let current = if skip_sequencing {
+            None
+        } else {
+            nameservice
+                .lookup(view.base().ledger_id())
+                .instrument(tracing::debug_span!("commit_nameservice_lookup"))
+                .await?
+        };
+        if !skip_sequencing {
+            let span = tracing::debug_span!("commit_verify_sequencing");
             let _g = span.enter();
-            let mut reverse_graph = base.snapshot.build_reverse_graph()?;
-            // Ensure txn-meta graph is always routable for commit metadata flakes.
-            let txn_meta_iri = fluree_db_core::txn_meta_graph_iri(base.ledger_id());
-            if let Some(g_sid) = base.snapshot.encode_iri(&txn_meta_iri) {
-                reverse_graph.entry(g_sid).or_insert(TXN_META_GRAPH_ID);
-            }
-            Arc::make_mut(&mut new_novelty).apply_commit(all_flakes, new_t, &reverse_graph)?;
+            verify_sequencing(view.base(), current.as_ref())?;
         }
+        let expected_head_ref = current.as_ref().map(commit_head_ref);
 
-        // If the snapshot has an attached BinaryRangeProvider, re-attach it with the
-        // updated `dict_novelty` so overlay translation can resolve newly-introduced
-        // subject/string IDs (otherwise the provider holds a stale Arc).
-        let mut snapshot = base.snapshot;
-        if let Some(provider) = snapshot.range_provider.as_ref() {
-            if let Some(brp) = provider.as_any().downcast_ref::<BinaryRangeProvider>() {
-                let ns_fallback = Some(Arc::new(snapshot.namespaces().clone()));
-                snapshot.range_provider = Some(Arc::new(BinaryRangeProvider::new(
-                    Arc::clone(brp.store()),
-                    Arc::clone(&dict_novelty),
-                    Arc::clone(&runtime_small_dicts),
-                    ns_fallback,
-                )));
-            }
-        }
-
-        let new_state = LedgerState {
-            snapshot,
-            novelty: new_novelty,
-            dict_novelty,
-            runtime_small_dicts,
-            head_commit_id: Some(commit_cid.clone()),
-            head_index_id: base.head_index_id,
-            ns_record: base.ns_record,
-            binary_store: base.binary_store,
-            spatial_indexes: base.spatial_indexes,
-        };
-
-        let receipt = CommitReceipt {
-            commit_id: commit_cid,
-            t: new_t,
-            flake_count,
-        };
-
-        Ok((receipt, new_state))
+        let staged = build_commit(
+            view,
+            ns_registry,
+            expected_head_ref,
+            txn_id,
+            index_config,
+            opts,
+        )
+        .await?;
+        staged.apply(content_store, nameservice, skip_sequencing).await
     }
     .instrument(commit_span)
     .await
@@ -754,7 +878,6 @@ fn populate_dict_novelty(
     .map_err(|e| TransactError::FlakeGeneration(format!("populate_dict_novelty_safe: {e}")))
 }
 
-/// Verify that this commit follows the expected sequence
 fn verify_sequencing(
     base: &LedgerState,
     current: Option<&fluree_db_nameservice::NsRecord>,

@@ -120,6 +120,7 @@ pub use dataset::{
 };
 pub use error::{ApiError, BuilderError, BuilderErrors, Result};
 pub use fluree_db_core::ledger_id::format_ledger_id;
+pub use fluree_db_core::storage::ledger_id_prefix_for_path;
 pub use fluree_db_core::RemoteObject;
 pub use fluree_db_core::{
     commit_to_summary, find_common_ancestor, walk_commit_summaries, CommitSummary, CommonAncestor,
@@ -235,8 +236,9 @@ pub use fluree_db_query::{Term, TriplePattern};
 pub use fluree_db_query::ir::Query;
 pub use fluree_db_query::parse::ParseError;
 pub use fluree_db_transact::{
-    lower_sparql_update, lower_sparql_update_ast, CommitOpts, CommitReceipt,
-    LowerError as SparqlUpdateLowerError, NamespaceRegistry, TransactError, TxnOpts, TxnType,
+    build_commit, lower_sparql_update, lower_sparql_update_ast, CommitOpts, CommitReceipt,
+    LowerError as SparqlUpdateLowerError, NamespaceRegistry, StagedCommit, TransactError, TxnOpts,
+    TxnType,
 };
 
 // Re-export SPARQL types (product feature; always enabled)

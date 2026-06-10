@@ -18,7 +18,7 @@ use crate::{
     Committer, IdempotencyCacheKey, IdempotencyKey, LocalCommitter, MergeReceipt, MergeRequest,
     OperationReceipt, PushReceipt, PushRequest, RebaseReceipt, RebaseRequest, RevertReceipt,
     RevertRequest, RevertSelection, SubmissionError, SubmissionLookup, SubmissionState,
-    TransactionBody, TransactionReceipt, TransactionRequest,
+    TransactionReceipt, TransactionRequest,
 };
 use async_trait::async_trait;
 use fluree_db_api::{CommitRef, Fluree};
@@ -122,42 +122,7 @@ impl<C: Committer> CachingCommitter<C> {
     }
 
     fn hash_request_body(request: &TransactionRequest) -> [u8; 32] {
-        let mut hasher = Sha256::new();
-        // Each variant tag distinguishes both format and insert/upsert/update
-        // semantics — same bytes under a different variant produce different
-        // hashes, so two retries that disagree on operation kind collide
-        // correctly.
-        match &request.body {
-            TransactionBody::JsonLdInsert(json) => {
-                hasher.update(b"jsonld-insert");
-                hasher.update(json.to_string().as_bytes());
-            }
-            TransactionBody::JsonLdUpsert(json) => {
-                hasher.update(b"jsonld-upsert");
-                hasher.update(json.to_string().as_bytes());
-            }
-            TransactionBody::JsonLdUpdate(json) => {
-                hasher.update(b"jsonld-update");
-                hasher.update(json.to_string().as_bytes());
-            }
-            TransactionBody::TurtleInsert(text) => {
-                hasher.update(b"turtle-insert");
-                hasher.update(text.as_bytes());
-            }
-            TransactionBody::TurtleUpsert(text) => {
-                hasher.update(b"turtle-upsert");
-                hasher.update(text.as_bytes());
-            }
-            TransactionBody::TrigUpsert(text) => {
-                hasher.update(b"trig-upsert");
-                hasher.update(text.as_bytes());
-            }
-            TransactionBody::Sparql(text) => {
-                hasher.update(b"sparql");
-                hasher.update(text.as_bytes());
-            }
-        }
-        hasher.finalize().into()
+        request.body.body_hash()
     }
 
     /// Atomically claim an idempotency slot in the cache.
@@ -487,6 +452,7 @@ impl<C: Committer> SubmissionLookup for CachingCommitter<C> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::TransactionBody;
     use fluree_db_api::{
         CommitId, CommitRef, ConflictStrategy, FlureeBuilder, GovernanceOptions, TrackingOptions,
     };

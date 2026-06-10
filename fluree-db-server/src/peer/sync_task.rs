@@ -248,7 +248,7 @@ impl PeerSyncTask {
                     RefKind::IndexHead,
                     current.as_ref(),
                     &index_head,
-                )
+                        )
                 .await;
             match index_result {
                 Ok(CasResult::Updated) => {}

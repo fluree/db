@@ -44,11 +44,12 @@ use std::collections::HashMap;
 use std::fmt;
 use thiserror::Error;
 
-/// Caller-provided identifier for a transaction submission.
+/// Caller-provided identifier for a write submission.
 ///
-/// Used both for idempotent retry (retries with the same key collapse to one
-/// outcome) and for status lookup via [`SubmissionLookup`]. Callers typically
-/// generate a ULID before submission so they can recover after a disconnect.
+/// Used for idempotent retry (retries with the same key collapse to one
+/// outcome) and for after-the-fact status lookup. Callers typically
+/// generate a ULID before submission so they can recover after a
+/// disconnect.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct IdempotencyKey(String);
 
@@ -139,6 +140,53 @@ impl TransactionBody {
             Self::JsonLdUpdate(_) => "update",
             Self::Sparql(_) => "sparql-update",
         }
+    }
+
+    /// SHA-256 of this body's canonical bytes.
+    ///
+    /// Each variant tag is mixed into the digest so the same JSON
+    /// bytes under different semantics (insert vs upsert vs update)
+    /// hash to different values — two retries that disagree on
+    /// operation kind collide correctly.
+    ///
+    /// Used both by the in-process caching layer (to detect
+    /// "same key, different body" misuse) and by consensus-coordinated
+    /// nameservices (to populate the [`IdempotencyContext`]'s
+    /// `body_hash` field).
+    pub fn body_hash(&self) -> [u8; 32] {
+        use sha2::{Digest, Sha256};
+        let mut hasher = Sha256::new();
+        match self {
+            Self::JsonLdInsert(json) => {
+                hasher.update(b"jsonld-insert");
+                hasher.update(json.to_string().as_bytes());
+            }
+            Self::JsonLdUpsert(json) => {
+                hasher.update(b"jsonld-upsert");
+                hasher.update(json.to_string().as_bytes());
+            }
+            Self::JsonLdUpdate(json) => {
+                hasher.update(b"jsonld-update");
+                hasher.update(json.to_string().as_bytes());
+            }
+            Self::TurtleInsert(text) => {
+                hasher.update(b"turtle-insert");
+                hasher.update(text.as_bytes());
+            }
+            Self::TurtleUpsert(text) => {
+                hasher.update(b"turtle-upsert");
+                hasher.update(text.as_bytes());
+            }
+            Self::TrigUpsert(text) => {
+                hasher.update(b"trig-upsert");
+                hasher.update(text.as_bytes());
+            }
+            Self::Sparql(text) => {
+                hasher.update(b"sparql");
+                hasher.update(text.as_bytes());
+            }
+        }
+        hasher.finalize().into()
     }
 }
 

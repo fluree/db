@@ -106,7 +106,7 @@ impl TrackingOptions {
 }
 
 /// Policy execution statistics: `{:executed N :allowed M}`
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PolicyStats {
     pub executed: u64,
     pub allowed: u64,
@@ -269,7 +269,7 @@ impl Tracker {
 }
 
 /// Tracking tally returned on completion.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TrackingTally {
     /// Formatted time string like `"12.34ms"`
     #[serde(skip_serializing_if = "Option::is_none")]

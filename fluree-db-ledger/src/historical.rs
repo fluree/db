@@ -609,7 +609,11 @@ mod tests {
             id: Some(cid.clone()),
             t: commit.t,
         };
-        match ns.fast_forward_commit(ledger_id, &new, 3).await.unwrap() {
+        match ns
+            .fast_forward_commit(ledger_id, &new, 3)
+            .await
+            .unwrap()
+        {
             CasResult::Updated => {}
             CasResult::Conflict { actual } => {
                 assert!(
