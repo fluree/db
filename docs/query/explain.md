@@ -305,7 +305,10 @@ bounded subject probing (default 65,536 subjects), and
 size). Probing requires HEAD execution (no overlay, `to_t == max_t`); otherwise
 every edge is loaded by a full overlay-correct scan as before. Setting
 `FLUREE_CYCLIC_BGP_MAX_BOUNDED_SUBJECTS=0` disables probing without disabling
-the operator. The node exposes the old nested-loop
+the operator. When statistics prove no probe can ever pass the subject cap
+(every edge's subject variable is only exposed by edges whose distinct counts
+exceed the cap with margin), the edge scans and relation-index builds run
+concurrently on the shared worker pool instead of the sequential cascade. The node exposes the old nested-loop
 plan as a `fallback` child; the fallback runs when the runtime mode is
 unsupported by the fast path.
 
