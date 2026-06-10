@@ -328,22 +328,27 @@ async fn run_update_branch(
     // Async uploader: drain the channel, uploading each blob under the global
     // budget and freeing its bytes. Runs concurrently with the CoW.
     let upload_budget_ref = upload_budget.as_ref();
-    let uploader = async {
-        let mut totals = LeafUploadCounts::default();
-        while let Some(blob) = rx.recv().await {
-            let c = upload_one_leaf_blob(
-                content_store.as_ref(),
-                &tracker,
-                upload_budget_ref,
-                &cache_dir,
-                blob,
-            )
-            .await?;
-            totals.leaf_bytes += c.leaf_bytes;
-            totals.sidecar_bytes += c.sidecar_bytes;
-            totals.sidecar_count += c.sidecar_count;
+    let uploader = {
+        let content_store = content_store.as_ref();
+        let tracker = &tracker;
+        let cache_dir = &cache_dir;
+        async move {
+            let mut totals = LeafUploadCounts::default();
+            while let Some(blob) = rx.recv().await {
+                let c = upload_one_leaf_blob(
+                    content_store,
+                    tracker,
+                    upload_budget_ref,
+                    cache_dir,
+                    blob,
+                )
+                .await?;
+                totals.leaf_bytes += c.leaf_bytes;
+                totals.sidecar_bytes += c.sidecar_bytes;
+                totals.sidecar_count += c.sidecar_count;
+            }
+            Ok::<LeafUploadCounts, IndexerError>(totals)
         }
-        Ok::<LeafUploadCounts, IndexerError>(totals)
     };
 
     // Drive both to completion. If the uploader fails it drops `rx`, so the

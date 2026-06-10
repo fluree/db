@@ -112,34 +112,6 @@ impl ChunkSubjectDict {
         self.forward
     }
 
-    /// Sort the forward entries by `(ns_code ASC, suffix_bytes ASC)` and write
-    /// them to a sorted vocab file at `path`.
-    ///
-    /// Each entry is written with its original chunk-local ID (its position in
-    /// the unsorted `forward` vec) so the merge phase can build remap tables.
-    ///
-    /// Consumes `self` — the dict's reverse map and forward vec are freed after
-    /// writing. Returns the number of entries written.
-    pub fn write_sorted_vocab(self, path: &Path) -> io::Result<u64> {
-        let forward = self.forward;
-        let n = forward.len();
-
-        // Build sorted indices.
-        let mut indices: Vec<usize> = (0..n).collect();
-        indices.sort_unstable_by(|&a, &b| {
-            let (ns_a, ref suf_a) = forward[a];
-            let (ns_b, ref suf_b) = forward[b];
-            ns_a.cmp(&ns_b).then_with(|| suf_a.cmp(suf_b))
-        });
-
-        let mut writer = SubjectVocabWriter::new(path)?;
-        for &idx in &indices {
-            let (ns_code, ref suffix) = forward[idx];
-            writer.write_entry(ns_code, idx as u64, suffix)?;
-        }
-        writer.finish()
-    }
-
     /// Sort entries by canonical subject order `(ns_code ASC, suffix ASC)`,
     /// write a sorted vocab file with **sorted-position IDs** (0, 1, 2, ...),
     /// and return the insertion→sorted remap table.
@@ -268,27 +240,6 @@ impl ChunkStringDict {
     /// Consume the dict and return the forward entries.
     pub fn into_forward_entries(self) -> Vec<Vec<u8>> {
         self.forward
-    }
-
-    /// Sort the forward entries by string bytes (lexicographic ASC) and write
-    /// them to a sorted vocab file at `path`.
-    ///
-    /// Each entry is written with its original chunk-local ID (its position in
-    /// the unsorted `forward` vec) so the merge phase can build remap tables.
-    ///
-    /// Consumes `self`. Returns the number of entries written.
-    pub fn write_sorted_vocab(self, path: &Path) -> io::Result<u64> {
-        let forward = self.forward;
-        let n = forward.len();
-
-        let mut indices: Vec<usize> = (0..n).collect();
-        indices.sort_unstable_by(|&a, &b| forward[a].cmp(&forward[b]));
-
-        let mut writer = StringVocabWriter::new(path)?;
-        for &idx in &indices {
-            writer.write_entry(idx as u32, &forward[idx])?;
-        }
-        writer.finish()
     }
 
     /// Sort entries by UTF-8 byte-lex order, write a sorted vocab file with
@@ -521,7 +472,12 @@ mod tests {
         assert_ne!(h1, h2);
     }
 
-    // ---- write_sorted_vocab tests ----
+    // ---- sort_and_write_sorted_vocab tests ----
+    //
+    // `sort_and_write_sorted_vocab` is the only vocab writer the import pipeline
+    // uses: it writes entries in canonical sorted order with `local_id =
+    // sorted_position` (so the k-way merge drains each chunk in local_id order)
+    // and returns the `insertion_id → sorted_position` remap applied to records.
 
     fn temp_path(name: &str) -> std::path::PathBuf {
         let dir = std::env::temp_dir().join("fluree_chunk_dict_tests");
@@ -530,25 +486,28 @@ mod tests {
     }
 
     #[test]
-    fn test_subject_write_sorted_vocab() {
+    fn test_subject_sort_and_write_sorted_vocab() {
         use crate::run_index::vocab::vocab_file::SubjectVocabReader;
 
         let mut dict = ChunkSubjectDict::new();
-        // Insert out of sorted order: ns=20 before ns=5, and within ns=5 "Zara" before "Alice"
-        dict.get_or_insert(20, b"Carol"); // local_id=0
-        dict.get_or_insert(5, b"Zara"); // local_id=1
-        dict.get_or_insert(5, b"Alice"); // local_id=2
+        // Insert out of sorted order: ns=20 before ns=5, and within ns=5 "Zara" before "Alice".
+        dict.get_or_insert(20, b"Carol"); // insertion_id=0
+        dict.get_or_insert(5, b"Zara"); // insertion_id=1
+        dict.get_or_insert(5, b"Alice"); // insertion_id=2
 
         let path = temp_path("subj_sorted.voc");
-        let count = dict.write_sorted_vocab(&path).unwrap();
+        let (remap, count) = dict.sort_and_write_sorted_vocab(&path).unwrap();
         assert_eq!(count, 3);
+        // remap[insertion_id] = sorted_position.
+        // Sorted order: (5,Alice)=0, (5,Zara)=1, (20,Carol)=2.
+        assert_eq!(remap, vec![2, 1, 0]); // Carol→2, Zara→1, Alice→0
 
-        // Read back: should be sorted (5,"Alice"), (5,"Zara"), (20,"Carol")
+        // Read back: sorted (5,"Alice"), (5,"Zara"), (20,"Carol") with sorted-position local_ids.
         let mut r = SubjectVocabReader::open(&path).unwrap();
 
         let e0 = r.next_entry().unwrap().unwrap();
         assert_eq!((e0.ns_code, &e0.suffix[..]), (5, &b"Alice"[..]));
-        assert_eq!(e0.local_id, 2); // original position
+        assert_eq!(e0.local_id, 0);
 
         let e1 = r.next_entry().unwrap().unwrap();
         assert_eq!((e1.ns_code, &e1.suffix[..]), (5, &b"Zara"[..]));
@@ -556,60 +515,64 @@ mod tests {
 
         let e2 = r.next_entry().unwrap().unwrap();
         assert_eq!((e2.ns_code, &e2.suffix[..]), (20, &b"Carol"[..]));
-        assert_eq!(e2.local_id, 0);
+        assert_eq!(e2.local_id, 2);
 
         assert!(r.next_entry().unwrap().is_none());
         std::fs::remove_file(&path).ok();
     }
 
     #[test]
-    fn test_string_write_sorted_vocab() {
+    fn test_string_sort_and_write_sorted_vocab() {
         use crate::run_index::vocab::vocab_file::StringVocabReader;
 
         let mut dict = ChunkStringDict::new();
-        // Insert out of sorted order
-        dict.get_or_insert(b"gamma"); // local_id=0
-        dict.get_or_insert(b"alpha"); // local_id=1
-        dict.get_or_insert(b"beta"); // local_id=2
+        // Insert out of sorted order.
+        dict.get_or_insert(b"gamma"); // insertion_id=0
+        dict.get_or_insert(b"alpha"); // insertion_id=1
+        dict.get_or_insert(b"beta"); // insertion_id=2
 
         let path = temp_path("str_sorted.voc");
-        let count = dict.write_sorted_vocab(&path).unwrap();
+        let (remap, count) = dict.sort_and_write_sorted_vocab(&path).unwrap();
         assert_eq!(count, 3);
+        // Sorted order: alpha=0, beta=1, gamma=2.
+        assert_eq!(remap, vec![2, 0, 1]); // gamma→2, alpha→0, beta→1
 
-        // Read back: should be sorted "alpha", "beta", "gamma"
+        // Read back: sorted "alpha", "beta", "gamma" with sorted-position local_ids.
         let mut r = StringVocabReader::open(&path).unwrap();
 
         let e0 = r.next_entry().unwrap().unwrap();
         assert_eq!(&e0.string_bytes[..], b"alpha");
-        assert_eq!(e0.local_id, 1);
+        assert_eq!(e0.local_id, 0);
 
         let e1 = r.next_entry().unwrap().unwrap();
         assert_eq!(&e1.string_bytes[..], b"beta");
-        assert_eq!(e1.local_id, 2);
+        assert_eq!(e1.local_id, 1);
 
         let e2 = r.next_entry().unwrap().unwrap();
         assert_eq!(&e2.string_bytes[..], b"gamma");
-        assert_eq!(e2.local_id, 0);
+        assert_eq!(e2.local_id, 2);
 
         assert!(r.next_entry().unwrap().is_none());
         std::fs::remove_file(&path).ok();
     }
 
     #[test]
-    fn test_subject_write_sorted_vocab_empty() {
+    fn test_subject_sort_and_write_sorted_vocab_empty() {
         let dict = ChunkSubjectDict::new();
         let path = temp_path("subj_sorted_empty.voc");
-        let count = dict.write_sorted_vocab(&path).unwrap();
+        let (remap, count) = dict.sort_and_write_sorted_vocab(&path).unwrap();
         assert_eq!(count, 0);
+        assert!(remap.is_empty());
         std::fs::remove_file(&path).ok();
     }
 
     #[test]
-    fn test_string_write_sorted_vocab_empty() {
+    fn test_string_sort_and_write_sorted_vocab_empty() {
         let dict = ChunkStringDict::new();
         let path = temp_path("str_sorted_empty.voc");
-        let count = dict.write_sorted_vocab(&path).unwrap();
+        let (remap, count) = dict.sort_and_write_sorted_vocab(&path).unwrap();
         assert_eq!(count, 0);
+        assert!(remap.is_empty());
         std::fs::remove_file(&path).ok();
     }
 }

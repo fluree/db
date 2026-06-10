@@ -66,6 +66,7 @@ pub mod stats_view;
 pub mod stats_wire;
 pub mod storage;
 pub mod subject_id;
+pub mod sysmem;
 pub mod temporal;
 pub mod tracking;
 pub mod value;

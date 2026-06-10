@@ -36,6 +36,7 @@ pub mod fulltext_hook;
 pub mod gc;
 #[path = "stats/hll256.rs"]
 pub mod hll;
+pub mod mem;
 pub mod orchestrator;
 pub mod run_index;
 pub mod spatial_hook;
