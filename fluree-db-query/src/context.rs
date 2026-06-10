@@ -12,6 +12,7 @@ use crate::remote_service::RemoteServiceExecutor;
 use crate::var_registry::VarRegistry;
 use crate::vector::VectorIndexProvider;
 use fluree_db_binary_index::{BinaryGraphView, BinaryIndexStore, FulltextArena};
+use fluree_db_core::comparator::IndexType;
 use fluree_db_core::dict_novelty::DictNovelty;
 use fluree_db_core::{
     GraphDbRef, GraphId, LedgerSnapshot, NoOverlay, OverlayProvider, QueryCancellation,
@@ -58,6 +59,21 @@ pub type ConstSidCache = Arc<Mutex<FxHashMap<ConstSidKey, Option<u64>>>>;
 /// Map from `(graph_id, predicate_id, lang_id)` to fulltext BoW arenas used
 /// by `fulltext()` BM25 scoring.
 pub type FulltextProviders = HashMap<(GraphId, u32, u16), Arc<FulltextArena>>;
+
+/// Per-query memo for overlay flake → V3 `OverlayOp` translation, keyed by
+/// `(overlay epoch, graph id, index)`.
+///
+/// Translating the overlay walks every overlay flake and resolves each
+/// subject/predicate/object through the dictionaries, then sorts the result —
+/// O(overlay size × dict lookups). Per-row join probes open a fresh scan per
+/// left row; without this memo each probe re-translates the entire overlay
+/// (quadratic on reasoning queries, where the derived-facts overlay holds the
+/// whole materialization).
+///
+/// Scoping: contexts that swap the overlay (`with_graph_ref`) start a fresh
+/// memo, mirroring `const_sid_cache`; same-overlay derivations share it.
+pub type OverlayOpsCache =
+    Arc<Mutex<FxHashMap<(u64, GraphId, IndexType), Arc<crate::binary_scan::TranslatedOverlayOps>>>>;
 
 /// Execution context providing access to database and query state.
 ///
@@ -197,6 +213,9 @@ pub struct ExecutionContext<'a> {
     /// Per-query memo: constant filter operands → internal subject id, so a
     /// `<const> != ?var` FILTER resolves the constant once, not per row.
     pub const_sid_cache: ConstSidCache,
+    /// Per-query memo: translated + sorted overlay ops per (epoch, graph, index),
+    /// so per-row scan opens reuse one overlay translation (see [`OverlayOpsCache`]).
+    pub overlay_ops_cache: OverlayOpsCache,
 }
 
 impl<'a> ExecutionContext<'a> {
@@ -234,6 +253,7 @@ impl<'a> ExecutionContext<'a> {
             eager_materialization: false,
             original_snapshot: snapshot,
             const_sid_cache: ConstSidCache::default(),
+            overlay_ops_cache: OverlayOpsCache::default(),
         }
     }
 
@@ -283,6 +303,7 @@ impl<'a> ExecutionContext<'a> {
             eager_materialization: db.eager,
             original_snapshot: db.snapshot,
             const_sid_cache: ConstSidCache::default(),
+            overlay_ops_cache: OverlayOpsCache::default(),
         }
     }
 
@@ -336,6 +357,7 @@ impl<'a> ExecutionContext<'a> {
             eager_materialization: db.eager,
             original_snapshot: db.snapshot,
             const_sid_cache: ConstSidCache::default(),
+            overlay_ops_cache: OverlayOpsCache::default(),
         }
     }
 
@@ -378,6 +400,7 @@ impl<'a> ExecutionContext<'a> {
             eager_materialization: false,
             original_snapshot: snapshot,
             const_sid_cache: ConstSidCache::default(),
+            overlay_ops_cache: OverlayOpsCache::default(),
         }
     }
 
@@ -419,6 +442,7 @@ impl<'a> ExecutionContext<'a> {
             eager_materialization: false,
             original_snapshot: snapshot,
             const_sid_cache: ConstSidCache::default(),
+            overlay_ops_cache: OverlayOpsCache::default(),
         }
     }
 
@@ -462,6 +486,7 @@ impl<'a> ExecutionContext<'a> {
             eager_materialization: false,
             original_snapshot: snapshot,
             const_sid_cache: ConstSidCache::default(),
+            overlay_ops_cache: OverlayOpsCache::default(),
         }
     }
 
@@ -917,6 +942,7 @@ impl<'a> ExecutionContext<'a> {
             eager_materialization: self.eager_materialization,
             original_snapshot: self.original_snapshot,
             const_sid_cache: self.const_sid_cache.clone(),
+            overlay_ops_cache: self.overlay_ops_cache.clone(),
         }
     }
 
@@ -969,6 +995,7 @@ impl<'a> ExecutionContext<'a> {
             eager_materialization: self.eager_materialization,
             original_snapshot: self.original_snapshot,
             const_sid_cache: self.const_sid_cache.clone(),
+            overlay_ops_cache: self.overlay_ops_cache.clone(),
         }
     }
 
@@ -1024,6 +1051,7 @@ impl<'a> ExecutionContext<'a> {
             // graph/store into another. (`with_active_graph`/`with_default_graph`
             // keep the same store, so they correctly share the parent's memo.)
             const_sid_cache: ConstSidCache::default(),
+            overlay_ops_cache: OverlayOpsCache::default(),
         }
     }
 

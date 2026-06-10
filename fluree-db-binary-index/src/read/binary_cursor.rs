@@ -48,7 +48,7 @@ pub struct BinaryCursor {
     current_leaflet_idx: usize,
     exhausted: bool,
     /// Overlay ops sorted by this cursor's sort order.
-    overlay_ops: Vec<OverlayOp>,
+    overlay_ops: Arc<[OverlayOp]>,
     /// Start position in overlay_ops for the current leaf (set per-leaf via slicing).
     overlay_pos: usize,
     /// Exclusive end position in overlay_ops for the current leaf.
@@ -93,7 +93,7 @@ impl BinaryCursor {
             // Don't mark exhausted when leaf_range is empty — overlay-only path
             // may still have ops to emit.
             exhausted: false,
-            overlay_ops: Vec::new(),
+            overlay_ops: Arc::from([]),
             overlay_pos: 0,
             leaf_overlay_end: 0,
             epoch: 0,
@@ -122,7 +122,7 @@ impl BinaryCursor {
             current_leaf: None,
             current_leaflet_idx: 0,
             exhausted: false,
-            overlay_ops: Vec::new(),
+            overlay_ops: Arc::from([]),
             overlay_pos: 0,
             leaf_overlay_end: 0,
             epoch: 0,
@@ -147,6 +147,15 @@ impl BinaryCursor {
     /// assert/retract lifecycles must be resolved (at most one op per fact key).
     /// Use [`sort_overlay_ops`] then [`resolve_overlay_ops`] before calling.
     pub fn set_overlay_ops(&mut self, ops: Vec<OverlayOp>) {
+        self.set_overlay_ops_shared(ops.into());
+    }
+
+    /// Set overlay ops from a shared, pre-translated slice.
+    ///
+    /// Same contract as [`Self::set_overlay_ops`]. Use this when the same
+    /// translated overlay is attached to many cursors (e.g. per-row join
+    /// probes) to avoid cloning the ops per cursor.
+    pub fn set_overlay_ops_shared(&mut self, ops: Arc<[OverlayOp]>) {
         debug_assert!(
             ops.windows(2).all(|w| w[0].fact_key() != w[1].fact_key()),
             "overlay ops contain duplicate fact keys — caller must resolve \

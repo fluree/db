@@ -1934,20 +1934,50 @@ impl Operator for BinaryScanOperator {
         };
 
         // Overlay: translate novelty flakes to OverlayOp and attach to cursor.
+        //
+        // Translation + sorting is a pure function of (overlay epoch, graph,
+        // index) within one execution, and per-row join probes re-open a scan
+        // per left row — so the translated product is memoized in the
+        // execution context and shared across cursors (see `OverlayOpsCache`).
         if ctx.overlay.is_some() {
-            let (mut ops, mut untranslated, ephemeral_preds) =
-                translate_overlay_flakes_with_untranslated(
-                    ctx.overlay(),
-                    &store_arc,
-                    ctx.dict_novelty.as_ref(),
-                    ctx.runtime_small_dicts,
-                    ctx.to_t,
-                    self.g_id,
-                );
+            let epoch = ctx.overlay().epoch();
+            let cache_key = (epoch, self.g_id, self.index);
+            let translated = {
+                let mut cache = ctx
+                    .overlay_ops_cache
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                if let Some(hit) = cache.get(&cache_key) {
+                    Arc::clone(hit)
+                } else {
+                    let (mut ops, mut untranslated, ephemeral_preds) =
+                        translate_overlay_flakes_with_untranslated(
+                            ctx.overlay(),
+                            &store_arc,
+                            ctx.dict_novelty.as_ref(),
+                            ctx.runtime_small_dicts,
+                            ctx.to_t,
+                            self.g_id,
+                        );
+                    sort_overlay_ops(&mut ops, order);
+                    resolve_overlay_ops(&mut ops);
+                    if !untranslated.is_empty() {
+                        untranslated.sort_by(self.index.comparator());
+                        untranslated = resolve_overlay_retractions(untranslated);
+                    }
+                    let entry = Arc::new(TranslatedOverlayOps {
+                        ops: ops.into(),
+                        untranslated,
+                        ephemeral_preds,
+                    });
+                    cache.insert(cache_key, Arc::clone(&entry));
+                    entry
+                }
+            };
 
             // Extend p_sids table with novelty-only predicates so that ephemeral
             // p_ids from overlay ops can be decoded back to Sids during row binding.
-            for (sid, ep_id) in &ephemeral_preds {
+            for (sid, ep_id) in &translated.ephemeral_preds {
                 let idx = *ep_id as usize;
                 if idx >= self.p_sids.len() {
                     self.p_sids.resize(idx + 1, Sid::new(0, ""));
@@ -1955,20 +1985,16 @@ impl Operator for BinaryScanOperator {
                 self.p_sids[idx] = sid.clone();
             }
 
-            if !ops.is_empty() {
-                sort_overlay_ops(&mut ops, order);
-                resolve_overlay_ops(&mut ops);
-                let epoch = ctx.overlay().epoch();
-                cursor.set_overlay_ops(ops);
+            if !translated.ops.is_empty() {
+                cursor.set_overlay_ops_shared(Arc::clone(&translated.ops));
                 cursor.set_epoch(epoch);
             }
 
             // Some overlay flakes cannot be represented in V3 overlay ops (e.g., @vector).
             // Keep them as materialized flakes and stream them after the cursor completes.
-            if !untranslated.is_empty() {
-                let cmp = self.index.comparator();
-                untranslated.sort_by(cmp);
-                untranslated = resolve_overlay_retractions(untranslated);
+            // (Already sorted + retraction-resolved in the cached entry.)
+            if !translated.untranslated.is_empty() {
+                let mut untranslated = translated.untranslated.clone();
 
                 // Apply equality match (subject/predicate/object) against pattern constants.
                 let s_sid = match &self.pattern.s {
@@ -2196,6 +2222,22 @@ pub fn translate_overlay_flakes(
     );
 
     (ops, ephemeral_preds)
+}
+
+/// Overlay translation product memoized per query execution (see
+/// [`crate::context::OverlayOpsCache`]): translated + sorted + lifecycle-resolved
+/// overlay ops, the flakes V3 cannot represent (sorted + retraction-resolved),
+/// and the novelty-only predicate mapping.
+#[derive(Debug)]
+pub struct TranslatedOverlayOps {
+    /// Sorted (per the memo key's index) and lifecycle-resolved overlay ops,
+    /// shared across cursors via [`BinaryCursor::set_overlay_ops_shared`].
+    pub ops: Arc<[OverlayOp]>,
+    /// Flakes not representable as V3 ops (e.g. `@vector`), sorted by the
+    /// index comparator with retractions resolved. Callers filter per pattern.
+    pub untranslated: Vec<Flake>,
+    /// Novelty-only predicate IRI → ephemeral p_id.
+    pub ephemeral_preds: EphemeralPredicateMap,
 }
 
 /// Translate overlay flakes to V3 overlay ops, also returning flakes that cannot be translated
