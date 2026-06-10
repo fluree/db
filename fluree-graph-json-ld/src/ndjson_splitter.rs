@@ -34,18 +34,17 @@
 //!
 //! # Malformed input
 //!
-//! True ndjson has exactly one JSON value per line. Each line is validated as a
-//! single complete JSON value (cheaply, via `IgnoredAny` — no value tree is
-//! built); a line that isn't (e.g. pretty-printed JSON split across lines)
-//! fails loudly with the offending line number rather than producing a
-//! silently-broken chunk. A malformed first line surfaces from the constructor;
-//! a malformed later line surfaces from [`NdjsonReader::join`].
+//! True ndjson has exactly one JSON object per line. Each line is validated as
+//! a single complete JSON object (cheaply, via `IgnoredAny` — no value tree is
+//! built); a line that isn't (e.g. pretty-printed JSON split across lines, or a
+//! stray scalar/array line) fails loudly with the offending line number rather
+//! than producing a silently-broken chunk. A malformed first line surfaces from
+//! the constructor; a malformed later line surfaces from
+//! [`NdjsonReader::join`]. A leading UTF-8 BOM is tolerated.
 
-use std::fs::File;
-use std::io::{BufRead, BufReader};
-use std::path::Path;
+use std::io::BufRead;
 use std::sync::mpsc;
-use std::sync::{Arc, Mutex};
+use std::sync::Mutex;
 use std::thread::{self, JoinHandle};
 
 use serde::de::IgnoredAny;
@@ -72,27 +71,11 @@ pub enum FirstLineContextPolicy {
 /// Streams a newline-delimited JSON-LD source as standalone JSON-LD chunks.
 pub struct NdjsonReader {
     prelude: JsonLdPrelude,
-    rx: Arc<Mutex<mpsc::Receiver<ChunkPayload>>>,
+    rx: Mutex<mpsc::Receiver<ChunkPayload>>,
     reader_handle: Option<JoinHandle<Result<usize, SplitError>>>,
 }
 
 impl NdjsonReader {
-    /// Create a reader over a local ndjson/jsonl file.
-    ///
-    /// Compressed inputs (`.gz` / `.zst`) are not decoded here — wrap the file
-    /// in the appropriate decoder and use
-    /// [`new_from_reader`](Self::new_from_reader).
-    pub fn new(
-        path: &Path,
-        chunk_size_bytes: u64,
-        channel_capacity: usize,
-        policy: FirstLineContextPolicy,
-    ) -> Result<Self, SplitError> {
-        let reader: Box<dyn BufRead + Send> =
-            Box::new(BufReader::with_capacity(256 * 1024, File::open(path)?));
-        Self::new_from_reader(reader, chunk_size_bytes, channel_capacity, policy)
-    }
-
     /// Create a reader over any byte stream (local file, S3 object range
     /// stream, decompressor, …). This is the streaming entry point: no `Seek`
     /// is required and memory stays bounded by `channel_capacity` × chunk size.
@@ -113,12 +96,21 @@ impl NdjsonReader {
 
         let (tx, rx) = mpsc::sync_channel(channel_capacity.max(1));
         let first_node = head.first_node;
-        let handle =
-            thread::spawn(move || reader_thread(reader, context, first_node, chunk_size_bytes, tx));
+        let lines_consumed = head.lines_consumed;
+        let handle = thread::spawn(move || {
+            reader_thread(
+                reader,
+                context,
+                first_node,
+                lines_consumed,
+                chunk_size_bytes,
+                tx,
+            )
+        });
 
         Ok(Self {
             prelude,
-            rx: Arc::new(Mutex::new(rx)),
+            rx: Mutex::new(rx),
             reader_handle: Some(handle),
         })
     }
@@ -132,11 +124,6 @@ impl NdjsonReader {
             Ok(payload) => Ok(Some(payload)),
             Err(_) => Ok(None),
         }
-    }
-
-    /// Shared receiver for distributing chunks to worker threads.
-    pub fn shared_receiver(&self) -> Arc<Mutex<mpsc::Receiver<ChunkPayload>>> {
-        Arc::clone(&self.rx)
     }
 
     /// The shared `@context`, if the source carried a leading context line.
@@ -164,26 +151,38 @@ struct Head {
     /// The first node line, when the first non-blank line was a node rather
     /// than a consumed context.
     first_node: Option<Vec<u8>>,
+    /// Source lines consumed (the first node, when present, sits on the last
+    /// of them). Seeds the reader thread's line counter so later error
+    /// messages report true file line numbers.
+    lines_consumed: usize,
 }
+
+/// UTF-8 byte-order mark, tolerated at the very start of the stream (common in
+/// Windows-exported files).
+const UTF8_BOM: &[u8] = b"\xEF\xBB\xBF";
 
 /// Read and interpret the first non-blank line per `policy`.
 fn read_prelude(
     reader: &mut Box<dyn BufRead + Send>,
     policy: FirstLineContextPolicy,
 ) -> Result<Head, SplitError> {
+    let mut line_buf = Vec::new();
     let mut line_no = 0usize;
     loop {
+        if !read_line(reader, &mut line_buf)? {
+            return Ok(Head {
+                context: None,
+                first_node: None,
+                lines_consumed: line_no,
+            });
+        }
         line_no += 1;
-        let raw = match read_line(reader)? {
-            Some(l) => l,
-            None => {
-                return Ok(Head {
-                    context: None,
-                    first_node: None,
-                })
-            }
+        let line: &[u8] = if line_no == 1 {
+            line_buf.strip_prefix(UTF8_BOM).unwrap_or(&line_buf)
+        } else {
+            &line_buf
         };
-        let trimmed = trim(&raw);
+        let trimmed = line.trim_ascii();
         if trimmed.is_empty() {
             continue;
         }
@@ -193,6 +192,7 @@ fn read_prelude(
             return Ok(Head {
                 context: None,
                 first_node: Some(trimmed.to_vec()),
+                lines_consumed: line_no,
             });
         }
 
@@ -211,6 +211,7 @@ fn read_prelude(
                 Ok(Head {
                     context: Some(ctx),
                     first_node: None,
+                    lines_consumed: line_no,
                 })
             }
             FirstLineContextPolicy::Auto => {
@@ -218,11 +219,17 @@ fn read_prelude(
                     Ok(Head {
                         context: Some(ctx),
                         first_node: None,
+                        lines_consumed: line_no,
                     })
+                } else if !value.is_object() {
+                    Err(SplitError::InvalidJson(format!(
+                        "line {line_no}: ndjson requires one JSON object per line"
+                    )))
                 } else {
                     Ok(Head {
                         context: None,
                         first_node: Some(trimmed.to_vec()),
+                        lines_consumed: line_no,
                     })
                 }
             }
@@ -258,27 +265,33 @@ fn reader_thread(
     mut reader: Box<dyn BufRead + Send>,
     context: Option<JsonValue>,
     first_node: Option<Vec<u8>>,
+    lines_consumed: usize,
     chunk_size: u64,
     tx: mpsc::SyncSender<ChunkPayload>,
 ) -> Result<usize, SplitError> {
     let prefix = build_prefix(&context)?;
     let suffix: &[u8] = b"]}";
 
-    let mut chunk_buf: Vec<u8> = Vec::with_capacity(chunk_size.max(1) as usize);
+    // The buffer always starts with the prefix; `emit` seals it with the
+    // suffix and moves it out whole, so the accumulated bytes are never
+    // re-copied. (The size check below therefore includes the prefix length —
+    // negligible against chunk_size.)
+    let mut chunk_buf = seeded_buf(&prefix, chunk_size);
     let mut element_count: usize = 0;
     let mut chunk_idx: usize = 0;
-    let mut line_no: usize = 0;
+    // Continue the prelude's numbering so errors report true file lines.
+    let mut line_no: usize = lines_consumed;
+    let mut line_buf: Vec<u8> = Vec::new();
 
-    // The first node (already read + validated during prelude detection) starts
-    // the stream.
+    // The first node (already read + validated during prelude detection, where
+    // it was counted) starts the stream.
     if let Some(node) = first_node {
-        line_no += 1;
         push_node(&mut chunk_buf, &mut element_count, &node);
     }
 
-    while let Some(raw) = read_line(&mut reader)? {
+    while read_line(&mut reader, &mut line_buf)? {
         line_no += 1;
-        let trimmed = trim(&raw);
+        let trimmed = line_buf.trim_ascii();
         if trimmed.is_empty() {
             continue;
         }
@@ -286,17 +299,24 @@ fn reader_thread(
         push_node(&mut chunk_buf, &mut element_count, trimmed);
 
         if chunk_buf.len() as u64 >= chunk_size {
-            emit(&tx, &mut chunk_idx, &prefix, &chunk_buf, suffix)?;
-            chunk_buf.clear();
+            emit(&tx, &mut chunk_idx, &mut chunk_buf, suffix)?;
+            chunk_buf = seeded_buf(&prefix, chunk_size);
             element_count = 0;
         }
     }
 
     if element_count > 0 {
-        emit(&tx, &mut chunk_idx, &prefix, &chunk_buf, suffix)?;
+        emit(&tx, &mut chunk_idx, &mut chunk_buf, suffix)?;
     }
 
     Ok(chunk_idx)
+}
+
+/// A fresh chunk buffer pre-seeded with the document prefix.
+fn seeded_buf(prefix: &[u8], chunk_size: u64) -> Vec<u8> {
+    let mut buf = Vec::with_capacity(prefix.len() + chunk_size.max(1) as usize + 16);
+    buf.extend_from_slice(prefix);
+    buf
 }
 
 fn push_node(chunk_buf: &mut Vec<u8>, element_count: &mut usize, node: &[u8]) {
@@ -307,17 +327,15 @@ fn push_node(chunk_buf: &mut Vec<u8>, element_count: &mut usize, node: &[u8]) {
     *element_count += 1;
 }
 
+/// Seal `chunk_buf` with the suffix and send it, leaving the buffer empty.
 fn emit(
     tx: &mpsc::SyncSender<ChunkPayload>,
     chunk_idx: &mut usize,
-    prefix: &[u8],
-    elements: &[u8],
+    chunk_buf: &mut Vec<u8>,
     suffix: &[u8],
 ) -> Result<(), SplitError> {
-    let mut doc = Vec::with_capacity(prefix.len() + elements.len() + suffix.len());
-    doc.extend_from_slice(prefix);
-    doc.extend_from_slice(elements);
-    doc.extend_from_slice(suffix);
+    chunk_buf.extend_from_slice(suffix);
+    let doc = std::mem::take(chunk_buf);
     tx.send((*chunk_idx, doc))
         .map_err(|_| SplitError::ChannelClosed)?;
     *chunk_idx += 1;
@@ -338,9 +356,14 @@ fn build_prefix(context: &Option<JsonValue>) -> Result<Vec<u8>, SplitError> {
     Ok(prefix)
 }
 
-/// Validate that `line` is exactly one complete JSON value (no value tree is
+/// Validate that `line` is exactly one complete JSON object (no value tree is
 /// built, and trailing data is rejected).
 fn validate_json_line(line: &[u8], line_no: usize) -> Result<(), SplitError> {
+    if line.first() != Some(&b'{') {
+        return Err(SplitError::InvalidJson(format!(
+            "line {line_no}: ndjson requires one JSON object per line"
+        )));
+    }
     let mut de = serde_json::Deserializer::from_slice(line);
     IgnoredAny::deserialize(&mut de).map_err(|e| {
         SplitError::InvalidJson(format!(
@@ -357,29 +380,12 @@ fn validate_json_line(line: &[u8], line_no: usize) -> Result<(), SplitError> {
     Ok(())
 }
 
-/// Read one line (terminator included). `None` at EOF.
-fn read_line(reader: &mut Box<dyn BufRead + Send>) -> Result<Option<Vec<u8>>, SplitError> {
-    let mut buf = Vec::new();
-    let n = reader.read_until(b'\n', &mut buf)?;
-    if n == 0 {
-        Ok(None)
-    } else {
-        Ok(Some(buf))
-    }
-}
-
-/// Strip leading/trailing ASCII whitespace (handles `\r\n`, trailing newline).
-fn trim(bytes: &[u8]) -> &[u8] {
-    let start = bytes
-        .iter()
-        .position(|b| !b.is_ascii_whitespace())
-        .unwrap_or(bytes.len());
-    let end = bytes
-        .iter()
-        .rposition(|b| !b.is_ascii_whitespace())
-        .map(|i| i + 1)
-        .unwrap_or(start);
-    &bytes[start..end]
+/// Read one line (terminator included) into `buf`, clearing it first; the
+/// buffer is reused across lines to avoid a per-line allocation. `false` at
+/// EOF.
+fn read_line(reader: &mut Box<dyn BufRead + Send>, buf: &mut Vec<u8>) -> Result<bool, SplitError> {
+    buf.clear();
+    Ok(reader.read_until(b'\n', buf)? != 0)
 }
 
 #[cfg(test)]
@@ -550,6 +556,58 @@ mod tests {
         // First line valid; a later line is two values (not single-value ndjson).
         let input = "{\"@id\":\"ex:1\"}\n{\"@id\":\"ex:2\"} {\"@id\":\"ex:3\"}\n";
         let err = read_all(input, 1_000_000, FirstLineContextPolicy::Auto).unwrap_err();
+        assert!(matches!(err, SplitError::InvalidJson(_)));
+    }
+
+    #[test]
+    fn error_line_numbers_account_for_prelude_lines() {
+        // Context on line 1, blank line 2, valid node line 3, malformed line 4:
+        // the error must say "line 4", not restart counting after the prelude.
+        let input = "{\"@context\":{\"ex\":\"http://example.org/\"}}\n\
+                     \n\
+                     {\"@id\":\"ex:1\"}\n\
+                     {\"@id\":\"ex:2\"} trailing\n";
+        let err = read_all(input, 1_000_000, FirstLineContextPolicy::Auto).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("line 4"), "wrong line number in: {msg}");
+    }
+
+    #[test]
+    fn strips_leading_utf8_bom() {
+        let mut input = Vec::from(*b"\xEF\xBB\xBF");
+        input.extend_from_slice(
+            b"{\"@context\":{\"ex\":\"http://example.org/\"}}\n{\"@id\":\"ex:1\"}\n",
+        );
+        let input = String::from_utf8(input).unwrap();
+        let (ctx, chunks) = read_all(&input, 1_000_000, FirstLineContextPolicy::Auto).unwrap();
+        assert_eq!(ctx.unwrap()["ex"], "http://example.org/");
+        assert_eq!(total_nodes(&chunks), 1);
+    }
+
+    #[test]
+    fn non_object_line_fails_with_line_number() {
+        // Scalars/arrays are valid JSON values but not ndjson node lines; they
+        // must fail here with a line number, not surface later as a confusing
+        // downstream JSON-LD expansion error.
+        let input = "{\"@id\":\"ex:1\"}\n42\n";
+        let err = read_all(input, 1_000_000, FirstLineContextPolicy::Auto).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("line 2") && msg.contains("JSON object per line"),
+            "unexpected error: {msg}"
+        );
+    }
+
+    #[test]
+    fn non_object_first_line_fails_from_constructor() {
+        let err = NdjsonReader::new_from_reader(
+            reader_for("[{\"@id\":\"ex:1\"}]\n"),
+            1_000_000,
+            4,
+            FirstLineContextPolicy::Auto,
+        )
+        .err()
+        .expect("non-object first line must error");
         assert!(matches!(err, SplitError::InvalidJson(_)));
     }
 

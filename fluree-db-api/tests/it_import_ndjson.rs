@@ -264,3 +264,145 @@ async fn import_local_dir_of_ndjson_then_query() {
     let json = qr.to_jsonld(&ledger.snapshot).expect("format jsonld");
     assert_eq!(extract_sorted_strings(&json), vec!["Alice", "Bob"]);
 }
+
+/// A `.jsonl` source with no data lines (context-only) fails with a clear
+/// up-front error — not an opaque "no commit head" storage error at the end
+/// of the pipeline.
+#[tokio::test]
+async fn import_empty_ndjson_fails_with_clear_error() {
+    let db_dir = tempfile::tempdir().expect("db tmpdir");
+    let data_dir = tempfile::tempdir().expect("data tmpdir");
+
+    let path = write_file(
+        data_dir.path(),
+        "empty.jsonl",
+        "{\"@context\":{\"ex\":\"http://example.org/ns/\"}}\n",
+    );
+
+    let fluree = FlureeBuilder::file(db_dir.path().to_string_lossy().to_string())
+        .build()
+        .expect("build file-backed Fluree");
+
+    let err = fluree
+        .create("test/import-ndjson-empty:main")
+        .import(&path)
+        .threads(2)
+        .memory_budget_mb(256)
+        .cleanup(false)
+        .execute()
+        .await
+        .expect_err("context-only ndjson must fail");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("no data records"),
+        "expected clear empty-source error, got: {msg}"
+    );
+}
+
+/// A gzip-compressed `.jsonl.gz` file streams through `open_decoded`
+/// transparently.
+#[tokio::test]
+async fn import_gzipped_ndjson_then_query() {
+    use std::io::Write as _;
+
+    let db_dir = tempfile::tempdir().expect("db tmpdir");
+    let data_dir = tempfile::tempdir().expect("data tmpdir");
+
+    let ndjson = concat!(
+        "{\"@context\":{\"ex\":\"http://example.org/ns/\",\"schema\":\"http://schema.org/\"}}\n",
+        "{\"@id\":\"ex:zed\",\"schema:name\":\"Zed\"}\n",
+    );
+    let path = data_dir.path().join("people.jsonl.gz");
+    let f = std::fs::File::create(&path).expect("create gz file");
+    let mut enc = flate2::write::GzEncoder::new(f, flate2::Compression::default());
+    enc.write_all(ndjson.as_bytes()).expect("write gz");
+    enc.finish().expect("finish gz");
+
+    let fluree = FlureeBuilder::file(db_dir.path().to_string_lossy().to_string())
+        .build()
+        .expect("build file-backed Fluree");
+    let result = fluree
+        .create("test/import-ndjson-gz:main")
+        .import(&path)
+        .threads(2)
+        .memory_budget_mb(256)
+        .cleanup(false)
+        .execute()
+        .await
+        .expect("gzipped ndjson import should succeed");
+    assert!(result.flake_count > 0);
+
+    let ledger = fluree
+        .ledger("test/import-ndjson-gz:main")
+        .await
+        .expect("load ledger after import");
+    let query = json!({
+        "@context": { "schema": "http://schema.org/" },
+        "select": ["?name"],
+        "where": { "schema:name": "?name" }
+    });
+    let qr = support::query_jsonld(&fluree, &ledger, &query)
+        .await
+        .expect("query after import");
+    let json = qr.to_jsonld(&ledger.snapshot).expect("format jsonld");
+    assert_eq!(extract_sorted_strings(&json), vec!["Zed"]);
+}
+
+/// Remote ndjson with `size_bytes: 0` (caller-supplied OrderedObjects without
+/// sizes — the documented fallback when metadata listing is unsupported) must
+/// fall back to a whole-object fetch and import the data, not silently treat
+/// the object as empty. Runs on the default current_thread test runtime to
+/// also exercise the serial loop's non-blocking chunk receive.
+#[tokio::test]
+async fn import_from_storage_ndjson_unknown_size_then_query() {
+    use fluree_db_api::{RemoteObject, RemoteSource};
+    use fluree_db_core::{MemoryStorage, StorageRead, StorageWrite};
+    use std::sync::Arc;
+
+    let db_dir = tempfile::tempdir().expect("db tmpdir");
+    let storage = Arc::new(MemoryStorage::new());
+
+    let obj = concat!(
+        "{\"@context\":{\"schema\":\"http://schema.org/\"}}\n",
+        "{\"@id\":\"http://example.org/ns/dana\",\"schema:name\":\"Dana\"}\n",
+    );
+    storage
+        .write_bytes("imports/unsized.jsonl", obj.as_bytes())
+        .await
+        .unwrap();
+
+    let objects = vec![RemoteObject {
+        address: "imports/unsized.jsonl".to_string(),
+        size_bytes: 0, // unknown — must not be treated as "empty object"
+    }];
+
+    let fluree = FlureeBuilder::file(db_dir.path().to_string_lossy().to_string())
+        .build()
+        .expect("build file-backed Fluree");
+    let storage_dyn: Arc<dyn StorageRead> = storage.clone();
+    let result = fluree
+        .create("test/remote-ndjson-unsized:main")
+        .import_from_storage(storage_dyn, RemoteSource::OrderedObjects(objects))
+        .threads(2)
+        .memory_budget_mb(256)
+        .cleanup(false)
+        .execute()
+        .await
+        .expect("unknown-size remote ndjson import should succeed");
+    assert!(result.flake_count > 0, "rows must not be silently dropped");
+
+    let ledger = fluree
+        .ledger("test/remote-ndjson-unsized:main")
+        .await
+        .expect("load ledger after import");
+    let query = json!({
+        "@context": { "schema": "http://schema.org/" },
+        "select": ["?name"],
+        "where": { "schema:name": "?name" }
+    });
+    let qr = support::query_jsonld(&fluree, &ledger, &query)
+        .await
+        .expect("query after import");
+    let json = qr.to_jsonld(&ledger.snapshot).expect("format jsonld");
+    assert_eq!(extract_sorted_strings(&json), vec!["Dana"]);
+}
