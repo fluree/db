@@ -1446,18 +1446,29 @@ pub fn build_where_operators_seeded_with_needed(
                 if block.binds.is_empty() && block.filters.is_empty() {
                     let mut augmented_rwv = augmented_at(end);
 
-                    // Preserve property-join eligibility when a top-level VALUES precedes
-                    // a pure star block. Wrapping VALUES first seeds the schema/operator and
-                    // prevents `build_triple_operators()` from taking the property-join path.
-                    // Defer only when the star will actually take that path (same gate as
-                    // `build_triple_operators`: eligible AND object-anchored); otherwise
-                    // seed VALUES under the chain so its bindings constrain the scans.
+                    // A VALUES that shares no vars with the block is a parameter
+                    // injection: defer it above the block (a pure cross product
+                    // either way, and seeding would re-open the scans per VALUES
+                    // row). A VALUES that overlaps the block constrains it — seed
+                    // it under the chain so its bindings drive the scans, except
+                    // when the block will take the anchored property-join path
+                    // (same gate as `build_triple_operators`), which keeps
+                    // overlap vars alive itself and prefers VALUES layered above.
                     let star_analysis = analyze_property_join(&block.triples);
+                    let block_vars: HashSet<VarId> = block
+                        .triples
+                        .iter()
+                        .flat_map(crate::ir::triple::TriplePattern::referenced_vars)
+                        .collect();
+                    let values_overlap_block = block
+                        .values
+                        .iter()
+                        .any(|vp| vp.vars.iter().any(|v| block_vars.contains(v)));
                     let values_after_triples = operator.is_none()
                         && !block.values.is_empty()
                         && block.triples.len() >= 2
-                        && star_analysis.eligible()
-                        && star_analysis.has_bound_objects;
+                        && (!values_overlap_block
+                            || (star_analysis.eligible() && star_analysis.has_bound_objects));
 
                     // A deferred VALUES joins against the block's output above it, so
                     // its vars must survive the block's liveness trimming.
