@@ -759,7 +759,7 @@ impl GraphDb {
 
     /// Remove reasoning defaults from the view.
     ///
-    /// Queries will use their own reasoning modes (or auto-RDFS).
+    /// Queries will use their own reasoning modes (default: none).
     pub fn without_reasoning(mut self) -> Self {
         self.reasoning = None;
         self
@@ -783,8 +783,8 @@ impl GraphDb {
     ///   reasoning enabled or explicitly disabled
     /// - `Force`: Wrapper modes always win
     ///
-    /// Returns `None` if no reasoning should be applied (let query engine
-    /// use its auto-RDFS behavior).
+    /// Returns `None` if this view contributes no reasoning default (the
+    /// query's own modes apply; reasoning stays off unless they request it).
     pub fn effective_reasoning(
         &self,
         query_has_reasoning: bool,
