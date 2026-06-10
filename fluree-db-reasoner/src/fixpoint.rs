@@ -88,6 +88,16 @@ pub async fn run_fixpoint(
     // Accumulated derived facts
     let mut derived = DerivedSet::new();
 
+    // Seed facts flow through the same delta/derived sets as derived facts
+    // (rules join against them), but they already exist in the database —
+    // register their content keys so they are excluded from the emitted
+    // overlay and from derived-fact counts. A seed fact recanonicalized to a
+    // different subject/object no longer matches its base key and is emitted
+    // (eq-rep-s/o entailments are genuine derivations).
+    for flake in delta.iter() {
+        derived.register_base(flake);
+    }
+
     // owl:sameAs SID for rule application
     let owl_same_as_sid = owl::same_as_sid();
 
@@ -114,9 +124,13 @@ pub async fn run_fixpoint(
             break;
         }
 
-        if derived.len() > budget.max_facts {
-            diagnostics =
-                ReasoningDiagnostics::capped("facts", iterations, derived.len(), start.elapsed());
+        if derived.derived_len() > budget.max_facts {
+            diagnostics = ReasoningDiagnostics::capped(
+                "facts",
+                iterations,
+                derived.derived_len(),
+                start.elapsed(),
+            );
             break;
         }
 
@@ -336,11 +350,12 @@ pub async fn run_fixpoint(
 
     // Update diagnostics if not already capped
     if !diagnostics.capped {
-        diagnostics = ReasoningDiagnostics::completed(iterations, derived.len(), start.elapsed());
+        diagnostics =
+            ReasoningDiagnostics::completed(iterations, derived.derived_len(), start.elapsed());
         diagnostics.rules_fired = std::mem::take(&mut diagnostics.rules_fired);
     }
 
-    Ok((derived.into_flakes(), frozen_same_as, diagnostics))
+    Ok((derived.into_derived_flakes(), frozen_same_as, diagnostics))
 }
 
 /// Seed the initial delta with base facts for relevant predicates
