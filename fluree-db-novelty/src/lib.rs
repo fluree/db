@@ -768,6 +768,12 @@ impl OverlayProvider for Novelty {
         self.epoch
     }
 
+    fn is_effectively_empty(&self) -> bool {
+        // Not `store.is_empty()`: after `clear_up_to` the arena retains dead
+        // flakes, while `size` tracks only alive bytes.
+        self.size == 0
+    }
+
     fn for_each_overlay_flake(
         &self,
         g_id: GraphId,
@@ -1264,6 +1270,28 @@ mod tests {
 
         // Epoch should be bumped
         assert_eq!(novelty.epoch, initial_epoch + 1);
+    }
+
+    #[test]
+    fn test_is_effectively_empty_after_full_clear() {
+        let mut novelty = Novelty::new(0);
+        let rg = no_graphs();
+
+        assert!(novelty.is_effectively_empty());
+
+        novelty
+            .apply_commit(vec![make_flake(1, 1, 100, 1, true)], 1, &rg)
+            .unwrap();
+        assert!(!novelty.is_effectively_empty());
+
+        // Drain everything, as an index swap does (apply_index/apply_loaded_db)
+        novelty.clear_up_to(1);
+
+        // The arena retains dead flakes, so `is_empty()` stays false — pin that
+        // `is_effectively_empty()` sees through it via `size`.
+        assert!(!novelty.is_empty());
+        assert!(novelty.epoch > 0);
+        assert!(novelty.is_effectively_empty());
     }
 
     #[test]

@@ -499,7 +499,10 @@ impl LedgerState {
         );
         // Re-populate dict_novelty with any remaining novelty flakes (t > index_t)
         // so overlay translation can resolve newly-introduced subject/string IDs.
-        if !new_novelty.is_empty() {
+        // Note: use `size > 0` not `is_empty()` — after clear_up_to the arena still
+        // holds dead flakes, but `size` tracks only active bytes.
+        let has_remaining_novelty = new_novelty.size > 0;
+        if has_remaining_novelty {
             new_dict_novelty.populate_from_flakes_iter(
                 new_novelty
                     .iter_index(fluree_db_core::IndexType::Post)
@@ -508,7 +511,7 @@ impl LedgerState {
         }
 
         let mut new_runtime_small_dicts = RuntimeSmallDicts::new();
-        if !new_novelty.is_empty() {
+        if has_remaining_novelty {
             new_runtime_small_dicts.populate_from_flakes_iter(
                 new_novelty
                     .iter_index(fluree_db_core::IndexType::Post)

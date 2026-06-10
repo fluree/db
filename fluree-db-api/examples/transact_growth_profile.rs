@@ -8,6 +8,7 @@
 //!     vectors — O(N) in total novelty, scaling with time-since-reindex; and
 //!   - the commit path deep-clones the entire growing novelty arena
 //!     (`Arc::make_mut`) before appending one batch.
+//!
 //! If that is right, per-commit latency rises ~linearly with novelty size and
 //! a flamegraph of a high-novelty commit is dominated by the merge + the clone.
 //!
@@ -24,15 +25,15 @@
 //!
 //! ## Modes — `GROW_MODE` (default `grow`)
 //! - `grow`    — from an empty ledger, commit `GROW_COMMITS` times, threading
-//!               the ledger forward so novelty accumulates. Emits a per-commit
-//!               CSV (latency vs novelty). THIS IS THE COST-CURVE INSTRUMENT.
+//!   the ledger forward so novelty accumulates. Emits a per-commit
+//!   CSV (latency vs novelty). THIS IS THE COST-CURVE INSTRUMENT.
 //! - `prepare` — build a persistent ledger at `$GROW_DB_DIR` with `GROW_COMMITS`
-//!               commits of novelty, then exit. Not profiled. Run once.
+//!   commits of novelty, then exit. Not profiled. Run once.
 //! - `steady`  — open `$GROW_DB_DIR` (reload replays novelty to its prepared
-//!               size), then commit `GROW_STEADY_COMMITS` more times, timed, at
-//!               that constant high-novelty level. THIS IS THE FLAMEGRAPH
-//!               TARGET: profile this mode to see one high-novelty commit's cost
-//!               without the cheap early commits diluting the samples.
+//!   size), then commit `GROW_STEADY_COMMITS` more times, timed, at
+//!   that constant high-novelty level. THIS IS THE FLAMEGRAPH
+//!   TARGET: profile this mode to see one high-novelty commit's cost
+//!   without the cheap early commits diluting the samples.
 //! - `all`     — `grow` into a tempdir; quick local sanity check.
 //!
 //! ## Config (env vars)

@@ -424,6 +424,11 @@ impl OptionalBuilder for PatternOptionalBuilder {
         if start_row >= required_batch.len() || ctx.is_multi_ledger() {
             return Ok(None);
         }
+        // Batched probe reads base leaflets without overlay merging — bail to
+        // the per-row scan when novelty is present.
+        if !ctx.overlay_free_single_graph() {
+            return Ok(None);
+        }
         let Some(store) = ctx.binary_store.as_ref() else {
             return Ok(None);
         };
@@ -772,6 +777,17 @@ impl OptionalBuilder for GroupedPatternOptionalBuilder {
             );
             return Ok(None);
         };
+        // Batched probe reads base leaflets without overlay merging — bail to
+        // the per-row scan when novelty is present.
+        if !ctx.overlay_free_single_graph() {
+            tracing::debug!(
+                predicate_count = self.triples.len(),
+                start_row,
+                reason = "overlay-present",
+                "grouped optional builder fallback"
+            );
+            return Ok(None);
+        }
         if self.triples.iter().any(|tp| tp.dtc.is_some()) {
             tracing::debug!(
                 predicate_count = self.triples.len(),

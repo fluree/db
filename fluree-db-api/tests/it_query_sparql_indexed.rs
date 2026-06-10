@@ -7805,3 +7805,236 @@ async fn indexed_overlay_count_no_cache_projection_invariant() {
         })
         .await;
 }
+
+// =============================================================================
+// Bug repro: same-subject star join drops novelty bindings (indexed + overlay)
+// =============================================================================
+
+/// Indexed ledger + novelty-only assertion: a same-subject star join
+/// (`?s ex:price ?v . ?s ex:currency ?c`) must see the novelty price the
+/// single-predicate scan sees. The batched subject probe / SPOT star walk
+/// read base leaflets directly and previously skipped overlay flakes,
+/// silently undercounting aggregates (SUM 60 instead of 67).
+#[tokio::test]
+async fn indexed_inline_type_star_aggregate_with_overlay_multivalue_and_facet() {
+    assert_index_defaults();
+    let fluree = FlureeBuilder::memory()
+        .with_ledger_cache_config(LedgerManagerConfig::default())
+        .build_memory();
+    let ledger_id = "it/regress-star-overlay:main";
+
+    let (local, handle) = start_background_indexer_local(
+        fluree.backend().clone(),
+        Arc::new(fluree.nameservice_mode().clone()),
+        fluree_db_indexer::IndexerConfig::small(),
+    );
+
+    local
+        .run_until(async move {
+            let index_cfg = IndexConfig {
+                reindex_min_bytes: 0,
+                reindex_max_bytes: 10_000_000,
+            };
+
+            // Phase 1: seed and index multivalue line items.
+            let ledger = genesis_ledger_for_fluree(&fluree, ledger_id);
+            let baseline = json!({
+                "@context": { "ex": "http://example.org/ns/" },
+                "@graph": [
+                    {
+                        "@id": "ex:a",
+                        "@type": "ex:LineItem",
+                        "ex:price": [10, 20],
+                        "ex:currency": "USD"
+                    },
+                    {
+                        "@id": "ex:b",
+                        "@type": "ex:LineItem",
+                        "ex:price": 30,
+                        "ex:currency": "USD"
+                    },
+                    {
+                        "@id": "ex:order",
+                        "@type": "ex:Order",
+                        "ex:item": [{"@id": "ex:a"}, {"@id": "ex:b"}]
+                    }
+                ]
+            });
+            let ledger = fluree
+                .insert_with_opts(
+                    ledger,
+                    &baseline,
+                    TxnOpts::default(),
+                    CommitOpts::default(),
+                    &index_cfg,
+                )
+                .await
+                .expect("baseline insert")
+                .ledger;
+            let outcome = trigger_index_and_wait_outcome(&handle, ledger_id, ledger.t()).await;
+            if let fluree_db_api::IndexOutcome::Completed { index_t, .. } = outcome {
+                assert_eq!(index_t, 1, "should index to t=1");
+            }
+
+            // Phase 2: novelty-only price for an already-indexed subject.
+            let _ledger = fluree
+                .insert(
+                    ledger,
+                    &json!({
+                        "@context": { "ex": "http://example.org/ns/" },
+                        "@graph": [ {"@id": "ex:a", "ex:price": 7} ]
+                    }),
+                )
+                .await
+                .expect("novelty insert")
+                .ledger;
+
+            // Phase 3: query at the new head without re-indexing.
+            let view = fluree.db(ledger_id).await.expect("load view");
+
+            // Control: single-predicate scan merges overlay correctly.
+            let control = r"
+                PREFIX ex: <http://example.org/ns/>
+                SELECT (SUM(?v) AS ?sum)
+                WHERE { ?s ex:price ?v . }
+            ";
+            let result = fluree
+                .query(&view, QueryInput::Sparql(control))
+                .await
+                .expect("control query");
+            let jsonld = result.to_jsonld(&view.snapshot).expect("to_jsonld");
+            assert_eq!(
+                normalize_rows(&jsonld),
+                normalize_rows(&json!([[67]])),
+                "control single-predicate SUM must include novelty price 7"
+            );
+
+            // Faceted same-subject star: previously dropped the novelty price.
+            let faceted = r"
+                PREFIX ex: <http://example.org/ns/>
+                SELECT (SUM(?v) AS ?sum)
+                WHERE {
+                  ?s ex:price ?v .
+                  ?s ex:currency ?currency .
+                }
+            ";
+            let result = fluree
+                .query(&view, QueryInput::Sparql(faceted))
+                .await
+                .expect("faceted star query");
+            let jsonld = result.to_jsonld(&view.snapshot).expect("to_jsonld");
+            assert_eq!(
+                normalize_rows(&jsonld),
+                normalize_rows(&json!([[67]])),
+                "faceted same-subject star SUM must include novelty price 7"
+            );
+
+            // Reversed pattern order: forces the other join driver choice.
+            let reversed = r"
+                PREFIX ex: <http://example.org/ns/>
+                SELECT (SUM(?v) AS ?sum)
+                WHERE {
+                  ?s ex:currency ?currency .
+                  ?s ex:price ?v .
+                }
+            ";
+            let result = fluree
+                .query(&view, QueryInput::Sparql(reversed))
+                .await
+                .expect("reversed faceted star query");
+            let jsonld = result.to_jsonld(&view.snapshot).expect("to_jsonld");
+            assert_eq!(
+                normalize_rows(&jsonld),
+                normalize_rows(&json!([[67]])),
+                "reversed faceted same-subject star SUM must include novelty price 7"
+            );
+
+            // Dataset mode (FROM clause): joins resolve IriMatch subjects to
+            // raw s_ids and use the batched leaflet probe.
+            let from_query = format!(
+                r"PREFIX ex: <http://example.org/ns/>
+                SELECT (SUM(?v) AS ?sum)
+                FROM <{ledger_id}>
+                WHERE {{
+                  ?s ex:price ?v .
+                  ?s ex:currency ?currency .
+                }}"
+            );
+            let jsonld = fluree
+                .query_from()
+                .sparql(&from_query)
+                .format(fluree_db_api::FormatterConfig::jsonld())
+                .execute_formatted()
+                .await
+                .expect("FROM faceted star query");
+            assert_eq!(
+                normalize_rows(&jsonld),
+                normalize_rows(&json!([[67]])),
+                "FROM-clause faceted star SUM must include novelty price 7"
+            );
+
+            // Ref-hop join: `?o ex:item ?s . ?s ex:price ?v` routes through
+            // the nested-loop join's batched subject probe.
+            let ref_hop = r"
+                PREFIX ex: <http://example.org/ns/>
+                SELECT (SUM(?v) AS ?sum)
+                WHERE {
+                  ?o ex:item ?s .
+                  ?s ex:price ?v .
+                }
+            ";
+            let result = fluree
+                .query(&view, QueryInput::Sparql(ref_hop))
+                .await
+                .expect("ref-hop join query");
+            let jsonld = result.to_jsonld(&view.snapshot).expect("to_jsonld");
+            assert_eq!(
+                normalize_rows(&jsonld),
+                normalize_rows(&json!([[67]])),
+                "ref-hop join SUM must include novelty price 7"
+            );
+
+            // OPTIONAL probe: the grouped/pattern optional batch builders use
+            // the same base-leaflet probe and previously dropped novelty too.
+            let optional_probe = r"
+                PREFIX ex: <http://example.org/ns/>
+                SELECT (SUM(?v) AS ?sum)
+                WHERE {
+                  ?o ex:item ?s .
+                  OPTIONAL { ?s ex:price ?v }
+                }
+            ";
+            let result = fluree
+                .query(&view, QueryInput::Sparql(optional_probe))
+                .await
+                .expect("optional probe query");
+            let jsonld = result.to_jsonld(&view.snapshot).expect("to_jsonld");
+            assert_eq!(
+                normalize_rows(&jsonld),
+                normalize_rows(&json!([[67]])),
+                "OPTIONAL probe SUM must include novelty price 7"
+            );
+
+            // Typed variant rides the same star/property-join family.
+            let typed = r"
+                PREFIX ex: <http://example.org/ns/>
+                SELECT (SUM(?v) AS ?sum)
+                WHERE {
+                  ?s a ex:LineItem ;
+                     ex:price ?v ;
+                     ex:currency ?currency .
+                }
+            ";
+            let result = fluree
+                .query(&view, QueryInput::Sparql(typed))
+                .await
+                .expect("typed star query");
+            let jsonld = result.to_jsonld(&view.snapshot).expect("to_jsonld");
+            assert_eq!(
+                normalize_rows(&jsonld),
+                normalize_rows(&json!([[67]])),
+                "typed same-subject star SUM must include novelty price 7"
+            );
+        })
+        .await;
+}
