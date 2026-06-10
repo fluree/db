@@ -5520,15 +5520,34 @@ fn build_import_summary(
 
 /// Generate a unique session identifier for directory naming.
 ///
-/// Uses nanosecond timestamp XOR'd for uniqueness. Not cryptographic,
-/// just unique enough for concurrent session directories.
+/// Builds a scratch-directory identifier that is unique across every concurrent
+/// import, even when several import the same ledger alias at the same instant.
+///
+/// The id combines three sources so no two live imports can collide:
+/// - a nanosecond timestamp (human-readable ordering),
+/// - the process id (distinguishes separate processes, e.g. nextest workers,
+///   whose clocks can report the same nanosecond),
+/// - a per-process atomic counter (distinguishes concurrent imports inside one
+///   process, where the clock can be coarser than nanosecond resolution).
+///
+/// This matters because [`derive_session_dir`] keys the import scratch space on
+/// `{alias, session_id}` only. A timestamp-only id let two same-alias imports
+/// land in the same `run_dir`/`remap_dir`, where their parallel vocab merges
+/// truncated each other's mmap'd remap files (`File::create` on a shared path)
+/// and panicked. Not cryptographic — just collision-free for live sessions.
 fn session_id() -> String {
+    use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::SystemTime;
-    let seed = SystemTime::now()
+
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+
+    let nanos = SystemTime::now()
         .duration_since(SystemTime::UNIX_EPOCH)
         .unwrap_or_default()
         .as_nanos();
-    format!("{:032x}", seed ^ (seed >> 64))
+    let pid = std::process::id();
+    let seq = COUNTER.fetch_add(1, Ordering::Relaxed);
+    format!("{nanos:032x}-{pid:08x}-{seq:016x}")
 }
 
 /// Derive the session directory path.
