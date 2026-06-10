@@ -25,7 +25,7 @@
 
 use crate::ledger_info::{gs_record_to_jsonld, ns_record_to_jsonld};
 use crate::{ApiError, FlureeBuilder, GraphDb, Result};
-use fluree_db_nameservice::NameService;
+use fluree_db_nameservice::NameServiceLookup;
 use fluree_db_transact::{CommitOpts, TxnOpts, TxnType};
 use serde_json::{json, Value as JsonValue};
 
@@ -58,7 +58,7 @@ use serde_json::{json, Value as JsonValue};
 /// ```
 pub async fn query_nameservice<N>(nameservice: &N, query_json: &JsonValue) -> Result<JsonValue>
 where
-    N: NameService,
+    N: NameServiceLookup,
 {
     // 1. Get all ledger records
     let ledger_records = nameservice.all_records().await?;

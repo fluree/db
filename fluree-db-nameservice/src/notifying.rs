@@ -12,7 +12,7 @@ use fluree_db_core::ContentId;
 use crate::{
     event_bus::LedgerEventBus, AdminPublisher, CasResult, ConfigCasResult, ConfigLookup,
     ConfigPublisher, ConfigValue, GraphSourceLookup, GraphSourcePublisher, GraphSourceRecord,
-    GraphSourceType, NameService, NameServiceEvent, NsLookupResult, NsRecord,
+    BranchLifecycle, GraphSourceType, NameServiceEvent, NameServiceLookup, NsLookupResult, NsRecord,
     NsRecordSnapshot, Publisher, RefKind, RefLookup, RefPublisher, RefValue, Result,
     StatusCasResult, StatusLookup, StatusPublisher, StatusValue, Subscription, SubscriptionScope,
 };
@@ -61,13 +61,13 @@ impl<N: Clone> Clone for NotifyingNameService<N> {
 }
 
 // ---------------------------------------------------------------------------
-// NameService (read + branch management) — pure delegation
+// Read + branch lifecycle — pure delegation
 // ---------------------------------------------------------------------------
 
 #[async_trait]
-impl<N> NameService for NotifyingNameService<N>
+impl<N> NameServiceLookup for NotifyingNameService<N>
 where
-    N: NameService,
+    N: NameServiceLookup,
 {
     async fn lookup(&self, ledger_id: &str) -> Result<Option<NsRecord>> {
         self.inner.lookup(ledger_id).await
@@ -80,7 +80,13 @@ where
     async fn list_branches(&self, ledger_name: &str) -> Result<Vec<NsRecord>> {
         self.inner.list_branches(ledger_name).await
     }
+}
 
+#[async_trait]
+impl<N> BranchLifecycle for NotifyingNameService<N>
+where
+    N: BranchLifecycle,
+{
     async fn create_branch(
         &self,
         ledger_name: &str,

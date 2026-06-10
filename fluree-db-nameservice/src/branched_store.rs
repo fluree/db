@@ -15,7 +15,7 @@ use std::sync::Arc;
 
 use fluree_db_core::{format_ledger_id, BranchedContentStore, ContentStore, StorageBackend};
 
-use crate::{NameService, NameServiceError, NsRecord, Result};
+use crate::{NameServiceError, NameServiceLookup, NsRecord, Result};
 
 /// Build a content store for `record`, walking branch ancestry on read miss.
 ///
@@ -29,7 +29,7 @@ use crate::{NameService, NameServiceError, NsRecord, Result};
 /// common (non-branched) path.
 pub async fn branched_content_store_for_record(
     backend: &StorageBackend,
-    ns: &dyn NameService,
+    ns: &dyn NameServiceLookup,
     record: &NsRecord,
 ) -> Result<Arc<dyn ContentStore>> {
     if record.source_branch.is_none() {
@@ -46,7 +46,7 @@ pub async fn branched_content_store_for_record(
 /// otherwise prefer the `_for_record` variant to skip the extra lookup.
 pub async fn branched_content_store_for_id(
     backend: &StorageBackend,
-    ns: &dyn NameService,
+    ns: &dyn NameServiceLookup,
     ledger_id: &str,
 ) -> Result<Arc<dyn ContentStore>> {
     let record = ns
@@ -70,7 +70,7 @@ pub async fn branched_content_store_for_id(
 ///   path swallow it.
 pub async fn load_default_context_blob(
     backend: &StorageBackend,
-    ns: &dyn NameService,
+    ns: &dyn NameServiceLookup,
     record: &NsRecord,
 ) -> Result<Option<serde_json::Value>> {
     let Some(ctx_id) = record.default_context.as_ref() else {
@@ -97,7 +97,7 @@ pub async fn load_default_context_blob(
 /// [`branched_content_store_for_record_or_id`] instead.
 pub async fn content_store_for_record_or_id(
     backend: &StorageBackend,
-    ns: &dyn NameService,
+    ns: &dyn NameServiceLookup,
     record: Option<&NsRecord>,
     fallback_id: &str,
 ) -> Result<Arc<dyn ContentStore>> {
@@ -121,7 +121,7 @@ pub async fn content_store_for_record_or_id(
 /// fallback, use [`content_store_for_record_or_id`].
 pub async fn branched_content_store_for_record_or_id(
     backend: &StorageBackend,
-    ns: &dyn NameService,
+    ns: &dyn NameServiceLookup,
     record: Option<&NsRecord>,
     ledger_id: &str,
 ) -> Result<Arc<dyn ContentStore>> {
@@ -143,7 +143,7 @@ pub async fn branched_content_store_for_record_or_id(
 /// non-branched case before recursing.
 pub async fn build_branched_store(
     backend: &StorageBackend,
-    ns: &dyn NameService,
+    ns: &dyn NameServiceLookup,
     record: &NsRecord,
 ) -> Result<BranchedContentStore> {
     let source = record

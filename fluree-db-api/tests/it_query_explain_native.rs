@@ -3,7 +3,6 @@
 
 #![cfg(feature = "native")]
 
-use std::sync::Arc;
 mod support;
 
 use fluree_db_api::{
@@ -49,7 +48,7 @@ async fn explain_no_optimization_when_equal_selectivity() {
     let mut fluree = FlureeBuilder::memory().build_memory();
     let (local, handle) = start_background_indexer_local(
         fluree.backend().clone(),
-        Arc::new(fluree.nameservice_mode().clone()),
+        fluree.nameservice_mode().publisher_arc().expect("test setup requires ReadWrite nameservice mode"),
         fluree_db_indexer::IndexerConfig::small(),
     );
     fluree.set_indexing_mode(IndexingMode::Background(handle.clone()));
@@ -117,7 +116,7 @@ async fn explain_reorders_bound_object_email_first() {
     let mut fluree = FlureeBuilder::memory().build_memory();
     let (local, handle) = start_background_indexer_local(
         fluree.backend().clone(),
-        Arc::new(fluree.nameservice_mode().clone()),
+        fluree.nameservice_mode().publisher_arc().expect("test setup requires ReadWrite nameservice mode"),
         fluree_db_indexer::IndexerConfig::small(),
     );
     fluree.set_indexing_mode(IndexingMode::Background(handle.clone()));
@@ -181,7 +180,7 @@ async fn explain_reorders_badge_property_scan_before_class_scan() {
     let mut fluree = FlureeBuilder::memory().build_memory();
     let (local, handle) = start_background_indexer_local(
         fluree.backend().clone(),
-        Arc::new(fluree.nameservice_mode().clone()),
+        fluree.nameservice_mode().publisher_arc().expect("test setup requires ReadWrite nameservice mode"),
         fluree_db_indexer::IndexerConfig::small(),
     );
     fluree.set_indexing_mode(IndexingMode::Background(handle.clone()));
@@ -244,7 +243,7 @@ async fn explain_includes_inputs_fields_and_flags() {
     let mut fluree = FlureeBuilder::memory().build_memory();
     let (local, handle) = start_background_indexer_local(
         fluree.backend().clone(),
-        Arc::new(fluree.nameservice_mode().clone()),
+        fluree.nameservice_mode().publisher_arc().expect("test setup requires ReadWrite nameservice mode"),
         fluree_db_indexer::IndexerConfig::small(),
     );
     fluree.set_indexing_mode(IndexingMode::Background(handle.clone()));

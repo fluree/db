@@ -282,7 +282,7 @@ impl crate::Fluree {
                     "rebase failed, rolling back nameservice state"
                 );
                 if let Err(rollback_err) = self
-                    .nameservice()
+                    .publisher()?
                     .reset_head(&branch_id, pre_rebase_snapshot)
                     .await
                 {

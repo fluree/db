@@ -690,7 +690,7 @@ async fn policy_onclass_applies_to_novelty_properties_without_type_restated() {
 
     let (local, handle) = support::start_background_indexer_local(
         fluree.backend().clone(),
-        Arc::new(fluree.nameservice_mode().clone()),
+        fluree.nameservice_mode().publisher_arc().expect("test setup requires ReadWrite nameservice mode"),
         fluree_db_indexer::IndexerConfig::small(),
     );
     fluree.set_indexing_mode(fluree_db_api::tx::IndexingMode::Background(handle.clone()));

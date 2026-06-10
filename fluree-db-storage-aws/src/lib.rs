@@ -60,4 +60,4 @@ pub use fluree_db_core::{
     Storage, StorageCas, StorageDelete, StorageExtError, StorageExtResult, StorageList,
     StorageWrite,
 };
-pub use fluree_db_nameservice::{NameService, NsRecord, Publisher};
+pub use fluree_db_nameservice::{BranchLifecycle, NameServiceLookup, NsRecord, Publisher};

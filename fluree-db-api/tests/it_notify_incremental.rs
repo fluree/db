@@ -5,7 +5,6 @@
 
 #![cfg(feature = "native")]
 
-use std::sync::Arc;
 mod support;
 
 use fluree_db_api::{
@@ -195,7 +194,7 @@ async fn notify_index_only_trims_novelty() {
     // Start a background indexer
     let (local, indexer_handle) = start_background_indexer_local(
         fluree.backend().clone(),
-        Arc::new(fluree.nameservice_mode().clone()),
+        fluree.nameservice_mode().publisher_arc().expect("test setup requires ReadWrite nameservice mode"),
         fluree_db_indexer::IndexerConfig::small(),
     );
 

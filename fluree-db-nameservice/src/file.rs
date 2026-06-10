@@ -30,7 +30,7 @@ use crate::{
     check_cas_expectation, deserialize_json, parse_default_context_value, ref_values_match,
     serialize_json, AdminPublisher, CasResult, ConfigCasResult, ConfigLookup, ConfigPublisher,
     ConfigValue, GraphSourceLookup, GraphSourcePublisher, GraphSourceRecord, GraphSourceType,
-    NameService, NameServiceError, NsLookupResult, NsRecord, Publisher,
+    NameServiceError, NsLookupResult, NsRecord, Publisher,
     RefKind, RefLookup, RefPublisher, RefValue, Result, StatusCasResult, StatusLookup,
     StatusPublisher, StatusValue,
 };
@@ -395,7 +395,7 @@ impl FileNameService {
 }
 
 #[async_trait]
-impl NameService for FileNameService {
+impl crate::NameServiceLookup for FileNameService {
     async fn lookup(&self, ledger_id: &str) -> Result<Option<NsRecord>> {
         let (ledger_name, branch) = split_ledger_id(ledger_id)?;
         self.load_record(&ledger_name, &branch).await
@@ -453,7 +453,10 @@ impl NameService for FileNameService {
 
         Ok(records)
     }
+}
 
+#[async_trait]
+impl crate::BranchLifecycle for FileNameService {
     async fn create_branch(
         &self,
         ledger_name: &str,
@@ -1466,6 +1469,7 @@ impl ConfigPublisher for FileNameService {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{BranchLifecycle, NameServiceLookup};
     use fluree_db_core::ContentKind;
     use tempfile::TempDir;
 

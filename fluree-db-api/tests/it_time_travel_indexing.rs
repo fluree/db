@@ -10,7 +10,6 @@
 
 #![cfg(feature = "native")]
 
-use std::sync::Arc;
 mod support;
 
 use fluree_db_api::{FlureeBuilder, IndexConfig, LedgerManagerConfig, LedgerState, Novelty};
@@ -182,7 +181,7 @@ async fn time_travel_index_current() {
 
     let (local, handle) = start_background_indexer_local(
         fluree.backend().clone(),
-        Arc::new(fluree.nameservice_mode().clone()),
+        fluree.nameservice_mode().publisher_arc().expect("test setup requires ReadWrite nameservice mode"),
         fluree_db_indexer::IndexerConfig::small(),
     );
 
@@ -253,7 +252,7 @@ async fn time_travel_index_plus_novelty() {
 
     let (local, handle) = start_background_indexer_local(
         fluree.backend().clone(),
-        Arc::new(fluree.nameservice_mode().clone()),
+        fluree.nameservice_mode().publisher_arc().expect("test setup requires ReadWrite nameservice mode"),
         fluree_db_indexer::IndexerConfig::small(),
     );
 
@@ -413,7 +412,7 @@ async fn time_travel_updates_across_index_novelty_boundary() {
 
     let (local, handle) = start_background_indexer_local(
         fluree.backend().clone(),
-        Arc::new(fluree.nameservice_mode().clone()),
+        fluree.nameservice_mode().publisher_arc().expect("test setup requires ReadWrite nameservice mode"),
         fluree_db_indexer::IndexerConfig::small(),
     );
 
@@ -548,7 +547,7 @@ async fn time_travel_retraction_across_index_novelty_boundary() {
 
     let (local, handle) = start_background_indexer_local(
         fluree.backend().clone(),
-        Arc::new(fluree.nameservice_mode().clone()),
+        fluree.nameservice_mode().publisher_arc().expect("test setup requires ReadWrite nameservice mode"),
         fluree_db_indexer::IndexerConfig::small(),
     );
 
@@ -641,7 +640,7 @@ async fn time_travel_consistent_results_across_scenarios() {
 
     let (local, handle) = start_background_indexer_local(
         fluree.backend().clone(),
-        Arc::new(fluree.nameservice_mode().clone()),
+        fluree.nameservice_mode().publisher_arc().expect("test setup requires ReadWrite nameservice mode"),
         fluree_db_indexer::IndexerConfig::small(),
     );
 
@@ -771,7 +770,7 @@ async fn time_travel_no_duplicate_overlay_emission() {
 
     let (local, handle) = start_background_indexer_local(
         fluree.backend().clone(),
-        Arc::new(fluree.nameservice_mode().clone()),
+        fluree.nameservice_mode().publisher_arc().expect("test setup requires ReadWrite nameservice mode"),
         fluree_db_indexer::IndexerConfig::small(),
     );
 

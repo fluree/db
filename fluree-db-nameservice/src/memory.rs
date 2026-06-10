@@ -7,7 +7,7 @@
 use crate::{
     check_cas_expectation, ref_values_match, AdminPublisher, CasResult, ConfigCasResult,
     ConfigLookup, ConfigPublisher, ConfigValue, GraphSourceLookup, GraphSourcePublisher,
-    GraphSourceRecord, GraphSourceType, NameService, NsLookupResult, NsRecord,
+    GraphSourceRecord, GraphSourceType, NsLookupResult, NsRecord,
     Publisher, RefKind, RefLookup, RefPublisher, RefValue, Result, StatusCasResult, StatusLookup,
     StatusPayload, StatusPublisher, StatusValue,
 };
@@ -102,7 +102,7 @@ impl MemoryNameService {
 }
 
 #[async_trait]
-impl NameService for MemoryNameService {
+impl crate::NameServiceLookup for MemoryNameService {
     async fn lookup(&self, ledger_id: &str) -> Result<Option<NsRecord>> {
         Ok(self.get_record(ledger_id))
     }
@@ -120,7 +120,10 @@ impl NameService for MemoryNameService {
             .cloned()
             .collect())
     }
+}
 
+#[async_trait]
+impl crate::BranchLifecycle for MemoryNameService {
     async fn create_branch(
         &self,
         ledger_name: &str,
@@ -704,7 +707,7 @@ impl ConfigPublisher for MemoryNameService {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{ConfigPayload, StatusPayload};
+    use crate::{BranchLifecycle, ConfigPayload, NameServiceLookup, StatusPayload};
     use fluree_db_core::ContentKind;
 
     fn test_commit_id(label: &str) -> ContentId {

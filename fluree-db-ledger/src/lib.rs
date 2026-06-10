@@ -37,7 +37,7 @@ use fluree_db_core::{
     BranchedContentStore, ContentId, ContentStore, DictNovelty, Flake, GraphDbRef, GraphId,
     LedgerSnapshot, RuntimeSmallDicts, StorageBackend, TXN_META_GRAPH_ID,
 };
-use fluree_db_nameservice::{NameService, NsRecord};
+use fluree_db_nameservice::{NameServiceLookup, NsRecord};
 use fluree_db_novelty::{
     generate_commit_flakes, stamp_graph_on_commit_flakes, trace_commits_by_id, Commit, Novelty,
 };
@@ -124,7 +124,7 @@ impl LedgerState {
     /// This is resilient to missing index - if the nameservice has commits
     /// but no index yet, it creates a genesis LedgerSnapshot and loads all commits as novelty.
     pub async fn load(
-        ns: &dyn NameService,
+        ns: &dyn NameServiceLookup,
         ledger_id: &str,
         backend: &StorageBackend,
     ) -> Result<Self> {
@@ -153,7 +153,7 @@ impl LedgerState {
     /// same logic via the nameservice helpers without taking on a
     /// `fluree-db-ledger` dependency.
     pub async fn build_branched_store(
-        ns: &dyn NameService,
+        ns: &dyn NameServiceLookup,
         record: &NsRecord,
         backend: &StorageBackend,
     ) -> Result<BranchedContentStore> {
@@ -728,7 +728,7 @@ impl LedgerState {
     /// - Other errors from `apply_index`
     pub async fn maybe_apply_newer_index(
         &mut self,
-        ns: &dyn NameService,
+        ns: &dyn NameServiceLookup,
         cs: &dyn ContentStore,
     ) -> Result<bool> {
         let record = ns

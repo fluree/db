@@ -408,11 +408,17 @@ pub enum NsLookupResult {
     NotFound,
 }
 
-/// Read-only nameservice lookup trait
+/// Read-only nameservice lookup surface.
 ///
-/// Implementations provide ledger discovery by ledger ID.
+/// Implementations provide ledger discovery by ledger ID and the
+/// associated read concerns (refs, graph sources, status, config).
+/// This is the read-only counterpart to [`NameService`].
+///
+/// Callers that only need to read should bind this trait — that lets
+/// read-only backends (e.g., a replicated state machine projection)
+/// implement the lookup surface without claiming write capability.
 #[async_trait]
-pub trait NameService:
+pub trait NameServiceLookup:
     GraphSourceLookup + RefLookup + StatusLookup + ConfigLookup + Debug + Send + Sync
 {
     /// Look up a ledger by its ledger ID (e.g. "mydb:main")
@@ -440,7 +446,18 @@ pub trait NameService:
             .filter(|r| r.name == ledger_name && !r.retracted)
             .collect())
     }
+}
 
+/// Branch lifecycle writes — create, drop, and non-monotonic head reset.
+///
+/// Implementations that can't durably write (e.g., a Raft state-machine
+/// projection where writes flow through consensus proposals instead) should
+/// skip this trait entirely. Implementations of [`create_branch`](Self::create_branch)
+/// typically need to read the source branch to derive the starting commit
+/// head — they get that capability from also implementing
+/// [`NameServiceLookup`], not from a supertrait bound here.
+#[async_trait]
+pub trait BranchLifecycle: Debug + Send + Sync {
     /// Create a new branch for a ledger.
     ///
     /// Creates a new [`NsRecord`] for `ledger_name:new_branch` with its
@@ -586,13 +603,14 @@ pub trait Publisher: Debug + Send + Sync {
 
 /// Combined read-write nameservice trait.
 ///
-/// A convenience super-trait for components that need both `NameService`
-/// (lookup) and `Publisher` (write) access via a single `dyn` reference.
-/// All types that implement both `NameService` and `Publisher` automatically
+/// A convenience super-trait for components that need lookup
+/// ([`NameServiceLookup`]), branch lifecycle writes ([`BranchLifecycle`]),
+/// and commit/index publishing ([`Publisher`]) access through a single
+/// `dyn` reference. All types that implement the three automatically
 /// implement this trait via the blanket impl.
-pub trait ReadWriteNameService: NameService + Publisher {}
+pub trait ReadWriteNameService: NameServiceLookup + BranchLifecycle + Publisher {}
 
-impl<T> ReadWriteNameService for T where T: NameService + Publisher {}
+impl<T> ReadWriteNameService for T where T: NameServiceLookup + BranchLifecycle + Publisher {}
 
 /// Admin-level publisher operations
 ///
@@ -1211,8 +1229,7 @@ pub trait ConfigPublisher: ConfigLookup {
 /// Use `Arc<dyn NameServicePublisher>` when a component needs ownership of a
 /// nameservice that supports all operations.
 pub trait NameServicePublisher:
-    NameService
-    + Publisher
+    ReadWriteNameService
     + AdminPublisher
     + RefPublisher
     + GraphSourcePublisher
@@ -1222,8 +1239,7 @@ pub trait NameServicePublisher:
 }
 
 impl<T> NameServicePublisher for T where
-    T: NameService
-        + Publisher
+    T: ReadWriteNameService
         + AdminPublisher
         + RefPublisher
         + GraphSourcePublisher

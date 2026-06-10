@@ -9,7 +9,7 @@ use fluree_db_connection::{connect_async, ConnectionHandle};
 use fluree_db_core::{ContentId, ContentKind, StorageRead, StorageWrite};
 use fluree_db_nameservice::{
     AdminPublisher, CasResult, ConfigCasResult, ConfigLookup, ConfigPayload, ConfigPublisher,
-    ConfigValue, GraphSourceLookup, GraphSourcePublisher, GraphSourceType, NameService,
+    ConfigValue, GraphSourceLookup, GraphSourcePublisher, GraphSourceType, NameServiceLookup,
     NsLookupResult, Publisher, RefKind, RefLookup, RefPublisher, RefValue, StatusCasResult,
     StatusLookup, StatusPayload, StatusPublisher, StatusValue,
 };

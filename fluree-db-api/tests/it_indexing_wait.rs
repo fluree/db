@@ -13,7 +13,6 @@
 
 #![cfg(feature = "native")]
 
-use std::sync::Arc;
 mod support;
 
 use fluree_db_api::{FlureeBuilder, IndexConfig};
@@ -35,7 +34,7 @@ async fn background_indexing_trigger_wait_then_load_index_root() {
     // Start background indexing worker + handle (LocalSet since worker may be !Send).
     let (local, handle) = start_background_indexer_local(
         fluree.backend().clone(),
-        Arc::new(fluree.nameservice_mode().clone()),
+        fluree.nameservice_mode().publisher_arc().expect("test setup requires ReadWrite nameservice mode"),
         fluree_db_indexer::IndexerConfig::small(),
     );
 

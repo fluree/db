@@ -478,7 +478,7 @@ use fluree_db_query::BinaryRangeProvider;
 /// 404 on a fresh branch that hasn't yet had its own index built.
 pub(crate) async fn load_and_attach_binary_store(
     backend: &StorageBackend,
-    nameservice: &dyn fluree_db_nameservice::NameService,
+    nameservice: &dyn fluree_db_nameservice::NameServiceLookup,
     state: &mut LedgerState,
     cache_dir: &std::path::Path,
     leaflet_cache: Option<Arc<LeafletCache>>,

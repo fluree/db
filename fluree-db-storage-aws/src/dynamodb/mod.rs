@@ -24,9 +24,9 @@ use fluree_db_core::ContentId;
 use fluree_db_nameservice::{
     AdminPublisher, CasResult, ConfigCasResult, ConfigLookup, ConfigPayload, ConfigPublisher,
     ConfigValue, GraphSourceLookup, GraphSourcePublisher, GraphSourceRecord, GraphSourceType,
-    NameService, NameServiceError, NsLookupResult, NsRecord, Publisher, RefKind, RefLookup,
-    RefPublisher, RefValue, StatusCasResult, StatusLookup, StatusPayload, StatusPublisher,
-    StatusValue,
+    BranchLifecycle, NameServiceError, NameServiceLookup, NsLookupResult, NsRecord, Publisher,
+    RefKind, RefLookup, RefPublisher, RefValue, StatusCasResult, StatusLookup, StatusPayload,
+    StatusPublisher, StatusValue,
 };
 use schema::*;
 use std::collections::HashMap;
@@ -495,7 +495,7 @@ impl DynamoDbNameService {
 // ─── NameService ────────────────────────────────────────────────────────────
 
 #[async_trait]
-impl NameService for DynamoDbNameService {
+impl fluree_db_nameservice::NameServiceLookup for DynamoDbNameService {
     async fn lookup(
         &self,
         ledger_id: &str,
@@ -526,7 +526,10 @@ impl NameService for DynamoDbNameService {
 
         Ok(records)
     }
+}
 
+#[async_trait]
+impl BranchLifecycle for DynamoDbNameService {
     async fn create_branch(
         &self,
         ledger_name: &str,

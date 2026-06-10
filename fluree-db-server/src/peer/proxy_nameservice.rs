@@ -5,7 +5,7 @@
 //! credentials.
 
 use async_trait::async_trait;
-use fluree_db_nameservice::{NameService, NameServiceError, NsRecord, Result};
+use fluree_db_nameservice::{BranchLifecycle, NameServiceError, NsRecord, Result};
 use reqwest::{Client, StatusCode};
 use serde::Deserialize;
 use std::fmt::Debug;
@@ -158,7 +158,7 @@ impl fluree_db_nameservice::ConfigLookup for ProxyNameService {
 }
 
 #[async_trait]
-impl NameService for ProxyNameService {
+impl fluree_db_nameservice::NameServiceLookup for ProxyNameService {
     async fn lookup(&self, ledger_id: &str) -> Result<Option<NsRecord>> {
         let url = self.ns_url(ledger_id);
 
@@ -201,7 +201,10 @@ impl NameService for ProxyNameService {
         // The peer maintains its own view of known ledgers via SSE events
         Ok(Vec::new())
     }
+}
 
+#[async_trait]
+impl BranchLifecycle for ProxyNameService {
     async fn create_branch(
         &self,
         _ledger_name: &str,

@@ -16,6 +16,7 @@ raft = ["dep:openraft", "dep:postcard"]
 [dependencies]
 fluree-db-api = { path = "../fluree-db-api" }
 fluree-db-core = { path = "../fluree-db-core" }
+fluree-db-nameservice = { path = "../fluree-db-nameservice" }
 fluree-db-transact = { path = "../fluree-db-transact" }
 fluree-db-ledger = { path = "../fluree-db-ledger" }
 

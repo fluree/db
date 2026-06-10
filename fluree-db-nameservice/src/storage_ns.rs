@@ -23,8 +23,9 @@ use crate::ns_format::{
 use crate::{
     deserialize_json, parse_default_context_value, serialize_json, AdminPublisher, CasResult,
     ConfigCasResult, ConfigLookup, ConfigPublisher, ConfigValue, GraphSourceLookup,
-    GraphSourcePublisher, GraphSourceRecord, GraphSourceType, NameService,
-    NameServiceError, NsLookupResult, NsRecord, Publisher, RefKind, RefLookup, RefPublisher,
+    BranchLifecycle, GraphSourcePublisher, GraphSourceRecord, GraphSourceType,
+    NameServiceError, NameServiceLookup, NsLookupResult, NsRecord, Publisher, RefKind, RefLookup,
+    RefPublisher,
     RefValue, Result, StatusCasResult, StatusLookup, StatusPublisher, StatusValue,
 };
 use async_trait::async_trait;
@@ -471,7 +472,7 @@ enum CasUpdateOutcome {
 }
 
 #[async_trait]
-impl<S> NameService for StorageNameService<S>
+impl<S> NameServiceLookup for StorageNameService<S>
 where
     S: StorageRead + StorageWrite + StorageList + StorageCas + Debug + Send + Sync,
 {
@@ -559,7 +560,13 @@ where
 
         Ok(records)
     }
+}
 
+#[async_trait]
+impl<S> BranchLifecycle for StorageNameService<S>
+where
+    S: StorageRead + StorageWrite + StorageList + StorageCas + Debug + Send + Sync,
+{
     async fn create_branch(
         &self,
         ledger_name: &str,

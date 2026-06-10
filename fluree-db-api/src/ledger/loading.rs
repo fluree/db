@@ -221,7 +221,7 @@ impl Fluree {
 
         let is_historical = at_commit.is_some();
 
-        self.nameservice()
+        self.publisher()?
             .create_branch(ledger_name, new_branch, source, at_commit)
             .await
             .map_err(|e| match e {

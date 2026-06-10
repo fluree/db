@@ -318,7 +318,7 @@ async fn orchestrator_first_reindex_no_config_completes_quickly() {
         .with_fulltext_config_provider(fluree.fulltext_config_provider());
     let (local, handle) = support::start_background_indexer_local(
         fluree.backend().clone(),
-        Arc::new(fluree.nameservice_mode().clone()),
+        fluree.nameservice_mode().publisher_arc().expect("test setup requires ReadWrite nameservice mode"),
         cfg,
     );
 

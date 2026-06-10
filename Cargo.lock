@@ -2640,6 +2640,7 @@ dependencies = [
  "fluree-db-api",
  "fluree-db-core",
  "fluree-db-ledger",
+ "fluree-db-nameservice",
  "fluree-db-transact",
  "hex",
  "moka",

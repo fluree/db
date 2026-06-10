@@ -71,7 +71,7 @@ pub use run_index::build::build_from_commits::{
 };
 
 use fluree_db_core::ContentStore;
-use fluree_db_nameservice::{NameService, Publisher};
+use fluree_db_nameservice::{NameServiceLookup, Publisher};
 use tracing::Instrument;
 
 /// Result of building an index
@@ -227,7 +227,7 @@ pub async fn build_index_for_record(
 /// Use `rebuild_index_from_commits` directly to force a rebuild regardless.
 pub async fn build_index_for_ledger(
     content_store: std::sync::Arc<dyn ContentStore>,
-    nameservice: &dyn NameService,
+    nameservice: &dyn NameServiceLookup,
     ledger_id: &str,
     config: IndexerConfig,
 ) -> Result<IndexResult> {

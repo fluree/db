@@ -222,8 +222,8 @@ pub use fluree_db_ledger::{
     HistoricalLedgerView, IndexConfig, LedgerState, StagedLedger, TypeErasedStore,
 };
 pub use fluree_db_nameservice::{
-    ConfigCasResult, ConfigPayload, ConfigPublisher, ConfigValue, GraphSourceLookup,
-    GraphSourcePublisher, NameService, NsRecord, Publisher,
+    BranchLifecycle, ConfigCasResult, ConfigPayload, ConfigPublisher, ConfigValue,
+    GraphSourceLookup, GraphSourcePublisher, NameServiceLookup, NsRecord, Publisher,
 };
 pub use fluree_db_novelty::Novelty;
 pub use fluree_db_query::{
@@ -292,7 +292,7 @@ pub enum NameServiceMode {
     ReadWrite(Arc<dyn NameServicePublisher>),
     /// Read-only proxy nameservice.
     /// Writes are forwarded to the remote transaction server via HTTP.
-    ReadOnly(Arc<dyn NameService>),
+    ReadOnly(Arc<dyn NameServiceLookup>),
 }
 
 impl std::fmt::Debug for NameServiceMode {
@@ -306,19 +306,22 @@ impl std::fmt::Debug for NameServiceMode {
 
 impl NameServiceMode {
     /// Get read-only nameservice access (always available).
-    pub fn reader(&self) -> &dyn NameService {
+    pub fn reader(&self) -> &dyn NameServiceLookup {
         match self {
             Self::ReadWrite(ns) => ns.as_ref(),
             Self::ReadOnly(ns) => ns.as_ref(),
         }
     }
 
-    /// Owned `Arc<dyn NameService>` view, for handing off to long-lived
+    /// Owned `Arc<dyn NameServiceLookup>` view, for handing off to long-lived
     /// subsystems (e.g. the indexer's full-text config provider) that
     /// need to outlive a single borrow of the mode enum.
-    pub fn as_arc_reader(&self) -> Arc<dyn NameService> {
+    pub fn as_arc_reader(&self) -> Arc<dyn NameServiceLookup> {
         match self {
-            Self::ReadWrite(ns) => Arc::clone(ns) as Arc<dyn NameService>,
+            Self::ReadWrite(ns) => {
+                let cloned: Arc<dyn NameServicePublisher> = Arc::clone(ns);
+                cloned
+            }
             Self::ReadOnly(ns) => Arc::clone(ns),
         }
     }
@@ -349,7 +352,7 @@ impl NameServiceMode {
 }
 
 #[async_trait]
-impl fluree_db_nameservice::NameService for NameServiceMode {
+impl fluree_db_nameservice::NameServiceLookup for NameServiceMode {
     async fn lookup(
         &self,
         ledger_id: &str,
@@ -368,34 +371,11 @@ impl fluree_db_nameservice::NameService for NameServiceMode {
     > {
         self.reader().all_records().await
     }
-
-    async fn create_branch(
-        &self,
-        ledger_name: &str,
-        new_branch: &str,
-        source_branch: &str,
-        at_commit: Option<(fluree_db_core::ContentId, i64)>,
-    ) -> std::result::Result<(), fluree_db_nameservice::NameServiceError> {
-        self.reader()
-            .create_branch(ledger_name, new_branch, source_branch, at_commit)
-            .await
-    }
-
-    async fn drop_branch(
-        &self,
-        ledger_id: &str,
-    ) -> std::result::Result<Option<u32>, fluree_db_nameservice::NameServiceError> {
-        self.reader().drop_branch(ledger_id).await
-    }
-
-    async fn reset_head(
-        &self,
-        ledger_id: &str,
-        snapshot: fluree_db_nameservice::NsRecordSnapshot,
-    ) -> std::result::Result<(), fluree_db_nameservice::NameServiceError> {
-        self.reader().reset_head(ledger_id, snapshot).await
-    }
 }
+
+// No `BranchLifecycle` impl for `NameServiceMode`: read-only modes can't
+// honestly fulfill branch writes. Callers needing branch lifecycle access
+// go through `publisher()` (Some only for `ReadWrite` mode).
 
 #[async_trait]
 impl fluree_db_nameservice::GraphSourceLookup for NameServiceMode {
@@ -2211,7 +2191,7 @@ impl FlureeBuilder {
         nameservice: &N,
     ) -> tx::IndexingMode
     where
-        N: NameService + fluree_db_nameservice::Publisher + Clone + 'static,
+        N: NameServiceLookup + BranchLifecycle + fluree_db_nameservice::Publisher + Clone + 'static,
     {
         self.start_background_indexing_dyn(backend, Arc::new(nameservice.clone()))
     }
@@ -2232,7 +2212,7 @@ impl FlureeBuilder {
             // runs would silently drop configured plain-string values
             // committed after the connection started. 64MB cache matches
             // the default `LeafletCache` budget in `load_per_graph_arenas`.
-            let ns_for_provider: Arc<dyn fluree_db_nameservice::NameService> =
+            let ns_for_provider: Arc<dyn fluree_db_nameservice::NameServiceLookup> =
                 Arc::clone(&nameservice) as _;
             let provider = Arc::new(
                 crate::indexer_fulltext_provider::ApiFulltextConfigProvider {
@@ -2668,7 +2648,7 @@ impl Fluree {
     }
 
     /// Get read-only nameservice access (always available).
-    pub fn nameservice(&self) -> &dyn NameService {
+    pub fn nameservice(&self) -> &dyn NameServiceLookup {
         self.nameservice_mode.reader()
     }
 

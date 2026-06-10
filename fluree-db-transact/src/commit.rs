@@ -26,7 +26,7 @@ use chrono::Utc;
 use fluree_db_binary_index::BinaryIndexStore;
 use fluree_db_core::{ContentId, ContentKind, ContentStore, DictNovelty, Flake, TXN_META_GRAPH_ID};
 use fluree_db_ledger::{IndexConfig, LedgerState, StagedLedger};
-use fluree_db_nameservice::{CasResult, NameService, RefKind, RefPublisher, RefValue};
+use fluree_db_nameservice::{CasResult, NameServiceLookup, RefKind, RefPublisher, RefValue};
 use fluree_db_novelty::{generate_commit_flakes, stamp_graph_on_commit_flakes};
 use fluree_db_novelty::{Commit, SigningKey, TxnMetaEntry, TxnMetaValue, TxnSignature};
 use fluree_db_query::BinaryRangeProvider;
@@ -791,7 +791,7 @@ pub async fn commit<C, N>(
 ) -> Result<(CommitReceipt, LedgerState)>
 where
     C: ContentStore + ?Sized,
-    N: NameService + RefPublisher + ?Sized,
+    N: NameServiceLookup + RefPublisher + ?Sized,
 {
     let skip_sequencing = opts.skip_sequencing;
 
@@ -956,8 +956,8 @@ mod tests {
     };
     use fluree_db_nameservice::memory::MemoryNameService;
     use fluree_db_nameservice::{
-        GraphSourceLookup, GraphSourceRecord, NameService, NsLookupResult, NsRecord,
-        NsRecordSnapshot, RefPublisher,
+        BranchLifecycle, GraphSourceLookup, GraphSourceRecord, NameServiceLookup, NsLookupResult,
+        NsRecord, NsRecordSnapshot, RefPublisher,
     };
     use fluree_db_novelty::Novelty;
     use std::fmt;
@@ -998,7 +998,7 @@ mod tests {
     }
 
     #[async_trait::async_trait]
-    impl NameService for LosePublishRaceNameService {
+    impl NameServiceLookup for LosePublishRaceNameService {
         async fn lookup(&self, ledger_id: &str) -> fluree_db_nameservice::Result<Option<NsRecord>> {
             self.inner.lookup(ledger_id).await
         }
@@ -1006,7 +1006,10 @@ mod tests {
         async fn all_records(&self) -> fluree_db_nameservice::Result<Vec<NsRecord>> {
             self.inner.all_records().await
         }
+    }
 
+    #[async_trait::async_trait]
+    impl BranchLifecycle for LosePublishRaceNameService {
         async fn create_branch(
             &self,
             ledger_name: &str,
