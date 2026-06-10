@@ -106,17 +106,30 @@ impl SameAsTracker {
     /// Get the canonical representative without modifying (for read-only access)
     ///
     /// This does NOT do path compression, so it's O(log n) instead of O(α(n)).
-    /// Use `find` if you need repeated lookups.
+    /// Call [`Self::compress_all`] after unions to make this single-hop, or
+    /// use `find` if you have mutable access.
     pub fn canonical(&self, x: &Sid) -> Sid {
-        if !self.parent.contains_key(x) {
-            return x.clone();
+        let mut current = x;
+        while let Some(parent) = self.parent.get(current) {
+            if parent == current {
+                break;
+            }
+            current = parent;
         }
+        current.clone()
+    }
 
-        let mut current = x.clone();
-        while self.parent[&current] != current {
-            current = self.parent[&current].clone();
+    /// Path-compress every tracked element so subsequent read-only
+    /// [`Self::canonical`] lookups are single-hop.
+    ///
+    /// Call after a batch of unions (e.g., once per fixpoint iteration in
+    /// which the equivalence classes changed) — rule application holds the
+    /// tracker behind a shared reference and cannot compress on the fly.
+    pub fn compress_all(&mut self) {
+        let elements: Vec<Sid> = self.parent.keys().cloned().collect();
+        for elem in &elements {
+            self.find(elem);
         }
-        current
     }
 
     /// Returns true if this tracker has any equivalence relations

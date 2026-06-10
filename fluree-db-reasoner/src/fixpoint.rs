@@ -206,6 +206,13 @@ pub async fn run_fixpoint(
         );
         same_as_changed = same_as_changed || identity_same_as_changed;
 
+        // Phase C rules canonicalize every fact through a shared reference
+        // (read-only walks, no compression). Compress once here so those
+        // lookups are single-hop for the rest of the iteration.
+        if same_as_changed {
+            same_as_tracker.compress_all();
+        }
+
         // PHASE C: Apply non-identity rules
         // These rules produce property/type facts (not sameAs)
 
