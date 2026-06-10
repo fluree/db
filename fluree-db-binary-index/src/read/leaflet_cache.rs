@@ -202,6 +202,11 @@ pub struct V3BatchCacheKey {
     pub leaf_id: u128,
     /// Leaflet slot within the leaf (0..leaflet_count).
     pub leaflet_idx: u32,
+    /// `ColumnSet` bitmask of the columns decoded into this cached batch.
+    /// Projection-aware: a narrow batch (e.g. one decoded without the `t`
+    /// column for a current-time scan) caches under a different key than a full
+    /// decode, so it is never served to a query that needs the omitted column.
+    pub columns: u16,
 }
 
 // ============================================================================
@@ -640,7 +645,7 @@ impl LeafletCache {
         if let Some(batch) = self.get_v3_batch(&key) {
             return Ok(batch);
         }
-        // Miss: run the single-flight wait/init in a blocking region so a
+        // Run the single-flight wait/init in a blocking region so a
         // waiter promotes a replacement worker (see in_blocking_region).
         let result = in_blocking_region(|| {
             self.inner.try_get_with(CacheKey::V3Batch(key), || {

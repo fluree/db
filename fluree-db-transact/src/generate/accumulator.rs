@@ -25,7 +25,7 @@
 //!   retractions survive (RDF set semantics: 4 retracts + 1 assert collapses
 //!   to 1 surviving retract, not 0).
 
-use fluree_db_core::{Flake, IndexType};
+use fluree_db_core::{Flake, IndexType, Sid};
 use rustc_hash::{FxBuildHasher, FxHashMap, FxHashSet};
 
 /// Accumulates flakes from one or more sources and produces a deterministic,
@@ -33,13 +33,23 @@ use rustc_hash::{FxBuildHasher, FxHashMap, FxHashSet};
 pub struct FlakeAccumulator {
     inner: AccInner,
     input_count: u64,
+    capacity_hint: usize,
 }
 
+/// Dedup is keyed by **(graph, fact)**, not fact alone.
+///
+/// `Flake`'s `Eq`/`Hash` intentionally ignore the graph component `g`
+/// (`fluree-db-core/src/flake.rs`), so a single fact asserted/retracted in two
+/// different graphs within one transaction would otherwise collapse into one
+/// bucket — silently dropping the second graph's flake, or cross-cancelling an
+/// assertion in one graph against a retraction in another. Nesting the maps by
+/// `Option<Sid>` (the graph; `None` = default graph) scopes cancellation to a
+/// single graph. Single-graph transactions are unaffected (one outer entry).
 enum AccInner {
-    /// Pure-DELETE: only retractions, deduplicated by fact identity.
-    PureRetract(FxHashSet<Flake>),
-    /// Mixed assertions + retractions with 1:1 per-fact cancellation.
-    Mixed(FxHashMap<Flake, FlakeBucket>),
+    /// Pure-DELETE: retractions deduplicated by fact identity, per graph.
+    PureRetract(FxHashMap<Option<Sid>, FxHashSet<Flake>>),
+    /// Mixed assertions + retractions with 1:1 per-fact cancellation, per graph.
+    Mixed(FxHashMap<Option<Sid>, FxHashMap<Flake, FlakeBucket>>),
 }
 
 #[derive(Default)]
@@ -57,22 +67,18 @@ impl FlakeAccumulator {
     /// Use only when the transaction has no INSERT templates and is not Upsert.
     pub fn pure_delete(capacity_hint: usize) -> Self {
         Self {
-            inner: AccInner::PureRetract(FxHashSet::with_capacity_and_hasher(
-                capacity_hint,
-                FxBuildHasher,
-            )),
+            inner: AccInner::PureRetract(FxHashMap::default()),
             input_count: 0,
+            capacity_hint,
         }
     }
 
     /// Mixed assertion + retraction accumulator with set-semantics cancellation.
     pub fn mixed(capacity_hint: usize) -> Self {
         Self {
-            inner: AccInner::Mixed(FxHashMap::with_capacity_and_hasher(
-                capacity_hint,
-                FxBuildHasher,
-            )),
+            inner: AccInner::Mixed(FxHashMap::default()),
             input_count: 0,
+            capacity_hint,
         }
     }
 
@@ -89,21 +95,28 @@ impl FlakeAccumulator {
     /// Push retractions from any source. Duplicates collapse to a single
     /// representative survivor (RDF set semantics).
     pub fn push_retractions<I: IntoIterator<Item = Flake>>(&mut self, flakes: I) {
+        let hint = self.capacity_hint;
         match &mut self.inner {
-            AccInner::PureRetract(set) => {
+            AccInner::PureRetract(graphs) => {
                 for f in flakes {
                     debug_assert!(!f.op, "push_retractions received an assertion (op=true)");
                     self.input_count += 1;
-                    // Dropping `f` on collision is the dedup — the `FxHashSet`
-                    // keeps the first inserted flake and drops the duplicate.
-                    set.insert(f);
+                    // Dropping `f` on collision is the dedup — the per-graph
+                    // `FxHashSet` keeps the first inserted flake of each fact.
+                    graphs
+                        .entry(f.g.clone())
+                        .or_insert_with(|| FxHashSet::with_capacity_and_hasher(hint, FxBuildHasher))
+                        .insert(f);
                 }
             }
-            AccInner::Mixed(map) => {
+            AccInner::Mixed(graphs) => {
                 for f in flakes {
                     debug_assert!(!f.op, "push_retractions received an assertion (op=true)");
                     self.input_count += 1;
-                    push_into_mixed(map, f);
+                    let inner = graphs.entry(f.g.clone()).or_insert_with(|| {
+                        FxHashMap::with_capacity_and_hasher(hint, FxBuildHasher)
+                    });
+                    push_into_mixed(inner, f);
                 }
             }
         }
@@ -124,11 +137,15 @@ impl FlakeAccumulator {
                      accumulator — this indicates an upstream wiring bug"
                 );
             }
-            AccInner::Mixed(map) => {
+            AccInner::Mixed(graphs) => {
+                let hint = self.capacity_hint;
                 for f in flakes {
                     debug_assert!(f.op, "push_assertions received a retraction (op=false)");
                     self.input_count += 1;
-                    push_into_mixed(map, f);
+                    let inner = graphs.entry(f.g.clone()).or_insert_with(|| {
+                        FxHashMap::with_capacity_and_hasher(hint, FxBuildHasher)
+                    });
+                    push_into_mixed(inner, f);
                 }
             }
         }
@@ -141,19 +158,24 @@ impl FlakeAccumulator {
     /// cancel; surplus on either side contributes one survivor of that op.
     pub fn finalize(self) -> Vec<Flake> {
         let mut out: Vec<Flake> = match self.inner {
-            AccInner::PureRetract(set) => set.into_iter().collect(),
-            AccInner::Mixed(map) => {
-                let mut v = Vec::with_capacity(map.len());
-                for (_key, b) in map {
-                    let cancel = b.assert_count.min(b.retract_count);
-                    if b.assert_count > cancel {
-                        if let Some(a) = b.assertion {
-                            v.push(a);
+            AccInner::PureRetract(graphs) => graphs
+                .into_values()
+                .flat_map(IntoIterator::into_iter)
+                .collect(),
+            AccInner::Mixed(graphs) => {
+                let mut v = Vec::with_capacity(graphs.values().map(FxHashMap::len).sum());
+                for inner in graphs.into_values() {
+                    for (_key, b) in inner {
+                        let cancel = b.assert_count.min(b.retract_count);
+                        if b.assert_count > cancel {
+                            if let Some(a) = b.assertion {
+                                v.push(a);
+                            }
                         }
-                    }
-                    if b.retract_count > cancel {
-                        if let Some(r) = b.retraction {
-                            v.push(r);
+                        if b.retract_count > cancel {
+                            if let Some(r) = b.retraction {
+                                v.push(r);
+                            }
                         }
                     }
                 }
@@ -369,6 +391,73 @@ mod tests {
         // guard. (Allows defensively shaped call sites.)
         let mut acc = FlakeAccumulator::pure_delete(0);
         acc.push_assertions(Vec::<Flake>::new());
+        assert!(acc.finalize().is_empty());
+    }
+
+    // ---- Graph scoping: dedup/cancellation is per (graph, fact) -------------
+
+    fn flake_in_graph(g: u16, s: u16, p: u16, o: i64, t: i64, op: bool) -> Flake {
+        Flake::new_in_graph(
+            Sid::new(g, format!("g{g}")),
+            Sid::new(s, format!("s{s}")),
+            Sid::new(p, format!("p{p}")),
+            FlakeValue::Long(o),
+            Sid::new(2, "long"),
+            t,
+            op,
+            None,
+        )
+    }
+
+    #[test]
+    fn pure_delete_distinguishes_graphs() {
+        // Same fact retracted in the default graph AND a named graph must yield
+        // two survivors (one per graph), not collapse to one.
+        let mut acc = FlakeAccumulator::pure_delete(2);
+        acc.push_retractions(vec![
+            flake(1, 1, 100, 5, false),             // default graph (g = None)
+            flake_in_graph(7, 1, 1, 100, 5, false), // named graph
+        ]);
+        let out = acc.finalize();
+        assert_eq!(out.len(), 2, "default and named retractions are distinct");
+        assert!(out.iter().any(|f| f.g.is_none()));
+        assert!(out.iter().any(|f| f.g.is_some()));
+    }
+
+    #[test]
+    fn mixed_assert_and_named_copy_both_survive() {
+        // Same fact asserted in the default graph AND a named graph in one txn:
+        // both must survive (no collapse).
+        let mut acc = FlakeAccumulator::mixed(2);
+        acc.push_assertions(vec![
+            flake(1, 1, 100, 5, true),
+            flake_in_graph(7, 1, 1, 100, 5, true),
+        ]);
+        let out = acc.finalize();
+        assert_eq!(out.len(), 2);
+        assert!(out.iter().all(|f| f.op));
+    }
+
+    #[test]
+    fn mixed_does_not_cancel_across_graphs() {
+        // An assertion in a named graph and a retraction of the same fact in the
+        // default graph target different graphs and must NOT cancel.
+        let mut acc = FlakeAccumulator::mixed(2);
+        acc.push_assertions(vec![flake_in_graph(7, 1, 1, 100, 5, true)]);
+        acc.push_retractions(vec![flake(1, 1, 100, 6, false)]);
+        let out = acc.finalize();
+        assert_eq!(out.len(), 2, "cross-graph assert/retract must not cancel");
+        assert!(out.iter().any(|f| f.op && f.g.is_some()));
+        assert!(out.iter().any(|f| !f.op && f.g.is_none()));
+    }
+
+    #[test]
+    fn mixed_cancels_within_same_graph() {
+        // Within the SAME named graph, an assert + retract of the same fact
+        // cancel 1:1 (unchanged set semantics, now graph-scoped).
+        let mut acc = FlakeAccumulator::mixed(2);
+        acc.push_assertions(vec![flake_in_graph(7, 1, 1, 100, 5, true)]);
+        acc.push_retractions(vec![flake_in_graph(7, 1, 1, 100, 6, false)]);
         assert!(acc.finalize().is_empty());
     }
 }

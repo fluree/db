@@ -233,7 +233,36 @@ fn eval_cached_bool_predicate_with_spec<R: RowAccess>(
     Ok(Some(pass))
 }
 
+/// Cheap, hash-free variable-usage walk used to pre-filter cacheable predicates.
+///
+/// The encoded-bool-predicate cache only applies to single-variable predicates,
+/// but `analyze_bool_cache` computes a SipHash of the whole expression tree as it
+/// walks. For the common multi-variable predicate (e.g. `?a < ?b + k`) that hash
+/// is pure waste — recomputed per row only to be discarded. This walk decides
+/// single-vs-multi without hashing and short-circuits on the second distinct var.
+fn bool_predicate_var_usage(expr: &Expression) -> VarUsage {
+    match expr {
+        Expression::Var(v) => VarUsage::Single(*v),
+        Expression::Const(_) | Expression::Exists { .. } => VarUsage::None,
+        Expression::Call { args, .. } => {
+            let mut vars = VarUsage::None;
+            for arg in args {
+                vars = merge_var_usage(vars, bool_predicate_var_usage(arg));
+                if matches!(vars, VarUsage::Multiple) {
+                    return VarUsage::Multiple;
+                }
+            }
+            vars
+        }
+    }
+}
+
 fn analyze_cacheable_bool_predicate(expr: &Expression) -> Option<CacheableBoolPredicate> {
+    // Bail before the (SipHash) structural+hash walk when the predicate isn't a
+    // single-variable shape — the only shape the cache can serve.
+    if !matches!(bool_predicate_var_usage(expr), VarUsage::Single(_)) {
+        return None;
+    }
     let analysis = analyze_bool_cache(expr);
     let VarUsage::Single(input_var) = analysis.vars else {
         return None;
