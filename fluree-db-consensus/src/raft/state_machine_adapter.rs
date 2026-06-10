@@ -24,6 +24,14 @@ use openraft::{
 use std::io::Cursor;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use tokio::sync::RwLock;
+
+/// Handle to the replicated nameservice state used by the apply
+/// path. Cloning is cheap (`Arc` clone). Sharing this with a
+/// [`RaftNameService`](crate::raft::nameservice::RaftNameService)
+/// lets read-only consumers see committed state without going
+/// through openraft's RPC surface.
+pub type SharedState = Arc<RwLock<NameServiceState>>;
 
 fn io_err<S: ToString>(
     verb: ErrorVerb,
@@ -55,14 +63,16 @@ fn snapshot_err<S: ToString>(verb: ErrorVerb, source: S) -> StorageError<NodeId>
 
 /// openraft state-machine adapter wrapping an `Arc<S: RaftStorage>`.
 ///
-/// Holds the in-memory [`NameServiceState`] plus the bookkeeping
-/// openraft needs (last-applied log id, current membership). Snapshot
+/// Holds the in-memory [`NameServiceState`] (shared via [`SharedState`]
+/// so a [`RaftNameService`](crate::raft::nameservice::RaftNameService)
+/// can read the same committed state) plus the bookkeeping openraft
+/// needs (last-applied log id, current membership). Snapshot
 /// reads/writes go through `S::SnapshotStore`.
 pub struct StateMachineAdapter<S>
 where
     S: RaftStorage,
 {
-    state: NameServiceState,
+    state: SharedState,
     last_applied: Option<LogId<NodeId>>,
     last_membership: StoredMembership<NodeId, BasicNode>,
     storage: Arc<S>,
@@ -75,9 +85,17 @@ impl<S> StateMachineAdapter<S>
 where
     S: RaftStorage,
 {
+    /// Construct an adapter with a freshly-allocated [`SharedState`].
     pub fn new(storage: Arc<S>) -> Self {
+        Self::with_state(storage, Arc::new(RwLock::new(NameServiceState::default())))
+    }
+
+    /// Construct an adapter sharing the provided state handle. Use
+    /// this when the same state must be visible to a `RaftNameService`
+    /// constructed alongside the adapter.
+    pub fn with_state(storage: Arc<S>, state: SharedState) -> Self {
         Self {
-            state: NameServiceState::default(),
+            state,
             last_applied: None,
             last_membership: StoredMembership::default(),
             storage,
@@ -85,10 +103,9 @@ where
         }
     }
 
-    /// Borrow the current state machine state. Useful in tests; not
-    /// part of the openraft trait surface.
-    pub fn state(&self) -> &NameServiceState {
-        &self.state
+    /// Borrow the shared state handle. Cheap clone (`Arc`).
+    pub fn shared_state(&self) -> SharedState {
+        Arc::clone(&self.state)
     }
 }
 
@@ -111,13 +128,14 @@ where
         I::IntoIter: Send,
     {
         let mut responses = Vec::new();
+        let mut state = self.state.write().await;
         for entry in entries {
             let log_id = entry.log_id;
             self.last_applied = Some(log_id);
             match entry.payload {
                 EntryPayload::Blank => responses.push(Response::NoOp),
                 EntryPayload::Normal(cmd) => {
-                    responses.push(state_machine::apply(&mut self.state, cmd, log_id.index));
+                    responses.push(state_machine::apply(&mut state, cmd, log_id.index));
                 }
                 EntryPayload::Membership(m) => {
                     self.last_membership = StoredMembership::new(Some(log_id), m);
@@ -130,8 +148,9 @@ where
 
     async fn get_snapshot_builder(&mut self) -> Self::SnapshotBuilder {
         let counter = self.snapshot_counter.fetch_add(1, Ordering::Relaxed) + 1;
+        let state_clone = self.state.read().await.clone();
         SnapshotBuilder {
-            state: self.state.clone(),
+            state: state_clone,
             last_applied: self.last_applied,
             last_membership: self.last_membership.clone(),
             storage: Arc::clone(&self.storage),
@@ -151,7 +170,7 @@ where
         snapshot: Box<Cursor<Vec<u8>>>,
     ) -> Result<(), StorageError<NodeId>> {
         let bytes = snapshot.into_inner();
-        let state = NameServiceState::from_snapshot(&bytes).map_err(read_state_err)?;
+        let new_state = NameServiceState::from_snapshot(&bytes).map_err(read_state_err)?;
         let membership_bytes =
             postcard::to_allocvec(&meta.last_membership).map_err(write_state_err)?;
 
@@ -168,7 +187,7 @@ where
             .await
             .map_err(|e| snapshot_err(ErrorVerb::Write, e))?;
 
-        self.state = state;
+        *self.state.write().await = new_state;
         self.last_applied = meta.last_log_id;
         self.last_membership = meta.last_membership.clone();
         Ok(())
@@ -315,7 +334,7 @@ mod tests {
         let responses = sm.apply([create_ledger_entry(1, "test/db")]).await.unwrap();
         assert_eq!(responses.len(), 1);
         assert!(matches!(responses[0], Response::Created { .. }));
-        assert!(sm.state().ledgers.contains_key("test/db"));
+        assert!(sm.shared_state().read().await.ledgers.contains_key("test/db"));
         let (applied, _) = sm.applied_state().await.unwrap();
         assert_eq!(applied, Some(log_id(1, 1)));
     }
@@ -381,7 +400,12 @@ mod tests {
             .await
             .unwrap();
 
-        assert!(target.state().ledgers.contains_key("test/db"));
+        assert!(target
+            .shared_state()
+            .read()
+            .await
+            .ledgers
+            .contains_key("test/db"));
         let (applied, _) = target.applied_state().await.unwrap();
         assert_eq!(applied, Some(log_id(1, 1)));
     }
