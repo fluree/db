@@ -305,13 +305,26 @@ pub async fn build_index_for_ledger_with_tracker(
     tracker: fluree_db_core::tracking::Tracker,
     nameservice: &dyn NameService,
     ledger_id: &str,
-    config: IndexerConfig,
+    mut config: IndexerConfig,
 ) -> Result<IndexResult> {
     let record = nameservice
         .lookup(ledger_id)
         .await
         .map_err(|e| IndexerError::NameService(e.to_string()))?
         .ok_or_else(|| IndexerError::LedgerNotFound(ledger_id.to_string()))?;
+
+    // Hand the commit-CID index (if any) to the incremental path so it can
+    // skip the serial commit-DAG walk. Errors degrade to `None` (fall back to
+    // the walk); the index is never a correctness dependency.
+    // `force_serial_commit_walk` leaves it unset to A/B the serial baseline.
+    config.pending_commit_cids = if config.force_serial_commit_walk {
+        None
+    } else {
+        nameservice
+            .pending_commit_cids(ledger_id, record.index_t)
+            .await
+            .unwrap_or(None)
+    };
 
     build_index_for_record_with_tracker(content_store, tracker, &record, config).await
 }

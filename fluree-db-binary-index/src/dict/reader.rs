@@ -267,6 +267,45 @@ impl DictTreeReader {
         Ok(result)
     }
 
+    /// Distinct leaf `address`es the given keys map to, via the in-memory
+    /// branch routing (no I/O). Lets a caller learn which leaves a batched
+    /// reverse lookup will touch so it can prewarm them concurrently before
+    /// the sync lookup runs. Preserves first-seen order; deduplicated.
+    pub fn touched_leaf_addresses<'a, I>(&self, keys: I) -> Vec<&str>
+    where
+        I: IntoIterator<Item = &'a [u8]>,
+    {
+        let mut seen = vec![false; self.branch.leaves.len()];
+        let mut addresses = Vec::new();
+        for key in keys {
+            if let Some(leaf_idx) = self.branch.find_leaf(key) {
+                if !seen[leaf_idx] {
+                    seen[leaf_idx] = true;
+                    addresses.push(self.branch.leaves[leaf_idx].address.as_str());
+                }
+            }
+        }
+        addresses
+    }
+
+    /// The remote CID for a leaf `address`, if this reader fetches that leaf
+    /// from CAS on demand (i.e. it is not a local file). Returns `None` for
+    /// local/in-memory leaves and for unknown addresses. Used to prewarm the
+    /// disk artifact cache before a sync reverse lookup.
+    pub fn remote_leaf_cid(&self, address: &str) -> Option<&ContentId> {
+        match &self.leaf_source {
+            LeafSource::CasOnDemand { remote_cids, .. } => remote_cids.get(address),
+            _ => None,
+        }
+    }
+
+    /// The disk-backed artifact cache directory this reader reads prewarmed
+    /// leaves from, if configured. A prefetch must write to this same dir for
+    /// `load_leaf` to find the bytes.
+    pub fn disk_cache_dir(&self) -> Option<&std::path::Path> {
+        self.disk_cache_dir.as_deref()
+    }
+
     /// Batched reverse lookup: find IDs by key bytes while loading each touched
     /// leaf at most once for the batch.
     pub fn reverse_lookup_many<'a, I>(&self, keys: I) -> io::Result<Vec<Option<u64>>>

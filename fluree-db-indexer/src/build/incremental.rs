@@ -26,18 +26,21 @@ use fluree_db_binary_index::format::run_record::RunSortOrder;
 use fluree_db_binary_index::format::run_record_v2::{cmp_v2_for_order, RunRecordV2};
 use fluree_db_binary_index::{BinaryGarbageRef, BinaryPrevIndexRef};
 use fluree_db_core::{ContentId, ContentKind, ContentStore};
-use futures::stream::{self, StreamExt};
+use futures::stream::{self, StreamExt, TryStreamExt};
 
 use crate::error::{IndexerError, Result};
 use crate::gc;
 use crate::run_index::build::incremental_branch::{
-    touched_leaf_refs, update_branch, BranchUpdateConfig, BranchUpdateResult,
+    touched_leaf_refs, update_branch_streaming, BranchUpdateConfig, BranchUpdateMeta,
+    BranchUpdateResult,
 };
+use crate::run_index::build::incremental_leaf::NewLeafBlob;
 use crate::run_index::build::incremental_resolve::{
     resolve_incremental_commits_v6, IncrementalResolveConfig,
 };
 use crate::run_index::build::incremental_root::IncrementalRootBuilder;
 use crate::{IndexResult, IndexStats, IndexerConfig};
+use tokio::sync::Semaphore;
 
 fn artifact_cache_dir(config: &IndexerConfig) -> std::path::PathBuf {
     config
@@ -143,8 +146,9 @@ async fn upload_dict_blob_cached(
     Ok(cid)
 }
 
-/// Run `update_branch`: async-prefetch the touched leaves/sidecars, then do
-/// the CPU-bound copy-on-write update on a blocking thread.
+/// Run a branch update: async-prefetch the touched leaves/sidecars, then do
+/// the CPU-bound copy-on-write update on a blocking thread while STREAMING each
+/// produced leaf blob to an async uploader.
 ///
 /// All CAS I/O happens here, on the async runtime — NOT inside the
 /// `spawn_blocking` closure. The previous version fetched leaves on demand via
@@ -154,14 +158,25 @@ async fn upload_dict_blob_cached(
 /// never reproduces on a local filesystem (cache hits resolve instantly). We
 /// prefetch the touched set (mirroring `build/dicts.rs`) so the blocking
 /// closure only reads in-memory maps.
+///
+/// Streaming: the `spawn_blocking` CoW emits each finished [`NewLeafBlob`] over
+/// a bounded channel (`blocking_send` for backpressure) to a concurrent async
+/// uploader that puts each blob under the shared global `upload_budget` and
+/// frees its bytes immediately. The CoW returns only [`BranchUpdateMeta`], so
+/// the leaf/sidecar byte set is never resident as a whole — peak upload memory
+/// is ~`upload_budget × leaf_size` plus the bounded channel.
+#[allow(clippy::too_many_arguments)]
 async fn run_update_branch(
     branch_bytes: Vec<u8>,
     sorted_records: Vec<RunRecordV2>,
     sorted_ops: Vec<u8>,
     branch_config: BranchUpdateConfig,
     content_store: Arc<dyn fluree_db_core::storage::ContentStore>,
+    tracker: fluree_db_core::tracking::Tracker,
+    upload_budget: Arc<Semaphore>,
+    upload_buffer: usize,
     cache_dir: std::path::PathBuf,
-) -> std::result::Result<(BranchUpdateResult, Phase2FetchStatsSnapshot), IndexerError> {
+) -> std::result::Result<(BranchUpdateMeta, Phase2FetchStatsSnapshot), IndexerError> {
     let parent_span = tracing::Span::current();
     let stats = Phase2FetchStats::default();
 
@@ -176,20 +191,42 @@ async fn run_update_branch(
     )
     .map_err(|e| IndexerError::StorageRead(format!("compute touched leaves: {e}")))?;
 
-    // Prefetch (async, off any blocking thread). Dedups by CID.
-    let mut leaf_map: HashMap<ContentId, Vec<u8>> = HashMap::new();
-    let mut sidecar_map: HashMap<ContentId, Vec<u8>> = HashMap::new();
-    for (leaf_cid, sidecar_cid) in &touched {
-        if !leaf_map.contains_key(leaf_cid) {
-            let cached_before = cache_dir.join(leaf_cid.to_string()).exists();
+    // Prefetch (async). Dedup distinct CIDs, then fetch them concurrently under
+    // the SAME shared global budget as the uploads (one permit per fetch, never
+    // held across the stream), so prefetch reads + leaf uploads across all
+    // order-tasks share one in-flight cap. Maps are keyed by CID, so fetch order
+    // is irrelevant to the downstream CoW.
+    let mut leaf_cids: Vec<ContentId> = Vec::new();
+    let mut sidecar_cids: Vec<ContentId> = Vec::new();
+    {
+        let mut seen_leaf = std::collections::HashSet::new();
+        let mut seen_sc = std::collections::HashSet::new();
+        for (leaf_cid, sidecar_cid) in &touched {
+            if seen_leaf.insert(leaf_cid.clone()) {
+                leaf_cids.push(leaf_cid.clone());
+            }
+            if let Some(sc) = sidecar_cid {
+                if seen_sc.insert(sc.clone()) {
+                    sidecar_cids.push(sc.clone());
+                }
+            }
+        }
+    }
+    let fetch_width = upload_budget.available_permits().max(1);
+
+    // Required leaves: any fetch error aborts the fold (preserved).
+    let leaf_pairs: Vec<(ContentId, Vec<u8>)> = stream::iter(leaf_cids)
+        .map(|cid| async {
+            let _permit = upload_budget.acquire().await.expect("upload budget open");
+            let cached_before = cache_dir.join(cid.to_string()).exists();
             let started = Instant::now();
             let bytes = fluree_db_binary_index::read::artifact_cache::fetch_cached_bytes_cid(
                 content_store.as_ref(),
-                leaf_cid,
+                &cid,
                 &cache_dir,
             )
             .await
-            .map_err(|e| IndexerError::StorageRead(format!("prefetch leaf {leaf_cid}: {e}")))?;
+            .map_err(|e| IndexerError::StorageRead(format!("prefetch leaf {cid}: {e}")))?;
             stats.leaf_fetches.fetch_add(1, Ordering::Relaxed);
             stats
                 .leaf_fetch_ms
@@ -202,55 +239,74 @@ async fn run_update_branch(
             } else {
                 stats.leaf_cache_misses.fetch_add(1, Ordering::Relaxed);
             }
-            leaf_map.insert(leaf_cid.clone(), bytes);
-        }
-        if let Some(sc) = sidecar_cid {
-            if !sidecar_map.contains_key(sc) {
-                let cached_before = cache_dir.join(sc.to_string()).exists();
-                let started = Instant::now();
-                match fluree_db_binary_index::read::artifact_cache::fetch_cached_bytes_cid(
-                    content_store.as_ref(),
-                    sc,
-                    &cache_dir,
-                )
-                .await
-                {
-                    Ok(bytes) => {
-                        stats.sidecar_fetches.fetch_add(1, Ordering::Relaxed);
-                        stats
-                            .sidecar_fetch_ms
-                            .fetch_add(started.elapsed().as_millis() as u64, Ordering::Relaxed);
-                        stats
-                            .sidecar_bytes
-                            .fetch_add(bytes.len() as u64, Ordering::Relaxed);
-                        if cached_before {
-                            stats.sidecar_cache_hits.fetch_add(1, Ordering::Relaxed);
-                        } else {
-                            stats.sidecar_cache_misses.fetch_add(1, Ordering::Relaxed);
-                        }
-                        sidecar_map.insert(sc.clone(), bytes);
+            Ok::<(ContentId, Vec<u8>), IndexerError>((cid, bytes))
+        })
+        .buffer_unordered(fetch_width)
+        .try_collect()
+        .await?;
+    let leaf_map: HashMap<ContentId, Vec<u8>> = leaf_pairs.into_iter().collect();
+
+    // Sidecars: NotFound => absent (None); other errors abort (preserved).
+    let sidecar_pairs: Vec<(ContentId, Option<Vec<u8>>)> = stream::iter(sidecar_cids)
+        .map(|cid| async {
+            let _permit = upload_budget.acquire().await.expect("upload budget open");
+            let cached_before = cache_dir.join(cid.to_string()).exists();
+            let started = Instant::now();
+            match fluree_db_binary_index::read::artifact_cache::fetch_cached_bytes_cid(
+                content_store.as_ref(),
+                &cid,
+                &cache_dir,
+            )
+            .await
+            {
+                Ok(bytes) => {
+                    stats.sidecar_fetches.fetch_add(1, Ordering::Relaxed);
+                    stats
+                        .sidecar_fetch_ms
+                        .fetch_add(started.elapsed().as_millis() as u64, Ordering::Relaxed);
+                    stats
+                        .sidecar_bytes
+                        .fetch_add(bytes.len() as u64, Ordering::Relaxed);
+                    if cached_before {
+                        stats.sidecar_cache_hits.fetch_add(1, Ordering::Relaxed);
+                    } else {
+                        stats.sidecar_cache_misses.fetch_add(1, Ordering::Relaxed);
                     }
-                    // A sidecar listed in the manifest may not exist in storage;
-                    // treat NotFound as "absent" (closure returns None), same as
-                    // the previous on-demand path.
-                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                        stats.sidecar_absent.fetch_add(1, Ordering::Relaxed);
-                    }
-                    Err(e) => {
-                        return Err(IndexerError::StorageRead(format!(
-                            "prefetch sidecar {sc}: {e}"
-                        )));
-                    }
+                    Ok::<(ContentId, Option<Vec<u8>>), IndexerError>((cid, Some(bytes)))
                 }
+                // A sidecar listed in the manifest may not exist in storage;
+                // treat NotFound as "absent", same as the previous path.
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                    stats.sidecar_absent.fetch_add(1, Ordering::Relaxed);
+                    Ok((cid, None))
+                }
+                Err(e) => Err(IndexerError::StorageRead(format!(
+                    "prefetch sidecar {cid}: {e}"
+                ))),
             }
-        }
-    }
+        })
+        .buffer_unordered(fetch_width)
+        .try_collect()
+        .await?;
+    let sidecar_map: HashMap<ContentId, Vec<u8>> = sidecar_pairs
+        .into_iter()
+        .filter_map(|(cid, opt)| opt.map(|b| (cid, b)))
+        .collect();
+
+    // Bounded channel from the blocking CoW to the async uploader. The bound
+    // gives backpressure: the CoW parks on `blocking_send` (it's already on a
+    // blocking-pool thread, so parking there starves no tokio worker) when the
+    // uploader is behind, capping resident blobs to the channel depth + the
+    // in-flight puts. Depth tracks the upload budget so the CoW can run a few
+    // leaves ahead without unbounded buffering.
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<NewLeafBlob>(upload_buffer.max(1));
 
     // CPU-bound CoW update on a blocking thread. The fetch closures read the
-    // prefetched in-memory maps — no `block_on`, no S3 inside the closure.
-    let result = tokio::task::spawn_blocking(move || {
+    // prefetched in-memory maps — no `block_on`, no S3 inside the closure. Each
+    // produced blob is streamed out via `blocking_send`.
+    let cow = tokio::task::spawn_blocking(move || {
         let _guard = parent_span.enter();
-        update_branch(
+        update_branch_streaming(
             &branch_bytes,
             &sorted_records,
             &sorted_ops,
@@ -262,12 +318,57 @@ async fn run_update_branch(
                     .ok_or_else(|| std::io::Error::other(format!("leaf {cid} not prefetched")))
             },
             &|cid| Ok(sidecar_map.get(cid).cloned()),
+            &mut |blob| {
+                tx.blocking_send(blob)
+                    .map_err(|_| std::io::Error::other("leaf upload channel closed"))
+            },
         )
-    })
-    .await
-    .map_err(|e| IndexerError::StorageWrite(format!("branch update task panicked: {e}")))?
-    .map_err(|e| IndexerError::StorageWrite(e.to_string()))?;
-    Ok((result, stats.snapshot()))
+    });
+
+    // Async uploader: drain the channel, uploading each blob under the global
+    // budget and freeing its bytes. Runs concurrently with the CoW.
+    let upload_budget_ref = upload_budget.as_ref();
+    let uploader = {
+        let content_store = content_store.as_ref();
+        let tracker = &tracker;
+        let cache_dir = &cache_dir;
+        async move {
+            let mut totals = LeafUploadCounts::default();
+            while let Some(blob) = rx.recv().await {
+                let c = upload_one_leaf_blob(
+                    content_store,
+                    tracker,
+                    upload_budget_ref,
+                    cache_dir,
+                    blob,
+                )
+                .await?;
+                totals.leaf_bytes += c.leaf_bytes;
+                totals.sidecar_bytes += c.sidecar_bytes;
+                totals.sidecar_count += c.sidecar_count;
+            }
+            Ok::<LeafUploadCounts, IndexerError>(totals)
+        }
+    };
+
+    // Drive both to completion. If the uploader fails it drops `rx`, so the
+    // CoW's next `blocking_send` errors out instead of hanging.
+    let (cow_join, upload_res) = tokio::join!(cow, uploader);
+    let upload_totals = upload_res?;
+    let meta = cow_join
+        .map_err(|e| IndexerError::StorageWrite(format!("branch update task panicked: {e}")))?
+        .map_err(|e| IndexerError::StorageWrite(e.to_string()))?;
+
+    tracing::debug!(
+        leaves = meta.new_leaf_count,
+        leaf_bytes = upload_totals.leaf_bytes,
+        sidecars = upload_totals.sidecar_count,
+        sidecar_bytes = upload_totals.sidecar_bytes,
+        cache_dir = %cache_dir.display(),
+        "V6 Phase 2 streamed upload complete; seeded artifact cache"
+    );
+
+    Ok((meta, stats.snapshot()))
 }
 
 enum Phase2TaskKind {
@@ -302,11 +403,14 @@ struct Phase2TaskOutput {
     fetch_stats: Phase2FetchStatsSnapshot,
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn execute_phase2_task(
     task: Phase2Task,
     config: &IndexerConfig,
     content_store: Arc<dyn fluree_db_core::storage::ContentStore>,
     tracker: fluree_db_core::tracking::Tracker,
+    upload_budget: Arc<Semaphore>,
+    upload_buffer: usize,
     cache_dir: std::path::PathBuf,
 ) -> Result<Phase2TaskOutput> {
     let Phase2Task {
@@ -334,43 +438,55 @@ async fn execute_phase2_task(
         Phase2TaskKind::DefaultExisting { leaves } => {
             let branch_bytes =
                 fluree_db_binary_index::format::branch::build_branch_bytes(order, g_id, &leaves);
-            let (result, fetch_stats) = run_update_branch(
+            let (meta, fetch_stats) = run_update_branch(
                 branch_bytes,
                 sorted_records,
                 sorted_ops,
                 branch_config,
                 Arc::clone(&content_store),
+                tracker.clone(),
+                Arc::clone(&upload_budget),
+                upload_buffer,
                 cache_dir.clone(),
             )
             .await?;
-            upload_leaf_blobs(content_store.as_ref(), &tracker, &result, &cache_dir).await?;
             Phase2TaskOutput {
                 seq,
                 g_id,
                 order,
                 update: Phase2TaskUpdate::Default {
-                    leaf_entries: result.leaf_entries,
+                    leaf_entries: meta.leaf_entries,
                 },
-                replaced_leaf_cids: result.replaced_leaf_cids,
-                replaced_sidecar_cids: result.replaced_sidecar_cids,
-                new_leaf_count: result.new_leaf_blobs.len(),
+                replaced_leaf_cids: meta.replaced_leaf_cids,
+                replaced_sidecar_cids: meta.replaced_sidecar_cids,
+                new_leaf_count: meta.new_leaf_count,
                 fetch_stats,
             }
         }
         Phase2TaskKind::DefaultFresh => {
-            let result =
-                build_fresh_default_graph_v3(&sorted_records, &sorted_ops, order, g_id, config)?;
-            upload_leaf_blobs(content_store.as_ref(), &tracker, &result, &cache_dir).await?;
+            let BranchUpdateResult {
+                leaf_entries,
+                new_leaf_blobs,
+                ..
+            } = build_fresh_default_graph_v3(&sorted_records, &sorted_ops, order, g_id, config)?;
+            let new_leaf_count = new_leaf_blobs.len();
+            upload_leaf_blobs(
+                content_store.as_ref(),
+                &tracker,
+                upload_budget.as_ref(),
+                upload_buffer,
+                new_leaf_blobs,
+                &cache_dir,
+            )
+            .await?;
             Phase2TaskOutput {
                 seq,
                 g_id,
                 order,
-                update: Phase2TaskUpdate::Default {
-                    leaf_entries: result.leaf_entries,
-                },
+                update: Phase2TaskUpdate::Default { leaf_entries },
                 replaced_leaf_cids: Vec::new(),
                 replaced_sidecar_cids: Vec::new(),
-                new_leaf_count: result.new_leaf_blobs.len(),
+                new_leaf_count,
                 fetch_stats: Phase2FetchStatsSnapshot::default(),
             }
         }
@@ -382,60 +498,68 @@ async fn execute_phase2_task(
                 format!("fetch V3 branch g_id={g_id} {order:?}"),
             )
             .await?;
-            let (result, fetch_stats) = run_update_branch(
+            let (meta, fetch_stats) = run_update_branch(
                 branch_bytes,
                 sorted_records,
                 sorted_ops,
                 branch_config,
                 Arc::clone(&content_store),
+                tracker.clone(),
+                Arc::clone(&upload_budget),
+                upload_buffer,
                 cache_dir.clone(),
             )
             .await?;
-            upload_leaf_blobs(content_store.as_ref(), &tracker, &result, &cache_dir).await?;
             let branch_cid = content_store
-                .put(ContentKind::IndexBranch, &result.branch_bytes)
+                .put(ContentKind::IndexBranch, &meta.branch_bytes)
                 .await
                 .map_err(|e| IndexerError::StorageWrite(e.to_string()))?;
-            debug_assert!(branch_cid == result.branch_cid);
-            cache_artifact_bytes(
-                &cache_dir,
-                &branch_cid,
-                &result.branch_bytes,
-                "index_branch",
-            );
+            debug_assert!(branch_cid == meta.branch_cid);
+            cache_artifact_bytes(&cache_dir, &branch_cid, &meta.branch_bytes, "index_branch");
             Phase2TaskOutput {
                 seq,
                 g_id,
                 order,
                 update: Phase2TaskUpdate::Named { branch_cid },
-                replaced_leaf_cids: result.replaced_leaf_cids,
-                replaced_sidecar_cids: result.replaced_sidecar_cids,
-                new_leaf_count: result.new_leaf_blobs.len(),
+                replaced_leaf_cids: meta.replaced_leaf_cids,
+                replaced_sidecar_cids: meta.replaced_sidecar_cids,
+                new_leaf_count: meta.new_leaf_count,
                 fetch_stats,
             }
         }
         Phase2TaskKind::NamedFresh => {
-            let result = build_fresh_named_graph_v3(&sorted_records, order, g_id, config)?;
-            upload_leaf_blobs(content_store.as_ref(), &tracker, &result, &cache_dir).await?;
+            let BranchUpdateResult {
+                new_leaf_blobs,
+                replaced_leaf_cids,
+                replaced_sidecar_cids,
+                branch_bytes,
+                branch_cid: expected_branch_cid,
+                ..
+            } = build_fresh_named_graph_v3(&sorted_records, order, g_id, config)?;
+            let new_leaf_count = new_leaf_blobs.len();
+            upload_leaf_blobs(
+                content_store.as_ref(),
+                &tracker,
+                upload_budget.as_ref(),
+                upload_buffer,
+                new_leaf_blobs,
+                &cache_dir,
+            )
+            .await?;
             let branch_cid = content_store
-                .put(ContentKind::IndexBranch, &result.branch_bytes)
+                .put(ContentKind::IndexBranch, &branch_bytes)
                 .await
                 .map_err(|e| IndexerError::StorageWrite(e.to_string()))?;
-            debug_assert!(branch_cid == result.branch_cid);
-            cache_artifact_bytes(
-                &cache_dir,
-                &branch_cid,
-                &result.branch_bytes,
-                "index_branch",
-            );
+            debug_assert!(branch_cid == expected_branch_cid);
+            cache_artifact_bytes(&cache_dir, &branch_cid, &branch_bytes, "index_branch");
             Phase2TaskOutput {
                 seq,
                 g_id,
                 order,
                 update: Phase2TaskUpdate::Named { branch_cid },
-                replaced_leaf_cids: Vec::new(),
-                replaced_sidecar_cids: Vec::new(),
-                new_leaf_count: result.new_leaf_blobs.len(),
+                replaced_leaf_cids,
+                replaced_sidecar_cids,
+                new_leaf_count,
                 fetch_stats: Phase2FetchStatsSnapshot::default(),
             }
         }
@@ -493,6 +617,13 @@ pub async fn incremental_index(
     let cache_dir = artifact_cache_dir(&config);
     let _ = std::fs::create_dir_all(&cache_dir);
 
+    // Single global S3 budget shared across the whole fold: the reconcile
+    // leaf prefetch (Phase 1), and the Phase 2 leaf prefetch + leaf/sidecar
+    // uploads all acquire from this one semaphore, so total in-flight S3 reads
+    // and writes are capped here regardless of phase.
+    let upload_buffer = config.incremental_leaf_upload_concurrency.max(1);
+    let upload_budget = Arc::new(Semaphore::new(upload_buffer));
+
     // ---- Phase 1: Resolve incremental commits ----
     let resolve_config = IncrementalResolveConfig {
         base_root_id: base_root_id.clone(),
@@ -501,10 +632,16 @@ pub async fn incremental_index(
         artifact_cache_dir: Some(cache_dir.clone()),
         max_commit_bytes: config.incremental_max_commit_bytes,
         fulltext_configured_properties: config.fulltext_configured_properties.clone(),
+        pending_commit_cids: config.pending_commit_cids.clone(),
+        commit_fetch_concurrency: config.incremental_max_concurrency.max(1),
     };
-    let mut novelty = resolve_incremental_commits_v6(content_store.clone(), resolve_config)
-        .await
-        .map_err(|e| IndexerError::StorageWrite(format!("V6 incremental resolve: {e}")))?;
+    let mut novelty = resolve_incremental_commits_v6(
+        content_store.clone(),
+        resolve_config,
+        Arc::clone(&upload_budget),
+    )
+    .await
+    .map_err(|e| IndexerError::StorageWrite(format!("V6 incremental resolve: {e}")))?;
 
     if novelty.records.is_empty() {
         tracing::debug!("no new records resolved; returning existing V6 root");
@@ -616,8 +753,18 @@ pub async fn incremental_index(
             let content_store = content_store.clone();
             let cache_dir = cache_dir.clone();
             let task_tracker = tracker.clone();
+            let task_budget = Arc::clone(&upload_budget);
             async move {
-                execute_phase2_task(task, config_ref, content_store, task_tracker, cache_dir).await
+                execute_phase2_task(
+                    task,
+                    config_ref,
+                    content_store,
+                    task_tracker,
+                    task_budget,
+                    upload_buffer,
+                    cache_dir,
+                )
+                .await
             }
         })
         .buffer_unordered(concurrency)
@@ -1981,6 +2128,46 @@ pub async fn incremental_index(
                         );
                     }
 
+                    // Prewarm the PSOT leaves the per-graph rdf:type scans will
+                    // touch. Keys are built exactly as batched_lookup_predicate_refs
+                    // derives them (p_id pinned, s_id spanning the subject range),
+                    // so the warmed leaves match the scan. Cache-only; the scan's
+                    // results are byte-identical. Reuses the one shared upload_budget.
+                    for (&scan_g_id, scan_sids) in &subjects_by_graph {
+                        if scan_sids.is_empty() {
+                            continue;
+                        }
+                        let min_s = scan_sids[0];
+                        let max_s = *scan_sids.last().unwrap_or(&min_s);
+                        let min_key = fluree_db_binary_index::format::run_record_v2::RunRecordV2 {
+                            s_id: fluree_db_core::subject_id::SubjectId::from_u64(min_s),
+                            o_key: 0,
+                            p_id: rdf_type_p_id,
+                            t: 0,
+                            o_i: 0,
+                            o_type: 0,
+                            g_id: scan_g_id,
+                        };
+                        let max_key = fluree_db_binary_index::format::run_record_v2::RunRecordV2 {
+                            s_id: fluree_db_core::subject_id::SubjectId::from_u64(max_s),
+                            o_key: u64::MAX,
+                            p_id: rdf_type_p_id,
+                            t: 0,
+                            o_i: u32::MAX,
+                            o_type: u16::MAX,
+                            g_id: scan_g_id,
+                        };
+                        store
+                            .prefetch_leaves_for_range(
+                                scan_g_id,
+                                fluree_db_binary_index::format::run_record::RunSortOrder::Psot,
+                                &min_key,
+                                &max_key,
+                                &upload_budget,
+                            )
+                            .await;
+                    }
+
                     // Batched PSOT lookup per graph.
                     for (&scan_g_id, scan_sids) in &subjects_by_graph {
                         if scan_sids.is_empty() {
@@ -2618,6 +2805,35 @@ pub async fn incremental_index(
                 let base_class_sid_hits = AtomicUsize::new(0usize);
                 let mut entries_by_key: std::collections::HashMap<(u16, u64), is::ClassStatEntry> =
                     std::collections::HashMap::new();
+
+                // Prewarm the subject reverse-tree leaves the serial seed loop
+                // below will read. The loop resolves each base class Sid via
+                // find_subject_id_by_parts (a sync reverse_lookup); on a cold
+                // remote store those lookups are serial S3 fetches. The store
+                // method encodes keys identically, so this only warms the disk
+                // cache — seed results are byte-identical. Reuses the one shared
+                // upload_budget; runs in Phase 3b (after Phase 1/2), so no
+                // Phase 1 contention.
+                if let Some(store) = store_opt.as_ref() {
+                    if let Some(ref base_stats) = base_root.stats {
+                        if let Some(ref graphs) = base_stats.graphs {
+                            let parts: Vec<(u16, String)> = graphs
+                                .iter()
+                                .filter_map(|g| g.classes.as_ref())
+                                .flatten()
+                                .map(|entry| {
+                                    (
+                                        entry.class_sid.namespace_code,
+                                        entry.class_sid.name.to_string(),
+                                    )
+                                })
+                                .collect();
+                            store
+                                .prefetch_subject_reverse_leaves(&parts, &upload_budget)
+                                .await;
+                        }
+                    }
+                }
 
                 // Seed from base root per-graph class entries.
                 if let Some(ref base_stats) = base_root.stats {
@@ -3365,51 +3581,93 @@ pub async fn incremental_index(
 // Helpers
 // ============================================================================
 
-/// Upload leaf and sidecar blobs from a branch update result.
+/// Byte/object counts from a single leaf-blob upload, accumulated for tracing.
+#[derive(Default, Clone, Copy)]
+struct LeafUploadCounts {
+    leaf_bytes: u64,
+    sidecar_bytes: u64,
+    sidecar_count: u64,
+}
+
+/// Upload ONE leaf (+ its sidecar) under a single permit from the global
+/// upload budget, charge the per-leaflet fuel, seed the artifact cache, then
+/// drop the bytes. The `blob` is consumed by value so its byte buffers are
+/// freed the moment this future completes — they never accumulate.
 ///
-/// Shared by all four code paths: default-graph existing/fresh, named-graph existing/fresh.
-///
-/// `tracker` is used only for the per-leaflet portion of FLI3 leaf fuel
-/// charges. The base per-write fuel is charged automatically by
+/// The base per-write fuel is charged automatically by
 /// [`crate::fuel::MeteredContentStore`] when `content_store` is the metered
-/// wrapper.
+/// wrapper; `tracker` here covers only the per-leaflet FLI3 portion.
+async fn upload_one_leaf_blob(
+    content_store: &dyn ContentStore,
+    tracker: &fluree_db_core::tracking::Tracker,
+    upload_budget: &Semaphore,
+    cache_dir: &std::path::Path,
+    blob: NewLeafBlob,
+) -> Result<LeafUploadCounts> {
+    let _permit = upload_budget
+        .acquire()
+        .await
+        .map_err(|e| IndexerError::StorageWrite(format!("upload budget closed: {e}")))?;
+
+    let info = blob.info;
+    let mut counts = LeafUploadCounts::default();
+
+    let leaf_cid = content_store
+        .put(ContentKind::IndexLeaf, &info.leaf_bytes)
+        .await
+        .map_err(|e| IndexerError::StorageWrite(e.to_string()))?;
+    crate::fuel::charge_extra_leaflets(tracker, info.re_encoded_leaflet_count)?;
+    debug_assert!(leaf_cid == info.leaf_cid);
+    cache_artifact_bytes(cache_dir, &leaf_cid, &info.leaf_bytes, "index_leaf");
+    counts.leaf_bytes = info.leaf_bytes.len() as u64;
+
+    if let Some(sc_bytes) = info.sidecar_bytes.as_deref() {
+        let sidecar_cid = content_store
+            .put(ContentKind::HistorySidecar, sc_bytes)
+            .await
+            .map_err(|e| IndexerError::StorageWrite(e.to_string()))?;
+        if let Some(expected) = &info.sidecar_cid {
+            debug_assert!(&sidecar_cid == expected);
+        }
+        cache_artifact_bytes(cache_dir, &sidecar_cid, sc_bytes, "history_sidecar");
+        counts.sidecar_bytes = sc_bytes.len() as u64;
+        counts.sidecar_count = 1;
+    }
+    // `info` (and its leaf_bytes/sidecar_bytes) drops here, freeing the buffers.
+    Ok(counts)
+}
+
+/// Upload a fully-materialized set of leaf blobs (the fresh-build paths produce
+/// the whole `Vec` up front) in parallel under the shared global budget,
+/// consuming each blob by value so its bytes are freed after its put.
 async fn upload_leaf_blobs(
     content_store: &dyn ContentStore,
     tracker: &fluree_db_core::tracking::Tracker,
-    result: &BranchUpdateResult,
+    upload_budget: &Semaphore,
+    upload_buffer: usize,
+    blobs: Vec<NewLeafBlob>,
     cache_dir: &std::path::Path,
 ) -> Result<()> {
-    let mut leaf_bytes = 0u64;
-    let mut sidecar_bytes = 0u64;
-    let mut sidecar_count = 0u64;
-    for blob in &result.new_leaf_blobs {
-        let leaf_cid = content_store
-            .put(ContentKind::IndexLeaf, &blob.info.leaf_bytes)
-            .await
-            .map_err(|e| IndexerError::StorageWrite(e.to_string()))?;
-        crate::fuel::charge_extra_leaflets(tracker, blob.info.re_encoded_leaflet_count)?;
-        debug_assert!(leaf_cid == blob.info.leaf_cid);
-        cache_artifact_bytes(cache_dir, &leaf_cid, &blob.info.leaf_bytes, "index_leaf");
-        leaf_bytes += blob.info.leaf_bytes.len() as u64;
-
-        if let Some(ref sc_bytes) = blob.info.sidecar_bytes {
-            let sidecar_cid = content_store
-                .put(ContentKind::HistorySidecar, sc_bytes)
-                .await
-                .map_err(|e| IndexerError::StorageWrite(e.to_string()))?;
-            if let Some(expected) = &blob.info.sidecar_cid {
-                debug_assert!(&sidecar_cid == expected);
-            }
-            cache_artifact_bytes(cache_dir, &sidecar_cid, sc_bytes, "history_sidecar");
-            sidecar_bytes += sc_bytes.len() as u64;
-            sidecar_count += 1;
-        }
-    }
+    let leaf_total = blobs.len();
+    // The global semaphore is the real concurrency cap; bound the in-flight
+    // future set so we don't materialize one pending future per leaf for a
+    // large fresh build.
+    let buffer = upload_buffer.max(1);
+    let totals = stream::iter(blobs)
+        .map(|blob| upload_one_leaf_blob(content_store, tracker, upload_budget, cache_dir, blob))
+        .buffer_unordered(buffer)
+        .try_fold(LeafUploadCounts::default(), |mut acc, c| async move {
+            acc.leaf_bytes += c.leaf_bytes;
+            acc.sidecar_bytes += c.sidecar_bytes;
+            acc.sidecar_count += c.sidecar_count;
+            Ok(acc)
+        })
+        .await?;
     tracing::debug!(
-        leaves = result.new_leaf_blobs.len(),
-        leaf_bytes,
-        sidecars = sidecar_count,
-        sidecar_bytes,
+        leaves = leaf_total,
+        leaf_bytes = totals.leaf_bytes,
+        sidecars = totals.sidecar_count,
+        sidecar_bytes = totals.sidecar_bytes,
         cache_dir = %cache_dir.display(),
         "V6 Phase 2 upload complete; seeded artifact cache"
     );

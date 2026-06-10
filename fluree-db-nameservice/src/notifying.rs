@@ -108,6 +108,22 @@ where
     async fn reset_head(&self, ledger_id: &str, snapshot: NsRecordSnapshot) -> Result<()> {
         self.inner.reset_head(ledger_id, snapshot).await
     }
+
+    // Pass-through wrapper: delegate so the inner backend's commit-CID index
+    // (e.g. FileNameService) still accelerates incremental indexing. Falling
+    // back to the trait default here would silently force the serial DAG walk
+    // for the entire FileStorage server path, which wraps in this notifier.
+    async fn pending_commit_cids(
+        &self,
+        ledger_id: &str,
+        since_t: i64,
+    ) -> Result<Option<Vec<(i64, ContentId)>>> {
+        self.inner.pending_commit_cids(ledger_id, since_t).await
+    }
+
+    async fn prune_commit_index(&self, ledger_id: &str, up_to_t: i64) -> Result<()> {
+        self.inner.prune_commit_index(ledger_id, up_to_t).await
+    }
 }
 
 // ---------------------------------------------------------------------------

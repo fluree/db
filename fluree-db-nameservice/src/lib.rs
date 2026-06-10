@@ -489,6 +489,36 @@ pub trait NameService:
     /// # Errors
     /// Returns [`NotFound`](NameServiceError::NotFound) if the branch does not exist.
     async fn reset_head(&self, ledger_id: &str, snapshot: NsRecordSnapshot) -> Result<()>;
+
+    /// Return commit CIDs with `t > since_t`, sorted ascending by `t`, when the
+    /// backend maintains a commit-CID index.
+    ///
+    /// This lets incremental indexing skip the serial commit-DAG walk (one
+    /// envelope round-trip per commit to chase parent pointers) and instead
+    /// discover the chain in a single lookup, then fetch bodies in parallel.
+    ///
+    /// `Ok(None)` means the backend keeps no such index; callers MUST fall
+    /// back to the serial DAG walk. `Ok(Some(v))` is the gap-free set of
+    /// commits after `since_t`. The caller independently validates coverage
+    /// before trusting it, so a stale or partial index is never a correctness
+    /// hazard — only a missed optimization.
+    async fn pending_commit_cids(
+        &self,
+        ledger_id: &str,
+        since_t: i64,
+    ) -> Result<Option<Vec<(i64, fluree_db_core::ContentId)>>> {
+        let _ = (ledger_id, since_t);
+        Ok(None)
+    }
+
+    /// Compact the commit-CID index, dropping entries with `t <= up_to_t`.
+    ///
+    /// Called after a successful index publish + GC so the index never grows
+    /// without bound. Default is a no-op for backends that keep no index.
+    async fn prune_commit_index(&self, ledger_id: &str, up_to_t: i64) -> Result<()> {
+        let _ = (ledger_id, up_to_t);
+        Ok(())
+    }
 }
 
 /// Captured state of an `NsRecord` for rollback purposes.

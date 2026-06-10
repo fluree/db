@@ -166,6 +166,44 @@ impl FileNameService {
             .join(format!("{branch}.index.json"))
     }
 
+    /// Get the filesystem path for the append-only commit-CID index.
+    ///
+    /// One JSON line per advanced commit head (`{"t":<t>,"cid":"<cid>"}`).
+    /// Append-only on the write path; full-rewrite only on prune. Readers
+    /// dedup by `t` (last-wins), so re-appending the same `t` is harmless.
+    fn commits_path(&self, ledger_name: &str, branch: &str) -> PathBuf {
+        self.storage
+            .base_path()
+            .join(NS_VERSION)
+            .join(ledger_name)
+            .join(format!("{branch}.commits.jsonl"))
+    }
+
+    /// Append one `{"t","cid"}` line to the commit-CID index. Best-effort:
+    /// the index is a discovery accelerator, never a source of truth, so a
+    /// failure here must not fail the commit publish (callers log + ignore).
+    async fn append_commit_index_entry(
+        &self,
+        ledger_name: &str,
+        branch: &str,
+        t: i64,
+        cid_str: &str,
+    ) -> std::io::Result<()> {
+        use tokio::io::AsyncWriteExt;
+        let path = self.commits_path(ledger_name, branch);
+        if let Some(parent) = path.parent() {
+            tokio::fs::create_dir_all(parent).await?;
+        }
+        let line = format!("{{\"t\":{t},\"cid\":\"{cid_str}\"}}\n");
+        let mut file = tokio::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+            .await?;
+        file.write_all(line.as_bytes()).await?;
+        file.flush().await
+    }
+
     /// Recursively walk `root` and return the relative paths of main ns record
     /// `.json` files, skipping index, snapshot, lock, and tmp files.
     ///
@@ -555,6 +593,7 @@ impl NameService for FileNameService {
         let _ = tokio::fs::remove_file(&main_path).await;
         let idx_path = self.index_path(&ledger_name, &branch);
         let _ = tokio::fs::remove_file(&idx_path).await;
+        let _ = tokio::fs::remove_file(&self.commits_path(&ledger_name, &branch)).await;
 
         // Decrement parent's child count if this branch had a parent
         match parent_source {
@@ -609,6 +648,100 @@ impl NameService for FileNameService {
 
         Ok(())
     }
+
+    async fn pending_commit_cids(
+        &self,
+        ledger_id: &str,
+        since_t: i64,
+    ) -> Result<Option<Vec<(i64, ContentId)>>> {
+        let (ledger_name, branch) = split_ledger_id(ledger_id)?;
+        let path = self.commits_path(&ledger_name, &branch);
+
+        // No file = old ledger predating the index; signal fallback to the walk.
+        let content = match tokio::fs::read_to_string(&path).await {
+            Ok(c) => c,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(e) => return Err(NameServiceError::storage(e.to_string())),
+        };
+
+        // Dedup by (t, cid) pair since appends are idempotent, but preserve
+        // distinct commits that share the same t (possible in merge DAGs where
+        // two branches independently increment t from the same base). Keying
+        // on t alone would silently drop one of them, letting an incomplete
+        // pending list pass the coverage check in the indexer.
+        let mut seen: std::collections::HashSet<(i64, String)> = std::collections::HashSet::new();
+        let mut out: Vec<(i64, ContentId)> = Vec::new();
+        for line in content.lines() {
+            let line = line.trim();
+            if line.is_empty() {
+                continue;
+            }
+            let entry: CommitIndexEntry = match serde_json::from_str(line) {
+                Ok(e) => e,
+                // A torn/partial trailing line can't be trusted; treat the
+                // whole index as unusable and fall back to the serial walk.
+                Err(_) => return Ok(None),
+            };
+            if entry.t <= since_t {
+                continue;
+            }
+            let Ok(cid) = entry.cid.parse::<ContentId>() else {
+                return Ok(None);
+            };
+            if seen.insert((entry.t, entry.cid)) {
+                out.push((entry.t, cid));
+            }
+        }
+        out.sort_by_key(|(t, _)| *t);
+
+        Ok(Some(out))
+    }
+
+    async fn prune_commit_index(&self, ledger_id: &str, up_to_t: i64) -> Result<()> {
+        let (ledger_name, branch) = split_ledger_id(ledger_id)?;
+        let path = self.commits_path(&ledger_name, &branch);
+
+        let content = match tokio::fs::read_to_string(&path).await {
+            Ok(c) => c,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(e) => return Err(NameServiceError::storage(e.to_string())),
+        };
+
+        let mut kept = String::with_capacity(content.len());
+        for line in content.lines() {
+            let line = line.trim();
+            if line.is_empty() {
+                continue;
+            }
+            if let Ok(entry) = serde_json::from_str::<CommitIndexEntry>(line) {
+                if entry.t > up_to_t {
+                    kept.push_str(line);
+                    kept.push('\n');
+                }
+            }
+        }
+
+        // Crash-atomic rewrite: write to a temp file in the same dir then
+        // rename over the target (a partial write can't truncate the index).
+        let mut tmp_os = path.clone().into_os_string();
+        tmp_os.push(format!(".tmp.{}", std::process::id()));
+        let tmp_path = PathBuf::from(tmp_os);
+        tokio::fs::write(&tmp_path, kept.as_bytes())
+            .await
+            .map_err(|e| NameServiceError::storage(e.to_string()))?;
+        if let Err(e) = tokio::fs::rename(&tmp_path, &path).await {
+            let _ = tokio::fs::remove_file(&tmp_path).await;
+            return Err(NameServiceError::storage(e.to_string()));
+        }
+        Ok(())
+    }
+}
+
+/// One line of the append-only commit-CID index (`<branch>.commits.jsonl`).
+#[derive(Serialize, Deserialize)]
+struct CommitIndexEntry {
+    t: i64,
+    cid: String,
 }
 
 #[async_trait]
@@ -665,7 +798,8 @@ impl Publisher for FileNameService {
         let branch_c = branch.clone();
         let cid_str = commit_id.to_string();
 
-        self.storage
+        let outcome = self
+            .storage
             .compare_and_swap(&address, |bytes| {
                 let cid_val = Some(cid_str.clone());
 
@@ -713,6 +847,15 @@ impl Publisher for FileNameService {
                 }
             })
             .await?;
+
+        if matches!(outcome, CasOutcome::Written) {
+            if let Err(e) = self
+                .append_commit_index_entry(&ledger_name, &branch, commit_t, &cid_str)
+                .await
+            {
+                tracing::debug!(error = %e, ledger_id, commit_t, "commit-index append failed (non-fatal)");
+            }
+        }
 
         Ok(())
     }
@@ -786,6 +929,8 @@ impl Publisher for FileNameService {
         // Also remove the index sidecar if present
         let idx_path = self.index_path(&ledger_name, &branch);
         let _ = tokio::fs::remove_file(&idx_path).await;
+        // And the commit-CID index sidecar
+        let _ = tokio::fs::remove_file(&self.commits_path(&ledger_name, &branch)).await;
         Ok(())
     }
 
@@ -1205,6 +1350,23 @@ impl RefPublisher for FileNameService {
                     CasOutcome::Written => CasResult::Updated,
                     CasOutcome::Aborted(r) => r,
                 };
+
+                // Mirror the advanced head into the commit-CID index so
+                // incremental indexing can discover the chain without a serial
+                // DAG walk. The normal `fluree.insert_*` commit publishes its
+                // head through this path (transact/commit.rs → compare_and_set_ref
+                // / fast_forward_commit). Best-effort; never fail the publish.
+                if matches!(result, CasResult::Updated) {
+                    if let Some(cid) = new_clone.id.as_ref() {
+                        let cid_str = cid.to_string();
+                        if let Err(e) = self
+                            .append_commit_index_entry(&ledger_name, &branch, new_clone.t, &cid_str)
+                            .await
+                        {
+                            tracing::debug!(error = %e, ledger_id, t = new_clone.t, "commit-index append failed (non-fatal)");
+                        }
+                    }
+                }
 
                 Ok(result)
             }

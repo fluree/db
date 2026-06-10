@@ -77,6 +77,20 @@ pub const ATTR_COMMIT_T: &str = "commit_t";
 pub const ATTR_INDEX_ID: &str = "index_id";
 pub const ATTR_INDEX_T: &str = "index_t";
 
+// ── Commit-CID index items (per advanced commit head) ────────────────────────
+/// Sort-key prefix for per-commit index items. The `t` is zero-padded so
+/// lexical SK order matches numeric `t` order: `commit#00000000000000000001`.
+pub const SK_COMMIT_PREFIX: &str = "commit#";
+/// Width `t` is zero-padded to under [`SK_COMMIT_PREFIX`] (i64 max has 19 digits).
+pub const COMMIT_SK_PAD: usize = 20;
+/// Commit CID string on a commit-index item.
+pub const ATTR_COMMIT_CID: &str = "commit_cid";
+/// TTL backstop (epoch seconds); explicit prune is primary, this caps growth
+/// if a prune is missed. Enable TTL on this attribute to activate it.
+pub const ATTR_TTL: &str = "ttl";
+/// Commit-index TTL window: 30 days in seconds.
+pub const COMMIT_INDEX_TTL_SECS: u64 = 30 * 24 * 60 * 60;
+
 // ── Config item attributes ──────────────────────────────────────────────────
 /// Default JSON-LD context address (ledger config)
 pub const ATTR_DEFAULT_CONTEXT_ADDRESS: &str = "default_context_address";
