@@ -437,6 +437,17 @@ pub struct LedgerManagerConfig {
     ///
     /// By default this is injected by `Fluree` from its global cache budget.
     pub leaflet_cache: Option<Arc<LeafletCache>>,
+    /// When `true`, [`LedgerManager::get_or_load`] checks the nameservice's
+    /// current head against the cached handle's `t` on every hit, and
+    /// evicts + reloads if the cache is behind.
+    ///
+    /// Off by default — the single-node path mutates the cache atomically
+    /// with the nameservice publish, so the check is wasted I/O. Turn this
+    /// on when the nameservice can advance independently of in-process
+    /// writers (e.g., when wrapped over a Raft state-machine projection,
+    /// where consensus apply can advance heads on follower nodes without
+    /// the local writer pipeline running).
+    pub verify_freshness_on_cache_hit: bool,
 }
 
 impl std::fmt::Debug for LedgerManagerConfig {
@@ -446,6 +457,10 @@ impl std::fmt::Debug for LedgerManagerConfig {
             .field("sweep_interval", &self.sweep_interval)
             .field("cache_dir", &self.cache_dir)
             .field("has_leaflet_cache", &self.leaflet_cache.is_some())
+            .field(
+                "verify_freshness_on_cache_hit",
+                &self.verify_freshness_on_cache_hit,
+            )
             .finish()
     }
 }
@@ -457,6 +472,7 @@ impl Default for LedgerManagerConfig {
             sweep_interval: Duration::from_secs(60),
             cache_dir: std::env::temp_dir().join("fluree_binary_cache"),
             leaflet_cache: None,
+            verify_freshness_on_cache_hit: false,
         }
     }
 }
@@ -619,6 +635,24 @@ impl LedgerManager {
         &self.config
     }
 
+    /// Compare the cached handle's `t` against the nameservice's
+    /// current commit head and report whether the cache is behind.
+    ///
+    /// Returns `false` (not stale) when the freshness check is
+    /// disabled, when the nameservice lookup errors, or when the
+    /// nameservice reports no record — we don't want a transient
+    /// nameservice failure to invalidate every cache hit.
+    async fn cached_handle_is_stale(&self, handle: &LedgerHandle) -> bool {
+        if !self.config.verify_freshness_on_cache_hit {
+            return false;
+        }
+        let cached_t = handle.t().await;
+        match self.nameservice_mode.reader().lookup(handle.id()).await {
+            Ok(Some(record)) => record.commit_t > cached_t,
+            _ => false,
+        }
+    }
+
     /// Get cached handle or load from nameservice
     ///
     /// Uses single-flight pattern: concurrent requests for same ledger ID
@@ -636,10 +670,16 @@ impl LedgerManager {
         {
             let entries = self.entries.read().await;
             if let Some(LoadState::Ready(handle)) = entries.get(&canonical_alias) {
-                return Ok(handle.clone());
-            }
-            // Also check Reloading - handle is still valid
-            if let Some(LoadState::Reloading { handle, .. }) = entries.get(&canonical_alias) {
+                let handle = handle.clone();
+                drop(entries);
+                if !self.cached_handle_is_stale(&handle).await {
+                    return Ok(handle);
+                }
+                // Stale: fall through to the load path, which will
+                // re-fetch from nameservice + backend.
+                self.entries.write().await.remove(&canonical_alias);
+            } else if let Some(LoadState::Reloading { handle, .. }) = entries.get(&canonical_alias) {
+                // Handle is valid even during reload
                 return Ok(handle.clone());
             }
         }
@@ -1717,6 +1757,59 @@ mod tests {
 
         let http_internal = ApiError::http(internal.status_code(), internal.to_string());
         assert_eq!(http_internal.status_code(), 500);
+    }
+
+    #[tokio::test]
+    async fn cached_handle_is_stale_respects_config_flag_and_ns_head() {
+        use fluree_db_core::{ContentId, ContentKind, LedgerSnapshot, MemoryStorage};
+        use fluree_db_ledger::LedgerState;
+        use fluree_db_nameservice::{memory::MemoryNameService, Publisher};
+        use fluree_db_novelty::Novelty;
+
+        let ns = MemoryNameService::new();
+        ns.publish_ledger_init("test:main").await.unwrap();
+        ns.publish_commit("test:main", 5, &ContentId::new(ContentKind::Commit, b"c5"))
+            .await
+            .unwrap();
+
+        let backend = StorageBackend::Managed(Arc::new(MemoryStorage::new()));
+        let ns_mode = crate::NameServiceMode::ReadWrite(Arc::new(ns));
+        let snapshot = LedgerSnapshot::genesis("test:main");
+        let novelty = Novelty::new(5);
+        let state = LedgerState::new(snapshot, novelty);
+        let handle = LedgerHandle::new("test:main".to_string(), state, None);
+
+        // With the flag off, the helper always reports fresh — no I/O,
+        // no surprise eviction on the single-node path.
+        let mgr_off = LedgerManager::new(
+            backend.clone(),
+            ns_mode.clone(),
+            LedgerManagerConfig::default(),
+        );
+        assert!(!mgr_off.cached_handle_is_stale(&handle).await);
+
+        // With the flag on and cache at the nameservice's current
+        // commit_t, the helper still reports fresh.
+        let mgr_on = LedgerManager::new(
+            backend,
+            ns_mode.clone(),
+            LedgerManagerConfig {
+                verify_freshness_on_cache_hit: true,
+                ..LedgerManagerConfig::default()
+            },
+        );
+        assert!(!mgr_on.cached_handle_is_stale(&handle).await);
+
+        // Advance the nameservice past the cache: the helper now reports stale.
+        let writable = match &ns_mode {
+            crate::NameServiceMode::ReadWrite(arc) => arc,
+            crate::NameServiceMode::ReadOnly(_) => unreachable!(),
+        };
+        writable
+            .publish_commit("test:main", 12, &ContentId::new(ContentKind::Commit, b"c12"))
+            .await
+            .unwrap();
+        assert!(mgr_on.cached_handle_is_stale(&handle).await);
     }
 
     #[tokio::test]
