@@ -669,8 +669,7 @@ impl NameService for FileNameService {
         // two branches independently increment t from the same base). Keying
         // on t alone would silently drop one of them, letting an incomplete
         // pending list pass the coverage check in the indexer.
-        let mut seen: std::collections::HashSet<(i64, String)> =
-            std::collections::HashSet::new();
+        let mut seen: std::collections::HashSet<(i64, String)> = std::collections::HashSet::new();
         let mut out: Vec<(i64, ContentId)> = Vec::new();
         for line in content.lines() {
             let line = line.trim();
