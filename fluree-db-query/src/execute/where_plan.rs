@@ -26,7 +26,7 @@ use crate::minus::MinusOperator;
 use crate::operator::inline::InlineOperator;
 use crate::operator::BoxedOperator;
 use crate::optional::{GroupedPatternOptionalBuilder, OptionalOperator, PlanTreeOptionalBuilder};
-use crate::planner::{analyze_property_join, is_property_join, reorder_patterns};
+use crate::planner::{analyze_property_join, reorder_patterns};
 use crate::property_join::PropertyJoinOperator;
 use crate::property_path::{PropertyPathOperator, DEFAULT_MAX_VISITED};
 use crate::seed::EmptyOperator;
@@ -1444,16 +1444,35 @@ pub fn build_where_operators_seeded_with_needed(
                 // Hot path: triples only (no BIND/FILTER).
                 // Skip dependency bookkeeping entirely.
                 if block.binds.is_empty() && block.filters.is_empty() {
-                    let augmented_rwv = augmented_at(end);
-                    let augmented_ref = augmented_rwv.as_deref();
+                    let mut augmented_rwv = augmented_at(end);
 
                     // Preserve property-join eligibility when a top-level VALUES precedes
                     // a pure star block. Wrapping VALUES first seeds the schema/operator and
                     // prevents `build_triple_operators()` from taking the property-join path.
+                    // Defer only when the star will actually take that path (same gate as
+                    // `build_triple_operators`: eligible AND object-anchored); otherwise
+                    // seed VALUES under the chain so its bindings constrain the scans.
+                    let star_analysis = analyze_property_join(&block.triples);
                     let values_after_triples = operator.is_none()
                         && !block.values.is_empty()
                         && block.triples.len() >= 2
-                        && is_property_join(&block.triples);
+                        && star_analysis.eligible()
+                        && star_analysis.has_bound_objects;
+
+                    // A deferred VALUES joins against the block's output above it, so
+                    // its vars must survive the block's liveness trimming.
+                    if values_after_triples {
+                        if let Some(rwv) = augmented_rwv.as_mut() {
+                            for vp in &block.values {
+                                for v in &vp.vars {
+                                    if !rwv.contains(v) {
+                                        rwv.push(*v);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    let augmented_ref = augmented_rwv.as_deref();
 
                     let mut built = build_triple_operators(
                         if values_after_triples {
