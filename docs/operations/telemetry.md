@@ -177,6 +177,11 @@ Build the server with the `otel` feature flag:
 cargo build -p fluree-db-server --features otel --release
 ```
 
+> **Building via the CLI crate?** Feature flags do not propagate across
+> binaries: `cargo build -p fluree-db-cli --features otel` enables OTEL only
+> for the CLI's import pipeline, not for the server the daemon launches. Use
+> `--features "otel,fluree-db-server/otel"` to enable both.
+
 Then set environment variables to configure the OTLP exporter:
 
 ```bash
