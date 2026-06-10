@@ -28,7 +28,8 @@ use std::sync::Arc;
 const OUTPUT_BATCH_SIZE: usize = 1024;
 const DEFAULT_MAX_PREDICATE_ROWS: u64 = 10_000_000;
 const DEFAULT_MAX_SQUARE_WEDGE_PAIRS: usize = 5_000_000;
-const DEFAULT_MAX_BOUNDED_TRIANGLE_SUBJECTS: usize = 100_000;
+const DEFAULT_MAX_BOUNDED_TRIANGLE_SEED_ROWS: usize = 512;
+const DEFAULT_MAX_BOUNDED_TRIANGLE_SUBJECTS: usize = 128;
 
 fn cyclic_bgp_enabled() -> bool {
     !matches!(
@@ -56,6 +57,13 @@ fn max_bounded_triangle_subjects() -> usize {
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(DEFAULT_MAX_BOUNDED_TRIANGLE_SUBJECTS)
+}
+
+fn max_bounded_triangle_seed_rows() -> usize {
+    std::env::var("FLUREE_CYCLIC_BGP_MAX_BOUNDED_SEED_ROWS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(DEFAULT_MAX_BOUNDED_TRIANGLE_SEED_ROWS)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -675,6 +683,9 @@ impl CyclicBgpOperator {
             return Ok(None);
         };
         let seed_len = seed_rows.len();
+        if seed_len > max_bounded_triangle_seed_rows() {
+            return Ok(None);
+        }
         let seed_rel = RelationIndex::new(seed_edge.clone(), seed_rows);
         if seed_rel.rows.is_empty() {
             return Ok(Some((vec![seed_rel], seed_len)));
@@ -1738,6 +1749,10 @@ impl Operator for CyclicBgpOperator {
         }
         if self.bounded_triangle {
             m.insert("triangle-strategy".into(), "seeded_subject_probe".into());
+            m.insert(
+                "triangle-bounded-seed-row-cap".into(),
+                max_bounded_triangle_seed_rows().into(),
+            );
             m.insert(
                 "triangle-bounded-subject-cap".into(),
                 max_bounded_triangle_subjects().into(),

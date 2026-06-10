@@ -283,6 +283,8 @@ would otherwise be planned as left-deep nested-loop joins. Its `details` include
 - `triangle-strategy`: `seeded_subject_probe` when an encoded triangle scanned
   the smallest edge first, then used bounded PSOT subject-range probes for the
   remaining edges instead of full predicate scans
+- `triangle-bounded-seed-row-cap`: the maximum number of rows allowed in the
+  seed edge before the triangle falls back to the regular cyclic enumerator
 - `triangle-bounded-subject-cap`: the maximum number of seed-derived subjects
   allowed per bounded triangle probe edge
 - `raw-relation-rows` / `pruned-relation-rows`: runtime row totals, present when
@@ -293,11 +295,13 @@ testing. `FLUREE_CYCLIC_BGP_MAX_ROWS` can lower or raise the per-predicate row
 cap. `FLUREE_CYCLIC_BGP_MAX_WEDGE_PAIRS` controls the encoded-square build-side
 wedge cap (default 5,000,000 pairs); when both exact wedge decompositions exceed
 the cap, the operator falls back to the regular cyclic enumerator.
-`FLUREE_CYCLIC_BGP_MAX_BOUNDED_SUBJECTS` controls the encoded-triangle bounded
-subject cap (default 100,000 seed-derived subjects); when a triangle orientation
-is unsupported or the cap is exceeded, the regular cyclic enumerator remains in
-use. The node exposes the old nested-loop plan as a `fallback` child; the
-fallback runs when the runtime mode is unsupported by the fast path.
+`FLUREE_CYCLIC_BGP_MAX_BOUNDED_SEED_ROWS` controls the encoded-triangle seed
+edge cap (default 512 rows), and `FLUREE_CYCLIC_BGP_MAX_BOUNDED_SUBJECTS`
+controls the per-probe-edge subject cap (default 128 seed-derived subjects);
+when a triangle orientation is unsupported or either cap is exceeded, the
+regular cyclic enumerator remains in use. The node exposes the old nested-loop
+plan as a `fallback` child; the fallback runs when the runtime mode is
+unsupported by the fast path.
 
 The edge `rel` distinguishes a real input from an alternative:
 
