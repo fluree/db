@@ -82,6 +82,10 @@ pub struct ReasoningOptions {
     /// `cls-avf`, `cls-int1`, `cls-int2`, `cls-uni`, `cls-oo`, `cls-maxc2`,
     /// `cls-maxqc`.
     ///
+    /// Where one implementation covers several spec rules, the spec IDs are
+    /// accepted as aliases: `cax-eqc1`/`cax-eqc2` for `cax-eqc`, and
+    /// `cls-maxqc3`/`cls-maxqc4` for `cls-maxqc`.
+    ///
     /// `owl:sameAs` equality processing (`eq-*`) is canonicalization
     /// infrastructure and always runs.
     pub enabled_rules: Vec<String>,
@@ -105,7 +109,19 @@ impl ReasoningOptions {
     ///
     /// An empty `enabled_rules` list enables every rule.
     pub fn rule_enabled(&self, name: &str) -> bool {
-        self.enabled_rules.is_empty() || self.enabled_rules.iter().any(|r| r == name)
+        self.rule_enabled_any(&[name])
+    }
+
+    /// Whether a rule known under any of the given identifiers should run.
+    ///
+    /// Used for gates whose single implementation covers several spec rules
+    /// (e.g. `cax-eqc` implements `cax-eqc1` and `cax-eqc2`).
+    pub fn rule_enabled_any(&self, names: &[&str]) -> bool {
+        self.enabled_rules.is_empty()
+            || self
+                .enabled_rules
+                .iter()
+                .any(|r| names.iter().any(|n| r == n))
     }
 
     /// Compute a hash for cache key purposes

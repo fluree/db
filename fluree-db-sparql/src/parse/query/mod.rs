@@ -18,7 +18,7 @@ use crate::ast::{
     BaseDecl, GraphPattern, Pragmas, PrefixDecl, Prologue, QueryBody, SparqlAst, TriplePattern,
 };
 use crate::diag::{DiagCode, Diagnostic, ParseOutput};
-use crate::lex::{tokenize, TokenKind};
+use crate::lex::{tokenize_with_comments, TokenKind};
 use crate::span::SourceSpan;
 
 // Re-export sub-module dependencies for use via `super::` in child modules.
@@ -38,7 +38,7 @@ enum Verb {
 /// Returns a `ParseOutput` containing the AST (if parsing succeeded) and
 /// any diagnostics (errors or warnings).
 pub fn parse_sparql(input: &str) -> ParseOutput<SparqlAst> {
-    let tokens = tokenize(input);
+    let (tokens, comments) = tokenize_with_comments(input);
 
     // Check for lexer errors first
     let lex_errors: Vec<_> = tokens
@@ -66,35 +66,29 @@ pub fn parse_sparql(input: &str) -> ParseOutput<SparqlAst> {
 
     match parser.parse_query() {
         Some(mut ast) => {
-            ast.pragmas = extract_pragmas(input);
+            ast.pragmas = extract_pragmas(&comments);
             ParseOutput::with_diagnostics(Some(ast), stream.take_diagnostics())
         }
         None => ParseOutput::with_diagnostics(None, stream.take_diagnostics()),
     }
 }
 
-/// Extract Fluree `# PRAGMA ...` directives from full-line comments.
+/// Extract Fluree `# PRAGMA ...` directives from the query's comments.
 ///
-/// Only lines whose first non-whitespace character is `#` are considered, so
-/// the query stays valid SPARQL for standard tooling and `#` characters inside
-/// IRIs or strings can never be misread as directives. Comparison is
-/// case-insensitive on the `PRAGMA` keyword and pragma name; the value is
-/// split on commas and whitespace. Unrecognized pragma names are ignored
-/// (they are ordinary comments).
+/// Comments are sourced from the lexer (`tokenize_with_comments`), so `#`
+/// characters inside string literals or IRIs can never be misread as
+/// directives, and the query stays valid SPARQL for standard tooling.
+/// Comparison is case-insensitive on the `PRAGMA` keyword and pragma name;
+/// the value is split on commas and whitespace. Unrecognized pragma names
+/// are ignored (they are ordinary comments).
 ///
 /// Supported:
 /// - `# PRAGMA reasoning: owl2rl` (also `rdfs`, `owl2ql`, `datalog`,
 ///   `owl-datalog`, `none`, or a comma-separated combination)
-fn extract_pragmas(input: &str) -> Pragmas {
+fn extract_pragmas(comments: &[String]) -> Pragmas {
     let mut pragmas = Pragmas::default();
 
-    for line in input.lines() {
-        let trimmed = line.trim_start();
-        let Some(comment) = trimmed.strip_prefix('#') else {
-            continue;
-        };
-        let comment = comment.trim_start();
-
+    for comment in comments {
         let Some(rest) = strip_keyword_ci(comment, "PRAGMA") else {
             continue;
         };

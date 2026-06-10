@@ -36,9 +36,11 @@ impl SparqlAst {
     }
 }
 
-/// Fluree-specific directives extracted from full-line comments.
+/// Fluree-specific directives extracted from comments.
 ///
-/// Pragmas keep the query text valid SPARQL for any standard tooling:
+/// Comments are identified by the lexer, so `#` inside string literals or
+/// IRIs is never treated as a directive. Pragmas keep the query text valid
+/// SPARQL for any standard tooling:
 ///
 /// ```sparql
 /// # PRAGMA reasoning: owl2rl

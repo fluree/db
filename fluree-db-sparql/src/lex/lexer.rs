@@ -31,12 +31,21 @@ impl<'a> Lexer<'a> {
 
     /// Tokenize the entire input.
     pub fn tokenize(self) -> Vec<Token> {
+        self.tokenize_collecting(&mut Vec::new())
+    }
+
+    /// Tokenize the entire input, collecting comment text (without the
+    /// leading `#`, one entry per comment) into `comments`.
+    ///
+    /// Comments are identified by the lexer itself, so `#` characters inside
+    /// string literals or IRIs are never treated as comments.
+    pub fn tokenize_collecting(self, comments: &mut Vec<String>) -> Vec<Token> {
         let mut tokens = Vec::new();
         let mut input = LocatingSlice::new(self.input);
 
         loop {
             // Skip whitespace and comments
-            skip_ws_and_comments(&mut input);
+            skip_ws_and_comments(&mut input, comments);
 
             if input.is_empty() {
                 // Add EOF token
@@ -68,8 +77,9 @@ impl<'a> Lexer<'a> {
     }
 }
 
-/// Skip whitespace and comments.
-fn skip_ws_and_comments(input: &mut Input<'_>) {
+/// Skip whitespace and comments, collecting comment text (without the
+/// leading `#`) into `comments`.
+fn skip_ws_and_comments(input: &mut Input<'_>, comments: &mut Vec<String>) {
     loop {
         // Skip whitespace
         let _: ModalResult<&str, ContextError> = take_while(0.., is_ws).parse_next(input);
@@ -77,8 +87,11 @@ fn skip_ws_and_comments(input: &mut Input<'_>) {
         // Check for comment
         if input.starts_with('#') {
             // Skip until end of line
-            let _: ModalResult<&str, ContextError> =
+            let comment: ModalResult<&str, ContextError> =
                 take_till(0.., |c| c == '\n' || c == '\r').parse_next(input);
+            if let Ok(text) = comment {
+                comments.push(text.trim_start_matches('#').to_string());
+            }
             // Skip the newline if present
             let _: ModalResult<Option<char>, ContextError> =
                 opt(one_of(['\n', '\r'])).parse_next(input);
@@ -905,6 +918,14 @@ fn parse_punctuation(input: &mut Input<'_>) -> ModalResult<TokenKind> {
 /// Tokenize a SPARQL query string.
 pub fn tokenize(input: &str) -> Vec<Token> {
     Lexer::new(input).tokenize()
+}
+
+/// Tokenize a SPARQL query string, also returning comment text (without
+/// the leading `#`, one entry per comment, in source order).
+pub fn tokenize_with_comments(input: &str) -> (Vec<Token>, Vec<String>) {
+    let mut comments = Vec::new();
+    let tokens = Lexer::new(input).tokenize_collecting(&mut comments);
+    (tokens, comments)
 }
 
 #[cfg(test)]

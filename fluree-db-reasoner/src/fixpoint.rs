@@ -72,8 +72,19 @@ pub async fn run_fixpoint(
     // This ensures owl:sameAs is queryable even without property rules
     if ontology.is_empty() && restrictions.is_empty() {
         let frozen_same_as = same_as_tracker.finalize();
-        // Generate explicit sameAs flakes from equivalence classes (eq-sym, eq-trans)
-        let same_as_flakes = generate_same_as_flakes(&frozen_same_as, db.t);
+        // Generate explicit sameAs flakes from equivalence classes (eq-sym,
+        // eq-trans), excluding pairs already asserted in the base data — the
+        // database serves those itself.
+        let base_pairs: hashbrown::HashSet<&(Sid, Sid)> = same_as_pairs.iter().collect();
+        let same_as_flakes: Vec<Flake> = generate_same_as_flakes(&frozen_same_as, db.t)
+            .into_iter()
+            .filter(|f| match &f.o {
+                fluree_db_core::value::FlakeValue::Ref(o) => {
+                    !base_pairs.contains(&(f.s.clone(), o.clone()))
+                }
+                _ => true,
+            })
+            .collect();
         let flake_count = same_as_flakes.len();
         return Ok((
             same_as_flakes,
@@ -123,8 +134,12 @@ pub async fn run_fixpoint(
     while !delta.is_empty() {
         // Check budget
         if start.elapsed() > budget.max_duration {
-            diagnostics =
-                ReasoningDiagnostics::capped("time", iterations, derived.len(), start.elapsed());
+            diagnostics = ReasoningDiagnostics::capped(
+                "time",
+                iterations,
+                derived.derived_len(),
+                start.elapsed(),
+            );
             break;
         }
 
@@ -196,7 +211,7 @@ pub async fn run_fixpoint(
 
             // B.5. MaxQualifiedCardinality=1 rule (cls-maxqc3/4):
             // P(x, y1), P(x, y2), type(x, C), type(y1, D), type(y2, D) → sameAs(y1, y2)
-            if opts.rule_enabled("cls-maxqc") {
+            if opts.rule_enabled_any(&["cls-maxqc", "cls-maxqc3", "cls-maxqc4"]) {
                 apply_max_qualified_cardinality_rule(&restrictions, &mut identity_ctx);
             }
         }
@@ -273,7 +288,7 @@ pub async fn run_fixpoint(
         }
 
         // C.9. EquivalentClass rule (cax-eqc): type(x, C1), equivalentClass(C1, C2) → type(x, C2)
-        if opts.rule_enabled("cax-eqc") {
+        if opts.rule_enabled_any(&["cax-eqc", "cax-eqc1", "cax-eqc2"]) {
             apply_equivalent_class_rule(&ontology, &mut ctx);
         }
 

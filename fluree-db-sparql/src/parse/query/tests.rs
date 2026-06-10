@@ -2007,3 +2007,22 @@ fn test_pragma_after_query_body_line() {
     let ast = assert_parses("SELECT * WHERE { }\n# PRAGMA reasoning: rdfs");
     assert_eq!(ast.pragmas.reasoning, Some(vec!["rdfs".to_string()]));
 }
+
+#[test]
+fn test_pragma_inside_string_literal_ignored() {
+    // A '#' line inside a long string literal is data, not a comment —
+    // it must never be interpreted as a pragma.
+    let ast = assert_parses("SELECT * WHERE { ?s ?p \"\"\"\n# PRAGMA reasoning: owl2rl\n\"\"\" }");
+    assert_eq!(ast.pragmas.reasoning, None);
+
+    // Same for single-line strings containing a '#'.
+    let ast = assert_parses("SELECT * WHERE { ?s ?p \"# PRAGMA reasoning: owl2rl\" }");
+    assert_eq!(ast.pragmas.reasoning, None);
+}
+
+#[test]
+fn test_pragma_in_trailing_comment_honored() {
+    // A genuine trailing comment is a comment; the lexer identifies it.
+    let ast = assert_parses("SELECT * WHERE { } # PRAGMA reasoning: rdfs");
+    assert_eq!(ast.pragmas.reasoning, Some(vec!["rdfs".to_string()]));
+}
