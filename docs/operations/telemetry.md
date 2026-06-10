@@ -279,6 +279,7 @@ Additional spans: `binary_cursor_next_leaf`, `property_join`, `group_by`, `aggre
 
 ```
 query_execute (debug)
+├── ledger_view_load (debug, ledger_id, cold_binary_store — view acquisition; the pre-prepare phase, multi-second on cold ledgers)
 ├── query_prepare (debug)
 │   ├── reasoning_prep (debug)
 │   ├── pattern_rewrite (debug, patterns_before, patterns_after)

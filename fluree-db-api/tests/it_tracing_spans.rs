@@ -902,9 +902,14 @@ async fn ac9_cyclic_bgp_operator_spans() {
                 .expect("insert");
             let ledger = result.ledger;
             support::trigger_index_and_wait_outcome(&handle, ledger_id, ledger.t()).await;
-            let view = fluree.db(ledger_id).await.expect("load view");
 
             let (store, _guard) = span_capture::init_test_tracing();
+            let view = fluree.db(ledger_id).await.expect("load view");
+            assert!(
+                store.has_span("ledger_view_load"),
+                "ledger_view_load span should wrap view acquisition. Captured: {:?}",
+                store.span_names()
+            );
 
             let triangle = r"PREFIX ex: <http://example.org/ns/>
                 SELECT ?a ?b ?c
