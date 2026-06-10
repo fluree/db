@@ -20,6 +20,8 @@ pub struct SparqlAst {
     pub body: QueryBody,
     /// Source span for the entire query
     pub span: SourceSpan,
+    /// Fluree directives from comment lines (`# PRAGMA ...`)
+    pub pragmas: Pragmas,
 }
 
 impl SparqlAst {
@@ -29,8 +31,28 @@ impl SparqlAst {
             prologue,
             body,
             span,
+            pragmas: Pragmas::default(),
         }
     }
+}
+
+/// Fluree-specific directives extracted from full-line comments.
+///
+/// Pragmas keep the query text valid SPARQL for any standard tooling:
+///
+/// ```sparql
+/// # PRAGMA reasoning: owl2rl
+/// SELECT ?s WHERE { ?s a ex:Student }
+/// ```
+///
+/// Unrecognized pragma names are ignored (they are comments); recognized
+/// pragmas with invalid values error during lowering.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Pragmas {
+    /// `# PRAGMA reasoning: <mode>[, <mode>...]` — per-query reasoning modes
+    /// (`none`, `rdfs`, `owl2ql`, `owl2rl`, `datalog`, `owl-datalog`).
+    /// Values are collected verbatim; mode names validate during lowering.
+    pub reasoning: Option<Vec<String>>,
 }
 
 /// The body of a SPARQL query (SELECT, CONSTRUCT, ASK, DESCRIBE, or UPDATE).

@@ -15,7 +15,7 @@ mod tests;
 
 use crate::ast::path::PropertyPath;
 use crate::ast::{
-    BaseDecl, GraphPattern, PrefixDecl, Prologue, QueryBody, SparqlAst, TriplePattern,
+    BaseDecl, GraphPattern, Pragmas, PrefixDecl, Prologue, QueryBody, SparqlAst, TriplePattern,
 };
 use crate::diag::{DiagCode, Diagnostic, ParseOutput};
 use crate::lex::{tokenize, TokenKind};
@@ -65,8 +65,72 @@ pub fn parse_sparql(input: &str) -> ParseOutput<SparqlAst> {
     let mut parser = Parser::new(&mut stream);
 
     match parser.parse_query() {
-        Some(ast) => ParseOutput::with_diagnostics(Some(ast), stream.take_diagnostics()),
+        Some(mut ast) => {
+            ast.pragmas = extract_pragmas(input);
+            ParseOutput::with_diagnostics(Some(ast), stream.take_diagnostics())
+        }
         None => ParseOutput::with_diagnostics(None, stream.take_diagnostics()),
+    }
+}
+
+/// Extract Fluree `# PRAGMA ...` directives from full-line comments.
+///
+/// Only lines whose first non-whitespace character is `#` are considered, so
+/// the query stays valid SPARQL for standard tooling and `#` characters inside
+/// IRIs or strings can never be misread as directives. Comparison is
+/// case-insensitive on the `PRAGMA` keyword and pragma name; the value is
+/// split on commas and whitespace. Unrecognized pragma names are ignored
+/// (they are ordinary comments).
+///
+/// Supported:
+/// - `# PRAGMA reasoning: owl2rl` (also `rdfs`, `owl2ql`, `datalog`,
+///   `owl-datalog`, `none`, or a comma-separated combination)
+fn extract_pragmas(input: &str) -> Pragmas {
+    let mut pragmas = Pragmas::default();
+
+    for line in input.lines() {
+        let trimmed = line.trim_start();
+        let Some(comment) = trimmed.strip_prefix('#') else {
+            continue;
+        };
+        let comment = comment.trim_start();
+
+        let Some(rest) = strip_keyword_ci(comment, "PRAGMA") else {
+            continue;
+        };
+
+        if let Some(value) = strip_keyword_ci(rest, "reasoning") {
+            let value = value.trim_start().strip_prefix(':').unwrap_or(value);
+            let modes: Vec<String> = value
+                .split([',', ' ', '\t'])
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string)
+                .collect();
+            // Last pragma wins if repeated; an empty mode list is preserved so
+            // lowering can reject `# PRAGMA reasoning:` with no value.
+            pragmas.reasoning = Some(modes);
+        }
+    }
+
+    pragmas
+}
+
+/// Strip a case-insensitive keyword prefix followed by a word boundary
+/// (whitespace, `:`, or end of input). Returns the remainder.
+fn strip_keyword_ci<'a>(input: &'a str, keyword: &str) -> Option<&'a str> {
+    let trimmed = input.trim_start();
+    if trimmed.len() < keyword.len() || !trimmed.is_char_boundary(keyword.len()) {
+        return None;
+    }
+    let (head, rest) = trimmed.split_at(keyword.len());
+    if !head.eq_ignore_ascii_case(keyword) {
+        return None;
+    }
+    match rest.chars().next() {
+        None => Some(rest),
+        Some(c) if c.is_whitespace() || c == ':' => Some(rest),
+        Some(_) => None,
     }
 }
 

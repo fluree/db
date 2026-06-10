@@ -1953,3 +1953,57 @@ fn test_service_fluree_ledger_endpoint() {
         }
     }
 }
+
+#[test]
+fn test_pragma_reasoning_single_mode() {
+    let ast = assert_parses("# PRAGMA reasoning: owl2rl\nSELECT * WHERE { }");
+    assert_eq!(ast.pragmas.reasoning, Some(vec!["owl2rl".to_string()]));
+}
+
+#[test]
+fn test_pragma_reasoning_case_insensitive_and_no_colon() {
+    let ast = assert_parses("#pragma Reasoning owl2rl\nSELECT * WHERE { }");
+    assert_eq!(ast.pragmas.reasoning, Some(vec!["owl2rl".to_string()]));
+}
+
+#[test]
+fn test_pragma_reasoning_multiple_modes() {
+    let ast = assert_parses("# PRAGMA reasoning: rdfs, datalog\nSELECT * WHERE { }");
+    assert_eq!(
+        ast.pragmas.reasoning,
+        Some(vec!["rdfs".to_string(), "datalog".to_string()])
+    );
+}
+
+#[test]
+fn test_pragma_reasoning_last_wins() {
+    let ast =
+        assert_parses("# PRAGMA reasoning: rdfs\n# PRAGMA reasoning: owl2rl\nSELECT * WHERE { }");
+    assert_eq!(ast.pragmas.reasoning, Some(vec!["owl2rl".to_string()]));
+}
+
+#[test]
+fn test_pragma_reasoning_empty_value_preserved() {
+    let ast = assert_parses("# PRAGMA reasoning:\nSELECT * WHERE { }");
+    assert_eq!(ast.pragmas.reasoning, Some(Vec::new()));
+}
+
+#[test]
+fn test_ordinary_comments_are_not_pragmas() {
+    let ast =
+        assert_parses("# just a comment about reasoning\n# PRAGMATIC note\nSELECT * WHERE { }");
+    assert_eq!(ast.pragmas.reasoning, None);
+}
+
+#[test]
+fn test_unknown_pragma_ignored() {
+    let ast = assert_parses("# PRAGMA timeout: 30\nSELECT * WHERE { }");
+    assert_eq!(ast.pragmas.reasoning, None);
+}
+
+#[test]
+fn test_pragma_after_query_body_line() {
+    // Pragmas are honored anywhere as full-line comments.
+    let ast = assert_parses("SELECT * WHERE { }\n# PRAGMA reasoning: rdfs");
+    assert_eq!(ast.pragmas.reasoning, Some(vec!["rdfs".to_string()]));
+}
