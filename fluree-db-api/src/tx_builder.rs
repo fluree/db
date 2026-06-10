@@ -878,7 +878,7 @@ impl Fluree {
     /// when needed. Consumes the write guard, releasing the lock before the
     /// (potentially slow) reindex trigger so other writers aren't blocked
     /// behind it.
-    pub(crate) async fn finalize_commit(
+    pub async fn finalize_commit(
         &self,
         mut write_guard: LedgerWriteGuard,
         mut new_state: LedgerState,

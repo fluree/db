@@ -188,9 +188,9 @@ impl Committer for RaftCommitter {
         }
 
         // 5. Stage locally → produces the commit blob in memory. The
-        //    write guard is held until `_write_guard` drops at the end
-        //    of this function.
-        let (_write_guard, staged_commit) = builder.build_commit().await.map_err(execution_failure)?;
+        //    write guard is held across the AdvanceRef round-trip; on
+        //    Applied we install the new state into it before drop.
+        let (write_guard, staged_commit) = builder.build_commit().await.map_err(execution_failure)?;
 
         let commit_cid = staged_commit
             .commit
@@ -252,7 +252,11 @@ impl Committer for RaftCommitter {
                     message: format!("raft client_write failed: {e}"),
                 })?;
 
-        // 10. Translate Response into TransactionReceipt.
+        // 10. Translate Response into TransactionReceipt. On the
+        //     Applied branch we also derive the post-commit
+        //     LedgerState from the staged commit and install it via
+        //     the held write guard, so this node's cached state is
+        //     not stale on the next stage.
         match resp.data {
             SmResponse::Applied {
                 head_t,
@@ -260,15 +264,29 @@ impl Committer for RaftCommitter {
                 accepted: _,
                 release: _,
                 tally,
-            } => Ok(TransactionReceipt {
-                idempotency_key,
-                commit: fluree_db_api::CommitReceipt {
-                    commit_id: head_id,
-                    t: head_t,
-                    flake_count,
-                },
-                tally: tally.map(Into::into),
-            }),
+            } => {
+                let (_receipt, new_state) =
+                    staged_commit
+                        .finalize_state()
+                        .map_err(|e| SubmissionError::Execution {
+                            status: 500,
+                            message: format!("finalize_state failed: {e}"),
+                        })?;
+                let needs_reindex = new_state.should_reindex(&self.index_config);
+                self.fluree
+                    .finalize_commit(write_guard, new_state, head_t, needs_reindex)
+                    .await
+                    .map_err(execution_failure)?;
+                Ok(TransactionReceipt {
+                    idempotency_key,
+                    commit: fluree_db_api::CommitReceipt {
+                        commit_id: head_id,
+                        t: head_t,
+                        flake_count,
+                    },
+                    tally: tally.map(Into::into),
+                })
+            }
             SmResponse::Conflict {
                 current_head: _,
                 current_t: _,
@@ -289,12 +307,9 @@ impl Committer for RaftCommitter {
                 message: "unexpected Response variant for AdvanceRef".into(),
             }),
         }
-        // _write_guard drops here, releasing the ledger lock. The
-        // post-apply cache refresh / indexer trigger is deferred to a
-        // later phase (the existing finalize_commit path requires the
-        // new LedgerState, which we'd derive via finalize_state — left
-        // as a follow-up so this phase ships focused on the consensus
-        // round-trip).
+        // On non-Applied paths, the write guard drops here without
+        // installing new state — the local cache remains at the
+        // pre-build snapshot (correct: nothing advanced).
     }
 
     async fn revert(&self, _request: RevertRequest) -> Result<RevertReceipt, SubmissionError> {
